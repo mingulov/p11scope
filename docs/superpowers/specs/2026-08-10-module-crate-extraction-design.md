@@ -1,9 +1,7 @@
 # Shared PKCS#11 module-loading crate — extraction design
 
 **Date:** 2026-08-10
-**Status:** Proposed — revision 4, incorporating external review rounds 1–3
-(round 3: one P1 safety correction — 2.x layout acceptance — plus seam
-reachability and evidence-purity fixes). No code has been written.
+**Status:** Implemented — revision 4 approved by external review; extraction landed (pkcs11-proxy-ng crates/module, submodule commits cb37041..7c5c860). No further design rounds.
 **Scope of this doc:** the Phase 1 *cross-repo precursor* from the
 [ROADMAP](../plans/ROADMAP.md): extracting the reusable module-FFI *facts*
 (dlopen bootstrap + table enumeration + field-offset tables + layout

@@ -1,0 +1,9 @@
+C_CloseSession 10
+C_Digest 50
+C_DigestInit 50
+C_Finalize 1
+C_GenerateRandom 100
+C_GetInfo 3
+C_GetSlotList 1
+C_Initialize 1
+C_OpenSession 10

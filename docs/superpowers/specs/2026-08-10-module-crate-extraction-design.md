@@ -1,11 +1,15 @@
 # Shared PKCS#11 module-loading crate — extraction design
 
 **Date:** 2026-08-10
-**Status:** Proposed — pending review. No code has been written.
+**Status:** Proposed — revision 2, incorporating external review round 1
+(verdict: changes required; all five findings accepted, boundary narrowed per
+the reviewer's counter-proposal). No code has been written.
 **Scope of this doc:** the Phase 1 *cross-repo precursor* from the
-[ROADMAP](../plans/ROADMAP.md): extracting `pkcs11-proxy-ng`'s module-FFI
-(dlopen + function-table discovery) into a lean crate that both the proxy and
-`p11scope-discover` consume. It does **not** cover the eBPF observer, the
+[ROADMAP](../plans/ROADMAP.md): extracting the reusable module-FFI *facts*
+(dlopen bootstrap + table enumeration + field-offset tables) from
+`pkcs11-proxy-ng` into a lean crate that both the proxy and
+`p11scope-discover` consume, plus two latent-bug fixes in the proxy's loading
+path that the review surfaced. It does **not** cover the eBPF observer, the
 manifest schema, or anything else in Phase 1.
 **Parent docs:** [pkcs11-scope design](2026-08-10-pkcs11-scope-design.md)
 ("Shared decode core" decision row), ROADMAP Phase 1,
@@ -15,12 +19,11 @@ manifest schema, or anything else in Phase 1.
 
 ## 1. Problem
 
-`p11scope-discover` must dlopen a PKCS#11 provider, obtain its function
-table(s), and map the function pointers to ELF file offsets. pkcs11-proxy-ng
-already has production-hardened code for the first two steps
-(`crates/backend/src/ffi/loading.rs` + `ffi/function_field_tables.rs`),
-including quirk handling for real providers that misreport their interfaces.
-The settled decision (scope design spec) is to **reuse it, not duplicate it**.
+`p11scope-discover` must dlopen a PKCS#11 provider, obtain **all** of its
+function tables, and map the function pointers to ELF file offsets.
+pkcs11-proxy-ng has production-hardened module-FFI code
+(`crates/backend/src/ffi/loading.rs` + `ffi/function_field_tables.rs`). The
+settled decision (scope design spec) is to reuse it, not duplicate it.
 
 Reuse is blocked by a dependency chain, verified in the tree:
 
@@ -32,233 +35,248 @@ pkcs11-proxy-ng-backend  →  pkcs11-proxy-ng-proto  →  tonic/prost
 
 (CI installs `protobuf-compiler`; `crates/proto/build.rs` compiles three
 `.proto` files.) The discover helper ships as glibc **and** musl *dynamic*
-binaries that get copied into arbitrary target containers — requiring
-protoc + the tonic stack to build a dlopen helper is the concrete cost being
-removed.
-
-A second, proxy-side benefit: the loader becomes independently buildable and
-testable, and `crates/backend` gets thinner.
+binaries copied into arbitrary target containers — requiring protoc + the
+tonic stack to build a dlopen helper is the concrete cost being removed.
 
 ## 2. Decision summary
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| New crate | `crates/module` in the `pkcs11-proxy-ng` workspace; package name **`pkcs11-module`** (subject to a crates.io availability check, see §9) | Repo-neutral name so a later relocation (own repo, crates.io) changes only the consumer's dependency *source* line, never `use` paths. Matches the family naming (`pkcs11-check`, `pkcs11-scope`, `pkcs11-lab`). Deliberately *not* `pkcs11-proxy-ng-module` (locks name to repo) and not `cryptoki-*` (that namespace on crates.io belongs to an unrelated project family; adjacency invites confusion) |
-| Dependencies | `libloading`, `cryptoki-sys` — nothing else | No `types` dep: everything the loader needs from `types` turned out to be nothing (see §5). No tracing, no serde |
-| What moves | `loading.rs` (verbatim, incl. version-fallback policy), `function_field_tables.rs`, `host_abi.rs` | §4 |
-| What is new | `interface_list()` raw `C_GetInterfaceList` enumeration; `read_fn_pointers()`; `Abi` value type | §4, §6 |
-| What stays in `backend` | `detect_interface_capabilities` (imports the moved tables), all 100+ `Pkcs11Backend` op implementations, `initialize_args`, session/mech caches | §5 |
-| What stays in `types` | `width.rs` bridge, `is_ulong()`/`is_ulong_array()` classifier, mechanism registry, official name tables | §5 — scope consumes `types` as a second, independent git dep |
-| Consumption model | git deps pinned to a rev/tag; all crates stay `publish = false` | Standalone repo / crates.io deferred until publishing pressure exists (settled in the parent spec) |
-| Foreign ABIs | Detect and refuse; no cross-ABI layout computation in v1 | §6 |
+| New crate | `crates/module` in the `pkcs11-proxy-ng` workspace; package name **`pkcs11-module`** (confirmed unregistered on crates.io at review time; availability is in any case non-blocking for a `publish = false` git dependency) | Repo-neutral name so a later relocation changes only the consumer's dependency *source* line. Matches family naming (`pkcs11-check`, `pkcs11-scope`, `pkcs11-lab`). Not `cryptoki-*` (unrelated project family owns that crates.io namespace) |
+| Dependencies | `libloading`, `cryptoki-sys` — nothing else | No `types`, no tracing, no serde |
+| Boundary principle | **Facts move; policy stays.** The crate holds only operations with two consumers or that are provider-fact extraction; the proxy's interface-selection *policy* (version fallback, quirk handling) stays in `backend` | Review round 1: the earlier "move `open()` verbatim" plan was invalidated by findings 1 and 4 — the loading path needs edits either way, so single-home-for-loading no longer justified exporting proxy policy |
+| What moves | `try_get_function_list` (as public `function_list()`), the three field-offset tables, `detect_null_functions` + new `read_fn_pointers` (both switched to unaligned reads) | §3 |
+| What is new | `interface_list()` — hardened raw `C_GetInterfaceList` enumeration with a deterministic test seam | §3, §5 |
+| What stays in `backend` | `loading.rs` policy (`C_GetInterface` machinery, version fallback, `load_with_init_args`) with two fixes (§6); `host_abi.rs`; `detect_interface_capabilities`; all op implementations | §4 |
+| What stays in `types` | `width.rs` bridge, ulong classifier, mechanism registry, official name tables | Scope consumes `types` as a second, independent git dep |
+| Errors | `Result<_, String>`, matching the existing loading path | Revisit if/when the manifest schema wants structured evidence; not now |
+| Foreign ABIs | Detect and refuse at `dlopen` (ELF-class mismatch fails there); **no `Abi`/`ByteOrder` abstraction in v1** | The earlier draft's `Abi` value type was speculative; v1 is x86-64-Linux-only and the dlopen error is the refusal evidence. `host_abi.rs` (proxy wire advertisement) stays in backend; its stale module comment gets fixed in place |
 
 ## 3. Crate API surface (illustrative — exact signatures at implementation)
 
 ```rust
 // package pkcs11-module, crates/module/src/
 
-/// A dlopen'ed PKCS#11 module and its resolved function-list pointers.
-/// Construction never calls C_Initialize; side effects are limited to the
-/// module's own dlopen constructors.
-pub struct LoadedModule {
-    pub lib: libloading::Library,          // keeps the module mapped
-    pub func_list: *mut CK_FUNCTION_LIST,
-    pub func_list_3_0: Option<*const CK_FUNCTION_LIST_3_0>,
-    pub func_list_3_2: Option<*const CK_FUNCTION_LIST_3_2>,
-}
+/// Resolve the legacy 2.40 entry point and return its table.
+/// Moved from backend's try_get_function_list, made a free fn.
+/// Never calls C_Initialize (spec: C_GetFunctionList/C_GetInterfaceList/
+/// C_GetInterface are the only pre-initialize calls).
+pub fn function_list(lib: &Library) -> Result<*mut CK_FUNCTION_LIST, String>;
 
-/// Proxy-semantics open: C_GetInterface preferred, C_GetFunctionList
-/// fallback, plus the primary-interface version fallback (see §4).
-/// Moved verbatim from backend's loading.rs.
-pub fn open(path: &Path) -> Result<LoadedModule, String>;
-
-/// Raw interface enumeration via C_GetInterfaceList (two-call pattern).
-/// NEW code. Returns each interface exactly as the module reports it —
-/// no version fallback, no de-duplication. Empty result for 2.40-only
-/// modules (no C_GetInterfaceList export).
+/// One interface exactly as the module reported it. Nothing is resolved,
+/// deduplicated, or reinterpreted; NULL fields are preserved as evidence.
 pub struct RawInterface {
-    pub name: String,                      // copied from pInterfaceName
-    pub version: CK_VERSION,               // leading field of pFunctionList
+    pub name: Option<Vec<u8>>,       // bytes of pInterfaceName; None if NULL
+    pub version: Option<CK_VERSION>, // leading field of pFunctionList; None if that is NULL
     pub flags: CK_FLAGS,
-    pub func_list: *mut c_void,
+    pub func_list: *mut c_void,      // may be NULL — preserved, never deref'd then
 }
+
+impl RawInterface {
+    /// Exact-match test against the standard interface name b"PKCS 11".
+    /// Callers MUST NOT walk the standard field tables over an interface
+    /// for which this is false (vendor layouts are unrelated; only the
+    /// leading CK_VERSION is guaranteed by the spec).
+    pub fn is_standard(&self) -> bool;
+}
+
+/// Raw C_GetInterfaceList enumeration (two-call pattern), hardened per §5.
+/// Empty Vec for modules that do not export C_GetInterfaceList.
 pub fn interface_list(lib: &Library) -> Result<Vec<RawInterface>, String>;
 
+// Deterministic-test seam: the public fn resolves the symbol and delegates
+// to the pure driver, which is what the unit tests exercise.
+fn interface_list_impl(
+    get_list: impl FnMut(*mut CK_INTERFACE, *mut CK_ULONG) -> CK_RV,
+) -> Result<Vec<RawInterface>, String>;
+
 /// (field name, byte offset) tables for the three function-list structs.
-/// offset_of!-derived: valid for the COMPILATION TARGET's ABI only (§6).
-pub static FUNCTION_LIST_FIELDS: &[FnField];          // 68 entries (v2.40)
+/// offset_of!-derived: valid for the COMPILATION TARGET's ABI only (§7).
+pub static FUNCTION_LIST_FIELDS: &[FnField];           // 68 entries (v2.40)
 pub static FUNCTION_LIST_3_0_EXTRA_FIELDS: &[FnField]; // +24
 pub static FUNCTION_LIST_3_2_EXTRA_FIELDS: &[FnField]; // +12
 
-/// Existing NULL-slot scan (moved) and its new sibling that returns the
-/// pointer values themselves (for pointer→file-offset mapping in the
-/// discover helper).
+/// NULL-slot scan (moved) and pointer-value reader (new sibling, for the
+/// helper's pointer→file-offset mapping). BOTH use read_unaligned: on the
+/// packed Windows-MSVC cryptoki-sys bindings, function-pointer fields start
+/// at offset 2 (after CK_VERSION) and an aligned read is UB. (Fixes a
+/// latent-UB bug in the current detect_null_functions; free on x86-64.)
 pub unsafe fn detect_null_functions(base: *const u8, fields: &[FnField]) -> Vec<String>;
 pub unsafe fn read_fn_pointers(base: *const u8, fields: &[FnField])
     -> Vec<(&'static str, usize)>;
-
-/// The build target's C-ABI properties relevant to PKCS#11 (moved from
-/// backend/src/host_abi.rs, generalized from two free functions into a
-/// value type so "detected but unsupported" is expressible).
-pub struct Abi { pub ulong_width: u32, pub byte_order: ByteOrder }
-impl Abi { pub fn host() -> Abi; }
 ```
 
 Notes for reviewers:
 
-- **No `unsafe impl Send/Sync` on `LoadedModule`.** `FfiBackend` keeps its
-  own unsafe impls with the existing `CKF_OS_LOCKING_OK` justification —
-  that argument is about how the *proxy* drives the module, and does not
-  transfer to arbitrary consumers.
-- Raw pointer fields are `pub` on purpose: the discover helper must hand
-  them to `dladdr`/`dl_iterate_phdr`-based mapping code (scope-side; not
-  this crate's business).
-- ELF build-ID extraction, pointer→file-offset mapping, manifest JSON, and
-  aliasing analysis all stay in `p11scope-discover`. This crate is
-  deliberately only "dlopen + tables + self-ABI".
+- There is deliberately **no `open()`, no `LoadedModule`, no Send/Sync
+  assertion, and no C_GetInterface wrapper** in the crate. Interface
+  *selection* is proxy policy and stays in `backend` (§4). The crate never
+  interprets what it enumerates.
+- ELF build-ID extraction, pointer→file-offset mapping (`dladdr` /
+  `dl_iterate_phdr`), manifest JSON, and aliasing analysis stay in
+  `p11scope-discover`.
+- Version read (`RawInterface.version`) dereferences the leading
+  `CK_VERSION` of a non-NULL `func_list` only — guaranteed by the spec for
+  vendor and standard interfaces alike; nothing beyond those two bytes is
+  read unless `is_standard()`.
 
-## 4. The two surfaces — why `open()` alone is not enough
+## 4. Boundary rationale: facts vs policy
 
-`open()` carries the proxy's **version-fallback policy**: some real 3.x
-modules answer an explicit versioned `C_GetInterface` query for `{3,0}` with
-NULL even though their default 3.1+ interface implements the 3.0 functions.
-The fallback reuses the *primary* table pointer for `func_list_3_0` in that
-case. (Concrete provider: BouncyHSM; there is a regression test for it in
-`loading.rs`. Without the fallback, 3.0-only dispatch such as
-`C_SessionCancel` wrongly returns `CKR_FUNCTION_NOT_SUPPORTED` through the
-proxy.)
+The proxy's `loading.rs` contains a **version-fallback policy**: some real
+3.x modules answer an explicit versioned `C_GetInterface` query for `{3,0}`
+with NULL even though their default 3.1+ interface implements the 3.0
+functions (concrete provider: BouncyHSM; regression test in `loading.rs`).
+The fallback reuses the *primary* table pointer for `func_list_3_0`.
 
-For the proxy this is correct dispatch behavior. For the observer it is
-**evidence poison**: if the discover helper read `func_list_3_0` off
-`LoadedModule`, a fallback-resolved list is literally the same address as
-the primary list, and the helper would report "aliased functions across
-interfaces" — an artifact of proxy policy, not a property of the provider.
-The scope design spec explicitly requires per-interface aliasing to be
-reported as genuine ambiguity, so the input must be unprocessed.
+For proxy dispatch this is correct. For the observer it is **evidence
+poison**: a fallback-resolved list is literally the same address as the
+primary list, so consuming it would report "aliased functions across
+interfaces" as provider fact when it is proxy policy. Keeping the policy in
+`backend` makes the hazard unrepresentable: the crate's only enumeration
+output is the module's own answers, and the discover helper cannot reach the
+fallback at all.
 
-Hence the split:
+This also keeps the BouncyHSM regression test where it lives today
+(resolving an open question from revision 1).
 
-| Surface | Consumer | Semantics |
-|---|---|---|
-| `open()` | proxy backend | best-effort dispatch tables, quirk handling ON |
-| `interface_list()` | discover helper | raw per-interface enumeration, no interpretation |
+## 5. `interface_list()` contract (review finding: must be deterministic-testable)
 
-The discover helper uses `interface_list()` (plus `C_GetFunctionList` for
-2.40-only modules) and **never** the fallback-resolved fields. This is the
-one place where the extraction is more than a mechanical move, and it is the
-main thing this document asks reviewers to sanity-check.
+Two-call pattern with the following hardening, all exercised through the
+`interface_list_impl` seam with closure-simulated providers — an optional
+real-provider test alone is insufficient:
 
-## 5. What deliberately does not move
+1. **Bounded retry.** First call (NULL buffer) yields a count; allocate;
+   second call may return `CKR_BUFFER_TOO_SMALL` if the count grew. Retry
+   the whole sequence, **3 attempts total**, then error.
+2. **Checked count handling.** `CK_ULONG → usize` via checked conversion;
+   allocation capped (256 interfaces — real providers report a handful; a
+   garbage count must not drive allocation).
+3. **Capacity overrun rejected.** If the second call returns
+   `CKR_OK` with a count exceeding the supplied capacity, error out —
+   never read past the allocation.
+4. **NULL preservation.** NULL `pInterfaceName` → `name: None`; NULL
+   `pFunctionList` → entry kept with `version: None`, pointer preserved,
+   nothing dereferenced. Malformed entries are *evidence*, not panics.
+5. **Zero interfaces** is a valid result (`Ok(vec![])`), distinct from
+   "symbol absent" only in that both return an empty Vec — the helper
+   records which case occurred via its own symbol probe if needed.
 
-- **`types/width.rs` (the CK_ULONG width/endianness bridge, ADR-0011).**
-  Pure, zero-dep, runtime-parameterized by `(src_width, dst_width, order)`,
-  ~15 call sites across shim and backend. It already lives in the
-  dependency-lean `types` crate, which scope consumes anyway for the
-  mechanism registry and official name tables. Moving it would churn call
-  sites for zero benefit.
-- **`types/attribute.rs` ulong classifier** — same reasoning.
-- **`detect_interface_capabilities` / `InterfaceCapabilities`.** This is
-  proxy *wire shape* (advertised to shims over gRPC). Moving it would drag
-  a `types` dep into the crate for something the observer never emits. It
-  stays in `backend` and imports the moved tables.
-- **The `backend → proto` untangle.** `backend`'s only proto coupling is
-  `proto::convert::message_params::MessageParameter` (used by the 3.x
-  message-ops paths; proto's own comment already marks it as a future
-  migration to `types`). None of that code is on the loading path; the
-  cleanup is real but unrelated, and bundling it would grow this change's
-  risk for no Phase 1 benefit.
-- **A `types` split into "general PKCS#11" vs "proxy wire" crates, a
-  standalone shared repo, crates.io publishing.** All deferred; the trigger
-  for each is publishing pressure, which does not exist yet. The
-  relocation-neutral crate name is what keeps these cheap later.
+Deterministic test matrix (pure Rust, no provider): count growth converging
+on attempt 2; count growth never converging (error after 3); absurd count
+(cap → error); `CKR_OK` with count > capacity (error); NULL name; NULL
+function list; zero interfaces; vendor-named interface passes through with
+`is_standard() == false`.
 
-## 6. ABI analysis (the "compatibility layers" question)
+## 6. Two latent bugs fixed in `backend` during extraction
 
-ADR-0011 decomposes every C edge into two orthogonal axes:
+Both were found by external review of this design; both are in the loading
+path that stays behind, and both ship in the extraction change with tests.
 
-1. **`CK_ULONG` width + byte order** — the only properties that cross a
-   process/wire boundary. LP64 = (8, LE); ILP32 and LLP64/Windows-x64 are
-   both (4, LE) for this axis.
-2. **Pointer width + struct packing** — purely local to each edge's build;
-   handled by cryptoki-sys's per-target pregenerated bindings (verified in
-   cryptoki-sys 0.5.0: 13 targets; only `x86_64-pc-windows-msvc` and
-   `generic` are `#[repr(C, packed)]`).
+**6a. Default-interface name validation (spec conformance).**
+`C_GetInterface(NULL, NULL, …)` returns "a default interface of its choice"
+(OASIS general-purpose functions, verified in the vendored spec) — nothing
+restricts it to the standard interface, and a vendor interface's function
+list has no guaranteed layout beyond the leading `CK_VERSION`. The current
+`try_get_interface` makes exactly that unnamed request and discards
+`pInterfaceName`, so a module whose default interface is vendor-defined
+would be table-walked as if it were `CK_FUNCTION_LIST`. New selection order:
 
-Consequences for this crate:
+1. named query for the standard interface (`C_GetInterface(b"PKCS 11", NULL, …)`);
+2. unnamed query, **accepted only if** the returned `pInterfaceName` is
+   exactly `"PKCS 11"` (covers providers that only answer unnamed forms —
+   the BouncyHSM class of quirk);
+3. `C_GetFunctionList`.
 
-- **The `offset_of!` tables describe the compilation target's layout and
-  nothing else.** They cannot be "keyed by ABI" to produce foreign layouts
-  — `offset_of!` is a compile-time construct. An earlier draft of this
-  proposal suggested an ABI-keyed `fields_for(abi)` API; that claim was
-  wrong and is withdrawn. (A computed-layout generalization *is* possible
-  for function lists specifically — every field after the leading
-  `CK_VERSION` is a pointer, so `offset = base(abi) + i × ptr_width(abi)` —
-  but it is real code with real tests, and no consumer needs it: v1 targets
-  x86-64 Linux, and the first post-v1 target, AArch64 Linux, is also LP64.)
-- **The tables are still sound for the discover helper by construction:**
-  discovery dlopens the provider into the helper's own process, so helper
-  ABI == provider ABI whenever dlopen succeeds. A class-mismatched provider
-  (e.g. an i386 `.so` against the x86-64 helper) fails at `dlopen` with an
-  ELF-class error and must be reported as *unsupported* — matching the
-  parent spec's detect-and-refuse rule for 32-bit targets. Cross-machine
-  manifest reuse is gated on ELF build-ID equality, and identical build-ID
-  implies identical binary implies identical ABI, so the manifest schema
-  needs no separate ABI field.
-- **`Abi` ships as a value type, not machinery.** Its v1 job is to make
-  "detected (4, LE), refusing" a first-class reportable state. `host()` is
-  the moved `host_abi.rs` logic (`size_of::<CK_ULONG>()` +
-  `cfg!(target_endian)`). The width *bridge* stays in `types/width.rs` and
-  is not this crate's concern.
+This is a deliberate behavior change (a conformance bug fix). Gate: the
+existing proxy test suite plus a pooled provider-matrix run (SoftHSM2
+baseline at minimum) before merge; a pure unit test covers the name
+comparison itself.
 
-## 7. Migration mechanics in pkcs11-proxy-ng
+**6b. Fallback provenance (unsound flag derivation).**
+`loading.rs` sets `primary_from_interface` from *symbol existence*
+(`resolve_get_interface(&lib).is_some()`) **before** the query runs. If
+`C_GetInterface` exists but its query fails and loading falls back to
+`C_GetFunctionList`, the base-size table is still flagged interface-derived
+— and `primary_interface_fallback` may then reuse it as a 3.0/3.2 list,
+which the existing regression test
+(`primary_fallback_ignores_c_get_function_list_version_3_x`) documents as
+unsound but cannot reach (it passes the flag manually). Fix by deriving the
+flag from the branch that produced the pointer:
 
-Verified blast radius (grep evidence as of submodule `HEAD` at the time of
-writing):
+```rust
+let (func_list, primary_from_interface) = match Self::try_get_interface(&lib) {
+    Ok(fl) => (fl, true),
+    Err(_) => (Self::try_get_function_list(&lib)?, false),
+};
+```
 
-- Every private fn in `loading.rs` (`try_get_interface`,
-  `resolve_get_interface`, `try_get_versioned_interface`,
-  `primary_interface_fallback`, `get_interface_with_name`,
-  `try_get_function_list`) has **zero call sites outside the file** and is
-  already `self`-free (all take `&Library` or raw pointers). Only
-  `load_with_init_args` constructs `FfiBackend`.
-- `FfiBackend::load_with_init_args` external callers: `server/src/main.rs`,
-  `server/tests/support/daemon.rs`. Signatures unchanged — it becomes a thin
-  wrapper that calls `module::open()` and destructures `LoadedModule` into
-  the existing fields. The ~217 `self.func_list*` references across the 12
-  FFI op files are **untouched**.
-- `detect_null_functions` users: `ffi/interface_caps.rs` only (import path
-  change).
-- `host_abi` users: `backend/src/traits.rs`, two call sites. Its module doc
-  comment ("the only crate that links cryptoki-sys as a normal dependency")
-  is stale — backend, server, and shim all do — and gets fixed in the move.
+Correct by construction; the existing test continues to cover the
+downstream gating.
 
-Same-commit checklist (proxy-ng contributor rules require refactors to land
-whole, with scans updated):
+## 7. ABI analysis
 
-1. Workspace `Cargo.toml` `members` += `crates/module`.
-2. `scripts/oasis-coverage-inventory.py` — the function-field-table path
-   (currently `crates/backend/src/ffi/function_field_tables.rs`) moves; the
-   script and its generated evidence strings must follow.
-3. `crates/server/tests/local_quality_gate_test.rs` — the XOF ABI-decision
-   evidence assertion cites the same path; update in lockstep with (2).
-4. `AGENTS.md` §13 architecture quick reference + `doc/architecture-overview.md`
-   gain the new crate row (contributor rule: architectural changes ship with
-   doc updates in the same change).
-5. The BouncyHSM 3.0-fallback regression test moves with the code it tests
-   (or stays in backend against the wrapper — implementer's choice; it must
-   keep passing either way, env-gated as today).
-6. New: an `interface_list()` test, env-gated on a 3.x module being present
-   (SoftHSM2 2.6 is 2.40-only; kryoptic or BouncyHSM are suitable), plus a
-   pure-Rust test that the two-call pattern handles count-only responses.
-7. New crate inherits workspace lints/edition 2024/MSRV 1.88, is
-   `publish = false`, and is added to the standalone-build verification
-   (the submodule must keep passing `cargo fmt/check/test` from a fresh
-   clone).
+ADR-0011 decomposes every C edge into two orthogonal axes: (1) `CK_ULONG`
+width + byte order — the only properties that cross a boundary; (2) pointer
+width + struct packing — purely local, handled by cryptoki-sys's per-target
+pregenerated bindings (verified in 0.5.0: 13 targets; only
+`x86_64-pc-windows-msvc` and `generic` are `#[repr(C, packed)]`).
 
-Commit order per the umbrella workspace rules: commit in the
-`pkcs11-proxy-ng` submodule first, then bump the submodule pointer.
+Consequences:
 
-## 8. How `p11scope-discover` consumes it (context, not part of this change)
+- **The `offset_of!` tables describe the compilation target only.** They
+  cannot be keyed by a foreign ABI (an earlier draft suggested that; the
+  claim was wrong and is withdrawn). This is sound for the discover helper
+  *by construction*: discovery dlopens the provider into the helper's own
+  process, so helper ABI == provider ABI whenever dlopen succeeds. A
+  class-mismatched provider fails at `dlopen` and is reported as
+  unsupported — matching the parent spec's detect-and-refuse rule. No
+  `Abi` value type is introduced for this; the dlopen failure is the
+  refusal.
+- **Manifest reuse needs no ABI field**: it is gated on ELF build-ID
+  equality, and identical build-ID ⇒ identical binary ⇒ identical ABI.
+- **Unaligned reads** (§3) are the one packed-target correctness item in
+  the moved code; fixed in the move.
+
+## 8. Migration mechanics in pkcs11-proxy-ng
+
+Verified blast radius:
+
+- `try_get_function_list`: no callers outside `loading.rs`; its body moves
+  to the crate, `loading.rs` calls `pkcs11_module::function_list()`.
+- Field tables / `detect_null_functions`: only consumer is
+  `ffi/interface_caps.rs` (import-path change).
+- `FfiBackend::load_with_init_args` external callers (`server/src/main.rs`,
+  `server/tests/support/daemon.rs`): signature unchanged. The ~217
+  `self.func_list*` references across the 12 FFI op files: untouched.
+- `host_abi.rs`: does not move; its stale module comment ("the only crate
+  that links cryptoki-sys as a normal dependency" — backend, server, and
+  shim all do) is corrected in place.
+
+Same-commit checklist (proxy contributor rules: refactors land whole, scans
+updated):
+
+1. Workspace `Cargo.toml` `members` += `crates/module`; crate inherits
+   edition 2024 / MSRV 1.88 / lints; `publish = false`.
+2. `scripts/oasis-coverage-inventory.py` — function-field-table path
+   follows the move.
+3. `crates/server/tests/local_quality_gate_test.rs` — XOF ABI-decision
+   evidence path updated in lockstep with (2).
+4. `AGENTS.md` §13 + `doc/architecture-overview.md` gain the new crate row.
+   **Pre-existing condition:** the proxy tree currently carries an
+   uncommitted, unrelated refresh of `doc/architecture-overview.md`; it
+   must be committed or dropped before this change touches the same file.
+5. §6a + §6b fixes with their tests (unit-level name comparison;
+   existing BouncyHSM + fallback-gating regression tests stay in backend
+   and keep passing; provider-matrix gate for §6a).
+6. `interface_list()` deterministic test matrix (§5) + an env-gated
+   real-provider test against a 3.x module (SoftHSM2 2.6 is 2.40-only;
+   kryoptic or BouncyHSM are suitable).
+7. Standalone-build verification: the submodule keeps passing
+   `cargo fmt/check/test` from a fresh clone, now including the new crate.
+
+Commit order per umbrella rules: submodule first, then pointer bump.
+
+## 9. How `p11scope-discover` consumes it (context, not part of this change)
 
 ```toml
 # pkcs11-scope/Cargo.toml (Phase 1, later change)
@@ -267,36 +285,61 @@ pkcs11-module         = { git = "https://github.com/mingulov/pkcs11-proxy-ng", r
 pkcs11-proxy-ng-types = { git = "https://github.com/mingulov/pkcs11-proxy-ng", rev = "<pinned>" }
 ```
 
-Helper flow: `Library::new(path)` → `interface_list()` (3.x) and/or
-`C_GetFunctionList` (2.40) → `read_fn_pointers()` per table →
-`dladdr`/`dl_iterate_phdr` mapping to file offsets (scope-side) → manifest
-JSON with build-ID (scope-side). Per-interface aliasing is *recorded*, never
-resolved. The helper is built as glibc and musl **dynamic** binaries; the
-crate must not assume glibc (libloading/dlopen is fine on musl-dynamic).
+Helper flow — **both surfaces, always, regardless of module generation**
+(review finding: a third-party app may call through the legacy 2.40 table a
+3.x provider also exports, and its pointers are not guaranteed identical to
+any listed interface; collecting only interfaces can yield zero capture
+reported as complete):
 
-## 9. Open questions for review
+1. `Library::new(path)`;
+2. `function_list()` → the legacy table (present on virtually every module);
+3. `interface_list()` → every reported interface, standard or not;
+4. table-walk (`read_fn_pointers`) **only** surfaces that are the legacy
+   table or `is_standard()` interfaces; vendor interfaces are recorded in
+   the manifest as *present-but-undecoded* evidence, never walked;
+5. pointer→file-offset mapping via `dladdr`/`dl_iterate_phdr` (scope-side);
+6. manifest records each probe target's **provenance** (legacy table vs
+   named interface + version) and cross-surface pointer aliasing as
+   observed — the union is probed; aliases are reported as ambiguity, never
+   resolved to one name.
 
-1. **Crate name.** Is `pkcs11-module` acceptable, and is it free on
-   crates.io? (Availability not yet checked — must be verified before the
-   first commit that hardcodes the name. Alternative: `pkcs11-module-ffi`.)
-2. **`interface_list()` error granularity.** Flat `Result<Vec<_>, String>`
-   (matching `open()`'s current style) vs a small error enum. The proxy
-   uses `String` errors throughout the loading path; the observer will want
-   to record failures as evidence. Default: keep `String` for symmetry,
-   revisit when the manifest schema lands.
-3. **Where the BouncyHSM fallback test lives** (moved vs wrapper-level in
-   backend). Cosmetic; see §7 item 5.
+The helper builds as glibc and musl **dynamic** binaries; the crate must not
+assume glibc (libloading/dlopen is fine on musl-dynamic).
 
-## 10. Risks
+## 10. Alternative evaluated: `cryptoki_sys::Pkcs11` (bindgen dynamic loader)
 
-- **FFI move regression.** Mitigated by moving `loading.rs` verbatim (no
-  logic edits), keeping `FfiBackend`'s public API identical, and the
-  existing proxy test suite + BouncyHSM regression test.
-- **Silent quality-gate drift** if the inventory script and gate test paths
-  are not updated atomically — mitigated by the same-commit checklist and
-  the gate test itself failing loudly on the stale path.
-- **Name churn** if `pkcs11-module` proves unavailable — bounded by
-  checking before the first commit (§9.1).
-- **Scope creep** toward the `types` split / shared repo — explicitly
-  deferred in §5; reviewers should push back on any implementation PR that
-  drags those in.
+cryptoki-sys ships a generated `Pkcs11` struct (`Pkcs11::new(path)`) that
+dlsym-loads every `C_*` symbol for symbol-based dispatch. Rejected:
+
+- Symbol-based dispatch is exactly the surface **stripped providers do not
+  export** — the tool's core premise (and the proxy's) is table-based
+  discovery via the three bootstrap entry points;
+- `from_library` consumes the `Library`, which the helper still needs for
+  pointer→offset mapping, and attempts ~200 dlsym calls that are pure noise
+  against a stripped module;
+- The only thing it would replace is the ~10-line bootstrap dlsym that
+  `function_list()` already is; it provides neither table walking nor the
+  hardened `C_GetInterfaceList` enumeration.
+
+## 11. Resolved questions (from revision 1 review)
+
+1. **Crate name** — `pkcs11-module`; confirmed unregistered at review time;
+   availability non-blocking for a git dep.
+2. **Error granularity** — `String` for v1.
+3. **BouncyHSM test placement** — stays in `backend`, where the fallback
+   policy now stays.
+
+## 12. Risks
+
+- **§6a is a behavior change** in provider selection, mitigated by the
+  named→validated-unnamed→legacy order (strictly widens conformance, keeps
+  quirk tolerance) and gated on the provider-matrix run.
+- **Silent quality-gate drift** if inventory script and gate test paths are
+  not updated atomically — mitigated by the same-commit checklist and the
+  gate test failing loudly.
+- **Scope creep** toward moving policy, a `types` split, or a shared repo —
+  all explicitly out; reviewers should push back on any implementation PR
+  that drags them in.
+- **The uncommitted `doc/architecture-overview.md` refresh** in the proxy
+  tree must land or be dropped first (§8 item 4) or the extraction commit
+  will entangle unrelated content.

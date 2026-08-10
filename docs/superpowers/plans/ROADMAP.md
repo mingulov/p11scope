@@ -20,16 +20,20 @@ SoftHSM2 has `p_offset == p_vaddr`).
 ## Phase 1 — Shared core (proxy-ng) + discovery helper + attach engine + `metrics` mode
 
 - **In `pkcs11-proxy-ng` (cross-repo precursor):** extract the module-FFI
-  from `crates/backend` (loading, `CK_FUNCTION_LIST`/`_3_0`/`_3_2`
-  field-offset tables, host-ABI introspection) into a lean crate depending
-  only on libloading + cryptoki-sys (interface-caps reporting stays in
-  backend — it is proxy wire shape); backend consumes it, behavior unchanged.
-  This is the "improve proxy-ng instead of duplicating" decision.
-  The crate must expose **two distinct surfaces**: the proxy's `open()`
-  (with its version-fallback policy, moved verbatim) and a raw
-  `C_GetInterfaceList` enumeration primitive (new code). The discover helper
-  uses ONLY the raw enumeration: fallback-resolved 3.x lists may alias the
-  primary table by design and would fabricate false aliasing evidence.
+  **facts** from `crates/backend` into a lean crate (`pkcs11-module`,
+  libloading + cryptoki-sys only): raw `function_list()` +
+  `interface_list()` primitives, the `CK_FUNCTION_LIST`/`_3_0`/`_3_2`
+  field-offset tables, and an unaligned-safe pointer reader. Interface
+  selection **policy** (version fallback, quirk handling), host-ABI
+  introspection, and interface-caps reporting all stay in backend — the
+  discover helper must see only the module's own answers, never
+  fallback-resolved lists (those may alias the primary table by design and
+  would fabricate false aliasing evidence). The helper always collects
+  **both** the legacy 2.40 table and the interface enumeration, and walks
+  standard-named (`"PKCS 11"`) surfaces only; vendor interfaces are recorded
+  as present-but-undecoded evidence. Two latent proxy bugs land with the
+  extraction (default-interface name validation; fallback provenance). See
+  [the extraction design](../specs/2026-08-10-module-crate-extraction-design.md).
 - `p11scope-discover`: Rust bin on that crate + `pkcs11-proxy-ng-types`;
   2.x `C_GetFunctionList` **and** 3.x `C_GetInterfaceList`/`C_GetInterface`,
   ELF build-ID in the manifest, JSON output. Shipped as glibc **and** musl

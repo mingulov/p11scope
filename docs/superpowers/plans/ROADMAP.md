@@ -15,20 +15,27 @@ exact capture, on host and across Docker namespaces, incl. shared-inode.
 **Gate G0 (go/no-go):** all six checks in `docs/notes/spike-findings.md` PASS;
 any FAIL amends the design spec before Phase 1 planning starts.
 
-## Phase 1 — Discovery helper + attach engine + `metrics` mode
+## Phase 1 — Shared core (proxy-ng) + discovery helper + attach engine + `metrics` mode
 
-- `p11scope-discover`: product-quality helper in C, musl-static build
-  (runs in glibc *and* Alpine containers), PKCS#11 2.x `C_GetFunctionList`
-  **and** 3.x `C_GetInterfaceList`/`C_GetInterface`, ELF build-ID in the
-  manifest, JSON output.
-- `p11scope`: Go + cilium/ebpf; attach uprobe+uretprobe per manifest entry
+- **In `pkcs11-proxy-ng` (cross-repo precursor):** extract the module-FFI
+  from `crates/backend` (loading, `CK_FUNCTION_LIST`/`_3_0`/`_3_2`
+  field-offset tables, interface caps) into a lean crate depending only on
+  libloading + cryptoki-sys + types; backend consumes it, behavior unchanged.
+  This is the "improve proxy-ng instead of duplicating" decision.
+- `p11scope-discover`: Rust bin on that crate + `pkcs11-proxy-ng-types`;
+  2.x `C_GetFunctionList` **and** 3.x `C_GetInterfaceList`/`C_GetInterface`,
+  ELF build-ID in the manifest, JSON output. Shipped as glibc **and** musl
+  *dynamic* builds — a fully static binary cannot dlopen.
+- `p11scope`: Rust + aya; attach uprobe+uretprobe per manifest entry
   (offset-based), PID/cgroup filter maps, aggregate counts/latency/CK_RV in
-  BPF maps, `metrics` mode live summary.
+  BPF maps, `metrics` mode live summary. Fully static musl build (the
+  observer never dlopens providers).
 
-**Gate G1 (engineering review):** /code-review on the branch; manifest reuse
-refused on build-ID mismatch (tested); helper verified in ubuntu + alpine
-containers; attach failures and aliased offsets surface in output rather than
-being dropped.
+**Gate G1 (engineering review):** /code-review on both repos' branches;
+proxy-ng test suite green after the extraction; manifest reuse refused on
+build-ID mismatch (tested); helper verified in ubuntu (glibc) and alpine
+(musl) containers; attach failures and aliased offsets surface in output
+rather than being dropped.
 
 ## Phase 2 — Semantic state machine + `profile` mode + schema
 
@@ -51,6 +58,8 @@ silently complete.
   hash/MGF/saltLen, GCM length metadata), login user type (never PIN),
   search/template attribute *types* + selected safe policy values,
   wrap/unwrap/derive. Decoding and dropping happen in BPF, before userspace.
+  Which mechanisms have decodable params is driven by proxy-ng's TOML
+  mechanism registry (shared param shapes + vendor overrides), not hardcoded.
 - Secret-canary suite: sentinel PINs, key material, labels, plaintext,
   mechanism blobs planted by the workload; assert no sentinel appears in any
   event, map dump, log, or output file.

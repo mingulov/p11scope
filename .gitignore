@@ -1,6 +1,6 @@
+/target/
 /dist/
-/p11scope
-/p11scope-discover
 *.o
 *.bpf.o
 vmlinux.h
+spike/work/

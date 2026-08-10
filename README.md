@@ -58,7 +58,10 @@ comes after v1.
 | pkcs11-proxy-ng | Controlled interposition, transport, fault injection |
 | pkcs11-lab | Combines profiles and test results into migration assessments |
 
-Integration boundary: the versioned `observed-profile.json` schema.
+Integration boundary: the versioned `observed-profile.json` schema. The
+userspace side is Rust and reuses pkcs11-proxy-ng's PKCS#11 core (official
+name tables, mechanism registry, module-loading FFI) rather than duplicating
+it; the eBPF observer itself is new code.
 
 ## License
 

@@ -4,7 +4,7 @@
 
 **Goal:** Prove the decisive experiment from the design spec: an isolated helper obtains a (stripped) provider's function table, maps the pointers to stable file offsets, probes attach *before* the workload runs, and every controlled-harness call is captured with no module substitution — on the host and across a Docker mount-namespace boundary, including the shared-image-layer (inode) property.
 
-**Architecture:** Three throwaway spike-grade artifacts in `spike/`: a C discovery helper (dlopen + `C_GetFunctionList` + `/proc/self/maps` → offset manifest), a deterministic C workload harness with exact known call counts, and shell glue that turns the manifest into a generated **bpftrace** program. No Go/cilium-ebpf yet — bpftrace is already installed and is the laziest way to test the *attachment semantics*, which is the actual risk. The product toolchain comes in Phase 1.
+**Architecture:** Three throwaway spike-grade artifacts in `spike/`: a C discovery helper (dlopen + `C_GetFunctionList` + `/proc/self/maps` → offset manifest), a deterministic C workload harness with exact known call counts, and shell glue that turns the manifest into a generated **bpftrace** program. No product Rust/aya code yet — bpftrace is already installed and is the laziest way to test the *attachment semantics*, which is the actual risk. The product toolchain (Rust + aya + shared proxy-ng crates) comes in Phase 1; the spike is deliberately language-agnostic.
 
 **Tech Stack:** C (clang), bpftrace ≥ 0.20, SoftHSM2 2.6, Docker (ubuntu:24.04 image), `strip`/`nm`/`readelf`.
 

@@ -27,8 +27,9 @@ require elevated privileges, and are visible to host administrators.
 | Repo / product name | `pkcs11-scope` | Chosen by owner; "p11scope" reads like "periscope" — apt for a passive observer |
 | Binary names | `p11scope` (observer), `p11scope-discover` (helper) | Short CLI name; helper is a separately copyable artifact (see Architecture) |
 | Primary target | **External third-party applications** | The product exists for apps we do not control. `pkcs11-check` (developed locally) is the dev-time workload generator and ground-truth oracle, not the product focus |
-| Observer language | Go (1.26) + `cilium/ebpf`, CO-RE BPF C compiled with clang | Static no-cgo binary for container/DaemonSet deployment; most-trodden path for this tool shape (ecapture, Parca precedent). Alternative considered: Rust + aya — safety edge is small because hostile-input parsing happens in verifier-checked BPF, and Go iteration is faster |
-| Discovery helper language | Small static C binary (musl) | Must be copyable into arbitrary target containers (`docker exec` / `kubectl exec`) and dlopen the provider in the target's own filesystem/dependency view. Emits manifest JSON on stdout; no eBPF, no privileges |
+| Observer language | Rust + `aya` (BPF side: aya-ebpf or clang-built C; `libbpf-rs` as fallback if aya hits a wall) | The family already has a large Rust PKCS#11 core in `pkcs11-proxy-ng` (official mechanism/CKR/attribute name tables, TOML mechanism registry, 2.x/3.x FFI). The observer never dlopens providers, so it can still be a fully static musl binary. Go rejected: a third language in the family, and it would rebuild tables that already exist (miekg/pkcs11 is 2.x-era — no 3.x interfaces, no vendor registry) |
+| Shared decode core | **Improve `pkcs11-proxy-ng`**, don't duplicate: extract its module-FFI (loading + `CK_FUNCTION_LIST`/`_3_0`/`_3_2` field-offset tables + interface caps) from `crates/backend` into a lean crate; pkcs11-scope consumes it and `pkcs11-proxy-ng-types` via git deps | Verified: `types` is dependency-lean (serde/toml/tracing/zeroize); the FFI code exists but is entangled with `proto` (tonic) via `backend` — extraction is a genuine proxy-ng improvement (thinner backend, independently testable loading). The proto/convert marshalling layer stays proxy-only (tonic-coupled); the observer's raw-bytes decoding is new but driven by the same mechanism registry. A standalone shared repo is deferred until publishing pressure exists |
+| Discovery helper | Rust bin on the shared crates; shipped as glibc **and** musl *dynamic* builds | dlopen is impossible from a fully static binary (glibc and musl both), so the helper ships per-libc builds, copyable into target containers (`docker exec` / `kubectl exec`); manifests stay reusable across machines via ELF build-ID. Emits manifest JSON on stdout; no eBPF, no privileges |
 | License | Dual MIT / Apache-2.0 | Matches `pkcs11-check` |
 | Module path | `github.com/mingulov/pkcs11-scope` | Matches sibling repos |
 | Platform floor | Linux x86-64, kernel ≥ 5.15 | ringbuf needs 5.8+; 5.15 = oldest mainstream LTS in target fleets. AArch64 next, no 32-bit |
@@ -96,12 +97,13 @@ truth. Everything else in this design is conventional engineering.
 ## Architecture
 
 ```
-p11scope-discover (static C, unprivileged, short-lived)
-    dlopen(provider.so) → C_GetFunctionList / C_GetInterfaceList (3.x)
+p11scope-discover (Rust, unprivileged, short-lived; glibc + musl builds)
+    dlopen(provider.so) via shared proxy-ng module-FFI crate
+    C_GetFunctionList / C_GetInterfaceList (3.x)
     map each pointer → containing mapping → ELF file offset
     → probe manifest JSON (stdout): {api, object path, offset, build-id, interface, version}
 
-p11scope (Go, static, privileged)
+p11scope (Rust + aya, fully static musl, privileged)
     discover   — runs/execs the helper (locally, or inside the target container)
     profile    — attach uprobes+uretprobes from manifest, aggregate in BPF maps
     trace      — per-event capture via ring buffer, time-bounded
@@ -110,8 +112,10 @@ p11scope (Go, static, privileged)
 
 Data flow: manifest → attach (entry+return probes per discovered function,
 scoped by PID/cgroup filter map) → BPF programs update aggregate maps
-(profile) or reserve ring-buffer events (trace) → Go userspace decodes its own
-fixed-layout structs, maintains the semantic state machine, writes outputs.
+(profile) or reserve ring-buffer events (trace) → Rust userspace decodes its
+own fixed-layout structs, maintains the semantic state machine, writes
+outputs. Mechanism/CKR/attribute naming and the param-shape allowlist come
+from the shared proxy-ng registry, so scope and proxy speak one dialect.
 
 - Helper runs vendor code (dlopen constructors) — that is why it is a
   separate unprivileged short-lived process, and why a previously generated

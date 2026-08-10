@@ -35,8 +35,10 @@ SoftHSM2 has `p_offset == p_vaddr`).
   extraction (default-interface name validation; fallback provenance). See
   [the extraction design](../specs/2026-08-10-module-crate-extraction-design.md).
 - `p11scope-discover`: Rust bin on that crate + `pkcs11-proxy-ng-types`;
-  2.x `C_GetFunctionList` **and** 3.x `C_GetInterfaceList`/`C_GetInterface`,
-  ELF build-ID in the manifest, JSON output. Shipped as glibc **and** musl
+  2.x `C_GetFunctionList` **and** 3.x `C_GetInterfaceList` (never
+  `C_GetInterface` — interface *selection* is proxy policy; the helper
+  records what the module reports), ELF build-ID in the manifest, JSON
+  output. Shipped as glibc **and** musl
   *dynamic* builds — a fully static binary cannot dlopen.
 - `p11scope`: Rust + aya; attach uprobe+uretprobe per manifest entry
   (offset-based), PID/cgroup filter maps, aggregate counts/latency/CK_RV in

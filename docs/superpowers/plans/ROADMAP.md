@@ -32,7 +32,8 @@ SoftHSM2 has `p_offset == p_vaddr`).
   **both** the legacy 2.40 table and the interface enumeration, and walks
   standard-named (`"PKCS 11"`) surfaces only; vendor interfaces are recorded
   as present-but-undecoded evidence. Two latent proxy bugs land with the
-  extraction (default-interface name validation; fallback provenance). See
+  extraction (name validation of every unnamed `C_GetInterface` result,
+  primary and versioned; fallback provenance). See
   [the extraction design](../specs/2026-08-10-module-crate-extraction-design.md).
 - `p11scope-discover`: Rust bin on that crate + `pkcs11-proxy-ng-types`;
   2.x `C_GetFunctionList` **and** 3.x `C_GetInterfaceList` (never

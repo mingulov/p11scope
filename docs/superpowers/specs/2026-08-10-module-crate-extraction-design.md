@@ -1,9 +1,9 @@
 # Shared PKCS#11 module-loading crate — extraction design
 
 **Date:** 2026-08-10
-**Status:** Proposed — revision 3, incorporating external review rounds 1–2
-(round 2 verdict: changes required; all four findings accepted). No code has
-been written.
+**Status:** Proposed — revision 4, incorporating external review rounds 1–3
+(round 3: one P1 safety correction — 2.x layout acceptance — plus seam
+reachability and evidence-purity fixes). No code has been written.
 **Scope of this doc:** the Phase 1 *cross-repo precursor* from the
 [ROADMAP](../plans/ROADMAP.md): extracting the reusable module-FFI *facts*
 (dlopen bootstrap + table enumeration + field-offset tables + layout
@@ -88,11 +88,13 @@ impl RawInterface {
 /// symbol probe.
 pub fn interface_list(lib: &Library) -> Result<Option<Vec<RawInterface>>, String>;
 
-// Deterministic-test seam: the public fn resolves the symbol and delegates
-// to the pure driver, which is what the unit tests exercise.
+// Deterministic-test seam at the RESOLVER level: `None` models an absent
+// C_GetInterfaceList export, so Ok(None) is reachable in pure unit tests
+// (review round 3, finding 2). The public fn resolves the symbol and
+// delegates.
 fn interface_list_impl(
-    get_list: impl FnMut(*mut CK_INTERFACE, *mut CK_ULONG) -> CK_RV,
-) -> Result<Vec<RawInterface>, String>;
+    get_list: Option<impl FnMut(*mut CK_INTERFACE, *mut CK_ULONG) -> CK_RV>,
+) -> Result<Option<Vec<RawInterface>>, String>;
 
 /// (field name, byte offset) tables for the three function-list structs.
 /// offset_of!-derived: valid for the COMPILATION TARGET's ABI only (§8).
@@ -199,8 +201,9 @@ real-provider test alone is insufficient:
 5. **Absent symbol vs zero interfaces are distinct facts:** `Ok(None)` vs
    `Ok(Some(vec![]))` (§3).
 
-Deterministic test matrix (pure Rust, no provider): symbol absent (`None`);
-zero interfaces (`Some(empty)`); count growth converging on attempt 2;
+Deterministic test matrix (pure Rust, no provider): symbol absent (seam
+`None` → `Ok(None)`); zero interfaces (`Some(empty)`); count growth
+converging on attempt 2;
 count growth never converging (error after 3); absurd count (cap → error);
 `CKR_OK` with count > capacity (error); NULL name; NULL function list;
 vendor-named interface passes through with `is_standard() == false`.
@@ -276,17 +279,19 @@ and validated version**, never to what a table's own bytes claim. Pinned:
 | Surface (provenance) | Reported version | Tables walked |
 |---|---|---|
 | `C_GetFunctionList` (legacy) | *any* — including a 3.x or malformed claim | base `FUNCTION_LIST_FIELDS` **only** (a legacy pointer is only known to be base-size; same principle as the existing proxy regression test) |
-| Standard interface (`is_standard()`) | 2.x | base |
+| Standard interface (`is_standard()`) | 2.40 exactly | base — the only 2.x layout OASIS defines for this structure (the spec mandates version 0x02/0x28, "a version 2.40 compatible structure") |
+| Standard interface | other 2.x | **refuse** — an older 2.x table is not guaranteed to contain the complete 2.40 tail; recorded as unknown-2.x-layout evidence |
 | Standard interface | 3.0 / 3.1 | base + 3.0 extras |
 | Standard interface | 3.2 | base + 3.0 + 3.2 extras |
-| Standard interface | 3.minor > 2 | base + 3.0 + 3.2 as **known prefix**; the surface is recorded as beyond-known-layout evidence |
+| Standard interface | 3.minor > 2 | base + 3.0 + 3.2 **walked as known prefix**; only the fields beyond the known 3.2 layout are unwalked, recorded as excess evidence |
 | Standard interface | major ∉ {2, 3} | **refuse** — recorded as unknown-version evidence, nothing walked |
 | Vendor interface (`!is_standard()`) | any | **refuse** — present-but-undecoded evidence |
 | NULL `func_list` | — | nothing (already unreachable via `tables_for`) |
 
 `tables_for()` (§3) is the single implementation of this table, in the
 shared crate, exhaustively unit-tested (every row plus boundary versions
-2.40/3.0/3.1/3.2/3.3/4.0). Both consumers go through it: the discover
+2.30/2.40/3.0/3.1/3.2/3.3/4.0 — in particular 2.30 → refuse, 2.40 → base).
+Both consumers go through it: the discover
 helper for every walked surface; `backend`'s `detect_interface_capabilities`
 conforms today by construction (its 3.x lists come from validated versioned
 queries after §6a) and adopts `tables_for()` in the move so the invariant
@@ -373,12 +378,15 @@ interface):
 
 1. `Library::new(path)`;
 2. `function_list()` → the legacy table;
-3. `interface_list()` → `None` (no export — recorded as a 2.40-only module
-   fact) or every reported interface, standard or not;
+3. `interface_list()` → `None` is recorded verbatim as "`C_GetInterfaceList`
+   not exported" — the only proven fact; no inference about module
+   generation (a nonconforming 3.x provider could also omit it). `Some` →
+   every reported interface, standard or not;
 4. for each surface, `tables_for(surface)` decides what is walked
    (`read_fn_pointers`) — legacy → base only; standard interfaces → per
-   validated version; vendor / unknown-major / beyond-known-prefix →
-   recorded evidence, not walked (§7);
+   validated version (a 3.minor > 2 surface has its known prefix walked,
+   only the excess recorded as unwalked); vendor / unknown-major /
+   non-2.40 2.x → recorded evidence, not walked (§7);
 5. pointer→file-offset mapping via `dladdr`/`dl_iterate_phdr` (scope-side);
 6. manifest records each probe target's **provenance** (legacy table vs
    named interface + version) and cross-surface pointer aliasing as
@@ -427,9 +435,8 @@ own repository only when one of these becomes real:
 
 1. **crates.io publishing** of any consumer that depends on it (git deps
    cannot be published);
-2. **scope-driven churn**: changes to `pkcs11-module` needed by scope start
-   requiring frequent proxy-side commits/reviews that the proxy does not
-   otherwise want (as a gauge: more than ~quarterly);
+2. **scope-driven churn**: repeated scope-only changes causing unwanted
+   proxy commits;
 3. **a consumer outside the two products** appears (`pkcs11-lab` is Python
    and consumes JSON, so it does not count).
 

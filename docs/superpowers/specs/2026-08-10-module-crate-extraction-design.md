@@ -348,10 +348,9 @@ updated):
 3. `crates/server/tests/local_quality_gate_test.rs` — XOF ABI-decision
    evidence path updated in lockstep with (2).
 4. `AGENTS.md` §13 + `doc/architecture-overview.md` gain the new crate row.
-   **Precondition:** the proxy tree's pre-existing uncommitted
-   `doc/architecture-overview.md` refresh is **committed separately first**
-   (review round 2 verified its content against the dev tree: legitimate
-   stale-doc cleanup, the proxy's only dirty file — commit, don't drop).
+   (The unrelated overview refresh that previously sat uncommitted in the
+   proxy tree landed separately as submodule commit `866b307`, umbrella
+   pointer `12a08e8`; the proxy tree is clean.)
 5. §6a + §6b fixes with the deterministic selection tests (§6) and the
    provider-matrix gate for §6a.
 6. `interface_list()` deterministic test matrix (§5) + `tables_for()`
@@ -454,6 +453,3 @@ for consumers, with no `use`-path churn.
 - **Scope creep** toward moving policy, a `types` split, or a shared repo —
   all explicitly out; reviewers should push back on any implementation PR
   that drags them in.
-- **The uncommitted `doc/architecture-overview.md` refresh** must be
-  committed separately before the extraction touches the same file (§9
-  item 4; content verified legitimate by review round 2).

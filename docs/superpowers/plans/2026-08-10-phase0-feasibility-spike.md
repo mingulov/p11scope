@@ -8,6 +8,14 @@
 
 **Tech Stack:** C (clang), bpftrace ≥ 0.20, SoftHSM2 2.6, Docker (ubuntu:24.04 image), `strip`/`nm`/`readelf`.
 
+> **Pre-verified (2026-08-10, this host):** the embedded `discover.c` and
+> `harness.c` were compiled and run before this plan was finalized —
+> `discover` resolves 68/68 SoftHSM2 entries (0 UNRESOLVED), offsets match
+> `nm -D` for all sampled symbols, the fully-stripped copy also resolves
+> 68/68, `harness` prints `harness OK`, `check.sh` passes its good/bad
+> synthetic cases, and `gen-bt.sh` output parses as bpftrace. Only the
+> root-only capture steps (Tasks 3–4 bpftrace/Docker runs) remain unrun.
+
 ## Global Constraints
 
 - Everything in this plan lives under `spike/` (plus one findings doc in `docs/notes/`); it is evidence, not product code — committed, but never imported by product code.
@@ -89,9 +97,13 @@ int main(int argc, char **argv)
     unsigned long rv = gfl(&list);
     if (rv != 0 || !list) { fprintf(stderr, "C_GetFunctionList rv=0x%lx\n", rv); return 1; }
 
-    /* CK_FUNCTION_LIST = CK_VERSION {2 x CK_BYTE}, padded to pointer
-     * alignment, then 68 function pointers. On LP64 the pointers start at
-     * offset 8 (Linux pkcs11.h uses no struct packing). */
+    /* CK_FUNCTION_LIST = CK_VERSION {2 x CK_BYTE} then 68 function pointers.
+     * +8 is an EMPIRICAL property of SoftHSM2 (naturally-aligned table: 2 bytes
+     * version + 6 padding, first pointer at 8), NOT universal — the canonical
+     * pkcs11.h uses #pragma pack(cryptoki,1); a genuinely packed table puts the
+     * first pointer at offset 2. Fine for this spike (SoftHSM2 only); the
+     * product MUST derive the offset from proxy-ng's offset_of! field tables,
+     * never hardcode 8. */
     void **fns = (void **)((char *)list + 8);
 
     struct map maps[4096];
@@ -317,9 +329,11 @@ git commit -m "spike: deterministic PKCS#11 workload harness with known call cou
 ```bash
 #!/bin/sh
 # gen-bt.sh <manifest> [path-prefix]  — emit a bpftrace program on stdout.
-# Uses the vaddr column ($4): bpftrace's numeric-address probe form expects a
-# virtual address within the object, not a raw file offset (see fallback note
-# in the plan if counts come back zero). path-prefix is for /proc/<pid>/root.
+# Uses column $4. For SoftHSM2 the file-offset ($3) and vaddr ($4) columns are
+# numerically EQUAL (its executable LOAD segment has p_offset == p_vaddr), so
+# the spike cannot tell which one bpftrace's `uprobe:binary:NUMBER` form wants —
+# both attach. That is a known limitation of this spike, not a resolved fact
+# (see the fallback note). path-prefix is for /proc/<pid>/root.
 awk -v prefix="${2:-}" '$2 != "UNRESOLVED" {
     path = prefix $2
     printf "uprobe:%s:%s { @call[\"%s\"] = count(); }\n",    path, $4, $1
@@ -363,10 +377,11 @@ below consults any symbol table; only the manifest's numeric offsets are used.)
 ```bash
 spike/gen-bt.sh spike/work/manifest-stripped.txt > spike/work/spike.bt
 sudo timeout -s INT 60 bpftrace spike/work/spike.bt > spike/work/host-capture.txt &
+BT=$!   # pid of the backgrounded sudo; SIGINT forwards sudo→timeout→bpftrace
 sleep 5   # let all ~136 probes attach
 export SOFTHSM2_CONF=$PWD/spike/work/softhsm2.conf
 spike/work/harness "$PWD/spike/work/libsofthsm2-stripped.so"
-sleep 1; sudo pkill -INT -f 'bpftrace .*spike.bt'; sleep 2   # flush + print maps
+sleep 1; sudo kill -INT "$BT"; sleep 2   # flush + print maps ($BT = bpftrace pid)
 spike/check.sh spike/expected.txt spike/work/host-capture.txt
 grep '@rv\[C_Digest, 0\]' spike/work/host-capture.txt   # expect: count 50 (CKR_OK)
 ```
@@ -378,8 +393,12 @@ uretprobe.
 the address as a file offset rather than a vaddr (or vice versa). Convert and
 retry once — for each function, file offset ↔ vaddr via the containing LOAD
 segment: `readelf -lW <lib>` , `vaddr = p_vaddr + (fileoff - p_offset)`.
-Whichever interpretation works, **record it in the findings doc** — Phase 1's
-cilium/ebpf attach code needs the same decision made explicitly.
+**This spike cannot settle the offset-vs-vaddr question** because SoftHSM2's
+two columns are equal (verified: `p_offset == p_vaddr` for its exec segment);
+whichever interpretation bpftrace uses, counts match. Phase 1 must pin it
+explicitly for **aya** (aya's `UProbe::attach` takes a *file offset*), not
+leave it to bpftrace's convention. To actually exercise the branch, add one
+capture against a non-PIE binary where `p_offset != p_vaddr`.
 
 - [ ] **Step 5: Commit**
 
@@ -399,7 +418,11 @@ git commit -m "spike: offset-attached bpftrace capture matches harness ground tr
 - Consumes: all Task 1–3 artifacts unchanged.
 - Produces: evidence only (capture files under `spike/work/`), consumed by Task 5.
 
-- [ ] **Step 1: Write the image** (same distro as host so host-built binaries run inside)
+- [ ] **Step 1: Write the image** (ubuntu:24.04 so the host-built dynamic
+  `discover`/`harness` run inside — this requires the **host glibc ≤ the
+  container's** (glibc 2.39). If the host is newer, build the two binaries in
+  an ubuntu:24.04 container instead of copying host builds, or the container
+  run fails with `GLIBC_x.y not found`.)
 
 ```dockerfile
 FROM ubuntu:24.04
@@ -427,6 +450,7 @@ spike/gen-bt.sh spike/work/manifest-container.txt "/proc/$PID/root" \
     > spike/work/spike-container.bt
 sudo timeout -s INT 120 bpftrace spike/work/spike-container.bt \
     > spike/work/container-capture.txt &
+BT=$!
 sleep 5
 ```
 
@@ -441,7 +465,7 @@ docker exec spike1 /spike/harness /usr/lib/softhsm/libsofthsm2.so
 ```bash
 docker run -d --rm --name spike2 p11scope-spike
 docker exec spike2 /spike/harness /usr/lib/softhsm/libsofthsm2.so
-sleep 1; sudo pkill -INT -f 'bpftrace .*spike-container.bt'; sleep 2
+sleep 1; sudo kill -INT "$BT"; sleep 2
 docker rm -f spike1 spike2
 ```
 
@@ -454,10 +478,20 @@ spike/check.sh spike/work/expected-double.txt spike/work/container-capture.txt
 
 Expected: `ALL COUNTS MATCH`. spike2's calls landed in probes attached while
 only spike1 existed → overlayfs image-layer inode is shared and future
-containers are observed for free. If this FAILS at exactly 1× the counts,
-the inode-sharing claim is wrong for this storage driver — record it; the
-design's Knative story then needs per-container attach (a design revision,
-not a spike failure).
+containers are observed for free. Interpret the failure modes explicitly:
+
+- **1× the counts** (only spike1 captured): inode sharing does not hold for
+  this storage driver — the design's Knative scale-from-zero story needs
+  per-container attach. Design revision, not a spike failure. Record the
+  `docker info` storage driver.
+- **0× the counts** (nothing captured even from spike1): attach via
+  `/proc/spike1/root/...` bound to an inode the process never maps (overlay
+  merged-mount inode ≠ registration inode) — the whole cross-namespace attach
+  path needs rework before Phase 1. This is the one result that blocks G0.
+- **exactly 2×**: the headline claim holds.
+
+Confirm the driver is `overlay2` first: `docker info --format '{{.Driver}}'`
+(fuse-overlayfs / devicemapper / btrfs / zfs invalidate the inode assumption).
 
 - [ ] **Step 6: Commit**
 
@@ -485,9 +519,11 @@ git commit -m "spike: cross-mount-namespace and shared-image-layer capture verif
 | Host capture == ground truth (stripped, attach-first) | PASS/FAIL |
 | CK_RV via uretprobe (C_Digest → CKR_OK ×50) | PASS/FAIL |
 | Container capture from host, attach-before-run | PASS/FAIL |
-| Second container observed w/o re-attach (2× counts) | PASS/FAIL |
+| Second container observed w/o re-attach (2× / 1× / 0×) | PASS/FAIL |
 
-- bpftrace address interpretation: vaddr / file-offset (which one worked)
+- docker storage driver (`docker info --format '{{.Driver}}'`):
+- offset-vs-vaddr: NOT settled by this spike (SoftHSM2 p_offset==p_vaddr);
+  Phase 1 pins aya (file offset). Note here if a non-PIE control was run.
 - Surprises / deviations:
 - Decision: proceed to Phase 1: YES/NO (+ any design-spec amendments needed)
 ```

@@ -46,11 +46,14 @@ rather than being dropped.
   evidence-quality section: attach failures, aliases, event loss counters,
   capture window, completeness verdict.
 
-**Gate G2 (schema + honesty review):** schema reviewed wearing the
-`pkcs11-lab`-consumer hat (can an assessment actually be built from it?);
-induced-gap test — deliberately alias two entries and drop events (tiny ring
-buffer) and assert the report says PARTIAL with correct numbers, never
-silently complete.
+**Gate G2 (schema + honesty review):** schema reviewed against the explicit
+acceptance list in the design spec's "Profile schema requirements" table —
+i.e. it can drive all five `pkcs11-lab` categories (OBSERVED AND VALIDATED /
+… DIFFERED / … NOT COVERED / TESTED NOT OBSERVED / UNKNOWN), including raw
+vendor mechanism IDs preserved verbatim and capture-window metadata for
+UNKNOWN. Induced-gap test — deliberately alias two entries, leave a call
+in-flight, and drop events (tiny ring buffer); assert the report says PARTIAL
+with correct numbers for each, never silently complete.
 
 ## Phase 3 — Allowlist semantic decoding + privacy enforcement
 
@@ -75,14 +78,19 @@ pointers/lengths).
   containers sharing an image layer → kind pod → Knative service in kind
   including a scale-from-zero cycle.
 - `pkcs11-check` (local sibling; Python) run as workload generator against
-  SoftHSM2 with p11scope attached; diff its own call log (ground truth)
-  against the captured profile — automated completeness assertion and the
-  main day-to-day debugging rig.
+  SoftHSM2 with p11scope attached. Oracle artifact is its `--rv-trace` output
+  in `report.jsonl` plus per-test `call_log` counts. Design the diff around two
+  known caveats: rv-trace resets per test *after* fixture bootstrap + login (so
+  bootstrap calls are in p11scope but not the oracle), and `--isolation file`
+  spawns many subprocesses. Diff direction: **oracle ⊆ capture** (every logged
+  call must appear; capture may legitimately hold more). Independent dev-time
+  cross-check: OpenSC `pkcs11-spy` (interposition — dev only).
 
 **Gate G4 (validation review):** matrix table fully green with capture
-completeness COMPLETE (or documented loss counters); zero calls missed vs the
-pkcs11-check oracle; privileges actually required documented per environment
-(measured, not assumed).
+completeness COMPLETE (or documented loss counters); oracle ⊆ capture holds
+(zero *logged* calls missed) within the documented tolerance; fork-scoping
+behavior verified (a prefork workload captured via cgroup scope); privileges
+actually required documented per environment (measured, not assumed).
 
 ## Phase 5 — Overhead benchmark + docs + v0.1 release
 

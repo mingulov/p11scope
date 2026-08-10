@@ -23,16 +23,29 @@ assessment and incident diagnostics.
 - **Migration dependency discovery** — which PKCS#11 subset and parameter
   combinations does the application *actually* depend on? Feed the observed
   profile to [pkcs11-check](https://github.com/mingulov/pkcs11-check) /
-  `pkcs11-lab` to validate a candidate provider against real usage.
+  `pkcs11-lab` to validate a candidate provider against real usage:
+
+  ```bash
+  p11scope profile --module /opt/vendor/lib/pkcs11.so --pid 12345 -o observed-profile.json
+  pkcs11-check test --module /opt/candidate/lib/pkcs11.so --output-file candidate.json
+  pkcs11-lab assess --profile observed-profile.json --results candidate.json
+  ```
+
+See [what you will see](docs/superpowers/specs/2026-08-10-pkcs11-scope-outputs.md)
+for the CLI, live output, trace lines, and an example `observed-profile.json`.
 
 ## Honest claims
 
 - Zero application changes, no PKCS#11 interposition, attachable to running
-  processes and containers. **Not** "undetectable", **not** zero overhead
-  (uprobes cost microseconds per call; overhead is measured and published,
-  not guessed).
-- Requires elevated privileges (root, or `CAP_BPF`+`CAP_PERFMON` and friends),
-  Linux ≥ 5.15, x86-64 first.
+  processes and containers (via a reusable manifest — calls *before* attach are
+  outside the capture window; there is no v1 mid-run auto-discovery). **Not**
+  "undetectable", **not** zero overhead — overhead is measured and published in
+  Phase 5, not asserted here.
+- Requires elevated privileges (root, or `CAP_BPF`+`CAP_PERFMON` and friends,
+  kernel-version-dependent), Linux ≥ 5.15, x86-64 first.
+- Point it at the **real** provider `.so`, not `p11-kit-proxy.so` — profiling
+  the proxy layer attributes everything to p11-kit (the tool warns when it
+  detects this).
 - **Profiles, never replays.** It records safe semantic metadata via a strict
   per-field allowlist. PINs, key material, plaintext, ciphertext, signatures
   and wrapped blobs are never captured in any mode — enforced by a
@@ -44,10 +57,18 @@ assessment and incident diagnostics.
 ## Containers and Kubernetes
 
 Uprobes bind to the file inode, so attaching to a provider `.so` in a shared
-image layer observes every container on that node using that layer — including
-pods started later (e.g. Knative scale-from-zero). Docker, kind and Knative are
-first-class validation targets; cluster-wide packaging (DaemonSet/operator)
-comes after v1.
+image layer is *expected* to observe every container on that node using that
+layer — including pods started later (e.g. Knative scale-from-zero). That
+inode-sharing property is the headline bet and is the first thing the Phase 0
+spike validates (it depends on the `overlay2` storage driver). Docker, kind and
+Knative are first-class validation targets; cluster-wide packaging
+(DaemonSet/operator) comes after v1.
+
+Discovery uses a small unprivileged helper (`p11scope-discover`) that you copy
+into the target container (`docker cp`/`kubectl cp`, then `exec`); it dlopens
+the provider in the container's own view and prints a manifest the observer
+attaches from. Because it runs vendor constructor code, a manifest can instead
+be generated once on a safe host and reused (matched by ELF build-ID).
 
 ## Project family
 

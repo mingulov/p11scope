@@ -58,7 +58,13 @@ lower-layer inode.
 - The `+8` `CK_FUNCTION_LIST` pointer offset worked for SoftHSM2, as documented
   — this remains an empirical property of this provider, **not** a general fact
   (canonical headers use `#pragma pack(cryptoki,1)`). The product must derive
-  the offset from proxy-ng's `offset_of!` tables.
+  the offset from proxy-ng's `offset_of!` tables — **with the precondition
+  that those tables describe the helper's own build target only**
+  (cryptoki-sys ships pregenerated per-target bindings; only the Windows MSVC
+  and generic variants are packed). This is sound because discovery dlopens
+  the provider into the helper's own process, so helper ABI == provider ABI
+  by construction; a class-mismatched provider fails at `dlopen` and must be
+  reported as unsupported, never re-derived from foreign-ABI guesses.
 - Not covered by this spike (unchanged from plan): PKCS#11 3.x interface
   discovery (SoftHSM2 2.6 is a 2.40 module), kind/Knative orchestration
   (Phase 4), aliased/non-file-backed pointer handling (SoftHSM2 has none).

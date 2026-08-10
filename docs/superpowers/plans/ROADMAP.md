@@ -21,9 +21,15 @@ SoftHSM2 has `p_offset == p_vaddr`).
 
 - **In `pkcs11-proxy-ng` (cross-repo precursor):** extract the module-FFI
   from `crates/backend` (loading, `CK_FUNCTION_LIST`/`_3_0`/`_3_2`
-  field-offset tables, interface caps) into a lean crate depending only on
-  libloading + cryptoki-sys + types; backend consumes it, behavior unchanged.
+  field-offset tables, host-ABI introspection) into a lean crate depending
+  only on libloading + cryptoki-sys (interface-caps reporting stays in
+  backend — it is proxy wire shape); backend consumes it, behavior unchanged.
   This is the "improve proxy-ng instead of duplicating" decision.
+  The crate must expose **two distinct surfaces**: the proxy's `open()`
+  (with its version-fallback policy, moved verbatim) and a raw
+  `C_GetInterfaceList` enumeration primitive (new code). The discover helper
+  uses ONLY the raw enumeration: fallback-resolved 3.x lists may alias the
+  primary table by design and would fabricate false aliasing evidence.
 - `p11scope-discover`: Rust bin on that crate + `pkcs11-proxy-ng-types`;
   2.x `C_GetFunctionList` **and** 3.x `C_GetInterfaceList`/`C_GetInterface`,
   ELF build-ID in the manifest, JSON output. Shipped as glibc **and** musl

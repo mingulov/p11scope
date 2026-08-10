@@ -12,8 +12,10 @@ Spec: [2026-08-10-pkcs11-scope-design.md](../specs/2026-08-10-pkcs11-scope-desig
 Prove: stripped-provider table discovery → file offsets → attach-before-run →
 exact capture, on host and across Docker namespaces, incl. shared-inode.
 
-**Gate G0 (go/no-go):** all six checks in `docs/notes/spike-findings.md` PASS;
-any FAIL amends the design spec before Phase 1 planning starts.
+**Gate G0 (go/no-go): PASSED 2026-08-10** — all six checks green, see
+[spike-findings.md](../../notes/spike-findings.md). Carried into Phase 1: pin
+aya's offset-vs-vaddr semantics explicitly (the spike could not settle it,
+SoftHSM2 has `p_offset == p_vaddr`).
 
 ## Phase 1 — Shared core (proxy-ng) + discovery helper + attach engine + `metrics` mode
 

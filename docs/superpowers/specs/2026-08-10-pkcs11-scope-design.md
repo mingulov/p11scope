@@ -1,7 +1,10 @@
 # pkcs11-scope — Design
 
 **Date:** 2026-08-10
-**Status:** Draft — pending owner review (feasibility assessed positive; implementation not started)
+**Status:** Draft — pending owner review. **Phase 0 spike PASSED 2026-08-10**
+([findings](../../notes/spike-findings.md)): stripped-provider table discovery,
+attach-before-run capture, and cross-container inode sharing all confirmed.
+Product implementation not started.
 **Extended rationale:** [docs/notes/info.md](../../notes/info.md) — this spec records the decisions; the notes record the full reasoning.
 **Companion:** [what you will see](2026-08-10-pkcs11-scope-outputs.md) — CLI surface, live/trace output, and the `observed-profile.json` shape.
 
@@ -67,16 +70,16 @@ require elevated privileges, and are visible to host administrators.
   A late `dlopen` in an already-probed process (app starts, loads the provider
   minutes later) is caught for the same reason — the probe is on the file, not
   a mapping.
-- **Hypothesis to validate, not settled fact:** with the `overlay2` storage
-  driver, containers sharing an image layer share the lowerdir inode, so one
-  attachment should cover every container on the node using that layer,
-  including containers started later (the Knative scale-from-zero story below).
-  This is exactly what spike Task 4 tests (2× counts from two containers, one
-  attach). It depends on the storage driver (`overlay2`; not
-  `fuse-overlayfs`/`devicemapper`/`btrfs`/`zfs`) and on the uprobe binding to
-  the shared lower inode rather than a per-container overlay inode. If the
-  spike shows 1×, the design falls back to per-container attach and the
-  scale-from-zero claim is retracted.
+- **Validated in Phase 0 on `overlay2`** ([findings](../../notes/spike-findings.md)):
+  containers sharing an image layer share the lowerdir inode, so one attachment
+  covers every container on the node using that layer, including containers
+  started *later* — the basis of the Knative scale-from-zero story below.
+  Measured: probes attached to container A's provider captured container B's
+  calls with no re-attachment (counts exactly 2×), and the file showed the
+  **same inode on different devices** (two overlay merged mounts, one lower
+  inode). Still qualified by storage driver — `overlay2` only;
+  `fuse-overlayfs`/`devicemapper`/`btrfs`/`zfs` are unverified and must be
+  detected and reported rather than assumed.
 - Caveat: a library modified or copied in a writable layer gets a new inode →
   needs its own attachment. Manifests are file-relative and reusable across
   machines, but only after verifying file identity (ELF build ID or SHA-256).

@@ -10,6 +10,7 @@ pub mod render;
 pub mod scope;
 pub mod semantics;
 pub mod shapes;
+pub mod trace;
 pub mod verify;
 
 /// The BPF object, built by build.rs. Alignment matters: aya parses it

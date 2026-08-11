@@ -4,7 +4,7 @@
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use p11scope::attach::{Scope, Session};
-use p11scope::{discover_cmd, events, metrics, plan, render, scope, semantics, verify};
+use p11scope::{discover_cmd, events, metrics, plan, render, scope, semantics, trace, verify};
 use p11scope_manifest::manifest::{Manifest, SCHEMA};
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -12,9 +12,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "usage:\n  \
 p11scope profile --manifest <m.json> (--pid <n> | --cgroup <path>) [--mode profile|metrics] [--duration <secs>] [-o <out.json>]\n  \
+p11scope trace --manifest <m.json> (--pid <n> | --cgroup <path>) [--duration <secs>] [-o <out.file>]\n  \
 p11scope discover --module <provider.so> [-o <manifest.json>]\n\n\
 note: --mode defaults to profile (metrics + mechanisms/sessions/logins from\n\
 the event stream); --mode metrics is the lighter, maps-only level.\n\
+note: trace prints one line per completed call as it happens, in arrival\n\
+order, instead of aggregating; --duration bounds it, same as profile. If\n\
+omitted, trace streams until interrupted (Ctrl-C) or the process exits.\n\
 note: no SIGINT handler is installed in this build (no signal-handling\n\
 dependency); Ctrl-C aborts without writing output. Use --duration for a\n\
 clean exit that prints the final frame and (with -o) writes the JSON report.\n\
@@ -35,6 +39,7 @@ fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("profile") => cmd_profile(args),
+        Some("trace") => cmd_trace(args),
         Some("discover") => discover_cmd::run(args),
         Some("--help") | Some("-h") => {
             eprintln!("{USAGE}");
@@ -57,6 +62,75 @@ fn require_value(args: &mut impl Iterator<Item = String>, flag: &str) -> String 
             std::process::exit(2);
         }
     }
+}
+
+/// Pulls `(pid, cgroup)` apart into the one `Scope` the CLI contract
+/// allows — shared by every subcommand that attaches. Exits 2 with the
+/// usual usage message on zero or both being set.
+fn resolve_scope(pid: Option<u32>, cgroup: Option<PathBuf>) -> Result<Scope> {
+    match (pid, cgroup) {
+        (Some(p), None) => Ok(Scope::Pid(p)),
+        (None, Some(c)) => Ok(Scope::Cgroup { id: scope::cgroup_id(&c)?, level: scope::cgroup_level(&c)? }),
+        (None, None) => {
+            eprintln!("exactly one of --pid or --cgroup is required\n{USAGE}");
+            std::process::exit(2);
+        }
+        (Some(_), Some(_)) => {
+            eprintln!("--pid and --cgroup are mutually exclusive\n{USAGE}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Loads and verifies the manifest, then builds the attach plan — shared
+/// by every subcommand that attaches (`profile`, `trace`).
+fn load_plan(manifest_path: &std::path::Path) -> Result<(Manifest, plan::AttachPlan)> {
+    let text = std::fs::read_to_string(manifest_path)
+        .with_context(|| format!("reading manifest {}", manifest_path.display()))?;
+    let manifest: Manifest = serde_json::from_str(&text)
+        .with_context(|| format!("parsing manifest {}", manifest_path.display()))?;
+    if manifest.schema != SCHEMA {
+        bail!(
+            "manifest schema mismatch: got {:?}, this build expects {SCHEMA:?}",
+            manifest.schema
+        );
+    }
+    if let Err(problems) = verify::check_reuse(&manifest) {
+        for p in &problems {
+            eprintln!("p11scope: {p}");
+        }
+        bail!("manifest does not match the current files; refusing to attach");
+    }
+
+    let plan = plan::build(&manifest);
+    if plan.slots.is_empty() {
+        bail!(
+            "attach plan is empty: manifest {} has no attachable slots",
+            manifest_path.display()
+        );
+    }
+    if plan.slots.len() > p11scope_ebpf_common::MAX_SLOTS as usize {
+        bail!(
+            "attach plan has {} slots, exceeding MAX_SLOTS ({}): BPF would silently drop slots \
+             beyond that limit",
+            plan.slots.len(),
+            p11scope_ebpf_common::MAX_SLOTS
+        );
+    }
+    Ok((manifest, plan))
+}
+
+/// Loads the embedded-default mechanism registry and publishes its
+/// shapes into `state` — the same load `Session::start` already did to
+/// publish `MECH_SHAPE` (attach.rs), reloaded here (cheap: no I/O, no
+/// dlopen) so `state` can tell "no allowlisted shape for this
+/// mechanism" apart from "an allowlisted shape whose decode failed on
+/// every call" when rendering.
+fn load_mech_shapes(state: &mut semantics::State) -> Result<()> {
+    let registry = pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry::load(None)
+        .map_err(|e| anyhow!("loading mechanism registry: {e}"))?;
+    state.set_mech_shapes(p11scope::shapes::expected_shapes(&registry));
+    Ok(())
 }
 
 fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
@@ -97,55 +171,13 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
         eprintln!("--manifest is required\n{USAGE}");
         std::process::exit(2);
     };
-    let scope = match (pid, cgroup) {
-        (Some(p), None) => Scope::Pid(p),
-        (None, Some(c)) => Scope::Cgroup { id: scope::cgroup_id(&c)?, level: scope::cgroup_level(&c)? },
-        (None, None) => {
-            eprintln!("exactly one of --pid or --cgroup is required\n{USAGE}");
-            std::process::exit(2);
-        }
-        (Some(_), Some(_)) => {
-            eprintln!("--pid and --cgroup are mutually exclusive\n{USAGE}");
-            std::process::exit(2);
-        }
-    };
+    let scope = resolve_scope(pid, cgroup)?;
     if mode != "metrics" && mode != "profile" {
         eprintln!("mode {mode} not implemented in this phase\n{USAGE}");
         std::process::exit(2);
     }
 
-    let text = std::fs::read_to_string(&manifest_path)
-        .with_context(|| format!("reading manifest {}", manifest_path.display()))?;
-    let manifest: Manifest = serde_json::from_str(&text)
-        .with_context(|| format!("parsing manifest {}", manifest_path.display()))?;
-    if manifest.schema != SCHEMA {
-        bail!(
-            "manifest schema mismatch: got {:?}, this build expects {SCHEMA:?}",
-            manifest.schema
-        );
-    }
-    if let Err(problems) = verify::check_reuse(&manifest) {
-        for p in &problems {
-            eprintln!("p11scope: {p}");
-        }
-        bail!("manifest does not match the current files; refusing to attach");
-    }
-
-    let plan = plan::build(&manifest);
-    if plan.slots.is_empty() {
-        bail!(
-            "attach plan is empty: manifest {} has no attachable slots",
-            manifest_path.display()
-        );
-    }
-    if plan.slots.len() > p11scope_ebpf_common::MAX_SLOTS as usize {
-        bail!(
-            "attach plan has {} slots, exceeding MAX_SLOTS ({}): BPF would silently drop slots \
-             beyond that limit",
-            plan.slots.len(),
-            p11scope_ebpf_common::MAX_SLOTS
-        );
-    }
+    let (manifest, plan) = load_plan(&manifest_path)?;
 
     let mut session = Session::start(&plan, &scope).context("starting attach session")?;
     for (idx, msg) in session.attach_failures() {
@@ -155,17 +187,7 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
     // Only `--mode profile` decodes the event stream; `--mode metrics` never
     // drains the ring buffer, so it stays the lighter, maps-only level.
     let mut state = semantics::State::new(&plan);
-    // Same embedded-defaults registry load `Session::start` already did to
-    // publish MECH_SHAPE (attach.rs) — reloaded here (cheap: no I/O, no
-    // dlopen) so `state` can tell "no allowlisted shape for this
-    // mechanism" apart from "an allowlisted shape whose decode failed on
-    // every call" when rendering. A future task can share one load instead
-    // of two without touching this call's placement.
-    {
-        let registry = pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry::load(None)
-            .map_err(|e| anyhow!("loading mechanism registry: {e}"))?;
-        state.set_mech_shapes(p11scope::shapes::expected_shapes(&registry));
-    }
+    load_mech_shapes(&mut state)?;
     let mut malformed_records: u64 = 0;
     let drain_events = |session: &mut Session, state: &mut semantics::State| -> Result<u64> {
         let mut drain = events::Drain::new(&mut session.ebpf)?;
@@ -232,6 +254,147 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
             .with_context(|| format!("writing {}", out_path.display()))?;
     }
 
+    Ok(())
+}
+
+/// `p11scope trace`: one line per completed call, printed as it arrives,
+/// instead of `profile`'s periodic aggregate frame. A separate
+/// subcommand rather than a `--mode` — its transport (drain-and-print
+/// every tick, no periodic full-screen redraw) and time-bounding differ
+/// enough that folding it into `profile`'s loop would tangle both.
+fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let mut manifest_path: Option<PathBuf> = None;
+    let mut pid: Option<u32> = None;
+    let mut cgroup: Option<PathBuf> = None;
+    let mut duration: Option<u64> = None;
+    let mut out: Option<PathBuf> = None;
+
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--manifest" => manifest_path = Some(require_value(&mut args, "--manifest").into()),
+            "--pid" => {
+                let v = require_value(&mut args, "--pid");
+                pid = Some(v.parse().with_context(|| format!("--pid: invalid number {v:?}"))?);
+            }
+            "--cgroup" => cgroup = Some(require_value(&mut args, "--cgroup").into()),
+            "--duration" => {
+                let v = require_value(&mut args, "--duration");
+                duration =
+                    Some(v.parse().with_context(|| format!("--duration: invalid number {v:?}"))?);
+            }
+            "-o" => out = Some(require_value(&mut args, "-o").into()),
+            "--help" | "-h" => {
+                eprintln!("{USAGE}");
+                return Ok(());
+            }
+            other => {
+                eprintln!("unknown argument: {other}\n{USAGE}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let Some(manifest_path) = manifest_path else {
+        eprintln!("--manifest is required\n{USAGE}");
+        std::process::exit(2);
+    };
+    if duration.is_none() {
+        eprintln!(
+            "p11scope: no --duration given; trace streams until interrupted (Ctrl-C) or the \
+             process exits"
+        );
+    }
+    let scope = resolve_scope(pid, cgroup)?;
+    let (_manifest, plan) = load_plan(&manifest_path)?;
+
+    let mut session = Session::start(&plan, &scope).context("starting attach session")?;
+    for (idx, msg) in session.attach_failures() {
+        eprintln!("attach failed (slot {idx}): {msg}");
+    }
+
+    let mut state = semantics::State::new(&plan);
+    load_mech_shapes(&mut state)?;
+    let mut tracer = trace::Tracer::new(&plan);
+
+    let mut out_file: Option<std::io::BufWriter<std::fs::File>> = match &out {
+        Some(p) => Some(std::io::BufWriter::new(
+            std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
+        )),
+        None => None,
+    };
+
+    let mut malformed_records: u64 = 0;
+    let mut last_reported_loss: u64 = 0;
+    let clock = Instant::now();
+    loop {
+        let elapsed = clock.elapsed();
+        if duration.is_some_and(|d| elapsed >= Duration::from_secs(d)) {
+            break;
+        }
+        malformed_records +=
+            drain_trace_events(&mut session, &mut state, &mut tracer, &mut out_file)?;
+        report_trace_loss(&session, &mut last_reported_loss, &mut out_file)?;
+        std::io::stdout().flush().ok();
+        if let Some(f) = out_file.as_mut() {
+            f.flush().ok();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // Final drain: catch whatever arrived since the last poll, then report
+    // the closing loss line — a trace that lost events must never end
+    // silently.
+    malformed_records += drain_trace_events(&mut session, &mut state, &mut tracer, &mut out_file)?;
+    report_trace_loss(&session, &mut last_reported_loss, &mut out_file)?;
+    if malformed_records > 0 {
+        eprintln!(
+            "p11scope: {malformed_records} malformed ring-buffer records discarded this capture"
+        );
+    }
+    if let Some(f) = out_file.as_mut() {
+        f.flush().ok();
+    }
+
+    Ok(())
+}
+
+/// Prints (and, if given, appends to the `-o` file) every rendered line.
+fn emit_trace_line(line: &str, out_file: &mut Option<std::io::BufWriter<std::fs::File>>) {
+    println!("{line}");
+    if let Some(f) = out_file {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Drains whatever the ring buffer currently holds, rendering and
+/// emitting one line per completed call. Returns the malformed-record
+/// count from this drain, to accumulate at the call site.
+fn drain_trace_events(
+    session: &mut Session,
+    state: &mut semantics::State,
+    tracer: &mut trace::Tracer<'_>,
+    out_file: &mut Option<std::io::BufWriter<std::fs::File>>,
+) -> Result<u64> {
+    let mut drain = events::Drain::new(&mut session.ebpf)?;
+    drain.poll(|ev| emit_trace_line(&tracer.on_event(&ev, state), out_file));
+    Ok(drain.malformed())
+}
+
+/// Emits `LOST n events` when the ring buffer's loss counter has grown
+/// since the last report — mandatory whenever it is nonzero, so a trace
+/// that dropped events never ends silently.
+fn report_trace_loss(
+    session: &Session,
+    last_reported_loss: &mut u64,
+    out_file: &mut Option<std::io::BufWriter<std::fs::File>>,
+) -> Result<()> {
+    let lost = metrics::lost_events(session)?;
+    if lost > *last_reported_loss {
+        if let Some(line) = trace::lost_line(lost) {
+            emit_trace_line(&line, out_file);
+        }
+        *last_reported_loss = lost;
+    }
     Ok(())
 }
 

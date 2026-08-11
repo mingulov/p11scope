@@ -108,7 +108,7 @@ fn label(r: &SlotReport) -> String {
     if r.aliased { format!("{} (aliased)", r.names.join("|")) } else { r.names.join("|") }
 }
 
-fn fmt_ns(ns: Option<u64>) -> String {
+pub(crate) fn fmt_ns(ns: Option<u64>) -> String {
     match ns {
         None => "—".into(),
         Some(v) if v < 1_000 => format!("{v}ns"),
@@ -320,7 +320,7 @@ struct MechanismOut {
 /// (should not occur: `param_combos` only ever stores shapes the BPF side
 /// actually decoded) — filtered out by the caller, never emitted as a
 /// guess.
-fn param_combo_json(shape_code: u32, p0: u64, p1: u64, p2: u64, count: u64) -> Option<serde_json::Value> {
+pub(crate) fn param_combo_json(shape_code: u32, p0: u64, p1: u64, p2: u64, count: u64) -> Option<serde_json::Value> {
     match shape_code {
         p11scope_ebpf_common::shape::RSA_PKCS_PSS => Some(serde_json::json!({
             "shape": "rsa_pkcs_pss",

@@ -390,6 +390,17 @@ impl State {
         }
     }
 
+    /// The pseudonym currently naming `(pid, raw)` — `sess#N` in `trace`
+    /// output — or `None` if no session with that raw handle is
+    /// currently tracked (not yet opened this capture, or already
+    /// closed). Never exposes the raw handle itself; callers that need a
+    /// session's pseudonym for a call that is *about* to close it
+    /// (`C_CloseSession`) must resolve this before `observe`-ing that
+    /// event, since a successful close removes the mapping.
+    pub fn session_pseudonym(&self, pid: u32, raw: u64) -> Option<u64> {
+        self.pseudonym_of.get(&(pid, raw)).copied()
+    }
+
     pub fn mechanisms(&self) -> &BTreeMap<u64, MechStat> {
         &self.mechanisms
     }

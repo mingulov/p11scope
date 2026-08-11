@@ -70,6 +70,17 @@ pub fn read(session: &Session, plan: &AttachPlan) -> Result<Vec<SlotReport>> {
     Ok(out)
 }
 
+/// Events the kernel side could not reserve ring buffer space for,
+/// summed across CPUs. A nonzero count means the capture dropped
+/// events — `STATS`/`RV_COUNTS` still saw them, but the per-call detail
+/// in `EVENTS` is incomplete.
+pub fn lost_events(session: &Session) -> Result<u64> {
+    let lost: PerCpuArray<_, u64> =
+        PerCpuArray::try_from(session.ebpf.map("LOST").context("LOST map")?)?;
+    let per_cpu = lost.get(&0, 0)?;
+    Ok(per_cpu.iter().copied().sum())
+}
+
 /// Approximate quantile from log2 buckets: the lower bound of the bucket
 /// containing the q-th observation. `q` is in (0.0, 1.0].
 pub fn percentile_ns(buckets: &[u64; LATENCY_BUCKETS], q: f64) -> Option<u64> {

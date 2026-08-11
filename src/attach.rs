@@ -24,6 +24,13 @@ impl Session {
     pub fn start(plan: &AttachPlan, scope: &Scope) -> Result<Self> {
         let mut ebpf = Ebpf::load(crate::EBPF_OBJECT).context("loading BPF object")?;
         crate::scope::apply(&mut ebpf, scope).context("installing scope filter")?;
+        {
+            let mut kinds: aya::maps::Array<_, u32> =
+                aya::maps::Array::try_from(ebpf.map_mut("SLOT_KIND").context("SLOT_KIND map")?)?;
+            for slot in &plan.slots {
+                kinds.set(slot.index, slot.kind, 0)?;
+            }
+        }
         let uprobe_scope = match scope {
             Scope::Pid(pid) => UProbeScope::OneProcess(
                 std::num::NonZeroU32::new(*pid).context("pid must be non-zero")?,

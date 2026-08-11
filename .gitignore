@@ -4,3 +4,5 @@
 *.bpf.o
 vmlinux.h
 spike/work/
+target/
+spike/aya-offset-pin/work/

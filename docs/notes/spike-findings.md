@@ -49,6 +49,8 @@ lower-layer inode.
   columns are numerically identical and either interpretation attaches. Phase 1
   must pin this explicitly for **aya** (`UProbe::attach` takes a file offset).
   No non-PIE control was run.
+  Resolved 2026-08-11 — see aya-offset-semantics.md (file offsets; pinned by
+  spike/aya-offset-pin).
 - **`/proc/<pid>/root` requires root** — confirmed empirically (denied as the
   normal user, readable under `sudo`). This validates the documented privilege
   requirement rather than contradicting it.

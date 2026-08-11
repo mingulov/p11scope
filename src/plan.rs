@@ -15,6 +15,8 @@ pub struct Slot {
     /// True when >= 2 distinct names share this target: counts belong to
     /// the group, never to one name.
     pub aliased: bool,
+    /// Semantic function kind: shared kind of all names, or OTHER when they disagree.
+    pub kind: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,12 +130,14 @@ pub fn build(m: &Manifest) -> AttachPlan {
         .map(|(i, ((object, file_offset), mut names))| {
             names.sort();
             names.dedup();
+            let kind = crate::kinds::classify_slot(&names);
             Slot {
                 index: i as u32,
                 object,
                 file_offset,
                 aliased: names.len() >= 2,
                 names,
+                kind,
             }
         })
         .collect();
@@ -190,18 +194,22 @@ mod tests {
         let m = manifest_with(vec![
             rec("C_Sign", Resolution::Resolved { object: 0, file_offset: 0x10 }),
             rec("C_Verify", Resolution::Resolved { object: 0, file_offset: 0x20 }),
+            rec("C_OpenSession", Resolution::Resolved { object: 0, file_offset: 0x40 }),
             rec("C_CancelFunction", Resolution::Resolved { object: 0, file_offset: 0x30 }),
             rec("C_WaitForSlotEvent", Resolution::Resolved { object: 0, file_offset: 0x30 }),
         ]);
         let p = build(&m);
-        assert_eq!(p.slots.len(), 3, "aliased pair collapses to one slot");
-        assert_eq!(p.entries_seen, 4);
+        assert_eq!(p.slots.len(), 4, "aliased pair collapses to one slot");
+        assert_eq!(p.entries_seen, 5);
         let aliased: Vec<&Slot> = p.slots.iter().filter(|s| s.aliased).collect();
         assert_eq!(aliased.len(), 1);
         assert_eq!(aliased[0].names, vec!["C_CancelFunction", "C_WaitForSlotEvent"]);
         // Slot indices are dense and start at zero.
         let idx: Vec<u32> = p.slots.iter().map(|s| s.index).collect();
-        assert_eq!(idx, vec![0, 1, 2]);
+        assert_eq!(idx, vec![0, 1, 2, 3]);
+        // Assert C_OpenSession slot gets the right kind.
+        let open_session_slot = p.slots.iter().find(|s| s.names == vec!["C_OpenSession"]).unwrap();
+        assert_eq!(open_session_slot.kind, p11scope_ebpf_common::fnkind::OPEN_SESSION);
     }
 
     #[test]

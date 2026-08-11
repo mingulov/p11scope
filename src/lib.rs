@@ -2,6 +2,7 @@
 
 pub mod attach;
 pub mod discover_cmd;
+pub mod kinds;
 pub mod metrics;
 pub mod plan;
 pub mod render;

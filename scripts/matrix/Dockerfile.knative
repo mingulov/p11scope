@@ -1,0 +1,16 @@
+# Image for the Knative row of the Phase 4 environment matrix
+# (verify-knative.sh). A Knative Service needs a container that listens on
+# $PORT and serves HTTP; knative-server.py runs the deterministic harness
+# workload once per request. Same base/softhsm2 setup as Dockerfile.kind
+# (see its header for why binaries are baked in rather than bind-mounted).
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends softhsm2 python3 \
+    && rm -rf /var/lib/apt/lists/*
+ENV SOFTHSM2_CONF=/matrix/softhsm2.conf
+RUN mkdir -p /matrix/tokens \
+    && printf 'directories.tokendir = /matrix/tokens\nobjectstore.backend = file\nlog.level = ERROR\nslots.removable = false\n' \
+       > /matrix/softhsm2.conf \
+    && softhsm2-util --init-token --free --label matrix --so-pin 1234 --pin 1234
+COPY build/harness /usr/local/bin/harness
+COPY build/knative-server.py /server.py
+CMD ["python3", "/server.py"]

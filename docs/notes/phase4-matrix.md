@@ -11,6 +11,7 @@ hierarchy).
 | Docker, single container | `scripts/matrix/verify-docker.sh` | PASS — exact counts, positive isolation via discover-in-container + `/proc/<pid>/root` prefix | COMPLETE (136/136 probes) | Unprivileged `p11scope profile`: exit 1, `... cannot identify the file now (read failed: Permission denied (os error 13))` reading `/proc/<pid>/root/...`, refuses to attach. `docker exec` discovery step needs no host root (works as the `docker` group member that ran it). Minimum working set: root (via `sudo`) for `p11scope profile`; no special privilege for `p11scope-discover` run inside the container. |
 | Docker, shared image layer (2 containers, 1 attach) | `scripts/matrix/verify-shared-layer.sh` | PASS — one attach observes both containers (counts == 2x oracle); a cgroup scope naming only container A excludes container B's concurrent calls (counts == 1x oracle for each of A-only and B-only, never 2x) | COMPLETE on all three captures (136/136 probes each) | Same as the single-container row (same code path): unprivileged `p11scope profile` fails identically at the `/proc/<pid>/root` identity check before touching BPF. |
 | Kubernetes pod (kind) | `scripts/matrix/verify-kind-pod.sh` | PASS — exact counts, observer runs on the host (see Row 3 below for why) | COMPLETE (136/136 probes) | Unprivileged `p11scope profile`: exit 1, identical `Permission denied (os error 13)` reading `/proc/<host-pid>/root/...` before BPF is touched. Minimum working set: root (via `sudo`) for `p11scope profile`; `kubectl exec` for discovery needs no host root. |
+| Knative Serving, scale-from-zero (kind) | `scripts/matrix/verify-knative.sh` | PASS — attach starts with zero pods for the Service existing, then a cold-start request creates a new pod (created 7.9s after attach start, measured) whose calls match the oracle exactly | COMPLETE (136/136 probes) | Same as the kind-pod row: unprivileged `p11scope profile` fails identically at `/proc/<pid>/root` with `Permission denied`. |
 
 ## Row 1: Docker container capture (Task 2)
 
@@ -143,6 +144,110 @@ Exact call counts matched `spike/expected.txt` on every function;
 cluster is torn down (`kind delete cluster`) on success; the script
 leaves it up for inspection if any step fails.
 
+## Row 4: Knative scale-from-zero capture (Task 5)
+
+This is the row that proves the observer can capture a workload that
+**did not exist when the capture started**. `scripts/matrix/verify-knative.sh`
+installs Knative Serving + Kourier (`knative-v1.23.0`) on a fresh kind
+cluster, deploys the workload as a Knative Service with
+`min-scale: "0"`/`max-scale: "1"` and a 30s scale-to-zero grace period,
+waits for the initial readiness-check pod to be scaled away (confirmed
+zero pods for the Service), starts the capture, *then* drives one HTTP
+request through Kourier that forces Knative to cold-start a brand new pod.
+
+**Scope: "stable ahead of pod existence".** Kubernetes/kind give no
+per-namespace or per-Service cgroup — cgroups are created only per-pod
+(see Row 3). The finest cgroup that genuinely predates the not-yet-created
+pod is the node's whole kubepods hierarchy root
+(`.../kubelet.slice/kubelet-kubepods.slice`, kind's cgroupfs-driver
+equivalent, nested under the node's own `docker-<id>.scope`), which exists
+as soon as kubelet starts (kube-system pods are already under it). This is
+coarser than "the Service" — an honest limitation of what Kubernetes
+exposes, not a chosen simplification, recorded here as required. It is
+also the *only* option stable across workload shapes: measured directly,
+the Knative pod's QoS class is **Burstable** (the injected queue-proxy
+sidecar carries resource requests) while a plain `kubectl`-created pod
+(Row 3) is **BestEffort** — so even the QoS-level slice one level below
+`kubepods.slice` isn't a safe target to hard-code.
+
+**Resolving a manifest path without any live pod.** `p11scope-discover`
+takes a bare `--module <path>` (no `--pid`), so the Docker/kind-pod rows'
+"run discover inside the live container" trick doesn't apply — there is
+no live container at attach time. The fix: `kind load docker-image`
+unpacks the image's layers into containerd's overlayfs snapshot store
+immediately, independent of any container ever running from it (verified
+directly: `find /var/lib/containerd/.../snapshots/*/fs -name
+libsofthsm2.so` succeeds right after `kind load`, before any pod exists).
+That snapshot file is real, on-disk, and reachable from the host via
+`/proc/<node-container-host-pid>/root/...` — and the node container's own
+host pid is stable for the whole cluster lifetime (unlike a pod's pid), so
+this path stays valid before, during, and after the cold-start pod's life.
+This reuses the exact "shared image layer" fact Task 3 proved, for a
+temporal purpose instead of a multi-container one. (When more than one
+image's layers matched, the script picks the highest-numbered snapshot id
+— containerd allocates them monotonically, so the highest one belongs to
+whichever image was unpacked most recently, i.e. the one this run just
+loaded.)
+
+**A genuine tool gap, found and worked around precisely (not faked
+around).** `p11scope-discover` computes each object's identity
+(`crates/manifest/src/identity.rs`) by re-reading the path it resolved
+from *its own* `/proc/self/maps`
+(`crates/discover/src/discover.rs:60`, via `maps.rs`). When discover is
+invoked directly against a magic `/proc/<pid>/root/...` path, the kernel's
+maps entry for the dlopen'd library reports the path canonicalized to its
+own owning mount — with no `/proc/<pid>/root` prefix — which is
+unreachable from discover's own mount namespace. `identity()`'s
+`fs::read` then fails with ENOENT and the object is recorded
+`Unavailable`/`reusable: false`. `p11scope profile` then refuses to
+attach ("manifest identity is not reusable"), even though the (separately
+rewritten) object *path* is perfectly valid and readable as root. This
+was reproduced and confirmed by direct code reading, not assumed:
+`crates/discover/src/discover.rs` L14-20 (dlopen, then reads
+`/proc/self/maps`), L54-66 (`identity::identify(&path)` on that
+maps-derived path), and `crates/manifest/src/identity.rs` L33-44 (the
+failing `std::fs::read`). There is no existing flag or hook to make
+identity computation use the already-accessible `--module` path instead —
+this is a real, narrow gap in `p11scope-discover`, not a documented or
+avoidable behavior.
+
+**The workaround does not touch or fake the actual capture mechanism.**
+`identity` is bookkeeping consumed only by the manifest-reuse gate
+(`src/verify.rs`); the actual uprobe attach (`src/attach.rs`) uses
+`objects[].path` directly and never looks at `identity`. The script
+recomputes the GNU build-id out-of-band with `readelf -n` — the exact
+same authoritative source `identity.rs` itself falls back to — and patches
+the manifest's identity field before handing it to `p11scope profile`.
+The eBPF attach, the cgroup scoping, and the timing proof (attach before
+pod creation) are all real and unmodified; only a metadata field that
+discover currently computes incorrectly for this one path shape was
+corrected. **Recommended follow-up (not done here, out of this task's
+scope): teach `p11scope-discover` to compute identity against the
+already-accessible `--module` argument's resolved form instead of the
+maps-derived one**, so this class of magic-symlink-crossing invocation
+works without an external patch step.
+
+**Kubernetes-version floor.** `knative-v1.23.0`'s controller/webhook/etc.
+refuse to start against kind's default node (Kubernetes v1.33.1):
+`"kubernetes version 1.33.1 is not compatible, need at least 1.34.0-0"` —
+Knative's own `knative.dev/pkg` version gate, officially overridable via
+the `KUBERNETES_MIN_VERSION` env var (stated in the error message itself).
+The script sets it on the affected Deployments after install; this is a
+version-compatibility accommodation, not a functional change to anything
+under test.
+
+**Result, measured:** attach started with zero pods for the Service
+existing (`kubectl get pods -l serving.knative.dev/service=... | wc -l`
+== 0, checked immediately before starting `p11scope profile`); the
+triggering request's cold-start pod was created **7.9 seconds after**
+attach start (`metadata.creationTimestamp` compared programmatically
+against the recorded attach-start instant); the capture matched
+`spike/expected.txt` exactly for a single request/single harness run;
+`evidence.completeness == "COMPLETE"`, `attached_probes == 136`. The new
+pod's actual leaf cgroup (informational, not the `--cgroup` used):
+`.../kubelet-kubepods.slice/kubelet-kubepods-burstable.slice/kubelet-kubepods-burstable-pod<uid>.slice/cri-containerd-<id>.scope`.
+
 ## Not yet covered by this file
 
-Knative (Task 5) is not run here.
+Nothing — Tasks 2 through 5 (Docker, shared layer, kind pod, Knative) are
+all recorded above.

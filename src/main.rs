@@ -154,6 +154,36 @@ fn load_plan(manifest_path: &std::path::Path) -> Result<(Manifest, plan::AttachP
     Ok((manifest, plan))
 }
 
+/// Prints every attach failure — shared by `profile` and `trace`, which
+/// each attach the same way. A capture that attached at least one probe
+/// still gets each per-slot failure printed (it is real evidence of a
+/// PARTIAL capture, kept as-is). But when literally nothing attached,
+/// N copies of the same generic per-slot line leave the operator to
+/// work out on their own that this means "the environment can't do BPF
+/// attach at all" — so that case also gets one synthesized, actionable
+/// summary line naming the likely causes, not just a wall of identical
+/// failures. This is in addition to `Session::start`'s own hint (fired
+/// only when the *earlier* map-creation/program-load stage fails
+/// outright); this one covers the case where that stage succeeds but
+/// every individual uprobe attach is refused (e.g. `perf_event_open`
+/// blocked by `perf_event_paranoid`).
+fn report_attach_failures(session: &Session) {
+    for (idx, msg) in session.attach_failures() {
+        eprintln!("attach failed (slot {idx}): {msg}");
+    }
+    if session.attached_probes() == 0 {
+        if let Some((_, first)) = session.attach_failures().first() {
+            eprintln!(
+                "p11scope: 0/{} attach attempts failed, every one the same way — this almost \
+                 always means the environment cannot attach BPF uprobes at all: missing \
+                 CAP_BPF/CAP_SYS_ADMIN (or root), a kernel lockdown mode, or a restrictive \
+                 kernel.perf_event_paranoid sysctl. First underlying error: {first}",
+                session.attach_failures().len()
+            );
+        }
+    }
+}
+
 /// Loads the embedded-default mechanism registry and publishes its
 /// shapes into `state` — the same load `Session::start` already did to
 /// publish `MECH_SHAPE` (attach.rs), reloaded here (cheap: no I/O, no
@@ -214,9 +244,7 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
     let (manifest, plan) = load_plan(&manifest_path)?;
 
     let mut session = Session::start(&plan, &scope).context("starting attach session")?;
-    for (idx, msg) in session.attach_failures() {
-        eprintln!("attach failed (slot {idx}): {msg}");
-    }
+    report_attach_failures(&session);
 
     // Only `--mode profile` decodes the event stream; `--mode metrics` never
     // drains the ring buffer, so it stays the lighter, maps-only level.
@@ -352,9 +380,7 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
     let (_manifest, plan) = load_plan(&manifest_path)?;
 
     let mut session = Session::start(&plan, &scope).context("starting attach session")?;
-    for (idx, msg) in session.attach_failures() {
-        eprintln!("attach failed (slot {idx}): {msg}");
-    }
+    report_attach_failures(&session);
 
     let mut state = semantics::State::new(&plan);
     load_mech_shapes(&mut state)?;

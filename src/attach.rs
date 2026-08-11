@@ -25,8 +25,47 @@ pub struct Session {
     attached: usize,
 }
 
+/// Renders `e` and every `.source()` beneath it, joined by `: `. Several
+/// of aya's error variants (e.g. `ProgramError::SyscallError`) are
+/// `#[error(transparent)]`, so `{e}` alone prints only the outer
+/// message (`` `perf_event_open` failed ``) and silently drops the
+/// actual OS error (`EPERM`/`EACCES`/...) that explains *why* — that
+/// detail lives one level down in `.source()`. `anyhow`'s `{:#}` does
+/// this same walk for an `anyhow::Error`; this is the equivalent for a
+/// plain `std::error::Error` this code does not otherwise wrap, so the
+/// per-slot attach failure text below is not silently missing the one
+/// fact an operator needs (was it a permission error, and which one).
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut msg = e.to_string();
+    let mut cur = e.source();
+    while let Some(src) = cur {
+        msg.push_str(": ");
+        msg.push_str(&src.to_string());
+        cur = src.source();
+    }
+    msg
+}
+
+/// A kernel/environment that cannot load or attach BPF programs at all
+/// fails somewhere in `start_inner` below (map creation, program load,
+/// or the mechanism registry step never reaches that far) — never at
+/// the per-slot attach loop, which is reached only after those succeed.
+/// Every realistic cause at that point is an unsupported-environment
+/// one, so every early failure gets the same actionable hint appended,
+/// naming the concrete things to check instead of leaving a bare
+/// syscall error for the operator to diagnose alone.
+const UNSUPPORTED_ENV_HINT: &str = "hint: this usually means the environment cannot load or \
+attach BPF programs at all — missing CAP_BPF and/or CAP_SYS_ADMIN (or root), a kernel \
+lockdown mode, a kernel below the supported floor (>= 5.15), missing BTF \
+(/sys/kernel/btf/vmlinux), or a restrictive kernel.perf_event_paranoid sysctl. See \
+docs/notes/phase5-unsupported.md for what each looks like when observed.";
+
 impl Session {
     pub fn start(plan: &AttachPlan, scope: &Scope) -> Result<Self> {
+        Self::start_inner(plan, scope).map_err(|e| anyhow!("{e:#}\n{UNSUPPORTED_ENV_HINT}"))
+    }
+
+    fn start_inner(plan: &AttachPlan, scope: &Scope) -> Result<Self> {
         let mut ebpf = Ebpf::load(crate::EBPF_OBJECT).context("loading BPF object")?;
         crate::scope::apply(&mut ebpf, scope).context("installing scope filter")?;
         {
@@ -72,7 +111,12 @@ impl Session {
                     Ok(_) => attached += 1,
                     Err(e) => attach_failures.push((
                         slot.index,
-                        format!("{prog_name} at {}+{:#x}: {e}", slot.object, slot.file_offset),
+                        format!(
+                            "{prog_name} at {}+{:#x}: {}",
+                            slot.object,
+                            slot.file_offset,
+                            error_chain(&e)
+                        ),
                     )),
                 }
             }

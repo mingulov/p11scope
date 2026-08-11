@@ -131,11 +131,32 @@ pub fn live(reports: &[SlotReport], ev: &Evidence, elapsed: Duration, module: &s
         ev.skipped.len(),
         ev.in_flight_at_end,
     );
-    if surface_gaps > 0 || ev.vendor_interfaces > 0 {
-        evidence_line.push_str(&format!(
-            " · {surface_gaps} surface gaps · {} vendor interfaces",
-            ev.vendor_interfaces
-        ));
+    if surface_gaps > 0 || ev.vendor_interfaces > 0 || ev.event_loss > 0 || ev.malformed_records > 0 {
+        evidence_line.push_str(" ·");
+        if surface_gaps > 0 {
+            evidence_line.push_str(&format!(" {surface_gaps} surface gaps"));
+        }
+        if ev.vendor_interfaces > 0 {
+            evidence_line.push_str(&format!(" {} vendor interfaces", ev.vendor_interfaces));
+        }
+        if ev.event_loss > 0 {
+            evidence_line.push_str(&format!(" {} events lost", ev.event_loss));
+        }
+        if ev.malformed_records > 0 {
+            evidence_line.push_str(&format!(" {} malformed records", ev.malformed_records));
+        }
+    }
+    if ev.orphan_ops > 0 || ev.unmatched_closes > 0 {
+        evidence_line.push_str(" · ");
+        if ev.orphan_ops > 0 {
+            evidence_line.push_str(&format!("ℹ {orphan_ops} orphan ops", orphan_ops = ev.orphan_ops));
+        }
+        if ev.unmatched_closes > 0 {
+            if ev.orphan_ops > 0 {
+                evidence_line.push_str(" ");
+            }
+            evidence_line.push_str(&format!("ℹ {unmatched} unmatched closes", unmatched = ev.unmatched_closes));
+        }
     }
     evidence_line.push_str(&format!(" → {}\n", ev.completeness));
     s.push_str(&evidence_line);
@@ -407,6 +428,44 @@ mod tests {
         assert!(out.contains("up 00:01:05"));
         assert!(out.contains("mode profile"));
         assert!(out.contains("approximation"));
+    }
+
+    #[test]
+    fn live_view_surfaces_gap_counters_when_nonzero() {
+        let mut ev = evidence();
+        ev.event_loss = 5;
+        ev.malformed_records = 2;
+        ev.verdict();
+        let out = live(
+            &[report("C_Sign", 10, 0, false)],
+            &ev,
+            Duration::from_secs(10),
+            "/opt/p11.so",
+            "profile",
+        );
+        // Evidence line shows why a PARTIAL verdict was rendered.
+        assert!(out.contains("5 events lost"), "event_loss must appear in evidence line");
+        assert!(out.contains("2 malformed records"), "malformed_records must appear in evidence line");
+        assert!(out.contains("PARTIAL"));
+    }
+
+    #[test]
+    fn live_view_surfaces_informational_counters_when_nonzero() {
+        let mut ev = evidence();
+        ev.orphan_ops = 3;
+        ev.unmatched_closes = 1;
+        ev.verdict();
+        let out = live(
+            &[report("C_Sign", 10, 0, false)],
+            &ev,
+            Duration::from_secs(10),
+            "/opt/p11.so",
+            "profile",
+        );
+        // Informational evidence: capture started mid-operation, still marked COMPLETE for its scope.
+        assert!(out.contains("3 orphan ops"), "orphan_ops must appear in evidence line");
+        assert!(out.contains("1 unmatched closes"), "unmatched_closes must appear in evidence line");
+        assert!(out.contains("COMPLETE"));
     }
 
     #[test]

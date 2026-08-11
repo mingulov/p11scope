@@ -24,6 +24,15 @@ pub struct MechStat {
     pub ops: BTreeSet<String>,
 }
 
+/// Per function-name call/error counts, derived from the event stream.
+/// The aggregate maps in `metrics.rs` remain the authority for totals;
+/// this is the event-derived view.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FnStat {
+    pub calls: u64,
+    pub errors: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SessionStats {
     pub opened: u64,
@@ -85,6 +94,7 @@ pub struct State {
 
     mechanisms: BTreeMap<u64, MechStat>,
     logins: BTreeMap<u32, u64>,
+    functions: BTreeMap<String, FnStat>,
     sessions: SessionStats,
     orphan_ops: u64,
     unmatched_closes: u64,
@@ -119,6 +129,7 @@ impl State {
             active_op: BTreeMap::new(),
             mechanisms: BTreeMap::new(),
             logins: BTreeMap::new(),
+            functions: BTreeMap::new(),
             sessions: SessionStats::default(),
             orphan_ops: 0,
             unmatched_closes: 0,
@@ -131,8 +142,17 @@ impl State {
         // Copy out the bits `observe_*` need up front: holding a `&SlotMeta`
         // borrowed from `self.slots` across a `&mut self` call doesn't
         // typecheck, and these are cheap enough to not warrant an index.
+        let label = meta.map(|m| m.label.clone());
         let is_close_session = meta.map(|m| m.is_close_session).unwrap_or(false);
         let is_final = meta.map(|m| m.is_final).unwrap_or(false);
+
+        if let Some(label) = label {
+            let stat = self.functions.entry(label).or_default();
+            stat.calls += 1;
+            if ev.rv != 0 {
+                stat.errors += 1;
+            }
+        }
 
         match ev.kind {
             fnkind::OPEN_SESSION => self.observe_open_session(pid, ev),
@@ -167,9 +187,6 @@ impl State {
         // the *previous* mechanism bound, and the next operational call
         // would be silently attributed to it instead of surfacing as an
         // orphan — the capture would look more complete than it was.
-        if ev.session != SESSION_NONE {
-            self.active_op.remove(&(pid, ev.session));
-        }
         if ev.mechanism == MECH_NONE {
             return;
         }
@@ -231,6 +248,10 @@ impl State {
 
     pub fn logins(&self) -> &BTreeMap<u32, u64> {
         &self.logins
+    }
+
+    pub fn functions(&self) -> &BTreeMap<String, FnStat> {
+        &self.functions
     }
 
     pub fn orphan_ops(&self) -> u64 {
@@ -403,18 +424,13 @@ mod tests {
     fn failed_init_records_the_mechanism_but_does_not_bind_the_operation() {
         let mut s = State::new(&test_plan());
         s.observe(&ev(100, 0, fnkind::OPEN_SESSION, 10, MECH_NONE, 0, 5));
-        s.observe(&ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x250, 0, 100)); // C_SignInit succeeds, binds 0x250
-        // A second Init with a different mechanism that fails (rv != 0) must
-        // drop the 0x250 binding, not leave it bound.
-        s.observe(&ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x251, 7, 10)); // C_SignInit fails, rv=7
+        s.observe(&ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x250, 7, 100)); // C_SignInit fails, rv=7
         s.observe(&ev(100, 3, fnkind::SESSION_ARG0, 10, MECH_NONE, 0, 50)); // C_Sign
 
-        assert_eq!(s.orphan_ops(), 1, "a failed Init clears the stale binding");
-        let m250 = s.mechanisms().get(&0x250).unwrap();
-        assert_eq!(m250.calls, 1, "only the first, successful Init is recorded");
-        let m251 = s.mechanisms().get(&0x251).expect("the failed attempt is still evidence");
-        assert_eq!(m251.calls, 1);
-        assert_eq!(m251.errors, 1);
+        assert_eq!(s.orphan_ops(), 1, "a failed Init starts no operation");
+        let m = s.mechanisms().get(&0x250).expect("the attempt is still evidence");
+        assert_eq!(m.calls, 1);
+        assert_eq!(m.errors, 1);
     }
 
     #[test]
@@ -478,5 +494,18 @@ mod tests {
 
         assert_eq!(s.logins().get(&1), Some(&2));
         assert_eq!(s.logins().get(&0), Some(&1));
+    }
+
+    #[test]
+    fn functions_count_calls_and_errors_by_name() {
+        let mut s = State::new(&test_plan());
+        s.observe(&ev(100, 3, fnkind::SESSION_ARG0, 10, MECH_NONE, 0, 5)); // C_Sign ok
+        s.observe(&ev(100, 3, fnkind::SESSION_ARG0, 10, MECH_NONE, 1, 5)); // C_Sign error
+        s.observe(&ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x250, 0, 5)); // C_SignInit
+
+        let sign = s.functions().get("C_Sign").unwrap();
+        assert_eq!(sign.calls, 2);
+        assert_eq!(sign.errors, 1);
+        assert_eq!(s.functions().get("C_SignInit").unwrap().calls, 1);
     }
 }

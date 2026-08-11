@@ -5,3 +5,7 @@ version = 4
 [[package]]
 name = "p11scope"
 version = "0.0.0"
+
+[[package]]
+name = "p11scope-discover"
+version = "0.0.0"

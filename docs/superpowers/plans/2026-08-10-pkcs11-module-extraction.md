@@ -63,7 +63,7 @@ testable.
   - `pub unsafe fn read_fn_pointers(base: *const u8, fields: &[FnField]) -> Vec<(&'static str, usize)>`
   - All re-exported at crate root (`pkcs11_module::FnField` etc.).
 
-- [ ] **Step 1: Create the crate skeleton**
+- [x] **Step 1: Create the crate skeleton**
 
 `crates/module/Cargo.toml`:
 
@@ -105,7 +105,7 @@ pub use tables::{
 Add `"crates/module",` to the workspace `members` list in the root
 `Cargo.toml` (after `"crates/audit"`, keeping the existing order style).
 
-- [ ] **Step 2: Move the tables into `crates/module/src/tables.rs`**
+- [x] **Step 2: Move the tables into `crates/module/src/tables.rs`**
 
 Copy the entire contents of `crates/backend/src/ffi/function_field_tables.rs`
 into `crates/module/src/tables.rs`, then make exactly these changes:
@@ -144,7 +144,7 @@ pub unsafe fn read_fn_pointers(base: *const u8, fields: &[FnField]) -> Vec<(&'st
 lists — `scripts/oasis-coverage-inventory.py` parses this file textually.
 Delete `crates/backend/src/ffi/function_field_tables.rs` after copying.
 
-- [ ] **Step 3: Write the reader unit tests (in `tables.rs`)**
+- [x] **Step 3: Write the reader unit tests (in `tables.rs`)**
 
 ```rust
 #[cfg(test)]
@@ -187,12 +187,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Run the new crate's tests**
+- [x] **Step 4: Run the new crate's tests**
 
 Run: `cargo test -p pkcs11-module`
 Expected: PASS (3 tests).
 
-- [ ] **Step 5: Repoint backend**
+- [x] **Step 5: Repoint backend**
 
 In `crates/backend/Cargo.toml` add under `[dependencies]`:
 
@@ -219,7 +219,7 @@ with
 use pkcs11_module::tables::*;
 ```
 
-- [ ] **Step 6: Repoint the OASIS scan and the quality gate**
+- [x] **Step 6: Repoint the OASIS scan and the quality gate**
 
 Run: `grep -rn "function_field_tables" --include="*.py" --include="*.rs" --include="*.md" .`
 For **every** hit (expected: `scripts/oasis-coverage-inventory.py` around
@@ -228,7 +228,7 @@ update any others the grep surfaces the same way), replace the path string
 `crates/backend/src/ffi/function_field_tables.rs` with
 `crates/module/src/tables.rs`.
 
-- [ ] **Step 7: Verify the whole workspace**
+- [x] **Step 7: Verify the whole workspace**
 
 Run: `cargo fmt --all && cargo check`
 Run: `cargo test -p pkcs11-proxy-ng-backend`
@@ -236,7 +236,7 @@ Run: `cargo test -p pkcs11-proxy-ng --test local_quality_gate_test`
 Expected: all PASS. If the gate test fails on a path string, Step 6 missed a
 citation — fix it there, not by weakening the test.
 
-- [ ] **Step 8: Commit (submodule)**
+- [x] **Step 8: Commit (submodule)**
 
 ```bash
 git add -A
@@ -276,7 +276,7 @@ pub enum TableSet {
 pub fn tables_for(surface: Surface) -> TableSet;
 ```
 
-- [ ] **Step 1: Write the failing tests (spec §7 rows + boundary versions)**
+- [x] **Step 1: Write the failing tests (spec §7 rows + boundary versions)**
 
 Append to the `tests` module in `tables.rs`:
 
@@ -361,12 +361,12 @@ fn unknown_majors_are_refused() {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p pkcs11-module tables_for`
 Expected: FAIL to compile — `Surface`, `TableSet`, `tables_for` not defined.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add to `tables.rs` (above the tests):
 
@@ -425,12 +425,12 @@ pub fn tables_for(surface: Surface) -> TableSet {
 
 Add `Surface`, `TableSet`, `tables_for` to the re-export list in `lib.rs`.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p pkcs11-module`
 Expected: PASS (all, including Task 1's).
 
-- [ ] **Step 5: Adopt in `interface_caps.rs`**
+- [x] **Step 5: Adopt in `interface_caps.rs`**
 
 Replace the body of `detect_interface_capabilities` so table selection goes
 through `tables_for` (walked sets are unchanged — this is consolidation, not
@@ -473,14 +473,14 @@ let nulls = nulls_for(
 keeping the surrounding `InterfaceCapabilities { interfaces }` construction
 exactly as it is.
 
-- [ ] **Step 6: Verify backend + gate**
+- [x] **Step 6: Verify backend + gate**
 
 Run: `cargo fmt --all && cargo check`
 Run: `cargo test -p pkcs11-proxy-ng-backend`
 Run: `cargo test -p pkcs11-proxy-ng --test local_quality_gate_test`
 Expected: PASS.
 
-- [ ] **Step 7: Commit (submodule)**
+- [x] **Step 7: Commit (submodule)**
 
 ```bash
 git add -A
@@ -506,7 +506,7 @@ it; walked sets unchanged."
 - Produces: `pub fn pkcs11_module::function_list(lib: &libloading::Library) -> Result<*mut cryptoki_sys::CK_FUNCTION_LIST, String>`
 - Task 5 consumes it as the legacy branch of primary selection.
 
-- [ ] **Step 1: Create `crates/module/src/acquire.rs`**
+- [x] **Step 1: Create `crates/module/src/acquire.rs`**
 
 Move the body of `FfiBackend::try_get_function_list` (in
 `crates/backend/src/ffi/loading.rs`) into a free function:
@@ -547,7 +547,7 @@ pub mod acquire;
 pub use acquire::function_list;
 ```
 
-- [ ] **Step 2: Repoint backend**
+- [x] **Step 2: Repoint backend**
 
 In `crates/backend/src/ffi/loading.rs`:
 - delete the private `fn try_get_function_list`;
@@ -558,13 +558,13 @@ In `crates/backend/src/ffi/loading.rs`:
 by every backend test that loads a real module, and by Task 4's env-gated
 real-provider test alongside `interface_list`.)
 
-- [ ] **Step 3: Verify**
+- [x] **Step 3: Verify**
 
 Run: `cargo fmt --all && cargo check`
 Run: `cargo test -p pkcs11-module && cargo test -p pkcs11-proxy-ng-backend`
 Expected: PASS.
 
-- [ ] **Step 4: Commit (submodule)**
+- [x] **Step 4: Commit (submodule)**
 
 ```bash
 git add -A
@@ -596,7 +596,7 @@ impl RawInterface { pub fn is_standard(&self) -> bool; }
 pub fn interface_list(lib: &Library) -> Result<Option<Vec<RawInterface>>, String>;
 ```
 
-- [ ] **Step 1: Write the failing deterministic test matrix**
+- [x] **Step 1: Write the failing deterministic test matrix**
 
 Append a `tests` module to `acquire.rs`. The seam is resolver-level:
 `interface_list_impl(None)` models an absent export. Non-null test pointers
@@ -758,12 +758,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p pkcs11-module acquire`
 Expected: FAIL to compile — `RawInterface`, `interface_list_impl` not defined.
 
-- [ ] **Step 3: Implement in `acquire.rs`**
+- [x] **Step 3: Implement in `acquire.rs`**
 
 ```rust
 use cryptoki_sys::{CK_INTERFACE, CK_RV, CK_ULONG, CKR_BUFFER_TOO_SMALL, CKR_OK};
@@ -912,12 +912,12 @@ unsafe fn raw_interface(iface: &CK_INTERFACE) -> RawInterface {
 Re-export in `lib.rs`: add `RawInterface`, `interface_list` to the
 `pub use acquire::{...}` list.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p pkcs11-module`
 Expected: PASS (all).
 
-- [ ] **Step 5: Add the env-gated real-provider test**
+- [x] **Step 5: Add the env-gated real-provider test**
 
 Append to the same `tests` module (pattern follows backend's existing
 BouncyHSM test — skip when the module is absent):
@@ -953,7 +953,7 @@ Run: `cargo test -p pkcs11-module` (expect skip locally unless env set; if a
 3.x module path is known in this environment, run once with
 `PKCS11_MODULE_TEST_3X_MODULE=<path>` and confirm PASS).
 
-- [ ] **Step 6: Verify + commit (submodule)**
+- [x] **Step 6: Verify + commit (submodule)**
 
 Run: `cargo fmt --all && cargo check && cargo test -p pkcs11-module`
 
@@ -997,7 +997,7 @@ fn select_versioned(
   `resolve_get_interface`, `primary_interface_fallback`, and all existing
   tests (including the env-gated BouncyHSM test) stay.
 
-- [ ] **Step 1: Write the failing driver tests**
+- [x] **Step 1: Write the failing driver tests**
 
 Append to the existing `tests` module in `loading.rs`:
 
@@ -1080,13 +1080,13 @@ closure returns — since `NonNull::dangling()` is deterministic for a given
 type, constructing two `answer(b"PKCS 11")` values yields the same pointer;
 asserting equality against a separately-constructed one is fine.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p pkcs11-proxy-ng-backend loading`
 Expected: FAIL to compile — `select_primary`, `select_versioned`,
 `InterfaceAnswer` not defined.
 
-- [ ] **Step 3: Implement the driver + FFI adapter; rewire `load_with_init_args`**
+- [x] **Step 3: Implement the driver + FFI adapter; rewire `load_with_init_args`**
 
 In `loading.rs`, **delete** `try_get_interface`,
 `try_get_versioned_interface`, and `get_interface_with_name`. **Keep**
@@ -1225,7 +1225,7 @@ let func_list_3_2 = get_iface_sym
 Preserve the existing block comment above the 3.0/3.2 discovery (the
 BouncyHSM fallback rationale) — move it onto this rewired block.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -p pkcs11-proxy-ng-backend loading`
 Expected: PASS — the four new driver tests plus the existing
@@ -1233,7 +1233,7 @@ Expected: PASS — the four new driver tests plus the existing
 `has_interface_accessors_*`, and (if the module is present) the env-gated
 BouncyHSM test.
 
-- [ ] **Step 5: Full backend + server suites**
+- [x] **Step 5: Full backend + server suites**
 
 Run: `cargo fmt --all && cargo check`
 Run: `cargo test -p pkcs11-proxy-ng-backend && cargo test -p pkcs11-proxy-ng`
@@ -1241,7 +1241,7 @@ Expected: PASS. If SoftHSM2-backed integration tests exist in this
 environment they must pass unchanged — §6a does not alter selection for any
 conforming provider (SoftHSM2 answers the named standard query).
 
-- [ ] **Step 6: Commit (submodule)**
+- [x] **Step 6: Commit (submodule)**
 
 ```bash
 git add -A
@@ -1273,7 +1273,7 @@ matrix (SoftHSM2 baseline) before merge."
 - Modify: `AGENTS.md` (§13 Architecture Quick Reference)
 - Modify: `doc/architecture-overview.md` (crate table)
 
-- [ ] **Step 1: AGENTS.md §13**
+- [x] **Step 1: AGENTS.md §13**
 
 Add one bullet after the **FFI backend** entry:
 
@@ -1286,7 +1286,7 @@ Add one bullet after the **FFI backend** entry:
   via git dependency. Interface-*selection* policy stays in the backend.
 ```
 
-- [ ] **Step 2: architecture-overview.md crate table**
+- [x] **Step 2: architecture-overview.md crate table**
 
 Add a row to the "Current Crate Structure" table (after `backend`):
 
@@ -1294,7 +1294,7 @@ Add a row to the "Current Crate Structure" table (after `backend`):
 | `module` | lib | Shared module-FFI facts: raw function-table acquisition, field-offset tables, layout selection (`pkcs11-module`; consumed by backend and externally) |
 ```
 
-- [ ] **Step 3: Verify the dependency claim and the whole tree**
+- [x] **Step 3: Verify the dependency claim and the whole tree**
 
 Run: `cargo tree -p pkcs11-module --edges normal`
 Expected: only `libloading` and `cryptoki-sys` subtrees — no tonic, prost,
@@ -1305,7 +1305,7 @@ Expected: full workspace suite PASS. (This approximates the spec's
 fresh-clone standalone check; the real fresh-clone verification happens in
 CI as it does today.)
 
-- [ ] **Step 4: Commit (submodule)**
+- [x] **Step 4: Commit (submodule)**
 
 ```bash
 git add -A
@@ -1315,6 +1315,9 @@ git commit -m "docs: add pkcs11-module to the architecture quick reference and o
 ---
 
 ### Task 7: Provider-matrix gate for §6a (spec requirement before merge)
+
+> Task 7 (provider-matrix gate) is owned by the pkcs11-proxy-ng project;
+> not tracked in this repo.
 
 **Working directory: the umbrella repo** `/home/user/src/m/pkcs11-proxy-ng-ws`.
 
@@ -1355,19 +1358,19 @@ addition here — it exercises the versioned unnamed fallback §6a touches.
 
 **Working directory: the umbrella repo** `/home/user/src/m/pkcs11-proxy-ng-ws`.
 
-- [ ] **Step 1: Confirm the submodule is clean and pushedable**
+- [x] **Step 1: Confirm the submodule is clean and pushedable**
 
 Run (in the submodule): `git status --short` → empty; `git log --oneline -7`
 → the Task 1–6 commits on top of the previous HEAD.
 
-- [ ] **Step 2: Bump the pointer**
+- [x] **Step 2: Bump the pointer**
 
 ```bash
 git add pkcs11-proxy-ng
 git commit -m "chore: advance proxy for the pkcs11-module extraction"
 ```
 
-- [ ] **Step 3: Mark the spec's status**
+- [x] **Step 3: Mark the spec's status**
 
 In the **pkcs11-scope repo**, edit
 `docs/superpowers/specs/2026-08-10-module-crate-extraction-design.md`

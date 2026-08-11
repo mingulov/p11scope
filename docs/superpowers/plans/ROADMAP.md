@@ -45,6 +45,12 @@ SoftHSM2 has `p_offset == p_vaddr`).
   (offset-based), PID/cgroup filter maps, aggregate counts/latency/CK_RV in
   BPF maps, `metrics` mode live summary. Fully static musl build (the
   observer never dlopens providers).
+- Phase 1 is executed as two plans: **1a** — offset-semantics pin +
+  `p11scope-discover` ([plan](2026-08-11-phase1a-discover.md)); **1b** — aya
+  attach engine + `metrics` mode, plan written only after 1a lands (the
+  plan-after-inputs rule above). Gate G1 closes when both have landed.
+  The `pkcs11-proxy-ng-types` dependency is deferred until code actually
+  needs it (review, 2026-08-11) — the helper consumes only `pkcs11-module`.
 
 **Gate G1 (engineering review):** /code-review on both repos' branches;
 proxy-ng test suite green after the extraction; manifest reuse refused on

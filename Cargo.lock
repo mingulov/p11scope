@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "assert_matches"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -209,6 +215,14 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "p11scope"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "aya",
+ "p11scope-ebpf-common",
+ "p11scope-manifest",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "p11scope-discover"

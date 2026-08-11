@@ -48,7 +48,19 @@ SoftHSM2 has `p_offset == p_vaddr`).
 - Phase 1 is executed as two plans: **1a** — offset-semantics pin +
   `p11scope-discover` ([plan](2026-08-11-phase1a-discover.md)); **1b** — aya
   attach engine + `metrics` mode, plan written only after 1a lands (the
-  plan-after-inputs rule above). Gate G1 closes when both have landed.
+  plan-after-inputs rule above). Both have landed; Gate G1 verification
+  complete against all criteria: proxy-ng test suite green after extraction
+  (verified 2026-08-11, 18 module + 303 backend + 62 quality-gate tests);
+  helper verified in ubuntu (glibc) and alpine (musl) containers (68/68,
+  `scripts/verify-discover-containers.sh`); manifest reuse refused on
+  build-ID mismatch, tested (`tests/reuse.rs`, 4 tests); attach failures and
+  aliased offsets surfaced in output rather than dropped (`render::Evidence`,
+  COMPLETE only when no attach failures, no skipped entries, no aliasing,
+  nothing in flight); end-to-end counts verified against the deterministic
+  oracle (9/9 functions matched `spike/expected.txt` exactly, 136/136 probes
+  attached, completeness COMPLETE; `scripts/verify-attach-e2e.sh`,
+  `docs/notes/phase1b-e2e.md`). Remaining criterion: `/code-review` on both
+  repos' branches (human-triggered step, awaiting review).
   The `pkcs11-proxy-ng-types` dependency is deferred until code actually
   needs it (review, 2026-08-11) — the helper consumes only `pkcs11-module`.
 

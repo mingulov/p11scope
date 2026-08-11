@@ -43,16 +43,28 @@ pub struct Evidence {
     /// informational, does not affect `completeness`.
     pub unmatched_closes: u64,
     /// `*Init` calls whose parameter decode did not apply for a mechanism
-    /// id that decoded successfully at least once elsewhere in this
-    /// capture (`semantics::State::shape_decode_failures`) — an
-    /// inconsistent-decode signal. Informational: does not affect
-    /// `completeness`, since it may reflect provider-side parameter
-    /// validation rather than a capture defect.
+    /// id known to have an allowlisted shape this capture
+    /// (`semantics::State::shape_decode_failures`) — an inconsistent- or
+    /// total-decode-failure signal, by call count. Informational: does not
+    /// affect `completeness` on its own, since an inconsistent decode may
+    /// reflect provider-side parameter validation rather than a capture
+    /// defect. See `shape_decode_total_failures` for the subset (whole
+    /// mechanisms, never once decoded) that does gate `completeness`.
     pub shape_decode_failures: u64,
+    /// Mechanism ids with a published shape whose decode never once
+    /// succeeded this capture (`semantics::State::total_shape_decode_failures`)
+    /// — a real decode regression (wrong offsets, too-short
+    /// `ulParameterLen`, an unfaulted page, every single call), not
+    /// ordinary provider-side rejection variance. Unlike
+    /// `shape_decode_failures`, this **does** gate `completeness`: a
+    /// mechanism in this state renders `params: null` but is not the
+    /// benign "no allowlisted shape" case — see `mechanisms[].note`.
+    pub shape_decode_total_failures: u64,
     /// True when any `templates[].operations[]` entry observed
     /// `attr_total > attr_count` — a template longer than the capture's
-    /// per-event cap. Unlike the informational counters above, this DOES
-    /// gate `completeness`: truncation is lost evidence.
+    /// per-event cap, or a read failure mid-walk. Unlike the informational
+    /// counters above, this DOES gate `completeness`: truncation is lost
+    /// evidence.
     pub templates_truncated: bool,
     pub completeness: &'static str,
 }
@@ -68,8 +80,9 @@ impl Evidence {
     /// nothing was skipped, no aliasing ambiguity, no call left in flight,
     /// every surface was fully walked with a successful acquisition, no
     /// vendor interfaces were left undecoded, (profile mode) the ring
-    /// buffer neither dropped nor emitted a malformed record, and no
-    /// template was truncated.
+    /// buffer neither dropped nor emitted a malformed record, no template
+    /// was truncated, and no mechanism's parameter decode failed on every
+    /// single observed call.
     pub fn verdict(&mut self) {
         let surfaces_complete =
             self.surfaces.iter().all(|s| s.walk == "full" && s.acquisition == "ok");
@@ -82,6 +95,7 @@ impl Evidence {
             && self.event_loss == 0
             && self.malformed_records == 0
             && !self.templates_truncated
+            && self.shape_decode_total_failures == 0
         {
             "COMPLETE"
         } else {
@@ -150,6 +164,7 @@ pub fn live(reports: &[SlotReport], ev: &Evidence, elapsed: Duration, module: &s
         || ev.event_loss > 0
         || ev.malformed_records > 0
         || ev.templates_truncated
+        || ev.shape_decode_total_failures > 0
     {
         evidence_line.push_str(" ·");
         if surface_gaps > 0 {
@@ -166,6 +181,12 @@ pub fn live(reports: &[SlotReport], ev: &Evidence, elapsed: Duration, module: &s
         }
         if ev.templates_truncated {
             evidence_line.push_str(" templates truncated");
+        }
+        if ev.shape_decode_total_failures > 0 {
+            evidence_line.push_str(&format!(
+                " {n} mechanisms never decoded",
+                n = ev.shape_decode_total_failures
+            ));
         }
     }
     if ev.orphan_ops > 0 || ev.unmatched_closes > 0 || ev.shape_decode_failures > 0 {
@@ -448,10 +469,24 @@ pub fn profile_json(
                 .filter_map(|(&(sh, p0, p1, p2), &count)| param_combo_json(sh, p0, p1, p2, count))
                 .collect();
             let (params, note) = if combos.is_empty() {
-                (
-                    serde_json::Value::Null,
-                    "parameter decoding is Phase 3; not attempted here, never a partial decode",
-                )
+                if state.mech_shapes().contains_key(id) {
+                    // A published shape exists for this id, but not one
+                    // observed call decoded successfully — a total decode
+                    // failure, never "not attempted" (see
+                    // evidence.shape_decode_total_failures, which this
+                    // mechanism forces nonzero).
+                    (
+                        serde_json::Value::Null,
+                        "this mechanism has an allowlisted parameter shape, but every decode \
+                         attempt failed in this capture (see evidence.shape_decode_total_failures \
+                         and evidence.shape_decode_failures) — never a partial decode",
+                    )
+                } else {
+                    (
+                        serde_json::Value::Null,
+                        "parameter decoding is Phase 3; not attempted here, never a partial decode",
+                    )
+                }
             } else {
                 (
                     serde_json::Value::Array(combos),
@@ -548,6 +583,7 @@ mod tests {
             orphan_ops: 0,
             unmatched_closes: 0,
             shape_decode_failures: 0,
+            shape_decode_total_failures: 0,
             templates_truncated: false,
             completeness: "UNKNOWN",
         }
@@ -573,6 +609,7 @@ mod tests {
             |e: &mut Evidence| e.event_loss = 1,
             |e: &mut Evidence| e.malformed_records = 1,
             |e: &mut Evidence| e.templates_truncated = true,
+            |e: &mut Evidence| e.shape_decode_total_failures = 1,
         ] {
             let mut ev = evidence();
             mutate(&mut ev);
@@ -876,6 +913,64 @@ mod tests {
         let v = profile_json(&[], &ev, &state, &capture);
 
         assert_eq!(v["mechanisms"][0]["params"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn total_decode_failure_forces_partial_with_an_honest_note() {
+        use p11scope_ebpf_common::shape;
+
+        // Mechanism has a published GCM shape, but every observed *Init
+        // fails to decode (shape::NONE on both calls).
+        let mut state = crate::semantics::State::new(&init_plan());
+        state.observe(&init_event(0, 0x1087, shape::NONE, 0, 0, 0));
+        state.observe(&init_event(0, 0x1087, shape::NONE, 0, 0, 0));
+        state.set_mech_shapes(std::collections::BTreeMap::from([(0x1087, shape::GCM)]));
+
+        let mut ev = evidence();
+        ev.shape_decode_failures = state.shape_decode_failures();
+        ev.shape_decode_total_failures = state.total_shape_decode_failures();
+        ev.verdict();
+        assert_eq!(ev.shape_decode_total_failures, 1);
+        assert_eq!(ev.completeness, "PARTIAL", "a total decode failure must force PARTIAL");
+
+        let capture = CaptureMeta { module: "/opt/p11.so", build_id: None, started: "t0", ended: "t1", kernel: "6.8.0" };
+        let v = profile_json(&[], &ev, &state, &capture);
+        assert_eq!(v["mechanisms"][0]["params"], serde_json::Value::Null);
+        let note = v["mechanisms"][0]["note"].as_str().unwrap();
+        assert!(
+            !note.contains("not attempted here"),
+            "a total decode failure must never read as decoding not having been attempted: {note}"
+        );
+        assert!(note.contains("every decode attempt failed"), "note: {note}");
+        assert_eq!(v["evidence"]["shape_decode_total_failures"], 1);
+        assert_eq!(v["evidence"]["completeness"], "PARTIAL");
+    }
+
+    #[test]
+    fn mechanism_with_no_published_shape_keeps_the_not_attempted_note_and_stays_complete() {
+        use p11scope_ebpf_common::shape;
+
+        let mut state = crate::semantics::State::new(&init_plan());
+        state.observe(&init_event(0, 0x0999, shape::NONE, 0, 0, 0));
+        // A different mechanism id is published — 0x0999 itself is not.
+        state.set_mech_shapes(std::collections::BTreeMap::from([(0x1087, shape::GCM)]));
+
+        let mut ev = evidence();
+        ev.shape_decode_failures = state.shape_decode_failures();
+        ev.shape_decode_total_failures = state.total_shape_decode_failures();
+        ev.verdict();
+        assert_eq!(ev.shape_decode_failures, 0);
+        assert_eq!(ev.shape_decode_total_failures, 0);
+        assert_eq!(ev.completeness, "COMPLETE", "an ordinary id-only mechanism is not a gap");
+
+        let capture = CaptureMeta { module: "/opt/p11.so", build_id: None, started: "t0", ended: "t1", kernel: "6.8.0" };
+        let v = profile_json(&[], &ev, &state, &capture);
+        assert_eq!(v["mechanisms"][0]["params"], serde_json::Value::Null);
+        assert_eq!(
+            v["mechanisms"][0]["note"],
+            "parameter decoding is Phase 3; not attempted here, never a partial decode"
+        );
+        assert_eq!(v["evidence"]["completeness"], "COMPLETE");
     }
 
     fn template_plan() -> crate::plan::AttachPlan {

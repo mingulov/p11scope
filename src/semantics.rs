@@ -142,6 +142,15 @@ pub struct State {
     sessions: SessionStats,
     orphan_ops: u64,
     unmatched_closes: u64,
+    /// Mechanism id -> published shape code, exactly what was written into
+    /// the BPF `MECH_SHAPE` map this capture (`shapes::expected_shapes`).
+    /// Empty unless the caller opts in via `set_mech_shapes` — tests that
+    /// don't care about the decode-failure distinction are unaffected.
+    /// This is what lets `shape_decode_failures`/`total_shape_decode_failures`
+    /// tell "no allowlisted shape for this id" apart from "an allowlisted
+    /// shape whose decode never once succeeded" — a distinction the event
+    /// stream alone cannot make.
+    mech_shapes: BTreeMap<u64, u32>,
 }
 
 fn pid_of(ev: &Event) -> u32 {
@@ -178,7 +187,19 @@ impl State {
             sessions: SessionStats::default(),
             orphan_ops: 0,
             unmatched_closes: 0,
+            mech_shapes: BTreeMap::new(),
         }
+    }
+
+    /// Records which mechanism ids have a published (allowlisted)
+    /// parameter shape this capture — the same set `shapes::publish`
+    /// wrote into the BPF `MECH_SHAPE` map. Optional: call before
+    /// `observe`-ing (or any time before reading `shape_decode_failures`/
+    /// `total_shape_decode_failures`/rendering `mechanisms[].note`) to
+    /// enable the "total decode failure" distinction; without it, those
+    /// only see the weaker "decoded successfully somewhere" signal.
+    pub fn set_mech_shapes(&mut self, mech_shapes: BTreeMap<u64, u32>) {
+        self.mech_shapes = mech_shapes;
     }
 
     pub fn observe(&mut self, ev: &Event) {
@@ -346,23 +367,46 @@ impl State {
         self.templates.values().any(|t| t.truncated)
     }
 
-    /// `*Init` calls whose parameter decode did not apply, for mechanism
-    /// ids that decoded successfully **at least once** elsewhere in this
-    /// capture — an inconsistent-decode signal, not a completeness gap
-    /// (see `MechStat::init_no_shape`). A mechanism id that never decoded
-    /// **at all** — including one whose *every* decode attempt failed —
-    /// contributes nothing here: distinguishing "no decodable shape" from
-    /// "a decodable shape that failed on every single call" needs the
-    /// registry (which id→shape mapping was published), and this
-    /// accessor only has the event stream. This is a deliberate, disclosed
-    /// blind spot, not an oversight — see `docs/schema/observed-profile-v1.md`
-    /// ("`params` in v1.1" and the `shape_decode_failures` evidence row).
+    /// Mechanism id -> published shape code, as set by `set_mech_shapes`
+    /// (empty if the caller never called it).
+    pub fn mech_shapes(&self) -> &BTreeMap<u64, u32> {
+        &self.mech_shapes
+    }
+
+    /// `*Init` calls whose parameter decode did not apply, counted for
+    /// every mechanism id that is **known to have an allowlisted shape**
+    /// this capture — either because it decoded successfully at least
+    /// once (`param_combos` non-empty, the signal available even without
+    /// `set_mech_shapes`), or because `set_mech_shapes` says its id has a
+    /// published shape (catching the *total*-failure case too: a
+    /// mechanism whose decode fails on **every** call). Informational:
+    /// does **not** affect `completeness` — an inconsistent (some calls
+    /// decode, some don't) decode may reflect provider-side parameter
+    /// validation, not a capture defect. For the subset that gates
+    /// `completeness`, see `total_shape_decode_failures`.
     pub fn shape_decode_failures(&self) -> u64 {
         self.mechanisms
-            .values()
-            .filter(|m| !m.param_combos.is_empty())
-            .map(|m| m.init_no_shape)
+            .iter()
+            .filter(|(id, m)| !m.param_combos.is_empty() || self.mech_shapes.contains_key(id))
+            .map(|(_, m)| m.init_no_shape)
             .sum()
+    }
+
+    /// Mechanism ids with a **published** shape (`set_mech_shapes`) whose
+    /// decode never once succeeded this capture (`param_combos` empty) —
+    /// the specific "total decode failure" case: wrong offsets, a
+    /// too-short `ulParameterLen`, or an unfaulted `pParameter` page, on
+    /// every single observed call. Unlike `shape_decode_failures`, this
+    /// count of *mechanisms* (not calls) **does** gate `completeness`:
+    /// a total failure is a real decode regression, not ordinary
+    /// provider-side rejection variance. Always `0` if `set_mech_shapes`
+    /// was never called (nothing is "known" to have a shape, so nothing
+    /// can be flagged as a total failure of one).
+    pub fn total_shape_decode_failures(&self) -> u64 {
+        self.mechanisms
+            .iter()
+            .filter(|(id, m)| m.param_combos.is_empty() && self.mech_shapes.contains_key(id))
+            .count() as u64
     }
 }
 
@@ -724,6 +768,41 @@ mod tests {
         let unshaped = s.mechanisms().get(&0x9999).unwrap();
         assert_eq!(unshaped.init_no_shape, 1);
         assert!(unshaped.param_combos.is_empty());
+    }
+
+    #[test]
+    fn total_decode_failure_is_invisible_without_mech_shapes_but_visible_with_it() {
+        let mut s = State::new(&test_plan());
+        // 0x1087 has a published GCM shape, but every observed call fails
+        // to decode — the total-failure case Finding 1 flagged.
+        s.observe(&ev_shape(100, 10, 0x1087, 0, shape::NONE, (0, 0, 0)));
+        s.observe(&ev_shape(100, 10, 0x1087, 0, shape::NONE, (0, 0, 0)));
+
+        // Without set_mech_shapes, this mechanism looks identical to an
+        // ordinary id-only mechanism — the old, narrower signal.
+        assert_eq!(s.shape_decode_failures(), 0);
+        assert_eq!(s.total_shape_decode_failures(), 0);
+
+        // Once the published-shape set is known, both counters see it.
+        s.set_mech_shapes(BTreeMap::from([(0x1087, shape::GCM)]));
+        assert_eq!(s.shape_decode_failures(), 2, "both failed calls now count");
+        assert_eq!(
+            s.total_shape_decode_failures(),
+            1,
+            "one mechanism id, wholly failed — the completeness-gating count"
+        );
+    }
+
+    #[test]
+    fn mechanism_with_no_published_shape_never_counts_as_a_total_failure() {
+        let mut s = State::new(&test_plan());
+        s.observe(&ev_shape(100, 10, 0x9999, 0, shape::NONE, (0, 0, 0)));
+        // 0x9999 is not in the published set at all — an ordinary
+        // "no allowlisted shape for this mechanism" id.
+        s.set_mech_shapes(BTreeMap::from([(0x1087, shape::GCM)]));
+
+        assert_eq!(s.total_shape_decode_failures(), 0);
+        assert_eq!(s.shape_decode_failures(), 0);
     }
 
     #[test]

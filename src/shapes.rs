@@ -27,6 +27,21 @@ pub fn code_for(shape_name: &str) -> u32 {
     }
 }
 
+/// Every registered mechanism id whose shape maps to a non-NONE code,
+/// mapped to that code — exactly the set `publish` writes into the BPF
+/// `MECH_SHAPE` map. Exposed so userspace can also answer "does this
+/// mechanism id have an allowlisted parameter shape at all" without a
+/// second registry parse — e.g. `semantics::State` uses this to tell "no
+/// decodable shape" apart from "a decodable shape whose decode failed on
+/// every observed call" (see `render`'s `mechanisms[].note`).
+pub fn expected_shapes(reg: &MechanismRegistry) -> std::collections::BTreeMap<u64, u32> {
+    reg.registered_mechanisms()
+        .into_iter()
+        .filter_map(|mech| reg.param_shape(mech).map(|name| (mech, code_for(name))))
+        .filter(|&(_, code)| code != shape::NONE)
+        .collect()
+}
+
 /// Publishes MECH_SHAPE from the registry: every registered mechanism
 /// whose shape maps to a non-NONE code gets an entry. Returns how many
 /// were published. Called once, before uprobes attach — same
@@ -36,17 +51,11 @@ pub fn code_for(shape_name: &str) -> u32 {
 pub fn publish(ebpf: &mut Ebpf, reg: &MechanismRegistry) -> Result<usize> {
     let mut shapes: HashMap<_, u64, u32> =
         HashMap::try_from(ebpf.map_mut("MECH_SHAPE").context("MECH_SHAPE map")?)?;
-    let mut published = 0usize;
-    for mech in reg.registered_mechanisms() {
-        let Some(name) = reg.param_shape(mech) else { continue };
-        let code = code_for(name);
-        if code == shape::NONE {
-            continue;
-        }
+    let expected = expected_shapes(reg);
+    for (&mech, &code) in &expected {
         shapes.insert(mech, code, 0)?;
-        published += 1;
     }
-    Ok(published)
+    Ok(expected.len())
 }
 
 #[cfg(test)]
@@ -104,6 +113,19 @@ mod tests {
         assert!(
             shaped.iter().any(|&(id, c)| id == CKM_RSA_PKCS_PSS && c == shape::RSA_PKCS_PSS),
             "expected CKM_RSA_PKCS_PSS among the PSS-shaped mechanisms"
+        );
+    }
+
+    #[test]
+    fn expected_shapes_matches_what_publish_would_write() {
+        let reg = MechanismRegistry::load(None).expect("load embedded registry");
+        let expected = expected_shapes(&reg);
+        assert_eq!(expected.get(&CKM_AES_GCM), Some(&shape::GCM));
+        assert_eq!(expected.get(&CKM_RSA_PKCS_PSS), Some(&shape::RSA_PKCS_PSS));
+        assert!(!expected.is_empty());
+        assert!(
+            expected.values().all(|&c| c != shape::NONE),
+            "NONE-shaped mechanisms must never appear in the published set"
         );
     }
 }

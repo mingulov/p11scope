@@ -2,7 +2,7 @@
 //! point; the modules themselves live in the `p11scope` library crate
 //! (`src/lib.rs`) so integration tests can exercise them directly.
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use p11scope::attach::{Scope, Session};
 use p11scope::{discover_cmd, events, metrics, plan, render, scope, semantics, verify};
 use p11scope_manifest::manifest::{Manifest, SCHEMA};
@@ -152,6 +152,17 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
     // Only `--mode profile` decodes the event stream; `--mode metrics` never
     // drains the ring buffer, so it stays the lighter, maps-only level.
     let mut state = semantics::State::new(&plan);
+    // Same embedded-defaults registry load `Session::start` already did to
+    // publish MECH_SHAPE (attach.rs) — reloaded here (cheap: no I/O, no
+    // dlopen) so `state` can tell "no allowlisted shape for this
+    // mechanism" apart from "an allowlisted shape whose decode failed on
+    // every call" when rendering. A future task can share one load instead
+    // of two without touching this call's placement.
+    {
+        let registry = pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry::load(None)
+            .map_err(|e| anyhow!("loading mechanism registry: {e}"))?;
+        state.set_mech_shapes(p11scope::shapes::expected_shapes(&registry));
+    }
     let mut malformed_records: u64 = 0;
     let drain_events = |session: &mut Session, state: &mut semantics::State| -> Result<u64> {
         let mut drain = events::Drain::new(&mut session.ebpf)?;
@@ -254,6 +265,7 @@ fn evidence_for(
         orphan_ops: state.orphan_ops(),
         unmatched_closes: state.unmatched_closes(),
         shape_decode_failures: state.shape_decode_failures(),
+        shape_decode_total_failures: state.total_shape_decode_failures(),
         templates_truncated: state.templates_truncated(),
         completeness: "UNKNOWN",
     };

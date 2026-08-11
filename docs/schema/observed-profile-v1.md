@@ -36,6 +36,14 @@ questions:
   decode failures (`evidence.malformed_records`). `mechanisms`, `sessions`,
   and `logins` are built from it exclusively; there is no aggregate-map
   equivalent for any of them.
+- **The mechanism registry** (`pkcs11-proxy-ng-types::MechanismRegistry`,
+  loaded embedded-default, no config-file plumbing) is a third, much
+  narrower input: it only affects whether `mechanisms[].note` can tell "no
+  allowlisted shape for this id" apart from "an allowlisted shape whose
+  decode failed on every call" (`shape_decode_total_failures`, new in
+  v1.1) — the same registry `shapes::publish` already used to fill
+  `MECH_SHAPE` before attaching. It never adds or removes a mechanism
+  entry, changes any count, or supplies any value inside `params`.
 
 Where a reader needs an authoritative call count for a specific function
 name, use `functions`, never sum `mechanisms[].calls` — a session's
@@ -98,23 +106,29 @@ meaning as in the `v0-metrics` document):
 | **`malformed_records`** | number | *(new in v1)* Ring-buffer records rejected by `events::decode`'s size check — the writer/reader layout drifted mid-capture. Always `0` in `--mode metrics`. |
 | **`orphan_ops`** | number | *(new in v1)* Operational calls (`C_Sign`, `C_Encrypt`, ...) observed with no active `*Init` on their session — expected when the capture attaches mid-operation. Informational: does **not** affect `completeness`. |
 | **`unmatched_closes`** | number | *(new in v1)* `C_CloseSession` calls observed with no matching open. Same: informational, does not affect `completeness`. |
-| **`shape_decode_failures`** | number | *(new in v1.1)* `*Init` calls whose parameter decode did not apply (`Event::shape == shape::NONE`), counted only for mechanism ids that decoded successfully **at least once elsewhere** in this capture (`semantics::State::shape_decode_failures`) — i.e. this mechanism id is known to have a decodable shape, and this call's decode didn't produce one. Informational: does **not** affect `completeness`, since an inconsistent decode may reflect provider-side parameter validation, not a capture defect. **Known blind spot:** a mechanism id whose decode fails on **every** call in this capture — e.g. every `C_EncryptInit` for `CKM_AES_GCM` hits the `ulParameterLen` guard because a nonstandard provider passes a shorter/differently-laid-out `CK_GCM_PARAMS` — contributes **zero** here, because this counter needs at least one in-capture success to know the mechanism has a decodable shape at all; it cannot consult the registry directly (see `mechanisms[].params` below — that mechanism renders identically to one with no allowlisted shape at all: `params: null`, unchanged v1 note). This is a deliberate, disclosed scope limit of the userspace/event-only design, not a transient bug — treat a suspiciously GCM/PSS-shaped mechanism id that never appears with non-null `params` as worth investigating by other means (e.g. a raw capture), not as proof it has no parameters. |
+| **`shape_decode_failures`** | number | *(new in v1.1)* `*Init` calls whose parameter decode did not apply (`Event::shape == shape::NONE`), counted for every mechanism id **known to have an allowlisted shape** this capture (`semantics::State::shape_decode_failures`) — either because it decoded successfully at least once elsewhere (the signal available even without registry access), or because `p11scope profile` published a shape for that id (`shapes::expected_shapes`, wired into `semantics::State::set_mech_shapes`; see `mechanisms[].params` below). A call count, informational: does **not** affect `completeness` by itself, since an inconsistent (sometimes decodes, sometimes doesn't) decode may reflect provider-side parameter validation rather than a capture defect. For the subset of this signal that *does* gate `completeness` — mechanisms that decoded on **zero** calls despite having a published shape — see `shape_decode_total_failures`. |
+| **`shape_decode_total_failures`** | number | *(new in v1.1)* Count of **mechanism ids** (not calls) with a published shape whose decode **never once succeeded** this capture (`semantics::State::total_shape_decode_failures`) — e.g. every `C_EncryptInit` for `CKM_AES_GCM` hits the `ulParameterLen` guard because a nonstandard provider passes a shorter/differently-laid-out `CK_GCM_PARAMS`. Unlike `shape_decode_failures`, this **does** gate `completeness`: a mechanism id known (via the registry) to have a decodable shape, that never once decoded, is a real decode regression — wrong offsets, a too-short parameter buffer, or an unfaulted page, consistently — not ordinary provider-side rejection variance. Such a mechanism still renders `params: null` in `mechanisms[]`, but with a distinct `note` that says so explicitly rather than the "not attempted here" wording (see `mechanisms[].params` below). Always `0` in `--mode metrics`. |
 | **`templates_truncated`** | boolean | *(new in v1.1)* True when any `templates.operations[]` entry observed `attr_total > attr_count` — the template had more entries than the per-event `MAX_ATTRS` (8) cap, **or** the in-kernel walk stopped early because a `bpf_probe_read_user` failed mid-template (an unreadable `pTemplate`/entry) — this field does not distinguish which cause. A short template (well under 8 entries) can still set this if the walk hit a read failure; do not assume ">8 entries" is the only cause. Unlike the two informational counters above, this **does** gate `completeness`: either cause is lost evidence, not merely context. Always `false` in `--mode metrics`, which never drains the ring buffer or builds `templates`. |
 | `completeness` | `"COMPLETE"` or `"PARTIAL"` | See below. |
 
 **Completeness verdict.** `COMPLETE` requires every one of: no attach
 failures, no skipped entries, no aliasing, no in-flight calls, every
 surface fully walked with a successful acquisition, no undecoded vendor
-interfaces, `event_loss == 0`, `malformed_records == 0`, **and (new in
-v1.1) `templates_truncated == false`**. Any other gap — including a
-nonzero `event_loss`, `malformed_records`, or `templates_truncated == true`
-— forces `PARTIAL`. `orphan_ops`, `unmatched_closes`, and (new in v1.1)
+interfaces, `event_loss == 0`, `malformed_records == 0`, `templates_truncated
+== false`, **and (new in v1.1) `shape_decode_total_failures == 0`**. Any
+other gap — including a nonzero `event_loss`, `malformed_records`,
+`templates_truncated == true`, or `shape_decode_total_failures > 0` —
+forces `PARTIAL`. `orphan_ops`, `unmatched_closes`, and
 `shape_decode_failures` are reported for visibility but never flip the
-verdict: they are expected consequences of attaching mid-operation or of
-provider-side parameter handling, not evidence the capture itself lost
-anything. Enforced by `render::tests::any_gap_forces_partial`,
+verdict on their own: they are expected consequences of attaching
+mid-operation, or of provider-side parameter handling that fails
+*inconsistently*, not evidence the capture itself lost anything. A
+mechanism failing *consistently* (`shape_decode_total_failures`) is
+different — see that field's row above. Enforced by
+`render::tests::any_gap_forces_partial`,
 `render::tests::orphan_ops_and_unmatched_closes_do_not_affect_completeness`,
-and `render::tests::profile_json_template_truncation_forces_partial_and_evidence_field`.
+`render::tests::profile_json_template_truncation_forces_partial_and_evidence_field`,
+and `render::tests::total_decode_failure_forces_partial_with_an_honest_note`.
 
 **Gate G2:** the whole `evidence` section, together with `capture`, is what
 keeps **UNKNOWN** honest — a reader can tell "not observed because it
@@ -158,19 +172,40 @@ exists for per-mechanism breakdown):
 | `note` | string | Human-readable restatement of the `params` value's meaning. |
 
 **`params` in v1.1.** `null` when no allowlisted parameter shape ever
-decoded for this mechanism id in this capture. Two causes collapse into
-this one value, and v1.1 cannot always tell them apart: (a) this
-mechanism's registry shape genuinely isn't one of the two this phase
-decodes (ordinary, expected — most mechanisms), or (b) it *is* one of the
-two, but every single decode attempt for it failed this capture (a
-provider-layout mismatch, an unfaulted `pParameter` page every time, ...).
-`evidence.shape_decode_failures` only disambiguates a **mix** of successes
-and failures for the same id — a mechanism that fails on every call is
-invisible to it too (see that field's "known blind spot" note). This is
-**unchanged from v1's `params: null` behavior** and carries the same
-`note` text as before: `"parameter decoding is Phase 3; not attempted
-here, never a partial decode"` — read "not attempted" as "not attempted
-*successfully*", not as proof no attempt occurred.
+decoded for this mechanism id in this capture. Two distinct causes
+collapse into the same `null` value, but `note` now tells them apart
+(both `note` strings are exact — match on them, don't parse `params`
+alone to infer which case applies):
+
+- **No allowlisted shape for this mechanism id.** The ordinary, expected
+  case for most mechanisms — its registry shape isn't one of the two this
+  phase decodes (or it has no registered shape at all). `note`:
+  `"parameter decoding is Phase 3; not attempted here, never a partial
+  decode"` — **unchanged from v1's `params: null` behavior**, same
+  wording as before. Does not affect `completeness`.
+- **An allowlisted shape whose decode failed on every call.** This
+  mechanism id *is* one of the two shapes this phase decodes — `p11scope`
+  published it into `MECH_SHAPE` from the registry — but not one observed
+  `*Init` call for it decoded successfully this capture (a provider
+  parameter-layout mismatch, an `ulParameterLen` that's always too short,
+  an unfaulted `pParameter` page every time, ...). `note`: `"this
+  mechanism has an allowlisted parameter shape, but every decode attempt
+  failed in this capture (see evidence.shape_decode_total_failures and
+  evidence.shape_decode_failures) — never a partial decode"`. This
+  mechanism also forces `evidence.shape_decode_total_failures > 0` and
+  `completeness: PARTIAL` — read "not attempted" in the first bullet's
+  note as never applying here; this is "attempted and failed," a real
+  decode regression, not the benign case.
+
+Distinguishing these needs the mechanism registry (which id → shape was
+published), not just the event stream — `semantics::State::set_mech_shapes`
+carries that from `shapes::expected_shapes`, called once in `main.rs`
+alongside the existing `Session::start` registry load. A consumer of an
+older, unpatched build (or a `State` a caller never called
+`set_mech_shapes` on) only ever sees the first, benign note — this is a
+safe default, not silent data loss: the mechanism's absence from
+`params`/non-null combos is still visible, just not yet labeled as a
+regression.
 
 Otherwise `params` is an **array** of shape-tagged parameter-combination
 objects — one entry per **distinct** combination of decoded scalar values
@@ -349,8 +384,10 @@ schema string itself.
   A v1 consumer that only ever saw `null` and ignored the field is
   unaffected; a consumer that asserted `params` is always `null` needs
   updating.
-- `evidence` gained `shape_decode_failures` (informational) and
-  `templates_truncated` (a new `completeness` gap condition).
+- `evidence` gained `shape_decode_failures` (informational call count),
+  `shape_decode_total_failures` (mechanism count; a new `completeness`
+  gap condition — nonzero forces `PARTIAL`), and `templates_truncated`
+  (boolean; also a new `completeness` gap condition).
 - A new top-level `templates` section was added.
 
 No v1.1 field removes or renames anything v1 defined.

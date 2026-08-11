@@ -2,6 +2,7 @@
 //! directly. Runs vendor code via dlopen; that is why the helper is a
 //! separate unprivileged short-lived process (design spec, Architecture).
 
+pub mod discover;
 pub mod identity;
 pub mod manifest;
 pub mod maps;

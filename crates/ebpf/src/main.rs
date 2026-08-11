@@ -10,8 +10,9 @@ use aya_ebpf::maps::{Array, HashMap, PerCpuArray, PerCpuHashMap, RingBuf};
 use aya_ebpf::programs::{ProbeContext, RetProbeContext};
 use aya_ebpf::{EbpfContext as _, helpers};
 use p11scope_ebpf_common::{
-    CFG_FLAGS, CallStart, Event, FLAG_CGROUP_FILTER, FLAG_PID_FILTER, MAX_SLOTS, MECH_NONE,
-    RING_BYTES, RvKey, SESSION_NONE, SlotStats, StartKey, USER_TYPE_NONE, bucket_of, fnkind,
+    CFG_FLAGS, CallStart, Event, FLAG_CGROUP_FILTER, FLAG_PID_FILTER, MAX_MECH_SHAPES, MAX_SLOTS,
+    MECH_NONE, RING_BYTES, RvKey, SESSION_NONE, SlotStats, StartKey, USER_TYPE_NONE, bucket_of,
+    fnkind,
 };
 
 #[map]
@@ -37,6 +38,13 @@ static RV_COUNTS: PerCpuHashMap<RvKey, u64> = PerCpuHashMap::with_max_entries(40
 /// UB, never a guess.
 #[map]
 static SLOT_KIND: Array<u32> = Array::with_max_entries(MAX_SLOTS, 0);
+
+/// Mechanism id -> parameter shape code, published by userspace from
+/// proxy-ng's registry (Task 1). Not consumed yet — Task 3 adds the
+/// in-kernel decode that switches on it. An unknown mechanism id looks
+/// up empty, which callers must treat as `shape::NONE`.
+#[map]
+static MECH_SHAPE: HashMap<u64, u32> = HashMap::with_max_entries(MAX_MECH_SHAPES, 0);
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(RING_BYTES, 0);

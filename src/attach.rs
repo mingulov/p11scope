@@ -2,10 +2,11 @@
 //! slot; the attach cookie carries the slot index.
 
 use crate::plan::AttachPlan;
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use aya::Ebpf;
 use aya::programs::UProbe;
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeScope};
+use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
 
 /// Which processes the capture covers. Scope is always explicit.
 #[derive(Debug, Clone)]
@@ -30,6 +31,15 @@ impl Session {
             for slot in &plan.slots {
                 kinds.set(slot.index, slot.kind, 0)?;
             }
+        }
+        {
+            // Embedded defaults: this binary ships statically and has no
+            // config-file plumbing yet, so `None` is the only reachable
+            // path today. A future task can thread a path through here
+            // without touching the publish-before-attach placement.
+            let registry = MechanismRegistry::load(None)
+                .map_err(|e| anyhow!("loading mechanism registry: {e}"))?;
+            crate::shapes::publish(&mut ebpf, &registry).context("publishing MECH_SHAPE")?;
         }
         let uprobe_scope = match scope {
             Scope::Pid(pid) => UProbeScope::OneProcess(

@@ -101,6 +101,21 @@ pub mod fnkind {
     pub const LOGIN: u32 = 4;
 }
 
+/// Mechanism parameter shape codes. Userspace maps the registry's shape
+/// string to one of these and publishes it into MECH_SHAPE, keyed by
+/// mechanism id; only shapes this phase decodes get a non-NONE code, and
+/// an absent/unrecognized shape degrades to NONE (decode nothing) — the
+/// same "unknown degrades to no capture" contract as `fnkind`.
+pub mod shape {
+    pub const NONE: u32 = 0;
+    pub const RSA_PKCS_PSS: u32 = 1;
+    pub const GCM: u32 = 2;
+}
+
+/// MECH_SHAPE map capacity. 336 mechanisms are registered upstream today;
+/// this covers that several times over.
+pub const MAX_MECH_SHAPES: u32 = 1024;
+
 /// Sentinels. Zero is a legal PKCS#11 value for some of these, so absence
 /// gets its own out-of-band marker.
 pub const MECH_NONE: u64 = u64::MAX;

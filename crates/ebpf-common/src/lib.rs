@@ -83,6 +83,73 @@ unsafe impl aya::Pod for StartKey {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for RvKey {}
 
+/// What a slot's function *is*, semantically. Userspace classifies each
+/// slot from the manifest's names and publishes this into SLOT_KIND; the
+/// BPF programs switch on it to decide which arguments are safe to read.
+/// A plain u32 rather than a Rust enum: it crosses the map boundary, and
+/// an unknown value must degrade to "no capture", never to UB.
+pub mod fnkind {
+    pub const OTHER: u32 = 0;
+    /// (hSession, pMechanism) — read mechanism type from arg1.
+    pub const INIT_WITH_MECH: u32 = 1;
+    /// (slotID, flags, pApp, notify, phSession) — session via arg4 out-pointer.
+    pub const OPEN_SESSION: u32 = 2;
+    /// (hSession, ...) — session is arg0.
+    pub const SESSION_ARG0: u32 = 3;
+    /// (hSession, userType, pPin, ulPinLen) — userType from arg1. pPin is
+    /// NEVER read, in any mode, at any privilege.
+    pub const LOGIN: u32 = 4;
+}
+
+/// Sentinels. Zero is a legal PKCS#11 value for some of these, so absence
+/// gets its own out-of-band marker.
+pub const MECH_NONE: u64 = u64::MAX;
+pub const SESSION_NONE: u64 = u64::MAX;
+pub const USER_TYPE_NONE: u32 = u32::MAX;
+
+/// Ring buffer capacity in bytes. Must be a power of two and page-aligned.
+/// 256 KiB holds ~2700 events; the induced-gap test (Task 7) overrides it
+/// to force loss deliberately.
+pub const RING_BYTES: u32 = 256 * 1024;
+
+/// What the entry probe stashes until the matching return. Replaces the
+/// bare timestamp Phase 1b stored.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CallStart {
+    pub ts_ns: u64,
+    pub session: u64,
+    pub mechanism: u64,
+    /// `phSession` for C_OpenSession; 0 otherwise. Read only at return.
+    pub out_ptr: u64,
+    pub user_type: u32,
+    pub _pad: u32,
+}
+
+/// One completed call. Emitted at return only: a call with no return is
+/// visible as in-flight in the aggregate maps, never as a partial event.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Event {
+    pub ts_ns: u64,
+    pub duration_ns: u64,
+    pub pid_tgid: u64,
+    pub cgroup_id: u64,
+    /// Raw handle. Pseudonymized in userspace; never written to output.
+    pub session: u64,
+    pub mechanism: u64,
+    pub rv: u64,
+    pub slot: u32,
+    pub kind: u32,
+    pub user_type: u32,
+    pub _pad: u32,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for CallStart {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for Event {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +173,28 @@ mod tests {
         // Saturates, never indexes out of bounds.
         assert_eq!(bucket_of(u64::MAX), (LATENCY_BUCKETS - 1) as u32);
         assert!((bucket_of(u64::MAX) as usize) < LATENCY_BUCKETS);
+    }
+
+    #[test]
+    fn event_and_callstart_have_no_implicit_padding() {
+        // Both cross the kernel/userspace boundary as raw bytes; implicit
+        // tail padding would read as uninitialized on one side.
+        assert_eq!(core::mem::size_of::<CallStart>(), 8 * 4 + 4 + 4);
+        assert_eq!(core::mem::size_of::<Event>(), 8 * 7 + 4 * 4);
+        assert_eq!(core::mem::align_of::<Event>(), 8);
+    }
+
+    #[test]
+    fn ring_bytes_is_page_aligned_power_of_two() {
+        assert!(RING_BYTES.is_power_of_two());
+        assert_eq!(RING_BYTES % 4096, 0);
+    }
+
+    #[test]
+    fn sentinels_do_not_collide_with_real_values() {
+        // CKM_SHA256 = 0x250, CKU_USER = 1, session handles are small.
+        assert_ne!(MECH_NONE, 0x250);
+        assert_ne!(USER_TYPE_NONE, 1);
+        assert_ne!(SESSION_NONE, 0);
     }
 }

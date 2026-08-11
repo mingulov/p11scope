@@ -4,6 +4,11 @@
 # dlopen providers sanely). The glibc binary is built in rust:1-bookworm
 # (glibc 2.36) so it runs on ubuntu 24.04 (2.39) — the host glibc may be
 # newer than the container's, so a host build is not portable.
+#
+# Both --target-dir paths below are under $PWD/target (bind-mounted into
+# the container as /src), not the container's own /tmp, so the built
+# artifacts survive the container's --rm and are reused as-is by
+# scripts/build-release.sh instead of building them a second time.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -37,11 +42,11 @@ docker run --rm -v "$PWD:/src" -w /src rust:1-alpine sh -ec '
   export CARGO_HOME=/tmp/cargo
   mkdir -p /tmp/cargo && cp target/vendor/config.container.toml /tmp/cargo/config.toml
   export RUSTFLAGS="-C target-feature=-crt-static"
-  cargo build --release -p p11scope-discover --offline --target-dir /tmp/build
-  file /tmp/build/release/p11scope-discover | grep -q "dynamically linked" \
+  cargo build --release -p p11scope-discover --offline --target-dir /src/target/musl-build
+  file /src/target/musl-build/release/p11scope-discover | grep -q "dynamically linked" \
       || { echo "helper is NOT dynamic"; exit 1; }
-  ldd /tmp/build/release/p11scope-discover
-  /tmp/build/release/p11scope-discover --module /usr/lib/softhsm/libsofthsm2.so -o /tmp/m.json
+  ldd /src/target/musl-build/release/p11scope-discover
+  /src/target/musl-build/release/p11scope-discover --module /usr/lib/softhsm/libsofthsm2.so -o /tmp/m.json
   n=$(grep -c "\"name\": \"C_" /tmp/m.json)
   test "$n" = 68 || { echo "expected 68 function records, got $n"; exit 1; }
   echo "alpine musl-dynamic: 68/68 OK"'

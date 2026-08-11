@@ -180,6 +180,16 @@ impl State {
     }
 
     fn observe_init(&mut self, pid: u32, ev: &Event) {
+        // A new *Init always clears whatever was bound before, whether or
+        // not it names a mechanism. Without this, an Init whose pMechanism
+        // read failed (MECH_NONE — null pointer, unfaulted page, an
+        // anticipated capture-failure mode, not hypothetical) would leave
+        // the *previous* mechanism bound, and the next operational call
+        // would be silently attributed to it instead of surfacing as an
+        // orphan — the capture would look more complete than it was.
+        if ev.session != SESSION_NONE {
+            self.active_op.remove(&(pid, ev.session));
+        }
         if ev.mechanism == MECH_NONE {
             return;
         }
@@ -189,7 +199,10 @@ impl State {
         if let Some(ops) = ops {
             stat.ops.extend(ops);
         }
-        if ev.session != SESSION_NONE {
+        // The application genuinely requested this mechanism, so it is
+        // recorded above regardless of outcome — but a failed Init starts
+        // no operation, so only a successful one binds the session.
+        if ev.rv == 0 && ev.session != SESSION_NONE {
             self.active_op.insert((pid, ev.session), ev.mechanism);
         }
     }
@@ -393,6 +406,34 @@ mod tests {
         assert_eq!(m.ops.iter().collect::<Vec<_>>(), vec!["sign"]);
         assert_eq!(m.total_ns, 400);
         assert_eq!(m.max_ns, 300);
+    }
+
+    #[test]
+    fn init_with_failed_mechanism_read_clears_the_stale_binding() {
+        let mut s = State::new(&test_plan());
+        s.observe(&ev(100, 0, fnkind::OPEN_SESSION, 10, MECH_NONE, 0, 5));
+        s.observe(&ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x250, 0, 100)); // C_SignInit binds 0x250
+        // A second Init whose pMechanism read failed (kernel reports
+        // MECH_NONE) must drop that binding, not leave 0x250 bound.
+        s.observe(&ev(100, 2, fnkind::INIT_WITH_MECH, 10, MECH_NONE, 0, 10));
+        s.observe(&ev(100, 3, fnkind::SESSION_ARG0, 10, MECH_NONE, 0, 50)); // C_Sign
+
+        assert_eq!(s.orphan_ops(), 1, "must not inherit the stale 0x250 binding");
+        let m = s.mechanisms().get(&0x250).unwrap();
+        assert_eq!(m.calls, 1, "only the first, successful Init is recorded");
+    }
+
+    #[test]
+    fn failed_init_records_the_mechanism_but_does_not_bind_the_operation() {
+        let mut s = State::new(&test_plan());
+        s.observe(&ev(100, 0, fnkind::OPEN_SESSION, 10, MECH_NONE, 0, 5));
+        s.observe(&ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x250, 7, 100)); // C_SignInit fails, rv=7
+        s.observe(&ev(100, 3, fnkind::SESSION_ARG0, 10, MECH_NONE, 0, 50)); // C_Sign
+
+        assert_eq!(s.orphan_ops(), 1, "a failed Init starts no operation");
+        let m = s.mechanisms().get(&0x250).expect("the attempt is still evidence");
+        assert_eq!(m.calls, 1);
+        assert_eq!(m.errors, 1);
     }
 
     #[test]

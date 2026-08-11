@@ -1,6 +1,7 @@
 //! p11scope — non-interposing PKCS#11 observer (eBPF uprobes).
 
 mod attach;
+mod discover_cmd;
 mod metrics;
 mod plan;
 mod render;
@@ -36,12 +37,7 @@ fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("profile") => cmd_profile(args),
-        Some("discover") => {
-            eprintln!(
-                "discover: not implemented in this phase (use p11scope-discover directly)\n{USAGE}"
-            );
-            std::process::exit(2);
-        }
+        Some("discover") => discover_cmd::run(args),
         Some("--help") | Some("-h") => {
             eprintln!("{USAGE}");
             Ok(())

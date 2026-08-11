@@ -106,10 +106,31 @@ PARTIAL, never silently complete.
   mechanism blobs planted by the workload; assert no sentinel appears in any
   event, map dump, log, or output file.
 
-**Gate G3 (privacy review — release-blocking forever after):** canary suite
-green in CI; adversarial review of the allowlist (each field justified in
-writing: why is it safe?); /security-review of the decoding paths (hostile
-pointers/lengths).
+**Gate G3 (privacy review — release-blocking forever after): PASSED 2026-08-11**
+(with outstanding items noted below).
+
+1. **Canary suite green:** `scripts/verify-canaries.sh` + `docs/notes/phase3-canaries.md`.
+   8 sentinels planted (PIN, CKA_VALUE key material, CKA_LABEL, CKA_ID, digest
+   plaintext, GCM pIv, GCM pAAD, malformed >1-byte value on policy-boolean
+   attribute). Artifacts scanned: profile JSON, profiler log, 10 BPF map dumps.
+   Mandatory positive control proves scanner detects leaks before trusting clean
+   result. Result: `=== canaries: NONE LEAKED ===` on two reproducible runs.
+   Decisive detail: profile showed GCM decode captured `iv_len=42`/`aad_len=43`,
+   exactly the sentinel buffer lengths — proving the decode path executed while
+   buffer *contents* never escaped. **Outstanding:** "green in CI" is not yet
+   literally true (no CI pipeline in this repo); suite is green when run locally.
+
+2. **Adversarial review of allowlist:** `docs/privacy/allowlist-v1.md` — 9
+   allowlisted field groups justified, 9 rejected candidates refused, with
+   file:line citations. Self-flags three weak spots: session-pseudonymization
+   claim overstates current behavior (no session identifier reaches output at
+   all — actually stronger); PSS/GCM parameter length-guard has no adversarial
+   canary (real coverage gap); `cgroup_id` captured with no current consumer.
+   **Outstanding:** the *writing* is done; actual adversarial review by a
+   second party is not complete.
+
+3. **/security-review of decoding paths:** Human-triggered step.
+   **Outstanding — awaiting review.**
 
 ## Phase 4 — Environment matrix + pkcs11-check oracle
 

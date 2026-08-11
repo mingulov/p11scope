@@ -6,13 +6,80 @@ Ubuntu 24.04.4, glibc 2.39, kernel 7.0.0-28-generic, Docker 29.7.2
 (storage driver `overlay2`, cgroup driver `systemd`, cgroup2 unified
 hierarchy).
 
+## Final matrix (Gate G4)
+
 | Environment | Script | Result | Completeness | Measured privileges |
 | --- | --- | --- | --- | --- |
-| Docker, single container | `scripts/matrix/verify-docker.sh` | PASS — exact counts, positive isolation via discover-in-container + `/proc/<pid>/root` prefix | COMPLETE (136/136 probes) | Unprivileged `p11scope profile`: exit 1, `... cannot identify the file now (read failed: Permission denied (os error 13))` reading `/proc/<pid>/root/...`, refuses to attach. `docker exec` discovery step needs no host root (works as the `docker` group member that ran it). Minimum working set: root (via `sudo`) for `p11scope profile`; no special privilege for `p11scope-discover` run inside the container. |
+| Host process (`--pid`) | `scripts/verify-attach-e2e.sh` (Phase 1b) | PASS — exact counts against `spike/expected.txt` on every function, reproduced on repeat runs | COMPLETE (136/136 probes) | See fork-scoping row below (same host, same code path, measured to the specific capability): `CAP_SYS_ADMIN` alone is sufficient, no full root needed. |
+| Docker, single container | `scripts/matrix/verify-docker.sh` | PASS — exact counts, positive isolation via discover-in-container + `/proc/<pid>/root` prefix | COMPLETE (136/136 probes) | Unprivileged `p11scope profile`: exit 1, `... cannot identify the file now (read failed: Permission denied (os error 13))` reading `/proc/<pid>/root/...`, refuses to attach. `docker exec` discovery step needs no host root (works as the `docker` group member that ran it). Measured minimum (see Row 6 below): `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` — not full root. |
 | Docker, shared image layer (2 containers, 1 attach) | `scripts/matrix/verify-shared-layer.sh` | PASS — one attach observes both containers (counts == 2x oracle); a cgroup scope naming only container A excludes container B's concurrent calls (counts == 1x oracle for each of A-only and B-only, never 2x) | COMPLETE on all three captures (136/136 probes each) | Same as the single-container row (same code path): unprivileged `p11scope profile` fails identically at the `/proc/<pid>/root` identity check before touching BPF. |
-| Kubernetes pod (kind) | `scripts/matrix/verify-kind-pod.sh` | PASS — exact counts, observer runs on the host (see Row 3 below for why) | COMPLETE (136/136 probes) | Unprivileged `p11scope profile`: exit 1, identical `Permission denied (os error 13)` reading `/proc/<host-pid>/root/...` before BPF is touched. Minimum working set: root (via `sudo`) for `p11scope profile`; `kubectl exec` for discovery needs no host root. |
-| Knative Serving, scale-from-zero (kind) | `scripts/matrix/verify-knative.sh` | PASS — attach starts with zero pods for the Service existing, then a cold-start request creates a new pod (created 7.9s after attach start, measured) whose calls match the oracle exactly | COMPLETE (136/136 probes) | Same as the kind-pod row: unprivileged `p11scope profile` fails identically at `/proc/<pid>/root` with `Permission denied`. |
-| Prefork server, fork scoping (host) | `scripts/matrix/verify-fork-scope.sh` | PASS — cgroup attach precedes both the parent harness process and all 4 forked children; summed parent+children counts match `fork-expected.txt` exactly | COMPLETE (136/136 probes) | Measured, host `--pid` (same-uid target): unprivileged fails at BPF map creation (`Operation not permitted`); `CAP_BPF`+`CAP_PERFMON` alone still fails every attach (`perf_event_open` failed, `kernel.perf_event_paranoid=4` on this kernel); **`CAP_SYS_ADMIN` alone is sufficient** — no full root needed. Finer-grained than the rows above; see `docs/notes/phase4-privileges.md`. |
+| Kubernetes pod (kind) | `scripts/matrix/verify-kind-pod.sh` | PASS — exact counts, observer runs on the host (see Row 3 below for why) | COMPLETE (136/136 probes) | Unprivileged `p11scope profile`: exit 1, identical `Permission denied (os error 13)` reading `/proc/<host-pid>/root/...` before BPF is touched. Measured minimum: `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` — not full root, independently re-measured against a live kind pod (Row 6). |
+| Knative Serving, scale-from-zero (kind) | `scripts/matrix/verify-knative.sh` | PASS — attach starts with zero pods for the Service existing, then a cold-start request creates a new pod (created 7.9s after attach start, measured) whose calls match the oracle exactly | COMPLETE (136/136 probes) | Same code path as the kind-pod row: unprivileged `p11scope profile` fails identically at `/proc/<pid>/root` with `Permission denied`; same `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` minimum. |
+| Prefork server, fork scoping (host) | `scripts/matrix/verify-fork-scope.sh` | PASS — cgroup attach precedes both the parent harness process and all 4 forked children; summed parent+children counts match `fork-expected.txt` exactly (e.g. `C_Digest` 20/20, `C_Initialize` 5/5) | COMPLETE (136/136 probes) | Measured, host `--pid` (same-uid target): unprivileged fails at BPF map creation (`Operation not permitted`); `CAP_BPF`+`CAP_PERFMON` alone still fails every attach (`perf_event_open` failed, `kernel.perf_event_paranoid=4` on this kernel); **`CAP_SYS_ADMIN` alone is sufficient** — no full root needed. Finer-grained than the rows above; see `docs/notes/phase4-privileges.md`. |
+| Independent oracle diff (`pkcs11-check`, host) | `scripts/matrix/verify-oracle.sh` | PASS — oracle ⊆ capture: all 10 `(function, CK_RV)` pairs the oracle logged (40 calls total, 284-file run) present in the capture at least as often; 1 apparent discrepancy investigated and traced to an oracle-side bug, not a capture gap (see Known limitations) | COMPLETE (136/136 probes) | Same as the fork-scoping row (host, `--cgroup`, same-uid target): `CAP_SYS_ADMIN` alone sufficient. |
+
+Not a fresh "environment" but included because Gate G4 requires it as evidence: the oracle diff cross-checks capture correctness against an
+independent implementation's own trace, rather than validating a new deployment shape.
+
+## Known limitations
+
+Stated plainly, not buried in the row detail below:
+
+- **Knative scope is node-wide, not per-Service.** The Knative row's
+  `--cgroup` targets the node's whole `kubelet-kubepods.slice` ancestor,
+  not anything scoped to the individual Service or pod. Kubernetes/kind
+  create cgroups only per-pod, so there is no cgroup that both predates a
+  not-yet-created pod and is finer than the node's kubepods root. This is
+  coarser than "the Service" — an honest limitation of what Kubernetes
+  exposes, not a chosen simplification. It is also the only stable option
+  across workload shapes: the Knative pod's QoS class is measured
+  **Burstable** (queue-proxy sidecar carries resource requests) while a
+  plain kind pod (Row 3) is **BestEffort**, so even the QoS-level slice one
+  level below `kubepods.slice` cannot be hard-coded. Detail:
+  `scripts/matrix/verify-knative.sh`, Row 4 below.
+- **Knative needed a `KUBERNETES_MIN_VERSION` override.** `knative-v1.23.0`
+  refuses to start against kind's default node (Kubernetes v1.33.1):
+  `"kubernetes version 1.33.1 is not compatible, need at least 1.34.0-0"`.
+  The override is Knative's own documented escape hatch (named in its own
+  error message), applied to the affected Deployments — a version-compat
+  accommodation, not a functional change to anything under test.
+- **A real `p11scope-discover` identity-computation gap, worked around, not
+  hidden.** Discovering against a magic `/proc/<pid>/root/...` path (the
+  Knative row, where no live container exists at attach time) makes
+  `identity()` read the object's path as reported by discover's own
+  `/proc/self/maps`, which is unreachable from discover's own mount
+  namespace — the object is wrongly recorded `Unavailable`/`reusable:
+  false`, and `p11scope profile` refuses to attach. Worked around by
+  recomputing the GNU build-id out-of-band with `readelf -n` (the same
+  authoritative source `identity.rs` itself falls back to) and patching the
+  manifest before attach; the actual uprobe attach, cgroup scoping, and
+  timing proof are untouched. Recommended upstream fix (out of this task's
+  scope): teach `p11scope-discover` to compute identity from the
+  already-accessible `--module` path instead of the maps-derived one.
+  Full chain of evidence: Row 4 below.
+- **Per-container attribution isn't exposed via CLI/JSON yet.** `cgroup_id`
+  is captured on every event but has no consumer in the output today (that
+  consumer is out of this phase's scope). The shared-layer row demonstrates
+  the underlying distinction is real and recoverable via two separately
+  cgroup-scoped captures (A-only / B-only), not via a per-event field.
+  Detail: Row 2 below.
+- **One oracle discrepancy, investigated, traced to the oracle's own
+  bug.** `verify-oracle.sh` found six `(function, CK_RV)` pairs at exactly
+  2x the capture count. Root-caused to `pkcs11-check`'s own `--rv-trace`
+  attributing one physical 8-call sequence to two adjacent pytest node IDs
+  (`test_v30_encrypt_decrypt_aes` and `test_v32_interface_negotiated`); the
+  latter test holds no session/module fixture and is physically incapable
+  of making a PKCS#11 call. This is an upstream oracle-side bookkeeping
+  artifact, not a p11scope capture gap — recorded honestly, with the exact
+  excluded node ID named in the script (not filtered by pattern). Full
+  investigation: `docs/notes/phase4-oracle.md`.
+- **Privilege minimums are measured on this host only.** `CAP_BPF` +
+  `CAP_PERFMON` alone fails on this kernel
+  (`kernel.perf_event_paranoid=4`, an Ubuntu hardening level beyond
+  upstream's documented 0-3 range); `CAP_SYS_ADMIN` is required instead.
+  This is a real, measured, host-specific fact — not something to
+  generalize to another kernel without re-checking
+  `sysctl kernel.perf_event_paranoid`. Detail: `docs/notes/phase4-privileges.md`.
 
 ## Row 1: Docker container capture (Task 2)
 

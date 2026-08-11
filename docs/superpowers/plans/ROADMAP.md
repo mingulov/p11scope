@@ -146,11 +146,37 @@ PARTIAL, never silently complete.
   call must appear; capture may legitimately hold more). Independent dev-time
   cross-check: OpenSC `pkcs11-spy` (interposition — dev only).
 
-**Gate G4 (validation review):** matrix table fully green with capture
-completeness COMPLETE (or documented loss counters); oracle ⊆ capture holds
-(zero *logged* calls missed) within the documented tolerance; fork-scoping
-behavior verified (a prefork workload captured via cgroup scope); privileges
-actually required documented per environment (measured, not assumed).
+**Gate G4 (validation review): PASSED 2026-08-12** — final matrix table and
+known-limitations section: `docs/notes/phase4-matrix.md`.
+
+1. **Matrix table fully green with capture completeness COMPLETE (or
+   documented loss counters):** all seven rows (host, Docker single
+   container, Docker shared image layer, kind pod, Knative scale-from-zero,
+   prefork fork-scoping, independent oracle diff) PASS at
+   `completeness: COMPLETE`, `attached_probes: 136/136` — no row reports
+   loss counters, so none were needed. Documented limitations exist
+   (Knative's node-wide cgroup scope, the `KUBERNETES_MIN_VERSION`
+   override, a `p11scope-discover` identity-computation gap worked around
+   for the Knative row) but none reduce a row below COMPLETE — see
+   `docs/notes/phase4-matrix.md`'s "Known limitations" section.
+2. **Oracle ⊆ capture holds (zero logged calls missed) within the
+   documented tolerance:** `scripts/matrix/verify-oracle.sh` — 40 logged
+   calls across 10 `(function, CK_RV)` pairs from `pkcs11-check`'s own
+   `--rv-trace`, all present in the capture at least as often as logged.
+   One apparent discrepancy (exact 2x pattern, 6 pairs) investigated and
+   traced to `pkcs11-check`'s own trace-attribution bug, not a capture
+   gap — full chain of evidence in `docs/notes/phase4-oracle.md`.
+3. **Fork-scoping behavior verified (a prefork workload captured via
+   cgroup scope):** `scripts/matrix/verify-fork-scope.sh` — cgroup attach
+   precedes the prefork parent and all 4 children; summed counts match
+   `fork-expected.txt` exactly (e.g. `C_Digest` 20/20, `C_Initialize` 5/5).
+4. **Privileges actually required documented per environment (measured,
+   not assumed):** `docs/notes/phase4-privileges.md` — host needs
+   `CAP_SYS_ADMIN` alone (measured: `CAP_BPF`+`CAP_PERFMON` alone still
+   fails on this kernel's `perf_event_paranoid=4`); Docker/kind need
+   `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` (crossing into a different-uid
+   container/pod's `/proc/<pid>/root`). Neither environment needs full
+   root.
 
 ## Phase 5 — Overhead benchmark + docs + v0.1 release
 

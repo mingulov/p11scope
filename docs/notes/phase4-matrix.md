@@ -9,6 +9,7 @@ hierarchy).
 | Environment | Script | Result | Completeness | Measured privileges |
 | --- | --- | --- | --- | --- |
 | Docker, single container | `scripts/matrix/verify-docker.sh` | PASS — exact counts, positive isolation via discover-in-container + `/proc/<pid>/root` prefix | COMPLETE (136/136 probes) | Unprivileged `p11scope profile`: exit 1, `... cannot identify the file now (read failed: Permission denied (os error 13))` reading `/proc/<pid>/root/...`, refuses to attach. `docker exec` discovery step needs no host root (works as the `docker` group member that ran it). Minimum working set: root (via `sudo`) for `p11scope profile`; no special privilege for `p11scope-discover` run inside the container. |
+| Docker, shared image layer (2 containers, 1 attach) | `scripts/matrix/verify-shared-layer.sh` | PASS — one attach observes both containers (counts == 2x oracle); a cgroup scope naming only container A excludes container B's concurrent calls (counts == 1x oracle for each of A-only and B-only, never 2x) | COMPLETE on all three captures (136/136 probes each) | Same as the single-container row (same code path): unprivileged `p11scope profile` fails identically at the `/proc/<pid>/root` identity check before touching BPF. |
 
 ## Row 1: Docker container capture (Task 2)
 
@@ -43,7 +44,48 @@ Exact call counts matched `spike/expected.txt` on every function;
 `evidence.completeness == "COMPLETE"`, `attached_probes == 136` (68 slots
 x2 uprobe+uretprobe).
 
+## Row 2: Shared image layer / inode-sharing proof (Task 3)
+
+`verify-shared-layer.sh` starts two containers (`p11scope-matrix-shared-a`,
+`-b`) from the identical image, under one dedicated cgroup parent slice
+(`--cgroup-parent=p11scope-shared.slice` on both — systemd auto-nests this
+under `p11scope.slice`, giving a clean common ancestor with no unrelated
+host services under it).
+
+**Inode-sharing proof (measured, not assumed):** `docker exec <A> stat -c
+%i /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so` and the same in B both
+returned **51969427** — the identical inode number, confirming the overlay2
+image layer is genuinely shared before the capture claims anything about
+it. The script hard-fails with BLOCKED-style output (and prints the
+storage driver) if the inodes ever differ.
+
+**Positive:** discover once (in container A's mount view), attach **once**
+with `--cgroup` set to the shared parent slice, run the harness in *both*
+containers during that single attach window. Observed counts were exactly
+double the oracle (e.g. `C_GenerateRandom: 200`, `C_Digest: 100`) —
+one attach, both containers' calls captured, `completeness: COMPLETE`.
+
+**Negative isolation (the important one):** two further captures, each a
+fresh `p11scope profile` invocation scoped to only one container's leaf
+cgroup (`A-only`, `B-only`), but with **both** containers' harnesses run
+during each capture's window — so the excluded container's calls are real,
+concurrent, and land on the very inode the probe is attached to. Both
+scoped captures came back at exactly **1x** the oracle, never 2x:
+scoping the capture to A while B was actively calling into the same
+probed `.so` produced zero B calls in A's report, and symmetrically for B.
+This is the proof that cgroup scoping filters by *task*, not by *inode* —
+the earlier under-scoping bug this phase's Task 1 fixed (descendant
+matching) is the mechanism that makes this exclusion correct rather than
+accidental.
+
+Per-container attribution via `cgroup_id` is not yet exposed through the
+CLI/JSON output (that consumer is Task 6 — `cgroup_id` is already captured
+on every event per the phase plan's inherited facts, just unconsumed). The
+brief's own fallback — "two scoped runs" — is what this row uses to
+demonstrate the raw distinction is recoverable: the A-only and B-only
+captures above *are* that per-container breakdown, produced by cgroup
+scope rather than by a not-yet-built event-level field.
+
 ## Not yet covered by this file
 
-Shared-image-layer, Kubernetes/kind, and Knative rows (later Phase 4
-tasks) are not run here.
+Kubernetes/kind and Knative rows (later Phase 4 tasks) are not run here.

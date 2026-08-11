@@ -247,7 +247,40 @@ against the recorded attach-start instant); the capture matched
 pod's actual leaf cgroup (informational, not the `--cgroup` used):
 `.../kubelet-kubepods.slice/kubelet-kubepods-burstable.slice/kubelet-kubepods-burstable-pod<uid>.slice/cri-containerd-<id>.scope`.
 
+## Row 5: independent oracle diff — `pkcs11-check` (Task 7)
+
+`scripts/matrix/verify-oracle.sh` is the first check in this phase against
+an oracle p11scope did not write: `pkcs11-check`
+(`/home/user/src/m/pkcs11-check-ws/pkcs11-check`), a separate,
+vendor-neutral PKCS#11 test client with its own per-call `CK_RV` trace
+(`--rv-trace`). Direction: **oracle ⊆ capture** — every `(function, CK_RV)`
+pair the oracle logged must appear in the capture at least that many
+times; the capture may hold more.
+
+Run against SoftHSM2, `--marker smoke --isolation file --rv-trace`, scoped
+by a `systemd-run --scope` cgroup created (and attached to) before
+pkcs11-check is even exec'd — the same attach-before-run pattern as every
+other row, with `--cgroup` standing in for `--pid` because `--isolation
+file` forks one subprocess per test file (many `C_Initialize` cycles, many
+PIDs, most nonexistent at attach time).
+
+Result: `attached_probes: 136`, `completeness: COMPLETE`, every
+oracle-logged `(function, CK_RV)` pair present in the capture at least as
+often as logged. One apparent discrepancy (an exact 2x pattern across a
+6-function, 8-call flow) was investigated and traced to pkcs11-check's own
+rv-trace attributing one physical call sequence to two adjacent test node
+IDs — not a p11scope capture gap (proven: the "recipient" test takes no
+session/module fixture and is physically incapable of making a PKCS#11
+call). Full investigation, evidence, and the exact excluded node ID:
+`docs/notes/phase4-oracle.md`.
+
+A `uv`-is-a-snap-package infrastructure gotcha (snap confinement silently
+moves the process out of the target cgroup, `systemd-run --scope`
+reporting the unit "Deactivated successfully" within the same second)
+took the longest to isolate; the fix (invoke the venv's own installed
+console script instead of `uv run`) is recorded in the same notes file.
+
 ## Not yet covered by this file
 
-Nothing — Tasks 2 through 5 (Docker, shared layer, kind pod, Knative) are
-all recorded above.
+Nothing — Tasks 2 through 7 (Docker, shared layer, kind pod, Knative, and
+the `pkcs11-check` oracle diff) are all recorded above.

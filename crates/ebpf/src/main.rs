@@ -38,7 +38,7 @@ static RV_COUNTS: PerCpuHashMap<RvKey, u64> = PerCpuHashMap::with_max_entries(40
 fn in_scope(ctx: &ProbeContext) -> bool {
     let flags = CONFIG.get(CFG_FLAGS).copied().unwrap_or(0);
     if flags & FLAG_PID_FILTER != 0 {
-        let tgid = (ctx.pid()) as u32;
+        let tgid = ctx.tgid();
         if unsafe { PID_FILTER.get(&tgid) }.is_some() {
             return true;
         }

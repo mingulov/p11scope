@@ -4,6 +4,7 @@
 # dlopen providers sanely). The glibc binary is built in rust:1-bookworm
 # (glibc 2.36) so it runs on ubuntu 24.04 (2.39) — the host glibc may be
 # newer than the container's, so a host build is not portable.
+set -eu
 cd "$(dirname "$0")/.."
 
 docker pull -q ubuntu:24.04

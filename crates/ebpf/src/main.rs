@@ -10,9 +10,9 @@ use aya_ebpf::maps::{Array, HashMap, PerCpuArray, PerCpuHashMap, RingBuf};
 use aya_ebpf::programs::{ProbeContext, RetProbeContext};
 use aya_ebpf::{EbpfContext as _, helpers};
 use p11scope_ebpf_common::{
-    CFG_FLAGS, CallStart, Event, FLAG_CGROUP_FILTER, FLAG_PID_FILTER, MAX_ATTRS, MAX_MECH_SHAPES,
-    MAX_SLOTS, MECH_NONE, RING_BYTES, RvKey, SESSION_NONE, SlotStats, StartKey, USER_TYPE_NONE,
-    attr_bool, bucket_of, fnkind, shape,
+    CFG_CGROUP_LEVEL, CFG_FLAGS, CallStart, Event, FLAG_CGROUP_FILTER, FLAG_PID_FILTER, MAX_ATTRS,
+    MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, RING_BYTES, RvKey, SESSION_NONE, SlotStats, StartKey,
+    USER_TYPE_NONE, attr_bool, bucket_of, fnkind, shape,
 };
 
 #[map]
@@ -66,7 +66,15 @@ fn in_scope(ctx: &ProbeContext) -> bool {
         }
     }
     if flags & FLAG_CGROUP_FILTER != 0 {
-        let cgid = unsafe { helpers::bpf_get_current_cgroup_id() };
+        // Ancestor match, not leaf match: a task deep in a descendant
+        // cgroup still has an ancestor at the target's level, and that
+        // ancestor's id is what CGROUP_FILTER was populated with. Using
+        // the *specific* published level (rather than e.g. probing every
+        // level, or using the task's own leaf id) is what keeps this from
+        // widening the match to unrelated cgroups — a sibling subtree has
+        // a *different* id at that same level, so it never matches.
+        let level = CONFIG.get(CFG_CGROUP_LEVEL).copied().unwrap_or(0) as i32;
+        let cgid = unsafe { helpers::bpf_get_current_ancestor_cgroup_id(level) };
         if unsafe { CGROUP_FILTER.get(&cgid) }.is_some() {
             return true;
         }

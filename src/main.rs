@@ -18,8 +18,11 @@ the event stream); --mode metrics is the lighter, maps-only level.\n\
 note: no SIGINT handler is installed in this build (no signal-handling\n\
 dependency); Ctrl-C aborts without writing output. Use --duration for a\n\
 clean exit that prints the final frame and (with -o) writes the JSON report.\n\
-note: --cgroup matches that exact cgroup only, not descendant cgroups; a\n\
-service whose processes live in child cgroups will show zero counts.";
+note: --cgroup matches that cgroup and every descendant cgroup beneath it\n\
+(kernel >= 5.15 ancestor matching), so a container or pod directory works\n\
+even though its processes live in a nested child cgroup. Sibling cgroups\n\
+(anything not under the given path) are never matched. The path must be\n\
+under /sys/fs/cgroup.";
 
 fn main() {
     if let Err(e) = run() {
@@ -96,7 +99,7 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
     };
     let scope = match (pid, cgroup) {
         (Some(p), None) => Scope::Pid(p),
-        (None, Some(c)) => Scope::Cgroup(scope::cgroup_id(&c)?),
+        (None, Some(c)) => Scope::Cgroup { id: scope::cgroup_id(&c)?, level: scope::cgroup_level(&c)? },
         (None, None) => {
             eprintln!("exactly one of --pid or --cgroup is required\n{USAGE}");
             std::process::exit(2);

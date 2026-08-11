@@ -12,7 +12,11 @@ use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
 #[derive(Debug, Clone)]
 pub enum Scope {
     Pid(u32),
-    Cgroup(u64),
+    /// Target cgroup id plus its ancestor level under `/sys/fs/cgroup`
+    /// (root = 0). The level is what lets the BPF side match any
+    /// descendant of the target, not just tasks in that exact cgroup —
+    /// see `scope::cgroup_level`.
+    Cgroup { id: u64, level: u32 },
 }
 
 pub struct Session {
@@ -47,7 +51,7 @@ impl Session {
             ),
             // Cgroup scoping is enforced in BPF, so the probe itself is
             // process-wide and the filter map decides.
-            Scope::Cgroup(_) => UProbeScope::AllProcesses,
+            Scope::Cgroup { .. } => UProbeScope::AllProcesses,
         };
 
         let mut attach_failures = Vec::new();

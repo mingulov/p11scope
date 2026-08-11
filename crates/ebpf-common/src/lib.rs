@@ -14,6 +14,12 @@ pub const LATENCY_BUCKETS: usize = 32;
 
 /// CONFIG map indices.
 pub const CFG_FLAGS: u32 = 0;
+/// Ancestor level (in the cgroup hierarchy, root = 0) of the scoped
+/// cgroup, for `bpf_get_current_ancestor_cgroup_id`. Only meaningful when
+/// `FLAG_CGROUP_FILTER` is set; userspace derives it from the target
+/// cgroup's path depth under `/sys/fs/cgroup` and publishes it alongside
+/// the cgroup id before attach, like every other scope input.
+pub const CFG_CGROUP_LEVEL: u32 = 1;
 /// CONFIG flag bits.
 pub const FLAG_PID_FILTER: u64 = 1 << 0;
 pub const FLAG_CGROUP_FILTER: u64 = 1 << 1;

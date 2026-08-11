@@ -3,4 +3,5 @@
 //! separate unprivileged short-lived process (design spec, Architecture).
 
 pub mod identity;
+pub mod manifest;
 pub mod maps;

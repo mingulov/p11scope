@@ -8,6 +8,8 @@ use p11scope::{discover_cmd, events, metrics, plan, render, scope, semantics, tr
 use p11scope_manifest::manifest::{Manifest, SCHEMA};
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "usage:\n  \
@@ -19,14 +21,46 @@ the event stream); --mode metrics is the lighter, maps-only level.\n\
 note: trace prints one line per completed call as it happens, in arrival\n\
 order, instead of aggregating; --duration bounds it, same as profile. If\n\
 omitted, trace streams until interrupted (Ctrl-C) or the process exits.\n\
-note: no SIGINT handler is installed in this build (no signal-handling\n\
-dependency); Ctrl-C aborts without writing output. Use --duration for a\n\
-clean exit that prints the final frame and (with -o) writes the JSON report.\n\
+note: Ctrl-C (SIGINT) ends either subcommand's capture cleanly: polling\n\
+stops, the final frame prints, and (with -o) the report is written —\n\
+same as --duration elapsing. --duration remains the only way to bound a\n\
+capture that runs unattended.\n\
 note: --cgroup matches that cgroup and every descendant cgroup beneath it\n\
 (kernel >= 5.15 ancestor matching), so a container or pod directory works\n\
 even though its processes live in a nested child cgroup. Sibling cgroups\n\
 (anything not under the given path) are never matched. The path must be\n\
 under /sys/fs/cgroup.";
+
+/// Installs a SIGINT handler that only ever sets an `AtomicBool` —
+/// `signal_hook::flag::register` is itself the signal-safe minimum a raw
+/// handler may do (no allocation, no I/O, no locks). Every capture loop
+/// polls this flag cooperatively, the same way it already polls
+/// `--duration` elapsing, so Ctrl-C ends a capture the same clean way:
+/// stop polling, print the final frame, write `-o` if given — never
+/// torn down mid-write.
+///
+/// Chose `signal-hook` over a hand-rolled `libc::signal` handler: this
+/// is exactly the "self-pipe/flag" pattern signal-hook exists for, its
+/// `flag` module is a few lines of audited, already-idiomatic code doing
+/// precisely this, and it costs one small, already-`libc`-based
+/// dependency (the project already pulls `libc` transitively via `aya`).
+/// Hand-rolling it correctly means getting async-signal-safety right
+/// with no compiler help; reusing it means getting it right by
+/// construction.
+fn install_sigint_flag() -> Result<Arc<AtomicBool>> {
+    let flag = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&flag))
+        .context("installing SIGINT handler")?;
+    Ok(flag)
+}
+
+/// Whether a capture loop should stop this tick: interrupted (Ctrl-C) or
+/// `--duration` elapsed. A pure function so the interrupt path is
+/// directly testable without sending a real signal — set the flag,
+/// confirm this returns `true` regardless of `elapsed`/`duration`.
+fn should_stop(interrupted: &AtomicBool, elapsed: Duration, duration: Option<u64>) -> bool {
+    interrupted.load(Ordering::Relaxed) || duration.is_some_and(|d| elapsed >= Duration::from_secs(d))
+}
 
 fn main() {
     if let Err(e) = run() {
@@ -195,11 +229,12 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
         Ok(drain.malformed())
     };
 
+    let interrupted = install_sigint_flag()?;
     let wall_start = SystemTime::now();
     let clock = Instant::now();
     loop {
         let elapsed = clock.elapsed();
-        if duration.is_some_and(|d| elapsed >= Duration::from_secs(d)) {
+        if should_stop(&interrupted, elapsed, duration) {
             break;
         }
         let event_loss = if mode == "profile" {
@@ -250,11 +285,20 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
         } else {
             render::json(&reports, &ev, &manifest.module_path, &started, &ended, &kernel)
         };
-        std::fs::write(&out_path, serde_json::to_vec_pretty(&j)?)
-            .with_context(|| format!("writing {}", out_path.display()))?;
+        write_json_report(&out_path, &j)?;
     }
 
     Ok(())
+}
+
+/// Writes the `-o` report — the same call whether the loop above it
+/// exited because `--duration` elapsed or because SIGINT set
+/// `interrupted`: finalization does not know or care which. Factored out
+/// so that fact is directly testable (see `tests::shutdown_path_writes_a_valid_json_report`)
+/// without standing up a real attach session.
+fn write_json_report(path: &std::path::Path, j: &serde_json::Value) -> Result<()> {
+    std::fs::write(path, serde_json::to_vec_pretty(j)?)
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 /// `p11scope trace`: one line per completed call, printed as it arrives,
@@ -323,12 +367,13 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
         None => None,
     };
 
+    let interrupted = install_sigint_flag()?;
     let mut malformed_records: u64 = 0;
     let mut last_reported_loss: u64 = 0;
     let clock = Instant::now();
     loop {
         let elapsed = clock.elapsed();
-        if duration.is_some_and(|d| elapsed >= Duration::from_secs(d)) {
+        if should_stop(&interrupted, elapsed, duration) {
             break;
         }
         malformed_records +=
@@ -482,5 +527,49 @@ mod tests {
             "2024-01-01T00:00:00Z"
         );
         assert_eq!(fmt_rfc3339(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+    }
+
+    /// Exercises the interrupt path directly, with no real signal sent:
+    /// once the flag `signal_hook::flag::register` would set is set, a
+    /// capture loop must stop on the very next tick regardless of
+    /// `--duration` — the same "stop, then finalize" branch a real
+    /// SIGINT drives.
+    #[test]
+    fn should_stop_on_interrupt_regardless_of_duration() {
+        let interrupted = AtomicBool::new(false);
+        assert!(!should_stop(&interrupted, Duration::from_secs(0), None));
+        assert!(!should_stop(&interrupted, Duration::from_secs(0), Some(3600)));
+
+        interrupted.store(true, Ordering::Relaxed);
+        assert!(should_stop(&interrupted, Duration::from_secs(0), None), "no --duration set at all");
+        assert!(
+            should_stop(&interrupted, Duration::from_secs(0), Some(3600)),
+            "must stop immediately even mid-way through a long --duration"
+        );
+    }
+
+    #[test]
+    fn should_stop_still_honors_duration_elapsing_without_an_interrupt() {
+        let interrupted = AtomicBool::new(false);
+        assert!(should_stop(&interrupted, Duration::from_secs(10), Some(5)));
+        assert!(!should_stop(&interrupted, Duration::from_secs(4), Some(5)));
+    }
+
+    /// The finalization a stopped loop runs into (profile's `-o` write)
+    /// succeeds and produces valid JSON — exercised directly, standing in
+    /// for "Ctrl-C a capture, confirm -o has valid JSON" without a real
+    /// attach session (that part needs root + a real kernel; see the
+    /// manual check documented in the phase report).
+    #[test]
+    fn shutdown_path_writes_a_valid_json_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed.json");
+        let j = serde_json::json!({"schema": "pkcs11-scope/observed-profile/v1.2", "evidence": {}});
+
+        write_json_report(&path, &j).expect("shutdown finalization must write the report");
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
+        assert_eq!(parsed["schema"], "pkcs11-scope/observed-profile/v1.2");
     }
 }

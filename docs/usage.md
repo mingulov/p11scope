@@ -48,9 +48,10 @@ window. It is never proof of what the application *cannot* do — see
 
 ## Quickstart
 
-Point discovery at the *real* provider `.so`, not `p11-kit-proxy.so` (the
-tool warns when it detects the proxy layer — profiling it attributes
-everything to p11-kit, not the real vendor library).
+Point discovery at the *real* provider `.so`, not `p11-kit-proxy.so` —
+profiling the proxy layer attributes everything to p11-kit, not the real
+vendor library. The tool does not detect or warn about this today;
+getting it right is on the operator.
 
 ```bash
 # 1. Discover the provider's real function offsets (no privileges needed).

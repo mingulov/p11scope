@@ -70,8 +70,9 @@ for the CLI, live output, trace lines, and an example `observed-profile.json`.
   named cause and a hint, never a panic or a raw verifier dump
   (`docs/notes/phase5-unsupported.md`).
 - Point it at the **real** provider `.so`, not `p11-kit-proxy.so` — profiling
-  the proxy layer attributes everything to p11-kit (the tool warns when it
-  detects this).
+  the proxy layer attributes everything to p11-kit, not the real vendor
+  library. The tool does not detect or warn about this today; getting it
+  right is on the operator.
 - **Profiles, never replays.** It records safe semantic metadata via a strict
   per-field allowlist. PINs, key material, plaintext, ciphertext, signatures
   and wrapped blobs are never captured in any mode — enforced by a

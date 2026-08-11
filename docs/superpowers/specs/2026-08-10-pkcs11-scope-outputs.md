@@ -134,7 +134,11 @@ keeps "UNKNOWN" honest.
 
 PINs, key material, `CKA_VALUE` contents, plaintext, ciphertext, signatures,
 wrapped blobs, random output, operation-state blobs, raw mechanism byte
-arrays, raw handle values. Labels/`CKA_ID` only behind an explicit opt-in
-flag. There is no flag combination that dumps buffers. A profile describes
-the observed window only — it is evidence of what the app *did*, never proof
-of what it *cannot do*.
+arrays, raw handle values. **Update, post-implementation (v0.1.0):** this
+draft originally sketched Labels/`CKA_ID` as available "behind an explicit
+opt-in flag" — the shipped tool is stricter than that sketch: it refuses
+both outright, with no flag of any kind that reveals them (see
+[`docs/privacy/allowlist-v1.md`](../../privacy/allowlist-v1.md)). There is
+no flag combination that dumps buffers. A profile describes the observed
+window only — it is evidence of what the app *did*, never proof of what it
+*cannot do*.

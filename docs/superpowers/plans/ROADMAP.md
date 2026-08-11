@@ -125,7 +125,10 @@ PARTIAL, never silently complete.
    file:line citations. Self-flags three weak spots: session-pseudonymization
    claim overstates current behavior (no session identifier reaches output at
    all — actually stronger); PSS/GCM parameter length-guard has no adversarial
-   canary (real coverage gap); `cgroup_id` captured with no current consumer.
+   canary (real coverage gap); `cgroup_id` captured with no current consumer
+   **(stale — RESOLVED as of v1.2: Phase 4 Task 6 gave it a consumer, the
+   `cgroups[]` per-cgroup breakdown; see `docs/privacy/allowlist-v1.md`'s
+   "Summary of weak points" item 2)**.
    **Outstanding:** the *writing* is done; actual adversarial review by a
    second party is not complete.
 
@@ -190,6 +193,92 @@ known-limitations section: `docs/notes/phase4-matrix.md`.
 **Gate G5 (release review):** full-repo review (/code-review ultra candidate)
 + security review of the privileged tool as a whole; README claims
 cross-checked against measured reality; canary suite still green.
+
+1. **Canary suite still green:** re-verified 2026-08-12 —
+   `scripts/verify-canaries.sh`: `=== canaries: NONE LEAKED ===`, positive
+   control OK, GCM/PSS decode correctness re-checked (same result as
+   Phase 3's original run). Additionally spot-checked the same sentinel
+   workload under `trace` (a new output path since Phase 3, not covered
+   by the script itself): `=== trace canaries: NONE LEAKED ===` across
+   both the `-o` file and stdout, consistent with the ad hoc check
+   already recorded in Phase 5 Task 1's report. Full detail:
+   `.superpowers/sdd/2026-08-12-phase5-release/task-7-report.md`.
+2. **README claims cross-checked against measured reality:** every
+   quantitative/behavioral claim in `README.md` and `docs/usage.md`
+   checked against its cited source (a script or a notes file); full
+   claim-by-claim table in `task-7-report.md`. Two real drifts found and
+   fixed, not softened:
+   - Both docs claimed "the tool warns when it detects" the
+     `p11-kit-proxy.so` case — no such detection exists anywhere in the
+     code (`rg p11-kit src/ crates/` finds nothing); the false claim was
+     deleted from both files.
+   - The original outputs-spec draft
+     (`docs/superpowers/specs/2026-08-10-pkcs11-scope-outputs.md`) said
+     Labels/`CKA_ID` would be available "behind an explicit opt-in flag"
+     — the shipped tool is stricter (refused outright, no such flag
+     exists); corrected to match, since README and `docs/usage.md` both
+     cite that file as the privacy commitment and their own wording
+     ("refused outright") already matched reality.
+   Every other checked claim — overhead numbers, measured privileges,
+   unsupported-environment error text, the kernel-floor inheritance
+   caveat, schema version string, the `COMPLETE`/`PARTIAL` gate list, the
+   `cgroups[]` per-cgroup claim — matched its cited source exactly, no
+   change needed.
+3. **Full-repo review (`/code-review ultra` candidate):** human-triggered.
+   **Outstanding — not run.**
+4. **Security review of the privileged tool as a whole:** human-triggered.
+   **Outstanding — not run.** (Distinct from Phase 3's still-outstanding
+   `/security-review` of the decoding paths specifically — this G5
+   criterion is scoped to the whole privileged tool.)
+
+All other verification scripts were re-run the same day as this gate
+(release blockers per this phase's Global Constraints, not G5 criteria
+themselves): `cargo test --workspace` (109 passed, 0 failed),
+`verify-attach-e2e.sh`, `verify-induced-gaps.sh`, all six
+`scripts/matrix/*.sh` (docker, shared-layer, kind-pod, knative, oracle,
+fork-scope), `bench-overhead.sh` (full unshortened run, 5 runs/condition
+— numbers consistent with `docs/notes/phase5-overhead.md` within normal
+run-to-run noise), and `build-release.sh`. Zero failures across all of
+them. Full table: `task-7-report.md`.
+
+### Overall project status (as of Gate G5, 2026-08-12)
+
+Phases 0-4 are complete against their own gates (G0-G4 PASSED, see each
+phase above). Phase 5's automatable criteria are met: canary suite green,
+README/usage.md cross-checked against measured reality (two drifts found
+and fixed), all verification scripts green, v0.1.0 built and verified
+(`scripts/build-release.sh`). **Not done, and worth knowing before
+treating the tool as "reviewed":**
+
+- **The two human-triggered reviews remain outstanding across every
+  phase they were named in.** `/code-review` (Phase 1's engineering
+  review, and this gate's full-repo `ultra` pass) and `/security-review`
+  (Phase 3's decoding-path review, and this gate's whole-tool privileged
+  review) have not been run by a second party at any point in this
+  project. Every phase's "PASSED" gate above reflects the implementer's
+  own verification against stated, checkable criteria — not an
+  independent review.
+- **The kernel floor (≥5.15) is inherited, not independently verified.**
+  It traces to `bpf_get_current_ancestor_cgroup_id()` (`src/scope.rs`)
+  but was never re-derived or tested against a live sub-5.15 kernel in
+  this repo — no such kernel was available
+  (`docs/notes/phase5-unsupported.md`, case 5). `docs/usage.md` states
+  this caveat explicitly, next to the kernel-floor claim itself.
+- **The canary suite is green locally, not in CI** — there is still no
+  CI pipeline in this repo (a Phase 3 G3 finding that remains true).
+- **Matrix limitations still standing**, per
+  `docs/notes/phase4-matrix.md`: Knative's `--cgroup` scope is node-wide,
+  not per-Service (an honest limit of what Kubernetes exposes, not a
+  bug); `p11scope-discover`'s identity computation has a real,
+  worked-around gap for magic `/proc/<pid>/root` paths with no live
+  container at attach time (recommended upstream fix not done);
+  privilege minimums are measured on one host only. (The
+  previously-listed "`cgroup_id` has no consumer" limitation is now
+  resolved — Phase 4 Task 6's `cgroups[]` breakdown gave it a consumer;
+  `docs/notes/phase4-matrix.md` and this ROADMAP's Phase 3 G3 entry were
+  both stale on this point and are corrected as part of this gate.)
+- x86-64 only in this release; AArch64 is the first post-v1 item (see
+  "Explicitly deferred" below).
 
 ## Explicitly deferred (post-v1, in design spec's "out" list)
 

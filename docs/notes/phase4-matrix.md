@@ -57,12 +57,16 @@ Stated plainly, not buried in the row detail below:
   scope): teach `p11scope-discover` to compute identity from the
   already-accessible `--module` path instead of the maps-derived one.
   Full chain of evidence: Row 4 below.
-- **Per-container attribution isn't exposed via CLI/JSON yet.** `cgroup_id`
-  is captured on every event but has no consumer in the output today (that
-  consumer is out of this phase's scope). The shared-layer row demonstrates
-  the underlying distinction is real and recoverable via two separately
-  cgroup-scoped captures (A-only / B-only), not via a per-event field.
-  Detail: Row 2 below.
+- **Per-container attribution is now exposed via CLI/JSON** (stale as of
+  this row's original writing — fixed here). `cgroup_id` was captured on
+  every event with no consumer at the time this row was written; Task 6
+  (`98015e3`, after this row) added the `cgroups[]` per-cgroup breakdown
+  to `observed-profile.json`, giving it one — see
+  `docs/schema/observed-profile-v1.md`'s `cgroups` section. The
+  shared-layer row below still additionally demonstrates the underlying
+  distinction via two separately cgroup-scoped captures (A-only /
+  B-only); that path remains real and useful even with `cgroups[]`
+  available. Detail: Row 2 below.
 - **One oracle discrepancy, investigated, traced to the oracle's own
   bug.** `verify-oracle.sh` found six `(function, CK_RV)` pairs at exactly
   2x the capture count. Root-caused to `pkcs11-check`'s own `--rv-trace`
@@ -148,13 +152,17 @@ the earlier under-scoping bug this phase's Task 1 fixed (descendant
 matching) is the mechanism that makes this exclusion correct rather than
 accidental.
 
-Per-container attribution via `cgroup_id` is not yet exposed through the
-CLI/JSON output (that consumer is Task 6 — `cgroup_id` is already captured
-on every event per the phase plan's inherited facts, just unconsumed). The
-brief's own fallback — "two scoped runs" — is what this row uses to
-demonstrate the raw distinction is recoverable: the A-only and B-only
-captures above *are* that per-container breakdown, produced by cgroup
-scope rather than by a not-yet-built event-level field.
+Per-container attribution via `cgroup_id` is now exposed through the
+CLI/JSON output as `cgroups[]` (Task 6, `98015e3`, landed after this row
+was originally written — this paragraph is corrected accordingly). At
+the time this row was written, `cgroup_id` was already captured on every
+event per the phase plan's inherited facts but had no consumer yet. The
+brief's own fallback — "two scoped runs" — is what this row still uses
+to demonstrate the raw distinction is independently recoverable: the
+A-only and B-only captures above *are* that per-container breakdown,
+produced by cgroup scope rather than by the per-event `cgroups[]` field
+— a second, cross-checking proof of the same fact `cgroups[]` now
+reports directly.
 
 ## Row 3: Kubernetes pod capture on kind (Task 4)
 

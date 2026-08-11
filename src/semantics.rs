@@ -427,13 +427,18 @@ mod tests {
     fn failed_init_records_the_mechanism_but_does_not_bind_the_operation() {
         let mut s = State::new(&test_plan());
         s.observe(&ev(100, 0, fnkind::OPEN_SESSION, 10, MECH_NONE, 0, 5));
-        s.observe(&ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x250, 7, 100)); // C_SignInit fails, rv=7
+        s.observe(&ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x250, 0, 100)); // C_SignInit succeeds, binds 0x250
+        // A second Init with a different mechanism that fails (rv != 0) must
+        // drop the 0x250 binding, not leave it bound.
+        s.observe(&ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x251, 7, 10)); // C_SignInit fails, rv=7
         s.observe(&ev(100, 3, fnkind::SESSION_ARG0, 10, MECH_NONE, 0, 50)); // C_Sign
 
-        assert_eq!(s.orphan_ops(), 1, "a failed Init starts no operation");
-        let m = s.mechanisms().get(&0x250).expect("the attempt is still evidence");
-        assert_eq!(m.calls, 1);
-        assert_eq!(m.errors, 1);
+        assert_eq!(s.orphan_ops(), 1, "a failed Init clears the stale binding");
+        let m250 = s.mechanisms().get(&0x250).unwrap();
+        assert_eq!(m250.calls, 1, "only the first, successful Init is recorded");
+        let m251 = s.mechanisms().get(&0x251).expect("the failed attempt is still evidence");
+        assert_eq!(m251.calls, 1);
+        assert_eq!(m251.errors, 1);
     }
 
     #[test]

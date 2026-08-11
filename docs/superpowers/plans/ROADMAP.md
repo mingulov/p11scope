@@ -79,14 +79,20 @@ rather than being dropped.
   evidence-quality section: attach failures, aliases, event loss counters,
   capture window, completeness verdict.
 
-**Gate G2 (schema + honesty review):** schema reviewed against the explicit
-acceptance list in the design spec's "Profile schema requirements" table —
-i.e. it can drive all five `pkcs11-lab` categories (OBSERVED AND VALIDATED /
-… DIFFERED / … NOT COVERED / TESTED NOT OBSERVED / UNKNOWN), including raw
-vendor mechanism IDs preserved verbatim and capture-window metadata for
-UNKNOWN. Induced-gap test — deliberately alias two entries, leave a call
-in-flight, and drop events (tiny ring buffer); assert the report says PARTIAL
-with correct numbers for each, never silently complete.
+**Gate G2 (schema + honesty review): PASSED 2026-08-11** — Schema validated
+per `docs/schema/observed-profile-v1.md` against the design spec's "Profile
+schema requirements" table: all five `pkcs11-lab` categories supported
+(OBSERVED AND VALIDATED / DIFFERED / NOT COVERED with verbatim vendor
+mechanism IDs / TESTED NOT OBSERVED / UNKNOWN with capture-window metadata).
+Known v1 gap: mechanism-parameter combos (RSA-PSS hash/MGF/salt, GCM lengths)
+not yet decoded (`params: null` with note); Phase 3's allowlist decoder
+required before full parameter-based joins. Induced-gap test
+(`scripts/verify-induced-gaps.sh` + `docs/notes/phase2-induced-gaps.md`)
+confirms honest degradation: Gap 1 (aliasing) — 42 grouped calls (25+17);
+Gap 2 (in-flight) — 1 call stranded, latency percentiles null; Gap 3
+(event loss) — ~199,900 ring events lost of 200,000, aggregate STATS map
+exact at 200,000 (maps are count authority); all three report completeness
+PARTIAL, never silently complete.
 
 ## Phase 3 — Allowlist semantic decoding + privacy enforcement
 

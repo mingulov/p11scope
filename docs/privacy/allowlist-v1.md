@@ -32,7 +32,7 @@ usually described (see that entry).
 
 - **What it is:** the `CK_MECHANISM_TYPE` (`CK_ULONG`) at offset 0 of the
   `pMechanism` argument to any `*Init` call. Read at
-  `crates/ebpf/src/main.rs:234`.
+  `crates/ebpf/src/main.rs:246`.
 - **Why an assessor needs it:** it is the entire point of the tool — "which
   mechanisms does this application actually drive" is the first question
   a PKCS#11 migration assessment answers, and it is what
@@ -48,7 +48,7 @@ usually described (see that entry).
   mechanism exists, not what it does. Verbatim, never renamed
   (`src/render.rs:295` `mechanism`/`mechanism_hex`).
 - **Enforcement:** runtime-gated on `pmech != 0`
-  (`crates/ebpf/src/main.rs:232`) — a null pointer is never dereferenced.
+  (`crates/ebpf/src/main.rs:244`) — a null pointer is never dereferenced.
   No dedicated canary targets this specific read (it is not secret data),
   but every canary run exercises it as a side effect of driving real
   mechanisms.
@@ -57,14 +57,16 @@ usually described (see that entry).
 
 - **What it is:** three `CK_ULONG` scalars from `CK_RSA_PKCS_PSS_PARAMS`
   at offsets 0/8/16 of `pParameter`, read only when the mechanism's
-  registry-published shape is `RSA_PKCS_PSS`
-  (`crates/ebpf/src/main.rs:99`, reads at lines 121-123).
+  registry-published shape is `RSA_PKCS_PSS` and `ulParameterLen == 24`
+  (`crates/ebpf/src/main.rs:107-135`, the layout match at line 117, reads
+  at lines 133-135).
 - **Why an assessor needs it:** RSA-PSS's security margin and
   interoperability depend on the hash algorithm, MGF, and salt length
   actually used — a candidate provider that silently truncates the salt
   or swaps the MGF hash is a real migration regression `pkcs11-lab` needs
   to flag, not something a mechanism id alone reveals. Emitted as
-  `hash_alg`/`mgf`/`salt_len` (`src/render.rs:325-332`).
+  `hash_alg`/`mgf`/`salt_len` (`src/render.rs`, `param_combo_json`'s
+  `RSA_PKCS_PSS` arm).
 - **What an attacker could learn:** the padding scheme's configuration
   (which is itself a public parameter of the signature; PSS parameters
   are transmitted or standardized alongside the signature in most
@@ -73,44 +75,66 @@ usually described (see that entry).
   configuration, not key material or message content — comparable to
   observing a TLS ciphersuite's PRF. No plaintext, digest input, or
   signature ever crosses this boundary.
-- **Enforcement:** runtime-gated, three checks in order:
-  `ulParameterLen >= 24` (`crates/ebpf/src/main.rs:107,111`), `pParameter
-  != 0` (`crates/ebpf/src/main.rs:115,118`), and all three scalar reads
-  must succeed together or nothing is recorded
-  (`crates/ebpf/src/main.rs:121-129`, `if let (Ok(a), Ok(b), Ok(c))`).
-  **Coverage gap:** `scripts/verify-canaries.sh` does not include a
-  short/malformed `ulParameterLen` fixture for PSS — the length and
-  null-pointer guards are read-reviewed and structurally present, but not
-  exercised by an adversarial test today. Flagged as a follow-up, not a
-  blocker: the failure mode of a missing guard here would be an
-  out-of-bounds *scalar* read (still bounded to 8 bytes, never attacker
-  buffer content), not a secret leak.
+- **Enforcement:** runtime-gated, three checks in order: `ulParameterLen
+  == 24` exactly (`crates/ebpf/src/main.rs`, `decode_params`'s `match
+  (sh, param_len)` — not `>=`, for the same reason the GCM guard below was
+  tightened to an exact per-layout match), `pParameter != 0`, and all
+  three scalar reads must succeed together or nothing is recorded (`if
+  let (Ok(a), Ok(b), Ok(c))`). **Coverage gap:** `scripts/verify-canaries.sh`
+  now drives a real RSA-PSS `*Init` call (previously the PSS decode path
+  was never exercised at all), but still does not plant a short/malformed
+  `ulParameterLen` fixture for it the way the GCM case now does — see
+  "Summary of weak points" below. Flagged as a follow-up, not a blocker:
+  the failure mode of a missing guard here would be an out-of-bounds
+  *scalar* read (still bounded to 8 bytes, never attacker buffer
+  content), not a secret leak — `CK_RSA_PKCS_PSS_PARAMS` has no pointer
+  fields, unlike `CK_GCM_PARAMS`.
 
 ### 3. GCM `ulIvLen` / `ulAADLen` / `ulTagBits`
 
-- **What it is:** three `CK_ULONG` scalars from `CK_GCM_PARAMS` at offsets
-  8/24/32, read only when the shape is `GCM`
-  (`crates/ebpf/src/main.rs:101`, reads at lines 121-123). Offsets 0 and
-  16 (`pIv`, `pAAD` — pointers to the actual IV/AAD bytes) are never read;
-  the function doc comment states this explicitly
-  (`crates/ebpf/src/main.rs:93-95`).
+- **What it is:** three `CK_ULONG` scalars from `CK_GCM_PARAMS`, read only
+  when the shape is `GCM` and `CK_MECHANISM.ulParameterLen` **exactly**
+  matches one of the two known `CK_GCM_PARAMS` layouts
+  (`crates/ebpf/src/main.rs`, `decode_params`'s `match (sh, param_len)`).
+  `CK_GCM_PARAMS` has two incompatible layouts in the wild: the legacy
+  PKCS#11 v2.20 struct (`pIv`@0 `ulIvLen`@8 `pAAD`@16 `ulAADLen`@24
+  `ulTagBits`@32, 40 bytes) and the current v2.40/OASIS struct — what
+  `cryptoki_sys::CK_GCM_PARAMS` actually is — which inserts `ulIvBits` at
+  offset 16 and pushes the rest out (`pIv`@0 `ulIvLen`@8 `ulIvBits`@16
+  `pAAD`@24 `ulAADLen`@32 `ulTagBits`@40, 48 bytes). The pointer fields
+  (`pIv`, always offset 0; `pAAD`, offset 16 or 24 depending on which
+  layout matched) are never read in either case; only the three
+  length/count scalars are. An earlier version of this function guarded
+  with `ulParameterLen >= 40` instead of an exact per-layout match, which
+  let a modern 48-byte struct pass the guard while still using the
+  legacy offsets — reading `CK_GCM_PARAMS.pAAD` (a userspace pointer) into
+  what the output labeled `aad_len`. Fixed by making the match exact and
+  layout-specific; see "Summary of weak points" below for how this was
+  found and the coverage this closed.
 - **Why an assessor needs it:** IV length and tag length are correctness
   parameters for GCM — a candidate using a non-standard IV length (not
   96 bits) or a truncated tag is a real interoperability/security
   regression to surface, and AAD length (not content) indicates whether
-  associated data is used at all. Emitted as `iv_len`/`aad_len`/`tag_bits`
-  (`src/render.rs:333-338`).
+  associated data is used at all. Emitted as `iv_len`/`aad_len`/`tag_bits`,
+  tagged with `layout` (`"v2.20"` or `"v2.40"`) so a reader can tell which
+  struct shape produced the values (`src/render.rs`'s `param_combo_json`).
 - **What an attacker could learn:** the shape of the GCM invocation (IV
   size, whether AAD is present and how long, tag truncation). Never the
-  IV bytes, AAD bytes, key, plaintext, or ciphertext.
+  IV bytes, AAD bytes, key, plaintext, ciphertext, or a pointer address.
 - **Why that is acceptable:** IV/tag lengths are protocol parameters
   (e.g. TLS record framing implies IV/tag length already), not secrets.
   AAD length alone (without content) is a low-value signal.
-- **Enforcement:** runtime-gated, identical structure to PSS above
-  (`crates/ebpf/src/main.rs:107-129`). Same coverage gap noted for PSS
-  applies here too — no canary specifically targets a short
-  `ulParameterLen` for GCM. The canary suite does verify the *pointer*
-  fields (`pIv`/`pAAD`) are never dereferenced: `CANARY_IV`/`CANARY_AAD`
+- **Enforcement:** runtime-gated, same overall structure as PSS above
+  (`ulParameterLen` read and matched, then `pParameter != 0`, then all
+  three scalar reads must succeed together or nothing is recorded) but
+  with the match now exact per layout, never `>=`. The canary suite
+  exercises **both** layouts (a legacy 40-byte call and a modern 48-byte
+  call with planted sentinel IV/AAD buffers) plus a malformed-length GCM
+  call (`ulParameterLen` matching neither layout), and asserts the
+  malformed call renders as a decode failure — not a fabricated combo —
+  and that no emitted numeric field looks like a pointer (implausibly
+  large, e.g. `> 2^32`). It still verifies the *pointer* fields
+  (`pIv`/`pAAD`) are never dereferenced: `CANARY_IV`/`CANARY_AAD`
   sentinels are planted at those exact offsets by
   `scripts/fixtures/canary_workload.c` (see its header comment) and
   `scripts/verify-canaries.sh` scans every output artifact and BPF map
@@ -119,9 +143,9 @@ usually described (see that entry).
 ### 4. Login user type (`CK_USER_TYPE`)
 
 - **What it is:** the `CK_ULONG` at `C_Login`'s arg1, read into
-  `start.user_type` (`crates/ebpf/src/main.rs:284-286`). `pPin` (arg2) and
+  `start.user_type` (`crates/ebpf/src/main.rs:296-298`). `pPin` (arg2) and
   `ulPinLen` (arg3) are never touched — stated explicitly in the comment
-  at `crates/ebpf/src/main.rs:283` and in the `fnkind::LOGIN` doc comment
+  at `crates/ebpf/src/main.rs:295` and in the `fnkind::LOGIN` doc comment
   (`crates/ebpf-common/src/lib.rs:99-100`: "pPin is NEVER read, in any
   mode, at any privilege").
 - **Why an assessor needs it:** whether the application authenticates as
@@ -133,11 +157,11 @@ usually described (see that entry).
   enumeration, not tenant- or identity-specific.
 - **Why that is acceptable:** carries no credential material. Counted
   per role, not per call (`src/semantics.rs:308-309`,
-  `src/render.rs:516-517`).
+  `src/render.rs:525-526`).
 - **Enforcement:** structural — there is no field in `CallStart`/`Event`
   that could hold `pPin` or `ulPinLen`; the LOGIN arm's code path
   physically only reads `ctx.arg::<u64>(1)`
-  (`crates/ebpf/src/main.rs:284`). Tested by
+  (`crates/ebpf/src/main.rs:296`). Tested by
   `scripts/verify-canaries.sh` via the `CANARY_PIN` sentinel planted in
   `C_Login`'s `pPin` argument by `scripts/fixtures/canary_workload.c`.
 
@@ -145,10 +169,10 @@ usually described (see that entry).
 
 - **What it is:** the raw `CK_SESSION_HANDLE` (`CK_ULONG`), captured three
   ways depending on call kind: from `arg0` directly
-  (`crates/ebpf/src/main.rs:228-230,252-254,260-262,272-274,280-282`), or
+  (`crates/ebpf/src/main.rs:240-242,264-266,272-274,284-286,292-294`), or
   for `C_OpenSession`, by stashing the `phSession` out-pointer at entry
   and reading it back at return only on success
-  (`crates/ebpf/src/main.rs:247-250,341-346`).
+  (`crates/ebpf/src/main.rs:259-262,353-358`).
 - **Why an assessor needs it:** session lifecycle (open/close balance,
   peak concurrency) and per-session operation sequencing
   (`*Init` → operational call → `*Final`) are how the semantic state
@@ -172,7 +196,7 @@ usually described (see that entry).
   maps below; no accessor on `State` returns one" (`src/semantics.rs:4-5`),
   and `src/render.rs`'s `SessionsOut` carries only aggregate counts —
   `opened`/`closed`/`peak_concurrent`/`balance`
-  (`src/render.rs:433-440,509-515`) — with no per-session field anywhere
+  (`src/render.rs:442-449,518-524`) — with no per-session field anywhere
   in `profile_json`. This is stronger than the plan's stated property,
   not weaker, so it is called out explicitly rather than left to look
   like an inconsistency.
@@ -180,7 +204,7 @@ usually described (see that entry).
   struct in `src/render.rs` can hold a session identifier); runtime-gated
   for the raw value's brief lifetime inside `Event` (`start.out_ptr != 0
   && rv == 0` before trusting the `C_OpenSession` out-pointer,
-  `crates/ebpf/src/main.rs:341-343`). No canary specifically targets this
+  `crates/ebpf/src/main.rs:353-355`). No canary specifically targets this
   (it is not a secret-value leak class), but the two-pid isolation tests
   in `src/semantics.rs` (`two_pids_do_not_share_pseudonyms_or_session_state`,
   around `src/semantics.rs:685-708`) cover the pseudonym-assignment logic
@@ -191,11 +215,11 @@ usually described (see that entry).
 - **What it is:** the `CK_ATTRIBUTE_TYPE` (`CK_ULONG`) at offset 0 of each
   `CK_ATTRIBUTE` entry in `pTemplate`, for `C_FindObjectsInit`,
   `C_CreateObject`, and `C_GenerateKey`. Read in `walk_template`
-  (`crates/ebpf/src/main.rs:144-190`, the type read at line 155). Bounded
+  (`crates/ebpf/src/main.rs:156-202`, the type read at line 167). Bounded
   to `MAX_ATTRS = 8` entries per event
-  (`crates/ebpf-common/src/lib.rs:188`); `attr_total` still records the
+  (`crates/ebpf-common/src/lib.rs:207`); `attr_total` still records the
   real count so a longer template shows as truncated evidence rather than
-  being silently trimmed (`crates/ebpf/src/main.rs:145`,
+  being silently trimmed (`crates/ebpf/src/main.rs:157`,
   `src/render.rs:65-68` doc comment on `templates_truncated`).
 - **Why an assessor needs it:** which attribute *kinds* an application
   asks for when creating/searching/generating objects (e.g. does it
@@ -209,14 +233,14 @@ usually described (see that entry).
   standardized (or vendor-documented) enumeration — knowing that an
   application requests `CKA_EXTRACTABLE` reveals a coding pattern, not a
   secret. Emitted as numeric + hex only (`AttrTypeOut`,
-  `src/render.rs:360-364,411-414`), explicitly marked `requested: true`
-  (never asserted as effective policy — `src/render.rs:389-391,410`).
+  `src/render.rs:369-373,420-423`), explicitly marked `requested: true`
+  (never asserted as effective policy — `src/render.rs:398-400,419`).
 - **Enforcement:** structural for the value: the walk reads `pValue` for
   *no* attribute type outside the policy-boolean allowlist — the comment
-  at `crates/ebpf/src/main.rs:150-153` states `type` "is the only field
+  at `crates/ebpf/src/main.rs:162-165` states `type` "is the only field
   ever read for a non-allowlisted attribute." Runtime-gated for the loop
   bound itself (constant `MAX_ATTRS`, not the caller-supplied `count`, so
-  the verifier can prove termination — `crates/ebpf/src/main.rs:139-141`).
+  the verifier can prove termination — `crates/ebpf/src/main.rs:151-153`).
   Tested by `scripts/verify-canaries.sh`: `CANARY_LABEL`/`CANARY_ID`/
   `CANARY_KEY` are planted as `CKA_LABEL`/`CKA_ID`/`CKA_VALUE` values on
   `C_CreateObject` and confirmed absent from every artifact.
@@ -227,12 +251,12 @@ usually described (see that entry).
   these 11 attribute types, and only when `ulValueLen == 1`:
   `CKA_TOKEN`, `CKA_PRIVATE`, `CKA_SENSITIVE`, `CKA_ENCRYPT`,
   `CKA_DECRYPT`, `CKA_WRAP`, `CKA_UNWRAP`, `CKA_SIGN`, `CKA_VERIFY`,
-  `CKA_DERIVE`, `CKA_EXTRACTABLE` (`crates/ebpf-common/src/lib.rs:127-169`,
-  the read at `crates/ebpf/src/main.rs:168-187`). Recorded as two
+  `CKA_DERIVE`, `CKA_EXTRACTABLE` (`crates/ebpf-common/src/lib.rs:146-188`,
+  the read at `crates/ebpf/src/main.rs:180-199`). Recorded as two
   bitmasks — `attr_bools` (value, when true) and `attr_bools_seen`
   (presence, true or false) — so a name absent from both lists means
   "never requested," a real three-state
-  (`crates/ebpf-common/src/lib.rs:213-216`, `src/render.rs:366-377`).
+  (`crates/ebpf-common/src/lib.rs:232-235`, `src/render.rs:375-386`).
 - **Why an assessor needs each one:** these are the capability/policy
   flags a candidate provider must honor identically for a migration to
   be safe — a provider that silently drops a requested `CKA_SENSITIVE`
@@ -253,14 +277,14 @@ usually described (see that entry).
   attribute, gated to a fixed, pre-declared, tiny set; no other attribute
   type's value is ever read regardless of its `ulValueLen`. Emitted as
   attribute names only (`observed_true`/`observed_false`,
-  `POLICY_BOOL_NAMES` at `src/render.rs:346-358`), explicitly framed as
-  "requested," not "effective" (`src/render.rs:531-535`).
+  `POLICY_BOOL_NAMES` at `src/render.rs:355-367`), explicitly framed as
+  "requested," not "effective" (`src/render.rs:540-544`).
 - **Enforcement:** runtime-gated — three checks in strict order: type
   must be in `bit_for_attr_type`'s match (`crates/ebpf-common/src/lib.rs:
   153-168`), then `ulValueLen == 1` exactly
-  (`crates/ebpf/src/main.rs:171-177`), *then* one byte is read
-  (`crates/ebpf/src/main.rs:178-182`). This is the sharpest edge in the
-  allowlist — the comment at `crates/ebpf/src/main.rs:165-167` calls the
+  (`crates/ebpf/src/main.rs:183-189`), *then* one byte is read
+  (`crates/ebpf/src/main.rs:190-194`). This is the sharpest edge in the
+  allowlist — the comment at `crates/ebpf/src/main.rs:177-179` calls the
   length gate "load-bearing: it is what keeps a `CKA_VALUE` or
   `CKA_LABEL` from ever being read even if a type were mis-listed on the
   allowlist." **Directly tested**: `scripts/verify-canaries.sh` /
@@ -273,9 +297,9 @@ usually described (see that entry).
 ### 8. Call latency
 
 - **What it is:** `duration_ns` (`now - start.ts_ns`, computed in BPF at
-  `crates/ebpf/src/main.rs:310`) and its bucketed/aggregate forms —
+  `crates/ebpf/src/main.rs:322`) and its bucketed/aggregate forms —
   per-slot histograms in the `STATS` map
-  (`crates/ebpf/src/main.rs:313-329`) and per-event `duration_ns` fed into
+  (`crates/ebpf/src/main.rs:325-341`) and per-event `duration_ns` fed into
   the semantic state machine's per-mechanism latency
   (`src/render.rs:240-249,304`).
 - **Why an assessor needs it:** whether a candidate provider's HSM-backed
@@ -304,8 +328,8 @@ usually described (see that entry).
 ### 9. `CK_RV` (return code)
 
 - **What it is:** the uretprobe's return value, `ctx.ret()`
-  (`crates/ebpf/src/main.rs:311`), counted per-slot
-  (`crates/ebpf/src/main.rs:325-327,336-338`) and rendered as hex
+  (`crates/ebpf/src/main.rs:323`), counted per-slot
+  (`crates/ebpf/src/main.rs:337-339,348-350`) and rendered as hex
   (`src/render.rs:264-268`).
 - **Why an assessor needs it:** error-rate per function/mechanism is
   direct evidence of compatibility problems — a candidate that returns
@@ -325,8 +349,8 @@ usually described (see that entry).
 
 - **What they are:** `bpf_get_current_pid_tgid()` and
   `bpf_get_current_cgroup_id()` (kernel helpers, not user-memory reads),
-  stored on every `Event` (`crates/ebpf/src/main.rs:351-352`,
-  `crates/ebpf-common/src/lib.rs:238-239`).
+  stored on every `Event` (`crates/ebpf/src/main.rs:363-364`,
+  `crates/ebpf-common/src/lib.rs:257-258`).
 - **Current status — flagged as weak, not because it leaks, but because
   it is unused:** `pid_tgid` is consumed internally only to key per-process
   state (`src/semantics.rs:156-159`, the `pid()` helper); `cgroup_id` is
@@ -353,7 +377,7 @@ Each of these was considered and refused. The refusal is enforced in code,
 not merely in this document.
 
 - **PIN contents.** Never read at all: the `LOGIN` arm touches only arg1
-  (`crates/ebpf/src/main.rs:284`); arg2 (`pPin`) is never passed to
+  (`crates/ebpf/src/main.rs:296`); arg2 (`pPin`) is never passed to
   `bpf_probe_read_user` anywhere in the file. **Structural.** Canary:
   `CANARY_PIN` (`scripts/verify-canaries.sh`,
   `scripts/fixtures/canary_workload.c`).
@@ -364,9 +388,9 @@ not merely in this document.
   though it is "just a number." **Structural** — there is no code path
   that reads arg3, and no field in `CallStart`/`Event` reserved for it.
 - **Label contents (`CKA_LABEL`).** Only the attribute *type* is read for
-  any non-policy-boolean attribute (`crates/ebpf/src/main.rs:155-159`);
+  any non-policy-boolean attribute (`crates/ebpf/src/main.rs:167-171`);
   `CKA_LABEL`'s value is never on the policy-boolean allowlist
-  (`crates/ebpf-common/src/lib.rs:153-168` has no entry for it), so its
+  (`crates/ebpf-common/src/lib.rs:172-187` has no entry for it), so its
   `pValue` is never touched. Refused because a label routinely carries
   tenant, certificate, or key-identity information — the design spec
   reserves label disclosure for an explicit opt-in flag, which does not
@@ -383,11 +407,14 @@ not merely in this document.
   This is key material itself; the design spec lists it first among
   things "never recorded in any mode." **Structural.** Canary:
   `CANARY_KEY`.
-- **GCM IV/AAD contents.** `CK_GCM_PARAMS.pIv` (offset 0) and `.pAAD`
-  (offset 16) are pointers to the actual bytes; `decode_params` reads
-  only offsets 8/24/32 (`crates/ebpf/src/main.rs:101,121-123`) — the
-  pointer offsets are never passed to `bpf_probe_read_user`. Refused
-  because IV/AAD bytes can carry structured or identifying content
+- **GCM IV/AAD contents.** `CK_GCM_PARAMS.pIv` (offset 0, both layouts)
+  and `.pAAD` (offset 16 for the legacy v2.20 layout, offset 24 for the
+  current v2.40 layout — see the GCM entry above) are pointers to the
+  actual bytes; `decode_params` reads only the three length/count
+  scalars for whichever layout `ulParameterLen` exactly matches — the
+  pointer offsets are never passed to `bpf_probe_read_user` in either
+  layout. Refused because IV/AAD bytes can carry structured or identifying
+  content
   (nonces are sometimes derived from sequence numbers or identities;
   AAD frequently *is* identity/context data by design). **Structural.**
   Canary: `CANARY_IV`, `CANARY_AAD`.
@@ -395,7 +422,7 @@ not merely in this document.
   a data pointer and length (`C_Sign`, `C_Digest`, `C_Encrypt`, and their
   `*Update` siblings) classify as `fnkind::SESSION_ARG0`
   (`src/kinds.rs:21-32`), whose BPF arm reads only `ctx.arg::<u64>(0)`
-  (the session handle) — `crates/ebpf/src/main.rs:251-255`. No data
+  (the session handle) — `crates/ebpf/src/main.rs:263-267`. No data
   pointer or length argument for these calls is ever read. Refused
   because the design spec calls this out explicitly: "sign *input
   lengths* can characterize messages" — even without content, a length
@@ -424,15 +451,34 @@ not merely in this document.
 Being explicit about the thin spots, per the brief's instruction that
 flagging them is what makes this document credible:
 
-1. **PSS/GCM `ulParameterLen`/null-pointer guards have no adversarial
-   canary.** The guards exist and are read-reviewed
-   (`crates/ebpf/src/main.rs:107-120`), but `scripts/verify-canaries.sh`
-   does not plant a short or malformed `CK_MECHANISM.ulParameterLen` the
-   way it plants an oversized `ulValueLen` for the boolean gate. The blast
-   radius of a broken guard here is bounded (an out-of-bounds *scalar*
-   read of up to 8 attacker-adjacent bytes interpreted as a `u64`, never
-   attacker-controlled buffer content), so this is a coverage gap to
-   close, not a reason to pull the field from the allowlist.
+1. **GCM's malformed-`ulParameterLen` gap is now closed; PSS's is not.**
+   This gap was not hypothetical: the missing GCM canary is exactly what
+   let a real defect ship — the pre-fix `decode_params` guarded
+   `ulParameterLen >= 40` instead of matching a specific layout, so a
+   modern 48-byte `CK_GCM_PARAMS` (the OASIS v2.40 layout, what
+   `cryptoki_sys::CK_GCM_PARAMS` actually is) passed the guard and was
+   decoded using the legacy 40-byte layout's offsets, reading
+   `CK_GCM_PARAMS.pAAD` — a userspace pointer — into the field labeled
+   `aad_len`. Every read still returned `Ok`, so the record rendered
+   `completeness: COMPLETE` with no signal anything was wrong. Every
+   existing canary run used only the 40-byte struct
+   (`scripts/fixtures/canary_workload.c`'s original `CK_GCM_PARAMS`), so
+   this suite could not have caught it. Fixed by making the offset match
+   exact per layout (`(shape::GCM, 40)` / `(shape::GCM, 48)`, `crates/ebpf/src/main.rs`)
+   and closing the coverage gap: the canary workload now drives a
+   legacy 40-byte call, a modern 48-byte call with its own planted
+   sentinel IV/AAD, and a malformed-length call that matches neither
+   layout, with `scripts/verify-canaries.sh` asserting the malformed call
+   decodes nothing (never a fabricated combo) and that no emitted numeric
+   field looks like a pointer. The equivalent PSS gap — a short or
+   malformed `ulParameterLen` for `CK_RSA_PKCS_PSS_PARAMS` — remains
+   open: the canary suite now exercises the PSS *decode* path at all (it
+   previously never did), but does not yet plant an adversarial length
+   for it. `CK_RSA_PKCS_PSS_PARAMS` has one layout (three `CK_ULONG`s, no
+   pointer fields), so the blast radius of a broken guard there is
+   narrower than GCM's was — an out-of-bounds *scalar* read, never a
+   pointer disclosure — but it is still a coverage gap to close, not a
+   reason to consider this fully closed.
 2. **`cgroup_id` is captured with no current consumer.** Not a leak (no
    output field exists for it), but capturing a field with no
    justification-by-use is exactly the pattern this document is supposed

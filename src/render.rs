@@ -330,8 +330,17 @@ fn param_combo_json(shape_code: u32, p0: u64, p1: u64, p2: u64, count: u64) -> O
             "salt_len": p2,
             "count": count,
         })),
-        p11scope_ebpf_common::shape::GCM => Some(serde_json::json!({
+        p11scope_ebpf_common::shape::GCM_V220 => Some(serde_json::json!({
             "shape": "gcm",
+            "layout": "v2.20",
+            "iv_len": p0,
+            "aad_len": p1,
+            "tag_bits": p2,
+            "count": count,
+        })),
+        p11scope_ebpf_common::shape::GCM_V240 => Some(serde_json::json!({
+            "shape": "gcm",
+            "layout": "v2.40",
             "iv_len": p0,
             "aad_len": p1,
             "tag_bits": p2,
@@ -862,23 +871,39 @@ mod tests {
     }
 
     #[test]
-    fn profile_json_renders_gcm_params_as_a_shape_tagged_object() {
+    fn profile_json_renders_gcm_params_as_a_shape_tagged_object_with_its_layout() {
         use p11scope_ebpf_common::shape;
 
+        // Both `CK_GCM_PARAMS` layouts can appear in the same capture (a
+        // provider using the legacy v2.20 struct, another using the
+        // current v2.40 one) — they must render as two distinct combos,
+        // each tagged with the layout that produced it, never merged and
+        // never mislabeled as the other's fields.
         let mut state = crate::semantics::State::new(&init_plan());
-        state.observe(&init_event(0, 0x1087, shape::GCM, 12, 0, 128));
+        state.observe(&init_event(0, 0x1087, shape::GCM_V220, 12, 0, 128));
+        state.observe(&init_event(0, 0x1087, shape::GCM_V240, 12, 16, 128));
 
         let mut ev = evidence();
         ev.verdict();
         let capture = CaptureMeta { module: "/opt/p11.so", build_id: None, started: "t0", ended: "t1", kernel: "6.8.0" };
         let v = profile_json(&[], &ev, &state, &capture);
 
-        let combo = &v["mechanisms"][0]["params"][0];
-        assert_eq!(combo["shape"], "gcm");
-        assert_eq!(combo["iv_len"], 12);
-        assert_eq!(combo["aad_len"], 0);
-        assert_eq!(combo["tag_bits"], 128);
-        assert_eq!(combo["count"], 1);
+        let combos = v["mechanisms"][0]["params"].as_array().unwrap();
+        assert_eq!(combos.len(), 2, "two distinct layouts, not merged");
+
+        let v220 = combos.iter().find(|c| c["layout"] == "v2.20").expect("v2.20 combo present");
+        assert_eq!(v220["shape"], "gcm");
+        assert_eq!(v220["iv_len"], 12);
+        assert_eq!(v220["aad_len"], 0);
+        assert_eq!(v220["tag_bits"], 128);
+        assert_eq!(v220["count"], 1);
+
+        let v240 = combos.iter().find(|c| c["layout"] == "v2.40").expect("v2.40 combo present");
+        assert_eq!(v240["shape"], "gcm");
+        assert_eq!(v240["iv_len"], 12);
+        assert_eq!(v240["aad_len"], 16);
+        assert_eq!(v240["tag_bits"], 128);
+        assert_eq!(v240["count"], 1);
     }
 
     #[test]

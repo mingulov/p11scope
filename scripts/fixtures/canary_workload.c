@@ -12,12 +12,27 @@
  *                                            in the BPF template walk must
  *                                            refuse to dereference)
  *   - C_DigestInit/Digest pData          -> CANARY_PLAINTEXT_*
- *   - C_EncryptInit       CK_GCM_PARAMS.pIv  -> CANARY_IV_*
- *                         CK_GCM_PARAMS.pAAD -> CANARY_AAD_*
- *                         (offsets 0 and 16 of CK_GCM_PARAMS — precisely
- *                         the pointers the allowlist forbids dereferencing;
- *                         only ulIvLen/ulAADLen/ulTagBits at offsets
- *                         8/24/32 are ever read)
+ *   - C_EncryptInit       CK_GCM_PARAMS.pIv  -> CANARY_IV_*  (legacy v2.20
+ *                         CK_GCM_PARAMS.pAAD -> CANARY_AAD_*  layout, 40
+ *                         bytes: offsets 0/16 are the pointers, never
+ *                         read; only ulIvLen/ulAADLen/ulTagBits at
+ *                         offsets 8/24/32 are)
+ *   - C_EncryptInit       same sentinels again, against the *modern*
+ *                         v2.40/OASIS CK_GCM_PARAMS layout (48 bytes,
+ *                         `ulIvBits` inserted at offset 16 — what
+ *                         `cryptoki_sys::CK_GCM_PARAMS` actually is):
+ *                         pIv@0/pAAD@24 are the pointers, never read;
+ *                         only ulIvLen@8/ulAADLen@32/ulTagBits@40 are.
+ *                         This is the case the pointer-disclosure defect
+ *                         (fixed alongside this canary) needed: the old
+ *                         `ulParameterLen >= 40` guard let this 48-byte
+ *                         struct through and misread pAAD as aad_len.
+ *   - C_EncryptInit       a malformed CK_GCM_PARAMS call, ulParameterLen
+ *                         == 24 (matches neither known GCM layout) — must
+ *                         decode nothing, never a fabricated combo.
+ *   - C_SignInit          CK_RSA_PKCS_PSS_PARAMS { hashAlg, mgf, sLen } —
+ *                         exercises the PSS offset path at all (nothing
+ *                         else in this workload did before).
  *
  * SoftHSM2 handles every one of these entry points natively (some of the
  * calls are expected to fail — a garbled boolean length, a login with the
@@ -43,7 +58,7 @@ typedef unsigned char CK_UTF8CHAR;
 typedef struct { CK_ULONG mechanism; void *pParameter; CK_ULONG ulParameterLen; } CK_MECHANISM;
 typedef struct { CK_ATTRIBUTE_TYPE type; void *pValue; CK_ULONG ulValueLen; } CK_ATTRIBUTE;
 
-/* CK_GCM_PARAMS per the plan's x86-64 layout: pIv@0, ulIvLen@8, pAAD@16,
+/* CK_GCM_PARAMS, legacy PKCS#11 v2.20 layout: pIv@0, ulIvLen@8, pAAD@16,
  * ulAADLen@24, ulTagBits@32 — 40 bytes, five 8-byte fields. */
 typedef struct {
     CK_BYTE_PTR pIv;
@@ -53,11 +68,32 @@ typedef struct {
     CK_ULONG ulTagBits;
 } CK_GCM_PARAMS;
 
+/* CK_GCM_PARAMS, current v2.40/OASIS layout — what cryptoki_sys's binding
+ * actually is: ulIvBits inserted at offset 16 pushes pAAD/ulAADLen/
+ * ulTagBits to 24/32/40 — 48 bytes, six 8-byte fields. */
+typedef struct {
+    CK_BYTE_PTR pIv;
+    CK_ULONG ulIvLen;
+    CK_ULONG ulIvBits;
+    CK_BYTE_PTR pAAD;
+    CK_ULONG ulAADLen;
+    CK_ULONG ulTagBits;
+} CK_GCM_PARAMS_V240;
+
+/* CK_RSA_PKCS_PSS_PARAMS: three CK_ULONGs, 24 bytes, one layout. */
+typedef struct {
+    CK_ULONG hashAlg;
+    CK_ULONG mgf;
+    CK_ULONG sLen;
+} CK_RSA_PKCS_PSS_PARAMS;
+
 #define CKF_SERIAL_SESSION 4UL
 #define CKF_RW_SESSION 2UL
 #define CKU_USER 1UL
 #define CKM_SHA256 0x250UL
 #define CKM_AES_GCM 0x1087UL
+#define CKM_RSA_PKCS_PSS 0x0DUL
+#define CKG_MGF1_SHA256 0x02UL
 
 #define CKA_CLASS 0x00000000UL
 #define CKA_TOKEN 0x00000001UL
@@ -74,7 +110,7 @@ enum {
     I_Initialize = 0, I_Finalize = 1, I_GetSlotList = 4,
     I_OpenSession = 12, I_CloseSession = 13, I_Login = 18,
     I_CreateObject = 20, I_EncryptInit = 29,
-    I_DigestInit = 37, I_Digest = 38,
+    I_DigestInit = 37, I_Digest = 38, I_SignInit = 42,
 };
 
 typedef CK_RV (*fn_gen)(void *);
@@ -87,6 +123,7 @@ typedef CK_RV (*fn_encinit)(CK_SESSION_HANDLE, CK_MECHANISM *, CK_OBJECT_HANDLE)
 typedef CK_RV (*fn_diginit)(CK_SESSION_HANDLE, CK_MECHANISM *);
 typedef CK_RV (*fn_digest)(CK_SESSION_HANDLE, unsigned char *, CK_ULONG,
                            unsigned char *, CK_ULONG *);
+typedef CK_RV (*fn_signinit)(CK_SESSION_HANDLE, CK_MECHANISM *, CK_OBJECT_HANDLE);
 
 static void **fns;
 
@@ -180,7 +217,40 @@ int main(int argc, char **argv)
         .ulTagBits = 128,
     };
     CK_MECHANISM gcm_mech = { CKM_AES_GCM, &gcm, sizeof(gcm) };
-    NOTE("C_EncryptInit", ((fn_encinit)fns[I_EncryptInit])(sess, &gcm_mech, hObject));
+    NOTE("C_EncryptInit(GCM v2.20)", ((fn_encinit)fns[I_EncryptInit])(sess, &gcm_mech, hObject));
+
+    /* Same sentinels, against the modern v2.40/OASIS CK_GCM_PARAMS layout
+     * (48 bytes, ulIvBits inserted at offset 16) — the layout the
+     * pointer-disclosure defect was about: the old ulParameterLen >= 40
+     * guard let this struct through and misread pAAD (offset 24 here,
+     * not 16) as ulAADLen. */
+    CK_GCM_PARAMS_V240 gcm240 = {
+        .pIv = (CK_BYTE_PTR)SENT_IV, .ulIvLen = (CK_ULONG)strlen(SENT_IV),
+        .ulIvBits = (CK_ULONG)strlen(SENT_IV) * 8,
+        .pAAD = (CK_BYTE_PTR)SENT_AAD, .ulAADLen = (CK_ULONG)strlen(SENT_AAD),
+        .ulTagBits = 128,
+    };
+    CK_MECHANISM gcm240_mech = { CKM_AES_GCM, &gcm240, sizeof(gcm240) };
+    NOTE("C_EncryptInit(GCM v2.40)",
+         ((fn_encinit)fns[I_EncryptInit])(sess, &gcm240_mech, hObject));
+
+    /* Malformed ulParameterLen: 24 matches neither the 40-byte legacy nor
+     * the 48-byte modern GCM layout. Must decode nothing — never guess at
+     * offsets for an unrecognized length. The buffer's bytes must never
+     * matter since the length guard should reject this before either
+     * pIv/pAAD offset is ever read. */
+    CK_BYTE malformed_buf[24] = {0};
+    CK_MECHANISM gcm_malformed_mech = { CKM_AES_GCM, malformed_buf, sizeof(malformed_buf) };
+    NOTE("C_EncryptInit(GCM malformed len=24)",
+         ((fn_encinit)fns[I_EncryptInit])(sess, &gcm_malformed_mech, hObject));
+
+    /* RSA-PSS *Init — exercises the PSS offset path at all (nothing else
+     * in this workload did before). hObject is a secret-key handle (or
+     * possibly invalid, if C_CreateObject above failed), so this is
+     * expected to fail on a real token; the uprobe fires regardless. */
+    CK_RSA_PKCS_PSS_PARAMS pss = { CKM_SHA256, CKG_MGF1_SHA256, 32 };
+    CK_MECHANISM pss_mech = { CKM_RSA_PKCS_PSS, &pss, sizeof(pss) };
+    NOTE("C_SignInit(PSS)", ((fn_signinit)fns[I_SignInit])(sess, &pss_mech, hObject));
 
     NOTE("C_CloseSession", ((fn_close)fns[I_CloseSession])(sess));
     NOTE("C_Finalize", ((fn_gen)fns[I_Finalize])(NULL));

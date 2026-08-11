@@ -83,34 +83,46 @@ where
 
 /// Decode allowlisted `CK_MECHANISM` parameters for `shape` at `pmech`,
 /// writing the result into `start.shape/p0/p1/p2`. Anything unexpected —
-/// short `ulParameterLen`, null `pParameter`, or any failed read — leaves
-/// `start.shape` at its `shape::NONE` default and `p0/p1/p2` untouched
-/// (they are already zeroed by the caller): partial decodes are never
-/// emitted.
+/// an `ulParameterLen` that matches no known layout, null `pParameter`, or
+/// any failed read — leaves `start.shape` at its `shape::NONE` default and
+/// `p0/p1/p2` untouched (they are already zeroed by the caller): partial
+/// decodes are never emitted, and an unrecognized length is never guessed
+/// at.
+///
+/// PKCS#11 has two incompatible `CK_GCM_PARAMS` layouts in the wild: the
+/// legacy v2.20 one (40 bytes) and the current v2.40/OASIS one (48 bytes,
+/// which inserts `ulIvBits` at offset 16 and pushes the rest out). Reusing
+/// the legacy offsets against a modern 48-byte struct — as this function
+/// used to, guarding only `ulParameterLen >= 40` — reads `CK_GCM_PARAMS.pAAD`
+/// (a userspace pointer) into what the caller believes is `ulAADLen`. The
+/// match below is deliberately an *exact* length match per layout, never
+/// `>=`: a length that fits neither known layout means the field offsets
+/// are unknown, and guessing is exactly what caused that disclosure.
 ///
 /// Reads exactly two `CK_MECHANISM` fields (`ulParameterLen` at offset 16,
 /// `pParameter` at offset 8) plus three shape-specific `u64` scalars at
-/// fixed offsets from `pParameter`. For `GCM`, offsets 0 and 16 of
-/// `CK_GCM_PARAMS` are `pIv`/`pAAD` — pointers — and are never read; only
-/// `ulIvLen` (8), `ulAADLen` (24), `ulTagBits` (32) are.
+/// fixed offsets from `pParameter`. For GCM, `pIv`/`pAAD` — pointers, at
+/// offset 0 always and offset 16 or 24 depending on layout — are never
+/// read; only the three length/count scalars are.
 fn decode_params(pmech: u64, sh: u32, start: &mut CallStart) {
-    let (needed, o0, o1, o2) = match sh {
-        // CK_RSA_PKCS_PSS_PARAMS { hashAlg, mgf, sLen } — three CK_ULONGs.
-        shape::RSA_PKCS_PSS => (24u64, 0u64, 8u64, 16u64),
-        // CK_GCM_PARAMS { pIv, ulIvLen, pAAD, ulAADLen, ulTagBits }.
-        shape::GCM => (40u64, 8u64, 24u64, 32u64),
-        _ => return,
-    };
-    // CK_MECHANISM.ulParameterLen is the third CK_ULONG (offset 16). Guard
-    // first: a provider passing a short buffer must never cause a read
-    // past its end.
+    // CK_MECHANISM.ulParameterLen is the third CK_ULONG (offset 16). Read
+    // first: which offsets (if any) apply depends on it.
     let Ok(param_len) = (unsafe { helpers::bpf_probe_read_user((pmech + 16) as *const u64) })
     else {
         return;
     };
-    if param_len < needed {
-        return;
-    }
+    let (o0, o1, o2, out_shape) = match (sh, param_len) {
+        // CK_RSA_PKCS_PSS_PARAMS { hashAlg, mgf, sLen } — three CK_ULONGs,
+        // 24 bytes, one layout.
+        (shape::RSA_PKCS_PSS, 24) => (0u64, 8u64, 16u64, shape::RSA_PKCS_PSS),
+        // CK_GCM_PARAMS, legacy v2.20 layout (40 bytes):
+        // { pIv, ulIvLen, pAAD, ulAADLen, ulTagBits }.
+        (shape::GCM, 40) => (8u64, 24u64, 32u64, shape::GCM_V220),
+        // CK_GCM_PARAMS, v2.40/OASIS layout (48 bytes):
+        // { pIv, ulIvLen, ulIvBits, pAAD, ulAADLen, ulTagBits }.
+        (shape::GCM, 48) => (8u64, 32u64, 40u64, shape::GCM_V240),
+        _ => return,
+    };
     // CK_MECHANISM.pParameter is the second CK_ULONG (offset 8).
     let Ok(pparam) = (unsafe { helpers::bpf_probe_read_user((pmech + 8) as *const u64) }) else {
         return;
@@ -122,7 +134,7 @@ fn decode_params(pmech: u64, sh: u32, start: &mut CallStart) {
     let r1 = unsafe { helpers::bpf_probe_read_user((pparam + o1) as *const u64) };
     let r2 = unsafe { helpers::bpf_probe_read_user((pparam + o2) as *const u64) };
     if let (Ok(a), Ok(b), Ok(c)) = (r0, r1, r2) {
-        start.shape = sh;
+        start.shape = out_shape;
         start.p0 = a;
         start.p1 = b;
         start.p2 = c;

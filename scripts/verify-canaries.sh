@@ -226,3 +226,104 @@ if leaks:
 
 print("=== canaries: NONE LEAKED ===")
 PY
+
+echo "=== verify GCM/PSS parameter decode correctness ==="
+# Beyond "no sentinel leaked" above: this checks the *decoded scalar
+# fields themselves* are correct, not just absent of secrets. This is the
+# regression test for a defect the sentinel scan above cannot see: a
+# stale ulParameterLen >= 40 guard let a modern 48-byte CK_GCM_PARAMS
+# through and misread its pAAD *pointer* into the field labeled aad_len —
+# a small, plausible-looking-but-wrong integer, not a sentinel byte
+# string, so nothing above would have caught it. Verified instead by
+# checking the emitted value against the length actually planted, and
+# generically by rejecting any numeric field that looks like a pointer.
+python3 - "$WORK/observed.json" <<'PY'
+import json, sys
+
+path = sys.argv[1]
+doc = json.load(open(path))
+mechs = {m["mechanism_hex"]: m for m in doc["mechanisms"]}
+
+# Must match scripts/fixtures/canary_workload.c exactly.
+AAD_LEN = len("CANARY_AAD_5b1502ea971ec81f4b974fe84d62a22f")
+IV_LEN = len("CANARY_IV_d81e4ec085489f1adfcf4729eadd745d")
+
+
+def combos_for(mech_hex):
+    m = mechs.get(mech_hex)
+    assert m is not None, f"mechanism {mech_hex} not observed in {path}"
+    params = m["params"]
+    assert params is not None, f"mechanism {mech_hex} has null params: note={m['note']!r}"
+    return params
+
+
+# No emitted numeric field, on any mechanism, may look like a pointer.
+# General sweep, not just the GCM combo the defect happened to hit: a
+# pointer disclosure could show up in any shape-specific field.
+PTR_LOOKS_LIKE = 2**32
+for m in doc["mechanisms"]:
+    for combo in m["params"] or []:
+        for k, v in combo.items():
+            if k in ("shape", "layout", "count") or k.endswith("_hex"):
+                continue
+            assert isinstance(v, int) and v < PTR_LOOKS_LIKE, (
+                f"mechanism {m['mechanism_hex']} combo {combo!r} field "
+                f"{k!r}={v!r} looks like a pointer, not a length/count"
+            )
+print("no emitted parameter field looks like a pointer (all < 2^32)")
+
+# CKM_AES_GCM (0x1087): must show exactly the two real combos — legacy
+# v2.20 and modern v2.40 — never a third, fabricated one from the
+# malformed ulParameterLen=24 call (which matches neither known layout).
+gcm_combos = combos_for("0x1087")
+by_layout = {c["layout"]: c for c in gcm_combos if c.get("shape") == "gcm"}
+assert set(by_layout) == {"v2.20", "v2.40"}, (
+    f"expected exactly the v2.20 and v2.40 GCM combos, got {sorted(by_layout)} "
+    "— an extra combo would mean the malformed-length call decoded "
+    "something instead of being rejected"
+)
+
+v220, v240 = by_layout["v2.20"], by_layout["v2.40"]
+assert v220["aad_len"] == AAD_LEN, f"v2.20 aad_len should be {AAD_LEN}, got {v220['aad_len']}"
+assert v220["iv_len"] == IV_LEN and v220["tag_bits"] == 128, v220
+# This is the exact defect this fix closes: against the pre-fix code, a
+# 48-byte struct read offset 24 (pAAD, a pointer) into this field instead
+# of offset 32 (ulAADLen) — aad_len would be a huge, pointer-looking
+# value instead of the planted AAD length.
+assert v240["aad_len"] == AAD_LEN, (
+    f"v2.40 aad_len should be the planted AAD length ({AAD_LEN}), not a "
+    f"pointer-looking value — got {v240['aad_len']}"
+)
+assert v240["iv_len"] == IV_LEN and v240["tag_bits"] == 128, v240
+print(f"GCM v2.20 combo verified: {v220}")
+print(f"GCM v2.40 combo verified: {v240} (aad_len is the planted length, not the pAAD pointer)")
+
+# The malformed call must be visible evidence, not silently absorbed into
+# a clean-looking record: it must count as a shape decode failure. (It
+# does not flip evidence.completeness to PARTIAL here — that requires
+# EVERY observed call for a mechanism id to fail to decode
+# (shape_decode_total_failures, see semantics::State::total_shape_decode_failures
+# and its dedicated Rust unit tests), and this mechanism id also decoded
+# successfully twice above in the same capture, which is correctly the
+# weaker "inconsistent decode" signal, not a total regression.)
+shape_decode_failures = doc["evidence"]["shape_decode_failures"]
+assert shape_decode_failures >= 1, (
+    "the malformed-length GCM call should count as a shape decode failure "
+    f"(evidence.shape_decode_failures), got evidence={doc['evidence']}"
+)
+print(f"evidence.shape_decode_failures = {shape_decode_failures} "
+      "(malformed-length call counted as a failure, not silently dropped)")
+
+# CKM_RSA_PKCS_PSS (0xd): the PSS offset path, exercised here for the
+# first time by this suite.
+pss_combos = combos_for("0xd")
+assert len(pss_combos) == 1, f"expected exactly one PSS combo, got {pss_combos}"
+pss = pss_combos[0]
+assert pss["shape"] == "rsa_pkcs_pss"
+assert pss["hash_alg"] == 0x250, pss    # CKM_SHA256
+assert pss["mgf"] == 2, pss             # CKG_MGF1_SHA256
+assert pss["salt_len"] == 32, pss
+print(f"PSS combo verified: {pss}")
+
+print("=== GCM/PSS parameter decode: OK ===")
+PY

@@ -221,21 +221,39 @@ with (e.g. "this mechanism was called with a 96-bit tag 40 times and a
 { "shape": "rsa_pkcs_pss", "hash_alg": 592, "hash_alg_hex": "0x250",
   "mgf": 1, "salt_len": 32, "count": 40 }
 
-// AES-GCM (CKM_AES_GCM)
-{ "shape": "gcm", "iv_len": 12, "aad_len": 0, "tag_bits": 128, "count": 1 }
+// AES-GCM (CKM_AES_GCM), legacy v2.20 CK_GCM_PARAMS (40 bytes)
+{ "shape": "gcm", "layout": "v2.20", "iv_len": 12, "aad_len": 0, "tag_bits": 128, "count": 1 }
+
+// AES-GCM (CKM_AES_GCM), current v2.40/OASIS CK_GCM_PARAMS (48 bytes)
+{ "shape": "gcm", "layout": "v2.40", "iv_len": 12, "aad_len": 16, "tag_bits": 128, "count": 3 }
 ```
 
 | Shape | Fields | Source (`CK_*_PARAMS` field) |
 | --- | --- | --- |
 | `rsa_pkcs_pss` | `hash_alg`, `hash_alg_hex`, `mgf`, `salt_len` | `hashAlg`, `mgf`, `sLen` |
-| `gcm` | `iv_len`, `aad_len`, `tag_bits` | `ulIvLen`, `ulAADLen`, `ulTagBits` |
+| `gcm` | `layout`, `iv_len`, `aad_len`, `tag_bits` | (`layout`: which `CK_GCM_PARAMS` struct shape matched), `ulIvLen`, `ulAADLen`, `ulTagBits` |
 
-Both shapes' fields are scalars read directly at fixed offsets in-kernel;
-no pointer field (`CK_GCM_PARAMS.pIv`/`pAAD`, PSS has none) is ever
-dereferenced. Every combo is recorded regardless of the `*Init` call's
-`CK_RV` — same rationale as `mechanisms[].calls`: the application
-genuinely requested these parameters, and that request is the evidence,
-independent of whether the operation succeeded.
+`CK_GCM_PARAMS` has two incompatible layouts in the wild: the legacy
+PKCS#11 v2.20 struct (`pIv`@0 `ulIvLen`@8 `pAAD`@16 `ulAADLen`@24
+`ulTagBits`@32, 40 bytes) and the current v2.40/OASIS struct, which is
+what `cryptoki_sys::CK_GCM_PARAMS` actually is (`pIv`@0 `ulIvLen`@8
+`ulIvBits`@16 `pAAD`@24 `ulAADLen`@32 `ulTagBits`@40, 48 bytes). The
+in-kernel decoder (`decode_params`, `crates/ebpf/src/main.rs`)
+disambiguates by an **exact** match on `CK_MECHANISM.ulParameterLen` (40
+or 48, never `>=`) and only then reads the three length/count scalars at
+that layout's offsets; a length matching neither is treated as an unknown
+layout — nothing is decoded, and the mechanism's `*Init` call counts
+toward `evidence.shape_decode_failures` (see below) instead of being
+guessed at. `layout` records which of the two applied, so a reader (and a
+future audit) can tell without re-deriving it from `iv_len`/`aad_len`/
+`tag_bits` alone. RSA-PSS has one layout, `hashAlg`@0 `mgf`@8 `sLen`@16
+(24 bytes), matched the same exact way. Every field emitted is a scalar
+read directly at its layout's offset in-kernel; no pointer field
+(`CK_GCM_PARAMS.pIv`/`pAAD`, PSS has none) is ever dereferenced. Every
+combo is recorded regardless of the `*Init` call's `CK_RV` — same
+rationale as `mechanisms[].calls`: the application genuinely requested
+these parameters, and that request is the evidence, independent of
+whether the operation succeeded.
 
 **Gate G2 — narrower than v1's gap, not closed for every shape.**
 `mechanism`/`mechanism_hex` verbatim preservation is exactly what

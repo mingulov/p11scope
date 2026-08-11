@@ -112,10 +112,29 @@ pub mod fnkind {
 /// mechanism id; only shapes this phase decodes get a non-NONE code, and
 /// an absent/unrecognized shape degrades to NONE (decode nothing) — the
 /// same "unknown degrades to no capture" contract as `fnkind`.
+///
+/// `GCM` is the *registry-level* code only: it is what `MECH_SHAPE` maps a
+/// GCM-capable mechanism id to (`shapes::code_for`), and what
+/// `decode_params` looks up to decide "attempt a GCM decode for this
+/// mechanism." It is never the code an actual decoded `Event` carries —
+/// `CK_GCM_PARAMS` has two incompatible struct layouts in the wild (see
+/// `GCM_V220`/`GCM_V240`), and which one applied is only known once
+/// `ulParameterLen` is read at decode time, so the decode result is
+/// tagged with the specific layout, not the generic `GCM` code.
 pub mod shape {
     pub const NONE: u32 = 0;
     pub const RSA_PKCS_PSS: u32 = 1;
     pub const GCM: u32 = 2;
+    /// A `CK_GCM_PARAMS` decoded per the legacy PKCS#11 v2.20 layout:
+    /// `pIv`@0 `ulIvLen`@8 `pAAD`@16 `ulAADLen`@24 `ulTagBits`@32, 40 bytes
+    /// total (`ulParameterLen == 40`).
+    pub const GCM_V220: u32 = 3;
+    /// A `CK_GCM_PARAMS` decoded per the current v2.40/OASIS layout, which
+    /// inserts `ulIvBits` at offset 16 and pushes the rest out: `pIv`@0
+    /// `ulIvLen`@8 `ulIvBits`@16 `pAAD`@24 `ulAADLen`@32 `ulTagBits`@40, 48
+    /// bytes total (`ulParameterLen == 48`) — what `cryptoki_sys::CK_GCM_PARAMS`
+    /// actually is.
+    pub const GCM_V240: u32 = 4;
 }
 
 /// MECH_SHAPE map capacity. 336 mechanisms are registered upstream today;
@@ -226,7 +245,9 @@ pub struct CallStart {
 /// parameters:
 ///
 /// - `RSA_PKCS_PSS`: p0 = hashAlg, p1 = mgf, p2 = sLen
-/// - `GCM`: p0 = ulIvLen, p1 = ulAADLen, p2 = ulTagBits
+/// - `GCM_V220`/`GCM_V240`: p0 = ulIvLen, p1 = ulAADLen, p2 = ulTagBits
+///   (the shape code itself says which `CK_GCM_PARAMS` layout the decode
+///   used; plain `GCM` never appears here, see the `shape` module docs)
 ///
 /// For unknown or unhandled shapes, `shape` is `shape::NONE` and the `p*`
 /// fields are meaningless.

@@ -19,7 +19,22 @@ pub fn discover(module_path: &Path) -> Result<Manifest, String> {
         .map_err(|e| format!("/proc/self/maps: {e}"))?;
     let maps = maps::parse_maps(&maps_text);
 
-    let mut objects = ObjectTable::default();
+    // /proc/self/maps can report the module's own mapping under a path
+    // string that differs from `module_path` -- not cosmetically, but
+    // genuinely: a magic /proc/<pid>/root/... argument crossing into
+    // another mount namespace is reported by the kernel canonicalized to
+    // whichever mount actually owns the file, which is sometimes not even
+    // reachable from this process at all (a containerd overlay snapshot
+    // mounted only inside a node container's own private namespace, e.g.
+    // scripts/matrix/verify-knative.sh). `module_anchor` locates that
+    // mapping by an address we know lies inside it (one of the module's
+    // two interface-lookup exports), so the module's own object can be
+    // recorded against `module_path` -- the path this call was actually
+    // told to trust, and the one `p11scope profile`/`verify::check_reuse`
+    // re-identifies against later -- instead of the unreliable maps path.
+    let module_maps_path = module_anchor(&lib, &maps);
+
+    let mut objects = ObjectTable::new(module_path, module_maps_path);
     let legacy = legacy_surface(&lib, &maps, &mut objects);
     let (interface_list_acq, iface_surfaces, vendor_interfaces) =
         interface_records(&lib, &maps, &mut objects);
@@ -39,14 +54,45 @@ pub fn discover(module_path: &Path) -> Result<Manifest, String> {
     })
 }
 
+/// Address of one of the module's two interface-lookup exports (whichever
+/// is present), used only to find which `/proc/self/maps` entry — and
+/// hence which resolved path string — is the module's own mapping. `None`
+/// when neither export exists (nothing for `discover` to walk anyway).
+fn module_anchor(lib: &Library, maps: &[maps::MapEntry]) -> Option<PathBuf> {
+    for name in [&b"C_GetFunctionList\0"[..], &b"C_GetInterfaceList\0"[..]] {
+        let Ok(sym) = (unsafe { lib.get::<unsafe extern "C" fn()>(name) }) else { continue };
+        let addr = *sym as usize as u64;
+        if let maps::Resolved::File { path, .. } = maps::resolve(maps, addr) {
+            return Some(path);
+        }
+    }
+    None
+}
+
 /// Dense object ids in first-seen order; identity computed once per object.
-#[derive(Default)]
 struct ObjectTable {
+    /// The `--module` argument, verbatim — what a later `p11scope
+    /// profile`/`verify::check_reuse` will re-identify against.
+    module_path: PathBuf,
+    /// The path `/proc/self/maps` reports for the module's own mapping
+    /// (see `module_anchor`), if resolvable. Any object seen under this
+    /// exact path string is substituted with `module_path` instead: same
+    /// file, but the path this call was actually told to trust.
+    module_maps_path: Option<PathBuf>,
     ids: BTreeMap<PathBuf, u32>,
 }
 
 impl ObjectTable {
+    fn new(module_path: &Path, module_maps_path: Option<PathBuf>) -> Self {
+        Self { module_path: module_path.to_path_buf(), module_maps_path, ids: BTreeMap::new() }
+    }
+
     fn id(&mut self, path: PathBuf) -> u32 {
+        let path = if self.module_maps_path.as_ref() == Some(&path) {
+            self.module_path.clone()
+        } else {
+            path
+        };
         let next = self.ids.len() as u32;
         *self.ids.entry(path).or_insert(next)
     }

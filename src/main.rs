@@ -173,15 +173,7 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
             0
         };
         let reports = metrics::read(&session, &plan)?;
-        let ev = evidence_for(
-            &plan,
-            &session,
-            &reports,
-            event_loss,
-            malformed_records,
-            state.orphan_ops(),
-            state.unmatched_closes(),
-        );
+        let ev = evidence_for(&plan, &session, &reports, event_loss, malformed_records, &state);
         let frame = render::live(&reports, &ev, elapsed, &manifest.module_path, &mode);
         print!("\x1b[2J\x1b[H{frame}");
         std::io::stdout().flush().ok();
@@ -193,15 +185,7 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
     }
     let reports = metrics::read(&session, &plan)?;
     let event_loss = if mode == "profile" { metrics::lost_events(&session)? } else { 0 };
-    let ev = evidence_for(
-        &plan,
-        &session,
-        &reports,
-        event_loss,
-        malformed_records,
-        state.orphan_ops(),
-        state.unmatched_closes(),
-    );
+    let ev = evidence_for(&plan, &session, &reports, event_loss, malformed_records, &state);
     let frame = render::live(&reports, &ev, clock.elapsed(), &manifest.module_path, &mode);
     print!("\x1b[2J\x1b[H{frame}");
     std::io::stdout().flush().ok();
@@ -248,8 +232,7 @@ fn evidence_for(
     reports: &[metrics::SlotReport],
     event_loss: u64,
     malformed_records: u64,
-    orphan_ops: u64,
-    unmatched_closes: u64,
+    state: &semantics::State,
 ) -> render::Evidence {
     let mut ev = render::Evidence {
         table_entries: plan.entries_seen,
@@ -268,8 +251,10 @@ fn evidence_for(
         interface_list: plan.interface_list.clone(),
         event_loss,
         malformed_records,
-        orphan_ops,
-        unmatched_closes,
+        orphan_ops: state.orphan_ops(),
+        unmatched_closes: state.unmatched_closes(),
+        shape_decode_failures: state.shape_decode_failures(),
+        templates_truncated: state.templates_truncated(),
         completeness: "UNKNOWN",
     };
     ev.verdict();

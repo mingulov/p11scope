@@ -42,6 +42,18 @@ pub struct Evidence {
     /// `C_CloseSession` calls observed with no matching open — likewise
     /// informational, does not affect `completeness`.
     pub unmatched_closes: u64,
+    /// `*Init` calls whose parameter decode did not apply for a mechanism
+    /// id that decoded successfully at least once elsewhere in this
+    /// capture (`semantics::State::shape_decode_failures`) — an
+    /// inconsistent-decode signal. Informational: does not affect
+    /// `completeness`, since it may reflect provider-side parameter
+    /// validation rather than a capture defect.
+    pub shape_decode_failures: u64,
+    /// True when any `templates[].operations[]` entry observed
+    /// `attr_total > attr_count` — a template longer than the capture's
+    /// per-event cap. Unlike the informational counters above, this DOES
+    /// gate `completeness`: truncation is lost evidence.
+    pub templates_truncated: bool,
     pub completeness: &'static str,
 }
 
@@ -55,8 +67,9 @@ impl Evidence {
     /// COMPLETE only when nothing was lost: every planned probe attached,
     /// nothing was skipped, no aliasing ambiguity, no call left in flight,
     /// every surface was fully walked with a successful acquisition, no
-    /// vendor interfaces were left undecoded, and (profile mode) the ring
-    /// buffer neither dropped nor emitted a malformed record.
+    /// vendor interfaces were left undecoded, (profile mode) the ring
+    /// buffer neither dropped nor emitted a malformed record, and no
+    /// template was truncated.
     pub fn verdict(&mut self) {
         let surfaces_complete =
             self.surfaces.iter().all(|s| s.walk == "full" && s.acquisition == "ok");
@@ -68,6 +81,7 @@ impl Evidence {
             && self.vendor_interfaces == 0
             && self.event_loss == 0
             && self.malformed_records == 0
+            && !self.templates_truncated
         {
             "COMPLETE"
         } else {
@@ -131,7 +145,12 @@ pub fn live(reports: &[SlotReport], ev: &Evidence, elapsed: Duration, module: &s
         ev.skipped.len(),
         ev.in_flight_at_end,
     );
-    if surface_gaps > 0 || ev.vendor_interfaces > 0 || ev.event_loss > 0 || ev.malformed_records > 0 {
+    if surface_gaps > 0
+        || ev.vendor_interfaces > 0
+        || ev.event_loss > 0
+        || ev.malformed_records > 0
+        || ev.templates_truncated
+    {
         evidence_line.push_str(" ·");
         if surface_gaps > 0 {
             evidence_line.push_str(&format!(" {surface_gaps} surface gaps"));
@@ -145,8 +164,11 @@ pub fn live(reports: &[SlotReport], ev: &Evidence, elapsed: Duration, module: &s
         if ev.malformed_records > 0 {
             evidence_line.push_str(&format!(" {} malformed records", ev.malformed_records));
         }
+        if ev.templates_truncated {
+            evidence_line.push_str(" templates truncated");
+        }
     }
-    if ev.orphan_ops > 0 || ev.unmatched_closes > 0 {
+    if ev.orphan_ops > 0 || ev.unmatched_closes > 0 || ev.shape_decode_failures > 0 {
         evidence_line.push_str(" · ");
         if ev.orphan_ops > 0 {
             evidence_line.push_str(&format!("ℹ {orphan_ops} orphan ops", orphan_ops = ev.orphan_ops));
@@ -156,6 +178,15 @@ pub fn live(reports: &[SlotReport], ev: &Evidence, elapsed: Duration, module: &s
                 evidence_line.push_str(" ");
             }
             evidence_line.push_str(&format!("ℹ {unmatched} unmatched closes", unmatched = ev.unmatched_closes));
+        }
+        if ev.shape_decode_failures > 0 {
+            if ev.orphan_ops > 0 || ev.unmatched_closes > 0 {
+                evidence_line.push_str(" ");
+            }
+            evidence_line.push_str(&format!(
+                "ℹ {n} shape decode gaps",
+                n = ev.shape_decode_failures
+            ));
         }
     }
     evidence_line.push_str(&format!(" → {}\n", ev.completeness));
@@ -250,11 +281,132 @@ struct MechanismOut {
     calls: u64,
     errors: u64,
     latency_ns: LatencyOut,
-    /// Parameter decoding is Phase 3 — never a partial decode. Always
-    /// `null` today; typed as `Value` so a Phase 3 decoder can populate
-    /// it without a schema-breaking type change.
+    /// `null` when no allowlisted parameter shape ever decoded for this
+    /// mechanism id in this capture (unrecognized/absent shape, or every
+    /// decode attempt failed) — unchanged from v1. Otherwise an array of
+    /// shape-tagged parameter-combination objects, one per **distinct**
+    /// combination of decoded scalar values observed, each carrying its
+    /// own `count` — never an average or a "latest wins" value, since
+    /// migration assessment needs the actual combos a mechanism was
+    /// driven with. See `docs/schema/observed-profile-v1.md` for the
+    /// per-shape field layout.
     params: serde_json::Value,
     note: &'static str,
+}
+
+/// One decoded parameter combination, tagged by shape, with its
+/// occurrence count. `None` for a shape code this phase does not decode
+/// (should not occur: `param_combos` only ever stores shapes the BPF side
+/// actually decoded) — filtered out by the caller, never emitted as a
+/// guess.
+fn param_combo_json(shape_code: u32, p0: u64, p1: u64, p2: u64, count: u64) -> Option<serde_json::Value> {
+    match shape_code {
+        p11scope_ebpf_common::shape::RSA_PKCS_PSS => Some(serde_json::json!({
+            "shape": "rsa_pkcs_pss",
+            "hash_alg": p0,
+            "hash_alg_hex": format!("0x{p0:x}"),
+            "mgf": p1,
+            "salt_len": p2,
+            "count": count,
+        })),
+        p11scope_ebpf_common::shape::GCM => Some(serde_json::json!({
+            "shape": "gcm",
+            "iv_len": p0,
+            "aad_len": p1,
+            "tag_bits": p2,
+            "count": count,
+        })),
+        _ => None,
+    }
+}
+
+/// Bit position (`attr_bool` module) -> the `CKA_*` name it stands for, in
+/// the same order `crates/ebpf-common::attr_bool` declares them.
+const POLICY_BOOL_NAMES: &[(u32, &str)] = &[
+    (p11scope_ebpf_common::attr_bool::TOKEN, "CKA_TOKEN"),
+    (p11scope_ebpf_common::attr_bool::PRIVATE, "CKA_PRIVATE"),
+    (p11scope_ebpf_common::attr_bool::SENSITIVE, "CKA_SENSITIVE"),
+    (p11scope_ebpf_common::attr_bool::ENCRYPT, "CKA_ENCRYPT"),
+    (p11scope_ebpf_common::attr_bool::DECRYPT, "CKA_DECRYPT"),
+    (p11scope_ebpf_common::attr_bool::WRAP, "CKA_WRAP"),
+    (p11scope_ebpf_common::attr_bool::UNWRAP, "CKA_UNWRAP"),
+    (p11scope_ebpf_common::attr_bool::SIGN, "CKA_SIGN"),
+    (p11scope_ebpf_common::attr_bool::VERIFY, "CKA_VERIFY"),
+    (p11scope_ebpf_common::attr_bool::DERIVE, "CKA_DERIVE"),
+    (p11scope_ebpf_common::attr_bool::EXTRACTABLE, "CKA_EXTRACTABLE"),
+];
+
+#[derive(Serialize)]
+struct AttrTypeOut {
+    attr_type: u32,
+    attr_type_hex: String,
+}
+
+#[derive(Serialize)]
+struct PolicyBooleansOut {
+    /// Policy-boolean attributes (`CKA_*` names) observed present-and-true
+    /// on at least one call.
+    observed_true: Vec<&'static str>,
+    /// Observed present-and-false on at least one call. Independent of
+    /// `observed_true` — a name can legitimately appear in both when
+    /// different calls asked for different values. A name absent from
+    /// both lists was never present in a requested template at all in
+    /// this capture — a real three-state, not a boolean default.
+    observed_false: Vec<&'static str>,
+}
+
+/// One template-bearing operation (`C_FindObjectsInit`, `C_CreateObject`,
+/// `C_GenerateKey`, ...). Every field here is what the application
+/// **requested** via its `CK_ATTRIBUTE` template — never the key's
+/// effective policy, which the provider may reject, ignore, or override.
+/// See `templates.note` in the top-level document and
+/// `docs/schema/observed-profile-v1.md`.
+#[derive(Serialize)]
+struct TemplateOut {
+    names: Vec<String>,
+    aliased: bool,
+    /// Always `true`: an explicit, unambiguous marker (not just prose)
+    /// that every field below is a request, never an effective policy.
+    requested: bool,
+    /// Union of attribute *types* requested across every observed call
+    /// for this operation — never a value, except the policy booleans
+    /// below.
+    attr_types: Vec<AttrTypeOut>,
+    policy_booleans: PolicyBooleansOut,
+    /// True when any observed call had `attr_total > attr_count` — a
+    /// template longer than the capture's per-event cap. Also forces
+    /// `evidence.templates_truncated` and `completeness: PARTIAL`.
+    truncated: bool,
+}
+
+fn templates_out(state: &crate::semantics::State) -> Vec<TemplateOut> {
+    state
+        .templates()
+        .values()
+        .map(|t| TemplateOut {
+            names: t.names.clone(),
+            aliased: t.aliased,
+            requested: true,
+            attr_types: t
+                .attr_types
+                .iter()
+                .map(|&ty| AttrTypeOut { attr_type: ty, attr_type_hex: format!("0x{ty:x}") })
+                .collect(),
+            policy_booleans: PolicyBooleansOut {
+                observed_true: POLICY_BOOL_NAMES
+                    .iter()
+                    .filter(|(bit, _)| t.bools_true & bit != 0)
+                    .map(|(_, name)| *name)
+                    .collect(),
+                observed_false: POLICY_BOOL_NAMES
+                    .iter()
+                    .filter(|(bit, _)| t.bools_false & bit != 0)
+                    .map(|(_, name)| *name)
+                    .collect(),
+            },
+            truncated: t.truncated,
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -289,15 +441,34 @@ pub fn profile_json(
     let mechanisms: Vec<MechanismOut> = state
         .mechanisms()
         .iter()
-        .map(|(id, m)| MechanismOut {
-            mechanism: *id,
-            mechanism_hex: format!("0x{id:x}"),
-            ops: m.ops.iter().cloned().collect(),
-            calls: m.calls,
-            errors: m.errors,
-            latency_ns: latency_out(&m.buckets, m.total_ns, m.max_ns),
-            params: serde_json::Value::Null,
-            note: "parameter decoding is Phase 3; not attempted here, never a partial decode",
+        .map(|(id, m)| {
+            let combos: Vec<serde_json::Value> = m
+                .param_combos
+                .iter()
+                .filter_map(|(&(sh, p0, p1, p2), &count)| param_combo_json(sh, p0, p1, p2, count))
+                .collect();
+            let (params, note) = if combos.is_empty() {
+                (
+                    serde_json::Value::Null,
+                    "parameter decoding is Phase 3; not attempted here, never a partial decode",
+                )
+            } else {
+                (
+                    serde_json::Value::Array(combos),
+                    "decoded from allowlisted parameters (RSA-PSS hash/MGF/salt, GCM IV/AAD/tag \
+                     length); requested values as passed to the operation, never a partial decode",
+                )
+            };
+            MechanismOut {
+                mechanism: *id,
+                mechanism_hex: format!("0x{id:x}"),
+                ops: m.ops.iter().cloned().collect(),
+                calls: m.calls,
+                errors: m.errors,
+                latency_ns: latency_out(&m.buckets, m.total_ns, m.max_ns),
+                params,
+                note,
+            }
         })
         .collect();
     let sessions = state.sessions();
@@ -311,7 +482,7 @@ pub fn profile_json(
         state.logins().iter().map(|(user_type, n)| (user_type.to_string(), *n)).collect();
 
     serde_json::json!({
-        "schema": "pkcs11-scope/observed-profile/v1",
+        "schema": "pkcs11-scope/observed-profile/v1.1",
         "capture": {
             "start": capture.started, "end": capture.ended, "mode": "profile",
             "kernel": capture.kernel,
@@ -322,6 +493,13 @@ pub fn profile_json(
         "mechanisms": mechanisms,
         "sessions": sessions_out,
         "logins": logins,
+        "templates": {
+            "note": "every field here is what the application asked for via a CK_ATTRIBUTE \
+                     template — never asserted as the key's effective policy; the provider may \
+                     reject, ignore, or override any of it (see the `requested` marker on each \
+                     operation)",
+            "operations": templates_out(state),
+        },
     })
 }
 
@@ -369,6 +547,8 @@ mod tests {
             malformed_records: 0,
             orphan_ops: 0,
             unmatched_closes: 0,
+            shape_decode_failures: 0,
+            templates_truncated: false,
             completeness: "UNKNOWN",
         }
     }
@@ -392,6 +572,7 @@ mod tests {
             |e: &mut Evidence| e.vendor_interfaces = 1,
             |e: &mut Evidence| e.event_loss = 1,
             |e: &mut Evidence| e.malformed_records = 1,
+            |e: &mut Evidence| e.templates_truncated = true,
         ] {
             let mut ev = evidence();
             mutate(&mut ev);
@@ -407,6 +588,7 @@ mod tests {
         let mut ev = evidence();
         ev.orphan_ops = 3;
         ev.unmatched_closes = 2;
+        ev.shape_decode_failures = 4;
         ev.verdict();
         assert_eq!(ev.completeness, "COMPLETE");
     }
@@ -505,12 +687,13 @@ mod tests {
         };
         let v = profile_json(&[], &ev, &state, &capture);
 
-        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v1");
+        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v1.1");
         for section in
-            ["capture", "evidence", "functions", "mechanisms", "sessions", "logins"]
+            ["capture", "evidence", "functions", "mechanisms", "sessions", "logins", "templates"]
         {
-            assert!(v.get(section).is_some(), "v1 document missing required section {section}");
+            assert!(v.get(section).is_some(), "v1.1 document missing required section {section}");
         }
+        assert_eq!(v["templates"]["operations"], serde_json::json!([]));
         assert_eq!(v["capture"]["mode"], "profile");
         assert_eq!(v["capture"]["module"]["path"], "/opt/p11.so");
         assert_eq!(v["capture"]["module"]["build_id"], "aabb");
@@ -573,5 +756,230 @@ mod tests {
         assert_eq!(mech["params"], serde_json::Value::Null);
         assert_eq!(mech["calls"], 1);
         assert_eq!(v["capture"]["module"]["build_id"], serde_json::Value::Null);
+    }
+
+    fn init_event(slot: u32, mechanism: u64, shape_code: u32, p0: u64, p1: u64, p2: u64) -> p11scope_ebpf_common::Event {
+        use p11scope_ebpf_common::{Event, USER_TYPE_NONE, fnkind};
+        Event {
+            ts_ns: 0,
+            duration_ns: 100,
+            pid_tgid: (100u64 << 32) | 1,
+            cgroup_id: 0,
+            session: 7,
+            mechanism,
+            rv: 0,
+            p0,
+            p1,
+            p2,
+            slot,
+            kind: fnkind::INIT_WITH_MECH,
+            user_type: USER_TYPE_NONE,
+            shape: shape_code,
+            attr_types: [0; 8],
+            attr_count: 0,
+            attr_total: 0,
+            attr_bools: 0,
+            attr_bools_seen: 0,
+        }
+    }
+
+    fn init_plan() -> crate::plan::AttachPlan {
+        use p11scope_ebpf_common::fnkind;
+        crate::plan::AttachPlan {
+            slots: vec![crate::plan::Slot {
+                index: 0,
+                object: "/opt/p11.so".into(),
+                file_offset: 0x10,
+                names: vec!["C_SignInit".into()],
+                aliased: false,
+                kind: fnkind::INIT_WITH_MECH,
+            }],
+            ..empty_plan()
+        }
+    }
+
+    #[test]
+    fn profile_json_renders_pss_params_as_a_shape_tagged_object_with_count() {
+        use p11scope_ebpf_common::shape;
+
+        let mut state = crate::semantics::State::new(&init_plan());
+        // Same mechanism, same combo, twice — must collapse into one
+        // entry with count 2, not two entries.
+        state.observe(&init_event(0, 0x0D, shape::RSA_PKCS_PSS, 0x270, 1, 32));
+        state.observe(&init_event(0, 0x0D, shape::RSA_PKCS_PSS, 0x270, 1, 32));
+
+        let mut ev = evidence();
+        ev.verdict();
+        let capture = CaptureMeta { module: "/opt/p11.so", build_id: None, started: "t0", ended: "t1", kernel: "6.8.0" };
+        let v = profile_json(&[], &ev, &state, &capture);
+
+        let params = &v["mechanisms"][0]["params"];
+        assert_eq!(params.as_array().unwrap().len(), 1, "one distinct combo");
+        let combo = &params[0];
+        assert_eq!(combo["shape"], "rsa_pkcs_pss");
+        assert_eq!(combo["hash_alg"], 0x270);
+        assert_eq!(combo["hash_alg_hex"], "0x270");
+        assert_eq!(combo["mgf"], 1);
+        assert_eq!(combo["salt_len"], 32);
+        assert_eq!(combo["count"], 2);
+    }
+
+    #[test]
+    fn profile_json_renders_gcm_params_as_a_shape_tagged_object() {
+        use p11scope_ebpf_common::shape;
+
+        let mut state = crate::semantics::State::new(&init_plan());
+        state.observe(&init_event(0, 0x1087, shape::GCM, 12, 0, 128));
+
+        let mut ev = evidence();
+        ev.verdict();
+        let capture = CaptureMeta { module: "/opt/p11.so", build_id: None, started: "t0", ended: "t1", kernel: "6.8.0" };
+        let v = profile_json(&[], &ev, &state, &capture);
+
+        let combo = &v["mechanisms"][0]["params"][0];
+        assert_eq!(combo["shape"], "gcm");
+        assert_eq!(combo["iv_len"], 12);
+        assert_eq!(combo["aad_len"], 0);
+        assert_eq!(combo["tag_bits"], 128);
+        assert_eq!(combo["count"], 1);
+    }
+
+    #[test]
+    fn profile_json_multiple_distinct_combos_get_separate_entries() {
+        use p11scope_ebpf_common::shape;
+
+        let mut state = crate::semantics::State::new(&init_plan());
+        state.observe(&init_event(0, 0x0D, shape::RSA_PKCS_PSS, 0x270, 1, 32));
+        state.observe(&init_event(0, 0x0D, shape::RSA_PKCS_PSS, 0x270, 1, 64));
+
+        let mut ev = evidence();
+        ev.verdict();
+        let capture = CaptureMeta { module: "/opt/p11.so", build_id: None, started: "t0", ended: "t1", kernel: "6.8.0" };
+        let v = profile_json(&[], &ev, &state, &capture);
+
+        assert_eq!(
+            v["mechanisms"][0]["params"].as_array().unwrap().len(),
+            2,
+            "distinct salt lengths must not collapse into one combo"
+        );
+    }
+
+    #[test]
+    fn profile_json_unknown_shape_still_yields_null_params() {
+        // shape::NONE — no decode ever applied for this mechanism.
+        let mut state = crate::semantics::State::new(&init_plan());
+        state.observe(&init_event(0, 0x0999, 0, 0, 0, 0));
+
+        let mut ev = evidence();
+        ev.verdict();
+        let capture = CaptureMeta { module: "/opt/p11.so", build_id: None, started: "t0", ended: "t1", kernel: "6.8.0" };
+        let v = profile_json(&[], &ev, &state, &capture);
+
+        assert_eq!(v["mechanisms"][0]["params"], serde_json::Value::Null);
+    }
+
+    fn template_plan() -> crate::plan::AttachPlan {
+        use p11scope_ebpf_common::fnkind;
+        crate::plan::AttachPlan {
+            slots: vec![crate::plan::Slot {
+                index: 0,
+                object: "/opt/p11.so".into(),
+                file_offset: 0x20,
+                names: vec!["C_FindObjectsInit".into()],
+                aliased: false,
+                kind: fnkind::TEMPLATE_ARG1,
+            }],
+            ..empty_plan()
+        }
+    }
+
+    fn template_event(
+        attr_types: &[u32],
+        attr_total: u32,
+        attr_bools: u32,
+        attr_bools_seen: u32,
+    ) -> p11scope_ebpf_common::Event {
+        use p11scope_ebpf_common::{Event, USER_TYPE_NONE, fnkind};
+        let mut types = [0u32; 8];
+        for (i, &t) in attr_types.iter().enumerate() {
+            types[i] = t;
+        }
+        Event {
+            ts_ns: 0,
+            duration_ns: 10,
+            pid_tgid: (100u64 << 32) | 1,
+            cgroup_id: 0,
+            session: 7,
+            mechanism: p11scope_ebpf_common::MECH_NONE,
+            rv: 0,
+            p0: 0,
+            p1: 0,
+            p2: 0,
+            slot: 0,
+            kind: fnkind::TEMPLATE_ARG1,
+            user_type: USER_TYPE_NONE,
+            shape: 0,
+            attr_types: types,
+            attr_count: attr_types.len() as u32,
+            attr_total,
+            attr_bools,
+            attr_bools_seen,
+        }
+    }
+
+    #[test]
+    fn profile_json_templates_render_requested_types_and_tristate_booleans() {
+        use p11scope_ebpf_common::attr_bool;
+
+        let mut state = crate::semantics::State::new(&template_plan());
+        // CKA_TOKEN (0x01) true, CKA_PRIVATE (0x02) present-but-false,
+        // CKA_SIGN (0x108) never appears.
+        state.observe(&template_event(
+            &[0x01, 0x02],
+            2,
+            attr_bool::TOKEN,
+            attr_bool::TOKEN | attr_bool::PRIVATE,
+        ));
+
+        let mut ev = evidence();
+        ev.verdict();
+        let capture = CaptureMeta { module: "/opt/p11.so", build_id: None, started: "t0", ended: "t1", kernel: "6.8.0" };
+        let v = profile_json(&[], &ev, &state, &capture);
+
+        let op = &v["templates"]["operations"][0];
+        assert_eq!(op["names"], serde_json::json!(["C_FindObjectsInit"]));
+        assert_eq!(op["requested"], true, "must be an explicit, unambiguous marker");
+        assert_eq!(op["truncated"], false);
+        let types: Vec<u64> =
+            op["attr_types"].as_array().unwrap().iter().map(|t| t["attr_type"].as_u64().unwrap()).collect();
+        assert_eq!(types, vec![0x01, 0x02]);
+        assert_eq!(op["attr_types"][0]["attr_type_hex"], "0x1");
+
+        let true_names: Vec<&str> =
+            op["policy_booleans"]["observed_true"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        let false_names: Vec<&str> =
+            op["policy_booleans"]["observed_false"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(true_names, vec!["CKA_TOKEN"]);
+        assert_eq!(false_names, vec!["CKA_PRIVATE"]);
+        assert!(!true_names.contains(&"CKA_SIGN"), "never present — not true");
+        assert!(!false_names.contains(&"CKA_SIGN"), "never present — not false either");
+    }
+
+    #[test]
+    fn profile_json_template_truncation_forces_partial_and_evidence_field() {
+        let mut state = crate::semantics::State::new(&template_plan());
+        state.observe(&template_event(&[0x01; 8], 10, 0, 0)); // attr_total(10) > attr_count(8)
+
+        let mut ev = evidence();
+        ev.templates_truncated = state.templates_truncated();
+        ev.verdict();
+        assert!(ev.templates_truncated, "the aggregate accessor must see the truncation");
+        assert_eq!(ev.completeness, "PARTIAL");
+
+        let capture = CaptureMeta { module: "/opt/p11.so", build_id: None, started: "t0", ended: "t1", kernel: "6.8.0" };
+        let v = profile_json(&[], &ev, &state, &capture);
+        assert_eq!(v["templates"]["operations"][0]["truncated"], true);
+        assert_eq!(v["evidence"]["templates_truncated"], true);
+        assert_eq!(v["evidence"]["completeness"], "PARTIAL");
     }
 }

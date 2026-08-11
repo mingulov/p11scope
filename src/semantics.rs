@@ -5,7 +5,9 @@
 //! returns one.
 
 use crate::plan::AttachPlan;
-use p11scope_ebpf_common::{Event, LATENCY_BUCKETS, MECH_NONE, SESSION_NONE, USER_TYPE_NONE, bucket_of, fnkind};
+use p11scope_ebpf_common::{
+    Event, LATENCY_BUCKETS, MECH_NONE, SESSION_NONE, USER_TYPE_NONE, bucket_of, fnkind, shape,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Aggregate stats for one mechanism id, kept **verbatim** as `u64` —
@@ -22,6 +24,55 @@ pub struct MechStat {
     /// at the slot that recorded it. A set, not a scalar: the same
     /// mechanism id can legally serve more than one operation kind.
     pub ops: BTreeSet<String>,
+    /// Distinct decoded parameter combinations observed on `*Init` calls
+    /// for this mechanism, keyed by `(shape code, p0, p1, p2)` with each
+    /// combination's occurrence count. A map, not a single "latest" or
+    /// averaged value: migration assessment needs the actual combos a
+    /// mechanism was driven with, not a summary that could hide a
+    /// weaker one. Only entries whose decode applied (`shape !=
+    /// shape::NONE`) are recorded here.
+    pub param_combos: BTreeMap<(u32, u64, u64, u64), u64>,
+    /// `*Init` calls for this mechanism whose parameter decode did not
+    /// apply (`Event::shape == shape::NONE`). Combined with
+    /// `param_combos` being non-empty (this mechanism id *did* decode
+    /// successfully at least once this capture), a nonzero count here is
+    /// evidence of an inconsistent/failed decode on some calls — see
+    /// `State::shape_decode_failures`. When `param_combos` is empty this
+    /// mechanism simply has no decodable shape (or none observed), which
+    /// is not a failure.
+    pub init_no_shape: u64,
+}
+
+/// Aggregate stats for one template-bearing operation (`C_FindObjectsInit`,
+/// `C_CreateObject`, `C_GenerateKey`, ...), keyed by attach slot — the same
+/// grouping `functions[]` uses, so an aliased slot's calls stay one entry.
+/// Carries only what the application *asked for*: attribute types and the
+/// policy-boolean allowlist observed on those templates, never a value
+/// beyond the allowlisted booleans, and never the key's effective policy
+/// (see module docs on the requested-vs-effective distinction).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TemplateStat {
+    /// Every distinct function name resolving to this slot.
+    pub names: Vec<String>,
+    pub aliased: bool,
+    /// Union of attribute *types* requested across every observed call.
+    pub attr_types: BTreeSet<u32>,
+    /// Bit set (`attr_bool` positions) => this policy-boolean attribute
+    /// was observed present-and-true on at least one call.
+    pub bools_true: u32,
+    /// Bit set => observed present-and-false on at least one call.
+    /// Independent of `bools_true`: a bit can be set in both when
+    /// different calls asked for different values, and that is
+    /// legitimate, distinguishable evidence, not an error.
+    pub bools_false: u32,
+    /// True when any observed call had `attr_total > attr_count`: either
+    /// the template had more entries than the capture's per-event cap
+    /// (`MAX_ATTRS`), or the in-kernel walk stopped early on a
+    /// `bpf_probe_read_user` failure (an unreadable `pTemplate`/entry) —
+    /// both leave `attr_count` short of `attr_total`, and this field does
+    /// not distinguish which. Either way it is lost evidence: some
+    /// attribute types the application requested were not captured.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -34,9 +85,8 @@ pub struct SessionStats {
 /// Per-slot facts `observe` needs on every event, resolved once from the
 /// `AttachPlan` so the hot path never re-scans it.
 struct SlotMeta {
-    /// Joined function name(s) — `"C_Sign"`, or `"C_A|C_B"` for an
-    /// aliased slot whose names share a target.
-    label: String,
+    /// Every distinct function name resolving to this slot.
+    names: Vec<String>,
     /// True for the slot that resolves `C_CloseSession` — the one
     /// `SESSION_ARG0` call that ends a session rather than operating on
     /// one.
@@ -47,6 +97,8 @@ struct SlotMeta {
     /// Operation categories named by this slot's `*Init` function(s), if
     /// any — empty for slots that are not `INIT_WITH_MECH`.
     ops: Vec<String>,
+    /// True when >= 2 distinct names share this slot.
+    aliased: bool,
 }
 
 /// Maps a `*Init` function name to the operation category it starts.
@@ -84,6 +136,8 @@ pub struct State {
     active_op: BTreeMap<(u32, u64), u64>,
 
     mechanisms: BTreeMap<u64, MechStat>,
+    /// Template-bearing operations, keyed by attach slot.
+    templates: BTreeMap<u32, TemplateStat>,
     logins: BTreeMap<u32, u64>,
     sessions: SessionStats,
     orphan_ops: u64,
@@ -105,10 +159,11 @@ impl State {
                 slots.resize_with(idx + 1, || None);
             }
             slots[idx] = Some(SlotMeta {
-                label: slot.names.join("|"),
+                names: slot.names.clone(),
                 is_close_session: slot.names.iter().any(|n| n == "C_CloseSession"),
                 is_final: slot.names.iter().any(|n| n.ends_with("Final")),
                 ops: slot.names.iter().filter_map(|n| op_of_init_name(n)).map(String::from).collect(),
+                aliased: slot.aliased,
             });
         }
         Self {
@@ -118,6 +173,7 @@ impl State {
             open: BTreeSet::new(),
             active_op: BTreeMap::new(),
             mechanisms: BTreeMap::new(),
+            templates: BTreeMap::new(),
             logins: BTreeMap::new(),
             sessions: SessionStats::default(),
             orphan_ops: 0,
@@ -139,6 +195,7 @@ impl State {
             fnkind::INIT_WITH_MECH => self.observe_init(pid, ev),
             fnkind::SESSION_ARG0 => self.observe_session_arg0(pid, ev, is_close_session, is_final),
             fnkind::LOGIN => self.observe_login(ev),
+            fnkind::TEMPLATE_ARG1 | fnkind::TEMPLATE_ARG2 => self.observe_template(ev),
             _ => {}
         }
     }
@@ -178,6 +235,17 @@ impl State {
         record_call(stat, ev);
         if let Some(ops) = ops {
             stat.ops.extend(ops);
+        }
+        // Decoded parameters are requested-values evidence, same as the
+        // mechanism id itself: recorded regardless of `rv`. Only a
+        // successful decode (`shape != NONE`) adds a combo; everything
+        // else is counted as a no-decode `*Init`, which only becomes
+        // interesting evidence (`State::shape_decode_failures`) once this
+        // mechanism id has decoded successfully at least once elsewhere.
+        if ev.shape != shape::NONE {
+            *stat.param_combos.entry((ev.shape, ev.p0, ev.p1, ev.p2)).or_insert(0) += 1;
+        } else {
+            stat.init_no_shape += 1;
         }
         // The application genuinely requested this mechanism, so it is
         // recorded above regardless of outcome — but a failed Init starts
@@ -221,8 +289,36 @@ impl State {
         }
     }
 
+    /// `C_FindObjectsInit` / `C_CreateObject` / `C_GenerateKey` — templates
+    /// are recorded regardless of `rv`, same rationale as mechanisms: the
+    /// application asked for these attributes, and that is the evidence,
+    /// independent of whether the call succeeded.
+    fn observe_template(&mut self, ev: &Event) {
+        let Some(meta) = self.slots.get(ev.slot as usize).and_then(|s| s.as_ref()) else {
+            return;
+        };
+        let stat = self.templates.entry(ev.slot).or_insert_with(|| TemplateStat {
+            names: meta.names.clone(),
+            aliased: meta.aliased,
+            ..Default::default()
+        });
+        let count = (ev.attr_count as usize).min(ev.attr_types.len());
+        for &attr_type in &ev.attr_types[..count] {
+            stat.attr_types.insert(attr_type);
+        }
+        stat.bools_true |= ev.attr_bools & ev.attr_bools_seen;
+        stat.bools_false |= ev.attr_bools_seen & !ev.attr_bools;
+        if ev.attr_total > ev.attr_count {
+            stat.truncated = true;
+        }
+    }
+
     pub fn mechanisms(&self) -> &BTreeMap<u64, MechStat> {
         &self.mechanisms
+    }
+
+    pub fn templates(&self) -> &BTreeMap<u32, TemplateStat> {
+        &self.templates
     }
 
     pub fn sessions(&self) -> SessionStats {
@@ -239,6 +335,34 @@ impl State {
 
     pub fn unmatched_closes(&self) -> u64 {
         self.unmatched_closes
+    }
+
+    /// True when any template-bearing operation observed `attr_total >
+    /// attr_count` in this capture — either a template longer than the
+    /// per-event cap, or the in-kernel walk stopping early on a read
+    /// failure (see `TemplateStat::truncated`); both are lost evidence.
+    /// Feeds `evidence.templates_truncated`, a `completeness` gap.
+    pub fn templates_truncated(&self) -> bool {
+        self.templates.values().any(|t| t.truncated)
+    }
+
+    /// `*Init` calls whose parameter decode did not apply, for mechanism
+    /// ids that decoded successfully **at least once** elsewhere in this
+    /// capture — an inconsistent-decode signal, not a completeness gap
+    /// (see `MechStat::init_no_shape`). A mechanism id that never decoded
+    /// **at all** — including one whose *every* decode attempt failed —
+    /// contributes nothing here: distinguishing "no decodable shape" from
+    /// "a decodable shape that failed on every single call" needs the
+    /// registry (which id→shape mapping was published), and this
+    /// accessor only has the event stream. This is a deliberate, disclosed
+    /// blind spot, not an oversight — see `docs/schema/observed-profile-v1.md`
+    /// ("`params` in v1.1" and the `shape_decode_failures` evidence row).
+    pub fn shape_decode_failures(&self) -> u64 {
+        self.mechanisms
+            .values()
+            .filter(|m| !m.param_combos.is_empty())
+            .map(|m| m.init_no_shape)
+            .sum()
     }
 }
 
@@ -323,6 +447,7 @@ mod tests {
     // Slot layout shared by the tests below:
     // 0 C_OpenSession   1 C_CloseSession   2 C_SignInit
     // 3 C_Sign          4 C_SignFinal      5 C_Login
+    // 6 C_FindObjectsInit (template)
     fn test_plan() -> AttachPlan {
         AttachPlan {
             slots: vec![
@@ -332,12 +457,81 @@ mod tests {
                 slot(3, &["C_Sign"], fnkind::SESSION_ARG0),
                 slot(4, &["C_SignFinal"], fnkind::SESSION_ARG0),
                 slot(5, &["C_Login"], fnkind::LOGIN),
+                slot(6, &["C_FindObjectsInit"], fnkind::TEMPLATE_ARG1),
             ],
             skipped: vec![],
-            entries_seen: 6,
+            entries_seen: 7,
             surfaces: vec![],
             vendor_interfaces: 0,
             interface_list: "absent".into(),
+        }
+    }
+
+    /// An `*Init` event carrying a decoded (or not-decoded) parameter shape.
+    fn ev_shape(
+        pid: u32,
+        session: u64,
+        mechanism: u64,
+        rv: u64,
+        shape_code: u32,
+        params: (u64, u64, u64),
+    ) -> Event {
+        let (p0, p1, p2) = params;
+        Event {
+            ts_ns: 0,
+            duration_ns: 10,
+            pid_tgid: pid_tgid(pid),
+            cgroup_id: 0,
+            session,
+            mechanism,
+            rv,
+            p0,
+            p1,
+            p2,
+            slot: 2,
+            kind: fnkind::INIT_WITH_MECH,
+            user_type: USER_TYPE_NONE,
+            shape: shape_code,
+            attr_types: [0; 8],
+            attr_count: 0,
+            attr_total: 0,
+            attr_bools: 0,
+            attr_bools_seen: 0,
+        }
+    }
+
+    /// A `C_FindObjectsInit`-shaped template event on slot 6.
+    fn ev_template(
+        pid: u32,
+        attr_types: &[u32],
+        attr_total: u32,
+        attr_bools: u32,
+        attr_bools_seen: u32,
+    ) -> Event {
+        let mut types = [0u32; 8];
+        for (i, &t) in attr_types.iter().enumerate() {
+            types[i] = t;
+        }
+        Event {
+            ts_ns: 0,
+            duration_ns: 10,
+            pid_tgid: pid_tgid(pid),
+            cgroup_id: 0,
+            session: 10,
+            mechanism: MECH_NONE,
+            rv: 0,
+            p0: 0,
+            p1: 0,
+            p2: 0,
+            slot: 6,
+            kind: fnkind::TEMPLATE_ARG1,
+            user_type: USER_TYPE_NONE,
+            shape: 0,
+            attr_types: types,
+            attr_count: attr_types.len() as u32,
+            attr_total,
+            attr_bools,
+            attr_bools_seen,
         }
     }
 
@@ -494,5 +688,83 @@ mod tests {
 
         assert_eq!(s.logins().get(&1), Some(&2));
         assert_eq!(s.logins().get(&0), Some(&1));
+    }
+
+    #[test]
+    fn distinct_param_combos_are_recorded_with_their_own_counts() {
+        let mut s = State::new(&test_plan());
+        // Same mechanism, same combo, twice.
+        s.observe(&ev_shape(100, 10, 0x0D, 0, shape::RSA_PKCS_PSS, (0x270, 1, 32)));
+        s.observe(&ev_shape(100, 10, 0x0D, 0, shape::RSA_PKCS_PSS, (0x270, 1, 32)));
+        // Same mechanism, a different salt length: a distinct combo, not an
+        // average or a "latest wins" overwrite.
+        s.observe(&ev_shape(100, 10, 0x0D, 0, shape::RSA_PKCS_PSS, (0x270, 1, 64)));
+
+        let m = s.mechanisms().get(&0x0D).unwrap();
+        assert_eq!(m.param_combos.len(), 2, "two distinct combos, not merged");
+        assert_eq!(m.param_combos.get(&(shape::RSA_PKCS_PSS, 0x270, 1, 32)), Some(&2));
+        assert_eq!(m.param_combos.get(&(shape::RSA_PKCS_PSS, 0x270, 1, 64)), Some(&1));
+        assert_eq!(m.init_no_shape, 0);
+    }
+
+    #[test]
+    fn shape_decode_failures_only_count_mechanisms_that_decoded_at_least_once() {
+        let mut s = State::new(&test_plan());
+        // Mechanism 0x1087 (GCM) decodes once, then fails to decode once —
+        // the failure is now interesting evidence.
+        s.observe(&ev_shape(100, 10, 0x1087, 0, shape::GCM, (12, 0, 128)));
+        s.observe(&ev_shape(100, 10, 0x1087, 0, shape::NONE, (0, 0, 0)));
+        // Mechanism 0x9999 never decodes at all — an ordinary id-only
+        // mechanism, not a failure.
+        s.observe(&ev_shape(100, 10, 0x9999, 0, shape::NONE, (0, 0, 0)));
+
+        assert_eq!(s.shape_decode_failures(), 1);
+        let gcm = s.mechanisms().get(&0x1087).unwrap();
+        assert_eq!(gcm.init_no_shape, 1);
+        let unshaped = s.mechanisms().get(&0x9999).unwrap();
+        assert_eq!(unshaped.init_no_shape, 1);
+        assert!(unshaped.param_combos.is_empty());
+    }
+
+    #[test]
+    fn template_attribute_types_and_policy_booleans_render_the_tristate_unambiguously() {
+        use p11scope_ebpf_common::attr_bool;
+
+        let mut s = State::new(&test_plan());
+        // Call 1: CKA_TOKEN (0x01) true, CKA_PRIVATE (0x02) present-but-false.
+        s.observe(&ev_template(
+            100,
+            &[0x01, 0x02],
+            2,
+            attr_bool::TOKEN,
+            attr_bool::TOKEN | attr_bool::PRIVATE,
+        ));
+        // Call 2: CKA_SIGN (0x108) never appears at all — must stay absent
+        // from both true and false, not default to false.
+        s.observe(&ev_template(100, &[0x01], 1, attr_bool::TOKEN, attr_bool::TOKEN));
+
+        let t = s.templates().get(&6).expect("slot 6 recorded");
+        assert_eq!(t.names, vec!["C_FindObjectsInit".to_string()]);
+        assert!(!t.aliased);
+        assert_eq!(t.attr_types, BTreeSet::from([0x01, 0x02]));
+        assert_eq!(t.bools_true & attr_bool::TOKEN, attr_bool::TOKEN, "seen and true");
+        assert_eq!(t.bools_false & attr_bool::PRIVATE, attr_bool::PRIVATE, "seen and false");
+        assert_eq!(t.bools_true & attr_bool::SIGN, 0, "never present — not true");
+        assert_eq!(t.bools_false & attr_bool::SIGN, 0, "never present — not false either");
+        assert!(!t.truncated);
+    }
+
+    #[test]
+    fn template_truncation_is_recorded_per_call_and_surfaced_by_the_aggregate_accessor() {
+        let mut s = State::new(&test_plan());
+        assert!(!s.templates_truncated(), "nothing observed yet");
+
+        // attr_total (10) > attr_count (8, the MAX_ATTRS cap already applied
+        // by ev_template's slice length) — a template longer than the cap.
+        s.observe(&ev_template(100, &[0x01; 8], 10, 0, 0));
+
+        assert!(s.templates_truncated());
+        let t = s.templates().get(&6).unwrap();
+        assert!(t.truncated);
     }
 }

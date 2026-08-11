@@ -1,10 +1,13 @@
-# `observed-profile.json` schema v1
+# `observed-profile.json` schema v1 / v1.1
 
-**Schema string:** `"pkcs11-scope/observed-profile/v1"`
+**Schema string:** `"pkcs11-scope/observed-profile/v1.1"` (current; `"v1"`
+documents describe the schema before Phase 3 landed parameter/template
+decoding — see "v1 → v1.1: what changed" below for the exact, additive-only
+delta).
 **Producer:** `p11scope profile` (default `--mode profile`; `--mode metrics`
 instead emits the lighter `pkcs11-scope/observed-profile/v0-metrics`
 document — `capture`/`evidence`/`functions` only, no `mechanisms`,
-`sessions`, or `logins`).
+`sessions`, `logins`, or `templates`).
 **Rust type:** `render::profile_json(reports, ev, state, capture) ->
 serde_json::Value` in `src/render.rs`.
 
@@ -43,19 +46,20 @@ mechanism they're running under, not counted per function name there.
 
 ```json
 {
-  "schema": "pkcs11-scope/observed-profile/v1",
+  "schema": "pkcs11-scope/observed-profile/v1.1",
   "capture": { "...": "..." },
   "evidence": { "...": "..." },
   "functions": [ { "...": "..." } ],
   "mechanisms": [ { "...": "..." } ],
   "sessions": { "...": "..." },
-  "logins": { "...": "..." }
+  "logins": { "...": "..." },
+  "templates": { "note": "...", "operations": [ { "...": "..." } ] }
 }
 ```
 
-All six sections are always present, even when empty (`functions: []`,
-`mechanisms: []`, `logins: {}`) — a v1 consumer should never need to
-special-case a missing section. Enforced by
+All seven sections are always present, even when empty (`functions: []`,
+`mechanisms: []`, `logins: {}`, `templates.operations: []`) — a consumer
+should never need to special-case a missing section. Enforced by
 `render::tests::profile_json_has_every_required_top_level_section`.
 
 ## `capture`
@@ -94,19 +98,23 @@ meaning as in the `v0-metrics` document):
 | **`malformed_records`** | number | *(new in v1)* Ring-buffer records rejected by `events::decode`'s size check — the writer/reader layout drifted mid-capture. Always `0` in `--mode metrics`. |
 | **`orphan_ops`** | number | *(new in v1)* Operational calls (`C_Sign`, `C_Encrypt`, ...) observed with no active `*Init` on their session — expected when the capture attaches mid-operation. Informational: does **not** affect `completeness`. |
 | **`unmatched_closes`** | number | *(new in v1)* `C_CloseSession` calls observed with no matching open. Same: informational, does not affect `completeness`. |
+| **`shape_decode_failures`** | number | *(new in v1.1)* `*Init` calls whose parameter decode did not apply (`Event::shape == shape::NONE`), counted only for mechanism ids that decoded successfully **at least once elsewhere** in this capture (`semantics::State::shape_decode_failures`) — i.e. this mechanism id is known to have a decodable shape, and this call's decode didn't produce one. Informational: does **not** affect `completeness`, since an inconsistent decode may reflect provider-side parameter validation, not a capture defect. **Known blind spot:** a mechanism id whose decode fails on **every** call in this capture — e.g. every `C_EncryptInit` for `CKM_AES_GCM` hits the `ulParameterLen` guard because a nonstandard provider passes a shorter/differently-laid-out `CK_GCM_PARAMS` — contributes **zero** here, because this counter needs at least one in-capture success to know the mechanism has a decodable shape at all; it cannot consult the registry directly (see `mechanisms[].params` below — that mechanism renders identically to one with no allowlisted shape at all: `params: null`, unchanged v1 note). This is a deliberate, disclosed scope limit of the userspace/event-only design, not a transient bug — treat a suspiciously GCM/PSS-shaped mechanism id that never appears with non-null `params` as worth investigating by other means (e.g. a raw capture), not as proof it has no parameters. |
+| **`templates_truncated`** | boolean | *(new in v1.1)* True when any `templates.operations[]` entry observed `attr_total > attr_count` — the template had more entries than the per-event `MAX_ATTRS` (8) cap, **or** the in-kernel walk stopped early because a `bpf_probe_read_user` failed mid-template (an unreadable `pTemplate`/entry) — this field does not distinguish which cause. A short template (well under 8 entries) can still set this if the walk hit a read failure; do not assume ">8 entries" is the only cause. Unlike the two informational counters above, this **does** gate `completeness`: either cause is lost evidence, not merely context. Always `false` in `--mode metrics`, which never drains the ring buffer or builds `templates`. |
 | `completeness` | `"COMPLETE"` or `"PARTIAL"` | See below. |
 
 **Completeness verdict.** `COMPLETE` requires every one of: no attach
 failures, no skipped entries, no aliasing, no in-flight calls, every
 surface fully walked with a successful acquisition, no undecoded vendor
-interfaces, **and (new in v1) `event_loss == 0` and `malformed_records ==
-0`**. Any other gap — including a nonzero `event_loss` or
-`malformed_records` — forces `PARTIAL`. `orphan_ops` and
-`unmatched_closes` are reported for visibility but never flip the verdict:
-they are an expected consequence of attaching after the target process
-already had operations or sessions in progress, not evidence the capture
-itself lost anything. Enforced by `render::tests::any_gap_forces_partial`
-and `render::tests::orphan_ops_and_unmatched_closes_do_not_affect_completeness`.
+interfaces, `event_loss == 0`, `malformed_records == 0`, **and (new in
+v1.1) `templates_truncated == false`**. Any other gap — including a
+nonzero `event_loss`, `malformed_records`, or `templates_truncated == true`
+— forces `PARTIAL`. `orphan_ops`, `unmatched_closes`, and (new in v1.1)
+`shape_decode_failures` are reported for visibility but never flip the
+verdict: they are expected consequences of attaching mid-operation or of
+provider-side parameter handling, not evidence the capture itself lost
+anything. Enforced by `render::tests::any_gap_forces_partial`,
+`render::tests::orphan_ops_and_unmatched_closes_do_not_affect_completeness`,
+and `render::tests::profile_json_template_truncation_forces_partial_and_evidence_field`.
 
 **Gate G2:** the whole `evidence` section, together with `capture`, is what
 keeps **UNKNOWN** honest — a reader can tell "not observed because it
@@ -146,20 +154,67 @@ exists for per-mechanism breakdown):
 | `calls` | number | Completed calls attributed to this mechanism: its `*Init` calls plus the operational calls (`C_Sign`, `C_SignUpdate`, `C_SignFinal`, ...) run under it. |
 | `errors` | number | Of those, how many returned nonzero `CK_RV`. |
 | `latency_ns` | object | See "Latency shape" below. |
-| `params` | `null` | **Always `null` in v1.** Mechanism-parameter decoding (RSA-PSS hash/MGF/salt length, GCM IV/tag length, ...) is Phase 3 work, gated on the allowlist-based decoder. v1 never attempts a partial decode. |
-| `note` | string | Human-readable restatement of the `params: null` reason. |
+| `params` | `null` or array | *(behavior changed in v1.1 — see below)* |
+| `note` | string | Human-readable restatement of the `params` value's meaning. |
 
-**Gate G2 — and its known v1 gap.** `mechanism`/`mechanism_hex` verbatim
-preservation is exactly what **OBSERVED BUT NOT COVERED BY CORPUS** needs
-(raw vendor ids preserved, not dropped). `mechanism` + `calls`/`errors`
-also let a `pkcs11-lab` join happen **by mechanism id** for **OBSERVED AND
-VALIDATED** / **OBSERVED BUT CANDIDATE DIFFERED** — but both of those
-categories, per the design spec's acceptance table, ultimately want a join
-keyed on **mechanism + full parameter combo** (hash/MGF/salt, GCM
-lengths), and v1's `params` is unconditionally `null`. Until Phase 3 lands
-parameter decoding, a `pkcs11-lab` consumer can only join on mechanism id,
-not on the full parameter combo — report this precisely as a v1
-limitation, not as those categories being unsupported.
+**`params` in v1.1.** `null` when no allowlisted parameter shape ever
+decoded for this mechanism id in this capture. Two causes collapse into
+this one value, and v1.1 cannot always tell them apart: (a) this
+mechanism's registry shape genuinely isn't one of the two this phase
+decodes (ordinary, expected — most mechanisms), or (b) it *is* one of the
+two, but every single decode attempt for it failed this capture (a
+provider-layout mismatch, an unfaulted `pParameter` page every time, ...).
+`evidence.shape_decode_failures` only disambiguates a **mix** of successes
+and failures for the same id — a mechanism that fails on every call is
+invisible to it too (see that field's "known blind spot" note). This is
+**unchanged from v1's `params: null` behavior** and carries the same
+`note` text as before: `"parameter decoding is Phase 3; not attempted
+here, never a partial decode"` — read "not attempted" as "not attempted
+*successfully*", not as proof no attempt occurred.
+
+Otherwise `params` is an **array** of shape-tagged parameter-combination
+objects — one entry per **distinct** combination of decoded scalar values
+observed on this mechanism's `*Init` calls, each carrying its own `count`.
+This is deliberately not a single object, an average, or a "latest wins"
+value: migration assessment needs the actual combos a mechanism was driven
+with (e.g. "this mechanism was called with a 96-bit tag 40 times and a
+128-bit tag once" is different evidence from "this mechanism used a
+128-bit tag"). Two shapes decode in this phase:
+
+```json
+// RSA-PKCS-PSS (CKM_RSA_PKCS_PSS, CKM_SHA256_RSA_PKCS_PSS, ...)
+{ "shape": "rsa_pkcs_pss", "hash_alg": 592, "hash_alg_hex": "0x250",
+  "mgf": 1, "salt_len": 32, "count": 40 }
+
+// AES-GCM (CKM_AES_GCM)
+{ "shape": "gcm", "iv_len": 12, "aad_len": 0, "tag_bits": 128, "count": 1 }
+```
+
+| Shape | Fields | Source (`CK_*_PARAMS` field) |
+| --- | --- | --- |
+| `rsa_pkcs_pss` | `hash_alg`, `hash_alg_hex`, `mgf`, `salt_len` | `hashAlg`, `mgf`, `sLen` |
+| `gcm` | `iv_len`, `aad_len`, `tag_bits` | `ulIvLen`, `ulAADLen`, `ulTagBits` |
+
+Both shapes' fields are scalars read directly at fixed offsets in-kernel;
+no pointer field (`CK_GCM_PARAMS.pIv`/`pAAD`, PSS has none) is ever
+dereferenced. Every combo is recorded regardless of the `*Init` call's
+`CK_RV` — same rationale as `mechanisms[].calls`: the application
+genuinely requested these parameters, and that request is the evidence,
+independent of whether the operation succeeded.
+
+**Gate G2 — narrower than v1's gap, not closed for every shape.**
+`mechanism`/`mechanism_hex` verbatim preservation is exactly what
+**OBSERVED BUT NOT COVERED BY CORPUS** needs (raw vendor ids preserved,
+never dropped). For the two decoded shapes (`rsa_pkcs_pss`, `gcm`),
+**OBSERVED AND VALIDATED** / **OBSERVED BUT CANDIDATE DIFFERED** can now
+join on the full key the design spec's acceptance table wants: **mechanism
++ parameter combo** (hash/MGF/salt, or GCM IV/AAD/tag lengths), not just
+mechanism id. For every other shape — including mechanisms the registry
+marks parameterless, or shapes not on this phase's allowlist (e.g.
+`ecdh1_derive`) — `params` stays `null` and a `pkcs11-lab` consumer can
+still only join **by mechanism id**. Report this precisely: id-only for
+undecoded shapes is a known, disclosed v1.1 limitation, not those
+categories being unsupported.
 
 ## `sessions`
 
@@ -187,6 +242,68 @@ dependency was added for it — see the task's global constraints), so
 readers must map the numeric key themselves; the raw values match the
 PKCS#11 header constants exactly.
 
+## `templates` *(new in v1.1)*
+
+```json
+{
+  "note": "every field here is what the application asked for via a CK_ATTRIBUTE template — never asserted as the key's effective policy; the provider may reject, ignore, or override any of it (see the `requested` marker on each operation)",
+  "operations": [
+    {
+      "names": ["C_FindObjectsInit"],
+      "aliased": false,
+      "requested": true,
+      "attr_types": [
+        { "attr_type": 1, "attr_type_hex": "0x1" },
+        { "attr_type": 258, "attr_type_hex": "0x102" }
+      ],
+      "policy_booleans": { "observed_true": ["CKA_TOKEN"], "observed_false": ["CKA_PRIVATE"] },
+      "truncated": false
+    }
+  ]
+}
+```
+
+**Requested, never effective — the load-bearing caveat.** Everything in
+this section is what the application put in a `CK_ATTRIBUTE` template when
+calling `C_FindObjectsInit`, `C_CreateObject`, or `C_GenerateKey`. It is
+**never** the key's actual, effective policy: the provider may silently
+reject the call, ignore an attribute it doesn't support, or apply a
+different default than what was asked for. `templates.note` states this in
+prose once at the section level; each operation additionally carries
+`"requested": true` as an explicit, machine-checkable marker — a consumer
+joining this data into a policy decision must not skip past the prose note
+and treat it as ground truth.
+
+`templates.operations` is an array, one entry per template-bearing attach
+**slot observed at least once** (aliased slots — several names sharing one
+address — appear once, as a group, same convention as `functions[]`),
+**sourced from the semantic state machine**. Unlike `functions[]` — which
+lists every planned slot from the aggregate maps, calls or not — a slot
+with zero observed template calls is simply absent here, the same
+"observed, not planned" convention `mechanisms[]` already uses:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `names` | array of strings | Every function name resolving to this slot: `C_FindObjectsInit`, `C_CreateObject`, or `C_GenerateKey` (or an alias group of them). |
+| `aliased` | boolean | `true` when ≥2 distinct names share this slot. |
+| `requested` | boolean | Always `true` — see the caveat above. |
+| `attr_types` | array of `{attr_type, attr_type_hex}` | The **union** of `CK_ATTRIBUTE_TYPE` values requested across every observed call for this operation. Never a value — only the type field of each template entry is captured, except the policy-boolean allowlist below. Capped at 8 distinct-slot entries per call (`MAX_ATTRS`); see `truncated`. |
+| `policy_booleans.observed_true` | array of strings | `CKA_*` names (from the fixed policy-boolean allowlist — `CKA_TOKEN`, `CKA_PRIVATE`, `CKA_SENSITIVE`, `CKA_ENCRYPT`, `CKA_DECRYPT`, `CKA_WRAP`, `CKA_UNWRAP`, `CKA_SIGN`, `CKA_VERIFY`, `CKA_DERIVE`, `CKA_EXTRACTABLE`) observed present-and-true (`CK_BBOOL` byte nonzero) on at least one call. |
+| `policy_booleans.observed_false` | array of strings | The same allowlist, names observed present-and-**false** on at least one call. Independent of `observed_true` — a name can legitimately appear in **both** when different calls asked for different values; that is real, distinguishable evidence, not a conflict to resolve. A name absent from both lists was never present in a requested template at all in this capture — a genuine three-state (true / false / absent), never a boolean default standing in for "absent". |
+| `truncated` | boolean | `true` when any observed call had `attr_total > attr_count`. Two distinct causes collapse into this one field: the application's template had more entries than the capture's per-event cap (`MAX_ATTRS = 8`) could record, **or** the in-kernel walk (`walk_template`) stopped early after a `bpf_probe_read_user` failure on some entry — a 2- or 3-attribute template can trigger this exactly the same way an 8+-entry one does. Either way, some requested attribute types were not captured — genuinely lost evidence, not a benign "long template" note. Also sets `evidence.templates_truncated` and forces `completeness: PARTIAL` (see `evidence` above). |
+
+No `CK_ATTRIBUTE.pValue` is ever read except the single `CK_BBOOL` byte for
+an allowlisted boolean attribute with `ulValueLen == 1` — never
+`CKA_VALUE`, `CKA_LABEL`, `CKA_ID`, or any other attribute's value, at any
+privilege, in any mode.
+
+**Gate G2:** `templates` is diagnostic/policy context, not one of the five
+`pkcs11-lab` migration-assessment categories directly — it answers "what
+attribute policy did the application ask providers to enforce", which
+`pkcs11-lab` can use alongside the mechanism join to flag a requested
+policy the candidate provider doesn't support, but it is not itself a
+join key.
+
 ## Latency shape
 
 `functions[].latency_ns` and `mechanisms[].latency_ns` share one shape:
@@ -206,14 +323,34 @@ are exact because both maps (`SlotStats`) and the semantic state machine
 (`MechStat`) accumulate them directly from each event's `duration_ns`,
 with no bucketing loss.
 
-## What v1 deliberately omits
+## What v1.1 deliberately omits
 
-Per the design spec's privacy model and v1 scope: no raw handle values, no
-`CKA_VALUE`/PIN/key-material contents, no mechanism parameter bytes (only
-the allowlisted decode is ever planned, and it isn't implemented yet — see
-`mechanisms[].params` above), no attribute/template sections (those are a
-later phase, not part of this v1 document), no labels/`CKA_ID` (opt-in
-flag, not default). A v1 document with zero mechanisms and zero sessions
-is a legitimate output for a target that never called into PKCS#11 during
-the window — check `evidence.completeness` and `capture.start`/`end`
-before concluding the target doesn't use those features at all.
+Per the design spec's privacy model: no raw handle values, no PIN, no
+`CKA_VALUE`/key-material/IV/AAD/signature/digest/wrapped-blob/random-buffer
+bytes, no `CKA_LABEL`/`CKA_ID` values (attribute *types* only — an id/label
+*type* can appear in `templates.operations[].attr_types`, its *value*
+never can), no mechanism-parameter bytes outside the two allowlisted
+shapes (`rsa_pkcs_pss`, `gcm` — every other shape stays `params: null`,
+id-only). A document with zero mechanisms, zero sessions, and
+`templates.operations: []` is a legitimate output for a target that never
+called into PKCS#11 during the window — check `evidence.completeness` and
+`capture.start`/`end` before concluding the target doesn't use those
+features at all.
+
+## v1 → v1.1: what changed
+
+Purely additive — every v1 field keeps its v1 meaning; a v1 consumer that
+ignores unknown fields reads a v1.1 document unchanged except for the
+schema string itself.
+
+- `schema` is now `"pkcs11-scope/observed-profile/v1.1"`.
+- `mechanisms[].params`, always `null` in v1, can now be a non-null
+  **array** of shape-tagged combo objects — see "`params` in v1.1" above.
+  A v1 consumer that only ever saw `null` and ignored the field is
+  unaffected; a consumer that asserted `params` is always `null` needs
+  updating.
+- `evidence` gained `shape_decode_failures` (informational) and
+  `templates_truncated` (a new `completeness` gap condition).
+- A new top-level `templates` section was added.
+
+No v1.1 field removes or renames anything v1 defined.

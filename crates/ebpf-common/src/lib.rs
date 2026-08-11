@@ -99,6 +99,12 @@ pub mod fnkind {
     /// (hSession, userType, pPin, ulPinLen) — userType from arg1. pPin is
     /// NEVER read, in any mode, at any privilege.
     pub const LOGIN: u32 = 4;
+    /// (hSession, pTemplate, ulCount, ...) — session arg0, template arg1,
+    /// count arg2. `C_FindObjectsInit`, `C_CreateObject`.
+    pub const TEMPLATE_ARG1: u32 = 5;
+    /// (hSession, pMechanism, pTemplate, ulCount, ...) — session arg0,
+    /// template arg2, count arg3. `C_GenerateKey`.
+    pub const TEMPLATE_ARG2: u32 = 6;
 }
 
 /// Mechanism parameter shape codes. Userspace maps the registry's shape
@@ -200,6 +206,14 @@ pub struct CallStart {
     pub p0: u64,
     pub p1: u64,
     pub p2: u64,
+    /// Template attribute *types* only (never values), captured at entry
+    /// since `pTemplate` is only guaranteed live then. See `Event` for the
+    /// field-by-field meaning; these mirror it verbatim to the return probe.
+    pub attr_types: [u32; MAX_ATTRS],
+    pub attr_count: u32,
+    pub attr_total: u32,
+    pub attr_bools: u32,
+    pub attr_bools_seen: u32,
 }
 
 /// One completed call. Emitted at return only: a call with no return is
@@ -275,8 +289,12 @@ mod tests {
     fn event_and_callstart_have_no_implicit_padding() {
         // Both cross the kernel/userspace boundary as raw bytes; implicit
         // tail padding would read as uninitialized on one side.
-        // CallStart: 7 u64 + 2 u32 = 56 + 8 = 64 bytes (no padding needed)
-        assert_eq!(core::mem::size_of::<CallStart>(), 8 * 7 + 4 * 2);
+        // CallStart: 7 u64 + 2 u32 (56 + 8 = 64) + [u32; 8] + 4 u32
+        // (32 + 16 = 48) = 112 bytes (no padding needed: 112 % 8 == 0).
+        assert_eq!(
+            core::mem::size_of::<CallStart>(),
+            8 * 7 + 4 * 2 + 4 * MAX_ATTRS + 4 * 4
+        );
         // Event: 10 u64 + 4 u32 + [u32; 8] + 4 u32 = 80 + 16 + 32 + 16 = 144 bytes
         assert_eq!(core::mem::size_of::<Event>(), 8 * 10 + 4 * 8 + 32);
         assert_eq!(core::mem::align_of::<Event>(), 8);

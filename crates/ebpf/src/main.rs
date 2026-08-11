@@ -12,7 +12,7 @@ use aya_ebpf::{EbpfContext as _, helpers};
 use p11scope_ebpf_common::{
     CFG_FLAGS, CallStart, Event, FLAG_CGROUP_FILTER, FLAG_PID_FILTER, MAX_ATTRS, MAX_MECH_SHAPES,
     MAX_SLOTS, MECH_NONE, RING_BYTES, RvKey, SESSION_NONE, SlotStats, StartKey, USER_TYPE_NONE,
-    bucket_of, fnkind, shape,
+    attr_bool, bucket_of, fnkind, shape,
 };
 
 #[map]
@@ -129,6 +129,66 @@ fn decode_params(pmech: u64, sh: u32, start: &mut CallStart) {
     }
 }
 
+/// Walk at most `MAX_ATTRS` entries of `pTemplate`, recording each entry's
+/// *type* only into `start.attr_types` — `pValue` is never read except for
+/// the policy-boolean allowlist under the `ulValueLen == 1` gate below.
+/// `attr_total` is always set from `count`, so a template longer than the
+/// cap (or one abandoned early by a read failure) stays visible as
+/// truncation evidence rather than being silently trimmed.
+///
+/// The loop bound is the constant `MAX_ATTRS`, not `count`, so the
+/// verifier can prove termination; the `i >= count` check inside just
+/// stops early for shorter templates. Any read failure for an entry —
+/// including a bad `pTemplate` itself — stops the walk immediately;
+/// entries already captured are kept, nothing is skipped ahead or guessed.
+fn walk_template(ptemplate: u64, count: u64, start: &mut CallStart) {
+    start.attr_total = count as u32;
+    for i in 0..MAX_ATTRS {
+        if (i as u64) >= count {
+            break;
+        }
+        // CK_ATTRIBUTE { CK_ATTRIBUTE_TYPE type; CK_VOID_PTR pValue;
+        // CK_ULONG ulValueLen; } — 24 bytes; all three fields are
+        // CK_ULONG-sized (8 bytes) on LP64. `type` is read first and is
+        // the only field ever read for a non-allowlisted attribute.
+        let base = ptemplate + (i as u64) * 24;
+        let Ok(t) = (unsafe { helpers::bpf_probe_read_user(base as *const u64) }) else {
+            break;
+        };
+        let attr_type = t as u32;
+        start.attr_types[i] = attr_type;
+        start.attr_count += 1;
+
+        // Policy-boolean allowlist only: read ulValueLen (offset 16) next,
+        // and only when it is exactly 1 read the single CK_BBOOL byte at
+        // pValue (offset 8). This length gate is load-bearing: it is what
+        // keeps a CKA_VALUE or CKA_LABEL from ever being read even if a
+        // type were mis-listed on the allowlist. Type checked first, then
+        // length, then the single byte — in that order, always.
+        let Some(bit) = attr_bool::bit_for_attr_type(attr_type) else {
+            continue;
+        };
+        let Ok(len) = (unsafe { helpers::bpf_probe_read_user((base + 16) as *const u64) })
+        else {
+            break;
+        };
+        if len != 1 {
+            continue;
+        }
+        let Ok(pvalue) = (unsafe { helpers::bpf_probe_read_user((base + 8) as *const u64) })
+        else {
+            break;
+        };
+        let Ok(b) = (unsafe { helpers::bpf_probe_read_user(pvalue as *const u8) }) else {
+            break;
+        };
+        start.attr_bools_seen |= 1 << bit;
+        if b != 0 {
+            start.attr_bools |= 1 << bit;
+        }
+    }
+}
+
 #[uprobe]
 pub fn p11_entry(ctx: ProbeContext) -> u32 {
     let slot = slot_of(&ctx);
@@ -155,6 +215,11 @@ pub fn p11_entry(ctx: ProbeContext) -> u32 {
         p0: 0,
         p1: 0,
         p2: 0,
+        attr_types: [0; MAX_ATTRS],
+        attr_count: 0,
+        attr_total: 0,
+        attr_bools: 0,
+        attr_bools_seen: 0,
     };
     match kind {
         fnkind::INIT_WITH_MECH => {
@@ -186,6 +251,29 @@ pub fn p11_entry(ctx: ProbeContext) -> u32 {
         fnkind::SESSION_ARG0 => {
             if let Some(sess) = ctx.arg::<u64>(0) {
                 start.session = sess;
+            }
+        }
+        fnkind::TEMPLATE_ARG1 => {
+            // (hSession, pTemplate, ulCount, ...) — C_FindObjectsInit,
+            // C_CreateObject. This kind moved out of SESSION_ARG0, so
+            // session capture happens here too, not just the walk.
+            if let Some(sess) = ctx.arg::<u64>(0) {
+                start.session = sess;
+            }
+            if let (Some(pt), Some(count)) = (ctx.arg::<u64>(1), ctx.arg::<u64>(2)) {
+                walk_template(pt, count, &mut start);
+            }
+        }
+        fnkind::TEMPLATE_ARG2 => {
+            // (hSession, pMechanism, pTemplate, ulCount, ...) —
+            // C_GenerateKey. Mechanism type/shape decode is not done here
+            // (that's INIT_WITH_MECH's job for *Init calls); this kind
+            // only needs session + template.
+            if let Some(sess) = ctx.arg::<u64>(0) {
+                start.session = sess;
+            }
+            if let (Some(pt), Some(count)) = (ctx.arg::<u64>(2), ctx.arg::<u64>(3)) {
+                walk_template(pt, count, &mut start);
             }
         }
         fnkind::LOGIN => {
@@ -272,11 +360,11 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
         kind: SLOT_KIND.get(slot).copied().unwrap_or(fnkind::OTHER),
         user_type: start.user_type,
         shape: start.shape,
-        attr_types: [0; MAX_ATTRS],
-        attr_count: 0,
-        attr_total: 0,
-        attr_bools: 0,
-        attr_bools_seen: 0,
+        attr_types: start.attr_types,
+        attr_count: start.attr_count,
+        attr_total: start.attr_total,
+        attr_bools: start.attr_bools,
+        attr_bools_seen: start.attr_bools_seen,
     };
     match EVENTS.reserve::<Event>(0) {
         Some(mut e) => {

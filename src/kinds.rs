@@ -11,6 +11,13 @@ pub fn classify(name: &str) -> u32 {
         | "C_DecryptInit" | "C_SignRecoverInit" | "C_VerifyRecoverInit" => fnkind::INIT_WITH_MECH,
         "C_OpenSession" => fnkind::OPEN_SESSION,
         "C_Login" => fnkind::LOGIN,
+        // C_FindObjectsInit(hSession, pTemplate, ulCount) and
+        // C_CreateObject(hSession, pTemplate, ulCount, phObject) both put
+        // the template at arg1, count at arg2.
+        "C_FindObjectsInit" | "C_CreateObject" => fnkind::TEMPLATE_ARG1,
+        // C_GenerateKey(hSession, pMechanism, pTemplate, ulCount, phKey)
+        // puts the template at arg2, count at arg3.
+        "C_GenerateKey" => fnkind::TEMPLATE_ARG2,
         // Session is arg0 for the operational entry points we care about.
         "C_CloseSession" | "C_CloseAllSessions" | "C_Logout" | "C_GetSessionInfo"
         | "C_Digest" | "C_DigestUpdate" | "C_DigestFinal"
@@ -18,11 +25,11 @@ pub fn classify(name: &str) -> u32 {
         | "C_Verify" | "C_VerifyUpdate" | "C_VerifyFinal"
         | "C_Encrypt" | "C_EncryptUpdate" | "C_EncryptFinal"
         | "C_Decrypt" | "C_DecryptUpdate" | "C_DecryptFinal"
-        | "C_GenerateKey" | "C_GenerateKeyPair" | "C_WrapKey" | "C_UnwrapKey"
+        | "C_GenerateKeyPair" | "C_WrapKey" | "C_UnwrapKey"
         | "C_DeriveKey" | "C_GenerateRandom" | "C_SeedRandom"
-        | "C_FindObjectsInit" | "C_FindObjects" | "C_FindObjectsFinal"
+        | "C_FindObjects" | "C_FindObjectsFinal"
         | "C_GetAttributeValue" | "C_SetAttributeValue"
-        | "C_CreateObject" | "C_CopyObject" | "C_DestroyObject" => fnkind::SESSION_ARG0,
+        | "C_CopyObject" | "C_DestroyObject" => fnkind::SESSION_ARG0,
         _ => fnkind::OTHER,
     }
 }
@@ -52,6 +59,31 @@ mod tests {
         assert_eq!(classify("C_Digest"), fnkind::SESSION_ARG0);
         assert_eq!(classify("C_Initialize"), fnkind::OTHER);
         assert_eq!(classify("C_WhoKnows"), fnkind::OTHER);
+    }
+
+    #[test]
+    fn template_bearing_functions_classify_by_actual_arg_position() {
+        // C_FindObjectsInit(hSession, pTemplate, ulCount): template arg1.
+        assert_eq!(classify("C_FindObjectsInit"), fnkind::TEMPLATE_ARG1);
+        // C_CreateObject(hSession, pTemplate, ulCount, phObject): template
+        // arg1 too — NOT arg2, despite grouping with C_GenerateKey in the
+        // shape description; its real signature puts pTemplate right after
+        // hSession, same as C_FindObjectsInit.
+        assert_eq!(classify("C_CreateObject"), fnkind::TEMPLATE_ARG1);
+        // C_GenerateKey(hSession, pMechanism, pTemplate, ulCount, phKey):
+        // template arg2.
+        assert_eq!(classify("C_GenerateKey"), fnkind::TEMPLATE_ARG2);
+    }
+
+    #[test]
+    fn template_functions_still_moved_out_of_session_arg0() {
+        // These must not collide with the plain SESSION_ARG0 kind: the BPF
+        // side switches on kind to decide which arguments are safe to read,
+        // and a template-bearing call needs the walk, not just session
+        // capture.
+        assert_ne!(classify("C_FindObjectsInit"), fnkind::SESSION_ARG0);
+        assert_ne!(classify("C_CreateObject"), fnkind::SESSION_ARG0);
+        assert_ne!(classify("C_GenerateKey"), fnkind::SESSION_ARG0);
     }
 
     #[test]

@@ -32,6 +32,37 @@ pub fn cgroup_level(path: &Path) -> Result<u32> {
     Ok(rel.components().count() as u32)
 }
 
+/// Best-effort human label for a `cgroup_id`, for the per-cgroup profile
+/// breakdown (`render::profile_json`'s `cgroups[]`): walks `root` (the
+/// caller passes `/sys/fs/cgroup`) looking for the one directory whose
+/// inode matches `target`, returning its path relative to `root` (e.g.
+/// `"kubepods.slice/kubepods-pod1234.slice/cri-containerd-abcd.scope"`).
+/// `None` when no match is found anywhere under `root` — an absent label
+/// is fine, a wrong one is not: this never guesses, and a cgroup that has
+/// since been removed (the capture ended, the container exited) simply
+/// yields no label rather than a stale or mismatched one.
+pub fn label(root: &Path, target: u64) -> Option<String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if std::fs::metadata(&dir).is_ok_and(|md| md.ino() == target) {
+            return dir
+                .strip_prefix(root)
+                .ok()
+                .map(|p| p.display().to_string())
+                .filter(|s| !s.is_empty());
+        }
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    stack.push(entry.path());
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn apply(ebpf: &mut Ebpf, scope: &Scope) -> Result<()> {
     let mut flags: u64 = 0;
     let mut cgroup_level_val: u64 = 0;
@@ -105,5 +136,24 @@ mod tests {
     fn cgroup_level_rejects_paths_outside_the_cgroup_root() {
         let e = cgroup_level(Path::new("/tmp/not-a-cgroup")).unwrap_err();
         assert!(e.to_string().contains("is not under"));
+    }
+
+    #[test]
+    fn label_finds_a_nested_directory_by_inode() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("kubepods.slice").join("pod-123.slice");
+        std::fs::create_dir_all(&nested).unwrap();
+        let target = std::fs::metadata(&nested).unwrap().ino();
+
+        let got = label(root.path(), target).expect("nested directory must be found");
+        assert_eq!(got, "kubepods.slice/pod-123.slice");
+    }
+
+    #[test]
+    fn label_is_none_when_no_directory_matches() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("a")).unwrap();
+        assert_eq!(label(root.path(), 0xdead_beef), None);
     }
 }

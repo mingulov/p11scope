@@ -82,6 +82,40 @@ pub struct SessionStats {
     pub peak_concurrent: u64,
 }
 
+/// Calls/errors attributed to one mechanism id, scoped to one cgroup — a
+/// `CgroupStat::mechanisms` entry. Deliberately a smaller sibling of
+/// `MechStat`, not that type reused: per-cgroup breakdown only needs to
+/// answer "how much of this cgroup's traffic used this mechanism", not
+/// carry its own latency histogram or parameter combos (those stay
+/// capture-wide in `State::mechanisms`, the single source for them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MechCallStat {
+    pub calls: u64,
+    pub errors: u64,
+}
+
+/// Aggregate stats for one `cgroup_id` — a directory inode number
+/// (`docs/privacy/allowlist-v1.md`'s `cgroup_id` entry). Exists so one
+/// node-wide attach over a cgroup shared by several containers/pods (e.g.
+/// two containers sharing one overlay2 image layer, hence one inode) can
+/// still be split back out per container in the report.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CgroupStat {
+    /// Every event observed with this `cgroup_id`, regardless of kind —
+    /// the same "every completed call" scope `functions[].calls` uses at
+    /// the top level. Not expected to equal the sum of `mechanisms[]`
+    /// below, for the same reason `mechanisms[].calls` doesn't sum to
+    /// `functions[].calls` capture-wide: session-scoped operational calls
+    /// are attributed by mechanism, not every event names one.
+    pub calls: u64,
+    pub errors: u64,
+    /// Mechanism id -> calls/errors seen from this cgroup — the subset of
+    /// `calls` above that a mechanism could be attributed to (an `*Init`
+    /// call, or a later operational call on a session with an active
+    /// mechanism).
+    pub mechanisms: BTreeMap<u64, MechCallStat>,
+}
+
 /// Per-slot facts `observe` needs on every event, resolved once from the
 /// `AttachPlan` so the hot path never re-scans it.
 struct SlotMeta {
@@ -140,6 +174,8 @@ pub struct State {
     templates: BTreeMap<u32, TemplateStat>,
     logins: BTreeMap<u32, u64>,
     sessions: SessionStats,
+    /// Per-`cgroup_id` breakdown — see `CgroupStat`.
+    cgroups: BTreeMap<u64, CgroupStat>,
     orphan_ops: u64,
     unmatched_closes: u64,
     /// Mechanism id -> published shape code, exactly what was written into
@@ -185,6 +221,7 @@ impl State {
             templates: BTreeMap::new(),
             logins: BTreeMap::new(),
             sessions: SessionStats::default(),
+            cgroups: BTreeMap::new(),
             orphan_ops: 0,
             unmatched_closes: 0,
             mech_shapes: BTreeMap::new(),
@@ -210,6 +247,12 @@ impl State {
         // typecheck, and these are cheap enough to not warrant an index.
         let is_close_session = meta.map(|m| m.is_close_session).unwrap_or(false);
         let is_final = meta.map(|m| m.is_final).unwrap_or(false);
+
+        let cg = self.cgroups.entry(ev.cgroup_id).or_default();
+        cg.calls += 1;
+        if ev.rv != 0 {
+            cg.errors += 1;
+        }
 
         match ev.kind {
             fnkind::OPEN_SESSION => self.observe_open_session(pid, ev),
@@ -268,6 +311,7 @@ impl State {
         } else {
             stat.init_no_shape += 1;
         }
+        self.record_cgroup_mechanism(ev.cgroup_id, ev.mechanism, ev.rv);
         // The application genuinely requested this mechanism, so it is
         // recorded above regardless of outcome — but a failed Init starts
         // no operation, so only a successful one binds the session.
@@ -296,11 +340,23 @@ impl State {
         match self.active_op.get(&key).copied() {
             Some(mech) => {
                 record_call(self.mechanisms.entry(mech).or_default(), ev);
+                self.record_cgroup_mechanism(ev.cgroup_id, mech, ev.rv);
                 if is_final {
                     self.active_op.remove(&key);
                 }
             }
             None => self.orphan_ops += 1,
+        }
+    }
+
+    /// Attributes one call to `mechanism` within `cgroup_id`'s breakdown —
+    /// called from exactly the two sites `record_call` (mechanism-wide) is
+    /// called from, so the two views stay in lockstep by construction.
+    fn record_cgroup_mechanism(&mut self, cgroup_id: u64, mechanism: u64, rv: u64) {
+        let m = self.cgroups.entry(cgroup_id).or_default().mechanisms.entry(mechanism).or_default();
+        m.calls += 1;
+        if rv != 0 {
+            m.errors += 1;
         }
     }
 
@@ -348,6 +404,11 @@ impl State {
 
     pub fn logins(&self) -> &BTreeMap<u32, u64> {
         &self.logins
+    }
+
+    /// Per-`cgroup_id` breakdown — see `CgroupStat`.
+    pub fn cgroups(&self) -> &BTreeMap<u64, CgroupStat> {
+        &self.cgroups
     }
 
     pub fn orphan_ops(&self) -> u64 {
@@ -845,5 +906,56 @@ mod tests {
         assert!(s.templates_truncated());
         let t = s.templates().get(&6).unwrap();
         assert!(t.truncated);
+    }
+
+    /// Sets `cgroup_id` on an already-built event — every other test
+    /// helper hardcodes `cgroup_id: 0` since they predate this field
+    /// mattering to anything.
+    fn with_cgroup(mut e: Event, cgroup_id: u64) -> Event {
+        e.cgroup_id = cgroup_id;
+        e
+    }
+
+    #[test]
+    fn two_cgroups_produce_two_separate_breakdown_entries() {
+        let mut s = State::new(&test_plan());
+        // Two containers sharing one node-wide attach: same mechanism,
+        // different cgroup ids, must not collapse into one entry.
+        s.observe(&with_cgroup(ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x250, 0, 100), 111)); // C_SignInit, cgroup 111
+        s.observe(&with_cgroup(ev(100, 3, fnkind::SESSION_ARG0, 99, MECH_NONE, 0, 50), 111)); // C_Sign on a different, never-Init'd session -- orphan, no mechanism
+        s.observe(&with_cgroup(ev(200, 2, fnkind::INIT_WITH_MECH, 20, 0x251, 7, 30), 222)); // C_SignInit, cgroup 222, fails
+
+        assert_eq!(s.cgroups().len(), 2, "two distinct cgroup ids, two entries");
+
+        let cg111 = s.cgroups().get(&111).expect("cgroup 111 present");
+        assert_eq!(cg111.calls, 2, "both events observed under cgroup 111");
+        assert_eq!(cg111.errors, 0);
+        let m111 = cg111.mechanisms.get(&0x250).expect("mechanism 0x250 attributed to cgroup 111");
+        assert_eq!(m111.calls, 1, "only the Init call names a mechanism here");
+        assert_eq!(m111.errors, 0);
+
+        let cg222 = s.cgroups().get(&222).expect("cgroup 222 present");
+        assert_eq!(cg222.calls, 1);
+        assert_eq!(cg222.errors, 1, "the failed Init counts as an error at the cgroup level too");
+        let m222 = cg222.mechanisms.get(&0x251).expect("mechanism 0x251 attributed to cgroup 222");
+        assert_eq!(m222.calls, 1);
+        assert_eq!(m222.errors, 1);
+    }
+
+    #[test]
+    fn one_shared_cgroup_produces_one_breakdown_entry() {
+        let mut s = State::new(&test_plan());
+        s.observe(&with_cgroup(ev(100, 0, fnkind::OPEN_SESSION, 10, MECH_NONE, 0, 5), 111));
+        s.observe(&with_cgroup(ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x250, 0, 100), 111)); // C_SignInit
+        s.observe(&with_cgroup(ev(100, 3, fnkind::SESSION_ARG0, 10, MECH_NONE, 0, 200), 111)); // C_Sign, attributed to 0x250
+
+        assert_eq!(s.cgroups().len(), 1, "one cgroup id, one entry");
+        let cg = s.cgroups().get(&111).unwrap();
+        assert_eq!(cg.calls, 3, "every observed event, not just mechanism-attributed ones");
+        assert_eq!(cg.errors, 0);
+        assert_eq!(cg.mechanisms.len(), 1);
+        let m = cg.mechanisms.get(&0x250).unwrap();
+        assert_eq!(m.calls, 2, "the init call and the following op both attributed");
+        assert_eq!(m.errors, 0);
     }
 }

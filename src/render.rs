@@ -448,6 +448,64 @@ struct SessionsOut {
     balance: u64,
 }
 
+/// One mechanism id's calls/errors, scoped to one cgroup —
+/// `semantics::MechCallStat` rendered.
+#[derive(Serialize)]
+struct CgroupMechOut {
+    mechanism: u64,
+    mechanism_hex: String,
+    calls: u64,
+    errors: u64,
+}
+
+/// One `cgroup_id`'s breakdown — `semantics::CgroupStat` rendered. Exists
+/// so one node-wide attach over a cgroup shared by several containers/pods
+/// (e.g. two sharing one overlay2 image layer, hence one inode) can still
+/// be split back out per container: see `docs/schema/observed-profile-v1.md`
+/// and `docs/privacy/allowlist-v1.md`'s `cgroup_id` entry.
+#[derive(Serialize)]
+struct CgroupOut {
+    /// The raw kernel cgroup id — a directory inode number, not a
+    /// sensitive value (see the allowlist doc). Verbatim, so a consumer
+    /// can cross-reference it against its own container/pod inventory.
+    cgroup_id: u64,
+    /// Best-effort label resolved by matching `cgroup_id` against
+    /// `/sys/fs/cgroup` directory inodes at report time (`scope::label`).
+    /// `null` when it cannot be resolved — e.g. the cgroup was already
+    /// removed by report time (container exited mid-capture). Absent is
+    /// fine; this never guesses, so a present label is always trustworthy.
+    label: Option<String>,
+    /// Every event observed with this `cgroup_id`, regardless of kind.
+    calls: u64,
+    errors: u64,
+    /// The subset of `calls` a mechanism could be attributed to.
+    mechanisms: Vec<CgroupMechOut>,
+}
+
+fn cgroups_out(state: &crate::semantics::State) -> Vec<CgroupOut> {
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    state
+        .cgroups()
+        .iter()
+        .map(|(&cgroup_id, c)| CgroupOut {
+            cgroup_id,
+            label: crate::scope::label(root, cgroup_id),
+            calls: c.calls,
+            errors: c.errors,
+            mechanisms: c
+                .mechanisms
+                .iter()
+                .map(|(&mechanism, m)| CgroupMechOut {
+                    mechanism,
+                    mechanism_hex: format!("0x{mechanism:x}"),
+                    calls: m.calls,
+                    errors: m.errors,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 /// `capture` section fields that aren't derived from `reports`/`ev`/`state`.
 pub struct CaptureMeta<'a> {
     pub module: &'a str,
@@ -459,9 +517,10 @@ pub struct CaptureMeta<'a> {
 }
 
 /// The v1 `observed-profile.json` document. `functions` comes from the
-/// aggregate maps (count authority); `mechanisms`/`sessions`/`logins`
-/// come from the semantic state machine, the only place that
-/// reconstructs mechanism/session/login context from the event stream.
+/// aggregate maps (count authority); `mechanisms`/`sessions`/`logins`/
+/// `cgroups` come from the semantic state machine, the only place that
+/// reconstructs mechanism/session/login/cgroup context from the event
+/// stream.
 pub fn profile_json(
     reports: &[SlotReport],
     ev: &Evidence,
@@ -526,7 +585,7 @@ pub fn profile_json(
         state.logins().iter().map(|(user_type, n)| (user_type.to_string(), *n)).collect();
 
     serde_json::json!({
-        "schema": "pkcs11-scope/observed-profile/v1.1",
+        "schema": "pkcs11-scope/observed-profile/v1.2",
         "capture": {
             "start": capture.started, "end": capture.ended, "mode": "profile",
             "kernel": capture.kernel,
@@ -544,6 +603,7 @@ pub fn profile_json(
                      operation)",
             "operations": templates_out(state),
         },
+        "cgroups": cgroups_out(state),
     })
 }
 
@@ -733,13 +793,15 @@ mod tests {
         };
         let v = profile_json(&[], &ev, &state, &capture);
 
-        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v1.1");
-        for section in
-            ["capture", "evidence", "functions", "mechanisms", "sessions", "logins", "templates"]
-        {
-            assert!(v.get(section).is_some(), "v1.1 document missing required section {section}");
+        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v1.2");
+        for section in [
+            "capture", "evidence", "functions", "mechanisms", "sessions", "logins", "templates",
+            "cgroups",
+        ] {
+            assert!(v.get(section).is_some(), "v1.2 document missing required section {section}");
         }
         assert_eq!(v["templates"]["operations"], serde_json::json!([]));
+        assert_eq!(v["cgroups"], serde_json::json!([]));
         assert_eq!(v["capture"]["mode"], "profile");
         assert_eq!(v["capture"]["module"]["path"], "/opt/p11.so");
         assert_eq!(v["capture"]["module"]["build_id"], "aabb");
@@ -1101,5 +1163,43 @@ mod tests {
         assert_eq!(v["templates"]["operations"][0]["truncated"], true);
         assert_eq!(v["evidence"]["templates_truncated"], true);
         assert_eq!(v["evidence"]["completeness"], "PARTIAL");
+    }
+
+    #[test]
+    fn profile_json_cgroups_split_one_attach_into_two_container_entries() {
+        // Two containers/pods sharing one node-wide attach (Phase 4's
+        // Knative row: one overlay2 inode observed by a single attach) —
+        // the whole point of the breakdown is that this splits back out.
+        let mut state = crate::semantics::State::new(&init_plan());
+        let mut ev_a = init_event(0, 0x0D, 0, 0, 0, 0);
+        ev_a.cgroup_id = 111;
+        state.observe(&ev_a);
+        let mut ev_b = init_event(0, 0x0D, 0, 0, 0, 0);
+        ev_b.cgroup_id = 222;
+        ev_b.rv = 7;
+        state.observe(&ev_b);
+
+        let mut ev = evidence();
+        ev.verdict();
+        let capture = CaptureMeta { module: "/opt/p11.so", build_id: None, started: "t0", ended: "t1", kernel: "6.8.0" };
+        let v = profile_json(&[], &ev, &state, &capture);
+
+        let cgroups = v["cgroups"].as_array().unwrap();
+        assert_eq!(cgroups.len(), 2, "two distinct cgroup ids, two entries");
+        let cg111 = cgroups.iter().find(|c| c["cgroup_id"] == 111).expect("cgroup 111 present");
+        assert_eq!(cg111["calls"], 1);
+        assert_eq!(cg111["errors"], 0);
+        assert_eq!(cg111["mechanisms"][0]["mechanism"], 0x0D);
+        assert_eq!(cg111["mechanisms"][0]["mechanism_hex"], "0xd");
+        assert_eq!(cg111["mechanisms"][0]["calls"], 1);
+        assert_eq!(cg111["mechanisms"][0]["errors"], 0);
+        // No real /sys/fs/cgroup directory has this synthetic inode —
+        // label resolution must degrade to null, never a guess.
+        assert_eq!(cg111["label"], serde_json::Value::Null);
+
+        let cg222 = cgroups.iter().find(|c| c["cgroup_id"] == 222).expect("cgroup 222 present");
+        assert_eq!(cg222["calls"], 1);
+        assert_eq!(cg222["errors"], 1, "the failed call counts as an error at the cgroup level too");
+        assert_eq!(cg222["mechanisms"][0]["errors"], 1);
     }
 }

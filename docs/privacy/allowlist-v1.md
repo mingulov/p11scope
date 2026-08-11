@@ -11,9 +11,10 @@ Fields were enumerated by reading the code, not from the phase plan: all 11
 and `attr_bool` definitions in `crates/ebpf-common/src/lib.rs`, and what
 `src/render.rs` actually serializes into `observed-profile.json`. That list
 matches the plan's expected field set exactly, with two additions the plan
-didn't name explicitly (`pid_tgid`, `cgroup_id` — see "Captured but never
-exposed" below) and one important correction to how "session handle" is
-usually described (see that entry).
+didn't name explicitly (`pid_tgid` — see "Captured but never exposed"
+below — and `cgroup_id`, entry 10 above, once Phase 4 gave it a real
+consumer) and one important correction to how "session handle" is usually
+described (see that entry).
 
 ## Enforcement categories
 
@@ -343,31 +344,84 @@ usually described (see that entry).
 - **Enforcement:** structural — comes from `ProbeContext::ret()` on the
   return probe, never from a user-memory read.
 
+### 10. Cgroup id (per-cgroup breakdown)
+
+- **What it is:** the `CK_ULONG`-sized value from `bpf_get_current_cgroup_id()`
+  (a kernel helper, not a `bpf_probe_read_user` call), stored on every
+  `Event` (`crates/ebpf/src/main.rs:363-364`,
+  `crates/ebpf-common/src/lib.rs:257-258`) and now surfaced verbatim as
+  `cgroups[].cgroup_id`, with a best-effort resolved `label`
+  (`src/render.rs`'s `cgroups_out`, `src/scope.rs`'s `label`) — see
+  `docs/schema/observed-profile-v1.md`'s `cgroups` section (new in v1.2).
+  **This entry replaces the "captured but never exposed" status this
+  field carried through v1.1** — it now has a real consumer, so it needs
+  the same written justification as every other allowlisted field, not a
+  deferral.
+- **Why an assessor needs it:** it is a directory inode number, not an
+  opaque identity — the same value the kernel returns for every task
+  inside that cgroup, so it is the only thing that lets one node-wide
+  attach be split back out per container/pod after the fact. This is not
+  a hypothetical: Phase 4's Knative row measured two containers sharing
+  a single overlay2 image-layer inode (`51969427`, identical in both),
+  observed by one attach — without this field their calls are
+  indistinguishable in the report. Kubernetes exposes no cgroup finer
+  than node-wide `kubepods.slice` that is stable *before* a pod exists
+  (`docs/notes/phase4-matrix.md`, the Knative row), so a coarse attach
+  scope is sometimes the only option, and `cgroup_id` is what recovers
+  per-container attribution from it afterward.
+- **What an attacker could learn:** which container/pod a given burst of
+  PKCS#11 activity came from, when several share one attach. This is
+  scheduling/placement metadata, not cryptographic material — comparable
+  to knowing which container issued a syscall from `/proc/<pid>/cgroup`,
+  which is already visible to anything with host `/proc` access at the
+  same privilege this tool already requires to attach uprobes at all.
+- **Why that is acceptable:** a cgroup id is a directory inode number on
+  a virtual filesystem (`/sys/fs/cgroup`) — it names a scheduling
+  grouping, not a person, credential, or key. It carries no more
+  information than "which of the containers sharing this attach did
+  this call come from", which is exactly the question `cgroups[]` exists
+  to answer. The **label**, resolved by walking `/sys/fs/cgroup` for a
+  matching inode (`scope::label`), is more legible (e.g.
+  `kubepods.slice/kubepods-podabc.slice/cri-containerd-def.scope`) but
+  reveals nothing the raw id didn't already: both are visible to anyone
+  with the same host filesystem access this tool already requires, and
+  the label never falls back to a guess — an unresolved id renders
+  `label: null`, never a mismatched or stale one (`docs/schema/observed-profile-v1.md`'s
+  `cgroups` section, the `label` row).
+- **Enforcement:** structural for the source value — `bpf_get_current_cgroup_id()`
+  is a kernel helper called with no arguments, not a `bpf_probe_read_user`
+  call, so there is no user-memory read to gate. Runtime-gated for the
+  label: `scope::label` only ever returns a path it found by walking
+  `/sys/fs/cgroup` and matching an inode exactly (`std::fs::metadata(&dir)
+  .is_ok_and(|md| md.ino() == target)`, `src/scope.rs`); a miss (no match,
+  or `/sys/fs/cgroup` unreadable at the calling privilege) yields `None`,
+  never a partial or best-guess string. Tested by
+  `render::tests::profile_json_cgroups_split_one_attach_into_two_container_entries`
+  (two synthetic cgroup ids render as two separate breakdown entries with
+  correct per-cgroup calls/errors/mechanisms) and
+  `scope::tests::label_is_none_when_no_directory_matches` (an id with no
+  matching directory resolves to `None`, not a guess).
+
 ---
 
-## Captured but never exposed: `pid_tgid`, `cgroup_id`
+## Captured but never exposed: `pid_tgid`
 
-- **What they are:** `bpf_get_current_pid_tgid()` and
-  `bpf_get_current_cgroup_id()` (kernel helpers, not user-memory reads),
-  stored on every `Event` (`crates/ebpf/src/main.rs:363-364`,
-  `crates/ebpf-common/src/lib.rs:257-258`).
+- **What it is:** `bpf_get_current_pid_tgid()` (a kernel helper, not a
+  user-memory read), stored on every `Event`
+  (`crates/ebpf/src/main.rs:363-364`).
 - **Current status — flagged as weak, not because it leaks, but because
-  it is unused:** `pid_tgid` is consumed internally only to key per-process
-  state (`src/semantics.rs:156-159`, the `pid()` helper); `cgroup_id` is
-  captured into every `Event` but **has no consumer at all** — it is not
-  read by `src/semantics.rs`, not read by `src/render.rs`, and does not
-  appear anywhere in `observed-profile.json` today (confirmed by
-  exhaustive grep of `src/render.rs`). The design spec anticipates a
-  future per-container breakdown ("Events also carry process / thread /
-  cgroup identity... so the profile can break down calls per container"),
-  but that consumer does not exist yet.
-- **Recommendation:** since `cgroup_id` is captured but never surfaced,
-  there is nothing to justify *today* — no output field exists that could
-  leak it, so it needs no allowlist entry of its own yet. When the
-  per-container breakdown lands, this field will need its own writeup
-  (cgroup id is a low-sensitivity but real identifier — it maps to a
-  specific container/pod). Until then this is dead capture, not a privacy
-  gap; noted so a future reviewer does not have to rediscover it.
+  its consumer is entirely internal:** consumed only to key per-process
+  state (`src/semantics.rs:156-159`, the `pid()` helper) — pseudonym
+  allocation, session tracking, per-pid active-operation binding. It does
+  not appear anywhere in `observed-profile.json`: no accessor on `State`
+  returns a raw or derived pid, and no `*Out` struct in `src/render.rs`
+  carries one.
+- **Recommendation:** unchanged from earlier phases — since `pid_tgid`
+  is captured but never surfaced, there is nothing to justify *today* as
+  an output-facing field; it needs no allowlist entry of its own unless a
+  future consumer emits it. This is dead-to-output capture, not a privacy
+  gap (unlike `cgroup_id`, above, which moved to the allowlisted-fields
+  section once `cgroups[]` gave it a real, checked consumer).
 
 ---
 
@@ -479,11 +533,13 @@ flagging them is what makes this document credible:
    narrower than GCM's was — an out-of-bounds *scalar* read, never a
    pointer disclosure — but it is still a coverage gap to close, not a
    reason to consider this fully closed.
-2. **`cgroup_id` is captured with no current consumer.** Not a leak (no
-   output field exists for it), but capturing a field with no
-   justification-by-use is exactly the pattern this document is supposed
-   to prevent. Recommend either wiring it into a future per-container
-   breakdown promptly, or dropping the capture until that lands.
+2. **RESOLVED (v1.2): `cgroup_id` is captured with no current consumer.**
+   Flagged in earlier phases as capturing a field with no
+   justification-by-use — exactly the pattern this document is supposed
+   to prevent. Phase 4 wired it into the per-cgroup breakdown
+   (`cgroups[]`, entry 10 above) with its own written justification, so
+   this is no longer an open weak point; left here, marked resolved, so
+   the earlier finding's history isn't silently erased.
 3. **The plan's "session handle... pseudonymization suffices" framing is
    more conservative than what the code actually does.** The code doesn't
    need the reviewer to trust pseudonymization at all for v1, since no
@@ -494,7 +550,7 @@ flagging them is what makes this document credible:
    suffices" reasoning has not actually been exercised by any shipped
    output path yet.
 
-None of the 9 allowlisted field groups above were judged unjustifiable —
-each answers a concrete, named migration-assessment question. The three
-items above are process/coverage gaps, not fields that should be pulled
-from the allowlist.
+None of the 10 allowlisted field groups above were judged unjustifiable —
+each answers a concrete, named migration-assessment question. Of the three
+items above, one (#2) is resolved; the remaining two are process/coverage
+gaps, not fields that should be pulled from the allowlist.

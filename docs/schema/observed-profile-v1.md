@@ -1,13 +1,14 @@
-# `observed-profile.json` schema v1 / v1.1
+# `observed-profile.json` schema v1 / v1.1 / v1.2
 
-**Schema string:** `"pkcs11-scope/observed-profile/v1.1"` (current; `"v1"`
+**Schema string:** `"pkcs11-scope/observed-profile/v1.2"` (current; `"v1"`
 documents describe the schema before Phase 3 landed parameter/template
-decoding — see "v1 → v1.1: what changed" below for the exact, additive-only
-delta).
+decoding, `"v1.1"` before Phase 4 landed the per-cgroup breakdown — see
+"v1 → v1.1: what changed" and "v1.1 → v1.2: what changed" below for the
+exact, additive-only deltas).
 **Producer:** `p11scope profile` (default `--mode profile`; `--mode metrics`
 instead emits the lighter `pkcs11-scope/observed-profile/v0-metrics`
 document — `capture`/`evidence`/`functions` only, no `mechanisms`,
-`sessions`, `logins`, or `templates`).
+`sessions`, `logins`, `templates`, or `cgroups`).
 **Rust type:** `render::profile_json(reports, ev, state, capture) ->
 serde_json::Value` in `src/render.rs`.
 
@@ -30,11 +31,13 @@ questions:
 - **The event stream** (ring buffer → `events::Drain` → `semantics::State`)
   is the only path that reconstructs *semantic* context — which mechanism
   a session's active operation is using, session open/close pairing, login
-  user type — because that requires correlating consecutive calls on the
-  same session, which the per-slot aggregate maps cannot express. It is
-  subject to ring-buffer loss (`evidence.event_loss`) and per-record
-  decode failures (`evidence.malformed_records`). `mechanisms`, `sessions`,
-  and `logins` are built from it exclusively; there is no aggregate-map
+  user type, which cgroup a call came from — because that requires
+  correlating consecutive calls on the same session, or a per-event field
+  the aggregate maps don't carry at all, neither of which the per-slot
+  aggregate maps can express. It is subject to ring-buffer loss
+  (`evidence.event_loss`) and per-record decode failures
+  (`evidence.malformed_records`). `mechanisms`, `sessions`, `logins`, and
+  `cgroups` are built from it exclusively; there is no aggregate-map
   equivalent for any of them.
 - **The mechanism registry** (`pkcs11-proxy-ng-types::MechanismRegistry`,
   loaded embedded-default, no config-file plumbing) is a third, much
@@ -54,21 +57,22 @@ mechanism they're running under, not counted per function name there.
 
 ```json
 {
-  "schema": "pkcs11-scope/observed-profile/v1.1",
+  "schema": "pkcs11-scope/observed-profile/v1.2",
   "capture": { "...": "..." },
   "evidence": { "...": "..." },
   "functions": [ { "...": "..." } ],
   "mechanisms": [ { "...": "..." } ],
   "sessions": { "...": "..." },
   "logins": { "...": "..." },
-  "templates": { "note": "...", "operations": [ { "...": "..." } ] }
+  "templates": { "note": "...", "operations": [ { "...": "..." } ] },
+  "cgroups": [ { "...": "..." } ]
 }
 ```
 
-All seven sections are always present, even when empty (`functions: []`,
-`mechanisms: []`, `logins: {}`, `templates.operations: []`) — a consumer
-should never need to special-case a missing section. Enforced by
-`render::tests::profile_json_has_every_required_top_level_section`.
+All eight sections are always present, even when empty (`functions: []`,
+`mechanisms: []`, `logins: {}`, `templates.operations: []`, `cgroups: []`)
+— a consumer should never need to special-case a missing section. Enforced
+by `render::tests::profile_json_has_every_required_top_level_section`.
 
 ## `capture`
 
@@ -357,6 +361,62 @@ attribute policy did the application ask providers to enforce", which
 policy the candidate provider doesn't support, but it is not itself a
 join key.
 
+## `cgroups` *(new in v1.2)*
+
+```json
+[
+  {
+    "cgroup_id": 51969427,
+    "label": "kubepods.slice/kubepods-podabc123.slice/cri-containerd-def456.scope",
+    "calls": 412,
+    "errors": 3,
+    "mechanisms": [
+      { "mechanism": 592, "mechanism_hex": "0x250", "calls": 400, "errors": 3 }
+    ]
+  }
+]
+```
+
+**Why this exists.** `cgroup_id` (a directory inode number) is captured on
+every `Event` but had no consumer through v1.1 — flagged as a "dead
+capture" in `docs/privacy/allowlist-v1.md`. Phase 4's Knative row proved
+the concrete need: two containers can share a single overlay2 image-layer
+inode, so a `--pid`/`--cgroup` attach scoped no finer than that inode
+observes both containers' calls as one indistinguishable stream. `cgroups`
+lets one such attach be split back out per container/pod after the fact —
+this is *not* a replacement for a finer-grained `--cgroup` scope where one
+is available; it is the only per-container attribution possible when it
+isn't (Kubernetes exposes no cgroup finer than node-wide `kubepods.slice`
+that is stable *before* a pod exists — see `docs/notes/phase4-matrix.md`,
+the Knative row).
+
+`cgroups` is an array, one entry per distinct `cgroup_id` observed in this
+capture (absent entirely, i.e. `cgroups: []`, when nothing was observed —
+same "observed, not planned" convention `mechanisms[]`/`templates[]` use),
+**sourced from the semantic state machine** (event-derived; no
+aggregate-map equivalent exists, since the per-slot aggregate maps carry
+no cgroup dimension at all):
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `cgroup_id` | number | The raw kernel cgroup id, verbatim — a directory inode number (`bpf_get_current_cgroup_id()`), **not a sensitive value** (see `docs/privacy/allowlist-v1.md`'s `cgroup_id` entry): it identifies a container/pod's cgroup directory, not a person, credential, or piece of key material. Kept raw, never hashed or dropped, so a consumer can cross-reference it against its own container/pod inventory. |
+| `label` | string or `null` | Best-effort human label, resolved at report time by walking `/sys/fs/cgroup` for the directory whose inode equals `cgroup_id` (`scope::label`) and recording its path relative to `/sys/fs/cgroup`. `null` when no match is found — e.g. the cgroup was already removed by report-write time (the container exited mid-capture), or the reporting process cannot read `/sys/fs/cgroup` (unprivileged run). This is deliberately best-effort: an absent label is fine, a wrong one is not, so resolution never guesses or falls back to a stale/partial match. |
+| `calls` | number | Every event observed with this `cgroup_id`, regardless of kind — the same "every completed call" scope `functions[].calls` uses at the top level. Not expected to sum to `functions[].calls` capture-wide when more than one cgroup is observed (this splits it out) nor to equal the sum of `mechanisms[].calls` below, for the same reason `mechanisms[].calls` doesn't sum to `functions[].calls` capture-wide (see "Field sourcing" above): not every event names a mechanism. |
+| `errors` | number | Of `calls`, how many returned a nonzero `CK_RV`. |
+| `mechanisms` | array of `{mechanism, mechanism_hex, calls, errors}` | The subset of this cgroup's `calls` a mechanism could be attributed to: this cgroup's `*Init` calls for that mechanism id, plus the operational calls (`C_Sign`, `C_Encrypt`, ...) run under it on a session opened from this cgroup. `mechanism`/`mechanism_hex` follow the same verbatim/hex-formatted convention as `mechanisms[].mechanism` at the top level — vendor ids survive unchanged. This is a narrower view than the top-level `mechanisms[]` entry for the same id: no latency histogram, no parameter combos, no `ops` — those stay capture-wide (join on `mechanism`/`mechanism_hex` against the top-level `mechanisms[]` entry for the fuller picture). |
+
+No new BPF-side capture was added for this section — `cgroup_id` was
+already read via `bpf_get_current_cgroup_id()` (a kernel helper, not a
+`bpf_probe_read_user` call) on every event; this section is purely a
+userspace aggregation of a field that was already flowing through
+`Event`.
+
+**Gate G2:** `cgroups` is diagnostic/attribution context, not one of the
+five `pkcs11-lab` migration-assessment categories directly — it answers
+"which container/pod is this activity coming from", which matters for
+scoping an assessment to one workload sharing a node-wide attach, but it
+is not itself a join key into `pkcs11-lab`'s categories.
+
 ## Latency shape
 
 `functions[].latency_ns` and `mechanisms[].latency_ns` share one shape:
@@ -409,3 +469,16 @@ schema string itself.
 - A new top-level `templates` section was added.
 
 No v1.1 field removes or renames anything v1 defined.
+
+## v1.1 → v1.2: what changed
+
+Purely additive — every v1.1 field keeps its v1.1 meaning; a v1.1 consumer
+that ignores unknown fields reads a v1.2 document unchanged except for the
+schema string itself.
+
+- `schema` is now `"pkcs11-scope/observed-profile/v1.2"`.
+- A new top-level `cgroups` section was added — see "`cgroups`" above.
+  `evidence`/`functions`/`mechanisms`/`sessions`/`logins`/`templates` are
+  unchanged.
+
+No v1.2 field removes or renames anything v1/v1.1 defined.

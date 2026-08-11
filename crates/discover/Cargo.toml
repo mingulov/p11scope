@@ -9,3 +9,6 @@ description = "PKCS#11 discovery helper: dlopen a provider, map its function tab
 publish = false
 
 [dependencies]
+object = { version = "0.39", default-features = false, features = ["read"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"

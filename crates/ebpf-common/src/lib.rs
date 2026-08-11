@@ -116,6 +116,52 @@ pub mod shape {
 /// this covers that several times over.
 pub const MAX_MECH_SHAPES: u32 = 1024;
 
+/// Bit positions for policy-allowlisted boolean attributes in attr_bools bitmask.
+/// Each bit represents whether that attribute was observed as true.
+pub mod attr_bool {
+    /// CKA_TOKEN (PKCS#11 type 0x01) — bit 0
+    pub const TOKEN: u32 = 1 << 0;
+    /// CKA_PRIVATE (PKCS#11 type 0x02) — bit 1
+    pub const PRIVATE: u32 = 1 << 1;
+    /// CKA_SENSITIVE (PKCS#11 type 0x103) — bit 2
+    pub const SENSITIVE: u32 = 1 << 2;
+    /// CKA_ENCRYPT (PKCS#11 type 0x104) — bit 3
+    pub const ENCRYPT: u32 = 1 << 3;
+    /// CKA_DECRYPT (PKCS#11 type 0x105) — bit 4
+    pub const DECRYPT: u32 = 1 << 4;
+    /// CKA_WRAP (PKCS#11 type 0x106) — bit 5
+    pub const WRAP: u32 = 1 << 5;
+    /// CKA_UNWRAP (PKCS#11 type 0x107) — bit 6
+    pub const UNWRAP: u32 = 1 << 6;
+    /// CKA_SIGN (PKCS#11 type 0x108) — bit 7
+    pub const SIGN: u32 = 1 << 7;
+    /// CKA_VERIFY (PKCS#11 type 0x10A) — bit 8
+    pub const VERIFY: u32 = 1 << 8;
+    /// CKA_DERIVE (PKCS#11 type 0x10C) — bit 9
+    pub const DERIVE: u32 = 1 << 9;
+    /// CKA_EXTRACTABLE (PKCS#11 type 0x162) — bit 10
+    pub const EXTRACTABLE: u32 = 1 << 10;
+
+    /// Map a PKCS#11 attribute type to its bit position, if allowlisted.
+    /// Returns Some(bit_position) for recognized attributes, None otherwise.
+    pub const fn bit_for_attr_type(attr_type: u32) -> Option<u32> {
+        match attr_type {
+            0x01 => Some(0),   // CKA_TOKEN
+            0x02 => Some(1),   // CKA_PRIVATE
+            0x103 => Some(2),  // CKA_SENSITIVE
+            0x104 => Some(3),  // CKA_ENCRYPT
+            0x105 => Some(4),  // CKA_DECRYPT
+            0x106 => Some(5),  // CKA_WRAP
+            0x107 => Some(6),  // CKA_UNWRAP
+            0x108 => Some(7),  // CKA_SIGN
+            0x10A => Some(8),  // CKA_VERIFY
+            0x10C => Some(9),  // CKA_DERIVE
+            0x162 => Some(10), // CKA_EXTRACTABLE
+            _ => None,
+        }
+    }
+}
+
 /// Sentinels. Zero is a legal PKCS#11 value for some of these, so absence
 /// gets its own out-of-band marker.
 pub const MECH_NONE: u64 = u64::MAX;
@@ -131,6 +177,9 @@ pub const USER_TYPE_NONE: u32 = u32::MAX;
 pub const RING_BYTES: u32 = 256 * 1024;
 #[cfg(feature = "small-ring")]
 pub const RING_BYTES: u32 = 4096;
+
+/// Maximum template attributes captured per event.
+pub const MAX_ATTRS: usize = 8;
 
 /// What the entry probe stashes until the matching return. Replaces the
 /// bare timestamp Phase 1b stored.
@@ -148,6 +197,18 @@ pub struct CallStart {
 
 /// One completed call. Emitted at return only: a call with no return is
 /// visible as in-flight in the aggregate maps, never as a partial event.
+///
+/// ## Decoded mechanism parameters
+///
+/// For mechanism shapes decoded in this phase, `shape` holds the shape code
+/// (from the `shape` module) and `p0`, `p1`, `p2` hold shape-specific scalar
+/// parameters:
+///
+/// - `RSA_PKCS_PSS`: p0 = hashAlg, p1 = mgf, p2 = sLen
+/// - `GCM`: p0 = ulIvLen, p1 = ulAADLen, p2 = ulTagBits
+///
+/// For unknown or unhandled shapes, `shape` is `shape::NONE` and the `p*`
+/// fields are meaningless.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Event {
@@ -159,10 +220,18 @@ pub struct Event {
     pub session: u64,
     pub mechanism: u64,
     pub rv: u64,
+    pub p0: u64,
+    pub p1: u64,
+    pub p2: u64,
     pub slot: u32,
     pub kind: u32,
     pub user_type: u32,
-    pub _pad: u32,
+    pub shape: u32,
+    pub attr_types: [u32; MAX_ATTRS],
+    pub attr_count: u32,
+    pub attr_total: u32,
+    pub attr_bools: u32,
+    pub attr_bools_seen: u32,
 }
 
 #[cfg(feature = "user")]
@@ -199,8 +268,10 @@ mod tests {
     fn event_and_callstart_have_no_implicit_padding() {
         // Both cross the kernel/userspace boundary as raw bytes; implicit
         // tail padding would read as uninitialized on one side.
+        // CallStart: 4 u64 + 2 u32 = 32 + 8 = 40 bytes (no padding needed)
         assert_eq!(core::mem::size_of::<CallStart>(), 8 * 4 + 4 + 4);
-        assert_eq!(core::mem::size_of::<Event>(), 8 * 7 + 4 * 4);
+        // Event: 10 u64 + 4 u32 + [u32; 8] + 4 u32 = 80 + 16 + 32 + 16 = 144 bytes
+        assert_eq!(core::mem::size_of::<Event>(), 8 * 10 + 4 * 8 + 32);
         assert_eq!(core::mem::align_of::<Event>(), 8);
     }
 

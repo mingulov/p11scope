@@ -10,9 +10,9 @@ use aya_ebpf::maps::{Array, HashMap, PerCpuArray, PerCpuHashMap, RingBuf};
 use aya_ebpf::programs::{ProbeContext, RetProbeContext};
 use aya_ebpf::{EbpfContext as _, helpers};
 use p11scope_ebpf_common::{
-    CFG_FLAGS, CallStart, Event, FLAG_CGROUP_FILTER, FLAG_PID_FILTER, MAX_MECH_SHAPES, MAX_SLOTS,
-    MECH_NONE, RING_BYTES, RvKey, SESSION_NONE, SlotStats, StartKey, USER_TYPE_NONE, bucket_of,
-    fnkind,
+    CFG_FLAGS, CallStart, Event, FLAG_CGROUP_FILTER, FLAG_PID_FILTER, MAX_ATTRS, MAX_MECH_SHAPES,
+    MAX_SLOTS, MECH_NONE, RING_BYTES, RvKey, SESSION_NONE, SlotStats, StartKey, USER_TYPE_NONE,
+    bucket_of, fnkind,
 };
 
 #[map]
@@ -211,10 +211,18 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
         session,
         mechanism: start.mechanism,
         rv,
+        p0: 0,
+        p1: 0,
+        p2: 0,
         slot,
         kind: SLOT_KIND.get(slot).copied().unwrap_or(fnkind::OTHER),
         user_type: start.user_type,
-        _pad: 0,
+        shape: 0,
+        attr_types: [0; MAX_ATTRS],
+        attr_count: 0,
+        attr_total: 0,
+        attr_bools: 0,
+        attr_bools_seen: 0,
     };
     match EVENTS.reserve::<Event>(0) {
         Some(mut e) => {

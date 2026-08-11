@@ -270,10 +270,18 @@ mod tests {
             session,
             mechanism,
             rv,
+            p0: 0,
+            p1: 0,
+            p2: 0,
             slot,
             kind,
             user_type: USER_TYPE_NONE,
-            _pad: 0,
+            shape: 0,
+            attr_types: [0; 8],
+            attr_count: 0,
+            attr_total: 0,
+            attr_bools: 0,
+            attr_bools_seen: 0,
         }
     }
 
@@ -286,10 +294,18 @@ mod tests {
             session: SESSION_NONE,
             mechanism: MECH_NONE,
             rv: 0,
+            p0: 0,
+            p1: 0,
+            p2: 0,
             slot: 5,
             kind: fnkind::LOGIN,
             user_type,
-            _pad: 0,
+            shape: 0,
+            attr_types: [0; 8],
+            attr_count: 0,
+            attr_total: 0,
+            attr_bools: 0,
+            attr_bools_seen: 0,
         }
     }
 

@@ -65,10 +65,18 @@ mod tests {
             session: 5,
             mechanism: 6,
             rv: 7,
+            p0: 0,
+            p1: 0,
+            p2: 0,
             slot: 8,
             kind: 9,
             user_type: 10,
-            _pad: 0,
+            shape: 0,
+            attr_types: [0; 8],
+            attr_count: 0,
+            attr_total: 0,
+            attr_bools: 0,
+            attr_bools_seen: 0,
         }
     }
 

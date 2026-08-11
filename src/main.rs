@@ -1,23 +1,14 @@
-//! p11scope — non-interposing PKCS#11 observer (eBPF uprobes).
-
-mod attach;
-mod discover_cmd;
-mod metrics;
-mod plan;
-mod render;
-mod scope;
+//! p11scope — non-interposing PKCS#11 observer (eBPF uprobes). CLI entry
+//! point; the modules themselves live in the `p11scope` library crate
+//! (`src/lib.rs`) so integration tests can exercise them directly.
 
 use anyhow::{Context as _, Result, bail};
-use attach::{Scope, Session};
+use p11scope::attach::{Scope, Session};
+use p11scope::{discover_cmd, metrics, plan, render, scope, verify};
 use p11scope_manifest::manifest::{Manifest, SCHEMA};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-/// The BPF object, built by build.rs. Alignment matters: aya parses it
-/// as ELF in place.
-pub static EBPF_OBJECT: &[u8] =
-    aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/p11scope-ebpf"));
 
 const USAGE: &str = "usage:\n  \
 p11scope profile --manifest <m.json> (--pid <n> | --cgroup <path>) [--mode metrics] [--duration <secs>] [-o <out.json>]\n  \
@@ -126,6 +117,12 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
             manifest.schema
         );
     }
+    if let Err(problems) = verify::check_reuse(&manifest) {
+        for p in &problems {
+            eprintln!("p11scope: {p}");
+        }
+        bail!("manifest does not match the current files; refusing to attach");
+    }
 
     let plan = plan::build(&manifest);
     if plan.slots.is_empty() {
@@ -233,8 +230,9 @@ mod tests {
     /// placeholder byte array — a stub would silently break every attach.
     #[test]
     fn ebpf_object_is_a_real_bpf_elf() {
-        assert!(EBPF_OBJECT.len() > 1000, "expected a real BPF object, not a stub");
-        assert_eq!(&EBPF_OBJECT[..4], b"\x7fELF", "embedded object is not an ELF file");
+        let obj = p11scope::EBPF_OBJECT;
+        assert!(obj.len() > 1000, "expected a real BPF object, not a stub");
+        assert_eq!(&obj[..4], b"\x7fELF", "embedded object is not an ELF file");
     }
 
     #[test]

@@ -8,11 +8,15 @@ repository = "https://github.com/mingulov/pkcs11-scope"
 description = "Non-interposing PKCS#11 observer on eBPF uprobes (design phase)"
 publish = false
 
+[lib]
+name = "p11scope"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = "1"
 aya = "=0.14.0"
 p11scope-ebpf-common = { path = "crates/ebpf-common", features = ["user"] }
-p11scope-manifest = { path = "crates/manifest" }
+p11scope-manifest = { path = "crates/manifest", features = ["identify"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

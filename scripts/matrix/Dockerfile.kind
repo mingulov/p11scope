@@ -1,0 +1,19 @@
+# Image for the Kubernetes rows of the Phase 4 environment matrix
+# (verify-kind-pod.sh, verify-knative.sh). kind pods can't be bind-mounted
+# from the host the way verify-docker.sh's containers are (no --pid=host
+# equivalent for a plain kubectl-run pod), so this image bakes the
+# host-built harness and p11scope-discover binaries straight in at build
+# time. Still valid because this host is ubuntu:24.04/glibc 2.39 -- same
+# as the base image -- so the host-built dynamic binaries run unmodified
+# (same reasoning as scripts/matrix/Dockerfile).
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends softhsm2 \
+    && rm -rf /var/lib/apt/lists/*
+ENV SOFTHSM2_CONF=/matrix/softhsm2.conf
+RUN mkdir -p /matrix/tokens \
+    && printf 'directories.tokendir = /matrix/tokens\nobjectstore.backend = file\nlog.level = ERROR\nslots.removable = false\n' \
+       > /matrix/softhsm2.conf \
+    && softhsm2-util --init-token --free --label matrix --so-pin 1234 --pin 1234
+COPY build/harness /usr/local/bin/harness
+COPY build/p11scope-discover /usr/local/bin/p11scope-discover
+CMD ["sleep", "infinity"]

@@ -6,3 +6,4 @@ vmlinux.h
 spike/work/
 target/
 spike/aya-offset-pin/work/
+crates/ebpf/target/

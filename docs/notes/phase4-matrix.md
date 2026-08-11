@@ -12,6 +12,7 @@ hierarchy).
 | Docker, shared image layer (2 containers, 1 attach) | `scripts/matrix/verify-shared-layer.sh` | PASS — one attach observes both containers (counts == 2x oracle); a cgroup scope naming only container A excludes container B's concurrent calls (counts == 1x oracle for each of A-only and B-only, never 2x) | COMPLETE on all three captures (136/136 probes each) | Same as the single-container row (same code path): unprivileged `p11scope profile` fails identically at the `/proc/<pid>/root` identity check before touching BPF. |
 | Kubernetes pod (kind) | `scripts/matrix/verify-kind-pod.sh` | PASS — exact counts, observer runs on the host (see Row 3 below for why) | COMPLETE (136/136 probes) | Unprivileged `p11scope profile`: exit 1, identical `Permission denied (os error 13)` reading `/proc/<host-pid>/root/...` before BPF is touched. Minimum working set: root (via `sudo`) for `p11scope profile`; `kubectl exec` for discovery needs no host root. |
 | Knative Serving, scale-from-zero (kind) | `scripts/matrix/verify-knative.sh` | PASS — attach starts with zero pods for the Service existing, then a cold-start request creates a new pod (created 7.9s after attach start, measured) whose calls match the oracle exactly | COMPLETE (136/136 probes) | Same as the kind-pod row: unprivileged `p11scope profile` fails identically at `/proc/<pid>/root` with `Permission denied`. |
+| Prefork server, fork scoping (host) | `scripts/matrix/verify-fork-scope.sh` | PASS — cgroup attach precedes both the parent harness process and all 4 forked children; summed parent+children counts match `fork-expected.txt` exactly | COMPLETE (136/136 probes) | Measured, host `--pid` (same-uid target): unprivileged fails at BPF map creation (`Operation not permitted`); `CAP_BPF`+`CAP_PERFMON` alone still fails every attach (`perf_event_open` failed, `kernel.perf_event_paranoid=4` on this kernel); **`CAP_SYS_ADMIN` alone is sufficient** — no full root needed. Finer-grained than the rows above; see `docs/notes/phase4-privileges.md`. |
 
 ## Row 1: Docker container capture (Task 2)
 
@@ -280,7 +281,23 @@ reporting the unit "Deactivated successfully" within the same second)
 took the longest to isolate; the fix (invoke the venv's own installed
 console script instead of `uv run`) is recorded in the same notes file.
 
+## Row 6: fork scoping + measured privileges (Task 8)
+
+Fork-scoping proof: see the "Prefork server, fork scoping (host)" table
+row above, `scripts/matrix/verify-fork-scope.sh`, full detail in
+`docs/notes/phase4-privileges.md`.
+
+Privileges, measured (not copied from docs) for all three environments —
+host, Docker, kind — down to the specific capability, not just
+unprivileged-vs-root: `docs/notes/phase4-privileges.md`. Headline finding:
+host needs only `CAP_SYS_ADMIN`; Docker/kind (crossing into a
+different-uid container/pod process's `/proc/<pid>/root`) need
+`CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` — neither environment needs full root,
+which the earlier rows' coarser "root via sudo" privilege notes did not
+distinguish.
+
 ## Not yet covered by this file
 
-Nothing — Tasks 2 through 7 (Docker, shared layer, kind pod, Knative, and
-the `pkcs11-check` oracle diff) are all recorded above.
+Nothing — Tasks 2 through 8 (Docker, shared layer, kind pod, Knative, the
+`pkcs11-check` oracle diff, fork scoping, and measured privileges) are all
+recorded above.

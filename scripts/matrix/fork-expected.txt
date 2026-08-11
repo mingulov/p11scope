@@ -1,0 +1,8 @@
+C_CloseSession 4
+C_Digest 20
+C_DigestInit 20
+C_Finalize 5
+C_GetInfo 1
+C_GetSlotList 4
+C_Initialize 5
+C_OpenSession 4

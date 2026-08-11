@@ -19,6 +19,15 @@ pub struct Evidence {
     /// Manifest entries with no attachable target, and why.
     pub skipped: Vec<SkippedOut>,
     pub in_flight_at_end: u64,
+    /// Per-surface discovery provenance (walk outcome, acquisition status).
+    /// A surface that was not fully walked or failed to acquire means
+    /// functions the manifest declares may never have been probed, even
+    /// when `skipped`/`aliased` are empty.
+    pub surfaces: Vec<crate::plan::SurfaceSummary>,
+    /// Present-but-undecoded vendor interfaces (never walked).
+    pub vendor_interfaces: usize,
+    /// Outcome of the manifest-level C_GetInterfaceList enumeration.
+    pub interface_list: String,
     pub completeness: &'static str,
 }
 
@@ -30,12 +39,18 @@ pub struct SkippedOut {
 
 impl Evidence {
     /// COMPLETE only when nothing was lost: every planned probe attached,
-    /// nothing was skipped, no aliasing ambiguity, no call left in flight.
+    /// nothing was skipped, no aliasing ambiguity, no call left in flight,
+    /// every surface was fully walked with a successful acquisition, and
+    /// no vendor interfaces were left undecoded.
     pub fn verdict(&mut self) {
+        let surfaces_complete =
+            self.surfaces.iter().all(|s| s.walk == "full" && s.acquisition == "ok");
         self.completeness = if self.attach_failures.is_empty()
             && self.skipped.is_empty()
             && self.aliased.is_empty()
             && self.in_flight_at_end == 0
+            && surfaces_complete
+            && self.vendor_interfaces == 0
         {
             "COMPLETE"
         } else {
@@ -88,16 +103,25 @@ pub fn live(reports: &[SlotReport], ev: &Evidence, elapsed: Duration, module: &s
         ));
     }
     s.push_str("(~ = log2-bucket approximation, lower bound)\n");
-    s.push_str(&format!(
-        "Evidence: {}/{} probes attached · {} slots · {} aliased · {} skipped · {} in-flight → {}\n",
+    let surface_gaps =
+        ev.surfaces.iter().filter(|s| s.walk != "full" || s.acquisition != "ok").count();
+    let mut evidence_line = format!(
+        "Evidence: {}/{} probes attached · {} slots · {} aliased · {} skipped · {} in-flight",
         ev.attached_probes,
         ev.slots * 2,
         ev.slots,
         ev.aliased.len(),
         ev.skipped.len(),
         ev.in_flight_at_end,
-        ev.completeness
-    ));
+    );
+    if surface_gaps > 0 || ev.vendor_interfaces > 0 {
+        evidence_line.push_str(&format!(
+            " · {surface_gaps} surface gaps · {} vendor interfaces",
+            ev.vendor_interfaces
+        ));
+    }
+    evidence_line.push_str(&format!(" → {}\n", ev.completeness));
+    s.push_str(&evidence_line);
     s
 }
 
@@ -182,6 +206,15 @@ mod tests {
         }
     }
 
+    fn ok_surface() -> crate::plan::SurfaceSummary {
+        crate::plan::SurfaceSummary {
+            source: "legacy_function_list".into(),
+            walk: "full".into(),
+            acquisition: "ok".into(),
+            functions: 68,
+        }
+    }
+
     fn evidence() -> Evidence {
         Evidence {
             table_entries: 68,
@@ -191,6 +224,9 @@ mod tests {
             aliased: vec![],
             skipped: vec![],
             in_flight_at_end: 0,
+            surfaces: vec![ok_surface()],
+            vendor_interfaces: 0,
+            interface_list: "absent".into(),
             completeness: "UNKNOWN",
         }
     }
@@ -209,6 +245,9 @@ mod tests {
             |e: &mut Evidence| e.skipped.push(SkippedOut { name: "C_X".into(), reason: "null pointer".into() }),
             |e: &mut Evidence| e.aliased.push(vec!["C_A".into(), "C_B".into()]),
             |e: &mut Evidence| e.in_flight_at_end = 1,
+            |e: &mut Evidence| e.surfaces[0].walk = "known_prefix".into(),
+            |e: &mut Evidence| e.surfaces[0].acquisition = "error: boom".into(),
+            |e: &mut Evidence| e.vendor_interfaces = 1,
         ] {
             let mut ev = evidence();
             mutate(&mut ev);

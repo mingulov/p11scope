@@ -27,6 +27,10 @@ pub fn apply(ebpf: &mut Ebpf, scope: &Scope) -> Result<()> {
             flags |= FLAG_PID_FILTER;
         }
         Scope::Cgroup(id) => {
+            // Exact-match only: bpf_get_current_cgroup_id() returns the
+            // task's leaf cgroup, so processes living in a *descendant* of
+            // this cgroup are not matched. Ancestor matching is Phase 2
+            // work.
             let mut m: HashMap<_, u64, u8> =
                 HashMap::try_from(ebpf.map_mut("CGROUP_FILTER").context("CGROUP_FILTER map")?)?;
             m.insert(*id, 1, 0)?;

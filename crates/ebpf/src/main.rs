@@ -116,6 +116,11 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
         }
     }
 
+    // CK_RV is CK_ULONG (u64 on LP64) but RvKey.rv is u32, so this narrows.
+    // `errors` above already compares the full u64, so only a pathological
+    // vendor rv > 2^32 could alias in the RV_COUNTS distribution. Left as
+    // u32 to avoid churning the shared kernel/userspace ABI this late;
+    // Phase 2 should widen this key when it reshapes events.
     let rk = RvKey { slot, rv: rv as u32 };
     let prev = unsafe { RV_COUNTS.get(&rk) }.copied().unwrap_or(0);
     let _ = RV_COUNTS.insert(&rk, &(prev + 1), 0);

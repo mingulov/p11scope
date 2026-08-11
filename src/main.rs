@@ -15,7 +15,9 @@ p11scope profile --manifest <m.json> (--pid <n> | --cgroup <path>) [--mode metri
 p11scope discover --module <provider.so> [-o <manifest.json>]\n\n\
 note: no SIGINT handler is installed in this build (no signal-handling\n\
 dependency); Ctrl-C aborts without writing output. Use --duration for a\n\
-clean exit that prints the final frame and (with -o) writes the JSON report.";
+clean exit that prints the final frame and (with -o) writes the JSON report.\n\
+note: --cgroup matches that exact cgroup only, not descendant cgroups; a\n\
+service whose processes live in child cgroups will show zero counts.";
 
 fn main() {
     if let Err(e) = run() {
@@ -131,6 +133,14 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
             manifest_path.display()
         );
     }
+    if plan.slots.len() > p11scope_ebpf_common::MAX_SLOTS as usize {
+        bail!(
+            "attach plan has {} slots, exceeding MAX_SLOTS ({}): BPF would silently drop slots \
+             beyond that limit",
+            plan.slots.len(),
+            p11scope_ebpf_common::MAX_SLOTS
+        );
+    }
 
     let session = Session::start(&plan, &scope).context("starting attach session")?;
     for (idx, msg) in session.attach_failures() {
@@ -153,8 +163,7 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
     }
 
     let reports = metrics::read(&session, &plan)?;
-    let mut ev = evidence_for(&plan, &session, &reports);
-    ev.verdict();
+    let ev = evidence_for(&plan, &session, &reports);
     let frame = render::live(&reports, &ev, clock.elapsed(), &manifest.module_path);
     print!("\x1b[2J\x1b[H{frame}");
     std::io::stdout().flush().ok();
@@ -174,9 +183,10 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
     Ok(())
 }
 
-/// Evidence built from the plan (skips, aliases), the session (attach
-/// failures), and the current reports (in-flight count). `completeness`
-/// starts unset — call `.verdict()` once the reports are final.
+/// Evidence built from the plan (skips, aliases, surface/vendor gaps), the
+/// session (attach failures), and the current reports (in-flight count).
+/// Calls `.verdict()` itself before returning, so callers must not call it
+/// again.
 fn evidence_for(
     plan: &plan::AttachPlan,
     session: &Session,
@@ -194,6 +204,9 @@ fn evidence_for(
             .map(|s| render::SkippedOut { name: s.name.clone(), reason: s.reason.clone() })
             .collect(),
         in_flight_at_end: reports.iter().map(|r| r.in_flight).sum(),
+        surfaces: plan.surfaces.clone(),
+        vendor_interfaces: plan.vendor_interfaces,
+        interface_list: plan.interface_list.clone(),
         completeness: "UNKNOWN",
     };
     ev.verdict();

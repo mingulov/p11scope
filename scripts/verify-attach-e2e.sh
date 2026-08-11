@@ -86,6 +86,9 @@ print("evidence:", ev["attached_probes"], "probes,", ev["completeness"])
 if ev["attached_probes"] == 0:
     print("no probes attached")
     fail = 1
+if ev["completeness"] != "COMPLETE":
+    print(f"completeness: want COMPLETE, got {ev['completeness']!r}")
+    fail = 1
 sys.exit(fail)
 PY
 

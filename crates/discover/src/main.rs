@@ -12,8 +12,20 @@ fn main() {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--module" => module = args.next().map(PathBuf::from),
-            "-o" => out = args.next().map(PathBuf::from),
+            "--module" => match args.next() {
+                Some(v) => module = Some(PathBuf::from(v)),
+                None => {
+                    eprintln!("--module requires a value\n{USAGE}");
+                    std::process::exit(2);
+                }
+            },
+            "-o" => match args.next() {
+                Some(v) => out = Some(PathBuf::from(v)),
+                None => {
+                    eprintln!("-o requires a value\n{USAGE}");
+                    std::process::exit(2);
+                }
+            },
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
                 std::process::exit(0);

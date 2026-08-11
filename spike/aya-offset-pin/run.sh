@@ -1,5 +1,6 @@
 #!/bin/sh -eu
 # Regression pin for aya's uprobe offset semantics (Gate G0 carry-over).
+set -eu
 cd "$(dirname "$0")"
 mkdir -p work
 gcc -no-pie -O0 -o work/target target.c

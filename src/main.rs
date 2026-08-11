@@ -2,6 +2,7 @@
 
 mod attach;
 mod plan;
+mod scope;
 
 /// The BPF object, built by build.rs. Alignment matters: aya parses it
 /// as ELF in place.

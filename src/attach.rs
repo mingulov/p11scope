@@ -23,6 +23,7 @@ pub struct Session {
 impl Session {
     pub fn start(plan: &AttachPlan, scope: &Scope) -> Result<Self> {
         let mut ebpf = Ebpf::load(crate::EBPF_OBJECT).context("loading BPF object")?;
+        crate::scope::apply(&mut ebpf, scope).context("installing scope filter")?;
         let uprobe_scope = match scope {
             Scope::Pid(pid) => UProbeScope::OneProcess(
                 std::num::NonZeroU32::new(*pid).context("pid must be non-zero")?,

@@ -192,7 +192,14 @@ pub struct CallStart {
     /// `phSession` for C_OpenSession; 0 otherwise. Read only at return.
     pub out_ptr: u64,
     pub user_type: u32,
-    pub _pad: u32,
+    /// Parameter shape decoded at entry (Phase 3), or `shape::NONE`.
+    /// Decode happens in `p11_entry` since `pMechanism` is only live then;
+    /// these fields carry the result to the return probe that builds
+    /// `Event`.
+    pub shape: u32,
+    pub p0: u64,
+    pub p1: u64,
+    pub p2: u64,
 }
 
 /// One completed call. Emitted at return only: a call with no return is
@@ -268,8 +275,8 @@ mod tests {
     fn event_and_callstart_have_no_implicit_padding() {
         // Both cross the kernel/userspace boundary as raw bytes; implicit
         // tail padding would read as uninitialized on one side.
-        // CallStart: 4 u64 + 2 u32 = 32 + 8 = 40 bytes (no padding needed)
-        assert_eq!(core::mem::size_of::<CallStart>(), 8 * 4 + 4 + 4);
+        // CallStart: 7 u64 + 2 u32 = 56 + 8 = 64 bytes (no padding needed)
+        assert_eq!(core::mem::size_of::<CallStart>(), 8 * 7 + 4 * 2);
         // Event: 10 u64 + 4 u32 + [u32; 8] + 4 u32 = 80 + 16 + 32 + 16 = 144 bytes
         assert_eq!(core::mem::size_of::<Event>(), 8 * 10 + 4 * 8 + 32);
         assert_eq!(core::mem::align_of::<Event>(), 8);

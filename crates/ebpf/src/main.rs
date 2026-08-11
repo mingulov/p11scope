@@ -12,7 +12,7 @@ use aya_ebpf::{EbpfContext as _, helpers};
 use p11scope_ebpf_common::{
     CFG_FLAGS, CallStart, Event, FLAG_CGROUP_FILTER, FLAG_PID_FILTER, MAX_ATTRS, MAX_MECH_SHAPES,
     MAX_SLOTS, MECH_NONE, RING_BYTES, RvKey, SESSION_NONE, SlotStats, StartKey, USER_TYPE_NONE,
-    bucket_of, fnkind,
+    bucket_of, fnkind, shape,
 };
 
 #[map]
@@ -81,6 +81,54 @@ where
     (unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) }) as u32
 }
 
+/// Decode allowlisted `CK_MECHANISM` parameters for `shape` at `pmech`,
+/// writing the result into `start.shape/p0/p1/p2`. Anything unexpected —
+/// short `ulParameterLen`, null `pParameter`, or any failed read — leaves
+/// `start.shape` at its `shape::NONE` default and `p0/p1/p2` untouched
+/// (they are already zeroed by the caller): partial decodes are never
+/// emitted.
+///
+/// Reads exactly two `CK_MECHANISM` fields (`ulParameterLen` at offset 16,
+/// `pParameter` at offset 8) plus three shape-specific `u64` scalars at
+/// fixed offsets from `pParameter`. For `GCM`, offsets 0 and 16 of
+/// `CK_GCM_PARAMS` are `pIv`/`pAAD` — pointers — and are never read; only
+/// `ulIvLen` (8), `ulAADLen` (24), `ulTagBits` (32) are.
+fn decode_params(pmech: u64, sh: u32, start: &mut CallStart) {
+    let (needed, o0, o1, o2) = match sh {
+        // CK_RSA_PKCS_PSS_PARAMS { hashAlg, mgf, sLen } — three CK_ULONGs.
+        shape::RSA_PKCS_PSS => (24u64, 0u64, 8u64, 16u64),
+        // CK_GCM_PARAMS { pIv, ulIvLen, pAAD, ulAADLen, ulTagBits }.
+        shape::GCM => (40u64, 8u64, 24u64, 32u64),
+        _ => return,
+    };
+    // CK_MECHANISM.ulParameterLen is the third CK_ULONG (offset 16). Guard
+    // first: a provider passing a short buffer must never cause a read
+    // past its end.
+    let Ok(param_len) = (unsafe { helpers::bpf_probe_read_user((pmech + 16) as *const u64) })
+    else {
+        return;
+    };
+    if param_len < needed {
+        return;
+    }
+    // CK_MECHANISM.pParameter is the second CK_ULONG (offset 8).
+    let Ok(pparam) = (unsafe { helpers::bpf_probe_read_user((pmech + 8) as *const u64) }) else {
+        return;
+    };
+    if pparam == 0 {
+        return;
+    }
+    let r0 = unsafe { helpers::bpf_probe_read_user((pparam + o0) as *const u64) };
+    let r1 = unsafe { helpers::bpf_probe_read_user((pparam + o1) as *const u64) };
+    let r2 = unsafe { helpers::bpf_probe_read_user((pparam + o2) as *const u64) };
+    if let (Ok(a), Ok(b), Ok(c)) = (r0, r1, r2) {
+        start.shape = sh;
+        start.p0 = a;
+        start.p1 = b;
+        start.p2 = c;
+    }
+}
+
 #[uprobe]
 pub fn p11_entry(ctx: ProbeContext) -> u32 {
     let slot = slot_of(&ctx);
@@ -103,13 +151,15 @@ pub fn p11_entry(ctx: ProbeContext) -> u32 {
         mechanism: MECH_NONE,
         out_ptr: 0,
         user_type: USER_TYPE_NONE,
-        _pad: 0,
+        shape: shape::NONE,
+        p0: 0,
+        p1: 0,
+        p2: 0,
     };
     match kind {
         fnkind::INIT_WITH_MECH => {
-            // (hSession, pMechanism, [hKey]) — mechanism TYPE only. The
-            // params pointer inside CK_MECHANISM is deliberately not read;
-            // parameter decoding is Phase 3, behind the allowlist.
+            // (hSession, pMechanism, [hKey]) — mechanism TYPE, then (Phase
+            // 3) allowlisted parameters for registry-published shapes only.
             if let Some(sess) = ctx.arg::<u64>(0) {
                 start.session = sess;
             }
@@ -118,6 +168,10 @@ pub fn p11_entry(ctx: ProbeContext) -> u32 {
                     // CK_MECHANISM.mechanism is the first CK_ULONG.
                     if let Ok(m) = unsafe { helpers::bpf_probe_read_user(pmech as *const u64) } {
                         start.mechanism = m;
+                        let sh = unsafe { MECH_SHAPE.get(&m) }.copied().unwrap_or(shape::NONE);
+                        if sh != shape::NONE {
+                            decode_params(pmech, sh, &mut start);
+                        }
                     }
                 }
             }
@@ -211,13 +265,13 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
         session,
         mechanism: start.mechanism,
         rv,
-        p0: 0,
-        p1: 0,
-        p2: 0,
+        p0: start.p0,
+        p1: start.p1,
+        p2: start.p2,
         slot,
         kind: SLOT_KIND.get(slot).copied().unwrap_or(fnkind::OTHER),
         user_type: start.user_type,
-        shape: 0,
+        shape: start.shape,
         attr_types: [0; MAX_ATTRS],
         attr_count: 0,
         attr_total: 0,

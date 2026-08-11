@@ -3,13 +3,14 @@
 //! and must not run vendor constructors in its own address space.
 
 use anyhow::{Result, anyhow};
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::PathBuf;
 use std::process::Command;
 
 pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
     let mut helper: Option<PathBuf> = None;
     let mut forwarded: Vec<String> = Vec::new();
-    let mut it = args.peekable();
+    let mut it = args;
     while let Some(a) = it.next() {
         if a == "--helper" {
             let v = it.next().ok_or_else(|| anyhow!("--helper requires a value"))?;
@@ -24,34 +25,53 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
     }
 
     let mut searched = Vec::new();
-    let path = match helper {
-        Some(p) => {
-            searched.push(p.display().to_string());
-            p.exists().then_some(p)
+    let path = if let Some(p) = helper {
+        // Explicit --helper is authoritative; fail if it doesn't exist.
+        searched.push(p.display().to_string());
+        if !p.exists() {
+            eprintln!(
+                "cannot execute discovery helper; searched: {}",
+                searched.join(", ")
+            );
+            std::process::exit(1);
         }
-        None => {
-            let sibling = std::env::current_exe()
-                .ok()
-                .and_then(|e| e.parent().map(|d| d.join("p11scope-discover")));
-            match sibling {
-                Some(p) => {
-                    searched.push(p.display().to_string());
-                    if p.exists() { Some(p) } else { None }
-                }
-                None => None,
+        p
+    } else {
+        // Without --helper, search: (1) sibling of current_exe(), (2) PATH
+        let sibling = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|d| d.join("p11scope-discover")));
+
+        match sibling {
+            Some(p) if p.exists() => {
+                searched.push(p.display().to_string());
+                p
             }
-        }
-    };
-    let path = match path {
-        Some(p) => p,
-        None => {
-            searched.push("p11scope-discover on PATH".into());
-            PathBuf::from("p11scope-discover")
+            Some(p) => {
+                searched.push(p.display().to_string());
+                searched.push("p11scope-discover on PATH".into());
+                eprintln!(
+                    "cannot execute discovery helper; searched: {}",
+                    searched.join(", ")
+                );
+                std::process::exit(1);
+            }
+            None => {
+                searched.push("p11scope-discover on PATH".into());
+                eprintln!(
+                    "cannot execute discovery helper; searched: {}",
+                    searched.join(", ")
+                );
+                std::process::exit(1);
+            }
         }
     };
 
     let status = Command::new(&path).args(&forwarded).status().map_err(|e| {
         anyhow!("cannot execute discovery helper ({e}); searched: {}", searched.join(", "))
     })?;
-    std::process::exit(status.code().unwrap_or(1));
+    let code = status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+    std::process::exit(code);
 }

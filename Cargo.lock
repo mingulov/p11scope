@@ -112,8 +112,17 @@ version = "0.0.0"
 dependencies = [
  "cryptoki-sys",
  "libloading",
- "object",
+ "p11scope-manifest",
  "pkcs11-module",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p11scope-manifest"
+version = "0.0.0"
+dependencies = [
+ "object",
  "serde",
  "serde_json",
  "sha2",

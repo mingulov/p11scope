@@ -3,10 +3,10 @@
 //! helper is a separate unprivileged short-lived process. It never calls
 //! C_Initialize and never calls C_GetInterface.
 
-use crate::identity;
-use crate::manifest::*;
 use crate::maps;
 use libloading::Library;
+use p11scope_manifest::identity;
+use p11scope_manifest::manifest::*;
 use pkcs11_module::{FnField, Surface, TableSet, function_list, interface_list, read_fn_pointers, tables_for};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

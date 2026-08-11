@@ -3,9 +3,12 @@
 //! build-ID mismatch). GNU build-ID is authoritative; whole-file SHA-256 is
 //! the fallback; a file we cannot read gets an explicit not-reusable state.
 
+#[cfg(feature = "identify")]
 use object::Object as _;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "identify")]
 use sha2::{Digest as _, Sha256};
+#[cfg(feature = "identify")]
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +29,7 @@ pub struct ObjectIdentity {
     pub note: Option<String>,
 }
 
+#[cfg(feature = "identify")]
 pub fn identify(path: &Path) -> ObjectIdentity {
     let data = match std::fs::read(path) {
         Ok(d) => d,
@@ -65,6 +69,7 @@ pub fn identify(path: &Path) -> ObjectIdentity {
     }
 }
 
-pub(crate) fn hex(bytes: &[u8]) -> String {
+#[cfg(feature = "identify")]
+pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

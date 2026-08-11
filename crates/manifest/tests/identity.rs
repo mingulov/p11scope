@@ -1,4 +1,4 @@
-use p11scope_discover::identity::{IdentityKind, identify};
+use p11scope_manifest::identity::{IdentityKind, identify};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

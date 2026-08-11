@@ -9,4 +9,4 @@ description = "Non-interposing PKCS#11 observer on eBPF uprobes (design phase)"
 publish = false
 
 [workspace]
-members = ["crates/discover"]
+members = ["crates/discover", "crates/manifest"]

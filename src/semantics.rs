@@ -15,6 +15,13 @@ pub struct MechStat {
     pub calls: u64,
     pub errors: u64,
     pub buckets: [u64; LATENCY_BUCKETS],
+    pub total_ns: u64,
+    pub max_ns: u64,
+    /// Operation categories (`"sign"`, `"encrypt"`, ...) this mechanism id
+    /// was seen initializing, derived from the `*Init` function name(s)
+    /// at the slot that recorded it. A set, not a scalar: the same
+    /// mechanism id can legally serve more than one operation kind.
+    pub ops: BTreeSet<String>,
 }
 
 /// Per function-name call/error counts, derived from the event stream.
@@ -46,6 +53,25 @@ struct SlotMeta {
     /// True when any name at this slot is a `*Final` call: it still
     /// attributes latency to the active operation, but also ends it.
     is_final: bool,
+    /// Operation categories named by this slot's `*Init` function(s), if
+    /// any — empty for slots that are not `INIT_WITH_MECH`.
+    ops: Vec<String>,
+}
+
+/// Maps a `*Init` function name to the operation category it starts.
+/// Anything not recognized (including non-`*Init` names, reached only if
+/// a caller passes one) is dropped rather than guessed.
+fn op_of_init_name(name: &str) -> Option<&'static str> {
+    match name {
+        "C_DigestInit" => Some("digest"),
+        "C_SignInit" => Some("sign"),
+        "C_VerifyInit" => Some("verify"),
+        "C_EncryptInit" => Some("encrypt"),
+        "C_DecryptInit" => Some("decrypt"),
+        "C_SignRecoverInit" => Some("sign_recover"),
+        "C_VerifyRecoverInit" => Some("verify_recover"),
+        _ => None,
+    }
 }
 
 /// Turns raw `Event`s into pseudonymized, semantic state. Construct once
@@ -92,6 +118,7 @@ impl State {
                 label: slot.names.join("|"),
                 is_close_session: slot.names.iter().any(|n| n == "C_CloseSession"),
                 is_final: slot.names.iter().any(|n| n.ends_with("Final")),
+                ops: slot.names.iter().filter_map(|n| op_of_init_name(n)).map(String::from).collect(),
             });
         }
         Self {
@@ -156,7 +183,12 @@ impl State {
         if ev.mechanism == MECH_NONE {
             return;
         }
-        record_call(self.mechanisms.entry(ev.mechanism).or_default(), ev);
+        let ops = self.slots.get(ev.slot as usize).and_then(|s| s.as_ref()).map(|m| m.ops.clone());
+        let stat = self.mechanisms.entry(ev.mechanism).or_default();
+        record_call(stat, ev);
+        if let Some(ops) = ops {
+            stat.ops.extend(ops);
+        }
         if ev.session != SESSION_NONE {
             self.active_op.insert((pid, ev.session), ev.mechanism);
         }
@@ -227,6 +259,8 @@ fn record_call(stat: &mut MechStat, ev: &Event) {
         stat.errors += 1;
     }
     stat.buckets[bucket_of(ev.duration_ns) as usize] += 1;
+    stat.total_ns += ev.duration_ns;
+    stat.max_ns = stat.max_ns.max(ev.duration_ns);
 }
 
 #[cfg(test)]
@@ -347,6 +381,18 @@ mod tests {
 
         assert_eq!(s.orphan_ops(), 1);
         assert!(s.mechanisms().is_empty(), "an orphan op names no mechanism — never a guess");
+    }
+
+    #[test]
+    fn init_records_op_and_exact_latency_totals() {
+        let mut s = State::new(&test_plan());
+        s.observe(&ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x250, 0, 100)); // C_SignInit, 100ns
+        s.observe(&ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x250, 0, 300)); // C_SignInit again, 300ns
+
+        let m = s.mechanisms().get(&0x250).unwrap();
+        assert_eq!(m.ops.iter().collect::<Vec<_>>(), vec!["sign"]);
+        assert_eq!(m.total_ns, 400);
+        assert_eq!(m.max_ns, 300);
     }
 
     #[test]

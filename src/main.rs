@@ -4,15 +4,17 @@
 
 use anyhow::{Context as _, Result, bail};
 use p11scope::attach::{Scope, Session};
-use p11scope::{discover_cmd, metrics, plan, render, scope, verify};
+use p11scope::{discover_cmd, events, metrics, plan, render, scope, semantics, verify};
 use p11scope_manifest::manifest::{Manifest, SCHEMA};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "usage:\n  \
-p11scope profile --manifest <m.json> (--pid <n> | --cgroup <path>) [--mode metrics] [--duration <secs>] [-o <out.json>]\n  \
+p11scope profile --manifest <m.json> (--pid <n> | --cgroup <path>) [--mode profile|metrics] [--duration <secs>] [-o <out.json>]\n  \
 p11scope discover --module <provider.so> [-o <manifest.json>]\n\n\
+note: --mode defaults to profile (metrics + mechanisms/sessions/logins from\n\
+the event stream); --mode metrics is the lighter, maps-only level.\n\
 note: no SIGINT handler is installed in this build (no signal-handling\n\
 dependency); Ctrl-C aborts without writing output. Use --duration for a\n\
 clean exit that prints the final frame and (with -o) writes the JSON report.\n\
@@ -58,7 +60,7 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
     let mut manifest_path: Option<PathBuf> = None;
     let mut pid: Option<u32> = None;
     let mut cgroup: Option<PathBuf> = None;
-    let mut mode = "metrics".to_string();
+    let mut mode = "profile".to_string();
     let mut duration: Option<u64> = None;
     let mut out: Option<PathBuf> = None;
 
@@ -104,7 +106,7 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
             std::process::exit(2);
         }
     };
-    if mode != "metrics" {
+    if mode != "metrics" && mode != "profile" {
         eprintln!("mode {mode} not implemented in this phase\n{USAGE}");
         std::process::exit(2);
     }
@@ -142,10 +144,20 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
         );
     }
 
-    let session = Session::start(&plan, &scope).context("starting attach session")?;
+    let mut session = Session::start(&plan, &scope).context("starting attach session")?;
     for (idx, msg) in session.attach_failures() {
         eprintln!("attach failed (slot {idx}): {msg}");
     }
+
+    // Only `--mode profile` decodes the event stream; `--mode metrics` never
+    // drains the ring buffer, so it stays the lighter, maps-only level.
+    let mut state = semantics::State::new(&plan);
+    let mut malformed_records: u64 = 0;
+    let drain_events = |session: &mut Session, state: &mut semantics::State| -> Result<u64> {
+        let mut drain = events::Drain::new(&mut session.ebpf)?;
+        drain.poll(|ev| state.observe(&ev));
+        Ok(drain.malformed())
+    };
 
     let wall_start = SystemTime::now();
     let clock = Instant::now();
@@ -154,17 +166,43 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
         if duration.is_some_and(|d| elapsed >= Duration::from_secs(d)) {
             break;
         }
+        let event_loss = if mode == "profile" {
+            malformed_records += drain_events(&mut session, &mut state)?;
+            metrics::lost_events(&session)?
+        } else {
+            0
+        };
         let reports = metrics::read(&session, &plan)?;
-        let ev = evidence_for(&plan, &session, &reports);
-        let frame = render::live(&reports, &ev, elapsed, &manifest.module_path);
+        let ev = evidence_for(
+            &plan,
+            &session,
+            &reports,
+            event_loss,
+            malformed_records,
+            state.orphan_ops(),
+            state.unmatched_closes(),
+        );
+        let frame = render::live(&reports, &ev, elapsed, &manifest.module_path, &mode);
         print!("\x1b[2J\x1b[H{frame}");
         std::io::stdout().flush().ok();
         std::thread::sleep(Duration::from_secs(1));
     }
 
+    if mode == "profile" {
+        malformed_records += drain_events(&mut session, &mut state)?;
+    }
     let reports = metrics::read(&session, &plan)?;
-    let ev = evidence_for(&plan, &session, &reports);
-    let frame = render::live(&reports, &ev, clock.elapsed(), &manifest.module_path);
+    let event_loss = if mode == "profile" { metrics::lost_events(&session)? } else { 0 };
+    let ev = evidence_for(
+        &plan,
+        &session,
+        &reports,
+        event_loss,
+        malformed_records,
+        state.orphan_ops(),
+        state.unmatched_closes(),
+    );
+    let frame = render::live(&reports, &ev, clock.elapsed(), &manifest.module_path, &mode);
     print!("\x1b[2J\x1b[H{frame}");
     std::io::stdout().flush().ok();
 
@@ -175,7 +213,23 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
             .to_string();
         let started = fmt_rfc3339(wall_start);
         let ended = fmt_rfc3339(SystemTime::now());
-        let j = render::json(&reports, &ev, &manifest.module_path, &started, &ended, &kernel);
+        let j = if mode == "profile" {
+            let build_id = manifest
+                .objects
+                .iter()
+                .find(|o| o.path == manifest.module_path)
+                .and_then(|o| o.identity.value.as_deref());
+            let capture = render::CaptureMeta {
+                module: &manifest.module_path,
+                build_id,
+                started: &started,
+                ended: &ended,
+                kernel: &kernel,
+            };
+            render::profile_json(&reports, &ev, &state, &capture)
+        } else {
+            render::json(&reports, &ev, &manifest.module_path, &started, &ended, &kernel)
+        };
         std::fs::write(&out_path, serde_json::to_vec_pretty(&j)?)
             .with_context(|| format!("writing {}", out_path.display()))?;
     }
@@ -184,13 +238,18 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
 }
 
 /// Evidence built from the plan (skips, aliases, surface/vendor gaps), the
-/// session (attach failures), and the current reports (in-flight count).
-/// Calls `.verdict()` itself before returning, so callers must not call it
-/// again.
+/// session (attach failures), the current reports (in-flight count), and
+/// (profile mode only — always 0 in metrics mode) the ring-buffer/semantic
+/// gap counters. Calls `.verdict()` itself before returning, so callers
+/// must not call it again.
 fn evidence_for(
     plan: &plan::AttachPlan,
     session: &Session,
     reports: &[metrics::SlotReport],
+    event_loss: u64,
+    malformed_records: u64,
+    orphan_ops: u64,
+    unmatched_closes: u64,
 ) -> render::Evidence {
     let mut ev = render::Evidence {
         table_entries: plan.entries_seen,
@@ -207,6 +266,10 @@ fn evidence_for(
         surfaces: plan.surfaces.clone(),
         vendor_interfaces: plan.vendor_interfaces,
         interface_list: plan.interface_list.clone(),
+        event_loss,
+        malformed_records,
+        orphan_ops,
+        unmatched_closes,
         completeness: "UNKNOWN",
     };
     ev.verdict();

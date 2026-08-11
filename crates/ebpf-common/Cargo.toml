@@ -9,6 +9,10 @@ publish = false
 [features]
 # Userspace side needs aya's Pod impls; the kernel side must stay no_std.
 user = ["dep:aya"]
+# Shrinks RING_BYTES to force ring-buffer loss on demand (Task 7, gate G2's
+# induced-gap test). Off by default: the default build's RING_BYTES is
+# unchanged.
+small-ring = []
 
 [dependencies]
 aya = { version = "=0.14.0", optional = true }

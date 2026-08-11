@@ -5,6 +5,9 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
 
+[features]
+small-ring = ["p11scope-ebpf-common/small-ring"]
+
 [dependencies]
 aya-ebpf = "=0.2.1"
 p11scope-ebpf-common = { path = "../ebpf-common" }

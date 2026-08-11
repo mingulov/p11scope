@@ -29,6 +29,11 @@ fn main() {
     println!("cargo:rerun-if-changed=crates/ebpf/src");
     println!("cargo:rerun-if-changed=crates/ebpf/Cargo.toml");
     println!("cargo:rerun-if-changed=crates/ebpf-common/src");
+    // Gate G2 induced-gap test (Task 7): forces a tiny RING_BYTES so a high
+    // call rate overflows the ring buffer deliberately. Unset (the default)
+    // leaves the build byte-for-byte identical to before this flag existed.
+    println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_RING");
+    let small_ring = matches!(env::var("P11SCOPE_SMALL_RING").as_deref(), Ok("1") | Ok("true"));
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
@@ -39,18 +44,22 @@ fn main() {
     };
 
     let ebpf_manifest = manifest_dir.join("crates/ebpf/Cargo.toml");
-    let status = Command::new("cargo")
-        .args([
-            "+nightly",
-            "build",
-            "--release",
-            "--target",
-            target,
-            "-Z",
-            "build-std=core",
-            "--manifest-path",
-        ])
-        .arg(&ebpf_manifest)
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "+nightly",
+        "build",
+        "--release",
+        "--target",
+        target,
+        "-Z",
+        "build-std=core",
+        "--manifest-path",
+    ])
+    .arg(&ebpf_manifest);
+    if small_ring {
+        cmd.args(["--features", "small-ring"]);
+    }
+    let status = cmd
         // Cargo sets these for build-script subprocesses to point at the
         // *outer* (stable) toolchain; left alone they'd override `+nightly`
         // on the inner cargo invocation. Same workaround as `aya-build`.

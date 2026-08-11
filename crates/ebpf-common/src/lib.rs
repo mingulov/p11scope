@@ -108,9 +108,14 @@ pub const SESSION_NONE: u64 = u64::MAX;
 pub const USER_TYPE_NONE: u32 = u32::MAX;
 
 /// Ring buffer capacity in bytes. Must be a power of two and page-aligned.
-/// 256 KiB holds ~2700 events; the induced-gap test (Task 7) overrides it
-/// to force loss deliberately.
+/// 256 KiB holds ~2700 events. The `small-ring` feature (off by default;
+/// the default build is unaffected) shrinks this to one page so the
+/// induced-gap test (Task 7, `scripts/verify-induced-gaps.sh`) can force
+/// ring-buffer loss deliberately with a high call rate.
+#[cfg(not(feature = "small-ring"))]
 pub const RING_BYTES: u32 = 256 * 1024;
+#[cfg(feature = "small-ring")]
+pub const RING_BYTES: u32 = 4096;
 
 /// What the entry probe stashes until the matching return. Replaces the
 /// bare timestamp Phase 1b stored.
@@ -188,6 +193,14 @@ mod tests {
     fn ring_bytes_is_page_aligned_power_of_two() {
         assert!(RING_BYTES.is_power_of_two());
         assert_eq!(RING_BYTES % 4096, 0);
+    }
+
+    #[test]
+    fn default_ring_bytes_is_256kib() {
+        // Pins the default so the small-ring override (Cargo feature,
+        // opt-in only) can never change it silently.
+        #[cfg(not(feature = "small-ring"))]
+        assert_eq!(RING_BYTES, 256 * 1024);
     }
 
     #[test]

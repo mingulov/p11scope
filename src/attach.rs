@@ -185,8 +185,37 @@ pub struct Session {
     pub ebpf: Ebpf,
     attach_failures: Vec<(u32, String)>,
     attached: usize,
+    policy: CapturePolicy,
+    fork_attached: bool,
     _config: u64,
     _cgroup_file: Option<std::fs::File>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProducerProgram {
+    UProbe(&'static str),
+    TracePoint(&'static str),
+}
+
+fn detach_producers_with(
+    policy: CapturePolicy,
+    fork_attached: bool,
+    mut detach: impl FnMut(ProducerProgram) -> Result<()>,
+) -> Result<()> {
+    detach(ProducerProgram::UProbe("p11_entry"))?;
+    if policy.uses_unsafe_decoders() {
+        for name in [
+            "p11_entry_template",
+            "p11_entry_template_types",
+            "p11_entry_template_pair",
+        ] {
+            detach(ProducerProgram::UProbe(name))?;
+        }
+    }
+    if fork_attached {
+        detach(ProducerProgram::TracePoint("sched_process_fork"))?;
+    }
+    detach(ProducerProgram::UProbe("p11_return"))
 }
 
 /// Renders `e` and every `.source()` beneath it, joined by `: `. Several
@@ -551,7 +580,8 @@ impl Session {
         publish_and_freeze_template_tail(&mut ebpf, unsafe_enabled)
             .context("publishing and freezing TEMPLATE_TAIL")?;
 
-        if matches!(scope, Scope::Cgroup { .. }) && policy.uses_events() {
+        let fork_attached = matches!(scope, Scope::Cgroup { .. }) && policy.uses_events();
+        if fork_attached {
             let fork: &mut TracePoint = ebpf
                 .program_mut("sched_process_fork")
                 .context("program sched_process_fork missing from object")?
@@ -627,8 +657,41 @@ impl Session {
             ebpf,
             attach_failures,
             attached,
+            policy,
+            fork_attached,
             _config: published_scope.config,
             _cgroup_file: published_scope.cgroup_file,
+        })
+    }
+
+    /// Detach every event/map producer while keeping the maps and ring reader
+    /// available for the terminal drain and stable snapshot. Entry probes go
+    /// first so calls that begin before detach but return later remain visible
+    /// as `in_flight_at_end` once the fork and return probes are removed last.
+    pub fn detach_producers(&mut self) -> Result<()> {
+        let ebpf = &mut self.ebpf;
+        detach_producers_with(self.policy, self.fork_attached, |producer| {
+            match producer {
+                ProducerProgram::UProbe(name) => {
+                    let program: &mut UProbe = ebpf
+                        .program_mut(name)
+                        .with_context(|| format!("program {name} missing during detach"))?
+                        .try_into()?;
+                    program
+                        .unload()
+                        .with_context(|| format!("detaching {name}"))?;
+                }
+                ProducerProgram::TracePoint(name) => {
+                    let program: &mut TracePoint = ebpf
+                        .program_mut(name)
+                        .with_context(|| format!("program {name} missing during detach"))?
+                        .try_into()?;
+                    program
+                        .unload()
+                        .with_context(|| format!("detaching {name}"))?;
+                }
+            }
+            Ok(())
         })
     }
 
@@ -721,6 +784,71 @@ mod policy_output {
 mod tests {
     use super::*;
     use p11scope_ebpf_common::{ARG_NONE, SlotSemantics};
+
+    #[test]
+    fn terminal_quiesce_detaches_every_entry_before_return_and_stops_on_error() {
+        let mut safe = Vec::new();
+        detach_producers_with(CapturePolicy::Allowlisted, false, |producer| {
+            safe.push(producer);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            safe,
+            [
+                ProducerProgram::UProbe("p11_entry"),
+                ProducerProgram::UProbe("p11_return"),
+            ]
+        );
+
+        let mut aggregate = Vec::new();
+        detach_producers_with(CapturePolicy::AggregateOnly, false, |producer| {
+            aggregate.push(producer);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(aggregate, safe);
+
+        let mut unsafe_cgroup = Vec::new();
+        detach_producers_with(CapturePolicy::UnsafeUnvalidatedMetadata, true, |producer| {
+            unsafe_cgroup.push(producer);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            unsafe_cgroup,
+            [
+                ProducerProgram::UProbe("p11_entry"),
+                ProducerProgram::UProbe("p11_entry_template"),
+                ProducerProgram::UProbe("p11_entry_template_types"),
+                ProducerProgram::UProbe("p11_entry_template_pair"),
+                ProducerProgram::TracePoint("sched_process_fork"),
+                ProducerProgram::UProbe("p11_return"),
+            ]
+        );
+
+        let mut attempted = Vec::new();
+        let error = detach_producers_with(
+            CapturePolicy::UnsafeUnvalidatedMetadata,
+            false,
+            |producer| {
+                attempted.push(producer);
+                if producer == ProducerProgram::UProbe("p11_entry_template") {
+                    anyhow::bail!("injected detach failure");
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "injected detach failure");
+        assert_eq!(
+            attempted,
+            [
+                ProducerProgram::UProbe("p11_entry"),
+                ProducerProgram::UProbe("p11_entry_template"),
+            ]
+        );
+    }
 
     #[test]
     fn immutable_map_inventory_covers_every_authorization_input() {

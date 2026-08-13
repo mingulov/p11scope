@@ -466,6 +466,7 @@ fn capture_profile(
         std::thread::sleep(Duration::from_secs(1));
     }
 
+    session.detach_producers()?;
     objects
         .ensure_stable()
         .map_err(anyhow::Error::msg)
@@ -713,9 +714,10 @@ fn capture_trace(
         std::thread::sleep(Duration::from_millis(200));
     }
 
-    // Final drain: catch whatever arrived since the last poll, then report
-    // the closing loss line — a trace that lost events must never end
-    // silently.
+    session.detach_producers()?;
+    // Final drain after detaching every producer: empty the remaining ring,
+    // then report the closing loss line. Calls that had entered but did not
+    // return before detach remain explicit in `in_flight_at_end`.
     malformed_records += drain_trace_events(
         &mut session,
         &mut state,
@@ -989,6 +991,40 @@ mod tests {
     struct FailingWriter {
         kind: std::io::ErrorKind,
         fail_flush: bool,
+    }
+
+    #[test]
+    fn terminal_quiesce_precedes_final_drain_maps_and_evidence() {
+        let source = include_str!("main.rs");
+        let profile = source
+            .split_once("fn capture_profile(")
+            .unwrap()
+            .1
+            .split_once("fn write_json_report(")
+            .unwrap()
+            .0;
+        let profile_detach = profile.rfind("session.detach_producers()?").unwrap();
+        let profile_drain = profile.rfind("drain_events(").unwrap();
+        let profile_maps = profile.rfind("metrics::read(").unwrap();
+        let profile_output = profile.rfind("write_json_report(").unwrap();
+        assert!(profile_detach < profile_drain);
+        assert!(profile_detach < profile_maps);
+        assert!(profile_maps < profile_output);
+
+        let trace = source
+            .split_once("fn capture_trace(")
+            .unwrap()
+            .1
+            .split_once("fn finish_supervised_capture(")
+            .unwrap()
+            .0;
+        let trace_detach = trace.rfind("session.detach_producers()?").unwrap();
+        let trace_drain = trace.rfind("drain_trace_events(").unwrap();
+        let trace_maps = trace.rfind("metrics::read(").unwrap();
+        let trace_evidence = trace.rfind("trace::evidence_line(").unwrap();
+        assert!(trace_detach < trace_drain);
+        assert!(trace_drain < trace_maps);
+        assert!(trace_maps < trace_evidence);
     }
 
     impl Write for FailingWriter {

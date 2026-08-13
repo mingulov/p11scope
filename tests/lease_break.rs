@@ -11,6 +11,12 @@ use std::time::{Duration, Instant};
 
 static FORK_TEST: Mutex<()> = Mutex::new(());
 
+fn protected_tempdir() -> tempfile::TempDir {
+    let directory = tempfile::Builder::new().tempdir().unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    directory
+}
+
 fn spawn_single_threaded(run: impl FnOnce() -> i32) -> libc::pid_t {
     // SAFETY: the child performs the test protocol and terminates with _exit;
     // the parent only receives its pid and waits below.
@@ -71,6 +77,36 @@ fn wait_for_file(path: &Path) {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn wait_for_stopped_process(pid: libc::pid_t) {
+    let status = format!("/proc/{pid}/status");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if std::fs::read_to_string(&status)
+            .is_ok_and(|text| text.lines().any(|line| line.starts_with("State:\tT")))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "process {pid} did not enter stopped state"
+        );
+        std::thread::yield_now();
+    }
+}
+
+fn profile_temp_path(directory: &Path) -> std::path::PathBuf {
+    std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("p11scope")
+        })
+        .expect("same-directory profile temp")
 }
 
 fn wait_for_child(parent: libc::pid_t) -> libc::pid_t {
@@ -276,7 +312,7 @@ fn manifest_for(object: &Path) -> Manifest {
 #[test]
 fn supervisor_refuses_to_fork_a_multithreaded_process() {
     let _serial = FORK_TEST.lock().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = protected_tempdir();
     let object = dir.path().join("leased.so");
     std::fs::copy("/bin/true", &object).unwrap();
     let child_object = object.clone();
@@ -305,7 +341,7 @@ fn supervisor_refuses_to_fork_a_multithreaded_process() {
 #[test]
 fn trace_abort_sink_must_be_a_regular_file() {
     let _serial = FORK_TEST.lock().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = protected_tempdir();
     let sink = dir.path().join("sink");
     std::os::unix::fs::symlink("/dev/null", &sink).unwrap();
 
@@ -323,7 +359,7 @@ fn trace_abort_sink_must_be_a_regular_file() {
 #[test]
 fn real_cli_refuses_preexisting_threads_before_lease_acquisition() {
     let _serial = FORK_TEST.lock().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = protected_tempdir();
     let (provider, manifest, oracle_ran) = build_cli_fixture(dir.path());
     let preload_source = dir.path().join("thread.c");
     let preload = dir.path().join("thread.so");
@@ -365,7 +401,7 @@ fn real_cli_refuses_preexisting_threads_before_lease_acquisition() {
 #[test]
 fn lease_signal_owner_is_the_supervisor_not_the_worker() {
     let _serial = FORK_TEST.lock().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = protected_tempdir();
     let object = dir.path().join("leased.so");
     std::fs::copy("/bin/true", &object).unwrap();
     let child_object = object.clone();
@@ -405,7 +441,7 @@ fn lease_signal_owner_is_the_supervisor_not_the_worker() {
 #[test]
 fn normal_completion_atomically_publishes_profile_output() {
     let _serial = FORK_TEST.lock().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = protected_tempdir();
     let object = dir.path().join("leased.so");
     let profile = dir.path().join("profile.json");
     let worker_pid_path = dir.path().join("worker.pid");
@@ -479,9 +515,77 @@ fn normal_completion_atomically_publishes_profile_output() {
 }
 
 #[test]
+fn substituted_profile_temp_is_never_published_or_removed_as_cleanup() {
+    let _serial = FORK_TEST.lock().unwrap();
+    let dir = protected_tempdir();
+    let object = dir.path().join("leased.so");
+    let profile = dir.path().join("profile.json");
+    let worker_pid_path = dir.path().join("worker.pid");
+    let supervisor_error = dir.path().join("supervisor.error");
+    std::fs::copy("/bin/true", &object).unwrap();
+    let child_object = object.clone();
+    let child_profile = profile.clone();
+    let child_worker_pid_path = worker_pid_path.clone();
+    let child_supervisor_error = supervisor_error.clone();
+
+    let supervisor = spawn_single_threaded(move || {
+        let signals = p11scope::verify::CaptureSignals::block().unwrap();
+        let objects = p11scope::verify::check_reuse(&manifest_for(&child_object)).unwrap();
+        let output = p11scope::verify::SupervisorOutput::profile(Some(child_profile)).unwrap();
+        let result = p11scope::verify::supervise_capture(signals, objects, output, |worker| {
+            worker
+                .output()
+                .unwrap()
+                .write_all(br#"{"trusted":true}"#)
+                .map_err(|error| error.to_string())?;
+            std::fs::write(child_worker_pid_path, std::process::id().to_string())
+                .map_err(|error| error.to_string())?;
+            unsafe { libc::raise(libc::SIGSTOP) };
+            Ok(())
+        });
+        match result {
+            Err(error) => {
+                std::fs::write(child_supervisor_error, &error).unwrap();
+                i32::from(!error.contains("identity"))
+            }
+            Ok(outcome) => finish(outcome),
+        }
+    });
+
+    wait_for_file(&worker_pid_path);
+    let worker: libc::pid_t = std::fs::read_to_string(&worker_pid_path)
+        .unwrap()
+        .parse()
+        .unwrap();
+    wait_for_stopped_process(worker);
+    let temp = profile_temp_path(dir.path());
+    std::fs::remove_file(&temp).unwrap();
+    std::fs::write(&temp, br#"{"attacker":true}"#).unwrap();
+    assert_eq!(unsafe { libc::kill(worker, libc::SIGCONT) }, 0);
+
+    let status = wait_status_bounded(supervisor);
+    assert!(libc::WIFEXITED(status));
+    assert_eq!(libc::WEXITSTATUS(status), 0);
+    assert!(
+        !profile.exists(),
+        "replacement reached the final profile name"
+    );
+    assert_eq!(
+        std::fs::read(&temp).unwrap(),
+        br#"{"attacker":true}"#,
+        "cleanup removed or changed the substituted entry"
+    );
+    assert!(
+        std::fs::read_to_string(supervisor_error)
+            .unwrap()
+            .contains("identity")
+    );
+}
+
+#[test]
 fn abnormal_completion_removes_the_profile_temp_and_preserves_exit_status() {
     let _serial = FORK_TEST.lock().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = protected_tempdir();
     let object = dir.path().join("leased.so");
     let profile = dir.path().join("profile.json");
     std::fs::copy("/bin/true", &object).unwrap();
@@ -520,7 +624,7 @@ fn abnormal_completion_removes_the_profile_temp_and_preserves_exit_status() {
 #[test]
 fn worker_panic_removes_the_profile_temp_and_exits_101() {
     let _serial = FORK_TEST.lock().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = protected_tempdir();
     let object = dir.path().join("leased.so");
     let profile = dir.path().join("profile.json");
     std::fs::copy("/bin/true", &object).unwrap();
@@ -554,7 +658,7 @@ fn worker_panic_removes_the_profile_temp_and_exits_101() {
 #[test]
 fn externally_killed_worker_releases_lease_cleans_profile_and_mirrors_sigkill() {
     let _serial = FORK_TEST.lock().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = protected_tempdir();
     let object = dir.path().join("leased.so");
     let profile = dir.path().join("profile.json");
     let worker_pid_path = dir.path().join("worker.pid");
@@ -643,7 +747,7 @@ fn externally_killed_worker_releases_lease_cleans_profile_and_mirrors_sigkill() 
 #[test]
 fn failed_worker_that_stops_is_killed_before_leases_are_released() {
     let _serial = FORK_TEST.lock().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = protected_tempdir();
     let object = dir.path().join("leased.so");
     let profile = dir.path().join("profile.json");
     let worker_pid_path = dir.path().join("worker.pid");
@@ -705,7 +809,7 @@ fn failed_worker_that_stops_is_killed_before_leases_are_released() {
 #[test]
 fn lease_break_kills_a_stopped_worker_before_the_writer_and_records_abort() {
     let _serial = FORK_TEST.lock().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = protected_tempdir();
     let object = dir.path().join("leased.so");
     let worker_pid_path = dir.path().join("worker.pid");
     let writer_result = dir.path().join("writer.result");
@@ -789,7 +893,7 @@ fn lease_break_kills_a_stopped_worker_before_the_writer_and_records_abort() {
 #[test]
 fn pending_break_at_start_barrier_never_enters_capture_worker() {
     let _serial = FORK_TEST.lock().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = protected_tempdir();
     let object = dir.path().join("leased.so");
     let leased = dir.path().join("leased");
     let worker_started = dir.path().join("worker-started");
@@ -855,7 +959,7 @@ fn pending_break_at_start_barrier_never_enters_capture_worker() {
 #[test]
 fn supervisor_death_kills_a_worker_blocked_in_output_and_releases_its_lease() {
     let _serial = FORK_TEST.lock().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = protected_tempdir();
     let object = dir.path().join("leased.so");
     let worker_pid_path = dir.path().join("worker.pid");
     let trace = dir.path().join("trace.log");
@@ -926,7 +1030,7 @@ fn supervisor_death_kills_a_worker_blocked_in_output_and_releases_its_lease() {
 #[test]
 fn parent_death_setup_race_cannot_leave_an_orphan_worker() {
     let _serial = FORK_TEST.lock().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = protected_tempdir();
     let object = dir.path().join("leased.so");
     std::fs::copy("/bin/true", &object).unwrap();
 
@@ -963,7 +1067,7 @@ fn parent_death_setup_race_cannot_leave_an_orphan_worker() {
 #[test]
 fn sigint_stops_the_worker_cleanly_and_preserves_normal_status() {
     let _serial = FORK_TEST.lock().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = protected_tempdir();
     let object = dir.path().join("leased.so");
     let ready = dir.path().join("ready");
     std::fs::copy("/bin/true", &object).unwrap();
@@ -999,7 +1103,7 @@ fn sigint_stops_the_worker_cleanly_and_preserves_normal_status() {
 #[test]
 fn sigterm_preserves_terminating_signal_status() {
     let _serial = FORK_TEST.lock().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = protected_tempdir();
     let object = dir.path().join("leased.so");
     let ready = dir.path().join("ready");
     std::fs::copy("/bin/true", &object).unwrap();
@@ -1032,7 +1136,7 @@ fn sigterm_preserves_terminating_signal_status() {
 #[test]
 fn sigterm_ignored_by_the_original_process_is_reset_for_the_worker() {
     let _serial = FORK_TEST.lock().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = protected_tempdir();
     let object = dir.path().join("leased.so");
     let ready = dir.path().join("ready");
     std::fs::copy("/bin/true", &object).unwrap();
@@ -1066,7 +1170,7 @@ fn sigterm_ignored_by_the_original_process_is_reset_for_the_worker() {
 #[test]
 fn sigterm_blocked_by_the_original_process_is_unblocked_when_mirrored() {
     let _serial = FORK_TEST.lock().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = protected_tempdir();
     let object = dir.path().join("leased.so");
     let ready = dir.path().join("ready");
     std::fs::copy("/bin/true", &object).unwrap();

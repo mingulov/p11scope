@@ -9,9 +9,11 @@ use p11scope_manifest::identity::{
 use p11scope_manifest::manifest::*;
 use pkcs11_module::{Surface, TableSet, tables_for};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{CString, OsStr};
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -216,62 +218,144 @@ impl SupervisorOutput {
 }
 
 fn open_trace_output(path: PathBuf) -> Result<std::fs::File, String> {
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(&path)
-        .map_err(|error| {
+    let path = normalize_output_path(path)?;
+    let directory_path = path
+        .parent()
+        .ok_or_else(|| format!("trace output {} has no parent", path.display()))?;
+    let directory = open_protected_directory(directory_path)?;
+    let name = c_name(
+        path.file_name()
+            .ok_or_else(|| format!("trace output {} has no file name", path.display()))?,
+        "trace output file name",
+    )?;
+    let file = openat_trace(&directory, &name).map_err(|error| {
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            format!("trace output {} is not a regular file", path.display())
+        } else {
             format!(
                 "opening regular trace output {} failed: {error}",
                 path.display()
             )
-        })?;
-    if !file
+        }
+    })?;
+    let metadata = file
         .metadata()
-        .map_err(|error| format!("checking {}: {error}", path.display()))?
-        .is_file()
-    {
+        .map_err(|error| format!("checking {}: {error}", path.display()))?;
+    let current = unsafe { libc::geteuid() };
+    if metadata.uid() != current || metadata.mode() & 0o022 != 0 {
+        return Err(format!(
+            "trace output {} must be owned by current euid {current} and not group/other writable (uid {}, mode {:#o})",
+            path.display(),
+            metadata.uid(),
+            metadata.mode() & 0o7777,
+        ));
+    }
+    if !metadata.is_file() {
         return Err(format!(
             "trace output {} is not a regular file",
             path.display()
         ));
     }
+    file.set_len(0).map_err(|error| {
+        format!(
+            "truncating regular trace output {} failed: {error}",
+            path.display()
+        )
+    })?;
     Ok(file)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+struct AtMetadata {
+    mode: u32,
+    owner: u32,
+    identity: FileIdentity,
+}
+
+impl AtMetadata {
+    fn is_file(&self) -> bool {
+        self.mode & libc::S_IFMT == libc::S_IFREG
+    }
+
+    fn is_symlink(&self) -> bool {
+        self.mode & libc::S_IFMT == libc::S_IFLNK
+    }
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
 struct PendingProfile {
-    temp: PathBuf,
+    directory: std::fs::File,
+    temp_file: std::fs::File,
+    temp_name: CString,
+    final_name: CString,
     final_path: PathBuf,
+    identity: FileIdentity,
     cleanup: bool,
 }
 
 impl PendingProfile {
     fn create(final_path: PathBuf) -> Result<(std::fs::File, Self), String> {
-        let directory = final_path.parent().unwrap_or_else(|| Path::new("."));
-        let name = final_path
+        let final_path = normalize_output_path(final_path)?;
+        let directory_path = final_path
+            .parent()
+            .ok_or_else(|| format!("profile output {} has no parent", final_path.display()))?;
+        let directory = open_protected_directory(directory_path)?;
+        let final_name = final_path
             .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("profile");
+            .ok_or_else(|| format!("profile output {} has no file name", final_path.display()))?;
+        let final_name = c_name(final_name, "profile output file name")?;
         for sequence in 0..128u32 {
-            let temp = directory.join(format!(
-                ".{name}.p11scope.{}.{}.tmp",
-                std::process::id(),
-                sequence
-            ));
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temp)
-            {
+            let temp_name =
+                CString::new(format!(".p11scope.{}.{}.tmp", std::process::id(), sequence))
+                    .expect("generated temporary profile name has no NUL");
+            match openat_profile(&directory, &temp_name) {
                 Ok(file) => {
+                    let metadata = file.metadata().map_err(|error| {
+                        format!(
+                            "checking temporary profile beside {} failed: {error}",
+                            final_path.display()
+                        )
+                    })?;
+                    if !metadata.is_file() {
+                        let _ = unlinkat(&directory, &temp_name);
+                        return Err(format!(
+                            "temporary profile beside {} is not a regular file",
+                            final_path.display()
+                        ));
+                    }
+                    let identity = FileIdentity::from_metadata(&metadata);
+                    let temp_file = match file.try_clone() {
+                        Ok(temp_file) => temp_file,
+                        Err(error) => {
+                            let _ = unlinkat(&directory, &temp_name);
+                            return Err(format!(
+                                "retaining temporary profile beside {} failed: {error}",
+                                final_path.display()
+                            ));
+                        }
+                    };
                     return Ok((
                         file,
                         Self {
-                            temp,
+                            directory,
+                            temp_file,
+                            temp_name,
+                            final_name,
                             final_path,
+                            identity,
                             cleanup: true,
                         },
                     ));
@@ -296,7 +380,14 @@ impl PendingProfile {
     }
 
     fn publish(mut self) -> Result<(), String> {
-        std::fs::rename(&self.temp, &self.final_path).map_err(|error| {
+        self.verify_temp_identity()?;
+        renameat(
+            &self.directory,
+            &self.temp_name,
+            &self.directory,
+            &self.final_name,
+        )
+        .map_err(|error| {
             format!(
                 "publishing profile {} failed: {error}",
                 self.final_path.display()
@@ -305,13 +396,256 @@ impl PendingProfile {
         self.cleanup = false;
         Ok(())
     }
+
+    fn verify_temp_identity(&self) -> Result<(), String> {
+        let metadata = metadata_at(&self.directory, &self.temp_name).map_err(|error| {
+            format!(
+                "temporary profile identity check for {} failed: {error}",
+                self.final_path.display()
+            )
+        })?;
+        let current = unsafe { libc::geteuid() };
+        if !metadata.is_file()
+            || metadata.identity != self.identity
+            || metadata.owner != current
+            || metadata.mode & 0o077 != 0
+        {
+            return Err(format!(
+                "temporary profile identity/owner/mode for {} does not match the retained private regular file",
+                self.final_path.display()
+            ));
+        }
+        let held = self.temp_file.metadata().map_err(|error| {
+            format!(
+                "checking retained temporary profile for {} failed: {error}",
+                self.final_path.display()
+            )
+        })?;
+        if !held.is_file()
+            || FileIdentity::from_metadata(&held) != self.identity
+            || held.uid() != current
+            || held.mode() & 0o077 != 0
+        {
+            return Err(format!(
+                "retained temporary profile identity/owner/mode for {} changed",
+                self.final_path.display()
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for PendingProfile {
     fn drop(&mut self) {
-        if self.cleanup {
-            let _ = std::fs::remove_file(&self.temp);
+        if self.cleanup
+            && metadata_at(&self.directory, &self.temp_name).is_ok_and(|metadata| {
+                metadata.is_file()
+                    && metadata.identity == self.identity
+                    && metadata.owner == unsafe { libc::geteuid() }
+                    && metadata.mode & 0o077 == 0
+            })
+        {
+            let _ = unlinkat(&self.directory, &self.temp_name);
         }
+    }
+}
+
+fn normalize_output_path(path: PathBuf) -> Result<PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("resolving relative profile output failed: {error}"))?
+            .join(path)
+    };
+    let mut normalized = PathBuf::from("/");
+    for component in absolute.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(name) => normalized.push(name),
+            std::path::Component::ParentDir => {
+                return Err("profile output must not contain a .. parent component".into());
+            }
+            std::path::Component::Prefix(_) => {
+                return Err("profile output uses an unsupported path prefix".into());
+            }
+        }
+    }
+    if normalized.file_name().is_none() {
+        return Err(format!(
+            "profile output {} has no file name",
+            normalized.display()
+        ));
+    }
+    Ok(normalized)
+}
+
+fn c_name(name: &OsStr, label: &str) -> Result<CString, String> {
+    CString::new(name.as_bytes()).map_err(|_| format!("{label} contains a NUL byte"))
+}
+
+fn open_protected_directory(path: &Path) -> Result<std::fs::File, String> {
+    debug_assert!(path.is_absolute());
+    let root = c_name(OsStr::new("/"), "filesystem root")?;
+    let mut directory = openat_directory(libc::AT_FDCWD, &root, Path::new("/"))?;
+    validate_protected_directory(&directory, Path::new("/"), path == Path::new("/"))?;
+    let mut walked = PathBuf::from("/");
+    let components = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for (index, name) in components.iter().enumerate() {
+        walked.push(name);
+        let name = c_name(name, "profile output directory component")?;
+        if symlink_at(&directory, &name)? {
+            return Err(format!(
+                "profile output directory {} contains a symlink component",
+                walked.display()
+            ));
+        }
+        directory = openat_directory(directory.as_raw_fd(), &name, &walked)?;
+        validate_protected_directory(&directory, &walked, index + 1 == components.len())?;
+    }
+    Ok(directory)
+}
+
+fn validate_protected_directory(
+    file: &std::fs::File,
+    path: &Path,
+    final_parent: bool,
+) -> Result<(), String> {
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "checking profile output directory {} failed: {error}",
+            path.display()
+        )
+    })?;
+    let owner = metadata.uid();
+    let current = unsafe { libc::geteuid() };
+    let mode = metadata.mode();
+    if (owner != 0 && owner != current)
+        || (mode & 0o022 != 0 && (final_parent || mode & libc::S_ISVTX == 0))
+    {
+        return Err(format!(
+            "profile output directory {} is not protected (uid {owner}, euid {current}, mode {:#o}): every parent must be owned by root/current euid, writable ancestors require sticky semantics, and the final parent must not be group/world writable",
+            path.display(),
+            mode & 0o7777,
+        ));
+    }
+    Ok(())
+}
+
+fn openat_directory(
+    parent: libc::c_int,
+    name: &CString,
+    path: &Path,
+) -> Result<std::fs::File, String> {
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd == -1 {
+        return Err(format!(
+            "opening protected profile output directory {} failed: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+fn openat_profile(directory: &std::fs::File, name: &CString) -> std::io::Result<std::fs::File> {
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+}
+
+fn openat_trace(directory: &std::fs::File, name: &CString) -> std::io::Result<std::fs::File> {
+    let flags =
+        libc::O_WRONLY | libc::O_CREAT | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+    if fd == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+}
+
+fn metadata_at(directory: &std::fs::File, name: &CString) -> std::io::Result<AtMetadata> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == -1
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(AtMetadata {
+        mode: stat.st_mode,
+        owner: stat.st_uid,
+        identity: FileIdentity {
+            device: stat.st_dev,
+            inode: stat.st_ino,
+        },
+    })
+}
+
+fn symlink_at(directory: &std::fs::File, name: &CString) -> Result<bool, String> {
+    match metadata_at(directory, name) {
+        Ok(metadata) => Ok(metadata.is_symlink()),
+        Err(error) => Err(format!(
+            "checking profile output directory component failed: {error}"
+        )),
+    }
+}
+
+fn renameat(
+    old_directory: &std::fs::File,
+    old_name: &CString,
+    new_directory: &std::fs::File,
+    new_name: &CString,
+) -> std::io::Result<()> {
+    if unsafe {
+        libc::renameat(
+            old_directory.as_raw_fd(),
+            old_name.as_ptr(),
+            new_directory.as_raw_fd(),
+            new_name.as_ptr(),
+        )
+    } == -1
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn unlinkat(directory: &std::fs::File, name: &CString) -> std::io::Result<()> {
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -2025,4 +2359,158 @@ pub fn check_reuse(m: &Manifest) -> Result<VerifiedObjects, Vec<String>> {
         identities,
         lease,
     })
+}
+
+#[cfg(test)]
+mod profile_publication {
+    use super::{PendingProfile, open_trace_output};
+    use std::io::Write as _;
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+    use std::path::{Path, PathBuf};
+
+    fn protected_tempdir() -> tempfile::TempDir {
+        let directory = tempfile::Builder::new().tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
+
+    fn temporary_path(directory: &Path) -> PathBuf {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("p11scope")
+            })
+            .expect("temporary profile")
+    }
+
+    #[test]
+    fn protected_profile_directory_rejects_unprotected_and_symlinked_parents() {
+        let root = protected_tempdir();
+        let unprotected = root.path().join("unprotected");
+        std::fs::create_dir(&unprotected).unwrap();
+        std::fs::set_permissions(&unprotected, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = match PendingProfile::create(unprotected.join("profile.json")) {
+            Err(error) => error,
+            Ok(_) => panic!("unprotected parent was accepted"),
+        };
+        assert!(error.contains("not protected"), "{error}");
+
+        let protected = root.path().join("protected");
+        let linked = root.path().join("linked");
+        std::fs::create_dir(&protected).unwrap();
+        std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&protected, &linked).unwrap();
+        let error = match PendingProfile::create(linked.join("profile.json")) {
+            Err(error) => error,
+            Ok(_) => panic!("symlinked parent was accepted"),
+        };
+        assert!(error.contains("symlink"), "{error}");
+
+        let error = match PendingProfile::create(protected.join("child/../profile.json")) {
+            Err(error) => error,
+            Ok(_) => panic!("parent traversal was accepted"),
+        };
+        assert!(error.contains(".."), "{error}");
+    }
+
+    #[test]
+    fn direct_sticky_parent_is_rejected_but_a_protected_child_is_allowed() {
+        let final_path = PathBuf::from(format!(
+            "/tmp/.p11scope-sticky-parent-test-{}",
+            std::process::id()
+        ));
+        let error = match PendingProfile::create(final_path) {
+            Err(error) => error,
+            Ok(_) => panic!("writable sticky directory was accepted as the final parent"),
+        };
+        assert!(error.contains("final parent"), "{error}");
+
+        let protected = protected_tempdir();
+        let (_worker, pending) =
+            PendingProfile::create(protected.path().join("profile.json")).unwrap();
+        drop(pending);
+    }
+
+    #[test]
+    fn exact_temp_identity_is_required_and_replacement_is_not_removed() {
+        let root = protected_tempdir();
+        let final_path = root.path().join("profile.json");
+        let (mut worker, pending) = PendingProfile::create(final_path.clone()).unwrap();
+        worker.write_all(br#"{"trusted":true}"#).unwrap();
+        let temp = temporary_path(root.path());
+        std::fs::remove_file(&temp).unwrap();
+        std::fs::write(&temp, br#"{"attacker":true}"#).unwrap();
+
+        let error = pending.publish().unwrap_err();
+        assert!(error.contains("identity"), "{error}");
+        assert!(!final_path.exists());
+        assert_eq!(std::fs::read(&temp).unwrap(), br#"{"attacker":true}"#);
+    }
+
+    #[test]
+    fn temp_mode_change_fails_closed_before_publication() {
+        let root = protected_tempdir();
+        let final_path = root.path().join("profile.json");
+        let (_worker, pending) = PendingProfile::create(final_path.clone()).unwrap();
+        let temp = temporary_path(root.path());
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let error = pending.publish().unwrap_err();
+        assert!(error.contains("owner/mode"), "{error}");
+        assert!(!final_path.exists());
+    }
+
+    #[test]
+    fn retained_directory_fd_survives_parent_path_retarget() {
+        let root = protected_tempdir();
+        let original = root.path().join("original");
+        let moved = root.path().join("moved");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let final_path = original.join("profile.json");
+        let (mut worker, pending) = PendingProfile::create(final_path.clone()).unwrap();
+        worker.write_all(br#"{"complete":true}"#).unwrap();
+
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        pending.publish().unwrap();
+
+        assert!(!final_path.exists());
+        assert_eq!(
+            std::fs::read(moved.join("profile.json")).unwrap(),
+            br#"{"complete":true}"#
+        );
+    }
+
+    #[test]
+    fn exact_temp_inode_publishes_normally() {
+        let root = protected_tempdir();
+        let final_path = root.path().join("profile.json");
+        let (mut worker, pending) = PendingProfile::create(final_path.clone()).unwrap();
+        worker.write_all(br#"{"complete":true}"#).unwrap();
+        pending.publish().unwrap();
+        assert_eq!(std::fs::read(final_path).unwrap(), br#"{"complete":true}"#);
+    }
+
+    #[test]
+    fn trace_output_uses_the_same_protected_no_symlink_parent_contract() {
+        let root = protected_tempdir();
+        let trace = root.path().join("trace.log");
+        open_trace_output(trace).unwrap();
+
+        let unprotected = root.path().join("unprotected");
+        std::fs::create_dir(&unprotected).unwrap();
+        std::fs::set_permissions(&unprotected, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = open_trace_output(unprotected.join("trace.log")).unwrap_err();
+        assert!(error.contains("not protected"), "{error}");
+
+        let linked = root.path().join("linked");
+        symlink(root.path(), &linked).unwrap();
+        let error = open_trace_output(linked.join("trace.log")).unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+    }
 }

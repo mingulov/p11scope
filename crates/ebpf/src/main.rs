@@ -7,21 +7,25 @@
 
 use aya_ebpf::macros::{map, tracepoint, uprobe, uretprobe};
 use aya_ebpf::bindings::BPF_F_RDONLY_PROG;
-use aya_ebpf::maps::{
-    Array, CgroupArray, HashMap, PerCpuArray, PerCpuHashMap, ProgramArray, RingBuf,
-};
+use aya_ebpf::maps::{Array, CgroupArray, HashMap, PerCpuArray, PerCpuHashMap, RingBuf};
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+use aya_ebpf::maps::ProgramArray;
 use aya_ebpf::programs::{ProbeContext, RetProbeContext, TracePointContext};
 use aya_ebpf::helpers;
 use core::mem::MaybeUninit;
 use p11scope_ebpf_common::{
     ARG_NONE, CFG_FLAGS, CallStart, EVIDENCE_CELLS, EVIDENCE_CGROUP_SCOPE_FAILURES,
     EVIDENCE_RING_LOSS, EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
-    EVIDENCE_START_INSERT_FAILURES, EVIDENCE_TEMPLATE_TAIL_FAILURES,
-    EVIDENCE_UNMATCHED_RETURNS, Event, FLAG_CGROUP_FILTER, FLAG_PID_FILTER,
-    FUNCTION_HASH_OFFSET, FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, MAX_ATTRS, MAX_MECH_SHAPES,
-    MAX_SLOTS, MECH_NONE, RING_BYTES, RV_ENTRIES, RvKey, SESSION_NONE, START_ENTRIES,
-    SlotSemantics, SlotStats, StartKey, USER_TYPE_NONE, bucket_of, capture, event_type,
-    function_hash_step, lifecycle, shape, valid_config,
+    EVIDENCE_START_INSERT_FAILURES, EVIDENCE_UNMATCHED_RETURNS,
+    EVIDENCE_UNREGISTERED_MECHANISMS, Event, FLAG_CGROUP_FILTER, FLAG_PID_FILTER,
+    FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED, FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE,
+    FunctionNameKey, MAX_ATTRS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, RING_BYTES, RV_ENTRIES,
+    RvKey, SESSION_NONE, START_ENTRIES, SlotSemantics, SlotStats, StartKey, USER_TYPE_NONE,
+    bucket_of, capture, event_type, lifecycle, return_allows_mechanism, shape, valid_config,
+};
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+use p11scope_ebpf_common::{
+    EVIDENCE_TEMPLATE_TAIL_FAILURES, FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
 };
 
 #[map]
@@ -56,16 +60,19 @@ static MECH_SHAPE: HashMap<u64, u32> =
 /// Attribute type -> allowlisted boolean mask. Keeping the catalog in a map
 /// avoids multiplying verifier states by eleven match arms for every one of
 /// the bounded template entries.
+#[cfg(feature = "unsafe-unvalidated-metadata")]
 #[map]
 static ATTR_BOOL_BITS: HashMap<u32, u32> = HashMap::with_max_entries(16, BPF_F_RDONLY_PROG);
 
+#[cfg(feature = "unsafe-unvalidated-metadata")]
 #[map]
 static TEMPLATE_TAIL: ProgramArray = ProgramArray::with_max_entries(1, 0);
 
-/// FNV hash of an exact standard function name -> stable shared-table id.
-/// Raw `pFunctionName` bytes never leave the BPF stack.
+/// Exact bounded standard function name -> stable shared-table id. Raw
+/// `pFunctionName` bytes never leave the BPF stack.
 #[map]
-static ASYNC_FUNCTIONS: HashMap<u64, u32> = HashMap::with_max_entries(128, BPF_F_RDONLY_PROG);
+static ASYNC_FUNCTIONS: HashMap<FunctionNameKey, u32> =
+    HashMap::with_max_entries(128, BPF_F_RDONLY_PROG);
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(RING_BYTES, 0);
@@ -82,27 +89,28 @@ fn bump_evidence(index: u32) {
     }
 }
 
-fn in_scope() -> bool {
+fn scope_flags() -> Option<u64> {
     let flags = CONFIG.get(CFG_FLAGS).copied().unwrap_or(0);
     if !valid_config(flags) {
-        return false;
+        return None;
     }
     if flags & FLAG_PID_FILTER != 0 {
         let tgid = (helpers::bpf_get_current_pid_tgid() >> 32) as u32;
         if unsafe { PID_FILTER.get(&tgid) }.is_some() {
-            return true;
+            return Some(flags);
         }
     }
     if flags & FLAG_CGROUP_FILTER != 0 {
         match CGROUP_FILTER.current_task_under_cgroup(0) {
-            Ok(matches) => return matches,
+            Ok(true) => return Some(flags),
+            Ok(false) => return None,
             Err(_) => {
                 bump_evidence(EVIDENCE_CGROUP_SCOPE_FAILURES);
-                return false;
+                return None;
             }
         }
     }
-    false
+    None
 }
 
 fn slot_of<C>(ctx: &C) -> u32
@@ -135,6 +143,8 @@ where
 /// fixed offsets from `pParameter`. For GCM, `pIv`/`pAAD` — pointers, at
 /// offset 0 always and offset 16 or 24 depending on layout — are never
 /// read; only the three length/count scalars are.
+#[cfg(feature = "unsafe-unvalidated-metadata")]
+#[inline(never)]
 fn decode_params(pmech: u64, sh: u32, start: &mut CallStart) {
     // CK_MECHANISM.ulParameterLen is the third CK_ULONG (offset 16). Read
     // first: which offsets (if any) apply depends on it.
@@ -205,6 +215,7 @@ fn decode_params(pmech: u64, sh: u32, start: &mut CallStart) {
 /// including a bad `pTemplate` itself — stops the walk immediately;
 /// entries already captured are kept, nothing is skipped ahead or guessed.
 #[inline(never)]
+#[cfg(feature = "unsafe-unvalidated-metadata")]
 fn walk_template<const TYPES_ONLY: bool, const SECOND: bool>(
     ptemplate: u64,
     count: u64,
@@ -350,21 +361,23 @@ fn capture_async_target(ctx: &ProbeContext, index: u8, start: &mut CallStart) {
             pointer as *const core::ffi::c_void,
         )
     };
-    if read <= 1 || read > (FUNCTION_NAME_MAX_BYTES + 1) as _ {
+    if read <= 0 || read > (FUNCTION_NAME_MAX_BYTES + 1) as _ {
         capture_failure(start);
         return;
     }
     let len = (read - 1) as usize;
     let name = name.as_ptr().cast::<u8>();
-    let mut hash = FUNCTION_HASH_OFFSET;
+    let mut key = FunctionNameKey {
+        len: len as u32,
+        ..FunctionNameKey::default()
+    };
     for offset in 0..FUNCTION_NAME_MAX_BYTES {
         if offset >= len {
             break;
         }
-        hash = function_hash_step(hash, unsafe { name.add(offset).read() });
+        key.bytes[offset] = unsafe { name.add(offset).read() };
     }
-    hash = function_hash_step(hash, len as u8);
-    match unsafe { ASYNC_FUNCTIONS.get(&hash) }.copied() {
+    match unsafe { ASYNC_FUNCTIONS.get(&key) }.copied() {
         Some(id) => start.target_function = id,
         None => capture_failure(start),
     }
@@ -375,25 +388,32 @@ pub fn p11_entry(ctx: ProbeContext) -> u32 {
     p11_entry_impl::<0>(ctx)
 }
 
+#[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_template(ctx: ProbeContext) -> u32 {
     p11_entry_impl::<1>(ctx)
 }
 
+#[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_template_types(ctx: ProbeContext) -> u32 {
     p11_entry_impl::<2>(ctx)
 }
 
+#[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_template_pair(ctx: ProbeContext) -> u32 {
     p11_entry_impl::<3>(ctx)
 }
 
+#[cfg(feature = "unsafe-unvalidated-metadata")]
 #[uprobe]
 pub fn p11_entry_template_second(ctx: ProbeContext) -> u32 {
     let slot = slot_of(&ctx);
-    if slot >= MAX_SLOTS {
+    let Some(flags) = scope_flags() else {
+        return 0;
+    };
+    if slot >= MAX_SLOTS || flags & FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA == 0 {
         return 0;
     }
     let key = StartKey {
@@ -420,18 +440,48 @@ pub fn p11_entry_template_second(ctx: ProbeContext) -> u32 {
     0
 }
 
+fn store_start(key: &StartKey, start: &CallStart) -> bool {
+    if START
+        .insert(key, start, aya_ebpf::bindings::BPF_NOEXIST as u64)
+        .is_ok()
+    {
+        return true;
+    }
+    // A same-thread/same-slot ambiguous nested call makes both returns
+    // untrustworthy. Invalidate the outer record so neither return can
+    // combine entry state from one invocation with the other.
+    let _ = START.remove(key);
+    bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+    false
+}
+
+fn record_aggregate_start(key: &StartKey) {
+    let start = CallStart {
+        ts_ns: unsafe { helpers::bpf_ktime_get_ns() },
+        ..CallStart::default()
+    };
+    let _ = store_start(key, &start);
+}
+
 #[inline(always)]
 fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {
     let slot = slot_of(&ctx);
-    if slot >= MAX_SLOTS || !in_scope() {
+    if slot >= MAX_SLOTS {
         return 0;
     }
+    let Some(flags) = scope_flags() else {
+        return 0;
+    };
     if let Some(stats) = STATS.get_ptr_mut(slot) {
         // SAFETY: PerCpuArray gives this CPU exclusive access to its own
         // copy; there is no cross-CPU aliasing to race with.
         unsafe { (*stats).entered += 1 };
     }
     let key = StartKey { pid_tgid: helpers::bpf_get_current_pid_tgid(), slot, _pad: 0 };
+    if flags & FLAG_POLICY_AGGREGATE != 0 {
+        record_aggregate_start(&key);
+        return 0;
+    }
     let semantics = SLOT_SEMANTICS.get(slot).copied().unwrap_or(SlotSemantics::COUNT_ONLY);
     let mut start = CallStart {
         ts_ns: unsafe { helpers::bpf_ktime_get_ns() },
@@ -488,25 +538,30 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {
                 start.capture =
                     (start.capture & !capture::MECHANISM_MASK) | capture::MECHANISM_NULL;
             }
-            Some(pointer) => match unsafe {
-                helpers::bpf_probe_read_user(pointer as *const u64)
-            } {
-                Ok(mechanism) => {
-                    start.mechanism = mechanism;
-                    start.capture =
-                        (start.capture & !capture::MECHANISM_MASK) | capture::MECHANISM_VALUE;
-                    let parameter_shape =
-                        unsafe { MECH_SHAPE.get(&mechanism) }.copied().unwrap_or(shape::NONE);
-                    if parameter_shape != shape::NONE {
-                        decode_params(pointer, parameter_shape, &mut start);
+            Some(pointer) => {
+                start.mechanism_ptr = pointer;
+                #[cfg(feature = "unsafe-unvalidated-metadata")]
+                if flags & FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA != 0 {
+                    match unsafe { helpers::bpf_probe_read_user(pointer as *const u64) } {
+                        Ok(mechanism) => {
+                            start.mechanism = mechanism;
+                            start.capture = (start.capture & !capture::MECHANISM_MASK)
+                                | capture::MECHANISM_VALUE;
+                            let parameter_shape = unsafe { MECH_SHAPE.get(&mechanism) }
+                                .copied()
+                                .unwrap_or(shape::NONE);
+                            if parameter_shape != shape::NONE {
+                                decode_params(pointer, parameter_shape, &mut start);
+                            }
+                        }
+                        Err(_) => {
+                            start.capture = (start.capture & !capture::MECHANISM_MASK)
+                                | capture::MECHANISM_UNREADABLE;
+                            capture_failure(&mut start);
+                        }
                     }
                 }
-                Err(_) => {
-                    start.capture = (start.capture & !capture::MECHANISM_MASK)
-                        | capture::MECHANISM_UNREADABLE;
-                    capture_failure(&mut start);
-                }
-            },
+            }
         }
     }
 
@@ -526,7 +581,8 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {
         }
     }
 
-    if TEMPLATE_MODE != 0 {
+    #[cfg(feature = "unsafe-unvalidated-metadata")]
+    if flags & FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA != 0 && TEMPLATE_MODE != 0 {
         if semantics.template0_arg != ARG_NONE {
             // Keep the reads nested. Holding two Option payloads across the
             // second helper call makes LLVM spill an uninitialized `None`
@@ -562,17 +618,10 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {
         }
     }
 
-    if START
-        .insert(&key, &start, aya_ebpf::bindings::BPF_NOEXIST as u64)
-        .is_err()
-    {
-        // A same-thread/same-slot ambiguous nested call makes both returns
-        // untrustworthy. Invalidate the outer record so neither return can
-        // combine entry state from one invocation with the other.
-        let _ = START.remove(&key);
-        bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+    if !store_start(&key, &start) {
         return 0;
     }
+    #[cfg(feature = "unsafe-unvalidated-metadata")]
     if TEMPLATE_MODE == 3 {
         // Success never returns. Failure leaves template0 as usable partial
         // evidence and is independently disclosed below.
@@ -589,7 +638,7 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
         return 0;
     }
     let key = StartKey { pid_tgid: helpers::bpf_get_current_pid_tgid(), slot, _pad: 0 };
-    if !in_scope() {
+    let Some(flags) = scope_flags() else {
         // Entry-time scope owns this pairing record. If a task migrates out
         // of a selected cgroup mid-call, clean it up without emitting an
         // out-of-scope event and disclose the lost completion.
@@ -597,7 +646,7 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
             bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
         }
         return 0;
-    }
+    };
     // No start entry means the entry probe filtered this call out (or the
     // process was already inside the function at attach time). Either way
     // there is nothing to attribute.
@@ -637,7 +686,32 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
         bump_evidence(EVIDENCE_RV_UPDATE_FAILURES);
     }
 
+    if flags & FLAG_POLICY_AGGREGATE != 0 {
+        return 0;
+    }
+
     let semantics = SLOT_SEMANTICS.get(slot).copied().unwrap_or(SlotSemantics::COUNT_ONLY);
+    let mut mechanism = start.mechanism;
+    let mut capture_flags = start.capture;
+    if flags & FLAG_POLICY_ALLOWLISTED != 0
+        && return_allows_mechanism(rv)
+        && start.mechanism_ptr != 0
+    {
+        match unsafe { helpers::bpf_probe_read_user(start.mechanism_ptr as *const u64) } {
+            Ok(value) if unsafe { MECH_SHAPE.get(&value) }.is_some() => {
+                mechanism = value;
+                capture_flags =
+                    (capture_flags & !capture::MECHANISM_MASK) | capture::MECHANISM_VALUE;
+            }
+            Ok(_) => bump_evidence(EVIDENCE_UNREGISTERED_MECHANISMS),
+            Err(_) => {
+                capture_flags = (capture_flags & !capture::MECHANISM_MASK)
+                    | capture::MECHANISM_UNREADABLE
+                    | capture::ARG_READ_FAILURE;
+                bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+            }
+        }
+    }
     let mut session = start.session;
     if semantics.lifecycle == lifecycle::OPEN_SESSION && start.out_ptr != 0 && (rv == 0 || rv == 0x204) {
         // C_OpenSession wrote the handle by now. Only trust it on success.
@@ -647,7 +721,6 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
         }
     }
     let mut async_value = start.async_value;
-    let mut capture_flags = start.capture;
     if rv == 0 && start.out_ptr != 0 && semantics.lifecycle == lifecycle::ASYNC_GET_ID {
         match unsafe { helpers::bpf_probe_read_user(start.out_ptr as *const u64) } {
             Ok(value) => async_value = value,
@@ -665,7 +738,7 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
         cgroup_id: unsafe { helpers::bpf_get_current_cgroup_id() },
         session,
         slot_id: start.slot_id,
-        mechanism: start.mechanism,
+        mechanism,
         flags: start.flags,
         rv,
         p0: start.p0,
@@ -703,7 +776,10 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
 
 #[tracepoint(category = "sched", name = "sched_process_fork")]
 pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
-    if !in_scope() {
+    let Some(flags) = scope_flags() else {
+        return 0;
+    };
+    if flags & FLAG_POLICY_AGGREGATE != 0 {
         return 0;
     }
     // Linux sched_process_fork format: common fields (8), parent_comm

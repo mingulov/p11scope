@@ -230,7 +230,8 @@ pub const EVIDENCE_RV_UPDATE_FAILURES: u32 = 3;
 pub const EVIDENCE_CGROUP_SCOPE_FAILURES: u32 = 4;
 pub const EVIDENCE_SEMANTIC_CAPTURE_FAILURES: u32 = 5;
 pub const EVIDENCE_TEMPLATE_TAIL_FAILURES: u32 = 6;
-pub const EVIDENCE_CELLS: u32 = 7;
+pub const EVIDENCE_UNREGISTERED_MECHANISMS: u32 = 7;
+pub const EVIDENCE_CELLS: u32 = 8;
 
 /// Hash-map capacities. The opt-in induced-gap build shrinks both maps so
 /// their independent failure counters can be exercised deterministically.
@@ -364,18 +365,40 @@ pub const SESSION_NONE: u64 = u64::MAX;
 pub const USER_TYPE_NONE: u32 = u32::MAX;
 pub const FUNCTION_NONE: u32 = u32::MAX;
 
-pub const FUNCTION_HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-pub const FUNCTION_HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
 /// Longest published standard function name in the 3.2 table.
 pub const FUNCTION_NAME_MAX_BYTES: usize = 27;
 
-pub const fn function_hash_step(hash: u64, byte: u8) -> u64 {
-    (hash ^ byte as u64).wrapping_mul(FUNCTION_HASH_PRIME)
+/// Exact bounded C-string key for the immutable standard async catalog.
+/// The extra zero byte avoids implicit tail padding in the 32-byte map key.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FunctionNameKey {
+    pub len: u32,
+    pub bytes: [u8; FUNCTION_NAME_MAX_BYTES + 1],
 }
 
-pub fn function_name_hash(name: &str) -> u64 {
-    let hash = name.bytes().fold(FUNCTION_HASH_OFFSET, function_hash_step);
-    function_hash_step(hash, name.len() as u8)
+impl FunctionNameKey {
+    pub fn from_bytes(snapshot: &[u8]) -> Option<Self> {
+        if snapshot.len() > FUNCTION_NAME_MAX_BYTES + 2 {
+            return None;
+        }
+        let len = snapshot.iter().position(|byte| *byte == 0)?;
+        if len > FUNCTION_NAME_MAX_BYTES {
+            return None;
+        }
+        let mut key = Self {
+            len: len as u32,
+            ..Self::default()
+        };
+        key.bytes[..len].copy_from_slice(&snapshot[..len]);
+        Some(key)
+    }
+}
+
+/// Only immediate success or pending means the provider accepted enough of a
+/// mechanism-bearing request for safe return-time membership capture.
+pub const fn return_allows_mechanism(rv: u64) -> bool {
+    matches!(rv, 0 | 0x204)
 }
 
 pub mod event_type {
@@ -516,6 +539,8 @@ pub struct Event {
 unsafe impl aya::Pod for CallStart {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for Event {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for FunctionNameKey {}
 
 #[cfg(test)]
 mod tests {
@@ -548,6 +573,7 @@ mod tests {
             EVIDENCE_CGROUP_SCOPE_FAILURES,
             EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
             EVIDENCE_TEMPLATE_TAIL_FAILURES,
+            EVIDENCE_UNREGISTERED_MECHANISMS,
         ];
         for (position, index) in indices.iter().enumerate() {
             assert_eq!(*index as usize, position);
@@ -593,16 +619,6 @@ mod tests {
     }
 
     #[test]
-    fn function_hash_is_stable_and_length_sensitive() {
-        assert_ne!(
-            function_name_hash("C_Sign"),
-            function_name_hash("C_SignInit")
-        );
-        assert_ne!(function_name_hash("C_Sign"), function_name_hash("C_Sign\0"));
-        assert_eq!(FUNCTION_NAME_MAX_BYTES, 27);
-    }
-
-    #[test]
     fn ring_bytes_is_page_aligned_power_of_two() {
         assert!(RING_BYTES.is_power_of_two());
         assert_eq!(RING_BYTES % 4096, 0);
@@ -630,5 +646,76 @@ mod tests {
         assert_ne!(MECH_NONE, 0x250);
         assert_ne!(USER_TYPE_NONE, 1);
         assert_ne!(SESSION_NONE, 0);
+    }
+}
+
+#[cfg(test)]
+mod safe_capture {
+    use super::*;
+
+    #[test]
+    fn mechanism_capture_is_allowed_only_after_ok_or_pending() {
+        assert!(return_allows_mechanism(0));
+        assert!(return_allows_mechanism(0x204));
+        assert!(!return_allows_mechanism(0x7));
+        assert!(!return_allows_mechanism(u64::MAX));
+    }
+
+    #[test]
+    fn function_name_key_is_exact_zero_filled_and_bounded() {
+        let expected = FunctionNameKey {
+            len: 9,
+            bytes: [
+                b'C', b'_', b'E', b'n', b'c', b'r', b'y', b'p', b't', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        };
+        assert_eq!(FunctionNameKey::from_bytes(b"C_Encrypt\0"), Some(expected));
+        assert_eq!(FunctionNameKey::from_bytes(b"\0").unwrap().len, 0);
+        assert_eq!(FunctionNameKey::from_bytes(b"C_Encrypt"), None);
+        assert_eq!(
+            FunctionNameKey::from_bytes(b"1234567890123456789012345678\0"),
+            None
+        );
+        assert_eq!(core::mem::size_of::<FunctionNameKey>(), 32);
+        assert_eq!(core::mem::align_of::<FunctionNameKey>(), 4);
+    }
+
+    #[test]
+    fn exact_catalog_key_rejects_unknown_name_even_with_a_shared_candidate_id() {
+        let exact = FunctionNameKey::from_bytes(b"C_Encrypt\0").unwrap();
+        let unknown = FunctionNameKey::from_bytes(b"C_EncryptX\0").unwrap();
+        let same_length_unknown = FunctionNameKey::from_bytes(b"C_Encrypu\0").unwrap();
+        let catalog = [(exact, 30u32)];
+
+        assert_eq!(
+            catalog.iter().find(|(key, _)| *key == exact).map(|x| x.1),
+            Some(30)
+        );
+        assert_eq!(
+            catalog.iter().find(|(key, _)| *key == unknown).map(|x| x.1),
+            None
+        );
+        assert_eq!(
+            catalog
+                .iter()
+                .find(|(key, _)| *key == same_length_unknown)
+                .map(|x| x.1),
+            None
+        );
+    }
+
+    #[test]
+    fn full_width_mechanism_uses_capture_state_not_the_numeric_sentinel() {
+        let event = Event {
+            mechanism: u64::MAX,
+            capture: capture::MECHANISM_VALUE,
+            ..Event::default()
+        };
+        assert_eq!(event.mechanism, u64::MAX);
+        assert_eq!(
+            event.capture & capture::MECHANISM_MASK,
+            capture::MECHANISM_VALUE
+        );
     }
 }

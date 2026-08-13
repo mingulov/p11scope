@@ -53,6 +53,22 @@ fn embedded_map_definitions() -> BTreeMap<String, [u32; 7]> {
         .collect()
 }
 
+fn embedded_symbols() -> String {
+    let directory = tempfile::tempdir().expect("temporary symbol-inspection directory");
+    let object = directory.path().join("p11scope-ebpf");
+    fs::write(&object, p11scope::EBPF_OBJECT).expect("write embedded eBPF object");
+    let output = Command::new("llvm-readelf")
+        .args(["-sW", object.to_str().unwrap()])
+        .output()
+        .expect("run llvm-readelf");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("UTF-8 symbol table")
+}
+
 #[test]
 fn privacy_gate_uses_observer_owned_live_maps() {
     let script = read("scripts/verify-canaries.sh");
@@ -96,16 +112,116 @@ fn immutable_policy_maps() {
         "SLOT_SEMANTICS",
         "ASYNC_FUNCTIONS",
         "MECH_SHAPE",
-        "ATTR_BOOL_BITS",
     ] {
         assert_eq!(definitions[name][FLAGS], BPF_F_RDONLY_PROG, "{name}");
     }
-    for name in ["CGROUP_FILTER", "TEMPLATE_TAIL"] {
-        assert_eq!(definitions[name][FLAGS], 0, "{name}");
-    }
+    assert_eq!(definitions["CGROUP_FILTER"][FLAGS], 0);
+    assert!(!definitions.contains_key("ATTR_BOOL_BITS"));
+    assert!(!definitions.contains_key("TEMPLATE_TAIL"));
     for name in ["STATS", "START", "RV_COUNTS", "EVENTS", "EVIDENCE"] {
         assert_eq!(definitions[name][FLAGS], 0, "dynamic map {name}");
     }
+}
+
+#[test]
+fn policy_specific_ebpf() {
+    const KEY_SIZE: usize = 1;
+    let definitions = embedded_map_definitions();
+    let symbols = embedded_symbols();
+
+    assert_eq!(definitions["ASYNC_FUNCTIONS"][KEY_SIZE], 32);
+    for unsafe_map in ["ATTR_BOOL_BITS", "TEMPLATE_TAIL"] {
+        assert!(
+            !definitions.contains_key(unsafe_map),
+            "default object contains unsafe-only map {unsafe_map}"
+        );
+    }
+    for unsafe_symbol in [
+        "p11_entry_template",
+        "p11_entry_template_types",
+        "p11_entry_template_pair",
+        "p11_entry_template_second",
+        "walk_template",
+        "decode_params",
+    ] {
+        assert!(
+            !symbols.contains(unsafe_symbol),
+            "default object contains unsafe-only symbol {unsafe_symbol}"
+        );
+    }
+
+    let source = read("crates/ebpf/src/main.rs");
+    let entry = source.split_once("fn p11_entry_impl").unwrap().1;
+    let aggregate = entry.find("FLAG_POLICY_AGGREGATE").unwrap();
+    let semantics = entry.find("SLOT_SEMANTICS").unwrap();
+    let first_argument = entry.find("capture_scalar").unwrap();
+    let async_name = entry.find("capture_async_target").unwrap();
+    assert!(
+        aggregate < semantics && aggregate < first_argument && aggregate < async_name,
+        "aggregate entry must precede semantic and argument reads"
+    );
+
+    let ret = source.split_once("pub fn p11_return").unwrap().1;
+    let aggregate = ret.find("FLAG_POLICY_AGGREGATE").unwrap();
+    let semantics = ret.find("SLOT_SEMANTICS").unwrap();
+    let event = ret.find("EVENTS.reserve").unwrap();
+    assert!(aggregate < semantics && aggregate < event);
+    let cleanup = ret.rfind("START.remove(&key)").unwrap();
+    let safe_read = ret.find("return_allows_mechanism(rv)").unwrap();
+    assert!(cleanup < safe_read);
+    assert!(ret.contains("MECH_SHAPE.get(&value)"));
+    assert!(ret.contains("EVIDENCE_UNREGISTERED_MECHANISMS"));
+    assert!(ret.contains("EVIDENCE_SEMANTIC_CAPTURE_FAILURES"));
+
+    let open_session = ret
+        .split_once("let mut session = start.session;")
+        .unwrap()
+        .1
+        .split_once("let mut async_value = start.async_value;")
+        .unwrap()
+        .0;
+    assert!(open_session.contains("lifecycle::OPEN_SESSION"));
+    assert!(open_session.contains("rv == 0 || rv == 0x204"));
+    assert!(open_session.contains("bpf_probe_read_user(start.out_ptr as *const u64)"));
+    assert!(open_session.contains("Ok(value) => session = value"));
+    assert!(open_session.contains("Err(_) => bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES)"));
+
+    let async_id = ret
+        .split_once("let mut async_value = start.async_value;")
+        .unwrap()
+        .1
+        .split_once("let ev = Event")
+        .unwrap()
+        .0;
+    assert!(async_id.contains("rv == 0"));
+    assert!(async_id.contains("lifecycle::ASYNC_GET_ID"));
+    assert!(async_id.contains("bpf_probe_read_user(start.out_ptr as *const u64)"));
+    assert!(async_id.contains("Ok(value) => async_value = value"));
+    assert!(async_id.contains("capture::ASYNC_VALUE_UNREADABLE"));
+    assert!(async_id.contains("bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES)"));
+    assert_eq!(
+        ret.matches("bpf_probe_read_user(start.out_ptr as *const u64)")
+            .count(),
+        2,
+        "only C_OpenSession and C_AsyncGetID may dereference an output pointer"
+    );
+
+    let async_target = source
+        .split_once("fn capture_async_target")
+        .unwrap()
+        .1
+        .split_once("pub fn p11_entry")
+        .unwrap()
+        .0;
+    assert!(async_target.contains("if pointer == 0"));
+    assert!(async_target.contains("bpf_probe_read_user_str"));
+    assert!(async_target.contains("read <= 0"));
+    assert!(async_target.contains("FUNCTION_NAME_MAX_BYTES + 1"));
+    assert!(async_target.contains("FunctionNameKey::default()"));
+    assert!(async_target.contains("ASYNC_FUNCTIONS.get(&key)"));
+    assert!(!source.contains("FUNCTION_HASH_OFFSET"));
+    assert!(!source.contains("function_hash_step"));
+    assert!(source.matches("checked_add(").count() >= 7);
 }
 
 #[test]
@@ -415,7 +531,7 @@ fn ebpf_boolean_reads_and_cgroup_migration_emit_gap_evidence() {
 
     let ret = source.split_once("pub fn p11_return").unwrap().1;
     let key = ret.find("let key = StartKey").unwrap();
-    let scope = ret.find("if !in_scope()").unwrap();
+    let scope = ret.find("let Some(flags) = scope_flags() else").unwrap();
     let cleanup = ret.find("START.remove(&key)").unwrap();
     assert!(key < scope && scope < cleanup);
     assert!(ret[cleanup..].contains("EVIDENCE_UNMATCHED_RETURNS"));

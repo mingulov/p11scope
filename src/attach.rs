@@ -10,11 +10,12 @@ use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeScope
 use aya::programs::{TracePoint, UProbe};
 use p11scope_ebpf_common::{
     ARG_NONE, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
-    FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, MAX_SLOTS, SlotSemantics,
+    FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, FUNCTION_NAME_MAX_BYTES, FunctionNameKey, MAX_SLOTS,
+    SlotSemantics,
 };
 use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
 use std::collections::BTreeMap;
-use std::mem::size_of_val;
+use std::mem::{size_of, size_of_val};
 use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::path::PathBuf;
 
@@ -193,7 +194,10 @@ fn error_chain(e: &dyn std::error::Error) -> String {
     msg
 }
 
-fn entry_program(semantics: &SlotSemantics) -> &'static str {
+fn entry_program(semantics: &SlotSemantics, policy: CapturePolicy) -> &'static str {
+    if !policy.uses_unsafe_decoders() {
+        return "p11_entry";
+    }
     if semantics.template1_arg != ARG_NONE {
         "p11_entry_template_pair"
     } else if semantics.semantic_flags & p11scope_ebpf_common::semantic_flags::TEMPLATE0_TYPES_ONLY
@@ -205,6 +209,30 @@ fn entry_program(semantics: &SlotSemantics) -> &'static str {
     } else {
         "p11_entry"
     }
+}
+
+fn standard_async_catalog() -> Result<BTreeMap<FunctionNameKey, u32>> {
+    let fields = pkcs11_module::FUNCTION_LIST_FIELDS
+        .iter()
+        .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS)
+        .chain(pkcs11_module::FUNCTION_LIST_3_2_EXTRA_FIELDS);
+    let mut catalog = BTreeMap::new();
+    for (id, field) in fields.enumerate() {
+        if field.name.len() > FUNCTION_NAME_MAX_BYTES {
+            bail!("standard function name is too long: {}", field.name);
+        }
+        let mut snapshot = [0u8; FUNCTION_NAME_MAX_BYTES + 1];
+        snapshot[..field.name.len()].copy_from_slice(field.name.as_bytes());
+        let key = FunctionNameKey::from_bytes(&snapshot[..=field.name.len()])
+            .with_context(|| format!("invalid standard function name {}", field.name))?;
+        if let Some(previous) = catalog.insert(key, id as u32) {
+            bail!(
+                "duplicate standard function name {} at ids {previous} and {id}",
+                field.name
+            );
+        }
+    }
+    Ok(catalog)
 }
 
 fn publish_slot_semantics(ebpf: &mut Ebpf, plan: &AttachPlan) -> Result<()> {
@@ -257,22 +285,7 @@ fn publish_slot_semantics(ebpf: &mut Ebpf, plan: &AttachPlan) -> Result<()> {
 }
 
 fn publish_async_catalog(ebpf: &mut Ebpf) -> Result<()> {
-    let fields = pkcs11_module::FUNCTION_LIST_FIELDS
-        .iter()
-        .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS)
-        .chain(pkcs11_module::FUNCTION_LIST_3_2_EXTRA_FIELDS);
-    let mut names = BTreeMap::new();
-    let mut by_hash = BTreeMap::new();
-    for (id, field) in fields.enumerate() {
-        let hash = p11scope_ebpf_common::function_name_hash(field.name);
-        if let Some(previous) = names.insert(hash, field.name) {
-            bail!(
-                "standard function-name hash collision: {previous} and {}",
-                field.name
-            );
-        }
-        by_hash.insert(hash, id as u32);
-    }
+    let expected = standard_async_catalog()?;
 
     let info = policy_map_data(
         "ASYNC_FUNCTIONS",
@@ -280,24 +293,28 @@ fn publish_async_catalog(ebpf: &mut Ebpf) -> Result<()> {
     )?
     .info()
     .context("reading ASYNC_FUNCTIONS map info")?;
-    if info.map_type()? != MapType::Hash || info.max_entries() != 128 {
+    if info.map_type()? != MapType::Hash
+        || info.max_entries() != 128
+        || info.key_size() != size_of::<FunctionNameKey>() as u32
+    {
         bail!(
-            "ASYNC_FUNCTIONS has type {:?} and capacity {}, expected Hash and 128",
+            "ASYNC_FUNCTIONS has type {:?}, key size {}, and capacity {}, expected Hash, 32, and 128",
             info.map_type()?,
+            info.key_size(),
             info.max_entries()
         );
     }
-    let mut functions: HashMap<_, u64, u32> = HashMap::try_from(
+    let mut functions: HashMap<_, FunctionNameKey, u32> = HashMap::try_from(
         ebpf.map_mut("ASYNC_FUNCTIONS")
             .context("ASYNC_FUNCTIONS map")?,
     )?;
-    for (&hash, &id) in &by_hash {
-        functions.insert(hash, id, 0)?;
+    for (&key, &id) in &expected {
+        functions.insert(key, id, 0)?;
     }
-    let functions: HashMap<_, u64, u32> =
+    let functions: HashMap<_, FunctionNameKey, u32> =
         HashMap::try_from(ebpf.map("ASYNC_FUNCTIONS").context("ASYNC_FUNCTIONS map")?)?;
     let actual = functions.iter().collect::<Result<BTreeMap<_, _>, _>>()?;
-    if actual != by_hash {
+    if actual != expected {
         bail!("ASYNC_FUNCTIONS exact readback differs from the standard catalog");
     }
     Ok(())
@@ -495,14 +512,19 @@ impl Session {
             })
             .collect::<Result<_>>()?;
 
-        for prog_name in [
-            "p11_return",
-            "p11_entry",
-            "p11_entry_template",
-            "p11_entry_template_types",
-            "p11_entry_template_pair",
-            "p11_entry_template_second",
-        ] {
+        let programs: &[&str] = if unsafe_enabled {
+            &[
+                "p11_return",
+                "p11_entry",
+                "p11_entry_template",
+                "p11_entry_template_types",
+                "p11_entry_template_pair",
+                "p11_entry_template_second",
+            ]
+        } else {
+            &["p11_return", "p11_entry"]
+        };
+        for prog_name in programs {
             let prog: &mut UProbe = ebpf
                 .program_mut(prog_name)
                 .with_context(|| format!("program {prog_name} missing from object"))?
@@ -513,7 +535,7 @@ impl Session {
         publish_and_freeze_template_tail(&mut ebpf, unsafe_enabled)
             .context("publishing and freezing TEMPLATE_TAIL")?;
 
-        if matches!(scope, Scope::Cgroup { .. }) {
+        if matches!(scope, Scope::Cgroup { .. }) && policy.uses_events() {
             let fork: &mut TracePoint = ebpf
                 .program_mut("sched_process_fork")
                 .context("program sched_process_fork missing from object")?
@@ -548,15 +570,22 @@ impl Session {
                 }
             }
         }
-        for prog_name in [
-            "p11_entry",
-            "p11_entry_template",
-            "p11_entry_template_types",
-            "p11_entry_template_pair",
-        ] {
+        let entry_programs: &[&str] = if unsafe_enabled {
+            &[
+                "p11_entry",
+                "p11_entry_template",
+                "p11_entry_template_types",
+                "p11_entry_template_pair",
+            ]
+        } else {
+            &["p11_entry"]
+        };
+        for prog_name in entry_programs {
             let prog: &mut UProbe = ebpf.program_mut(prog_name).unwrap().try_into()?;
             for (position, slot) in plan.slots.iter().enumerate() {
-                if !return_attached[position] || entry_program(&slot.semantics) != prog_name {
+                if !return_attached[position]
+                    || entry_program(&slot.semantics, policy) != *prog_name
+                {
                     continue;
                 }
                 let point = UProbeAttachPoint {
@@ -705,26 +734,78 @@ mod tests {
     }
 
     #[test]
-    fn entry_program_is_selected_by_template_capture() {
-        assert_eq!(entry_program(&SlotSemantics::COUNT_ONLY), "p11_entry");
+    fn safe_capture_entry_program_selection_never_uses_unsafe_templates() {
+        assert_eq!(
+            entry_program(&SlotSemantics::COUNT_ONLY, CapturePolicy::Allowlisted),
+            "p11_entry"
+        );
 
         let mut template = SlotSemantics::COUNT_ONLY;
         template.template0_arg = 1;
-        assert_eq!(entry_program(&template), "p11_entry_template");
+        assert_eq!(
+            entry_program(&template, CapturePolicy::UnsafeUnvalidatedMetadata),
+            "p11_entry_template"
+        );
+        assert_eq!(
+            entry_program(&template, CapturePolicy::Allowlisted),
+            "p11_entry"
+        );
+        assert_eq!(
+            entry_program(&template, CapturePolicy::AggregateOnly),
+            "p11_entry"
+        );
 
         let mut second_template = SlotSemantics::COUNT_ONLY;
         second_template.template0_arg = 2;
         second_template.template1_arg = 4;
-        assert_eq!(entry_program(&second_template), "p11_entry_template_pair");
+        assert_eq!(
+            entry_program(&second_template, CapturePolicy::UnsafeUnvalidatedMetadata),
+            "p11_entry_template_pair"
+        );
 
         let mut types_only = SlotSemantics::COUNT_ONLY;
         types_only.template0_arg = 2;
         types_only.semantic_flags = p11scope_ebpf_common::semantic_flags::TEMPLATE0_TYPES_ONLY;
-        assert_eq!(entry_program(&types_only), "p11_entry_template_types");
+        assert_eq!(
+            entry_program(&types_only, CapturePolicy::UnsafeUnvalidatedMetadata),
+            "p11_entry_template_types"
+        );
 
         let mut async_call = SlotSemantics::COUNT_ONLY;
         async_call.async_name_arg = 1;
         assert_ne!(async_call.async_name_arg, ARG_NONE);
-        assert_eq!(entry_program(&async_call), "p11_entry");
+        assert_eq!(
+            entry_program(&async_call, CapturePolicy::UnsafeUnvalidatedMetadata),
+            "p11_entry"
+        );
+    }
+
+    #[test]
+    fn safe_capture_exact_async_catalog_preserves_ids_and_rejects_unknown_names() {
+        let catalog = standard_async_catalog().unwrap();
+        let exact = p11scope_ebpf_common::FunctionNameKey::from_bytes(b"C_Encrypt\0").unwrap();
+        let unknown = p11scope_ebpf_common::FunctionNameKey::from_bytes(b"C_EncryptX\0").unwrap();
+
+        assert_eq!(catalog.len(), 104);
+        assert_eq!(catalog.get(&exact), Some(&30));
+        assert_eq!(catalog.get(&unknown), None);
+    }
+
+    #[test]
+    fn safe_capture_internal_output_correlation_values_do_not_enter_trace_output() {
+        let raw_session = 0xdead_beef_cafe_babe;
+        let raw_async_id = 0xfeed_face_1234_5678;
+        let event = p11scope_ebpf_common::Event {
+            session: raw_session,
+            async_value: raw_async_id,
+            mechanism: p11scope_ebpf_common::MECH_NONE,
+            ..p11scope_ebpf_common::Event::default()
+        };
+        let line = crate::trace::format_line(&event, 0, "C_AsyncGetID", None);
+
+        assert!(!line.contains(&format!("{raw_session:x}")));
+        assert!(!line.contains(&format!("{raw_async_id:x}")));
+        assert!(!line.contains(&raw_session.to_string()));
+        assert!(!line.contains(&raw_async_id.to_string()));
     }
 }

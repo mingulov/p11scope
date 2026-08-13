@@ -171,7 +171,9 @@ pub fn capture_line(policy: CapturePolicy) -> String {
     format!("CAPTURE privacy={}", policy.privacy_mode())
 }
 
-/// Final machine-readable evidence record for a normally drained trace.
+/// Final machine-readable evidence record for a normally stopped trace.
+/// Detaching perf links does not prove already-running callbacks quiesced, so
+/// this record must remain PARTIAL and must not claim a proven final drain.
 pub fn evidence_line(ev: &render::Evidence, policy: CapturePolicy) -> String {
     let encoded = serde_json::to_string(ev).expect("Evidence serializes");
     let mut value: serde_json::Value =
@@ -183,8 +185,12 @@ pub fn evidence_line(ev: &render::Evidence, policy: CapturePolicy) -> String {
         "privacy_mode".into(),
         serde_json::Value::String(policy.privacy_mode().into()),
     );
+    object.insert(
+        "completeness".into(),
+        serde_json::Value::String("PARTIAL".into()),
+    );
     object.insert("capture_aborted".into(), serde_json::Value::Null);
-    object.insert("final_drain".into(), serde_json::Value::Bool(true));
+    object.insert("final_drain".into(), serde_json::Value::Bool(false));
     object.insert("counters_available".into(), serde_json::Value::Bool(true));
     format!("EVIDENCE {value}")
 }
@@ -396,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn final_evidence_line_is_machine_readable_and_carries_partial_gaps() {
+    fn final_evidence_line_is_machine_readable_and_never_claims_a_proven_drain() {
         let evidence = render::Evidence {
             table_entries: 0,
             slots: 0,
@@ -429,7 +435,7 @@ mod tests {
             async_duplicates: 0,
             async_evictions: 0,
             fork_state_ambiguities: 0,
-            semantic_state_drops: 3,
+            semantic_state_drops: 0,
             pending_at_end: 0,
             malformed_records: 0,
             orphan_ops: 0,
@@ -437,16 +443,16 @@ mod tests {
             shape_decode_failures: 0,
             shape_decode_total_failures: 0,
             templates_truncated: false,
-            completeness: "PARTIAL",
+            completeness: "COMPLETE",
         };
         let line = evidence_line(&evidence, crate::attach::CapturePolicy::Allowlisted);
         let value: serde_json::Value =
             serde_json::from_str(line.strip_prefix("EVIDENCE ").unwrap()).unwrap();
-        assert_eq!(value["semantic_state_drops"], 3);
+        assert_eq!(value["semantic_state_drops"], 0);
         assert_eq!(value["completeness"], "PARTIAL");
         assert_eq!(value["privacy_mode"], "allowlisted");
         assert_eq!(value["capture_aborted"], serde_json::Value::Null);
-        assert_eq!(value["final_drain"], true);
+        assert_eq!(value["final_drain"], false);
         assert_eq!(value["counters_available"], true);
     }
 

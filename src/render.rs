@@ -150,6 +150,13 @@ impl Evidence {
             "PARTIAL"
         };
     }
+
+    /// A detached perf link stops new invocations but does not wait for BPF
+    /// callbacks already executing on another CPU. Until capture has a real
+    /// kernel quiescence barrier, a terminal snapshot cannot be COMPLETE.
+    pub fn mark_terminal_drain_unproven(&mut self) {
+        self.completeness = "PARTIAL";
+    }
 }
 
 fn label(r: &SlotReport) -> String {
@@ -878,6 +885,22 @@ mod tests {
         let mut ev = evidence();
         ev.verdict();
         assert_eq!(ev.completeness, "COMPLETE");
+    }
+
+    #[test]
+    fn unproven_terminal_drain_forces_partial_without_fabricating_a_gap() {
+        let mut ev = evidence();
+        ev.verdict();
+        assert_eq!(ev.completeness, "COMPLETE");
+
+        ev.mark_terminal_drain_unproven();
+
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(ev.in_flight_at_end, 0);
+        assert_eq!(ev.event_loss, 0);
+        assert_eq!(ev.malformed_records, 0);
+        let value = serde_json::to_value(&ev).unwrap();
+        assert!(value.get("terminal_drain_unproven").is_none());
     }
 
     #[test]

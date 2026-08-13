@@ -665,9 +665,10 @@ impl Session {
     }
 
     /// Detach every event/map producer while keeping the maps and ring reader
-    /// available for the terminal drain and stable snapshot. Entry probes go
-    /// first so calls that begin before detach but return later remain visible
-    /// as `in_flight_at_end` once the fork and return probes are removed last.
+    /// available for a best-effort terminal drain and snapshot. Entry probes
+    /// go first so fewer calls are stranded before the return probes are
+    /// removed last. Kernel detach does not wait for callbacks already running
+    /// on another CPU; callers must not claim that the terminal drain is final.
     pub fn detach_producers(&mut self) -> Result<()> {
         let ebpf = &mut self.ebpf;
         detach_producers_with(self.policy, self.fork_attached, |producer| {
@@ -786,7 +787,7 @@ mod tests {
     use p11scope_ebpf_common::{ARG_NONE, SlotSemantics};
 
     #[test]
-    fn terminal_quiesce_detaches_every_entry_before_return_and_stops_on_error() {
+    fn terminal_detach_orders_selected_producers_and_stops_on_error() {
         let mut safe = Vec::new();
         detach_producers_with(CapturePolicy::Allowlisted, false, |producer| {
             safe.push(producer);

@@ -480,7 +480,7 @@ fn capture_profile(
     if mode != "profile" {
         kernel_evidence.ring_loss = 0;
     }
-    let ev = evidence_for(
+    let mut ev = evidence_for(
         &plan,
         &session,
         &reports,
@@ -489,6 +489,7 @@ fn capture_profile(
         malformed_records,
         &state,
     );
+    ev.mark_terminal_drain_unproven();
     let frame = render::live(
         &reports,
         &ev,
@@ -715,9 +716,9 @@ fn capture_trace(
     }
 
     session.detach_producers()?;
-    // Final drain after detaching every producer: empty the remaining ring,
-    // then report the closing loss line. Calls that had entered but did not
-    // return before detach remain explicit in `in_flight_at_end`.
+    // Drain everything currently visible after detach, then report the closing
+    // loss line. Kernel detach does not wait for callbacks already executing
+    // on another CPU, so terminal evidence below remains explicitly PARTIAL.
     malformed_records += drain_trace_events(
         &mut session,
         &mut state,
@@ -740,7 +741,7 @@ fn capture_trace(
         out_file,
     )?;
     let reports = metrics::read(&session, &plan)?;
-    let evidence = evidence_for(
+    let mut evidence = evidence_for(
         &plan,
         &session,
         &reports,
@@ -749,6 +750,7 @@ fn capture_trace(
         malformed_records,
         &state,
     );
+    evidence.mark_terminal_drain_unproven();
     objects
         .ensure_stable()
         .map_err(anyhow::Error::msg)
@@ -994,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_quiesce_precedes_final_drain_maps_and_evidence() {
+    fn terminal_detach_precedes_snapshot_and_unproven_drain_mark_precedes_output() {
         let source = include_str!("main.rs");
         let profile = source
             .split_once("fn capture_profile(")
@@ -1006,10 +1008,15 @@ mod tests {
         let profile_detach = profile.rfind("session.detach_producers()?").unwrap();
         let profile_drain = profile.rfind("drain_events(").unwrap();
         let profile_maps = profile.rfind("metrics::read(").unwrap();
+        let profile_mark = profile.rfind("ev.mark_terminal_drain_unproven()").unwrap();
+        let profile_render = profile.rfind("let frame = render::live(").unwrap();
         let profile_output = profile.rfind("write_json_report(").unwrap();
         assert!(profile_detach < profile_drain);
         assert!(profile_detach < profile_maps);
-        assert!(profile_maps < profile_output);
+        assert!(profile_drain < profile_maps);
+        assert!(profile_maps < profile_mark);
+        assert!(profile_mark < profile_render);
+        assert!(profile_render < profile_output);
 
         let trace = source
             .split_once("fn capture_trace(")
@@ -1021,10 +1028,14 @@ mod tests {
         let trace_detach = trace.rfind("session.detach_producers()?").unwrap();
         let trace_drain = trace.rfind("drain_trace_events(").unwrap();
         let trace_maps = trace.rfind("metrics::read(").unwrap();
+        let trace_mark = trace
+            .rfind("evidence.mark_terminal_drain_unproven()")
+            .unwrap();
         let trace_evidence = trace.rfind("trace::evidence_line(").unwrap();
         assert!(trace_detach < trace_drain);
         assert!(trace_drain < trace_maps);
-        assert!(trace_maps < trace_evidence);
+        assert!(trace_maps < trace_mark);
+        assert!(trace_mark < trace_evidence);
     }
 
     impl Write for FailingWriter {

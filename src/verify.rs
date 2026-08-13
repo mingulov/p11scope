@@ -8,11 +8,11 @@ use p11scope_manifest::identity::{
 use p11scope_manifest::manifest::*;
 use pkcs11_module::{Surface, TableSet, tables_for};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read as _;
-use std::os::fd::AsRawFd as _;
+use std::io::{Read as _, Write as _};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 pub const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_TOTAL_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
@@ -22,6 +22,928 @@ const MAX_FUNCTIONS: usize = 32_768;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_DETAIL_BYTES: usize = 4096;
 pub const OBJECT_CHANGED_EXIT: i32 = 78;
+
+/// The capture process blocks lease and operator signals before taking any
+/// candidate lease. The supervisor consumes this set synchronously through
+/// signalfd; a forked worker later unblocks only SIGINT/SIGTERM.
+pub struct CaptureSignals {
+    fd: OwnedFd,
+    previous: libc::sigset_t,
+}
+
+impl CaptureSignals {
+    pub fn block() -> Result<Self, String> {
+        let threads = thread_count()?;
+        if threads != 1 {
+            return Err(format!(
+                "capture signal setup requires a single-threaded process before lease acquisition; found {threads} threads"
+            ));
+        }
+        // SAFETY: both sets are initialized before use; pthread_sigmask writes
+        // the previous mask, and signalfd copies the supplied blocked set.
+        unsafe {
+            let mut blocked = std::mem::zeroed();
+            let mut previous = std::mem::zeroed();
+            if libc::sigemptyset(&mut blocked) == -1
+                || libc::sigaddset(&mut blocked, libc::SIGIO) == -1
+                || libc::sigaddset(&mut blocked, libc::SIGINT) == -1
+                || libc::sigaddset(&mut blocked, libc::SIGTERM) == -1
+            {
+                return Err(format!(
+                    "preparing capture signal set failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let error = libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous);
+            if error != 0 {
+                return Err(format!(
+                    "blocking capture signals failed: {}",
+                    std::io::Error::from_raw_os_error(error)
+                ));
+            }
+            let fd = libc::signalfd(-1, &blocked, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK);
+            if fd == -1 {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+                return Err(format!(
+                    "creating capture signalfd failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(Self {
+                fd: OwnedFd::from_raw_fd(fd),
+                previous,
+            })
+        }
+    }
+
+    fn worker_inherits_mask(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for CaptureSignals {
+    fn drop(&mut self) {
+        // SAFETY: previous was filled by pthread_sigmask in block().
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut());
+        }
+    }
+}
+
+pub struct SupervisorOutput(OutputMode);
+
+enum OutputMode {
+    Trace {
+        supervisor_stdout: std::fs::File,
+        worker_stdout: std::fs::File,
+        supervisor_file: Option<std::fs::File>,
+        worker_file: Option<std::fs::File>,
+        privacy_mode: &'static str,
+    },
+    Profile {
+        worker_stdout: std::fs::File,
+        worker_file: Option<std::fs::File>,
+        pending: Option<PendingProfile>,
+    },
+}
+
+impl SupervisorOutput {
+    pub fn trace(path: Option<PathBuf>, privacy_mode: &'static str) -> Result<Self, String> {
+        let supervisor_stdout = duplicate_fd(libc::STDOUT_FILENO)
+            .map(std::fs::File::from)
+            .map_err(|error| format!("duplicating trace stdout failed: {error}"))?;
+        let worker_stdout = supervisor_stdout
+            .try_clone()
+            .map_err(|error| format!("duplicating worker trace stdout failed: {error}"))?;
+        let supervisor_file = path.map(open_trace_output).transpose()?;
+        let worker_file = supervisor_file
+            .as_ref()
+            .map(std::fs::File::try_clone)
+            .transpose()
+            .map_err(|error| format!("duplicating worker trace output failed: {error}"))?;
+        Ok(Self(OutputMode::Trace {
+            supervisor_stdout,
+            worker_stdout,
+            supervisor_file,
+            worker_file,
+            privacy_mode,
+        }))
+    }
+
+    pub fn profile(path: Option<PathBuf>) -> Result<Self, String> {
+        let worker_stdout = duplicate_fd(libc::STDOUT_FILENO)
+            .map(std::fs::File::from)
+            .map_err(|error| format!("duplicating profile stdout failed: {error}"))?;
+        let (worker_file, pending) = match path {
+            Some(final_path) => {
+                let (file, pending) = PendingProfile::create(final_path)?;
+                (Some(file), Some(pending))
+            }
+            None => (None, None),
+        };
+        Ok(Self(OutputMode::Profile {
+            worker_stdout,
+            worker_file,
+            pending,
+        }))
+    }
+
+    fn into_worker(self, objects: VerifiedObjects) -> WorkerContext {
+        match self.0 {
+            OutputMode::Trace {
+                supervisor_stdout,
+                worker_stdout,
+                supervisor_file,
+                worker_file,
+                ..
+            } => {
+                drop(supervisor_stdout);
+                drop(supervisor_file);
+                WorkerContext {
+                    stdout: worker_stdout,
+                    output: worker_file,
+                    profile: false,
+                    objects,
+                }
+            }
+            OutputMode::Profile {
+                worker_stdout,
+                worker_file,
+                pending,
+            } => {
+                if let Some(pending) = pending {
+                    pending.disarm();
+                }
+                WorkerContext {
+                    stdout: worker_stdout,
+                    output: worker_file,
+                    profile: true,
+                    objects,
+                }
+            }
+        }
+    }
+
+    fn into_parent(self) -> ParentOutput {
+        match self.0 {
+            OutputMode::Trace {
+                supervisor_stdout,
+                worker_stdout,
+                supervisor_file,
+                worker_file,
+                privacy_mode,
+            } => {
+                drop(worker_stdout);
+                drop(worker_file);
+                ParentOutput::Trace {
+                    stdout: supervisor_stdout,
+                    file: supervisor_file,
+                    privacy_mode,
+                }
+            }
+            OutputMode::Profile {
+                worker_stdout,
+                worker_file,
+                pending,
+            } => {
+                drop(worker_stdout);
+                drop(worker_file);
+                ParentOutput::Profile { pending }
+            }
+        }
+    }
+}
+
+fn open_trace_output(path: PathBuf) -> Result<std::fs::File, String> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&path)
+        .map_err(|error| {
+            format!(
+                "opening regular trace output {} failed: {error}",
+                path.display()
+            )
+        })?;
+    if !file
+        .metadata()
+        .map_err(|error| format!("checking {}: {error}", path.display()))?
+        .is_file()
+    {
+        return Err(format!(
+            "trace output {} is not a regular file",
+            path.display()
+        ));
+    }
+    Ok(file)
+}
+
+struct PendingProfile {
+    temp: PathBuf,
+    final_path: PathBuf,
+    cleanup: bool,
+}
+
+impl PendingProfile {
+    fn create(final_path: PathBuf) -> Result<(std::fs::File, Self), String> {
+        let directory = final_path.parent().unwrap_or_else(|| Path::new("."));
+        let name = final_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("profile");
+        for sequence in 0..128u32 {
+            let temp = directory.join(format!(
+                ".{name}.p11scope.{}.{}.tmp",
+                std::process::id(),
+                sequence
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp)
+            {
+                Ok(file) => {
+                    return Ok((
+                        file,
+                        Self {
+                            temp,
+                            final_path,
+                            cleanup: true,
+                        },
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "creating temporary profile beside {} failed: {error}",
+                        final_path.display()
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "cannot allocate a unique temporary profile beside {}",
+            final_path.display()
+        ))
+    }
+
+    fn disarm(mut self) {
+        self.cleanup = false;
+    }
+
+    fn publish(mut self) -> Result<(), String> {
+        std::fs::rename(&self.temp, &self.final_path).map_err(|error| {
+            format!(
+                "publishing profile {} failed: {error}",
+                self.final_path.display()
+            )
+        })?;
+        self.cleanup = false;
+        Ok(())
+    }
+}
+
+impl Drop for PendingProfile {
+    fn drop(&mut self) {
+        if self.cleanup {
+            let _ = std::fs::remove_file(&self.temp);
+        }
+    }
+}
+
+enum ParentOutput {
+    Trace {
+        stdout: std::fs::File,
+        file: Option<std::fs::File>,
+        privacy_mode: &'static str,
+    },
+    Profile {
+        pending: Option<PendingProfile>,
+    },
+}
+
+impl ParentOutput {
+    fn abort(&mut self) -> Result<(), String> {
+        let Self::Trace {
+            stdout,
+            file,
+            privacy_mode,
+        } = self
+        else {
+            return Ok(());
+        };
+        let label = serde_json::to_string(privacy_mode)
+            .map_err(|error| format!("serializing privacy mode failed: {error}"))?;
+        let record = format!(
+            "\nEVIDENCE {{\"completeness\":\"PARTIAL\",\"privacy_mode\":{label},\"capture_aborted\":\"object_lease_break\",\"final_drain\":false,\"counters_available\":false,\"event_loss\":null}}\n"
+        );
+        debug_assert!(record.len() < 512);
+        if let Some(file) = file {
+            file.write_all(record.as_bytes())
+                .map_err(|error| format!("writing mandatory trace abort record failed: {error}"))?;
+            file.flush().map_err(|error| {
+                format!("flushing mandatory trace abort record failed: {error}")
+            })?;
+            file.sync_data()
+                .map_err(|error| format!("syncing mandatory trace abort record failed: {error}"))?;
+        }
+        bounded_stdout_write(stdout, record.as_bytes());
+        Ok(())
+    }
+
+    fn finish(self, completed: bool, status: libc::c_int) -> Result<(), String> {
+        if let Self::Profile {
+            pending: Some(pending),
+        } = self
+            && completed
+            && libc::WIFEXITED(status)
+            && libc::WEXITSTATUS(status) == 0
+        {
+            pending.publish()?;
+        }
+        Ok(())
+    }
+}
+
+pub struct WorkerContext {
+    stdout: std::fs::File,
+    output: Option<std::fs::File>,
+    profile: bool,
+    objects: VerifiedObjects,
+}
+
+impl WorkerContext {
+    pub fn stdout(&mut self) -> &mut std::fs::File {
+        &mut self.stdout
+    }
+
+    pub fn output(&mut self) -> Option<&mut std::fs::File> {
+        self.output.as_mut()
+    }
+
+    pub fn objects(&self) -> &VerifiedObjects {
+        &self.objects
+    }
+
+    pub fn output_parts(
+        &mut self,
+    ) -> (
+        &mut std::fs::File,
+        &mut Option<std::fs::File>,
+        &VerifiedObjects,
+    ) {
+        (&mut self.stdout, &mut self.output, &self.objects)
+    }
+
+    /// Call after the capture loop has installed its SIGINT handler. SIGTERM
+    /// retains its default terminating disposition.
+    pub fn unblock_operator_signals(&mut self) -> Result<(), String> {
+        // SAFETY: the initialized set is used only to unblock these two
+        // operator signals in the single-threaded capture worker.
+        unsafe {
+            let mut operators = std::mem::zeroed();
+            if libc::sigemptyset(&mut operators) == -1
+                || libc::sigaddset(&mut operators, libc::SIGINT) == -1
+                || libc::sigaddset(&mut operators, libc::SIGTERM) == -1
+            {
+                return Err(format!(
+                    "preparing worker operator signal set failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let error = libc::pthread_sigmask(libc::SIG_UNBLOCK, &operators, std::ptr::null_mut());
+            if error != 0 {
+                return Err(format!(
+                    "unblocking worker operator signals failed: {}",
+                    std::io::Error::from_raw_os_error(error)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        self.stdout
+            .flush()
+            .map_err(|error| format!("flushing worker stdout failed: {error}"))?;
+        if let Some(file) = &mut self.output {
+            file.flush()
+                .map_err(|error| format!("flushing worker output failed: {error}"))?;
+            if self.profile {
+                file.sync_all()
+                    .map_err(|error| format!("syncing temporary profile failed: {error}"))?;
+            } else {
+                file.sync_data()
+                    .map_err(|error| format!("syncing trace output failed: {error}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorOutcome {
+    Exited(i32),
+    Signaled(i32),
+    LeaseBroken,
+}
+
+pub fn supervise_capture(
+    signals: CaptureSignals,
+    objects: VerifiedObjects,
+    output: SupervisorOutput,
+    worker: impl FnOnce(&mut WorkerContext) -> Result<(), String>,
+) -> Result<SupervisorOutcome, String> {
+    let threads = thread_count()?;
+    if threads != 1 {
+        return Err(format!(
+            "capture supervisor requires a single-threaded process before fork; found {threads} threads"
+        ));
+    }
+
+    let (parent_control, child_control) = socket_pair()?;
+    let parent_pid = unsafe { libc::getpid() };
+    // SAFETY: the process is proven single-threaded at this exact point. The
+    // child touches only owned descriptors/state and terminates with _exit.
+    let child = unsafe { libc::fork() };
+    if child == -1 {
+        return Err(format!(
+            "forking capture worker failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if child == 0 {
+        worker_process(
+            parent_pid,
+            parent_control,
+            child_control,
+            signals,
+            objects,
+            output,
+            worker,
+        );
+    }
+
+    drop(child_control);
+    drop(worker);
+    let mut parent_output = output.into_parent();
+    let pidfd = match pidfd_open(child) {
+        Ok(pidfd) => pidfd,
+        Err(error) => {
+            unsafe { libc::kill(child, libc::SIGKILL) };
+            let _ = wait_child(child);
+            return Err(format!("opening capture worker pidfd failed: {error}"));
+        }
+    };
+
+    let mut ready = false;
+    let mut completed = false;
+    let mut worker_failed = false;
+    let mut lease_broken = false;
+    let mut operator_deadline: Option<Instant> = None;
+    let mut malformed_completion = false;
+    let mut deadline_expired = false;
+
+    let protocol = (|| -> Result<(), String> {
+        while !ready {
+            match poll_supervisor(&signals, &parent_control, &pidfd, operator_deadline)? {
+                SupervisorEvent::Signal(signal) if signal == libc::SIGIO => {
+                    lease_broken = true;
+                    return Ok(());
+                }
+                SupervisorEvent::Signal(signal)
+                    if signal == libc::SIGINT || signal == libc::SIGTERM =>
+                {
+                    pidfd_send_signal(&pidfd, signal)?;
+                    operator_deadline.get_or_insert_with(|| Instant::now() + OPERATOR_GRACE);
+                }
+                SupervisorEvent::Control(READY) => ready = true,
+                SupervisorEvent::Control(_) => {
+                    malformed_completion = true;
+                    return Ok(());
+                }
+                SupervisorEvent::Exited => return Ok(()),
+                SupervisorEvent::Deadline => {
+                    deadline_expired = true;
+                    return Ok(());
+                }
+                SupervisorEvent::Signal(_) => {}
+            }
+        }
+
+        if objects.ensure_stable().is_err()
+            || pending_lease_break(&signals, &pidfd, &mut operator_deadline)?
+        {
+            lease_broken = true;
+            return Ok(());
+        }
+        send_packet(&parent_control, GO)?;
+
+        while !lease_broken && !malformed_completion {
+            match poll_supervisor(&signals, &parent_control, &pidfd, operator_deadline)? {
+                SupervisorEvent::Signal(signal) if signal == libc::SIGIO => {
+                    lease_broken = true;
+                    return Ok(());
+                }
+                SupervisorEvent::Signal(signal)
+                    if signal == libc::SIGINT || signal == libc::SIGTERM =>
+                {
+                    pidfd_send_signal(&pidfd, signal)?;
+                    operator_deadline.get_or_insert_with(|| Instant::now() + OPERATOR_GRACE);
+                }
+                SupervisorEvent::Control(DONE) if !completed => completed = true,
+                SupervisorEvent::Control(FAILED) if !completed && !worker_failed => {
+                    worker_failed = true;
+                }
+                SupervisorEvent::Control(_) => {
+                    malformed_completion = true;
+                    return Ok(());
+                }
+                SupervisorEvent::Exited => return Ok(()),
+                SupervisorEvent::Deadline => {
+                    deadline_expired = true;
+                    return Ok(());
+                }
+                SupervisorEvent::Signal(_) => {}
+            }
+        }
+        Ok(())
+    })();
+
+    let mut supervisor_error = protocol.err();
+    if lease_broken || malformed_completion || deadline_expired || supervisor_error.is_some() {
+        if let Err(error) = pidfd_send_signal(&pidfd, libc::SIGKILL) {
+            supervisor_error.get_or_insert(error);
+        }
+    }
+    if let Err(error) = wait_pidfd(&pidfd) {
+        supervisor_error.get_or_insert(error);
+    }
+    let status = wait_child(child);
+    if let Err(error) = &status {
+        supervisor_error.get_or_insert_with(|| error.clone());
+    }
+    if objects.ensure_stable().is_err() {
+        lease_broken = true;
+    }
+    match pending_lease_break(&signals, &pidfd, &mut operator_deadline) {
+        Ok(broken) => lease_broken |= broken,
+        Err(error) => {
+            lease_broken = true;
+            supervisor_error.get_or_insert(error);
+        }
+    }
+    drop(objects);
+
+    if lease_broken {
+        if let Err(error) = parent_output.abort() {
+            eprintln!("p11scope: {error}");
+        }
+        return Ok(SupervisorOutcome::LeaseBroken);
+    }
+    let status = status?;
+    parent_output.finish(
+        completed && !worker_failed && !malformed_completion && supervisor_error.is_none(),
+        status,
+    )?;
+    if let Some(error) = supervisor_error {
+        return Err(error);
+    }
+    if libc::WIFEXITED(status) {
+        Ok(SupervisorOutcome::Exited(libc::WEXITSTATUS(status)))
+    } else if libc::WIFSIGNALED(status) {
+        Ok(SupervisorOutcome::Signaled(libc::WTERMSIG(status)))
+    } else {
+        Err("capture worker ended with an unknown wait status".into())
+    }
+}
+
+fn thread_count() -> Result<usize, String> {
+    std::fs::read_dir("/proc/self/task")
+        .map_err(|error| format!("checking capture thread count failed: {error}"))?
+        .try_fold(0usize, |count, entry| entry.map(|_| count + 1))
+        .map_err(|error| format!("checking capture thread count failed: {error}"))
+}
+
+const READY: u8 = b'R';
+const GO: u8 = b'G';
+const DONE: u8 = b'D';
+const FAILED: u8 = b'F';
+const OPERATOR_GRACE: Duration = Duration::from_secs(2);
+
+fn worker_process(
+    parent_pid: libc::pid_t,
+    parent_control: OwnedFd,
+    child_control: OwnedFd,
+    signals: CaptureSignals,
+    objects: VerifiedObjects,
+    output: SupervisorOutput,
+    worker: impl FnOnce(&mut WorkerContext) -> Result<(), String>,
+) -> ! {
+    drop(parent_control);
+    signals.worker_inherits_mask();
+    // SAFETY: scalar prctl arguments request uncatchable teardown if the
+    // supervisor disappears. The getppid recheck closes the setup race.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } == -1
+        || unsafe { libc::getppid() } != parent_pid
+        || send_packet(&child_control, READY).is_err()
+        || receive_packet(&child_control) != Ok(Some(GO))
+    {
+        unsafe { libc::_exit(70) }
+    }
+    let mut context = output.into_worker(objects);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker(&mut context)));
+    let code = match result {
+        Ok(Ok(())) => match context.finish() {
+            Ok(()) if send_packet(&child_control, DONE).is_ok() => 0,
+            Ok(()) => 71,
+            Err(error) => {
+                eprintln!("p11scope: {error}");
+                1
+            }
+        },
+        Ok(Err(error)) => {
+            eprintln!("p11scope: {error}");
+            1
+        }
+        Err(_) => 101,
+    };
+    if code != 0 {
+        let _ = send_packet(&child_control, FAILED);
+    }
+    unsafe { libc::_exit(code) }
+}
+
+enum SupervisorEvent {
+    Signal(i32),
+    Control(u8),
+    Exited,
+    Deadline,
+}
+
+fn poll_supervisor(
+    signals: &CaptureSignals,
+    control: &OwnedFd,
+    pidfd: &OwnedFd,
+    deadline: Option<Instant>,
+) -> Result<SupervisorEvent, String> {
+    let timeout = deadline
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        .map(|remaining| remaining.as_millis().min(i32::MAX as u128) as i32)
+        .unwrap_or(-1);
+    let mut fds = [
+        libc::pollfd {
+            fd: signals.fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: control.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+        if result > 0 {
+            break;
+        }
+        if result == 0 {
+            return Ok(SupervisorEvent::Deadline);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(format!("polling capture supervisor failed: {error}"));
+        }
+    }
+    if fds[0].revents & libc::POLLIN != 0 {
+        return read_signal(signals).map(SupervisorEvent::Signal);
+    }
+    if fds[1].revents & libc::POLLIN != 0 {
+        return Ok(match receive_packet(control)? {
+            Some(packet) => SupervisorEvent::Control(packet),
+            None => SupervisorEvent::Exited,
+        });
+    }
+    if fds[2].revents & libc::POLLIN != 0 {
+        return Ok(SupervisorEvent::Exited);
+    }
+    if fds[1].revents & libc::POLLHUP != 0 {
+        return Ok(SupervisorEvent::Exited);
+    }
+    Err("capture supervisor poll returned no recognized event".into())
+}
+
+fn read_signal(signals: &CaptureSignals) -> Result<i32, String> {
+    let mut info: libc::signalfd_siginfo = unsafe { std::mem::zeroed() };
+    let read = unsafe {
+        libc::read(
+            signals.fd.as_raw_fd(),
+            (&mut info as *mut libc::signalfd_siginfo).cast(),
+            std::mem::size_of::<libc::signalfd_siginfo>(),
+        )
+    };
+    if read == std::mem::size_of::<libc::signalfd_siginfo>() as isize {
+        Ok(info.ssi_signo as i32)
+    } else if read == -1 {
+        Err(format!(
+            "reading capture signalfd failed: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Err("capture signalfd returned a short record".into())
+    }
+}
+
+fn pending_lease_break(
+    signals: &CaptureSignals,
+    pidfd: &OwnedFd,
+    operator_deadline: &mut Option<Instant>,
+) -> Result<bool, String> {
+    loop {
+        let mut pollfd = libc::pollfd {
+            fd: signals.fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        if result == 0 {
+            return Ok(false);
+        }
+        if result == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("polling capture signalfd failed: {error}"));
+        }
+        match read_signal(signals)? {
+            libc::SIGIO => return Ok(true),
+            signal @ (libc::SIGINT | libc::SIGTERM) => {
+                pidfd_send_signal(pidfd, signal)?;
+                operator_deadline.get_or_insert_with(|| Instant::now() + OPERATOR_GRACE);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn socket_pair() -> Result<(OwnedFd, OwnedFd), String> {
+    let mut fds = [-1; 2];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    } == -1
+    {
+        return Err(format!(
+            "creating capture start barrier failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+fn send_packet(fd: &OwnedFd, packet: u8) -> Result<(), String> {
+    let sent = unsafe { libc::send(fd.as_raw_fd(), (&packet as *const u8).cast(), 1, 0) };
+    if sent == 1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "sending capture supervisor record failed: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+fn receive_packet(fd: &OwnedFd) -> Result<Option<u8>, String> {
+    let mut packet = 0u8;
+    loop {
+        let received = unsafe { libc::recv(fd.as_raw_fd(), (&mut packet as *mut u8).cast(), 1, 0) };
+        if received == 1 {
+            return Ok(Some(packet));
+        }
+        if received == 0 {
+            return Ok(None);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(format!("reading capture supervisor record failed: {error}"));
+        }
+    }
+}
+
+fn pidfd_open(pid: libc::pid_t) -> std::io::Result<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+    if fd == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+fn pidfd_send_signal(pidfd: &OwnedFd, signal: i32) -> Result<(), String> {
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(format!(
+                "signaling capture worker through pidfd failed: {error}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn wait_pidfd(pidfd: &OwnedFd) -> Result<(), String> {
+    let mut pollfd = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut pollfd, 1, -1) };
+        if result > 0 && pollfd.revents & libc::POLLIN != 0 {
+            return Ok(());
+        }
+        if result > 0 {
+            return Err(format!(
+                "waiting for capture worker pidfd returned events {:#x}",
+                pollfd.revents
+            ));
+        }
+        if result == -1 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+        {
+            return Err(format!(
+                "waiting for capture worker pidfd failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+}
+
+fn wait_child(pid: libc::pid_t) -> Result<libc::c_int, String> {
+    let mut status = 0;
+    loop {
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if waited == pid {
+            return Ok(status);
+        }
+        let error = std::io::Error::last_os_error();
+        if waited != -1 || error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(format!("waiting for capture worker failed: {error}"));
+        }
+    }
+}
+
+fn bounded_stdout_write(stdout: &mut std::fs::File, bytes: &[u8]) {
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+    let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1
+        || unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+    {
+        return;
+    }
+    let mut pollfd = libc::pollfd {
+        fd: stdout.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut pollfd, 1, 20) } > 0 {
+        let _ = stdout.write(bytes);
+    }
+}
+
+fn duplicate_fd(fd: libc::c_int) -> std::io::Result<OwnedFd> {
+    // SAFETY: fcntl duplicates the live descriptor and returns independent fd
+    // ownership on success.
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: successful F_DUPFD_CLOEXEC returned a new owned descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+    }
+}
 
 /// Reads one regular, bounded UTF-8 manifest. The descriptor is opened before
 /// metadata and content are inspected, so replacing its pathname cannot mix
@@ -96,31 +1018,24 @@ impl VerifiedObjects {
 }
 
 #[derive(Debug)]
-pub(crate) struct LeaseMonitor {
-    broken: Arc<AtomicBool>,
-    signal_id: signal_hook::SigId,
-}
+pub(crate) struct LeaseMonitor;
 
 impl LeaseMonitor {
-    pub(crate) fn new() -> Result<Self, String> {
-        let broken = Arc::new(AtomicBool::new(false));
-        let signal_flag = Arc::clone(&broken);
-        // SAFETY: the handler performs only an atomic store and `_exit`, both
-        // async-signal-safe. Exiting immediately ensures probes disappear
-        // before a writer waiting on the broken lease can modify the object.
-        let signal_id = unsafe {
-            signal_hook::low_level::register(libc::SIGIO, move || {
-                signal_flag.store(true, Ordering::SeqCst);
-                libc::_exit(OBJECT_CHANGED_EXIT);
-            })
-        }
-        .map_err(|error| format!("installing object-lease signal handler failed: {error}"))?;
-        Ok(Self { broken, signal_id })
+    pub(crate) fn new() -> Self {
+        Self
     }
 
     pub(crate) fn acquire(&self, file: &std::fs::File) -> Result<(), String> {
-        // SAFETY: fcntl receives a live descriptor and the integer lease type
-        // required by Linux F_SETLEASE.
+        // SAFETY: fcntl receives a live descriptor, this single-threaded
+        // process's pid as the positive F_SETOWN recipient, and the Linux read
+        // lease type. Ownership is set before acquisition so no lease-break
+        // notification can race with recipient selection.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETOWN, libc::getpid()) } == -1 {
+            return Err(format!(
+                "setting object lease signal owner failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
         if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLEASE, libc::F_RDLCK) } == -1 {
             return Err(format!(
                 "cannot acquire required read lease: {}; the observer needs file ownership or CAP_LEASE, and the object must have no writer",
@@ -134,9 +1049,6 @@ impl LeaseMonitor {
         &self,
         files: impl IntoIterator<Item = &'a std::fs::File>,
     ) -> Result<(), String> {
-        if self.broken.load(Ordering::SeqCst) {
-            return Err("an authorized object changed while capture was active".into());
-        }
         for file in files {
             // SAFETY: F_GETLEASE only queries the lease on this live fd.
             let lease = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLEASE) };
@@ -150,16 +1062,7 @@ impl LeaseMonitor {
                 return Err("an authorized object changed while capture was active".into());
             }
         }
-        if self.broken.load(Ordering::SeqCst) {
-            return Err("an authorized object changed while capture was active".into());
-        }
         Ok(())
-    }
-}
-
-impl Drop for LeaseMonitor {
-    fn drop(&mut self) {
-        signal_hook::low_level::unregister(self.signal_id);
     }
 }
 
@@ -200,6 +1103,12 @@ impl SynchronousLeaseMonitor {
     }
 
     pub(crate) fn acquire(&self, file: &std::fs::File) -> Result<(), String> {
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETOWN, libc::getpid()) } == -1 {
+            return Err(format!(
+                "setting provenance lease signal owner failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
         if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLEASE, libc::F_RDLCK) } == -1 {
             return Err(format!(
                 "cannot acquire required read lease: {}; the observer needs file ownership or CAP_LEASE, and the object must have no writer",
@@ -967,10 +1876,7 @@ pub fn check_reuse(m: &Manifest) -> Result<VerifiedObjects, Vec<String>> {
         return Err(problems);
     }
 
-    let lease = match LeaseMonitor::new() {
-        Ok(lease) => lease,
-        Err(error) => return Err(vec![error]),
-    };
+    let lease = LeaseMonitor::new();
     let mut pinned = Vec::new();
     let mut total_object_bytes = 0u64;
     for object in &m.objects {

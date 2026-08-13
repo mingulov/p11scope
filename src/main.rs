@@ -331,9 +331,32 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
         std::process::exit(2);
     }
 
+    let signals = verify::CaptureSignals::block().map_err(anyhow::Error::msg)?;
     let (manifest, plan, objects) = load_plan(&manifest_path, &provenance_module)?;
+    let output = verify::SupervisorOutput::profile(out.clone()).map_err(anyhow::Error::msg)?;
+    let outcome = verify::supervise_capture(signals, objects, output, move |worker| {
+        capture_profile(manifest, plan, scope, mode, duration, out.is_some(), worker)
+            .map_err(|error| format!("{error:#}"))
+    })
+    .map_err(anyhow::Error::msg)?;
+    finish_supervised_capture(outcome)
+}
 
-    let mut session = Session::start(&plan, &scope, &objects).context("starting attach session")?;
+fn capture_profile(
+    manifest: Manifest,
+    plan: plan::AttachPlan,
+    scope: Scope,
+    mode: String,
+    duration: Option<u64>,
+    has_output: bool,
+    worker: &mut verify::WorkerContext,
+) -> Result<()> {
+    let interrupted = install_sigint_flag()?;
+    worker
+        .unblock_operator_signals()
+        .map_err(anyhow::Error::msg)?;
+    let (stdout, output, objects) = worker.output_parts();
+    let mut session = Session::start(&plan, &scope, objects).context("starting attach session")?;
     objects
         .verify_stable()
         .map_err(anyhow::Error::msg)
@@ -365,9 +388,6 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
         Ok(drain.malformed())
     };
 
-    let interrupted = install_sigint_flag()?;
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
     let mut stdout_open = true;
     let wall_start = SystemTime::now();
     let clock = Instant::now();
@@ -404,12 +424,12 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
             .map_err(anyhow::Error::msg)
             .context("authorized provider object changed during capture")?;
         write_stdout(
-            &mut stdout,
+            stdout,
             &mut stdout_open,
             format!("\x1b[2J\x1b[H{frame}").as_bytes(),
         )?;
-        flush_stdout(&mut stdout, &mut stdout_open)?;
-        if !stdout_open && out.is_none() {
+        flush_stdout(stdout, &mut stdout_open)?;
+        if !stdout_open && !has_output {
             break;
         }
         std::thread::sleep(Duration::from_secs(1));
@@ -443,13 +463,13 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
         .map_err(anyhow::Error::msg)
         .context("authorized provider object changed during capture")?;
     write_stdout(
-        &mut stdout,
+        stdout,
         &mut stdout_open,
         format!("\x1b[2J\x1b[H{frame}").as_bytes(),
     )?;
-    flush_stdout(&mut stdout, &mut stdout_open)?;
+    flush_stdout(stdout, &mut stdout_open)?;
 
-    if let Some(out_path) = out {
+    if let Some(out_file) = output.as_mut() {
         let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
             .unwrap_or_default()
             .trim()
@@ -477,9 +497,10 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
             .ensure_stable()
             .map_err(anyhow::Error::msg)
             .context("authorized provider object changed during capture")?;
-        write_json_report(&out_path, &j)?;
+        write_json_report(out_file, &j)?;
     }
 
+    drop(session);
     Ok(())
 }
 
@@ -488,9 +509,10 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
 /// `interrupted`: finalization does not know or care which. Factored out
 /// so that fact is directly testable (see `tests::shutdown_path_writes_a_valid_json_report`)
 /// without standing up a real attach session.
-fn write_json_report(path: &std::path::Path, j: &serde_json::Value) -> Result<()> {
-    std::fs::write(path, serde_json::to_vec_pretty(j)?)
-        .with_context(|| format!("writing {}", path.display()))
+fn write_json_report(writer: &mut dyn Write, j: &serde_json::Value) -> Result<()> {
+    writer
+        .write_all(&serde_json::to_vec_pretty(j)?)
+        .context("writing profile output")
 }
 
 /// `p11scope trace`: one line per completed call, printed as it arrives,
@@ -554,9 +576,29 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
         );
     }
     let scope = resolve_scope(pid, cgroup)?;
+    let signals = verify::CaptureSignals::block().map_err(anyhow::Error::msg)?;
     let (_manifest, plan, objects) = load_plan(&manifest_path, &provenance_module)?;
+    let output = verify::SupervisorOutput::trace(out, "unsafe-unvalidated-metadata")
+        .map_err(anyhow::Error::msg)?;
+    let outcome = verify::supervise_capture(signals, objects, output, move |worker| {
+        capture_trace(plan, scope, duration, worker).map_err(|error| format!("{error:#}"))
+    })
+    .map_err(anyhow::Error::msg)?;
+    finish_supervised_capture(outcome)
+}
 
-    let mut session = Session::start(&plan, &scope, &objects).context("starting attach session")?;
+fn capture_trace(
+    plan: plan::AttachPlan,
+    scope: Scope,
+    duration: Option<u64>,
+    worker: &mut verify::WorkerContext,
+) -> Result<()> {
+    let interrupted = install_sigint_flag()?;
+    worker
+        .unblock_operator_signals()
+        .map_err(anyhow::Error::msg)?;
+    let (stdout, out_file, objects) = worker.output_parts();
+    let mut session = Session::start(&plan, &scope, objects).context("starting attach session")?;
     objects
         .verify_stable()
         .map_err(anyhow::Error::msg)
@@ -568,16 +610,6 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
     load_mech_shapes(&mut state)?;
     let mut tracer = trace::Tracer::new(&plan);
 
-    let mut out_file: Option<std::io::BufWriter<std::fs::File>> = match &out {
-        Some(p) => Some(std::io::BufWriter::new(
-            std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
-        )),
-        None => None,
-    };
-
-    let interrupted = install_sigint_flag()?;
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
     let mut stdout_open = true;
     let mut malformed_records: u64 = 0;
     let mut last_reported_loss: u64 = 0;
@@ -596,9 +628,9 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
             &mut state,
             &mut process_tracker,
             &mut tracer,
-            &mut stdout,
+            stdout,
             &mut stdout_open,
-            &mut out_file,
+            out_file,
         )?;
         retire_exited(&mut process_tracker, &mut state);
         objects
@@ -608,11 +640,11 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
         report_trace_loss(
             &session,
             &mut last_reported_loss,
-            &mut stdout,
+            stdout,
             &mut stdout_open,
-            &mut out_file,
+            out_file,
         )?;
-        flush_stdout(&mut stdout, &mut stdout_open)?;
+        flush_stdout(stdout, &mut stdout_open)?;
         if let Some(f) = out_file.as_mut() {
             f.flush().context("flushing trace output file")?;
         }
@@ -630,9 +662,9 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
         &mut state,
         &mut process_tracker,
         &mut tracer,
-        &mut stdout,
+        stdout,
         &mut stdout_open,
-        &mut out_file,
+        out_file,
     )?;
     retire_exited(&mut process_tracker, &mut state);
     objects
@@ -642,9 +674,9 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
     report_trace_loss(
         &session,
         &mut last_reported_loss,
-        &mut stdout,
+        stdout,
         &mut stdout_open,
-        &mut out_file,
+        out_file,
     )?;
     let reports = metrics::read(&session, &plan)?;
     let evidence = evidence_for(
@@ -662,9 +694,9 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
         .context("authorized provider object changed during capture")?;
     emit_trace_line(
         &trace::evidence_line(&evidence),
-        &mut stdout,
+        stdout,
         &mut stdout_open,
-        &mut out_file,
+        out_file,
     )?;
     if malformed_records > 0 {
         eprintln!(
@@ -675,7 +707,21 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
         f.flush().context("flushing trace output file")?;
     }
 
+    drop(session);
     Ok(())
+}
+
+fn finish_supervised_capture(outcome: verify::SupervisorOutcome) -> Result<()> {
+    match outcome {
+        verify::SupervisorOutcome::Exited(0) => Ok(()),
+        verify::SupervisorOutcome::Exited(code) => std::process::exit(code),
+        verify::SupervisorOutcome::LeaseBroken => std::process::exit(verify::OBJECT_CHANGED_EXIT),
+        verify::SupervisorOutcome::Signaled(signal) => unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+            std::process::exit(128 + signal)
+        },
+    }
 }
 
 /// Prints (and, if given, appends to the `-o` file) every rendered line.
@@ -1042,7 +1088,8 @@ mod tests {
         let path = dir.path().join("observed.json");
         let j = serde_json::json!({"schema": "pkcs11-scope/observed-profile/v1.3", "evidence": {}});
 
-        write_json_report(&path, &j).expect("shutdown finalization must write the report");
+        let mut file = std::fs::File::create(&path).unwrap();
+        write_json_report(&mut file, &j).expect("shutdown finalization must write the report");
 
         let written = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");

@@ -154,6 +154,29 @@ pub const FLAG_POLICY_ALLOWLISTED: u64 = 1 << 2;
 pub const FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA: u64 = 1 << 3;
 pub const FLAG_POLICY_AGGREGATE: u64 = 1 << 4;
 
+/// A loaded program may observe only an explicitly selected scope under one
+/// immutable capture policy. Unknown and multi-bit configurations fail closed.
+pub const fn valid_config(flags: u64) -> bool {
+    let scope = flags & (FLAG_PID_FILTER | FLAG_CGROUP_FILTER);
+    let policy = flags
+        & (FLAG_POLICY_ALLOWLISTED
+            | FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA
+            | FLAG_POLICY_AGGREGATE);
+    let known = FLAG_PID_FILTER
+        | FLAG_CGROUP_FILTER
+        | FLAG_POLICY_ALLOWLISTED
+        | FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA
+        | FLAG_POLICY_AGGREGATE;
+    matches!(scope, FLAG_PID_FILTER | FLAG_CGROUP_FILTER)
+        && matches!(
+            policy,
+            FLAG_POLICY_ALLOWLISTED
+                | FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA
+                | FLAG_POLICY_AGGREGATE
+        )
+        && flags & !known == 0
+}
+
 /// Per-slot aggregates. `entered - returned` is the in-flight count;
 /// they are separate counters precisely so a call that never returns is
 /// visible rather than silently absent.

@@ -1,9 +1,56 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
 fn read(path: &str) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| panic!("reading {path}: {error}"))
+}
+
+fn embedded_map_definitions() -> BTreeMap<String, [u32; 7]> {
+    let directory = tempfile::tempdir().expect("temporary map-inspection directory");
+    let object = directory.path().join("p11scope-ebpf");
+    let maps = directory.path().join("maps.bin");
+    fs::write(&object, p11scope::EBPF_OBJECT).expect("write embedded eBPF object");
+
+    let symbols = Command::new("llvm-readelf")
+        .args(["-sW", object.to_str().unwrap()])
+        .output()
+        .expect("run llvm-readelf");
+    assert!(
+        symbols.status.success(),
+        "{}",
+        String::from_utf8_lossy(&symbols.stderr)
+    );
+    let dump = format!("maps={}", maps.display());
+    let sections = Command::new("llvm-objcopy")
+        .args(["--dump-section", &dump, object.to_str().unwrap()])
+        .output()
+        .expect("run llvm-objcopy");
+    assert!(
+        sections.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sections.stderr)
+    );
+    let data = fs::read(maps).expect("read legacy map definitions");
+
+    String::from_utf8(symbols.stdout)
+        .expect("UTF-8 symbol table")
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 8 || fields[3] != "OBJECT" || fields[6].parse::<u32>().is_err() {
+                return None;
+            }
+            let offset = usize::from_str_radix(fields[1], 16).ok()?;
+            let bytes = data.get(offset..offset + 28)?;
+            let mut definition = [0; 7];
+            for (value, chunk) in definition.iter_mut().zip(bytes.chunks_exact(4)) {
+                *value = u32::from_le_bytes(chunk.try_into().unwrap());
+            }
+            Some((fields[7].to_string(), definition))
+        })
+        .collect()
 }
 
 #[test]
@@ -35,6 +82,30 @@ fn metadata_feature_matrix() {
     let build = read("build.rs");
     assert!(build.contains("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA"));
     assert!(build.contains("features.join(\",\")"));
+}
+
+#[test]
+fn immutable_policy_maps() {
+    const BPF_F_RDONLY_PROG: u32 = 1 << 7;
+    const FLAGS: usize = 4;
+    let definitions = embedded_map_definitions();
+
+    for name in [
+        "CONFIG",
+        "PID_FILTER",
+        "SLOT_SEMANTICS",
+        "ASYNC_FUNCTIONS",
+        "MECH_SHAPE",
+        "ATTR_BOOL_BITS",
+    ] {
+        assert_eq!(definitions[name][FLAGS], BPF_F_RDONLY_PROG, "{name}");
+    }
+    for name in ["CGROUP_FILTER", "TEMPLATE_TAIL"] {
+        assert_eq!(definitions[name][FLAGS], 0, "{name}");
+    }
+    for name in ["STATS", "START", "RV_COUNTS", "EVENTS", "EVIDENCE"] {
+        assert_eq!(definitions[name][FLAGS], 0, "dynamic map {name}");
+    }
 }
 
 #[test]

@@ -3,7 +3,7 @@
 //! (`src/lib.rs`) so integration tests can exercise them directly.
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use p11scope::attach::{Scope, Session};
+use p11scope::attach::{CapturePolicy, Scope, Session};
 use p11scope::{
     discover_cmd, events, metrics, plan, process, render, scope, semantics, trace, verify,
 };
@@ -356,7 +356,13 @@ fn capture_profile(
         .unblock_operator_signals()
         .map_err(anyhow::Error::msg)?;
     let (stdout, output, objects) = worker.output_parts();
-    let mut session = Session::start(&plan, &scope, objects).context("starting attach session")?;
+    let policy = if mode == "metrics" {
+        CapturePolicy::AggregateOnly
+    } else {
+        CapturePolicy::Allowlisted
+    };
+    let mut session =
+        Session::start(&plan, &scope, objects, policy).context("starting attach session")?;
     objects
         .verify_stable()
         .map_err(anyhow::Error::msg)
@@ -598,7 +604,8 @@ fn capture_trace(
         .unblock_operator_signals()
         .map_err(anyhow::Error::msg)?;
     let (stdout, out_file, objects) = worker.output_parts();
-    let mut session = Session::start(&plan, &scope, objects).context("starting attach session")?;
+    let mut session = Session::start(&plan, &scope, objects, CapturePolicy::Allowlisted)
+        .context("starting attach session")?;
     objects
         .verify_stable()
         .map_err(anyhow::Error::msg)

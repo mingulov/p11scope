@@ -6,6 +6,7 @@
 #![no_main]
 
 use aya_ebpf::macros::{map, tracepoint, uprobe, uretprobe};
+use aya_ebpf::bindings::BPF_F_RDONLY_PROG;
 use aya_ebpf::maps::{
     Array, CgroupArray, HashMap, PerCpuArray, PerCpuHashMap, ProgramArray, RingBuf,
 };
@@ -20,14 +21,14 @@ use p11scope_ebpf_common::{
     FUNCTION_HASH_OFFSET, FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, MAX_ATTRS, MAX_MECH_SHAPES,
     MAX_SLOTS, MECH_NONE, RING_BYTES, RV_ENTRIES, RvKey, SESSION_NONE, START_ENTRIES,
     SlotSemantics, SlotStats, StartKey, USER_TYPE_NONE, bucket_of, capture, event_type,
-    function_hash_step, lifecycle, shape,
+    function_hash_step, lifecycle, shape, valid_config,
 };
 
 #[map]
-static CONFIG: Array<u64> = Array::with_max_entries(1, 0);
+static CONFIG: Array<u64> = Array::with_max_entries(1, BPF_F_RDONLY_PROG);
 
 #[map]
-static PID_FILTER: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
+static PID_FILTER: HashMap<u32, u8> = HashMap::with_max_entries(1024, BPF_F_RDONLY_PROG);
 
 #[map]
 static CGROUP_FILTER: CgroupArray = CgroupArray::with_max_entries(1, 0);
@@ -42,19 +43,21 @@ static START: HashMap<StartKey, CallStart> = HashMap::with_max_entries(START_ENT
 static RV_COUNTS: PerCpuHashMap<RvKey, u64> = PerCpuHashMap::with_max_entries(RV_ENTRIES, 0);
 
 #[map]
-static SLOT_SEMANTICS: Array<SlotSemantics> = Array::with_max_entries(MAX_SLOTS, 0);
+static SLOT_SEMANTICS: Array<SlotSemantics> =
+    Array::with_max_entries(MAX_SLOTS, BPF_F_RDONLY_PROG);
 
 /// Mechanism id -> parameter shape code, published by userspace from
 /// proxy-ng's registry. An unknown mechanism id looks up empty and is
 /// treated as `shape::NONE`.
 #[map]
-static MECH_SHAPE: HashMap<u64, u32> = HashMap::with_max_entries(MAX_MECH_SHAPES, 0);
+static MECH_SHAPE: HashMap<u64, u32> =
+    HashMap::with_max_entries(MAX_MECH_SHAPES, BPF_F_RDONLY_PROG);
 
 /// Attribute type -> allowlisted boolean mask. Keeping the catalog in a map
 /// avoids multiplying verifier states by eleven match arms for every one of
 /// the bounded template entries.
 #[map]
-static ATTR_BOOL_BITS: HashMap<u32, u32> = HashMap::with_max_entries(16, 0);
+static ATTR_BOOL_BITS: HashMap<u32, u32> = HashMap::with_max_entries(16, BPF_F_RDONLY_PROG);
 
 #[map]
 static TEMPLATE_TAIL: ProgramArray = ProgramArray::with_max_entries(1, 0);
@@ -62,7 +65,7 @@ static TEMPLATE_TAIL: ProgramArray = ProgramArray::with_max_entries(1, 0);
 /// FNV hash of an exact standard function name -> stable shared-table id.
 /// Raw `pFunctionName` bytes never leave the BPF stack.
 #[map]
-static ASYNC_FUNCTIONS: HashMap<u64, u32> = HashMap::with_max_entries(128, 0);
+static ASYNC_FUNCTIONS: HashMap<u64, u32> = HashMap::with_max_entries(128, BPF_F_RDONLY_PROG);
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(RING_BYTES, 0);
@@ -81,6 +84,9 @@ fn bump_evidence(index: u32) {
 
 fn in_scope() -> bool {
     let flags = CONFIG.get(CFG_FLAGS).copied().unwrap_or(0);
+    if !valid_config(flags) {
+        return false;
+    }
     if flags & FLAG_PID_FILTER != 0 {
         let tgid = (helpers::bpf_get_current_pid_tgid() >> 32) as u32;
         if unsafe { PID_FILTER.get(&tgid) }.is_some() {

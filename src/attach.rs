@@ -5,15 +5,119 @@ use crate::plan::AttachPlan;
 use crate::verify::VerifiedObjects;
 use anyhow::{Context as _, Result, anyhow, bail};
 use aya::Ebpf;
-use aya::maps::ProgramArray;
+use aya::maps::{Array, HashMap, Map, MapType, ProgramArray};
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeScope};
 use aya::programs::{TracePoint, UProbe};
 use p11scope_ebpf_common::{
     ARG_NONE, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
-    FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, SlotSemantics,
+    FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, MAX_SLOTS, SlotSemantics,
 };
 use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
+use std::collections::BTreeMap;
+use std::mem::size_of_val;
+use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::path::PathBuf;
+
+const BASE_POLICY_MAPS: [&str; 6] = [
+    "CONFIG",
+    "PID_FILTER",
+    "CGROUP_FILTER",
+    "SLOT_SEMANTICS",
+    "ASYNC_FUNCTIONS",
+    "MECH_SHAPE",
+];
+const FEATURE_POLICY_MAPS: [&str; 1] = ["ATTR_BOOL_BITS"];
+const TAIL_POLICY_MAP: &str = "TEMPLATE_TAIL";
+
+#[repr(C)]
+#[derive(Default)]
+struct BpfMapFreezeAttr {
+    map_fd: u32,
+}
+
+pub(crate) fn policy_map_data<'a>(name: &str, map: &'a Map) -> Result<&'a aya::maps::MapData> {
+    match map {
+        Map::Array(map) | Map::HashMap(map) | Map::CgroupArray(map) | Map::ProgramArray(map) => {
+            Ok(map)
+        }
+        other => bail!("refusing unexpected {name} policy map variant {other:?}"),
+    }
+}
+
+fn freeze_map(name: &str, map: &Map) -> Result<()> {
+    let data = policy_map_data(name, map)
+        .with_context(|| format!("refusing to freeze unexpected {name} map variant"))?;
+    let attr = BpfMapFreezeAttr {
+        map_fd: data.fd().as_fd().as_raw_fd() as u32,
+    };
+    // SAFETY: `attr` is the complete zero-reserved BPF_MAP_FREEZE command
+    // payload and its borrowed storage remains live for the syscall.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            22u32,
+            &attr as *const BpfMapFreezeAttr,
+            size_of_val(&attr),
+        )
+    };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("freezing {name}"));
+    }
+    Ok(())
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct BpfMapElementAttr {
+    map_fd: u32,
+    _pad: u32,
+    key: u64,
+    value: u64,
+    flags: u64,
+}
+
+fn program_array_lookup_result(
+    name: &str,
+    key: u32,
+    value: u32,
+    result: std::io::Result<()>,
+) -> Result<Option<u32>> {
+    match result {
+        Ok(()) => Ok(Some(value)),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading back {name}[{key}]")),
+    }
+}
+
+fn program_array_id(name: &str, map: &Map, key: u32) -> Result<Option<u32>> {
+    let data = match map {
+        Map::ProgramArray(map) => map,
+        other => bail!("refusing to read unexpected {name} map variant {other:?}"),
+    };
+    let mut value = 0u32;
+    let attr = BpfMapElementAttr {
+        map_fd: data.fd().as_fd().as_raw_fd() as u32,
+        key: (&key as *const u32) as u64,
+        value: (&mut value as *mut u32) as u64,
+        ..BpfMapElementAttr::default()
+    };
+    // SAFETY: `key`, `value`, and `attr` stay live for BPF_MAP_LOOKUP_ELEM;
+    // the map metadata has already pinned their exact u32 sizes.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            1u32,
+            &attr as *const BpfMapElementAttr,
+            size_of_val(&attr),
+        )
+    };
+    let result = if rc == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    };
+    program_array_lookup_result(name, key, value, result)
+}
 
 /// Which processes the capture covers. Scope is always explicit.
 #[derive(Debug, Clone)]
@@ -64,6 +168,8 @@ pub struct Session {
     pub ebpf: Ebpf,
     attach_failures: Vec<(u32, String)>,
     attached: usize,
+    _config: u64,
+    _cgroup_file: Option<std::fs::File>,
 }
 
 /// Renders `e` and every `.source()` beneath it, joined by `: `. Several
@@ -101,6 +207,210 @@ fn entry_program(semantics: &SlotSemantics) -> &'static str {
     }
 }
 
+fn publish_slot_semantics(ebpf: &mut Ebpf, plan: &AttachPlan) -> Result<()> {
+    let mut expected = vec![SlotSemantics::COUNT_ONLY; MAX_SLOTS as usize];
+    let mut seen = std::collections::BTreeSet::new();
+    for slot in &plan.slots {
+        if !seen.insert(slot.index) {
+            bail!("attach plan repeats slot {}", slot.index);
+        }
+        let target = expected
+            .get_mut(slot.index as usize)
+            .with_context(|| format!("slot {} exceeds SLOT_SEMANTICS capacity", slot.index))?;
+        if let Some(index) = slot.semantics.argument_indices().find(|index| *index > 6) {
+            bail!(
+                "slot {} requests forbidden argument index {index}",
+                slot.index
+            );
+        }
+        *target = slot.semantics;
+    }
+
+    let info = policy_map_data(
+        "SLOT_SEMANTICS",
+        ebpf.map("SLOT_SEMANTICS").context("SLOT_SEMANTICS map")?,
+    )?
+    .info()
+    .context("reading SLOT_SEMANTICS map info")?;
+    if info.map_type()? != MapType::Array || info.max_entries() != MAX_SLOTS {
+        bail!(
+            "SLOT_SEMANTICS has type {:?} and capacity {}, expected Array and {}",
+            info.map_type()?,
+            info.max_entries(),
+            MAX_SLOTS
+        );
+    }
+    let mut semantics: Array<_, SlotSemantics> = Array::try_from(
+        ebpf.map_mut("SLOT_SEMANTICS")
+            .context("SLOT_SEMANTICS map")?,
+    )?;
+    for (index, value) in expected.iter().copied().enumerate() {
+        semantics.set(index as u32, value, 0)?;
+    }
+    let semantics: Array<_, SlotSemantics> =
+        Array::try_from(ebpf.map("SLOT_SEMANTICS").context("SLOT_SEMANTICS map")?)?;
+    let actual = semantics.iter().collect::<Result<Vec<_>, _>>()?;
+    if actual != expected {
+        bail!("SLOT_SEMANTICS exact readback differs from the attach plan");
+    }
+    Ok(())
+}
+
+fn publish_async_catalog(ebpf: &mut Ebpf) -> Result<()> {
+    let fields = pkcs11_module::FUNCTION_LIST_FIELDS
+        .iter()
+        .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS)
+        .chain(pkcs11_module::FUNCTION_LIST_3_2_EXTRA_FIELDS);
+    let mut names = BTreeMap::new();
+    let mut by_hash = BTreeMap::new();
+    for (id, field) in fields.enumerate() {
+        let hash = p11scope_ebpf_common::function_name_hash(field.name);
+        if let Some(previous) = names.insert(hash, field.name) {
+            bail!(
+                "standard function-name hash collision: {previous} and {}",
+                field.name
+            );
+        }
+        by_hash.insert(hash, id as u32);
+    }
+
+    let info = policy_map_data(
+        "ASYNC_FUNCTIONS",
+        ebpf.map("ASYNC_FUNCTIONS").context("ASYNC_FUNCTIONS map")?,
+    )?
+    .info()
+    .context("reading ASYNC_FUNCTIONS map info")?;
+    if info.map_type()? != MapType::Hash || info.max_entries() != 128 {
+        bail!(
+            "ASYNC_FUNCTIONS has type {:?} and capacity {}, expected Hash and 128",
+            info.map_type()?,
+            info.max_entries()
+        );
+    }
+    let mut functions: HashMap<_, u64, u32> = HashMap::try_from(
+        ebpf.map_mut("ASYNC_FUNCTIONS")
+            .context("ASYNC_FUNCTIONS map")?,
+    )?;
+    for (&hash, &id) in &by_hash {
+        functions.insert(hash, id, 0)?;
+    }
+    let functions: HashMap<_, u64, u32> =
+        HashMap::try_from(ebpf.map("ASYNC_FUNCTIONS").context("ASYNC_FUNCTIONS map")?)?;
+    let actual = functions.iter().collect::<Result<BTreeMap<_, _>, _>>()?;
+    if actual != by_hash {
+        bail!("ASYNC_FUNCTIONS exact readback differs from the standard catalog");
+    }
+    Ok(())
+}
+
+fn publish_attribute_catalog(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
+    let Some(map) = ebpf.map("ATTR_BOOL_BITS") else {
+        if enabled {
+            bail!("ATTR_BOOL_BITS is missing from the diagnostic eBPF object");
+        }
+        return Ok(());
+    };
+    let info = policy_map_data("ATTR_BOOL_BITS", map)?
+        .info()
+        .context("reading ATTR_BOOL_BITS map info")?;
+    if info.map_type()? != MapType::Hash || info.max_entries() != 16 {
+        bail!(
+            "ATTR_BOOL_BITS has type {:?} and capacity {}, expected Hash and 16",
+            info.map_type()?,
+            info.max_entries()
+        );
+    }
+    let expected = if enabled {
+        p11scope_ebpf_common::attr_bool::TYPES_AND_BITS
+            .into_iter()
+            .map(|(attribute, bit)| (attribute, 1u32 << bit))
+            .collect::<BTreeMap<_, _>>()
+    } else {
+        BTreeMap::new()
+    };
+    let mut bits: HashMap<_, u32, u32> = HashMap::try_from(
+        ebpf.map_mut("ATTR_BOOL_BITS")
+            .context("ATTR_BOOL_BITS map")?,
+    )?;
+    for (&attribute, &mask) in &expected {
+        bits.insert(attribute, mask, 0)?;
+    }
+    let bits: HashMap<_, u32, u32> =
+        HashMap::try_from(ebpf.map("ATTR_BOOL_BITS").context("ATTR_BOOL_BITS map")?)?;
+    let actual = bits.iter().collect::<Result<BTreeMap<_, _>, _>>()?;
+    if actual != expected {
+        bail!("ATTR_BOOL_BITS exact readback differs from the selected policy");
+    }
+    Ok(())
+}
+
+fn freeze_published_maps(ebpf: &Ebpf) -> Result<()> {
+    for name in BASE_POLICY_MAPS {
+        freeze_map(name, ebpf.map(name).with_context(|| format!("{name} map"))?)?;
+    }
+    for name in FEATURE_POLICY_MAPS {
+        if let Some(map) = ebpf.map(name) {
+            freeze_map(name, map)?;
+        }
+    }
+    Ok(())
+}
+
+fn publish_and_freeze_template_tail(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
+    if ebpf.map(TAIL_POLICY_MAP).is_none() {
+        if enabled {
+            bail!("{TAIL_POLICY_MAP} is missing from the diagnostic eBPF object");
+        }
+        return Ok(());
+    }
+    let info = policy_map_data(
+        TAIL_POLICY_MAP,
+        ebpf.map(TAIL_POLICY_MAP).context("TEMPLATE_TAIL map")?,
+    )?
+    .info()
+    .context("reading TEMPLATE_TAIL map info")?;
+    if info.map_type()? != MapType::ProgramArray || info.max_entries() != 1 {
+        bail!(
+            "TEMPLATE_TAIL has type {:?} and capacity {}, expected ProgramArray and 1",
+            info.map_type()?,
+            info.max_entries()
+        );
+    }
+
+    if enabled {
+        let (tail_fd, expected_id) = {
+            let tail: &UProbe = ebpf
+                .program("p11_entry_template_second")
+                .context("program p11_entry_template_second missing from object")?
+                .try_into()?;
+            (tail.fd()?.try_clone()?, tail.info()?.id())
+        };
+        let mut tails: ProgramArray<_> =
+            ProgramArray::try_from(ebpf.map_mut(TAIL_POLICY_MAP).context("TEMPLATE_TAIL map")?)?;
+        tails.set(0, &tail_fd, 0)?;
+        let actual_id = program_array_id(
+            TAIL_POLICY_MAP,
+            ebpf.map(TAIL_POLICY_MAP).context("TEMPLATE_TAIL map")?,
+            0,
+        )?;
+        if actual_id != Some(expected_id) {
+            bail!(
+                "TEMPLATE_TAIL exact readback id {actual_id:?} differs from loaded program {expected_id}"
+            );
+        }
+    } else if let Some(id) = program_array_id(
+        TAIL_POLICY_MAP,
+        ebpf.map(TAIL_POLICY_MAP).context("TEMPLATE_TAIL map")?,
+        0,
+    )? {
+        bail!("TEMPLATE_TAIL unexpectedly contains program id {id} for the selected policy");
+    }
+    freeze_map(
+        TAIL_POLICY_MAP,
+        ebpf.map(TAIL_POLICY_MAP).context("TEMPLATE_TAIL map")?,
+    )
+}
+
 /// A kernel/environment that cannot load or attach BPF programs at all
 /// fails somewhere in `start_inner` below (map creation, program load,
 /// or the mechanism registry step never reaches that far) — never at
@@ -116,12 +426,17 @@ lockdown mode, a kernel below the supported floor (>= 5.15), missing BTF \
 docs/notes/phase5-unsupported.md for what each looks like when observed.";
 
 impl Session {
-    pub fn start(plan: &AttachPlan, scope: &Scope, objects: &VerifiedObjects) -> Result<Self> {
+    pub fn start(
+        plan: &AttachPlan,
+        scope: &Scope,
+        objects: &VerifiedObjects,
+        policy: CapturePolicy,
+    ) -> Result<Self> {
         objects
             .ensure_stable()
             .map_err(anyhow::Error::msg)
             .context("checking authorized provider objects before attach")?;
-        let session = Self::start_inner(plan, scope, objects)
+        let session = Self::start_inner(plan, scope, objects, policy)
             .map_err(|e| anyhow!("{e:#}\n{UNSUPPORTED_ENV_HINT}"))?;
         objects
             .ensure_stable()
@@ -130,46 +445,20 @@ impl Session {
         Ok(session)
     }
 
-    fn start_inner(plan: &AttachPlan, scope: &Scope, objects: &VerifiedObjects) -> Result<Self> {
+    fn start_inner(
+        plan: &AttachPlan,
+        scope: &Scope,
+        objects: &VerifiedObjects,
+        policy: CapturePolicy,
+    ) -> Result<Self> {
+        if policy.uses_unsafe_decoders() && !cfg!(feature = "unsafe-unvalidated-metadata") {
+            bail!("unsafe-unvalidated-metadata policy is absent from this eBPF object");
+        }
         let mut ebpf = Ebpf::load(crate::EBPF_OBJECT).context("loading BPF object")?;
-        crate::scope::apply(&mut ebpf, scope).context("installing scope filter")?;
-        {
-            let mut semantics: aya::maps::Array<_, p11scope_ebpf_common::SlotSemantics> =
-                aya::maps::Array::try_from(
-                    ebpf.map_mut("SLOT_SEMANTICS")
-                        .context("SLOT_SEMANTICS map")?,
-                )?;
-            for slot in &plan.slots {
-                if let Some(index) = slot.semantics.argument_indices().find(|index| *index > 6) {
-                    bail!(
-                        "slot {} requests forbidden argument index {index}",
-                        slot.index
-                    );
-                }
-                semantics.set(slot.index, slot.semantics, 0)?;
-            }
-        }
-        {
-            let fields = pkcs11_module::FUNCTION_LIST_FIELDS
-                .iter()
-                .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS)
-                .chain(pkcs11_module::FUNCTION_LIST_3_2_EXTRA_FIELDS);
-            let mut hashes = std::collections::BTreeMap::new();
-            let mut names: aya::maps::HashMap<_, u64, u32> = aya::maps::HashMap::try_from(
-                ebpf.map_mut("ASYNC_FUNCTIONS")
-                    .context("ASYNC_FUNCTIONS map")?,
-            )?;
-            for (id, field) in fields.enumerate() {
-                let hash = p11scope_ebpf_common::function_name_hash(field.name);
-                if let Some(previous) = hashes.insert(hash, field.name) {
-                    bail!(
-                        "standard function-name hash collision: {previous} and {}",
-                        field.name
-                    );
-                }
-                names.insert(hash, id as u32, 0)?;
-            }
-        }
+        let published_scope = crate::scope::publish(&mut ebpf, scope, policy)
+            .context("publishing scope and capture policy")?;
+        publish_slot_semantics(&mut ebpf, plan).context("publishing SLOT_SEMANTICS")?;
+        publish_async_catalog(&mut ebpf).context("publishing ASYNC_FUNCTIONS")?;
         {
             // Embedded defaults: this binary ships statically and has no
             // config-file plumbing yet, so `None` is the only reachable
@@ -179,15 +468,12 @@ impl Session {
                 .map_err(|e| anyhow!("loading mechanism registry: {e}"))?;
             crate::shapes::publish(&mut ebpf, &registry).context("publishing MECH_SHAPE")?;
         }
-        {
-            let mut bits: aya::maps::HashMap<_, u32, u32> = aya::maps::HashMap::try_from(
-                ebpf.map_mut("ATTR_BOOL_BITS")
-                    .context("ATTR_BOOL_BITS map")?,
-            )?;
-            for (attribute, bit) in p11scope_ebpf_common::attr_bool::TYPES_AND_BITS {
-                bits.insert(attribute, 1u32 << bit, 0)?;
-            }
-        }
+        let unsafe_enabled =
+            cfg!(feature = "unsafe-unvalidated-metadata") && policy.uses_unsafe_decoders();
+        publish_attribute_catalog(&mut ebpf, unsafe_enabled)
+            .context("publishing ATTR_BOOL_BITS")?;
+        freeze_published_maps(&ebpf).context("freezing published policy maps")?;
+
         let uprobe_scope = match scope {
             Scope::Pid(pid) => UProbeScope::OneProcess(
                 std::num::NonZeroU32::new(*pid).context("pid must be non-zero")?,
@@ -196,16 +482,6 @@ impl Session {
             // process-wide and the filter map decides.
             Scope::Cgroup { .. } => UProbeScope::AllProcesses,
         };
-
-        if matches!(scope, Scope::Cgroup { .. }) {
-            let fork: &mut TracePoint = ebpf
-                .program_mut("sched_process_fork")
-                .context("program sched_process_fork missing from object")?
-                .try_into()?;
-            fork.load().context("loading sched_process_fork")?;
-            fork.attach("sched", "sched_process_fork")
-                .context("attaching sched_process_fork")?;
-        }
 
         let mut attach_failures = Vec::new();
         let mut attached = 0usize;
@@ -234,18 +510,17 @@ impl Session {
             prog.load()
                 .with_context(|| format!("loading {prog_name}"))?;
         }
-        {
-            let tail_fd = {
-                let tail: &UProbe = ebpf
-                    .program("p11_entry_template_second")
-                    .context("program p11_entry_template_second missing from object")?
-                    .try_into()?;
-                tail.fd()?.try_clone()?
-            };
-            let mut tails: ProgramArray<_> = ProgramArray::try_from(
-                ebpf.map_mut("TEMPLATE_TAIL").context("TEMPLATE_TAIL map")?,
-            )?;
-            tails.set(0, &tail_fd, 0)?;
+        publish_and_freeze_template_tail(&mut ebpf, unsafe_enabled)
+            .context("publishing and freezing TEMPLATE_TAIL")?;
+
+        if matches!(scope, Scope::Cgroup { .. }) {
+            let fork: &mut TracePoint = ebpf
+                .program_mut("sched_process_fork")
+                .context("program sched_process_fork missing from object")?
+                .try_into()?;
+            fork.load().context("loading sched_process_fork")?;
+            fork.attach("sched", "sched_process_fork")
+                .context("attaching sched_process_fork")?;
         }
 
         let mut return_attached = vec![false; plan.slots.len()];
@@ -307,6 +582,8 @@ impl Session {
             ebpf,
             attach_failures,
             attached,
+            _config: published_scope.config,
+            _cgroup_file: published_scope.cgroup_file,
         })
     }
 
@@ -363,6 +640,69 @@ mod capture_policy {
 mod tests {
     use super::*;
     use p11scope_ebpf_common::{ARG_NONE, SlotSemantics};
+
+    #[test]
+    fn immutable_map_inventory_covers_every_authorization_input() {
+        assert_eq!(
+            BASE_POLICY_MAPS,
+            [
+                "CONFIG",
+                "PID_FILTER",
+                "CGROUP_FILTER",
+                "SLOT_SEMANTICS",
+                "ASYNC_FUNCTIONS",
+                "MECH_SHAPE",
+            ]
+        );
+        assert_eq!(FEATURE_POLICY_MAPS, ["ATTR_BOOL_BITS"]);
+        assert_eq!(TAIL_POLICY_MAP, "TEMPLATE_TAIL");
+    }
+
+    #[test]
+    fn map_freeze_syscall_attribute_is_only_the_u32_fd() {
+        assert_eq!(std::mem::size_of::<BpfMapFreezeAttr>(), 4);
+        assert_eq!(std::mem::align_of::<BpfMapFreezeAttr>(), 4);
+        assert_eq!(std::mem::offset_of!(BpfMapFreezeAttr, map_fd), 0);
+    }
+
+    #[test]
+    fn program_array_readback_distinguishes_empty_from_failure() {
+        assert_eq!(
+            program_array_lookup_result("TEMPLATE_TAIL", 0, 37, Ok(())).unwrap(),
+            Some(37)
+        );
+        assert_eq!(
+            program_array_lookup_result(
+                "TEMPLATE_TAIL",
+                0,
+                0,
+                Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
+            )
+            .unwrap(),
+            None
+        );
+
+        let error = program_array_lookup_result(
+            "TEMPLATE_TAIL",
+            0,
+            0,
+            Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("reading back TEMPLATE_TAIL[0]"));
+        assert!(rendered.contains("Operation not permitted"));
+    }
+
+    #[test]
+    fn map_element_lookup_attribute_matches_the_kernel_abi() {
+        assert_eq!(std::mem::size_of::<BpfMapElementAttr>(), 32);
+        assert_eq!(std::mem::align_of::<BpfMapElementAttr>(), 8);
+        assert_eq!(std::mem::offset_of!(BpfMapElementAttr, map_fd), 0);
+        assert_eq!(std::mem::offset_of!(BpfMapElementAttr, key), 8);
+        assert_eq!(std::mem::offset_of!(BpfMapElementAttr, value), 16);
+        assert_eq!(std::mem::offset_of!(BpfMapElementAttr, flags), 24);
+    }
 
     #[test]
     fn entry_program_is_selected_by_template_capture() {

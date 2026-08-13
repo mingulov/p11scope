@@ -5,11 +5,14 @@
 //! by config alone. An unrecognized or absent shape always maps to
 //! `shape::NONE`: that is the safe default when anything goes wrong.
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use aya::Ebpf;
-use aya::maps::HashMap;
-use p11scope_ebpf_common::shape;
-use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
+use aya::maps::{HashMap, MapType};
+use p11scope_ebpf_common::{MAX_MECH_SHAPES, shape};
+use pkcs11_proxy_ng_types::{
+    PKCS11_3_2_OFFICIAL_MECHANISMS, mechanism_registry::MechanismRegistry,
+};
+use std::collections::BTreeMap;
 
 /// Maps the registry's shape string to a BPF shape code. Only shapes
 /// this phase decodes get a non-NONE code; everything else — including
@@ -27,13 +30,11 @@ pub fn code_for(shape_name: &str) -> u32 {
     }
 }
 
-/// Every registered mechanism id whose shape maps to a non-NONE code,
-/// mapped to that code — exactly the set `publish` writes into the BPF
-/// `MECH_SHAPE` map. Exposed so userspace can also answer "does this
-/// mechanism id have an allowlisted parameter shape at all" without a
-/// second registry parse — e.g. `semantics::State` uses this to tell "no
-/// decodable shape" apart from "a decodable shape whose decode failed on
-/// every observed call" (see `render`'s `mechanisms[].note`).
+/// Every registered mechanism whose configured parameter shape has a supported
+/// decoder. This shaped-only view lets userspace distinguish "no decodable
+/// shape" from "a decodable shape whose decode failed on every observed call"
+/// (see `render`'s `mechanisms[].note`). `publish` additionally writes approved
+/// unshaped mechanisms with `shape::NONE` so map presence remains authorization.
 pub fn expected_shapes(reg: &MechanismRegistry) -> std::collections::BTreeMap<u64, u32> {
     reg.registered_mechanisms()
         .into_iter()
@@ -42,18 +43,65 @@ pub fn expected_shapes(reg: &MechanismRegistry) -> std::collections::BTreeMap<u6
         .collect()
 }
 
-/// Publishes MECH_SHAPE from the registry: every registered mechanism
-/// whose shape maps to a non-NONE code gets an entry. Returns how many
-/// were published. Called once, before uprobes attach — same
-/// publish-before-attach pattern `SLOT_SEMANTICS` uses, for the same reason:
-/// a probe that fires before its shape is published must decode
-/// nothing, and NONE is that safe default.
+/// Every mechanism id safe mode may publish: the complete official 3.2
+/// catalog plus configured registered ids. Presence is approval; the value is
+/// only an optional decoder shape.
+pub fn approved_mechanisms(reg: &MechanismRegistry) -> BTreeMap<u64, u32> {
+    let mut approved = PKCS11_3_2_OFFICIAL_MECHANISMS
+        .iter()
+        .map(|mechanism| (mechanism.0, shape::NONE))
+        .collect::<BTreeMap<_, _>>();
+    for mechanism in reg.registered_mechanisms() {
+        let code = reg
+            .param_shape(mechanism)
+            .map(code_for)
+            .unwrap_or(shape::NONE);
+        approved.insert(mechanism, code);
+    }
+    approved
+}
+
+fn ensure_approval_capacity(approved: &BTreeMap<u64, u32>) -> Result<()> {
+    if approved.len() > MAX_MECH_SHAPES as usize {
+        bail!(
+            "mechanism approval union has {} entries but MECH_SHAPE holds only {}; refusing to publish a prefix",
+            approved.len(),
+            MAX_MECH_SHAPES
+        );
+    }
+    Ok(())
+}
+
+/// Publishes the complete approved mechanism union, verifies exact readback,
+/// and returns how many entries were published. Capacity is checked before the
+/// first insert, so overflow cannot silently publish a prefix.
 pub fn publish(ebpf: &mut Ebpf, reg: &MechanismRegistry) -> Result<usize> {
+    let expected = approved_mechanisms(reg);
+    ensure_approval_capacity(&expected)?;
+    let info = crate::attach::policy_map_data(
+        "MECH_SHAPE",
+        ebpf.map("MECH_SHAPE").context("MECH_SHAPE map")?,
+    )?
+    .info()
+    .context("reading MECH_SHAPE map info")?;
+    if info.map_type()? != MapType::Hash || info.max_entries() != MAX_MECH_SHAPES {
+        bail!(
+            "MECH_SHAPE has type {:?} and capacity {}, expected Hash and {}",
+            info.map_type()?,
+            info.max_entries(),
+            MAX_MECH_SHAPES
+        );
+    }
     let mut shapes: HashMap<_, u64, u32> =
         HashMap::try_from(ebpf.map_mut("MECH_SHAPE").context("MECH_SHAPE map")?)?;
-    let expected = expected_shapes(reg);
     for (&mech, &code) in &expected {
         shapes.insert(mech, code, 0)?;
+    }
+    let shapes: HashMap<_, u64, u32> =
+        HashMap::try_from(ebpf.map("MECH_SHAPE").context("MECH_SHAPE map")?)?;
+    let actual = shapes.iter().collect::<Result<BTreeMap<_, _>, _>>()?;
+    if actual != expected {
+        bail!("MECH_SHAPE exact readback differs from the approved mechanism union");
     }
     Ok(expected.len())
 }
@@ -61,6 +109,9 @@ pub fn publish(ebpf: &mut Ebpf, reg: &MechanismRegistry) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p11scope_ebpf_common::MAX_MECH_SHAPES;
+    use pkcs11_proxy_ng_types::{DiscoveryMode, PKCS11_3_2_OFFICIAL_MECHANISMS};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
     #[test]
     fn code_for_maps_known_shapes() {
@@ -127,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn expected_shapes_matches_what_publish_would_write() {
+    fn expected_shapes_is_the_supported_decoder_subset() {
         let reg = MechanismRegistry::load(None).expect("load embedded registry");
         let expected = expected_shapes(&reg);
         assert_eq!(expected.get(&CKM_AES_GCM), Some(&shape::GCM));
@@ -137,5 +188,56 @@ mod tests {
             expected.values().all(|&c| c != shape::NONE),
             "NONE-shaped mechanisms must never appear in the published set"
         );
+    }
+
+    #[test]
+    fn approvals_are_the_exact_official_and_registered_union() {
+        // This count belongs to the dependency pinned in Cargo.toml at
+        // a2aab6cd67d21d140277a4584942e06c903f165b. A revision change is a
+        // deliberate catalog decision, not a number to update casually.
+        let official = PKCS11_3_2_OFFICIAL_MECHANISMS
+            .iter()
+            .map(|mechanism| mechanism.0)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(official.len(), 463);
+
+        let registry = MechanismRegistry::load(None).expect("load embedded registry");
+        let approved = approved_mechanisms(&registry);
+        assert_eq!(
+            approved.len(),
+            463,
+            "official/registered overlap must deduplicate"
+        );
+        assert!(official.iter().all(|id| approved.contains_key(id)));
+        assert_eq!(approved.get(&0), Some(&shape::NONE));
+        assert_eq!(approved.get(&CKM_AES_GCM), Some(&shape::GCM));
+    }
+
+    #[test]
+    fn configured_maximum_mechanism_id_is_preserved_as_data() {
+        let registry = MechanismRegistry::from_parts(
+            HashMap::new(),
+            HashSet::from([u64::MAX]),
+            DiscoveryMode::Transparent,
+            "max-id-control".into(),
+        );
+        let approved = approved_mechanisms(&registry);
+
+        assert_eq!(approved.len(), 464);
+        assert_eq!(approved.get(&u64::MAX), Some(&shape::NONE));
+    }
+
+    #[test]
+    fn approval_capacity_refuses_the_whole_oversized_union() {
+        let oversized = (0..=u64::from(MAX_MECH_SHAPES))
+            .map(|id| (id, shape::NONE))
+            .collect::<BTreeMap<_, _>>();
+        let error = ensure_approval_capacity(&oversized)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("1025"), "{error}");
+        assert!(error.contains("1024"), "{error}");
+        assert!(error.contains("refusing"), "{error}");
     }
 }

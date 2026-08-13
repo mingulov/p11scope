@@ -399,11 +399,17 @@ impl WorkerContext {
     }
 
     /// Call after the capture loop has installed its SIGINT handler. SIGTERM
-    /// retains its default terminating disposition.
+    /// is restored to its terminating default before either signal is unblocked.
     pub fn unblock_operator_signals(&mut self) -> Result<(), String> {
         // SAFETY: the initialized set is used only to unblock these two
         // operator signals in the single-threaded capture worker.
         unsafe {
+            if libc::signal(libc::SIGTERM, libc::SIG_DFL) == libc::SIG_ERR {
+                return Err(format!(
+                    "resetting worker SIGTERM disposition failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
             let mut operators = std::mem::zeroed();
             if libc::sigemptyset(&mut operators) == -1
                 || libc::sigaddset(&mut operators, libc::SIGINT) == -1
@@ -449,6 +455,21 @@ pub enum SupervisorOutcome {
     Exited(i32),
     Signaled(i32),
     LeaseBroken,
+}
+
+pub fn mirror_worker_signal(signal: i32) -> ! {
+    // SAFETY: the signal came from WTERMSIG. Restoring its disposition and
+    // unblocking it makes the supervisor preserve the worker's signal status
+    // even when the invoking shell supplied SIG_IGN or a blocked mask.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        let mut unblocked = std::mem::zeroed();
+        libc::sigemptyset(&mut unblocked);
+        libc::sigaddset(&mut unblocked, signal);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &unblocked, std::ptr::null_mut());
+        libc::raise(signal);
+        libc::_exit(128 + signal)
+    }
 }
 
 pub fn supervise_capture(
@@ -557,6 +578,7 @@ pub fn supervise_capture(
                 SupervisorEvent::Control(DONE) if !completed => completed = true,
                 SupervisorEvent::Control(FAILED) if !completed && !worker_failed => {
                     worker_failed = true;
+                    return Ok(());
                 }
                 SupervisorEvent::Control(_) => {
                     malformed_completion = true;
@@ -574,7 +596,12 @@ pub fn supervise_capture(
     })();
 
     let mut supervisor_error = protocol.err();
-    if lease_broken || malformed_completion || deadline_expired || supervisor_error.is_some() {
+    if lease_broken
+        || worker_failed
+        || malformed_completion
+        || deadline_expired
+        || supervisor_error.is_some()
+    {
         if let Err(error) = pidfd_send_signal(&pidfd, libc::SIGKILL) {
             supervisor_error.get_or_insert(error);
         }

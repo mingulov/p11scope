@@ -716,11 +716,7 @@ fn finish_supervised_capture(outcome: verify::SupervisorOutcome) -> Result<()> {
         verify::SupervisorOutcome::Exited(0) => Ok(()),
         verify::SupervisorOutcome::Exited(code) => std::process::exit(code),
         verify::SupervisorOutcome::LeaseBroken => std::process::exit(verify::OBJECT_CHANGED_EXIT),
-        verify::SupervisorOutcome::Signaled(signal) => unsafe {
-            libc::signal(signal, libc::SIG_DFL);
-            libc::raise(signal);
-            std::process::exit(128 + signal)
-        },
+        verify::SupervisorOutcome::Signaled(signal) => verify::mirror_worker_signal(signal),
     }
 }
 

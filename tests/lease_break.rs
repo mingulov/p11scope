@@ -116,6 +116,37 @@ fn pidfd_exited(pidfd: &OwnedFd, timeout_ms: libc::c_int) -> bool {
     pollfd.revents & libc::POLLIN != 0
 }
 
+fn send_worker_control(packet: u8) -> Result<(), String> {
+    for entry in std::fs::read_dir("/proc/self/fd").map_err(|error| error.to_string())? {
+        let fd: libc::c_int = match entry
+            .map_err(|error| error.to_string())?
+            .file_name()
+            .to_string_lossy()
+            .parse()
+        {
+            Ok(fd) if fd > libc::STDERR_FILENO => fd,
+            _ => continue,
+        };
+        let mut socket_type = 0;
+        let mut length = std::mem::size_of_val(&socket_type) as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_TYPE,
+                (&mut socket_type as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        } == 0
+            && socket_type == libc::SOCK_SEQPACKET
+            && unsafe { libc::send(fd, (&packet as *const u8).cast(), 1, 0) } == 1
+        {
+            return Ok(());
+        }
+    }
+    Err("capture worker control socket was not found".into())
+}
+
 fn full_pipe() -> (OwnedFd, OwnedFd) {
     let mut fds = [-1; 2];
     assert_eq!(
@@ -202,11 +233,9 @@ fn finish(outcome: p11scope::verify::SupervisorOutcome) -> ! {
         p11scope::verify::SupervisorOutcome::LeaseBroken => unsafe {
             libc::_exit(p11scope::verify::OBJECT_CHANGED_EXIT)
         },
-        p11scope::verify::SupervisorOutcome::Signaled(signal) => unsafe {
-            libc::signal(signal, libc::SIG_DFL);
-            libc::raise(signal);
-            libc::_exit(128 + signal)
-        },
+        p11scope::verify::SupervisorOutcome::Signaled(signal) => {
+            p11scope::verify::mirror_worker_signal(signal)
+        }
     }
 }
 
@@ -516,6 +545,157 @@ fn worker_panic_removes_the_profile_temp_and_exits_101() {
             .to_string_lossy()
             .contains("p11scope")
     }));
+}
+
+#[test]
+fn externally_killed_worker_releases_lease_cleans_profile_and_mirrors_sigkill() {
+    let _serial = FORK_TEST.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let object = dir.path().join("leased.so");
+    let profile = dir.path().join("profile.json");
+    let worker_pid_path = dir.path().join("worker.pid");
+    let writer_result = dir.path().join("writer.result");
+    std::fs::copy("/bin/true", &object).unwrap();
+    let child_object = object.clone();
+    let child_profile = profile.clone();
+    let child_worker_pid_path = worker_pid_path.clone();
+
+    let supervisor = spawn_single_threaded(move || {
+        let signals = p11scope::verify::CaptureSignals::block().unwrap();
+        let objects = p11scope::verify::check_reuse(&manifest_for(&child_object)).unwrap();
+        let output = p11scope::verify::SupervisorOutput::profile(Some(child_profile)).unwrap();
+        let outcome =
+            p11scope::verify::supervise_capture(signals, objects, output, move |worker| {
+                worker
+                    .output()
+                    .unwrap()
+                    .write_all(b"partial")
+                    .map_err(|error| error.to_string())?;
+                std::fs::write(child_worker_pid_path, std::process::id().to_string())
+                    .map_err(|error| error.to_string())?;
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            })
+            .unwrap();
+        finish(outcome)
+    });
+
+    wait_for_file(&worker_pid_path);
+    let worker: libc::pid_t = std::fs::read_to_string(&worker_pid_path)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let worker_pidfd = pidfd_open(worker);
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGSTOP) }, 0);
+    let mut stopped = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(supervisor, &mut stopped, libc::WUNTRACED) },
+        supervisor
+    );
+    assert!(libc::WIFSTOPPED(stopped));
+    assert_eq!(unsafe { libc::kill(worker, libc::SIGKILL) }, 0);
+    assert!(pidfd_exited(&worker_pidfd, 1_000));
+    assert!(!profile.exists());
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGCONT) }, 0);
+    let supervisor_status = wait_status_bounded(supervisor);
+    assert!(libc::WIFSIGNALED(supervisor_status));
+    assert_eq!(libc::WTERMSIG(supervisor_status), libc::SIGKILL);
+
+    let writer_object = object.clone();
+    let writer_result_path = writer_result.clone();
+    let writer = spawn_single_threaded(move || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(writer_object)
+            .unwrap();
+        let worker_is_gone = unsafe { libc::kill(worker, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        std::fs::write(
+            writer_result_path,
+            if worker_is_gone {
+                &b"gone"[..]
+            } else {
+                &b"alive"[..]
+            },
+        )
+        .unwrap();
+        i32::from(!worker_is_gone)
+    });
+    let writer_status = wait_status_bounded(writer);
+    assert!(libc::WIFEXITED(writer_status));
+    assert_eq!(libc::WEXITSTATUS(writer_status), 0);
+    assert_eq!(std::fs::read(writer_result).unwrap(), b"gone");
+    assert!(!profile.exists());
+    assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("p11scope")
+    }));
+}
+
+#[test]
+fn failed_worker_that_stops_is_killed_before_leases_are_released() {
+    let _serial = FORK_TEST.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let object = dir.path().join("leased.so");
+    let profile = dir.path().join("profile.json");
+    let worker_pid_path = dir.path().join("worker.pid");
+    std::fs::copy("/bin/true", &object).unwrap();
+    let child_object = object.clone();
+    let child_profile = profile.clone();
+    let child_worker_pid_path = worker_pid_path.clone();
+
+    let supervisor = spawn_single_threaded(move || {
+        let signals = p11scope::verify::CaptureSignals::block().unwrap();
+        let objects = p11scope::verify::check_reuse(&manifest_for(&child_object)).unwrap();
+        let output = p11scope::verify::SupervisorOutput::profile(Some(child_profile)).unwrap();
+        let outcome =
+            p11scope::verify::supervise_capture(signals, objects, output, move |worker| {
+                worker
+                    .output()
+                    .unwrap()
+                    .write_all(b"partial")
+                    .map_err(|error| error.to_string())?;
+                std::fs::write(child_worker_pid_path, std::process::id().to_string())
+                    .map_err(|error| error.to_string())?;
+                send_worker_control(b'F')?;
+                unsafe { libc::raise(libc::SIGSTOP) };
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            })
+            .unwrap();
+        finish(outcome)
+    });
+
+    wait_for_file(&worker_pid_path);
+    let worker: libc::pid_t = std::fs::read_to_string(&worker_pid_path)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let supervisor_status = wait_status_bounded(supervisor);
+    assert!(libc::WIFSIGNALED(supervisor_status));
+    assert_eq!(libc::WTERMSIG(supervisor_status), libc::SIGKILL);
+    assert_eq!(unsafe { libc::kill(worker, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    assert!(!profile.exists());
+    assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("p11scope")
+    }));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(object)
+        .expect("writer must proceed only after the stopped worker is gone");
 }
 
 #[test]
@@ -842,5 +1022,81 @@ fn sigterm_preserves_terminating_signal_status() {
     assert_eq!(unsafe { libc::kill(supervisor, libc::SIGTERM) }, 0);
     let status = wait_status_bounded(supervisor);
     assert!(libc::WIFSIGNALED(status));
+    assert_eq!(libc::WTERMSIG(status), libc::SIGTERM);
+}
+
+#[test]
+fn sigterm_ignored_by_the_original_process_is_reset_for_the_worker() {
+    let _serial = FORK_TEST.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let object = dir.path().join("leased.so");
+    let ready = dir.path().join("ready");
+    std::fs::copy("/bin/true", &object).unwrap();
+    let child_object = object.clone();
+    let child_ready = ready.clone();
+
+    let supervisor = spawn_single_threaded(move || {
+        unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+        let signals = p11scope::verify::CaptureSignals::block().unwrap();
+        let objects = p11scope::verify::check_reuse(&manifest_for(&child_object)).unwrap();
+        let output = p11scope::verify::SupervisorOutput::profile(None).unwrap();
+        let outcome =
+            p11scope::verify::supervise_capture(signals, objects, output, move |worker| {
+                worker.unblock_operator_signals()?;
+                std::fs::write(child_ready, b"ready").map_err(|error| error.to_string())?;
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            })
+            .unwrap();
+        finish(outcome)
+    });
+
+    wait_for_file(&ready);
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGTERM) }, 0);
+    let status = wait_status_bounded(supervisor);
+    assert!(libc::WIFSIGNALED(status));
+    assert_eq!(libc::WTERMSIG(status), libc::SIGTERM);
+}
+
+#[test]
+fn sigterm_blocked_by_the_original_process_is_unblocked_when_mirrored() {
+    let _serial = FORK_TEST.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let object = dir.path().join("leased.so");
+    let ready = dir.path().join("ready");
+    std::fs::copy("/bin/true", &object).unwrap();
+    let child_object = object.clone();
+    let child_ready = ready.clone();
+
+    let supervisor = spawn_single_threaded(move || {
+        unsafe {
+            let mut blocked = std::mem::zeroed();
+            assert_eq!(libc::sigemptyset(&mut blocked), 0);
+            assert_eq!(libc::sigaddset(&mut blocked, libc::SIGTERM), 0);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut()),
+                0
+            );
+        }
+        let signals = p11scope::verify::CaptureSignals::block().unwrap();
+        let objects = p11scope::verify::check_reuse(&manifest_for(&child_object)).unwrap();
+        let output = p11scope::verify::SupervisorOutput::profile(None).unwrap();
+        let outcome =
+            p11scope::verify::supervise_capture(signals, objects, output, move |worker| {
+                worker.unblock_operator_signals()?;
+                std::fs::write(child_ready, b"ready").map_err(|error| error.to_string())?;
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            })
+            .unwrap();
+        finish(outcome)
+    });
+
+    wait_for_file(&ready);
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGTERM) }, 0);
+    let status = wait_status_bounded(supervisor);
+    assert!(libc::WIFSIGNALED(status), "wait status {status:#x}");
     assert_eq!(libc::WTERMSIG(status), libc::SIGTERM);
 }

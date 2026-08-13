@@ -19,6 +19,14 @@ use std::path::Path;
 #[cfg(feature = "identify")]
 pub const MAX_OBJECT_BYTES: u64 = 256 * 1024 * 1024;
 
+#[cfg(feature = "identify")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MappingFileKey {
+    pub device_major: u64,
+    pub device_minor: u64,
+    pub inode: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityKind {
@@ -77,6 +85,47 @@ pub fn open_object(path: &Path) -> Result<std::fs::File, String> {
         ));
     }
     Ok(file)
+}
+
+/// Returns the device/inode tuple rendered for this fd's mappings in
+/// `/proc/*/maps`. On filesystems such as btrfs, `st_dev` can be an anonymous
+/// subvolume device while maps reports the containing mount's device.
+#[cfg(feature = "identify")]
+pub fn mapping_file_key(file: &std::fs::File) -> Result<MappingFileKey, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("metadata failed: {error}"))?;
+    let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))
+        .map_err(|error| format!("reading fd mount identity failed: {error}"))?;
+    let mount_id = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:\t"))
+        .ok_or_else(|| "fd mount identity is missing".to_string())?;
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|error| format!("reading mount table failed: {error}"))?;
+    let device = mountinfo
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            (fields.next()? == mount_id)
+                .then(|| fields.nth(1))
+                .flatten()
+        })
+        .ok_or_else(|| format!("fd mount {mount_id} is missing from the mount table"))?;
+    let (major, minor) = device
+        .split_once(':')
+        .ok_or_else(|| format!("invalid mount device {device:?}"))?;
+    Ok(MappingFileKey {
+        device_major: major
+            .parse()
+            .map_err(|_| format!("invalid mount device {device:?}"))?,
+        device_minor: minor
+            .parse()
+            .map_err(|_| format!("invalid mount device {device:?}"))?,
+        inode: metadata.ino(),
+    })
 }
 
 /// Pins the pathname without invoking device/FIFO open semantics, verifies

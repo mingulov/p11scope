@@ -228,6 +228,19 @@ mod tests {
                     note: None,
                 },
             }],
+            provenance_objects: vec![ProvenanceObject {
+                path: "/opt/p11.so".into(),
+                device_major: 8,
+                device_minor: 1,
+                inode: 42,
+                identity: ObjectIdentity {
+                    kind: IdentityKind::GnuBuildId,
+                    value: Some("aa".into()),
+                    sha256: Some("11".repeat(32)),
+                    reusable: true,
+                    note: None,
+                },
+            }],
             interface_list: Acquisition::Absent,
             surfaces: vec![SurfaceRecord {
                 source: SurfaceSource::LegacyFunctionList,

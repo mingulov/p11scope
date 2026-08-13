@@ -13,13 +13,26 @@ fn same_inode_write_during_fresh_discovery_is_refused_before_bpf() {
     std::fs::copy("/bin/true", &object).unwrap();
     std::fs::set_permissions(&observer, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+    let object_file = p11scope_manifest::identity::open_object(&object).unwrap();
+    let object_key = p11scope_manifest::identity::mapping_file_key(&object_file).unwrap();
+    let object_identity = p11scope_manifest::identity::inspect_file(&object_file)
+        .unwrap()
+        .identity;
+
     let manifest = Manifest {
         schema: SCHEMA.into(),
         module_path: object.display().to_string(),
         objects: vec![ObjectRecord {
             id: 0,
             path: object.display().to_string(),
-            identity: p11scope_manifest::identity::identify(&object),
+            identity: object_identity.clone(),
+        }],
+        provenance_objects: vec![ProvenanceObject {
+            path: object.display().to_string(),
+            device_major: object_key.device_major,
+            device_minor: object_key.device_minor,
+            inode: object_key.inode,
+            identity: object_identity,
         }],
         interface_list: Acquisition::Absent,
         surfaces: vec![SurfaceRecord {

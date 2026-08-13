@@ -1,4 +1,4 @@
-//! Probe-manifest schema v3. Offsets are ELF object-file byte offsets —
+//! Probe-manifest schema v4. Offsets are ELF object-file byte offsets —
 //! aya 0.14 `UProbeAttachLocation::AbsoluteOffset` semantics, pinned in
 //! docs/notes/aya-offset-semantics.md. Evidence (NULL entries, vendor
 //! interfaces, non-file-backed pointers, acquisition failures) is recorded,
@@ -7,7 +7,7 @@
 use crate::identity::ObjectIdentity;
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA: &str = "p11scope-manifest/3";
+pub const SCHEMA: &str = "p11scope-manifest/4";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -17,6 +17,11 @@ pub struct Manifest {
     /// Every distinct object file some pointer resolved into. Identity is
     /// per object: a table entry may legally live outside the module .so.
     pub objects: Vec<ObjectRecord>,
+    /// Complete file-backed executable mapping closure after acquisition.
+    /// Device/inode are pass-local stabilization facts; whole-file identity
+    /// is the path-independent evidence used by later provenance comparison.
+    #[serde(default)]
+    pub provenance_objects: Vec<ProvenanceObject>,
     /// Outcome of the C_GetInterfaceList enumeration as a whole (the
     /// legacy surface records its own acquisition inside its record).
     pub interface_list: Acquisition,
@@ -31,6 +36,15 @@ pub struct Manifest {
 pub struct ObjectRecord {
     pub id: u32,
     pub path: String,
+    pub identity: ObjectIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProvenanceObject {
+    pub path: String,
+    pub device_major: u64,
+    pub device_minor: u64,
+    pub inode: u64,
     pub identity: ObjectIdentity,
 }
 
@@ -177,6 +191,19 @@ mod tests {
                     note: None,
                 },
             }],
+            provenance_objects: vec![ProvenanceObject {
+                path: "/opt/p11.so".into(),
+                device_major: 8,
+                device_minor: 1,
+                inode: 42,
+                identity: ObjectIdentity {
+                    kind: IdentityKind::GnuBuildId,
+                    value: Some("aa".into()),
+                    sha256: Some("11".repeat(32)),
+                    reusable: true,
+                    note: None,
+                },
+            }],
             interface_list: Acquisition::Error {
                 detail: "boom".into(),
             },
@@ -231,7 +258,7 @@ mod tests {
             alias_groups: vec![],
         };
         let json = serde_json::to_string_pretty(&m).unwrap();
-        assert!(json.contains("\"schema\": \"p11scope-manifest/3\""));
+        assert!(json.contains("\"schema\": \"p11scope-manifest/4\""));
         assert!(json.contains("\"sha256\": \"1111"));
         assert!(json.contains("\"status\": \"null_pointer\""));
         assert!(json.contains("\"classification\": \"exact_standard\""));
@@ -240,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_serializes_unreadable_walks_and_unusable_files() {
+    fn v4_serializes_unreadable_walks_and_unusable_files() {
         let walk = serde_json::to_value(WalkOutcome::Unreadable {
             detail: "short /proc/self/mem read".into(),
         })

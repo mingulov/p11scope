@@ -3,7 +3,9 @@
 //! and must not run vendor constructors in its own address space.
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use p11scope_manifest::manifest::{Manifest, SCHEMA};
+use p11scope_manifest::identity::{MappingFileKey, inspect_file, mapping_file_key, open_object};
+use p11scope_manifest::manifest::{Manifest, ProvenanceObject, SCHEMA};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::Read;
 use std::os::fd::AsRawFd as _;
@@ -15,6 +17,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_STABILIZATION_PASSES: usize = 8;
+const MAX_PROVENANCE_OBJECTS: usize = p11scope_ebpf_common::MAX_SLOTS as usize;
 
 fn target_id(name: &str) -> Option<u32> {
     std::env::var(name)
@@ -132,10 +136,250 @@ fn append_bounded(output: &mut Vec<u8>, bytes: &[u8], limit: u64) -> Result<()> 
     Ok(())
 }
 
-/// Runs the installed sibling helper as a bounded, unprivileged discovery
-/// oracle. This is intentionally stricter than the user-facing `discover`
-/// dispatcher below: authorization never searches PATH or accepts `--helper`.
-pub fn rediscover(module: &Path) -> Result<Manifest> {
+/// A final oracle pass plus the exact closure leases that made that pass
+/// eligible to authorize attachment. The guard must outlive comparison.
+#[derive(Debug)]
+pub struct StableDiscovery {
+    manifest: Manifest,
+    leases: ClosureLeases,
+    module: PathBuf,
+}
+
+impl StableDiscovery {
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    pub fn ensure_stable(&self) -> Result<()> {
+        self.leases.ensure().map_err(anyhow::Error::msg)?;
+        self.leases.revalidate_seed(&self.module)
+    }
+}
+
+#[derive(Debug)]
+struct RetainedProvenanceObject {
+    identity: p11scope_manifest::identity::ObjectIdentity,
+    file: File,
+}
+
+#[derive(Debug)]
+struct ClosureLeases {
+    // Drop lease-bearing fds before restoring SIGIO delivery.
+    objects: BTreeMap<MappingFileKey, RetainedProvenanceObject>,
+    monitor: crate::verify::SynchronousLeaseMonitor,
+    seed: MappingFileKey,
+    total_bytes: u64,
+}
+
+impl ClosureLeases {
+    fn new(module: &Path) -> Result<Self> {
+        let monitor = crate::verify::SynchronousLeaseMonitor::new().map_err(anyhow::Error::msg)?;
+        let (record, file) = current_provenance_object(module)?;
+        let seed = record_key(&record);
+        let mut leases = Self {
+            objects: BTreeMap::new(),
+            monitor,
+            seed,
+            total_bytes: 0,
+        };
+        leases.retain(record, file)?;
+        Ok(leases)
+    }
+
+    fn retain_reported(&mut self, record: &ProvenanceObject) -> Result<()> {
+        let key = record_key(record);
+        if let Some(retained) = self.objects.get(&key) {
+            if !same_identity(&retained.identity, &record.identity) {
+                bail!("provenance mapping {key:?} changed whole-file identity between passes");
+            }
+            return Ok(());
+        }
+        let (current, file) = current_provenance_object(Path::new(&record.path))?;
+        if record_key(&current) != key {
+            bail!(
+                "provenance mapping {} changed device/inode before it could be leased",
+                record.path
+            );
+        }
+        if !same_identity(&current.identity, &record.identity) {
+            bail!(
+                "provenance mapping {} changed whole-file identity before it could be leased",
+                record.path
+            );
+        }
+        self.retain(current, file)
+    }
+
+    fn retain(&mut self, record: ProvenanceObject, file: File) -> Result<()> {
+        if self.objects.len() >= MAX_PROVENANCE_OBJECTS {
+            bail!("provenance closure exceeds the {MAX_PROVENANCE_OBJECTS}-object limit");
+        }
+        let len = file
+            .metadata()
+            .with_context(|| format!("reading provenance object metadata for {}", record.path))?
+            .len();
+        let total = self
+            .total_bytes
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("provenance closure size overflowed u64"))?;
+        if total > crate::verify::MAX_TOTAL_OBJECT_BYTES {
+            bail!(
+                "provenance closure totals more than the {}-byte limit",
+                crate::verify::MAX_TOTAL_OBJECT_BYTES
+            );
+        }
+        self.monitor.acquire(&file).map_err(anyhow::Error::msg)?;
+        self.total_bytes = total;
+        self.objects.insert(
+            record_key(&record),
+            RetainedProvenanceObject {
+                identity: record.identity,
+                file,
+            },
+        );
+        self.ensure().map_err(anyhow::Error::msg)
+    }
+
+    fn keys(&self) -> BTreeSet<MappingFileKey> {
+        self.objects.keys().copied().collect()
+    }
+
+    fn revalidate_seed(&self, module: &Path) -> Result<()> {
+        let (record, _file) = current_provenance_object(module)?;
+        let Some(retained) = self.objects.get(&self.seed) else {
+            bail!("internal error: provenance seed lease is missing");
+        };
+        if record_key(&record) != self.seed || !same_identity(&record.identity, &retained.identity)
+        {
+            bail!("provenance module {} was replaced", module.display());
+        }
+        Ok(())
+    }
+
+    fn ensure(&self) -> Result<(), String> {
+        self.monitor
+            .ensure(self.objects.values().map(|object| &object.file))
+    }
+}
+
+fn same_identity(
+    left: &p11scope_manifest::identity::ObjectIdentity,
+    right: &p11scope_manifest::identity::ObjectIdentity,
+) -> bool {
+    left.kind == right.kind
+        && left.value == right.value
+        && left.sha256 == right.sha256
+        && left.reusable == right.reusable
+}
+
+fn record_key(record: &ProvenanceObject) -> MappingFileKey {
+    MappingFileKey {
+        device_major: record.device_major,
+        device_minor: record.device_minor,
+        inode: record.inode,
+    }
+}
+
+fn current_provenance_object(path: &Path) -> Result<(ProvenanceObject, File)> {
+    if !path.is_absolute() {
+        bail!(
+            "provenance object path must be absolute: {}",
+            path.display()
+        );
+    }
+    let file = open_object(path)
+        .map_err(anyhow::Error::msg)
+        .with_context(|| format!("opening provenance object {}", path.display()))?;
+    let key = mapping_file_key(&file).map_err(anyhow::Error::msg)?;
+    let identity = inspect_file(&file)
+        .map_err(anyhow::Error::msg)
+        .with_context(|| format!("identifying provenance object {}", path.display()))?
+        .identity;
+    if !identity.reusable || identity.sha256.as_deref().is_none_or(|sha| sha.len() != 64) {
+        bail!(
+            "provenance object {} has no reusable whole-file SHA-256",
+            path.display()
+        );
+    }
+    Ok((
+        ProvenanceObject {
+            path: path.display().to_string(),
+            device_major: key.device_major,
+            device_minor: key.device_minor,
+            inode: key.inode,
+            identity,
+        },
+        file,
+    ))
+}
+
+fn closure_keys(manifest: &Manifest) -> Result<BTreeSet<MappingFileKey>> {
+    if manifest.provenance_objects.is_empty()
+        || manifest.provenance_objects.len() > MAX_PROVENANCE_OBJECTS
+    {
+        bail!(
+            "discovery pass reported {} provenance objects; expected 1..={MAX_PROVENANCE_OBJECTS}",
+            manifest.provenance_objects.len()
+        );
+    }
+    let mut keys = BTreeSet::new();
+    for object in &manifest.provenance_objects {
+        if !Path::new(&object.path).is_absolute() || object.inode == 0 {
+            bail!("discovery pass reported an invalid provenance object");
+        }
+        if !object.identity.reusable
+            || object
+                .identity
+                .sha256
+                .as_deref()
+                .is_none_or(|sha| sha.len() != 64)
+        {
+            bail!(
+                "discovery pass provenance object {} has no reusable whole-file SHA-256",
+                object.path
+            );
+        }
+        if !keys.insert(record_key(object)) {
+            bail!("discovery pass reported a duplicate provenance device/inode");
+        }
+    }
+    Ok(keys)
+}
+
+fn stabilize(module: &Path, mut pass: impl FnMut() -> Result<Manifest>) -> Result<StableDiscovery> {
+    let mut leases = ClosureLeases::new(module)?;
+    let mut previous = None;
+    for _ in 0..MAX_STABILIZATION_PASSES {
+        leases.ensure().map_err(anyhow::Error::msg)?;
+        leases.revalidate_seed(module)?;
+        let preleased = leases.keys();
+        let manifest = pass()?;
+        leases.revalidate_seed(module)?;
+        leases.ensure().map_err(anyhow::Error::msg)?;
+        let current = closure_keys(&manifest)?;
+        if !current.contains(&leases.seed) {
+            bail!("discovery pass omitted the selected provenance module mapping");
+        }
+        let already_leased = current.is_subset(&preleased);
+        for object in &manifest.provenance_objects {
+            leases.retain_reported(object)?;
+        }
+        leases.ensure().map_err(anyhow::Error::msg)?;
+        if already_leased && previous.as_ref() == Some(&current) {
+            return Ok(StableDiscovery {
+                manifest,
+                leases,
+                module: module.to_path_buf(),
+            });
+        }
+        previous = Some(current);
+    }
+    bail!("provenance closure did not stabilize within {MAX_STABILIZATION_PASSES} discovery passes")
+}
+
+/// Runs the installed sibling helper until one complete pass used only a
+/// pre-leased, unchanged exact executable-mapping closure.
+pub fn rediscover_stable(module: &Path) -> Result<StableDiscovery> {
     if !module.is_absolute() {
         bail!("--provenance-module must be an absolute path");
     }
@@ -144,45 +388,11 @@ pub fn rediscover(module: &Path) -> Result<Manifest> {
         .parent()
         .ok_or_else(|| anyhow!("running p11scope executable has no parent directory"))?
         .join("p11scope-discover");
-    rediscover_authorized_with_helper(&helper_path, module)
+    rediscover_stable_with_helper(&helper_path, module)
 }
 
-fn rediscover_authorized_with_helper(helper_path: &Path, module: &Path) -> Result<Manifest> {
-    let lease = crate::verify::LeaseMonitor::new().map_err(anyhow::Error::msg)?;
-    let module_file = p11scope_manifest::identity::open_object(module)
-        .map_err(anyhow::Error::msg)
-        .with_context(|| format!("opening provenance module {}", module.display()))?;
-    lease
-        .acquire(&module_file)
-        .map_err(anyhow::Error::msg)
-        .with_context(|| format!("locking provenance module {}", module.display()))?;
-    // Inherit only an O_PATH handle. The lease-bearing readable fd stays
-    // CLOEXEC, so provider code cannot fork a child that prolongs the lease.
-    let module_path_handle = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-        .open(format!("/proc/self/fd/{}", module_file.as_raw_fd()))
-        .context("pinning provenance module path for oracle")?;
-    clear_close_on_exec(&module_path_handle)
-        .context("making provenance module path available to oracle")?;
-    let module_fd_path = PathBuf::from(format!("/proc/self/fd/{}", module_path_handle.as_raw_fd()));
-    let manifest = rediscover_with_helper(helper_path, &module_fd_path)?;
-    lease
-        .ensure([&module_file])
-        .map_err(anyhow::Error::msg)
-        .context("provenance module changed during discovery")?;
-    Ok(manifest)
-}
-
-fn clear_close_on_exec(file: &impl std::os::fd::AsRawFd) -> std::io::Result<()> {
-    // SAFETY: both fcntl calls operate on a live regular-file descriptor.
-    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
-    if flags == -1
-        || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC) } == -1
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+fn rediscover_stable_with_helper(helper_path: &Path, module: &Path) -> Result<StableDiscovery> {
+    stabilize(module, || rediscover_with_helper(helper_path, module))
 }
 
 fn rediscover_with_helper(helper_path: &Path, module: &Path) -> Result<Manifest> {
@@ -464,6 +674,9 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p11scope_manifest::manifest::{
+        Acquisition, ObjectRecord, ProvenanceObject, SurfaceRecord, SurfaceSource, WalkOutcome,
+    };
     use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
@@ -516,7 +729,7 @@ mod tests {
             &source,
             r#"#include <stdio.h>
 int main(void) {
-  puts("{\"schema\":\"p11scope-manifest/3\",\"module_path\":\"/tmp/provider.so\",\"objects\":[],\"interface_list\":{\"status\":\"absent\"},\"surfaces\":[],\"vendor_interfaces\":[],\"alias_groups\":[]}");
+  puts("{\"schema\":\"p11scope-manifest/4\",\"module_path\":\"/tmp/provider.so\",\"objects\":[],\"provenance_objects\":[],\"interface_list\":{\"status\":\"absent\"},\"surfaces\":[],\"vendor_interfaces\":[],\"alias_groups\":[]}");
   return 0;
 }
 "#,
@@ -549,7 +762,7 @@ int main(void) {
 #include <stdlib.h>
 int main(void) {
   if (getenv("PATH") || getenv("HOME")) return 91;
-  puts("{\"schema\":\"p11scope-manifest/3\",\"module_path\":\"/tmp/provider.so\",\"objects\":[],\"interface_list\":{\"status\":\"absent\"},\"surfaces\":[],\"vendor_interfaces\":[],\"alias_groups\":[]}");
+  puts("{\"schema\":\"p11scope-manifest/4\",\"module_path\":\"/tmp/provider.so\",\"objects\":[],\"provenance_objects\":[],\"interface_list\":{\"status\":\"absent\"},\"surfaces\":[],\"vendor_interfaces\":[],\"alias_groups\":[]}");
   return 0;
 }
 "#,
@@ -618,7 +831,7 @@ int main(void) {
         let _writer = OpenOptions::new().write(true).open(&module).unwrap();
 
         let error =
-            rediscover_authorized_with_helper(&dir.path().join("missing"), &module).unwrap_err();
+            rediscover_stable_with_helper(&dir.path().join("missing"), &module).unwrap_err();
         assert!(format!("{error:#}").contains("read lease"), "{error:#}");
     }
 
@@ -631,7 +844,7 @@ int main(void) {
             &source,
             r#"#include <stdio.h>
 int main(void) {
-  puts("{\"schema\":\"p11scope-manifest/3\",\"module_path\":\"/tmp/original.so\",\"objects\":[],\"interface_list\":{\"status\":\"absent\"},\"surfaces\":[],\"vendor_interfaces\":[],\"alias_groups\":[]}");
+  puts("{\"schema\":\"p11scope-manifest/4\",\"module_path\":\"/tmp/original.so\",\"objects\":[],\"provenance_objects\":[],\"interface_list\":{\"status\":\"absent\"},\"surfaces\":[],\"vendor_interfaces\":[],\"alias_groups\":[]}");
   return 0;
 }
 "#,
@@ -655,5 +868,133 @@ int main(void) {
             rediscover_from_open_helper(helper, &helper_path, Path::new("/tmp/original.so"))
                 .unwrap();
         assert_eq!(manifest.module_path, "/tmp/original.so");
+    }
+
+    fn closure_manifest(module: &Path, paths: &[&Path]) -> Manifest {
+        let identity = p11scope_manifest::identity::identify(module);
+        Manifest {
+            schema: SCHEMA.into(),
+            module_path: module.display().to_string(),
+            objects: vec![ObjectRecord {
+                id: 0,
+                path: module.display().to_string(),
+                identity,
+            }],
+            provenance_objects: paths
+                .iter()
+                .map(|path| current_provenance_object(path).unwrap().0)
+                .collect::<Vec<ProvenanceObject>>(),
+            interface_list: Acquisition::Absent,
+            surfaces: vec![SurfaceRecord {
+                source: SurfaceSource::LegacyFunctionList,
+                acquisition: Acquisition::Absent,
+                version: None,
+                walk: WalkOutcome::NotWalked,
+                functions: vec![],
+            }],
+            vendor_interfaces: vec![],
+            alias_groups: vec![],
+        }
+    }
+
+    #[test]
+    fn new_dependency_is_not_authorized_until_a_preleased_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("module.so");
+        let dependency = dir.path().join("dependency.so");
+        std::fs::copy("/bin/true", &module).unwrap();
+        std::fs::copy("/bin/false", &dependency).unwrap();
+        let passes = [
+            closure_manifest(&module, &[&module]),
+            closure_manifest(&module, &[&module, &dependency]),
+            closure_manifest(&module, &[&module, &dependency]),
+        ];
+        let mut count = 0;
+
+        let stable = stabilize(&module, || {
+            let manifest = passes[count].clone();
+            count += 1;
+            Ok(manifest)
+        })
+        .unwrap();
+
+        assert_eq!(count, 3);
+        assert_eq!(stable.manifest().provenance_objects.len(), 2);
+    }
+
+    #[test]
+    fn byte_identical_replacement_inode_forces_a_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("module.so");
+        let first = dir.path().join("first.so");
+        let replacement = dir.path().join("replacement.so");
+        std::fs::copy("/bin/true", &module).unwrap();
+        std::fs::copy("/bin/false", &first).unwrap();
+        std::fs::copy(&first, &replacement).unwrap();
+        assert_eq!(
+            p11scope_manifest::identity::identify(&first).sha256,
+            p11scope_manifest::identity::identify(&replacement).sha256
+        );
+        assert_ne!(
+            first.metadata().unwrap().ino(),
+            replacement.metadata().unwrap().ino()
+        );
+        let passes = [
+            closure_manifest(&module, &[&module, &first]),
+            closure_manifest(&module, &[&module, &replacement]),
+            closure_manifest(&module, &[&module, &replacement]),
+        ];
+        let mut count = 0;
+
+        stabilize(&module, || {
+            let manifest = passes[count].clone();
+            count += 1;
+            Ok(manifest)
+        })
+        .unwrap();
+
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn alternating_inode_closure_exhausts_the_pass_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("module.so");
+        let first = dir.path().join("first.so");
+        let second = dir.path().join("second.so");
+        std::fs::copy("/bin/true", &module).unwrap();
+        std::fs::copy("/bin/false", &first).unwrap();
+        std::fs::copy(&first, &second).unwrap();
+        let manifests = [
+            closure_manifest(&module, &[&module, &first]),
+            closure_manifest(&module, &[&module, &second]),
+        ];
+        let mut count = 0;
+
+        let error = stabilize(&module, || {
+            let manifest = manifests[count % 2].clone();
+            count += 1;
+            Ok(manifest)
+        })
+        .unwrap_err();
+
+        assert_eq!(count, 8);
+        assert!(error.to_string().contains("did not stabilize"), "{error:#}");
+    }
+
+    #[test]
+    fn seed_path_replacement_invalidates_the_stable_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("module.so");
+        let replacement = dir.path().join("replacement.so");
+        std::fs::copy("/bin/true", &module).unwrap();
+        std::fs::copy("/bin/false", &replacement).unwrap();
+        let manifest = closure_manifest(&module, &[&module]);
+
+        let stable = stabilize(&module, || Ok(manifest.clone())).unwrap();
+        std::fs::rename(&replacement, &module).unwrap();
+
+        let error = stable.ensure_stable().unwrap_err();
+        assert!(error.to_string().contains("was replaced"), "{error:#}");
     }
 }

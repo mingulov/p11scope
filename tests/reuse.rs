@@ -47,7 +47,8 @@ fn cc_so_with_build_id(dir: &Path, name: &str, body: &str, build_id: &str) -> Pa
 }
 
 fn manifest_for(path: &Path) -> Manifest {
-    let id = p11scope_manifest::identity::identify(path);
+    let provenance = provenance_for(path);
+    let id = provenance.identity.clone();
     Manifest {
         schema: SCHEMA.to_string(),
         module_path: path.display().to_string(),
@@ -56,6 +57,7 @@ fn manifest_for(path: &Path) -> Manifest {
             path: path.display().to_string(),
             identity: id,
         }],
+        provenance_objects: vec![provenance],
         interface_list: Acquisition::Absent,
         surfaces: vec![SurfaceRecord {
             source: SurfaceSource::LegacyFunctionList,
@@ -66,6 +68,20 @@ fn manifest_for(path: &Path) -> Manifest {
         }],
         vendor_interfaces: vec![],
         alias_groups: vec![],
+    }
+}
+
+fn provenance_for(path: &Path) -> ProvenanceObject {
+    let file = p11scope_manifest::identity::open_object(path).unwrap();
+    let key = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
+    ProvenanceObject {
+        path: path.display().to_string(),
+        device_major: key.device_major,
+        device_minor: key.device_minor,
+        inode: key.inode,
+        identity: p11scope_manifest::identity::inspect_file(&file)
+            .unwrap()
+            .identity,
     }
 }
 
@@ -115,6 +131,9 @@ fn forged_function_role_is_refused_by_fresh_provenance() {
         path: dependency.display().to_string(),
         identity: p11scope_manifest::identity::identify(&dependency),
     });
+    discovered
+        .provenance_objects
+        .push(provenance_for(&dependency));
     discovered.surfaces[0]
         .functions
         .iter_mut()
@@ -150,7 +169,7 @@ fn forged_function_role_is_refused_by_fresh_provenance() {
 }
 
 #[test]
-fn provenance_accepts_an_identity_equal_copy_and_ignores_diagnostic_text() {
+fn provenance_accepts_an_identity_equal_copy_and_ignores_paths_ids_and_diagnostics() {
     let d = tmpdir("reuse_provenance_copy");
     let original = cc_so(&d, "original", "int provider(void){return 1;}\n");
     let copy = d.join("safe-copy.so");
@@ -167,9 +186,29 @@ fn provenance_accepts_an_identity_equal_copy_and_ignores_diagnostic_text() {
         detail: "unreadable pointer 0x9999".into(),
     };
     candidate.objects[0].identity.note = Some("attach diagnostic".into());
+    candidate.provenance_objects[0].path = "/different/diagnostic/path.so".into();
+    candidate.provenance_objects[0].device_minor ^= 1;
+    candidate.provenance_objects[0].inode = candidate.provenance_objects[0].inode.wrapping_add(1);
+    candidate.provenance_objects[0].identity.note = Some("closure diagnostic".into());
 
     assert!(p11scope::verify::check_reuse(&candidate).is_ok());
     p11scope::verify::check_provenance(&candidate, &discovered).unwrap();
+}
+
+#[test]
+fn manifest_v4_requires_a_whole_file_provenance_closure() {
+    let d = tmpdir("reuse_missing_provenance_closure");
+    let so = cc_so(&d, "missing-closure", "int f(void){return 1;}\n");
+    let mut manifest = manifest_for(&so);
+    manifest.provenance_objects.clear();
+
+    let errors = p11scope::verify::check_reuse(&manifest).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("provenance objects")),
+        "{errors:?}"
+    );
 }
 
 #[test]
@@ -212,6 +251,7 @@ fn provenance_normalizes_dependency_object_ids() {
             path: path.display().to_string(),
             identity: p11scope_manifest::identity::identify(path),
         });
+        discovered.provenance_objects.push(provenance_for(path));
     }
     for (name, object, file_offset) in [
         ("C_Initialize", 1, first_executable_offset(&dependency_a)),
@@ -596,6 +636,20 @@ fn aggregate_object_bytes_are_refused_before_parsing() {
         m.objects.push(ObjectRecord {
             id,
             path: path.display().to_string(),
+            identity: ObjectIdentity {
+                kind: IdentityKind::Sha256,
+                value: Some("00".repeat(32)),
+                sha256: Some("00".repeat(32)),
+                reusable: true,
+                note: None,
+            },
+        });
+        let key = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
+        m.provenance_objects.push(ProvenanceObject {
+            path: path.display().to_string(),
+            device_major: key.device_major,
+            device_minor: key.device_minor,
+            inode: key.inode,
             identity: ObjectIdentity {
                 kind: IdentityKind::Sha256,
                 value: Some("00".repeat(32)),

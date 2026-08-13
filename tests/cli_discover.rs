@@ -131,7 +131,7 @@ fn discover_forwards_to_the_helper() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["schema"], "p11scope-manifest/3");
+    assert_eq!(v["schema"], "p11scope-manifest/4");
 }
 
 #[test]
@@ -200,7 +200,13 @@ fn profile_refuses_a_forged_function_role_before_bpf_startup() {
     let provider = build_provider(dir.path());
     let genuine = p11scope_discover::discover::discover(&provider).unwrap();
     let genuine_path = dir.path().join("genuine.json");
-    std::fs::write(&genuine_path, serde_json::to_vec(&genuine).unwrap()).unwrap();
+    let mut oracle = genuine.clone();
+    let provider_sha = genuine.objects[0].identity.sha256.as_deref().unwrap();
+    oracle
+        .provenance_objects
+        .retain(|object| object.identity.sha256.as_deref() == Some(provider_sha));
+    assert_eq!(oracle.provenance_objects.len(), 1);
+    std::fs::write(&genuine_path, serde_json::to_vec(&oracle).unwrap()).unwrap();
 
     let mut forged = genuine;
     let legacy = &mut forged.surfaces[0];

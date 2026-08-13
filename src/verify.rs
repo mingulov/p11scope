@@ -163,6 +163,127 @@ impl Drop for LeaseMonitor {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct SynchronousLeaseMonitor {
+    blocked: libc::sigset_t,
+    previous: libc::sigset_t,
+}
+
+impl SynchronousLeaseMonitor {
+    pub(crate) fn new() -> Result<Self, String> {
+        // SAFETY: both sets are initialized before use and pthread_sigmask
+        // writes the caller-owned previous mask.
+        unsafe {
+            let mut blocked = std::mem::zeroed();
+            let mut previous = std::mem::zeroed();
+            if libc::sigemptyset(&mut blocked) == -1
+                || libc::sigaddset(&mut blocked, libc::SIGIO) == -1
+            {
+                return Err(format!(
+                    "preparing provenance lease signal set failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let error = libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous);
+            if error != 0 {
+                return Err(format!(
+                    "blocking provenance lease signals failed: {}",
+                    std::io::Error::from_raw_os_error(error)
+                ));
+            }
+            let monitor = Self { blocked, previous };
+            if monitor.consume_signal()? {
+                object_changed_exit();
+            }
+            Ok(monitor)
+        }
+    }
+
+    pub(crate) fn acquire(&self, file: &std::fs::File) -> Result<(), String> {
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLEASE, libc::F_RDLCK) } == -1 {
+            return Err(format!(
+                "cannot acquire required read lease: {}; the observer needs file ownership or CAP_LEASE, and the object must have no writer",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure<'a>(
+        &self,
+        files: impl IntoIterator<Item = &'a std::fs::File>,
+    ) -> Result<(), String> {
+        if self.consume_signal()? {
+            object_changed_exit();
+        }
+        for file in files {
+            let lease = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLEASE) };
+            if lease == -1 {
+                return Err(format!(
+                    "checking provenance read lease failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if lease != libc::F_RDLCK {
+                object_changed_exit();
+            }
+        }
+        if self.consume_signal()? {
+            object_changed_exit();
+        }
+        Ok(())
+    }
+
+    fn consume_signal(&self) -> Result<bool, String> {
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let mut consumed = false;
+        loop {
+            // SAFETY: SIGIO is blocked in this thread and both pointers refer
+            // to initialized caller-owned values for the duration of the call.
+            let signal =
+                unsafe { libc::sigtimedwait(&self.blocked, std::ptr::null_mut(), &timeout) };
+            if signal == libc::SIGIO {
+                consumed = true;
+                continue;
+            }
+            if signal == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EAGAIN) {
+                    return Ok(consumed);
+                }
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(format!("reading provenance lease signal failed: {error}"));
+            }
+            return Err(format!(
+                "unexpected signal {signal} while reading provenance lease notifications"
+            ));
+        }
+    }
+}
+
+fn object_changed_exit() -> ! {
+    // Preserve the established CLI contract while consuming the blocked
+    // notification synchronously at an authorization checkpoint.
+    unsafe { libc::_exit(OBJECT_CHANGED_EXIT) }
+}
+
+impl Drop for SynchronousLeaseMonitor {
+    fn drop(&mut self) {
+        if self.consume_signal() != Ok(false) {
+            object_changed_exit();
+        }
+        // SAFETY: previous was filled by pthread_sigmask in new().
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut());
+        }
+    }
+}
+
 fn bounded(label: &str, value: &str, limit: usize, problems: &mut Vec<String>) {
     if value.len() > limit {
         problems.push(format!(
@@ -174,6 +295,35 @@ fn bounded(label: &str, value: &str, limit: usize, problems: &mut Vec<String>) {
 
 fn valid_hex(value: &str) -> bool {
     value.len() % 2 == 0 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_identity(label: &str, identity: &ObjectIdentity, problems: &mut Vec<String>) {
+    match (
+        &identity.kind,
+        &identity.value,
+        &identity.sha256,
+        identity.reusable,
+    ) {
+        (IdentityKind::GnuBuildId, Some(value), Some(sha256), true) => {
+            if value.is_empty() || value.len() > 128 || !valid_hex(value) {
+                problems.push(format!("{label} has an invalid GNU build-id"));
+            }
+            if sha256.len() != 64 || !valid_hex(sha256) {
+                problems.push(format!("{label} has an invalid content SHA-256"));
+            }
+        }
+        (IdentityKind::Sha256, Some(value), Some(sha256), true) => {
+            if value.len() != 64 || !valid_hex(value) || value != sha256 {
+                problems.push(format!("{label} has an invalid SHA-256 identity"));
+            }
+        }
+        _ => problems.push(format!(
+            "{label} identity is not reusable and has no mandatory whole-file SHA-256"
+        )),
+    }
+    if let Some(note) = &identity.note {
+        bounded("identity note", note, MAX_DETAIL_BYTES, problems);
+    }
 }
 
 fn expected_surface(surface: &SurfaceRecord) -> Result<(Vec<&'static str>, &'static str), String> {
@@ -276,46 +426,77 @@ fn validate_structure(m: &Manifest) -> Vec<String> {
         if !object_paths.insert(object.path.as_str()) {
             problems.push(format!("duplicate object path {:?}", object.path));
         }
-        match (
-            &object.identity.kind,
-            &object.identity.value,
-            &object.identity.sha256,
-            object.identity.reusable,
-        ) {
-            (IdentityKind::GnuBuildId, Some(value), Some(sha256), true) => {
-                if value.is_empty() || value.len() > 128 || !valid_hex(value) {
-                    problems.push(format!("object {} has an invalid GNU build-id", object.id));
-                }
-                if sha256.len() != 64 || !valid_hex(sha256) {
-                    problems.push(format!(
-                        "object {} has an invalid content SHA-256",
-                        object.id
-                    ));
-                }
-            }
-            (IdentityKind::Sha256, Some(value), Some(sha256), true) => {
-                if value.len() != 64 || !valid_hex(value) || value != sha256 {
-                    problems.push(format!(
-                        "object {} has an invalid SHA-256 identity",
-                        object.id
-                    ));
-                }
-            }
-            (IdentityKind::Unavailable, None, None, false) => {}
-            _ => problems.push(format!(
-                "object {} has an inconsistent identity record",
-                object.id
-            )),
-        }
-        if let Some(note) = &object.identity.note {
-            bounded("identity note", note, MAX_DETAIL_BYTES, &mut problems);
-        }
+        validate_identity(
+            &format!("object {}", object.id),
+            &object.identity,
+            &mut problems,
+        );
     }
     if m.objects
         .first()
         .is_some_and(|object| object.path != m.module_path)
     {
         problems.push("object id 0 path must equal module_path".into());
+    }
+
+    if m.provenance_objects.is_empty() || m.provenance_objects.len() > MAX_OBJECTS {
+        problems.push(format!(
+            "manifest has {} provenance objects; expected 1..={MAX_OBJECTS}",
+            m.provenance_objects.len()
+        ));
+    }
+    let mut provenance_keys = BTreeSet::new();
+    let mut provenance_paths = BTreeSet::new();
+    let mut provenance_identities = BTreeSet::new();
+    for object in &m.provenance_objects {
+        bounded(
+            "provenance object path",
+            &object.path,
+            MAX_PATH_BYTES,
+            &mut problems,
+        );
+        if !Path::new(&object.path).is_absolute() {
+            problems.push(format!(
+                "provenance object path must be absolute: {:?}",
+                object.path
+            ));
+        }
+        if object.inode == 0 {
+            problems.push(format!(
+                "provenance object {:?} has a zero inode",
+                object.path
+            ));
+        }
+        if !provenance_keys.insert((object.device_major, object.device_minor, object.inode)) {
+            problems.push("duplicate provenance device/inode".into());
+        }
+        if !provenance_paths.insert(object.path.as_str()) {
+            problems.push(format!(
+                "duplicate provenance object path {:?}",
+                object.path
+            ));
+        }
+        validate_identity(
+            &format!("provenance object {:?}", object.path),
+            &object.identity,
+            &mut problems,
+        );
+        if let Some(sha256) = &object.identity.sha256 {
+            provenance_identities.insert(sha256.as_str());
+        }
+    }
+    for object in &m.objects {
+        if object
+            .identity
+            .sha256
+            .as_deref()
+            .is_some_and(|sha256| !provenance_identities.contains(sha256))
+        {
+            problems.push(format!(
+                "object {} identity is absent from the executable provenance closure",
+                object.id
+            ));
+        }
     }
 
     let mut legacy_seen = false;

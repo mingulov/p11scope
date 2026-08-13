@@ -16,7 +16,7 @@ fn manifest_json_on_stdout() {
         .unwrap();
     assert!(out.status.success());
     let m: p11scope_discover::manifest::Manifest = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(m.schema, "p11scope-manifest/3");
+    assert_eq!(m.schema, "p11scope-manifest/4");
     assert_eq!(m.surfaces[0].functions.len(), 68);
 }
 
@@ -69,7 +69,7 @@ fn o_writes_manifest_file() {
     assert!(Path::new(&outfile).exists());
     let contents = std::fs::read(&outfile).unwrap();
     let m: p11scope_discover::manifest::Manifest = serde_json::from_slice(&contents).unwrap();
-    assert_eq!(m.schema, "p11scope-manifest/3");
+    assert_eq!(m.schema, "p11scope-manifest/4");
 }
 
 #[test]

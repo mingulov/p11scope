@@ -148,18 +148,21 @@ fn load_plan(
         }
         anyhow!("manifest does not match the current files; refusing to attach")
     })?;
-    let discovered = discover_cmd::rediscover(provenance_module).with_context(|| {
+    let discovered = discover_cmd::rediscover_stable(provenance_module).with_context(|| {
         format!(
             "verifying manifest against fresh discovery of {}",
             provenance_module.display()
         )
     })?;
-    verify::check_provenance(&manifest, &discovered).map_err(|problems| {
+    verify::check_provenance(&manifest, discovered.manifest()).map_err(|problems| {
         for problem in &problems {
             eprintln!("p11scope: {problem}");
         }
         anyhow!("manifest provenance was not reproduced; refusing to attach")
     })?;
+    discovered
+        .ensure_stable()
+        .context("checking provenance closure after manifest comparison")?;
     objects
         .ensure_stable()
         .map_err(anyhow::Error::msg)

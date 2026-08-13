@@ -5,13 +5,25 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn manifest_for(object: &Path) -> Manifest {
+    let file = p11scope_manifest::identity::open_object(object).unwrap();
+    let key = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
+    let identity = p11scope_manifest::identity::inspect_file(&file)
+        .unwrap()
+        .identity;
     Manifest {
         schema: SCHEMA.into(),
         module_path: object.display().to_string(),
         objects: vec![ObjectRecord {
             id: 0,
             path: object.display().to_string(),
-            identity: p11scope_manifest::identity::identify(object),
+            identity: identity.clone(),
+        }],
+        provenance_objects: vec![ProvenanceObject {
+            path: object.display().to_string(),
+            device_major: key.device_major,
+            device_minor: key.device_minor,
+            inode: key.inode,
+            identity,
         }],
         interface_list: Acquisition::Absent,
         surfaces: vec![SurfaceRecord {

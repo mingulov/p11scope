@@ -10,11 +10,12 @@ use pkcs11_module::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 
 const INTERFACE_NAME_CAP: usize = 256;
 const MAX_OBJECTS: usize = 512;
+const MAX_TOTAL_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct ObjectKey {
@@ -106,16 +107,110 @@ pub fn discover(module_path: &Path) -> Result<Manifest, String> {
     let mut surfaces = vec![legacy];
     surfaces.extend(interface_surfaces);
     let alias_groups = alias_groups(&surfaces);
+    let provenance_objects = provenance_objects(&maps)?;
 
     Ok(Manifest {
         schema: SCHEMA.to_string(),
         module_path: module_path_text.to_string(),
         objects: objects.into_records(),
+        provenance_objects,
         interface_list,
         surfaces,
         vendor_interfaces,
         alias_groups,
     })
+}
+
+fn provenance_objects(mappings: &[maps::MapEntry]) -> Result<Vec<ProvenanceObject>, String> {
+    let mut by_key: BTreeMap<ObjectKey, ProvenanceObject> = BTreeMap::new();
+    let mut opened_paths = BTreeMap::new();
+    let mut total_bytes = 0u64;
+
+    for mapping in mappings
+        .iter()
+        .filter(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
+    {
+        let raw_path = mapping
+            .raw_path
+            .as_deref()
+            .ok_or_else(|| "file-backed executable mapping has no pathname".to_string())?;
+        let path = match maps::resolve(mappings, mapping.start) {
+            maps::Resolved::File {
+                path: MappedPath::Usable(path),
+                ..
+            } => path,
+            maps::Resolved::File {
+                path: MappedPath::Unusable { reason },
+                ..
+            } => {
+                return Err(format!(
+                    "executable mapping {} is unusable: {reason}",
+                    identity::hex(raw_path)
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "file-backed executable mapping {} has no usable absolute path",
+                    identity::hex(raw_path)
+                ));
+            }
+        };
+        let key = map_key(mapping);
+        if let Some(previous) = opened_paths.insert(path.clone(), key) {
+            if previous != key {
+                return Err(format!(
+                    "executable mapping path {} changed device/inode within one pass",
+                    path.display()
+                ));
+            }
+            continue;
+        }
+
+        let file = identity::open_object(&path).map_err(|error| {
+            format!("cannot open executable mapping {}: {error}", path.display())
+        })?;
+        let object_identity = validated_file_identity(&path, &file, key)?;
+        if let Some(previous) = by_key.get(&key) {
+            if previous.identity != object_identity {
+                return Err(format!(
+                    "executable mapping aliases for {key:?} disagree on whole-file identity"
+                ));
+            }
+            continue;
+        }
+        if by_key.len() >= MAX_OBJECTS {
+            return Err(format!(
+                "executable provenance object cap {MAX_OBJECTS} reached"
+            ));
+        }
+        let len = file
+            .metadata()
+            .map_err(|error| format!("metadata for {} failed: {error}", path.display()))?
+            .len();
+        total_bytes = total_bytes
+            .checked_add(len)
+            .ok_or_else(|| "executable provenance size overflowed u64".to_string())?;
+        if total_bytes > MAX_TOTAL_OBJECT_BYTES {
+            return Err(format!(
+                "executable provenance objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
+            ));
+        }
+        by_key.insert(
+            key,
+            ProvenanceObject {
+                path: path.display().to_string(),
+                device_major: key.device.major,
+                device_minor: key.device.minor,
+                inode: key.inode,
+                identity: object_identity,
+            },
+        );
+    }
+
+    if by_key.is_empty() {
+        return Err("discovery found no file-backed executable mappings".into());
+    }
+    Ok(by_key.into_values().collect())
 }
 
 fn map_key(entry: &maps::MapEntry) -> ObjectKey {
@@ -150,10 +245,6 @@ fn loaded_module_key(
     module_file_key: ObjectKey,
     module_identity: &ObjectIdentity,
 ) -> Result<ObjectKey, String> {
-    // Overlayfs and mount namespaces can expose a different device number in
-    // maps than stat(2) exposes for the same inode. An actual module export
-    // pins the mapping; inode plus the separately checked file identity pins
-    // it to the requested absolute path without trusting a basename.
     for address in [exports.get_function_list, exports.get_interface_list]
         .into_iter()
         .flatten()
@@ -165,13 +256,10 @@ fn loaded_module_key(
             ..
         } = maps::resolve(maps, address as u64)
         {
-            if inode == module_file_key.inode {
+            if (ObjectKey { device, inode }) == module_file_key {
                 if let MappedPath::Usable(path) = path {
-                    // When the kernel-reported path is reachable, require
-                    // the same stat identity and build identity too. A
-                    // namespace-only path may be unreachable; the absolute
-                    // dlopen target plus export address and inode remain the
-                    // available correlation in that case.
+                    // When the kernel-reported path is reachable, require the
+                    // same exact fd identity and whole-file identity too.
                     if std::fs::metadata(&path).is_ok()
                         && validated_identity(&path, module_file_key).as_ref()
                             != Ok(module_identity)
@@ -187,40 +275,27 @@ fn loaded_module_key(
 }
 
 fn file_key(file: &File) -> Result<ObjectKey, String> {
-    let metadata = file
-        .metadata()
-        .map_err(|e| format!("metadata failed: {e}"))?;
+    let key = identity::mapping_file_key(file)?;
     Ok(ObjectKey {
-        device: device_from_dev_t(metadata.dev()),
-        inode: metadata.ino(),
+        device: Device {
+            major: key.device_major,
+            minor: key.device_minor,
+        },
+        inode: key.inode,
     })
-}
-
-// Linux's gnu_dev_major()/gnu_dev_minor() layout, used by /proc/*/maps.
-fn device_from_dev_t(dev: u64) -> Device {
-    Device {
-        major: ((dev & 0x0000_0000_000f_ff00) >> 8) | ((dev & 0xffff_f000_0000_0000) >> 32),
-        minor: (dev & 0x0000_0000_0000_00ff) | ((dev & 0x0000_0fff_fff0_0000) >> 12),
-    }
 }
 
 fn validated_identity(path: &Path, expected: ObjectKey) -> Result<ObjectIdentity, String> {
     let file = identity::open_object(path)
         .map_err(|e| format!("cannot open {} for reuse: {e}", path.display()))?;
-    validated_file_identity(path, &file, expected, true)
-}
-
-fn validated_mapped_identity(path: &Path, mapped: ObjectKey) -> Result<ObjectIdentity, String> {
-    let file = identity::open_object(path)
-        .map_err(|e| format!("cannot open {} for reuse: {e}", path.display()))?;
-    validated_file_identity(path, &file, mapped, false)
+    validated_file_identity(path, &file, expected)
 }
 
 fn identity_and_key(path: &Path) -> Result<(ObjectKey, ObjectIdentity), String> {
     let file = identity::open_object(path)
         .map_err(|e| format!("cannot open {} for reuse: {e}", path.display()))?;
     let key = file_key(&file)?;
-    let identity = validated_file_identity(path, &file, key, true)?;
+    let identity = validated_file_identity(path, &file, key)?;
     Ok((key, identity))
 }
 
@@ -228,10 +303,9 @@ fn validated_file_identity(
     path: &Path,
     file: &File,
     expected: ObjectKey,
-    require_device: bool,
 ) -> Result<ObjectIdentity, String> {
     let actual = file_key(file)?;
-    if actual.inode != expected.inode || require_device && actual.device != expected.device {
+    if actual != expected {
         return Err(format!(
             "device/inode mismatch for {}: mapped {:?}, path {:?}",
             path.display(),
@@ -836,7 +910,7 @@ impl ObjectTable {
                 &raw_path,
             );
         }
-        let object_identity = match validated_mapped_identity(&path, key) {
+        let object_identity = match validated_identity(&path, key) {
             Ok(identity) => identity,
             Err(reason) => return unusable_file(reason, &raw_path),
         };
@@ -966,7 +1040,7 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(replacement, &link).unwrap();
 
-        let actual = validated_file_identity(&link, &file, key, true).unwrap();
+        let actual = validated_file_identity(&link, &file, key).unwrap();
         assert_eq!(actual, identity::identify(&original));
         assert_ne!(actual, identity::identify(replacement));
 

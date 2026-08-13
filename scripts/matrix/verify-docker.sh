@@ -17,9 +17,8 @@
 #    before handing the manifest to `p11scope profile`, exactly matching
 #    the Phase 0 spike's bpftrace path-prefix trick (see
 #    docs/superpowers/plans/2026-08-10-phase0-feasibility-spike.md, Task 4)
-#    -- both the uprobe attach path (attach.rs passes slot.object straight
-#    through to aya) and the manifest reuse/identity check (verify.rs reads
-#    Path::new(&obj.path) directly) go through that same rewritten path.
+#    -- manifest verification opens that rewritten path once, checks its
+#    identity, and keeps the resulting descriptor pinned through attach.
 # 2. The capture is scoped to the container's cgroup (--cgroup), using
 #    Task 1's new descendant-matching so it doesn't matter whether the
 #    workload runs directly in the container's leaf cgroup or a nested one.
@@ -28,12 +27,24 @@ cd "$(dirname "$0")/../.."
 
 MODULE_IN_CONTAINER=/usr/lib/softhsm/libsofthsm2.so
 WORK=target/matrix-docker
+TRUST_DIR="$PWD/$WORK/trusted"
+PROVENANCE_MODULE="$PWD/$WORK/provider-provenance.so"
 IMAGE=p11scope-matrix
 NAME=p11scope-matrix-docker
+WPID=
+SPID=
+. scripts/trusted-p11scope.sh
 
 command -v docker >/dev/null || { echo "docker required"; exit 1; }
 
-cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
+cleanup() {
+    [ -z "$WPID" ] || kill "$WPID" 2>/dev/null || true
+    [ -z "$SPID" ] || kill "$SPID" 2>/dev/null || true
+    [ -z "$WPID" ] || wait "$WPID" 2>/dev/null || true
+    [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || true
+    docker rm -f "$NAME" >/dev/null 2>&1 || true
+    remove_trusted_p11scope "$TRUST_DIR"
+}
 trap cleanup EXIT
 
 echo "=== build product + workload ==="
@@ -56,10 +67,15 @@ test -n "$PID" && [ "$PID" -gt 0 ] || { echo "could not get container pid"; exit
 echo "container pid on host: $PID"
 
 echo "=== discover inside the container's mount view ==="
-# Runs as the container's root, via the docker daemon socket -- no host
-# root required for this step (measured below).
-docker exec "$NAME" p11scope-discover --module "$MODULE_IN_CONTAINER" -o /shared/manifest.json
+# The helper drops container-root before loading the provider; no host root
+# is required for this step (measured below).
+docker exec "$NAME" p11scope-discover --module "$MODULE_IN_CONTAINER" \
+    > "$WORK/shared/manifest.json"
 test -s "$WORK/shared/manifest.json" || { echo "manifest not produced"; exit 1; }
+rm -f "$PROVENANCE_MODULE"
+docker cp -L "$NAME:$MODULE_IN_CONTAINER" "$PROVENANCE_MODULE"
+test -f "$PROVENANCE_MODULE" && [ ! -L "$PROVENANCE_MODULE" ] \
+    || { echo "provenance module is not a regular copied file"; exit 1; }
 
 echo "=== rewrite manifest object paths with /proc/<pid>/root prefix ==="
 python3 - "$WORK/shared/manifest.json" "$WORK/manifest-host.json" "/proc/$PID/root" <<'PY'
@@ -81,7 +97,8 @@ test -d "$CGROUP_PATH" || { echo "cgroup path does not exist: $CGROUP_PATH"; exi
 echo "=== measure privileges: unprivileged profile attempt ==="
 set +e
 UNPRIV_OUT=$(./target/release/p11scope profile --manifest "$WORK/manifest-host.json" \
-    --cgroup "$CGROUP_PATH" --mode metrics --duration 1 2>&1)
+    --provenance-module "$PROVENANCE_MODULE" --cgroup "$CGROUP_PATH" \
+    --mode metrics --duration 1 2>&1)
 UNPRIV_RC=$?
 set -e
 echo "$UNPRIV_OUT"
@@ -95,19 +112,22 @@ echo "$UNPRIV_OUT" | grep -q "Permission denied" \
 echo "measured: unprivileged run fails identifying /proc/<pid>/root/... (EACCES) before BPF is even touched"
 
 echo "=== observe: attach-before-run against the container ==="
+stage_trusted_p11scope target/release/p11scope \
+    target/release/p11scope-discover "$TRUST_DIR"
 rm -f "$WORK/shared/go"
 ( while [ ! -f "$WORK/shared/go" ]; do sleep 0.05; done
   docker exec "$NAME" /usr/local/bin/harness "$MODULE_IN_CONTAINER" ) &
 WPID=$!
-sudo ./target/release/p11scope profile \
+sudo "$TRUST_DIR/p11scope" profile \
     --manifest "$WORK/manifest-host.json" --cgroup "$CGROUP_PATH" \
+    --provenance-module "$PROVENANCE_MODULE" \
     --mode metrics --duration 20 -o "$WORK/observed.json" \
     > "$WORK/profile.log" 2>&1 &
 SPID=$!
 sleep 3            # let attach complete
 touch "$WORK/shared/go"
-wait "$WPID"
-wait "$SPID"
+if wait "$WPID"; then WPID=; else status=$?; WPID=; echo "container workload failed: $status"; exit "$status"; fi
+if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "container profiler failed: $status"; tail -n 20 "$WORK/profile.log"; exit "$status"; fi
 tail -n 15 "$WORK/profile.log"
 
 echo "=== verify against spike/expected.txt ==="

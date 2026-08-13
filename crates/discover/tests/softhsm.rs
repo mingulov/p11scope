@@ -26,7 +26,10 @@ fn softhsm2_legacy_table_fully_resolved() {
     assert!(matches!(legacy.source, SurfaceSource::LegacyFunctionList));
     assert!(matches!(legacy.acquisition, Acquisition::Ok));
     assert!(matches!(legacy.walk, WalkOutcome::Full));
-    let expected: Vec<&str> = pkcs11_module::FUNCTION_LIST_FIELDS.iter().map(|f| f.name).collect();
+    let expected: Vec<&str> = pkcs11_module::FUNCTION_LIST_FIELDS
+        .iter()
+        .map(|f| f.name)
+        .collect();
     let got: Vec<&str> = legacy.functions.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(got, expected);
     assert_eq!(legacy.functions.len(), 68);
@@ -35,7 +38,11 @@ fn softhsm2_legacy_table_fully_resolved() {
     for f in &legacy.functions {
         match f.resolution {
             Resolution::Resolved { object, .. } => {
-                assert!(m.objects[object as usize].path.contains("softhsm"), "{}", f.name);
+                assert!(
+                    m.objects[object as usize].path.contains("softhsm"),
+                    "{}",
+                    f.name
+                );
             }
             ref other => panic!("{} did not resolve: {other:?}", f.name),
         }
@@ -49,6 +56,7 @@ fn softhsm2_legacy_table_fully_resolved() {
     // Distro .so carries a GNU build-id.
     assert_eq!(m.objects[0].identity.kind, IdentityKind::GnuBuildId);
     assert!(m.objects[0].identity.reusable);
+    assert_eq!(m.objects[0].identity.sha256.as_deref().unwrap().len(), 64);
 }
 
 /// Regression for the discover identity bug the Knative row found
@@ -83,5 +91,6 @@ fn magic_proc_path_records_identity_against_the_module_path_argument() {
     let current = p11scope_discover::identity::identify(Path::new(&obj.path));
     assert_eq!(current.kind, obj.identity.kind);
     assert_eq!(current.value, obj.identity.value);
+    assert_eq!(current.sha256, obj.identity.sha256);
     assert!(current.reusable);
 }

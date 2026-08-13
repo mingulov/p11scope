@@ -42,9 +42,12 @@ cd "$(dirname "$0")/../.."
 
 MODULE_IN_POD=/usr/lib/softhsm/libsofthsm2.so
 WORK=target/matrix-kind
+TRUST_DIR="$PWD/$WORK/trusted"
+PROVENANCE_MODULE="$PWD/$WORK/provider-provenance.so"
 IMAGE=p11scope-matrix-k8s
 CLUSTER=p11scope-matrix
 POD=p11scope-matrix-pod
+. scripts/trusted-p11scope.sh
 
 command -v kind >/dev/null || { echo "kind required"; exit 1; }
 command -v kubectl >/dev/null || { echo "kubectl required"; exit 1; }
@@ -52,7 +55,10 @@ command -v docker >/dev/null || { echo "docker required"; exit 1; }
 
 CLUSTER_CREATED=0
 FAILED=1
+SPID=
 cleanup() {
+    [ -z "$SPID" ] || kill "$SPID" 2>/dev/null || true
+    [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || true
     if [ "$FAILED" -eq 0 ]; then
         kubectl delete pod "$POD" --wait=true --ignore-not-found >/dev/null 2>&1 || true
         if [ "$CLUSTER_CREATED" -eq 1 ]; then
@@ -61,6 +67,7 @@ cleanup() {
     else
         echo "FAILED -- leaving cluster '$CLUSTER' and pod '$POD' up for inspection"
     fi
+    remove_trusted_p11scope "$TRUST_DIR"
 }
 trap cleanup EXIT
 
@@ -110,6 +117,7 @@ echo "=== discover inside the pod's mount view ==="
 kubectl exec "$POD" -- p11scope-discover --module "$MODULE_IN_POD" -o /tmp/manifest.json
 kubectl exec "$POD" -- cat /tmp/manifest.json > "$WORK/manifest.json"
 test -s "$WORK/manifest.json" || { echo "manifest not produced"; exit 1; }
+kubectl exec "$POD" -- cat "$MODULE_IN_POD" > "$PROVENANCE_MODULE"
 
 echo "=== resolve container id, host pid, and cgroup paths ==="
 CID=$(kubectl get pod "$POD" -o jsonpath='{.status.containerStatuses[0].containerID}' | sed 's#containerd://##')
@@ -138,7 +146,8 @@ PY
 echo "=== measure privileges: unprivileged profile attempt ==="
 set +e
 UNPRIV_OUT=$(./target/release/p11scope profile --manifest "$WORK/manifest-host.json" \
-    --cgroup "$POD_CG" --mode metrics --duration 1 2>&1)
+    --provenance-module "$PROVENANCE_MODULE" --cgroup "$POD_CG" \
+    --mode metrics --duration 1 2>&1)
 UNPRIV_RC=$?
 set -e
 echo "$UNPRIV_OUT"
@@ -152,14 +161,17 @@ echo "$UNPRIV_OUT" | grep -q "Permission denied" \
 echo "measured: unprivileged run fails identifying /proc/<pid>/root/... (EACCES) before BPF is even touched"
 
 echo "=== observe: attach-before-run against the pod, scoped to the POD-level cgroup ==="
-sudo ./target/release/p11scope profile \
+stage_trusted_p11scope target/release/p11scope \
+    target/release/p11scope-discover "$TRUST_DIR"
+sudo "$TRUST_DIR/p11scope" profile \
     --manifest "$WORK/manifest-host.json" --cgroup "$POD_CG" \
+    --provenance-module "$PROVENANCE_MODULE" \
     --mode metrics --duration 20 -o "$WORK/observed.json" \
     > "$WORK/profile.log" 2>&1 &
 SPID=$!
 sleep 3            # let attach complete
 kubectl exec "$POD" -- /usr/local/bin/harness "$MODULE_IN_POD"
-wait "$SPID"
+if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "pod profiler failed: $status"; tail -n 20 "$WORK/profile.log"; exit "$status"; fi
 tail -n 15 "$WORK/profile.log"
 
 echo "=== verify against spike/expected.txt ==="

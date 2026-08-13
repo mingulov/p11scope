@@ -5,10 +5,18 @@ how to run it, and what its output actually proves. Every number below
 cites the script that produced it — re-run the script to check it
 yourself.
 
+> **Unreleased security status:** this corrective worktree is not
+> release-ready. Its current default metadata decoder assumes trusted ABI-valid
+> pointer placement, and its first provenance/lease pass has open dependency
+> and teardown gaps. See the
+> [safe metadata design](superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md)
+> and [corrected provenance plan](superpowers/plans/2026-08-13-manifest-provenance.md).
+
 - [What it does](#what-it-does)
 - [What it does NOT do](#what-it-does-not-do)
 - [Quickstart](#quickstart)
-- [Privileges, per environment (measured)](#privileges-per-environment-measured)
+- [PKCS #11 versions and interface names](#pkcs-11-versions-and-interface-names)
+- [Privileges, per environment](#privileges-per-environment)
 - [Kernel floor and unsupported environments](#kernel-floor-and-unsupported-environments)
 - [Overhead (measured)](#overhead-measured)
 - [The evidence/completeness model](#the-evidencecompleteness-model)
@@ -26,14 +34,16 @@ for a bounded investigation window (`trace` mode), and writes a versioned
 `observed-profile.json` for migration assessment
 (`docs/schema/observed-profile-v1.md`) or an operator to read directly.
 
-## What it does NOT do
+## What it does NOT intentionally decode
 
-No PINs, no key material, no `CKA_VALUE` contents, no plaintext,
-ciphertext, signatures, or wrapped blobs, no random output, no
-operation-state blobs, no raw mechanism byte arrays, no raw session
-handles, no buffer contents — **in any mode, at any privilege**. Labels
-and `CKA_ID` are refused outright; there is no flag that dumps buffers or
-label contents. See
+There is no decoder or dump flag for PINs, key material, `CKA_VALUE`, labels,
+`CKA_ID`, plaintext, ciphertext, signatures, wrapped blobs, random output,
+operation-state blobs, raw mechanism byte arrays, raw session handles, or
+ordinary buffers. This is not yet a hostile-pointer guarantee: the current
+unreleased decoder follows caller-selected metadata pointers, so malicious
+aliasing can expose selected unrelated scalar words or bytes. The safe-default
+design linked above removes those dereferences unless an explicit diagnostic
+feature and flag are both enabled. See
 [docs/superpowers/specs/2026-08-10-pkcs11-scope-outputs.md](superpowers/specs/2026-08-10-pkcs11-scope-outputs.md#what-you-will-not-see-by-design-in-every-mode)
 for the design commitment and
 [docs/privacy/allowlist-v1.md](privacy/allowlist-v1.md) for the field-by-field
@@ -45,6 +55,20 @@ exercises it).
 A profile is evidence of what the application *did* during the capture
 window. It is never proof of what the application *cannot* do — see
 [Honest claims](#honest-claims).
+
+## PKCS #11 versions and interface names
+
+Support is cumulative: legacy 2.00 (67 slots), 2.01 through 2.40 (68), 3.0
+and 3.1 interfaces (92), and the final 3.2 interface (104 published slots).
+Newer support does not replace 2.x support.
+
+The standard name `"PKCS 11"` is common but not universal. Discovery also
+handles alternate, null, unreadable, and non-UTF-8 names. It walks those tables
+only when standard export anchors—or an independently acquired legacy 2.40
+table—corroborate the expected layout. Such a walk is a known prefix and keeps
+the report `PARTIAL`; uncorroborated entries remain present as vendor evidence
+and are not decoded. Discovery enumerates `C_GetInterfaceList` but never calls
+`C_GetInterface`.
 
 ## Quickstart
 
@@ -58,19 +82,67 @@ getting it right is on the operator.
 p11scope-discover --module /usr/lib/softhsm/libsofthsm2.so -o manifest.json
 
 # 2. Attach and aggregate over a running process or a cgroup.
-p11scope profile --manifest manifest.json --pid 12345 --duration 60 -o observed-profile.json
-p11scope profile --manifest manifest.json --cgroup /sys/fs/cgroup/kubepods.slice/... --mode metrics
+p11scope profile --manifest manifest.json --provenance-module /usr/lib/softhsm/libsofthsm2.so --pid 12345 --duration 60 -o observed-profile.json
+p11scope profile --manifest manifest.json --provenance-module /usr/lib/softhsm/libsofthsm2.so --cgroup /sys/fs/cgroup/kubepods.slice/... --mode metrics
 
 # 3. Or: stream one line per call for a short, bounded investigation.
-p11scope trace --manifest manifest.json --pid 12345 --duration 15
+p11scope trace --manifest manifest.json --provenance-module /usr/lib/softhsm/libsofthsm2.so --pid 12345 --duration 15
 ```
+
+The application may already have mapped the provider at an unrelated ASLR
+address. That is expected: discovery converts each live table pointer to an
+ELF object identity plus file offset, and uprobes attach to that object/offset
+in the selected PID or cgroup. Virtual addresses never have to match.
+
+The helper reconstructs the table in its own unprivileged process; it does not
+read or inject into the target process. This relies on a provider build exposing
+the same file-backed function table in each process. Anonymous or JIT-generated
+helper targets are recorded as unattachable; a provider whose table changes by
+process or configuration is outside this release's completeness guarantee. The
+kernel keys each accepted uprobe to the pinned inode and offset, and the BPF
+scope guard runs before any argument read.
+
+Discovery always drops supplementary groups, UID/GID, and active, permitted,
+inheritable, and ambient capabilities before loading provider code, even when
+invoked from an elevated observer. The module and output directory must
+therefore be readable/writable by the invoking unprivileged identity (or the
+`nobody` fallback for a direct root invocation). After an ID change, the helper
+restores Linux dumpability only to perform bounded reads through
+`/proc/self/mem`; it does not restore groups, IDs, or capabilities.
 
 Both `profile` and `trace` require `--manifest` and either `--pid` or
 `--cgroup`; `--cgroup` matches that cgroup and every descendant beneath it
-(kernel ≥5.15 ancestor matching), so pointing it at a container's or pod's
+(kernel ≥5.15 due to attach cookies), so pointing it at a container's or pod's
 directory reaches the workload's actual nested cgroup. `--duration` bounds
 either subcommand; Ctrl-C also ends a capture cleanly (final frame printed,
 `-o` file written) instead of aborting it.
+
+Before either command builds an attach plan it treats the stored manifest as
+untrusted input. `--provenance-module` is mandatory, so the operator names the
+provider bytes independently instead of letting the manifest select its own
+authority. The observer repeats discovery through the sibling
+`p11scope-discover`. The helper must be a regular executable beside
+`p11scope`, owned by root for a privileged/capability-bearing observer (root
+or the invoking uid for an unprivileged observer), and not group/world
+writable. It is opened once, executed through that descriptor after privilege
+drop, receives an empty environment, has stderr discarded, and is killed with
+its process group if it exceeds 30 seconds. Its stdout is capped at 16 MiB.
+Install the two binaries together.
+
+The current first pass opens and Linux read-leases candidate attach objects,
+re-hashes them after attach, and exits with code 78 on a lease-break signal.
+That is useful defense but not a release proof: the helper's provider-fd route
+breaks `$ORIGIN`, not every lazy dependency is leased before discovery, and
+plain `_exit` does not order BPF-link closure before lease-fd closure. The
+corrected design loads the provider by its validated absolute path, stabilizes
+the exact mapped-inode closure under leases, and keeps the original CLI as a
+lease supervisor while a child owns all BPF links. On a break the supervisor
+SIGKILLs and pidfd-waits that worker before releasing its last lease.
+
+Pass the real provider path as `--provenance-module`. Namespace-safe copies
+must eventually preserve the provider's required `$ORIGIN` sibling closure,
+not just the top-level bytes. The current container/privileged lanes must be
+rerun after that implementation. There is no `--trust-manifest` override.
 
 **Real output**, `profile --mode metrics` against a SoftHSM2 workload
 (`scripts/verify-attach-e2e.sh`):
@@ -93,25 +165,41 @@ pseudonym, never the provider's raw session handle):
 22:25:03.791056 pid 431682 tid 431682 sess#1 C_DigestInit 0x250 → CKR_OK 155.3µs
 22:25:03.791069 pid 431682 tid 431682 sess#1 C_Digest → CKR_OK 9.8µs
 22:25:03.791885 pid 431682 tid 431682 sess#1 C_CloseSession → CKR_OK 3.7µs
+EVIDENCE {"table_entries":68,"slots":68,...,"completeness":"COMPLETE"}
 ```
 
-If the ring buffer drops events, `trace` ends with an explicit
+Every trace ends with the same machine-readable evidence object used by
+profile output. If the ring buffer drops events, it also emits an explicit
 `LOST n events` line rather than silently under-reporting — see
 [Overhead](#overhead-measured) for when that actually happens.
 
-## Privileges, per environment (measured)
+## Privileges, per environment
 
-Measured on real hosts/containers/pods with `capsh`/`setpriv`, dropping
+The BPF/procfs rows below were measured on real hosts/containers/pods before
+the byte-stability hardening, using `capsh`/`setpriv` and dropping
 capabilities one at a time and recording the *actual* error text — not
 documentation claims. Full detail, including the docker/kind
 reproduction: `docs/notes/phase4-privileges.md`
-(`scripts/matrix/verify-fork-scope.sh` asserts the host row numerically
-from real JSON output).
+(`scripts/matrix/verify-fork-scope.sh` has been updated for the new lease
+requirement, but its privileged rerun still requires approval).
 
-| Environment | Minimum privilege | Full root needed? |
+| Environment | Previously measured BPF/procfs minimum | Added file-stability requirement |
 | --- | --- | --- |
-| Host process (`--pid`, same-uid target) | `CAP_SYS_ADMIN` alone | No |
-| Docker / kind (`--cgroup`, cross-uid target) | `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` | No |
+| Host process (`--pid`, same-uid target) | `CAP_SYS_ADMIN` | File ownership or `CAP_LEASE` |
+| Docker / kind (`--cgroup`, cross-uid target) | `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` | File ownership or `CAP_LEASE` |
+
+System and container provider objects are normally root-owned, so a
+capability-only observer is now expected to need `CAP_LEASE` in addition to
+the measured row. Full root already has it. This is an enforced Linux lease
+requirement, not yet a newly measured minimum; the updated matrix must be rerun
+before the release records it as measured.
+
+A same-uid process can send unmaskable `SIGSTOP`/`SIGKILL` to a
+capability-bearing observer. Therefore the completed lease-continuity design's
+hostile-target claim additionally requires a supervisor identity the workload
+cannot signal or ptrace—normally host root against a non-root workload, or a
+dedicated service uid. The same-uid capability-only row remains useful for
+trusted workloads but cannot carry that hostile-target claim.
 
 `CAP_BPF`+`CAP_PERFMON` alone is documented upstream as sufficient for
 BPF+uprobe work without `CAP_SYS_ADMIN` — measured here, it is **not**
@@ -128,8 +216,8 @@ permissions.
 
 ## Kernel floor and unsupported environments
 
-Kernel floor: **≥ 5.15**, traced to `bpf_get_current_ancestor_cgroup_id()`
-(cgroup-scoped attach, `src/scope.rs`). This tool does not runtime-check
+Kernel floor: **≥ 5.15**, required by the attach-cookie design and validated
+by the supported cgroup-scoped BPF path. This tool does not runtime-check
 the kernel version; on an unsupported kernel or configuration it relies on
 the same clear-failure path described below. Caveat, stated plainly: the
 5.15 number itself was not re-derived against a live sub-5.15 kernel in
@@ -230,9 +318,9 @@ ring-buffer loss — they stayed exact in every run. `evidence.completeness`
 correctly reports `PARTIAL` whenever this happens; it is never silently
 reported as complete. An operator capturing a bursty, high-rate workload
 should expect `PARTIAL` with a real `event_loss` count, and should trust
-the aggregate function/mechanism counts over the per-call event stream
-(`mechanisms`/`sessions`/`logins`/`cgroups`, and `trace`'s lines) in that
-case. Same finding `scripts/verify-induced-gaps.sh` demonstrates
+the aggregate `functions[]` counts over event-derived
+`mechanisms`/`sessions`/`logins`/`cgroups` and `trace` lines in that case.
+Same finding `scripts/verify-induced-gaps.sh` demonstrates
 deliberately on a lighter workload (`docs/notes/phase2-induced-gaps.md`).
 
 ## The evidence/completeness model
@@ -241,11 +329,27 @@ Every `observed-profile.json` carries an `evidence` section
 (`docs/schema/observed-profile-v1.md`) ending in a `completeness` verdict:
 `"COMPLETE"` or `"PARTIAL"`.
 
-**`COMPLETE`** requires *all* of: no attach failures, no skipped manifest
-entries, no aliasing, no in-flight calls at capture end, every manifest
-surface fully walked with a successful acquisition, no undecoded vendor
-interfaces, `event_loss == 0`, `malformed_records == 0`,
-`templates_truncated == false`, and `shape_decode_total_failures == 0`.
+Manifests are untrusted proposed plans. Their table provenance is freshly
+reproduced before attach; every object carries an always-computed whole-file
+SHA-256 (GNU build-ID remains reporting evidence), files are identified
+through pinned regular-file descriptors, and offsets must land in executable
+ELF segments. Those checks prevent several stale/path-retarget cases, but the
+current first pass is not release authorization: it does not yet establish a
+pre-leased exact-inode closure for lazy dependencies or ordered probe teardown
+on a lease break. Manifest v4 and the lease-supervisor protocol in the corrected
+provenance plan are required before release. The current oracle has an empty
+environment and a 30-second deadline. Inputs are capped at a 16 MiB manifest,
+16 MiB oracle output, 256 MiB per object, and 512 MiB across all objects.
+
+**`COMPLETE`** requires every manifest surface to be fully acquired and
+walked, every planned probe attached, and zero discovery, START/RV/ring,
+cgroup, process-identity, semantic-state, fork, cancellation, async,
+template, or parameter-decode gaps. The schema document lists every field
+and the four explicitly informational exceptions.
+
+`COMPLETE` describes the completeness of the accepted capture window. It is
+not a claim that deliberately malicious native provider code truthfully
+implements the ABI role named in its own function table.
 
 **`PARTIAL`** is forced by any single gap in that list — an attach
 failure, ring-buffer loss, a template the in-kernel walk couldn't finish
@@ -299,12 +403,11 @@ What this tool proves, and what it deliberately does not claim to:
 ## Related docs
 
 - [`docs/privacy/allowlist-v1.md`](privacy/allowlist-v1.md) — the
-  field-by-field privacy allowlist: every captured field justified, every
-  rejected candidate refused, with file:line citations and the canary test
-  that enforces each gate.
+  field-by-field decoder inventory, current hostile-pointer limitation, and
+  the canary work still required for the safe/diagnostic policy split.
 - [`docs/schema/observed-profile-v1.md`](schema/observed-profile-v1.md) —
   the versioned `observed-profile.json` schema (current:
-  `pkcs11-scope/observed-profile/v1.2`), the integration boundary
+  `pkcs11-scope/observed-profile/v1.3`), the integration boundary
   `pkcs11-lab` reads.
 - [`docs/superpowers/specs/2026-08-10-pkcs11-scope-outputs.md`](superpowers/specs/2026-08-10-pkcs11-scope-outputs.md)
   — the original "what you will see" design commitment.

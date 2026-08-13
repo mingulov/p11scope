@@ -31,6 +31,7 @@ fn gnu_build_id_preferred() {
     assert_eq!(id.kind, IdentityKind::GnuBuildId);
     assert!(id.reusable);
     assert_eq!(id.value.unwrap().len(), 40); // sha1 note = 20 bytes hex
+    assert_eq!(id.sha256.unwrap().len(), 64);
 }
 
 #[test]
@@ -39,17 +40,20 @@ fn sha256_fallback_without_build_id() {
     let id = identify(&so);
     assert_eq!(id.kind, IdentityKind::Sha256);
     assert!(id.reusable);
-    assert_eq!(id.value.unwrap().len(), 64);
+    assert_eq!(id.value.as_ref().unwrap().len(), 64);
+    assert_eq!(id.sha256, id.value);
 }
 
 #[test]
-fn non_elf_still_hashes_bytes() {
+fn non_elf_is_not_an_attachable_identity() {
     let d = tmpdir("id3");
     let f = d.join("not_elf.so");
     std::fs::write(&f, b"not an ELF at all").unwrap();
     let id = identify(&f);
-    assert_eq!(id.kind, IdentityKind::Sha256);
-    assert!(id.reusable);
+    assert_eq!(id.kind, IdentityKind::Unavailable);
+    assert!(!id.reusable);
+    assert!(id.value.is_none());
+    assert!(id.sha256.is_none());
     assert!(id.note.unwrap().contains("not parseable"));
 }
 
@@ -59,4 +63,5 @@ fn unreadable_is_explicitly_not_reusable() {
     assert_eq!(id.kind, IdentityKind::Unavailable);
     assert!(!id.reusable);
     assert!(id.value.is_none());
+    assert!(id.sha256.is_none());
 }

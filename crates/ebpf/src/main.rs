@@ -1,82 +1,99 @@
-//! p11scope BPF programs. Two programs serve every attach point: the
-//! attach cookie carries the slot index, so 68+ probes need two programs
-//! rather than 68 copies. Cookies need kernel >= 5.15, which is the
-//! project's floor.
+//! p11scope BPF programs. A lightweight or template-aware entry program
+//! plus one return program serve every attach point. The attach cookie
+//! carries the slot index, so 68+ probes share a small fixed program set
+//! rather than per-function copies. Cookies need kernel >= 5.15.
 #![no_std]
 #![no_main]
 
-use aya_ebpf::macros::{map, uprobe, uretprobe};
-use aya_ebpf::maps::{Array, HashMap, PerCpuArray, PerCpuHashMap, RingBuf};
-use aya_ebpf::programs::{ProbeContext, RetProbeContext};
-use aya_ebpf::{EbpfContext as _, helpers};
+use aya_ebpf::macros::{map, tracepoint, uprobe, uretprobe};
+use aya_ebpf::maps::{
+    Array, CgroupArray, HashMap, PerCpuArray, PerCpuHashMap, ProgramArray, RingBuf,
+};
+use aya_ebpf::programs::{ProbeContext, RetProbeContext, TracePointContext};
+use aya_ebpf::helpers;
+use core::mem::MaybeUninit;
 use p11scope_ebpf_common::{
-    CFG_CGROUP_LEVEL, CFG_FLAGS, CallStart, Event, FLAG_CGROUP_FILTER, FLAG_PID_FILTER, MAX_ATTRS,
-    MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, RING_BYTES, RvKey, SESSION_NONE, SlotStats, StartKey,
-    USER_TYPE_NONE, attr_bool, bucket_of, fnkind, shape,
+    ARG_NONE, CFG_FLAGS, CallStart, EVIDENCE_CELLS, EVIDENCE_CGROUP_SCOPE_FAILURES,
+    EVIDENCE_RING_LOSS, EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
+    EVIDENCE_START_INSERT_FAILURES, EVIDENCE_TEMPLATE_TAIL_FAILURES,
+    EVIDENCE_UNMATCHED_RETURNS, Event, FLAG_CGROUP_FILTER, FLAG_PID_FILTER,
+    FUNCTION_HASH_OFFSET, FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, MAX_ATTRS, MAX_MECH_SHAPES,
+    MAX_SLOTS, MECH_NONE, RING_BYTES, RV_ENTRIES, RvKey, SESSION_NONE, START_ENTRIES,
+    SlotSemantics, SlotStats, StartKey, USER_TYPE_NONE, bucket_of, capture, event_type,
+    function_hash_step, lifecycle, shape,
 };
 
 #[map]
-static CONFIG: Array<u64> = Array::with_max_entries(4, 0);
+static CONFIG: Array<u64> = Array::with_max_entries(1, 0);
 
 #[map]
 static PID_FILTER: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
 
 #[map]
-static CGROUP_FILTER: HashMap<u64, u8> = HashMap::with_max_entries(1024, 0);
+static CGROUP_FILTER: CgroupArray = CgroupArray::with_max_entries(1, 0);
 
 #[map]
 static STATS: PerCpuArray<SlotStats> = PerCpuArray::with_max_entries(MAX_SLOTS, 0);
 
 #[map]
-static START: HashMap<StartKey, CallStart> = HashMap::with_max_entries(16384, 0);
+static START: HashMap<StartKey, CallStart> = HashMap::with_max_entries(START_ENTRIES, 0);
 
 #[map]
-static RV_COUNTS: PerCpuHashMap<RvKey, u64> = PerCpuHashMap::with_max_entries(4096, 0);
+static RV_COUNTS: PerCpuHashMap<RvKey, u64> = PerCpuHashMap::with_max_entries(RV_ENTRIES, 0);
 
-/// Slot -> semantic function kind, published by userspace (Task 4). An
-/// unknown slot degrades to `fnkind::OTHER`, i.e. "capture nothing" — never
-/// UB, never a guess.
 #[map]
-static SLOT_KIND: Array<u32> = Array::with_max_entries(MAX_SLOTS, 0);
+static SLOT_SEMANTICS: Array<SlotSemantics> = Array::with_max_entries(MAX_SLOTS, 0);
 
 /// Mechanism id -> parameter shape code, published by userspace from
-/// proxy-ng's registry (Task 1). Not consumed yet — Task 3 adds the
-/// in-kernel decode that switches on it. An unknown mechanism id looks
-/// up empty, which callers must treat as `shape::NONE`.
+/// proxy-ng's registry. An unknown mechanism id looks up empty and is
+/// treated as `shape::NONE`.
 #[map]
 static MECH_SHAPE: HashMap<u64, u32> = HashMap::with_max_entries(MAX_MECH_SHAPES, 0);
+
+/// Attribute type -> allowlisted boolean mask. Keeping the catalog in a map
+/// avoids multiplying verifier states by eleven match arms for every one of
+/// the bounded template entries.
+#[map]
+static ATTR_BOOL_BITS: HashMap<u32, u32> = HashMap::with_max_entries(16, 0);
+
+#[map]
+static TEMPLATE_TAIL: ProgramArray = ProgramArray::with_max_entries(1, 0);
+
+/// FNV hash of an exact standard function name -> stable shared-table id.
+/// Raw `pFunctionName` bytes never leave the BPF stack.
+#[map]
+static ASYNC_FUNCTIONS: HashMap<u64, u32> = HashMap::with_max_entries(128, 0);
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(RING_BYTES, 0);
 
-/// Events that could not be reserved. A capture that dropped events must
-/// never read COMPLETE, so this is reported, not swallowed.
 #[map]
-static LOST: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+static EVIDENCE: PerCpuArray<u64> = PerCpuArray::with_max_entries(EVIDENCE_CELLS, 0);
 
 /// Does this call belong to the capture scope? With no filter configured
 /// nothing is observed — scope is always explicit (design spec: no
 /// magical system-wide capture).
-fn in_scope(ctx: &ProbeContext) -> bool {
+fn bump_evidence(index: u32) {
+    if let Some(value) = EVIDENCE.get_ptr_mut(index) {
+        unsafe { *value += 1 };
+    }
+}
+
+fn in_scope() -> bool {
     let flags = CONFIG.get(CFG_FLAGS).copied().unwrap_or(0);
     if flags & FLAG_PID_FILTER != 0 {
-        let tgid = ctx.tgid();
+        let tgid = (helpers::bpf_get_current_pid_tgid() >> 32) as u32;
         if unsafe { PID_FILTER.get(&tgid) }.is_some() {
             return true;
         }
     }
     if flags & FLAG_CGROUP_FILTER != 0 {
-        // Ancestor match, not leaf match: a task deep in a descendant
-        // cgroup still has an ancestor at the target's level, and that
-        // ancestor's id is what CGROUP_FILTER was populated with. Using
-        // the *specific* published level (rather than e.g. probing every
-        // level, or using the task's own leaf id) is what keeps this from
-        // widening the match to unrelated cgroups — a sibling subtree has
-        // a *different* id at that same level, so it never matches.
-        let level = CONFIG.get(CFG_CGROUP_LEVEL).copied().unwrap_or(0) as i32;
-        let cgid = unsafe { helpers::bpf_get_current_ancestor_cgroup_id(level) };
-        if unsafe { CGROUP_FILTER.get(&cgid) }.is_some() {
-            return true;
+        match CGROUP_FILTER.current_task_under_cgroup(0) {
+            Ok(matches) => return matches,
+            Err(_) => {
+                bump_evidence(EVIDENCE_CGROUP_SCOPE_FAILURES);
+                return false;
+            }
         }
     }
     false
@@ -115,8 +132,13 @@ where
 fn decode_params(pmech: u64, sh: u32, start: &mut CallStart) {
     // CK_MECHANISM.ulParameterLen is the third CK_ULONG (offset 16). Read
     // first: which offsets (if any) apply depends on it.
-    let Ok(param_len) = (unsafe { helpers::bpf_probe_read_user((pmech + 16) as *const u64) })
+    let Some(param_len_addr) = pmech.checked_add(16) else {
+        capture_failure(start);
+        return;
+    };
+    let Ok(param_len) = (unsafe { helpers::bpf_probe_read_user(param_len_addr as *const u64) })
     else {
+        capture_failure(start);
         return;
     };
     let (o0, o1, o2, out_shape) = match (sh, param_len) {
@@ -132,20 +154,35 @@ fn decode_params(pmech: u64, sh: u32, start: &mut CallStart) {
         _ => return,
     };
     // CK_MECHANISM.pParameter is the second CK_ULONG (offset 8).
-    let Ok(pparam) = (unsafe { helpers::bpf_probe_read_user((pmech + 8) as *const u64) }) else {
+    let Some(pparam_addr) = pmech.checked_add(8) else {
+        capture_failure(start);
+        return;
+    };
+    let Ok(pparam) = (unsafe { helpers::bpf_probe_read_user(pparam_addr as *const u64) }) else {
+        capture_failure(start);
         return;
     };
     if pparam == 0 {
         return;
     }
-    let r0 = unsafe { helpers::bpf_probe_read_user((pparam + o0) as *const u64) };
-    let r1 = unsafe { helpers::bpf_probe_read_user((pparam + o1) as *const u64) };
-    let r2 = unsafe { helpers::bpf_probe_read_user((pparam + o2) as *const u64) };
+    let (Some(a0), Some(a1), Some(a2)) = (
+        pparam.checked_add(o0),
+        pparam.checked_add(o1),
+        pparam.checked_add(o2),
+    ) else {
+        capture_failure(start);
+        return;
+    };
+    let r0 = unsafe { helpers::bpf_probe_read_user(a0 as *const u64) };
+    let r1 = unsafe { helpers::bpf_probe_read_user(a1 as *const u64) };
+    let r2 = unsafe { helpers::bpf_probe_read_user(a2 as *const u64) };
     if let (Ok(a), Ok(b), Ok(c)) = (r0, r1, r2) {
         start.shape = out_shape;
         start.p0 = a;
         start.p1 = b;
         start.p2 = c;
+    } else {
+        capture_failure(start);
     }
 }
 
@@ -161,8 +198,18 @@ fn decode_params(pmech: u64, sh: u32, start: &mut CallStart) {
 /// stops early for shorter templates. Any read failure for an entry —
 /// including a bad `pTemplate` itself — stops the walk immediately;
 /// entries already captured are kept, nothing is skipped ahead or guessed.
-fn walk_template(ptemplate: u64, count: u64, start: &mut CallStart) {
-    start.attr_total = count as u32;
+#[inline(never)]
+fn walk_template<const TYPES_ONLY: bool, const SECOND: bool>(
+    ptemplate: u64,
+    count: u64,
+    start: &mut CallStart,
+) {
+    let total = count.min(u32::MAX as u64) as u32;
+    if SECOND {
+        start.attr_total1 = total;
+    } else {
+        start.attr_total = total;
+    }
     for i in 0..MAX_ATTRS {
         if (i as u64) >= count {
             break;
@@ -171,13 +218,22 @@ fn walk_template(ptemplate: u64, count: u64, start: &mut CallStart) {
         // CK_ULONG ulValueLen; } — 24 bytes; all three fields are
         // CK_ULONG-sized (8 bytes) on LP64. `type` is read first and is
         // the only field ever read for a non-allowlisted attribute.
-        let base = ptemplate + (i as u64) * 24;
-        let Ok(t) = (unsafe { helpers::bpf_probe_read_user(base as *const u64) }) else {
+        let Some(base) = ptemplate.checked_add((i as u64) * 24) else {
+            capture_failure(start);
             break;
         };
-        let attr_type = t as u32;
-        start.attr_types[i] = attr_type;
-        start.attr_count += 1;
+        let Ok(t) = (unsafe { helpers::bpf_probe_read_user(base as *const u64) }) else {
+            capture_failure(start);
+            break;
+        };
+        let attr_type = t;
+        if SECOND {
+            start.attr_types1[i] = attr_type;
+            start.attr_count1 += 1;
+        } else {
+            start.attr_types[i] = attr_type;
+            start.attr_count += 1;
+        }
 
         // Policy-boolean allowlist only: read ulValueLen (offset 16) next,
         // and only when it is exactly 1 read the single CK_BBOOL byte at
@@ -185,34 +241,183 @@ fn walk_template(ptemplate: u64, count: u64, start: &mut CallStart) {
         // keeps a CKA_VALUE or CKA_LABEL from ever being read even if a
         // type were mis-listed on the allowlist. Type checked first, then
         // length, then the single byte — in that order, always.
-        let Some(bit) = attr_bool::bit_for_attr_type(attr_type) else {
+        if TYPES_ONLY {
             continue;
+        }
+        // CK_ATTRIBUTE_TYPE is full-width on LP64 and remains so in the
+        // event. Only standard low-width values can enter the boolean
+        // allowlist; a vendor type with matching low bits must not alias it.
+        if attr_type > u32::MAX as u64 {
+            continue;
+        }
+        let bool_type = attr_type as u32;
+        let Some(mask) = (unsafe { ATTR_BOOL_BITS.get(&bool_type) }).copied() else { continue };
+        // Read the two remaining CK_ATTRIBUTE fields together only after
+        // the type allowlist matched. This preserves the privacy order while
+        // keeping the verifier from exploring two independent read failures.
+        let Some(value_addr) = base.checked_add(8) else {
+            capture_failure(start);
+            break;
         };
-        let Ok(len) = (unsafe { helpers::bpf_probe_read_user((base + 16) as *const u64) })
+        let Ok([pvalue, len]) =
+            (unsafe { helpers::bpf_probe_read_user(value_addr as *const [u64; 2]) })
         else {
+            capture_failure(start);
             break;
         };
         if len != 1 {
             continue;
         }
-        let Ok(pvalue) = (unsafe { helpers::bpf_probe_read_user((base + 8) as *const u64) })
-        else {
-            break;
-        };
         let Ok(b) = (unsafe { helpers::bpf_probe_read_user(pvalue as *const u8) }) else {
+            capture_failure(start);
             break;
         };
-        start.attr_bools_seen |= 1 << bit;
-        if b != 0 {
-            start.attr_bools |= 1 << bit;
+        if SECOND {
+            start.attr_bools_seen1 |= mask;
+            if b != 0 {
+                start.attr_bools1 |= mask;
+            }
+        } else {
+            start.attr_bools_seen |= mask;
+            if b != 0 {
+                start.attr_bools |= mask;
+            }
         }
+    }
+}
+
+fn arg_u64(ctx: &ProbeContext, index: u8) -> Result<u64, ()> {
+    match index {
+        // Keep every register index a compile-time constant. A dynamic
+        // `ctx.arg(index)` becomes variable pointer arithmetic on pt_regs,
+        // which the kernel verifier correctly rejects.
+        0 => ctx.arg::<u64>(0).ok_or(()),
+        1 => ctx.arg::<u64>(1).ok_or(()),
+        2 => ctx.arg::<u64>(2).ok_or(()),
+        3 => ctx.arg::<u64>(3).ok_or(()),
+        4 => ctx.arg::<u64>(4).ok_or(()),
+        5 => ctx.arg::<u64>(5).ok_or(()),
+        6 => {
+            let rsp = unsafe { (*ctx.regs).rsp as u64 };
+            let Some(address) = rsp.checked_add(8) else { return Err(()) };
+            match unsafe { helpers::bpf_probe_read_user(address as *const u64) } {
+                Ok(value) => Ok(value),
+                Err(_) => Err(()),
+            }
+        }
+        _ => Err(()),
+    }
+}
+
+fn capture_failure(start: &mut CallStart) {
+    start.capture |= capture::ARG_READ_FAILURE;
+    bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+}
+
+fn capture_scalar(ctx: &ProbeContext, index: u8, start: &mut CallStart) -> Option<u64> {
+    if index == ARG_NONE {
+        return None;
+    }
+    match arg_u64(ctx, index) {
+        Ok(value) => Some(value),
+        Err(()) => {
+            capture_failure(start);
+            None
+        }
+    }
+}
+
+fn capture_async_target(ctx: &ProbeContext, index: u8, start: &mut CallStart) {
+    let Some(pointer) = capture_scalar(ctx, index, start) else { return };
+    if pointer == 0 {
+        capture_failure(start);
+        return;
+    }
+    // One helper call bounds and NUL-terminates the snapshot. `MaybeUninit`
+    // avoids a verifier-expensive 29-byte memset. Only the bytes covered by
+    // the helper's returned length are read below.
+    let mut name = MaybeUninit::<[u8; FUNCTION_NAME_MAX_BYTES + 2]>::uninit();
+    let read = unsafe {
+        helpers::generated::bpf_probe_read_user_str(
+            name.as_mut_ptr().cast(),
+            (FUNCTION_NAME_MAX_BYTES + 2) as u32,
+            pointer as *const core::ffi::c_void,
+        )
+    };
+    if read <= 1 || read > (FUNCTION_NAME_MAX_BYTES + 1) as _ {
+        capture_failure(start);
+        return;
+    }
+    let len = (read - 1) as usize;
+    let name = name.as_ptr().cast::<u8>();
+    let mut hash = FUNCTION_HASH_OFFSET;
+    for offset in 0..FUNCTION_NAME_MAX_BYTES {
+        if offset >= len {
+            break;
+        }
+        hash = function_hash_step(hash, unsafe { name.add(offset).read() });
+    }
+    hash = function_hash_step(hash, len as u8);
+    match unsafe { ASYNC_FUNCTIONS.get(&hash) }.copied() {
+        Some(id) => start.target_function = id,
+        None => capture_failure(start),
     }
 }
 
 #[uprobe]
 pub fn p11_entry(ctx: ProbeContext) -> u32 {
+    p11_entry_impl::<0>(ctx)
+}
+
+#[uprobe]
+pub fn p11_entry_template(ctx: ProbeContext) -> u32 {
+    p11_entry_impl::<1>(ctx)
+}
+
+#[uprobe]
+pub fn p11_entry_template_types(ctx: ProbeContext) -> u32 {
+    p11_entry_impl::<2>(ctx)
+}
+
+#[uprobe]
+pub fn p11_entry_template_pair(ctx: ProbeContext) -> u32 {
+    p11_entry_impl::<3>(ctx)
+}
+
+#[uprobe]
+pub fn p11_entry_template_second(ctx: ProbeContext) -> u32 {
     let slot = slot_of(&ctx);
-    if slot >= MAX_SLOTS || !in_scope(&ctx) {
+    if slot >= MAX_SLOTS {
+        return 0;
+    }
+    let key = StartKey {
+        pid_tgid: helpers::bpf_get_current_pid_tgid(),
+        slot,
+        _pad: 0,
+    };
+    let Some(start) = START.get_ptr_mut(&key) else {
+        bump_evidence(EVIDENCE_TEMPLATE_TAIL_FAILURES);
+        return 0;
+    };
+    let semantics = SLOT_SEMANTICS
+        .get(slot)
+        .copied()
+        .unwrap_or(SlotSemantics::COUNT_ONLY);
+    // SAFETY: START owns this per-thread/per-slot value until the return
+    // probe removes it; the primary entry program has already inserted it.
+    let start = unsafe { &mut *start };
+    if let Some(template) = capture_scalar(&ctx, semantics.template1_arg, start) {
+        if let Some(count) = capture_scalar(&ctx, semantics.template_count1_arg, start) {
+            walk_template::<false, true>(template, count, start);
+        }
+    }
+    0
+}
+
+#[inline(always)]
+fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {
+    let slot = slot_of(&ctx);
+    if slot >= MAX_SLOTS || !in_scope() {
         return 0;
     }
     if let Some(stats) = STATS.get_ptr_mut(slot) {
@@ -221,93 +426,152 @@ pub fn p11_entry(ctx: ProbeContext) -> u32 {
         unsafe { (*stats).entered += 1 };
     }
     let key = StartKey { pid_tgid: helpers::bpf_get_current_pid_tgid(), slot, _pad: 0 };
-    // A re-entrant call overwrites its own start: the outer call then
-    // measures short. Recorded rather than dropped; PKCS#11 entry points
-    // are not re-entrant in practice.
-    let kind = SLOT_KIND.get(slot).copied().unwrap_or(fnkind::OTHER);
+    let semantics = SLOT_SEMANTICS.get(slot).copied().unwrap_or(SlotSemantics::COUNT_ONLY);
     let mut start = CallStart {
         ts_ns: unsafe { helpers::bpf_ktime_get_ns() },
         session: SESSION_NONE,
+        slot_id: 0,
         mechanism: MECH_NONE,
+        flags: 0,
         out_ptr: 0,
         user_type: USER_TYPE_NONE,
         shape: shape::NONE,
         p0: 0,
         p1: 0,
         p2: 0,
+        async_value: 0,
         attr_types: [0; MAX_ATTRS],
         attr_count: 0,
         attr_total: 0,
         attr_bools: 0,
         attr_bools_seen: 0,
+        attr_types1: [0; MAX_ATTRS],
+        attr_count1: 0,
+        attr_total1: 0,
+        attr_bools1: 0,
+        attr_bools_seen1: 0,
+        capture: capture::MECHANISM_NONE | capture::OUTPUT_NONE,
+        target_function: FUNCTION_NONE,
+        _pad: 0,
     };
-    match kind {
-        fnkind::INIT_WITH_MECH => {
-            // (hSession, pMechanism, [hKey]) — mechanism TYPE, then (Phase
-            // 3) allowlisted parameters for registry-published shapes only.
-            if let Some(sess) = ctx.arg::<u64>(0) {
-                start.session = sess;
+
+    if let Some(value) = capture_scalar(&ctx, semantics.session_arg, &mut start) {
+        start.session = value;
+    }
+    if let Some(value) = capture_scalar(&ctx, semantics.slot_arg, &mut start) {
+        start.slot_id = value;
+    }
+    if let Some(value) = capture_scalar(&ctx, semantics.flags_arg, &mut start) {
+        start.flags = value;
+        if semantics.lifecycle == lifecycle::OPEN_SESSION && value & 0x8 != 0 {
+            start.capture |= capture::ASYNC_SESSION;
+        }
+    }
+    if let Some(value) = capture_scalar(&ctx, semantics.user_type_arg, &mut start) {
+        start.user_type = value as u32;
+    }
+
+    if semantics.mechanism_arg != ARG_NONE {
+        match capture_scalar(&ctx, semantics.mechanism_arg, &mut start) {
+            None => {
+                start.capture =
+                    (start.capture & !capture::MECHANISM_MASK) | capture::MECHANISM_UNREADABLE;
             }
-            if let Some(pmech) = ctx.arg::<u64>(1) {
-                if pmech != 0 {
-                    // CK_MECHANISM.mechanism is the first CK_ULONG.
-                    if let Ok(m) = unsafe { helpers::bpf_probe_read_user(pmech as *const u64) } {
-                        start.mechanism = m;
-                        let sh = unsafe { MECH_SHAPE.get(&m) }.copied().unwrap_or(shape::NONE);
-                        if sh != shape::NONE {
-                            decode_params(pmech, sh, &mut start);
-                        }
+            Some(0) => {
+                start.capture =
+                    (start.capture & !capture::MECHANISM_MASK) | capture::MECHANISM_NULL;
+            }
+            Some(pointer) => match unsafe {
+                helpers::bpf_probe_read_user(pointer as *const u64)
+            } {
+                Ok(mechanism) => {
+                    start.mechanism = mechanism;
+                    start.capture =
+                        (start.capture & !capture::MECHANISM_MASK) | capture::MECHANISM_VALUE;
+                    let parameter_shape =
+                        unsafe { MECH_SHAPE.get(&mechanism) }.copied().unwrap_or(shape::NONE);
+                    if parameter_shape != shape::NONE {
+                        decode_params(pointer, parameter_shape, &mut start);
+                    }
+                }
+                Err(_) => {
+                    start.capture = (start.capture & !capture::MECHANISM_MASK)
+                        | capture::MECHANISM_UNREADABLE;
+                    capture_failure(&mut start);
+                }
+            },
+        }
+    }
+
+    if semantics.output_arg != ARG_NONE {
+        match capture_scalar(&ctx, semantics.output_arg, &mut start) {
+            None => {
+                start.capture =
+                    (start.capture & !capture::OUTPUT_MASK) | capture::OUTPUT_UNREADABLE;
+            }
+            Some(pointer) => {
+                start.capture = (start.capture & !capture::OUTPUT_MASK)
+                    | if pointer == 0 { capture::OUTPUT_NULL } else { capture::OUTPUT_NON_NULL };
+                if semantics.lifecycle == lifecycle::OPEN_SESSION {
+                    start.out_ptr = pointer;
+                }
+            }
+        }
+    }
+
+    if TEMPLATE_MODE != 0 {
+        if semantics.template0_arg != ARG_NONE {
+            // Keep the reads nested. Holding two Option payloads across the
+            // second helper call makes LLVM spill an uninitialized `None`
+            // payload, which the BPF verifier rejects even though Rust would
+            // test both discriminants before use.
+            if let Some(template) = capture_scalar(&ctx, semantics.template0_arg, &mut start) {
+                if let Some(count) =
+                    capture_scalar(&ctx, semantics.template_count0_arg, &mut start)
+                {
+                    if TEMPLATE_MODE == 2 {
+                        walk_template::<true, false>(template, count, &mut start);
+                    } else {
+                        walk_template::<false, false>(template, count, &mut start);
                     }
                 }
             }
         }
-        fnkind::OPEN_SESSION => {
-            // phSession is arg4 and is only written by the time the call
-            // returns; stash the pointer, read it at return.
-            if let Some(p) = ctx.arg::<u64>(4) {
-                start.out_ptr = p;
-            }
-        }
-        fnkind::SESSION_ARG0 => {
-            if let Some(sess) = ctx.arg::<u64>(0) {
-                start.session = sess;
-            }
-        }
-        fnkind::TEMPLATE_ARG1 => {
-            // (hSession, pTemplate, ulCount, ...) — C_FindObjectsInit,
-            // C_CreateObject. This kind moved out of SESSION_ARG0, so
-            // session capture happens here too, not just the walk.
-            if let Some(sess) = ctx.arg::<u64>(0) {
-                start.session = sess;
-            }
-            if let (Some(pt), Some(count)) = (ctx.arg::<u64>(1), ctx.arg::<u64>(2)) {
-                walk_template(pt, count, &mut start);
-            }
-        }
-        fnkind::TEMPLATE_ARG2 => {
-            // (hSession, pMechanism, pTemplate, ulCount, ...) —
-            // C_GenerateKey. Mechanism type/shape decode is not done here
-            // (that's INIT_WITH_MECH's job for *Init calls); this kind
-            // only needs session + template.
-            if let Some(sess) = ctx.arg::<u64>(0) {
-                start.session = sess;
-            }
-            if let (Some(pt), Some(count)) = (ctx.arg::<u64>(2), ctx.arg::<u64>(3)) {
-                walk_template(pt, count, &mut start);
-            }
-        }
-        fnkind::LOGIN => {
-            if let Some(sess) = ctx.arg::<u64>(0) {
-                start.session = sess;
-            }
-            // userType only. pPin (arg2) and ulPinLen (arg3) are never read.
-            if let Some(ut) = ctx.arg::<u64>(1) {
-                start.user_type = ut as u32;
-            }
-        }
-        _ => {}
     }
-    let _ = START.insert(&key, &start, 0);
+    if TEMPLATE_MODE == 0 && semantics.async_name_arg != ARG_NONE {
+        capture_async_target(&ctx, semantics.async_name_arg, &mut start);
+        match semantics.lifecycle {
+            lifecycle::ASYNC_JOIN => {
+                if let Some(value) = capture_scalar(&ctx, semantics.async_value_arg, &mut start) {
+                    start.async_value = value;
+                }
+            }
+            lifecycle::ASYNC_GET_ID => {
+                if let Some(pointer) = capture_scalar(&ctx, semantics.async_value_arg, &mut start) {
+                    start.out_ptr = pointer;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if START
+        .insert(&key, &start, aya_ebpf::bindings::BPF_NOEXIST as u64)
+        .is_err()
+    {
+        // A same-thread/same-slot ambiguous nested call makes both returns
+        // untrustworthy. Invalidate the outer record so neither return can
+        // combine entry state from one invocation with the other.
+        let _ = START.remove(&key);
+        bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+        return 0;
+    }
+    if TEMPLATE_MODE == 3 {
+        // Success never returns. Failure leaves template0 as usable partial
+        // evidence and is independently disclosed below.
+        unsafe { TEMPLATE_TAIL.tail_call(&ctx, 0) };
+        bump_evidence(EVIDENCE_TEMPLATE_TAIL_FAILURES);
+    }
     0
 }
 
@@ -318,13 +582,25 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
         return 0;
     }
     let key = StartKey { pid_tgid: helpers::bpf_get_current_pid_tgid(), slot, _pad: 0 };
+    if !in_scope() {
+        // Entry-time scope owns this pairing record. If a task migrates out
+        // of a selected cgroup mid-call, clean it up without emitting an
+        // out-of-scope event and disclose the lost completion.
+        if START.remove(&key).is_ok() {
+            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        }
+        return 0;
+    }
     // No start entry means the entry probe filtered this call out (or the
     // process was already inside the function at attach time). Either way
     // there is nothing to attribute.
     let Some(&start) = (unsafe { START.get(&key) }) else {
         return 0;
     };
-    let _ = START.remove(&key);
+    if START.remove(&key).is_err() {
+        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        return 0;
+    }
 
     let now = unsafe { helpers::bpf_ktime_get_ns() };
     let delta = now.saturating_sub(start.ts_ns);
@@ -342,26 +618,36 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
             if b < (*stats).buckets.len() {
                 (*stats).buckets[b] += 1;
             }
-            if rv != 0 {
+            if rv != 0 && rv != 0x204 {
                 (*stats).errors += 1;
             }
         }
     }
 
-    // CK_RV is CK_ULONG (u64 on LP64) but RvKey.rv is u32, so this narrows.
-    // `errors` above already compares the full u64, so only a pathological
-    // vendor rv > 2^32 could alias in the RV_COUNTS distribution. Left as
-    // u32 to avoid churning the shared kernel/userspace ABI this late;
-    // Phase 2 should widen this key when it reshapes events.
-    let rk = RvKey { slot, rv: rv as u32 };
+    let rk = RvKey { slot, _pad: 0, rv };
     let prev = unsafe { RV_COUNTS.get(&rk) }.copied().unwrap_or(0);
-    let _ = RV_COUNTS.insert(&rk, &(prev + 1), 0);
+    if RV_COUNTS.insert(&rk, &(prev + 1), 0).is_err() {
+        bump_evidence(EVIDENCE_RV_UPDATE_FAILURES);
+    }
 
+    let semantics = SLOT_SEMANTICS.get(slot).copied().unwrap_or(SlotSemantics::COUNT_ONLY);
     let mut session = start.session;
-    if start.out_ptr != 0 && rv == 0 {
+    if semantics.lifecycle == lifecycle::OPEN_SESSION && start.out_ptr != 0 && (rv == 0 || rv == 0x204) {
         // C_OpenSession wrote the handle by now. Only trust it on success.
-        if let Ok(s) = unsafe { helpers::bpf_probe_read_user(start.out_ptr as *const u64) } {
-            session = s;
+        match unsafe { helpers::bpf_probe_read_user(start.out_ptr as *const u64) } {
+            Ok(value) => session = value,
+            Err(_) => bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES),
+        }
+    }
+    let mut async_value = start.async_value;
+    let mut capture_flags = start.capture;
+    if rv == 0 && start.out_ptr != 0 && semantics.lifecycle == lifecycle::ASYNC_GET_ID {
+        match unsafe { helpers::bpf_probe_read_user(start.out_ptr as *const u64) } {
+            Ok(value) => async_value = value,
+            Err(_) => {
+                capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
+                bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+            }
         }
     }
 
@@ -371,13 +657,16 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
         pid_tgid: helpers::bpf_get_current_pid_tgid(),
         cgroup_id: unsafe { helpers::bpf_get_current_cgroup_id() },
         session,
+        slot_id: start.slot_id,
         mechanism: start.mechanism,
+        flags: start.flags,
         rv,
         p0: start.p0,
         p1: start.p1,
         p2: start.p2,
+        async_value,
         slot,
-        kind: SLOT_KIND.get(slot).copied().unwrap_or(fnkind::OTHER),
+        target_function: start.target_function,
         user_type: start.user_type,
         shape: start.shape,
         attr_types: start.attr_types,
@@ -385,6 +674,13 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
         attr_total: start.attr_total,
         attr_bools: start.attr_bools,
         attr_bools_seen: start.attr_bools_seen,
+        attr_types1: start.attr_types1,
+        attr_count1: start.attr_count1,
+        attr_total1: start.attr_total1,
+        attr_bools1: start.attr_bools1,
+        attr_bools_seen1: start.attr_bools_seen1,
+        capture: capture_flags,
+        event_type: event_type::CALL,
     };
     match EVENTS.reserve::<Event>(0) {
         Some(mut e) => {
@@ -392,11 +688,35 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
             e.submit(0);
         }
         None => {
-            if let Some(l) = LOST.get_ptr_mut(0) {
-                // SAFETY: per-CPU storage, no cross-CPU aliasing.
-                unsafe { *l += 1 };
-            }
+            bump_evidence(EVIDENCE_RING_LOSS);
         }
+    }
+    0
+}
+
+#[tracepoint(category = "sched", name = "sched_process_fork")]
+pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
+    if !in_scope() {
+        return 0;
+    }
+    // Linux sched_process_fork format: common fields (8), parent_comm
+    // (16), parent_pid (4), child_comm (16), child_pid (4).
+    // SAFETY: offsets are fixed by the sched_process_fork tracepoint ABI
+    // described above and each read stays within that record.
+    let Ok(parent) = (unsafe { ctx.read_at::<u32>(24) }) else { return 0 };
+    let Ok(child) = (unsafe { ctx.read_at::<u32>(44) }) else { return 0 };
+    let ev = Event {
+        pid_tgid: (parent as u64) << 32,
+        session: child as u64,
+        event_type: event_type::FORK,
+        ..Event::default()
+    };
+    match EVENTS.reserve::<Event>(0) {
+        Some(mut event) => {
+            event.write(ev);
+            event.submit(0);
+        }
+        None => bump_evidence(EVIDENCE_RING_LOSS),
     }
     0
 }

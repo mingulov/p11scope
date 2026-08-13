@@ -6,6 +6,7 @@ pub mod events;
 pub mod kinds;
 pub mod metrics;
 pub mod plan;
+pub mod process;
 pub mod render;
 pub mod scope;
 pub mod semantics;

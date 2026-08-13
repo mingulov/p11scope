@@ -11,7 +11,8 @@ publish = false
 [dependencies]
 cryptoki-sys = "0.5"
 libloading = "0.8"
+libc = "0.2"
 p11scope-manifest = { path = "../manifest", features = ["identify"] }
-pkcs11-module = { git = "https://github.com/mingulov/pkcs11-proxy-ng", rev = "7c5c86043820eb3795f40c65a36ce961cdfd26c5" }
+pkcs11-module = { git = "https://github.com/mingulov/pkcs11-proxy-ng", rev = "a2aab6cd67d21d140277a4584942e06c903f165b" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

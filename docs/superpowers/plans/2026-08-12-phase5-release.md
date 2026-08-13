@@ -19,7 +19,7 @@
 - Phase 4 HEAD `41012fb`; 97 tests green; all 7 matrix rows green; G4 criteria met.
 - `p11scope profile --mode profile|metrics` exists; **`trace` does not exist yet** despite being in the design spec's v1 scope and referenced by this phase's benchmark.
 - The ring buffer, event drain (`events::Drain`, with `malformed()`), loss counter (`metrics::lost_events`), and semantic state machine already exist — `trace` is a renderer plus CLI wiring, not new kernel work.
-- Measured privileges (Phase 4, real): host = `CAP_SYS_ADMIN` alone; Docker/kind = `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN`. Neither needs full root. There is also a host-specific `perf_event_paranoid` finding in `docs/notes/phase4-privileges.md`.
+- Historical measured BPF/procfs privileges (Phase 4, real): host = `CAP_SYS_ADMIN`; Docker/kind = `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN`. The later same-inode hardening additionally requires file ownership or `CAP_LEASE`; its updated privileged matrix is pending approval. There is also a host-specific `perf_event_paranoid` finding in `docs/notes/phase4-privileges.md`.
 - Schema is at `pkcs11-scope/observed-profile/v1.2` (`docs/schema/observed-profile-v1.md`), with per-cgroup breakdown.
 - **Known UX gap**: no SIGINT handler — Ctrl-C aborts without writing output, and `--duration` is the only clean exit. For a long-running observer that is a release-quality problem (Task 2).
 - The design spec's trace format (`docs/superpowers/specs/2026-08-10-pkcs11-scope-outputs.md`, "Trace mode" section) is the target: one line per completed call with timestamp, pid, tid, session pseudonym, function, mechanism + safe params, key pseudonym, CK_RV, duration; and `LOST n events` when the ring dropped any.

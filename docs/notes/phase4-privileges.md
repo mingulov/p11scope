@@ -1,5 +1,10 @@
 # Phase 4 Task 8 — fork scoping and measured privileges
 
+> Historical measurement note: these results predate the 2026-08-13
+> same-inode hardening. Current authorization requires file ownership or
+> `CAP_LEASE` in addition to the BPF/procfs capabilities measured here. The
+> script is updated, but that privileged rerun is still pending approval.
+
 ## Part 1: fork scoping
 
 `scripts/matrix/fork-harness.c` is a prefork-server-shape workload: it

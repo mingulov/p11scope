@@ -29,17 +29,18 @@ SoftHSM2 has `p_offset == p_vaddr`).
   discover helper must see only the module's own answers, never
   fallback-resolved lists (those may alias the primary table by design and
   would fabricate false aliasing evidence). The helper always collects
-  **both** the legacy 2.40 table and the interface enumeration, and walks
-  standard-named (`"PKCS 11"`) surfaces only; vendor interfaces are recorded
-  as present-but-undecoded evidence. Two latent proxy bugs land with the
+  **both** the legacy table and the interface enumeration, and walks exact
+  `"PKCS 11"` surfaces plus structurally corroborated alternate/null/
+  unreadable-name prefixes; uncorroborated vendor interfaces are recorded as
+  present-but-undecoded evidence. Two latent proxy bugs land with the
   extraction (name validation of every unnamed `C_GetInterface` result,
   primary and versioned; fallback provenance). See
   [the extraction design](../specs/2026-08-10-module-crate-extraction-design.md).
 - `p11scope-discover`: Rust bin on that crate + `pkcs11-proxy-ng-types`;
   2.x `C_GetFunctionList` **and** 3.x `C_GetInterfaceList` (never
   `C_GetInterface` — interface *selection* is proxy policy; the helper
-  records what the module reports), ELF build-ID in the manifest, JSON
-  output. Shipped as glibc **and** musl
+  records what the module reports), ELF build-ID plus whole-file SHA-256 in
+  the manifest, JSON output. Shipped as glibc **and** musl
   *dynamic* builds — a fully static binary cannot dlopen.
 - `p11scope`: Rust + aya; attach uprobe+uretprobe per manifest entry
   (offset-based), PID/cgroup filter maps, aggregate counts/latency/CK_RV in
@@ -48,25 +49,31 @@ SoftHSM2 has `p_offset == p_vaddr`).
 - Phase 1 is executed as two plans: **1a** — offset-semantics pin +
   `p11scope-discover` ([plan](2026-08-11-phase1a-discover.md)); **1b** — aya
   attach engine + `metrics` mode, plan written only after 1a lands (the
-  plan-after-inputs rule above). Both have landed; Gate G1 verification
-  complete against all criteria: proxy-ng test suite green after extraction
+  plan-after-inputs rule above). Both have landed; the historical Gate G1
+  verification completed its then-recorded criteria: proxy-ng test suite green after extraction
   (verified 2026-08-11, 18 module + 303 backend + 62 quality-gate tests);
   helper verified in ubuntu (glibc) and alpine (musl) containers (68/68,
   `scripts/verify-discover-containers.sh`); manifest reuse refused on
-  build-ID mismatch, tested (`tests/reuse.rs`, 4 tests); attach failures and
+  content-identity mismatch and every attach requires fresh agreement on the
+  provider's function-role/object/offset provenance (`tests/reuse.rs` and
+  `tests/cli_discover.rs`); attach failures and
   aliased offsets surfaced in output rather than dropped (`render::Evidence`,
   COMPLETE only when no attach failures, no skipped entries, no aliasing,
   nothing in flight); end-to-end counts verified against the deterministic
   oracle (9/9 functions matched `spike/expected.txt` exactly, 136/136 probes
   attached, completeness COMPLETE; `scripts/verify-attach-e2e.sh`,
-  `docs/notes/phase1b-e2e.md`). Remaining criterion: `/code-review` on both
-  repos' branches (human-triggered step, awaiting review).
-  The `pkcs11-proxy-ng-types` dependency is deferred until code actually
-  needs it (review, 2026-08-11) — the helper consumes only `pkcs11-module`.
+  `docs/notes/phase1b-e2e.md`). Both shared crates are published and pinned at the exact,
+  reachable Git revision `a2aab6cd67d21d140277a4584942e06c903f165b`;
+  the lockfile resolves that revision with no local path override. The first
+  provenance implementation rejects the original raw-manifest forgery, but a
+  later maximum review found unresolved `$ORIGIN`, lazy-dependency leasing,
+  and lease-break teardown gaps. Its corrected plan is
+  `2026-08-13-manifest-provenance.md`; G1's provenance clause is open until
+  Tasks 4–7 there pass.
 
 **Gate G1 (engineering review):** /code-review on both repos' branches;
 proxy-ng test suite green after the extraction; manifest reuse refused on
-build-ID mismatch (tested); helper verified in ubuntu (glibc) and alpine
+content-identity or fresh table-provenance mismatch (tested); helper verified in ubuntu (glibc) and alpine
 (musl) containers; attach failures and aliased offsets surface in output
 rather than being dropped.
 
@@ -106,8 +113,10 @@ PARTIAL, never silently complete.
   mechanism blobs planted by the workload; assert no sentinel appears in any
   event, map dump, log, or output file.
 
-**Gate G3 (privacy review — release-blocking forever after): PASSED 2026-08-11**
-(with outstanding items noted below).
+**Gate G3 (privacy review — release-blocking forever after): REOPENED
+2026-08-13.** The 2026-08-11 result remains historical ordinary-placement
+canary evidence; it did not test malicious pointer aliasing or the safe/unsafe
+policy split now required by the approved privacy amendment.
 
 1. **Canary suite green:** `scripts/verify-canaries.sh` + `docs/notes/phase3-canaries.md`.
    8 sentinels planted (PIN, CKA_VALUE key material, CKA_LABEL, CKA_ID, digest
@@ -120,20 +129,16 @@ PARTIAL, never silently complete.
    buffer *contents* never escaped. **Outstanding:** "green in CI" is not yet
    literally true (no CI pipeline in this repo); suite is green when run locally.
 
-2. **Adversarial review of allowlist:** `docs/privacy/allowlist-v1.md` — 9
-   allowlisted field groups justified, 9 rejected candidates refused, with
-   file:line citations. Self-flags three weak spots: session-pseudonymization
-   claim overstates current behavior (no session identifier reaches output at
-   all — actually stronger); PSS/GCM parameter length-guard has no adversarial
-   canary (real coverage gap); `cgroup_id` captured with no current consumer
-   **(stale — RESOLVED as of v1.2: Phase 4 Task 6 gave it a consumer, the
-   `cgroups[]` per-cgroup breakdown; see `docs/privacy/allowlist-v1.md`'s
-   "Summary of weak points" item 2)**.
-   **Outstanding:** the *writing* is done; actual adversarial review by a
-   second party is not complete.
+2. **Adversarial review of allowlist:** completed independently on the
+   corrective tree. `docs/privacy/allowlist-v1.md` now uses stable symbol
+   citations; the live canary covers 15 sentinels in every output and all
+   observer-owned BPF maps, including 2.40/3.0/3.2 parameter paths.
 
-3. **/security-review of decoding paths:** Human-triggered step.
-   **Outstanding — awaiting review.**
+3. **Security review of decoding paths:** the 2026-08-12 corrective snapshot
+   fixed and source-validated its eight reported classes. A 2026-08-13 deeper
+   review then found the remaining pointer-provenance boundary and hash-only
+   async-name authorization. G3 stays open until the safe-default design and
+   expanded hostile-alias canaries are implemented and independently rerun.
 
 ## Phase 4 — Environment matrix + pkcs11-check oracle
 
@@ -179,7 +184,10 @@ known-limitations section: `docs/notes/phase4-matrix.md`.
    fails on this kernel's `perf_event_paranoid=4`); Docker/kind need
    `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` (crossing into a different-uid
    container/pod's `/proc/<pid>/root`). Neither environment needs full
-   root.
+   root. These Phase 4 measurements predate the same-inode hardening:
+   a capability-only observer now additionally needs `CAP_LEASE` for
+   provider files it does not own. The updated privileged matrix has not yet
+   been rerun.
 
 ## Phase 5 — Overhead benchmark + docs + v0.1 release
 
@@ -224,14 +232,14 @@ cross-checked against measured reality; canary suite still green.
    caveat, schema version string, the `COMPLETE`/`PARTIAL` gate list, the
    `cgroups[]` per-cgroup claim — matched its cited source exactly, no
    change needed.
-3. **Full-repo review (`/code-review ultra` candidate):** human-triggered.
-   **Outstanding — not run.**
-4. **Security review of the privileged tool as a whole:** human-triggered.
-   **Outstanding — not run.** (Distinct from Phase 3's still-outstanding
-   `/security-review` of the decoding paths specifically — this G5
-   criterion is scoped to the whole privileged tool.)
+3. **Full-repo review:** the earlier corrective-tree review completed, but its
+   zero-finding result was superseded by the 2026-08-13 maximum re-review. The
+   current tree has the release blockers listed below.
+4. **Security review of the privileged tool as a whole:** open. Post-fix
+   validation must be repeated only after the corrected provenance and safe
+   metadata designs are implemented.
 
-All other verification scripts were re-run the same day as this gate
+On the earlier corrective snapshot, all other verification scripts were re-run the same day as this gate
 (release blockers per this phase's Global Constraints, not G5 criteria
 themselves): `cargo test --workspace` (109 passed, 0 failed),
 `verify-attach-e2e.sh`, `verify-induced-gaps.sh`, all six
@@ -241,27 +249,42 @@ fork-scope), `bench-overhead.sh` (full unshortened run, 5 runs/condition
 run-to-run noise), and `build-release.sh`. Zero failures across all of
 them. Full table: `task-7-report.md`.
 
-### Overall project status (as of Gate G5, 2026-08-12)
+Corrective-snapshot verification on 2026-08-12 additionally passed 166
+locked Rust tests, formatting, Clippy, the release eBPF build, privacy canaries,
+all five induced-gap cases, static-musl packaging, Ubuntu/glibc and Alpine/musl
+68/92/104-entry discovery, the fork/cgroup matrix, and the 284-file
+`pkcs11-check` RV oracle (10 RV pairs, 40 calls, `COMPLETE`). NSS discovery
+reported legacy 2.40 plus standard 3.0/2.40 interfaces; the configured proxy
+shim reported its actual legacy/interface 2.40 surfaces. BouncyHSM and Kryoptic
+were not provisioned and are not claimed.
 
-Phases 0-4 are complete against their own gates (G0-G4 PASSED, see each
-phase above). Phase 5's automatable criteria are met: canary suite green,
-README/usage.md cross-checked against measured reality (two drifts found
-and fixed), all verification scripts green, v0.1.0 built and verified
-(`scripts/build-release.sh`). **Not done, and worth knowing before
-treating the tool as "reviewed":**
+### Overall project status (Gate G5 reopened, 2026-08-13)
 
-- **The two human-triggered reviews remain outstanding across every
-  phase they were named in.** `/code-review` (Phase 1's engineering
-  review, and this gate's full-repo `ultra` pass) and `/security-review`
-  (Phase 3's decoding-path review, and this gate's whole-tool privileged
-  review) have not been run by a second party at any point in this
-  project. Every phase's "PASSED" gate above reflects the implementer's
-  own verification against stated, checkable criteria — not an
-  independent review.
+Phases 0-4 retain their recorded historical gate evidence (G0-G4 PASSED, see
+each phase above), and the former shared-crate revision blocker is cleared:
+the manifests and `Cargo.lock` pin reachable revision `a2aab6c` with no local
+path patch. The latest unprivileged gates remain useful regression evidence,
+but this dirty tree is not a final or release-ready tree. The 2026-08-13 deep
+re-review confirmed these release blockers:
+
+- provider rediscovery through `/proc/self/fd/<provider-fd>` changes
+  `$ORIGIN` and rejects a supported wrapper with an adjacent lazy backend;
+- only the provenance seed module is leased before rediscovery, so a mutable
+  lazy dependency can still influence an apparently stable table projection;
+- the SIGIO `_exit` path does not prove BPF links close before lease fds;
+- the default semantic decoders follow caller-selected pointer topology and
+  need the safe-default/explicit-unsafe policy in
+  `docs/superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md`.
+
+The corrected provenance work is tracked in Tasks 4–7 of
+`docs/superpowers/plans/2026-08-13-manifest-provenance.md`. The privileged
+canary and Docker/kind/Knative lanes also remain unrerun because they require
+explicit approval. **Other verified limitations:**
+
 - **The kernel floor (≥5.15) is inherited, not independently verified.**
-  It traces to `bpf_get_current_ancestor_cgroup_id()` (`src/scope.rs`)
-  but was never re-derived or tested against a live sub-5.15 kernel in
-  this repo — no such kernel was available
+  The current cgroup filter works on older kernels; 5.15 is retained for
+  uprobe attach-cookie support and has not been tested against a live
+  sub-5.15 kernel in this repo — no such kernel was available
   (`docs/notes/phase5-unsupported.md`, case 5). `docs/usage.md` states
   this caveat explicitly, next to the kernel-floor claim itself.
 - **The canary suite is green locally, not in CI** — there is still no
@@ -269,9 +292,9 @@ treating the tool as "reviewed":**
 - **Matrix limitations still standing**, per
   `docs/notes/phase4-matrix.md`: Knative's `--cgroup` scope is node-wide,
   not per-Service (an honest limit of what Kubernetes exposes, not a
-  bug); `p11scope-discover`'s identity computation has a real,
-  worked-around gap for magic `/proc/<pid>/root` paths with no live
-  container at attach time (recommended upstream fix not done);
+  bug); namespace-rewritten or stable-layer attach paths require an
+  unprivileged byte-identical `--provenance-module` safe copy (providers whose
+  dependent target objects cannot be reproduced are refused);
   privilege minimums are measured on one host only. (The
   previously-listed "`cgroup_id` has no consumer" limitation is now
   resolved — Phase 4 Task 6's `cgroups[]` breakdown gave it a consumer;

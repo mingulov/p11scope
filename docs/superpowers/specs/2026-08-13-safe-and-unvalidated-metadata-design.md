@@ -2,208 +2,437 @@
 
 **Date:** 2026-08-13
 
-**Status:** Approved design; awaiting written-spec review
+**Status:** Approved after independent deep review; implementation pending
 
 **Amends:** `docs/superpowers/specs/2026-08-12-v0.1-corrective-release-design.md`
 
 ## Goal
 
-Keep the default observer useful for mechanism profiling without allowing an
-arbitrary readable target pointer to become a raw metadata output channel.
-Operators who deliberately need the metadata decoders that exist today can
-compile and explicitly enable a diagnostic policy. Neither policy adds a PIN,
-key, label, `CKA_ID`, message, signature, wrapped-object, or arbitrary-buffer
-decoder.
+Keep mechanism profiling useful without letting an arbitrary readable target
+pointer become a general metadata-output channel. Safe capture is the default
+in every binary. Operators who need the metadata decoders that exist today may
+compile and explicitly enable a diagnostic policy for trusted, ABI-valid
+workloads.
 
-This design addresses pointer-derived metadata capture only. It does not close
-or supersede separate provenance, object-lease, teardown-order, or provider
-loading findings.
+This design changes pointer-derived metadata capture only. It does not close
+or supersede the separately tracked provider-provenance, object-lease,
+provider-loading, or teardown-order findings. Implementing it is not, by
+itself, a release-readiness claim.
 
-## Security boundary
+## Precedence over the corrective design
 
-`bpf_probe_read_user` makes a userspace read non-faulting for the observer, but
-it cannot prove that a readable C pointer identifies a `CK_MECHANISM`, parameter
-structure, template, or string. The safe policy therefore relies on output
-containment rather than claiming runtime C type validation:
+For `allowlisted` capture, this document supersedes the corrective design's
+requirements to record rejected initialization requests, every vendor
+mechanism id, parameters, templates, policy booleans, and hash-only async-name
+authorization. It also supersedes the v1.3 profile-schema requirement.
 
-- a target pointer is dereferenced only where this design says so;
-- an unregistered pointer-derived scalar never enters `START`, the event ring,
-  a report, a trace, a log, or an error message;
-- failures are categorical evidence and never include the rejected value;
-- the manifest/provenance, PID/cgroup, bounded-read, and evidence controls apply
-  in both policies.
+For `unsafe-unvalidated-metadata`, the previous entry-time mechanism,
+parameter, template, and async capture semantics remain unchanged, including
+metadata from calls the provider later rejects. Every unrelated corrective
+requirement remains in force for both policies.
 
-The remaining generic-observer limit is explicit: an ABI-malicious caller can
-still combine provider success with the finite public mechanism registry as a
-bounded equality oracle. Eliminating even that oracle requires a cooperative
-provider audit point after provider-side validation and is outside a portable
-uprobe observer.
+## Security contract and assumptions
+
+`bpf_probe_read_user` prevents a bad address from faulting the target, but it
+cannot prove that readable bytes are a `CK_MECHANISM`, parameter structure,
+template, or string. Safe capture therefore contains output rather than
+claiming runtime C type validation:
+
+- pointer-derived content can become evidence only through a finite public
+  equality oracle: a published/configured mechanism id or one of the 104
+  published function names;
+- a value that fails either lookup remains only in BPF registers/stack and
+  never enters `START`, an event, output, a log, or an error;
+- pointer values are never public output;
+- failures are categorical counts and never include rejected bytes.
+
+The safe policy still assumes an ABI-valid caller for semantic truth. A caller
+can race or mutate `pMechanism`, or put arbitrary numbers directly in ordinary
+scalar arguments. The observer cannot prove which bytes a provider consumed.
+It reports only a registered id observed at return from a call whose immediate
+result was `CKR_OK` or `CKR_PENDING`; it does not call that value
+cryptographically or provider-side authenticated.
+
+Successful reads of provider-written `phSession` and async-id scalars require
+a conforming provider that writes the promised output on success. They remain
+internal correlation keys and are never serialized. A malicious native
+provider is already code executing inside the target and is outside this
+semantic guarantee.
+
+The diagnostic unsafe policy has a deliberately weaker contract. It never
+adds an intentional PIN, key, label, `CKA_ID`, message, signature,
+wrapped-object, or arbitrary-buffer decoder, but its existing scalar decoders
+follow caller-supplied pointer topology. A malicious caller can alias those
+pointers into unrelated readable memory and disclose selected scalar words or
+bytes. Unsafe mode is therefore for trusted ABI-valid workloads, not hostile
+targets. Only `allowlisted` carries the strong arbitrary-pointer-content
+boundary.
+
+Eliminating even the safe policy's finite equality oracles, output-scalar
+assumption, and mechanism TOCTOU requires a cooperative provider audit point
+after provider-side validation. That is outside a portable uprobe observer.
 
 ## Capture policies
 
-### `allowlisted` — default
+### `allowlisted` — default profile and trace
 
-The default policy retains metadata that does not follow an application-owned
-input pointer:
+Safe capture retains:
 
 - authenticated function identity, PID/TID and cgroup;
 - scalar session/slot identifiers, session flags and login user type;
 - return code, latency and aggregate/evidence counters;
 - pointer nullness required by operation semantics;
 - successful provider-written session and async identifiers, internally only;
-- a provider-accepted, non-null mechanism id only after registry membership
-  succeeds.
+- an approved mechanism id after an immediate `CKR_OK` or `CKR_PENDING`;
+- bounded exact-match async target identity needed for PKCS #11 3.2 state.
 
-For a mechanism-bearing call, entry capture stores the protocol pointer but
-does not dereference it. On `CKR_OK` or `CKR_PENDING`, the return probe reads
-exactly the first `CK_ULONG`, immediately checks membership in the published
-mechanism registry, and stores only an approved id. `CKR_PENDING` must be read
-at this boundary because later async completion may occur after the caller's
-pointer lifetime. The approved id remains pending until the existing async
-state machine receives the final result. A null mechanism remains a distinct
-state so the existing function-specific null-cancellation rules continue to
-work.
+For a mechanism-bearing call, the entry probe records only nullness plus the
+raw `pMechanism` address needed by the return probe. This address is transient
+privileged metadata in `START`; it is never dereferenced at entry and never
+copied to `Event` or public output. On `CKR_OK` or `CKR_PENDING`, the return
+probe reads exactly the first `CK_ULONG` with `bpf_probe_read_user`, immediately
+checks `MECH_SHAPE` membership, and copies only an approved id into the event.
+An unapproved raw value exists only during the lookup. The `START` record is
+then removed normally.
 
-Returns other than `CKR_OK` and `CKR_PENDING` do not dereference `pMechanism`
-and are not attributed to a requested mechanism. That is an intentional
-privacy-policy limitation, not an event gap, and does not itself make the
-capture `PARTIAL`. If an accepted call has an unreadable or unregistered
-non-null mechanism, the observer clears or withholds any binding that cannot
-safely be reconstructed, increments evidence, and reports `PARTIAL` without
-retaining the raw value.
+The return-time read intentionally prioritizes provider-result gating over a
+racy claim that the value is exactly what the provider consumed. `CKR_PENDING`
+is captured there because the caller's pointer need not remain live until
+completion. The approved id stays in the existing bounded pending state until
+the final async result. If the final result is an error, the retained approved
+id can still identify that initially pending operation.
 
-Safe mode does not dereference mechanism parameter structures, templates,
-template boolean values, or async-name input pointers. Those fields are absent,
-not guessed. Existing successful provider-output scalar reads remain internal
-and are never serialized.
+Other immediate returns never dereference `pMechanism` and are not attributed
+to a requested mechanism. That is a selected-policy limitation, not event
+loss, so it does not make the capture `PARTIAL`. After `CKR_OK` or
+`CKR_PENDING`, a non-null pointer that is unreadable increments
+`semantic_capture_failures`; a readable but unapproved id increments
+`unregistered_mechanisms`. Both withhold the value, clear any unsafe binding,
+and force `PARTIAL`. Null remains a distinct state for function-specific
+null-cancellation rules.
 
-### `unsafe-unvalidated-metadata` — diagnostic opt-in
+Safe PKCS #11 3.2 async correlation keeps the existing bounded name decoder.
+It snapshots at most `FUNCTION_NAME_MAX_BYTES + 2` bytes on the BPF stack,
+requires a NUL-terminated exact match to one of the 104 published names, and
+persists only its numeric table id. Hash-plus-length is not exact matching: a
+hash may select a candidate, but authorization must compare the captured bytes
+and length with the canonical name. The smallest preferred representation is
+an immutable map keyed by a zero-padded fixed-size `{ length, bytes }` value,
+not by an FNV hash. The raw pointer and name never enter `START`, an event, or
+output. Null, unreadable, overlong, and unknown names increment existing async
+evidence and force `PARTIAL` when correlation is required.
 
-This policy preserves exactly the pointer-derived metadata decoders present
-before this design:
+Safe mode does not walk parameter structures or templates and does not read
+template boolean values. Those omissions are identified as disabled by policy,
+not decode attempts, and therefore do not increment shape/template failure
+evidence. It also does not attach template-specific entry or tail-call
+programs.
 
-- full-width mechanism ids, including unregistered vendor ids;
+### `unsafe-unvalidated-metadata` — diagnostic profile and trace
+
+This policy preserves exactly the decoder behavior immediately before this
+design:
+
+- entry-time, full-width mechanism ids, including unregistered vendor ids and
+  requests the provider later rejects;
 - RSA-PSS `hashAlg`, `mgf`, and `sLen` for the exact known structure length;
 - GCM IV length, AAD length, and tag bits for the exact supported layouts;
 - bounded template attribute type ids and the existing eleven one-byte policy
   booleans;
-- exact-match standard async function names and existing internal async
+- bounded exact-match standard async function names and current internal async
   correlation data.
 
-It does not add a decoder, widen a bound, emit pointer values, or make any
-currently forbidden buffer readable. The same `bpf_probe_read_user` failure
-handling remains in force, so invalid addresses produce evidence rather than a
-probe-induced target fault. Values from readable but semantically unrelated
-memory may be reported; that is the reason the policy is named `unsafe`.
+It adds no decoder, widens no bound, and emits no pointer value. Invalid
+addresses still become evidence rather than target faults. Readable but
+semantically unrelated memory can produce decoded scalar metadata, as stated
+in the unsafe contract above. A warning describing that risk is printed to
+stderr before discovery or attachment.
+
+Preserving the unsafe decoder does not preserve silent capture gaps. Every
+fixed pointer offset uses checked arithmetic; overflow records a semantic
+capture failure and performs no read. If a template attribute type was
+captured but its allowlisted boolean metadata or byte is unreadable, the type
+remains captured, the boolean remains unknown, and the failure forces
+`PARTIAL`, including for a one-entry or final-entry template.
+
+Mechanism presence is determined only by `capture::MECHANISM_*`, never by a
+numeric sentinel comparison. This preserves a real full-width vendor id equal
+to `u64::MAX` in state, JSON, and trace.
+
+### `aggregate-only` — metrics
+
+Metrics is a real kernel capture policy, not merely a userspace decision to
+leave the ring unread. Entry records only the timestamp needed for aggregate
+latency and updates `STATS`; it reads no semantic argument or target pointer.
+Return updates `STATS` and `RV_COUNTS`, removes the timestamp record, and does
+not reserve or emit an `Event`. The fork tracepoint, semantic state, async name
+table, mechanism registry, template maps, and template programs are not used.
+
+Semantic evidence stays zero because capture was deliberately disabled, not
+lost. Aggregate map update/start-pairing failures retain their ordinary
+evidence and can force `PARTIAL`.
+
+## Mechanism approval registry
+
+`MECH_SHAPE` remains the single membership-and-shape map. The approved set is
+the deduplicated union of:
+
+1. every value in
+   `pkcs11_proxy_ng_types::PKCS11_3_2_OFFICIAL_MECHANISMS`; and
+2. every trusted configured id in `MechanismRegistry::registered_mechanisms()`.
+
+The pinned official inventory currently contains 463 unique published PKCS
+#11 3.2 values and is cumulative for published 2.0x, 2.40, 3.0, 3.1, and 3.2
+mechanisms. `MechanismRegistry` is a parameter-model/configuration registry,
+not the standards-completeness oracle. It supplies an optional decoder shape
+and approved configured vendor ids. Every other official id is still inserted
+with `shape::NONE`.
+
+The complete union must fit `MAX_MECH_SHAPES`; capacity overflow aborts before
+attachment and never truncates. Publication is exact and deduplicated. Safe
+capture interprets map presence as approval and the value as an optional shape
+only. Unsafe capture records absent ids exactly as today. Userspace loads
+parameter-shape expectations only in unsafe mode, so a deliberately omitted
+safe decode cannot become a false total-decode failure. This design adds no
+registry-path CLI; the current embedded registry is the only configured source.
 
 ## Compile-time and runtime gates
 
 Add the off-by-default Cargo feature `unsafe-unvalidated-metadata` to the root
-and eBPF crates. `build.rs` propagates the root feature to the embedded eBPF
-build, following the existing `small-ring` feature pattern.
+and eBPF crates. The default embedded eBPF object compiles out `decode_params`,
+`walk_template`, the unsafe branches, template entry/tail programs, and
+`ATTR_BOOL_BITS`. Shared `CallStart`/`Event` layout stays feature-independent so
+host/eBPF ABI tests cover both artifacts.
 
-The root CLI recognizes `--unsafe-unvalidated-metadata` for semantic `profile`
-and `trace` captures:
+The feature build contains both runtime paths in one eBPF object. With no flag
+it attaches the safe generic entry program; with the flag it attaches the
+current template variants where required and enables the unsafe parameter
+branch. No second object or new dependency is introduced.
 
-- default build, no flag: run `allowlisted`;
-- default build, flag present: refuse before discovery, privilege use, or
-  attachment and name the required Cargo feature;
-- feature build, no flag: run `allowlisted`;
-- feature build, flag present: run `unsafe-unvalidated-metadata`;
-- `profile --mode metrics` plus the flag: refuse because metrics mode performs
-  no semantic pointer decoding;
-- `discover` never accepts the flag.
+`build.rs` reads `CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA` and forwards that
+eBPF feature. It builds one combined feature list so the existing
+`P11SCOPE_SMALL_RING` test mode and the unsafe feature work together. Required
+build cases are default, unsafe, small-ring, and unsafe+small-ring, including
+direct embedded-eBPF builds.
 
-The feature build contains both runtime paths in one eBPF object. Userspace
-sets a new `CONFIG` flag only for the explicit unsafe invocation. The flag is
-published before any probe attaches; publication failure aborts attachment.
-The feature-disabled eBPF build has no reachable unsafe path. No second eBPF
-object or new dependency is introduced.
+The root CLI accepts `--unsafe-unvalidated-metadata` only for `profile` and
+`trace`:
 
-## Mechanism registry
+- default build, no flag: `allowlisted`;
+- default build, flag: refuse during argument validation, before discovery,
+  privilege use, or attachment, and name the required Cargo feature;
+- feature build, no flag: `allowlisted`;
+- feature build, flag: `unsafe-unvalidated-metadata`;
+- `profile --mode metrics` plus the flag: refuse;
+- `discover`: never accepts the flag.
 
-Reuse `MECH_SHAPE` rather than add another map. Userspace publishes every id
-from the existing shared `MechanismRegistry`; mechanisms without a supported
-parameter decoder carry `shape::NONE`. Map presence means that an id is
-approved, while the value still selects an optional parameter decoder.
+## Immutable publication before attach
 
-Safe capture distinguishes absence from `shape::NONE`. Unsafe capture retains
-the current behavior: an absent id is still recorded and merely receives no
-parameter decode. A future trusted registry-override path may approve a vendor
-id without changing this policy or the eBPF ABI, but this design does not add
-that CLI plumbing.
+Use one small userspace `CapturePolicy` enum as the sole source of policy bits,
+program selection, renderer labels, and warnings. Compose one `CONFIG` word
+containing exactly one scope bit and exactly one capture-policy bit. A missing
+or conflicting scope/policy combination is rejected by userspace and fails
+closed in eBPF.
+
+One owner publishes the complete configuration in this order:
+
+1. scope filters and the composed `CONFIG` word;
+2. slot semantics and, where used, async names, mechanism approvals/shapes,
+   and boolean attributes;
+3. exact readback of the word and every expected policy-map entry, with no
+   extras, except for the `CGROUP_FILTER` syscall-readback limitation described
+   below;
+4. `BPF_MAP_FREEZE` on those immutable data/control maps;
+5. program load, with no attachment yet;
+6. when the unsafe feature is compiled, populate `TEMPLATE_TAIL` from the
+   now-loaded tail program only for an unsafe invocation, read it back, and
+   freeze it; safe/aggregate invocations freeze the compiled map empty;
+7. attachment.
+
+The immutable control maps are `CONFIG`, `PID_FILTER`, `CGROUP_FILTER`,
+`SLOT_SEMANTICS`, `ASYNC_FUNCTIONS`, `MECH_SHAPE`, and, when compiled,
+`ATTR_BOOL_BITS` and `TEMPLATE_TAIL`. Compiled optional control maps are frozen
+empty when the selected policy does not use them. Ordinary Array/HashMap
+controls are declared program-read-only and no eBPF path updates any control
+map. Linux rejects `BPF_F_RDONLY_PROG` for fd-array map types, so
+`CGROUP_FILTER` (`CgroupArray`) and `TEMPLATE_TAIL` (`ProgramArray`) are explicit
+flag exceptions; their map types, absence of a BPF update path, exact
+publication checks, and `BPF_MAP_FREEZE` provide the equivalent selected-policy
+contract.
+
+`CGROUP_FILTER` is also the sole readback exception: its Linux map type does
+not support `BPF_MAP_LOOKUP_ELEM`. Userspace instead validates its map type and
+one-entry capacity, retains the already validated source cgroup fd, requires a
+successful `set(0, fd)`, freezes the map, and covers effective membership with
+the live in-scope/out-of-scope cgroup gate. `TEMPLATE_TAIL` is read back as the
+expected loaded program id before it is frozen. Every map is frozen before it
+can influence an attached program. Any required publication, supported
+readback, or freeze failure aborts. Dynamic data maps such as `START`, `STATS`,
+`RV_COUNTS`, `EVENTS`, and `EVIDENCE` are not frozen.
+
+This removes the current risk that separate configuration writers overwrite
+scope or policy bits, and prevents a feature build from being switched to
+unsafe capture after output was labeled safe.
 
 ## Evidence and output contracts
 
-Add `capture.privacy_mode` to every JSON report. Its value is
-`allowlisted`, `unsafe-unvalidated-metadata`, or `aggregate-only` for metrics.
-The profile schema advances from `v1.3` to `v1.4`; the additive metrics schema
-remains `v1-metrics`.
+Every presentation identifies policy:
 
-Trace writes one persistent `CAPTURE privacy=<mode>` record before call records.
-Unsafe capture also prints a clear warning to stderr before attachment. Output
-tagging is unconditional in a feature build and cannot be suppressed.
+- JSON: required `capture.privacy_mode`;
+- live profile/metrics: policy in every frame header;
+- trace: `CAPTURE privacy=<mode>` before calls and the same field in the final
+  machine-readable `EVIDENCE` record;
+- unsafe invocation: an additional stderr warning before discovery/attach.
 
-Reuse `evidence.semantic_capture_failures` for safe mechanism read failures.
-Add `evidence.unregistered_mechanisms` as a count only; it never contains an id.
-Either condition on a provider-accepted call forces `PARTIAL`. Deliberately
-choosing the unsafe policy does not force `PARTIAL`: completeness describes
-gaps in the selected policy, while `capture.privacy_mode` describes that
-policy.
+Allowed values are `allowlisted`, `unsafe-unvalidated-metadata`, and
+`aggregate-only`. Labels always come from the immutable userspace enum whose
+bits passed publication/readback; they are not inferred later from mutable
+maps.
+
+Profile advances from `pkcs11-scope/observed-profile/v1.3` to
+`pkcs11-scope/observed-profile/v1.4`. Metrics advances from
+`pkcs11-scope/observed-profile/v1-metrics` to
+`pkcs11-scope/observed-profile/v1.1-metrics`; consumers dispatch on the exact
+schema string.
+
+The v1.4 profile representation is explicit:
+
+- safe mechanism statistics begin only with an init/direct call whose
+  immediate result allowed an approved id to be observed; later operation
+  calls attributed through that binding are included. Rejected initialization
+  requests are not. `functions[]` remains the authority for all calls and
+  return codes;
+- unsafe mechanism totals retain v1.3 request attribution, including rejected
+  initialization attempts;
+- safe `mechanisms[].params` is `null` with a note that decoding was disabled
+  by `allowlisted`, never a shape failure;
+- safe `templates.operations` is empty and `templates.note` says template
+  capture was disabled by policy, so emptiness is not evidence that no template
+  was used;
+- unsafe keeps the existing parameter/template structures and decode-failure
+  meanings, but their notes explicitly call the values unvalidated
+  pointer-derived metadata rather than describing them as safe or allowlisted.
+
+Reuse `evidence.semantic_capture_failures` for safe mechanism reads after
+`CKR_OK`/`CKR_PENDING` that fault. Add `evidence.unregistered_mechanisms` as a
+count only. Either forces `PARTIAL`. Policy-disabled parameter/template
+capture does not affect completeness. Selecting unsafe does not itself force
+`PARTIAL`: completeness means no gaps within the selected policy, while
+`privacy_mode` identifies the policy.
+
+The v1.3→v1.4 and v1-metrics→v1.1-metrics migration notes must state these
+semantic and structural differences; older documents are never reinterpreted.
 
 ## Verification
 
-The non-privileged suite covers:
+### Unprivileged contracts
 
-1. the default build rejects the unsafe flag and names the Cargo feature;
-2. a feature build without the flag selects `allowlisted` and leaves the
-   runtime policy bit clear;
-3. a feature build with the flag sets the bit before any probe attaches and
-   labels JSON/trace output;
-4. `metrics` rejects the flag and reports `aggregate-only` otherwise;
-5. every shared-registry mechanism is published, including ids whose shape is
-   `NONE`, while absence remains distinguishable;
-6. a known mechanism on `CKR_OK` appears in safe mode, while `CKR_PENDING`
-   retains the approved id for the existing async completion path;
-7. failed, unreadable, and successful-but-unregistered mechanisms never expose
-   their raw values in safe events or output;
-8. parameters, templates, booleans and async-name metadata are absent in safe
-   mode and retain their previous results in unsafe mode;
-9. schema and trace contract tests pin every privacy-mode marker.
+The ordinary suite pins:
 
-The release canary runs both policies against the existing live-map scanner.
-Safe mode plants an unknown readable mechanism sentinel and proves it appears
-in neither output nor the observer-owned `START` and event maps. Unsafe mode
-proves every existing metadata decoder remains available. Both runs plant and
-reject PIN, key material, label, `CKA_ID`, plaintext, ciphertext, signature,
-wrapped-object, random-output and ordinary-buffer sentinels. Intentionally
-decoded metadata is not treated as a forbidden unsafe-mode canary.
+1. all CLI/build combinations and early flag refusal;
+2. all legal scope/policy `CONFIG` words and rejection of conflicting bits;
+3. exact policy-map publication, readback, capacity failure, and freeze order:
+   data policy before program load, tail-call target after load, all before
+   attach; object inspection pins `BPF_F_RDONLY_PROG` on ordinary immutable
+   Array/HashMap controls and its required absence on the two fd-array maps;
+4. exactly 463 official ids, cumulative standards coverage, configured vendor
+   union, deduplication, `shape::NONE`, and `u64::MAX` presence by capture tag;
+5. safe `CKR_OK`/`CKR_PENDING`, failed/unreadable/unregistered/null mechanism
+   boundaries and async pending completion;
+6. safe byte-exact async names and categorical rejection of unknown names;
+   structural coverage proves no hash-only authorization path remains and a
+   non-catalog byte string sharing a test-injected legacy hash is rejected;
+7. policy-aware shape/template evidence and v1.4/v1.1-metrics JSON, live, and
+   trace markers;
+8. aggregate-only argument/pointer non-read and zero event emission;
+9. default, unsafe, small-ring, and unsafe+small-ring host/eBPF builds with
+   unchanged shared ABI sizes;
+10. default-object inventory proves unsafe-only programs/maps are absent;
+11. unsafe fixed-offset overflow and unreadable allowlisted boolean
+    metadata/value failures perform no derived read, retain any already read
+    attribute type, and force `PARTIAL`, including at the final entry.
 
-The ordinary Rust format, check, test and clippy gates run for the default and
-feature builds. The embedded eBPF crate is built in both feature states. Live
-privileged canaries remain approval-gated under `AGENTS.md`.
+### Approval-gated live canaries
 
-## Documentation and release
+The safe workload passes `pMechanism` pointing to a readable unknown
+eight-byte sentinel, has the provider return `CKR_OK`, and proves the sentinel
+never appears in observer-owned maps, events, logs, or output. A separate
+approved standard-id case proves safe mechanism usefulness. The test resolves
+this run's map ids, observes a nonempty `START`, and verifies that its allowed
+raw address field is never mistaken for pointee content or emitted publicly.
 
-Update the README, usage guide, privacy allowlist and observed-profile schema
-document together. The public promise remains absolute for PINs, keys and raw
-buffers in every build; it no longer implies that an explicitly unsafe build
-validates all decoded metadata pointers.
+Malicious-alias fixtures route benign sentinels through every existing pointer
+decoder. Safe mode must contain all of them except the documented finite
+catalog matches. Unsafe mode must reproduce the existing scalar decodes and
+its warning/labels; that lane demonstrates the documented risk rather than
+claiming hostile-target safety. Both policies retain ordinary-placement
+canaries for PIN, key material, label, `CKA_ID`, plaintext, ciphertext,
+signature, wrapped-object, random output, and normal buffers, none of which has
+an intentional decoder.
 
-Official release artifacts are built explicitly without default features and
-must reject the unsafe flag. The release script contains a contract check for
-that property. Unsafe diagnostic builds are operator-built and visibly tagged;
-they are not substituted into the ordinary release archive.
+Additional live cases cover safe async exact matching, aggregate-only empty
+events, feature co-builds, and the `u64::MAX` trace regression. After attach,
+a mutation by exact map id must fail with the frozen-map `EPERM` for every
+control map. Each mutation uses an otherwise-valid value or deletes a
+populated fd-array entry, and a matched unfrozen control proves the same
+operation would otherwise succeed; an invalid cgroup/program fd is not a
+freeze test. Ordinary kernel updates to dynamic aggregate/evidence maps must
+still work. Missing privilege fails or is reported as unrun according to the
+existing gate contract; it is never converted to a pass.
+
+## Release and documentation
+
+Update README, usage, privacy allowlist, observed-profile schema, and release
+notes together. Public wording makes the safe/unsafe trust distinction
+prominent and never describes `bpf_probe_read_user` as pointer validation.
+
+Official artifacts use `--no-default-features` in a dedicated
+`CARGO_TARGET_DIR`, reject the unsafe flag, and contain no unsafe-only eBPF
+program/map inventory. Unsafe canary/diagnostic builds use a different target
+directory and are never copied into the release archive.
+
+Before release, the separately open provider provenance, dependency leasing,
+`$ORIGIN`/fd loading, and lease-break teardown findings must be fixed and
+re-reviewed. The still-open final-review tasks in
+`docs/superpowers/plans/2026-08-13-manifest-provenance.md` remain authoritative;
+this metadata design does not waive them.
+
+## Alternatives and decision
+
+- Removing all target-pointer reads gives the strongest boundary but loses
+  mechanism profiling and PKCS #11 3.2 async correlation.
+- Keeping the current decoders as the default preserves detail but cannot be
+  safe against pointer aliasing.
+- A cooperative provider audit point can authenticate structures but is not a
+  general observer for existing providers.
+
+The selected design is the smallest portable compromise: one safe default,
+one explicit compile-time-plus-runtime diagnostic escape hatch, one aggregate
+path, the existing map inventory and shared event ABI, and no new dependency
+or second BPF object.
 
 ## Acceptance criteria
 
-- Safe execution is the default in every build.
-- Official binaries contain no reachable unsafe metadata path.
-- The unsafe feature plus runtime flag reproduces all and only the metadata
-  decoders that existed before this design.
-- Unregistered raw mechanism values never persist in safe mode.
-- No policy can request or emit a PIN, key, label, `CKA_ID`, protocol buffer,
-  plaintext, ciphertext, signature, wrapped object, or arbitrary memory dump.
-- Every output identifies its privacy policy.
-- Default and feature build gates pass, and the approval-gated dual-policy
-  canary passes before release.
+- `allowlisted` is the default in every profile/trace-capable build;
+  `aggregate-only` is the only metrics policy.
+- Default artifacts compile out and cannot activate unsafe decoders.
+- Feature plus runtime flag reproduces all and only the pre-design metadata
+  decoders and is labeled as unsafe for trusted ABI-valid workloads.
+- Safe output contains only approved mechanism ids and exact published async
+  target ids; rejected pointer-derived values never persist.
+- All 463 published mechanism ids plus trusted configured vendor ids are
+  approved without silent capacity loss.
+- Policy and registry maps receive every supported exact readback and are
+  frozen before they can influence an attached program. `CGROUP_FILTER` uses
+  validated type/capacity, successful set, retained source fd, freeze, and the
+  live membership gate because its map type has no syscall lookup. Output
+  labels cannot diverge from selected policy.
+- Metrics performs no semantic pointer read and emits no semantic event.
+- Full-width `u64::MAX` mechanism ids render when the capture-state tag says a
+  value is present.
+- Every JSON, live, and trace output identifies privacy policy and the schema
+  migration is explicit.
+- Default/feature/co-feature gates pass, and approval-gated canaries pass
+  before release.
+- Separate provenance and teardown blockers are resolved and re-reviewed; this
+  design alone is never used as a release-clearance claim.

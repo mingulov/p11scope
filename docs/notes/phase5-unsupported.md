@@ -125,9 +125,9 @@ which is exactly the branch `UNSUPPORTED_ENV_HINT` above now covers
 This host runs `7.0.0-28-generic`, far above the floor. Downgrading the
 running kernel is out of scope for this environment (no VM/container
 with an older kernel readily available here). **Not induced; not
-faked.** The 5.15 floor traces to
-`bpf_get_current_ancestor_cgroup_id()` (cgroup-scoped attach,
-`src/scope.rs`), a kernel feature with a real minimum version — this
+faked.** The 5.15 floor comes from the attach-cookie design used by every
+uprobe/uretprobe; cgroup filtering now uses native `CgroupArray` membership.
+This
 tool does not runtime-check the kernel version anywhere in the code, so
 on a kernel that lacks a feature it depends on, the failure mode is
 whatever aya's `Ebpf::load()`/program-load path produces for that

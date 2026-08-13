@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased corrective release
+
+This section describes work in progress, not a releasable artifact. Deep
+review on 2026-08-13 reopened the safe-metadata, lazy-dependency provenance,
+`$ORIGIN`, and lease-break teardown gates; the amended designs require
+manifest v4 and observed-profile v1.4/v1.1-metrics before release.
+
+- Discovery now snapshots provider pointers through bounded process-memory
+  reads and emits `p11scope-manifest/3` with byte-safe mapping evidence,
+  reporting build IDs, and mandatory whole-file SHA-256 identities.
+- Stored manifests no longer authorize probes by themselves: every attach
+  requires bounded fresh unprivileged discovery through a pinned trusted
+  sibling helper, an explicit operator-selected `--provenance-module`, and
+  exact function-name/object/offset provenance agreement.
+- The first pass read-leases candidate attach objects and re-hashes after
+  attach. Full exact-inode dependency stabilization and supervisor-ordered
+  teardown remain open release work. The authorization helper has an empty
+  environment, 16 MiB output cap, and 30-second process-group deadline.
+- Cumulative function-table support covers 2.00, 2.01–2.40, 3.0, 3.1, and
+  all 104 published 3.2 slots. Alternate/null interface names are walked only
+  as structurally corroborated prefixes; vendor lookalikes stay undecoded.
+- Independent START, RV, cgroup, semantic, process, fork, cancellation, and
+  async loss evidence prevents a degraded capture from reporting complete.
+- Profile output is `pkcs11-scope/observed-profile/v1.3`; metrics output is
+  `pkcs11-scope/observed-profile/v1-metrics`. See the schema migration note for
+  the corrected `sessions.closed` meaning.
+- The release gates now exercise live verifier loading, observer-owned map-id
+  canaries, START/RV/ring saturation, and dynamic glibc/musl 68/92/104 walks.
+
 ## v0.1.0
 
 First release. A non-interposing PKCS#11 observer: attach to a running
@@ -9,8 +38,9 @@ module.
 
 ### Discovery and attach
 
-- `p11scope-discover` reads a provider's real function table straight
-  from the ELF file — including stripped providers with no `C_*` symbols
+- `p11scope-discover` loads a provider and reads its live function table,
+  resolving pointers to mapped ELF objects — including stripped providers
+  with no `C_*` symbols
   — and writes a manifest of file offsets `p11scope` attaches to. Handles
   both the legacy `C_GetFunctionList` table and PKCS#11 3.x
   `C_GetInterfaceList`.

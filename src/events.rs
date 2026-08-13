@@ -69,7 +69,6 @@ mod tests {
             p1: 0,
             p2: 0,
             slot: 8,
-            kind: 9,
             user_type: 10,
             shape: 0,
             attr_types: [0; 8],
@@ -77,6 +76,7 @@ mod tests {
             attr_total: 0,
             attr_bools: 0,
             attr_bools_seen: 0,
+            ..Event::default()
         }
     }
 
@@ -101,7 +101,6 @@ mod tests {
         assert_eq!(decoded.mechanism, ev.mechanism);
         assert_eq!(decoded.rv, ev.rv);
         assert_eq!(decoded.slot, ev.slot);
-        assert_eq!(decoded.kind, ev.kind);
         assert_eq!(decoded.user_type, ev.user_type);
     }
 

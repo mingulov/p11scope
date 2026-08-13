@@ -31,7 +31,11 @@ fn build_fixture() -> PathBuf {
 }
 
 fn resolution<'a>(s: &'a SurfaceRecord, name: &str) -> &'a Resolution {
-    &s.functions.iter().find(|f| f.name == name).unwrap().resolution
+    &s.functions
+        .iter()
+        .find(|f| f.name == name)
+        .unwrap()
+        .resolution
 }
 
 #[test]
@@ -43,14 +47,25 @@ fn fixture_covers_3x_vendor_null_alias_cross_object() {
     let legacy = &m.surfaces[0];
     assert!(matches!(legacy.walk, WalkOutcome::Full));
     assert_eq!(legacy.functions.len(), 68);
-    assert!(matches!(resolution(legacy, "C_GetFunctionStatus"), Resolution::NullPointer));
+    assert!(matches!(
+        resolution(legacy, "C_GetFunctionStatus"),
+        Resolution::NullPointer
+    ));
 
     // Cross-object: C_GenerateRandom resolves into helper.so, which gets
     // its own object record with its own identity.
-    let Resolution::Resolved { object: helper_obj, .. } = *resolution(legacy, "C_GenerateRandom")
-    else { panic!("C_GenerateRandom did not resolve") };
-    let Resolution::Resolved { object: main_obj, .. } = *resolution(legacy, "C_Initialize")
-    else { panic!("C_Initialize did not resolve") };
+    let Resolution::Resolved {
+        object: helper_obj, ..
+    } = *resolution(legacy, "C_GenerateRandom")
+    else {
+        panic!("C_GenerateRandom did not resolve")
+    };
+    let Resolution::Resolved {
+        object: main_obj, ..
+    } = *resolution(legacy, "C_Initialize")
+    else {
+        panic!("C_Initialize did not resolve")
+    };
     assert_ne!(helper_obj, main_obj);
     assert!(m.objects[helper_obj as usize].path.ends_with("helper.so"));
     assert!(m.objects[helper_obj as usize].identity.reusable);
@@ -77,7 +92,10 @@ fn fixture_covers_3x_vendor_null_alias_cross_object() {
 
     // Vendor interface: present-but-undecoded, lossless name.
     assert_eq!(m.vendor_interfaces.len(), 1);
-    assert_eq!(m.vendor_interfaces[0].name_lossy.as_deref(), Some("Vendor NetHSM-Ext"));
+    assert_eq!(
+        m.vendor_interfaces[0].name_lossy.as_deref(),
+        Some("Vendor NetHSM-Ext")
+    );
     assert!(!m.vendor_interfaces[0].func_list_null);
 
     // Alias: C_CancelFunction and C_WaitForSlotEvent share one target.

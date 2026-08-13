@@ -5,6 +5,13 @@
 mock-ups of v1 output; exact formatting will evolve, the *content* is the
 commitment.
 
+**Superseded details:** The privacy modes, schema versions, mandatory
+provenance module, and current CLI are defined by
+`2026-08-13-safe-and-unvalidated-metadata-design.md`,
+`2026-08-12-v0.1-corrective-release-design.md`, and
+`../plans/2026-08-13-manifest-provenance.md`. Examples below remain historical
+mock-ups and must not be used as an implementation or release contract.
+
 ## CLI surface (v1)
 
 ```bash

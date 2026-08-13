@@ -40,30 +40,11 @@
 #    Task 3 proved, used here for a temporal purpose instead of a
 #    multi-container one.
 #
-# 3. GENUINE TOOL GAP (found, not worked around): `p11scope-discover`
-#    computes each object's identity (crates/manifest/src/identity.rs) by
-#    re-reading the path it resolved from ITS OWN /proc/self/maps
-#    (crates/discover/src/discover.rs:60, via maps.rs). When discover is
-#    invoked directly against a magic /proc/<pid>/root/... path, the
-#    kernel's maps entry for the dlopen'd library reports the path
-#    canonicalized to its OWN owning mount (no /proc/<pid>/root prefix),
-#    which is unreachable from discover's own mount namespace --
-#    `identity()`'s `fs::read` then fails ENOENT and the object is
-#    recorded `Unavailable`/`reusable: false`. `p11scope profile` then
-#    refuses to attach ("manifest identity is not reusable"), *even
-#    though* the (separately rewritten) object path is perfectly valid
-#    and readable. This is a real, narrow gap: discover has no way to
-#    compute identity against a path reachable only via a magic symlink
-#    crossing a mount-namespace boundary. This script works around it by
-#    recomputing the GNU build-id out-of-band (`readelf -n`, the same
-#    authoritative source identity.rs itself falls back to) and patching
-#    the manifest's identity field -- identity is bookkeeping for the
-#    manifest-reuse gate (verify.rs), not part of the actual uprobe attach
-#    (attach.rs uses objects[].path directly), so this does not touch or
-#    fake the actual capture mechanism. The gap itself is recorded in
-#    docs/notes/phase4-matrix.md as a finding for a future fix (teach
-#    discover to record identity against the --module argument's own
-#    accessible form, not the maps-resolved one).
+# 3. Fresh provenance is mandatory even though no pod exists. The exact image
+#    layer ELF is copied to an unprivileged safe path for discovery, while the
+#    manifest's attach path is retargeted to the stable snapshot inode.
+#    `--provenance-module` binds those two views by whole-file SHA-256 and every
+#    function offset; a raw rewritten manifest is never trusted.
 #
 # 4. Knative's latest release (knative-v1.23.0) refuses to start against
 #    kind's default node (Kubernetes 1.33.1): "kubernetes version 1.33.1
@@ -78,11 +59,13 @@ set -eu
 cd "$(dirname "$0")/../.."
 
 WORK=target/matrix-knative
+TRUST_DIR="$PWD/$WORK/trusted"
 IMAGE_LOCAL=kind.local/p11scope-matrix-knative:latest
 IMAGE_TAG=p11scope-matrix-knative
 CLUSTER=p11scope-knative
 KSVC=p11scope-matrix-ksvc
 KNATIVE_VERSION=knative-v1.23.0
+. scripts/trusted-p11scope.sh
 
 command -v kind >/dev/null || { echo "kind required"; exit 1; }
 command -v kubectl >/dev/null || { echo "kubectl required"; exit 1; }
@@ -91,8 +74,11 @@ command -v docker >/dev/null || { echo "docker required"; exit 1; }
 CLUSTER_CREATED=0
 FAILED=1
 PF_PID=""
+SPID=
 cleanup() {
     [ -n "$PF_PID" ] && kill "$PF_PID" >/dev/null 2>&1 || true
+    [ -z "$SPID" ] || kill "$SPID" 2>/dev/null || true
+    [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || true
     if [ "$FAILED" -eq 0 ]; then
         kubectl delete ksvc "$KSVC" --wait=true --ignore-not-found >/dev/null 2>&1 || true
         if [ "$CLUSTER_CREATED" -eq 1 ]; then
@@ -101,6 +87,7 @@ cleanup() {
     else
         echo "FAILED -- leaving cluster '$CLUSTER' and ksvc '$KSVC' up for inspection"
     fi
+    remove_trusted_p11scope "$TRUST_DIR"
 }
 trap cleanup EXIT
 
@@ -198,26 +185,32 @@ SNAP_PATH=$(echo "$CANDIDATES" | sed -E 's#.*/snapshots/([0-9]+)/fs/.*#\1 &#' | 
 echo "provider file on the node's disk, reachable via the node's own long-lived pid: $SNAP_PATH"
 
 echo "=== discover against the pre-existing image layer (no live pod needed) ==="
-sudo ./target/release/p11scope-discover --module "$SNAP_PATH" -o "$WORK/manifest-raw.json"
-sudo chown "$(id -u):$(id -g)" "$WORK/manifest-raw.json"
+# Discovery cannot inherit the observer's root authority. Copy the exact ELF
+# bytes into the user-owned work directory, discover there, then retarget the
+# manifest to the verified snapshot inode used for attachment.
+DISCOVERY_COPY="$PWD/$WORK/provider-discovery.so"
+sudo cp "$SNAP_PATH" "$DISCOVERY_COPY"
+sudo chown "$(id -u):$(id -g)" "$DISCOVERY_COPY"
+./target/release/p11scope-discover --module "$DISCOVERY_COPY" -o "$WORK/manifest-raw.json"
 BUILDID=$(sudo readelf -n "$SNAP_PATH" 2>/dev/null | grep "Build ID" | awk '{print $3}')
 test -n "$BUILDID" || { echo "could not read build-id via readelf"; exit 1; }
-echo "authoritative build-id (readelf, out-of-band -- see header point 3): $BUILDID"
-python3 - "$WORK/manifest-raw.json" "$WORK/manifest-host.json" "/proc/$NODEPID/root" "$BUILDID" <<'PY'
+echo "provider build-id (readelf, corroborating evidence -- see header point 3): $BUILDID"
+python3 - "$WORK/manifest-raw.json" "$WORK/manifest-host.json" "$SNAP_PATH" "$BUILDID" <<'PY'
 import json, sys
-inp, outp, prefix, buildid = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+inp, outp, target, buildid = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 m = json.load(open(inp))
-for o in m["objects"]:
-    if not o["path"].startswith(prefix):
-        o["path"] = prefix + o["path"]
-    o["identity"] = {"kind": "gnu_build_id", "value": buildid, "reusable": True, "note": None}
+assert len(m["objects"]) == 1, "SoftHSM fixture unexpectedly spans multiple objects"
+m["module_path"] = target
+m["objects"][0]["path"] = target
+assert m["objects"][0]["identity"]["value"] == buildid
 json.dump(m, open(outp, "w"))
 PY
 
 echo "=== measure privileges: unprivileged profile attempt ==="
 set +e
 UNPRIV_OUT=$(./target/release/p11scope profile --manifest "$WORK/manifest-host.json" \
-    --cgroup "$KUBEPODS" --mode metrics --duration 1 2>&1)
+    --provenance-module "$DISCOVERY_COPY" --cgroup "$KUBEPODS" \
+    --mode metrics --duration 1 2>&1)
 UNPRIV_RC=$?
 set -e
 echo "$UNPRIV_OUT"
@@ -236,8 +229,11 @@ test "$N" -eq 0 || { echo "expected zero pods immediately before attach, got $N"
 ATTACH_START=$(python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat())')
 echo "attach start (UTC): $ATTACH_START -- zero pods for $KSVC exist at this instant"
 
-sudo ./target/release/p11scope profile \
+stage_trusted_p11scope target/release/p11scope \
+    target/release/p11scope-discover "$TRUST_DIR"
+sudo "$TRUST_DIR/p11scope" profile \
     --manifest "$WORK/manifest-host.json" --cgroup "$KUBEPODS" \
+    --provenance-module "$DISCOVERY_COPY" \
     --mode metrics --duration 40 -o "$WORK/observed.json" \
     > "$WORK/profile.log" 2>&1 &
 SPID=$!
@@ -252,7 +248,7 @@ curl -sS -H "Host: $HOST" "http://127.0.0.1:18080/" --max-time 60
 echo
 kill "$PF_PID" >/dev/null 2>&1 || true
 PF_PID=""
-wait "$SPID"
+if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "Knative profiler failed: $status"; tail -n 20 "$WORK/profile.log"; exit "$status"; fi
 tail -n 15 "$WORK/profile.log"
 
 echo "=== verify: the new pod genuinely postdates attach start ==="

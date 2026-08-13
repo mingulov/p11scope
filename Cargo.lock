@@ -251,8 +251,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aya",
+ "cryptoki-sys",
+ "libc",
+ "p11scope-discover",
  "p11scope-ebpf-common",
  "p11scope-manifest",
+ "pkcs11-module",
  "pkcs11-proxy-ng-types",
  "serde",
  "serde_json",
@@ -265,6 +269,7 @@ name = "p11scope-discover"
 version = "0.0.0"
 dependencies = [
  "cryptoki-sys",
+ "libc",
  "libloading",
  "p11scope-manifest",
  "pkcs11-module",
@@ -283,6 +288,7 @@ dependencies = [
 name = "p11scope-manifest"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "object",
  "serde",
  "serde_json",
@@ -298,7 +304,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "pkcs11-module"
 version = "0.2.0"
-source = "git+https://github.com/mingulov/pkcs11-proxy-ng?rev=7c5c86043820eb3795f40c65a36ce961cdfd26c5#7c5c86043820eb3795f40c65a36ce961cdfd26c5"
+source = "git+https://github.com/mingulov/pkcs11-proxy-ng?rev=a2aab6cd67d21d140277a4584942e06c903f165b#a2aab6cd67d21d140277a4584942e06c903f165b"
 dependencies = [
  "cryptoki-sys",
  "libloading",
@@ -307,7 +313,7 @@ dependencies = [
 [[package]]
 name = "pkcs11-proxy-ng-types"
 version = "0.2.0"
-source = "git+https://github.com/mingulov/pkcs11-proxy-ng?rev=7c5c86043820eb3795f40c65a36ce961cdfd26c5#7c5c86043820eb3795f40c65a36ce961cdfd26c5"
+source = "git+https://github.com/mingulov/pkcs11-proxy-ng?rev=a2aab6cd67d21d140277a4584942e06c903f165b#a2aab6cd67d21d140277a4584942e06c903f165b"
 dependencies = [
  "serde",
  "toml",

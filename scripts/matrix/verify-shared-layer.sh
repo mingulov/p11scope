@@ -30,13 +30,28 @@ cd "$(dirname "$0")/../.."
 MODULE_IN_CONTAINER=/usr/lib/softhsm/libsofthsm2.so
 PROVIDER_REAL_PATH=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
 WORK=target/matrix-shared
+TRUST_DIR="$PWD/$WORK/trusted"
+PROVENANCE_MODULE="$PWD/$WORK/provider-provenance.so"
 IMAGE=p11scope-matrix
 NAME_A=p11scope-matrix-shared-a
 NAME_B=p11scope-matrix-shared-b
+wa=
+wb=
+sp=
+. scripts/trusted-p11scope.sh
 
 command -v docker >/dev/null || { echo "docker required"; exit 1; }
 
-cleanup() { docker rm -f "$NAME_A" "$NAME_B" >/dev/null 2>&1 || true; }
+cleanup() {
+    [ -z "$wa" ] || kill "$wa" 2>/dev/null || true
+    [ -z "$wb" ] || kill "$wb" 2>/dev/null || true
+    [ -z "$sp" ] || kill "$sp" 2>/dev/null || true
+    [ -z "$wa" ] || wait "$wa" 2>/dev/null || true
+    [ -z "$wb" ] || wait "$wb" 2>/dev/null || true
+    [ -z "$sp" ] || wait "$sp" 2>/dev/null || true
+    docker rm -f "$NAME_A" "$NAME_B" >/dev/null 2>&1 || true
+    remove_trusted_p11scope "$TRUST_DIR"
+}
 trap cleanup EXIT
 
 echo "=== build product + workload ==="
@@ -76,8 +91,15 @@ fi
 echo "confirmed: both containers see the same provider inode ($INODE_A) -- storage driver $(docker info --format '{{.Driver}}')"
 
 echo "=== discover once, inside container A's mount view ==="
-docker exec "$NAME_A" p11scope-discover --module "$MODULE_IN_CONTAINER" -o /shared/manifest.json
+docker exec "$NAME_A" p11scope-discover --module "$MODULE_IN_CONTAINER" \
+    > "$WORK/shared-a/manifest.json"
 test -s "$WORK/shared-a/manifest.json" || { echo "manifest not produced"; exit 1; }
+rm -f "$PROVENANCE_MODULE"
+docker cp -L "$NAME_A:$MODULE_IN_CONTAINER" "$PROVENANCE_MODULE"
+test -f "$PROVENANCE_MODULE" && [ ! -L "$PROVENANCE_MODULE" ] \
+    || { echo "provenance module is not a regular copied file"; exit 1; }
+stage_trusted_p11scope target/release/p11scope \
+    target/release/p11scope-discover "$TRUST_DIR"
 
 echo "=== rewrite manifest object paths with /proc/<A's pid>/root prefix ==="
 python3 - "$WORK/shared-a/manifest.json" "$WORK/manifest-host.json" "/proc/$PID_A/root" <<'PY'
@@ -118,16 +140,17 @@ run_capture() {
     ( while [ ! -f "$WORK/shared-b/go" ]; do sleep 0.05; done
       docker exec "$NAME_B" /usr/local/bin/harness "$MODULE_IN_CONTAINER" ) &
     wb=$!
-    sudo ./target/release/p11scope profile \
+    sudo "$TRUST_DIR/p11scope" profile \
         --manifest "$WORK/manifest-host.json" --cgroup "$cg" \
+        --provenance-module "$PROVENANCE_MODULE" \
         --mode metrics --duration 20 -o "$out" \
         > "$WORK/$label.log" 2>&1 &
     sp=$!
     sleep 3
     touch "$WORK/shared-a/go" "$WORK/shared-b/go"
-    wait "$wa"
-    wait "$wb"
-    wait "$sp"
+    if wait "$wa"; then wa=; else status=$?; wa=; echo "$label workload A failed: $status"; exit "$status"; fi
+    if wait "$wb"; then wb=; else status=$?; wb=; echo "$label workload B failed: $status"; exit "$status"; fi
+    if wait "$sp"; then sp=; else status=$?; sp=; echo "$label profiler failed: $status"; tail -n 20 "$WORK/$label.log"; exit "$status"; fi
     tail -n 5 "$WORK/$label.log"
 }
 

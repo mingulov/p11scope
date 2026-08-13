@@ -31,7 +31,9 @@ cd "$(dirname "$0")/../.."
 
 MODULE=/usr/lib/softhsm/libsofthsm2.so
 WORK=target/matrix-fork
+TRUST_DIR="$PWD/$WORK/trusted"
 EXPECTED=scripts/matrix/fork-expected.txt
+. scripts/trusted-p11scope.sh
 
 command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
 command -v softhsm2-util >/dev/null || { echo "softhsm2-util required"; exit 1; }
@@ -43,14 +45,29 @@ test -f "$MODULE" || { echo "SoftHSM2 not installed at $MODULE"; exit 1; }
 mkdir -p "$WORK"
 UNIT="p11scope-fork-$$"
 CGROUP_PATH="/sys/fs/cgroup/system.slice/${UNIT}.scope"
+LAUNCHER_PID=
+PROFILE_PID=
+PRIV_PID=
 
 cleanup() {
+    status=$?
+    trap - EXIT INT TERM
+    [ -z "$PROFILE_PID" ] || sudo kill -TERM "$PROFILE_PID" >/dev/null 2>&1 || true
+    [ -z "$LAUNCHER_PID" ] || kill -TERM "$LAUNCHER_PID" >/dev/null 2>&1 || true
+    [ -z "$PRIV_PID" ] || kill -TERM "$PRIV_PID" >/dev/null 2>&1 || true
+    [ -z "$PROFILE_PID" ] || wait "$PROFILE_PID" 2>/dev/null || true
+    [ -z "$LAUNCHER_PID" ] || wait "$LAUNCHER_PID" 2>/dev/null || true
+    [ -z "$PRIV_PID" ] || wait "$PRIV_PID" 2>/dev/null || true
     sudo systemctl stop "${UNIT}.scope" >/dev/null 2>&1 || true
+    remove_trusted_p11scope "$TRUST_DIR"
+    exit "$status"
 }
-trap cleanup EXIT
+. scripts/cleanup-traps.sh
 
 echo "=== build product + fork-harness ==="
 cargo build --release --workspace
+stage_trusted_p11scope target/release/p11scope \
+    target/release/p11scope-discover "$TRUST_DIR"
 gcc -O0 -o "$WORK/fork-harness" scripts/matrix/fork-harness.c -ldl
 
 echo "=== softhsm token (private, disposable) ==="
@@ -80,17 +97,30 @@ LAUNCHER_PID=$!
 sleep 1     # let systemd-run establish the cgroup
 test -d "$CGROUP_PATH" || { echo "cgroup was not created: $CGROUP_PATH"; exit 1; }
 
-sudo ./target/release/p11scope profile --manifest "$WORK/manifest.json" \
-    --cgroup "$CGROUP_PATH" --mode metrics --duration 20 -o "$WORK/observed.json" \
+sudo "$TRUST_DIR/p11scope" profile --manifest "$WORK/manifest.json" \
+    --provenance-module "$MODULE" --cgroup "$CGROUP_PATH" \
+    --mode metrics --duration 20 -o "$WORK/observed.json" \
     > "$WORK/profile.log" 2>&1 &
 PROFILE_PID=$!
 sleep 3     # let attach complete -- neither the parent harness process nor
             # any child exists yet at this point; both are still blocked
             # behind the go-file wait, which is the whole point of this test
 touch "$WORK/go"
-wait "$LAUNCHER_PID"
-LAUNCHER_RC=$?
-wait "$PROFILE_PID"
+if wait "$LAUNCHER_PID"; then
+    LAUNCHER_PID=
+    LAUNCHER_RC=0
+else
+    LAUNCHER_RC=$?
+    LAUNCHER_PID=
+fi
+if wait "$PROFILE_PID"; then
+    PROFILE_PID=
+else
+    status=$?
+    PROFILE_PID=
+    echo "fork-scope profiler failed: $status"
+    exit "$status"
+fi
 tail -n 15 "$WORK/profile.log"
 test "$LAUNCHER_RC" -eq 0 || { echo "fork-harness (parent+children) failed, rc=$LAUNCHER_RC"; exit 1; }
 
@@ -133,52 +163,52 @@ echo "=== Part 2: measured privileges (host) ==="
 # call ever made by it.
 sleep 30 &
 PRIV_PID=$!
-priv_cleanup() { kill "$PRIV_PID" >/dev/null 2>&1 || true; cleanup; }
-trap priv_cleanup EXIT
 
 echo "--- unprivileged ---"
 set +e
-UNPRIV_OUT=$(./target/release/p11scope profile --manifest "$WORK/manifest.json" \
-    --pid "$PRIV_PID" --mode metrics --duration 1 2>&1)
+UNPRIV_OUT=$("$TRUST_DIR/p11scope" profile --manifest "$WORK/manifest.json" \
+    --provenance-module "$MODULE" --pid "$PRIV_PID" --mode metrics --duration 1 2>&1)
 UNPRIV_RC=$?
 set -e
 echo "$UNPRIV_OUT"
 echo "exit code: $UNPRIV_RC"
 test "$UNPRIV_RC" -ne 0 || { echo "expected unprivileged attach to fail, it exited 0"; exit 1; }
-echo "$UNPRIV_OUT" | grep -q "Operation not permitted" \
-    || { echo "expected 'Operation not permitted' in unprivileged failure text"; exit 1; }
+echo "$UNPRIV_OUT" | grep -q "required read lease" \
+    || { echo "expected the root-owned provider lease to fail without CAP_LEASE"; exit 1; }
 
-echo "--- CAP_BPF + CAP_PERFMON only (no CAP_SYS_ADMIN) ---"
+echo "--- CAP_BPF + CAP_PERFMON + CAP_LEASE (no CAP_SYS_ADMIN) ---"
 set +e
-CAPS_OUT=$(sudo capsh --caps="cap_bpf,cap_perfmon+eip cap_setpcap,cap_setuid,cap_setgid+ep" \
-    --keep=1 --user="$(whoami)" --addamb=cap_bpf --addamb=cap_perfmon \
-    -- -c "./target/release/p11scope profile --manifest '$WORK/manifest.json' --pid $PRIV_PID --mode metrics --duration 1 -o '$WORK/priv-bpf-perfmon.json'" 2>&1)
+CAPS_OUT=$(sudo capsh --caps="cap_bpf,cap_perfmon,cap_lease+eip cap_setpcap,cap_setuid,cap_setgid+ep" \
+    --keep=1 --user="$(whoami)" --addamb=cap_bpf --addamb=cap_perfmon --addamb=cap_lease \
+    -- -c "'$TRUST_DIR/p11scope' profile --manifest '$WORK/manifest.json' --provenance-module '$MODULE' --pid $PRIV_PID --mode metrics --duration 1 -o '$WORK/priv-bpf-perfmon.json'" 2>&1)
 set -e
 echo "$CAPS_OUT" | tail -5
 ATTACHED=$(python3 -c "import json;print(json.load(open('$WORK/priv-bpf-perfmon.json'))['evidence']['attached_probes'])")
-echo "attached_probes with CAP_BPF+CAP_PERFMON only: $ATTACHED"
+echo "attached_probes with CAP_BPF+CAP_PERFMON+CAP_LEASE: $ATTACHED"
 # Measured, not assumed: on this kernel kernel.perf_event_paranoid=4 is an
 # Ubuntu hardening level that blocks perf_event_open() for uprobes even
-# with CAP_PERFMON, unlike the upstream-documented behavior -- only
-# CAP_SYS_ADMIN (or full root) gets through. See docs/notes/phase4-privileges.md.
-test "$ATTACHED" -eq 0 || { echo "expected 0 attached probes with CAP_BPF+CAP_PERFMON alone on this kernel, got $ATTACHED"; exit 1; }
+# with CAP_PERFMON, unlike the upstream-documented behavior. CAP_SYS_ADMIN
+# is still required for attach; CAP_LEASE is carried separately for the
+# root-owned provider. See docs/notes/phase4-privileges.md.
+test "$ATTACHED" -eq 0 || { echo "expected 0 attached probes without CAP_SYS_ADMIN on this kernel, got $ATTACHED"; exit 1; }
 
-echo "--- CAP_SYS_ADMIN alone ---"
-sudo capsh --caps="cap_sys_admin+eip cap_setpcap,cap_setuid,cap_setgid+ep" \
-    --keep=1 --user="$(whoami)" --addamb=cap_sys_admin \
-    -- -c "./target/release/p11scope profile --manifest '$WORK/manifest.json' --pid $PRIV_PID --mode metrics --duration 1 -o '$WORK/priv-sysadmin.json'" \
+echo "--- CAP_SYS_ADMIN + CAP_LEASE ---"
+sudo capsh --caps="cap_sys_admin,cap_lease+eip cap_setpcap,cap_setuid,cap_setgid+ep" \
+    --keep=1 --user="$(whoami)" --addamb=cap_sys_admin --addamb=cap_lease \
+    -- -c "'$TRUST_DIR/p11scope' profile --manifest '$WORK/manifest.json' --provenance-module '$MODULE' --pid $PRIV_PID --mode metrics --duration 1 -o '$WORK/priv-sysadmin.json'" \
     > "$WORK/priv-sysadmin.log" 2>&1
 tail -5 "$WORK/priv-sysadmin.log"
 ATTACHED2=$(python3 -c "import json;print(json.load(open('$WORK/priv-sysadmin.json'))['evidence']['attached_probes'])")
 COMPLETE2=$(python3 -c "import json;print(json.load(open('$WORK/priv-sysadmin.json'))['evidence']['completeness'])")
-echo "attached_probes with CAP_SYS_ADMIN alone: $ATTACHED2 ($COMPLETE2)"
-test "$ATTACHED2" -eq 136 || { echo "expected 136 attached probes with CAP_SYS_ADMIN alone, got $ATTACHED2"; exit 1; }
-test "$COMPLETE2" = "COMPLETE" || { echo "expected COMPLETE with CAP_SYS_ADMIN alone, got $COMPLETE2"; exit 1; }
+echo "attached_probes with CAP_SYS_ADMIN+CAP_LEASE: $ATTACHED2 ($COMPLETE2)"
+test "$ATTACHED2" -eq 136 || { echo "expected 136 attached probes with CAP_SYS_ADMIN+CAP_LEASE, got $ATTACHED2"; exit 1; }
+test "$COMPLETE2" = "COMPLETE" || { echo "expected COMPLETE with CAP_SYS_ADMIN+CAP_LEASE, got $COMPLETE2"; exit 1; }
 
 kill "$PRIV_PID" >/dev/null 2>&1 || true
 wait "$PRIV_PID" 2>/dev/null || true
+PRIV_PID=
 
 echo "=== fork-scope + privileges: ALL OK ==="
-echo "measured minimum on host (--pid, same-uid target): CAP_SYS_ADMIN alone."
+echo "expected hardened minimum on host for a root-owned provider: CAP_SYS_ADMIN+CAP_LEASE."
 echo "docker/kind measurements (different code path -- /proc/<pid>/root of a"
 echo "different-uid process): see docs/notes/phase4-privileges.md."

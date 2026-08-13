@@ -6,8 +6,10 @@
 
 use crate::plan::AttachPlan;
 use p11scope_ebpf_common::{
-    Event, LATENCY_BUCKETS, MECH_NONE, SESSION_NONE, USER_TYPE_NONE, bucket_of, fnkind, shape,
+    Event, FUNCTION_NONE, LATENCY_BUCKETS, MECH_NONE, SESSION_NONE, USER_TYPE_NONE, bucket_of,
+    capture, direct, event_type, lifecycle, operation, semantic_flags, shape, transition,
 };
+use pkcs11_proxy_ng_types::CkRv;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Aggregate stats for one mechanism id, kept **verbatim** as `u64` —
@@ -43,6 +45,639 @@ pub struct MechStat {
     pub init_no_shape: u64,
 }
 
+#[cfg(test)]
+mod corrective_tests {
+    use super::*;
+    use crate::plan::{AttachPlan, Slot};
+
+    fn plan(names: &[&str]) -> AttachPlan {
+        plan_with_fork(names, false)
+    }
+
+    fn plan_with_fork(names: &[&str], fork_safe: bool) -> AttachPlan {
+        AttachPlan {
+            slots: names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| Slot {
+                    index: index as u32,
+                    object: "/opt/p11.so".into(),
+                    file_offset: index as u64 * 16,
+                    names: vec![(*name).into()],
+                    aliased: false,
+                    semantics: crate::kinds::descriptor(name).unwrap(),
+                    semantic_ambiguous: false,
+                    fork_safe,
+                })
+                .collect(),
+            skipped: vec![],
+            entries_seen: names.len(),
+            surfaces: vec![],
+            vendor_interfaces: 0,
+            interface_list: "absent".into(),
+        }
+    }
+
+    fn event(plan: &AttachPlan, name: &str, session: u64, rv: u64) -> Event {
+        let slot = plan
+            .slots
+            .iter()
+            .find(|slot| slot.names == [name])
+            .unwrap()
+            .index;
+        Event {
+            ts_ns: 100,
+            duration_ns: 10,
+            pid_tgid: 100u64 << 32,
+            session,
+            mechanism: MECH_NONE,
+            rv,
+            slot,
+            capture: capture::MECHANISM_NONE | capture::OUTPUT_NON_NULL,
+            target_function: FUNCTION_NONE,
+            ..Event::default()
+        }
+    }
+
+    fn mechanism(plan: &AttachPlan, name: &str, session: u64, mechanism: u64, rv: u64) -> Event {
+        Event {
+            mechanism,
+            capture: capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL,
+            ..event(plan, name, session, rv)
+        }
+    }
+
+    fn open(plan: &AttachPlan, session: u64, slot_id: u64) -> Event {
+        Event {
+            slot_id,
+            ..event(plan, "C_OpenSession", session, CkRv::OK.0)
+        }
+    }
+
+    #[test]
+    fn concurrent_operations_and_unrelated_calls_never_cross_attribute() {
+        let p = plan(&[
+            "C_SignInit",
+            "C_DigestInit",
+            "C_Sign",
+            "C_DigestUpdate",
+            "C_GenerateRandom",
+        ]);
+        let mut state = State::new(&p);
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x101, 0));
+        state.observe(&mechanism(&p, "C_DigestInit", 7, 0x250, 0));
+        state.observe(&event(&p, "C_GenerateRandom", 7, 0));
+        state.observe(&event(&p, "C_Sign", 7, 0));
+        state.observe(&event(&p, "C_DigestUpdate", 7, 0));
+
+        assert_eq!(state.mechanisms()[&0x101].calls, 2);
+        assert_eq!(state.mechanisms()[&0x250].calls, 2);
+        assert_eq!(state.orphan_ops(), 0);
+        assert!(
+            !state
+                .active_ops
+                .contains_key(&(ProcessKey::from_pid(100), 7, operation::SIGN))
+        );
+        assert!(
+            state
+                .active_ops
+                .contains_key(&(ProcessKey::from_pid(100), 7, operation::DIGEST))
+        );
+    }
+
+    #[test]
+    fn object_search_and_close_all_follow_their_own_lifecycle() {
+        let p = plan(&[
+            "C_OpenSession",
+            "C_SignInit",
+            "C_FindObjectsInit",
+            "C_FindObjectsFinal",
+            "C_SignFinal",
+            "C_CloseAllSessions",
+        ]);
+        let mut state = State::new(&p);
+        state.observe(&open(&p, 10, 1));
+        state.observe(&open(&p, 20, 2));
+        state.observe(&mechanism(&p, "C_SignInit", 10, 0x101, 0));
+        state.observe(&event(&p, "C_FindObjectsInit", 10, 0));
+        state.observe(&event(&p, "C_FindObjectsFinal", 10, 0));
+        state.observe(&event(&p, "C_SignFinal", 10, 0));
+        let mut close_all = event(&p, "C_CloseAllSessions", SESSION_NONE, 0);
+        close_all.slot_id = 1;
+        state.observe(&close_all);
+
+        assert_eq!(state.mechanisms()[&0x101].calls, 2);
+        assert_eq!(state.sessions().closed, 1);
+        assert!(state.session_pseudonym(100, 10).is_none());
+        assert!(state.session_pseudonym(100, 20).is_some());
+    }
+
+    #[test]
+    fn init_null_unreadable_and_failure_rules_are_distinct() {
+        let p = plan(&["C_SignInit", "C_Sign", "C_MessageSignInit"]);
+        let process = ProcessKey::from_pid(100);
+        let mut state = State::new(&p);
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x101, 0));
+        state.observe(&mechanism(
+            &p,
+            "C_SignInit",
+            7,
+            0x102,
+            CkRv::OPERATION_ACTIVE.0,
+        ));
+        assert_eq!(
+            state.active_ops[&(process, 7, operation::SIGN)].mechanism,
+            0x101
+        );
+
+        let null_failed = Event {
+            capture: capture::MECHANISM_NULL,
+            ..event(&p, "C_SignInit", 7, CkRv::ARGUMENTS_BAD.0)
+        };
+        state.observe(&null_failed);
+        assert!(
+            state
+                .active_ops
+                .contains_key(&(process, 7, operation::SIGN))
+        );
+
+        let null_ok = Event {
+            capture: capture::MECHANISM_NULL,
+            ..event(&p, "C_SignInit", 7, 0)
+        };
+        state.observe(&null_ok);
+        assert!(
+            !state
+                .active_ops
+                .contains_key(&(process, 7, operation::SIGN))
+        );
+
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x103, 0));
+        let unreadable = Event {
+            capture: capture::MECHANISM_UNREADABLE,
+            ..event(&p, "C_SignInit", 7, 0)
+        };
+        state.observe(&unreadable);
+        assert!(
+            !state
+                .active_ops
+                .contains_key(&(process, 7, operation::SIGN))
+        );
+
+        let invalid_null = Event {
+            capture: capture::MECHANISM_NULL,
+            ..event(&p, "C_MessageSignInit", 7, 0)
+        };
+        state.observe(&invalid_null);
+        assert_eq!(state.semantic_evidence().semantic_capture_failures, 1);
+    }
+
+    #[test]
+    fn output_and_update_termination_buckets_match_the_standard_contract() {
+        let p = plan(&[
+            "C_VerifyInit",
+            "C_Verify",
+            "C_VerifyRecoverInit",
+            "C_VerifyRecover",
+            "C_EncryptInit",
+            "C_EncryptUpdate",
+            "C_DigestInit",
+            "C_DigestKey",
+            "C_SignInit",
+            "C_SignUpdate",
+            "C_DigestEncryptUpdate",
+        ]);
+        let process = ProcessKey::from_pid(100);
+        let mut state = State::new(&p);
+
+        state.observe(&mechanism(&p, "C_VerifyInit", 7, 1, 0));
+        state.observe(&event(&p, "C_Verify", 7, CkRv::BUFFER_TOO_SMALL.0));
+        assert!(
+            !state
+                .active_ops
+                .contains_key(&(process, 7, operation::VERIFY))
+        );
+
+        state.observe(&mechanism(&p, "C_VerifyRecoverInit", 7, 2, 0));
+        let query = Event {
+            capture: capture::OUTPUT_NULL,
+            ..event(&p, "C_VerifyRecover", 7, 0)
+        };
+        state.observe(&query);
+        assert!(
+            state
+                .active_ops
+                .contains_key(&(process, 7, operation::VERIFY_RECOVER))
+        );
+        state.observe(&event(&p, "C_VerifyRecover", 7, 0));
+        assert!(
+            !state
+                .active_ops
+                .contains_key(&(process, 7, operation::VERIFY_RECOVER))
+        );
+
+        state.observe(&mechanism(&p, "C_EncryptInit", 7, 3, 0));
+        state.observe(&event(&p, "C_EncryptUpdate", 7, CkRv::BUFFER_TOO_SMALL.0));
+        assert!(
+            state
+                .active_ops
+                .contains_key(&(process, 7, operation::ENCRYPT))
+        );
+
+        state.observe(&mechanism(&p, "C_DigestInit", 7, 4, 0));
+        state.observe(&event(&p, "C_DigestKey", 7, CkRv::KEY_HANDLE_INVALID.0));
+        assert!(
+            state
+                .active_ops
+                .contains_key(&(process, 7, operation::DIGEST))
+        );
+
+        state.observe(&mechanism(&p, "C_SignInit", 7, 5, 0));
+        state.observe(&event(&p, "C_SignUpdate", 7, CkRv::DATA_LEN_RANGE.0));
+        assert!(
+            !state
+                .active_ops
+                .contains_key(&(process, 7, operation::SIGN))
+        );
+
+        state.observe(&mechanism(&p, "C_SignInit", 7, 5, 0));
+        state.observe(&event(
+            &p,
+            "C_DigestEncryptUpdate",
+            7,
+            CkRv::GENERAL_ERROR.0,
+        ));
+        assert!(
+            state
+                .active_ops
+                .contains_key(&(process, 7, operation::DIGEST))
+        );
+        assert!(
+            state
+                .active_ops
+                .contains_key(&(process, 7, operation::ENCRYPT))
+        );
+    }
+
+    #[test]
+    fn direct_key_mechanisms_and_keypair_template_roles_are_independent() {
+        let names = [
+            "C_GenerateKey",
+            "C_GenerateKeyPair",
+            "C_WrapKey",
+            "C_UnwrapKey",
+            "C_DeriveKey",
+            "C_EncapsulateKey",
+            "C_DecapsulateKey",
+            "C_WrapKeyAuthenticated",
+            "C_UnwrapKeyAuthenticated",
+        ];
+        let p = plan(&names);
+        let mut state = State::new(&p);
+        for (index, name) in names.iter().enumerate() {
+            let mut ev = mechanism(&p, name, 7, 0x8000_0000 + index as u64, 0);
+            if *name == "C_GenerateKeyPair" {
+                ev.attr_types[0] = 0x104;
+                ev.attr_count = 1;
+                ev.attr_total = 1;
+                ev.attr_types1[0] = 0x108;
+                ev.attr_count1 = 1;
+                ev.attr_total1 = 1;
+            }
+            state.observe(&ev);
+        }
+        assert_eq!(state.mechanisms().len(), names.len());
+        assert!(state.active_ops.is_empty());
+        assert_eq!(state.templates()[&(1, 0)].role, Some("public"));
+        assert_eq!(state.templates()[&(1, 1)].role, Some("private"));
+        assert!(state.templates()[&(1, 0)].attr_types.contains(&0x104));
+        assert!(state.templates()[&(1, 1)].attr_types.contains(&0x108));
+    }
+
+    #[test]
+    fn authentication_cancel_restore_and_reconciliation_are_explicit_evidence() {
+        let p = plan(&[
+            "C_OpenSession",
+            "C_SignInit",
+            "C_Sign",
+            "C_Login",
+            "C_Logout",
+            "C_SessionCancel",
+            "C_SetOperationState",
+        ]);
+        let process = ProcessKey::from_pid(100);
+        let mut state = State::new(&p);
+        state.observe(&open(&p, 7, 3));
+        state.observe(&mechanism(&p, "C_SignInit", 7, 1, 0));
+
+        let mut failed_login = event(&p, "C_Login", 7, CkRv::PIN_INCORRECT.0);
+        failed_login.user_type = 1;
+        state.observe(&failed_login);
+        assert!(state.logins().is_empty());
+        assert!(
+            state
+                .active_ops
+                .contains_key(&(process, 7, operation::SIGN))
+        );
+
+        let mut context_login = event(&p, "C_Login", 7, 0);
+        context_login.user_type = 2;
+        state.observe(&context_login);
+        assert!(
+            state
+                .active_ops
+                .contains_key(&(process, 7, operation::SIGN))
+        );
+
+        let mut cancel = event(&p, "C_SessionCancel", 7, CkRv::OPERATION_CANCEL_FAILED.0);
+        cancel.flags = CKF_SIGN | CKF_DIGEST;
+        state.observe(&cancel);
+        assert!(
+            !state
+                .active_ops
+                .contains_key(&(process, 7, operation::SIGN))
+        );
+        assert_eq!(state.semantic_evidence().session_cancel_ambiguities, 1);
+
+        state.observe(&mechanism(&p, "C_SignInit", 7, 2, 0));
+        state.observe(&event(&p, "C_SetOperationState", 7, 0));
+        assert!(
+            !state
+                .active_ops
+                .contains_key(&(process, 7, operation::SIGN))
+        );
+        assert_eq!(state.semantic_evidence().operation_state_imports, 1);
+
+        state.observe(&mechanism(&p, "C_SignInit", 7, 3, 0));
+        state.observe(&event(&p, "C_Sign", 7, CkRv::OPERATION_NOT_INITIALIZED.0));
+        assert_eq!(state.semantic_evidence().state_reconciliations, 1);
+
+        state.observe(&mechanism(&p, "C_SignInit", 7, 4, 0));
+        let mut login = event(&p, "C_Login", 7, 0);
+        login.user_type = 1;
+        state.observe(&login);
+        assert_eq!(state.logins()[&1], 1);
+        assert_eq!(state.semantic_evidence().auth_state_ambiguities, 1);
+    }
+
+    #[test]
+    fn close_finalize_pid_reuse_and_fork_copy_only_proven_state() {
+        let p = plan_with_fork(
+            &["C_OpenSession", "C_SignInit", "C_Sign", "C_Finalize"],
+            true,
+        );
+        let parent = ProcessKey {
+            pid: 100,
+            generation: 1,
+        };
+        let child = ProcessKey {
+            pid: 101,
+            generation: 1,
+        };
+        let reused = ProcessKey {
+            pid: 100,
+            generation: 2,
+        };
+        let mut state = State::new(&p);
+        state.observe_process(parent, &open(&p, 7, 3));
+        state.observe_process(parent, &mechanism(&p, "C_SignInit", 7, 1, 0));
+        state.fork_process(parent, child);
+        state.observe_process(child, &event(&p, "C_Sign", 7, 0));
+        assert_eq!(state.sessions().inherited, 1);
+        assert_eq!(state.mechanisms()[&1].calls, 2);
+
+        state.observe_process(reused, &event(&p, "C_Finalize", SESSION_NONE, 0));
+        assert!(state.session_pseudonym_process(parent, 7).is_none());
+
+        let unsafe_plan = plan_with_fork(&["C_OpenSession", "C_SignInit", "C_Sign"], false);
+        let mut unsafe_state = State::new(&unsafe_plan);
+        unsafe_state.observe_process(parent, &open(&unsafe_plan, 7, 3));
+        unsafe_state.observe_process(parent, &mechanism(&unsafe_plan, "C_SignInit", 7, 1, 0));
+        unsafe_state.fork_process(parent, child);
+        unsafe_state.observe_process(child, &event(&unsafe_plan, "C_Sign", 7, 0));
+        assert_eq!(unsafe_state.semantic_evidence().fork_state_ambiguities, 1);
+    }
+
+    #[test]
+    fn process_retirement_clears_state_without_a_recorded_open() {
+        let p = plan_with_fork(
+            &[
+                "C_OpenSession",
+                "C_CloseSession",
+                "C_SignInit",
+                "C_FindObjectsInit",
+            ],
+            false,
+        );
+        let parent = ProcessKey {
+            pid: 100,
+            generation: 1,
+        };
+        let child = ProcessKey {
+            pid: 101,
+            generation: 1,
+        };
+        let exiting_child = ProcessKey {
+            pid: 102,
+            generation: 1,
+        };
+        let mut state = State::new(&p);
+
+        // A capture can begin after the application opened these sessions.
+        state.observe_process(parent, &mechanism(&p, "C_SignInit", 7, 1, 0));
+        state.observe_process(parent, &event(&p, "C_FindObjectsInit", 8, 0));
+        state.observe_process(parent, &open(&p, 9, 3));
+        state.fork_process(parent, child);
+        state.fork_process(parent, exiting_child);
+        assert!(state.has_process_state(parent));
+        assert!(state.has_process_state(child));
+        assert!(state.has_process_state(exiting_child));
+
+        // Closing an unproven inherited session clears its ambiguity too.
+        state.observe_process(child, &event(&p, "C_CloseSession", 9, 0));
+        assert!(!state.has_process_state(child));
+
+        state.retire_process(parent);
+        state.retire_process(exiting_child);
+        assert!(!state.has_process_state(parent));
+        assert!(!state.has_process_state(exiting_child));
+    }
+
+    #[test]
+    fn async_pending_complete_detach_join_and_open_apply_once() {
+        let p = plan(&[
+            "C_OpenSession",
+            "C_CloseSession",
+            "C_SignInit",
+            "C_SignFinal",
+            "C_AsyncComplete",
+            "C_AsyncGetID",
+            "C_AsyncJoin",
+        ]);
+        let process = ProcessKey::from_pid(100);
+        let mut state = State::new(&p);
+
+        let mut pending_open = open(&p, 7, 3);
+        pending_open.rv = CkRv::PENDING.0;
+        pending_open.capture |= capture::ASYNC_SESSION;
+        state.observe(&pending_open);
+        assert_eq!(state.pending_at_end(), 1);
+        let mut complete_open = event(&p, "C_AsyncComplete", 7, 0);
+        complete_open.target_function = crate::kinds::function_id("C_OpenSession").unwrap();
+        complete_open.async_value = CkRv::OK.0;
+        state.observe(&complete_open);
+        assert_eq!(state.sessions().opened, 1);
+        assert_eq!(state.sessions().async_opened, 1);
+
+        let mut pending_init = mechanism(&p, "C_SignInit", 7, 0x101, CkRv::PENDING.0);
+        pending_init.ts_ns = 200;
+        state.observe(&pending_init);
+        let mut complete_init = event(&p, "C_AsyncComplete", 7, 0);
+        complete_init.target_function = crate::kinds::function_id("C_SignInit").unwrap();
+        // CK_ASYNC_DATA.ulValue is an output size, not the completed CK_RV.
+        complete_init.async_value = CkRv::GENERAL_ERROR.0;
+        complete_init.ts_ns = 300;
+        state.observe(&complete_init);
+        assert!(
+            state
+                .active_ops
+                .contains_key(&(process, 7, operation::SIGN))
+        );
+
+        let mut pending_final = event(&p, "C_SignFinal", 7, CkRv::PENDING.0);
+        pending_final.ts_ns = 400;
+        state.observe(&pending_final);
+        let mut get_id = event(&p, "C_AsyncGetID", 7, 0);
+        get_id.target_function = crate::kinds::function_id("C_SignFinal").unwrap();
+        get_id.async_value = 42;
+        state.observe(&get_id);
+        state.observe(&event(&p, "C_CloseSession", 7, 0));
+
+        state.observe(&open(&p, 8, 3));
+        let mut join = event(&p, "C_AsyncJoin", 8, 0);
+        join.target_function = crate::kinds::function_id("C_SignFinal").unwrap();
+        join.async_value = 42;
+        state.observe(&join);
+        let mut complete_final = event(&p, "C_AsyncComplete", 8, 0);
+        complete_final.target_function = crate::kinds::function_id("C_SignFinal").unwrap();
+        complete_final.async_value = CkRv::OK.0;
+        complete_final.ts_ns = 500;
+        state.observe(&complete_final);
+        assert_eq!(state.pending_at_end(), 0);
+        assert!(
+            !state
+                .active_ops
+                .contains_key(&(process, 8, operation::SIGN))
+        );
+
+        state.observe(&complete_final);
+        assert_eq!(state.semantic_evidence().async_orphans, 1);
+    }
+
+    #[test]
+    fn async_complete_uses_its_return_value_and_consumes_failed_completions() {
+        let p = plan(&["C_SignInit", "C_AsyncComplete"]);
+        let process = ProcessKey::from_pid(100);
+        let mut state = State::new(&p);
+
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x101, CkRv::PENDING.0));
+        let mut complete = event(&p, "C_AsyncComplete", 7, CkRv::GENERAL_ERROR.0);
+        complete.target_function = crate::kinds::function_id("C_SignInit").unwrap();
+        complete.async_value = CkRv::OK.0;
+        state.observe(&complete);
+
+        assert_eq!(state.pending_at_end(), 0);
+        assert!(
+            !state
+                .active_ops
+                .contains_key(&(process, 7, operation::SIGN))
+        );
+        assert_eq!(state.mechanisms()[&0x101].errors, 1);
+    }
+
+    #[test]
+    fn session_cancel_removes_detached_find_init() {
+        let p = plan(&[
+            "C_OpenSession",
+            "C_FindObjectsInit",
+            "C_AsyncGetID",
+            "C_SessionCancel",
+        ]);
+        let mut state = State::new(&p);
+        state.observe(&open(&p, 7, 3));
+        state.observe(&event(&p, "C_FindObjectsInit", 7, CkRv::PENDING.0));
+
+        let mut get_id = event(&p, "C_AsyncGetID", 7, CkRv::OK.0);
+        get_id.target_function = crate::kinds::function_id("C_FindObjectsInit").unwrap();
+        get_id.async_value = 42;
+        state.observe(&get_id);
+        assert_eq!(state.pending_at_end(), 1);
+
+        let mut cancel = event(&p, "C_SessionCancel", 7, CkRv::OK.0);
+        cancel.flags = CKF_FIND_OBJECTS;
+        state.observe(&cancel);
+        assert_eq!(state.pending_at_end(), 0);
+    }
+
+    #[test]
+    fn conclusive_find_objects_error_clears_search_presence() {
+        let p = plan(&["C_FindObjectsInit", "C_FindObjects"]);
+        let process = ProcessKey::from_pid(100);
+        let mut state = State::new(&p);
+        state.observe(&event(&p, "C_FindObjectsInit", 7, CkRv::OK.0));
+        assert!(state.find_active.contains(&(process, 7)));
+
+        state.observe(&event(
+            &p,
+            "C_FindObjects",
+            7,
+            CkRv::OPERATION_NOT_INITIALIZED.0,
+        ));
+        assert!(!state.find_active.contains(&(process, 7)));
+        assert_eq!(state.semantic_evidence().state_reconciliations, 1);
+    }
+
+    #[test]
+    fn hostile_semantic_cardinality_is_bounded_and_reported() {
+        let p = plan(&[
+            "C_OpenSession",
+            "C_SignInit",
+            "C_GenerateKey",
+            "C_Login",
+            "C_FindObjectsInit",
+        ]);
+        let mut state = State::with_limit(&p, 12);
+        for value in 0..100u64 {
+            let mut opened = open(&p, value + 1, value);
+            opened.cgroup_id = value;
+            state.observe(&opened);
+
+            let mut init = mechanism(&p, "C_SignInit", value + 1, value, 0);
+            init.shape = shape::RSA_PKCS_PSS;
+            init.p0 = value;
+            state.observe(&init);
+
+            let mut template = mechanism(&p, "C_GenerateKey", value + 1, value, 0);
+            template.attr_types[0] = value;
+            template.attr_count = 1;
+            template.attr_total = 1;
+            state.observe(&template);
+
+            let mut login = event(&p, "C_Login", value + 1, 0);
+            login.user_type = value as u32;
+            state.observe(&login);
+            state.observe(&event(&p, "C_FindObjectsInit", value + 1, 0));
+        }
+
+        assert!(state.semantic_evidence().semantic_state_drops > 0);
+        assert!(
+            state.retained_dynamic_keys() <= 12,
+            "retained {} keys",
+            state.retained_dynamic_keys()
+        );
+    }
+}
+
 /// Aggregate stats for one template-bearing operation (`C_FindObjectsInit`,
 /// `C_CreateObject`, `C_GenerateKey`, ...), keyed by attach slot — the same
 /// grouping `functions[]` uses, so an aliased slot's calls stay one entry.
@@ -55,8 +690,10 @@ pub struct TemplateStat {
     /// Every distinct function name resolving to this slot.
     pub names: Vec<String>,
     pub aliased: bool,
+    /// `public`/`private` for the two C_GenerateKeyPair templates.
+    pub role: Option<&'static str>,
     /// Union of attribute *types* requested across every observed call.
-    pub attr_types: BTreeSet<u32>,
+    pub attr_types: BTreeSet<u64>,
     /// Bit set (`attr_bool` positions) => this policy-boolean attribute
     /// was observed present-and-true on at least one call.
     pub bools_true: u32,
@@ -78,7 +715,9 @@ pub struct TemplateStat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SessionStats {
     pub opened: u64,
+    pub inherited: u64,
     pub closed: u64,
+    pub async_opened: u64,
     pub peak_concurrent: u64,
 }
 
@@ -116,107 +755,267 @@ pub struct CgroupStat {
     pub mechanisms: BTreeMap<u64, MechCallStat>,
 }
 
-/// Per-slot facts `observe` needs on every event, resolved once from the
-/// `AttachPlan` so the hot path never re-scans it.
-struct SlotMeta {
-    /// Every distinct function name resolving to this slot.
-    names: Vec<String>,
-    /// True for the slot that resolves `C_CloseSession` — the one
-    /// `SESSION_ARG0` call that ends a session rather than operating on
-    /// one.
-    is_close_session: bool,
-    /// True when any name at this slot is a `*Final` call: it still
-    /// attributes latency to the active operation, but also ends it.
-    is_final: bool,
-    /// Operation categories named by this slot's `*Init` function(s), if
-    /// any — empty for slots that are not `INIT_WITH_MECH`.
-    ops: Vec<String>,
-    /// True when >= 2 distinct names share this slot.
-    aliased: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProcessKey {
+    pub pid: u32,
+    pub generation: u64,
 }
 
-/// Maps a `*Init` function name to the operation category it starts.
-/// Anything not recognized (including non-`*Init` names, reached only if
-/// a caller passes one) is dropped rather than guessed.
-fn op_of_init_name(name: &str) -> Option<&'static str> {
-    match name {
-        "C_DigestInit" => Some("digest"),
-        "C_SignInit" => Some("sign"),
-        "C_VerifyInit" => Some("verify"),
-        "C_EncryptInit" => Some("encrypt"),
-        "C_DecryptInit" => Some("decrypt"),
-        "C_SignRecoverInit" => Some("sign_recover"),
-        "C_VerifyRecoverInit" => Some("verify_recover"),
+impl ProcessKey {
+    pub const fn from_pid(pid: u32) -> Self {
+        Self { pid, generation: 0 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SemanticEvidence {
+    pub state_reconciliations: u64,
+    pub session_cancel_ambiguities: u64,
+    pub session_cancel_unknown_flags: u64,
+    pub operation_state_imports: u64,
+    pub auth_state_ambiguities: u64,
+    pub semantic_capture_failures: u64,
+    pub async_target_failures: u64,
+    pub async_orphans: u64,
+    pub async_duplicates: u64,
+    pub async_evictions: u64,
+    pub fork_state_ambiguities: u64,
+    /// New semantic keys refused after the bounded per-capture budget was
+    /// exhausted. Aggregate kernel counts remain authoritative.
+    pub semantic_state_drops: u64,
+}
+
+#[derive(Clone)]
+struct SlotMeta {
+    names: Vec<String>,
+    aliased: bool,
+    semantics: p11scope_ebpf_common::SlotSemantics,
+    function_id: Option<u32>,
+    fork_safe: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SessionInfo {
+    pseudonym: u64,
+    slot: u64,
+    fork_safe: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Binding {
+    mechanism: u64,
+    fork_safe: bool,
+}
+
+#[derive(Clone)]
+struct Pending {
+    event: Event,
+    meta: SlotMeta,
+    started_ns: u64,
+    sequence: u64,
+}
+
+#[derive(Clone)]
+struct Detached {
+    pending: Pending,
+    owner: Option<(ProcessKey, u64)>,
+}
+
+const OPERATIONS: [(u16, &str); 11] = [
+    (operation::DIGEST, "digest"),
+    (operation::SIGN, "sign"),
+    (operation::VERIFY, "verify"),
+    (operation::ENCRYPT, "encrypt"),
+    (operation::DECRYPT, "decrypt"),
+    (operation::SIGN_RECOVER, "sign_recover"),
+    (operation::VERIFY_RECOVER, "verify_recover"),
+    (operation::MESSAGE_ENCRYPT, "message_encrypt"),
+    (operation::MESSAGE_DECRYPT, "message_decrypt"),
+    (operation::MESSAGE_SIGN, "message_sign"),
+    (operation::MESSAGE_VERIFY, "message_verify"),
+];
+
+const CKF_MESSAGE_ENCRYPT: u64 = 0x0000_0002;
+const CKF_MESSAGE_DECRYPT: u64 = 0x0000_0004;
+const CKF_MESSAGE_SIGN: u64 = 0x0000_0008;
+const CKF_MESSAGE_VERIFY: u64 = 0x0000_0010;
+const CKF_FIND_OBJECTS: u64 = 0x0000_0040;
+const CKF_ENCRYPT: u64 = 0x0000_0100;
+const CKF_DECRYPT: u64 = 0x0000_0200;
+const CKF_DIGEST: u64 = 0x0000_0400;
+const CKF_SIGN: u64 = 0x0000_0800;
+const CKF_SIGN_RECOVER: u64 = 0x0000_1000;
+const CKF_VERIFY: u64 = 0x0000_2000;
+const CKF_VERIFY_RECOVER: u64 = 0x0000_4000;
+const CKF_GENERATE: u64 = 0x0000_8000;
+const CKF_GENERATE_KEY_PAIR: u64 = 0x0001_0000;
+const CKF_WRAP: u64 = 0x0002_0000;
+const CKF_UNWRAP: u64 = 0x0004_0000;
+const CKF_DERIVE: u64 = 0x0008_0000;
+const CKF_ENCAPSULATE: u64 = 0x1000_0000;
+const CKF_DECAPSULATE: u64 = 0x2000_0000;
+const KNOWN_CANCEL_FLAGS: u64 = CKF_MESSAGE_ENCRYPT
+    | CKF_MESSAGE_DECRYPT
+    | CKF_MESSAGE_SIGN
+    | CKF_MESSAGE_VERIFY
+    | CKF_FIND_OBJECTS
+    | CKF_ENCRYPT
+    | CKF_DECRYPT
+    | CKF_DIGEST
+    | CKF_SIGN
+    | CKF_SIGN_RECOVER
+    | CKF_VERIFY
+    | CKF_VERIFY_RECOVER
+    | CKF_GENERATE
+    | CKF_GENERATE_KEY_PAIR
+    | CKF_WRAP
+    | CKF_UNWRAP
+    | CKF_DERIVE
+    | CKF_ENCAPSULATE
+    | CKF_DECAPSULATE;
+const MAX_PENDING: usize = 16_384;
+const MAX_STATE_KEYS: usize = 16_384;
+
+fn pid_of(ev: &Event) -> u32 {
+    (ev.pid_tgid >> 32) as u32
+}
+
+fn operation_bits(mask: u16) -> impl Iterator<Item = (u16, &'static str)> {
+    OPERATIONS
+        .into_iter()
+        .filter(move |(bit, _)| mask & bit != 0)
+}
+
+fn direct_name(value: u8) -> Option<&'static str> {
+    match value {
+        direct::GENERATE_KEY => Some("generate_key"),
+        direct::GENERATE_KEY_PAIR => Some("generate_key_pair"),
+        direct::WRAP => Some("wrap"),
+        direct::UNWRAP => Some("unwrap"),
+        direct::DERIVE => Some("derive"),
+        direct::ENCAPSULATE => Some("encapsulate"),
+        direct::DECAPSULATE => Some("decapsulate"),
+        direct::WRAP_AUTHENTICATED => Some("wrap_authenticated"),
+        direct::UNWRAP_AUTHENTICATED => Some("unwrap_authenticated"),
         _ => None,
     }
 }
 
-/// Turns raw `Event`s into pseudonymized, semantic state. Construct once
-/// per capture from the `AttachPlan`, then feed it every completed event.
+fn direct_cancel_flag(value: u8) -> u64 {
+    match value {
+        direct::GENERATE_KEY => CKF_GENERATE,
+        direct::GENERATE_KEY_PAIR => CKF_GENERATE_KEY_PAIR,
+        direct::WRAP | direct::WRAP_AUTHENTICATED => CKF_WRAP,
+        direct::UNWRAP | direct::UNWRAP_AUTHENTICATED => CKF_UNWRAP,
+        direct::DERIVE => CKF_DERIVE,
+        direct::ENCAPSULATE => CKF_ENCAPSULATE,
+        direct::DECAPSULATE => CKF_DECAPSULATE,
+        _ => 0,
+    }
+}
+
+fn cancel_operation_mask(flags: u64) -> u16 {
+    let mut mask = 0;
+    for (flag, operation) in [
+        (CKF_MESSAGE_ENCRYPT, operation::MESSAGE_ENCRYPT),
+        (CKF_MESSAGE_DECRYPT, operation::MESSAGE_DECRYPT),
+        (CKF_MESSAGE_SIGN, operation::MESSAGE_SIGN),
+        (CKF_MESSAGE_VERIFY, operation::MESSAGE_VERIFY),
+        (CKF_ENCRYPT, operation::ENCRYPT),
+        (CKF_DECRYPT, operation::DECRYPT),
+        (CKF_DIGEST, operation::DIGEST),
+        (CKF_SIGN, operation::SIGN),
+        (CKF_SIGN_RECOVER, operation::SIGN_RECOVER),
+        (CKF_VERIFY, operation::VERIFY),
+        (CKF_VERIFY_RECOVER, operation::VERIFY_RECOVER),
+    ] {
+        if flags & flag != 0 {
+            mask |= operation;
+        }
+    }
+    mask
+}
+
+enum MechanismCapture {
+    Absent,
+    Null,
+    Unreadable,
+    Value(u64),
+}
+
+fn mechanism_capture(ev: &Event) -> MechanismCapture {
+    match ev.capture & capture::MECHANISM_MASK {
+        capture::MECHANISM_NULL => MechanismCapture::Null,
+        capture::MECHANISM_UNREADABLE => MechanismCapture::Unreadable,
+        capture::MECHANISM_VALUE => MechanismCapture::Value(ev.mechanism),
+        _ if ev.mechanism != MECH_NONE => MechanismCapture::Value(ev.mechanism),
+        _ => MechanismCapture::Absent,
+    }
+}
+
+/// Pseudonymized semantic state. Raw handles and async ids remain private map keys.
 pub struct State {
     slots: Vec<Option<SlotMeta>>,
-
-    /// pid -> next pseudonym to allocate. Pseudonyms are 1-based and
-    /// allocated in first-seen order, independently per pid.
-    next_pseudonym: BTreeMap<u32, u64>,
-    /// (pid, raw handle) -> pseudonym currently naming that handle. Never
-    /// serialized; exists only so a later event on the same handle
-    /// resolves to the same session identity.
-    pseudonym_of: BTreeMap<(u32, u64), u64>,
-    /// (pid, raw handle) currently open.
-    open: BTreeSet<(u32, u64)>,
-    /// (pid, raw handle) -> mechanism bound by the session's last *Init,
-    /// if any operation is currently active.
-    active_op: BTreeMap<(u32, u64), u64>,
-
+    current_process: BTreeMap<u32, ProcessKey>,
+    next_pseudonym: BTreeMap<ProcessKey, u64>,
+    open: BTreeMap<(ProcessKey, u64), SessionInfo>,
+    active_ops: BTreeMap<(ProcessKey, u64, u16), Binding>,
+    find_active: BTreeSet<(ProcessKey, u64)>,
+    inherited_ambiguous: BTreeSet<(ProcessKey, u64)>,
+    pending: BTreeMap<(ProcessKey, u64, u32), Pending>,
+    detached: BTreeMap<(u64, u32, u64), Detached>,
+    sequence: u64,
     mechanisms: BTreeMap<u64, MechStat>,
-    /// Template-bearing operations, keyed by attach slot.
-    templates: BTreeMap<u32, TemplateStat>,
+    templates: BTreeMap<(u32, u8), TemplateStat>,
     logins: BTreeMap<u32, u64>,
     sessions: SessionStats,
-    /// Per-`cgroup_id` breakdown — see `CgroupStat`.
     cgroups: BTreeMap<u64, CgroupStat>,
     orphan_ops: u64,
     unmatched_closes: u64,
-    /// Mechanism id -> published shape code, exactly what was written into
-    /// the BPF `MECH_SHAPE` map this capture (`shapes::expected_shapes`).
-    /// Empty unless the caller opts in via `set_mech_shapes` — tests that
-    /// don't care about the decode-failure distinction are unaffected.
-    /// This is what lets `shape_decode_failures`/`total_shape_decode_failures`
-    /// tell "no allowlisted shape for this id" apart from "an allowlisted
-    /// shape whose decode never once succeeded" — a distinction the event
-    /// stream alone cannot make.
+    evidence: SemanticEvidence,
     mech_shapes: BTreeMap<u64, u32>,
-}
-
-fn pid_of(ev: &Event) -> u32 {
-    // bpf_get_current_pid_tgid(): tgid (the process id) in the high
-    // 32 bits, thread id in the low 32 — matches PID_FILTER's scoping.
-    (ev.pid_tgid >> 32) as u32
+    state_key_limit: usize,
+    state_keys: usize,
 }
 
 impl State {
     pub fn new(plan: &AttachPlan) -> Self {
-        let mut slots: Vec<Option<SlotMeta>> = Vec::new();
+        Self::with_key_limit(plan, MAX_STATE_KEYS)
+    }
+
+    #[cfg(test)]
+    fn with_limit(plan: &AttachPlan, limit: usize) -> Self {
+        Self::with_key_limit(plan, limit)
+    }
+
+    fn with_key_limit(plan: &AttachPlan, state_key_limit: usize) -> Self {
+        let mut slots = Vec::new();
         for slot in &plan.slots {
-            let idx = slot.index as usize;
-            if idx >= slots.len() {
-                slots.resize_with(idx + 1, || None);
+            let index = slot.index as usize;
+            if index >= slots.len() {
+                slots.resize_with(index + 1, || None);
             }
-            slots[idx] = Some(SlotMeta {
+            slots[index] = Some(SlotMeta {
                 names: slot.names.clone(),
-                is_close_session: slot.names.iter().any(|n| n == "C_CloseSession"),
-                is_final: slot.names.iter().any(|n| n.ends_with("Final")),
-                ops: slot.names.iter().filter_map(|n| op_of_init_name(n)).map(String::from).collect(),
                 aliased: slot.aliased,
+                semantics: slot.semantics,
+                function_id: (slot.names.len() == 1)
+                    .then(|| crate::kinds::function_id(&slot.names[0]))
+                    .flatten(),
+                fork_safe: slot.fork_safe,
             });
         }
         Self {
             slots,
+            current_process: BTreeMap::new(),
             next_pseudonym: BTreeMap::new(),
-            pseudonym_of: BTreeMap::new(),
-            open: BTreeSet::new(),
-            active_op: BTreeMap::new(),
+            open: BTreeMap::new(),
+            active_ops: BTreeMap::new(),
+            find_active: BTreeSet::new(),
+            inherited_ambiguous: BTreeSet::new(),
+            pending: BTreeMap::new(),
+            detached: BTreeMap::new(),
+            sequence: 0,
             mechanisms: BTreeMap::new(),
             templates: BTreeMap::new(),
             logins: BTreeMap::new(),
@@ -224,260 +1023,851 @@ impl State {
             cgroups: BTreeMap::new(),
             orphan_ops: 0,
             unmatched_closes: 0,
+            evidence: SemanticEvidence::default(),
             mech_shapes: BTreeMap::new(),
+            state_key_limit,
+            state_keys: 0,
         }
     }
 
-    /// Records which mechanism ids have a published (allowlisted)
-    /// parameter shape this capture — the same set `shapes::publish`
-    /// wrote into the BPF `MECH_SHAPE` map. Optional: call before
-    /// `observe`-ing (or any time before reading `shape_decode_failures`/
-    /// `total_shape_decode_failures`/rendering `mechanisms[].note`) to
-    /// enable the "total decode failure" distinction; without it, those
-    /// only see the weaker "decoded successfully somewhere" signal.
+    // ponytail: admissions are a monotonic per-capture budget. Replace with
+    // counted eviction only if long captures routinely exhaust 16K keys.
+    fn admit(&mut self, new_keys: usize) -> bool {
+        if new_keys == 0 {
+            return true;
+        }
+        match self.state_keys.checked_add(new_keys) {
+            Some(total) if total <= self.state_key_limit => {
+                self.state_keys = total;
+                true
+            }
+            _ => {
+                self.evidence.semantic_state_drops += 1;
+                false
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn retained_dynamic_keys(&self) -> usize {
+        self.current_process.len()
+            + self.next_pseudonym.len()
+            + self.open.len()
+            + self.active_ops.len()
+            + self.find_active.len()
+            + self.inherited_ambiguous.len()
+            + self.mechanisms.len()
+            + self
+                .mechanisms
+                .values()
+                .map(|stat| stat.param_combos.len())
+                .sum::<usize>()
+            + self.templates.len()
+            + self
+                .templates
+                .values()
+                .map(|stat| stat.attr_types.len())
+                .sum::<usize>()
+            + self.logins.len()
+            + self.cgroups.len()
+            + self
+                .cgroups
+                .values()
+                .map(|stat| stat.mechanisms.len())
+                .sum::<usize>()
+    }
+
     pub fn set_mech_shapes(&mut self, mech_shapes: BTreeMap<u64, u32>) {
         self.mech_shapes = mech_shapes;
     }
 
     pub fn observe(&mut self, ev: &Event) {
-        let pid = pid_of(ev);
-        let meta = self.slots.get(ev.slot as usize).and_then(|s| s.as_ref());
-        // Copy out the bits `observe_*` need up front: holding a `&SlotMeta`
-        // borrowed from `self.slots` across a `&mut self` call doesn't
-        // typecheck, and these are cheap enough to not warrant an index.
-        let is_close_session = meta.map(|m| m.is_close_session).unwrap_or(false);
-        let is_final = meta.map(|m| m.is_final).unwrap_or(false);
+        if ev.event_type == event_type::FORK {
+            self.fork_process(
+                ProcessKey::from_pid(pid_of(ev)),
+                ProcessKey::from_pid(ev.session as u32),
+            );
+            return;
+        }
+        let process = self
+            .current_process
+            .get(&pid_of(ev))
+            .copied()
+            .unwrap_or_else(|| ProcessKey::from_pid(pid_of(ev)));
+        self.observe_process(process, ev);
+    }
 
-        let cg = self.cgroups.entry(ev.cgroup_id).or_default();
-        cg.calls += 1;
-        if ev.rv != 0 {
-            cg.errors += 1;
+    pub fn observe_process(&mut self, process: ProcessKey, ev: &Event) {
+        let previous = self.current_process.get(&process.pid).copied();
+        if previous != Some(process) && self.admit(usize::from(previous.is_none())) {
+            if let Some(old) = previous {
+                self.retire_process(old);
+            }
+            self.current_process.insert(process.pid, process);
+        }
+        let meta = self.slots.get(ev.slot as usize).and_then(Clone::clone);
+        if !self.cgroups.contains_key(&ev.cgroup_id) && self.admit(1) {
+            self.cgroups.insert(ev.cgroup_id, CgroupStat::default());
+        }
+        if let Some(cg) = self.cgroups.get_mut(&ev.cgroup_id) {
+            cg.calls += 1;
+            if ev.rv != CkRv::OK.0 && ev.rv != CkRv::PENDING.0 {
+                cg.errors += 1;
+            }
+        }
+        let Some(meta) = meta else { return };
+
+        if ev.session != SESSION_NONE && self.inherited_ambiguous.remove(&(process, ev.session)) {
+            self.evidence.fork_state_ambiguities += 1;
+        }
+        if matches!(
+            meta.semantics.lifecycle,
+            lifecycle::ASYNC_COMPLETE | lifecycle::ASYNC_GET_ID | lifecycle::ASYNC_JOIN
+        ) {
+            self.observe_async(process, ev);
+            return;
+        }
+        if ev.rv == CkRv::PENDING.0 {
+            self.queue_pending(process, ev, meta);
+            return;
+        }
+        self.apply_completed(process, ev, &meta);
+    }
+
+    fn apply_completed(&mut self, process: ProcessKey, ev: &Event, meta: &SlotMeta) {
+        self.observe_templates(ev, meta);
+        if meta.semantics.transition == transition::INITIALIZE
+            || meta.semantics.direct != direct::NONE
+        {
+            self.record_requested_mechanism(ev, meta);
+        }
+        if meta.semantics.lifecycle == lifecycle::LOGIN
+            && ev.rv == CkRv::OK.0
+            && ev.user_type != USER_TYPE_NONE
+        {
+            if !self.logins.contains_key(&ev.user_type) && self.admit(1) {
+                self.logins.insert(ev.user_type, 0);
+            }
+            if let Some(calls) = self.logins.get_mut(&ev.user_type) {
+                *calls += 1;
+            }
+        }
+        if self.reconcile_conclusive(process, ev, meta) {
+            return;
+        }
+        self.apply_lifecycle(process, ev, meta);
+        if meta.semantics.transition == transition::INITIALIZE {
+            self.apply_init(process, ev, meta);
+        } else if meta.semantics.direct == direct::NONE && meta.semantics.operations != 0 {
+            self.apply_operations(process, ev, meta);
+        }
+    }
+
+    fn record_requested_mechanism(&mut self, ev: &Event, meta: &SlotMeta) {
+        let MechanismCapture::Value(mechanism) = mechanism_capture(ev) else {
+            return;
+        };
+        if !self.mechanisms.contains_key(&mechanism) && self.admit(1) {
+            self.mechanisms.insert(mechanism, MechStat::default());
+        }
+        let Some(stat) = self.mechanisms.get_mut(&mechanism) else {
+            return;
+        };
+        record_call(stat, ev);
+        stat.ops
+            .extend(operation_bits(meta.semantics.operations).map(|(_, name)| name.to_string()));
+        if let Some(name) = direct_name(meta.semantics.direct) {
+            stat.ops.insert(name.to_string());
+        }
+        let combo = (ev.shape, ev.p0, ev.p1, ev.p2);
+        if ev.shape == shape::NONE {
+            stat.init_no_shape += 1;
+        } else if stat.param_combos.contains_key(&combo) {
+            *stat.param_combos.get_mut(&combo).unwrap() += 1;
+        } else {
+            let _ = stat;
+            if self.admit(1) {
+                self.mechanisms
+                    .get_mut(&mechanism)
+                    .unwrap()
+                    .param_combos
+                    .insert(combo, 1);
+            }
+        }
+        self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv);
+    }
+
+    fn apply_init(&mut self, process: ProcessKey, ev: &Event, meta: &SlotMeta) {
+        if ev.rv != CkRv::OK.0 || ev.session == SESSION_NONE {
+            return;
+        }
+        for (operation, _) in operation_bits(meta.semantics.operations) {
+            let key = (process, ev.session, operation);
+            match mechanism_capture(ev) {
+                MechanismCapture::Value(mechanism) => {
+                    if self.active_ops.contains_key(&key) || self.admit(1) {
+                        self.active_ops.insert(
+                            key,
+                            Binding {
+                                mechanism,
+                                fork_safe: meta.fork_safe,
+                            },
+                        );
+                    }
+                }
+                MechanismCapture::Null => {
+                    self.active_ops.remove(&key);
+                    if meta.semantics.semantic_flags & semantic_flags::NULL_MECHANISM_CANCEL == 0 {
+                        self.evidence.semantic_capture_failures += 1;
+                    }
+                }
+                MechanismCapture::Unreadable | MechanismCapture::Absent => {
+                    self.active_ops.remove(&key);
+                }
+            }
+        }
+    }
+
+    fn apply_operations(&mut self, process: ProcessKey, ev: &Event, meta: &SlotMeta) {
+        let mut mechanisms = BTreeSet::new();
+        for (operation, _) in operation_bits(meta.semantics.operations) {
+            match self.active_ops.get(&(process, ev.session, operation)) {
+                Some(binding) => {
+                    mechanisms.insert(binding.mechanism);
+                }
+                None => self.orphan_ops += 1,
+            }
+        }
+        for mechanism in mechanisms {
+            if !self.mechanisms.contains_key(&mechanism) && self.admit(1) {
+                self.mechanisms.insert(mechanism, MechStat::default());
+            }
+            if let Some(stat) = self.mechanisms.get_mut(&mechanism) {
+                record_call(stat, ev);
+            }
+            self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv);
         }
 
-        match ev.kind {
-            fnkind::OPEN_SESSION => self.observe_open_session(pid, ev),
-            fnkind::INIT_WITH_MECH => self.observe_init(pid, ev),
-            fnkind::SESSION_ARG0 => self.observe_session_arg0(pid, ev, is_close_session, is_final),
-            fnkind::LOGIN => self.observe_login(ev),
-            fnkind::TEMPLATE_ARG1 | fnkind::TEMPLATE_ARG2 => self.observe_template(ev),
+        let retain = match meta.semantics.transition {
+            transition::CONTINUE => ev.rv == CkRv::OK.0,
+            transition::UPDATE_WITH_OUTPUT => {
+                ev.rv == CkRv::OK.0 || ev.rv == CkRv::BUFFER_TOO_SMALL.0
+            }
+            transition::FINISH_WITH_OUTPUT => {
+                ev.rv == CkRv::BUFFER_TOO_SMALL.0
+                    || (ev.rv == CkRv::OK.0
+                        && ev.capture & capture::OUTPUT_MASK == capture::OUTPUT_NULL)
+            }
+            transition::FINISH_ALWAYS => false,
+            transition::RETAIN_ALWAYS => true,
+            transition::FINISH_ON_SUCCESS => ev.rv != CkRv::OK.0,
+            _ => true,
+        };
+        if !retain {
+            for (operation, _) in operation_bits(meta.semantics.operations) {
+                self.active_ops.remove(&(process, ev.session, operation));
+            }
+        }
+    }
+
+    fn reconcile_conclusive(&mut self, process: ProcessKey, ev: &Event, meta: &SlotMeta) -> bool {
+        if ev.rv == CkRv::OPERATION_NOT_INITIALIZED.0 {
+            let mut changed = false;
+            for (operation, _) in operation_bits(meta.semantics.operations) {
+                changed |= self
+                    .active_ops
+                    .remove(&(process, ev.session, operation))
+                    .is_some();
+            }
+            if matches!(
+                meta.semantics.lifecycle,
+                lifecycle::FIND_OPERATION | lifecycle::FIND_FINAL
+            ) {
+                changed |= self.find_active.remove(&(process, ev.session));
+            }
+            self.evidence.state_reconciliations += u64::from(changed);
+            return true;
+        }
+        if matches!(ev.rv, 0x0000_00b0 | 0x0000_00b3) {
+            let changed = self.retire_session(process, ev.session);
+            self.evidence.state_reconciliations += u64::from(changed);
+            return true;
+        }
+        if ev.rv == CkRv::CRYPTOKI_NOT_INITIALIZED.0 {
+            let changed = self.retire_process(process) > 0;
+            self.evidence.state_reconciliations += u64::from(changed);
+            return true;
+        }
+        false
+    }
+
+    fn apply_lifecycle(&mut self, process: ProcessKey, ev: &Event, meta: &SlotMeta) {
+        match meta.semantics.lifecycle {
+            lifecycle::OPEN_SESSION if ev.rv == CkRv::OK.0 && ev.session != SESSION_NONE => {
+                if self.retire_session(process, ev.session) {
+                    self.evidence.state_reconciliations += 1;
+                }
+                let async_session = ev.capture & capture::ASYNC_SESSION != 0;
+                self.sessions.opened += 1;
+                self.sessions.async_opened += u64::from(async_session);
+                let counter_new = !self.next_pseudonym.contains_key(&process);
+                if self.admit(1 + usize::from(counter_new)) {
+                    let counter = self.next_pseudonym.entry(process).or_default();
+                    *counter += 1;
+                    self.open.insert(
+                        (process, ev.session),
+                        SessionInfo {
+                            pseudonym: *counter,
+                            slot: ev.slot_id,
+                            fork_safe: meta.fork_safe,
+                        },
+                    );
+                    self.update_peak();
+                }
+            }
+            lifecycle::CLOSE_SESSION if ev.rv == CkRv::OK.0 => {
+                if !self.retire_session(process, ev.session) {
+                    self.unmatched_closes += 1;
+                }
+            }
+            lifecycle::CLOSE_ALL_SESSIONS if ev.rv == CkRv::OK.0 => {
+                let sessions: Vec<u64> = self
+                    .open
+                    .iter()
+                    .filter(|((owner, _), info)| *owner == process && info.slot == ev.slot_id)
+                    .map(|((_, session), _)| *session)
+                    .collect();
+                for session in sessions {
+                    self.retire_session(process, session);
+                }
+            }
+            lifecycle::FINALIZE if ev.rv == CkRv::OK.0 => {
+                self.retire_process(process);
+            }
+            lifecycle::LOGIN => self.apply_auth(process, ev, meta),
+            lifecycle::LOGOUT => self.apply_auth(process, ev, meta),
+            lifecycle::FIND_INIT if ev.rv == CkRv::OK.0 => {
+                let key = (process, ev.session);
+                if self.find_active.contains(&key) || self.admit(1) {
+                    self.find_active.insert(key);
+                }
+            }
+            lifecycle::FIND_FINAL if ev.rv == CkRv::OK.0 => {
+                self.find_active.remove(&(process, ev.session));
+            }
+            lifecycle::SESSION_CANCEL => self.apply_session_cancel(process, ev),
+            lifecycle::SET_OPERATION_STATE if ev.rv == CkRv::OK.0 => {
+                self.clear_operations(process, ev.session, u16::MAX);
+                self.evidence.operation_state_imports += 1;
+            }
             _ => {}
         }
     }
 
-    fn observe_open_session(&mut self, pid: u32, ev: &Event) {
-        if ev.rv != 0 || ev.session == SESSION_NONE {
+    fn apply_auth(&mut self, process: ProcessKey, ev: &Event, meta: &SlotMeta) {
+        let context_specific = meta.names.iter().any(|name| name == "C_Login")
+            && ev.user_type == 2
+            && ev.rv == CkRv::OK.0;
+        if context_specific {
             return;
         }
-        let key = (pid, ev.session);
-        let counter = self.next_pseudonym.entry(pid).or_insert(0);
-        *counter += 1;
-        self.pseudonym_of.insert(key, *counter);
-        // A raw handle can be reused for a new logical session once the
-        // old one closes; drop any stale binding so it can't leak in.
-        self.active_op.remove(&key);
-        self.open.insert(key);
-        self.sessions.opened += 1;
+        if ev.rv != CkRv::OK.0 && ev.rv != CkRv::PIN_LOCKED.0 {
+            return;
+        }
+        let Some(slot) = self.open.get(&(process, ev.session)).map(|info| info.slot) else {
+            return;
+        };
+        let sessions: Vec<u64> = self
+            .open
+            .iter()
+            .filter(|((owner, _), info)| *owner == process && info.slot == slot)
+            .map(|((_, session), _)| *session)
+            .collect();
+        let mut changed = false;
+        for session in sessions {
+            changed |= self.clear_session_state(process, session);
+        }
+        self.evidence.auth_state_ambiguities += u64::from(changed);
+    }
+
+    fn apply_session_cancel(&mut self, process: ProcessKey, ev: &Event) {
+        if ev.flags & !KNOWN_CANCEL_FLAGS != 0 {
+            self.evidence.session_cancel_unknown_flags += 1;
+        }
+        let selected = (ev.flags & KNOWN_CANCEL_FLAGS).count_ones();
+        if ev.rv == CkRv::OPERATION_CANCEL_FAILED.0 && selected > 1 {
+            self.clear_selected(process, ev.session, ev.flags);
+            self.evidence.session_cancel_ambiguities += 1;
+        } else if ev.rv == CkRv::OK.0 {
+            self.clear_selected(process, ev.session, ev.flags);
+        }
+    }
+
+    fn clear_selected(&mut self, process: ProcessKey, session: u64, flags: u64) {
+        self.clear_operations(process, session, cancel_operation_mask(flags));
+        if flags & CKF_FIND_OBJECTS != 0 {
+            self.find_active.remove(&(process, session));
+        }
+        self.pending.retain(|(owner, handle, _), pending| {
+            !(*owner == process
+                && *handle == session
+                && (pending.meta.semantics.operations & cancel_operation_mask(flags) != 0
+                    || direct_cancel_flag(pending.meta.semantics.direct) & flags != 0
+                    || (pending.meta.semantics.lifecycle == lifecycle::FIND_INIT
+                        && flags & CKF_FIND_OBJECTS != 0)))
+        });
+        self.detached.retain(|_, detached| {
+            let selected_owner = detached.owner == Some((process, session));
+            !(selected_owner
+                && (detached.pending.meta.semantics.operations & cancel_operation_mask(flags) != 0
+                    || direct_cancel_flag(detached.pending.meta.semantics.direct) & flags != 0
+                    || (detached.pending.meta.semantics.lifecycle == lifecycle::FIND_INIT
+                        && flags & CKF_FIND_OBJECTS != 0)))
+        });
+    }
+
+    fn observe_async(&mut self, process: ProcessKey, ev: &Event) {
+        if ev.target_function == FUNCTION_NONE {
+            self.evidence.async_target_failures += 1;
+            return;
+        }
+        if ev.capture & capture::ASYNC_VALUE_UNREADABLE != 0 {
+            self.evidence.async_target_failures += 1;
+            return;
+        }
+        let Some(meta) = self.slots.get(ev.slot as usize).and_then(Clone::clone) else {
+            return;
+        };
+        match meta.semantics.lifecycle {
+            lifecycle::ASYNC_COMPLETE => {
+                if ev.rv == CkRv::PENDING.0 {
+                    return;
+                }
+                let key = (process, ev.session, ev.target_function);
+                let pending = self.pending.remove(&key).or_else(|| {
+                    let detached_key = self.detached.iter().find_map(|(key, value)| {
+                        (value.owner == Some((process, ev.session))
+                            && value.pending.meta.function_id == Some(ev.target_function))
+                        .then_some(*key)
+                    });
+                    detached_key.and_then(|key| self.detached.remove(&key).map(|d| d.pending))
+                });
+                let Some(pending) = pending else {
+                    self.evidence.async_orphans += 1;
+                    return;
+                };
+                let mut completed = pending.event;
+                completed.session = ev.session;
+                completed.rv = ev.rv;
+                completed.ts_ns = ev.ts_ns;
+                completed.duration_ns = ev.ts_ns.saturating_sub(pending.started_ns);
+                if completed.rv == CkRv::PENDING.0 {
+                    self.queue_pending(process, &completed, pending.meta);
+                } else {
+                    self.apply_completed(process, &completed, &pending.meta);
+                }
+            }
+            lifecycle::ASYNC_GET_ID if ev.rv == CkRv::OK.0 => {
+                let key = (process, ev.session, ev.target_function);
+                let Some(pending) = self.pending.remove(&key) else {
+                    self.evidence.async_orphans += 1;
+                    return;
+                };
+                let Some(slot) = self.open.get(&(process, ev.session)).map(|info| info.slot) else {
+                    self.evidence.async_target_failures += 1;
+                    return;
+                };
+                if self
+                    .detached
+                    .insert(
+                        (slot, ev.target_function, ev.async_value),
+                        Detached {
+                            pending,
+                            owner: Some((process, ev.session)),
+                        },
+                    )
+                    .is_some()
+                {
+                    self.evidence.async_duplicates += 1;
+                }
+            }
+            lifecycle::ASYNC_JOIN if ev.rv == CkRv::OK.0 => {
+                let Some(slot) = self.open.get(&(process, ev.session)).map(|info| info.slot) else {
+                    self.evidence.async_target_failures += 1;
+                    return;
+                };
+                match self
+                    .detached
+                    .get_mut(&(slot, ev.target_function, ev.async_value))
+                {
+                    Some(detached) => detached.owner = Some((process, ev.session)),
+                    None => self.evidence.async_orphans += 1,
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn queue_pending(&mut self, process: ProcessKey, ev: &Event, meta: SlotMeta) {
+        let Some(function_id) = meta.function_id else {
+            self.evidence.async_target_failures += 1;
+            return;
+        };
+        if meta.semantics.lifecycle == lifecycle::OPEN_SESSION && ev.session == SESSION_NONE {
+            self.evidence.async_target_failures += 1;
+            return;
+        }
+        self.sequence = self.sequence.wrapping_add(1);
+        let key = (process, ev.session, function_id);
+        let pending = Pending {
+            event: *ev,
+            meta,
+            started_ns: ev.ts_ns.saturating_sub(ev.duration_ns),
+            sequence: self.sequence,
+        };
+        if self.pending.insert(key, pending).is_some() {
+            self.evidence.async_duplicates += 1;
+        }
+        self.evict_pending_if_needed();
+    }
+
+    fn evict_pending_if_needed(&mut self) {
+        if self.pending.len() + self.detached.len() <= MAX_PENDING {
+            return;
+        }
+        let pending = self
+            .pending
+            .iter()
+            .min_by_key(|(_, value)| value.sequence)
+            .map(|(k, _)| *k);
+        let detached = self
+            .detached
+            .iter()
+            .min_by_key(|(_, value)| value.pending.sequence)
+            .map(|(k, value)| (*k, value.pending.sequence));
+        match (pending, detached) {
+            (Some(key), Some((detached_key, detached_sequence))) => {
+                if self.pending[&key].sequence <= detached_sequence {
+                    self.pending.remove(&key);
+                } else {
+                    self.detached.remove(&detached_key);
+                }
+            }
+            (Some(key), None) => {
+                self.pending.remove(&key);
+            }
+            (None, Some((key, _))) => {
+                self.detached.remove(&key);
+            }
+            (None, None) => return,
+        }
+        self.evidence.async_evictions += 1;
+    }
+
+    fn observe_templates(&mut self, ev: &Event, meta: &SlotMeta) {
+        if meta.semantics.template0_arg != p11scope_ebpf_common::ARG_NONE {
+            self.record_template(
+                ev.slot,
+                0,
+                if meta.semantics.template1_arg != p11scope_ebpf_common::ARG_NONE {
+                    Some("public")
+                } else {
+                    None
+                },
+                meta,
+                &ev.attr_types,
+                ev.attr_count,
+                ev.attr_total,
+                ev.attr_bools,
+                ev.attr_bools_seen,
+            );
+        }
+        if meta.semantics.template1_arg != p11scope_ebpf_common::ARG_NONE {
+            self.record_template(
+                ev.slot,
+                1,
+                Some("private"),
+                meta,
+                &ev.attr_types1,
+                ev.attr_count1,
+                ev.attr_total1,
+                ev.attr_bools1,
+                ev.attr_bools_seen1,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_template(
+        &mut self,
+        slot: u32,
+        index: u8,
+        role: Option<&'static str>,
+        meta: &SlotMeta,
+        types: &[u64; p11scope_ebpf_common::MAX_ATTRS],
+        count: u32,
+        total: u32,
+        bools: u32,
+        bools_seen: u32,
+    ) {
+        let key = (slot, index);
+        if !self.templates.contains_key(&key) {
+            if !self.admit(1) {
+                return;
+            }
+            self.templates.insert(
+                key,
+                TemplateStat {
+                    names: meta.names.clone(),
+                    aliased: meta.aliased,
+                    role,
+                    ..Default::default()
+                },
+            );
+        }
+        let missing: BTreeSet<u64> = types[..(count as usize).min(types.len())]
+            .iter()
+            .copied()
+            .filter(|attr_type| !self.templates[&key].attr_types.contains(attr_type))
+            .collect();
+        let add_types = missing.is_empty() || self.admit(missing.len());
+        let stat = self.templates.get_mut(&key).unwrap();
+        if add_types {
+            stat.attr_types.extend(missing);
+        }
+        stat.bools_true |= bools & bools_seen;
+        stat.bools_false |= bools_seen & !bools;
+        stat.truncated |= total > count;
+    }
+
+    fn record_cgroup_mechanism(&mut self, cgroup_id: u64, mechanism: u64, rv: u64) {
+        let Some(cgroup) = self.cgroups.get(&cgroup_id) else {
+            return;
+        };
+        let exists = cgroup.mechanisms.contains_key(&mechanism);
+        if !exists && !self.admit(1) {
+            return;
+        }
+        let stat = self
+            .cgroups
+            .get_mut(&cgroup_id)
+            .unwrap()
+            .mechanisms
+            .entry(mechanism)
+            .or_default();
+        stat.calls += 1;
+        if rv != CkRv::OK.0 && rv != CkRv::PENDING.0 {
+            stat.errors += 1;
+        }
+    }
+
+    fn clear_operations(&mut self, process: ProcessKey, session: u64, mask: u16) -> bool {
+        let before = self.active_ops.len();
+        self.active_ops.retain(|(owner, handle, operation), _| {
+            !(*owner == process && *handle == session && mask & *operation != 0)
+        });
+        self.active_ops.len() != before
+    }
+
+    fn clear_session_state(&mut self, process: ProcessKey, session: u64) -> bool {
+        let mut changed = self.clear_operations(process, session, u16::MAX);
+        changed |= self.find_active.remove(&(process, session));
+        changed |= self.inherited_ambiguous.remove(&(process, session));
+        let pending_before = self.pending.len();
+        self.pending
+            .retain(|(owner, handle, _), _| !(*owner == process && *handle == session));
+        changed |= self.pending.len() != pending_before;
+        for detached in self.detached.values_mut() {
+            if detached.owner == Some((process, session)) {
+                detached.owner = None;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn retire_session(&mut self, process: ProcessKey, session: u64) -> bool {
+        let existed = self.open.remove(&(process, session)).is_some();
+        self.clear_session_state(process, session);
+        if existed {
+            self.sessions.closed += 1;
+        }
+        existed
+    }
+
+    pub fn retire_process(&mut self, process: ProcessKey) -> u64 {
+        let had_state = self.has_process_state(process);
+        let sessions: Vec<u64> = self
+            .open
+            .keys()
+            .filter(|(owner, _)| *owner == process)
+            .map(|(_, session)| *session)
+            .collect();
+        for session in &sessions {
+            self.retire_session(process, *session);
+        }
+        self.active_ops.retain(|(owner, _, _), _| *owner != process);
+        self.find_active.retain(|(owner, _)| *owner != process);
+        self.inherited_ambiguous
+            .retain(|(owner, _)| *owner != process);
+        self.pending.retain(|(owner, _, _), _| *owner != process);
+        for detached in self.detached.values_mut() {
+            if detached.owner.is_some_and(|(owner, _)| owner == process) {
+                detached.owner = None;
+            }
+        }
+        self.next_pseudonym.remove(&process);
+        if self.current_process.get(&process.pid) == Some(&process) {
+            self.current_process.remove(&process.pid);
+        }
+        u64::from(had_state)
+    }
+
+    pub fn fork_process(&mut self, parent: ProcessKey, child: ProcessKey) {
+        if !self.current_process.contains_key(&child.pid) && !self.admit(1) {
+            return;
+        }
+        self.current_process.insert(child.pid, child);
+        let sessions: Vec<(u64, SessionInfo)> = self
+            .open
+            .iter()
+            .filter(|((owner, _), _)| *owner == parent)
+            .map(|((_, session), info)| (*session, *info))
+            .collect();
+        for (session, info) in sessions {
+            if !info.fork_safe {
+                let key = (child, session);
+                if self.inherited_ambiguous.contains(&key) || self.admit(1) {
+                    self.inherited_ambiguous.insert(key);
+                }
+                continue;
+            }
+            let open_key = (child, session);
+            let needed = usize::from(!self.next_pseudonym.contains_key(&child))
+                + usize::from(!self.open.contains_key(&open_key));
+            if !self.admit(needed) {
+                continue;
+            }
+            let counter = self.next_pseudonym.entry(child).or_default();
+            *counter += 1;
+            self.open.insert(
+                open_key,
+                SessionInfo {
+                    pseudonym: *counter,
+                    ..info
+                },
+            );
+            self.sessions.inherited += 1;
+            for ((owner, handle, operation), binding) in self.active_ops.clone() {
+                if owner == parent && handle == session {
+                    if binding.fork_safe {
+                        let key = (child, session, operation);
+                        if self.active_ops.contains_key(&key) || self.admit(1) {
+                            self.active_ops.insert(key, binding);
+                        }
+                    } else {
+                        let key = (child, session);
+                        if self.inherited_ambiguous.contains(&key) || self.admit(1) {
+                            self.inherited_ambiguous.insert(key);
+                        }
+                    }
+                }
+            }
+            if self.find_active.contains(&(parent, session)) {
+                let key = (child, session);
+                if self.find_active.contains(&key) || self.admit(1) {
+                    self.find_active.insert(key);
+                }
+            }
+        }
+        self.update_peak();
+    }
+
+    fn update_peak(&mut self) {
         self.sessions.peak_concurrent = self.sessions.peak_concurrent.max(self.open.len() as u64);
     }
 
-    fn observe_init(&mut self, pid: u32, ev: &Event) {
-        // A new *Init always clears whatever was bound before, whether or
-        // not it names a mechanism. Without this, an Init whose pMechanism
-        // read failed (MECH_NONE — null pointer, unfaulted page, an
-        // anticipated capture-failure mode, not hypothetical) would leave
-        // the *previous* mechanism bound, and the next operational call
-        // would be silently attributed to it instead of surfacing as an
-        // orphan — the capture would look more complete than it was.
-        if ev.session != SESSION_NONE {
-            self.active_op.remove(&(pid, ev.session));
-        }
-        if ev.mechanism == MECH_NONE {
-            return;
-        }
-        let ops = self.slots.get(ev.slot as usize).and_then(|s| s.as_ref()).map(|m| m.ops.clone());
-        let stat = self.mechanisms.entry(ev.mechanism).or_default();
-        record_call(stat, ev);
-        if let Some(ops) = ops {
-            stat.ops.extend(ops);
-        }
-        // Decoded parameters are requested-values evidence, same as the
-        // mechanism id itself: recorded regardless of `rv`. Only a
-        // successful decode (`shape != NONE`) adds a combo; everything
-        // else is counted as a no-decode `*Init`, which only becomes
-        // interesting evidence (`State::shape_decode_failures`) once this
-        // mechanism id has decoded successfully at least once elsewhere.
-        if ev.shape != shape::NONE {
-            *stat.param_combos.entry((ev.shape, ev.p0, ev.p1, ev.p2)).or_insert(0) += 1;
-        } else {
-            stat.init_no_shape += 1;
-        }
-        self.record_cgroup_mechanism(ev.cgroup_id, ev.mechanism, ev.rv);
-        // The application genuinely requested this mechanism, so it is
-        // recorded above regardless of outcome — but a failed Init starts
-        // no operation, so only a successful one binds the session.
-        if ev.rv == 0 && ev.session != SESSION_NONE {
-            self.active_op.insert((pid, ev.session), ev.mechanism);
-        }
-    }
-
-    fn observe_session_arg0(&mut self, pid: u32, ev: &Event, is_close: bool, is_final: bool) {
-        let key = (pid, ev.session);
-        if is_close {
-            if ev.rv != 0 {
-                return;
-            }
-            if self.open.remove(&key) {
-                self.sessions.closed += 1;
-            } else {
-                self.unmatched_closes += 1;
-            }
-            self.pseudonym_of.remove(&key);
-            self.active_op.remove(&key);
-            return;
-        }
-        // Operational call: attribute to the session's active mechanism,
-        // or count as an orphan — evidence capture started mid-operation.
-        match self.active_op.get(&key).copied() {
-            Some(mech) => {
-                record_call(self.mechanisms.entry(mech).or_default(), ev);
-                self.record_cgroup_mechanism(ev.cgroup_id, mech, ev.rv);
-                if is_final {
-                    self.active_op.remove(&key);
-                }
-            }
-            None => self.orphan_ops += 1,
-        }
-    }
-
-    /// Attributes one call to `mechanism` within `cgroup_id`'s breakdown —
-    /// called from exactly the two sites `record_call` (mechanism-wide) is
-    /// called from, so the two views stay in lockstep by construction.
-    fn record_cgroup_mechanism(&mut self, cgroup_id: u64, mechanism: u64, rv: u64) {
-        let m = self.cgroups.entry(cgroup_id).or_default().mechanisms.entry(mechanism).or_default();
-        m.calls += 1;
-        if rv != 0 {
-            m.errors += 1;
-        }
-    }
-
-    fn observe_login(&mut self, ev: &Event) {
-        if ev.user_type != USER_TYPE_NONE {
-            *self.logins.entry(ev.user_type).or_insert(0) += 1;
-        }
-    }
-
-    /// `C_FindObjectsInit` / `C_CreateObject` / `C_GenerateKey` — templates
-    /// are recorded regardless of `rv`, same rationale as mechanisms: the
-    /// application asked for these attributes, and that is the evidence,
-    /// independent of whether the call succeeded.
-    fn observe_template(&mut self, ev: &Event) {
-        let Some(meta) = self.slots.get(ev.slot as usize).and_then(|s| s.as_ref()) else {
-            return;
-        };
-        let stat = self.templates.entry(ev.slot).or_insert_with(|| TemplateStat {
-            names: meta.names.clone(),
-            aliased: meta.aliased,
-            ..Default::default()
-        });
-        let count = (ev.attr_count as usize).min(ev.attr_types.len());
-        for &attr_type in &ev.attr_types[..count] {
-            stat.attr_types.insert(attr_type);
-        }
-        stat.bools_true |= ev.attr_bools & ev.attr_bools_seen;
-        stat.bools_false |= ev.attr_bools_seen & !ev.attr_bools;
-        if ev.attr_total > ev.attr_count {
-            stat.truncated = true;
-        }
-    }
-
-    /// The pseudonym currently naming `(pid, raw)` — `sess#N` in `trace`
-    /// output — or `None` if no session with that raw handle is
-    /// currently tracked (not yet opened this capture, or already
-    /// closed). Never exposes the raw handle itself; callers that need a
-    /// session's pseudonym for a call that is *about* to close it
-    /// (`C_CloseSession`) must resolve this before `observe`-ing that
-    /// event, since a successful close removes the mapping.
     pub fn session_pseudonym(&self, pid: u32, raw: u64) -> Option<u64> {
-        self.pseudonym_of.get(&(pid, raw)).copied()
+        let process = self
+            .current_process
+            .get(&pid)
+            .copied()
+            .unwrap_or_else(|| ProcessKey::from_pid(pid));
+        self.session_pseudonym_process(process, raw)
+    }
+
+    pub fn session_pseudonym_process(&self, process: ProcessKey, raw: u64) -> Option<u64> {
+        self.open.get(&(process, raw)).map(|info| info.pseudonym)
     }
 
     pub fn mechanisms(&self) -> &BTreeMap<u64, MechStat> {
         &self.mechanisms
     }
-
-    pub fn templates(&self) -> &BTreeMap<u32, TemplateStat> {
+    pub fn templates(&self) -> &BTreeMap<(u32, u8), TemplateStat> {
         &self.templates
     }
-
     pub fn sessions(&self) -> SessionStats {
         self.sessions
     }
-
     pub fn logins(&self) -> &BTreeMap<u32, u64> {
         &self.logins
     }
-
-    /// Per-`cgroup_id` breakdown — see `CgroupStat`.
     pub fn cgroups(&self) -> &BTreeMap<u64, CgroupStat> {
         &self.cgroups
     }
-
     pub fn orphan_ops(&self) -> u64 {
         self.orphan_ops
     }
-
     pub fn unmatched_closes(&self) -> u64 {
         self.unmatched_closes
     }
-
-    /// True when any template-bearing operation observed `attr_total >
-    /// attr_count` in this capture — either a template longer than the
-    /// per-event cap, or the in-kernel walk stopping early on a read
-    /// failure (see `TemplateStat::truncated`); both are lost evidence.
-    /// Feeds `evidence.templates_truncated`, a `completeness` gap.
+    pub fn semantic_evidence(&self) -> SemanticEvidence {
+        self.evidence
+    }
+    pub fn pending_at_end(&self) -> u64 {
+        (self.pending.len() + self.detached.len()) as u64
+    }
+    pub fn has_process_state(&self, process: ProcessKey) -> bool {
+        self.open.keys().any(|(owner, _)| *owner == process)
+            || self
+                .active_ops
+                .keys()
+                .any(|(owner, _, _)| *owner == process)
+            || self.find_active.iter().any(|(owner, _)| *owner == process)
+            || self.pending.keys().any(|(owner, _, _)| *owner == process)
+            || self
+                .detached
+                .values()
+                .any(|record| record.owner.is_some_and(|(owner, _)| owner == process))
+            || self
+                .inherited_ambiguous
+                .iter()
+                .any(|(owner, _)| *owner == process)
+    }
+    pub fn pid_has_process_state(&self, pid: u32) -> bool {
+        self.current_process
+            .get(&pid)
+            .is_some_and(|process| self.has_process_state(*process))
+    }
     pub fn templates_truncated(&self) -> bool {
         self.templates.values().any(|t| t.truncated)
     }
-
-    /// Mechanism id -> published shape code, as set by `set_mech_shapes`
-    /// (empty if the caller never called it).
     pub fn mech_shapes(&self) -> &BTreeMap<u64, u32> {
         &self.mech_shapes
     }
 
-    /// `*Init` calls whose parameter decode did not apply, counted for
-    /// every mechanism id that is **known to have an allowlisted shape**
-    /// this capture — either because it decoded successfully at least
-    /// once (`param_combos` non-empty, the signal available even without
-    /// `set_mech_shapes`), or because `set_mech_shapes` says its id has a
-    /// published shape (catching the *total*-failure case too: a
-    /// mechanism whose decode fails on **every** call). Informational:
-    /// does **not** affect `completeness` — an inconsistent (some calls
-    /// decode, some don't) decode may reflect provider-side parameter
-    /// validation, not a capture defect. For the subset that gates
-    /// `completeness`, see `total_shape_decode_failures`.
     pub fn shape_decode_failures(&self) -> u64 {
         self.mechanisms
             .iter()
-            .filter(|(id, m)| !m.param_combos.is_empty() || self.mech_shapes.contains_key(id))
-            .map(|(_, m)| m.init_no_shape)
+            .filter(|(id, stat)| !stat.param_combos.is_empty() || self.mech_shapes.contains_key(id))
+            .map(|(_, stat)| stat.init_no_shape)
             .sum()
     }
 
-    /// Mechanism ids with a **published** shape (`set_mech_shapes`) whose
-    /// decode never once succeeded this capture (`param_combos` empty) —
-    /// the specific "total decode failure" case: wrong offsets, a
-    /// too-short `ulParameterLen`, or an unfaulted `pParameter` page, on
-    /// every single observed call. Unlike `shape_decode_failures`, this
-    /// count of *mechanisms* (not calls) **does** gate `completeness`:
-    /// a total failure is a real decode regression, not ordinary
-    /// provider-side rejection variance. Always `0` if `set_mech_shapes`
-    /// was never called (nothing is "known" to have a shape, so nothing
-    /// can be flagged as a total failure of one).
     pub fn total_shape_decode_failures(&self) -> u64 {
         self.mechanisms
             .iter()
-            .filter(|(id, m)| m.param_combos.is_empty() && self.mech_shapes.contains_key(id))
+            .filter(|(id, stat)| stat.param_combos.is_empty() && self.mech_shapes.contains_key(id))
             .count() as u64
     }
 }
@@ -497,11 +1887,27 @@ mod tests {
     use super::*;
     use crate::plan::Slot;
 
+    mod fnkind {
+        pub const INIT_WITH_MECH: u32 = 1;
+        pub const OPEN_SESSION: u32 = 2;
+        pub const SESSION_ARG0: u32 = 3;
+        pub const LOGIN: u32 = 4;
+        pub const TEMPLATE_ARG1: u32 = 5;
+    }
+
     fn pid_tgid(pid: u32) -> u64 {
         ((pid as u64) << 32) | 0xABCD
     }
 
-    fn ev(pid: u32, slot: u32, kind: u32, session: u64, mechanism: u64, rv: u64, duration_ns: u64) -> Event {
+    fn ev(
+        pid: u32,
+        slot: u32,
+        _kind: u32,
+        session: u64,
+        mechanism: u64,
+        rv: u64,
+        duration_ns: u64,
+    ) -> Event {
         Event {
             ts_ns: 0,
             duration_ns,
@@ -514,7 +1920,6 @@ mod tests {
             p1: 0,
             p2: 0,
             slot,
-            kind,
             user_type: USER_TYPE_NONE,
             shape: 0,
             attr_types: [0; 8],
@@ -522,6 +1927,7 @@ mod tests {
             attr_total: 0,
             attr_bools: 0,
             attr_bools_seen: 0,
+            ..Event::default()
         }
     }
 
@@ -538,7 +1944,6 @@ mod tests {
             p1: 0,
             p2: 0,
             slot: 5,
-            kind: fnkind::LOGIN,
             user_type,
             shape: 0,
             attr_types: [0; 8],
@@ -546,17 +1951,23 @@ mod tests {
             attr_total: 0,
             attr_bools: 0,
             attr_bools_seen: 0,
+            ..Event::default()
         }
     }
 
-    fn slot(index: u32, names: &[&str], kind: u32) -> Slot {
+    fn slot(index: u32, names: &[&str], _kind: u32) -> Slot {
+        let names = names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let aliased = names.len() >= 2;
+        let (semantics, semantic_ambiguous) = crate::kinds::descriptor_slot(&names);
         Slot {
             index,
             object: "/opt/p11.so".into(),
             file_offset: index as u64 * 0x10,
-            names: names.iter().map(|s| s.to_string()).collect(),
-            aliased: names.len() >= 2,
-            kind,
+            names,
+            aliased,
+            semantics,
+            semantic_ambiguous,
+            fork_safe: false,
         }
     }
 
@@ -605,7 +2016,6 @@ mod tests {
             p1,
             p2,
             slot: 2,
-            kind: fnkind::INIT_WITH_MECH,
             user_type: USER_TYPE_NONE,
             shape: shape_code,
             attr_types: [0; 8],
@@ -613,18 +2023,19 @@ mod tests {
             attr_total: 0,
             attr_bools: 0,
             attr_bools_seen: 0,
+            ..Event::default()
         }
     }
 
     /// A `C_FindObjectsInit`-shaped template event on slot 6.
     fn ev_template(
         pid: u32,
-        attr_types: &[u32],
+        attr_types: &[u64],
         attr_total: u32,
         attr_bools: u32,
         attr_bools_seen: u32,
     ) -> Event {
-        let mut types = [0u32; 8];
+        let mut types = [0u64; 8];
         for (i, &t) in attr_types.iter().enumerate() {
             types[i] = t;
         }
@@ -640,7 +2051,6 @@ mod tests {
             p1: 0,
             p2: 0,
             slot: 6,
-            kind: fnkind::TEMPLATE_ARG1,
             user_type: USER_TYPE_NONE,
             shape: 0,
             attr_types: types,
@@ -648,6 +2058,7 @@ mod tests {
             attr_total,
             attr_bools,
             attr_bools_seen,
+            ..Event::default()
         }
     }
 
@@ -671,7 +2082,11 @@ mod tests {
         s.observe(&ev(100, 1, fnkind::SESSION_ARG0, 99, MECH_NONE, 0, 5)); // close, never opened
 
         assert_eq!(s.unmatched_closes(), 1);
-        assert_eq!(s.sessions().closed, 0, "an unmatched close must not inflate the balance");
+        assert_eq!(
+            s.sessions().closed,
+            0,
+            "an unmatched close must not inflate the balance"
+        );
     }
 
     #[test]
@@ -695,7 +2110,10 @@ mod tests {
         s.observe(&ev(100, 3, fnkind::SESSION_ARG0, 10, MECH_NONE, 0, 200)); // C_Sign, no prior Init
 
         assert_eq!(s.orphan_ops(), 1);
-        assert!(s.mechanisms().is_empty(), "an orphan op names no mechanism — never a guess");
+        assert!(
+            s.mechanisms().is_empty(),
+            "an orphan op names no mechanism — never a guess"
+        );
     }
 
     #[test]
@@ -720,7 +2138,11 @@ mod tests {
         s.observe(&ev(100, 2, fnkind::INIT_WITH_MECH, 10, MECH_NONE, 0, 10));
         s.observe(&ev(100, 3, fnkind::SESSION_ARG0, 10, MECH_NONE, 0, 50)); // C_Sign
 
-        assert_eq!(s.orphan_ops(), 1, "must not inherit the stale 0x250 binding");
+        assert_eq!(
+            s.orphan_ops(),
+            1,
+            "must not inherit the stale 0x250 binding"
+        );
         let m = s.mechanisms().get(&0x250).unwrap();
         assert_eq!(m.calls, 1, "only the first, successful Init is recorded");
     }
@@ -730,15 +2152,25 @@ mod tests {
         let mut s = State::new(&test_plan());
         s.observe(&ev(100, 0, fnkind::OPEN_SESSION, 10, MECH_NONE, 0, 5));
         s.observe(&ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x250, 0, 100)); // C_SignInit succeeds, binds 0x250
-        // A second Init with a different mechanism that fails (rv != 0) must
-        // drop the 0x250 binding, not leave it bound.
+        // This deliberately reverses the old single-binding workaround:
+        // a failed Init leaves the provider's existing operation intact.
         s.observe(&ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x251, 7, 10)); // C_SignInit fails, rv=7
         s.observe(&ev(100, 3, fnkind::SESSION_ARG0, 10, MECH_NONE, 0, 50)); // C_Sign
 
-        assert_eq!(s.orphan_ops(), 1, "a failed Init clears the stale binding");
+        assert_eq!(
+            s.orphan_ops(),
+            0,
+            "a failed Init preserves the active binding"
+        );
         let m250 = s.mechanisms().get(&0x250).unwrap();
-        assert_eq!(m250.calls, 1, "only the first, successful Init is recorded");
-        let m251 = s.mechanisms().get(&0x251).expect("the failed attempt is still evidence");
+        assert_eq!(
+            m250.calls, 2,
+            "the later Sign remains attributed to the active operation"
+        );
+        let m251 = s
+            .mechanisms()
+            .get(&0x251)
+            .expect("the failed attempt is still evidence");
         assert_eq!(m251.calls, 1);
         assert_eq!(m251.errors, 1);
     }
@@ -750,7 +2182,7 @@ mod tests {
         s.observe(&ev(100, 2, fnkind::INIT_WITH_MECH, 10, vendor_id, 0, 100));
 
         assert!(s.mechanisms().contains_key(&vendor_id));
-        assert_eq!(format!("{:#x}", vendor_id), "0x80001042");
+        assert_eq!(format!("{vendor_id:#x}"), "0x80001042");
     }
 
     #[test]
@@ -763,8 +2195,8 @@ mod tests {
         assert_eq!(s.sessions().opened, 2);
         assert_eq!(s.sessions().peak_concurrent, 2);
         // Each pid gets its own first-seen numbering, independently.
-        assert_eq!(s.pseudonym_of.get(&(100, 5)), Some(&1));
-        assert_eq!(s.pseudonym_of.get(&(200, 5)), Some(&1));
+        assert_eq!(s.session_pseudonym(100, 5), Some(1));
+        assert_eq!(s.session_pseudonym(200, 5), Some(1));
 
         // Closing pid 100's session must not touch pid 200's.
         s.observe(&ev(100, 1, fnkind::SESSION_ARG0, 5, MECH_NONE, 0, 5));
@@ -778,7 +2210,11 @@ mod tests {
 
         s.observe(&ev(200, 1, fnkind::SESSION_ARG0, 5, MECH_NONE, 0, 5));
         assert_eq!(s.sessions().closed, 2);
-        assert_eq!(s.unmatched_closes(), 1, "pid 200's valid close must not be miscounted");
+        assert_eq!(
+            s.unmatched_closes(),
+            1,
+            "pid 200's valid close must not be miscounted"
+        );
     }
 
     #[test]
@@ -810,16 +2246,43 @@ mod tests {
     fn distinct_param_combos_are_recorded_with_their_own_counts() {
         let mut s = State::new(&test_plan());
         // Same mechanism, same combo, twice.
-        s.observe(&ev_shape(100, 10, 0x0D, 0, shape::RSA_PKCS_PSS, (0x270, 1, 32)));
-        s.observe(&ev_shape(100, 10, 0x0D, 0, shape::RSA_PKCS_PSS, (0x270, 1, 32)));
+        s.observe(&ev_shape(
+            100,
+            10,
+            0x0D,
+            0,
+            shape::RSA_PKCS_PSS,
+            (0x270, 1, 32),
+        ));
+        s.observe(&ev_shape(
+            100,
+            10,
+            0x0D,
+            0,
+            shape::RSA_PKCS_PSS,
+            (0x270, 1, 32),
+        ));
         // Same mechanism, a different salt length: a distinct combo, not an
         // average or a "latest wins" overwrite.
-        s.observe(&ev_shape(100, 10, 0x0D, 0, shape::RSA_PKCS_PSS, (0x270, 1, 64)));
+        s.observe(&ev_shape(
+            100,
+            10,
+            0x0D,
+            0,
+            shape::RSA_PKCS_PSS,
+            (0x270, 1, 64),
+        ));
 
         let m = s.mechanisms().get(&0x0D).unwrap();
         assert_eq!(m.param_combos.len(), 2, "two distinct combos, not merged");
-        assert_eq!(m.param_combos.get(&(shape::RSA_PKCS_PSS, 0x270, 1, 32)), Some(&2));
-        assert_eq!(m.param_combos.get(&(shape::RSA_PKCS_PSS, 0x270, 1, 64)), Some(&1));
+        assert_eq!(
+            m.param_combos.get(&(shape::RSA_PKCS_PSS, 0x270, 1, 32)),
+            Some(&2)
+        );
+        assert_eq!(
+            m.param_combos.get(&(shape::RSA_PKCS_PSS, 0x270, 1, 64)),
+            Some(&1)
+        );
         assert_eq!(m.init_no_shape, 0);
     }
 
@@ -892,16 +2355,38 @@ mod tests {
         ));
         // Call 2: CKA_SIGN (0x108) never appears at all — must stay absent
         // from both true and false, not default to false.
-        s.observe(&ev_template(100, &[0x01], 1, attr_bool::TOKEN, attr_bool::TOKEN));
+        s.observe(&ev_template(
+            100,
+            &[0x01],
+            1,
+            attr_bool::TOKEN,
+            attr_bool::TOKEN,
+        ));
 
-        let t = s.templates().get(&6).expect("slot 6 recorded");
+        let t = s.templates().get(&(6, 0)).expect("slot 6 recorded");
         assert_eq!(t.names, vec!["C_FindObjectsInit".to_string()]);
         assert!(!t.aliased);
         assert_eq!(t.attr_types, BTreeSet::from([0x01, 0x02]));
-        assert_eq!(t.bools_true & attr_bool::TOKEN, attr_bool::TOKEN, "seen and true");
-        assert_eq!(t.bools_false & attr_bool::PRIVATE, attr_bool::PRIVATE, "seen and false");
-        assert_eq!(t.bools_true & attr_bool::SIGN, 0, "never present — not true");
-        assert_eq!(t.bools_false & attr_bool::SIGN, 0, "never present — not false either");
+        assert_eq!(
+            t.bools_true & attr_bool::TOKEN,
+            attr_bool::TOKEN,
+            "seen and true"
+        );
+        assert_eq!(
+            t.bools_false & attr_bool::PRIVATE,
+            attr_bool::PRIVATE,
+            "seen and false"
+        );
+        assert_eq!(
+            t.bools_true & attr_bool::SIGN,
+            0,
+            "never present — not true"
+        );
+        assert_eq!(
+            t.bools_false & attr_bool::SIGN,
+            0,
+            "never present — not false either"
+        );
         assert!(!t.truncated);
     }
 
@@ -915,7 +2400,7 @@ mod tests {
         s.observe(&ev_template(100, &[0x01; 8], 10, 0, 0));
 
         assert!(s.templates_truncated());
-        let t = s.templates().get(&6).unwrap();
+        let t = s.templates().get(&(6, 0)).unwrap();
         assert!(t.truncated);
     }
 
@@ -932,23 +2417,41 @@ mod tests {
         let mut s = State::new(&test_plan());
         // Two containers sharing one node-wide attach: same mechanism,
         // different cgroup ids, must not collapse into one entry.
-        s.observe(&with_cgroup(ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x250, 0, 100), 111)); // C_SignInit, cgroup 111
-        s.observe(&with_cgroup(ev(100, 3, fnkind::SESSION_ARG0, 99, MECH_NONE, 0, 50), 111)); // C_Sign on a different, never-Init'd session -- orphan, no mechanism
-        s.observe(&with_cgroup(ev(200, 2, fnkind::INIT_WITH_MECH, 20, 0x251, 7, 30), 222)); // C_SignInit, cgroup 222, fails
+        s.observe(&with_cgroup(
+            ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x250, 0, 100),
+            111,
+        )); // C_SignInit, cgroup 111
+        s.observe(&with_cgroup(
+            ev(100, 3, fnkind::SESSION_ARG0, 99, MECH_NONE, 0, 50),
+            111,
+        )); // C_Sign on a different, never-Init'd session -- orphan, no mechanism
+        s.observe(&with_cgroup(
+            ev(200, 2, fnkind::INIT_WITH_MECH, 20, 0x251, 7, 30),
+            222,
+        )); // C_SignInit, cgroup 222, fails
 
         assert_eq!(s.cgroups().len(), 2, "two distinct cgroup ids, two entries");
 
         let cg111 = s.cgroups().get(&111).expect("cgroup 111 present");
         assert_eq!(cg111.calls, 2, "both events observed under cgroup 111");
         assert_eq!(cg111.errors, 0);
-        let m111 = cg111.mechanisms.get(&0x250).expect("mechanism 0x250 attributed to cgroup 111");
+        let m111 = cg111
+            .mechanisms
+            .get(&0x250)
+            .expect("mechanism 0x250 attributed to cgroup 111");
         assert_eq!(m111.calls, 1, "only the Init call names a mechanism here");
         assert_eq!(m111.errors, 0);
 
         let cg222 = s.cgroups().get(&222).expect("cgroup 222 present");
         assert_eq!(cg222.calls, 1);
-        assert_eq!(cg222.errors, 1, "the failed Init counts as an error at the cgroup level too");
-        let m222 = cg222.mechanisms.get(&0x251).expect("mechanism 0x251 attributed to cgroup 222");
+        assert_eq!(
+            cg222.errors, 1,
+            "the failed Init counts as an error at the cgroup level too"
+        );
+        let m222 = cg222
+            .mechanisms
+            .get(&0x251)
+            .expect("mechanism 0x251 attributed to cgroup 222");
         assert_eq!(m222.calls, 1);
         assert_eq!(m222.errors, 1);
     }
@@ -956,17 +2459,32 @@ mod tests {
     #[test]
     fn one_shared_cgroup_produces_one_breakdown_entry() {
         let mut s = State::new(&test_plan());
-        s.observe(&with_cgroup(ev(100, 0, fnkind::OPEN_SESSION, 10, MECH_NONE, 0, 5), 111));
-        s.observe(&with_cgroup(ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x250, 0, 100), 111)); // C_SignInit
-        s.observe(&with_cgroup(ev(100, 3, fnkind::SESSION_ARG0, 10, MECH_NONE, 0, 200), 111)); // C_Sign, attributed to 0x250
+        s.observe(&with_cgroup(
+            ev(100, 0, fnkind::OPEN_SESSION, 10, MECH_NONE, 0, 5),
+            111,
+        ));
+        s.observe(&with_cgroup(
+            ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x250, 0, 100),
+            111,
+        )); // C_SignInit
+        s.observe(&with_cgroup(
+            ev(100, 3, fnkind::SESSION_ARG0, 10, MECH_NONE, 0, 200),
+            111,
+        )); // C_Sign, attributed to 0x250
 
         assert_eq!(s.cgroups().len(), 1, "one cgroup id, one entry");
         let cg = s.cgroups().get(&111).unwrap();
-        assert_eq!(cg.calls, 3, "every observed event, not just mechanism-attributed ones");
+        assert_eq!(
+            cg.calls, 3,
+            "every observed event, not just mechanism-attributed ones"
+        );
         assert_eq!(cg.errors, 0);
         assert_eq!(cg.mechanisms.len(), 1);
         let m = cg.mechanisms.get(&0x250).unwrap();
-        assert_eq!(m.calls, 2, "the init call and the following op both attributed");
+        assert_eq!(
+            m.calls, 2,
+            "the init call and the following op both attributed"
+        );
         assert_eq!(m.errors, 0);
     }
 }

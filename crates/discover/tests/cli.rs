@@ -10,10 +10,13 @@ fn manifest_json_on_stdout() {
         eprintln!("SKIP: {SOFTHSM} not present");
         return;
     }
-    let out = Command::new(BIN).args(["--module", SOFTHSM]).output().unwrap();
+    let out = Command::new(BIN)
+        .args(["--module", SOFTHSM])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let m: p11scope_discover::manifest::Manifest = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(m.schema, "p11scope-manifest/1");
+    assert_eq!(m.schema, "p11scope-manifest/3");
     assert_eq!(m.surfaces[0].functions.len(), 68);
 }
 
@@ -25,10 +28,28 @@ fn missing_module_is_usage_error() {
 }
 
 #[test]
-fn undlopenable_module_fails_loudly() {
-    let out = Command::new(BIN).args(["--module", "/dev/null"]).output().unwrap();
+fn relative_module_is_rejected_before_dlopen() {
+    let out = Command::new(BIN)
+        .args(["--module", "provider.so"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--module must be an absolute path"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn non_object_module_is_refused_before_dlopen() {
+    let out = Command::new(BIN)
+        .args(["--module", "/dev/null"])
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot dlopen"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not a regular file"), "{stderr}");
 }
 
 #[test]
@@ -48,7 +69,7 @@ fn o_writes_manifest_file() {
     assert!(Path::new(&outfile).exists());
     let contents = std::fs::read(&outfile).unwrap();
     let m: p11scope_discover::manifest::Manifest = serde_json::from_slice(&contents).unwrap();
-    assert_eq!(m.schema, "p11scope-manifest/1");
+    assert_eq!(m.schema, "p11scope-manifest/3");
 }
 
 #[test]

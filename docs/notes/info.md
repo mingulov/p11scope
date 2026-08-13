@@ -1,5 +1,10 @@
 ﻿# My reassessment: yes, but it should not be merely a “PKCS#11 tracer”
 
+> Historical product exploration, not a current security contract. The
+> authoritative pointer-derived metadata and attach-authorization boundaries
+> are `docs/superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md`
+> and `docs/superpowers/plans/2026-08-13-manifest-provenance.md`.
+
 This is a **strong idea**, and it fits `pkcs11-lab` extremely well. But the valuable product is not:
 
 > “Print every call to `C_Sign` using eBPF.”

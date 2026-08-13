@@ -17,25 +17,26 @@
 //! So: fallback per the brief — shell out to the same nightly command
 //! Task 3 used and copy the artifact into OUT_DIR ourselves.
 //!
-//! Set AYA_BUILD_SKIP=1 to skip (e.g. doc-only builds).
 use std::{env, path::PathBuf, process::Command};
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=AYA_BUILD_SKIP");
-    if matches!(env::var("AYA_BUILD_SKIP").as_deref(), Ok("1") | Ok("true")) {
-        println!("cargo:warning=AYA_BUILD_SKIP set; skipping eBPF build");
-        return;
-    }
     println!("cargo:rerun-if-changed=crates/ebpf/src");
     println!("cargo:rerun-if-changed=crates/ebpf/Cargo.toml");
+    println!("cargo:rerun-if-changed=crates/ebpf/Cargo.lock");
+    println!("cargo:rerun-if-changed=crates/ebpf/rust-toolchain.toml");
     println!("cargo:rerun-if-changed=crates/ebpf-common/src");
+    println!("cargo:rerun-if-changed=crates/ebpf-common/Cargo.toml");
     // Gate G2 induced-gap test (Task 7): forces a tiny RING_BYTES so a high
     // call rate overflows the ring buffer deliberately. Unset (the default)
     // leaves the build byte-for-byte identical to before this flag existed.
     println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_RING");
-    let small_ring = matches!(env::var("P11SCOPE_SMALL_RING").as_deref(), Ok("1") | Ok("true"));
+    let small_ring = matches!(
+        env::var("P11SCOPE_SMALL_RING").as_deref(),
+        Ok("1") | Ok("true")
+    );
 
-    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
+    let manifest_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
 
     let target = match env::var("CARGO_CFG_TARGET_ENDIAN").as_deref() {
@@ -44,10 +45,12 @@ fn main() {
     };
 
     let ebpf_manifest = manifest_dir.join("crates/ebpf/Cargo.toml");
+    let target_dir = out_dir.join("ebpf-target");
     let mut cmd = Command::new("cargo");
     cmd.args([
         "+nightly",
         "build",
+        "--locked",
         "--release",
         "--target",
         target,
@@ -55,7 +58,9 @@ fn main() {
         "build-std=core",
         "--manifest-path",
     ])
-    .arg(&ebpf_manifest);
+    .arg(&ebpf_manifest)
+    .arg("--target-dir")
+    .arg(&target_dir);
     if small_ring {
         cmd.args(["--features", "small-ring"]);
     }
@@ -69,10 +74,7 @@ fn main() {
         .expect("failed to spawn `cargo +nightly build` for crates/ebpf");
     assert!(status.success(), "building crates/ebpf failed: {status}");
 
-    let built = manifest_dir
-        .join("crates/ebpf/target")
-        .join(target)
-        .join("release/p11scope-ebpf");
+    let built = target_dir.join(target).join("release/p11scope-ebpf");
     std::fs::copy(&built, out_dir.join("p11scope-ebpf"))
         .unwrap_or_else(|e| panic!("copying {} to OUT_DIR: {e}", built.display()));
 }

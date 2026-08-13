@@ -2,6 +2,7 @@
 //! everything the manifest could not resolve becomes a Skipped entry so
 //! the capture's evidence section can report it.
 
+use p11scope_ebpf_common::SlotSemantics;
 use p11scope_manifest::manifest::{Acquisition, Manifest, Resolution, SurfaceSource, WalkOutcome};
 use std::collections::BTreeMap;
 
@@ -15,8 +16,12 @@ pub struct Slot {
     /// True when >= 2 distinct names share this target: counts belong to
     /// the group, never to one name.
     pub aliased: bool,
-    /// Semantic function kind: shared kind of all names, or OTHER when they disagree.
-    pub kind: u32,
+    pub semantics: SlotSemantics,
+    /// At least one name was unknown or the aliased names disagreed.
+    pub semantic_ambiguous: bool,
+    /// True only when every surface exposing this exact target is a
+    /// standard interface carrying CKF_INTERFACE_FORK_SAFE.
+    pub fork_safe: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,8 +46,17 @@ pub struct SurfaceSummary {
 fn source_label(s: &SurfaceSource) -> String {
     match s {
         SurfaceSource::LegacyFunctionList => "legacy_function_list".into(),
-        SurfaceSource::Interface { index, name_lossy, .. } => {
-            format!("interface[{index}] {name_lossy}")
+        SurfaceSource::Interface {
+            index,
+            name_lossy,
+            name_error,
+            ..
+        } => {
+            let name = name_lossy
+                .as_deref()
+                .or(name_error.as_deref())
+                .unwrap_or("unnamed");
+            format!("interface[{index}] {name}")
         }
     }
 }
@@ -53,6 +67,7 @@ fn walk_label(w: &WalkOutcome) -> String {
         WalkOutcome::KnownPrefix => "known_prefix".into(),
         WalkOutcome::Refused => "refused".into(),
         WalkOutcome::NotWalked => "not_walked".into(),
+        WalkOutcome::Unreadable { detail } => format!("unreadable: {detail}"),
     }
 }
 
@@ -81,8 +96,21 @@ pub struct AttachPlan {
     pub interface_list: String,
 }
 
+pub fn ensure_capacity(plan: &AttachPlan) -> Result<(), String> {
+    let required = plan.slots.len();
+    let available = p11scope_ebpf_common::MAX_SLOTS as usize;
+    if required > available {
+        Err(format!(
+            "attach plan requires {required} slots but only {available} are available; refusing to attach a prefix"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 pub fn build(m: &Manifest) -> AttachPlan {
     let mut by_target: BTreeMap<(String, u64), Vec<String>> = BTreeMap::new();
+    let mut fork_safe_by_target: BTreeMap<(String, u64), bool> = BTreeMap::new();
     let mut skipped = Vec::new();
     let mut entries_seen = 0usize;
     let mut surfaces = Vec::new();
@@ -97,7 +125,10 @@ pub fn build(m: &Manifest) -> AttachPlan {
         for f in &surface.functions {
             entries_seen += 1;
             match &f.resolution {
-                Resolution::Resolved { object, file_offset } => {
+                Resolution::Resolved {
+                    object,
+                    file_offset,
+                } => {
                     let path = m
                         .objects
                         .iter()
@@ -111,15 +142,33 @@ pub fn build(m: &Manifest) -> AttachPlan {
                         });
                         continue;
                     }
-                    by_target.entry((path, *file_offset)).or_default().push(f.name.clone());
+                    let target = (path, *file_offset);
+                    let surface_fork_safe = matches!(
+                        &surface.source,
+                        SurfaceSource::Interface { flags, .. } if flags & 1 != 0
+                    );
+                    fork_safe_by_target
+                        .entry(target.clone())
+                        .and_modify(|safe| *safe &= surface_fork_safe)
+                        .or_insert(surface_fork_safe);
+                    by_target.entry(target).or_default().push(f.name.clone());
                 }
-                Resolution::NullPointer => skipped
-                    .push(Skipped { name: f.name.clone(), reason: "null pointer".into() }),
-                Resolution::NonFileBacked => skipped
-                    .push(Skipped { name: f.name.clone(), reason: "non-file-backed".into() }),
-                Resolution::Unmapped => {
-                    skipped.push(Skipped { name: f.name.clone(), reason: "unmapped".into() })
-                }
+                Resolution::NullPointer => skipped.push(Skipped {
+                    name: f.name.clone(),
+                    reason: "null pointer".into(),
+                }),
+                Resolution::NonFileBacked => skipped.push(Skipped {
+                    name: f.name.clone(),
+                    reason: "non-file-backed".into(),
+                }),
+                Resolution::Unmapped => skipped.push(Skipped {
+                    name: f.name.clone(),
+                    reason: "unmapped".into(),
+                }),
+                Resolution::UnusableFile { reason, .. } => skipped.push(Skipped {
+                    name: f.name.clone(),
+                    reason: reason.clone(),
+                }),
             }
         }
     }
@@ -130,14 +179,20 @@ pub fn build(m: &Manifest) -> AttachPlan {
         .map(|(i, ((object, file_offset), mut names))| {
             names.sort();
             names.dedup();
-            let kind = crate::kinds::classify_slot(&names);
+            let (semantics, semantic_ambiguous) = crate::kinds::descriptor_slot(&names);
+            let fork_safe = fork_safe_by_target
+                .get(&(object.clone(), file_offset))
+                .copied()
+                .unwrap_or(false);
             Slot {
                 index: i as u32,
                 object,
                 file_offset,
                 aliased: names.len() >= 2,
                 names,
-                kind,
+                semantics,
+                semantic_ambiguous,
+                fork_safe,
             }
         })
         .collect();
@@ -168,6 +223,7 @@ mod tests {
                 identity: ObjectIdentity {
                     kind: IdentityKind::GnuBuildId,
                     value: Some("aa".into()),
+                    sha256: Some("11".repeat(32)),
                     reusable: true,
                     note: None,
                 },
@@ -186,36 +242,87 @@ mod tests {
     }
 
     fn rec(name: &str, r: Resolution) -> FunctionRecord {
-        FunctionRecord { name: name.into(), resolution: r }
+        FunctionRecord {
+            name: name.into(),
+            resolution: r,
+        }
     }
 
     #[test]
     fn one_slot_per_unique_target_and_aliases_flagged() {
         let m = manifest_with(vec![
-            rec("C_Sign", Resolution::Resolved { object: 0, file_offset: 0x10 }),
-            rec("C_Verify", Resolution::Resolved { object: 0, file_offset: 0x20 }),
-            rec("C_OpenSession", Resolution::Resolved { object: 0, file_offset: 0x40 }),
-            rec("C_CancelFunction", Resolution::Resolved { object: 0, file_offset: 0x30 }),
-            rec("C_WaitForSlotEvent", Resolution::Resolved { object: 0, file_offset: 0x30 }),
+            rec(
+                "C_Sign",
+                Resolution::Resolved {
+                    object: 0,
+                    file_offset: 0x10,
+                },
+            ),
+            rec(
+                "C_Verify",
+                Resolution::Resolved {
+                    object: 0,
+                    file_offset: 0x20,
+                },
+            ),
+            rec(
+                "C_OpenSession",
+                Resolution::Resolved {
+                    object: 0,
+                    file_offset: 0x40,
+                },
+            ),
+            rec(
+                "C_CancelFunction",
+                Resolution::Resolved {
+                    object: 0,
+                    file_offset: 0x30,
+                },
+            ),
+            rec(
+                "C_WaitForSlotEvent",
+                Resolution::Resolved {
+                    object: 0,
+                    file_offset: 0x30,
+                },
+            ),
         ]);
         let p = build(&m);
         assert_eq!(p.slots.len(), 4, "aliased pair collapses to one slot");
         assert_eq!(p.entries_seen, 5);
         let aliased: Vec<&Slot> = p.slots.iter().filter(|s| s.aliased).collect();
         assert_eq!(aliased.len(), 1);
-        assert_eq!(aliased[0].names, vec!["C_CancelFunction", "C_WaitForSlotEvent"]);
+        assert_eq!(
+            aliased[0].names,
+            vec!["C_CancelFunction", "C_WaitForSlotEvent"]
+        );
+        assert!(aliased[0].semantic_ambiguous);
+        assert_eq!(aliased[0].semantics, SlotSemantics::COUNT_ONLY);
         // Slot indices are dense and start at zero.
         let idx: Vec<u32> = p.slots.iter().map(|s| s.index).collect();
         assert_eq!(idx, vec![0, 1, 2, 3]);
-        // Assert C_OpenSession slot gets the right kind.
-        let open_session_slot = p.slots.iter().find(|s| s.names == vec!["C_OpenSession"]).unwrap();
-        assert_eq!(open_session_slot.kind, p11scope_ebpf_common::fnkind::OPEN_SESSION);
+        // Assert C_OpenSession slot gets the exact descriptor.
+        let open_session_slot = p
+            .slots
+            .iter()
+            .find(|s| s.names == vec!["C_OpenSession"])
+            .unwrap();
+        assert_eq!(
+            open_session_slot.semantics,
+            crate::kinds::descriptor("C_OpenSession").unwrap()
+        );
     }
 
     #[test]
     fn unresolvable_entries_become_skipped_evidence() {
         let m = manifest_with(vec![
-            rec("C_Sign", Resolution::Resolved { object: 0, file_offset: 0x10 }),
+            rec(
+                "C_Sign",
+                Resolution::Resolved {
+                    object: 0,
+                    file_offset: 0x10,
+                },
+            ),
             rec("C_GetFunctionStatus", Resolution::NullPointer),
             rec("C_Weird", Resolution::NonFileBacked),
             rec("C_Gone", Resolution::Unmapped),
@@ -234,7 +341,10 @@ mod tests {
     fn surface_summaries_are_populated_from_the_manifest() {
         let m = manifest_with(vec![rec(
             "C_Sign",
-            Resolution::Resolved { object: 0, file_offset: 0x10 },
+            Resolution::Resolved {
+                object: 0,
+                file_offset: 0x10,
+            },
         )]);
         let p = build(&m);
         assert_eq!(p.surfaces.len(), 1);
@@ -250,16 +360,25 @@ mod tests {
     fn surface_summaries_carry_gap_provenance() {
         let mut m = manifest_with(vec![rec(
             "C_Sign",
-            Resolution::Resolved { object: 0, file_offset: 0x10 },
+            Resolution::Resolved {
+                object: 0,
+                file_offset: 0x10,
+            },
         )]);
-        m.interface_list = Acquisition::Error { detail: "boom".into() };
+        m.interface_list = Acquisition::Error {
+            detail: "boom".into(),
+        };
         m.surfaces[0].walk = WalkOutcome::KnownPrefix;
-        m.surfaces[0].acquisition = Acquisition::Error { detail: "partial read".into() };
+        m.surfaces[0].acquisition = Acquisition::Error {
+            detail: "partial read".into(),
+        };
         m.vendor_interfaces = vec![VendorInterface {
             index: 1,
             raw_name_hex: None,
             name_lossy: None,
+            name_error: Some("null name pointer".into()),
             version: None,
+            version_error: Some("null function-list pointer".into()),
             flags: 0,
             func_list_null: true,
         }];
@@ -268,5 +387,33 @@ mod tests {
         assert_eq!(p.surfaces[0].acquisition, "error: partial read");
         assert_eq!(p.vendor_interfaces, 1);
         assert_eq!(p.interface_list, "error: boom");
+    }
+
+    #[test]
+    fn known_matrix_fits_and_overflow_is_refused_whole() {
+        let make = |count| AttachPlan {
+            slots: (0..count)
+                .map(|index| Slot {
+                    index: index as u32,
+                    object: "/opt/p11.so".into(),
+                    file_offset: index as u64 * 8,
+                    names: vec!["C_Initialize".into()],
+                    aliased: false,
+                    semantics: SlotSemantics::COUNT_ONLY,
+                    semantic_ambiguous: false,
+                    fork_safe: false,
+                })
+                .collect(),
+            skipped: vec![],
+            entries_seen: count,
+            surfaces: vec![],
+            vendor_interfaces: 0,
+            interface_list: "absent".into(),
+        };
+        assert!(ensure_capacity(&make(424)).is_ok());
+        let error = ensure_capacity(&make(513)).unwrap_err();
+        assert!(error.contains("requires 513"));
+        assert!(error.contains("only 512"));
+        assert!(error.contains("refusing to attach a prefix"));
     }
 }

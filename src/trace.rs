@@ -9,8 +9,9 @@
 
 use crate::plan::AttachPlan;
 use crate::render;
+use crate::semantics::ProcessKey;
 use crate::semantics::State;
-use p11scope_ebpf_common::{Event, MECH_NONE, SESSION_NONE, fnkind, shape};
+use p11scope_ebpf_common::{Event, MECH_NONE, SESSION_NONE, shape};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// `pid_tgid` (`bpf_get_current_pid_tgid()`) -> (pid, tid): tgid (process
@@ -44,14 +45,18 @@ fn function_name(plan: &AttachPlan, slot: u32) -> String {
 /// ever becomes a real ask.
 fn mechanism_name(id: u64) -> Option<&'static str> {
     match id {
-        _ if id == pkcs11_proxy_ng_types::CkMechanismType::RSA_PKCS_PSS.0 => Some("CKM_RSA_PKCS_PSS"),
+        _ if id == pkcs11_proxy_ng_types::CkMechanismType::RSA_PKCS_PSS.0 => {
+            Some("CKM_RSA_PKCS_PSS")
+        }
         _ if id == pkcs11_proxy_ng_types::CkMechanismType::AES_GCM.0 => Some("CKM_AES_GCM"),
         _ => None,
     }
 }
 
 fn mechanism_label(id: u64) -> String {
-    mechanism_name(id).map(str::to_string).unwrap_or_else(|| format!("0x{id:x}"))
+    mechanism_name(id)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("0x{id:x}"))
 }
 
 /// Standard PKCS#11 hash-algorithm mechanism ids that can appear as the
@@ -96,7 +101,12 @@ fn render_mechanism(ev: &Event) -> String {
     };
     let params = match v.get("shape").and_then(|s| s.as_str()) {
         Some("rsa_pkcs_pss") => {
-            format!("hash={} mgf={} salt={}", hash_alg_name(ev.p0), mgf_name(ev.p1), ev.p2)
+            format!(
+                "hash={} mgf={} salt={}",
+                hash_alg_name(ev.p0),
+                mgf_name(ev.p1),
+                ev.p2
+            )
         }
         Some("gcm") => format!("iv_len={} aad_len={} tag_bits={}", ev.p0, ev.p1, ev.p2),
         _ => return label,
@@ -116,7 +126,11 @@ fn fmt_wall_time(wall_ns: u128) -> String {
     let secs_total = (wall_ns / 1_000_000_000) as u64;
     let sub_ns = (wall_ns % 1_000_000_000) as u32;
     let secs_of_day = secs_total % 86_400;
-    let (h, m, s) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
+    let (h, m, s) = (
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+    );
     format!("{h:02}:{m:02}:{s:02}.{:06}", sub_ns / 1_000)
 }
 
@@ -132,11 +146,15 @@ pub fn format_line(ev: &Event, wall_ns: u128, function: &str, session: Option<u6
         line.push_str(&format!(" sess#{n}"));
     }
     line.push_str(&format!(" {function}"));
-    if ev.kind == fnkind::INIT_WITH_MECH && ev.mechanism != MECH_NONE {
+    if ev.mechanism != MECH_NONE {
         line.push(' ');
         line.push_str(&render_mechanism(ev));
     }
-    line.push_str(&format!(" \u{2192} {} {}", rv_name(ev.rv), render::fmt_ns(Some(ev.duration_ns))));
+    line.push_str(&format!(
+        " \u{2192} {} {}",
+        rv_name(ev.rv),
+        render::fmt_ns(Some(ev.duration_ns))
+    ));
     line
 }
 
@@ -146,6 +164,14 @@ pub fn format_line(ev: &Event, wall_ns: u128, function: &str, session: Option<u6
 /// than testing the string for a sentinel.
 pub fn lost_line(n: u64) -> Option<String> {
     (n > 0).then(|| format!("LOST {n} events"))
+}
+
+/// Final machine-readable evidence record for a trace stream.
+pub fn evidence_line(ev: &render::Evidence) -> String {
+    format!(
+        "EVIDENCE {}",
+        serde_json::to_string(ev).expect("Evidence serializes")
+    )
 }
 
 /// Turns completed events into trace lines, tracking the two bits of
@@ -172,8 +198,10 @@ impl<'a> Tracer<'a> {
         match self.anchor {
             Some((mono0, wall0)) => wall0 + u128::from(ts_ns.saturating_sub(mono0)),
             None => {
-                let wall0 =
-                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+                let wall0 = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
                 self.anchor = Some((ts_ns, wall0));
                 wall0
             }
@@ -187,11 +215,23 @@ impl<'a> Tracer<'a> {
     /// the mapping on a successful close, and the closing call's own
     /// line must still show which session closed.
     pub fn on_event(&mut self, ev: &Event, state: &mut State) -> String {
-        let (pid, _tid) = pid_tid(ev.pid_tgid);
-        let pre = (ev.session != SESSION_NONE).then(|| state.session_pseudonym(pid, ev.session)).flatten();
-        state.observe(ev);
+        self.on_event_process(ev, ProcessKey::from_pid(pid_tid(ev.pid_tgid).0), state)
+    }
+
+    pub fn on_event_process(
+        &mut self,
+        ev: &Event,
+        process: ProcessKey,
+        state: &mut State,
+    ) -> String {
+        let pre = (ev.session != SESSION_NONE)
+            .then(|| state.session_pseudonym_process(process, ev.session))
+            .flatten();
+        state.observe_process(process, ev);
         let session = pre.or_else(|| {
-            (ev.session != SESSION_NONE).then(|| state.session_pseudonym(pid, ev.session)).flatten()
+            (ev.session != SESSION_NONE)
+                .then(|| state.session_pseudonym_process(process, ev.session))
+                .flatten()
         });
         let wall_ns = self.wall_ns_for(ev.ts_ns);
         let function = function_name(self.plan, ev.slot);
@@ -217,7 +257,6 @@ mod tests {
             p1: 0,
             p2: 0,
             slot: 0,
-            kind: fnkind::SESSION_ARG0,
             user_type: USER_TYPE_NONE,
             shape: shape::NONE,
             attr_types: [0; 8],
@@ -225,13 +264,13 @@ mod tests {
             attr_total: 0,
             attr_bools: 0,
             attr_bools_seen: 0,
+            ..Event::default()
         }
     }
 
     #[test]
     fn known_event_renders_the_documented_line_shape() {
         let mut ev = base_event();
-        ev.kind = fnkind::INIT_WITH_MECH;
         ev.mechanism = pkcs11_proxy_ng_types::CkMechanismType::RSA_PKCS_PSS.0;
         ev.shape = shape::RSA_PKCS_PSS;
         ev.p0 = 0x0000_0250; // CKM_SHA256
@@ -255,25 +294,29 @@ mod tests {
     #[test]
     fn vendor_mechanism_renders_as_hex() {
         let mut ev = base_event();
-        ev.kind = fnkind::INIT_WITH_MECH;
         ev.mechanism = 0x8000_1042;
         ev.shape = shape::NONE;
 
         let line = format_line(&ev, 0, "C_EncryptInit", None);
         assert!(line.contains("0x80001042"), "line: {line}");
-        assert!(!line.contains("sess#"), "no session pseudonym must appear when none resolved");
+        assert!(
+            !line.contains("sess#"),
+            "no session pseudonym must appear when none resolved"
+        );
     }
 
     #[test]
     fn known_mechanism_id_with_no_decoded_shape_still_renders_by_name_only() {
         let mut ev = base_event();
-        ev.kind = fnkind::INIT_WITH_MECH;
         ev.mechanism = pkcs11_proxy_ng_types::CkMechanismType::AES_GCM.0;
         ev.shape = shape::NONE; // e.g. decode failed this call
 
         let line = format_line(&ev, 0, "C_EncryptInit", None);
         assert!(line.contains("CKM_AES_GCM"), "line: {line}");
-        assert!(!line.contains('('), "no parameters rendered without a decoded shape: {line}");
+        assert!(
+            !line.contains('('),
+            "no parameters rendered without a decoded shape: {line}"
+        );
     }
 
     #[test]
@@ -303,6 +346,56 @@ mod tests {
         assert_eq!(lost_line(42), Some("LOST 42 events".to_string()));
     }
 
+    #[test]
+    fn final_evidence_line_is_machine_readable_and_carries_partial_gaps() {
+        let evidence = render::Evidence {
+            table_entries: 0,
+            slots: 0,
+            attached_probes: 0,
+            attach_failures: vec![],
+            aliased: vec![],
+            skipped: vec![],
+            in_flight_at_end: 0,
+            surfaces: vec![],
+            vendor_interfaces: 0,
+            interface_list: "absent".into(),
+            event_loss: 0,
+            start_insert_failures: 0,
+            unmatched_returns: 0,
+            rv_update_failures: 0,
+            cgroup_scope_failures: 0,
+            semantic_capture_failures: 0,
+            template_tail_failures: 0,
+            process_tracking_fallbacks: 0,
+            process_tracking_failures: 0,
+            process_tracking_evictions: 0,
+            state_reconciliations: 0,
+            session_cancel_ambiguities: 0,
+            session_cancel_unknown_flags: 0,
+            operation_state_imports: 0,
+            auth_state_ambiguities: 0,
+            async_target_failures: 0,
+            async_orphans: 0,
+            async_duplicates: 0,
+            async_evictions: 0,
+            fork_state_ambiguities: 0,
+            semantic_state_drops: 3,
+            pending_at_end: 0,
+            malformed_records: 0,
+            orphan_ops: 0,
+            unmatched_closes: 0,
+            shape_decode_failures: 0,
+            shape_decode_total_failures: 0,
+            templates_truncated: false,
+            completeness: "PARTIAL",
+        };
+        let line = evidence_line(&evidence);
+        let value: serde_json::Value =
+            serde_json::from_str(line.strip_prefix("EVIDENCE ").unwrap()).unwrap();
+        assert_eq!(value["semantic_state_drops"], 3);
+        assert_eq!(value["completeness"], "PARTIAL");
+    }
+
     fn test_plan() -> AttachPlan {
         AttachPlan {
             slots: vec![
@@ -312,7 +405,9 @@ mod tests {
                     file_offset: 0x10,
                     names: vec!["C_OpenSession".into()],
                     aliased: false,
-                    kind: fnkind::OPEN_SESSION,
+                    semantics: crate::kinds::descriptor("C_OpenSession").unwrap(),
+                    semantic_ambiguous: false,
+                    fork_safe: false,
                 },
                 crate::plan::Slot {
                     index: 1,
@@ -320,7 +415,9 @@ mod tests {
                     file_offset: 0x20,
                     names: vec!["C_CloseSession".into()],
                     aliased: false,
-                    kind: fnkind::SESSION_ARG0,
+                    semantics: crate::kinds::descriptor("C_CloseSession").unwrap(),
+                    semantic_ambiguous: false,
+                    fork_safe: false,
                 },
             ],
             skipped: vec![],
@@ -334,7 +431,6 @@ mod tests {
     fn open_event(pid: u32, session: u64) -> Event {
         let mut ev = base_event();
         ev.pid_tgid = (u64::from(pid) << 32) | 1;
-        ev.kind = fnkind::OPEN_SESSION;
         ev.session = session;
         ev.slot = 0;
         ev
@@ -343,7 +439,6 @@ mod tests {
     fn close_event(pid: u32, session: u64) -> Event {
         let mut ev = base_event();
         ev.pid_tgid = (u64::from(pid) << 32) | 1;
-        ev.kind = fnkind::SESSION_ARG0;
         ev.session = session;
         ev.slot = 1;
         ev
@@ -357,13 +452,19 @@ mod tests {
 
         let open_line = tracer.on_event(&open_event(100, 0xDEAD_BEEF), &mut state);
         assert!(open_line.contains("sess#1"), "line: {open_line}");
-        assert!(!open_line.contains("deadbeef"), "raw handle must never appear: {open_line}");
+        assert!(
+            !open_line.contains("deadbeef"),
+            "raw handle must never appear: {open_line}"
+        );
 
         // The closing call must still show the pseudonym, even though
         // `State::observe` retires the mapping as part of processing it.
         let close_line = tracer.on_event(&close_event(100, 0xDEAD_BEEF), &mut state);
         assert!(close_line.contains("sess#1"), "line: {close_line}");
-        assert!(state.session_pseudonym(100, 0xDEAD_BEEF).is_none(), "mapping retired after close");
+        assert!(
+            state.session_pseudonym(100, 0xDEAD_BEEF).is_none(),
+            "mapping retired after close"
+        );
     }
 
     #[test]
@@ -382,6 +483,9 @@ mod tests {
 
         let first_ts = &first_line[..15];
         let second_ts = &second_line[..15];
-        assert_ne!(first_ts, second_ts, "distinct kernel timestamps must render distinct wall times");
+        assert_ne!(
+            first_ts, second_ts,
+            "distinct kernel timestamps must render distinct wall times"
+        );
     }
 }

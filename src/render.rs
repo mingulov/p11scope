@@ -32,6 +32,27 @@ pub struct Evidence {
     /// (`metrics::lost_events`). Zero in `--mode metrics`, which never
     /// drains the ring buffer.
     pub event_loss: u64,
+    pub start_insert_failures: u64,
+    pub unmatched_returns: u64,
+    pub rv_update_failures: u64,
+    pub cgroup_scope_failures: u64,
+    pub semantic_capture_failures: u64,
+    pub template_tail_failures: u64,
+    pub process_tracking_fallbacks: u64,
+    pub process_tracking_failures: u64,
+    pub process_tracking_evictions: u64,
+    pub state_reconciliations: u64,
+    pub session_cancel_ambiguities: u64,
+    pub session_cancel_unknown_flags: u64,
+    pub operation_state_imports: u64,
+    pub auth_state_ambiguities: u64,
+    pub async_target_failures: u64,
+    pub async_orphans: u64,
+    pub async_duplicates: u64,
+    pub async_evictions: u64,
+    pub fork_state_ambiguities: u64,
+    pub semantic_state_drops: u64,
+    pub pending_at_end: u64,
     /// Ring-buffer records rejected by the size check (`events::Drain`).
     /// A nonzero count means the writer/reader layout drifted mid-capture.
     pub malformed_records: u64,
@@ -84,8 +105,11 @@ impl Evidence {
     /// was truncated, and no mechanism's parameter decode failed on every
     /// single observed call.
     pub fn verdict(&mut self) {
-        let surfaces_complete =
-            self.surfaces.iter().all(|s| s.walk == "full" && s.acquisition == "ok");
+        let surfaces_complete = self
+            .surfaces
+            .iter()
+            .all(|s| s.walk == "full" && s.acquisition == "ok");
+        let interface_list_complete = !self.interface_list.starts_with("error:");
         self.completeness = if self.attach_failures.is_empty()
             && self.skipped.is_empty()
             && self.aliased.is_empty()
@@ -93,9 +117,30 @@ impl Evidence {
             && surfaces_complete
             && self.vendor_interfaces == 0
             && self.event_loss == 0
+            && self.start_insert_failures == 0
+            && self.unmatched_returns == 0
+            && self.rv_update_failures == 0
+            && self.cgroup_scope_failures == 0
+            && self.semantic_capture_failures == 0
+            && self.template_tail_failures == 0
+            && self.process_tracking_failures == 0
+            && self.process_tracking_evictions == 0
+            && self.state_reconciliations == 0
+            && self.session_cancel_ambiguities == 0
+            && self.session_cancel_unknown_flags == 0
+            && self.operation_state_imports == 0
+            && self.auth_state_ambiguities == 0
+            && self.async_target_failures == 0
+            && self.async_orphans == 0
+            && self.async_duplicates == 0
+            && self.async_evictions == 0
+            && self.fork_state_ambiguities == 0
+            && self.semantic_state_drops == 0
+            && self.pending_at_end == 0
             && self.malformed_records == 0
             && !self.templates_truncated
             && self.shape_decode_total_failures == 0
+            && interface_list_complete
         {
             "COMPLETE"
         } else {
@@ -105,7 +150,11 @@ impl Evidence {
 }
 
 fn label(r: &SlotReport) -> String {
-    if r.aliased { format!("{} (aliased)", r.names.join("|")) } else { r.names.join("|") }
+    if r.aliased {
+        format!("{} (aliased)", r.names.join("|"))
+    } else {
+        r.names.join("|")
+    }
 }
 
 pub(crate) fn fmt_ns(ns: Option<u64>) -> String {
@@ -120,7 +169,13 @@ pub(crate) fn fmt_ns(ns: Option<u64>) -> String {
 
 /// One refreshing screen. Rows with no activity are omitted; the evidence
 /// line is always present.
-pub fn live(reports: &[SlotReport], ev: &Evidence, elapsed: Duration, module: &str, mode: &str) -> String {
+pub fn live(
+    reports: &[SlotReport],
+    ev: &Evidence,
+    elapsed: Duration,
+    module: &str,
+    mode: &str,
+) -> String {
     let mut s = String::new();
     s.push_str(&format!(
         "p11scope — {module} — up {:02}:{:02}:{:02} — mode {mode}\n",
@@ -132,8 +187,10 @@ pub fn live(reports: &[SlotReport], ev: &Evidence, elapsed: Duration, module: &s
         "{:<28} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
         "FUNCTION", "CALLS", "ERR", "p50~", "p95~", "p99~", "IN-FLIGHT"
     ));
-    let mut rows: Vec<&SlotReport> =
-        reports.iter().filter(|r| r.calls > 0 || r.in_flight > 0).collect();
+    let mut rows: Vec<&SlotReport> = reports
+        .iter()
+        .filter(|r| r.calls > 0 || r.in_flight > 0)
+        .collect();
     rows.sort_by(|a, b| b.calls.cmp(&a.calls).then(a.names.cmp(&b.names)));
     for r in rows {
         s.push_str(&format!(
@@ -148,8 +205,25 @@ pub fn live(reports: &[SlotReport], ev: &Evidence, elapsed: Duration, module: &s
         ));
     }
     s.push_str("(~ = log2-bucket approximation, lower bound)\n");
-    let surface_gaps =
-        ev.surfaces.iter().filter(|s| s.walk != "full" || s.acquisition != "ok").count();
+    let surface_gaps = ev
+        .surfaces
+        .iter()
+        .filter(|s| s.walk != "full" || s.acquisition != "ok")
+        .count();
+    let state_gaps = ev.process_tracking_failures
+        + ev.process_tracking_evictions
+        + ev.state_reconciliations
+        + ev.session_cancel_ambiguities
+        + ev.session_cancel_unknown_flags
+        + ev.operation_state_imports
+        + ev.auth_state_ambiguities
+        + ev.async_target_failures
+        + ev.async_orphans
+        + ev.async_duplicates
+        + ev.async_evictions
+        + ev.fork_state_ambiguities
+        + ev.semantic_state_drops
+        + ev.pending_at_end;
     let mut evidence_line = format!(
         "Evidence: {}/{} probes attached · {} slots · {} aliased · {} skipped · {} in-flight",
         ev.attached_probes,
@@ -162,6 +236,13 @@ pub fn live(reports: &[SlotReport], ev: &Evidence, elapsed: Duration, module: &s
     if surface_gaps > 0
         || ev.vendor_interfaces > 0
         || ev.event_loss > 0
+        || ev.start_insert_failures > 0
+        || ev.unmatched_returns > 0
+        || ev.rv_update_failures > 0
+        || ev.cgroup_scope_failures > 0
+        || ev.semantic_capture_failures > 0
+        || ev.template_tail_failures > 0
+        || state_gaps > 0
         || ev.malformed_records > 0
         || ev.templates_truncated
         || ev.shape_decode_total_failures > 0
@@ -176,6 +257,39 @@ pub fn live(reports: &[SlotReport], ev: &Evidence, elapsed: Duration, module: &s
         if ev.event_loss > 0 {
             evidence_line.push_str(&format!(" {} events lost", ev.event_loss));
         }
+        if ev.start_insert_failures > 0 {
+            evidence_line.push_str(&format!(
+                " {} start inserts failed",
+                ev.start_insert_failures
+            ));
+        }
+        if ev.unmatched_returns > 0 {
+            evidence_line.push_str(&format!(" {} unmatched returns", ev.unmatched_returns));
+        }
+        if ev.rv_update_failures > 0 {
+            evidence_line.push_str(&format!(" {} RV updates failed", ev.rv_update_failures));
+        }
+        if ev.cgroup_scope_failures > 0 {
+            evidence_line.push_str(&format!(
+                " {} cgroup checks failed",
+                ev.cgroup_scope_failures
+            ));
+        }
+        if ev.semantic_capture_failures > 0 {
+            evidence_line.push_str(&format!(
+                " {} semantic captures failed",
+                ev.semantic_capture_failures
+            ));
+        }
+        if ev.template_tail_failures > 0 {
+            evidence_line.push_str(&format!(
+                " {} template tail calls failed",
+                ev.template_tail_failures
+            ));
+        }
+        if state_gaps > 0 {
+            evidence_line.push_str(&format!(" {state_gaps} semantic state gaps"));
+        }
         if ev.malformed_records > 0 {
             evidence_line.push_str(&format!(" {} malformed records", ev.malformed_records));
         }
@@ -189,24 +303,40 @@ pub fn live(reports: &[SlotReport], ev: &Evidence, elapsed: Duration, module: &s
             ));
         }
     }
-    if ev.orphan_ops > 0 || ev.unmatched_closes > 0 || ev.shape_decode_failures > 0 {
+    if ev.orphan_ops > 0
+        || ev.unmatched_closes > 0
+        || ev.shape_decode_failures > 0
+        || ev.process_tracking_fallbacks > 0
+    {
         evidence_line.push_str(" · ");
         if ev.orphan_ops > 0 {
-            evidence_line.push_str(&format!("ℹ {orphan_ops} orphan ops", orphan_ops = ev.orphan_ops));
+            evidence_line.push_str(&format!(
+                "ℹ {orphan_ops} orphan ops",
+                orphan_ops = ev.orphan_ops
+            ));
         }
         if ev.unmatched_closes > 0 {
             if ev.orphan_ops > 0 {
-                evidence_line.push_str(" ");
+                evidence_line.push(' ');
             }
-            evidence_line.push_str(&format!("ℹ {unmatched} unmatched closes", unmatched = ev.unmatched_closes));
+            evidence_line.push_str(&format!(
+                "ℹ {unmatched} unmatched closes",
+                unmatched = ev.unmatched_closes
+            ));
         }
         if ev.shape_decode_failures > 0 {
             if ev.orphan_ops > 0 || ev.unmatched_closes > 0 {
-                evidence_line.push_str(" ");
+                evidence_line.push(' ');
             }
             evidence_line.push_str(&format!(
                 "ℹ {n} shape decode gaps",
                 n = ev.shape_decode_failures
+            ));
+        }
+        if ev.process_tracking_fallbacks > 0 {
+            evidence_line.push_str(&format!(
+                " ℹ {} process trackers using /proc",
+                ev.process_tracking_fallbacks
             ));
         }
     }
@@ -221,6 +351,7 @@ struct FunctionOut {
     aliased: bool,
     calls: u64,
     errors: u64,
+    pending_returns: u64,
     in_flight: u64,
     latency_ns: LatencyOut,
     rv_counts: std::collections::BTreeMap<String, u64>,
@@ -237,7 +368,11 @@ struct LatencyOut {
     max: u64,
 }
 
-fn latency_out(buckets: &[u64; p11scope_ebpf_common::LATENCY_BUCKETS], total: u64, max: u64) -> LatencyOut {
+fn latency_out(
+    buckets: &[u64; p11scope_ebpf_common::LATENCY_BUCKETS],
+    total: u64,
+    max: u64,
+) -> LatencyOut {
     LatencyOut {
         approximate: true,
         p50: percentile_ns(buckets, 0.50),
@@ -259,29 +394,28 @@ fn functions_out(reports: &[SlotReport]) -> Vec<FunctionOut> {
             aliased: r.aliased,
             calls: r.calls,
             errors: r.errors,
+            pending_returns: r
+                .rv_counts
+                .get(&pkcs11_proxy_ng_types::CkRv::PENDING.0)
+                .copied()
+                .unwrap_or(0),
             in_flight: r.in_flight,
             latency_ns: latency_out(&r.buckets, r.total_ns, r.max_ns),
             rv_counts: r
                 .rv_counts
                 .iter()
-                .map(|(rv, n)| (format!("0x{rv:08x}"), *n))
+                .map(|(rv, n)| (format!("0x{rv:016x}"), *n))
                 .collect(),
         })
         .collect()
 }
 
-pub fn json(
-    reports: &[SlotReport],
-    ev: &Evidence,
-    module: &str,
-    started: &str,
-    ended: &str,
-    kernel: &str,
-) -> serde_json::Value {
+pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) -> serde_json::Value {
     serde_json::json!({
-        "schema": "pkcs11-scope/observed-profile/v0-metrics",
-        "capture": { "start": started, "end": ended, "mode": "metrics",
-                     "kernel": kernel, "module": module },
+        "schema": "pkcs11-scope/observed-profile/v1-metrics",
+        "capture": { "start": capture.started, "end": capture.ended, "mode": "metrics",
+                     "kernel": capture.kernel,
+                     "module": { "path": capture.module, "build_id": capture.build_id } },
         "evidence": ev,
         "functions": functions_out(reports),
     })
@@ -320,7 +454,13 @@ struct MechanismOut {
 /// (should not occur: `param_combos` only ever stores shapes the BPF side
 /// actually decoded) — filtered out by the caller, never emitted as a
 /// guess.
-pub(crate) fn param_combo_json(shape_code: u32, p0: u64, p1: u64, p2: u64, count: u64) -> Option<serde_json::Value> {
+pub(crate) fn param_combo_json(
+    shape_code: u32,
+    p0: u64,
+    p1: u64,
+    p2: u64,
+    count: u64,
+) -> Option<serde_json::Value> {
     match shape_code {
         p11scope_ebpf_common::shape::RSA_PKCS_PSS => Some(serde_json::json!({
             "shape": "rsa_pkcs_pss",
@@ -363,12 +503,15 @@ const POLICY_BOOL_NAMES: &[(u32, &str)] = &[
     (p11scope_ebpf_common::attr_bool::SIGN, "CKA_SIGN"),
     (p11scope_ebpf_common::attr_bool::VERIFY, "CKA_VERIFY"),
     (p11scope_ebpf_common::attr_bool::DERIVE, "CKA_DERIVE"),
-    (p11scope_ebpf_common::attr_bool::EXTRACTABLE, "CKA_EXTRACTABLE"),
+    (
+        p11scope_ebpf_common::attr_bool::EXTRACTABLE,
+        "CKA_EXTRACTABLE",
+    ),
 ];
 
 #[derive(Serialize)]
 struct AttrTypeOut {
-    attr_type: u32,
+    attr_type: u64,
     attr_type_hex: String,
 }
 
@@ -395,6 +538,7 @@ struct PolicyBooleansOut {
 struct TemplateOut {
     names: Vec<String>,
     aliased: bool,
+    role: Option<&'static str>,
     /// Always `true`: an explicit, unambiguous marker (not just prose)
     /// that every field below is a request, never an effective policy.
     requested: bool,
@@ -416,11 +560,15 @@ fn templates_out(state: &crate::semantics::State) -> Vec<TemplateOut> {
         .map(|t| TemplateOut {
             names: t.names.clone(),
             aliased: t.aliased,
+            role: t.role,
             requested: true,
             attr_types: t
                 .attr_types
                 .iter()
-                .map(|&ty| AttrTypeOut { attr_type: ty, attr_type_hex: format!("0x{ty:x}") })
+                .map(|&ty| AttrTypeOut {
+                    attr_type: ty,
+                    attr_type_hex: format!("0x{ty:x}"),
+                })
                 .collect(),
             policy_booleans: PolicyBooleansOut {
                 observed_true: POLICY_BOOL_NAMES
@@ -442,9 +590,11 @@ fn templates_out(state: &crate::semantics::State) -> Vec<TemplateOut> {
 #[derive(Serialize)]
 struct SessionsOut {
     opened: u64,
+    inherited: u64,
     closed: u64,
+    async_opened: u64,
     peak_concurrent: u64,
-    /// `opened - closed`: sessions still open (or leaked) at capture end.
+    /// `opened + inherited - closed`: sessions still live at capture end.
     balance: u64,
 }
 
@@ -552,7 +702,8 @@ pub fn profile_json(
                 } else {
                     (
                         serde_json::Value::Null,
-                        "parameter decoding is Phase 3; not attempted here, never a partial decode",
+                        "this mechanism has no published allowlisted parameter shape; decoding \
+                         was not attempted, never a partial decode",
                     )
                 }
             } else {
@@ -577,15 +728,23 @@ pub fn profile_json(
     let sessions = state.sessions();
     let sessions_out = SessionsOut {
         opened: sessions.opened,
+        inherited: sessions.inherited,
         closed: sessions.closed,
+        async_opened: sessions.async_opened,
         peak_concurrent: sessions.peak_concurrent,
-        balance: sessions.opened.saturating_sub(sessions.closed),
+        balance: sessions
+            .opened
+            .saturating_add(sessions.inherited)
+            .saturating_sub(sessions.closed),
     };
-    let logins: std::collections::BTreeMap<String, u64> =
-        state.logins().iter().map(|(user_type, n)| (user_type.to_string(), *n)).collect();
+    let logins: std::collections::BTreeMap<String, u64> = state
+        .logins()
+        .iter()
+        .map(|(user_type, n)| (user_type.to_string(), *n))
+        .collect();
 
     serde_json::json!({
-        "schema": "pkcs11-scope/observed-profile/v1.2",
+        "schema": "pkcs11-scope/observed-profile/v1.3",
         "capture": {
             "start": capture.started, "end": capture.ended, "mode": "profile",
             "kernel": capture.kernel,
@@ -648,6 +807,27 @@ mod tests {
             vendor_interfaces: 0,
             interface_list: "absent".into(),
             event_loss: 0,
+            start_insert_failures: 0,
+            unmatched_returns: 0,
+            rv_update_failures: 0,
+            cgroup_scope_failures: 0,
+            semantic_capture_failures: 0,
+            template_tail_failures: 0,
+            process_tracking_fallbacks: 0,
+            process_tracking_failures: 0,
+            process_tracking_evictions: 0,
+            state_reconciliations: 0,
+            session_cancel_ambiguities: 0,
+            session_cancel_unknown_flags: 0,
+            operation_state_imports: 0,
+            auth_state_ambiguities: 0,
+            async_target_failures: 0,
+            async_orphans: 0,
+            async_duplicates: 0,
+            async_evictions: 0,
+            fork_state_ambiguities: 0,
+            semantic_state_drops: 0,
+            pending_at_end: 0,
             malformed_records: 0,
             orphan_ops: 0,
             unmatched_closes: 0,
@@ -669,13 +849,39 @@ mod tests {
     fn any_gap_forces_partial() {
         for mutate in [
             (|e: &mut Evidence| e.attach_failures.push("boom".into())) as fn(&mut Evidence),
-            |e: &mut Evidence| e.skipped.push(SkippedOut { name: "C_X".into(), reason: "null pointer".into() }),
+            |e: &mut Evidence| {
+                e.skipped.push(SkippedOut {
+                    name: "C_X".into(),
+                    reason: "null pointer".into(),
+                })
+            },
             |e: &mut Evidence| e.aliased.push(vec!["C_A".into(), "C_B".into()]),
             |e: &mut Evidence| e.in_flight_at_end = 1,
             |e: &mut Evidence| e.surfaces[0].walk = "known_prefix".into(),
             |e: &mut Evidence| e.surfaces[0].acquisition = "error: boom".into(),
             |e: &mut Evidence| e.vendor_interfaces = 1,
+            |e: &mut Evidence| e.interface_list = "error: boom".into(),
             |e: &mut Evidence| e.event_loss = 1,
+            |e: &mut Evidence| e.start_insert_failures = 1,
+            |e: &mut Evidence| e.unmatched_returns = 1,
+            |e: &mut Evidence| e.rv_update_failures = 1,
+            |e: &mut Evidence| e.cgroup_scope_failures = 1,
+            |e: &mut Evidence| e.semantic_capture_failures = 1,
+            |e: &mut Evidence| e.template_tail_failures = 1,
+            |e: &mut Evidence| e.process_tracking_failures = 1,
+            |e: &mut Evidence| e.process_tracking_evictions = 1,
+            |e: &mut Evidence| e.state_reconciliations = 1,
+            |e: &mut Evidence| e.session_cancel_ambiguities = 1,
+            |e: &mut Evidence| e.session_cancel_unknown_flags = 1,
+            |e: &mut Evidence| e.operation_state_imports = 1,
+            |e: &mut Evidence| e.auth_state_ambiguities = 1,
+            |e: &mut Evidence| e.async_target_failures = 1,
+            |e: &mut Evidence| e.async_orphans = 1,
+            |e: &mut Evidence| e.async_duplicates = 1,
+            |e: &mut Evidence| e.async_evictions = 1,
+            |e: &mut Evidence| e.fork_state_ambiguities = 1,
+            |e: &mut Evidence| e.semantic_state_drops = 1,
+            |e: &mut Evidence| e.pending_at_end = 1,
             |e: &mut Evidence| e.malformed_records = 1,
             |e: &mut Evidence| e.templates_truncated = true,
             |e: &mut Evidence| e.shape_decode_total_failures = 1,
@@ -683,7 +889,10 @@ mod tests {
             let mut ev = evidence();
             mutate(&mut ev);
             ev.verdict();
-            assert_eq!(ev.completeness, "PARTIAL", "a gap must never read as COMPLETE");
+            assert_eq!(
+                ev.completeness, "PARTIAL",
+                "a gap must never read as COMPLETE"
+            );
         }
     }
 
@@ -694,6 +903,7 @@ mod tests {
         let mut ev = evidence();
         ev.orphan_ops = 3;
         ev.unmatched_closes = 2;
+        ev.process_tracking_fallbacks = 4;
         ev.shape_decode_failures = 4;
         ev.verdict();
         assert_eq!(ev.completeness, "COMPLETE");
@@ -704,7 +914,10 @@ mod tests {
         let mut ev = evidence();
         ev.verdict();
         let out = live(
-            &[report("C_Sign", 10, 0, false), report("C_WaitForSlotEvent", 0, 1, true)],
+            &[
+                report("C_Sign", 10, 0, false),
+                report("C_WaitForSlotEvent", 0, 1, true),
+            ],
             &ev,
             Duration::from_secs(65),
             "/opt/p11.so",
@@ -732,8 +945,14 @@ mod tests {
             "profile",
         );
         // Evidence line shows why a PARTIAL verdict was rendered.
-        assert!(out.contains("5 events lost"), "event_loss must appear in evidence line");
-        assert!(out.contains("2 malformed records"), "malformed_records must appear in evidence line");
+        assert!(
+            out.contains("5 events lost"),
+            "event_loss must appear in evidence line"
+        );
+        assert!(
+            out.contains("2 malformed records"),
+            "malformed_records must appear in evidence line"
+        );
         assert!(out.contains("PARTIAL"));
     }
 
@@ -751,8 +970,14 @@ mod tests {
             "profile",
         );
         // Informational evidence: capture started mid-operation, still marked COMPLETE for its scope.
-        assert!(out.contains("3 orphan ops"), "orphan_ops must appear in evidence line");
-        assert!(out.contains("1 unmatched closes"), "unmatched_closes must appear in evidence line");
+        assert!(
+            out.contains("3 orphan ops"),
+            "orphan_ops must appear in evidence line"
+        );
+        assert!(
+            out.contains("1 unmatched closes"),
+            "unmatched_closes must appear in evidence line"
+        );
         assert!(out.contains("COMPLETE"));
     }
 
@@ -762,9 +987,16 @@ mod tests {
         ev.verdict();
         let mut r = report("C_Sign", 1, 0, false);
         r.rv_counts.insert(0, 1);
-        let v = json(&[r], &ev, "/opt/p11.so", "t0", "t1", "6.8.0");
+        let capture = CaptureMeta {
+            module: "/opt/p11.so",
+            build_id: Some("aabb"),
+            started: "t0",
+            ended: "t1",
+            kernel: "6.8.0",
+        };
+        let v = json(&[r], &ev, &capture);
         assert_eq!(v["functions"][0]["latency_ns"]["approximate"], true);
-        assert_eq!(v["functions"][0]["rv_counts"]["0x00000000"], 1);
+        assert_eq!(v["functions"][0]["rv_counts"]["0x0000000000000000"], 1);
         assert_eq!(v["evidence"]["completeness"], "COMPLETE");
     }
 
@@ -793,12 +1025,21 @@ mod tests {
         };
         let v = profile_json(&[], &ev, &state, &capture);
 
-        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v1.2");
+        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v1.3");
         for section in [
-            "capture", "evidence", "functions", "mechanisms", "sessions", "logins", "templates",
+            "capture",
+            "evidence",
+            "functions",
+            "mechanisms",
+            "sessions",
+            "logins",
+            "templates",
             "cgroups",
         ] {
-            assert!(v.get(section).is_some(), "v1.2 document missing required section {section}");
+            assert!(
+                v.get(section).is_some(),
+                "v1.3 document missing required section {section}"
+            );
         }
         assert_eq!(v["templates"]["operations"], serde_json::json!([]));
         assert_eq!(v["cgroups"], serde_json::json!([]));
@@ -809,7 +1050,7 @@ mod tests {
 
     #[test]
     fn profile_json_mechanisms_carry_verbatim_id_hex_ops_and_null_params() {
-        use p11scope_ebpf_common::{Event, USER_TYPE_NONE, fnkind};
+        use p11scope_ebpf_common::{Event, USER_TYPE_NONE};
 
         let plan = crate::plan::AttachPlan {
             slots: vec![crate::plan::Slot {
@@ -818,7 +1059,9 @@ mod tests {
                 file_offset: 0x10,
                 names: vec!["C_SignInit".into()],
                 aliased: false,
-                kind: fnkind::INIT_WITH_MECH,
+                semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
+                semantic_ambiguous: false,
+                fork_safe: false,
             }],
             ..empty_plan()
         };
@@ -836,7 +1079,6 @@ mod tests {
             p1: 0,
             p2: 0,
             slot: 0,
-            kind: fnkind::INIT_WITH_MECH,
             user_type: USER_TYPE_NONE,
             shape: 0,
             attr_types: [0; 8],
@@ -844,6 +1086,7 @@ mod tests {
             attr_total: 0,
             attr_bools: 0,
             attr_bools_seen: 0,
+            ..Event::default()
         });
 
         let mut ev = evidence();
@@ -866,8 +1109,15 @@ mod tests {
         assert_eq!(v["capture"]["module"]["build_id"], serde_json::Value::Null);
     }
 
-    fn init_event(slot: u32, mechanism: u64, shape_code: u32, p0: u64, p1: u64, p2: u64) -> p11scope_ebpf_common::Event {
-        use p11scope_ebpf_common::{Event, USER_TYPE_NONE, fnkind};
+    fn init_event(
+        slot: u32,
+        mechanism: u64,
+        shape_code: u32,
+        p0: u64,
+        p1: u64,
+        p2: u64,
+    ) -> p11scope_ebpf_common::Event {
+        use p11scope_ebpf_common::{Event, USER_TYPE_NONE};
         Event {
             ts_ns: 0,
             duration_ns: 100,
@@ -880,7 +1130,6 @@ mod tests {
             p1,
             p2,
             slot,
-            kind: fnkind::INIT_WITH_MECH,
             user_type: USER_TYPE_NONE,
             shape: shape_code,
             attr_types: [0; 8],
@@ -888,11 +1137,11 @@ mod tests {
             attr_total: 0,
             attr_bools: 0,
             attr_bools_seen: 0,
+            ..Event::default()
         }
     }
 
     fn init_plan() -> crate::plan::AttachPlan {
-        use p11scope_ebpf_common::fnkind;
         crate::plan::AttachPlan {
             slots: vec![crate::plan::Slot {
                 index: 0,
@@ -900,7 +1149,9 @@ mod tests {
                 file_offset: 0x10,
                 names: vec!["C_SignInit".into()],
                 aliased: false,
-                kind: fnkind::INIT_WITH_MECH,
+                semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
+                semantic_ambiguous: false,
+                fork_safe: false,
             }],
             ..empty_plan()
         }
@@ -918,7 +1169,13 @@ mod tests {
 
         let mut ev = evidence();
         ev.verdict();
-        let capture = CaptureMeta { module: "/opt/p11.so", build_id: None, started: "t0", ended: "t1", kernel: "6.8.0" };
+        let capture = CaptureMeta {
+            module: "/opt/p11.so",
+            build_id: None,
+            started: "t0",
+            ended: "t1",
+            kernel: "6.8.0",
+        };
         let v = profile_json(&[], &ev, &state, &capture);
 
         let params = &v["mechanisms"][0]["params"];
@@ -947,20 +1204,32 @@ mod tests {
 
         let mut ev = evidence();
         ev.verdict();
-        let capture = CaptureMeta { module: "/opt/p11.so", build_id: None, started: "t0", ended: "t1", kernel: "6.8.0" };
+        let capture = CaptureMeta {
+            module: "/opt/p11.so",
+            build_id: None,
+            started: "t0",
+            ended: "t1",
+            kernel: "6.8.0",
+        };
         let v = profile_json(&[], &ev, &state, &capture);
 
         let combos = v["mechanisms"][0]["params"].as_array().unwrap();
         assert_eq!(combos.len(), 2, "two distinct layouts, not merged");
 
-        let v220 = combos.iter().find(|c| c["layout"] == "v2.20").expect("v2.20 combo present");
+        let v220 = combos
+            .iter()
+            .find(|c| c["layout"] == "v2.20")
+            .expect("v2.20 combo present");
         assert_eq!(v220["shape"], "gcm");
         assert_eq!(v220["iv_len"], 12);
         assert_eq!(v220["aad_len"], 0);
         assert_eq!(v220["tag_bits"], 128);
         assert_eq!(v220["count"], 1);
 
-        let v240 = combos.iter().find(|c| c["layout"] == "v2.40").expect("v2.40 combo present");
+        let v240 = combos
+            .iter()
+            .find(|c| c["layout"] == "v2.40")
+            .expect("v2.40 combo present");
         assert_eq!(v240["shape"], "gcm");
         assert_eq!(v240["iv_len"], 12);
         assert_eq!(v240["aad_len"], 16);
@@ -978,7 +1247,13 @@ mod tests {
 
         let mut ev = evidence();
         ev.verdict();
-        let capture = CaptureMeta { module: "/opt/p11.so", build_id: None, started: "t0", ended: "t1", kernel: "6.8.0" };
+        let capture = CaptureMeta {
+            module: "/opt/p11.so",
+            build_id: None,
+            started: "t0",
+            ended: "t1",
+            kernel: "6.8.0",
+        };
         let v = profile_json(&[], &ev, &state, &capture);
 
         assert_eq!(
@@ -996,7 +1271,13 @@ mod tests {
 
         let mut ev = evidence();
         ev.verdict();
-        let capture = CaptureMeta { module: "/opt/p11.so", build_id: None, started: "t0", ended: "t1", kernel: "6.8.0" };
+        let capture = CaptureMeta {
+            module: "/opt/p11.so",
+            build_id: None,
+            started: "t0",
+            ended: "t1",
+            kernel: "6.8.0",
+        };
         let v = profile_json(&[], &ev, &state, &capture);
 
         assert_eq!(v["mechanisms"][0]["params"], serde_json::Value::Null);
@@ -1018,9 +1299,18 @@ mod tests {
         ev.shape_decode_total_failures = state.total_shape_decode_failures();
         ev.verdict();
         assert_eq!(ev.shape_decode_total_failures, 1);
-        assert_eq!(ev.completeness, "PARTIAL", "a total decode failure must force PARTIAL");
+        assert_eq!(
+            ev.completeness, "PARTIAL",
+            "a total decode failure must force PARTIAL"
+        );
 
-        let capture = CaptureMeta { module: "/opt/p11.so", build_id: None, started: "t0", ended: "t1", kernel: "6.8.0" };
+        let capture = CaptureMeta {
+            module: "/opt/p11.so",
+            build_id: None,
+            started: "t0",
+            ended: "t1",
+            kernel: "6.8.0",
+        };
         let v = profile_json(&[], &ev, &state, &capture);
         assert_eq!(v["mechanisms"][0]["params"], serde_json::Value::Null);
         let note = v["mechanisms"][0]["note"].as_str().unwrap();
@@ -1048,20 +1338,29 @@ mod tests {
         ev.verdict();
         assert_eq!(ev.shape_decode_failures, 0);
         assert_eq!(ev.shape_decode_total_failures, 0);
-        assert_eq!(ev.completeness, "COMPLETE", "an ordinary id-only mechanism is not a gap");
+        assert_eq!(
+            ev.completeness, "COMPLETE",
+            "an ordinary id-only mechanism is not a gap"
+        );
 
-        let capture = CaptureMeta { module: "/opt/p11.so", build_id: None, started: "t0", ended: "t1", kernel: "6.8.0" };
+        let capture = CaptureMeta {
+            module: "/opt/p11.so",
+            build_id: None,
+            started: "t0",
+            ended: "t1",
+            kernel: "6.8.0",
+        };
         let v = profile_json(&[], &ev, &state, &capture);
         assert_eq!(v["mechanisms"][0]["params"], serde_json::Value::Null);
         assert_eq!(
             v["mechanisms"][0]["note"],
-            "parameter decoding is Phase 3; not attempted here, never a partial decode"
+            "this mechanism has no published allowlisted parameter shape; decoding was not \
+             attempted, never a partial decode"
         );
         assert_eq!(v["evidence"]["completeness"], "COMPLETE");
     }
 
     fn template_plan() -> crate::plan::AttachPlan {
-        use p11scope_ebpf_common::fnkind;
         crate::plan::AttachPlan {
             slots: vec![crate::plan::Slot {
                 index: 0,
@@ -1069,20 +1368,22 @@ mod tests {
                 file_offset: 0x20,
                 names: vec!["C_FindObjectsInit".into()],
                 aliased: false,
-                kind: fnkind::TEMPLATE_ARG1,
+                semantics: crate::kinds::descriptor("C_FindObjectsInit").unwrap(),
+                semantic_ambiguous: false,
+                fork_safe: false,
             }],
             ..empty_plan()
         }
     }
 
     fn template_event(
-        attr_types: &[u32],
+        attr_types: &[u64],
         attr_total: u32,
         attr_bools: u32,
         attr_bools_seen: u32,
     ) -> p11scope_ebpf_common::Event {
-        use p11scope_ebpf_common::{Event, USER_TYPE_NONE, fnkind};
-        let mut types = [0u32; 8];
+        use p11scope_ebpf_common::{Event, USER_TYPE_NONE};
+        let mut types = [0u64; 8];
         for (i, &t) in attr_types.iter().enumerate() {
             types[i] = t;
         }
@@ -1098,7 +1399,6 @@ mod tests {
             p1: 0,
             p2: 0,
             slot: 0,
-            kind: fnkind::TEMPLATE_ARG1,
             user_type: USER_TYPE_NONE,
             shape: 0,
             attr_types: types,
@@ -1106,6 +1406,7 @@ mod tests {
             attr_total,
             attr_bools,
             attr_bools_seen,
+            ..Event::default()
         }
     }
 
@@ -1125,26 +1426,53 @@ mod tests {
 
         let mut ev = evidence();
         ev.verdict();
-        let capture = CaptureMeta { module: "/opt/p11.so", build_id: None, started: "t0", ended: "t1", kernel: "6.8.0" };
+        let capture = CaptureMeta {
+            module: "/opt/p11.so",
+            build_id: None,
+            started: "t0",
+            ended: "t1",
+            kernel: "6.8.0",
+        };
         let v = profile_json(&[], &ev, &state, &capture);
 
         let op = &v["templates"]["operations"][0];
         assert_eq!(op["names"], serde_json::json!(["C_FindObjectsInit"]));
-        assert_eq!(op["requested"], true, "must be an explicit, unambiguous marker");
+        assert_eq!(
+            op["requested"], true,
+            "must be an explicit, unambiguous marker"
+        );
         assert_eq!(op["truncated"], false);
-        let types: Vec<u64> =
-            op["attr_types"].as_array().unwrap().iter().map(|t| t["attr_type"].as_u64().unwrap()).collect();
+        let types: Vec<u64> = op["attr_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["attr_type"].as_u64().unwrap())
+            .collect();
         assert_eq!(types, vec![0x01, 0x02]);
         assert_eq!(op["attr_types"][0]["attr_type_hex"], "0x1");
 
-        let true_names: Vec<&str> =
-            op["policy_booleans"]["observed_true"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-        let false_names: Vec<&str> =
-            op["policy_booleans"]["observed_false"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        let true_names: Vec<&str> = op["policy_booleans"]["observed_true"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let false_names: Vec<&str> = op["policy_booleans"]["observed_false"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
         assert_eq!(true_names, vec!["CKA_TOKEN"]);
         assert_eq!(false_names, vec!["CKA_PRIVATE"]);
-        assert!(!true_names.contains(&"CKA_SIGN"), "never present — not true");
-        assert!(!false_names.contains(&"CKA_SIGN"), "never present — not false either");
+        assert!(
+            !true_names.contains(&"CKA_SIGN"),
+            "never present — not true"
+        );
+        assert!(
+            !false_names.contains(&"CKA_SIGN"),
+            "never present — not false either"
+        );
     }
 
     #[test]
@@ -1155,10 +1483,19 @@ mod tests {
         let mut ev = evidence();
         ev.templates_truncated = state.templates_truncated();
         ev.verdict();
-        assert!(ev.templates_truncated, "the aggregate accessor must see the truncation");
+        assert!(
+            ev.templates_truncated,
+            "the aggregate accessor must see the truncation"
+        );
         assert_eq!(ev.completeness, "PARTIAL");
 
-        let capture = CaptureMeta { module: "/opt/p11.so", build_id: None, started: "t0", ended: "t1", kernel: "6.8.0" };
+        let capture = CaptureMeta {
+            module: "/opt/p11.so",
+            build_id: None,
+            started: "t0",
+            ended: "t1",
+            kernel: "6.8.0",
+        };
         let v = profile_json(&[], &ev, &state, &capture);
         assert_eq!(v["templates"]["operations"][0]["truncated"], true);
         assert_eq!(v["evidence"]["templates_truncated"], true);
@@ -1181,12 +1518,21 @@ mod tests {
 
         let mut ev = evidence();
         ev.verdict();
-        let capture = CaptureMeta { module: "/opt/p11.so", build_id: None, started: "t0", ended: "t1", kernel: "6.8.0" };
+        let capture = CaptureMeta {
+            module: "/opt/p11.so",
+            build_id: None,
+            started: "t0",
+            ended: "t1",
+            kernel: "6.8.0",
+        };
         let v = profile_json(&[], &ev, &state, &capture);
 
         let cgroups = v["cgroups"].as_array().unwrap();
         assert_eq!(cgroups.len(), 2, "two distinct cgroup ids, two entries");
-        let cg111 = cgroups.iter().find(|c| c["cgroup_id"] == 111).expect("cgroup 111 present");
+        let cg111 = cgroups
+            .iter()
+            .find(|c| c["cgroup_id"] == 111)
+            .expect("cgroup 111 present");
         assert_eq!(cg111["calls"], 1);
         assert_eq!(cg111["errors"], 0);
         assert_eq!(cg111["mechanisms"][0]["mechanism"], 0x0D);
@@ -1197,9 +1543,15 @@ mod tests {
         // label resolution must degrade to null, never a guess.
         assert_eq!(cg111["label"], serde_json::Value::Null);
 
-        let cg222 = cgroups.iter().find(|c| c["cgroup_id"] == 222).expect("cgroup 222 present");
+        let cg222 = cgroups
+            .iter()
+            .find(|c| c["cgroup_id"] == 222)
+            .expect("cgroup 222 present");
         assert_eq!(cg222["calls"], 1);
-        assert_eq!(cg222["errors"], 1, "the failed call counts as an error at the cgroup level too");
+        assert_eq!(
+            cg222["errors"], 1,
+            "the failed call counts as an error at the cgroup level too"
+        );
         assert_eq!(cg222["mechanisms"][0]["errors"], 1);
     }
 }

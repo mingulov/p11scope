@@ -8,6 +8,11 @@ Product implementation not started.
 **Extended rationale:** [docs/notes/info.md](../../notes/info.md) — this spec records the decisions; the notes record the full reasoning.
 **Companion:** [what you will see](2026-08-10-pkcs11-scope-outputs.md) — CLI surface, live/trace output, and the `observed-profile.json` shape.
 
+**Superseded details:** This historical product draft does not define the
+current attach-provenance or pointer-derived metadata boundary. Use
+`2026-08-13-safe-and-unvalidated-metadata-design.md` and
+`../plans/2026-08-13-manifest-provenance.md` for those requirements.
+
 ## One-sentence positioning
 
 > Observe the real PKCS#11 dependency surface of a running Linux application —

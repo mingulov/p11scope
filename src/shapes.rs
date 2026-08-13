@@ -45,7 +45,7 @@ pub fn expected_shapes(reg: &MechanismRegistry) -> std::collections::BTreeMap<u6
 /// Publishes MECH_SHAPE from the registry: every registered mechanism
 /// whose shape maps to a non-NONE code gets an entry. Returns how many
 /// were published. Called once, before uprobes attach — same
-/// publish-before-attach pattern `SLOT_KIND` uses, for the same reason:
+/// publish-before-attach pattern `SLOT_SEMANTICS` uses, for the same reason:
 /// a probe that fires before its shape is published must decode
 /// nothing, and NONE is that safe default.
 pub fn publish(ebpf: &mut Ebpf, reg: &MechanismRegistry) -> Result<usize> {
@@ -85,7 +85,10 @@ mod tests {
     #[test]
     fn embedded_registry_shapes_known_ids_as_expected() {
         let reg = MechanismRegistry::load(None).expect("load embedded registry");
-        assert_eq!(code_for(reg.param_shape(CKM_RSA_PKCS_PSS).unwrap()), shape::RSA_PKCS_PSS);
+        assert_eq!(
+            code_for(reg.param_shape(CKM_RSA_PKCS_PSS).unwrap()),
+            shape::RSA_PKCS_PSS
+        );
         assert_eq!(
             code_for(reg.param_shape(CKM_SHA256_RSA_PKCS_PSS).unwrap()),
             shape::RSA_PKCS_PSS
@@ -105,13 +108,20 @@ mod tests {
             .filter_map(|m| reg.param_shape(m).map(|s| (m, code_for(s))))
             .filter(|(_, c)| *c != shape::NONE)
             .collect();
-        assert!(!shaped.is_empty(), "expected at least one non-NONE shaped mechanism");
         assert!(
-            shaped.iter().any(|&(id, c)| id == CKM_AES_GCM && c == shape::GCM),
+            !shaped.is_empty(),
+            "expected at least one non-NONE shaped mechanism"
+        );
+        assert!(
+            shaped
+                .iter()
+                .any(|&(id, c)| id == CKM_AES_GCM && c == shape::GCM),
             "expected CKM_AES_GCM among the GCM-shaped mechanisms"
         );
         assert!(
-            shaped.iter().any(|&(id, c)| id == CKM_RSA_PKCS_PSS && c == shape::RSA_PKCS_PSS),
+            shaped
+                .iter()
+                .any(|&(id, c)| id == CKM_RSA_PKCS_PSS && c == shape::RSA_PKCS_PSS),
             "expected CKM_RSA_PKCS_PSS among the PSS-shaped mechanisms"
         );
     }

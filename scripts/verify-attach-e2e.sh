@@ -7,7 +7,23 @@ cd "$(dirname "$0")/.."
 
 MODULE=/usr/lib/softhsm/libsofthsm2.so
 WORK=target/e2e
+TRUST_DIR="$PWD/$WORK/trusted"
+WPID=
+SPID=
 mkdir -p "$WORK"
+. scripts/trusted-p11scope.sh
+
+cleanup() {
+    status=$?
+    trap - EXIT INT TERM
+    [ -z "$WPID" ] || kill "$WPID" 2>/dev/null || true
+    [ -z "$SPID" ] || kill "$SPID" 2>/dev/null || true
+    [ -z "$WPID" ] || wait "$WPID" 2>/dev/null || true
+    [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || true
+    remove_trusted_p11scope "$TRUST_DIR"
+    exit "$status"
+}
+. scripts/cleanup-traps.sh
 
 command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
 command -v softhsm2-util >/dev/null || { echo "softhsm2-util required"; exit 1; }
@@ -21,6 +37,8 @@ echo "=== build ==="
 # silently goes missing and the "discover" step below fails with ENOENT.
 # --workspace makes both binaries build, matching what this script needs.
 cargo build --release --workspace
+stage_trusted_p11scope target/release/p11scope \
+    target/release/p11scope-discover "$TRUST_DIR"
 gcc -O0 -o "$WORK/harness" spike/harness.c -ldl
 
 echo "=== softhsm token ==="
@@ -53,15 +71,15 @@ echo "=== observe ==="
 rm -f "$WORK/go"
 ( while [ ! -f "$WORK/go" ]; do sleep 0.05; done; exec "$WORK/harness" "$MODULE" ) &
 WPID=$!
-sudo --preserve-env=SOFTHSM2_CONF ./target/release/p11scope profile \
-    --manifest "$WORK/manifest.json" --pid "$WPID" \
+sudo --preserve-env=SOFTHSM2_CONF "$TRUST_DIR/p11scope" profile \
+    --manifest "$WORK/manifest.json" --provenance-module "$MODULE" --pid "$WPID" \
     --mode metrics --duration 20 -o "$WORK/observed.json" \
     > "$WORK/profile.log" 2>&1 &
 SPID=$!
 sleep 3            # let attach complete
 touch "$WORK/go"
-wait "$WPID"
-wait "$SPID"
+if wait "$WPID"; then WPID=; else status=$?; WPID=; echo "workload failed: $status"; exit "$status"; fi
+if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "profiler failed: $status"; tail -n 20 "$WORK/profile.log"; exit "$status"; fi
 tail -n 20 "$WORK/profile.log"
 
 echo "=== verify against spike/expected.txt ==="

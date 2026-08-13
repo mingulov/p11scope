@@ -4,17 +4,19 @@
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use p11scope::attach::{Scope, Session};
-use p11scope::{discover_cmd, events, metrics, plan, render, scope, semantics, trace, verify};
+use p11scope::{
+    discover_cmd, events, metrics, plan, process, render, scope, semantics, trace, verify,
+};
 use p11scope_manifest::manifest::{Manifest, SCHEMA};
-use std::io::Write as _;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "usage:\n  \
-p11scope profile --manifest <m.json> (--pid <n> | --cgroup <path>) [--mode profile|metrics] [--duration <secs>] [-o <out.json>]\n  \
-p11scope trace --manifest <m.json> (--pid <n> | --cgroup <path>) [--duration <secs>] [-o <out.file>]\n  \
+p11scope profile --manifest <m.json> --provenance-module <provider.so> (--pid <n> | --cgroup <path>) [--mode profile|metrics] [--duration <secs>] [-o <out.json>]\n  \
+p11scope trace --manifest <m.json> --provenance-module <provider.so> (--pid <n> | --cgroup <path>) [--duration <secs>] [-o <out.file>]\n  \
 p11scope discover --module <provider.so> [-o <manifest.json>]\n\n\
 note: --mode defaults to profile (metrics + mechanisms/sessions/logins from\n\
 the event stream); --mode metrics is the lighter, maps-only level.\n\
@@ -26,7 +28,7 @@ stops, the final frame prints, and (with -o) the report is written —\n\
 same as --duration elapsing. --duration remains the only way to bound a\n\
 capture that runs unattended.\n\
 note: --cgroup matches that cgroup and every descendant cgroup beneath it\n\
-(kernel >= 5.15 ancestor matching), so a container or pod directory works\n\
+(kernel >= 5.15 due to attach cookies), so a container or pod directory works\n\
 even though its processes live in a nested child cgroup. Sibling cgroups\n\
 (anything not under the given path) are never matched. The path must be\n\
 under /sys/fs/cgroup.";
@@ -59,7 +61,8 @@ fn install_sigint_flag() -> Result<Arc<AtomicBool>> {
 /// directly testable without sending a real signal — set the flag,
 /// confirm this returns `true` regardless of `elapsed`/`duration`.
 fn should_stop(interrupted: &AtomicBool, elapsed: Duration, duration: Option<u64>) -> bool {
-    interrupted.load(Ordering::Relaxed) || duration.is_some_and(|d| elapsed >= Duration::from_secs(d))
+    interrupted.load(Ordering::Relaxed)
+        || duration.is_some_and(|d| elapsed >= Duration::from_secs(d))
 }
 
 fn main() {
@@ -80,7 +83,10 @@ fn run() -> Result<()> {
             Ok(())
         }
         other => {
-            eprintln!("unknown or missing subcommand: {}\n{USAGE}", other.unwrap_or("(none)"));
+            eprintln!(
+                "unknown or missing subcommand: {}\n{USAGE}",
+                other.unwrap_or("(none)")
+            );
             std::process::exit(2);
         }
     }
@@ -104,7 +110,10 @@ fn require_value(args: &mut impl Iterator<Item = String>, flag: &str) -> String 
 fn resolve_scope(pid: Option<u32>, cgroup: Option<PathBuf>) -> Result<Scope> {
     match (pid, cgroup) {
         (Some(p), None) => Ok(Scope::Pid(p)),
-        (None, Some(c)) => Ok(Scope::Cgroup { id: scope::cgroup_id(&c)?, level: scope::cgroup_level(&c)? }),
+        (None, Some(c)) => Ok(Scope::Cgroup {
+            id: scope::cgroup_id(&c)?,
+            path: c,
+        }),
         (None, None) => {
             eprintln!("exactly one of --pid or --cgroup is required\n{USAGE}");
             std::process::exit(2);
@@ -118,23 +127,43 @@ fn resolve_scope(pid: Option<u32>, cgroup: Option<PathBuf>) -> Result<Scope> {
 
 /// Loads and verifies the manifest, then builds the attach plan — shared
 /// by every subcommand that attaches (`profile`, `trace`).
-fn load_plan(manifest_path: &std::path::Path) -> Result<(Manifest, plan::AttachPlan)> {
-    let text = std::fs::read_to_string(manifest_path)
-        .with_context(|| format!("reading manifest {}", manifest_path.display()))?;
+fn load_plan(
+    manifest_path: &std::path::Path,
+    provenance_module: &std::path::Path,
+) -> Result<(Manifest, plan::AttachPlan, verify::VerifiedObjects)> {
+    let text = verify::read_manifest(manifest_path)
+        .map_err(|error| anyhow!("reading manifest {}: {error}", manifest_path.display()))?;
     let manifest: Manifest = serde_json::from_str(&text)
         .with_context(|| format!("parsing manifest {}", manifest_path.display()))?;
     if manifest.schema != SCHEMA {
         bail!(
-            "manifest schema mismatch: got {:?}, this build expects {SCHEMA:?}",
+            "manifest schema mismatch: got {:?}, this build expects {SCHEMA:?}; \
+             rerun `p11scope discover` to rediscover the module",
             manifest.schema
         );
     }
-    if let Err(problems) = verify::check_reuse(&manifest) {
-        for p in &problems {
-            eprintln!("p11scope: {p}");
+    let objects = verify::check_reuse(&manifest).map_err(|problems| {
+        for problem in &problems {
+            eprintln!("p11scope: {problem}");
         }
-        bail!("manifest does not match the current files; refusing to attach");
-    }
+        anyhow!("manifest does not match the current files; refusing to attach")
+    })?;
+    let discovered = discover_cmd::rediscover(provenance_module).with_context(|| {
+        format!(
+            "verifying manifest against fresh discovery of {}",
+            provenance_module.display()
+        )
+    })?;
+    verify::check_provenance(&manifest, &discovered).map_err(|problems| {
+        for problem in &problems {
+            eprintln!("p11scope: {problem}");
+        }
+        anyhow!("manifest provenance was not reproduced; refusing to attach")
+    })?;
+    objects
+        .ensure_stable()
+        .map_err(anyhow::Error::msg)
+        .context("checking authorized provider objects after provenance discovery")?;
 
     let plan = plan::build(&manifest);
     if plan.slots.is_empty() {
@@ -143,15 +172,8 @@ fn load_plan(manifest_path: &std::path::Path) -> Result<(Manifest, plan::AttachP
             manifest_path.display()
         );
     }
-    if plan.slots.len() > p11scope_ebpf_common::MAX_SLOTS as usize {
-        bail!(
-            "attach plan has {} slots, exceeding MAX_SLOTS ({}): BPF would silently drop slots \
-             beyond that limit",
-            plan.slots.len(),
-            p11scope_ebpf_common::MAX_SLOTS
-        );
-    }
-    Ok((manifest, plan))
+    plan::ensure_capacity(&plan).map_err(|error| anyhow!(error))?;
+    Ok((manifest, plan, objects))
 }
 
 /// Prints every attach failure — shared by `profile` and `trace`, which
@@ -174,11 +196,12 @@ fn report_attach_failures(session: &Session) {
     if session.attached_probes() == 0 {
         if let Some((_, first)) = session.attach_failures().first() {
             eprintln!(
-                "p11scope: 0/{} attach attempts failed, every one the same way — this almost \
+                "p11scope: {}/{} attach attempts failed, every one the same way — this almost \
                  always means the environment cannot attach BPF uprobes at all: missing \
                  CAP_BPF/CAP_SYS_ADMIN (or root), a kernel lockdown mode, or a restrictive \
                  kernel.perf_event_paranoid sysctl. First underlying error: {first}",
-                session.attach_failures().len()
+                session.attach_failures().len(),
+                session.attached_probes() + session.attach_failures().len()
             );
         }
     }
@@ -197,8 +220,60 @@ fn load_mech_shapes(state: &mut semantics::State) -> Result<()> {
     Ok(())
 }
 
+fn identify_tracked(
+    tracker: &mut process::Tracker,
+    state: &mut semantics::State,
+    ev: &p11scope_ebpf_common::Event,
+) -> semantics::ProcessKey {
+    let pid = (ev.pid_tgid >> 32) as u32;
+    let identified = tracker.identify(pid);
+    if let Some(retired) = identified.retired {
+        state.retire_process(retired);
+    }
+    identified.key
+}
+
+fn retire_exited(tracker: &mut process::Tracker, state: &mut semantics::State) {
+    for process in tracker.poll_exited() {
+        state.retire_process(process);
+    }
+}
+
+fn observe_fork(
+    tracker: &mut process::Tracker,
+    state: &mut semantics::State,
+    ev: &p11scope_ebpf_common::Event,
+) -> bool {
+    if ev.event_type != p11scope_ebpf_common::event_type::FORK {
+        return false;
+    }
+    let parent_pid = (ev.pid_tgid >> 32) as u32;
+    if !state.pid_has_process_state(parent_pid) {
+        return true;
+    }
+    let parent = tracker.identify(parent_pid);
+    if let Some(retired) = parent.retired {
+        state.retire_process(retired);
+    }
+    if !state.has_process_state(parent.key) {
+        tracker.retire(parent.key);
+        return true;
+    }
+    let child = tracker.identify(ev.session as u32);
+    if let Some(retired) = child.retired {
+        state.retire_process(retired);
+    }
+    state.fork_process(parent.key, child.key);
+    if !state.has_process_state(child.key) {
+        state.retire_process(child.key);
+        tracker.retire(child.key);
+    }
+    true
+}
+
 fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
     let mut manifest_path: Option<PathBuf> = None;
+    let mut provenance_module: Option<PathBuf> = None;
     let mut pid: Option<u32> = None;
     let mut cgroup: Option<PathBuf> = None;
     let mut mode = "profile".to_string();
@@ -208,16 +283,24 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--manifest" => manifest_path = Some(require_value(&mut args, "--manifest").into()),
+            "--provenance-module" => {
+                provenance_module = Some(require_value(&mut args, "--provenance-module").into())
+            }
             "--pid" => {
                 let v = require_value(&mut args, "--pid");
-                pid = Some(v.parse().with_context(|| format!("--pid: invalid number {v:?}"))?);
+                pid = Some(
+                    v.parse()
+                        .with_context(|| format!("--pid: invalid number {v:?}"))?,
+                );
             }
             "--cgroup" => cgroup = Some(require_value(&mut args, "--cgroup").into()),
             "--mode" => mode = require_value(&mut args, "--mode"),
             "--duration" => {
                 let v = require_value(&mut args, "--duration");
-                duration =
-                    Some(v.parse().with_context(|| format!("--duration: invalid number {v:?}"))?);
+                duration = Some(
+                    v.parse()
+                        .with_context(|| format!("--duration: invalid number {v:?}"))?,
+                );
             }
             "-o" => out = Some(require_value(&mut args, "-o").into()),
             "--help" | "-h" => {
@@ -235,59 +318,133 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
         eprintln!("--manifest is required\n{USAGE}");
         std::process::exit(2);
     };
+    let Some(provenance_module) = provenance_module else {
+        eprintln!("--provenance-module is required\n{USAGE}");
+        std::process::exit(2);
+    };
     let scope = resolve_scope(pid, cgroup)?;
     if mode != "metrics" && mode != "profile" {
         eprintln!("mode {mode} not implemented in this phase\n{USAGE}");
         std::process::exit(2);
     }
 
-    let (manifest, plan) = load_plan(&manifest_path)?;
+    let (manifest, plan, objects) = load_plan(&manifest_path, &provenance_module)?;
 
-    let mut session = Session::start(&plan, &scope).context("starting attach session")?;
+    let mut session = Session::start(&plan, &scope, &objects).context("starting attach session")?;
+    objects
+        .verify_stable()
+        .map_err(anyhow::Error::msg)
+        .context("rechecking authorized provider objects after attach")?;
     report_attach_failures(&session);
 
     // Only `--mode profile` decodes the event stream; `--mode metrics` never
     // drains the ring buffer, so it stays the lighter, maps-only level.
     let mut state = semantics::State::new(&plan);
+    let mut process_tracker = process::Tracker::new();
     load_mech_shapes(&mut state)?;
     let mut malformed_records: u64 = 0;
-    let drain_events = |session: &mut Session, state: &mut semantics::State| -> Result<u64> {
+    let drain_events = |session: &mut Session,
+                        state: &mut semantics::State,
+                        tracker: &mut process::Tracker|
+     -> Result<u64> {
         let mut drain = events::Drain::new(&mut session.ebpf)?;
-        drain.poll(|ev| state.observe(&ev));
+        drain.poll(|ev| {
+            if observe_fork(tracker, state, &ev) {
+                return;
+            }
+            let process = identify_tracked(tracker, state, &ev);
+            state.observe_process(process, &ev);
+            if !state.has_process_state(process) {
+                state.retire_process(process);
+                tracker.retire(process);
+            }
+        });
         Ok(drain.malformed())
     };
 
     let interrupted = install_sigint_flag()?;
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    let mut stdout_open = true;
     let wall_start = SystemTime::now();
     let clock = Instant::now();
     loop {
+        objects
+            .ensure_stable()
+            .map_err(anyhow::Error::msg)
+            .context("authorized provider object changed during capture")?;
         let elapsed = clock.elapsed();
+        retire_exited(&mut process_tracker, &mut state);
         if should_stop(&interrupted, elapsed, duration) {
             break;
         }
-        let event_loss = if mode == "profile" {
-            malformed_records += drain_events(&mut session, &mut state)?;
-            metrics::lost_events(&session)?
-        } else {
-            0
-        };
+        if mode == "profile" {
+            malformed_records += drain_events(&mut session, &mut state, &mut process_tracker)?;
+        }
+        let mut kernel_evidence = metrics::kernel_evidence(&session)?;
+        if mode != "profile" {
+            kernel_evidence.ring_loss = 0;
+        }
         let reports = metrics::read(&session, &plan)?;
-        let ev = evidence_for(&plan, &session, &reports, event_loss, malformed_records, &state);
+        let ev = evidence_for(
+            &plan,
+            &session,
+            &reports,
+            kernel_evidence,
+            process_tracker.evidence(),
+            malformed_records,
+            &state,
+        );
         let frame = render::live(&reports, &ev, elapsed, &manifest.module_path, &mode);
-        print!("\x1b[2J\x1b[H{frame}");
-        std::io::stdout().flush().ok();
+        objects
+            .ensure_stable()
+            .map_err(anyhow::Error::msg)
+            .context("authorized provider object changed during capture")?;
+        write_stdout(
+            &mut stdout,
+            &mut stdout_open,
+            format!("\x1b[2J\x1b[H{frame}").as_bytes(),
+        )?;
+        flush_stdout(&mut stdout, &mut stdout_open)?;
+        if !stdout_open && out.is_none() {
+            break;
+        }
         std::thread::sleep(Duration::from_secs(1));
     }
 
+    objects
+        .ensure_stable()
+        .map_err(anyhow::Error::msg)
+        .context("authorized provider object changed during capture")?;
     if mode == "profile" {
-        malformed_records += drain_events(&mut session, &mut state)?;
+        malformed_records += drain_events(&mut session, &mut state, &mut process_tracker)?;
     }
+    retire_exited(&mut process_tracker, &mut state);
     let reports = metrics::read(&session, &plan)?;
-    let event_loss = if mode == "profile" { metrics::lost_events(&session)? } else { 0 };
-    let ev = evidence_for(&plan, &session, &reports, event_loss, malformed_records, &state);
+    let mut kernel_evidence = metrics::kernel_evidence(&session)?;
+    if mode != "profile" {
+        kernel_evidence.ring_loss = 0;
+    }
+    let ev = evidence_for(
+        &plan,
+        &session,
+        &reports,
+        kernel_evidence,
+        process_tracker.evidence(),
+        malformed_records,
+        &state,
+    );
     let frame = render::live(&reports, &ev, clock.elapsed(), &manifest.module_path, &mode);
-    print!("\x1b[2J\x1b[H{frame}");
-    std::io::stdout().flush().ok();
+    objects
+        .ensure_stable()
+        .map_err(anyhow::Error::msg)
+        .context("authorized provider object changed during capture")?;
+    write_stdout(
+        &mut stdout,
+        &mut stdout_open,
+        format!("\x1b[2J\x1b[H{frame}").as_bytes(),
+    )?;
+    flush_stdout(&mut stdout, &mut stdout_open)?;
 
     if let Some(out_path) = out {
         let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
@@ -296,23 +453,27 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
             .to_string();
         let started = fmt_rfc3339(wall_start);
         let ended = fmt_rfc3339(SystemTime::now());
+        let build_id = manifest
+            .objects
+            .iter()
+            .find(|o| o.path == manifest.module_path)
+            .and_then(|o| o.identity.value.as_deref());
+        let capture = render::CaptureMeta {
+            module: &manifest.module_path,
+            build_id,
+            started: &started,
+            ended: &ended,
+            kernel: &kernel,
+        };
         let j = if mode == "profile" {
-            let build_id = manifest
-                .objects
-                .iter()
-                .find(|o| o.path == manifest.module_path)
-                .and_then(|o| o.identity.value.as_deref());
-            let capture = render::CaptureMeta {
-                module: &manifest.module_path,
-                build_id,
-                started: &started,
-                ended: &ended,
-                kernel: &kernel,
-            };
             render::profile_json(&reports, &ev, &state, &capture)
         } else {
-            render::json(&reports, &ev, &manifest.module_path, &started, &ended, &kernel)
+            render::json(&reports, &ev, &capture)
         };
+        objects
+            .ensure_stable()
+            .map_err(anyhow::Error::msg)
+            .context("authorized provider object changed during capture")?;
         write_json_report(&out_path, &j)?;
     }
 
@@ -336,6 +497,7 @@ fn write_json_report(path: &std::path::Path, j: &serde_json::Value) -> Result<()
 /// enough that folding it into `profile`'s loop would tangle both.
 fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
     let mut manifest_path: Option<PathBuf> = None;
+    let mut provenance_module: Option<PathBuf> = None;
     let mut pid: Option<u32> = None;
     let mut cgroup: Option<PathBuf> = None;
     let mut duration: Option<u64> = None;
@@ -344,15 +506,23 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--manifest" => manifest_path = Some(require_value(&mut args, "--manifest").into()),
+            "--provenance-module" => {
+                provenance_module = Some(require_value(&mut args, "--provenance-module").into())
+            }
             "--pid" => {
                 let v = require_value(&mut args, "--pid");
-                pid = Some(v.parse().with_context(|| format!("--pid: invalid number {v:?}"))?);
+                pid = Some(
+                    v.parse()
+                        .with_context(|| format!("--pid: invalid number {v:?}"))?,
+                );
             }
             "--cgroup" => cgroup = Some(require_value(&mut args, "--cgroup").into()),
             "--duration" => {
                 let v = require_value(&mut args, "--duration");
-                duration =
-                    Some(v.parse().with_context(|| format!("--duration: invalid number {v:?}"))?);
+                duration = Some(
+                    v.parse()
+                        .with_context(|| format!("--duration: invalid number {v:?}"))?,
+                );
             }
             "-o" => out = Some(require_value(&mut args, "-o").into()),
             "--help" | "-h" => {
@@ -370,6 +540,10 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
         eprintln!("--manifest is required\n{USAGE}");
         std::process::exit(2);
     };
+    let Some(provenance_module) = provenance_module else {
+        eprintln!("--provenance-module is required\n{USAGE}");
+        std::process::exit(2);
+    };
     if duration.is_none() {
         eprintln!(
             "p11scope: no --duration given; trace streams until interrupted (Ctrl-C) or the \
@@ -377,12 +551,17 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
         );
     }
     let scope = resolve_scope(pid, cgroup)?;
-    let (_manifest, plan) = load_plan(&manifest_path)?;
+    let (_manifest, plan, objects) = load_plan(&manifest_path, &provenance_module)?;
 
-    let mut session = Session::start(&plan, &scope).context("starting attach session")?;
+    let mut session = Session::start(&plan, &scope, &objects).context("starting attach session")?;
+    objects
+        .verify_stable()
+        .map_err(anyhow::Error::msg)
+        .context("rechecking authorized provider objects after attach")?;
     report_attach_failures(&session);
 
     let mut state = semantics::State::new(&plan);
+    let mut process_tracker = process::Tracker::new();
     load_mech_shapes(&mut state)?;
     let mut tracer = trace::Tracer::new(&plan);
 
@@ -394,20 +573,48 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
     };
 
     let interrupted = install_sigint_flag()?;
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    let mut stdout_open = true;
     let mut malformed_records: u64 = 0;
     let mut last_reported_loss: u64 = 0;
     let clock = Instant::now();
     loop {
+        objects
+            .ensure_stable()
+            .map_err(anyhow::Error::msg)
+            .context("authorized provider object changed during capture")?;
         let elapsed = clock.elapsed();
         if should_stop(&interrupted, elapsed, duration) {
             break;
         }
-        malformed_records +=
-            drain_trace_events(&mut session, &mut state, &mut tracer, &mut out_file)?;
-        report_trace_loss(&session, &mut last_reported_loss, &mut out_file)?;
-        std::io::stdout().flush().ok();
+        malformed_records += drain_trace_events(
+            &mut session,
+            &mut state,
+            &mut process_tracker,
+            &mut tracer,
+            &mut stdout,
+            &mut stdout_open,
+            &mut out_file,
+        )?;
+        retire_exited(&mut process_tracker, &mut state);
+        objects
+            .ensure_stable()
+            .map_err(anyhow::Error::msg)
+            .context("authorized provider object changed during capture")?;
+        report_trace_loss(
+            &session,
+            &mut last_reported_loss,
+            &mut stdout,
+            &mut stdout_open,
+            &mut out_file,
+        )?;
+        flush_stdout(&mut stdout, &mut stdout_open)?;
         if let Some(f) = out_file.as_mut() {
-            f.flush().ok();
+            f.flush().context("flushing trace output file")?;
+        }
+        if !stdout_open && out_file.is_none() {
+            break;
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -415,54 +622,156 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
     // Final drain: catch whatever arrived since the last poll, then report
     // the closing loss line — a trace that lost events must never end
     // silently.
-    malformed_records += drain_trace_events(&mut session, &mut state, &mut tracer, &mut out_file)?;
-    report_trace_loss(&session, &mut last_reported_loss, &mut out_file)?;
+    malformed_records += drain_trace_events(
+        &mut session,
+        &mut state,
+        &mut process_tracker,
+        &mut tracer,
+        &mut stdout,
+        &mut stdout_open,
+        &mut out_file,
+    )?;
+    retire_exited(&mut process_tracker, &mut state);
+    objects
+        .ensure_stable()
+        .map_err(anyhow::Error::msg)
+        .context("authorized provider object changed during capture")?;
+    report_trace_loss(
+        &session,
+        &mut last_reported_loss,
+        &mut stdout,
+        &mut stdout_open,
+        &mut out_file,
+    )?;
+    let reports = metrics::read(&session, &plan)?;
+    let evidence = evidence_for(
+        &plan,
+        &session,
+        &reports,
+        metrics::kernel_evidence(&session)?,
+        process_tracker.evidence(),
+        malformed_records,
+        &state,
+    );
+    objects
+        .ensure_stable()
+        .map_err(anyhow::Error::msg)
+        .context("authorized provider object changed during capture")?;
+    emit_trace_line(
+        &trace::evidence_line(&evidence),
+        &mut stdout,
+        &mut stdout_open,
+        &mut out_file,
+    )?;
     if malformed_records > 0 {
         eprintln!(
             "p11scope: {malformed_records} malformed ring-buffer records discarded this capture"
         );
     }
     if let Some(f) = out_file.as_mut() {
-        f.flush().ok();
+        f.flush().context("flushing trace output file")?;
     }
 
     Ok(())
 }
 
 /// Prints (and, if given, appends to the `-o` file) every rendered line.
-fn emit_trace_line(line: &str, out_file: &mut Option<std::io::BufWriter<std::fs::File>>) {
-    println!("{line}");
+fn emit_trace_line<W: Write>(
+    line: &str,
+    stdout: &mut dyn Write,
+    stdout_open: &mut bool,
+    out_file: &mut Option<W>,
+) -> Result<()> {
+    write_stdout(stdout, stdout_open, format!("{line}\n").as_bytes())?;
     if let Some(f) = out_file {
-        let _ = writeln!(f, "{line}");
+        writeln!(f, "{line}").context("writing trace output file")?;
+    }
+    Ok(())
+}
+
+fn write_stdout(writer: &mut dyn Write, open: &mut bool, bytes: &[u8]) -> Result<()> {
+    if !*open {
+        return Ok(());
+    }
+    match writer.write_all(bytes) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+            *open = false;
+            Ok(())
+        }
+        Err(error) => Err(error).context("writing stdout"),
+    }
+}
+
+fn flush_stdout(writer: &mut dyn Write, open: &mut bool) -> Result<()> {
+    if !*open {
+        return Ok(());
+    }
+    match writer.flush() {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+            *open = false;
+            Ok(())
+        }
+        Err(error) => Err(error).context("flushing stdout"),
     }
 }
 
 /// Drains whatever the ring buffer currently holds, rendering and
 /// emitting one line per completed call. Returns the malformed-record
 /// count from this drain, to accumulate at the call site.
-fn drain_trace_events(
+fn drain_trace_events<W: Write>(
     session: &mut Session,
     state: &mut semantics::State,
+    tracker: &mut process::Tracker,
     tracer: &mut trace::Tracer<'_>,
-    out_file: &mut Option<std::io::BufWriter<std::fs::File>>,
+    stdout: &mut dyn Write,
+    stdout_open: &mut bool,
+    out_file: &mut Option<W>,
 ) -> Result<u64> {
     let mut drain = events::Drain::new(&mut session.ebpf)?;
-    drain.poll(|ev| emit_trace_line(&tracer.on_event(&ev, state), out_file));
+    let mut write_error = None;
+    drain.poll(|ev| {
+        if observe_fork(tracker, state, &ev) {
+            return;
+        }
+        let process = identify_tracked(tracker, state, &ev);
+        if write_error.is_none() {
+            write_error = emit_trace_line(
+                &tracer.on_event_process(&ev, process, state),
+                stdout,
+                stdout_open,
+                out_file,
+            )
+            .err();
+        } else {
+            state.observe_process(process, &ev);
+        }
+        if !state.has_process_state(process) {
+            state.retire_process(process);
+            tracker.retire(process);
+        }
+    });
+    if let Some(error) = write_error {
+        return Err(error);
+    }
     Ok(drain.malformed())
 }
 
 /// Emits `LOST n events` when the ring buffer's loss counter has grown
 /// since the last report — mandatory whenever it is nonzero, so a trace
 /// that dropped events never ends silently.
-fn report_trace_loss(
+fn report_trace_loss<W: Write>(
     session: &Session,
     last_reported_loss: &mut u64,
-    out_file: &mut Option<std::io::BufWriter<std::fs::File>>,
+    stdout: &mut dyn Write,
+    stdout_open: &mut bool,
+    out_file: &mut Option<W>,
 ) -> Result<()> {
     let lost = metrics::lost_events(session)?;
     if lost > *last_reported_loss {
         if let Some(line) = trace::lost_line(lost) {
-            emit_trace_line(&line, out_file);
+            emit_trace_line(&line, stdout, stdout_open, out_file)?;
         }
         *last_reported_loss = lost;
     }
@@ -478,26 +787,62 @@ fn evidence_for(
     plan: &plan::AttachPlan,
     session: &Session,
     reports: &[metrics::SlotReport],
-    event_loss: u64,
+    kernel_evidence: metrics::KernelEvidence,
+    tracking_evidence: process::TrackingEvidence,
     malformed_records: u64,
     state: &semantics::State,
 ) -> render::Evidence {
+    let semantic = state.semantic_evidence();
     let mut ev = render::Evidence {
         table_entries: plan.entries_seen,
         slots: plan.slots.len(),
         attached_probes: session.attached_probes(),
-        attach_failures: session.attach_failures().iter().map(|(_, msg)| msg.clone()).collect(),
-        aliased: plan.slots.iter().filter(|s| s.aliased).map(|s| s.names.clone()).collect(),
+        attach_failures: session
+            .attach_failures()
+            .iter()
+            .map(|(_, msg)| msg.clone())
+            .collect(),
+        aliased: plan
+            .slots
+            .iter()
+            .filter(|s| s.aliased)
+            .map(|s| s.names.clone())
+            .collect(),
         skipped: plan
             .skipped
             .iter()
-            .map(|s| render::SkippedOut { name: s.name.clone(), reason: s.reason.clone() })
+            .map(|s| render::SkippedOut {
+                name: s.name.clone(),
+                reason: s.reason.clone(),
+            })
             .collect(),
         in_flight_at_end: reports.iter().map(|r| r.in_flight).sum(),
         surfaces: plan.surfaces.clone(),
         vendor_interfaces: plan.vendor_interfaces,
         interface_list: plan.interface_list.clone(),
-        event_loss,
+        event_loss: kernel_evidence.ring_loss,
+        start_insert_failures: kernel_evidence.start_insert_failures,
+        unmatched_returns: kernel_evidence.unmatched_returns,
+        rv_update_failures: kernel_evidence.rv_update_failures,
+        cgroup_scope_failures: kernel_evidence.cgroup_scope_failures,
+        semantic_capture_failures: kernel_evidence.semantic_capture_failures
+            + semantic.semantic_capture_failures,
+        template_tail_failures: kernel_evidence.template_tail_failures,
+        process_tracking_fallbacks: tracking_evidence.fallbacks,
+        process_tracking_failures: tracking_evidence.failures,
+        process_tracking_evictions: tracking_evidence.evictions,
+        state_reconciliations: semantic.state_reconciliations,
+        session_cancel_ambiguities: semantic.session_cancel_ambiguities,
+        session_cancel_unknown_flags: semantic.session_cancel_unknown_flags,
+        operation_state_imports: semantic.operation_state_imports,
+        auth_state_ambiguities: semantic.auth_state_ambiguities,
+        async_target_failures: semantic.async_target_failures,
+        async_orphans: semantic.async_orphans,
+        async_duplicates: semantic.async_duplicates,
+        async_evictions: semantic.async_evictions,
+        fork_state_ambiguities: semantic.fork_state_ambiguities,
+        semantic_state_drops: semantic.semantic_state_drops,
+        pending_at_end: state.pending_at_end(),
         malformed_records,
         orphan_ops: state.orphan_ops(),
         unmatched_closes: state.unmatched_closes(),
@@ -536,6 +881,29 @@ fn fmt_rfc3339(t: SystemTime) -> String {
 mod tests {
     use super::*;
 
+    struct FailingWriter {
+        kind: std::io::ErrorKind,
+        fail_flush: bool,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            if self.fail_flush {
+                Ok(0)
+            } else {
+                Err(std::io::Error::from(self.kind))
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush {
+                Err(std::io::Error::from(self.kind))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     /// build.rs must embed the real cross-compiled BPF object, never a
     /// placeholder byte array — a stub would silently break every attach.
     #[test]
@@ -564,10 +932,17 @@ mod tests {
     fn should_stop_on_interrupt_regardless_of_duration() {
         let interrupted = AtomicBool::new(false);
         assert!(!should_stop(&interrupted, Duration::from_secs(0), None));
-        assert!(!should_stop(&interrupted, Duration::from_secs(0), Some(3600)));
+        assert!(!should_stop(
+            &interrupted,
+            Duration::from_secs(0),
+            Some(3600)
+        ));
 
         interrupted.store(true, Ordering::Relaxed);
-        assert!(should_stop(&interrupted, Duration::from_secs(0), None), "no --duration set at all");
+        assert!(
+            should_stop(&interrupted, Duration::from_secs(0), None),
+            "no --duration set at all"
+        );
         assert!(
             should_stop(&interrupted, Duration::from_secs(0), Some(3600)),
             "must stop immediately even mid-way through a long --duration"
@@ -581,6 +956,78 @@ mod tests {
         assert!(!should_stop(&interrupted, Duration::from_secs(4), Some(5)));
     }
 
+    #[test]
+    fn fork_only_traffic_does_not_consume_process_tracking_budget() {
+        let plan = plan::AttachPlan {
+            slots: vec![],
+            skipped: vec![],
+            entries_seen: 0,
+            surfaces: vec![],
+            vendor_interfaces: 0,
+            interface_list: "absent".into(),
+        };
+        let mut state = semantics::State::new(&plan);
+        let mut tracker = process::Tracker::with_limits(0, 1);
+        for parent in 100_000..100_100u32 {
+            let event = p11scope_ebpf_common::Event {
+                event_type: p11scope_ebpf_common::event_type::FORK,
+                pid_tgid: u64::from(parent) << 32,
+                session: u64::from(parent + 1),
+                ..Default::default()
+            };
+            assert!(observe_fork(&mut tracker, &mut state, &event));
+        }
+        assert_eq!(tracker.evidence(), process::TrackingEvidence::default());
+    }
+
+    #[test]
+    fn manifest_v1_is_rejected_with_rediscovery_instruction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest-v1.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "schema":"p11scope-manifest/1",
+                "module_path":"/opt/provider.so",
+                "objects":[],
+                "interface_list":{"status":"absent"},
+                "surfaces":[],
+                "vendor_interfaces":[],
+                "alias_groups":[]
+            }"#,
+        )
+        .unwrap();
+
+        let err = load_plan(&path, std::path::Path::new("/unused"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rediscover"), "{err}");
+    }
+
+    #[test]
+    fn manifest_v2_is_rejected_with_rediscovery_instruction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest-v2.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "schema":"p11scope-manifest/2",
+                "module_path":"/opt/provider.so",
+                "objects":[{"id":0,"path":"/opt/provider.so","identity":{"kind":"gnu_build_id","value":"aa","reusable":true,"note":null}}],
+                "interface_list":{"status":"absent"},
+                "surfaces":[],
+                "vendor_interfaces":[],
+                "alias_groups":[]
+            }"#,
+        )
+        .unwrap();
+
+        let err = load_plan(&path, std::path::Path::new("/unused"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rediscover"), "{err}");
+    }
+
     /// The finalization a stopped loop runs into (profile's `-o` write)
     /// succeeds and produces valid JSON — exercised directly, standing in
     /// for "Ctrl-C a capture, confirm -o has valid JSON" without a real
@@ -590,12 +1037,43 @@ mod tests {
     fn shutdown_path_writes_a_valid_json_report() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("observed.json");
-        let j = serde_json::json!({"schema": "pkcs11-scope/observed-profile/v1.2", "evidence": {}});
+        let j = serde_json::json!({"schema": "pkcs11-scope/observed-profile/v1.3", "evidence": {}});
 
         write_json_report(&path, &j).expect("shutdown finalization must write the report");
 
         let written = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
-        assert_eq!(parsed["schema"], "pkcs11-scope/observed-profile/v1.2");
+        assert_eq!(parsed["schema"], "pkcs11-scope/observed-profile/v1.3");
+    }
+
+    #[test]
+    fn broken_stdout_closes_only_that_sink_and_file_continues() {
+        let mut stdout = FailingWriter {
+            kind: std::io::ErrorKind::BrokenPipe,
+            fail_flush: false,
+        };
+        let mut stdout_open = true;
+        let mut file = Some(Vec::new());
+        emit_trace_line("final", &mut stdout, &mut stdout_open, &mut file).unwrap();
+        assert!(!stdout_open);
+        assert_eq!(file.unwrap(), b"final\n");
+    }
+
+    #[test]
+    fn trace_file_write_and_flush_errors_propagate() {
+        let mut stdout = Vec::new();
+        let mut stdout_open = true;
+        let mut file = Some(FailingWriter {
+            kind: std::io::ErrorKind::Other,
+            fail_flush: false,
+        });
+        assert!(emit_trace_line("x", &mut stdout, &mut stdout_open, &mut file).is_err());
+
+        let mut flush = FailingWriter {
+            kind: std::io::ErrorKind::Other,
+            fail_flush: true,
+        };
+        let mut open = true;
+        assert!(flush_stdout(&mut flush, &mut open).is_err());
     }
 }

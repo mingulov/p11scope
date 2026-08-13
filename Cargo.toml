@@ -15,14 +15,18 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = "1"
 aya = "=0.14.0"
+cryptoki-sys = "0.5"
+libc = "0.2"
 p11scope-ebpf-common = { path = "crates/ebpf-common", features = ["user"] }
 p11scope-manifest = { path = "crates/manifest", features = ["identify"] }
-pkcs11-proxy-ng-types = { git = "https://github.com/mingulov/pkcs11-proxy-ng", rev = "7c5c86043820eb3795f40c65a36ce961cdfd26c5" }
+pkcs11-module = { git = "https://github.com/mingulov/pkcs11-proxy-ng", rev = "a2aab6cd67d21d140277a4584942e06c903f165b" }
+pkcs11-proxy-ng-types = { git = "https://github.com/mingulov/pkcs11-proxy-ng", rev = "a2aab6cd67d21d140277a4584942e06c903f165b" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 signal-hook = { version = "0.4.4", default-features = false }
 
 [dev-dependencies]
+p11scope-discover = { path = "crates/discover" }
 tempfile = "3"
 
 [workspace]

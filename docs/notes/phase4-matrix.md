@@ -6,6 +6,13 @@ Ubuntu 24.04.4, glibc 2.39, kernel 7.0.0-28-generic, Docker 29.7.2
 (storage driver `overlay2`, cgroup driver `systemd`, cgroup2 unified
 hierarchy).
 
+The PASS rows below are the recorded pre-v3 environment runs. The scripts now
+include the manifest-v3 fresh-provenance gate, but those privileged/container
+runs have not yet been repeated. Current authorization additionally requires
+file ownership or `CAP_LEASE` and capture-lifetime object leases; the updated
+privileged matrix remains pending approval. Current unprivileged checks are
+recorded in `docs/superpowers/plans/ROADMAP.md`.
+
 ## Final matrix (Gate G4)
 
 | Environment | Script | Result | Completeness | Measured privileges |
@@ -43,20 +50,11 @@ Stated plainly, not buried in the row detail below:
   The override is Knative's own documented escape hatch (named in its own
   error message), applied to the affected Deployments — a version-compat
   accommodation, not a functional change to anything under test.
-- **A real `p11scope-discover` identity-computation gap, worked around, not
-  hidden.** Discovering against a magic `/proc/<pid>/root/...` path (the
-  Knative row, where no live container exists at attach time) makes
-  `identity()` read the object's path as reported by discover's own
-  `/proc/self/maps`, which is unreachable from discover's own mount
-  namespace — the object is wrongly recorded `Unavailable`/`reusable:
-  false`, and `p11scope profile` refuses to attach. Worked around by
-  recomputing the GNU build-id out-of-band with `readelf -n` (the same
-  authoritative source `identity.rs` itself falls back to) and patching the
-  manifest before attach; the actual uprobe attach, cgroup scoping, and
-  timing proof are untouched. Recommended upstream fix (out of this task's
-  scope): teach `p11scope-discover` to compute identity from the
-  already-accessible `--module` path instead of the maps-derived one.
-  Full chain of evidence: Row 4 below.
+- **Namespace-rewritten manifests now fail closed without fresh provenance.**
+  Docker, kind, shared-layer, and Knative lanes retain the container/snapshot
+  path for attachment but pass a byte-identical unprivileged safe copy via
+  `--provenance-module`. Whole-file SHA-256 and every function offset must
+  match; the former out-of-band build-ID patch is gone. Full chain: Row 4.
 - **Per-container attribution is now exposed via CLI/JSON** (stale as of
   this row's original writing — fixed here). `cgroup_id` was captured on
   every event with no consumer at the time this row was written; Task 6
@@ -105,7 +103,9 @@ Two problems, both solved explicitly in `verify-docker.sh`:
    feeds two separate consumers that both read `manifest.objects[].path`
    directly with no namespace awareness of their own: `attach.rs`'s
    `prog.attach(point, &slot.object, ...)` (the actual uprobe target) and
-   `verify.rs::check_reuse` (the identity re-check gate). Matches the
+   `verify.rs::check_reuse` (the identity re-check gate). Fresh discovery is
+   separately run against a byte-identical safe copy and compared before the
+   attach plan is built. Matches the
    Phase 0 spike's bpftrace path-prefix trick exactly (see
    `docs/superpowers/plans/2026-08-10-phase0-feasibility-spike.md`, Task
    4).
@@ -265,43 +265,14 @@ image's layers matched, the script picks the highest-numbered snapshot id
 whichever image was unpacked most recently, i.e. the one this run just
 loaded.)
 
-**A genuine tool gap, found and worked around precisely (not faked
-around).** `p11scope-discover` computes each object's identity
-(`crates/manifest/src/identity.rs`) by re-reading the path it resolved
-from *its own* `/proc/self/maps`
-(`crates/discover/src/discover.rs:60`, via `maps.rs`). When discover is
-invoked directly against a magic `/proc/<pid>/root/...` path, the kernel's
-maps entry for the dlopen'd library reports the path canonicalized to its
-own owning mount — with no `/proc/<pid>/root` prefix — which is
-unreachable from discover's own mount namespace. `identity()`'s
-`fs::read` then fails with ENOENT and the object is recorded
-`Unavailable`/`reusable: false`. `p11scope profile` then refuses to
-attach ("manifest identity is not reusable"), even though the (separately
-rewritten) object *path* is perfectly valid and readable as root. This
-was reproduced and confirmed by direct code reading, not assumed:
-`crates/discover/src/discover.rs` L14-20 (dlopen, then reads
-`/proc/self/maps`), L54-66 (`identity::identify(&path)` on that
-maps-derived path), and `crates/manifest/src/identity.rs` L33-44 (the
-failing `std::fs::read`). There is no existing flag or hook to make
-identity computation use the already-accessible `--module` path instead —
-this is a real, narrow gap in `p11scope-discover`, not a documented or
-avoidable behavior.
-
-**The workaround does not touch or fake the actual capture mechanism.**
-`identity` is bookkeeping consumed only by the manifest-reuse gate
-(`src/verify.rs`); the actual uprobe attach (`src/attach.rs`) uses
-`objects[].path` directly and never looks at `identity`. The script
-recomputes the GNU build-id out-of-band with `readelf -n` — the exact
-same authoritative source `identity.rs` itself falls back to — and patches
-the manifest's identity field before handing it to `p11scope profile`.
-The eBPF attach, the cgroup scoping, and the timing proof (attach before
-pod creation) are all real and unmodified; only a metadata field that
-discover currently computes incorrectly for this one path shape was
-corrected. **Recommended follow-up (not done here, out of this task's
-scope): teach `p11scope-discover` to compute identity against the
-already-accessible `--module` argument's resolved form instead of the
-maps-derived one**, so this class of magic-symlink-crossing invocation
-works without an external patch step.
+**Fresh provenance without a live pod.** The exact snapshot ELF is copied to
+an unprivileged safe path and discovered there. The stored manifest keeps the
+stable snapshot inode as its attach path, while `--provenance-module` names
+the safe copy. Manifest v3 verifies equivalence with whole-file SHA-256
+and compares every provider-table function role and file offset before
+`plan::build`; GNU build-ID is retained only as reporting evidence. No
+identity field is patched, and inability to reproduce dependent target
+objects refuses the capture.
 
 **Kubernetes-version floor.** `knative-v1.23.0`'s controller/webhook/etc.
 refuse to start against kind's default node (Kubernetes v1.33.1):
@@ -369,7 +340,9 @@ host needs only `CAP_SYS_ADMIN`; Docker/kind (crossing into a
 different-uid container/pod process's `/proc/<pid>/root`) need
 `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` — neither environment needs full root,
 which the earlier rows' coarser "root via sudo" privilege notes did not
-distinguish.
+distinguish. These are the pre-hardening BPF/procfs measurements; current
+authorization also requires file ownership or `CAP_LEASE`, and the updated
+privileged lane has not yet been rerun.
 
 ## Not yet covered by this file
 

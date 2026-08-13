@@ -25,18 +25,44 @@ cd "$(dirname "$0")/.."
 
 MODULE=/usr/lib/softhsm/libsofthsm2.so
 WORK=target/canaries
+TRUST_DIR="$PWD/$WORK/trusted"
 
 mkdir -p "$WORK"
+. scripts/trusted-p11scope.sh
 
 command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
 command -v softhsm2-util >/dev/null || { echo "softhsm2-util required"; exit 1; }
 command -v bpftool >/dev/null || { echo "bpftool required"; exit 1; }
 command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
+sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
 test -f "$MODULE" || { echo "SoftHSM2 not installed at $MODULE"; exit 1; }
+
+WPID=
+SPID=
+OBSERVER_PID=
+cleanup() {
+    status=$?
+    trap - EXIT INT TERM
+    [ -z "$OBSERVER_PID" ] || sudo kill -TERM "$OBSERVER_PID" 2>/dev/null || true
+    [ -z "$WPID" ] || kill -TERM "$WPID" 2>/dev/null || true
+    [ -z "$SPID" ] || kill -TERM "$SPID" 2>/dev/null || true
+    [ -z "$WPID" ] || wait "$WPID" 2>/dev/null || true
+    [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || true
+    remove_trusted_p11scope "$TRUST_DIR"
+    exit "$status"
+}
+. scripts/cleanup-traps.sh
 
 echo "=== build ==="
 cargo build --release --workspace
+stage_trusted_p11scope target/release/p11scope \
+    target/release/p11scope-discover "$TRUST_DIR"
 gcc -O0 -Wall -o "$WORK/canary_workload" scripts/fixtures/canary_workload.c -ldl
+gcc -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 -DPRIVACY_BLOCKS=1 \
+    -o "$WORK/privacy-provider.so" crates/discover/tests/fixture/version_matrix.c
+gcc -O0 -Wall -Wextra -pthread -o "$WORK/privacy-stack-workload" \
+    scripts/fixtures/privacy-stack-workload.c -ldl
+python3 scripts/dump-owned-bpf-maps.py --self-test
 
 echo "=== softhsm token ==="
 export SOFTHSM2_CONF="$WORK/softhsm2.conf"
@@ -56,85 +82,61 @@ echo "=== discover ==="
 ./target/release/p11scope-discover --module "$MODULE" -o "$WORK/manifest.json"
 
 echo "=== observe (canary workload under attach) ==="
-rm -f "$WORK/go"
-# Snapshot loaded programs *before* this run's attach. This sandbox's
-# kernel has been observed to retain stray p11_entry/p11_return copies
-# from earlier, unrelated captures (their prog fds end up held open by
-# PID 1 well after the owning p11scope process exits — an environment
-# quirk, not something this script causes or can fix). Matching on name
-# alone would risk dumping — and attributing a "leak" to — a foreign,
-# unrelated program's maps. Diffing against this snapshot isolates the
-# programs *this* run's attach actually created.
-sudo bpftool prog show --json > "$WORK/progs_before.json"
-
+rm -f "$WORK/go" "$WORK/observer.pid" "$WORK/observed.json" "$WORK/profile.log" \
+    "$WORK"/mapdump_*.json "$WORK"/mapdump_manifest_*.json
 ( while [ ! -f "$WORK/go" ]; do sleep 0.05; done; exec "$WORK/canary_workload" "$MODULE" ) &
 WPID=$!
-sudo --preserve-env=SOFTHSM2_CONF ./target/release/p11scope profile \
-    --manifest "$WORK/manifest.json" --pid "$WPID" \
-    --mode profile --duration 25 -o "$WORK/observed.json" \
+sudo --preserve-env=SOFTHSM2_CONF sh -c \
+    'echo $$ > "$1"; shift; exec "$@"' sh "$WORK/observer.pid" \
+    "$TRUST_DIR/p11scope" profile --manifest "$WORK/manifest.json" \
+    --provenance-module "$MODULE" --pid "$WPID" \
+    --mode profile --duration 8 -o "$WORK/observed.json" \
     > "$WORK/profile.log" 2>&1 &
 SPID=$!
 sleep 3             # let attach complete before the workload runs
-sudo bpftool prog show --json > "$WORK/progs_after.json"
+test -s "$WORK/observer.pid" || { echo "observer pid was not recorded"; exit 1; }
+OBSERVER_PID=$(cat "$WORK/observer.pid")
+sudo kill -0 "$OBSERVER_PID"
 touch "$WORK/go"
-wait "$WPID"
+if wait "$WPID"; then WPID=; else status=$?; WPID=; echo "canary workload failed: $status"; exit "$status"; fi
 echo "workload done; profiler still attached — dumping BPF maps now"
-
-echo "=== bpf map dump (every map p11_entry/p11_return own) ==="
-rm -f "$WORK"/mapdump_*.json
-python3 - "$WORK/progs_before.json" "$WORK/progs_after.json" "$WORK" <<'PY'
-import json, subprocess, sys
-
-before_path, after_path, work = sys.argv[1], sys.argv[2], sys.argv[3]
-before_ids = {p["id"] for p in json.load(open(before_path))}
-after = json.load(open(after_path))
-
-our_progs = [p for p in after
-             if p.get("name") in ("p11_entry", "p11_return") and p["id"] not in before_ids]
-if not our_progs:
-    print("no newly-attached p11_entry/p11_return program found — attach failed, or this "
-          "run's programs are indistinguishable from a pre-existing stray one",
-          file=sys.stderr)
-    sys.exit(1)
-
-map_ids = set()
-for p in our_progs:
-    map_ids.update(p.get("map_ids") or [])
-print(f"this run's programs: {[(p['id'], p['name']) for p in our_progs]}")
-
-dumped = []
-for mid in sorted(map_ids):
-    show = subprocess.run(["sudo", "bpftool", "map", "show", "id", str(mid)],
-                           capture_output=True, text=True, check=True).stdout
-    # "<id>: <type>  name <NAME>  flags ..."
-    name = show.split("name", 1)[1].split()[0]
-    # check=False: bpftool exits non-zero on BPF_MAP_TYPE_RINGBUF (EVENTS)
-    # even though it prints valid ("[]") JSON — ring buffers aren't a
-    # lookup map the kernel can iterate for dump, a structural quirk, not
-    # a failure to capture. Every map still gets dumped; still fail loudly
-    # if a map produces no parseable output at all.
-    proc = subprocess.run(["sudo", "bpftool", "map", "dump", "id", str(mid), "-j"],
-                           capture_output=True, text=True, check=False)
-    dump = proc.stdout
-    try:
-        json.loads(dump)
-    except json.JSONDecodeError:
-        print(f"bpftool map dump id {mid} ({name}) produced unparseable output: "
-              f"rc={proc.returncode} stderr={proc.stderr!r}", file=sys.stderr)
-        sys.exit(1)
-    open(f"{work}/mapdump_{name}.json", "w").write(dump)
-    dumped.append(name)
-
-open(f"{work}/mapdump_manifest.txt", "w").write("\n".join(sorted(dumped)) + "\n")
-print(f"dumped {len(dumped)} maps: {', '.join(sorted(dumped))}")
-PY
-
-wait "$SPID"
+sudo python3 scripts/dump-owned-bpf-maps.py "$OBSERVER_PID" "$WORK" base 0 16384
+if wait "$SPID"; then SPID=; OBSERVER_PID=; else status=$?; SPID=; OBSERVER_PID=; echo "profiler failed: $status"; exit "$status"; fi
+test -s "$WORK/observed.json" || { echo "profiler produced no fresh observed.json"; exit 1; }
 tail -n 20 "$WORK/profile.log"
+
+echo "=== live START map: nine blocked 2.40/3.0/3.2 calls ==="
+./target/release/p11scope-discover --module "$PWD/$WORK/privacy-provider.so" \
+    -o "$WORK/privacy-manifest.json"
+rm -f "$WORK/privacy-go" "$WORK/privacy-observer.pid" "$WORK/privacy-observed.json" \
+    "$WORK/privacy-profile.log" "$WORK/privacy-workload.log"
+( while [ ! -f "$WORK/privacy-go" ]; do sleep 0.05; done
+  exec "$WORK/privacy-stack-workload" "$PWD/$WORK/privacy-provider.so" ) \
+    > "$WORK/privacy-workload.log" 2>&1 &
+WPID=$!
+sudo --preserve-env=SOFTHSM2_CONF sh -c \
+    'echo $$ > "$1"; shift; exec "$@"' sh "$WORK/privacy-observer.pid" \
+    "$TRUST_DIR/p11scope" profile --manifest "$WORK/privacy-manifest.json" \
+    --provenance-module "$PWD/$WORK/privacy-provider.so" --pid "$WPID" \
+    --mode profile --duration 8 -o "$WORK/privacy-observed.json" \
+    > "$WORK/privacy-profile.log" 2>&1 &
+SPID=$!
+sleep 3
+test -s "$WORK/privacy-observer.pid" || { echo "privacy observer pid was not recorded"; exit 1; }
+OBSERVER_PID=$(cat "$WORK/privacy-observer.pid")
+sudo kill -0 "$OBSERVER_PID"
+touch "$WORK/privacy-go"
+sudo python3 scripts/dump-owned-bpf-maps.py "$OBSERVER_PID" "$WORK" live 9 16384
+kill -TERM "$WPID" 2>/dev/null || true
+wait "$WPID" 2>/dev/null || true
+WPID=
+if wait "$SPID"; then SPID=; OBSERVER_PID=; else status=$?; SPID=; OBSERVER_PID=; echo "privacy profiler failed: $status"; exit "$status"; fi
+test -s "$WORK/privacy-observed.json" || { echo "privacy profiler produced no fresh report"; exit 1; }
+tail -n 10 "$WORK/privacy-profile.log"
 
 echo "=== scan every artifact for every sentinel ==="
 python3 - "$WORK" <<'PY'
-import re, sys
+import json, pathlib, re, sys
 
 work = sys.argv[1]
 
@@ -148,6 +150,13 @@ SENTINELS = {
     "IV":        b"CANARY_IV_d81e4ec085489f1adfcf4729eadd745d",
     "AAD":       b"CANARY_AAD_5b1502ea971ec81f4b974fe84d62a22f",
     "BOOLLONG":  b"CANARY_BOOLLONG_7cd9f6ab17348ba2e65a43d173f9ea1d",
+    "USERNAME":  b"CANARY_USERNAME_e2df5c11270a7b893619aa831b78fc18",
+    "SIGNATURE": b"CANARY_SIGNATURE_a578d332cab775078a719c4c520bfd8c",
+    "ASYNC":     b"CANARY_ASYNC_ef239b70be4c0e1d5cb234a225fe1ff7",
+    "OUTPUT":    b"CANARY_OUTPUT_5391960450406458bc83e37c2b43b80b",
+    "ARG7":      b"CANARY_ARG7_b2747079a35f10aba729f83ff3285ddc",
+    "ARG8":      b"CANARY_ARG8_1752403b4bb53924b6881d095e3e9198",
+    "ARG9":      b"CANARY_ARG9_8f119353c9e69ce4f2f3b9a4d2aa2fab",
 }
 assert all(len(v) >= 16 for v in SENTINELS.values()), "every sentinel must be >= 16 bytes"
 
@@ -184,10 +193,13 @@ def reconstruct_from_hex_tokens(content: bytes) -> bytes:
 
 
 # --- Mandatory positive control: prove the scanner can detect a leak. ---
-control_path = f"{work}/positive_control.txt"
+control_path = f"{work}/positive_control.json"
 with open(control_path, "wb") as f:
-    f.write(b"scanner self-test scratch file: " + SENTINELS["PIN"] + b"\n")
-control_hits = hits(open(control_path, "rb").read())
+    tokens = b",".join(f'"0x{byte:02x}"'.encode() for byte in SENTINELS["PIN"])
+    f.write(b'{"value":[' + tokens + b']}\n')
+control_content = open(control_path, "rb").read()
+assert hits(control_content) == set(), "positive control accidentally contains raw/contiguous hex"
+control_hits = hits(control_content, reconstruct_from_hex_tokens(control_content))
 assert control_hits == {"PIN"}, (
     f"positive control FAILED: expected to find exactly {{'PIN'}} in "
     f"{control_path}, found {control_hits!r} — the scanner cannot be "
@@ -199,12 +211,19 @@ print(f"positive control OK: scanner found {control_hits} in {control_path}")
 text_artifacts = [
     ("observed.json", f"{work}/observed.json"),
     ("profile.log", f"{work}/profile.log"),
+    ("privacy-observed.json", f"{work}/privacy-observed.json"),
+    ("privacy-profile.log", f"{work}/privacy-profile.log"),
+    ("privacy-workload.log", f"{work}/privacy-workload.log"),
 ]
 
 # --- Real artifacts: every BPF map the program owns. ---
-map_names = open(f"{work}/mapdump_manifest.txt").read().split()
-assert map_names, "no BPF maps were dumped — nothing to scan"
-mapdump_artifacts = [(f"mapdump:{n}", f"{work}/mapdump_{n}.json") for n in map_names]
+mapdump_artifacts = []
+for manifest_path in sorted(pathlib.Path(work).glob("mapdump_manifest_*.json")):
+    for item in json.load(open(manifest_path)):
+        mapdump_artifacts.append((f"mapdump:{item['name']}:{item['id']}", item["file"]))
+assert mapdump_artifacts, "no observer-owned BPF maps were dumped — nothing to scan"
+live_start = json.load(open(f"{work}/mapdump_START_live.json"))
+assert len(live_start) >= 9, f"live START positive control is empty/short: {len(live_start)}"
 
 leaks = {}
 for label, path in text_artifacts + mapdump_artifacts:
@@ -215,7 +234,7 @@ for label, path in text_artifacts + mapdump_artifacts:
         leaks[label] = found
 
 print(f"scanned {len(text_artifacts)} text artifacts and "
-      f"{len(mapdump_artifacts)} BPF map dumps ({', '.join(map_names)}) "
+      f"{len(mapdump_artifacts)} observer-owned BPF map dumps "
       f"for {len(SENTINELS)} sentinels")
 
 if leaks:

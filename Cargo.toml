@@ -12,6 +12,9 @@ publish = false
 name = "p11scope"
 path = "src/lib.rs"
 
+[features]
+unsafe-unvalidated-metadata = []
+
 [dependencies]
 anyhow = "1"
 aya = "=0.14.0"

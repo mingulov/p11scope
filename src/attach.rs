@@ -8,7 +8,10 @@ use aya::Ebpf;
 use aya::maps::ProgramArray;
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeScope};
 use aya::programs::{TracePoint, UProbe};
-use p11scope_ebpf_common::{ARG_NONE, SlotSemantics};
+use p11scope_ebpf_common::{
+    ARG_NONE, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
+    FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, SlotSemantics,
+};
 use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
 use std::path::PathBuf;
 
@@ -21,6 +24,40 @@ pub enum Scope {
         id: u64,
         path: PathBuf,
     },
+}
+
+/// Immutable capture behavior selected by userspace before attachment.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CapturePolicy {
+    Allowlisted,
+    UnsafeUnvalidatedMetadata,
+    AggregateOnly,
+}
+
+impl CapturePolicy {
+    pub const fn config_bit(self) -> u64 {
+        match self {
+            Self::Allowlisted => FLAG_POLICY_ALLOWLISTED,
+            Self::UnsafeUnvalidatedMetadata => FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
+            Self::AggregateOnly => FLAG_POLICY_AGGREGATE,
+        }
+    }
+
+    pub const fn privacy_mode(self) -> &'static str {
+        match self {
+            Self::Allowlisted => "allowlisted",
+            Self::UnsafeUnvalidatedMetadata => "unsafe-unvalidated-metadata",
+            Self::AggregateOnly => "aggregate-only",
+        }
+    }
+
+    pub const fn uses_events(self) -> bool {
+        !matches!(self, Self::AggregateOnly)
+    }
+
+    pub const fn uses_unsafe_decoders(self) -> bool {
+        matches!(self, Self::UnsafeUnvalidatedMetadata)
+    }
 }
 
 pub struct Session {
@@ -282,6 +319,43 @@ impl Session {
     /// Successful attachments across both programs (2 per fully-attached slot).
     pub fn attached_probes(&self) -> usize {
         self.attached
+    }
+}
+
+#[cfg(test)]
+mod capture_policy {
+    use super::CapturePolicy;
+
+    #[test]
+    fn capture_policies_have_distinct_bits_and_visible_behavior() {
+        let policies = [
+            (CapturePolicy::Allowlisted, "allowlisted", true, false),
+            (
+                CapturePolicy::UnsafeUnvalidatedMetadata,
+                "unsafe-unvalidated-metadata",
+                true,
+                true,
+            ),
+            (CapturePolicy::AggregateOnly, "aggregate-only", false, false),
+        ];
+
+        for (policy, privacy_mode, uses_events, uses_unsafe_decoders) in policies {
+            assert_eq!(policy.privacy_mode(), privacy_mode);
+            assert_eq!(policy.uses_events(), uses_events);
+            assert_eq!(policy.uses_unsafe_decoders(), uses_unsafe_decoders);
+        }
+        assert_ne!(
+            CapturePolicy::Allowlisted.config_bit(),
+            CapturePolicy::UnsafeUnvalidatedMetadata.config_bit()
+        );
+        assert_ne!(
+            CapturePolicy::Allowlisted.config_bit(),
+            CapturePolicy::AggregateOnly.config_bit()
+        );
+        assert_ne!(
+            CapturePolicy::UnsafeUnvalidatedMetadata.config_bit(),
+            CapturePolicy::AggregateOnly.config_bit()
+        );
     }
 }
 

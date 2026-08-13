@@ -24,6 +24,20 @@ fn release_packages_and_smokes_the_documented_helper_path() {
 }
 
 #[test]
+fn metadata_feature_matrix() {
+    for path in ["Cargo.toml", "crates/ebpf/Cargo.toml"] {
+        assert!(
+            read(path).contains("unsafe-unvalidated-metadata = []"),
+            "{path} does not declare the diagnostic metadata feature"
+        );
+    }
+
+    let build = read("build.rs");
+    assert!(build.contains("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA"));
+    assert!(build.contains("features.join(\",\")"));
+}
+
+#[test]
 fn induced_gaps_pin_embedded_map_capacities() {
     let script = read("scripts/verify-induced-gaps.sh");
     assert!(script.contains("check-bpf-map-defs.py"));

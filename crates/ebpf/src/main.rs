@@ -432,6 +432,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {
         session: SESSION_NONE,
         slot_id: 0,
         mechanism: MECH_NONE,
+        mechanism_ptr: 0,
         flags: 0,
         out_ptr: 0,
         user_type: USER_TYPE_NONE,

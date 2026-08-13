@@ -150,6 +150,9 @@ pub const CFG_FLAGS: u32 = 0;
 /// CONFIG flag bits.
 pub const FLAG_PID_FILTER: u64 = 1 << 0;
 pub const FLAG_CGROUP_FILTER: u64 = 1 << 1;
+pub const FLAG_POLICY_ALLOWLISTED: u64 = 1 << 2;
+pub const FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA: u64 = 1 << 3;
+pub const FLAG_POLICY_AGGREGATE: u64 = 1 << 4;
 
 /// Per-slot aggregates. `entered - returned` is the in-flight count;
 /// they are separate counters precisely so a call that never returns is
@@ -400,6 +403,8 @@ pub struct CallStart {
     pub session: u64,
     pub slot_id: u64,
     pub mechanism: u64,
+    /// Transient entry-time `pMechanism`; never copied to `Event`.
+    pub mechanism_ptr: u64,
     pub flags: u64,
     /// `phSession` for C_OpenSession; 0 otherwise. Read only at return.
     pub out_ptr: u64,
@@ -552,8 +557,9 @@ mod tests {
     fn event_and_callstart_have_no_implicit_padding() {
         // Both cross the kernel/userspace boundary as raw bytes; implicit
         // tail padding would read as uninitialized on one side.
-        assert_eq!(core::mem::size_of::<CallStart>(), 264);
+        assert_eq!(core::mem::size_of::<CallStart>(), 272);
         assert_eq!(core::mem::size_of::<Event>(), 288);
+        assert_eq!(core::mem::align_of::<CallStart>(), 8);
         assert_eq!(core::mem::align_of::<Event>(), 8);
     }
 

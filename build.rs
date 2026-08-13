@@ -30,6 +30,7 @@ fn main() {
     // call rate overflows the ring buffer deliberately. Unset (the default)
     // leaves the build byte-for-byte identical to before this flag existed.
     println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_RING");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA");
     let small_ring = matches!(
         env::var("P11SCOPE_SMALL_RING").as_deref(),
         Ok("1") | Ok("true")
@@ -61,8 +62,15 @@ fn main() {
     .arg(&ebpf_manifest)
     .arg("--target-dir")
     .arg(&target_dir);
+    let mut features = Vec::new();
     if small_ring {
-        cmd.args(["--features", "small-ring"]);
+        features.push("small-ring");
+    }
+    if env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some() {
+        features.push("unsafe-unvalidated-metadata");
+    }
+    if !features.is_empty() {
+        cmd.arg("--features").arg(features.join(","));
     }
     let status = cmd
         // Cargo sets these for build-script subprocesses to point at the

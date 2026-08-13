@@ -11,7 +11,7 @@ use crate::plan::AttachPlan;
 use crate::render;
 use crate::semantics::ProcessKey;
 use crate::semantics::State;
-use p11scope_ebpf_common::{Event, MECH_NONE, SESSION_NONE, shape};
+use p11scope_ebpf_common::{Event, SESSION_NONE, capture, shape};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// `pid_tgid` (`bpf_get_current_pid_tgid()`) -> (pid, tid): tgid (process
@@ -146,7 +146,7 @@ pub fn format_line(ev: &Event, wall_ns: u128, function: &str, session: Option<u6
         line.push_str(&format!(" sess#{n}"));
     }
     line.push_str(&format!(" {function}"));
-    if ev.mechanism != MECH_NONE {
+    if ev.capture & capture::MECHANISM_MASK == capture::MECHANISM_VALUE {
         line.push(' ');
         line.push_str(&render_mechanism(ev));
     }
@@ -242,7 +242,7 @@ impl<'a> Tracer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p11scope_ebpf_common::{USER_TYPE_NONE, shape};
+    use p11scope_ebpf_common::{MECH_NONE, USER_TYPE_NONE, capture, shape};
 
     fn base_event() -> Event {
         Event {
@@ -272,6 +272,7 @@ mod tests {
     fn known_event_renders_the_documented_line_shape() {
         let mut ev = base_event();
         ev.mechanism = pkcs11_proxy_ng_types::CkMechanismType::RSA_PKCS_PSS.0;
+        ev.capture = capture::MECHANISM_VALUE;
         ev.shape = shape::RSA_PKCS_PSS;
         ev.p0 = 0x0000_0250; // CKM_SHA256
         ev.p1 = 0x2; // CKG_MGF1_SHA256
@@ -295,6 +296,7 @@ mod tests {
     fn vendor_mechanism_renders_as_hex() {
         let mut ev = base_event();
         ev.mechanism = 0x8000_1042;
+        ev.capture = capture::MECHANISM_VALUE;
         ev.shape = shape::NONE;
 
         let line = format_line(&ev, 0, "C_EncryptInit", None);
@@ -306,9 +308,25 @@ mod tests {
     }
 
     #[test]
+    fn tagged_maximum_mechanism_id_renders_as_hex() {
+        let ev = Event {
+            mechanism: u64::MAX,
+            capture: capture::MECHANISM_VALUE,
+            ..base_event()
+        };
+
+        let line = format_line(&ev, 0, "C_EncryptInit", None);
+        assert!(
+            line.contains(" C_EncryptInit 0xffffffffffffffff \u{2192} CKR_OK"),
+            "line: {line}"
+        );
+    }
+
+    #[test]
     fn known_mechanism_id_with_no_decoded_shape_still_renders_by_name_only() {
         let mut ev = base_event();
         ev.mechanism = pkcs11_proxy_ng_types::CkMechanismType::AES_GCM.0;
+        ev.capture = capture::MECHANISM_VALUE;
         ev.shape = shape::NONE; // e.g. decode failed this call
 
         let line = format_line(&ev, 0, "C_EncryptInit", None);

@@ -2,6 +2,7 @@
 //! target through one open file descriptor, and keep those leased descriptors
 //! alive through the complete capture while Aya attaches via `/proc/self/fd/*`.
 
+use crate::attach::CapturePolicy;
 use p11scope_manifest::identity::{
     IdentityKind, ObjectIdentity, inspect_file, open_object, open_regular,
 };
@@ -98,7 +99,7 @@ enum OutputMode {
         worker_stdout: std::fs::File,
         supervisor_file: Option<std::fs::File>,
         worker_file: Option<std::fs::File>,
-        privacy_mode: &'static str,
+        policy: CapturePolicy,
     },
     Profile {
         worker_stdout: std::fs::File,
@@ -108,7 +109,7 @@ enum OutputMode {
 }
 
 impl SupervisorOutput {
-    pub fn trace(path: Option<PathBuf>, privacy_mode: &'static str) -> Result<Self, String> {
+    pub fn trace(path: Option<PathBuf>, policy: CapturePolicy) -> Result<Self, String> {
         let supervisor_stdout = duplicate_fd(libc::STDOUT_FILENO)
             .map(std::fs::File::from)
             .map_err(|error| format!("duplicating trace stdout failed: {error}"))?;
@@ -126,7 +127,7 @@ impl SupervisorOutput {
             worker_stdout,
             supervisor_file,
             worker_file,
-            privacy_mode,
+            policy,
         }))
     }
 
@@ -191,14 +192,14 @@ impl SupervisorOutput {
                 worker_stdout,
                 supervisor_file,
                 worker_file,
-                privacy_mode,
+                policy,
             } => {
                 drop(worker_stdout);
                 drop(worker_file);
                 ParentOutput::Trace {
                     stdout: supervisor_stdout,
                     file: supervisor_file,
-                    privacy_mode,
+                    policy,
                 }
             }
             OutputMode::Profile {
@@ -318,7 +319,7 @@ enum ParentOutput {
     Trace {
         stdout: std::fs::File,
         file: Option<std::fs::File>,
-        privacy_mode: &'static str,
+        policy: CapturePolicy,
     },
     Profile {
         pending: Option<PendingProfile>,
@@ -330,15 +331,14 @@ impl ParentOutput {
         let Self::Trace {
             stdout,
             file,
-            privacy_mode,
+            policy,
         } = self
         else {
             return Ok(());
         };
-        let label = serde_json::to_string(privacy_mode)
-            .map_err(|error| format!("serializing privacy mode failed: {error}"))?;
         let record = format!(
-            "\nEVIDENCE {{\"completeness\":\"PARTIAL\",\"privacy_mode\":{label},\"capture_aborted\":\"object_lease_break\",\"final_drain\":false,\"counters_available\":false,\"event_loss\":null}}\n"
+            "\n{}\n",
+            crate::trace::abort_evidence_line(*policy, "object_lease_break")
         );
         debug_assert!(record.len() < 512);
         if let Some(file) = file {

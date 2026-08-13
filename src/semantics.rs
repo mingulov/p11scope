@@ -4,10 +4,13 @@
 //! handles live only in the in-memory maps below; no accessor on `State`
 //! returns one.
 
+use crate::attach::CapturePolicy;
 use crate::plan::AttachPlan;
+#[cfg(test)]
+use p11scope_ebpf_common::MECH_NONE;
 use p11scope_ebpf_common::{
-    Event, FUNCTION_NONE, LATENCY_BUCKETS, MECH_NONE, SESSION_NONE, USER_TYPE_NONE, bucket_of,
-    capture, direct, event_type, lifecycle, operation, semantic_flags, shape, transition,
+    Event, FUNCTION_NONE, LATENCY_BUCKETS, SESSION_NONE, USER_TYPE_NONE, bucket_of, capture,
+    direct, event_type, lifecycle, operation, semantic_flags, shape, transition,
 };
 use pkcs11_proxy_ng_types::CkRv;
 use std::collections::{BTreeMap, BTreeSet};
@@ -333,7 +336,8 @@ mod corrective_tests {
             "C_UnwrapKeyAuthenticated",
         ];
         let p = plan(&names);
-        let mut state = State::new(&p);
+        let mut state =
+            State::with_policy(&p, crate::attach::CapturePolicy::UnsafeUnvalidatedMetadata);
         for (index, name) in names.iter().enumerate() {
             let mut ev = mechanism(&p, name, 7, 0x8000_0000 + index as u64, 0);
             if *name == "C_GenerateKeyPair" {
@@ -948,13 +952,13 @@ fn mechanism_capture(ev: &Event) -> MechanismCapture {
         capture::MECHANISM_NULL => MechanismCapture::Null,
         capture::MECHANISM_UNREADABLE => MechanismCapture::Unreadable,
         capture::MECHANISM_VALUE => MechanismCapture::Value(ev.mechanism),
-        _ if ev.mechanism != MECH_NONE => MechanismCapture::Value(ev.mechanism),
         _ => MechanismCapture::Absent,
     }
 }
 
 /// Pseudonymized semantic state. Raw handles and async ids remain private map keys.
 pub struct State {
+    policy: CapturePolicy,
     slots: Vec<Option<SlotMeta>>,
     current_process: BTreeMap<u32, ProcessKey>,
     next_pseudonym: BTreeMap<ProcessKey, u64>,
@@ -980,15 +984,19 @@ pub struct State {
 
 impl State {
     pub fn new(plan: &AttachPlan) -> Self {
-        Self::with_key_limit(plan, MAX_STATE_KEYS)
+        Self::with_policy(plan, CapturePolicy::Allowlisted)
+    }
+
+    pub fn with_policy(plan: &AttachPlan, policy: CapturePolicy) -> Self {
+        Self::with_key_limit(plan, policy, MAX_STATE_KEYS)
     }
 
     #[cfg(test)]
     fn with_limit(plan: &AttachPlan, limit: usize) -> Self {
-        Self::with_key_limit(plan, limit)
+        Self::with_key_limit(plan, CapturePolicy::Allowlisted, limit)
     }
 
-    fn with_key_limit(plan: &AttachPlan, state_key_limit: usize) -> Self {
+    fn with_key_limit(plan: &AttachPlan, policy: CapturePolicy, state_key_limit: usize) -> Self {
         let mut slots = Vec::new();
         for slot in &plan.slots {
             let index = slot.index as usize;
@@ -1006,6 +1014,7 @@ impl State {
             });
         }
         Self {
+            policy,
             slots,
             current_process: BTreeMap::new(),
             next_pseudonym: BTreeMap::new(),
@@ -1131,13 +1140,20 @@ impl State {
             self.queue_pending(process, ev, meta);
             return;
         }
-        self.apply_completed(process, ev, &meta);
+        self.apply_completed(process, ev, &meta, false);
     }
 
-    fn apply_completed(&mut self, process: ProcessKey, ev: &Event, meta: &SlotMeta) {
+    fn apply_completed(
+        &mut self,
+        process: ProcessKey,
+        ev: &Event,
+        meta: &SlotMeta,
+        was_pending: bool,
+    ) {
         self.observe_templates(ev, meta);
-        if meta.semantics.transition == transition::INITIALIZE
-            || meta.semantics.direct != direct::NONE
+        if (meta.semantics.transition == transition::INITIALIZE
+            || meta.semantics.direct != direct::NONE)
+            && (self.policy.uses_unsafe_decoders() || was_pending || ev.rv == CkRv::OK.0)
         {
             self.record_requested_mechanism(ev, meta);
         }
@@ -1179,19 +1195,21 @@ impl State {
         if let Some(name) = direct_name(meta.semantics.direct) {
             stat.ops.insert(name.to_string());
         }
-        let combo = (ev.shape, ev.p0, ev.p1, ev.p2);
-        if ev.shape == shape::NONE {
-            stat.init_no_shape += 1;
-        } else if stat.param_combos.contains_key(&combo) {
-            *stat.param_combos.get_mut(&combo).unwrap() += 1;
-        } else {
-            let _ = stat;
-            if self.admit(1) {
-                self.mechanisms
-                    .get_mut(&mechanism)
-                    .unwrap()
-                    .param_combos
-                    .insert(combo, 1);
+        if self.policy.uses_unsafe_decoders() {
+            let combo = (ev.shape, ev.p0, ev.p1, ev.p2);
+            if ev.shape == shape::NONE {
+                stat.init_no_shape += 1;
+            } else if stat.param_combos.contains_key(&combo) {
+                *stat.param_combos.get_mut(&combo).unwrap() += 1;
+            } else {
+                let _ = stat;
+                if self.admit(1) {
+                    self.mechanisms
+                        .get_mut(&mechanism)
+                        .unwrap()
+                        .param_combos
+                        .insert(combo, 1);
+                }
             }
         }
         self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv);
@@ -1464,7 +1482,7 @@ impl State {
                 if completed.rv == CkRv::PENDING.0 {
                     self.queue_pending(process, &completed, pending.meta);
                 } else {
-                    self.apply_completed(process, &completed, &pending.meta);
+                    self.apply_completed(process, &completed, &pending.meta, true);
                 }
             }
             lifecycle::ASYNC_GET_ID if ev.rv == CkRv::OK.0 => {
@@ -1565,6 +1583,9 @@ impl State {
     }
 
     fn observe_templates(&mut self, ev: &Event, meta: &SlotMeta) {
+        if !self.policy.uses_unsafe_decoders() {
+            return;
+        }
         if meta.semantics.template0_arg != p11scope_ebpf_common::ARG_NONE {
             self.record_template(
                 ev.slot,
@@ -1857,6 +1878,9 @@ impl State {
     }
 
     pub fn shape_decode_failures(&self) -> u64 {
+        if !self.policy.uses_unsafe_decoders() {
+            return 0;
+        }
         self.mechanisms
             .iter()
             .filter(|(id, stat)| !stat.param_combos.is_empty() || self.mech_shapes.contains_key(id))
@@ -1865,6 +1889,9 @@ impl State {
     }
 
     pub fn total_shape_decode_failures(&self) -> u64 {
+        if !self.policy.uses_unsafe_decoders() {
+            return 0;
+        }
         self.mechanisms
             .iter()
             .filter(|(id, stat)| stat.param_combos.is_empty() && self.mech_shapes.contains_key(id))
@@ -1915,6 +1942,11 @@ mod tests {
             cgroup_id: 0,
             session,
             mechanism,
+            capture: if mechanism == MECH_NONE {
+                capture::MECHANISM_NONE
+            } else {
+                capture::MECHANISM_VALUE
+            },
             rv,
             p0: 0,
             p1: 0,
@@ -2011,6 +2043,7 @@ mod tests {
             cgroup_id: 0,
             session,
             mechanism,
+            capture: capture::MECHANISM_VALUE,
             rv,
             p0,
             p1,
@@ -2149,7 +2182,10 @@ mod tests {
 
     #[test]
     fn failed_init_records_the_mechanism_but_does_not_bind_the_operation() {
-        let mut s = State::new(&test_plan());
+        let mut s = State::with_policy(
+            &test_plan(),
+            crate::attach::CapturePolicy::UnsafeUnvalidatedMetadata,
+        );
         s.observe(&ev(100, 0, fnkind::OPEN_SESSION, 10, MECH_NONE, 0, 5));
         s.observe(&ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x250, 0, 100)); // C_SignInit succeeds, binds 0x250
         // This deliberately reverses the old single-binding workaround:
@@ -2173,6 +2209,62 @@ mod tests {
             .expect("the failed attempt is still evidence");
         assert_eq!(m251.calls, 1);
         assert_eq!(m251.errors, 1);
+    }
+
+    #[test]
+    fn policy_output_safe_rejected_init_is_not_a_mechanism_request() {
+        let mut s = State::with_policy(&test_plan(), crate::attach::CapturePolicy::Allowlisted);
+        let rejected = Event {
+            mechanism: 0x251,
+            rv: CkRv::ARGUMENTS_BAD.0,
+            capture: capture::MECHANISM_VALUE,
+            ..ev(100, 2, fnkind::INIT_WITH_MECH, 10, MECH_NONE, 0, 10)
+        };
+        s.observe(&rejected);
+
+        assert!(s.mechanisms().is_empty());
+    }
+
+    #[test]
+    fn policy_output_unsafe_rejected_init_keeps_legacy_request_attribution() {
+        let mut s = State::with_policy(
+            &test_plan(),
+            crate::attach::CapturePolicy::UnsafeUnvalidatedMetadata,
+        );
+        let rejected = Event {
+            mechanism: 0x251,
+            rv: CkRv::ARGUMENTS_BAD.0,
+            capture: capture::MECHANISM_VALUE,
+            ..ev(100, 2, fnkind::INIT_WITH_MECH, 10, MECH_NONE, 0, 10)
+        };
+        s.observe(&rejected);
+
+        assert_eq!(s.mechanisms()[&0x251].errors, 1);
+    }
+
+    #[test]
+    fn policy_output_safe_mode_does_not_record_disabled_metadata() {
+        let mut s = State::with_policy(&test_plan(), crate::attach::CapturePolicy::Allowlisted);
+        s.observe(&ev_shape(
+            100,
+            10,
+            0x1087,
+            CkRv::OK.0,
+            shape::GCM,
+            (12, 0, 128),
+        ));
+        s.observe(&ev_template(
+            100,
+            &[0x01],
+            1,
+            p11scope_ebpf_common::attr_bool::TOKEN,
+            p11scope_ebpf_common::attr_bool::TOKEN,
+        ));
+
+        assert!(s.templates().is_empty());
+        assert!(s.mechanisms()[&0x1087].param_combos.is_empty());
+        assert_eq!(s.shape_decode_failures(), 0);
+        assert_eq!(s.total_shape_decode_failures(), 0);
     }
 
     #[test]
@@ -2244,7 +2336,10 @@ mod tests {
 
     #[test]
     fn distinct_param_combos_are_recorded_with_their_own_counts() {
-        let mut s = State::new(&test_plan());
+        let mut s = State::with_policy(
+            &test_plan(),
+            crate::attach::CapturePolicy::UnsafeUnvalidatedMetadata,
+        );
         // Same mechanism, same combo, twice.
         s.observe(&ev_shape(
             100,
@@ -2288,7 +2383,10 @@ mod tests {
 
     #[test]
     fn shape_decode_failures_only_count_mechanisms_that_decoded_at_least_once() {
-        let mut s = State::new(&test_plan());
+        let mut s = State::with_policy(
+            &test_plan(),
+            crate::attach::CapturePolicy::UnsafeUnvalidatedMetadata,
+        );
         // Mechanism 0x1087 (GCM) decodes once, then fails to decode once —
         // the failure is now interesting evidence.
         s.observe(&ev_shape(100, 10, 0x1087, 0, shape::GCM, (12, 0, 128)));
@@ -2307,7 +2405,10 @@ mod tests {
 
     #[test]
     fn total_decode_failure_is_invisible_without_mech_shapes_but_visible_with_it() {
-        let mut s = State::new(&test_plan());
+        let mut s = State::with_policy(
+            &test_plan(),
+            crate::attach::CapturePolicy::UnsafeUnvalidatedMetadata,
+        );
         // 0x1087 has a published GCM shape, but every observed call fails
         // to decode — the total-failure case Finding 1 flagged.
         s.observe(&ev_shape(100, 10, 0x1087, 0, shape::NONE, (0, 0, 0)));
@@ -2330,10 +2431,12 @@ mod tests {
 
     #[test]
     fn mechanism_with_no_published_shape_never_counts_as_a_total_failure() {
-        let mut s = State::new(&test_plan());
+        let mut s = State::with_policy(
+            &test_plan(),
+            crate::attach::CapturePolicy::UnsafeUnvalidatedMetadata,
+        );
         s.observe(&ev_shape(100, 10, 0x9999, 0, shape::NONE, (0, 0, 0)));
-        // 0x9999 is not in the published set at all — an ordinary
-        // "no allowlisted shape for this mechanism" id.
+        // 0x9999 is not in the diagnostic shape set at all.
         s.set_mech_shapes(BTreeMap::from([(0x1087, shape::GCM)]));
 
         assert_eq!(s.total_shape_decode_failures(), 0);
@@ -2344,7 +2447,10 @@ mod tests {
     fn template_attribute_types_and_policy_booleans_render_the_tristate_unambiguously() {
         use p11scope_ebpf_common::attr_bool;
 
-        let mut s = State::new(&test_plan());
+        let mut s = State::with_policy(
+            &test_plan(),
+            crate::attach::CapturePolicy::UnsafeUnvalidatedMetadata,
+        );
         // Call 1: CKA_TOKEN (0x01) true, CKA_PRIVATE (0x02) present-but-false.
         s.observe(&ev_template(
             100,
@@ -2392,7 +2498,10 @@ mod tests {
 
     #[test]
     fn template_truncation_is_recorded_per_call_and_surfaced_by_the_aggregate_accessor() {
-        let mut s = State::new(&test_plan());
+        let mut s = State::with_policy(
+            &test_plan(),
+            crate::attach::CapturePolicy::UnsafeUnvalidatedMetadata,
+        );
         assert!(!s.templates_truncated(), "nothing observed yet");
 
         // attr_total (10) > attr_count (8, the MAX_ATTRS cap already applied
@@ -2414,7 +2523,10 @@ mod tests {
 
     #[test]
     fn two_cgroups_produce_two_separate_breakdown_entries() {
-        let mut s = State::new(&test_plan());
+        let mut s = State::with_policy(
+            &test_plan(),
+            crate::attach::CapturePolicy::UnsafeUnvalidatedMetadata,
+        );
         // Two containers sharing one node-wide attach: same mechanism,
         // different cgroup ids, must not collapse into one entry.
         s.observe(&with_cgroup(

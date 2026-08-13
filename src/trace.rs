@@ -7,6 +7,7 @@
 //! `semantics::State`'s session-pseudonym machinery so a raw handle is
 //! never rendered.
 
+use crate::attach::CapturePolicy;
 use crate::plan::AttachPlan;
 use crate::render;
 use crate::semantics::ProcessKey;
@@ -166,11 +167,41 @@ pub fn lost_line(n: u64) -> Option<String> {
     (n > 0).then(|| format!("LOST {n} events"))
 }
 
-/// Final machine-readable evidence record for a trace stream.
-pub fn evidence_line(ev: &render::Evidence) -> String {
+pub fn capture_line(policy: CapturePolicy) -> String {
+    format!("CAPTURE privacy={}", policy.privacy_mode())
+}
+
+/// Final machine-readable evidence record for a normally drained trace.
+pub fn evidence_line(ev: &render::Evidence, policy: CapturePolicy) -> String {
+    let encoded = serde_json::to_string(ev).expect("Evidence serializes");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&encoded).expect("serialized Evidence is valid JSON");
+    let object = value
+        .as_object_mut()
+        .expect("Evidence serializes as an object");
+    object.insert(
+        "privacy_mode".into(),
+        serde_json::Value::String(policy.privacy_mode().into()),
+    );
+    object.insert("capture_aborted".into(), serde_json::Value::Null);
+    object.insert("final_drain".into(), serde_json::Value::Bool(true));
+    object.insert("counters_available".into(), serde_json::Value::Bool(true));
+    format!("EVIDENCE {value}")
+}
+
+/// Minimal terminal record available to the lease supervisor after it has
+/// killed and reaped the only process that owned BPF state.
+pub fn abort_evidence_line(policy: CapturePolicy, reason: &'static str) -> String {
     format!(
         "EVIDENCE {}",
-        serde_json::to_string(ev).expect("Evidence serializes")
+        serde_json::json!({
+            "completeness": "PARTIAL",
+            "privacy_mode": policy.privacy_mode(),
+            "capture_aborted": reason,
+            "final_drain": false,
+            "counters_available": false,
+            "event_loss": serde_json::Value::Null,
+        })
     )
 }
 
@@ -383,6 +414,7 @@ mod tests {
             rv_update_failures: 0,
             cgroup_scope_failures: 0,
             semantic_capture_failures: 0,
+            unregistered_mechanisms: 0,
             template_tail_failures: 0,
             process_tracking_fallbacks: 0,
             process_tracking_failures: 0,
@@ -407,11 +439,42 @@ mod tests {
             templates_truncated: false,
             completeness: "PARTIAL",
         };
-        let line = evidence_line(&evidence);
+        let line = evidence_line(&evidence, crate::attach::CapturePolicy::Allowlisted);
         let value: serde_json::Value =
             serde_json::from_str(line.strip_prefix("EVIDENCE ").unwrap()).unwrap();
         assert_eq!(value["semantic_state_drops"], 3);
         assert_eq!(value["completeness"], "PARTIAL");
+        assert_eq!(value["privacy_mode"], "allowlisted");
+        assert_eq!(value["capture_aborted"], serde_json::Value::Null);
+        assert_eq!(value["final_drain"], true);
+        assert_eq!(value["counters_available"], true);
+    }
+
+    #[test]
+    fn policy_output_abort_evidence_is_minimal_and_never_fabricates_counters() {
+        let line = abort_evidence_line(
+            crate::attach::CapturePolicy::Allowlisted,
+            "object_lease_break",
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(line.strip_prefix("EVIDENCE ").unwrap()).unwrap();
+
+        assert_eq!(value["completeness"], "PARTIAL");
+        assert_eq!(value["privacy_mode"], "allowlisted");
+        assert_eq!(value["capture_aborted"], "object_lease_break");
+        assert_eq!(value["final_drain"], false);
+        assert_eq!(value["counters_available"], false);
+        assert_eq!(value["event_loss"], serde_json::Value::Null);
+        assert!(value.get("attached_probes").is_none());
+        assert!(value.get("unregistered_mechanisms").is_none());
+    }
+
+    #[test]
+    fn policy_output_capture_header_uses_the_selected_policy() {
+        assert_eq!(
+            capture_line(crate::attach::CapturePolicy::UnsafeUnvalidatedMetadata),
+            "CAPTURE privacy=unsafe-unvalidated-metadata"
+        );
     }
 
     fn test_plan() -> AttachPlan {

@@ -283,7 +283,11 @@ fn supervisor_refuses_to_fork_a_multithreaded_process() {
     let pid = spawn_single_threaded(move || {
         let signals = p11scope::verify::CaptureSignals::block().unwrap();
         let objects = p11scope::verify::check_reuse(&manifest_for(&child_object)).unwrap();
-        let output = p11scope::verify::SupervisorOutput::trace(None, "allowlisted").unwrap();
+        let output = p11scope::verify::SupervisorOutput::trace(
+            None,
+            p11scope::attach::CapturePolicy::Allowlisted,
+        )
+        .unwrap();
         let (release, wait) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || wait.recv().unwrap());
         let error = p11scope::verify::supervise_capture(signals, objects, output, |_| Ok(()))
@@ -307,7 +311,7 @@ fn trace_abort_sink_must_be_a_regular_file() {
 
     let error = match p11scope::verify::SupervisorOutput::trace(
         Some(sink),
-        "unsafe-unvalidated-metadata",
+        p11scope::attach::CapturePolicy::UnsafeUnvalidatedMetadata,
     ) {
         Ok(_) => panic!("mandatory trace abort delivery requires a regular-file sink"),
         Err(error) => error,
@@ -722,7 +726,7 @@ fn lease_break_kills_a_stopped_worker_before_the_writer_and_records_abort() {
         let objects = p11scope::verify::check_reuse(&manifest_for(&child_object)).unwrap();
         let output = p11scope::verify::SupervisorOutput::trace(
             Some(child_trace),
-            "unsafe-unvalidated-metadata",
+            p11scope::attach::CapturePolicy::UnsafeUnvalidatedMetadata,
         )
         .unwrap();
         let outcome = p11scope::verify::supervise_capture(signals, objects, output, move |_| {
@@ -801,7 +805,7 @@ fn pending_break_at_start_barrier_never_enters_capture_worker() {
         let objects = p11scope::verify::check_reuse(&manifest_for(&child_object)).unwrap();
         let output = p11scope::verify::SupervisorOutput::trace(
             Some(child_trace),
-            "unsafe-unvalidated-metadata",
+            p11scope::attach::CapturePolicy::UnsafeUnvalidatedMetadata,
         )
         .unwrap();
         std::fs::write(child_leased, b"ready").unwrap();
@@ -871,7 +875,7 @@ fn supervisor_death_kills_a_worker_blocked_in_output_and_releases_its_lease() {
         let objects = p11scope::verify::check_reuse(&manifest_for(&child_object)).unwrap();
         let output = p11scope::verify::SupervisorOutput::trace(
             Some(child_trace),
-            "unsafe-unvalidated-metadata",
+            p11scope::attach::CapturePolicy::UnsafeUnvalidatedMetadata,
         )
         .unwrap();
         let outcome =

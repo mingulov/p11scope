@@ -8,15 +8,15 @@ use p11scope::{
     discover_cmd, events, metrics, plan, process, render, scope, semantics, trace, verify,
 };
 use p11scope_manifest::manifest::{Manifest, SCHEMA};
-use std::io::Write;
+use std::io::{Seek as _, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "usage:\n  \
-p11scope profile --manifest <m.json> --provenance-module <provider.so> (--pid <n> | --cgroup <path>) [--mode profile|metrics] [--duration <secs>] [-o <out.json>]\n  \
-p11scope trace --manifest <m.json> --provenance-module <provider.so> (--pid <n> | --cgroup <path>) [--duration <secs>] [-o <out.file>]\n  \
+p11scope profile --manifest <m.json> --provenance-module <provider.so> (--pid <n> | --cgroup <path>) [--mode profile|metrics] [--unsafe-unvalidated-metadata] [--duration <secs>] [-o <out.json>]\n  \
+p11scope trace --manifest <m.json> --provenance-module <provider.so> (--pid <n> | --cgroup <path>) [--unsafe-unvalidated-metadata] [--duration <secs>] [-o <out.file>]\n  \
 p11scope discover --module <provider.so> [-o <manifest.json>]\n\n\
 note: --mode defaults to profile (metrics + mechanisms/sessions/logins from\n\
 the event stream); --mode metrics is the lighter, maps-only level.\n\
@@ -77,7 +77,7 @@ fn run() -> Result<()> {
     match args.next().as_deref() {
         Some("profile") => cmd_profile(args),
         Some("trace") => cmd_trace(args),
-        Some("discover") => discover_cmd::run(args),
+        Some("discover") => cmd_discover(args),
         Some("--help") | Some("-h") => {
             eprintln!("{USAGE}");
             Ok(())
@@ -90,6 +90,21 @@ fn run() -> Result<()> {
             std::process::exit(2);
         }
     }
+}
+
+fn cmd_discover(args: impl Iterator<Item = String>) -> Result<()> {
+    let args: Vec<_> = args.collect();
+    if args
+        .iter()
+        .any(|arg| arg == "--unsafe-unvalidated-metadata")
+    {
+        CapturePolicy::from_cli(
+            "discover",
+            true,
+            cfg!(feature = "unsafe-unvalidated-metadata"),
+        )?;
+    }
+    discover_cmd::run(args.into_iter())
 }
 
 /// Pulls the value for a flag out of the argument stream, or exits 2 with
@@ -210,17 +225,22 @@ fn report_attach_failures(session: &Session) {
     }
 }
 
-/// Loads the embedded-default mechanism registry and publishes its
-/// shapes into `state` — the same load `Session::start` already did to
-/// publish `MECH_SHAPE` (attach.rs), reloaded here (cheap: no I/O, no
-/// dlopen) so `state` can tell "no allowlisted shape for this
-/// mechanism" apart from "an allowlisted shape whose decode failed on
-/// every call" when rendering.
+/// Gives unsafe rendering the same diagnostic shape expectations that
+/// `Session::start` published to `MECH_SHAPE`.
 fn load_mech_shapes(state: &mut semantics::State) -> Result<()> {
     let registry = pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry::load(None)
         .map_err(|e| anyhow!("loading mechanism registry: {e}"))?;
     state.set_mech_shapes(p11scope::shapes::expected_shapes(&registry));
     Ok(())
+}
+
+fn warn_unsafe_policy(policy: CapturePolicy) {
+    if policy.uses_unsafe_decoders() {
+        eprintln!(
+            "p11scope: WARNING: unsafe-unvalidated-metadata follows caller-supplied pointer \
+             topology and is only for trusted, ABI-valid workloads"
+        );
+    }
 }
 
 fn identify_tracked(
@@ -282,6 +302,7 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
     let mut mode = "profile".to_string();
     let mut duration: Option<u64> = None;
     let mut out: Option<PathBuf> = None;
+    let mut unsafe_requested = false;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -306,6 +327,7 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
                 );
             }
             "-o" => out = Some(require_value(&mut args, "-o").into()),
+            "--unsafe-unvalidated-metadata" => unsafe_requested = true,
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
                 return Ok(());
@@ -317,6 +339,15 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
         }
     }
 
+    if mode != "profile" && mode != "metrics" {
+        bail!("mode {mode} not implemented in this phase");
+    }
+    let policy = CapturePolicy::from_cli(
+        &mode,
+        unsafe_requested,
+        cfg!(feature = "unsafe-unvalidated-metadata"),
+    )?;
+
     let Some(manifest_path) = manifest_path else {
         eprintln!("--manifest is required\n{USAGE}");
         std::process::exit(2);
@@ -326,16 +357,12 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
         std::process::exit(2);
     };
     let scope = resolve_scope(pid, cgroup)?;
-    if mode != "metrics" && mode != "profile" {
-        eprintln!("mode {mode} not implemented in this phase\n{USAGE}");
-        std::process::exit(2);
-    }
-
+    warn_unsafe_policy(policy);
     let signals = verify::CaptureSignals::block().map_err(anyhow::Error::msg)?;
     let (manifest, plan, objects) = load_plan(&manifest_path, &provenance_module)?;
-    let output = verify::SupervisorOutput::profile(out.clone()).map_err(anyhow::Error::msg)?;
+    let output = verify::SupervisorOutput::profile(out).map_err(anyhow::Error::msg)?;
     let outcome = verify::supervise_capture(signals, objects, output, move |worker| {
-        capture_profile(manifest, plan, scope, mode, duration, out.is_some(), worker)
+        capture_profile(manifest, plan, scope, mode, policy, duration, worker)
             .map_err(|error| format!("{error:#}"))
     })
     .map_err(anyhow::Error::msg)?;
@@ -347,8 +374,8 @@ fn capture_profile(
     plan: plan::AttachPlan,
     scope: Scope,
     mode: String,
+    policy: CapturePolicy,
     duration: Option<u64>,
-    has_output: bool,
     worker: &mut verify::WorkerContext,
 ) -> Result<()> {
     let interrupted = install_sigint_flag()?;
@@ -356,11 +383,7 @@ fn capture_profile(
         .unblock_operator_signals()
         .map_err(anyhow::Error::msg)?;
     let (stdout, output, objects) = worker.output_parts();
-    let policy = if mode == "metrics" {
-        CapturePolicy::AggregateOnly
-    } else {
-        CapturePolicy::Allowlisted
-    };
+    let has_output = output.is_some();
     let mut session =
         Session::start(&plan, &scope, objects, policy).context("starting attach session")?;
     objects
@@ -371,9 +394,11 @@ fn capture_profile(
 
     // Only `--mode profile` decodes the event stream; `--mode metrics` never
     // drains the ring buffer, so it stays the lighter, maps-only level.
-    let mut state = semantics::State::new(&plan);
+    let mut state = semantics::State::with_policy(&plan, policy);
     let mut process_tracker = process::Tracker::new();
-    load_mech_shapes(&mut state)?;
+    if policy.uses_unsafe_decoders() {
+        load_mech_shapes(&mut state)?;
+    }
     let mut malformed_records: u64 = 0;
     let drain_events = |session: &mut Session,
                         state: &mut semantics::State,
@@ -424,7 +449,7 @@ fn capture_profile(
             malformed_records,
             &state,
         );
-        let frame = render::live(&reports, &ev, elapsed, &manifest.module_path, &mode);
+        let frame = render::live(&reports, &ev, elapsed, &manifest.module_path, &mode, policy);
         objects
             .ensure_stable()
             .map_err(anyhow::Error::msg)
@@ -463,7 +488,14 @@ fn capture_profile(
         malformed_records,
         &state,
     );
-    let frame = render::live(&reports, &ev, clock.elapsed(), &manifest.module_path, &mode);
+    let frame = render::live(
+        &reports,
+        &ev,
+        clock.elapsed(),
+        &manifest.module_path,
+        &mode,
+        policy,
+    );
     objects
         .ensure_stable()
         .map_err(anyhow::Error::msg)
@@ -493,6 +525,7 @@ fn capture_profile(
             started: &started,
             ended: &ended,
             kernel: &kernel,
+            policy,
         };
         let j = if mode == "profile" {
             render::profile_json(&reports, &ev, &state, &capture)
@@ -513,12 +546,14 @@ fn capture_profile(
 /// Writes the `-o` report — the same call whether the loop above it
 /// exited because `--duration` elapsed or because SIGINT set
 /// `interrupted`: finalization does not know or care which. Factored out
-/// so that fact is directly testable (see `tests::shutdown_path_writes_a_valid_json_report`)
-/// without standing up a real attach session.
-fn write_json_report(writer: &mut dyn Write, j: &serde_json::Value) -> Result<()> {
-    writer
-        .write_all(&serde_json::to_vec_pretty(j)?)
-        .context("writing profile output")
+/// so that fact is directly testable without standing up a real attach session.
+fn write_json_report(file: &mut std::fs::File, j: &serde_json::Value) -> Result<()> {
+    file.set_len(0).context("truncating profile output")?;
+    file.seek(SeekFrom::Start(0))
+        .context("seeking profile output")?;
+    serde_json::to_writer_pretty(&mut *file, j).context("writing profile output")?;
+    file.flush().context("flushing profile output")?;
+    file.sync_all().context("syncing profile output")
 }
 
 /// `p11scope trace`: one line per completed call, printed as it arrives,
@@ -533,6 +568,7 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
     let mut cgroup: Option<PathBuf> = None;
     let mut duration: Option<u64> = None;
     let mut out: Option<PathBuf> = None;
+    let mut unsafe_requested = false;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -556,6 +592,7 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
                 );
             }
             "-o" => out = Some(require_value(&mut args, "-o").into()),
+            "--unsafe-unvalidated-metadata" => unsafe_requested = true,
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
                 return Ok(());
@@ -566,6 +603,12 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
             }
         }
     }
+
+    let policy = CapturePolicy::from_cli(
+        "trace",
+        unsafe_requested,
+        cfg!(feature = "unsafe-unvalidated-metadata"),
+    )?;
 
     let Some(manifest_path) = manifest_path else {
         eprintln!("--manifest is required\n{USAGE}");
@@ -582,12 +625,12 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
         );
     }
     let scope = resolve_scope(pid, cgroup)?;
+    warn_unsafe_policy(policy);
     let signals = verify::CaptureSignals::block().map_err(anyhow::Error::msg)?;
     let (_manifest, plan, objects) = load_plan(&manifest_path, &provenance_module)?;
-    let output = verify::SupervisorOutput::trace(out, "unsafe-unvalidated-metadata")
-        .map_err(anyhow::Error::msg)?;
+    let output = verify::SupervisorOutput::trace(out, policy).map_err(anyhow::Error::msg)?;
     let outcome = verify::supervise_capture(signals, objects, output, move |worker| {
-        capture_trace(plan, scope, duration, worker).map_err(|error| format!("{error:#}"))
+        capture_trace(plan, scope, policy, duration, worker).map_err(|error| format!("{error:#}"))
     })
     .map_err(anyhow::Error::msg)?;
     finish_supervised_capture(outcome)
@@ -596,6 +639,7 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
 fn capture_trace(
     plan: plan::AttachPlan,
     scope: Scope,
+    policy: CapturePolicy,
     duration: Option<u64>,
     worker: &mut verify::WorkerContext,
 ) -> Result<()> {
@@ -604,23 +648,31 @@ fn capture_trace(
         .unblock_operator_signals()
         .map_err(anyhow::Error::msg)?;
     let (stdout, out_file, objects) = worker.output_parts();
-    let mut session = Session::start(&plan, &scope, objects, CapturePolicy::Allowlisted)
-        .context("starting attach session")?;
+    let mut session =
+        Session::start(&plan, &scope, objects, policy).context("starting attach session")?;
     objects
         .verify_stable()
         .map_err(anyhow::Error::msg)
         .context("rechecking authorized provider objects after attach")?;
     report_attach_failures(&session);
 
-    let mut state = semantics::State::new(&plan);
+    let mut state = semantics::State::with_policy(&plan, policy);
     let mut process_tracker = process::Tracker::new();
-    load_mech_shapes(&mut state)?;
+    if policy.uses_unsafe_decoders() {
+        load_mech_shapes(&mut state)?;
+    }
     let mut tracer = trace::Tracer::new(&plan);
 
     let mut stdout_open = true;
     let mut malformed_records: u64 = 0;
     let mut last_reported_loss: u64 = 0;
     let clock = Instant::now();
+    emit_trace_line(
+        &trace::capture_line(policy),
+        stdout,
+        &mut stdout_open,
+        out_file,
+    )?;
     loop {
         objects
             .ensure_stable()
@@ -700,7 +752,7 @@ fn capture_trace(
         .map_err(anyhow::Error::msg)
         .context("authorized provider object changed during capture")?;
     emit_trace_line(
-        &trace::evidence_line(&evidence),
+        &trace::evidence_line(&evidence, policy),
         stdout,
         &mut stdout_open,
         out_file,
@@ -879,6 +931,7 @@ fn evidence_for(
         cgroup_scope_failures: kernel_evidence.cgroup_scope_failures,
         semantic_capture_failures: kernel_evidence.semantic_capture_failures
             + semantic.semantic_capture_failures,
+        unregistered_mechanisms: kernel_evidence.unregistered_mechanisms,
         template_tail_failures: kernel_evidence.template_tail_failures,
         process_tracking_fallbacks: tracking_evidence.fallbacks,
         process_tracking_failures: tracking_evidence.failures,
@@ -1086,17 +1139,82 @@ mod tests {
     /// attach session (that part needs root + a real kernel; see the
     /// manual check documented in the phase report).
     #[test]
-    fn shutdown_path_writes_a_valid_json_report() {
+    fn policy_output_shutdown_path_replaces_a_file_with_valid_json() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("observed.json");
-        let j = serde_json::json!({"schema": "pkcs11-scope/observed-profile/v1.3", "evidence": {}});
+        let j = serde_json::json!({"schema": "pkcs11-scope/observed-profile/v1.4", "evidence": {}});
 
         let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"stale trailing bytes that must disappear")
+            .unwrap();
         write_json_report(&mut file, &j).expect("shutdown finalization must write the report");
 
         let written = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
-        assert_eq!(parsed["schema"], "pkcs11-scope/observed-profile/v1.3");
+        assert_eq!(parsed["schema"], "pkcs11-scope/observed-profile/v1.4");
+    }
+
+    #[cfg(not(feature = "unsafe-unvalidated-metadata"))]
+    #[test]
+    fn policy_output_unsafe_flag_is_refused_before_manifest_loading() {
+        let error = cmd_profile(
+            [
+                "--unsafe-unvalidated-metadata",
+                "--manifest",
+                "/definitely/not/a/manifest.json",
+                "--provenance-module",
+                "/definitely/not/a/provider.so",
+                "--pid",
+                "1",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("Cargo feature"), "{rendered}");
+        assert!(!rendered.contains("reading manifest"), "{rendered}");
+    }
+
+    #[test]
+    fn policy_output_profile_rejects_trace_mode_before_manifest_loading() {
+        let error = cmd_profile(
+            [
+                "--mode",
+                "trace",
+                "--manifest",
+                "/definitely/not/a/manifest.json",
+                "--provenance-module",
+                "/definitely/not/a/provider.so",
+                "--pid",
+                "1",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("mode trace"), "{rendered}");
+        assert!(!rendered.contains("reading manifest"), "{rendered}");
+    }
+
+    #[test]
+    fn policy_output_discover_rejects_unsafe_flag_before_helper_lookup() {
+        let error = cmd_discover(
+            [
+                "--unsafe-unvalidated-metadata",
+                "--module",
+                "/definitely/not/a/provider.so",
+                "--helper",
+                "/definitely/not/a/helper",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("discover does not accept"), "{rendered}");
+        assert!(!rendered.contains("helper"), "{rendered}");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Rendering. Both renderers state the capture's completeness; a report
 //! that lost information never reads as complete.
 
+use crate::attach::CapturePolicy;
 use crate::metrics::{SlotReport, percentile_ns};
 use serde::Serialize;
 use std::time::Duration;
@@ -37,6 +38,7 @@ pub struct Evidence {
     pub rv_update_failures: u64,
     pub cgroup_scope_failures: u64,
     pub semantic_capture_failures: u64,
+    pub unregistered_mechanisms: u64,
     pub template_tail_failures: u64,
     pub process_tracking_fallbacks: u64,
     pub process_tracking_failures: u64,
@@ -63,8 +65,8 @@ pub struct Evidence {
     /// `C_CloseSession` calls observed with no matching open — likewise
     /// informational, does not affect `completeness`.
     pub unmatched_closes: u64,
-    /// `*Init` calls whose parameter decode did not apply for a mechanism
-    /// id known to have an allowlisted shape this capture
+    /// `*Init` calls whose unsafe parameter decode did not apply for a mechanism
+    /// id known to have a diagnostic shape this capture
     /// (`semantics::State::shape_decode_failures`) — an inconsistent- or
     /// total-decode-failure signal, by call count. Informational: does not
     /// affect `completeness` on its own, since an inconsistent decode may
@@ -79,7 +81,7 @@ pub struct Evidence {
     /// ordinary provider-side rejection variance. Unlike
     /// `shape_decode_failures`, this **does** gate `completeness`: a
     /// mechanism in this state renders `params: null` but is not the
-    /// benign "no allowlisted shape" case — see `mechanisms[].note`.
+    /// benign "no diagnostic shape" case — see `mechanisms[].note`.
     pub shape_decode_total_failures: u64,
     /// True when any `templates[].operations[]` entry observed
     /// `attr_total > attr_count` — a template longer than the capture's
@@ -122,6 +124,7 @@ impl Evidence {
             && self.rv_update_failures == 0
             && self.cgroup_scope_failures == 0
             && self.semantic_capture_failures == 0
+            && self.unregistered_mechanisms == 0
             && self.template_tail_failures == 0
             && self.process_tracking_failures == 0
             && self.process_tracking_evictions == 0
@@ -175,13 +178,15 @@ pub fn live(
     elapsed: Duration,
     module: &str,
     mode: &str,
+    policy: CapturePolicy,
 ) -> String {
     let mut s = String::new();
     s.push_str(&format!(
-        "p11scope — {module} — up {:02}:{:02}:{:02} — mode {mode}\n",
+        "p11scope — {module} — up {:02}:{:02}:{:02} — mode {mode} — privacy={}\n",
         elapsed.as_secs() / 3600,
         (elapsed.as_secs() % 3600) / 60,
-        elapsed.as_secs() % 60
+        elapsed.as_secs() % 60,
+        policy.privacy_mode(),
     ));
     s.push_str(&format!(
         "{:<28} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
@@ -241,6 +246,7 @@ pub fn live(
         || ev.rv_update_failures > 0
         || ev.cgroup_scope_failures > 0
         || ev.semantic_capture_failures > 0
+        || ev.unregistered_mechanisms > 0
         || ev.template_tail_failures > 0
         || state_gaps > 0
         || ev.malformed_records > 0
@@ -279,6 +285,12 @@ pub fn live(
             evidence_line.push_str(&format!(
                 " {} semantic captures failed",
                 ev.semantic_capture_failures
+            ));
+        }
+        if ev.unregistered_mechanisms > 0 {
+            evidence_line.push_str(&format!(
+                " {} unregistered mechanisms",
+                ev.unregistered_mechanisms
             ));
         }
         if ev.template_tail_failures > 0 {
@@ -412,8 +424,9 @@ fn functions_out(reports: &[SlotReport]) -> Vec<FunctionOut> {
 
 pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) -> serde_json::Value {
     serde_json::json!({
-        "schema": "pkcs11-scope/observed-profile/v1-metrics",
+        "schema": "pkcs11-scope/observed-profile/v1.1-metrics",
         "capture": { "start": capture.started, "end": capture.ended, "mode": "metrics",
+                     "privacy_mode": capture.policy.privacy_mode(),
                      "kernel": capture.kernel,
                      "module": { "path": capture.module, "build_id": capture.build_id } },
         "evidence": ev,
@@ -436,7 +449,7 @@ struct MechanismOut {
     calls: u64,
     errors: u64,
     latency_ns: LatencyOut,
-    /// `null` when no allowlisted parameter shape ever decoded for this
+    /// `null` when no diagnostic parameter shape ever decoded for this
     /// mechanism id in this capture (unrecognized/absent shape, or every
     /// decode attempt failed) — unchanged from v1. Otherwise an array of
     /// shape-tagged parameter-combination objects, one per **distinct**
@@ -664,6 +677,7 @@ pub struct CaptureMeta<'a> {
     pub started: &'a str,
     pub ended: &'a str,
     pub kernel: &'a str,
+    pub policy: CapturePolicy,
 }
 
 /// The v1 `observed-profile.json` document. `functions` comes from the
@@ -686,7 +700,12 @@ pub fn profile_json(
                 .iter()
                 .filter_map(|(&(sh, p0, p1, p2), &count)| param_combo_json(sh, p0, p1, p2, count))
                 .collect();
-            let (params, note) = if combos.is_empty() {
+            let (params, note) = if !capture.policy.uses_unsafe_decoders() {
+                (
+                    serde_json::Value::Null,
+                    "parameter decoding was disabled by allowlisted capture policy",
+                )
+            } else if combos.is_empty() {
                 if state.mech_shapes().contains_key(id) {
                     // A published shape exists for this id, but not one
                     // observed call decoded successfully — a total decode
@@ -695,22 +714,26 @@ pub fn profile_json(
                     // mechanism forces nonzero).
                     (
                         serde_json::Value::Null,
-                        "this mechanism has an allowlisted parameter shape, but every decode \
-                         attempt failed in this capture (see evidence.shape_decode_total_failures \
-                         and evidence.shape_decode_failures) — never a partial decode",
+                        "this mechanism has a diagnostic parameter shape, but every decode \
+                         attempt failed in this capture (see \
+                         evidence.shape_decode_total_failures and \
+                         evidence.shape_decode_failures); any successfully decoded values would \
+                         be unvalidated pointer-derived metadata — never a partial decode",
                     )
                 } else {
                     (
                         serde_json::Value::Null,
-                        "this mechanism has no published allowlisted parameter shape; decoding \
-                         was not attempted, never a partial decode",
+                        "this mechanism has no published diagnostic parameter shape; \
+                         unvalidated pointer-derived decoding was not attempted, never a \
+                         partial decode",
                     )
                 }
             } else {
                 (
                     serde_json::Value::Array(combos),
-                    "decoded from allowlisted parameters (RSA-PSS hash/MGF/salt, GCM IV/AAD/tag \
-                     length); requested values as passed to the operation, never a partial decode",
+                    "unvalidated pointer-derived metadata (RSA-PSS hash/MGF/salt, GCM \
+                     IV/AAD/tag length); requested values as passed to the operation, never a \
+                     partial decode",
                 )
             };
             MechanismOut {
@@ -742,11 +765,17 @@ pub fn profile_json(
         .iter()
         .map(|(user_type, n)| (user_type.to_string(), *n))
         .collect();
+    let templates = if capture.policy.uses_unsafe_decoders() {
+        templates_out(state)
+    } else {
+        Vec::new()
+    };
 
     serde_json::json!({
-        "schema": "pkcs11-scope/observed-profile/v1.3",
+        "schema": "pkcs11-scope/observed-profile/v1.4",
         "capture": {
             "start": capture.started, "end": capture.ended, "mode": "profile",
+            "privacy_mode": capture.policy.privacy_mode(),
             "kernel": capture.kernel,
             "module": { "path": capture.module, "build_id": capture.build_id },
         },
@@ -756,11 +785,16 @@ pub fn profile_json(
         "sessions": sessions_out,
         "logins": logins,
         "templates": {
-            "note": "every field here is what the application asked for via a CK_ATTRIBUTE \
-                     template — never asserted as the key's effective policy; the provider may \
-                     reject, ignore, or override any of it (see the `requested` marker on each \
-                     operation)",
-            "operations": templates_out(state),
+            "note": if capture.policy.uses_unsafe_decoders() {
+                "unvalidated pointer-derived metadata: every field here is what the application \
+                 asked for via a CK_ATTRIBUTE template — never asserted as the key's effective \
+                 policy; the provider may reject, ignore, or override any of it (see the \
+                 `requested` marker on each operation)"
+            } else {
+                "template capture was disabled by allowlisted capture policy; an empty operation \
+                 list is not evidence that no template was used"
+            },
+            "operations": templates,
         },
         "cgroups": cgroups_out(state),
     })
@@ -769,7 +803,7 @@ pub fn profile_json(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p11scope_ebpf_common::LATENCY_BUCKETS;
+    use p11scope_ebpf_common::{LATENCY_BUCKETS, shape};
 
     fn report(name: &str, calls: u64, in_flight: u64, aliased: bool) -> SlotReport {
         SlotReport {
@@ -812,6 +846,7 @@ mod tests {
             rv_update_failures: 0,
             cgroup_scope_failures: 0,
             semantic_capture_failures: 0,
+            unregistered_mechanisms: 0,
             template_tail_failures: 0,
             process_tracking_fallbacks: 0,
             process_tracking_failures: 0,
@@ -867,6 +902,7 @@ mod tests {
             |e: &mut Evidence| e.rv_update_failures = 1,
             |e: &mut Evidence| e.cgroup_scope_failures = 1,
             |e: &mut Evidence| e.semantic_capture_failures = 1,
+            |e: &mut Evidence| e.unregistered_mechanisms = 1,
             |e: &mut Evidence| e.template_tail_failures = 1,
             |e: &mut Evidence| e.process_tracking_failures = 1,
             |e: &mut Evidence| e.process_tracking_evictions = 1,
@@ -922,6 +958,7 @@ mod tests {
             Duration::from_secs(65),
             "/opt/p11.so",
             "profile",
+            CapturePolicy::Allowlisted,
         );
         assert!(out.contains("C_Sign"));
         // Zero-call rows still appear when a call is in flight.
@@ -943,6 +980,7 @@ mod tests {
             Duration::from_secs(10),
             "/opt/p11.so",
             "profile",
+            CapturePolicy::Allowlisted,
         );
         // Evidence line shows why a PARTIAL verdict was rendered.
         assert!(
@@ -968,6 +1006,7 @@ mod tests {
             Duration::from_secs(10),
             "/opt/p11.so",
             "profile",
+            CapturePolicy::Allowlisted,
         );
         // Informational evidence: capture started mid-operation, still marked COMPLETE for its scope.
         assert!(
@@ -993,11 +1032,55 @@ mod tests {
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
+            policy: crate::attach::CapturePolicy::AggregateOnly,
         };
         let v = json(&[r], &ev, &capture);
+        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v1.1-metrics");
+        assert_eq!(v["capture"]["privacy_mode"], "aggregate-only");
         assert_eq!(v["functions"][0]["latency_ns"]["approximate"], true);
         assert_eq!(v["functions"][0]["rv_counts"]["0x0000000000000000"], 1);
         assert_eq!(v["evidence"]["completeness"], "COMPLETE");
+    }
+
+    #[test]
+    fn policy_output_unregistered_mechanisms_force_partial_and_render_live() {
+        let mut ev = evidence();
+        ev.unregistered_mechanisms = 2;
+        ev.verdict();
+
+        assert_eq!(ev.completeness, "PARTIAL");
+        let out = live(
+            &[],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        assert!(out.contains("privacy=allowlisted"), "{out}");
+        assert!(out.contains("2 unregistered mechanisms"), "{out}");
+    }
+
+    #[test]
+    fn policy_output_live_headers_use_every_selected_policy_label() {
+        for (policy, label) in [
+            (CapturePolicy::Allowlisted, "allowlisted"),
+            (
+                CapturePolicy::UnsafeUnvalidatedMetadata,
+                "unsafe-unvalidated-metadata",
+            ),
+            (CapturePolicy::AggregateOnly, "aggregate-only"),
+        ] {
+            let out = live(
+                &[],
+                &evidence(),
+                Duration::ZERO,
+                "/opt/p11.so",
+                "test",
+                policy,
+            );
+            assert!(out.contains(&format!("privacy={label}")), "{out}");
+        }
     }
 
     fn empty_plan() -> crate::plan::AttachPlan {
@@ -1015,17 +1098,22 @@ mod tests {
     fn profile_json_has_every_required_top_level_section() {
         let mut ev = evidence();
         ev.verdict();
-        let state = crate::semantics::State::new(&empty_plan());
+        let state = crate::semantics::State::with_policy(
+            &empty_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
         let capture = CaptureMeta {
             module: "/opt/p11.so",
             build_id: Some("aabb"),
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
+            policy: crate::attach::CapturePolicy::Allowlisted,
         };
         let v = profile_json(&[], &ev, &state, &capture);
 
-        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v1.3");
+        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v1.4");
+        assert_eq!(v["capture"]["privacy_mode"], "allowlisted");
         for section in [
             "capture",
             "evidence",
@@ -1038,14 +1126,62 @@ mod tests {
         ] {
             assert!(
                 v.get(section).is_some(),
-                "v1.3 document missing required section {section}"
+                "v1.4 document missing required section {section}"
             );
         }
         assert_eq!(v["templates"]["operations"], serde_json::json!([]));
+        assert!(
+            v["templates"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("disabled by allowlisted")
+        );
         assert_eq!(v["cgroups"], serde_json::json!([]));
         assert_eq!(v["capture"]["mode"], "profile");
         assert_eq!(v["capture"]["module"]["path"], "/opt/p11.so");
         assert_eq!(v["capture"]["module"]["build_id"], "aabb");
+    }
+
+    #[test]
+    fn policy_output_safe_params_are_disabled_and_maximum_id_renders() {
+        let mut state = crate::semantics::State::with_policy(
+            &init_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let mut event = init_event(0, u64::MAX, shape::NONE, 0, 0, 0);
+        event.capture = p11scope_ebpf_common::capture::MECHANISM_VALUE;
+        state.observe(&event);
+        state.set_mech_shapes(std::collections::BTreeMap::from([(
+            u64::MAX,
+            shape::RSA_PKCS_PSS,
+        )]));
+
+        let mut ev = evidence();
+        ev.verdict();
+        let capture = CaptureMeta {
+            module: "/opt/p11.so",
+            build_id: None,
+            started: "t0",
+            ended: "t1",
+            kernel: "6.8.0",
+            policy: crate::attach::CapturePolicy::Allowlisted,
+        };
+        let value = profile_json(&[], &ev, &state, &capture);
+
+        assert_eq!(value["mechanisms"][0]["mechanism"], u64::MAX);
+        assert_eq!(
+            value["mechanisms"][0]["mechanism_hex"],
+            "0xffffffffffffffff"
+        );
+        assert_eq!(value["mechanisms"][0]["params"], serde_json::Value::Null);
+        assert!(
+            value["mechanisms"][0]["note"]
+                .as_str()
+                .unwrap()
+                .contains("disabled by allowlisted")
+        );
+        assert_eq!(value["evidence"]["shape_decode_total_failures"], 0);
+        assert_eq!(value["evidence"]["completeness"], "COMPLETE");
     }
 
     #[test]
@@ -1074,6 +1210,7 @@ mod tests {
             cgroup_id: 0,
             session: 7,
             mechanism: vendor_id,
+            capture: p11scope_ebpf_common::capture::MECHANISM_VALUE,
             rv: 0,
             p0: 0,
             p1: 0,
@@ -1097,6 +1234,7 @@ mod tests {
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
+            policy: CapturePolicy::Allowlisted,
         };
         let v = profile_json(&[], &ev, &state, &capture);
 
@@ -1125,6 +1263,7 @@ mod tests {
             cgroup_id: 0,
             session: 7,
             mechanism,
+            capture: p11scope_ebpf_common::capture::MECHANISM_VALUE,
             rv: 0,
             p0,
             p1,
@@ -1161,7 +1300,10 @@ mod tests {
     fn profile_json_renders_pss_params_as_a_shape_tagged_object_with_count() {
         use p11scope_ebpf_common::shape;
 
-        let mut state = crate::semantics::State::new(&init_plan());
+        let mut state = crate::semantics::State::with_policy(
+            &init_plan(),
+            CapturePolicy::UnsafeUnvalidatedMetadata,
+        );
         // Same mechanism, same combo, twice — must collapse into one
         // entry with count 2, not two entries.
         state.observe(&init_event(0, 0x0D, shape::RSA_PKCS_PSS, 0x270, 1, 32));
@@ -1175,9 +1317,11 @@ mod tests {
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
+            policy: CapturePolicy::UnsafeUnvalidatedMetadata,
         };
         let v = profile_json(&[], &ev, &state, &capture);
 
+        assert_eq!(v["capture"]["privacy_mode"], "unsafe-unvalidated-metadata");
         let params = &v["mechanisms"][0]["params"];
         assert_eq!(params.as_array().unwrap().len(), 1, "one distinct combo");
         let combo = &params[0];
@@ -1198,7 +1342,10 @@ mod tests {
         // current v2.40 one) — they must render as two distinct combos,
         // each tagged with the layout that produced it, never merged and
         // never mislabeled as the other's fields.
-        let mut state = crate::semantics::State::new(&init_plan());
+        let mut state = crate::semantics::State::with_policy(
+            &init_plan(),
+            CapturePolicy::UnsafeUnvalidatedMetadata,
+        );
         state.observe(&init_event(0, 0x1087, shape::GCM_V220, 12, 0, 128));
         state.observe(&init_event(0, 0x1087, shape::GCM_V240, 12, 16, 128));
 
@@ -1210,6 +1357,7 @@ mod tests {
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
+            policy: CapturePolicy::UnsafeUnvalidatedMetadata,
         };
         let v = profile_json(&[], &ev, &state, &capture);
 
@@ -1241,7 +1389,10 @@ mod tests {
     fn profile_json_multiple_distinct_combos_get_separate_entries() {
         use p11scope_ebpf_common::shape;
 
-        let mut state = crate::semantics::State::new(&init_plan());
+        let mut state = crate::semantics::State::with_policy(
+            &init_plan(),
+            CapturePolicy::UnsafeUnvalidatedMetadata,
+        );
         state.observe(&init_event(0, 0x0D, shape::RSA_PKCS_PSS, 0x270, 1, 32));
         state.observe(&init_event(0, 0x0D, shape::RSA_PKCS_PSS, 0x270, 1, 64));
 
@@ -1253,6 +1404,7 @@ mod tests {
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
+            policy: CapturePolicy::UnsafeUnvalidatedMetadata,
         };
         let v = profile_json(&[], &ev, &state, &capture);
 
@@ -1266,7 +1418,10 @@ mod tests {
     #[test]
     fn profile_json_unknown_shape_still_yields_null_params() {
         // shape::NONE — no decode ever applied for this mechanism.
-        let mut state = crate::semantics::State::new(&init_plan());
+        let mut state = crate::semantics::State::with_policy(
+            &init_plan(),
+            CapturePolicy::UnsafeUnvalidatedMetadata,
+        );
         state.observe(&init_event(0, 0x0999, 0, 0, 0, 0));
 
         let mut ev = evidence();
@@ -1277,6 +1432,7 @@ mod tests {
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
+            policy: CapturePolicy::UnsafeUnvalidatedMetadata,
         };
         let v = profile_json(&[], &ev, &state, &capture);
 
@@ -1289,7 +1445,10 @@ mod tests {
 
         // Mechanism has a published GCM shape, but every observed *Init
         // fails to decode (shape::NONE on both calls).
-        let mut state = crate::semantics::State::new(&init_plan());
+        let mut state = crate::semantics::State::with_policy(
+            &init_plan(),
+            CapturePolicy::UnsafeUnvalidatedMetadata,
+        );
         state.observe(&init_event(0, 0x1087, shape::NONE, 0, 0, 0));
         state.observe(&init_event(0, 0x1087, shape::NONE, 0, 0, 0));
         state.set_mech_shapes(std::collections::BTreeMap::from([(0x1087, shape::GCM)]));
@@ -1310,6 +1469,7 @@ mod tests {
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
+            policy: CapturePolicy::UnsafeUnvalidatedMetadata,
         };
         let v = profile_json(&[], &ev, &state, &capture);
         assert_eq!(v["mechanisms"][0]["params"], serde_json::Value::Null);
@@ -1327,7 +1487,10 @@ mod tests {
     fn mechanism_with_no_published_shape_keeps_the_not_attempted_note_and_stays_complete() {
         use p11scope_ebpf_common::shape;
 
-        let mut state = crate::semantics::State::new(&init_plan());
+        let mut state = crate::semantics::State::with_policy(
+            &init_plan(),
+            CapturePolicy::UnsafeUnvalidatedMetadata,
+        );
         state.observe(&init_event(0, 0x0999, shape::NONE, 0, 0, 0));
         // A different mechanism id is published — 0x0999 itself is not.
         state.set_mech_shapes(std::collections::BTreeMap::from([(0x1087, shape::GCM)]));
@@ -1349,13 +1512,14 @@ mod tests {
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
+            policy: CapturePolicy::UnsafeUnvalidatedMetadata,
         };
         let v = profile_json(&[], &ev, &state, &capture);
         assert_eq!(v["mechanisms"][0]["params"], serde_json::Value::Null);
         assert_eq!(
             v["mechanisms"][0]["note"],
-            "this mechanism has no published allowlisted parameter shape; decoding was not \
-             attempted, never a partial decode"
+            "this mechanism has no published diagnostic parameter shape; unvalidated \
+             pointer-derived decoding was not attempted, never a partial decode"
         );
         assert_eq!(v["evidence"]["completeness"], "COMPLETE");
     }
@@ -1414,7 +1578,10 @@ mod tests {
     fn profile_json_templates_render_requested_types_and_tristate_booleans() {
         use p11scope_ebpf_common::attr_bool;
 
-        let mut state = crate::semantics::State::new(&template_plan());
+        let mut state = crate::semantics::State::with_policy(
+            &template_plan(),
+            CapturePolicy::UnsafeUnvalidatedMetadata,
+        );
         // CKA_TOKEN (0x01) true, CKA_PRIVATE (0x02) present-but-false,
         // CKA_SIGN (0x108) never appears.
         state.observe(&template_event(
@@ -1432,6 +1599,7 @@ mod tests {
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
+            policy: CapturePolicy::UnsafeUnvalidatedMetadata,
         };
         let v = profile_json(&[], &ev, &state, &capture);
 
@@ -1477,7 +1645,10 @@ mod tests {
 
     #[test]
     fn profile_json_template_truncation_forces_partial_and_evidence_field() {
-        let mut state = crate::semantics::State::new(&template_plan());
+        let mut state = crate::semantics::State::with_policy(
+            &template_plan(),
+            CapturePolicy::UnsafeUnvalidatedMetadata,
+        );
         state.observe(&template_event(&[0x01; 8], 10, 0, 0)); // attr_total(10) > attr_count(8)
 
         let mut ev = evidence();
@@ -1495,6 +1666,7 @@ mod tests {
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
+            policy: CapturePolicy::UnsafeUnvalidatedMetadata,
         };
         let v = profile_json(&[], &ev, &state, &capture);
         assert_eq!(v["templates"]["operations"][0]["truncated"], true);
@@ -1524,6 +1696,7 @@ mod tests {
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
+            policy: CapturePolicy::Allowlisted,
         };
         let v = profile_json(&[], &ev, &state, &capture);
 
@@ -1552,6 +1725,10 @@ mod tests {
             cg222["errors"], 1,
             "the failed call counts as an error at the cgroup level too"
         );
-        assert_eq!(cg222["mechanisms"][0]["errors"], 1);
+        assert_eq!(
+            cg222["mechanisms"],
+            serde_json::json!([]),
+            "allowlisted capture must not attribute a rejected init as a mechanism request"
+        );
     }
 }

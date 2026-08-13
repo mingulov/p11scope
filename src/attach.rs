@@ -140,6 +140,22 @@ pub enum CapturePolicy {
 }
 
 impl CapturePolicy {
+    pub fn from_cli(mode: &str, unsafe_requested: bool, unsafe_compiled: bool) -> Result<Self> {
+        match mode {
+            "metrics" if unsafe_requested => {
+                bail!("--unsafe-unvalidated-metadata is not available in metrics mode")
+            }
+            "metrics" => Ok(Self::AggregateOnly),
+            "profile" | "trace" if unsafe_requested && !unsafe_compiled => bail!(
+                "--unsafe-unvalidated-metadata requires a build with the unsafe-unvalidated-metadata Cargo feature"
+            ),
+            "profile" | "trace" if unsafe_requested => Ok(Self::UnsafeUnvalidatedMetadata),
+            "profile" | "trace" => Ok(Self::Allowlisted),
+            "discover" => bail!("discover does not accept --unsafe-unvalidated-metadata"),
+            _ => bail!("unknown capture mode {mode:?}"),
+        }
+    }
+
     pub const fn config_bit(self) -> u64 {
         match self {
             Self::Allowlisted => FLAG_POLICY_ALLOWLISTED,
@@ -662,6 +678,42 @@ mod capture_policy {
             CapturePolicy::UnsafeUnvalidatedMetadata.config_bit(),
             CapturePolicy::AggregateOnly.config_bit()
         );
+    }
+}
+
+#[cfg(test)]
+mod policy_output {
+    use super::CapturePolicy;
+
+    #[test]
+    fn cli_policy_matrix_is_safe_by_default_and_double_gates_unsafe() {
+        assert_eq!(
+            CapturePolicy::from_cli("profile", false, false).unwrap(),
+            CapturePolicy::Allowlisted
+        );
+        assert_eq!(
+            CapturePolicy::from_cli("profile", false, true).unwrap(),
+            CapturePolicy::Allowlisted
+        );
+        assert_eq!(
+            CapturePolicy::from_cli("trace", false, true).unwrap(),
+            CapturePolicy::Allowlisted
+        );
+        assert_eq!(
+            CapturePolicy::from_cli("metrics", false, false).unwrap(),
+            CapturePolicy::AggregateOnly
+        );
+        assert_eq!(
+            CapturePolicy::from_cli("metrics", false, true).unwrap(),
+            CapturePolicy::AggregateOnly
+        );
+        assert_eq!(
+            CapturePolicy::from_cli("profile", true, true).unwrap(),
+            CapturePolicy::UnsafeUnvalidatedMetadata
+        );
+        assert!(CapturePolicy::from_cli("profile", true, false).is_err());
+        assert!(CapturePolicy::from_cli("metrics", true, true).is_err());
+        assert!(CapturePolicy::from_cli("discover", true, true).is_err());
     }
 }
 

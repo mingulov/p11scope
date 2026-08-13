@@ -208,7 +208,7 @@ fn profile_refuses_a_forged_function_role_before_bpf_startup() {
     assert_eq!(oracle.provenance_objects.len(), 1);
     std::fs::write(&genuine_path, serde_json::to_vec(&oracle).unwrap()).unwrap();
 
-    let mut forged = genuine;
+    let mut forged = oracle;
     let legacy = &mut forged.surfaces[0];
     let initialize = legacy
         .functions

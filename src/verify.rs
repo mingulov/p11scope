@@ -750,6 +750,7 @@ fn validate_structure(m: &Manifest) -> Vec<String> {
 struct Provenance {
     module: String,
     objects: Vec<String>,
+    provenance_objects: Vec<String>,
     interface_list: &'static str,
     surfaces: Vec<ProvenanceSurface>,
     vendor_interfaces: Vec<Vec<String>>,
@@ -794,6 +795,18 @@ fn provenance(m: &Manifest) -> Result<Provenance, Vec<String>> {
         .collect();
     let mut objects: Vec<String> = identities.values().cloned().collect();
     objects.sort();
+    let mut provenance_objects: Vec<String> = m
+        .provenance_objects
+        .iter()
+        .map(|object| {
+            object
+                .identity
+                .sha256
+                .clone()
+                .expect("structure validation requires closure SHA-256")
+        })
+        .collect();
+    provenance_objects.sort();
 
     let mut surfaces = Vec::with_capacity(m.surfaces.len());
     for surface in &m.surfaces {
@@ -876,6 +889,7 @@ fn provenance(m: &Manifest) -> Result<Provenance, Vec<String>> {
             .expect("structure validation requires object zero")
             .clone(),
         objects,
+        provenance_objects,
         interface_list: acquisition_name(&m.interface_list),
         surfaces,
         vendor_interfaces,
@@ -897,6 +911,11 @@ pub fn check_provenance(candidate: &Manifest, discovered: &Manifest) -> Result<(
     if candidate.objects != discovered.objects {
         return Err(vec![
             "object provenance differs from fresh discovery; refusing to attach".into(),
+        ]);
+    }
+    if candidate.provenance_objects != discovered.provenance_objects {
+        return Err(vec![
+            "executable provenance closure differs from fresh discovery; refusing to attach".into(),
         ]);
     }
     if candidate.interface_list != discovered.interface_list {

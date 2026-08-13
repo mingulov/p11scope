@@ -196,6 +196,53 @@ fn provenance_accepts_an_identity_equal_copy_and_ignores_paths_ids_and_diagnosti
 }
 
 #[test]
+fn provenance_rejects_removed_or_substituted_non_attach_closure_members() {
+    let d = tmpdir("reuse_provenance_closure");
+    let provider = cc_so(&d, "provider", "int provider(void){return 1;}\n");
+    let runtime = cc_so(&d, "runtime", "int runtime(void){return 2;}\n");
+    let runtime_copy = d.join("runtime-copy.so");
+    std::fs::copy(&runtime, &runtime_copy).unwrap();
+    let substitute = cc_so(&d, "substitute", "int substitute(void){return 3;}\n");
+
+    let mut discovered = walked_legacy_manifest(&provider);
+    discovered.provenance_objects.push(provenance_for(&runtime));
+    discovered
+        .provenance_objects
+        .push(provenance_for(&runtime_copy));
+    assert_eq!(
+        discovered.provenance_objects[1].identity.sha256,
+        discovered.provenance_objects[2].identity.sha256,
+        "fixture must contain duplicate closure identities on distinct inodes"
+    );
+
+    let mut candidate = discovered.clone();
+    for (index, object) in candidate.provenance_objects.iter_mut().enumerate() {
+        object.path = format!("/diagnostic/closure-{index}.so");
+        object.device_major = 900 + index as u64;
+        object.device_minor = 100 + index as u64;
+        object.inode = 1_000 + index as u64;
+        object.identity.note = Some(format!("diagnostic {index}"));
+    }
+    p11scope::verify::check_provenance(&candidate, &discovered).unwrap();
+
+    let mut truncated = candidate.clone();
+    truncated.provenance_objects.pop();
+    let errors = p11scope::verify::check_provenance(&truncated, &discovered).unwrap_err();
+    assert!(
+        errors.iter().any(|error| error.contains("closure")),
+        "{errors:?}"
+    );
+
+    let mut substituted = candidate;
+    substituted.provenance_objects[2].identity = provenance_for(&substitute).identity;
+    let errors = p11scope::verify::check_provenance(&substituted, &discovered).unwrap_err();
+    assert!(
+        errors.iter().any(|error| error.contains("closure")),
+        "{errors:?}"
+    );
+}
+
+#[test]
 fn manifest_v4_requires_a_whole_file_provenance_closure() {
     let d = tmpdir("reuse_missing_provenance_closure");
     let so = cc_so(&d, "missing-closure", "int f(void){return 1;}\n");

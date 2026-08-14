@@ -383,7 +383,13 @@ fn real_cli_refuses_preexisting_threads_before_lease_acquisition() {
         .arg(manifest)
         .arg("--provenance-module")
         .arg(provider)
-        .args(["--pid", &std::process::id().to_string(), "--duration", "0"])
+        .args([
+            "--pid",
+            &std::process::id().to_string(),
+            "--trusted-workload",
+            "--duration",
+            "0",
+        ])
         .env("LD_PRELOAD", preload)
         .output()
         .unwrap();

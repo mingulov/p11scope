@@ -1,8 +1,10 @@
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 const BIN: &str = env!("CARGO_BIN_EXE_p11scope");
+static IN_PROCESS_DISCOVERY: Mutex<()> = Mutex::new(());
 
 fn build_provider(dir: &Path) -> PathBuf {
     let provider = dir.join("provider.so");
@@ -24,17 +26,21 @@ fn build_provider(dir: &Path) -> PathBuf {
 fn build_manifest_oracle(dir: &Path, manifest: &Path) -> PathBuf {
     let source = dir.join("oracle.c");
     let helper = dir.join("p11scope-discover");
+    let marker = dir.join("oracle-ran");
     std::fs::write(
         &source,
         format!(
             r#"#include <stdio.h>
 int main(void) {{
+  FILE *marker = fopen({:?}, "wb");
+  if (!marker || fclose(marker)) return 3;
   FILE *in = fopen({:?}, "rb");
   if (!in) return 2;
   for (int c; (c = fgetc(in)) != EOF;) fputc(c, stdout);
   return ferror(in) || ferror(stdout);
 }}
 "#,
+            marker.display().to_string(),
             manifest.display().to_string()
         ),
     )
@@ -146,6 +152,7 @@ fn attach_commands_require_an_explicit_provider_authority() {
         let out = Command::new(BIN)
             .args([
                 command,
+                "--trusted-workload",
                 "--manifest",
                 "/nonexistent/manifest.json",
                 "--pid",
@@ -196,6 +203,7 @@ fn implicit_helper_resolves_sibling() {
 fn profile_refuses_a_forged_function_role_before_bpf_startup() {
     use p11scope_manifest::manifest::Resolution;
 
+    let _serial = IN_PROCESS_DISCOVERY.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let provider = build_provider(dir.path());
     let genuine = p11scope_discover::discover::discover(&provider).unwrap();
@@ -237,7 +245,13 @@ fn profile_refuses_a_forged_function_role_before_bpf_startup() {
         .arg(&forged_path)
         .args(["--provenance-module"])
         .arg(&provider)
-        .args(["--pid", &std::process::id().to_string(), "--duration", "0"])
+        .args([
+            "--pid",
+            &std::process::id().to_string(),
+            "--trusted-workload",
+            "--duration",
+            "0",
+        ])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
@@ -245,4 +259,101 @@ fn profile_refuses_a_forged_function_role_before_bpf_startup() {
     assert!(stderr.contains("C_EncryptInit provenance"), "{stderr}");
     assert!(stderr.contains("refusing to attach"), "{stderr}");
     assert!(!stderr.contains("starting attach session"), "{stderr}");
+}
+
+#[test]
+fn dynamic_observer_without_acknowledgement_refuses_before_oracle_execution() {
+    let _serial = IN_PROCESS_DISCOVERY.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let provider = build_provider(dir.path());
+    let mut manifest = p11scope_discover::discover::discover(&provider).unwrap();
+    let provider_sha = manifest.objects[0].identity.sha256.as_deref().unwrap();
+    manifest
+        .provenance_objects
+        .retain(|object| object.identity.sha256.as_deref() == Some(provider_sha));
+    let manifest_path = dir.path().join("manifest.json");
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+    let observer = dir.path().join("p11scope");
+    std::fs::copy(BIN, &observer).unwrap();
+    std::fs::set_permissions(&observer, std::fs::Permissions::from_mode(0o755)).unwrap();
+    build_manifest_oracle(dir.path(), &manifest_path);
+
+    for command in ["profile", "trace"] {
+        let output = Command::new(&observer)
+            .args([command, "--manifest"])
+            .arg(&manifest_path)
+            .arg("--provenance-module")
+            .arg(&provider)
+            .args(["--pid", &std::process::id().to_string(), "--duration", "0"])
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(1), "{command}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("--trusted-workload"), "{stderr}");
+        assert!(!dir.path().join("oracle-ran").exists(), "{command}");
+    }
+}
+
+#[test]
+fn trusted_acknowledgement_does_not_bypass_reuse_validation() {
+    let _serial = IN_PROCESS_DISCOVERY.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let provider = build_provider(dir.path());
+    let mut manifest = p11scope_discover::discover::discover(&provider).unwrap();
+    let provider_sha = manifest.objects[0].identity.sha256.as_deref().unwrap();
+    manifest
+        .provenance_objects
+        .retain(|object| object.identity.sha256.as_deref() == Some(provider_sha));
+    let manifest_path = dir.path().join("manifest.json");
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let replacement = dir.path().join("replacement.so");
+    std::fs::copy("/bin/false", &replacement).unwrap();
+    std::fs::rename(replacement, &provider).unwrap();
+
+    let observer = dir.path().join("p11scope");
+    std::fs::copy(BIN, &observer).unwrap();
+    std::fs::set_permissions(&observer, std::fs::Permissions::from_mode(0o755)).unwrap();
+    build_manifest_oracle(dir.path(), &manifest_path);
+
+    let output = Command::new(observer)
+        .args(["profile", "--manifest"])
+        .arg(&manifest_path)
+        .arg("--provenance-module")
+        .arg(&provider)
+        .args([
+            "--pid",
+            &std::process::id().to_string(),
+            "--trusted-workload",
+            "--duration",
+            "0",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("current files"), "{stderr}");
+    assert!(!dir.path().join("oracle-ran").exists());
+}
+
+#[test]
+fn standalone_discover_rejects_trusted_workload_acknowledgement() {
+    let output = Command::new(BIN)
+        .args([
+            "discover",
+            "--trusted-workload",
+            "--module",
+            "/dev/null",
+            "--helper",
+            "/definitely/missing/p11scope-discover",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unknown argument: --trusted-workload")
+    );
 }

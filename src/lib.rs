@@ -5,6 +5,7 @@ pub mod discover_cmd;
 pub mod events;
 pub mod kinds;
 pub mod metrics;
+pub(crate) mod oracle;
 pub mod plan;
 pub mod process;
 pub mod render;

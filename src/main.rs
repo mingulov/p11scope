@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "usage:\n  \
-p11scope profile --manifest <m.json> --provenance-module <provider.so> (--pid <n> | --cgroup <path>) [--mode profile|metrics] [--unsafe-unvalidated-metadata] [--duration <secs>] [-o <out.json>]\n  \
-p11scope trace --manifest <m.json> --provenance-module <provider.so> (--pid <n> | --cgroup <path>) [--unsafe-unvalidated-metadata] [--duration <secs>] [-o <out.file>]\n  \
+p11scope profile --manifest <m.json> --provenance-module <provider.so> (--pid <n> | --cgroup <path>) [--trusted-workload] [--mode profile|metrics] [--unsafe-unvalidated-metadata] [--duration <secs>] [-o <out.json>]\n  \
+p11scope trace --manifest <m.json> --provenance-module <provider.so> (--pid <n> | --cgroup <path>) [--trusted-workload] [--unsafe-unvalidated-metadata] [--duration <secs>] [-o <out.file>]\n  \
 p11scope discover --module <provider.so> [-o <manifest.json>]\n\n\
 note: --mode defaults to profile (metrics + mechanisms/sessions/logins from\n\
 the event stream); --mode metrics is the lighter, maps-only level.\n\
@@ -145,6 +145,8 @@ fn resolve_scope(pid: Option<u32>, cgroup: Option<PathBuf>) -> Result<Scope> {
 fn load_plan(
     manifest_path: &std::path::Path,
     provenance_module: &std::path::Path,
+    scope: &Scope,
+    trusted_workload: bool,
 ) -> Result<(Manifest, plan::AttachPlan, verify::VerifiedObjects)> {
     let text = verify::read_manifest(manifest_path)
         .map_err(|error| anyhow!("reading manifest {}: {error}", manifest_path.display()))?;
@@ -163,12 +165,13 @@ fn load_plan(
         }
         anyhow!("manifest does not match the current files; refusing to attach")
     })?;
-    let discovered = discover_cmd::rediscover_stable(provenance_module).with_context(|| {
-        format!(
-            "verifying manifest against fresh discovery of {}",
-            provenance_module.display()
-        )
-    })?;
+    let discovered = discover_cmd::rediscover_stable(provenance_module, scope, trusted_workload)
+        .with_context(|| {
+            format!(
+                "verifying manifest against fresh discovery of {}",
+                provenance_module.display()
+            )
+        })?;
     verify::check_provenance(&manifest, discovered.manifest()).map_err(|problems| {
         for problem in &problems {
             eprintln!("p11scope: {problem}");
@@ -303,6 +306,7 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
     let mut duration: Option<u64> = None;
     let mut out: Option<PathBuf> = None;
     let mut unsafe_requested = false;
+    let mut trusted_workload = false;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -327,6 +331,7 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
                 );
             }
             "-o" => out = Some(require_value(&mut args, "-o").into()),
+            "--trusted-workload" => trusted_workload = true,
             "--unsafe-unvalidated-metadata" => unsafe_requested = true,
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
@@ -359,7 +364,8 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
     let scope = resolve_scope(pid, cgroup)?;
     warn_unsafe_policy(policy);
     let signals = verify::CaptureSignals::block().map_err(anyhow::Error::msg)?;
-    let (manifest, plan, objects) = load_plan(&manifest_path, &provenance_module)?;
+    let (manifest, plan, objects) =
+        load_plan(&manifest_path, &provenance_module, &scope, trusted_workload)?;
     let output = verify::SupervisorOutput::profile(out).map_err(anyhow::Error::msg)?;
     let outcome = verify::supervise_capture(signals, objects, output, move |worker| {
         capture_profile(manifest, plan, scope, mode, policy, duration, worker)
@@ -571,6 +577,7 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
     let mut duration: Option<u64> = None;
     let mut out: Option<PathBuf> = None;
     let mut unsafe_requested = false;
+    let mut trusted_workload = false;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -594,6 +601,7 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
                 );
             }
             "-o" => out = Some(require_value(&mut args, "-o").into()),
+            "--trusted-workload" => trusted_workload = true,
             "--unsafe-unvalidated-metadata" => unsafe_requested = true,
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
@@ -629,7 +637,8 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
     let scope = resolve_scope(pid, cgroup)?;
     warn_unsafe_policy(policy);
     let signals = verify::CaptureSignals::block().map_err(anyhow::Error::msg)?;
-    let (_manifest, plan, objects) = load_plan(&manifest_path, &provenance_module)?;
+    let (_manifest, plan, objects) =
+        load_plan(&manifest_path, &provenance_module, &scope, trusted_workload)?;
     let output = verify::SupervisorOutput::trace(out, policy).map_err(anyhow::Error::msg)?;
     let outcome = verify::supervise_capture(signals, objects, output, move |worker| {
         capture_trace(plan, scope, policy, duration, worker).map_err(|error| format!("{error:#}"))
@@ -1150,7 +1159,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = load_plan(&path, std::path::Path::new("/unused"))
+        let err = load_plan(&path, std::path::Path::new("/unused"), &Scope::Pid(1), true)
             .unwrap_err()
             .to_string();
         assert!(err.contains("rediscover"), "{err}");
@@ -1174,7 +1183,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = load_plan(&path, std::path::Path::new("/unused"))
+        let err = load_plan(&path, std::path::Path::new("/unused"), &Scope::Pid(1), true)
             .unwrap_err()
             .to_string();
         assert!(err.contains("rediscover"), "{err}");

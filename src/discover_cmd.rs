@@ -2,6 +2,7 @@
 //! p11scope never dlopens a provider itself: it is privileged, static,
 //! and must not run vendor constructors in its own address space.
 
+use crate::attach::Scope;
 use anyhow::{Context as _, Result, anyhow, bail};
 use p11scope_manifest::identity::{MappingFileKey, inspect_file, mapping_file_key, open_object};
 use p11scope_manifest::manifest::{Manifest, ProvenanceObject, SCHEMA};
@@ -379,16 +380,36 @@ fn stabilize(module: &Path, mut pass: impl FnMut() -> Result<Manifest>) -> Resul
 
 /// Runs the installed sibling helper until one complete pass used only a
 /// pre-leased, unchanged exact executable-mapping closure.
-pub fn rediscover_stable(module: &Path) -> Result<StableDiscovery> {
+pub fn rediscover_stable(
+    module: &Path,
+    scope: &Scope,
+    trusted_workload: bool,
+) -> Result<StableDiscovery> {
     if !module.is_absolute() {
         bail!("--provenance-module must be an absolute path");
     }
+    let selection = crate::oracle::select(scope, trusted_workload)?;
     let helper_path = std::env::current_exe()
         .context("locating the running p11scope executable")?
         .parent()
         .ok_or_else(|| anyhow!("running p11scope executable has no parent directory"))?
         .join("p11scope-discover");
-    rediscover_stable_with_helper(&helper_path, module)
+    rediscover_stable_selected(&helper_path, module, selection)
+}
+
+fn rediscover_stable_selected(
+    helper_path: &Path,
+    module: &Path,
+    selection: crate::oracle::OracleSelection,
+) -> Result<StableDiscovery> {
+    match selection.mode {
+        crate::oracle::OracleMode::TrustedWorkload => {
+            rediscover_stable_with_helper(helper_path, module)
+        }
+        crate::oracle::OracleMode::Hardened => bail!(
+            "hardened discovery oracle is incomplete until the pinned loader/runtime closure and PREPARED/DROP/READY/GO validation are installed"
+        ),
+    }
 }
 
 fn rediscover_stable_with_helper(helper_path: &Path, module: &Path) -> Result<StableDiscovery> {
@@ -590,6 +611,9 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
                 .next()
                 .ok_or_else(|| anyhow!("--helper requires a value"))?;
             helper = Some(PathBuf::from(v));
+        } else if a == "--trusted-workload" {
+            eprintln!("unknown argument: --trusted-workload");
+            std::process::exit(2);
         } else {
             forwarded.push(a);
         }
@@ -996,5 +1020,24 @@ int main(void) {
 
         let error = stable.ensure_stable().unwrap_err();
         assert!(error.to_string().contains("was replaced"), "{error:#}");
+    }
+
+    #[test]
+    fn hardened_selection_fails_closed_until_the_hardened_runner_exists() {
+        let error = rediscover_stable_selected(
+            Path::new("/missing/p11scope-discover"),
+            Path::new("/missing/provider.so"),
+            crate::oracle::OracleSelection {
+                mode: crate::oracle::OracleMode::Hardened,
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("hardened discovery oracle is incomplete"),
+            "{error:#}"
+        );
     }
 }

@@ -82,7 +82,13 @@ int main(int argc, char **argv) {{
         .arg(&manifest_path)
         .args(["--provenance-module"])
         .arg(&object)
-        .args(["--pid", &std::process::id().to_string(), "--duration", "1"])
+        .args([
+            "--pid",
+            &std::process::id().to_string(),
+            "--trusted-workload",
+            "--duration",
+            "1",
+        ])
         .output()
         .unwrap();
     assert_eq!(

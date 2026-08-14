@@ -3,6 +3,9 @@ use p11scope_manifest::manifest::*;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+
+static CC_LOCK: Mutex<()> = Mutex::new(());
 
 fn tmpdir(name: &str) -> PathBuf {
     let d =
@@ -13,6 +16,7 @@ fn tmpdir(name: &str) -> PathBuf {
 
 /// Build a .so with a caller-chosen build-id so two builds differ.
 fn cc_so(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let _guard = CC_LOCK.lock().unwrap();
     let src = dir.join(format!("{name}.c"));
     std::fs::write(&src, body).unwrap();
     let so = dir.join(format!("{name}.so"));
@@ -29,6 +33,7 @@ fn cc_so(dir: &Path, name: &str, body: &str) -> PathBuf {
 }
 
 fn cc_so_with_build_id(dir: &Path, name: &str, body: &str, build_id: &str) -> PathBuf {
+    let _guard = CC_LOCK.lock().unwrap();
     let src = dir.join(format!("{name}.c"));
     std::fs::write(&src, body).unwrap();
     let so = dir.join(format!("{name}.so"));
@@ -674,6 +679,7 @@ fn manifest_input_is_regular_utf8_and_bounded() {
 fn aggregate_object_bytes_are_refused_before_parsing() {
     let d = tmpdir("reuse_aggregate_object_bytes");
     let so = cc_so(&d, "small", "int f(void){return 1;}\n");
+    let _guard = CC_LOCK.lock().unwrap();
     let mut m = manifest_for(&so);
     for id in 1..=2 {
         let path = d.join(format!("large-{id}.so"));

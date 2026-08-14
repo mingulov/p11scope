@@ -124,16 +124,37 @@ def exact_common(evidence, *, aliases, skipped, in_flight):
     require(evidence["completeness"] == "PARTIAL", evidence["completeness"])
 
 
+# The four counters the schema documents as informational, and therefore
+# permits nonzero in an otherwise complete document. A lane that attaches mid
+# execution legitimately reports orphan operations and unmatched closes, and a
+# lane observing many short-lived processes legitimately falls back from pidfd
+# identity to /proc start-time identity.
+INFORMATIONAL_COUNTERS = frozenset(
+    {
+        "process_tracking_fallbacks",
+        "orphan_ops",
+        "unmatched_closes",
+        "shape_decode_failures",
+    }
+)
+
+
 def terminal_capture_is_clean(evidence):
     """Normal terminal evidence for a lane with its own call oracle.
 
     A detached perf link does not wait for BPF callbacks already running on
     another CPU, so a terminal snapshot is PARTIAL by construction. "Clean"
-    therefore means PARTIAL with no concrete gap: no attach failure, alias,
-    skip, or in-flight call, and every gap counter zero.
+    therefore means exactly what COMPLETE used to mean, minus that one
+    unprovable drain: no attach failure, alias, skip, or in-flight call, and
+    every *concrete* gap counter zero. The documented informational counters
+    are not gaps and are not constrained here; a lane that can prove an exact
+    value for them should assert it directly with exact_counters.
     """
     exact_common(evidence, aliases=[], skipped=[], in_flight=0)
-    exact_counters(evidence)
+    for name in COUNTERS:
+        if name in INFORMATIONAL_COUNTERS:
+            continue
+        require(evidence[name] == 0, f"{name}: want 0, got {evidence[name]}")
 
 
 def load_json(path):
@@ -459,10 +480,18 @@ def self_test():
         ("event_loss", 1),
         ("in_flight_at_end", 1),
         ("aliased", ["C_Sign"]),
+        ("semantic_state_drops", 1),
+        ("rv_update_failures", 1),
     ):
         bad = copy.deepcopy(clean["evidence"])
         bad[field] = value
         rejected(lambda bad=bad: terminal_capture_is_clean(bad))
+    # The documented informational counters are not gaps: a lane attaching mid
+    # execution must still read as clean.
+    for field in sorted(INFORMATIONAL_COUNTERS):
+        tolerated = copy.deepcopy(clean["evidence"])
+        tolerated[field] = 7
+        terminal_capture_is_clean(tolerated)
     print("terminal capture predicate is PARTIAL with no concrete gap: OK")
 
 

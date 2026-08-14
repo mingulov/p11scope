@@ -384,12 +384,12 @@ with Task 7 here.
 **Files:**
 - Review only: the complete current diff and trust-boundary call graph.
 
-- [ ] Run the forged-manifest, lazy-dependency, `$ORIGIN`, same-inode rewrite,
+- [x] Run the forged-manifest, lazy-dependency, `$ORIGIN`, same-inode rewrite,
   churn, and ordered-teardown regressions and confirm refusal occurs before
   `plan::build`/`Session::start` or before a writer proceeds, as applicable.
-- [ ] Run all four `AGENTS.md` gates on the final tree.
-- [ ] Re-review helper replacement, output exhaustion, path/ID/diagnostic normalization, container safe-copy, and equivalent `profile`/`trace` sinks.
-- [ ] Re-review same-inode mutation, lease acquisition/break handling, empty oracle environment, deadline/process-group cleanup, and post-attach/final-output stability checks.
+- [x] Run all four `AGENTS.md` gates on the final tree.
+- [x] Re-review helper replacement, output exhaustion, path/ID/diagnostic normalization, container safe-copy, and equivalent `profile`/`trace` sinks.
+- [x] Re-review same-inode mutation, lease acquisition/break handling, empty oracle environment, deadline/process-group cleanup, and post-attach/final-output stability checks.
 - [ ] Re-run the final maximum code review and require zero findings in these
   fixed classes: manifest self-authorization/forged function roles; helper
   replacement and pre-main runtime injection; provider, dependency, path,
@@ -398,3 +398,44 @@ with Task 7 here.
   same-uid signal/ptrace authority; and safe/unsafe pointer-alias privacy plus
   immutable policy publication. Report privileged/container experiments as
   unrun unless separately approved.
+
+#### Task 7 pass of 2026-08-14
+
+Steps 1–4 above are complete. Regressions: `reuse` 18/18, `lease_break` 21/21,
+`provenance_lease_break` 1/1, `cli_discover` 9/9. Gates: fmt, check, 342
+workspace tests, Clippy with warnings denied, `git diff --check`, shellcheck at
+error level, and every Python self-test.
+
+Ordering verified structurally, not only by test name: `plan::build` has
+exactly one caller, inside `load_plan`, and every refusal — schema,
+`check_reuse`, oracle selection and revalidation, `rediscover_stable`,
+`check_provenance`, closure and object `ensure_stable` — precedes it
+(`src/main.rs:202`). `Session::start` has one caller, reached only through
+`load_plan`. On a lease break the supervisor waits the worker pidfd, reaps,
+`drop(objects)` releases the leases, and *only then* writes the trace abort
+record, so output I/O cannot consume the kernel's lease-break deadline
+(`src/verify.rs:938-961`). Profile output publishes only on
+`completed && WIFEXITED && WEXITSTATUS == 0`. The worker unblocks SIGINT and
+SIGTERM by explicit two-signal set, leaving SIGIO blocked, so a break cannot
+reach the worker's default disposition. Policy maps are frozen before any
+program load or attach, with `SLOT_SEMANTICS` frozen after load and still
+before the first attach. `CallStart.mechanism_ptr` exists only in the kernel
+struct: it appears nowhere in `Event` and nowhere in `src/`, and the return
+probe accepts a read only on `CKR_OK`/`CKR_PENDING` and only when the value is
+an exact `MECH_SHAPE` member.
+
+**One finding, in this pass's own new code, fixed before commit.** The shared
+`terminal_capture_is_clean` predicate initially called `exact_counters` with no
+allowances, requiring *every* counter to be zero — stricter than the `COMPLETE`
+contract it replaced, which permits the four documented informational counters.
+`verify-oracle.sh` attaches mid-execution to a workload that spawns many
+subprocesses, exactly the case where `orphan_ops` and
+`process_tracking_fallbacks` are legitimately nonzero, so the lane would have
+failed a clean run. The predicate now constrains only concrete gap counters and
+the self-test asserts both directions.
+
+**Step 5 remains open.** The review above was performed directly by reading the
+trust-boundary call graph; it is not the project's multi-agent maximum review,
+which is user-triggered (`/code-review ultra`) and cannot be launched from a
+session. Run that before treating this gate as passed. No privileged or
+container experiment was run in this pass.

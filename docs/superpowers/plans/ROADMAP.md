@@ -306,8 +306,11 @@ shared layer broad 2x plus both leaf 1x, kind pod 68/68/136, Knative
 cold-start capture from a pod created after attach) — each recording
 read-lease, filesystem-type, and `lease-break-time` evidence.
 
-**A new session starts at provenance Task 7**, the final cross-cutting
-re-review, which is the remaining G5 criterion. Plans:
+**Provenance Task 7 Steps 1–4 passed on 2026-08-14** (regressions, four gates,
+and both re-review clauses; one defect found and fixed in that pass's own new
+code — see the plan's "Task 7 pass of 2026-08-14"). **Step 5, the multi-agent
+maximum code review, is the remaining G5 criterion** and is user-triggered
+(`/code-review ultra`); it cannot be launched from a session. Plans:
 `2026-08-13-manifest-provenance.md` (Tasks 1–6 done) and
 `2026-08-13-safe-and-unvalidated-metadata.md` (Tasks 1–5 done, Task 6 Step 6
 partial). Slice-by-slice evidence including every deferred Minor is under

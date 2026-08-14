@@ -147,7 +147,12 @@ fn load_plan(
     provenance_module: &std::path::Path,
     scope: &Scope,
     trusted_workload: bool,
-) -> Result<(Manifest, plan::AttachPlan, verify::VerifiedObjects)> {
+) -> Result<(
+    Manifest,
+    plan::AttachPlan,
+    verify::VerifiedObjects,
+    discover_cmd::OracleSelection,
+)> {
     let text = verify::read_manifest(manifest_path)
         .map_err(|error| anyhow!("reading manifest {}: {error}", manifest_path.display()))?;
     let manifest: Manifest = serde_json::from_str(&text)
@@ -165,8 +170,13 @@ fn load_plan(
         }
         anyhow!("manifest does not match the current files; refusing to attach")
     })?;
-    let discovered = discover_cmd::rediscover_stable(provenance_module, scope, trusted_workload)
-        .with_context(|| {
+    let oracle = discover_cmd::select_oracle(scope, trusted_workload)
+        .context("selecting the discovery oracle authority")?;
+    oracle
+        .revalidate()
+        .context("revalidating the observed process before fresh discovery")?;
+    let discovered =
+        discover_cmd::rediscover_stable(provenance_module, &oracle).with_context(|| {
             format!(
                 "verifying manifest against fresh discovery of {}",
                 provenance_module.display()
@@ -185,6 +195,9 @@ fn load_plan(
         .ensure_stable()
         .map_err(anyhow::Error::msg)
         .context("checking authorized provider objects after provenance discovery")?;
+    oracle
+        .revalidate()
+        .context("revalidating the observed process after provenance comparison")?;
 
     let plan = plan::build(&manifest);
     if plan.slots.is_empty() {
@@ -194,7 +207,7 @@ fn load_plan(
         );
     }
     plan::ensure_capacity(&plan).map_err(|error| anyhow!(error))?;
-    Ok((manifest, plan, objects))
+    Ok((manifest, plan, objects, oracle))
 }
 
 /// Prints every attach failure — shared by `profile` and `trace`, which
@@ -226,6 +239,29 @@ fn report_attach_failures(session: &Session) {
             );
         }
     }
+}
+
+fn start_authorized_session(
+    plan: &plan::AttachPlan,
+    scope: &Scope,
+    objects: &verify::VerifiedObjects,
+    policy: CapturePolicy,
+    oracle: &discover_cmd::OracleSelection,
+) -> Result<Session> {
+    oracle
+        .revalidate()
+        .context("revalidating the observed process before attach")?;
+    let session =
+        Session::start(plan, scope, objects, policy).context("starting attach session")?;
+    oracle
+        .revalidate()
+        .context("revalidating the observed process after attach")?;
+    objects
+        .verify_stable()
+        .map_err(anyhow::Error::msg)
+        .context("rechecking authorized provider objects after attach")?;
+    report_attach_failures(&session);
+    Ok(session)
 }
 
 /// Gives unsafe rendering the same diagnostic shape expectations that
@@ -364,11 +400,11 @@ fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
     let scope = resolve_scope(pid, cgroup)?;
     warn_unsafe_policy(policy);
     let signals = verify::CaptureSignals::block().map_err(anyhow::Error::msg)?;
-    let (manifest, plan, objects) =
+    let (manifest, plan, objects, oracle) =
         load_plan(&manifest_path, &provenance_module, &scope, trusted_workload)?;
     let output = verify::SupervisorOutput::profile(out).map_err(anyhow::Error::msg)?;
     let outcome = verify::supervise_capture(signals, objects, output, move |worker| {
-        capture_profile(manifest, plan, scope, mode, policy, duration, worker)
+        capture_profile(manifest, plan, scope, policy, duration, oracle, worker)
             .map_err(|error| format!("{error:#}"))
     })
     .map_err(anyhow::Error::msg)?;
@@ -379,9 +415,9 @@ fn capture_profile(
     manifest: Manifest,
     plan: plan::AttachPlan,
     scope: Scope,
-    mode: String,
     policy: CapturePolicy,
     duration: Option<u64>,
+    oracle: discover_cmd::OracleSelection,
     worker: &mut verify::WorkerContext,
 ) -> Result<()> {
     let interrupted = install_sigint_flag()?;
@@ -390,13 +426,9 @@ fn capture_profile(
         .map_err(anyhow::Error::msg)?;
     let (stdout, output, objects) = worker.output_parts();
     let has_output = output.is_some();
-    let mut session =
-        Session::start(&plan, &scope, objects, policy).context("starting attach session")?;
-    objects
-        .verify_stable()
-        .map_err(anyhow::Error::msg)
-        .context("rechecking authorized provider objects after attach")?;
-    report_attach_failures(&session);
+    let mut session = start_authorized_session(&plan, &scope, objects, policy, &oracle)?;
+    let profile = policy.uses_events();
+    let mode = if profile { "profile" } else { "metrics" };
 
     // Only `--mode profile` decodes the event stream; `--mode metrics` never
     // drains the ring buffer, so it stays the lighter, maps-only level.
@@ -438,11 +470,11 @@ fn capture_profile(
         if should_stop(&interrupted, elapsed, duration) {
             break;
         }
-        if mode == "profile" {
+        if profile {
             malformed_records += drain_events(&mut session, &mut state, &mut process_tracker)?;
         }
         let mut kernel_evidence = metrics::kernel_evidence(&session)?;
-        if mode != "profile" {
+        if !profile {
             kernel_evidence.ring_loss = 0;
         }
         let reports = metrics::read(&session, &plan)?;
@@ -455,7 +487,7 @@ fn capture_profile(
             malformed_records,
             &state,
         );
-        let frame = render::live(&reports, &ev, elapsed, &manifest.module_path, &mode, policy);
+        let frame = render::live(&reports, &ev, elapsed, &manifest.module_path, mode, policy);
         objects
             .ensure_stable()
             .map_err(anyhow::Error::msg)
@@ -477,13 +509,13 @@ fn capture_profile(
         .ensure_stable()
         .map_err(anyhow::Error::msg)
         .context("authorized provider object changed during capture")?;
-    if mode == "profile" {
+    if profile {
         malformed_records += drain_events(&mut session, &mut state, &mut process_tracker)?;
     }
     retire_exited(&mut process_tracker, &mut state);
     let reports = metrics::read(&session, &plan)?;
     let mut kernel_evidence = metrics::kernel_evidence(&session)?;
-    if mode != "profile" {
+    if !profile {
         kernel_evidence.ring_loss = 0;
     }
     let mut ev = evidence_for(
@@ -501,7 +533,7 @@ fn capture_profile(
         &ev,
         clock.elapsed(),
         &manifest.module_path,
-        &mode,
+        mode,
         policy,
     );
     objects
@@ -535,7 +567,7 @@ fn capture_profile(
             kernel: &kernel,
             policy,
         };
-        let j = if mode == "profile" {
+        let j = if profile {
             render::profile_json(&reports, &ev, &state, &capture)
         } else {
             render::json(&reports, &ev, &capture)
@@ -548,6 +580,7 @@ fn capture_profile(
     }
 
     drop(session);
+    drop(oracle);
     Ok(())
 }
 
@@ -637,11 +670,12 @@ fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
     let scope = resolve_scope(pid, cgroup)?;
     warn_unsafe_policy(policy);
     let signals = verify::CaptureSignals::block().map_err(anyhow::Error::msg)?;
-    let (_manifest, plan, objects) =
+    let (_manifest, plan, objects, oracle) =
         load_plan(&manifest_path, &provenance_module, &scope, trusted_workload)?;
     let output = verify::SupervisorOutput::trace(out, policy).map_err(anyhow::Error::msg)?;
     let outcome = verify::supervise_capture(signals, objects, output, move |worker| {
-        capture_trace(plan, scope, policy, duration, worker).map_err(|error| format!("{error:#}"))
+        capture_trace(plan, scope, policy, duration, oracle, worker)
+            .map_err(|error| format!("{error:#}"))
     })
     .map_err(anyhow::Error::msg)?;
     finish_supervised_capture(outcome)
@@ -652,6 +686,7 @@ fn capture_trace(
     scope: Scope,
     policy: CapturePolicy,
     duration: Option<u64>,
+    oracle: discover_cmd::OracleSelection,
     worker: &mut verify::WorkerContext,
 ) -> Result<()> {
     let interrupted = install_sigint_flag()?;
@@ -659,13 +694,7 @@ fn capture_trace(
         .unblock_operator_signals()
         .map_err(anyhow::Error::msg)?;
     let (stdout, out_file, objects) = worker.output_parts();
-    let mut session =
-        Session::start(&plan, &scope, objects, policy).context("starting attach session")?;
-    objects
-        .verify_stable()
-        .map_err(anyhow::Error::msg)
-        .context("rechecking authorized provider objects after attach")?;
-    report_attach_failures(&session);
+    let mut session = start_authorized_session(&plan, &scope, objects, policy, &oracle)?;
 
     let mut state = semantics::State::with_policy(&plan, policy);
     let mut process_tracker = process::Tracker::new();
@@ -780,6 +809,7 @@ fn capture_trace(
     }
 
     drop(session);
+    drop(oracle);
     Ok(())
 }
 

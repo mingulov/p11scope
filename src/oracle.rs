@@ -1,12 +1,12 @@
 use crate::attach::Scope;
 use anyhow::{Context as _, Result, anyhow};
 use p11scope_manifest::identity::{
-    ElfLoader, MappingFileKey, inspect_elf_loader, mapping_file_key, open_object,
+    ElfLoader, MappingFileKey, inspect_elf_loader, mapping_file_key,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
-use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::FileExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -17,6 +17,9 @@ const GLIBC_LOADER: &str = "ld-linux-x86-64.so.2";
 const GLIBC_SEARCH_DIRECTORIES: [&str; 2] = ["/usr/lib/x86_64-linux-gnu", "/usr/lib64"];
 const GLIBC_STAGING_DIRECTORY: &str = "/run/p11scope";
 const MAX_SYMLINK_HOPS: usize = 8;
+const MAX_PROC_STATUS_BYTES: usize = 64 * 1024;
+const MAX_PROC_STAT_BYTES: usize = 4 * 1024;
+const MAX_TARGET_TASKS: usize = 16_384;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OracleMode {
@@ -24,8 +27,10 @@ pub(crate) enum OracleMode {
     Hardened,
 }
 
-pub(crate) struct OracleSelection {
-    pub(crate) mode: OracleMode,
+#[derive(Debug)]
+pub struct OracleSelection {
+    mode: OracleMode,
+    target: Option<PinnedTarget>,
 }
 
 struct HardenedFacts<'a> {
@@ -43,12 +48,152 @@ struct HardenedFacts<'a> {
 struct ProcessStatus {
     uids: [u32; 4],
     capabilities: u64,
+    no_new_privileges: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TargetIdentity {
+    directory: ProcFileIdentity,
+    status: ProcFileIdentity,
+    tasks: ProcFileIdentity,
+    start_time: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TaskIdentity {
+    directory: ProcFileIdentity,
+    status: ProcFileIdentity,
+    start_time: u64,
+}
+
+type TaskIdentitySet = BTreeMap<u32, TaskIdentity>;
+
+#[derive(Debug)]
+struct PinnedTarget {
+    pid: u32,
+    pidfd: OwnedFd,
+    procfs: File,
+    directory: File,
+    status: File,
+    tasks: File,
+    identity: TargetIdentity,
 }
 
 fn trusted_required(reason: impl std::fmt::Display) -> anyhow::Error {
     anyhow!(
         "{reason}; pass --trusted-workload only when the observed workload is explicitly trusted"
     )
+}
+
+impl OracleSelection {
+    fn trusted_workload() -> Self {
+        Self {
+            mode: OracleMode::TrustedWorkload,
+            target: None,
+        }
+    }
+
+    fn hardened(target: PinnedTarget) -> Self {
+        Self {
+            mode: OracleMode::Hardened,
+            target: Some(target),
+        }
+    }
+
+    pub(crate) fn mode(&self) -> OracleMode {
+        self.mode
+    }
+
+    pub fn revalidate(&self) -> Result<()> {
+        match (self.mode, &self.target) {
+            (OracleMode::TrustedWorkload, None) => Ok(()),
+            (OracleMode::Hardened, Some(target)) => target.revalidate(),
+            _ => Err(anyhow!(
+                "discovery oracle selection has inconsistent target authority"
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hardened_without_target_for_test() -> Self {
+        Self {
+            mode: OracleMode::Hardened,
+            target: None,
+        }
+    }
+}
+
+impl PinnedTarget {
+    fn pin(pid: u32) -> Result<Self> {
+        let pidfd = open_pidfd(pid)?;
+        ensure_pid_alive(pid, &pidfd)?;
+        let procfs = open_procfs()?;
+        let directory = open_proc_pid_directory(&procfs, pid)?;
+        let status = open_proc_regular(&directory, "status")?;
+        let tasks = open_proc_directory(&directory, "task")?;
+        let identity = target_identity(&directory, &status, &tasks)?;
+        let target = Self {
+            pid,
+            pidfd,
+            procfs,
+            directory,
+            status,
+            tasks,
+            identity,
+        };
+        target.revalidate()?;
+        Ok(target)
+    }
+
+    fn revalidate(&self) -> Result<()> {
+        ensure_pid_alive(self.pid, &self.pidfd)?;
+        validate_procfs_binding(&self.procfs)?;
+        let retained = TargetIdentity {
+            directory: proc_file_identity(&self.directory)?,
+            status: proc_file_identity(&self.status)?,
+            tasks: proc_file_identity(&self.tasks)?,
+            start_time: self.identity.start_time,
+        };
+        ensure_same_target(self.pid, self.identity, retained)?;
+        let directory = open_proc_pid_directory(&self.procfs, self.pid)?;
+        let status = open_proc_regular(&directory, "status")?;
+        let tasks = open_proc_directory(&directory, "task")?;
+        let current = target_identity(&directory, &status, &tasks)?;
+        ensure_same_target(self.pid, self.identity, current)?;
+        let first = validated_task_set(&self.tasks, self.pid)?;
+        let second = validated_task_set(&self.tasks, self.pid)?;
+        ensure_same_task_set(self.pid, &first, &second)?;
+        ensure_pid_alive(self.pid, &self.pidfd)
+    }
+
+    fn status(&self) -> Result<String> {
+        read_proc_text(&self.status, MAX_PROC_STATUS_BYTES, "process status")
+    }
+}
+
+fn validate_target_status(status: &ProcessStatus) -> Result<()> {
+    if status.uids.contains(&0) {
+        return Err(anyhow!(
+            "the observed process has a root UID and can share authority with the observer",
+        ));
+    }
+    if status.capabilities != 0 {
+        return Err(anyhow!(
+            "the observed process has capabilities that can regain authority over the observer",
+        ));
+    }
+    if !status.no_new_privileges {
+        return Err(anyhow!(
+            "the observed process does not have NoNewPrivs enabled",
+        ));
+    }
+    Ok(())
 }
 
 fn select_from_facts(
@@ -104,17 +249,7 @@ fn select_from_facts(
             ));
         }
         let target = parse_status(facts.target_status)?;
-        if target.uids.contains(&0) {
-            return Err(anyhow!(
-                "the observed process has a root UID and can share authority with the observer",
-            ));
-        }
-        let dangerous = (1u64 << 5) | (1u64 << 7) | (1u64 << 19);
-        if target.capabilities & dangerous != 0 {
-            return Err(anyhow!(
-                "the observed process has signal, set-UID, or ptrace capability over the observer",
-            ));
-        }
+        validate_target_status(&target)?;
         Ok(())
     })();
     match eligible {
@@ -126,13 +261,25 @@ fn select_from_facts(
 
 pub(crate) fn select(scope: &Scope, trusted_workload: bool) -> Result<OracleSelection> {
     let Scope::Pid(pid) = scope else {
-        return select_from_facts(scope, trusted_workload, None)
-            .map(|mode| OracleSelection { mode });
+        select_from_facts(scope, trusted_workload, None)?;
+        return Ok(OracleSelection::trusted_workload());
     };
-    let selected = (|| -> Result<OracleMode> {
-        let observer = open_object(Path::new("/proc/self/exe")).map_err(|error| {
-            trusted_required(format!("opening the running observer failed: {error}"))
+    let selected = (|| -> Result<(OracleMode, PinnedTarget)> {
+        let target = PinnedTarget::pin(*pid).map_err(|error| {
+            trusted_required(format!("pinning observed process {pid} failed: {error}"))
         })?;
+        let observer_pid = u32::try_from(unsafe { libc::getpid() })
+            .map_err(|_| trusted_required("the observer PID is out of range"))?;
+        let observer_directory =
+            open_proc_pid_directory(&target.procfs, observer_pid).map_err(|error| {
+                trusted_required(format!(
+                    "opening the observer proc directory failed: {error}"
+                ))
+            })?;
+        let observer =
+            openat_file(&observer_directory, "exe", libc::O_RDONLY).map_err(|error| {
+                trusted_required(format!("opening the running observer failed: {error}"))
+            })?;
         let metadata = observer.metadata().map_err(|error| {
             trusted_required(format!(
                 "reading the running observer metadata failed: {error}"
@@ -141,30 +288,43 @@ pub(crate) fn select(scope: &Scope, trusted_workload: bool) -> Result<OracleSele
         let observer_loader = inspect_elf_loader(&observer).map_err(|error| {
             trusted_required(format!("inspecting the running observer failed: {error}"))
         })?;
-        let observer_status = std::fs::read_to_string("/proc/self/status").map_err(|error| {
+        let observer_status = read_proc_entry(
+            &observer_directory,
+            "status",
+            MAX_PROC_STATUS_BYTES,
+            "observer process status",
+        )
+        .map_err(|error| {
             trusted_required(format!(
                 "reading the observer process status failed: {error}"
             ))
         })?;
-        let target_status =
-            std::fs::read_to_string(format!("/proc/{pid}/status")).map_err(|error| {
-                trusted_required(format!(
-                    "reading observed process {pid} status failed: {error}"
-                ))
-            })?;
-        let observer_uid_map = std::fs::read_to_string("/proc/self/uid_map").map_err(|error| {
+        let target_status = target.status().map_err(|error| {
+            trusted_required(format!(
+                "reading observed process {pid} status failed: {error}"
+            ))
+        })?;
+        let observer_uid_map = read_proc_entry(
+            &observer_directory,
+            "uid_map",
+            MAX_PROC_STATUS_BYTES,
+            "observer UID map",
+        )
+        .map_err(|error| {
             trusted_required(format!("reading the observer UID map failed: {error}"))
         })?;
-        let observer_user_namespace =
-            namespace_id(Path::new("/proc/self/ns/user")).map_err(|error| {
-                trusted_required(format!(
-                    "opening the observer user namespace failed: {error}"
-                ))
-            })?;
-        let init_user_namespace = namespace_id(Path::new("/proc/1/ns/user")).map_err(|error| {
+        let observer_user_namespace = namespace_id_at(&observer_directory).map_err(|error| {
+            trusted_required(format!(
+                "opening the observer user namespace failed: {error}"
+            ))
+        })?;
+        let init_directory = open_proc_pid_directory(&target.procfs, 1).map_err(|error| {
+            trusted_required(format!("opening the PID 1 proc directory failed: {error}"))
+        })?;
+        let init_user_namespace = namespace_id_at(&init_directory).map_err(|error| {
             trusted_required(format!("opening the PID 1 user namespace failed: {error}"))
         })?;
-        select_from_facts(
+        let mode = select_from_facts(
             scope,
             false,
             Some(HardenedFacts {
@@ -177,18 +337,411 @@ pub(crate) fn select(scope: &Scope, trusted_workload: bool) -> Result<OracleSele
                 observer_user_namespace,
                 init_user_namespace,
             }),
-        )
+        )?;
+        target.revalidate().map_err(|error| {
+            trusted_required(format!(
+                "revalidating observed process {pid} failed: {error}"
+            ))
+        })?;
+        Ok((mode, target))
     })();
-    let mode = match selected {
-        Err(_) if trusted_workload => Ok(OracleMode::TrustedWorkload),
-        result => result,
-    }?;
-    Ok(OracleSelection { mode })
+    match selected {
+        Ok((OracleMode::Hardened, target)) => Ok(OracleSelection::hardened(target)),
+        Ok((OracleMode::TrustedWorkload, _)) => Err(anyhow!(
+            "hardened oracle selection unexpectedly returned trusted mode"
+        )),
+        Err(_) if trusted_workload => Ok(OracleSelection::trusted_workload()),
+        Err(error) => Err(error),
+    }
 }
 
-fn namespace_id(path: &Path) -> Result<(u64, u64)> {
-    let metadata = std::fs::File::open(path)?.metadata()?;
+fn open_pidfd(pid: u32) -> Result<OwnedFd> {
+    let pid = libc::pid_t::try_from(pid).map_err(|_| anyhow!("observed PID is out of range"))?;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+    if fd == -1 {
+        return Err(std::io::Error::last_os_error()).context("opening observed process pidfd");
+    }
+    normalize_owned_fd(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn ensure_pid_alive(pid: u32, pidfd: &OwnedFd) -> Result<()> {
+    let mut pollfd = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        if result == 0 {
+            return Ok(());
+        }
+        if result > 0 {
+            return Err(anyhow!(
+                "observed process {pid} exited while its authority was retained"
+            ));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error).context("checking observed process pidfd");
+        }
+    }
+}
+
+fn open_procfs() -> Result<File> {
+    let path = CString::new("/proc").expect("fixed procfs path has no NUL");
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd == -1 {
+        return Err(std::io::Error::last_os_error()).context("opening /proc");
+    }
+    let procfs = normalize_file_fd(unsafe { File::from_raw_fd(fd) })?;
+    validate_procfs_binding(&procfs)?;
+    Ok(procfs)
+}
+
+fn validate_procfs(procfs: &File) -> Result<()> {
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::fstatfs(procfs.as_raw_fd(), stat.as_mut_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error()).context("identifying /proc filesystem");
+    }
+    let stat = unsafe { stat.assume_init() };
+    if stat.f_type as u64 != libc::PROC_SUPER_MAGIC as u64 {
+        return Err(anyhow!("/proc is not a procfs filesystem"));
+    }
+    Ok(())
+}
+
+fn validate_procfs_binding(procfs: &File) -> Result<()> {
+    validate_procfs(procfs)?;
+    let pid = u32::try_from(unsafe { libc::getpid() })
+        .map_err(|_| anyhow!("the observer PID is out of range"))?;
+    let self_directory = openat_file(procfs, "self", libc::O_RDONLY | libc::O_DIRECTORY)
+        .context("opening procfs self directory")?;
+    let numeric_directory = open_proc_pid_directory(procfs, pid)?;
+    let status = read_proc_entry(
+        &self_directory,
+        "status",
+        MAX_PROC_STATUS_BYTES,
+        "procfs self status",
+    )?;
+    validate_procfs_binding_facts(
+        pid,
+        proc_file_identity(&self_directory)?,
+        proc_file_identity(&numeric_directory)?,
+        &status,
+    )
+}
+
+fn validate_procfs_binding_facts(
+    pid: u32,
+    self_identity: ProcFileIdentity,
+    numeric_identity: ProcFileIdentity,
+    status: &str,
+) -> Result<()> {
+    if self_identity != numeric_identity {
+        return Err(anyhow!(
+            "procfs self and numeric observer directory identity differ"
+        ));
+    }
+    let mut nspid = None;
+    for line in status.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name != "NSpid" {
+            continue;
+        }
+        if nspid.is_some() {
+            return Err(anyhow!("procfs self status has duplicate NSpid fields"));
+        }
+        let mut values = value.split_ascii_whitespace();
+        let value = values
+            .next()
+            .ok_or_else(|| anyhow!("procfs self status has an empty NSpid field"))?;
+        if values.next().is_some() {
+            return Err(anyhow!("procfs self status NSpid field is not a singleton"));
+        }
+        let parsed = value
+            .parse::<u32>()
+            .map_err(|_| anyhow!("procfs self status has an invalid NSpid field"))?;
+        if parsed.to_string() != value || parsed != pid {
+            return Err(anyhow!(
+                "procfs self status NSpid does not match the observer PID"
+            ));
+        }
+        nspid = Some(parsed);
+    }
+    nspid
+        .map(|_| ())
+        .ok_or_else(|| anyhow!("procfs self status is missing its NSpid field"))
+}
+
+fn open_proc_pid_directory(procfs: &File, pid: u32) -> Result<File> {
+    let name = pid.to_string();
+    open_proc_directory(procfs, &name)
+        .with_context(|| format!("opening observed process {pid} proc directory"))
+}
+
+fn open_proc_directory(parent: &File, name: &str) -> Result<File> {
+    let directory = openat_file(
+        parent,
+        name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+    )?;
+    if !directory.metadata()?.is_dir() {
+        return Err(anyhow!("proc entry {name:?} is not a directory"));
+    }
+    Ok(directory)
+}
+
+fn open_proc_regular(directory: &File, name: &str) -> Result<File> {
+    let file = openat_file(directory, name, libc::O_RDONLY | libc::O_NOFOLLOW)
+        .with_context(|| format!("opening observed process proc {name}"))?;
+    if !file.metadata()?.is_file() {
+        return Err(anyhow!(
+            "observed process proc {name} is not a regular file"
+        ));
+    }
+    Ok(file)
+}
+
+fn read_proc_entry(directory: &File, name: &str, limit: usize, label: &str) -> Result<String> {
+    let file = open_proc_regular(directory, name)?;
+    read_proc_text(&file, limit, label)
+}
+
+fn namespace_id_at(process_directory: &File) -> Result<(u64, u64)> {
+    let namespace_directory = openat_file(
+        process_directory,
+        "ns",
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+    )?;
+    let namespace = openat_file(&namespace_directory, "user", libc::O_RDONLY)?;
+    let metadata = namespace.metadata()?;
     Ok((metadata.dev(), metadata.ino()))
+}
+
+fn openat_file(directory: &File, name: &str, flags: i32) -> Result<File> {
+    if name.is_empty() || name.as_bytes().contains(&b'/') {
+        return Err(anyhow!("invalid proc entry name"));
+    }
+    let name = CString::new(name).map_err(|_| anyhow!("proc entry name contains NUL"))?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC,
+        )
+    };
+    if fd == -1 {
+        return Err(std::io::Error::last_os_error()).context("opening proc entry");
+    }
+    normalize_file_fd(unsafe { File::from_raw_fd(fd) })
+}
+
+fn directory_entry_names(directory: &File, limit: usize, label: &str) -> Result<Vec<OsString>> {
+    let directory_fd = directory.as_raw_fd();
+    if unsafe { libc::lseek(directory_fd, 0, libc::SEEK_SET) } == -1 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("rewinding {label}"));
+    }
+    let fd = unsafe { libc::fcntl(directory_fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if fd == -1 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("duplicating {label} listing fd"));
+    }
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(error).with_context(|| format!("opening {label} directory stream"));
+    }
+    let mut entries = Vec::new();
+    let result = loop {
+        unsafe { *libc::__errno_location() = 0 };
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(0) {
+                break Ok(());
+            }
+            break Err(error).with_context(|| format!("enumerating {label}"));
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            entries.push(OsString::from_vec(name.to_vec()));
+            if entries.len() > limit {
+                break Err(anyhow!("{label} exceeds the {limit}-entry limit"));
+            }
+        }
+    };
+    let close = unsafe { libc::closedir(stream) };
+    let rewind = unsafe { libc::lseek(directory_fd, 0, libc::SEEK_SET) };
+    result?;
+    if close == -1 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("closing {label} directory stream"));
+    }
+    if rewind == -1 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("restoring {label} directory offset"));
+    }
+    Ok(entries)
+}
+
+fn proc_file_identity(file: &File) -> Result<ProcFileIdentity> {
+    let metadata = file.metadata()?;
+    Ok(ProcFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn target_identity(directory: &File, status: &File, tasks: &File) -> Result<TargetIdentity> {
+    let stat = open_proc_regular(directory, "stat")?;
+    Ok(TargetIdentity {
+        directory: proc_file_identity(directory)?,
+        status: proc_file_identity(status)?,
+        tasks: proc_file_identity(tasks)?,
+        start_time: parse_proc_start_time(&read_proc_bytes(
+            &stat,
+            MAX_PROC_STAT_BYTES,
+            "process stat",
+        )?)?,
+    })
+}
+
+fn validate_task_status(tid: u32, status: &str) -> Result<()> {
+    let status = parse_status(status)
+        .with_context(|| format!("parsing observed process task {tid} status"))?;
+    validate_target_status(&status)
+        .with_context(|| format!("observed process task {tid} is not hostile-safe"))
+}
+
+fn validated_task_set(tasks: &File, pid: u32) -> Result<TaskIdentitySet> {
+    let names = directory_entry_names(tasks, MAX_TARGET_TASKS, "observed process task directory")?;
+    let mut identities = BTreeMap::new();
+    for name in names {
+        let bytes = name.as_bytes();
+        if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+            return Err(anyhow!(
+                "observed process task directory has a non-TID entry"
+            ));
+        }
+        let tid_text = std::str::from_utf8(bytes)
+            .map_err(|_| anyhow!("observed process task directory has a non-UTF-8 TID"))?;
+        let tid: u32 = tid_text
+            .parse()
+            .map_err(|_| anyhow!("observed process task directory has an invalid TID"))?;
+        if tid == 0 || tid.to_string() != tid_text {
+            return Err(anyhow!(
+                "observed process task directory has a non-canonical TID"
+            ));
+        }
+        let directory = open_proc_directory(tasks, tid_text)
+            .with_context(|| format!("opening observed process task {tid}"))?;
+        let status = open_proc_regular(&directory, "status")
+            .with_context(|| format!("opening observed process task {tid} status"))?;
+        validate_task_status(
+            tid,
+            &read_proc_text(
+                &status,
+                MAX_PROC_STATUS_BYTES,
+                "observed process task status",
+            )?,
+        )?;
+        let stat = open_proc_regular(&directory, "stat")?;
+        let identity = TaskIdentity {
+            directory: proc_file_identity(&directory)?,
+            status: proc_file_identity(&status)?,
+            start_time: parse_proc_start_time(&read_proc_bytes(
+                &stat,
+                MAX_PROC_STAT_BYTES,
+                "observed process task stat",
+            )?)?,
+        };
+        if identities.insert(tid, identity).is_some() {
+            return Err(anyhow!(
+                "observed process task directory has duplicate TIDs"
+            ));
+        }
+    }
+    if !identities.contains_key(&pid) {
+        return Err(anyhow!(
+            "observed process task set is missing its leader {pid}"
+        ));
+    }
+    Ok(identities)
+}
+
+fn ensure_same_task_set(pid: u32, first: &TaskIdentitySet, second: &TaskIdentitySet) -> Result<()> {
+    if first != second {
+        return Err(anyhow!(
+            "observed process {pid} task set changed during authorization"
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_same_target(pid: u32, pinned: TargetIdentity, current: TargetIdentity) -> Result<()> {
+    if current != pinned {
+        return Err(anyhow!(
+            "observed process {pid} proc identity or start time changed (possible PID reuse)"
+        ));
+    }
+    Ok(())
+}
+
+fn read_proc_text(file: &File, limit: usize, label: &str) -> Result<String> {
+    String::from_utf8(read_proc_bytes(file, limit, label)?)
+        .with_context(|| format!("{label} is not UTF-8"))
+}
+
+fn read_proc_bytes(file: &File, limit: usize, label: &str) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let read = file
+            .read_at(&mut chunk, bytes.len() as u64)
+            .with_context(|| format!("reading {label}"))?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        if bytes.len() + read > limit {
+            return Err(anyhow!("{label} exceeds the {limit}-byte limit"));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn parse_proc_start_time(stat: &[u8]) -> Result<u64> {
+    let close = stat
+        .iter()
+        .rposition(|byte| *byte == b')')
+        .ok_or_else(|| anyhow!("process stat is missing its command terminator"))?;
+    let start_time = stat[close + 1..]
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty())
+        .nth(19)
+        .ok_or_else(|| anyhow!("process stat is missing its start time"))?;
+    std::str::from_utf8(start_time)
+        .context("process stat start time is not UTF-8")?
+        .parse()
+        .context("process stat has an invalid start time")
+}
+
+fn normalize_owned_fd(fd: OwnedFd) -> Result<OwnedFd> {
+    if fd.as_raw_fd() > 2 {
+        return Ok(fd);
+    }
+    let duplicated = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicated == -1 {
+        return Err(std::io::Error::last_os_error()).context("moving authority fd above stdio");
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
 }
 
 fn prepare_glibc_graph(
@@ -860,54 +1413,17 @@ impl PrivateAliasDir {
     }
 
     fn entries(&self) -> Result<BTreeSet<OsString>> {
-        let directory_fd = self
+        let directory = self
             .directory
             .as_ref()
-            .ok_or_else(|| anyhow!("private glibc alias directory fd is missing"))?
-            .as_raw_fd();
-        if unsafe { libc::lseek(directory_fd, 0, libc::SEEK_SET) } == -1 {
-            return Err(std::io::Error::last_os_error())
-                .context("rewinding private glibc alias directory");
-        }
-        let fd = unsafe { libc::fcntl(directory_fd, libc::F_DUPFD_CLOEXEC, 3) };
-        if fd == -1 {
-            return Err(std::io::Error::last_os_error())
-                .context("duplicating private glibc listing fd");
-        }
-        let directory = unsafe { libc::fdopendir(fd) };
-        if directory.is_null() {
-            let error = std::io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(error).context("opening private glibc directory stream");
-        }
-        let mut entries = BTreeSet::new();
-        let result = loop {
-            unsafe { *libc::__errno_location() = 0 };
-            let entry = unsafe { libc::readdir(directory) };
-            if entry.is_null() {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(0) {
-                    break Ok(());
-                }
-                break Err(error).context("enumerating private glibc alias directory");
-            }
-            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-            if name != b"." && name != b".." {
-                entries.insert(OsString::from_vec(name.to_vec()));
-            }
-        };
-        let close = unsafe { libc::closedir(directory) };
-        let rewind = unsafe { libc::lseek(directory_fd, 0, libc::SEEK_SET) };
-        result?;
-        if close == -1 {
-            return Err(std::io::Error::last_os_error())
-                .context("closing private glibc directory stream");
-        }
-        if rewind == -1 {
-            return Err(std::io::Error::last_os_error())
-                .context("restoring private glibc directory offset");
-        }
-        Ok(entries)
+            .ok_or_else(|| anyhow!("private glibc alias directory fd is missing"))?;
+        Ok(directory_entry_names(
+            directory,
+            self.aliases.len().saturating_add(1),
+            "private glibc alias directory",
+        )?
+        .into_iter()
+        .collect())
     }
 
     fn validate_aliases(&self) -> Result<()> {
@@ -1508,6 +2024,7 @@ fn parse_status(status: &str) -> Result<ProcessStatus> {
     let mut uids = None;
     let mut capabilities = 0u64;
     let mut seen_caps = 0u8;
+    let mut no_new_privileges = None;
     for line in status.lines() {
         if let Some(value) = line.strip_prefix("Uid:") {
             if uids.is_some() {
@@ -1540,6 +2057,22 @@ fn parse_status(status: &str) -> Result<ProcessStatus> {
             capabilities |= u64::from_str_radix(value.trim(), 16)
                 .map_err(|_| anyhow!("process status contains an invalid {name} field"))?;
         }
+        if let Some(value) = line.strip_prefix("NoNewPrivs:") {
+            if no_new_privileges.is_some() {
+                return Err(anyhow!(
+                    "process status contains duplicate NoNewPrivs fields"
+                ));
+            }
+            no_new_privileges = Some(match value.trim() {
+                "0" => false,
+                "1" => true,
+                _ => {
+                    return Err(anyhow!(
+                        "process status contains an invalid NoNewPrivs field"
+                    ));
+                }
+            });
+        }
     }
     if seen_caps != 0b1111 {
         return Err(anyhow!("process status is missing capability fields"));
@@ -1547,6 +2080,8 @@ fn parse_status(status: &str) -> Result<ProcessStatus> {
     Ok(ProcessStatus {
         uids: uids.ok_or_else(|| anyhow!("process status is missing its Uid field"))?,
         capabilities,
+        no_new_privileges: no_new_privileges
+            .ok_or_else(|| anyhow!("process status is missing its NoNewPrivs field"))?,
     })
 }
 
@@ -1557,10 +2092,13 @@ mod tests {
     use p11scope_manifest::identity::ElfLoader;
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::process::CommandExt as _;
     use std::path::PathBuf;
+    use std::process::{Child, Command, Stdio};
+    use std::time::Duration;
 
-    const ROOT_STATUS: &str = "Uid:\t0\t0\t0\t0\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapAmb:\t0000000000000000\n";
-    const TARGET_STATUS: &str = "Uid:\t1000\t1000\t1000\t1000\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapAmb:\t0000000000000000\n";
+    const ROOT_STATUS: &str = "Uid:\t0\t0\t0\t0\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\n";
+    const TARGET_STATUS: &str = "Uid:\t1000\t1000\t1000\t1000\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapAmb:\t0000000000000000\nNoNewPrivs:\t1\n";
     const FULL_UID_MAP: &str = "         0          0 4294967295\n";
 
     fn static_loader() -> ElfLoader {
@@ -1569,6 +2107,57 @@ mod tests {
             needed: vec![],
             soname: None,
         }
+    }
+
+    fn configure_non_root_no_new_privileges(command: &mut Command) {
+        unsafe {
+            command.pre_exec(|| {
+                if libc::geteuid() == 0
+                    && (libc::setgroups(0, std::ptr::null()) == -1
+                        || libc::setresgid(65_534, 65_534, 65_534) == -1
+                        || libc::setresuid(65_534, 65_534, 65_534) == -1)
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    fn spawn_non_root_no_new_privileges_child() -> Child {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        configure_non_root_no_new_privileges(&mut command);
+        command.spawn().unwrap()
+    }
+
+    fn spawn_safe_multithreaded_child() -> Child {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "oracle::tests::safe_multithreaded_target_fixture",
+            ])
+            .env("P11SCOPE_TEST_MULTITHREADED_TARGET", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_non_root_no_new_privileges(&mut command);
+        command.spawn().unwrap()
+    }
+
+    fn wait_for_multiple_tasks(pid: u32) {
+        for _ in 0..100 {
+            if std::fs::read_dir(format!("/proc/{pid}/task"))
+                .is_ok_and(|entries| entries.count() >= 2)
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("multithreaded target fixture did not become ready");
     }
 
     #[test]
@@ -1674,7 +2263,7 @@ mod tests {
     }
 
     #[test]
-    fn target_root_or_kill_setuid_ptrace_capability_is_refused() {
+    fn target_root_or_any_capability_is_refused() {
         for status in [
             ROOT_STATUS.to_string(),
             TARGET_STATUS.replace("1000\t1000\t1000\t1000", "0\t1000\t1000\t1000"),
@@ -1685,6 +2274,10 @@ mod tests {
             TARGET_STATUS.replace("CapPrm:\t0000000000000000", "CapPrm:\t0000000000000080"),
             TARGET_STATUS.replace("CapEff:\t0000000000000000", "CapEff:\t0000000000080000"),
             TARGET_STATUS.replace("CapAmb:\t0000000000000000", "CapAmb:\t0000000000000020"),
+            TARGET_STATUS.replace("CapInh:\t0000000000000000", "CapInh:\t0000000000000001"),
+            TARGET_STATUS.replace("CapPrm:\t0000000000000000", "CapPrm:\t0000000000000001"),
+            TARGET_STATUS.replace("CapEff:\t0000000000000000", "CapEff:\t0000000000000001"),
+            TARGET_STATUS.replace("CapAmb:\t0000000000000000", "CapAmb:\t0000000000000001"),
         ] {
             let error = select_from_facts(
                 &Scope::Pid(42),
@@ -1706,6 +2299,202 @@ mod tests {
                 "{error:#}"
             );
         }
+    }
+
+    #[test]
+    fn target_requires_exact_no_new_privileges() {
+        for status in [
+            TARGET_STATUS.replace("NoNewPrivs:\t1\n", "NoNewPrivs:\t0\n"),
+            TARGET_STATUS.replace("NoNewPrivs:\t1\n", ""),
+            TARGET_STATUS.replace("NoNewPrivs:\t1\n", "NoNewPrivs:\t1\nNoNewPrivs:\t1\n"),
+            TARGET_STATUS.replace("NoNewPrivs:\t1\n", "NoNewPrivs:\tnot-a-bit\n"),
+        ] {
+            let error = select_from_facts(
+                &Scope::Pid(42),
+                false,
+                Some(HardenedFacts {
+                    observer_loader: static_loader(),
+                    observer_owner: 0,
+                    observer_mode: 0o100755,
+                    observer_status: ROOT_STATUS,
+                    target_status: &status,
+                    observer_uid_map: FULL_UID_MAP,
+                    observer_user_namespace: (4, 1),
+                    init_user_namespace: (4, 1),
+                }),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("--trusted-workload"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn divergent_unsafe_nonleader_task_status_is_refused() {
+        validate_task_status(42, TARGET_STATUS).unwrap();
+        let unsafe_nonleader =
+            TARGET_STATUS.replace("CapEff:\t0000000000000000", "CapEff:\t0000000000000001");
+
+        let error = validate_task_status(43, &unsafe_nonleader).unwrap_err();
+
+        assert!(error.to_string().contains("task 43"), "{error:#}");
+    }
+
+    #[test]
+    fn target_task_identity_set_must_stabilize() {
+        let identity = TaskIdentity {
+            directory: ProcFileIdentity {
+                device: 7,
+                inode: 11,
+            },
+            status: ProcFileIdentity {
+                device: 7,
+                inode: 12,
+            },
+            start_time: 13,
+        };
+        let first = BTreeMap::from([(42, identity)]);
+        ensure_same_task_set(42, &first, &first).unwrap();
+
+        for second in [
+            BTreeMap::new(),
+            BTreeMap::from([(43, identity)]),
+            BTreeMap::from([(
+                42,
+                TaskIdentity {
+                    start_time: 23,
+                    ..identity
+                },
+            )]),
+        ] {
+            let error = ensure_same_task_set(42, &first, &second).unwrap_err();
+            assert!(error.to_string().contains("task set changed"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn pinned_target_revalidation_detects_process_exit() {
+        let mut child = spawn_non_root_no_new_privileges_child();
+        let oracle = OracleSelection::hardened(PinnedTarget::pin(child.id()).unwrap());
+        oracle.revalidate().unwrap();
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let error = oracle.revalidate().unwrap_err();
+
+        assert!(error.to_string().contains("exited"), "{error:#}");
+    }
+
+    #[test]
+    fn pinned_target_revalidation_accepts_safe_multithreaded_process() {
+        let mut child = spawn_safe_multithreaded_child();
+        wait_for_multiple_tasks(child.id());
+
+        let result = PinnedTarget::pin(child.id()).and_then(|target| target.revalidate());
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        result.unwrap();
+    }
+
+    #[test]
+    fn safe_multithreaded_target_fixture() {
+        if std::env::var_os("P11SCOPE_TEST_MULTITHREADED_TARGET").is_none() {
+            return;
+        }
+        let other = std::thread::spawn(|| std::thread::sleep(Duration::from_secs(30)));
+        std::thread::sleep(Duration::from_secs(30));
+        other.join().unwrap();
+    }
+
+    #[test]
+    fn target_identity_revalidation_detects_pid_reuse_facts() {
+        let pinned = TargetIdentity {
+            directory: ProcFileIdentity {
+                device: 7,
+                inode: 11,
+            },
+            status: ProcFileIdentity {
+                device: 7,
+                inode: 12,
+            },
+            tasks: ProcFileIdentity {
+                device: 7,
+                inode: 13,
+            },
+            start_time: 14,
+        };
+        for current in [
+            TargetIdentity {
+                directory: ProcFileIdentity {
+                    device: 7,
+                    inode: 21,
+                },
+                ..pinned
+            },
+            TargetIdentity {
+                status: ProcFileIdentity {
+                    device: 7,
+                    inode: 22,
+                },
+                ..pinned
+            },
+            TargetIdentity {
+                start_time: 23,
+                ..pinned
+            },
+        ] {
+            let error = ensure_same_target(42, pinned, current).unwrap_err();
+            assert!(error.to_string().contains("PID reuse"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn proc_start_time_parser_handles_spaces_and_closing_parenthesis_in_comm() {
+        let stat = b"42 (odd ) name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 20\n";
+
+        assert_eq!(parse_proc_start_time(stat).unwrap(), 4242);
+    }
+
+    #[test]
+    fn procfs_binding_requires_one_canonical_matching_nspid() {
+        let identity = ProcFileIdentity {
+            device: 7,
+            inode: 11,
+        };
+        validate_procfs_binding_facts(42, identity, identity, "NSpid:\t42\n").unwrap();
+
+        for status in [
+            "Uid:\t1000\t1000\t1000\t1000\n",
+            "NSpid:\tnot-a-pid\n",
+            "NSpid:\t042\n",
+            "NSpid:\t42\t1\n",
+            "NSpid:\t42\nNSpid:\t42\n",
+            "NSpid:\t43\n",
+        ] {
+            let error = validate_procfs_binding_facts(42, identity, identity, status).unwrap_err();
+            assert!(error.to_string().contains("NSpid"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn procfs_binding_requires_self_and_numeric_identity_to_match() {
+        let self_identity = ProcFileIdentity {
+            device: 7,
+            inode: 11,
+        };
+        let numeric_identity = ProcFileIdentity {
+            device: 7,
+            inode: 12,
+        };
+
+        let error =
+            validate_procfs_binding_facts(42, self_identity, numeric_identity, "NSpid:\t42\n")
+                .unwrap_err();
+
+        assert!(error.to_string().contains("identity"), "{error:#}");
     }
 
     #[test]

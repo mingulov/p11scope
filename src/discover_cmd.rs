@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+pub use crate::oracle::OracleSelection;
+
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_STABILIZATION_PASSES: usize = 8;
 const MAX_PROVENANCE_OBJECTS: usize = p11scope_ebpf_common::MAX_SLOTS as usize;
@@ -428,15 +430,14 @@ fn stabilize(module: &Path, mut pass: impl FnMut() -> Result<Manifest>) -> Resul
 
 /// Runs the installed sibling helper until one complete pass used only a
 /// pre-leased, unchanged exact executable-mapping closure.
-pub fn rediscover_stable(
-    module: &Path,
-    scope: &Scope,
-    trusted_workload: bool,
-) -> Result<StableDiscovery> {
+pub fn select_oracle(scope: &Scope, trusted_workload: bool) -> Result<OracleSelection> {
+    crate::oracle::select(scope, trusted_workload)
+}
+
+pub fn rediscover_stable(module: &Path, selection: &OracleSelection) -> Result<StableDiscovery> {
     if !module.is_absolute() {
         bail!("--provenance-module must be an absolute path");
     }
-    let selection = crate::oracle::select(scope, trusted_workload)?;
     let helper_path = std::env::current_exe()
         .context("locating the running p11scope executable")?
         .parent()
@@ -448,9 +449,9 @@ pub fn rediscover_stable(
 fn rediscover_stable_selected(
     helper_path: &Path,
     module: &Path,
-    selection: crate::oracle::OracleSelection,
+    selection: &OracleSelection,
 ) -> Result<StableDiscovery> {
-    match selection.mode {
+    match selection.mode() {
         crate::oracle::OracleMode::TrustedWorkload => {
             rediscover_stable_with_helper(helper_path, module)
         }
@@ -1184,9 +1185,7 @@ int main(void) {
         let error = rediscover_stable_selected(
             Path::new("/missing/p11scope-discover"),
             Path::new("/missing/provider.so"),
-            crate::oracle::OracleSelection {
-                mode: crate::oracle::OracleMode::Hardened,
-            },
+            &crate::oracle::OracleSelection::hardened_without_target_for_test(),
         )
         .unwrap_err();
 

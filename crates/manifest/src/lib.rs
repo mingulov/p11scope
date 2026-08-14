@@ -4,6 +4,8 @@
 
 pub mod identity;
 pub mod manifest;
+#[cfg(feature = "identify")]
+pub mod maps;
 
 pub use identity::{IdentityKind, ObjectIdentity};
 pub use manifest::*;

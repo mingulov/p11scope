@@ -40,7 +40,7 @@ pub fn discover(module_path: &Path) -> Result<Manifest, String> {
     let (module_file_key, module_identity) = identity_and_key(module_path)?;
     let before_maps = maps::parse_maps(
         &std::fs::read("/proc/self/maps").map_err(|e| format!("/proc/self/maps: {e}"))?,
-    );
+    )?;
     let before_keys: BTreeSet<ObjectKey> = before_maps.iter().map(map_key).collect();
 
     let lib = unsafe { Library::new(module_path) }
@@ -57,7 +57,7 @@ pub fn discover(module_path: &Path) -> Result<Manifest, String> {
 
     let maps_bytes =
         std::fs::read("/proc/self/maps").map_err(|e| format!("/proc/self/maps: {e}"))?;
-    let maps = maps::parse_maps(&maps_bytes);
+    let maps = maps::parse_maps(&maps_bytes)?;
     let module_map_key = loaded_module_key(raw_exports, &maps, module_file_key, &module_identity)?;
     let mut approved_keys: BTreeSet<ObjectKey> = maps
         .iter()

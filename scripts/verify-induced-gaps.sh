@@ -61,7 +61,7 @@ cleanup() {
 
 echo "=== build isolated default + induced-gap variants ==="
 rm -rf "$WORK/default-build" "$WORK/small-build" "$WORK/freeze-build"
-cargo build --locked --release --workspace --target-dir "$WORK/default-build"
+cargo +1.88 build --locked --release --workspace --target-dir "$WORK/default-build"
 DISCOVER=./"$WORK"/default-build/release/p11scope-discover
 
 echo "=== build small-ring p11scope (Gap 3 only; default build untouched) ==="
@@ -70,8 +70,8 @@ echo "=== build small-ring p11scope (Gap 3 only; default build untouched) ==="
 # forwards it to the eBPF crate's build only when P11SCOPE_SMALL_RING is
 # set. A separate --target-dir keeps this build fully out of target/release
 # so scripts/verify-attach-e2e.sh's binary is never touched by this script.
-P11SCOPE_SMALL_RING=1 cargo build --locked --release --workspace --target-dir "$WORK/small-build"
-cargo build --locked --release --workspace --features unsafe-unvalidated-metadata \
+P11SCOPE_SMALL_RING=1 cargo +1.88 build --locked --release --workspace --target-dir "$WORK/small-build"
+cargo +1.88 build --locked --release --workspace --features unsafe-unvalidated-metadata \
     --target-dir "$WORK/freeze-build"
 stage_trusted_p11scope "$WORK/default-build/release/p11scope" \
     "$WORK/default-build/release/p11scope-discover" "$TRUST_DEFAULT_DIR"
@@ -288,6 +288,8 @@ import json, struct, sys
 before_path, after_path = sys.argv[1:]
 before = {item["name"]: item for item in json.load(open(before_path))}
 after = {item["name"]: item for item in json.load(open(after_path))}
+assert before["EVENTS"]["oracle"] == after["EVENTS"]["oracle"] == "mmap"
+assert "file" not in before["EVENTS"] and "file" not in after["EVENTS"]
 assert {name: item['id'] for name, item in before.items()} == {
     name: item['id'] for name, item in after.items()
 }, "observer-owned map ids changed during freeze lane"
@@ -329,7 +331,7 @@ echo "=== policy-map immutability control with live dynamic maps ==="
 gcc -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 \
     -o "$WORK/freeze-provider.so" crates/discover/tests/fixture/version_matrix.c
 gcc -std=c11 -O0 -Wall -Wextra -o "$WORK/freeze-workload" \
-    scripts/fixtures/canary_workload.c -ldl
+    scripts/fixtures/canary_workload.c -ldl -pthread
 "$WORK/freeze-build/release/p11scope-discover" \
     --module "$PWD/$WORK/freeze-provider.so" -o "$WORK/freeze-manifest.json"
 

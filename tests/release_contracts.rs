@@ -7,6 +7,14 @@ fn read(path: &str) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| panic!("reading {path}: {error}"))
 }
 
+fn canary_literals(source: &str) -> std::collections::BTreeSet<String> {
+    source
+        .split('"')
+        .filter(|value| value.starts_with("CANARY_"))
+        .map(str::to_owned)
+        .collect()
+}
+
 fn run_ok(program: &str, args: &[&str]) -> String {
     let output = Command::new(program)
         .args(args)
@@ -259,12 +267,52 @@ aggregate-only-metrics default metrics"
     );
     for marker in [
         "assert_exact_owned_map_inventory",
-        "assert_nonempty_start",
-        "assert_ring_empty \"$WORK/mapdump_manifest_$lane.json\"",
+        "assert_hostile_starts",
+        "assert_raw_events",
+        "sudo kill -STOP \"$OBSERVER_PID\"",
+        "wait_for_stopped \"$OBSERVER_PID\"",
+        "sudo kill -CONT \"$OBSERVER_PID\"",
         "--unsafe-unvalidated-metadata",
     ] {
         assert!(canaries.contains(marker), "canary gate misses {marker}");
     }
+    assert!(!canaries.contains("assert_ring_empty"));
+    let normal_lane = canaries
+        .split_once("run_lane() {")
+        .unwrap()
+        .1
+        .split_once("\n}\n\necho \"=== discover deterministic matrix providers ===\"")
+        .unwrap()
+        .0;
+    let stop = normal_lane
+        .find("sudo kill -STOP \"$OBSERVER_PID\"")
+        .unwrap();
+    let stopped = normal_lane
+        .find("wait_for_stopped \"$OBSERVER_PID\"")
+        .unwrap();
+    let release = normal_lane.find("touch \"$WORK/$lane.go\"").unwrap();
+    assert!(stop < stopped && stopped < release);
+
+    let start_lane = canaries.split_once("run_start_lane() {").unwrap().1;
+    for marker in [
+        "kill -0 \"$WPID\"",
+        "kill -TERM \"$WPID\"",
+        "[ \"$start_status\" -eq 143 ]",
+    ] {
+        assert!(start_lane.contains(marker), "START lane misses {marker}");
+    }
+
+    let blocked_lanes = canaries
+        .split_once("done <<'BLOCKED_LANES'\n")
+        .expect("blocked safe-policy lane table")
+        .1
+        .split_once("\nBLOCKED_LANES")
+        .unwrap()
+        .0;
+    assert_eq!(
+        blocked_lanes,
+        "default-safe-start default\nfeature-safe-start feature"
+    );
 
     let induced = read("scripts/verify-induced-gaps.sh");
     for marker in [
@@ -307,6 +355,16 @@ aggregate-only-metrics default metrics"
         "scripts/verify-induced-gaps.sh",
     ] {
         run_ok("sh", &["-n", path]);
+        for line in read(path).lines().map(str::trim_start) {
+            if !line.starts_with('#')
+                && (line.starts_with("cargo ") || line.contains(" cargo build"))
+            {
+                assert!(
+                    line.contains("cargo +1.88"),
+                    "unpinned cargo command in {path}: {line}"
+                );
+            }
+        }
     }
     let directory = tempfile::tempdir().unwrap();
     let provider = directory.path().join("matrix-provider.so");
@@ -331,6 +389,7 @@ aggregate-only-metrics default metrics"
             "-Wall",
             "-Wextra",
             "-Werror",
+            "-pthread",
             "-o",
             workload.to_str().unwrap(),
             "scripts/fixtures/canary_workload.c",
@@ -346,12 +405,45 @@ aggregate-only-metrics default metrics"
             .lines()
             .filter(|line| line.ends_with(" -> 0x0"))
             .count(),
-        24
+        25
     );
     assert!(matrix.contains("canary_workload matrix: all calls CKR_OK"));
 
+    let blocked = run_ok(
+        workload.to_str().unwrap(),
+        &[provider.to_str().unwrap(), "blocked"],
+    );
+    assert!(blocked.contains("blocked hostile subset: all calls CKR_OK"));
+    let faults = run_ok(
+        workload.to_str().unwrap(),
+        &[provider.to_str().unwrap(), "faults"],
+    );
+    assert!(faults.contains("blocked template faults: all calls CKR_OK"));
+
     let lanes = run_ok("sh", &["scripts/verify-canaries.sh", "--self-test"]);
     assert!(lanes.contains("canary lane assertion self-test: OK"));
+    assert!(lanes.contains("raw binary alias scanner self-test: OK"));
+    assert!(lanes.contains("unsafe raw template oracle self-test: OK"));
+    assert!(lanes.contains("raw policy oracle self-test: OK"));
+    assert!(lanes.contains("full CallStart safe defaults self-test: OK"));
+    let mut sentinels = canary_literals(&read("scripts/fixtures/canary_workload.c"));
+    sentinels.extend(canary_literals(&read(
+        "scripts/fixtures/privacy-stack-workload.c",
+    )));
+    assert_eq!(sentinels.len(), 18, "unexpected fixture sentinel inventory");
+    for sentinel in sentinels {
+        assert!(
+            lanes.contains(&sentinel),
+            "scanner self-test omitted fixture sentinel {sentinel}"
+        );
+    }
+
+    let dumper = run_ok(
+        "python3",
+        &["scripts/dump-owned-bpf-maps.py", "--self-test"],
+    );
+    assert!(dumper.contains("nonzero valid JSON rejected: OK"));
+    assert!(dumper.contains("ordinary dump list validation: OK"));
 
     let harness = induced
         .split_once("#define _GNU_SOURCE\n")
@@ -387,17 +479,7 @@ aggregate-only-metrics default metrics"
 
     let inspector = run_ok("python3", &["scripts/check-bpf-map-defs.py", "--self-test"]);
     assert!(inspector.contains("policy inventory self-test: OK"));
-
-    let exact = p11scope_ebpf_common::FunctionNameKey::from_bytes(b"C_Encrypt\0").unwrap();
-    let noncatalog = p11scope_ebpf_common::FunctionNameKey::from_bytes(b"C_Encrypu\0").unwrap();
-    let injected_legacy_candidate = 30u32;
-    let catalog = BTreeMap::from([(exact, injected_legacy_candidate)]);
-    assert_eq!(catalog.get(&exact), Some(&injected_legacy_candidate));
-    assert_eq!(
-        catalog.get(&noncatalog),
-        None,
-        "a test-injected shared legacy candidate must not authorize a noncatalog exact name"
-    );
+    assert!(inspector.contains("malformed map definitions rejected: OK"));
 }
 
 #[test]

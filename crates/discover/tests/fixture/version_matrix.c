@@ -39,7 +39,17 @@ typedef struct { CK_VERSION version; void *functions[104]; } Table;
 #define UNTRUSTED_TARGETS 0
 #endif
 
+#if PRIVACY_FIXTURE
+#define TEN_ARGS CK_ULONG a0, CK_ULONG a1, CK_ULONG a2, CK_ULONG a3, CK_ULONG a4, CK_ULONG a5, CK_ULONG a6, CK_ULONG a7, CK_ULONG a8, CK_ULONG a9
+#define S(n) static CK_RV s##n(TEN_ARGS) { \
+    (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; \
+    (void)a6; (void)a7; (void)a8; (void)a9; \
+    if (PRIVACY_BLOCKS) sleep(60); \
+    return CKR_OK; \
+}
+#else
 #define S(n) static CK_RV s##n(void) { return CKR_OK; }
+#endif
 #define S10(m) S(m##0) S(m##1) S(m##2) S(m##3) S(m##4) S(m##5) S(m##6) S(m##7) S(m##8) S(m##9)
 S10(0) S10(1) S10(2) S10(3) S10(4) S10(5) S10(6) S10(7) S10(8) S10(9)
 S(100) S(101) S(102) S(103)
@@ -49,18 +59,6 @@ static void *stubs[104] = {
     L10(5), L10(6), L10(7), L10(8), L10(9),
     s100, s101, s102, s103
 };
-
-#if PRIVACY_FIXTURE
-#define TEN_ARGS CK_ULONG a0, CK_ULONG a1, CK_ULONG a2, CK_ULONG a3, CK_ULONG a4, CK_ULONG a5, CK_ULONG a6, CK_ULONG a7, CK_ULONG a8, CK_ULONG a9
-#define PRIVACY_FN(n) static CK_RV privacy_##n(TEN_ARGS) { \
-    (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; \
-    (void)a6; (void)a7; (void)a8; (void)a9; \
-    if (PRIVACY_BLOCKS) sleep(60); \
-    return CKR_OK; \
-}
-PRIVACY_FN(18) PRIVACY_FN(58) PRIVACY_FN(59) PRIVACY_FN(70) PRIVACY_FN(72)
-PRIVACY_FN(94) PRIVACY_FN(99) PRIVACY_FN(102) PRIVACY_FN(103)
-#endif
 
 CK_RV C_GetFunctionList(void **out);
 CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count);
@@ -88,19 +86,6 @@ static void fill_table(Table *table, CK_BYTE major, CK_BYTE minor, int anchors) 
 #if UNTRUSTED_TARGETS
     table->functions[0] = (void *)write; /* preloaded libc, not provider-owned */
     table->functions[1] = (void *)&legacy; /* mapped, but not executable */
-#endif
-#if PRIVACY_FIXTURE
-    if (major == 3 && minor == 2) {
-        table->functions[18] = (void *)privacy_18;   /* C_Login */
-        table->functions[58] = (void *)privacy_58;   /* C_GenerateKey */
-        table->functions[59] = (void *)privacy_59;   /* C_GenerateKeyPair */
-        table->functions[70] = (void *)privacy_70;   /* C_LoginUser */
-        table->functions[72] = (void *)privacy_72;   /* C_MessageEncryptInit */
-        table->functions[94] = (void *)privacy_94;   /* C_VerifySignatureInit */
-        table->functions[99] = (void *)privacy_99;   /* C_AsyncComplete */
-        table->functions[102] = (void *)privacy_102; /* C_WrapKeyAuthenticated */
-        table->functions[103] = (void *)privacy_103; /* C_UnwrapKeyAuthenticated */
-    }
 #endif
 }
 

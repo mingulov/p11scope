@@ -4,10 +4,13 @@
  * scripts own all output, map, and non-disclosure assertions. */
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 typedef unsigned char CK_BYTE;
 typedef CK_BYTE *CK_BYTE_PTR;
@@ -49,6 +52,7 @@ typedef struct {
 } CK_RSA_PKCS_PSS_PARAMS;
 
 #define CKU_USER 1UL
+#define CKR_OK 0UL
 #define CKM_SHA256 0x250UL
 #define CKM_AES_GCM 0x1087UL
 #define CKM_RSA_PKCS_PSS 0x0DUL
@@ -76,7 +80,8 @@ typedef struct {
 /* CK_FUNCTION_LIST indices (v2.40 order, see spike/discover.c) */
 enum {
     I_Login = 18,
-    I_CreateObject = 20, I_EncryptInit = 29, I_Encrypt = 30,
+    I_CreateObject = 20, I_CopyObject = 21, I_SetAttributeValue = 25,
+    I_EncryptInit = 29, I_Encrypt = 30,
     I_DecryptInit = 33,
     I_DigestInit = 37, I_Digest = 38, I_SignInit = 42,
     I_Sign = 43, I_WrapKey = 60, I_GenerateRandom = 64,
@@ -125,7 +130,6 @@ static const char SENT_ARG9[]      = "CANARY_ARG9_8f119353c9e69ce4f2f3b9a4d2aa2f
 #define REGISTERED_MECHANISM_CONTROL CKM_SHA256
 #define UNKNOWN_MECHANISM_CONTROL   ALIAS_MECHANISM_ID
 #define MAXIMUM_MECHANISM_CONTROL   (~0UL)
-#define FINAL_BOOLEAN_FAULT         ((void *)(uintptr_t)1)
 #define OVERFLOW_PARAMETER_POINTER  ((void *)(uintptr_t)(UINTPTR_MAX - 4))
 
 static CK_BYTE ALIAS_POLICY_VALUES[11] = {
@@ -137,6 +141,74 @@ static const char ALIAS_ASYNC_NAME[] = "AliasAsync_7a91c45d";
 static const char LEGACY_HASH_CANDIDATE[] = "C_Encrypu";
 
 static CK_ULONG ptr(const void *value) { return (CK_ULONG)(uintptr_t)value; }
+
+static void **matrix_functions(void *module)
+{
+    CK_RV (*get_interfaces)(CK_INTERFACE *, CK_ULONG *) =
+        (CK_RV (*)(CK_INTERFACE *, CK_ULONG *))dlsym(module, "C_GetInterfaceList");
+    if (!get_interfaces) { fprintf(stderr, "no C_GetInterfaceList\n"); return NULL; }
+    CK_ULONG count = 0;
+    if (get_interfaces(NULL, &count) != 0 || count == 0) return NULL;
+    CK_INTERFACE *interfaces = calloc(count, sizeof(*interfaces));
+    if (!interfaces || get_interfaces(interfaces, &count) != 0) return NULL;
+    void **functions = NULL;
+    for (CK_ULONG i = 0; i < count; i++) {
+        CK_VERSION version;
+        if (!interfaces[i].name || strcmp(interfaces[i].name, "PKCS 11") != 0 ||
+            !interfaces[i].table) continue;
+        memcpy(&version, interfaces[i].table, sizeof(version));
+        if (version.major == 3 && version.minor == 2) {
+            functions = (void **)((char *)interfaces[i].table + 8);
+            break;
+        }
+    }
+    free(interfaces);
+    if (!functions) fprintf(stderr, "no exact PKCS 11 v3.2 table\n");
+    return functions;
+}
+
+static CK_ATTRIBUTE *metadata_fault_template(void **mapping, size_t *length)
+{
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) return NULL;
+    *length = (size_t)page * 2;
+    *mapping = mmap(NULL, *length, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (*mapping == MAP_FAILED ||
+        mprotect((char *)*mapping + page, (size_t)page, PROT_NONE) != 0) return NULL;
+    CK_ATTRIBUTE_TYPE *type = (CK_ATTRIBUTE_TYPE *)((char *)*mapping + page - sizeof(*type));
+    *type = CKA_PRIVATE;
+    return (CK_ATTRIBUTE *)type;
+}
+
+struct concurrent_call {
+    fn10 function;
+    CK_ULONG args[10];
+    CK_RV rv;
+};
+
+static void *invoke(void *opaque)
+{
+    struct concurrent_call *call = opaque;
+    call->rv = call->function(call->args[0], call->args[1], call->args[2], call->args[3],
+                             call->args[4], call->args[5], call->args[6], call->args[7],
+                             call->args[8], call->args[9]);
+    return NULL;
+}
+
+static int run_concurrent(struct concurrent_call *calls, size_t count, const char *label)
+{
+    pthread_t threads[4];
+    if (count > sizeof(threads) / sizeof(threads[0])) return 1;
+    for (size_t i = 0; i < count; i++) {
+        if (pthread_create(&threads[i], NULL, invoke, &calls[i]) != 0) return 1;
+    }
+    fprintf(stderr, "%s started %zu calls\n", label, count);
+    for (size_t i = 0; i < count; i++) pthread_join(threads[i], NULL);
+    for (size_t i = 0; i < count; i++) if (calls[i].rv != CKR_OK) return 1;
+    printf("%s: all calls CKR_OK\n", label);
+    return 0;
+}
 
 static int matrix_call(void **functions, unsigned index, const char *label,
                        const CK_ULONG args[10])
@@ -151,28 +223,20 @@ static int matrix_call(void **functions, unsigned index, const char *label,
     failures += matrix_call(functions, (index), (label), (CK_ULONG[10]){__VA_ARGS__}); \
 } while (0)
 
-static int run_matrix(void *module)
+static int wait_for_gate(const char *ready, const char *gate)
 {
-    CK_RV (*get_interfaces)(CK_INTERFACE *, CK_ULONG *) =
-        (CK_RV (*)(CK_INTERFACE *, CK_ULONG *))dlsym(module, "C_GetInterfaceList");
-    if (!get_interfaces) { fprintf(stderr, "no C_GetInterfaceList\n"); return 1; }
-    CK_ULONG count = 0;
-    if (get_interfaces(NULL, &count) != 0 || count == 0) return 1;
-    CK_INTERFACE *interfaces = calloc(count, sizeof(*interfaces));
-    if (!interfaces || get_interfaces(interfaces, &count) != 0) return 1;
-    void **functions = NULL;
-    for (CK_ULONG i = 0; i < count; i++) {
-        CK_VERSION version;
-        if (!interfaces[i].name || strcmp(interfaces[i].name, "PKCS 11") != 0 ||
-            !interfaces[i].table) continue;
-        memcpy(&version, interfaces[i].table, sizeof(version));
-        if (version.major == 3 && version.minor == 2) {
-            functions = (void **)((char *)interfaces[i].table + 8);
-            break;
-        }
-    }
-    free(interfaces);
-    if (!functions) { fprintf(stderr, "no exact PKCS 11 v3.2 table\n"); return 1; }
+    if (!gate) return 0;
+    FILE *handle = fopen(ready, "w");
+    if (!handle) return 1;
+    if (fputs("ready\n", handle) < 0 || fclose(handle) != 0) return 1;
+    while (access(gate, F_OK) != 0) usleep(50000);
+    return 0;
+}
+
+static int run_matrix(void *module, const char *ready, const char *gate)
+{
+    void **functions = matrix_functions(module);
+    if (!functions || wait_for_gate(ready, gate) != 0) return 1;
 
     int failures = 0;
     CK_ULONG session = 0x101;
@@ -252,11 +316,16 @@ static int run_matrix(void *module)
                 sizeof(aliases_a) / sizeof(aliases_a[0]), ptr(&object));
     MATRIX_CALL(I_CreateObject, "aliased template and policy values B", session, ptr(aliases_b),
                 sizeof(aliases_b) / sizeof(aliases_b[0]), ptr(&object));
-    CK_ATTRIBUTE final_fault[] = {
-        {ALIAS_TEMPLATE_TYPE, NULL, 0}, {CKA_TOKEN, FINAL_BOOLEAN_FAULT, 1},
-    };
-    MATRIX_CALL(I_CreateObject, "final boolean fault", session, ptr(final_fault),
-                sizeof(final_fault) / sizeof(final_fault[0]), ptr(&object));
+    void *fault_mapping = NULL;
+    size_t fault_mapping_len = 0;
+    CK_ATTRIBUTE *metadata_fault = metadata_fault_template(&fault_mapping, &fault_mapping_len);
+    if (!metadata_fault) return 1;
+    MATRIX_CALL(I_CopyObject, "template metadata fault", session, object,
+                ptr(metadata_fault), 1, ptr(&object));
+    CK_ATTRIBUTE value_fault = {CKA_TOKEN, (void *)(uintptr_t)1, 1};
+    MATRIX_CALL(I_SetAttributeValue, "template boolean value fault", session, object,
+                ptr(&value_fault), 1);
+    munmap(fault_mapping, fault_mapping_len);
 
     CK_MECHANISM overflow = {CKM_AES_GCM, OVERFLOW_PARAMETER_POINTER, sizeof(CK_GCM_PARAMS)};
     MATRIX_CALL(I_EncryptInit, "overflow parameter pointer", session, ptr(&overflow), object);
@@ -265,26 +334,69 @@ static int run_matrix(void *module)
     MATRIX_CALL(I_EncryptInit, "unreadable mechanism pointer", session, 1, object);
 
     static const char exact_async[] = "C_Encrypt";
-    MATRIX_CALL(I_AsyncComplete, "exact async name", session, ptr(exact_async), 0,
+    MATRIX_CALL(I_AsyncComplete, "exact async name", 0x11d, ptr(exact_async), 0,
                 0);
-    MATRIX_CALL(I_AsyncComplete, "noncatalog legacy candidate", session,
+    MATRIX_CALL(I_AsyncComplete, "noncatalog legacy candidate", 0x11e,
                 ptr(LEGACY_HASH_CANDIDATE), 0);
-    MATRIX_CALL(I_AsyncComplete, "aliased async name", session, ptr(ALIAS_ASYNC_NAME), 0,
+    MATRIX_CALL(I_AsyncComplete, "aliased async name", 0x11f, ptr(ALIAS_ASYNC_NAME), 0,
                 0);
 
     printf("canary_workload matrix: %s\n", failures == 0 ? "all calls CKR_OK" : "FAILED");
     return failures == 0 ? 0 : 1;
 }
 
+static int run_blocked(void *module)
+{
+    void **functions = matrix_functions(module);
+    if (!functions) return 1;
+    CK_MECHANISM unknown = {UNKNOWN_MECHANISM_CONTROL, NULL, 0};
+    static const char exact[] = "C_Encrypt";
+    struct concurrent_call calls[] = {
+        {(fn10)functions[I_EncryptInit], {0x301, ptr(&unknown)}, 0},
+        {(fn10)functions[I_AsyncComplete], {0x302, ptr(exact)}, 0},
+        {(fn10)functions[I_AsyncComplete], {0x303, ptr(LEGACY_HASH_CANDIDATE)}, 0},
+        {(fn10)functions[I_AsyncComplete], {0x304, ptr(ALIAS_ASYNC_NAME)}, 0},
+    };
+    printf("P11SCOPE_POINTERS {\"unknown_mechanism\":%lu,"
+           "\"exact_async\":%lu,\"legacy_name\":%lu,\"alias_name\":%lu}\n",
+           ptr(&unknown), ptr(exact), ptr(LEGACY_HASH_CANDIDATE), ptr(ALIAS_ASYNC_NAME));
+    fflush(stdout);
+    return run_concurrent(calls, sizeof(calls) / sizeof(calls[0]), "blocked hostile subset");
+}
+
+static int run_faults(void *module)
+{
+    void **functions = matrix_functions(module);
+    if (!functions) return 1;
+    void *mapping = NULL;
+    size_t mapping_len = 0;
+    CK_ATTRIBUTE *metadata_fault = metadata_fault_template(&mapping, &mapping_len);
+    if (!metadata_fault) return 1;
+    CK_ATTRIBUTE value_fault = {CKA_TOKEN, (void *)(uintptr_t)1, 1};
+    struct concurrent_call calls[] = {
+        {(fn10)functions[I_CopyObject], {0x401, 1, ptr(metadata_fault), 1}, 0},
+        {(fn10)functions[I_SetAttributeValue], {0x402, 1, ptr(&value_fault), 1}, 0},
+    };
+    int status = run_concurrent(calls, sizeof(calls) / sizeof(calls[0]),
+                                "blocked template faults");
+    munmap(mapping, mapping_len);
+    return status;
+}
+
 #undef MATRIX_CALL
 
 int main(int argc, char **argv)
 {
-    if (argc != 3 || strcmp(argv[2], "matrix") != 0) {
-        fprintf(stderr, "usage: %s /path/to/fixture.so matrix\n", argv[0]);
+    if (argc < 3 || argc > 5) {
+        fprintf(stderr, "usage: %s /path/to/fixture.so matrix|blocked|faults [READY GO]\n", argv[0]);
         return 2;
     }
     void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
-    return run_matrix(h);
+    if (strcmp(argv[2], "matrix") == 0 && argc == 3) return run_matrix(h, NULL, NULL);
+    if (strcmp(argv[2], "matrix") == 0 && argc == 5) return run_matrix(h, argv[3], argv[4]);
+    if (strcmp(argv[2], "blocked") == 0) return run_blocked(h);
+    if (strcmp(argv[2], "faults") == 0) return run_faults(h);
+    fprintf(stderr, "usage: %s /path/to/fixture.so matrix|blocked|faults [READY GO]\n", argv[0]);
+    return 2;
 }

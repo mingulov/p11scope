@@ -10,6 +10,7 @@ import tempfile
 
 
 MAP_FIELDS = ("type", "key_size", "value_size", "max_entries", "flags", "id", "pinning")
+MAP_DEFINITION_SIZE = 28
 
 
 def elf_records(path):
@@ -37,6 +38,34 @@ def elf_records(path):
     return records, indices
 
 
+def decode_map_definitions(records, section, data):
+    objects = sorted(
+        (offset, size, name)
+        for offset, size, kind, _, _, symbol_section, name in records
+        if kind == "OBJECT" and symbol_section == str(section)
+    )
+    maps = {}
+    cursor = 0
+    for offset, size, name in objects:
+        if name in maps:
+            raise RuntimeError(f"duplicate map symbol name {name}")
+        if size != MAP_DEFINITION_SIZE:
+            raise RuntimeError(f"{name} map definition size is {size}, expected 28")
+        if offset % 4:
+            raise RuntimeError(f"misaligned map definition for {name}: offset {offset}")
+        if offset != cursor:
+            raise RuntimeError(
+                f"non-contiguous map definitions before {name}: offset {offset}, expected {cursor}"
+            )
+        if offset + size > len(data):
+            raise RuntimeError(f"truncated map definition for {name}")
+        maps[name] = dict(zip(MAP_FIELDS, struct.unpack_from("<7I", data, offset)))
+        cursor += size
+    if cursor != len(data):
+        raise RuntimeError(f"maps section has {len(data) - cursor} trailing bytes")
+    return maps
+
+
 def inspect(path):
     records, sections = elf_records(path)
     if "maps" not in sections:
@@ -45,12 +74,7 @@ def inspect(path):
         raw = Path(directory) / "maps.bin"
         subprocess.run(["llvm-objcopy", "--dump-section", f"maps={raw}", path], check=True)
         data = raw.read_bytes()
-    maps = {}
-    for offset, _, kind, _, _, section, name in records:
-        if kind == "OBJECT" and section == str(sections["maps"]):
-            if offset + 28 > len(data):
-                raise RuntimeError(f"truncated map definition for {name}")
-            maps[name] = dict(zip(MAP_FIELDS, struct.unpack_from("<7I", data, offset)))
+    maps = decode_map_definitions(records, sections["maps"], data)
     program_sections = {
         index for name, index in sections.items()
         if name in {"uprobe", "uretprobe"} or name.startswith("tracepoint/")
@@ -131,6 +155,24 @@ def self_test():
         pass
     else:
         raise AssertionError("unsafe default inventory was accepted")
+    record = (0, 28, "OBJECT", "GLOBAL", "DEFAULT", "9", "ONE")
+    data = struct.pack("<7I", 1, 4, 8, 1, 0, 0, 0)
+    assert decode_map_definitions([record], 9, data)["ONE"]["value_size"] == 8
+    mutations = [
+        ([(0, 28, "OBJECT", "GLOBAL", "DEFAULT", "9", "ONE"), record], data * 2),
+        ([(0, 24, "OBJECT", "GLOBAL", "DEFAULT", "9", "ONE")], data),
+        ([(2, 28, "OBJECT", "GLOBAL", "DEFAULT", "9", "ONE")], b"\0\0" + data),
+        ([(0, 28, "OBJECT", "GLOBAL", "DEFAULT", "9", "ONE")], data[:-1]),
+        ([record], data + b"\0"),
+    ]
+    for records, raw in mutations:
+        try:
+            decode_map_definitions(records, 9, raw)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"malformed map definitions accepted: {records!r}")
+    print("malformed map definitions rejected: OK")
     print("check-bpf-map-defs self-test: OK")
     print("policy inventory self-test: OK")
 

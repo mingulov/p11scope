@@ -18,18 +18,25 @@ def map_ids_from_fdinfo(texts):
     return sorted({int(match.group(1)) for text in texts for match in MAP_ID.finditer(text)})
 
 
-def run_json(args, allow_failure=False):
-    proc = subprocess.run(args, capture_output=True, text=True)
+def checked_json(args, returncode, stdout, stderr, require_list=False):
+    if returncode:
+        raise RuntimeError(f"{' '.join(args)} failed: {stderr.strip()}")
     try:
-        value = json.loads(proc.stdout)
+        value = json.loads(stdout)
     except json.JSONDecodeError as error:
         raise RuntimeError(
-            f"{' '.join(args)} produced invalid JSON: rc={proc.returncode} "
-            f"stderr={proc.stderr!r}"
+            f"{' '.join(args)} produced invalid JSON: stderr={stderr!r}"
         ) from error
-    if proc.returncode and not allow_failure:
-        raise RuntimeError(f"{' '.join(args)} failed: {proc.stderr.strip()}")
+    if require_list and not isinstance(value, list):
+        raise RuntimeError(f"{' '.join(args)} produced {type(value).__name__}, expected JSON list")
     return value
+
+
+def run_json(args, require_list=False):
+    proc = subprocess.run(args, capture_output=True, text=True)
+    return checked_json(
+        args, proc.returncode, proc.stdout, proc.stderr, require_list=require_list
+    )
 
 
 def one(value):
@@ -49,6 +56,20 @@ def self_test():
         pass
     else:
         raise AssertionError("empty bpftool result was accepted")
+    try:
+        checked_json(["bpftool"], 1, "[]", "map disappeared", require_list=True)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("nonzero bpftool result with valid JSON was accepted")
+    print("nonzero valid JSON rejected: OK")
+    try:
+        checked_json(["bpftool"], 0, "{}", "", require_list=True)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("non-list ordinary map dump was accepted")
+    print("ordinary dump list validation: OK")
     print("dump-owned-bpf-maps self-test: OK")
 
 
@@ -102,14 +123,14 @@ def main():
         while True:
             entries = run_json(
                 ["bpftool", "-j", "map", "dump", "id", str(start["id"])],
-                allow_failure=True,
+                require_list=True,
             )
-            if isinstance(entries, list) and len(entries) >= min_start:
+            if len(entries) >= min_start:
                 break
             if time.monotonic() >= deadline:
                 raise RuntimeError(
                     f"START map id {start['id']} never reached {min_start} live entries; "
-                    f"last dump had {len(entries) if isinstance(entries, list) else 'non-list'}"
+                    f"last dump had {len(entries)}"
                 )
             time.sleep(0.05)
 
@@ -117,10 +138,25 @@ def main():
     manifest = []
     for item in maps:
         name = item["name"]
+        if name == "EVENTS":
+            if item.get("type") != "ringbuf":
+                raise RuntimeError(f"EVENTS is not a ringbuf: {item}")
+            manifest.append(
+                {
+                    "id": item["id"],
+                    "name": name,
+                    "type": item.get("type"),
+                    "key_size": item.get("bytes_key"),
+                    "value_size": item.get("bytes_value"),
+                    "max_entries": item.get("max_entries"),
+                    "oracle": "mmap",
+                }
+            )
+            continue
         output = out_dir / f"mapdump_{name}{suffix}.json"
         dumped = run_json(
             ["bpftool", "-j", "map", "dump", "id", str(item["id"])],
-            allow_failure=True,
+            require_list=True,
         )
         output.write_text(json.dumps(dumped, separators=(",", ":")) + "\n")
         manifest.append(
@@ -128,7 +164,10 @@ def main():
                 "id": item["id"],
                 "name": name,
                 "type": item.get("type"),
+                "key_size": item.get("bytes_key"),
+                "value_size": item.get("bytes_value"),
                 "max_entries": item.get("max_entries"),
+                "oracle": "dump",
                 "file": str(output),
             }
         )

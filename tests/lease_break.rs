@@ -1147,7 +1147,7 @@ fn parent_death_setup_race_cannot_leave_an_orphan_worker() {
 }
 
 #[test]
-fn sigint_stops_the_worker_cleanly_and_preserves_normal_status() {
+fn sigint_allows_bounded_clean_output_work_and_preserves_normal_status() {
     let _serial = FORK_TEST.lock().unwrap();
     let dir = protected_tempdir();
     let object = dir.path().join("leased.so");
@@ -1169,6 +1169,7 @@ fn sigint_stops_the_worker_cleanly_and_preserves_normal_status() {
                 while !interrupted.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(10));
                 }
+                std::thread::sleep(Duration::from_millis(2_100));
                 Ok(())
             })
             .unwrap();
@@ -1180,6 +1181,53 @@ fn sigint_stops_the_worker_cleanly_and_preserves_normal_status() {
     let status = wait_status_bounded(supervisor);
     assert!(libc::WIFEXITED(status));
     assert_eq!(libc::WEXITSTATUS(status), 0);
+}
+
+#[test]
+fn sigterm_shortens_a_prior_sigint_cleanup_deadline() {
+    let _serial = FORK_TEST.lock().unwrap();
+    let dir = protected_tempdir();
+    let object = dir.path().join("leased.so");
+    let ready = dir.path().join("ready");
+    let interrupt_seen = dir.path().join("interrupt-seen");
+    std::fs::copy("/bin/true", &object).unwrap();
+    let child_object = object.clone();
+    let child_ready = ready.clone();
+    let child_interrupt_seen = interrupt_seen.clone();
+
+    let supervisor = spawn_single_threaded(move || {
+        let signals = p11scope::verify::CaptureSignals::block().unwrap();
+        let objects = p11scope::verify::check_reuse(&manifest_for(&child_object)).unwrap();
+        let output = p11scope::verify::SupervisorOutput::profile(None).unwrap();
+        let outcome =
+            p11scope::verify::supervise_capture(signals, objects, output, move |worker| {
+                let interrupted = Arc::new(AtomicBool::new(false));
+                signal_hook::flag::register(libc::SIGINT, Arc::clone(&interrupted)).unwrap();
+                worker.unblock_operator_signals()?;
+                assert_ne!(
+                    unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) },
+                    libc::SIG_ERR
+                );
+                std::fs::write(child_ready, b"ready").map_err(|error| error.to_string())?;
+                while !interrupted.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                std::fs::write(child_interrupt_seen, b"seen").map_err(|error| error.to_string())?;
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            })
+            .unwrap();
+        finish(outcome)
+    });
+
+    wait_for_file(&ready);
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGINT) }, 0);
+    wait_for_file(&interrupt_seen);
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGTERM) }, 0);
+    let status = wait_status_bounded(supervisor);
+    assert!(libc::WIFSIGNALED(status));
+    assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
 }
 
 #[test]

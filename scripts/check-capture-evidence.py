@@ -68,6 +68,15 @@ UNSAFE_ALLOWANCES = {
     "orphan_ops": 3,
     "shape_decode_failures": 2,
 }
+G3_COUNTS = {
+    "C_GetFunctionList": 1,
+    "C_Initialize": 1,
+    "C_Finalize": 1,
+    "C_GetSlotList": 1,
+    "C_OpenSession": 1,
+    "C_CloseSession": 1,
+    "C_GenerateRandom": 200000,
+}
 
 
 def require(condition, message):
@@ -227,9 +236,17 @@ def validate_induced(lane, document):
         exact_common(evidence, aliases=[], skipped=[], in_flight=0)
         require(evidence["event_loss"] > 0, f"event_loss: {evidence['event_loss']}")
         require(evidence["unmatched_closes"] in (0, 1), evidence["unmatched_closes"])
+        actual = Counter()
+        for item in document["functions"]:
+            if item["calls"]:
+                actual.update({name: item["calls"] for name in item["names"]})
+        require(dict(actual) == G3_COUNTS, f"G3 function counts: {dict(actual)}")
         exact_counters(
             evidence,
-            {"event_loss": evidence["event_loss"], "unmatched_closes": evidence["unmatched_closes"]},
+            {
+                "event_loss": evidence["event_loss"],
+                "unmatched_closes": evidence["unmatched_closes"],
+            },
         )
     elif lane == "G4":
         exact_shape(evidence, 988, 104, 208, VERSION_SURFACES, 1, "ok")
@@ -373,8 +390,18 @@ def self_test():
     )
     induced["G2"] = document_fixture(g2)
     g3 = evidence_fixture(LEGACY_SURFACES)
-    g3.update(table_entries=68, slots=68, attached_probes=136, event_loss=1, unmatched_closes=1)
+    g3.update(
+        table_entries=68,
+        slots=68,
+        attached_probes=136,
+        event_loss=1,
+        unmatched_closes=1,
+    )
     induced["G3"] = document_fixture(g3)
+    induced["G3"]["functions"] = [
+        {"names": [name], "calls": calls}
+        for name, calls in G3_COUNTS.items()
+    ]
     g4 = copy.deepcopy(version)
     g4.update(in_flight_at_end=9, start_insert_failures=8)
     induced["G4"] = document_fixture(g4)
@@ -388,6 +415,16 @@ def self_test():
         bad["evidence"]["malformed_records"] = 1
         rejected(lambda lane=lane, bad=bad: validate_induced(lane, bad))
         print(f"induced {lane} exact allowances: OK")
+
+    bad = copy.deepcopy(induced["G3"])
+    bad["evidence"]["rv_update_failures"] = 1
+    rejected(lambda: validate_induced("G3", bad))
+    print("induced G3 rejects state-map contamination: OK")
+
+    bad = copy.deepcopy(induced["G3"])
+    next(item for item in bad["functions"] if item["names"] == ["C_GenerateRandom"])["calls"] -= 1
+    rejected(lambda: validate_induced("G3", bad))
+    print("induced G3 exact function counts required: OK")
 
     bad = copy.deepcopy(induced["G5"])
     bad["functions"][0]["calls"] = 12

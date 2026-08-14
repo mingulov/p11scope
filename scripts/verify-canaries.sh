@@ -468,29 +468,30 @@ def assert_event_records(raw_records, lane, workload_pid):
     mechanisms = {event["mechanism"] for event in events}
     assert {REGISTERED, UNKNOWN, MAXIMUM, 0xD, 0x1087} <= mechanisms, mechanisms
     pss = [(event["shape"], event["p0"], event["p1"], event["p2"])
-           for event in events if event["slot"] == 42]
+           for event in events
+           if event["mechanism"] == 0xD and event["shape"] != 0]
     assert pss == [(1, ALIASES["pss_hash"], ALIASES["pss_mgf"], ALIASES["pss_salt"])], pss
     gcm = {(event["shape"], event["p0"], event["p1"], event["p2"])
-           for event in events if event["slot"] == 29 and event["shape"] != 0}
+           for event in events
+           if event["mechanism"] == 0x1087 and event["shape"] != 0}
     assert gcm == {
         (3, ALIASES["gcm220_iv"], ALIASES["gcm220_aad"], ALIASES["gcm220_tag"]),
         (4, ALIASES["gcm240_iv"], ALIASES["gcm240_aad"], ALIASES["gcm240_tag"]),
     }, gcm
     templates = [event for event in events
-                 if event["slot"] == 20 and event["attrs"][0] == ALIASES["template_type"]]
+                 if event["attrs"][0] == ALIASES["template_type"]]
     assert [(event["attrs"], event["attr_count"], event["attr_total"],
              event["attr_bools"], event["attr_seen"]) for event in templates] == [
         ((ALIASES["template_type"], *POLICY_BOOLEAN_TYPES[:6], 0), 7, 7, 0x3F, 0x3F),
         ((ALIASES["template_type"], *POLICY_BOOLEAN_TYPES[6:], 0, 0), 6, 6, 0x7C0, 0x7C0),
     ], templates
-    fault_types = {event["slot"]: event["attrs"][0] for event in events
-                   if event["slot"] in {21, 25}}
-    assert fault_types == {21: 2, 25: 1}, fault_types
-    for event in events:
-        if event["slot"] in {21, 25}:
-            assert (event["attr_count"], event["attr_total"], event["attr_bools"],
-                    event["attr_seen"]) == (1, 1, 0, 0), event
-            assert event["capture"] & ARG_READ_FAILURE
+    faults = [event for event in events
+              if event["attrs"][0] in {1, 2}
+              and event["capture"] & ARG_READ_FAILURE]
+    assert sorted(event["attrs"][0] for event in faults) == [1, 2], faults
+    for event in faults:
+        assert (event["attr_count"], event["attr_total"], event["attr_bools"],
+                event["attr_seen"]) == (1, 1, 0, 0), event
 
 
 def assert_raw_events(manifest, lane, workload_pid, output):
@@ -828,31 +829,31 @@ if work == "--self-test":
     unsafe_events[10] = event_bytes(10, mechanism=UNKNOWN)
     unsafe_events[11] = event_bytes(11, mechanism=MAXIMUM)
     unsafe_events[12] = event_bytes(
-        12, mechanism=0xD, slot=42, shape=1, p0=ALIASES["pss_hash"],
+        12, mechanism=0xD, slot=401, shape=1, p0=ALIASES["pss_hash"],
         p1=ALIASES["pss_mgf"], p2=ALIASES["pss_salt"]
     )
     unsafe_events[13] = event_bytes(
-        13, mechanism=0x1087, slot=29, shape=3, p0=ALIASES["gcm220_iv"],
+        13, mechanism=0x1087, slot=402, shape=3, p0=ALIASES["gcm220_iv"],
         p1=ALIASES["gcm220_aad"], p2=ALIASES["gcm220_tag"]
     )
     unsafe_events[14] = event_bytes(
-        14, mechanism=0x1087, slot=29, shape=4, p0=ALIASES["gcm240_iv"],
+        14, mechanism=0x1087, slot=402, shape=4, p0=ALIASES["gcm240_iv"],
         p1=ALIASES["gcm240_aad"], p2=ALIASES["gcm240_tag"]
     )
     unsafe_events[15] = event_bytes(
-        15, slot=20, attrs=(ALIASES["template_type"], *POLICY_BOOLEAN_TYPES[:6]),
+        15, slot=403, attrs=(ALIASES["template_type"], *POLICY_BOOLEAN_TYPES[:6]),
         attr_count=7, attr_total=7, attr_bools=0x3F, attr_seen=0x3F
     )
     unsafe_events[16] = event_bytes(
-        16, slot=20, attrs=(ALIASES["template_type"], *POLICY_BOOLEAN_TYPES[6:]),
+        16, slot=403, attrs=(ALIASES["template_type"], *POLICY_BOOLEAN_TYPES[6:]),
         attr_count=6, attr_total=6, attr_bools=0x7C0, attr_seen=0x7C0
     )
     unsafe_events[17] = event_bytes(
-        17, slot=21, attrs=(2,), attr_count=1, attr_total=1,
+        17, slot=404, attrs=(2,), attr_count=1, attr_total=1,
         capture=ARG_READ_FAILURE
     )
     unsafe_events[18] = event_bytes(
-        18, slot=25, attrs=(1,), attr_count=1, attr_total=1,
+        18, slot=405, attrs=(1,), attr_count=1, attr_total=1,
         capture=ARG_READ_FAILURE
     )
     assert_event_records(unsafe_events, "feature-unsafe-profile", 0x555)
@@ -921,8 +922,10 @@ print(f"positive control OK: scanner found PIN in {control}")
 
 artifacts = []
 for lane in lanes:
-    artifacts.extend(Path(work) / f"{lane}.{suffix}" for suffix in
-                     ("output", "observer.log", "workload.log", "events.raw"))
+    suffixes = ("output", "observer.log", "workload.log")
+    if lane != "aggregate-only-metrics":
+        suffixes += ("events.raw",)
+    artifacts.extend(Path(work) / f"{lane}.{suffix}" for suffix in suffixes)
 artifacts.extend(Path(work).glob("mapdump_*.json"))
 for lane in ("default-safe-start", "feature-safe-start", "feature-unsafe-fault"):
     artifacts.extend(Path(work) / f"{lane}.{suffix}" for suffix in
@@ -971,6 +974,7 @@ command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
 sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
 
 WPID=
+WORKLOAD_STARTTIME=
 SPID=
 OBSERVER_PID=
 OBSERVER_STARTTIME=
@@ -995,7 +999,9 @@ cleanup() {
     elif [ -n "$SPID" ]; then
         kill -TERM "$SPID" 2>/dev/null || true
     fi
-    [ -z "$WPID" ] || kill -TERM "$WPID" 2>/dev/null || true
+    if [ -n "$WPID" ] && [ -n "$WORKLOAD_STARTTIME" ]; then
+        signal_verified_process KILL "$WPID" "$WORKLOAD_STARTTIME" 2>/dev/null || true
+    fi
     [ -z "$WPID" ] || wait "$WPID" 2>/dev/null || true
     [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || true
     cleanup_step restore_suid_dumpable
@@ -1091,6 +1097,25 @@ wait_for_stopped() {
     return 1
 }
 
+wait_for_workload_stopped() {
+    wfws_pid=$1
+    wfws_starttime=$2
+    wfws_attempt=0
+    while [ "$wfws_attempt" -lt 160 ]; do
+        process_matches_starttime "$wfws_pid" "$wfws_starttime" || {
+            echo "workload $wfws_pid exited or changed identity" >&2
+            return 1
+        }
+        wfws_state=$(awk '$1 == "State:" { print $2; exit }' \
+            "/proc/$wfws_pid/status" 2>/dev/null || true)
+        [ "$wfws_state" = T ] && return 0
+        wfws_attempt=$((wfws_attempt + 1))
+        sleep 0.05
+    done
+    echo "workload $wfws_pid did not stop after completing its calls" >&2
+    return 1
+}
+
 run_lane() {
     lane=$1
     build=$2
@@ -1117,6 +1142,10 @@ run_lane() {
         "$PWD/$WORK/$lane.ready" "$PWD/$WORK/$lane.go" \
         > "$WORK/$lane.workload.log" 2>&1 &
     WPID=$!
+    WORKLOAD_STARTTIME=$(process_starttime "$WPID") || {
+        echo "$lane workload identity unavailable"
+        exit 1
+    }
     lane_workload_pid=$WPID
     lane_ready_attempt=0
     while [ ! -f "$WORK/$lane.ready" ] && [ "$lane_ready_attempt" -lt 160 ]; do
@@ -1168,7 +1197,7 @@ run_lane() {
     WORKER_STOPPED=1
     wait_for_stopped "$OBSERVER_PID" "$OBSERVER_STARTTIME"
     touch "$WORK/$lane.go"
-    if wait "$WPID"; then WPID=; else status=$?; WPID=; echo "$lane workload failed: $status"; exit "$status"; fi
+    wait_for_workload_stopped "$WPID" "$WORKLOAD_STARTTIME"
     sudo python3 "$TRUST_ROOT/dump-owned-bpf-maps.py" \
         "$OBSERVER_PID" "$RUN_DIR" "$lane" 0 16384
     assert_lanes --raw-events "$RUN_DIR/mapdump_manifest_$lane.json" "$lane" \
@@ -1179,9 +1208,21 @@ run_lane() {
     OBSERVER_PID=
     OBSERVER_STARTTIME=
     if wait "$SPID"; then SPID=; SUPERVISOR_PID=; SUPERVISOR_STARTTIME=; else status=$?; SPID=; SUPERVISOR_PID=; SUPERVISOR_STARTTIME=; echo "$lane observer failed: $status"; exit "$status"; fi
+    signal_verified_process CONT "$WPID" "$WORKLOAD_STARTTIME"
+    if wait "$WPID"; then
+        WPID=
+        WORKLOAD_STARTTIME=
+    else
+        status=$?
+        WPID=
+        WORKLOAD_STARTTIME=
+        echo "$lane workload failed: $status"
+        exit "$status"
+    fi
     publish_protected_file "$RUN_DIR" "$lane.output" "$WORK" "$lane.output"
     python3 scripts/check-capture-evidence.py canary "$lane" "$WORK/$lane.output"
-    publish_protected_file "$RUN_DIR" "$lane.events.raw" "$WORK" "$lane.events.raw"
+    [ "$kind" = metrics ] || \
+        publish_protected_file "$RUN_DIR" "$lane.events.raw" "$WORK" "$lane.events.raw"
     publish_protected_mapdump_lane "$RUN_DIR" "$WORK" "$lane"
 }
 
@@ -1230,6 +1271,10 @@ run_start_lane() {
       exec "$WORK/canary_workload" "$PWD/$WORK/privacy-provider.so" "$start_mode" ) \
         > "$WORK/$start_lane.workload.log" 2>&1 &
     WPID=$!
+    WORKLOAD_STARTTIME=$(process_starttime "$WPID") || {
+        echo "$start_lane workload identity unavailable"
+        exit 1
+    }
     start_workload_pid=$WPID
     set -- "$start_trust/p11scope" profile --manifest "$RUN_DIR/privacy-manifest.json" \
         --provenance-module "$PWD/$WORK/privacy-provider.so" --pid "$WPID" \
@@ -1269,14 +1314,22 @@ run_start_lane() {
         assert_lanes "$start_oracle" "$RUN_DIR/mapdump_manifest_$start_lane.json" \
             "$WORK/$start_lane.workload.log" "$start_workload_pid"
     fi
-    kill -0 "$WPID" || { echo "$start_lane workload exited before START oracle completed"; exit 1; }
-    kill -TERM "$WPID" || { echo "$start_lane workload could not be terminated"; exit 1; }
+    process_matches_starttime "$WPID" "$WORKLOAD_STARTTIME" || {
+        echo "$start_lane workload exited before START oracle completed"
+        exit 1
+    }
+    signal_verified_process TERM "$WPID" "$WORKLOAD_STARTTIME" || {
+        echo "$start_lane workload could not be terminated"
+        exit 1
+    }
     if wait "$WPID"; then
         start_status=0
         WPID=
+        WORKLOAD_STARTTIME=
     else
         start_status=$?
         WPID=
+        WORKLOAD_STARTTIME=
     fi
     [ "$start_status" -eq 143 ] || {
         echo "$start_lane workload exit status $start_status, expected SIGTERM status 143"

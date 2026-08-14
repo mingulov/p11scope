@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -342,6 +343,8 @@ static int run_matrix(void *module, const char *ready, const char *gate)
                 0);
 
     printf("canary_workload matrix: %s\n", failures == 0 ? "all calls CKR_OK" : "FAILED");
+    fflush(stdout);
+    if (gate && raise(SIGSTOP) != 0) return 1;
     return failures == 0 ? 0 : 1;
 }
 

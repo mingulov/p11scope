@@ -408,6 +408,9 @@ fn publish_attribute_catalog(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
 
 fn freeze_published_maps(ebpf: &Ebpf) -> Result<()> {
     for name in BASE_POLICY_MAPS {
+        if name == "SLOT_SEMANTICS" {
+            continue;
+        }
         freeze_map(name, ebpf.map(name).with_context(|| format!("{name} map"))?)?;
     }
     for name in FEATURE_POLICY_MAPS {
@@ -577,6 +580,15 @@ impl Session {
             prog.load()
                 .with_context(|| format!("loading {prog_name}"))?;
         }
+        // Linux can constant-fold frozen one-entry arrays, but returns its
+        // internal ENOTSUPP for direct reads from this 512-entry array.
+        // Loading first avoids that kernel path; freezing still precedes every
+        // attachment, so no probe can observe mutable policy.
+        freeze_map(
+            "SLOT_SEMANTICS",
+            ebpf.map("SLOT_SEMANTICS").context("SLOT_SEMANTICS map")?,
+        )
+        .context("freezing SLOT_SEMANTICS")?;
         publish_and_freeze_template_tail(&mut ebpf, unsafe_enabled)
             .context("publishing and freezing TEMPLATE_TAIL")?;
 

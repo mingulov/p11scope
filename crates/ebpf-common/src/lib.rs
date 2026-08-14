@@ -235,13 +235,13 @@ pub const EVIDENCE_CELLS: u32 = 8;
 
 /// Hash-map capacities. The opt-in induced-gap build shrinks both maps so
 /// their independent failure counters can be exercised deterministically.
-#[cfg(not(feature = "small-ring"))]
+#[cfg(not(feature = "small-state-maps"))]
 pub const START_ENTRIES: u32 = 16_384;
-#[cfg(feature = "small-ring")]
+#[cfg(feature = "small-state-maps")]
 pub const START_ENTRIES: u32 = 1;
-#[cfg(not(feature = "small-ring"))]
+#[cfg(not(feature = "small-state-maps"))]
 pub const RV_ENTRIES: u32 = 4_096;
-#[cfg(feature = "small-ring")]
+#[cfg(feature = "small-state-maps")]
 pub const RV_ENTRIES: u32 = 1;
 
 /// Bucket index for a duration. Saturates into the last bucket so a
@@ -634,10 +634,12 @@ mod tests {
 
     #[test]
     fn induced_gap_capacities_are_explicit() {
-        #[cfg(not(feature = "small-ring"))]
+        #[cfg(not(feature = "small-state-maps"))]
         assert_eq!((START_ENTRIES, RV_ENTRIES), (16_384, 4_096));
         #[cfg(feature = "small-ring")]
-        assert_eq!((RING_BYTES, START_ENTRIES, RV_ENTRIES), (4_096, 1, 1));
+        assert_eq!(RING_BYTES, 4_096);
+        #[cfg(feature = "small-state-maps")]
+        assert_eq!((START_ENTRIES, RV_ENTRIES), (1, 1));
     }
 
     #[test]

@@ -10,6 +10,7 @@
  * convention spike/harness.c uses against SoftHSM2.
  */
 #include <dlfcn.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -43,5 +44,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < n_wait; i++) wait_for_slot();
 
     printf("alias_workload OK: %d cancel + %d wait calls\n", n_cancel, n_wait);
+    fflush(stdout);
+    if (getenv("P11SCOPE_HOLD") && raise(SIGSTOP) != 0) return 1;
     return 0;
 }

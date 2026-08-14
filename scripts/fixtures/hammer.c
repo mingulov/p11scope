@@ -5,6 +5,7 @@
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -57,5 +58,7 @@ int main(int argc, char **argv)
     CHECK("C_Finalize", ((fn_gen)fns[I_Finalize])(NULL));
 
     printf("hammer OK: %ld C_GenerateRandom calls\n", n);
+    fflush(stdout);
+    if (getenv("P11SCOPE_HOLD") && raise(SIGSTOP) != 0) return 1;
     return 0;
 }

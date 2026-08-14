@@ -873,7 +873,7 @@ pub fn supervise_capture(
                     if signal == libc::SIGINT || signal == libc::SIGTERM =>
                 {
                     pidfd_send_signal(&pidfd, signal)?;
-                    operator_deadline.get_or_insert_with(|| Instant::now() + OPERATOR_GRACE);
+                    tighten_deadline(&mut operator_deadline, operator_grace(signal));
                 }
                 SupervisorEvent::Control(READY) => ready = true,
                 SupervisorEvent::Control(_) => {
@@ -907,12 +907,12 @@ pub fn supervise_capture(
                     if signal == libc::SIGINT || signal == libc::SIGTERM =>
                 {
                     pidfd_send_signal(&pidfd, signal)?;
-                    operator_deadline.get_or_insert_with(|| Instant::now() + OPERATOR_GRACE);
+                    tighten_deadline(&mut operator_deadline, operator_grace(signal));
                 }
                 SupervisorEvent::Control(DONE) if !completed && !worker_failed => completed = true,
                 SupervisorEvent::Control(FAILED) if !completed && !worker_failed => {
                     worker_failed = true;
-                    operator_deadline.get_or_insert_with(|| Instant::now() + OPERATOR_GRACE);
+                    tighten_deadline(&mut operator_deadline, OPERATOR_GRACE);
                 }
                 SupervisorEvent::Control(_) => {
                     malformed_completion = true;
@@ -994,6 +994,24 @@ const GO: u8 = b'G';
 const DONE: u8 = b'D';
 const FAILED: u8 = b'F';
 const OPERATOR_GRACE: Duration = Duration::from_secs(2);
+// Aya detaches each perf/uprobe link separately. The live 208-probe gate
+// spends about 12 seconds in kernel SRCU teardown before it can publish.
+const SIGINT_GRACE: Duration = Duration::from_secs(30);
+
+fn operator_grace(signal: i32) -> Duration {
+    if signal == libc::SIGINT {
+        SIGINT_GRACE
+    } else {
+        OPERATOR_GRACE
+    }
+}
+
+fn tighten_deadline(deadline: &mut Option<Instant>, grace: Duration) {
+    let candidate = Instant::now() + grace;
+    if deadline.is_none_or(|current| candidate < current) {
+        *deadline = Some(candidate);
+    }
+}
 
 fn worker_process(
     parent_pid: libc::pid_t,
@@ -1150,7 +1168,7 @@ fn pending_lease_break(
             libc::SIGIO => return Ok(true),
             signal @ (libc::SIGINT | libc::SIGTERM) => {
                 pidfd_send_signal(pidfd, signal)?;
-                operator_deadline.get_or_insert_with(|| Instant::now() + OPERATOR_GRACE);
+                tighten_deadline(operator_deadline, operator_grace(signal));
             }
             _ => {}
         }

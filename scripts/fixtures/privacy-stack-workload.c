@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -121,5 +122,7 @@ int main(int argc, char **argv)
         if (calls[i].rv != 0) { fprintf(stderr, "call %zu returned 0x%lx\n", i, calls[i].rv); return 1; }
     }
     printf("privacy-stack workload: all %zu calls returned\n", count_calls);
+    fflush(stdout);
+    if (getenv("P11SCOPE_HOLD") && raise(SIGSTOP) != 0) return 1;
     return 0;
 }

@@ -451,6 +451,13 @@ fn task6_review_root_signals_verify_process_starttime() {
     assert!(canaries.contains("signal_verified_root_process CONT"));
     assert!(!canaries.contains("sudo kill -TERM \"$OBSERVER_PID\""));
     assert!(!canaries.contains("sudo kill -CONT \"$OBSERVER_PID\""));
+    let start_lane = between(
+        &canaries,
+        "run_start_lane() {",
+        "=== live safe START policy",
+    );
+    assert!(start_lane.contains("WORKLOAD_STARTTIME=$(process_starttime \"$WPID\")"));
+    assert!(start_lane.contains("signal_verified_process TERM \"$WPID\" \"$WORKLOAD_STARTTIME\""));
 
     let induced = read("scripts/verify-induced-gaps.sh");
     assert!(induced.contains("SUPERVISOR_STARTTIME"));
@@ -579,6 +586,8 @@ fn task6_review_capture_evidence_checker_self_tests_exact_allowances() {
         "induced G1 exact allowances: OK",
         "induced G2 exact allowances: OK",
         "induced G3 exact allowances: OK",
+        "induced G3 rejects state-map contamination: OK",
+        "induced G3 exact function counts required: OK",
         "induced G4 exact allowances: OK",
         "induced G5 exact allowances: OK",
         "induced G5 exact 11 calls and 9 RV failures: OK",
@@ -608,7 +617,7 @@ PRIMARY=$2
 WPID= TARGET_STARTTIME= LPID= SPID= PUBLISH_TMP=
 OBSERVER_PID= OBSERVER_STARTTIME= SUPERVISOR_PID= SUPERVISOR_STARTTIME= WORKER_STOPPED=
 TRUST_DIR=default TRUST_UNSAFE_DIR=unsafe TRUST_ROOT=root
-TRUST_DEFAULT_DIR=default TRUST_SMALL_DIR=small TRUST_FREEZE_DIR=freeze RUN_DIR=run
+TRUST_DEFAULT_DIR=default TRUST_RING_DIR=ring TRUST_STATE_DIR=state TRUST_FREEZE_DIR=freeze RUN_DIR=run
 restore_suid_dumpable() {{ return 0; }}
 signal_verified_process() {{ return 0; }}
 signal_verified_root_process() {{ return 0; }}
@@ -926,8 +935,8 @@ aggregate-only-metrics default metrics"
 
     let start_lane = canaries.split_once("run_start_lane() {").unwrap().1;
     for marker in [
-        "kill -0 \"$WPID\"",
-        "kill -TERM \"$WPID\"",
+        "process_matches_starttime \"$WPID\" \"$WORKLOAD_STARTTIME\"",
+        "signal_verified_process TERM \"$WPID\" \"$WORKLOAD_STARTTIME\"",
         "[ \"$start_status\" -eq 143 ]",
     ] {
         assert!(start_lane.contains(marker), "START lane misses {marker}");
@@ -1118,8 +1127,23 @@ aggregate-only-metrics default metrics"
 fn induced_gaps_pin_embedded_map_capacities() {
     let script = read("scripts/verify-induced-gaps.sh");
     assert!(script.contains("check-bpf-map-defs.py"));
-    assert!(script.contains("START=1"));
-    assert!(script.contains("RV_COUNTS=1"));
+    for capacities in [
+        "EVENTS=262144 START=16384 RV_COUNTS=4096",
+        "EVENTS=4096 START=16384 RV_COUNTS=4096",
+        "EVENTS=262144 START=1 RV_COUNTS=1",
+    ] {
+        assert!(script.contains(capacities), "missing {capacities}");
+    }
+    let g3 = between(&script, "=== gap 3/5:", "=== gap 4/5:");
+    assert!(g3.contains("$P11SCOPE_SMALLRING"));
+    assert!(!g3.contains("$P11SCOPE_SMALLSTATE"));
+    for lane in [
+        between(&script, "=== gap 4/5:", "=== gap 5/5:"),
+        script.split_once("=== gap 5/5:").unwrap().1,
+    ] {
+        assert!(lane.contains("$P11SCOPE_SMALLSTATE"));
+        assert!(!lane.contains("$P11SCOPE_SMALLRING"));
+    }
 }
 
 #[test]

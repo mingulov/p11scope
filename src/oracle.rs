@@ -950,6 +950,18 @@ fn runtime_candidates<'a>(
     Ok(candidates)
 }
 
+fn loader_candidates(authority: &AuthorityRoot) -> Result<Vec<File>> {
+    let mut candidates = Vec::new();
+    for directory in GLIBC_SEARCH_DIRECTORIES {
+        if let Some(candidate) =
+            authority.open_regular(&Path::new(directory).join(GLIBC_LOADER), true)?
+        {
+            candidates.push(candidate);
+        }
+    }
+    Ok(candidates)
+}
+
 fn open_runtime_candidate(directory: &File, name: &OsStr, owner: u32) -> Result<Option<File>> {
     let mut name = name.to_os_string();
     let mut symlink_hops = 0usize;
@@ -1879,7 +1891,11 @@ fn prepare_glibc_in_root<'a>(
         .collect::<Vec<_>>();
     let mut runtime_fds = BTreeMap::new();
     let _graph = prepare_glibc_graph(&helper_facts, |name| {
-        let candidates = runtime_candidates(search_files.iter().copied(), name, owner)?;
+        let candidates = if name == OsStr::new(GLIBC_LOADER) {
+            loader_candidates(&authority)?
+        } else {
+            runtime_candidates(search_files.iter().copied(), name, owner)?
+        };
         let (fd, facts) = if name == OsStr::new(GLIBC_LOADER) {
             let interpreter = leases
                 .file(interpreter_fd)
@@ -2017,7 +2033,11 @@ fn revalidate_glibc_pins(
         let retained = leases
             .file(*fd)
             .ok_or_else(|| anyhow!("retained hardened glibc runtime fd is missing"))?;
-        let candidates = runtime_candidates(search_files.iter().copied(), name, owner)?;
+        let candidates = if name == OsStr::new(GLIBC_LOADER) {
+            loader_candidates(authority)?
+        } else {
+            runtime_candidates(search_files.iter().copied(), name, owner)?
+        };
         if name == OsStr::new(GLIBC_LOADER) {
             pinned_loader_candidate(retained, candidates)?;
         } else {
@@ -3052,6 +3072,39 @@ mod tests {
             .open_regular(Path::new("/link0/ld-linux-x86-64.so.2"), false)
             .unwrap_err();
         assert!(error.to_string().contains("symlink"), "{error:#}");
+    }
+
+    #[test]
+    fn glibc_loader_search_accepts_protected_parent_symlink_to_pinned_interpreter() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        for directory in ["usr", "usr/lib", "usr/lib/x86_64-linux-gnu", "usr/lib64"] {
+            std::fs::create_dir_all(root.path().join(directory)).unwrap();
+            std::fs::set_permissions(
+                root.path().join(directory),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let loader = root
+            .path()
+            .join("usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2");
+        std::fs::copy("/bin/true", &loader).unwrap();
+        std::fs::set_permissions(&loader, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("usr/lib64", root.path().join("lib64")).unwrap();
+        std::os::unix::fs::symlink(
+            "../lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+            root.path().join("usr/lib64/ld-linux-x86-64.so.2"),
+        )
+        .unwrap();
+        let owner = unsafe { libc::geteuid() };
+        let authority = AuthorityRoot::open(root.path(), owner).unwrap();
+        let interpreter = authority
+            .open_regular(Path::new(GLIBC_INTERP), false)
+            .unwrap()
+            .unwrap();
+        let candidates = loader_candidates(&authority).unwrap();
+        pinned_loader_candidate(&interpreter, candidates).unwrap();
     }
 
     #[test]

@@ -15,7 +15,7 @@ set_suid_dumpable_zero() {
     case $SUID_DUMPABLE_ORIGINAL in 0|1|2) ;; *) return 1 ;; esac
     SUID_DUMPABLE_CHANGED=1
     if [ "$SUID_DUMPABLE_ORIGINAL" != 0 ]; then
-        printf '%s\n' 0 | sudo tee /proc/sys/fs/suid_dumpable >/dev/null || return 1
+        printf '%s\n' 0 | sudo -n tee /proc/sys/fs/suid_dumpable >/dev/null || return 1
     fi
     [ "$(cat /proc/sys/fs/suid_dumpable)" = 0 ] || {
         echo "privileged discovery requires /proc/sys/fs/suid_dumpable=0" >&2
@@ -26,7 +26,7 @@ set_suid_dumpable_zero() {
 restore_suid_dumpable() {
     [ -n "${SUID_DUMPABLE_CHANGED-}" ] || return 0
     if ! printf '%s\n' "$SUID_DUMPABLE_ORIGINAL" \
-        | sudo tee /proc/sys/fs/suid_dumpable >/dev/null \
+        | sudo -n tee /proc/sys/fs/suid_dumpable >/dev/null \
         || [ "$(cat /proc/sys/fs/suid_dumpable)" != "$SUID_DUMPABLE_ORIGINAL" ]; then
         echo "failed to restore /proc/sys/fs/suid_dumpable=$SUID_DUMPABLE_ORIGINAL" >&2
         return 1
@@ -76,9 +76,9 @@ create_trusted_exec_dir() {
     case ,$mount_options, in
         *,noexec,*) echo "/usr/local/bin is mounted noexec" >&2; return 1 ;;
     esac
-    destination=$(sudo mktemp -d /usr/local/bin/.p11scope.XXXXXXXX) || return 1
-    if ! sudo chmod 0755 "$destination"; then
-        sudo rmdir "$destination" 2>/dev/null || true
+    destination=$(sudo -n mktemp -d /usr/local/bin/.p11scope.XXXXXXXX) || return 1
+    if ! sudo -n chmod 0755 "$destination"; then
+        sudo -n rmdir "$destination" 2>/dev/null || true
         return 1
     fi
     printf '%s\n' "$destination"
@@ -86,9 +86,9 @@ create_trusted_exec_dir() {
 
 create_protected_output_dir() {
     validate_protected_parent /run || return 1
-    destination=$(sudo mktemp -d /run/p11scope-output.XXXXXXXX) || return 1
-    if ! sudo chmod 0700 "$destination"; then
-        sudo rmdir "$destination" 2>/dev/null || true
+    destination=$(sudo -n mktemp -d /run/p11scope-output.XXXXXXXX) || return 1
+    if ! sudo -n chmod 0700 "$destination"; then
+        sudo -n rmdir "$destination" 2>/dev/null || true
         return 1
     fi
     printf '%s\n' "$destination"
@@ -102,9 +102,19 @@ stage_trusted_p11scope() {
         echo "refusing unexpected executable staging path: $destination" >&2
         return 1
     }
-    sudo install -d -o root -g root -m 0755 "$destination"
-    sudo install -o root -g root -m 0755 "$observer" "$destination/p11scope"
-    sudo install -o root -g root -m 0755 "$helper" "$destination/p11scope-discover"
+    sudo -n install -d -o root -g root -m 0755 "$destination"
+    sudo -n install -o root -g root -m 0755 "$observer" "$destination/p11scope"
+    sudo -n install -o root -g root -m 0755 "$helper" "$destination/p11scope-discover"
+}
+
+stage_container_authority() {
+    source=$1
+    destination=$2
+    is_trusted_exec_destination "$destination" || {
+        echo "refusing unexpected executable staging path: $destination" >&2
+        return 1
+    }
+    sudo -n install -o root -g root -m 0555 "$source" "$destination/container-authority.py"
 }
 
 remove_trusted_p11scope() {
@@ -115,9 +125,10 @@ remove_trusted_p11scope() {
         return 1
     }
     rtp_status=0
-    sudo rm -f "$destination/p11scope" "$destination/p11scope-discover" \
+    sudo -n rm -f "$destination/p11scope" "$destination/p11scope-discover" \
+        "$destination/container-authority.py" \
         || rtp_status=$?
-    sudo rmdir "$destination" 2>/dev/null || {
+    sudo -n rmdir "$destination" 2>/dev/null || {
         rtp_rmdir_status=$?
         [ "$rtp_status" -ne 0 ] || rtp_status=$rtp_rmdir_status
     }
@@ -131,7 +142,7 @@ remove_trusted_exec_root() {
         echo "refusing unexpected executable staging path: $destination" >&2
         return 1
     }
-    sudo rmdir "$destination"
+    sudo -n rmdir "$destination"
 }
 
 remove_protected_output_dir() {
@@ -142,9 +153,9 @@ remove_protected_output_dir() {
         return 1
     }
     rpod_status=0
-    sudo find "$destination" -mindepth 1 -maxdepth 1 -type f -delete \
+    sudo -n find "$destination" -mindepth 1 -maxdepth 1 -type f -delete \
         || rpod_status=$?
-    sudo rmdir "$destination" || {
+    sudo -n rmdir "$destination" || {
         rpod_rmdir_status=$?
         [ "$rpod_status" -ne 0 ] || rpod_status=$rpod_rmdir_status
     }
@@ -158,6 +169,12 @@ cleanup_step() {
         CLEANUP_STATUS=$cleanup_step_status
     fi
     return 0
+}
+
+require_rewritten_authority_refusal() {
+    printf '%s\n' "$1" \
+        | grep -F "$2: cannot open the file now (" \
+        | grep -Fq "Permission denied"
 }
 
 publish_protected_file() {
@@ -178,7 +195,7 @@ publish_protected_file() {
         esac
     done
     PUBLISH_TMP=$(mktemp "$work_dir/.${destination}.XXXXXXXX") || return 1
-    if ! sudo cat "$run_dir/$source" > "$PUBLISH_TMP" \
+    if ! sudo -n cat "$run_dir/$source" > "$PUBLISH_TMP" \
         || ! mv -f "$PUBLISH_TMP" "$work_dir/$destination"; then
         rm -f -- "$PUBLISH_TMP"
         PUBLISH_TMP=
@@ -195,7 +212,7 @@ publish_protected_mapdump_lane() {
     ppml_run_dir=$1
     ppml_work_dir=$2
     ppml_lane=$3
-    for ppml_path in $(sudo find "$ppml_run_dir" -mindepth 1 -maxdepth 1 -type f \
+    for ppml_path in $(sudo -n find "$ppml_run_dir" -mindepth 1 -maxdepth 1 -type f \
         -name "mapdump_*_$ppml_lane.json" -print); do
         publish_protected_file "$ppml_run_dir" "${ppml_path##*/}" \
             "$ppml_work_dir" "${ppml_path##*/}"
@@ -226,6 +243,67 @@ PY
     PUBLISH_TMP=
 }
 
+is_protected_output_file() {
+    ipof_path=$1
+    ipof_parent=${ipof_path%/*}
+    ipof_leaf=${ipof_path##*/}
+    is_immediate_child "$ipof_parent" /run p11scope-output. || return 1
+    case $ipof_leaf in
+        ''|.*|*/*|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+}
+
+launch_root_recorded_process() {
+    lrrp_pidfile=$1
+    lrrp_log=$2
+    shift 2
+    is_protected_output_file "$lrrp_pidfile" || {
+        echo "refusing unexpected root process record: $lrrp_pidfile" >&2
+        return 1
+    }
+    sudo -n sh -c '
+        umask 077
+        starttime=$(awk '\''{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[20]; exit }'\'' "/proc/$$/stat") || exit 1
+        printf "%s %s\n" "$$" "$starttime" > "$1"
+        shift
+        exec "$@"
+    ' sh "$lrrp_pidfile" "$@" > "$lrrp_log" 2>&1 &
+    ROOT_LAUNCH_PID=$!
+    lrrp_record=$(wait_root_process_record "$lrrp_pidfile" "$ROOT_LAUNCH_PID") || {
+        lrrp_status=$?
+        kill "$ROOT_LAUNCH_PID" 2>/dev/null || true
+        wait "$ROOT_LAUNCH_PID" 2>/dev/null || true
+        ROOT_LAUNCH_PID=
+        return "$lrrp_status"
+    }
+    set -- $lrrp_record
+    [ "$#" -eq 2 ] || return 1
+    ROOT_PROCESS_PID=$1
+    ROOT_PROCESS_STARTTIME=$2
+}
+
+wait_root_process_record() {
+    wrpr_pidfile=$1
+    wrpr_launcher=$2
+    wrpr_attempt=0
+    while ! sudo -n test -s "$wrpr_pidfile" && [ "$wrpr_attempt" -lt 160 ]; do
+        kill -0 "$wrpr_launcher" 2>/dev/null || {
+            echo "root process exited before recording its identity" >&2
+            return 1
+        }
+        wrpr_attempt=$((wrpr_attempt + 1))
+        sleep 0.05
+    done
+    sudo -n test -s "$wrpr_pidfile" || {
+        echo "root process identity was not recorded" >&2
+        return 1
+    }
+    set -- $(sudo -n cat "$wrpr_pidfile")
+    [ "$#" -eq 2 ] || return 1
+    case $1:$2 in *[!0-9:]*) return 1 ;; esac
+    printf '%s %s\n' "$1" "$2"
+}
+
 process_starttime() {
     pst_pid=$1
     case $pst_pid in ''|*[!0-9]*) return 1 ;; esac
@@ -238,7 +316,7 @@ process_starttime() {
 root_process_starttime() {
     rpst_pid=$1
     case $rpst_pid in ''|*[!0-9]*) return 1 ;; esac
-    rpst_value=$(sudo awk '{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[20]; exit }' \
+    rpst_value=$(sudo -n awk '{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[20]; exit }' \
         "/proc/$rpst_pid/stat" 2>/dev/null) || return 1
     case $rpst_value in ''|*[!0-9]*) return 1 ;; esac
     printf '%s\n' "$rpst_value"
@@ -263,7 +341,7 @@ signal_pinned_process() {
     shift
     case $spp_privilege in
         user) spp_python=python3 ;;
-        root) spp_python='sudo python3' ;;
+        root) spp_python='sudo -n python3' ;;
         *) return 1 ;;
     esac
     $spp_python - "$@" <<'PY'

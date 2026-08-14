@@ -140,7 +140,8 @@ def load_canary(path, trace):
     return json.loads(records[0])
 
 
-def validate_clean_metrics(document, expected):
+def validate_clean_metrics(document, expected, multiplier=1):
+    require(multiplier >= 1, f"invalid clean-metrics multiplier: {multiplier}")
     require(document["schema"] == "pkcs11-scope/observed-profile/v1.1-metrics", document["schema"])
     require(document["capture"]["mode"] == "metrics", document["capture"])
     require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
@@ -156,11 +157,9 @@ def validate_clean_metrics(document, expected):
         require(item["names"], f"function without names: {item}")
         if calls:
             actual.update({name: calls for name in item["names"]})
-    wanted = dict(expected)
-    require(
-        wanted.setdefault("C_GetFunctionList", 1) == 1,
-        "C_GetFunctionList bootstrap count must be exactly 1",
-    )
+    wanted = {name: calls * multiplier for name, calls in expected.items()}
+    require("C_GetFunctionList" not in wanted, "expected-count file must omit bootstrap")
+    wanted["C_GetFunctionList"] = multiplier
     require(dict(actual) == wanted, f"positive function counts: want {wanted}, got {dict(actual)}")
 
 
@@ -332,6 +331,12 @@ def self_test():
     bad["functions"][0]["calls"] = 2
     rejected(lambda: validate_clean_metrics(bad, {"C_Initialize": 1}))
     print("bootstrap function exact count required: OK")
+    doubled = copy.deepcopy(clean)
+    for item in doubled["functions"]:
+        item["calls"] *= 2
+    validate_clean_metrics(doubled, {"C_Initialize": 1}, 2)
+    rejected(lambda: validate_clean_metrics(clean, {"C_Initialize": 1}, 2))
+    print("clean metrics multiplier is exact: OK")
 
     version = evidence_fixture(VERSION_SURFACES)
     version.update(table_entries=988, slots=104, attached_probes=208, vendor_interfaces=1, interface_list="ok")
@@ -442,15 +447,16 @@ def main(argv):
         self_test()
         return
     require(len(argv) >= 1, "usage: check-capture-evidence.py MODE ...")
-    if argv[0] == "clean-metrics" and len(argv) == 3:
-        validate_clean_metrics(load_json(argv[1]), expected_counts(argv[2]))
+    if argv[0] == "clean-metrics" and len(argv) in (3, 4):
+        multiplier = int(argv[3]) if len(argv) == 4 else 1
+        validate_clean_metrics(load_json(argv[1]), expected_counts(argv[2]), multiplier)
     elif argv[0] == "canary" and len(argv) == 3:
         trace = argv[1].endswith("-trace")
         validate_canary(argv[1], load_canary(argv[2], trace))
     elif argv[0] == "induced" and len(argv) == 3:
         validate_induced(argv[1], load_json(argv[2]))
     else:
-        raise AssertionError("usage: check-capture-evidence.py clean-metrics OUTPUT EXPECTED | canary LANE OUTPUT | induced G[1-5] OUTPUT | --self-test")
+        raise AssertionError("usage: check-capture-evidence.py clean-metrics OUTPUT EXPECTED [MULTIPLIER] | canary LANE OUTPUT | induced G[1-5] OUTPUT | --self-test")
 
 
 if __name__ == "__main__":

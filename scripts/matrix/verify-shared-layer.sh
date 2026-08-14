@@ -1,228 +1,258 @@
 #!/bin/sh
-# Phase 4 Task 3: shared-image-layer capture. Two containers from the same
-# image share libsofthsm2.so as one overlay2 inode; one attach must observe
-# both, and a scope naming only one container must exclude the other even
-# though the probe sits on an inode both use.
-#
-# Uses the same discover-inside-container + /proc/<pid>/root-prefix
-# approach as verify-docker.sh (see that script's header for why: no
-# --pid flag on p11scope-discover, so the container's mount view is
-# reached by running the helper inside it).
-#
-# Three captures, each a fresh `p11scope profile` invocation (attach is
-# not persisted across runs):
-#   1. BROAD:  --cgroup <shared parent slice>, one attach, harness run in
-#              BOTH containers -> proves the shared-inode claim: one
-#              attach observes both (counts == 2x spike/expected.txt).
-#   2. A-ONLY: --cgroup <container A's leaf>, harness run in BOTH
-#              containers concurrently -> B's calls happen on the same
-#              probed inode but must NOT appear (counts == 1x, not 2x).
-#              This is the negative isolation proof.
-#   3. B-ONLY: symmetric to 2, with A and B swapped -> together with 2
-#              this is the "two scoped runs" evidence (Task 3 brief) that
-#              per-container attribution is recoverable via cgroup scope,
-#              standing in for a not-yet-built cgroup_id breakdown
-#              (that consumer is Task 6; cgroup_id is already captured on
-#              every event per the phase plan's inherited facts).
+# Task 6: one shared image-layer inode, broad and leaf cgroup authority.
 set -eu
 cd "$(dirname "$0")/../.."
 
 MODULE_IN_CONTAINER=/usr/lib/softhsm/libsofthsm2.so
-PROVIDER_REAL_PATH=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
-WORK=target/matrix-shared
-TRUST_DIR="$PWD/$WORK/trusted"
-PROVENANCE_MODULE="$PWD/$WORK/provider-provenance.so"
-IMAGE=p11scope-matrix
-NAME_A=p11scope-matrix-shared-a
-NAME_B=p11scope-matrix-shared-b
-wa=
-wb=
-sp=
+RUN_ID=$(date +%s%N)-$$
+WORK="target/matrix-shared/$RUN_ID"
+IMAGE="p11scope-matrix-shared:$RUN_ID"
+NAME_A="p11scope-matrix-shared-a-$RUN_ID"
+NAME_B="p11scope-matrix-shared-b-$RUN_ID"
+CGROUP_PARENT="p11scope-shared-$RUN_ID.slice"
+PRODUCT=target/matrix-product
+SAFE_ROOT="$PWD/$WORK/provider-safe"
+TRUST_DIR=
+RUN_DIR=
+PROVENANCE_MODULE=
+WA=
+WB=
+SPID=
+SUPERVISOR_PID=
+SUPERVISOR_STARTTIME=
+ROOT_LAUNCH_PID=
+ROOT_PROCESS_PID=
+ROOT_PROCESS_STARTTIME=
+PUBLISH_TMP=
+IMAGE_CREATED=
+CONTAINER_A_STARTED=
+CONTAINER_B_STARTED=
 . scripts/trusted-p11scope.sh
 
-command -v docker >/dev/null || { echo "docker required"; exit 1; }
+require_non_root_caller
+for tool in cargo docker gcc python3 tar timeout; do
+    command -v "$tool" >/dev/null || { echo "$tool required"; exit 1; }
+done
+sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
+mkdir -p "$WORK/shared-a" "$WORK/shared-b"
+
+remove_owned_container() {
+    timeout --signal=TERM --kill-after=5s 30s docker rm -f "$1" >/dev/null 2>&1
+}
+
+remove_owned_image() {
+    timeout --signal=TERM --kill-after=5s 30s docker image rm "$IMAGE" >/dev/null 2>&1
+}
 
 cleanup() {
-    [ -z "$wa" ] || kill "$wa" 2>/dev/null || true
-    [ -z "$wb" ] || kill "$wb" 2>/dev/null || true
-    [ -z "$sp" ] || kill "$sp" 2>/dev/null || true
-    [ -z "$wa" ] || wait "$wa" 2>/dev/null || true
-    [ -z "$wb" ] || wait "$wb" 2>/dev/null || true
-    [ -z "$sp" ] || wait "$sp" 2>/dev/null || true
-    docker rm -f "$NAME_A" "$NAME_B" >/dev/null 2>&1 || true
-    remove_trusted_p11scope "$TRUST_DIR"
+    CLEANUP_STATUS=$?
+    trap - EXIT INT TERM
+    set +e
+    launcher=${SPID:-$ROOT_LAUNCH_PID}
+    recorded_pid=${SUPERVISOR_PID:-$ROOT_PROCESS_PID}
+    recorded_starttime=${SUPERVISOR_STARTTIME:-$ROOT_PROCESS_STARTTIME}
+    if [ -n "$recorded_pid" ] && [ -n "$recorded_starttime" ]; then
+        signal_verified_root_process TERM "$recorded_pid" "$recorded_starttime" \
+            2>/dev/null || true
+    fi
+    [ -z "$launcher" ] || wait "$launcher" 2>/dev/null || true
+    cleanup_step restore_suid_dumpable
+    [ -z "$CONTAINER_A_STARTED" ] || cleanup_step remove_owned_container "$NAME_A"
+    [ -z "$CONTAINER_B_STARTED" ] || cleanup_step remove_owned_container "$NAME_B"
+    [ -z "$WA" ] || wait "$WA" 2>/dev/null || true
+    [ -z "$WB" ] || wait "$WB" 2>/dev/null || true
+    [ -z "$IMAGE_CREATED" ] || cleanup_step remove_owned_image
+    [ -z "$PUBLISH_TMP" ] || cleanup_step rm -f -- "$PUBLISH_TMP"
+    cleanup_step remove_trusted_p11scope "$TRUST_DIR"
+    cleanup_step remove_protected_output_dir "$RUN_DIR"
+    exit "$CLEANUP_STATUS"
 }
-trap cleanup EXIT
+. scripts/cleanup-traps.sh
 
 echo "=== build product + workload ==="
-cargo build --release --workspace
-mkdir -p "$WORK/shared-a" "$WORK/shared-b"
-gcc -O0 -o "$WORK/harness" spike/harness.c -ldl
+rm -rf "$SAFE_ROOT"
+timeout --signal=TERM --kill-after=5s 600s cargo +1.88 build --locked --release \
+    --workspace --target-dir "$PRODUCT"
+timeout --signal=TERM --kill-after=5s 60s gcc -O0 -o "$WORK/harness" \
+    spike/harness.c -ldl
 
-echo "=== build container image ==="
-docker build -q -t "$IMAGE" -f scripts/matrix/Dockerfile scripts/matrix >/dev/null
-
-echo "=== start two containers from the same image, under one dedicated cgroup parent ==="
-cleanup
-docker run -d --rm --name "$NAME_A" --cgroup-parent=p11scope-shared.slice \
-    -v "$PWD/target/release/p11scope-discover:/usr/local/bin/p11scope-discover:ro" \
+echo "=== build and start two owned containers ==="
+IMAGE_CREATED=1
+timeout --signal=TERM --kill-after=5s 600s docker build -q -t "$IMAGE" \
+    -f scripts/matrix/Dockerfile scripts/matrix >/dev/null
+TRUST_DIR=$(create_trusted_exec_dir)
+RUN_DIR=$(create_protected_output_dir)
+stage_trusted_p11scope "$PRODUCT/release/p11scope" \
+    "$PRODUCT/release/p11scope-discover" "$TRUST_DIR"
+stage_container_authority scripts/container-authority.py "$TRUST_DIR"
+rm -f "$WORK/shared-a/go" "$WORK/shared-b/go"
+CONTAINER_A_STARTED=1
+timeout --signal=TERM --kill-after=5s 60s docker run -d --name "$NAME_A" \
+    --cgroup-parent="$CGROUP_PARENT" \
     -v "$PWD/$WORK/harness:/usr/local/bin/harness:ro" \
-    -v "$PWD/$WORK/shared-a:/shared" \
-    "$IMAGE" >/dev/null
-docker run -d --rm --name "$NAME_B" --cgroup-parent=p11scope-shared.slice \
+    -v "$PWD/$WORK/shared-a:/shared" "$IMAGE" >/dev/null
+CONTAINER_B_STARTED=1
+timeout --signal=TERM --kill-after=5s 60s docker run -d --name "$NAME_B" \
+    --cgroup-parent="$CGROUP_PARENT" \
     -v "$PWD/$WORK/harness:/usr/local/bin/harness:ro" \
-    -v "$PWD/$WORK/shared-b:/shared" \
-    "$IMAGE" >/dev/null
-PID_A=$(docker inspect -f '{{.State.Pid}}' "$NAME_A")
-PID_B=$(docker inspect -f '{{.State.Pid}}' "$NAME_B")
-echo "PID_A=$PID_A PID_B=$PID_B"
+    -v "$PWD/$WORK/shared-b:/shared" "$IMAGE" >/dev/null
+PID_A=$(timeout --signal=TERM --kill-after=5s 60s \
+    docker inspect -f '{{.State.Pid}}' "$NAME_A")
+PID_B=$(timeout --signal=TERM --kill-after=5s 60s \
+    docker inspect -f '{{.State.Pid}}' "$NAME_B")
+case $PID_A in ''|*[!0-9]*) echo "invalid container pid A: $PID_A"; exit 1 ;; esac
+case $PID_B in ''|*[!0-9]*) echo "invalid container pid B: $PID_B"; exit 1 ;; esac
+[ "$PID_A" -gt 0 ] && [ "$PID_B" -gt 0 ] || { echo "container pid is zero"; exit 1; }
 
-echo "=== verify the provider .so really is one shared overlay2 inode ==="
-INODE_A=$(docker exec "$NAME_A" stat -c %i "$PROVIDER_REAL_PATH")
-INODE_B=$(docker exec "$NAME_B" stat -c %i "$PROVIDER_REAL_PATH")
-echo "inode in A: $INODE_A"
-echo "inode in B: $INODE_B"
-if [ "$INODE_A" != "$INODE_B" ]; then
-    echo "BLOCKED: provider inode differs between containers ($INODE_A vs $INODE_B)."
-    echo "The image layer is not shared on this storage driver; this test would prove nothing."
-    docker info --format 'storage driver: {{.Driver}}'
+echo "=== prove the provider is one shared host inode ==="
+PROVIDER_REAL=$(timeout --signal=TERM --kill-after=5s 60s \
+    docker exec "$NAME_A" readlink -f -- "$MODULE_IN_CONTAINER")
+PROVIDER_REAL_B=$(timeout --signal=TERM --kill-after=5s 60s \
+    docker exec "$NAME_B" readlink -f -- "$MODULE_IN_CONTAINER")
+[ "$PROVIDER_REAL" = "$PROVIDER_REAL_B" ] \
+    || { echo "provider resolves differently: $PROVIDER_REAL vs $PROVIDER_REAL_B"; exit 1; }
+case $PROVIDER_REAL in /*/*) ;; *) echo "invalid resolved provider path: $PROVIDER_REAL"; exit 1 ;; esac
+DEVINO_A=$(sudo -n timeout --signal=TERM --kill-after=5s 60s \
+    stat -Lc '%d:%i' "/proc/$PID_A/root$PROVIDER_REAL")
+DEVINO_B=$(sudo -n timeout --signal=TERM --kill-after=5s 60s \
+    stat -Lc '%d:%i' "/proc/$PID_B/root$PROVIDER_REAL")
+INODE_A=${DEVINO_A#*:}
+INODE_B=${DEVINO_B#*:}
+[ "$INODE_A" = "$INODE_B" ] || {
+    echo "BLOCKED: provider overlay inode differs ($DEVINO_A vs $DEVINO_B)"
     exit 1
-fi
-echo "confirmed: both containers see the same provider inode ($INODE_A) -- storage driver $(docker info --format '{{.Driver}}')"
+}
+echo "shared provider overlay inode: $INODE_A (host identities $DEVINO_A vs $DEVINO_B)"
 
-echo "=== discover once, inside container A's mount view ==="
-docker exec "$NAME_A" p11scope-discover --module "$MODULE_IN_CONTAINER" \
-    > "$WORK/shared-a/manifest.json"
-test -s "$WORK/shared-a/manifest.json" || { echo "manifest not produced"; exit 1; }
-rm -f "$PROVENANCE_MODULE"
-docker cp -L "$NAME_A:$MODULE_IN_CONTAINER" "$PROVENANCE_MODULE"
+echo "=== copy resolved provider directory and discover on the host ==="
+PROVIDER_DIR=${PROVIDER_REAL%/*}
+PROVIDER_BASE=${PROVIDER_REAL##*/}
+mkdir -p "$SAFE_ROOT"
+timeout --signal=TERM --kill-after=5s 60s docker exec "$NAME_A" \
+    tar -h -c -f - -C "$PROVIDER_DIR" . > "$WORK/provider.tar"
+tar -xf "$WORK/provider.tar" -C "$SAFE_ROOT"
+rm -f "$WORK/provider.tar"
+PROVENANCE_MODULE="$SAFE_ROOT/$PROVIDER_BASE"
 test -f "$PROVENANCE_MODULE" && [ ! -L "$PROVENANCE_MODULE" ] \
     || { echo "provenance module is not a regular copied file"; exit 1; }
-stage_trusted_p11scope target/release/p11scope \
-    target/release/p11scope-discover "$TRUST_DIR"
+timeout --signal=TERM --kill-after=5s 60s python3 \
+    scripts/container-authority.py validate-copy "$SAFE_ROOT" "$PROVENANCE_MODULE"
+timeout --signal=TERM --kill-after=5s 60s "$TRUST_DIR/p11scope" discover \
+    --module "$PROVENANCE_MODULE" \
+    -o "$WORK/.manifest-safe.json"
+timeout --signal=TERM --kill-after=5s 60s python3 scripts/container-authority.py rewrite \
+    "$WORK/.manifest-safe.json" "$WORK/.manifest-host.json" \
+    "$SAFE_ROOT" "/proc/$PID_A/root$PROVIDER_DIR"
+sudo -n install -o root -g root -m 0600 "$WORK/.manifest-host.json" \
+    "$RUN_DIR/manifest-host.json"
+rm -f "$WORK/.manifest-safe.json" "$WORK/.manifest-host.json"
+sudo -n timeout --signal=TERM --kill-after=5s 60s \
+    python3 "$TRUST_DIR/container-authority.py" lease-evidence \
+    "$RUN_DIR/manifest-host.json" "$RUN_DIR/lease-evidence.json"
+publish_protected_file "$RUN_DIR" lease-evidence.json "$WORK" lease-evidence.json
+publish_protected_file "$RUN_DIR" manifest-host.json "$WORK" manifest-host.json
 
-echo "=== rewrite manifest object paths with /proc/<A's pid>/root prefix ==="
-python3 - "$WORK/shared-a/manifest.json" "$WORK/manifest-host.json" "/proc/$PID_A/root" <<'PY'
-import json, sys
-inp, outp, prefix = sys.argv[1], sys.argv[2], sys.argv[3]
-m = json.load(open(inp))
-m["module_path"] = prefix + m["module_path"]
-for o in m["objects"]:
-    o["path"] = prefix + o["path"]
-json.dump(m, open(outp, "w"))
-PY
-
-echo "=== resolve cgroup paths: the shared parent, and each container's leaf ==="
-CGROUP_A_REL=$(sed 's/^0:://' "/proc/$PID_A/cgroup")
-CGROUP_B_REL=$(sed 's/^0:://' "/proc/$PID_B/cgroup")
-CGROUP_PARENT_REL=$(dirname "$CGROUP_A_REL")
-BROAD_PATH="/sys/fs/cgroup$CGROUP_PARENT_REL"
+echo "=== resolve and compare broad/leaf cgroups ==="
+CGROUP_A_REL=$(awk -F: '$1 == "0" && $2 == "" { print $3; exit }' "/proc/$PID_A/cgroup")
+CGROUP_B_REL=$(awk -F: '$1 == "0" && $2 == "" { print $3; exit }' "/proc/$PID_B/cgroup")
+case $CGROUP_A_REL:$CGROUP_B_REL in /*:/*) ;; *) echo "unified container cgroups missing"; exit 1 ;; esac
+CGROUP_A_PARENT=${CGROUP_A_REL%/*}
+CGROUP_B_PARENT=${CGROUP_B_REL%/*}
+[ "$CGROUP_A_PARENT" = "$CGROUP_B_PARENT" ] || {
+    echo "shared cgroup parent differs: $CGROUP_A_PARENT vs $CGROUP_B_PARENT"
+    exit 1
+}
+BROAD_PATH="/sys/fs/cgroup$CGROUP_A_PARENT"
 LEAF_A_PATH="/sys/fs/cgroup$CGROUP_A_REL"
 LEAF_B_PATH="/sys/fs/cgroup$CGROUP_B_REL"
-for p in "$BROAD_PATH" "$LEAF_A_PATH" "$LEAF_B_PATH"; do
-    test -d "$p" || { echo "cgroup path does not exist: $p"; exit 1; }
+for path in "$BROAD_PATH" "$LEAF_A_PATH" "$LEAF_B_PATH"; do
+    test -d "$path" || { echo "cgroup path does not exist: $path"; exit 1; }
 done
-echo "broad (parent, covers both): $BROAD_PATH"
-echo "leaf A: $LEAF_A_PATH"
-echo "leaf B: $LEAF_B_PATH"
 
-# Runs one capture; $1 = label, $2 = --cgroup target, $3 = output json.
-# Always exercises BOTH containers' harnesses during the window, so a
-# narrow scope's "absence" is a real exclusion of live concurrent calls,
-# not just an artifact of nothing having run.
+echo "=== unprivileged diagnostic ==="
+set +e
+UNPRIV_OUT=$(timeout --signal=TERM --kill-after=5s 60s \
+    "$TRUST_DIR/p11scope" profile --manifest "$WORK/manifest-host.json" \
+    --provenance-module "$PROVENANCE_MODULE" --cgroup "$BROAD_PATH" \
+    --trusted-workload --mode metrics --duration 1 2>&1)
+UNPRIV_RC=$?
+set -e
+printf '%s\n' "$UNPRIV_OUT"
+[ "$UNPRIV_RC" -ne 0 ] || { echo "unprivileged profile unexpectedly succeeded"; exit 1; }
+require_rewritten_authority_refusal "$UNPRIV_OUT" "/proc/$PID_A/root$PROVIDER_REAL" \
+    || { echo "unprivileged failure missed the rewritten-object authority boundary"; exit 1; }
+
 run_capture() {
-    label=$1; cg=$2; out=$3
-    echo "--- capture: $label (scope=$cg) ---"
+    label=$1
+    cgroup=$2
+    multiplier=$3
+    echo "--- capture: $label (scope=$cgroup) ---"
     rm -f "$WORK/shared-a/go" "$WORK/shared-b/go"
-    ( while [ ! -f "$WORK/shared-a/go" ]; do sleep 0.05; done
-      docker exec "$NAME_A" /usr/local/bin/harness "$MODULE_IN_CONTAINER" ) &
-    wa=$!
-    ( while [ ! -f "$WORK/shared-b/go" ]; do sleep 0.05; done
-      docker exec "$NAME_B" /usr/local/bin/harness "$MODULE_IN_CONTAINER" ) &
-    wb=$!
-    sudo "$TRUST_DIR/p11scope" profile \
-        --manifest "$WORK/manifest-host.json" --cgroup "$cg" \
-        --provenance-module "$PROVENANCE_MODULE" \
-        --mode metrics --duration 20 -o "$out" \
-        > "$WORK/$label.log" 2>&1 &
-    sp=$!
-    sleep 3
+    timeout --signal=TERM --kill-after=5s 60s docker exec "$NAME_A" sh -c \
+        'while [ ! -f /shared/go ]; do sleep 0.05; done; exec /usr/local/bin/harness "$1"' \
+        sh "$MODULE_IN_CONTAINER" > "$WORK/$label-workload-a.log" 2>&1 &
+    WA=$!
+    timeout --signal=TERM --kill-after=5s 60s docker exec "$NAME_B" sh -c \
+        'while [ ! -f /shared/go ]; do sleep 0.05; done; exec /usr/local/bin/harness "$1"' \
+        sh "$MODULE_IN_CONTAINER" > "$WORK/$label-workload-b.log" 2>&1 &
+    WB=$!
+    set_suid_dumpable_zero
+    launch_root_recorded_process "$RUN_DIR/$label.pid" "$WORK/$label.log" \
+        timeout --signal=TERM --kill-after=35s 45s \
+        "$TRUST_DIR/p11scope" profile --manifest "$RUN_DIR/manifest-host.json" \
+        --provenance-module "$PROVENANCE_MODULE" --cgroup "$cgroup" \
+        --trusted-workload --mode metrics --duration 30 -o "$RUN_DIR/$label.json"
+    SPID=$ROOT_LAUNCH_PID
+    SUPERVISOR_PID=$ROOT_PROCESS_PID
+    SUPERVISOR_STARTTIME=$ROOT_PROCESS_STARTTIME
+    wait_for_capture_ready "$WORK/$label.log" aggregate-only metrics
     touch "$WORK/shared-a/go" "$WORK/shared-b/go"
-    if wait "$wa"; then wa=; else status=$?; wa=; echo "$label workload A failed: $status"; exit "$status"; fi
-    if wait "$wb"; then wb=; else status=$?; wb=; echo "$label workload B failed: $status"; exit "$status"; fi
-    if wait "$sp"; then sp=; else status=$?; sp=; echo "$label profiler failed: $status"; tail -n 20 "$WORK/$label.log"; exit "$status"; fi
-    tail -n 5 "$WORK/$label.log"
+    if wait "$WA"; then
+        WA=
+    else
+        status=$?
+        WA=
+        echo "$label workload A failed: $status"
+        cat "$WORK/$label-workload-a.log" || true
+        exit "$status"
+    fi
+    if wait "$WB"; then
+        WB=
+    else
+        status=$?
+        WB=
+        echo "$label workload B failed: $status"
+        cat "$WORK/$label-workload-b.log" || true
+        exit "$status"
+    fi
+    signal_verified_root_process INT "$SUPERVISOR_PID" "$SUPERVISOR_STARTTIME"
+    if wait "$SPID"; then
+        SPID=
+        SUPERVISOR_PID=
+        SUPERVISOR_STARTTIME=
+        ROOT_LAUNCH_PID=
+        ROOT_PROCESS_PID=
+        ROOT_PROCESS_STARTTIME=
+    else
+        status=$?
+        SPID=
+        SUPERVISOR_PID=
+        SUPERVISOR_STARTTIME=
+        ROOT_LAUNCH_PID=
+        ROOT_PROCESS_PID=
+        ROOT_PROCESS_STARTTIME=
+        echo "$label profiler failed: $status"
+        tail -n 30 "$WORK/$label.log" || true
+        exit "$status"
+    fi
+    restore_suid_dumpable
+    publish_protected_file "$RUN_DIR" "$label.json" "$WORK" "$label.json"
+    python3 scripts/check-capture-evidence.py clean-metrics \
+        "$WORK/$label.json" spike/expected.txt "$multiplier"
 }
 
-run_capture broad "$BROAD_PATH" "$WORK/observed-broad.json"
-run_capture a-only "$LEAF_A_PATH" "$WORK/observed-a-only.json"
-run_capture b-only "$LEAF_B_PATH" "$WORK/observed-b-only.json"
-
-echo "=== verify: positive (broad == 2x oracle) ==="
-python3 - "$WORK/observed-broad.json" spike/expected.txt 2 <<'PY'
-import json, sys
-obs = json.load(open(sys.argv[1]))
-mult = int(sys.argv[3])
-counts = {}
-for f in obs["functions"]:
-    for n in f["names"]:
-        counts[n] = counts.get(n, 0) + f["calls"]
-fail = 0
-for line in open(sys.argv[2]):
-    name, want = line.split()
-    want = int(want) * mult
-    got = counts.get(name, 0)
-    if got != want:
-        print(f"MISMATCH {name}: want {want}, got {got}")
-        fail = 1
-    else:
-        print(f"ok {name}: {got}")
-ev = obs["evidence"]
-print("evidence:", ev["attached_probes"], "probes,", ev["completeness"])
-if ev["attached_probes"] == 0 or ev["completeness"] != "COMPLETE":
-    print("evidence gap")
-    fail = 1
-sys.exit(fail)
-PY
-
-echo "=== verify: negative isolation (A-only == 1x, B-only == 1x, never 2x) ==="
-python3 - "$WORK/observed-a-only.json" "$WORK/observed-b-only.json" spike/expected.txt <<'PY'
-import json, sys
-a = json.load(open(sys.argv[1]))
-b = json.load(open(sys.argv[2]))
-
-def counts(obs):
-    c = {}
-    for f in obs["functions"]:
-        for n in f["names"]:
-            c[n] = c.get(n, 0) + f["calls"]
-    return c
-
-ca, cb = counts(a), counts(b)
-fail = 0
-for line in open(sys.argv[3]):
-    name, want = line.split()
-    want = int(want)
-    ga, gb = ca.get(name, 0), cb.get(name, 0)
-    if ga != want:
-        print(f"MISMATCH a-only {name}: want {want}, got {ga}")
-        fail = 1
-    if gb != want:
-        print(f"MISMATCH b-only {name}: want {want}, got {gb}")
-        fail = 1
-    if ga == want * 2 or gb == want * 2:
-        print(f"OVER-CAPTURE {name}: scoped run saw both containers' calls")
-        fail = 1
-    if fail == 0:
-        print(f"ok {name}: a-only={ga} b-only={gb} (isolated, both containers were live)")
-
-for label, obs in (("a-only", a), ("b-only", b)):
-    ev = obs["evidence"]
-    print(f"{label} evidence:", ev["attached_probes"], "probes,", ev["completeness"])
-    if ev["attached_probes"] == 0 or ev["completeness"] != "COMPLETE":
-        print(f"{label}: evidence gap")
-        fail = 1
-sys.exit(fail)
-PY
+run_capture broad "$BROAD_PATH" 2
+run_capture a-only "$LEAF_A_PATH" 1
+run_capture b-only "$LEAF_B_PATH" 1
 
 echo "=== shared-layer: ALL OK ==="

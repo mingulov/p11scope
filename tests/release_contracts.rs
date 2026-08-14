@@ -129,9 +129,9 @@ fn release_packages_and_smokes_the_documented_helper_path() {
 fn task6_protected_staging_allocators_separate_exec_and_output_mounts() {
     let helper = read("scripts/trusted-p11scope.sh");
     assert!(helper.contains("create_trusted_exec_dir"));
-    assert!(helper.contains("sudo mktemp -d /usr/local/bin/.p11scope.XXXXXXXX"));
+    assert!(helper.contains("sudo -n mktemp -d /usr/local/bin/.p11scope.XXXXXXXX"));
     assert!(helper.contains("create_protected_output_dir"));
-    assert!(helper.contains("sudo mktemp -d /run/p11scope-output.XXXXXXXX"));
+    assert!(helper.contains("sudo -n mktemp -d /run/p11scope-output.XXXXXXXX"));
     assert!(helper.contains("noexec"));
     assert!(helper.contains("remove_trusted_exec_root"));
     assert!(helper.contains("remove_protected_output_dir"));
@@ -296,7 +296,7 @@ fn task6_review_staging_paths_are_exact_and_publication_is_shared() {
     assert!(helper.contains("publish_protected_file"));
     assert!(helper.contains("mktemp \"$work_dir/.${destination}.XXXXXXXX\""));
     assert!(helper.contains("validate_protected_parent /run"));
-    assert!(helper.contains("sudo rmdir \"$destination\""));
+    assert!(helper.contains("sudo -n rmdir \"$destination\""));
 
     for path in [
         "scripts/build-release.sh",
@@ -579,6 +579,7 @@ fn task6_review_capture_evidence_checker_self_tests_exact_allowances() {
     for marker in [
         "unexpected positive function rejected: OK",
         "bootstrap function exact count required: OK",
+        "clean metrics multiplier is exact: OK",
         "canary matrix 988/104/208 with 13 mixed surfaces: OK",
         "canary safe exact allowances: OK",
         "canary unsafe exact allowances: OK",
@@ -738,6 +739,11 @@ fn task6_review_host_shell_syntax_is_checked_as_one_set() {
         "scripts/verify-attach-e2e.sh",
         "scripts/verify-canaries.sh",
         "scripts/verify-induced-gaps.sh",
+        "scripts/verify-discover-containers.sh",
+        "scripts/matrix/verify-docker.sh",
+        "scripts/matrix/verify-shared-layer.sh",
+        "scripts/matrix/verify-kind-pod.sh",
+        "scripts/matrix/verify-knative.sh",
     ] {
         let status = Command::new("sh")
             .args(["-n", path])
@@ -1156,9 +1162,203 @@ fn spike_count_check_refuses_missing_inputs() {
 fn container_discovery_covers_all_table_sizes_and_nonstandard_names() {
     let script = read("scripts/verify-discover-containers.sh");
     assert!(script.contains("version_matrix.c"));
+    assert!(script.contains("rust:1.88.0-bookworm"));
+    assert!(script.contains("rust:1.88.0-alpine"));
+    assert!(script.contains("cargo +1.88 vendor --locked"));
+    assert!(script.matches("cargo build --locked --release").count() >= 2);
+    assert!(script.matches("--offline").count() >= 2);
+    assert_eq!(script.matches("run_discover() {").count(), 2);
+    assert_eq!(script.matches("run_discover --module").count(), 4);
+    assert_eq!(script.matches("setpriv --reuid=65534").count(), 2);
     for marker in ["68", "92", "104", "corroborated_standard_prefix"] {
         assert!(script.contains(marker), "container gate misses {marker}");
     }
+}
+
+#[test]
+fn task6_container_authority_rewrites_only_attach_paths_and_proves_leases() {
+    let output = run_ok(
+        "python3",
+        &["scripts/container-authority.py", "--self-test"],
+    );
+    for marker in [
+        "container safe-copy validation: OK",
+        "manifest attach-path rewrite: OK",
+        "read-lease and filesystem evidence: OK",
+    ] {
+        assert!(
+            output.contains(marker),
+            "container authority self-test misses {marker}"
+        );
+    }
+    let helper = read("scripts/container-authority.py");
+    assert!(helper.contains("os.O_PATH"));
+    assert!(helper.contains("/proc/self/fd/{pinned}"));
+}
+
+#[test]
+fn task6_container_lanes_share_the_protected_authority_pipeline() {
+    for path in [
+        "scripts/matrix/verify-docker.sh",
+        "scripts/matrix/verify-shared-layer.sh",
+        "scripts/matrix/verify-kind-pod.sh",
+        "scripts/matrix/verify-knative.sh",
+    ] {
+        let script = read(path);
+        for marker in [
+            "create_trusted_exec_dir",
+            "create_protected_output_dir",
+            "stage_container_authority",
+            "scripts/container-authority.py rewrite",
+            "$TRUST_DIR/container-authority.py\" lease-evidence",
+            "--trusted-workload",
+            "wait_for_capture_ready",
+            "publish_protected_file",
+            "check-capture-evidence.py clean-metrics",
+            "cargo +1.88 build --locked",
+            "timeout --signal=TERM --kill-after=5s",
+            ". scripts/cleanup-traps.sh",
+            "require_rewritten_authority_refusal \"$UNPRIV_OUT\"",
+            "date +%s%N",
+        ] {
+            assert!(script.contains(marker), "{path} misses {marker}");
+        }
+        assert!(
+            script.contains("-o \"$RUN_DIR/"),
+            "{path} writes root output outside RUN_DIR"
+        );
+        assert!(!script.contains("completeness\"] != \"COMPLETE\""));
+        assert!(!script.contains("sleep 3            # let attach complete"));
+        let validation = script
+            .find("container-authority.py validate-copy")
+            .unwrap_or_else(|| panic!("{path} does not validate its safe copy"));
+        let discovery = script
+            .find("p11scope\" discover")
+            .unwrap_or_else(|| panic!("{path} does not discover on the host"));
+        assert!(
+            validation < discovery,
+            "{path} validates after provider loading"
+        );
+        assert!(
+            script.contains("UNPRIV_OUT=$(timeout --signal=TERM --kill-after=5s"),
+            "{path} leaves the diagnostic unbounded"
+        );
+        assert_eq!(
+            script.matches("--cgroup \"").count(),
+            script.matches("--trusted-workload").count(),
+            "{path} has a cgroup command without its trusted-workload acknowledgement"
+        );
+    }
+
+    let trusted = read("scripts/trusted-p11scope.sh");
+    assert!(trusted.contains("require_rewritten_authority_refusal() {"));
+    assert!(trusted.contains("cannot open the file now ("));
+    assert!(trusted.contains("grep -Fq \"Permission denied\""));
+
+    let shared = read("scripts/matrix/verify-shared-layer.sh");
+    assert!(shared.contains("stat -Lc '%d:%i'"));
+    assert!(shared.contains("INODE_A=${DEVINO_A#*:}"));
+    assert!(shared.contains("[ \"$INODE_A\" = \"$INODE_B\" ]"));
+    assert!(!shared.contains("[ \"$DEVINO_A\" = \"$DEVINO_B\" ]"));
+    assert!(shared.contains("shared provider overlay inode:"));
+    assert!(shared.contains("host identities $DEVINO_A vs $DEVINO_B"));
+    assert!(shared.contains("shared cgroup parent differs"));
+
+    for path in [
+        "scripts/matrix/verify-docker.sh",
+        "scripts/matrix/verify-shared-layer.sh",
+    ] {
+        let script = read(path);
+        assert!(
+            script.contains("timeout --signal=TERM --kill-after=35s 45s"),
+            "{path} gives SIGINT cleanup less time than the observer contract"
+        );
+    }
+
+    for path in [
+        "scripts/matrix/verify-kind-pod.sh",
+        "scripts/matrix/verify-knative.sh",
+    ] {
+        let script = read(path);
+        assert!(script.contains("KUBECONFIG=\"$PWD/$WORK/kubeconfig\""));
+        assert!(script.contains("cleanup_step rm -f -- \"$KUBECONFIG\""));
+    }
+    let knative = read("scripts/matrix/verify-knative.sh");
+    assert!(knative.contains("IMAGE=\"kind.local/p11scope-matrix-knative:$TOKEN\""));
+    assert!(knative.contains("ANCHOR_KEY"));
+    assert!(knative.contains("ANCHOR_INODE=${ANCHOR_KEY#*:}"));
+    assert!(knative.contains("[ \"$ANCHOR_INODE\" = \"$NEW_INODE\" ]"));
+    assert!(!knative.contains("[ \"$ANCHOR_KEY\" = \"$NEW_KEY\" ]"));
+    assert!(knative.contains("cold pod provider overlay inode:"));
+    assert!(knative.contains("host identities $ANCHOR_KEY vs $NEW_KEY"));
+    assert!(!knative.contains("snapshots/"));
+    assert!(!knative.contains("SNAP_PATH"));
+}
+
+#[test]
+fn task6_container_root_launcher_returns_its_pinned_identity() {
+    let directory = tempfile::tempdir().expect("launcher directory");
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            r#"
+set -eu
+. scripts/trusted-p11scope.sh
+is_protected_output_file() { return 0; }
+sudo() { [ "$1" != -n ] || shift; "$@"; }
+directory=$1
+launch_root_recorded_process "$directory/pid" "$directory/log" sh -c 'sleep 0.1'
+case $ROOT_LAUNCH_PID:$ROOT_PROCESS_PID:$ROOT_PROCESS_STARTTIME in
+    *[!0-9:]*) exit 1 ;;
+esac
+root_process_matches_starttime "$ROOT_PROCESS_PID" "$ROOT_PROCESS_STARTTIME"
+wait "$ROOT_LAUNCH_PID"
+"#,
+            "sh",
+        ])
+        .arg(directory.path())
+        .output()
+        .expect("exercise recorded root launcher");
+    assert!(
+        output.status.success(),
+        "recorded launcher failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn task6_knative_proves_zero_service_pods_immediately_before_attach() {
+    let script = read("scripts/matrix/verify-knative.sh");
+    assert!(!script.contains("grep -vc Terminating || true"));
+    assert!(!script.contains("autoscaling.knative.dev/scale-to-zero-grace-period"));
+    assert!(script.contains("timeoutSeconds: 10"));
+    assert!(script.contains("while [ \"$attempt\" -lt 36 ]"));
+    let zero_before_launch = script
+        .find("service pods appeared before attach")
+        .expect("Knative lane does not repeat the zero-pod assertion");
+    let launch = script
+        .find("set_suid_dumpable_zero")
+        .expect("Knative launch marker");
+    assert!(
+        zero_before_launch < launch,
+        "Knative checks zero pods after launching the observer"
+    );
+    let ready = script
+        .rfind("wait_for_capture_ready")
+        .expect("Knative readiness marker");
+    let zero_after_ready = script
+        .find("service pods appeared after attach readiness")
+        .expect("Knative does not prove zero pods at attach readiness");
+    let attach_ready = script
+        .find("ATTACH_READY=")
+        .expect("attach-ready timestamp");
+    assert!(ready < zero_after_ready && zero_after_ready < attach_ready);
+    let request = script.find("curl -fsS").expect("cold-start request");
+    let new_pod = script.find("NEWPOD_TS=").expect("new-pod timestamp");
+    let comparison = script
+        .find("if created <= attach:")
+        .expect("strict post-attach pod comparison");
+    assert!(attach_ready < request && request < new_pod && new_pod < comparison);
 }
 
 #[test]
@@ -1242,9 +1442,10 @@ fn privileged_and_namespace_gates_preserve_manifest_provenance() {
     ] {
         let script = read(path);
         assert!(
-            script.contains("docker cp -L"),
-            "{path} can stage a dangling provider symlink"
+            script.contains("tar -h"),
+            "{path} does not dereference the adjacent provider closure"
         );
+        assert!(script.contains("scripts/container-authority.py rewrite"));
         assert!(script.contains("[ ! -L \"$PROVENANCE_MODULE\" ]"));
     }
     for path in ["src/main.rs", "src/discover_cmd.rs"] {

@@ -662,6 +662,82 @@ fn worker_panic_removes_the_profile_temp_and_exits_101() {
 }
 
 #[test]
+fn failed_record_allows_a_delayed_nonzero_exit_status() {
+    let _serial = FORK_TEST.lock().unwrap();
+    let dir = protected_tempdir();
+    let object = dir.path().join("leased.so");
+    let profile = dir.path().join("profile.json");
+    std::fs::copy("/bin/true", &object).unwrap();
+    let child_object = object.clone();
+    let child_profile = profile.clone();
+
+    let pid = spawn_single_threaded(move || {
+        let signals = p11scope::verify::CaptureSignals::block().unwrap();
+        let objects = p11scope::verify::check_reuse(&manifest_for(&child_object)).unwrap();
+        let output = p11scope::verify::SupervisorOutput::profile(Some(child_profile)).unwrap();
+        let outcome = p11scope::verify::supervise_capture(signals, objects, output, |worker| {
+            worker
+                .output()
+                .unwrap()
+                .write_all(b"partial")
+                .map_err(|error| error.to_string())?;
+            send_worker_control(b'F')?;
+            std::thread::sleep(Duration::from_millis(50));
+            unsafe { libc::_exit(23) }
+        })
+        .unwrap();
+        finish(outcome)
+    });
+
+    let status = wait_status_bounded(pid);
+    assert!(libc::WIFEXITED(status));
+    assert_eq!(libc::WEXITSTATUS(status), 23);
+    assert!(!profile.exists());
+}
+
+#[test]
+fn failed_record_followed_by_zero_is_a_protocol_error() {
+    let _serial = FORK_TEST.lock().unwrap();
+    let dir = protected_tempdir();
+    let object = dir.path().join("leased.so");
+    let profile = dir.path().join("profile.json");
+    std::fs::copy("/bin/true", &object).unwrap();
+    let child_object = object.clone();
+    let child_profile = profile.clone();
+
+    let pid = spawn_single_threaded(move || {
+        let signals = p11scope::verify::CaptureSignals::block().unwrap();
+        let objects = p11scope::verify::check_reuse(&manifest_for(&child_object)).unwrap();
+        let output = p11scope::verify::SupervisorOutput::profile(Some(child_profile)).unwrap();
+        match p11scope::verify::supervise_capture(signals, objects, output, |worker| {
+            worker
+                .output()
+                .unwrap()
+                .write_all(b"partial")
+                .map_err(|error| error.to_string())?;
+            send_worker_control(b'F')?;
+            std::thread::sleep(Duration::from_millis(50));
+            unsafe { libc::_exit(0) }
+        }) {
+            Err(error) if error.contains("reported failure") => 0,
+            _ => 1,
+        }
+    });
+
+    let status = wait_status_bounded(pid);
+    assert!(libc::WIFEXITED(status));
+    assert_eq!(libc::WEXITSTATUS(status), 0);
+    assert!(!profile.exists());
+    assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("p11scope")
+    }));
+}
+
+#[test]
 fn externally_killed_worker_releases_lease_cleans_profile_and_mirrors_sigkill() {
     let _serial = FORK_TEST.lock().unwrap();
     let dir = protected_tempdir();

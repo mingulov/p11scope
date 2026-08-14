@@ -6,11 +6,11 @@ use p11scope_manifest::identity::{
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::FileExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 const GLIBC_INTERP: &str = "/lib64/ld-linux-x86-64.so.2";
 const GLIBC_LOADER: &str = "ld-linux-x86-64.so.2";
@@ -1627,9 +1627,9 @@ impl FixedDirectory {
 pub(crate) struct PreparedGlibc<'a> {
     // This guard must clean its child before any retained path or lease can drop.
     private: PrivateAliasDir,
-    leases: &'a crate::discover_cmd::ClosureLeases,
+    leases: &'a mut crate::discover_cmd::ClosureLeases,
     authority: AuthorityRoot,
-    helper_path: &'a Path,
+    helper_path: PathBuf,
     helper_fd: RawFd,
     runtime_fds: BTreeMap<OsString, RawFd>,
     search_directories: Vec<FixedDirectory>,
@@ -1642,7 +1642,7 @@ impl PreparedGlibc<'_> {
     pub(crate) fn revalidate(&self) -> Result<()> {
         revalidate_glibc_pins(
             &self.authority,
-            self.helper_path,
+            &self.helper_path,
             self.helper_fd,
             &self.runtime_fds,
             &self.search_directories,
@@ -1654,6 +1654,46 @@ impl PreparedGlibc<'_> {
         self.private.revalidate()
     }
 
+    pub(crate) fn ensure_leases(&self) -> Result<()> {
+        self.leases.ensure().map_err(anyhow::Error::msg)
+    }
+
+    #[allow(dead_code, reason = "polled by the hardened child supervisor in C3.3")]
+    pub(crate) fn lease_event_fd(&self) -> BorrowedFd<'_> {
+        self.leases.event_fd()
+    }
+
+    #[allow(dead_code, reason = "polled by the hardened child supervisor in C3.3")]
+    pub(crate) fn take_lease_break(&self) -> Result<bool, String> {
+        self.leases.take_break()
+    }
+
+    pub(crate) fn helper_fd(&self) -> RawFd {
+        self.helper_fd
+    }
+
+    pub(crate) fn loader_fd(&self) -> Result<RawFd> {
+        self.runtime_fds
+            .get(OsStr::new(GLIBC_LOADER))
+            .copied()
+            .ok_or_else(|| anyhow!("pinned hardened glibc interpreter fd is missing"))
+    }
+
+    pub(crate) fn private_directory_fd(&self) -> RawFd {
+        self.private.directory_fd()
+    }
+
+    pub(crate) fn runtime_fds(&self) -> impl Iterator<Item = RawFd> + '_ {
+        self.runtime_fds.values().copied()
+    }
+
+    pub(crate) fn alias_links(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
+        self.private
+            .aliases
+            .iter()
+            .map(|(name, expected)| (name.as_os_str(), expected.link_text.as_os_str()))
+    }
+
     pub(crate) fn cleanup(&mut self) -> Result<()> {
         self.private.cleanup()
     }
@@ -1661,7 +1701,7 @@ impl PreparedGlibc<'_> {
 
 pub(crate) fn prepare_glibc<'a>(
     helper: File,
-    helper_path: &'a Path,
+    helper_path: &Path,
     leases: &'a mut crate::discover_cmd::ClosureLeases,
 ) -> Result<PreparedGlibc<'a>> {
     if unsafe { libc::geteuid() } != 0 {
@@ -1676,7 +1716,7 @@ pub(crate) fn prepare_glibc<'a>(
 #[cfg(test)]
 pub(crate) fn prepare_glibc_test_root<'a>(
     root: &Path,
-    helper_path: &'a Path,
+    helper_path: &Path,
     owner: u32,
     leases: &'a mut crate::discover_cmd::ClosureLeases,
 ) -> Result<PreparedGlibc<'a>> {
@@ -1690,7 +1730,7 @@ pub(crate) fn prepare_glibc_test_root<'a>(
 fn prepare_glibc_in_root<'a>(
     authority: AuthorityRoot,
     helper: File,
-    helper_path: &'a Path,
+    helper_path: &Path,
     owner: u32,
     leases: &'a mut crate::discover_cmd::ClosureLeases,
 ) -> Result<PreparedGlibc<'a>> {
@@ -1781,7 +1821,7 @@ fn prepare_glibc_in_root<'a>(
         private,
         leases,
         authority,
-        helper_path,
+        helper_path: helper_path.to_path_buf(),
         helper_fd,
         runtime_fds,
         search_directories,

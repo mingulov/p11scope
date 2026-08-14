@@ -11,7 +11,7 @@ use pkcs11_module::{Surface, TableSet, tables_for};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsStr};
 use std::io::{Read as _, Write as _};
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
@@ -909,10 +909,10 @@ pub fn supervise_capture(
                     pidfd_send_signal(&pidfd, signal)?;
                     operator_deadline.get_or_insert_with(|| Instant::now() + OPERATOR_GRACE);
                 }
-                SupervisorEvent::Control(DONE) if !completed => completed = true,
+                SupervisorEvent::Control(DONE) if !completed && !worker_failed => completed = true,
                 SupervisorEvent::Control(FAILED) if !completed && !worker_failed => {
                     worker_failed = true;
-                    return Ok(());
+                    operator_deadline.get_or_insert_with(|| Instant::now() + OPERATOR_GRACE);
                 }
                 SupervisorEvent::Control(_) => {
                     malformed_completion = true;
@@ -930,12 +930,7 @@ pub fn supervise_capture(
     })();
 
     let mut supervisor_error = protocol.err();
-    if lease_broken
-        || worker_failed
-        || malformed_completion
-        || deadline_expired
-        || supervisor_error.is_some()
-    {
+    if lease_broken || malformed_completion || deadline_expired || supervisor_error.is_some() {
         if let Err(error) = pidfd_send_signal(&pidfd, libc::SIGKILL) {
             supervisor_error.get_or_insert(error);
         }
@@ -966,6 +961,11 @@ pub fn supervise_capture(
         return Ok(SupervisorOutcome::LeaseBroken);
     }
     let status = status?;
+    if worker_failed && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+        supervisor_error.get_or_insert_with(|| {
+            "capture worker reported failure but exited successfully".into()
+        });
+    }
     parent_output.finish(
         completed && !worker_failed && !malformed_completion && supervisor_error.is_none(),
         status,
@@ -1429,7 +1429,7 @@ impl LeaseMonitor {
 
 #[derive(Debug)]
 pub(crate) struct SynchronousLeaseMonitor {
-    blocked: libc::sigset_t,
+    event: OwnedFd,
     previous: libc::sigset_t,
 }
 
@@ -1455,7 +1455,18 @@ impl SynchronousLeaseMonitor {
                     std::io::Error::from_raw_os_error(error)
                 ));
             }
-            let monitor = Self { blocked, previous };
+            let fd = libc::signalfd(-1, &blocked, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK);
+            if fd == -1 {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+                return Err(format!(
+                    "creating provenance lease signalfd failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let monitor = Self {
+                event: OwnedFd::from_raw_fd(fd),
+                previous,
+            };
             if monitor.consume_signal()? {
                 object_changed_exit();
             }
@@ -1483,9 +1494,17 @@ impl SynchronousLeaseMonitor {
         &self,
         files: impl IntoIterator<Item = &'a std::fs::File>,
     ) -> Result<(), String> {
-        if self.consume_signal()? {
+        if self.take_break(files)? {
             object_changed_exit();
         }
+        Ok(())
+    }
+
+    pub(crate) fn take_break<'a>(
+        &self,
+        files: impl IntoIterator<Item = &'a std::fs::File>,
+    ) -> Result<bool, String> {
+        let mut broken = self.consume_signal()?;
         for file in files {
             let lease = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLEASE) };
             if lease == -1 {
@@ -1495,33 +1514,40 @@ impl SynchronousLeaseMonitor {
                 ));
             }
             if lease != libc::F_RDLCK {
-                object_changed_exit();
+                broken = true;
             }
         }
-        if self.consume_signal()? {
-            object_changed_exit();
-        }
-        Ok(())
+        let trailing = self.consume_signal()?;
+        Ok(broken || trailing)
+    }
+
+    #[allow(dead_code, reason = "polled by the hardened child supervisor in C3.3")]
+    pub(crate) fn event_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.event.as_fd()
     }
 
     fn consume_signal(&self) -> Result<bool, String> {
-        let timeout = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
         let mut consumed = false;
         loop {
-            // SAFETY: SIGIO is blocked in this thread and both pointers refer
-            // to initialized caller-owned values for the duration of the call.
-            let signal =
-                unsafe { libc::sigtimedwait(&self.blocked, std::ptr::null_mut(), &timeout) };
-            if signal == libc::SIGIO {
+            let mut info: libc::signalfd_siginfo = unsafe { std::mem::zeroed() };
+            // SAFETY: event is a nonblocking signalfd and info is writable for
+            // exactly the requested signalfd record size.
+            let read = unsafe {
+                libc::read(
+                    self.event.as_raw_fd(),
+                    (&mut info as *mut libc::signalfd_siginfo).cast(),
+                    std::mem::size_of::<libc::signalfd_siginfo>(),
+                )
+            };
+            if read == std::mem::size_of::<libc::signalfd_siginfo>() as isize
+                && info.ssi_signo == libc::SIGIO as u32
+            {
                 consumed = true;
                 continue;
             }
-            if signal == -1 {
+            if read == -1 {
                 let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::EAGAIN) {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
                     return Ok(consumed);
                 }
                 if error.kind() == std::io::ErrorKind::Interrupted {
@@ -1530,7 +1556,8 @@ impl SynchronousLeaseMonitor {
                 return Err(format!("reading provenance lease signal failed: {error}"));
             }
             return Err(format!(
-                "unexpected signal {signal} while reading provenance lease notifications"
+                "unexpected {read}-byte provenance lease signal record for signal {}",
+                info.ssi_signo
             ));
         }
     }

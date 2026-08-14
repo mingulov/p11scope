@@ -7,9 +7,11 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use p11scope_manifest::identity::{MappingFileKey, inspect_file, mapping_file_key, open_object};
 use p11scope_manifest::manifest::{Manifest, ProvenanceObject, SCHEMA};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::CString;
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::Read;
-use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
+use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, RawFd};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::os::unix::process::ExitStatusExt as _;
@@ -292,12 +294,23 @@ impl ClosureLeases {
     }
 
     pub(crate) fn ensure(&self) -> Result<(), String> {
-        self.monitor.ensure(
-            self.objects
-                .values()
-                .map(|object| &object.file)
-                .chain(self.influences.iter()),
-        )
+        self.monitor.ensure(self.files())
+    }
+
+    pub(crate) fn take_break(&self) -> Result<bool, String> {
+        self.monitor.take_break(self.files())
+    }
+
+    #[allow(dead_code, reason = "polled by the hardened child supervisor in C3.3")]
+    pub(crate) fn event_fd(&self) -> BorrowedFd<'_> {
+        self.monitor.event_fd()
+    }
+
+    fn files(&self) -> impl Iterator<Item = &File> {
+        self.objects
+            .values()
+            .map(|object| &object.file)
+            .chain(self.influences.iter())
     }
 }
 
@@ -490,6 +503,217 @@ fn rediscover_stable_with_helper(helper_path: &Path, module: &Path) -> Result<St
 fn rediscover_with_helper(helper_path: &Path, module: &Path) -> Result<Manifest> {
     let helper = open_trusted_helper(helper_path)?;
     rediscover_from_open_helper(helper, helper_path, module)
+}
+
+struct InheritedFd {
+    fd: RawFd,
+    device: libc::dev_t,
+    inode: libc::ino_t,
+    kind: libc::mode_t,
+}
+
+struct AliasLinkCheck {
+    directory: RawFd,
+    name: CString,
+    link: Vec<u8>,
+}
+
+struct HardenedChild<'prepared, 'leases> {
+    child: Child,
+    _prepared: &'prepared crate::oracle::PreparedGlibc<'leases>,
+    reaped: bool,
+}
+
+#[allow(dead_code, reason = "driven by the hardened child supervisor in C3.3")]
+impl HardenedChild<'_, '_> {
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    fn kill_and_wait(&mut self) -> std::io::Result<()> {
+        if self.reaped {
+            return Ok(());
+        }
+        if let Ok(pid) = i32::try_from(self.child.id()) {
+            // SAFETY: spawn_helper creates a process group whose id is the
+            // child pid. SIGKILL is uncatchable and wait reaps the leader.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        let _ = self.child.kill();
+        self.child.wait()?;
+        self.reaped = true;
+        Ok(())
+    }
+}
+
+impl Drop for HardenedChild<'_, '_> {
+    fn drop(&mut self) {
+        let _ = self.kill_and_wait();
+    }
+}
+
+impl<'leases> crate::oracle::PreparedGlibc<'leases> {
+    #[allow(dead_code, reason = "wired to the hardened child supervisor in C3.3")]
+    fn spawn_helper<'prepared>(
+        &'prepared self,
+        module: &Path,
+        child_control: BorrowedFd<'_>,
+    ) -> Result<HardenedChild<'prepared, 'leases>> {
+        let mut command = self.helper_command(module, child_control)?;
+        let child = command
+            .spawn()
+            .context("executing the pinned hardened discovery loader")?;
+        Ok(HardenedChild {
+            child,
+            _prepared: self,
+            reaped: false,
+        })
+    }
+
+    fn helper_command(&self, module: &Path, child_control: BorrowedFd<'_>) -> Result<Command> {
+        if !module.is_absolute() {
+            bail!("hardened discovery provider path must be absolute");
+        }
+        self.ensure_leases()?;
+        self.revalidate()?;
+        self.ensure_leases()?;
+        let loader = self.loader_fd()?;
+        let helper = self.helper_fd();
+        let directory = self.private_directory_fd();
+        let child_control = child_control.as_raw_fd();
+        let loader_path = format!("/proc/self/fd/{loader}");
+        let directory_path = format!("/proc/self/fd/{directory}");
+        let helper_path = format!("/proc/self/fd/{helper}");
+        let mut command = Command::new(loader_path);
+        command
+            .arg("--inhibit-cache")
+            .arg("--library-path")
+            .arg(directory_path)
+            .arg(helper_path)
+            .arg("--module")
+            .arg(module)
+            .arg("--control-fd")
+            .arg(child_control.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .env_clear();
+        configure_process_group(&mut command);
+        let mut inherited = self.runtime_fds().collect::<Vec<_>>();
+        inherited.extend([loader, helper, directory, child_control]);
+        let aliases = self
+            .alias_links()
+            .map(|(name, link)| {
+                Ok(AliasLinkCheck {
+                    directory,
+                    name: CString::new(name.as_bytes())
+                        .map_err(|_| anyhow!("private glibc alias contains NUL"))?,
+                    link: link.as_bytes().to_vec(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        configure_exact_inheritance(&mut command, inherited, aliases)?;
+        Ok(command)
+    }
+}
+
+fn configure_exact_inheritance(
+    command: &mut Command,
+    mut inherited: Vec<RawFd>,
+    aliases: Vec<AliasLinkCheck>,
+) -> Result<()> {
+    inherited.sort_unstable();
+    inherited.dedup();
+    let inherited = inherited
+        .into_iter()
+        .map(|fd| {
+            if fd <= libc::STDERR_FILENO || unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+                bail!("hardened discovery inherited fd {fd} is invalid or overlaps stdio");
+            }
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(fd, &mut stat) } == -1 {
+                return Err(std::io::Error::last_os_error())
+                    .context("pinning hardened discovery inherited fd identity");
+            }
+            Ok(InheritedFd {
+                fd,
+                device: stat.st_dev,
+                inode: stat.st_ino,
+                kind: stat.st_mode & libc::S_IFMT,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for alias in &aliases {
+        if !inherited
+            .iter()
+            .any(|identity| identity.fd == alias.directory)
+        {
+            bail!(
+                "private glibc alias directory fd {} is not inherited",
+                alias.directory
+            );
+        }
+    }
+    // SAFETY: the closure makes only async-signal-safe Linux syscalls. It runs
+    // after the other pre-exec hooks so no later hook can broaden inheritance.
+    unsafe {
+        command.pre_exec(move || {
+            for expected in &inherited {
+                let mut stat: libc::stat = std::mem::zeroed();
+                if libc::fstat(expected.fd, &mut stat) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if stat.st_dev != expected.device
+                    || stat.st_ino != expected.inode
+                    || stat.st_mode & libc::S_IFMT != expected.kind
+                {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESTALE));
+                }
+            }
+            for expected in &aliases {
+                let mut link = [0u8; 128];
+                let length = libc::readlinkat(
+                    expected.directory,
+                    expected.name.as_ptr(),
+                    link.as_mut_ptr().cast(),
+                    link.len(),
+                );
+                if length == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if length as usize != expected.link.len()
+                    || link[..length as usize] != expected.link
+                {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESTALE));
+                }
+            }
+            if libc::syscall(
+                libc::SYS_close_range,
+                3u32,
+                u32::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            ) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            for expected in &inherited {
+                let flags = libc::fcntl(expected.fd, libc::F_GETFD);
+                if flags == -1
+                    || libc::fcntl(expected.fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    Ok(())
 }
 
 fn rediscover_from_open_helper(
@@ -1115,7 +1339,194 @@ int main(void) {
     }
 
     #[test]
+    fn hardened_lease_break_can_be_taken_without_process_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("module.so");
+        let runtime = dir.path().join("runtime.so");
+        std::fs::copy("/bin/true", &module).unwrap();
+        std::fs::copy("/bin/false", &runtime).unwrap();
+        let mut leases = ClosureLeases::new(&module).unwrap();
+        let fd = leases
+            .retain_influence(std::fs::File::open(&runtime).unwrap(), "glibc runtime")
+            .unwrap();
+
+        #[repr(C)]
+        struct LeaseOwner {
+            kind: libc::c_int,
+            pid: libc::pid_t,
+        }
+        const F_OWNER_TID: libc::c_int = 0;
+        const F_SETOWN_EX: libc::c_int = 15;
+        // Libtest has other threads whose signal masks we do not own. Route
+        // this real break to the current blocked test thread; production uses
+        // process-directed SIGIO only after its single-thread gate.
+        let owner = LeaseOwner {
+            kind: F_OWNER_TID,
+            pid: unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t },
+        };
+        assert_eq!(unsafe { libc::fcntl(fd, F_SETOWN_EX, &owner) }, 0);
+
+        let mut writer = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec 3>\"$1\"")
+            .arg("sh")
+            .arg(&runtime)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut event = libc::pollfd {
+            fd: leases.event_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut event, 1, 1_000) }, 1);
+        assert_ne!(event.revents & libc::POLLIN, 0);
+        assert!(leases.take_break().unwrap());
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_UNLCK) },
+            0
+        );
+        assert!(writer.wait().unwrap().success());
+    }
+
+    #[test]
+    fn exact_inheritance_sweeps_every_unlisted_fd_at_exec() {
+        use std::os::unix::process::CommandExt as _;
+
+        let allowed = std::fs::File::open("/bin/true").unwrap();
+        let forbidden = std::fs::File::open("/bin/false").unwrap();
+        assert!(allowed.as_raw_fd() > 2 && forbidden.as_raw_fd() > 2);
+        let forbidden_fd = forbidden.as_raw_fd();
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf R; kill -STOP $$")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .env_clear();
+        // SAFETY: this test hook uses async-signal-safe fcntl calls and runs
+        // before the production exact-inheritance hook.
+        unsafe {
+            command.pre_exec(move || {
+                let flags = libc::fcntl(forbidden_fd, libc::F_GETFD);
+                if flags == -1
+                    || libc::fcntl(forbidden_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        configure_exact_inheritance(&mut command, vec![allowed.as_raw_fd()], Vec::new()).unwrap();
+
+        let mut child = command.spawn().unwrap();
+        let mut readable = libc::pollfd {
+            fd: child.stdout.as_ref().unwrap().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready_event = unsafe { libc::poll(&mut readable, 1, 5_000) };
+        if ready_event != 1 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert_eq!(ready_event, 1, "child did not reach the post-exec barrier");
+        let mut ready = [0u8; 1];
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        assert_eq!(ready, *b"R");
+        let actual = std::fs::read_dir(format!("/proc/{}/fd", child.id()))
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .parse::<RawFd>()
+                    .unwrap()
+            })
+            .collect::<BTreeSet<_>>();
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        assert_eq!(actual, BTreeSet::from([0, 1, 2, allowed.as_raw_fd()]));
+        assert!(!actual.contains(&forbidden_fd));
+    }
+
+    #[test]
+    fn cloexec_sweep_preserves_rusts_exec_error_pipe() {
+        let allowed = std::fs::File::open("/bin/true").unwrap();
+        let mut command = Command::new("/definitely/missing");
+        configure_exact_inheritance(&mut command, vec![allowed.as_raw_fd()], Vec::new()).unwrap();
+
+        let error = command.spawn().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+    }
+
+    #[test]
+    fn post_fork_fd_substitution_is_rejected_before_exec() {
+        use std::os::unix::process::CommandExt as _;
+
+        let allowed = std::fs::File::open("/bin/true").unwrap();
+        let replacement = std::fs::File::open("/bin/false").unwrap();
+        let allowed_fd = allowed.as_raw_fd();
+        let replacement_fd = replacement.as_raw_fd();
+        let mut command = Command::new("/bin/true");
+        // SAFETY: dup2 is async-signal-safe and deliberately mutates only the
+        // child fd table before the production identity check.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(replacement_fd, allowed_fd) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        configure_exact_inheritance(&mut command, vec![allowed_fd], Vec::new()).unwrap();
+
+        let error = command.spawn().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+    }
+
+    #[test]
+    fn post_fork_alias_retarget_is_rejected_before_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = std::fs::File::open(dir.path()).unwrap();
+        let target = std::fs::File::open("/bin/true").unwrap();
+        let replacement = std::fs::File::open("/bin/false").unwrap();
+        let alias = dir.path().join("libc.so.6");
+        let expected_link = format!("/proc/self/fd/{}", target.as_raw_fd());
+        std::os::unix::fs::symlink(&expected_link, &alias).unwrap();
+        let mut command = Command::new("/bin/true");
+        configure_exact_inheritance(
+            &mut command,
+            vec![directory.as_raw_fd(), target.as_raw_fd()],
+            vec![AliasLinkCheck {
+                directory: directory.as_raw_fd(),
+                name: CString::new("libc.so.6").unwrap(),
+                link: expected_link.into_bytes(),
+            }],
+        )
+        .unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(format!("/proc/self/fd/{}", replacement.as_raw_fd()), &alias)
+            .unwrap();
+
+        let error = command.spawn().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+    }
+
+    #[test]
     fn hardened_glibc_preflight_leases_revalidates_and_cleans_test_root() {
+        use std::os::fd::AsFd as _;
+
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         for directory in [
@@ -1139,7 +1550,40 @@ int main(void) {
         let module = root.path().join("opt/provider.so");
         let interpreter = root.path().join("lib64/ld-linux-x86-64.so.2");
         let libc = root.path().join("usr/lib/x86_64-linux-gnu/libc.so.6");
-        std::fs::copy("/bin/true", &helper).unwrap();
+        let helper_source = root.path().join("opt/p11scope-discover.c");
+        std::fs::write(
+            &helper_source,
+            r#"
+#include <signal.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(int argc, char **argv, char **envp) {
+    int envc = 0;
+    while (envp[envc] != NULL) envc++;
+    if (dprintf(1, "argc=%d\n", argc) < 0) return 2;
+    for (int i = 0; i < argc; i++) {
+        if (dprintf(1, "arg%d=%s\n", i, argv[i]) < 0) return 2;
+    }
+    if (dprintf(1, "envc=%d\npid=%ld\npgid=%ld\nSTOP\n",
+                envc, (long)getpid(), (long)getpgrp()) < 0) return 2;
+    if (raise(SIGSTOP) != 0) return 3;
+    return 0;
+}
+"#,
+        )
+        .unwrap();
+        let compiled = Command::new("gcc")
+            .args(["-O2", "-Wall", "-Werror", "-o"])
+            .arg(&helper)
+            .arg(&helper_source)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
         std::fs::copy("/bin/false", &module).unwrap();
         std::fs::copy("/lib64/ld-linux-x86-64.so.2", &interpreter).unwrap();
         std::fs::copy("/usr/lib/x86_64-linux-gnu/libc.so.6", &libc).unwrap();
@@ -1162,6 +1606,108 @@ int main(void) {
             &mut leases,
         )
         .unwrap();
+
+        let mut controls = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    controls.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let parent_control = unsafe { std::os::fd::OwnedFd::from_raw_fd(controls[0]) };
+        let child_control = unsafe { std::os::fd::OwnedFd::from_raw_fd(controls[1]) };
+        assert!(parent_control.as_raw_fd() > 2 && child_control.as_raw_fd() > 2);
+        let mut expected_fds = BTreeSet::from([
+            0,
+            1,
+            2,
+            prepared.helper_fd(),
+            prepared.loader_fd().unwrap(),
+            prepared.private_directory_fd(),
+            child_control.as_raw_fd(),
+        ]);
+        expected_fds.extend(prepared.runtime_fds());
+        let event_fd = prepared.lease_event_fd().as_raw_fd();
+        let helper_fd = prepared.helper_fd();
+        let control_fd = child_control.as_raw_fd();
+        let mut child = prepared
+            .spawn_helper(&module, child_control.as_fd())
+            .unwrap();
+        let pid = child.id();
+        let mut stdout = child.take_stdout().unwrap();
+        set_nonblocking(&stdout).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = Vec::new();
+        while !output.ends_with(b"STOP\n") {
+            let mut bytes = [0u8; 512];
+            match stdout.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(read) => output.extend_from_slice(&bytes[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        child.kill_and_wait().unwrap();
+                        panic!("hardened helper did not reach its stop barrier");
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("reading hardened helper facts failed: {error}"),
+            }
+        }
+        let mut status = 0;
+        let stopped = loop {
+            let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WUNTRACED) };
+            if waited == pid as libc::pid_t {
+                break libc::WIFSTOPPED(status);
+            }
+            if waited == -1
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            break false;
+        };
+        assert!(
+            stopped,
+            "hardened helper did not stop after reporting facts"
+        );
+        let expected_output = format!(
+            "argc=5\narg0=/proc/self/fd/{helper_fd}\narg1=--module\narg2={}\narg3=--control-fd\narg4={control_fd}\nenvc=0\npid={pid}\npgid={pid}\nSTOP\n",
+            module.display()
+        );
+        assert_eq!(String::from_utf8(output).unwrap(), expected_output);
+        assert_eq!(
+            unsafe { libc::getpgid(pid as libc::pid_t) },
+            pid as libc::pid_t
+        );
+        let actual_fds = std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .parse::<RawFd>()
+                    .unwrap()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual_fds, expected_fds);
+        assert!(!actual_fds.contains(&parent_control.as_raw_fd()));
+        assert!(!actual_fds.contains(&event_fd));
+        drop(child);
+        let mut reaped_status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut reaped_status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
 
         prepared.revalidate().unwrap();
         std::fs::write(root.path().join("etc/ld.so.preload"), []).unwrap();

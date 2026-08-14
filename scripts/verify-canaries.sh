@@ -6,9 +6,10 @@ set -eu
 cd "$(dirname "$0")/.."
 
 WORK=target/canaries
-TRUST_DIR="$PWD/$WORK/trusted"
-TRUST_UNSAFE_DIR="$PWD/$WORK/trusted-unsafe"
-RUN_DIR=/run/p11scope-canaries-$$
+TRUST_ROOT=
+TRUST_DIR=
+TRUST_UNSAFE_DIR=
+RUN_DIR=
 
 assert_lanes() {
     case ${1-} in
@@ -58,16 +59,6 @@ SAFE_MAPS = {
     "STATS",
 }
 FEATURE_MAPS = SAFE_MAPS | {"ATTR_BOOL_BITS", "TEMPLATE_TAIL"}
-ZERO_AGGREGATE_EVIDENCE = (
-    "event_loss", "start_insert_failures", "unmatched_returns",
-    "rv_update_failures", "cgroup_scope_failures", "semantic_capture_failures",
-    "unregistered_mechanisms", "template_tail_failures", "state_reconciliations",
-    "session_cancel_ambiguities", "session_cancel_unknown_flags",
-    "operation_state_imports", "auth_state_ambiguities", "async_target_failures",
-    "async_orphans", "async_duplicates", "async_evictions", "fork_state_ambiguities",
-    "semantic_state_drops", "pending_at_end", "malformed_records",
-    "shape_decode_failures", "shape_decode_total_failures",
-)
 EXPECTED_SENTINEL_FAMILIES = {
     "PIN", "KEY", "LABEL", "ID", "PLAINTEXT", "IV", "AAD", "BOOLLONG",
     "USERNAME", "CIPHERTEXT", "SIGNATURE", "WRAPPED", "RANDOM", "OUTPUT",
@@ -113,8 +104,10 @@ CALL_START_SIZE = 272
 EVENT_SIZE = 288
 
 
-def profile_terminal(doc):
-    assert doc["evidence"]["completeness"] == "PARTIAL", doc["evidence"]
+def profile_terminal(doc, schema="pkcs11-scope/observed-profile/v1.4"):
+    assert doc["schema"] == schema, doc["schema"]
+    ev = doc["evidence"]
+    assert ev["completeness"] == "PARTIAL", ev
 
 
 def trace_terminal(text, privacy):
@@ -124,8 +117,25 @@ def trace_terminal(text, privacy):
     ev = json.loads(records[0])
     assert ev["privacy_mode"] == privacy, ev
     assert ev["completeness"] == "PARTIAL", ev
+    assert ev["capture_aborted"] is None, ev
     assert ev["final_drain"] is False, ev
     assert ev["counters_available"] is True, ev
+    return ev
+
+
+def trace_abort_terminal(text, privacy):
+    records = [line.removeprefix("EVIDENCE ") for line in text.splitlines()
+               if line.startswith("EVIDENCE ")]
+    assert len(records) == 1, f"expected one terminal abort EVIDENCE record, got {len(records)}"
+    ev = json.loads(records[0])
+    assert ev == {
+        "completeness": "PARTIAL",
+        "privacy_mode": privacy,
+        "capture_aborted": "object_lease_break",
+        "final_drain": False,
+        "counters_available": False,
+        "event_loss": None,
+    }, ev
     return ev
 
 
@@ -143,7 +153,7 @@ def assert_safe_profile(doc):
     assert all(item["params"] is None for item in mechanisms.values()), mechanisms
     assert doc["templates"]["operations"] == [], doc["templates"]
     ev = doc["evidence"]
-    assert ev["unregistered_mechanisms"] >= 2, ev
+    assert ev["unregistered_mechanisms"] == 2, ev
     assert ev["semantic_capture_failures"] == 3, ev
     assert ev["async_target_failures"] == 2, ev
 
@@ -154,7 +164,7 @@ def assert_safe_trace(text):
     assert "C_DigestInit 0x250" in text, "registered mechanism missing from trace"
     for value in set(ALIASES.values()) | {MAXIMUM}:
         assert str(value) not in text and f"0x{value:x}" not in text, value
-    assert ev["unregistered_mechanisms"] >= 2, ev
+    assert ev["unregistered_mechanisms"] == 2, ev
     assert ev["semantic_capture_failures"] == 3, ev
     assert ev["async_target_failures"] == 2, ev
 
@@ -220,13 +230,8 @@ def assert_aggregate_metrics(doc):
     assert doc["schema"] == "pkcs11-scope/observed-profile/v1.1-metrics"
     assert doc["capture"]["mode"] == "metrics"
     assert doc["capture"]["privacy_mode"] == "aggregate-only"
-    profile_terminal(doc)
-    assert sum(item["calls"] for item in doc["functions"]) >= 25, doc["functions"]
-    ev = doc["evidence"]
-    assert {name: ev[name] for name in ZERO_AGGREGATE_EVIDENCE} == {
-        name: 0 for name in ZERO_AGGREGATE_EVIDENCE
-    }, ev
-    assert ev["templates_truncated"] is False, ev
+    profile_terminal(doc, "pkcs11-scope/observed-profile/v1.1-metrics")
+    assert sum(item["calls"] for item in doc["functions"]) == 25, doc["functions"]
 
 
 def read_json(path):
@@ -551,17 +556,26 @@ if work == "--self-test":
             return
         raise AssertionError(f"{label} mutation was accepted")
 
+    full_fixture = {
+        "attached_probes": 136, "table_entries": 68,
+        "surfaces": [{"walk": "full", "acquisition": "ok"}],
+        "shape_decode_failures": 0,
+    }
+
     def terminal(privacy, semantic, unregistered=0):
         return {
+            **full_fixture,
             "privacy_mode": privacy, "completeness": "PARTIAL",
+            "capture_aborted": None,
             "final_drain": False, "counters_available": True,
             "semantic_capture_failures": semantic,
             "unregistered_mechanisms": unregistered, "async_target_failures": 2,
         }
 
     safe = {
+        "schema": "pkcs11-scope/observed-profile/v1.4",
         "capture": {"mode": "profile", "privacy_mode": "allowlisted"},
-        "evidence": {"completeness": "PARTIAL", "unregistered_mechanisms": 2,
+        "evidence": {**full_fixture, "completeness": "PARTIAL", "unregistered_mechanisms": 2,
                      "semantic_capture_failures": 3, "async_target_failures": 2},
         "mechanisms": [{"mechanism": REGISTERED, "params": None}],
         "templates": {"operations": []},
@@ -594,6 +608,7 @@ if work == "--self-test":
          "aad_len": ALIASES["gcm240_aad"], "tag_bits": ALIASES["gcm240_tag"]},
     ]
     unsafe = {
+        "schema": "pkcs11-scope/observed-profile/v1.4",
         "capture": {"mode": "profile", "privacy_mode": "unsafe-unvalidated-metadata"},
         "evidence": {**terminal("unsafe-unvalidated-metadata", 7),
                      "templates_truncated": False},
@@ -637,17 +652,37 @@ if work == "--self-test":
         unsafe_trace.replace(missing, "removed", 1)
     ))
 
+    aborted = "CAPTURE privacy=allowlisted\nEVIDENCE " + json.dumps({
+        "completeness": "PARTIAL", "privacy_mode": "allowlisted",
+        "capture_aborted": "object_lease_break", "final_drain": False,
+        "counters_available": False, "event_loss": None,
+    })
+    trace_abort_terminal(aborted, "allowlisted")
+    for field, value in (("capture_aborted", None), ("final_drain", True),
+                         ("counters_available", True), ("event_loss", 0)):
+        mutated = json.loads(aborted.split("EVIDENCE ", 1)[1])
+        mutated[field] = value
+        reject(f"trace abort {field}", lambda mutated=mutated:
+               trace_abort_terminal("EVIDENCE " + json.dumps(mutated), "allowlisted"))
+    mutated = json.loads(aborted.split("EVIDENCE ", 1)[1])
+    mutated["unmatched_returns"] = 0
+    reject("trace abort fabricated counter", lambda:
+           trace_abort_terminal("EVIDENCE " + json.dumps(mutated), "allowlisted"))
+
     aggregate = {
         "schema": "pkcs11-scope/observed-profile/v1.1-metrics",
         "capture": {"mode": "metrics", "privacy_mode": "aggregate-only"},
-        "evidence": {"completeness": "PARTIAL", "templates_truncated": False,
-                     **{name: 0 for name in ZERO_AGGREGATE_EVIDENCE}},
+        "evidence": {
+            **full_fixture,
+            "completeness": "PARTIAL", "templates_truncated": False,
+            "attach_failures": [], "skipped": [], "aliased": [],
+            "in_flight_at_end": 0,
+            "surfaces": [{"walk": "full", "acquisition": "ok"}],
+            "vendor_interfaces": 0, "interface_list": "ok",
+        },
         "functions": [{"calls": 25}],
     }
     assert_aggregate_metrics(aggregate)
-    bad_aggregate = json.loads(json.dumps(aggregate))
-    bad_aggregate["evidence"]["semantic_capture_failures"] = 1
-    reject("aggregate semantic evidence", lambda: assert_aggregate_metrics(bad_aggregate))
 
     for family, sentinel in sorted(fixture_sentinels().items()):
         control = positive_control_content(sentinel)
@@ -921,12 +956,14 @@ PY
 }
 
 if [ "${1-}" = "--self-test" ]; then
+    python3 scripts/check-capture-evidence.py --self-test
     assert_lanes --self-test
     exit 0
 fi
 
-mkdir -p "$WORK"
 . scripts/trusted-p11scope.sh
+require_non_root_caller
+mkdir -p "$WORK"
 
 command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
 command -v bpftool >/dev/null || { echo "bpftool required"; exit 1; }
@@ -936,28 +973,39 @@ sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
 WPID=
 SPID=
 OBSERVER_PID=
+OBSERVER_STARTTIME=
+SUPERVISOR_PID=
+SUPERVISOR_STARTTIME=
 WORKER_STOPPED=
 PUBLISH_TMP=
 cleanup() {
-    status=$?
+    CLEANUP_STATUS=$?
     trap - EXIT INT TERM
+    set +e
     if [ -n "$OBSERVER_PID" ] && [ -n "$WORKER_STOPPED" ]; then
-        sudo kill -CONT "$OBSERVER_PID" 2>/dev/null || true
+        signal_verified_root_process CONT "$OBSERVER_PID" "$OBSERVER_STARTTIME" \
+            "$SUPERVISOR_PID" "$SUPERVISOR_STARTTIME" 2>/dev/null || true
         WORKER_STOPPED=
     fi
-    [ -z "$OBSERVER_PID" ] || sudo kill -TERM "$OBSERVER_PID" 2>/dev/null || true
+    OBSERVER_PID=
+    OBSERVER_STARTTIME=
+    if [ -n "$SUPERVISOR_PID" ] && [ -n "$SUPERVISOR_STARTTIME" ]; then
+        signal_verified_root_process TERM "$SUPERVISOR_PID" "$SUPERVISOR_STARTTIME" \
+            2>/dev/null || true
+    elif [ -n "$SPID" ]; then
+        kill -TERM "$SPID" 2>/dev/null || true
+    fi
     [ -z "$WPID" ] || kill -TERM "$WPID" 2>/dev/null || true
-    [ -z "$SPID" ] || kill -TERM "$SPID" 2>/dev/null || true
     [ -z "$WPID" ] || wait "$WPID" 2>/dev/null || true
     [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || true
-    [ -z "$PUBLISH_TMP" ] || rm -f -- "$PUBLISH_TMP"
-    remove_trusted_p11scope "$TRUST_DIR"
-    remove_trusted_p11scope "$TRUST_UNSAFE_DIR"
-    if sudo test -d "$RUN_DIR"; then
-        sudo find "$RUN_DIR" -mindepth 1 -maxdepth 1 -type f -delete
-        sudo rmdir "$RUN_DIR"
-    fi
-    exit "$status"
+    cleanup_step restore_suid_dumpable
+    [ -z "$PUBLISH_TMP" ] || cleanup_step rm -f -- "$PUBLISH_TMP"
+    cleanup_step remove_trusted_p11scope "$TRUST_DIR"
+    cleanup_step remove_trusted_p11scope "$TRUST_UNSAFE_DIR"
+    [ -z "$TRUST_ROOT" ] || cleanup_step sudo rm -f "$TRUST_ROOT/dump-owned-bpf-maps.py"
+    cleanup_step remove_trusted_exec_root "$TRUST_ROOT"
+    cleanup_step remove_protected_output_dir "$RUN_DIR"
+    exit "$CLEANUP_STATUS"
 }
 . scripts/cleanup-traps.sh
 
@@ -966,6 +1014,12 @@ rm -rf "$WORK/default-build" "$WORK/feature-build"
 cargo +1.88 build --locked --release --workspace --target-dir "$WORK/default-build"
 cargo +1.88 build --locked --release --workspace --features unsafe-unvalidated-metadata \
     --target-dir "$WORK/feature-build"
+TRUST_ROOT=$(create_trusted_exec_dir)
+TRUST_DIR=$TRUST_ROOT/default
+TRUST_UNSAFE_DIR=$TRUST_ROOT/unsafe
+RUN_DIR=$(create_protected_output_dir)
+sudo install -o root -g root -m 0555 scripts/dump-owned-bpf-maps.py \
+    "$TRUST_ROOT/dump-owned-bpf-maps.py"
 stage_trusted_p11scope "$WORK/default-build/release/p11scope" \
     "$WORK/default-build/release/p11scope-discover" "$TRUST_DIR"
 stage_trusted_p11scope "$WORK/feature-build/release/p11scope" \
@@ -977,7 +1031,6 @@ gcc -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 \
 gcc -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 -DPRIVACY_BLOCKS=1 \
     -o "$WORK/privacy-provider.so" crates/discover/tests/fixture/version_matrix.c
 python3 scripts/dump-owned-bpf-maps.py --self-test
-sudo install -d -o root -g root -m 0700 "$RUN_DIR"
 
 set -- "$WORK"/default-build/release/build/p11scope-*/out/p11scope-ebpf
 [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "default BPF object is not unique"; exit 1; }
@@ -989,13 +1042,28 @@ python3 scripts/check-bpf-map-defs.py --policy-inventory "$DEFAULT_BPF" "$FEATUR
 
 observer_worker_pid() {
     ow_supervisor=$1
+    ow_supervisor_starttime=$2
     ow_attempt=0
     while [ "$ow_attempt" -lt 160 ]; do
+        root_process_matches_starttime "$ow_supervisor" "$ow_supervisor_starttime" || {
+            echo "supervisor $ow_supervisor exited or changed identity" >&2
+            return 1
+        }
         ow_children=$(sudo cat "/proc/$ow_supervisor/task/$ow_supervisor/children" 2>/dev/null || true)
         set -- $ow_children
         if [ "$#" -eq 1 ]; then
-            printf '%s\n' "$1"
-            return 0
+            ow_worker=$1
+            ow_worker_starttime=$(root_process_starttime "$ow_worker") || return 1
+            ow_parent=$(sudo awk '$1 == "PPid:" { print $2; exit }' \
+                "/proc/$ow_worker/status" 2>/dev/null) || return 1
+            ow_recheck=$(sudo cat "/proc/$ow_supervisor/task/$ow_supervisor/children" \
+                2>/dev/null || true)
+            if [ "$ow_parent" = "$ow_supervisor" ] \
+                && [ "$ow_recheck" = "$ow_children" ] \
+                && root_process_matches_starttime "$ow_supervisor" "$ow_supervisor_starttime"; then
+                printf '%s %s\n' "$ow_worker" "$ow_worker_starttime"
+                return 0
+            fi
         fi
         ow_attempt=$((ow_attempt + 1))
         sleep 0.05
@@ -1004,54 +1072,23 @@ observer_worker_pid() {
     return 1
 }
 
-wait_for_capture_ready() {
-    wcr_log=$1
-    wcr_privacy=$2
-    wcr_kind=$3
-    wcr_attempt=0
-    while [ "$wcr_attempt" -lt 160 ]; do
-        case $wcr_kind in
-            trace) grep -Fqx "CAPTURE privacy=$wcr_privacy" "$wcr_log" 2>/dev/null && return 0 ;;
-            profile|metrics) grep -Fq " — privacy=$wcr_privacy" "$wcr_log" 2>/dev/null && return 0 ;;
-            *) echo "unknown readiness kind: $wcr_kind" >&2; return 1 ;;
-        esac
-        [ -z "$SPID" ] || kill -0 "$SPID" 2>/dev/null || {
-            echo "observer exited before capture readiness: $wcr_log" >&2
-            return 1
-        }
-        wcr_attempt=$((wcr_attempt + 1))
-        sleep 0.05
-    done
-    echo "observer never reported capture readiness: $wcr_log" >&2
-    return 1
-}
-
 wait_for_stopped() {
     wfs_pid=$1
+    wfs_starttime=$2
     wfs_attempt=0
     while [ "$wfs_attempt" -lt 160 ]; do
+        root_process_matches_starttime "$wfs_pid" "$wfs_starttime" || {
+            echo "capture worker $wfs_pid exited or changed identity" >&2
+            return 1
+        }
         wfs_state=$(sudo awk '$1 == "State:" { print $2; exit }' \
             "/proc/$wfs_pid/status" 2>/dev/null || true)
         [ "$wfs_state" = T ] && return 0
-        sudo kill -0 "$wfs_pid" 2>/dev/null || {
-            echo "capture worker $wfs_pid exited before SIGSTOP took effect" >&2
-            return 1
-        }
         wfs_attempt=$((wfs_attempt + 1))
         sleep 0.05
     done
     echo "capture worker $wfs_pid did not reach State: T after SIGSTOP" >&2
     return 1
-}
-
-publish_protected() {
-    pp_source=$1
-    pp_dest=$2
-    PUBLISH_TMP="$WORK/.$pp_dest.$$"
-    sudo cat "$RUN_DIR/$pp_source" > "$PUBLISH_TMP"
-    mv -f "$PUBLISH_TMP" "$WORK/$pp_dest"
-    PUBLISH_TMP=
-    test -s "$WORK/$pp_dest" || { echo "$pp_dest was not published"; exit 1; }
 }
 
 run_lane() {
@@ -1072,7 +1109,7 @@ run_lane() {
     esac
 
     echo "=== $lane ($build $kind) ==="
-    rm -f "$WORK/$lane.ready" "$WORK/$lane.go" "$WORK/$lane.observer.pid" "$WORK/$lane.output" \
+    rm -f "$WORK/$lane.ready" "$WORK/$lane.go" "$WORK/$lane.output" \
         "$WORK/$lane.observer.log" "$WORK/$lane.workload.log" \
         "$WORK/$lane.events.raw" \
         "$WORK"/mapdump_*_"$lane".json "$WORK/mapdump_manifest_$lane.json"
@@ -1090,12 +1127,20 @@ run_lane() {
     test -f "$WORK/$lane.ready" || { echo "$lane workload never became ready"; exit 1; }
 
     set -- "$lane_trust/p11scope" "$lane_command" \
-        --manifest "$WORK/matrix-manifest.json" \
-        --provenance-module "$PWD/$WORK/matrix-provider.so" --pid "$WPID"
+        --manifest "$RUN_DIR/matrix-manifest.json" \
+        --provenance-module "$PWD/$WORK/matrix-provider.so" --pid "$WPID" \
+        --trusted-workload
     [ -z "$lane_mode" ] || set -- "$@" --mode "$lane_mode"
     [ -z "$lane_unsafe" ] || set -- "$@" --unsafe-unvalidated-metadata
     set -- "$@" --duration 6 -o "$RUN_DIR/$lane.output"
-    sudo sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$WORK/$lane.observer.pid" "$@" \
+    sudo sh -c '
+        umask 077
+        starttime=$(awk '\''{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[20]; exit }'\'' "/proc/$$/stat") || exit 1
+        printf "%s %s\n" "$$" "$starttime" > "$1"
+        shift
+        exec "$@"
+    ' sh \
+        "$RUN_DIR/$lane.observer.pid" "$@" \
         > "$WORK/$lane.observer.log" 2>&1 &
     SPID=$!
     case $build in
@@ -1103,31 +1148,55 @@ run_lane() {
         *) [ "$kind" = metrics ] && lane_privacy=aggregate-only || lane_privacy=allowlisted ;;
     esac
     wait_for_capture_ready "$WORK/$lane.observer.log" "$lane_privacy" "$kind"
-    test -s "$WORK/$lane.observer.pid" || { echo "$lane supervisor pid missing"; exit 1; }
-    lane_supervisor=$(cat "$WORK/$lane.observer.pid")
-    OBSERVER_PID=$(observer_worker_pid "$lane_supervisor")
-    sudo kill -0 "$OBSERVER_PID"
-    sudo kill -STOP "$OBSERVER_PID"
+    sudo test -s "$RUN_DIR/$lane.observer.pid" || { echo "$lane supervisor pid missing"; exit 1; }
+    set -- $(sudo cat "$RUN_DIR/$lane.observer.pid")
+    [ "$#" -eq 2 ] || { echo "$lane supervisor identity invalid"; exit 1; }
+    SUPERVISOR_PID=$1
+    SUPERVISOR_STARTTIME=$2
+    case $SUPERVISOR_PID:$SUPERVISOR_STARTTIME in
+        *[!0-9:]*) echo "$lane supervisor identity invalid"; exit 1 ;;
+    esac
+    set -- $(observer_worker_pid "$SUPERVISOR_PID" "$SUPERVISOR_STARTTIME")
+    [ "$#" -eq 2 ] || { echo "$lane worker identity invalid"; exit 1; }
+    OBSERVER_PID=$1
+    OBSERVER_STARTTIME=$2
+    case $OBSERVER_PID:$OBSERVER_STARTTIME in
+        *[!0-9:]*) echo "$lane worker identity invalid"; exit 1 ;;
+    esac
+    signal_verified_root_process STOP "$OBSERVER_PID" "$OBSERVER_STARTTIME" \
+        "$SUPERVISOR_PID" "$SUPERVISOR_STARTTIME"
     WORKER_STOPPED=1
-    wait_for_stopped "$OBSERVER_PID"
+    wait_for_stopped "$OBSERVER_PID" "$OBSERVER_STARTTIME"
     touch "$WORK/$lane.go"
     if wait "$WPID"; then WPID=; else status=$?; WPID=; echo "$lane workload failed: $status"; exit "$status"; fi
-    sudo python3 scripts/dump-owned-bpf-maps.py "$OBSERVER_PID" "$WORK" "$lane" 0 16384
-    assert_lanes --raw-events "$WORK/mapdump_manifest_$lane.json" "$lane" \
+    sudo python3 "$TRUST_ROOT/dump-owned-bpf-maps.py" \
+        "$OBSERVER_PID" "$RUN_DIR" "$lane" 0 16384
+    assert_lanes --raw-events "$RUN_DIR/mapdump_manifest_$lane.json" "$lane" \
         "$lane_workload_pid" "$RUN_DIR/$lane.events.raw"
-    sudo kill -CONT "$OBSERVER_PID"
+    signal_verified_root_process CONT "$OBSERVER_PID" "$OBSERVER_STARTTIME" \
+        "$SUPERVISOR_PID" "$SUPERVISOR_STARTTIME"
     WORKER_STOPPED=
-    if wait "$SPID"; then SPID=; OBSERVER_PID=; else status=$?; SPID=; OBSERVER_PID=; echo "$lane observer failed: $status"; exit "$status"; fi
-    publish_protected "$lane.output" "$lane.output"
-    publish_protected "$lane.events.raw" "$lane.events.raw"
+    OBSERVER_PID=
+    OBSERVER_STARTTIME=
+    if wait "$SPID"; then SPID=; SUPERVISOR_PID=; SUPERVISOR_STARTTIME=; else status=$?; SPID=; SUPERVISOR_PID=; SUPERVISOR_STARTTIME=; echo "$lane observer failed: $status"; exit "$status"; fi
+    publish_protected_file "$RUN_DIR" "$lane.output" "$WORK" "$lane.output"
+    python3 scripts/check-capture-evidence.py canary "$lane" "$WORK/$lane.output"
+    publish_protected_file "$RUN_DIR" "$lane.events.raw" "$WORK" "$lane.events.raw"
+    publish_protected_mapdump_lane "$RUN_DIR" "$WORK" "$lane"
 }
 
 echo "=== discover deterministic matrix providers ==="
 "$WORK/default-build/release/p11scope-discover" \
-    --module "$PWD/$WORK/matrix-provider.so" -o "$WORK/matrix-manifest.json"
+    --module "$PWD/$WORK/matrix-provider.so" -o "$WORK/.matrix-manifest.candidate"
 "$WORK/default-build/release/p11scope-discover" \
-    --module "$PWD/$WORK/privacy-provider.so" -o "$WORK/privacy-manifest.json"
+    --module "$PWD/$WORK/privacy-provider.so" -o "$WORK/.privacy-manifest.candidate"
+sudo install -o root -g root -m 0600 "$WORK/.matrix-manifest.candidate" \
+    "$RUN_DIR/matrix-manifest.json"
+sudo install -o root -g root -m 0600 "$WORK/.privacy-manifest.candidate" \
+    "$RUN_DIR/privacy-manifest.json"
+rm -f "$WORK/.matrix-manifest.candidate" "$WORK/.privacy-manifest.candidate"
 rm -f "$WORK"/mapdump_*.json "$WORK"/mapdump_manifest_*.json
+set_suid_dumpable_zero
 
 while read -r lane build kind; do
     run_lane "$lane" "$build" "$kind"
@@ -1153,7 +1222,7 @@ run_start_lane() {
         feature-unsafe) start_trust=$TRUST_UNSAFE_DIR; start_privacy=unsafe-unvalidated-metadata; start_unsafe=1 ;;
         *) echo "unknown START build: $start_build" >&2; exit 1 ;;
     esac
-    rm -f "$WORK/$start_lane.go" "$WORK/$start_lane.observer.pid" \
+    rm -f "$WORK/$start_lane.go" \
         "$WORK/$start_lane.output" "$WORK/$start_lane.observer.log" \
         "$WORK/$start_lane.workload.log" "$WORK"/mapdump_*_"$start_lane".json \
         "$WORK/mapdump_manifest_$start_lane.json"
@@ -1162,31 +1231,42 @@ run_start_lane() {
         > "$WORK/$start_lane.workload.log" 2>&1 &
     WPID=$!
     start_workload_pid=$WPID
-    set -- "$start_trust/p11scope" profile --manifest "$WORK/privacy-manifest.json" \
+    set -- "$start_trust/p11scope" profile --manifest "$RUN_DIR/privacy-manifest.json" \
         --provenance-module "$PWD/$WORK/privacy-provider.so" --pid "$WPID" \
-        --mode profile --duration 8 -o "$RUN_DIR/$start_lane.output"
+        --trusted-workload --mode profile --duration 8 -o "$RUN_DIR/$start_lane.output"
     [ -z "$start_unsafe" ] || set -- "$@" --unsafe-unvalidated-metadata
-    sudo sh -c 'echo $$ > "$1"; shift; exec "$@"' sh \
-        "$WORK/$start_lane.observer.pid" "$@" > "$WORK/$start_lane.observer.log" 2>&1 &
+    sudo sh -c '
+        umask 077
+        starttime=$(awk '\''{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[20]; exit }'\'' "/proc/$$/stat") || exit 1
+        printf "%s %s\n" "$$" "$starttime" > "$1"
+        shift
+        exec "$@"
+    ' sh \
+        "$RUN_DIR/$start_lane.observer.pid" "$@" > "$WORK/$start_lane.observer.log" 2>&1 &
     SPID=$!
     wait_for_capture_ready "$WORK/$start_lane.observer.log" "$start_privacy" profile
-    start_supervisor=$(cat "$WORK/$start_lane.observer.pid")
-    OBSERVER_PID=$(observer_worker_pid "$start_supervisor")
-    sudo kill -0 "$OBSERVER_PID"
+    set -- $(sudo cat "$RUN_DIR/$start_lane.observer.pid")
+    [ "$#" -eq 2 ] || { echo "$start_lane supervisor identity invalid"; exit 1; }
+    SUPERVISOR_PID=$1
+    SUPERVISOR_STARTTIME=$2
+    case $SUPERVISOR_PID:$SUPERVISOR_STARTTIME in
+        *[!0-9:]*) echo "$start_lane supervisor identity invalid"; exit 1 ;;
+    esac
+    set -- $(observer_worker_pid "$SUPERVISOR_PID" "$SUPERVISOR_STARTTIME")
+    [ "$#" -eq 2 ] || { echo "$start_lane worker identity invalid"; exit 1; }
+    OBSERVER_PID=$1
+    OBSERVER_STARTTIME=$2
+    case $OBSERVER_PID:$OBSERVER_STARTTIME in
+        *[!0-9:]*) echo "$start_lane worker identity invalid"; exit 1 ;;
+    esac
     touch "$WORK/$start_lane.go"
-    sudo python3 scripts/dump-owned-bpf-maps.py "$OBSERVER_PID" "$WORK" \
+    sudo python3 "$TRUST_ROOT/dump-owned-bpf-maps.py" "$OBSERVER_PID" "$RUN_DIR" \
         "$start_lane" "$start_entries" 16384
-    if [ "$start_lane" = default-safe-start ]; then
-        PUBLISH_TMP="$WORK/.mapdump_START_live.$$"
-        cp "$WORK/mapdump_START_$start_lane.json" "$PUBLISH_TMP"
-        mv -f "$PUBLISH_TMP" "$WORK/mapdump_START_live.json"
-        PUBLISH_TMP=
-    fi
     if [ "$start_oracle" = --fault-starts ]; then
-        assert_lanes "$start_oracle" "$WORK/mapdump_manifest_$start_lane.json" \
+        assert_lanes "$start_oracle" "$RUN_DIR/mapdump_manifest_$start_lane.json" \
             "$start_workload_pid"
     else
-        assert_lanes "$start_oracle" "$WORK/mapdump_manifest_$start_lane.json" \
+        assert_lanes "$start_oracle" "$RUN_DIR/mapdump_manifest_$start_lane.json" \
             "$WORK/$start_lane.workload.log" "$start_workload_pid"
     fi
     kill -0 "$WPID" || { echo "$start_lane workload exited before START oracle completed"; exit 1; }
@@ -1202,8 +1282,17 @@ run_start_lane() {
         echo "$start_lane workload exit status $start_status, expected SIGTERM status 143"
         exit 1
     }
-    if wait "$SPID"; then SPID=; OBSERVER_PID=; else status=$?; SPID=; OBSERVER_PID=; echo "$start_lane observer failed: $status"; exit "$status"; fi
-    publish_protected "$start_lane.output" "$start_lane.output"
+    OBSERVER_PID=
+    OBSERVER_STARTTIME=
+    if wait "$SPID"; then SPID=; SUPERVISOR_PID=; SUPERVISOR_STARTTIME=; else status=$?; SPID=; SUPERVISOR_PID=; SUPERVISOR_STARTTIME=; echo "$start_lane observer failed: $status"; exit "$status"; fi
+    publish_protected_file "$RUN_DIR" "$start_lane.output" "$WORK" "$start_lane.output"
+    publish_protected_mapdump_lane "$RUN_DIR" "$WORK" "$start_lane"
+    if [ "$start_lane" = default-safe-start ]; then
+        PUBLISH_TMP=$(mktemp "$WORK/.mapdump_START_live.XXXXXXXX")
+        cp "$WORK/mapdump_START_$start_lane.json" "$PUBLISH_TMP"
+        mv -f "$PUBLISH_TMP" "$WORK/mapdump_START_live.json"
+        PUBLISH_TMP=
+    fi
 }
 
 echo "=== live safe START policy: hostile exact-name and mechanism controls ==="
@@ -1216,6 +1305,11 @@ BLOCKED_LANES
 
 echo "=== live diagnostic START policy: distinct template faults ==="
 run_start_lane feature-unsafe-fault feature-unsafe faults 2 --fault-starts
+
+restore_suid_dumpable
+
+publish_protected_file "$RUN_DIR" matrix-manifest.json "$WORK" matrix-manifest.json
+publish_protected_file "$RUN_DIR" privacy-manifest.json "$WORK" privacy-manifest.json
 
 echo "=== assert capture-policy matrix ==="
 assert_lanes "$WORK"

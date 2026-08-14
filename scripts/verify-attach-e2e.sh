@@ -7,21 +7,28 @@ cd "$(dirname "$0")/.."
 
 MODULE=/usr/lib/softhsm/libsofthsm2.so
 WORK=target/e2e
-TRUST_DIR="$PWD/$WORK/trusted"
+TRUST_DIR=
+RUN_DIR=
 WPID=
 SPID=
-mkdir -p "$WORK"
+PUBLISH_TMP=
 . scripts/trusted-p11scope.sh
+require_non_root_caller
+mkdir -p "$WORK"
 
 cleanup() {
-    status=$?
+    CLEANUP_STATUS=$?
     trap - EXIT INT TERM
+    set +e
     [ -z "$WPID" ] || kill "$WPID" 2>/dev/null || true
     [ -z "$SPID" ] || kill "$SPID" 2>/dev/null || true
     [ -z "$WPID" ] || wait "$WPID" 2>/dev/null || true
     [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || true
-    remove_trusted_p11scope "$TRUST_DIR"
-    exit "$status"
+    cleanup_step restore_suid_dumpable
+    [ -z "$PUBLISH_TMP" ] || cleanup_step rm -f -- "$PUBLISH_TMP"
+    cleanup_step remove_trusted_p11scope "$TRUST_DIR"
+    cleanup_step remove_protected_output_dir "$RUN_DIR"
+    exit "$CLEANUP_STATUS"
 }
 . scripts/cleanup-traps.sh
 
@@ -30,15 +37,12 @@ command -v softhsm2-util >/dev/null || { echo "softhsm2-util required"; exit 1; 
 test -f "$MODULE" || { echo "SoftHSM2 not installed at $MODULE"; exit 1; }
 
 echo "=== build ==="
-# NOTE (deviation from the literal brief): the root Cargo.toml is a
-# combined package+workspace manifest. A plain `cargo build --release`
-# run from the root only builds the root package (p11scope) since Cargo
-# 1.71 — it does NOT build the other workspace members. p11scope-discover
-# silently goes missing and the "discover" step below fails with ENOENT.
-# --workspace makes both binaries build, matching what this script needs.
-cargo build --release --workspace
-stage_trusted_p11scope target/release/p11scope \
-    target/release/p11scope-discover "$TRUST_DIR"
+rm -rf "$WORK/build"
+cargo +1.88 build --locked --release --workspace --target-dir "$WORK/build"
+TRUST_DIR=$(create_trusted_exec_dir)
+RUN_DIR=$(create_protected_output_dir)
+stage_trusted_p11scope "$WORK/build/release/p11scope" \
+    "$WORK/build/release/p11scope-discover" "$TRUST_DIR"
 gcc -O0 -o "$WORK/harness" spike/harness.c -ldl
 
 echo "=== softhsm token ==="
@@ -61,7 +65,7 @@ EOF
 softhsm2-util --init-token --free --label e2e --so-pin 1234 --pin 1234 >/dev/null
 
 echo "=== discover ==="
-./target/release/p11scope-discover --module "$MODULE" -o "$WORK/manifest.json"
+"$TRUST_DIR/p11scope" discover --module "$MODULE" -o "$WORK/manifest.json"
 
 echo "=== observe ==="
 # The workload waits for a go-file so probes are attached before it runs
@@ -71,58 +75,22 @@ echo "=== observe ==="
 rm -f "$WORK/go"
 ( while [ ! -f "$WORK/go" ]; do sleep 0.05; done; exec "$WORK/harness" "$MODULE" ) &
 WPID=$!
+set_suid_dumpable_zero
 sudo --preserve-env=SOFTHSM2_CONF "$TRUST_DIR/p11scope" profile \
     --manifest "$WORK/manifest.json" --provenance-module "$MODULE" --pid "$WPID" \
-    --mode metrics --duration 20 -o "$WORK/observed.json" \
+    --trusted-workload --mode metrics --duration 20 -o "$RUN_DIR/observed.json" \
     > "$WORK/profile.log" 2>&1 &
 SPID=$!
-sleep 3            # let attach complete
+wait_for_capture_ready "$WORK/profile.log" aggregate-only metrics
 touch "$WORK/go"
 if wait "$WPID"; then WPID=; else status=$?; WPID=; echo "workload failed: $status"; exit "$status"; fi
-if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "profiler failed: $status"; tail -n 20 "$WORK/profile.log"; exit "$status"; fi
+if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "profiler failed: $status"; tail -n 20 "$WORK/profile.log" || true; exit "$status"; fi
+restore_suid_dumpable
 tail -n 20 "$WORK/profile.log"
+publish_protected_file "$RUN_DIR" observed.json "$WORK" observed.json
 
 echo "=== verify against spike/expected.txt ==="
-python3 - "$WORK/observed.json" spike/expected.txt <<'PY'
-import json, sys
-obs = json.load(open(sys.argv[1]))
-counts = {}
-for f in obs["functions"]:
-    for n in f["names"]:
-        counts[n] = counts.get(n, 0) + f["calls"]
-fail = 0
-for line in open(sys.argv[2]):
-    name, want = line.split()
-    got = counts.get(name, 0)
-    if got != int(want):
-        print(f"MISMATCH {name}: want {want}, got {got}")
-        fail = 1
-    else:
-        print(f"ok {name}: {got}")
-ev = obs["evidence"]
-print("evidence:", ev["attached_probes"], "probes,", ev["completeness"])
-if ev["attached_probes"] == 0:
-    print("no probes attached")
-    fail = 1
-if ev["completeness"] != "COMPLETE":
-    print(f"completeness: want COMPLETE, got {ev['completeness']!r}")
-    fail = 1
-sys.exit(fail)
-PY
-
-echo "=== static musl build ==="
-rustup target add x86_64-unknown-linux-musl
-RUSTFLAGS="-C target-feature=+crt-static" \
-    cargo build --release --target x86_64-unknown-linux-musl --bin p11scope
-# NOTE (deviation from the literal brief): on this toolchain (rustc
-# 1.94 / file 5.45), `file` reports a static+PIE musl binary as
-# "static-pie linked", not "statically linked" — grep-ing only the
-# latter string false-negatives a genuinely static binary. Accept
-# either; `ldd` on the same binary independently confirms
-# "statically linked" (no dynamic interpreter).
-file target/x86_64-unknown-linux-musl/release/p11scope \
-    | grep -qE "statically linked|static-pie linked" \
-    || { echo "p11scope is NOT static"; exit 1; }
-echo "p11scope: statically linked OK"
+python3 scripts/check-capture-evidence.py clean-metrics \
+    "$WORK/observed.json" spike/expected.txt
 
 echo "=== e2e: ALL OK ==="

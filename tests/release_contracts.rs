@@ -7,6 +7,16 @@ fn read(path: &str) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| panic!("reading {path}: {error}"))
 }
 
+fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    source
+        .split_once(start)
+        .unwrap_or_else(|| panic!("missing section start: {start}"))
+        .1
+        .split_once(end)
+        .unwrap_or_else(|| panic!("missing section end: {end}"))
+        .0
+}
+
 fn canary_literals(source: &str) -> std::collections::BTreeSet<String> {
     source
         .split('"')
@@ -26,6 +36,14 @@ fn run_ok(program: &str, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).expect("command stdout is UTF-8")
+}
+
+fn cleanup_function(path: &str) -> String {
+    let source = read(path);
+    format!(
+        "cleanup() {{{}\n}}",
+        between(&source, "cleanup() {", "\n}\n. scripts/cleanup-traps.sh")
+    )
 }
 
 fn embedded_map_definitions() -> BTreeMap<String, [u32; 7]> {
@@ -105,6 +123,619 @@ fn release_packages_and_smokes_the_documented_helper_path() {
     assert!(script.contains("verify-canaries.sh"));
     assert!(script.contains("$DIST/p11scope-discover\""));
     assert!(script.contains("$DIST/p11scope\" discover"));
+}
+
+#[test]
+fn task6_protected_staging_allocators_separate_exec_and_output_mounts() {
+    let helper = read("scripts/trusted-p11scope.sh");
+    assert!(helper.contains("create_trusted_exec_dir"));
+    assert!(helper.contains("sudo mktemp -d /usr/local/bin/.p11scope.XXXXXXXX"));
+    assert!(helper.contains("create_protected_output_dir"));
+    assert!(helper.contains("sudo mktemp -d /run/p11scope-output.XXXXXXXX"));
+    assert!(helper.contains("noexec"));
+    assert!(helper.contains("remove_trusted_exec_root"));
+    assert!(helper.contains("remove_protected_output_dir"));
+}
+
+#[test]
+fn task6_host_staging_separates_executables_from_protected_output() {
+    for path in [
+        "scripts/build-release.sh",
+        "scripts/verify-attach-e2e.sh",
+        "scripts/verify-canaries.sh",
+        "scripts/verify-induced-gaps.sh",
+    ] {
+        let script = read(path);
+        assert!(
+            script.contains("create_trusted_exec_dir"),
+            "{path} does not allocate protected executable staging"
+        );
+        assert!(
+            script.contains("create_protected_output_dir"),
+            "{path} does not allocate protected output staging"
+        );
+        assert!(
+            !script.contains("TRUST_DIR=\"$PWD"),
+            "{path} executes a root observer below a user-writable ancestor"
+        );
+        assert!(
+            script.contains("-o \"$RUN_DIR/"),
+            "{path} does not give root a protected output path"
+        );
+    }
+
+    let induced = read("scripts/verify-induced-gaps.sh");
+    assert!(induced.contains("$TRUST_ROOT/freeze-policy-maps"));
+    assert!(
+        !induced.contains("\"$RUN_DIR/freeze-policy-maps\""),
+        "the noexec output mount still hosts an executed helper"
+    );
+    assert!(
+        read("src/oracle.rs").contains("const GLIBC_STAGING_DIRECTORY: &str = \"/run/p11scope\";")
+    );
+}
+
+#[test]
+fn task6_host_capture_lanes_pin_the_intended_oracle_mode() {
+    let attach = read("scripts/verify-attach-e2e.sh");
+    let attach_observe = between(&attach, "=== observe ===", "=== verify against");
+    assert_eq!(attach_observe.matches("--trusted-workload").count(), 1);
+
+    let canaries = read("scripts/verify-canaries.sh");
+    assert!(!canaries.contains("sudo python3 scripts/dump-owned-bpf-maps.py"));
+    assert!(canaries.contains("$TRUST_ROOT/dump-owned-bpf-maps.py"));
+    let normal_canary = between(
+        &canaries,
+        "run_lane() {",
+        "=== discover deterministic matrix providers ===",
+    );
+    let start_canary = between(
+        &canaries,
+        "run_start_lane() {",
+        "=== live safe START policy",
+    );
+    assert_eq!(normal_canary.matches("--trusted-workload").count(), 1);
+    assert_eq!(start_canary.matches("--trusted-workload").count(), 1);
+
+    let induced = read("scripts/verify-induced-gaps.sh");
+    assert!(!induced.contains("sudo python3 scripts/dump-owned-bpf-maps.py"));
+    assert!(induced.contains("$TRUST_ROOT/dump-owned-bpf-maps.py"));
+    for (start, end) in [
+        ("=== policy-map immutability", "=== private softhsm token"),
+        ("=== gap 1/5:", "=== gap 2/5:"),
+        ("=== gap 2/5:", "=== gap 3/5:"),
+        ("=== gap 3/5:", "=== gap 4/5:"),
+        ("=== gap 4/5:", "=== gap 5/5:"),
+        ("=== gap 5/5:", "=== induced gaps: ALL OK ==="),
+    ] {
+        let lane = between(&induced, start, end);
+        assert_eq!(
+            lane.matches("--trusted-workload").count(),
+            1,
+            "induced command section {start}"
+        );
+    }
+
+    let release = read("scripts/build-release.sh");
+    let hardened = release
+        .split_once("=== official static hostile-target smoke ===")
+        .expect("official Hardened smoke section")
+        .1
+        .split_once("=== dist/ ===")
+        .unwrap()
+        .0;
+    assert!(hardened.contains("setpriv --no-new-privs"));
+    assert!(hardened.contains("wait_for_hardened_target"));
+    for field in [
+        "State:",
+        "Uid:",
+        "CapInh:",
+        "CapPrm:",
+        "CapEff:",
+        "CapAmb:",
+        "NoNewPrivs:",
+    ] {
+        assert!(
+            hardened.contains(field),
+            "Hardened target check misses {field}"
+        );
+    }
+    assert!(hardened.contains("--pid \"$WPID\""));
+    assert!(!hardened.contains("--cgroup"));
+    assert!(!hardened.contains("--trusted-workload"));
+}
+
+#[test]
+fn task6_official_observer_build_is_isolated_and_safe_only() {
+    let release = read("scripts/build-release.sh");
+    assert!(release.contains("OFFICIAL_TARGET=target/release-official"));
+    let official = between(
+        &release,
+        "=== p11scope: isolated safe-only official static build ===",
+        "=== p11scope-discover: dynamic glibc + dynamic musl builds ===",
+    );
+    let command = [
+        "CARGO_TARGET_DIR=\"$OFFICIAL_TARGET\" \\",
+        "RUSTFLAGS=\"-C target-feature=+crt-static\" \\",
+        "    cargo +1.88 build --locked --release --no-default-features \\",
+        "        --target x86_64-unknown-linux-musl --bin p11scope",
+    ]
+    .join("\n");
+    assert!(official.contains(&command));
+    for marker in [
+        "--policy-inventory \"$OFFICIAL_BPF\" \"$DIAGNOSTIC_BPF\"",
+        "--unsafe-unvalidated-metadata requires a build with",
+    ] {
+        assert!(official.contains(marker), "official build misses {marker}");
+    }
+
+    let attach = read("scripts/verify-attach-e2e.sh");
+    assert!(attach.contains("--target-dir \"$WORK/build\""));
+    assert!(!attach.contains("x86_64-unknown-linux-musl"));
+}
+
+#[test]
+fn task6_review_staging_paths_are_exact_and_publication_is_shared() {
+    let status = Command::new("sh")
+        .args([
+            "-c",
+            ". scripts/trusted-p11scope.sh; \
+             is_immediate_child /run/p11scope-output.abc /run p11scope-output. && \
+             ! is_immediate_child /run/p11scope-output.abc/child /run p11scope-output. && \
+             ! is_immediate_child /run/p11scope-output.abc/../other /run p11scope-output. && \
+             is_trusted_exec_destination /usr/local/bin/.p11scope.abc/default && \
+             ! is_trusted_exec_destination /usr/local/bin/.p11scope.abc/default/child && \
+             ! is_trusted_exec_destination /tmp/.p11scope.abc",
+        ])
+        .status()
+        .expect("exercise staging path guard");
+    assert!(status.success(), "staging path guard rejected its contract");
+
+    let helper = read("scripts/trusted-p11scope.sh");
+    assert!(helper.contains("require_non_root_caller"));
+    assert!(helper.contains("publish_protected_file"));
+    assert!(helper.contains("mktemp \"$work_dir/.${destination}.XXXXXXXX\""));
+    assert!(helper.contains("validate_protected_parent /run"));
+    assert!(helper.contains("sudo rmdir \"$destination\""));
+
+    for path in [
+        "scripts/build-release.sh",
+        "scripts/verify-attach-e2e.sh",
+        "scripts/verify-canaries.sh",
+        "scripts/verify-induced-gaps.sh",
+    ] {
+        let script = read(path);
+        assert!(script.contains("require_non_root_caller"), "{path}");
+        assert!(script.contains("publish_protected_file"), "{path}");
+        assert!(!script.contains("publish_protected() {"), "{path}");
+        assert!(!script.contains("copy_gap_output() {"), "{path}");
+    }
+}
+
+#[test]
+fn task6_review_hostile_lane_pins_sysctl_toolchain_and_target_identity() {
+    let release = read("scripts/build-release.sh");
+    assert!(release.contains("rustup target add --toolchain 1.88 x86_64-unknown-linux-musl"));
+
+    let hostile = between(
+        &release,
+        "=== official static hostile-target smoke ===",
+        "=== dist/ ===",
+    );
+    for marker in [
+        "set_suid_dumpable_zero",
+        "TARGET_STARTTIME",
+        "signal_verified_process CONT \"$WPID\" \"$TARGET_STARTTIME\"",
+    ] {
+        assert!(hostile.contains(marker), "hostile lane misses {marker}");
+    }
+    assert!(!hostile.contains("sudo kill -CONT \"$WPID\""));
+
+    let cleanup = between(&release, "cleanup() {", "\n}\n");
+    assert!(cleanup.contains("restore_suid_dumpable"));
+    assert!(cleanup.contains("TARGET_STARTTIME"));
+    assert!(!cleanup.contains("sudo kill -KILL \"$WPID\""));
+}
+
+#[test]
+fn task6_review_every_privileged_discovery_lane_pins_suid_dumpable() {
+    let helper = read("scripts/trusted-p11scope.sh");
+    for marker in [
+        "set_suid_dumpable_zero()",
+        "restore_suid_dumpable()",
+        "/proc/sys/fs/suid_dumpable",
+    ] {
+        assert!(
+            helper.contains(marker),
+            "shared sysctl helper misses {marker}"
+        );
+    }
+
+    for path in [
+        "scripts/build-release.sh",
+        "scripts/verify-attach-e2e.sh",
+        "scripts/verify-canaries.sh",
+        "scripts/verify-induced-gaps.sh",
+    ] {
+        let script = read(path);
+        assert!(
+            script.contains("set_suid_dumpable_zero"),
+            "{path} does not pin suid_dumpable before privileged discovery"
+        );
+        assert!(
+            cleanup_function(path).contains("restore_suid_dumpable"),
+            "{path} does not restore suid_dumpable during cleanup"
+        );
+    }
+}
+
+#[test]
+fn task6_review_privileged_intermediates_never_use_user_work() {
+    let canaries = read("scripts/verify-canaries.sh");
+    for forbidden in [
+        "sh \"$WORK/$lane.observer.pid\"",
+        "sh \"$WORK/$start_lane.observer.pid\"",
+        "--manifest \"$WORK/matrix-manifest.json\"",
+        "--manifest \"$WORK/privacy-manifest.json\"",
+        "\"$OBSERVER_PID\" \"$WORK\" \"$lane\"",
+        "\"$OBSERVER_PID\" \"$WORK\" \"$start_lane\"",
+    ] {
+        assert!(
+            !canaries.contains(forbidden),
+            "canary root sink under WORK: {forbidden}"
+        );
+    }
+    for required in [
+        "\"$RUN_DIR/$lane.observer.pid\"",
+        "\"$RUN_DIR/$start_lane.observer.pid\"",
+        "--manifest \"$RUN_DIR/matrix-manifest.json\"",
+        "--manifest \"$RUN_DIR/privacy-manifest.json\"",
+    ] {
+        assert!(
+            canaries.contains(required),
+            "canary protected artifact missing: {required}"
+        );
+    }
+
+    let induced = read("scripts/verify-induced-gaps.sh");
+    for forbidden in [
+        "\"$WORK/freeze-supervisor.pid\"",
+        "\"$WORK/freeze-policy-map-ids\"",
+        "\"$OBSERVER_PID\" \"$WORK\" freeze-before",
+        "\"$OBSERVER_PID\" \"$WORK\" freeze-after",
+        "--manifest \"$WORK/freeze-manifest.json\"",
+        "--manifest \"$WORK/g1_manifest.json\"",
+        "--manifest \"$WORK/g2_manifest.json\"",
+        "--manifest \"$WORK/g3_manifest.json\"",
+        "--manifest \"$WORK/g4_manifest.json\"",
+        "--manifest \"$WORK/g5_manifest.json\"",
+    ] {
+        assert!(
+            !induced.contains(forbidden),
+            "induced root sink under WORK: {forbidden}"
+        );
+    }
+    for required in [
+        "\"$RUN_DIR/freeze-supervisor.pid\"",
+        "\"$RUN_DIR/freeze-policy-map-ids\"",
+        "--manifest \"$RUN_DIR/freeze-manifest.json\"",
+        "--manifest \"$RUN_DIR/g1_manifest.json\"",
+    ] {
+        assert!(
+            induced.contains(required),
+            "induced protected artifact missing: {required}"
+        );
+    }
+}
+
+#[test]
+fn task6_review_root_signals_verify_process_starttime() {
+    let helper = read("scripts/trusted-p11scope.sh");
+    for marker in [
+        "process_starttime",
+        "signal_verified_process",
+        "signal_verified_root_process",
+        "os.pidfd_open",
+        "signal.pidfd_send_signal",
+        "raw.rsplit(b\") \", 1)",
+    ] {
+        assert!(
+            helper.contains(marker),
+            "PID identity helper missing: {marker}"
+        );
+    }
+
+    let canaries = read("scripts/verify-canaries.sh");
+    assert!(canaries.contains("OBSERVER_STARTTIME"));
+    assert!(canaries.contains("signal_verified_root_process STOP"));
+    assert!(canaries.contains("signal_verified_root_process CONT"));
+    assert!(!canaries.contains("sudo kill -TERM \"$OBSERVER_PID\""));
+    assert!(!canaries.contains("sudo kill -CONT \"$OBSERVER_PID\""));
+
+    let induced = read("scripts/verify-induced-gaps.sh");
+    assert!(induced.contains("SUPERVISOR_STARTTIME"));
+    assert!(induced.contains("signal_verified_root_process INT"));
+    assert!(!induced.contains("sudo kill -TERM \"$OBSERVER_PID\""));
+    assert!(!induced.contains("sudo kill -TERM \"$SUPERVISOR_PID\""));
+    assert!(!induced.contains("sudo kill -INT \"$SUPERVISOR_PID\""));
+}
+
+#[test]
+fn task6_review_pidfd_signal_is_bound_to_the_recorded_identity() {
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            r#"
+set -eu
+. scripts/trusted-p11scope.sh
+sleep 30 & pinned_pid=$!
+trap 'kill -KILL "$pinned_pid" 2>/dev/null || true; wait "$pinned_pid" 2>/dev/null || true' EXIT
+pinned_start=$(process_starttime "$pinned_pid")
+if signal_verified_process TERM "$pinned_pid" "$((pinned_start + 1))" 2>/dev/null; then
+    exit 1
+fi
+kill -0 "$pinned_pid"
+signal_verified_process STOP "$pinned_pid" "$pinned_start"
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+    state=$(awk '$1 == "State:" { print $2; exit }' "/proc/$pinned_pid/status")
+    [ "$state" = T ] && break
+    attempt=$((attempt + 1))
+    sleep 0.01
+done
+[ "$state" = T ]
+signal_verified_process CONT "$pinned_pid" "$pinned_start"
+signal_verified_process TERM "$pinned_pid" "$pinned_start"
+if wait "$pinned_pid"; then exit 1; else status=$?; fi
+[ "$status" -eq 143 ]
+pinned_pid=
+trap - EXIT
+"#,
+        ])
+        .output()
+        .expect("exercise pidfd identity signal helper");
+    assert!(
+        output.status.success(),
+        "pidfd helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn task6_review_capture_start_uses_bounded_exact_readiness() {
+    for (path, log, privacy, kind) in [
+        (
+            "scripts/build-release.sh",
+            "$WORK/profile-static-smoke.log",
+            "aggregate-only",
+            "metrics",
+        ),
+        (
+            "scripts/verify-attach-e2e.sh",
+            "$WORK/profile.log",
+            "aggregate-only",
+            "metrics",
+        ),
+    ] {
+        let script = read(path);
+        let call = format!("wait_for_capture_ready \"{log}\" {privacy} {kind}");
+        assert!(script.contains(&call), "{path} misses exact readiness call");
+        assert!(
+            !script.contains("sleep 3"),
+            "{path} retains fixed attach sleep"
+        );
+    }
+
+    let induced = read("scripts/verify-induced-gaps.sh");
+    assert!(!induced.contains("sleep 3"));
+    assert!(induced.contains("wait_for_capture_ready"));
+    assert!(induced.contains("aggregate-only") || induced.contains("allowlisted"));
+    assert!(read("scripts/trusted-p11scope.sh").contains("kill -0 \"$SPID\""));
+}
+
+#[test]
+fn task6_review_fixture_evidence_requires_full_exact_shape() {
+    for path in ["scripts/build-release.sh", "scripts/verify-attach-e2e.sh"] {
+        let script = read(path);
+        assert!(script.contains("scripts/check-capture-evidence.py clean-metrics"));
+    }
+
+    let canaries = read("scripts/verify-canaries.sh");
+    assert!(canaries.contains("scripts/check-capture-evidence.py canary \"$lane\""));
+    assert!(!canaries.contains("ev[\"attached_probes\"] == 136"));
+    let checker = read("scripts/check-capture-evidence.py");
+    for marker in [
+        "68, 68, 136",
+        "988, 104, 208",
+        "VERSION_SURFACES",
+        "COUNTERS",
+    ] {
+        assert!(
+            checker.contains(marker),
+            "shared evidence oracle misses {marker}"
+        );
+    }
+}
+
+#[test]
+fn task6_review_capture_evidence_checker_self_tests_exact_allowances() {
+    let output = Command::new("python3")
+        .args(["scripts/check-capture-evidence.py", "--self-test"])
+        .output()
+        .expect("run capture-evidence checker self-test");
+    assert!(
+        output.status.success(),
+        "capture-evidence checker self-test failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 checker output");
+    for marker in [
+        "unexpected positive function rejected: OK",
+        "bootstrap function exact count required: OK",
+        "canary matrix 988/104/208 with 13 mixed surfaces: OK",
+        "canary safe exact allowances: OK",
+        "canary unsafe exact allowances: OK",
+        "canary aggregate exact baseline: OK",
+        "induced G1 exact allowances: OK",
+        "induced G2 exact allowances: OK",
+        "induced G3 exact allowances: OK",
+        "induced G4 exact allowances: OK",
+        "induced G5 exact allowances: OK",
+        "induced G5 exact 11 calls and 9 RV failures: OK",
+        "unrelated evidence gap rejected: OK",
+    ] {
+        assert!(stdout.contains(marker), "checker self-test misses {marker}");
+    }
+}
+
+#[test]
+fn task6_review_cleanup_preserves_primary_status_and_attempts_every_root() {
+    for path in [
+        "scripts/build-release.sh",
+        "scripts/verify-attach-e2e.sh",
+        "scripts/verify-canaries.sh",
+        "scripts/verify-induced-gaps.sh",
+    ] {
+        let directory = tempfile::tempdir().expect("cleanup harness directory");
+        let harness = directory.path().join("cleanup-harness.sh");
+        fs::write(
+            &harness,
+            format!(
+                r#"set -eu
+. scripts/trusted-p11scope.sh
+MARKER=$1
+PRIMARY=$2
+WPID= TARGET_STARTTIME= LPID= SPID= PUBLISH_TMP=
+OBSERVER_PID= OBSERVER_STARTTIME= SUPERVISOR_PID= SUPERVISOR_STARTTIME= WORKER_STOPPED=
+TRUST_DIR=default TRUST_UNSAFE_DIR=unsafe TRUST_ROOT=root
+TRUST_DEFAULT_DIR=default TRUST_SMALL_DIR=small TRUST_FREEZE_DIR=freeze RUN_DIR=run
+restore_suid_dumpable() {{ return 0; }}
+signal_verified_process() {{ return 0; }}
+signal_verified_root_process() {{ return 0; }}
+sudo() {{ printf '%s\n' sudo >> "$MARKER"; return 7; }}
+remove_trusted_p11scope() {{ printf '%s\n' trusted >> "$MARKER"; return 7; }}
+remove_trusted_exec_root() {{ printf '%s\n' exec >> "$MARKER"; return 7; }}
+remove_protected_output_dir() {{ printf '%s\n' output >> "$MARKER"; return 7; }}
+{}
+trap cleanup EXIT
+exit "$PRIMARY"
+"#,
+                cleanup_function(path)
+            ),
+        )
+        .expect("write cleanup harness");
+
+        for primary in [23, 0] {
+            let marker = directory.path().join(format!("cleanup-{primary}.log"));
+            let output = Command::new("sh")
+                .arg(&harness)
+                .arg(&marker)
+                .arg(primary.to_string())
+                .output()
+                .expect("run cleanup harness");
+            if primary == 0 {
+                assert!(!output.status.success(), "{path}: cleanup failure was lost");
+            } else {
+                assert_eq!(
+                    output.status.code(),
+                    Some(primary),
+                    "{path}: cleanup masked primary status: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let markers = fs::read_to_string(&marker).unwrap_or_default();
+            assert_eq!(
+                markers.lines().last(),
+                Some("output"),
+                "{path}: cleanup skipped a later root: {markers:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn task6_review_observer_diagnostics_preserve_child_status() {
+    for (path, diagnostic) in [
+        ("scripts/build-release.sh", "cat"),
+        ("scripts/verify-attach-e2e.sh", "tail"),
+    ] {
+        let source = read(path);
+        let wait_branch = source
+            .lines()
+            .find(|line| line.contains("if wait \"$SPID\"") && line.contains(diagnostic))
+            .unwrap_or_else(|| panic!("{path}: observer diagnostic branch missing"));
+        let directory = tempfile::tempdir().expect("diagnostic harness directory");
+        let harness = directory.path().join("diagnostic-harness.sh");
+        fs::write(
+            &harness,
+            format!(
+                r#"set -eu
+SPID=1
+WORK=missing
+wait() {{ return 37; }}
+cat() {{ return 41; }}
+tail() {{ return 42; }}
+{wait_branch}
+"#
+            ),
+        )
+        .expect("write diagnostic harness");
+        let output = Command::new("sh")
+            .arg(&harness)
+            .output()
+            .expect("run observer diagnostic harness");
+        assert_eq!(
+            output.status.code(),
+            Some(37),
+            "{path}: {diagnostic} masked observer status: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn task6_host_terminal_assertions_match_unproven_drain_and_lease_abort() {
+    for path in ["scripts/build-release.sh", "scripts/verify-attach-e2e.sh"] {
+        let script = read(path);
+        assert!(script.contains("scripts/check-capture-evidence.py clean-metrics"));
+    }
+
+    let canaries = read("scripts/verify-canaries.sh");
+    for marker in [
+        "pkcs11-scope/observed-profile/v1.4",
+        "pkcs11-scope/observed-profile/v1.1-metrics",
+        "trace_abort_terminal",
+        "capture_aborted",
+        "object_lease_break",
+        "counters_available",
+        "final_drain",
+    ] {
+        assert!(
+            canaries.contains(marker),
+            "canary terminal oracle misses {marker}"
+        );
+    }
+    let checker = read("scripts/check-capture-evidence.py");
+    assert!(checker.contains("COUNTERS"));
+    assert!(checker.contains("\"completeness\"] == \"PARTIAL\""));
+    assert_eq!(p11scope::verify::OBJECT_CHANGED_EXIT, 78);
+}
+
+#[test]
+fn task6_review_host_shell_syntax_is_checked_as_one_set() {
+    for path in [
+        "scripts/trusted-p11scope.sh",
+        "scripts/build-release.sh",
+        "scripts/verify-attach-e2e.sh",
+        "scripts/verify-canaries.sh",
+        "scripts/verify-induced-gaps.sh",
+    ] {
+        let status = Command::new("sh")
+            .args(["-n", path])
+            .status()
+            .unwrap_or_else(|error| panic!("sh -n {path}: {error}"));
+        assert!(status.success(), "sh -n failed for {path}");
+    }
 }
 
 #[test]
@@ -269,9 +900,9 @@ aggregate-only-metrics default metrics"
         "assert_exact_owned_map_inventory",
         "assert_hostile_starts",
         "assert_raw_events",
-        "sudo kill -STOP \"$OBSERVER_PID\"",
+        "signal_verified_root_process STOP \"$OBSERVER_PID\"",
         "wait_for_stopped \"$OBSERVER_PID\"",
-        "sudo kill -CONT \"$OBSERVER_PID\"",
+        "signal_verified_root_process CONT \"$OBSERVER_PID\"",
         "--unsafe-unvalidated-metadata",
     ] {
         assert!(canaries.contains(marker), "canary gate misses {marker}");
@@ -285,7 +916,7 @@ aggregate-only-metrics default metrics"
         .unwrap()
         .0;
     let stop = normal_lane
-        .find("sudo kill -STOP \"$OBSERVER_PID\"")
+        .find("signal_verified_root_process STOP \"$OBSERVER_PID\"")
         .unwrap();
     let stopped = normal_lane
         .find("wait_for_stopped \"$OBSERVER_PID\"")
@@ -318,7 +949,7 @@ aggregate-only-metrics default metrics"
     for marker in [
         "freeze_policy_maps \"$WPID\" \"$CGROUP_PATH\"",
         "/children",
-        "wait_for_privacy_frame",
+        "wait_for_capture_ready",
         "BPF_MAP_GET_FD_BY_ID",
         "BPF_OBJ_GET_INFO_BY_FD",
         "BPF_MAP_CREATE",
@@ -426,6 +1057,7 @@ aggregate-only-metrics default metrics"
     assert!(lanes.contains("unsafe raw template oracle self-test: OK"));
     assert!(lanes.contains("raw policy oracle self-test: OK"));
     assert!(lanes.contains("full CallStart safe defaults self-test: OK"));
+    assert!(lanes.contains("canary matrix 988/104/208 with 13 mixed surfaces: OK"));
     let mut sentinels = canary_literals(&read("scripts/fixtures/canary_workload.c"));
     sentinels.extend(canary_literals(&read(
         "scripts/fixtures/privacy-stack-workload.c",
@@ -687,16 +1319,6 @@ fn every_reaped_pid_is_cleared_on_both_wait_paths() {
     }
 
     check_tree(Path::new("scripts"));
-
-    let canaries = read("scripts/verify-canaries.sh");
-    for line in canaries
-        .lines()
-        .filter(|line| line.contains("wait \"$SPID\""))
-    {
-        if line.trim_start().starts_with("if wait") {
-            assert_eq!(line.matches("OBSERVER_PID=").count(), 2);
-        }
-    }
 }
 
 #[test]

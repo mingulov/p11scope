@@ -9,13 +9,10 @@
 #                          helper cannot dlopen a provider .so sanely, so
 #                          discover is intentionally never static)
 #
-# This script does not re-implement either build: it calls the two
-# existing verification scripts that already build and prove these
-# artifacts correct, then copies what they produced into dist/.
-#   - scripts/verify-attach-e2e.sh        builds the dynamic host binary,
-#     proves real attach+capture correctness end to end against
-#     spike/expected.txt, THEN builds the static musl target and checks
-#     `file` reports it static.
+# The dynamic host attach gate and container discover builds stay isolated
+# from the dedicated safe-only target directory used for the official observer.
+#   - scripts/verify-attach-e2e.sh        proves dynamic attach+capture
+#     correctness end to end against spike/expected.txt.
 #   - scripts/verify-discover-containers.sh  builds p11scope-discover for
 #     glibc (rust:1-bookworm -> run in ubuntu:24.04) and dynamic musl
 #     (rust:1-alpine), and smoke-runs each against SoftHSM2 inside its
@@ -30,39 +27,86 @@ cd "$(dirname "$0")/.."
 
 command -v file >/dev/null || { echo "file(1) required"; exit 1; }
 command -v jq >/dev/null || { echo "jq required"; exit 1; }
+command -v setpriv >/dev/null || { echo "setpriv required"; exit 1; }
 
+MODULE=/usr/lib/softhsm/libsofthsm2.so
 DIST=dist
+WORK=target/e2e
+OFFICIAL_TARGET=target/release-official
+TRUST_DIR=
+RUN_DIR=
 WPID=
+TARGET_STARTTIME=
+LPID=
 SPID=
+PUBLISH_TMP=
+SUID_DUMPABLE_ORIGINAL=
+SUID_DUMPABLE_CHANGED=
+. scripts/trusted-p11scope.sh
+require_non_root_caller
 rm -rf "$DIST"
 mkdir -p "$DIST"
-. scripts/trusted-p11scope.sh
 
 cleanup() {
-    status=$?
+    CLEANUP_STATUS=$?
     trap - EXIT INT TERM
-    [ -z "$WPID" ] || kill "$WPID" 2>/dev/null || true
+    set +e
+    if [ -n "$WPID" ] && [ -n "$TARGET_STARTTIME" ]; then
+        signal_verified_process KILL "$WPID" "$TARGET_STARTTIME" 2>/dev/null || true
+    fi
+    [ -z "$LPID" ] || kill "$LPID" 2>/dev/null || true
     [ -z "$SPID" ] || kill "$SPID" 2>/dev/null || true
-    [ -z "$WPID" ] || wait "$WPID" 2>/dev/null || true
+    [ -z "$LPID" ] || wait "$LPID" 2>/dev/null || true
     [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || true
-    remove_trusted_p11scope "${TRUST_DIR:-}"
-    exit "$status"
+    cleanup_step restore_suid_dumpable
+    [ -z "$PUBLISH_TMP" ] || cleanup_step rm -f -- "$PUBLISH_TMP"
+    cleanup_step remove_trusted_p11scope "$TRUST_DIR"
+    cleanup_step remove_protected_output_dir "$RUN_DIR"
+    exit "$CLEANUP_STATUS"
 }
 . scripts/cleanup-traps.sh
 
 echo "=== release privacy gate ==="
 sh scripts/verify-canaries.sh
 
-echo "=== p11scope: dynamic-build attach correctness + static musl build ==="
+echo "=== p11scope: dynamic-build attach correctness ==="
 sh scripts/verify-attach-e2e.sh
-P11SCOPE_STATIC=target/x86_64-unknown-linux-musl/release/p11scope
+
+echo "=== p11scope: isolated safe-only official static build ==="
+rustup target add --toolchain 1.88 x86_64-unknown-linux-musl
+rm -rf "$OFFICIAL_TARGET"
+CARGO_TARGET_DIR="$OFFICIAL_TARGET" \
+RUSTFLAGS="-C target-feature=+crt-static" \
+    cargo +1.88 build --locked --release --no-default-features \
+        --target x86_64-unknown-linux-musl --bin p11scope
+P11SCOPE_STATIC=$OFFICIAL_TARGET/x86_64-unknown-linux-musl/release/p11scope
+
+set -- "$OFFICIAL_TARGET"/x86_64-unknown-linux-musl/release/build/p11scope-*/out/p11scope-ebpf
+[ "$#" -eq 1 ] && [ -f "$1" ] || { echo "official BPF object is not unique"; exit 1; }
+OFFICIAL_BPF=$1
+set -- target/canaries/feature-build/release/build/p11scope-*/out/p11scope-ebpf
+[ "$#" -eq 1 ] && [ -f "$1" ] || { echo "diagnostic BPF object is not unique"; exit 1; }
+DIAGNOSTIC_BPF=$1
+python3 scripts/check-bpf-map-defs.py --policy-inventory "$OFFICIAL_BPF" "$DIAGNOSTIC_BPF"
+
+if "$P11SCOPE_STATIC" profile --unsafe-unvalidated-metadata \
+    > "$OFFICIAL_TARGET/unsafe-cli.log" 2>&1; then
+    echo "safe-only official observer accepted --unsafe-unvalidated-metadata"
+    exit 1
+fi
+grep -Fq -- "--unsafe-unvalidated-metadata requires a build with" \
+    "$OFFICIAL_TARGET/unsafe-cli.log" || {
+        echo "safe-only observer returned the wrong unsafe-feature diagnostic"
+        cat "$OFFICIAL_TARGET/unsafe-cli.log"
+        exit 1
+    }
 
 echo "--- file: p11scope (static musl) ---"
 file "$P11SCOPE_STATIC"
 file "$P11SCOPE_STATIC" | grep -qE "statically linked|static-pie linked" \
     || { echo "p11scope is NOT static"; exit 1; }
 echo "--- ldd: p11scope (static musl) ---"
-ldd "$P11SCOPE_STATIC" || true   # expect "not a dynamic executable" / "statically linked"; ldd's own exit status varies by libc, text is what we check
+ldd "$P11SCOPE_STATIC" || true   # diagnostic only; file(1) above is the enforced static-link check
 cp "$P11SCOPE_STATIC" "$DIST/p11scope"
 
 echo "=== p11scope-discover: dynamic glibc + dynamic musl builds ==="
@@ -105,33 +149,94 @@ echo "=== p11scope: smoke run of the packaged STATIC artifact itself ==="
 "$DIST/p11scope" --help >/dev/null
 echo "--help OK"
 
-# Functional smoke run: attach the actual dist/p11scope binary (not the
-# dynamic host build verify-attach-e2e.sh already proved correct above)
-# to a real workload, to prove the static musl build's eBPF attach path
-# also works, not just that `file`/`ldd` call it static. Reuses the
-# harness, private SoftHSM2 token and manifest verify-attach-e2e.sh just
-# built under target/e2e -- no need to rebuild any of that.
-WORK=target/e2e
-TRUST_DIR="$PWD/$WORK/trusted-release"
+echo "=== official static hostile-target smoke ==="
+wait_for_hardened_target() {
+    wht_pid=$1
+    wht_starttime=$2
+    wht_attempt=0
+    while [ "$wht_attempt" -lt 160 ]; do
+        process_matches_starttime "$wht_pid" "$wht_starttime" || {
+            echo "Hardened target $wht_pid exited or changed identity" >&2
+            return 1
+        }
+        if awk '
+            $1 == "State:" { stopped_ok = ($2 == "T" || $2 == "t") }
+            $1 == "Uid:" {
+                uid_ok = ($2 != 0 && $3 != 0 && $4 != 0 && $5 != 0)
+            }
+            $1 == "CapInh:" || $1 == "CapPrm:" || $1 == "CapEff:" || $1 == "CapAmb:" {
+                caps_ok += ($2 == "0000000000000000")
+            }
+            $1 == "NoNewPrivs:" { nnp_ok = ($2 == 1) }
+            END { exit !(stopped_ok && uid_ok && caps_ok == 4 && nnp_ok) }
+        ' "/proc/$wht_pid/status" 2>/dev/null; then
+            return 0
+        fi
+        kill -0 "$wht_pid" 2>/dev/null || {
+            echo "Hardened target $wht_pid exited before its status was verified" >&2
+            return 1
+        }
+        wht_attempt=$((wht_attempt + 1))
+        sleep 0.05
+    done
+    echo "Hardened target $wht_pid did not stop with non-root UIDs, zero active capabilities, and NoNewPrivs" >&2
+    cat "/proc/$wht_pid/status" >&2 || true
+    return 1
+}
+
+TRUST_DIR=$(create_trusted_exec_dir)
+RUN_DIR=$(create_protected_output_dir)
 stage_trusted_p11scope "$DIST/p11scope" "$DIST/p11scope-discover" "$TRUST_DIR"
-export SOFTHSM2_CONF="$WORK/softhsm2.conf"
-rm -f "$WORK/go-static"
-( while [ ! -f "$WORK/go-static" ]; do sleep 0.05; done
-  exec "$WORK/harness" /usr/lib/softhsm/libsofthsm2.so ) &
-WPID=$!
+export SOFTHSM2_CONF="$PWD/$WORK/softhsm2.conf"
+"$TRUST_DIR/p11scope" discover --module "$MODULE" -o "$WORK/release-manifest.json"
+
+TARGET_UID=$(id -u)
+TARGET_GID=$(id -g)
+rm -f "$WORK/observed-static-smoke.json"
+set_suid_dumpable_zero
+sudo --preserve-env=SOFTHSM2_CONF sh -c 'umask 077; exec 3>"$1"; shift; exec "$@"' \
+    sh "$RUN_DIR/hardened-target.pid" \
+    setpriv --no-new-privs --reuid "$TARGET_UID" --regid "$TARGET_GID" \
+    --clear-groups --inh-caps=-all --ambient-caps=-all --bounding-set=-all -- \
+    sh -c '
+        starttime=$(awk '\''{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[20]; exit }'\'' \
+            "/proc/$$/stat") || exit 1
+        case $starttime in ""|*[!0-9]*) exit 1 ;; esac
+        printf "%s %s\n" "$$" "$starttime" >&3
+        exec 3>&-
+        kill -STOP "$$"
+        exec "$1" "$2"
+    ' sh "$PWD/$WORK/harness" "$MODULE" &
+LPID=$!
+target_attempt=0
+while ! sudo test -s "$RUN_DIR/hardened-target.pid" && [ "$target_attempt" -lt 160 ]; do
+    kill -0 "$LPID" 2>/dev/null || { echo "Hardened target launcher exited before publishing its pid"; exit 1; }
+    target_attempt=$((target_attempt + 1))
+    sleep 0.05
+done
+sudo test -s "$RUN_DIR/hardened-target.pid" || { echo "Hardened target pid missing"; exit 1; }
+set -- $(sudo cat "$RUN_DIR/hardened-target.pid")
+[ "$#" -eq 2 ] || { echo "invalid Hardened target identity record"; exit 1; }
+WPID=$1
+TARGET_STARTTIME=$2
+case $WPID:$TARGET_STARTTIME in *[!0-9:]*) echo "invalid Hardened target identity"; exit 1 ;; esac
+wait_for_hardened_target "$WPID" "$TARGET_STARTTIME"
+
 sudo --preserve-env=SOFTHSM2_CONF "$TRUST_DIR/p11scope" profile \
-    --manifest "$WORK/manifest.json" --provenance-module /usr/lib/softhsm/libsofthsm2.so \
+    --manifest "$WORK/release-manifest.json" --provenance-module "$MODULE" \
     --pid "$WPID" \
-    --mode metrics --duration 20 -o "$WORK/observed-static-smoke.json" \
+    --mode metrics --duration 20 -o "$RUN_DIR/observed-static-smoke.json" \
     > "$WORK/profile-static-smoke.log" 2>&1 &
 SPID=$!
-sleep 3            # let attach complete before releasing the workload
-touch "$WORK/go-static"
-if wait "$WPID"; then WPID=; else status=$?; WPID=; echo "static smoke workload failed: $status"; exit "$status"; fi
-if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "static smoke profiler failed: $status"; cat "$WORK/profile-static-smoke.log"; exit "$status"; fi
-jq -e '.evidence.attached_probes > 0 and .evidence.completeness == "COMPLETE"' \
-    "$WORK/observed-static-smoke.json" >/dev/null \
-    || { echo "static p11scope smoke attach FAILED"; cat "$WORK/profile-static-smoke.log"; exit 1; }
+wait_for_capture_ready "$WORK/profile-static-smoke.log" aggregate-only metrics
+signal_verified_process CONT "$WPID" "$TARGET_STARTTIME"
+if wait "$LPID"; then LPID=; WPID=; TARGET_STARTTIME=; else status=$?; LPID=; WPID=; TARGET_STARTTIME=; echo "static smoke workload failed: $status"; exit "$status"; fi
+if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "static smoke profiler failed: $status"; cat "$WORK/profile-static-smoke.log" || true; exit "$status"; fi
+restore_suid_dumpable
+publish_protected_file "$RUN_DIR" observed-static-smoke.json "$WORK" observed-static-smoke.json
+
+python3 scripts/check-capture-evidence.py clean-metrics \
+    "$WORK/observed-static-smoke.json" spike/expected.txt
 echo "static p11scope smoke attach OK: $(jq -c .evidence "$WORK/observed-static-smoke.json")"
 
 echo "=== dist/ ==="

@@ -34,9 +34,22 @@ pub fn discover(module_path: &Path) -> Result<Manifest, String> {
     if !module_path.is_absolute() {
         return Err("--module must be an absolute path".into());
     }
+    discover_with_self_memory(module_path, ProcessMemory::open()?.0)
+}
+
+/// Discover with a retained descriptor for the helper's post-exec address
+/// space. The helper hardens itself before releasing the provider-load barrier.
+pub fn discover_with_self_memory(
+    module_path: &Path,
+    self_memory: File,
+) -> Result<Manifest, String> {
+    if !module_path.is_absolute() {
+        return Err("--module must be an absolute path".into());
+    }
     let module_path_text = module_path
         .to_str()
         .ok_or_else(|| "--module path must be valid UTF-8 for the manifest".to_string())?;
+    let memory = ProcessMemory(self_memory);
     let (module_file_key, module_identity) = identity_and_key(module_path)?;
     let before_maps = maps::parse_maps(
         &std::fs::read("/proc/self/maps").map_err(|e| format!("/proc/self/maps: {e}"))?,
@@ -78,7 +91,6 @@ pub fn discover(module_path: &Path) -> Result<Manifest, String> {
         get_interface_list: module_export(raw_exports.get_interface_list, &maps, module_map_key),
         get_interface: module_export(raw_exports.get_interface, &maps, module_map_key),
     };
-    let memory = ProcessMemory::open()?;
     let mut objects = ObjectTable::new(
         module_path.to_path_buf(),
         module_map_key,

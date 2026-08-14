@@ -207,14 +207,46 @@ impl ClosureLeases {
             total_bytes: 0,
         };
         leases.retain(record, file)?;
+        leases.ensure().map_err(anyhow::Error::msg)?;
         Ok(leases)
     }
 
     fn retain_reported(&mut self, record: &ProvenanceObject) -> Result<()> {
+        self.retain_reported_inner(record)?;
+        self.ensure().map_err(anyhow::Error::msg)
+    }
+
+    pub(crate) fn retain_reported_nonexiting(&mut self, record: &ProvenanceObject) -> Result<bool> {
+        self.retain_reported_inner(record)?;
+        self.take_break().map_err(anyhow::Error::msg)
+    }
+
+    fn retain_reported_inner(&mut self, record: &ProvenanceObject) -> Result<()> {
         let key = record_key(record);
         if let Some(retained) = self.objects.get(&key) {
             if !same_identity(&retained.identity, &record.identity) {
                 bail!("provenance mapping {key:?} changed whole-file identity between passes");
+            }
+            return Ok(());
+        }
+        for influence in &self.influences {
+            if mapping_file_key(influence).map_err(anyhow::Error::msg)? != key {
+                continue;
+            }
+            let identity = inspect_file(influence)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| {
+                    format!(
+                        "identifying retained hardened influence for {}",
+                        record.path
+                    )
+                })?
+                .identity;
+            if !same_identity(&identity, &record.identity) {
+                bail!(
+                    "provenance mapping {} changed whole-file identity between preparation and discovery",
+                    record.path
+                );
             }
             return Ok(());
         }
@@ -261,11 +293,23 @@ impl ClosureLeases {
                 file,
             },
         );
-        self.ensure().map_err(anyhow::Error::msg)
+        Ok(())
     }
 
     fn keys(&self) -> BTreeSet<MappingFileKey> {
         self.objects.keys().copied().collect()
+    }
+
+    pub(crate) fn stabilization_keys(&self) -> Result<BTreeSet<MappingFileKey>> {
+        let mut keys = self.keys();
+        for influence in &self.influences {
+            keys.insert(mapping_file_key(influence).map_err(anyhow::Error::msg)?);
+        }
+        Ok(keys)
+    }
+
+    pub(crate) fn seed_key(&self) -> MappingFileKey {
+        self.seed
     }
 
     pub(crate) fn retain_influence(&mut self, file: File, label: &str) -> Result<RawFd> {
@@ -458,6 +502,88 @@ fn stabilize(module: &Path, mut pass: impl FnMut() -> Result<Manifest>) -> Resul
     bail!("provenance closure did not stabilize within {MAX_STABILIZATION_PASSES} discovery passes")
 }
 
+fn stabilize_hardened<'leases>(
+    module: &Path,
+    selection: &OracleSelection,
+    prepared: &mut crate::oracle::PreparedGlibc<'leases>,
+    mut pass: impl FnMut(&crate::oracle::PreparedGlibc<'leases>) -> Result<HardenedPassOutcome>,
+) -> Result<HardenedPassOutcome> {
+    let mut previous = None;
+    for _ in 0..MAX_STABILIZATION_PASSES {
+        selection.revalidate()?;
+        prepared.revalidate()?;
+        prepared.revalidate_seed(module)?;
+        if prepared.take_lease_break().map_err(anyhow::Error::msg)? {
+            return Ok(HardenedPassOutcome::LeaseBroken);
+        }
+        let preleased = prepared.stabilization_keys()?;
+        let HardenedPassOutcome::Complete(manifest) = pass(prepared)? else {
+            return Ok(HardenedPassOutcome::LeaseBroken);
+        };
+        let current = closure_keys(&manifest)?;
+        if !current.contains(&prepared.seed_key()) {
+            bail!("discovery pass omitted the selected provenance module mapping");
+        }
+        selection.revalidate()?;
+        prepared.revalidate()?;
+        prepared.revalidate_seed(module)?;
+        if prepared.take_lease_break().map_err(anyhow::Error::msg)? {
+            return Ok(HardenedPassOutcome::LeaseBroken);
+        }
+        let already_leased = current.is_subset(&preleased);
+        for object in &manifest.provenance_objects {
+            if prepared.retain_reported_nonexiting(object)? {
+                return Ok(HardenedPassOutcome::LeaseBroken);
+            }
+        }
+        selection.revalidate()?;
+        prepared.revalidate()?;
+        prepared.revalidate_seed(module)?;
+        if already_leased && previous.as_ref() == Some(&current) {
+            return Ok(HardenedPassOutcome::Complete(manifest));
+        }
+        previous = Some(current);
+    }
+    bail!("provenance closure did not stabilize within {MAX_STABILIZATION_PASSES} discovery passes")
+}
+
+fn finalize_hardened_prepared<'leases>(
+    mut prepared: crate::oracle::PreparedGlibc<'leases>,
+    stabilization: Result<HardenedPassOutcome>,
+) -> Result<(Result<()>, Result<HardenedPassOutcome>)> {
+    let validation = prepared.revalidate();
+    let cleanup = prepared.cleanup();
+    drop(prepared);
+    cleanup.context("cleaning hardened glibc preparation")?;
+    if matches!(&stabilization, Ok(HardenedPassOutcome::LeaseBroken)) {
+        crate::verify::object_changed_exit();
+    }
+    Ok((validation, stabilization))
+}
+
+fn finish_hardened(
+    module: &Path,
+    leases: ClosureLeases,
+    finalized: (Result<()>, Result<HardenedPassOutcome>),
+) -> Result<StableDiscovery> {
+    let lease_check = leases.ensure().map_err(anyhow::Error::msg);
+    let seed_check = leases.revalidate_seed(module);
+    let (validation, stabilization) = finalized;
+    lease_check.context("rechecking hardened glibc leases after cleanup")?;
+    seed_check.context("revalidating the provenance seed after cleanup")?;
+    validation.context("revalidating hardened glibc preparation")?;
+    match stabilization? {
+        HardenedPassOutcome::Complete(manifest) => Ok(StableDiscovery {
+            manifest,
+            leases,
+            module: module.to_path_buf(),
+        }),
+        HardenedPassOutcome::LeaseBroken => {
+            unreachable!("lease breaks exit while finalizing hardened preparation")
+        }
+    }
+}
+
 /// Runs the installed sibling helper until one complete pass used only a
 /// pre-leased, unchanged exact executable-mapping closure.
 pub fn select_oracle(scope: &Scope, trusted_workload: bool) -> Result<OracleSelection> {
@@ -489,26 +615,11 @@ fn rediscover_stable_selected(
             let helper = open_trusted_helper(helper_path)?;
             let mut leases = ClosureLeases::new(module)?;
             let mut prepared = crate::oracle::prepare_glibc(helper, helper_path, &mut leases)?;
-            let validation = prepared.revalidate();
-            let cleanup = prepared.cleanup();
-            drop(prepared);
-            if let Err(error) = cleanup {
-                return Err(error).context("cleaning hardened glibc preparation");
-            }
-            let lease_check = leases.ensure().map_err(anyhow::Error::msg);
-            let seed_check = leases.revalidate_seed(module);
-            if let Err(error) = lease_check {
-                return Err(error).context("rechecking hardened glibc leases after cleanup");
-            }
-            if let Err(error) = seed_check {
-                return Err(error).context("revalidating the provenance seed after cleanup");
-            }
-            if let Err(error) = validation {
-                return Err(error).context("revalidating hardened glibc preparation");
-            }
-            bail!(
-                "hardened discovery oracle is incomplete until PREPARED/DROP/READY/GO validation is installed"
-            )
+            let stabilization = stabilize_hardened(module, selection, &mut prepared, |prepared| {
+                run_hardened_pass(selection, prepared, module, DISCOVERY_TIMEOUT)
+            });
+            let finalized = finalize_hardened_prepared(prepared, stabilization)?;
+            finish_hardened(module, leases, finalized)
         }
     }
 }
@@ -952,7 +1063,7 @@ fn run_hardened_pass(
         bail!("hardened child control fd overlaps stdio");
     }
 
-    let provider = record_key(&current_provenance_object(module)?.0);
+    let provider = prepared.seed_key();
     let mut executable = BTreeSet::from([prepared.file_key(prepared.helper_fd())?]);
     for fd in prepared.runtime_fds() {
         executable.insert(prepared.file_key(fd)?);
@@ -961,6 +1072,7 @@ fn run_hardened_pass(
     let mut state = HardenedProtocolState::Prepared;
     let mut process = None;
     let mut maps = None;
+    let mut self_memory = None;
     let mut output = Vec::new();
     let mut stdout_eof = false;
     let mut control_eof = false;
@@ -1098,6 +1210,7 @@ fn run_hardened_pass(
                             if child_process.fd_identities()? != expected_fds {
                                 bail!("hardened discovery child inherited an unexpected fd target");
                             }
+                            self_memory = Some(child_process.memory_identity()?);
                             prepared.revalidate()?;
                             prepared.revalidate_seed(module)?;
                             poll_timeout(deadline)?;
@@ -1125,9 +1238,19 @@ fn run_hardened_pass(
                                 "hardened child maps",
                             )?;
                             validate_hardened_executable_maps(&maps_bytes, &executable, provider)?;
-                            if child_process.exe_key()? != loader
-                                || child_process.fd_identities()? != expected_fds
-                            {
+                            let ready_fds = child_process.fd_identities()?;
+                            let memory_identity = self_memory.ok_or_else(|| {
+                                anyhow!("hardened child self-memory identity is missing")
+                            })?;
+                            let exact_self_memory_addition = ready_fds.len()
+                                == expected_fds.len() + 1
+                                && expected_fds
+                                    .iter()
+                                    .all(|(fd, identity)| ready_fds.get(fd) == Some(identity))
+                                && ready_fds.iter().any(|(fd, identity)| {
+                                    !expected_fds.contains_key(fd) && *identity == memory_identity
+                                });
+                            if child_process.exe_key()? != loader || !exact_self_memory_addition {
                                 bail!("hardened discovery child authority changed before GO");
                             }
                             prepared.revalidate()?;
@@ -1503,10 +1626,17 @@ mod tests {
 #include <time.h>
 #include <unistd.h>
 
+static int self_memory = -1;
+
 static __attribute__((unused)) int expect(int fd, const char *wanted) {
     char bytes[32];
     ssize_t n = recv(fd, bytes, sizeof(bytes), MSG_TRUNC);
-    return n == (ssize_t)strlen(wanted) && !memcmp(bytes, wanted, (size_t)n);
+    int matched = n == (ssize_t)strlen(wanted) && !memcmp(bytes, wanted, (size_t)n);
+    if (matched && !strcmp(wanted, "DROP") && self_memory == -1) {
+        self_memory = open("/proc/self/mem", O_RDONLY | O_CLOEXEC);
+        if (self_memory == -1) return 0;
+    }
+    return matched;
 }
 
 int main(int argc, char **argv) {
@@ -1788,6 +1918,79 @@ int main(int argc, char **argv) {
         assert_eq!(manifest.schema, SCHEMA);
         assert_eq!(manifest.module_path, module.to_str().unwrap());
         assert!(marker.exists());
+
+        target.kill().unwrap();
+        target.wait().unwrap();
+        drop(selection);
+        prepared.cleanup().unwrap();
+    }
+
+    #[test]
+    fn supervised_hardened_pass_allows_the_post_drop_self_memory_fd() {
+        let flow = r#"
+            if (send(control, "PREPARED", 8, 0) != 8) return 2;
+            if (!expect(control, "DROP")) return 3;
+            if (send(control, "READY", 5, 0) != 5) return 4;
+            if (!expect(control, "GO")) return 5;
+            if (dprintf(1, "{\"schema\":\"p11scope-manifest/4\",\"module_path\":\"@MODULE@\",\"objects\":[],\"provenance_objects\":[],\"interface_list\":{\"status\":\"absent\"},\"surfaces\":[],\"vendor_interfaces\":[],\"alias_groups\":[]}") < 0) return 6;
+            return 0;
+        "#;
+        let (root, _helper, module, _loader, _marker, _pid_file) =
+            hardened_protocol_root_with(flow);
+        let mut leases = ClosureLeases::new(&module).unwrap();
+        let mut prepared = crate::oracle::prepare_glibc_test_root(
+            root.path(),
+            Path::new("/opt/p11scope-discover"),
+            unsafe { libc::geteuid() },
+            &mut leases,
+        )
+        .unwrap();
+        let (mut target, selection) = hardened_test_selection();
+
+        let outcome =
+            run_hardened_pass(&selection, &prepared, &module, Duration::from_secs(5)).unwrap();
+        assert!(matches!(outcome, HardenedPassOutcome::Complete(_)));
+
+        target.kill().unwrap();
+        target.wait().unwrap();
+        drop(selection);
+        prepared.cleanup().unwrap();
+    }
+
+    #[test]
+    fn supervised_hardened_pass_refuses_an_extra_ready_fd() {
+        let flow = r#"
+            if (send(control, "PREPARED", 8, 0) != 8) return 2;
+            if (!expect(control, "DROP")) return 3;
+            int unexpected = open("/dev/null", O_RDONLY | O_CLOEXEC);
+            if (unexpected < 0) return 4;
+            if (send(control, "READY", 5, 0) != 5) return 5;
+            pause();
+            return 0;
+        "#;
+        let (root, _helper, module, _loader, _marker, pid_file) = hardened_protocol_root_with(flow);
+        let mut leases = ClosureLeases::new(&module).unwrap();
+        let mut prepared = crate::oracle::prepare_glibc_test_root(
+            root.path(),
+            Path::new("/opt/p11scope-discover"),
+            unsafe { libc::geteuid() },
+            &mut leases,
+        )
+        .unwrap();
+        let (mut target, selection) = hardened_test_selection();
+
+        let error =
+            run_hardened_pass(&selection, &prepared, &module, Duration::from_secs(5)).unwrap_err();
+        assert!(
+            error.to_string().contains("authority changed before GO"),
+            "{error:#}"
+        );
+        let pid = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_leader_reaped(pid);
 
         target.kill().unwrap();
         target.wait().unwrap();
@@ -2441,6 +2644,281 @@ int main(void) {
     }
 
     #[test]
+    fn hardened_stabilization_preleases_exact_inodes_and_converges() {
+        let (root, helper, module, interpreter, _marker, _pid_file) = hardened_protocol_root();
+        let libc = root.path().join("usr/lib/x86_64-linux-gnu/libc.so.6");
+        let dependency = root.path().join("opt/dependency.so");
+        std::fs::copy("/bin/true", &dependency).unwrap();
+        let manifests = [
+            closure_manifest(&module, &[&module, &helper, &interpreter, &libc]),
+            closure_manifest(
+                &module,
+                &[&module, &helper, &interpreter, &libc, &dependency],
+            ),
+            closure_manifest(
+                &module,
+                &[&module, &helper, &interpreter, &libc, &dependency],
+            ),
+        ];
+        let (mut target, selection) = hardened_test_selection();
+        let mut leases = ClosureLeases::new(&module).unwrap();
+        let mut prepared = crate::oracle::prepare_glibc_test_root(
+            root.path(),
+            Path::new("/opt/p11scope-discover"),
+            unsafe { libc::geteuid() },
+            &mut leases,
+        )
+        .unwrap();
+        let preleased_count = prepared.stabilization_keys().unwrap().len();
+        let mut passes = 0;
+        let mut private_directory = None;
+
+        let outcome = stabilize_hardened(&module, &selection, &mut prepared, |prepared| {
+            let fd = prepared.private_directory_fd();
+            assert_eq!(*private_directory.get_or_insert(fd), fd);
+            let manifest = manifests[passes].clone();
+            passes += 1;
+            Ok(HardenedPassOutcome::Complete(manifest))
+        })
+        .unwrap();
+
+        let HardenedPassOutcome::Complete(manifest) = outcome else {
+            panic!("lease unexpectedly broke");
+        };
+        assert_eq!(passes, 3);
+        assert_eq!(manifest, manifests[2]);
+        prepared.cleanup().unwrap();
+        drop(prepared);
+        assert_eq!(leases.influences.len(), preleased_count - 1);
+        assert_eq!(leases.objects.len(), 2);
+        target.kill().unwrap();
+        target.wait().unwrap();
+
+        let (root, helper, module, interpreter, _marker, _pid_file) = hardened_protocol_root();
+        let libc = root.path().join("usr/lib/x86_64-linux-gnu/libc.so.6");
+        let first = root.path().join("opt/first.so");
+        let replacement = root.path().join("opt/replacement-dependency.so");
+        std::fs::copy("/bin/false", &first).unwrap();
+        std::fs::copy(&first, &replacement).unwrap();
+        assert_eq!(
+            p11scope_manifest::identity::identify(&first).sha256,
+            p11scope_manifest::identity::identify(&replacement).sha256
+        );
+        assert_ne!(
+            first.metadata().unwrap().ino(),
+            replacement.metadata().unwrap().ino()
+        );
+        let manifests = [
+            closure_manifest(&module, &[&module, &helper, &interpreter, &libc, &first]),
+            closure_manifest(
+                &module,
+                &[&module, &helper, &interpreter, &libc, &replacement],
+            ),
+            closure_manifest(
+                &module,
+                &[&module, &helper, &interpreter, &libc, &replacement],
+            ),
+        ];
+        let (mut target, selection) = hardened_test_selection();
+        let mut leases = ClosureLeases::new(&module).unwrap();
+        let mut prepared = crate::oracle::prepare_glibc_test_root(
+            root.path(),
+            Path::new("/opt/p11scope-discover"),
+            unsafe { libc::geteuid() },
+            &mut leases,
+        )
+        .unwrap();
+        let mut passes = 0;
+
+        let outcome = stabilize_hardened(&module, &selection, &mut prepared, |_| {
+            let manifest = manifests[passes].clone();
+            passes += 1;
+            Ok(HardenedPassOutcome::Complete(manifest))
+        })
+        .unwrap();
+
+        let HardenedPassOutcome::Complete(manifest) = outcome else {
+            panic!("lease unexpectedly broke");
+        };
+        assert_eq!(passes, 3);
+        assert_eq!(manifest, manifests[2]);
+        prepared.cleanup().unwrap();
+        drop(prepared);
+        target.kill().unwrap();
+        target.wait().unwrap();
+    }
+
+    #[test]
+    fn hardened_stabilization_refuses_authority_change_and_inode_churn() {
+        let (root, helper, module, interpreter, _marker, _pid_file) = hardened_protocol_root();
+        let libc = root.path().join("usr/lib/x86_64-linux-gnu/libc.so.6");
+        let replacement = root.path().join("opt/replacement.so");
+        let manifest = closure_manifest(&module, &[&module, &helper, &interpreter, &libc]);
+        let (mut target, selection) = hardened_test_selection();
+        let mut leases = ClosureLeases::new(&module).unwrap();
+        let mut prepared = crate::oracle::prepare_glibc_test_root(
+            root.path(),
+            Path::new("/opt/p11scope-discover"),
+            unsafe { libc::geteuid() },
+            &mut leases,
+        )
+        .unwrap();
+        let mut passes = 0;
+
+        let result = stabilize_hardened(&module, &selection, &mut prepared, |_| {
+            passes += 1;
+            if passes == 1 {
+                std::fs::rename(&replacement, &module).unwrap();
+            }
+            Ok(HardenedPassOutcome::Complete(manifest.clone()))
+        });
+
+        prepared.cleanup().unwrap();
+        drop(prepared);
+        target.kill().unwrap();
+        target.wait().unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(passes, 1);
+        assert!(error.to_string().contains("was replaced"), "{error:#}");
+
+        let (root, helper, module, interpreter, _marker, _pid_file) = hardened_protocol_root();
+        let libc = root.path().join("usr/lib/x86_64-linux-gnu/libc.so.6");
+        let manifest = closure_manifest(&module, &[&module, &helper, &interpreter, &libc]);
+        let (mut target, selection) = hardened_test_selection();
+        let mut leases = ClosureLeases::new(&module).unwrap();
+        let mut prepared = crate::oracle::prepare_glibc_test_root(
+            root.path(),
+            Path::new("/opt/p11scope-discover"),
+            unsafe { libc::geteuid() },
+            &mut leases,
+        )
+        .unwrap();
+        let mut passes = 0;
+
+        let result = stabilize_hardened(&module, &selection, &mut prepared, |_| {
+            passes += 1;
+            if passes == 1 {
+                target.kill().unwrap();
+                target.wait().unwrap();
+            }
+            Ok(HardenedPassOutcome::Complete(manifest.clone()))
+        });
+
+        prepared.cleanup().unwrap();
+        drop(prepared);
+        let error = result.unwrap_err();
+        assert_eq!(passes, 1);
+        assert!(
+            error.to_string().contains("exited while its authority"),
+            "{error:#}"
+        );
+
+        let (root, helper, module, interpreter, _marker, _pid_file) = hardened_protocol_root();
+        let libc = root.path().join("usr/lib/x86_64-linux-gnu/libc.so.6");
+        let first = root.path().join("opt/first.so");
+        let second = root.path().join("opt/second.so");
+        std::fs::copy("/bin/false", &first).unwrap();
+        std::fs::copy(&first, &second).unwrap();
+        let manifests = [
+            closure_manifest(&module, &[&module, &helper, &interpreter, &libc, &first]),
+            closure_manifest(&module, &[&module, &helper, &interpreter, &libc, &second]),
+        ];
+        let (mut target, selection) = hardened_test_selection();
+        let mut leases = ClosureLeases::new(&module).unwrap();
+        let mut prepared = crate::oracle::prepare_glibc_test_root(
+            root.path(),
+            Path::new("/opt/p11scope-discover"),
+            unsafe { libc::geteuid() },
+            &mut leases,
+        )
+        .unwrap();
+        let mut passes = 0;
+
+        let result = stabilize_hardened(&module, &selection, &mut prepared, |_| {
+            let manifest = manifests[passes % 2].clone();
+            passes += 1;
+            Ok(HardenedPassOutcome::Complete(manifest))
+        });
+
+        prepared.cleanup().unwrap();
+        drop(prepared);
+        target.kill().unwrap();
+        target.wait().unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(passes, MAX_STABILIZATION_PASSES);
+        assert!(error.to_string().contains("did not stabilize"), "{error:#}");
+    }
+
+    #[test]
+    fn hardened_stabilization_cleans_before_exit_78() {
+        let (root, _helper, module, _interpreter, _marker, _pid_file) = hardened_protocol_root();
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let mut leases = ClosureLeases::new(&module).unwrap();
+            let prepared = crate::oracle::prepare_glibc_test_root(
+                root.path(),
+                Path::new("/opt/p11scope-discover"),
+                unsafe { libc::geteuid() },
+                &mut leases,
+            )
+            .unwrap();
+            let _ = finalize_hardened_prepared(prepared, Ok(HardenedPassOutcome::LeaseBroken));
+            unsafe { libc::_exit(99) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            crate::verify::OBJECT_CHANGED_EXIT
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path().join("run/p11scope"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn hardened_production_finalization_returns_live_stable_discovery() {
+        let (root, helper, module, interpreter, _marker, _pid_file) = hardened_protocol_root();
+        let libc = root.path().join("usr/lib/x86_64-linux-gnu/libc.so.6");
+        let manifest = closure_manifest(&module, &[&module, &helper, &interpreter, &libc]);
+        let (mut target, selection) = hardened_test_selection();
+        let mut leases = ClosureLeases::new(&module).unwrap();
+        let mut prepared = crate::oracle::prepare_glibc_test_root(
+            root.path(),
+            Path::new("/opt/p11scope-discover"),
+            unsafe { libc::geteuid() },
+            &mut leases,
+        )
+        .unwrap();
+        let mut passes = 0;
+        let stabilization = stabilize_hardened(&module, &selection, &mut prepared, |_| {
+            passes += 1;
+            Ok(HardenedPassOutcome::Complete(manifest.clone()))
+        });
+        let finalized = finalize_hardened_prepared(prepared, stabilization).unwrap();
+
+        let stable = finish_hardened(&module, leases, finalized).unwrap();
+
+        assert_eq!(passes, 2);
+        assert_eq!(stable.manifest(), &manifest);
+        stable.ensure_stable().unwrap();
+        assert_eq!(
+            std::fs::read_dir(root.path().join("run/p11scope"))
+                .unwrap()
+                .count(),
+            0
+        );
+        target.kill().unwrap();
+        target.wait().unwrap();
+    }
+
+    #[test]
     fn new_dependency_is_not_authorized_until_a_preleased_retry() {
         let dir = tempfile::tempdir().unwrap();
         let module = dir.path().join("module.so");
@@ -2965,33 +3443,5 @@ int main(int argc, char **argv, char **envp) {
                 .to_string()
                 .contains("hardened discovery oracle is incomplete")
         );
-    }
-
-    #[test]
-    fn hardened_stage_is_cleaned_before_lease_check_and_c3_refusal() {
-        let source = include_str!("discover_cmd.rs");
-        let production = &source[..source.find("#[cfg(test)]").unwrap()];
-        let start = production
-            .find("let mut prepared = crate::oracle::prepare_glibc")
-            .unwrap();
-        let block = &production[start..];
-        let prepared_statement = block.find(';').unwrap() + 1;
-        let validation = block
-            .find("let validation = prepared.revalidate();")
-            .unwrap();
-        let cleanup = block.find("let cleanup = prepared.cleanup();").unwrap();
-        let drop_guard = block.find("drop(prepared);").unwrap();
-        let ensure = block.find("leases.ensure()").unwrap();
-        let seed = block.find("leases.revalidate_seed(module)").unwrap();
-        let saved_validation = block.find("if let Err(error) = validation").unwrap();
-        let refusal = block
-            .find("hardened discovery oracle is incomplete")
-            .unwrap();
-
-        assert!(validation < cleanup && cleanup < drop_guard);
-        assert!(drop_guard < ensure && ensure < seed);
-        assert!(seed < saved_validation && saved_validation < refusal);
-        assert!(!block[prepared_statement..drop_guard].contains('?'));
-        assert!(!block[prepared_statement..drop_guard].contains("leases.ensure"));
     }
 }

@@ -1563,7 +1563,7 @@ impl SynchronousLeaseMonitor {
     }
 }
 
-fn object_changed_exit() -> ! {
+pub(crate) fn object_changed_exit() -> ! {
     // Preserve the established CLI contract while consuming the blocked
     // notification synchronously at an authorization checkpoint.
     unsafe { libc::_exit(OBJECT_CHANGED_EXIT) }

@@ -16,6 +16,7 @@ struct Fixture {
     dir: PathBuf,
     provider: PathBuf,
     marker: PathBuf,
+    fd_marker: PathBuf,
 }
 
 impl Fixture {
@@ -32,13 +33,44 @@ impl Fixture {
         std::fs::create_dir(&marker_dir).unwrap();
         std::fs::set_permissions(&marker_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
         let marker = marker_dir.join("constructor-marker");
+        let fd_marker = marker_dir.join("fd-marker");
         let constructor = dir.join("constructor.c");
         std::fs::write(
             &constructor,
-            r#"#include <fcntl.h>
+            r#"#include <dirent.h>
+#include <fcntl.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
+
+static int one_read_only_self_memory_fd(void) {
+    struct stat memory;
+    if (stat("/proc/self/mem", &memory) != 0) return 0;
+    DIR *directory = opendir("/proc/self/fd");
+    if (!directory) return 0;
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        char *end = NULL;
+        long fd = strtol(entry->d_name, &end, 10);
+        if (!entry->d_name[0] || !end || *end || fd < 0) continue;
+        struct stat opened;
+        if (fstat((int)fd, &opened) != 0) continue;
+        if (opened.st_dev == memory.st_dev && opened.st_ino == memory.st_ino &&
+            (opened.st_mode & S_IFMT) == (memory.st_mode & S_IFMT)) {
+            int flags = fcntl((int)fd, F_GETFL);
+            if (flags < 0 || (flags & O_ACCMODE) != O_RDONLY) {
+                closedir(directory);
+                return 0;
+            }
+            count++;
+        }
+    }
+    closedir(directory);
+    return count == 1;
+}
 
 __attribute__((constructor)) static void mark_constructor(void) {
     const char *state =
@@ -48,6 +80,13 @@ __attribute__((constructor)) static void mark_constructor(void) {
     int fd = open(MARKER_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd >= 0) {
         (void)write(fd, state, strlen(state));
+        (void)close(fd);
+    }
+    const char *fd_state = one_read_only_self_memory_fd()
+        ? "one-read-only-self-memory\n" : "invalid-self-memory-fds\n";
+    fd = open(FD_MARKER_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+        (void)write(fd, fd_state, strlen(fd_state));
         (void)close(fd);
     }
 }
@@ -61,6 +100,7 @@ __attribute__((constructor)) static void mark_constructor(void) {
             .arg(&matrix)
             .arg(&constructor)
             .arg(format!("-DMARKER_PATH=\"{}\"", marker.display()))
+            .arg(format!("-DFD_MARKER_PATH=\"{}\"", fd_marker.display()))
             .status()
             .unwrap();
         assert!(status.success(), "gcc failed to build the barrier provider");
@@ -69,6 +109,7 @@ __attribute__((constructor)) static void mark_constructor(void) {
             dir,
             provider,
             marker,
+            fd_marker,
         }
     }
 
@@ -78,7 +119,7 @@ __attribute__((constructor)) static void mark_constructor(void) {
 
     fn assert_not_loaded(&self) {
         assert!(
-            !self.marker.exists(),
+            !self.marker.exists() && !self.fd_marker.exists(),
             "provider constructor ran before authorization"
         );
     }
@@ -335,6 +376,29 @@ fn provider_load_waits_for_go() {
     );
     let manifest: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(manifest["schema"], "p11scope-manifest/4");
+}
+
+#[test]
+fn controlled_helper_opens_one_read_only_self_memory_fd_after_drop() {
+    let fixture = Fixture::build();
+    let child = spawn_controlled(&fixture.provider);
+
+    assert_eq!(child.packet(), b"PREPARED");
+    fixture.assert_not_loaded();
+    child.send(b"DROP");
+    assert_eq!(child.packet(), b"READY");
+    fixture.assert_not_loaded();
+    child.send(b"GO");
+    let output = child.output();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fixture.fd_marker).unwrap(),
+        "one-read-only-self-memory\n"
+    );
 }
 
 #[test]

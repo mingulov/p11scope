@@ -3,6 +3,7 @@ use anyhow::{Context as _, Result, anyhow};
 use p11scope_manifest::identity::{
     ElfLoader, MappingFileKey, inspect_elf_loader, mapping_file_key,
 };
+use p11scope_manifest::manifest::ProvenanceObject;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
@@ -210,6 +211,16 @@ impl HardenedChildProcess {
             }
         }
         Ok(result)
+    }
+
+    pub(crate) fn memory_identity(&self) -> Result<ProcFdIdentity> {
+        let stat = stat_at(&self.directory, &CString::new("mem").unwrap())
+            .context("identifying hardened child self-memory")?;
+        Ok(ProcFdIdentity {
+            device: stat.st_dev,
+            inode: stat.st_ino,
+            kind: stat.st_mode & libc::S_IFMT,
+        })
     }
 }
 
@@ -1746,6 +1757,18 @@ impl PreparedGlibc<'_> {
     #[allow(dead_code, reason = "polled by the hardened child supervisor in C3.3")]
     pub(crate) fn take_lease_break(&self) -> Result<bool, String> {
         self.leases.take_break()
+    }
+
+    pub(crate) fn stabilization_keys(&self) -> Result<BTreeSet<MappingFileKey>> {
+        self.leases.stabilization_keys()
+    }
+
+    pub(crate) fn seed_key(&self) -> MappingFileKey {
+        self.leases.seed_key()
+    }
+
+    pub(crate) fn retain_reported_nonexiting(&mut self, record: &ProvenanceObject) -> Result<bool> {
+        self.leases.retain_reported_nonexiting(record)
     }
 
     pub(crate) fn helper_fd(&self) -> RawFd {

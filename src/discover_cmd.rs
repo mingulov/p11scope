@@ -9,7 +9,7 @@ use p11scope_manifest::manifest::{Manifest, ProvenanceObject, SCHEMA};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::Read;
-use std::os::fd::AsRawFd as _;
+use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::os::unix::process::ExitStatusExt as _;
@@ -164,9 +164,10 @@ struct RetainedProvenanceObject {
 }
 
 #[derive(Debug)]
-struct ClosureLeases {
+pub(crate) struct ClosureLeases {
     // Drop lease-bearing fds before restoring SIGIO delivery.
     objects: BTreeMap<MappingFileKey, RetainedProvenanceObject>,
+    influences: Vec<File>,
     monitor: crate::verify::SynchronousLeaseMonitor,
     seed: MappingFileKey,
     total_bytes: u64,
@@ -179,6 +180,7 @@ impl ClosureLeases {
         let seed = record_key(&record);
         let mut leases = Self {
             objects: BTreeMap::new(),
+            influences: Vec::new(),
             monitor,
             seed,
             total_bytes: 0,
@@ -245,6 +247,36 @@ impl ClosureLeases {
         self.objects.keys().copied().collect()
     }
 
+    pub(crate) fn retain_influence(&mut self, file: File, label: &str) -> Result<RawFd> {
+        let file = normalize_influence_fd(file)?;
+        let len = file
+            .metadata()
+            .with_context(|| format!("reading hardened influence metadata for {label}"))?
+            .len();
+        let total = self
+            .total_bytes
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("hardened influence closure size overflowed u64"))?;
+        if total > crate::verify::MAX_TOTAL_OBJECT_BYTES {
+            bail!(
+                "hardened influence closure totals more than the {}-byte limit",
+                crate::verify::MAX_TOTAL_OBJECT_BYTES
+            );
+        }
+        self.monitor.acquire(&file).map_err(anyhow::Error::msg)?;
+        let fd = file.as_raw_fd();
+        self.total_bytes = total;
+        self.influences.push(file);
+        self.ensure().map_err(anyhow::Error::msg)?;
+        Ok(fd)
+    }
+
+    pub(crate) fn file(&self, fd: RawFd) -> Option<&File> {
+        self.influences
+            .iter()
+            .find(|influence| influence.as_raw_fd() == fd)
+    }
+
     fn revalidate_seed(&self, module: &Path) -> Result<()> {
         let (record, _file) = current_provenance_object(module)?;
         let Some(retained) = self.objects.get(&self.seed) else {
@@ -257,10 +289,26 @@ impl ClosureLeases {
         Ok(())
     }
 
-    fn ensure(&self) -> Result<(), String> {
-        self.monitor
-            .ensure(self.objects.values().map(|object| &object.file))
+    pub(crate) fn ensure(&self) -> Result<(), String> {
+        self.monitor.ensure(
+            self.objects
+                .values()
+                .map(|object| &object.file)
+                .chain(self.influences.iter()),
+        )
     }
+}
+
+fn normalize_influence_fd(file: File) -> Result<File> {
+    if file.as_raw_fd() > 2 {
+        return Ok(file);
+    }
+    let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if fd == -1 {
+        return Err(std::io::Error::last_os_error())
+            .context("moving hardened influence fd above stdio");
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 fn same_identity(
@@ -406,9 +454,31 @@ fn rediscover_stable_selected(
         crate::oracle::OracleMode::TrustedWorkload => {
             rediscover_stable_with_helper(helper_path, module)
         }
-        crate::oracle::OracleMode::Hardened => bail!(
-            "hardened discovery oracle is incomplete until the pinned loader/runtime closure and PREPARED/DROP/READY/GO validation are installed"
-        ),
+        crate::oracle::OracleMode::Hardened => {
+            let helper = open_trusted_helper(helper_path)?;
+            let mut leases = ClosureLeases::new(module)?;
+            let mut prepared = crate::oracle::prepare_glibc(helper, helper_path, &mut leases)?;
+            let validation = prepared.revalidate();
+            let cleanup = prepared.cleanup();
+            drop(prepared);
+            if let Err(error) = cleanup {
+                return Err(error).context("cleaning hardened glibc preparation");
+            }
+            let lease_check = leases.ensure().map_err(anyhow::Error::msg);
+            let seed_check = leases.revalidate_seed(module);
+            if let Err(error) = lease_check {
+                return Err(error).context("rechecking hardened glibc leases after cleanup");
+            }
+            if let Err(error) = seed_check {
+                return Err(error).context("revalidating the provenance seed after cleanup");
+            }
+            if let Err(error) = validation {
+                return Err(error).context("revalidating hardened glibc preparation");
+            }
+            bail!(
+                "hardened discovery oracle is incomplete until PREPARED/DROP/READY/GO validation is installed"
+            )
+        }
     }
 }
 
@@ -1023,7 +1093,94 @@ int main(void) {
     }
 
     #[test]
-    fn hardened_selection_fails_closed_until_the_hardened_runner_exists() {
+    fn hardened_influences_use_the_closure_lease_monitor_and_fd_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("module.so");
+        let runtime = dir.path().join("runtime.so");
+        std::fs::copy("/bin/true", &module).unwrap();
+        std::fs::copy("/bin/false", &runtime).unwrap();
+        let mut leases = ClosureLeases::new(&module).unwrap();
+
+        let fd = leases
+            .retain_influence(std::fs::File::open(&runtime).unwrap(), "glibc runtime")
+            .unwrap();
+
+        assert!(fd > 2);
+        assert_eq!(
+            mapping_file_key(leases.file(fd).unwrap()).unwrap(),
+            mapping_file_key(&std::fs::File::open(&runtime).unwrap()).unwrap()
+        );
+        leases.ensure().unwrap();
+    }
+
+    #[test]
+    fn hardened_glibc_preflight_leases_revalidates_and_cleans_test_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        for directory in [
+            "opt",
+            "lib64",
+            "usr",
+            "usr/lib",
+            "usr/lib/x86_64-linux-gnu",
+            "usr/lib64",
+            "etc",
+            "run",
+        ] {
+            std::fs::create_dir(root.path().join(directory)).unwrap();
+            std::fs::set_permissions(
+                root.path().join(directory),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let helper = root.path().join("opt/p11scope-discover");
+        let module = root.path().join("opt/provider.so");
+        let interpreter = root.path().join("lib64/ld-linux-x86-64.so.2");
+        let libc = root.path().join("usr/lib/x86_64-linux-gnu/libc.so.6");
+        std::fs::copy("/bin/true", &helper).unwrap();
+        std::fs::copy("/bin/false", &module).unwrap();
+        std::fs::copy("/lib64/ld-linux-x86-64.so.2", &interpreter).unwrap();
+        std::fs::copy("/usr/lib/x86_64-linux-gnu/libc.so.6", &libc).unwrap();
+        std::fs::hard_link(
+            &interpreter,
+            root.path()
+                .join("usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"),
+        )
+        .unwrap();
+        for file in [&helper, &module, &interpreter, &libc] {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let owner = unsafe { libc::geteuid() };
+        let mut leases = ClosureLeases::new(&module).unwrap();
+
+        let mut prepared = crate::oracle::prepare_glibc_test_root(
+            root.path(),
+            Path::new("/opt/p11scope-discover"),
+            owner,
+            &mut leases,
+        )
+        .unwrap();
+
+        prepared.revalidate().unwrap();
+        std::fs::write(root.path().join("etc/ld.so.preload"), []).unwrap();
+        let error = prepared.revalidate().unwrap_err();
+        assert!(error.to_string().contains("appeared"), "{error:#}");
+        std::fs::remove_file(root.path().join("etc/ld.so.preload")).unwrap();
+        prepared.revalidate().unwrap();
+        prepared.cleanup().unwrap();
+        drop(prepared);
+        leases.ensure().unwrap();
+        assert_eq!(
+            std::fs::read_dir(root.path().join("run/p11scope"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn hardened_selection_preflights_instead_of_routing_to_legacy() {
         let error = rediscover_stable_selected(
             Path::new("/missing/p11scope-discover"),
             Path::new("/missing/provider.so"),
@@ -1036,8 +1193,41 @@ int main(void) {
         assert!(
             error
                 .to_string()
-                .contains("hardened discovery oracle is incomplete"),
+                .contains("opening discovery oracle helper"),
             "{error:#}"
         );
+        assert!(
+            !error
+                .to_string()
+                .contains("hardened discovery oracle is incomplete")
+        );
+    }
+
+    #[test]
+    fn hardened_stage_is_cleaned_before_lease_check_and_c3_refusal() {
+        let source = include_str!("discover_cmd.rs");
+        let production = &source[..source.find("#[cfg(test)]").unwrap()];
+        let start = production
+            .find("let mut prepared = crate::oracle::prepare_glibc")
+            .unwrap();
+        let block = &production[start..];
+        let prepared_statement = block.find(';').unwrap() + 1;
+        let validation = block
+            .find("let validation = prepared.revalidate();")
+            .unwrap();
+        let cleanup = block.find("let cleanup = prepared.cleanup();").unwrap();
+        let drop_guard = block.find("drop(prepared);").unwrap();
+        let ensure = block.find("leases.ensure()").unwrap();
+        let seed = block.find("leases.revalidate_seed(module)").unwrap();
+        let saved_validation = block.find("if let Err(error) = validation").unwrap();
+        let refusal = block
+            .find("hardened discovery oracle is incomplete")
+            .unwrap();
+
+        assert!(validation < cleanup && cleanup < drop_guard);
+        assert!(drop_guard < ensure && ensure < seed);
+        assert!(seed < saved_validation && saved_validation < refusal);
+        assert!(!block[prepared_statement..drop_guard].contains('?'));
+        assert!(!block[prepared_statement..drop_guard].contains("leases.ensure"));
     }
 }

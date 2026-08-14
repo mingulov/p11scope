@@ -7,3 +7,4 @@ spike/work/
 target/
 spike/aya-offset-pin/work/
 crates/ebpf/target/
+__pycache__/

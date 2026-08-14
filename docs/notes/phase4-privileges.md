@@ -2,8 +2,12 @@
 
 > Historical measurement note: these results predate the 2026-08-13
 > same-inode hardening. Current authorization requires file ownership or
-> `CAP_LEASE` in addition to the BPF/procfs capabilities measured here. The
-> script is updated, but that privileged rerun is still pending approval.
+> `CAP_LEASE` in addition to the BPF/procfs capabilities measured here.
+> `scripts/matrix/verify-fork-scope.sh` encodes the `CAP_SYS_ADMIN`+`CAP_LEASE`
+> lane and was corrected on 2026-08-14 to stop asserting a terminal
+> `COMPLETE`, but it has **not** been rerun. The minimum capability set is
+> therefore still inherited from the measurements below rather than freshly
+> derived; every 2026-08-14 live lane ran as root.
 
 ## Part 1: fork scoping
 

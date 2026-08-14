@@ -2,31 +2,76 @@
 
 ## Unreleased corrective release
 
-This section describes work in progress, not a releasable artifact. Deep
-review on 2026-08-13 reopened the safe-metadata, lazy-dependency provenance,
-`$ORIGIN`, and lease-break teardown gates; the amended designs require
-manifest v4 and observed-profile v1.4/v1.1-metrics before release.
+The gates reopened by the 2026-08-13 deep review — safe metadata,
+lazy-dependency provenance, `$ORIGIN`, and lease-break teardown — are
+implemented, and the privileged host and container lanes have been rerun
+against them. Not yet done: the final consolidated security re-review, and any
+packaging, tag, or publication. This is reviewed engineering work awaiting its
+release gate.
 
-- Discovery now snapshots provider pointers through bounded process-memory
-  reads and emits `p11scope-manifest/3` with byte-safe mapping evidence,
-  reporting build IDs, and mandatory whole-file SHA-256 identities.
-- Stored manifests no longer authorize probes by themselves: every attach
-  requires bounded fresh unprivileged discovery through a pinned trusted
-  sibling helper, an explicit operator-selected `--provenance-module`, and
-  exact function-name/object/offset provenance agreement.
-- The first pass read-leases candidate attach objects and re-hashes after
-  attach. Full exact-inode dependency stabilization and supervisor-ordered
-  teardown remain open release work. The authorization helper has an empty
-  environment, 16 MiB output cap, and 30-second process-group deadline.
-- Cumulative function-table support covers 2.00, 2.01–2.40, 3.0, 3.1, and
-  all 104 published 3.2 slots. Alternate/null interface names are walked only
-  as structurally corroborated prefixes; vendor lookalikes stay undecoded.
+**Safe by default**
+
+- Capture policy is fixed in the eBPF object before attachment and its policy
+  maps are frozen, so the emitted `capture.privacy_mode` describes kernel
+  behavior, not userspace intent. `profile`/`trace` default to `allowlisted`;
+  `metrics` is always `aggregate-only` and reads no call arguments at all.
+- Under `allowlisted`, pointer-derived bytes reach output only by exact
+  membership in a finite published set — the mechanism registry, or the 104
+  published function names. Aliasing a metadata pointer into unrelated
+  readable memory yields no decoded value rather than an arbitrary read.
+- The previous unvalidated fixed-offset decoders survive only behind the
+  off-by-default `unsafe-unvalidated-metadata` Cargo feature *and* an explicit
+  `--unsafe-unvalidated-metadata` flag. The flag cannot reach code absent from
+  the object, `metrics` refuses it, and the official artifact is built
+  `--no-default-features` with packaging that fails if the unsafe path is
+  reachable.
+
+**Provenance and continuity**
+
+- Discovery emits `p11scope-manifest/4`: bounded process-memory pointer
+  snapshots, reporting build IDs, mandatory whole-file SHA-256 identities, and
+  the exact-inode provenance closure recorded separately from attach objects.
+- Stored manifests never authorize probes by themselves. Every attach requires
+  bounded fresh unprivileged discovery through a pinned root-owned sibling
+  helper, an operator-selected `--provenance-module`, and exact
+  function-name/object/offset agreement. There is no raw-manifest bypass.
+- Authorization accepts only a pass in which every file-backed executable
+  mapping was read-leased beforehand; the provider loads by absolute path so
+  `$ORIGIN` and lazy dependencies resolve as the target sees them. Content
+  identity alone is treated as insufficient — a path can be retargeted to a
+  byte-identical unleased inode — so comparison is by exact inode with a
+  bounded churn retry.
+- Before any BPF load the CLI becomes a lease supervisor and forks the worker.
+  A lease break kills the worker through its pidfd, releases leases, and exits
+  78. Profile output publishes atomically only on normal completion; an
+  aborted trace still receives a terminal `PARTIAL` `EVIDENCE` record naming
+  the break reason, so truncation cannot read as completeness.
+
+**Evidence**
+
+- A written profile is now always `PARTIAL`: a detached perf link does not
+  wait for BPF callbacks already running on another CPU, so no terminal
+  snapshot can prove a final drain. A clean run is `PARTIAL` with every
+  concrete gap counter zero, asserted by
+  `scripts/check-capture-evidence.py: terminal_capture_is_clean`.
 - Independent START, RV, cgroup, semantic, process, fork, cancellation, and
-  async loss evidence prevents a degraded capture from reporting complete.
-- Profile output is `pkcs11-scope/observed-profile/v1.3`; metrics output is
-  `pkcs11-scope/observed-profile/v1-metrics`. See the schema migration note for
-  the corrected `sessions.closed` meaning.
-- The release gates now exercise live verifier loading, observer-owned map-id
+  async loss evidence still prevents a degraded capture from overclaiming.
+- Cumulative function-table support covers 2.00, 2.01–2.40, 3.0, 3.1, and all
+  104 published 3.2 slots. Alternate/null interface names are walked only as
+  structurally corroborated prefixes; vendor lookalikes stay undecoded.
+- Schemas: profile `v1.4`, metrics `v1.1-metrics`. Profile `v1.3` and
+  `v1-metrics` were internal waypoints that no consumer received, so the
+  published migrations are v1.2→v1.4 and v0-metrics→v1.1-metrics.
+
+**Operations**
+
+- `scripts/attach-pod.sh` wraps the previously manual existing-pod workflow:
+  resolve namespace/pod/container to a host cgroup and PID, safe-copy and
+  discover the provider, rewrite attach paths, and run the trusted cgroup
+  capture. It requires an explicit `--trusted-workload` acknowledgement.
+- Container provider copies are byte-capped, so a compromised image cannot
+  fill the host filesystem through the copy step.
+- The release gates exercise live verifier loading, observer-owned map-id
   canaries, START/RV/ring saturation, and dynamic glibc/musl 68/92/104 walks.
 
 ## v0.1.0

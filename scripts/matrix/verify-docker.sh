@@ -96,8 +96,9 @@ case $PROVIDER_REAL in /*/*) ;; *) echo "invalid resolved provider path: $PROVID
 PROVIDER_DIR=${PROVIDER_REAL%/*}
 PROVIDER_BASE=${PROVIDER_REAL##*/}
 mkdir -p "$SAFE_ROOT"
-timeout --signal=TERM --kill-after=5s 60s docker exec "$NAME" \
-    tar -h -c -f - -C "$PROVIDER_DIR" . > "$WORK/provider.tar"
+capped_container_tar "$WORK/provider.tar" \
+    timeout --signal=TERM --kill-after=5s 60s docker exec "$NAME" \
+    tar -h -c -f - -C "$PROVIDER_DIR" .
 tar -xf "$WORK/provider.tar" -C "$SAFE_ROOT"
 rm -f "$WORK/provider.tar"
 PROVENANCE_MODULE="$SAFE_ROOT/$PROVIDER_BASE"

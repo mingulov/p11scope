@@ -313,6 +313,84 @@ fn task6_review_staging_paths_are_exact_and_publication_is_shared() {
 }
 
 #[test]
+fn container_provider_streams_are_byte_capped() {
+    // A hostile image controls how many bytes the copy step reads. Under the
+    // cap succeeds; reaching the cap and an empty stream both refuse, so a
+    // truncated archive can never become an attach plan.
+    let status = Command::new("sh")
+        .args([
+            "-c",
+            ". scripts/trusted-p11scope.sh; \
+             out=$(mktemp) || exit 1; \
+             MAX_CONTAINER_TAR_BYTES=64; \
+             capped_container_tar \"$out\" printf 'small' 2>/dev/null && \
+             ! capped_container_tar \"$out\" sh -c 'head -c 4096 /dev/zero' 2>/dev/null && \
+             ! capped_container_tar \"$out\" true 2>/dev/null; \
+             result=$?; rm -f \"$out\"; exit $result",
+        ])
+        .status()
+        .expect("exercise the container stream cap");
+    assert!(status.success(), "container tar cap rejected its contract");
+
+    for path in [
+        "scripts/attach-pod.sh",
+        "scripts/matrix/verify-docker.sh",
+        "scripts/matrix/verify-shared-layer.sh",
+        "scripts/matrix/verify-kind-pod.sh",
+        "scripts/matrix/verify-knative.sh",
+    ] {
+        let script = read(path);
+        assert!(script.contains("capped_container_tar"), "{path}");
+        assert!(!script.contains(". > \"$WORK/provider.tar\""), "{path}");
+    }
+}
+
+#[test]
+fn existing_pod_wrapper_refuses_without_acknowledgement_and_shares_authority() {
+    // The cgroup lane assumes an honest provider. The wrapper must not launder
+    // that acknowledgement on the operator's behalf, and must reach attachment
+    // through the same safe-copy/rewrite/provenance path as the gates.
+    let refused = Command::new("sh")
+        .args([
+            "scripts/attach-pod.sh",
+            "--pod",
+            "example",
+            "--module",
+            "/usr/lib/softhsm/libsofthsm2.so",
+        ])
+        .output()
+        .expect("run the wrapper without acknowledgement");
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--trusted-workload"),
+        "wrapper did not name the missing acknowledgement"
+    );
+
+    let relative = Command::new("sh")
+        .args([
+            "scripts/attach-pod.sh",
+            "--pod",
+            "example",
+            "--module",
+            "lib/libsofthsm2.so",
+            "--trusted-workload",
+        ])
+        .output()
+        .expect("run the wrapper with a relative module");
+    assert_eq!(relative.status.code(), Some(2));
+
+    let script = read("scripts/attach-pod.sh");
+    assert!(script.contains("require_non_root_caller"));
+    assert!(script.contains("container-authority.py validate-copy"));
+    assert!(script.contains("container-authority.py rewrite"));
+    assert!(script.contains("lease-evidence"));
+    assert!(script.contains("--provenance-module"));
+    assert!(script.contains("create_protected_output_dir"));
+    assert!(script.contains("publish_protected_file"));
+    assert!(!script.contains("--trust-manifest"));
+}
+
+#[test]
 fn task6_review_hostile_lane_pins_sysctl_toolchain_and_target_identity() {
     let release = read("scripts/build-release.sh");
     assert!(release.contains("rustup target add --toolchain 1.88 x86_64-unknown-linux-musl"));
@@ -1364,16 +1442,21 @@ fn task6_knative_proves_zero_service_pods_immediately_before_attach() {
 #[test]
 fn public_docs_pin_current_schema_support_and_stable_privacy_symbols() {
     let readme = read("README.md");
-    for marker in ["observed-profile/v1.3", "2.00", "2.40", "3.2", "Alternate"] {
+    for marker in ["observed-profile/v1.4", "2.00", "2.40", "3.2", "Alternate"] {
         assert!(readme.contains(marker), "README misses {marker}");
+    }
+    // The internal corrective waypoints must not reach a public document.
+    for stale in ["observed-profile/v1.3", "observed-profile/v1-metrics"] {
+        assert!(!readme.contains(stale), "README still names {stale}");
     }
 
     let schema = read("docs/schema/observed-profile-v1.md");
     for marker in [
-        "p11scope-manifest/3",
-        "observed-profile/v1.3",
-        "observed-profile/v1-metrics",
-        "v1.2 → v1.3",
+        "p11scope-manifest/4",
+        "observed-profile/v1.4",
+        "observed-profile/v1.1-metrics",
+        "v1.2 → v1.4",
+        "v0-metrics → v1.1-metrics",
         "process_tracking_failures",
         "sessions.closed",
     ] {
@@ -1396,6 +1479,11 @@ fn public_docs_pin_current_schema_support_and_stable_privacy_symbols() {
         !allowlist.contains(".rs:"),
         "privacy contract uses unstable source line citations"
     );
+    // The transient raw pointer is shipped state, not a future plan.
+    assert!(
+        allowlist.contains("Transient mechanism pointer") && !allowlist.contains("In future"),
+        "privacy contract does not describe the shipped transient pointer row"
+    );
 
     let usage = read("docs/usage.md");
     let main = read("src/main.rs");
@@ -1403,6 +1491,23 @@ fn public_docs_pin_current_schema_support_and_stable_privacy_symbols() {
         assert!(source.contains("due to attach cookies"));
         assert!(!source.contains("5.15 native cgroup"));
     }
+
+    // Safe-by-default is the headline public claim; both docs must state the
+    // policy names and that the unsafe path needs a build feature, not a flag.
+    for (path, source) in [("README.md", &readme), ("docs/usage.md", &usage)] {
+        assert!(
+            source.contains("allowlisted"),
+            "{path} misses the default policy"
+        );
+        assert!(
+            source.contains("unsafe-unvalidated-metadata"),
+            "{path} misses the opt-in unsafe policy"
+        );
+    }
+    assert!(
+        usage.contains("PARTIAL"),
+        "usage does not explain terminal PARTIAL completeness"
+    );
 }
 
 #[test]

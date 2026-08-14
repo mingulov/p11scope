@@ -1,22 +1,30 @@
-# `observed-profile.json` schema v1.3
+# `observed-profile.json` schema v1.4
 
 Current schema identifiers:
 
-- profile: `pkcs11-scope/observed-profile/v1.3`
-- metrics: `pkcs11-scope/observed-profile/v1-metrics`
+- profile: `pkcs11-scope/observed-profile/v1.4`
+- metrics: `pkcs11-scope/observed-profile/v1.1-metrics`
 
-These are interim schemas for the unreleased corrective tree, not the final
-safe-policy contract. Implementing the approved privacy design advances them
-to profile v1.4 and metrics v1.1-metrics; consumers must not reinterpret old
-documents under the new semantics.
+The safe-policy implementation landed before publication, so `v1.3` and
+`v1-metrics` were internal corrective-tree waypoints that no consumer ever
+received. The published migrations are therefore **v1.2 → v1.4** and
+**v0-metrics → v1.1-metrics**; nothing observes a v1.3 document. Schema
+identifiers are opaque exact dispatch keys — the apparent major/minor spelling
+grants no compatibility, and a consumer must dispatch on the exact string.
 
-`p11scope-manifest/3` is a separate discovery input schema. Version 3 keeps a
-GNU build-ID when present and adds a mandatory whole-file SHA-256 used for
-fresh attach authorization. Authorization also requires fresh table
-provenance and candidate-object read leases, but the current first pass has
-open `$ORIGIN`, dependency-closure, and teardown-order findings. Manifest v4
-adds the exact-inode provenance closure required by the corrected design. A
-profile consumer must dispatch on the exact observed-profile schema string.
+Both documents carry `capture.privacy_mode`, naming the policy that produced
+them: `allowlisted` (the profile/trace default), `aggregate-only` (the only
+metrics policy, which reads no call arguments at all), or
+`unsafe-unvalidated-metadata`. The policy is fixed in the eBPF object before
+attachment and its maps are frozen, so the label describes kernel behavior
+rather than a userspace intention.
+
+`p11scope-manifest/4` is a separate discovery input schema. It keeps a GNU
+build-ID when present, carries the mandatory whole-file SHA-256 used for fresh
+attach authorization, and adds the exact-inode provenance closure: the
+complete file-backed executable mapping set that must be read-leased before
+the authorizing rediscovery pass, recorded separately from the attach objects
+themselves.
 
 ## Data authority
 
@@ -38,7 +46,7 @@ Profile mode always emits:
 
 ```json
 {
-  "schema": "pkcs11-scope/observed-profile/v1.3",
+  "schema": "pkcs11-scope/observed-profile/v1.4",
   "capture": {},
   "evidence": {},
   "functions": [],
@@ -129,6 +137,15 @@ fields permitted in a complete document are the explicitly informational
 a structurally corroborated known prefix, but that surface deliberately keeps
 the verdict `PARTIAL`.
 
+**A written profile is always `PARTIAL`.** Detaching a perf link stops new
+probe invocations but does not wait for BPF callbacks already executing on
+another CPU, so no terminal snapshot can prove it drained everything. The
+in-capture verdict above still governs live rendering, and the final document
+is downgraded once on the way out. Read a clean run as `PARTIAL` with every
+concrete gap counter zero — that combination, not the `COMPLETE` string, is
+what the release lanes assert
+(`scripts/check-capture-evidence.py: terminal_capture_is_clean`).
+
 `trace` ends with `EVIDENCE {json}`. The JSON object is this same evidence
 contract, including its final `completeness` verdict; `LOST n events` remains
 an immediate human-readable notification when ring loss grows.
@@ -204,14 +221,33 @@ captured.
 Each item has numeric `cgroup_id`, best-effort `label`, calls, errors, and a
 per-mechanism breakdown. A missing label is `null`; the resolver never guesses.
 
-## Metrics v1 migration
+## v0-metrics → v1.1-metrics migration
 
-`pkcs11-scope/observed-profile/v1-metrics` replaces the experimental
+`pkcs11-scope/observed-profile/v1.1-metrics` replaces the experimental
 `v0-metrics`. This is intentionally a major schema change: `capture.module`
 is now `{path, build_id}`, function return codes are full-width, and the
-expanded evidence object carries independent loss classes.
+expanded evidence object carries independent loss classes. It additionally
+carries `capture.privacy_mode`, always `aggregate-only`: metrics mode reads no
+call arguments in the kernel at all, so it cannot contain argument-derived
+metadata regardless of build features.
 
-## v1.2 → v1.3 migration
+## v1.2 → v1.4 migration
+
+Everything in the v1.2 → v1.3 section below applies, plus the safe-policy
+revision:
+
+- `capture.privacy_mode` names the kernel capture policy that produced the
+  document (`allowlisted` by default, `unsafe-unvalidated-metadata` only in a
+  build that opted into the feature *and* passed the flag).
+- Under `allowlisted`, pointer-derived metadata appears only when it matched
+  the finite published mechanism registry or the 104-name function catalog
+  exactly. A caller that aliases a metadata pointer elsewhere yields no
+  decoded value rather than an arbitrary read.
+- Mechanism parameter and template decoding beyond that finite equality is
+  absent from the default eBPF object, so `params: null` is now the normal
+  result for shapes the safe policy does not cover.
+
+### v1.2 → v1.3 (folded into the above; v1.3 was never published)
 
 This is a semantic, not merely additive, revision:
 
@@ -228,7 +264,7 @@ This is a semantic, not merely additive, revision:
 - `sessions.balance` is now `opened + inherited - closed`.
 
 Earlier v1/v1.1/v1.2 documents remain distinguishable by their schema strings;
-consumers must not reinterpret them as v1.3.
+consumers must not reinterpret them as v1.4.
 
 ## Privacy boundary
 

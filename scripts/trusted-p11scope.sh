@@ -171,6 +171,27 @@ cleanup_step() {
     return 0
 }
 
+# A controlled provider directory is a few megabytes. Cap the stream so a
+# compromised or hostile image cannot fill the host filesystem through the
+# copy step, and refuse a stream that reaches the cap rather than attaching
+# from a silently truncated archive.
+MAX_CONTAINER_TAR_BYTES=${MAX_CONTAINER_TAR_BYTES:-268435456}
+
+capped_container_tar() {
+    cct_out=$1
+    shift
+    "$@" | head -c "$MAX_CONTAINER_TAR_BYTES" > "$cct_out" || return 1
+    cct_size=$(stat -Lc %s "$cct_out") || return 1
+    [ "$cct_size" -gt 0 ] || {
+        echo "container provider stream produced no bytes" >&2
+        return 1
+    }
+    [ "$cct_size" -lt "$MAX_CONTAINER_TAR_BYTES" ] || {
+        echo "container provider stream reached the $MAX_CONTAINER_TAR_BYTES byte cap" >&2
+        return 1
+    }
+}
+
 require_rewritten_authority_refusal() {
     printf '%s\n' "$1" \
         | grep -F "$2: cannot open the file now (" \

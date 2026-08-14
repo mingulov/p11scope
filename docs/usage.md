@@ -5,12 +5,13 @@ how to run it, and what its output actually proves. Every number below
 cites the script that produced it — re-run the script to check it
 yourself.
 
-> **Unreleased security status:** this corrective worktree is not
-> release-ready. Its current default metadata decoder assumes trusted ABI-valid
-> pointer placement, and its first provenance/lease pass has open dependency
-> and teardown gaps. See the
+> **Status: unreleased, not tagged or published.** The safe-by-default capture
+> policy and the provenance/lease authorization protocol are implemented, and
+> the privileged host and container lanes have been rerun against them. The
+> final consolidated security re-review and the release itself have not
+> happened. See the
 > [safe metadata design](superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md)
-> and [corrected provenance plan](superpowers/plans/2026-08-13-manifest-provenance.md).
+> and [provenance plan](superpowers/plans/2026-08-13-manifest-provenance.md).
 
 - [What it does](#what-it-does)
 - [What it does NOT do](#what-it-does-not-do)
@@ -39,11 +40,22 @@ for a bounded investigation window (`trace` mode), and writes a versioned
 There is no decoder or dump flag for PINs, key material, `CKA_VALUE`, labels,
 `CKA_ID`, plaintext, ciphertext, signatures, wrapped blobs, random output,
 operation-state blobs, raw mechanism byte arrays, raw session handles, or
-ordinary buffers. This is not yet a hostile-pointer guarantee: the current
-unreleased decoder follows caller-selected metadata pointers, so malicious
-aliasing can expose selected unrelated scalar words or bytes. The safe-default
-design linked above removes those dereferences unless an explicit diagnostic
-feature and flag are both enabled. See
+ordinary buffers.
+
+The default capture policy is `allowlisted`. Under it, pointer-derived bytes
+reach output only by exact membership in a finite published set — a mechanism
+id in the registry, or one of the 104 published function names — so a caller
+that aliases a metadata pointer into unrelated readable memory produces no
+decoded value rather than an arbitrary read. `metrics` mode uses
+`aggregate-only`, which reads no call arguments in the kernel at all.
+
+The older unvalidated fixed-offset decoders still exist as a diagnostic, but
+only in a build compiled with the off-by-default `unsafe-unvalidated-metadata`
+Cargo feature *and* run with `--unsafe-unvalidated-metadata`. The flag alone
+cannot enable code absent from the shipped eBPF object, `metrics` refuses the
+flag, and the observer prints a warning naming the exposure when it is active.
+The official release artifact is built `--no-default-features`, and packaging
+fails if the unsafe path is reachable. See
 [docs/superpowers/specs/2026-08-10-pkcs11-scope-outputs.md](superpowers/specs/2026-08-10-pkcs11-scope-outputs.md#what-you-will-not-see-by-design-in-every-mode)
 for the design commitment and
 [docs/privacy/allowlist-v1.md](privacy/allowlist-v1.md) for the field-by-field
@@ -88,6 +100,33 @@ p11scope profile --manifest manifest.json --provenance-module /usr/lib/softhsm/l
 # 3. Or: stream one line per call for a short, bounded investigation.
 p11scope trace --manifest manifest.json --provenance-module /usr/lib/softhsm/libsofthsm2.so --pid 12345 --duration 15
 ```
+
+### Attaching to an existing Kubernetes pod
+
+Those steps get longer for a pod: you have to resolve the pod's container to a
+host cgroup and PID, copy the provider directory out as regular files (a
+manifest cannot authorize attachment through a path the workload controls),
+discover from that copy, rewrite the attach paths into the target's `/proc`
+view, and only then capture. `scripts/attach-pod.sh` does exactly that,
+reusing the same staging and authority helpers as the release gates:
+
+```bash
+# Run on the node hosting the pod, as a non-root user with passwordless sudo.
+scripts/attach-pod.sh --namespace prod --pod api-7d9f --container api \
+    --module /usr/lib/softhsm/libsofthsm2.so \
+    --trusted-workload --duration 60 -o observed-profile.json
+```
+
+`--trusted-workload` is required and not defaulted. Capturing an existing pod
+through its cgroup assumes an honest, ABI-valid provider; the hostile-target
+guarantee belongs to the fixed-PID static observer lane, not this one. The
+wrapper refuses rather than guessing on your behalf.
+
+Caveat, stated plainly: this wrapper has never been run against a live
+cluster. Its argument handling and refusal path are covered by
+`tests/release_contracts.rs`, and every step it performs is the same sequence
+the kind and Knative gates execute and pass — but the composed script itself
+is unproven. Treat its first run as an experiment.
 
 The application may already have mapped the provider at an unrelated ASLR
 address. That is expected: discovery converts each live table pointer to an
@@ -333,19 +372,31 @@ Manifests are untrusted proposed plans. Their table provenance is freshly
 reproduced before attach; every object carries an always-computed whole-file
 SHA-256 (GNU build-ID remains reporting evidence), files are identified
 through pinned regular-file descriptors, and offsets must land in executable
-ELF segments. Those checks prevent several stale/path-retarget cases, but the
-current first pass is not release authorization: it does not yet establish a
-pre-leased exact-inode closure for lazy dependencies or ordered probe teardown
-on a lease break. Manifest v4 and the lease-supervisor protocol in the corrected
-provenance plan are required before release. The current oracle has an empty
-environment and a 30-second deadline. Inputs are capped at a 16 MiB manifest,
-16 MiB oracle output, 256 MiB per object, and 512 MiB across all objects.
+ELF segments. Authorization accepts a mapping only from a bounded rediscovery
+pass in which every file-backed executable mapping — the manifest v4
+exact-inode closure, including lazy dependencies — was read-leased before the
+pass began, with the provider loaded by absolute path so `$ORIGIN` resolves as
+the target sees it. A lease break kills the capture worker through its pidfd
+and exits 78 rather than continuing against changed bytes. The oracle has an
+empty environment and a 30-second deadline. Inputs are capped at a 16 MiB
+manifest, 16 MiB oracle output, 256 MiB per object, and 512 MiB across all
+objects.
 
 **`COMPLETE`** requires every manifest surface to be fully acquired and
 walked, every planned probe attached, and zero discovery, START/RV/ring,
 cgroup, process-identity, semantic-state, fork, cancellation, async,
 template, or parameter-decode gaps. The schema document lists every field
 and the four explicitly informational exceptions.
+
+**In a written profile you will not see `COMPLETE`.** Detaching a perf link
+stops new probe invocations but does not wait for BPF callbacks already
+running on another CPU, so a terminal snapshot cannot honestly claim it
+drained everything, and the final document is downgraded to `PARTIAL` on the
+way out. The verdict above still governs the live display during capture.
+What a clean run looks like is `PARTIAL` with every concrete gap counter at
+zero — that is exactly what the release lanes assert, via
+`scripts/check-capture-evidence.py: terminal_capture_is_clean`. If you are
+diffing against older notes that record `COMPLETE` rows, this is the reason.
 
 `COMPLETE` describes the completeness of the accepted capture window. It is
 not a claim that deliberately malicious native provider code truthfully

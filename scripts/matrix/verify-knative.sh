@@ -160,8 +160,9 @@ PROVIDER_REAL=$(timeout --signal=TERM --kill-after=5s 60s kubectl exec "$ANCHOR"
     readlink -f "$MODULE_IN_POD")
 PROVIDER_DIR=${PROVIDER_REAL%/*}
 PROVIDER_NAME=${PROVIDER_REAL##*/}
-timeout --signal=TERM --kill-after=5s 60s kubectl exec "$ANCHOR" -- \
-    tar -chC "$PROVIDER_DIR" . > "$WORK/provider.tar"
+capped_container_tar "$WORK/provider.tar" \
+    timeout --signal=TERM --kill-after=5s 60s kubectl exec "$ANCHOR" -- \
+    tar -chC "$PROVIDER_DIR" .
 tar -xf "$WORK/provider.tar" -C "$WORK/provider-safe"
 SAFE_MODULE="$PWD/$WORK/provider-safe/$PROVIDER_NAME"
 timeout --signal=TERM --kill-after=5s 60s python3 \

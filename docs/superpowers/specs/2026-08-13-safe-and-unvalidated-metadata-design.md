@@ -6,6 +6,9 @@
 
 **Amends:** `docs/superpowers/specs/2026-08-12-v0.1-corrective-release-design.md`
 
+**Implementation plan:**
+`docs/superpowers/plans/2026-08-13-safe-and-unvalidated-metadata.md`
+
 ## Goal
 
 Keep mechanism profiling useful without letting an arbitrary readable target
@@ -270,6 +273,16 @@ can influence an attached program. Any required publication, supported
 readback, or freeze failure aborts. Dynamic data maps such as `START`, `STATS`,
 `RV_COUNTS`, `EVENTS`, and `EVIDENCE` are not frozen.
 
+Aya 0.14.0 does not expose its internal `bpf_map_freeze` wrapper. Implement one
+private helper in `src/attach.rs` using the already-present `libc` dependency:
+match only the expected Aya `Map` variants to their public `MapData::fd()`,
+invoke `bpf(BPF_MAP_FREEZE, ...)` with a zero-initialized map-fd attribute, and
+return an error naming the map and syscall failure. An unexpected map variant
+or any freeze error aborts before attachment. This is a small Linux UAPI shim,
+not a reason to add a dependency or fork Aya. The live gate proves it with an
+otherwise-valid mutation that returns `EPERM` after freeze and succeeds on an
+unfrozen control.
+
 This removes the current risk that separate configuration writers overwrite
 scope or policy bits, and prevents a feature build from being switched to
 unsafe capture after output was labeled safe.
@@ -288,6 +301,22 @@ Allowed values are `allowlisted`, `unsafe-unvalidated-metadata`, and
 `aggregate-only`. Labels always come from the immutable userspace enum whose
 bits passed publication/readback; they are not inferred later from mutable
 maps.
+
+The provenance supervisor owns the exceptional lease-break ending. After it
+has killed and reaped the worker, it appends a bounded terminal `EVIDENCE`
+record to every writable trace sink with `completeness: "PARTIAL"`, the
+immutable `privacy_mode`, `capture_aborted: "object_lease_break"`,
+`final_drain: false`, `counters_available: false`, and `event_loss: null`.
+Other ordinary evidence fields are absent in this discriminated abort variant
+because the supervisor has no BPF state from which to derive them. Normal
+terminal evidence has `counters_available: true`. Exit 78 remains authoritative,
+and a consumer treats either exit 78 or an absent terminal `EVIDENCE` record as
+truncated output. The supervisor does not invent a numeric `LOST` count after
+killing the only BPF owner. Profile JSON is written only to a
+supervisor-prepared same-directory temporary fd; after a
+valid completion record and pidfd-confirmed normal worker exit, the supervisor
+releases the leases and atomically publishes it. A lease-broken or abnormal
+worker never leaves a valid profile document.
 
 Profile advances from `pkcs11-scope/observed-profile/v1.3` to
 `pkcs11-scope/observed-profile/v1.4`. Metrics advances from
@@ -320,7 +349,11 @@ capture does not affect completeness. Selecting unsafe does not itself force
 `PARTIAL`: completeness means no gaps within the selected policy, while
 `privacy_mode` identifies the policy.
 
-The v1.3→v1.4 and v1-metrics→v1.1-metrics migration notes must state these
+The v1.3 and v1-metrics schemas are internal waypoints in the unreleased
+corrective tree. If this design lands before the next artifact, the published
+migrations are v1.2→v1.4 and v0-metrics→v1.1-metrics. The schema may retain an
+internal-waypoint appendix for implementation history, but must not imply that
+consumers received an intermediate release. Every migration note states the
 semantic and structural differences; older documents are never reinterpreted.
 
 ## Verification
@@ -335,8 +368,11 @@ The ordinary suite pins:
    data policy before program load, tail-call target after load, all before
    attach; object inspection pins `BPF_F_RDONLY_PROG` on ordinary immutable
    Array/HashMap controls and its required absence on the two fd-array maps;
-4. exactly 463 official ids, cumulative standards coverage, configured vendor
-   union, deduplication, `shape::NONE`, and `u64::MAX` presence by capture tag;
+4. exactly 463 official ids at the pinned dependency revision (the test names
+   that pin so a dependency update is a deliberate standards-inventory
+   decision), cumulative standards coverage, configured vendor union,
+   deduplication, `shape::NONE`, capacity refusal, and `u64::MAX` presence by
+   capture tag;
 5. safe `CKR_OK`/`CKR_PENDING`, failed/unreadable/unregistered/null mechanism
    boundaries and async pending completion;
 6. safe byte-exact async names and categorical rejection of unknown names;
@@ -382,9 +418,16 @@ existing gate contract; it is never converted to a pass.
 
 ## Release and documentation
 
-Update README, usage, privacy allowlist, observed-profile schema, and release
-notes together. Public wording makes the safe/unsafe trust distinction
-prominent and never describes `bpf_probe_read_user` as pointer validation.
+The implementation plan's final integration task is the sole owner of README,
+usage, privacy allowlist, observed-profile schema, changelog, ROADMAP,
+release/matrix scripts, and `tests/release_contracts.rs` for both this design
+and provenance-plan Task 6. Execute provenance Tasks 4–5 first, metadata Tasks
+1–5 next, then that one integration task, then provenance Task 7. Public
+wording makes the safe/unsafe trust distinction prominent and never describes
+`bpf_probe_read_user` as pointer validation. The allowlist update explicitly
+records the transient raw `START.pMechanism` address, its no-entry-dereference
+guard, bounded lifetime, privileged-map exposure, and prohibition from public
+output.
 
 Official artifacts use `--no-default-features` in a dedicated
 `CARGO_TARGET_DIR`, reject the unsafe flag, and contain no unsafe-only eBPF

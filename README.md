@@ -10,14 +10,14 @@ table (including stripped providers with no `C_*` symbols), attaches probes by
 file offset, and produces a versioned `observed-profile.json` for migration
 assessment and incident diagnostics.
 
-> **Unreleased security status:** the current corrective worktree is not
-> release-ready. Its default metadata path still follows caller-supplied
-> pointers, and its first provenance/lease pass does not yet protect the full
-> lazy-dependency closure or ordered teardown. Use it only with trusted,
-> ABI-valid workloads. The required safe default and completed authorization
-> protocol are specified in
-> [the privacy amendment](docs/superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md)
-> and [provenance plan](docs/superpowers/plans/2026-08-13-manifest-provenance.md).
+> **Status: unreleased, not yet tagged or published.** The safe-by-default
+> capture policy and the provenance/lease authorization protocol are both
+> implemented, and the privileged host and container lanes have been rerun
+> against them. What has not happened: the final consolidated security
+> re-review (Task 7 of the
+> [provenance plan](docs/superpowers/plans/2026-08-13-manifest-provenance.md)),
+> and any packaging, tag, or publication. Treat this tree as reviewed
+> engineering work pending its release gate, not as a shipped release.
 
 Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40
 table, and standard 3.0, 3.1, and 3.2 interfaces (all 104 slots published in
@@ -27,7 +27,8 @@ bounded known prefix only when the table is independently corroborated by the
 module's standard exports or legacy table, records that evidence as `PARTIAL`,
 and leaves deceptive/vendor tables undecoded. It never calls `C_GetInterface`.
 
-**v0.1.0.** See [CHANGELOG.md](CHANGELOG.md) for what shipped, and
+**v0.1.0, unreleased.** See [CHANGELOG.md](CHANGELOG.md) for what is in the
+tree, and
 [docs/usage.md](docs/usage.md) for the full operator's guide (privileges,
 kernel floor, overhead, and the evidence/completeness model — every
 quantitative claim there cites the script that measured it).
@@ -58,17 +59,29 @@ quantitative claim there cites the script that measured it).
 
 There is no decoder or dump switch for PINs, key material, `CKA_VALUE`, labels,
 `CKA_ID`, plaintext, ciphertext, signatures, wrapped blobs, random output, raw
-mechanism byte arrays, raw session handles, or ordinary buffers. This decoder
-inventory is not yet a hostile-pointer guarantee: in the current unreleased
-tree a malicious caller can alias an existing scalar metadata pointer into
-unrelated readable memory. The safe-default amendment above closes that output
-channel; until it is implemented, use only trusted ABI-valid workloads. The
-inventory is maintained in the written, field-by-field allowlist
+mechanism byte arrays, raw session handles, or ordinary buffers.
+
+The default capture policy is `allowlisted`, and it is safe against a caller
+that aliases a metadata pointer into unrelated readable memory. Pointer-derived
+bytes become output only by *exact* membership in a finite published set: a
+mechanism id in the registry, or one of the 104 published function names.
+Anything else is dropped in the kernel. That is a containment boundary, not
+pointer validation — `bpf_probe_read_user` avoids faults, it does not check
+types.
+
+The previous unvalidated parameter/template decoders still exist, but only
+behind **both** an off-by-default Cargo feature and an explicit
+`--unsafe-unvalidated-metadata` flag; the flag alone cannot enable code that is
+absent from the shipped eBPF object, and `metrics` mode refuses it outright.
+The official release artifact is built `--no-default-features`, so packaging
+fails if the unsafe path is reachable at all.
+
+The inventory is maintained in the written, field-by-field allowlist
 ([docs/privacy/allowlist-v1.md](docs/privacy/allowlist-v1.md)) and a
-secret-canary test suite (`scripts/verify-canaries.sh`) that plants sentinel
-PINs, key material, and buffer contents in a real workload and scans every
-output artifact for leaks. The existing canary does not prove resistance to
-malicious pointer aliasing.
+secret-canary suite (`scripts/verify-canaries.sh`) that plants sentinel PINs,
+key material, and buffer contents in a real workload and scans every output
+artifact and every observer-owned BPF map for leaks — including hostile-alias
+lanes and the transient raw `pMechanism` address the return probe needs.
 
 See [what you will see](docs/superpowers/specs/2026-08-10-pkcs11-scope-outputs.md)
 for the CLI, live output, trace lines, and an example `observed-profile.json`.
@@ -87,11 +100,15 @@ for the CLI, live output, trace lines, and an example `observed-profile.json`.
   (`scripts/bench-overhead.sh`, `docs/notes/phase5-overhead.md`; full numbers
   and the event-loss finding at high call rates: [docs/usage.md](docs/usage.md#overhead-measured)).
 - Requires elevated privileges, kernel-version-dependent, x86-64 first.
-  The previously measured BPF minimum was `CAP_SYS_ADMIN` on the host, plus
-  `CAP_SYS_PTRACE` for cross-UID container paths. The hardened observer also
-  needs `CAP_LEASE` when provider files are not owned by its UID (or simply
-  run as root); the changed capability matrix awaits an approved privileged
-  rerun ([docs/usage.md](docs/usage.md#privileges-per-environment)).
+  The measured BPF minimum is `CAP_SYS_ADMIN` on the host, plus
+  `CAP_SYS_PTRACE` for cross-UID container paths (`CAP_BPF`+`CAP_PERFMON`
+  alone still fails on this kernel's `perf_event_paranoid` setting). The
+  hardened observer additionally needs `CAP_LEASE` for provider files its UID
+  does not own. The capability lane in `scripts/matrix/verify-fork-scope.sh`
+  encodes `CAP_SYS_ADMIN`+`CAP_LEASE`, but has **not** been rerun since the
+  lease and terminal-drain changes, so treat the exact minimum set as
+  inherited rather than freshly measured. Every live lane that *was* rerun ran
+  as root ([docs/usage.md](docs/usage.md#privileges-per-environment)).
   Kernel floor ≥5.15; on an unsupported environment the tool fails with a
   named cause and a hint, never a panic or a raw verifier dump
   (`docs/notes/phase5-unsupported.md`).
@@ -100,21 +117,27 @@ for the CLI, live output, trace lines, and an example `observed-profile.json`.
   library. The tool does not detect or warn about this today; getting it
   right is on the operator.
 - **Profiles, never replays.** It has only the bounded metadata decoders listed
-  in the field allowlist and no intentional secret/buffer decoder. The current
-  unreleased default still assumes trusted ABI-valid pointer placement; the
-  safe-default amendment is a release blocker, not an already-shipped claim.
+  in the field allowlist and no intentional secret/buffer decoder. Under the
+  default `allowlisted` policy this holds against hostile pointer placement,
+  not merely trusted ABI-valid callers.
 - A trace is evidence about the observed window only; the profile includes an
   explicit evidence-quality/completeness section (attach failures, aliased
   functions, event loss) — `COMPLETE`/`PARTIAL`, never silently confident.
-  Absence of a call means "not observed in this window," never "the
-  application cannot do it"; aliased table entries are ambiguous by
-  construction; requested attributes are what the app asked for, not the
-  key's effective policy. Full honest-claims section:
+  **A terminal snapshot is always `PARTIAL`**: detaching a perf link stops new
+  invocations but does not wait for BPF callbacks already running on another
+  CPU, so a completed capture cannot honestly claim a proven final drain. A
+  clean run is `PARTIAL` with every concrete gap counter zero; that is the
+  contract the release lanes assert. Absence of a call means "not observed in
+  this window," never "the application cannot do it"; aliased table entries are
+  ambiguous by construction; requested attributes are what the app asked for,
+  not the key's effective policy. Full honest-claims section:
   [docs/usage.md](docs/usage.md#honest-claims).
-- The current interim schema is `pkcs11-scope/observed-profile/v1.3` (or
-  `v1-metrics`), documented at
+- The schema is `pkcs11-scope/observed-profile/v1.4` for `profile` and
+  `pkcs11-scope/observed-profile/v1.1-metrics` for `metrics`, with discovery
+  input at `p11scope-manifest/4`, documented at
   [docs/schema/observed-profile-v1.md](docs/schema/observed-profile-v1.md).
-  The safe-policy implementation advances it to v1.4/v1.1-metrics.
+  Schema ids are opaque exact dispatch keys; the major/minor spelling grants
+  no compatibility.
 
 ## Containers and Kubernetes
 
@@ -136,18 +159,29 @@ when discovery is launched by an elevated observer.
 
 A stored manifest is evidence and a proposed attach plan, not authority by
 itself. The operator must independently name the intended provider bytes with
-`--provenance-module`; the manifest cannot select its own authority.
-The current first pass runs a pinned, non-writable sibling helper without
-privilege and compares provider/object SHA-256 identities and function-name →
-file-offset mappings. It is not sufficient for release: loading the provider
-through its fd changes `$ORIGIN`, lazily loaded dependencies are not all
-pre-leased, and the SIGIO exit path does not prove probes disappear before a
-waiting writer proceeds. The corrected bounded exact-inode closure and lease
-supervisor are specified in the linked provenance plan. Its hostile-target
-continuity claim also requires a supervisor identity the workload cannot
-signal or ptrace; same-uid capability-only launches remain trusted-workload
-lanes. There is no planned
-raw-manifest trust bypass.
+`--provenance-module`; the manifest cannot select its own authority. There is
+no raw-manifest trust bypass, planned or otherwise.
+
+Authorization runs a pinned, non-writable, root-owned sibling helper without
+privilege, and accepts a function-name → file-offset mapping only from a
+bounded rediscovery pass in which every file-backed executable mapping was
+read-leased *before* that pass began. The provider is loaded by its validated
+absolute path, never through `/proc/self/fd`, so `$ORIGIN` and lazily loaded
+dependencies resolve as the target sees them. Content identity alone is
+explicitly insufficient — a pathname can be retargeted to a byte-identical but
+unleased inode — so the closure is compared by exact inode with a bounded
+retry for churn. Before any BPF load the CLI process becomes a lease
+supervisor and forks the capture worker; on a lease break it kills the worker
+through its pidfd, releases the leases, and exits 78. Profile output is
+published atomically only on normal completion, and an aborted trace still
+receives a terminal `EVIDENCE` record marked `PARTIAL` with the break reason,
+so a truncated capture cannot read as a complete one.
+
+Two honest limits remain: the hostile-target continuity claim needs a
+supervisor identity the workload cannot signal or ptrace, so same-uid
+capability-only launches stay trusted-workload lanes; and the boundary assumes
+an honest provider — sandboxing malicious provider code is explicitly outside
+it.
 
 The helper recreates that table in its own process; it never reads or injects
 into the observed process. Uprobes are bound to the verified target inode and

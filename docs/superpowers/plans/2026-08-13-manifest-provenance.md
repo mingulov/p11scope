@@ -2,12 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Review status (2026-08-13): Approved after independent deep review; Tasks
-4–7 remain unimplemented.** Tasks 1–3 record the first implementation pass,
-not release clearance. Deep review found that loading the provider through
-`/proc/self/fd` changes `$ORIGIN`, a lease on only the top-level module does not
-protect lazy dependencies, and observer-owned `_exit` cannot order teardown
-robustly. Tasks 4–7 below supersede those parts of the first pass.
+**Status (2026-08-14): Tasks 1–6 implemented and independently reviewed;
+Task 7 open.** The deep-review findings that motivated Tasks 4–7 — provider
+loading through `/proc/self/fd` changing `$ORIGIN`, a top-level-only lease
+failing to protect lazy dependencies, and observer-owned `_exit` not ordering
+teardown — are closed in the tree. Per-slice reviews recorded 0 Critical and
+0 Important findings, and Task 6's privileged host and container lanes were
+run under explicit approval and passed. Task 7's final cross-cutting re-review
+has **not** run; until it does, this is reviewed work pending its release
+gate, not release clearance. Slice-by-slice evidence, including every deferred
+Minor, is in `.superpowers/sdd/2026-08-13-manifest-provenance/`.
 
 **Goal:** Refuse every attach plan whose PKCS #11 function name-to-offset mapping cannot be reproduced from the explicitly selected provider immediately before attachment.
 
@@ -27,6 +31,11 @@ The supervisor never owns a BPF fd.
 
 **Tech Stack:** Rust 1.88, edition 2024, Linux `/proc/self/fd`, existing manifest/discovery crates, standard library plus existing `libc`.
 
+**Execution order:** Complete Tasks 4–5 here, then Tasks 1–5 in
+`2026-08-13-safe-and-unvalidated-metadata.md`. Its Task 6 is the sole integrated
+owner of the shared public/release surface and consumes Task 6 below. Finish
+with Task 7 here.
+
 ## Global Constraints
 
 - Never attach from a raw manifest alone and do not add a `--trust-manifest` bypass.
@@ -38,9 +47,13 @@ The supervisor never owns a BPF fd.
   from identity verification through capture; provenance-closure objects are
   leased before the authoritative pass through its comparison. Refuse an
   existing writer, lease failure, or break notification. This release supports
-  regular files on local filesystems whose read-lease behavior passes the live
-  gate; unsupported/network/FUSE/overlay cases that cannot establish the
-  required lease are refused, not downgraded.
+  regular files whose read-lease behavior passes the live gate. Overlay is not
+  categorically unsupported: every Docker, shared-layer, kind, and Knative
+  lane must positively prove leases on its actual provider, attach objects,
+  and authorization runtime closure, and record filesystem type plus
+  `/proc/sys/fs/lease-break-time`. Any lane or network/FUSE filesystem that
+  cannot establish the required leases is refused and is not claimed, never
+  downgraded.
 - Preserve provider loader semantics: never `dlopen` a provider through
   `/proc/self/fd`; use its validated absolute path and test `$ORIGIN`/lazy
   dependencies.
@@ -73,12 +86,18 @@ The supervisor never owns a BPF fd.
   race a generic post-load mapping inventory can prove away.
 - For a hostile observed process, the lease supervisor must run under a host
   identity the workload cannot signal or ptrace (normally host root against a
-  non-root workload, or a dedicated service uid). A same-uid file-capability
-  launch is supported only for trusted workloads: Linux `SIGSTOP`/`SIGKILL`
+  non-root workload, or a dedicated service uid with `CAP_LEASE` for every
+  provider/helper/interpreter/runtime object it does not own). A same-uid
+  file-capability launch is supported only for trusted workloads: Linux
+  `SIGSTOP`/`SIGKILL`
   cannot be masked, so same-uid signal authority is incompatible with the
   hostile-target continuity claim. Host root/`CAP_KILL` and kernel compromise
   remain outside the boundary.
 - Preserve all unrelated working-tree changes; do not commit without explicit approval.
+- Use a unique root-owned per-run directory below a validated root-owned,
+  non-group/world-writable `/run/p11scope`: parent mode 0755, run directory
+  mode 0511. Authority is its retained directory fd, not later pathname
+  lookup. Root removes it after helper exit; stale entries are never reused.
 
 ---
 
@@ -113,7 +132,7 @@ The supervisor never owns a BPF fd.
 - [x] Add focused tests for helper trust: regular executable, correct owner for the effective identity, and no group/world write bit. Add a bounded-reader test proving byte 16 MiB + 1 is rejected.
 - [x] Run the focused tests and confirm RED because trusted rediscovery is absent.
 - [x] Open the sibling helper once, validate metadata on that descriptor, and execute `/proc/self/fd/<n>` so a pathname retarget cannot replace it. Require root ownership when effective UID is root; otherwise require current effective-UID ownership. Give the oracle an empty environment, discard untrusted stderr, reuse the existing privilege-drop hook, cap stdout at `verify::MAX_MANIFEST_BYTES`, and kill/reap its process group after 30 seconds.
-- [ ] Make hostile-target oracle launch available only from the official
+- [x] Make hostile-target oracle launch available only from the official
   fully static observer. Using the existing ELF reader, parse the already
   pinned helper and its absolute `PT_INTERP` before exec. Recognize only the
   supported glibc and musl x86-64 loaders; open and validate the interpreter
@@ -121,7 +140,7 @@ The supervisor never owns a BPF fd.
   writable. Reject nonempty `/etc/ld.so.preload`, unexpected musl path config,
   `DT_RPATH`/`DT_RUNPATH`, slash-containing `DT_NEEDED`, and dynamic
   audit/filter/auxiliary tags on every object in the runtime closure.
-- [ ] Resolve `DT_NEEDED` recursively, before exec, using the exact ordered
+- [x] Resolve `DT_NEEDED` recursively, before exec, using the exact ordered
   trusted host directories supported by the recognized loader adapter.
   Open each selected file once, verify its SONAME/device/inode/regular-file
   ownership and mode from that fd, acquire a read lease, and retain every fd
@@ -129,7 +148,7 @@ The supervisor never owns a BPF fd.
   and total bytes; reject duplicate SONAME ambiguity or any unresolved object.
   Official artifacts permit only the platform loader/libc and the toolchain's
   required unwind library.
-- [ ] Execute the pinned interpreter fd directly, not the helper and not an
+- [x] Execute the pinned interpreter fd directly, not the helper and not an
   interpreter pathname. Build a root-owned mode-0511 directory containing one
   unambiguous root-created SONAME link to `/proc/self/fd/<runtime-fd>` for every
   retained dependency; it is traversable after UID drop but never writable by
@@ -138,32 +157,37 @@ The supervisor never owns a BPF fd.
   `/proc/self/fd/<helper-fd>` as the program; for glibc also pass
   `--inhibit-cache`, while musl's explicit path is accepted only after tests
   prove the complete initial closure never falls through to its system path.
-  Inherit only the helper, interpreter, directory, runtime, and control fds,
-  with their close-on-exec state set deliberately. Revalidate the directory
-  fd, entries, and every target fd after fork and before releasing the exec
-  barrier. This makes every possible pre-main constructor come from an inode
-  that was authorized and leased before it could execute.
-- [ ] Keep a parent/helper control-fd handshake as confirmation, not authority.
+  Create it as the per-run directory specified in Global Constraints. Finalize
+  inherited descriptor numbers before creating any `/proc/self/fd/<n>` link:
+  either preserve the actual numbers across fork/exec or use `dup3` into a
+  collision-checked reserved range. Numeric determinism is not required, but
+  each link must name the exact descriptor the child inherits. Clear
+  `FD_CLOEXEC` only on the allowlisted helper, interpreter, directory, runtime,
+  and control fds. Revalidate the directory fd, entries, descriptor numbers,
+  and every target fd after fork and before releasing the exec barrier. This
+  makes every possible pre-main constructor come from an inode that was
+  authorized and leased before it could execute.
+- [x] Keep a parent/helper control-fd handshake as confirmation, not authority.
   At the first instruction under helper control and before `dlopen`, the helper
   waits while the parent independently inventories `/proc/<helper-pid>/maps`.
   Require the exact pre-authorized helper/interpreter/runtime inode set and no
   extra file-backed executable mapping, then release the provider load. Failure
   to inspect procfs or any mismatch is refusal. The helper itself keeps the
   validated owner rule (root for a privileged observer, current euid otherwise).
-- [ ] Keep the post-drop helper non-dumpable. Remove the current
+- [x] Keep the post-drop helper non-dumpable. Remove the current
   `PR_SET_DUMPABLE=1`; after dropping every uid/gid/capability and setting
   `NO_NEW_PRIVS`, open `/proc/self/mem` from the helper itself. Linux permits
   same-thread-group self access before the dumpability check; pin this on the
   5.15 floor and supported kernels, and refuse if the open fails. Never inherit
   a pre-exec self-memory fd because it refers to the pre-exec address space.
-- [ ] Replace the first pass's provider `/proc/self/fd` route: read-lease and
+- [x] Replace the first pass's provider `/proc/self/fd` route: read-lease and
   validate the provenance module, but pass its absolute path to the pinned
   helper. Revalidate that path against the leased seed before and after each
   pass. Parse only schema-v4 JSON and retain the existing timeout, output cap,
   process-group cleanup, privilege drop, and helper-metadata checks.
 - [x] Extend `load_plan` to run `check_reuse`, trusted rediscovery, and `check_provenance` before `plan::build`; no attach path may bypass this sequence.
 - [x] Require `--provenance-module <absolute-provider-or-copy>` on `profile` and `trace`, so an untrusted manifest cannot select its own authority and namespace-rewritten attach paths can use a byte-identical safe copy.
-- [ ] Re-run focused library and CLI tests, including a malicious pre-main
+- [x] Re-run focused library and CLI tests, including a malicious pre-main
   constructor that hides/unmaps its origin, hostile helper/transitive RPATH,
   preload/audit injection, writable interpreter/runtime, unknown loader,
   pre-provider handshake failure, same-uid ptrace/output-forgery attempts,
@@ -189,7 +213,7 @@ The supervisor never owns a BPF fd.
 - [x] Document the exact boundary: stored manifests are untrusted proposed plans; fresh table provenance is mandatory; `COMPLETE` describes capture completeness, not semantic honesty of malicious native code.
 - [x] Stage a root-owned sibling helper in privileged release scripts, and pass a safe-copy provenance module in namespace-rewritten Docker, kind, shared-layer, and Knative lanes.
 - [x] Follow and then reject symlinks when staging Docker safe copies, so `/usr/lib/...` provider links become regular byte copies rather than dangling host links.
-- [ ] Stage any `$ORIGIN` siblings required by the selected provider; a lone
+- [x] Stage any `$ORIGIN` siblings required by the selected provider; a lone
   top-level copy is not a valid provenance fixture for a provider whose loader
   contract includes adjacent objects.
 - [x] Replace source-text-only assertions with the smallest executable or behavioral contracts available for helper trust and forged-manifest refusal.
@@ -212,12 +236,12 @@ The supervisor never owns a BPF fd.
 - Produces: `discover_cmd::rediscover_stable`, which returns only a manifest
   produced by a pass whose complete provenance closure was leased beforehand.
 
-- [ ] Record the complete executable mapping closure, not only objects that own
+- [x] Record the complete executable mapping closure, not only objects that own
   final function pointers. Open each path once, compare the fd's device/inode
   with the mapping, and derive SHA/build identity from that same fd. An
   unopenable, deleted, identity-mismatched, or over-cap mapping makes the pass
   ineligible for authorization.
-- [ ] Keep attach objects and provenance-only objects separate so short-lived
+- [x] Keep attach objects and provenance-only objects separate so short-lived
   authorization leases do not turn every helper/system library into a
   capture-lifetime attach lease. During stabilization, match every fresh
   mapping by its exact device/inode to the parent's already-open, already-leased
@@ -226,7 +250,7 @@ The supervisor never owns a BPF fd.
   address, diagnostic text, and dense id. The candidate's recorded closure is
   evidence, never authority; only the pre-leased fresh closure authorizes its
   table projection.
-- [ ] Run an unprivileged preliminary pass using the absolute provider path,
+- [x] Run an unprivileged preliminary pass using the absolute provider path,
   open/validate/lease every reported provenance object in the parent, then
   rediscover. If the next pass maps any device/inode not already represented by
   a retained lease fd, add that exact inode's lease and repeat even when its
@@ -235,15 +259,15 @@ The supervisor never owns a BPF fd.
   every exact mapped inode in a pass was already leased before that pass began;
   bound the loop to 8 passes and existing object/byte/output limits. Churn,
   disappearance, seed-module replacement, or capacity exhaustion fails closed.
-- [ ] Block lease-break signals and consume them synchronously during closure
+- [x] Block lease-break signals and consume them synchronously during closure
   stabilization. A notification or failed `F_GETLEASE` recheck invalidates the
   pass before any BPF program is loaded. Stable SHA-based/path-independent
   comparison is used only later for the candidate/final manifest security
   projection, never to prove that a discovery-pass inode was leased.
-- [ ] Compare the candidate security projection only with that final pass.
+- [x] Compare the candidate security projection only with that final pass.
   Hold provenance-closure leases through comparison; hold independently
   verified candidate attach-object leases through attach and capture.
-- [ ] Add a wrapper/backend regression proving direct absolute loading retains
+- [x] Add a wrapper/backend regression proving direct absolute loading retains
   `$ORIGIN`, the old provider-fd route fails the fixture, an unleased lazy
   dependency cannot authorize offsets, one newly discovered dependency causes
   a bounded retry, a byte-identical inode replacement also forces a retry, and
@@ -257,35 +281,55 @@ The supervisor never owns a BPF fd.
 - Modify: `src/main.rs`
 - Test: `tests/lease_break.rs`
 
-- [ ] Block SIGIO, SIGINT, and SIGTERM in the original CLI process before lease
+- [x] Block SIGIO, SIGINT, and SIGTERM in the original CLI process before lease
   acquisition and consume them with `signalfd`. After authorization and before
   BPF load, keep that process as the lease supervisor and fork one capture
   worker. Both retain candidate lease fds; only the worker receives verified
   attach state and may load BPF. Require `/proc/self/task` to prove the process
   is single-threaded at fork; otherwise refuse. Add no daemon, service, thread,
   or dependency.
-- [ ] Set every lease's `F_SETOWN` to the supervisor. Fork behind a socketpair
+- [x] Prepare output before fork. For trace, the supervisor retains duplicate
+  fds for stdout and any `-o` regular file and gives the worker its own
+  duplicates. For profile `-o`, create one same-directory, create-new temporary
+  file; the worker receives only its fd while the supervisor retains the temp
+  and final paths. Do not expose the final profile pathname until normal
+  completion. Cleanup removes an unpublished temp file.
+- [x] Set every lease's `F_SETOWN` to the supervisor. Fork behind a socketpair
   start barrier: the worker first sets `PR_SET_PDEATHSIG=SIGKILL`, rechecks its
   parent pid, and blocks; while the unreaped child PID cannot be reused, the
   supervisor opens its pidfd, rechecks every `F_GETLEASE`, then releases the
   barrier. The worker inherits SIGIO blocked and cannot become its recipient.
   No BPF load occurs before those checks.
-- [ ] On SIGIO or a failed lease recheck, the supervisor sends uncatchable
+- [x] On SIGIO or a failed lease recheck, the supervisor sends uncatchable
   `SIGKILL` through the worker pidfd and waits for pidfd readability/process
   exit before releasing its lease fds. This works even when the worker is
   blocked or stopped. Only after process exit has kernel-closed every BPF link
-  may the supervisor release the last lease references and return exit 78.
-- [ ] On normal completion, the worker writes and flushes final output,
-  explicitly drops `Session`, sends a small completion record, and exits. The
-  supervisor waits for both the record and pidfd-confirmed exit before releasing
-  leases, then mirrors the worker status. It forwards operator SIGINT/SIGTERM
+  may the supervisor release the last lease references. It then appends the
+  bounded terminal trace-abort `EVIDENCE` record defined by the safe-metadata
+  design and returns exit 78; output I/O is not allowed to consume the kernel's
+  lease-break deadline. The supervisor retains a duplicate of each trace sink
+  and the immutable privacy-policy label, but no BPF fd or semantic state. Prefix
+  the record with a newline because the killed worker may have stopped
+  mid-line. When `-o` is present, delivery to that regular-file sink is
+  mandatory and flushed; stdout is best-effort with a bounded nonblocking/poll
+  write so a full pipe cannot delay lease release. No numeric `LOST` value is
+  invented. Profile output uses a temporary file and atomic publish only after
+  normal completion; lease break never leaves a normal profile JSON.
+- [x] On normal completion, the worker writes and flushes final output,
+  explicitly drops `Session`, sends a small completion record, and exits. For
+  profile output, it writes and syncs only the supervisor-prepared temp fd; the
+  supervisor waits for the valid completion record and pidfd-confirmed exit,
+  releases the last lease references, then atomically renames that temp to the
+  final path. An absent/malformed record or abnormal exit removes the temp.
+  Output I/O therefore never holds a broken lease open. The supervisor then
+  mirrors the worker status. It forwards operator SIGINT/SIGTERM
   without releasing leases early: SIGINT uses the existing clean-output path;
   SIGTERM retains terminating semantics/status. The worker explicitly unblocks
   those signals after installing/resetting its handlers. A bounded `SIGKILL`
   fallback prevents a stuck worker from consuming the lease-break deadline.
   Worker error and panic paths use process exit, not Rust drop order, as the
   final teardown proof.
-- [ ] An unexpected supervisor exit requests fail-stop worker teardown through
+- [x] An unexpected supervisor exit requests fail-stop worker teardown through
   `PDEATHSIG`, and the setup race is validated, but this is availability
   hardening rather than the lease/BPF ordering proof: the dying worker's own fd
   close order is not controlled. The hostile-target guarantee therefore relies
@@ -293,18 +337,22 @@ The supervisor never owns a BPF fd.
   not cover supervisor death caused by host root, the kernel/OOM manager, or a
   supervisor memory-safety failure. Do not claim it for a same-uid
   capability-only run.
-- [ ] Add unprivileged supervisor/protocol/exit-code/drop-order tests and an
+- [x] Add unprivileged supervisor/protocol/exit-code/drop-order tests and an
   approval-gated live case with a real attached probe plus waiting writer. The
   writer must not proceed until the worker pidfd is readable and the
   probe/link is demonstrably gone. Include SIGIO, normal exit, observer
   SIGKILL/SIGSTOP, supervisor death during deliberately blocked attach/output,
   parent-death setup race, multithreaded-fork refusal, operator signals, and
-  attach-time break cases.
-- [ ] Hostile kernel/root behavior and the kernel's configured lease-break
+  attach-time break cases. Add a happy-path assertion that the process has
+  exactly one thread at the real pre-fork point after signal setup and loader
+  preparation; retain the multithreaded refusal test. Exercise a blocked trace
+  stdout and prove exit 78/lease release remain bounded while the regular-file
+  sink receives the terminal abort record.
+- [x] Hostile kernel/root behavior and the kernel's configured lease-break
   timeout remain outside user-space proof. Record the observed timeout in gate
   evidence and require every tested shutdown path to complete well inside it.
 
-### Task 6: Public and release contract correction
+### Task 6: Inputs to the consolidated public/release task
 
 **Files:**
 - Modify: `README.md`
@@ -314,15 +362,22 @@ The supervisor never owns a BPF fd.
 - Modify: affected release/matrix scripts
 - Test: `tests/release_contracts.rs`
 
-- [ ] Remove claims that the first provenance pass already closed same-inode
+- [x] Hand these requirements to Task 6 of
+  `2026-08-13-safe-and-unvalidated-metadata.md`; do not edit or gate the shared
+  release surface in a separate pass.
+- [x] Remove claims that the first provenance pass already closed same-inode
   dependency mutation or ordered lease-break teardown.
-- [ ] Document absolute-path `$ORIGIN` behavior, manifest v4 migration,
+- [x] Document absolute-path `$ORIGIN` behavior, manifest v4 migration,
   bounded closure stabilization, safe-copy sibling requirements, and the
   trusted helper-loader chain, honest-provider assumption, and same-uid signal
   limitation.
-- [ ] Make every container/shared-layer fixture copy the resolved provider and
+- [x] Make every container/shared-layer fixture copy the resolved provider and
   its required adjacent dependency closure as regular files, then rerun all
-  approval-gated changed lanes.
+  approval-gated changed lanes. Each lane must also prove read-lease
+  acquisition for every actual attach/provenance runtime object and record its
+  filesystem type and configured lease-break timeout. A supplied preliminary
+  Docker-overlay2 observation says this succeeds, but it is not release
+  evidence until the repository gate records it.
 
 ### Task 7: Final verification
 
@@ -335,4 +390,11 @@ The supervisor never owns a BPF fd.
 - [ ] Run all four `AGENTS.md` gates on the final tree.
 - [ ] Re-review helper replacement, output exhaustion, path/ID/diagnostic normalization, container safe-copy, and equivalent `profile`/`trace` sinks.
 - [ ] Re-review same-inode mutation, lease acquisition/break handling, empty oracle environment, deadline/process-group cleanup, and post-attach/final-output stability checks.
-- [ ] Re-run the final maximum code review and require zero findings in the fixed class; report privileged/container experiments as unrun unless separately approved.
+- [ ] Re-run the final maximum code review and require zero findings in these
+  fixed classes: manifest self-authorization/forged function roles; helper
+  replacement and pre-main runtime injection; provider, dependency, path,
+  inode, and same-inode content mutation; `$ORIGIN` and closure churn; lease
+  acquisition, break, and teardown ordering; terminal trace-abort evidence;
+  same-uid signal/ptrace authority; and safe/unsafe pointer-alias privacy plus
+  immutable policy publication. Report privileged/container experiments as
+  unrun unless separately approved.

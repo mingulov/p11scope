@@ -65,11 +65,13 @@ SoftHSM2 has `p_offset == p_vaddr`).
   `docs/notes/phase1b-e2e.md`). Both shared crates are published and pinned at the exact,
   reachable Git revision `a2aab6cd67d21d140277a4584942e06c903f165b`;
   the lockfile resolves that revision with no local path override. The first
-  provenance implementation rejects the original raw-manifest forgery, but a
-  later maximum review found unresolved `$ORIGIN`, lazy-dependency leasing,
-  and lease-break teardown gaps. Its corrected plan is
-  `2026-08-13-manifest-provenance.md`; G1's provenance clause is open until
-  Tasks 4–7 there pass.
+  provenance implementation rejects the original raw-manifest forgery, and the
+  `$ORIGIN`, lazy-dependency leasing, and lease-break teardown gaps a later
+  maximum review found are closed by Tasks 4–6 of
+  `2026-08-13-manifest-provenance.md`. G1's provenance clause is satisfied in
+  implementation; the historical `completeness COMPLETE` recorded above is a
+  pre-2026-08-14 verdict, since a terminal snapshot is now always `PARTIAL`
+  (see the Overall project status below).
 
 **Gate G1 (engineering review):** /code-review on both repos' branches;
 proxy-ng test suite green after the extraction; manifest reuse refused on
@@ -113,10 +115,16 @@ PARTIAL, never silently complete.
   mechanism blobs planted by the workload; assert no sentinel appears in any
   event, map dump, log, or output file.
 
-**Gate G3 (privacy review — release-blocking forever after): REOPENED
-2026-08-13.** The 2026-08-11 result remains historical ordinary-placement
-canary evidence; it did not test malicious pointer aliasing or the safe/unsafe
-policy split now required by the approved privacy amendment.
+**Gate G3 (privacy review — release-blocking forever after): PASSED
+2026-08-14**, after being reopened 2026-08-13. The 2026-08-11 result is
+historical ordinary-placement canary evidence only; it did not test malicious
+pointer aliasing or the safe/unsafe policy split. Both now exist and were
+rerun live: `allowlisted` is the default policy, pointer-derived output is
+confined to finite published equality oracles, and the canary matrix passed
+seven capture lanes plus three START lanes — including hostile-alias cases and
+the transient raw `pMechanism` address, scanned in this run's exact map ids.
+The remaining caveat is unchanged and structural: the suite is green locally,
+not in CI, because this repo still has no CI pipeline.
 
 1. **Canary suite green:** `scripts/verify-canaries.sh` + `docs/notes/phase3-canaries.md`.
    8 sentinels planted (PIN, CKA_VALUE key material, CKA_LABEL, CKA_ID, digest
@@ -137,8 +145,11 @@ policy split now required by the approved privacy amendment.
 3. **Security review of decoding paths:** the 2026-08-12 corrective snapshot
    fixed and source-validated its eight reported classes. A 2026-08-13 deeper
    review then found the remaining pointer-provenance boundary and hash-only
-   async-name authorization. G3 stays open until the safe-default design and
-   expanded hostile-alias canaries are implemented and independently rerun.
+   async-name authorization. Both are closed: the pointer boundary by the
+   `allowlisted` default policy (finite published equality oracles, policy
+   maps frozen before attach), and async-name authorization by byte-and-length
+   exact match with structural coverage proving no hash-only path remains.
+   Independent per-slice reviews recorded 0 Critical and 0 Important.
 
 ## Phase 4 — Environment matrix + pkcs11-check oracle
 
@@ -232,12 +243,18 @@ cross-checked against measured reality; canary suite still green.
    caveat, schema version string, the `COMPLETE`/`PARTIAL` gate list, the
    `cgroups[]` per-cgroup claim — matched its cited source exactly, no
    change needed.
-3. **Full-repo review:** the earlier corrective-tree review completed, but its
-   zero-finding result was superseded by the 2026-08-13 maximum re-review. The
-   current tree has the release blockers listed below.
-4. **Security review of the privileged tool as a whole:** open. Post-fix
-   validation must be repeated only after the corrected provenance and safe
-   metadata designs are implemented.
+3. **Full-repo review:** open. Every implementation slice carried its own
+   independent security/correctness and spec reviews at 0 Critical and
+   0 Important, but those are per-slice. The final cross-cutting re-review
+   over the fixed classes — manifest self-authorization, helper replacement
+   and pre-main injection, provider/dependency/inode mutation, `$ORIGIN` and
+   closure churn, lease acquisition/break/teardown ordering, terminal
+   trace-abort evidence, same-uid signal authority, and safe/unsafe pointer
+   aliasing plus immutable policy publication — is Task 7 of the provenance
+   plan and has not run.
+4. **Security review of the privileged tool as a whole:** open, and gated on
+   item 3. The corrected provenance and safe-metadata designs are now
+   implemented, so this review is unblocked rather than premature.
 
 On the earlier corrective snapshot, all other verification scripts were re-run the same day as this gate
 (release blockers per this phase's Global Constraints, not G5 criteria
@@ -258,28 +275,60 @@ reported legacy 2.40 plus standard 3.0/2.40 interfaces; the configured proxy
 shim reported its actual legacy/interface 2.40 surfaces. BouncyHSM and Kryoptic
 were not provisioned and are not claimed.
 
-### Overall project status (Gate G5 reopened, 2026-08-13)
+### Overall project status (2026-08-14: blockers closed, G5 open on final review)
 
 Phases 0-4 retain their recorded historical gate evidence (G0-G4 PASSED, see
 each phase above), and the former shared-crate revision blocker is cleared:
 the manifests and `Cargo.lock` pin reachable revision `a2aab6c` with no local
-path patch. The latest unprivileged gates remain useful regression evidence,
-but this dirty tree is not a final or release-ready tree. The 2026-08-13 deep
-re-review confirmed these release blockers:
+path patch.
 
-- provider rediscovery through `/proc/self/fd/<provider-fd>` changes
-  `$ORIGIN` and rejects a supported wrapper with an adjacent lazy backend;
-- only the provenance seed module is leased before rediscovery, so a mutable
-  lazy dependency can still influence an apparently stable table projection;
-- the SIGIO `_exit` path does not prove BPF links close before lease fds;
-- the default semantic decoders follow caller-selected pointer topology and
-  need the safe-default/explicit-unsafe policy in
-  `docs/superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md`.
+All four release blockers confirmed by the 2026-08-13 deep re-review are now
+implemented and independently reviewed (0 Critical, 0 Important per slice):
 
-The corrected provenance work is tracked in Tasks 4–7 of
-`docs/superpowers/plans/2026-08-13-manifest-provenance.md`. The privileged
-canary and Docker/kind/Knative lanes also remain unrerun because they require
-explicit approval. **Other verified limitations:**
+- **`$ORIGIN`** — the provider loads by validated absolute path, never through
+  `/proc/self/fd`, so a wrapper with an adjacent lazy backend resolves;
+- **lazy-dependency leasing** — authorization accepts only a bounded pass in
+  which the complete file-backed executable mapping closure was read-leased
+  beforehand, compared by exact inode with a bounded churn retry;
+- **ordered teardown** — the CLI becomes a lease supervisor and forks the
+  worker; a break kills the worker by pidfd, releases leases, and exits 78,
+  leaving a terminal `PARTIAL` `EVIDENCE` record on the trace sink;
+- **safe metadata** — `allowlisted` is the default policy, pointer-derived
+  output is confined to finite published equality oracles, and the old
+  unvalidated decoders require both an off-by-default Cargo feature and an
+  explicit flag.
+
+The approval-gated lanes were rerun and passed: privileged host attach
+(136/136 probes, exact counts, `PARTIAL` with zero concrete gap counters), the
+full canary matrix (seven capture lanes, three START lanes), induced gaps
+G1–G5, and the container matrix (Ubuntu/Alpine discovery, Docker 68/68/136,
+shared layer broad 2x plus both leaf 1x, kind pod 68/68/136, Knative
+cold-start capture from a pod created after attach) — each recording
+read-lease, filesystem-type, and `lease-break-time` evidence.
+
+**A new session starts at provenance Task 7**, the final cross-cutting
+re-review, which is the remaining G5 criterion. Plans:
+`2026-08-13-manifest-provenance.md` (Tasks 1–6 done) and
+`2026-08-13-safe-and-unvalidated-metadata.md` (Tasks 1–5 done, Task 6 Step 6
+partial). Slice-by-slice evidence including every deferred Minor is under
+`.superpowers/sdd/`; the adjudicated review that started this work is
+`docs/notes/2026-08-13-metadata-and-provenance-review.md`.
+
+**Unrun, and therefore not claimed:**
+
+- `scripts/matrix/verify-fork-scope.sh` and `scripts/matrix/verify-oracle.sh`
+  both asserted a terminal `COMPLETE` that the drain change made impossible.
+  They were corrected to the shared `terminal_capture_is_clean` predicate on
+  2026-08-14 and have not been rerun. Because fork-scope carries the
+  capability matrix, the minimum capability set remains inherited rather than
+  freshly measured: `CAP_LEASE` is required by construction, but the minimum
+  was not re-derived. Every lane that was rerun ran as root.
+- The container lanes predate the provider-copy byte cap, and
+  `scripts/attach-pod.sh` has never run against a live cluster — it is
+  unprivileged-tested for argument refusal only.
+- Packaging, publication, push, and tag: NOT PERFORMED.
+
+**Other verified limitations:**
 
 - **The kernel floor (≥5.15) is inherited, not independently verified.**
   The current cgroup filter works on older kernels; 5.15 is retained for

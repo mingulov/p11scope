@@ -6,12 +6,26 @@ Ubuntu 24.04.4, glibc 2.39, kernel 7.0.0-28-generic, Docker 29.7.2
 (storage driver `overlay2`, cgroup driver `systemd`, cgroup2 unified
 hierarchy).
 
-The PASS rows below are the recorded pre-v3 environment runs. The scripts now
-include the manifest-v3 fresh-provenance gate, but those privileged/container
-runs have not yet been repeated. Current authorization additionally requires
-file ownership or `CAP_LEASE` and capture-lifetime object leases; the updated
-privileged matrix remains pending approval. Current unprivileged checks are
-recorded in `docs/superpowers/plans/ROADMAP.md`.
+> **Reading these rows in 2026-08-14 and later.** The table below is the
+> recorded Gate G4 (pre-v3) run and is kept as historical evidence. Two things
+> have since changed:
+>
+> 1. **`COMPLETE` is no longer reachable in a written profile.** A terminal
+>    snapshot is downgraded to `PARTIAL` because a detached perf link does not
+>    wait for BPF callbacks already running on another CPU. The equivalent
+>    modern claim is `PARTIAL` with every concrete gap counter zero.
+> 2. **Authorization now requires manifest v4 fresh provenance**, the leased
+>    exact-inode closure, and file ownership or `CAP_LEASE`.
+>
+> The container matrix *was* rerun on 2026-08-14 under the current code and
+> passed — Ubuntu/glibc and Alpine/musl discovery, Docker 68/68/136, shared
+> layer broad 2x plus both leaf 1x, kind pod 68/68/136, and a Knative
+> cold-start capture from a pod created after attach, each recording
+> read-lease, filesystem-type, and `lease-break-time` evidence. The
+> `verify-fork-scope.sh` and `verify-oracle.sh` rows were **not** rerun; both
+> were corrected on 2026-08-14 to stop asserting the now-impossible terminal
+> `COMPLETE`. Per-slice detail:
+> `.superpowers/sdd/2026-08-13-manifest-provenance/task-6-report.md`.
 
 ## Final matrix (Gate G4)
 

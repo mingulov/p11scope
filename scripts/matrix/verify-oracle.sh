@@ -161,6 +161,20 @@ echo "=== oracle subset-of capture ==="
 python3 - "$WORK/reports/report.jsonl" "$WORK/observed.json" <<'PY'
 import json, sys
 
+
+def evidence_oracle():
+    """Load the canonical evidence oracle so gap counters live in one place."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "check_capture_evidence", "scripts/check-capture-evidence.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+
 report_path, observed_path = sys.argv[1], sys.argv[2]
 
 # Oracle counts, keyed by (function, CK_RV hex). Sourced ONLY from
@@ -268,8 +282,10 @@ print("evidence:", ev["attached_probes"], "probes,", ev["completeness"])
 if ev["attached_probes"] == 0:
     print("no probes attached")
     fail = 1
-if ev["completeness"] != "COMPLETE":
-    print(f"completeness: want COMPLETE, got {ev['completeness']!r}")
+try:
+    evidence_oracle().terminal_capture_is_clean(ev)
+except AssertionError as error:
+    print(f"terminal evidence: {error}")
     fail = 1
 
 sys.exit(fail)

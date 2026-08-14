@@ -127,6 +127,20 @@ test "$LAUNCHER_RC" -eq 0 || { echo "fork-harness (parent+children) failed, rc=$
 echo "=== verify: summed counts across parent + all children match fork-expected.txt exactly ==="
 python3 - "$WORK/observed.json" "$EXPECTED" <<'PY'
 import json, sys
+
+
+def evidence_oracle():
+    """Load the canonical evidence oracle so gap counters live in one place."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "check_capture_evidence", "scripts/check-capture-evidence.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 obs = json.load(open(sys.argv[1]))
 counts = {}
 for f in obs["functions"]:
@@ -146,8 +160,10 @@ print("evidence:", ev["attached_probes"], "probes,", ev["completeness"])
 if ev["attached_probes"] != 136:
     print(f"attached_probes: want 136, got {ev['attached_probes']}")
     fail = 1
-if ev["completeness"] != "COMPLETE":
-    print(f"completeness: want COMPLETE, got {ev['completeness']!r}")
+try:
+    evidence_oracle().terminal_capture_is_clean(ev)
+except AssertionError as error:
+    print(f"terminal evidence: {error}")
     fail = 1
 sys.exit(fail)
 PY
@@ -202,7 +218,20 @@ ATTACHED2=$(python3 -c "import json;print(json.load(open('$WORK/priv-sysadmin.js
 COMPLETE2=$(python3 -c "import json;print(json.load(open('$WORK/priv-sysadmin.json'))['evidence']['completeness'])")
 echo "attached_probes with CAP_SYS_ADMIN+CAP_LEASE: $ATTACHED2 ($COMPLETE2)"
 test "$ATTACHED2" -eq 136 || { echo "expected 136 attached probes with CAP_SYS_ADMIN+CAP_LEASE, got $ATTACHED2"; exit 1; }
-test "$COMPLETE2" = "COMPLETE" || { echo "expected COMPLETE with CAP_SYS_ADMIN+CAP_LEASE, got $COMPLETE2"; exit 1; }
+# Terminal snapshots are PARTIAL by construction since the drain became
+# unprovable; the capability claim is that attach and capture worked, which
+# attached_probes plus the absence of any concrete gap already proves.
+test "$COMPLETE2" = "PARTIAL" || { echo "expected PARTIAL with CAP_SYS_ADMIN+CAP_LEASE, got $COMPLETE2"; exit 1; }
+python3 - "$WORK/priv-sysadmin.json" <<'PY'
+import importlib.util, json, sys
+
+spec = importlib.util.spec_from_file_location(
+    "check_capture_evidence", "scripts/check-capture-evidence.py"
+)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.terminal_capture_is_clean(json.load(open(sys.argv[1]))["evidence"])
+PY
 
 kill "$PRIV_PID" >/dev/null 2>&1 || true
 wait "$PRIV_PID" 2>/dev/null || true

@@ -124,6 +124,18 @@ def exact_common(evidence, *, aliases, skipped, in_flight):
     require(evidence["completeness"] == "PARTIAL", evidence["completeness"])
 
 
+def terminal_capture_is_clean(evidence):
+    """Normal terminal evidence for a lane with its own call oracle.
+
+    A detached perf link does not wait for BPF callbacks already running on
+    another CPU, so a terminal snapshot is PARTIAL by construction. "Clean"
+    therefore means PARTIAL with no concrete gap: no attach failure, alias,
+    skip, or in-flight call, and every gap counter zero.
+    """
+    exact_common(evidence, aliases=[], skipped=[], in_flight=0)
+    exact_counters(evidence)
+
+
 def load_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
@@ -440,6 +452,18 @@ def self_test():
     bad["evidence"]["operation_state_imports"] = 1
     rejected(lambda: validate_canary("default-safe-profile", bad))
     print("unrelated evidence gap rejected: OK")
+
+    terminal_capture_is_clean(copy.deepcopy(clean["evidence"]))
+    for field, value in (
+        ("completeness", "COMPLETE"),
+        ("event_loss", 1),
+        ("in_flight_at_end", 1),
+        ("aliased", ["C_Sign"]),
+    ):
+        bad = copy.deepcopy(clean["evidence"])
+        bad[field] = value
+        rejected(lambda bad=bad: terminal_capture_is_clean(bad))
+    print("terminal capture predicate is PARTIAL with no concrete gap: OK")
 
 
 def main(argv):

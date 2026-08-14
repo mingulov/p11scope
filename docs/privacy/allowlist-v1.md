@@ -1,30 +1,39 @@
 # Privacy allowlist v1 — decoder inventory
 
-This inventories the current bounded metadata decoders. It is not release
-clearance for the unreleased corrective tree: the present default follows
-caller-supplied metadata pointers, and a malicious caller can alias them into
-unrelated readable memory. Use the current tree only with trusted, ABI-valid
-workloads. The safe-default boundary and explicit diagnostic feature are
-specified in
-`docs/superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md`.
-There is no arbitrary-buffer dump switch.
+This inventories the bounded metadata decoders. There is no arbitrary-buffer
+dump switch.
 
-The boundary assumes ABI-valid PKCS #11 structures. A deliberately malicious
-caller can place arbitrary numbers in an allowlisted scalar field; the kernel
-cannot distinguish that from a legitimate scalar. In the current decoder it
-can also redirect an allowed fixed-offset read to unrelated readable bytes;
-`bpf_probe_read_user` prevents a target fault but does not validate C type or
-provenance. The safe policy will contain pointer-derived output to finite
-published/configured equality oracles instead.
+Rows below are marked by the capture policy that contains them. The default
+policy for `profile` and `trace` is `allowlisted`; `metrics` is always
+`aggregate-only` and reads no call arguments at all. The unvalidated
+fixed-offset decoders are present only in a build compiled with the
+off-by-default `unsafe-unvalidated-metadata` Cargo feature *and* run with
+`--unsafe-unvalidated-metadata`; the flag cannot reach code that is absent
+from the object. The design is
+`docs/superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md`.
+
+The boundary assumes ABI-valid PKCS #11 structures for *scalar* fields: a
+deliberately malicious caller can place arbitrary numbers in an allowlisted
+scalar, and the kernel cannot distinguish that from a legitimate value.
+
+Under `allowlisted`, that is the whole exposure — pointer-derived bytes become
+output only by exact membership in a finite published set (the mechanism
+registry, or the 104 published function names), so aliasing a metadata pointer
+into unrelated readable memory yields no decoded value rather than an
+arbitrary read. Under `unsafe-unvalidated-metadata` the older behavior returns
+in full: an allowed fixed-offset read can be redirected to unrelated readable
+bytes. `bpf_probe_read_user` prevents a target fault; it does not validate C
+type or provenance in either policy.
 
 It also assumes the explicitly selected native provider truthfully exposes
 PKCS #11 ABI functions in its own tables. A malicious provider is already
 arbitrary native code in the observed application and is outside that semantic
-guarantee. A raw manifest is not intended to authorize unrelated code. The
-current first provenance pass checks fresh table mappings and leases candidate
-objects, but its `$ORIGIN`, lazy-dependency closure, and teardown ordering gaps
-remain release blockers. The corrected exact-inode protocol is specified in
-`docs/superpowers/plans/2026-08-13-manifest-provenance.md`.
+guarantee. A raw manifest never authorizes code: attachment requires fresh
+table provenance from a pass whose complete exact-inode closure — including
+lazy dependencies, with `$ORIGIN` resolved by absolute path — was read-leased
+beforehand, and a lease break tears the capture down through the supervisor
+rather than continuing against changed bytes
+(`docs/superpowers/plans/2026-08-13-manifest-provenance.md`).
 
 The controlling policy is `kinds::descriptor`. Each of the 104 published
 PKCS #11 3.2 function-table slots has an explicit `SlotSemantics` descriptor;
@@ -44,6 +53,7 @@ one entry program per slot, and only template-bearing calls use
 | Slot id and session flags | One allowlisted argument word each. | Aggregate lifecycle/async-session evidence only. |
 | Login user type | One allowlisted argument word. | Successful-login counts by numeric `CK_USER_TYPE`. |
 | Mechanism type | After the descriptor identifies `pMechanism`, one bounded read of `CK_MECHANISM.mechanism`. | Verbatim 64-bit id, including vendor ids. |
+| Transient mechanism pointer | In `allowlisted` mode, the entry probe copies the raw `pMechanism` argument register into `START` without dereferencing it. Only the matching return probe may use it, and only after `CKR_OK`/`CKR_PENDING`, for the finite mechanism-registry equality check. Every terminal path removes it. | Privileged internal map state only; never copied to `Event`, profile, trace, logs, or errors. The live canary scans this run's exact map id and proves address bytes are not mistaken for pointee data. |
 | RSA-PSS parameters | Exact `ulParameterLen == 24`, then only `hashAlg`, `mgf`, and `sLen`. | Shape-tagged scalar combination. |
 | GCM parameters | Exact known layout length (`40` legacy v2.20 or `48` v2.40+), then only IV length, AAD length, and tag bits. | Shape-tagged scalar combination including layout. |
 | Output-pointer nullness | `capture_scalar` reads only the pointer-sized argument word with `ctx.arg::<u64>(n)` (or the single x86-64 stack word for argument 6). It never dereferences ordinary output buffers. | Null/non-null/unreadable capture state used for operation termination. The pointer value is not emitted. |

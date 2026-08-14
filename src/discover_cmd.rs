@@ -10,13 +10,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::Read;
-use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, RawFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 pub use crate::oracle::OracleSelection;
@@ -138,6 +138,23 @@ fn append_bounded(output: &mut Vec<u8>, bytes: &[u8], limit: u64) -> Result<()> 
         bail!("discovery oracle output exceeds the {limit}-byte limit");
     }
     output.extend_from_slice(bytes);
+    Ok(())
+}
+
+#[allow(dead_code, reason = "private one-pass seam awaiting C3.3B wiring")]
+fn validate_hardened_executable_maps(
+    bytes: &[u8],
+    expected: &BTreeSet<MappingFileKey>,
+    provider: MappingFileKey,
+) -> Result<()> {
+    let maps = p11scope_manifest::maps::parse_maps(bytes).map_err(anyhow::Error::msg)?;
+    let actual = p11scope_manifest::maps::executable_file_keys(&maps);
+    if actual.contains(&provider) {
+        bail!("provider was executable before hardened discovery GO");
+    }
+    if actual != *expected {
+        bail!("hardened discovery executable mappings differ from the authorized closure");
+    }
     Ok(())
 }
 
@@ -281,7 +298,7 @@ impl ClosureLeases {
             .find(|influence| influence.as_raw_fd() == fd)
     }
 
-    fn revalidate_seed(&self, module: &Path) -> Result<()> {
+    pub(crate) fn revalidate_seed(&self, module: &Path) -> Result<()> {
         let (record, _file) = current_provenance_object(module)?;
         let Some(retained) = self.objects.get(&self.seed) else {
             bail!("internal error: provenance seed lease is missing");
@@ -520,8 +537,9 @@ struct AliasLinkCheck {
 
 struct HardenedChild<'prepared, 'leases> {
     child: Child,
+    pidfd: Option<OwnedFd>,
     _prepared: &'prepared crate::oracle::PreparedGlibc<'leases>,
-    reaped: bool,
+    status: Option<ExitStatus>,
 }
 
 #[allow(dead_code, reason = "driven by the hardened child supervisor in C3.3")]
@@ -534,27 +552,61 @@ impl HardenedChild<'_, '_> {
         self.child.stdout.take()
     }
 
-    fn kill_and_wait(&mut self) -> std::io::Result<()> {
-        if self.reaped {
+    fn pidfd(&self) -> &OwnedFd {
+        self.pidfd
+            .as_ref()
+            .expect("spawn returns only after opening the child pidfd")
+    }
+
+    fn terminate_and_wait(&mut self) -> Result<()> {
+        if self.status.is_some() {
             return Ok(());
         }
-        if let Ok(pid) = i32::try_from(self.child.id()) {
-            // SAFETY: spawn_helper creates a process group whose id is the
-            // child pid. SIGKILL is uncatchable and wait reaps the leader.
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
+        let pid = i32::try_from(self.child.id())
+            .map_err(|_| anyhow!("hardened discovery child PID is out of range"))?;
+        // SAFETY: spawn_helper creates a process group whose id is the child
+        // pid. SIGKILL is uncatchable and the guard reaps the leader below.
+        let mut failure = None;
+        if unsafe { libc::kill(-pid, libc::SIGKILL) } == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                failure = Some(anyhow!(
+                    "killing hardened discovery process group failed: {error}"
+                ));
             }
         }
-        let _ = self.child.kill();
-        self.child.wait()?;
-        self.reaped = true;
-        Ok(())
+        if let Some(pidfd) = &self.pidfd {
+            if let Err(error) = crate::verify::pidfd_send_signal(pidfd, libc::SIGKILL) {
+                let _ = self.child.kill();
+                if !error.contains("No such process") {
+                    failure.get_or_insert_with(|| anyhow!(error));
+                }
+            }
+            if let Err(error) = crate::verify::wait_pidfd(pidfd) {
+                failure.get_or_insert_with(|| anyhow!(error));
+            }
+        } else {
+            let _ = self.child.kill();
+        }
+        let status = self
+            .child
+            .wait()
+            .context("reaping hardened discovery child")?;
+        self.status = Some(status);
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn status(&self) -> Option<ExitStatus> {
+        self.status
     }
 }
 
 impl Drop for HardenedChild<'_, '_> {
     fn drop(&mut self) {
-        let _ = self.kill_and_wait();
+        let _ = self.terminate_and_wait();
     }
 }
 
@@ -563,26 +615,31 @@ impl<'leases> crate::oracle::PreparedGlibc<'leases> {
     fn spawn_helper<'prepared>(
         &'prepared self,
         module: &Path,
-        child_control: BorrowedFd<'_>,
+        child_control: OwnedFd,
     ) -> Result<HardenedChild<'prepared, 'leases>> {
-        let mut command = self.helper_command(module, child_control)?;
+        let mut command = self.helper_command(module, child_control.as_fd())?;
         let child = command
             .spawn()
             .context("executing the pinned hardened discovery loader")?;
-        Ok(HardenedChild {
+        drop(child_control);
+        let mut child = HardenedChild {
             child,
+            pidfd: None,
             _prepared: self,
-            reaped: false,
-        })
+            status: None,
+        };
+        let pid = libc::pid_t::try_from(child.id())
+            .map_err(|_| anyhow!("hardened discovery child PID is out of range"))?;
+        child.pidfd =
+            Some(crate::verify::pidfd_open(pid).context("opening hardened discovery child pidfd")?);
+        Ok(child)
     }
 
     fn helper_command(&self, module: &Path, child_control: BorrowedFd<'_>) -> Result<Command> {
         if !module.is_absolute() {
             bail!("hardened discovery provider path must be absolute");
         }
-        self.ensure_leases()?;
         self.revalidate()?;
-        self.ensure_leases()?;
         let loader = self.loader_fd()?;
         let helper = self.helper_fd();
         let directory = self.private_directory_fd();
@@ -714,6 +771,382 @@ fn configure_exact_inheritance(
         });
     }
     Ok(())
+}
+
+#[allow(dead_code, reason = "private one-pass seam awaiting C3.3B wiring")]
+#[derive(Debug)]
+enum HardenedPassOutcome {
+    Complete(Manifest),
+    LeaseBroken,
+}
+
+#[allow(dead_code, reason = "private one-pass seam awaiting C3.3B wiring")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HardenedProtocolState {
+    Prepared,
+    Ready,
+    Running,
+}
+
+#[allow(dead_code, reason = "private one-pass seam awaiting C3.3B wiring")]
+fn fd_identity(fd: RawFd) -> Result<crate::oracle::ProcFdIdentity> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } == -1 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("identifying hardened discovery fd {fd}"));
+    }
+    Ok(crate::oracle::ProcFdIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+        kind: stat.st_mode & libc::S_IFMT,
+    })
+}
+
+#[allow(dead_code, reason = "private one-pass seam awaiting C3.3B wiring")]
+fn make_control_pair() -> Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [-1; 2];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    } == -1
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("creating hardened discovery control socketpair");
+    }
+    let parent = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let child = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    Ok((
+        crate::oracle::normalize_owned_fd(parent)?,
+        crate::oracle::normalize_owned_fd(child)?,
+    ))
+}
+
+#[allow(dead_code, reason = "private one-pass seam awaiting C3.3B wiring")]
+fn send_control(fd: &OwnedFd, packet: &[u8]) -> Result<()> {
+    let sent = unsafe {
+        libc::send(
+            fd.as_raw_fd(),
+            packet.as_ptr().cast(),
+            packet.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    };
+    if sent != packet.len() as isize {
+        return Err(if sent == -1 {
+            std::io::Error::last_os_error().into()
+        } else {
+            anyhow!("hardened discovery control packet was partially sent")
+        });
+    }
+    Ok(())
+}
+
+#[allow(dead_code, reason = "private one-pass seam awaiting C3.3B wiring")]
+enum ControlPacket {
+    None,
+    Eof,
+    Packet(Vec<u8>),
+}
+
+#[allow(dead_code, reason = "private one-pass seam awaiting C3.3B wiring")]
+fn receive_control(fd: &OwnedFd) -> Result<ControlPacket> {
+    let mut bytes = [0u8; 32];
+    let received = unsafe {
+        libc::recv(
+            fd.as_raw_fd(),
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+            libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+        )
+    };
+    if received == 0 {
+        return Ok(ControlPacket::Eof);
+    }
+    if received == -1 {
+        let error = std::io::Error::last_os_error();
+        return if matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ) {
+            Ok(ControlPacket::None)
+        } else {
+            Err(error).context("receiving hardened discovery control packet")
+        };
+    }
+    let received = usize::try_from(received)
+        .map_err(|_| anyhow!("invalid hardened discovery control packet length"))?;
+    if received > bytes.len() {
+        bail!("hardened discovery control packet exceeds 32 bytes");
+    }
+    Ok(ControlPacket::Packet(bytes[..received].to_vec()))
+}
+
+#[allow(dead_code, reason = "private one-pass seam awaiting C3.3B wiring")]
+fn bounded_read(mut file: &File, limit: u64, label: &str) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {label}"))?;
+    if bytes.len() as u64 > limit {
+        bail!("{label} exceeds the {limit}-byte limit");
+    }
+    Ok(bytes)
+}
+
+#[allow(dead_code, reason = "private one-pass seam awaiting C3.3B wiring")]
+fn poll_timeout(deadline: Instant) -> Result<libc::c_int> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| anyhow!("hardened discovery oracle reached its absolute deadline"))?;
+    let millis = remaining.as_millis().saturating_add(1);
+    Ok(millis.min(libc::c_int::MAX as u128) as libc::c_int)
+}
+
+#[allow(dead_code, reason = "private one-pass seam awaiting C3.3B wiring")]
+fn run_hardened_pass(
+    selection: &OracleSelection,
+    prepared: &crate::oracle::PreparedGlibc<'_>,
+    module: &Path,
+    timeout: Duration,
+) -> Result<HardenedPassOutcome> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| anyhow!("hardened discovery deadline overflow"))?;
+    if prepared.take_lease_break().map_err(anyhow::Error::msg)? {
+        return Ok(HardenedPassOutcome::LeaseBroken);
+    }
+    let (parent_control, child_control) = make_control_pair()?;
+    set_nonblocking(&parent_control)?;
+    let child_control_fd = child_control.as_raw_fd();
+    let child_control_identity = fd_identity(child_control.as_raw_fd())?;
+    let mut child = prepared.spawn_helper(module, child_control)?;
+    poll_timeout(deadline)?;
+    let pid = child.id();
+    let mut stdout = child
+        .take_stdout()
+        .ok_or_else(|| anyhow!("hardened discovery stdout was not piped"))?;
+    set_nonblocking(&stdout)?;
+
+    let null = File::open("/dev/null").context("opening /dev/null identity")?;
+    let mut expected_fds = BTreeMap::from([
+        (0, fd_identity(null.as_raw_fd())?),
+        (1, fd_identity(stdout.as_raw_fd())?),
+        (2, fd_identity(null.as_raw_fd())?),
+    ]);
+    expected_fds.insert(prepared.helper_fd(), fd_identity(prepared.helper_fd())?);
+    expected_fds.insert(prepared.loader_fd()?, fd_identity(prepared.loader_fd()?)?);
+    expected_fds.insert(
+        prepared.private_directory_fd(),
+        fd_identity(prepared.private_directory_fd())?,
+    );
+    for fd in prepared.runtime_fds() {
+        expected_fds.insert(fd, fd_identity(fd)?);
+    }
+    expected_fds.insert(child_control_fd, child_control_identity);
+    if child_control_fd <= 2 {
+        bail!("hardened child control fd overlaps stdio");
+    }
+
+    let provider = record_key(&current_provenance_object(module)?.0);
+    let mut executable = BTreeSet::from([prepared.file_key(prepared.helper_fd())?]);
+    for fd in prepared.runtime_fds() {
+        executable.insert(prepared.file_key(fd)?);
+    }
+    let loader = prepared.file_key(prepared.loader_fd()?)?;
+    let mut state = HardenedProtocolState::Prepared;
+    let mut process = None;
+    let mut maps = None;
+    let mut output = Vec::new();
+    let mut stdout_eof = false;
+    let mut control_eof = false;
+    let mut child_exited = false;
+
+    loop {
+        if prepared.take_lease_break().map_err(anyhow::Error::msg)? {
+            child.terminate_and_wait()?;
+            return Ok(HardenedPassOutcome::LeaseBroken);
+        }
+
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) => {
+                    stdout_eof = true;
+                    break;
+                }
+                Ok(read) => append_bounded(
+                    &mut output,
+                    &chunk[..read],
+                    crate::verify::MAX_MANIFEST_BYTES,
+                )?,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error).context("reading hardened discovery stdout"),
+            }
+        }
+
+        if state == HardenedProtocolState::Running && child_exited && stdout_eof {
+            child.terminate_and_wait()?;
+            let status = child.status().expect("termination always caches status");
+            if !status.success() {
+                let code = status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| format!("signal {}", status.signal().unwrap_or(0)));
+                bail!("hardened discovery oracle exited with {code}");
+            }
+            poll_timeout(deadline)?;
+            let manifest: Manifest =
+                serde_json::from_slice(&output).context("parsing hardened discovery JSON")?;
+            if manifest.schema != SCHEMA {
+                bail!(
+                    "hardened discovery schema mismatch: got {:?}, expected {SCHEMA:?}",
+                    manifest.schema
+                );
+            }
+            if prepared.take_lease_break().map_err(anyhow::Error::msg)? {
+                return Ok(HardenedPassOutcome::LeaseBroken);
+            }
+            selection.revalidate()?;
+            prepared.revalidate()?;
+            prepared.revalidate_seed(module)?;
+            if prepared.take_lease_break().map_err(anyhow::Error::msg)? {
+                return Ok(HardenedPassOutcome::LeaseBroken);
+            }
+            poll_timeout(deadline)?;
+            return Ok(HardenedPassOutcome::Complete(manifest));
+        }
+
+        let mut pollfds = [
+            libc::pollfd {
+                fd: if control_eof {
+                    -1
+                } else {
+                    parent_control.as_raw_fd()
+                },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if stdout_eof { -1 } else { stdout.as_raw_fd() },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if child_exited {
+                    -1
+                } else {
+                    child.pidfd().as_raw_fd()
+                },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: prepared.lease_event_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let polled = loop {
+            let timeout = poll_timeout(deadline)?;
+            let result = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, timeout) };
+            if result >= 0 {
+                break result;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error).context("polling hardened discovery child");
+            }
+        };
+        if polled == 0 {
+            bail!("hardened discovery oracle reached its absolute deadline");
+        }
+        if pollfds[2].revents & libc::POLLIN != 0 {
+            child_exited = true;
+            if state != HardenedProtocolState::Running {
+                bail!("hardened discovery child exited before GO");
+            }
+        }
+        if pollfds[3].revents != 0 {
+            continue;
+        }
+        if pollfds[0].revents != 0 {
+            match receive_control(&parent_control)? {
+                ControlPacket::None => {}
+                ControlPacket::Eof if state != HardenedProtocolState::Running => {
+                    bail!("hardened discovery control closed before GO")
+                }
+                ControlPacket::Eof => control_eof = true,
+                ControlPacket::Packet(packet) => {
+                    if prepared.take_lease_break().map_err(anyhow::Error::msg)? {
+                        child.terminate_and_wait()?;
+                        return Ok(HardenedPassOutcome::LeaseBroken);
+                    }
+                    match state {
+                        HardenedProtocolState::Prepared if packet == b"PREPARED" => {
+                            selection.revalidate()?;
+                            let child_process = selection.open_hardened_child(pid)?;
+                            let maps_file = child_process.maps()?;
+                            if child_process.exe_key()? != loader {
+                                bail!("hardened discovery child did not execute the pinned loader");
+                            }
+                            if child_process.fd_identities()? != expected_fds {
+                                bail!("hardened discovery child inherited an unexpected fd target");
+                            }
+                            prepared.revalidate()?;
+                            prepared.revalidate_seed(module)?;
+                            poll_timeout(deadline)?;
+                            if prepared.take_lease_break().map_err(anyhow::Error::msg)? {
+                                child.terminate_and_wait()?;
+                                return Ok(HardenedPassOutcome::LeaseBroken);
+                            }
+                            poll_timeout(deadline)?;
+                            send_control(&parent_control, b"DROP")?;
+                            process = Some(child_process);
+                            maps = Some(maps_file);
+                            state = HardenedProtocolState::Ready;
+                        }
+                        HardenedProtocolState::Ready if packet == b"READY" => {
+                            selection.revalidate()?;
+                            let child_process = process.as_ref().ok_or_else(|| {
+                                anyhow!("hardened child proc authority is missing")
+                            })?;
+                            let maps_file = maps.as_ref().ok_or_else(|| {
+                                anyhow!("hardened child maps authority is missing")
+                            })?;
+                            let maps_bytes = bounded_read(
+                                maps_file,
+                                crate::verify::MAX_MANIFEST_BYTES,
+                                "hardened child maps",
+                            )?;
+                            validate_hardened_executable_maps(&maps_bytes, &executable, provider)?;
+                            if child_process.exe_key()? != loader
+                                || child_process.fd_identities()? != expected_fds
+                            {
+                                bail!("hardened discovery child authority changed before GO");
+                            }
+                            prepared.revalidate()?;
+                            prepared.revalidate_seed(module)?;
+                            poll_timeout(deadline)?;
+                            if prepared.take_lease_break().map_err(anyhow::Error::msg)? {
+                                child.terminate_and_wait()?;
+                                return Ok(HardenedPassOutcome::LeaseBroken);
+                            }
+                            poll_timeout(deadline)?;
+                            send_control(&parent_control, b"GO")?;
+                            state = HardenedProtocolState::Running;
+                        }
+                        _ => bail!("unexpected hardened discovery control packet {packet:?}"),
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn rediscover_from_open_helper(
@@ -996,7 +1429,266 @@ mod tests {
     use p11scope_manifest::manifest::{
         Acquisition, ObjectRecord, ProvenanceObject, SurfaceRecord, SurfaceSource, WalkOutcome,
     };
+    use std::ffi::OsStr;
     use std::os::unix::fs::PermissionsExt as _;
+
+    const HAPPY_PROTOCOL: &str = r#"
+    if (send(control, "PREPARED", 8, 0) != 8) return 91;
+    if (!expect(control, "DROP")) return 92;
+    if (send(control, "READY", 5, 0) != 5) return 93;
+    if (!expect(control, "GO")) return 94;
+    int marker = open("@MARKER@", O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (marker < 0 || close(marker) != 0) return 95;
+    if (dprintf(1, "{\"schema\":\"p11scope-manifest/4\",\"module_path\":\"@MODULE@\",\"objects\":[],\"provenance_objects\":[],\"interface_list\":{\"status\":\"absent\"},\"surfaces\":[],\"vendor_interfaces\":[],\"alias_groups\":[]}") < 0) return 96;
+    return 0;
+"#;
+
+    fn hardened_protocol_root() -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+    ) {
+        hardened_protocol_root_with(HAPPY_PROTOCOL)
+    }
+
+    fn hardened_protocol_root_with(
+        flow: &str,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        for directory in [
+            "opt",
+            "lib64",
+            "usr",
+            "usr/lib",
+            "usr/lib/x86_64-linux-gnu",
+            "usr/lib64",
+            "etc",
+            "run",
+        ] {
+            std::fs::create_dir(root.path().join(directory)).unwrap();
+            std::fs::set_permissions(
+                root.path().join(directory),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let helper = root.path().join("opt/p11scope-discover");
+        let module = root.path().join("opt/provider.so");
+        let interpreter = root.path().join("lib64/ld-linux-x86-64.so.2");
+        let libc = root.path().join("usr/lib/x86_64-linux-gnu/libc.so.6");
+        let marker = root.path().join("provider-loaded");
+        let checkpoint = root.path().join("checkpoint");
+        let mutated = root.path().join("mutation-done");
+        let pid_file = root.path().join("oracle.pid");
+        let source = root.path().join("opt/p11scope-discover.c");
+        let program = r#"
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+static __attribute__((unused)) int expect(int fd, const char *wanted) {
+    char bytes[32];
+    ssize_t n = recv(fd, bytes, sizeof(bytes), MSG_TRUNC);
+    return n == (ssize_t)strlen(wanted) && !memcmp(bytes, wanted, (size_t)n);
+}
+
+int main(int argc, char **argv) {
+    if (argc != 5) return 90;
+    int control = atoi(argv[4]);
+    FILE *pid_file = fopen("@PID_FILE@", "w");
+    if (!pid_file || fprintf(pid_file, "%ld\n", (long)getpid()) < 0 || fclose(pid_file) != 0) return 89;
+@FLOW@
+}
+"#
+        .replace("@FLOW@", flow)
+        .replace("@MARKER@", marker.to_str().unwrap())
+        .replace("@CHECKPOINT@", checkpoint.to_str().unwrap())
+        .replace("@MUTATED@", mutated.to_str().unwrap())
+        .replace("@MODULE@", module.to_str().unwrap())
+        .replace(
+            "@REPLACEMENT@",
+            root.path().join("opt/replacement.so").to_str().unwrap(),
+        )
+        .replace("@PID_FILE@", pid_file.to_str().unwrap());
+        std::fs::write(&source, program).unwrap();
+        let compiled = Command::new("gcc")
+            .args(["-O2", "-Wall", "-Werror", "-o"])
+            .arg(&helper)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        std::fs::copy("/bin/false", &module).unwrap();
+        std::fs::copy("/bin/true", root.path().join("opt/replacement.so")).unwrap();
+        std::fs::copy("/lib64/ld-linux-x86-64.so.2", &interpreter).unwrap();
+        std::fs::copy("/usr/lib/x86_64-linux-gnu/libc.so.6", &libc).unwrap();
+        std::fs::hard_link(
+            &interpreter,
+            root.path()
+                .join("usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"),
+        )
+        .unwrap();
+        for file in [&helper, &module, &interpreter, &libc] {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (root, helper, module, interpreter, marker, pid_file)
+    }
+
+    fn thread_cpu_time() -> Duration {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+            0
+        );
+        Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+    }
+
+    fn assert_pid_esrch(pid: libc::pid_t) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if unsafe { libc::kill(pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "process {pid} survived teardown");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn assert_leader_reaped(pid: libc::pid_t) {
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert_pid_esrch(pid);
+    }
+
+    fn restore_private_aliases(prepared: &crate::oracle::PreparedGlibc<'_>) {
+        let directory = prepared.private_directory_fd();
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(directory, &mut stat) }, 0);
+        let mode = stat.st_mode & 0o777;
+        assert_eq!(unsafe { libc::fchmod(directory, 0o700) }, 0);
+        let aliases = prepared
+            .alias_links()
+            .map(|(name, target)| (name.to_owned(), target.to_owned()))
+            .collect::<Vec<_>>();
+        for (name, target) in aliases {
+            let name = CString::new(name.as_bytes()).unwrap();
+            let target = CString::new(target.as_bytes()).unwrap();
+            unsafe {
+                libc::unlinkat(directory, name.as_ptr(), 0);
+            }
+            assert_eq!(
+                unsafe { libc::symlinkat(target.as_ptr(), directory, name.as_ptr()) },
+                0
+            );
+        }
+        assert_eq!(unsafe { libc::fchmod(directory, mode) }, 0);
+    }
+
+    fn spawn_alias_mutator(
+        prepared: &crate::oracle::PreparedGlibc<'_>,
+        checkpoint: &Path,
+        mutated: &Path,
+    ) -> libc::pid_t {
+        let directory = prepared.private_directory_fd();
+        let (name, _target) = prepared
+            .alias_links()
+            .find(|(name, _)| *name == OsStr::new("libc.so.6"))
+            .unwrap();
+        let name = CString::new(name.as_bytes()).unwrap();
+        let replacement = c"/proc/self/fd/0";
+        let checkpoint = CString::new(checkpoint.as_os_str().as_bytes()).unwrap();
+        let mutated = CString::new(mutated.as_os_str().as_bytes()).unwrap();
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(directory, &mut stat) }, 0);
+        let mode = stat.st_mode & 0o777;
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            for _ in 0..3000 {
+                let checkpoint_fd =
+                    unsafe { libc::open(checkpoint.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+                if checkpoint_fd >= 0 {
+                    unsafe { libc::close(checkpoint_fd) };
+                    break;
+                }
+                unsafe { libc::usleep(1000) };
+            }
+            let failed = unsafe {
+                libc::fchmod(directory, 0o700) == -1
+                    || libc::unlinkat(directory, name.as_ptr(), 0) == -1
+                    || libc::symlinkat(replacement.as_ptr(), directory, name.as_ptr()) == -1
+                    || libc::fchmod(directory, mode) == -1
+            };
+            if failed {
+                unsafe { libc::_exit(20) };
+            }
+            let done = unsafe {
+                libc::open(
+                    mutated.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if done < 0 {
+                unsafe { libc::_exit(21) };
+            }
+            unsafe {
+                libc::close(done);
+                libc::_exit(0);
+            }
+        }
+        pid
+    }
+
+    fn hardened_test_selection() -> (Child, crate::oracle::OracleSelection) {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        let selection =
+            crate::oracle::OracleSelection::hardened_for_pid_for_test(child.id()).unwrap();
+        (child, selection)
+    }
 
     #[test]
     fn oracle_helper_metadata_enforces_owner_mode_and_file_type() {
@@ -1037,6 +1729,538 @@ mod tests {
         let mut exact = Vec::new();
         append_bounded(&mut exact, &[b'x'; 16], 16).unwrap();
         assert_eq!(exact.len(), 16);
+    }
+
+    #[test]
+    fn hardened_executable_maps_require_the_exact_pre_authorized_set() {
+        let helper = MappingFileKey {
+            device_major: 8,
+            device_minor: 1,
+            inode: 11,
+        };
+        let loader = MappingFileKey {
+            device_major: 8,
+            device_minor: 1,
+            inode: 12,
+        };
+        let provider = MappingFileKey {
+            device_major: 8,
+            device_minor: 1,
+            inode: 13,
+        };
+        let expected = BTreeSet::from([helper, loader]);
+        let exact = b"1000-2000 r-xp 00000000 08:01 11 /helper\n2000-3000 r-xp 00000000 08:01 12 /loader\n3000-4000 rw-p 00000000 00:00 0 [heap]\n";
+        validate_hardened_executable_maps(exact, &expected, provider).unwrap();
+        let repeated_authorized_inode = b"1000-2000 r-xp 00000000 08:01 11 /helper\n2000-3000 r-xp 00001000 08:01 11 /helper\n3000-4000 r-xp 00000000 08:01 12 /loader\n";
+        validate_hardened_executable_maps(repeated_authorized_inode, &expected, provider).unwrap();
+
+        for refused in [
+            b"1000-2000 r-xp 00000000 08:01 11 /helper\n".as_slice(),
+            b"1000-2000 r-xp 00000000 08:01 11 /helper\n2000-3000 r-xp 00000000 08:01 12 /loader\n3000-4000 r-xp 00000000 08:01 14 /extra\n",
+            b"1000-2000 r-xp 00000000 08:01 11 /helper\n2000-3000 r-xp 00000000 08:01 12 /loader\n3000-4000 r-xp 00000000 08:01 13 /provider\n",
+            b"not a maps line\n",
+        ] {
+            assert!(
+                validate_hardened_executable_maps(refused, &expected, provider).is_err(),
+                "accepted {refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn supervised_hardened_pass_completes_only_after_both_barriers() {
+        let (root, _helper, module, _loader, marker, _pid_file) = hardened_protocol_root();
+        let mut leases = ClosureLeases::new(&module).unwrap();
+        let mut prepared = crate::oracle::prepare_glibc_test_root(
+            root.path(),
+            Path::new("/opt/p11scope-discover"),
+            unsafe { libc::geteuid() },
+            &mut leases,
+        )
+        .unwrap();
+        let (mut target, selection) = hardened_test_selection();
+
+        let outcome =
+            run_hardened_pass(&selection, &prepared, &module, Duration::from_secs(5)).unwrap();
+        let HardenedPassOutcome::Complete(manifest) = outcome else {
+            panic!("lease unexpectedly broke");
+        };
+        assert_eq!(manifest.schema, SCHEMA);
+        assert_eq!(manifest.module_path, module.to_str().unwrap());
+        assert!(marker.exists());
+
+        target.kill().unwrap();
+        target.wait().unwrap();
+        drop(selection);
+        prepared.cleanup().unwrap();
+    }
+
+    #[test]
+    fn supervised_hardened_pass_rejects_invalid_or_abandoned_control_records() {
+        let cases = [
+            (
+                r#"send(control, "WRONG", 5, 0); pause(); return 0;"#,
+                "unexpected hardened discovery control packet",
+                false,
+            ),
+            (
+                r#"char packet[64] = {0}; send(control, packet, sizeof(packet), 0); pause(); return 0;"#,
+                "exceeds 32 bytes",
+                false,
+            ),
+            (
+                r#"send(control, "PREP", 4, 0); pause(); return 0;"#,
+                "unexpected hardened discovery control packet",
+                false,
+            ),
+            (
+                r#"send(control, "PREPARED", 8, 0); send(control, "PREPARED", 8, 0); pause(); return 0;"#,
+                "unexpected hardened discovery control packet",
+                false,
+            ),
+            (
+                r#"shutdown(control, SHUT_WR); pause(); return 0;"#,
+                "control closed before GO",
+                false,
+            ),
+            (
+                r#"
+                send(control, "PREPARED", 8, 0); if (!expect(control, "DROP")) return 2;
+                int checkpoint = open("@CHECKPOINT@", O_WRONLY | O_CREAT | O_EXCL, 0600);
+                if (checkpoint < 0 || close(checkpoint) != 0) return 3;
+                if (shutdown(control, SHUT_WR) != 0) return 4;
+                pause(); return 0;
+                "#,
+                "control closed before GO",
+                true,
+            ),
+            (
+                r#"send(control, "PREPARED", 8, 0); if (!expect(control, "DROP")) return 2; send(control, "READY", 5, 0); if (!expect(control, "GO")) return 3; send(control, "EXTRA", 5, 0); dprintf(1, "{\"schema\":\"p11scope-manifest/4\",\"module_path\":\"@MODULE@\",\"objects\":[],\"provenance_objects\":[],\"interface_list\":{\"status\":\"absent\"},\"surfaces\":[],\"vendor_interfaces\":[],\"alias_groups\":[]}"); pause(); return 0;"#,
+                "unexpected hardened discovery control packet",
+                false,
+            ),
+        ];
+        for (flow, expected_error, checkpoint_expected) in cases {
+            let (root, _helper, module, _loader, marker, pid_file) =
+                hardened_protocol_root_with(flow);
+            let checkpoint = root.path().join("checkpoint");
+            let mut leases = ClosureLeases::new(&module).unwrap();
+            let mut prepared = crate::oracle::prepare_glibc_test_root(
+                root.path(),
+                Path::new("/opt/p11scope-discover"),
+                unsafe { libc::geteuid() },
+                &mut leases,
+            )
+            .unwrap();
+            let (mut target, selection) = hardened_test_selection();
+
+            let error = run_hardened_pass(&selection, &prepared, &module, Duration::from_secs(2))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(expected_error),
+                "{flow}: {error:#}"
+            );
+            assert!(!marker.exists(), "provider marker exists for {flow}");
+            assert_eq!(
+                checkpoint.exists(),
+                checkpoint_expected,
+                "wrong DROP checkpoint state for {flow}"
+            );
+            let pid: i32 = std::fs::read_to_string(&pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_leader_reaped(pid);
+            prepared.cleanup().unwrap();
+            target.kill().unwrap();
+            target.wait().unwrap();
+        }
+    }
+
+    #[test]
+    fn supervised_hardened_pass_uses_one_deadline_and_kills_stdout_leaks() {
+        let cases = [
+            (
+                "(void)control; sleep(30); return 0;",
+                Duration::from_millis(100),
+                1,
+            ),
+            (
+                r#"
+                usleep(70000);
+                if (send(control, "PREPARED", 8, 0) != 8) return 2;
+                if (!expect(control, "DROP")) return 3;
+                usleep(70000);
+                if (send(control, "READY", 5, 0) != 5) return 4;
+                if (!expect(control, "GO")) return 5;
+                if (dprintf(1, "{\"schema\":\"p11scope-manifest/4\",\"module_path\":\"@MODULE@\",\"objects\":[],\"provenance_objects\":[],\"interface_list\":{\"status\":\"absent\"},\"surfaces\":[],\"vendor_interfaces\":[],\"alias_groups\":[]}") < 0) return 6;
+                int sync_pipe[2]; if (pipe(sync_pipe) != 0) return 7;
+                pid_t descendant = fork(); if (descendant < 0) return 8;
+                if (descendant == 0) {
+                    close(sync_pipe[0]); FILE *pid_file = fopen("@PID_FILE@", "a");
+                    if (!pid_file || fprintf(pid_file, "%ld\n", (long)getpid()) < 0 || fclose(pid_file) != 0) _exit(9);
+                    if (write(sync_pipe[1], "x", 1) != 1) _exit(10);
+                    sleep(30); _exit(0);
+                }
+                close(sync_pipe[1]); char acknowledged;
+                if (read(sync_pipe[0], &acknowledged, 1) != 1) return 11;
+                close(sync_pipe[0]);
+                return 0;
+                "#,
+                Duration::from_millis(190),
+                2,
+            ),
+        ];
+        for (flow, timeout, expected_pid_count) in cases {
+            let (root, _helper, module, _loader, _marker, pid_file) =
+                hardened_protocol_root_with(flow);
+            let mut leases = ClosureLeases::new(&module).unwrap();
+            let mut prepared = crate::oracle::prepare_glibc_test_root(
+                root.path(),
+                Path::new("/opt/p11scope-discover"),
+                unsafe { libc::geteuid() },
+                &mut leases,
+            )
+            .unwrap();
+            let (mut target, selection) = hardened_test_selection();
+            let started = Instant::now();
+
+            let error = run_hardened_pass(&selection, &prepared, &module, timeout).unwrap_err();
+            let elapsed = started.elapsed();
+            assert!(error.to_string().contains("deadline"), "{error:#}");
+            assert!(elapsed >= timeout, "deadline fired early: {elapsed:?}");
+            assert!(
+                elapsed < timeout + Duration::from_millis(250),
+                "deadline was reset: {elapsed:?}"
+            );
+            let pids: Vec<libc::pid_t> = std::fs::read_to_string(&pid_file)
+                .unwrap()
+                .lines()
+                .map(|line| line.parse().unwrap())
+                .collect();
+            assert_eq!(pids.len(), expected_pid_count);
+            assert_leader_reaped(pids[0]);
+            for descendant in &pids[1..] {
+                assert_pid_esrch(*descendant);
+            }
+            prepared.cleanup().unwrap();
+            target.kill().unwrap();
+            target.wait().unwrap();
+        }
+    }
+
+    #[test]
+    fn supervised_hardened_pass_blocks_after_leader_exit_until_stdout_deadline() {
+        let flow = r#"
+            if (send(control, "PREPARED", 8, 0) != 8) return 2;
+            if (!expect(control, "DROP")) return 3;
+            if (send(control, "READY", 5, 0) != 5) return 4;
+            if (!expect(control, "GO")) return 5;
+            if (dprintf(1, "{\"schema\":\"p11scope-manifest/4\",\"module_path\":\"@MODULE@\",\"objects\":[],\"provenance_objects\":[],\"interface_list\":{\"status\":\"absent\"},\"surfaces\":[],\"vendor_interfaces\":[],\"alias_groups\":[]}") < 0) return 6;
+            int sync_pipe[2]; if (pipe(sync_pipe) != 0) return 7;
+            pid_t descendant = fork(); if (descendant < 0) return 8;
+            if (descendant == 0) {
+                close(sync_pipe[0]);
+                FILE *pid_file = fopen("@PID_FILE@", "a");
+                if (!pid_file || fprintf(pid_file, "%ld\n", (long)getpid()) < 0 || fclose(pid_file) != 0) _exit(9);
+                if (write(sync_pipe[1], "x", 1) != 1) _exit(10);
+                sleep(30); _exit(0);
+            }
+            close(sync_pipe[1]); char acknowledged;
+            if (read(sync_pipe[0], &acknowledged, 1) != 1) return 11;
+            close(sync_pipe[0]); return 0;
+        "#;
+        let timeout = Duration::from_millis(220);
+        let (root, _helper, module, _loader, _marker, pid_file) = hardened_protocol_root_with(flow);
+        let mut leases = ClosureLeases::new(&module).unwrap();
+        let mut prepared = crate::oracle::prepare_glibc_test_root(
+            root.path(),
+            Path::new("/opt/p11scope-discover"),
+            unsafe { libc::geteuid() },
+            &mut leases,
+        )
+        .unwrap();
+        let (mut target, selection) = hardened_test_selection();
+        let wall_started = Instant::now();
+        let cpu_started = thread_cpu_time();
+
+        let error = match run_hardened_pass(&selection, &prepared, &module, timeout) {
+            Err(error) => error,
+            Ok(_) => panic!("accepted incomplete stdout after its deadline"),
+        };
+        let cpu_elapsed = thread_cpu_time() - cpu_started;
+        let wall_elapsed = wall_started.elapsed();
+
+        assert!(error.to_string().contains("deadline"), "{error:#}");
+        assert!(
+            wall_elapsed >= timeout,
+            "deadline fired early: {wall_elapsed:?}"
+        );
+        assert!(
+            cpu_elapsed < Duration::from_millis(60),
+            "pidfd readiness busy-spun for {cpu_elapsed:?} CPU over {wall_elapsed:?} wall"
+        );
+        let pids: Vec<libc::pid_t> = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .lines()
+            .map(|line| line.parse().unwrap())
+            .collect();
+        assert_eq!(
+            pids.len(),
+            2,
+            "leader and descendant were not both recorded"
+        );
+        assert_leader_reaped(pids[0]);
+        assert_pid_esrch(pids[1]);
+        prepared.cleanup().unwrap();
+        target.kill().unwrap();
+        target.wait().unwrap();
+    }
+
+    #[test]
+    fn supervised_hardened_pass_refuses_result_completed_after_deadline() {
+        let flow = r#"
+            if (send(control, "PREPARED", 8, 0) != 8) return 2;
+            if (!expect(control, "DROP")) return 3;
+            if (send(control, "READY", 5, 0) != 5) return 4;
+            if (!expect(control, "GO")) return 5;
+            struct timespec started, now;
+            if (clock_gettime(CLOCK_MONOTONIC, &started) != 0) return 6;
+            if (dprintf(1, "{\"schema\":\"p11scope-manifest/4\",\"module_path\":\"") < 0) return 7;
+            char escaped[6000];
+            for (int i = 0; i < 1000; i++) memcpy(escaped + i * 6, "\\u0061", 6);
+            for (int i = 0; i < 2500; i++) if (write(1, escaped, sizeof(escaped)) != sizeof(escaped)) return 8;
+            if (dprintf(1, "\",\"objects\":[],\"provenance_objects\":[],\"interface_list\":{\"status\":\"absent\"},\"surfaces\":[],\"vendor_interfaces\":[],\"alias_groups\":[]}") < 0) return 9;
+            do {
+                if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 10;
+                long elapsed_ms = (now.tv_sec - started.tv_sec) * 1000 + (now.tv_nsec - started.tv_nsec) / 1000000;
+                if (elapsed_ms >= 200) break;
+                usleep(1000);
+            } while (1);
+            return 0;
+        "#;
+        let timeout = Duration::from_millis(230);
+        let (root, _helper, module, _loader, _marker, _pid_file) =
+            hardened_protocol_root_with(flow);
+        let mut leases = ClosureLeases::new(&module).unwrap();
+        let mut prepared = crate::oracle::prepare_glibc_test_root(
+            root.path(),
+            Path::new("/opt/p11scope-discover"),
+            unsafe { libc::geteuid() },
+            &mut leases,
+        )
+        .unwrap();
+        let (mut target, selection) = hardened_test_selection();
+        let started = Instant::now();
+
+        let error = match run_hardened_pass(&selection, &prepared, &module, timeout) {
+            Err(error) => error,
+            Ok(_) => panic!("accepted hardened discovery result after its deadline"),
+        };
+
+        assert!(error.to_string().contains("deadline"), "{error:#}");
+        assert!(started.elapsed() >= timeout);
+        prepared.cleanup().unwrap();
+        target.kill().unwrap();
+        target.wait().unwrap();
+    }
+
+    #[test]
+    fn supervised_hardened_pass_refuses_authority_output_and_exit_mutations() {
+        let cases = [
+            (
+                r#"
+                send(control, "PREPARED", 8, 0); if (!expect(control, "DROP")) return 2;
+                int checkpoint = open("@CHECKPOINT@", O_WRONLY | O_CREAT | O_EXCL, 0600);
+                int fd = open("/bin/false", O_RDONLY);
+                int helper_fd = atoi(strrchr(argv[0], '/') + 1);
+                if (checkpoint < 0 || close(checkpoint) != 0 || fd < 0 || dup2(fd, helper_fd) < 0) return 3;
+                close(fd); send(control, "READY", 5, 0); pause(); return 0;
+                "#,
+                "authority changed before GO",
+                false,
+            ),
+            (
+                r#"
+                send(control, "PREPARED", 8, 0); if (!expect(control, "DROP")) return 2;
+                send(control, "READY", 5, 0); if (!expect(control, "GO")) return 3;
+                int checkpoint = open("@CHECKPOINT@", O_WRONLY | O_CREAT | O_EXCL, 0600);
+                if (checkpoint < 0 || close(checkpoint) != 0) return 4;
+                for (int i = 0; i < 3000 && access("@MUTATED@", F_OK) != 0; i++) usleep(1000);
+                if (access("@MUTATED@", F_OK) != 0) return 5;
+                dprintf(1, "{\"schema\":\"p11scope-manifest/4\",\"module_path\":\"@MODULE@\",\"objects\":[],\"provenance_objects\":[],\"interface_list\":{\"status\":\"absent\"},\"surfaces\":[],\"vendor_interfaces\":[],\"alias_groups\":[]}"); return 0;
+                "#,
+                "was retargeted",
+                true,
+            ),
+            (
+                r#"
+                send(control, "PREPARED", 8, 0); if (!expect(control, "DROP")) return 2;
+                send(control, "READY", 5, 0); if (!expect(control, "GO")) return 3;
+                int checkpoint = open("@CHECKPOINT@", O_WRONLY | O_CREAT | O_EXCL, 0600);
+                if (checkpoint < 0 || close(checkpoint) != 0 || rename("@REPLACEMENT@", "@MODULE@") != 0) return 4;
+                dprintf(1, "{\"schema\":\"p11scope-manifest/4\",\"module_path\":\"@MODULE@\",\"objects\":[],\"provenance_objects\":[],\"interface_list\":{\"status\":\"absent\"},\"surfaces\":[],\"vendor_interfaces\":[],\"alias_groups\":[]}"); return 0;
+                "#,
+                "provenance module",
+                false,
+            ),
+            (
+                r#"
+                send(control, "PREPARED", 8, 0); if (!expect(control, "DROP")) return 2;
+                int checkpoint = open("@CHECKPOINT@", O_WRONLY | O_CREAT | O_EXCL, 0600);
+                int fd = open("/bin/true", O_RDONLY); struct stat st; if (checkpoint < 0 || close(checkpoint) != 0 || fd < 0 || fstat(fd, &st) != 0) return 3;
+                if (mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0) == MAP_FAILED) return 4;
+                close(fd); send(control, "READY", 5, 0); pause(); return 0;
+                "#,
+                "executable mappings differ",
+                false,
+            ),
+            (
+                r#"
+                send(control, "PREPARED", 8, 0); if (!expect(control, "DROP")) return 2;
+                int checkpoint = open("@CHECKPOINT@", O_WRONLY | O_CREAT | O_EXCL, 0600);
+                int fd = open("@MODULE@", O_RDONLY); struct stat st; if (checkpoint < 0 || close(checkpoint) != 0 || fd < 0 || fstat(fd, &st) != 0) return 3;
+                if (mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0) == MAP_FAILED) return 4;
+                close(fd); send(control, "READY", 5, 0); pause(); return 0;
+                "#,
+                "provider was executable before hardened discovery GO",
+                false,
+            ),
+            (
+                r#"
+                send(control, "PREPARED", 8, 0); if (!expect(control, "DROP")) return 2;
+                send(control, "READY", 5, 0); if (!expect(control, "GO")) return 3;
+                int checkpoint = open("@CHECKPOINT@", O_WRONLY | O_CREAT | O_EXCL, 0600);
+                if (checkpoint < 0 || close(checkpoint) != 0) return 4;
+                char bytes[8192] = {0}; for (int i = 0; i < 2049; i++) if (write(1, bytes, sizeof(bytes)) != sizeof(bytes)) return 5;
+                return 0;
+                "#,
+                "byte limit",
+                false,
+            ),
+            (
+                r#"
+                send(control, "PREPARED", 8, 0); if (!expect(control, "DROP")) return 2;
+                send(control, "READY", 5, 0); if (!expect(control, "GO")) return 3;
+                int checkpoint = open("@CHECKPOINT@", O_WRONLY | O_CREAT | O_EXCL, 0600);
+                if (checkpoint < 0 || close(checkpoint) != 0) return 4;
+                return 7;
+                "#,
+                "exited with 7",
+                false,
+            ),
+        ];
+        for (flow, expected_error, restore_alias) in cases {
+            let (root, _helper, module, _loader, marker, pid_file) =
+                hardened_protocol_root_with(flow);
+            let checkpoint = root.path().join("checkpoint");
+            let mut leases = ClosureLeases::new(&module).unwrap();
+            let mut prepared = crate::oracle::prepare_glibc_test_root(
+                root.path(),
+                Path::new("/opt/p11scope-discover"),
+                unsafe { libc::geteuid() },
+                &mut leases,
+            )
+            .unwrap();
+            let (mut target, selection) = hardened_test_selection();
+            let alias_mutator = restore_alias.then(|| {
+                spawn_alias_mutator(&prepared, &checkpoint, &root.path().join("mutation-done"))
+            });
+
+            let error = run_hardened_pass(&selection, &prepared, &module, Duration::from_secs(3))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(expected_error),
+                "{flow}: {error:#}"
+            );
+            assert!(!marker.exists());
+            assert!(checkpoint.exists(), "phase checkpoint missing for {flow}");
+            let pid: i32 = std::fs::read_to_string(&pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_leader_reaped(pid);
+            if let Some(alias_mutator) = alias_mutator {
+                let mut status = 0;
+                assert_eq!(
+                    unsafe { libc::waitpid(alias_mutator, &mut status, 0) },
+                    alias_mutator
+                );
+                assert!(libc::WIFEXITED(status));
+                assert_eq!(libc::WEXITSTATUS(status), 0);
+                restore_private_aliases(&prepared);
+            }
+            prepared.cleanup().unwrap();
+            target.kill().unwrap();
+            target.wait().unwrap();
+        }
+    }
+
+    #[test]
+    fn supervised_hardened_pass_reports_lease_break_only_after_reaping() {
+        let flow = format!("usleep(200000); {HAPPY_PROTOCOL}");
+        let (root, _helper, module, _loader, marker, pid_file) = hardened_protocol_root_with(&flow);
+        let mut leases = ClosureLeases::new(&module).unwrap();
+        #[repr(C)]
+        struct LeaseOwner {
+            kind: libc::c_int,
+            pid: libc::pid_t,
+        }
+        const F_OWNER_TID: libc::c_int = 0;
+        const F_SETOWN_EX: libc::c_int = 15;
+        let owner = LeaseOwner {
+            kind: F_OWNER_TID,
+            pid: unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t },
+        };
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    leases.objects.get(&leases.seed).unwrap().file.as_raw_fd(),
+                    F_SETOWN_EX,
+                    &owner,
+                )
+            },
+            0
+        );
+        let mut prepared = crate::oracle::prepare_glibc_test_root(
+            root.path(),
+            Path::new("/opt/p11scope-discover"),
+            unsafe { libc::geteuid() },
+            &mut leases,
+        )
+        .unwrap();
+        let (mut target, selection) = hardened_test_selection();
+        let writer_module = module.clone();
+        let writer_pid_file = pid_file.clone();
+        let writer = std::thread::spawn(move || {
+            while !writer_pid_file.exists() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            OpenOptions::new().write(true).open(writer_module).unwrap();
+        });
+
+        let outcome =
+            run_hardened_pass(&selection, &prepared, &module, Duration::from_secs(3)).unwrap();
+        assert!(matches!(outcome, HardenedPassOutcome::LeaseBroken));
+        assert!(!marker.exists());
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "child {pid} survived");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        prepared.cleanup().unwrap();
+        drop(prepared);
+        drop(leases);
+        writer.join().unwrap();
+        target.kill().unwrap();
+        target.wait().unwrap();
     }
 
     #[test]
@@ -1525,8 +2749,6 @@ int main(void) {
 
     #[test]
     fn hardened_glibc_preflight_leases_revalidates_and_cleans_test_root() {
-        use std::os::fd::AsFd as _;
-
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         for directory in [
@@ -1556,9 +2778,11 @@ int main(void) {
             r#"
 #include <signal.h>
 #include <stdio.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 
 int main(int argc, char **argv, char **envp) {
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return 4;
     int envc = 0;
     while (envp[envc] != NULL) envc++;
     if (dprintf(1, "argc=%d\n", argc) < 0) return 2;
@@ -1635,9 +2859,7 @@ int main(int argc, char **argv, char **envp) {
         let event_fd = prepared.lease_event_fd().as_raw_fd();
         let helper_fd = prepared.helper_fd();
         let control_fd = child_control.as_raw_fd();
-        let mut child = prepared
-            .spawn_helper(&module, child_control.as_fd())
-            .unwrap();
+        let mut child = prepared.spawn_helper(&module, child_control).unwrap();
         let pid = child.id();
         let mut stdout = child.take_stdout().unwrap();
         set_nonblocking(&stdout).unwrap();
@@ -1650,7 +2872,7 @@ int main(int argc, char **argv, char **envp) {
                 Ok(read) => output.extend_from_slice(&bytes[..read]),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if Instant::now() >= deadline {
-                        child.kill_and_wait().unwrap();
+                        child.terminate_and_wait().unwrap();
                         panic!("hardened helper did not reach its stop barrier");
                     }
                     std::thread::sleep(Duration::from_millis(1));
@@ -1658,18 +2880,15 @@ int main(int argc, char **argv, char **envp) {
                 Err(error) => panic!("reading hardened helper facts failed: {error}"),
             }
         }
-        let mut status = 0;
         let stopped = loop {
-            let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WUNTRACED) };
-            if waited == pid as libc::pid_t {
-                break libc::WIFSTOPPED(status);
+            let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+            if status.lines().any(|line| line.starts_with("State:\tT")) {
+                break true;
             }
-            if waited == -1
-                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-            {
-                continue;
+            if Instant::now() >= deadline {
+                break false;
             }
-            break false;
+            std::thread::sleep(Duration::from_millis(1));
         };
         assert!(
             stopped,
@@ -1684,16 +2903,16 @@ int main(int argc, char **argv, char **envp) {
             unsafe { libc::getpgid(pid as libc::pid_t) },
             pid as libc::pid_t
         );
-        let actual_fds = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        let selection = crate::oracle::OracleSelection::hardened_for_pid_for_test(pid).unwrap();
+        let process = selection.open_hardened_child(pid).unwrap();
+        assert_eq!(
+            process.exe_key().unwrap(),
+            mapping_file_key(&File::open(&interpreter).unwrap()).unwrap()
+        );
+        let actual_fds = process
+            .fd_identities()
             .unwrap()
-            .map(|entry| {
-                entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .parse::<RawFd>()
-                    .unwrap()
-            })
+            .into_keys()
             .collect::<BTreeSet<_>>();
         assert_eq!(actual_fds, expected_fds);
         assert!(!actual_fds.contains(&parent_control.as_raw_fd()));

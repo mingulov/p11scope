@@ -85,6 +85,19 @@ struct PinnedTarget {
     identity: TargetIdentity,
 }
 
+#[allow(dead_code, reason = "private one-pass seam awaiting C3.3B wiring")]
+pub(crate) struct HardenedChildProcess {
+    directory: File,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code, reason = "private one-pass seam awaiting C3.3B wiring")]
+pub(crate) struct ProcFdIdentity {
+    pub(crate) device: libc::dev_t,
+    pub(crate) inode: libc::ino_t,
+    pub(crate) kind: libc::mode_t,
+}
+
 fn trusted_required(reason: impl std::fmt::Display) -> anyhow::Error {
     anyhow!(
         "{reason}; pass --trusted-workload only when the observed workload is explicitly trusted"
@@ -126,6 +139,77 @@ impl OracleSelection {
             mode: OracleMode::Hardened,
             target: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hardened_for_pid_for_test(pid: u32) -> Result<Self> {
+        Ok(Self::hardened(PinnedTarget::pin(pid)?))
+    }
+
+    #[allow(dead_code, reason = "private one-pass seam awaiting C3.3B wiring")]
+    pub(crate) fn open_hardened_child(&self, pid: u32) -> Result<HardenedChildProcess> {
+        let target = self
+            .target
+            .as_ref()
+            .ok_or_else(|| anyhow!("hardened oracle selection has no retained target authority"))?;
+        target.revalidate()?;
+        validate_procfs_binding(&target.procfs)?;
+        Ok(HardenedChildProcess {
+            directory: open_proc_pid_directory(&target.procfs, pid)?,
+        })
+    }
+}
+
+#[allow(dead_code, reason = "private one-pass seam awaiting C3.3B wiring")]
+impl HardenedChildProcess {
+    pub(crate) fn maps(&self) -> Result<File> {
+        open_proc_regular(&self.directory, "maps")
+    }
+
+    pub(crate) fn exe_key(&self) -> Result<MappingFileKey> {
+        let exe = openat_file(&self.directory, "exe", libc::O_RDONLY)?;
+        mapping_file_key(&exe).map_err(anyhow::Error::msg)
+    }
+
+    pub(crate) fn fd_identities(&self) -> Result<BTreeMap<RawFd, ProcFdIdentity>> {
+        let directory = open_proc_directory(&self.directory, "fd")?;
+        let mut result = BTreeMap::new();
+        for name in directory_entry_names(&directory, MAX_TARGET_TASKS, "hardened child fd")? {
+            let bytes = name.as_bytes();
+            if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+                return Err(anyhow!(
+                    "hardened child fd directory has a non-numeric entry"
+                ));
+            }
+            let text = std::str::from_utf8(bytes)
+                .map_err(|_| anyhow!("hardened child fd is not UTF-8"))?;
+            let fd: RawFd = text
+                .parse()
+                .map_err(|_| anyhow!("hardened child fd is out of range"))?;
+            if fd < 0 || fd.to_string() != text {
+                return Err(anyhow!("hardened child fd is not canonical"));
+            }
+            let name = CString::new(bytes).expect("numeric fd has no NUL");
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstatat(directory.as_raw_fd(), name.as_ptr(), &mut stat, 0) } == -1 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("identifying hardened child fd {fd}"));
+            }
+            if result
+                .insert(
+                    fd,
+                    ProcFdIdentity {
+                        device: stat.st_dev,
+                        inode: stat.st_ino,
+                        kind: stat.st_mode & libc::S_IFMT,
+                    },
+                )
+                .is_some()
+            {
+                return Err(anyhow!("hardened child fd directory has duplicate entries"));
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -733,7 +817,7 @@ fn parse_proc_start_time(stat: &[u8]) -> Result<u64> {
         .context("process stat has an invalid start time")
 }
 
-fn normalize_owned_fd(fd: OwnedFd) -> Result<OwnedFd> {
+pub(crate) fn normalize_owned_fd(fd: OwnedFd) -> Result<OwnedFd> {
     if fd.as_raw_fd() > 2 {
         return Ok(fd);
     }
@@ -1654,10 +1738,6 @@ impl PreparedGlibc<'_> {
         self.private.revalidate()
     }
 
-    pub(crate) fn ensure_leases(&self) -> Result<()> {
-        self.leases.ensure().map_err(anyhow::Error::msg)
-    }
-
     #[allow(dead_code, reason = "polled by the hardened child supervisor in C3.3")]
     pub(crate) fn lease_event_fd(&self) -> BorrowedFd<'_> {
         self.leases.event_fd()
@@ -1685,6 +1765,21 @@ impl PreparedGlibc<'_> {
 
     pub(crate) fn runtime_fds(&self) -> impl Iterator<Item = RawFd> + '_ {
         self.runtime_fds.values().copied()
+    }
+
+    #[allow(dead_code, reason = "private one-pass seam awaiting C3.3B wiring")]
+    pub(crate) fn file_key(&self, fd: RawFd) -> Result<MappingFileKey> {
+        mapping_file_key(
+            self.leases
+                .file(fd)
+                .ok_or_else(|| anyhow!("retained hardened glibc fd {fd} is missing"))?,
+        )
+        .map_err(anyhow::Error::msg)
+    }
+
+    #[allow(dead_code, reason = "private one-pass seam awaiting C3.3B wiring")]
+    pub(crate) fn revalidate_seed(&self, module: &Path) -> Result<()> {
+        self.leases.revalidate_seed(module)
     }
 
     pub(crate) fn alias_links(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {

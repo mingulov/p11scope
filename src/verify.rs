@@ -1205,7 +1205,7 @@ fn receive_packet(fd: &OwnedFd) -> Result<Option<u8>, String> {
     }
 }
 
-fn pidfd_open(pid: libc::pid_t) -> std::io::Result<OwnedFd> {
+pub(crate) fn pidfd_open(pid: libc::pid_t) -> std::io::Result<OwnedFd> {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
     if fd == -1 {
         Err(std::io::Error::last_os_error())
@@ -1214,7 +1214,7 @@ fn pidfd_open(pid: libc::pid_t) -> std::io::Result<OwnedFd> {
     }
 }
 
-fn pidfd_send_signal(pidfd: &OwnedFd, signal: i32) -> Result<(), String> {
+pub(crate) fn pidfd_send_signal(pidfd: &OwnedFd, signal: i32) -> Result<(), String> {
     let result = unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
@@ -1235,7 +1235,7 @@ fn pidfd_send_signal(pidfd: &OwnedFd, signal: i32) -> Result<(), String> {
     Ok(())
 }
 
-fn wait_pidfd(pidfd: &OwnedFd) -> Result<(), String> {
+pub(crate) fn wait_pidfd(pidfd: &OwnedFd) -> Result<(), String> {
     let mut pollfd = libc::pollfd {
         fd: pidfd.as_raw_fd(),
         events: libc::POLLIN,

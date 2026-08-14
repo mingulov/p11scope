@@ -7,6 +7,19 @@ fn read(path: &str) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| panic!("reading {path}: {error}"))
 }
 
+fn run_ok(program: &str, args: &[&str]) -> String {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("running {program}: {error}"));
+    assert!(
+        output.status.success(),
+        "{program} {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("command stdout is UTF-8")
+}
+
 fn embedded_map_definitions() -> BTreeMap<String, [u32; 7]> {
     let directory = tempfile::tempdir().expect("temporary map-inspection directory");
     let object = directory.path().join("p11scope-ebpf");
@@ -222,6 +235,169 @@ fn policy_specific_ebpf() {
     assert!(!source.contains("FUNCTION_HASH_OFFSET"));
     assert!(!source.contains("function_hash_step"));
     assert!(source.matches("checked_add(").count() >= 7);
+}
+
+#[test]
+fn metadata_canary_matrix() {
+    let canaries = read("scripts/verify-canaries.sh");
+    let lane_block = canaries
+        .split_once("done <<'LANES'\n")
+        .expect("canary lane table")
+        .1
+        .split_once("\nLANES")
+        .unwrap()
+        .0;
+    assert_eq!(
+        lane_block,
+        "default-safe-profile default profile\n\
+default-safe-trace default trace\n\
+feature-safe-profile feature profile\n\
+feature-safe-trace feature trace\n\
+feature-unsafe-profile feature-unsafe profile\n\
+feature-unsafe-trace feature-unsafe trace\n\
+aggregate-only-metrics default metrics"
+    );
+    for marker in [
+        "assert_exact_owned_map_inventory",
+        "assert_nonempty_start",
+        "assert_ring_empty \"$WORK/mapdump_manifest_$lane.json\"",
+        "--unsafe-unvalidated-metadata",
+    ] {
+        assert!(canaries.contains(marker), "canary gate misses {marker}");
+    }
+
+    let induced = read("scripts/verify-induced-gaps.sh");
+    for marker in [
+        "freeze_policy_maps \"$WPID\" \"$CGROUP_PATH\"",
+        "/children",
+        "wait_for_privacy_frame",
+        "BPF_MAP_GET_FD_BY_ID",
+        "BPF_OBJ_GET_INFO_BY_FD",
+        "BPF_MAP_CREATE",
+        "BPF_MAP_UPDATE_ELEM",
+        "BPF_MAP_DELETE_ELEM",
+        "BPF_PROG_GET_FD_BY_ID",
+        "matched_result(control_rc, target_rc, target_errno)",
+        "assert_dynamic_maps_advanced",
+        "approval_capacity_refuses_the_whole_oversized_union",
+        "START insertion loss",
+        "RV update loss",
+        "event loss",
+    ] {
+        assert!(induced.contains(marker), "induced-gap gate misses {marker}");
+    }
+    for name in [
+        "CONFIG",
+        "PID_FILTER",
+        "CGROUP_FILTER",
+        "SLOT_SEMANTICS",
+        "ASYNC_FUNCTIONS",
+        "MECH_SHAPE",
+        "ATTR_BOOL_BITS",
+        "TEMPLATE_TAIL",
+        "STATS",
+        "RV_COUNTS",
+        "EVIDENCE",
+    ] {
+        assert!(induced.contains(name), "induced-gap gate misses map {name}");
+    }
+
+    for path in [
+        "scripts/verify-canaries.sh",
+        "scripts/verify-induced-gaps.sh",
+    ] {
+        run_ok("sh", &["-n", path]);
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let provider = directory.path().join("matrix-provider.so");
+    let workload = directory.path().join("canary-workload");
+    run_ok(
+        "cc",
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wall",
+            "-Wextra",
+            "-DPRIVACY_FIXTURE=1",
+            "-o",
+            provider.to_str().unwrap(),
+            "crates/discover/tests/fixture/version_matrix.c",
+        ],
+    );
+    run_ok(
+        "cc",
+        &[
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-o",
+            workload.to_str().unwrap(),
+            "scripts/fixtures/canary_workload.c",
+            "-ldl",
+        ],
+    );
+    let matrix = run_ok(
+        workload.to_str().unwrap(),
+        &[provider.to_str().unwrap(), "matrix"],
+    );
+    assert_eq!(
+        matrix
+            .lines()
+            .filter(|line| line.ends_with(" -> 0x0"))
+            .count(),
+        24
+    );
+    assert!(matrix.contains("canary_workload matrix: all calls CKR_OK"));
+
+    let lanes = run_ok("sh", &["scripts/verify-canaries.sh", "--self-test"]);
+    assert!(lanes.contains("canary lane assertion self-test: OK"));
+
+    let harness = induced
+        .split_once("#define _GNU_SOURCE\n")
+        .unwrap()
+        .1
+        .split_once("\nEOF\n")
+        .unwrap()
+        .0;
+    assert!(!harness.contains("BPF_MAP_FREEZE"));
+    let source = directory.path().join("freeze-policy-maps.c");
+    let binary = directory.path().join("freeze-policy-maps");
+    fs::write(&source, format!("#define _GNU_SOURCE\n{harness}")).unwrap();
+    let compiled = Command::new("cc")
+        .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-o"])
+        .arg(&binary)
+        .arg(source)
+        .output()
+        .expect("compile freeze harness");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let harness_test = Command::new(binary)
+        .arg("--self-test")
+        .output()
+        .expect("run freeze predicate self-test");
+    assert!(harness_test.status.success());
+    assert!(
+        String::from_utf8_lossy(&harness_test.stdout)
+            .contains("freeze matched-result self-test: OK")
+    );
+
+    let inspector = run_ok("python3", &["scripts/check-bpf-map-defs.py", "--self-test"]);
+    assert!(inspector.contains("policy inventory self-test: OK"));
+
+    let exact = p11scope_ebpf_common::FunctionNameKey::from_bytes(b"C_Encrypt\0").unwrap();
+    let noncatalog = p11scope_ebpf_common::FunctionNameKey::from_bytes(b"C_Encrypu\0").unwrap();
+    let injected_legacy_candidate = 30u32;
+    let catalog = BTreeMap::from([(exact, injected_legacy_candidate)]);
+    assert_eq!(catalog.get(&exact), Some(&injected_legacy_candidate));
+    assert_eq!(
+        catalog.get(&noncatalog),
+        None,
+        "a test-injected shared legacy candidate must not authorize a noncatalog exact name"
+    );
 }
 
 #[test]

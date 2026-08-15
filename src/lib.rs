@@ -8,6 +8,7 @@ pub mod kinds;
 pub mod manifest_input;
 pub mod metrics;
 pub(crate) mod oracle;
+pub mod output;
 pub mod plan;
 pub mod process;
 pub mod render;

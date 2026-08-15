@@ -10,14 +10,15 @@ table (including stripped providers with no `C_*` symbols), attaches probes by
 file offset, and produces a versioned `observed-profile.json` for migration
 assessment and incident diagnostics.
 
-> **Status: unreleased, not yet tagged or published.** The safe-by-default
-> capture policy and the provenance/lease authorization protocol are both
-> implemented, and the privileged host and container lanes have been rerun
-> against them. What has not happened: the final consolidated security
-> re-review (Task 7 of the
+> **Status: public MVP; productization toward the first tagged release is
+> underway.** The source repository is public, but no binary/package release
+> has been tagged. The safe-by-default capture policy and the provenance/lease
+> authorization protocol are both implemented, and the privileged host and
+> container lanes have been rerun against them. What has not happened: the
+> final consolidated security re-review (Task 7 of the
 > [provenance plan](docs/superpowers/plans/2026-08-13-manifest-provenance.md)),
-> and any packaging, tag, or publication. Treat this tree as reviewed
-> engineering work pending its release gate, not as a shipped release.
+> and any packaging or release tag. Treat this tree as reviewed engineering
+> work pending its release gate, not as a shipped release.
 
 Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40
 table, and standard 3.0, 3.1, and 3.2 interfaces (all 104 slots published in

@@ -5,11 +5,12 @@ how to run it, and what its output actually proves. Every number below
 cites the script that produced it — re-run the script to check it
 yourself.
 
-> **Status: unreleased, not tagged or published.** The safe-by-default capture
-> policy and the provenance/lease authorization protocol are implemented, and
-> the privileged host and container lanes have been rerun against them. The
-> final consolidated security re-review and the release itself have not
-> happened. See the
+> **Status: public MVP; productization toward the first tagged release is
+> underway.** The source repository is public, but no binary/package release
+> has been tagged. The safe-by-default capture policy and the provenance/lease
+> authorization protocol are implemented, and the privileged host and
+> container lanes have been rerun against them. The final consolidated
+> security re-review and the release itself have not happened. See the
 > [safe metadata design](superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md)
 > and [provenance plan](superpowers/plans/2026-08-13-manifest-provenance.md).
 

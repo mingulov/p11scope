@@ -2,6 +2,7 @@
 
 pub mod attach;
 pub mod discover_cmd;
+pub mod discovery;
 pub mod events;
 pub mod kinds;
 pub mod manifest_input;

@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased — productization slice 1a
+
+Trust simplification. The lease/provenance/hardened-oracle authorization lane
+described in the corrective-release section below is removed: the observer no
+longer forks a lease supervisor, leases candidate objects, runs a sibling
+discovery oracle at attach time, or exits 78 on a lease break. Reasoning:
+`docs/notes/2026-08-15-architecture-and-gap-analysis.md` (A5, A7) and
+`docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust-design.md`
+(§4.11, §10.6); restorable from history at `263935a`.
+
+- **CLI**: single parser for `profile`/`trace` with `--duration` suffixes
+  (`30`, `30s`, `5m`, `1h`). `--provenance-module`, `--trusted-workload`, and
+  the `p11scope discover` subcommand are removed; each now errors with a hint
+  pointing at `docs/usage.md`. Discovery is only the separate offline helper,
+  `p11scope-discover --module <provider.so> [-o <manifest.json>]` — it
+  executes provider code, is opt-in, and is never run by the observer.
+- **Provider identity**: manifest objects are structurally validated, opened
+  once, and identity-matched (SHA-256, and build-id when present) against the
+  pinned file descriptor. `fstat` (inode, size, ctime) is re-checked
+  before/after attach — attach is refused on a mismatch — and again during
+  capture; an in-place change sets `evidence.provider_changed`, which forces
+  `PARTIAL` and shows " · provider changed" on the live line.
+- Ctrl-C **or SIGTERM** now ends a capture cleanly (final frame printed, `-o`
+  written), not just Ctrl-C.
+- `profile -o` is published atomically (private temp beside the target,
+  fsync, rename); `trace -o` opens a private 0600 regular file with
+  `O_NOFOLLOW`.
+- **CI**: a GitHub Actions skeleton (`.github/workflows/ci.yml`) runs the
+  unprivileged checks and a sudo e2e gate; first run pending.
+- **Scripts**: the release gates (`scripts/gates.sh`, `scripts/lib.sh` —
+  renamed from `trusted-p11scope.sh`) run binaries directly under `sudo`,
+  dropping the trusted staging directory, `fs.suid_dumpable` sysctl step, and
+  provenance/lease steps the removed lane required. `scripts/attach-pod.sh`
+  and `scripts/container-authority.py` are deleted; a pod-attach wrapper
+  returns in Slice 1b.
+
 ## Unreleased corrective release
 
 The gates reopened by the 2026-08-13 deep review — safe metadata,

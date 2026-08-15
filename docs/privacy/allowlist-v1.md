@@ -28,12 +28,9 @@ type or provenance in either policy.
 It also assumes the explicitly selected native provider truthfully exposes
 PKCS #11 ABI functions in its own tables. A malicious provider is already
 arbitrary native code in the observed application and is outside that semantic
-guarantee. A raw manifest never authorizes code: attachment requires fresh
-table provenance from a pass whose complete exact-inode closure — including
-lazy dependencies, with `$ORIGIN` resolved by absolute path — was read-leased
-beforehand, and a lease break tears the capture down through the supervisor
-rather than continuing against changed bytes
-(`docs/superpowers/plans/2026-08-13-manifest-provenance.md`).
+guarantee. A manifest is trusted operator input, structurally validated and
+hash-matched against the pinned object; the observer executes no provider
+code.
 
 The controlling policy is `kinds::descriptor`. Each of the 104 published
 PKCS #11 3.2 function-table slots has an explicit `SlotSemantics` descriptor;

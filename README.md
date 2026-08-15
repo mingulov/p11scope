@@ -10,15 +10,12 @@ table (including stripped providers with no `C_*` symbols), attaches probes by
 file offset, and produces a versioned `observed-profile.json` for migration
 assessment and incident diagnostics.
 
-> **Status: public MVP; productization toward the first tagged release is
-> underway.** The source repository is public, but no binary/package release
-> has been tagged. The safe-by-default capture policy and the provenance/lease
-> authorization protocol are both implemented, and the privileged host and
-> container lanes have been rerun against them. What has not happened: the
-> final consolidated security re-review (Task 7 of the
-> [provenance plan](docs/superpowers/plans/2026-08-13-manifest-provenance.md)),
-> and any packaging or release tag. Treat this tree as reviewed engineering
-> work pending its release gate, not as a shipped release.
+> **Status: unreleased.** Productization slice 1a: the lease/provenance/
+> hardened-oracle lane was removed (see
+> [ROADMAP.md](docs/superpowers/plans/ROADMAP.md) → Productization); provider
+> identity is pinned by SHA-256 at attach and checked for in-place change
+> during capture (`evidence.provider_changed`). Discovery without the offline
+> helper, `run`/`inspect`/`doctor` and minimum-privilege tiers are Slice 1b.
 
 Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40
 table, and standard 3.0, 3.1, and 3.2 interfaces (all 104 slots published in
@@ -46,9 +43,7 @@ quantitative claim there cites the script that measured it).
 
   ```bash
   p11scope-discover --module /opt/vendor/lib/pkcs11.so -o manifest.json
-  p11scope profile --manifest manifest.json \
-    --provenance-module /opt/vendor/lib/pkcs11.so --pid 12345 \
-    -o observed-profile.json
+  p11scope profile --manifest manifest.json --pid 12345 -o observed-profile.json
   pkcs11-check test --module /opt/candidate/lib/pkcs11.so --output-file candidate.json
   pkcs11-lab assess --profile observed-profile.json --results candidate.json
   ```
@@ -101,15 +96,17 @@ for the CLI, live output, trace lines, and an example `observed-profile.json`.
   (`scripts/bench-overhead.sh`, `docs/notes/phase5-overhead.md`; full numbers
   and the event-loss finding at high call rates: [docs/usage.md](docs/usage.md#overhead-measured)).
 - Requires elevated privileges, kernel-version-dependent, x86-64 first.
-  The measured BPF minimum is `CAP_SYS_ADMIN` on the host, plus
-  `CAP_SYS_PTRACE` for cross-UID container paths (`CAP_BPF`+`CAP_PERFMON`
-  alone still fails on this kernel's `perf_event_paranoid` setting). The
-  hardened observer additionally needs `CAP_LEASE` for provider files its UID
-  does not own. The capability lane in `scripts/matrix/verify-fork-scope.sh`
-  encodes `CAP_SYS_ADMIN`+`CAP_LEASE`, but has **not** been rerun since the
-  lease and terminal-drain changes, so treat the exact minimum set as
-  inherited rather than freshly measured. Every live lane that *was* rerun ran
-  as root ([docs/usage.md](docs/usage.md#privileges-per-environment)).
+  Productization slice 1a removed the lease/provenance lane, so the
+  requirement is now just BPF capabilities — `CAP_BPF`+`CAP_PERFMON`, or
+  `CAP_SYS_ADMIN` on hosts where `kernel.perf_event_paranoid` is 3 or higher
+  (Ubuntu's default is 4) — plus `CAP_SYS_PTRACE` for cross-UID targets
+  reached through `/proc/<pid>/root`. No `CAP_LEASE`, no
+  `fs.suid_dumpable=0`, no root-owned trusted exec dir. The `--cgroup` lane in
+  `scripts/matrix/verify-fork-scope.sh` still grants `CAP_LEASE` and has
+  **not** been re-measured since the lane was removed, so treat its exact
+  minimum as pending re-measurement, not a fresh number. Every live lane that
+  *was* rerun ran as root
+  ([docs/usage.md](docs/usage.md#privileges-per-environment)).
   Kernel floor ≥5.15; on an unsupported environment the tool fails with a
   named cause and a hint, never a panic or a raw verifier dump
   (`docs/notes/phase5-unsupported.md`).
@@ -158,31 +155,11 @@ the provider in the container's own view and prints a manifest the observer
 attaches from. Privilege dropping is enforced before provider loading, even
 when discovery is launched by an elevated observer.
 
-A stored manifest is evidence and a proposed attach plan, not authority by
-itself. The operator must independently name the intended provider bytes with
-`--provenance-module`; the manifest cannot select its own authority. There is
-no raw-manifest trust bypass, planned or otherwise.
-
-Authorization runs a pinned, non-writable, root-owned sibling helper without
-privilege, and accepts a function-name → file-offset mapping only from a
-bounded rediscovery pass in which every file-backed executable mapping was
-read-leased *before* that pass began. The provider is loaded by its validated
-absolute path, never through `/proc/self/fd`, so `$ORIGIN` and lazily loaded
-dependencies resolve as the target sees them. Content identity alone is
-explicitly insufficient — a pathname can be retargeted to a byte-identical but
-unleased inode — so the closure is compared by exact inode with a bounded
-retry for churn. Before any BPF load the CLI process becomes a lease
-supervisor and forks the capture worker; on a lease break it kills the worker
-through its pidfd, releases the leases, and exits 78. Profile output is
-published atomically only on normal completion, and an aborted trace still
-receives a terminal `EVIDENCE` record marked `PARTIAL` with the break reason,
-so a truncated capture cannot read as a complete one.
-
-Two honest limits remain: the hostile-target continuity claim needs a
-supervisor identity the workload cannot signal or ptrace, so same-uid
-capability-only launches stay trusted-workload lanes; and the boundary assumes
-an honest provider — sandboxing malicious provider code is explicitly outside
-it.
+Provider identity is pinned by SHA-256 at attach and re-checked (`fstat`
+ino/size/ctime) before, during, and after capture; a change during capture
+sets `evidence.provider_changed`, which forces the report `PARTIAL`. Profile
+output is published atomically (private temp beside the target, fsync,
+rename).
 
 The helper recreates that table in its own process; it never reads or injects
 into the observed process. Uprobes are bound to the verified target inode and

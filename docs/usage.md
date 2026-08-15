@@ -5,14 +5,16 @@ how to run it, and what its output actually proves. Every number below
 cites the script that produced it — re-run the script to check it
 yourself.
 
-> **Status: public MVP; productization toward the first tagged release is
-> underway.** The source repository is public, but no binary/package release
-> has been tagged. The safe-by-default capture policy and the provenance/lease
-> authorization protocol are implemented, and the privileged host and
-> container lanes have been rerun against them. The final consolidated
-> security re-review and the release itself have not happened. See the
+> **Status: unreleased.** Productization slice 1a: the lease/provenance/
+> hardened-oracle lane was removed (see
+> [ROADMAP.md](superpowers/plans/ROADMAP.md) → Productization); provider
+> identity is pinned by SHA-256 at attach and checked for in-place change
+> during capture (`evidence.provider_changed`). Discovery without the offline
+> helper, `run`/`inspect`/`doctor` and minimum-privilege tiers are Slice 1b.
+> See the
 > [safe metadata design](superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md)
-> and [provenance plan](superpowers/plans/2026-08-13-manifest-provenance.md).
+> and the
+> [productization design](superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust-design.md).
 
 - [What it does](#what-it-does)
 - [What it does NOT do](#what-it-does-not-do)
@@ -95,39 +97,20 @@ getting it right is on the operator.
 p11scope-discover --module /usr/lib/softhsm/libsofthsm2.so -o manifest.json
 
 # 2. Attach and aggregate over a running process or a cgroup.
-p11scope profile --manifest manifest.json --provenance-module /usr/lib/softhsm/libsofthsm2.so --pid 12345 --duration 60 -o observed-profile.json
-p11scope profile --manifest manifest.json --provenance-module /usr/lib/softhsm/libsofthsm2.so --cgroup /sys/fs/cgroup/kubepods.slice/... --mode metrics
+p11scope profile --manifest manifest.json --pid 12345 --duration 60 -o observed-profile.json
+p11scope profile --manifest manifest.json --cgroup /sys/fs/cgroup/kubepods.slice/... --mode metrics
 
 # 3. Or: stream one line per call for a short, bounded investigation.
-p11scope trace --manifest manifest.json --provenance-module /usr/lib/softhsm/libsofthsm2.so --pid 12345 --duration 15
+p11scope trace --manifest manifest.json --pid 12345 --duration 15
 ```
 
 ### Attaching to an existing Kubernetes pod
 
-Those steps get longer for a pod: you have to resolve the pod's container to a
-host cgroup and PID, copy the provider directory out as regular files (a
-manifest cannot authorize attachment through a path the workload controls),
-discover from that copy, rewrite the attach paths into the target's `/proc`
-view, and only then capture. `scripts/attach-pod.sh` does exactly that,
-reusing the same staging and authority helpers as the release gates:
-
-```bash
-# Run on the node hosting the pod, as a non-root user with passwordless sudo.
-scripts/attach-pod.sh --namespace prod --pod api-7d9f --container api \
-    --module /usr/lib/softhsm/libsofthsm2.so \
-    --trusted-workload --duration 60 -o observed-profile.json
-```
-
-`--trusted-workload` is required and not defaulted. Capturing an existing pod
-through its cgroup assumes an honest, ABI-valid provider; the hostile-target
-guarantee belongs to the fixed-PID static observer lane, not this one. The
-wrapper refuses rather than guessing on your behalf.
-
-Caveat, stated plainly: this wrapper has never been run against a live
-cluster. Its argument handling and refusal path are covered by
-`tests/release_contracts.rs`, and every step it performs is the same sequence
-the kind and Knative gates execute and pass — but the composed script itself
-is unproven. Treat its first run as an experiment.
+Productization slice 1a removed the pod-attach wrapper
+(`scripts/attach-pod.sh`) along with the lease/provenance lane it relied on. A
+pod attach wrapper returns in Slice 1b; until then, resolve the pod's
+container to a host cgroup and PID yourself and use `--cgroup` as described
+below.
 
 The application may already have mapped the provider at an unrelated ASLR
 address. That is expected: discovery converts each live table pointer to an
@@ -154,35 +137,21 @@ Both `profile` and `trace` require `--manifest` and either `--pid` or
 `--cgroup`; `--cgroup` matches that cgroup and every descendant beneath it
 (kernel ≥5.15 due to attach cookies), so pointing it at a container's or pod's
 directory reaches the workload's actual nested cgroup. `--duration` bounds
-either subcommand; Ctrl-C also ends a capture cleanly (final frame printed,
-`-o` file written) instead of aborting it.
+either subcommand; Ctrl-C or SIGTERM also ends a capture cleanly (final frame
+printed, `-o` file written) instead of aborting it.
 
-Before either command builds an attach plan it treats the stored manifest as
-untrusted input. `--provenance-module` is mandatory, so the operator names the
-provider bytes independently instead of letting the manifest select its own
-authority. The observer repeats discovery through the sibling
-`p11scope-discover`. The helper must be a regular executable beside
-`p11scope`, owned by root for a privileged/capability-bearing observer (root
-or the invoking uid for an unprivileged observer), and not group/world
-writable. It is opened once, executed through that descriptor after privilege
-drop, receives an empty environment, has stderr discarded, and is killed with
-its process group if it exceeds 30 seconds. Its stdout is capped at 16 MiB.
-Install the two binaries together.
-
-The current first pass opens and Linux read-leases candidate attach objects,
-re-hashes them after attach, and exits with code 78 on a lease-break signal.
-That is useful defense but not a release proof: the helper's provider-fd route
-breaks `$ORIGIN`, not every lazy dependency is leased before discovery, and
-plain `_exit` does not order BPF-link closure before lease-fd closure. The
-corrected design loads the provider by its validated absolute path, stabilizes
-the exact mapped-inode closure under leases, and keeps the original CLI as a
-lease supervisor while a child owns all BPF links. On a break the supervisor
-SIGKILLs and pidfd-waits that worker before releasing its last lease.
-
-Pass the real provider path as `--provenance-module`. Namespace-safe copies
-must eventually preserve the provider's required `$ORIGIN` sibling closure,
-not just the top-level bytes. The current container/privileged lanes must be
-rerun after that implementation. There is no `--trust-manifest` override.
+Before either command builds an attach plan, manifest objects are
+structurally validated, opened once, and identity-matched (SHA-256 and, when
+present, build-id) against the file the manifest names; the accepted object
+is then pinned by file descriptor. `fstat` (inode, size, ctime) is re-checked
+before and after attach — attach is refused if the pinned bytes changed — and
+again during capture; a change during capture sets
+`evidence.provider_changed`, which forces the report `PARTIAL` and shows
+" · provider changed" on the live line. Renaming over or unlinking the pinned
+inode (for example, a package upgrade mid-capture) also bumps ctime, so it is
+reported the same conservative way. There is no separate discovery step the
+observer performs at attach time; the manifest produced by
+`p11scope-discover` is the only input.
 
 **Real output**, `profile --mode metrics` against a SoftHSM2 workload
 (`scripts/verify-attach-e2e.sh`):
@@ -215,31 +184,24 @@ profile output. If the ring buffer drops events, it also emits an explicit
 
 ## Privileges, per environment
 
-The BPF/procfs rows below were measured on real hosts/containers/pods before
-the byte-stability hardening, using `capsh`/`setpriv` and dropping
-capabilities one at a time and recording the *actual* error text — not
-documentation claims. Full detail, including the docker/kind
-reproduction: `docs/notes/phase4-privileges.md`
-(`scripts/matrix/verify-fork-scope.sh` has been updated for the new lease
-requirement, but its privileged rerun still requires approval).
+The BPF/procfs rows below were measured on real hosts/containers/pods, using
+`capsh`/`setpriv` and dropping capabilities one at a time and recording the
+*actual* error text — not documentation claims. Full detail, including the
+docker/kind reproduction: `docs/notes/phase4-privileges.md`. This measurement
+predates productization slice 1a's removal of the lease/provenance lane;
+`scripts/matrix/verify-fork-scope.sh` still grants `CAP_LEASE` in its
+`--cgroup` lane and has not been re-run since, so the exact current minimum
+is pending re-measurement, not a fresh number.
 
-| Environment | Previously measured BPF/procfs minimum | Added file-stability requirement |
-| --- | --- | --- |
-| Host process (`--pid`, same-uid target) | `CAP_SYS_ADMIN` | File ownership or `CAP_LEASE` |
-| Docker / kind (`--cgroup`, cross-uid target) | `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` | File ownership or `CAP_LEASE` |
+| Environment | Previously measured BPF/procfs minimum |
+| --- | --- |
+| Host process (`--pid`, same-uid target) | `CAP_SYS_ADMIN` |
+| Docker / kind (`--cgroup`, cross-uid target) | `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` |
 
-System and container provider objects are normally root-owned, so a
-capability-only observer is now expected to need `CAP_LEASE` in addition to
-the measured row. Full root already has it. This is an enforced Linux lease
-requirement, not yet a newly measured minimum; the updated matrix must be rerun
-before the release records it as measured.
-
-A same-uid process can send unmaskable `SIGSTOP`/`SIGKILL` to a
-capability-bearing observer. Therefore the completed lease-continuity design's
-hostile-target claim additionally requires a supervisor identity the workload
-cannot signal or ptrace—normally host root against a non-root workload, or a
-dedicated service uid. The same-uid capability-only row remains useful for
-trusted workloads but cannot carry that hostile-target claim.
+Slice 1a removed the lease/provenance/hardened-oracle lane, so there is no
+`CAP_LEASE`, `fs.suid_dumpable=0`, or root-owned trusted exec dir requirement
+today — the tool runs with BPF capabilities plus, for cross-uid targets,
+`CAP_SYS_PTRACE`.
 
 `CAP_BPF`+`CAP_PERFMON` alone is documented upstream as sufficient for
 BPF+uprobe work without `CAP_SYS_ADMIN` — measured here, it is **not**
@@ -369,19 +331,15 @@ Every `observed-profile.json` carries an `evidence` section
 (`docs/schema/observed-profile-v1.md`) ending in a `completeness` verdict:
 `"COMPLETE"` or `"PARTIAL"`.
 
-Manifests are untrusted proposed plans. Their table provenance is freshly
-reproduced before attach; every object carries an always-computed whole-file
-SHA-256 (GNU build-ID remains reporting evidence), files are identified
-through pinned regular-file descriptors, and offsets must land in executable
-ELF segments. Authorization accepts a mapping only from a bounded rediscovery
-pass in which every file-backed executable mapping — the manifest v4
-exact-inode closure, including lazy dependencies — was read-leased before the
-pass began, with the provider loaded by absolute path so `$ORIGIN` resolves as
-the target sees it. A lease break kills the capture worker through its pidfd
-and exits 78 rather than continuing against changed bytes. The oracle has an
-empty environment and a 30-second deadline. Inputs are capped at a 16 MiB
-manifest, 16 MiB oracle output, 256 MiB per object, and 512 MiB across all
-objects.
+Manifests are trusted operator input, not proposed plans requiring
+re-discovery. Every object is structurally validated, opened once, and
+identity-matched (whole-file SHA-256, and GNU build-id when present) against
+the file the manifest names, then pinned by file descriptor; offsets must
+land in executable ELF segments. `fstat` (inode, size, ctime) is re-checked
+before and after attach — attach is refused on a mismatch — and again during
+capture, where a change sets `evidence.provider_changed` and forces the
+report `PARTIAL` instead of tearing the capture down. Inputs are capped at a
+16 MiB manifest, 256 MiB per object, and 512 MiB across all objects.
 
 **`COMPLETE`** requires every manifest surface to be fully acquired and
 walked, every planned probe attached, and zero discovery, START/RV/ring,
@@ -459,7 +417,7 @@ What this tool proves, and what it deliberately does not claim to:
   the canary work still required for the safe/diagnostic policy split.
 - [`docs/schema/observed-profile-v1.md`](schema/observed-profile-v1.md) —
   the versioned `observed-profile.json` schema (current:
-  `pkcs11-scope/observed-profile/v1.3`), the integration boundary
+  `pkcs11-scope/observed-profile/v1.4`), the integration boundary
   `pkcs11-lab` reads.
 - [`docs/superpowers/specs/2026-08-10-pkcs11-scope-outputs.md`](superpowers/specs/2026-08-10-pkcs11-scope-outputs.md)
   — the original "what you will see" design commitment.

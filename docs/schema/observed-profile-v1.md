@@ -88,6 +88,7 @@ Discovery and attachment:
 | `vendor_interfaces` | Present but undecoded interfaces. |
 | `interface_list` | `C_GetInterfaceList` acquisition outcome. |
 | `in_flight_at_end` | Entries with no matching return at shutdown. |
+| `provider_changed` | A pinned provider object changed (ino, size or ctime) after attach; forces `PARTIAL`. (v1.4 addendum, 2026-08-15) |
 
 Kernel/event loss:
 

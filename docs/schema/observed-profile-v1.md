@@ -19,12 +19,13 @@ metrics policy, which reads no call arguments at all), or
 attachment and its maps are frozen, so the label describes kernel behavior
 rather than a userspace intention.
 
-`p11scope-manifest/4` is a separate discovery input schema. It keeps a GNU
-build-ID when present, carries the mandatory whole-file SHA-256 used for fresh
-attach authorization, and adds the exact-inode provenance closure: the
-complete file-backed executable mapping set that must be read-leased before
-the authorizing rediscovery pass, recorded separately from the attach objects
-themselves.
+`p11scope-manifest/4` is a separate discovery input schema produced by the
+offline helper `p11scope-discover`. It keeps a GNU build-ID when present and
+the whole-file SHA-256 that the observer matches against the pinned object at
+attach; the schema still carries the `provenance_objects` closure recorded by
+earlier versions, which the observer no longer uses for authorization
+(Productization Slice 1a; the field is dropped with the schema v2 bump in
+Slice 1b).
 
 ## Data authority
 

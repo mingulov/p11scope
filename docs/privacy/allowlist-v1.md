@@ -94,17 +94,17 @@ pointer and offset that an existing scalar decoder is allowed to follow.
 
 ## Structural enforcement
 
-- Stored manifests are untrusted proposed plans. The current first pass uses a
-  pinned sibling oracle and mandatory operator-selected
-  `--provenance-module`, but the complete exact-inode dependency closure and
-  `$ORIGIN`-correct load are still open work.
-- Candidate attach objects are read-leased and re-hashed, but the current
-  `_exit` signal path does not prove all BPF links close before the waiting
-  writer proceeds. The lease supervisor is required before release, and its
-  hostile-target claim requires an identity the workload cannot signal or
-  ptrace.
-- The mandatory oracle gets an empty environment, bounded stdout, discarded
-  stderr, a 30-second deadline, and no provider-time privilege.
+- Manifests are trusted operator input: structurally validated
+  (`manifest_input::validate_structure`), every object opened once and
+  identity-matched (GNU build-id / whole-file SHA-256) against the opened
+  file, then pinned by descriptor; attach goes through `/proc/self/fd/N`,
+  never the manifest path.
+- The pinned objects' `(ino, size, ctime)` are re-checked before and after
+  attach (refuse to attach on change) and during capture; a change during
+  capture sets `evidence.provider_changed` and forces `PARTIAL`. The observer
+  executes no provider code; discovery is the separate offline helper
+  `p11scope-discover` (executes the provider, opt-in, never launched by the
+  observer).
 - `arg_u64` has explicit constant cases `0..=6`; descriptors requesting any
   higher argument are rejected before BPF publication.
 - `p11_entry` excludes template walking; `p11_entry_template` is attached only

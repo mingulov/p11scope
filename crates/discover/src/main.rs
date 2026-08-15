@@ -3,14 +3,9 @@
 //! never silently proceed (design spec, Architecture).
 
 use std::fs::File;
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::path::PathBuf;
 
 const USAGE: &str = "usage: p11scope-discover --module <provider.so> [-o manifest.json]";
-const PREPARED: &[u8] = b"PREPARED";
-const DROP: &[u8] = b"DROP";
-const READY: &[u8] = b"READY";
-const GO: &[u8] = b"GO";
 
 #[derive(Clone, Copy)]
 struct DropTarget {
@@ -61,21 +56,9 @@ fn current_ids() -> Result<([libc::uid_t; 3], [libc::gid_t; 3]), String> {
     Ok((uids, gids))
 }
 
-fn validate_suid_dumpable(value: &[u8]) -> Result<(), String> {
-    if value != b"0\n" {
-        return Err(
-            "refusing privileged discovery unless /proc/sys/fs/suid_dumpable is exactly 0".into(),
-        );
-    }
-    Ok(())
-}
-
 fn prepare_drop() -> Result<DropTarget, String> {
     let (uids, gids) = current_ids()?;
     if uids[1] == 0 {
-        let policy = std::fs::read("/proc/sys/fs/suid_dumpable")
-            .map_err(|error| format!("cannot read /proc/sys/fs/suid_dumpable: {error}"))?;
-        validate_suid_dumpable(&policy)?;
         return Ok(DropTarget {
             uid: target_id("SUDO_UID").unwrap_or(65_534),
             gid: target_id("SUDO_GID").unwrap_or(65_534),
@@ -229,122 +212,9 @@ fn drop_privileges_and_open_self_memory(target: DropTarget) -> Result<File, Stri
     Ok(self_memory)
 }
 
-fn socket_option(fd: RawFd, option: libc::c_int) -> Result<libc::c_int, String> {
-    let mut value = 0;
-    let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
-    if unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            option,
-            (&mut value as *mut libc::c_int).cast(),
-            &mut length,
-        )
-    } != 0
-        || length as usize != std::mem::size_of_val(&value)
-    {
-        return Err(format!(
-            "invalid discovery control socket: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(value)
-}
-
-fn inherited_control(value: &str) -> Result<OwnedFd, String> {
-    let fd: RawFd = value
-        .parse()
-        .map_err(|_| "--control-fd requires an integer descriptor".to_string())?;
-    if fd < 3 {
-        return Err("--control-fd must not name stdin, stdout, or stderr".into());
-    }
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags == -1 {
-        return Err(format!(
-            "invalid discovery control descriptor: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    if socket_option(fd, libc::SO_DOMAIN)? != libc::AF_UNIX
-        || socket_option(fd, libc::SO_TYPE)? != libc::SOCK_SEQPACKET
-    {
-        return Err("discovery control descriptor is not an AF_UNIX SOCK_SEQPACKET".into());
-    }
-    let mut peer: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut peer_len = std::mem::size_of_val(&peer) as libc::socklen_t;
-    if unsafe {
-        libc::getpeername(
-            fd,
-            (&mut peer as *mut libc::sockaddr_storage).cast(),
-            &mut peer_len,
-        )
-    } != 0
-        || peer.ss_family as libc::c_int != libc::AF_UNIX
-    {
-        return Err("discovery control descriptor is not a connected AF_UNIX socket".into());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
-        return Err(format!(
-            "cannot protect discovery control descriptor: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-fn send_control(fd: &OwnedFd, packet: &[u8]) -> Result<(), String> {
-    loop {
-        let sent = unsafe {
-            libc::send(
-                fd.as_raw_fd(),
-                packet.as_ptr().cast(),
-                packet.len(),
-                libc::MSG_NOSIGNAL,
-            )
-        };
-        if sent == -1 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        if sent != packet.len() as isize {
-            return Err(format!(
-                "cannot send discovery control packet: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        return Ok(());
-    }
-}
-
-fn expect_control(fd: &OwnedFd, expected: &[u8]) -> Result<(), String> {
-    let mut packet = [0u8; 16];
-    loop {
-        let received = unsafe {
-            libc::recv(
-                fd.as_raw_fd(),
-                packet.as_mut_ptr().cast(),
-                packet.len(),
-                libc::MSG_TRUNC,
-            )
-        };
-        if received == -1
-            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-        {
-            continue;
-        }
-        if received == 0 {
-            return Err("discovery control channel closed before the expected packet".into());
-        }
-        if received != expected.len() as isize || &packet[..expected.len()] != expected {
-            return Err("unexpected discovery control packet".into());
-        }
-        return Ok(());
-    }
-}
-
 fn main() {
     let mut module: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
-    let mut control: Option<OwnedFd> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -362,23 +232,6 @@ fn main() {
                     std::process::exit(2);
                 }
             },
-            "--control-fd" => {
-                if control.is_some() {
-                    eprintln!("--control-fd may be specified only once\n{USAGE}");
-                    std::process::exit(2);
-                }
-                let Some(value) = args.next() else {
-                    eprintln!("--control-fd requires a value\n{USAGE}");
-                    std::process::exit(2);
-                };
-                control = match inherited_control(&value) {
-                    Ok(control) => Some(control),
-                    Err(error) => {
-                        eprintln!("p11scope-discover: {error}");
-                        std::process::exit(2);
-                    }
-                };
-            }
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
                 std::process::exit(0);
@@ -404,13 +257,6 @@ fn main() {
             std::process::exit(1);
         }
     };
-    if let Some(control) = control.as_ref()
-        && let Err(error) =
-            send_control(control, PREPARED).and_then(|()| expect_control(control, DROP))
-    {
-        eprintln!("p11scope-discover: {error}");
-        std::process::exit(1);
-    }
     let self_memory = match drop_privileges_and_open_self_memory(drop_target) {
         Ok(memory) => memory,
         Err(error) => {
@@ -418,13 +264,6 @@ fn main() {
             std::process::exit(1);
         }
     };
-    if let Some(control) = control.as_ref()
-        && let Err(error) = send_control(control, READY).and_then(|()| expect_control(control, GO))
-    {
-        eprintln!("p11scope-discover: {error}");
-        std::process::exit(1);
-    }
-    drop(control);
     match p11scope_discover::discover::discover_with_self_memory(&module, self_memory) {
         Err(e) => {
             eprintln!("p11scope-discover: {e}");
@@ -441,19 +280,6 @@ fn main() {
                     }
                 }
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn credential_transition_requires_suid_dumpable_zero() {
-        validate_suid_dumpable(b"0\n").unwrap();
-        for value in [b"1\n".as_slice(), b"2\n", b"", b"garbage\n", b"0 1\n"] {
-            assert!(validate_suid_dumpable(value).is_err(), "{value:?}");
         }
     }
 }

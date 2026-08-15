@@ -83,6 +83,16 @@ fn o_missing_value_is_usage_error() {
 }
 
 #[test]
+fn control_fd_flag_is_gone() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_p11scope-discover"))
+        .args(["--control-fd", "3", "--module", "/nonexistent.so"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown argument: --control-fd"));
+}
+
+#[test]
 fn o_write_failure_exits_1() {
     if !Path::new(SOFTHSM).exists() {
         eprintln!("SKIP: {SOFTHSM} not present");

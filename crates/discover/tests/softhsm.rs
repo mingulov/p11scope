@@ -65,9 +65,10 @@ fn softhsm2_legacy_table_fully_resolved() {
 /// report the loaded module's own mapping under a path string that
 /// differs from `--module` — sometimes one unreachable from this process
 /// at all. The module's object must still be recorded against the
-/// argument path, not that resolved one, so a later `p11scope profile`/
-/// `verify::check_reuse` re-identifying against `module_path` (the only
-/// path guaranteed to stay valid) finds a matching, reusable object.
+/// argument path, not that resolved one, so the observer's manifest pinning
+/// (`p11scope::discovery::identity::pin_manifest_objects`) re-identifying
+/// against `module_path` (the only path guaranteed to stay valid) finds a
+/// matching, reusable object.
 #[test]
 fn magic_proc_path_records_identity_against_the_module_path_argument() {
     if !Path::new(SOFTHSM).exists() {
@@ -84,10 +85,12 @@ fn magic_proc_path_records_identity_against_the_module_path_argument() {
     assert_eq!(obj.identity.kind, IdentityKind::GnuBuildId);
     assert!(obj.identity.reusable);
 
-    // Reproduces verify::check_reuse's per-object comparison directly:
-    // re-identify against the recorded path and confirm it still matches
-    // — the manifest passes the reuse gate end to end, no manual patching
-    // (the workaround verify-knative.sh had to fall back to) needed.
+    // Reproduces the observer's manifest pinning
+    // (p11scope::discovery::identity::pin_manifest_objects) per-object
+    // comparison directly: re-identify against the recorded path and
+    // confirm it still matches — the manifest passes the reuse gate end
+    // to end, no manual patching (the workaround verify-knative.sh had to
+    // fall back to) needed.
     let current = p11scope_discover::identity::identify(Path::new(&obj.path));
     assert_eq!(current.kind, obj.identity.kind);
     assert_eq!(current.value, obj.identity.value);

@@ -1,9 +1,10 @@
 # Productization slice 1 — discovery and trust — design
 
 **Date:** 2026-08-15
-**Status:** Approved in discussion (owner); revised after external review (2026-08-15, four
-blockers + clarifications addressed in §4.1, §4.3, §4.4, §4.5, §4.7, §4.9, §4.12, §4.13);
-pending owner sign-off
+**Status:** Approved in discussion (owner); revised twice after external review
+(2026-08-15: blockers and clarifications in §4.1, §4.3, §4.4, §4.5, §4.7, §4.9, §4.12,
+§4.13; second pass: shared attach targets, pause authority/generation ownership,
+live-discovery loss evidence, consistency edits); pending owner sign-off
 **Input:** `docs/notes/2026-08-15-architecture-and-gap-analysis.md` (§3–§5, Addendum A1–A7)
 **Supersedes for discovery/attach authorization:**
 `docs/superpowers/plans/2026-08-13-manifest-provenance.md` (the lease/provenance/hardened
@@ -12,9 +13,11 @@ lane is removed by this design), the discovery/attach parts of
 `2026-08-10-pkcs11-scope-design.md`. The privacy model
 (`2026-08-13-safe-and-unvalidated-metadata-design.md`) is unchanged by this slice; its
 extension (safe params) is slice 2.
-**Follow-on slices:** 2 = capture quality (ring/epoll, budgets, safe params, multi-module
-state, SIGTERM already here, filters, snapshots); 3 = structure/DRY refactor, docs
-consolidation, full CI matrix; then AArch64/32-bit.
+**Follow-on slices:** 2 = capture quality (ring/epoll, budgets, safe params, per-module
+profile sections, filters, snapshots); 3 = structure/DRY refactor, docs consolidation, full
+CI matrix; then AArch64/32-bit. In `docs/superpowers/plans/ROADMAP.md` these are
+"Productization Slice 1a/1b/2/3" (the historical "Phase 1a/1b" names remain in use there);
+updating the ROADMAP is the first documentation task of plan 1a.
 
 ## 1. Goal
 
@@ -23,8 +26,10 @@ Make `p11scope` usable as a product on ordinary hosts and clusters:
 - discover a target's PKCS#11 function tables **without executing provider code** and
   without copying anything into or out of containers;
 - attach with the **minimum privileges uprobes need** (`CAP_BPF`+`CAP_PERFMON`, or
-  `CAP_SYS_ADMIN` where `perf_event_paranoid ≥ 3`; `CAP_SYS_PTRACE` for cross-uid
-  targets) — no `CAP_LEASE`, no root-owned sibling helper, no sysctl, no static binary;
+  `CAP_SYS_ADMIN` where `perf_event_paranoid ≥ 3`; `CAP_SYS_PTRACE` for cross-uid targets
+  and for same-uid memory scans under Yama `ptrace_scope ≥ 1`; `CAP_KILL` only when pausing
+  cross-uid targets) — no `CAP_LEASE`, no root-owned sibling helper, no sysctl, no static
+  binary;
 - keep the observer honest: every report names how the tables were found
   (`discovery`), how the provider identity was pinned (`authority`), and any window in
   which calls could have been missed (`attach_gap_ms`, `pause`);
@@ -34,10 +39,11 @@ Make `p11scope` usable as a product on ordinary hosts and clusters:
   operational requirements, recording in history that it existed and was removed
   deliberately.
 
-Non-goals for this slice: multi-module *state* attribution (slice 2; this slice records
-per-module `functions[]` only), safe-policy params/templates (slice 2), ring/epoll and
-budget fixes (slice 2), module refactor of `attach.rs`/evidence plumbing (slice 3),
-AArch64/32-bit, `uprobe_multi`, cgroup-freezer pause, manifest catalog tooling.
+Non-goals for this slice: per-module `mechanisms`/`sessions` sections in the profile
+(slice 2; this slice keys state per module — §4.13 — and records per-module `functions[]`),
+safe-policy params/templates (slice 2), ring/epoll and budget fixes (slice 2), module
+refactor of `attach.rs`/evidence plumbing (slice 3), AArch64/32-bit, `uprobe_multi`,
+cgroup-freezer pause, manifest catalog tooling.
 
 ## 2. Decisions carried in from the review (fixed)
 
@@ -47,13 +53,15 @@ AArch64/32-bit, `uprobe_multi`, cgroup-freezer pause, manifest catalog tooling.
 | Helper | `p11scope-discover` stays a standalone offline tool ("executes provider code"); the observer never invokes it; `--manifest` accepted, verified by SHA-256 |
 | Static relocation scan of files | not now |
 | Race between table hand-out and attach | adaptive pause: `bpf_send_signal(SIGSTOP)` unless the target has a controlling tty; `run` always pauses (own session); `--pause auto|never|always`; gap always reported |
-| Hook registry | built-in `C_GetFunctionList`, `C_GetInterfaceList`, `C_GetInterface`, `NSC_GetFunctionList`, `FC_GetFunctionList`; `--hook-symbol NAME` adds names |
+| Hook registry | built-in `C_GetFunctionList`, `C_GetInterfaceList`, `C_GetInterface`, `NSC_GetFunctionList`, `FC_GetFunctionList`; `--hook-symbol NAME[:functionlist\|interfacelist\|interface]` adds names (default ABI `functionlist`) |
+| Shared attach targets | attach key is `{pinned object identity, offset}` across modules; a target claimed by ≥2 modules is attached once, module-ambiguous, count-only for state, PARTIAL (§4.7) |
+| Live-discovery loss | own evidence counters (`discovery_ring_loss`, `discovery_state_failures`, `discovery_truncated`), never merged with call-event loss; nonzero → PARTIAL (§4.3) |
 | Provider identity | pinned fd (opened via `/proc/<pid>/root/<path>`, identity-checked against `maps`); SHA-256 **once** at attach; `fstat` `(ino, size, ctime)` compared every frame and at end → `provider_changed`; no re-hash |
 | Manifest input | trusted operator input, structurally validated, labelled `manifest`, corroborated by scan/live when possible; uncorroborated at end → PARTIAL |
 | Frozen policy vs later modules | semantics move into a capture-independent frozen `DESCRIPTORS` table selected by the attach cookie; slots are dynamic data-map indices (§4.7) |
 | Multi-module state | `(process, module, session)` keys land in slice 1b (§4.13); per-module JSON sections in slice 2 |
 | Old authorization lane | removed now (leases, provenance rediscovery, hardened oracle, glibc staging, supervisor fork, `--provenance-module`, `--trusted-workload`, helper ownership rules, `suid_dumpable`, `/run/p11scope`, exit 78) — restorable from git; commit message says so |
-| Kernel | floor 5.15; newer features (uprobe_multi 6.6, bounded-spin pause) feature-probed later, never required |
+| Kernel | upstream 5.15 feature baseline; runtime probes authoritative; newer features (uprobe_multi 6.6, bounded-spin pause) feature-probed later, never required |
 | CI | GitHub Actions: unprivileged checks on every push + `sudo` BPF e2e job on `ubuntu-24.04`; root gates also runnable locally by one command; text-grep contract tests deleted with the lane |
 | Schema | `pkcs11-scope/observed-profile/v2` (nothing published yet) |
 | Slicing | one spec (this), two plans: **1a** trust simplification, **1b** discovery engine + commands |
@@ -160,8 +168,9 @@ rendered.
 - `dl_debug_state` (uprobe, entry) attached to the target's `ld.so` inode at the exported
   `_dl_debug_state` offset (glibc; musl `_dl_debug_state` verified in a spike task, fallback:
   `dlopen` return in libc). Body: scope check → record `{kind: LOADER, pid, tid}` → if
-  `CONFIG.PAUSE` and pid ∈ `PAUSE_PIDS` → `rc = bpf_send_signal(SIGSTOP)`, and `paused = (rc
-  == 0)` is stored in the record.
+  `CONFIG.PAUSE` and pid ∈ `PAUSE_PIDS` → `rc = bpf_send_signal(SIGSTOP)`, and
+  `stop_requested = (rc == 0)` is stored in the record (`rc == 0` only means the request was
+  accepted; the whole-group confirmation in §4.4 is what makes a pause).
 - Export hooks, attached per PKCS#11 object at each hook-registry symbol found, with one
   entry/return pair **per ABI** (the three exports do not share a signature):
   - `C_GetFunctionList(CK_FUNCTION_LIST_PTR_PTR pp)` (also `NSC_`/`FC_` variants): entry
@@ -177,11 +186,25 @@ rendered.
   - `C_GetInterface(name, pVersion, CK_INTERFACE_PTR_PTR ppInterface, flags)`: entry stashes
     `arg2`; return: only if `rv == CKR_OK`, read `*ppInterface` → one `INTERFACE` record as
     above.
-  Read failures increment `discovery_read_failures` (evidence) and produce a record with
-  `n = 0`. Optional pause as for the loader hook.
+  Interface names are classified in BPF and only the class is emitted (`exact_standard`
+  = `"PKCS 11"`, `other`, `null`, `unreadable`); the bytes are never persisted or rendered
+  in capture output, matching the privacy allowlist. (`inspect` and manifests, which are
+  discovery tools rather than capture output, keep the lossy name as `p11scope-discover`
+  does today.) `--hook-symbol NAME` binds a name to the `functionlist` ABI unless suffixed
+  `:interfacelist` or `:interface`.
+  Read failures increment `discovery_read_failures` and produce a record with `n = 0`.
+  Independent evidence for the live path (nonzero → PARTIAL, never merged with the call-event
+  loss counter): `discovery_ring_loss` (`RingBuf::reserve` failed), `discovery_state_failures`
+  (entry-state insert failed or an entry was overwritten before its return), and
+  `discovery_truncated` (interface count above 16, table longer than the record, or a record
+  that userspace could not decode). Optional pause as for the loader hook.
 - `sched_process_exec` (tracepoint) for `--cgroup` and `run` scopes: record `{kind: EXEC,
   pid}`; pauses **only** in `run` scope (the child of `run`), never in cgroup scope (busy pods
   must not be stalled per exec).
+- `sched_process_exit` (tracepoint): when the exiting task is a thread-group leader
+  (`pid == tgid`), delete its `PAUSE_PIDS` entry in BPF, so a recycled PID can never be
+  stopped by a stale entry (a PID is reusable only after every task of the old group has
+  exited, i.e. after this deletion).
 
 Userspace handling (`discovery::Engine::on_event`), every per-pid action guarded by the pid's
 pinned identity (§4.5; PID reuse aborts the action):
@@ -210,25 +233,33 @@ measured; scope-filtered first). Documented in usage as the one host-wide effect
 
 ### 4.4 `discovery::pause` — adaptive stop/continue
 
-- Decision per pid: `auto` → pause unless `/proc/<pid>/stat` `tty_nr != 0` (a process under
-  an interactive shell's job control would be reported as `Stopped`); `run` children are
-  started in their own session (`setsid`) so they always qualify; `never`/`always` override.
-  Only pids the observer decided to pause are inserted into `PAUSE_PIDS`.
-- Contract: the BPF hook records `paused = (bpf_send_signal(SIGSTOP) == 0)`; a failed send
-  (task exiting, `-EPERM`, `-EINVAL`) is not a pause and is reported as such. `SIGSTOP` is
-  delivered synchronously before the discovering thread executes its next user instruction;
-  other threads stop at their next return to user mode. Userspace keeps a table of pauses it
-  caused, keyed by `(pid, start_time)`; it resumes **only** entries in that table, once, via
-  `pidfd_send_signal(SIGCONT)`, and never a pid whose event said `paused = false`. Before
-  attaching, userspace confirms the whole thread group is stopped (`/proc/<pid>/task/*/stat`
-  state `T`/`t`, bounded wait 100 ms) — the record `pause: sigstop` and a claimed zero gap
-  require that confirmation plus all probes attached before resume; otherwise the record says
-  `pause: partial` and reports the measured gap. A `Drop` guard resumes every entry on any
-  error path and on Ctrl-C/SIGTERM.
-- Not distinguishable and accepted: a third party stopping the target inside the window (our
-  `SIGCONT` would resume it); an observer `SIGKILL` inside the ~ms window leaves the target
-  stopped — documented; `doctor` lists in-scope processes in state `T` whose stop is
-  unexplained.
+- Arming (userspace, per pid, before the pid is inserted into `PAUSE_PIDS`): `auto` → pause
+  only if all hold — `/proc/<pid>/stat` `tty_nr == 0` (no interactive job control), the pid
+  is not already stopped or traced (`State` not `T`/`t`, `TracerPid == 0`), the target's
+  identity is pinned (pidfd/start time), and **resume authority is proven** with
+  `pidfd_send_signal(pidfd, 0)` (kill permission: matching credentials or `CAP_KILL`;
+  `CAP_SYS_PTRACE` does not grant it). `always` fails before arming when any of these is
+  missing (named reason); `auto` falls back to no pause for that pid and records it;
+  `never` arms nothing. `run` children start in their own session and are the observer's
+  own children, so they always qualify.
+- BPF side: the hook records `stop_requested = (bpf_send_signal(SIGSTOP) == 0)`; a rejected
+  request (task exiting, `-EPERM`, `-EINVAL`) is reported as such. `SIGSTOP` is delivered
+  before the discovering thread executes its next user instruction; other threads stop at
+  their next return to user mode. `PAUSE_PIDS` entries are deleted by BPF on the leader's
+  exit (§4.3), so a stale pid can never be stopped.
+- Userspace ownership: a table of stops it requested, keyed by `(pid, start_time)`; on each
+  `stop_requested` record it (1) confirms the whole thread group is stopped
+  (`/proc/<pid>/task/*/stat` state `T`, bounded wait 100 ms) — only then the pause counts as
+  `paused` and a claimed zero gap requires all probes attached before resume; otherwise the
+  record says `pause: partial` with the measured gap; (2) after attach, resumes **exactly
+  once** via `pidfd_send_signal(SIGCONT)`; if the pid's generation no longer matches (recycled
+  in the window) it still resumes that pid — the observer stopped it — through a fresh pidfd,
+  reporting `pause_generation_mismatch`. A `Drop` guard resumes every outstanding entry on
+  any error path and on Ctrl-C/SIGTERM.
+- Not distinguishable and accepted (documented): a third party stopping the target inside the
+  window (our `SIGCONT` resumes it — standard signals neither queue nor count); an observer
+  `SIGKILL` inside the ~ms window leaves the target stopped; `doctor` lists in-scope processes
+  in state `T` whose stop is unexplained.
 - Timing: `attach_gap_ms` = hook-event timestamp → last probe attached, per module; initial and
   periodic scans record `scan_ms` and `attached_at_ms` (relative to capture start) per module,
   so a mid-run attach shows when observation began even though calls before it are simply
@@ -310,11 +341,19 @@ into the attach cookie:
 - Attach cookie = `slot_index (low 32) | descriptor_index (high 32)`. BPF derives `slot` for
   `STATS`/`RV_COUNTS`/`START`/`Event` and `DESCRIPTORS[descriptor_index]` for semantics; an
   out-of-range descriptor index falls back to `COUNT_ONLY` (fail closed).
-- Slot indices are allocated monotonically per attached module from a single space of
-  `MAX_SLOTS` (512) — indices into dynamic data maps only, so allocating them after the freeze
-  mutates no control map. Overflow → `modules_skipped` with a reason, never truncation.
-  Capacity note: 512 slots ≈ four modules of 104 unique offsets (proxy + backend fits); a
-  gate exercises proxy + provider in one process; raising `MAX_SLOTS` is a later knob.
+- The global attachment key is `{pinned object identity (dev, ino, sha256), offset}`,
+  across modules. Slot indices are allocated monotonically per new attachment key from a
+  single space of `MAX_SLOTS` (512) — indices into dynamic data maps only, so allocating them
+  after the freeze mutates no control map. Overflow → `modules_skipped` with a reason, never
+  truncation. Capacity note: 512 slots ≈ four modules of 104 unique offsets (proxy + backend
+  fits); a gate exercises proxy + provider in one process; raising `MAX_SLOTS` is a later knob.
+- Shared targets: each attachment records `module_ids[]`. When a second module claims an
+  already-attached `{object, offset}`, it is **not** attached again (no double counting); the
+  slot's descriptor is replaced by `COUNT_ONLY` for state purposes (a new slot cannot be
+  re-described after the freeze, so the userspace slot→module table marks it
+  `module_ambiguous` and the semantic layer ignores its events; aggregate counts remain in
+  `functions[]` with both module ids), `module_ambiguous += 1`, PARTIAL. No call-stack or
+  return-address heuristic. Regression test: two fixture tables sharing one target.
 - `Session::start` loads the object and publishes/freezes policy once; `attach_module(plan)`
   is then called per discovered module and `attach_loader_hook(ld_so_fd, offset)` /
   `attach_export_hooks(fd, [(symbol, offset)])` per loader/object.
@@ -336,8 +375,13 @@ Additions to the evidence object (both profile and metrics documents; trace `EVI
 | `discovery_conflicts` | scan vs export-hook disagreement count (forces PARTIAL) |
 | `discovery_uncorroborated` | manifest-sourced tables never corroborated by scan/live by capture end (forces PARTIAL) |
 | `discovery_read_failures` | BPF-side table reads that failed |
+| `discovery_ring_loss` | `DISCOVERY` ring reservations that failed (forces PARTIAL) |
+| `discovery_state_failures` | export entry-state insert failures/overwrites (forces PARTIAL) |
+| `discovery_truncated` | live records truncated or undecodable (forces PARTIAL) |
+| `module_ambiguous` | attach targets shared by ≥2 modules (forces PARTIAL) |
+| `pause_generation_mismatch` | resumes issued to a recycled pid |
 | `attach_gap_ms` | max over modules of hook-event→attached; `null` when no live event occurred |
-| `pause` | `sigstop` / `partial` / `none` / `mixed` |
+| `pause` | `sigstop` (confirmed whole-group stop) / `partial` / `none` / `mixed` |
 | `provider_changed` | any pinned object's `(ino,size,ctime)` changed (forces PARTIAL) |
 | `modules_skipped` | modules not attached for capacity or unsupported class |
 | `child_still_running` | `run` only: `--duration` elapsed with the child alive |
@@ -363,7 +407,10 @@ are those tied to the deleted lane (none of the capture-quality counters change)
 - `/proc/<pid>/map_files/*`: `CAP_CHECKPOINT_RESTORE`/`CAP_SYS_ADMIN`; optional, never
   required.
 - `--cgroup`: read access to the cgroup directory and `cgroup.procs`.
-- Resume after pause: `pidfd_send_signal(SIGCONT)` — same uid or `CAP_KILL`.
+- Pause/resume: `SIGSTOP` is sent by the kernel helper without a permission check, but the
+  resume `pidfd_send_signal(SIGCONT)` needs kill permission — matching real/effective
+  credentials or **`CAP_KILL`** (conditional row of the privilege matrix: only when pausing
+  cross-uid targets); proven before arming (§4.4).
 - `doctor` demonstrates each of these per target. The privilege table in `docs/usage.md` is
   re-measured by a gate (`capsh` rows on the CI runner and on the development host, with
   `ptrace_scope` recorded) as part of 1b and stated as measured there.
@@ -376,6 +423,9 @@ are those tied to the deleted lane (none of the capture-quality counters change)
   zero modules the report is still written (`PARTIAL`, `attach_gap_ms: null`).
 - BPF load/attach failures keep today's actionable hints; per-slot attach failures remain
   non-fatal.
+- Live-discovery loss (`discovery_ring_loss`, `discovery_state_failures`,
+  `discovery_truncated`) is evidence, forces PARTIAL, and is surfaced on the live frame; it is
+  never folded into the call-event `event_loss`.
 - Pause guard: any error after a `SIGSTOP` resumes the pid before propagating.
 - `run`: child exec failure → exit 127 with the OS error; child killed by signal → mirror.
 
@@ -437,12 +487,17 @@ Unprivileged (`cargo test`):
 - Export-hook ABI: userspace decoding of `FUNCTION_LIST`/`INTERFACE` records from fixtures
   covering the `C_GetInterfaceList` sizing idiom, `CKR_BUFFER_TOO_SMALL`, `C_GetInterface`
   output at `arg2`, bounded counts.
-- Multi-module: two fixture modules with colliding session handles → independent state.
+- Multi-module: two fixture modules with colliding session handles → independent state; two
+  fixture tables sharing one `{object, offset}` → attached once, `module_ambiguous`, PARTIAL.
+- Discovery loss counters: forced `reserve` failure (tiny `DISCOVERY` ring feature),
+  entry-state overwrite, >16 interfaces → each counter, PARTIAL.
 - `elf.rs`: registry lookup and symbol→offset on fixtures and on the host's own `ld.so`/`libc`.
 - `identity.rs`: fstat pin change detection (touch/`utimensat` cannot hide ctime), manifest
   sha256 match/mismatch.
-- `pause.rs`: decision from `/proc/<pid>/stat` fixtures; resume only own pauses; failed send
-  is not a pause; guard resumes on drop; whole-group stop confirmation.
+- `pause.rs`: decision from `/proc/<pid>/stat` fixtures (tty, already stopped, traced);
+  resume authority probe (`pidfd_send_signal(…, 0)`, EPERM → no arm); resume only own
+  requests, once; `stop_requested` vs confirmed `paused`; recycled-pid resume; guard resumes
+  on drop; whole-group stop confirmation.
 - Descriptor table: `DESCRIPTORS` content is capture-independent and matches `kinds`; cookie
   encode/decode; out-of-range descriptor → `COUNT_ONLY`.
 - `cli.rs`: every flag/duration suffix; removed flags rejected with hints.
@@ -484,12 +539,12 @@ Root gates (local `just gates`, and CI):
 
 ## 7. Plans
 
-- **1a — trust simplification (first):** deletions of §4.11; `identity.rs` (pinned fd,
+- **Productization Slice 1a — trust simplification (first):** deletions of §4.11; `identity.rs` (pinned fd,
   sha256 once, fstat pin) replacing `check_reuse`; manifest as optional input; CLI cleanup
   (`cli.rs`, remove flags, `--duration` suffixes, SIGTERM); scripts on the new CLI; CI
   skeleton (job 1 + e2e job); ROADMAP/CHANGELOG entries. Outcome: today's behaviour with
   `--manifest` and the minimum privileges, ~6k fewer lines, green gates.
-- **1b — discovery engine and commands:** `scan.rs`, `elf.rs`, BPF hooks, `pause.rs`,
+- **Productization Slice 1b — discovery engine and commands:** `scan.rs`, `elf.rs`, BPF hooks, `pause.rs`,
   `Engine`, `attach_module`, `inspect`, `doctor`, `run`, schema v2 evidence, docs rewrite,
   privilege re-measurement, spikes §6.
 
@@ -504,7 +559,9 @@ Root gates (local `just gates`, and CI):
 - Docker and kind rows pass on the new CLI with nothing copied into the container.
 - `doctor` explains every unavailable lane on a host lacking a capability.
 - Proxy + backend in one process are attached and reported as two modules with independent
-  session state.
+  session state; a shared attach target is counted once and marked `module_ambiguous`.
+- A cross-uid pause without `CAP_KILL` is refused before arming (`--pause always`) or
+  skipped (`auto`) — the target is never left stopped.
 - A same-uid target under Yama `ptrace_scope=1` is still discovered live; `doctor` explains
   why the scan is unavailable.
 - The old lane is gone; `git log` records why; unprivileged suite + CI green.
@@ -530,9 +587,11 @@ Root gates (local `just gates`, and CI):
 
 ### 10.1 Why not the helper by default (and why it stays as an offline tool)
 
-The helper answered the discovery race by producing offsets before the app starts, but its
-output is untrusted input, which pulled in provenance rediscovery, closure leases and a
-supervisor. Beyond that cost it (a) executes provider constructors on a machine that may not
+The helper answered the discovery race by producing offsets before the app starts, but the
+previous design treated its output as untrusted input, which pulled in provenance
+rediscovery, closure leases and a supervisor. This design instead treats a manifest as
+trusted operator input that is structurally validated and corroborated when possible
+(§4.12). Beyond that cost it (a) executes provider constructors on a machine that may not
 be the target's, (b) in containers must run inside the container's filesystem view with a
 matching libc (copy-in or `setns`+`execveat`), and (c) can resolve a table the app never
 uses (NSS softokn `NSC_` vs `FC_`). Kept as an *offline* generator of portable manifests
@@ -591,9 +650,11 @@ out-of-scope processes return immediately; documented in usage as the one host-w
 
 ### 10.5 Pause mechanism alternatives
 
-- `bpf_send_signal(SIGSTOP)` (chosen): synchronous with the discovering thread's return to
-  user mode — deterministic zero-gap; visible to job-control parents (interactive shells show
-  `Stopped`), hence adaptive (no controlling tty → pause; `run` gets its own session).
+- `bpf_send_signal(SIGSTOP)` (chosen): delivered before the discovering thread's next user
+  instruction; a zero gap is claimed only under the confirmed whole-group stop of §4.4;
+  visible to job-control parents (interactive shells show `Stopped`), hence adaptive (no
+  controlling tty → pause; `run` gets its own session); resume needs kill permission
+  (`CAP_KILL` for cross-uid targets), proven before arming.
 - cgroup v2 freezer: invisible to job control but needs write access to the cgroup, freezes
   every process in it, and leaves a userspace-latency window; kept as a possible later option
   for cgroup scope.
@@ -619,9 +680,10 @@ keeps it; the deletion commit names the reason and the note (`A5`/`A7`).
 Protected by construction: PID/cgroup scoping in BPF before any argument read; the
 `allowlisted` capture policy (unchanged: pointer-derived bytes reach output only by finite
 published equality); provider identity pinned by fd + SHA-256 + `fstat` change detection;
-discovery reads target memory only through `/proc/<pid>/mem` under `ptrace_may_access`;
-discovery pointer values never appear in output; no provider code executed by the observer;
-outputs published atomically.
+discovery reads target memory either through `/proc/<pid>/mem` under `ptrace_may_access`
+(scan) or with bounded `bpf_probe_read_user` in the export hooks (live), never both
+persisted: pointer values and interface-name bytes never appear in capture output; no
+provider code executed by the observer; outputs published atomically.
 
 Accepted residual risks (documented in usage): a workload that rewrites its provider in
 place after attach may cause misattributed statistics, missed calls (probes stay at offsets
@@ -631,9 +693,10 @@ malicious native provider is code inside the target and outside the semantic gua
 before); an observer killed inside a pause window leaves the target stopped.
 
 Privilege floor of the default lanes: `CAP_BPF`+`CAP_PERFMON` (or `CAP_SYS_ADMIN` where
-`perf_event_paranoid ≥ 3`); `CAP_SYS_PTRACE` for cross-uid `/proc/<pid>` access; nothing
-else. Any grant beyond that (`CAP_LEASE`, root-owned staging, sysctl changes) is no longer
-required.
+`perf_event_paranoid ≥ 3`); `CAP_SYS_PTRACE` for cross-uid `/proc/<pid>` access and for
+same-uid memory scans under Yama `ptrace_scope ≥ 1`; `CAP_KILL` only to pause cross-uid
+targets; nothing else. Any grant beyond that (`CAP_LEASE`, root-owned staging, sysctl
+changes) is no longer required.
 
 ## 12. Platform basis for the kernel decision
 

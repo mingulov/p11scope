@@ -644,7 +644,11 @@ process keeps the old one mapped (our probes and fd are on it — nothing change
 observation), and new processes load the new inode, which the live path discovers as a new
 module. Only an in-place write to the same inode matters. The kernel already records that:
 `ctime` changes on every write and cannot be set from userspace, so `fstat` on the pinned fd
-comparing `(ino, size, ctime)` is O(1), free, and robust against non-root writers. Uprobed
+comparing `(ino, size, ctime)` is O(1), free, and robust against non-root writers. Unlinking or
+renaming over the pinned inode also bumps its `ctime` (the link count is inode metadata), so a
+package upgrade *during* a capture is reported as `provider_changed` as well — conservatively,
+because it is indistinguishable from an in-place write without trusting the settable `mtime`;
+the observation itself continues on the old inode. Uprobed
 pages are private copies per process, so an in-place write cannot move a breakpoint; and
 in-place modification of a mapped `.so` is a broken deployment in any case. Read leases were
 the only stronger primitive and are the reason `CAP_LEASE` was needed; they were removed with

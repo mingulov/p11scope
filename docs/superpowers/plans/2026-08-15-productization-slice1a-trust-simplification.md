@@ -256,9 +256,9 @@ and `VerifiedObjects` → `PinnedObjects`: `matching_identity_is_accepted`,
 ```rust
 #[test]
 fn same_size_overwrite_changes_ctime_and_is_detected() {
-    let dir = tmpdir();
-    let so = cc_so(&dir, "provider", "int f(void){return 1;}");
-    let m = manifest_for(&[&so]);
+    let d = tmpdir("manifest_pinning_same_size_overwrite");
+    let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
+    let m = manifest_for(&so);
     let pinned = p11scope::discovery::identity::pin_manifest_objects(&m).unwrap();
     assert!(pinned.check_unchanged().unwrap());
     std::thread::sleep(std::time::Duration::from_millis(20)); // ctime granularity margin
@@ -271,17 +271,29 @@ fn same_size_overwrite_changes_ctime_and_is_detected() {
 }
 
 #[test]
-fn replacing_the_file_by_rename_keeps_the_pinned_inode_unchanged() {
-    let dir = tmpdir();
-    let so = cc_so(&dir, "provider", "int f(void){return 1;}");
-    let m = manifest_for(&[&so]);
+fn replacing_the_file_by_rename_keeps_the_pinned_inode_but_reports_a_change() {
+    let d = tmpdir("manifest_pinning_rename_over");
+    let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
+    let m = manifest_for(&so);
     let pinned = p11scope::discovery::identity::pin_manifest_objects(&m).unwrap();
-    let other = cc_so(&dir, "other", "int g(void){return 2;}");
+    let old_bytes = std::fs::read(&so).unwrap();
+    let attach = pinned.attach_path(so.to_str().unwrap()).unwrap();
+    assert!(attach.starts_with("/proc/self/fd/"));
+    std::thread::sleep(std::time::Duration::from_millis(20)); // ctime granularity margin
+    let other = cc_so(&d, "other", "int g(void){return 2;}\n");
     std::fs::rename(&other, &so).unwrap(); // new inode at the old path
-    assert!(pinned.check_unchanged().unwrap(), "the old inode is what we hold");
-    assert!(pinned.attach_path(so.to_str().unwrap()).unwrap().starts_with("/proc/self/fd/"));
+    // The fd still pins the old inode (aya would attach to the old bytes) …
+    assert_eq!(std::fs::read(&attach).unwrap(), old_bytes, "the old inode is what we hold");
+    // … but unlinking the old inode bumped its ctime, so the change is reported
+    // conservatively (a rename-over is indistinguishable from an in-place write
+    // without relying on the settable mtime; the capture continues, PARTIAL).
+    assert!(!pinned.check_unchanged().unwrap(), "rename-over is reported as a change");
 }
 ```
+
+Helper signatures are those of `tests/reuse.rs`: `tmpdir(name: &str)`, `cc_so(dir, name, body)`
+(takes the `CC_LOCK` itself), `manifest_for(path: &Path)` (needs `provenance_for`); copy each
+helper only when a test in the file uses it (unused helpers fail clippy `-D warnings`).
 
 - [ ] **Step 2: Run** — `cargo +1.88 test --locked --test manifest_pinning` → compile error.
 - [ ] **Step 3: Implement** — `src/discovery/mod.rs`:

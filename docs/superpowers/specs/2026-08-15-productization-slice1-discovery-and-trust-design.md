@@ -364,3 +364,162 @@ Root gates (local `just gates`, and CI):
 - Docker and kind rows pass on the new CLI with nothing copied into the container.
 - `doctor` explains every unavailable lane on a host lacking a capability.
 - The old lane is gone; `git log` records why; unprivileged suite + CI green.
+
+## 9. Owner requirements (as stated, 2026-08-15)
+
+- The MVP works; the next phase is productization.
+- It must be usable with **reduced capabilities**, preferably the minimum — at least function
+  calls/RVs/latency — reporting what is available rather than refusing.
+- **No vendor code executed by default**: dlopen of a provider may run license checks, take
+  exclusive device/token locks, rewrite configuration, open network connections. The helper
+  is acceptable only as an explicit, optional, offline tool.
+- Proxies (p11-kit or any other) are ordinary PKCS#11 modules to be observed, not a case to
+  warn about; if the backends are on the same machine they should be observable too.
+- Newer kernels are acceptable *if genuinely needed*; the product is "for the future".
+- 32-bit targets and other architectures/ABIs would be nice.
+- Heuristics that are too complex for now (file relocation scan) are out; the memory scan
+  is worth trying, enabled by default, otherwise wait.
+- SIGSTOP mitigation is fine "if SIGSTOP is really needed".
+- Re-hashing looked unnecessary — find a simpler mechanism (→ §4.5, §10.3).
+
+## 10. Rationale and alternatives considered
+
+### 10.1 Why not the helper by default (and why it stays as an offline tool)
+
+The helper answered the discovery race by producing offsets before the app starts, but its
+output is untrusted input, which pulled in provenance rediscovery, closure leases and a
+supervisor. Beyond that cost it (a) executes provider constructors on a machine that may not
+be the target's, (b) in containers must run inside the container's filesystem view with a
+matching libc (copy-in or `setns`+`execveat`), and (c) can resolve a table the app never
+uses (NSS softokn `NSC_` vs `FC_`). Kept as an *offline* generator of portable manifests
+(SHA-256/build-id keyed; a future "manifest catalog" per vendor package version follows from
+this at zero cost) because that use is legitimate on a build machine.
+
+### 10.2 Why memory scan + loader hook, and what was rejected
+
+- **Static `CK_FUNCTION_LIST` in memory** is universal in practice (SoftHSM, OpenSC, NSS
+  softokn `NSC_`/`FC_`, p11-kit proxy/rpc, YubiHSM, Kryoptic, vendor HSM libraries):
+  version word + 68/92/104 code pointers is a signature with essentially no false positives,
+  needs only `/proc/<pid>/mem` read access (already required for `maps`), works inside
+  containers and for 32-bit words. Vendor extensions appear either after the standard prefix
+  (ignored) or as `CK_INTERFACE` entries with non-standard names (recorded, undecoded).
+- **Loader breakpoint `_dl_debug_state`** is the mechanism debuggers use; it fires after
+  relocation and before constructors for both the initial link set and every `dlopen`, so it
+  catches DT_NEEDED providers and lazily loaded ones alike, without hooking `dlopen` in a
+  libc whose identity is unknown until a process exists.
+- **Export hooks** (`C_GetFunctionList` …) alone were the first idea; they cannot see a table
+  handed out before the observer started, so they became the cross-check and the fallback for
+  dynamically built tables.
+- Rejected: **file relocation scan** (`R_*_RELATIVE` runs in `.data.rel.ro`) — needs ELF
+  relocation parsing, more heuristics, no advantage over the live-memory scan;
+  **decoding `C_GetFunctionList`'s `lea`** — compiler/provider specific;
+  **`dlopen`-hook-only discovery** — misses DT_NEEDED providers and needs per-libc hooking;
+  **hooking only the three standard exports** — misses NSS FIPS (`FC_`) tables.
+
+### 10.3 Why `fstat` pinning instead of re-hashing or leases
+
+What we hold is an fd pinning the *inode*. A package upgrade creates a new inode: the observed
+process keeps the old one mapped (our probes and fd are on it — nothing changes for the
+observation), and new processes load the new inode, which the live path discovers as a new
+module. Only an in-place write to the same inode matters. The kernel already records that:
+`ctime` changes on every write and cannot be set from userspace, so `fstat` on the pinned fd
+comparing `(ino, size, ctime)` is O(1), free, and robust against non-root writers. Uprobed
+pages are private copies per process, so an in-place write cannot move a breakpoint; and
+in-place modification of a mapped `.so` is a broken deployment in any case. Read leases were
+the only stronger primitive and are the reason `CAP_LEASE` was needed; they were removed with
+the lane. SHA-256 is computed once at attach for identity (report, manifest matching).
+
+### 10.4 Hook inventory, safety, cost
+
+Beyond the per-function entry/return probes (unchanged; ~3.3 µs per observed call measured
+on SoftHSM2), this design adds three hook kinds: `_dl_debug_state` (empty function that
+exists for debuggers; fires on library load/unload only), export uretprobes (fire once per
+module initialisation), `sched_process_exec` (cgroup/`run` scope; ~100 ns per exec). All are
+scope-filtered first thing in BPF. Uprobes bind to inodes, so hooking a shared `ld.so` traps
+every process on the host on library-load events for the observer's lifetime — ~1–3 µs each,
+out-of-scope processes return immediately; documented in usage as the one host-wide effect.
+
+### 10.5 Pause mechanism alternatives
+
+- `bpf_send_signal(SIGSTOP)` (chosen): synchronous with the discovering thread's return to
+  user mode — deterministic zero-gap; visible to job-control parents (interactive shells show
+  `Stopped`), hence adaptive (no controlling tty → pause; `run` gets its own session).
+- cgroup v2 freezer: invisible to job control but needs write access to the cgroup, freezes
+  every process in it, and leaves a userspace-latency window; kept as a possible later option
+  for cgroup scope.
+- Bounded busy-wait inside the uretprobe until userspace signals "attached": no signal, no
+  stopped-forever risk, but only viable when attach is sub-millisecond (`uprobe_multi`,
+  kernel 6.6+) because of the BPF instruction budget; noted as a 6.6+ improvement.
+- No pause: simplest; the first calls (often `C_Initialize`) may be unobserved; kept as
+  `--pause never` with the gap reported.
+- Accepted residual risk of the chosen mechanism: an observer `SIGKILL` between `SIGSTOP`
+  and `SIGCONT` (a window of milliseconds) leaves the target stopped; a `Drop` guard covers
+  every other exit path, `doctor` reports unexplained stopped in-scope processes.
+
+### 10.6 Why remove the old lane instead of keeping it behind a flag
+
+5.8k product lines (as large as the observer), a maintenance and test burden for a property
+(`integrity of statistics against a hostile observed workload`) that the docs already
+conceded cannot be closed for same-uid targets, cgroup scope, or malicious providers, and
+whose payoff under the `allowlisted` policy is misattributed counts, not secrets. Git history
+keeps it; the deletion commit names the reason and the note (`A5`/`A7`).
+
+## 11. Security model of the default lanes
+
+Protected by construction: PID/cgroup scoping in BPF before any argument read; the
+`allowlisted` capture policy (unchanged: pointer-derived bytes reach output only by finite
+published equality); provider identity pinned by fd + SHA-256 + `fstat` change detection;
+discovery reads target memory only through `/proc/<pid>/mem` under `ptrace_may_access`;
+discovery pointer values never appear in output; no provider code executed by the observer;
+outputs published atomically.
+
+Accepted residual risks (documented in usage): a workload that rewrites its provider in
+place after attach may cause misattributed statistics until `provider_changed` flags it; a
+malicious native provider is code inside the target and outside the semantic guarantee (as
+before); an observer killed inside a pause window leaves the target stopped.
+
+Privilege floor of the default lanes: `CAP_BPF`+`CAP_PERFMON` (or `CAP_SYS_ADMIN` where
+`perf_event_paranoid ≥ 3`); `CAP_SYS_PTRACE` for cross-uid `/proc/<pid>` access; nothing
+else. Any grant beyond that (`CAP_LEASE`, root-owned staging, sysctl changes) is no longer
+required.
+
+## 12. Platform basis for the kernel decision
+
+| Distribution | Kernel | 5.15 base | uprobe_multi (6.6) |
+| --- | --- | --- | --- |
+| Ubuntu 22.04 / 24.04 | 5.15 / 6.8 | ✔ / ✔ | ✘ / ✔ |
+| Debian 12 / 13 | 6.1 / 6.12 | ✔ | ✘ / ✔ |
+| RHEL 9 / 10 | 5.14 (+backports) / 6.12 | by feature probe / ✔ | ✘ / ✔ |
+| Fedora 43 | 6.17 | ✔ | ✔ |
+| Amazon Linux 2023 | 6.1 / 6.12 | ✔ | ✘ / ✔ |
+| SLES 15 SP6 / 16 | 6.4 / 6.12 | ✔ | ✘ / ✔ |
+
+Hence: base 5.15, `doctor` probes features (attach cookies, `bpf_send_signal`, ring buffer,
+`uprobe_multi`) rather than comparing versions; a higher hard floor would exclude
+Ubuntu 22.04, Debian 12, AL2023-6.1 and RHEL 9 for an optimisation.
+
+## 13. CI on GitHub — findings
+
+GitHub-hosted `ubuntu-22.04`/`ubuntu-24.04` runners are full VMs (kernels 6.5–6.11) with
+passwordless `sudo`; BPF and uprobes work there directly, which is how aya, cilium/ebpf, bcc
+and tracee run their privileged tests. SoftHSM2 is installable from apt; Docker is present;
+kind is installable (`helm/kind-action`). Multi-kernel coverage (5.15/6.1/6.6/6.12) is done
+with qemu-based actions (`cilium/little-vm-helper`, `vimto`, `libbpf/ci`) — slice 3.
+Knative remains a manual/nightly lane. Capability-only rows (`capsh`) can run on the hosted
+runner too, so the privilege table can be re-measured in CI.
+
+## 14. Decisions already taken for later slices (recorded so they are not lost)
+
+- Slice 2 — extend the safe (`allowlisted`) policy: RSA-PSS/GCM parameters and template
+  attribute *types* read only after `CKR_OK`/`CKR_PENDING`, only when the registry shape
+  length matches, and emitted only when every value is a member of a finite published set
+  (hash alg ∈ mechanism registry, MGF ∈ `CKG_*`, lengths bounded, attribute types ∈ `CKA_*`);
+  policy booleans stay diagnostic-only.
+- Slice 2 — semantic state keyed by `(process, module, session)`; profile JSON gains
+  `modules[]`; one run observes every module in scope (proxy → backend attribution).
+- Slice 2 — ring/epoll wait, larger default ring, compact `Event` for the safe policy,
+  refund of the semantic key budget, trace filters/JSONL, periodic snapshots.
+- Slice 3 — module split of `attach.rs`/evidence plumbing, `serde(flatten)` evidence, typed
+  `Profile` types, script consolidation, single doc, multi-kernel CI, text-grep tests gone.
+- Then — AArch64 (argument accessor abstraction), 32-bit counting mode, `uprobe_multi`
+  fast attach and bounded-spin pause, cgroup-freezer pause option, manifest catalog.

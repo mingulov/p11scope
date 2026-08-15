@@ -325,9 +325,72 @@ feature-unsafe-profile feature-unsafe profile\n\
 feature-unsafe-trace feature-unsafe trace\n\
 aggregate-only-metrics default metrics"
     );
+    let blocked_lanes = canaries
+        .split_once("done <<'BLOCKED_LANES'\n")
+        .expect("blocked safe-policy lane table")
+        .1
+        .split_once("\nBLOCKED_LANES")
+        .unwrap()
+        .0;
+    assert_eq!(
+        blocked_lanes,
+        "default-safe-start default\nfeature-safe-start feature"
+    );
 
     let induced = read("scripts/verify-induced-gaps.sh");
     let directory = tempfile::tempdir().unwrap();
+    let provider = directory.path().join("matrix-provider.so");
+    let workload = directory.path().join("canary-workload");
+    run_ok(
+        "cc",
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wall",
+            "-Wextra",
+            "-DPRIVACY_FIXTURE=1",
+            "-o",
+            provider.to_str().unwrap(),
+            "crates/discover/tests/fixture/version_matrix.c",
+        ],
+    );
+    run_ok(
+        "cc",
+        &[
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+            "-o",
+            workload.to_str().unwrap(),
+            "scripts/fixtures/canary_workload.c",
+            "-ldl",
+        ],
+    );
+    let matrix = run_ok(
+        workload.to_str().unwrap(),
+        &[provider.to_str().unwrap(), "matrix"],
+    );
+    assert_eq!(
+        matrix
+            .lines()
+            .filter(|line| line.ends_with(" -> 0x0"))
+            .count(),
+        25
+    );
+    assert!(matrix.contains("canary_workload matrix: all calls CKR_OK"));
+
+    let blocked = run_ok(
+        workload.to_str().unwrap(),
+        &[provider.to_str().unwrap(), "blocked"],
+    );
+    assert!(blocked.contains("blocked hostile subset: all calls CKR_OK"));
+    let faults = run_ok(
+        workload.to_str().unwrap(),
+        &[provider.to_str().unwrap(), "faults"],
+    );
+    assert!(faults.contains("blocked template faults: all calls CKR_OK"));
 
     let lanes = run_ok("sh", &["scripts/verify-canaries.sh", "--self-test"]);
     assert!(lanes.contains("canary lane assertion self-test: OK"));
@@ -390,4 +453,24 @@ aggregate-only-metrics default metrics"
     let inspector = run_ok("python3", &["scripts/check-bpf-map-defs.py", "--self-test"]);
     assert!(inspector.contains("policy inventory self-test: OK"));
     assert!(inspector.contains("malformed map definitions rejected: OK"));
+}
+
+#[test]
+fn gate_scripts_pin_the_toolchain() {
+    for path in [
+        "scripts/verify-canaries.sh",
+        "scripts/verify-induced-gaps.sh",
+    ] {
+        run_ok("sh", &["-n", path]);
+        for line in read(path).lines().map(str::trim_start) {
+            if !line.starts_with('#')
+                && (line.starts_with("cargo ") || line.contains(" cargo build"))
+            {
+                assert!(
+                    line.contains("cargo +1.88"),
+                    "unpinned cargo command in {path}: {line}"
+                );
+            }
+        }
+    }
 }

@@ -1,7 +1,8 @@
 //! Pins manifest-recorded objects to their current identity without holding read
 //! leases. `check_unchanged` gives cheap, best-effort change detection via
-//! `(ino, size, ctime)`; it is not a security boundary — see `src/verify.rs` for
-//! that (the leased, provenance-checked path this module will replace).
+//! `(ino, size, ctime)`; it is not a security boundary — the leased,
+//! provenance-checked verification path it replaces was removed by
+//! Productization Slice 1a (formerly `src/verify.rs`, restorable from history).
 
 use std::collections::BTreeMap;
 use std::os::fd::AsRawFd as _;

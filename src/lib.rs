@@ -2,13 +2,11 @@
 
 pub mod attach;
 pub mod cli;
-pub mod discover_cmd;
 pub mod discovery;
 pub mod events;
 pub mod kinds;
 pub mod manifest_input;
 pub mod metrics;
-pub(crate) mod oracle;
 pub mod output;
 pub mod plan;
 pub mod process;
@@ -17,7 +15,6 @@ pub mod scope;
 pub mod semantics;
 pub mod shapes;
 pub mod trace;
-pub mod verify;
 
 /// The BPF object, built by build.rs. Alignment matters: aya parses it
 /// as ELF in place.

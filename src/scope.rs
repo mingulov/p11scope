@@ -57,9 +57,10 @@ pub struct PublishedScope {
     pub cgroup_file: Option<File>,
 }
 
-/// Publishes one exact scope and policy, verifies every supported readback,
-/// and retains the cgroup descriptor whose successful insertion is the one
-/// defined syscall-readback exception.
+/// Publishes one exact scope and policy and verifies every supported
+/// readback. The returned cgroup descriptor may be dropped once publication
+/// succeeds — the kernel holds its own cgroup reference through the map, so
+/// the caller does not need to keep the fd open.
 pub fn publish(ebpf: &mut Ebpf, scope: &Scope, policy: CapturePolicy) -> Result<PublishedScope> {
     let scope_flag = match scope {
         Scope::Pid(_) => FLAG_PID_FILTER,

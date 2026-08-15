@@ -195,22 +195,6 @@ pub fn evidence_line(ev: &render::Evidence, policy: CapturePolicy) -> String {
     format!("EVIDENCE {value}")
 }
 
-/// Minimal terminal record available to the lease supervisor after it has
-/// killed and reaped the only process that owned BPF state.
-pub fn abort_evidence_line(policy: CapturePolicy, reason: &'static str) -> String {
-    format!(
-        "EVIDENCE {}",
-        serde_json::json!({
-            "completeness": "PARTIAL",
-            "privacy_mode": policy.privacy_mode(),
-            "capture_aborted": reason,
-            "final_drain": false,
-            "counters_available": false,
-            "event_loss": serde_json::Value::Null,
-        })
-    )
-}
-
 /// Turns completed events into trace lines, tracking the two bits of
 /// state a pure per-line formatter cannot carry itself: the wall-clock
 /// anchor (kernel timestamps are boot-relative monotonic, not epoch —
@@ -455,25 +439,6 @@ mod tests {
         assert_eq!(value["capture_aborted"], serde_json::Value::Null);
         assert_eq!(value["final_drain"], false);
         assert_eq!(value["counters_available"], true);
-    }
-
-    #[test]
-    fn policy_output_abort_evidence_is_minimal_and_never_fabricates_counters() {
-        let line = abort_evidence_line(
-            crate::attach::CapturePolicy::Allowlisted,
-            "object_lease_break",
-        );
-        let value: serde_json::Value =
-            serde_json::from_str(line.strip_prefix("EVIDENCE ").unwrap()).unwrap();
-
-        assert_eq!(value["completeness"], "PARTIAL");
-        assert_eq!(value["privacy_mode"], "allowlisted");
-        assert_eq!(value["capture_aborted"], "object_lease_break");
-        assert_eq!(value["final_drain"], false);
-        assert_eq!(value["counters_available"], false);
-        assert_eq!(value["event_loss"], serde_json::Value::Null);
-        assert!(value.get("attached_probes").is_none());
-        assert!(value.get("unregistered_mechanisms").is_none());
     }
 
     #[test]

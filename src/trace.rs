@@ -443,6 +443,7 @@ mod tests {
             shape_decode_failures: 0,
             shape_decode_total_failures: 0,
             templates_truncated: false,
+            provider_changed: false,
             completeness: "COMPLETE",
         };
         let line = evidence_line(&evidence, crate::attach::CapturePolicy::Allowlisted);

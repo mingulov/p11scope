@@ -997,6 +997,7 @@ fn evidence_for(
         shape_decode_failures: state.shape_decode_failures(),
         shape_decode_total_failures: state.total_shape_decode_failures(),
         templates_truncated: state.templates_truncated(),
+        provider_changed: false, // wired to PinnedObjects::check_unchanged() in a later task
         completeness: "UNKNOWN",
     };
     ev.verdict();

@@ -89,6 +89,9 @@ pub struct Evidence {
     /// counters above, this DOES gate `completeness`: truncation is lost
     /// evidence.
     pub templates_truncated: bool,
+    /// A pinned provider object changed (ino, size or ctime) after attach;
+    /// probes may no longer describe the mapped bytes.
+    pub provider_changed: bool,
     pub completeness: &'static str,
 }
 
@@ -104,8 +107,8 @@ impl Evidence {
     /// every surface was fully walked with a successful acquisition, no
     /// vendor interfaces were left undecoded, (profile mode) the ring
     /// buffer neither dropped nor emitted a malformed record, no template
-    /// was truncated, and no mechanism's parameter decode failed on every
-    /// single observed call.
+    /// was truncated, no mechanism's parameter decode failed on every
+    /// single observed call, and no pinned provider object changed.
     pub fn verdict(&mut self) {
         let surfaces_complete = self
             .surfaces
@@ -143,6 +146,7 @@ impl Evidence {
             && self.malformed_records == 0
             && !self.templates_truncated
             && self.shape_decode_total_failures == 0
+            && !self.provider_changed
             && interface_list_complete
         {
             "COMPLETE"
@@ -259,6 +263,7 @@ pub fn live(
         || ev.malformed_records > 0
         || ev.templates_truncated
         || ev.shape_decode_total_failures > 0
+        || ev.provider_changed
     {
         evidence_line.push_str(" ·");
         if surface_gaps > 0 {
@@ -320,6 +325,9 @@ pub fn live(
                 " {n} mechanisms never decoded",
                 n = ev.shape_decode_total_failures
             ));
+        }
+        if ev.provider_changed {
+            evidence_line.push_str(" provider changed");
         }
     }
     if ev.orphan_ops > 0
@@ -876,6 +884,7 @@ mod tests {
             shape_decode_failures: 0,
             shape_decode_total_failures: 0,
             templates_truncated: false,
+            provider_changed: false,
             completeness: "UNKNOWN",
         }
     }
@@ -885,6 +894,29 @@ mod tests {
         let mut ev = evidence();
         ev.verdict();
         assert_eq!(ev.completeness, "COMPLETE");
+    }
+
+    #[test]
+    fn provider_change_forces_partial_and_is_shown_live() {
+        let mut ev = evidence();
+        ev.verdict();
+        assert_eq!(ev.completeness, "COMPLETE");
+        ev.provider_changed = true;
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        let frame = live(
+            &[],
+            &ev,
+            Duration::from_secs(1),
+            "/x.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+        );
+        assert!(frame.contains("provider changed"), "{frame}");
+        assert_eq!(
+            serde_json::to_value(&ev).unwrap()["provider_changed"],
+            serde_json::Value::Bool(true)
+        );
     }
 
     #[test]

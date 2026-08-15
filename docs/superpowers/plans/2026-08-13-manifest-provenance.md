@@ -1,5 +1,9 @@
 # Manifest Provenance Implementation Plan
 
+> **Status (2026-08-15): scheduled for removal by Productization Slice 1a** (spec
+> `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust-design.md`
+> §4.11/§10.6). This note is updated to "removed" by the slice's deletion task.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Status (2026-08-14): Tasks 1–6 implemented and independently reviewed;

@@ -360,3 +360,24 @@ partial). Slice-by-slice evidence including every deferred Minor is under
 AArch64 → first item after v1. Then, unordered and only on demonstrated need:
 live-discovery fallback mode, syscall/network correlation, DaemonSet/operator
 packaging, system-wide module discovery, security-findings layer, GUI.
+
+## Productization (2026-08-15 →)
+
+Input: `docs/notes/2026-08-15-architecture-and-gap-analysis.md` (review + decisions A1–A7)
+and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust-design.md`.
+
+- **Slice 1a — trust simplification** ([plan](2026-08-15-productization-slice1a-trust-simplification.md)):
+  the lease/provenance/hardened-oracle lane of `2026-08-13-manifest-provenance.md` is
+  **scheduled for removal** (status flips to "removed" in the plan's deletion task; kept in
+  git history; reasoning in the spec §4.11 and §10.6). Object identity becomes hash-pinned
+  (SHA-256 once, `fstat` change detection). CLI drops `--provenance-module`,
+  `--trusted-workload`, the `p11scope discover` subcommand and exit code 78. CI skeleton.
+- **Slice 1b — discovery engine and commands**: memory-scan + loader/export-hook discovery,
+  `run`, `inspect`, `doctor`, `--module` optional, schema v2. Plan written after 1a lands.
+- **Slice 2 — capture quality**: ring/epoll, budgets, safe-policy params, per-module profile
+  sections, filters, snapshots.
+- **Slice 3 — structure**: module split, evidence plumbing, docs consolidation, multi-kernel CI.
+- Then AArch64, 32-bit counting mode, `uprobe_multi`, freezer pause, manifest catalog.
+
+**Gate for each slice:** the four cargo checks, the unprivileged suite, and the CI e2e job
+green; root gates run locally only with owner approval and are otherwise recorded UNRUN.

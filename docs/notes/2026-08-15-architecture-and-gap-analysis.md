@@ -740,3 +740,39 @@ every layer (app → proxy → backend, JVM SunPKCS11, Go/Rust bindings) attribu
 `(process, module, session)` key as the original design intended. The remaining
 p11-kit-specific caveat is `p11-kit-remote`/`server`, where the backend runs in another
 process — that process is simply another attach target.
+
+### A5. Decision (2026-08-15) — discovery paths and trust model for productization
+
+Clarification first: the "race" exists only for live discovery. On the current
+helper/manifest path offsets come from the helper's dlopen and are independent of the target
+process; uprobes are armed on the file, so a running process can be attached mid-run with no
+race — calls before attach are simply outside the window (`orphan_ops` etc. are
+informational). Live discovery learns the offsets from the target's own
+`C_GetFunctionList`/`C_GetInterface*` call, so it needs that call to happen after the export
+hook is in place; it cannot attach mid-run to a process that obtained its table earlier.
+
+Decided:
+
+1. **Two first-class discovery paths, one probe engine, chosen automatically.**
+   - *Live* — default when the target has not loaded the module yet (`run -- cmd`,
+     `--cgroup`, `--pid` with a later `dlopen`, new pods/Knative): exec/`dlopen` hooks find
+     objects exporting `C_GetFunctionList`/`C_GetInterfaceList`; uretprobes on those exports
+     yield the table; `bpf_send_signal(SIGSTOP)` at that return closes the attach race
+     (`--no-pause` opts out; the window is then reported in evidence). No helper, nothing
+     copied into containers.
+   - *Offline/manifest* — `p11scope-discover` is kept as a first-class path, default for
+     mid-run attach to a process that already loaded the module, and for operators who want
+     a reusable manifest. Verification is what manifest v4 already carries: SHA-256 of the
+     file the observer opens vs the manifest, re-hash at end → `provider_changed`. No fresh
+     rediscovery, no closure leases, no root-owned helper, no `suid_dumpable`, no static
+     observer required.
+   - Static relocation scan: not now.
+2. **Leases / hardened oracle become an explicit opt-in lane** (`--authorization=leased|hardened`),
+   not the default; the supervisor fork runs only when something is leased.
+3. **Output always names the lane**: `discovery: live|manifest`, `authority:
+   hash-pinned|leased|hardened`, plus `privacy_mode` as today.
+4. Privilege floor for the default lanes: `CAP_BPF`+`CAP_PERFMON` (or `CAP_SYS_ADMIN` where
+   `perf_event_paranoid ≥ 3`) + `CAP_SYS_PTRACE` for cross-uid `/proc/<pid>` access;
+   `p11scope doctor` reports which lanes the host allows.
+5. Proxies (p11-kit or any other) are ordinary modules; multi-module attribution per
+   `(process, module, session)` is a productization goal, not a warning.

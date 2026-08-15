@@ -133,6 +133,12 @@ impl AtomicFile {
                 self.final_path.display()
             )
         })?;
+        self.directory.sync_all().map_err(|error| {
+            format!(
+                "syncing output directory for {} failed: {error}",
+                self.final_path.display()
+            )
+        })?;
         self.cleanup = false;
         Ok(())
     }
@@ -363,6 +369,11 @@ mod tests {
         std::fs::remove_file(&temp).unwrap();
         std::fs::write(&temp, b"impostor").unwrap(); // different inode at the temp name
         assert!(a.commit().is_err());
+        assert_eq!(
+            std::fs::read(&temp).unwrap(),
+            b"impostor",
+            "Drop must not unlink a file it did not create"
+        );
         assert!(!path.exists());
     }
 }

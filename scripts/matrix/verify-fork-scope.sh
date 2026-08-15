@@ -31,9 +31,7 @@ cd "$(dirname "$0")/../.."
 
 MODULE=/usr/lib/softhsm/libsofthsm2.so
 WORK=target/matrix-fork
-TRUST_DIR="$PWD/$WORK/trusted"
 EXPECTED=scripts/matrix/fork-expected.txt
-. scripts/trusted-p11scope.sh
 
 command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
 command -v softhsm2-util >/dev/null || { echo "softhsm2-util required"; exit 1; }
@@ -59,15 +57,12 @@ cleanup() {
     [ -z "$LAUNCHER_PID" ] || wait "$LAUNCHER_PID" 2>/dev/null || true
     [ -z "$PRIV_PID" ] || wait "$PRIV_PID" 2>/dev/null || true
     sudo systemctl stop "${UNIT}.scope" >/dev/null 2>&1 || true
-    remove_trusted_p11scope "$TRUST_DIR"
     exit "$status"
 }
 . scripts/cleanup-traps.sh
 
 echo "=== build product + fork-harness ==="
 cargo build --release --workspace
-stage_trusted_p11scope target/release/p11scope \
-    target/release/p11scope-discover "$TRUST_DIR"
 gcc -O0 -o "$WORK/fork-harness" scripts/matrix/fork-harness.c -ldl
 
 echo "=== softhsm token (private, disposable) ==="
@@ -97,8 +92,8 @@ LAUNCHER_PID=$!
 sleep 1     # let systemd-run establish the cgroup
 test -d "$CGROUP_PATH" || { echo "cgroup was not created: $CGROUP_PATH"; exit 1; }
 
-sudo "$TRUST_DIR/p11scope" profile --manifest "$WORK/manifest.json" \
-    --provenance-module "$MODULE" --cgroup "$CGROUP_PATH" \
+sudo target/release/p11scope profile --manifest "$WORK/manifest.json" \
+    --cgroup "$CGROUP_PATH" \
     --mode metrics --duration 20 -o "$WORK/observed.json" \
     > "$WORK/profile.log" 2>&1 &
 PROFILE_PID=$!
@@ -122,6 +117,8 @@ else
     exit "$status"
 fi
 tail -n 15 "$WORK/profile.log"
+# The observer ran under sudo, so its published report is root-owned 0600.
+sudo chown "$(id -u):$(id -g)" "$WORK/observed.json"
 test "$LAUNCHER_RC" -eq 0 || { echo "fork-harness (parent+children) failed, rc=$LAUNCHER_RC"; exit 1; }
 
 echo "=== verify: summed counts across parent + all children match fork-expected.txt exactly ==="
@@ -182,21 +179,19 @@ PRIV_PID=$!
 
 echo "--- unprivileged ---"
 set +e
-UNPRIV_OUT=$("$TRUST_DIR/p11scope" profile --manifest "$WORK/manifest.json" \
-    --provenance-module "$MODULE" --pid "$PRIV_PID" --mode metrics --duration 1 2>&1)
+UNPRIV_OUT=$(target/release/p11scope profile --manifest "$WORK/manifest.json" \
+    --pid "$PRIV_PID" --mode metrics --duration 1 2>&1)
 UNPRIV_RC=$?
 set -e
 echo "$UNPRIV_OUT"
 echo "exit code: $UNPRIV_RC"
 test "$UNPRIV_RC" -ne 0 || { echo "expected unprivileged attach to fail, it exited 0"; exit 1; }
-echo "$UNPRIV_OUT" | grep -q "required read lease" \
-    || { echo "expected the root-owned provider lease to fail without CAP_LEASE"; exit 1; }
 
 echo "--- CAP_BPF + CAP_PERFMON + CAP_LEASE (no CAP_SYS_ADMIN) ---"
 set +e
 CAPS_OUT=$(sudo capsh --caps="cap_bpf,cap_perfmon,cap_lease+eip cap_setpcap,cap_setuid,cap_setgid+ep" \
     --keep=1 --user="$(whoami)" --addamb=cap_bpf --addamb=cap_perfmon --addamb=cap_lease \
-    -- -c "'$TRUST_DIR/p11scope' profile --manifest '$WORK/manifest.json' --provenance-module '$MODULE' --pid $PRIV_PID --mode metrics --duration 1 -o '$WORK/priv-bpf-perfmon.json'" 2>&1)
+    -- -c "'$PWD/target/release/p11scope' profile --manifest '$WORK/manifest.json' --pid $PRIV_PID --mode metrics --duration 1 -o '$WORK/priv-bpf-perfmon.json'" 2>&1)
 set -e
 echo "$CAPS_OUT" | tail -5
 ATTACHED=$(python3 -c "import json;print(json.load(open('$WORK/priv-bpf-perfmon.json'))['evidence']['attached_probes'])")
@@ -211,7 +206,7 @@ test "$ATTACHED" -eq 0 || { echo "expected 0 attached probes without CAP_SYS_ADM
 echo "--- CAP_SYS_ADMIN + CAP_LEASE ---"
 sudo capsh --caps="cap_sys_admin,cap_lease+eip cap_setpcap,cap_setuid,cap_setgid+ep" \
     --keep=1 --user="$(whoami)" --addamb=cap_sys_admin --addamb=cap_lease \
-    -- -c "'$TRUST_DIR/p11scope' profile --manifest '$WORK/manifest.json' --provenance-module '$MODULE' --pid $PRIV_PID --mode metrics --duration 1 -o '$WORK/priv-sysadmin.json'" \
+    -- -c "'$PWD/target/release/p11scope' profile --manifest '$WORK/manifest.json' --pid $PRIV_PID --mode metrics --duration 1 -o '$WORK/priv-sysadmin.json'" \
     > "$WORK/priv-sysadmin.log" 2>&1
 tail -5 "$WORK/priv-sysadmin.log"
 ATTACHED2=$(python3 -c "import json;print(json.load(open('$WORK/priv-sysadmin.json'))['evidence']['attached_probes'])")

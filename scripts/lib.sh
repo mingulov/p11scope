@@ -1,0 +1,236 @@
+#!/bin/sh
+# Shared helpers for the gate scripts: non-root caller check, cleanup traps,
+# container tar cap, root process pinning/signalling, capture-ready wait.
+
+require_non_root_caller() {
+    [ "$(id -u)" -ne 0 ] || {
+        echo "run this gate as a non-root user with passwordless sudo" >&2
+        return 1
+    }
+}
+
+cleanup_step() {
+    "$@"
+    cleanup_step_status=$?
+    if [ "$CLEANUP_STATUS" -eq 0 ] && [ "$cleanup_step_status" -ne 0 ]; then
+        CLEANUP_STATUS=$cleanup_step_status
+    fi
+    return 0
+}
+
+# A controlled provider directory is a few megabytes. Cap the stream so a
+# compromised or hostile image cannot fill the host filesystem through the
+# copy step, and refuse a stream that reaches the cap rather than attaching
+# from a silently truncated archive.
+MAX_CONTAINER_TAR_BYTES=${MAX_CONTAINER_TAR_BYTES:-268435456}
+
+capped_container_tar() {
+    cct_out=$1
+    shift
+    "$@" | head -c "$MAX_CONTAINER_TAR_BYTES" > "$cct_out" || return 1
+    cct_size=$(stat -Lc %s "$cct_out") || return 1
+    [ "$cct_size" -gt 0 ] || {
+        echo "container provider stream produced no bytes" >&2
+        return 1
+    }
+    [ "$cct_size" -lt "$MAX_CONTAINER_TAR_BYTES" ] || {
+        echo "container provider stream reached the $MAX_CONTAINER_TAR_BYTES byte cap" >&2
+        return 1
+    }
+}
+
+launch_root_recorded_process() {
+    lrrp_pidfile=$1
+    lrrp_log=$2
+    shift 2
+    sudo -n sh -c '
+        umask 077
+        starttime=$(awk '\''{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[20]; exit }'\'' "/proc/$$/stat") || exit 1
+        printf "%s %s\n" "$$" "$starttime" > "$1"
+        shift
+        exec "$@"
+    ' sh "$lrrp_pidfile" "$@" > "$lrrp_log" 2>&1 &
+    ROOT_LAUNCH_PID=$!
+    lrrp_record=$(wait_root_process_record "$lrrp_pidfile" "$ROOT_LAUNCH_PID") || {
+        lrrp_status=$?
+        kill "$ROOT_LAUNCH_PID" 2>/dev/null || true
+        wait "$ROOT_LAUNCH_PID" 2>/dev/null || true
+        ROOT_LAUNCH_PID=
+        return "$lrrp_status"
+    }
+    set -- $lrrp_record
+    [ "$#" -eq 2 ] || return 1
+    ROOT_PROCESS_PID=$1
+    ROOT_PROCESS_STARTTIME=$2
+}
+
+wait_root_process_record() {
+    wrpr_pidfile=$1
+    wrpr_launcher=$2
+    wrpr_attempt=0
+    while ! sudo -n test -s "$wrpr_pidfile" && [ "$wrpr_attempt" -lt 160 ]; do
+        kill -0 "$wrpr_launcher" 2>/dev/null || {
+            echo "root process exited before recording its identity" >&2
+            return 1
+        }
+        wrpr_attempt=$((wrpr_attempt + 1))
+        sleep 0.05
+    done
+    sudo -n test -s "$wrpr_pidfile" || {
+        echo "root process identity was not recorded" >&2
+        return 1
+    }
+    set -- $(sudo -n cat "$wrpr_pidfile")
+    [ "$#" -eq 2 ] || return 1
+    case $1:$2 in *[!0-9:]*) return 1 ;; esac
+    printf '%s %s\n' "$1" "$2"
+}
+
+process_starttime() {
+    pst_pid=$1
+    case $pst_pid in ''|*[!0-9]*) return 1 ;; esac
+    pst_value=$(awk '{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[20]; exit }' \
+        "/proc/$pst_pid/stat" 2>/dev/null) || return 1
+    case $pst_value in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$pst_value"
+}
+
+root_process_starttime() {
+    rpst_pid=$1
+    case $rpst_pid in ''|*[!0-9]*) return 1 ;; esac
+    rpst_value=$(sudo -n awk '{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[20]; exit }' \
+        "/proc/$rpst_pid/stat" 2>/dev/null) || return 1
+    case $rpst_value in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$rpst_value"
+}
+
+process_matches_starttime() {
+    pms_pid=$1
+    pms_expected=$2
+    pms_current=$(process_starttime "$pms_pid") || return 1
+    [ "$pms_current" = "$pms_expected" ]
+}
+
+root_process_matches_starttime() {
+    rpms_pid=$1
+    rpms_expected=$2
+    rpms_current=$(root_process_starttime "$rpms_pid") || return 1
+    [ "$rpms_current" = "$rpms_expected" ]
+}
+
+signal_pinned_process() {
+    spp_privilege=$1
+    shift
+    case $spp_privilege in
+        user) spp_python=python3 ;;
+        root) spp_python='sudo -n python3' ;;
+        *) return 1 ;;
+    esac
+    $spp_python - "$@" <<'PY'
+import os
+import select
+import signal
+import sys
+
+signals = {
+    "CONT": signal.SIGCONT,
+    "INT": signal.SIGINT,
+    "KILL": signal.SIGKILL,
+    "STOP": signal.SIGSTOP,
+    "TERM": signal.SIGTERM,
+}
+if len(sys.argv) not in (4, 6) or sys.argv[1] not in signals:
+    raise SystemExit("usage: SIGNAL PID STARTTIME [PARENT_PID PARENT_STARTTIME]")
+
+
+def identity(pid_text, start_text):
+    pid, expected = int(pid_text), int(start_text)
+    fd = os.pidfd_open(pid)
+    raw = open(f"/proc/{pid}/stat", "rb").read()
+    tail = raw.rsplit(b") ", 1)[1].split()
+    if len(tail) < 20 or int(tail[19]) != expected:
+        os.close(fd)
+        raise SystemExit(f"refusing changed process identity {pid}")
+    return pid, fd, int(tail[1])
+
+
+parent = None
+if len(sys.argv) == 6:
+    parent = identity(sys.argv[4], sys.argv[5])
+target = identity(sys.argv[2], sys.argv[3])
+if parent is not None:
+    if target[2] != parent[0]:
+        raise SystemExit("worker is not a live child of the pinned supervisor")
+    poller = select.poll()
+    poller.register(parent[1], select.POLLIN)
+    if poller.poll(0):
+        raise SystemExit("pinned supervisor exited before worker signal")
+signal.pidfd_send_signal(target[1], signals[sys.argv[1]], None, 0)
+if parent is not None and poller.poll(0):
+    raise SystemExit("pinned supervisor exited during worker signal")
+PY
+}
+
+signal_verified_process() {
+    signal_pinned_process user "$@"
+}
+
+signal_verified_root_process() {
+    signal_pinned_process root "$@"
+}
+
+wait_for_capture_ready() {
+    wcr_log=$1
+    wcr_privacy=$2
+    wcr_kind=$3
+    wcr_attempt=0
+    while [ "$wcr_attempt" -lt 160 ]; do
+        case $wcr_kind in
+            trace) grep -Fqx "CAPTURE privacy=$wcr_privacy" "$wcr_log" 2>/dev/null && return 0 ;;
+            profile|metrics) grep -Fq " — privacy=$wcr_privacy" "$wcr_log" 2>/dev/null && return 0 ;;
+            *) echo "unknown readiness kind: $wcr_kind" >&2; return 1 ;;
+        esac
+        [ -z "${SPID-}" ] || kill -0 "$SPID" 2>/dev/null || {
+            echo "observer exited before capture readiness: $wcr_log" >&2
+            return 1
+        }
+        wcr_attempt=$((wcr_attempt + 1))
+        sleep 0.05
+    done
+    echo "observer never reported capture readiness: $wcr_log" >&2
+    return 1
+}
+
+# Container discovery runs on a host copy of the container's provider
+# directory, so the manifest it emits names host paths. Point module_path
+# and every attach object at the same file inside the container's mount
+# namespace, refusing any object that escapes the copied directory.
+rewrite_container_manifest() {
+    python3 - "$@" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+source, destination, safe_root, target_root = sys.argv[1:5]
+safe_root = Path(safe_root).resolve(strict=True)
+target_root = Path(target_root)
+assert target_root.is_absolute(), f"target root is not absolute: {target_root}"
+manifest = json.loads(Path(source).read_text(encoding="utf-8"))
+
+
+def target(path):
+    resolved = Path(path).resolve(strict=True)
+    try:
+        relative = resolved.relative_to(safe_root)
+    except ValueError:
+        raise SystemExit(f"attach object escapes the copied directory: {resolved}")
+    return str(target_root / relative)
+
+
+manifest["module_path"] = target(manifest["module_path"])
+for item in manifest["objects"]:
+    item["path"] = target(item["path"])
+assert manifest["objects"][0]["path"] == manifest["module_path"], "object zero is not the module"
+Path(destination).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+}

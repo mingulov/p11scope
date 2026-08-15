@@ -6,10 +6,6 @@ set -eu
 cd "$(dirname "$0")/.."
 
 WORK=target/canaries
-TRUST_ROOT=
-TRUST_DIR=
-TRUST_UNSAFE_DIR=
-RUN_DIR=
 
 assert_lanes() {
     case ${1-} in
@@ -964,7 +960,7 @@ if [ "${1-}" = "--self-test" ]; then
     exit 0
 fi
 
-. scripts/trusted-p11scope.sh
+. scripts/lib.sh
 require_non_root_caller
 mkdir -p "$WORK"
 
@@ -1004,13 +1000,7 @@ cleanup() {
     fi
     [ -z "$WPID" ] || wait "$WPID" 2>/dev/null || true
     [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || true
-    cleanup_step restore_suid_dumpable
     [ -z "$PUBLISH_TMP" ] || cleanup_step rm -f -- "$PUBLISH_TMP"
-    cleanup_step remove_trusted_p11scope "$TRUST_DIR"
-    cleanup_step remove_trusted_p11scope "$TRUST_UNSAFE_DIR"
-    [ -z "$TRUST_ROOT" ] || cleanup_step sudo rm -f "$TRUST_ROOT/dump-owned-bpf-maps.py"
-    cleanup_step remove_trusted_exec_root "$TRUST_ROOT"
-    cleanup_step remove_protected_output_dir "$RUN_DIR"
     exit "$CLEANUP_STATUS"
 }
 . scripts/cleanup-traps.sh
@@ -1020,16 +1010,8 @@ rm -rf "$WORK/default-build" "$WORK/feature-build"
 cargo +1.88 build --locked --release --workspace --target-dir "$WORK/default-build"
 cargo +1.88 build --locked --release --workspace --features unsafe-unvalidated-metadata \
     --target-dir "$WORK/feature-build"
-TRUST_ROOT=$(create_trusted_exec_dir)
-TRUST_DIR=$TRUST_ROOT/default
-TRUST_UNSAFE_DIR=$TRUST_ROOT/unsafe
-RUN_DIR=$(create_protected_output_dir)
-sudo install -o root -g root -m 0555 scripts/dump-owned-bpf-maps.py \
-    "$TRUST_ROOT/dump-owned-bpf-maps.py"
-stage_trusted_p11scope "$WORK/default-build/release/p11scope" \
-    "$WORK/default-build/release/p11scope-discover" "$TRUST_DIR"
-stage_trusted_p11scope "$WORK/feature-build/release/p11scope" \
-    "$WORK/feature-build/release/p11scope-discover" "$TRUST_UNSAFE_DIR"
+P11SCOPE_DEFAULT="$WORK/default-build/release/p11scope"
+P11SCOPE_FEATURE="$WORK/feature-build/release/p11scope"
 gcc -std=c11 -O0 -Wall -Wextra -o "$WORK/canary_workload" \
     scripts/fixtures/canary_workload.c -ldl -pthread
 gcc -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 \
@@ -1121,9 +1103,9 @@ run_lane() {
     build=$2
     kind=$3
     case $build in
-        default) lane_trust=$TRUST_DIR; lane_unsafe= ;;
-        feature) lane_trust=$TRUST_UNSAFE_DIR; lane_unsafe= ;;
-        feature-unsafe) lane_trust=$TRUST_UNSAFE_DIR; lane_unsafe=1 ;;
+        default) lane_observer=$P11SCOPE_DEFAULT; lane_unsafe= ;;
+        feature) lane_observer=$P11SCOPE_FEATURE; lane_unsafe= ;;
+        feature-unsafe) lane_observer=$P11SCOPE_FEATURE; lane_unsafe=1 ;;
         *) echo "unknown lane build: $build" >&2; exit 1 ;;
     esac
     case $kind in
@@ -1155,13 +1137,11 @@ run_lane() {
     done
     test -f "$WORK/$lane.ready" || { echo "$lane workload never became ready"; exit 1; }
 
-    set -- "$lane_trust/p11scope" "$lane_command" \
-        --manifest "$RUN_DIR/matrix-manifest.json" \
-        --provenance-module "$PWD/$WORK/matrix-provider.so" --pid "$WPID" \
-        --trusted-workload
+    set -- "$lane_observer" "$lane_command" \
+        --manifest "$WORK/matrix-manifest.json" --pid "$WPID"
     [ -z "$lane_mode" ] || set -- "$@" --mode "$lane_mode"
     [ -z "$lane_unsafe" ] || set -- "$@" --unsafe-unvalidated-metadata
-    set -- "$@" --duration 6 -o "$RUN_DIR/$lane.output"
+    set -- "$@" --duration 6 -o "$WORK/$lane.output"
     sudo sh -c '
         umask 077
         starttime=$(awk '\''{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[20]; exit }'\'' "/proc/$$/stat") || exit 1
@@ -1169,7 +1149,7 @@ run_lane() {
         shift
         exec "$@"
     ' sh \
-        "$RUN_DIR/$lane.observer.pid" "$@" \
+        "$WORK/$lane.observer.pid" "$@" \
         > "$WORK/$lane.observer.log" 2>&1 &
     SPID=$!
     case $build in
@@ -1177,8 +1157,8 @@ run_lane() {
         *) [ "$kind" = metrics ] && lane_privacy=aggregate-only || lane_privacy=allowlisted ;;
     esac
     wait_for_capture_ready "$WORK/$lane.observer.log" "$lane_privacy" "$kind"
-    sudo test -s "$RUN_DIR/$lane.observer.pid" || { echo "$lane supervisor pid missing"; exit 1; }
-    set -- $(sudo cat "$RUN_DIR/$lane.observer.pid")
+    sudo test -s "$WORK/$lane.observer.pid" || { echo "$lane supervisor pid missing"; exit 1; }
+    set -- $(sudo cat "$WORK/$lane.observer.pid")
     [ "$#" -eq 2 ] || { echo "$lane supervisor identity invalid"; exit 1; }
     SUPERVISOR_PID=$1
     SUPERVISOR_STARTTIME=$2
@@ -1198,10 +1178,14 @@ run_lane() {
     wait_for_stopped "$OBSERVER_PID" "$OBSERVER_STARTTIME"
     touch "$WORK/$lane.go"
     wait_for_workload_stopped "$WPID" "$WORKLOAD_STARTTIME"
-    sudo python3 "$TRUST_ROOT/dump-owned-bpf-maps.py" \
-        "$OBSERVER_PID" "$RUN_DIR" "$lane" 0 16384
-    assert_lanes --raw-events "$RUN_DIR/mapdump_manifest_$lane.json" "$lane" \
-        "$lane_workload_pid" "$RUN_DIR/$lane.events.raw"
+    sudo python3 scripts/dump-owned-bpf-maps.py \
+        "$OBSERVER_PID" "$WORK" "$lane" 0 16384
+    assert_lanes --raw-events "$WORK/mapdump_manifest_$lane.json" "$lane" \
+        "$lane_workload_pid" "$WORK/$lane.events.raw"
+    # Root wrote the map dumps and the raw event stream; the matrix
+    # assertion below reads them as the caller.
+    sudo chown "$(id -u):$(id -g)" "$WORK"/mapdump_*_"$lane".json \
+        "$WORK/$lane.events.raw"
     signal_verified_root_process CONT "$OBSERVER_PID" "$OBSERVER_STARTTIME" \
         "$SUPERVISOR_PID" "$SUPERVISOR_STARTTIME"
     WORKER_STOPPED=
@@ -1219,25 +1203,20 @@ run_lane() {
         echo "$lane workload failed: $status"
         exit "$status"
     fi
-    publish_protected_file "$RUN_DIR" "$lane.output" "$WORK" "$lane.output"
+    # The observer ran as root, so its published report is root-owned 0600.
+    sudo chown "$(id -u):$(id -g)" "$WORK/$lane.output"
     python3 scripts/check-capture-evidence.py canary "$lane" "$WORK/$lane.output"
-    [ "$kind" = metrics ] || \
-        publish_protected_file "$RUN_DIR" "$lane.events.raw" "$WORK" "$lane.events.raw"
-    publish_protected_mapdump_lane "$RUN_DIR" "$WORK" "$lane"
+    # A metrics lane emits no per-call events; keep its empty raw dump out
+    # of the artifact set the matrix assertion scans.
+    [ "$kind" != metrics ] || rm -f "$WORK/$lane.events.raw"
 }
 
 echo "=== discover deterministic matrix providers ==="
 "$WORK/default-build/release/p11scope-discover" \
-    --module "$PWD/$WORK/matrix-provider.so" -o "$WORK/.matrix-manifest.candidate"
+    --module "$PWD/$WORK/matrix-provider.so" -o "$WORK/matrix-manifest.json"
 "$WORK/default-build/release/p11scope-discover" \
-    --module "$PWD/$WORK/privacy-provider.so" -o "$WORK/.privacy-manifest.candidate"
-sudo install -o root -g root -m 0600 "$WORK/.matrix-manifest.candidate" \
-    "$RUN_DIR/matrix-manifest.json"
-sudo install -o root -g root -m 0600 "$WORK/.privacy-manifest.candidate" \
-    "$RUN_DIR/privacy-manifest.json"
-rm -f "$WORK/.matrix-manifest.candidate" "$WORK/.privacy-manifest.candidate"
+    --module "$PWD/$WORK/privacy-provider.so" -o "$WORK/privacy-manifest.json"
 rm -f "$WORK"/mapdump_*.json "$WORK"/mapdump_manifest_*.json
-set_suid_dumpable_zero
 
 while read -r lane build kind; do
     run_lane "$lane" "$build" "$kind"
@@ -1258,9 +1237,9 @@ run_start_lane() {
     start_entries=$4
     start_oracle=$5
     case $start_build in
-        default) start_trust=$TRUST_DIR; start_privacy=allowlisted; start_unsafe= ;;
-        feature) start_trust=$TRUST_UNSAFE_DIR; start_privacy=allowlisted; start_unsafe= ;;
-        feature-unsafe) start_trust=$TRUST_UNSAFE_DIR; start_privacy=unsafe-unvalidated-metadata; start_unsafe=1 ;;
+        default) start_observer=$P11SCOPE_DEFAULT; start_privacy=allowlisted; start_unsafe= ;;
+        feature) start_observer=$P11SCOPE_FEATURE; start_privacy=allowlisted; start_unsafe= ;;
+        feature-unsafe) start_observer=$P11SCOPE_FEATURE; start_privacy=unsafe-unvalidated-metadata; start_unsafe=1 ;;
         *) echo "unknown START build: $start_build" >&2; exit 1 ;;
     esac
     rm -f "$WORK/$start_lane.go" \
@@ -1276,9 +1255,9 @@ run_start_lane() {
         exit 1
     }
     start_workload_pid=$WPID
-    set -- "$start_trust/p11scope" profile --manifest "$RUN_DIR/privacy-manifest.json" \
-        --provenance-module "$PWD/$WORK/privacy-provider.so" --pid "$WPID" \
-        --trusted-workload --mode profile --duration 8 -o "$RUN_DIR/$start_lane.output"
+    set -- "$start_observer" profile --manifest "$WORK/privacy-manifest.json" \
+        --pid "$WPID" \
+        --mode profile --duration 8 -o "$WORK/$start_lane.output"
     [ -z "$start_unsafe" ] || set -- "$@" --unsafe-unvalidated-metadata
     sudo sh -c '
         umask 077
@@ -1287,10 +1266,10 @@ run_start_lane() {
         shift
         exec "$@"
     ' sh \
-        "$RUN_DIR/$start_lane.observer.pid" "$@" > "$WORK/$start_lane.observer.log" 2>&1 &
+        "$WORK/$start_lane.observer.pid" "$@" > "$WORK/$start_lane.observer.log" 2>&1 &
     SPID=$!
     wait_for_capture_ready "$WORK/$start_lane.observer.log" "$start_privacy" profile
-    set -- $(sudo cat "$RUN_DIR/$start_lane.observer.pid")
+    set -- $(sudo cat "$WORK/$start_lane.observer.pid")
     [ "$#" -eq 2 ] || { echo "$start_lane supervisor identity invalid"; exit 1; }
     SUPERVISOR_PID=$1
     SUPERVISOR_STARTTIME=$2
@@ -1305,13 +1284,14 @@ run_start_lane() {
         *[!0-9:]*) echo "$start_lane worker identity invalid"; exit 1 ;;
     esac
     touch "$WORK/$start_lane.go"
-    sudo python3 "$TRUST_ROOT/dump-owned-bpf-maps.py" "$OBSERVER_PID" "$RUN_DIR" \
+    sudo python3 scripts/dump-owned-bpf-maps.py "$OBSERVER_PID" "$WORK" \
         "$start_lane" "$start_entries" 16384
+    sudo chown "$(id -u):$(id -g)" "$WORK"/mapdump_*_"$start_lane".json
     if [ "$start_oracle" = --fault-starts ]; then
-        assert_lanes "$start_oracle" "$RUN_DIR/mapdump_manifest_$start_lane.json" \
+        assert_lanes "$start_oracle" "$WORK/mapdump_manifest_$start_lane.json" \
             "$start_workload_pid"
     else
-        assert_lanes "$start_oracle" "$RUN_DIR/mapdump_manifest_$start_lane.json" \
+        assert_lanes "$start_oracle" "$WORK/mapdump_manifest_$start_lane.json" \
             "$WORK/$start_lane.workload.log" "$start_workload_pid"
     fi
     process_matches_starttime "$WPID" "$WORKLOAD_STARTTIME" || {
@@ -1338,8 +1318,8 @@ run_start_lane() {
     OBSERVER_PID=
     OBSERVER_STARTTIME=
     if wait "$SPID"; then SPID=; SUPERVISOR_PID=; SUPERVISOR_STARTTIME=; else status=$?; SPID=; SUPERVISOR_PID=; SUPERVISOR_STARTTIME=; echo "$start_lane observer failed: $status"; exit "$status"; fi
-    publish_protected_file "$RUN_DIR" "$start_lane.output" "$WORK" "$start_lane.output"
-    publish_protected_mapdump_lane "$RUN_DIR" "$WORK" "$start_lane"
+    # The observer ran as root, so its published report is root-owned 0600.
+    sudo chown "$(id -u):$(id -g)" "$WORK/$start_lane.output"
     if [ "$start_lane" = default-safe-start ]; then
         PUBLISH_TMP=$(mktemp "$WORK/.mapdump_START_live.XXXXXXXX")
         cp "$WORK/mapdump_START_$start_lane.json" "$PUBLISH_TMP"
@@ -1358,11 +1338,6 @@ BLOCKED_LANES
 
 echo "=== live diagnostic START policy: distinct template faults ==="
 run_start_lane feature-unsafe-fault feature-unsafe faults 2 --fault-starts
-
-restore_suid_dumpable
-
-publish_protected_file "$RUN_DIR" matrix-manifest.json "$WORK" matrix-manifest.json
-publish_protected_file "$RUN_DIR" privacy-manifest.json "$WORK" privacy-manifest.json
 
 echo "=== assert capture-policy matrix ==="
 assert_lanes "$WORK"

@@ -52,8 +52,6 @@ PKCS11_CHECK_DIR=/home/user/src/m/pkcs11-check-ws/pkcs11-check
 # $PKCS11_CHECK_DIR (its .venv exists) -- this script only ever reads it.
 PKCS11_CHECK_BIN="$PKCS11_CHECK_DIR/.venv/bin/pkcs11-check"
 WORK=target/matrix-oracle
-TRUST_DIR="$PWD/$WORK/trusted"
-. scripts/trusted-p11scope.sh
 
 command -v softhsm2-util >/dev/null || { echo "BLOCKED: softhsm2-util required"; exit 1; }
 command -v systemd-run >/dev/null || { echo "BLOCKED: systemd-run required"; exit 1; }
@@ -76,15 +74,12 @@ cleanup() {
     [ -z "$PROFILE_PID" ] || wait "$PROFILE_PID" 2>/dev/null || true
     [ -z "$LAUNCHER_PID" ] || wait "$LAUNCHER_PID" 2>/dev/null || true
     sudo systemctl stop "${UNIT}.scope" >/dev/null 2>&1 || true
-    remove_trusted_p11scope "$TRUST_DIR"
     exit "$status"
 }
 . scripts/cleanup-traps.sh
 
 echo "=== build product ==="
 cargo build --release --workspace
-stage_trusted_p11scope target/release/p11scope \
-    target/release/p11scope-discover "$TRUST_DIR"
 
 echo "=== softhsm token (private, disposable) ==="
 export SOFTHSM2_CONF="$PWD/$WORK/softhsm2.conf"
@@ -131,8 +126,8 @@ LAUNCHER_PID=$!
 sleep 1     # let systemd-run establish the cgroup
 test -d "$CGROUP_PATH" || { echo "cgroup was not created: $CGROUP_PATH"; exit 1; }
 
-sudo "$TRUST_DIR/p11scope" profile --manifest "$WORK/manifest.json" \
-    --provenance-module "$MODULE" --cgroup "$CGROUP_PATH" \
+sudo target/release/p11scope profile --manifest "$WORK/manifest.json" \
+    --cgroup "$CGROUP_PATH" \
     --mode metrics --duration 150 -o "$WORK/observed.json" \
     > "$WORK/profile.log" 2>&1 &
 PROFILE_PID=$!
@@ -154,6 +149,8 @@ else
     exit "$status"
 fi
 tail -n 15 "$WORK/profile.log"
+# The observer ran under sudo, so its published report is root-owned 0600.
+sudo chown "$(id -u):$(id -g)" "$WORK/observed.json"
 test "$LAUNCHER_RC" -eq 0 || { echo "pkcs11-check exited nonzero ($LAUNCHER_RC) -- see $WORK/reports/results.json"; exit 1; }
 test -s "$WORK/reports/report.jsonl" || { echo "report.jsonl was not produced"; exit 1; }
 

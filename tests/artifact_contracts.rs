@@ -132,7 +132,7 @@ fn container_provider_streams_are_byte_capped() {
     let status = Command::new("sh")
         .args([
             "-c",
-            ". scripts/trusted-p11scope.sh; \
+            ". scripts/lib.sh; \
              out=$(mktemp) || exit 1; \
              MAX_CONTAINER_TAR_BYTES=64; \
              capped_container_tar \"$out\" printf 'small' 2>/dev/null && \
@@ -145,7 +145,6 @@ fn container_provider_streams_are_byte_capped() {
     assert!(status.success(), "container tar cap rejected its contract");
 
     for path in [
-        "scripts/attach-pod.sh",
         "scripts/matrix/verify-docker.sh",
         "scripts/matrix/verify-shared-layer.sh",
         "scripts/matrix/verify-kind-pod.sh",
@@ -164,7 +163,7 @@ fn pidfd_signal_is_bound_to_recorded_identity() {
             "-c",
             r#"
 set -eu
-. scripts/trusted-p11scope.sh
+. scripts/lib.sh
 sleep 30 & pinned_pid=$!
 trap 'kill -KILL "$pinned_pid" 2>/dev/null || true; wait "$pinned_pid" 2>/dev/null || true' EXIT
 pinned_start=$(process_starttime "$pinned_pid")
@@ -235,7 +234,8 @@ fn capture_evidence_checker_self_test() {
 #[test]
 fn every_script_parses_with_sh_n() {
     for path in [
-        "scripts/trusted-p11scope.sh",
+        "scripts/lib.sh",
+        "scripts/gates.sh",
         "scripts/build-release.sh",
         "scripts/verify-attach-e2e.sh",
         "scripts/verify-canaries.sh",

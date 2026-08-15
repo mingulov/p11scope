@@ -14,8 +14,6 @@ ANCHOR="p11scope-anchor-$TOKEN"
 KNATIVE_VERSION=knative-v1.23.0
 KUBECONFIG="$PWD/$WORK/kubeconfig"
 export KUBECONFIG
-TRUST_DIR=
-RUN_DIR=
 SPID=
 SUPERVISOR_PID=
 SUPERVISOR_STARTTIME=
@@ -23,10 +21,9 @@ ROOT_LAUNCH_PID=
 ROOT_PROCESS_PID=
 ROOT_PROCESS_STARTTIME=
 PF_PID=
-PUBLISH_TMP=
 CLUSTER_CREATED=
 IMAGE_CREATED=
-. scripts/trusted-p11scope.sh
+. scripts/lib.sh
 require_non_root_caller
 
 cleanup() {
@@ -49,15 +46,11 @@ cleanup() {
         fi
         cleanup_step wait "$launcher"
     fi
-    cleanup_step restore_suid_dumpable
     [ -z "$CLUSTER_CREATED" ] || cleanup_step timeout --signal=TERM --kill-after=5s 120s \
         kind delete cluster --name "$CLUSTER"
     [ -z "$IMAGE_CREATED" ] || cleanup_step timeout --signal=TERM --kill-after=5s 30s \
         docker image rm -f "$IMAGE"
     cleanup_step rm -f -- "$KUBECONFIG"
-    [ -z "$PUBLISH_TMP" ] || cleanup_step rm -f -- "$PUBLISH_TMP"
-    cleanup_step remove_trusted_p11scope "$TRUST_DIR"
-    cleanup_step remove_protected_output_dir "$RUN_DIR"
     exit "$CLEANUP_STATUS"
 }
 . scripts/cleanup-traps.sh
@@ -79,12 +72,6 @@ cp scripts/matrix/knative-server.py "$WORK/build/knative-server.py"
 IMAGE_CREATED=1
 timeout --signal=TERM --kill-after=5s 600s docker build -q -t "$IMAGE" \
     -f scripts/matrix/Dockerfile.knative "$WORK" >/dev/null
-
-TRUST_DIR=$(create_trusted_exec_dir)
-RUN_DIR=$(create_protected_output_dir)
-stage_trusted_p11scope "$PRODUCT/release/p11scope" \
-    "$PRODUCT/release/p11scope-discover" "$TRUST_DIR"
-stage_container_authority scripts/container-authority.py "$TRUST_DIR"
 
 echo "=== create isolated kind cluster and install Knative ==="
 rm -f "$KUBECONFIG"
@@ -165,18 +152,13 @@ capped_container_tar "$WORK/provider.tar" \
     tar -chC "$PROVIDER_DIR" .
 tar -xf "$WORK/provider.tar" -C "$WORK/provider-safe"
 SAFE_MODULE="$PWD/$WORK/provider-safe/$PROVIDER_NAME"
-timeout --signal=TERM --kill-after=5s 60s python3 \
-    scripts/container-authority.py validate-copy "$PWD/$WORK/provider-safe" "$SAFE_MODULE"
-timeout --signal=TERM --kill-after=5s 60s "$TRUST_DIR/p11scope" discover \
+test -f "$SAFE_MODULE" && [ ! -L "$SAFE_MODULE" ] \
+    || { echo "copied provider is not a regular file" >&2; exit 1; }
+timeout --signal=TERM --kill-after=5s 60s "$PRODUCT/release/p11scope-discover" \
     --module "$SAFE_MODULE" -o "$WORK/manifest-raw.json"
-timeout --signal=TERM --kill-after=5s 60s python3 scripts/container-authority.py rewrite \
-    "$WORK/manifest-raw.json" \
+rewrite_container_manifest "$WORK/manifest-raw.json" \
     "$WORK/manifest-host.json" "$PWD/$WORK/provider-safe" \
     "/proc/$ANCHOR_PID/root$PROVIDER_DIR"
-sudo -n install -o root -g root -m 0600 "$WORK/manifest-host.json" "$RUN_DIR/manifest.json"
-sudo -n timeout --signal=TERM --kill-after=5s 60s \
-    python3 "$TRUST_DIR/container-authority.py" lease-evidence \
-    "$RUN_DIR/manifest.json" "$RUN_DIR/lease-evidence.json"
 
 echo "=== deploy service, then prove its initial pod scaled to zero ==="
 cat > "$WORK/ksvc.yaml" <<EOF
@@ -219,28 +201,25 @@ while [ "$attempt" -lt 36 ]; do
 done
 [ "$SERVICE_PODS" -eq 0 ] || { echo "service did not scale to zero" >&2; exit 1; }
 
-echo "=== unprivileged authority diagnostic ==="
+echo "=== unprivileged diagnostic: attach must fail without privileges ==="
 set +e
 UNPRIV_OUT=$(timeout --signal=TERM --kill-after=5s 60s \
     "$PRODUCT/release/p11scope" profile \
-    --manifest "$WORK/manifest-host.json" --provenance-module "$SAFE_MODULE" \
-    --cgroup "$KUBEPODS" --trusted-workload --mode metrics --duration 1 2>&1)
+    --manifest "$WORK/manifest-host.json" \
+    --cgroup "$KUBEPODS" --mode metrics --duration 1 2>&1)
 UNPRIV_RC=$?
 set -e
 echo "$UNPRIV_OUT"
 [ "$UNPRIV_RC" -ne 0 ] || { echo "unprivileged profile unexpectedly succeeded" >&2; exit 1; }
-require_rewritten_authority_refusal "$UNPRIV_OUT" "/proc/$ANCHOR_PID/root$PROVIDER_REAL" \
-    || { echo "unprivileged profile missed the rewritten-object authority boundary" >&2; exit 1; }
 
 echo "=== attach before the cold-start pod exists ==="
 SERVICE_PODS=$(service_pod_count)
 [ "$SERVICE_PODS" -eq 0 ] || { echo "service pods appeared before attach" >&2; exit 1; }
-set_suid_dumpable_zero
 set -- timeout --signal=TERM --kill-after=5s 70s \
-    "$TRUST_DIR/p11scope" profile --manifest "$RUN_DIR/manifest.json" \
-    --provenance-module "$SAFE_MODULE" --cgroup "$KUBEPODS" --trusted-workload \
-    --mode metrics --duration 40 -o "$RUN_DIR/observed.json"
-launch_root_recorded_process "$RUN_DIR/observer.pid" "$WORK/profile.log" "$@"
+    "$PRODUCT/release/p11scope" profile --manifest "$WORK/manifest-host.json" \
+    --cgroup "$KUBEPODS" \
+    --mode metrics --duration 40 -o "$WORK/observed.json"
+launch_root_recorded_process "$WORK/observer.pid" "$WORK/profile.log" "$@"
 SPID=$ROOT_LAUNCH_PID
 SUPERVISOR_PID=$ROOT_PROCESS_PID
 SUPERVISOR_STARTTIME=$ROOT_PROCESS_STARTTIME
@@ -322,11 +301,8 @@ else
     tail -n 20 "$WORK/profile.log" || true
     exit "$status"
 fi
-restore_suid_dumpable
-
-publish_protected_file "$RUN_DIR" observed.json "$WORK" observed.json
-publish_protected_file "$RUN_DIR" manifest.json "$WORK" manifest.json
-publish_protected_file "$RUN_DIR" lease-evidence.json "$WORK" lease-evidence.json
+# The observer ran as root, so its published report is root-owned 0600.
+sudo -n chown "$(id -u):$(id -g)" "$WORK/observed.json"
 python3 scripts/check-capture-evidence.py clean-metrics \
     "$WORK/observed.json" spike/expected.txt
 

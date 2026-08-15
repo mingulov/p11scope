@@ -33,16 +33,11 @@ MODULE=/usr/lib/softhsm/libsofthsm2.so
 DIST=dist
 WORK=target/e2e
 OFFICIAL_TARGET=target/release-official
-TRUST_DIR=
-RUN_DIR=
 WPID=
 TARGET_STARTTIME=
 LPID=
 SPID=
-PUBLISH_TMP=
-SUID_DUMPABLE_ORIGINAL=
-SUID_DUMPABLE_CHANGED=
-. scripts/trusted-p11scope.sh
+. scripts/lib.sh
 require_non_root_caller
 rm -rf "$DIST"
 mkdir -p "$DIST"
@@ -58,10 +53,6 @@ cleanup() {
     [ -z "$SPID" ] || kill "$SPID" 2>/dev/null || true
     [ -z "$LPID" ] || wait "$LPID" 2>/dev/null || true
     [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || true
-    cleanup_step restore_suid_dumpable
-    [ -z "$PUBLISH_TMP" ] || cleanup_step rm -f -- "$PUBLISH_TMP"
-    cleanup_step remove_trusted_p11scope "$TRUST_DIR"
-    cleanup_step remove_protected_output_dir "$RUN_DIR"
     exit "$CLEANUP_STATUS"
 }
 . scripts/cleanup-traps.sh
@@ -134,16 +125,12 @@ echo "musl-dynamic file/ldd/smoke run already verified inside the alpine" \
      "host has no musl dynamic linker to exec it directly."
 cp "$MUSL_DISCOVER" "$DIST/p11scope-discover-musl"
 
-echo "=== packaged discovery helper + subcommand smokes ==="
+echo "=== packaged discovery helper smoke ==="
 "$DIST/p11scope-discover" --module /usr/lib/softhsm/libsofthsm2.so \
     -o "$DIST/.smoke-manifest-helper.json"
-"$DIST/p11scope" discover --module /usr/lib/softhsm/libsofthsm2.so \
-    -o "$DIST/.smoke-manifest-subcommand.json"
-for manifest in "$DIST/.smoke-manifest-helper.json" "$DIST/.smoke-manifest-subcommand.json"; do
-    n=$(grep -c '"name": "C_' "$manifest")
-    test "$n" = 68 || { echo "$manifest: expected 68 function records, got $n"; exit 1; }
-done
-rm -f "$DIST/.smoke-manifest-helper.json" "$DIST/.smoke-manifest-subcommand.json"
+n=$(grep -c '"name": "C_' "$DIST/.smoke-manifest-helper.json")
+test "$n" = 68 || { echo "expected 68 function records, got $n"; exit 1; }
+rm -f "$DIST/.smoke-manifest-helper.json"
 
 echo "=== p11scope: smoke run of the packaged STATIC artifact itself ==="
 "$DIST/p11scope" --help >/dev/null
@@ -184,18 +171,14 @@ wait_for_hardened_target() {
     return 1
 }
 
-TRUST_DIR=$(create_trusted_exec_dir)
-RUN_DIR=$(create_protected_output_dir)
-stage_trusted_p11scope "$DIST/p11scope" "$DIST/p11scope-discover" "$TRUST_DIR"
 export SOFTHSM2_CONF="$PWD/$WORK/softhsm2.conf"
-"$TRUST_DIR/p11scope" discover --module "$MODULE" -o "$WORK/release-manifest.json"
+"$DIST/p11scope-discover" --module "$MODULE" -o "$WORK/release-manifest.json"
 
 TARGET_UID=$(id -u)
 TARGET_GID=$(id -g)
-rm -f "$WORK/observed-static-smoke.json"
-set_suid_dumpable_zero
+rm -f "$WORK/observed-static-smoke.json" "$WORK/hardened-target.pid"
 sudo --preserve-env=SOFTHSM2_CONF sh -c 'umask 077; exec 3>"$1"; shift; exec "$@"' \
-    sh "$RUN_DIR/hardened-target.pid" \
+    sh "$WORK/hardened-target.pid" \
     setpriv --no-new-privs --reuid "$TARGET_UID" --regid "$TARGET_GID" \
     --clear-groups --inh-caps=-all --ambient-caps=-all --bounding-set=-all -- \
     sh -c '
@@ -209,31 +192,31 @@ sudo --preserve-env=SOFTHSM2_CONF sh -c 'umask 077; exec 3>"$1"; shift; exec "$@
     ' sh "$PWD/$WORK/harness" "$MODULE" &
 LPID=$!
 target_attempt=0
-while ! sudo test -s "$RUN_DIR/hardened-target.pid" && [ "$target_attempt" -lt 160 ]; do
+while ! sudo test -s "$WORK/hardened-target.pid" && [ "$target_attempt" -lt 160 ]; do
     kill -0 "$LPID" 2>/dev/null || { echo "Hardened target launcher exited before publishing its pid"; exit 1; }
     target_attempt=$((target_attempt + 1))
     sleep 0.05
 done
-sudo test -s "$RUN_DIR/hardened-target.pid" || { echo "Hardened target pid missing"; exit 1; }
-set -- $(sudo cat "$RUN_DIR/hardened-target.pid")
+sudo test -s "$WORK/hardened-target.pid" || { echo "Hardened target pid missing"; exit 1; }
+set -- $(sudo cat "$WORK/hardened-target.pid")
 [ "$#" -eq 2 ] || { echo "invalid Hardened target identity record"; exit 1; }
 WPID=$1
 TARGET_STARTTIME=$2
 case $WPID:$TARGET_STARTTIME in *[!0-9:]*) echo "invalid Hardened target identity"; exit 1 ;; esac
 wait_for_hardened_target "$WPID" "$TARGET_STARTTIME"
 
-sudo --preserve-env=SOFTHSM2_CONF "$TRUST_DIR/p11scope" profile \
-    --manifest "$WORK/release-manifest.json" --provenance-module "$MODULE" \
+sudo --preserve-env=SOFTHSM2_CONF "$DIST/p11scope" profile \
+    --manifest "$WORK/release-manifest.json" \
     --pid "$WPID" \
-    --mode metrics --duration 20 -o "$RUN_DIR/observed-static-smoke.json" \
+    --mode metrics --duration 20 -o "$WORK/observed-static-smoke.json" \
     > "$WORK/profile-static-smoke.log" 2>&1 &
 SPID=$!
 wait_for_capture_ready "$WORK/profile-static-smoke.log" aggregate-only metrics
 signal_verified_process CONT "$WPID" "$TARGET_STARTTIME"
 if wait "$LPID"; then LPID=; WPID=; TARGET_STARTTIME=; else status=$?; LPID=; WPID=; TARGET_STARTTIME=; echo "static smoke workload failed: $status"; exit "$status"; fi
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "static smoke profiler failed: $status"; cat "$WORK/profile-static-smoke.log" || true; exit "$status"; fi
-restore_suid_dumpable
-publish_protected_file "$RUN_DIR" observed-static-smoke.json "$WORK" observed-static-smoke.json
+# The observer ran under sudo, so its published report is root-owned 0600.
+sudo chown "$(id -u):$(id -g)" "$WORK/observed-static-smoke.json"
 
 python3 scripts/check-capture-evidence.py clean-metrics \
     "$WORK/observed-static-smoke.json" spike/expected.txt

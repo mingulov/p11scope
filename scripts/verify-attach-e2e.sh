@@ -7,12 +7,9 @@ cd "$(dirname "$0")/.."
 
 MODULE=/usr/lib/softhsm/libsofthsm2.so
 WORK=target/e2e
-TRUST_DIR=
-RUN_DIR=
 WPID=
 SPID=
-PUBLISH_TMP=
-. scripts/trusted-p11scope.sh
+. scripts/lib.sh
 require_non_root_caller
 mkdir -p "$WORK"
 
@@ -24,10 +21,6 @@ cleanup() {
     [ -z "$SPID" ] || kill "$SPID" 2>/dev/null || true
     [ -z "$WPID" ] || wait "$WPID" 2>/dev/null || true
     [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || true
-    cleanup_step restore_suid_dumpable
-    [ -z "$PUBLISH_TMP" ] || cleanup_step rm -f -- "$PUBLISH_TMP"
-    cleanup_step remove_trusted_p11scope "$TRUST_DIR"
-    cleanup_step remove_protected_output_dir "$RUN_DIR"
     exit "$CLEANUP_STATUS"
 }
 . scripts/cleanup-traps.sh
@@ -39,10 +32,6 @@ test -f "$MODULE" || { echo "SoftHSM2 not installed at $MODULE"; exit 1; }
 echo "=== build ==="
 rm -rf "$WORK/build"
 cargo +1.88 build --locked --release --workspace --target-dir "$WORK/build"
-TRUST_DIR=$(create_trusted_exec_dir)
-RUN_DIR=$(create_protected_output_dir)
-stage_trusted_p11scope "$WORK/build/release/p11scope" \
-    "$WORK/build/release/p11scope-discover" "$TRUST_DIR"
 gcc -O0 -o "$WORK/harness" spike/harness.c -ldl
 
 echo "=== softhsm token ==="
@@ -65,7 +54,7 @@ EOF
 softhsm2-util --init-token --free --label e2e --so-pin 1234 --pin 1234 >/dev/null
 
 echo "=== discover ==="
-"$TRUST_DIR/p11scope" discover --module "$MODULE" -o "$WORK/manifest.json"
+"$WORK/build/release/p11scope-discover" --module "$MODULE" -o "$WORK/manifest.json"
 
 echo "=== observe ==="
 # The workload waits for a go-file so probes are attached before it runs
@@ -75,19 +64,19 @@ echo "=== observe ==="
 rm -f "$WORK/go"
 ( while [ ! -f "$WORK/go" ]; do sleep 0.05; done; exec "$WORK/harness" "$MODULE" ) &
 WPID=$!
-set_suid_dumpable_zero
-sudo --preserve-env=SOFTHSM2_CONF "$TRUST_DIR/p11scope" profile \
-    --manifest "$WORK/manifest.json" --provenance-module "$MODULE" --pid "$WPID" \
-    --trusted-workload --mode metrics --duration 20 -o "$RUN_DIR/observed.json" \
+sudo --preserve-env=SOFTHSM2_CONF "$WORK/build/release/p11scope" profile \
+    --manifest "$WORK/manifest.json" --pid "$WPID" \
+    --mode metrics --duration 20 -o "$WORK/observed.json" \
     > "$WORK/profile.log" 2>&1 &
 SPID=$!
 wait_for_capture_ready "$WORK/profile.log" aggregate-only metrics
 touch "$WORK/go"
 if wait "$WPID"; then WPID=; else status=$?; WPID=; echo "workload failed: $status"; exit "$status"; fi
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "profiler failed: $status"; tail -n 20 "$WORK/profile.log" || true; exit "$status"; fi
-restore_suid_dumpable
 tail -n 20 "$WORK/profile.log"
-publish_protected_file "$RUN_DIR" observed.json "$WORK" observed.json
+# The observer ran under sudo, so its published output is root-owned 0600.
+# Hand it back to the caller for the evidence check.
+sudo chown "$(id -u):$(id -g)" "$WORK/observed.json"
 
 echo "=== verify against spike/expected.txt ==="
 python3 scripts/check-capture-evidence.py clean-metrics \

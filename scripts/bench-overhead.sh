@@ -20,14 +20,12 @@ cd "$(dirname "$0")/.."
 
 MODULE=/usr/lib/softhsm/libsofthsm2.so
 WORK=target/bench-overhead
-TRUST_DIR="$PWD/$WORK/trusted"
 FIX=scripts/fixtures
 RUNS=${RUNS:-5}
 N_CALLS=${N_CALLS:-1000000}
 WPID=
 SPID=
 mkdir -p "$WORK"
-. scripts/trusted-p11scope.sh
 
 cleanup() {
     status=$?
@@ -36,7 +34,6 @@ cleanup() {
     [ -z "$SPID" ] || kill "$SPID" 2>/dev/null || true
     [ -z "$WPID" ] || wait "$WPID" 2>/dev/null || true
     [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || true
-    remove_trusted_p11scope "$TRUST_DIR"
     exit "$status"
 }
 . scripts/cleanup-traps.sh
@@ -49,9 +46,7 @@ test -f "$MODULE" || { echo "SoftHSM2 not installed at $MODULE"; exit 1; }
 echo "=== build ==="
 cargo build --release --workspace
 DISCOVER=./target/release/p11scope-discover
-stage_trusted_p11scope target/release/p11scope \
-    target/release/p11scope-discover "$TRUST_DIR"
-P11SCOPE="$TRUST_DIR/p11scope"
+P11SCOPE=./target/release/p11scope
 gcc -O0 -o "$WORK/hammer" "$FIX/hammer.c" -ldl
 
 echo "=== private softhsm token ==="
@@ -111,7 +106,7 @@ measure_profile() {
       exec "$WORK/hammer" "$MODULE" "$N_CALLS" ) > "$WORK/${label}_hammer_${n}.log" 2>&1 &
     WPID=$!
     sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" profile \
-        --manifest "$WORK/manifest.json" --provenance-module "$MODULE" --pid "$WPID" \
+        --manifest "$WORK/manifest.json" --pid "$WPID" \
         --mode "$mode" --duration 60 -o "$WORK/${label}_${n}.json" \
         > "$WORK/${label}_p11scope_${n}.log" 2>&1 &
     SPID=$!
@@ -123,6 +118,7 @@ measure_profile() {
     kill -INT "$SPID" 2>/dev/null || true
     wait "$SPID" 2>/dev/null || true
     SPID=
+    sudo chown "$(id -u):$(id -g)" "$WORK/${label}_${n}.json"
     if grep -q "attach failed" "$WORK/${label}_p11scope_${n}.log"; then
         echo "ATTACH FAILURE in $label run $n:" >&2
         cat "$WORK/${label}_p11scope_${n}.log" >&2
@@ -149,7 +145,7 @@ measure_trace() {
       exec "$WORK/hammer" "$MODULE" "$N_CALLS" ) > "$WORK/trace_hammer_${n}.log" 2>&1 &
     WPID=$!
     sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" trace \
-        --manifest "$WORK/manifest.json" --provenance-module "$MODULE" --pid "$WPID" \
+        --manifest "$WORK/manifest.json" --pid "$WPID" \
         --duration 60 -o "$WORK/trace_${n}.txt" \
         > "$WORK/trace_p11scope_${n}.log" 2>&1 &
     SPID=$!
@@ -161,6 +157,7 @@ measure_trace() {
     kill -INT "$SPID" 2>/dev/null || true
     wait "$SPID" 2>/dev/null || true
     SPID=
+    sudo chown "$(id -u):$(id -g)" "$WORK/trace_${n}.txt"
     if grep -q "attach failed" "$WORK/trace_p11scope_${n}.log"; then
         echo "ATTACH FAILURE in trace run $n:" >&2
         cat "$WORK/trace_p11scope_${n}.log" >&2

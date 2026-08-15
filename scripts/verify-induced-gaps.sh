@@ -16,14 +16,8 @@ cd "$(dirname "$0")/.."
 
 MODULE=/usr/lib/softhsm/libsofthsm2.so
 WORK=target/induced-gaps
-TRUST_ROOT=
-TRUST_DEFAULT_DIR=
-TRUST_RING_DIR=
-TRUST_STATE_DIR=
-TRUST_FREEZE_DIR=
-RUN_DIR=
 FIX=scripts/fixtures
-. scripts/trusted-p11scope.sh
+. scripts/lib.sh
 require_non_root_caller
 mkdir -p "$WORK"
 
@@ -43,7 +37,6 @@ SUPERVISOR_PID=
 SUPERVISOR_STARTTIME=
 OBSERVER_PID=
 OBSERVER_STARTTIME=
-PUBLISH_TMP=
 cleanup() {
     CLEANUP_STATUS=$?
     trap - EXIT INT TERM
@@ -63,16 +56,6 @@ cleanup() {
     fi
     [ -z "$WPID" ] || wait "$WPID" 2>/dev/null || true
     [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || true
-    cleanup_step restore_suid_dumpable
-    [ -z "$PUBLISH_TMP" ] || cleanup_step rm -f -- "$PUBLISH_TMP"
-    [ -z "$TRUST_ROOT" ] || cleanup_step sudo rm -f \
-        "$TRUST_ROOT/freeze-policy-maps" "$TRUST_ROOT/dump-owned-bpf-maps.py"
-    cleanup_step remove_trusted_p11scope "$TRUST_DEFAULT_DIR"
-    cleanup_step remove_trusted_p11scope "$TRUST_RING_DIR"
-    cleanup_step remove_trusted_p11scope "$TRUST_STATE_DIR"
-    cleanup_step remove_trusted_p11scope "$TRUST_FREEZE_DIR"
-    cleanup_step remove_trusted_exec_root "$TRUST_ROOT"
-    cleanup_step remove_protected_output_dir "$RUN_DIR"
     exit "$CLEANUP_STATUS"
 }
 . scripts/cleanup-traps.sh
@@ -94,26 +77,10 @@ P11SCOPE_SMALL_STATE_MAPS=1 cargo +1.88 build --locked --release --workspace \
     --target-dir "$WORK/state-build"
 cargo +1.88 build --locked --release --workspace --features unsafe-unvalidated-metadata \
     --target-dir "$WORK/freeze-build"
-TRUST_ROOT=$(create_trusted_exec_dir)
-TRUST_DEFAULT_DIR=$TRUST_ROOT/default
-TRUST_RING_DIR=$TRUST_ROOT/ring
-TRUST_STATE_DIR=$TRUST_ROOT/state
-TRUST_FREEZE_DIR=$TRUST_ROOT/freeze
-RUN_DIR=$(create_protected_output_dir)
-sudo install -o root -g root -m 0555 scripts/dump-owned-bpf-maps.py \
-    "$TRUST_ROOT/dump-owned-bpf-maps.py"
-stage_trusted_p11scope "$WORK/default-build/release/p11scope" \
-    "$WORK/default-build/release/p11scope-discover" "$TRUST_DEFAULT_DIR"
-stage_trusted_p11scope "$WORK/ring-build/release/p11scope" \
-    "$WORK/default-build/release/p11scope-discover" "$TRUST_RING_DIR"
-stage_trusted_p11scope "$WORK/state-build/release/p11scope" \
-    "$WORK/default-build/release/p11scope-discover" "$TRUST_STATE_DIR"
-stage_trusted_p11scope "$WORK/freeze-build/release/p11scope" \
-    "$WORK/freeze-build/release/p11scope-discover" "$TRUST_FREEZE_DIR"
-P11SCOPE="$TRUST_DEFAULT_DIR/p11scope"
-P11SCOPE_SMALLRING="$TRUST_RING_DIR/p11scope"
-P11SCOPE_SMALLSTATE="$TRUST_STATE_DIR/p11scope"
-P11SCOPE_FREEZE="$TRUST_FREEZE_DIR/p11scope"
+P11SCOPE="$WORK/default-build/release/p11scope"
+P11SCOPE_SMALLRING="$WORK/ring-build/release/p11scope"
+P11SCOPE_SMALLSTATE="$WORK/state-build/release/p11scope"
+P11SCOPE_FREEZE="$WORK/freeze-build/release/p11scope"
 
 python3 scripts/check-bpf-map-defs.py --self-test
 set -- "$WORK"/default-build/release/build/p11scope-*/out/p11scope-ebpf
@@ -177,13 +144,6 @@ pin_supervisor() {
     esac
 }
 
-protect_manifest() {
-    pm_candidate=$1
-    pm_name=$2
-    sudo install -o root -g root -m 0600 "$pm_candidate" "$RUN_DIR/$pm_name"
-    rm -f "$pm_candidate"
-}
-
 pin_workload() {
     WORKLOAD_STARTTIME=$(process_starttime "$WPID") || {
         echo "workload $WPID identity unavailable" >&2
@@ -235,7 +195,7 @@ freeze_policy_maps() {
     workload_pid=$1
     cgroup_path=$2
     manifest=$3
-    sudo python3 - "$manifest" "$RUN_DIR/freeze-policy-map-ids" <<'PY'
+    sudo python3 - "$manifest" "$WORK/freeze-policy-map-ids" <<'PY'
 import json, os, sys
 expected = {"CONFIG", "PID_FILTER", "CGROUP_FILTER", "SLOT_SEMANTICS",
             "ASYNC_FUNCTIONS", "MECH_SHAPE", "ATTR_BOOL_BITS", "TEMPLATE_TAIL"}
@@ -246,12 +206,12 @@ with open(sys.argv[2], "w", encoding="utf-8") as output:
     for name in sorted(expected):
         print(f"{name}={items[name]}", file=output)
 PY
-    set -- $(sudo cat "$RUN_DIR/freeze-policy-map-ids")
-    sudo "$TRUST_ROOT/freeze-policy-maps" "$workload_pid" "$cgroup_path" \
+    set -- $(sudo cat "$WORK/freeze-policy-map-ids")
+    sudo "$WORK/freeze-policy-maps" "$workload_pid" "$cgroup_path" \
         "$@"
 }
 
-sudo sh -c 'umask 077; exec tee "$1" >/dev/null' sh "$RUN_DIR/freeze-policy-maps.c" <<'EOF'
+cat > "$WORK/freeze-policy-maps.c" <<'EOF'
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -373,8 +333,8 @@ int main(int argc, char **argv) {
     return 0;
 }
 EOF
-sudo gcc -std=c11 -O2 -Wall -Wextra -Werror -o "$TRUST_ROOT/freeze-policy-maps" \
-    "$RUN_DIR/freeze-policy-maps.c"
+gcc -std=c11 -O2 -Wall -Wextra -Werror -o "$WORK/freeze-policy-maps" \
+    "$WORK/freeze-policy-maps.c"
 
 assert_dynamic_maps_advanced() {
     sudo python3 - "$1" "$2" <<'PY'
@@ -428,14 +388,12 @@ gcc -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 \
 gcc -std=c11 -O0 -Wall -Wextra -o "$WORK/freeze-workload" \
     scripts/fixtures/canary_workload.c -ldl -pthread
 "$WORK/freeze-build/release/p11scope-discover" \
-    --module "$PWD/$WORK/freeze-provider.so" -o "$WORK/.freeze-manifest.candidate"
-protect_manifest "$WORK/.freeze-manifest.candidate" freeze-manifest.json
+    --module "$PWD/$WORK/freeze-provider.so" -o "$WORK/freeze-manifest.json"
 
 rm -f "$WORK/freeze-ready" "$WORK/freeze-go" "$WORK/freeze-observed.json" \
     "$WORK/freeze-profile.log" "$WORK/freeze-workload.log" \
     "$WORK"/mapdump_*_freeze-before.json "$WORK"/mapdump_*_freeze-after.json \
     "$WORK/mapdump_manifest_freeze-before.json" "$WORK/mapdump_manifest_freeze-after.json"
-set_suid_dumpable_zero
 ( while [ ! -f "$WORK/freeze-go" ]; do sleep 0.05; done
   exec "$WORK/freeze-workload" "$PWD/$WORK/freeze-provider.so" matrix \
       "$PWD/$WORK/freeze-ready" "$PWD/$WORK/freeze-go" ) \
@@ -454,39 +412,37 @@ sudo sh -c '
     shift
     exec "$@"
 ' sh \
-    "$RUN_DIR/freeze-supervisor.pid" \
-    "$P11SCOPE_FREEZE" profile --manifest "$RUN_DIR/freeze-manifest.json" \
-    --provenance-module "$PWD/$WORK/freeze-provider.so" --cgroup "$CGROUP_PATH" \
-    --trusted-workload --mode profile --unsafe-unvalidated-metadata --duration 20 \
-    -o "$RUN_DIR/freeze-observed.json" > "$WORK/freeze-profile.log" 2>&1 &
+    "$WORK/freeze-supervisor.pid" \
+    "$P11SCOPE_FREEZE" profile --manifest "$WORK/freeze-manifest.json" \
+    --cgroup "$CGROUP_PATH" \
+    --mode profile --unsafe-unvalidated-metadata --duration 20 \
+    -o "$WORK/freeze-observed.json" > "$WORK/freeze-profile.log" 2>&1 &
 SPID=$!
 wait_for_capture_ready "$WORK/freeze-profile.log" unsafe-unvalidated-metadata profile
-pin_supervisor "$RUN_DIR/freeze-supervisor.pid"
+pin_supervisor "$WORK/freeze-supervisor.pid"
 set -- $(observer_worker_pid "$SUPERVISOR_PID" "$SUPERVISOR_STARTTIME")
 [ "$#" -eq 2 ] || { echo "freeze worker identity invalid"; exit 1; }
 OBSERVER_PID=$1
 OBSERVER_STARTTIME=$2
 root_process_matches_starttime "$OBSERVER_PID" "$OBSERVER_STARTTIME" || exit 1
-sudo python3 "$TRUST_ROOT/dump-owned-bpf-maps.py" \
-    "$OBSERVER_PID" "$RUN_DIR" freeze-before 0 16384
+sudo python3 scripts/dump-owned-bpf-maps.py \
+    "$OBSERVER_PID" "$WORK" freeze-before 0 16384
 freeze_policy_maps "$WPID" "$CGROUP_PATH" \
-    "$RUN_DIR/mapdump_manifest_freeze-before.json"
+    "$WORK/mapdump_manifest_freeze-before.json"
 touch "$WORK/freeze-go"
 wait_for_workload_stopped
-sudo python3 "$TRUST_ROOT/dump-owned-bpf-maps.py" \
-    "$OBSERVER_PID" "$RUN_DIR" freeze-after 0 16384
-assert_dynamic_maps_advanced "$RUN_DIR/mapdump_manifest_freeze-before.json" \
-    "$RUN_DIR/mapdump_manifest_freeze-after.json"
+sudo python3 scripts/dump-owned-bpf-maps.py \
+    "$OBSERVER_PID" "$WORK" freeze-after 0 16384
+assert_dynamic_maps_advanced "$WORK/mapdump_manifest_freeze-before.json" \
+    "$WORK/mapdump_manifest_freeze-after.json"
 OBSERVER_PID=
 OBSERVER_STARTTIME=
 signal_verified_root_process INT "$SUPERVISOR_PID" "$SUPERVISOR_STARTTIME"
 if wait "$SPID"; then SPID=; SUPERVISOR_PID=; SUPERVISOR_STARTTIME=; else status=$?; SPID=; SUPERVISOR_PID=; SUPERVISOR_STARTTIME=; echo "freeze observer failed: $status"; exit "$status"; fi
 resume_and_wait_workload freeze
-publish_protected_file "$RUN_DIR" freeze-observed.json "$WORK" freeze-observed.json
-publish_protected_file "$RUN_DIR" freeze-manifest.json "$WORK" freeze-manifest.json
-publish_protected_file "$RUN_DIR" freeze-policy-map-ids "$WORK" freeze-policy-map-ids
-publish_protected_mapdump_lane "$RUN_DIR" "$WORK" freeze-before
-publish_protected_mapdump_lane "$RUN_DIR" "$WORK" freeze-after
+# Every observer here runs under sudo, so each published report is
+# root-owned 0600. Hand it back to the caller before reading it.
+sudo chown "$(id -u):$(id -g)" "$WORK/freeze-observed.json"
 test -s "$WORK/freeze-observed.json" || { echo "freeze observer produced no output"; exit 1; }
 python3 scripts/check-capture-evidence.py canary feature-unsafe-profile \
     "$WORK/freeze-observed.json"
@@ -527,8 +483,7 @@ gcc -shared -fPIC -o "$WORK/g1/provider.so" \
     -Wl,-rpath,"$PWD/$WORK/g1"
 gcc -O0 -o "$WORK/g1_workload" "$FIX/alias_workload.c"
 
-"$DISCOVER" --module "$PWD/$WORK/g1/provider.so" -o "$WORK/.g1_manifest.candidate"
-protect_manifest "$WORK/.g1_manifest.candidate" g1_manifest.json
+"$DISCOVER" --module "$PWD/$WORK/g1/provider.so" -o "$WORK/g1_manifest.json"
 
 rm -f "$WORK/g1_go" "$WORK/g1_observed.json" "$WORK/g1_profile.log"
 ( while [ ! -f "$WORK/g1_go" ]; do sleep 0.05; done
@@ -537,9 +492,8 @@ rm -f "$WORK/g1_go" "$WORK/g1_observed.json" "$WORK/g1_profile.log"
 WPID=$!
 pin_workload
 sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" profile \
-    --manifest "$RUN_DIR/g1_manifest.json" \
-    --provenance-module "$PWD/$WORK/g1/provider.so" --pid "$WPID" \
-    --trusted-workload --mode profile --duration 8 -o "$RUN_DIR/g1_observed.json" \
+    --manifest "$WORK/g1_manifest.json" --pid "$WPID" \
+    --mode profile --duration 8 -o "$WORK/g1_observed.json" \
     > "$WORK/g1_profile.log" 2>&1 &
 SPID=$!
 wait_for_capture_ready "$WORK/g1_profile.log" allowlisted profile
@@ -547,8 +501,7 @@ touch "$WORK/g1_go"
 wait_for_workload_stopped
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "alias profiler failed: $status"; exit "$status"; fi
 resume_and_wait_workload alias
-publish_protected_file "$RUN_DIR" g1_observed.json "$WORK" g1_observed.json
-publish_protected_file "$RUN_DIR" g1_manifest.json "$WORK" g1_manifest.json
+sudo chown "$(id -u):$(id -g)" "$WORK/g1_observed.json"
 tail -n 5 "$WORK/g1_profile.log"
 python3 scripts/check-capture-evidence.py induced G1 "$WORK/g1_observed.json"
 
@@ -578,8 +531,7 @@ echo "=== gap 2/5: in-flight at end ==="
 gcc -shared -fPIC -o "$WORK/g2_provider.so" "$FIX/blocking_provider.c"
 gcc -O0 -o "$WORK/g2_workload" "$FIX/blocking_workload.c" -ldl
 
-"$DISCOVER" --module "$PWD/$WORK/g2_provider.so" -o "$WORK/.g2_manifest.candidate"
-protect_manifest "$WORK/.g2_manifest.candidate" g2_manifest.json
+"$DISCOVER" --module "$PWD/$WORK/g2_provider.so" -o "$WORK/g2_manifest.json"
 
 rm -f "$WORK/g2_go" "$WORK/g2_observed.json" "$WORK/g2_profile.log"
 ( while [ ! -f "$WORK/g2_go" ]; do sleep 0.05; done
@@ -587,9 +539,8 @@ rm -f "$WORK/g2_go" "$WORK/g2_observed.json" "$WORK/g2_profile.log"
 WPID=$!
 pin_workload
 sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" profile \
-    --manifest "$RUN_DIR/g2_manifest.json" \
-    --provenance-module "$PWD/$WORK/g2_provider.so" --pid "$WPID" \
-    --trusted-workload --mode profile --duration 6 -o "$RUN_DIR/g2_observed.json" \
+    --manifest "$WORK/g2_manifest.json" --pid "$WPID" \
+    --mode profile --duration 6 -o "$WORK/g2_observed.json" \
     > "$WORK/g2_profile.log" 2>&1 &
 SPID=$!
 wait_for_capture_ready "$WORK/g2_profile.log" allowlisted profile
@@ -597,8 +548,7 @@ touch "$WORK/g2_go"
 # The workload blocks for ~60s in the probed call; only the profiler exits
 # on its own (--duration). Don't `wait` on the still-blocked workload.
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "in-flight profiler failed: $status"; exit "$status"; fi
-publish_protected_file "$RUN_DIR" g2_observed.json "$WORK" g2_observed.json
-publish_protected_file "$RUN_DIR" g2_manifest.json "$WORK" g2_manifest.json
+sudo chown "$(id -u):$(id -g)" "$WORK/g2_observed.json"
 tail -n 5 "$WORK/g2_profile.log"
 signal_verified_process KILL "$WPID" "$WORKLOAD_STARTTIME" 2>/dev/null || true
 wait "$WPID" 2>/dev/null || true
@@ -627,8 +577,7 @@ PY
 echo "=== gap 3/5: event loss (tiny ring buffer, high call rate) ==="
 ##############################################################################
 gcc -O0 -o "$WORK/g3_hammer" "$FIX/hammer.c" -ldl
-"$DISCOVER" --module "$MODULE" -o "$WORK/.g3_manifest.candidate"
-protect_manifest "$WORK/.g3_manifest.candidate" g3_manifest.json
+"$DISCOVER" --module "$MODULE" -o "$WORK/g3_manifest.json"
 
 N_CALLS=200000
 rm -f "$WORK/g3_go" "$WORK/g3_observed.json" "$WORK/g3_profile.log"
@@ -638,8 +587,8 @@ rm -f "$WORK/g3_go" "$WORK/g3_observed.json" "$WORK/g3_profile.log"
 WPID=$!
 pin_workload
 sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE_SMALLRING" profile \
-    --manifest "$RUN_DIR/g3_manifest.json" --provenance-module "$MODULE" --pid "$WPID" \
-    --trusted-workload --mode profile --duration 15 -o "$RUN_DIR/g3_observed.json" \
+    --manifest "$WORK/g3_manifest.json" --pid "$WPID" \
+    --mode profile --duration 15 -o "$WORK/g3_observed.json" \
     > "$WORK/g3_profile.log" 2>&1 &
 SPID=$!
 wait_for_capture_ready "$WORK/g3_profile.log" allowlisted profile
@@ -647,8 +596,7 @@ touch "$WORK/g3_go"
 wait_for_workload_stopped
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "event-loss profiler failed: $status"; exit "$status"; fi
 resume_and_wait_workload hammer
-publish_protected_file "$RUN_DIR" g3_observed.json "$WORK" g3_observed.json
-publish_protected_file "$RUN_DIR" g3_manifest.json "$WORK" g3_manifest.json
+sudo chown "$(id -u):$(id -g)" "$WORK/g3_observed.json"
 tail -n 5 "$WORK/g3_profile.log"
 python3 scripts/check-capture-evidence.py induced G3 "$WORK/g3_observed.json"
 echo "gap 3 exact event-loss/count-authority evidence OK"
@@ -660,8 +608,7 @@ gcc -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 -DPRIVACY_BLOCKS=1 \
     -o "$WORK/g4_provider.so" crates/discover/tests/fixture/version_matrix.c
 gcc -O0 -Wall -Wextra -pthread -o "$WORK/privacy_stack_workload" \
     "$FIX/privacy-stack-workload.c" -ldl
-"$DISCOVER" --module "$PWD/$WORK/g4_provider.so" -o "$WORK/.g4_manifest.candidate"
-protect_manifest "$WORK/.g4_manifest.candidate" g4_manifest.json
+"$DISCOVER" --module "$PWD/$WORK/g4_provider.so" -o "$WORK/g4_manifest.json"
 
 rm -f "$WORK/g4_go" "$WORK/g4_observed.json" "$WORK/g4_profile.log"
 ( while [ ! -f "$WORK/g4_go" ]; do sleep 0.05; done
@@ -670,16 +617,14 @@ rm -f "$WORK/g4_go" "$WORK/g4_observed.json" "$WORK/g4_profile.log"
 WPID=$!
 pin_workload
 sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE_SMALLSTATE" profile \
-    --manifest "$RUN_DIR/g4_manifest.json" \
-    --provenance-module "$PWD/$WORK/g4_provider.so" --pid "$WPID" \
-    --trusted-workload --mode profile --duration 7 -o "$RUN_DIR/g4_observed.json" \
+    --manifest "$WORK/g4_manifest.json" --pid "$WPID" \
+    --mode profile --duration 7 -o "$WORK/g4_observed.json" \
     > "$WORK/g4_profile.log" 2>&1 &
 SPID=$!
 wait_for_capture_ready "$WORK/g4_profile.log" allowlisted profile
 touch "$WORK/g4_go"
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "START-loss profiler failed: $status"; exit "$status"; fi
-publish_protected_file "$RUN_DIR" g4_observed.json "$WORK" g4_observed.json
-publish_protected_file "$RUN_DIR" g4_manifest.json "$WORK" g4_manifest.json
+sudo chown "$(id -u):$(id -g)" "$WORK/g4_observed.json"
 signal_verified_process TERM "$WPID" "$WORKLOAD_STARTTIME" 2>/dev/null || true
 wait "$WPID" 2>/dev/null || true
 WPID=
@@ -692,8 +637,7 @@ echo "=== gap 5/5: RV update loss (one-entry map, distinct completed slots) ==="
 ##############################################################################
 gcc -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 \
     -o "$WORK/g5_provider.so" crates/discover/tests/fixture/version_matrix.c
-"$DISCOVER" --module "$PWD/$WORK/g5_provider.so" -o "$WORK/.g5_manifest.candidate"
-protect_manifest "$WORK/.g5_manifest.candidate" g5_manifest.json
+"$DISCOVER" --module "$PWD/$WORK/g5_provider.so" -o "$WORK/g5_manifest.json"
 
 rm -f "$WORK/g5_go" "$WORK/g5_observed.json" "$WORK/g5_profile.log"
 ( while [ ! -f "$WORK/g5_go" ]; do sleep 0.05; done
@@ -703,9 +647,8 @@ rm -f "$WORK/g5_go" "$WORK/g5_observed.json" "$WORK/g5_profile.log"
 WPID=$!
 pin_workload
 sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE_SMALLSTATE" profile \
-    --manifest "$RUN_DIR/g5_manifest.json" \
-    --provenance-module "$PWD/$WORK/g5_provider.so" --pid "$WPID" \
-    --trusted-workload --mode profile --duration 7 -o "$RUN_DIR/g5_observed.json" \
+    --manifest "$WORK/g5_manifest.json" --pid "$WPID" \
+    --mode profile --duration 7 -o "$WORK/g5_observed.json" \
     > "$WORK/g5_profile.log" 2>&1 &
 SPID=$!
 wait_for_capture_ready "$WORK/g5_profile.log" allowlisted profile
@@ -713,11 +656,8 @@ touch "$WORK/g5_go"
 wait_for_workload_stopped
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "RV-loss profiler failed: $status"; exit "$status"; fi
 resume_and_wait_workload RV
-publish_protected_file "$RUN_DIR" g5_observed.json "$WORK" g5_observed.json
-publish_protected_file "$RUN_DIR" g5_manifest.json "$WORK" g5_manifest.json
+sudo chown "$(id -u):$(id -g)" "$WORK/g5_observed.json"
 python3 scripts/check-capture-evidence.py induced G5 "$WORK/g5_observed.json"
 echo "gap 5 exact evidence OK"
-
-restore_suid_dumpable
 
 echo "=== induced gaps: ALL OK ==="

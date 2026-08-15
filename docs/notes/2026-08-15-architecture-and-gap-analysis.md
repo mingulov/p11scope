@@ -826,3 +826,33 @@ Missed so far, now recorded:
   Document as accepted for the default lanes.
 - **Still open**: params/templates under the safe policy (§3.3) — unchanged by this choice.
 - Later: daemon mode with pinned links; event sampling for high-rate workloads.
+
+### A7. Decision update — no vendor code by default; mid-run via memory scan (2026-08-15)
+
+- **Helper is opt-in only.** `dlopen` of a provider runs its constructors (license checks,
+  exclusive device/token locks, config rewrites, network) and in containers needs a
+  matching-libc helper inside the container's view — dangerous and operationally marginal.
+  `p11scope-discover` remains a standalone offline tool for generating portable manifests on
+  a build machine (catalog use), labelled "executes provider code"; the observer never
+  invokes it unless explicitly asked.
+- **Mid-run discovery = table scan of the target's memory.** Providers keep
+  `CK_FUNCTION_LIST` as a static struct: version word (`0x2802` = 2.40, `0x0003` = 3.0,
+  `0x0203` = 3.2) followed by 68/92/104 consecutive pointers. Read the module's
+  non-executable mappings via `/proc/<pid>/mem` (same access as `maps`), find that pattern
+  with all pointers inside the module's executable range → all tables (2.40 + 3.x + NSC/FC),
+  no execution, no ELF relocation parsing, works in containers and for 32-bit targets
+  (4-byte words). Label `discovery: memory-scan`; cross-check when a live
+  `C_GetFunctionList` return is later observed. Supersedes A5's "static reloc scan: not now".
+- **Default lanes: live (pre-start/lazy load) + memory-scan (already loaded).** No vendor
+  code executed anywhere by default.
+- **Kernel:** base floor 5.15; newer features opportunistic and feature-probed by `doctor`
+  (notably `uprobe_multi` links, 6.6: whole-module attach in one syscall, sub-ms — makes
+  the SIGSTOP pause rarely necessary). A higher floor is acceptable if it materially
+  simplifies; decide in the plan.
+- **32-bit targets** (x86 on x86-64 kernel, incl. Docker): counting mode (function/RV/
+  latency/in-flight) needs no argument reads — support it (mask `eax`, 4-byte table words);
+  semantic decoding needs an ILP32 argument reader + layouts — on demand; detect and label.
+- **AArch64:** BPF bytecode is arch-neutral; observer build + argument-accessor abstraction
+  (the x86 `rsp+8` seventh-arg read is the hard-coded spot). Introduce the abstraction now;
+  ship AArch64 right after the productization basics. Emulated cross-arch (qemu-user)
+  containers out of scope.

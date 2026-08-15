@@ -157,6 +157,46 @@ fn container_provider_streams_are_byte_capped() {
 }
 
 #[test]
+fn container_manifest_rewrite_refuses_escapes_and_rewrites_paths() {
+    // Discovery runs on a host copy of the container's provider directory, so
+    // every attach path must be rewritten into the container's mount view --
+    // and a path that escapes the copy must never become an attach plan.
+    let status = Command::new("sh")
+        .args([
+            "-c",
+            r#"
+set -eu
+. scripts/lib.sh
+root=$(mktemp -d) || exit 1
+trap 'rm -rf "$root"' EXIT
+mkdir "$root/copy"
+: > "$root/copy/provider.so"
+: > "$root/copy/dep.so"
+: > "$root/escape.so"
+manifest() {
+    printf '{"schema":"p11scope-manifest/4","module_path":"%s","objects":[{"id":0,"path":"%s"},{"id":1,"path":"%s"}]}\n' \
+        "$root/copy/provider.so" "$root/copy/provider.so" "$1" > "$root/in.json"
+}
+manifest "$root/copy/dep.so"
+rewrite_container_manifest "$root/in.json" "$root/out.json" "$root/copy" /proc/42/root/usr/lib
+grep -Fq '"module_path": "/proc/42/root/usr/lib/provider.so"' "$root/out.json"
+grep -Fq '"path": "/proc/42/root/usr/lib/dep.so"' "$root/out.json"
+! grep -Fq "$root/copy" "$root/out.json"
+manifest "$root/copy/../escape.so"
+! rewrite_container_manifest "$root/in.json" "$root/bad.json" "$root/copy" /proc/42/root/usr/lib 2>/dev/null
+printf '{"schema":"p11scope-manifest/3","module_path":"x","objects":[]}\n' > "$root/in.json"
+! rewrite_container_manifest "$root/in.json" "$root/bad.json" "$root/copy" /proc/42/root/usr/lib 2>/dev/null
+"#,
+        ])
+        .status()
+        .expect("exercise the container manifest rewrite");
+    assert!(
+        status.success(),
+        "container manifest rewrite broke its contract"
+    );
+}
+
+#[test]
 fn pidfd_signal_is_bound_to_recorded_identity() {
     let output = Command::new("sh")
         .args([
@@ -236,12 +276,16 @@ fn every_script_parses_with_sh_n() {
     for path in [
         "scripts/lib.sh",
         "scripts/gates.sh",
+        "scripts/cleanup-traps.sh",
+        "scripts/bench-overhead.sh",
         "scripts/build-release.sh",
         "scripts/verify-attach-e2e.sh",
         "scripts/verify-canaries.sh",
         "scripts/verify-induced-gaps.sh",
         "scripts/verify-discover-containers.sh",
         "scripts/matrix/verify-docker.sh",
+        "scripts/matrix/verify-fork-scope.sh",
+        "scripts/matrix/verify-oracle.sh",
         "scripts/matrix/verify-shared-layer.sh",
         "scripts/matrix/verify-kind-pod.sh",
         "scripts/matrix/verify-knative.sh",

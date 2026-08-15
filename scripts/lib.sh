@@ -206,7 +206,7 @@ wait_for_capture_ready() {
 # and every attach object at the same file inside the container's mount
 # namespace, refusing any object that escapes the copied directory.
 rewrite_container_manifest() {
-    python3 - "$@" <<'PY'
+    timeout --signal=TERM --kill-after=5s 60s python3 - "$@" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -214,8 +214,13 @@ from pathlib import Path
 source, destination, safe_root, target_root = sys.argv[1:5]
 safe_root = Path(safe_root).resolve(strict=True)
 target_root = Path(target_root)
-assert target_root.is_absolute(), f"target root is not absolute: {target_root}"
+if not target_root.is_absolute():
+    raise SystemExit(f"target root is not absolute: {target_root}")
 manifest = json.loads(Path(source).read_text(encoding="utf-8"))
+if manifest.get("schema") != "p11scope-manifest/4":
+    raise SystemExit(f"container manifest is not schema v4: {manifest.get('schema')!r}")
+if not manifest.get("objects"):
+    raise SystemExit("container manifest has no attach objects")
 
 
 def target(path):
@@ -230,7 +235,8 @@ def target(path):
 manifest["module_path"] = target(manifest["module_path"])
 for item in manifest["objects"]:
     item["path"] = target(item["path"])
-assert manifest["objects"][0]["path"] == manifest["module_path"], "object zero is not the module"
+if manifest["objects"][0]["path"] != manifest["module_path"]:
+    raise SystemExit("object zero is not the module")
 Path(destination).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 PY
 }

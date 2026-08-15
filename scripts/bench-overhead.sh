@@ -118,12 +118,12 @@ measure_profile() {
     kill -INT "$SPID" 2>/dev/null || true
     wait "$SPID" 2>/dev/null || true
     SPID=
-    sudo chown "$(id -u):$(id -g)" "$WORK/${label}_${n}.json"
     if grep -q "attach failed" "$WORK/${label}_p11scope_${n}.log"; then
         echo "ATTACH FAILURE in $label run $n:" >&2
         cat "$WORK/${label}_p11scope_${n}.log" >&2
         exit 1
     fi
+    sudo chown "$(id -u):$(id -g)" "$WORK/${label}_${n}.json"
     python3 -c "
 import json, sys
 ev = json.load(open('$WORK/${label}_${n}.json'))['evidence']
@@ -157,12 +157,12 @@ measure_trace() {
     kill -INT "$SPID" 2>/dev/null || true
     wait "$SPID" 2>/dev/null || true
     SPID=
-    sudo chown "$(id -u):$(id -g)" "$WORK/trace_${n}.txt"
     if grep -q "attach failed" "$WORK/trace_p11scope_${n}.log"; then
         echo "ATTACH FAILURE in trace run $n:" >&2
         cat "$WORK/trace_p11scope_${n}.log" >&2
         exit 1
     fi
+    sudo chown "$(id -u):$(id -g)" "$WORK/trace_${n}.txt"
     lines=$(wc -l < "$WORK/trace_${n}.txt")
     if [ "$lines" -lt 1 ]; then
         echo "trace run $n produced no output lines" >&2

@@ -187,7 +187,7 @@ echo "$UNPRIV_OUT"
 echo "exit code: $UNPRIV_RC"
 test "$UNPRIV_RC" -ne 0 || { echo "expected unprivileged attach to fail, it exited 0"; exit 1; }
 
-echo "--- CAP_BPF + CAP_PERFMON + CAP_LEASE (no CAP_SYS_ADMIN) ---"
+echo "--- CAP_BPF + CAP_PERFMON, no CAP_SYS_ADMIN (CAP_LEASE over-granted, unmeasured) ---"
 set +e
 CAPS_OUT=$(sudo capsh --caps="cap_bpf,cap_perfmon,cap_lease+eip cap_setpcap,cap_setuid,cap_setgid+ep" \
     --keep=1 --user="$(whoami)" --addamb=cap_bpf --addamb=cap_perfmon --addamb=cap_lease \
@@ -195,15 +195,18 @@ CAPS_OUT=$(sudo capsh --caps="cap_bpf,cap_perfmon,cap_lease+eip cap_setpcap,cap_
 set -e
 echo "$CAPS_OUT" | tail -5
 ATTACHED=$(python3 -c "import json;print(json.load(open('$WORK/priv-bpf-perfmon.json'))['evidence']['attached_probes'])")
-echo "attached_probes with CAP_BPF+CAP_PERFMON+CAP_LEASE: $ATTACHED"
+echo "attached_probes with CAP_BPF+CAP_PERFMON (plus over-granted CAP_LEASE): $ATTACHED"
 # Measured, not assumed: on this kernel kernel.perf_event_paranoid=4 is an
 # Ubuntu hardening level that blocks perf_event_open() for uprobes even
 # with CAP_PERFMON, unlike the upstream-documented behavior. CAP_SYS_ADMIN
-# is still required for attach; CAP_LEASE is carried separately for the
-# root-owned provider. See docs/notes/phase4-privileges.md.
+# is still required for attach. CAP_LEASE is still granted to both capsh
+# runs but is no longer required -- the read-lease requirement was removed
+# in Productization Slice 1a and nothing here measures its absence, so the
+# sets stay as they are until Slice 1b re-measures.
+# See docs/notes/phase4-privileges.md.
 test "$ATTACHED" -eq 0 || { echo "expected 0 attached probes without CAP_SYS_ADMIN on this kernel, got $ATTACHED"; exit 1; }
 
-echo "--- CAP_SYS_ADMIN + CAP_LEASE ---"
+echo "--- CAP_SYS_ADMIN (CAP_LEASE over-granted, unmeasured) ---"
 sudo capsh --caps="cap_sys_admin,cap_lease+eip cap_setpcap,cap_setuid,cap_setgid+ep" \
     --keep=1 --user="$(whoami)" --addamb=cap_sys_admin --addamb=cap_lease \
     -- -c "'$PWD/target/release/p11scope' profile --manifest '$WORK/manifest.json' --pid $PRIV_PID --mode metrics --duration 1 -o '$WORK/priv-sysadmin.json'" \
@@ -211,12 +214,12 @@ sudo capsh --caps="cap_sys_admin,cap_lease+eip cap_setpcap,cap_setuid,cap_setgid
 tail -5 "$WORK/priv-sysadmin.log"
 ATTACHED2=$(python3 -c "import json;print(json.load(open('$WORK/priv-sysadmin.json'))['evidence']['attached_probes'])")
 COMPLETE2=$(python3 -c "import json;print(json.load(open('$WORK/priv-sysadmin.json'))['evidence']['completeness'])")
-echo "attached_probes with CAP_SYS_ADMIN+CAP_LEASE: $ATTACHED2 ($COMPLETE2)"
-test "$ATTACHED2" -eq 136 || { echo "expected 136 attached probes with CAP_SYS_ADMIN+CAP_LEASE, got $ATTACHED2"; exit 1; }
+echo "attached_probes with CAP_SYS_ADMIN (plus over-granted CAP_LEASE): $ATTACHED2 ($COMPLETE2)"
+test "$ATTACHED2" -eq 136 || { echo "expected 136 attached probes with CAP_SYS_ADMIN, got $ATTACHED2"; exit 1; }
 # Terminal snapshots are PARTIAL by construction since the drain became
 # unprovable; the capability claim is that attach and capture worked, which
 # attached_probes plus the absence of any concrete gap already proves.
-test "$COMPLETE2" = "PARTIAL" || { echo "expected PARTIAL with CAP_SYS_ADMIN+CAP_LEASE, got $COMPLETE2"; exit 1; }
+test "$COMPLETE2" = "PARTIAL" || { echo "expected PARTIAL with CAP_SYS_ADMIN, got $COMPLETE2"; exit 1; }
 python3 - "$WORK/priv-sysadmin.json" <<'PY'
 import importlib.util, json, sys
 
@@ -233,6 +236,6 @@ wait "$PRIV_PID" 2>/dev/null || true
 PRIV_PID=
 
 echo "=== fork-scope + privileges: ALL OK ==="
-echo "expected hardened minimum on host for a root-owned provider: CAP_SYS_ADMIN+CAP_LEASE."
+echo "measured minimum on host: CAP_SYS_ADMIN (CAP_LEASE is still granted but no longer required; re-measure in Slice 1b)."
 echo "docker/kind measurements (different code path -- /proc/<pid>/root of a"
 echo "different-uid process): see docs/notes/phase4-privileges.md."

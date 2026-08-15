@@ -1,7 +1,9 @@
 # Productization slice 1 — discovery and trust — design
 
 **Date:** 2026-08-15
-**Status:** Approved in discussion (owner), pending written-spec review
+**Status:** Approved in discussion (owner); revised after external review (2026-08-15, four
+blockers + clarifications addressed in §4.1, §4.3, §4.4, §4.5, §4.7, §4.9, §4.12, §4.13);
+pending owner sign-off
 **Input:** `docs/notes/2026-08-15-architecture-and-gap-analysis.md` (§3–§5, Addendum A1–A7)
 **Supersedes for discovery/attach authorization:**
 `docs/superpowers/plans/2026-08-13-manifest-provenance.md` (the lease/provenance/hardened
@@ -46,7 +48,10 @@ AArch64/32-bit, `uprobe_multi`, cgroup-freezer pause, manifest catalog tooling.
 | Static relocation scan of files | not now |
 | Race between table hand-out and attach | adaptive pause: `bpf_send_signal(SIGSTOP)` unless the target has a controlling tty; `run` always pauses (own session); `--pause auto|never|always`; gap always reported |
 | Hook registry | built-in `C_GetFunctionList`, `C_GetInterfaceList`, `C_GetInterface`, `NSC_GetFunctionList`, `FC_GetFunctionList`; `--hook-symbol NAME` adds names |
-| Provider identity | pinned fd; SHA-256 **once** at attach; `fstat` `(ino, size, ctime)` compared every frame and at end → `provider_changed`; no re-hash |
+| Provider identity | pinned fd (opened via `/proc/<pid>/root/<path>`, identity-checked against `maps`); SHA-256 **once** at attach; `fstat` `(ino, size, ctime)` compared every frame and at end → `provider_changed`; no re-hash |
+| Manifest input | trusted operator input, structurally validated, labelled `manifest`, corroborated by scan/live when possible; uncorroborated at end → PARTIAL |
+| Frozen policy vs later modules | semantics move into a capture-independent frozen `DESCRIPTORS` table selected by the attach cookie; slots are dynamic data-map indices (§4.7) |
+| Multi-module state | `(process, module, session)` keys land in slice 1b (§4.13); per-module JSON sections in slice 2 |
 | Old authorization lane | removed now (leases, provenance rediscovery, hardened oracle, glibc staging, supervisor fork, `--provenance-module`, `--trusted-workload`, helper ownership rules, `suid_dumpable`, `/run/p11scope`, exit 78) — restorable from git; commit message says so |
 | Kernel | floor 5.15; newer features (uprobe_multi 6.6, bounded-spin pause) feature-probed later, never required |
 | CI | GitHub Actions: unprivileged checks on every push + `sudo` BPF e2e job on `ubuntu-24.04`; root gates also runnable locally by one command; text-grep contract tests deleted with the lane |
@@ -101,23 +106,38 @@ Input: pid, optional module path hints (`--module`), hook registry. Steps:
    group whose ELF `.dynsym` exports a hook-registry symbol (`elf.rs`, `object` crate, read
    through the pinned fd). Non-ELF, ELFCLASS32, or foreign-arch objects are recorded as
    `skipped: {reason}` (32-bit counting mode is a later slice).
-3. Read the group's non-executable mappings (`r--`, `rw-`) via `pread` on `/proc/<pid>/mem`
-   (bounded: 64 MiB per object, 512 MiB total; larger → `skipped: too_large`).
-4. Table detection over 8-byte words: a word `w` with `w & !0xffff == 0`,
-   `major = w & 0xff ∈ {2,3}`, `minor = (w >> 8) & 0xff` plausible (2.x: 0..=40; 3.x: 0..=2),
-   followed by `N` words each inside one of the group's `r-x` mapping ranges, where `N` = 67
-   (2.00), 68 (2.01–2.40), 92 (3.0/3.1), 104 (3.2) by version. Record every match; overlapping
-   matches keep the longest. Also detect `CK_INTERFACE` arrays: consecutive
+3. Read the candidate group's non-executable mappings (`r--`, `rw-`) via `pread` on
+   `/proc/<pid>/mem` (bounded: 64 MiB per object, 512 MiB total; larger → `skipped:
+   too_large`). `mem` requires `PTRACE_MODE_ATTACH` access (§4.9); when it is unavailable the
+   scan is reported as `unavailable: ptrace` and discovery relies on the hooks (§4.3), whose
+   table reads happen in BPF and need no `/proc` access.
+4. Table detection over 8-byte words against the **whole executable mapping snapshot of the
+   process** (not just the candidate's own mappings — wrapper providers keep the table in one
+   object and the functions in another, as the `lazy_wrapper` fixture and manifest v4
+   `objects[]` already model): a word `w` with `w & !0xffff == 0`, `major = w & 0xff ∈ {2,3}`,
+   `minor = (w >> 8) & 0xff` plausible (2.x: 0..=40; 3.x: 0..=2), followed by `N` words that
+   each fall inside a **file-backed `r-x` mapping of any object** in the snapshot, where `N` =
+   67 (2.00), 68 (2.01–2.40), 92 (3.0/3.1), 104 (3.2) by version. Record every match;
+   overlapping matches keep the longest. Also detect `CK_INTERFACE` arrays: consecutive
    `{name_ptr, table_ptr, flags}` triples where `name_ptr` reads as a NUL-terminated string
    ≤ 64 bytes and `table_ptr` is a detected table or a pointer into a non-executable mapping;
    name `"PKCS 11"` → standard, else vendor (present, undecoded), matching today's
-   `surfaces`/`vendor_interfaces` evidence.
-5. Pointer → offset: `offset = ptr - mapping.start + mapping.file_offset` for the executable
-   mapping containing `ptr` (`crates/discover/src/maps.rs::resolve` logic, moved into
-   `manifest::maps` so both binaries share it). Non-file-backed pointers → `skipped`.
-6. Output: `Module { key: (dev,ino), path, tables: Vec<Table{version, source: scan, entries}>,
-   interfaces, skipped }`, feeding the existing `plan::build` (alias grouping, `entries_seen`,
-   surfaces) unchanged in semantics.
+   `surfaces`/`vendor_interfaces` evidence. Non-file-backed pointers → `skipped` entries.
+   Acceptance criteria for the detector (measurable, §5): every table in the fixture matrix
+   (2.00/2.40/3.0/3.2, alias, vendor-interface, lazy-wrapper) is found with offsets equal to
+   `p11scope-discover`'s, and zero false positives on the fixtures plus the host's SoftHSM2,
+   OpenSC, NSS softokn (`NSC_`+`FC_`) and p11-kit proxy where installed.
+5. Pointer → object + offset: `offset = ptr - mapping.start + mapping.file_offset` for the
+   executable mapping containing `ptr` (`crates/discover/src/maps.rs::resolve`, moved into
+   `manifest::maps` so both binaries share it). Three identities are kept apart, exactly as
+   manifest v4 does: the **table-owning object** (the "module" for reporting), each **object
+   supplying entry points**, and the **(object, offset)** each uprobe is attached to. Every
+   attach object is pinned and hashed (§4.5) individually.
+6. Output: `Module { id: ModuleId, key: (dev,ino), path, sha256, tables: Vec<Table{version,
+   source: scan, entries: [(object, offset, names)]}>, interfaces, skipped }`, feeding the
+   existing `plan::build` (alias grouping, `entries_seen`, surfaces) unchanged in semantics.
+   `ModuleId` is a capture-local index; the stable identity in output is
+   `{dev, ino, sha256, path}` (§4.8).
 
 Cost: reading a few hundred KB–MB and a linear word scan — milliseconds. Idempotent; a
 module already attached (same `(dev,ino)`, same table set) is not re-attached; a new table set
@@ -132,69 +152,104 @@ with a named reason (this slice), so foreign objects are skipped, not misread.
 
 ### 4.3 Loader hook and export hooks (BPF + userspace)
 
-BPF programs added to `crates/ebpf`:
+BPF programs added to `crates/ebpf`. Discovery records are written to a separate small ring
+buffer `DISCOVERY` (64 KiB) using `RingBuf::reserve` (records up to ~1 KiB are filled in map
+memory, never on the BPF stack). Pointer values in these records are internal and never
+rendered.
 
 - `dl_debug_state` (uprobe, entry) attached to the target's `ld.so` inode at the exported
   `_dl_debug_state` offset (glibc; musl `_dl_debug_state` verified in a spike task, fallback:
-  `dlopen` return in libc). Body: scope check → emit `DiscoveryEvent{kind: LOADER, pid, tid}`
-  → if `CONFIG.PAUSE` and pid not tty-attached (userspace pre-decides per pid via a
-  `PAUSE_PIDS` map) → `bpf_send_signal(SIGSTOP)`.
-- `export_entry` / `export_return` (uprobe/uretprobe) attached per PKCS#11 object at each
-  registry symbol found: entry stashes `arg0` (`ppFunctionList` / `pInterfacesList` /
-  `ppInterface`) keyed by tid in a small map; return reads exactly one pointer-sized word from
-  it (`bpf_probe_read_user`) and emits `DiscoveryEvent{kind: EXPORT, symbol_id, pid, tid,
-  table_ptr, count?}`; optional pause as above. Pointer values are internal (never rendered).
-- `sched_process_exec` (tracepoint) for `--cgroup` and `run` scopes: emits
-  `DiscoveryEvent{kind: EXEC, pid}`; pauses **only** in `run` scope (the child of `run`), never
-  in cgroup scope (busy pods must not be stalled per exec).
+  `dlopen` return in libc). Body: scope check → record `{kind: LOADER, pid, tid}` → if
+  `CONFIG.PAUSE` and pid ∈ `PAUSE_PIDS` → `rc = bpf_send_signal(SIGSTOP)`, and `paused = (rc
+  == 0)` is stored in the record.
+- Export hooks, attached per PKCS#11 object at each hook-registry symbol found, with one
+  entry/return pair **per ABI** (the three exports do not share a signature):
+  - `C_GetFunctionList(CK_FUNCTION_LIST_PTR_PTR pp)` (also `NSC_`/`FC_` variants): entry
+    stashes `arg0`; return: only if `rv == CKR_OK`, read `*pp` → table pointer → read the
+    version word and `N` pointers (`N` by version, ≤ 104) with `bpf_probe_read_user` into the
+    reserved record `{kind: FUNCTION_LIST, symbol_id, pid, tid, table_ptr, version, n, ptrs[]}`.
+  - `C_GetInterfaceList(CK_INTERFACE_PTR list, CK_ULONG_PTR count)`: entry stashes `arg0` and
+    `arg1`; return: ignore the sizing idiom (`list == NULL`) and any `rv != CKR_OK`
+    (including `CKR_BUFFER_TOO_SMALL`); otherwise read `*count` bounded to 16, then up to 16
+    `CK_INTERFACE{name_ptr, table_ptr, flags}` triples, the name (≤ 32 bytes) and, for
+    standard-named entries, the table (version + `N` pointers) → one record per interface
+    `{kind: INTERFACE, index, name, flags, table…}`.
+  - `C_GetInterface(name, pVersion, CK_INTERFACE_PTR_PTR ppInterface, flags)`: entry stashes
+    `arg2`; return: only if `rv == CKR_OK`, read `*ppInterface` → one `INTERFACE` record as
+    above.
+  Read failures increment `discovery_read_failures` (evidence) and produce a record with
+  `n = 0`. Optional pause as for the loader hook.
+- `sched_process_exec` (tracepoint) for `--cgroup` and `run` scopes: record `{kind: EXEC,
+  pid}`; pauses **only** in `run` scope (the child of `run`), never in cgroup scope (busy pods
+  must not be stalled per exec).
 
-Userspace handling (`discovery::Engine::on_event`):
+Userspace handling (`discovery::Engine::on_event`), every per-pid action guarded by the pid's
+pinned identity (§4.5; PID reuse aborts the action):
 
 - `EXEC`: read `/proc/<pid>/exe`'s `PT_INTERP` (via `/proc/<pid>/root`), pin that `ld.so`
   inode; if not yet hooked, attach `dl_debug_state` there (once per inode). In `run` scope,
-  then `SIGCONT`.
-- `LOADER`: if `_r_debug` is resolvable, read `r_state` from `/proc/<pid>/mem`; on
-  `RT_CONSISTENT` (or when unresolvable) run the scan for that pid; attach new modules;
-  `SIGCONT` if paused. RT_ADD hits are ignored (unrelocated tables would not match anyway).
-- `EXPORT`: read the table at `table_ptr` (`scan.rs` table reader over `/proc/<pid>/mem`) and
-  cross-check against the scan result for that object; agreement is recorded; a table not
-  found by scan (dynamically built) is attached from the export result and labelled
-  `source: live`; disagreement (same object, different offsets) attaches the union and forces
-  `PARTIAL` with `discovery_conflicts += 1`.
-- Periodic sweep (every tick, cheap): any in-scope pid (from `/proc` for `--pid` and its
-  known children, from fork/exec events for cgroup scope) not yet scanned gets scanned; this
-  self-heals the exec-time window in cgroup scope where the loader hook was armed late.
+  then resume.
+- `LOADER`: if `_r_debug` is resolvable **and** `mem` is accessible, read `r_state` and act
+  only on `RT_CONSISTENT`; otherwise scan on every hit (RT_ADD hits find nothing because
+  unrelocated tables do not match). Scan the pid; attach new modules; resume if paused.
+- `FUNCTION_LIST` / `INTERFACE`: build the table from the record (no `/proc/<pid>/mem`
+  needed), resolve pointers against a fresh `maps` snapshot, cross-check against the scan
+  result for that object when one exists: agreement → `corroborated`; a table not found by
+  scan (dynamically built, or scan unavailable) is attached and labelled `source: live`;
+  disagreement (same object, different offsets) attaches the union and forces `PARTIAL` with
+  `discovery_conflicts += 1`.
+- Periodic sweep (every tick, cheap): any in-scope pid not yet scanned gets scanned when
+  `mem` is accessible; in-scope pids come from the `--pid` (only that pid; PID scope does not
+  follow forks), from `cgroup.procs` of the target cgroup and its descendants at start plus
+  fork/exec events for cgroup scope, and from the child for `run`. This self-heals the
+  exec-time window in cgroup scope where the loader hook was armed late.
 
 Uprobes on `ld.so`/`libc` are inode-wide: every process on the host using that loader takes
-the trap on library-load events while the observer runs (~1–3 µs each, scope-filtered
-first). Documented in usage as the one host-wide effect.
+the trap on library-load events while the observer runs (estimated ~1–3 µs each, to be
+measured; scope-filtered first). Documented in usage as the one host-wide effect.
 
 ### 4.4 `discovery::pause` — adaptive stop/continue
 
 - Decision per pid: `auto` → pause unless `/proc/<pid>/stat` `tty_nr != 0` (a process under
   an interactive shell's job control would be reported as `Stopped`); `run` children are
   started in their own session (`setsid`) so they always qualify; `never`/`always` override.
-- The BPF side sends `SIGSTOP` synchronously at the hook return, so the discovering thread
-  cannot execute the next user instruction before stopping. Userspace performs the scan/attach
-  and sends `SIGCONT` through the pidfd. A `Drop` guard resumes every paused pid on any error
-  path and on Ctrl-C/SIGTERM; a paused-pid list is also flushed at exit. Residual risk: an
-  observer `SIGKILL` inside the ~ms window leaves the target stopped — documented; `doctor`
-  lists in-scope processes in state `T` whose stop is unexplained.
-- Every pause/attach records `attach_gap_ms` (time from hook event to last probe attached);
-  a `never` run records the same number as the unobserved window.
+  Only pids the observer decided to pause are inserted into `PAUSE_PIDS`.
+- Contract: the BPF hook records `paused = (bpf_send_signal(SIGSTOP) == 0)`; a failed send
+  (task exiting, `-EPERM`, `-EINVAL`) is not a pause and is reported as such. `SIGSTOP` is
+  delivered synchronously before the discovering thread executes its next user instruction;
+  other threads stop at their next return to user mode. Userspace keeps a table of pauses it
+  caused, keyed by `(pid, start_time)`; it resumes **only** entries in that table, once, via
+  `pidfd_send_signal(SIGCONT)`, and never a pid whose event said `paused = false`. Before
+  attaching, userspace confirms the whole thread group is stopped (`/proc/<pid>/task/*/stat`
+  state `T`/`t`, bounded wait 100 ms) — the record `pause: sigstop` and a claimed zero gap
+  require that confirmation plus all probes attached before resume; otherwise the record says
+  `pause: partial` and reports the measured gap. A `Drop` guard resumes every entry on any
+  error path and on Ctrl-C/SIGTERM.
+- Not distinguishable and accepted: a third party stopping the target inside the window (our
+  `SIGCONT` would resume it); an observer `SIGKILL` inside the ~ms window leaves the target
+  stopped — documented; `doctor` lists in-scope processes in state `T` whose stop is
+  unexplained.
+- Timing: `attach_gap_ms` = hook-event timestamp → last probe attached, per module; initial and
+  periodic scans record `scan_ms` and `attached_at_ms` (relative to capture start) per module,
+  so a mid-run attach shows when observation began even though calls before it are simply
+  outside the window.
 
 ### 4.5 `identity` — pinned provider identity (replaces reuse/provenance)
 
-- Open the object through `/proc/<pid>/map_files/<start>-<end>` (fallback
-  `/proc/<pid>/root/<path>`), keep the fd for the capture, `fstat` → `(dev, ino, size,
-  ctime, mtime)`, SHA-256 once, GNU build-id if present. Attach through `/proc/self/fd/N`
-  (existing mechanism).
+- Process pinning: every per-pid action (scan, `root` walk, resume) uses the pid's pinned
+  identity — `pidfd_open` when available (existing `process.rs` logic), else
+  `/proc/<pid>/stat` start time; a mismatch means PID reuse and the action is dropped with an
+  evidence note.
+- Object pinning: open the object through `/proc/<pid>/root/<path>` (primary; needs only
+  `PTRACE_MODE_READ`); `/proc/<pid>/map_files/<start>-<end>` is used only when the observer has
+  `CAP_CHECKPOINT_RESTORE`/`CAP_SYS_ADMIN` (its `get_link` requires it). In both cases the
+  opened fd's identity is compared with the mapping's `(dev, ino)` via the existing
+  `mapping_file_key` translation (fdinfo/mountinfo, so overlay/btrfs device numbers match);
+  a mismatch means the path was retargeted and the object is `skipped: identity_mismatch`.
+  Keep the fd for the capture, `fstat` → `(dev, ino, size, ctime, mtime)`, SHA-256 once, GNU
+  build-id if present. Attach through `/proc/self/fd/N` (existing mechanism).
 - Every frame and at end: `fstat` again; any change in `(ino, size, ctime)` →
   `provider_changed: true` and `PARTIAL` (`ctime` is not settable from userspace).
-- `--manifest FILE`: parsed as today (v4), each object's `sha256` must equal the pinned
-  object's hash → its tables are used with `source: manifest`; mismatch → the manifest is
-  ignored for that object with an evidence note (never fatal when live/scan can proceed;
-  fatal only if the manifest was the sole discovery source and nothing else found tables).
 - Evidence: `authority: "hash-pinned"` (the only value this slice emits).
 
 ### 4.6 CLI (`cli.rs`, one parser; `main.rs` thin)
@@ -216,32 +271,59 @@ p11scope-discover ...   (unchanged standalone tool)
 - Removed: `--provenance-module`, `--trusted-workload`, `p11scope discover` subcommand,
   exit code 78.
 - `run`: fork; child `setsid()` then `raise(SIGSTOP)` before `exec`; parent records the pid,
-  publishes PID scope, arms the exec tracepoint, `SIGCONT`s; at the child's `exec` event the
-  BPF side stops it again so the loader hook can be armed on its `ld.so` before any library
-  loads (§4.3); the capture ends when the child exits or `--duration` elapses, and `run`
-  exits with the child's status (signal → 128+n). Forks of the child are not followed in
-  this slice (PID scope semantics unchanged); documented.
+  publishes PID scope, arms the exec tracepoint, resumes; at the child's `exec` event the BPF
+  side stops it again so the loader hook can be armed on its `ld.so` before any library loads
+  (§4.3). Lifecycle: the capture ends when the child exits (reaped by `run` with `waitpid`);
+  `run` then finalises and exits with the child's status (signal → 128+n; exec failure →
+  127 with the OS error). If `--duration` elapses first, the capture finalises and the child
+  keeps running (`child_still_running: true` in evidence) unless `--kill-on-timeout` (SIGTERM
+  to the child's process group, then SIGKILL after 5 s). SIGINT/SIGTERM received by `run` are
+  forwarded to the child's process group and `run` finalises when the child exits (a second
+  Ctrl-C sends SIGKILL). Scope is the child pid only: forks/children of the child are not
+  observed in this slice (PID scope semantics unchanged); documented, `--cgroup` remains the
+  answer for forking workloads.
 - `inspect`: runs the scan only (no BPF, no pause), prints modules, tables (version, count,
-  aliases), interfaces, identity; unprivileged for same-uid targets.
+  aliases), interfaces, identity; needs `maps`/`mem` access to the target (§4.9): same-uid
+  targets when the ptrace policy permits, otherwise `CAP_SYS_PTRACE`.
 - `doctor`: table of checks and a verdict per lane: kernel release, BTF, lockdown state,
-  `kernel.perf_event_paranoid`, effective capabilities, BPF map create probe, uprobe
-  `perf_event_open` probe on the observer's own libc, `/proc/<pid>/{maps,mem}` access (if
-  `--pid`), cgroup path readable (if `--cgroup`), `_dl_debug_state` resolvable in the
-  target's loader, `bpf_send_signal` availability, stopped in-scope processes; exits non-zero
-  if the requested lane is unavailable. No BPF program stays loaded after `doctor`.
+  `kernel.perf_event_paranoid`, `kernel.yama.ptrace_scope`, effective capabilities, BPF map
+  create probe, uprobe `perf_event_open` probe on the observer's own libc, `/proc/<pid>/maps`
+  (READ) and `/proc/<pid>/mem` (ATTACH) access separately (if `--pid`), cgroup path readable
+  (if `--cgroup`), `_dl_debug_state` resolvable in the target's loader, `bpf_send_signal`
+  availability, ring-buffer/attach-cookie/`uprobe_multi` feature probes, stopped in-scope
+  processes; prints which discovery methods (scan / live) and lanes are available and exits
+  non-zero if the requested lane is unavailable. No BPF program stays loaded after `doctor`.
 
-### 4.7 Attach engine changes (`attach.rs`, minimal in this slice)
+### 4.7 Attach engine changes (`attach.rs`) — immutable semantics, dynamic slots
 
-- `Session::start` no longer takes a single plan; it loads the object and publishes policy
-  once, then `attach_module(plan)` can be called repeatedly (per discovered module) and
-  `attach_discovery_hooks(ld_so_fd, offset)` / `attach_export_hooks(fd, offsets)`.
-- Slot ids remain a single global space (`MAX_SLOTS 512`) across modules; per-module slot
-  ranges are recorded so `functions[]` can be grouped by module. `MAX_SLOTS` overflow →
-  refuse further modules with evidence (`modules_skipped`), never truncate.
-- `CONFIG` gains a `PAUSE` bit (published and frozen like the other policy bits). A
-  `PAUSE_PIDS` hash map (pid → 1) lists pids a hook may stop; it must stay writable after
-  attach because pids appear later, so it is an ordinary (unfrozen) map that never
-  influences capture policy — only whether a hook may send `SIGSTOP`.
+The safe-metadata design requires every policy map to be published and frozen before any
+probe attaches, and no control-map mutation afterwards. Today `SLOT_SEMANTICS` is an
+`Array<SlotSemantics>` indexed by attach slot and frozen at start, which is incompatible with
+attaching modules discovered later. Resolution — move semantics out of the per-slot map and
+into the attach cookie:
+
+- `DESCRIPTORS`: `Array<SlotSemantics>` with a fixed, capture-independent content — one entry
+  per published function name (104) plus `COUNT_ONLY` (index 0) — published, read back and
+  frozen at start exactly like today's policy maps. It never changes; every possible descriptor
+  a slot could carry is already in it (an alias slot uses the shared descriptor when every
+  name agrees, else `COUNT_ONLY`, decided in userspace at discovery time as today).
+- Attach cookie = `slot_index (low 32) | descriptor_index (high 32)`. BPF derives `slot` for
+  `STATS`/`RV_COUNTS`/`START`/`Event` and `DESCRIPTORS[descriptor_index]` for semantics; an
+  out-of-range descriptor index falls back to `COUNT_ONLY` (fail closed).
+- Slot indices are allocated monotonically per attached module from a single space of
+  `MAX_SLOTS` (512) — indices into dynamic data maps only, so allocating them after the freeze
+  mutates no control map. Overflow → `modules_skipped` with a reason, never truncation.
+  Capacity note: 512 slots ≈ four modules of 104 unique offsets (proxy + backend fits); a
+  gate exercises proxy + provider in one process; raising `MAX_SLOTS` is a later knob.
+- `Session::start` loads the object and publishes/freezes policy once; `attach_module(plan)`
+  is then called per discovered module and `attach_loader_hook(ld_so_fd, offset)` /
+  `attach_export_hooks(fd, [(symbol, offset)])` per loader/object.
+- `CONFIG` gains a `PAUSE` bit (published and frozen). `PAUSE_PIDS` (pid → 1) lists pids a
+  hook may stop; it must stay writable after attach because pids appear later, so it is an
+  ordinary (unfrozen) map that never influences capture policy — only whether a hook may send
+  `SIGSTOP`. `ASYNC_FUNCTIONS`, `MECH_SHAPE` and the rest are unchanged (static, frozen).
+- Slot → module and slot → names are userspace-only tables in the plan; `Event.slot` keeps its
+  meaning.
 
 ### 4.8 Evidence and schema v2
 
@@ -250,26 +332,41 @@ Additions to the evidence object (both profile and metrics documents; trace `EVI
 | Field | Meaning |
 | --- | --- |
 | `authority` | `"hash-pinned"` |
-| `discovery[]` | per module: `{path, dev, ino, sha256, build_id, sources: [scan\|live\|manifest], tables: [{version, entries, source}], interfaces, skipped[]}` |
+| `discovery[]` | per module: `{module: {dev, ino, sha256, path, build_id}, objects: [{dev, ino, sha256, path}], sources: [scan\|live\|manifest], corroborated, tables: [{version, entries, source}], interfaces, skipped[], scan_ms, attached_at_ms, attach_gap_ms}` |
 | `discovery_conflicts` | scan vs export-hook disagreement count (forces PARTIAL) |
-| `attach_gap_ms` | max over modules of hook-event→attached; `null` when no live event occurred (pure pre-start manifest attach) |
-| `pause` | `sigstop` / `none` / `mixed` |
+| `discovery_uncorroborated` | manifest-sourced tables never corroborated by scan/live by capture end (forces PARTIAL) |
+| `discovery_read_failures` | BPF-side table reads that failed |
+| `attach_gap_ms` | max over modules of hook-event→attached; `null` when no live event occurred |
+| `pause` | `sigstop` / `partial` / `none` / `mixed` |
 | `provider_changed` | any pinned object's `(ino,size,ctime)` changed (forces PARTIAL) |
 | `modules_skipped` | modules not attached for capacity or unsupported class |
+| `child_still_running` | `run` only: `--duration` elapsed with the child alive |
 
-`functions[]` items gain `module: {path, ino}`. `capture.module` becomes `capture.modules[]`.
+`functions[]` items gain `module: {dev, ino, sha256}` (the stable module identity; `path`
+lives in `discovery[]`). `capture.module` becomes `capture.modules[]`.
 Schema ids: `pkcs11-scope/observed-profile/v2` and `pkcs11-scope/observed-profile/v2-metrics`.
 `docs/schema/observed-profile-v1.md` → `-v2.md` with a migration section; v1.4 → v2 is a
 breaking rename of `capture.module` and the evidence additions; the removed evidence fields
 are those tied to the deleted lane (none of the capture-quality counters change).
 
-### 4.9 Privileges
+### 4.9 Privileges and process access
 
-Default lanes need: `CAP_BPF`+`CAP_PERFMON` (or `CAP_SYS_ADMIN` where
-`perf_event_paranoid ≥ 3`), read access to `/proc/<pid>/{maps,mem,map_files}` (same-uid, or
-`CAP_SYS_PTRACE`), read access to the cgroup directory for `--cgroup`. `doctor` demonstrates
-each. The privilege table in `docs/usage.md` is re-measured by a gate (`capsh` rows) as part
-of 1b and stated as measured on that host.
+- BPF: `CAP_BPF`+`CAP_PERFMON` (or `CAP_SYS_ADMIN` where `perf_event_paranoid ≥ 3`).
+- `/proc/<pid>/maps`, `/proc/<pid>/exe`, `/proc/<pid>/root/<path>`: `PTRACE_MODE_READ` — the
+  same uid (and a dumpable target) or `CAP_SYS_PTRACE`; not subject to Yama.
+- `/proc/<pid>/mem` (memory scan, `_r_debug` read): `PTRACE_MODE_ATTACH` — additionally
+  subject to `kernel.yama.ptrace_scope`: `0` same uid; `1` (Ubuntu/Debian default) only
+  descendants of the observer (the `run` child qualifies) unless `CAP_SYS_PTRACE` or the
+  target called `PR_SET_PTRACER`; `2` `CAP_SYS_PTRACE` only; `3` never. When unavailable, the
+  scan is reported `unavailable: ptrace` and discovery relies on the loader/export hooks,
+  whose table reads run in BPF and need no `/proc` access.
+- `/proc/<pid>/map_files/*`: `CAP_CHECKPOINT_RESTORE`/`CAP_SYS_ADMIN`; optional, never
+  required.
+- `--cgroup`: read access to the cgroup directory and `cgroup.procs`.
+- Resume after pause: `pidfd_send_signal(SIGCONT)` — same uid or `CAP_KILL`.
+- `doctor` demonstrates each of these per target. The privilege table in `docs/usage.md` is
+  re-measured by a gate (`capsh` rows on the CI runner and on the development host, with
+  `ptrace_scope` recorded) as part of 1b and stated as measured there.
 
 ### 4.10 Error handling
 
@@ -302,6 +399,30 @@ final task; the removed design is referenced as history.
 Commit message of the deletion: "remove lease/provenance/hardened lane (kept in history:
 see docs/notes/2026-08-15-architecture-and-gap-analysis.md A5/A7)".
 
+### 4.12 Manifest trust and corroboration
+
+`--manifest FILE` is **trusted operator input**, like any command-line argument: SHA-256 binds
+the provider bytes but does not authenticate the manifest's name→offset assertions. The
+observer validates structure (schema v4, sizes, every offset inside an executable segment of
+the pinned object, `sha256` equal to the pinned object's), labels the source `manifest`, and
+corroborates automatically whenever the object is mapped in scope (scan or a live export
+record). Corroboration mismatch → `discovery_conflicts` (union attached, PARTIAL). A
+manifest-sourced table that was never corroborated by capture end → `discovery_uncorroborated`
+and PARTIAL: the observer cannot rule out that the offsets did not describe the live table. A
+manifest whose `sha256` does not match is ignored for that object with an evidence note; it is
+fatal only when it was the sole discovery source and nothing else found tables.
+
+### 4.13 Multi-module state (moved into slice 1b)
+
+Two modules in one process (proxy + backend, NSS + vendor) can hand out numerically equal
+session handles, so semantic state keyed by `(process, session)` would collide. In this slice
+the semantic keys become `SessionKey { process: ProcessKey, module: ModuleId, handle }` (module
+derived in userspace from `Event.slot` → module), including `active_ops`, `find_active`,
+`inherited_ambiguous`, `pending`/`detached` and fork inheritance. Aggregate output stays
+combined in v2 with a `modules[]` list; per-module sections of `mechanisms`/`sessions` are
+slice 2. A unit test opens the same handle value in two modules and proves the states do not
+interact.
+
 ## 5. Testing and CI
 
 Unprivileged (`cargo test`):
@@ -311,10 +432,19 @@ Unprivileged (`cargo test`):
   `/proc/self/mem` — expected tables/offsets equal the values `p11scope-discover` computes for
   the same fixture (oracle already exists). Negative: non-ELF, ELFCLASS32, table-less object,
   overlapping candidates, oversized mapping.
+- `scan.rs` cross-object: the `lazy_wrapper` fixture (table in the wrapper, functions in the
+  backend) resolves to two attach objects with the wrapper as the module.
+- Export-hook ABI: userspace decoding of `FUNCTION_LIST`/`INTERFACE` records from fixtures
+  covering the `C_GetInterfaceList` sizing idiom, `CKR_BUFFER_TOO_SMALL`, `C_GetInterface`
+  output at `arg2`, bounded counts.
+- Multi-module: two fixture modules with colliding session handles → independent state.
 - `elf.rs`: registry lookup and symbol→offset on fixtures and on the host's own `ld.so`/`libc`.
 - `identity.rs`: fstat pin change detection (touch/`utimensat` cannot hide ctime), manifest
   sha256 match/mismatch.
-- `pause.rs`: decision from `/proc/<pid>/stat` fixtures; guard resumes on drop.
+- `pause.rs`: decision from `/proc/<pid>/stat` fixtures; resume only own pauses; failed send
+  is not a pause; guard resumes on drop; whole-group stop confirmation.
+- Descriptor table: `DESCRIPTORS` content is capture-independent and matches `kinds`; cookie
+  encode/decode; out-of-range descriptor → `COUNT_ONLY`.
 - `cli.rs`: every flag/duration suffix; removed flags rejected with hints.
 - `doctor`: rendering from a fixed probe result set.
 - `run`: spawns a fixture that reports its session id and stop/continue.
@@ -324,11 +454,17 @@ Root gates (local `just gates`, and CI):
 - e2e (existing `verify-attach-e2e.sh` on new CLI): manifest-free `--pid` attach to a running
   SoftHSM2 harness (scan path), exact counts; `run -- harness` (live path with pause) exact
   counts incl. the first `C_Initialize`; `--pause never` shows `attach_gap_ms > 0` and the
-  known missed count; canaries, induced gaps, matrix scripts updated (docker/kind on new
-  CLI; Knative manual); privilege rows re-measured with `capsh`.
+  known missed count; proxy + provider in one process (p11-kit proxy over SoftHSM2 where
+  installed, else two fixture modules) attached and attributed separately within the slot
+  ceiling; Yama `ptrace_scope=1` lane: same-uid non-descendant target → scan `unavailable:
+  ptrace`, live hooks still discover; canaries, induced gaps, matrix scripts updated
+  (docker/kind on new CLI; Knative manual); privilege rows re-measured with `capsh`.
 - CI: `.github/workflows/ci.yml` — job 1 unprivileged (fmt, check, clippy, test, `--locked`,
   Rust 1.88 + nightly for the eBPF object); job 2 `ubuntu-24.04` with `sudo` (SoftHSM2 from
-  apt) running the e2e and canary gates. Multi-kernel qemu matrix and kind lanes are slice 3.
+  apt) running the e2e and canary gates. Hosted-runner kernels are not contractual and are
+  recorded per run; the multi-kernel qemu matrix and kind lanes are slice 3 and spike-gated
+  (nested virtualization on hosted runners is not guaranteed; a self-hosted runner is the
+  fallback).
 
 ## 6. Spikes inside plan 1b (must be answered before the dependent tasks)
 
@@ -339,8 +475,12 @@ Root gates (local `just gates`, and CI):
 3. `bpf_send_signal(SIGSTOP)` from a uretprobe on the target's return path: measure the gap
    (event → attached) with single-attach on 5.15/6.8; confirm the discovering thread does not
    execute user code before stopping.
-4. `map_files` open permission on the CI kernel (ptrace-read suffices since 4.3) — fallback
-   `/proc/<pid>/root/<path>` when it fails.
+4. `/proc/<pid>/root/<path>` + `mapping_file_key` identity check on overlay2/btrfs (the
+   primary object-open path); `map_files` only when `CAP_CHECKPOINT_RESTORE`/`CAP_SYS_ADMIN`.
+5. `RingBuf::reserve` of a ~1 KiB discovery record and bounded `bpf_probe_read_user` loops
+   (104 pointers, 16 interfaces) pass the verifier on 5.15 and 6.8.
+6. Yama `ptrace_scope=1`: confirm `maps` readable and `mem` refused for a same-uid
+   non-descendant, and that live hooks still discover the table (BPF-side reads).
 
 ## 7. Plans
 
@@ -363,6 +503,10 @@ Root gates (local `just gates`, and CI):
 - `p11scope inspect --pid` lists the same tables `p11scope-discover` computes for SoftHSM2.
 - Docker and kind rows pass on the new CLI with nothing copied into the container.
 - `doctor` explains every unavailable lane on a host lacking a capability.
+- Proxy + backend in one process are attached and reported as two modules with independent
+  session state.
+- A same-uid target under Yama `ptrace_scope=1` is still discovered live; `doctor` explains
+  why the scan is unavailable.
 - The old lane is gone; `git log` records why; unprivileged suite + CI green.
 
 ## 9. Owner requirements (as stated, 2026-08-15)
@@ -397,16 +541,21 @@ this at zero cost) because that use is legitimate on a build machine.
 
 ### 10.2 Why memory scan + loader hook, and what was rejected
 
-- **Static `CK_FUNCTION_LIST` in memory** is universal in practice (SoftHSM, OpenSC, NSS
-  softokn `NSC_`/`FC_`, p11-kit proxy/rpc, YubiHSM, Kryoptic, vendor HSM libraries):
-  version word + 68/92/104 code pointers is a signature with essentially no false positives,
-  needs only `/proc/<pid>/mem` read access (already required for `maps`), works inside
-  containers and for 32-bit words. Vendor extensions appear either after the standard prefix
-  (ignored) or as `CK_INTERFACE` entries with non-standard names (recorded, undecoded).
-- **Loader breakpoint `_dl_debug_state`** is the mechanism debuggers use; it fires after
-  relocation and before constructors for both the initial link set and every `dlopen`, so it
-  catches DT_NEEDED providers and lazily loaded ones alike, without hooking `dlopen` in a
-  libc whose identity is unknown until a process exists.
+- **Static `CK_FUNCTION_LIST` in memory** is the observed norm in the providers examined
+  (SoftHSM2, OpenSC, NSS softokn `NSC_`/`FC_`, p11-kit proxy/rpc, YubiHSM, Kryoptic; vendor
+  HSM libraries are C and expected to match — verified per provider as they are met): version
+  word + 68/92/104 code pointers is a strong signature; the measurable criteria are in §4.1
+  (all fixture tables found, zero false positives on fixtures and the installed real
+  providers). It needs `PTRACE_MODE_ATTACH` access to `/proc/<pid>/mem` (§4.9), works
+  inside containers and for 32-bit words. Vendor extensions appear either after the standard
+  prefix (ignored) or as `CK_INTERFACE` entries with non-standard names (recorded,
+  undecoded).
+- **Loader breakpoint `_dl_debug_state`** is the mechanism debuggers use; the working
+  hypothesis (spike §6.2) is that it fires after relocation and before constructors for both
+  the initial link set and every `dlopen`, so it would catch DT_NEEDED providers and lazily
+  loaded ones alike, without hooking `dlopen` in a libc whose identity is unknown until a
+  process exists. If the spike disproves the ordering, the fallback is `dlopen` return in
+  libc plus the export hooks.
 - **Export hooks** (`C_GetFunctionList` …) alone were the first idea; they cannot see a table
   handed out before the observer started, so they became the cross-check and the fallback for
   dynamically built tables.
@@ -432,7 +581,8 @@ the lane. SHA-256 is computed once at attach for identity (report, manifest matc
 ### 10.4 Hook inventory, safety, cost
 
 Beyond the per-function entry/return probes (unchanged; ~3.3 µs per observed call measured
-on SoftHSM2), this design adds three hook kinds: `_dl_debug_state` (empty function that
+on SoftHSM2), this design adds three hook kinds (costs below are estimates until the 1b
+gate measures them): `_dl_debug_state` (empty function that
 exists for debuggers; fires on library load/unload only), export uretprobes (fire once per
 module initialisation), `sched_process_exec` (cgroup/`run` scope; ~100 ns per exec). All are
 scope-filtered first thing in BPF. Uprobes bind to inodes, so hooking a shared `ld.so` traps
@@ -474,7 +624,9 @@ discovery pointer values never appear in output; no provider code executed by th
 outputs published atomically.
 
 Accepted residual risks (documented in usage): a workload that rewrites its provider in
-place after attach may cause misattributed statistics until `provider_changed` flags it; a
+place after attach may cause misattributed statistics, missed calls (probes stay at offsets
+whose instructions no longer exist in pages mapped afterwards) or disruption of the target
+itself until `provider_changed` flags it; a
 malicious native provider is code inside the target and outside the semantic guarantee (as
 before); an observer killed inside a pause window leaves the target stopped.
 
@@ -494,19 +646,24 @@ required.
 | Amazon Linux 2023 | 6.1 / 6.12 | ✔ | ✘ / ✔ |
 | SLES 15 SP6 / 16 | 6.4 / 6.12 | ✔ | ✘ / ✔ |
 
-Hence: base 5.15, `doctor` probes features (attach cookies, `bpf_send_signal`, ring buffer,
-`uprobe_multi`) rather than comparing versions; a higher hard floor would exclude
-Ubuntu 22.04, Debian 12, AL2023-6.1 and RHEL 9 for an optimisation.
+Hence: **upstream 5.15 feature baseline; runtime probes are authoritative** — `doctor`
+probes features (attach cookies, `bpf_send_signal`, ring buffer, `uprobe_multi`) rather than
+comparing versions, which is what makes a backport kernel such as RHEL 9's 5.14 supportable;
+a higher hard floor would exclude Ubuntu 22.04, Debian 12, AL2023-6.1 and RHEL 9 for an
+optimisation.
 
 ## 13. CI on GitHub — findings
 
-GitHub-hosted `ubuntu-22.04`/`ubuntu-24.04` runners are full VMs (kernels 6.5–6.11) with
-passwordless `sudo`; BPF and uprobes work there directly, which is how aya, cilium/ebpf, bcc
-and tracee run their privileged tests. SoftHSM2 is installable from apt; Docker is present;
-kind is installable (`helm/kind-action`). Multi-kernel coverage (5.15/6.1/6.6/6.12) is done
-with qemu-based actions (`cilium/little-vm-helper`, `vimto`, `libbpf/ci`) — slice 3.
-Knative remains a manual/nightly lane. Capability-only rows (`capsh`) can run on the hosted
-runner too, so the privilege table can be re-measured in CI.
+GitHub-hosted `ubuntu-22.04`/`ubuntu-24.04` runners are full VMs with passwordless `sudo`;
+their images (and kernels, 6.5–6.11 at the time of writing) are updated regularly and are
+not contractual, so each CI run records `uname -r`. BPF and uprobes work there directly,
+which is how aya, cilium/ebpf, bcc and tracee run their privileged tests. SoftHSM2 is
+installable from apt; Docker is present; kind is installable (`helm/kind-action`).
+Multi-kernel coverage (5.15/6.1/6.6/6.12) with qemu-based actions (`cilium/little-vm-helper`,
+`vimto`, `libbpf/ci`) depends on nested virtualization, which hosted runners do not
+guarantee — slice 3, spike-gated, self-hosted runner as fallback. Knative remains a
+manual/nightly lane. Capability-only rows (`capsh`) run on the hosted runner, so the
+privilege table can be re-measured in CI.
 
 ## 14. Decisions already taken for later slices (recorded so they are not lost)
 
@@ -515,8 +672,8 @@ runner too, so the privilege table can be re-measured in CI.
   length matches, and emitted only when every value is a member of a finite published set
   (hash alg ∈ mechanism registry, MGF ∈ `CKG_*`, lengths bounded, attribute types ∈ `CKA_*`);
   policy booleans stay diagnostic-only.
-- Slice 2 — semantic state keyed by `(process, module, session)`; profile JSON gains
-  `modules[]`; one run observes every module in scope (proxy → backend attribution).
+- Slice 2 — per-module `mechanisms`/`sessions` sections in the profile JSON (the state key
+  itself is `(process, module, session)` from slice 1b, §4.13).
 - Slice 2 — ring/epoll wait, larger default ring, compact `Event` for the safe policy,
   refund of the semantic key budget, trace filters/JSONL, periodic snapshots.
 - Slice 3 — module split of `attach.rs`/evidence plumbing, `serde(flatten)` evidence, typed

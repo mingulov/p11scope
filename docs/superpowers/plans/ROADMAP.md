@@ -372,6 +372,15 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
   git history; reasoning in the spec §4.11 and §10.6). Object identity becomes hash-pinned
   (SHA-256 once, `fstat` change detection). CLI drops `--provenance-module`,
   `--trusted-workload`, the `p11scope discover` subcommand and exit code 78. CI skeleton.
+  **Status (2026-08-15): landed on branch `productization/slice1a` (b8e4fc3..9cf2dee, 20
+  commits; lane removed in 263935a with the history note); −13,727 lines net across
+  `src`/`crates`/`tests`/`scripts` (2,798 added, 16,525 deleted). Verified: the four cargo
+  checks and the unprivileged suite green (all test binaries 0 failed, incl. 14 pinning tests,
+  10 artifact contracts). Root gates (`scripts/gates.sh`, matrix scripts, `build-release.sh`,
+  `bench-overhead.sh`): UNRUN (no owner approval for sudo/docker/kind in this environment).
+  CI e2e: PENDING first push. Follow-ups noted for 1b: re-measure the `--cgroup` minimum
+  (`verify-fork-scope.sh` still over-grants CAP_LEASE), one privileged `--cgroup` smoke after
+  the `_cgroup_file` removal, prune the now-unused root `p11scope-discover` dev-dependency.**
 - **Slice 1b — discovery engine and commands**: memory-scan + loader/export-hook discovery,
   `run`, `inspect`, `doctor`, `--module` optional, schema v2. Plan written after 1a lands.
 - **Slice 2 — capture quality**: ring/epoll, budgets, safe-policy params, per-module profile

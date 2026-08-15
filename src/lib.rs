@@ -1,6 +1,7 @@
 //! p11scope — non-interposing PKCS#11 observer (eBPF uprobes).
 
 pub mod attach;
+pub mod cli;
 pub mod discover_cmd;
 pub mod discovery;
 pub mod events;

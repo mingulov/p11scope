@@ -491,8 +491,9 @@ fn capture_trace(
     // bad `-o` path fails early, then appended to as lines arrive.
     let mut out_sink = match out {
         Some(path) => Some(
-            std::fs::File::create(path)
-                .with_context(|| format!("creating trace output {}", path.display()))?,
+            p11scope::output::create_private_stream(path)
+                .map_err(anyhow::Error::msg)
+                .context("creating trace output")?,
         ),
         None => None,
     };

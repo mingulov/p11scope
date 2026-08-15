@@ -196,6 +196,30 @@ impl Drop for AtomicFile {
     }
 }
 
+/// Opens (creating/truncating) a private regular file for an appended line
+/// stream — trace `-o`, which streams lines as they arrive and so cannot be
+/// published atomically like `AtomicFile`. O_NOFOLLOW on the final component
+/// (a planted symlink at the target is refused, not followed), mode 0600, and
+/// the opened descriptor must be a regular file (no FIFOs or devices).
+pub fn create_private_stream(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("opening output {} failed: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("checking output {} failed: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("output {} is not a regular file", path.display()));
+    }
+    Ok(file)
+}
+
 fn normalize_output_path(path: PathBuf) -> Result<PathBuf, String> {
     let absolute = if path.is_absolute() {
         path
@@ -314,6 +338,32 @@ fn unlinkat(directory: &std::fs::File, name: &CString) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn private_stream_refuses_a_symlinked_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"do not touch").unwrap();
+        let link = dir.path().join("trace.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(create_private_stream(&link).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not touch");
+    }
+
+    #[test]
+    fn private_stream_creates_0600_and_truncates_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace.log");
+        let mut file = create_private_stream(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::io::Write::write_all(&mut file, b"first").unwrap();
+        drop(file);
+        drop(create_private_stream(&path).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+    }
 
     #[test]
     fn commit_publishes_atomically_and_replaces_stale_content() {

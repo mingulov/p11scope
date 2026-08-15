@@ -1,8 +1,8 @@
 //! Loading and attaching. One selected entry uprobe + one uretprobe serve
 //! each slot; the attach cookie carries the slot index.
 
+use crate::discovery::identity::PinnedObjects;
 use crate::plan::AttachPlan;
-use crate::verify::VerifiedObjects;
 use anyhow::{Context as _, Result, anyhow, bail};
 use aya::Ebpf;
 use aya::maps::{Array, HashMap, Map, MapType, ProgramArray};
@@ -187,8 +187,6 @@ pub struct Session {
     attached: usize,
     policy: CapturePolicy,
     fork_attached: bool,
-    _config: u64,
-    _cgroup_file: Option<std::fs::File>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -494,33 +492,39 @@ impl Session {
     pub fn start(
         plan: &AttachPlan,
         scope: &Scope,
-        objects: &VerifiedObjects,
+        objects: &PinnedObjects,
         policy: CapturePolicy,
     ) -> Result<Self> {
-        objects
-            .ensure_stable()
-            .map_err(anyhow::Error::msg)
-            .context("checking authorized provider objects before attach")?;
+        if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
+            bail!(
+                "a pinned provider object changed before attach; refusing to observe changed bytes"
+            );
+        }
         let session = Self::start_inner(plan, scope, objects, policy)
             .map_err(|e| anyhow!("{e:#}\n{UNSUPPORTED_ENV_HINT}"))?;
-        objects
-            .ensure_stable()
-            .map_err(anyhow::Error::msg)
-            .context("checking authorized provider objects after attach")?;
+        // The error path drops `session`, which detaches every probe.
+        if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
+            bail!(
+                "a pinned provider object changed while attaching; refusing to observe changed bytes"
+            );
+        }
         Ok(session)
     }
 
     fn start_inner(
         plan: &AttachPlan,
         scope: &Scope,
-        objects: &VerifiedObjects,
+        objects: &PinnedObjects,
         policy: CapturePolicy,
     ) -> Result<Self> {
         if policy.uses_unsafe_decoders() && !cfg!(feature = "unsafe-unvalidated-metadata") {
             bail!("unsafe-unvalidated-metadata policy is absent from this eBPF object");
         }
         let mut ebpf = Ebpf::load(crate::EBPF_OBJECT).context("loading BPF object")?;
-        let published_scope = crate::scope::publish(&mut ebpf, scope, policy)
+        // Held until this function returns: the CGROUP_FILTER array holds the
+        // kernel-side cgroup reference, so the descriptor itself is only needed
+        // while publishing and attaching.
+        let _published_scope = crate::scope::publish(&mut ebpf, scope, policy)
             .context("publishing scope and capture policy")?;
         publish_slot_semantics(&mut ebpf, plan).context("publishing SLOT_SEMANTICS")?;
         publish_async_catalog(&mut ebpf).context("publishing ASYNC_FUNCTIONS")?;
@@ -671,8 +675,6 @@ impl Session {
             attached,
             policy,
             fork_attached,
-            _config: published_scope.config,
-            _cgroup_file: published_scope.cgroup_file,
         })
     }
 

@@ -4,42 +4,30 @@
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use p11scope::attach::{CapturePolicy, Scope, Session};
-use p11scope::{
-    discover_cmd, events, metrics, plan, process, render, scope, semantics, trace, verify,
-};
+use p11scope::cli::{self, CliError, Kind, ScopeArg};
+use p11scope::discovery::identity::{PinnedObjects, pin_manifest_objects};
+use p11scope::manifest_input::read_manifest;
+use p11scope::output::AtomicFile;
+use p11scope::{events, metrics, plan, process, render, scope, semantics, trace};
 use p11scope_manifest::manifest::{Manifest, SCHEMA};
 use std::io::{Seek as _, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const USAGE: &str = "usage:\n  \
-p11scope profile --manifest <m.json> --provenance-module <provider.so> (--pid <n> | --cgroup <path>) [--trusted-workload] [--mode profile|metrics] [--unsafe-unvalidated-metadata] [--duration <secs>] [-o <out.json>]\n  \
-p11scope trace --manifest <m.json> --provenance-module <provider.so> (--pid <n> | --cgroup <path>) [--trusted-workload] [--unsafe-unvalidated-metadata] [--duration <secs>] [-o <out.file>]\n  \
-p11scope discover --module <provider.so> [-o <manifest.json>]\n\n\
-note: --mode defaults to profile (metrics + mechanisms/sessions/logins from\n\
-the event stream); --mode metrics is the lighter, maps-only level.\n\
-note: trace prints one line per completed call as it happens, in arrival\n\
-order, instead of aggregating; --duration bounds it, same as profile. If\n\
-omitted, trace streams until interrupted (Ctrl-C) or the process exits.\n\
-note: Ctrl-C (SIGINT) ends either subcommand's capture cleanly: polling\n\
-stops, the final frame prints, and (with -o) the report is written —\n\
-same as --duration elapsing. --duration remains the only way to bound a\n\
-capture that runs unattended.\n\
-note: --cgroup matches that cgroup and every descendant cgroup beneath it\n\
-(kernel >= 5.15 due to attach cookies), so a container or pod directory works\n\
-even though its processes live in a nested child cgroup. Sibling cgroups\n\
-(anything not under the given path) are never matched. The path must be\n\
-under /sys/fs/cgroup.";
+/// Both operator stop signals end a capture the same clean way. SIGTERM is
+/// what a supervisor (systemd, a container runtime, `timeout`) sends, and
+/// its default disposition would kill the process mid-write.
+const STOP_SIGNALS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGTERM];
 
-/// Installs a SIGINT handler that only ever sets an `AtomicBool` —
+/// Installs handlers that only ever set an `AtomicBool` —
 /// `signal_hook::flag::register` is itself the signal-safe minimum a raw
 /// handler may do (no allocation, no I/O, no locks). Every capture loop
 /// polls this flag cooperatively, the same way it already polls
-/// `--duration` elapsing, so Ctrl-C ends a capture the same clean way:
-/// stop polling, print the final frame, write `-o` if given — never
-/// torn down mid-write.
+/// `--duration` elapsing, so Ctrl-C (or SIGTERM) ends a capture the same
+/// clean way: stop polling, print the final frame, write `-o` if given —
+/// never torn down mid-write.
 ///
 /// Chose `signal-hook` over a hand-rolled `libc::signal` handler: this
 /// is exactly the "self-pipe/flag" pattern signal-hook exists for, its
@@ -49,20 +37,21 @@ under /sys/fs/cgroup.";
 /// Hand-rolling it correctly means getting async-signal-safety right
 /// with no compiler help; reusing it means getting it right by
 /// construction.
-fn install_sigint_flag() -> Result<Arc<AtomicBool>> {
+fn install_stop_flag() -> Result<Arc<AtomicBool>> {
     let flag = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&flag))
-        .context("installing SIGINT handler")?;
+    for signal in STOP_SIGNALS {
+        signal_hook::flag::register(signal, Arc::clone(&flag))
+            .with_context(|| format!("installing handler for signal {signal}"))?;
+    }
     Ok(flag)
 }
 
-/// Whether a capture loop should stop this tick: interrupted (Ctrl-C) or
-/// `--duration` elapsed. A pure function so the interrupt path is
+/// Whether a capture loop should stop this tick: interrupted (Ctrl-C or
+/// SIGTERM) or `--duration` elapsed. A pure function so the stop path is
 /// directly testable without sending a real signal — set the flag,
 /// confirm this returns `true` regardless of `elapsed`/`duration`.
-fn should_stop(interrupted: &AtomicBool, elapsed: Duration, duration: Option<u64>) -> bool {
-    interrupted.load(Ordering::Relaxed)
-        || duration.is_some_and(|d| elapsed >= Duration::from_secs(d))
+fn should_stop(interrupted: &AtomicBool, elapsed: Duration, duration: Option<Duration>) -> bool {
+    interrupted.load(Ordering::Relaxed) || duration.is_some_and(|d| elapsed >= d)
 }
 
 fn main() {
@@ -75,130 +64,114 @@ fn main() {
 fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        Some("profile") => cmd_profile(args),
-        Some("trace") => cmd_trace(args),
-        Some("discover") => cmd_discover(args),
+        Some("profile") => cmd_capture(Kind::Profile, args),
+        Some("trace") => cmd_capture(Kind::Trace, args),
+        Some("discover") => {
+            eprintln!(
+                "`p11scope discover` was removed: run `p11scope-discover --module <provider.so> \
+                 -o <manifest.json>` (offline helper; executes provider code)\n{}",
+                cli::USAGE
+            );
+            std::process::exit(2);
+        }
         Some("--help") | Some("-h") => {
-            eprintln!("{USAGE}");
+            eprintln!("{}", cli::USAGE);
             Ok(())
         }
         other => {
             eprintln!(
-                "unknown or missing subcommand: {}\n{USAGE}",
-                other.unwrap_or("(none)")
+                "unknown or missing subcommand: {}\n{}",
+                other.unwrap_or("(none)"),
+                cli::USAGE
             );
             std::process::exit(2);
         }
     }
 }
 
-fn cmd_discover(args: impl Iterator<Item = String>) -> Result<()> {
-    let args: Vec<_> = args.collect();
-    if args
-        .iter()
-        .any(|arg| arg == "--unsafe-unvalidated-metadata")
-    {
-        CapturePolicy::from_cli(
-            "discover",
-            true,
-            cfg!(feature = "unsafe-unvalidated-metadata"),
-        )?;
-    }
-    discover_cmd::run(args.into_iter())
-}
-
-/// Pulls the value for a flag out of the argument stream, or exits 2 with
-/// the Phase 1a convention (`<flag> requires a value`) when it is missing.
-fn require_value(args: &mut impl Iterator<Item = String>, flag: &str) -> String {
-    match args.next() {
-        Some(v) => v,
-        None => {
-            eprintln!("{flag} requires a value\n{USAGE}");
+/// Both capture subcommands: parse, decide the policy, pin the manifest's
+/// objects, install the stop flag, then run the loop `kind` selects.
+fn cmd_capture(kind: Kind, args: impl Iterator<Item = String>) -> Result<()> {
+    let a = match cli::parse_capture(kind, args) {
+        Ok(a) => a,
+        Err(CliError::Help) => {
+            eprintln!("{}", cli::USAGE);
+            return Ok(());
+        }
+        Err(CliError::Usage(msg)) => {
+            eprintln!("{msg}");
             std::process::exit(2);
         }
+    };
+    let mode = match (kind, a.metrics) {
+        (Kind::Trace, _) => "trace",
+        (Kind::Profile, true) => "metrics",
+        (Kind::Profile, false) => "profile",
+    };
+    let policy = CapturePolicy::from_cli(
+        mode,
+        a.unsafe_requested,
+        cfg!(feature = "unsafe-unvalidated-metadata"),
+    )?;
+    let scope = match &a.scope {
+        ScopeArg::Pid(p) => Scope::Pid(*p),
+        ScopeArg::Cgroup(c) => Scope::Cgroup {
+            id: scope::cgroup_id(c)?,
+            path: c.clone(),
+        },
+    };
+    if kind == Kind::Trace && a.duration.is_none() {
+        eprintln!(
+            "p11scope: no --duration given; trace streams until interrupted (Ctrl-C) or the \
+             process exits"
+        );
+    }
+    warn_unsafe_policy(policy);
+    let (manifest, plan, pinned) = load_plan(&a.manifest)?;
+    let stop = install_stop_flag()?;
+    match kind {
+        Kind::Profile => capture_profile(
+            manifest,
+            plan,
+            scope,
+            policy,
+            a.duration,
+            a.out.as_deref(),
+            &pinned,
+            &stop,
+        ),
+        Kind::Trace => capture_trace(
+            plan,
+            scope,
+            policy,
+            a.duration,
+            a.out.as_deref(),
+            &pinned,
+            &stop,
+        ),
     }
 }
 
-/// Pulls `(pid, cgroup)` apart into the one `Scope` the CLI contract
-/// allows — shared by every subcommand that attaches. Exits 2 with the
-/// usual usage message on zero or both being set.
-fn resolve_scope(pid: Option<u32>, cgroup: Option<PathBuf>) -> Result<Scope> {
-    match (pid, cgroup) {
-        (Some(p), None) => Ok(Scope::Pid(p)),
-        (None, Some(c)) => Ok(Scope::Cgroup {
-            id: scope::cgroup_id(&c)?,
-            path: c,
-        }),
-        (None, None) => {
-            eprintln!("exactly one of --pid or --cgroup is required\n{USAGE}");
-            std::process::exit(2);
-        }
-        (Some(_), Some(_)) => {
-            eprintln!("--pid and --cgroup are mutually exclusive\n{USAGE}");
-            std::process::exit(2);
-        }
-    }
-}
-
-/// Loads and verifies the manifest, then builds the attach plan — shared
-/// by every subcommand that attaches (`profile`, `trace`).
-fn load_plan(
-    manifest_path: &std::path::Path,
-    provenance_module: &std::path::Path,
-    scope: &Scope,
-    trusted_workload: bool,
-) -> Result<(
-    Manifest,
-    plan::AttachPlan,
-    verify::VerifiedObjects,
-    discover_cmd::OracleSelection,
-)> {
-    let text = verify::read_manifest(manifest_path)
+/// Reads and pins the manifest, then builds the attach plan — shared by
+/// both capture subcommands.
+fn load_plan(manifest_path: &Path) -> Result<(Manifest, plan::AttachPlan, PinnedObjects)> {
+    let text = read_manifest(manifest_path)
         .map_err(|error| anyhow!("reading manifest {}: {error}", manifest_path.display()))?;
     let manifest: Manifest = serde_json::from_str(&text)
         .with_context(|| format!("parsing manifest {}", manifest_path.display()))?;
     if manifest.schema != SCHEMA {
         bail!(
             "manifest schema mismatch: got {:?}, this build expects {SCHEMA:?}; \
-             rerun `p11scope discover` to rediscover the module",
+             rerun `p11scope-discover` to rediscover the module",
             manifest.schema
         );
     }
-    let objects = verify::check_reuse(&manifest).map_err(|problems| {
+    let pinned = pin_manifest_objects(&manifest).map_err(|problems| {
         for problem in &problems {
             eprintln!("p11scope: {problem}");
         }
         anyhow!("manifest does not match the current files; refusing to attach")
     })?;
-    let oracle = discover_cmd::select_oracle(scope, trusted_workload)
-        .context("selecting the discovery oracle authority")?;
-    oracle
-        .revalidate()
-        .context("revalidating the observed process before fresh discovery")?;
-    let discovered =
-        discover_cmd::rediscover_stable(provenance_module, &oracle).with_context(|| {
-            format!(
-                "verifying manifest against fresh discovery of {}",
-                provenance_module.display()
-            )
-        })?;
-    verify::check_provenance(&manifest, discovered.manifest()).map_err(|problems| {
-        for problem in &problems {
-            eprintln!("p11scope: {problem}");
-        }
-        anyhow!("manifest provenance was not reproduced; refusing to attach")
-    })?;
-    discovered
-        .ensure_stable()
-        .context("checking provenance closure after manifest comparison")?;
-    objects
-        .ensure_stable()
-        .map_err(anyhow::Error::msg)
-        .context("checking authorized provider objects after provenance discovery")?;
-    oracle
-        .revalidate()
-        .context("revalidating the observed process after provenance comparison")?;
-
     let plan = plan::build(&manifest);
     if plan.slots.is_empty() {
         bail!(
@@ -207,7 +180,7 @@ fn load_plan(
         );
     }
     plan::ensure_capacity(&plan).map_err(|error| anyhow!(error))?;
-    Ok((manifest, plan, objects, oracle))
+    Ok((manifest, plan, pinned))
 }
 
 /// Prints every attach failure — shared by `profile` and `trace`, which
@@ -239,29 +212,6 @@ fn report_attach_failures(session: &Session) {
             );
         }
     }
-}
-
-fn start_authorized_session(
-    plan: &plan::AttachPlan,
-    scope: &Scope,
-    objects: &verify::VerifiedObjects,
-    policy: CapturePolicy,
-    oracle: &discover_cmd::OracleSelection,
-) -> Result<Session> {
-    oracle
-        .revalidate()
-        .context("revalidating the observed process before attach")?;
-    let session =
-        Session::start(plan, scope, objects, policy).context("starting attach session")?;
-    oracle
-        .revalidate()
-        .context("revalidating the observed process after attach")?;
-    objects
-        .verify_stable()
-        .map_err(anyhow::Error::msg)
-        .context("rechecking authorized provider objects after attach")?;
-    report_attach_failures(&session);
-    Ok(session)
 }
 
 /// Gives unsafe rendering the same diagnostic shape expectations that
@@ -333,100 +283,30 @@ fn observe_fork(
     true
 }
 
-fn cmd_profile(mut args: impl Iterator<Item = String>) -> Result<()> {
-    let mut manifest_path: Option<PathBuf> = None;
-    let mut provenance_module: Option<PathBuf> = None;
-    let mut pid: Option<u32> = None;
-    let mut cgroup: Option<PathBuf> = None;
-    let mut mode = "profile".to_string();
-    let mut duration: Option<u64> = None;
-    let mut out: Option<PathBuf> = None;
-    let mut unsafe_requested = false;
-    let mut trusted_workload = false;
-
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--manifest" => manifest_path = Some(require_value(&mut args, "--manifest").into()),
-            "--provenance-module" => {
-                provenance_module = Some(require_value(&mut args, "--provenance-module").into())
-            }
-            "--pid" => {
-                let v = require_value(&mut args, "--pid");
-                pid = Some(
-                    v.parse()
-                        .with_context(|| format!("--pid: invalid number {v:?}"))?,
-                );
-            }
-            "--cgroup" => cgroup = Some(require_value(&mut args, "--cgroup").into()),
-            "--mode" => mode = require_value(&mut args, "--mode"),
-            "--duration" => {
-                let v = require_value(&mut args, "--duration");
-                duration = Some(
-                    v.parse()
-                        .with_context(|| format!("--duration: invalid number {v:?}"))?,
-                );
-            }
-            "-o" => out = Some(require_value(&mut args, "-o").into()),
-            "--trusted-workload" => trusted_workload = true,
-            "--unsafe-unvalidated-metadata" => unsafe_requested = true,
-            "--help" | "-h" => {
-                eprintln!("{USAGE}");
-                return Ok(());
-            }
-            other => {
-                eprintln!("unknown argument: {other}\n{USAGE}");
-                std::process::exit(2);
-            }
-        }
-    }
-
-    if mode != "profile" && mode != "metrics" {
-        bail!("mode {mode} not implemented in this phase");
-    }
-    let policy = CapturePolicy::from_cli(
-        &mode,
-        unsafe_requested,
-        cfg!(feature = "unsafe-unvalidated-metadata"),
-    )?;
-
-    let Some(manifest_path) = manifest_path else {
-        eprintln!("--manifest is required\n{USAGE}");
-        std::process::exit(2);
-    };
-    let Some(provenance_module) = provenance_module else {
-        eprintln!("--provenance-module is required\n{USAGE}");
-        std::process::exit(2);
-    };
-    let scope = resolve_scope(pid, cgroup)?;
-    warn_unsafe_policy(policy);
-    let signals = verify::CaptureSignals::block().map_err(anyhow::Error::msg)?;
-    let (manifest, plan, objects, oracle) =
-        load_plan(&manifest_path, &provenance_module, &scope, trusted_workload)?;
-    let output = verify::SupervisorOutput::profile(out).map_err(anyhow::Error::msg)?;
-    let outcome = verify::supervise_capture(signals, objects, output, move |worker| {
-        capture_profile(manifest, plan, scope, policy, duration, oracle, worker)
-            .map_err(|error| format!("{error:#}"))
-    })
-    .map_err(anyhow::Error::msg)?;
-    finish_supervised_capture(outcome)
-}
-
+#[allow(clippy::too_many_arguments)]
 fn capture_profile(
     manifest: Manifest,
     plan: plan::AttachPlan,
     scope: Scope,
     policy: CapturePolicy,
-    duration: Option<u64>,
-    oracle: discover_cmd::OracleSelection,
-    worker: &mut verify::WorkerContext,
+    duration: Option<Duration>,
+    out: Option<&Path>,
+    pinned: &PinnedObjects,
+    interrupted: &AtomicBool,
 ) -> Result<()> {
-    let interrupted = install_sigint_flag()?;
-    worker
-        .unblock_operator_signals()
+    // Created before the attach so a bad `-o` path fails early, published
+    // by `commit()` only once the final report is written.
+    let output = out
+        .map(AtomicFile::create)
+        .transpose()
         .map_err(anyhow::Error::msg)?;
-    let (stdout, output, objects) = worker.output_parts();
     let has_output = output.is_some();
-    let mut session = start_authorized_session(&plan, &scope, objects, policy, &oracle)?;
+    let mut stdout_sink = std::io::stdout().lock();
+    let stdout: &mut dyn Write = &mut stdout_sink;
+    let mut provider_changed = false;
+    let mut session =
+        Session::start(&plan, &scope, pinned, policy).context("starting attach session")?;
+    report_attach_failures(&session);
     let profile = policy.uses_events();
     let mode = if profile { "profile" } else { "metrics" };
 
@@ -461,13 +341,12 @@ fn capture_profile(
     let wall_start = SystemTime::now();
     let clock = Instant::now();
     loop {
-        objects
-            .ensure_stable()
-            .map_err(anyhow::Error::msg)
-            .context("authorized provider object changed during capture")?;
+        if !pinned.check_unchanged().map_err(anyhow::Error::msg)? {
+            provider_changed = true;
+        }
         let elapsed = clock.elapsed();
         retire_exited(&mut process_tracker, &mut state);
-        if should_stop(&interrupted, elapsed, duration) {
+        if should_stop(interrupted, elapsed, duration) {
             break;
         }
         if profile {
@@ -486,12 +365,12 @@ fn capture_profile(
             process_tracker.evidence(),
             malformed_records,
             &state,
+            provider_changed,
         );
         let frame = render::live(&reports, &ev, elapsed, &manifest.module_path, mode, policy);
-        objects
-            .ensure_stable()
-            .map_err(anyhow::Error::msg)
-            .context("authorized provider object changed during capture")?;
+        if !pinned.check_unchanged().map_err(anyhow::Error::msg)? {
+            provider_changed = true;
+        }
         write_stdout(
             stdout,
             &mut stdout_open,
@@ -505,10 +384,9 @@ fn capture_profile(
     }
 
     session.detach_producers()?;
-    objects
-        .ensure_stable()
-        .map_err(anyhow::Error::msg)
-        .context("authorized provider object changed during capture")?;
+    if !pinned.check_unchanged().map_err(anyhow::Error::msg)? {
+        provider_changed = true;
+    }
     if profile {
         malformed_records += drain_events(&mut session, &mut state, &mut process_tracker)?;
     }
@@ -518,6 +396,11 @@ fn capture_profile(
     if !profile {
         kernel_evidence.ring_loss = 0;
     }
+    // Last look before the evidence that the final frame and the `-o` report
+    // are built from, so an in-place provider change is reflected in both.
+    if !pinned.check_unchanged().map_err(anyhow::Error::msg)? {
+        provider_changed = true;
+    }
     let mut ev = evidence_for(
         &plan,
         &session,
@@ -526,6 +409,7 @@ fn capture_profile(
         process_tracker.evidence(),
         malformed_records,
         &state,
+        provider_changed,
     );
     ev.mark_terminal_drain_unproven();
     let frame = render::live(
@@ -536,10 +420,6 @@ fn capture_profile(
         mode,
         policy,
     );
-    objects
-        .ensure_stable()
-        .map_err(anyhow::Error::msg)
-        .context("authorized provider object changed during capture")?;
     write_stdout(
         stdout,
         &mut stdout_open,
@@ -547,7 +427,7 @@ fn capture_profile(
     )?;
     flush_stdout(stdout, &mut stdout_open)?;
 
-    if let Some(out_file) = output.as_mut() {
+    if let Some(mut out_file) = output {
         let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
             .unwrap_or_default()
             .trim()
@@ -572,15 +452,11 @@ fn capture_profile(
         } else {
             render::json(&reports, &ev, &capture)
         };
-        objects
-            .ensure_stable()
-            .map_err(anyhow::Error::msg)
-            .context("authorized provider object changed during capture")?;
-        write_json_report(out_file, &j)?;
+        write_json_report(out_file.file(), &j)?;
+        out_file.commit().map_err(anyhow::Error::msg)?;
     }
 
     drop(session);
-    drop(oracle);
     Ok(())
 }
 
@@ -602,99 +478,31 @@ fn write_json_report(file: &mut std::fs::File, j: &serde_json::Value) -> Result<
 /// subcommand rather than a `--mode` — its transport (drain-and-print
 /// every tick, no periodic full-screen redraw) and time-bounding differ
 /// enough that folding it into `profile`'s loop would tangle both.
-fn cmd_trace(mut args: impl Iterator<Item = String>) -> Result<()> {
-    let mut manifest_path: Option<PathBuf> = None;
-    let mut provenance_module: Option<PathBuf> = None;
-    let mut pid: Option<u32> = None;
-    let mut cgroup: Option<PathBuf> = None;
-    let mut duration: Option<u64> = None;
-    let mut out: Option<PathBuf> = None;
-    let mut unsafe_requested = false;
-    let mut trusted_workload = false;
-
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--manifest" => manifest_path = Some(require_value(&mut args, "--manifest").into()),
-            "--provenance-module" => {
-                provenance_module = Some(require_value(&mut args, "--provenance-module").into())
-            }
-            "--pid" => {
-                let v = require_value(&mut args, "--pid");
-                pid = Some(
-                    v.parse()
-                        .with_context(|| format!("--pid: invalid number {v:?}"))?,
-                );
-            }
-            "--cgroup" => cgroup = Some(require_value(&mut args, "--cgroup").into()),
-            "--duration" => {
-                let v = require_value(&mut args, "--duration");
-                duration = Some(
-                    v.parse()
-                        .with_context(|| format!("--duration: invalid number {v:?}"))?,
-                );
-            }
-            "-o" => out = Some(require_value(&mut args, "-o").into()),
-            "--trusted-workload" => trusted_workload = true,
-            "--unsafe-unvalidated-metadata" => unsafe_requested = true,
-            "--help" | "-h" => {
-                eprintln!("{USAGE}");
-                return Ok(());
-            }
-            other => {
-                eprintln!("unknown argument: {other}\n{USAGE}");
-                std::process::exit(2);
-            }
-        }
-    }
-
-    let policy = CapturePolicy::from_cli(
-        "trace",
-        unsafe_requested,
-        cfg!(feature = "unsafe-unvalidated-metadata"),
-    )?;
-
-    let Some(manifest_path) = manifest_path else {
-        eprintln!("--manifest is required\n{USAGE}");
-        std::process::exit(2);
-    };
-    let Some(provenance_module) = provenance_module else {
-        eprintln!("--provenance-module is required\n{USAGE}");
-        std::process::exit(2);
-    };
-    if duration.is_none() {
-        eprintln!(
-            "p11scope: no --duration given; trace streams until interrupted (Ctrl-C) or the \
-             process exits"
-        );
-    }
-    let scope = resolve_scope(pid, cgroup)?;
-    warn_unsafe_policy(policy);
-    let signals = verify::CaptureSignals::block().map_err(anyhow::Error::msg)?;
-    let (_manifest, plan, objects, oracle) =
-        load_plan(&manifest_path, &provenance_module, &scope, trusted_workload)?;
-    let output = verify::SupervisorOutput::trace(out, policy).map_err(anyhow::Error::msg)?;
-    let outcome = verify::supervise_capture(signals, objects, output, move |worker| {
-        capture_trace(plan, scope, policy, duration, oracle, worker)
-            .map_err(|error| format!("{error:#}"))
-    })
-    .map_err(anyhow::Error::msg)?;
-    finish_supervised_capture(outcome)
-}
-
 fn capture_trace(
     plan: plan::AttachPlan,
     scope: Scope,
     policy: CapturePolicy,
-    duration: Option<u64>,
-    oracle: discover_cmd::OracleSelection,
-    worker: &mut verify::WorkerContext,
+    duration: Option<Duration>,
+    out: Option<&Path>,
+    pinned: &PinnedObjects,
+    interrupted: &AtomicBool,
 ) -> Result<()> {
-    let interrupted = install_sigint_flag()?;
-    worker
-        .unblock_operator_signals()
-        .map_err(anyhow::Error::msg)?;
-    let (stdout, out_file, objects) = worker.output_parts();
-    let mut session = start_authorized_session(&plan, &scope, objects, policy, &oracle)?;
+    // A line stream, not a published artifact: created before the attach so a
+    // bad `-o` path fails early, then appended to as lines arrive.
+    let mut out_sink = match out {
+        Some(path) => Some(
+            std::fs::File::create(path)
+                .with_context(|| format!("creating trace output {}", path.display()))?,
+        ),
+        None => None,
+    };
+    let out_file = &mut out_sink;
+    let mut stdout_sink = std::io::stdout().lock();
+    let stdout: &mut dyn Write = &mut stdout_sink;
+    let mut provider_changed = false;
+    let mut session =
+        Session::start(&plan, &scope, pinned, policy).context("starting attach session")?;
+    report_attach_failures(&session);
 
     let mut state = semantics::State::with_policy(&plan, policy);
     let mut process_tracker = process::Tracker::new();
@@ -714,12 +522,11 @@ fn capture_trace(
         out_file,
     )?;
     loop {
-        objects
-            .ensure_stable()
-            .map_err(anyhow::Error::msg)
-            .context("authorized provider object changed during capture")?;
+        if !pinned.check_unchanged().map_err(anyhow::Error::msg)? {
+            provider_changed = true;
+        }
         let elapsed = clock.elapsed();
-        if should_stop(&interrupted, elapsed, duration) {
+        if should_stop(interrupted, elapsed, duration) {
             break;
         }
         malformed_records += drain_trace_events(
@@ -732,10 +539,9 @@ fn capture_trace(
             out_file,
         )?;
         retire_exited(&mut process_tracker, &mut state);
-        objects
-            .ensure_stable()
-            .map_err(anyhow::Error::msg)
-            .context("authorized provider object changed during capture")?;
+        if !pinned.check_unchanged().map_err(anyhow::Error::msg)? {
+            provider_changed = true;
+        }
         report_trace_loss(
             &session,
             &mut last_reported_loss,
@@ -767,10 +573,9 @@ fn capture_trace(
         out_file,
     )?;
     retire_exited(&mut process_tracker, &mut state);
-    objects
-        .ensure_stable()
-        .map_err(anyhow::Error::msg)
-        .context("authorized provider object changed during capture")?;
+    if !pinned.check_unchanged().map_err(anyhow::Error::msg)? {
+        provider_changed = true;
+    }
     report_trace_loss(
         &session,
         &mut last_reported_loss,
@@ -779,6 +584,11 @@ fn capture_trace(
         out_file,
     )?;
     let reports = metrics::read(&session, &plan)?;
+    // Last look before the evidence line the trace ends with, so an in-place
+    // provider change is reflected in it.
+    if !pinned.check_unchanged().map_err(anyhow::Error::msg)? {
+        provider_changed = true;
+    }
     let mut evidence = evidence_for(
         &plan,
         &session,
@@ -787,12 +597,9 @@ fn capture_trace(
         process_tracker.evidence(),
         malformed_records,
         &state,
+        provider_changed,
     );
     evidence.mark_terminal_drain_unproven();
-    objects
-        .ensure_stable()
-        .map_err(anyhow::Error::msg)
-        .context("authorized provider object changed during capture")?;
     emit_trace_line(
         &trace::evidence_line(&evidence, policy),
         stdout,
@@ -809,17 +616,7 @@ fn capture_trace(
     }
 
     drop(session);
-    drop(oracle);
     Ok(())
-}
-
-fn finish_supervised_capture(outcome: verify::SupervisorOutcome) -> Result<()> {
-    match outcome {
-        verify::SupervisorOutcome::Exited(0) => Ok(()),
-        verify::SupervisorOutcome::Exited(code) => std::process::exit(code),
-        verify::SupervisorOutcome::LeaseBroken => std::process::exit(verify::OBJECT_CHANGED_EXIT),
-        verify::SupervisorOutcome::Signaled(signal) => verify::mirror_worker_signal(signal),
-    }
 }
 
 /// Prints (and, if given, appends to the `-o` file) every rendered line.
@@ -930,6 +727,7 @@ fn report_trace_loss<W: Write>(
 /// (profile mode only — always 0 in metrics mode) the ring-buffer/semantic
 /// gap counters. Calls `.verdict()` itself before returning, so callers
 /// must not call it again.
+#[allow(clippy::too_many_arguments)]
 fn evidence_for(
     plan: &plan::AttachPlan,
     session: &Session,
@@ -938,6 +736,7 @@ fn evidence_for(
     tracking_evidence: process::TrackingEvidence,
     malformed_records: u64,
     state: &semantics::State,
+    provider_changed: bool,
 ) -> render::Evidence {
     let semantic = state.semantic_evidence();
     let mut ev = render::Evidence {
@@ -997,7 +796,7 @@ fn evidence_for(
         shape_decode_failures: state.shape_decode_failures(),
         shape_decode_total_failures: state.total_shape_decode_failures(),
         templates_truncated: state.templates_truncated(),
-        provider_changed: false, // wired to PinnedObjects::check_unchanged() in a later task
+        provider_changed,
         completeness: "UNKNOWN",
     };
     ev.verdict();
@@ -1033,49 +832,6 @@ mod tests {
     struct FailingWriter {
         kind: std::io::ErrorKind,
         fail_flush: bool,
-    }
-
-    #[test]
-    fn terminal_detach_precedes_snapshot_and_unproven_drain_mark_precedes_output() {
-        let source = include_str!("main.rs");
-        let profile = source
-            .split_once("fn capture_profile(")
-            .unwrap()
-            .1
-            .split_once("fn write_json_report(")
-            .unwrap()
-            .0;
-        let profile_detach = profile.rfind("session.detach_producers()?").unwrap();
-        let profile_drain = profile.rfind("drain_events(").unwrap();
-        let profile_maps = profile.rfind("metrics::read(").unwrap();
-        let profile_mark = profile.rfind("ev.mark_terminal_drain_unproven()").unwrap();
-        let profile_render = profile.rfind("let frame = render::live(").unwrap();
-        let profile_output = profile.rfind("write_json_report(").unwrap();
-        assert!(profile_detach < profile_drain);
-        assert!(profile_detach < profile_maps);
-        assert!(profile_drain < profile_maps);
-        assert!(profile_maps < profile_mark);
-        assert!(profile_mark < profile_render);
-        assert!(profile_render < profile_output);
-
-        let trace = source
-            .split_once("fn capture_trace(")
-            .unwrap()
-            .1
-            .split_once("fn finish_supervised_capture(")
-            .unwrap()
-            .0;
-        let trace_detach = trace.rfind("session.detach_producers()?").unwrap();
-        let trace_drain = trace.rfind("drain_trace_events(").unwrap();
-        let trace_maps = trace.rfind("metrics::read(").unwrap();
-        let trace_mark = trace
-            .rfind("evidence.mark_terminal_drain_unproven()")
-            .unwrap();
-        let trace_evidence = trace.rfind("trace::evidence_line(").unwrap();
-        assert!(trace_detach < trace_drain);
-        assert!(trace_drain < trace_maps);
-        assert!(trace_maps < trace_mark);
-        assert!(trace_mark < trace_evidence);
     }
 
     impl Write for FailingWriter {
@@ -1127,7 +883,7 @@ mod tests {
         assert!(!should_stop(
             &interrupted,
             Duration::from_secs(0),
-            Some(3600)
+            Some(Duration::from_secs(3600))
         ));
 
         interrupted.store(true, Ordering::Relaxed);
@@ -1136,7 +892,11 @@ mod tests {
             "no --duration set at all"
         );
         assert!(
-            should_stop(&interrupted, Duration::from_secs(0), Some(3600)),
+            should_stop(
+                &interrupted,
+                Duration::from_secs(0),
+                Some(Duration::from_secs(3600))
+            ),
             "must stop immediately even mid-way through a long --duration"
         );
     }
@@ -1144,8 +904,29 @@ mod tests {
     #[test]
     fn should_stop_still_honors_duration_elapsing_without_an_interrupt() {
         let interrupted = AtomicBool::new(false);
-        assert!(should_stop(&interrupted, Duration::from_secs(10), Some(5)));
-        assert!(!should_stop(&interrupted, Duration::from_secs(4), Some(5)));
+        assert!(should_stop(
+            &interrupted,
+            Duration::from_secs(10),
+            Some(Duration::from_secs(5))
+        ));
+        assert!(!should_stop(
+            &interrupted,
+            Duration::from_secs(4),
+            Some(Duration::from_secs(5))
+        ));
+    }
+
+    /// A real SIGTERM (raised in-process after the handler is installed) sets
+    /// the same stop flag Ctrl-C sets, so `should_stop` returns true on the
+    /// next tick instead of the default disposition killing the capture
+    /// mid-write.
+    #[test]
+    fn sigterm_sets_the_stop_flag() {
+        let stop = install_stop_flag().unwrap();
+        assert!(!should_stop(&stop, Duration::ZERO, None));
+        // SAFETY: raise() with a handled signal; the handler only sets an AtomicBool.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        assert!(should_stop(&stop, Duration::ZERO, None));
     }
 
     #[test]
@@ -1173,135 +954,66 @@ mod tests {
     }
 
     #[test]
-    fn manifest_v1_is_rejected_with_rediscovery_instruction() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("manifest-v1.json");
-        std::fs::write(
-            &path,
-            r#"{
-                "schema":"p11scope-manifest/1",
-                "module_path":"/opt/provider.so",
-                "objects":[],
-                "interface_list":{"status":"absent"},
-                "surfaces":[],
-                "vendor_interfaces":[],
-                "alias_groups":[]
-            }"#,
-        )
-        .unwrap();
-
-        let err = load_plan(&path, std::path::Path::new("/unused"), &Scope::Pid(1), true)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("rediscover"), "{err}");
+    fn manifest_v1_and_v2_are_rejected_with_rediscovery_instruction() {
+        for schema in ["p11scope-manifest/1", "p11scope-manifest/2"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("m.json");
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"schema":"{schema}","module_path":"/opt/p.so","objects":[],"interface_list":{{"status":"absent"}},"surfaces":[],"vendor_interfaces":[],"alias_groups":[]}}"#
+                ),
+            )
+            .unwrap();
+            let err = load_plan(&path).unwrap_err().to_string();
+            assert!(err.contains("rediscover"), "{err}");
+        }
     }
 
+    /// The finalization a stopped loop runs into: `-o` publication produces
+    /// valid JSON and replaces stale content atomically (adapted from the
+    /// previous shutdown-path test).
     #[test]
-    fn manifest_v2_is_rejected_with_rediscovery_instruction() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("manifest-v2.json");
-        std::fs::write(
-            &path,
-            r#"{
-                "schema":"p11scope-manifest/2",
-                "module_path":"/opt/provider.so",
-                "objects":[{"id":0,"path":"/opt/provider.so","identity":{"kind":"gnu_build_id","value":"aa","reusable":true,"note":null}}],
-                "interface_list":{"status":"absent"},
-                "surfaces":[],
-                "vendor_interfaces":[],
-                "alias_groups":[]
-            }"#,
-        )
-        .unwrap();
-
-        let err = load_plan(&path, std::path::Path::new("/unused"), &Scope::Pid(1), true)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("rediscover"), "{err}");
-    }
-
-    /// The finalization a stopped loop runs into (profile's `-o` write)
-    /// succeeds and produces valid JSON — exercised directly, standing in
-    /// for "Ctrl-C a capture, confirm -o has valid JSON" without a real
-    /// attach session (that part needs root + a real kernel; see the
-    /// manual check documented in the phase report).
-    #[test]
-    fn policy_output_shutdown_path_replaces_a_file_with_valid_json() {
+    fn shutdown_path_publishes_valid_json_over_a_stale_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("observed.json");
+        std::fs::write(&path, b"stale trailing bytes that must disappear").unwrap();
         let j = serde_json::json!({"schema": "pkcs11-scope/observed-profile/v1.4", "evidence": {}});
-
-        let mut file = std::fs::File::create(&path).unwrap();
-        file.write_all(b"stale trailing bytes that must disappear")
-            .unwrap();
-        write_json_report(&mut file, &j).expect("shutdown finalization must write the report");
-
-        let written = std::fs::read_to_string(&path).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
+        let mut out = AtomicFile::create(&path).unwrap();
+        write_json_report(out.file(), &j).expect("shutdown finalization must write the report");
+        out.commit().unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(parsed["schema"], "pkcs11-scope/observed-profile/v1.4");
     }
 
+    /// The unsafe policy is refused by `CapturePolicy::from_cli` on the parsed
+    /// arguments alone — before the manifest path is ever opened.
     #[cfg(not(feature = "unsafe-unvalidated-metadata"))]
     #[test]
     fn policy_output_unsafe_flag_is_refused_before_manifest_loading() {
-        let error = cmd_profile(
+        let a = cli::parse_capture(
+            Kind::Profile,
             [
                 "--unsafe-unvalidated-metadata",
                 "--manifest",
                 "/definitely/not/a/manifest.json",
-                "--provenance-module",
-                "/definitely/not/a/provider.so",
                 "--pid",
                 "1",
             ]
             .into_iter()
             .map(str::to_string),
+        )
+        .unwrap();
+        let error = CapturePolicy::from_cli(
+            "profile",
+            a.unsafe_requested,
+            cfg!(feature = "unsafe-unvalidated-metadata"),
         )
         .unwrap_err();
         let rendered = format!("{error:#}");
         assert!(rendered.contains("Cargo feature"), "{rendered}");
         assert!(!rendered.contains("reading manifest"), "{rendered}");
-    }
-
-    #[test]
-    fn policy_output_profile_rejects_trace_mode_before_manifest_loading() {
-        let error = cmd_profile(
-            [
-                "--mode",
-                "trace",
-                "--manifest",
-                "/definitely/not/a/manifest.json",
-                "--provenance-module",
-                "/definitely/not/a/provider.so",
-                "--pid",
-                "1",
-            ]
-            .into_iter()
-            .map(str::to_string),
-        )
-        .unwrap_err();
-        let rendered = format!("{error:#}");
-        assert!(rendered.contains("mode trace"), "{rendered}");
-        assert!(!rendered.contains("reading manifest"), "{rendered}");
-    }
-
-    #[test]
-    fn policy_output_discover_rejects_unsafe_flag_before_helper_lookup() {
-        let error = cmd_discover(
-            [
-                "--unsafe-unvalidated-metadata",
-                "--module",
-                "/definitely/not/a/provider.so",
-                "--helper",
-                "/definitely/not/a/helper",
-            ]
-            .into_iter()
-            .map(str::to_string),
-        )
-        .unwrap_err();
-        let rendered = format!("{error:#}");
-        assert!(rendered.contains("discover does not accept"), "{rendered}");
-        assert!(!rendered.contains("helper"), "{rendered}");
     }
 
     #[test]

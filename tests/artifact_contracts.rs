@@ -181,11 +181,12 @@ manifest "$root/copy/dep.so"
 rewrite_container_manifest "$root/in.json" "$root/out.json" "$root/copy" /proc/42/root/usr/lib
 grep -Fq '"module_path": "/proc/42/root/usr/lib/provider.so"' "$root/out.json"
 grep -Fq '"path": "/proc/42/root/usr/lib/dep.so"' "$root/out.json"
-! grep -Fq "$root/copy" "$root/out.json"
+# set -e ignores a `!`-negated command, so every refusal is an explicit branch.
+if grep -Fq "$root/copy" "$root/out.json"; then echo "copy path leaked"; exit 1; fi
 manifest "$root/copy/../escape.so"
-! rewrite_container_manifest "$root/in.json" "$root/bad.json" "$root/copy" /proc/42/root/usr/lib 2>/dev/null
+if rewrite_container_manifest "$root/in.json" "$root/bad.json" "$root/copy" /proc/42/root/usr/lib 2>/dev/null; then echo "escape accepted"; exit 1; fi
 printf '{"schema":"p11scope-manifest/3","module_path":"x","objects":[]}\n' > "$root/in.json"
-! rewrite_container_manifest "$root/in.json" "$root/bad.json" "$root/copy" /proc/42/root/usr/lib 2>/dev/null
+if rewrite_container_manifest "$root/in.json" "$root/bad.json" "$root/copy" /proc/42/root/usr/lib 2>/dev/null; then echo "schema v3 accepted"; exit 1; fi
 "#,
         ])
         .status()

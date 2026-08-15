@@ -136,7 +136,7 @@ restores Linux dumpability only to perform bounded reads through
 Both `profile` and `trace` require `--manifest` and either `--pid` or
 `--cgroup`; `--cgroup` matches that cgroup and every descendant beneath it
 (kernel ≥5.15 due to attach cookies), so pointing it at a container's or pod's
-directory reaches the workload's actual nested cgroup. `--duration` bounds
+directory reaches the workload's actual nested cgroup. `--duration` (bare seconds or `30s`/`5m`/`1h`) bounds
 either subcommand; Ctrl-C or SIGTERM also ends a capture cleanly (final frame
 printed, `-o` file written) instead of aborting it.
 

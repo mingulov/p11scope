@@ -121,7 +121,7 @@ fn expected_surface(surface: &SurfaceRecord) -> Result<(Vec<&'static str>, &'sta
     ))
 }
 
-pub fn walk_name(walk: &WalkOutcome) -> &'static str {
+fn walk_name(walk: &WalkOutcome) -> &'static str {
     match walk {
         WalkOutcome::Full => "full",
         WalkOutcome::KnownPrefix => "known_prefix",

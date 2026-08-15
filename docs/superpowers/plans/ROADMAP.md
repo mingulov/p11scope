@@ -372,7 +372,7 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
   git history; reasoning in the spec §4.11 and §10.6). Object identity becomes hash-pinned
   (SHA-256 once, `fstat` change detection). CLI drops `--provenance-module`,
   `--trusted-workload`, the `p11scope discover` subcommand and exit code 78. CI skeleton.
-  **Status (2026-08-15): landed on branch `productization/slice1a` (b8e4fc3..9cf2dee, 20
+  **Status (2026-08-15): landed on branch `productization/slice1a` (b8e4fc3..HEAD, 21+
   commits; lane removed in 263935a with the history note); −13,727 lines net across
   `src`/`crates`/`tests`/`scripts` (2,798 added, 16,525 deleted). Verified: the four cargo
   checks and the unprivileged suite green (all test binaries 0 failed, incl. 14 pinning tests,

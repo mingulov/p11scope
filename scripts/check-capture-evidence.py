@@ -121,6 +121,7 @@ def exact_common(evidence, *, aliases, skipped, in_flight):
     require(evidence["skipped"] == skipped, f"unexpected skips: {evidence['skipped']}")
     require(evidence["in_flight_at_end"] == in_flight, evidence["in_flight_at_end"])
     require(evidence["templates_truncated"] is False, "templates were truncated")
+    require(evidence["provider_changed"] is False, "a pinned provider object changed during capture")
     require(evidence["completeness"] == "PARTIAL", evidence["completeness"])
 
 
@@ -321,6 +322,7 @@ def evidence_fixture(surfaces):
         "interface_list": "absent",
         **{name: 0 for name in COUNTERS},
         "templates_truncated": False,
+        "provider_changed": False,
         "completeness": "PARTIAL",
     }
 

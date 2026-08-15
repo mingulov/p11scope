@@ -202,7 +202,7 @@ impl Drop for AtomicFile {
 /// (a planted symlink at the target is refused, not followed), mode 0600, and
 /// the opened descriptor must be a regular file (no FIFOs or devices).
 pub fn create_private_stream(path: &Path) -> Result<std::fs::File, String> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -217,6 +217,9 @@ pub fn create_private_stream(path: &Path) -> Result<std::fs::File, String> {
     if !metadata.is_file() {
         return Err(format!("output {} is not a regular file", path.display()));
     }
+    // A pre-existing target keeps its old mode through O_TRUNC; make it private too.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("setting output {} private failed: {error}", path.display()))?;
     Ok(file)
 }
 
@@ -361,8 +364,14 @@ mod tests {
         );
         std::io::Write::write_all(&mut file, b"first").unwrap();
         drop(file);
+        // A pre-existing, world-readable target is truncated and made private.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         drop(create_private_stream(&path).unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), b"");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

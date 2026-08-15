@@ -81,6 +81,7 @@ DIAGNOSTIC_BPF=$1
 python3 scripts/check-bpf-map-defs.py --policy-inventory "$OFFICIAL_BPF" "$DIAGNOSTIC_BPF"
 
 if "$P11SCOPE_STATIC" profile --unsafe-unvalidated-metadata \
+    --manifest /nonexistent/manifest.json --pid 1 \
     > "$OFFICIAL_TARGET/unsafe-cli.log" 2>&1; then
     echo "safe-only official observer accepted --unsafe-unvalidated-metadata"
     exit 1

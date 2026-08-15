@@ -15,7 +15,7 @@ jobs:
       # bpf-linker 0.10.4 (default feature rust-llvm-22) proxies to the LLVM bundled with the
       # toolchain that runs it (nightly); no system LLVM is needed at build time.
       - run: cargo +1.88 install bpf-linker --version 0.10.4 --locked
-      - run: sudo apt-get update && sudo apt-get install -y gcc llvm python3
+      - run: sudo apt-get update && sudo apt-get install -y gcc llvm python3 softhsm2
       - run: cargo +1.88 fmt --all -- --check
       - run: cargo +1.88 check --locked --workspace --all-targets
       - run: cargo +1.88 test --locked --workspace --all-targets

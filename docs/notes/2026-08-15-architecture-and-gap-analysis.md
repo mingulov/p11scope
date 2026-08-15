@@ -776,3 +776,53 @@ Decided:
    `p11scope doctor` reports which lanes the host allows.
 5. Proxies (p11-kit or any other) are ordinary modules; multi-module attribution per
    `(process, module, session)` is a productization goal, not a warning.
+
+### A6. Gap analysis of the discovery approaches (2026-08-15)
+
+Manifest path in containers: the helper must run inside the container's filesystem view with
+a matching libc (glibc/musl builds exist) — today by copying it in; better by `setns` into the
+target's mount namespace and `execveat` of the right helper from a host fd — and container
+paths map back through `/proc/<pid>/root`. Not native-only, but heavier. The module must be
+named; `inspect --pid` answers that for a running process, image/config for a future one.
+
+Live path in two steps: **v1** — operator names the module (as today), offsets come from the
+target's own `C_GetFunctionList`/`C_GetInterface*` (no helper, no libc matching, nothing
+copied); **v2** — automatic module discovery via exec/`dlopen` hooks, no `--module`.
+
+| Capability | Manifest/helper | Live v1 (`--module`) | Live v2 (auto) |
+| --- | --- | --- | --- |
+| Attach before first call | ✔ no race | ✔ with pause | ✔ with pause |
+| Mid-run attach, module already loaded | ✔ | ✘ until app reloads | ✘ |
+| Containers/pods | helper in container's libc world + path mapping | `/proc/<pid>/{maps,root}` only | same |
+| Module unknown to operator | ✘ (`inspect --pid` for running procs) | ✘ | ✔ |
+| Multi-module / proxies | one manifest per module | one `--module` per module | ✔ all layers |
+| Provider file replaced (new inode) | re-discover | ✔ on next `dlopen` | ✔ |
+| Non-standard exports (NSS `NSC_/FC_`) | dlopen may pick the wrong table | export-name registry | same |
+| Runs vendor code outside the app | yes, sandboxed | no | no |
+| Result portable across machines | ✔ SHA-256/build-id | n/a | n/a |
+| Privileges | BPF caps + `/proc` access | same | same |
+| Kernel | ≥5.15 | + `bpf_send_signal` (≥5.3) | + `sched_process_exec` |
+| Static-linked provider, 32-bit target | ✘ | ✘ | ✘ |
+
+Missed so far, now recorded:
+
+- **SIGSTOP is visible to job control** (interactive shell shows `Stopped`, resumes the app
+  as a background job). Pause only when the target has no job-control parent (`tpgid`);
+  otherwise `--no-pause` with an `attach_gap_ms` evidence field; for cgroup scope the cgroup
+  v2 freezer is an invisible userspace-triggered alternative. Design it, don't assume it.
+- **Manifest catalog**: manifests are SHA-256/build-id keyed, so they can be pre-generated
+  per vendor package version and looked up from the mapped object's identity — mid-run
+  attach with no helper on the node and no race. Falls out of manifest v4 for free.
+- **Probes are on function code, not on the table** — how the app obtained the pointer
+  (table, `dlsym`, wrapper) does not matter. State as a guarantee.
+- **Identity = mapped inode, not path** (package upgrade during capture leaves the process on
+  the old, deleted inode): hash the fd you attached, re-hash that fd.
+- **Kernel floor by feature probe, not version** (RHEL 9 = 5.14 + backports); cgroup v1
+  hosts lose `--cgroup`, keep `--pid`.
+- **Export-name registry** for hooks (`C_GetFunctionList`, `C_GetInterfaceList`,
+  `C_GetInterface`, `NSC_*`, `FC_*`, configurable).
+- **Accepted residual risk** with leases opt-in: in-place rewrite of a mapped provider after
+  hashing → misattributed statistics, surfaced by periodic re-hash as `provider_changed`.
+  Document as accepted for the default lanes.
+- **Still open**: params/templates under the safe policy (§3.3) — unchanged by this choice.
+- Later: daemon mode with pinned links; event sampling for high-rate workloads.

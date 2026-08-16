@@ -1,7 +1,7 @@
 //! dlopen + table-walk glue: raw provider facts become bounded manifest evidence.
 //! The helper never calls C_Initialize or C_GetInterface.
 
-use crate::maps::{self, Device, MappedPath};
+use crate::maps::{self, Device, MappedPath, ObjectKey};
 use libloading::Library;
 use p11scope_manifest::identity::{self, ObjectIdentity};
 use p11scope_manifest::manifest::*;
@@ -16,12 +16,6 @@ use std::path::{Path, PathBuf};
 const INTERFACE_NAME_CAP: usize = 256;
 const MAX_OBJECTS: usize = 512;
 const MAX_TOTAL_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct ObjectKey {
-    device: Device,
-    inode: u64,
-}
 
 #[derive(Debug, Clone, Copy, Default)]
 struct ExportAddresses {
@@ -54,7 +48,7 @@ pub fn discover_with_self_memory(
     let before_maps = maps::parse_maps(
         &std::fs::read("/proc/self/maps").map_err(|e| format!("/proc/self/maps: {e}"))?,
     )?;
-    let before_keys: BTreeSet<ObjectKey> = before_maps.iter().map(map_key).collect();
+    let before_keys: BTreeSet<ObjectKey> = before_maps.iter().map(ObjectKey::of).collect();
 
     let lib = unsafe { Library::new(module_path) }
         .map_err(|e| format!("cannot dlopen {}: {e}", module_path.display()))?;
@@ -74,7 +68,7 @@ pub fn discover_with_self_memory(
     let module_map_key = loaded_module_key(raw_exports, &maps, module_file_key, &module_identity)?;
     let mut approved_keys: BTreeSet<ObjectKey> = maps
         .iter()
-        .map(map_key)
+        .map(ObjectKey::of)
         .filter(|key| !before_keys.contains(key))
         .collect();
     approved_keys.insert(module_map_key);
@@ -167,7 +161,7 @@ fn provenance_objects(mappings: &[maps::MapEntry]) -> Result<Vec<ProvenanceObjec
                 ));
             }
         };
-        let key = map_key(mapping);
+        let key = ObjectKey::of(mapping);
         if let Some(previous) = opened_paths.insert(path.clone(), key) {
             if previous != key {
                 return Err(format!(
@@ -223,13 +217,6 @@ fn provenance_objects(mappings: &[maps::MapEntry]) -> Result<Vec<ProvenanceObjec
         return Err("discovery found no file-backed executable mappings".into());
     }
     Ok(by_key.into_values().collect())
-}
-
-fn map_key(entry: &maps::MapEntry) -> ObjectKey {
-    ObjectKey {
-        device: entry.device,
-        inode: entry.inode,
-    }
 }
 
 fn symbol_address(lib: &Library, name: &[u8]) -> Option<usize> {

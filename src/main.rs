@@ -6,7 +6,9 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use p11scope::attach::{CapturePolicy, Scope, Session};
 use p11scope::cli::{self, CaptureArgs, CliError, Command, Kind, ScopeArg};
 use p11scope::discovery::identity::{PinnedObjects, pin_manifest_objects, pin_scanned_objects};
-use p11scope::discovery::scan::{ScanLimits, ScanOutcome, ScanRequest, ScannedModule, scan_pid};
+use p11scope::discovery::scan::{
+    ScanLimits, ScanOutcome, ScanRequest, ScannedModule, Skipped, scan_pid,
+};
 use p11scope::manifest_input::read_manifest;
 use p11scope::output::AtomicFile;
 use p11scope::{doctor, events, inspect, metrics, plan, process, render, scope, semantics, trace};
@@ -312,12 +314,27 @@ fn manifest_targets(m: &Manifest) -> BTreeSet<(String, u64)> {
 /// Without this the union of §4.12 would attach two probes to one address whenever
 /// the manifest was made on another host: the recorded {device, inode} and the live
 /// one differ, so the merge could not tell that both name one object.
-fn retarget_to_scanned(m: &mut Manifest, pinned: &PinnedObjects) {
+fn retarget_to_scanned(m: &mut Manifest, scanned: &ScannedModule, pinned: &PinnedObjects) {
+    // Only the objects this scan actually saw. Searching every pin could adopt an
+    // earlier manifest's pin of a content-identical copy the target does not map —
+    // a probe on the wrong file, which simply never fires.
+    let seen: BTreeSet<ObjectKey> = std::iter::once(scanned.key)
+        .chain(
+            scanned
+                .tables
+                .iter()
+                .flat_map(|table| &table.entries)
+                .map(|entry| entry.object),
+        )
+        .collect();
     for provenance in &mut m.provenance_objects {
         let Some(sha) = provenance.identity.sha256.as_deref() else {
             continue;
         };
-        if let Some(summary) = pinned.pinned().find(|p| p.sha256 == sha) {
+        if let Some(summary) = pinned
+            .pinned()
+            .find(|p| seen.contains(&p.key) && p.sha256 == sha)
+        {
             provenance.device_major = summary.key.device.major;
             provenance.device_minor = summary.key.device.minor;
             provenance.inode = summary.key.inode;
@@ -431,20 +448,51 @@ fn scan_and_pin(
     Ok((modules, pinned))
 }
 
+/// Drops every table entry whose object was not pinned, returning one `Skipped` per
+/// drop. `pin_scanned_objects` skips an object it cannot open, identify or afford to
+/// hash rather than failing the capture (spec §4.10) — so an entry pointing into one
+/// has no attach path of its own. Left in the plan it would either fail the whole
+/// attach (the opposite of what that skip is for) or, now that manifest pins share
+/// the set, fall back to `attach_path(object_path)` and probe the *observer's* file
+/// at the target's pathname, which in a container is a different file entirely.
+fn drop_unpinned_entries(modules: &mut [ScannedModule], pinned: &PinnedObjects) -> Vec<Skipped> {
+    let mut dropped = Vec::new();
+    for module in modules {
+        for table in &mut module.tables {
+            table.entries.retain(|entry| {
+                if pinned.pinned().any(|p| p.key == entry.object) {
+                    return true;
+                }
+                dropped.push(Skipped {
+                    subject: entry.name.to_string(),
+                    reason: format!(
+                        "{} was not pinned; nothing to attach into",
+                        entry.object_path
+                    ),
+                });
+                false
+            });
+        }
+    }
+    dropped
+}
+
 /// Discovery for one capture: scan the scope, read and corroborate any manifests,
 /// merge into one plan, pin every object. Task 13 adds the evidence return value.
 fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<(plan::AttachPlan, PinnedObjects)> {
     let limits = ScanLimits::default();
     let mut counters = DiscoveryCounters::default();
     let pids = scope_pids(scope);
-    let named = pids.len() == 1;
+    // The pid the operator named is the capture; a cgroup's processes are many,
+    // however few happen to be in it right now.
+    let named = matches!(scope, Scope::Pid(_));
     let mut modules: Vec<ScannedModule> = Vec::new();
     let mut pinned = PinnedObjects::empty();
     if pids.len() > MAX_SCAN_PIDS {
-        eprintln!(
-            "p11scope: {} processes in scope; discovery scans the first {MAX_SCAN_PIDS}",
+        counters.notes.push(format!(
+            "{} processes in scope; discovery scanned the first {MAX_SCAN_PIDS}",
             pids.len()
-        );
+        ));
     }
     for pid in pids.iter().take(MAX_SCAN_PIDS) {
         match scan_and_pin(*pid, a, limits, &mut counters) {
@@ -462,6 +510,16 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<(plan::AttachPlan, Pi
             Err(error) if named => return Err(error),
             Err(error) => eprintln!("p11scope: discovery skipped pid {pid}: {error:#}"),
         }
+    }
+
+    // Before corroboration: an entry nothing pinned is not a target either source
+    // can be held to, and must never reach the plan.
+    let unpinned = drop_unpinned_entries(&mut modules, &pinned);
+    for skipped in &unpinned {
+        eprintln!(
+            "p11scope: discovery skipped {} — {}",
+            skipped.subject, skipped.reason
+        );
     }
 
     let mut accepted: Vec<Manifest> = Vec::new();
@@ -501,7 +559,9 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<(plan::AttachPlan, Pi
                     manifest.module_path
                 ));
                 corroborated.extend(mapped);
-                retarget_to_scanned(&mut manifest, &pinned);
+                if let Some((module, _)) = view {
+                    retarget_to_scanned(&mut manifest, module, &pinned);
+                }
                 accepted.push(manifest);
                 pinned.absorb(manifest_pins);
             }
@@ -522,6 +582,7 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<(plan::AttachPlan, Pi
     }
 
     let mut plan = plan::build_from_sources(&modules, &accepted);
+    plan.skipped.extend(unpinned);
     for key in &corroborated {
         if let Some(summary) = plan.modules.iter_mut().find(|m| m.key == *key) {
             summary.corroborated = true;
@@ -1198,6 +1259,7 @@ fn fmt_rfc3339(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p11scope::discovery::scan::ScannedEntry;
 
     struct FailingWriter {
         kind: std::io::ErrorKind,
@@ -1348,6 +1410,210 @@ mod tests {
             .iter()
             .map(|offset| ("11".repeat(32), *offset))
             .collect()
+    }
+
+    /// Our own executable, scanned and pinned the way a capture pins a provider:
+    /// a real `PinnedObjects` with one key in it, with no privileges needed.
+    fn pinned_self() -> (Vec<ScannedModule>, PinnedObjects) {
+        let hooks = p11scope::discovery::hooks::HookRegistry::builtin();
+        let exe = std::env::current_exe().unwrap();
+        let outcome = scan_pid(&ScanRequest {
+            pid: std::process::id(),
+            hints: &[exe],
+            hooks: &hooks,
+            limits: ScanLimits::default(),
+        })
+        .unwrap();
+        let modules = outcome.modules().to_vec();
+        let (pinned, _) =
+            pin_scanned_objects(std::process::id(), &modules, ScanLimits::default()).unwrap();
+        assert_eq!(
+            pinned.pinned().count(),
+            1,
+            "the hinted executable is pinned"
+        );
+        (modules, pinned)
+    }
+
+    fn entry(name: &'static str, object: ObjectKey, file_offset: u64) -> ScannedEntry {
+        ScannedEntry {
+            name,
+            object,
+            object_path: format!("/opt/{}.so", object.inode),
+            file_offset,
+        }
+    }
+
+    /// An entry whose object could not be pinned has no attach path of its own. Left
+    /// in the plan it either kills the whole capture (§4.10 says one unusable
+    /// dependency must not) or, once a manifest is in the same plan, falls back to
+    /// the *observer's* file at the target's pathname — a different file, silently
+    /// probed at scan-derived offsets.
+    #[test]
+    fn a_table_entry_whose_object_was_not_pinned_never_becomes_a_slot() {
+        let (mut modules, pinned) = pinned_self();
+        let pinned_key = pinned.pinned().next().unwrap().key;
+        let unpinned_key = ObjectKey {
+            device: p11scope_manifest::maps::Device {
+                major: 0xffff,
+                minor: 0xffff,
+            },
+            inode: u64::MAX,
+        };
+        modules[0]
+            .tables
+            .push(p11scope::discovery::scan::ScannedTable {
+                version: (2, 40),
+                walk: "full",
+                entries: vec![
+                    entry("C_Sign", pinned_key, 0x10),
+                    entry("C_Verify", unpinned_key, 0x20),
+                ],
+                null_entries: vec![],
+                address: 0x7000,
+            });
+
+        let dropped = drop_unpinned_entries(&mut modules, &pinned);
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert_eq!(dropped[0].subject, "C_Verify");
+        assert!(dropped[0].reason.contains("not pinned"), "{dropped:?}");
+
+        let plan = plan::build_from_modules(&modules);
+        assert_eq!(plan.slots.len(), 1, "only the pinned target attaches");
+        for slot in &plan.slots {
+            assert!(
+                pinned.attach_path_for(slot.object).is_ok(),
+                "every scanned slot must have a pinned object of its own: {slot:?}"
+            );
+        }
+    }
+
+    /// The glue that picks among the four §4.12 outcomes: which scanned module a
+    /// manifest is talking about, and whether the bytes agree.
+    #[test]
+    fn scan_view_matches_by_hash_then_path_and_needs_a_pin() {
+        let (modules, pinned) = pinned_self();
+        let summary = pinned.pinned().next().unwrap();
+        let (path, sha) = (summary.path.to_string(), summary.sha256.to_string());
+
+        let m = manifest_naming(&path, Some(sha.clone()));
+        let (module, agrees) = scan_view(&m, &modules, &pinned).expect("mapped and pinned");
+        assert_eq!(module.key, summary.key);
+        assert!(agrees, "the recorded sha256 is the pinned one");
+        assert_eq!(
+            manifest_targets(&m),
+            BTreeSet::from([(sha.clone(), 0x40)]),
+            "manifest targets are keyed by object hash, not by device/inode"
+        );
+        assert_eq!(
+            scanned_targets(module, &pinned),
+            BTreeSet::new(),
+            "our own executable publishes no PKCS#11 table"
+        );
+
+        // Same path, different bytes: §4.12's identity mismatch.
+        let stale = manifest_naming(&path, Some("22".repeat(32)));
+        assert_eq!(
+            scan_view(&stale, &modules, &pinned).map(|(_, a)| a),
+            Some(false)
+        );
+
+        // Mapped but never pinned: nothing to compare against, so nothing corroborates
+        // it — the trigger condition for the unpinned-slot bug above.
+        let unpinned = manifest_naming(&path, Some(sha));
+        assert!(
+            scan_view(&unpinned, &modules, &PinnedObjects::empty()).is_none(),
+            "a module with no pin has no hash to agree or disagree with"
+        );
+
+        // A manifest for something the target does not map at all.
+        let elsewhere = manifest_naming("/opt/not-mapped.so", Some("33".repeat(32)));
+        assert!(scan_view(&elsewhere, &modules, &pinned).is_none());
+    }
+
+    /// Retargeting adopts the identity of the object the scan matched — never some
+    /// other pin that happens to hash the same (an earlier manifest's copy of the
+    /// same bytes, which the target may not map at all).
+    #[test]
+    fn retargeting_only_adopts_the_matched_scanned_object() {
+        let (modules, pinned) = pinned_self();
+        let summary = pinned.pinned().next().unwrap();
+        let (path, sha) = (summary.path.to_string(), summary.sha256.to_string());
+        let mut m = manifest_naming(&path, Some(sha.clone()));
+        m.provenance_objects[0].inode = 1;
+        m.provenance_objects[0].device_major = 99;
+
+        retarget_to_scanned(&mut m, &modules[0], &pinned);
+        assert_eq!(m.provenance_objects[0].inode, summary.key.inode);
+        assert_eq!(
+            m.provenance_objects[0].device_major,
+            summary.key.device.major
+        );
+
+        // The same bytes pinned under an identity the scan did not see must not be
+        // adopted: a decoy module the matched scan never named.
+        let decoy = ScannedModule {
+            key: ObjectKey {
+                device: p11scope_manifest::maps::Device { major: 0, minor: 0 },
+                inode: 7,
+            },
+            path: "/opt/decoy.so".into(),
+            exports: vec![],
+            tables: vec![],
+            interfaces: vec![],
+        };
+        let mut m = manifest_naming(&path, Some(sha));
+        m.provenance_objects[0].inode = 1;
+        retarget_to_scanned(&mut m, &decoy, &pinned);
+        assert_eq!(
+            m.provenance_objects[0].inode, 1,
+            "no pin of the decoy exists"
+        );
+    }
+
+    /// A minimal schema-current manifest naming one object with one resolved function.
+    fn manifest_naming(path: &str, sha256: Option<String>) -> Manifest {
+        use p11scope_manifest::identity::{IdentityKind, ObjectIdentity};
+        use p11scope_manifest::manifest::*;
+        let identity = ObjectIdentity {
+            kind: IdentityKind::GnuBuildId,
+            value: Some("aa".into()),
+            sha256,
+            reusable: true,
+            note: None,
+        };
+        Manifest {
+            schema: SCHEMA.to_string(),
+            module_path: path.to_string(),
+            objects: vec![ObjectRecord {
+                id: 0,
+                path: path.to_string(),
+                identity: identity.clone(),
+            }],
+            provenance_objects: vec![ProvenanceObject {
+                path: path.to_string(),
+                device_major: 8,
+                device_minor: 1,
+                inode: 42,
+                identity,
+            }],
+            interface_list: Acquisition::Absent,
+            surfaces: vec![SurfaceRecord {
+                source: SurfaceSource::LegacyFunctionList,
+                acquisition: Acquisition::Ok,
+                version: None,
+                walk: WalkOutcome::Full,
+                functions: vec![FunctionRecord {
+                    name: "C_Sign".into(),
+                    resolution: Resolution::Resolved {
+                        object: 0,
+                        file_offset: 0x40,
+                    },
+                }],
+            }],
+            vendor_interfaces: vec![],
+            alias_groups: vec![],
+        }
     }
 
     /// A capture that attached nothing must never publish COMPLETE: it has no

@@ -560,9 +560,18 @@ impl Session {
                     // recorded at discovery time, while the pin is keyed by the identity
                     // the object has right now — the two differ whenever a manifest is
                     // reused after a remount or on another host, which pinning allows
-                    // because it compares build-id and sha256, never the device. Only
-                    // manifest objects are indexed by path, so this cannot mis-attribute
-                    // a scanned one.
+                    // because it compares build-id and sha256, never the device.
+                    //
+                    // The path fallback exists for those slots alone. Only manifest
+                    // objects are indexed by path, but since a plan can now hold both
+                    // sources at once (`plan::build_from_sources`), a *scanned* slot
+                    // whose object was never pinned could fall through to a manifest
+                    // object that happens to share the pathname — and a scanned
+                    // `object_path` is the target's, which in a container names a
+                    // different file here. Discovery is what keeps that unreachable:
+                    // `main.rs::drop_unpinned_entries` removes every scanned entry
+                    // whose object is absent from `objects` before the plan is built,
+                    // so a scanned slot always resolves by key on the line above.
                     .or_else(|_| objects.attach_path(&slot.object_path))
                     .map_err(anyhow::Error::msg)
             })

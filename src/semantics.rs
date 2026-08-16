@@ -513,6 +513,91 @@ mod corrective_tests {
         );
     }
 
+    /// `detached` is keyed by module, and a `ModuleId` is plan-global: every
+    /// process mapping the same provider shares it. One process finalizing
+    /// that provider says nothing about another process's async operations.
+    #[test]
+    fn one_processs_finalize_leaves_another_processs_async_state() {
+        let p = plan(&[
+            "C_OpenSession",
+            "C_CloseSession",
+            "C_FindObjectsInit",
+            "C_AsyncGetID",
+            "C_AsyncJoin",
+            "C_AsyncComplete",
+            "C_Finalize",
+        ]);
+        let find_init = crate::kinds::function_id("C_FindObjectsInit").unwrap();
+        let a = ProcessKey::from_pid(100);
+        let b = ProcessKey::from_pid(200);
+        let mut state = State::new(&p);
+
+        // B detaches an async operation, then closes the session holding it:
+        // the record is now floating — joinable, owned by no session.
+        state.observe_process(b, &open(&p, 9, 3));
+        state.observe_process(b, &event(&p, "C_FindObjectsInit", 9, CkRv::PENDING.0));
+        let mut get_id = event(&p, "C_AsyncGetID", 9, CkRv::OK.0);
+        get_id.target_function = find_init;
+        get_id.async_value = 42;
+        state.observe_process(b, &get_id);
+        state.observe_process(b, &event(&p, "C_CloseSession", 9, 0));
+        assert_eq!(state.pending_at_end(), 1);
+
+        // A finalizes the same provider in its own process. A floating record
+        // names no session, so only the record's own process tells them apart.
+        state.observe_process(a, &open(&p, 5, 3));
+        state.observe_process(a, &event(&p, "C_Finalize", SESSION_NONE, 0));
+        assert_eq!(
+            state.pending_at_end(),
+            1,
+            "B's detached operation is not A's to finalize"
+        );
+        assert!(state.has_process_state(b), "a joinable id is live state");
+
+        // B re-joins it into a new session and completes it, instead of
+        // counting an orphan.
+        state.observe_process(b, &open(&p, 11, 3));
+        let mut join = event(&p, "C_AsyncJoin", 11, CkRv::OK.0);
+        join.target_function = find_init;
+        join.async_value = 42;
+        state.observe_process(b, &join);
+        let mut complete = event(&p, "C_AsyncComplete", 11, CkRv::OK.0);
+        complete.target_function = find_init;
+        complete.async_value = CkRv::OK.0;
+        state.observe_process(b, &complete);
+        assert_eq!(state.semantic_evidence().async_orphans, 0);
+        assert_eq!(state.pending_at_end(), 0);
+    }
+
+    /// The other half of the same trade: a floating id belonging to the
+    /// process that finalizes *is* dropped, because a later `C_Initialize`
+    /// there could mint the same key and `C_AsyncJoin` a dead operation.
+    #[test]
+    fn finalize_drops_its_own_processs_floating_async_ids() {
+        let p = plan(&[
+            "C_OpenSession",
+            "C_CloseSession",
+            "C_FindObjectsInit",
+            "C_AsyncGetID",
+            "C_Finalize",
+        ]);
+        let process = ProcessKey::from_pid(100);
+        let mut state = State::new(&p);
+        state.observe(&open(&p, 9, 3));
+        state.observe(&event(&p, "C_FindObjectsInit", 9, CkRv::PENDING.0));
+        let mut get_id = event(&p, "C_AsyncGetID", 9, CkRv::OK.0);
+        get_id.target_function = crate::kinds::function_id("C_FindObjectsInit").unwrap();
+        get_id.async_value = 42;
+        state.observe(&get_id);
+        state.observe(&event(&p, "C_CloseSession", 9, 0));
+        assert_eq!(state.pending_at_end(), 1);
+        assert!(state.has_process_state(process));
+
+        state.observe(&event(&p, "C_Finalize", SESSION_NONE, 0));
+        assert_eq!(state.pending_at_end(), 0);
+        assert!(!state.has_process_state(process));
+    }
+
     #[test]
     fn process_retirement_clears_state_without_a_recorded_open() {
         let p = plan_with_fork(
@@ -885,6 +970,17 @@ fn scoped(
     move |owner, session| *owner == process && module.is_none_or(|id| session.module == id)
 }
 
+/// The same scoping question for the async-id map, which is keyed by module
+/// and carries its process on the record rather than in the key. Separate
+/// because the key shape differs; shared between the query and the sweep for
+/// the same reason `scoped` is.
+fn scoped_detached(
+    process: ProcessKey,
+    module: Option<ModuleId>,
+) -> impl Fn(&ModuleId, &Detached) -> bool {
+    move |id, detached| detached.process == process && module.is_none_or(|m| *id == m)
+}
+
 #[derive(Clone, Copy)]
 struct SessionInfo {
     pseudonym: u64,
@@ -909,7 +1005,14 @@ struct Pending {
 #[derive(Clone)]
 struct Detached {
     pending: Pending,
+    /// The session currently holding this async id. `None` means detached and
+    /// joinable — `C_AsyncJoin` re-adopts it into another session — which is a
+    /// live state, not a dead one.
     owner: Option<(ProcessKey, SessionRef)>,
+    /// The process whose Cryptoki issued the id. The map key is
+    /// `(ModuleId, ...)` and a `ModuleId` is plan-global, so without this a
+    /// floating record could not be told apart from another process's.
+    process: ProcessKey,
 }
 
 const OPERATIONS: [(u16, &str); 11] = [
@@ -1457,12 +1560,11 @@ impl State {
             lifecycle::CLOSE_ALL_SESSIONS if ev.rv == CkRv::OK.0 => {
                 // Only this module's sessions on that PKCS#11 slot id: another
                 // module in the same process numbers its slots independently.
+                let owned = scoped(process, Some(meta.module));
                 let sessions: Vec<SessionRef> = self
                     .open
                     .iter()
-                    .filter(|((owner, open), info)| {
-                        *owner == process && open.module == meta.module && info.slot == ev.slot_id
-                    })
+                    .filter(|((owner, open), info)| owned(owner, open) && info.slot == ev.slot_id)
                     .map(|((_, open), _)| *open)
                     .collect();
                 for session in sessions {
@@ -1513,12 +1615,11 @@ impl State {
         };
         // The login applies to this module's sessions on that PKCS#11 slot;
         // another module's identically numbered slot is a different token.
+        let owned = scoped(process, Some(meta.module));
         let sessions: Vec<SessionRef> = self
             .open
             .iter()
-            .filter(|((owner, open), info)| {
-                *owner == process && open.module == meta.module && info.slot == slot
-            })
+            .filter(|((owner, open), info)| owned(owner, open) && info.slot == slot)
             .map(|((_, open), _)| *open)
             .collect();
         let mut changed = false;
@@ -1623,6 +1724,7 @@ impl State {
                         Detached {
                             pending,
                             owner: Some((process, session)),
+                            process,
                         },
                     )
                     .is_some()
@@ -1856,22 +1958,6 @@ impl State {
     fn retire_scope(&mut self, process: ProcessKey, module: Option<ModuleId>) -> u64 {
         let had_state = self.has_scope_state(process, module);
         let owned = scoped(process, module);
-        // Async ids first: `retire_session` below sets `owner = None` on the
-        // records it reaches, after which nothing can attribute them.
-        self.detached.retain(|(id, ..), detached| match module {
-            // C_Finalize kills every async id this module issued, adopted or
-            // floating: a later C_Initialize in the same module could mint an
-            // identical (module, slot, function, value) key and join a dead
-            // operation.
-            Some(finalizing) => *id != finalizing,
-            // A whole-process sweep can only reclaim what it still owns — the
-            // detached key carries no `ProcessKey`, so a record orphaned
-            // earlier by a `C_CloseSession` is unattributable and lives until
-            // MAX_PENDING eviction or capture end.
-            None => !detached
-                .owner
-                .is_some_and(|(owner, session)| owned(&owner, &session)),
-        });
         let sessions: Vec<SessionRef> = self
             .open
             .keys()
@@ -1891,6 +1977,14 @@ impl State {
             .retain(|(owner, session)| !owned(owner, session));
         self.pending
             .retain(|(owner, session, _), _| !owned(owner, session));
+        // Async ids die with the Cryptoki that issued them, adopted or
+        // floating: a later C_Initialize in this process could mint an
+        // identical (module, slot, function, value) key, and C_AsyncJoin would
+        // adopt a dead operation. Scoped by the record's own process, so
+        // another process's ids for the same module are untouched.
+        let owned_id = scoped_detached(process, module);
+        self.detached
+            .retain(|(id, ..), detached| !owned_id(id, detached));
         if module.is_none() {
             // Pseudonym numbering is per process and must not restart while
             // another module's sessions are still live under it.
@@ -2038,6 +2132,7 @@ impl State {
     /// the question and the sweep that answers it cannot disagree.
     fn has_scope_state(&self, process: ProcessKey, module: Option<ModuleId>) -> bool {
         let owned = scoped(process, module);
+        let owned_id = scoped_detached(process, module);
         self.open
             .keys()
             .any(|(owner, session)| owned(owner, session))
@@ -2053,11 +2148,12 @@ impl State {
                 .pending
                 .keys()
                 .any(|(owner, session, _)| owned(owner, session))
-            || self.detached.values().any(|record| {
-                record
-                    .owner
-                    .is_some_and(|(owner, session)| owned(&owner, &session))
-            })
+            // A floating async id is live state — it is still joinable — and
+            // now attributable, so it counts.
+            || self
+                .detached
+                .iter()
+                .any(|((id, ..), record)| owned_id(id, record))
             || self
                 .inherited_ambiguous
                 .iter()

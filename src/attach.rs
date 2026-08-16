@@ -481,7 +481,7 @@ fn publish_and_freeze_template_tail(ebpf: &mut Ebpf, enabled: bool) -> Result<()
 /// one, so every early failure gets the same actionable hint appended,
 /// naming the concrete things to check instead of leaving a bare
 /// syscall error for the operator to diagnose alone.
-const UNSUPPORTED_ENV_HINT: &str = "hint: this usually means the environment cannot load or \
+pub(crate) const UNSUPPORTED_ENV_HINT: &str = "hint: this usually means the environment cannot load or \
 attach BPF programs at all — missing CAP_BPF and/or CAP_SYS_ADMIN (or root), a kernel \
 lockdown mode, a kernel below the supported floor (>= 5.15), missing BTF \
 (/sys/kernel/btf/vmlinux), or a restrictive kernel.perf_event_paranoid sysctl. See \

@@ -137,13 +137,16 @@ fn parse_lockdown(content: &str) -> String {
 }
 
 fn lockdown_check() -> Check {
-    let mode = match std::fs::read_to_string("/sys/kernel/security/lockdown") {
-        Ok(content) => parse_lockdown(&content),
-        Err(_) => "none".to_string(),
+    let path = "/sys/kernel/security/lockdown";
+    let status = match std::fs::read_to_string(path) {
+        Ok(content) => Status::Ok(parse_lockdown(&content)),
+        // Absent means no lockdown LSM loaded — genuinely "none", not unknown.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Status::Ok("none".to_string()),
+        Err(e) => Status::Warn(format!("{path}: {e}")),
     };
     Check {
         name: "lockdown".to_string(),
-        status: Status::Ok(mode),
+        status,
     }
 }
 
@@ -183,24 +186,33 @@ fn decode_caps(mask: u64) -> Vec<&'static str> {
     names
 }
 
-fn read_cap_eff() -> Option<u64> {
-    let content = std::fs::read_to_string("/proc/self/status").ok()?;
-    content
+fn read_cap_eff() -> Result<u64, String> {
+    let content = std::fs::read_to_string("/proc/self/status")
+        .map_err(|e| format!("/proc/self/status: {e}"))?;
+    let hex = content
         .lines()
         .find_map(|line| line.strip_prefix("CapEff:"))
-        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+        .ok_or_else(|| "/proc/self/status: no CapEff line".to_string())?;
+    u64::from_str_radix(hex.trim(), 16).map_err(|e| format!("CapEff {hex:?}: {e}"))
 }
 
 fn capabilities_check() -> Check {
-    let names = decode_caps(read_cap_eff().unwrap_or(0));
-    let detail = if names.is_empty() {
-        "(none)".to_string()
-    } else {
-        names.join(" ")
+    // A read/parse failure is reported, never coerced into "(none)" — an
+    // unmeasured mask must not read the same as a genuinely empty one.
+    let status = match read_cap_eff() {
+        Ok(mask) => {
+            let names = decode_caps(mask);
+            Status::Ok(if names.is_empty() {
+                "(none)".to_string()
+            } else {
+                names.join(" ")
+            })
+        }
+        Err(e) => Status::Warn(e),
     };
     Check {
         name: "effective capabilities".to_string(),
-        status: Status::Ok(detail),
+        status,
     }
 }
 
@@ -221,7 +233,7 @@ fn bpf_checks() -> Vec<Check> {
         Err(e) => vec![
             Check {
                 name: "BPF map create".to_string(),
-                status: Status::Fail(e.to_string()),
+                status: Status::Fail(format!("{e} — {}", crate::attach::UNSUPPORTED_ENV_HINT)),
             },
             Check {
                 name: "uprobe attach (own libc)".to_string(),
@@ -259,13 +271,18 @@ fn attach_self_probe(ebpf: &mut Ebpf) -> Result<(), String> {
         .ok_or_else(|| "program p11_entry missing from the BPF object".to_string())?
         .try_into()
         .map_err(|e: aya::programs::ProgramError| e.to_string())?;
-    prog.load().map_err(|e| format!("loading p11_entry: {e}"))?;
+    prog.load().map_err(|e| {
+        format!(
+            "loading p11_entry: {e} — {}",
+            crate::attach::UNSUPPORTED_ENV_HINT
+        )
+    })?;
     let point = UProbeAttachPoint {
         location: UProbeAttachLocation::AbsoluteOffset(offset),
         cookie: None,
     };
     prog.attach(point, &libc_path, UProbeScope::CallingProcess)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e} — {}", crate::attach::UNSUPPORTED_ENV_HINT))?;
     Ok(())
 }
 

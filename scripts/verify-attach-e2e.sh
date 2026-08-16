@@ -74,9 +74,7 @@ touch "$WORK/go"
 if wait "$WPID"; then WPID=; else status=$?; WPID=; echo "workload failed: $status"; exit "$status"; fi
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "profiler failed: $status"; tail -n 20 "$WORK/profile.log" || true; exit "$status"; fi
 tail -n 20 "$WORK/profile.log"
-# The observer ran under sudo, so its published output is root-owned 0600.
-# Hand it back to the caller for the evidence check.
-sudo chown "$(id -u):$(id -g)" "$WORK/observed.json"
+reclaim_root_output "$WORK/observed.json"
 
 echo "=== verify against spike/expected.txt ==="
 python3 scripts/check-capture-evidence.py clean-metrics \

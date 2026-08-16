@@ -96,18 +96,6 @@ python3 scripts/check-bpf-map-defs.py "$RING_BPF" EVENTS=4096 START=16384 RV_COU
 python3 scripts/check-bpf-map-defs.py "$STATE_BPF" EVENTS=262144 START=1 RV_COUNTS=1
 python3 scripts/check-bpf-map-defs.py --policy-inventory "$DEFAULT_BPF" "$FREEZE_BPF"
 
-pin_observer() {
-    ps_pidfile=$1
-    sudo test -s "$ps_pidfile" || { echo "observer pid missing: $ps_pidfile" >&2; return 1; }
-    set -- $(sudo cat "$ps_pidfile")
-    [ "$#" -eq 2 ] || { echo "invalid observer identity record" >&2; return 1; }
-    OBSERVER_PID=$1
-    OBSERVER_STARTTIME=$2
-    case $OBSERVER_PID:$OBSERVER_STARTTIME in
-        *[!0-9:]*) echo "invalid observer identity" >&2; return 1 ;;
-    esac
-}
-
 pin_workload() {
     WORKLOAD_STARTTIME=$(process_starttime "$WPID") || {
         echo "workload $WPID identity unavailable" >&2
@@ -369,21 +357,15 @@ cgroup_rel=$(awk -F: '$1 == "0" && $2 == "" { print $3 }' "/proc/$WPID/cgroup")
 CGROUP_PATH=/sys/fs/cgroup$cgroup_rel
 [ -d "$CGROUP_PATH" ] || { echo "workload cgroup path missing: $CGROUP_PATH"; exit 1; }
 
-sudo sh -c '
-    umask 077
-    starttime=$(awk '\''{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[20]; exit }'\'' "/proc/$$/stat") || exit 1
-    printf "%s %s\n" "$$" "$starttime" > "$1"
-    shift
-    exec "$@"
-' sh \
-    "$WORK/freeze-observer.pid" \
+launch_root_recorded_process "$WORK/freeze-observer.pid" "$WORK/freeze-profile.log" \
     "$P11SCOPE_FREEZE" profile --manifest "$WORK/freeze-manifest.json" \
     --cgroup "$CGROUP_PATH" \
     --mode profile --unsafe-unvalidated-metadata --duration 20 \
-    -o "$WORK/freeze-observed.json" > "$WORK/freeze-profile.log" 2>&1 &
-SPID=$!
+    -o "$WORK/freeze-observed.json"
+SPID=$ROOT_LAUNCH_PID
+OBSERVER_PID=$ROOT_PROCESS_PID
+OBSERVER_STARTTIME=$ROOT_PROCESS_STARTTIME
 wait_for_capture_ready "$WORK/freeze-profile.log" unsafe-unvalidated-metadata profile
-pin_observer "$WORK/freeze-observer.pid"
 root_process_matches_starttime "$OBSERVER_PID" "$OBSERVER_STARTTIME" || exit 1
 sudo python3 scripts/dump-owned-bpf-maps.py \
     "$OBSERVER_PID" "$WORK" freeze-before 0 16384
@@ -398,9 +380,7 @@ assert_dynamic_maps_advanced "$WORK/mapdump_manifest_freeze-before.json" \
 signal_verified_root_process INT "$OBSERVER_PID" "$OBSERVER_STARTTIME"
 if wait "$SPID"; then SPID=; OBSERVER_PID=; OBSERVER_STARTTIME=; else status=$?; SPID=; OBSERVER_PID=; OBSERVER_STARTTIME=; echo "freeze observer failed: $status"; exit "$status"; fi
 resume_and_wait_workload freeze
-# Every observer here runs under sudo, so each published report is
-# root-owned 0600. Hand it back to the caller before reading it.
-sudo chown "$(id -u):$(id -g)" "$WORK/freeze-observed.json"
+reclaim_root_output "$WORK/freeze-observed.json"
 test -s "$WORK/freeze-observed.json" || { echo "freeze observer produced no output"; exit 1; }
 python3 scripts/check-capture-evidence.py canary feature-unsafe-profile \
     "$WORK/freeze-observed.json"
@@ -459,7 +439,7 @@ touch "$WORK/g1_go"
 wait_for_workload_stopped
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "alias profiler failed: $status"; exit "$status"; fi
 resume_and_wait_workload alias
-sudo chown "$(id -u):$(id -g)" "$WORK/g1_observed.json"
+reclaim_root_output "$WORK/g1_observed.json"
 tail -n 5 "$WORK/g1_profile.log"
 python3 scripts/check-capture-evidence.py induced G1 "$WORK/g1_observed.json"
 
@@ -506,7 +486,7 @@ touch "$WORK/g2_go"
 # The workload blocks for ~60s in the probed call; only the profiler exits
 # on its own (--duration). Don't `wait` on the still-blocked workload.
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "in-flight profiler failed: $status"; exit "$status"; fi
-sudo chown "$(id -u):$(id -g)" "$WORK/g2_observed.json"
+reclaim_root_output "$WORK/g2_observed.json"
 tail -n 5 "$WORK/g2_profile.log"
 signal_verified_process KILL "$WPID" "$WORKLOAD_STARTTIME" 2>/dev/null || true
 wait "$WPID" 2>/dev/null || true
@@ -554,7 +534,7 @@ touch "$WORK/g3_go"
 wait_for_workload_stopped
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "event-loss profiler failed: $status"; exit "$status"; fi
 resume_and_wait_workload hammer
-sudo chown "$(id -u):$(id -g)" "$WORK/g3_observed.json"
+reclaim_root_output "$WORK/g3_observed.json"
 tail -n 5 "$WORK/g3_profile.log"
 python3 scripts/check-capture-evidence.py induced G3 "$WORK/g3_observed.json"
 echo "gap 3 exact event-loss/count-authority evidence OK"
@@ -582,7 +562,7 @@ SPID=$!
 wait_for_capture_ready "$WORK/g4_profile.log" allowlisted profile
 touch "$WORK/g4_go"
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "START-loss profiler failed: $status"; exit "$status"; fi
-sudo chown "$(id -u):$(id -g)" "$WORK/g4_observed.json"
+reclaim_root_output "$WORK/g4_observed.json"
 signal_verified_process TERM "$WPID" "$WORKLOAD_STARTTIME" 2>/dev/null || true
 wait "$WPID" 2>/dev/null || true
 WPID=
@@ -614,7 +594,7 @@ touch "$WORK/g5_go"
 wait_for_workload_stopped
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "RV-loss profiler failed: $status"; exit "$status"; fi
 resume_and_wait_workload RV
-sudo chown "$(id -u):$(id -g)" "$WORK/g5_observed.json"
+reclaim_root_output "$WORK/g5_observed.json"
 python3 scripts/check-capture-evidence.py induced G5 "$WORK/g5_observed.json"
 echo "gap 5 exact evidence OK"
 

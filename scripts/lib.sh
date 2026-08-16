@@ -2,6 +2,12 @@
 # Shared helpers for the gate scripts: non-root caller check, cleanup traps,
 # container tar cap, root process pinning/signalling, capture-ready wait.
 
+# Observers run under sudo, so their published reports are root-owned 0600.
+# Hand them back to the caller before reading them.
+reclaim_root_output() {
+    sudo -n chown "$(id -u):$(id -g)" "$@"
+}
+
 require_non_root_caller() {
     [ "$(id -u)" -ne 0 ] || {
         echo "run this gate as a non-root user with passwordless sudo" >&2
@@ -179,6 +185,20 @@ wait_for_capture_ready() {
     done
     echo "observer never reported capture readiness: $wcr_log" >&2
     return 1
+}
+
+# Discover on the host copy of a container's provider directory and rewrite
+# the manifest for the container's mount namespace:
+#   discover_copied_provider SAFE_ROOT PROVIDER_BASENAME DISCOVER_BIN TARGET_DIR OUT_MANIFEST
+discover_copied_provider() {
+    dcp_module="$1/$2"
+    test -f "$dcp_module" && [ ! -L "$dcp_module" ] || {
+        echo "copied provider is not a regular file" >&2
+        return 1
+    }
+    timeout --signal=TERM --kill-after=5s 60s "$3" --module "$dcp_module" -o "$5.raw" || return 1
+    rewrite_container_manifest "$5.raw" "$5" "$1" "$4" || return 1
+    rm -f "$5.raw"
 }
 
 # Container discovery runs on a host copy of the container's provider

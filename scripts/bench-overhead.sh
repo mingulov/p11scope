@@ -17,6 +17,7 @@
 # reports median and min..max spread, not a single number.
 set -eu
 cd "$(dirname "$0")/.."
+. scripts/lib.sh
 
 MODULE=/usr/lib/softhsm/libsofthsm2.so
 WORK=target/bench-overhead
@@ -123,7 +124,7 @@ measure_profile() {
         cat "$WORK/${label}_p11scope_${n}.log" >&2
         exit 1
     fi
-    sudo chown "$(id -u):$(id -g)" "$WORK/${label}_${n}.json"
+    reclaim_root_output "$WORK/${label}_${n}.json"
     python3 -c "
 import json, sys
 ev = json.load(open('$WORK/${label}_${n}.json'))['evidence']
@@ -162,7 +163,7 @@ measure_trace() {
         cat "$WORK/trace_p11scope_${n}.log" >&2
         exit 1
     fi
-    sudo chown "$(id -u):$(id -g)" "$WORK/trace_${n}.txt"
+    reclaim_root_output "$WORK/trace_${n}.txt"
     lines=$(wc -l < "$WORK/trace_${n}.txt")
     if [ "$lines" -lt 1 ]; then
         echo "trace run $n produced no output lines" >&2

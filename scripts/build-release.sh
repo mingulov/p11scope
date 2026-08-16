@@ -216,8 +216,7 @@ wait_for_capture_ready "$WORK/profile-static-smoke.log" aggregate-only metrics
 signal_verified_process CONT "$WPID" "$TARGET_STARTTIME"
 if wait "$LPID"; then LPID=; WPID=; TARGET_STARTTIME=; else status=$?; LPID=; WPID=; TARGET_STARTTIME=; echo "static smoke workload failed: $status"; exit "$status"; fi
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "static smoke profiler failed: $status"; cat "$WORK/profile-static-smoke.log" || true; exit "$status"; fi
-# The observer ran under sudo, so its published report is root-owned 0600.
-sudo chown "$(id -u):$(id -g)" "$WORK/observed-static-smoke.json"
+reclaim_root_output "$WORK/observed-static-smoke.json"
 
 python3 scripts/check-capture-evidence.py clean-metrics \
     "$WORK/observed-static-smoke.json" spike/expected.txt

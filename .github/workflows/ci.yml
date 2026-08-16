@@ -6,7 +6,7 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  checks:
+  checks-and-e2e:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -20,16 +20,5 @@ jobs:
       - run: cargo +1.88 check --locked --workspace --all-targets
       - run: cargo +1.88 test --locked --workspace --all-targets
       - run: cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings
-  e2e:
-    runs-on: ubuntu-24.04
-    needs: checks
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install 1.88 --profile minimal
-      - run: rustup toolchain install nightly --profile minimal --component rust-src
-      # bpf-linker 0.10.4 (default feature rust-llvm-22) proxies to the LLVM bundled with the
-      # toolchain that runs it (nightly); no system LLVM is needed at build time.
-      - run: cargo +1.88 install bpf-linker --version 0.10.4 --locked
-      - run: sudo apt-get update && sudo apt-get install -y gcc softhsm2 python3
       - run: uname -r; cat /proc/sys/kernel/perf_event_paranoid; cat /proc/sys/kernel/yama/ptrace_scope
       - run: scripts/verify-attach-e2e.sh

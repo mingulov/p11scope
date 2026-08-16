@@ -113,18 +113,13 @@ capped_container_tar "$WORK/provider.tar" \
     timeout --signal=TERM --kill-after=5s 60s kubectl exec "$POD" -- \
     tar -chC "$PROVIDER_DIR" .
 tar -xf "$WORK/provider.tar" -C "$WORK/provider-safe"
-SAFE_MODULE="$PWD/$WORK/provider-safe/$PROVIDER_NAME"
-test -f "$SAFE_MODULE" && [ ! -L "$SAFE_MODULE" ] \
-    || { echo "copied provider is not a regular file" >&2; exit 1; }
 
 echo "=== host-generate manifest v4 against the pod's mount namespace ==="
-timeout --signal=TERM --kill-after=5s 60s "$PRODUCT/release/p11scope-discover" \
-    --module "$SAFE_MODULE" -o "$WORK/manifest-raw.json"
-rewrite_container_manifest "$WORK/manifest-raw.json" \
-    "$WORK/manifest-host.json" "$PWD/$WORK/provider-safe" \
-    "/proc/$HOSTPID/root$PROVIDER_DIR"
+discover_copied_provider "$PWD/$WORK/provider-safe" "$PROVIDER_NAME" \
+    "$PRODUCT/release/p11scope-discover" "/proc/$HOSTPID/root$PROVIDER_DIR" \
+    "$WORK/manifest-host.json"
 
-echo "=== unprivileged diagnostic: attach must fail without privileges ==="
+echo "=== unprivileged diagnostic: the container provider must be unreadable without privileges ==="
 set +e
 UNPRIV_OUT=$(timeout --signal=TERM --kill-after=5s 60s \
     "$PRODUCT/release/p11scope" profile \
@@ -134,6 +129,8 @@ UNPRIV_RC=$?
 set -e
 echo "$UNPRIV_OUT"
 [ "$UNPRIV_RC" -ne 0 ] || { echo "unprivileged profile unexpectedly succeeded" >&2; exit 1; }
+printf '%s\n' "$UNPRIV_OUT" | grep -Fq 'cannot open the file now (open failed: Permission denied' \
+    || { echo "unprivileged run failed for an unexpected reason" >&2; exit 1; }
 
 echo "=== attach before running the pod workload ==="
 set -- timeout --signal=TERM --kill-after=5s 45s \
@@ -165,8 +162,7 @@ else
     tail -n 20 "$WORK/profile.log" || true
     exit "$status"
 fi
-# The observer ran as root, so its published report is root-owned 0600.
-sudo -n chown "$(id -u):$(id -g)" "$WORK/observed.json"
+reclaim_root_output "$WORK/observed.json"
 python3 scripts/check-capture-evidence.py clean-metrics \
     "$WORK/observed.json" spike/expected.txt
 

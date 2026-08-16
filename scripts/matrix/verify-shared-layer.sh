@@ -12,7 +12,6 @@ NAME_B="p11scope-matrix-shared-b-$RUN_ID"
 CGROUP_PARENT="p11scope-shared-$RUN_ID.slice"
 PRODUCT=target/matrix-product
 SAFE_ROOT="$PWD/$WORK/provider-safe"
-SAFE_MODULE=
 WA=
 WB=
 SPID=
@@ -121,15 +120,8 @@ capped_container_tar "$WORK/provider.tar" \
     tar -h -c -f - -C "$PROVIDER_DIR" .
 tar -xf "$WORK/provider.tar" -C "$SAFE_ROOT"
 rm -f "$WORK/provider.tar"
-SAFE_MODULE="$SAFE_ROOT/$PROVIDER_BASE"
-test -f "$SAFE_MODULE" && [ ! -L "$SAFE_MODULE" ] \
-    || { echo "copied provider is not a regular file"; exit 1; }
-timeout --signal=TERM --kill-after=5s 60s "$PRODUCT/release/p11scope-discover" \
-    --module "$SAFE_MODULE" \
-    -o "$WORK/.manifest-safe.json"
-rewrite_container_manifest "$WORK/.manifest-safe.json" "$WORK/manifest-host.json" \
-    "$SAFE_ROOT" "/proc/$PID_A/root$PROVIDER_DIR"
-rm -f "$WORK/.manifest-safe.json"
+discover_copied_provider "$SAFE_ROOT" "$PROVIDER_BASE" "$PRODUCT/release/p11scope-discover" \
+    "/proc/$PID_A/root$PROVIDER_DIR" "$WORK/manifest-host.json"
 
 echo "=== resolve and compare broad/leaf cgroups ==="
 CGROUP_A_REL=$(awk -F: '$1 == "0" && $2 == "" { print $3; exit }' "/proc/$PID_A/cgroup")
@@ -148,7 +140,7 @@ for path in "$BROAD_PATH" "$LEAF_A_PATH" "$LEAF_B_PATH"; do
     test -d "$path" || { echo "cgroup path does not exist: $path"; exit 1; }
 done
 
-echo "=== unprivileged diagnostic: attach must fail without privileges ==="
+echo "=== unprivileged diagnostic: the container provider must be unreadable without privileges ==="
 set +e
 UNPRIV_OUT=$(timeout --signal=TERM --kill-after=5s 60s \
     "$PRODUCT/release/p11scope" profile --manifest "$WORK/manifest-host.json" \
@@ -157,6 +149,8 @@ UNPRIV_RC=$?
 set -e
 printf '%s\n' "$UNPRIV_OUT"
 [ "$UNPRIV_RC" -ne 0 ] || { echo "unprivileged profile unexpectedly succeeded"; exit 1; }
+printf '%s\n' "$UNPRIV_OUT" | grep -Fq 'cannot open the file now (open failed: Permission denied' \
+    || { echo "unprivileged run failed for an unexpected reason" >&2; exit 1; }
 
 run_capture() {
     label=$1
@@ -220,8 +214,7 @@ run_capture() {
         tail -n 30 "$WORK/$label.log" || true
         exit "$status"
     fi
-    # The observer ran as root, so its published report is root-owned 0600.
-    sudo -n chown "$(id -u):$(id -g)" "$WORK/$label.json"
+    reclaim_root_output "$WORK/$label.json"
     python3 scripts/check-capture-evidence.py clean-metrics \
         "$WORK/$label.json" spike/expected.txt "$multiplier"
 }

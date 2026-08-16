@@ -36,6 +36,7 @@
 #    membership and is captured by Task 1's descendant matching.
 set -eu
 cd "$(dirname "$0")/../.."
+. scripts/lib.sh
 
 MODULE=/usr/lib/softhsm/libsofthsm2.so
 PKCS11_CHECK_DIR=/home/user/src/m/pkcs11-check-ws/pkcs11-check
@@ -149,8 +150,7 @@ else
     exit "$status"
 fi
 tail -n 15 "$WORK/profile.log"
-# The observer ran under sudo, so its published report is root-owned 0600.
-sudo chown "$(id -u):$(id -g)" "$WORK/observed.json"
+reclaim_root_output "$WORK/observed.json"
 test "$LAUNCHER_RC" -eq 0 || { echo "pkcs11-check exited nonzero ($LAUNCHER_RC) -- see $WORK/reports/results.json"; exit 1; }
 test -s "$WORK/reports/report.jsonl" || { echo "report.jsonl was not produced"; exit 1; }
 

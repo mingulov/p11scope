@@ -28,6 +28,7 @@
 # Part 2 (privilege measurement) is below the fork-scoping proof.
 set -eu
 cd "$(dirname "$0")/../.."
+. scripts/lib.sh
 
 MODULE=/usr/lib/softhsm/libsofthsm2.so
 WORK=target/matrix-fork
@@ -117,8 +118,7 @@ else
     exit "$status"
 fi
 tail -n 15 "$WORK/profile.log"
-# The observer ran under sudo, so its published report is root-owned 0600.
-sudo chown "$(id -u):$(id -g)" "$WORK/observed.json"
+reclaim_root_output "$WORK/observed.json"
 test "$LAUNCHER_RC" -eq 0 || { echo "fork-harness (parent+children) failed, rc=$LAUNCHER_RC"; exit 1; }
 
 echo "=== verify: summed counts across parent + all children match fork-expected.txt exactly ==="
@@ -186,6 +186,8 @@ set -e
 echo "$UNPRIV_OUT"
 echo "exit code: $UNPRIV_RC"
 test "$UNPRIV_RC" -ne 0 || { echo "expected unprivileged attach to fail, it exited 0"; exit 1; }
+echo "$UNPRIV_OUT" | grep -Eq 'Operation not permitted|Permission denied' \
+    || { echo "unprivileged attach failed for an unexpected reason"; exit 1; }
 
 echo "--- CAP_BPF + CAP_PERFMON, no CAP_SYS_ADMIN (CAP_LEASE over-granted, unmeasured) ---"
 set +e

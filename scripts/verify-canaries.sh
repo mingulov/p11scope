@@ -1107,29 +1107,16 @@ run_lane() {
     [ -z "$lane_mode" ] || set -- "$@" --mode "$lane_mode"
     [ -z "$lane_unsafe" ] || set -- "$@" --unsafe-unvalidated-metadata
     set -- "$@" --duration 6 -o "$WORK/$lane.output"
-    sudo sh -c '
-        umask 077
-        starttime=$(awk '\''{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[20]; exit }'\'' "/proc/$$/stat") || exit 1
-        printf "%s %s\n" "$$" "$starttime" > "$1"
-        shift
-        exec "$@"
-    ' sh \
-        "$WORK/$lane.observer.pid" "$@" \
-        > "$WORK/$lane.observer.log" 2>&1 &
-    SPID=$!
+    launch_root_recorded_process "$WORK/$lane.observer.pid" "$WORK/$lane.observer.log" "$@" \
+        || { echo "$lane observer identity invalid"; exit 1; }
+    SPID=$ROOT_LAUNCH_PID
+    OBSERVER_PID=$ROOT_PROCESS_PID
+    OBSERVER_STARTTIME=$ROOT_PROCESS_STARTTIME
     case $build in
         feature-unsafe) lane_privacy=unsafe-unvalidated-metadata ;;
         *) [ "$kind" = metrics ] && lane_privacy=aggregate-only || lane_privacy=allowlisted ;;
     esac
     wait_for_capture_ready "$WORK/$lane.observer.log" "$lane_privacy" "$kind"
-    sudo test -s "$WORK/$lane.observer.pid" || { echo "$lane observer pid missing"; exit 1; }
-    set -- $(sudo cat "$WORK/$lane.observer.pid")
-    [ "$#" -eq 2 ] || { echo "$lane observer identity invalid"; exit 1; }
-    OBSERVER_PID=$1
-    OBSERVER_STARTTIME=$2
-    case $OBSERVER_PID:$OBSERVER_STARTTIME in
-        *[!0-9:]*) echo "$lane observer identity invalid"; exit 1 ;;
-    esac
     signal_verified_root_process STOP "$OBSERVER_PID" "$OBSERVER_STARTTIME"
     WORKER_STOPPED=1
     wait_for_stopped "$OBSERVER_PID" "$OBSERVER_STARTTIME"
@@ -1139,9 +1126,7 @@ run_lane() {
         "$OBSERVER_PID" "$WORK" "$lane" 0 16384
     assert_lanes --raw-events "$WORK/mapdump_manifest_$lane.json" "$lane" \
         "$lane_workload_pid" "$WORK/$lane.events.raw"
-    # Root wrote the map dumps and the raw event stream; the matrix
-    # assertion below reads them as the caller.
-    sudo chown "$(id -u):$(id -g)" "$WORK"/mapdump_*_"$lane".json \
+    reclaim_root_output "$WORK"/mapdump_*_"$lane".json \
         "$WORK/$lane.events.raw"
     signal_verified_root_process CONT "$OBSERVER_PID" "$OBSERVER_STARTTIME"
     # sudo suspends itself when its command stops; resume it too or `wait`
@@ -1160,8 +1145,7 @@ run_lane() {
         echo "$lane workload failed: $status"
         exit "$status"
     fi
-    # The observer ran as root, so its published report is root-owned 0600.
-    sudo chown "$(id -u):$(id -g)" "$WORK/$lane.output"
+    reclaim_root_output "$WORK/$lane.output"
     python3 scripts/check-capture-evidence.py canary "$lane" "$WORK/$lane.output"
     # A metrics lane emits no per-call events; keep its empty raw dump out
     # of the artifact set the matrix assertion scans.
@@ -1216,27 +1200,17 @@ run_start_lane() {
         --pid "$WPID" \
         --mode profile --duration 8 -o "$WORK/$start_lane.output"
     [ -z "$start_unsafe" ] || set -- "$@" --unsafe-unvalidated-metadata
-    sudo sh -c '
-        umask 077
-        starttime=$(awk '\''{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[20]; exit }'\'' "/proc/$$/stat") || exit 1
-        printf "%s %s\n" "$$" "$starttime" > "$1"
-        shift
-        exec "$@"
-    ' sh \
-        "$WORK/$start_lane.observer.pid" "$@" > "$WORK/$start_lane.observer.log" 2>&1 &
-    SPID=$!
+    launch_root_recorded_process "$WORK/$start_lane.observer.pid" \
+        "$WORK/$start_lane.observer.log" "$@" \
+        || { echo "$start_lane observer identity invalid"; exit 1; }
+    SPID=$ROOT_LAUNCH_PID
+    OBSERVER_PID=$ROOT_PROCESS_PID
+    OBSERVER_STARTTIME=$ROOT_PROCESS_STARTTIME
     wait_for_capture_ready "$WORK/$start_lane.observer.log" "$start_privacy" profile
-    set -- $(sudo cat "$WORK/$start_lane.observer.pid")
-    [ "$#" -eq 2 ] || { echo "$start_lane observer identity invalid"; exit 1; }
-    OBSERVER_PID=$1
-    OBSERVER_STARTTIME=$2
-    case $OBSERVER_PID:$OBSERVER_STARTTIME in
-        *[!0-9:]*) echo "$start_lane observer identity invalid"; exit 1 ;;
-    esac
     touch "$WORK/$start_lane.go"
     sudo python3 scripts/dump-owned-bpf-maps.py "$OBSERVER_PID" "$WORK" \
         "$start_lane" "$start_entries" 16384
-    sudo chown "$(id -u):$(id -g)" "$WORK"/mapdump_*_"$start_lane".json
+    reclaim_root_output "$WORK"/mapdump_*_"$start_lane".json
     if [ "$start_oracle" = --fault-starts ]; then
         assert_lanes "$start_oracle" "$WORK/mapdump_manifest_$start_lane.json" \
             "$start_workload_pid"
@@ -1266,8 +1240,7 @@ run_start_lane() {
         exit 1
     }
     if wait "$SPID"; then SPID=; OBSERVER_PID=; OBSERVER_STARTTIME=; else status=$?; SPID=; OBSERVER_PID=; OBSERVER_STARTTIME=; echo "$start_lane observer failed: $status"; exit "$status"; fi
-    # The observer ran as root, so its published report is root-owned 0600.
-    sudo chown "$(id -u):$(id -g)" "$WORK/$start_lane.output"
+    reclaim_root_output "$WORK/$start_lane.output"
     if [ "$start_lane" = default-safe-start ]; then
         PUBLISH_TMP=$(mktemp "$WORK/.mapdump_START_live.XXXXXXXX")
         cp "$WORK/mapdump_START_$start_lane.json" "$PUBLISH_TMP"

@@ -10,7 +10,6 @@ IMAGE="p11scope-matrix-docker:$RUN_ID"
 NAME="p11scope-matrix-docker-$RUN_ID"
 PRODUCT=target/matrix-product
 SAFE_ROOT="$PWD/$WORK/provider-safe"
-SAFE_MODULE=
 WPID=
 SPID=
 SUPERVISOR_PID=
@@ -89,15 +88,8 @@ capped_container_tar "$WORK/provider.tar" \
     tar -h -c -f - -C "$PROVIDER_DIR" .
 tar -xf "$WORK/provider.tar" -C "$SAFE_ROOT"
 rm -f "$WORK/provider.tar"
-SAFE_MODULE="$SAFE_ROOT/$PROVIDER_BASE"
-test -f "$SAFE_MODULE" && [ ! -L "$SAFE_MODULE" ] \
-    || { echo "copied provider is not a regular file"; exit 1; }
-timeout --signal=TERM --kill-after=5s 60s "$PRODUCT/release/p11scope-discover" \
-    --module "$SAFE_MODULE" \
-    -o "$WORK/.manifest-safe.json"
-rewrite_container_manifest "$WORK/.manifest-safe.json" "$WORK/manifest-host.json" \
-    "$SAFE_ROOT" "/proc/$PID/root$PROVIDER_DIR"
-rm -f "$WORK/.manifest-safe.json"
+discover_copied_provider "$SAFE_ROOT" "$PROVIDER_BASE" "$PRODUCT/release/p11scope-discover" \
+    "/proc/$PID/root$PROVIDER_DIR" "$WORK/manifest-host.json"
 
 echo "=== resolve container cgroup ==="
 CGROUP_REL=$(awk -F: '$1 == "0" && $2 == "" { print $3; exit }' "/proc/$PID/cgroup")
@@ -105,7 +97,7 @@ case $CGROUP_REL in /*) ;; *) echo "unified cgroup entry missing for container $
 CGROUP_PATH="/sys/fs/cgroup$CGROUP_REL"
 test -d "$CGROUP_PATH" || { echo "cgroup path does not exist: $CGROUP_PATH"; exit 1; }
 
-echo "=== unprivileged diagnostic: attach must fail without privileges ==="
+echo "=== unprivileged diagnostic: the container provider must be unreadable without privileges ==="
 set +e
 UNPRIV_OUT=$(timeout --signal=TERM --kill-after=5s 60s \
     "$PRODUCT/release/p11scope" profile --manifest "$WORK/manifest-host.json" \
@@ -114,6 +106,8 @@ UNPRIV_RC=$?
 set -e
 printf '%s\n' "$UNPRIV_OUT"
 [ "$UNPRIV_RC" -ne 0 ] || { echo "unprivileged profile unexpectedly succeeded"; exit 1; }
+printf '%s\n' "$UNPRIV_OUT" | grep -Fq 'cannot open the file now (open failed: Permission denied' \
+    || { echo "unprivileged run failed for an unexpected reason" >&2; exit 1; }
 
 echo "=== capture one container after observer readiness ==="
 timeout --signal=TERM --kill-after=5s 60s docker exec "$NAME" sh -c \
@@ -159,8 +153,7 @@ else
     tail -n 30 "$WORK/profile.log" || true
     exit "$status"
 fi
-# The observer ran as root, so its published report is root-owned 0600.
-sudo -n chown "$(id -u):$(id -g)" "$WORK/observed.json"
+reclaim_root_output "$WORK/observed.json"
 python3 scripts/check-capture-evidence.py clean-metrics \
     "$WORK/observed.json" spike/expected.txt
 

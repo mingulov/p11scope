@@ -459,13 +459,51 @@ fn open_in_target(pid: u32, path: &str) -> Result<File, String> {
     open_object(Path::new(&format!("/proc/{pid}/root{path}")))
 }
 
-/// `(inode, size)` for a `--module` hint. `/proc/<pid>/maps` renders the *mount's*
-/// device, not the file's `st_dev` (see `identity::mapping_file_key`), so the device
-/// cannot be compared here; the size is carried instead so that an inode number reused
-/// on another filesystem cannot pull an unrelated object into the scan.
+/// `(inode, size)` for a `--module` hint, read through the *observer's* filesystem view.
+/// `None` whenever the hint names a path that does not exist here — which is the normal
+/// case for a containerized target, whose module lives only under `/proc/<pid>/root`.
 fn hint_identity(hint: &Path) -> Option<(u64, u64)> {
     let metadata = open_object(hint).ok()?.metadata().ok()?;
     Some((metadata.ino(), metadata.len()))
+}
+
+/// How a `--module` hint matched a mapped object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HintMatch {
+    /// The target's rendered pathname equals the hint verbatim.
+    Path,
+    /// The hint's own inode number equals the mapped object's.
+    Inode,
+}
+
+/// Whether a hint match may be attributed to the object that was just opened.
+///
+/// Only an *inode* match needs corroboration: `/proc/<pid>/maps` renders the mount's
+/// device rather than the file's `st_dev` (see `identity::mapping_file_key`), so the
+/// device cannot be compared and a bare inode number can repeat across filesystems.
+/// Size agreement stands in for it.
+///
+/// A *path* match must never be gated on size. Matching by inode requires
+/// `hint_identity` to have succeeded, so `hint_size == None` implies the match was by
+/// path — a target in another mount namespace, where the hint does not resolve on the
+/// host at all. Gating that on a size the observer cannot read would reject every
+/// correctly-matched containerized module.
+fn hint_gate(
+    kind: HintMatch,
+    hint_size: Option<u64>,
+    actual_size: Option<u64>,
+) -> Result<(), String> {
+    if kind == HintMatch::Path || hint_size == actual_size {
+        return Ok(());
+    }
+    let bytes = |size: Option<u64>| size.map_or("unknown".to_string(), |size| size.to_string());
+    Err(format!(
+        "a --module hint has this object's inode number but a different size ({} bytes \
+         in the hint, {} bytes in the target); refusing to attribute an object whose \
+         inode number is reused on another filesystem",
+        bytes(hint_size),
+        bytes(actual_size)
+    ))
 }
 
 pub fn scan_pid(request: &ScanRequest<'_>) -> Result<ScanOutcome, String> {
@@ -514,17 +552,23 @@ pub fn scan_pid(request: &ScanRequest<'_>) -> Result<ScanOutcome, String> {
             Some((MappedPath::Usable(path), _)) => Some(path.clone()),
             _ => None,
         };
-        let matched: Vec<usize> = (0..request.hints.len())
-            .filter(|index| {
-                hint_ids[*index].is_some_and(|(inode, _)| inode == key.inode)
-                    || usable.as_deref() == Some(request.hints[*index].as_path())
+        // Path equality is the stronger evidence, so it wins when both hold.
+        let matched: Vec<(usize, HintMatch)> = (0..request.hints.len())
+            .filter_map(|index| {
+                if usable.as_deref() == Some(request.hints[index].as_path()) {
+                    Some((index, HintMatch::Path))
+                } else if hint_ids[index].is_some_and(|(inode, _)| inode == key.inode) {
+                    Some((index, HintMatch::Inode))
+                } else {
+                    None
+                }
             })
             .collect();
         let hinted = !matched.is_empty();
         if !request.hints.is_empty() && !hinted {
             continue;
         }
-        for index in &matched {
+        for (index, _) in &matched {
             hint_matched[*index] = true;
         }
         let subject = match &named {
@@ -553,18 +597,23 @@ pub fn scan_pid(request: &ScanRequest<'_>) -> Result<ScanOutcome, String> {
                 continue;
             }
         };
-        // The hint matched on inode alone; confirm the size before attributing this
-        // object to it, so a number reused on another filesystem cannot slip in.
-        if hinted
-            && !matched.iter().any(|index| {
-                hint_ids[*index].map(|(_, len)| len) == file.metadata().ok().map(|m| m.len())
-            })
-        {
+        // Corroborate an inode-only match before attributing the object to the hint.
+        let actual_size = file.metadata().ok().map(|metadata| metadata.len());
+        let mut refusal = None;
+        let attributable = matched.iter().any(|(index, kind)| {
+            match hint_gate(*kind, hint_ids[*index].map(|(_, size)| size), actual_size) {
+                Ok(()) => true,
+                Err(reason) => {
+                    refusal = Some(reason);
+                    false
+                }
+            }
+        });
+        if hinted && !attributable {
             skipped.push(Skipped {
                 subject,
-                reason: "inode matches a --module hint but the file size does not; \
-                         refusing to attribute an unrelated object"
-                    .into(),
+                reason: refusal
+                    .unwrap_or_else(|| "no --module hint could be attributed here".into()),
             });
             continue;
         }
@@ -753,6 +802,33 @@ mod tests {
         );
         // Ordinary data must not generate this diagnostic.
         assert!(detect_tables(&vec![0u8; 4096], 0x7000, &maps).1.is_empty());
+    }
+
+    /// Case 3 is the one that matters and the one no end-to-end test can reach here:
+    /// a hint naming a path that exists only inside the target's mount namespace has no
+    /// local identity at all, so the size gate must not apply to it. Reproducing that
+    /// for real needs a container or a second mount namespace, which this slice's tests
+    /// deliberately do not require; the docker gate in a later task exercises it.
+    #[test]
+    fn only_an_inode_match_is_gated_on_size() {
+        // 1. Inode match, sizes agree.
+        assert_eq!(hint_gate(HintMatch::Inode, Some(4096), Some(4096)), Ok(()));
+        // 2. Inode match, sizes differ: refused, and the reason names the collision.
+        let refused = hint_gate(HintMatch::Inode, Some(4096), Some(8192)).unwrap_err();
+        assert!(
+            refused.contains("inode number")
+                && refused.contains("4096")
+                && refused.contains("8192")
+                && refused.contains("reused on another filesystem"),
+            "{refused}"
+        );
+        // 3. Path match with no local identity (containerized target): accepted.
+        assert_eq!(hint_gate(HintMatch::Path, None, Some(8192)), Ok(()));
+        // A path match is never gated on size even when both sizes are known.
+        assert_eq!(hint_gate(HintMatch::Path, Some(1), Some(2)), Ok(()));
+        // An inode match cannot arise without a local identity, but must not be
+        // silently accepted if one ever did.
+        assert!(hint_gate(HintMatch::Inode, None, Some(8192)).is_err());
     }
 
     #[test]

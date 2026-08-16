@@ -389,8 +389,20 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
   (2026-08-16, `checks-and-e2e` success). Follow-ups noted for 1b: re-measure the `--cgroup` minimum
   (`verify-fork-scope.sh` still over-grants CAP_LEASE), one privileged `--cgroup` smoke after
   the `_cgroup_file` removal, prune the now-unused root `p11scope-discover` dev-dependency.**
-- **Slice 1b — discovery engine and commands**: memory-scan + loader/export-hook discovery,
-  `run`, `inspect`, `doctor`, `--module` optional, schema v2. Plan written after 1a lands.
+- **Slice 1b — discovery engine and commands.** Split in two independently shippable plans
+  when 1a landed (2026-08-16), because the memory scan needs no BPF change while the live
+  hooks need the attach-cookie/dynamic-slot refactor:
+  - **Slice 1b-1 — memory-scan discovery, `inspect`, `doctor`**
+    ([plan](2026-08-16-productization-slice1b-1-discovery-scan.md)): scan the target's
+    mappings for `CK_FUNCTION_LIST`/`CK_INTERFACE`, pin and attach without a manifest or the
+    helper, multi-module plans and per-module semantic state, `--module`/`--manifest`
+    optional, evidence `discovery[]`/`authority`, schema v2. The eBPF object is unchanged.
+    Scanning happens once at attach time; a module loaded later is not discovered (1b-2).
+    **Status: IN PROGRESS (started 2026-08-16).**
+  - **Slice 1b-2 — live discovery and `run`**: BPF loader (`_dl_debug_state`) and export
+    uretprobes, `DESCRIPTORS` + attach-cookie semantics with dynamic slot allocation,
+    `discovery::Engine`, `pause.rs`, `run -- cmd`, `attach_gap_ms`, mid-capture
+    module-ambiguity purge. Plan written after 1b-1 lands.
 - **Slice 2 — capture quality**: ring/epoll, budgets, safe-policy params, per-module profile
   sections, filters, snapshots.
 - **Slice 3 — structure**: module split, evidence plumbing, docs consolidation, multi-kernel CI.

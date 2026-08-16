@@ -974,8 +974,6 @@ WORKLOAD_STARTTIME=
 SPID=
 OBSERVER_PID=
 OBSERVER_STARTTIME=
-SUPERVISOR_PID=
-SUPERVISOR_STARTTIME=
 WORKER_STOPPED=
 PUBLISH_TMP=
 cleanup() {
@@ -984,13 +982,12 @@ cleanup() {
     set +e
     if [ -n "$OBSERVER_PID" ] && [ -n "$WORKER_STOPPED" ]; then
         signal_verified_root_process CONT "$OBSERVER_PID" "$OBSERVER_STARTTIME" \
-            "$SUPERVISOR_PID" "$SUPERVISOR_STARTTIME" 2>/dev/null || true
+            2>/dev/null || true
+        [ -z "$SPID" ] || kill -CONT "$SPID" 2>/dev/null || true
         WORKER_STOPPED=
     fi
-    OBSERVER_PID=
-    OBSERVER_STARTTIME=
-    if [ -n "$SUPERVISOR_PID" ] && [ -n "$SUPERVISOR_STARTTIME" ]; then
-        signal_verified_root_process TERM "$SUPERVISOR_PID" "$SUPERVISOR_STARTTIME" \
+    if [ -n "$OBSERVER_PID" ] && [ -n "$OBSERVER_STARTTIME" ]; then
+        signal_verified_root_process TERM "$OBSERVER_PID" "$OBSERVER_STARTTIME" \
             2>/dev/null || true
     elif [ -n "$SPID" ]; then
         kill -TERM "$SPID" 2>/dev/null || true
@@ -1028,45 +1025,13 @@ set -- "$WORK"/feature-build/release/build/p11scope-*/out/p11scope-ebpf
 FEATURE_BPF=$1
 python3 scripts/check-bpf-map-defs.py --policy-inventory "$DEFAULT_BPF" "$FEATURE_BPF"
 
-observer_worker_pid() {
-    ow_supervisor=$1
-    ow_supervisor_starttime=$2
-    ow_attempt=0
-    while [ "$ow_attempt" -lt 160 ]; do
-        root_process_matches_starttime "$ow_supervisor" "$ow_supervisor_starttime" || {
-            echo "supervisor $ow_supervisor exited or changed identity" >&2
-            return 1
-        }
-        ow_children=$(sudo cat "/proc/$ow_supervisor/task/$ow_supervisor/children" 2>/dev/null || true)
-        set -- $ow_children
-        if [ "$#" -eq 1 ]; then
-            ow_worker=$1
-            ow_worker_starttime=$(root_process_starttime "$ow_worker") || return 1
-            ow_parent=$(sudo awk '$1 == "PPid:" { print $2; exit }' \
-                "/proc/$ow_worker/status" 2>/dev/null) || return 1
-            ow_recheck=$(sudo cat "/proc/$ow_supervisor/task/$ow_supervisor/children" \
-                2>/dev/null || true)
-            if [ "$ow_parent" = "$ow_supervisor" ] \
-                && [ "$ow_recheck" = "$ow_children" ] \
-                && root_process_matches_starttime "$ow_supervisor" "$ow_supervisor_starttime"; then
-                printf '%s %s\n' "$ow_worker" "$ow_worker_starttime"
-                return 0
-            fi
-        fi
-        ow_attempt=$((ow_attempt + 1))
-        sleep 0.05
-    done
-    echo "supervisor $ow_supervisor did not expose exactly one capture worker" >&2
-    return 1
-}
-
 wait_for_stopped() {
     wfs_pid=$1
     wfs_starttime=$2
     wfs_attempt=0
     while [ "$wfs_attempt" -lt 160 ]; do
         root_process_matches_starttime "$wfs_pid" "$wfs_starttime" || {
-            echo "capture worker $wfs_pid exited or changed identity" >&2
+            echo "observer $wfs_pid exited or changed identity" >&2
             return 1
         }
         wfs_state=$(sudo awk '$1 == "State:" { print $2; exit }' \
@@ -1075,7 +1040,7 @@ wait_for_stopped() {
         wfs_attempt=$((wfs_attempt + 1))
         sleep 0.05
     done
-    echo "capture worker $wfs_pid did not reach State: T after SIGSTOP" >&2
+    echo "observer $wfs_pid did not reach State: T after SIGSTOP" >&2
     return 1
 }
 
@@ -1157,23 +1122,15 @@ run_lane() {
         *) [ "$kind" = metrics ] && lane_privacy=aggregate-only || lane_privacy=allowlisted ;;
     esac
     wait_for_capture_ready "$WORK/$lane.observer.log" "$lane_privacy" "$kind"
-    sudo test -s "$WORK/$lane.observer.pid" || { echo "$lane supervisor pid missing"; exit 1; }
+    sudo test -s "$WORK/$lane.observer.pid" || { echo "$lane observer pid missing"; exit 1; }
     set -- $(sudo cat "$WORK/$lane.observer.pid")
-    [ "$#" -eq 2 ] || { echo "$lane supervisor identity invalid"; exit 1; }
-    SUPERVISOR_PID=$1
-    SUPERVISOR_STARTTIME=$2
-    case $SUPERVISOR_PID:$SUPERVISOR_STARTTIME in
-        *[!0-9:]*) echo "$lane supervisor identity invalid"; exit 1 ;;
-    esac
-    set -- $(observer_worker_pid "$SUPERVISOR_PID" "$SUPERVISOR_STARTTIME")
-    [ "$#" -eq 2 ] || { echo "$lane worker identity invalid"; exit 1; }
+    [ "$#" -eq 2 ] || { echo "$lane observer identity invalid"; exit 1; }
     OBSERVER_PID=$1
     OBSERVER_STARTTIME=$2
     case $OBSERVER_PID:$OBSERVER_STARTTIME in
-        *[!0-9:]*) echo "$lane worker identity invalid"; exit 1 ;;
+        *[!0-9:]*) echo "$lane observer identity invalid"; exit 1 ;;
     esac
-    signal_verified_root_process STOP "$OBSERVER_PID" "$OBSERVER_STARTTIME" \
-        "$SUPERVISOR_PID" "$SUPERVISOR_STARTTIME"
+    signal_verified_root_process STOP "$OBSERVER_PID" "$OBSERVER_STARTTIME"
     WORKER_STOPPED=1
     wait_for_stopped "$OBSERVER_PID" "$OBSERVER_STARTTIME"
     touch "$WORK/$lane.go"
@@ -1186,12 +1143,12 @@ run_lane() {
     # assertion below reads them as the caller.
     sudo chown "$(id -u):$(id -g)" "$WORK"/mapdump_*_"$lane".json \
         "$WORK/$lane.events.raw"
-    signal_verified_root_process CONT "$OBSERVER_PID" "$OBSERVER_STARTTIME" \
-        "$SUPERVISOR_PID" "$SUPERVISOR_STARTTIME"
+    signal_verified_root_process CONT "$OBSERVER_PID" "$OBSERVER_STARTTIME"
+    # sudo suspends itself when its command stops; resume it too or `wait`
+    # below never returns (and the exited observer stays a zombie under it).
+    kill -CONT "$SPID"
     WORKER_STOPPED=
-    OBSERVER_PID=
-    OBSERVER_STARTTIME=
-    if wait "$SPID"; then SPID=; SUPERVISOR_PID=; SUPERVISOR_STARTTIME=; else status=$?; SPID=; SUPERVISOR_PID=; SUPERVISOR_STARTTIME=; echo "$lane observer failed: $status"; exit "$status"; fi
+    if wait "$SPID"; then SPID=; OBSERVER_PID=; OBSERVER_STARTTIME=; else status=$?; SPID=; OBSERVER_PID=; OBSERVER_STARTTIME=; echo "$lane observer failed: $status"; exit "$status"; fi
     signal_verified_process CONT "$WPID" "$WORKLOAD_STARTTIME"
     if wait "$WPID"; then
         WPID=
@@ -1270,18 +1227,11 @@ run_start_lane() {
     SPID=$!
     wait_for_capture_ready "$WORK/$start_lane.observer.log" "$start_privacy" profile
     set -- $(sudo cat "$WORK/$start_lane.observer.pid")
-    [ "$#" -eq 2 ] || { echo "$start_lane supervisor identity invalid"; exit 1; }
-    SUPERVISOR_PID=$1
-    SUPERVISOR_STARTTIME=$2
-    case $SUPERVISOR_PID:$SUPERVISOR_STARTTIME in
-        *[!0-9:]*) echo "$start_lane supervisor identity invalid"; exit 1 ;;
-    esac
-    set -- $(observer_worker_pid "$SUPERVISOR_PID" "$SUPERVISOR_STARTTIME")
-    [ "$#" -eq 2 ] || { echo "$start_lane worker identity invalid"; exit 1; }
+    [ "$#" -eq 2 ] || { echo "$start_lane observer identity invalid"; exit 1; }
     OBSERVER_PID=$1
     OBSERVER_STARTTIME=$2
     case $OBSERVER_PID:$OBSERVER_STARTTIME in
-        *[!0-9:]*) echo "$start_lane worker identity invalid"; exit 1 ;;
+        *[!0-9:]*) echo "$start_lane observer identity invalid"; exit 1 ;;
     esac
     touch "$WORK/$start_lane.go"
     sudo python3 scripts/dump-owned-bpf-maps.py "$OBSERVER_PID" "$WORK" \
@@ -1315,9 +1265,7 @@ run_start_lane() {
         echo "$start_lane workload exit status $start_status, expected SIGTERM status 143"
         exit 1
     }
-    OBSERVER_PID=
-    OBSERVER_STARTTIME=
-    if wait "$SPID"; then SPID=; SUPERVISOR_PID=; SUPERVISOR_STARTTIME=; else status=$?; SPID=; SUPERVISOR_PID=; SUPERVISOR_STARTTIME=; echo "$start_lane observer failed: $status"; exit "$status"; fi
+    if wait "$SPID"; then SPID=; OBSERVER_PID=; OBSERVER_STARTTIME=; else status=$?; SPID=; OBSERVER_PID=; OBSERVER_STARTTIME=; echo "$start_lane observer failed: $status"; exit "$status"; fi
     # The observer ran as root, so its published report is root-owned 0600.
     sudo chown "$(id -u):$(id -g)" "$WORK/$start_lane.output"
     if [ "$start_lane" = default-safe-start ]; then

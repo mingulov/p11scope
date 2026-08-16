@@ -128,7 +128,6 @@ signal_pinned_process() {
     esac
     $spp_python - "$@" <<'PY'
 import os
-import select
 import signal
 import sys
 
@@ -139,35 +138,16 @@ signals = {
     "STOP": signal.SIGSTOP,
     "TERM": signal.SIGTERM,
 }
-if len(sys.argv) not in (4, 6) or sys.argv[1] not in signals:
-    raise SystemExit("usage: SIGNAL PID STARTTIME [PARENT_PID PARENT_STARTTIME]")
+if len(sys.argv) != 4 or sys.argv[1] not in signals:
+    raise SystemExit("usage: SIGNAL PID STARTTIME")
 
-
-def identity(pid_text, start_text):
-    pid, expected = int(pid_text), int(start_text)
-    fd = os.pidfd_open(pid)
-    raw = open(f"/proc/{pid}/stat", "rb").read()
-    tail = raw.rsplit(b") ", 1)[1].split()
-    if len(tail) < 20 or int(tail[19]) != expected:
-        os.close(fd)
-        raise SystemExit(f"refusing changed process identity {pid}")
-    return pid, fd, int(tail[1])
-
-
-parent = None
-if len(sys.argv) == 6:
-    parent = identity(sys.argv[4], sys.argv[5])
-target = identity(sys.argv[2], sys.argv[3])
-if parent is not None:
-    if target[2] != parent[0]:
-        raise SystemExit("worker is not a live child of the pinned supervisor")
-    poller = select.poll()
-    poller.register(parent[1], select.POLLIN)
-    if poller.poll(0):
-        raise SystemExit("pinned supervisor exited before worker signal")
-signal.pidfd_send_signal(target[1], signals[sys.argv[1]], None, 0)
-if parent is not None and poller.poll(0):
-    raise SystemExit("pinned supervisor exited during worker signal")
+pid, expected = int(sys.argv[2]), int(sys.argv[3])
+fd = os.pidfd_open(pid)
+raw = open(f"/proc/{pid}/stat", "rb").read()
+tail = raw.rsplit(b") ", 1)[1].split()
+if len(tail) < 20 or int(tail[19]) != expected:
+    raise SystemExit(f"refusing changed process identity {pid}")
+signal.pidfd_send_signal(fd, signals[sys.argv[1]], None, 0)
 PY
 }
 

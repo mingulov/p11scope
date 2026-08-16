@@ -33,22 +33,18 @@ test -f "$MODULE" || { echo "SoftHSM2 not installed at $MODULE"; exit 1; }
 WPID=
 WORKLOAD_STARTTIME=
 SPID=
-SUPERVISOR_PID=
-SUPERVISOR_STARTTIME=
 OBSERVER_PID=
 OBSERVER_STARTTIME=
 cleanup() {
     CLEANUP_STATUS=$?
     trap - EXIT INT TERM
     set +e
-    if [ -n "$SUPERVISOR_PID" ] && [ -n "$SUPERVISOR_STARTTIME" ]; then
-        signal_verified_root_process TERM "$SUPERVISOR_PID" "$SUPERVISOR_STARTTIME" \
+    if [ -n "$OBSERVER_PID" ] && [ -n "$OBSERVER_STARTTIME" ]; then
+        signal_verified_root_process TERM "$OBSERVER_PID" "$OBSERVER_STARTTIME" \
             2>/dev/null || true
     elif [ -n "$SPID" ]; then
         kill -TERM "$SPID" 2>/dev/null || true
     fi
-    OBSERVER_PID=
-    OBSERVER_STARTTIME=
     if [ -n "$WPID" ] && [ -n "$WORKLOAD_STARTTIME" ]; then
         signal_verified_process KILL "$WPID" "$WORKLOAD_STARTTIME" 2>/dev/null || true
     elif [ -n "$WPID" ]; then
@@ -100,47 +96,15 @@ python3 scripts/check-bpf-map-defs.py "$RING_BPF" EVENTS=4096 START=16384 RV_COU
 python3 scripts/check-bpf-map-defs.py "$STATE_BPF" EVENTS=262144 START=1 RV_COUNTS=1
 python3 scripts/check-bpf-map-defs.py --policy-inventory "$DEFAULT_BPF" "$FREEZE_BPF"
 
-observer_worker_pid() {
-    owp_supervisor=$1
-    owp_supervisor_starttime=$2
-    owp_attempt=0
-    while [ "$owp_attempt" -lt 160 ]; do
-        root_process_matches_starttime "$owp_supervisor" "$owp_supervisor_starttime" || {
-            echo "supervisor $owp_supervisor exited or changed identity" >&2
-            return 1
-        }
-        owp_children=$(sudo cat "/proc/$owp_supervisor/task/$owp_supervisor/children" 2>/dev/null || true)
-        set -- $owp_children
-        if [ "$#" -eq 1 ]; then
-            owp_worker=$1
-            owp_worker_starttime=$(root_process_starttime "$owp_worker") || return 1
-            owp_parent=$(sudo awk '$1 == "PPid:" { print $2; exit }' \
-                "/proc/$owp_worker/status" 2>/dev/null) || return 1
-            owp_recheck=$(sudo cat "/proc/$owp_supervisor/task/$owp_supervisor/children" \
-                2>/dev/null || true)
-            if [ "$owp_parent" = "$owp_supervisor" ] \
-                && [ "$owp_recheck" = "$owp_children" ] \
-                && root_process_matches_starttime "$owp_supervisor" "$owp_supervisor_starttime"; then
-                printf '%s %s\n' "$owp_worker" "$owp_worker_starttime"
-                return 0
-            fi
-        fi
-        owp_attempt=$((owp_attempt + 1))
-        sleep 0.05
-    done
-    echo "supervisor $owp_supervisor did not expose exactly one capture worker" >&2
-    return 1
-}
-
-pin_supervisor() {
+pin_observer() {
     ps_pidfile=$1
-    sudo test -s "$ps_pidfile" || { echo "supervisor pid missing: $ps_pidfile" >&2; return 1; }
+    sudo test -s "$ps_pidfile" || { echo "observer pid missing: $ps_pidfile" >&2; return 1; }
     set -- $(sudo cat "$ps_pidfile")
-    [ "$#" -eq 2 ] || { echo "invalid supervisor identity record" >&2; return 1; }
-    SUPERVISOR_PID=$1
-    SUPERVISOR_STARTTIME=$2
-    case $SUPERVISOR_PID:$SUPERVISOR_STARTTIME in
-        *[!0-9:]*) echo "invalid supervisor identity" >&2; return 1 ;;
+    [ "$#" -eq 2 ] || { echo "invalid observer identity record" >&2; return 1; }
+    OBSERVER_PID=$1
+    OBSERVER_STARTTIME=$2
+    case $OBSERVER_PID:$OBSERVER_STARTTIME in
+        *[!0-9:]*) echo "invalid observer identity" >&2; return 1 ;;
     esac
 }
 
@@ -412,18 +376,14 @@ sudo sh -c '
     shift
     exec "$@"
 ' sh \
-    "$WORK/freeze-supervisor.pid" \
+    "$WORK/freeze-observer.pid" \
     "$P11SCOPE_FREEZE" profile --manifest "$WORK/freeze-manifest.json" \
     --cgroup "$CGROUP_PATH" \
     --mode profile --unsafe-unvalidated-metadata --duration 20 \
     -o "$WORK/freeze-observed.json" > "$WORK/freeze-profile.log" 2>&1 &
 SPID=$!
 wait_for_capture_ready "$WORK/freeze-profile.log" unsafe-unvalidated-metadata profile
-pin_supervisor "$WORK/freeze-supervisor.pid"
-set -- $(observer_worker_pid "$SUPERVISOR_PID" "$SUPERVISOR_STARTTIME")
-[ "$#" -eq 2 ] || { echo "freeze worker identity invalid"; exit 1; }
-OBSERVER_PID=$1
-OBSERVER_STARTTIME=$2
+pin_observer "$WORK/freeze-observer.pid"
 root_process_matches_starttime "$OBSERVER_PID" "$OBSERVER_STARTTIME" || exit 1
 sudo python3 scripts/dump-owned-bpf-maps.py \
     "$OBSERVER_PID" "$WORK" freeze-before 0 16384
@@ -435,10 +395,8 @@ sudo python3 scripts/dump-owned-bpf-maps.py \
     "$OBSERVER_PID" "$WORK" freeze-after 0 16384
 assert_dynamic_maps_advanced "$WORK/mapdump_manifest_freeze-before.json" \
     "$WORK/mapdump_manifest_freeze-after.json"
-OBSERVER_PID=
-OBSERVER_STARTTIME=
-signal_verified_root_process INT "$SUPERVISOR_PID" "$SUPERVISOR_STARTTIME"
-if wait "$SPID"; then SPID=; SUPERVISOR_PID=; SUPERVISOR_STARTTIME=; else status=$?; SPID=; SUPERVISOR_PID=; SUPERVISOR_STARTTIME=; echo "freeze observer failed: $status"; exit "$status"; fi
+signal_verified_root_process INT "$OBSERVER_PID" "$OBSERVER_STARTTIME"
+if wait "$SPID"; then SPID=; OBSERVER_PID=; OBSERVER_STARTTIME=; else status=$?; SPID=; OBSERVER_PID=; OBSERVER_STARTTIME=; echo "freeze observer failed: $status"; exit "$status"; fi
 resume_and_wait_workload freeze
 # Every observer here runs under sudo, so each published report is
 # root-owned 0600. Hand it back to the caller before reading it.

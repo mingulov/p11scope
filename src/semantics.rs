@@ -1417,7 +1417,9 @@ impl State {
                 }
             }
             lifecycle::FINALIZE if ev.rv == CkRv::OK.0 => {
-                self.retire_process(process);
+                // C_Finalize ends this module's Cryptoki. Another module in the
+                // same process keeps its own sessions and operations.
+                self.retire_scope(process, Some(meta.module));
             }
             lifecycle::LOGIN => self.apply_auth(process, ev, meta),
             lifecycle::LOGOUT => self.apply_auth(process, ev, meta),
@@ -1785,31 +1787,59 @@ impl State {
     }
 
     pub fn retire_process(&mut self, process: ProcessKey) -> u64 {
+        self.retire_scope(process, None)
+    }
+
+    /// Drops session-scoped state for `process`. `None` retires the whole
+    /// process — every module's state, plus the process-scoped bookkeeping —
+    /// which is what a process exit, a pid reuse or `CKR_CRYPTOKI_NOT_INITIALIZED`
+    /// means. `Some(id)` retires one module's Cryptoki (`C_Finalize`) and
+    /// leaves every other module in that same process untouched.
+    ///
+    /// Returns whether the process had any state before the sweep; only
+    /// meaningful for the whole-process case, which is the only caller
+    /// reading it.
+    fn retire_scope(&mut self, process: ProcessKey, module: Option<ModuleId>) -> u64 {
         let had_state = self.has_process_state(process);
-        // Every module's sessions in this process: the sweep matches on the
-        // `ProcessKey` alone, never on a module.
+        // The `ProcessKey` is always required; the module narrows the sweep
+        // only when one module is finalizing.
+        let owned = |owner: &ProcessKey, session: &SessionRef| {
+            *owner == process && module.is_none_or(|id| session.module == id)
+        };
         let sessions: Vec<SessionRef> = self
             .open
             .keys()
-            .filter(|(owner, _)| *owner == process)
+            .filter(|(owner, session)| owned(owner, session))
             .map(|(_, session)| *session)
             .collect();
         for session in &sessions {
             self.retire_session(process, *session);
         }
-        self.active_ops.retain(|(owner, _, _), _| *owner != process);
-        self.find_active.retain(|(owner, _)| *owner != process);
+        // Sessions the capture never saw opening leave state behind that no
+        // `retire_session` above could have reached.
+        self.active_ops
+            .retain(|(owner, session, _), _| !owned(owner, session));
+        self.find_active
+            .retain(|(owner, session)| !owned(owner, session));
         self.inherited_ambiguous
-            .retain(|(owner, _)| *owner != process);
-        self.pending.retain(|(owner, _, _), _| *owner != process);
+            .retain(|(owner, session)| !owned(owner, session));
+        self.pending
+            .retain(|(owner, session, _), _| !owned(owner, session));
         for detached in self.detached.values_mut() {
-            if detached.owner.is_some_and(|(owner, _)| owner == process) {
+            if detached
+                .owner
+                .is_some_and(|(owner, session)| owned(&owner, &session))
+            {
                 detached.owner = None;
             }
         }
-        self.next_pseudonym.remove(&process);
-        if self.current_process.get(&process.pid) == Some(&process) {
-            self.current_process.remove(&process.pid);
+        if module.is_none() {
+            // Pseudonym numbering is per process and must not restart while
+            // another module's sessions are still live under it.
+            self.next_pseudonym.remove(&process);
+            if self.current_process.get(&process.pid) == Some(&process) {
+                self.current_process.remove(&process.pid);
+            }
         }
         u64::from(had_state)
     }

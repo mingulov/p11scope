@@ -5,7 +5,7 @@ perf_event_paranoid=4.
 
 | Question | Answer | Evidence |
 | --- | --- | --- |
-| `/proc/<pid>/maps` for a same-uid non-descendant | readable | `tests/proc_access.rs::maps_is_readable_and_mem_is_refused_for_a_same_uid_non_descendant` |
+| `/proc/<pid>/maps` for a same-uid non-descendant | readable | `tests/proc_access.rs::mem_access_for_a_same_uid_non_descendant_follows_the_documented_ptrace_rules` |
 | `/proc/<pid>/mem` for the same target under `ptrace_scope=1` | refused | same test |
 | `/proc/self/root/<path>` opens the mapped inode | yes | `tests/proc_access.rs::proc_root_path_opens_the_same_inode_the_mapping_names` |
 | `mapping_file_key` resolves on this filesystem | yes, btrfs (`/home` is `/dev/sda1` btrfs) | same test |

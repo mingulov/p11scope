@@ -1,6 +1,8 @@
 //! Measures the /proc access rules the scan depends on (spec §4.9, §6.6). Each test
-//! states its precondition and SKIPs loudly rather than asserting a policy the host
-//! does not have — the point is a recorded measurement, not a forced pass.
+//! asserts the outcome the documented rules require for the observed configuration
+//! (root vs non-root, `ptrace_scope` value, filesystem identity resolution) instead of
+//! skipping a precondition it cannot control — `eprintln!` output is only for
+//! `--nocapture` observability, no test result depends on it being read.
 
 use std::io::Read as _;
 use std::process::{Child, Command};
@@ -26,23 +28,29 @@ fn same_uid_non_descendant() -> (u32, Child) {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let pids: Vec<&str> = stdout.split_whitespace().collect();
-    assert_eq!(
-        pids.len(),
-        1,
-        "expected exactly one 'sleep 31.4159' process, found {}: {:?}",
-        pids.len(),
-        pids
-    );
+    if pids.len() != 1 {
+        // Don't leak the target(s) on the failure path — kill whatever pgrep matched.
+        for pid in &pids {
+            let _ = Command::new("kill").arg(pid).status();
+        }
+        panic!(
+            "expected exactly one 'sleep 31.4159' process, found {}: {:?}",
+            pids.len(),
+            pids
+        );
+    }
     let pid: u32 = pids[0].parse().expect("pgrep sleep pid");
     (pid, child)
 }
 
+/// `/proc/<pid>/maps` needs `PTRACE_MODE_READ` (same uid, or `CAP_SYS_PTRACE`) and is not
+/// subject to Yama. `/proc/<pid>/mem` needs `PTRACE_MODE_ATTACH`, additionally gated by
+/// `kernel.yama.ptrace_scope`: 0 = same uid allowed; 1..=3 = refused for a non-descendant
+/// without `CAP_SYS_PTRACE` (root always has it). Every branch below asserts the outcome
+/// the documented rule requires for the configuration actually observed — none of them
+/// are skipped.
 #[test]
-fn maps_is_readable_and_mem_is_refused_for_a_same_uid_non_descendant() {
-    if unsafe { libc::geteuid() } == 0 {
-        eprintln!("SKIP: running as root; Yama does not apply");
-        return;
-    }
+fn mem_access_for_a_same_uid_non_descendant_follows_the_documented_ptrace_rules() {
     let (pid, mut spawner) = same_uid_non_descendant();
     let _ = spawner.wait();
 
@@ -56,18 +64,28 @@ fn maps_is_readable_and_mem_is_refused_for_a_same_uid_non_descendant() {
         let mut b = [0u8; 1];
         f.read_exact(&mut b)
     });
-    if ptrace_scope() >= 1 {
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let scope = ptrace_scope();
+    if is_root {
         assert!(
-            mem.is_err(),
-            "ptrace_scope={} must refuse mem for a non-descendant",
-            ptrace_scope()
+            mem.is_ok(),
+            "root (CAP_SYS_PTRACE) must be able to read mem: {mem:?}"
+        );
+    } else if scope == 0 {
+        assert!(
+            mem.is_ok(),
+            "ptrace_scope=0 must allow mem for a same-uid target: {mem:?}"
         );
     } else {
-        eprintln!(
-            "MEASURED: ptrace_scope=0, mem access allowed: {:?}",
-            mem.is_ok()
+        assert!(
+            mem.is_err(),
+            "ptrace_scope={scope} must refuse mem for a non-descendant: {mem:?}"
         );
     }
+    eprintln!(
+        "MEASURED: euid_root={is_root}, ptrace_scope={scope}, mem access allowed: {:?}",
+        mem.is_ok()
+    );
     let _ = Command::new("kill").arg(pid.to_string()).status();
 }
 
@@ -118,7 +136,14 @@ fn proc_root_path_opens_the_same_inode_the_mapping_names() {
             );
         }
         Err(error) => {
-            eprintln!("MEASURED: mapping_file_key unavailable on this filesystem: {error}")
+            eprintln!("MEASURED: mapping_file_key unavailable on this filesystem: {error}");
+            // No mountinfo-derived device to check, but the identity claim still has to
+            // hold: fall back to plain fstat and prove the inode agrees with the mapping.
+            let fallback_inode = std::os::unix::fs::MetadataExt::ino(&file.metadata().unwrap());
+            assert_eq!(
+                fallback_inode, exe.inode,
+                "mapping_file_key unavailable ({error}); fstat fallback inode must still match the mapping"
+            );
         }
     }
 }

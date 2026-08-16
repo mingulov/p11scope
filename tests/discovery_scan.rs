@@ -1,0 +1,460 @@
+//! The scan's oracle is the offline helper: for the same provider loaded in this
+//! process, every table entry the scan finds must have the offset
+//! `p11scope-discover` computes. Both run in-process here; the helper dlopens the
+//! fixture (test-only — the observer itself never does).
+//!
+//! Run with `--test-threads=1`: every test dlopens a fixture into the shared
+//! process image and then scans that image.
+
+use p11scope::discovery::hooks::HookRegistry;
+use p11scope::discovery::scan::{ScanLimits, ScanOutcome, ScanRequest, scan_pid};
+use p11scope_manifest::manifest::{Resolution, SurfaceSource};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn tmp(name: &str) -> PathBuf {
+    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn compile(dir: &Path, name: &str, source: &Path, defines: &[&str]) -> PathBuf {
+    let so = dir.join(format!("{name}.so"));
+    let ok = Command::new("gcc")
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&so)
+        .arg(source)
+        .args(defines)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "gcc failed for {name}");
+    so
+}
+
+fn build_fixture(dir: &Path, name: &str, defines: &[&str]) -> PathBuf {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("crates/discover/tests/fixture/version_matrix.c");
+    compile(dir, name, &source, defines)
+}
+
+/// dlopen + call C_GetFunctionList so the fixture's static tables are filled,
+/// exactly as a real application would before the observer scans it.
+fn load_and_populate(so: &Path) {
+    let c = std::ffi::CString::new(so.to_str().unwrap()).unwrap();
+    let handle = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    assert!(!handle.is_null(), "dlopen {}", so.display());
+    let symbol = std::ffi::CString::new("C_GetFunctionList").unwrap();
+    let entry = unsafe { libc::dlsym(handle, symbol.as_ptr()) };
+    assert!(!entry.is_null(), "C_GetFunctionList missing");
+    let entry: extern "C" fn(*mut *mut std::ffi::c_void) -> u64 =
+        unsafe { std::mem::transmute(entry) };
+    let mut table: *mut std::ffi::c_void = std::ptr::null_mut();
+    assert_eq!(
+        entry(&mut table),
+        0,
+        "fixture C_GetFunctionList must succeed"
+    );
+}
+
+fn scan_self(hints: &[PathBuf]) -> ScanOutcome {
+    let hooks = HookRegistry::builtin();
+    scan_pid(&ScanRequest {
+        pid: std::process::id(),
+        hints,
+        hooks: &hooks,
+        limits: ScanLimits::default(),
+    })
+    .expect("scanning our own process must not fail")
+}
+
+fn helper_offsets(so: &Path) -> BTreeMap<String, u64> {
+    let manifest = p11scope_discover::discover::discover(so).expect("helper discovery");
+    let mut out = BTreeMap::new();
+    for surface in &manifest.surfaces {
+        if !matches!(surface.source, SurfaceSource::LegacyFunctionList) {
+            continue;
+        }
+        for function in &surface.functions {
+            if let Resolution::Resolved { file_offset, .. } = function.resolution {
+                out.insert(function.name.clone(), file_offset);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn scanned_offsets_equal_the_helpers_for_the_legacy_table() {
+    let dir = tmp("scan-oracle");
+    let so = build_fixture(&dir, "oracle", &["-DMATRIX_INTERFACES=0"]);
+    load_and_populate(&so);
+
+    let ScanOutcome::Scanned { modules, .. } = scan_self(&[so.clone()]) else {
+        panic!("/proc/self/mem must always be readable");
+    };
+    let module = modules
+        .iter()
+        .find(|m| m.path.ends_with("oracle.so"))
+        .expect("the fixture must be discovered");
+
+    let legacy = module
+        .tables
+        .iter()
+        .find(|t| t.version == (2, 40))
+        .expect("the 2.40 legacy table must be found");
+    let scanned: BTreeMap<String, u64> = legacy
+        .entries
+        .iter()
+        .map(|e| (e.name.to_string(), e.file_offset))
+        .collect();
+
+    let expected = helper_offsets(&so);
+    assert!(!expected.is_empty(), "the helper must produce an oracle");
+    assert_eq!(
+        scanned, expected,
+        "scanned offsets must equal the helper's exactly"
+    );
+    assert!(
+        legacy.entries.len() >= 60,
+        "a 2.40 table has 68 slots: {}",
+        legacy.entries.len()
+    );
+}
+
+#[test]
+fn every_supported_version_layout_is_found_with_its_documented_entry_count() {
+    // (major, minor, expected entry+null count) — the N of spec §4.1 step 4.
+    for (major, minor, expected) in [(2u8, 0u8, 67usize), (2, 40, 68), (3, 0, 92), (3, 2, 104)] {
+        let dir = tmp(&format!("scan-v{major}-{minor}"));
+        let so = build_fixture(
+            &dir,
+            "versioned",
+            &[
+                &format!("-DLEGACY_MAJOR={major}"),
+                &format!("-DLEGACY_MINOR={minor}"),
+                "-DMATRIX_INTERFACES=0",
+            ],
+        );
+        load_and_populate(&so);
+        let ScanOutcome::Scanned { modules, .. } = scan_self(&[so.clone()]) else {
+            panic!("scan must be available");
+        };
+        let module = modules
+            .iter()
+            .find(|m| m.path.ends_with("versioned.so"))
+            .unwrap();
+        let table = module
+            .tables
+            .iter()
+            .find(|t| t.version == (major, minor))
+            .unwrap_or_else(|| panic!("{major}.{minor} table not found"));
+        assert_eq!(
+            table.entries.len() + table.null_entries.len(),
+            expected,
+            "{major}.{minor} must decode {expected} slots"
+        );
+    }
+}
+
+/// A provider-owned, statically initialised `CK_FUNCTION_LIST` plus the
+/// `CK_INTERFACE` array that names it — the shape a PKCS#11 v3 provider publishes
+/// and hands back by pointer from `C_GetInterface`. `version_matrix.c` cannot serve
+/// here: it builds its interface list in the *caller's* buffer, so the triples live
+/// on the application heap and never appear in any mapping of the provider object
+/// that the scan reads (measured: see the task report).
+const INTERFACE_ARRAY_FIXTURE: &str = r#"
+typedef unsigned char CK_BYTE;
+typedef unsigned long CK_ULONG;
+typedef unsigned long CK_RV;
+typedef unsigned long CK_FLAGS;
+typedef struct { CK_BYTE major; CK_BYTE minor; } CK_VERSION;
+typedef struct { char *pInterfaceName; void *pFunctionList; CK_FLAGS flags; } CK_INTERFACE;
+typedef struct { CK_VERSION version; void *functions[68]; } Table;
+
+#define CKR_OK 0UL
+#define S(n) static CK_RV s##n(void) { return CKR_OK; }
+#define S10(m) S(m##0) S(m##1) S(m##2) S(m##3) S(m##4) S(m##5) S(m##6) S(m##7) S(m##8) S(m##9)
+S10(0) S10(1) S10(2) S10(3) S10(4) S10(5)
+S(60) S(61) S(62) S(63) S(64) S(65) S(66) S(67)
+#define L10(m) s##m##0, s##m##1, s##m##2, s##m##3, s##m##4, s##m##5, s##m##6, s##m##7, s##m##8, s##m##9
+
+static Table published_table = {
+    {2, 40},
+    {L10(0), L10(1), L10(2), L10(3), L10(4), L10(5),
+     s60, s61, s62, s63, s64, s65, s66, s67}
+};
+
+static char standard_name[] = "PKCS 11";
+static char vendor_name[] = "Acme Vendor ABI";
+
+static CK_INTERFACE published[] = {
+    {standard_name, &published_table, 0},
+    {vendor_name, &published_table, 0},
+};
+
+CK_RV C_GetFunctionList(void **out) {
+    if (!out) return 1;
+    *out = &published_table;
+    return CKR_OK;
+}
+
+CK_RV C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags) {
+    (void)name; (void)version; (void)flags;
+    if (!out) return 1;
+    *out = &published[0];
+    return CKR_OK;
+}
+"#;
+
+#[test]
+fn interfaces_are_recorded_with_their_name_class() {
+    let dir = tmp("scan-interfaces");
+    let source = dir.join("interface_array.c");
+    std::fs::write(&source, INTERFACE_ARRAY_FIXTURE).unwrap();
+    let so = compile(&dir, "ifaces", &source, &[]);
+    load_and_populate(&so);
+
+    let ScanOutcome::Scanned { modules, .. } = scan_self(&[so.clone()]) else {
+        panic!("scan must be available")
+    };
+    let module = modules
+        .iter()
+        .find(|m| m.path.ends_with("ifaces.so"))
+        .unwrap();
+    assert!(
+        !module.tables.is_empty(),
+        "the published 2.40 table must be found first: {module:?}"
+    );
+    assert!(
+        module
+            .interfaces
+            .iter()
+            .any(|i| i.name_class == "exact_standard"
+                && i.name_lossy.as_deref() == Some("PKCS 11")),
+        "the fixture publishes a \"PKCS 11\" interface: {:?}",
+        module.interfaces
+    );
+    assert!(
+        module
+            .interfaces
+            .iter()
+            .any(|i| i.name_class == "other" && i.name_lossy.as_deref() == Some("Acme Vendor ABI")),
+        "the fixture publishes a vendor-named interface too: {:?}",
+        module.interfaces
+    );
+    // Every accepted triple must name a table this scan actually decoded.
+    assert!(
+        module
+            .interfaces
+            .iter()
+            .all(|i| i.table.is_some_and(|index| index < module.tables.len())),
+        "{:?}",
+        module.interfaces
+    );
+}
+
+#[test]
+fn a_table_less_object_and_a_non_elf_hint_produce_no_module_and_no_panic() {
+    let dir = tmp("scan-negative");
+    let plain = dir.join("plain.so");
+    let c = dir.join("plain.c");
+    std::fs::write(&c, "int unrelated(void){return 1;}\n").unwrap();
+    assert!(
+        Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&plain)
+            .arg(&c)
+            .status()
+            .unwrap()
+            .success()
+    );
+    load_and_populate_ignoring_missing_entry(&plain);
+
+    let ScanOutcome::Scanned { modules, .. } = scan_self(&[plain.clone()]) else {
+        panic!("scan must be available")
+    };
+    // The hint is honoured, so the object is identified; it just has nothing in it.
+    let module = modules
+        .iter()
+        .find(|m| m.path.ends_with("plain.so"))
+        .expect("a hinted object that is mapped must be identified");
+    assert!(
+        module.tables.is_empty() && module.interfaces.is_empty() && module.exports.is_empty(),
+        "an object with no table must yield no tables: {module:?}"
+    );
+
+    let text = dir.join("not-elf.so");
+    std::fs::write(&text, b"not an elf at all\n").unwrap();
+    let ScanOutcome::Scanned { skipped, .. } = scan_self(&[text.clone()]) else {
+        panic!("scan must be available")
+    };
+    // The hint names a file that is not mapped at all: recorded, never fatal.
+    assert!(
+        skipped.iter().any(|s| s.subject.contains("not-elf.so")),
+        "{skipped:?}"
+    );
+}
+
+fn load_and_populate_ignoring_missing_entry(so: &Path) {
+    let c = std::ffi::CString::new(so.to_str().unwrap()).unwrap();
+    let handle = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    assert!(!handle.is_null(), "dlopen {}", so.display());
+}
+
+#[test]
+fn the_per_object_byte_cap_is_enforced_as_a_skip_not_a_truncation() {
+    let dir = tmp("scan-cap");
+    let so = build_fixture(&dir, "capped", &["-DMATRIX_INTERFACES=0"]);
+    load_and_populate(&so);
+    let hooks = HookRegistry::builtin();
+    let outcome = scan_pid(&ScanRequest {
+        pid: std::process::id(),
+        hints: &[so.clone()],
+        hooks: &hooks,
+        limits: ScanLimits {
+            per_object_bytes: 1,
+            total_bytes: 512 * 1024 * 1024,
+        },
+    })
+    .unwrap();
+    let ScanOutcome::Scanned {
+        modules, skipped, ..
+    } = outcome
+    else {
+        panic!("scan must be available")
+    };
+    // The object is still identified — it is the *decode* that the cap refuses — so
+    // the emptiness assertion below is about a module that really exists.
+    assert!(
+        modules.iter().any(|m| m.path.ends_with("capped.so")),
+        "a capped object must be reported, not dropped: {modules:?}"
+    );
+    assert!(
+        modules.iter().all(|m| m.tables.is_empty()),
+        "nothing may be decoded from a capped object"
+    );
+    assert!(
+        skipped.iter().any(|s| s.reason.contains("too_large")),
+        "the cap must be reported as too_large: {skipped:?}"
+    );
+}
+
+/// An unreadable `/proc/<pid>/mem` costs the tables, never the object inventory and
+/// never the call (spec §4.1 step 3, §4.9). The target is a same-uid *non-descendant*,
+/// which `ptrace_scope >= 1` refuses; the expected outcome is derived from the live
+/// configuration rather than assumed, exactly as `proc_access.rs` does.
+#[test]
+fn an_unreadable_proc_mem_is_reported_as_unavailable_not_as_an_error() {
+    let child = Command::new("setsid")
+        .args(["--fork", "sleep", "27.1828"])
+        .spawn()
+        .expect("spawn setsid sleep");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let out = Command::new("pgrep")
+        .args(["-f", "sleep 27.1828"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let pids: Vec<&str> = stdout.split_whitespace().collect();
+    for pid in &pids {
+        if pids.len() != 1 {
+            let _ = Command::new("kill").arg(pid).status();
+        }
+    }
+    assert_eq!(pids.len(), 1, "expected one reparented sleep: {pids:?}");
+    let pid: u32 = pids[0].parse().unwrap();
+
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).expect("target exe link");
+    let hooks = HookRegistry::builtin();
+    let outcome = scan_pid(&ScanRequest {
+        pid,
+        hints: &[exe.clone()],
+        hooks: &hooks,
+        limits: ScanLimits::default(),
+    });
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+    drop(child);
+
+    let outcome = outcome.expect("an unreadable /proc/<pid>/mem is never fatal");
+    let scope: i32 = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .map(|s| s.trim().parse().unwrap_or(0))
+        .unwrap_or(0);
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let refused = if is_root { scope > 2 } else { scope > 0 };
+    eprintln!(
+        "MEASURED: euid_root={is_root}, ptrace_scope={scope}, outcome={:?}",
+        outcome.unavailable_reason()
+    );
+    assert_eq!(
+        outcome.unavailable_reason(),
+        refused.then_some("ptrace"),
+        "ptrace_scope={scope}, euid_root={is_root}"
+    );
+    // Either way the hinted object is identified from maps + .dynsym alone.
+    let module = outcome
+        .modules()
+        .iter()
+        .find(|m| m.path == exe.display().to_string())
+        .unwrap_or_else(|| panic!("{} must still be identified", exe.display()));
+    if refused {
+        assert!(
+            module.tables.is_empty() && module.interfaces.is_empty(),
+            "no memory was read, so nothing may be claimed: {module:?}"
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|s| s.subject == format!("/proc/{pid}/mem")),
+            "the refusal itself must be recorded: {:?}",
+            outcome.skipped()
+        );
+    }
+}
+
+#[test]
+fn softhsm_if_installed_is_discovered_without_false_positives() {
+    let module = Path::new("/usr/lib/softhsm/libsofthsm2.so");
+    if !module.exists() {
+        eprintln!("SKIP: SoftHSM2 not installed");
+        return;
+    }
+    load_and_populate(module);
+    let ScanOutcome::Scanned { modules, .. } = scan_self(&[module.to_path_buf()]) else {
+        panic!("scan must be available")
+    };
+    let found = modules
+        .iter()
+        .find(|m| m.path.contains("libsofthsm2.so"))
+        .expect("SoftHSM2 must be discovered");
+    assert!(
+        !found.tables.is_empty(),
+        "SoftHSM2 must expose at least one table"
+    );
+    let expected = helper_offsets(module);
+    let mut checked = 0usize;
+    for table in &found.tables {
+        for entry in &table.entries {
+            if let Some(want) = expected.get(entry.name) {
+                assert_eq!(
+                    entry.file_offset, *want,
+                    "{} offset disagrees with the helper",
+                    entry.name
+                );
+                checked += 1;
+            }
+        }
+    }
+    eprintln!(
+        "softhsm: {} tables, {checked} entries cross-checked against the helper",
+        found.tables.len()
+    );
+    // Without this the loop above could agree with the helper vacuously.
+    assert!(
+        checked >= 60,
+        "a 2.40 table has 68 slots; only {checked} were cross-checked"
+    );
+}

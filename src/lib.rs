@@ -3,6 +3,7 @@
 pub mod attach;
 pub mod cli;
 pub mod discovery;
+pub mod doctor;
 pub mod events;
 pub mod inspect;
 pub mod kinds;

@@ -24,3 +24,7 @@ serde_json = "1"
 [[test]]
 name = "identity"
 required-features = ["identify"]
+
+[[test]]
+name = "elf"
+required-features = ["identify"]

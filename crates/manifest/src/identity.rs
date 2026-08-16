@@ -204,7 +204,7 @@ pub fn inspect_file(file: &std::fs::File) -> Result<InspectedObject, String> {
 }
 
 #[cfg(feature = "identify")]
-fn read_object_bytes(file: &std::fs::File) -> Result<Vec<u8>, String> {
+pub(crate) fn read_object_bytes(file: &std::fs::File) -> Result<Vec<u8>, String> {
     let metadata = file
         .metadata()
         .map_err(|error| format!("metadata failed: {error}"))?;

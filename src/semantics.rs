@@ -569,6 +569,64 @@ mod corrective_tests {
         assert_eq!(state.pending_at_end(), 0);
     }
 
+    /// A successful `C_AsyncJoin` *assigns* the joining process/session (spec
+    /// §"Successful `C_AsyncJoin` assigns the joining process/session"), and
+    /// the lookup key is process-blind, so custody can legitimately move
+    /// between processes. Custody has to move whole: the record's process must
+    /// follow its owner, or the previous holder still gets to destroy it.
+    #[test]
+    fn a_cross_process_join_moves_custody_off_the_previous_holder() {
+        let p = plan(&[
+            "C_OpenSession",
+            "C_CloseSession",
+            "C_FindObjectsInit",
+            "C_AsyncGetID",
+            "C_AsyncJoin",
+            "C_AsyncComplete",
+            "C_Finalize",
+        ]);
+        let find_init = crate::kinds::function_id("C_FindObjectsInit").unwrap();
+        let a = ProcessKey::from_pid(100);
+        let b = ProcessKey::from_pid(200);
+        let mut state = State::new(&p);
+
+        // B detaches an async id, then closes the session holding it.
+        state.observe_process(b, &open(&p, 9, 3));
+        state.observe_process(b, &event(&p, "C_FindObjectsInit", 9, CkRv::PENDING.0));
+        let mut get_id = event(&p, "C_AsyncGetID", 9, CkRv::OK.0);
+        get_id.target_function = find_init;
+        get_id.async_value = 42;
+        state.observe_process(b, &get_id);
+        state.observe_process(b, &event(&p, "C_CloseSession", 9, 0));
+        assert!(state.has_process_state(b), "B still holds the floating id");
+
+        // A joins it. That hands custody over — B keeps nothing.
+        state.observe_process(a, &open(&p, 5, 3));
+        let mut join = event(&p, "C_AsyncJoin", 5, CkRv::OK.0);
+        join.target_function = find_init;
+        join.async_value = 42;
+        state.observe_process(a, &join);
+        assert!(
+            !state.has_process_state(b),
+            "the join moved the id off B, so B holds nothing"
+        );
+
+        // So B finalizing its own library cannot tear down A's operation.
+        state.observe_process(b, &event(&p, "C_Finalize", SESSION_NONE, 0));
+        assert_eq!(
+            state.pending_at_end(),
+            1,
+            "A's adopted operation is not B's to finalize"
+        );
+
+        let mut complete = event(&p, "C_AsyncComplete", 5, CkRv::OK.0);
+        complete.target_function = find_init;
+        complete.async_value = CkRv::OK.0;
+        state.observe_process(a, &complete);
+        assert_eq!(state.semantic_evidence().async_orphans, 0);
+        assert_eq!(state.pending_at_end(), 0);
+    }
+
     /// The other half of the same trade: a floating id belonging to the
     /// process that finalizes *is* dropped, because a later `C_Initialize`
     /// there could mint the same key and `C_AsyncJoin` a dead operation.
@@ -1009,9 +1067,15 @@ struct Detached {
     /// joinable — `C_AsyncJoin` re-adopts it into another session — which is a
     /// live state, not a dead one.
     owner: Option<(ProcessKey, SessionRef)>,
-    /// The process whose Cryptoki issued the id. The map key is
-    /// `(ModuleId, ...)` and a `ModuleId` is plan-global, so without this a
-    /// floating record could not be told apart from another process's.
+    /// The process holding the id — the one that issued it, or the one a
+    /// `C_AsyncJoin` handed it to. The map key is `(ModuleId, ...)` and a
+    /// `ModuleId` is plan-global, so without this a floating record could not
+    /// be told apart from another process's.
+    ///
+    /// Invariant: `owner.is_some() => owner.0 == process`. Both write sites —
+    /// the `ASYNC_GET_ID` insert and the `ASYNC_JOIN` assignment — set the two
+    /// together; `owner` is only ever cleared to `None`, never reassigned to a
+    /// different process on its own.
     process: ProcessKey,
 }
 
@@ -1743,7 +1807,14 @@ impl State {
                     ev.target_function,
                     ev.async_value,
                 )) {
-                    Some(detached) => detached.owner = Some((process, session)),
+                    Some(detached) => {
+                        // A successful join *assigns* the joining
+                        // process/session, so custody moves whole: leaving
+                        // `process` behind would let the previous holder's
+                        // C_Finalize destroy an operation it no longer owns.
+                        detached.owner = Some((process, session));
+                        detached.process = process;
+                    }
                     None => self.evidence.async_orphans += 1,
                 }
             }
@@ -2128,8 +2199,10 @@ impl State {
     }
 
     /// Whether `process` still holds session-scoped state. `Some(id)` asks
-    /// about one module's state only. Shares `scoped` with `retire_scope`, so
-    /// the question and the sweep that answers it cannot disagree.
+    /// about one module's state only. Shares both `scoped` (session-keyed
+    /// maps) and `scoped_detached` (the module-keyed async ids) with
+    /// `retire_scope`, so the question and the sweep that answers it cannot
+    /// disagree.
     fn has_scope_state(&self, process: ProcessKey, module: Option<ModuleId>) -> bool {
         let owned = scoped(process, module);
         let owned_id = scoped_detached(process, module);

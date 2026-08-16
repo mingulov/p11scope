@@ -45,10 +45,13 @@ fn same_uid_non_descendant() -> (u32, Child) {
 
 /// `/proc/<pid>/maps` needs `PTRACE_MODE_READ` (same uid, or `CAP_SYS_PTRACE`) and is not
 /// subject to Yama. `/proc/<pid>/mem` needs `PTRACE_MODE_ATTACH`, additionally gated by
-/// `kernel.yama.ptrace_scope`: 0 = same uid allowed; 1..=3 = refused for a non-descendant
-/// without `CAP_SYS_PTRACE` (root always has it). Every branch below asserts the outcome
-/// the documented rule requires for the configuration actually observed — none of them
-/// are skipped.
+/// `kernel.yama.ptrace_scope` (spec §4.9): 0 = same uid allowed; 1 = descendants only
+/// unless `CAP_SYS_PTRACE`; 2 = `CAP_SYS_PTRACE` only; 3 = refused for *everyone*, including
+/// root/`CAP_SYS_PTRACE` holders — in `yama_ptrace_access_check`
+/// (`security/yama/yama_lsm.c`), the `YAMA_SCOPE_NO_ATTACH` case returns `-EPERM` directly
+/// with no `ns_capable(..., CAP_SYS_PTRACE)` check, unlike scopes 1 and 2. Every branch
+/// below asserts the outcome the documented rule requires for the configuration actually
+/// observed — none of them are skipped.
 #[test]
 fn mem_access_for_a_same_uid_non_descendant_follows_the_documented_ptrace_rules() {
     let (pid, mut spawner) = same_uid_non_descendant();
@@ -66,10 +69,15 @@ fn mem_access_for_a_same_uid_non_descendant_follows_the_documented_ptrace_rules(
     });
     let is_root = unsafe { libc::geteuid() } == 0;
     let scope = ptrace_scope();
-    if is_root {
+    if is_root && scope <= 2 {
         assert!(
             mem.is_ok(),
-            "root (CAP_SYS_PTRACE) must be able to read mem: {mem:?}"
+            "root (CAP_SYS_PTRACE) must be able to read mem at ptrace_scope={scope} (<=2): {mem:?}"
+        );
+    } else if is_root {
+        assert!(
+            mem.is_err(),
+            "ptrace_scope={scope} (YAMA_SCOPE_NO_ATTACH) must refuse mem even for root: {mem:?}"
         );
     } else if scope == 0 {
         assert!(

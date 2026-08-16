@@ -1,6 +1,6 @@
-//! Pins manifest-recorded objects to their current identity without holding read
-//! leases. `check_unchanged` gives cheap, best-effort change detection via
-//! `(ino, size, ctime)`; it is not a security boundary — the leased,
+//! Pins objects — manifest-recorded or scan-discovered — to their current identity
+//! without holding read leases. `check_unchanged` gives cheap, best-effort change
+//! detection via `(ino, size, ctime)`; it is not a security boundary — the leased,
 //! provenance-checked verification path it replaces was removed by
 //! Productization Slice 1a (formerly `src/verify.rs`, restorable from history).
 
@@ -9,10 +9,15 @@ use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
-use p11scope_manifest::identity::{inspect_file, open_object};
+use p11scope_manifest::identity::{
+    IdentityKind, ObjectIdentity, inspect_file, mapping_file_key, open_object,
+};
 use p11scope_manifest::manifest::{Manifest, Resolution};
+use p11scope_manifest::maps::{Device, ObjectKey};
 
+use crate::discovery::scan::{ScannedModule, Skipped};
 use crate::manifest_input::{MAX_TOTAL_OBJECT_BYTES, validate_structure};
+use crate::process::PidPin;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Pin {
@@ -32,13 +37,61 @@ fn pin_of(file: &std::fs::File) -> Result<Pin, String> {
     })
 }
 
-/// Every manifest object opened, identity-matched, and pinned by `(ino, size, ctime)`.
-/// No read leases are held: `check_unchanged` is a cheap, best-effort check, not a
-/// guarantee that the bytes cannot change between the check and Aya's attach.
+#[derive(Debug)]
+struct Entry {
+    file: std::fs::File,
+    pin: Pin,
+    path: String,
+    sha256: String,
+    build_id: Option<String>,
+    identity_source: &'static str,
+}
+
+impl Entry {
+    fn new(
+        file: std::fs::File,
+        pin: Pin,
+        path: String,
+        identity: &ObjectIdentity,
+        identity_source: &'static str,
+    ) -> Self {
+        Self {
+            file,
+            pin,
+            path,
+            // `inspect_file` always records a whole-file digest.
+            sha256: identity.sha256.clone().unwrap_or_default(),
+            build_id: match identity.kind {
+                IdentityKind::GnuBuildId => identity.value.clone(),
+                _ => None,
+            },
+            identity_source,
+        }
+    }
+}
+
+/// What a pinned object is, for the `discovery[]` report.
+#[derive(Debug, Clone, Copy)]
+pub struct PinnedSummary<'a> {
+    pub key: ObjectKey,
+    pub path: &'a str,
+    pub sha256: &'a str,
+    pub build_id: Option<&'a str>,
+    /// "mountinfo" or "stat" — how the mapping identity was confirmed.
+    pub identity_source: &'static str,
+}
+
+/// Every object opened, identity-matched, and pinned by `(ino, size, ctime)`, keyed
+/// by the `(device, inode)` a mapping of it shows. No read leases are held:
+/// `check_unchanged` is a cheap, best-effort check, not a guarantee that the bytes
+/// cannot change between the check and Aya's attach.
 #[derive(Debug)]
 pub struct PinnedObjects {
-    files: BTreeMap<String, std::fs::File>,
-    pins: BTreeMap<String, Pin>,
+    by_key: BTreeMap<ObjectKey, Entry>,
+    /// Manifest paths → key, so `attach_path(&str)` keeps working. Scan-sourced
+    /// objects are not listed here: their paths are the *target's*, which two
+    /// processes in different mount namespaces can spell identically.
+    by_path: BTreeMap<String, ObjectKey>,
     /// Latched by `check_unchanged` the first time any pin differs.
     changed: std::cell::Cell<bool>,
 }
@@ -46,10 +99,30 @@ pub struct PinnedObjects {
 impl PinnedObjects {
     /// Path Aya may reopen without re-resolving the untrusted manifest path.
     pub fn attach_path(&self, original: &str) -> Result<PathBuf, String> {
-        self.files
+        let key = *self
+            .by_path
             .get(original)
-            .map(|file| PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())))
-            .ok_or_else(|| format!("object path {original:?} was not pinned"))
+            .ok_or_else(|| format!("object path {original:?} was not pinned"))?;
+        self.attach_path_for(key)
+    }
+
+    /// Attach path for an object discovered by the scan.
+    pub fn attach_path_for(&self, key: ObjectKey) -> Result<PathBuf, String> {
+        self.by_key
+            .get(&key)
+            .map(|entry| PathBuf::from(format!("/proc/self/fd/{}", entry.file.as_raw_fd())))
+            .ok_or_else(|| format!("object {key:?} was not pinned"))
+    }
+
+    /// Every pinned object, for `discovery[]`.
+    pub fn pinned(&self) -> impl Iterator<Item = PinnedSummary<'_>> {
+        self.by_key.iter().map(|(key, entry)| PinnedSummary {
+            key: *key,
+            path: &entry.path,
+            sha256: &entry.sha256,
+            build_id: entry.build_id.as_deref(),
+            identity_source: entry.identity_source,
+        })
     }
 
     /// `Ok(true)` when every pinned object still has the `(ino, size, ctime)` seen
@@ -59,8 +132,8 @@ impl PinnedObjects {
         if self.changed.get() {
             return Ok(false);
         }
-        for (path, file) in &self.files {
-            if pin_of(file).map_err(|e| format!("{path}: {e}"))? != self.pins[path] {
+        for entry in self.by_key.values() {
+            if pin_of(&entry.file).map_err(|e| format!("{}: {e}", entry.path))? != entry.pin {
                 self.changed.set(true);
                 return Ok(false);
             }
@@ -72,6 +145,39 @@ impl PinnedObjects {
     pub fn provider_changed(&self) -> bool {
         self.changed.get()
     }
+}
+
+/// The `(device, inode)` a mapping of this fd would show, and how it was determined.
+/// `mapping_file_key` renders the device the way `/proc/<pid>/maps` does (fdinfo +
+/// mountinfo, so btrfs subvolumes and overlay agree). When the fd's mount is missing
+/// from the observer's own table — plausible for a container — `st_dev` is *not* that
+/// device, so `"stat"` records that only the inode is comparable.
+fn identity_of(file: &std::fs::File) -> Result<(ObjectKey, &'static str), String> {
+    if let Ok(key) = mapping_file_key(file) {
+        return Ok((
+            ObjectKey {
+                device: Device {
+                    major: key.device_major,
+                    minor: key.device_minor,
+                },
+                inode: key.inode,
+            },
+            "mountinfo",
+        ));
+    }
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("fstat failed: {error}"))?;
+    Ok((
+        ObjectKey {
+            device: Device {
+                major: libc::major(metadata.dev()).into(),
+                minor: libc::minor(metadata.dev()).into(),
+            },
+            inode: metadata.ino(),
+        },
+        "stat",
+    ))
 }
 
 /// Structural validation + open + size cap + identity match + executable-offset check.
@@ -203,15 +309,109 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
     if !problems.is_empty() {
         return Err(problems);
     }
-    let mut files = BTreeMap::new();
-    let mut pins = BTreeMap::new();
-    for (path, file, _, pin) in opened.into_values() {
-        pins.insert(path.clone(), pin);
-        files.insert(path, file);
+    let mut by_key = BTreeMap::new();
+    let mut by_path = BTreeMap::new();
+    for (path, file, inspected, pin) in opened.into_values() {
+        let (key, identity_source) = match identity_of(&file) {
+            Ok(identity) => identity,
+            Err(error) => {
+                problems.push(format!("{path}: {error}"));
+                continue;
+            }
+        };
+        by_path.insert(path.clone(), key);
+        by_key.insert(
+            key,
+            Entry::new(file, pin, path, &inspected.identity, identity_source),
+        );
+    }
+    if !problems.is_empty() {
+        return Err(problems);
     }
     Ok(PinnedObjects {
-        files,
-        pins,
+        by_key,
+        by_path,
         changed: std::cell::Cell::new(false),
     })
+}
+
+/// Opens, identity-checks, hashes once and pins every object the scan named. Objects
+/// that cannot be pinned are returned as `Skipped`, never as errors: one unusable
+/// dependency must not lose the whole capture (spec §4.10). `Err` is reserved for the
+/// case that makes the whole result meaningless — the target exiting, after which a
+/// report could be claiming objects pinned from a recycled pid.
+pub fn pin_scanned_objects(
+    pid: u32,
+    modules: &[ScannedModule],
+) -> Result<(PinnedObjects, Vec<Skipped>), String> {
+    let pin = PidPin::open(pid)?;
+    // Both the table-owning modules and every object a table entry points into: an
+    // entry may land in a dependency the module itself only forwards to.
+    let mut wanted: BTreeMap<ObjectKey, &str> = BTreeMap::new();
+    for module in modules {
+        wanted.entry(module.key).or_insert(&module.path);
+        for entry in module.tables.iter().flat_map(|table| &table.entries) {
+            wanted.entry(entry.object).or_insert(&entry.object_path);
+        }
+    }
+
+    let exited = || format!("pid {pid} exited during discovery");
+    let mut by_key = BTreeMap::new();
+    let mut skipped = Vec::new();
+    for (key, path) in wanted {
+        // Opening through /proc/<pid>/root is a per-pid action (spec §4.5).
+        if !pin.still_the_same() {
+            return Err(exited());
+        }
+        match pin_scanned_object(pid, key, path) {
+            Ok(entry) => {
+                by_key.insert(key, entry);
+            }
+            Err(reason) => skipped.push(Skipped {
+                subject: path.to_string(),
+                reason,
+            }),
+        }
+    }
+    if !pin.still_the_same() {
+        return Err(exited());
+    }
+    Ok((
+        PinnedObjects {
+            by_key,
+            by_path: BTreeMap::new(),
+            changed: std::cell::Cell::new(false),
+        },
+        skipped,
+    ))
+}
+
+fn pin_scanned_object(pid: u32, key: ObjectKey, path: &str) -> Result<Entry, String> {
+    // The target's own filesystem view: a container's object is never copied out.
+    let file = open_object(Path::new(&format!("/proc/{pid}/root{path}")))?;
+    let (found, identity_source) = identity_of(&file)?;
+    // Under the "stat" fallback there is no mountinfo-derived device to compare with
+    // the one `/proc/<pid>/maps` rendered, so the inode is all that can be checked.
+    let same =
+        found.inode == key.inode && (identity_source == "stat" || found.device == key.device);
+    if !same {
+        return Err(format!(
+            "identity_mismatch: the mapping is {key:?} but {path} now opens as {found:?} \
+             (compared via {identity_source})"
+        ));
+    }
+    let before = pin_of(&file)?;
+    let inspected = inspect_file(&file)?;
+    // The pin was taken before the bytes were hashed; a write that lands during the
+    // hash must not become the baseline the capture trusts.
+    if pin_of(&file)? != before {
+        return Err("file changed while it was being identified — retry".into());
+    }
+    Ok(Entry::new(
+        file,
+        before,
+        path.to_string(),
+        &inspected.identity,
+        identity_source,
+    ))
 }

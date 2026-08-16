@@ -500,3 +500,67 @@ fn replacing_the_file_by_rename_keeps_the_pinned_inode_but_reports_a_change() {
         "rename-over is reported as a change"
     );
 }
+
+#[test]
+fn a_pid_pin_detects_process_exit() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pin = p11scope::process::PidPin::open(child.id()).expect("pin a live child");
+    assert!(pin.still_the_same());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while pin.still_the_same() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "exit must become visible"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn scanned_objects_are_pinned_hashed_and_attachable() {
+    use p11scope::discovery::hooks::HookRegistry;
+    use p11scope::discovery::scan::{ScanLimits, ScanOutcome, ScanRequest, scan_pid};
+
+    // Our own executable is a file-backed mapping with a stable identity; scan
+    // our process with it as the hint and pin whatever the scan reports.
+    let hooks = HookRegistry::builtin();
+    let exe = std::env::current_exe().unwrap();
+    let outcome = scan_pid(&ScanRequest {
+        pid: std::process::id(),
+        hints: &[exe.clone()],
+        hooks: &hooks,
+        limits: ScanLimits::default(),
+    })
+    .unwrap();
+    let ScanOutcome::Scanned { modules, .. } = outcome else {
+        panic!("/proc/self/mem is always readable")
+    };
+    let (pinned, skipped) =
+        p11scope::discovery::identity::pin_scanned_objects(std::process::id(), &modules).unwrap();
+    assert!(
+        skipped.is_empty(),
+        "nothing about our own process should be unpinnable: {skipped:?}"
+    );
+    // The hint is our own executable, so the scan always names at least that object.
+    // (Measured: it is the only one — the test binary maps no PKCS#11 table, so no
+    // table entry names a second object. Its identity resolves via "mountinfo".)
+    assert!(
+        pinned.pinned().any(|s| s.path == exe.display().to_string()),
+        "the hinted executable must be pinned"
+    );
+    for summary in pinned.pinned() {
+        assert_eq!(summary.sha256.len(), 64, "sha256 must be a full digest");
+        let attach = pinned.attach_path_for(summary.key).unwrap();
+        assert!(attach.starts_with("/proc/self/fd/"), "{attach:?}");
+        assert!(
+            std::fs::metadata(&attach).is_ok(),
+            "the pinned fd must still be open"
+        );
+    }
+    assert!(pinned.check_unchanged().unwrap());
+}

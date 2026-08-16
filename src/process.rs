@@ -193,6 +193,45 @@ impl Default for Tracker {
     }
 }
 
+/// A process identity that survives PID reuse. `pidfd_open` is exact; the
+/// `/proc/<pid>/stat` start time is the documented fallback where pidfds are
+/// unavailable. Both already back `Tracker`; `PidPin` exposes them for the
+/// discovery path, which must drop any per-pid action whose target was recycled.
+pub struct PidPin {
+    pid: u32,
+    pidfd: Option<OwnedFd>,
+    start_time: Option<u64>,
+}
+
+impl PidPin {
+    pub fn open(pid: u32) -> Result<Self, String> {
+        let start_time = process_start_time(pid).ok();
+        let pidfd = pidfd_open(pid).ok();
+        if pidfd.is_none() && start_time.is_none() {
+            return Err(format!(
+                "cannot pin pid {pid}: no pidfd and no /proc/{pid}/stat"
+            ));
+        }
+        Ok(Self {
+            pid,
+            pidfd,
+            start_time,
+        })
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// False when the process exited or the pid was reused since `open`.
+    pub fn still_the_same(&self) -> bool {
+        match &self.pidfd {
+            Some(fd) => !pidfd_ready(fd).unwrap_or(false),
+            None => process_start_time(self.pid).ok() == self.start_time,
+        }
+    }
+}
+
 fn raise_nofile() -> io::Result<usize> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,

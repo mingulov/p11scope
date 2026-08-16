@@ -521,13 +521,12 @@ fn a_pid_pin_detects_process_exit() {
     }
 }
 
-#[test]
-fn scanned_objects_are_pinned_hashed_and_attachable() {
+/// Our own executable is a file-backed mapping with a stable identity; scan our
+/// process with it as the hint, so the modules are the scan's real view of us.
+fn scan_self() -> (PathBuf, Vec<p11scope::discovery::scan::ScannedModule>) {
     use p11scope::discovery::hooks::HookRegistry;
     use p11scope::discovery::scan::{ScanLimits, ScanOutcome, ScanRequest, scan_pid};
 
-    // Our own executable is a file-backed mapping with a stable identity; scan
-    // our process with it as the hint and pin whatever the scan reports.
     let hooks = HookRegistry::builtin();
     let exe = std::env::current_exe().unwrap();
     let outcome = scan_pid(&ScanRequest {
@@ -540,8 +539,20 @@ fn scanned_objects_are_pinned_hashed_and_attachable() {
     let ScanOutcome::Scanned { modules, .. } = outcome else {
         panic!("/proc/self/mem is always readable")
     };
-    let (pinned, skipped) =
-        p11scope::discovery::identity::pin_scanned_objects(std::process::id(), &modules).unwrap();
+    (exe, modules)
+}
+
+#[test]
+fn scanned_objects_are_pinned_hashed_and_attachable() {
+    use p11scope::discovery::scan::ScanLimits;
+
+    let (exe, modules) = scan_self();
+    let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
+        std::process::id(),
+        &modules,
+        ScanLimits::default(),
+    )
+    .unwrap();
     assert!(
         skipped.is_empty(),
         "nothing about our own process should be unpinnable: {skipped:?}"
@@ -563,4 +574,114 @@ fn scanned_objects_are_pinned_hashed_and_attachable() {
         );
     }
     assert!(pinned.check_unchanged().unwrap());
+}
+
+#[test]
+fn a_retargeted_path_is_skipped_as_an_identity_mismatch() {
+    use p11scope::discovery::scan::{ScanLimits, ScannedModule};
+    use p11scope_manifest::maps::{Device, ObjectKey};
+
+    // The path the scan named still resolves — to a different inode than the mapping
+    // reported. That is what a retargeted path looks like, and it must never be pinned.
+    let exe = std::env::current_exe().unwrap();
+    let module = ScannedModule {
+        key: ObjectKey {
+            device: Device { major: 0, minor: 0 },
+            inode: std::fs::metadata(&exe).unwrap().ino() + 1,
+        },
+        path: exe.display().to_string(),
+        exports: vec![],
+        tables: vec![],
+        interfaces: vec![],
+    };
+    let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
+        std::process::id(),
+        &[module],
+        ScanLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(pinned.pinned().count(), 0, "a mismatch must not be pinned");
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert!(
+        skipped[0].reason.starts_with("identity_mismatch"),
+        "{:?}",
+        skipped[0]
+    );
+    assert_eq!(skipped[0].subject, exe.display().to_string());
+
+    // Right inode, wrong device: only the "mountinfo" comparison can catch this, so
+    // this is what a silent downgrade of the check to inode-only would break. On a
+    // host where mountinfo cannot resolve, the weaker check is legitimate — but it
+    // then has to say so rather than pass itself off as the strong one.
+    let module = ScannedModule {
+        key: ObjectKey {
+            device: Device {
+                major: 0xffff,
+                minor: 0xffff,
+            },
+            inode: std::fs::metadata(&exe).unwrap().ino(),
+        },
+        path: exe.display().to_string(),
+        exports: vec![],
+        tables: vec![],
+        interfaces: vec![],
+    };
+    let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
+        std::process::id(),
+        &[module],
+        ScanLimits::default(),
+    )
+    .unwrap();
+    match pinned.pinned().next() {
+        None => assert!(
+            skipped[0].reason.starts_with("identity_mismatch"),
+            "{:?}",
+            skipped[0]
+        ),
+        Some(summary) => assert_eq!(
+            summary.identity_source, "stat",
+            "a device mismatch may only be accepted when mountinfo was unavailable, \
+             and the report must record why: {:?}",
+            summary.note
+        ),
+    }
+}
+
+#[test]
+fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
+    use p11scope::discovery::scan::ScanLimits;
+
+    let (exe, modules) = scan_self();
+    // Sized from live data: one byte under the object the scan actually reported.
+    let len = std::fs::metadata(&exe).unwrap().len();
+    for limits in [
+        ScanLimits {
+            per_object_bytes: len - 1,
+            total_bytes: u64::MAX,
+        },
+        ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: len - 1,
+        },
+    ] {
+        let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
+            std::process::id(),
+            &modules,
+            limits,
+        )
+        .unwrap();
+        assert_eq!(
+            pinned.pinned().count(),
+            0,
+            "an object over budget is never hashed"
+        );
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        let reason = &skipped[0].reason;
+        assert!(
+            reason.starts_with("too_large")
+                && reason.contains(&format!("{len} bytes"))
+                && reason.contains(&(len - 1).to_string()),
+            "the reason must name the object's size and the cap it broke: {reason}"
+        );
+    }
 }

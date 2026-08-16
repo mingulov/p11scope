@@ -15,7 +15,7 @@ use p11scope_manifest::identity::{
 use p11scope_manifest::manifest::{Manifest, Resolution};
 use p11scope_manifest::maps::{Device, ObjectKey};
 
-use crate::discovery::scan::{ScannedModule, Skipped};
+use crate::discovery::scan::{ScanLimits, ScannedModule, Skipped};
 use crate::manifest_input::{MAX_TOTAL_OBJECT_BYTES, validate_structure};
 use crate::process::PidPin;
 
@@ -37,6 +37,46 @@ fn pin_of(file: &std::fs::File) -> Result<Pin, String> {
     })
 }
 
+/// How an object's `(device, inode)` was determined, and therefore how much of it can
+/// be compared with what `/proc/<pid>/maps` reported. A typed distinction on purpose:
+/// this is the strength of the retargeting check, and a stray string must not be able
+/// to downgrade it silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentitySource {
+    /// fdinfo + mountinfo resolved the mount's device — the whole key is comparable.
+    Mountinfo,
+    /// The mountinfo lookup failed, and `st_dev` is *not* the device maps renders
+    /// (btrfs subvolumes, overlay), so only the inode is comparable.
+    Stat,
+}
+
+impl IdentitySource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Mountinfo => "mountinfo",
+            Self::Stat => "stat",
+        }
+    }
+
+    /// Whether the opened file is the object the mapping named.
+    fn confirms(self, found: ObjectKey, expected: ObjectKey) -> bool {
+        found.inode == expected.inode
+            && match self {
+                Self::Mountinfo => found.device == expected.device,
+                Self::Stat => true,
+            }
+    }
+}
+
+struct FoundIdentity {
+    key: ObjectKey,
+    source: IdentitySource,
+    /// Why the mountinfo lookup was unavailable, when it was. Four of its five failures
+    /// mean the observer's own `/proc` is broken rather than "the target is a
+    /// container", so the downgrade is recorded instead of inferred.
+    note: Option<String>,
+}
+
 #[derive(Debug)]
 struct Entry {
     file: std::fs::File,
@@ -45,6 +85,7 @@ struct Entry {
     sha256: String,
     build_id: Option<String>,
     identity_source: &'static str,
+    note: Option<String>,
 }
 
 impl Entry {
@@ -53,7 +94,7 @@ impl Entry {
         pin: Pin,
         path: String,
         identity: &ObjectIdentity,
-        identity_source: &'static str,
+        found: FoundIdentity,
     ) -> Self {
         Self {
             file,
@@ -65,7 +106,8 @@ impl Entry {
                 IdentityKind::GnuBuildId => identity.value.clone(),
                 _ => None,
             },
-            identity_source,
+            identity_source: found.source.label(),
+            note: found.note,
         }
     }
 }
@@ -74,11 +116,15 @@ impl Entry {
 #[derive(Debug, Clone, Copy)]
 pub struct PinnedSummary<'a> {
     pub key: ObjectKey,
+    /// For scan-sourced objects this is the *target's* path: it is namespace-relative
+    /// and the observer cannot open it. Attach through `attach_path_for` instead.
     pub path: &'a str,
     pub sha256: &'a str,
     pub build_id: Option<&'a str>,
     /// "mountinfo" or "stat" — how the mapping identity was confirmed.
     pub identity_source: &'static str,
+    /// Why `identity_source` is "stat" rather than "mountinfo".
+    pub note: Option<&'a str>,
 }
 
 /// Every object opened, identity-matched, and pinned by `(ino, size, ctime)`, keyed
@@ -122,6 +168,7 @@ impl PinnedObjects {
             sha256: &entry.sha256,
             build_id: entry.build_id.as_deref(),
             identity_source: entry.identity_source,
+            note: entry.note.as_deref(),
         })
     }
 
@@ -152,32 +199,37 @@ impl PinnedObjects {
 /// mountinfo, so btrfs subvolumes and overlay agree). When the fd's mount is missing
 /// from the observer's own table — plausible for a container — `st_dev` is *not* that
 /// device, so `"stat"` records that only the inode is comparable.
-fn identity_of(file: &std::fs::File) -> Result<(ObjectKey, &'static str), String> {
-    if let Ok(key) = mapping_file_key(file) {
-        return Ok((
-            ObjectKey {
-                device: Device {
-                    major: key.device_major,
-                    minor: key.device_minor,
+fn identity_of(file: &std::fs::File) -> Result<FoundIdentity, String> {
+    let note = match mapping_file_key(file) {
+        Ok(key) => {
+            return Ok(FoundIdentity {
+                key: ObjectKey {
+                    device: Device {
+                        major: key.device_major,
+                        minor: key.device_minor,
+                    },
+                    inode: key.inode,
                 },
-                inode: key.inode,
-            },
-            "mountinfo",
-        ));
-    }
+                source: IdentitySource::Mountinfo,
+                note: None,
+            });
+        }
+        Err(error) => format!("mountinfo device unavailable ({error}); inode compared alone"),
+    };
     let metadata = file
         .metadata()
         .map_err(|error| format!("fstat failed: {error}"))?;
-    Ok((
-        ObjectKey {
+    Ok(FoundIdentity {
+        key: ObjectKey {
             device: Device {
                 major: libc::major(metadata.dev()).into(),
                 minor: libc::minor(metadata.dev()).into(),
             },
             inode: metadata.ino(),
         },
-        "stat",
-    ))
+        source: IdentitySource::Stat,
+        note: Some(note),
+    })
 }
 
 /// Structural validation + open + size cap + identity match + executable-offset check.
@@ -312,18 +364,24 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
     let mut by_key = BTreeMap::new();
     let mut by_path = BTreeMap::new();
     for (path, file, inspected, pin) in opened.into_values() {
-        let (key, identity_source) = match identity_of(&file) {
-            Ok(identity) => identity,
+        let found = match identity_of(&file) {
+            Ok(found) => found,
             Err(error) => {
                 problems.push(format!("{path}: {error}"));
                 continue;
             }
         };
+        let key = found.key;
         by_path.insert(path.clone(), key);
-        by_key.insert(
+        if let Some(previous) = by_key.insert(
             key,
-            Entry::new(file, pin, path, &inspected.identity, identity_source),
-        );
+            Entry::new(file, pin, path.clone(), &inspected.identity, found),
+        ) {
+            problems.push(format!(
+                "{path} and {} are the same object ({key:?}); refusing an ambiguous pin",
+                previous.path
+            ));
+        }
     }
     if !problems.is_empty() {
         return Err(problems);
@@ -340,9 +398,14 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
 /// dependency must not lose the whole capture (spec §4.10). `Err` is reserved for the
 /// case that makes the whole result meaningless — the target exiting, after which a
 /// report could be claiming objects pinned from a recycled pid.
+///
+/// `limits` are the scan's own byte caps and bind here too: hashing reads each object
+/// whole, and the object set comes from the target's mappings, so an unbounded pin
+/// would let a target turn a bounded memory scan into unbounded reads on the observer.
 pub fn pin_scanned_objects(
     pid: u32,
     modules: &[ScannedModule],
+    limits: ScanLimits,
 ) -> Result<(PinnedObjects, Vec<Skipped>), String> {
     let pin = PidPin::open(pid)?;
     // Both the table-owning modules and every object a table entry points into: an
@@ -358,12 +421,13 @@ pub fn pin_scanned_objects(
     let exited = || format!("pid {pid} exited during discovery");
     let mut by_key = BTreeMap::new();
     let mut skipped = Vec::new();
+    let mut total_bytes = 0u64;
     for (key, path) in wanted {
         // Opening through /proc/<pid>/root is a per-pid action (spec §4.5).
         if !pin.still_the_same() {
             return Err(exited());
         }
-        match pin_scanned_object(pid, key, path) {
+        match pin_scanned_object(pid, key, path, limits, &mut total_bytes) {
             Ok(entry) => {
                 by_key.insert(key, entry);
             }
@@ -386,21 +450,41 @@ pub fn pin_scanned_objects(
     ))
 }
 
-fn pin_scanned_object(pid: u32, key: ObjectKey, path: &str) -> Result<Entry, String> {
+fn pin_scanned_object(
+    pid: u32,
+    key: ObjectKey,
+    path: &str,
+    limits: ScanLimits,
+    total_bytes: &mut u64,
+) -> Result<Entry, String> {
     // The target's own filesystem view: a container's object is never copied out.
     let file = open_object(Path::new(&format!("/proc/{pid}/root{path}")))?;
-    let (found, identity_source) = identity_of(&file)?;
-    // Under the "stat" fallback there is no mountinfo-derived device to compare with
-    // the one `/proc/<pid>/maps` rendered, so the inode is all that can be checked.
-    let same =
-        found.inode == key.inode && (identity_source == "stat" || found.device == key.device);
-    if !same {
+    let found = identity_of(&file)?;
+    if !found.source.confirms(found.key, key) {
         return Err(format!(
-            "identity_mismatch: the mapping is {key:?} but {path} now opens as {found:?} \
-             (compared via {identity_source})"
+            "identity_mismatch: the mapping is {key:?} but {path} now opens as {:?} \
+             (compared via {})",
+            found.key,
+            found.source.label(),
         ));
     }
     let before = pin_of(&file)?;
+    // Checked before the hash, which reads the object whole. Over budget is a skip,
+    // never a partial digest.
+    match total_bytes.checked_add(before.size) {
+        Some(running)
+            if before.size <= limits.per_object_bytes && running <= limits.total_bytes =>
+        {
+            *total_bytes = running
+        }
+        _ => {
+            return Err(format!(
+                "too_large ({} bytes; caps are {} per object and {} per capture, \
+                 {total_bytes} already pinned)",
+                before.size, limits.per_object_bytes, limits.total_bytes
+            ));
+        }
+    }
     let inspected = inspect_file(&file)?;
     // The pin was taken before the bytes were hashed; a write that lands during the
     // hash must not become the baseline the capture trusts.
@@ -412,6 +496,6 @@ fn pin_scanned_object(pid: u32, key: ObjectKey, path: &str) -> Result<Entry, Str
         before,
         path.to_string(),
         &inspected.identity,
-        identity_source,
+        found,
     ))
 }

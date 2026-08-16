@@ -87,7 +87,7 @@ workflow runs the unprivileged checks and the e2e gate.
 **Files:**
 - Modify: `docs/superpowers/plans/ROADMAP.md`, `docs/superpowers/plans/2026-08-13-manifest-provenance.md`
 
-- [ ] **Step 1: Add the productization section** — append after "Explicitly deferred":
+- [x] **Step 1: Add the productization section** — append after "Explicitly deferred":
 
 ```markdown
 ## Productization (2026-08-15 →)
@@ -112,7 +112,7 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
 green; root gates run locally only with owner approval and are otherwise recorded UNRUN.
 ```
 
-- [ ] **Step 2: Mark the provenance plan** — under its title add:
+- [x] **Step 2: Mark the provenance plan** — under its title add:
 
 ```markdown
 > **Status (2026-08-15): scheduled for removal by Productization Slice 1a** (spec
@@ -120,7 +120,7 @@ green; root gates run locally only with owner approval and are otherwise recorde
 > §4.11/§10.6). This note is updated to "removed" by the slice's deletion task.
 ```
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add docs/superpowers/plans/ROADMAP.md docs/superpowers/plans/2026-08-13-manifest-provenance.md
@@ -139,7 +139,7 @@ later tasks move code); they may execute scripts, artifacts and self-tests. Scri
 references they still contain are updated in Task 11 in the same commit that changes the
 scripts.
 
-- [ ] **Step 1: Keep exactly these** (bodies verbatim unless noted; helpers `run_ok`,
+- [x] **Step 1: Keep exactly these** (bodies verbatim unless noted; helpers `run_ok`,
 `embedded_map_definitions`, `embedded_symbols`, `read`, `between` may stay if used):
   1. `immutable_policy_maps` — embedded eBPF object: RDONLY flags on control maps.
   2. `policy_specific_ebpf` → keep only the embedded-object inventory assertions (default
@@ -159,11 +159,11 @@ scripts.
   8. `task6_official_observer_build_is_isolated_and_safe_only` → rename
      `official_build_is_safe_only`; keep the `--no-default-features` / `OFFICIAL_TARGET`
      assertions on `scripts/build-release.sh`; delete assertions about staging.
-- [ ] **Step 2: Delete every other test** (they read `src/*.rs`, `crates/*/src/*.rs`,
+- [x] **Step 2: Delete every other test** (they read `src/*.rs`, `crates/*/src/*.rs`,
 docs, or assert on the removed lane's script text).
-- [ ] **Step 3: Run** — `cargo +1.88 test --locked --test artifact_contracts` → PASS
+- [x] **Step 3: Run** — `cargo +1.88 test --locked --test artifact_contracts` → PASS
 (needs `llvm-readelf`, `llvm-objcopy`, `python3`, `sh`, as before).
-- [ ] **Step 4: Commit** — `git add -A tests && git commit -m "test: artifact contracts only (drop text-grep contract tests before the lane moves)"`
+- [x] **Step 4: Commit** — `git add -A tests && git commit -m "test: artifact contracts only (drop text-grep contract tests before the lane moves)"`
 
 ---
 
@@ -182,7 +182,7 @@ docs, or assert on the removed lane's script text).
   (moved verbatim from `src/verify.rs:1602-2062` with every private helper/constant it uses:
   `MAX_OBJECTS`, `MAX_SURFACES`, `MAX_FUNCTIONS`, `MAX_PATH_BYTES`, `MAX_DETAIL_BYTES`).
 
-- [ ] **Step 1: Failing test** — create `tests/manifest_pinning.rs` with the helpers
+- [x] **Step 1: Failing test** — create `tests/manifest_pinning.rs` with the helpers
 `tmpdir`, `cc_so`, `cc_so_with_build_id`, `manifest_for`, `first_executable_offset`,
 `walked_legacy_manifest` copied verbatim from `tests/reuse.rs:10-126`, and one test copied
 from `tests/reuse.rs` with its import changed:
@@ -192,9 +192,9 @@ use p11scope::manifest_input::{read_manifest, MAX_MANIFEST_BYTES};
 // body of `manifest_input_is_regular_utf8_and_bounded` verbatim, calling `read_manifest`
 ```
 
-- [ ] **Step 2: Run** — `cargo +1.88 test --locked --test manifest_pinning` → compile error
+- [x] **Step 2: Run** — `cargo +1.88 test --locked --test manifest_pinning` → compile error
 `could not find manifest_input in p11scope`.
-- [ ] **Step 3: Move** — create `src/manifest_input.rs` (module doc: "Manifest input hygiene:
+- [x] **Step 3: Move** — create `src/manifest_input.rs` (module doc: "Manifest input hygiene:
 bounded read and structural validation of `p11scope-manifest/4` documents. Trusted operator
 input, validated before use.") and *cut* the ranges above from `src/verify.rs`. In
 `src/verify.rs` add **only**:
@@ -207,8 +207,8 @@ pub use crate::manifest_input::{
 
 (a `pub use` also brings the names into `verify.rs`'s own scope; do not add a second `use`).
 Add `pub mod manifest_input;` to `src/lib.rs`.
-- [ ] **Step 4: Run** — full test + clippy → PASS.
-- [ ] **Step 5: Commit** — `git add src/manifest_input.rs src/lib.rs src/verify.rs tests/manifest_pinning.rs && git commit -m "refactor: move manifest input hygiene into manifest_input.rs"`
+- [x] **Step 4: Run** — full test + clippy → PASS.
+- [x] **Step 5: Commit** — `git add src/manifest_input.rs src/lib.rs src/verify.rs tests/manifest_pinning.rs && git commit -m "refactor: move manifest input hygiene into manifest_input.rs"`
 
 ---
 
@@ -240,7 +240,7 @@ impl PinnedObjects {
 pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>>;
 ```
 
-- [ ] **Step 1: Failing tests** — in `tests/manifest_pinning.rs` add, copied from
+- [x] **Step 1: Failing tests** — in `tests/manifest_pinning.rs` add, copied from
 `tests/reuse.rs` with `p11scope::verify::check_reuse` → `p11scope::discovery::identity::pin_manifest_objects`
 and `VerifiedObjects` → `PinnedObjects`: `matching_identity_is_accepted`,
 `changed_object_is_refused_naming_the_file`, `vanished_object_is_refused`,
@@ -295,8 +295,8 @@ Helper signatures are those of `tests/reuse.rs`: `tmpdir(name: &str)`, `cc_so(di
 (takes the `CC_LOCK` itself), `manifest_for(path: &Path)` (needs `provenance_for`); copy each
 helper only when a test in the file uses it (unused helpers fail clippy `-D warnings`).
 
-- [ ] **Step 2: Run** — `cargo +1.88 test --locked --test manifest_pinning` → compile error.
-- [ ] **Step 3: Implement** — `src/discovery/mod.rs`:
+- [x] **Step 2: Run** — `cargo +1.88 test --locked --test manifest_pinning` → compile error.
+- [x] **Step 3: Implement** — `src/discovery/mod.rs`:
 
 ```rust
 //! Discovery: how the observer learns which objects/offsets to probe and pins their
@@ -360,9 +360,9 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
 
 Keep the error strings of `check_reuse` verbatim (tests assert on them) except
 `re-run \`p11scope discover\`` → `re-run \`p11scope-discover\``.
-- [ ] **Step 4: Run** — `cargo +1.88 test --locked --test manifest_pinning` → PASS (the
+- [x] **Step 4: Run** — `cargo +1.88 test --locked --test manifest_pinning` → PASS (the
 `an_existing_writer_prevents_object_authorization` lease test is not carried over).
-- [ ] **Step 5: Commit** — `git add src/discovery src/lib.rs tests/manifest_pinning.rs && git commit -m "feat: hash-pinned object identity without leases (discovery::identity)"`
+- [x] **Step 5: Commit** — `git add src/discovery src/lib.rs tests/manifest_pinning.rs && git commit -m "feat: hash-pinned object identity without leases (discovery::identity)"`
 
 ---
 
@@ -404,7 +404,7 @@ O_NOFOLLOW off — follow is fine for the parent). Add `sync_all()` before `rena
 original did not fsync). Keep the `cleanup` flag so `Drop` unlinks the temp on every
 non-committed path, including a failed `commit`.
 
-- [ ] **Step 1: Failing tests** — create `src/output.rs` containing only the module doc and
+- [x] **Step 1: Failing tests** — create `src/output.rs` containing only the module doc and
 this test module, and add `pub mod output;` to `src/lib.rs` (so the red state is real):
 
 ```rust
@@ -455,10 +455,10 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run** — `cargo +1.88 test --locked --lib output` → compile error (`AtomicFile`).
-- [ ] **Step 3: Implement** by moving the listed code and applying the listed edits.
-- [ ] **Step 4: Run** — `cargo +1.88 test --locked --lib output` and full clippy → PASS.
-- [ ] **Step 5: Commit** — `git add src/output.rs src/lib.rs && git commit -m "feat: output::AtomicFile — identity-safe temp+rename publication without directory ownership policy"`
+- [x] **Step 2: Run** — `cargo +1.88 test --locked --lib output` → compile error (`AtomicFile`).
+- [x] **Step 3: Implement** by moving the listed code and applying the listed edits.
+- [x] **Step 4: Run** — `cargo +1.88 test --locked --lib output` and full clippy → PASS.
+- [x] **Step 5: Commit** — `git add src/output.rs src/lib.rs && git commit -m "feat: output::AtomicFile — identity-safe temp+rename publication without directory ownership policy"`
 
 ---
 
@@ -498,7 +498,7 @@ Removed flags → `CliError::Usage` with a hint: `--provenance-module` / `--trus
 → "removed in productization slice 1a: the observer pins provider identity by SHA-256 and
 fstat; see docs/usage.md"; `--mode trace` → "trace is a subcommand: `p11scope trace …`".
 
-- [ ] **Step 1: Failing tests** — create `src/cli.rs` with only the module doc and this test
+- [x] **Step 1: Failing tests** — create `src/cli.rs` with only the module doc and this test
 module; add `pub mod cli;` to `src/lib.rs`:
 
 ```rust
@@ -550,8 +550,8 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run** — `cargo +1.88 test --locked --lib cli` → compile error.
-- [ ] **Step 3: Implement** — a `while let Some(a) = args.next()` loop like today's
+- [x] **Step 2: Run** — `cargo +1.88 test --locked --lib cli` → compile error.
+- [x] **Step 3: Implement** — a `while let Some(a) = args.next()` loop like today's
 `cmd_profile`, producing `CliError::Usage(format!("{msg}\n{USAGE}"))` where main.rs used
 `eprintln!(…); exit(2)`. `USAGE`:
 
@@ -568,8 +568,8 @@ attach and checked for in-place change during capture (evidence.provider_changed
 ```
 
 `parse_duration`: optional trailing `s|m|h`, digits only before it, `u64`, non-empty.
-- [ ] **Step 4: Run** — `cargo +1.88 test --locked --lib cli` → PASS.
-- [ ] **Step 5: Commit** — `git add src/cli.rs src/lib.rs && git commit -m "feat: single CLI parser with duration suffixes and removed-flag hints"`
+- [x] **Step 4: Run** — `cargo +1.88 test --locked --lib cli` → PASS.
+- [x] **Step 5: Commit** — `git add src/cli.rs src/lib.rs && git commit -m "feat: single CLI parser with duration suffixes and removed-flag hints"`
 
 ---
 
@@ -581,7 +581,7 @@ attach and checked for in-place change during capture (evidence.provider_changed
   `provider_changed: false` for now)
 - Test: `src/render.rs` tests
 
-- [ ] **Step 1: Failing test** — in the `render.rs` test module, using its existing all-zero
+- [x] **Step 1: Failing test** — in the `render.rs` test module, using its existing all-zero
 evidence fixture (whatever it is named there; do not add a second one):
 
 ```rust
@@ -599,13 +599,13 @@ fn provider_change_forces_partial_and_is_shown_live() {
 }
 ```
 
-- [ ] **Step 2: Run** — compile error (no field).
-- [ ] **Step 3: Implement** — `pub provider_changed: bool` (doc: "A pinned provider object
+- [x] **Step 2: Run** — compile error (no field).
+- [x] **Step 3: Implement** — `pub provider_changed: bool` (doc: "A pinned provider object
 changed (ino, size or ctime) after attach; probes may no longer describe the mapped bytes.");
 `&& !self.provider_changed` in `verdict()`; `" · provider changed"` on the live gap line;
 `provider_changed: false` in every `Evidence { … }` literal the compiler points at.
-- [ ] **Step 4: Run** — full tests → PASS.
-- [ ] **Step 5: Commit** — `git commit -am "feat: evidence.provider_changed (in-place provider change forces PARTIAL)"`
+- [x] **Step 4: Run** — full tests → PASS.
+- [x] **Step 5: Commit** — `git commit -am "feat: evidence.provider_changed (in-place provider change forces PARTIAL)"`
 
 ---
 
@@ -625,7 +625,7 @@ changed (ino, size or ctime) after attach; probes may no longer describe the map
   attaching (error "a pinned provider object changed before/after attach; refusing to observe
   changed bytes"); during capture a change sets `provider_changed` (never aborts).
 
-- [ ] **Step 1: Failing tests** — replace the `main.rs` test module: keep
+- [x] **Step 1: Failing tests** — replace the `main.rs` test module: keep
 `ebpf_object_is_a_real_bpf_elf`, `fmt_rfc3339_matches_a_known_instant`, `should_stop_*`,
 `fork_only_traffic_does_not_consume_process_tracking_budget`,
 `broken_stdout_closes_only_that_sink_and_file_continues`,
@@ -673,8 +673,8 @@ fn sigterm_sets_the_stop_flag() {
 }
 ```
 
-- [ ] **Step 2: Run** — `cargo +1.88 test --locked --bin p11scope` → compile errors.
-- [ ] **Step 3: Rewrite `main.rs`** — keep verbatim: `report_attach_failures`,
+- [x] **Step 2: Run** — `cargo +1.88 test --locked --bin p11scope` → compile errors.
+- [x] **Step 3: Rewrite `main.rs`** — keep verbatim: `report_attach_failures`,
 `load_mech_shapes`, `warn_unsafe_policy`, `identify_tracked`, `retire_exited`, `observe_fork`,
 `write_json_report` (now called with `AtomicFile::file()`), `emit_trace_line`, `write_stdout`,
 `flush_stdout`, `drain_trace_events`, `report_trace_loss`, `evidence_for` (add a
@@ -777,9 +777,9 @@ if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
 (the returned error drops `session`, which detaches). Delete the dead `_config` and
 `_cgroup_file` fields and their assignments.
 
-- [ ] **Step 4: Run** — full tests + clippy → PASS (verify/oracle/discover_cmd still compile,
+- [x] **Step 4: Run** — full tests + clippy → PASS (verify/oracle/discover_cmd still compile,
 unused by main; they are `pub mod`, so no dead-code warnings).
-- [ ] **Step 5: Commit** — `git commit -am "refactor: single-process capture on cli/manifest_input/identity/output; SIGTERM stops cleanly; refuse attach on changed pinned bytes"`
+- [x] **Step 5: Commit** — `git commit -am "refactor: single-process capture on cli/manifest_input/identity/output; SIGTERM stops cleanly; refuse attach on changed pinned bytes"`
 
 ---
 
@@ -795,7 +795,7 @@ unused by main; they are `pub mod`, so no dead-code warnings).
   `crates/manifest/tests/identity.rs` (delete the loader-graph tests),
   `docs/superpowers/plans/2026-08-13-manifest-provenance.md` (status note → "removed")
 
-- [ ] **Step 1: Delete and fix compilation**
+- [x] **Step 1: Delete and fix compilation**
 
 ```bash
 git rm src/verify.rs src/oracle.rs src/discover_cmd.rs tests/lease_break.rs tests/provenance_lease_break.rs tests/cli_discover.rs tests/reuse.rs
@@ -805,8 +805,8 @@ Remove `pub mod discover_cmd; pub(crate) mod oracle; pub mod verify;` from `src/
 `cargo +1.88 check --locked --workspace --all-targets`; fix each error only by deleting the
 dead item it points at. Flip the provenance plan's status note to "**removed** by
 Productization Slice 1a (this commit)".
-- [ ] **Step 2: Run everything** — the four checks → PASS.
-- [ ] **Step 3: Commit with the history note**
+- [x] **Step 2: Run everything** — the four checks → PASS.
+- [x] **Step 3: Commit with the history note**
 
 ```bash
 git commit -am "remove: lease/provenance/hardened-oracle authorization lane
@@ -828,7 +828,7 @@ provider code by default. Reasoning: docs/notes/2026-08-15-architecture-and-gap-
 - Modify: `crates/discover/src/main.rs`; Delete: `crates/discover/tests/control_protocol.rs`
 - Test: `crates/discover/tests/cli.rs`
 
-- [ ] **Step 1: Failing test** — in `crates/discover/tests/cli.rs`:
+- [x] **Step 1: Failing test** — in `crates/discover/tests/cli.rs`:
 
 ```rust
 #[test]
@@ -840,13 +840,13 @@ fn control_fd_flag_is_gone() {
 }
 ```
 
-- [ ] **Step 2: Run** — FAIL (flag accepted).
-- [ ] **Step 3: Implement** — delete `PREPARED/DROP/READY/GO`, `inherited_control`,
+- [x] **Step 2: Run** — FAIL (flag accepted).
+- [x] **Step 3: Implement** — delete `PREPARED/DROP/READY/GO`, `inherited_control`,
 `send_control`, `expect_control`, the `--control-fd` arm and both handshake blocks in `main`;
 in `prepare_drop` delete the `suid_dumpable` read and `validate_suid_dumpable` (and its unit
 test); keep the credential drop exactly as is. `git rm crates/discover/tests/control_protocol.rs`.
-- [ ] **Step 4: Run** — `cargo +1.88 test --locked -p p11scope-discover` + clippy → PASS.
-- [ ] **Step 5: Commit** — `git commit -am "discover: standalone offline helper — drop control-fd handshake and suid_dumpable requirement"`
+- [x] **Step 4: Run** — `cargo +1.88 test --locked -p p11scope-discover` + clippy → PASS.
+- [x] **Step 5: Commit** — `git commit -am "discover: standalone offline helper — drop control-fd handshake and suid_dumpable requirement"`
 
 ---
 
@@ -863,7 +863,7 @@ test); keep the credential drop exactly as is. `git rm crates/discover/tests/con
   `tests/artifact_contracts.rs` (script references)
 - Create: `scripts/gates.sh`
 
-- [ ] **Step 1: `scripts/lib.sh`** — from `trusted-p11scope.sh` delete: `set_suid_dumpable_zero`,
+- [x] **Step 1: `scripts/lib.sh`** — from `trusted-p11scope.sh` delete: `set_suid_dumpable_zero`,
 `restore_suid_dumpable`, `validate_protected_parent`, `is_immediate_child`,
 `is_trusted_exec_destination`, `create_trusted_exec_dir`, `create_protected_output_dir`,
 `stage_container_authority`, `stage_trusted_p11scope`, `remove_trusted_exec_root`,
@@ -874,7 +874,7 @@ test); keep the credential drop exactly as is. `git rm crates/discover/tests/con
 `root_process_starttime`, `process_matches_starttime`, `root_process_matches_starttime`,
 `signal_pinned_process`, `signal_verified_process`, `signal_verified_root_process`,
 `wait_for_capture_ready`.
-- [ ] **Step 2: Every script** — mechanical rewrite, nothing else: `. scripts/trusted-p11scope.sh`
+- [x] **Step 2: Every script** — mechanical rewrite, nothing else: `. scripts/trusted-p11scope.sh`
 → `. scripts/lib.sh`; delete `TRUST_DIR=`/`RUN_DIR=` lines, `create_trusted_exec_dir`/
 `create_protected_output_dir`/`stage_trusted_p11scope`, `set_suid_dumpable_zero`/
 `restore_suid_dumpable`, `cleanup_step remove_trusted_p11scope …`,
@@ -888,7 +888,7 @@ asserted the exit-78 lease abort or the "rewritten authority refusal". Container
 scripts keep copying `p11scope-discover` into the container (`capped_container_tar`) and
 rewriting attach paths to `/proc/<pid>/root/…`; delete only the `container-authority.py`
 provenance steps.
-- [ ] **Step 3: `scripts/gates.sh`**
+- [x] **Step 3: `scripts/gates.sh`**
 
 ```sh
 #!/bin/sh
@@ -902,11 +902,11 @@ done
 echo "=== gates: ALL OK ==="
 ```
 
-- [ ] **Step 4: Update `tests/artifact_contracts.rs`** — `scripts/trusted-p11scope.sh` →
+- [x] **Step 4: Update `tests/artifact_contracts.rs`** — `scripts/trusted-p11scope.sh` →
 `scripts/lib.sh` in the two shell-executing tests; drop `scripts/attach-pod.sh` from the
 byte-cap script list; trim `metadata_canary_matrix` / `official_build_is_safe_only` to the
 assertions that remain true.
-- [ ] **Step 5: Verify without privileges**
+- [x] **Step 5: Verify without privileges**
 
 ```sh
 for f in scripts/*.sh scripts/matrix/*.sh; do sh -n "$f" || exit 1; done
@@ -917,7 +917,7 @@ fi
 cargo +1.88 test --locked --test artifact_contracts
 ```
 Expected: all pass, grep finds nothing.
-- [ ] **Step 6: Commit** — `git add -A scripts tests/artifact_contracts.rs && git commit -m "scripts: run binaries directly under sudo; drop trusted staging, sysctl and provenance steps"`
+- [x] **Step 6: Commit** — `git add -A scripts tests/artifact_contracts.rs && git commit -m "scripts: run binaries directly under sudo; drop trusted staging, sysctl and provenance steps"`
 
 Executor note: the gates need `sudo`; do **not** run them without owner approval
 (CLAUDE.md). CI (Task 12) runs `verify-attach-e2e.sh`. Record their status as UNRUN in the
@@ -930,7 +930,7 @@ Task 14 note unless run.
 **Files:**
 - Create: `.github/workflows/ci.yml`
 
-- [ ] **Step 1: Write the workflow**
+- [x] **Step 1: Write the workflow**
 
 ```yaml
 name: ci
@@ -961,8 +961,8 @@ jobs:
       - run: scripts/verify-attach-e2e.sh
 ```
 
-- [ ] **Step 2: Local sanity** — `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"` → parses.
-- [ ] **Step 3: Commit** — `git add .github && git commit -m "ci: unprivileged checks and sudo e2e gate on GitHub Actions"`
+- [x] **Step 2: Local sanity** — `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"` → parses.
+- [x] **Step 3: Commit** — `git add .github && git commit -m "ci: unprivileged checks and sudo e2e gate on GitHub Actions"`
 
 The first real run happens when the owner pushes; the executor cannot observe it and must
 record it as PENDING (Task 14).
@@ -975,7 +975,7 @@ record it as PENDING (Task 14).
 - Modify: `README.md`, `docs/usage.md`, `CHANGELOG.md`, `docs/schema/observed-profile-v1.md`,
   `docs/privacy/allowlist-v1.md`
 
-- [ ] **Step 1: README** — replace the status block (`README.md:13-21`) with: "**Status:
+- [x] **Step 1: README** — replace the status block (`README.md:13-21`) with: "**Status:
 unreleased.** Productization slice 1a: the lease/provenance/hardened-oracle lane was
 removed (see `docs/superpowers/plans/ROADMAP.md` → Productization); provider identity is
 pinned by SHA-256 at attach and checked for in-place change during capture
@@ -986,33 +986,33 @@ observed-profile.json`. Delete the "Containers and Kubernetes" paragraphs on pro
 leases/exit 78 (keep the inode-sharing paragraph). In "Honest claims" delete the `CAP_LEASE`
 sentence; state the current requirement: BPF capabilities (`CAP_SYS_ADMIN` on
 `perf_event_paranoid=4` hosts) plus `CAP_SYS_PTRACE` for cross-uid `/proc/<pid>/root`.
-- [ ] **Step 2: usage.md** — same for the status block, Quickstart, "Attaching to an existing
+- [x] **Step 2: usage.md** — same for the status block, Quickstart, "Attaching to an existing
 Kubernetes pod" (delete; wrapper returns in Slice 1b), the provenance paragraphs (delete),
 the privileges table (drop the "Added file-stability requirement" column and the `CAP_LEASE`
 text), "Related docs" (`v1.3` → `v1.4`).
-- [ ] **Step 3: CHANGELOG** — new top section "Unreleased — productization slice 1a": lane
+- [x] **Step 3: CHANGELOG** — new top section "Unreleased — productization slice 1a": lane
 removed (pointer to reasoning), CLI changes, `provider_changed`, SIGTERM, CI, helper is
 offline-only.
-- [ ] **Step 4: schema doc** — add `provider_changed` row to the evidence table "(v1.4
+- [x] **Step 4: schema doc** — add `provider_changed` row to the evidence table "(v1.4
 addendum, 2026-08-15)".
-- [ ] **Step 5: allowlist** — replace the paragraph starting "A raw manifest never authorizes
+- [x] **Step 5: allowlist** — replace the paragraph starting "A raw manifest never authorizes
 code…" with "A manifest is trusted operator input, structurally validated and hash-matched
 against the pinned object; the observer executes no provider code." (capture-field tables
 unchanged).
-- [ ] **Step 6: Commit** — `git commit -am "docs: sync README/usage/CHANGELOG/schema/allowlist with slice 1a"`
+- [x] **Step 6: Commit** — `git commit -am "docs: sync README/usage/CHANGELOG/schema/allowlist with slice 1a"`
 
 ---
 
 ### Task 14: Final verification and honest status
 
-- [ ] **Step 1: The four checks** — all green (Global Constraints).
-- [ ] **Step 2: Line count** — `git diff --stat f35c04e..HEAD -- src crates tests scripts | tail -1`.
-- [ ] **Step 3: Ask the owner** whether to run `scripts/gates.sh` locally (sudo). Run only on
+- [x] **Step 1: The four checks** — all green (Global Constraints).
+- [x] **Step 2: Line count** — `git diff --stat f35c04e..HEAD -- src crates tests scripts | tail -1`.
+- [x] **Step 3: Ask the owner** whether to run `scripts/gates.sh` locally (sudo). Run only on
 approval.
-- [ ] **Step 4: Record in the ROADMAP Slice 1a entry**: "landed <commit>, −N lines; unprivileged
+- [x] **Step 4: Record in the ROADMAP Slice 1a entry**: "landed <commit>, −N lines; unprivileged
 suite green; root gates: <PASS with log tail | UNRUN (not approved)>; CI e2e: <PASS |
 PENDING first push>". Never write "green" for anything not run.
-- [ ] **Step 5: Commit** the ROADMAP line.
+- [x] **Step 5: Commit** the ROADMAP line.
 
 ---
 

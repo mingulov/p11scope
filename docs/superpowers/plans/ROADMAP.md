@@ -372,13 +372,19 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
   git history; reasoning in the spec §4.11 and §10.6). Object identity becomes hash-pinned
   (SHA-256 once, `fstat` change detection). CLI drops `--provenance-module`,
   `--trusted-workload`, the `p11scope discover` subcommand and exit code 78. CI skeleton.
-  **Status (2026-08-15): landed on branch `productization/slice1a` (b8e4fc3..HEAD, 21+
+  **Status (2026-08-16): landed on branch `productization/slice1a` (b8e4fc3..HEAD, 27
   commits; lane removed in 263935a with the history note); −13,727 lines net across
   `src`/`crates`/`tests`/`scripts` (2,798 added, 16,525 deleted). Verified: the four cargo
   checks and the unprivileged suite green (all test binaries 0 failed, incl. 14 pinning tests,
-  10 artifact contracts). Root gates (`scripts/gates.sh`, matrix scripts, `build-release.sh`,
-  `bench-overhead.sh`): UNRUN (no owner approval for sudo/docker/kind in this environment).
-  CI e2e: PENDING first push. Follow-ups noted for 1b: re-measure the `--cgroup` minimum
+  10 artifact contracts). Root gates (owner-approved, 2026-08-16, all exit=0):
+  `scripts/gates.sh` (incl. canary matrix) 462s; matrix — docker 15s, shared-layer 24s,
+  fork-scope 42s, oracle 158s, kind-pod 68s, knative 225s; `verify-discover-containers.sh`
+  47s; `build-release.sh` (first run needed one manual `kill -CONT` of the self-suspended
+  sudo in the hardened-target smoke — same class as 2d2cc32, fixed by resuming `$LPID`;
+  clean re-run after the fix: ALL OK); `bench-overhead.sh` — overhead ns/call: unobserved
+  0, metrics 3366.6, profile 3754.4, trace 4127.8 (5 runs/condition, 1M calls each,
+  kernel 7.0.0-28-generic; consistent with the documented ~3.3µs). CI e2e: PENDING first
+  push. Follow-ups noted for 1b: re-measure the `--cgroup` minimum
   (`verify-fork-scope.sh` still over-grants CAP_LEASE), one privileged `--cgroup` smoke after
   the `_cgroup_file` removal, prune the now-unused root `p11scope-discover` dev-dependency.**
 - **Slice 1b — discovery engine and commands**: memory-scan + loader/export-hook discovery,

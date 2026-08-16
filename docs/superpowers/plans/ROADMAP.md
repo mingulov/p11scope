@@ -383,8 +383,10 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
   sudo in the hardened-target smoke — same class as 2d2cc32, fixed by resuming `$LPID`;
   clean re-run after the fix: ALL OK); `bench-overhead.sh` — overhead ns/call: unobserved
   0, metrics 3366.6, profile 3754.4, trace 4127.8 (5 runs/condition, 1M calls each,
-  kernel 7.0.0-28-generic; consistent with the documented ~3.3µs). CI e2e: PENDING first
-  push. Follow-ups noted for 1b: re-measure the `--cgroup` minimum
+  kernel 7.0.0-28-generic; consistent with the documented ~3.3µs). CI e2e: PASS — first
+  push, run
+  [31935749796](https://github.com/mingulov/pkcs11-scope/actions/runs/31935749796)
+  (2026-08-16, `checks-and-e2e` success). Follow-ups noted for 1b: re-measure the `--cgroup` minimum
   (`verify-fork-scope.sh` still over-grants CAP_LEASE), one privileged `--cgroup` smoke after
   the `_cgroup_file` removal, prune the now-unused root `p11scope-discover` dev-dependency.**
 - **Slice 1b — discovery engine and commands**: memory-scan + loader/export-hook discovery,

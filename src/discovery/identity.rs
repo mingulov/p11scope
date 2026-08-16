@@ -153,6 +153,19 @@ impl PinnedObjects {
         }
     }
 
+    /// Folds another pin set into this one. A capture pins what the scan found and
+    /// what every `--manifest` names, but `Session::start` takes exactly one set.
+    /// The receiver wins a duplicate key: the scan opens objects through the
+    /// target's own `/proc/<pid>/root` view, which is the file the probe attaches
+    /// into even when the observer's namespace spells the path differently.
+    pub fn absorb(&mut self, other: PinnedObjects) {
+        for (key, entry) in other.by_key {
+            self.by_key.entry(key).or_insert(entry);
+        }
+        self.by_path.extend(other.by_path);
+        self.changed.set(self.changed.get() || other.changed.get());
+    }
+
     /// Path Aya may reopen without re-resolving the untrusted manifest path.
     pub fn attach_path(&self, original: &str) -> Result<PathBuf, String> {
         let key = *self

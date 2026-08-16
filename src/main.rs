@@ -4,12 +4,15 @@
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use p11scope::attach::{CapturePolicy, Scope, Session};
-use p11scope::cli::{self, CliError, Kind, ScopeArg};
-use p11scope::discovery::identity::{PinnedObjects, pin_manifest_objects};
+use p11scope::cli::{self, CaptureArgs, CliError, Command, Kind, ScopeArg};
+use p11scope::discovery::identity::{PinnedObjects, pin_manifest_objects, pin_scanned_objects};
+use p11scope::discovery::scan::{ScanLimits, ScanOutcome, ScanRequest, ScannedModule, scan_pid};
 use p11scope::manifest_input::read_manifest;
 use p11scope::output::AtomicFile;
-use p11scope::{events, metrics, plan, process, render, scope, semantics, trace};
-use p11scope_manifest::manifest::{Manifest, SCHEMA};
+use p11scope::{doctor, events, inspect, metrics, plan, process, render, scope, semantics, trace};
+use p11scope_manifest::manifest::{Manifest, Resolution, SCHEMA};
+use p11scope_manifest::maps::ObjectKey;
+use std::collections::BTreeSet;
 use std::io::{Seek as _, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -55,54 +58,52 @@ fn should_stop(interrupted: &AtomicBool, elapsed: Duration, duration: Option<Dur
 }
 
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("p11scope: {e:#}");
-        std::process::exit(1);
-    }
-}
-
-fn run() -> Result<()> {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("profile") => cmd_capture(Kind::Profile, args),
-        Some("trace") => cmd_capture(Kind::Trace, args),
-        Some("discover") => {
-            eprintln!(
-                "`p11scope discover` was removed: run `p11scope-discover --module <provider.so> \
-                 -o <manifest.json>` (offline helper; executes provider code)\n{}",
-                cli::USAGE
-            );
-            std::process::exit(2);
-        }
-        Some("--help") | Some("-h") => {
-            eprintln!("{}", cli::USAGE);
-            Ok(())
-        }
-        other => {
-            eprintln!(
-                "unknown or missing subcommand: {}\n{}",
-                other.unwrap_or("(none)"),
-                cli::USAGE
-            );
-            std::process::exit(2);
+    match run() {
+        Ok(0) => {}
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            // Every failure the observer can name arrives here as one line: an
+            // unreadable target, a stale manifest, an environment without BPF.
+            eprintln!("p11scope: {e:#}");
+            std::process::exit(1);
         }
     }
 }
 
-/// Both capture subcommands: parse, decide the policy, pin the manifest's
-/// objects, install the stop flag, then run the loop `kind` selects.
-fn cmd_capture(kind: Kind, args: impl Iterator<Item = String>) -> Result<()> {
-    let a = match cli::parse_capture(kind, args) {
-        Ok(a) => a,
+fn run() -> Result<i32> {
+    match cli::parse(std::env::args().skip(1)) {
+        // `kind` travels inside the arguments, so both capture subcommands share
+        // one arm as well as one parser.
+        Ok(Command::Profile(a) | Command::Trace(a)) => cmd_capture(a).map(|()| 0),
+        // Both of `inspect`'s hard failures — a pid that names nothing, and a target
+        // that exited while its objects were being pinned — mean "the target could
+        // not be read at all": one line here, exit 1, never a panic.
+        Ok(Command::Inspect(a)) => inspect::run(a.pid, &a.modules, &a.hooks, a.json)
+            .with_context(|| format!("inspect --pid {}", a.pid)),
+        Ok(Command::Doctor(a)) => {
+            if let Some(module) = &a.module {
+                eprintln!(
+                    "p11scope: doctor has no module lane yet; ignoring --module {}",
+                    module.display()
+                );
+            }
+            doctor::run(a.pid, a.cgroup.as_deref())
+        }
         Err(CliError::Help) => {
             eprintln!("{}", cli::USAGE);
-            return Ok(());
+            Ok(0)
         }
         Err(CliError::Usage(msg)) => {
             eprintln!("{msg}");
-            std::process::exit(2);
+            Ok(2)
         }
-    };
+    }
+}
+
+/// Both capture subcommands: decide the policy, discover and pin what is in
+/// scope, install the stop flag, then run the loop `kind` selects.
+fn cmd_capture(a: CaptureArgs) -> Result<()> {
+    let kind = a.kind;
     let mode = match (kind, a.metrics) {
         (Kind::Trace, _) => "trace",
         (Kind::Profile, true) => "metrics",
@@ -115,9 +116,9 @@ fn cmd_capture(kind: Kind, args: impl Iterator<Item = String>) -> Result<()> {
     )?;
     let scope = match &a.scope {
         ScopeArg::Pid(p) => {
-            if !std::path::Path::new(&format!("/proc/{p}")).exists() {
-                bail!("--pid {p}: no such process");
-            }
+            // Refuses a pid that names nothing before anything is opened, and gives
+            // discovery a pin it can recheck: a recycled pid must not be scanned.
+            process::PidPin::open(*p).map_err(|error| anyhow!("--pid {p}: {error}"))?;
             Scope::Pid(*p)
         }
         ScopeArg::Cgroup(c) => Scope::Cgroup {
@@ -132,11 +133,15 @@ fn cmd_capture(kind: Kind, args: impl Iterator<Item = String>) -> Result<()> {
         );
     }
     warn_unsafe_policy(policy);
-    let (manifest, plan, pinned) = load_plan(&a.manifest)?;
+    let (plan, pinned) = discover_plan(&a, &scope)?;
+    // Zero modules is not an error (spec §4.10): the capture still runs, still
+    // writes its report, and says here how to find out why it found nothing.
+    if plan.modules.is_empty() {
+        eprintln!("{}", no_modules_hint(&a.scope));
+    }
     let stop = install_stop_flag()?;
     match kind {
         Kind::Profile => capture_profile(
-            manifest,
             plan,
             scope,
             policy,
@@ -157,13 +162,222 @@ fn cmd_capture(kind: Kind, args: impl Iterator<Item = String>) -> Result<()> {
     }
 }
 
-/// Reads and pins the manifest, then builds the attach plan — shared by
-/// both capture subcommands.
-fn load_plan(manifest_path: &Path) -> Result<(Manifest, plan::AttachPlan, PinnedObjects)> {
-    let text = read_manifest(manifest_path)
-        .map_err(|error| anyhow!("reading manifest {}: {error}", manifest_path.display()))?;
+/// How many processes of a `--cgroup` discovery scans.
+///
+/// ponytail: a flat cap, not a byte budget. A pod is a handful of processes; a
+/// cgroup with thousands would otherwise pay the per-pid scan budget thousands of
+/// times. Upgrade path if that ever bites: carry `ScanLimits::total_bytes` across
+/// pids instead of counting them.
+const MAX_SCAN_PIDS: usize = 256;
+
+/// What the discovery pass learned besides the plan itself. One struct rather than
+/// loose locals because Task 13 turns exactly these fields into `DiscoveryEvidence`
+/// and returns them from `discover_plan` as a third element.
+#[derive(Debug, Default)]
+struct DiscoveryCounters {
+    /// Manifest modules the scan contradicted; the union is attached (spec §4.12).
+    conflicts: u64,
+    /// Manifest modules nothing corroborated by the time the plan was built.
+    uncorroborated: u64,
+    /// `Some("ptrace")` when the memory scan could not read a target's memory.
+    scan_unavailable: Option<&'static str>,
+    scan_ms: u64,
+    /// Manifest objects ignored, and why — evidence, never silence.
+    notes: Vec<String>,
+}
+
+impl DiscoveryCounters {
+    /// Everything discovery has to say, on stderr, before the capture starts.
+    /// Task 13 moves this into `evidence.discovery[]` in the published report.
+    fn report(&self, plan: &plan::AttachPlan) {
+        for note in &self.notes {
+            eprintln!("p11scope: {note}");
+        }
+        if let Some(reason) = self.scan_unavailable {
+            eprintln!(
+                "p11scope: the memory scan could not read the target ({reason}); any \
+                 --manifest offsets are attached uncorroborated"
+            );
+        }
+        eprintln!(
+            "p11scope: discovery: {} module(s), {} attach slot(s), scan {}ms, \
+             conflicts {}, uncorroborated {}",
+            plan.modules.len(),
+            plan.slots.len(),
+            self.scan_ms,
+            self.conflicts,
+            self.uncorroborated,
+        );
+    }
+}
+
+/// Which of spec §4.12's four outcomes one `--manifest` gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Corroboration {
+    /// Not mapped in scope, or the scan could not run: its offsets stand alone.
+    Uncorroborated,
+    /// Mapped, and the scan found exactly the same {object, offset} set.
+    Agreed,
+    /// Mapped, but the two sets differ: attach the union and count a conflict.
+    Conflict,
+    /// Mapped with bytes the manifest did not record: ignore this manifest.
+    IdentityMismatch,
+}
+
+/// Pure so all four cases are testable without a live target. `identity` is `None`
+/// when the object is not mapped in scope (or was not pinnable), `Some(false)` when
+/// the object is mapped but its SHA-256 is not the one the manifest recorded.
+fn corroborate(
+    scan_unavailable: bool,
+    identity: Option<bool>,
+    manifest_targets: &BTreeSet<(String, u64)>,
+    scanned_targets: &BTreeSet<(String, u64)>,
+) -> Corroboration {
+    match identity {
+        // A scan that could not read memory found no tables to compare against;
+        // that is not evidence against the manifest.
+        _ if scan_unavailable => Corroboration::Uncorroborated,
+        None => Corroboration::Uncorroborated,
+        Some(false) => Corroboration::IdentityMismatch,
+        Some(true) if manifest_targets == scanned_targets => Corroboration::Agreed,
+        Some(true) => Corroboration::Conflict,
+    }
+}
+
+/// The scan's view of the object a manifest describes, and whether the two agree on
+/// its bytes. Matched by SHA-256 first — a manifest records the device and inode of
+/// the host it was made on, which a container or a remount spells differently — and
+/// by the recorded path second: a path match whose hash differs is exactly §4.12's
+/// "manifest `sha256` ≠ the pinned object's".
+fn scan_view<'a>(
+    m: &Manifest,
+    modules: &'a [ScannedModule],
+    pinned: &PinnedObjects,
+) -> Option<(&'a ScannedModule, bool)> {
+    let sha_of = |module: &ScannedModule| {
+        pinned
+            .pinned()
+            .find(|p| p.key == module.key)
+            .map(|p| p.sha256.to_string())
+    };
+    let sha = m
+        .objects
+        .iter()
+        .find(|o| o.path == m.module_path)
+        .and_then(|o| o.identity.sha256.clone());
+    if let Some(sha) = sha
+        && let Some(module) = modules.iter().find(|m| sha_of(m).as_deref() == Some(&sha))
+    {
+        return Some((module, true));
+    }
+    let module = modules.iter().find(|module| module.path == m.module_path)?;
+    // A module the scan saw but could not pin has no hash to disagree with: that is
+    // "nothing corroborated it", never "the manifest is wrong".
+    sha_of(module).map(|_| (module, false))
+}
+
+/// {object SHA-256, file offset} for every entry the scan decoded — the comparison
+/// a manifest can be held against without depending on device and inode numbers.
+fn scanned_targets(module: &ScannedModule, pinned: &PinnedObjects) -> BTreeSet<(String, u64)> {
+    module
+        .tables
+        .iter()
+        .flat_map(|table| &table.entries)
+        .filter_map(|entry| {
+            let sha = pinned.pinned().find(|p| p.key == entry.object)?.sha256;
+            Some((sha.to_string(), entry.file_offset))
+        })
+        .collect()
+}
+
+/// The same set as a manifest records it.
+fn manifest_targets(m: &Manifest) -> BTreeSet<(String, u64)> {
+    m.surfaces
+        .iter()
+        .flat_map(|surface| &surface.functions)
+        .filter_map(|function| match function.resolution {
+            Resolution::Resolved {
+                object,
+                file_offset,
+            } => {
+                let record = m.objects.iter().find(|o| o.id == object)?;
+                Some((record.identity.sha256.clone()?, file_offset))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Adopts the identity the scan sees for every manifest object with the same bytes.
+/// Without this the union of §4.12 would attach two probes to one address whenever
+/// the manifest was made on another host: the recorded {device, inode} and the live
+/// one differ, so the merge could not tell that both name one object.
+fn retarget_to_scanned(m: &mut Manifest, pinned: &PinnedObjects) {
+    for provenance in &mut m.provenance_objects {
+        let Some(sha) = provenance.identity.sha256.as_deref() else {
+            continue;
+        };
+        if let Some(summary) = pinned.pinned().find(|p| p.sha256 == sha) {
+            provenance.device_major = summary.key.device.major;
+            provenance.device_minor = summary.key.device.minor;
+            provenance.inode = summary.key.inode;
+        }
+    }
+}
+
+/// Every pid discovery must look at. `--cgroup` matches the named cgroup and every
+/// descendant during capture, so discovery walks the same tree: a pod's processes
+/// live in its container cgroups, never in `cgroup.procs` of the pod directory.
+fn scope_pids(scope: &Scope) -> Vec<u32> {
+    let path = match scope {
+        Scope::Pid(pid) => return vec![*pid],
+        Scope::Cgroup { path, .. } => path,
+    };
+    let mut pids = Vec::new();
+    let mut stack = vec![path.clone()];
+    while let Some(dir) = stack.pop() {
+        if let Ok(text) = std::fs::read_to_string(dir.join("cgroup.procs")) {
+            pids.extend(
+                text.lines()
+                    .filter_map(|line| line.trim().parse::<u32>().ok()),
+            );
+        }
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    stack.push(entry.path());
+                }
+            }
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+/// Zero modules is not an error (spec §4.10) — but an operator whose provider was
+/// not found is owed the two commands that say why.
+fn no_modules_hint(scope: &ScopeArg) -> String {
+    match scope {
+        ScopeArg::Pid(pid) => format!(
+            "p11scope: no PKCS#11 modules discovered in pid {pid}; run \
+             `p11scope inspect --pid {pid}` or `p11scope doctor --pid {pid}` to see why"
+        ),
+        ScopeArg::Cgroup(path) => format!(
+            "p11scope: no PKCS#11 modules discovered in cgroup {0}; run \
+             `p11scope inspect --pid <n>` for a process in it or \
+             `p11scope doctor --cgroup {0}` to see why",
+            path.display()
+        ),
+    }
+}
+
+/// Reads, parses and schema-checks one `--manifest`.
+fn read_manifest_file(path: &Path) -> Result<Manifest> {
+    let text = read_manifest(path)
+        .map_err(|error| anyhow!("reading manifest {}: {error}", path.display()))?;
     let manifest: Manifest = serde_json::from_str(&text)
-        .with_context(|| format!("parsing manifest {}", manifest_path.display()))?;
+        .with_context(|| format!("parsing manifest {}", path.display()))?;
     if manifest.schema != SCHEMA {
         bail!(
             "manifest schema mismatch: got {:?}, this build expects {SCHEMA:?}; \
@@ -171,26 +385,172 @@ fn load_plan(manifest_path: &Path) -> Result<(Manifest, plan::AttachPlan, Pinned
             manifest.schema
         );
     }
-    let pinned = pin_manifest_objects(&manifest).map_err(|problems| {
-        for problem in &problems {
-            eprintln!("p11scope: {problem}");
+    Ok(manifest)
+}
+
+/// Scans one process and pins every object the scan named. The scan's own skips and
+/// the pinning skips are printed rather than dropped: a module the observer could
+/// see but not read is exactly the gap an operator needs to know about.
+fn scan_and_pin(
+    pid: u32,
+    a: &CaptureArgs,
+    limits: ScanLimits,
+    counters: &mut DiscoveryCounters,
+) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
+    let outcome = scan_pid(&ScanRequest {
+        pid,
+        hints: &a.modules,
+        hooks: &a.hooks,
+        limits,
+    })
+    .map_err(|error| anyhow!("scanning pid {pid}: {error}"))?;
+    counters.scan_unavailable = counters.scan_unavailable.or(outcome.unavailable_reason());
+    for skipped in outcome.skipped() {
+        eprintln!(
+            "p11scope: discovery skipped {} — {}",
+            skipped.subject, skipped.reason
+        );
+    }
+    let (pinned, pin_skips) = pin_scanned_objects(pid, outcome.modules(), limits)
+        .map_err(|error| anyhow!("pinning the objects of pid {pid}: {error}"))?;
+    for skipped in &pin_skips {
+        eprintln!(
+            "p11scope: discovery skipped {} — {}",
+            skipped.subject, skipped.reason
+        );
+    }
+    let modules = match outcome {
+        ScanOutcome::Scanned {
+            modules, scan_ms, ..
+        } => {
+            counters.scan_ms += scan_ms;
+            modules
         }
-        anyhow!("manifest does not match the current files; refusing to attach")
-    })?;
-    let plan = plan::build(&manifest);
+        ScanOutcome::Unavailable { modules, .. } => modules,
+    };
+    Ok((modules, pinned))
+}
+
+/// Discovery for one capture: scan the scope, read and corroborate any manifests,
+/// merge into one plan, pin every object. Task 13 adds the evidence return value.
+fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<(plan::AttachPlan, PinnedObjects)> {
+    let limits = ScanLimits::default();
+    let mut counters = DiscoveryCounters::default();
+    let pids = scope_pids(scope);
+    let named = pids.len() == 1;
+    let mut modules: Vec<ScannedModule> = Vec::new();
+    let mut pinned = PinnedObjects::empty();
+    if pids.len() > MAX_SCAN_PIDS {
+        eprintln!(
+            "p11scope: {} processes in scope; discovery scans the first {MAX_SCAN_PIDS}",
+            pids.len()
+        );
+    }
+    for pid in pids.iter().take(MAX_SCAN_PIDS) {
+        match scan_and_pin(*pid, a, limits, &mut counters) {
+            Ok((found, pins)) => {
+                pinned.absorb(pins);
+                // A provider ten pods map is one module: merged by object identity.
+                for module in found {
+                    if !modules.iter().any(|known| known.key == module.key) {
+                        modules.push(module);
+                    }
+                }
+            }
+            // The pid the operator named *is* the capture; any other is one of many
+            // in a cgroup, and may legitimately exit between listing and scanning.
+            Err(error) if named => return Err(error),
+            Err(error) => eprintln!("p11scope: discovery skipped pid {pid}: {error:#}"),
+        }
+    }
+
+    let mut accepted: Vec<Manifest> = Vec::new();
+    let mut corroborated: Vec<ObjectKey> = Vec::new();
+    let mut ignored = 0usize;
+    for path in &a.manifests {
+        let mut manifest = read_manifest_file(path)?;
+        let manifest_pins = pin_manifest_objects(&manifest).map_err(|problems| {
+            for problem in &problems {
+                eprintln!("p11scope: {problem}");
+            }
+            anyhow!(
+                "manifest {} does not match the current files; refusing to attach",
+                path.display()
+            )
+        })?;
+        let view = scan_view(&manifest, &modules, &pinned);
+        let mapped = view.map(|(module, _)| module.key);
+        let outcome = corroborate(
+            counters.scan_unavailable.is_some(),
+            view.map(|(_, agrees)| agrees),
+            &manifest_targets(&manifest),
+            &view
+                .map(|(module, _)| scanned_targets(module, &pinned))
+                .unwrap_or_default(),
+        );
+        match outcome {
+            // Every offset it carries is already in the plan; nothing to add but the
+            // fact that a second source said the same thing.
+            Corroboration::Agreed => corroborated.extend(mapped),
+            Corroboration::Conflict => {
+                counters.conflicts += 1;
+                counters.notes.push(format!(
+                    "manifest {} and the memory scan disagree about {}; attaching the \
+                     union of both",
+                    path.display(),
+                    manifest.module_path
+                ));
+                corroborated.extend(mapped);
+                retarget_to_scanned(&mut manifest, &pinned);
+                accepted.push(manifest);
+                pinned.absorb(manifest_pins);
+            }
+            Corroboration::Uncorroborated => {
+                accepted.push(manifest);
+                pinned.absorb(manifest_pins);
+            }
+            Corroboration::IdentityMismatch => {
+                ignored += 1;
+                counters.notes.push(format!(
+                    "ignoring manifest {}: the {} mapped in the target does not hash to \
+                     the sha256 it records",
+                    path.display(),
+                    manifest.module_path
+                ));
+            }
+        }
+    }
+
+    let mut plan = plan::build_from_sources(&modules, &accepted);
+    for key in &corroborated {
+        if let Some(summary) = plan.modules.iter_mut().find(|m| m.key == *key) {
+            summary.corroborated = true;
+            if summary.source == "scan" {
+                summary.source = "scan+manifest";
+            }
+        }
+    }
+    counters.uncorroborated = plan
+        .modules
+        .iter()
+        .filter(|m| m.source.contains("manifest") && !m.corroborated)
+        .count() as u64;
+    // Ignoring a manifest is only fatal when it was the sole discovery source and
+    // nothing else found a table (spec §4.12).
+    if ignored > 0 && plan.slots.is_empty() {
+        bail!(
+            "{}; no other discovery source found a function table",
+            counters.notes.join("; ")
+        );
+    }
     // The merge refuses an over-capacity module whole rather than attaching a
     // prefix, so the ceiling is reported here instead of as an empty plan.
     if let Some(refused) = plan.modules_skipped.first() {
         bail!("{}: {}", refused.subject, refused.reason);
     }
-    if plan.slots.is_empty() {
-        bail!(
-            "attach plan is empty: manifest {} has no attachable slots",
-            manifest_path.display()
-        );
-    }
     plan::ensure_capacity(&plan).map_err(|error| anyhow!(error))?;
-    Ok((manifest, plan, pinned))
+    counters.report(&plan);
+    Ok((plan, pinned))
 }
 
 /// Prints every attach failure — shared by `profile` and `trace`, which
@@ -293,9 +653,18 @@ fn observe_fork(
     true
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The provider line the live frame and the report name. Task 13 replaces it with
+/// `capture.modules[]`; until then a capture that observed two providers says so
+/// rather than picking one and calling it "the" module.
+fn module_label(plan: &plan::AttachPlan) -> String {
+    match plan.modules.as_slice() {
+        [] => "no modules discovered".to_string(),
+        [only] => only.path.clone(),
+        [first, rest @ ..] => format!("{} (+{} more)", first.path, rest.len()),
+    }
+}
+
 fn capture_profile(
-    manifest: Manifest,
     plan: plan::AttachPlan,
     scope: Scope,
     policy: CapturePolicy,
@@ -304,6 +673,7 @@ fn capture_profile(
     pinned: &PinnedObjects,
     interrupted: &AtomicBool,
 ) -> Result<()> {
+    let module_label = module_label(&plan);
     // Created before the attach so a bad `-o` path fails early, published
     // by `commit()` only once the final report is written.
     let output = out
@@ -374,7 +744,7 @@ fn capture_profile(
             &state,
             pinned.provider_changed(),
         );
-        let frame = render::live(&reports, &ev, elapsed, &manifest.module_path, mode, policy);
+        let frame = render::live(&reports, &ev, elapsed, &module_label, mode, policy);
         pinned.check_unchanged().map_err(anyhow::Error::msg)?;
         write_stdout(
             stdout,
@@ -413,14 +783,7 @@ fn capture_profile(
         pinned.provider_changed(),
     );
     ev.mark_terminal_drain_unproven();
-    let frame = render::live(
-        &reports,
-        &ev,
-        clock.elapsed(),
-        &manifest.module_path,
-        mode,
-        policy,
-    );
+    let frame = render::live(&reports, &ev, clock.elapsed(), &module_label, mode, policy);
     write_stdout(
         stdout,
         &mut stdout_open,
@@ -435,14 +798,16 @@ fn capture_profile(
             .to_string();
         let started = fmt_rfc3339(wall_start);
         let ended = fmt_rfc3339(SystemTime::now());
-        let build_id = manifest
-            .objects
-            .iter()
-            .find(|o| o.path == manifest.module_path)
-            .and_then(|o| o.identity.value.as_deref());
+        // The first discovered module's build-id; Task 13 publishes one entry per
+        // module instead of a single `capture.module`.
+        let build_id = plan
+            .modules
+            .first()
+            .and_then(|m| pinned.pinned().find(|p| p.key == m.key))
+            .and_then(|p| p.build_id.map(str::to_string));
         let capture = render::CaptureMeta {
-            module: &manifest.module_path,
-            build_id,
+            module: &module_label,
+            build_id: build_id.as_deref(),
             started: &started,
             ended: &ended,
             kernel: &kernel,
@@ -793,7 +1158,19 @@ fn evidence_for(
         completeness: "UNKNOWN",
     };
     ev.verdict();
+    ev.completeness = discovered_completeness(plan, ev.completeness);
     ev
+}
+
+/// A capture that attached nothing has no attach failures, no skips and no loss, so
+/// `Evidence::verdict` would call having observed nothing COMPLETE. Task 13 moves
+/// this rule into `verdict()` itself as `discovery.modules.is_empty()`.
+fn discovered_completeness(plan: &plan::AttachPlan, verdict: &'static str) -> &'static str {
+    if plan.slots.is_empty() {
+        "PARTIAL"
+    } else {
+        verdict
+    }
 }
 
 /// `SystemTime` → an RFC3339-ish UTC timestamp, no `chrono` dependency.
@@ -961,9 +1338,146 @@ mod tests {
                 ),
             )
             .unwrap();
-            let err = load_plan(&path).unwrap_err().to_string();
+            let err = read_manifest_file(&path).unwrap_err().to_string();
             assert!(err.contains("rediscover"), "{err}");
         }
+    }
+
+    fn targets(offsets: &[u64]) -> BTreeSet<(String, u64)> {
+        offsets
+            .iter()
+            .map(|offset| ("11".repeat(32), *offset))
+            .collect()
+    }
+
+    /// A capture that attached nothing must never publish COMPLETE: it has no
+    /// failures to report precisely because it observed nothing (spec §4.10).
+    #[test]
+    fn a_capture_that_attached_nothing_is_partial() {
+        let mut plan = plan::AttachPlan {
+            slots: vec![],
+            modules: vec![],
+            skipped: vec![],
+            modules_skipped: vec![],
+            entries_seen: 0,
+            surfaces: vec![],
+            vendor_interfaces: 0,
+            interface_list: "absent".into(),
+            module_ambiguous: 0,
+        };
+        assert_eq!(discovered_completeness(&plan, "COMPLETE"), "PARTIAL");
+        plan.slots.push(plan::Slot {
+            index: 0,
+            object: p11scope_manifest::maps::ObjectKey {
+                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                inode: 42,
+            },
+            object_path: "/opt/p11.so".into(),
+            file_offset: 0x10,
+            names: vec!["C_Sign".into()],
+            aliased: false,
+            semantics: p11scope_ebpf_common::SlotSemantics::COUNT_ONLY,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![plan::ModuleId(0)],
+        });
+        assert_eq!(discovered_completeness(&plan, "COMPLETE"), "COMPLETE");
+        assert_eq!(discovered_completeness(&plan, "PARTIAL"), "PARTIAL");
+    }
+
+    /// The four outcomes of spec §4.12, which decide whether `--manifest` is a safe
+    /// fallback or a trapdoor. Each one changes what is attached and what the
+    /// capture claims about it.
+    #[test]
+    fn the_four_corroboration_outcomes() {
+        let recorded = targets(&[0x10, 0x20]);
+        // 1. Not mapped in scope: the manifest stands on its own.
+        assert_eq!(
+            corroborate(false, None, &recorded, &BTreeSet::new()),
+            Corroboration::Uncorroborated
+        );
+        // 2. Mapped, same {object, offset} set: corroborated.
+        assert_eq!(
+            corroborate(false, Some(true), &recorded, &targets(&[0x10, 0x20])),
+            Corroboration::Agreed
+        );
+        // 3. Mapped, the sets differ: a conflict (the caller attaches the union).
+        assert_eq!(
+            corroborate(false, Some(true), &recorded, &targets(&[0x10, 0x30])),
+            Corroboration::Conflict
+        );
+        assert_eq!(
+            corroborate(false, Some(true), &recorded, &BTreeSet::new()),
+            Corroboration::Conflict
+        );
+        // 4. Mapped, but the bytes are not the ones the manifest recorded.
+        assert_eq!(
+            corroborate(false, Some(false), &recorded, &recorded),
+            Corroboration::IdentityMismatch
+        );
+        // A scan that could not read memory found no tables to disagree with, so it
+        // never turns a usable manifest into a conflict or a mismatch.
+        for identity in [None, Some(true), Some(false)] {
+            assert_eq!(
+                corroborate(true, identity, &recorded, &BTreeSet::new()),
+                Corroboration::Uncorroborated,
+                "{identity:?}"
+            );
+        }
+    }
+
+    /// A pod's processes live in the container cgroups below the pod directory;
+    /// capture scope already includes every descendant, so discovery must too.
+    #[test]
+    fn cgroup_scope_collects_pids_from_every_descendant() {
+        let root = tempfile::tempdir().unwrap();
+        let leaf = root.path().join("kubepods.slice").join("container.scope");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(root.path().join("cgroup.procs"), "11\n").unwrap();
+        std::fs::write(leaf.join("cgroup.procs"), "22\n33\n\n22\n").unwrap();
+        let pids = scope_pids(&Scope::Cgroup {
+            id: 0,
+            path: root.path().to_path_buf(),
+        });
+        assert_eq!(pids, vec![11, 22, 33], "deduplicated, descendants included");
+        assert_eq!(scope_pids(&Scope::Pid(7)), vec![7]);
+    }
+
+    /// Finding nothing is not an error, so the only thing that keeps the operator
+    /// from a silent empty report is this line naming the two commands that explain.
+    #[test]
+    fn zero_modules_points_at_inspect_and_doctor() {
+        let hint = no_modules_hint(&ScopeArg::Pid(42));
+        assert!(
+            hint.contains("no PKCS#11 modules discovered in pid 42"),
+            "{hint}"
+        );
+        assert!(hint.contains("p11scope inspect --pid 42"), "{hint}");
+        assert!(hint.contains("p11scope doctor --pid 42"), "{hint}");
+        let hint = no_modules_hint(&ScopeArg::Cgroup("/sys/fs/cgroup/x".into()));
+        assert!(hint.contains("cgroup /sys/fs/cgroup/x"), "{hint}");
+        assert!(hint.contains("p11scope inspect --pid"), "{hint}");
+        assert!(
+            hint.contains("p11scope doctor --cgroup /sys/fs/cgroup/x"),
+            "{hint}"
+        );
+    }
+
+    /// `inspect` propagates a hard error for a pid that names nothing; it must reach
+    /// the operator as one line and exit 1, never as a panic or a backtrace dump.
+    #[test]
+    fn inspect_on_a_nonexistent_pid_is_one_line_and_not_a_panic() {
+        // Above /proc/sys/kernel/pid_max on every supported kernel.
+        let error = inspect::run(
+            0x7fff_fff0,
+            &[],
+            &p11scope::discovery::hooks::HookRegistry::builtin(),
+            false,
+        )
+        .expect_err("a pid that names nothing cannot be inspected");
+        let rendered = format!("{error:#}");
+        assert_eq!(rendered.lines().count(), 1, "{rendered}");
+        assert!(rendered.contains("2147483632"), "{rendered}");
     }
 
     /// The finalization a stopped loop runs into: `-o` publication produces

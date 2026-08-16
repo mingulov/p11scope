@@ -109,6 +109,39 @@ fn matching_identity_is_accepted() {
     assert!(p11scope::discovery::identity::pin_manifest_objects(&m).is_ok());
 }
 
+/// A capture pins objects from the scan *and* from every `--manifest`, but
+/// `Session::start` takes one set: both must survive the merge, each still
+/// reachable the way its own slots are attached (by key for a scanned object,
+/// by the recorded path for a manifest one).
+#[test]
+fn scan_and_manifest_pins_merge_into_one_set() {
+    use p11scope::discovery::scan::ScanLimits;
+
+    let d = tmpdir("manifest_pinning_absorb");
+    let so = cc_so(&d, "absorbed", "int f(void){return 1;}\n");
+    let manifest_pins =
+        p11scope::discovery::identity::pin_manifest_objects(&manifest_for(&so)).unwrap();
+
+    let (exe, modules) = scan_self();
+    let (mut pinned, _) = p11scope::discovery::identity::pin_scanned_objects(
+        std::process::id(),
+        &modules,
+        ScanLimits::default(),
+    )
+    .unwrap();
+    pinned.absorb(manifest_pins);
+
+    assert!(
+        pinned.pinned().any(|s| s.path == exe.display().to_string()),
+        "the scanned object survives the merge"
+    );
+    let attach = pinned
+        .attach_path(&so.display().to_string())
+        .expect("the manifest path still resolves after the merge");
+    assert!(attach.starts_with("/proc/self/fd/"), "{attach:?}");
+    assert!(pinned.check_unchanged().unwrap());
+}
+
 #[test]
 fn changed_object_is_refused_naming_the_file() {
     let d = tmpdir("manifest_pinning_bad");

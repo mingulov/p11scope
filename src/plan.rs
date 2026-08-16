@@ -244,7 +244,28 @@ fn merge(
             continue;
         }
 
-        let id = ModuleId(modules.len() as u32);
+        // One object is one module however many sources described it. A manifest
+        // corroborating a scanned module must not read as two rivals claiming the same
+        // target: that would make every corroborated slot COUNT_ONLY (§4.7) and turn
+        // the fallback `--manifest` of §4.12 into a trapdoor.
+        let id = match modules
+            .iter()
+            .position(|existing: &ModuleSummary| existing.key == module.key)
+        {
+            Some(index) => ModuleId(index as u32),
+            None => {
+                modules.push(ModuleSummary {
+                    id: ModuleId(modules.len() as u32),
+                    key: module.key,
+                    path: module.path.to_string(),
+                    tables: Vec::new(),
+                    interfaces: 0,
+                    source: module.source,
+                    corroborated: false,
+                });
+                ModuleId(modules.len() as u32 - 1)
+            }
+        };
         for target in &module.targets {
             let position = *positions
                 .entry((target.object, target.file_offset))
@@ -268,15 +289,12 @@ fn merge(
             slot.names.push(target.name.to_string());
             slot.fork_safe &= target.fork_safe;
         }
-        modules.push(ModuleSummary {
-            id,
-            key: module.key,
-            path: module.path.to_string(),
-            tables: module.tables,
-            interfaces: module.interfaces,
-            source: module.source,
-            corroborated: false,
-        });
+        let summary = &mut modules[id.0 as usize];
+        if summary.source != module.source {
+            summary.source = "scan+manifest";
+        }
+        summary.tables.extend(module.tables);
+        summary.interfaces += module.interfaces;
         surfaces.extend(module.surfaces);
         skipped.extend(module.skipped);
         entries_seen += module.entries_seen;
@@ -328,13 +346,26 @@ fn merge(
 
 /// Merges every scanned module into one plan over a single slot space.
 pub fn build_from_modules(modules: &[ScannedModule]) -> AttachPlan {
-    // The scan never calls the provider, so there is no C_GetInterfaceList
-    // enumeration to report and nothing was left present-but-undecoded: every
-    // interface it records names a table it decoded.
+    build_from_sources(modules, &[])
+}
+
+/// Every module discovery found — scanned and manifest-supplied — merged into one
+/// plan over the single slot space the eBPF side has. Both sources lower into
+/// `Discovered`, so a target both describe becomes one slot rather than two probes
+/// on one address (spec §4.12's union).
+pub fn build_from_sources(scanned: &[ScannedModule], manifests: &[Manifest]) -> AttachPlan {
+    let mut discovered: Vec<Discovered<'_>> = scanned.iter().map(lower_scanned).collect();
+    discovered.extend(manifests.iter().map(lower_manifest));
+    // The scan never calls the provider, so it contributes no C_GetInterfaceList
+    // enumeration and leaves nothing present-but-undecoded: every interface it
+    // records names a table it decoded. Only a manifest can report either.
     merge(
-        modules.iter().map(lower_scanned).collect(),
-        0,
-        "absent".into(),
+        discovered,
+        manifests.iter().map(|m| m.vendor_interfaces.len()).sum(),
+        manifests.first().map_or_else(
+            || "absent".to_string(),
+            |m| acquisition_label(&m.interface_list),
+        ),
     )
 }
 
@@ -419,11 +450,7 @@ fn object_key(m: &Manifest, object: &ObjectRecord) -> Option<ObjectKey> {
 }
 
 pub fn build(m: &Manifest) -> AttachPlan {
-    merge(
-        vec![lower_manifest(m)],
-        m.vendor_interfaces.len(),
-        acquisition_label(&m.interface_list),
-    )
+    build_from_sources(&[], std::slice::from_ref(m))
 }
 
 fn lower_manifest(m: &Manifest) -> Discovered<'_> {
@@ -753,6 +780,49 @@ mod tests {
             "{:?}",
             p.modules_skipped[0]
         );
+    }
+
+    /// A manifest and the scan describing the *same object* are one module with one
+    /// slot space, not two rivals: treating them as two would mark every corroborated
+    /// target COUNT_ONLY and force PARTIAL, turning `--manifest` into a trapdoor.
+    #[test]
+    fn a_manifest_and_a_scan_of_the_same_object_are_one_module() {
+        use crate::discovery::scan::{ScannedEntry, ScannedTable};
+
+        let m = manifest_with(vec![resolved("C_Sign", 0x10), resolved("C_Login", 0x50)]);
+        let entry = |name: &'static str, file_offset| ScannedEntry {
+            name,
+            object: TEST_OBJECT,
+            object_path: "/opt/p11.so".into(),
+            file_offset,
+        };
+        let scanned = ScannedModule {
+            key: TEST_OBJECT,
+            path: "/opt/p11.so".into(),
+            exports: vec!["C_GetFunctionList".into()],
+            tables: vec![ScannedTable {
+                version: (2, 40),
+                walk: "full",
+                entries: vec![entry("C_Sign", 0x10), entry("C_Verify", 0x60)],
+                null_entries: vec![],
+                address: 0x7000,
+            }],
+            interfaces: vec![],
+        };
+
+        let p = build_from_sources(std::slice::from_ref(&scanned), std::slice::from_ref(&m));
+        assert_eq!(p.modules.len(), 1, "{:?}", p.modules);
+        assert_eq!(p.modules[0].source, "scan+manifest");
+        assert_eq!(p.module_ambiguous, 0, "corroboration is not ambiguity");
+        // The union: 0x10 from both, 0x60 only the scan saw, 0x50 only the manifest.
+        let offsets: Vec<u64> = p.slots.iter().map(|s| s.file_offset).collect();
+        assert_eq!(offsets, vec![0x10, 0x60, 0x50]);
+        for slot in &p.slots {
+            assert_eq!(slot.module_ids, vec![ModuleId(0)], "{slot:?}");
+            assert!(!slot.semantic_ambiguous, "{slot:?}");
+        }
+        // Both sources' tables stay visible as evidence.
+        assert_eq!(p.modules[0].tables.len(), 2);
     }
 
     #[test]

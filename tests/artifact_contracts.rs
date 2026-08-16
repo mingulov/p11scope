@@ -500,6 +500,55 @@ aggregate-only-metrics default metrics"
     assert!(inspector.contains("malformed map definitions rejected: OK"));
 }
 
+/// The usage text is the contract for the manifest-free CLI, and the binary must
+/// keep the exit codes that contract implies: 2 for a usage error, 0 for `--help`,
+/// 1 with a single line for a target that cannot be read at all.
+#[test]
+fn usage_documents_every_subcommand_and_capture_needs_no_manifest() {
+    for line in [
+        "p11scope profile",
+        "p11scope trace",
+        "p11scope inspect --pid",
+        "p11scope doctor",
+        "p11scope-discover --module",
+    ] {
+        assert!(
+            p11scope::cli::USAGE.contains(line),
+            "{line} missing from usage"
+        );
+    }
+    assert!(
+        p11scope::cli::USAGE
+            .contains("discovery scans the target's mapped memory — no manifest and no helper")
+    );
+
+    let bin = env!("CARGO_BIN_EXE_p11scope");
+    let help = Command::new(bin)
+        .arg("--help")
+        .output()
+        .expect("run --help");
+    assert_eq!(help.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&help.stderr).contains("p11scope inspect"));
+
+    let no_pid = Command::new(bin)
+        .arg("inspect")
+        .output()
+        .expect("run inspect");
+    let stderr = String::from_utf8_lossy(&no_pid.stderr);
+    assert_eq!(no_pid.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("--pid"), "{stderr}");
+
+    // A pid that names nothing: one line, exit 1, never a panic or a backtrace.
+    let gone = Command::new(bin)
+        .args(["inspect", "--pid", "2147483632"])
+        .output()
+        .expect("run inspect on a dead pid");
+    let stderr = String::from_utf8_lossy(&gone.stderr);
+    assert_eq!(gone.status.code(), Some(1), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
 #[test]
 fn gate_scripts_pin_the_toolchain() {
     for path in [

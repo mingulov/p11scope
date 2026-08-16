@@ -69,7 +69,10 @@ pub struct ScannedTable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedInterface {
     pub index: usize,
-    /// "exact_standard" | "other" | "null" | "unreadable"
+    /// "exact_standard" | "other" | "null" | "unreadable". "unreadable" covers all
+    /// three ways a name does not become text: the read failed, the name ran past
+    /// `INTERFACE_NAME_CAP`, or the pointer was outside this object's readable pages
+    /// and was deliberately not dereferenced.
     pub name_class: &'static str,
     /// Kept for `inspect` and manifests only; never rendered in capture output.
     pub name_lossy: Option<String>,
@@ -184,6 +187,8 @@ fn decode_candidate(
     offset: usize,
     base_address: u64,
     maps: &[MapEntry],
+    mapped: &std::ops::Range<u64>,
+    truncated: &mut Vec<String>,
 ) -> Option<(ScannedTable, usize)> {
     let word = u64::from_ne_bytes(
         snapshot
@@ -193,8 +198,21 @@ fn decode_candidate(
     );
     let (version, spans, walk) = spans_for(word)?;
     let len = span_bytes(spans)?;
-    let bytes = snapshot.get(offset..offset.checked_add(len)?)?;
     let address = base_address.checked_add(offset as u64)?;
+    let Some(bytes) = snapshot.get(offset..offset.checked_add(len)?) else {
+        // Clauses 1–4 held, so this really looks like a table header; only clause 5
+        // failed. Recording it is what keeps the .bss-spill gap visible instead of
+        // silently returning an empty module (coordinator ruling, 2026-08-16).
+        truncated.push(format!(
+            "table header for {}.{} at {address:#x} extends past the object's \
+             file-backed data ({len} bytes needed, {} available); a table built at \
+             run time in .bss or on the heap is outside the memory scan's reach",
+            version.0,
+            version.1,
+            snapshot.len().saturating_sub(offset),
+        ));
+        return None;
+    };
 
     let mut entries = Vec::new();
     let mut null_entries = Vec::new();
@@ -207,6 +225,9 @@ fn decode_candidate(
                 continue;
             }
             non_null += 1;
+            if !mapped.contains(&(value as u64)) {
+                return None; // outside every mapping ⇒ resolve would say Unmapped
+            }
             let Resolved::File {
                 path,
                 file_offset,
@@ -248,11 +269,30 @@ fn decode_candidate(
 }
 
 /// Every 8-byte-aligned candidate in one snapshot, longest match kept on overlap.
-fn detect_tables(snapshot: &[u8], base_address: u64, maps: &[MapEntry]) -> Vec<ScannedTable> {
+/// The second return is the reasons for candidates whose header parsed but whose body
+/// ran past the snapshot — the caller turns each into a `Skipped`.
+fn detect_tables(
+    snapshot: &[u8],
+    base_address: u64,
+    maps: &[MapEntry],
+) -> (Vec<ScannedTable>, Vec<String>) {
+    // One pass over the maps here saves a linear `resolve` scan per rejected word.
+    let (low, high) = maps.iter().fold((u64::MAX, 0), |(low, high), entry| {
+        (low.min(entry.start), high.max(entry.end))
+    });
+    let mapped = low..high;
+    let mut truncated = Vec::new();
     let mut found: Vec<(usize, usize, ScannedTable)> = Vec::new();
     let mut offset = 0usize;
     while offset + WORD <= snapshot.len() {
-        if let Some((table, len)) = decode_candidate(snapshot, offset, base_address, maps) {
+        if let Some((table, len)) = decode_candidate(
+            snapshot,
+            offset,
+            base_address,
+            maps,
+            &mapped,
+            &mut truncated,
+        ) {
             found.push((offset, len, table));
         }
         offset += WORD;
@@ -270,12 +310,21 @@ fn detect_tables(snapshot: &[u8], base_address: u64, maps: &[MapEntry]) -> Vec<S
         }
     }
     kept.sort_by_key(|(start, _, _)| *start);
-    kept.into_iter().map(|(_, _, table)| table).collect()
+    (
+        kept.into_iter().map(|(_, _, table)| table).collect(),
+        truncated,
+    )
 }
 
 /// `CK_INTERFACE` triples in one snapshot that name a table this scan decoded.
 /// The triple's own address is not recorded, so no `base_address` is needed here.
-fn scan_interfaces(snapshot: &[u8], mem: &File, tables: &[ScannedTable]) -> Vec<ScannedInterface> {
+fn scan_interfaces(
+    snapshot: &[u8],
+    mem: &File,
+    tables: &[ScannedTable],
+    maps: &[MapEntry],
+    key: ObjectKey,
+) -> Vec<ScannedInterface> {
     let word_at = |offset: usize| -> Option<u64> {
         Some(u64::from_ne_bytes(
             snapshot
@@ -295,17 +344,27 @@ fn scan_interfaces(snapshot: &[u8], mem: &File, tables: &[ScannedTable]) -> Vec<
             // is just data. Requiring a decoded table also keeps the byte budget —
             // only the provider's own mappings are ever read.
             let table = tables.iter().position(|t| t.address == table_ptr)?;
-            let (name_class, name_lossy) = if name_ptr == 0 {
-                ("null", None)
-            } else {
-                match read_name(mem, name_ptr) {
+            // Privacy boundary: a triple is accepted on `table_ptr` alone, so the name
+            // pointer of a look-alike structure could aim anywhere. Only this object's
+            // own readable pages — where a provider keeps its interface names — are
+            // ever dereferenced; anything else is recorded without being read.
+            let readable_here = matches!(
+                resolve(maps, name_ptr),
+                Resolved::File {
+                    device, inode, permissions, ..
+                } if permissions[0] == b'r' && ObjectKey { device, inode } == key
+            );
+            let (name_class, name_lossy) = match name_ptr {
+                0 => ("null", None),
+                _ if !readable_here => ("unreadable", None),
+                _ => match read_name(mem, name_ptr) {
                     Some(raw) if raw == STANDARD_INTERFACE_NAME => (
                         "exact_standard",
                         Some(String::from_utf8_lossy(&raw).into_owned()),
                     ),
                     Some(raw) => ("other", Some(String::from_utf8_lossy(&raw).into_owned())),
                     None => ("unreadable", None),
-                }
+                },
             };
             Some(ScannedInterface {
                 index: 0,
@@ -344,26 +403,44 @@ fn read_name(mem: &File, address: u64) -> Option<Vec<u8>> {
     None
 }
 
-/// `entry.start..entry.end` from the target, in ≤1 MiB chunks. A short or failed read
-/// ends this mapping and keeps what was read: a guard page must not lose the rest.
-fn read_mapping(mem: &File, entry: &MapEntry) -> Vec<u8> {
+/// `entry.start..entry.end` from the target, in ≤1 MiB chunks. A partial read simply
+/// advances and retries; only a failed or zero-length read ends the mapping, keeping
+/// what was read so far. The second return says why it stopped short — everything past
+/// that point went unscanned, and the caller must record that rather than imply it was
+/// examined and found empty.
+fn read_mapping(mem: &File, entry: &MapEntry) -> (Vec<u8>, Option<String>) {
     let Some(len) = entry.end.checked_sub(entry.start).map(|len| len as usize) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     let mut bytes = vec![0u8; len];
     let mut done = 0usize;
+    let mut short = None;
     while done < len {
         let want = READ_CHUNK.min(len - done);
         let Some(at) = entry.start.checked_add(done as u64) else {
+            short = Some("address arithmetic overflowed".to_string());
             break;
         };
         match mem.read_at(&mut bytes[done..done + want], at) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => {
+                short = Some(format!("read at {at:#x} returned no bytes"));
+                break;
+            }
+            Err(error) => {
+                short = Some(format!("read at {at:#x} failed: {error}"));
+                break;
+            }
             Ok(read) => done += read,
         }
     }
     bytes.truncate(done);
-    bytes
+    let short = short.map(|cause| {
+        format!(
+            "partial snapshot of the mapping at {:#x}: read {done} of {len} bytes: {cause}",
+            entry.start
+        )
+    });
+    (bytes, short)
 }
 
 /// File-backed mappings grouped by object, keeping groups that carry code.
@@ -382,12 +459,13 @@ fn open_in_target(pid: u32, path: &str) -> Result<File, String> {
     open_object(Path::new(&format!("/proc/{pid}/root{path}")))
 }
 
-fn hint_inode(hint: &Path) -> Option<u64> {
-    open_object(hint)
-        .ok()?
-        .metadata()
-        .ok()
-        .map(|metadata| metadata.ino())
+/// `(inode, size)` for a `--module` hint. `/proc/<pid>/maps` renders the *mount's*
+/// device, not the file's `st_dev` (see `identity::mapping_file_key`), so the device
+/// cannot be compared here; the size is carried instead so that an inode number reused
+/// on another filesystem cannot pull an unrelated object into the scan.
+fn hint_identity(hint: &Path) -> Option<(u64, u64)> {
+    let metadata = open_object(hint).ok()?.metadata().ok()?;
+    Some((metadata.ino(), metadata.len()))
 }
 
 pub fn scan_pid(request: &ScanRequest<'_>) -> Result<ScanOutcome, String> {
@@ -401,20 +479,25 @@ pub fn scan_pid(request: &ScanRequest<'_>) -> Result<ScanOutcome, String> {
     let mut modules = Vec::new();
     let mut skipped = Vec::new();
     // `/proc/<pid>/mem` is gated by PTRACE_MODE_ATTACH and Yama; losing it costs the
-    // tables, never the object inventory (spec §4.1 step 3).
-    let mem = match File::open(format!("/proc/{pid}/mem")) {
-        Ok(mem) => Some(mem),
-        Err(error) => {
-            skipped.push(Skipped {
-                subject: format!("/proc/{pid}/mem"),
-                reason: error.to_string(),
-            });
-            None
+    // tables, never the object inventory (spec §4.1 step 3). Only an access refusal is
+    // a ptrace refusal — a pid that died mid-scan gets its own label.
+    let mem = File::open(format!("/proc/{pid}/mem"));
+    let unavailable = mem.as_ref().err().map(|error| {
+        skipped.push(Skipped {
+            subject: format!("/proc/{pid}/mem"),
+            reason: error.to_string(),
+        });
+        match error.raw_os_error() {
+            Some(libc::EACCES | libc::EPERM) => "ptrace",
+            Some(libc::ESRCH) => "gone",
+            _ => "unreadable",
         }
-    };
+    });
+    let mem = mem.ok();
 
     let wanted = request.hooks.names();
-    let hint_inodes: Vec<Option<u64>> = request.hints.iter().map(|h| hint_inode(h)).collect();
+    let hint_ids: Vec<Option<(u64, u64)>> =
+        request.hints.iter().map(|h| hint_identity(h)).collect();
     let mut hint_matched = vec![false; request.hints.len()];
     let mut total_bytes = 0u64;
 
@@ -433,15 +516,16 @@ pub fn scan_pid(request: &ScanRequest<'_>) -> Result<ScanOutcome, String> {
         };
         let matched: Vec<usize> = (0..request.hints.len())
             .filter(|index| {
-                hint_inodes[*index] == Some(key.inode)
+                hint_ids[*index].is_some_and(|(inode, _)| inode == key.inode)
                     || usable.as_deref() == Some(request.hints[*index].as_path())
             })
             .collect();
-        if !request.hints.is_empty() && matched.is_empty() {
+        let hinted = !matched.is_empty();
+        if !request.hints.is_empty() && !hinted {
             continue;
         }
-        for index in matched {
-            hint_matched[index] = true;
+        for index in &matched {
+            hint_matched[*index] = true;
         }
         let subject = match &named {
             Some((_, raw_path)) => String::from_utf8_lossy(raw_path).into_owned(),
@@ -469,6 +553,21 @@ pub fn scan_pid(request: &ScanRequest<'_>) -> Result<ScanOutcome, String> {
                 continue;
             }
         };
+        // The hint matched on inode alone; confirm the size before attributing this
+        // object to it, so a number reused on another filesystem cannot slip in.
+        if hinted
+            && !matched.iter().any(|index| {
+                hint_ids[*index].map(|(_, len)| len) == file.metadata().ok().map(|m| m.len())
+            })
+        {
+            skipped.push(Skipped {
+                subject,
+                reason: "inode matches a --module hint but the file size does not; \
+                         refusing to attribute an unrelated object"
+                    .into(),
+            });
+            continue;
+        }
         let exports = match exports_matching(&file, &wanted) {
             Ok(exports) => exports,
             Err(reason) => {
@@ -520,20 +619,44 @@ pub fn scan_pid(request: &ScanRequest<'_>) -> Result<ScanOutcome, String> {
         }
         total_bytes = running.unwrap_or(total_bytes);
 
-        let snapshots: Vec<(u64, Vec<u8>)> = data
-            .iter()
-            .map(|entry| (entry.start, read_mapping(mem, entry)))
-            .collect();
+        let mut snapshots = Vec::with_capacity(data.len());
+        for entry in &data {
+            let (bytes, short) = read_mapping(mem, entry);
+            // Bytes past a failed read were never examined; saying nothing here would
+            // present a partial decode as a complete one.
+            if let Some(reason) = short {
+                skipped.push(Skipped {
+                    subject: module.path.clone(),
+                    reason,
+                });
+            }
+            snapshots.push((entry.start, bytes));
+        }
         for (base, snapshot) in &snapshots {
-            module.tables.extend(detect_tables(snapshot, *base, &maps));
+            let (tables, truncated) = detect_tables(snapshot, *base, &maps);
+            module.tables.extend(tables);
+            skipped.extend(truncated.into_iter().map(|reason| Skipped {
+                subject: module.path.clone(),
+                reason,
+            }));
         }
         for (_, snapshot) in &snapshots {
             module
                 .interfaces
-                .extend(scan_interfaces(snapshot, mem, &module.tables));
+                .extend(scan_interfaces(snapshot, mem, &module.tables, &maps, key));
         }
         for (index, interface) in module.interfaces.iter_mut().enumerate() {
             interface.index = index;
+        }
+        // An operator who named this module explicitly is owed an answer when it
+        // yielded nothing, rather than an empty report with no explanation.
+        if hinted && module.tables.is_empty() {
+            skipped.push(Skipped {
+                subject: module.path.clone(),
+                reason: "matched a --module hint but no function table was found in its \
+                         file-backed data"
+                    .into(),
+            });
         }
         modules.push(module);
     }
@@ -547,14 +670,14 @@ pub fn scan_pid(request: &ScanRequest<'_>) -> Result<ScanOutcome, String> {
         }
     }
 
-    Ok(match mem {
-        Some(_) => ScanOutcome::Scanned {
+    Ok(match unavailable {
+        None => ScanOutcome::Scanned {
             modules,
             skipped,
             scan_ms: started.elapsed().as_millis() as u64,
         },
-        None => ScanOutcome::Unavailable {
-            reason: "ptrace",
+        Some(reason) => ScanOutcome::Unavailable {
+            reason,
             modules,
             skipped,
         },
@@ -596,13 +719,55 @@ mod tests {
         }
         let inner = 8 + 30 * 8;
         snapshot[inner..inner + 8].copy_from_slice(&0x2802u64.to_ne_bytes());
-        let tables = detect_tables(&snapshot, 0x7000, &maps);
+        let (tables, truncated) = detect_tables(&snapshot, 0x7000, &maps);
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].version, (3, 2));
         assert_eq!(tables[0].address, 0x7000);
         // The 2.40 header word is a NULL-looking non-pointer, so it is recorded as an
         // entry of the 3.2 table pointing into the provider's executable mapping.
         assert_eq!(tables[0].entries.len(), 104);
+        assert!(truncated.is_empty(), "{truncated:?}");
+    }
+
+    #[test]
+    fn a_header_whose_body_runs_past_the_snapshot_is_recorded_not_dropped() {
+        let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();
+        // A 2.40 header with only 10 of its 68 slots inside the snapshot: exactly the
+        // shape of a table whose .bss has spilled into an anonymous mapping.
+        let mut snapshot = vec![0u8; 8 + 10 * 8];
+        snapshot[..8].copy_from_slice(&0x2802u64.to_ne_bytes());
+        for slot in 0..10 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_ne_bytes());
+        }
+        let (tables, truncated) = detect_tables(&snapshot, 0x7000, &maps);
+        assert!(tables.is_empty(), "an incomplete table is never decoded");
+        assert_eq!(truncated.len(), 1, "{truncated:?}");
+        assert!(
+            truncated[0].contains("2.40")
+                && truncated[0].contains("0x7000")
+                && truncated[0].contains("552 bytes needed")
+                && truncated[0].contains("88 available"),
+            "{}",
+            truncated[0]
+        );
+        // Ordinary data must not generate this diagnostic.
+        assert!(detect_tables(&vec![0u8; 4096], 0x7000, &maps).1.is_empty());
+    }
+
+    #[test]
+    fn a_short_read_returns_what_it_got_and_says_why_it_stopped() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), vec![7u8; 64]).unwrap();
+        let mem = File::open(file.path()).unwrap();
+        let entry = &parse_maps(b"0-1000 rw-p 00000000 08:01 7 /lib/provider.so\n").unwrap()[0];
+        let (bytes, short) = read_mapping(&mem, entry);
+        assert_eq!(bytes, vec![7u8; 64], "what was read is kept");
+        let short = short.expect("a short snapshot must say so");
+        assert!(
+            short.contains("read 64 of 4096 bytes") && short.contains("no bytes"),
+            "{short}"
+        );
     }
 
     #[test]
@@ -622,15 +787,19 @@ mod tests {
             snapshot[8..16].copy_from_slice(&bad.to_ne_bytes());
             snapshot
         };
-        assert_eq!(detect_tables(&build(0x1600), 0x2000, &maps).len(), 1);
-        assert!(detect_tables(&build(0x2500), 0x2000, &maps).is_empty()); // rw- data
-        assert!(detect_tables(&build(0x9000), 0x2000, &maps).is_empty()); // unmapped
+        assert_eq!(detect_tables(&build(0x1600), 0x2000, &maps).0.len(), 1);
+        assert!(detect_tables(&build(0x2500), 0x2000, &maps).0.is_empty()); // rw- data
+        assert!(detect_tables(&build(0x9000), 0x2000, &maps).0.is_empty()); // unmapped
         // Every slot NULL: a zeroed page is not a table.
-        assert!(detect_tables(&vec![0u8; 8 + 68 * 8], 0x2000, &maps).is_empty());
+        assert!(
+            detect_tables(&vec![0u8; 8 + 68 * 8], 0x2000, &maps)
+                .0
+                .is_empty()
+        );
         // One NULL slot among live ones is legitimate evidence, not a rejection.
         let mut with_null = build(0x1600);
         with_null[16..24].copy_from_slice(&0u64.to_ne_bytes());
-        let tables = detect_tables(&with_null, 0x2000, &maps);
+        let (tables, _) = detect_tables(&with_null, 0x2000, &maps);
         assert_eq!(tables[0].null_entries.len(), 1);
         assert_eq!(tables[0].entries.len(), 67);
     }

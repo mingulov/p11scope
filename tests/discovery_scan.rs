@@ -304,6 +304,129 @@ fn load_and_populate_ignoring_missing_entry(so: &Path) {
     assert!(!handle.is_null(), "dlopen {}", so.display());
 }
 
+/// The fixture's later tables (`t32` onwards) sit in the `.bss` spill, an *anonymous*
+/// mapping the scan deliberately will not attribute to the object; `t31` straddles the
+/// end of the file-backed page. Neither is decoded — but neither may vanish silently,
+/// or an operator whose provider builds its table at run time gets an empty report with
+/// no explanation.
+#[test]
+fn a_table_running_past_the_file_backed_data_is_recorded_not_silently_lost() {
+    let dir = tmp("scan-truncated");
+    let so = build_fixture(&dir, "truncated", &["-DMATRIX_INTERFACES=0"]);
+    load_and_populate(&so);
+    let ScanOutcome::Scanned {
+        modules, skipped, ..
+    } = scan_self(&[so.clone()])
+    else {
+        panic!("scan must be available")
+    };
+    // The tables that do fit are still found, so this is not a wholesale failure.
+    let module = modules
+        .iter()
+        .find(|m| m.path.ends_with("truncated.so"))
+        .unwrap();
+    assert!(!module.tables.is_empty(), "{module:?}");
+    let extends_past: Vec<&str> = skipped
+        .iter()
+        .filter(|s| s.subject.ends_with("truncated.so") && s.reason.contains("extends past"))
+        .map(|s| s.reason.as_str())
+        .collect();
+    assert!(
+        !extends_past.is_empty(),
+        "a header whose body runs past the object's file-backed data must be recorded; \
+         got {skipped:?}"
+    );
+    assert!(
+        extends_past
+            .iter()
+            .all(|r| r.contains("bytes needed") && r.contains("outside the memory scan's reach")),
+        "{extends_past:?}"
+    );
+}
+
+#[test]
+fn a_hinted_object_with_no_table_says_so() {
+    let dir = tmp("scan-hinted-empty");
+    let plain = dir.join("empty.so");
+    let c = dir.join("empty.c");
+    std::fs::write(&c, "int unrelated(void){return 1;}\n").unwrap();
+    assert!(
+        Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&plain)
+            .arg(&c)
+            .status()
+            .unwrap()
+            .success()
+    );
+    load_and_populate_ignoring_missing_entry(&plain);
+    let ScanOutcome::Scanned { skipped, .. } = scan_self(&[plain.clone()]) else {
+        panic!("scan must be available")
+    };
+    assert!(
+        skipped
+            .iter()
+            .any(|s| s.subject.ends_with("empty.so") && s.reason.contains("--module hint")),
+        "an explicitly named module that yielded nothing must be explained: {skipped:?}"
+    );
+}
+
+/// The readable non-executable bytes the scan would snapshot for `so`, as the scan
+/// itself counts them — used to size a budget that admits exactly one object.
+fn readable_data_bytes(so: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    let inode = std::fs::metadata(so).unwrap().ino();
+    let maps =
+        p11scope_manifest::maps::parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    maps.iter()
+        .filter(|m| m.inode == inode && m.permissions[0] == b'r' && m.permissions[2] != b'x')
+        .map(|m| m.end - m.start)
+        .sum()
+}
+
+#[test]
+fn the_per_capture_byte_cap_accumulates_across_objects() {
+    let dir = tmp("scan-capture-cap");
+    let first = build_fixture(&dir, "budget-a", &["-DMATRIX_INTERFACES=0"]);
+    let second = build_fixture(&dir, "budget-b", &["-DMATRIX_INTERFACES=0"]);
+    load_and_populate(&first);
+    load_and_populate(&second);
+    // Room for exactly one of the two: the second object must trip the running total,
+    // not the per-object cap.
+    let budget = readable_data_bytes(&first);
+    assert_eq!(budget, readable_data_bytes(&second), "fixtures must match");
+    let hooks = HookRegistry::builtin();
+    let ScanOutcome::Scanned {
+        modules, skipped, ..
+    } = scan_pid(&ScanRequest {
+        pid: std::process::id(),
+        hints: &[first.clone(), second.clone()],
+        hooks: &hooks,
+        limits: ScanLimits {
+            per_object_bytes: 64 * 1024 * 1024,
+            total_bytes: budget,
+        },
+    })
+    .unwrap()
+    else {
+        panic!("scan must be available")
+    };
+    assert_eq!(modules.len(), 2, "both objects are identified: {modules:?}");
+    assert_eq!(
+        modules.iter().filter(|m| !m.tables.is_empty()).count(),
+        1,
+        "the budget admits exactly one object: {modules:?}"
+    );
+    assert_eq!(
+        skipped
+            .iter()
+            .filter(|s| s.reason.contains("too_large"))
+            .count(),
+        1,
+        "the object over the running total must be reported: {skipped:?}"
+    );
+}
+
 #[test]
 fn the_per_object_byte_cap_is_enforced_as_a_skip_not_a_truncation() {
     let dir = tmp("scan-cap");
@@ -348,24 +471,27 @@ fn the_per_object_byte_cap_is_enforced_as_a_skip_not_a_truncation() {
 /// configuration rather than assumed, exactly as `proc_access.rs` does.
 #[test]
 fn an_unreadable_proc_mem_is_reported_as_unavailable_not_as_an_error() {
-    let child = Command::new("setsid")
+    let mut child = Command::new("setsid")
         .args(["--fork", "sleep", "27.1828"])
         .spawn()
         .expect("spawn setsid sleep");
+    // `setsid --fork` exits as soon as it has forked; reap it so it is not left a zombie.
+    child.wait().expect("reap setsid");
     std::thread::sleep(std::time::Duration::from_millis(200));
     let out = Command::new("pgrep")
         .args(["-f", "sleep 27.1828"])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let pids: Vec<&str> = stdout.split_whitespace().collect();
-    for pid in &pids {
-        if pids.len() != 1 {
-            let _ = Command::new("kill").arg(pid).status();
-        }
-    }
-    assert_eq!(pids.len(), 1, "expected one reparented sleep: {pids:?}");
-    let pid: u32 = pids[0].parse().unwrap();
+    // A leftover from an earlier run would match too: use one and clean up all of them,
+    // rather than failing on a condition that says nothing about the code under test.
+    let pids: Vec<u32> = stdout
+        .split_whitespace()
+        .filter_map(|pid| pid.parse().ok())
+        .collect();
+    let Some(&pid) = pids.first() else {
+        panic!("expected a reparented sleep, pgrep found none")
+    };
 
     let exe = std::fs::read_link(format!("/proc/{pid}/exe")).expect("target exe link");
     let hooks = HookRegistry::builtin();
@@ -375,8 +501,9 @@ fn an_unreadable_proc_mem_is_reported_as_unavailable_not_as_an_error() {
         hooks: &hooks,
         limits: ScanLimits::default(),
     });
-    let _ = Command::new("kill").arg(pid.to_string()).status();
-    drop(child);
+    for pid in &pids {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
 
     let outcome = outcome.expect("an unreadable /proc/<pid>/mem is never fatal");
     let scope: i32 = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")

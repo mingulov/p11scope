@@ -72,6 +72,20 @@ fn provenance_for(path: &Path) -> ProvenanceObject {
     }
 }
 
+/// The `(device, inode)` a mapping of this file would show — the key every pin is
+/// stored under.
+fn manifest_key(path: &Path) -> p11scope_manifest::maps::ObjectKey {
+    let file = p11scope_manifest::identity::open_object(path).unwrap();
+    let key = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
+    p11scope_manifest::maps::ObjectKey {
+        device: p11scope_manifest::maps::Device {
+            major: key.device_major,
+            minor: key.device_minor,
+        },
+        inode: key.inode,
+    }
+}
+
 fn first_executable_offset(path: &Path) -> u64 {
     let file = p11scope_manifest::identity::open_object(path).unwrap();
     p11scope_manifest::identity::inspect_file(&file)
@@ -135,9 +149,10 @@ fn scan_and_manifest_pins_merge_into_one_set() {
         pinned.pinned().any(|s| s.path == exe.display().to_string()),
         "the scanned object survives the merge"
     );
+    let key = manifest_key(&so);
     let attach = pinned
-        .attach_path(&so.display().to_string())
-        .expect("the manifest path still resolves after the merge");
+        .attach_path_for(key)
+        .expect("the manifest's object still resolves after the merge");
     assert!(attach.starts_with("/proc/self/fd/"), "{attach:?}");
     assert!(pinned.check_unchanged().unwrap());
 }
@@ -224,8 +239,8 @@ fn symlink_is_pinned_and_non_executable_offsets_are_refused() {
     symlink_manifest.objects[0].path = link.display().to_string();
     let pinned = p11scope::discovery::identity::pin_manifest_objects(&symlink_manifest).unwrap();
     let attach = pinned
-        .attach_path(&symlink_manifest.objects[0].path)
-        .unwrap();
+        .attach_path_for(manifest_key(&link))
+        .expect("a symlinked object is pinned by the identity it resolves to");
     let replacement = cc_so(&d, "replacement", "int f(void){return 2;}\n");
     std::fs::remove_file(&link).unwrap();
     std::os::unix::fs::symlink(&replacement, &link).unwrap();
@@ -514,7 +529,7 @@ fn replacing_the_file_by_rename_keeps_the_pinned_inode_but_reports_a_change() {
     let m = manifest_for(&so);
     let pinned = p11scope::discovery::identity::pin_manifest_objects(&m).unwrap();
     let old_bytes = std::fs::read(&so).unwrap();
-    let attach = pinned.attach_path(so.to_str().unwrap()).unwrap();
+    let attach = pinned.attach_path_for(manifest_key(&so)).unwrap();
     assert!(attach.starts_with("/proc/self/fd/"));
     std::thread::sleep(std::time::Duration::from_millis(20)); // ctime granularity margin
     let other = cc_so(&d, "other", "int g(void){return 2;}\n");

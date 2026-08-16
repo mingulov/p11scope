@@ -133,11 +133,12 @@ pub struct PinnedSummary<'a> {
 /// cannot change between the check and Aya's attach.
 #[derive(Debug)]
 pub struct PinnedObjects {
+    /// Keyed by identity alone. There is deliberately no path index: a pathname is
+    /// not an identity — the target's `/proc/<pid>/maps` path names a different file
+    /// in the observer's namespace, and a manifest's recorded path resolves to
+    /// whatever lives there now. Callers resolve by the key of an object this
+    /// capture pinned, which `main.rs` guarantees every plan slot carries.
     by_key: BTreeMap<ObjectKey, Entry>,
-    /// Manifest paths → key, so `attach_path(&str)` keeps working. Scan-sourced
-    /// objects are not listed here: their paths are the *target's*, which two
-    /// processes in different mount namespaces can spell identically.
-    by_path: BTreeMap<String, ObjectKey>,
     /// Latched by `check_unchanged` the first time any pin differs.
     changed: std::cell::Cell<bool>,
 }
@@ -148,7 +149,6 @@ impl PinnedObjects {
     pub fn empty() -> Self {
         Self {
             by_key: BTreeMap::new(),
-            by_path: BTreeMap::new(),
             changed: std::cell::Cell::new(false),
         }
     }
@@ -162,20 +162,11 @@ impl PinnedObjects {
         for (key, entry) in other.by_key {
             self.by_key.entry(key).or_insert(entry);
         }
-        self.by_path.extend(other.by_path);
         self.changed.set(self.changed.get() || other.changed.get());
     }
 
-    /// Path Aya may reopen without re-resolving the untrusted manifest path.
-    pub fn attach_path(&self, original: &str) -> Result<PathBuf, String> {
-        let key = *self
-            .by_path
-            .get(original)
-            .ok_or_else(|| format!("object path {original:?} was not pinned"))?;
-        self.attach_path_for(key)
-    }
-
-    /// Attach path for an object discovered by the scan.
+    /// The path Aya reopens for this object: an fd this capture holds, never a name
+    /// resolved again through a namespace that may not mean the same file.
     pub fn attach_path_for(&self, key: ObjectKey) -> Result<PathBuf, String> {
         self.by_key
             .get(&key)
@@ -385,7 +376,6 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
         return Err(problems);
     }
     let mut by_key = BTreeMap::new();
-    let mut by_path = BTreeMap::new();
     for (path, file, inspected, pin) in opened.into_values() {
         let found = match identity_of(&file) {
             Ok(found) => found,
@@ -395,7 +385,6 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
             }
         };
         let key = found.key;
-        by_path.insert(path.clone(), key);
         if let Some(previous) = by_key.insert(
             key,
             Entry::new(file, pin, path.clone(), &inspected.identity, found),
@@ -411,7 +400,6 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
     }
     Ok(PinnedObjects {
         by_key,
-        by_path,
         changed: std::cell::Cell::new(false),
     })
 }
@@ -466,7 +454,6 @@ pub fn pin_scanned_objects(
     Ok((
         PinnedObjects {
             by_key,
-            by_path: BTreeMap::new(),
             changed: std::cell::Cell::new(false),
         },
         skipped,

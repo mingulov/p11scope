@@ -189,12 +189,18 @@ struct DiscoveryCounters {
 }
 
 impl DiscoveryCounters {
-    /// Everything discovery has to say, on stderr, before the capture starts.
-    /// Task 13 moves this into `evidence.discovery[]` in the published report.
-    fn report(&self, plan: &plan::AttachPlan) {
+    /// The notes, on stderr. Called as soon as they are complete rather than from
+    /// `report`, because every bail between the two would otherwise swallow them —
+    /// and a note is most useful exactly when discovery is about to fail.
+    /// Task 13 publishes the same list as `evidence.discovery[]`.
+    fn report_notes(&self) {
         for note in &self.notes {
             eprintln!("p11scope: {note}");
         }
+    }
+
+    /// What discovery ended up with, on stderr, before the capture starts.
+    fn report(&self, plan: &plan::AttachPlan) {
         if let Some(reason) = self.scan_unavailable {
             eprintln!(
                 "p11scope: the memory scan could not read the target ({reason}); any \
@@ -310,35 +316,57 @@ fn manifest_targets(m: &Manifest) -> BTreeSet<(String, u64)> {
         .collect()
 }
 
-/// Adopts the identity the scan sees for every manifest object with the same bytes.
-/// Without this the union of §4.12 would attach two probes to one address whenever
-/// the manifest was made on another host: the recorded {device, inode} and the live
-/// one differ, so the merge could not tell that both name one object.
-fn retarget_to_scanned(m: &mut Manifest, scanned: &ScannedModule, pinned: &PinnedObjects) {
-    // Only the objects this scan actually saw. Searching every pin could adopt an
-    // earlier manifest's pin of a content-identical copy the target does not map —
-    // a probe on the wrong file, which simply never fires.
-    let seen: BTreeSet<ObjectKey> = std::iter::once(scanned.key)
-        .chain(
-            scanned
-                .tables
-                .iter()
-                .flat_map(|table| &table.entries)
-                .map(|entry| entry.object),
-        )
+/// Replaces every `{device, inode}` a manifest *recorded* with the identity of the
+/// object this capture actually *pinned* for it: the scan's pin of the module it
+/// corroborated when there is one, this manifest's own pin otherwise.
+///
+/// A recorded pair is an identity from another host, another mount or another boot —
+/// it is not an identity in this capture's namespace, and it must never be used as
+/// one. Two things break if it is:
+///
+///  - `Session::start` resolves a slot by key first, so a recorded pair that happens
+///    to equal a live pin of an *unrelated* file (inode reuse after a rebuild is
+///    enough) attaches the manifest's offsets into that file;
+///  - the union of §4.12 lands in two slots on one address, double-counting every
+///    call, whenever the scan and the manifest name one object differently.
+///
+/// After this pass every key in the plan is one this capture pinned — the invariant
+/// `attach.rs` resolves against, with no by-path fallback to paper over a miss.
+fn retarget_to_pins(
+    m: &mut Manifest,
+    scanned: Option<&ScannedModule>,
+    scan_pins: &PinnedObjects,
+    own_pins: &PinnedObjects,
+) {
+    // Only the objects the matched scan saw. Any pin with the same bytes could
+    // otherwise be adopted — including an earlier manifest's copy of a file this
+    // target does not map, which is a probe that never fires.
+    let seen: BTreeSet<ObjectKey> = scanned
+        .into_iter()
+        .flat_map(|module| {
+            std::iter::once(module.key).chain(
+                module
+                    .tables
+                    .iter()
+                    .flat_map(|table| &table.entries)
+                    .map(|entry| entry.object),
+            )
+        })
         .collect();
     for provenance in &mut m.provenance_objects {
-        let Some(sha) = provenance.identity.sha256.as_deref() else {
+        let sha = provenance.identity.sha256.as_deref();
+        let Some(summary) = scan_pins
+            .pinned()
+            .find(|p| seen.contains(&p.key) && Some(p.sha256) == sha)
+            // This manifest's own pins are indexed by the path the manifest names,
+            // so the fallback is an exact match, not a guess by content.
+            .or_else(|| own_pins.pinned().find(|p| p.path == provenance.path))
+        else {
             continue;
         };
-        if let Some(summary) = pinned
-            .pinned()
-            .find(|p| seen.contains(&p.key) && p.sha256 == sha)
-        {
-            provenance.device_major = summary.key.device.major;
-            provenance.device_minor = summary.key.device.minor;
-            provenance.inode = summary.key.inode;
-        }
+        provenance.device_major = summary.key.device.major;
+        provenance.device_minor = summary.key.device.minor;
+        provenance.inode = summary.key.inode;
     }
 }
 
@@ -559,13 +587,19 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<(plan::AttachPlan, Pi
                     manifest.module_path
                 ));
                 corroborated.extend(mapped);
-                if let Some((module, _)) = view {
-                    retarget_to_scanned(&mut manifest, module, &pinned);
-                }
+                retarget_to_pins(
+                    &mut manifest,
+                    view.map(|(module, _)| module),
+                    &pinned,
+                    &manifest_pins,
+                );
                 accepted.push(manifest);
                 pinned.absorb(manifest_pins);
             }
             Corroboration::Uncorroborated => {
+                // No scan pin to prefer, but the recorded identity is still not one of
+                // this capture's: it becomes the manifest's own pin.
+                retarget_to_pins(&mut manifest, None, &pinned, &manifest_pins);
                 accepted.push(manifest);
                 pinned.absorb(manifest_pins);
             }
@@ -580,6 +614,8 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<(plan::AttachPlan, Pi
             }
         }
     }
+
+    counters.report_notes();
 
     let mut plan = plan::build_from_sources(&modules, &accepted);
     plan.skipped.extend(unpinned);
@@ -600,8 +636,8 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<(plan::AttachPlan, Pi
     // nothing else found a table (spec §4.12).
     if ignored > 0 && plan.slots.is_empty() {
         bail!(
-            "{}; no other discovery source found a function table",
-            counters.notes.join("; ")
+            "every --manifest was ignored (see the lines above) and no other discovery \
+             source found a function table"
         );
     }
     // The merge refuses an over-capacity module whole rather than attaching a
@@ -1260,6 +1296,7 @@ fn fmt_rfc3339(t: SystemTime) -> String {
 mod tests {
     use super::*;
     use p11scope::discovery::scan::ScannedEntry;
+    use std::os::unix::fs::MetadataExt as _;
 
     struct FailingWriter {
         kind: std::io::ErrorKind,
@@ -1417,16 +1454,23 @@ mod tests {
     fn pinned_self() -> (Vec<ScannedModule>, PinnedObjects) {
         let hooks = p11scope::discovery::hooks::HookRegistry::builtin();
         let exe = std::env::current_exe().unwrap();
+        // Unbounded on purpose: `pin_scanned_object` caps on the whole file size, and
+        // this test binary is already at 96% of the 64 MiB default. The byte caps are
+        // not what these tests are about, and a silent skip would fail them with
+        // "the hinted executable is pinned", which names the symptom, not the cause.
+        let limits = ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        };
         let outcome = scan_pid(&ScanRequest {
             pid: std::process::id(),
             hints: &[exe],
             hooks: &hooks,
-            limits: ScanLimits::default(),
+            limits,
         })
         .unwrap();
         let modules = outcome.modules().to_vec();
-        let (pinned, _) =
-            pin_scanned_objects(std::process::id(), &modules, ScanLimits::default()).unwrap();
+        let (pinned, _) = pin_scanned_objects(std::process::id(), &modules, limits).unwrap();
         assert_eq!(
             pinned.pinned().count(),
             1,
@@ -1488,6 +1532,64 @@ mod tests {
         }
     }
 
+    /// A manifest records the `{device, inode}` its provider had on the host it was
+    /// made on. Inode reuse after a rebuild is enough for that pair to collide with a
+    /// *live* pin of an unrelated file — and the by-key lookup in `Session::start` is
+    /// consulted first, so the collision wins and the manifest's offsets are applied
+    /// to the wrong file. The mirror of the unpinned-entry hazard above.
+    #[test]
+    fn a_stale_recorded_identity_never_resolves_to_another_objects_pin() {
+        let (_, mut pins) = pinned_self();
+        let collision = pins.pinned().next().unwrap().key;
+
+        // A second, unrelated file, pinned the way every object is: under the identity
+        // it has right now. (`pin_manifest_objects` would need a canonical full
+        // function list to reach this point; the `Entry` it produces is this one.)
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("provider.so");
+        std::fs::copy("/bin/sh", &provider).unwrap();
+        let path = provider.display().to_string();
+        let file = p11scope_manifest::identity::open_object(&provider).unwrap();
+        let found = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
+        let (own, skipped) = pin_scanned_objects(
+            std::process::id(),
+            &[ScannedModule {
+                key: ObjectKey {
+                    device: p11scope_manifest::maps::Device {
+                        major: found.device_major,
+                        minor: found.device_minor,
+                    },
+                    inode: found.inode,
+                },
+                path: path.clone(),
+                exports: vec![],
+                tables: vec![],
+                interfaces: vec![],
+            }],
+            ScanLimits::default(),
+        )
+        .unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+
+        let mut m = manifest_naming(&path, Some("11".repeat(32)));
+        // The stale pair, here colliding with the live pin of a different file.
+        m.provenance_objects[0].device_major = collision.device.major;
+        m.provenance_objects[0].device_minor = collision.device.minor;
+        m.provenance_objects[0].inode = collision.inode;
+
+        retarget_to_pins(&mut m, None, &pins, &own);
+        pins.absorb(own);
+
+        let plan = plan::build_from_sources(&[], std::slice::from_ref(&m));
+        let attach = pins.attach_path_for(plan.slots[0].object).unwrap();
+        assert_eq!(
+            std::fs::metadata(&attach).unwrap().ino(),
+            std::fs::metadata(&provider).unwrap().ino(),
+            "a manifest slot must attach into its own object, never into whatever \
+             live pin happens to share the identity it recorded"
+        );
+    }
+
     /// The glue that picks among the four §4.12 outcomes: which scanned module a
     /// manifest is talking about, and whether the bytes agree.
     #[test]
@@ -1543,7 +1645,7 @@ mod tests {
         m.provenance_objects[0].inode = 1;
         m.provenance_objects[0].device_major = 99;
 
-        retarget_to_scanned(&mut m, &modules[0], &pinned);
+        retarget_to_pins(&mut m, Some(&modules[0]), &pinned, &PinnedObjects::empty());
         assert_eq!(m.provenance_objects[0].inode, summary.key.inode);
         assert_eq!(
             m.provenance_objects[0].device_major,
@@ -1564,7 +1666,7 @@ mod tests {
         };
         let mut m = manifest_naming(&path, Some(sha));
         m.provenance_objects[0].inode = 1;
-        retarget_to_scanned(&mut m, &decoy, &pinned);
+        retarget_to_pins(&mut m, Some(&decoy), &pinned, &PinnedObjects::empty());
         assert_eq!(
             m.provenance_objects[0].inode, 1,
             "no pin of the decoy exists"

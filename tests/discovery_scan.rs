@@ -585,3 +585,36 @@ fn softhsm_if_installed_is_discovered_without_false_positives() {
         "a 2.40 table has 68 slots; only {checked} were cross-checked"
     );
 }
+
+#[test]
+fn inspect_renders_a_scanned_fixture_end_to_end() {
+    let dir = tmp("inspect-e2e");
+    let so = build_fixture(&dir, "inspected", &["-DMATRIX_INTERFACES=0"]);
+    load_and_populate(&so);
+    let hooks = HookRegistry::builtin();
+    let outcome = scan_pid(&ScanRequest {
+        pid: std::process::id(),
+        hints: &[so.clone()],
+        hooks: &hooks,
+        limits: ScanLimits::default(),
+    })
+    .unwrap();
+    let (pinned, _) = p11scope::discovery::identity::pin_scanned_objects(
+        std::process::id(),
+        outcome.modules(),
+        ScanLimits::default(),
+    )
+    .unwrap();
+    let text = p11scope::inspect::render_text(std::process::id(), &outcome, &pinned);
+    assert!(text.contains("inspected.so"), "{text}");
+    assert!(text.contains("2.40"), "{text}");
+    let json = p11scope::inspect::render_json(std::process::id(), &outcome, &pinned);
+    assert_eq!(json["schema"], "pkcs11-scope/inspect/v1");
+    assert!(
+        json["modules"][0]["identity"]["sha256"]
+            .as_str()
+            .unwrap()
+            .len()
+            == 64
+    );
+}

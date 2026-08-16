@@ -4,6 +4,7 @@ pub mod attach;
 pub mod cli;
 pub mod discovery;
 pub mod events;
+pub mod inspect;
 pub mod kinds;
 pub mod manifest_input;
 pub mod metrics;

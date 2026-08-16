@@ -143,6 +143,16 @@ pub struct PinnedObjects {
 }
 
 impl PinnedObjects {
+    /// An empty set: no objects pinned. For rendering tests that have no live
+    /// process to pin objects from.
+    pub fn empty() -> Self {
+        Self {
+            by_key: BTreeMap::new(),
+            by_path: BTreeMap::new(),
+            changed: std::cell::Cell::new(false),
+        }
+    }
+
     /// Path Aya may reopen without re-resolving the untrusted manifest path.
     pub fn attach_path(&self, original: &str) -> Result<PathBuf, String> {
         let key = *self

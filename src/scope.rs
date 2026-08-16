@@ -51,17 +51,10 @@ pub fn label(root: &Path, target: u64) -> Option<String> {
     None
 }
 
-#[derive(Debug)]
-pub struct PublishedScope {
-    pub config: u64,
-    pub cgroup_file: Option<File>,
-}
-
 /// Publishes one exact scope and policy and verifies every supported
-/// readback. The returned cgroup descriptor may be dropped once publication
-/// succeeds — the kernel holds its own cgroup reference through the map, so
-/// the caller does not need to keep the fd open.
-pub fn publish(ebpf: &mut Ebpf, scope: &Scope, policy: CapturePolicy) -> Result<PublishedScope> {
+/// readback. The cgroup descriptor opened for `--cgroup` is dropped on return —
+/// the kernel holds its own cgroup reference through the map.
+pub fn publish(ebpf: &mut Ebpf, scope: &Scope, policy: CapturePolicy) -> Result<()> {
     let scope_flag = match scope {
         Scope::Pid(_) => FLAG_PID_FILTER,
         Scope::Cgroup { .. } => FLAG_CGROUP_FILTER,
@@ -160,10 +153,8 @@ pub fn publish(ebpf: &mut Ebpf, scope: &Scope, policy: CapturePolicy) -> Result<
         bail!("CONFIG exact readback {readback:#x} differs from {config:#x}");
     }
 
-    Ok(PublishedScope {
-        config,
-        cgroup_file,
-    })
+    drop(cgroup_file);
+    Ok(())
 }
 
 #[cfg(test)]

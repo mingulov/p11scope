@@ -9,7 +9,7 @@ use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
-use p11scope_manifest::identity::{ObjectIdentity, inspect_file, open_object};
+use p11scope_manifest::identity::{inspect_file, open_object};
 use p11scope_manifest::manifest::{Manifest, Resolution};
 
 use crate::manifest_input::{MAX_TOTAL_OBJECT_BYTES, validate_structure};
@@ -38,7 +38,6 @@ fn pin_of(file: &std::fs::File) -> Result<Pin, String> {
 #[derive(Debug)]
 pub struct PinnedObjects {
     files: BTreeMap<String, std::fs::File>,
-    identities: BTreeMap<String, ObjectIdentity>,
     pins: BTreeMap<String, Pin>,
     /// Latched by `check_unchanged` the first time any pin differs.
     changed: std::cell::Cell<bool>,
@@ -72,11 +71,6 @@ impl PinnedObjects {
     /// Whether any `check_unchanged` so far saw a pinned object change.
     pub fn provider_changed(&self) -> bool {
         self.changed.get()
-    }
-
-    /// (path, identity) of every pinned object, for `capture.module` rendering.
-    pub fn identities(&self) -> impl Iterator<Item = (&str, &ObjectIdentity)> {
-        self.identities.iter().map(|(p, i)| (p.as_str(), i))
     }
 }
 
@@ -210,16 +204,13 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
         return Err(problems);
     }
     let mut files = BTreeMap::new();
-    let mut identities = BTreeMap::new();
     let mut pins = BTreeMap::new();
-    for (path, file, inspected, pin) in opened.into_values() {
+    for (path, file, _, pin) in opened.into_values() {
         pins.insert(path.clone(), pin);
-        identities.insert(path.clone(), inspected.identity);
         files.insert(path, file);
     }
     Ok(PinnedObjects {
         files,
-        identities,
         pins,
         changed: std::cell::Cell::new(false),
     })

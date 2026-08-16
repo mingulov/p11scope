@@ -151,7 +151,6 @@ impl CapturePolicy {
             ),
             "profile" | "trace" if unsafe_requested => Ok(Self::UnsafeUnvalidatedMetadata),
             "profile" | "trace" => Ok(Self::Allowlisted),
-            "discover" => bail!("discover does not accept --unsafe-unvalidated-metadata"),
             _ => bail!("unknown capture mode {mode:?}"),
         }
     }
@@ -521,10 +520,7 @@ impl Session {
             bail!("unsafe-unvalidated-metadata policy is absent from this eBPF object");
         }
         let mut ebpf = Ebpf::load(crate::EBPF_OBJECT).context("loading BPF object")?;
-        // Held until this function returns: the CGROUP_FILTER array holds the
-        // kernel-side cgroup reference, so the descriptor itself is only needed
-        // while publishing and attaching.
-        let _published_scope = crate::scope::publish(&mut ebpf, scope, policy)
+        crate::scope::publish(&mut ebpf, scope, policy)
             .context("publishing scope and capture policy")?;
         publish_slot_semantics(&mut ebpf, plan).context("publishing SLOT_SEMANTICS")?;
         publish_async_catalog(&mut ebpf).context("publishing ASYNC_FUNCTIONS")?;

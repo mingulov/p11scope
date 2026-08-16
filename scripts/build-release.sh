@@ -49,7 +49,7 @@ cleanup() {
     if [ -n "$WPID" ] && [ -n "$TARGET_STARTTIME" ]; then
         signal_verified_process KILL "$WPID" "$TARGET_STARTTIME" 2>/dev/null || true
     fi
-    [ -z "$LPID" ] || kill "$LPID" 2>/dev/null || true
+    [ -z "$LPID" ] || { kill -CONT "$LPID" 2>/dev/null || true; kill "$LPID" 2>/dev/null || true; }
     [ -z "$SPID" ] || kill "$SPID" 2>/dev/null || true
     [ -z "$LPID" ] || wait "$LPID" 2>/dev/null || true
     [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || true
@@ -214,6 +214,9 @@ sudo --preserve-env=SOFTHSM2_CONF "$DIST/p11scope" profile \
 SPID=$!
 wait_for_capture_ready "$WORK/profile-static-smoke.log" aggregate-only metrics
 signal_verified_process CONT "$WPID" "$TARGET_STARTTIME"
+# sudo suspends itself when its command stops; resume it too or `wait`
+# below never returns (and the exited target stays a zombie under it).
+kill -CONT "$LPID" 2>/dev/null || true
 if wait "$LPID"; then LPID=; WPID=; TARGET_STARTTIME=; else status=$?; LPID=; WPID=; TARGET_STARTTIME=; echo "static smoke workload failed: $status"; exit "$status"; fi
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "static smoke profiler failed: $status"; cat "$WORK/profile-static-smoke.log" || true; exit "$status"; fi
 reclaim_root_output "$WORK/observed-static-smoke.json"

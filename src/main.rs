@@ -114,7 +114,12 @@ fn cmd_capture(kind: Kind, args: impl Iterator<Item = String>) -> Result<()> {
         cfg!(feature = "unsafe-unvalidated-metadata"),
     )?;
     let scope = match &a.scope {
-        ScopeArg::Pid(p) => Scope::Pid(*p),
+        ScopeArg::Pid(p) => {
+            if !std::path::Path::new(&format!("/proc/{p}")).exists() {
+                bail!("--pid {p}: no such process");
+            }
+            Scope::Pid(*p)
+        }
         ScopeArg::Cgroup(c) => Scope::Cgroup {
             id: scope::cgroup_id(c)?,
             path: c.clone(),
@@ -303,7 +308,6 @@ fn capture_profile(
     let has_output = output.is_some();
     let mut stdout_sink = std::io::stdout().lock();
     let stdout: &mut dyn Write = &mut stdout_sink;
-    let mut provider_changed = false;
     let mut session =
         Session::start(&plan, &scope, pinned, policy).context("starting attach session")?;
     report_attach_failures(&session);
@@ -341,9 +345,7 @@ fn capture_profile(
     let wall_start = SystemTime::now();
     let clock = Instant::now();
     loop {
-        if !pinned.check_unchanged().map_err(anyhow::Error::msg)? {
-            provider_changed = true;
-        }
+        pinned.check_unchanged().map_err(anyhow::Error::msg)?;
         let elapsed = clock.elapsed();
         retire_exited(&mut process_tracker, &mut state);
         if should_stop(interrupted, elapsed, duration) {
@@ -365,12 +367,10 @@ fn capture_profile(
             process_tracker.evidence(),
             malformed_records,
             &state,
-            provider_changed,
+            pinned.provider_changed(),
         );
         let frame = render::live(&reports, &ev, elapsed, &manifest.module_path, mode, policy);
-        if !pinned.check_unchanged().map_err(anyhow::Error::msg)? {
-            provider_changed = true;
-        }
+        pinned.check_unchanged().map_err(anyhow::Error::msg)?;
         write_stdout(
             stdout,
             &mut stdout_open,
@@ -384,9 +384,7 @@ fn capture_profile(
     }
 
     session.detach_producers()?;
-    if !pinned.check_unchanged().map_err(anyhow::Error::msg)? {
-        provider_changed = true;
-    }
+    pinned.check_unchanged().map_err(anyhow::Error::msg)?;
     if profile {
         malformed_records += drain_events(&mut session, &mut state, &mut process_tracker)?;
     }
@@ -398,9 +396,7 @@ fn capture_profile(
     }
     // Last look before the evidence that the final frame and the `-o` report
     // are built from, so an in-place provider change is reflected in both.
-    if !pinned.check_unchanged().map_err(anyhow::Error::msg)? {
-        provider_changed = true;
-    }
+    pinned.check_unchanged().map_err(anyhow::Error::msg)?;
     let mut ev = evidence_for(
         &plan,
         &session,
@@ -409,7 +405,7 @@ fn capture_profile(
         process_tracker.evidence(),
         malformed_records,
         &state,
-        provider_changed,
+        pinned.provider_changed(),
     );
     ev.mark_terminal_drain_unproven();
     let frame = render::live(
@@ -500,7 +496,6 @@ fn capture_trace(
     let out_file = &mut out_sink;
     let mut stdout_sink = std::io::stdout().lock();
     let stdout: &mut dyn Write = &mut stdout_sink;
-    let mut provider_changed = false;
     let mut session =
         Session::start(&plan, &scope, pinned, policy).context("starting attach session")?;
     report_attach_failures(&session);
@@ -523,9 +518,7 @@ fn capture_trace(
         out_file,
     )?;
     loop {
-        if !pinned.check_unchanged().map_err(anyhow::Error::msg)? {
-            provider_changed = true;
-        }
+        pinned.check_unchanged().map_err(anyhow::Error::msg)?;
         let elapsed = clock.elapsed();
         if should_stop(interrupted, elapsed, duration) {
             break;
@@ -540,9 +533,7 @@ fn capture_trace(
             out_file,
         )?;
         retire_exited(&mut process_tracker, &mut state);
-        if !pinned.check_unchanged().map_err(anyhow::Error::msg)? {
-            provider_changed = true;
-        }
+        pinned.check_unchanged().map_err(anyhow::Error::msg)?;
         report_trace_loss(
             &session,
             &mut last_reported_loss,
@@ -574,9 +565,7 @@ fn capture_trace(
         out_file,
     )?;
     retire_exited(&mut process_tracker, &mut state);
-    if !pinned.check_unchanged().map_err(anyhow::Error::msg)? {
-        provider_changed = true;
-    }
+    pinned.check_unchanged().map_err(anyhow::Error::msg)?;
     report_trace_loss(
         &session,
         &mut last_reported_loss,
@@ -587,9 +576,7 @@ fn capture_trace(
     let reports = metrics::read(&session, &plan)?;
     // Last look before the evidence line the trace ends with, so an in-place
     // provider change is reflected in it.
-    if !pinned.check_unchanged().map_err(anyhow::Error::msg)? {
-        provider_changed = true;
-    }
+    pinned.check_unchanged().map_err(anyhow::Error::msg)?;
     let mut evidence = evidence_for(
         &plan,
         &session,
@@ -598,7 +585,7 @@ fn capture_trace(
         process_tracker.evidence(),
         malformed_records,
         &state,
-        provider_changed,
+        pinned.provider_changed(),
     );
     evidence.mark_terminal_drain_unproven();
     emit_trace_line(

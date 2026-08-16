@@ -40,6 +40,8 @@ pub struct PinnedObjects {
     files: BTreeMap<String, std::fs::File>,
     identities: BTreeMap<String, ObjectIdentity>,
     pins: BTreeMap<String, Pin>,
+    /// Latched by `check_unchanged` the first time any pin differs.
+    changed: std::cell::Cell<bool>,
 }
 
 impl PinnedObjects {
@@ -52,14 +54,24 @@ impl PinnedObjects {
     }
 
     /// `Ok(true)` when every pinned object still has the `(ino, size, ctime)` seen
-    /// at pinning; `Ok(false)` when any changed; `Err` only when `fstat` itself fails.
+    /// at pinning; `Ok(false)` when any changed (sticky: once seen, every later
+    /// call is `Ok(false)` without re-checking); `Err` only when `fstat` itself fails.
     pub fn check_unchanged(&self) -> Result<bool, String> {
+        if self.changed.get() {
+            return Ok(false);
+        }
         for (path, file) in &self.files {
             if pin_of(file).map_err(|e| format!("{path}: {e}"))? != self.pins[path] {
+                self.changed.set(true);
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// Whether any `check_unchanged` so far saw a pinned object change.
+    pub fn provider_changed(&self) -> bool {
+        self.changed.get()
     }
 
     /// (path, identity) of every pinned object, for `capture.module` rendering.
@@ -102,13 +114,14 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
                 continue;
             }
         };
-        let len = match file.metadata() {
-            Ok(metadata) => metadata.len(),
+        let pin = match pin_of(&file) {
+            Ok(pin) => pin,
             Err(error) => {
-                problems.push(format!("{}: metadata failed ({error})", object.path));
+                problems.push(format!("{}: {error}", object.path));
                 continue;
             }
         };
+        let len = pin.size;
         let Some(total) = total_object_bytes.checked_add(len) else {
             problems.push("total object size overflowed u64".into());
             continue;
@@ -120,14 +133,14 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
             continue;
         }
         total_object_bytes = total;
-        pinned.push((object, file));
+        pinned.push((object, file, pin));
     }
     if !problems.is_empty() {
         return Err(problems);
     }
 
     let mut opened = BTreeMap::new();
-    for (object, file) in pinned {
+    for (object, file, pin) in pinned {
         let inspected = match inspect_file(&file) {
             Ok(inspected) => inspected,
             Err(error) => {
@@ -138,6 +151,22 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
                 continue;
             }
         };
+        // The pin was taken before the bytes were hashed; a write that lands
+        // during the hash must not become the baseline the capture trusts.
+        match pin_of(&file) {
+            Ok(after) if after == pin => {}
+            Ok(_) => {
+                problems.push(format!(
+                    "{}: file changed while it was being identified — retry",
+                    object.path
+                ));
+                continue;
+            }
+            Err(error) => {
+                problems.push(format!("{}: {error}", object.path));
+                continue;
+            }
+        }
         if inspected.identity.kind != object.identity.kind
             || inspected.identity.value != object.identity.value
             || inspected.identity.sha256 != object.identity.sha256
@@ -154,7 +183,7 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
             ));
             continue;
         }
-        opened.insert(object.id, (object.path.clone(), file, inspected));
+        opened.insert(object.id, (object.path.clone(), file, inspected, pin));
     }
 
     for surface in &m.surfaces {
@@ -166,7 +195,7 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
             else {
                 continue;
             };
-            if let Some((path, _, inspected)) = opened.get(&object)
+            if let Some((path, _, inspected, _)) = opened.get(&object)
                 && !inspected.contains_executable_offset(file_offset)
             {
                 problems.push(format!(
@@ -183,8 +212,7 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
     let mut files = BTreeMap::new();
     let mut identities = BTreeMap::new();
     let mut pins = BTreeMap::new();
-    for (path, file, inspected) in opened.into_values() {
-        let pin = pin_of(&file).map_err(|e| vec![format!("{path}: {e}")])?;
+    for (path, file, inspected, pin) in opened.into_values() {
         pins.insert(path.clone(), pin);
         identities.insert(path.clone(), inspected.identity);
         files.insert(path, file);
@@ -193,5 +221,6 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
         files,
         identities,
         pins,
+        changed: std::cell::Cell::new(false),
     })
 }

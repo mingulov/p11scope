@@ -133,12 +133,9 @@ impl AtomicFile {
                 self.final_path.display()
             )
         })?;
-        self.directory.sync_all().map_err(|error| {
-            format!(
-                "syncing output directory for {} failed: {error}",
-                self.final_path.display()
-            )
-        })?;
+        // The report is published at this point; a directory fsync that the
+        // filesystem cannot honour must not turn a complete run into a failure.
+        let _ = self.directory.sync_all();
         self.cleanup = false;
         Ok(())
     }
@@ -199,16 +196,17 @@ impl Drop for AtomicFile {
 /// Opens (creating/truncating) a private regular file for an appended line
 /// stream — trace `-o`, which streams lines as they arrive and so cannot be
 /// published atomically like `AtomicFile`. O_NOFOLLOW on the final component
-/// (a planted symlink at the target is refused, not followed), mode 0600, and
-/// the opened descriptor must be a regular file (no FIFOs or devices).
+/// (a planted symlink at the target is refused, not followed), O_NONBLOCK so a
+/// planted FIFO fails instead of blocking, mode 0600. An existing target is
+/// only truncated after it proved to be a regular file owned by the caller;
+/// its mode is then made private too.
 pub fn create_private_stream(path: &Path) -> Result<std::fs::File, String> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|error| format!("opening output {} failed: {error}", path.display()))?;
     let metadata = file
@@ -217,7 +215,15 @@ pub fn create_private_stream(path: &Path) -> Result<std::fs::File, String> {
     if !metadata.is_file() {
         return Err(format!("output {} is not a regular file", path.display()));
     }
-    // A pre-existing target keeps its old mode through O_TRUNC; make it private too.
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(format!(
+            "output {} exists and is owned by uid {}; refusing to overwrite it",
+            path.display(),
+            metadata.uid()
+        ));
+    }
+    file.set_len(0)
+        .map_err(|error| format!("truncating output {} failed: {error}", path.display()))?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
         .map_err(|error| format!("setting output {} private failed: {error}", path.display()))?;
     Ok(file)
@@ -351,6 +357,16 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(create_private_stream(&link).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"do not touch");
+    }
+
+    #[test]
+    fn private_stream_refuses_a_fifo_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("trace.log");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        // No reader exists: a blocking open would hang here.
+        assert!(create_private_stream(&fifo).is_err());
     }
 
     #[test]

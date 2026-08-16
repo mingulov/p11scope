@@ -143,9 +143,10 @@ printed, `-o` file written) instead of aborting it.
 Before either command builds an attach plan, manifest objects are
 structurally validated, opened once, and identity-matched (SHA-256 and, when
 present, build-id) against the file the manifest names; the accepted object
-is then pinned by file descriptor. `fstat` (inode, size, ctime) is re-checked
-before and after attach — attach is refused if the pinned bytes changed — and
-again during capture; a change during capture sets
+is then pinned by file descriptor: `fstat` (inode, size, ctime) is recorded
+before the bytes are hashed and re-checked after, before and after attach —
+attach is refused if that identity changed (a best-effort change detector, not
+a byte-level guarantee) — and again during capture; a change during capture sets
 `evidence.provider_changed`, which forces the report `PARTIAL` and shows
 " · provider changed" on the live line. Renaming over or unlinking the pinned
 inode (for example, a package upgrade mid-capture) also bumps ctime, so it is

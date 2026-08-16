@@ -555,7 +555,15 @@ impl Session {
             .iter()
             .map(|slot| {
                 objects
-                    .attach_path(&slot.object)
+                    .attach_path_for(slot.object)
+                    // A manifest-sourced slot carries the device/inode the manifest
+                    // recorded at discovery time, while the pin is keyed by the identity
+                    // the object has right now — the two differ whenever a manifest is
+                    // reused after a remount or on another host, which pinning allows
+                    // because it compares build-id and sha256, never the device. Only
+                    // manifest objects are indexed by path, so this cannot mis-attribute
+                    // a scanned one.
+                    .or_else(|_| objects.attach_path(&slot.object_path))
                     .map_err(anyhow::Error::msg)
             })
             .collect::<Result<_>>()?;
@@ -620,7 +628,7 @@ impl Session {
                         slot.index,
                         format!(
                             "p11_return at {}+{:#x}: {}",
-                            slot.object,
+                            slot.object_path,
                             slot.file_offset,
                             error_chain(&e)
                         ),
@@ -656,7 +664,7 @@ impl Session {
                         slot.index,
                         format!(
                             "{prog_name} at {}+{:#x}: {}",
-                            slot.object,
+                            slot.object_path,
                             slot.file_offset,
                             error_chain(&e)
                         ),

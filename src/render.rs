@@ -1141,11 +1141,14 @@ mod tests {
     fn empty_plan() -> crate::plan::AttachPlan {
         crate::plan::AttachPlan {
             slots: vec![],
+            modules: vec![],
             skipped: vec![],
+            modules_skipped: vec![],
             entries_seen: 0,
             surfaces: vec![],
             vendor_interfaces: 0,
             interface_list: "absent".into(),
+            module_ambiguous: 0,
         }
     }
 
@@ -1246,13 +1249,15 @@ mod tests {
         let plan = crate::plan::AttachPlan {
             slots: vec![crate::plan::Slot {
                 index: 0,
-                object: "/opt/p11.so".into(),
+                object: crate::plan::TEST_OBJECT,
+                object_path: "/opt/p11.so".into(),
                 file_offset: 0x10,
                 names: vec!["C_SignInit".into()],
                 aliased: false,
                 semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
                 semantic_ambiguous: false,
                 fork_safe: false,
+                module_ids: vec![crate::plan::ModuleId(0)],
             }],
             ..empty_plan()
         };
@@ -1339,13 +1344,15 @@ mod tests {
         crate::plan::AttachPlan {
             slots: vec![crate::plan::Slot {
                 index: 0,
-                object: "/opt/p11.so".into(),
+                object: crate::plan::TEST_OBJECT,
+                object_path: "/opt/p11.so".into(),
                 file_offset: 0x10,
                 names: vec!["C_SignInit".into()],
                 aliased: false,
                 semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
                 semantic_ambiguous: false,
                 fork_safe: false,
+                module_ids: vec![crate::plan::ModuleId(0)],
             }],
             ..empty_plan()
         }
@@ -1583,13 +1590,15 @@ mod tests {
         crate::plan::AttachPlan {
             slots: vec![crate::plan::Slot {
                 index: 0,
-                object: "/opt/p11.so".into(),
+                object: crate::plan::TEST_OBJECT,
+                object_path: "/opt/p11.so".into(),
                 file_offset: 0x20,
                 names: vec!["C_FindObjectsInit".into()],
                 aliased: false,
                 semantics: crate::kinds::descriptor("C_FindObjectsInit").unwrap(),
                 semantic_ambiguous: false,
                 fork_safe: false,
+                module_ids: vec![crate::plan::ModuleId(0)],
             }],
             ..empty_plan()
         }

@@ -64,20 +64,25 @@ mod corrective_tests {
                 .enumerate()
                 .map(|(index, name)| Slot {
                     index: index as u32,
-                    object: "/opt/p11.so".into(),
+                    object: crate::plan::TEST_OBJECT,
+                    object_path: "/opt/p11.so".into(),
                     file_offset: index as u64 * 16,
                     names: vec![(*name).into()],
                     aliased: false,
                     semantics: crate::kinds::descriptor(name).unwrap(),
                     semantic_ambiguous: false,
                     fork_safe,
+                    module_ids: vec![crate::plan::ModuleId(0)],
                 })
                 .collect(),
+            modules: vec![],
             skipped: vec![],
+            modules_skipped: vec![],
             entries_seen: names.len(),
             surfaces: vec![],
             vendor_interfaces: 0,
             interface_list: "absent".into(),
+            module_ambiguous: 0,
         }
     }
 
@@ -1993,13 +1998,15 @@ mod tests {
         let (semantics, semantic_ambiguous) = crate::kinds::descriptor_slot(&names);
         Slot {
             index,
-            object: "/opt/p11.so".into(),
+            object: crate::plan::TEST_OBJECT,
+            object_path: "/opt/p11.so".into(),
             file_offset: index as u64 * 0x10,
             names,
             aliased,
             semantics,
             semantic_ambiguous,
             fork_safe: false,
+            module_ids: vec![crate::plan::ModuleId(0)],
         }
     }
 
@@ -2018,11 +2025,14 @@ mod tests {
                 slot(5, &["C_Login"], fnkind::LOGIN),
                 slot(6, &["C_FindObjectsInit"], fnkind::TEMPLATE_ARG1),
             ],
+            modules: vec![],
             skipped: vec![],
+            modules_skipped: vec![],
             entries_seen: 7,
             surfaces: vec![],
             vendor_interfaces: 0,
             interface_list: "absent".into(),
+            module_ambiguous: 0,
         }
     }
 

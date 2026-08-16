@@ -178,6 +178,11 @@ fn load_plan(manifest_path: &Path) -> Result<(Manifest, plan::AttachPlan, Pinned
         anyhow!("manifest does not match the current files; refusing to attach")
     })?;
     let plan = plan::build(&manifest);
+    // The merge refuses an over-capacity module whole rather than attaching a
+    // prefix, so the ceiling is reported here instead of as an empty plan.
+    if let Some(refused) = plan.modules_skipped.first() {
+        bail!("{}: {}", refused.subject, refused.reason);
+    }
     if plan.slots.is_empty() {
         bail!(
             "attach plan is empty: manifest {} has no attachable slots",
@@ -746,7 +751,7 @@ fn evidence_for(
             .skipped
             .iter()
             .map(|s| render::SkippedOut {
-                name: s.name.clone(),
+                name: s.subject.clone(),
                 reason: s.reason.clone(),
             })
             .collect(),
@@ -921,11 +926,14 @@ mod tests {
     fn fork_only_traffic_does_not_consume_process_tracking_budget() {
         let plan = plan::AttachPlan {
             slots: vec![],
+            modules: vec![],
             skipped: vec![],
+            modules_skipped: vec![],
             entries_seen: 0,
             surfaces: vec![],
             vendor_interfaces: 0,
             interface_list: "absent".into(),
+            module_ambiguous: 0,
         };
         let mut state = semantics::State::new(&plan);
         let mut tracker = process::Tracker::with_limits(0, 1);

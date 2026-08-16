@@ -1,15 +1,36 @@
-//! Manifest → attach plan. One slot per unique {object, file_offset};
-//! everything the manifest could not resolve becomes a Skipped entry so
-//! the capture's evidence section can report it.
+//! Discovered modules → one attach plan. The eBPF side has a single fixed-size
+//! slot array, so every module a capture found shares one slot space: one slot per
+//! unique {object, file_offset} across all of them. A target two modules both hand
+//! out is attached once (attaching twice would double-count every call through it),
+//! and because its counts then belong to neither module its semantics degrade to
+//! COUNT_ONLY (spec §4.7). Capacity is refused whole modules at a time, never
+//! truncated: a partially attached module silently under-reports a provider.
+//!
+//! Both discovery sources — the memory scan and a manifest — lower into `Discovered`
+//! and go through the same `merge`, so there is exactly one implementation of the
+//! merge rules rather than two that can drift.
 
-use p11scope_ebpf_common::SlotSemantics;
-use p11scope_manifest::manifest::{Acquisition, Manifest, Resolution, SurfaceSource, WalkOutcome};
-use std::collections::BTreeMap;
+use crate::discovery::scan::ScannedModule;
+pub use crate::discovery::scan::Skipped;
+use p11scope_ebpf_common::{MAX_SLOTS, SlotSemantics};
+use p11scope_manifest::manifest::{
+    Acquisition, Manifest, ObjectRecord, Resolution, SurfaceSource, WalkOutcome,
+};
+use p11scope_manifest::maps::{Device, ObjectKey};
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Capture-local module index; the stable identity in output is {dev, ino, sha256, path}.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ModuleId(pub u32);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Slot {
     pub index: u32,
-    pub object: String,
+    /// The object the probe attaches into — a table entry may legally point
+    /// into a dependency rather than the module that published it.
+    pub object: ObjectKey,
+    /// That object's pathname as discovery saw it, for messages only.
+    pub object_path: String,
     pub file_offset: u64,
     /// Every distinct function name resolving here, sorted.
     pub names: Vec<String>,
@@ -17,17 +38,37 @@ pub struct Slot {
     /// the group, never to one name.
     pub aliased: bool,
     pub semantics: SlotSemantics,
-    /// At least one name was unknown or the aliased names disagreed.
+    /// At least one name was unknown, the aliased names disagreed, or two
+    /// modules claim this target.
     pub semantic_ambiguous: bool,
     /// True only when every surface exposing this exact target is a
     /// standard interface carrying CKF_INTERFACE_FORK_SAFE.
     pub fork_safe: bool,
+    /// Every module claiming this exact {object, offset}. Length >= 2 ⇒ ambiguous.
+    pub module_ids: Vec<ModuleId>,
 }
 
+/// One function table a module published.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Skipped {
-    pub name: String,
-    pub reason: String,
+pub struct TableSummary {
+    pub version: (u8, u8),
+    pub entries: usize,
+    /// "scan" | "manifest".
+    pub source: &'static str,
+}
+
+/// One module that contributed targets to this plan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleSummary {
+    pub id: ModuleId,
+    pub key: ObjectKey,
+    pub path: String,
+    pub tables: Vec<TableSummary>,
+    pub interfaces: usize,
+    /// "scan" | "manifest".
+    pub source: &'static str,
+    /// Whether a second discovery source agreed with this one (spec §4.12).
+    pub corroborated: bool,
 }
 
 /// Per-surface discovery provenance, carried through to evidence so a
@@ -83,22 +124,39 @@ fn acquisition_label(a: &Acquisition) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttachPlan {
     pub slots: Vec<Slot>,
+    pub modules: Vec<ModuleSummary>,
     pub skipped: Vec<Skipped>,
+    /// Modules refused whole because the slot ceiling was reached.
+    pub modules_skipped: Vec<Skipped>,
     /// Total function records seen across every walked surface.
     pub entries_seen: usize,
-    /// One entry per manifest surface, so evidence can see discovery gaps
-    /// (partial walks, failed acquisitions) even when they produced no
-    /// skipped/aliased function records of their own.
+    /// One entry per surface, so evidence can see discovery gaps (partial
+    /// walks, failed acquisitions) even when they produced no skipped/aliased
+    /// function records of their own.
     pub surfaces: Vec<SurfaceSummary>,
     /// Present-but-undecoded vendor interfaces (never walked).
     pub vendor_interfaces: usize,
     /// Outcome of the manifest-level C_GetInterfaceList enumeration.
     pub interface_list: String,
+    /// Slots claimed by >=2 modules — count-only, forces PARTIAL (spec §4.7).
+    pub module_ambiguous: usize,
+}
+
+impl AttachPlan {
+    /// The module a slot's counts belong to, or `None` when no single module
+    /// can own them (unknown slot, or a target two modules both hand out).
+    pub fn module_of_slot(&self, slot: u32) -> Option<ModuleId> {
+        self.slots
+            .iter()
+            .find(|s| s.index == slot)
+            .filter(|s| s.module_ids.len() == 1)
+            .map(|s| s.module_ids[0])
+    }
 }
 
 pub fn ensure_capacity(plan: &AttachPlan) -> Result<(), String> {
     let required = plan.slots.len();
-    let available = p11scope_ebpf_common::MAX_SLOTS as usize;
+    let available = MAX_SLOTS as usize;
     if required > available {
         Err(format!(
             "attach plan requires {required} slots but only {available} are available; refusing to attach a prefix"
@@ -108,12 +166,272 @@ pub fn ensure_capacity(plan: &AttachPlan) -> Result<(), String> {
     }
 }
 
-pub fn build(m: &Manifest) -> AttachPlan {
-    let mut by_target: BTreeMap<(String, u64), Vec<String>> = BTreeMap::new();
-    let mut fork_safe_by_target: BTreeMap<(String, u64), bool> = BTreeMap::new();
+/// A stand-in object identity for slot fixtures in other modules' unit tests.
+#[cfg(test)]
+pub(crate) const TEST_OBJECT: ObjectKey = ObjectKey {
+    device: Device { major: 8, minor: 1 },
+    inode: 42,
+};
+
+/// One attachable target as discovery reported it.
+struct Target<'a> {
+    name: &'a str,
+    object: ObjectKey,
+    object_path: &'a str,
+    file_offset: u64,
+    fork_safe: bool,
+}
+
+/// One module lowered for `merge`.
+struct Discovered<'a> {
+    key: ObjectKey,
+    path: &'a str,
+    source: &'static str,
+    tables: Vec<TableSummary>,
+    interfaces: usize,
+    surfaces: Vec<SurfaceSummary>,
+    /// Published table slots seen, including the NULL ones that became `skipped`.
+    entries_seen: usize,
+    targets: Vec<Target<'a>>,
+    skipped: Vec<Skipped>,
+}
+
+/// A slot under construction: the names and modules claiming one target.
+struct Building {
+    object: ObjectKey,
+    object_path: String,
+    file_offset: u64,
+    names: Vec<String>,
+    fork_safe: bool,
+    module_ids: Vec<ModuleId>,
+}
+
+fn merge(
+    discovered: Vec<Discovered<'_>>,
+    vendor_interfaces: usize,
+    interface_list: String,
+) -> AttachPlan {
+    let capacity = MAX_SLOTS as usize;
+    let mut positions: BTreeMap<(ObjectKey, u64), usize> = BTreeMap::new();
+    let mut building: Vec<Building> = Vec::new();
+    let mut modules = Vec::new();
+    let mut modules_skipped = Vec::new();
+    let mut skipped = Vec::new();
+    let mut surfaces = Vec::new();
+    let mut entries_seen = 0usize;
+    // Once one module does not fit, every later one is refused too: which of the
+    // remaining modules happens to overlap an attached one must not decide the report.
+    let mut refusing = false;
+
+    for module in discovered {
+        let wanted: BTreeSet<(ObjectKey, u64)> = module
+            .targets
+            .iter()
+            .map(|target| (target.object, target.file_offset))
+            .filter(|target| !positions.contains_key(target))
+            .collect();
+        if refusing || building.len() + wanted.len() > capacity {
+            refusing = true;
+            modules_skipped.push(Skipped {
+                subject: module.path.to_string(),
+                reason: format!(
+                    "module needs {} more of the {MAX_SLOTS} attach slots; {} are in use \
+                     — refusing to attach a prefix",
+                    wanted.len(),
+                    building.len()
+                ),
+            });
+            continue;
+        }
+
+        let id = ModuleId(modules.len() as u32);
+        for target in &module.targets {
+            let position = *positions
+                .entry((target.object, target.file_offset))
+                .or_insert_with(|| {
+                    building.push(Building {
+                        object: target.object,
+                        object_path: target.object_path.to_string(),
+                        file_offset: target.file_offset,
+                        names: Vec::new(),
+                        fork_safe: true,
+                        module_ids: Vec::new(),
+                    });
+                    building.len() - 1
+                });
+            let slot = &mut building[position];
+            // A module reaching one target under two names is aliasing, not module
+            // ambiguity, so each module is recorded at most once per slot.
+            if !slot.module_ids.contains(&id) {
+                slot.module_ids.push(id);
+            }
+            slot.names.push(target.name.to_string());
+            slot.fork_safe &= target.fork_safe;
+        }
+        modules.push(ModuleSummary {
+            id,
+            key: module.key,
+            path: module.path.to_string(),
+            tables: module.tables,
+            interfaces: module.interfaces,
+            source: module.source,
+            corroborated: false,
+        });
+        surfaces.extend(module.surfaces);
+        skipped.extend(module.skipped);
+        entries_seen += module.entries_seen;
+    }
+
+    let slots: Vec<Slot> = building
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut slot)| {
+            slot.names.sort();
+            slot.names.dedup();
+            let (semantics, semantic_ambiguous) = crate::kinds::descriptor_slot(&slot.names);
+            // Counts through a target two modules both publish cannot be attributed
+            // to either, so the slot may not carry semantics — it is counted, and the
+            // report says it was not attributed.
+            let shared = slot.module_ids.len() >= 2;
+            Slot {
+                index: index as u32,
+                object: slot.object,
+                object_path: slot.object_path,
+                file_offset: slot.file_offset,
+                aliased: slot.names.len() >= 2,
+                names: slot.names,
+                semantics: if shared {
+                    SlotSemantics::COUNT_ONLY
+                } else {
+                    semantics
+                },
+                semantic_ambiguous: semantic_ambiguous || shared,
+                fork_safe: slot.fork_safe,
+                module_ids: slot.module_ids,
+            }
+        })
+        .collect();
+    let module_ambiguous = slots.iter().filter(|s| s.module_ids.len() >= 2).count();
+
+    AttachPlan {
+        slots,
+        modules,
+        skipped,
+        modules_skipped,
+        entries_seen,
+        surfaces,
+        vendor_interfaces,
+        interface_list,
+        module_ambiguous,
+    }
+}
+
+/// Merges every scanned module into one plan over a single slot space.
+pub fn build_from_modules(modules: &[ScannedModule]) -> AttachPlan {
+    // The scan never calls the provider, so there is no C_GetInterfaceList
+    // enumeration to report and nothing was left present-but-undecoded: every
+    // interface it records names a table it decoded.
+    merge(
+        modules.iter().map(lower_scanned).collect(),
+        0,
+        "absent".into(),
+    )
+}
+
+fn lower_scanned(module: &ScannedModule) -> Discovered<'_> {
+    let mut tables = Vec::new();
+    let mut surfaces = Vec::new();
+    let mut targets = Vec::new();
     let mut skipped = Vec::new();
     let mut entries_seen = 0usize;
+    for (index, table) in module.tables.iter().enumerate() {
+        // CKF_INTERFACE_FORK_SAFE is bit 0. A table no standard interface exposes
+        // is never assumed fork-safe.
+        let fork_safe = module.interfaces.iter().any(|interface| {
+            interface.table == Some(index)
+                && interface.name_class == "exact_standard"
+                && interface.flags & 1 != 0
+        });
+        let published = table.entries.len() + table.null_entries.len();
+        entries_seen += published;
+        tables.push(TableSummary {
+            version: table.version,
+            entries: table.entries.len(),
+            source: "scan",
+        });
+        surfaces.push(SurfaceSummary {
+            source: format!(
+                "{} table {}.{}",
+                module.path, table.version.0, table.version.1
+            ),
+            walk: table.walk.to_string(),
+            // The bytes were read straight out of the target's mapping.
+            acquisition: "ok".into(),
+            functions: published,
+        });
+        targets.extend(table.entries.iter().map(|entry| Target {
+            name: entry.name,
+            object: entry.object,
+            object_path: &entry.object_path,
+            file_offset: entry.file_offset,
+            fork_safe,
+        }));
+        skipped.extend(table.null_entries.iter().map(|name| Skipped {
+            subject: (*name).to_string(),
+            reason: "null pointer".into(),
+        }));
+    }
+    Discovered {
+        key: module.key,
+        path: &module.path,
+        source: "scan",
+        tables,
+        interfaces: module.interfaces.len(),
+        surfaces,
+        entries_seen,
+        targets,
+        skipped,
+    }
+}
+
+/// The (device, inode) discovery recorded for a manifest object. Identity lives
+/// in `provenance_objects`; `objects[]` carries only paths and hashes. Matching by
+/// path first and by whole-file hash second is what `validate_structure` guarantees
+/// (every object's sha256 is in the provenance closure).
+fn object_key(m: &Manifest, object: &ObjectRecord) -> Option<ObjectKey> {
+    let provenance = m
+        .provenance_objects
+        .iter()
+        .find(|p| p.path == object.path)
+        .or_else(|| {
+            let sha256 = object.identity.sha256.as_deref()?;
+            m.provenance_objects
+                .iter()
+                .find(|p| p.identity.sha256.as_deref() == Some(sha256))
+        })?;
+    Some(ObjectKey {
+        device: Device {
+            major: provenance.device_major,
+            minor: provenance.device_minor,
+        },
+        inode: provenance.inode,
+    })
+}
+
+pub fn build(m: &Manifest) -> AttachPlan {
+    merge(
+        vec![lower_manifest(m)],
+        m.vendor_interfaces.len(),
+        acquisition_label(&m.interface_list),
+    )
+}
+
+fn lower_manifest(m: &Manifest) -> Discovered<'_> {
+    let mut tables = Vec::new();
     let mut surfaces = Vec::new();
+    let mut targets = Vec::new();
+    let mut skipped = Vec::new();
+    let mut entries_seen = 0usize;
 
     for surface in &m.surfaces {
         surfaces.push(SurfaceSummary {
@@ -122,88 +440,81 @@ pub fn build(m: &Manifest) -> AttachPlan {
             acquisition: acquisition_label(&surface.acquisition),
             functions: surface.functions.len(),
         });
+        tables.push(TableSummary {
+            version: surface
+                .version
+                .map_or((0, 0), |version| (version.major, version.minor)),
+            entries: surface.functions.len(),
+            source: "manifest",
+        });
+        let fork_safe = matches!(
+            &surface.source,
+            SurfaceSource::Interface { flags, .. } if flags & 1 != 0
+        );
         for f in &surface.functions {
             entries_seen += 1;
+            let mut skip = |reason: String| {
+                skipped.push(Skipped {
+                    subject: f.name.clone(),
+                    reason,
+                })
+            };
             match &f.resolution {
                 Resolution::Resolved {
                     object,
                     file_offset,
                 } => {
-                    let path = m
-                        .objects
-                        .iter()
-                        .find(|o| o.id == *object)
-                        .map(|o| o.path.clone())
-                        .unwrap_or_default();
-                    if path.is_empty() {
-                        skipped.push(Skipped {
-                            name: f.name.clone(),
-                            reason: format!("object id {object} missing from manifest"),
-                        });
+                    let Some(record) = m.objects.iter().find(|o| o.id == *object) else {
+                        skip(format!("object id {object} missing from manifest"));
                         continue;
-                    }
-                    let target = (path, *file_offset);
-                    let surface_fork_safe = matches!(
-                        &surface.source,
-                        SurfaceSource::Interface { flags, .. } if flags & 1 != 0
-                    );
-                    fork_safe_by_target
-                        .entry(target.clone())
-                        .and_modify(|safe| *safe &= surface_fork_safe)
-                        .or_insert(surface_fork_safe);
-                    by_target.entry(target).or_default().push(f.name.clone());
+                    };
+                    let Some(key) = object_key(m, record) else {
+                        skip(format!(
+                            "object id {object} has no provenance record naming {}",
+                            record.path
+                        ));
+                        continue;
+                    };
+                    targets.push(Target {
+                        name: &f.name,
+                        object: key,
+                        object_path: &record.path,
+                        file_offset: *file_offset,
+                        fork_safe,
+                    });
                 }
-                Resolution::NullPointer => skipped.push(Skipped {
-                    name: f.name.clone(),
-                    reason: "null pointer".into(),
-                }),
-                Resolution::NonFileBacked => skipped.push(Skipped {
-                    name: f.name.clone(),
-                    reason: "non-file-backed".into(),
-                }),
-                Resolution::Unmapped => skipped.push(Skipped {
-                    name: f.name.clone(),
-                    reason: "unmapped".into(),
-                }),
-                Resolution::UnusableFile { reason, .. } => skipped.push(Skipped {
-                    name: f.name.clone(),
-                    reason: reason.clone(),
-                }),
+                Resolution::NullPointer => skip("null pointer".into()),
+                Resolution::NonFileBacked => skip("non-file-backed".into()),
+                Resolution::Unmapped => skip("unmapped".into()),
+                Resolution::UnusableFile { reason, .. } => skip(reason.clone()),
             }
         }
     }
 
-    let slots = by_target
-        .into_iter()
-        .enumerate()
-        .map(|(i, ((object, file_offset), mut names))| {
-            names.sort();
-            names.dedup();
-            let (semantics, semantic_ambiguous) = crate::kinds::descriptor_slot(&names);
-            let fork_safe = fork_safe_by_target
-                .get(&(object.clone(), file_offset))
-                .copied()
-                .unwrap_or(false);
-            Slot {
-                index: i as u32,
-                object,
-                file_offset,
-                aliased: names.len() >= 2,
-                names,
-                semantics,
-                semantic_ambiguous,
-                fork_safe,
-            }
-        })
-        .collect();
-
-    AttachPlan {
-        slots,
-        skipped,
-        entries_seen,
+    Discovered {
+        // Informational only: every target carries the key of the object it
+        // resolved into, which for a forwarded entry is a dependency, not this.
+        key: m
+            .objects
+            .iter()
+            .find(|o| o.path == m.module_path)
+            .and_then(|o| object_key(m, o))
+            .unwrap_or(ObjectKey {
+                device: Device { major: 0, minor: 0 },
+                inode: 0,
+            }),
+        path: &m.module_path,
+        source: "manifest",
+        tables,
+        interfaces: m
+            .surfaces
+            .iter()
+            .filter(|s| matches!(s.source, SurfaceSource::Interface { .. }))
+            .count(),
         surfaces,
-        vendor_interfaces: m.vendor_interfaces.len(),
-        interface_list: acquisition_label(&m.interface_list),
+        entries_seen,
+        targets,
+        skipped,
     }
 }
 
@@ -261,44 +572,24 @@ mod tests {
         }
     }
 
+    fn resolved(name: &str, file_offset: u64) -> FunctionRecord {
+        rec(
+            name,
+            Resolution::Resolved {
+                object: 0,
+                file_offset,
+            },
+        )
+    }
+
     #[test]
     fn one_slot_per_unique_target_and_aliases_flagged() {
         let m = manifest_with(vec![
-            rec(
-                "C_Sign",
-                Resolution::Resolved {
-                    object: 0,
-                    file_offset: 0x10,
-                },
-            ),
-            rec(
-                "C_Verify",
-                Resolution::Resolved {
-                    object: 0,
-                    file_offset: 0x20,
-                },
-            ),
-            rec(
-                "C_OpenSession",
-                Resolution::Resolved {
-                    object: 0,
-                    file_offset: 0x40,
-                },
-            ),
-            rec(
-                "C_CancelFunction",
-                Resolution::Resolved {
-                    object: 0,
-                    file_offset: 0x30,
-                },
-            ),
-            rec(
-                "C_WaitForSlotEvent",
-                Resolution::Resolved {
-                    object: 0,
-                    file_offset: 0x30,
-                },
-            ),
+            resolved("C_Sign", 0x10),
+            resolved("C_Verify", 0x20),
+            resolved("C_OpenSession", 0x40),
+            resolved("C_CancelFunction", 0x30),
+            resolved("C_WaitForSlotEvent", 0x30),
         ]);
         let p = build(&m);
         assert_eq!(p.slots.len(), 4, "aliased pair collapses to one slot");
@@ -324,18 +615,21 @@ mod tests {
             open_session_slot.semantics,
             crate::kinds::descriptor("C_OpenSession").unwrap()
         );
+        // The manifest is one module, and aliasing inside it is not module ambiguity.
+        assert_eq!(p.modules.len(), 1);
+        assert_eq!(p.modules[0].source, "manifest");
+        assert_eq!(p.module_ambiguous, 0);
+        for slot in &p.slots {
+            assert_eq!(slot.module_ids, vec![ModuleId(0)]);
+            assert_eq!(slot.object_path, "/opt/p11.so");
+            assert_eq!(slot.object.inode, 42, "the provenance identity is used");
+        }
     }
 
     #[test]
     fn unresolvable_entries_become_skipped_evidence() {
         let m = manifest_with(vec![
-            rec(
-                "C_Sign",
-                Resolution::Resolved {
-                    object: 0,
-                    file_offset: 0x10,
-                },
-            ),
+            resolved("C_Sign", 0x10),
             rec("C_GetFunctionStatus", Resolution::NullPointer),
             rec("C_Weird", Resolution::NonFileBacked),
             rec("C_Gone", Resolution::Unmapped),
@@ -351,14 +645,23 @@ mod tests {
     }
 
     #[test]
+    fn an_object_with_no_provenance_identity_is_skipped_not_attached() {
+        let mut m = manifest_with(vec![resolved("C_Sign", 0x10)]);
+        m.provenance_objects[0].path = "/opt/other.so".into();
+        m.provenance_objects[0].identity.sha256 = Some("22".repeat(32));
+        let p = build(&m);
+        assert!(p.slots.is_empty());
+        assert_eq!(p.skipped.len(), 1);
+        assert!(
+            p.skipped[0].reason.contains("no provenance record"),
+            "{:?}",
+            p.skipped[0]
+        );
+    }
+
+    #[test]
     fn surface_summaries_are_populated_from_the_manifest() {
-        let m = manifest_with(vec![rec(
-            "C_Sign",
-            Resolution::Resolved {
-                object: 0,
-                file_offset: 0x10,
-            },
-        )]);
+        let m = manifest_with(vec![resolved("C_Sign", 0x10)]);
         let p = build(&m);
         assert_eq!(p.surfaces.len(), 1);
         assert_eq!(p.surfaces[0].source, "legacy_function_list");
@@ -371,13 +674,7 @@ mod tests {
 
     #[test]
     fn surface_summaries_carry_gap_provenance() {
-        let mut m = manifest_with(vec![rec(
-            "C_Sign",
-            Resolution::Resolved {
-                object: 0,
-                file_offset: 0x10,
-            },
-        )]);
+        let mut m = manifest_with(vec![resolved("C_Sign", 0x10)]);
         m.interface_list = Acquisition::Error {
             detail: "boom".into(),
         };
@@ -408,25 +705,61 @@ mod tests {
             slots: (0..count)
                 .map(|index| Slot {
                     index: index as u32,
-                    object: "/opt/p11.so".into(),
+                    object: ObjectKey {
+                        device: Device { major: 8, minor: 1 },
+                        inode: 42,
+                    },
+                    object_path: "/opt/p11.so".into(),
                     file_offset: index as u64 * 8,
                     names: vec!["C_Initialize".into()],
                     aliased: false,
                     semantics: SlotSemantics::COUNT_ONLY,
                     semantic_ambiguous: false,
                     fork_safe: false,
+                    module_ids: vec![ModuleId(0)],
                 })
                 .collect(),
+            modules: vec![],
             skipped: vec![],
+            modules_skipped: vec![],
             entries_seen: count,
             surfaces: vec![],
             vendor_interfaces: 0,
             interface_list: "absent".into(),
+            module_ambiguous: 0,
         };
         assert!(ensure_capacity(&make(424)).is_ok());
         let error = ensure_capacity(&make(513)).unwrap_err();
         assert!(error.contains("requires 513"));
         assert!(error.contains("only 512"));
         assert!(error.contains("refusing to attach a prefix"));
+    }
+
+    #[test]
+    fn a_manifest_over_the_ceiling_is_refused_whole_and_names_the_module() {
+        let m = manifest_with(
+            (0..(MAX_SLOTS as u64 + 1))
+                .map(|i| resolved("C_Sign", i * 8))
+                .collect(),
+        );
+        let p = build(&m);
+        assert!(p.slots.is_empty(), "a prefix is never attached");
+        assert!(p.modules.is_empty());
+        assert_eq!(p.modules_skipped.len(), 1);
+        assert_eq!(p.modules_skipped[0].subject, "/opt/p11.so");
+        assert!(
+            p.modules_skipped[0].reason.contains("513")
+                && p.modules_skipped[0].reason.contains("512"),
+            "{:?}",
+            p.modules_skipped[0]
+        );
+    }
+
+    #[test]
+    fn module_of_slot_names_one_module_or_nobody() {
+        let m = manifest_with(vec![resolved("C_Sign", 0x10)]);
+        let p = build(&m);
+        assert_eq!(p.module_of_slot(0), Some(ModuleId(0)));
+        assert_eq!(p.module_of_slot(7), None, "unknown slot");
     }
 }

@@ -246,12 +246,12 @@ impl<'a> Tracer<'a> {
         state: &mut State,
     ) -> String {
         let pre = (ev.session != SESSION_NONE)
-            .then(|| state.session_pseudonym_process(process, ev.session))
+            .then(|| state.session_pseudonym_process(process, ev.slot, ev.session))
             .flatten();
         state.observe_process(process, ev);
         let session = pre.or_else(|| {
             (ev.session != SESSION_NONE)
-                .then(|| state.session_pseudonym_process(process, ev.session))
+                .then(|| state.session_pseudonym_process(process, ev.slot, ev.session))
                 .flatten()
         });
         let wall_ns = self.wall_ns_for(ev.ts_ns);
@@ -522,7 +522,7 @@ mod tests {
         let close_line = tracer.on_event(&close_event(100, 0xDEAD_BEEF), &mut state);
         assert!(close_line.contains("sess#1"), "line: {close_line}");
         assert!(
-            state.session_pseudonym(100, 0xDEAD_BEEF).is_none(),
+            state.session_pseudonym(100, 0, 0xDEAD_BEEF).is_none(),
             "mapping retired after close"
         );
     }

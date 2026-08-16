@@ -5,7 +5,7 @@
 //! returns one.
 
 use crate::attach::CapturePolicy;
-use crate::plan::AttachPlan;
+use crate::plan::{AttachPlan, ModuleId};
 #[cfg(test)]
 use p11scope_ebpf_common::MECH_NONE;
 use p11scope_ebpf_common::{
@@ -55,6 +55,14 @@ mod corrective_tests {
 
     fn plan(names: &[&str]) -> AttachPlan {
         plan_with_fork(names, false)
+    }
+
+    /// Every slot in these single-module plans belongs to `ModuleId(0)`.
+    fn sess(handle: u64) -> SessionRef {
+        SessionRef {
+            module: crate::plan::ModuleId(0),
+            handle,
+        }
     }
 
     fn plan_with_fork(names: &[&str], fork_safe: bool) -> AttachPlan {
@@ -141,16 +149,16 @@ mod corrective_tests {
         assert_eq!(state.mechanisms()[&0x101].calls, 2);
         assert_eq!(state.mechanisms()[&0x250].calls, 2);
         assert_eq!(state.orphan_ops(), 0);
-        assert!(
-            !state
-                .active_ops
-                .contains_key(&(ProcessKey::from_pid(100), 7, operation::SIGN))
-        );
-        assert!(
-            state
-                .active_ops
-                .contains_key(&(ProcessKey::from_pid(100), 7, operation::DIGEST))
-        );
+        assert!(!state.active_ops.contains_key(&(
+            ProcessKey::from_pid(100),
+            sess(7),
+            operation::SIGN
+        )));
+        assert!(state.active_ops.contains_key(&(
+            ProcessKey::from_pid(100),
+            sess(7),
+            operation::DIGEST
+        )));
     }
 
     #[test]
@@ -176,8 +184,9 @@ mod corrective_tests {
 
         assert_eq!(state.mechanisms()[&0x101].calls, 2);
         assert_eq!(state.sessions().closed, 1);
-        assert!(state.session_pseudonym(100, 10).is_none());
-        assert!(state.session_pseudonym(100, 20).is_some());
+        // Slot 0 is this plan's C_OpenSession.
+        assert!(state.session_pseudonym(100, 0, 10).is_none());
+        assert!(state.session_pseudonym(100, 0, 20).is_some());
     }
 
     #[test]
@@ -194,7 +203,7 @@ mod corrective_tests {
             CkRv::OPERATION_ACTIVE.0,
         ));
         assert_eq!(
-            state.active_ops[&(process, 7, operation::SIGN)].mechanism,
+            state.active_ops[&(process, sess(7), operation::SIGN)].mechanism,
             0x101
         );
 
@@ -206,7 +215,7 @@ mod corrective_tests {
         assert!(
             state
                 .active_ops
-                .contains_key(&(process, 7, operation::SIGN))
+                .contains_key(&(process, sess(7), operation::SIGN))
         );
 
         let null_ok = Event {
@@ -217,7 +226,7 @@ mod corrective_tests {
         assert!(
             !state
                 .active_ops
-                .contains_key(&(process, 7, operation::SIGN))
+                .contains_key(&(process, sess(7), operation::SIGN))
         );
 
         state.observe(&mechanism(&p, "C_SignInit", 7, 0x103, 0));
@@ -229,7 +238,7 @@ mod corrective_tests {
         assert!(
             !state
                 .active_ops
-                .contains_key(&(process, 7, operation::SIGN))
+                .contains_key(&(process, sess(7), operation::SIGN))
         );
 
         let invalid_null = Event {
@@ -263,7 +272,7 @@ mod corrective_tests {
         assert!(
             !state
                 .active_ops
-                .contains_key(&(process, 7, operation::VERIFY))
+                .contains_key(&(process, sess(7), operation::VERIFY))
         );
 
         state.observe(&mechanism(&p, "C_VerifyRecoverInit", 7, 2, 0));
@@ -275,13 +284,13 @@ mod corrective_tests {
         assert!(
             state
                 .active_ops
-                .contains_key(&(process, 7, operation::VERIFY_RECOVER))
+                .contains_key(&(process, sess(7), operation::VERIFY_RECOVER))
         );
         state.observe(&event(&p, "C_VerifyRecover", 7, 0));
         assert!(
             !state
                 .active_ops
-                .contains_key(&(process, 7, operation::VERIFY_RECOVER))
+                .contains_key(&(process, sess(7), operation::VERIFY_RECOVER))
         );
 
         state.observe(&mechanism(&p, "C_EncryptInit", 7, 3, 0));
@@ -289,7 +298,7 @@ mod corrective_tests {
         assert!(
             state
                 .active_ops
-                .contains_key(&(process, 7, operation::ENCRYPT))
+                .contains_key(&(process, sess(7), operation::ENCRYPT))
         );
 
         state.observe(&mechanism(&p, "C_DigestInit", 7, 4, 0));
@@ -297,7 +306,7 @@ mod corrective_tests {
         assert!(
             state
                 .active_ops
-                .contains_key(&(process, 7, operation::DIGEST))
+                .contains_key(&(process, sess(7), operation::DIGEST))
         );
 
         state.observe(&mechanism(&p, "C_SignInit", 7, 5, 0));
@@ -305,7 +314,7 @@ mod corrective_tests {
         assert!(
             !state
                 .active_ops
-                .contains_key(&(process, 7, operation::SIGN))
+                .contains_key(&(process, sess(7), operation::SIGN))
         );
 
         state.observe(&mechanism(&p, "C_SignInit", 7, 5, 0));
@@ -318,12 +327,12 @@ mod corrective_tests {
         assert!(
             state
                 .active_ops
-                .contains_key(&(process, 7, operation::DIGEST))
+                .contains_key(&(process, sess(7), operation::DIGEST))
         );
         assert!(
             state
                 .active_ops
-                .contains_key(&(process, 7, operation::ENCRYPT))
+                .contains_key(&(process, sess(7), operation::ENCRYPT))
         );
     }
 
@@ -386,7 +395,7 @@ mod corrective_tests {
         assert!(
             state
                 .active_ops
-                .contains_key(&(process, 7, operation::SIGN))
+                .contains_key(&(process, sess(7), operation::SIGN))
         );
 
         let mut context_login = event(&p, "C_Login", 7, 0);
@@ -395,7 +404,7 @@ mod corrective_tests {
         assert!(
             state
                 .active_ops
-                .contains_key(&(process, 7, operation::SIGN))
+                .contains_key(&(process, sess(7), operation::SIGN))
         );
 
         let mut cancel = event(&p, "C_SessionCancel", 7, CkRv::OPERATION_CANCEL_FAILED.0);
@@ -404,7 +413,7 @@ mod corrective_tests {
         assert!(
             !state
                 .active_ops
-                .contains_key(&(process, 7, operation::SIGN))
+                .contains_key(&(process, sess(7), operation::SIGN))
         );
         assert_eq!(state.semantic_evidence().session_cancel_ambiguities, 1);
 
@@ -413,7 +422,7 @@ mod corrective_tests {
         assert!(
             !state
                 .active_ops
-                .contains_key(&(process, 7, operation::SIGN))
+                .contains_key(&(process, sess(7), operation::SIGN))
         );
         assert_eq!(state.semantic_evidence().operation_state_imports, 1);
 
@@ -456,7 +465,7 @@ mod corrective_tests {
         assert_eq!(state.mechanisms()[&1].calls, 2);
 
         state.observe_process(reused, &event(&p, "C_Finalize", SESSION_NONE, 0));
-        assert!(state.session_pseudonym_process(parent, 7).is_none());
+        assert!(state.session_pseudonym_process(parent, 0, 7).is_none());
 
         let unsafe_plan = plan_with_fork(&["C_OpenSession", "C_SignInit", "C_Sign"], false);
         let mut unsafe_state = State::new(&unsafe_plan);
@@ -550,7 +559,7 @@ mod corrective_tests {
         assert!(
             state
                 .active_ops
-                .contains_key(&(process, 7, operation::SIGN))
+                .contains_key(&(process, sess(7), operation::SIGN))
         );
 
         let mut pending_final = event(&p, "C_SignFinal", 7, CkRv::PENDING.0);
@@ -576,7 +585,7 @@ mod corrective_tests {
         assert!(
             !state
                 .active_ops
-                .contains_key(&(process, 8, operation::SIGN))
+                .contains_key(&(process, sess(8), operation::SIGN))
         );
 
         state.observe(&complete_final);
@@ -599,7 +608,7 @@ mod corrective_tests {
         assert!(
             !state
                 .active_ops
-                .contains_key(&(process, 7, operation::SIGN))
+                .contains_key(&(process, sess(7), operation::SIGN))
         );
         assert_eq!(state.mechanisms()[&0x101].errors, 1);
     }
@@ -634,7 +643,7 @@ mod corrective_tests {
         let process = ProcessKey::from_pid(100);
         let mut state = State::new(&p);
         state.observe(&event(&p, "C_FindObjectsInit", 7, CkRv::OK.0));
-        assert!(state.find_active.contains(&(process, 7)));
+        assert!(state.find_active.contains(&(process, sess(7))));
 
         state.observe(&event(
             &p,
@@ -642,7 +651,7 @@ mod corrective_tests {
             7,
             CkRv::OPERATION_NOT_INITIALIZED.0,
         ));
-        assert!(!state.find_active.contains(&(process, 7)));
+        assert!(!state.find_active.contains(&(process, sess(7))));
         assert_eq!(state.semantic_evidence().state_reconciliations, 1);
     }
 
@@ -794,6 +803,21 @@ pub struct SemanticEvidence {
     pub semantic_state_drops: u64,
 }
 
+/// Reserved module id for a slot no single module owns — unknown, or claimed
+/// by two or more modules. Ambiguous slots are `COUNT_ONLY`, so they emit no
+/// session-scoped events; the reserved id exists so that if one ever did, its
+/// handles could not alias a real module's.
+const MODULE_UNRESOLVED: ModuleId = ModuleId(u32::MAX);
+
+/// A session handle scoped to the module that issued it. A PKCS#11 proxy and
+/// the backend provider it loads live in one process and each hand out their
+/// own handle space, so the proxy's handle 5 is not the backend's handle 5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SessionRef {
+    module: ModuleId,
+    handle: u64,
+}
+
 #[derive(Clone)]
 struct SlotMeta {
     names: Vec<String>,
@@ -801,6 +825,16 @@ struct SlotMeta {
     semantics: p11scope_ebpf_common::SlotSemantics,
     function_id: Option<u32>,
     fork_safe: bool,
+    module: ModuleId,
+}
+
+impl SlotMeta {
+    fn session(&self, handle: u64) -> SessionRef {
+        SessionRef {
+            module: self.module,
+            handle,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -827,7 +861,7 @@ struct Pending {
 #[derive(Clone)]
 struct Detached {
     pending: Pending,
-    owner: Option<(ProcessKey, u64)>,
+    owner: Option<(ProcessKey, SessionRef)>,
 }
 
 const OPERATIONS: [(u16, &str); 11] = [
@@ -967,12 +1001,14 @@ pub struct State {
     slots: Vec<Option<SlotMeta>>,
     current_process: BTreeMap<u32, ProcessKey>,
     next_pseudonym: BTreeMap<ProcessKey, u64>,
-    open: BTreeMap<(ProcessKey, u64), SessionInfo>,
-    active_ops: BTreeMap<(ProcessKey, u64, u16), Binding>,
-    find_active: BTreeSet<(ProcessKey, u64)>,
-    inherited_ambiguous: BTreeSet<(ProcessKey, u64)>,
-    pending: BTreeMap<(ProcessKey, u64, u32), Pending>,
-    detached: BTreeMap<(u64, u32, u64), Detached>,
+    open: BTreeMap<(ProcessKey, SessionRef), SessionInfo>,
+    active_ops: BTreeMap<(ProcessKey, SessionRef, u16), Binding>,
+    find_active: BTreeSet<(ProcessKey, SessionRef)>,
+    inherited_ambiguous: BTreeSet<(ProcessKey, SessionRef)>,
+    pending: BTreeMap<(ProcessKey, SessionRef, u32), Pending>,
+    /// Async ids are only unique within one module's PKCS#11 slot, so the
+    /// issuing module is part of the key here too.
+    detached: BTreeMap<(ModuleId, u64, u32, u64), Detached>,
     sequence: u64,
     mechanisms: BTreeMap<u64, MechStat>,
     templates: BTreeMap<(u32, u8), TemplateStat>,
@@ -1016,6 +1052,7 @@ impl State {
                     .then(|| crate::kinds::function_id(&slot.names[0]))
                     .flatten(),
                 fork_safe: slot.fork_safe,
+                module: plan.module_of_slot(slot.index).unwrap_or(MODULE_UNRESOLVED),
             });
         }
         Self {
@@ -1131,7 +1168,11 @@ impl State {
         }
         let Some(meta) = meta else { return };
 
-        if ev.session != SESSION_NONE && self.inherited_ambiguous.remove(&(process, ev.session)) {
+        if ev.session != SESSION_NONE
+            && self
+                .inherited_ambiguous
+                .remove(&(process, meta.session(ev.session)))
+        {
             self.evidence.fork_state_ambiguities += 1;
         }
         if matches!(
@@ -1225,7 +1266,7 @@ impl State {
             return;
         }
         for (operation, _) in operation_bits(meta.semantics.operations) {
-            let key = (process, ev.session, operation);
+            let key = (process, meta.session(ev.session), operation);
             match mechanism_capture(ev) {
                 MechanismCapture::Value(mechanism) => {
                     if self.active_ops.contains_key(&key) || self.admit(1) {
@@ -1254,7 +1295,10 @@ impl State {
     fn apply_operations(&mut self, process: ProcessKey, ev: &Event, meta: &SlotMeta) {
         let mut mechanisms = BTreeSet::new();
         for (operation, _) in operation_bits(meta.semantics.operations) {
-            match self.active_ops.get(&(process, ev.session, operation)) {
+            match self
+                .active_ops
+                .get(&(process, meta.session(ev.session), operation))
+            {
                 Some(binding) => {
                     mechanisms.insert(binding.mechanism);
                 }
@@ -1288,7 +1332,8 @@ impl State {
         };
         if !retain {
             for (operation, _) in operation_bits(meta.semantics.operations) {
-                self.active_ops.remove(&(process, ev.session, operation));
+                self.active_ops
+                    .remove(&(process, meta.session(ev.session), operation));
             }
         }
     }
@@ -1299,20 +1344,22 @@ impl State {
             for (operation, _) in operation_bits(meta.semantics.operations) {
                 changed |= self
                     .active_ops
-                    .remove(&(process, ev.session, operation))
+                    .remove(&(process, meta.session(ev.session), operation))
                     .is_some();
             }
             if matches!(
                 meta.semantics.lifecycle,
                 lifecycle::FIND_OPERATION | lifecycle::FIND_FINAL
             ) {
-                changed |= self.find_active.remove(&(process, ev.session));
+                changed |= self
+                    .find_active
+                    .remove(&(process, meta.session(ev.session)));
             }
             self.evidence.state_reconciliations += u64::from(changed);
             return true;
         }
         if matches!(ev.rv, 0x0000_00b0 | 0x0000_00b3) {
-            let changed = self.retire_session(process, ev.session);
+            let changed = self.retire_session(process, meta.session(ev.session));
             self.evidence.state_reconciliations += u64::from(changed);
             return true;
         }
@@ -1325,9 +1372,10 @@ impl State {
     }
 
     fn apply_lifecycle(&mut self, process: ProcessKey, ev: &Event, meta: &SlotMeta) {
+        let session = meta.session(ev.session);
         match meta.semantics.lifecycle {
             lifecycle::OPEN_SESSION if ev.rv == CkRv::OK.0 && ev.session != SESSION_NONE => {
-                if self.retire_session(process, ev.session) {
+                if self.retire_session(process, session) {
                     self.evidence.state_reconciliations += 1;
                 }
                 let async_session = ev.capture & capture::ASYNC_SESSION != 0;
@@ -1338,7 +1386,7 @@ impl State {
                     let counter = self.next_pseudonym.entry(process).or_default();
                     *counter += 1;
                     self.open.insert(
-                        (process, ev.session),
+                        (process, session),
                         SessionInfo {
                             pseudonym: *counter,
                             slot: ev.slot_id,
@@ -1349,16 +1397,20 @@ impl State {
                 }
             }
             lifecycle::CLOSE_SESSION if ev.rv == CkRv::OK.0 => {
-                if !self.retire_session(process, ev.session) {
+                if !self.retire_session(process, session) {
                     self.unmatched_closes += 1;
                 }
             }
             lifecycle::CLOSE_ALL_SESSIONS if ev.rv == CkRv::OK.0 => {
-                let sessions: Vec<u64> = self
+                // Only this module's sessions on that PKCS#11 slot id: another
+                // module in the same process numbers its slots independently.
+                let sessions: Vec<SessionRef> = self
                     .open
                     .iter()
-                    .filter(|((owner, _), info)| *owner == process && info.slot == ev.slot_id)
-                    .map(|((_, session), _)| *session)
+                    .filter(|((owner, open), info)| {
+                        *owner == process && open.module == meta.module && info.slot == ev.slot_id
+                    })
+                    .map(|((_, open), _)| *open)
                     .collect();
                 for session in sessions {
                     self.retire_session(process, session);
@@ -1370,17 +1422,17 @@ impl State {
             lifecycle::LOGIN => self.apply_auth(process, ev, meta),
             lifecycle::LOGOUT => self.apply_auth(process, ev, meta),
             lifecycle::FIND_INIT if ev.rv == CkRv::OK.0 => {
-                let key = (process, ev.session);
+                let key = (process, session);
                 if self.find_active.contains(&key) || self.admit(1) {
                     self.find_active.insert(key);
                 }
             }
             lifecycle::FIND_FINAL if ev.rv == CkRv::OK.0 => {
-                self.find_active.remove(&(process, ev.session));
+                self.find_active.remove(&(process, session));
             }
-            lifecycle::SESSION_CANCEL => self.apply_session_cancel(process, ev),
+            lifecycle::SESSION_CANCEL => self.apply_session_cancel(process, ev, session),
             lifecycle::SET_OPERATION_STATE if ev.rv == CkRv::OK.0 => {
-                self.clear_operations(process, ev.session, u16::MAX);
+                self.clear_operations(process, session, u16::MAX);
                 self.evidence.operation_state_imports += 1;
             }
             _ => {}
@@ -1397,14 +1449,22 @@ impl State {
         if ev.rv != CkRv::OK.0 && ev.rv != CkRv::PIN_LOCKED.0 {
             return;
         }
-        let Some(slot) = self.open.get(&(process, ev.session)).map(|info| info.slot) else {
+        let Some(slot) = self
+            .open
+            .get(&(process, meta.session(ev.session)))
+            .map(|info| info.slot)
+        else {
             return;
         };
-        let sessions: Vec<u64> = self
+        // The login applies to this module's sessions on that PKCS#11 slot;
+        // another module's identically numbered slot is a different token.
+        let sessions: Vec<SessionRef> = self
             .open
             .iter()
-            .filter(|((owner, _), info)| *owner == process && info.slot == slot)
-            .map(|((_, session), _)| *session)
+            .filter(|((owner, open), info)| {
+                *owner == process && open.module == meta.module && info.slot == slot
+            })
+            .map(|((_, open), _)| *open)
             .collect();
         let mut changed = false;
         for session in sessions {
@@ -1413,20 +1473,20 @@ impl State {
         self.evidence.auth_state_ambiguities += u64::from(changed);
     }
 
-    fn apply_session_cancel(&mut self, process: ProcessKey, ev: &Event) {
+    fn apply_session_cancel(&mut self, process: ProcessKey, ev: &Event, session: SessionRef) {
         if ev.flags & !KNOWN_CANCEL_FLAGS != 0 {
             self.evidence.session_cancel_unknown_flags += 1;
         }
         let selected = (ev.flags & KNOWN_CANCEL_FLAGS).count_ones();
         if ev.rv == CkRv::OPERATION_CANCEL_FAILED.0 && selected > 1 {
-            self.clear_selected(process, ev.session, ev.flags);
+            self.clear_selected(process, session, ev.flags);
             self.evidence.session_cancel_ambiguities += 1;
         } else if ev.rv == CkRv::OK.0 {
-            self.clear_selected(process, ev.session, ev.flags);
+            self.clear_selected(process, session, ev.flags);
         }
     }
 
-    fn clear_selected(&mut self, process: ProcessKey, session: u64, flags: u64) {
+    fn clear_selected(&mut self, process: ProcessKey, session: SessionRef, flags: u64) {
         self.clear_operations(process, session, cancel_operation_mask(flags));
         if flags & CKF_FIND_OBJECTS != 0 {
             self.find_active.remove(&(process, session));
@@ -1461,15 +1521,16 @@ impl State {
         let Some(meta) = self.slots.get(ev.slot as usize).and_then(Clone::clone) else {
             return;
         };
+        let session = meta.session(ev.session);
         match meta.semantics.lifecycle {
             lifecycle::ASYNC_COMPLETE => {
                 if ev.rv == CkRv::PENDING.0 {
                     return;
                 }
-                let key = (process, ev.session, ev.target_function);
+                let key = (process, session, ev.target_function);
                 let pending = self.pending.remove(&key).or_else(|| {
                     let detached_key = self.detached.iter().find_map(|(key, value)| {
-                        (value.owner == Some((process, ev.session))
+                        (value.owner == Some((process, session))
                             && value.pending.meta.function_id == Some(ev.target_function))
                         .then_some(*key)
                     });
@@ -1491,22 +1552,22 @@ impl State {
                 }
             }
             lifecycle::ASYNC_GET_ID if ev.rv == CkRv::OK.0 => {
-                let key = (process, ev.session, ev.target_function);
+                let key = (process, session, ev.target_function);
                 let Some(pending) = self.pending.remove(&key) else {
                     self.evidence.async_orphans += 1;
                     return;
                 };
-                let Some(slot) = self.open.get(&(process, ev.session)).map(|info| info.slot) else {
+                let Some(slot) = self.open.get(&(process, session)).map(|info| info.slot) else {
                     self.evidence.async_target_failures += 1;
                     return;
                 };
                 if self
                     .detached
                     .insert(
-                        (slot, ev.target_function, ev.async_value),
+                        (session.module, slot, ev.target_function, ev.async_value),
                         Detached {
                             pending,
-                            owner: Some((process, ev.session)),
+                            owner: Some((process, session)),
                         },
                     )
                     .is_some()
@@ -1515,15 +1576,17 @@ impl State {
                 }
             }
             lifecycle::ASYNC_JOIN if ev.rv == CkRv::OK.0 => {
-                let Some(slot) = self.open.get(&(process, ev.session)).map(|info| info.slot) else {
+                let Some(slot) = self.open.get(&(process, session)).map(|info| info.slot) else {
                     self.evidence.async_target_failures += 1;
                     return;
                 };
-                match self
-                    .detached
-                    .get_mut(&(slot, ev.target_function, ev.async_value))
-                {
-                    Some(detached) => detached.owner = Some((process, ev.session)),
+                match self.detached.get_mut(&(
+                    session.module,
+                    slot,
+                    ev.target_function,
+                    ev.async_value,
+                )) {
+                    Some(detached) => detached.owner = Some((process, session)),
                     None => self.evidence.async_orphans += 1,
                 }
             }
@@ -1541,7 +1604,7 @@ impl State {
             return;
         }
         self.sequence = self.sequence.wrapping_add(1);
-        let key = (process, ev.session, function_id);
+        let key = (process, meta.session(ev.session), function_id);
         let pending = Pending {
             event: *ev,
             meta,
@@ -1687,7 +1750,7 @@ impl State {
         }
     }
 
-    fn clear_operations(&mut self, process: ProcessKey, session: u64, mask: u16) -> bool {
+    fn clear_operations(&mut self, process: ProcessKey, session: SessionRef, mask: u16) -> bool {
         let before = self.active_ops.len();
         self.active_ops.retain(|(owner, handle, operation), _| {
             !(*owner == process && *handle == session && mask & *operation != 0)
@@ -1695,7 +1758,7 @@ impl State {
         self.active_ops.len() != before
     }
 
-    fn clear_session_state(&mut self, process: ProcessKey, session: u64) -> bool {
+    fn clear_session_state(&mut self, process: ProcessKey, session: SessionRef) -> bool {
         let mut changed = self.clear_operations(process, session, u16::MAX);
         changed |= self.find_active.remove(&(process, session));
         changed |= self.inherited_ambiguous.remove(&(process, session));
@@ -1712,7 +1775,7 @@ impl State {
         changed
     }
 
-    fn retire_session(&mut self, process: ProcessKey, session: u64) -> bool {
+    fn retire_session(&mut self, process: ProcessKey, session: SessionRef) -> bool {
         let existed = self.open.remove(&(process, session)).is_some();
         self.clear_session_state(process, session);
         if existed {
@@ -1723,7 +1786,9 @@ impl State {
 
     pub fn retire_process(&mut self, process: ProcessKey) -> u64 {
         let had_state = self.has_process_state(process);
-        let sessions: Vec<u64> = self
+        // Every module's sessions in this process: the sweep matches on the
+        // `ProcessKey` alone, never on a module.
+        let sessions: Vec<SessionRef> = self
             .open
             .keys()
             .filter(|(owner, _)| *owner == process)
@@ -1754,7 +1819,8 @@ impl State {
             return;
         }
         self.current_process.insert(child.pid, child);
-        let sessions: Vec<(u64, SessionInfo)> = self
+        // Inherits every module's sessions; each carries its own module along.
+        let sessions: Vec<(SessionRef, SessionInfo)> = self
             .open
             .iter()
             .filter(|((owner, _), _)| *owner == parent)
@@ -1813,17 +1879,39 @@ impl State {
         self.sessions.peak_concurrent = self.sessions.peak_concurrent.max(self.open.len() as u64);
     }
 
-    pub fn session_pseudonym(&self, pid: u32, raw: u64) -> Option<u64> {
+    /// Pseudonym for the raw handle `raw` as issued by the module attached at
+    /// `slot`. Two modules in one process may both issue handle 5; each keeps
+    /// its own pseudonym, drawn from one per-process sequence so the rendered
+    /// numbers stay distinct.
+    pub fn session_pseudonym(&self, pid: u32, slot: u32, raw: u64) -> Option<u64> {
         let process = self
             .current_process
             .get(&pid)
             .copied()
             .unwrap_or_else(|| ProcessKey::from_pid(pid));
-        self.session_pseudonym_process(process, raw)
+        self.session_pseudonym_process(process, slot, raw)
     }
 
-    pub fn session_pseudonym_process(&self, process: ProcessKey, raw: u64) -> Option<u64> {
-        self.open.get(&(process, raw)).map(|info| info.pseudonym)
+    pub fn session_pseudonym_process(
+        &self,
+        process: ProcessKey,
+        slot: u32,
+        raw: u64,
+    ) -> Option<u64> {
+        let module = self
+            .slots
+            .get(slot as usize)
+            .and_then(Option::as_ref)
+            .map_or(MODULE_UNRESOLVED, |meta| meta.module);
+        self.open
+            .get(&(
+                process,
+                SessionRef {
+                    module,
+                    handle: raw,
+                },
+            ))
+            .map(|info| info.pseudonym)
     }
 
     pub fn mechanisms(&self) -> &BTreeMap<u64, MechStat> {
@@ -2297,8 +2385,8 @@ mod tests {
         assert_eq!(s.sessions().opened, 2);
         assert_eq!(s.sessions().peak_concurrent, 2);
         // Each pid gets its own first-seen numbering, independently.
-        assert_eq!(s.session_pseudonym(100, 5), Some(1));
-        assert_eq!(s.session_pseudonym(200, 5), Some(1));
+        assert_eq!(s.session_pseudonym(100, 0, 5), Some(1));
+        assert_eq!(s.session_pseudonym(200, 0, 5), Some(1));
 
         // Closing pid 100's session must not touch pid 200's.
         s.observe(&ev(100, 1, fnkind::SESSION_ARG0, 5, MECH_NONE, 0, 5));

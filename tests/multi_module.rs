@@ -2,6 +2,8 @@
 //! target two modules share, and a capacity ceiling that refuses whole modules.
 
 use p11scope::plan::{ModuleId, build_from_modules};
+use p11scope::semantics::{ProcessKey, State};
+use p11scope_ebpf_common::{Event, event_type};
 use p11scope_manifest::maps::{Device, ObjectKey};
 
 fn key(inode: u64) -> ObjectKey {
@@ -128,4 +130,99 @@ fn capacity_overflow_skips_whole_modules_and_says_which() {
         "the ceiling must be named: {:?}",
         plan.modules_skipped[0]
     );
+}
+
+// Session-scoped semantic state is keyed by the module that issued the handle:
+// a proxy and the backend it loads live in one process and each hand out their
+// own handle space, so handle 5 from one is not handle 5 from the other.
+
+fn slot_of(plan: &p11scope::plan::AttachPlan, inode: u64, name: &str) -> u32 {
+    plan.slots
+        .iter()
+        .find(|s| s.object.inode == inode && s.names == [name])
+        .unwrap()
+        .index
+}
+
+/// A completed `C_OpenSession`/`C_CloseSession` call on `slot` carrying the
+/// session handle the module issued.
+fn session_event(slot: u32, handle: u64) -> Event {
+    Event {
+        slot,
+        session: handle,
+        pid_tgid: 4242 << 32,
+        rv: 0,
+        event_type: event_type::CALL,
+        ..Event::default()
+    }
+}
+
+#[test]
+fn equal_session_handles_from_two_modules_do_not_interact() {
+    let plan = build_from_modules(&[
+        module(
+            10,
+            "/opt/proxy.so",
+            &[("C_OpenSession", 10, 0x100), ("C_CloseSession", 10, 0x108)],
+        ),
+        module(
+            20,
+            "/opt/backend.so",
+            &[("C_OpenSession", 20, 0x100), ("C_CloseSession", 20, 0x108)],
+        ),
+    ]);
+    let proxy_open = slot_of(&plan, 10, "C_OpenSession");
+    let backend_open = slot_of(&plan, 20, "C_OpenSession");
+    let proxy_close = slot_of(&plan, 10, "C_CloseSession");
+
+    let mut state = State::new(&plan);
+    let process = ProcessKey::from_pid(4242);
+    // The same numeric handle 5 opened through both modules.
+    state.observe_process(process, &session_event(proxy_open, 5));
+    state.observe_process(process, &session_event(backend_open, 5));
+    assert_eq!(state.sessions().opened, 2, "two distinct sessions, not one");
+    assert_eq!(
+        state.sessions().peak_concurrent,
+        2,
+        "both handle-5 sessions are open at once"
+    );
+    assert_eq!(
+        state.semantic_evidence().state_reconciliations,
+        0,
+        "the backend's open is not a re-open of the proxy's handle 5"
+    );
+    let proxy_pseudonym = state.session_pseudonym_process(process, proxy_open, 5);
+    let backend_pseudonym = state.session_pseudonym_process(process, backend_open, 5);
+    assert!(proxy_pseudonym.is_some() && backend_pseudonym.is_some());
+    assert_ne!(
+        proxy_pseudonym, backend_pseudonym,
+        "the two handle-5 sessions must render as different pseudonyms"
+    );
+
+    // Closing the proxy's 5 must leave the backend's 5 open.
+    state.observe_process(process, &session_event(proxy_close, 5));
+    assert_eq!(state.sessions().closed, 1);
+    assert_eq!(
+        state.unmatched_closes(),
+        0,
+        "the close matched the proxy's session"
+    );
+    assert!(
+        state.has_process_state(process),
+        "the backend's session is still open, so the process still has state"
+    );
+    assert_eq!(
+        state.session_pseudonym_process(process, proxy_open, 5),
+        None,
+        "the proxy's handle 5 is retired"
+    );
+    assert_eq!(
+        state.session_pseudonym_process(process, backend_open, 5),
+        backend_pseudonym,
+        "the backend's handle 5 is untouched"
+    );
+
+    // Retiring the process still sweeps every module's state, not just one.
+    state.retire_process(process);
+    assert!(!state.has_process_state(process));
 }

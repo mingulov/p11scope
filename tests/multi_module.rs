@@ -5,6 +5,7 @@ use p11scope::plan::{ModuleId, build_from_modules};
 use p11scope::semantics::{ProcessKey, State};
 use p11scope_ebpf_common::{Event, SESSION_NONE, event_type};
 use p11scope_manifest::maps::{Device, ObjectKey};
+use pkcs11_proxy_ng_types::CkRv;
 
 fn key(inode: u64) -> ObjectKey {
     ObjectKey {
@@ -283,4 +284,57 @@ fn one_modules_finalize_does_not_retire_another_modules_state() {
         "the backend's close matched a session we still knew about"
     );
     assert!(!state.has_process_state(process));
+}
+
+#[test]
+fn a_second_finalize_reporting_not_initialized_stays_within_its_module() {
+    // The standard idempotent teardown: C_Finalize, then C_Finalize again,
+    // which the module answers CKR_CRYPTOKI_NOT_INITIALIZED. That answer is
+    // about the module that gave it, never about the process.
+    let plan = build_from_modules(&[
+        module(
+            10,
+            "/opt/proxy.so",
+            &[("C_OpenSession", 10, 0x100), ("C_Finalize", 10, 0x110)],
+        ),
+        module(
+            20,
+            "/opt/backend.so",
+            &[("C_OpenSession", 20, 0x100), ("C_CloseSession", 20, 0x108)],
+        ),
+    ]);
+    let proxy_open = slot_of(&plan, 10, "C_OpenSession");
+    let proxy_finalize = slot_of(&plan, 10, "C_Finalize");
+    let backend_open = slot_of(&plan, 20, "C_OpenSession");
+    let backend_close = slot_of(&plan, 20, "C_CloseSession");
+
+    let mut state = State::new(&plan);
+    let process = ProcessKey::from_pid(4242);
+    state.observe_process(process, &session_event(proxy_open, 5));
+    state.observe_process(process, &session_event(backend_open, 5));
+    state.observe_process(process, &session_event(proxy_finalize, SESSION_NONE));
+
+    let mut again = session_event(proxy_finalize, SESSION_NONE);
+    again.rv = CkRv::CRYPTOKI_NOT_INITIALIZED.0;
+    state.observe_process(process, &again);
+    assert!(
+        state.has_process_state(process),
+        "the backend's session must survive the proxy's second C_Finalize"
+    );
+    assert!(
+        state
+            .session_pseudonym_process(process, backend_open, 5)
+            .is_some(),
+        "the backend's handle 5 is still open"
+    );
+    assert_eq!(
+        state.semantic_evidence().state_reconciliations,
+        0,
+        "the proxy had no state left to reconcile — counting one would be a false signal"
+    );
+
+    // The backend's own close still matches.
+    state.observe_process(process, &session_event(backend_close, 5));
+    assert_eq!(state.sessions().closed, 2);
+    assert_eq!(state.unmatched_closes(), 0);
 }

@@ -476,6 +476,43 @@ mod corrective_tests {
         assert_eq!(unsafe_state.semantic_evidence().fork_state_ambiguities, 1);
     }
 
+    /// `close_finalize_pid_reuse_and_fork_copy_only_proven_state` observes
+    /// `C_Finalize` as a *reused* pid, so the pid-reuse hook retires the state
+    /// before `apply_lifecycle` ever sees the event. This one reaches the
+    /// FINALIZE arm itself: one module finalizing clears its own state.
+    #[test]
+    fn finalize_retires_the_finalizing_modules_own_state() {
+        let p = plan(&[
+            "C_OpenSession",
+            "C_SignInit",
+            "C_FindObjectsInit",
+            "C_AsyncGetID",
+            "C_Finalize",
+        ]);
+        let process = ProcessKey::from_pid(100);
+        let mut state = State::new(&p);
+        state.observe(&open(&p, 7, 3));
+        state.observe(&mechanism(&p, "C_SignInit", 7, 1, 0));
+        // An async id detached from its session: still joinable, until the
+        // module that issued it finalizes.
+        state.observe(&event(&p, "C_FindObjectsInit", 7, CkRv::PENDING.0));
+        let mut get_id = event(&p, "C_AsyncGetID", 7, CkRv::OK.0);
+        get_id.target_function = crate::kinds::function_id("C_FindObjectsInit").unwrap();
+        get_id.async_value = 42;
+        state.observe(&get_id);
+        assert!(state.has_process_state(process));
+        assert_eq!(state.pending_at_end(), 1);
+
+        state.observe(&event(&p, "C_Finalize", SESSION_NONE, 0));
+        assert!(!state.has_process_state(process));
+        assert_eq!(state.sessions().closed, 1);
+        assert_eq!(
+            state.pending_at_end(),
+            0,
+            "the module's async ids die with its Cryptoki, not at capture end"
+        );
+    }
+
     #[test]
     fn process_retirement_clears_state_without_a_recorded_open() {
         let p = plan_with_fork(
@@ -835,6 +872,17 @@ impl SlotMeta {
             handle,
         }
     }
+}
+
+/// The one predicate every scoped query and sweep runs on: the `ProcessKey`
+/// always has to match, and `Some(module)` narrows it to the handles that one
+/// module issued. Defined once so `has_scope_state` and `retire_scope` cannot
+/// drift into disagreeing about what "this scope's state" means.
+fn scoped(
+    process: ProcessKey,
+    module: Option<ModuleId>,
+) -> impl Fn(&ProcessKey, &SessionRef) -> bool {
+    move |owner, session| *owner == process && module.is_none_or(|id| session.module == id)
 }
 
 #[derive(Clone, Copy)]
@@ -1364,7 +1412,12 @@ impl State {
             return true;
         }
         if ev.rv == CkRv::CRYPTOKI_NOT_INITIALIZED.0 {
-            let changed = self.retire_process(process) > 0;
+            // One library says it was never initialized or is already
+            // finalized. That is news about the module that answered, not
+            // about any other module sharing the process — and an ambiguous
+            // slot, whose module is `MODULE_UNRESOLVED`, gets to destroy
+            // nothing rather than everything.
+            let changed = self.retire_scope(process, Some(meta.module)) > 0;
             self.evidence.state_reconciliations += u64::from(changed);
             return true;
         }
@@ -1792,20 +1845,33 @@ impl State {
 
     /// Drops session-scoped state for `process`. `None` retires the whole
     /// process — every module's state, plus the process-scoped bookkeeping —
-    /// which is what a process exit, a pid reuse or `CKR_CRYPTOKI_NOT_INITIALIZED`
-    /// means. `Some(id)` retires one module's Cryptoki (`C_Finalize`) and
-    /// leaves every other module in that same process untouched.
+    /// which is what a process exit or a pid reuse means. `Some(id)` retires
+    /// one module's Cryptoki (`C_Finalize`, or a call answering
+    /// `CKR_CRYPTOKI_NOT_INITIALIZED`) and leaves every other module in that
+    /// same process untouched.
     ///
-    /// Returns whether the process had any state before the sweep; only
-    /// meaningful for the whole-process case, which is the only caller
-    /// reading it.
+    /// Returns whether *this scope* held any state before the sweep, so a
+    /// module-scoped call cannot report a reconciliation on the strength of
+    /// another module's live state.
     fn retire_scope(&mut self, process: ProcessKey, module: Option<ModuleId>) -> u64 {
-        let had_state = self.has_process_state(process);
-        // The `ProcessKey` is always required; the module narrows the sweep
-        // only when one module is finalizing.
-        let owned = |owner: &ProcessKey, session: &SessionRef| {
-            *owner == process && module.is_none_or(|id| session.module == id)
-        };
+        let had_state = self.has_scope_state(process, module);
+        let owned = scoped(process, module);
+        // Async ids first: `retire_session` below sets `owner = None` on the
+        // records it reaches, after which nothing can attribute them.
+        self.detached.retain(|(id, ..), detached| match module {
+            // C_Finalize kills every async id this module issued, adopted or
+            // floating: a later C_Initialize in the same module could mint an
+            // identical (module, slot, function, value) key and join a dead
+            // operation.
+            Some(finalizing) => *id != finalizing,
+            // A whole-process sweep can only reclaim what it still owns — the
+            // detached key carries no `ProcessKey`, so a record orphaned
+            // earlier by a `C_CloseSession` is unattributable and lives until
+            // MAX_PENDING eviction or capture end.
+            None => !detached
+                .owner
+                .is_some_and(|(owner, session)| owned(&owner, &session)),
+        });
         let sessions: Vec<SessionRef> = self
             .open
             .keys()
@@ -1825,14 +1891,6 @@ impl State {
             .retain(|(owner, session)| !owned(owner, session));
         self.pending
             .retain(|(owner, session, _), _| !owned(owner, session));
-        for detached in self.detached.values_mut() {
-            if detached
-                .owner
-                .is_some_and(|(owner, session)| owned(&owner, &session))
-            {
-                detached.owner = None;
-            }
-        }
         if module.is_none() {
             // Pseudonym numbering is per process and must not restart while
             // another module's sessions are still live under it.
@@ -1972,21 +2030,38 @@ impl State {
         (self.pending.len() + self.detached.len()) as u64
     }
     pub fn has_process_state(&self, process: ProcessKey) -> bool {
-        self.open.keys().any(|(owner, _)| *owner == process)
+        self.has_scope_state(process, None)
+    }
+
+    /// Whether `process` still holds session-scoped state. `Some(id)` asks
+    /// about one module's state only. Shares `scoped` with `retire_scope`, so
+    /// the question and the sweep that answers it cannot disagree.
+    fn has_scope_state(&self, process: ProcessKey, module: Option<ModuleId>) -> bool {
+        let owned = scoped(process, module);
+        self.open
+            .keys()
+            .any(|(owner, session)| owned(owner, session))
             || self
                 .active_ops
                 .keys()
-                .any(|(owner, _, _)| *owner == process)
-            || self.find_active.iter().any(|(owner, _)| *owner == process)
-            || self.pending.keys().any(|(owner, _, _)| *owner == process)
+                .any(|(owner, session, _)| owned(owner, session))
             || self
-                .detached
-                .values()
-                .any(|record| record.owner.is_some_and(|(owner, _)| owner == process))
+                .find_active
+                .iter()
+                .any(|(owner, session)| owned(owner, session))
+            || self
+                .pending
+                .keys()
+                .any(|(owner, session, _)| owned(owner, session))
+            || self.detached.values().any(|record| {
+                record
+                    .owner
+                    .is_some_and(|(owner, session)| owned(&owner, &session))
+            })
             || self
                 .inherited_ambiguous
                 .iter()
-                .any(|(owner, _)| *owner == process)
+                .any(|(owner, session)| owned(owner, session))
     }
     pub fn pid_has_process_state(&self, pid: u32) -> bool {
         self.current_process

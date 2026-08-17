@@ -38,16 +38,18 @@ quantitative claim there cites the script that measured it).
   concurrency, session lifecycle — with zero app changes.
 - **Migration dependency discovery** — which PKCS#11 subset and parameter
   combinations does the application *actually* depend on? Feed the observed
-  profile to [pkcs11-check](https://github.com/mingulov/pkcs11-check) /
-  `pkcs11-lab` to validate a candidate provider against real usage:
+  profile alongside [pkcs11-check](https://github.com/mingulov/pkcs11-check)
+  results to validate a candidate provider against real usage:
 
   ```bash
   p11scope doctor --pid 12345
   p11scope inspect --pid 12345
   sudo p11scope profile --pid 12345 -o observed-profile.json
-  pkcs11-check test --module /opt/candidate/lib/pkcs11.so --output-file candidate.json
-  pkcs11-lab assess --profile observed-profile.json --results candidate.json
+  pkcs11-check test --module /opt/candidate/lib/pkcs11.so --output json --output-file candidate.json
   ```
+
+  Combining those two artifacts into a migration assessment is the planned
+  `pkcs11-lab` integration; no `pkcs11-lab assess` command exists yet.
 
   `p11scope-discover` remains available as an optional offline path when a
   suitable manifest can be prepared for a provider the memory scan cannot
@@ -183,7 +185,7 @@ capture.
 | [pkcs11-check](https://github.com/mingulov/pkcs11-check) | Actively exercises and validates a provider |
 | **pkcs11-scope** | Passively observes real application behavior |
 | pkcs11-proxy-ng | Controlled interposition, transport, fault injection |
-| pkcs11-lab | Combines profiles and test results into migration assessments |
+| pkcs11-lab (planned) | Will combine profiles and test results into migration assessments |
 
 Integration boundary: the versioned `observed-profile.json` schema. The
 userspace side is Rust and reuses pkcs11-proxy-ng's PKCS#11 core (official

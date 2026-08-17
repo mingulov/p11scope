@@ -16,6 +16,9 @@
   `pkcs11-scope/observed-profile/v2` and `v2-metrics`, with
   `capture.modules[]`, per-function module identity, `evidence.discovery[]`,
   `authority: "hash-pinned"`, and explicit scan/corroboration/capacity gaps.
+  Top-level skip subjects retain exact standard function names but bound
+  object/process/scope losses to `discovery subject`, so cgroup scans do not
+  publish bystander paths or numeric PID labels.
 - **Known limit**: the memory scan runs only once, while attaching. A provider
   loaded later is missed; use a suitable pre-existing manifest when available
   and hash-matchable, or wait for Slice 1b-2 live discovery.

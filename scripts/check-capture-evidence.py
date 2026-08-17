@@ -87,6 +87,7 @@ VERSION_SHAPE_SCANNED = (1216, 104, 208, VERSION_SURFACES_SCANNED, 1, "ok")
 # The three tables the scan cannot reach in the version-matrix provider. Each is
 # an object-level skip naming the provider, not a lost table entry.
 VERSION_SCAN_SKIPS = 3
+DISCOVERY_SUBJECT = "discovery subject"
 G1_SURFACES = Counter({("full", 68): 1, ("full", 92): 1, ("not_walked", 0): 1})
 LEGACY_SURFACES = Counter({("full", 68): 1})
 
@@ -167,7 +168,8 @@ def entry_skips(evidence):
 
     `evidence.skipped` mixes two granularities the schema documents together:
     entry-level losses, whose `name` is the PKCS#11 function that was lost, and
-    object/process-level losses, whose `name` is an object path or `pid <n>`.
+    object/process-level losses, whose `name` is the bounded category
+    `discovery subject`.
     Only the first kind is an oracle a lane can state exactly — the second kind
     depends on what else the scan walked, which for a `--cgroup` lane is every
     process in that cgroup.
@@ -175,24 +177,17 @@ def entry_skips(evidence):
     return [item for item in evidence["skipped"] if item["name"].startswith("C_")]
 
 
-def module_skips(evidence):
-    """Object-level losses about a module this capture actually declared.
-
-    A `--cgroup` lane also sees losses about bystander processes that merely
-    share the cgroup (an object over the byte cap, a process that exited
-    mid-walk). Those cannot affect the attach plan of the module under test, so
-    they are not counted here; what the module itself lost is, exactly. The
-    shape assertion is what proves nothing the module *needed* went missing.
-    """
-    declared = {module["path"] for module in evidence["discovery"]}
-    return [
-        item
-        for item in evidence["skipped"]
-        if not item["name"].startswith("C_") and item["name"] in declared
-    ]
+def discovery_skips(evidence):
+    """Object/process/scope losses after capture-output subject bounding."""
+    for item in evidence["skipped"]:
+        require(
+            item["name"].startswith("C_") or item["name"] == DISCOVERY_SUBJECT,
+            f"unbounded capture skip subject: {item}",
+        )
+    return [item for item in evidence["skipped"] if item["name"] == DISCOVERY_SUBJECT]
 
 
-def exact_common(evidence, *, aliases, skipped, in_flight, module_skipped=0):
+def exact_common(evidence, *, aliases, skipped, in_flight, discovery_skipped=0):
     require(evidence["attach_failures"] == [], evidence["attach_failures"])
     require(evidence["aliased"] == aliases, f"unexpected aliases: {evidence['aliased']}")
     require(
@@ -200,8 +195,8 @@ def exact_common(evidence, *, aliases, skipped, in_flight, module_skipped=0):
         f"unexpected entry skips: {entry_skips(evidence)}",
     )
     require(
-        len(module_skips(evidence)) == module_skipped,
-        f"module-level skips: want {module_skipped}, got {module_skips(evidence)}",
+        len(discovery_skips(evidence)) == discovery_skipped,
+        f"discovery skips: want {discovery_skipped}, got {discovery_skips(evidence)}",
     )
     require(evidence["in_flight_at_end"] == in_flight, evidence["in_flight_at_end"])
     require(evidence["templates_truncated"] is False, "templates were truncated")
@@ -355,7 +350,7 @@ def validate_proxy_capacity_fallback(document):
     scan_skips = evidence["skipped"]
     require(len(scan_skips) == 3, f"unexpected scan skips: {scan_skips}")
     for skip in scan_skips:
-        require("p11-kit" in skip["name"].lower(), skip)
+        require(skip["name"] == DISCOVERY_SUBJECT, skip)
         require(
             re.fullmatch(
                 r"a 3\.0 table header extends past the object's file-backed data "
@@ -481,7 +476,7 @@ def validate_canary(lane, document):
         aliases=[],
         skipped=[],
         in_flight=0,
-        module_skipped=VERSION_SCAN_SKIPS if scanned else 0,
+        discovery_skipped=VERSION_SCAN_SKIPS if scanned else 0,
     )
     allowances = dict(
         SAFE_ALLOWANCES if policy == "safe" else UNSAFE_ALLOWANCES if policy == "unsafe" else {}
@@ -631,15 +626,14 @@ def discovery_fixture(sources=("scan",)):
     ]
 
 
-# An object-level skip as the scan emits one: the subject is the provider path,
-# not a function name, and it records a table the scan could not reach at all.
-MODULE_SKIP = {
-    "name": MODULE_FIXTURE["path"],
+# An object-level scan loss after capture-output subject bounding.
+DISCOVERY_SKIP = {
+    "name": DISCOVERY_SUBJECT,
     "reason": "a 3.0 table header extends past the object's file-backed data",
 }
 
 
-def evidence_fixture(surfaces, sources=("scan",), module_skipped=0):
+def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
     return {
         "authority": "hash-pinned",
         "discovery": discovery_fixture(sources),
@@ -651,7 +645,7 @@ def evidence_fixture(surfaces, sources=("scan",), module_skipped=0):
         "attached_probes": 0,
         "attach_failures": [],
         "aliased": [],
-        "skipped": [dict(MODULE_SKIP) for _ in range(module_skipped)],
+        "skipped": [dict(DISCOVERY_SKIP) for _ in range(discovery_skipped)],
         "in_flight_at_end": 0,
         "surfaces": [
             {"walk": walk, "functions": functions, "acquisition": "ok"}
@@ -783,7 +777,7 @@ def self_test():
     ]
     proxy["evidence"]["skipped"] = [
         {
-            "name": "/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.3.1",
+            "name": DISCOVERY_SUBJECT,
             "reason": "a 3.0 table header extends past the object's file-backed data "
             f"(744 bytes needed, {available} available); a table built at run time in "
             ".bss or on the heap is outside the memory scan's reach",
@@ -814,7 +808,7 @@ def self_test():
     version = evidence_fixture(
         VERSION_SURFACES_SCANNED,
         sources=("scan", "manifest"),
-        module_skipped=VERSION_SCAN_SKIPS,
+        discovery_skipped=VERSION_SCAN_SKIPS,
     )
     version.update(
         table_entries=1216,
@@ -827,6 +821,15 @@ def self_test():
     safe = document_fixture(copy.deepcopy(version))
     safe["evidence"].update(SAFE_ALLOWANCES)
     validate_canary("default-safe-profile", safe)
+    for leaked_subject in (
+        "/home/operator/private/bystander",
+        "pid 4242",
+        "/sys/fs/cgroup/user.slice/private.scope",
+    ):
+        bad = copy.deepcopy(safe)
+        bad["evidence"]["skipped"][0]["name"] = leaked_subject
+        rejected(lambda bad=bad: validate_canary("default-safe-profile", bad))
+    print("capture skip subjects are bounded before JSON output: OK")
     bad = copy.deepcopy(safe)
     bad["evidence"]["attached_probes"] = 206
     rejected(lambda: validate_canary("default-safe-profile", bad))

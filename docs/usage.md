@@ -254,7 +254,7 @@ summary line instead of 136 unexplained repeats:
 ```
 attach failed (slot 0): p11_entry at /usr/lib/softhsm/libsofthsm2.so+0x265b0: `perf_event_open` failed: Permission denied (os error 13)
 ...
-p11scope: 0/136 attach attempts failed, every one the same way — this almost always means the environment cannot attach BPF uprobes at all: missing CAP_BPF/CAP_SYS_ADMIN (or root), a kernel lockdown mode, or a restrictive kernel.perf_event_paranoid sysctl. First underlying error: p11_entry at /usr/lib/softhsm/libsofthsm2.so+0x265b0: `perf_event_open` failed: Permission denied (os error 13)
+p11scope: 136/136 attach attempts failed, every one the same way — this almost always means the environment cannot attach BPF uprobes at all: missing CAP_BPF/CAP_SYS_ADMIN (or root), a kernel lockdown mode, or a restrictive kernel.perf_event_paranoid sysctl. First underlying error: p11_entry at /usr/lib/softhsm/libsofthsm2.so+0x265b0: `perf_event_open` failed: Permission denied (os error 13)
 ```
 
 The tool keeps running with `attached_probes: 0`,
@@ -406,10 +406,13 @@ What this tool proves, and what it deliberately does not claim to:
   tell which name was actually called — there is nothing to disambiguate
   from a file offset alone. This is reported honestly as a group, not
   guessed apart.
-- **Requested attributes are what the application asked for, never the
-  key's effective policy.** Template attribute types and the 11
-  policy-boolean flags (`docs/privacy/allowlist-v1.md`, entries 6-7) are
-  recorded as `requested: true` — what the app's `CK_ATTRIBUTE` template
+- **In unsafe diagnostic captures, requested attributes are what the
+  application asked for, never the key's effective policy.** Template
+  attribute types and the 11
+  policy-boolean flags are available only in a build compiled with
+  `unsafe-unvalidated-metadata` and run with the matching flag; the default
+  `allowlisted` release does not contain these pointer-following decoders.
+  They are recorded as `requested: true` — what the app's `CK_ATTRIBUTE` template
   said. Whether the provider actually *honored* that request (granted
   `CKA_EXTRACTABLE`, enforced `CKA_SENSITIVE`) is a different question
   this tool does not answer; verifying effective policy against a
@@ -422,8 +425,8 @@ What this tool proves, and what it deliberately does not claim to:
 ## Related docs
 
 - [`docs/privacy/allowlist-v1.md`](privacy/allowlist-v1.md) — the
-  field-by-field decoder inventory, current hostile-pointer limitation, and
-  the canary work still required for the safe/diagnostic policy split.
+  field-by-field decoder inventory, policy boundary, and implemented
+  hostile-pointer canary coverage.
 - [`docs/schema/observed-profile-v2.md`](schema/observed-profile-v2.md) —
   the versioned `observed-profile.json` schema (current:
   `pkcs11-scope/observed-profile/v2`), the integration boundary

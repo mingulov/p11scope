@@ -226,13 +226,14 @@ assert ev["attached_probes"] == 2 * ev["slots"], (ev["attached_probes"], ev["slo
 
 # The common shared-layer lane must collapse matching overlay mappings, but the
 # predicate is heuristic. Require exactly one published uncertainty in broad scope
-# and none in either leaf scope; its subject includes the discarded mapping key.
+# and none in either leaf scope. Capture output bounds its subject so a
+# bystander mapping path or process identity cannot escape into evidence.
 uncertainty = [
     item for item in ev["skipped"]
     if "cannot prove physical identity" in item["reason"]
 ]
 assert len(uncertainty) == expected_collapses, (expected_collapses, uncertainty)
-assert all("ObjectKey" in item["name"] for item in uncertainty), uncertainty
+assert all(item["name"] == "discovery subject" for item in uncertainty), uncertainty
 
 # Two module entries with one digest would mean the matching provider bytes were
 # attached twice. Because a uprobe is registered per kernel (inode, offset), that

@@ -399,12 +399,14 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     optional, evidence `discovery[]`/`authority`, schema v2. The eBPF object is unchanged.
     Scanning happens once at attach time; a module loaded later is not discovered (1b-2).
     **Status (2026-08-17): implementation tasks and their task-local reviews are complete on
-    the recovery branch; this Task 15 commit reconciles the documentation, and final
-    whole-branch review is pending. Range `3b7c067..fdde185` is 37 code commits,
-    plus this Task 15 documentation commit; combined delta across the 38 commits is 57 files,
-    13,463 insertions, 1,348 deletions (net +12,115 lines). Fresh Task 15 verification: the
-    four Rust checks passed (295 tests, 0 failed) and `scripts/verify-inspect-doctor.sh`
-    reported `ALL OK`. Owner-approved root artifact evidence from Tasks 14, 16,
+    the recovery branch; the Task 15 documentation commit and its round-1 review-fix commit
+    reconcile the documentation and privacy boundary, and final whole-branch review is
+    pending. Range `3b7c067..fdde185` is 37 pre-Task-15 implementation/recovery commits;
+    with the two Task 15 commits, the combined 39-commit delta is 57 files, 13,578
+    insertions, 1,384 deletions (net +12,194 lines). Fresh round-2 verification: the four
+    Rust checks passed (296 tests, 0 failed), `scripts/verify-inspect-doctor.sh` reported
+    `ALL OK`, and the capture-evidence and canary self-tests passed. Owner-approved root
+    artifact evidence from Tasks 14, 16,
     and 17: `scripts/gates.sh`, `build-release.sh`, and matrix docker,
     fork-scope, oracle, kind-pod, and Knative lanes passed in Task 14; shared-layer passed
     after Task 16 with one published overlay physical-identity uncertainty (therefore

@@ -81,48 +81,12 @@ provision_preflight() {
     done
 }
 
-provision_jammy() {
-    provision_preflight /var/tmp/slice1b2-rustup-home /var/tmp/slice1b2-cargo-home
-    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update
-    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        gcc libc6-dev binutils ca-certificates
-    /var/tmp/slice1b2-toolchain/rustup toolchain install 1.88.0 --profile minimal
-}
-
 require_free_bytes() {
     local label=$1 path=$2 available
     available=$(df --output=avail -B1 "$path" | tail -n 1)
     [[ $available =~ ^[0-9]+$ ]] || return 64
     (( available >= 2147483648 )) || return 64
     printf '%s=%s\n' "$label" "$available"
-}
-
-vm_start() {
-    local lane=$1 run_dir=$2 config retained_overlay initial_serial ssh_port expected_fingerprint
-    local lock_file=/tmp/p11scope-slice1b2-spike-vm.lock
-    umask 077
-    exec {vm_lock_fd}>"$lock_file"
-    flock -n "$vm_lock_fd" || return 75
-    IFS='|' read -r retained_overlay initial_serial ssh_port expected_fingerprint < <(lane_config "$lane")
-    [[ ! -e $run_dir && ! -L $run_dir ]] || return 64
-    [[ $(stat -c '%a' "$retained_overlay") == 444 ]] || return 64
-    require_free_bytes before-overlay "$(dirname "$run_dir")"
-    mkdir -m 0700 "$run_dir"
-    qemu-img create -f qcow2 -F qcow2 -b "$retained_overlay" "$run_dir/runtime.qcow2"
-    chmod 0600 "$run_dir/runtime.qcow2"
-    qemu-img info --backing-chain --output=json "$run_dir/runtime.qcow2" \
-        >"$run_dir/backing-chain.before.json"
-    require_free_bytes before-boot "$run_dir"
-    qemu-system-x86_64 -accel tcg,thread=multi -cpu max -machine q35 -m 1024 -smp 2 \
-        -drive "file=$run_dir/runtime.qcow2,if=virtio,format=qcow2" \
-        -netdev "user,id=n1,hostfwd=tcp:127.0.0.1:$ssh_port-:22" \
-        -device virtio-net-pci,netdev=n1 -display none -serial "file:$run_dir/serial.log" \
-        -no-reboot -daemonize -pidfile "$run_dir/qemu.pid"
-    printf '%s\n%s\n' "$initial_serial" "$expected_fingerprint" >"$run_dir/lane-trust.txt"
-    qemu-img check "$run_dir/runtime.qcow2" >"$run_dir/qemu-img-check.txt"
-    qemu-img info --backing-chain --output=json "$run_dir/runtime.qcow2" \
-        >"$run_dir/backing-chain.after.json"
-    require_free_bytes after-shutdown-export "$run_dir"
 }
 
 fixed_inventory() {
@@ -182,15 +146,16 @@ export_evidence() {
 }
 
 build_fixture() {
-    local output=$1 here target
+    local output=$1 here target disassembly
     umask 077
     here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
     [[ ! -e $output && ! -L $output ]] || return 64
     gcc -std=c11 -O2 -Wall -Wextra -Werror -pthread -fno-lto -Wl,--export-dynamic \
         -o "$output" "$here/fixture.c"
+    disassembly=$(objdump -dr "$output")
     for target in spike_get_function_list spike_get_interface_list spike_stop_hook spike_late_target; do
         nm -D "$output" | awk -v target="$target" '$3 == target { found=1 } END { exit !found }'
-        objdump -dr "$output" | grep -Eq "call(q)?[[:space:]].*<$target(@plt)?>"
+        grep -E "call(q)?[[:space:]].*<$target(@plt)?>" <<<"$disassembly" >/dev/null
     done
     "$output" --self-check
 }
@@ -202,12 +167,12 @@ run_main() {
             build_fixture "$2"
             ;;
         provision-jammy)
-            [[ $# == 1 ]] || return 64
-            provision_jammy
+            printf 'provision-jammy unavailable until source and tool provenance are verified\n' >&2
+            return 64
             ;;
         vm-start)
-            [[ $# == 3 ]] || return 64
-            vm_start "$2" "$3"
+            printf 'vm-start unavailable until complete lifecycle is implemented\n' >&2
+            return 64
             ;;
         *)
             printf 'usage: run.sh {build-fixture OUT|provision-jammy|vm-start LANE NEW_RUN_DIR}\n' >&2

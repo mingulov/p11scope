@@ -292,7 +292,9 @@ pub struct CleanupFacts {
 }
 
 pub fn cleanup_oracle_pass(facts: CleanupFacts) -> bool {
-    (!facts.may_be_stopped || (facts.resume_attempts == 1 && facts.resume_via_original_pidfd))
+    facts.resume_attempts <= 1
+        && (facts.resume_attempts == 0 || facts.resume_via_original_pidfd)
+        && (!facts.may_be_stopped || facts.resume_attempts == 1)
         && facts.kill_via_original_pidfd
         && facts.reaped
 }
@@ -692,12 +694,10 @@ fn valid_hex(value: &str, length: usize) -> bool {
 }
 
 fn safe_archive_path(value: &str) -> bool {
-    let path = Path::new(value);
-    let mut components = path.components();
-    !path.is_absolute()
-        && matches!(components.next(), Some(std::path::Component::Normal(name)) if name == "source")
+    let mut components = value.split('/');
+    components.next() == Some("source")
         && components.clone().next().is_some()
-        && components.all(|component| matches!(component, std::path::Component::Normal(_)))
+        && components.all(|component| !matches!(component, "" | "." | ".."))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -755,7 +755,7 @@ pub fn compare_oracles(facts: &CompareFacts) -> bool {
     maps_match
         && cases.len() == 5
         && cases.values().all(|case| gate_a_case_pass(case))
-        && !facts.signal_runs.is_empty()
+        && facts.signal_runs.len() == 20
         && facts.signal_runs.iter().all(signal_oracle_pass)
 }
 
@@ -1225,6 +1225,28 @@ mod tests {
             resume_via_original_pidfd: false,
             ..valid
         }));
+
+        let unstopped = CleanupFacts {
+            may_be_stopped: false,
+            resume_attempts: 0,
+            resume_via_original_pidfd: false,
+            kill_via_original_pidfd: true,
+            reaped: true,
+        };
+        assert!(cleanup_oracle_pass(unstopped));
+        assert!(!cleanup_oracle_pass(CleanupFacts {
+            resume_attempts: 2,
+            ..unstopped
+        }));
+        assert!(!cleanup_oracle_pass(CleanupFacts {
+            resume_attempts: 1,
+            ..unstopped
+        }));
+        assert!(cleanup_oracle_pass(CleanupFacts {
+            resume_attempts: 1,
+            resume_via_original_pidfd: true,
+            ..unstopped
+        }));
     }
 
     #[test]
@@ -1326,6 +1348,33 @@ mod tests {
             }"#,
         )
         .unwrap();
+        for invalid_path in [
+            "",
+            ".",
+            "..",
+            "/source/alpha",
+            "source",
+            "source/",
+            "source//alpha",
+            "source/./alpha",
+            "source/../alpha",
+            "source/alpha/",
+            "source/alpha//beta",
+            "source/alpha/./beta",
+            "source/alpha/../beta",
+        ] {
+            let json = format!(
+                r#"{{
+                    "source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "source_archive_sha256":"ffafba2e642d1140e4f89b3fce5c001817234ea494378196f5e4afa6f7c44524",
+                    "members":[{{"path":"{invalid_path}","git_mode":33188,"type":"regular","sha256":"8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8"}}]
+                }}"#
+            );
+            assert!(
+                SourceManifest::parse(json.as_bytes()).is_err(),
+                "accepted aliased source member path {invalid_path:?}"
+            );
+        }
         let inventory = vec![
             InventoryMember {
                 path: "source/alpha".into(),
@@ -1357,30 +1406,85 @@ mod tests {
         let valid = CompareFacts {
             gate_a_cases: valid_gate_a_cases(),
             maps: valid_maps(),
-            signal_runs: vec![valid_signal()],
+            signal_runs: vec![valid_signal(); 20],
         };
         assert!(compare_oracles(&valid));
+        let mut short = valid.clone();
+        short.signal_runs.pop();
+        assert!(!compare_oracles(&short));
+        let mut long = valid.clone();
+        long.signal_runs.push(valid_signal());
+        assert!(!compare_oracles(&long));
 
         for case_index in 0..valid.gate_a_cases.len() {
             for mutate in 0..9 {
                 let mut changed = valid.clone();
                 let case = &mut changed.gate_a_cases[case_index];
                 match mutate {
-                    0 => case.entry_attach_attempts += 1,
-                    1 => case.entry_attach_accepted = false,
-                    2 => case.return_attach_attempts += 1,
-                    3 => case.return_attach_accepted = false,
-                    4 => case.entry_link_detached = false,
-                    5 => case.return_link_detached = false,
-                    6 => case.start_empty = false,
-                    7 => case.records[0].all_usable_pointers_nonzero = false,
-                    8 => case.records[0].all_usable_pointers_equal_fixture = false,
+                    0 => {
+                        case.case = match case.case {
+                            GateACaseId::Full104 => GateACaseId::GuardAfter7,
+                            _ => GateACaseId::Full104,
+                        }
+                    }
+                    1 => case.entry_attach_attempts += 1,
+                    2 => case.entry_attach_accepted = false,
+                    3 => case.return_attach_attempts += 1,
+                    4 => case.return_attach_accepted = false,
+                    5 => case.entry_link_detached = false,
+                    6 => case.return_link_detached = false,
+                    7 => case.start_empty = false,
+                    8 => {
+                        case.records.pop();
+                    }
                     _ => unreachable!(),
                 }
                 assert!(
                     !compare_oracles(&changed),
                     "accepted case mutation {case_index}/{mutate}"
                 );
+            }
+            for counter in 0..5 {
+                let mut changed = valid.clone();
+                changed.gate_a_cases[case_index].counters_before[counter] += 1;
+                assert!(
+                    !compare_oracles(&changed),
+                    "accepted case counter-before mutation {case_index}/{counter}"
+                );
+                let mut changed = valid.clone();
+                changed.gate_a_cases[case_index].counters_after[counter] += 1;
+                assert!(
+                    !compare_oracles(&changed),
+                    "accepted case counter-after mutation {case_index}/{counter}"
+                );
+            }
+            for record_index in 0..valid.gate_a_cases[case_index].records.len() {
+                for field in 0..6 {
+                    let mut changed = valid.clone();
+                    let record = &mut changed.gate_a_cases[case_index].records[record_index];
+                    match field {
+                        0 => record.usable_n = record.usable_n.wrapping_add(1),
+                        1 => record.pointers_attempted = record.pointers_attempted.wrapping_add(1),
+                        2 => record.completed_prefix = record.completed_prefix.wrapping_add(1),
+                        3 => {
+                            record.name_class = match record.name_class {
+                                NameClass::ExactStandard => NameClass::Other,
+                                NameClass::Other => NameClass::Null,
+                                NameClass::Null => NameClass::Unreadable,
+                                NameClass::Unreadable | NameClass::NotApplicable => {
+                                    NameClass::ExactStandard
+                                }
+                            }
+                        }
+                        4 => record.all_usable_pointers_nonzero = false,
+                        5 => record.all_usable_pointers_equal_fixture = false,
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        !compare_oracles(&changed),
+                        "accepted case record mutation {case_index}/{record_index}/{field}"
+                    );
+                }
             }
         }
 
@@ -1404,28 +1508,40 @@ mod tests {
             }
         }
 
-        for field in 0..18 {
+        for field in 0..30 {
             let mut changed = valid.clone();
             let signal = &mut changed.signal_runs[0];
             match field {
-                0 => signal.stop_request_accepted = false,
-                1 => signal.stopped_snapshot_1_exact_expected_task_set = false,
-                2 => signal.stopped_snapshot_1_all_tasks_stopped = false,
-                3 => signal.stopped_snapshot_2_exact_expected_task_set = false,
-                4 => signal.stopped_snapshot_2_all_tasks_stopped = false,
-                5 => signal.pre_stop_marker_observed = true,
-                6 => signal.post_attach_exact_expected_task_set = false,
-                7 => signal.post_attach_all_tasks_stopped = false,
-                8 => signal.post_attach_marker_observed = true,
-                9 => signal.signal_attach_attempts += 1,
-                10 => signal.signal_attach_accepted = false,
-                11 => signal.late_attach_attempts += 1,
-                12 => signal.late_attach_accepted = false,
-                13 => signal.signal_link_detached = false,
-                14 => signal.late_link_detached = false,
-                15 => signal.resume_via_original_pidfd = false,
-                16 => signal.post_resume_marker_observed = false,
-                17 => signal.reaped = false,
+                0 => signal.hook_ts_ns += 1,
+                1 => signal.send_signal_rc = -1,
+                2 => signal.stop_request_accepted = false,
+                3 => signal.expected_task_count += 1,
+                4 => signal.stopped_snapshot_1_count += 1,
+                5 => signal.stopped_snapshot_2_count += 1,
+                6 => signal.stopped_snapshot_1_exact_expected_task_set = false,
+                7 => signal.stopped_snapshot_1_all_tasks_stopped = false,
+                8 => signal.stopped_snapshot_2_exact_expected_task_set = false,
+                9 => signal.stopped_snapshot_2_all_tasks_stopped = false,
+                10 => signal.pre_stop_marker_observed = true,
+                11 => signal.post_attach_task_count += 1,
+                12 => signal.post_attach_exact_expected_task_set = false,
+                13 => signal.post_attach_all_tasks_stopped = false,
+                14 => signal.post_attach_marker_observed = true,
+                15 => signal.signal_attach_attempts += 1,
+                16 => signal.signal_attach_accepted = false,
+                17 => signal.late_attach_attempts += 1,
+                18 => signal.late_attach_accepted = false,
+                19 => signal.signal_link_detached = false,
+                20 => signal.late_link_detached = false,
+                21 => signal.last_attach_ts_ns += 1,
+                22 => signal.attach_gap_ms += 0.5,
+                23 => signal.pidfd_resume_attempts += 1,
+                24 => signal.pidfd_resume_rc = -1,
+                25 => signal.resume_via_original_pidfd = false,
+                26 => signal.post_resume_marker_observed = false,
+                27 => signal.late_hits += 1,
+                28 => signal.child_exit = 1,
+                29 => signal.reaped = false,
                 _ => unreachable!(),
             }
             assert!(
@@ -1493,29 +1609,53 @@ mod tests {
 
     #[test]
     fn vm_runner_serializes_and_enforces_three_exact_free_space_gates() {
-        let source =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh")).unwrap();
-        assert!(source.contains("/tmp/p11scope-slice1b2-spike-vm.lock"));
-        assert!(source.contains("flock -n"));
-        assert!(source.contains("available >= 2147483648"));
-        assert_eq!(
-            source.matches("require_free_bytes before-overlay").count(),
-            1
-        );
-        assert_eq!(source.matches("require_free_bytes before-boot").count(), 1);
-        assert_eq!(
-            source
-                .matches("require_free_bytes after-shutdown-export")
-                .count(),
-            1
-        );
-        let overlay = source.find("require_free_bytes before-overlay").unwrap();
-        let boot = source.find("require_free_bytes before-boot").unwrap();
-        let final_gate = source
-            .find("require_free_bytes after-shutdown-export")
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("vm-disabled");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let df = bin.join("df");
+        std::fs::write(&df, "#!/bin/sh\nprintf 'Avail\\n%s\\n' \"$DF_AVAILABLE\"\n").unwrap();
+        std::fs::set_permissions(&df, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let body = "source \"$1\"; require_free_bytes before-overlay \"$2\"";
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let exact = Command::new("bash")
+            .arg("-c")
+            .arg(body)
+            .arg("bash")
+            .arg(script)
+            .arg(temp.path())
+            .env("PATH", &path)
+            .env("DF_AVAILABLE", "2147483648")
+            .output()
             .unwrap();
-        assert!(overlay < boot && boot < final_gate);
-        assert!(source.contains("-no-reboot"));
+        assert!(exact.status.success());
+        assert_eq!(exact.stdout, b"before-overlay=2147483648\n");
+        let short = Command::new("bash")
+            .arg("-c")
+            .arg(body)
+            .arg("bash")
+            .arg(script)
+            .arg(temp.path())
+            .env("PATH", &path)
+            .env("DF_AVAILABLE", "2147483647")
+            .status()
+            .unwrap();
+        assert!(!short.success());
+
+        let existing = temp.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let disabled = Command::new(script)
+            .arg("vm-start")
+            .arg("jammy")
+            .arg(&existing)
+            .output()
+            .unwrap();
+        assert_eq!(disabled.status.code(), Some(64));
+        assert_eq!(
+            disabled.stderr,
+            b"vm-start unavailable until complete lifecycle is implemented\n"
+        );
+        assert!(std::fs::read_dir(existing).unwrap().next().is_none());
     }
 
     fn shell_lines(script: &str, body: &str, args: &[&OsStr]) -> Vec<String> {
@@ -1533,6 +1673,49 @@ mod tests {
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    #[test]
+    fn build_fixture_strict_mode_reaches_self_check() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("strict-fixture");
+        let wrapper = temp.path().join("bin");
+        std::fs::create_dir(&wrapper).unwrap();
+        let real_objdump = String::from_utf8(
+            Command::new("sh")
+                .arg("-c")
+                .arg("command -v objdump")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let objdump = wrapper.join("objdump");
+        std::fs::write(
+            &objdump,
+            format!(
+                "#!/bin/sh\n{} \"$@\"\nawk 'BEGIN {{ for (i=0; i<262144; i++) print \"padding\" }}'\n",
+                real_objdump.trim()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&objdump, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new(script)
+            .arg("build-fixture")
+            .arg(temp.path().join("fixture"))
+            .env(
+                "PATH",
+                format!("{}:{}", wrapper.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "strict build failed: status={:?} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"fixture-self-check: OK\n");
     }
 
     #[test]
@@ -1590,6 +1773,17 @@ mod tests {
         let rustup = temp.path().join("rustup");
         let cargo = temp.path().join("cargo");
         let body = "source \"$1\"; provision_preflight \"$2\" \"$3\"";
+
+        let disabled = Command::new(script)
+            .arg("provision-jammy")
+            .env("RUSTFLAGS", "refuse-before-network")
+            .output()
+            .unwrap();
+        assert_eq!(disabled.status.code(), Some(64));
+        assert_eq!(
+            disabled.stderr,
+            b"provision-jammy unavailable until source and tool provenance are verified\n"
+        );
 
         let rejected = Command::new("bash")
             .arg("-c")

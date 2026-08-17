@@ -178,6 +178,55 @@ fn emit_discovery(args: &EmitArgs) {
     entry.submit(0);
 }
 
+#[inline(never)]
+fn emit_interface(
+    base: u64,
+    case_id: u8,
+    interface_index: usize,
+    announced_count: u32,
+) -> bool {
+    let address = base + interface_index as u64 * 24;
+    // SAFETY: each bounded address names one live fixture CK_INTERFACE value.
+    let Ok([name, table, flags]) =
+        (unsafe { helpers::bpf_probe_read_user(address as *const [u64; 3]) })
+    else {
+        increment_counter(READ_FAILURES);
+        return false;
+    };
+    let name_class = if name == 0 {
+        NULL
+    } else {
+        let mut bytes = [0u8; 8];
+        // SAFETY: the helper bounds the read to the private stack buffer.
+        let read = unsafe {
+            helpers::generated::bpf_probe_read_user_str(
+                bytes.as_mut_ptr().cast(),
+                bytes.len() as u32,
+                name as *const core::ffi::c_void,
+            )
+        };
+        if read < 0 {
+            increment_counter(READ_FAILURES);
+            UNREADABLE
+        } else if read == 8 && bytes == *b"PKCS 11\0" {
+            EXACT_STANDARD
+        } else {
+            OTHER
+        }
+    };
+    emit_discovery(&EmitArgs {
+        kind: INTERFACE,
+        case_id,
+        interface_index: interface_index as u8,
+        name_class,
+        interface_flags: flags,
+        table_ptr: table,
+        announced_count,
+        read_table: name_class == EXACT_STANDARD,
+    });
+    true
+}
+
 #[uprobe]
 pub fn function_list_entry(ctx: ProbeContext) -> u32 {
     let key = state_key(&ctx);
@@ -251,50 +300,20 @@ pub fn interface_list_return(ctx: RetProbeContext) -> u32 {
     if count > 16 {
         increment_counter(TRUNCATED);
     }
+    let announced_count = count.min(u32::MAX as u64) as u32;
     let mut interface_index = 0usize;
     while interface_index < 16 {
         if interface_index as u64 >= count {
             break;
         }
-        let address = state.arg0 + interface_index as u64 * 24;
-        // SAFETY: each bounded address names one live fixture CK_INTERFACE value.
-        let Ok([name, table, flags]) =
-            (unsafe { helpers::bpf_probe_read_user(address as *const [u64; 3]) })
-        else {
-            increment_counter(READ_FAILURES);
+        if !emit_interface(
+            state.arg0,
+            key.attach_cookie as u8,
+            interface_index,
+            announced_count,
+        ) {
             break;
-        };
-        let name_class = if name == 0 {
-            NULL
-        } else {
-            let mut bytes = [0u8; 8];
-            // SAFETY: the helper bounds the read to the private stack buffer.
-            let read = unsafe {
-                helpers::generated::bpf_probe_read_user_str(
-                    bytes.as_mut_ptr().cast(),
-                    bytes.len() as u32,
-                    name as *const core::ffi::c_void,
-                )
-            };
-            if read < 0 {
-                increment_counter(READ_FAILURES);
-                UNREADABLE
-            } else if read == 8 && bytes == *b"PKCS 11\0" {
-                EXACT_STANDARD
-            } else {
-                OTHER
-            }
-        };
-        emit_discovery(&EmitArgs {
-            kind: INTERFACE,
-            case_id: key.attach_cookie as u8,
-            interface_index: interface_index as u8,
-            name_class,
-            interface_flags: flags,
-            table_ptr: table,
-            announced_count: count.min(u32::MAX as u64) as u32,
-            read_table: name_class == EXACT_STANDARD,
-        });
+        }
         interface_index += 1;
     }
     0

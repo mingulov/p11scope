@@ -2759,6 +2759,8 @@ mod tests {
         assert!(source.contains("Array::with_max_entries(5, 0)"));
         assert!(source.contains("while pointer_index < 104"));
         assert!(source.contains("while interface_index < 16"));
+        assert!(source.contains("#[inline(never)]\nfn emit_interface("));
+        assert!(source.contains("if !emit_interface("));
         assert!(source.contains("while word < 112"));
         assert!(
             source.contains("START.insert(&key, &state, aya_ebpf::bindings::BPF_NOEXIST as u64)")

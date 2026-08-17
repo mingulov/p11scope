@@ -22,6 +22,9 @@ pub const MAX_OBJECT_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(feature = "identify")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MappingFileKey {
+    /// The fd's mount identity from `/proc/self/fdinfo`. Zero only for lexical
+    /// map-derived values that have no opened fd and are therefore not comparable.
+    pub mount_id: u64,
     pub device_major: u64,
     pub device_minor: u64,
     pub inode: u64,
@@ -103,6 +106,9 @@ pub fn mapping_file_key(file: &std::fs::File) -> Result<MappingFileKey, String> 
         .lines()
         .find_map(|line| line.strip_prefix("mnt_id:\t"))
         .ok_or_else(|| "fd mount identity is missing".to_string())?;
+    let parsed_mount_id = mount_id
+        .parse()
+        .map_err(|_| format!("invalid fd mount identity {mount_id:?}"))?;
     let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
         .map_err(|error| format!("reading mount table failed: {error}"))?;
     let device = mountinfo
@@ -118,6 +124,7 @@ pub fn mapping_file_key(file: &std::fs::File) -> Result<MappingFileKey, String> 
         .split_once(':')
         .ok_or_else(|| format!("invalid mount device {device:?}"))?;
     Ok(MappingFileKey {
+        mount_id: parsed_mount_id,
         device_major: major
             .parse()
             .map_err(|_| format!("invalid mount device {device:?}"))?,

@@ -130,28 +130,19 @@ fn proc_root_path_opens_the_same_inode_the_mapping_names() {
     let via_root = format!("/proc/self/root{path}");
     let file = p11scope_manifest::identity::open_object(std::path::Path::new(&via_root))
         .expect("open through /proc/self/root");
-    let key = p11scope_manifest::identity::mapping_file_key(&file);
-    match key {
-        Ok(key) => {
-            assert_eq!(
-                key.inode, exe.inode,
-                "inode via /proc/self/root must match the mapping"
-            );
-            assert_eq!(
-                (key.device_major, key.device_minor),
-                (exe.device.major, exe.device.minor),
-                "mountinfo-derived device must match the mapping's device"
-            );
-        }
-        Err(error) => {
-            eprintln!("MEASURED: mapping_file_key unavailable on this filesystem: {error}");
-            // No mountinfo-derived device to check, but the identity claim still has to
-            // hold: fall back to plain fstat and prove the inode agrees with the mapping.
-            let fallback_inode = std::os::unix::fs::MetadataExt::ino(&file.metadata().unwrap());
-            assert_eq!(
-                fallback_inode, exe.inode,
-                "mapping_file_key unavailable ({error}); fstat fallback inode must still match the mapping"
-            );
-        }
-    }
+    let key = p11scope_manifest::identity::mapping_file_key(&file)
+        .expect("an unavailable full mapping identity must fail closed, never fall back to inode");
+    assert!(
+        key.mount_id > 0,
+        "the fd's parsed mount identity is required"
+    );
+    assert_eq!(
+        key.inode, exe.inode,
+        "inode via /proc/self/root must match the mapping"
+    );
+    assert_eq!(
+        (key.device_major, key.device_minor),
+        (exe.device.major, exe.device.minor),
+        "mountinfo-derived device must match the mapping's device"
+    );
 }

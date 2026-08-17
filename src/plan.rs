@@ -10,7 +10,7 @@
 //! and go through the same `merge`, so there is exactly one implementation of the
 //! merge rules rather than two that can drift.
 
-use crate::discovery::scan::ScannedModule;
+use crate::discovery::identity::{PinnedObjectId, PinnedObjects, ReconciledModule};
 pub use crate::discovery::scan::Skipped;
 use p11scope_ebpf_common::{MAX_SLOTS, SlotSemantics};
 use p11scope_manifest::manifest::{
@@ -29,7 +29,7 @@ pub struct Slot {
     pub index: u32,
     /// The object the probe attaches into — a table entry may legally point
     /// into a dependency rather than the module that published it.
-    pub object: ObjectKey,
+    pub object: PinnedObjectId,
     /// That object's pathname as discovery saw it, for messages only.
     pub object_path: String,
     pub file_offset: u64,
@@ -64,6 +64,7 @@ pub struct TableSummary {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleSummary {
     pub id: ModuleId,
+    pub object: PinnedObjectId,
     pub key: ObjectKey,
     pub path: String,
     pub tables: Vec<TableSummary>,
@@ -191,10 +192,13 @@ pub(crate) const TEST_OBJECT: ObjectKey = ObjectKey {
     inode: 42,
 };
 
+#[cfg(test)]
+pub(crate) const TEST_PINNED_OBJECT: PinnedObjectId = PinnedObjectId(42);
+
 /// One attachable target as discovery reported it.
 struct Target<'a> {
     name: &'a str,
-    object: ObjectKey,
+    object: PinnedObjectId,
     object_path: &'a str,
     file_offset: u64,
     fork_safe: bool,
@@ -202,6 +206,7 @@ struct Target<'a> {
 
 /// One module lowered for `merge`.
 struct Discovered<'a> {
+    object: PinnedObjectId,
     key: ObjectKey,
     path: &'a str,
     source: &'static str,
@@ -216,7 +221,7 @@ struct Discovered<'a> {
 
 /// A slot under construction: the names and modules claiming one target.
 struct Building {
-    object: ObjectKey,
+    object: PinnedObjectId,
     object_path: String,
     file_offset: u64,
     names: Vec<String>,
@@ -231,9 +236,9 @@ fn merge(
 ) -> AttachPlan {
     let capacity = MAX_SLOTS as usize;
     let mut groups: Vec<Vec<Discovered<'_>>> = Vec::new();
-    let mut group_positions: BTreeMap<ObjectKey, usize> = BTreeMap::new();
+    let mut group_positions: BTreeMap<PinnedObjectId, usize> = BTreeMap::new();
     for module in discovered {
-        let position = *group_positions.entry(module.key).or_insert_with(|| {
+        let position = *group_positions.entry(module.object).or_insert_with(|| {
             let position = groups.len();
             groups.push(Vec::new());
             position
@@ -241,7 +246,7 @@ fn merge(
         groups[position].push(module);
     }
 
-    let mut positions: BTreeMap<(ObjectKey, u64), usize> = BTreeMap::new();
+    let mut positions: BTreeMap<(PinnedObjectId, u64), usize> = BTreeMap::new();
     let mut building: Vec<Building> = Vec::new();
     let mut modules = Vec::new();
     let mut modules_skipped = Vec::new();
@@ -250,9 +255,10 @@ fn merge(
     let mut entries_seen = 0usize;
     for group in groups {
         let key = group[0].key;
+        let object = group[0].object;
         let path = group[0].path;
         let source = group[0].source;
-        let wanted: BTreeSet<(ObjectKey, u64)> = group
+        let wanted: BTreeSet<(PinnedObjectId, u64)> = group
             .iter()
             .flat_map(|module| &module.targets)
             .map(|target| (target.object, target.file_offset))
@@ -278,6 +284,7 @@ fn merge(
         let id = ModuleId(modules.len() as u32);
         modules.push(ModuleSummary {
             id,
+            object,
             key,
             path: path.to_string(),
             tables: Vec::new(),
@@ -372,41 +379,74 @@ fn merge(
     }
 }
 
-/// Merges every scanned module into one plan over a single slot space.
-pub fn build_from_modules(modules: &[ScannedModule]) -> AttachPlan {
-    build_from_sources(modules, &[])
+/// Merges every reconciled scanned module into one plan over a single slot space.
+pub fn build_from_reconciled_modules(modules: &[ReconciledModule]) -> AttachPlan {
+    merge(
+        modules.iter().map(lower_scanned).collect(),
+        0,
+        "absent".into(),
+    )
 }
 
 /// Every module discovery found — scanned and manifest-supplied — merged into one
 /// plan over the single slot space the eBPF side has. Both sources lower into
 /// `Discovered`, so a target both describe becomes one slot rather than two probes
 /// on one address (spec §4.12's union).
-pub fn build_from_sources(scanned: &[ScannedModule], manifests: &[Manifest]) -> AttachPlan {
+pub fn build_from_sources(
+    scanned: &[ReconciledModule],
+    manifests: &[Manifest],
+    pinned: &PinnedObjects,
+) -> AttachPlan {
+    build_from_sources_with(scanned, manifests, |key, path| {
+        pinned.id_for_manifest(key, path)
+    })
+}
+
+fn build_from_sources_with(
+    scanned: &[ReconciledModule],
+    manifests: &[Manifest],
+    mut pinned_id: impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId>,
+) -> AttachPlan {
     let mut discovered: Vec<Discovered<'_>> = scanned.iter().map(lower_scanned).collect();
-    discovered.extend(manifests.iter().map(lower_manifest));
+    let mut orphaned = Vec::new();
+    for manifest in manifests {
+        let (module, skipped) = lower_manifest(manifest, &mut pinned_id);
+        discovered.extend(module);
+        orphaned.extend(skipped);
+    }
     // The scan never calls the provider, so it contributes no C_GetInterfaceList
     // enumeration and leaves nothing present-but-undecoded: every interface it
     // records names a table it decoded. Only a manifest can report either.
-    merge(
+    let mut plan = merge(
         discovered,
         manifests.iter().map(|m| m.vendor_interfaces.len()).sum(),
         manifests.first().map_or_else(
             || "absent".to_string(),
             |m| acquisition_label(&m.interface_list),
         ),
-    )
+    );
+    plan.skipped.extend(orphaned);
+    plan
 }
 
-fn lower_scanned(module: &ScannedModule) -> Discovered<'_> {
+#[cfg(test)]
+fn build_from_test_sources(scanned: &[ReconciledModule], manifests: &[Manifest]) -> AttachPlan {
+    build_from_sources_with(scanned, manifests, |key, _| {
+        u32::try_from(key.inode).ok().map(PinnedObjectId)
+    })
+}
+
+fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
+    let scanned = &module.scanned;
     let mut tables = Vec::new();
     let mut surfaces = Vec::new();
     let mut targets = Vec::new();
     let mut skipped = Vec::new();
     let mut entries_seen = 0usize;
-    for (index, table) in module.tables.iter().enumerate() {
+    for (index, table) in scanned.tables.iter().enumerate() {
         // CKF_INTERFACE_FORK_SAFE is bit 0. A table no standard interface exposes
         // is never assumed fork-safe.
-        let fork_safe = module.interfaces.iter().any(|interface| {
+        let fork_safe = scanned.interfaces.iter().any(|interface| {
             interface.table == Some(index)
                 && interface.name_class == "exact_standard"
                 && interface.flags & 1 != 0
@@ -424,20 +464,22 @@ fn lower_scanned(module: &ScannedModule) -> Discovered<'_> {
         surfaces.push(SurfaceSummary {
             source: format!(
                 "{} table {}.{}",
-                module.path, table.version.0, table.version.1
+                scanned.path, table.version.0, table.version.1
             ),
             walk: table.walk.to_string(),
             // The bytes were read straight out of the target's mapping.
             acquisition: "ok".into(),
             functions: published,
         });
-        targets.extend(table.entries.iter().map(|entry| Target {
-            name: entry.name,
-            object: entry.object,
-            object_path: &entry.object_path,
-            file_offset: entry.file_offset,
-            fork_safe,
-        }));
+        targets.extend(table.entries.iter().zip(&module.entry_objects[index]).map(
+            |(entry, object)| Target {
+                name: entry.name,
+                object: *object,
+                object_path: &entry.object_path,
+                file_offset: entry.file_offset,
+                fork_safe,
+            },
+        ));
         skipped.extend(table.null_entries.iter().map(|name| Skipped {
             subject: (*name).to_string(),
             reason: "null pointer".into(),
@@ -445,11 +487,12 @@ fn lower_scanned(module: &ScannedModule) -> Discovered<'_> {
         skipped.extend(table.unpinned.iter().cloned());
     }
     Discovered {
-        key: module.key,
-        path: &module.path,
+        object: module.object,
+        key: scanned.key,
+        path: &scanned.path,
         source: "scan",
         tables,
-        interfaces: module.interfaces.len(),
+        interfaces: scanned.interfaces.len(),
         surfaces,
         entries_seen,
         targets,
@@ -458,25 +501,33 @@ fn lower_scanned(module: &ScannedModule) -> Discovered<'_> {
 }
 
 /// Which `provenance_objects[]` record carries the identity of an `objects[]` record.
-/// Matching by path first and by whole-file hash second is what `validate_structure`
-/// guarantees (every object's sha256 is in the provenance closure); the two paths are
-/// *not* the same string in general — `p11scope-discover` writes `objects[].path` as
-/// the `--module` argument was spelled and `provenance_objects[].path` as
-/// `/proc/self/maps` renders it, which differ for any provider named by symlink.
+/// Matching by equal path and identity first, then by one unique whole-file hash, is
+/// what `validate_structure` guarantees. The two paths are *not* the same string in
+/// general — `p11scope-discover` writes `objects[].path` as the `--module` argument
+/// was spelled and `provenance_objects[].path` as `/proc/self/maps` renders it, which
+/// differ for any provider named by symlink. A digest shared by multiple non-path
+/// records is incomparable rather than first-wins authority.
 ///
 /// Public because `main.rs::retarget_to_pins` rewrites the record this returns before
 /// the plan is built: one relation used by both, rather than two written against
 /// different fields, which is exactly how they drifted apart once already.
 pub fn provenance_of(m: &Manifest, object: &ObjectRecord) -> Option<usize> {
-    m.provenance_objects
+    if let Some((index, provenance)) = m
+        .provenance_objects
         .iter()
-        .position(|p| p.path == object.path)
-        .or_else(|| {
-            let sha256 = object.identity.sha256.as_deref()?;
-            m.provenance_objects
-                .iter()
-                .position(|p| p.identity.sha256.as_deref() == Some(sha256))
-        })
+        .enumerate()
+        .find(|(_, provenance)| provenance.path == object.path)
+    {
+        return (provenance.identity.sha256 == object.identity.sha256).then_some(index);
+    }
+    let sha256 = object.identity.sha256.as_deref()?;
+    let mut matches = m
+        .provenance_objects
+        .iter()
+        .enumerate()
+        .filter(|(_, provenance)| provenance.identity.sha256.as_deref() == Some(sha256));
+    let (index, _) = matches.next()?;
+    matches.next().is_none().then_some(index)
 }
 
 /// The (device, inode) discovery recorded for a manifest object. Identity lives
@@ -492,11 +543,27 @@ fn object_key(m: &Manifest, object: &ObjectRecord) -> Option<ObjectKey> {
     })
 }
 
-pub fn build(m: &Manifest) -> AttachPlan {
-    build_from_sources(&[], std::slice::from_ref(m))
+#[cfg(test)]
+fn build(m: &Manifest) -> AttachPlan {
+    let mut ids = BTreeMap::new();
+    for key in m.objects.iter().filter_map(|object| object_key(m, object)) {
+        let next = PinnedObjectId(ids.len() as u32);
+        ids.entry(key).or_insert(next);
+    }
+    let (discovered, orphaned) = lower_manifest(m, |key, _| ids.get(&key).copied());
+    let mut plan = merge(
+        discovered.into_iter().collect(),
+        m.vendor_interfaces.len(),
+        acquisition_label(&m.interface_list),
+    );
+    plan.skipped.extend(orphaned);
+    plan
 }
 
-fn lower_manifest(m: &Manifest) -> Discovered<'_> {
+fn lower_manifest(
+    m: &Manifest,
+    mut pinned_id: impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId>,
+) -> (Option<Discovered<'_>>, Vec<Skipped>) {
     let mut tables = Vec::new();
     let mut surfaces = Vec::new();
     let mut targets = Vec::new();
@@ -545,9 +612,15 @@ fn lower_manifest(m: &Manifest) -> Discovered<'_> {
                         ));
                         continue;
                     };
+                    let Some(object) = pinned_id(key, &record.path) else {
+                        skip(format!(
+                            "object id {object} has no comparable pinned identity"
+                        ));
+                        continue;
+                    };
                     targets.push(Target {
                         name: &f.name,
-                        object: key,
+                        object,
                         object_path: &record.path,
                         file_offset: *file_offset,
                         fork_safe,
@@ -561,36 +634,48 @@ fn lower_manifest(m: &Manifest) -> Discovered<'_> {
         }
     }
 
-    Discovered {
-        // Informational only: every target carries the key of the object it
-        // resolved into, which for a forwarded entry is a dependency, not this.
-        key: m
-            .objects
-            .iter()
-            .find(|o| o.path == m.module_path)
-            .and_then(|o| object_key(m, o))
-            .unwrap_or(ObjectKey {
-                device: Device { major: 0, minor: 0 },
-                inode: 0,
-            }),
-        path: &m.module_path,
-        source: "manifest",
-        tables,
-        interfaces: m
-            .surfaces
-            .iter()
-            .filter(|s| matches!(s.source, SurfaceSource::Interface { .. }))
-            .count(),
-        surfaces,
-        entries_seen,
-        targets,
-        skipped,
-    }
+    let key = m
+        .objects
+        .iter()
+        .find(|o| o.path == m.module_path)
+        .and_then(|o| object_key(m, o));
+    let Some(key) = key else {
+        return (None, skipped);
+    };
+    let Some(module_record) = m.objects.iter().find(|o| o.path == m.module_path) else {
+        return (None, skipped);
+    };
+    let Some(object) = pinned_id(key, &module_record.path) else {
+        return (None, skipped);
+    };
+    (
+        Some(Discovered {
+            object,
+            // Informational only: every target carries the key of the object it
+            // resolved into, which for a forwarded entry is a dependency, not this.
+            key,
+            path: &m.module_path,
+            source: "manifest",
+            tables,
+            interfaces: m
+                .surfaces
+                .iter()
+                .filter(|s| matches!(s.source, SurfaceSource::Interface { .. }))
+                .count(),
+            surfaces,
+            entries_seen,
+            targets,
+            skipped,
+        }),
+        Vec::new(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::scan::ScannedModule;
+    use crate::process::{MountNamespaceId, ProcessViewId};
     use p11scope_manifest::identity::{IdentityKind, ObjectIdentity};
     use p11scope_manifest::manifest::*;
 
@@ -656,30 +741,41 @@ mod tests {
         key: ObjectKey,
         path: &str,
         offsets: impl IntoIterator<Item = u64>,
-    ) -> ScannedModule {
+    ) -> ReconciledModule {
         use crate::discovery::scan::{ScannedEntry, ScannedTable};
 
-        ScannedModule {
-            key,
-            path: path.into(),
-            exports: vec!["C_GetFunctionList".into()],
-            tables: vec![ScannedTable {
-                version: (2, 40),
-                walk: "full",
-                entries: offsets
-                    .into_iter()
-                    .map(|file_offset| ScannedEntry {
-                        name: "C_Sign",
-                        object: key,
-                        object_path: path.into(),
-                        file_offset,
-                    })
-                    .collect(),
-                null_entries: vec![],
-                unpinned: vec![],
-                address: 0x7000,
-            }],
-            interfaces: vec![],
+        let entries: Vec<_> = offsets
+            .into_iter()
+            .map(|file_offset| ScannedEntry {
+                name: "C_Sign",
+                object: key,
+                object_path: path.into(),
+                file_offset,
+            })
+            .collect();
+        let object = PinnedObjectId(key.inode as u32);
+        ReconciledModule {
+            object,
+            entry_objects: vec![vec![object; entries.len()]],
+            scanned: ScannedModule {
+                view: ProcessViewId(0),
+                mount_namespace: MountNamespaceId {
+                    device: 1,
+                    inode: 1,
+                },
+                key,
+                path: path.into(),
+                exports: vec!["C_GetFunctionList".into()],
+                tables: vec![ScannedTable {
+                    version: (2, 40),
+                    walk: "full",
+                    entries,
+                    null_entries: vec![],
+                    unpinned: vec![],
+                    address: 0x7000,
+                }],
+                interfaces: vec![],
+            },
         }
     }
 
@@ -723,7 +819,7 @@ mod tests {
         for slot in &p.slots {
             assert_eq!(slot.module_ids, vec![ModuleId(0)]);
             assert_eq!(slot.object_path, "/opt/p11.so");
-            assert_eq!(slot.object.inode, 42, "the provenance identity is used");
+            assert_eq!(slot.object, PinnedObjectId(0));
         }
     }
 
@@ -838,10 +934,7 @@ mod tests {
             slots: (0..count)
                 .map(|index| Slot {
                     index: index as u32,
-                    object: ObjectKey {
-                        device: Device { major: 8, minor: 1 },
-                        inode: 42,
-                    },
+                    object: PinnedObjectId(42),
                     object_path: "/opt/p11.so".into(),
                     file_offset: index as u64 * 8,
                     names: vec!["C_Initialize".into()],
@@ -893,7 +986,7 @@ mod tests {
     /// target COUNT_ONLY and force PARTIAL, turning `--manifest` into a trapdoor.
     #[test]
     fn a_manifest_and_a_scan_of_the_same_object_are_one_module() {
-        use crate::discovery::scan::{ScannedEntry, ScannedInterface, ScannedTable};
+        use crate::discovery::scan::ScannedInterface;
 
         let mut m = manifest_with(vec![resolved("C_Sign", 0x10), resolved("C_Login", 0x50)]);
         // Both sources describe the same one standard interface of the same
@@ -906,34 +999,17 @@ mod tests {
             flags: 1,
             classification: InterfaceClassification::ExactStandard,
         };
-        let entry = |name: &'static str, file_offset| ScannedEntry {
-            name,
-            object: TEST_OBJECT,
-            object_path: "/opt/p11.so".into(),
-            file_offset,
-        };
-        let scanned = ScannedModule {
-            key: TEST_OBJECT,
-            path: "/opt/p11.so".into(),
-            exports: vec!["C_GetFunctionList".into()],
-            tables: vec![ScannedTable {
-                version: (2, 40),
-                walk: "full",
-                entries: vec![entry("C_Sign", 0x10), entry("C_Verify", 0x60)],
-                null_entries: vec![],
-                unpinned: vec![],
-                address: 0x7000,
-            }],
-            interfaces: vec![ScannedInterface {
-                index: 0,
-                name_class: "exact_standard",
-                name_lossy: Some("PKCS 11".into()),
-                flags: 1,
-                table: Some(0),
-            }],
-        };
+        let mut scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10, 0x60]);
+        scanned.scanned.tables[0].entries[1].name = "C_Verify";
+        scanned.scanned.interfaces = vec![ScannedInterface {
+            index: 0,
+            name_class: "exact_standard",
+            name_lossy: Some("PKCS 11".into()),
+            flags: 1,
+            table: Some(0),
+        }];
 
-        let p = build_from_sources(std::slice::from_ref(&scanned), std::slice::from_ref(&m));
+        let p = build_from_test_sources(std::slice::from_ref(&scanned), std::slice::from_ref(&m));
         assert_eq!(p.modules.len(), 1, "{:?}", p.modules);
         assert_eq!(p.modules[0].source, "scan+manifest");
         assert_eq!(p.module_ambiguous, 0, "corroboration is not ambiguity");
@@ -966,9 +1042,13 @@ mod tests {
         ];
         let manifest = manifest_with(vec![resolved("C_Sign", 0)]);
 
-        let p = build_from_sources(&scanned, std::slice::from_ref(&manifest));
+        let p = build_from_test_sources(&scanned, std::slice::from_ref(&manifest));
         assert_eq!(p.slots.len(), 2, "only the later distinct module fits");
-        assert!(p.slots.iter().all(|slot| slot.object == later));
+        assert!(
+            p.slots
+                .iter()
+                .all(|slot| slot.object == PinnedObjectId(later.inode as u32))
+        );
         assert_eq!(p.modules.len(), 1);
         assert_eq!(p.modules[0].path, "/opt/later.so");
         assert_eq!(p.modules[0].source, "scan");
@@ -994,13 +1074,17 @@ mod tests {
         ];
         let manifest = manifest_with((0..513).map(|i| resolved("C_Sign", i * 8)).collect());
 
-        let p = build_from_sources(&scanned, std::slice::from_ref(&manifest));
+        let p = build_from_test_sources(&scanned, std::slice::from_ref(&manifest));
         assert_eq!(
             p.slots.len(),
             2,
             "no scan prefix of the refused module remains"
         );
-        assert!(p.slots.iter().all(|slot| slot.object == later));
+        assert!(
+            p.slots
+                .iter()
+                .all(|slot| slot.object == PinnedObjectId(later.inode as u32))
+        );
         assert_eq!(p.modules.len(), 1);
         assert_eq!(p.modules[0].path, "/opt/later.so");
         assert_eq!(

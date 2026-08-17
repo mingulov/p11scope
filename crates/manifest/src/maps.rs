@@ -17,8 +17,8 @@ pub struct Device {
 ///  - one file can have two keys — overlay mounts can expose a shared image-layer
 ///    object under different anonymous superblock devices. The inverse is also
 ///    possible: two independent byte-identical overlay instances can look the same
-///    to the available metadata. `collapse_overlay_mappings` therefore treats a
-///    collapse as explicit uncertainty, never proof of one physical inode.
+///    to the available metadata. Reconciliation therefore treats the overlay-only
+///    collapse exception as explicit uncertainty, never proof of one physical inode.
 ///  - two files, one key — an inode number is unique only within a filesystem. On
 ///    btrfs it is not even unique within one: subvolumes number inodes independently
 ///    while maps renders the one filesystem-wide `s_dev` (the per-subvolume anonymous
@@ -70,6 +70,9 @@ pub fn executable_file_keys(entries: &[MapEntry]) -> BTreeSet<MappingFileKey> {
         .iter()
         .filter(|entry| entry.permissions[2] == b'x' && entry.inode != 0)
         .map(|entry| MappingFileKey {
+            // A maps line has no mount id. This value is lexical inventory only and
+            // must not be used as a comparable opened-file identity.
+            mount_id: 0,
             device_major: entry.device.major,
             device_minor: entry.device.minor,
             inode: entry.inode,

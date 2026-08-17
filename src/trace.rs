@@ -470,7 +470,7 @@ mod tests {
             slots: vec![
                 crate::plan::Slot {
                     index: 0,
-                    object: crate::plan::TEST_OBJECT,
+                    object: crate::plan::TEST_PINNED_OBJECT,
                     object_path: "/opt/p11.so".into(),
                     file_offset: 0x10,
                     names: vec!["C_OpenSession".into()],
@@ -482,7 +482,7 @@ mod tests {
                 },
                 crate::plan::Slot {
                     index: 1,
-                    object: crate::plan::TEST_OBJECT,
+                    object: crate::plan::TEST_PINNED_OBJECT,
                     object_path: "/opt/p11.so".into(),
                     file_offset: 0x20,
                     names: vec!["C_CloseSession".into()],

@@ -1,5 +1,6 @@
 use p11scope::discovery::scan::CaptureWorkBudget;
 use p11scope::manifest_input::{MAX_MANIFEST_BYTES, read_manifest};
+use p11scope::process::{MountNamespaceId, ProcessViewId};
 use p11scope_manifest::identity::{IdentityKind, ObjectIdentity};
 use p11scope_manifest::manifest::*;
 use std::os::unix::fs::MetadataExt as _;
@@ -8,6 +9,14 @@ use std::process::Command;
 use std::sync::Mutex;
 
 static CC_LOCK: Mutex<()> = Mutex::new(());
+
+fn current_mount_namespace() -> MountNamespaceId {
+    let metadata = std::fs::metadata("/proc/self/ns/mnt").unwrap();
+    MountNamespaceId {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
 
 fn tmpdir(name: &str) -> PathBuf {
     let d =
@@ -126,8 +135,7 @@ fn matching_identity_is_accepted() {
 
 /// A capture pins objects from the scan *and* from every `--manifest`, but
 /// `Session::start` takes one set: both must survive the merge, each still
-/// reachable the way its own slots are attached (by key for a scanned object,
-/// by the recorded path for a manifest one).
+/// reachable by its capture-local pinned ID.
 #[test]
 fn scan_and_manifest_pins_merge_into_one_set() {
     let d = tmpdir("manifest_pinning_absorb");
@@ -149,8 +157,9 @@ fn scan_and_manifest_pins_merge_into_one_set() {
         "the scanned object survives the merge"
     );
     let key = manifest_key(&so);
+    let id = pinned.pinned().find(|pin| pin.key == key).unwrap().id;
     let attach = pinned
-        .attach_path_for(key)
+        .attach_path_for(id)
         .expect("the manifest's object still resolves after the merge");
     assert!(attach.starts_with("/proc/self/fd/"), "{attach:?}");
     assert!(pinned.check_unchanged().unwrap());
@@ -249,7 +258,7 @@ fn symlink_is_pinned_and_non_executable_offsets_are_refused() {
     assert_ne!(summary.path, symlink_manifest.provenance_objects[0].path);
     assert_eq!(summary.key, manifest_key(&link));
     let attach = pinned
-        .attach_path_for(summary.key)
+        .attach_path_for(summary.id)
         .expect("a symlinked object is pinned by the identity it resolves to");
     let replacement = cc_so(&d, "replacement", "int f(void){return 2;}\n");
     std::fs::remove_file(&link).unwrap();
@@ -470,6 +479,55 @@ fn manifest_v4_requires_a_whole_file_provenance_closure() {
 }
 
 #[test]
+fn byte_identical_aliases_require_an_unambiguous_provenance_relation() {
+    let d = tmpdir("manifest_pinning_ambiguous_provenance");
+    let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
+    let identity = p11scope_manifest::identity::inspect_file(
+        &p11scope_manifest::identity::open_object(&so).unwrap(),
+    )
+    .unwrap()
+    .identity;
+    let mut m = manifest_for(&so);
+    m.module_path = "/aliases/a.so".into();
+    m.objects = vec![
+        ObjectRecord {
+            id: 0,
+            path: "/aliases/a.so".into(),
+            identity: identity.clone(),
+        },
+        ObjectRecord {
+            id: 1,
+            path: "/aliases/b.so".into(),
+            identity: identity.clone(),
+        },
+    ];
+    m.provenance_objects = vec![
+        ProvenanceObject {
+            path: "/real/a.so".into(),
+            device_major: 8,
+            device_minor: 1,
+            inode: 101,
+            identity: identity.clone(),
+        },
+        ProvenanceObject {
+            path: "/real/b.so".into(),
+            device_major: 8,
+            device_minor: 1,
+            inode: 102,
+            identity,
+        },
+    ];
+
+    let problems = p11scope::manifest_input::validate_structure(&m);
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.contains("matches multiple provenance objects")),
+        "first-digest provenance remained authoritative: {problems:?}"
+    );
+}
+
+#[test]
 fn aggregate_object_bytes_are_refused_before_parsing() {
     let d = tmpdir("manifest_pinning_aggregate_object_bytes");
     let so = cc_so(&d, "small", "int f(void){return 1;}\n");
@@ -539,7 +597,9 @@ fn replacing_the_file_by_rename_keeps_the_pinned_inode_but_reports_a_change() {
     let m = manifest_for(&so);
     let pinned = p11scope::discovery::identity::pin_manifest_objects(&m).unwrap();
     let old_bytes = std::fs::read(&so).unwrap();
-    let attach = pinned.attach_path_for(manifest_key(&so)).unwrap();
+    let key = manifest_key(&so);
+    let id = pinned.pinned().find(|pin| pin.key == key).unwrap().id;
+    let attach = pinned.attach_path_for(id).unwrap();
     assert!(attach.starts_with("/proc/self/fd/"));
     std::thread::sleep(std::time::Duration::from_millis(20)); // ctime granularity margin
     let other = cc_so(&d, "other", "int g(void){return 2;}\n");
@@ -624,7 +684,7 @@ fn scanned_objects_are_pinned_hashed_and_attachable() {
     );
     for summary in pinned.pinned() {
         assert_eq!(summary.sha256.len(), 64, "sha256 must be a full digest");
-        let attach = pinned.attach_path_for(summary.key).unwrap();
+        let attach = pinned.attach_path_for(summary.id).unwrap();
         assert!(attach.starts_with("/proc/self/fd/"), "{attach:?}");
         assert!(
             std::fs::metadata(&attach).is_ok(),
@@ -643,6 +703,8 @@ fn a_retargeted_path_is_skipped_as_an_identity_mismatch() {
     // reported. That is what a retargeted path looks like, and it must never be pinned.
     let exe = std::env::current_exe().unwrap();
     let module = ScannedModule {
+        view: ProcessViewId(0),
+        mount_namespace: current_mount_namespace(),
         key: ObjectKey {
             device: Device { major: 0, minor: 0 },
             inode: std::fs::metadata(&exe).unwrap().ino() + 1,
@@ -667,19 +729,42 @@ fn a_retargeted_path_is_skipped_as_an_identity_mismatch() {
     );
     assert_eq!(skipped[0].subject, exe.display().to_string());
 
-    // Right inode, wrong device: only the "mountinfo" comparison can catch this, so
-    // this is what a silent downgrade of the check to inode-only would break. On a
-    // host where mountinfo cannot resolve, the weaker check is legitimate — but it
-    // then has to say so rather than pass itself off as the strong one.
+    // Force `mapping_file_key` to be unavailable: memfd's internal mount does not
+    // appear in /proc/self/mountinfo. The inode still agrees, while the mapping device
+    // deliberately does not. Incomparable identity must fail closed, never fall back
+    // to accepting the inode by itself.
+    use std::ffi::CString;
+    use std::io::{Seek as _, Write as _};
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let name = CString::new("p11scope-identity-unavailable").unwrap();
+    // SAFETY: valid NUL-terminated name and supported memfd flags; success returns a
+    // uniquely owned descriptor transferred immediately into `File`.
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
+    let mut memfd = unsafe { std::fs::File::from_raw_fd(fd) };
+    memfd.write_all(&std::fs::read(&exe).unwrap()).unwrap();
+    memfd.rewind().unwrap();
+    let memfd_path = format!("/proc/self/fd/{}", memfd.as_raw_fd());
+    let opened = p11scope_manifest::identity::open_object(Path::new(&memfd_path)).unwrap();
+    let mapping_error = p11scope_manifest::identity::mapping_file_key(&opened)
+        .expect_err("memfd mount identity must be absent from mountinfo");
+    assert!(
+        mapping_error.contains("missing from the mount table"),
+        "{mapping_error}"
+    );
+    let metadata = memfd.metadata().unwrap();
     let module = ScannedModule {
+        view: ProcessViewId(0),
+        mount_namespace: current_mount_namespace(),
         key: ObjectKey {
             device: Device {
                 major: 0xffff,
                 minor: 0xffff,
             },
-            inode: std::fs::metadata(&exe).unwrap().ino(),
+            inode: metadata.ino(),
         },
-        path: exe.display().to_string(),
+        path: memfd_path.clone(),
         exports: vec![],
         tables: vec![],
         interfaces: vec![],
@@ -690,19 +775,18 @@ fn a_retargeted_path_is_skipped_as_an_identity_mismatch() {
         &mut CaptureWorkBudget::default(),
     )
     .unwrap();
-    match pinned.pinned().next() {
-        None => assert!(
-            skipped[0].reason.starts_with("identity_mismatch"),
-            "{:?}",
-            skipped[0]
-        ),
-        Some(summary) => assert_eq!(
-            summary.identity_source, "stat",
-            "a device mismatch may only be accepted when mountinfo was unavailable, \
-             and the report must record why: {:?}",
-            summary.note
-        ),
-    }
+    assert_eq!(
+        pinned.pinned().count(),
+        0,
+        "inode-only identity was accepted"
+    );
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!(skipped[0].subject, memfd_path);
+    assert!(
+        skipped[0].reason.contains("mapping identity") && skipped[0].reason.contains("unavailable"),
+        "{:?}",
+        skipped[0]
+    );
 }
 
 #[test]
@@ -785,6 +869,8 @@ fn a_failed_hash_attempt_still_consumes_the_capture_budget() {
     let len = std::fs::metadata(&valid).unwrap().len();
     assert_eq!(len, std::fs::metadata(&invalid).unwrap().len());
     let module = |path: &Path| ScannedModule {
+        view: ProcessViewId(0),
+        mount_namespace: current_mount_namespace(),
         key: manifest_key(path),
         path: path.display().to_string(),
         exports: vec![],

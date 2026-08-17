@@ -193,6 +193,66 @@ impl Default for Tracker {
     }
 }
 
+/// Capture-local process-generation identity. It is deliberately unrelated to the
+/// numeric PID and is never serialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProcessViewId(pub u32);
+
+/// Identity of the mount namespace in which one process view was scanned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MountNamespaceId {
+    pub device: u64,
+    pub inode: u64,
+}
+
+/// One accepted process generation and its filesystem view. Task 4 uses the pin
+/// through scan/open/hash; the later lifecycle task can retain this value and recheck
+/// it before subtracting this view's claims.
+pub struct ProcessView {
+    id: ProcessViewId,
+    mount_namespace: MountNamespaceId,
+    pin: PidPin,
+}
+
+impl ProcessView {
+    pub fn open(id: ProcessViewId, pid: u32) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let pin = PidPin::open(pid)?;
+        let metadata = std::fs::metadata(format!("/proc/{pid}/ns/mnt"))
+            .map_err(|error| format!("cannot identify pid {pid}'s mount namespace: {error}"))?;
+        if !pin.still_the_same() {
+            return Err(format!(
+                "pid {pid} exited while its mount namespace was identified"
+            ));
+        }
+        Ok(Self {
+            id,
+            mount_namespace: MountNamespaceId {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+            pin,
+        })
+    }
+
+    pub fn id(&self) -> ProcessViewId {
+        self.id
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pin.pid()
+    }
+
+    pub fn mount_namespace(&self) -> MountNamespaceId {
+        self.mount_namespace
+    }
+
+    pub fn still_the_same(&self) -> bool {
+        self.pin.still_the_same()
+    }
+}
+
 /// A process identity that survives PID reuse. `pidfd_open` is exact; the
 /// `/proc/<pid>/stat` start time is the documented fallback where pidfds are
 /// unavailable. Both already back `Tracker`; `PidPin` exposes them for the

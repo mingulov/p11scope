@@ -6,6 +6,7 @@
 //! authority the offline helper uses — so a scanned offset equals a manifest offset.
 
 use crate::discovery::hooks::HookRegistry;
+use crate::process::{MountNamespaceId, ProcessView, ProcessViewId};
 use p11scope_manifest::elf::exports_matching;
 use p11scope_manifest::identity::open_object;
 use p11scope_manifest::maps::{MapEntry, MappedPath, ObjectKey, Resolved, parse_maps, resolve};
@@ -176,8 +177,8 @@ pub struct ScannedTable {
     pub entries: Vec<ScannedEntry>,
     /// Published names whose slot held a NULL pointer — evidence, not entries.
     pub null_entries: Vec<&'static str>,
-    /// Entries this scan decoded but dropped because their object could not be
-    /// pinned (`main::drop_unpinned_entries`). Kept here so they stay counted
+    /// Entries this scan decoded but reconciliation could not bind to a comparable
+    /// pinned object. Kept here so they stay counted
     /// as *seen* and are reported as skipped, exactly like the NULL ones: a
     /// record the scan read and could not use is evidence, not silence.
     pub unpinned: Vec<Skipped>,
@@ -210,6 +211,9 @@ pub struct Skipped {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedModule {
+    /// Capture-local owner of every table and target contribution in this module.
+    pub view: ProcessViewId,
+    pub mount_namespace: MountNamespaceId,
     pub key: ObjectKey,
     pub path: String,
     pub exports: Vec<String>,
@@ -735,6 +739,23 @@ pub fn scan_pid(
     request: &ScanRequest<'_>,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ScanOutcome, String> {
+    let view = ProcessView::open(ProcessViewId(0), request.pid)?;
+    scan_process_view(request, &view, budget)
+}
+
+/// Scan through an already accepted process-generation pin. Capture discovery uses
+/// this entry point so one monotonically allocated `ProcessViewId` owns every result.
+pub fn scan_process_view(
+    request: &ScanRequest<'_>,
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+) -> Result<ScanOutcome, String> {
+    if request.pid != view.pid() {
+        return Err("scan request pid does not match its process view".into());
+    }
+    if !view.still_the_same() {
+        return Err(format!("pid {} exited before discovery", request.pid));
+    }
     let started = Instant::now();
     let pid = request.pid;
     let maps = parse_maps(
@@ -855,6 +876,8 @@ pub fn scan_pid(
             continue;
         }
         let mut module = ScannedModule {
+            view: view.id(),
+            mount_namespace: view.mount_namespace(),
             key,
             path,
             exports: exports.into_iter().map(|(name, _)| name).collect(),

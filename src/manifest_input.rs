@@ -205,7 +205,6 @@ pub fn validate_structure(m: &Manifest) -> Vec<String> {
     }
     let mut provenance_keys = BTreeSet::new();
     let mut provenance_paths = BTreeSet::new();
-    let mut provenance_identities = BTreeSet::new();
     for object in &m.provenance_objects {
         bounded(
             "provenance object path",
@@ -239,21 +238,41 @@ pub fn validate_structure(m: &Manifest) -> Vec<String> {
             &object.identity,
             &mut problems,
         );
-        if let Some(sha256) = &object.identity.sha256 {
-            provenance_identities.insert(sha256.as_str());
-        }
     }
     for object in &m.objects {
-        if object
-            .identity
-            .sha256
-            .as_deref()
-            .is_some_and(|sha256| !provenance_identities.contains(sha256))
+        let Some(sha256) = object.identity.sha256.as_deref() else {
+            // `validate_identity` already gives the precise unusable-identity
+            // diagnostic. Provenance relation is meaningful only for a digest.
+            continue;
+        };
+        if let Some(provenance) = m
+            .provenance_objects
+            .iter()
+            .find(|provenance| provenance.path == object.path)
         {
-            problems.push(format!(
+            if provenance.identity.sha256.as_deref() != Some(sha256) {
+                problems.push(format!(
+                    "object {} and its path-matched provenance object have different identities",
+                    object.id
+                ));
+            }
+            continue;
+        }
+        let matches = m
+            .provenance_objects
+            .iter()
+            .filter(|provenance| provenance.identity.sha256.as_deref() == Some(sha256))
+            .count();
+        match matches {
+            0 => problems.push(format!(
                 "object {} identity is absent from the executable provenance closure",
                 object.id
-            ));
+            )),
+            1 => {}
+            _ => problems.push(format!(
+                "object {} identity matches multiple provenance objects without an exact path",
+                object.id
+            )),
         }
     }
 

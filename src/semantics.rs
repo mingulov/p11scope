@@ -72,7 +72,7 @@ mod corrective_tests {
                 .enumerate()
                 .map(|(index, name)| Slot {
                     index: index as u32,
-                    object: crate::plan::TEST_OBJECT,
+                    object: crate::plan::TEST_PINNED_OBJECT,
                     object_path: "/opt/p11.so".into(),
                     file_offset: index as u64 * 16,
                     names: vec![(*name).into()],
@@ -2360,7 +2360,7 @@ mod tests {
         let (semantics, semantic_ambiguous) = crate::kinds::descriptor_slot(&names);
         Slot {
             index,
-            object: crate::plan::TEST_OBJECT,
+            object: crate::plan::TEST_PINNED_OBJECT,
             object_path: "/opt/p11.so".into(),
             file_offset: index as u64 * 0x10,
             names,

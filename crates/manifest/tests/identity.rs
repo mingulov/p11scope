@@ -39,11 +39,13 @@ fn strict_maps_refuse_malformed_lines_and_report_executable_inodes() {
         executable_file_keys(&maps),
         [
             MappingFileKey {
+                mount_id: 0,
                 device_major: 8,
                 device_minor: 2,
                 inode: 173521,
             },
             MappingFileKey {
+                mount_id: 0,
                 device_major: 8,
                 device_minor: 3,
                 inode: 173523,

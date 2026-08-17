@@ -553,12 +553,11 @@ impl Session {
         let attach_paths: Vec<PathBuf> = plan
             .slots
             .iter()
-            // By key, and only by key. Every key in a plan is one this capture pinned:
-            // `main.rs::drop_unpinned_entries` removes scanned entries whose object
-            // could not be pinned, and `main.rs::retarget_to_pins` replaces the
-            // {device, inode} a manifest *recorded* — an identity from another host or
-            // another boot — with the identity of the object pinned for it. A slot that
-            // does not resolve here is a discovery bug, and failing is the right answer:
+            // By capture-local pinned ID only. Reconciliation removes scanned entries
+            // without a comparable opened identity, and `main.rs::retarget_to_pins`
+            // replaces manifest identities recorded on another host or boot with the
+            // identity of the object pinned now. A slot that does not resolve here is
+            // a discovery bug, and failing is the right answer:
             // there is deliberately no by-path fallback, because `slot.object_path` is
             // the *target's* pathname, which in a container names a different file in
             // this namespace (`PinnedObjects` has no path index at all, so this cannot

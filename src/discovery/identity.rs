@@ -7,18 +7,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::{AsRawFd as _, RawFd};
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use p11scope_manifest::identity::{
-    IdentityKind, ObjectIdentity, inspect_file, inspect_file_with_reader, mapping_file_key,
-    open_object,
+    IdentityKind, MappingFileKey, ObjectIdentity, inspect_file, inspect_file_with_reader,
+    mapping_file_key, open_object,
 };
 use p11scope_manifest::manifest::{Manifest, Resolution};
 use p11scope_manifest::maps::{Device, ObjectKey};
 
 use crate::discovery::scan::{CaptureWorkBudget, IO_CEILING_REASON, ScannedModule, Skipped};
 use crate::manifest_input::{MAX_TOTAL_OBJECT_BYTES, validate_structure};
-use crate::process::PidPin;
+use crate::process::{MountNamespaceId, ProcessView, ProcessViewId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Pin {
@@ -38,55 +38,63 @@ fn pin_of(file: &std::fs::File) -> Result<Pin, String> {
     })
 }
 
-/// How an object's `(device, inode)` was determined, and therefore how much of it can
-/// be compared with what `/proc/<pid>/maps` reported. A typed distinction on purpose:
-/// this is the strength of the retargeting check, and a stray string must not be able
-/// to downgrade it silently.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IdentitySource {
-    /// fdinfo + mountinfo resolved the mount's device — the whole key is comparable.
-    Mountinfo,
-    /// The mountinfo lookup failed, and `st_dev` is *not* the device maps renders
-    /// (btrfs subvolumes, overlay), so only the inode is comparable.
-    Stat,
+/// Capture-local opened-object identity. It has no stable or serialized meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PinnedObjectId(pub u32);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RawObjectInstance {
+    mount_namespace: Option<MountNamespaceId>,
+    key: ObjectKey,
+    path: String,
 }
 
-impl IdentitySource {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Mountinfo => "mountinfo",
-            Self::Stat => "stat",
+impl RawObjectInstance {
+    fn scanned(module: &ScannedModule, key: ObjectKey, path: &str) -> Option<Self> {
+        Some(Self {
+            mount_namespace: Some(module.mount_namespace),
+            key,
+            path: normalize_target_path(path)?,
+        })
+    }
+
+    fn manifest(key: ObjectKey, path: String) -> Option<Self> {
+        Some(Self {
+            mount_namespace: None,
+            key,
+            path: normalize_target_path(&path)?,
+        })
+    }
+}
+
+fn normalize_target_path(path: &str) -> Option<String> {
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(component) => normalized.push(component),
+            Component::Prefix(_) => return None,
         }
     }
-
-    /// Whether the opened file is the object the mapping named.
-    fn confirms(self, found: ObjectKey, expected: ObjectKey) -> bool {
-        found.inode == expected.inode
-            && match self {
-                Self::Mountinfo => found.device == expected.device,
-                Self::Stat => true,
-            }
-    }
-}
-
-struct FoundIdentity {
-    key: ObjectKey,
-    source: IdentitySource,
-    /// Why the mountinfo lookup was unavailable, when it was. Four of its five failures
-    /// mean the observer's own `/proc` is broken rather than "the target is a
-    /// container", so the downgrade is recorded instead of inferred.
-    note: Option<String>,
+    normalized.to_str().map(str::to_string)
 }
 
 #[derive(Debug)]
 struct Entry {
+    raw: RawObjectInstance,
+    mapping: MappingFileKey,
     file: std::fs::File,
     pin: Pin,
     path: String,
     sha256: String,
     build_id: Option<String>,
-    identity_source: &'static str,
-    note: Option<String>,
     /// Whether this object was opened through overlayfs. This narrows the collapse
     /// heuristic but does not prove that another overlay instance resolves to the
     /// same underlying kernel inode.
@@ -118,10 +126,13 @@ impl Entry {
         pin: Pin,
         path: String,
         identity: &ObjectIdentity,
-        found: FoundIdentity,
+        raw: RawObjectInstance,
+        mapping: MappingFileKey,
     ) -> Result<Self, String> {
         Ok(Self {
             overlay: on_overlayfs(file.as_raw_fd())?,
+            raw,
+            mapping,
             file,
             pin,
             path,
@@ -131,8 +142,6 @@ impl Entry {
                 IdentityKind::GnuBuildId => identity.value.clone(),
                 _ => None,
             },
-            identity_source: found.source.label(),
-            note: found.note,
         })
     }
 }
@@ -140,30 +149,71 @@ impl Entry {
 /// What a pinned object is, for the `discovery[]` report.
 #[derive(Debug, Clone, Copy)]
 pub struct PinnedSummary<'a> {
+    pub id: PinnedObjectId,
     pub key: ObjectKey,
     /// For scan-sourced objects this is the *target's* path: it is namespace-relative
     /// and the observer cannot open it. Attach through `attach_path_for` instead.
     pub path: &'a str,
     pub sha256: &'a str,
     pub build_id: Option<&'a str>,
-    /// "mountinfo" or "stat" — how the mapping identity was confirmed.
+    /// Always "mountinfo": incomparable identities are refused rather than downgraded.
     pub identity_source: &'static str,
-    /// Why `identity_source` is "stat" rather than "mountinfo".
+    /// Reserved for bounded diagnostic context; ordinary comparable pins have none.
     pub note: Option<&'a str>,
 }
 
-/// Every object opened, identity-matched, and pinned by `(ino, size, ctime)`, keyed
-/// by the `(device, inode)` a mapping of it shows. No read leases are held:
+/// Claims retained per accepted process view. Vectors deliberately preserve duplicate
+/// claims: two tables or views may rely on the same pin/target independently.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ViewClaims {
+    pub tables: Vec<PinnedObjectId>,
+    pub targets: Vec<(PinnedObjectId, u64)>,
+    pub pins: Vec<PinnedObjectId>,
+}
+
+impl ViewClaims {
+    fn remap(&mut self, ids: &BTreeMap<PinnedObjectId, PinnedObjectId>) {
+        for id in self.tables.iter_mut().chain(&mut self.pins) {
+            if let Some(mapped) = ids.get(id) {
+                *id = *mapped;
+            }
+        }
+        for (id, _) in &mut self.targets {
+            if let Some(mapped) = ids.get(id) {
+                *id = *mapped;
+            }
+        }
+    }
+
+    fn remove(&mut self, ids: &BTreeSet<PinnedObjectId>) {
+        self.tables.retain(|id| !ids.contains(id));
+        self.targets.retain(|(id, _)| !ids.contains(id));
+        self.pins.retain(|id| !ids.contains(id));
+    }
+}
+
+/// A scanned process view after every raw object reference was reconciled to an opened,
+/// comparable, hashed capture-local object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconciledModule {
+    pub scanned: ScannedModule,
+    pub object: PinnedObjectId,
+    /// Parallel to `scanned.tables[*].entries`.
+    pub entry_objects: Vec<Vec<PinnedObjectId>>,
+}
+
+/// Every object opened, identity-matched, hashed, and pinned by a capture-local ID.
+/// Raw mapping keys remain lookup inputs until reconciliation, never attach identity.
+/// No read leases are held:
 /// `check_unchanged` is a cheap, best-effort check, not a guarantee that the bytes
 /// cannot change between the check and Aya's attach.
 #[derive(Debug)]
 pub struct PinnedObjects {
-    /// Keyed by identity alone. There is deliberately no path index: a pathname is
-    /// not an identity — the target's `/proc/<pid>/maps` path names a different file
-    /// in the observer's namespace, and a manifest's recorded path resolves to
-    /// whatever lives there now. Callers resolve by the key of an object this
-    /// capture pinned, which `main.rs` guarantees every plan slot carries.
-    by_key: BTreeMap<ObjectKey, Entry>,
+    by_id: BTreeMap<PinnedObjectId, Entry>,
+    raw_to_id: BTreeMap<RawObjectInstance, PinnedObjectId>,
+    rejected_keys: BTreeSet<ObjectKey>,
+    ownership: BTreeMap<ProcessViewId, ViewClaims>,
+    next_id: u32,
     /// Latched by `check_unchanged` the first time any pin differs.
     changed: std::cell::Cell<bool>,
 }
@@ -173,41 +223,147 @@ impl PinnedObjects {
     /// process to pin objects from.
     pub fn empty() -> Self {
         Self {
-            by_key: BTreeMap::new(),
+            by_id: BTreeMap::new(),
+            raw_to_id: BTreeMap::new(),
+            rejected_keys: BTreeSet::new(),
+            ownership: BTreeMap::new(),
+            next_id: 0,
             changed: std::cell::Cell::new(false),
         }
     }
 
-    /// Folds another pin set into this one. A capture pins what the scan found and
-    /// what every `--manifest` names, but `Session::start` takes exactly one set.
-    /// The receiver wins a duplicate key: the scan opens objects through the
-    /// target's own `/proc/<pid>/root` view, which is the file the probe attaches
-    /// into even when the observer's namespace spells the path differently.
-    pub fn absorb(&mut self, other: PinnedObjects) {
-        for (key, entry) in other.by_key {
-            self.by_key.entry(key).or_insert(entry);
+    /// Folds another pin set into this capture. Exact comparable identities merge;
+    /// an equal raw `ObjectKey` with any unequal full identity rejects the whole group.
+    pub fn absorb(&mut self, other: PinnedObjects) -> Vec<Skipped> {
+        let mut entries = other.by_id;
+        let mut raws: BTreeMap<PinnedObjectId, Vec<RawObjectInstance>> = BTreeMap::new();
+        for (raw, id) in other.raw_to_id {
+            raws.entry(id).or_default().push(raw);
+        }
+        let mut skipped = Vec::new();
+        let mut id_map = BTreeMap::new();
+        for (old_id, mut instances) in raws {
+            let Some(mut entry) = entries.remove(&old_id) else {
+                continue;
+            };
+            let raw = instances.remove(0);
+            entry.raw = raw.clone();
+            let id = self.insert_entry(entry, &mut skipped);
+            if let Some(id) = id {
+                id_map.insert(old_id, id);
+                for raw in instances {
+                    self.raw_to_id.insert(raw, id);
+                }
+            }
+        }
+        for key in other.rejected_keys {
+            self.reject_key(key, &mut skipped);
+        }
+        for (view, claims) in other.ownership {
+            let ours = self.ownership.entry(view).or_default();
+            ours.tables.extend(
+                claims
+                    .tables
+                    .into_iter()
+                    .filter_map(|id| id_map.get(&id).copied())
+                    .filter(|id| self.by_id.contains_key(id)),
+            );
+            ours.targets
+                .extend(claims.targets.into_iter().filter_map(|(id, offset)| {
+                    let id = id_map.get(&id).copied()?;
+                    self.by_id.contains_key(&id).then_some((id, offset))
+                }));
+            ours.pins.extend(
+                claims
+                    .pins
+                    .into_iter()
+                    .filter_map(|id| id_map.get(&id).copied())
+                    .filter(|id| self.by_id.contains_key(id)),
+            );
         }
         self.changed.set(self.changed.get() || other.changed.get());
+        skipped
     }
 
     /// The path Aya reopens for this object: an fd this capture holds, never a name
     /// resolved again through a namespace that may not mean the same file.
-    pub fn attach_path_for(&self, key: ObjectKey) -> Result<PathBuf, String> {
-        self.by_key
-            .get(&key)
+    pub fn attach_path_for(&self, id: PinnedObjectId) -> Result<PathBuf, String> {
+        self.by_id
+            .get(&id)
             .map(|entry| PathBuf::from(format!("/proc/self/fd/{}", entry.file.as_raw_fd())))
-            .ok_or_else(|| format!("object {key:?} was not pinned"))
+            .ok_or_else(|| format!("object {id:?} was not pinned"))
     }
 
     /// Every pinned object, for `discovery[]`.
     pub fn pinned(&self) -> impl Iterator<Item = PinnedSummary<'_>> {
-        self.by_key.iter().map(|(key, entry)| PinnedSummary {
-            key: *key,
+        self.by_id.iter().map(|(id, entry)| PinnedSummary {
+            id: *id,
+            key: entry.raw.key,
             path: &entry.path,
             sha256: &entry.sha256,
             build_id: entry.build_id.as_deref(),
-            identity_source: entry.identity_source,
-            note: entry.note.as_deref(),
+            identity_source: "mountinfo",
+            note: None,
+        })
+    }
+
+    pub fn view_claims(&self, view: ProcessViewId) -> Option<&ViewClaims> {
+        self.ownership.get(&view)
+    }
+
+    /// The one pin opened for a manifest object before it is absorbed into the
+    /// capture set. Used only to compare that opened object with scan-owned pins.
+    pub fn id_for_path(&self, path: &str) -> Option<PinnedObjectId> {
+        let path = normalize_target_path(path)?;
+        let mut ids = self.raw_to_id.iter().filter_map(|(raw, id)| {
+            (raw.mount_namespace.is_none() && raw.path == path).then_some(*id)
+        });
+        let first = ids.next()?;
+        ids.next().is_none().then_some(first)
+    }
+
+    /// Resolves a manifest record only through the exact raw instance established
+    /// when that record's path was opened. A bare raw key is never enough.
+    pub fn id_for_manifest(&self, key: ObjectKey, path: &str) -> Option<PinnedObjectId> {
+        self.raw_to_id
+            .get(&RawObjectInstance::manifest(key, path.to_string())?)
+            .copied()
+    }
+
+    /// Exact ordinary-file equality between two already opened, hashed pin sets.
+    pub fn exactly_matches(
+        &self,
+        id: PinnedObjectId,
+        other: &Self,
+        other_id: PinnedObjectId,
+    ) -> bool {
+        self.by_id
+            .get(&id)
+            .zip(other.by_id.get(&other_id))
+            .is_some_and(|(left, right)| ordinary_identity_equal(left, right))
+    }
+
+    pub fn id_for_scanned(
+        &self,
+        module: &ScannedModule,
+        key: ObjectKey,
+        path: &str,
+    ) -> Option<PinnedObjectId> {
+        self.raw_to_id
+            .get(&RawObjectInstance::scanned(module, key, path)?)
+            .copied()
+    }
+
+    pub fn summary(&self, id: PinnedObjectId) -> Option<PinnedSummary<'_>> {
+        let entry = self.by_id.get(&id)?;
+        Some(PinnedSummary {
+            id,
+            key: entry.raw.key,
+            path: &entry.path,
+            sha256: &entry.sha256,
+            build_id: entry.build_id.as_deref(),
+            identity_source: "mountinfo",
+            note: None,
         })
     }
 
@@ -218,7 +374,7 @@ impl PinnedObjects {
         if self.changed.get() {
             return Ok(false);
         }
-        for entry in self.by_key.values() {
+        for entry in self.by_id.values() {
             if pin_of(&entry.file).map_err(|e| format!("{}: {e}", entry.path))? != entry.pin {
                 self.changed.set(true);
                 return Ok(false);
@@ -231,44 +387,118 @@ impl PinnedObjects {
     pub fn provider_changed(&self) -> bool {
         self.changed.get()
     }
+
+    fn insert_entry(&mut self, entry: Entry, skipped: &mut Vec<Skipped>) -> Option<PinnedObjectId> {
+        let key = entry.raw.key;
+        if self.rejected_keys.contains(&key) {
+            skipped.push(ambiguous_identity_skip());
+            return None;
+        }
+        let same_key: Vec<PinnedObjectId> = self
+            .by_id
+            .iter()
+            .filter_map(|(id, known)| (known.raw.key == key).then_some(*id))
+            .collect();
+        if let Some(id) = same_key
+            .iter()
+            .copied()
+            .find(|id| ordinary_identity_equal(&self.by_id[id], &entry))
+        {
+            self.raw_to_id.insert(entry.raw, id);
+            return Some(id);
+        }
+        if let Some(id) = same_key
+            .iter()
+            .copied()
+            .find(|id| overlay_identity_equal(&self.by_id[id], &entry))
+        {
+            skipped.push(overlay_uncertainty(&entry, &self.by_id[&id]));
+            self.raw_to_id.insert(entry.raw, id);
+            return Some(id);
+        }
+        if !same_key.is_empty() {
+            self.reject_key(key, skipped);
+            return None;
+        }
+        let id = PinnedObjectId(self.next_id);
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("capture object id overflow");
+        self.raw_to_id.insert(entry.raw.clone(), id);
+        self.by_id.insert(id, entry);
+        Some(id)
+    }
+
+    fn reject_key(&mut self, key: ObjectKey, skipped: &mut Vec<Skipped>) {
+        self.rejected_keys.insert(key);
+        let ids: BTreeSet<PinnedObjectId> = self
+            .by_id
+            .iter()
+            .filter_map(|(id, entry)| (entry.raw.key == key).then_some(*id))
+            .collect();
+        self.by_id.retain(|id, _| !ids.contains(id));
+        self.raw_to_id
+            .retain(|raw, id| raw.key != key && !ids.contains(id));
+        for claims in self.ownership.values_mut() {
+            claims.remove(&ids);
+        }
+        if !ids.is_empty() {
+            skipped.push(ambiguous_identity_skip());
+        }
+    }
 }
 
-/// The `(device, inode)` a mapping of this fd would show, and how it was determined.
-/// `mapping_file_key` renders the device the way `/proc/<pid>/maps` does (fdinfo +
-/// mountinfo, so btrfs subvolumes and overlay agree). When the fd's mount is missing
-/// from the observer's own table — plausible for a container — `st_dev` is *not* that
-/// device, so `"stat"` records that only the inode is comparable.
-fn identity_of(file: &std::fs::File) -> Result<FoundIdentity, String> {
-    let note = match mapping_file_key(file) {
-        Ok(key) => {
-            return Ok(FoundIdentity {
-                key: ObjectKey {
-                    device: Device {
-                        major: key.device_major,
-                        minor: key.device_minor,
-                    },
-                    inode: key.inode,
-                },
-                source: IdentitySource::Mountinfo,
-                note: None,
-            });
-        }
-        Err(error) => format!("mountinfo device unavailable ({error}); inode compared alone"),
-    };
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("fstat failed: {error}"))?;
-    Ok(FoundIdentity {
-        key: ObjectKey {
-            device: Device {
-                major: libc::major(metadata.dev()).into(),
-                minor: libc::minor(metadata.dev()).into(),
-            },
-            inode: metadata.ino(),
+fn ambiguous_identity_skip() -> Skipped {
+    Skipped {
+        subject: "discovery subject".into(),
+        reason: "physical identity is ambiguous: equal mapping keys had unequal or unavailable full opened-file identities; the collision group was not attached".into(),
+    }
+}
+
+fn ordinary_identity_equal(left: &Entry, right: &Entry) -> bool {
+    left.mapping == right.mapping
+        && left.pin == right.pin
+        && !left.sha256.is_empty()
+        && left.sha256 == right.sha256
+}
+
+fn overlay_identity_equal(left: &Entry, right: &Entry) -> bool {
+    left.overlay
+        && right.overlay
+        && left.pin == right.pin
+        && !left.sha256.is_empty()
+        && left.sha256 == right.sha256
+}
+
+fn overlay_uncertainty(entry: &Entry, kept: &Entry) -> Skipped {
+    Skipped {
+        subject: format!("{} ({:?})", entry.path, entry.raw.key),
+        reason: format!(
+            "mapping {:?} was collapsed onto {:?} by the overlayfs + inode metadata + \
+             SHA-256 heuristic, which cannot prove physical identity across overlay \
+             instances; calls through a distinct byte-identical instance would not be probed",
+            entry.raw.key, kept.raw.key,
+        ),
+    }
+}
+
+/// The complete comparable mapping identity of an opened fd. `mapping_file_key`
+/// resolves fdinfo's mount ID through mountinfo, so btrfs subvolumes and overlay are
+/// compared in the same representation `/proc/<pid>/maps` uses. Missing mount data is
+/// incomparable and fails closed; `st_dev` is never substituted.
+fn identity_of(file: &std::fs::File) -> Result<MappingFileKey, String> {
+    mapping_file_key(file).map_err(|error| format!("mapping identity unavailable: {error}"))
+}
+
+fn object_key(mapping: MappingFileKey) -> ObjectKey {
+    ObjectKey {
+        device: Device {
+            major: mapping.device_major,
+            minor: mapping.device_minor,
         },
-        source: IdentitySource::Stat,
-        note: Some(note),
-    })
+        inode: mapping.inode,
+    }
 }
 
 /// Structural validation + open + size cap + identity match + executable-offset check.
@@ -400,37 +630,40 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
     if !problems.is_empty() {
         return Err(problems);
     }
-    let mut by_key = BTreeMap::new();
+    let mut result = PinnedObjects::empty();
     for (path, file, inspected, pin) in opened.into_values() {
-        let found = match identity_of(&file) {
+        let mapping = match identity_of(&file) {
             Ok(found) => found,
             Err(error) => {
                 problems.push(format!("{path}: {error}"));
                 continue;
             }
         };
-        let key = found.key;
-        let entry = match Entry::new(file, pin, path.clone(), &inspected.identity, found) {
+        let key = object_key(mapping);
+        let Some(raw) = RawObjectInstance::manifest(key, path.clone()) else {
+            problems.push(format!("{path}: object path cannot be normalized"));
+            continue;
+        };
+        let entry = match Entry::new(file, pin, path.clone(), &inspected.identity, raw, mapping) {
             Ok(entry) => entry,
             Err(error) => {
                 problems.push(format!("{path}: {error}"));
                 continue;
             }
         };
-        if let Some(previous) = by_key.insert(key, entry) {
-            problems.push(format!(
-                "{path} and {} are the same object ({key:?}); refusing an ambiguous pin",
-                previous.path
-            ));
+        let mut skipped = Vec::new();
+        if result.insert_entry(entry, &mut skipped).is_none() {
+            problems.extend(
+                skipped
+                    .into_iter()
+                    .map(|skip| format!("{path}: {}", skip.reason)),
+            );
         }
     }
     if !problems.is_empty() {
         return Err(problems);
     }
-    Ok(PinnedObjects {
-        by_key,
-        changed: std::cell::Cell::new(false),
-    })
+    Ok(result)
 }
 
 /// Opens, identity-checks, hashes once and pins every object the scan named. Objects
@@ -447,217 +680,196 @@ pub fn pin_scanned_objects(
     modules: &[ScannedModule],
     budget: &mut CaptureWorkBudget,
 ) -> Result<(PinnedObjects, Vec<Skipped>), String> {
-    let pin = PidPin::open(pid)?;
-    // Both the table-owning modules and every object a table entry points into: an
-    // entry may land in a dependency the module itself only forwards to.
-    let mut wanted: BTreeMap<ObjectKey, &str> = BTreeMap::new();
-    for module in modules {
-        wanted.entry(module.key).or_insert(&module.path);
-        for entry in module.tables.iter().flat_map(|table| &table.entries) {
-            wanted.entry(entry.object).or_insert(&entry.object_path);
-        }
-    }
-
-    let exited = || format!("pid {pid} exited during discovery");
-    let mut by_key = BTreeMap::new();
-    let mut skipped = Vec::new();
-    for (key, path) in wanted {
-        // Opening through /proc/<pid>/root is a per-pid action (spec §4.5).
-        if !pin.still_the_same() {
-            return Err(exited());
-        }
-        match pin_scanned_object(pid, key, path, budget) {
-            Ok(entry) => {
-                by_key.insert(key, entry);
-            }
-            Err(reason) => skipped.push(Skipped {
-                subject: path.to_string(),
-                reason,
-            }),
-        }
-    }
-    if !pin.still_the_same() {
-        return Err(exited());
-    }
-    Ok((
-        PinnedObjects {
-            by_key,
-            changed: std::cell::Cell::new(false),
-        },
-        skipped,
-    ))
+    let id = modules
+        .first()
+        .map_or(ProcessViewId(0), |module| module.view);
+    let view = ProcessView::open(id, pid)?;
+    pin_scanned_view_objects(&view, modules, budget)
 }
 
-/// Heuristically collapses likely shared overlay mappings onto one pinned key and
-/// drops duplicate module views. Returns how many keys were collapsed plus published
-/// uncertainty/loss evidence; every collapse is uncertain because overlayfs, inode
-/// metadata and identical bytes do not prove physical identity across overlay instances.
-///
-/// `ObjectKey` is `(device, inode)`, and that pair identifies a *mapping*, not a
-/// file: `/proc/<pid>/maps` renders `i_sb->s_dev`, the superblock the mapping was
-/// reached through, and an overlay mount reports the *underlying* inode's number under
-/// its own anonymous superblock device. Two containers started from one image
-/// therefore show one file as `[0,102]:56317450` and
-/// `[0,104]:56317450` — two keys, two modules, two slots. A uprobe is registered per
-/// `(inode, offset)`, so both slots are two registrations on *one* point: both fire
-/// for every call from either container, every count doubles, and nothing in the
-/// document says so (neither slot is shared by two modules, so `module_ambiguous`
-/// stays 0 and every entry reads as attributed). N pods from one image inflate N×,
-/// which is the ordinary Kubernetes shape, so this is not an edge case.
-///
-/// Candidates must both be opened through overlayfs and have equal inode number, size,
-/// ctime and whole-file SHA-256, with only the mapping device differing. The device is
-/// deliberately not compared because the common Kubernetes shared-layer case exposes
-/// one provider under a different anonymous overlay device per container.
-///
-/// This remains a heuristic: two independent overlay instances over byte-identical
-/// filesystem images can satisfy every predicate while resolving to distinct kernel
-/// inodes. Collapsing them would under-count one instance, so each rewrite is published
-/// through `Skipped` and forces `PARTIAL`. That makes the uncertainty explicit while
-/// retaining one-slot counting for the measured shared-image-layer case.
-///
-/// Two shapes deliberately do **not** merge:
-///  - one process reaching the file through an overlay and another reaching the same
-///    file directly (an overlay whose lowerdir is the very path the other maps). No
-///    container runtime builds that; a hand-rolled `mount -t overlay` could.
-///  - an overlay with `xino` disabled that numbers inodes from its own pool instead of
-///    passing the underlying inode's number through: `Pin.ino` then differs and nothing
-///    here fires.
-///
-/// A target two *different* modules both publish is a different thing entirely and
-/// is untouched here: those have different digests, so they keep their own keys, and
-/// `plan::merge` still gives that shared target one slot marked ambiguous and
-/// COUNT_ONLY.
-///
-/// Call this *after* `drop_unpinned_entries`, so the election below counts targets that
-/// can actually be attached rather than merely decoded.
-pub fn collapse_overlay_mappings(
-    modules: &mut Vec<ScannedModule>,
-    pinned: &PinnedObjects,
-) -> (usize, Vec<Skipped>) {
-    let mut first: BTreeMap<(Pin, &str), ObjectKey> = BTreeMap::new();
-    let mut canonical: BTreeMap<ObjectKey, ObjectKey> = BTreeMap::new();
+pub fn pin_scanned_view_objects(
+    view: &ProcessView,
+    modules: &[ScannedModule],
+    budget: &mut CaptureWorkBudget,
+) -> Result<(PinnedObjects, Vec<Skipped>), String> {
+    // Both the table-owning modules and every object a table entry points into: an
+    // entry may land in a dependency the module itself only forwards to.
+    let mut wanted = BTreeSet::new();
+    let mut skipped = Vec::new();
+    for module in modules {
+        if module.view != view.id() || module.mount_namespace != view.mount_namespace() {
+            return Err("scan result belongs to a different process view".into());
+        }
+        match RawObjectInstance::scanned(module, module.key, &module.path) {
+            Some(raw) => {
+                wanted.insert(raw);
+            }
+            None => skipped.push(Skipped {
+                subject: module.path.clone(),
+                reason: "target path cannot be normalized; object was not pinned".into(),
+            }),
+        }
+        for entry in module.tables.iter().flat_map(|table| &table.entries) {
+            match RawObjectInstance::scanned(module, entry.object, &entry.object_path) {
+                Some(raw) => {
+                    wanted.insert(raw);
+                }
+                None => skipped.push(Skipped {
+                    subject: entry.name.to_string(),
+                    reason: "target path cannot be normalized; entry was not pinned".into(),
+                }),
+            }
+        }
+    }
+
+    let exited = || "process generation exited during discovery".to_string();
+    let mut pinned = PinnedObjects::empty();
+    for raw in wanted {
+        // Opening through /proc/<pid>/root is a per-pid action (spec §4.5).
+        if !view.still_the_same() {
+            return Err(exited());
+        }
+        let candidate = pin_scanned_object(view, raw.clone(), budget);
+        record_scanned_candidate(&mut pinned, raw, candidate, &mut skipped);
+    }
+    if !view.still_the_same() {
+        return Err(exited());
+    }
+    Ok((pinned, skipped))
+}
+
+fn record_scanned_candidate(
+    pinned: &mut PinnedObjects,
+    raw: RawObjectInstance,
+    candidate: Result<Entry, String>,
+    skipped: &mut Vec<Skipped>,
+) {
+    match candidate {
+        Ok(entry) => {
+            pinned.insert_entry(entry, skipped);
+        }
+        Err(reason) => {
+            // A missing mapping identity or digest makes every equal raw-key
+            // observation incomparable. Remember the failed member so a candidate
+            // from another process view cannot become receiver-wins authority.
+            pinned.reject_key(raw.key, skipped);
+            skipped.push(Skipped {
+                subject: raw.path,
+                reason,
+            });
+        }
+    }
+}
+
+/// Resolves every process-view-local mapping reference to a capture-local opened
+/// object. Ordinary identities merge only when their complete mapping identity,
+/// pin metadata, and digest agree. The one pre-existing exception is the bounded
+/// overlayfs heuristic, which preserves all process views and publishes uncertainty.
+pub fn reconcile_scanned_modules(
+    modules: &[ScannedModule],
+    pinned: &mut PinnedObjects,
+) -> (Vec<ReconciledModule>, usize, Vec<Skipped>) {
+    let mut first: BTreeMap<(Pin, &str), PinnedObjectId> = BTreeMap::new();
+    let mut canonical: BTreeMap<PinnedObjectId, PinnedObjectId> = BTreeMap::new();
     let mut lost = Vec::new();
-    for (key, entry) in &pinned.by_key {
-        // An object nothing hashed has no content to be identified by, and one not
-        // reached through an overlay has no reason to show two devices: absence of
-        // evidence is never evidence of sameness.
+    for (id, entry) in &pinned.by_id {
         if entry.sha256.is_empty() || !entry.overlay {
             continue;
         }
         match first.entry((entry.pin, entry.sha256.as_str())) {
             std::collections::btree_map::Entry::Vacant(slot) => {
-                slot.insert(*key);
+                slot.insert(*id);
             }
             std::collections::btree_map::Entry::Occupied(kept) => {
                 let kept = *kept.get();
-                canonical.insert(*key, kept);
-                lost.push(Skipped {
-                    subject: format!("{} ({key:?})", entry.path),
-                    reason: format!(
-                        "mapping {key:?} was collapsed onto {kept:?} by the overlayfs + \
-                         inode metadata + SHA-256 heuristic, which cannot prove physical \
-                         identity across overlay instances; calls through a distinct \
-                         byte-identical instance would not be probed"
-                    ),
-                });
+                canonical.insert(*id, kept);
+                lost.push(overlay_uncertainty(entry, &pinned.by_id[&kept]));
             }
         }
     }
-    if canonical.is_empty() {
-        return (0, lost);
-    }
-    for module in modules.iter_mut() {
-        // A table entry may land in a dependency rather than in the module that
-        // published it, and that dependency is shared through the same mounts.
-        for entry in module
-            .tables
-            .iter_mut()
-            .flat_map(|table| &mut table.entries)
-        {
-            if let Some(key) = canonical.get(&entry.object) {
-                entry.object = *key;
-            }
+    for id in pinned.raw_to_id.values_mut() {
+        if let Some(kept) = canonical.get(id) {
+            *id = *kept;
         }
     }
-    // Keep one module per heuristic group. This is the shape that avoids duplicate
-    // registrations in the measured shared-layer case; the uncertainty above records
-    // that a distinct overlay instance could instead be omitted. The candidate with
-    // the most attachable targets wins — one process's
-    // `/proc/<pid>/mem` can be unreadable, or over the scan's byte caps, while another
-    // matching mapping was read in full, and an empty module must not shadow the one
-    // with targets to attach.
-    //
-    // Tables are read from *per-process* memory, so the loser can legitimately hold
-    // targets the winner does not: an in-memory patch applied in one container, or a
-    // dependency mapped only in one mount namespace. Those cannot be attached and are
-    // reported as skipped rather than dropped — a loss with no record is exactly the
-    // silence this whole task is about.
-    let targets = |module: &ScannedModule| -> BTreeSet<(ObjectKey, u64)> {
-        module
-            .tables
-            .iter()
-            .flat_map(|table| &table.entries)
-            .map(|entry| (entry.object, entry.file_offset))
-            .collect()
-    };
-    let mut kept: Vec<(ScannedModule, ObjectKey)> = Vec::new();
-    for mut module in std::mem::take(modules) {
-        let original_key = module.key;
-        module.key = canonical
-            .get(&original_key)
-            .copied()
-            .unwrap_or(original_key);
-        let Some(position) = kept.iter().position(|(known, _)| known.key == module.key) else {
-            kept.push((module, original_key));
+    for claims in pinned.ownership.values_mut() {
+        claims.remap(&canonical);
+    }
+    for id in canonical.keys() {
+        pinned.by_id.remove(id);
+    }
+
+    let mut reconciled = Vec::new();
+    for module in modules {
+        let Some(object) = pinned.id_for_scanned(module, module.key, &module.path) else {
+            lost.push(Skipped {
+                subject: module.path.clone(),
+                reason: "module has no comparable pinned identity; it was not attached".into(),
+            });
             continue;
         };
-        let (here, there) = (targets(&module), targets(&kept[position].0));
-        let wins = here.len() > there.len();
-        let missing = if wins {
-            there.difference(&here).count()
-        } else {
-            here.difference(&there).count()
-        };
-        if missing > 0 {
-            let discarded = if wins {
-                (&kept[position].0.path, kept[position].1)
-            } else {
-                (&module.path, original_key)
-            };
-            lost.push(Skipped {
-                subject: format!("{} ({:?})", discarded.0, discarded.1),
-                reason: format!(
-                    "the attached mapping does not publish {missing} target(s) the \
-                     discarded mapping decoded; those are not probed — the two \
-                     processes' function tables differ (a table patched in memory, or \
-                     a dependency mapped in only one mount namespace)"
-                ),
-            });
+        let mut scanned = module.clone();
+        let mut entry_objects = Vec::with_capacity(scanned.tables.len());
+        for table in &mut scanned.tables {
+            let mut ids = Vec::with_capacity(table.entries.len());
+            let mut kept = Vec::with_capacity(table.entries.len());
+            for entry in std::mem::take(&mut table.entries) {
+                match pinned.id_for_scanned(module, entry.object, &entry.object_path) {
+                    Some(id) => {
+                        ids.push(id);
+                        kept.push(entry);
+                    }
+                    None => {
+                        let skip = Skipped {
+                            subject: entry.name.to_string(),
+                            reason: format!(
+                                "{} could not be reconciled to a comparable pinned object; entry was not attached",
+                                entry.object_path
+                            ),
+                        };
+                        table.unpinned.push(skip.clone());
+                        lost.push(skip);
+                    }
+                }
+            }
+            table.entries = kept;
+            entry_objects.push(ids);
         }
-        if wins {
-            kept[position] = (module, original_key);
+        let claims = pinned.ownership.entry(module.view).or_default();
+        claims
+            .tables
+            .extend(std::iter::repeat_n(object, scanned.tables.len()));
+        claims.pins.push(object);
+        for (table, ids) in scanned.tables.iter().zip(&entry_objects) {
+            for (entry, id) in table.entries.iter().zip(ids) {
+                claims.targets.push((*id, entry.file_offset));
+                claims.pins.push(*id);
+            }
         }
+        reconciled.push(ReconciledModule {
+            scanned,
+            object,
+            entry_objects,
+        });
     }
-    *modules = kept.into_iter().map(|(module, _)| module).collect();
-    (canonical.len(), lost)
+    (reconciled, canonical.len(), lost)
 }
 
 fn pin_scanned_object(
-    pid: u32,
-    key: ObjectKey,
-    path: &str,
+    view: &ProcessView,
+    raw: RawObjectInstance,
     budget: &mut CaptureWorkBudget,
 ) -> Result<Entry, String> {
     // The target's own filesystem view: a container's object is never copied out.
-    let file = open_object(Path::new(&format!("/proc/{pid}/root{path}")))?;
+    let file = open_object(Path::new(&format!("/proc/{}/root{}", view.pid(), raw.path)))?;
     let found = identity_of(&file)?;
-    if !found.source.confirms(found.key, key) {
+    if object_key(found) != raw.key {
         return Err(format!(
-            "identity_mismatch: the mapping is {key:?} but {path} now opens as {:?} \
-             (compared via {})",
-            found.key,
-            found.source.label(),
+            "identity_mismatch: the mapping is {:?} but {} now opens as {:?} \
+             (compared via mountinfo)",
+            raw.key,
+            raw.path,
+            object_key(found),
         ));
     }
     let before = pin_of(&file)?;
@@ -686,7 +898,14 @@ fn pin_scanned_object(
     if pin_of(&file)? != before {
         return Err("file changed while it was being identified — retry".into());
     }
-    Entry::new(file, before, path.to_string(), &inspected.identity, found)
+    Entry::new(
+        file,
+        before,
+        raw.path.clone(),
+        &inspected.identity,
+        raw,
+        found,
+    )
 }
 
 #[cfg(test)]
@@ -709,6 +928,11 @@ mod tests {
 
     fn module(key: ObjectKey) -> ScannedModule {
         ScannedModule {
+            view: ProcessViewId(key.device.minor as u32),
+            mount_namespace: MountNamespaceId {
+                device: 1,
+                inode: key.device.minor,
+            },
             key,
             path: PATH.into(),
             exports: vec!["C_GetFunctionList".into()],
@@ -734,31 +958,39 @@ mod tests {
     /// state through the real scan needs two containers. Each entry is
     /// `(key, sha256, ctime)`; the pin's inode is the key's, as a real pin's always is.
     fn pin_set(entries: &[(ObjectKey, &str, i64)], overlay: bool) -> PinnedObjects {
-        PinnedObjects {
-            by_key: entries
-                .iter()
-                .map(|(key, sha, ctime)| {
-                    (
-                        *key,
-                        Entry {
-                            file: std::fs::File::open("/dev/null").unwrap(),
-                            pin: Pin {
-                                ino: key.inode,
-                                size: 4096,
-                                ctime: (*ctime, 7),
-                            },
-                            path: PATH.into(),
-                            sha256: (*sha).into(),
-                            build_id: None,
-                            identity_source: IdentitySource::Stat.label(),
-                            note: None,
-                            overlay,
-                        },
-                    )
-                })
-                .collect(),
-            changed: std::cell::Cell::new(false),
+        let mut result = PinnedObjects::empty();
+        for (key, sha, ctime) in entries {
+            let raw = RawObjectInstance {
+                mount_namespace: Some(MountNamespaceId {
+                    device: 1,
+                    inode: key.device.minor,
+                }),
+                key: *key,
+                path: PATH.into(),
+            };
+            let mapping = MappingFileKey {
+                mount_id: key.device.minor + 1,
+                device_major: key.device.major,
+                device_minor: key.device.minor,
+                inode: key.inode,
+            };
+            let entry = Entry {
+                raw,
+                mapping,
+                file: std::fs::File::open("/dev/null").unwrap(),
+                pin: Pin {
+                    ino: key.inode,
+                    size: 4096,
+                    ctime: (*ctime, 7),
+                },
+                path: PATH.into(),
+                sha256: (*sha).into(),
+                build_id: None,
+                overlay,
+            };
+            result.insert_entry(entry, &mut Vec::new());
         }
+        result
     }
 
     /// Objects opened through a container's overlay mount — the shape this is about.
@@ -777,30 +1009,220 @@ mod tests {
         assert!(error.contains("fstatfs failed"), "{error}");
     }
 
+    #[test]
+    fn raw_grouping_normalizes_path_aliases_but_keeps_mount_namespaces_distinct() {
+        let key = overlay(102);
+        let mut plain = module(key);
+        plain.path = "/usr/lib/softhsm/libsofthsm2.so".into();
+        let mut alias = plain.clone();
+        alias.path = "/usr/lib/./softhsm/../softhsm/libsofthsm2.so".into();
+        assert_eq!(
+            RawObjectInstance::scanned(&plain, key, &plain.path),
+            RawObjectInstance::scanned(&alias, key, &alias.path)
+        );
+
+        alias.mount_namespace.inode += 1;
+        assert_ne!(
+            RawObjectInstance::scanned(&plain, key, &plain.path),
+            RawObjectInstance::scanned(&alias, key, &alias.path)
+        );
+    }
+
+    #[test]
+    fn absorbing_incomparable_same_key_candidates_rejects_the_collision_group() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
+        let mut second = image_pins(&[(key, "aaaaaaaa", 1)]);
+        second.by_id.values_mut().next().unwrap().mapping.mount_id += 1;
+
+        let skipped = first.absorb(second);
+
+        assert_eq!(
+            first.pinned().count(),
+            0,
+            "receiver-wins would let one incomparable fd lend its offsets to the other view"
+        );
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(skipped[0].reason.contains("physical identity is ambiguous"));
+    }
+
+    #[test]
+    fn an_unavailable_identity_rejects_its_whole_raw_key_group() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        for unavailable_first in [false, true] {
+            let mut source = image_pins(&[(key, "aaaaaaaa", 1)]);
+            let entry = source.by_id.pop_first().unwrap().1;
+            let raw = entry.raw.clone();
+            let mut pinned = PinnedObjects::empty();
+            let mut skipped = Vec::new();
+            if unavailable_first {
+                record_scanned_candidate(
+                    &mut pinned,
+                    raw.clone(),
+                    Err("mapping identity unavailable".into()),
+                    &mut skipped,
+                );
+            }
+            record_scanned_candidate(&mut pinned, raw.clone(), Ok(entry), &mut skipped);
+            if !unavailable_first {
+                record_scanned_candidate(
+                    &mut pinned,
+                    raw,
+                    Err("mapping identity unavailable".into()),
+                    &mut skipped,
+                );
+            }
+            assert_eq!(
+                pinned.pinned().count(),
+                0,
+                "an unavailable group member left an attachable candidate"
+            );
+            assert!(
+                skipped
+                    .iter()
+                    .any(|skip| skip.reason.contains("physical identity is ambiguous")),
+                "the rejected collision group needs bounded ambiguity evidence: {skipped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_raw_key_overlay_candidates_keep_the_explicit_partial_exception() {
+        let key = ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 102,
+            },
+            inode: INODE,
+        };
+        let mut first = pins(&[(key, SHA, 1)]);
+        let mut second = pins(&[(key, SHA, 1)]);
+        second.by_id.values_mut().next().unwrap().mapping.mount_id += 1;
+
+        let skipped = first.absorb(second);
+
+        assert_eq!(first.pinned().count(), 1, "the overlay exception regressed");
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(
+            skipped[0]
+                .reason
+                .contains("cannot prove physical identity across overlay instances"),
+            "{skipped:?}"
+        );
+    }
+
+    #[test]
+    fn absorbing_reconciled_view_claims_remaps_their_capture_local_ids() {
+        let real = |minor| ObjectKey {
+            device: Device { major: 8, minor },
+            inode: INODE + minor,
+        };
+        let first_module = module(real(1));
+        let mut first = image_pins(&[(real(1), "aaaaaaaa", 1)]);
+        reconcile_scanned_modules(std::slice::from_ref(&first_module), &mut first);
+
+        let incoming_module = module(real(17));
+        let mut incoming = image_pins(&[(real(17), "bbbbbbbb", 2)]);
+        reconcile_scanned_modules(std::slice::from_ref(&incoming_module), &mut incoming);
+        first.absorb(incoming);
+
+        let incoming_id = first
+            .pinned()
+            .find(|pin| pin.key == real(17))
+            .expect("incoming pin survives")
+            .id;
+        assert_eq!(
+            first
+                .view_claims(ProcessViewId(17))
+                .expect("incoming view claims survive")
+                .pins,
+            vec![incoming_id, incoming_id],
+            "ownership kept the incoming set's pre-absorb ID"
+        );
+    }
+
+    #[test]
+    fn rejecting_a_late_collision_removes_stale_view_claims() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let first_module = module(key);
+        let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reconcile_scanned_modules(std::slice::from_ref(&first_module), &mut first);
+
+        let mut collision = image_pins(&[(key, "aaaaaaaa", 1)]);
+        collision
+            .by_id
+            .values_mut()
+            .next()
+            .unwrap()
+            .mapping
+            .mount_id += 1;
+        first.absorb(collision);
+
+        let claims = first
+            .view_claims(first_module.view)
+            .expect("the accepted view remains represented");
+        assert!(claims.tables.is_empty(), "stale table IDs: {claims:?}");
+        assert!(claims.targets.is_empty(), "stale target IDs: {claims:?}");
+        assert!(claims.pins.is_empty(), "stale pin IDs: {claims:?}");
+    }
+
+    #[test]
+    fn overlay_canonicalization_remaps_existing_view_claims() {
+        let a = module(overlay(102));
+        let mut pinned = pins(&[(overlay(102), SHA, 1)]);
+        reconcile_scanned_modules(std::slice::from_ref(&a), &mut pinned);
+
+        let b = module(overlay(104));
+        let mut incoming = pins(&[(overlay(104), SHA, 1)]);
+        reconcile_scanned_modules(std::slice::from_ref(&b), &mut incoming);
+        pinned.absorb(incoming);
+
+        let modules = [a, b];
+        reconcile_scanned_modules(&modules, &mut pinned);
+        for module in modules {
+            let claims = pinned.view_claims(module.view).expect("view claims");
+            assert!(
+                claims
+                    .tables
+                    .iter()
+                    .chain(claims.targets.iter().map(|(id, _)| id))
+                    .chain(&claims.pins)
+                    .all(|id| pinned.by_id.contains_key(id)),
+                "view {:?} retained a removed pre-collapse ID: {claims:?}",
+                module.view
+            );
+        }
+    }
+
     /// Models the measured common case: two containers from one image layer expose
     /// matching overlay metadata under different anonymous devices. Two slots caused
     /// doubled counts in the live lane; one slot restores its exact count oracle, but
     /// the unit predicate cannot prove physical identity and must publish uncertainty.
     #[test]
     fn common_shared_overlay_layer_is_one_module_and_one_slot_with_uncertainty() {
-        let mut modules = vec![module(overlay(104)), module(overlay(102))];
-        let pinned = pins(&[(overlay(104), SHA, 1), (overlay(102), SHA, 1)]);
+        let modules = vec![module(overlay(104)), module(overlay(102))];
+        let mut pinned = pins(&[(overlay(104), SHA, 1), (overlay(102), SHA, 1)]);
 
-        let (collapsed, uncertainty) = collapse_overlay_mappings(&mut modules, &pinned);
+        let (modules, collapsed, uncertainty) = reconcile_scanned_modules(&modules, &mut pinned);
         assert_eq!(collapsed, 1);
         assert_eq!(uncertainty.len(), 1, "{uncertainty:?}");
-        assert!(
-            uncertainty[0].subject.starts_with(PATH)
-                && uncertainty[0].subject.contains("minor: 104"),
-            "{uncertainty:?}"
-        );
+        assert!(uncertainty[0].subject.starts_with(PATH), "{uncertainty:?}");
         assert!(
             uncertainty[0]
                 .reason
                 .contains("cannot prove physical identity"),
             "{uncertainty:?}"
         );
-        let plan = crate::plan::build_from_modules(&modules);
+        let plan = crate::plan::build_from_reconciled_modules(&modules);
         assert_eq!(plan.slots.len(), 1, "{:?}", plan.slots);
         assert_eq!(plan.modules.len(), 1, "{:?}", plan.modules);
         // One module reached by two mounts is not two modules claiming one target:
@@ -809,13 +1231,29 @@ mod tests {
         assert!(!plan.slots[0].semantic_ambiguous);
         assert_eq!(plan.module_ambiguous, 0);
         assert_eq!(
-            plan.entries_seen, 1,
-            "one collapsed mapping published one table"
+            plan.entries_seen, 2,
+            "both process views retain their table claims"
         );
-        // Every plan key is still one this capture pinned — `Session::start`
-        // resolves by key alone and has no fallback.
+        // Every plan reference is a capture-local pin ID; attach has no raw-key or
+        // pathname fallback.
         assert!(pinned.attach_path_for(plan.slots[0].object).is_ok());
-        assert!(pinned.attach_path_for(plan.modules[0].key).is_ok());
+        assert!(pinned.attach_path_for(plan.modules[0].object).is_ok());
+        assert_eq!(
+            pinned
+                .view_claims(ProcessViewId(102))
+                .expect("first view")
+                .targets
+                .len(),
+            1
+        );
+        assert_eq!(
+            pinned
+                .view_claims(ProcessViewId(104))
+                .expect("second view")
+                .targets
+                .len(),
+            1
+        );
     }
 
     /// Two mounts of two byte-identical filesystem images (squashfs, erofs, iso, a
@@ -832,14 +1270,12 @@ mod tests {
             device: Device { major: 7, minor },
             inode: INODE,
         };
-        let mut modules = vec![module(image(0)), module(image(1))];
-        let pinned = image_pins(&[(image(0), SHA, 1), (image(1), SHA, 1)]);
+        let modules = vec![module(image(0)), module(image(1))];
+        let mut pinned = image_pins(&[(image(0), SHA, 1), (image(1), SHA, 1)]);
 
-        assert_eq!(
-            collapse_overlay_mappings(&mut modules, &pinned),
-            (0, vec![])
-        );
-        let plan = crate::plan::build_from_modules(&modules);
+        let (modules, collapsed, lost) = reconcile_scanned_modules(&modules, &mut pinned);
+        assert_eq!((collapsed, lost), (0, vec![]));
+        let plan = crate::plan::build_from_reconciled_modules(&modules);
         assert_eq!(plan.slots.len(), 2, "{:?}", plan.slots);
         assert_eq!(plan.modules.len(), 2, "{:?}", plan.modules);
     }
@@ -853,7 +1289,7 @@ mod tests {
             device: Device { major: 8, minor },
             inode: INODE,
         };
-        for pins in [
+        for mut pins in [
             // Same inode number, different bytes: two providers, two modules.
             pins(&[(real(1), SHA, 1), (real(17), "0badc0de", 1)]),
             // Same inode number and the same bytes, but not the same inode: two
@@ -862,9 +1298,10 @@ mod tests {
             // Nothing hashed either one, so nothing identifies them.
             pins(&[(real(1), "", 1), (real(17), "", 1)]),
         ] {
-            let mut modules = vec![module(real(1)), module(real(17))];
-            assert_eq!(collapse_overlay_mappings(&mut modules, &pins), (0, vec![]));
-            let plan = crate::plan::build_from_modules(&modules);
+            let modules = vec![module(real(1)), module(real(17))];
+            let (modules, collapsed, lost) = reconcile_scanned_modules(&modules, &mut pins);
+            assert_eq!((collapsed, lost), (0, vec![]));
+            let plan = crate::plan::build_from_reconciled_modules(&modules);
             assert_eq!(plan.modules.len(), 2, "{:?}", plan.modules);
             assert_eq!(plan.slots.len(), 2, "{:?}", plan.slots);
         }
@@ -888,8 +1325,8 @@ mod tests {
             module.tables[0].entries[0].object = dependency;
             module
         };
-        let mut modules = vec![forwarding(102, dep(102)), forwarding(104, dep(104))];
-        let pinned = pins(&[
+        let modules = vec![forwarding(102, dep(102)), forwarding(104, dep(104))];
+        let mut pinned = pins(&[
             // The two providers happen to share an inode number too: only their
             // digests separate them, and that is enough.
             (overlay(102), "aaaaaaaa", 1),
@@ -898,10 +1335,10 @@ mod tests {
             (dep(104), "dddddddd", 1),
         ]);
 
-        let (collapsed, uncertainty) = collapse_overlay_mappings(&mut modules, &pinned);
+        let (modules, collapsed, uncertainty) = reconcile_scanned_modules(&modules, &mut pinned);
         assert_eq!(collapsed, 1);
         assert_eq!(uncertainty.len(), 1, "{uncertainty:?}");
-        let plan = crate::plan::build_from_modules(&modules);
+        let plan = crate::plan::build_from_reconciled_modules(&modules);
         assert_eq!(plan.modules.len(), 2, "{:?}", plan.modules);
         assert_eq!(plan.slots.len(), 1, "{:?}", plan.slots);
         assert_eq!(plan.slots[0].module_ids.len(), 2);
@@ -921,44 +1358,51 @@ mod tests {
     fn the_mapping_that_decoded_the_tables_is_the_one_kept() {
         let mut empty = module(overlay(104));
         empty.tables.clear();
-        let mut modules = vec![empty, module(overlay(102))];
-        let pinned = pins(&[(overlay(104), SHA, 1), (overlay(102), SHA, 1)]);
+        let modules = vec![empty, module(overlay(102))];
+        let mut pinned = pins(&[(overlay(104), SHA, 1), (overlay(102), SHA, 1)]);
 
-        let (collapsed, uncertainty) = collapse_overlay_mappings(&mut modules, &pinned);
+        let (modules, collapsed, uncertainty) = reconcile_scanned_modules(&modules, &mut pinned);
         assert_eq!(collapsed, 1);
         assert_eq!(uncertainty.len(), 1, "{uncertainty:?}");
-        assert_eq!(modules.len(), 1);
-        assert_eq!(crate::plan::build_from_modules(&modules).slots.len(), 1);
+        assert_eq!(modules.len(), 2, "both process views are retained");
+        assert_eq!(
+            crate::plan::build_from_reconciled_modules(&modules)
+                .slots
+                .len(),
+            1
+        );
     }
 
-    /// Function tables are read from *per-process* memory, so two collapse candidates
+    /// Function tables are read from *per-process* memory, so two overlay candidates
     /// can decode different targets — a table patched in memory in one container, or a
-    /// dependency mapped in only one mount namespace. The discarded mapping's targets
-    /// are a separate concrete loss from the physical-identity uncertainty.
+    /// dependency mapped in only one mount namespace. Both views' targets must survive.
     #[test]
-    fn targets_only_the_discarded_mapping_decoded_are_reported_not_dropped() {
+    fn all_process_views_overlay_target_union_is_retained() {
         let mut patched = module(overlay(104));
         let mut extra = patched.tables[0].entries[0].clone();
         extra.name = "C_Sign";
         extra.file_offset = 0x9000;
         patched.tables[0].entries.push(extra);
-        let mut modules = vec![module(overlay(102)), patched];
-        let pinned = pins(&[(overlay(102), SHA, 1), (overlay(104), SHA, 1)]);
+        let modules = vec![module(overlay(102)), patched];
+        let mut pinned = pins(&[(overlay(102), SHA, 1), (overlay(104), SHA, 1)]);
 
-        let (collapsed, lost) = collapse_overlay_mappings(&mut modules, &pinned);
+        let (modules, collapsed, lost) = reconcile_scanned_modules(&modules, &mut pinned);
         assert_eq!(collapsed, 1);
-        // The richer mapping wins, so the only record is the unavoidable physical-
-        // identity uncertainty, not target loss.
+        // Both views survive, so the only record is the unavoidable physical-
+        // identity uncertainty; neither view's target is lost.
         assert_eq!(lost.len(), 1, "{lost:?}");
         assert!(lost[0].reason.contains("cannot prove physical identity"));
-        assert_eq!(crate::plan::build_from_modules(&modules).slots.len(), 2);
+        assert_eq!(
+            crate::plan::build_from_reconciled_modules(&modules)
+                .slots
+                .len(),
+            2
+        );
 
         // Reversed: the mapping that wins on count is missing a target the other had.
         let mut a = module(overlay(102));
-        a.path = "/discarded/libsofthsm2.so".into();
         a.tables[0].entries[0].file_offset = 0x1000;
         let mut b = module(overlay(104));
-        b.path = "/attached/libsofthsm2.so".into();
         b.tables[0].entries[0].file_offset = 0x2000;
         b.tables[0].entries.push(ScannedEntry {
             name: "C_Sign",
@@ -966,53 +1410,39 @@ mod tests {
             object_path: PATH.into(),
             file_offset: 0x3000,
         });
-        let mut modules = vec![a, b];
-        let (_, lost) = collapse_overlay_mappings(&mut modules, &pinned);
-        let target_loss: Vec<_> = lost
-            .iter()
-            .filter(|skip| skip.reason.contains("1 target(s)"))
-            .collect();
-        assert_eq!(target_loss.len(), 1, "{lost:?}");
-        assert!(
-            target_loss[0]
-                .subject
-                .starts_with("/discarded/libsofthsm2.so")
-                && target_loss[0].subject.contains("minor: 102"),
-            "{target_loss:?}"
-        );
-        assert!(
-            target_loss[0].reason.contains("not probed"),
-            "{target_loss:?}"
+        let modules = vec![a, b];
+        let mut pinned = pins(&[(overlay(102), SHA, 1), (overlay(104), SHA, 1)]);
+        let (modules, _, lost) = reconcile_scanned_modules(&modules, &mut pinned);
+        assert_eq!(lost.len(), 1, "only overlay uncertainty remains: {lost:?}");
+        assert_eq!(
+            crate::plan::build_from_reconciled_modules(&modules)
+                .slots
+                .len(),
+            3,
+            "the union of both process views must be attached"
         );
     }
 
     #[test]
-    fn target_loss_names_discarded_incoming_mapping_when_existing_wins() {
+    fn overlay_target_union_is_order_independent() {
         let mut existing = module(overlay(102));
-        existing.path = "/attached/libsofthsm2.so".into();
         let mut extra = existing.tables[0].entries[0].clone();
         extra.name = "C_Sign";
         extra.file_offset = 0x3000;
         existing.tables[0].entries.push(extra);
 
         let mut incoming = module(overlay(104));
-        incoming.path = "/discarded/libsofthsm2.so".into();
         incoming.tables[0].entries[0].file_offset = 0x2000;
-        let mut modules = vec![existing, incoming];
-        let pinned = pins(&[(overlay(102), SHA, 1), (overlay(104), SHA, 1)]);
+        let modules = vec![existing, incoming];
+        let mut pinned = pins(&[(overlay(102), SHA, 1), (overlay(104), SHA, 1)]);
 
-        let (_, lost) = collapse_overlay_mappings(&mut modules, &pinned);
-        let target_loss: Vec<_> = lost
-            .iter()
-            .filter(|skip| skip.reason.contains("1 target(s)"))
-            .collect();
-        assert_eq!(target_loss.len(), 1, "{lost:?}");
-        assert!(
-            target_loss[0]
-                .subject
-                .starts_with("/discarded/libsofthsm2.so")
-                && target_loss[0].subject.contains("minor: 104"),
-            "{target_loss:?}"
+        let (modules, _, lost) = reconcile_scanned_modules(&modules, &mut pinned);
+        assert_eq!(lost.len(), 1, "only overlay uncertainty remains: {lost:?}");
+        assert_eq!(
+            crate::plan::build_from_reconciled_modules(&modules)
+                .slots
+                .len(),
+            3
         );
     }
 }

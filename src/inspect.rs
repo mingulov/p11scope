@@ -302,6 +302,11 @@ mod tests {
     fn sample() -> ScanOutcome {
         ScanOutcome::Scanned {
             modules: vec![ScannedModule {
+                view: crate::process::ProcessViewId(0),
+                mount_namespace: crate::process::MountNamespaceId {
+                    device: 1,
+                    inode: 1,
+                },
                 key: key(11),
                 path: "/usr/lib/softhsm/libsofthsm2.so".into(),
                 exports: vec!["C_GetFunctionList".into(), "C_GetInterfaceList".into()],
@@ -372,6 +377,11 @@ mod tests {
         let outcome = ScanOutcome::Unavailable {
             reason: "ptrace",
             modules: vec![ScannedModule {
+                view: crate::process::ProcessViewId(0),
+                mount_namespace: crate::process::MountNamespaceId {
+                    device: 1,
+                    inode: 1,
+                },
                 key: key(11),
                 path: "/usr/lib/softhsm/libsofthsm2.so".into(),
                 exports: vec!["C_GetFunctionList".into()],

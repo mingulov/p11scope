@@ -6,15 +6,17 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use p11scope::attach::{CapturePolicy, Scope, Session};
 use p11scope::cli::{self, CaptureArgs, CliError, Command, Kind, ScopeArg};
 use p11scope::discovery::identity::{
-    PinnedObjects, collapse_overlay_mappings, pin_manifest_objects, pin_scanned_objects,
+    PinnedObjectId, PinnedObjects, pin_manifest_objects, pin_scanned_view_objects,
+    reconcile_scanned_modules,
 };
 #[cfg(test)]
 use p11scope::discovery::scan::ScanLimits;
 use p11scope::discovery::scan::{
-    CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, Skipped, scan_pid,
+    CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, Skipped, scan_process_view,
 };
 use p11scope::manifest_input::read_manifest;
 use p11scope::output::AtomicFile;
+use p11scope::process::{ProcessView, ProcessViewId};
 use p11scope::{doctor, events, inspect, metrics, plan, process, render, scope, semantics, trace};
 use p11scope_manifest::manifest::{Manifest, Resolution, SCHEMA};
 use p11scope_manifest::maps::ObjectKey;
@@ -278,48 +280,72 @@ fn corroborate(
     }
 }
 
-/// The scan's view of the object a manifest describes, and whether the two agree on
-/// its bytes. Matched by SHA-256 first — a manifest records the device and inode of
-/// the host it was made on, which a container or a remount spells differently — and
-/// by the recorded path second: a path match whose hash differs is exactly §4.12's
-/// "manifest `sha256` ≠ the pinned object's".
+struct ScanView<'a> {
+    modules: Vec<&'a ScannedModule>,
+    agrees: bool,
+}
+
+/// The scan views of the exact opened object a manifest describes. A digest is a
+/// comparison conjunct, never authority to choose among byte-identical ordinary
+/// files. Every process view of the same exact object is retained for target union.
 fn scan_view<'a>(
     m: &Manifest,
     modules: &'a [ScannedModule],
-    pinned: &PinnedObjects,
-) -> Option<(&'a ScannedModule, bool)> {
-    let sha_of = |module: &ScannedModule| {
-        pinned
-            .pinned()
-            .find(|p| p.key == module.key)
-            .map(|p| p.sha256.to_string())
-    };
+    scan_pins: &PinnedObjects,
+    manifest_pins: &PinnedObjects,
+) -> Option<ScanView<'a>> {
     let sha = m
         .objects
         .iter()
         .find(|o| o.path == m.module_path)
-        .and_then(|o| o.identity.sha256.clone());
-    if let Some(sha) = sha
-        && let Some(module) = modules.iter().find(|m| sha_of(m).as_deref() == Some(&sha))
-    {
-        return Some((module, true));
+        .and_then(|o| o.identity.sha256.as_deref());
+    let own = manifest_pins.id_for_path(&m.module_path);
+    let exact: Vec<&ScannedModule> = modules
+        .iter()
+        .filter(|module| {
+            let Some(scan) = scan_pins.id_for_scanned(module, module.key, &module.path) else {
+                return false;
+            };
+            let Some(own) = own else { return false };
+            scan_pins.exactly_matches(scan, manifest_pins, own)
+                && scan_pins.summary(scan).map(|pin| pin.sha256) == sha
+        })
+        .collect();
+    if !exact.is_empty() {
+        return Some(ScanView {
+            modules: exact,
+            agrees: true,
+        });
     }
-    let module = modules.iter().find(|module| module.path == m.module_path)?;
+    let path_matches: Vec<&ScannedModule> = modules
+        .iter()
+        .filter(|module| {
+            module.path == m.module_path
+                && scan_pins
+                    .id_for_scanned(module, module.key, &module.path)
+                    .is_some()
+        })
+        .collect();
     // A module the scan saw but could not pin has no hash to disagree with: that is
     // "nothing corroborated it", never "the manifest is wrong".
-    sha_of(module).map(|_| (module, false))
+    (!path_matches.is_empty()).then_some(ScanView {
+        modules: path_matches,
+        agrees: false,
+    })
 }
 
 /// {object SHA-256, file offset} for every entry the scan decoded — the comparison
 /// a manifest can be held against without depending on device and inode numbers.
-fn scanned_targets(module: &ScannedModule, pinned: &PinnedObjects) -> BTreeSet<(String, u64)> {
-    module
-        .tables
+fn scanned_targets(modules: &[&ScannedModule], pinned: &PinnedObjects) -> BTreeSet<(String, u64)> {
+    modules
         .iter()
-        .flat_map(|table| &table.entries)
-        .filter_map(|entry| {
-            let sha = pinned.pinned().find(|p| p.key == entry.object)?.sha256;
-            Some((sha.to_string(), entry.file_offset))
+        .flat_map(|module| {
+            module.tables.iter().flat_map(move |table| {
+                table.entries.iter().filter_map(move |entry| {
+                    let id = pinned.id_for_scanned(module, entry.object, &entry.object_path)?;
+                    Some((pinned.summary(id)?.sha256.to_string(), entry.file_offset))
+                })
+            })
         })
         .collect()
 }
@@ -350,33 +376,34 @@ fn manifest_targets(m: &Manifest) -> BTreeSet<(String, u64)> {
 /// it is not an identity in this capture's namespace, and it must never be used as
 /// one. Two things break if it is:
 ///
-///  - `Session::start` resolves a slot by key first, so a recorded pair that happens
-///    to equal a live pin of an *unrelated* file (inode reuse after a rebuild is
-///    enough) attaches the manifest's offsets into that file;
+///  - plan lowering resolves a recorded pair to a capture-local pin, so a pair that
+///    happens to equal an *unrelated* live pin (inode reuse after a rebuild is enough)
+///    would select that file's ID;
 ///  - the union of §4.12 lands in two slots on one address, double-counting every
 ///    call, whenever the scan and the manifest name one object differently.
 ///
-/// After this pass every key in the plan is one this capture pinned — the invariant
-/// `attach.rs` resolves against, with no by-path fallback to paper over a miss.
+/// After this pass every manifest key lowers to the intended capture-local pin ID;
+/// `attach.rs` resolves only that ID, with no key or path fallback.
 fn retarget_to_pins(
     m: &mut Manifest,
-    scanned: Option<&ScannedModule>,
+    scanned: &[&ScannedModule],
     scan_pins: &PinnedObjects,
     own_pins: &PinnedObjects,
 ) {
-    // Only the objects the matched scan saw. Any pin with the same bytes could
-    // otherwise be adopted — including an earlier manifest's copy of a file this
-    // target does not map, which is a probe that never fires.
-    let seen: BTreeSet<ObjectKey> = scanned
-        .into_iter()
+    // Only exact opened objects named by the matched scan views. Digest equality
+    // cannot choose among two ordinary byte-identical files.
+    let seen: BTreeSet<PinnedObjectId> = scanned
+        .iter()
         .flat_map(|module| {
-            std::iter::once(module.key).chain(
-                module
-                    .tables
-                    .iter()
-                    .flat_map(|table| &table.entries)
-                    .map(|entry| entry.object),
-            )
+            std::iter::once((module.key, module.path.as_str()))
+                .chain(
+                    module
+                        .tables
+                        .iter()
+                        .flat_map(|table| &table.entries)
+                        .map(|entry| (entry.object, entry.object_path.as_str())),
+                )
+                .filter_map(|(key, path)| scan_pins.id_for_scanned(module, key, path))
         })
         .collect();
     // Driven from `objects[]`, because that is what was pinned: `pin_manifest_objects`
@@ -389,11 +416,13 @@ fn retarget_to_pins(
         .objects
         .iter()
         .filter_map(|object| {
-            let sha = object.identity.sha256.as_deref();
-            let summary = scan_pins
-                .pinned()
-                .find(|p| seen.contains(&p.key) && Some(p.sha256) == sha)
-                .or_else(|| own_pins.pinned().find(|p| p.path == object.path))?;
+            let own = own_pins.id_for_path(&object.path)?;
+            let summary = seen
+                .iter()
+                .copied()
+                .find(|scan| scan_pins.exactly_matches(*scan, own_pins, own))
+                .and_then(|scan| scan_pins.summary(scan))
+                .or_else(|| own_pins.summary(own))?;
             Some((plan::provenance_of(m, object)?, summary.key))
         })
         .collect();
@@ -509,23 +538,24 @@ fn read_manifest_file(path: &Path) -> Result<Manifest> {
 /// the pinning skips are printed rather than dropped: a module the observer could
 /// see but not read is exactly the gap an operator needs to know about.
 fn scan_and_pin(
-    pid: u32,
+    view: &ProcessView,
     a: &CaptureArgs,
     budget: &mut CaptureWorkBudget,
     counters: &mut DiscoveryCounters,
 ) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
-    let outcome = scan_pid(
+    let outcome = scan_process_view(
         &ScanRequest {
-            pid,
+            pid: view.pid(),
             hints: &a.modules,
             hooks: &a.hooks,
         },
+        view,
         budget,
     )
-    .map_err(|error| anyhow!("scanning pid {pid}: {error}"))?;
+    .map_err(|error| anyhow!("scanning process view {:?}: {error}", view.id()))?;
     counters.scan_unavailable = counters.scan_unavailable.or(outcome.unavailable_reason());
-    let (pinned, pin_skips) = pin_scanned_objects(pid, outcome.modules(), budget)
-        .map_err(|error| anyhow!("pinning the objects of pid {pid}: {error}"))?;
+    let (pinned, pin_skips) = pin_scanned_view_objects(view, outcome.modules(), budget)
+        .map_err(|error| anyhow!("pinning process view {:?}: {error}", view.id()))?;
     // Printed *and* kept: an object discovery could not read is a provider that
     // may never have been observed, and a report that only prints it leaves the
     // document claiming a clean capture.
@@ -546,40 +576,6 @@ fn scan_and_pin(
         ScanOutcome::Unavailable { modules, .. } => modules,
     };
     Ok((modules, pinned))
-}
-
-/// Drops every table entry whose object was not pinned, returning one `Skipped` per
-/// drop. `pin_scanned_objects` skips an object it cannot open, identify or afford to
-/// hash rather than failing the capture (spec §4.10) — so an entry pointing into one
-/// has no attach path of its own, and `Session::start` resolves slots by key with no
-/// fallback. Keeping such an entry would fail the whole attach, which is the opposite
-/// of what that per-object skip exists for: this is the scanned half of "every key in
-/// a plan is one this capture pinned".
-fn drop_unpinned_entries(modules: &mut [ScannedModule], pinned: &PinnedObjects) -> Vec<Skipped> {
-    let mut dropped = Vec::new();
-    for module in modules {
-        for table in &mut module.tables {
-            let mut lost = Vec::new();
-            table.entries.retain(|entry| {
-                if pinned.pinned().any(|p| p.key == entry.object) {
-                    return true;
-                }
-                lost.push(Skipped {
-                    subject: entry.name.to_string(),
-                    reason: format!(
-                        "{} was not pinned; nothing to attach into",
-                        entry.object_path
-                    ),
-                });
-                false
-            });
-            dropped.extend(lost.iter().cloned());
-            // Left on the table it came from, so the plan still counts it as a
-            // record the scan saw and attributes the skip to this module.
-            table.unpinned.extend(lost);
-        }
-    }
-    dropped
 }
 
 /// Discovery for one capture: scan the scope, read and corroborate any manifests,
@@ -606,20 +602,22 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
             ),
         });
     }
-    for pid in pids.iter().take(MAX_SCAN_PIDS) {
-        match scan_and_pin(*pid, a, &mut budget, &mut counters) {
+    for (view_index, pid) in pids.iter().take(MAX_SCAN_PIDS).enumerate() {
+        let view = match ProcessView::open(ProcessViewId(view_index as u32), *pid) {
+            Ok(view) => view,
+            Err(error) if named => return Err(anyhow!(error)),
+            Err(error) => {
+                counters.object_skips.push(Skipped {
+                    subject: "process view".into(),
+                    reason: format!("the process generation could not be pinned: {error}"),
+                });
+                continue;
+            }
+        };
+        match scan_and_pin(&view, a, &mut budget, &mut counters) {
             Ok((found, pins)) => {
-                pinned.absorb(pins);
-                // Ten processes of one container map one object under one key; ten
-                // containers of one image map it under ten (each mount has its own
-                // anonymous device). Only the first case is a key match, so this
-                // dedupe cannot see the second — `collapse_overlay_mappings` below
-                // handles the measured shared-layer case with explicit uncertainty.
-                for module in found {
-                    if !modules.iter().any(|known| known.key == module.key) {
-                        modules.push(module);
-                    }
-                }
+                counters.object_skips.extend(pinned.absorb(pins));
+                modules.extend(found);
             }
             // The pid the operator named *is* the capture; any other is one of many
             // in a cgroup, and may legitimately exit between listing and scanning —
@@ -634,37 +632,6 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
             }
         }
     }
-
-    // Before corroboration: an entry nothing pinned is not a target either source
-    // can be held to, and must never reach the plan.
-    let unpinned = drop_unpinned_entries(&mut modules, &pinned);
-    for skipped in &unpinned {
-        eprintln!(
-            "p11scope: discovery skipped {} — {}",
-            skipped.subject, skipped.reason
-        );
-    }
-
-    // Then, and only then: collapse the common shared-overlay-layer shape so one kernel
-    // uprobe point is not registered once per container mount. Overlay classification
-    // and matching bytes cannot prove physical identity, so every rewrite below also
-    // publishes uncertainty and forces PARTIAL. Run after the drop so election counts
-    // only targets that can actually be attached.
-    let (collapsed, differed) = collapse_overlay_mappings(&mut modules, &pinned);
-    if collapsed > 0 {
-        eprintln!(
-            "p11scope: discovery: {collapsed} matching overlay mapping(s) were collapsed \
-             onto one attach target; physical identity is not provable, so published \
-             uncertainty makes this capture PARTIAL"
-        );
-    }
-    for skipped in &differed {
-        eprintln!(
-            "p11scope: discovery skipped {} — {}",
-            skipped.subject, skipped.reason
-        );
-    }
-    counters.object_skips.extend(differed);
 
     let mut accepted: Vec<Manifest> = Vec::new();
     let mut corroborated: Vec<ObjectKey> = Vec::new();
@@ -686,14 +653,18 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
                 path.display()
             )
         })?;
-        let view = scan_view(&manifest, &modules, &pinned);
-        let mapped = view.map(|(module, _)| module.key);
+        let view = scan_view(&manifest, &modules, &pinned, &manifest_pins);
+        let mapped = view
+            .as_ref()
+            .and_then(|view| view.modules.first())
+            .map(|module| module.key);
         let outcome = corroborate(
             counters.scan_unavailable.is_some(),
-            view.map(|(_, agrees)| agrees),
+            view.as_ref().map(|view| view.agrees),
             &manifest_targets(&manifest),
             &view
-                .map(|(module, _)| scanned_targets(module, &pinned))
+                .as_ref()
+                .map(|view| scanned_targets(&view.modules, &pinned))
                 .unwrap_or_default(),
         );
         counters
@@ -714,12 +685,12 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
                 ));
                 retarget_to_pins(
                     &mut manifest,
-                    view.map(|(module, _)| module),
+                    view.as_ref().map_or(&[], |view| view.modules.as_slice()),
                     &pinned,
                     &manifest_pins,
                 );
                 accepted.push(manifest);
-                pinned.absorb(manifest_pins);
+                counters.object_skips.extend(pinned.absorb(manifest_pins));
             }
             Corroboration::Conflict => {
                 counters.conflicts += 1;
@@ -732,19 +703,19 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
                 corroborated.extend(mapped);
                 retarget_to_pins(
                     &mut manifest,
-                    view.map(|(module, _)| module),
+                    view.as_ref().map_or(&[], |view| view.modules.as_slice()),
                     &pinned,
                     &manifest_pins,
                 );
                 accepted.push(manifest);
-                pinned.absorb(manifest_pins);
+                counters.object_skips.extend(pinned.absorb(manifest_pins));
             }
             Corroboration::Uncorroborated => {
                 // No scan pin to prefer, but the recorded identity is still not one of
                 // this capture's: it becomes the manifest's own pin.
-                retarget_to_pins(&mut manifest, None, &pinned, &manifest_pins);
+                retarget_to_pins(&mut manifest, &[], &pinned, &manifest_pins);
                 accepted.push(manifest);
-                pinned.absorb(manifest_pins);
+                counters.object_skips.extend(pinned.absorb(manifest_pins));
             }
             Corroboration::IdentityMismatch => {
                 identity_mismatches += 1;
@@ -760,10 +731,19 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
 
     counters.report_notes();
 
-    // Each dropped record stayed on the table it came from, so the plan counts
-    // it as seen and files its skip under its own module. The scan's object-level
-    // losses have no module to be filed under and are added here.
-    let mut plan = plan::build_from_sources(&modules, &accepted);
+    let (modules, collapsed, differed) = reconcile_scanned_modules(&modules, &mut pinned);
+    if collapsed > 0 {
+        eprintln!(
+            "p11scope: discovery: {collapsed} matching overlay mapping(s) were collapsed \
+             onto one attach target; physical identity is not provable, so published \
+             uncertainty makes this capture PARTIAL"
+        );
+    }
+    counters.object_skips.extend(differed);
+
+    // Every plan reference is now a capture-local pinned ID. Raw mapping keys remain
+    // evidence only and cannot select an attach fd.
+    let mut plan = plan::build_from_sources(&modules, &accepted, &pinned);
     record_object_skips(&mut plan, &counters.object_skips);
     for key in &corroborated {
         if let Some(summary) = plan.modules.iter_mut().find(|m| m.key == *key) {
@@ -857,32 +837,38 @@ fn discovery_evidence(
     pinned: &PinnedObjects,
     counters: &DiscoveryCounters,
 ) -> render::DiscoveryEvidence {
-    let summary_of = |key: ObjectKey, path: &str| {
-        let pin = pinned.pinned().find(|p| p.key == key);
+    let summary_of = |id, path: &str| {
+        let pin = pinned
+            .summary(id)
+            .expect("every planned object has a comparable pin");
         render::ObjectSummary {
-            dev: (key.device.major, key.device.minor),
-            ino: key.inode,
+            dev: (pin.key.device.major, pin.key.device.minor),
+            ino: pin.key.inode,
             // Absent, not empty: nothing hashed it, so there is no digest to
             // report — an empty string would read as one.
-            sha256: pin.map(|p| p.sha256.to_string()),
-            path: pin.map_or_else(|| path.to_string(), |p| p.path.to_string()),
-            build_id: pin.and_then(|p| p.build_id.map(str::to_string)),
-            identity_source: pin.map_or("unpinned", |p| p.identity_source),
-            note: pin.and_then(|p| p.note.map(str::to_string)),
+            sha256: Some(pin.sha256.to_string()),
+            path: if pin.path.is_empty() {
+                path.to_string()
+            } else {
+                pin.path.to_string()
+            },
+            build_id: pin.build_id.map(str::to_string),
+            identity_source: pin.identity_source,
+            note: pin.note.map(str::to_string),
         }
     };
     let modules = plan
         .modules
         .iter()
         .map(|m| {
-            let mut seen: BTreeSet<ObjectKey> = BTreeSet::new();
+            let mut seen = BTreeSet::new();
             let objects: Vec<render::ObjectSummary> = plan
                 .slots
                 .iter()
                 .filter(|s| s.module_ids.contains(&m.id) && seen.insert(s.object))
                 .map(|s| summary_of(s.object, &s.object_path))
                 .collect();
-            let identity = summary_of(m.key, &m.path);
+            let identity = summary_of(m.object, &m.path);
             render::DiscoveredModule {
                 dev: identity.dev,
                 ino: identity.ino,
@@ -1592,8 +1578,28 @@ fn fmt_rfc3339(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p11scope::discovery::scan::ScannedEntry;
+    use p11scope::discovery::identity::{
+        PinnedObjectId, ReconciledModule, pin_scanned_objects, reconcile_scanned_modules,
+    };
+    use p11scope::discovery::scan::{ScannedEntry, scan_pid};
     use std::os::unix::fs::MetadataExt as _;
+
+    fn current_mount_namespace() -> p11scope::process::MountNamespaceId {
+        let metadata = std::fs::metadata("/proc/self/ns/mnt").unwrap();
+        p11scope::process::MountNamespaceId {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    fn reconcile_for_test(
+        modules: &[ScannedModule],
+        pinned: &mut PinnedObjects,
+    ) -> Vec<ReconciledModule> {
+        let (modules, _, skipped) = reconcile_scanned_modules(modules, pinned);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        modules
+    }
 
     struct FailingWriter {
         kind: std::io::ErrorKind,
@@ -1809,10 +1815,10 @@ mod tests {
             unsafe_requested: false,
         };
         let mut counters = DiscoveryCounters::default();
-        let (_, first) =
-            scan_and_pin(std::process::id(), &args, &mut budget, &mut counters).unwrap();
-        let (_, second) =
-            scan_and_pin(std::process::id(), &args, &mut budget, &mut counters).unwrap();
+        let first_view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let (_, first) = scan_and_pin(&first_view, &args, &mut budget, &mut counters).unwrap();
+        let second_view = ProcessView::open(ProcessViewId(1), std::process::id()).unwrap();
+        let (_, second) = scan_and_pin(&second_view, &args, &mut budget, &mut counters).unwrap();
         assert_eq!(first.pinned().count(), 1);
         assert_eq!(
             second.pinned().count(),
@@ -1831,32 +1837,26 @@ mod tests {
 
     /// The pin `pin_manifest_objects` produces for one manifest object: filed under
     /// the path the manifest names (`ObjectRecord.path`, which it opens), keyed by the
-    /// identity that path resolves to right now. Built through `pin_scanned_objects`
-    /// only because reaching `pin_manifest_objects` needs a canonical full function
-    /// list; the `Entry` — the only thing a retarget reads — is the same one.
+    /// identity that path resolves to right now.
     fn pin_as_manifest_object(object_path: &str) -> PinnedObjects {
         let file = p11scope_manifest::identity::open_object(Path::new(object_path)).unwrap();
         let found = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
-        let (pins, skipped) = pin_scanned_objects(
-            std::process::id(),
-            &[ScannedModule {
-                key: ObjectKey {
-                    device: p11scope_manifest::maps::Device {
-                        major: found.device_major,
-                        minor: found.device_minor,
-                    },
-                    inode: found.inode,
-                },
-                path: object_path.to_string(),
-                exports: vec![],
-                tables: vec![],
-                interfaces: vec![],
-            }],
-            &mut CaptureWorkBudget::default(),
-        )
-        .unwrap();
-        assert!(skipped.is_empty(), "{skipped:?}");
-        pins
+        let identity = p11scope_manifest::identity::inspect_file(&file)
+            .unwrap()
+            .identity;
+        let mut manifest = manifest_naming(object_path, identity.sha256.clone());
+        manifest.objects[0].identity = identity.clone();
+        manifest.provenance_objects[0] = p11scope_manifest::manifest::ProvenanceObject {
+            path: object_path.to_string(),
+            device_major: found.device_major,
+            device_minor: found.device_minor,
+            inode: found.inode,
+            identity,
+        };
+        manifest.surfaces[0].acquisition = p11scope_manifest::manifest::Acquisition::Absent;
+        manifest.surfaces[0].walk = p11scope_manifest::manifest::WalkOutcome::NotWalked;
+        manifest.surfaces[0].functions.clear();
+        pin_manifest_objects(&manifest).unwrap()
     }
 
     fn entry(name: &'static str, object: ObjectKey, file_offset: u64) -> ScannedEntry {
@@ -1875,7 +1875,7 @@ mod tests {
     /// probed at scan-derived offsets.
     #[test]
     fn a_table_entry_whose_object_was_not_pinned_never_becomes_a_slot() {
-        let (mut modules, pinned) = pinned_self();
+        let (mut modules, mut pinned) = pinned_self();
         let pinned_key = pinned.pinned().next().unwrap().key;
         let unpinned_key = ObjectKey {
             device: p11scope_manifest::maps::Device {
@@ -1897,13 +1897,19 @@ mod tests {
                 unpinned: vec![],
                 address: 0x7000,
             });
+        modules[0].tables.last_mut().unwrap().entries[0].object_path = modules[0].path.clone();
 
-        let dropped = drop_unpinned_entries(&mut modules, &pinned);
+        let (reconciled, _, dropped) = reconcile_scanned_modules(&modules, &mut pinned);
         assert_eq!(dropped.len(), 1, "{dropped:?}");
         assert_eq!(dropped[0].subject, "C_Verify");
-        assert!(dropped[0].reason.contains("not pinned"), "{dropped:?}");
+        assert!(
+            dropped[0]
+                .reason
+                .contains("could not be reconciled to a comparable pinned object"),
+            "{dropped:?}"
+        );
 
-        let plan = plan::build_from_modules(&modules);
+        let plan = plan::build_from_reconciled_modules(&reconciled);
         assert_eq!(plan.slots.len(), 1, "only the pinned target attaches");
         for slot in &plan.slots {
             assert!(
@@ -1936,32 +1942,23 @@ mod tests {
                      ROUND4_ERROR_CHAIN_SENTINEL"
                 .into(),
         };
-        let module = ScannedModule {
-            key: ObjectKey {
-                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
-                inode: 42,
-            },
-            path: "/opt/p11.so".into(),
-            exports: vec![],
-            tables: vec![p11scope::discovery::scan::ScannedTable {
+        let (mut modules, mut pinned) = pinned_self();
+        modules[0]
+            .tables
+            .push(p11scope::discovery::scan::ScannedTable {
                 version: (2, 40),
                 walk: "full",
                 entries: vec![],
                 null_entries: vec![],
                 unpinned: vec![raw.clone()],
                 address: 0x7000,
-            }],
-            interfaces: vec![],
-        };
-        let plan = plan::build_from_modules(&[module]);
+            });
+        let reconciled = reconcile_for_test(&modules, &mut pinned);
+        let plan = plan::build_from_reconciled_modules(&reconciled);
         assert_eq!(plan.skipped, vec![raw.clone()]);
         assert_eq!(plan.modules[0].skipped, vec![raw]);
 
-        let discovery = discovery_evidence(
-            &plan,
-            &PinnedObjects::empty(),
-            &DiscoveryCounters::default(),
-        );
+        let discovery = discovery_evidence(&plan, &pinned, &DiscoveryCounters::default());
         let mut evidence = render::Evidence {
             table_entries: plan.entries_seen,
             slots: plan.slots.len(),
@@ -2070,7 +2067,7 @@ mod tests {
             per_object_bytes: 1024,
             total_bytes: 1024,
         };
-        let (pinned, skips) = pin_scanned_objects(
+        let (mut pinned, skips) = pin_scanned_objects(
             std::process::id(),
             &modules,
             &mut CaptureWorkBudget::new(tiny),
@@ -2079,9 +2076,8 @@ mod tests {
         assert_eq!(pinned.pinned().count(), 0, "nothing could be pinned");
         assert!(!skips.is_empty(), "the scan reported the loss");
 
-        let mut modules = modules;
-        drop_unpinned_entries(&mut modules, &pinned);
-        let mut plan = plan::build_from_modules(&modules);
+        let (reconciled, _, _) = reconcile_scanned_modules(&modules, &mut pinned);
+        let mut plan = plan::build_from_reconciled_modules(&reconciled);
         assert!(
             plan.skipped.is_empty(),
             "the module published no table, so nothing else records the loss: {:?}",
@@ -2109,7 +2105,7 @@ mod tests {
             .cloned()
             .chain([other.clone()])
             .collect();
-        let mut plan = plan::build_from_modules(&modules);
+        let mut plan = plan::build_from_reconciled_modules(&reconciled);
         record_object_skips(&mut plan, &mixed);
         assert_eq!(plan.skipped.len(), skips.len() + 1, "{:?}", plan.skipped);
         assert!(plan.skipped.contains(&other), "{:?}", plan.skipped);
@@ -2120,10 +2116,7 @@ mod tests {
             slots: (0..slots)
                 .map(|index| plan::Slot {
                     index: index as u32,
-                    object: ObjectKey {
-                        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
-                        inode: 42,
-                    },
+                    object: PinnedObjectId(42),
                     object_path: "/opt/p11.so".into(),
                     file_offset: index as u64 * 8,
                     names: vec!["C_Sign".into()],
@@ -2136,6 +2129,7 @@ mod tests {
                 .collect(),
             modules: vec![plan::ModuleSummary {
                 id: plan::ModuleId(0),
+                object: PinnedObjectId(42),
                 key: ObjectKey {
                     device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
                     inode: 42,
@@ -2162,6 +2156,20 @@ mod tests {
         }
     }
 
+    fn plan_with_pins(slots: usize, refused: usize) -> (plan::AttachPlan, PinnedObjects) {
+        let (_, pins) = pinned_self();
+        let pin = pins.pinned().next().unwrap();
+        let mut plan = plan_with(slots, refused);
+        for slot in &mut plan.slots {
+            slot.object = pin.id;
+            slot.object_path = pin.path.to_string();
+        }
+        plan.modules[0].object = pin.id;
+        plan.modules[0].key = pin.key;
+        plan.modules[0].path = pin.path.to_string();
+        (plan, pins)
+    }
+
     /// One provider over the slot ceiling must not cost the capture the other
     /// providers could still have shared: the refusal is evidence (and forces
     /// PARTIAL), not an abort. It stays an error only when nothing is left.
@@ -2181,11 +2189,8 @@ mod tests {
         // …and the refusal reaches evidence, which is what makes reporting it
         // instead of aborting honest: `render::Evidence::verdict` turns a
         // non-empty `modules_skipped` into PARTIAL (see `render`'s own tests).
-        let evidence = discovery_evidence(
-            &plan_with(4, 1),
-            &PinnedObjects::empty(),
-            &DiscoveryCounters::default(),
-        );
+        let (plan, pins) = plan_with_pins(4, 1);
+        let evidence = discovery_evidence(&plan, &pins, &DiscoveryCounters::default());
         assert_eq!(evidence.modules_skipped.len(), 1);
         assert_eq!(evidence.modules_skipped[0].name, "/opt/big0.so");
         assert!(
@@ -2218,7 +2223,7 @@ mod tests {
     /// record — and `discovery_conflicts` would have nothing explaining it.
     #[test]
     fn the_module_record_says_which_corroboration_outcome_it_got() {
-        let plan = plan_with(1, 0);
+        let (plan, pins) = plan_with_pins(1, 0);
         let key = plan.modules[0].key;
         for (outcome, label) in [
             (Corroboration::Agreed, "agreed"),
@@ -2230,16 +2235,12 @@ mod tests {
                 corroboration: vec![(key, corroboration_label(outcome))],
                 ..DiscoveryCounters::default()
             };
-            let evidence = discovery_evidence(&plan, &PinnedObjects::empty(), &counters);
+            let evidence = discovery_evidence(&plan, &pins, &counters);
             assert_eq!(evidence.modules[0].corroboration, vec![label]);
         }
         // Nothing recorded: one source described it, and the record says so
         // rather than implying a second source failed to.
-        let evidence = discovery_evidence(
-            &plan,
-            &PinnedObjects::empty(),
-            &DiscoveryCounters::default(),
-        );
+        let evidence = discovery_evidence(&plan, &pins, &DiscoveryCounters::default());
         assert_eq!(evidence.modules[0].corroboration, vec!["single_source"]);
         assert_eq!(evidence.modules[0].sources, vec!["scan"]);
     }
@@ -2267,10 +2268,10 @@ mod tests {
         m.provenance_objects[0].device_minor = collision.device.minor;
         m.provenance_objects[0].inode = collision.inode;
 
-        retarget_to_pins(&mut m, None, &pins, &own);
+        retarget_to_pins(&mut m, &[], &pins, &own);
         pins.absorb(own);
 
-        let plan = plan::build_from_sources(&[], std::slice::from_ref(&m));
+        let plan = plan::build_from_sources(&[], std::slice::from_ref(&m), &pins);
         let attach = pins.attach_path_for(plan.slots[0].object).unwrap();
         assert_eq!(
             std::fs::metadata(&attach).unwrap().ino(),
@@ -2320,9 +2321,9 @@ mod tests {
             m.provenance_objects[0].device_minor = recorded.device.minor;
             m.provenance_objects[0].inode = recorded.inode;
 
-            retarget_to_pins(&mut m, None, &pins, &own);
+            retarget_to_pins(&mut m, &[], &pins, &own);
 
-            let plan = plan::build_from_sources(&[], std::slice::from_ref(&m));
+            let plan = plan::build_from_sources(&[], std::slice::from_ref(&m), &pins);
             let attach = pins.attach_path_for(plan.slots[0].object).expect(
                 "a manifest whose recorded identity is not the live one must still \
                  resolve — that reuse is what pinning by build-id and sha256 is for",
@@ -2344,16 +2345,17 @@ mod tests {
         let (path, sha) = (summary.path.to_string(), summary.sha256.to_string());
 
         let m = manifest_naming(&path, Some(sha.clone()));
-        let (module, agrees) = scan_view(&m, &modules, &pinned).expect("mapped and pinned");
-        assert_eq!(module.key, summary.key);
-        assert!(agrees, "the recorded sha256 is the pinned one");
+        let own = pin_as_manifest_object(&path);
+        let view = scan_view(&m, &modules, &pinned, &own).expect("mapped and pinned");
+        assert_eq!(view.modules[0].key, summary.key);
+        assert!(view.agrees, "the recorded sha256 is the pinned one");
         assert_eq!(
             manifest_targets(&m),
             BTreeSet::from([(sha.clone(), 0x40)]),
             "manifest targets are keyed by object hash, not by device/inode"
         );
         assert_eq!(
-            scanned_targets(module, &pinned),
+            scanned_targets(&view.modules, &pinned),
             BTreeSet::new(),
             "our own executable publishes no PKCS#11 table"
         );
@@ -2361,7 +2363,7 @@ mod tests {
         // Same path, different bytes: §4.12's identity mismatch.
         let stale = manifest_naming(&path, Some("22".repeat(32)));
         assert_eq!(
-            scan_view(&stale, &modules, &pinned).map(|(_, a)| a),
+            scan_view(&stale, &modules, &pinned, &own).map(|view| view.agrees),
             Some(false)
         );
 
@@ -2369,13 +2371,65 @@ mod tests {
         // it — the trigger condition for the unpinned-slot bug above.
         let unpinned = manifest_naming(&path, Some(sha));
         assert!(
-            scan_view(&unpinned, &modules, &PinnedObjects::empty()).is_none(),
+            scan_view(&unpinned, &modules, &PinnedObjects::empty(), &own).is_none(),
             "a module with no pin has no hash to agree or disagree with"
         );
 
         // A manifest for something the target does not map at all.
         let elsewhere = manifest_naming("/opt/not-mapped.so", Some("33".repeat(32)));
-        assert!(scan_view(&elsewhere, &modules, &pinned).is_none());
+        assert!(scan_view(&elsewhere, &modules, &pinned, &PinnedObjects::empty()).is_none());
+    }
+
+    #[test]
+    fn scan_view_does_not_choose_the_first_byte_identical_ordinary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.so");
+        let intended = dir.path().join("intended.so");
+        std::fs::copy("/bin/sh", &first).unwrap();
+        std::fs::copy("/bin/sh", &intended).unwrap();
+        let as_module = |path: &Path| {
+            let file = p11scope_manifest::identity::open_object(path).unwrap();
+            let key = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
+            ScannedModule {
+                view: ProcessViewId(0),
+                mount_namespace: current_mount_namespace(),
+                key: ObjectKey {
+                    device: p11scope_manifest::maps::Device {
+                        major: key.device_major,
+                        minor: key.device_minor,
+                    },
+                    inode: key.inode,
+                },
+                path: path.display().to_string(),
+                exports: vec![],
+                tables: vec![],
+                interfaces: vec![],
+            }
+        };
+        let modules = vec![as_module(&first), as_module(&intended)];
+        let (pinned, skipped) = pin_scanned_objects(
+            std::process::id(),
+            &modules,
+            &mut CaptureWorkBudget::default(),
+        )
+        .unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let intended_sha = pinned
+            .pinned()
+            .find(|pin| pin.key == modules[1].key)
+            .unwrap()
+            .sha256
+            .to_string();
+        let intended_path = intended.display().to_string();
+        let manifest = manifest_naming(&intended_path, Some(intended_sha));
+        let own = pin_as_manifest_object(&intended_path);
+
+        let view = scan_view(&manifest, &modules, &pinned, &own).expect("mapped object");
+        assert!(view.agrees);
+        assert_eq!(
+            view.modules[0].path, modules[1].path,
+            "digest equality selected the first distinct ordinary file"
+        );
     }
 
     /// Retargeting adopts the identity of the object the scan matched — never some
@@ -2390,7 +2444,8 @@ mod tests {
         m.provenance_objects[0].inode = 1;
         m.provenance_objects[0].device_major = 99;
 
-        retarget_to_pins(&mut m, Some(&modules[0]), &pinned, &PinnedObjects::empty());
+        let own = pin_as_manifest_object(&path);
+        retarget_to_pins(&mut m, &[&modules[0]], &pinned, &own);
         assert_eq!(m.provenance_objects[0].inode, summary.key.inode);
         assert_eq!(
             m.provenance_objects[0].device_major,
@@ -2400,6 +2455,8 @@ mod tests {
         // The same bytes pinned under an identity the scan did not see must not be
         // adopted: a decoy module the matched scan never named.
         let decoy = ScannedModule {
+            view: ProcessViewId(0),
+            mount_namespace: current_mount_namespace(),
             key: ObjectKey {
                 device: p11scope_manifest::maps::Device { major: 0, minor: 0 },
                 inode: 7,
@@ -2411,10 +2468,10 @@ mod tests {
         };
         let mut m = manifest_naming(&path, Some(sha));
         m.provenance_objects[0].inode = 1;
-        retarget_to_pins(&mut m, Some(&decoy), &pinned, &PinnedObjects::empty());
+        retarget_to_pins(&mut m, &[&decoy], &pinned, &own);
         assert_eq!(
-            m.provenance_objects[0].inode, 1,
-            "no pin of the decoy exists"
+            m.provenance_objects[0].inode, summary.key.inode,
+            "no pin of the decoy exists, so the manifest's own exact pin is retained"
         );
     }
 

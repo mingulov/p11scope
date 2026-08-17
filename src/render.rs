@@ -219,6 +219,8 @@ const DISCOVERY_UNAVAILABLE: &str = "discovery unavailable";
 const ENTRY_UNAVAILABLE: &str = "function entry unavailable";
 const TABLE_UNAVAILABLE: &str = "function table unavailable in file-backed data";
 const SHARED_OVERLAY_UNCERTAINTY: &str = "shared-overlay physical identity is uncertain; a distinct byte-identical instance may be unobserved";
+const PHYSICAL_IDENTITY_AMBIGUITY: &str =
+    "physical identity is ambiguous; the collision group was not attached";
 
 /// Convert an untyped internal discovery loss into the finite public capture
 /// record. Detailed paths, process identities, and error chains remain in
@@ -237,6 +239,8 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
         .contains("cannot prove physical identity across overlay instances")
     {
         SHARED_OVERLAY_UNCERTAINTY
+    } else if s.reason.contains("physical identity is ambiguous") {
+        PHYSICAL_IDENTITY_AMBIGUITY
     } else if s
         .reason
         .contains("table header extends past the object's file-backed data")
@@ -1223,6 +1227,10 @@ mod tests {
                 subject: "/private/OVERLAY_SUBJECT_SENTINEL.so".into(),
                 reason: "mapping OVERLAY_KEY_SENTINEL was collapsed by the overlayfs + inode metadata + SHA-256 heuristic, which cannot prove physical identity across overlay instances; /private/OVERLAY_REASON_SENTINEL.so would not be probed".into(),
             },
+            Skipped {
+                subject: "discovery subject".into(),
+                reason: "physical identity is ambiguous: equal mapping keys had unequal or unavailable full opened-file identities; the collision group was not attached".into(),
+            },
         ];
         let mut ev = evidence();
         ev.skipped = skips.iter().map(capture_skipped_out).collect();
@@ -1243,6 +1251,10 @@ mod tests {
             (
                 "discovery subject",
                 "shared-overlay physical identity is uncertain; a distinct byte-identical instance may be unobserved",
+            ),
+            (
+                "discovery subject",
+                "physical identity is ambiguous; the collision group was not attached",
             ),
         ];
 
@@ -1833,7 +1845,7 @@ mod tests {
         let plan = crate::plan::AttachPlan {
             slots: vec![crate::plan::Slot {
                 index: 0,
-                object: crate::plan::TEST_OBJECT,
+                object: crate::plan::TEST_PINNED_OBJECT,
                 object_path: "/opt/p11.so".into(),
                 file_offset: 0x10,
                 names: vec!["C_SignInit".into()],
@@ -1929,7 +1941,7 @@ mod tests {
         crate::plan::AttachPlan {
             slots: vec![crate::plan::Slot {
                 index: 0,
-                object: crate::plan::TEST_OBJECT,
+                object: crate::plan::TEST_PINNED_OBJECT,
                 object_path: "/opt/p11.so".into(),
                 file_offset: 0x10,
                 names: vec!["C_SignInit".into()],
@@ -2163,7 +2175,7 @@ mod tests {
         crate::plan::AttachPlan {
             slots: vec![crate::plan::Slot {
                 index: 0,
-                object: crate::plan::TEST_OBJECT,
+                object: crate::plan::TEST_PINNED_OBJECT,
                 object_path: "/opt/p11.so".into(),
                 file_offset: 0x20,
                 names: vec!["C_FindObjectsInit".into()],

@@ -1,7 +1,9 @@
 //! One attach plan over many modules: distinct slots per module, one slot for a
 //! target two modules share, and a capacity ceiling that refuses whole modules.
 
-use p11scope::plan::{ModuleId, build_from_modules};
+use p11scope::discovery::identity::{PinnedObjectId, ReconciledModule};
+use p11scope::plan::{AttachPlan, ModuleId, build_from_reconciled_modules};
+use p11scope::process::{MountNamespaceId, ProcessViewId};
 use p11scope::semantics::{ProcessKey, State};
 use p11scope_ebpf_common::{Event, SESSION_NONE, event_type};
 use p11scope_manifest::maps::{Device, ObjectKey};
@@ -21,6 +23,8 @@ fn module(
 ) -> p11scope::discovery::scan::ScannedModule {
     use p11scope::discovery::scan::{ScannedEntry, ScannedModule, ScannedTable};
     ScannedModule {
+        view: ProcessViewId(inode as u32),
+        mount_namespace: MountNamespaceId { device: 1, inode },
         key: key(inode),
         path: path.to_string(),
         exports: vec!["C_GetFunctionList".into()],
@@ -42,6 +46,104 @@ fn module(
         }],
         interfaces: vec![],
     }
+}
+
+fn build_from_modules(modules: &[p11scope::discovery::scan::ScannedModule]) -> AttachPlan {
+    let reconciled: Vec<_> = modules
+        .iter()
+        .cloned()
+        .map(|scanned| ReconciledModule {
+            object: PinnedObjectId(scanned.key.inode as u32),
+            entry_objects: scanned
+                .tables
+                .iter()
+                .map(|table| {
+                    table
+                        .entries
+                        .iter()
+                        .map(|entry| PinnedObjectId(entry.object.inode as u32))
+                        .collect()
+                })
+                .collect(),
+            scanned,
+        })
+        .collect();
+    build_from_reconciled_modules(&reconciled)
+}
+
+#[test]
+fn equal_raw_keys_with_distinct_pinned_objects_never_share_slots() {
+    let reconcile = |module, object, targets: Vec<u32>| ReconciledModule {
+        scanned: module,
+        object: PinnedObjectId(object),
+        entry_objects: vec![targets.into_iter().map(PinnedObjectId).collect()],
+    };
+    let raw_key = 10;
+    let plan = build_from_reconciled_modules(&[
+        reconcile(
+            module(
+                raw_key,
+                "/views/a/provider.so",
+                &[("C_Sign", raw_key, 0x400)],
+            ),
+            1,
+            vec![1],
+        ),
+        reconcile(
+            module(
+                raw_key,
+                "/views/b/provider.so",
+                &[("C_Sign", raw_key, 0x400)],
+            ),
+            2,
+            vec![2],
+        ),
+    ]);
+
+    assert_eq!(
+        plan.modules.len(),
+        2,
+        "a raw ObjectKey is not physical identity"
+    );
+    assert_eq!(
+        plan.slots.len(),
+        2,
+        "neither fd/offset may be borrowed by the other view"
+    );
+    assert_ne!(plan.slots[0].object, plan.slots[1].object);
+}
+
+#[test]
+fn one_exact_pinned_object_keeps_every_views_nonempty_target_union() {
+    let reconcile = |module, targets: Vec<u32>| ReconciledModule {
+        scanned: module,
+        object: PinnedObjectId(7),
+        entry_objects: vec![targets.into_iter().map(PinnedObjectId).collect()],
+    };
+    let plan = build_from_reconciled_modules(&[
+        reconcile(
+            module(10, "/same/provider.so", &[("C_Initialize", 10, 0x100)]),
+            vec![7],
+        ),
+        reconcile(
+            module(10, "/same/provider.so", &[("C_Sign", 10, 0x200)]),
+            vec![7],
+        ),
+    ]);
+
+    assert_eq!(plan.modules.len(), 1, "exact identity is one module");
+    assert_eq!(
+        plan.slots.len(),
+        2,
+        "neither process view's target set is first-wins"
+    );
+    assert_eq!(
+        plan.slots
+            .iter()
+            .flat_map(|slot| &slot.names)
+            .collect::<Vec<_>>(),
+        vec![&"C_Initialize".to_string(), &"C_Sign".to_string()]
+    );
 }
 
 #[test]
@@ -153,7 +255,11 @@ fn an_oversized_module_does_not_refuse_a_later_module_that_fits() {
         2,
         "the later module fits and must attach whole"
     );
-    assert!(plan.slots.iter().all(|slot| slot.object.inode == 2));
+    assert!(
+        plan.slots
+            .iter()
+            .all(|slot| slot.object == PinnedObjectId(2))
+    );
     assert_eq!(plan.modules.len(), 1);
     assert_eq!(plan.modules[0].path, "/opt/small.so");
     assert!(plan.slots.len() <= p11scope_ebpf_common::MAX_SLOTS as usize);
@@ -176,7 +282,7 @@ fn an_oversized_module_does_not_refuse_a_later_module_that_fits() {
 fn slot_of(plan: &p11scope::plan::AttachPlan, inode: u64, name: &str) -> u32 {
     plan.slots
         .iter()
-        .find(|s| s.object.inode == inode && s.names == [name])
+        .find(|s| s.object == PinnedObjectId(inode as u32) && s.names == [name])
         .unwrap()
         .index
 }

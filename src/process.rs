@@ -240,6 +240,20 @@ fn open_then_mountinfo_checked<T>(
     Ok((opened, mountinfo))
 }
 
+fn run_while_same_with<T>(
+    mut still_the_same: impl FnMut() -> bool,
+    action: impl FnOnce() -> T,
+) -> Result<T, String> {
+    if !still_the_same() {
+        return Err("process generation changed before target access".into());
+    }
+    let result = action();
+    if !still_the_same() {
+        return Err("process generation changed during target access".into());
+    }
+    Ok(result)
+}
+
 /// One accepted process generation and its filesystem view. Task 4 uses the pin
 /// through scan/open/hash; the later lifecycle task can retain this value and recheck
 /// it before subtracting this view's claims.
@@ -281,6 +295,10 @@ impl ProcessView {
         self.pin.still_the_same()
     }
 
+    pub(crate) fn run_while_same<T>(&self, action: impl FnOnce() -> T) -> Result<T, String> {
+        run_while_same_with(|| self.still_the_same(), action)
+    }
+
     fn ensure_retained(&self) -> Result<(), String> {
         let exited = || {
             format!(
@@ -315,6 +333,14 @@ impl ProcessView {
             },
         )
     }
+}
+
+pub fn stale_view_ids(views: &[ProcessView]) -> Vec<ProcessViewId> {
+    views
+        .iter()
+        .filter(|view| !view.still_the_same())
+        .map(ProcessView::id)
+        .collect()
 }
 
 /// A process identity that survives PID reuse. `pidfd_open` is exact; the
@@ -484,6 +510,36 @@ mod tests {
             table_reads.get(),
             0,
             "a changed view must not supply a table"
+        );
+    }
+
+    /// Mutation caught: deleting either generation check around a target operation
+    /// would let the caller continue to its next `/proc/<pid>` action after reuse.
+    #[test]
+    fn a_generation_change_stops_before_the_next_target_action() {
+        let checks = Cell::new(0);
+        let actions = Cell::new(0);
+        let first = run_while_same_with(
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() == 1
+            },
+            || actions.set(actions.get() + 1),
+        );
+        let mut later_action = false;
+        if first.is_ok() {
+            later_action = true;
+        }
+
+        assert!(
+            first.is_err(),
+            "a change during the action must fail closed"
+        );
+        assert_eq!(checks.get(), 2, "the action needs pre/post checks");
+        assert_eq!(actions.get(), 1, "only the guarded action may have run");
+        assert!(
+            !later_action,
+            "no later target action may follow the mismatch"
         );
     }
 

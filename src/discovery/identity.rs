@@ -318,6 +318,41 @@ impl PinnedObjects {
         self.ownership.get(&view)
     }
 
+    /// Retires one accepted process generation without disturbing another view or a
+    /// manifest that still owns the same opened object. Returns the exact claims that
+    /// were removed so the caller can rebuild its plan from the remaining modules.
+    pub fn remove_view(&mut self, view: ProcessViewId) -> Option<ViewClaims> {
+        let removed = self.ownership.remove(&view)?;
+        let candidates: BTreeSet<_> = removed
+            .tables
+            .iter()
+            .chain(removed.targets.iter().map(|(id, _)| id))
+            .chain(&removed.pins)
+            .copied()
+            .collect();
+        let retained: BTreeSet<_> = self
+            .ownership
+            .values()
+            .flat_map(|claims| {
+                claims
+                    .tables
+                    .iter()
+                    .chain(claims.targets.iter().map(|(id, _)| id))
+                    .chain(&claims.pins)
+            })
+            .copied()
+            .chain(
+                self.raw_to_id
+                    .iter()
+                    .filter_map(|(raw, id)| raw.mount_namespace.is_none().then_some(*id)),
+            )
+            .collect();
+        let unowned: BTreeSet<_> = candidates.difference(&retained).copied().collect();
+        self.by_id.retain(|id, _| !unowned.contains(id));
+        self.raw_to_id.retain(|_, id| !unowned.contains(id));
+        Some(removed)
+    }
+
     /// The one pin opened for a manifest object before it is absorbed into the
     /// capture set. Used only to compare that opened object with scan-owned pins.
     pub fn id_for_path(&self, path: &str) -> Option<PinnedObjectId> {

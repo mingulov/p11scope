@@ -165,6 +165,79 @@ fn scan_and_manifest_pins_merge_into_one_set() {
     assert!(pinned.check_unchanged().unwrap());
 }
 
+/// Mutation caught: namespace/provider coalescing must never make one process
+/// generation own another generation's private table target or retained fd.
+#[test]
+fn retiring_one_shared_namespace_view_keeps_only_the_stable_views_claims() {
+    use p11scope::discovery::identity::{pin_scanned_view_objects, reconcile_scanned_modules};
+    use p11scope::discovery::scan::{ScannedEntry, ScannedModule, ScannedTable};
+    use p11scope::process::ProcessView;
+
+    let d = tmpdir("manifest_pinning_view_retirement");
+    let provider = cc_so(&d, "provider", "int provider(void){return 1;}\n");
+    let target_a = cc_so(&d, "target_a", "int target_a(void){return 2;}\n");
+    let target_b = cc_so(&d, "target_b", "int target_b(void){return 3;}\n");
+    let namespace = current_mount_namespace();
+    let module = |view, name, target: &Path| ScannedModule {
+        view,
+        mount_namespace: namespace,
+        key: manifest_key(&provider),
+        path: provider.display().to_string(),
+        exports: vec!["C_GetFunctionList".into()],
+        tables: vec![ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: vec![ScannedEntry {
+                name,
+                object: manifest_key(target),
+                object_path: target.display().to_string(),
+                file_offset: first_executable_offset(target),
+            }],
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x1000,
+        }],
+        interfaces: vec![],
+    };
+    let a = module(ProcessViewId(10), "C_Sign", &target_a);
+    let b = module(ProcessViewId(11), "C_Verify", &target_b);
+    let mut pinned = p11scope::discovery::identity::PinnedObjects::empty();
+    for scanned in [&a, &b] {
+        let view = ProcessView::open(scanned.view, std::process::id()).unwrap();
+        let (local, skipped) = pin_scanned_view_objects(
+            &view,
+            std::slice::from_ref(scanned),
+            &mut CaptureWorkBudget::default(),
+        )
+        .unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(pinned.absorb(local).is_empty());
+    }
+    let modules = vec![a, b];
+    let (mut reconciled, _, skipped) = reconcile_scanned_modules(&modules, &mut pinned);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let stale_target = pinned.view_claims(ProcessViewId(10)).unwrap().targets[0].0;
+    let stable_target = pinned.view_claims(ProcessViewId(11)).unwrap().targets[0].0;
+    assert_ne!(stale_target, stable_target);
+
+    let removed = pinned
+        .remove_view(ProcessViewId(10))
+        .expect("the stale view owns precise claims");
+    reconciled.retain(|module| module.scanned.view != ProcessViewId(10));
+    let plan = p11scope::plan::build_from_reconciled_modules(&reconciled);
+
+    assert_eq!(
+        removed.targets,
+        vec![(stale_target, first_executable_offset(&target_a))]
+    );
+    assert!(pinned.view_claims(ProcessViewId(10)).is_none());
+    assert!(pinned.attach_path_for(stale_target).is_err());
+    assert!(pinned.attach_path_for(stable_target).is_ok());
+    assert_eq!(plan.slots.len(), 1, "the stable view remains eligible");
+    assert_eq!(plan.slots[0].names, ["C_Verify"]);
+    assert_eq!(plan.slots[0].object, stable_target);
+}
+
 #[test]
 fn changed_object_is_refused_naming_the_file() {
     let d = tmpdir("manifest_pinning_bad");

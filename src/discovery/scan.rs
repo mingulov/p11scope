@@ -684,8 +684,8 @@ fn candidate_groups(maps: &[MapEntry]) -> BTreeMap<ObjectKey, Vec<&MapEntry>> {
 
 /// Opens an object as the *target* sees it (spec §4.5: needs only `PTRACE_MODE_READ`;
 /// `map_files` is never required, and a container's own file is never copied out).
-fn open_in_target(pid: u32, path: &str) -> Result<File, String> {
-    open_object(Path::new(&format!("/proc/{pid}/root{path}")))
+fn open_in_target(view: &ProcessView, path: &str) -> Result<File, String> {
+    view.run_while_same(|| open_object(Path::new(&format!("/proc/{}/root{path}", view.pid()))))?
 }
 
 /// `(inode, size)` for a `--module` hint, read through the *observer's* filesystem view.
@@ -759,7 +759,8 @@ pub fn scan_process_view(
     let started = Instant::now();
     let pid = request.pid;
     let maps = parse_maps(
-        &std::fs::read(format!("/proc/{pid}/maps"))
+        &view
+            .run_while_same(|| std::fs::read(format!("/proc/{pid}/maps")))?
             .map_err(|error| format!("/proc/{pid}/maps: {error}"))?,
     )?;
 
@@ -768,7 +769,7 @@ pub fn scan_process_view(
     // `/proc/<pid>/mem` is gated by PTRACE_MODE_ATTACH and Yama; losing it costs the
     // tables, never the object inventory (spec §4.1 step 3). Only an access refusal is
     // a ptrace refusal — a pid that died mid-scan gets its own label.
-    let mem = File::open(format!("/proc/{pid}/mem"));
+    let mem = view.run_while_same(|| File::open(format!("/proc/{pid}/mem")))?;
     let unavailable = mem.as_ref().err().map(|error| {
         skipped.push(Skipped {
             subject: format!("/proc/{pid}/mem"),
@@ -838,7 +839,7 @@ pub fn scan_process_view(
         };
         let path = usable.display().to_string();
 
-        let file = match open_in_target(pid, &path) {
+        let file = match open_in_target(view, &path) {
             Ok(file) => file,
             Err(reason) => {
                 skipped.push(Skipped { subject, reason });
@@ -996,7 +997,7 @@ pub fn scan_process_view(
         }
     }
 
-    Ok(match unavailable {
+    let outcome = match unavailable {
         None => ScanOutcome::Scanned {
             modules,
             skipped,
@@ -1007,7 +1008,9 @@ pub fn scan_process_view(
             modules,
             skipped,
         },
-    })
+    };
+    view.run_while_same(|| ())?;
+    Ok(outcome)
 }
 
 #[cfg(test)]

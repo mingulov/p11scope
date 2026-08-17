@@ -5,11 +5,11 @@
 //! `inspect` is a discovery tool, not capture output (spec §4.3).
 
 use crate::discovery::hooks::HookRegistry;
-use crate::discovery::identity::{PinnedObjects, pin_scanned_objects};
+use crate::discovery::identity::{PinnedObjects, pin_scanned_view_objects};
 use crate::discovery::scan::{
-    CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, Skipped, scan_pid,
+    CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, Skipped, scan_process_view,
 };
-use crate::process::PidPin;
+use crate::process::{ProcessView, ProcessViewId};
 use anyhow::Result;
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -255,24 +255,49 @@ fn with_extra_skips(outcome: ScanOutcome, extra: Vec<Skipped>) -> ScanOutcome {
     }
 }
 
+fn scan_and_pin_retained_with<C, S, P>(
+    context: &mut C,
+    mut still_the_same: impl FnMut(&mut C) -> bool,
+    scan: impl FnOnce(&mut C) -> Result<S, String>,
+    pin: impl FnOnce(&mut C, &S) -> Result<P, String>,
+) -> Result<(S, P), String> {
+    if !still_the_same(context) {
+        return Err("process generation changed before inspect".into());
+    }
+    let scanned = scan(context)?;
+    if !still_the_same(context) {
+        return Err("process generation changed while inspect was scanning".into());
+    }
+    let pinned = pin(context, &scanned)?;
+    if !still_the_same(context) {
+        return Err("process generation changed while inspect was pinning".into());
+    }
+    Ok((scanned, pinned))
+}
+
 /// `p11scope inspect` — scans, pins, prints. Exit code: 0 when the scan ran
 /// (even with zero modules), 1 when the target could not be read at all.
 pub fn run(pid: u32, hints: &[PathBuf], hooks: &HookRegistry, json: bool) -> Result<i32> {
-    // Fails fast, before any /proc/<pid>/maps read is attempted, when the pid
-    // names nothing at all (no pidfd, no /proc/<pid>/stat).
-    PidPin::open(pid).map_err(anyhow::Error::msg)?;
-
-    let mut budget = CaptureWorkBudget::default();
-    let outcome = match scan_pid(&ScanRequest { pid, hints, hooks }, &mut budget) {
-        Ok(outcome) => outcome,
+    let view = ProcessView::open(ProcessViewId(0), pid).map_err(anyhow::Error::msg)?;
+    let mut context = (&view, CaptureWorkBudget::default());
+    let (outcome, (pinned, pin_skips)) = match scan_and_pin_retained_with(
+        &mut context,
+        |context| context.0.still_the_same(),
+        |context| {
+            scan_process_view(
+                &ScanRequest { pid, hints, hooks },
+                context.0,
+                &mut context.1,
+            )
+        },
+        |context, outcome| pin_scanned_view_objects(context.0, outcome.modules(), &mut context.1),
+    ) {
+        Ok(result) => result,
         Err(error) => {
             println!("p11scope: cannot inspect pid {pid}: {error}");
             return Ok(1);
         }
     };
-
-    let (pinned, pin_skips) =
-        pin_scanned_objects(pid, outcome.modules(), &mut budget).map_err(anyhow::Error::msg)?;
     let outcome = with_extra_skips(outcome, pin_skips);
 
     if json {
@@ -297,6 +322,74 @@ mod tests {
             device: Device { major: 8, minor: 1 },
             inode,
         }
+    }
+
+    /// Mutation caught: reopening the PID for pinning, omitting the check between
+    /// scan and pin, or rendering after the final check fails would mix generations.
+    #[test]
+    fn inspect_uses_one_generation_through_its_final_target_operation() {
+        struct Lifecycle {
+            checks: usize,
+            events: Vec<&'static str>,
+        }
+        let mut changed_after_scan = Lifecycle {
+            checks: 0,
+            events: Vec::new(),
+        };
+        let result = scan_and_pin_retained_with(
+            &mut changed_after_scan,
+            |state| {
+                state.checks += 1;
+                state.checks < 2
+            },
+            |state| {
+                state.events.push("scan");
+                Ok(17)
+            },
+            |state, _| {
+                state.events.push("pin");
+                Ok(23)
+            },
+        );
+        if result.is_ok() {
+            changed_after_scan.events.push("render");
+        }
+
+        assert!(result.is_err(), "the post-scan mismatch must fail inspect");
+        assert_eq!(changed_after_scan.events, ["scan"]);
+        assert_eq!(
+            changed_after_scan.checks, 2,
+            "scan has a pre/post generation check"
+        );
+
+        let mut changed_after_pin = Lifecycle {
+            checks: 0,
+            events: Vec::new(),
+        };
+        let result = scan_and_pin_retained_with(
+            &mut changed_after_pin,
+            |state| {
+                state.checks += 1;
+                state.checks < 3
+            },
+            |state| {
+                state.events.push("scan");
+                Ok(17)
+            },
+            |state, _| {
+                state.events.push("pin");
+                Ok(23)
+            },
+        );
+        if result.is_ok() {
+            changed_after_pin.events.push("render");
+        }
+        assert!(result.is_err(), "the post-pin mismatch must fail inspect");
+        assert_eq!(changed_after_pin.events, ["scan", "pin"]);
+        assert_eq!(
+            changed_after_pin.checks, 3,
+            "pin has a final generation check before render"
+        );
     }
 
     fn sample() -> ScanOutcome {

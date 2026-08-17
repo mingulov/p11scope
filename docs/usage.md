@@ -36,7 +36,7 @@ replacing the module with a shim. It aggregates function/mechanism/error/
 latency counts (`profile`/`metrics` modes) or streams one line per call
 for a bounded investigation window (`trace` mode), and writes a versioned
 `observed-profile.json` for migration assessment
-(`docs/schema/observed-profile-v1.md`) or an operator to read directly.
+(`docs/schema/observed-profile-v2.md`) or an operator to read directly.
 
 ## What it does NOT intentionally decode
 
@@ -329,7 +329,7 @@ deliberately on a lighter workload (`docs/notes/phase2-induced-gaps.md`).
 ## The evidence/completeness model
 
 Every `observed-profile.json` carries an `evidence` section
-(`docs/schema/observed-profile-v1.md`) ending in a `completeness` verdict:
+(`docs/schema/observed-profile-v2.md`) ending in a `completeness` verdict:
 `"COMPLETE"` or `"PARTIAL"`.
 
 Manifests are trusted operator input, not proposed plans requiring
@@ -416,9 +416,9 @@ What this tool proves, and what it deliberately does not claim to:
 - [`docs/privacy/allowlist-v1.md`](privacy/allowlist-v1.md) — the
   field-by-field decoder inventory, current hostile-pointer limitation, and
   the canary work still required for the safe/diagnostic policy split.
-- [`docs/schema/observed-profile-v1.md`](schema/observed-profile-v1.md) —
+- [`docs/schema/observed-profile-v2.md`](schema/observed-profile-v2.md) —
   the versioned `observed-profile.json` schema (current:
-  `pkcs11-scope/observed-profile/v1.4`), the integration boundary
+  `pkcs11-scope/observed-profile/v2`), the integration boundary
   `pkcs11-lab` reads.
 - [`docs/superpowers/specs/2026-08-10-pkcs11-scope-outputs.md`](superpowers/specs/2026-08-10-pkcs11-scope-outputs.md)
   — the original "what you will see" design commitment.

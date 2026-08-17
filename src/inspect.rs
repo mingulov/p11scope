@@ -318,6 +318,7 @@ mod tests {
                         file_offset: 0x1234,
                     }],
                     null_entries: vec!["C_GetFunctionStatus"],
+                    unpinned: vec![],
                     address: 0x7f0000001000,
                 }],
                 interfaces: vec![ScannedInterface {

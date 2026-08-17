@@ -100,7 +100,7 @@ CALL_START_SIZE = 272
 EVENT_SIZE = 288
 
 
-def profile_terminal(doc, schema="pkcs11-scope/observed-profile/v1.4"):
+def profile_terminal(doc, schema="pkcs11-scope/observed-profile/v2"):
     assert doc["schema"] == schema, doc["schema"]
     ev = doc["evidence"]
     assert ev["completeness"] == "PARTIAL", ev
@@ -223,10 +223,10 @@ def assert_unsafe_trace(text):
 
 
 def assert_aggregate_metrics(doc):
-    assert doc["schema"] == "pkcs11-scope/observed-profile/v1.1-metrics"
+    assert doc["schema"] == "pkcs11-scope/observed-profile/v2-metrics"
     assert doc["capture"]["mode"] == "metrics"
     assert doc["capture"]["privacy_mode"] == "aggregate-only"
-    profile_terminal(doc, "pkcs11-scope/observed-profile/v1.1-metrics")
+    profile_terminal(doc, "pkcs11-scope/observed-profile/v2-metrics")
     assert sum(item["calls"] for item in doc["functions"]) == 25, doc["functions"]
 
 
@@ -570,7 +570,7 @@ if work == "--self-test":
         }
 
     safe = {
-        "schema": "pkcs11-scope/observed-profile/v1.4",
+        "schema": "pkcs11-scope/observed-profile/v2",
         "capture": {"mode": "profile", "privacy_mode": "allowlisted"},
         "evidence": {**full_fixture, "completeness": "PARTIAL", "unregistered_mechanisms": 2,
                      "semantic_capture_failures": 3, "async_target_failures": 2},
@@ -605,7 +605,7 @@ if work == "--self-test":
          "aad_len": ALIASES["gcm240_aad"], "tag_bits": ALIASES["gcm240_tag"]},
     ]
     unsafe = {
-        "schema": "pkcs11-scope/observed-profile/v1.4",
+        "schema": "pkcs11-scope/observed-profile/v2",
         "capture": {"mode": "profile", "privacy_mode": "unsafe-unvalidated-metadata"},
         "evidence": {**terminal("unsafe-unvalidated-metadata", 7),
                      "templates_truncated": False},
@@ -667,7 +667,7 @@ if work == "--self-test":
            trace_abort_terminal("EVIDENCE " + json.dumps(mutated), "allowlisted"))
 
     aggregate = {
-        "schema": "pkcs11-scope/observed-profile/v1.1-metrics",
+        "schema": "pkcs11-scope/observed-profile/v2-metrics",
         "capture": {"mode": "metrics", "privacy_mode": "aggregate-only"},
         "evidence": {
             **full_fixture,

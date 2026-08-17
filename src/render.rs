@@ -3,12 +3,111 @@
 
 use crate::attach::CapturePolicy;
 use crate::metrics::{SlotReport, percentile_ns};
+use crate::plan::TableSummary;
 use serde::Serialize;
 use std::time::Duration;
 
+/// What discovery learned, carried into evidence (spec §4.8). Flattened into
+/// `evidence`, so a consumer reads `evidence.authority`, `evidence.discovery[]`
+/// and the counters as siblings of every other evidence field.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct DiscoveryEvidence {
+    /// How the objects behind every probe were authorized. `"hash-pinned"` is
+    /// the only value this slice emits: pinned by fd, hashed once with SHA-256,
+    /// and re-checked by `fstat` `(ino, size, ctime)` during the capture.
+    pub authority: &'static str,
+    #[serde(rename = "discovery")]
+    pub modules: Vec<DiscoveredModule>,
+    /// Manifests whose recorded targets differ from the ones the scan decoded
+    /// in the same object; the union is attached (spec §4.12).
+    #[serde(rename = "discovery_conflicts")]
+    pub conflicts: u64,
+    /// Manifest modules nothing corroborated: not mapped in scope, the scan
+    /// could not run, or the scan decoded no table in them.
+    #[serde(rename = "discovery_uncorroborated")]
+    pub uncorroborated: u64,
+    /// Attach slots two modules both publish: counted, never attributed.
+    pub module_ambiguous: u64,
+    /// Modules refused whole at the slot ceiling — never attached in part.
+    pub modules_skipped: Vec<SkippedOut>,
+    /// `Some("ptrace")` when the memory scan could not run.
+    pub scan_unavailable: Option<String>,
+    pub scan_ms: u64,
+}
+
+impl Default for DiscoveryEvidence {
+    fn default() -> Self {
+        Self {
+            authority: "hash-pinned",
+            modules: Vec::new(),
+            conflicts: 0,
+            uncorroborated: 0,
+            module_ambiguous: 0,
+            modules_skipped: Vec::new(),
+            scan_unavailable: None,
+            scan_ms: 0,
+        }
+    }
+}
+
+/// One object this capture pinned. `path` is the pathname the source that found
+/// it saw: for anything the memory scan found that is a path in the **target's**
+/// mount namespace, which the observer may be unable to open and which may name
+/// a different file — or none — on the host. The identity is `{dev, ino, sha256}`;
+/// the path is a label.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ObjectSummary {
+    pub dev: (u64, u64),
+    pub ino: u64,
+    pub sha256: String,
+    pub path: String,
+    pub build_id: Option<String>,
+    /// `"mountinfo"` when the whole `{dev, ino}` was comparable against the
+    /// mapping, `"stat"` when only the inode was.
+    pub identity_source: &'static str,
+    /// Why `identity_source` is `"stat"` rather than `"mountinfo"`.
+    pub note: Option<String>,
+}
+
+/// One module discovery found, with everything known about how it was found.
+/// Same path caveat as `ObjectSummary`.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct DiscoveredModule {
+    pub dev: (u64, u64),
+    pub ino: u64,
+    pub sha256: String,
+    pub path: String,
+    pub build_id: Option<String>,
+    /// Every object this module's table entries resolve into — a forwarded
+    /// entry lands in a dependency, not in the module that published it.
+    pub objects: Vec<ObjectSummary>,
+    /// `"scan"`, `"manifest"`, or both.
+    pub sources: Vec<&'static str>,
+    /// A second source described the same targets (spec §4.12).
+    pub corroborated: bool,
+    /// Which §4.12 outcome produced `corroborated`, so an agreement and a
+    /// conflict are never indistinguishable in the record:
+    /// `single_source` (nothing to corroborate against), `agreed`, `conflict`
+    /// (both sources decoded targets and they differ), `scan_empty` (the scan
+    /// pinned this object but decoded no table in it — the documented use of
+    /// `--manifest`), `uncorroborated` (not mapped in scope, or no scan),
+    /// `identity_mismatch` (a manifest naming this object was ignored: the
+    /// mapped bytes are not the ones it records).
+    pub corroboration: &'static str,
+    pub tables: Vec<TableSummary>,
+    /// How many interfaces were seen. Never their names: those are bytes read
+    /// out of the target and stay in `inspect` (spec §4.3, allowlist v1).
+    pub interfaces: usize,
+    /// This module's own unattachable entries, and why.
+    pub skipped: Vec<SkippedOut>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Evidence {
-    /// Function records present in the manifest across walked surfaces.
+    /// Function records discovery decoded across every walked surface, whether
+    /// or not they became attachable — a NULL slot and an entry whose object
+    /// could not be pinned are both counted here and listed in `skipped`, so
+    /// this reads as "seen" against `slots`' "attached".
     pub table_entries: usize,
     /// Unique {object, file_offset} targets planned.
     pub slots: usize,
@@ -17,7 +116,8 @@ pub struct Evidence {
     pub attach_failures: Vec<String>,
     /// Slots whose counts belong to a name group, not a single name.
     pub aliased: Vec<Vec<String>>,
-    /// Manifest entries with no attachable target, and why.
+    /// Discovered entries with no attachable target, and why. Also published
+    /// per module in `discovery[].skipped`.
     pub skipped: Vec<SkippedOut>,
     pub in_flight_at_end: u64,
     /// Per-surface discovery provenance (walk outcome, acquisition status).
@@ -92,6 +192,9 @@ pub struct Evidence {
     /// A pinned provider object changed (ino, size or ctime) after attach;
     /// probes may no longer describe the mapped bytes.
     pub provider_changed: bool,
+    /// Everything discovery learned, flattened into this object.
+    #[serde(flatten)]
+    pub discovery: DiscoveryEvidence,
     pub completeness: &'static str,
 }
 
@@ -109,13 +212,26 @@ impl Evidence {
     /// buffer neither dropped nor emitted a malformed record, no template
     /// was truncated, no mechanism's parameter decode failed on every
     /// single observed call, and no pinned provider object changed.
+    ///
+    /// Discovery gates it too, and two of those conditions are the ones a
+    /// gap-counting verdict gets wrong on its own: a capture that discovered
+    /// no module, and one that discovered a module but planned no slot in it,
+    /// both have nothing to fail — no attach was attempted, no entry was
+    /// skipped — and would otherwise report COMPLETE having observed nothing.
     pub fn verdict(&mut self) {
         let surfaces_complete = self
             .surfaces
             .iter()
             .all(|s| s.walk == "full" && s.acquisition == "ok");
         let interface_list_complete = !self.interface_list.starts_with("error:");
-        self.completeness = if self.attach_failures.is_empty()
+        let discovery_complete = !self.discovery.modules.is_empty()
+            && self.slots > 0
+            && self.discovery.conflicts == 0
+            && self.discovery.uncorroborated == 0
+            && self.discovery.module_ambiguous == 0
+            && self.discovery.modules_skipped.is_empty();
+        self.completeness = if discovery_complete
+            && self.attach_failures.is_empty()
             && self.skipped.is_empty()
             && self.aliased.is_empty()
             && self.in_flight_at_end == 0
@@ -249,7 +365,14 @@ pub fn live(
         ev.skipped.len(),
         ev.in_flight_at_end,
     );
+    let discovery_gaps = ev.discovery.conflicts
+        + ev.discovery.uncorroborated
+        + ev.discovery.module_ambiguous
+        + ev.discovery.modules_skipped.len() as u64;
     if surface_gaps > 0
+        || discovery_gaps > 0
+        || ev.discovery.modules.is_empty()
+        || ev.discovery.scan_unavailable.is_some()
         || ev.vendor_interfaces > 0
         || ev.event_loss > 0
         || ev.start_insert_failures > 0
@@ -266,6 +389,35 @@ pub fn live(
         || ev.provider_changed
     {
         evidence_line.push_str(" ·");
+        // Discovery first: it explains a PARTIAL verdict that has no attach
+        // failure and no skip behind it at all.
+        if ev.discovery.modules.is_empty() {
+            evidence_line.push_str(" no modules discovered");
+        }
+        if let Some(reason) = &ev.discovery.scan_unavailable {
+            evidence_line.push_str(&format!(" scan unavailable ({reason})"));
+        }
+        if ev.discovery.conflicts > 0 {
+            evidence_line.push_str(&format!(" {} discovery conflicts", ev.discovery.conflicts));
+        }
+        if ev.discovery.uncorroborated > 0 {
+            evidence_line.push_str(&format!(
+                " {} uncorroborated modules",
+                ev.discovery.uncorroborated
+            ));
+        }
+        if ev.discovery.module_ambiguous > 0 {
+            evidence_line.push_str(&format!(
+                " {} module-ambiguous slots",
+                ev.discovery.module_ambiguous
+            ));
+        }
+        if !ev.discovery.modules_skipped.is_empty() {
+            evidence_line.push_str(&format!(
+                " {} modules refused",
+                ev.discovery.modules_skipped.len()
+            ));
+        }
         if surface_gaps > 0 {
             evidence_line.push_str(&format!(" {surface_gaps} surface gaps"));
         }
@@ -372,10 +524,24 @@ pub fn live(
     s
 }
 
+/// The module a slot's counts belong to, as `functions[]` renders it.
+#[derive(Serialize)]
+struct ModuleRef {
+    dev: (u64, u64),
+    ino: u64,
+    sha256: String,
+}
+
 #[derive(Serialize)]
 struct FunctionOut {
     names: Vec<String>,
     aliased: bool,
+    /// `null` when two modules publish this target: the counts are real, the
+    /// owner is not knowable, and guessing one would credit a provider's calls
+    /// to another.
+    module: Option<ModuleRef>,
+    /// True exactly when `module` is null because two modules claim the slot.
+    module_ambiguous: bool,
     calls: u64,
     errors: u64,
     pending_returns: u64,
@@ -412,13 +578,23 @@ fn latency_out(
 
 /// Per-name call/error/latency counts from the **aggregate BPF maps** —
 /// the count authority in every mode (see module docs on `functions`
-/// sourcing in both renderers).
-fn functions_out(reports: &[SlotReport]) -> Vec<FunctionOut> {
+/// sourcing in both renderers). `modules` is `evidence.discovery[]`, indexed
+/// by `ModuleId` — the same list `capture.modules[]` renders.
+fn functions_out(reports: &[SlotReport], modules: &[DiscoveredModule]) -> Vec<FunctionOut> {
     reports
         .iter()
         .map(|r| FunctionOut {
             names: r.names.clone(),
             aliased: r.aliased,
+            module: r
+                .module
+                .and_then(|id| modules.get(id.0 as usize))
+                .map(|m| ModuleRef {
+                    dev: m.dev,
+                    ino: m.ino,
+                    sha256: m.sha256.clone(),
+                }),
+            module_ambiguous: r.module_ambiguous,
             calls: r.calls,
             errors: r.errors,
             pending_returns: r
@@ -437,15 +613,34 @@ fn functions_out(reports: &[SlotReport]) -> Vec<FunctionOut> {
         .collect()
 }
 
+/// `capture.modules[]`: the identity of every discovered module, in `ModuleId`
+/// order. A projection of `evidence.discovery[]` rather than a second list, so
+/// the two can never disagree about what this capture observed.
+fn capture_modules(ev: &Evidence) -> Vec<serde_json::Value> {
+    ev.discovery
+        .modules
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "path": m.path,
+                "dev": m.dev,
+                "ino": m.ino,
+                "sha256": m.sha256,
+                "build_id": m.build_id,
+            })
+        })
+        .collect()
+}
+
 pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) -> serde_json::Value {
     serde_json::json!({
-        "schema": "pkcs11-scope/observed-profile/v1.1-metrics",
+        "schema": "pkcs11-scope/observed-profile/v2-metrics",
         "capture": { "start": capture.started, "end": capture.ended, "mode": "metrics",
                      "privacy_mode": capture.policy.privacy_mode(),
                      "kernel": capture.kernel,
-                     "module": { "path": capture.module, "build_id": capture.build_id } },
+                     "modules": capture_modules(ev) },
         "evidence": ev,
-        "functions": functions_out(reports),
+        "functions": functions_out(reports, &ev.discovery.modules),
     })
 }
 
@@ -471,7 +666,7 @@ struct MechanismOut {
     /// combination of decoded scalar values observed, each carrying its
     /// own `count` — never an average or a "latest wins" value, since
     /// migration assessment needs the actual combos a mechanism was
-    /// driven with. See `docs/schema/observed-profile-v1.md` for the
+    /// driven with. See `docs/schema/observed-profile-v2.md` for the
     /// per-shape field layout.
     params: serde_json::Value,
     note: &'static str,
@@ -561,7 +756,7 @@ struct PolicyBooleansOut {
 /// **requested** via its `CK_ATTRIBUTE` template — never the key's
 /// effective policy, which the provider may reject, ignore, or override.
 /// See `templates.note` in the top-level document and
-/// `docs/schema/observed-profile-v1.md`.
+/// `docs/schema/observed-profile-v2.md`.
 #[derive(Serialize)]
 struct TemplateOut {
     names: Vec<String>,
@@ -639,7 +834,7 @@ struct CgroupMechOut {
 /// One `cgroup_id`'s breakdown — `semantics::CgroupStat` rendered. Exists
 /// so one node-wide attach over a cgroup shared by several containers/pods
 /// (e.g. two sharing one overlay2 image layer, hence one inode) can still
-/// be split back out per container: see `docs/schema/observed-profile-v1.md`
+/// be split back out per container: see `docs/schema/observed-profile-v2.md`
 /// and `docs/privacy/allowlist-v1.md`'s `cgroup_id` entry.
 #[derive(Serialize)]
 struct CgroupOut {
@@ -685,10 +880,8 @@ fn cgroups_out(state: &crate::semantics::State) -> Vec<CgroupOut> {
 }
 
 /// `capture` section fields that aren't derived from `reports`/`ev`/`state`.
+/// The discovered modules are not among them: they come from `ev.discovery`.
 pub struct CaptureMeta<'a> {
-    pub module: &'a str,
-    /// From the manifest's object identity; `None` when unavailable.
-    pub build_id: Option<&'a str>,
     pub started: &'a str,
     pub ended: &'a str,
     pub kernel: &'a str,
@@ -787,15 +980,15 @@ pub fn profile_json(
     };
 
     serde_json::json!({
-        "schema": "pkcs11-scope/observed-profile/v1.4",
+        "schema": "pkcs11-scope/observed-profile/v2",
         "capture": {
             "start": capture.started, "end": capture.ended, "mode": "profile",
             "privacy_mode": capture.policy.privacy_mode(),
             "kernel": capture.kernel,
-            "module": { "path": capture.module, "build_id": capture.build_id },
+            "modules": capture_modules(ev),
         },
         "evidence": ev,
-        "functions": functions_out(reports),
+        "functions": functions_out(reports, &ev.discovery.modules),
         "mechanisms": mechanisms,
         "sessions": sessions_out,
         "logins": logins,
@@ -824,6 +1017,8 @@ mod tests {
         SlotReport {
             names: vec![name.into()],
             aliased,
+            module: None,
+            module_ambiguous: false,
             calls,
             errors: 0,
             in_flight,
@@ -885,7 +1080,60 @@ mod tests {
             shape_decode_total_failures: 0,
             templates_truncated: false,
             provider_changed: false,
+            discovery: DiscoveryEvidence {
+                modules: vec![discovered_fixture()],
+                ..DiscoveryEvidence::default()
+            },
             completeness: "UNKNOWN",
+        }
+    }
+
+    fn discovered_fixture() -> DiscoveredModule {
+        let sha = "11".repeat(32);
+        DiscoveredModule {
+            dev: (8, 1),
+            ino: 11,
+            sha256: sha.clone(),
+            path: "/opt/p11.so".into(),
+            build_id: Some("aabb".into()),
+            objects: vec![ObjectSummary {
+                dev: (8, 1),
+                ino: 11,
+                sha256: sha,
+                path: "/opt/p11.so".into(),
+                build_id: Some("aabb".into()),
+                identity_source: "mountinfo",
+                note: None,
+            }],
+            sources: vec!["scan"],
+            corroborated: false,
+            corroboration: "single_source",
+            tables: vec![crate::plan::TableSummary {
+                version: (2, 40),
+                entries: 68,
+                source: "scan",
+            }],
+            interfaces: 1,
+            skipped: vec![],
+        }
+    }
+
+    fn reports_fixture() -> Vec<SlotReport> {
+        let mut r = report("C_Sign", 1, 0, false);
+        r.module = Some(crate::plan::ModuleId(0));
+        vec![r]
+    }
+
+    fn state_fixture() -> crate::semantics::State {
+        crate::semantics::State::with_policy(&empty_plan(), CapturePolicy::Allowlisted)
+    }
+
+    fn capture_fixture() -> CaptureMeta<'static> {
+        CaptureMeta {
+            started: "t0",
+            ended: "t1",
+            kernel: "6.8.0",
+            policy: CapturePolicy::Allowlisted,
         }
     }
 
@@ -894,6 +1142,167 @@ mod tests {
         let mut ev = evidence();
         ev.verdict();
         assert_eq!(ev.completeness, "COMPLETE");
+    }
+
+    #[test]
+    fn a_capture_that_discovered_nothing_is_never_complete() {
+        let mut ev = evidence();
+        ev.discovery.modules.clear();
+        ev.verdict();
+        assert_eq!(
+            ev.completeness, "PARTIAL",
+            "no modules ⇒ nothing was observed"
+        );
+    }
+
+    /// The sibling of the rule above: a module was discovered, but nothing in it
+    /// could be attached. No attach failed (none was attempted) and a scan that
+    /// decoded no table produces no skips either.
+    #[test]
+    fn a_capture_that_attached_nothing_is_never_complete() {
+        let mut ev = evidence();
+        ev.slots = 0;
+        ev.attached_probes = 0;
+        ev.verdict();
+        assert_eq!(
+            ev.completeness, "PARTIAL",
+            "no slots ⇒ nothing was observed"
+        );
+    }
+
+    #[test]
+    fn discovery_gaps_each_force_partial() {
+        for mutate in [
+            (|e: &mut Evidence| e.discovery.conflicts = 1) as fn(&mut Evidence),
+            |e: &mut Evidence| e.discovery.uncorroborated = 1,
+            |e: &mut Evidence| e.discovery.module_ambiguous = 1,
+            |e: &mut Evidence| {
+                e.discovery.modules_skipped.push(SkippedOut {
+                    name: "/opt/x.so".into(),
+                    reason: "capacity".into(),
+                })
+            },
+        ] {
+            let mut ev = evidence();
+            mutate(&mut ev);
+            ev.verdict();
+            assert_eq!(ev.completeness, "PARTIAL");
+        }
+    }
+
+    #[test]
+    fn v2_json_publishes_modules_and_per_function_module_identity() {
+        let v = profile_json(
+            &reports_fixture(),
+            &evidence(),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v2");
+        assert_eq!(v["capture"]["modules"][0]["path"], "/opt/p11.so");
+        assert_eq!(
+            v["capture"]["modules"][0]["sha256"].as_str().unwrap().len(),
+            64
+        );
+        assert!(
+            v["capture"]["module"].is_null(),
+            "v1's singular field is gone"
+        );
+        assert_eq!(v["evidence"]["authority"], "hash-pinned");
+        assert_eq!(v["evidence"]["discovery"][0]["sources"][0], "scan");
+        assert_eq!(v["functions"][0]["module"]["ino"], 11);
+        assert_eq!(
+            v["functions"][0]["module"]["dev"],
+            serde_json::json!([8, 1])
+        );
+        assert_eq!(v["functions"][0]["module_ambiguous"], false);
+    }
+
+    /// A target two modules both hand out is counted, never attributed: guessing
+    /// an owner would attribute one provider's calls to another.
+    #[test]
+    fn an_ambiguous_slot_is_counted_but_never_attributed_to_a_module() {
+        let mut report = report("C_Sign", 3, 0, false);
+        report.module = None;
+        report.module_ambiguous = true;
+        let mut ev = evidence();
+        ev.discovery.module_ambiguous = 1;
+        ev.verdict();
+        let v = profile_json(&[report], &ev, &state_fixture(), &capture_fixture());
+        assert_eq!(v["functions"][0]["module"], serde_json::Value::Null);
+        assert_eq!(v["functions"][0]["module_ambiguous"], true);
+        assert_eq!(v["functions"][0]["calls"], 3);
+        assert_eq!(v["evidence"]["module_ambiguous"], 1);
+        assert_eq!(v["evidence"]["completeness"], "PARTIAL");
+    }
+
+    #[test]
+    fn interface_name_bytes_never_reach_capture_output() {
+        // inspect may show names; capture output may not (spec §4.3, allowlist v1).
+        // The count is the evidence; the bytes came out of a provider's memory.
+        // Both places a name could reach the document are exercised: the
+        // per-module discovery record, and the surface label a `--manifest`
+        // interface produces — built here by the real labelling function, so
+        // this fails if either starts carrying the recorded name.
+        let mut ev = evidence();
+        ev.discovery.modules[0].interfaces = 3;
+        ev.surfaces.push(crate::plan::SurfaceSummary {
+            source: crate::plan::source_label(
+                &p11scope_manifest::manifest::SurfaceSource::Interface {
+                    index: 0,
+                    raw_name_hex: Some("504b4353203131".into()),
+                    name_lossy: Some("PKCS 11".into()),
+                    name_error: None,
+                    flags: 1,
+                    classification:
+                        p11scope_manifest::manifest::InterfaceClassification::ExactStandard,
+                },
+            ),
+            walk: "full".into(),
+            acquisition: "ok".into(),
+            functions: 92,
+        });
+        ev.verdict();
+        let v = profile_json(
+            &reports_fixture(),
+            &ev,
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        let text = serde_json::to_string(&v).unwrap();
+        assert!(
+            !text.contains("PKCS 11"),
+            "interface names must not be rendered in capture output: {text}"
+        );
+        assert_eq!(v["evidence"]["discovery"][0]["interfaces"], 3);
+    }
+
+    #[test]
+    fn live_view_shows_every_discovery_gap_behind_a_partial_verdict() {
+        let mut ev = evidence();
+        ev.discovery.conflicts = 1;
+        ev.discovery.uncorroborated = 2;
+        ev.discovery.module_ambiguous = 3;
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/x.so".into(),
+            reason: "capacity".into(),
+        });
+        ev.discovery.scan_unavailable = Some("ptrace".into());
+        ev.verdict();
+        let out = live(
+            &[],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+        );
+        assert!(out.contains("1 discovery conflicts"), "{out}");
+        assert!(out.contains("2 uncorroborated modules"), "{out}");
+        assert!(out.contains("3 module-ambiguous slots"), "{out}");
+        assert!(out.contains("1 modules refused"), "{out}");
+        assert!(out.contains("scan unavailable (ptrace)"), "{out}");
+        assert!(out.contains("PARTIAL"), "{out}");
     }
 
     #[test]
@@ -1082,15 +1491,13 @@ mod tests {
         let mut r = report("C_Sign", 1, 0, false);
         r.rv_counts.insert(0, 1);
         let capture = CaptureMeta {
-            module: "/opt/p11.so",
-            build_id: Some("aabb"),
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
             policy: crate::attach::CapturePolicy::AggregateOnly,
         };
         let v = json(&[r], &ev, &capture);
-        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v1.1-metrics");
+        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v2-metrics");
         assert_eq!(v["capture"]["privacy_mode"], "aggregate-only");
         assert_eq!(v["functions"][0]["latency_ns"]["approximate"], true);
         assert_eq!(v["functions"][0]["rv_counts"]["0x0000000000000000"], 1);
@@ -1161,8 +1568,6 @@ mod tests {
             crate::attach::CapturePolicy::Allowlisted,
         );
         let capture = CaptureMeta {
-            module: "/opt/p11.so",
-            build_id: Some("aabb"),
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
@@ -1170,7 +1575,7 @@ mod tests {
         };
         let v = profile_json(&[], &ev, &state, &capture);
 
-        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v1.4");
+        assert_eq!(v["schema"], "pkcs11-scope/observed-profile/v2");
         assert_eq!(v["capture"]["privacy_mode"], "allowlisted");
         for section in [
             "capture",
@@ -1184,7 +1589,7 @@ mod tests {
         ] {
             assert!(
                 v.get(section).is_some(),
-                "v1.4 document missing required section {section}"
+                "v2 document missing required section {section}"
             );
         }
         assert_eq!(v["templates"]["operations"], serde_json::json!([]));
@@ -1196,8 +1601,8 @@ mod tests {
         );
         assert_eq!(v["cgroups"], serde_json::json!([]));
         assert_eq!(v["capture"]["mode"], "profile");
-        assert_eq!(v["capture"]["module"]["path"], "/opt/p11.so");
-        assert_eq!(v["capture"]["module"]["build_id"], "aabb");
+        assert_eq!(v["capture"]["modules"][0]["path"], "/opt/p11.so");
+        assert_eq!(v["capture"]["modules"][0]["build_id"], "aabb");
     }
 
     #[test]
@@ -1217,8 +1622,6 @@ mod tests {
         let mut ev = evidence();
         ev.verdict();
         let capture = CaptureMeta {
-            module: "/opt/p11.so",
-            build_id: None,
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
@@ -1289,8 +1692,6 @@ mod tests {
         let mut ev = evidence();
         ev.verdict();
         let capture = CaptureMeta {
-            module: "/opt/p11.so",
-            build_id: None,
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
@@ -1304,7 +1705,10 @@ mod tests {
         assert_eq!(mech["ops"], serde_json::json!(["sign"]));
         assert_eq!(mech["params"], serde_json::Value::Null);
         assert_eq!(mech["calls"], 1);
-        assert_eq!(v["capture"]["module"]["build_id"], serde_json::Value::Null);
+        // The identity of what was observed now lives in `capture.modules[]`,
+        // one entry per discovered module.
+        assert_eq!(v["capture"]["modules"][0]["build_id"], "aabb");
+        assert_eq!(v["capture"]["modules"][0]["ino"], 11);
     }
 
     fn init_event(
@@ -1374,8 +1778,6 @@ mod tests {
         let mut ev = evidence();
         ev.verdict();
         let capture = CaptureMeta {
-            module: "/opt/p11.so",
-            build_id: None,
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
@@ -1414,8 +1816,6 @@ mod tests {
         let mut ev = evidence();
         ev.verdict();
         let capture = CaptureMeta {
-            module: "/opt/p11.so",
-            build_id: None,
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
@@ -1461,8 +1861,6 @@ mod tests {
         let mut ev = evidence();
         ev.verdict();
         let capture = CaptureMeta {
-            module: "/opt/p11.so",
-            build_id: None,
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
@@ -1489,8 +1887,6 @@ mod tests {
         let mut ev = evidence();
         ev.verdict();
         let capture = CaptureMeta {
-            module: "/opt/p11.so",
-            build_id: None,
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
@@ -1526,8 +1922,6 @@ mod tests {
         );
 
         let capture = CaptureMeta {
-            module: "/opt/p11.so",
-            build_id: None,
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
@@ -1569,8 +1963,6 @@ mod tests {
         );
 
         let capture = CaptureMeta {
-            module: "/opt/p11.so",
-            build_id: None,
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
@@ -1658,8 +2050,6 @@ mod tests {
         let mut ev = evidence();
         ev.verdict();
         let capture = CaptureMeta {
-            module: "/opt/p11.so",
-            build_id: None,
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
@@ -1725,8 +2115,6 @@ mod tests {
         assert_eq!(ev.completeness, "PARTIAL");
 
         let capture = CaptureMeta {
-            module: "/opt/p11.so",
-            build_id: None,
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",
@@ -1755,8 +2143,6 @@ mod tests {
         let mut ev = evidence();
         ev.verdict();
         let capture = CaptureMeta {
-            module: "/opt/p11.so",
-            build_id: None,
             started: "t0",
             ended: "t1",
             kernel: "6.8.0",

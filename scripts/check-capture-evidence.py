@@ -37,6 +37,11 @@ COUNTERS = (
     "unmatched_closes",
     "shape_decode_failures",
     "shape_decode_total_failures",
+    # Discovery gaps (schema v2). Every one of them forces PARTIAL, so a lane
+    # with a real provider must report all three as zero.
+    "discovery_conflicts",
+    "discovery_uncorroborated",
+    "module_ambiguous",
 )
 
 VERSION_SURFACES = Counter(
@@ -122,6 +127,15 @@ def exact_common(evidence, *, aliases, skipped, in_flight):
     require(evidence["in_flight_at_end"] == in_flight, evidence["in_flight_at_end"])
     require(evidence["templates_truncated"] is False, "templates were truncated")
     require(evidence["provider_changed"] is False, "a pinned provider object changed during capture")
+    # Discovery is the claim the whole document rests on: a lane that attached
+    # probes must name what it attached them into, and how it was authorized.
+    require(evidence["authority"] == "hash-pinned", f"unexpected authority: {evidence['authority']}")
+    require(evidence["discovery"], "evidence.discovery is empty: nothing was discovered")
+    for module in evidence["discovery"]:
+        require(len(module["sha256"]) == 64, f"module without a whole-file digest: {module}")
+        require(module["sources"], f"module with no discovery source: {module}")
+    require(evidence["modules_skipped"] == [], f"modules refused: {evidence['modules_skipped']}")
+    require(evidence["scan_unavailable"] is None, evidence["scan_unavailable"])
     require(evidence["completeness"] == "PARTIAL", evidence["completeness"])
 
 
@@ -158,6 +172,29 @@ def terminal_capture_is_clean(evidence):
         require(evidence[name] == 0, f"{name}: want 0, got {evidence[name]}")
 
 
+def exact_capture_modules(document):
+    """`capture.modules[]` — v2's replacement for the singular `capture.module`.
+
+    A lane that attached probes observed at least one module, and every entry
+    must carry the identity the probes were authorized against, never just a
+    pathname (which for a scanned module is the target's, not the observer's).
+    """
+    modules = document["capture"]["modules"]
+    require(modules, "capture.modules is empty: the document names no provider")
+    for module in modules:
+        require(module["path"], f"module without a path: {module}")
+        require(len(module["sha256"]) == 64, f"module without a whole-file digest: {module}")
+        require(isinstance(module["ino"], int) and module["ino"] > 0, f"module inode: {module}")
+        require(len(module["dev"]) == 2, f"module device: {module}")
+    require(
+        modules == [
+            {key: module[key] for key in ("path", "dev", "ino", "sha256", "build_id")}
+            for module in document["evidence"]["discovery"]
+        ],
+        "capture.modules[] and evidence.discovery[] disagree about what was observed",
+    )
+
+
 def load_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
@@ -176,13 +213,14 @@ def load_canary(path, trace):
 
 def validate_clean_metrics(document, expected, multiplier=1):
     require(multiplier >= 1, f"invalid clean-metrics multiplier: {multiplier}")
-    require(document["schema"] == "pkcs11-scope/observed-profile/v1.1-metrics", document["schema"])
+    require(document["schema"] == "pkcs11-scope/observed-profile/v2-metrics", document["schema"])
     require(document["capture"]["mode"] == "metrics", document["capture"])
     require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
     evidence = document["evidence"]
     exact_shape(evidence, 68, 68, 136, LEGACY_SURFACES, 0, "absent")
     exact_common(evidence, aliases=[], skipped=[], in_flight=0)
     exact_counters(evidence)
+    exact_capture_modules(document)
 
     actual = Counter()
     for item in document["functions"]:
@@ -231,13 +269,14 @@ def validate_canary(lane, document):
         require(evidence["counters_available"] is True, evidence["counters_available"])
     else:
         schema = (
-            "pkcs11-scope/observed-profile/v1.1-metrics"
+            "pkcs11-scope/observed-profile/v2-metrics"
             if kind == "metrics"
-            else "pkcs11-scope/observed-profile/v1.4"
+            else "pkcs11-scope/observed-profile/v2"
         )
         require(document["schema"] == schema, document["schema"])
         require(document["capture"]["mode"] == kind, document["capture"])
         require(document["capture"]["privacy_mode"] == privacy, document["capture"])
+        exact_capture_modules(document)
     if policy == "aggregate":
         calls = sum(item["calls"] for item in document["functions"])
         require(calls == 25, f"aggregate calls: want 25, got {calls}")
@@ -245,9 +284,10 @@ def validate_canary(lane, document):
 
 def validate_induced(lane, document):
     require(lane in {"G1", "G2", "G3", "G4", "G5"}, f"unknown induced lane: {lane}")
-    require(document["schema"] == "pkcs11-scope/observed-profile/v1.4", document["schema"])
+    require(document["schema"] == "pkcs11-scope/observed-profile/v2", document["schema"])
     require(document["capture"]["mode"] == "profile", document["capture"])
     require(document["capture"]["privacy_mode"] == "allowlisted", document["capture"])
+    exact_capture_modules(document)
     evidence = document["evidence"]
 
     if lane == "G1":
@@ -304,8 +344,37 @@ def expected_counts(path):
     return counts
 
 
+MODULE_FIXTURE = {
+    "path": "/opt/p11.so",
+    "dev": [8, 1],
+    "ino": 4242,
+    "sha256": "11" * 32,
+    "build_id": "aabb",
+}
+
+
+def discovery_fixture():
+    return [
+        dict(
+            MODULE_FIXTURE,
+            objects=[dict(MODULE_FIXTURE, identity_source="mountinfo", note=None)],
+            sources=["scan"],
+            corroborated=False,
+            corroboration="single_source",
+            tables=[{"version": [2, 40], "entries": 68, "source": "scan"}],
+            interfaces=0,
+            skipped=[],
+        )
+    ]
+
+
 def evidence_fixture(surfaces):
     return {
+        "authority": "hash-pinned",
+        "discovery": discovery_fixture(),
+        "modules_skipped": [],
+        "scan_unavailable": None,
+        "scan_ms": 3,
         "table_entries": 0,
         "slots": 0,
         "attached_probes": 0,
@@ -327,10 +396,18 @@ def evidence_fixture(surfaces):
     }
 
 
-def document_fixture(evidence, *, schema="pkcs11-scope/observed-profile/v1.4", mode="profile", privacy="allowlisted"):
+def document_fixture(evidence, *, schema="pkcs11-scope/observed-profile/v2", mode="profile", privacy="allowlisted"):
     return {
         "schema": schema,
-        "capture": {"mode": mode, "privacy_mode": privacy},
+        "capture": {
+            "mode": mode,
+            "privacy_mode": privacy,
+            # v2: one entry per discovered module, projected from the evidence.
+            "modules": [
+                {key: module[key] for key in ("path", "dev", "ino", "sha256", "build_id")}
+                for module in evidence["discovery"]
+            ],
+        },
         "evidence": evidence,
         "functions": [],
     }
@@ -349,7 +426,7 @@ def self_test():
     clean_evidence.update(table_entries=68, slots=68, attached_probes=136)
     clean = document_fixture(
         clean_evidence,
-        schema="pkcs11-scope/observed-profile/v1.1-metrics",
+        schema="pkcs11-scope/observed-profile/v2-metrics",
         mode="metrics",
         privacy="aggregate-only",
     )
@@ -397,7 +474,7 @@ def self_test():
 
     aggregate = document_fixture(
         copy.deepcopy(version),
-        schema="pkcs11-scope/observed-profile/v1.1-metrics",
+        schema="pkcs11-scope/observed-profile/v2-metrics",
         mode="metrics",
         privacy="aggregate-only",
     )
@@ -495,6 +572,40 @@ def self_test():
         tolerated[field] = 7
         terminal_capture_is_clean(tolerated)
     print("terminal capture predicate is PARTIAL with no concrete gap: OK")
+
+    # v2 discovery oracles. A document that discovered nothing, was authorized
+    # by something else, refused a module, or names a provider its evidence does
+    # not, is never a clean capture.
+    for field, value in (
+        ("discovery", []),
+        ("authority", "manifest"),
+        ("modules_skipped", [{"name": "/opt/x.so", "reason": "capacity"}]),
+        ("scan_unavailable", "ptrace"),
+        ("discovery_conflicts", 1),
+        ("discovery_uncorroborated", 1),
+        ("module_ambiguous", 1),
+    ):
+        bad = copy.deepcopy(clean["evidence"])
+        bad[field] = value
+        rejected(lambda bad=bad: terminal_capture_is_clean(bad))
+    bad = copy.deepcopy(clean["evidence"])
+    bad["discovery"][0]["sha256"] = ""
+    rejected(lambda bad=bad: terminal_capture_is_clean(bad))
+    print("discovery evidence is required and gap-free: OK")
+
+    exact_capture_modules(clean)
+    for mutate in (
+        lambda d: d["capture"]["modules"].clear(),
+        lambda d: d["capture"]["modules"][0].update(sha256="00"),
+        lambda d: d["capture"]["modules"][0].update(ino=0),
+        lambda d: d["capture"]["modules"][0].update(path="/opt/other.so"),
+        lambda d: d["evidence"]["discovery"].append(copy.deepcopy(MODULE_FIXTURE)),
+    ):
+        bad = copy.deepcopy(clean)
+        mutate(bad)
+        rejected(lambda bad=bad: exact_capture_modules(bad))
+    print("capture.modules[] matches the discovery record exactly: OK")
+    print("self-test: OK")
 
 
 def main(argv):

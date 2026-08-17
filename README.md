@@ -130,10 +130,10 @@ for the CLI, live output, trace lines, and an example `observed-profile.json`.
   ambiguous by construction; requested attributes are what the app asked for,
   not the key's effective policy. Full honest-claims section:
   [docs/usage.md](docs/usage.md#honest-claims).
-- The schema is `pkcs11-scope/observed-profile/v1.4` for `profile` and
-  `pkcs11-scope/observed-profile/v1.1-metrics` for `metrics`, with discovery
-  input at `p11scope-manifest/4`, documented at
-  [docs/schema/observed-profile-v1.md](docs/schema/observed-profile-v1.md).
+- The schema is `pkcs11-scope/observed-profile/v2` for `profile` and
+  `pkcs11-scope/observed-profile/v2-metrics` for `metrics`, with optional
+  discovery input at `p11scope-manifest/4`, documented at
+  [docs/schema/observed-profile-v2.md](docs/schema/observed-profile-v2.md).
   Schema ids are opaque exact dispatch keys; the major/minor spelling grants
   no compatibility.
 

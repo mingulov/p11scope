@@ -14,7 +14,8 @@ use crate::discovery::scan::ScannedModule;
 pub use crate::discovery::scan::Skipped;
 use p11scope_ebpf_common::{MAX_SLOTS, SlotSemantics};
 use p11scope_manifest::manifest::{
-    Acquisition, Manifest, ObjectRecord, Resolution, SurfaceSource, WalkOutcome,
+    Acquisition, InterfaceClassification, Manifest, ObjectRecord, Resolution, SurfaceSource,
+    WalkOutcome,
 };
 use p11scope_manifest::maps::{Device, ObjectKey};
 use std::collections::{BTreeMap, BTreeSet};
@@ -49,9 +50,11 @@ pub struct Slot {
 }
 
 /// One function table a module published.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct TableSummary {
+    /// `[major, minor]` of the `CK_VERSION` header the table carries.
     pub version: (u8, u8),
+    /// Entries with a usable target; the unusable ones are in `skipped`.
     pub entries: usize,
     /// "scan" | "manifest".
     pub source: &'static str,
@@ -69,6 +72,10 @@ pub struct ModuleSummary {
     pub source: &'static str,
     /// Whether a second discovery source agreed with this one (spec §4.12).
     pub corroborated: bool,
+    /// This module's own entries with no attachable target, and why — the same
+    /// records as `AttachPlan::skipped`, attributed to the module that
+    /// published them so a report can say *which* provider lost entries.
+    pub skipped: Vec<Skipped>,
 }
 
 /// Per-surface discovery provenance, carried through to evidence so a
@@ -84,21 +91,30 @@ pub struct SurfaceSummary {
     pub functions: usize,
 }
 
-fn source_label(s: &SurfaceSource) -> String {
+/// A surface label for capture output. Never the interface's recorded name:
+/// those bytes were read out of a provider's memory, and capture output does not
+/// carry provider byte strings (spec §4.3, `docs/privacy/allowlist-v1.md`) —
+/// `p11scope inspect` is where names are shown. The classification is what a
+/// reader can act on anyway, and it stays honest for the corroborated case,
+/// where the recorded name was alternate, null or unreadable.
+///
+/// `pub(crate)` so a renderer's test can assert against the real label rather
+/// than one it made up.
+pub(crate) fn source_label(s: &SurfaceSource) -> String {
     match s {
         SurfaceSource::LegacyFunctionList => "legacy_function_list".into(),
         SurfaceSource::Interface {
             index,
-            name_lossy,
-            name_error,
+            classification,
             ..
-        } => {
-            let name = name_lossy
-                .as_deref()
-                .or(name_error.as_deref())
-                .unwrap_or("unnamed");
-            format!("interface[{index}] {name}")
-        }
+        } => format!(
+            "interface[{index}] {}",
+            match classification {
+                InterfaceClassification::ExactStandard => "exact_standard",
+                InterfaceClassification::CorroboratedStandardPrefix =>
+                    "corroborated_standard_prefix",
+            }
+        ),
     }
 }
 
@@ -262,6 +278,7 @@ fn merge(
                     interfaces: 0,
                     source: module.source,
                     corroborated: false,
+                    skipped: Vec::new(),
                 });
                 ModuleId(modules.len() as u32 - 1)
             }
@@ -295,6 +312,7 @@ fn merge(
         }
         summary.tables.extend(module.tables);
         summary.interfaces += module.interfaces;
+        summary.skipped.extend(module.skipped.iter().cloned());
         surfaces.extend(module.surfaces);
         skipped.extend(module.skipped);
         entries_seen += module.entries_seen;
@@ -383,7 +401,10 @@ fn lower_scanned(module: &ScannedModule) -> Discovered<'_> {
                 && interface.name_class == "exact_standard"
                 && interface.flags & 1 != 0
         });
-        let published = table.entries.len() + table.null_entries.len();
+        // Every record the scan decoded, including the ones no probe can reach:
+        // "seen" must not shrink because a target turned out to be unusable,
+        // or `slots` vs `table_entries` stops reading as attached vs seen.
+        let published = table.entries.len() + table.null_entries.len() + table.unpinned.len();
         entries_seen += published;
         tables.push(TableSummary {
             version: table.version,
@@ -411,6 +432,7 @@ fn lower_scanned(module: &ScannedModule) -> Discovered<'_> {
             subject: (*name).to_string(),
             reason: "null pointer".into(),
         }));
+        skipped.extend(table.unpinned.iter().cloned());
     }
     Discovered {
         key: module.key,
@@ -710,6 +732,38 @@ mod tests {
         assert_eq!(p.interface_list, "absent");
     }
 
+    /// An interface name is provider-supplied bytes. `inspect` shows them; a
+    /// capture document must not carry them, however they got into the manifest.
+    #[test]
+    fn an_interface_surface_is_labelled_by_classification_never_by_provider_bytes() {
+        let mut m = manifest_with(vec![resolved("C_Sign", 0x10)]);
+        m.surfaces[0].source = SurfaceSource::Interface {
+            index: 0,
+            raw_name_hex: Some("504b4353203131".into()),
+            name_lossy: Some("PKCS 11".into()),
+            name_error: None,
+            flags: 1,
+            classification: InterfaceClassification::ExactStandard,
+        };
+        let p = build(&m);
+        assert_eq!(p.surfaces[0].source, "interface[0] exact_standard");
+
+        m.surfaces[0].source = SurfaceSource::Interface {
+            index: 3,
+            raw_name_hex: None,
+            name_lossy: None,
+            name_error: Some("null name pointer".into()),
+            flags: 0,
+            classification: InterfaceClassification::CorroboratedStandardPrefix,
+        };
+        m.surfaces[0].walk = WalkOutcome::KnownPrefix;
+        let p = build(&m);
+        assert_eq!(
+            p.surfaces[0].source, "interface[3] corroborated_standard_prefix",
+            "an unnamed interface is classified, never labelled with its error text"
+        );
+    }
+
     #[test]
     fn surface_summaries_carry_gap_provenance() {
         let mut m = manifest_with(vec![resolved("C_Sign", 0x10)]);
@@ -816,6 +870,7 @@ mod tests {
                 walk: "full",
                 entries: vec![entry("C_Sign", 0x10), entry("C_Verify", 0x60)],
                 null_entries: vec![],
+                unpinned: vec![],
                 address: 0x7000,
             }],
             interfaces: vec![],

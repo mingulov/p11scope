@@ -388,6 +388,7 @@ mod tests {
     #[test]
     fn final_evidence_line_is_machine_readable_and_never_claims_a_proven_drain() {
         let evidence = render::Evidence {
+            discovery: render::DiscoveryEvidence::default(),
             table_entries: 0,
             slots: 0,
             attached_probes: 0,
@@ -439,6 +440,21 @@ mod tests {
         assert_eq!(value["capture_aborted"], serde_json::Value::Null);
         assert_eq!(value["final_drain"], false);
         assert_eq!(value["counters_available"], true);
+        // A trace's terminal record is the same evidence contract as the
+        // profile document, discovery included — one flattened struct, so the
+        // two can never carry different fields.
+        assert_eq!(value["authority"], "hash-pinned");
+        assert_eq!(value["discovery"], serde_json::json!([]));
+        for counter in [
+            "discovery_conflicts",
+            "discovery_uncorroborated",
+            "module_ambiguous",
+            "scan_ms",
+        ] {
+            assert_eq!(value[counter], 0, "{counter}");
+        }
+        assert_eq!(value["modules_skipped"], serde_json::json!([]));
+        assert_eq!(value["scan_unavailable"], serde_json::Value::Null);
     }
 
     #[test]

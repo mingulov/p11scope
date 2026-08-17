@@ -135,33 +135,40 @@ fn cmd_capture(a: CaptureArgs) -> Result<()> {
         );
     }
     warn_unsafe_policy(policy);
-    let (plan, pinned) = discover_plan(&a, &scope)?;
+    let discovered = discover_plan(&a, &scope)?;
     // Zero modules is not an error (spec §4.10): the capture still runs, still
     // writes its report, and says here how to find out why it found nothing.
-    if plan.modules.is_empty() {
+    if discovered.plan.modules.is_empty() {
         eprintln!("{}", no_modules_hint(&a.scope));
     }
     let stop = install_stop_flag()?;
     match kind {
         Kind::Profile => capture_profile(
-            plan,
+            discovered,
             scope,
             policy,
             a.duration,
             a.out.as_deref(),
-            &pinned,
             &stop,
         ),
         Kind::Trace => capture_trace(
-            plan,
+            discovered,
             scope,
             policy,
             a.duration,
             a.out.as_deref(),
-            &pinned,
             &stop,
         ),
     }
+}
+
+/// Everything discovery produced: the plan, the objects it pinned, and the
+/// record of how it found them. One value because every capture needs all
+/// three and none of them means anything without the others.
+struct Discovered {
+    plan: plan::AttachPlan,
+    pinned: PinnedObjects,
+    discovery: render::DiscoveryEvidence,
 }
 
 /// How many processes of a `--cgroup` discovery scans.
@@ -172,9 +179,8 @@ fn cmd_capture(a: CaptureArgs) -> Result<()> {
 /// pids instead of counting them.
 const MAX_SCAN_PIDS: usize = 256;
 
-/// What the discovery pass learned besides the plan itself. One struct rather than
-/// loose locals because Task 13 turns exactly these fields into `DiscoveryEvidence`
-/// and returns them from `discover_plan` as a third element.
+/// What the discovery pass learned besides the plan itself — everything
+/// `discovery_evidence` needs that the plan does not already carry.
 #[derive(Debug, Default)]
 struct DiscoveryCounters {
     /// Manifest modules the scan contradicted; the union is attached (spec §4.12).
@@ -186,13 +192,17 @@ struct DiscoveryCounters {
     scan_ms: u64,
     /// Manifest objects ignored, and why — evidence, never silence.
     notes: Vec<String>,
+    /// Which §4.12 outcome each corroborated module got, so `discovery[]` can
+    /// tell an agreement from a conflict instead of publishing a counter with
+    /// nothing to explain it.
+    corroboration: Vec<(ObjectKey, &'static str)>,
 }
 
 impl DiscoveryCounters {
     /// The notes, on stderr. Called as soon as they are complete rather than from
     /// `report`, because every bail between the two would otherwise swallow them —
-    /// and a note is most useful exactly when discovery is about to fail.
-    /// Task 13 publishes the same list as `evidence.discovery[]`.
+    /// and a note is most useful exactly when discovery is about to fail. The same
+    /// facts reach the report as `evidence.discovery[].corroboration`.
     fn report_notes(&self) {
         for note in &self.notes {
             eprintln!("p11scope: {note}");
@@ -219,7 +229,7 @@ impl DiscoveryCounters {
     }
 }
 
-/// Which of spec §4.12's four outcomes one `--manifest` gets.
+/// Which of spec §4.12's outcomes one `--manifest` gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Corroboration {
     /// Not mapped in scope, or the scan could not run: its offsets stand alone.
@@ -228,6 +238,12 @@ enum Corroboration {
     Agreed,
     /// Mapped, but the two sets differ: attach the union and count a conflict.
     Conflict,
+    /// Mapped and identity-matched, but the scan decoded no table in it at all —
+    /// the documented primary use of `--manifest` (offsets for a provider the
+    /// scan cannot read), not two sources contradicting each other. Attached
+    /// exactly like `Conflict`, reported as uncorroborated rather than as a
+    /// disagreement: there is no rival set to disagree with.
+    ScanEmpty,
     /// Mapped with bytes the manifest did not record: ignore this manifest.
     IdentityMismatch,
 }
@@ -248,6 +264,9 @@ fn corroborate(
         None => Corroboration::Uncorroborated,
         Some(false) => Corroboration::IdentityMismatch,
         Some(true) if manifest_targets == scanned_targets => Corroboration::Agreed,
+        // Nothing decoded is not a contradiction: the manifest is the only
+        // source that ever had offsets here.
+        Some(true) if scanned_targets.is_empty() => Corroboration::ScanEmpty,
         Some(true) => Corroboration::Conflict,
     }
 }
@@ -496,11 +515,12 @@ fn drop_unpinned_entries(modules: &mut [ScannedModule], pinned: &PinnedObjects) 
     let mut dropped = Vec::new();
     for module in modules {
         for table in &mut module.tables {
+            let mut lost = Vec::new();
             table.entries.retain(|entry| {
                 if pinned.pinned().any(|p| p.key == entry.object) {
                     return true;
                 }
-                dropped.push(Skipped {
+                lost.push(Skipped {
                     subject: entry.name.to_string(),
                     reason: format!(
                         "{} was not pinned; nothing to attach into",
@@ -509,14 +529,18 @@ fn drop_unpinned_entries(modules: &mut [ScannedModule], pinned: &PinnedObjects) 
                 });
                 false
             });
+            dropped.extend(lost.iter().cloned());
+            // Left on the table it came from, so the plan still counts it as a
+            // record the scan saw and attributes the skip to this module.
+            table.unpinned.extend(lost);
         }
     }
     dropped
 }
 
 /// Discovery for one capture: scan the scope, read and corroborate any manifests,
-/// merge into one plan, pin every object. Task 13 adds the evidence return value.
-fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<(plan::AttachPlan, PinnedObjects)> {
+/// merge into one plan, pin every object, and record how all of it was found.
+fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
     let limits = ScanLimits::default();
     let mut counters = DiscoveryCounters::default();
     let pids = scope_pids(scope);
@@ -566,8 +590,11 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<(plan::AttachPlan, Pi
     // were *accepted* with nothing to corroborate them.
     let mut identity_mismatches = 0usize;
     for path in &a.manifests {
-        let mut manifest = read_manifest_file(path)?;
+        // Both `?`s below leave discovery: the notes accumulated so far are most
+        // useful exactly here, so they are printed before either returns.
+        let mut manifest = read_manifest_file(path).inspect_err(|_| counters.report_notes())?;
         let manifest_pins = pin_manifest_objects(&manifest).map_err(|problems| {
+            counters.report_notes();
             for problem in &problems {
                 eprintln!("p11scope: {problem}");
             }
@@ -586,15 +613,36 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<(plan::AttachPlan, Pi
                 .map(|(module, _)| scanned_targets(module, &pinned))
                 .unwrap_or_default(),
         );
+        counters
+            .corroboration
+            .extend(mapped.map(|key| (key, corroboration_label(outcome))));
         match outcome {
             // Every offset it carries is already in the plan; nothing to add but the
             // fact that a second source said the same thing.
             Corroboration::Agreed => corroborated.extend(mapped),
+            Corroboration::ScanEmpty => {
+                // Not marked corroborated: nothing confirmed these offsets, so the
+                // module is counted as uncorroborated and the capture is PARTIAL.
+                counters.notes.push(format!(
+                    "the memory scan decoded no function table in {}; attaching the \
+                     offsets manifest {} records, uncorroborated",
+                    manifest.module_path,
+                    path.display(),
+                ));
+                retarget_to_pins(
+                    &mut manifest,
+                    view.map(|(module, _)| module),
+                    &pinned,
+                    &manifest_pins,
+                );
+                accepted.push(manifest);
+                pinned.absorb(manifest_pins);
+            }
             Corroboration::Conflict => {
                 counters.conflicts += 1;
                 counters.notes.push(format!(
-                    "manifest {} and the memory scan disagree about {}; attaching the \
-                     union of both",
+                    "manifest {} and the memory scan decoded different targets in {}; \
+                     attaching the union of both",
                     path.display(),
                     manifest.module_path
                 ));
@@ -629,8 +677,9 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<(plan::AttachPlan, Pi
 
     counters.report_notes();
 
+    // Each dropped record stayed on the table it came from, so the plan counts
+    // it as seen and files its skip under its own module: nothing to add here.
     let mut plan = plan::build_from_sources(&modules, &accepted);
-    plan.skipped.extend(unpinned);
     for key in &corroborated {
         if let Some(summary) = plan.modules.iter_mut().find(|m| m.key == *key) {
             summary.corroborated = true;
@@ -653,14 +702,136 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<(plan::AttachPlan, Pi
              discovery source found a function table"
         );
     }
-    // The merge refuses an over-capacity module whole rather than attaching a
-    // prefix, so the ceiling is reported here instead of as an empty plan.
-    if let Some(refused) = plan.modules_skipped.first() {
-        bail!("{}: {}", refused.subject, refused.reason);
+    for refused in &plan.modules_skipped {
+        eprintln!(
+            "p11scope: module refused: {} — {}",
+            refused.subject, refused.reason
+        );
+    }
+    if let Some(error) = refusal_error(&plan) {
+        bail!(error);
     }
     plan::ensure_capacity(&plan).map_err(|error| anyhow!(error))?;
     counters.report(&plan);
-    Ok((plan, pinned))
+    let discovery = discovery_evidence(&plan, &pinned, &counters);
+    Ok(Discovered {
+        plan,
+        pinned,
+        discovery,
+    })
+}
+
+/// The merge refuses an over-capacity module whole rather than attaching a
+/// prefix (`plan::merge`). One provider over the ceiling must not cost the
+/// capture the other providers could still have shared, so a refusal is
+/// reported — it reaches `evidence.modules_skipped` and forces PARTIAL — rather
+/// than aborting. It stays an error only when it leaves nothing to attach: an
+/// empty capture whose emptiness was caused by a refusal is not the "no modules
+/// discovered" case (spec §4.10) and must not read like it.
+fn refusal_error(plan: &plan::AttachPlan) -> Option<String> {
+    let refused = plan.modules_skipped.first()?;
+    plan.slots.is_empty().then(|| {
+        format!(
+            "every module discovery found was refused at the {} attach-slot ceiling, \
+             leaving nothing to attach — first refusal: {} — {}",
+            p11scope_ebpf_common::MAX_SLOTS,
+            refused.subject,
+            refused.reason
+        )
+    })
+}
+
+/// The `discovery[]` record: what was found, where it was found, and how well
+/// the two sources agreed. Identity is `{dev, ino, sha256}` — a path here is
+/// only the label the source that saw it used, and for anything the scan found
+/// that label lives in the *target's* mount namespace.
+fn discovery_evidence(
+    plan: &plan::AttachPlan,
+    pinned: &PinnedObjects,
+    counters: &DiscoveryCounters,
+) -> render::DiscoveryEvidence {
+    let summary_of = |key: ObjectKey, path: &str| {
+        let pin = pinned.pinned().find(|p| p.key == key);
+        render::ObjectSummary {
+            dev: (key.device.major, key.device.minor),
+            ino: key.inode,
+            sha256: pin.map(|p| p.sha256.to_string()).unwrap_or_default(),
+            path: pin.map_or_else(|| path.to_string(), |p| p.path.to_string()),
+            build_id: pin.and_then(|p| p.build_id.map(str::to_string)),
+            identity_source: pin.map_or("unpinned", |p| p.identity_source),
+            note: pin.and_then(|p| p.note.map(str::to_string)),
+        }
+    };
+    let modules = plan
+        .modules
+        .iter()
+        .map(|m| {
+            let mut seen: BTreeSet<ObjectKey> = BTreeSet::new();
+            let objects: Vec<render::ObjectSummary> = plan
+                .slots
+                .iter()
+                .filter(|s| s.module_ids.contains(&m.id) && seen.insert(s.object))
+                .map(|s| summary_of(s.object, &s.object_path))
+                .collect();
+            let identity = summary_of(m.key, &m.path);
+            render::DiscoveredModule {
+                dev: identity.dev,
+                ino: identity.ino,
+                sha256: identity.sha256,
+                path: m.path.clone(),
+                build_id: identity.build_id,
+                objects,
+                sources: m.source.split('+').collect(),
+                corroborated: m.corroborated,
+                corroboration: counters
+                    .corroboration
+                    .iter()
+                    .find(|(key, _)| *key == m.key)
+                    .map_or_else(
+                        || {
+                            if !m.source.contains("manifest") {
+                                "single_source"
+                            } else if m.corroborated {
+                                "agreed"
+                            } else {
+                                "uncorroborated"
+                            }
+                        },
+                        |(_, label)| label,
+                    ),
+                tables: m.tables.clone(),
+                interfaces: m.interfaces,
+                skipped: m.skipped.iter().map(skipped_out).collect(),
+            }
+        })
+        .collect();
+    render::DiscoveryEvidence {
+        modules,
+        conflicts: counters.conflicts,
+        uncorroborated: counters.uncorroborated,
+        module_ambiguous: plan.module_ambiguous as u64,
+        modules_skipped: plan.modules_skipped.iter().map(skipped_out).collect(),
+        scan_unavailable: counters.scan_unavailable.map(str::to_string),
+        scan_ms: counters.scan_ms,
+        ..render::DiscoveryEvidence::default()
+    }
+}
+
+fn skipped_out(s: &Skipped) -> render::SkippedOut {
+    render::SkippedOut {
+        name: s.subject.clone(),
+        reason: s.reason.clone(),
+    }
+}
+
+fn corroboration_label(outcome: Corroboration) -> &'static str {
+    match outcome {
+        Corroboration::Uncorroborated => "uncorroborated",
+        Corroboration::Agreed => "agreed",
+        Corroboration::Conflict => "conflict",
+        Corroboration::ScanEmpty => "scan_empty",
+        Corroboration::IdentityMismatch => "identity_mismatch",
+    }
 }
 
 /// Prints every attach failure — shared by `profile` and `trace`, which
@@ -763,9 +934,9 @@ fn observe_fork(
     true
 }
 
-/// The provider line the live frame and the report name. Task 13 replaces it with
-/// `capture.modules[]`; until then a capture that observed two providers says so
-/// rather than picking one and calling it "the" module.
+/// The provider line the live frame shows. One line for a screen header, where
+/// `capture.modules[]` is the report's answer: a capture that observed two
+/// providers says so rather than picking one and calling it "the" module.
 fn module_label(plan: &plan::AttachPlan) -> String {
     match plan.modules.as_slice() {
         [] => "no modules discovered".to_string(),
@@ -775,14 +946,19 @@ fn module_label(plan: &plan::AttachPlan) -> String {
 }
 
 fn capture_profile(
-    plan: plan::AttachPlan,
+    discovered: Discovered,
     scope: Scope,
     policy: CapturePolicy,
     duration: Option<Duration>,
     out: Option<&Path>,
-    pinned: &PinnedObjects,
     interrupted: &AtomicBool,
 ) -> Result<()> {
+    let Discovered {
+        plan,
+        pinned,
+        discovery,
+    } = discovered;
+    let pinned = &pinned;
     let module_label = module_label(&plan);
     // Created before the attach so a bad `-o` path fails early, published
     // by `commit()` only once the final report is written.
@@ -853,6 +1029,7 @@ fn capture_profile(
             malformed_records,
             &state,
             pinned.provider_changed(),
+            &discovery,
         );
         let frame = render::live(&reports, &ev, elapsed, &module_label, mode, policy);
         pinned.check_unchanged().map_err(anyhow::Error::msg)?;
@@ -891,6 +1068,7 @@ fn capture_profile(
         malformed_records,
         &state,
         pinned.provider_changed(),
+        &discovery,
     );
     ev.mark_terminal_drain_unproven();
     let frame = render::live(&reports, &ev, clock.elapsed(), &module_label, mode, policy);
@@ -908,16 +1086,9 @@ fn capture_profile(
             .to_string();
         let started = fmt_rfc3339(wall_start);
         let ended = fmt_rfc3339(SystemTime::now());
-        // The first discovered module's build-id; Task 13 publishes one entry per
-        // module instead of a single `capture.module`.
-        let build_id = plan
-            .modules
-            .first()
-            .and_then(|m| pinned.pinned().find(|p| p.key == m.key))
-            .and_then(|p| p.build_id.map(str::to_string));
+        // `capture.modules[]` comes from the evidence, not from here: one list,
+        // rendered twice, so the two sections cannot disagree.
         let capture = render::CaptureMeta {
-            module: &module_label,
-            build_id: build_id.as_deref(),
             started: &started,
             ended: &ended,
             kernel: &kernel,
@@ -955,14 +1126,19 @@ fn write_json_report(file: &mut std::fs::File, j: &serde_json::Value) -> Result<
 /// every tick, no periodic full-screen redraw) and time-bounding differ
 /// enough that folding it into `profile`'s loop would tangle both.
 fn capture_trace(
-    plan: plan::AttachPlan,
+    discovered: Discovered,
     scope: Scope,
     policy: CapturePolicy,
     duration: Option<Duration>,
     out: Option<&Path>,
-    pinned: &PinnedObjects,
     interrupted: &AtomicBool,
 ) -> Result<()> {
+    let Discovered {
+        plan,
+        pinned,
+        discovery,
+    } = discovered;
+    let pinned = &pinned;
     // A line stream, not a published artifact: created before the attach so a
     // bad `-o` path fails early, then appended to as lines arrive.
     let mut out_sink = match out {
@@ -1066,6 +1242,7 @@ fn capture_trace(
         malformed_records,
         &state,
         pinned.provider_changed(),
+        &discovery,
     );
     evidence.mark_terminal_drain_unproven();
     emit_trace_line(
@@ -1205,6 +1382,7 @@ fn evidence_for(
     malformed_records: u64,
     state: &semantics::State,
     provider_changed: bool,
+    discovery: &render::DiscoveryEvidence,
 ) -> render::Evidence {
     let semantic = state.semantic_evidence();
     let mut ev = render::Evidence {
@@ -1265,22 +1443,11 @@ fn evidence_for(
         shape_decode_total_failures: state.total_shape_decode_failures(),
         templates_truncated: state.templates_truncated(),
         provider_changed,
+        discovery: discovery.clone(),
         completeness: "UNKNOWN",
     };
     ev.verdict();
-    ev.completeness = discovered_completeness(plan, ev.completeness);
     ev
-}
-
-/// A capture that attached nothing has no attach failures, no skips and no loss, so
-/// `Evidence::verdict` would call having observed nothing COMPLETE. Task 13 moves
-/// this rule into `verdict()` itself as `discovery.modules.is_empty()`.
-fn discovered_completeness(plan: &plan::AttachPlan, verdict: &'static str) -> &'static str {
-    if plan.slots.is_empty() {
-        "PARTIAL"
-    } else {
-        verdict
-    }
 }
 
 /// `SystemTime` → an RFC3339-ish UTC timestamp, no `chrono` dependency.
@@ -1557,6 +1724,7 @@ mod tests {
                     entry("C_Verify", unpinned_key, 0x20),
                 ],
                 null_entries: vec![],
+                unpinned: vec![],
                 address: 0x7000,
             });
 
@@ -1573,6 +1741,125 @@ mod tests {
                 "every scanned slot must have a pinned object of its own: {slot:?}"
             );
         }
+        // A record the scan decoded and could not use is still a record it saw:
+        // dropping it from `entries_seen` would make `slots` vs `table_entries`
+        // read as "everything seen was attached". It is reported as a skip too,
+        // the same way a NULL entry is, and attributed to its own module.
+        assert_eq!(plan.entries_seen, 2, "the dropped entry stays counted");
+        assert_eq!(plan.skipped.len(), 1, "{:?}", plan.skipped);
+        assert_eq!(plan.skipped[0].subject, "C_Verify");
+        assert_eq!(plan.modules[0].skipped, plan.skipped);
+    }
+
+    fn plan_with(slots: usize, refused: usize) -> plan::AttachPlan {
+        plan::AttachPlan {
+            slots: (0..slots)
+                .map(|index| plan::Slot {
+                    index: index as u32,
+                    object: ObjectKey {
+                        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                        inode: 42,
+                    },
+                    object_path: "/opt/p11.so".into(),
+                    file_offset: index as u64 * 8,
+                    names: vec!["C_Sign".into()],
+                    aliased: false,
+                    semantics: p11scope_ebpf_common::SlotSemantics::COUNT_ONLY,
+                    semantic_ambiguous: false,
+                    fork_safe: false,
+                    module_ids: vec![plan::ModuleId(0)],
+                })
+                .collect(),
+            modules: vec![plan::ModuleSummary {
+                id: plan::ModuleId(0),
+                key: ObjectKey {
+                    device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                    inode: 42,
+                },
+                path: "/opt/p11.so".into(),
+                tables: vec![],
+                interfaces: 0,
+                source: "scan",
+                corroborated: false,
+                skipped: vec![],
+            }],
+            skipped: vec![],
+            modules_skipped: (0..refused)
+                .map(|i| Skipped {
+                    subject: format!("/opt/big{i}.so"),
+                    reason: "module needs 600 more of the 512 attach slots".into(),
+                })
+                .collect(),
+            entries_seen: slots,
+            surfaces: vec![],
+            vendor_interfaces: 0,
+            interface_list: "absent".into(),
+            module_ambiguous: 0,
+        }
+    }
+
+    /// One provider over the slot ceiling must not cost the capture the other
+    /// providers could still have shared: the refusal is evidence (and forces
+    /// PARTIAL), not an abort. It stays an error only when nothing is left.
+    #[test]
+    fn a_partial_capacity_refusal_is_reported_and_only_an_empty_one_is_fatal() {
+        assert_eq!(refusal_error(&plan_with(4, 0)), None, "nothing refused");
+        assert_eq!(
+            refusal_error(&plan_with(4, 1)),
+            None,
+            "one refused module must not lose the four slots that fit"
+        );
+        assert_eq!(refusal_error(&plan_with(0, 0)), None, "§4.10: not an error");
+        let error = refusal_error(&plan_with(0, 1)).expect("a refusal with nothing left is fatal");
+        assert!(error.contains("nothing to attach"), "{error}");
+        assert!(error.contains("/opt/big0.so"), "{error}");
+
+        // …and the refusal reaches evidence, which is what makes reporting it
+        // instead of aborting honest: `render::Evidence::verdict` turns a
+        // non-empty `modules_skipped` into PARTIAL (see `render`'s own tests).
+        let evidence = discovery_evidence(
+            &plan_with(4, 1),
+            &PinnedObjects::empty(),
+            &DiscoveryCounters::default(),
+        );
+        assert_eq!(evidence.modules_skipped.len(), 1);
+        assert_eq!(evidence.modules_skipped[0].name, "/opt/big0.so");
+        assert!(
+            evidence.modules_skipped[0].reason.contains("attach slots"),
+            "{:?}",
+            evidence.modules_skipped[0]
+        );
+    }
+
+    /// Both §4.12 outcomes that attach a union mark the module corroborated, so
+    /// without the outcome itself an agreement and a conflict are the same
+    /// record — and `discovery_conflicts` would have nothing explaining it.
+    #[test]
+    fn the_module_record_says_which_corroboration_outcome_it_got() {
+        let plan = plan_with(1, 0);
+        let key = plan.modules[0].key;
+        for (outcome, label) in [
+            (Corroboration::Agreed, "agreed"),
+            (Corroboration::Conflict, "conflict"),
+            (Corroboration::ScanEmpty, "scan_empty"),
+            (Corroboration::IdentityMismatch, "identity_mismatch"),
+        ] {
+            let counters = DiscoveryCounters {
+                corroboration: vec![(key, corroboration_label(outcome))],
+                ..DiscoveryCounters::default()
+            };
+            let evidence = discovery_evidence(&plan, &PinnedObjects::empty(), &counters);
+            assert_eq!(evidence.modules[0].corroboration, label);
+        }
+        // Nothing recorded: one source described it, and the record says so
+        // rather than implying a second source failed to.
+        let evidence = discovery_evidence(
+            &plan,
+            &PinnedObjects::empty(),
+            &DiscoveryCounters::default(),
+        );
+        assert_eq!(evidence.modules[0].corroboration, "single_source");
+        assert_eq!(evidence.modules[0].sources, vec!["scan"]);
     }
 
     /// A manifest records the `{device, inode}` its provider had on the host it was
@@ -1794,46 +2081,11 @@ mod tests {
         }
     }
 
-    /// A capture that attached nothing must never publish COMPLETE: it has no
-    /// failures to report precisely because it observed nothing (spec §4.10).
-    #[test]
-    fn a_capture_that_attached_nothing_is_partial() {
-        let mut plan = plan::AttachPlan {
-            slots: vec![],
-            modules: vec![],
-            skipped: vec![],
-            modules_skipped: vec![],
-            entries_seen: 0,
-            surfaces: vec![],
-            vendor_interfaces: 0,
-            interface_list: "absent".into(),
-            module_ambiguous: 0,
-        };
-        assert_eq!(discovered_completeness(&plan, "COMPLETE"), "PARTIAL");
-        plan.slots.push(plan::Slot {
-            index: 0,
-            object: p11scope_manifest::maps::ObjectKey {
-                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
-                inode: 42,
-            },
-            object_path: "/opt/p11.so".into(),
-            file_offset: 0x10,
-            names: vec!["C_Sign".into()],
-            aliased: false,
-            semantics: p11scope_ebpf_common::SlotSemantics::COUNT_ONLY,
-            semantic_ambiguous: false,
-            fork_safe: false,
-            module_ids: vec![plan::ModuleId(0)],
-        });
-        assert_eq!(discovered_completeness(&plan, "COMPLETE"), "COMPLETE");
-        assert_eq!(discovered_completeness(&plan, "PARTIAL"), "PARTIAL");
-    }
-
-    /// The four outcomes of spec §4.12, which decide whether `--manifest` is a safe
+    /// The outcomes of spec §4.12, which decide whether `--manifest` is a safe
     /// fallback or a trapdoor. Each one changes what is attached and what the
     /// capture claims about it.
     #[test]
-    fn the_four_corroboration_outcomes() {
+    fn the_corroboration_outcomes() {
         let recorded = targets(&[0x10, 0x20]);
         // 1. Not mapped in scope: the manifest stands on its own.
         assert_eq!(
@@ -1850,9 +2102,17 @@ mod tests {
             corroborate(false, Some(true), &recorded, &targets(&[0x10, 0x30])),
             Corroboration::Conflict
         );
+        // 3b. Mapped and identity-matched, but the scan decoded no table at all:
+        // the documented use of `--manifest`, not two sources contradicting each
+        // other. Reported as uncorroborated, never as a disagreement.
         assert_eq!(
             corroborate(false, Some(true), &recorded, &BTreeSet::new()),
-            Corroboration::Conflict
+            Corroboration::ScanEmpty
+        );
+        // Two empty sets are not a scan-empty case: nothing was recorded either.
+        assert_eq!(
+            corroborate(false, Some(true), &BTreeSet::new(), &BTreeSet::new()),
+            Corroboration::Agreed
         );
         // 4. Mapped, but the bytes are not the ones the manifest recorded.
         assert_eq!(
@@ -1932,13 +2192,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("observed.json");
         std::fs::write(&path, b"stale trailing bytes that must disappear").unwrap();
-        let j = serde_json::json!({"schema": "pkcs11-scope/observed-profile/v1.4", "evidence": {}});
+        let j = serde_json::json!({"schema": "pkcs11-scope/observed-profile/v2", "evidence": {}});
         let mut out = AtomicFile::create(&path).unwrap();
         write_json_report(out.file(), &j).expect("shutdown finalization must write the report");
         out.commit().unwrap();
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(parsed["schema"], "pkcs11-scope/observed-profile/v1.4");
+        assert_eq!(parsed["schema"], "pkcs11-scope/observed-profile/v2");
     }
 
     /// The unsafe policy is refused by `CapturePolicy::from_cli` on the parsed

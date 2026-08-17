@@ -62,6 +62,11 @@ pub struct ScannedTable {
     pub entries: Vec<ScannedEntry>,
     /// Published names whose slot held a NULL pointer — evidence, not entries.
     pub null_entries: Vec<&'static str>,
+    /// Entries this scan decoded but dropped because their object could not be
+    /// pinned (`main::drop_unpinned_entries`). Kept here so they stay counted
+    /// as *seen* and are reported as skipped, exactly like the NULL ones: a
+    /// record the scan read and could not use is evidence, not silence.
+    pub unpinned: Vec<Skipped>,
     /// Address of the version word in the target, for interface cross-reference.
     pub address: u64,
 }
@@ -262,6 +267,7 @@ fn decode_candidate(
             walk,
             entries,
             null_entries,
+            unpinned: Vec::new(),
             address,
         },
         len,

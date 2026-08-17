@@ -37,6 +37,7 @@ fn module(
                 })
                 .collect(),
             null_entries: vec![],
+            unpinned: vec![],
             address: 0x1000 + inode,
         }],
         interfaces: vec![],

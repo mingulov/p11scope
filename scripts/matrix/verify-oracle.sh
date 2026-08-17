@@ -237,7 +237,7 @@ if excluded:
 
 # Capture counts, keyed the same way, from the aggregate-map-sourced
 # `functions` section (the count authority -- never subject to
-# ring-buffer loss; see docs/schema/observed-profile-v1.md).
+# ring-buffer loss; see docs/schema/observed-profile-v2.md).
 observed = json.load(open(observed_path))
 capture = {}
 capture_by_name = {}

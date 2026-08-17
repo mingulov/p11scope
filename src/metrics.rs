@@ -4,7 +4,7 @@
 //! state.
 
 use crate::attach::Session;
-use crate::plan::AttachPlan;
+use crate::plan::{AttachPlan, ModuleId};
 use anyhow::{Context as _, Result};
 use aya::maps::{PerCpuArray, PerCpuHashMap};
 use p11scope_ebpf_common::{
@@ -19,6 +19,11 @@ use std::collections::BTreeMap;
 pub struct SlotReport {
     pub names: Vec<String>,
     pub aliased: bool,
+    /// The module these counts belong to; `None` when two modules publish this
+    /// target and neither can be credited (spec §4.7).
+    pub module: Option<ModuleId>,
+    /// True exactly when `module` is `None` because the target is shared.
+    pub module_ambiguous: bool,
     /// Completed calls (entry and return both observed).
     pub calls: u64,
     pub errors: u64,
@@ -67,6 +72,8 @@ pub fn read(session: &Session, plan: &AttachPlan) -> Result<Vec<SlotReport>> {
         out.push(SlotReport {
             names: slot.names.clone(),
             aliased: slot.aliased,
+            module: plan.module_of_slot(slot.index),
+            module_ambiguous: slot.module_ids.len() >= 2,
             calls: acc.returned,
             errors: acc.errors,
             in_flight: acc.entered.saturating_sub(acc.returned),

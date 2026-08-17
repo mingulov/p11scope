@@ -37,13 +37,23 @@ COUNTERS = (
     "unmatched_closes",
     "shape_decode_failures",
     "shape_decode_total_failures",
-    # Discovery gaps (schema v2). Every one of them forces PARTIAL, so a lane
-    # with a real provider must report all three as zero.
+    # Discovery gaps (schema v2). Every one of them forces PARTIAL. None of them
+    # may be nonzero by accident: each lane below states the value it expects and
+    # why, because "which sources described this provider" is now part of the
+    # oracle, not a detail of how the lane was set up.
     "discovery_conflicts",
     "discovery_uncorroborated",
     "module_ambiguous",
 )
 
+# The version-matrix provider, seen two ways. Both are measured, both are exact.
+#
+# MANIFEST-ONLY — the workload dlopens the provider only *after* the observer
+# attaches (every induced-gap lane, and every lane whose target is released by a
+# go-file). This slice scans once, at attach time, so the scan finds nothing in
+# scope: the manifest is the only source, and it is `uncorroborated` because
+# nothing was there to confirm it. Thirteen surfaces, 988 entries — the helper's
+# own numbers, unchanged from v1.
 VERSION_SURFACES = Counter(
     {
         ("full", 68): 2,
@@ -56,6 +66,26 @@ VERSION_SURFACES = Counter(
         ("not_walked", 0): 1,
     }
 )
+# SCANNED — the canary workload maps the provider *before* attach, so both
+# sources describe it. Only three of the provider's thirteen tables live in the
+# object's file-backed data; the other ten are built at run time in .bss, which
+# the memory scan cannot reach and says so (three object-level skips). So the
+# scan's set is a strict subset of the manifest's, the two sets differ, and
+# §4.12 records one `discovery_conflict` and attaches their union.
+#
+# What the union does *not* change is the attach plan: 104 slots and 208 probes,
+# exactly as before, because a slot is one {object, file offset} however many
+# sources named it. `table_entries` and `surfaces` do change: they count entries
+# and surfaces per source, so the three scanned tables add 68+68+92 = 228
+# entries (988 -> 1216) and three surfaces (13 -> 16).
+VERSION_SURFACES_SCANNED = VERSION_SURFACES + Counter(
+    {("full", 68): 2, ("full", 92): 1}
+)
+VERSION_SHAPE_MANIFEST_ONLY = (988, 104, 208, VERSION_SURFACES, 1, "ok")
+VERSION_SHAPE_SCANNED = (1216, 104, 208, VERSION_SURFACES_SCANNED, 1, "ok")
+# The three tables the scan cannot reach in the version-matrix provider. Each is
+# an object-level skip naming the provider, not a lost table entry.
+VERSION_SCAN_SKIPS = 3
 G1_SURFACES = Counter({("full", 68): 1, ("full", 92): 1, ("not_walked", 0): 1})
 LEGACY_SURFACES = Counter({("full", 68): 1})
 
@@ -131,10 +161,47 @@ def exact_shape(evidence, table_entries, slots, probes, surfaces, vendor, interf
     require(surface_signature(evidence) == surfaces, f"unexpected surfaces: {evidence['surfaces']}")
 
 
-def exact_common(evidence, *, aliases, skipped, in_flight):
+def entry_skips(evidence):
+    """The table entries no probe could attach to.
+
+    `evidence.skipped` mixes two granularities the schema documents together:
+    entry-level losses, whose `name` is the PKCS#11 function that was lost, and
+    object/process-level losses, whose `name` is an object path or `pid <n>`.
+    Only the first kind is an oracle a lane can state exactly — the second kind
+    depends on what else the scan walked, which for a `--cgroup` lane is every
+    process in that cgroup.
+    """
+    return [item for item in evidence["skipped"] if item["name"].startswith("C_")]
+
+
+def module_skips(evidence):
+    """Object-level losses about a module this capture actually declared.
+
+    A `--cgroup` lane also sees losses about bystander processes that merely
+    share the cgroup (an object over the byte cap, a process that exited
+    mid-walk). Those cannot affect the attach plan of the module under test, so
+    they are not counted here; what the module itself lost is, exactly. The
+    shape assertion is what proves nothing the module *needed* went missing.
+    """
+    declared = {module["path"] for module in evidence["discovery"]}
+    return [
+        item
+        for item in evidence["skipped"]
+        if not item["name"].startswith("C_") and item["name"] in declared
+    ]
+
+
+def exact_common(evidence, *, aliases, skipped, in_flight, module_skipped=0):
     require(evidence["attach_failures"] == [], evidence["attach_failures"])
     require(evidence["aliased"] == aliases, f"unexpected aliases: {evidence['aliased']}")
-    require(evidence["skipped"] == skipped, f"unexpected skips: {evidence['skipped']}")
+    require(
+        entry_skips(evidence) == skipped,
+        f"unexpected entry skips: {entry_skips(evidence)}",
+    )
+    require(
+        len(module_skips(evidence)) == module_skipped,
+        f"module-level skips: want {module_skipped}, got {module_skips(evidence)}",
+    )
     require(evidence["in_flight_at_end"] == in_flight, evidence["in_flight_at_end"])
     require(evidence["templates_truncated"] is False, "templates were truncated")
     require(evidence["provider_changed"] is False, "a pinned provider object changed during capture")
@@ -165,7 +232,7 @@ INFORMATIONAL_COUNTERS = frozenset(
 )
 
 
-def terminal_capture_is_clean(evidence):
+def terminal_capture_is_clean(evidence, *, uncorroborated=0):
     """Normal terminal evidence for a lane with its own call oracle.
 
     A detached perf link does not wait for BPF callbacks already running on
@@ -175,12 +242,20 @@ def terminal_capture_is_clean(evidence):
     every *concrete* gap counter zero. The documented informational counters
     are not gaps and are not constrained here; a lane that can prove an exact
     value for them should assert it directly with exact_counters.
+
+    `uncorroborated` is the one gap a lane may legitimately expect: a lane whose
+    target does not map the provider until *after* the observer has attached
+    (a forked child, a cold-start pod, a stopped process released by SIGCONT)
+    gives the scan nothing to corroborate its manifest against. The value is
+    still exact — a lane must say how many manifests stand alone, and one that
+    expected corroboration and did not get it still fails.
     """
     exact_common(evidence, aliases=[], skipped=[], in_flight=0)
     for name in COUNTERS:
         if name in INFORMATIONAL_COUNTERS:
             continue
-        require(evidence[name] == 0, f"{name}: want 0, got {evidence[name]}")
+        wanted = uncorroborated if name == "discovery_uncorroborated" else 0
+        require(evidence[name] == wanted, f"{name}: want {wanted}, got {evidence[name]}")
 
 
 def exact_capture_modules(document):
@@ -236,7 +311,30 @@ def load_canary(path, trace):
     return json.loads(records[0])
 
 
-def validate_clean_metrics(document, expected, multiplier=1):
+# How discovery saw the provider in a SoftHSM2 lane. The shape is the same for
+# all three — SoftHSM2 publishes one 2.40 table in the object's file-backed
+# data, so the scan and the helper compute the *same* 68 offsets — but which
+# sources described it, and whether anything corroborated the manifest, is part
+# of the oracle and never inferred.
+CLEAN_DISCOVERY = {
+    # The scan alone: no manifest was passed.
+    "scan": (["scan"], {}),
+    # Both, and they agreed: the manifest's offsets are confirmed by the target's
+    # own mapped bytes, and the two surface sets merge into one rather than
+    # double-counting.
+    "corroborated": (["scan", "manifest"], {}),
+    # The manifest alone, because the target has not mapped the provider yet when
+    # the observer attaches — a stopped process released by SIGCONT, a pod that
+    # scales up from zero. Nothing was there to confirm it, so it is
+    # uncorroborated; that is a stated gap, not a failure.
+    "manifest-only": (["manifest"], {"discovery_uncorroborated": 1}),
+}
+
+
+def validate_clean_metrics(document, expected, multiplier=1, *, discovery="scan"):
+    """SoftHSM2 counted exactly, with discovery stated rather than assumed."""
+    require(discovery in CLEAN_DISCOVERY, f"unknown clean-metrics discovery: {discovery}")
+    wanted_sources, allowances = CLEAN_DISCOVERY[discovery]
     require(multiplier >= 1, f"invalid clean-metrics multiplier: {multiplier}")
     require(document["schema"] == "pkcs11-scope/observed-profile/v2-metrics", document["schema"])
     require(document["capture"]["mode"] == "metrics", document["capture"])
@@ -244,7 +342,14 @@ def validate_clean_metrics(document, expected, multiplier=1):
     evidence = document["evidence"]
     exact_shape(evidence, 68, 68, 136, LEGACY_SURFACES, 0, "absent")
     exact_common(evidence, aliases=[], skipped=[], in_flight=0)
-    exact_counters(evidence)
+    exact_counters(evidence, allowances)
+    sources = [module["sources"] for module in evidence["discovery"]]
+    require(sources == [wanted_sources], f"unexpected discovery sources: {sources}")
+    corroborated = [module["corroborated"] for module in evidence["discovery"]]
+    require(
+        corroborated == [discovery == "corroborated"],
+        f"unexpected corroboration: {evidence['discovery']}",
+    )
     exact_capture_modules(document)
 
     actual = Counter()
@@ -261,25 +366,50 @@ def validate_clean_metrics(document, expected, multiplier=1):
 
 
 def validate_canary(lane, document):
+    """A canary lane: the version-matrix provider, exact in shape and policy.
+
+    The third element of each row is how discovery saw the provider. The canary
+    workload maps it before attach, so both sources describe it (`scanned`); the
+    freeze lane's workload is released only after attach, so the manifest stands
+    alone (`manifest-only`). Nothing else about those lanes differs, and neither
+    value is optional: a lane that scanned when it should not have, or failed to
+    scan when it should have, fails here.
+    """
     lanes = {
-        "default-safe-profile": ("safe", "profile"),
-        "default-safe-trace": ("safe", "trace"),
-        "feature-safe-profile": ("safe", "profile"),
-        "feature-safe-trace": ("safe", "trace"),
-        "feature-unsafe-profile": ("unsafe", "profile"),
-        "feature-unsafe-trace": ("unsafe", "trace"),
-        "aggregate-only-metrics": ("aggregate", "metrics"),
+        "default-safe-profile": ("safe", "profile", "scanned"),
+        "default-safe-trace": ("safe", "trace", "scanned"),
+        "feature-safe-profile": ("safe", "profile", "scanned"),
+        "feature-safe-trace": ("safe", "trace", "scanned"),
+        "feature-unsafe-profile": ("unsafe", "profile", "scanned"),
+        "feature-unsafe-trace": ("unsafe", "trace", "scanned"),
+        "aggregate-only-metrics": ("aggregate", "metrics", "scanned"),
+        "freeze-unsafe-profile": ("unsafe", "profile", "manifest-only"),
     }
     require(lane in lanes, f"unknown canary lane: {lane}")
-    policy, kind = lanes[lane]
+    policy, kind, discovery = lanes[lane]
     trace = kind == "trace"
     evidence = document if trace else document["evidence"]
 
-    exact_shape(evidence, 988, 104, 208, VERSION_SURFACES, 1, "ok")
-    exact_common(evidence, aliases=[], skipped=[], in_flight=0)
-    exact_counters(
+    scanned = discovery == "scanned"
+    exact_shape(
+        evidence, *(VERSION_SHAPE_SCANNED if scanned else VERSION_SHAPE_MANIFEST_ONLY)
+    )
+    exact_common(
         evidence,
-        SAFE_ALLOWANCES if policy == "safe" else UNSAFE_ALLOWANCES if policy == "unsafe" else {},
+        aliases=[],
+        skipped=[],
+        in_flight=0,
+        module_skipped=VERSION_SCAN_SKIPS if scanned else 0,
+    )
+    allowances = dict(
+        SAFE_ALLOWANCES if policy == "safe" else UNSAFE_ALLOWANCES if policy == "unsafe" else {}
+    )
+    allowances["discovery_conflicts" if scanned else "discovery_uncorroborated"] = 1
+    exact_counters(evidence, allowances)
+    sources = [module["sources"] for module in evidence["discovery"]]
+    require(
+        sources == ([["scan", "manifest"]] if scanned else [["manifest"]]),
+        f"unexpected discovery sources: {sources}",
     )
 
     privacy = {
@@ -307,6 +437,13 @@ def validate_canary(lane, document):
         require(calls == 25, f"aggregate calls: want 25, got {calls}")
 
 
+# Every induced-gap lane holds its workload behind a go-file, so nothing has
+# dlopened the provider when the observer attaches and the scan finds nothing in
+# scope to corroborate the manifest against. One uncorroborated module each,
+# exactly — the gap being induced is never the discovery one.
+INDUCED_ALLOWANCES = {"discovery_uncorroborated": 1}
+
+
 def validate_induced(lane, document):
     require(lane in {"G1", "G2", "G3", "G4", "G5"}, f"unknown induced lane: {lane}")
     require(document["schema"] == "pkcs11-scope/observed-profile/v2", document["schema"])
@@ -314,13 +451,15 @@ def validate_induced(lane, document):
     require(document["capture"]["privacy_mode"] == "allowlisted", document["capture"])
     exact_capture_modules(document)
     evidence = document["evidence"]
+    sources = [module["sources"] for module in evidence["discovery"]]
+    require(sources == [["manifest"]], f"unexpected discovery sources: {sources}")
 
     if lane == "G1":
         aliases = [["C_CancelFunction", "C_WaitForSlotEvent"]]
         skipped = [{"name": "C_GetFunctionStatus", "reason": "null pointer"}]
         exact_shape(evidence, 160, 93, 186, G1_SURFACES, 1, "ok")
         exact_common(evidence, aliases=aliases, skipped=skipped, in_flight=0)
-        exact_counters(evidence)
+        exact_counters(evidence, INDUCED_ALLOWANCES)
     elif lane == "G2":
         groups = evidence["aliased"]
         require(len(groups) == 1, f"G2 aliases: {groups}")
@@ -328,7 +467,7 @@ def validate_induced(lane, document):
         require("C_WaitForSlotEvent" not in groups[0], f"G2 stranded name was aliased: {groups}")
         exact_shape(evidence, 68, 2, 4, LEGACY_SURFACES, 0, "absent")
         exact_common(evidence, aliases=groups, skipped=[], in_flight=1)
-        exact_counters(evidence)
+        exact_counters(evidence, INDUCED_ALLOWANCES)
     elif lane == "G3":
         exact_shape(evidence, 68, 68, 136, LEGACY_SURFACES, 0, "absent")
         exact_common(evidence, aliases=[], skipped=[], in_flight=0)
@@ -341,21 +480,27 @@ def validate_induced(lane, document):
         require(dict(actual) == G3_COUNTS, f"G3 function counts: {dict(actual)}")
         exact_counters(
             evidence,
-            {
-                "event_loss": evidence["event_loss"],
-                "unmatched_closes": evidence["unmatched_closes"],
-            },
+            dict(
+                INDUCED_ALLOWANCES,
+                event_loss=evidence["event_loss"],
+                unmatched_closes=evidence["unmatched_closes"],
+            ),
         )
     elif lane == "G4":
-        exact_shape(evidence, 988, 104, 208, VERSION_SURFACES, 1, "ok")
+        exact_shape(evidence, *VERSION_SHAPE_MANIFEST_ONLY)
         exact_common(evidence, aliases=[], skipped=[], in_flight=9)
-        exact_counters(evidence, {"start_insert_failures": 8})
+        exact_counters(evidence, dict(INDUCED_ALLOWANCES, start_insert_failures=8))
     else:
-        exact_shape(evidence, 988, 104, 208, VERSION_SURFACES, 1, "ok")
+        exact_shape(evidence, *VERSION_SHAPE_MANIFEST_ONLY)
         exact_common(evidence, aliases=[], skipped=[], in_flight=0)
         exact_counters(
             evidence,
-            {"rv_update_failures": 9, "unregistered_mechanisms": 6, "async_orphans": 1},
+            dict(
+                INDUCED_ALLOWANCES,
+                rv_update_failures=9,
+                unregistered_mechanisms=6,
+                async_orphans=1,
+            ),
         )
         require(sum(item["calls"] for item in document["functions"]) == 11, document["functions"])
 
@@ -387,14 +532,16 @@ def function_items(pairs):
     ]
 
 
-def discovery_fixture():
+def discovery_fixture(sources=("scan",)):
+    sources = list(sources)
+    corroborated = sources == ["scan", "manifest"]
     return [
         dict(
             MODULE_FIXTURE,
             objects=[dict(MODULE_FIXTURE, identity_source="mountinfo", note=None)],
-            sources=["scan"],
-            corroborated=False,
-            corroboration=["single_source"],
+            sources=sources,
+            corroborated=corroborated,
+            corroboration=["conflict"] if corroborated else ["single_source"],
             tables=[{"version": [2, 40], "entries": 68, "source": "scan"}],
             interfaces=0,
             skipped=[],
@@ -402,10 +549,18 @@ def discovery_fixture():
     ]
 
 
-def evidence_fixture(surfaces):
+# An object-level skip as the scan emits one: the subject is the provider path,
+# not a function name, and it records a table the scan could not reach at all.
+MODULE_SKIP = {
+    "name": MODULE_FIXTURE["path"],
+    "reason": "a 3.0 table header extends past the object's file-backed data",
+}
+
+
+def evidence_fixture(surfaces, sources=("scan",), module_skipped=0):
     return {
         "authority": "hash-pinned",
-        "discovery": discovery_fixture(),
+        "discovery": discovery_fixture(sources),
         "modules_skipped": [],
         "scan_unavailable": None,
         "scan_ms": 3,
@@ -414,7 +569,7 @@ def evidence_fixture(surfaces):
         "attached_probes": 0,
         "attach_failures": [],
         "aliased": [],
-        "skipped": [],
+        "skipped": [dict(MODULE_SKIP) for _ in range(module_skipped)],
         "in_flight_at_end": 0,
         "surfaces": [
             {"walk": walk, "functions": functions, "acquisition": "ok"}
@@ -424,6 +579,9 @@ def evidence_fixture(surfaces):
         "vendor_interfaces": 0,
         "interface_list": "absent",
         **{name: 0 for name in COUNTERS},
+        # A fixture is self-consistent: a module only the manifest described is
+        # uncorroborated, by definition of the word.
+        "discovery_uncorroborated": 1 if list(sources) == ["manifest"] else 0,
         "templates_truncated": False,
         "provider_changed": False,
         "completeness": "PARTIAL",
@@ -483,15 +641,101 @@ def self_test():
     rejected(lambda: validate_clean_metrics(clean, {"C_Initialize": 1}, 2))
     print("clean metrics multiplier is exact: OK")
 
-    version = evidence_fixture(VERSION_SURFACES)
-    version.update(table_entries=988, slots=104, attached_probes=208, vendor_interfaces=1, interface_list="ok")
+    # A lane whose target maps the provider only after attach: the manifest is
+    # the sole source and is reported uncorroborated. The scanned expectation
+    # must reject it, and the manifest-only expectation must reject a scan.
+    manifest_only_evidence = evidence_fixture(LEGACY_SURFACES, sources=("manifest",))
+    manifest_only_evidence.update(
+        table_entries=68, slots=68, attached_probes=136, discovery_uncorroborated=1
+    )
+    manifest_only = document_fixture(
+        manifest_only_evidence,
+        schema="pkcs11-scope/observed-profile/v2-metrics",
+        mode="metrics",
+        privacy="aggregate-only",
+    )
+    manifest_only["functions"] = function_items(
+        [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
+    )
+    corroborated_evidence = evidence_fixture(
+        LEGACY_SURFACES, sources=("scan", "manifest")
+    )
+    corroborated_evidence.update(table_entries=68, slots=68, attached_probes=136)
+    corroborated = document_fixture(
+        corroborated_evidence,
+        schema="pkcs11-scope/observed-profile/v2-metrics",
+        mode="metrics",
+        privacy="aggregate-only",
+    )
+    corroborated["functions"] = function_items(
+        [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
+    )
+    documents = {
+        "scan": clean,
+        "corroborated": corroborated,
+        "manifest-only": manifest_only,
+    }
+    for discovery, document in documents.items():
+        validate_clean_metrics(document, {"C_Initialize": 1}, discovery=discovery)
+        for other in documents:
+            if other == discovery:
+                continue
+            rejected(
+                lambda d=document, o=other: validate_clean_metrics(
+                    d, {"C_Initialize": 1}, discovery=o
+                )
+            )
+    print("clean metrics discovery source is exact in all three lanes: OK")
+
+    version = evidence_fixture(
+        VERSION_SURFACES_SCANNED,
+        sources=("scan", "manifest"),
+        module_skipped=VERSION_SCAN_SKIPS,
+    )
+    version.update(
+        table_entries=1216,
+        slots=104,
+        attached_probes=208,
+        vendor_interfaces=1,
+        interface_list="ok",
+        discovery_conflicts=1,
+    )
     safe = document_fixture(copy.deepcopy(version))
     safe["evidence"].update(SAFE_ALLOWANCES)
     validate_canary("default-safe-profile", safe)
     bad = copy.deepcopy(safe)
     bad["evidence"]["attached_probes"] = 206
     rejected(lambda: validate_canary("default-safe-profile", bad))
-    print("canary matrix 988/104/208 with 13 mixed surfaces: OK")
+    print("canary matrix 1216/104/208 with 16 mixed surfaces: OK")
+    # The scan's own contribution is not optional: dropping the three tables it
+    # decoded, or the conflict they imply, must fail.
+    bad = copy.deepcopy(safe)
+    bad["evidence"]["discovery_conflicts"] = 0
+    rejected(lambda: validate_canary("default-safe-profile", bad))
+    bad = copy.deepcopy(safe)
+    bad["evidence"]["skipped"] = []
+    rejected(lambda: validate_canary("default-safe-profile", bad))
+    bad = copy.deepcopy(safe)
+    bad["evidence"]["discovery"][0]["sources"] = ["manifest"]
+    rejected(lambda: validate_canary("default-safe-profile", bad))
+    print("canary scan contribution is required: OK")
+
+    # The freeze lane: same provider, same policy, manifest alone.
+    freeze_evidence = evidence_fixture(VERSION_SURFACES, sources=("manifest",))
+    freeze_evidence.update(
+        table_entries=988,
+        slots=104,
+        attached_probes=208,
+        vendor_interfaces=1,
+        interface_list="ok",
+        discovery_uncorroborated=1,
+        **UNSAFE_ALLOWANCES,
+    )
+    freeze = document_fixture(freeze_evidence, privacy="unsafe-unvalidated-metadata")
+    validate_canary("freeze-unsafe-profile", freeze)
+    rejected(lambda: validate_canary("feature-unsafe-profile", freeze))
+    rejected(lambda: validate_canary("freeze-unsafe-profile", safe))
+    print("canary freeze lane is manifest-only 988/104/208 with 13 surfaces: OK")
     bad = copy.deepcopy(safe)
     bad["evidence"]["unregistered_mechanisms"] = 3
     rejected(lambda: validate_canary("default-safe-profile", bad))
@@ -519,7 +763,7 @@ def self_test():
     print("canary aggregate exact baseline: OK")
 
     induced = {}
-    g1 = evidence_fixture(G1_SURFACES)
+    g1 = evidence_fixture(G1_SURFACES, sources=("manifest",))
     g1.update(
         table_entries=160,
         slots=93,
@@ -530,7 +774,7 @@ def self_test():
         skipped=[{"name": "C_GetFunctionStatus", "reason": "null pointer"}],
     )
     induced["G1"] = document_fixture(g1)
-    g2 = evidence_fixture(LEGACY_SURFACES)
+    g2 = evidence_fixture(LEGACY_SURFACES, sources=("manifest",))
     g2.update(
         table_entries=68,
         slots=2,
@@ -539,7 +783,7 @@ def self_test():
         aliased=[[f"C_Alias_{index}" for index in range(67)]],
     )
     induced["G2"] = document_fixture(g2)
-    g3 = evidence_fixture(LEGACY_SURFACES)
+    g3 = evidence_fixture(LEGACY_SURFACES, sources=("manifest",))
     g3.update(
         table_entries=68,
         slots=68,
@@ -551,11 +795,12 @@ def self_test():
     induced["G3"]["functions"] = function_items(
         [([name], calls) for name, calls in G3_COUNTS.items()]
     )
-    g4 = copy.deepcopy(version)
-    g4.update(in_flight_at_end=9, start_insert_failures=8)
+    g4 = copy.deepcopy(freeze_evidence)
+    g4.update(in_flight_at_end=9, start_insert_failures=8, **{k: 0 for k in UNSAFE_ALLOWANCES})
     induced["G4"] = document_fixture(g4)
-    g5 = copy.deepcopy(version)
-    g5.update(rv_update_failures=9, unregistered_mechanisms=6, async_orphans=1)
+    g5 = copy.deepcopy(freeze_evidence)
+    g5.update(rv_update_failures=9, unregistered_mechanisms=6, async_orphans=1,
+              **{k: 0 for k in UNSAFE_ALLOWANCES if k not in ("async_orphans",)})
     induced["G5"] = document_fixture(g5)
     induced["G5"]["functions"] = function_items([(["C_Initialize"], 11)])
     for lane, document in induced.items():
@@ -603,6 +848,17 @@ def self_test():
         tolerated = copy.deepcopy(clean["evidence"])
         tolerated[field] = 7
         terminal_capture_is_clean(tolerated)
+    # An expected uncorroborated manifest is exact in both directions: the lane
+    # that expects one must get one, and the lane that expects none must not.
+    terminal_capture_is_clean(
+        copy.deepcopy(manifest_only["evidence"]), uncorroborated=1
+    )
+    rejected(lambda: terminal_capture_is_clean(copy.deepcopy(manifest_only["evidence"])))
+    rejected(
+        lambda: terminal_capture_is_clean(
+            copy.deepcopy(clean["evidence"]), uncorroborated=1
+        )
+    )
     print("terminal capture predicate is PARTIAL with no concrete gap: OK")
 
     # v2 discovery oracles. A document that discovered nothing, was authorized
@@ -662,16 +918,26 @@ def main(argv):
         self_test()
         return
     require(len(argv) >= 1, "usage: check-capture-evidence.py MODE ...")
-    if argv[0] == "clean-metrics" and len(argv) in (3, 4):
+    if argv[0].startswith("clean-metrics") and len(argv) in (3, 4):
+        discovery = argv[0][len("clean-metrics") :].lstrip("-") or "scan"
         multiplier = int(argv[3]) if len(argv) == 4 else 1
-        validate_clean_metrics(load_json(argv[1]), expected_counts(argv[2]), multiplier)
+        validate_clean_metrics(
+            load_json(argv[1]),
+            expected_counts(argv[2]),
+            multiplier,
+            discovery=discovery,
+        )
     elif argv[0] == "canary" and len(argv) == 3:
         trace = argv[1].endswith("-trace")
         validate_canary(argv[1], load_canary(argv[2], trace))
     elif argv[0] == "induced" and len(argv) == 3:
         validate_induced(argv[1], load_json(argv[2]))
     else:
-        raise AssertionError("usage: check-capture-evidence.py clean-metrics OUTPUT EXPECTED [MULTIPLIER] | canary LANE OUTPUT | induced G[1-5] OUTPUT | --self-test")
+        raise AssertionError(
+            "usage: check-capture-evidence.py "
+            "clean-metrics[-corroborated|-manifest-only] OUTPUT EXPECTED [MULTIPLIER] | "
+            "canary LANE OUTPUT | induced G[1-5] OUTPUT | --self-test"
+        )
 
 
 if __name__ == "__main__":

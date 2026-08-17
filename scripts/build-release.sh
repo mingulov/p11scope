@@ -221,7 +221,7 @@ if wait "$LPID"; then LPID=; WPID=; TARGET_STARTTIME=; else status=$?; LPID=; WP
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "static smoke profiler failed: $status"; cat "$WORK/profile-static-smoke.log" || true; exit "$status"; fi
 reclaim_root_output "$WORK/observed-static-smoke.json"
 
-python3 scripts/check-capture-evidence.py clean-metrics \
+python3 scripts/check-capture-evidence.py clean-metrics-manifest-only \
     "$WORK/observed-static-smoke.json" spike/expected.txt
 echo "static p11scope smoke attach OK: $(jq -c .evidence "$WORK/observed-static-smoke.json")"
 

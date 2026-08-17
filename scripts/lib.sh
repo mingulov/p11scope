@@ -165,6 +165,47 @@ signal_verified_root_process() {
     signal_pinned_process root "$@"
 }
 
+# This slice scans once, at attach time: a provider mapped later is not
+# discovered. Every manifest-free lane therefore starts its workload first and
+# waits here until the provider is really mapped, before the observer attaches.
+# Reads /proc/<pid>/maps through sudo so the same helper works for a container
+# process owned by another uid.
+wait_for_mapped_provider() {
+    wfmp_pid=$1
+    wfmp_name=$2
+    wfmp_attempt=0
+    while [ "$wfmp_attempt" -lt 200 ]; do
+        sudo -n grep -Fq "$wfmp_name" "/proc/$wfmp_pid/maps" 2>/dev/null && return 0
+        kill -0 "$wfmp_pid" 2>/dev/null || sudo -n test -d "/proc/$wfmp_pid" || {
+            echo "target $wfmp_pid exited before mapping $wfmp_name" >&2
+            return 1
+        }
+        wfmp_attempt=$((wfmp_attempt + 1))
+        sleep 0.05
+    done
+    echo "target $wfmp_pid never mapped $wfmp_name" >&2
+    return 1
+}
+
+# The same wait for a --cgroup lane, where the process that maps the provider is
+# inside a container and its host pid is not known up front. Descendants are
+# searched too, exactly as `--cgroup` itself matches them: a pod cgroup holds no
+# processes of its own, they live in its per-container leaves.
+wait_for_cgroup_provider() {
+    wfcp_cgroup=$1
+    wfcp_name=$2
+    wfcp_attempt=0
+    while [ "$wfcp_attempt" -lt 200 ]; do
+        for wfcp_pid in $(sudo -n find "$wfcp_cgroup" -name cgroup.procs -exec cat {} + 2>/dev/null); do
+            sudo -n grep -Fq "$wfcp_name" "/proc/$wfcp_pid/maps" 2>/dev/null && return 0
+        done
+        wfcp_attempt=$((wfcp_attempt + 1))
+        sleep 0.05
+    done
+    echo "no process in $wfcp_cgroup mapped $wfcp_name" >&2
+    return 1
+}
+
 wait_for_capture_ready() {
     wcr_log=$1
     wcr_privacy=$2

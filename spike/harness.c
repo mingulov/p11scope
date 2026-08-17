@@ -7,6 +7,8 @@
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
 
 typedef unsigned long CK_RV, CK_ULONG, CK_SLOT_ID, CK_SESSION_HANDLE;
 typedef struct { CK_ULONG mechanism; void *pParameter; CK_ULONG ulParameterLen; } CK_MECHANISM;
@@ -35,10 +37,25 @@ static void **fns;
 
 int main(int argc, char **argv)
 {
-    if (argc != 2) { fprintf(stderr, "usage: %s /path/to/module.so\n", argv[0]); return 2; }
+    if (argc < 2 || argc > 3) {
+        fprintf(stderr, "usage: %s /path/to/module.so [go-file]\n", argv[0]);
+        return 2;
+    }
 
     void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
+
+    /* With a go-file the provider is mapped *before* the observer attaches, and
+     * not one PKCS#11 call has run yet: the manifest-free lane needs both, since
+     * this slice scans once at attach time. Waiting in the shell instead would
+     * leave nothing mapped to scan. Call counts are unchanged either way —
+     * C_GetFunctionList below still runs after the wait. */
+    if (argc == 3) {
+        struct timespec tick = { 0, 50 * 1000 * 1000 };
+        while (access(argv[2], F_OK) != 0)
+            nanosleep(&tick, NULL);
+    }
+
     unsigned long (*gfl)(void **) =
         (unsigned long (*)(void **))dlsym(h, "C_GetFunctionList");
     void *list = NULL;

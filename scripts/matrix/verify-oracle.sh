@@ -97,6 +97,12 @@ EOF
 softhsm2-util --init-token --free --label oracle --so-pin 1234 --pin 1234 >/dev/null
 
 echo "=== discover ==="
+# This lane keeps its manifest, and must: pkcs11-check is released by the
+# go-file *after* attach and runs one subprocess per test file, so nothing in
+# the scope has the provider mapped when the observer scans. The manifest is
+# the only source that can describe a provider that is not loaded yet, and the
+# capture reports it as uncorroborated -- which is the honest reading, not a
+# fault. Live discovery of a module loaded after attach is Slice 1b-2.
 ./target/release/p11scope-discover --module "$MODULE" -o "$WORK/manifest.json"
 
 # file_runner's resume/checkpoint state (core/file_runner.py) persists
@@ -280,7 +286,7 @@ if ev["attached_probes"] == 0:
     print("no probes attached")
     fail = 1
 try:
-    evidence_oracle().terminal_capture_is_clean(ev)
+    evidence_oracle().terminal_capture_is_clean(ev, uncorroborated=1)
 except AssertionError as error:
     print(f"terminal evidence: {error}")
     fail = 1

@@ -1,5 +1,8 @@
 #!/bin/sh
 # Task 6: capture a deterministic SoftHSM workload in one kind pod.
+#
+# Manifest-free: nothing is copied out of the pod. The observer runs on the node,
+# scans the pod process's memory and opens its provider through /proc/<pid>/root.
 set -eu
 cd "$(dirname "$0")/../.."
 
@@ -13,6 +16,7 @@ POD="p11scope-matrix-pod-$TOKEN"
 KUBECONFIG="$PWD/$WORK/kubeconfig"
 export KUBECONFIG
 SPID=
+WPID=
 SUPERVISOR_PID=
 SUPERVISOR_STARTTIME=
 ROOT_LAUNCH_PID=
@@ -39,6 +43,7 @@ cleanup() {
         fi
         cleanup_step wait "$launcher"
     fi
+    [ -z "$WPID" ] || cleanup_step wait "$WPID"
     [ -z "$CLUSTER_CREATED" ] || cleanup_step timeout --signal=TERM --kill-after=5s 120s \
         kind delete cluster --name "$CLUSTER"
     [ -z "$IMAGE_CREATED" ] || cleanup_step timeout --signal=TERM --kill-after=5s 30s \
@@ -48,17 +53,17 @@ cleanup() {
 }
 . scripts/cleanup-traps.sh
 
-for command in cargo docker gcc kind kubectl python3 tar timeout; do
+for command in cargo docker gcc kind kubectl python3 timeout; do
     command -v "$command" >/dev/null || { echo "$command required" >&2; exit 1; }
 done
 sudo -n true 2>/dev/null || { echo "passwordless sudo required" >&2; exit 1; }
 
 echo "=== build product, workload, and unique pod image ==="
 mkdir -p "$WORK"
-rm -rf "$WORK/build" "$WORK/provider-safe"
+rm -rf "$WORK/build"
 timeout --signal=TERM --kill-after=5s 600s cargo +1.88 build --locked --release \
     --workspace --target-dir "$PRODUCT"
-mkdir -p "$WORK/build" "$WORK/provider-safe"
+mkdir -p "$WORK/build"
 IMAGE_CREATED=1
 timeout --signal=TERM --kill-after=5s 60s gcc -O0 -o "$WORK/build/harness" \
     spike/harness.c -ldl
@@ -92,7 +97,7 @@ timeout --signal=TERM --kill-after=5s 60s kubectl apply -f "$WORK/pod.yaml"
 timeout --signal=TERM --kill-after=5s 90s kubectl wait --for=condition=Ready \
     "pod/$POD" --timeout=60s
 
-echo "=== resolve pod authority and copy the provider directory as regular files ==="
+echo "=== resolve pod cgroup and host pid ==="
 CID=$(timeout --signal=TERM --kill-after=5s 60s kubectl get pod "$POD" \
     -o jsonpath='{.status.containerStatuses[0].containerID}' | sed 's#containerd://##')
 case $CID in ''|*[!0-9a-f]*) echo "pod container id invalid" >&2; exit 1 ;; esac
@@ -105,36 +110,31 @@ HOSTPID=$(sudo -n timeout --signal=TERM --kill-after=5s 60s \
     awk 'NR == 1 { print; exit }' "$CONTAINER_CG/cgroup.procs")
 case $HOSTPID in ''|*[!0-9]*) echo "pod host pid missing" >&2; exit 1 ;; esac
 
-PROVIDER_REAL=$(timeout --signal=TERM --kill-after=5s 60s kubectl exec "$POD" -- \
-    readlink -f "$MODULE_IN_POD")
-PROVIDER_DIR=${PROVIDER_REAL%/*}
-PROVIDER_NAME=${PROVIDER_REAL##*/}
-capped_container_tar "$WORK/provider.tar" \
-    timeout --signal=TERM --kill-after=5s 60s kubectl exec "$POD" -- \
-    tar -chC "$PROVIDER_DIR" .
-tar -xf "$WORK/provider.tar" -C "$WORK/provider-safe"
-
-echo "=== host-generate manifest v4 against the pod's mount namespace ==="
-discover_copied_provider "$PWD/$WORK/provider-safe" "$PROVIDER_NAME" \
-    "$PRODUCT/release/p11scope-discover" "/proc/$HOSTPID/root$PROVIDER_DIR" \
-    "$WORK/manifest-host.json"
+echo "=== start the pod workload: it maps the provider, then waits ==="
+# The scan runs once, at attach time, so the provider must already be mapped;
+# harness dlopens it and only then blocks on the go-file, so attach-before-run
+# still holds for every PKCS#11 call the oracle counts.
+timeout --signal=TERM --kill-after=5s 60s kubectl exec "$POD" -- rm -f /tmp/go
+timeout --signal=TERM --kill-after=5s 90s kubectl exec "$POD" -- \
+    /usr/local/bin/harness "$MODULE_IN_POD" /tmp/go > "$WORK/workload.log" 2>&1 &
+WPID=$!
+wait_for_cgroup_provider "$POD_CG" libsofthsm2.so
 
 echo "=== unprivileged diagnostic: the container provider must be unreadable without privileges ==="
 set +e
 UNPRIV_OUT=$(timeout --signal=TERM --kill-after=5s 60s \
     "$PRODUCT/release/p11scope" profile \
-    --manifest "$WORK/manifest-host.json" \
     --cgroup "$POD_CG" --mode metrics --duration 1 2>&1)
 UNPRIV_RC=$?
 set -e
 echo "$UNPRIV_OUT"
 [ "$UNPRIV_RC" -ne 0 ] || { echo "unprivileged profile unexpectedly succeeded" >&2; exit 1; }
-printf '%s\n' "$UNPRIV_OUT" | grep -Fq 'cannot open the file now (open failed: Permission denied' \
+printf '%s\n' "$UNPRIV_OUT" | grep -Fq 'Permission denied' \
     || { echo "unprivileged run failed for an unexpected reason" >&2; exit 1; }
 
-echo "=== attach before running the pod workload ==="
+echo "=== attach before the pod workload makes a single call ==="
 set -- timeout --signal=TERM --kill-after=5s 45s \
-    "$PRODUCT/release/p11scope" profile --manifest "$WORK/manifest-host.json" \
+    "$PRODUCT/release/p11scope" profile \
     --cgroup "$POD_CG" \
     --mode metrics --duration 20 -o "$WORK/observed.json"
 launch_root_recorded_process "$WORK/observer.pid" "$WORK/profile.log" "$@"
@@ -142,8 +142,16 @@ SPID=$ROOT_LAUNCH_PID
 SUPERVISOR_PID=$ROOT_PROCESS_PID
 SUPERVISOR_STARTTIME=$ROOT_PROCESS_STARTTIME
 wait_for_capture_ready "$WORK/profile.log" aggregate-only metrics
-timeout --signal=TERM --kill-after=5s 60s kubectl exec "$POD" -- \
-    /usr/local/bin/harness "$PROVIDER_REAL"
+timeout --signal=TERM --kill-after=5s 60s kubectl exec "$POD" -- touch /tmp/go
+if wait "$WPID"; then
+    WPID=
+else
+    status=$?
+    WPID=
+    echo "pod workload failed: $status" >&2
+    cat "$WORK/workload.log" >&2 || true
+    exit "$status"
+fi
 if wait "$SPID"; then
     SPID=
     SUPERVISOR_PID=
@@ -165,5 +173,16 @@ fi
 reclaim_root_output "$WORK/observed.json"
 python3 scripts/check-capture-evidence.py clean-metrics \
     "$WORK/observed.json" spike/expected.txt
+python3 - "$WORK/observed.json" <<'KIND'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+ev = doc["evidence"]
+assert [m["sources"] for m in ev["discovery"]] == [["scan"]], ev["discovery"]
+assert ev["scan_unavailable"] is None, ev["scan_unavailable"]
+module = doc["capture"]["modules"][0]
+assert module["path"].endswith("libsofthsm2.so"), module
+print("pod provider pinned from the node:", module["path"], module["dev"], module["ino"])
+print("identity_source:", [o["identity_source"] for o in ev["discovery"][0]["objects"]])
+KIND
 
 echo "=== kind pod: ALL OK ==="

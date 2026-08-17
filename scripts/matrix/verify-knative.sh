@@ -147,6 +147,13 @@ PROVIDER_REAL=$(timeout --signal=TERM --kill-after=5s 60s kubectl exec "$ANCHOR"
     readlink -f "$MODULE_IN_POD")
 PROVIDER_DIR=${PROVIDER_REAL%/*}
 PROVIDER_NAME=${PROVIDER_REAL##*/}
+# This lane keeps the copy-and-discover apparatus every other container lane
+# dropped, and must. The whole point is attaching *before the pod exists*: the
+# service is scaled to zero, so at attach time there is no process to scan and
+# no mapping to read. Only a manifest, taken from an anchor pod that runs the
+# same image, can describe a provider that has not been loaded yet -- so the
+# capture reports it uncorroborated. Discovering a provider in a pod that
+# cold-starts after attach is Slice 1b-2's live discovery, not this slice's.
 capped_container_tar "$WORK/provider.tar" \
     timeout --signal=TERM --kill-after=5s 60s kubectl exec "$ANCHOR" -- \
     tar -chC "$PROVIDER_DIR" .
@@ -301,7 +308,7 @@ else
     exit "$status"
 fi
 reclaim_root_output "$WORK/observed.json"
-python3 scripts/check-capture-evidence.py clean-metrics \
+python3 scripts/check-capture-evidence.py clean-metrics-manifest-only \
     "$WORK/observed.json" spike/expected.txt
 
 echo "=== knative scale-from-zero: ALL OK ==="

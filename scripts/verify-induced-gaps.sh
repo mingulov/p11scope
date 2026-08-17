@@ -382,7 +382,7 @@ if wait "$SPID"; then SPID=; OBSERVER_PID=; OBSERVER_STARTTIME=; else status=$?;
 resume_and_wait_workload freeze
 reclaim_root_output "$WORK/freeze-observed.json"
 test -s "$WORK/freeze-observed.json" || { echo "freeze observer produced no output"; exit 1; }
-python3 scripts/check-capture-evidence.py canary feature-unsafe-profile \
+python3 scripts/check-capture-evidence.py canary freeze-unsafe-profile \
     "$WORK/freeze-observed.json"
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); n=sum(f["calls"] for f in d["functions"]); assert n == 27, n' \
     "$WORK/freeze-observed.json"

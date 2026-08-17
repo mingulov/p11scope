@@ -1,5 +1,8 @@
 #!/bin/sh
-# Task 6: one shared image-layer inode, broad and leaf cgroup authority.
+# Task 6: one shared image-layer inode, broad and leaf cgroup scope.
+#
+# Manifest-free: nothing is copied out of either container. Both containers map
+# the *same* overlay inode, so the two scans must pin one object, not two.
 set -eu
 cd "$(dirname "$0")/../.."
 
@@ -11,7 +14,6 @@ NAME_A="p11scope-matrix-shared-a-$RUN_ID"
 NAME_B="p11scope-matrix-shared-b-$RUN_ID"
 CGROUP_PARENT="p11scope-shared-$RUN_ID.slice"
 PRODUCT=target/matrix-product
-SAFE_ROOT="$PWD/$WORK/provider-safe"
 WA=
 WB=
 SPID=
@@ -26,7 +28,7 @@ CONTAINER_B_STARTED=
 . scripts/lib.sh
 
 require_non_root_caller
-for tool in cargo docker gcc python3 tar timeout; do
+for tool in cargo docker gcc python3 timeout; do
     command -v "$tool" >/dev/null || { echo "$tool required"; exit 1; }
 done
 sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
@@ -62,7 +64,6 @@ cleanup() {
 . scripts/cleanup-traps.sh
 
 echo "=== build product + workload ==="
-rm -rf "$SAFE_ROOT"
 timeout --signal=TERM --kill-after=5s 600s cargo +1.88 build --locked --release \
     --workspace --target-dir "$PRODUCT"
 timeout --signal=TERM --kill-after=5s 60s gcc -O0 -o "$WORK/harness" \
@@ -111,18 +112,6 @@ INODE_B=${DEVINO_B#*:}
 }
 echo "shared provider overlay inode: $INODE_A (host identities $DEVINO_A vs $DEVINO_B)"
 
-echo "=== copy resolved provider directory and discover on the host ==="
-PROVIDER_DIR=${PROVIDER_REAL%/*}
-PROVIDER_BASE=${PROVIDER_REAL##*/}
-mkdir -p "$SAFE_ROOT"
-capped_container_tar "$WORK/provider.tar" \
-    timeout --signal=TERM --kill-after=5s 60s docker exec "$NAME_A" \
-    tar -h -c -f - -C "$PROVIDER_DIR" .
-tar -xf "$WORK/provider.tar" -C "$SAFE_ROOT"
-rm -f "$WORK/provider.tar"
-discover_copied_provider "$SAFE_ROOT" "$PROVIDER_BASE" "$PRODUCT/release/p11scope-discover" \
-    "/proc/$PID_A/root$PROVIDER_DIR" "$WORK/manifest-host.json"
-
 echo "=== resolve and compare broad/leaf cgroups ==="
 CGROUP_A_REL=$(awk -F: '$1 == "0" && $2 == "" { print $3; exit }' "/proc/$PID_A/cgroup")
 CGROUP_B_REL=$(awk -F: '$1 == "0" && $2 == "" { print $3; exit }' "/proc/$PID_B/cgroup")
@@ -143,13 +132,13 @@ done
 echo "=== unprivileged diagnostic: the container provider must be unreadable without privileges ==="
 set +e
 UNPRIV_OUT=$(timeout --signal=TERM --kill-after=5s 60s \
-    "$PRODUCT/release/p11scope" profile --manifest "$WORK/manifest-host.json" \
+    "$PRODUCT/release/p11scope" profile \
     --cgroup "$BROAD_PATH" --mode metrics --duration 1 2>&1)
 UNPRIV_RC=$?
 set -e
 printf '%s\n' "$UNPRIV_OUT"
 [ "$UNPRIV_RC" -ne 0 ] || { echo "unprivileged profile unexpectedly succeeded"; exit 1; }
-printf '%s\n' "$UNPRIV_OUT" | grep -Fq 'cannot open the file now (open failed: Permission denied' \
+printf '%s\n' "$UNPRIV_OUT" | grep -Fq 'Permission denied' \
     || { echo "unprivileged run failed for an unexpected reason" >&2; exit 1; }
 
 run_capture() {
@@ -158,17 +147,21 @@ run_capture() {
     multiplier=$3
     echo "--- capture: $label (scope=$cgroup) ---"
     rm -f "$WORK/shared-a/go" "$WORK/shared-b/go"
-    timeout --signal=TERM --kill-after=5s 60s docker exec "$NAME_A" sh -c \
-        'while [ ! -f /shared/go ]; do sleep 0.05; done; exec /usr/local/bin/harness "$1"' \
-        sh "$MODULE_IN_CONTAINER" > "$WORK/$label-workload-a.log" 2>&1 &
+    # Both workloads map the provider first and only then block on the go-file:
+    # the scan runs once, at attach time, and must find the object already there.
+    timeout --signal=TERM --kill-after=5s 60s docker exec "$NAME_A" \
+        /usr/local/bin/harness "$MODULE_IN_CONTAINER" /shared/go \
+        > "$WORK/$label-workload-a.log" 2>&1 &
     WA=$!
-    timeout --signal=TERM --kill-after=5s 60s docker exec "$NAME_B" sh -c \
-        'while [ ! -f /shared/go ]; do sleep 0.05; done; exec /usr/local/bin/harness "$1"' \
-        sh "$MODULE_IN_CONTAINER" > "$WORK/$label-workload-b.log" 2>&1 &
+    timeout --signal=TERM --kill-after=5s 60s docker exec "$NAME_B" \
+        /usr/local/bin/harness "$MODULE_IN_CONTAINER" /shared/go \
+        > "$WORK/$label-workload-b.log" 2>&1 &
     WB=$!
+    wait_for_cgroup_provider "$LEAF_A_PATH" libsofthsm2.so
+    wait_for_cgroup_provider "$LEAF_B_PATH" libsofthsm2.so
     launch_root_recorded_process "$WORK/$label.pid" "$WORK/$label.log" \
         timeout --signal=TERM --kill-after=35s 45s \
-        "$PRODUCT/release/p11scope" profile --manifest "$WORK/manifest-host.json" \
+        "$PRODUCT/release/p11scope" profile \
         --cgroup "$cgroup" \
         --mode metrics --duration 30 -o "$WORK/$label.json"
     SPID=$ROOT_LAUNCH_PID
@@ -215,6 +208,34 @@ run_capture() {
         exit "$status"
     fi
     reclaim_root_output "$WORK/$label.json"
+    # This runs before the count oracle on purpose: one file attached twice
+    # double-counts every call through it, and "one file, one attach target" is
+    # the claim that explains the counts, so it is the one that should name the
+    # failure if it breaks.
+    python3 - "$WORK/$label.json" <<'SHARED'
+import json, sys
+from collections import Counter
+
+doc = json.load(open(sys.argv[1]))
+ev = doc["evidence"]
+modules = doc["capture"]["modules"]
+assert [m["sources"] for m in ev["discovery"]] == [["scan"]] * len(modules), ev["discovery"]
+assert ev["attached_probes"] == 2 * ev["slots"], (ev["attached_probes"], ev["slots"])
+
+# Both containers map the same file from the same image layer. Two entries with
+# one digest means the same bytes were pinned twice and attached twice -- and
+# because a uprobe is registered per (inode, offset), both registrations fire
+# for every call from either container, so every count is inflated.
+digests = Counter(m["sha256"] for m in modules)
+repeated = {digest: n for digest, n in digests.items() if n > 1}
+assert not repeated, (
+    f"the same provider was attached {max(repeated.values())} times "
+    f"({[ (m['dev'], m['ino']) for m in modules ]}): one file shared by two "
+    "containers has one inode and must be one attach target, or every call "
+    "through it is counted once per mount"
+)
+print("one shared inode, one module:", modules[0]["ino"])
+SHARED
     python3 scripts/check-capture-evidence.py clean-metrics \
         "$WORK/$label.json" spike/expected.txt "$multiplier"
 }

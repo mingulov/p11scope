@@ -63,8 +63,9 @@ cleanup() {
 . scripts/cleanup-traps.sh
 
 echo "=== build product + fork-harness ==="
-cargo build --release --workspace
+cargo +1.88 build --locked --release --workspace
 gcc -O0 -o "$WORK/fork-harness" scripts/matrix/fork-harness.c -ldl
+gcc -O0 -o "$WORK/harness" spike/harness.c -ldl
 
 echo "=== softhsm token (private, disposable) ==="
 export SOFTHSM2_CONF="$WORK/softhsm2.conf"
@@ -81,6 +82,13 @@ EOF
 softhsm2-util --init-token --free --label forkscope --so-pin 1234 --pin 1234 >/dev/null
 
 echo "=== discover ==="
+# This lane keeps its manifest, and must. Nothing has dlopened the provider when
+# the observer attaches -- the parent harness has not been exec'd and the
+# children do not exist yet, which is the whole point of the test -- so the
+# memory scan has nothing in scope to find. A manifest is the only source that
+# can describe a provider that is not mapped yet; the capture reports it as
+# uncorroborated, and that is the honest reading. Live discovery of a module
+# loaded after attach is Slice 1b-2.
 ./target/release/p11scope-discover --module "$MODULE" -o "$WORK/manifest.json"
 
 echo "=== Part 1: fork-scoping capture ==="
@@ -158,7 +166,7 @@ if ev["attached_probes"] != 136:
     print(f"attached_probes: want 136, got {ev['attached_probes']}")
     fail = 1
 try:
-    evidence_oracle().terminal_capture_is_clean(ev)
+    evidence_oracle().terminal_capture_is_clean(ev, uncorroborated=1)
 except AssertionError as error:
     print(f"terminal evidence: {error}")
     fail = 1
@@ -167,77 +175,140 @@ PY
 echo "fork-scoping: children that did not exist at attach time were fully captured, exact counts"
 
 echo "=== Part 2: measured privileges (host) ==="
-# A bare placeholder process is enough to probe attach privileges: with
-# --pid, p11scope only needs a live pid to scope the attach to (the plain
-# host-path manifest is read directly, not through /proc/<pid>/root --
-# that indirection only exists for container/pod targets, see
-# verify-docker.sh / verify-kind-pod.sh). Verified directly while building
-# this script: attach succeeds against a bare `sleep`, with no PKCS#11
-# call ever made by it.
-sleep 30 &
-PRIV_PID=$!
+# Re-measured for Slice 1b-1, because discovery changed what privileges are for.
+# There are now two separable questions, and one capability set no longer
+# answers both:
+#
+#   attach  -- load the BPF object and open the uprobes;
+#   scan    -- read /proc/<pid>/mem to find the provider's tables.
+#
+# The target below has *mapped* SoftHSM2 and is waiting on a go-file, so the
+# scan has something real to find, and it is a same-uid non-descendant of every
+# observer started here -- the case Yama actually governs. CAP_LEASE is gone
+# from both sets: the read-lease requirement was removed in Slice 1a, and the
+# earlier runs granted it without measuring its absence.
+echo "kernel.yama.ptrace_scope   = $(cat /proc/sys/kernel/yama/ptrace_scope)"
+echo "kernel.perf_event_paranoid = $(cat /proc/sys/kernel/perf_event_paranoid)"
+PTRACE_SCOPE=$(cat /proc/sys/kernel/yama/ptrace_scope)
+PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid)
 
-echo "--- unprivileged ---"
+rm -f "$WORK/priv-go"
+"$WORK/harness" "$MODULE" "$WORK/priv-go" > "$WORK/priv-workload.log" 2>&1 &
+PRIV_PID=$!
+wait_for_mapped_provider "$PRIV_PID" libsofthsm2.so
+
+# `capsh --caps=... --user=...` then runs p11scope with exactly that set, as an
+# ordinary same-uid process. Prints "<probes> <scan_unavailable>" for the run,
+# or "- -" when it produced no document at all.
+measure_privileges() {
+    mp_label=$1
+    mp_caps=$2
+    mp_amb=$3
+    mp_out="$WORK/priv-$mp_label.json"
+    shift 3
+    rm -f "$mp_out"
+    set +e
+    sudo capsh --caps="$mp_caps" --keep=1 --user="$(whoami)" $mp_amb \
+        -- -c "'$PWD/target/release/p11scope' profile $* --pid $PRIV_PID \
+               --mode metrics --duration 1 -o '$mp_out'" \
+        > "$WORK/priv-$mp_label.log" 2>&1
+    mp_rc=$?
+    set -e
+    if [ -s "$mp_out" ]; then
+        python3 - "$mp_out" <<'MEASURE'
+import json, sys
+ev = json.load(open(sys.argv[1]))["evidence"]
+print(ev["attached_probes"], ev["scan_unavailable"] or "none")
+MEASURE
+    else
+        echo "- - (exit $mp_rc)"
+    fi
+}
+
+echo "--- unprivileged, manifest-free ---"
 set +e
-UNPRIV_OUT=$(target/release/p11scope profile --manifest "$WORK/manifest.json" \
-    --pid "$PRIV_PID" --mode metrics --duration 1 2>&1)
+UNPRIV_OUT=$(target/release/p11scope profile --pid "$PRIV_PID" \
+    --mode metrics --duration 1 2>&1)
 UNPRIV_RC=$?
 set -e
-echo "$UNPRIV_OUT"
+echo "$UNPRIV_OUT" | tail -5
 echo "exit code: $UNPRIV_RC"
 test "$UNPRIV_RC" -ne 0 || { echo "expected unprivileged attach to fail, it exited 0"; exit 1; }
 echo "$UNPRIV_OUT" | grep -Eq 'Operation not permitted|Permission denied' \
     || { echo "unprivileged attach failed for an unexpected reason"; exit 1; }
 
-echo "--- CAP_BPF + CAP_PERFMON, no CAP_SYS_ADMIN (CAP_LEASE over-granted, unmeasured) ---"
-set +e
-CAPS_OUT=$(sudo capsh --caps="cap_bpf,cap_perfmon,cap_lease+eip cap_setpcap,cap_setuid,cap_setgid+ep" \
-    --keep=1 --user="$(whoami)" --addamb=cap_bpf --addamb=cap_perfmon --addamb=cap_lease \
-    -- -c "'$PWD/target/release/p11scope' profile --manifest '$WORK/manifest.json' --pid $PRIV_PID --mode metrics --duration 1 -o '$WORK/priv-bpf-perfmon.json'" 2>&1)
-set -e
-echo "$CAPS_OUT" | tail -5
-ATTACHED=$(python3 -c "import json;print(json.load(open('$WORK/priv-bpf-perfmon.json'))['evidence']['attached_probes'])")
-echo "attached_probes with CAP_BPF+CAP_PERFMON (plus over-granted CAP_LEASE): $ATTACHED"
-# Measured, not assumed: on this kernel kernel.perf_event_paranoid=4 is an
-# Ubuntu hardening level that blocks perf_event_open() for uprobes even
-# with CAP_PERFMON, unlike the upstream-documented behavior. CAP_SYS_ADMIN
-# is still required for attach. CAP_LEASE is still granted to both capsh
-# runs but is no longer required -- the read-lease requirement was removed
-# in Productization Slice 1a and nothing here measures its absence, so the
-# sets stay as they are until Slice 1b re-measures.
-# See docs/notes/phase4-privileges.md.
-test "$ATTACHED" -eq 0 || { echo "expected 0 attached probes without CAP_SYS_ADMIN on this kernel, got $ATTACHED"; exit 1; }
+echo "--- measured capability matrix (probes, scan) ---"
+BPF_PERFMON=$(measure_privileges bpf-perfmon \
+    "cap_bpf,cap_perfmon+eip cap_setpcap,cap_setuid,cap_setgid+ep" \
+    "--addamb=cap_bpf --addamb=cap_perfmon" --manifest "$WORK/manifest.json")
+SYSADMIN=$(measure_privileges sysadmin \
+    "cap_sys_admin+eip cap_setpcap,cap_setuid,cap_setgid+ep" \
+    "--addamb=cap_sys_admin" --manifest "$WORK/manifest.json")
+SYSADMIN_SCAN=$(measure_privileges sysadmin-scan \
+    "cap_sys_admin+eip cap_setpcap,cap_setuid,cap_setgid+ep" \
+    "--addamb=cap_sys_admin")
+SYSADMIN_PTRACE=$(measure_privileges sysadmin-ptrace \
+    "cap_sys_admin,cap_sys_ptrace+eip cap_setpcap,cap_setuid,cap_setgid+ep" \
+    "--addamb=cap_sys_admin --addamb=cap_sys_ptrace")
+printf '%-34s %s\n' \
+    "CAP_BPF+CAP_PERFMON, manifest"   "$BPF_PERFMON" \
+    "CAP_SYS_ADMIN, manifest"         "$SYSADMIN" \
+    "CAP_SYS_ADMIN, scan"             "$SYSADMIN_SCAN" \
+    "CAP_SYS_ADMIN+PTRACE, scan"      "$SYSADMIN_PTRACE"
+echo "(columns: attached_probes, evidence.scan_unavailable; measured at"
+echo " ptrace_scope=$PTRACE_SCOPE perf_event_paranoid=$PARANOID)"
 
-echo "--- CAP_SYS_ADMIN (CAP_LEASE over-granted, unmeasured) ---"
-sudo capsh --caps="cap_sys_admin,cap_lease+eip cap_setpcap,cap_setuid,cap_setgid+ep" \
-    --keep=1 --user="$(whoami)" --addamb=cap_sys_admin --addamb=cap_lease \
-    -- -c "'$PWD/target/release/p11scope' profile --manifest '$WORK/manifest.json' --pid $PRIV_PID --mode metrics --duration 1 -o '$WORK/priv-sysadmin.json'" \
-    > "$WORK/priv-sysadmin.log" 2>&1
-tail -5 "$WORK/priv-sysadmin.log"
-ATTACHED2=$(python3 -c "import json;print(json.load(open('$WORK/priv-sysadmin.json'))['evidence']['attached_probes'])")
-COMPLETE2=$(python3 -c "import json;print(json.load(open('$WORK/priv-sysadmin.json'))['evidence']['completeness'])")
-echo "attached_probes with CAP_SYS_ADMIN (plus over-granted CAP_LEASE): $ATTACHED2 ($COMPLETE2)"
+# Measured, not assumed. On this kernel perf_event_paranoid=4 is an Ubuntu
+# hardening level that blocks perf_event_open() for uprobes even with
+# CAP_PERFMON, unlike the upstream-documented behaviour: CAP_SYS_ADMIN is
+# required for attach. See docs/notes/phase4-privileges.md.
+ATTACHED=${BPF_PERFMON%% *}
+test "$ATTACHED" = 0 || { echo "expected 0 attached probes without CAP_SYS_ADMIN on this kernel, got $ATTACHED"; exit 1; }
+ATTACHED2=${SYSADMIN%% *}
 test "$ATTACHED2" -eq 136 || { echo "expected 136 attached probes with CAP_SYS_ADMIN, got $ATTACHED2"; exit 1; }
-# Terminal snapshots are PARTIAL by construction since the drain became
-# unprovable; the capability claim is that attach and capture worked, which
-# attached_probes plus the absence of any concrete gap already proves.
-test "$COMPLETE2" = "PARTIAL" || { echo "expected PARTIAL with CAP_SYS_ADMIN, got $COMPLETE2"; exit 1; }
+# Not `terminal_capture_is_clean`: a deliberately capability-restricted observer
+# is not a clean-capture lane, and pretending otherwise would either weaken that
+# shared oracle or hide the very gap being measured. What must hold is narrower
+# and stated here -- every probe attached, nothing failed to attach, and the
+# document says plainly which half of discovery the missing capability cost.
 python3 - "$WORK/priv-sysadmin.json" <<'PY'
-import importlib.util, json, sys
+import json, sys
 
-spec = importlib.util.spec_from_file_location(
-    "check_capture_evidence", "scripts/check-capture-evidence.py"
-)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-module.terminal_capture_is_clean(json.load(open(sys.argv[1]))["evidence"])
+evidence = json.load(open(sys.argv[1]))["evidence"]
+assert evidence["completeness"] == "PARTIAL", evidence["completeness"]
+assert evidence["attach_failures"] == [], evidence["attach_failures"]
+assert evidence["attached_probes"] == 136, evidence["attached_probes"]
+assert evidence["authority"] == "hash-pinned", evidence["authority"]
+assert evidence["event_loss"] == 0, evidence["event_loss"]
+# Whatever the scan could or could not do, it is named, never silently absent.
+scan, uncorroborated = evidence["scan_unavailable"], evidence["discovery_uncorroborated"]
+assert (scan is not None) == (uncorroborated == 1), (scan, uncorroborated)
+print(f"CAP_SYS_ADMIN + manifest: 136 probes, scan={scan or 'ok'}")
 PY
 
+# The scan half, stated as a rule rather than a fixed answer, so it holds at any
+# ptrace_scope: CAP_SYS_PTRACE must never make the scan *worse*, and where Yama
+# is enforcing, it is what makes the difference.
+SCAN_ADMIN=${SYSADMIN_SCAN#* }
+SCAN_PTRACE=${SYSADMIN_PTRACE#* }
+test "$SCAN_PTRACE" = none || {
+    echo "CAP_SYS_ADMIN+CAP_SYS_PTRACE still could not scan: $SCAN_PTRACE"
+    exit 1
+}
+if [ "$PTRACE_SCOPE" -ge 1 ] && [ "$SCAN_ADMIN" = none ]; then
+    echo "note: CAP_SYS_ADMIN alone scanned a same-uid non-descendant at"
+    echo "      ptrace_scope=$PTRACE_SCOPE -- record this, it is not what Yama documents"
+fi
+
+touch "$WORK/priv-go"
+wait "$PRIV_PID" || true
 kill "$PRIV_PID" >/dev/null 2>&1 || true
 wait "$PRIV_PID" 2>/dev/null || true
 PRIV_PID=
 
 echo "=== fork-scope + privileges: ALL OK ==="
-echo "measured minimum on host: CAP_SYS_ADMIN (CAP_LEASE is still granted but no longer required; re-measure in Slice 1b)."
+echo "measured minimum on host: CAP_SYS_ADMIN to attach; the memory scan"
+echo "additionally needs ptrace access to the target (CAP_SYS_PTRACE, or"
+echo "ptrace_scope=0, or a descendant). CAP_LEASE is neither granted nor needed."
 echo "docker/kind measurements (different code path -- /proc/<pid>/root of a"
 echo "different-uid process): see docs/notes/phase4-privileges.md."

@@ -144,15 +144,31 @@ fn container_provider_streams_are_byte_capped() {
         .expect("exercise the container stream cap");
     assert!(status.success(), "container tar cap rejected its contract");
 
+    // Only the knative lane still copies anything out of a container, because
+    // it attaches before the pod exists and the memory scan has nothing to
+    // read. Every other container lane discovers by scanning the container's
+    // own mapped bytes, so it must not copy a provider at all.
+    let path = "scripts/matrix/verify-knative.sh";
+    let script = read(path);
+    assert!(script.contains("capped_container_tar"), "{path}");
+    assert!(!script.contains(". > \"$WORK/provider.tar\""), "{path}");
     for path in [
         "scripts/matrix/verify-docker.sh",
         "scripts/matrix/verify-shared-layer.sh",
         "scripts/matrix/verify-kind-pod.sh",
-        "scripts/matrix/verify-knative.sh",
+        "scripts/attach-pod.sh",
     ] {
         let script = read(path);
-        assert!(script.contains("capped_container_tar"), "{path}");
-        assert!(!script.contains(". > \"$WORK/provider.tar\""), "{path}");
+        for banned in [
+            "capped_container_tar",
+            "discover_copied_provider",
+            "--manifest",
+        ] {
+            assert!(
+                !script.contains(banned),
+                "{path} still uses {banned}: the scan reads the container's own memory"
+            );
+        }
     }
 }
 
@@ -254,7 +270,16 @@ fn capture_evidence_checker_self_test() {
         "unexpected positive function rejected: OK",
         "bootstrap function exact count required: OK",
         "clean metrics multiplier is exact: OK",
-        "canary matrix 988/104/208 with 13 mixed surfaces: OK",
+        "clean metrics discovery source is exact in all three lanes: OK",
+        // The scan now contributes to the same capture as the manifest: the
+        // version-matrix numbers are re-derived from a rooted run, not the
+        // helper's alone. 988 -> 1216 entries and 13 -> 16 surfaces because
+        // three of the provider's tables are also readable from its mapped
+        // bytes; 104 slots and 208 probes are unchanged, because a slot is one
+        // {object, offset} however many sources named it.
+        "canary matrix 1216/104/208 with 16 mixed surfaces: OK",
+        "canary scan contribution is required: OK",
+        "canary freeze lane is manifest-only 988/104/208 with 13 surfaces: OK",
         "canary safe exact allowances: OK",
         "canary unsafe exact allowances: OK",
         "canary aggregate exact baseline: OK",
@@ -280,7 +305,9 @@ fn every_script_parses_with_sh_n() {
         "scripts/cleanup-traps.sh",
         "scripts/bench-overhead.sh",
         "scripts/build-release.sh",
+        "scripts/attach-pod.sh",
         "scripts/verify-attach-e2e.sh",
+        "scripts/verify-inspect-doctor.sh",
         "scripts/verify-canaries.sh",
         "scripts/verify-induced-gaps.sh",
         "scripts/verify-discover-containers.sh",
@@ -290,12 +317,47 @@ fn every_script_parses_with_sh_n() {
         "scripts/matrix/verify-shared-layer.sh",
         "scripts/matrix/verify-kind-pod.sh",
         "scripts/matrix/verify-knative.sh",
+        "scripts/matrix/verify-proxy-stack.sh",
     ] {
         let status = Command::new("sh")
             .args(["-n", path])
             .status()
             .unwrap_or_else(|error| panic!("sh -n {path}: {error}"));
         assert!(status.success(), "sh -n failed for {path}");
+    }
+}
+
+/// `scripts/attach-pod.sh` runs `p11scope profile --cgroup` against a pod the
+/// operator names, so every name it accepts reaches a kubectl JSONPath filter
+/// and a cgroup search. Its refusals are the contract, and they must hold with
+/// no cluster, no sudo and no privileges.
+#[test]
+fn attach_pod_refuses_bad_arguments() {
+    let output = Command::new("sh")
+        .args(["scripts/attach-pod.sh", "--self-test"])
+        .output()
+        .expect("run attach-pod self-test");
+    assert!(
+        output.status.success(),
+        "attach-pod self-test failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("attach-pod argument self-test: OK"));
+
+    let script = read("scripts/attach-pod.sh");
+    // The rewritten script attaches by cgroup and copies nothing: no provider
+    // directory leaves the pod, and no manifest is rewritten into its mount view.
+    assert!(
+        script.contains("profile --cgroup"),
+        "attach-pod must attach by cgroup"
+    );
+    for gone in [
+        "rewrite_container_manifest",
+        "provider-safe",
+        "--trusted-workload",
+    ] {
+        assert!(!script.contains(gone), "attach-pod still references {gone}");
     }
 }
 
@@ -443,7 +505,7 @@ aggregate-only-metrics default metrics"
     assert!(lanes.contains("unsafe raw template oracle self-test: OK"));
     assert!(lanes.contains("raw policy oracle self-test: OK"));
     assert!(lanes.contains("full CallStart safe defaults self-test: OK"));
-    assert!(lanes.contains("canary matrix 988/104/208 with 13 mixed surfaces: OK"));
+    assert!(lanes.contains("canary matrix 1216/104/208 with 16 mixed surfaces: OK"));
     let mut sentinels = canary_literals(&read("scripts/fixtures/canary_workload.c"));
     sentinels.extend(canary_literals(&read(
         "scripts/fixtures/privacy-stack-workload.c",
@@ -554,6 +616,9 @@ fn gate_scripts_pin_the_toolchain() {
     for path in [
         "scripts/verify-canaries.sh",
         "scripts/verify-induced-gaps.sh",
+        "scripts/verify-inspect-doctor.sh",
+        "scripts/matrix/verify-fork-scope.sh",
+        "scripts/matrix/verify-proxy-stack.sh",
     ] {
         run_ok("sh", &["-n", path]);
         for line in read(path).lines().map(str::trim_start) {

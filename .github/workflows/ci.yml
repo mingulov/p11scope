@@ -21,4 +21,5 @@ jobs:
       - run: cargo +1.88 test --locked --workspace --all-targets
       - run: cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings
       - run: uname -r; cat /proc/sys/kernel/perf_event_paranoid; cat /proc/sys/kernel/yama/ptrace_scope
+      - run: scripts/verify-inspect-doctor.sh
       - run: scripts/verify-attach-e2e.sh

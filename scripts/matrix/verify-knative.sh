@@ -213,7 +213,7 @@ UNPRIV_RC=$?
 set -e
 echo "$UNPRIV_OUT"
 [ "$UNPRIV_RC" -ne 0 ] || { echo "unprivileged profile unexpectedly succeeded" >&2; exit 1; }
-printf '%s\n' "$UNPRIV_OUT" | grep -Fq 'cannot open the file now (open failed: Permission denied' \
+printf '%s\n' "$UNPRIV_OUT" | grep -Fq 'cannot inspect the file locator now (Permission denied' \
     || { echo "unprivileged run failed for an unexpected reason" >&2; exit 1; }
 
 echo "=== attach before the cold-start pod exists ==="

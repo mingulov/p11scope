@@ -14,8 +14,8 @@
 # and enters it *before* running the given command -- so the cgroup exists,
 # and p11scope can attach to it, before the harness process is even exec'd,
 # let alone before it forks. The harness's own exec is gated behind a
-# go-file busy-loop (same attach-before-run pattern as every other script
-# in this matrix): the shell inside the scope blocks on the go-file, so
+# stable FIFO barrier (the same attach-before-run pattern as every other script
+# in this matrix): the shell inside the scope blocks in its `read` builtin, so
 # neither the parent harness process nor any of its children make their
 # first PKCS#11 call -- or exist at all, in the children's case -- until
 # well after attach has completed. Plain `mkdir`+chown of a cgroup does
@@ -58,6 +58,7 @@ cleanup() {
     [ -z "$LAUNCHER_PID" ] || wait "$LAUNCHER_PID" 2>/dev/null || true
     [ -z "$PRIV_PID" ] || wait "$PRIV_PID" 2>/dev/null || true
     sudo systemctl stop "${UNIT}.scope" >/dev/null 2>&1 || true
+    rm -f "$WORK/go"
     exit "$status"
 }
 . scripts/cleanup-traps.sh
@@ -94,8 +95,9 @@ echo "=== discover ==="
 echo "=== Part 1: fork-scoping capture ==="
 echo "cgroup unit: ${UNIT}.scope"
 rm -f "$WORK/go"
+mkfifo "$WORK/go"
 ( sudo systemd-run --scope --unit="$UNIT" -- sh -c \
-    "while [ ! -f '$PWD/$WORK/go' ]; do sleep 0.05; done; \
+    "read -r _ < '$PWD/$WORK/go'; \
      exec env SOFTHSM2_CONF='$SOFTHSM2_CONF' '$PWD/$WORK/fork-harness' '$MODULE'" ) &
 LAUNCHER_PID=$!
 sleep 1     # let systemd-run establish the cgroup
@@ -106,10 +108,10 @@ sudo target/release/p11scope profile --manifest "$WORK/manifest.json" \
     --mode metrics --duration 20 -o "$WORK/observed.json" \
     > "$WORK/profile.log" 2>&1 &
 PROFILE_PID=$!
-sleep 3     # let attach complete -- neither the parent harness process nor
-            # any child exists yet at this point; both are still blocked
-            # behind the go-file wait, which is the whole point of this test
-touch "$WORK/go"
+wait_for_capture_ready "$WORK/profile.log" aggregate-only metrics
+# Neither the parent harness process nor any child exists yet; the stable shell
+# generation is still blocked in its builtin read.
+printf '\n' > "$WORK/go"
 if wait "$LAUNCHER_PID"; then
     LAUNCHER_PID=
     LAUNCHER_RC=0

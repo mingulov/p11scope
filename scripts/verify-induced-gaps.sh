@@ -27,11 +27,14 @@ command -v llvm-objcopy >/dev/null || { echo "llvm-objcopy required"; exit 1; }
 command -v llvm-readelf >/dev/null || { echo "llvm-readelf required"; exit 1; }
 command -v bpftool >/dev/null || { echo "bpftool required"; exit 1; }
 command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
+command -v systemd-run >/dev/null || { echo "systemd-run required"; exit 1; }
 sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
 test -f "$MODULE" || { echo "SoftHSM2 not installed at $MODULE"; exit 1; }
 
 WPID=
 WORKLOAD_STARTTIME=
+WORKLOAD_LAUNCHER_PID=
+WORKLOAD_UNIT=
 SPID=
 OBSERVER_PID=
 OBSERVER_STARTTIME=
@@ -50,8 +53,13 @@ cleanup() {
     elif [ -n "$WPID" ]; then
         kill -TERM "$WPID" 2>/dev/null || true
     fi
-    [ -z "$WPID" ] || wait "$WPID" 2>/dev/null || true
+    [ -z "$WORKLOAD_LAUNCHER_PID" ] \
+        || kill -CONT "$WORKLOAD_LAUNCHER_PID" 2>/dev/null || true
+    [ -z "$WORKLOAD_LAUNCHER_PID" ] || wait "$WORKLOAD_LAUNCHER_PID" 2>/dev/null || true
+    [ -n "$WORKLOAD_LAUNCHER_PID" ] || [ -z "$WPID" ] || wait "$WPID" 2>/dev/null || true
     [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || true
+    [ -z "$WORKLOAD_UNIT" ] || sudo systemctl stop "${WORKLOAD_UNIT}.scope" >/dev/null 2>&1 || true
+    rm -f "$WORK/freeze-barrier"
     exit "$CLEANUP_STATUS"
 }
 . scripts/cleanup-traps.sh
@@ -123,14 +131,23 @@ wait_for_workload_stopped() {
 resume_and_wait_workload() {
     raww_label=$1
     signal_verified_process CONT "$WPID" "$WORKLOAD_STARTTIME"
-    if wait "$WPID"; then
+    # systemd-run mirrors a stopped scope command's job-control state. Resume
+    # the script-owned launcher too so it can reap the continued workload.
+    [ -z "$WORKLOAD_LAUNCHER_PID" ] \
+        || kill -CONT "$WORKLOAD_LAUNCHER_PID" 2>/dev/null || true
+    raww_wait_pid=${WORKLOAD_LAUNCHER_PID:-$WPID}
+    if wait "$raww_wait_pid"; then
         raww_status=0
         WPID=
         WORKLOAD_STARTTIME=
+        WORKLOAD_LAUNCHER_PID=
+        WORKLOAD_UNIT=
     else
         raww_status=$?
         WPID=
         WORKLOAD_STARTTIME=
+        WORKLOAD_LAUNCHER_PID=
+        WORKLOAD_UNIT=
     fi
     [ "$raww_status" -eq 0 ] || {
         echo "$raww_label workload failed: $raww_status" >&2
@@ -344,17 +361,28 @@ gcc -std=c11 -O0 -Wall -Wextra -o "$WORK/freeze-workload" \
 
 rm -f "$WORK/freeze-ready" "$WORK/freeze-go" "$WORK/freeze-observed.json" \
     "$WORK/freeze-profile.log" "$WORK/freeze-workload.log" \
+    "$WORK/freeze-workload.pid" "$WORK/freeze-barrier" \
     "$WORK"/mapdump_*_freeze-before.json "$WORK"/mapdump_*_freeze-after.json \
     "$WORK/mapdump_manifest_freeze-before.json" "$WORK/mapdump_manifest_freeze-after.json"
-( while [ ! -f "$WORK/freeze-go" ]; do sleep 0.05; done
-  exec "$WORK/freeze-workload" "$PWD/$WORK/freeze-provider.so" matrix \
-      "$PWD/$WORK/freeze-ready" "$PWD/$WORK/freeze-go" ) \
+mkfifo "$WORK/freeze-barrier"
+WORKLOAD_UNIT="p11scope-freeze-$$"
+CGROUP_PATH="/sys/fs/cgroup/system.slice/${WORKLOAD_UNIT}.scope"
+( sudo systemd-run --scope --unit="$WORKLOAD_UNIT" \
+    --uid="$(id -u)" --gid="$(id -g)" -- sh -c \
+    "umask 077; \
+     starttime=\$(awk '{ sub(/^[0-9]+ \\(.*\\) /, \"\"); split(\$0, tail, \" \"); print tail[20]; exit }' /proc/\$\$/stat) || exit 1; \
+     printf '%s %s\\n' \"\$\$\" \"\$starttime\" > '$PWD/$WORK/freeze-workload.pid'; \
+     read -r _ < '$PWD/$WORK/freeze-barrier'; \
+     exec '$PWD/$WORK/freeze-workload' '$PWD/$WORK/freeze-provider.so' matrix \
+         '$PWD/$WORK/freeze-ready' '$PWD/$WORK/freeze-go'" ) \
     > "$WORK/freeze-workload.log" 2>&1 &
-WPID=$!
-pin_workload
-cgroup_rel=$(awk -F: '$1 == "0" && $2 == "" { print $3 }' "/proc/$WPID/cgroup")
-[ -n "$cgroup_rel" ] || { echo "unified cgroup entry missing for workload $WPID"; exit 1; }
-CGROUP_PATH=/sys/fs/cgroup$cgroup_rel
+WORKLOAD_LAUNCHER_PID=$!
+workload_record=$(wait_root_process_record \
+    "$WORK/freeze-workload.pid" "$WORKLOAD_LAUNCHER_PID")
+set -- $workload_record
+[ "$#" -eq 2 ] || { echo "freeze workload identity was not recorded"; exit 1; }
+WPID=$1
+WORKLOAD_STARTTIME=$2
 [ -d "$CGROUP_PATH" ] || { echo "workload cgroup path missing: $CGROUP_PATH"; exit 1; }
 
 launch_root_recorded_process "$WORK/freeze-observer.pid" "$WORK/freeze-profile.log" \
@@ -372,6 +400,7 @@ sudo python3 scripts/dump-owned-bpf-maps.py \
 freeze_policy_maps "$WPID" "$CGROUP_PATH" \
     "$WORK/mapdump_manifest_freeze-before.json"
 touch "$WORK/freeze-go"
+printf '\n' > "$WORK/freeze-barrier"
 wait_for_workload_stopped
 sudo python3 scripts/dump-owned-bpf-maps.py \
     "$OBSERVER_PID" "$WORK" freeze-after 0 16384

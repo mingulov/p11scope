@@ -1,9 +1,9 @@
 # Using p11scope
 
 This is the operator's guide: what the tool does, what it refuses to do,
-how to run it, and what its output actually proves. Every number below
-cites the script that produced it — re-run the script to check it
-yourself.
+how to run it, and what its output actually proves. Measured examples below
+name the script that produced them so they can be reproduced; fixed
+implementation limits are code contracts, not measurements.
 
 > **Status: unreleased; Slice 1b-1 remains open.** Memory-scan discovery,
 > `inspect`, `doctor`, multi-module capture, schema v2, and corrective Tasks

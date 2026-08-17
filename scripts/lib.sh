@@ -200,10 +200,14 @@ wait_for_mapped_provider() {
 wait_for_cgroup_provider() {
     wfcp_cgroup=$1
     wfcp_name=$2
+    MAPPED_PROVIDER_PID=
     wfcp_attempt=0
     while [ "$wfcp_attempt" -lt 200 ]; do
         for wfcp_pid in $(sudo -n find "$wfcp_cgroup" -name cgroup.procs -exec cat {} + 2>/dev/null); do
-            sudo -n grep -Fq "$wfcp_name" "/proc/$wfcp_pid/maps" 2>/dev/null && return 0
+            if sudo -n grep -Fq "$wfcp_name" "/proc/$wfcp_pid/maps" 2>/dev/null; then
+                MAPPED_PROVIDER_PID=$wfcp_pid
+                return 0
+            fi
         done
         wfcp_attempt=$((wfcp_attempt + 1))
         sleep 0.05

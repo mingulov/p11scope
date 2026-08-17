@@ -75,6 +75,7 @@ cleanup() {
     [ -z "$PROFILE_PID" ] || wait "$PROFILE_PID" 2>/dev/null || true
     [ -z "$LAUNCHER_PID" ] || wait "$LAUNCHER_PID" 2>/dev/null || true
     sudo systemctl stop "${UNIT}.scope" >/dev/null 2>&1 || true
+    rm -f "$WORK/go"
     exit "$status"
 }
 . scripts/cleanup-traps.sh
@@ -119,13 +120,14 @@ rm -f "$PKCS11_CHECK_DIR/.pkcs11-check-isolation-state.json" \
 echo "=== run pkcs11-check under a cgroup scope, attach-before-run ==="
 echo "cgroup unit: ${UNIT}.scope"
 rm -f "$WORK/go"
+mkfifo "$WORK/go"
 # --marker smoke: the fast slice (~27 tests / ~5s un-isolated); with
 # --isolation file (one subprocess per test FILE) real wall time measured
 # during development was ~90s for the full 284-file collection (most
 # files deselect everything and still pay subprocess start-up). --duration
 # 150 below gives headroom over that.
 ( sudo systemd-run --scope --unit="$UNIT" -- sh -c \
-    "while [ ! -f '$PWD/$WORK/go' ]; do sleep 0.05; done; \
+    "read -r _ < '$PWD/$WORK/go'; \
      cd '$PKCS11_CHECK_DIR' && exec env SOFTHSM2_CONF='$SOFTHSM2_CONF' '$PKCS11_CHECK_BIN' test \
         --module '$MODULE' --pin 1234 --slot 0 --marker smoke --isolation file --rv-trace \
         --output json --output-file '$PWD/$WORK/reports/results.json'" ) &
@@ -138,8 +140,8 @@ sudo target/release/p11scope profile --manifest "$WORK/manifest.json" \
     --mode metrics --duration 150 -o "$WORK/observed.json" \
     > "$WORK/profile.log" 2>&1 &
 PROFILE_PID=$!
-sleep 3     # let attach complete before pkcs11-check is released
-touch "$WORK/go"
+wait_for_capture_ready "$WORK/profile.log" aggregate-only metrics
+printf '\n' > "$WORK/go"
 if wait "$LAUNCHER_PID"; then
     LAUNCHER_PID=
     LAUNCHER_RC=0

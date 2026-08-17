@@ -665,7 +665,7 @@ PY
     sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         gcc libc6-dev binutils ca-certificates \
         >"$output/apt-install.stdout" 2>"$output/apt-install.stderr"
-    "$toolchain/rustup" toolchain install 1.88.0 --profile minimal \
+    "$toolchain/rustup" toolchain install 1.88.0 --profile minimal --no-self-update \
         >"$output/rustup.stdout" 2>"$output/rustup.stderr"
     "$toolchain/rustup" run 1.88.0 rustc --version --verbose >"$output/rustc.txt"
     "$toolchain/rustup" run 1.88.0 cargo --version --verbose >"$output/cargo.txt"

@@ -132,7 +132,7 @@ Exact call counts matched `spike/expected.txt` on every function;
 `evidence.completeness == "COMPLETE"`, `attached_probes == 136` (68 slots
 x2 uprobe+uretprobe).
 
-## Row 2: Shared image layer / inode-sharing proof (Task 3)
+## Row 2: Shared image layer / single-attach validation (Task 3)
 
 `verify-shared-layer.sh` starts two containers (`p11scope-matrix-shared-a`,
 `-b`) from the identical image, under one dedicated cgroup parent slice
@@ -140,18 +140,20 @@ x2 uprobe+uretprobe).
 under `p11scope.slice`, giving a clean common ancestor with no unrelated
 host services under it).
 
-**Inode-sharing proof (measured, not assumed):** `docker exec <A> stat -c
+**Overlay precondition (measured, not assumed):** `docker exec <A> stat -c
 %i /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so` and the same in B both
-returned **51969427** — the identical inode number, confirming the overlay2
-image layer is genuinely shared before the capture claims anything about
-it. The script hard-fails with BLOCKED-style output (and prints the
-storage driver) if the inodes ever differ.
+returned **51969427**. Equal inode numbers across two overlay devices match the
+shared-layer heuristic but do not alone prove physical identity: independent
+byte-identical overlay instances can look the same. The script hard-fails with
+BLOCKED-style output (and prints the storage driver) if the numbers differ.
 
 **Positive:** discover once (in container A's mount view), attach **once**
 with `--cgroup` set to the shared parent slice, run the harness in *both*
 containers during that single attach window. Observed counts were exactly
 double the oracle (e.g. `C_GenerateRandom: 200`, `C_Digest: 100`) —
 one attach, both containers' calls captured, `completeness: COMPLETE`.
+That one-attach exact-count result, rather than overlay classification by itself,
+is the evidence that these concrete instances shared the kernel probe point.
 
 **Negative isolation (the important one):** two further captures, each a
 fresh `p11scope profile` invocation scoped to only one container's leaf

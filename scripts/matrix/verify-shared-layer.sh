@@ -1,8 +1,9 @@
 #!/bin/sh
-# Task 6: one shared image-layer inode, broad and leaf cgroup scope.
+# Task 6: shared image-layer attach/count oracle, broad and leaf cgroup scope.
 #
-# Manifest-free: nothing is copied out of either container. Both containers map
-# the *same* overlay inode, so the two scans must pin one object, not two.
+# Manifest-free: nothing is copied out of either container. This is the measured
+# common shared-layer shape; exact counts prove that its two matching overlay
+# mappings need one attach, while output must retain heuristic uncertainty.
 set -eu
 cd "$(dirname "$0")/../.."
 
@@ -92,7 +93,7 @@ case $PID_A in ''|*[!0-9]*) echo "invalid container pid A: $PID_A"; exit 1 ;; es
 case $PID_B in ''|*[!0-9]*) echo "invalid container pid B: $PID_B"; exit 1 ;; esac
 [ "$PID_A" -gt 0 ] && [ "$PID_B" -gt 0 ] || { echo "container pid is zero"; exit 1; }
 
-echo "=== prove the provider is one shared host inode ==="
+echo "=== record the shared-layer overlay predicate ==="
 PROVIDER_REAL=$(timeout --signal=TERM --kill-after=5s 60s \
     docker exec "$NAME_A" readlink -f -- "$MODULE_IN_CONTAINER")
 PROVIDER_REAL_B=$(timeout --signal=TERM --kill-after=5s 60s \
@@ -145,6 +146,7 @@ run_capture() {
     label=$1
     cgroup=$2
     multiplier=$3
+    expected_collapses=$4
     echo "--- capture: $label (scope=$cgroup) ---"
     rm -f "$WORK/shared-a/go" "$WORK/shared-b/go"
     # Both workloads map the provider first and only then block on the go-file:
@@ -208,40 +210,48 @@ run_capture() {
         exit "$status"
     fi
     reclaim_root_output "$WORK/$label.json"
-    # This runs before the count oracle on purpose: one file attached twice
-    # double-counts every call through it, and "one file, one attach target" is
-    # the claim that explains the counts, so it is the one that should name the
-    # failure if it breaks.
-    python3 - "$WORK/$label.json" <<'SHARED'
+    # This runs before the count oracle on purpose: failing to collapse this measured
+    # shared-layer shape doubles counts, while pretending the heuristic proves identity
+    # hides possible under-counting on distinct byte-identical overlay instances.
+    python3 - "$WORK/$label.json" "$expected_collapses" <<'SHARED'
 import json, sys
 from collections import Counter
 
 doc = json.load(open(sys.argv[1]))
+expected_collapses = int(sys.argv[2])
 ev = doc["evidence"]
 modules = doc["capture"]["modules"]
 assert [m["sources"] for m in ev["discovery"]] == [["scan"]] * len(modules), ev["discovery"]
 assert ev["attached_probes"] == 2 * ev["slots"], (ev["attached_probes"], ev["slots"])
 
-# Both containers map the same file from the same image layer. Two entries with
-# one digest means the same bytes were pinned twice and attached twice -- and
-# because a uprobe is registered per (inode, offset), both registrations fire
-# for every call from either container, so every count is inflated.
+# The common shared-layer lane must collapse matching overlay mappings, but the
+# predicate is heuristic. Require exactly one published uncertainty in broad scope
+# and none in either leaf scope; its subject includes the discarded mapping key.
+uncertainty = [
+    item for item in ev["skipped"]
+    if "cannot prove physical identity" in item["reason"]
+]
+assert len(uncertainty) == expected_collapses, (expected_collapses, uncertainty)
+assert all("ObjectKey" in item["name"] for item in uncertainty), uncertainty
+
+# Two module entries with one digest would mean the matching provider bytes were
+# attached twice. Because a uprobe is registered per kernel (inode, offset), that
+# doubled every provider call in the reproduced shared-layer case.
 digests = Counter(m["sha256"] for m in modules)
 repeated = {digest: n for digest, n in digests.items() if n > 1}
 assert not repeated, (
     f"the same provider was attached {max(repeated.values())} times "
-    f"({[ (m['dev'], m['ino']) for m in modules ]}): one file shared by two "
-    "containers has one inode and must be one attach target, or every call "
-    "through it is counted once per mount"
+    f"({[ (m['dev'], m['ino']) for m in modules ]}): the shared-layer count "
+    "oracle requires one attach for these matching overlay mappings"
 )
-print("one shared inode, one module:", modules[0]["ino"])
+print("one shared-layer module; collapse uncertainties:", len(uncertainty), modules[0]["ino"])
 SHARED
     python3 scripts/check-capture-evidence.py clean-metrics \
         "$WORK/$label.json" spike/expected.txt "$multiplier"
 }
 
-run_capture broad "$BROAD_PATH" 2
-run_capture a-only "$LEAF_A_PATH" 1
-run_capture b-only "$LEAF_B_PATH" 1
+run_capture broad "$BROAD_PATH" 2 1
+run_capture a-only "$LEAF_A_PATH" 1 0
+run_capture b-only "$LEAF_B_PATH" 1 0
 
 echo "=== shared-layer: ALL OK ==="

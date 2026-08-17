@@ -6,7 +6,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use p11scope::attach::{CapturePolicy, Scope, Session};
 use p11scope::cli::{self, CaptureArgs, CliError, Command, Kind, ScopeArg};
 use p11scope::discovery::identity::{
-    PinnedObjects, merge_mappings_of_one_file, pin_manifest_objects, pin_scanned_objects,
+    PinnedObjects, collapse_overlay_mappings, pin_manifest_objects, pin_scanned_objects,
 };
 use p11scope::discovery::scan::{
     ScanLimits, ScanOutcome, ScanRequest, ScannedModule, Skipped, scan_pid,
@@ -611,8 +611,8 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
                 // Ten processes of one container map one object under one key; ten
                 // containers of one image map it under ten (each mount has its own
                 // anonymous device). Only the first case is a key match, so this
-                // dedupe cannot see the second — `merge_mappings_of_one_file` below
-                // is what collapses those, once every process has been pinned.
+                // dedupe cannot see the second — `collapse_overlay_mappings` below
+                // handles the measured shared-layer case with explicit uncertainty.
                 for module in found {
                     if !modules.iter().any(|known| known.key == module.key) {
                         modules.push(module);
@@ -643,19 +643,17 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
         );
     }
 
-    // Then, and only then: two mappings of one physical file are one module and one
-    // attach target, or every call through it is counted once per mount. After the
-    // drop above, so the mapping this keeps is chosen on targets that can actually be
-    // attached — otherwise an entry can win that choice and then be dropped as
-    // unpinned, with the mapping that could have attached it already gone. The order
-    // is otherwise immaterial: the collapse only ever maps a pinned key onto another
-    // pinned key, so it drops exactly the same entries either way.
-    let (collapsed, differed) = merge_mappings_of_one_file(&mut modules, &pinned);
+    // Then, and only then: collapse the common shared-overlay-layer shape so one kernel
+    // uprobe point is not registered once per container mount. Overlay classification
+    // and matching bytes cannot prove physical identity, so every rewrite below also
+    // publishes uncertainty and forces PARTIAL. Run after the drop so election counts
+    // only targets that can actually be attached.
+    let (collapsed, differed) = collapse_overlay_mappings(&mut modules, &pinned);
     if collapsed > 0 {
         eprintln!(
-            "p11scope: discovery: {collapsed} further mapping(s) of an already-discovered \
-             provider file were collapsed — containers sharing an image layer map one \
-             inode through their own mounts, and one file is one attach target"
+            "p11scope: discovery: {collapsed} matching overlay mapping(s) were collapsed \
+             onto one attach target; physical identity is not provable, so published \
+             uncertainty makes this capture PARTIAL"
         );
     }
     for skipped in &differed {

@@ -14,11 +14,11 @@ pub struct Device {
 /// *superblock* the mapping was reached through, not the file's `st_dev`. So this
 /// identifies a mapping, never a physical file, and it is wrong in both directions:
 ///
-///  - one file, two keys — an overlay mount reports the underlying inode's number
-///    under its own anonymous superblock device, so every container of one image
-///    spells one provider differently. See
-///    `p11scope::discovery::identity::merge_mappings_of_one_file` before letting two
-///    of these decide that there are two files.
+///  - one file can have two keys — overlay mounts can expose a shared image-layer
+///    object under different anonymous superblock devices. The inverse is also
+///    possible: two independent byte-identical overlay instances can look the same
+///    to the available metadata. `collapse_overlay_mappings` therefore treats a
+///    collapse as explicit uncertainty, never proof of one physical inode.
 ///  - two files, one key — an inode number is unique only within a filesystem. On
 ///    btrfs it is not even unique within one: subvolumes number inodes independently
 ///    while maps renders the one filesystem-wide `s_dev` (the per-subvolume anonymous

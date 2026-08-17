@@ -149,6 +149,12 @@ Docker container, two containers sharing one image layer, a Kubernetes pod
 (`docs/notes/phase4-matrix.md`). Cluster-wide packaging (DaemonSet/operator)
 comes after v1.
 
+Manifest-free discovery collapses matching overlay mappings in that common
+shared-layer case so the kernel point is attached once. Overlayfs classification,
+inode metadata, and identical bytes do not prove physical identity across separate
+overlay instances, so every such collapse is published as uncertainty and forces
+`PARTIAL`; a distinct byte-identical instance could otherwise be under-counted.
+
 Discovery uses a small unprivileged helper (`p11scope-discover`) that you copy
 into the target container (`docker cp`/`kubectl cp`, then `exec`); it dlopens
 the provider in the container's own view and prints a manifest the observer

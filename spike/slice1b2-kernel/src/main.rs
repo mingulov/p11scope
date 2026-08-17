@@ -2550,6 +2550,31 @@ mod tests {
     }
 
     #[test]
+    fn gate_a_verifier_execution_has_a_distinct_120_second_bound() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("gate-timeout");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let timeout = bin.join("timeout");
+        std::fs::write(&timeout, "#!/bin/sh\nprintf '%s\\n' \"$1\"\n").unwrap();
+        std::fs::set_permissions(&timeout, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg("source \"$1\"; gate_ssh /known-hosts 2222 true")
+            .arg("bash")
+            .arg(script)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "gate SSH failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"120s\n");
+    }
+
+    #[test]
     fn vm_cleanup_cannot_launder_an_intermediate_postcheck_failure() {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
         let temp = TestDir::new("vm-cleanup-failure");

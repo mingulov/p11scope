@@ -204,6 +204,14 @@ strict_ssh() {
     timeout 30s "${ssh[@]}" p11scope@127.0.0.1 "$@"
 }
 
+gate_ssh() {
+    local known_hosts=$1 port=$2
+    shift 2
+    local -a ssh
+    mapfile -d '' -t ssh < <(ssh_argv "$known_hosts" "$port")
+    timeout 120s "${ssh[@]}" p11scope@127.0.0.1 "$@"
+}
+
 strict_ssh_long() {
     local known_hosts=$1 port=$2
     shift 2
@@ -445,7 +453,7 @@ gate_a_lane() {
     esac
     if (( gate_rc == 0 )); then
         set +e
-        strict_ssh "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" \
+        gate_ssh "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" \
             "sudo -n $remote/slice1b2-runner gate-a --source-manifest $remote/source-elf.manifest --build-evidence $remote/build-evidence.txt --execution-manifest $remote/execution.manifest --bpf $remote/slice1b2-kernel-ebpf --fixture $remote/slice1b2-fixture --out $gate_dir" \
             >"$run_dir/gate-a.stdout" 2>"$run_dir/gate-a.stderr"
         gate_rc=$?

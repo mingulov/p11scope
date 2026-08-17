@@ -10,12 +10,12 @@ table (including stripped providers with no `C_*` symbols), attaches probes by
 file offset, and produces a versioned `observed-profile.json` for migration
 assessment and incident diagnostics.
 
-> **Status: unreleased.** Productization slice 1b-1 is implemented on the
-> current branch: manifest-free memory-scan discovery, `inspect`, `doctor`,
-> multi-module capture, and schema v2. Provider identity is pinned by SHA-256
-> at attach and checked for in-place change during capture
-> (`evidence.provider_changed`). Final whole-branch review and CI are pending;
-> live discovery and `run` remain Slice 1b-2.
+> **Status: unreleased; Slice 1b-1 remains open.** Its memory-scan discovery,
+> `inspect`, `doctor`, multi-module capture, schema v2, and corrective Tasks
+> 1–5 are implemented on this branch. The owner-selected scan-only semantic-
+> authority contract, its separately reviewed implementation, final whole-range
+> correctness/security reviews, and CI on the exact final commit are pending.
+> Loader/export hooks and `run` remain Slice 1b-2 and are not present here.
 
 Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40
 table, and standard 3.0, 3.1, and 3.2 interfaces (all 104 slots published in
@@ -120,10 +120,35 @@ for the CLI, live output, trace lines, and an example `observed-profile.json`.
   p11-kit's fixed closure array exceeds the 512-slot ceiling and is refused
   whole, while the later-fitting SoftHSM2 backend attaches; the report is
   explicitly `PARTIAL`, not a claim that the proxy layer was captured.
+- Discovery has one capture-wide 512 MiB attempted-I/O allowance shared by
+  memory scans and scan-sourced file hashes across all selected processes and
+  retries, with 64 MiB per scan/hash operation. It also stops at 512 accepted
+  table candidates, 53,248 decoded entries, 512 interface records, 256 cgroup
+  members, and 512 attach slots. Any bounded omission is evidence and forces
+  `PARTIAL`; a retry never renews the allowance.
+- A named PID's generation is retained through scan, pin, and attach and is
+  rechecked before and after session creation. Cgroup members use the same
+  retained generation and ownership records; a stale member's contributions
+  are removed and the one-shot plan is rebuilt from already-opened stable
+  inputs. Incomparable ordinary-file identities fail closed. The overlay-only
+  byte-identical collapse remains an explicit uncertainty that forces
+  `PARTIAL`.
+- Optional manifest staleness falls back per object only when one exact,
+  scan-opened table covers every dropped claim and survives final planning.
+  Malformed input, permissions/arbitrary I/O, incomparable identity, invalid
+  offsets, and stale sole sources remain fatal. Discovery interface names are
+  read at most 64 bytes and never beyond their containing readable VMA; only
+  escaped names appear in `inspect`, and capture output never contains the
+  bytes.
 - **Profiles, never replays.** It has only the bounded metadata decoders listed
   in the field allowlist and no intentional secret/buffer decoder. Under the
   default `allowlisted` policy this holds against hostile pointer placement,
   not merely trusted ABI-valid callers.
+- **Privacy-first 1.0 boundary.** The default release reports bounded function,
+  registered-mechanism, return-code, latency, and lifecycle evidence. It does
+  not correlate object handles and does not promise symbolic `CKA_CLASS` or
+  `CKA_KEY_TYPE` output. The existing unsafe diagnostic build does not enlarge
+  the default allowlist.
 - A trace is evidence about the observed window only; the profile includes an
   explicit evidence-quality/completeness section (attach failures, aliased
   functions, event loss) — `COMPLETE`/`PARTIAL`, never silently confident.
@@ -172,6 +197,19 @@ ino/size/ctime) before, during, and after capture; a change during capture
 sets `evidence.provider_changed`, which forces the report `PARTIAL`. Profile
 output is published atomically (private temp beside the target, fsync,
 rename).
+
+Memory scanning is heuristic discovery. The owner decision on whether a
+scan-only match may authorize semantic descriptors is still open; this branch
+does not resolve that policy by documentation. Until one of the recorded
+contracts is selected, implemented, and independently reviewed, Slice 1b-1 has
+no completion or security-clearance claim.
+
+Fresh local Task 6 evidence is mixed: all four Rust checks (357 tests),
+`scripts/verify-inspect-doctor.sh`, the capture-evidence self-test, shared-layer
+matrix, and glibc/musl container-discovery matrix passed. The aggregate gate,
+Docker, fork, external-oracle, proxy, kind, Knative, and release-assembly
+commands exited 1 on unchanged evidence/negative-control assertions. Those
+failures remain open; CI and whole-range reviews are pending.
 
 When used, the helper recreates the table in its own process; it never reads or
 injects into the observed process. Uprobes are bound to the verified target

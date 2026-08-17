@@ -92,15 +92,7 @@ fn run() -> Result<i32> {
         // not be read at all": one line here, exit 1, never a panic.
         Ok(Command::Inspect(a)) => inspect::run(a.pid, &a.modules, &a.hooks, a.json)
             .with_context(|| format!("inspect --pid {}", a.pid)),
-        Ok(Command::Doctor(a)) => {
-            if let Some(module) = &a.module {
-                eprintln!(
-                    "p11scope: doctor has no module lane yet; ignoring --module {}",
-                    module.display()
-                );
-            }
-            doctor::run(a.pid, a.cgroup.as_deref())
-        }
+        Ok(Command::Doctor(a)) => doctor::run(a.pid, a.cgroup.as_deref()),
         Err(CliError::Help) => {
             eprintln!("{}", cli::USAGE);
             Ok(0)

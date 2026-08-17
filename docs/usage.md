@@ -5,10 +5,12 @@ how to run it, and what its output actually proves. Every number below
 cites the script that produced it — re-run the script to check it
 yourself.
 
-> **Status: unreleased.** Productization slice 1b-1 is implemented on the
-> current branch: manifest-free memory-scan discovery, `inspect`, `doctor`,
-> multi-module capture, and schema v2. Final whole-branch review and CI are
-> pending; live discovery and `run` remain Slice 1b-2.
+> **Status: unreleased; Slice 1b-1 remains open.** Memory-scan discovery,
+> `inspect`, `doctor`, multi-module capture, schema v2, and corrective Tasks
+> 1–5 are implemented on this branch. The owner-selected scan-only semantic-
+> authority contract, its separately reviewed implementation, final whole-range
+> correctness/security reviews, and CI on the exact final commit are pending.
+> Loader/export hooks and `run` remain Slice 1b-2 and are not present here.
 > See the
 > [safe metadata design](superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md)
 > and the
@@ -42,6 +44,12 @@ There is no decoder or dump flag for PINs, key material, `CKA_VALUE`, labels,
 `CKA_ID`, plaintext, ciphertext, signatures, wrapped blobs, random output,
 operation-state blobs, raw mechanism byte arrays, raw session handles, or
 ordinary buffers.
+
+The privacy-first 1.0 product boundary is function, registered-mechanism,
+return-code, latency, and lifecycle evidence. The default release does not
+correlate object handles and does not promise symbolic `CKA_CLASS` or
+`CKA_KEY_TYPE` output. The unsafe diagnostic build described below does not
+enlarge the default allowlist.
 
 The default capture policy is `allowlisted`. Under it, pointer-derived bytes
 reach output only by exact membership in a finite published set — a mechanism
@@ -83,6 +91,11 @@ the report `PARTIAL`; uncorroborated entries remain present as vendor evidence
 and are not decoded. Discovery enumerates `C_GetInterfaceList` but never calls
 `C_GetInterface`.
 
+Interface-name discovery reads at most 64 bytes and never crosses the readable
+VMA containing the pointer. A name without an in-VMA NUL is unreadable. Text
+`inspect` escapes valid names; profile, metrics, and trace publish only bounded
+classification consequences, never the name bytes.
+
 ## Quickstart
 
 Start with `inspect`: it shows every provider-shaped module the target maps.
@@ -117,6 +130,10 @@ discovery.
 offline path. It executes provider code in its own unprivileged process; the
 normal manifest-free path does not execute provider code. `--module` is also
 optional and only narrows the memory scan to named providers.
+
+`doctor` has no module-specific probe lane. `doctor --module` is rejected as
+unsupported instead of accepting and ignoring operator input; use
+`inspect --pid <pid> --module <provider.so>` for module-specific discovery.
 
 ### Attaching to an existing Kubernetes pod
 
@@ -162,6 +179,17 @@ after attach and during capture. Attach is refused if that identity changes; a
 change during capture sets `evidence.provider_changed`, forces `PARTIAL`, and
 shows " · provider changed" on the live line. Renaming over or unlinking the
 pinned inode is reported by the same conservative check.
+
+The capture retains each selected process generation through its last target
+access and through attach, checking it immediately before and after session
+creation. A named PID mismatch is fatal. A changed/disappeared cgroup member is
+bounded `PARTIAL` evidence: only that retained view's claims are removed, and
+the plan is rebuilt from stable already-opened inputs without reopening files,
+rehashing, or renewing discovery budgets. Ordinary-file candidates merge only
+after comparable opened-file identity and digest agree; an incomparable
+collision group fails closed. The existing overlay-only byte-identical collapse
+is the sole heuristic exception and publishes uncertainty that forces
+`PARTIAL`.
 
 **Historical pre-terminal-drain output**, `profile --mode metrics` against a
 SoftHSM2 workload (`scripts/verify-attach-e2e.sh`). Current written captures
@@ -343,7 +371,20 @@ pinned by file descriptor; offsets must land in executable ELF segments.
 `fstat` (inode, size, ctime) is re-checked before and after attach — attach is
 refused on a mismatch — and during capture, where a change sets
 `evidence.provider_changed` and forces `PARTIAL`. Inputs are capped at a 16 MiB
-manifest, 256 MiB per object, and 512 MiB across all objects.
+manifest, 256 MiB per manifest object, and 512 MiB across one manifest's
+objects. Separately, one capture-wide 512 MiB attempted-I/O budget covers
+memory scanning and scan-sourced file hashing across every selected process,
+retry, and failed pin, with 64 MiB per scan/hash operation. Decoding stops at
+512 accepted table candidates, 53,248 table entries, and 512 interface records;
+cgroup discovery considers at most 256 members and planning has 512 attach
+slots. Every bounded omission forces `PARTIAL`; no retry renews a budget.
+
+An optional manifest's missing or identity-mismatched object is ignored only
+after one exact scan-opened table for that object covers every dropped claim
+and remains admitted in the final plan. The fallback is per object and is
+published in bounded, path/PID-free evidence. Malformed structure, permission
+or arbitrary I/O failure, incomparable identity, non-executable offsets, an
+ambiguous/incomplete replacement, and a stale sole source remain fatal.
 
 **`COMPLETE`** requires that discovery found a module and planned a slot in
 it, that the memory scan could read every target, that no module was refused
@@ -369,6 +410,21 @@ diffing against older notes that record `COMPLETE` rows, this is the reason.
 `COMPLETE` describes the completeness of the accepted capture window. It is
 not a claim that deliberately malicious native provider code truthfully
 implements the ABI role named in its own function table.
+
+Memory scanning itself is heuristic discovery. The separate owner decision on
+whether a scan-only table match may authorize semantic descriptors is still
+open; this document does not select a contract by implication. Slice 1b-1
+remains open until the selected contract is implemented and independently
+reviewed.
+
+The fresh Task 6 local matrix is not all-green. The four Rust checks (357
+tests), inspect/doctor script, capture-evidence self-test, shared-layer matrix,
+and glibc/musl container-discovery matrix passed. `scripts/gates.sh` and the
+Docker, fork, external-oracle, proxy, kind, Knative, and release-assembly
+commands exited 1 on their unchanged assertions. Knative installation and
+scale-to-zero readiness succeeded before its negative-control wording assertion
+failed. These failures are neither omitted nor converted to CI evidence; CI and
+whole-range reviews remain pending.
 
 **`PARTIAL`** is forced by any single gap in that list — an attach
 failure, ring-buffer loss, a template the in-kernel walk couldn't finish

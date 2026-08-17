@@ -2,6 +2,17 @@
 
 ## Unreleased — productization slice 1b-1
 
+Slice 1b-1 remains open. Corrective Tasks 1–5 are implemented, but the owner
+decision and separately reviewed implementation for scan-only semantic
+authority, whole-range correctness/security reviews, and CI on the exact final
+commit are pending. Loader/export hooks and `run` remain Slice 1b-2.
+
+Task 6 local verification is mixed: the Rust suite (357 tests), inspect/doctor,
+capture-evidence self-test, shared-layer, and glibc/musl container-discovery
+lanes passed. The aggregate gate, Docker, fork, external-oracle, proxy, kind,
+Knative, and release-assembly commands exited 1 on unchanged assertions and
+remain unresolved; CI and whole-range reviews have not run.
+
 - **Discovery**: `profile` and `trace` scan the target's mapped memory once at
   attach, so neither a manifest nor the offline helper is required. Repeatable
   `--module` hints and `--manifest` inputs are optional; manifests are
@@ -9,6 +20,8 @@
 - **Diagnostics**: `inspect --pid` reports mapped providers, table surfaces,
   interface discovery and pinned file identities without loading BPF;
   `doctor` probes host/target scan, BPF and uprobe availability before capture.
+  It rejects unsupported `doctor --module` input instead of ignoring it; use
+  `inspect --pid ... --module ...` for module-specific discovery.
 - **Multiple modules**: one capture plan can attach several providers, with
   module-scoped session/operation/async state and explicit count-only evidence
   when two modules publish the same target.
@@ -22,6 +35,24 @@
 - **Known limit**: the memory scan runs only once, while attaching. A provider
   loaded later is missed; use a suitable pre-existing manifest when available
   and hash-matchable, or wait for Slice 1b-2 live discovery.
+- **Corrective work bounds**: one 512 MiB attempted-I/O budget covers all
+  memory scans and scan-sourced hashes in a capture (64 MiB per operation),
+  with ceilings of 512 accepted tables, 53,248 decoded entries, 512 interfaces,
+  256 cgroup members, and 512 attach slots. Any omission forces `PARTIAL`.
+- **Process and file identity**: selected process generations survive through
+  attach; stale cgroup views are subtracted before a bounded rebuild from
+  retained inputs. Ordinary incomparable file identities fail closed; only the
+  existing overlay-specific collapse remains, with explicit `PARTIAL`
+  uncertainty.
+- **Discovery hygiene**: interface names are confined to one readable VMA and
+  escaped in text `inspect`. Stale optional-manifest objects fall back per
+  object only after exact scan coverage survives final planning; malformed,
+  incomparable, permission/I/O, invalid-offset, and stale-sole-source cases are
+  fatal.
+- **Privacy-first 1.0**: the default boundary is bounded function,
+  registered-mechanism, return-code, latency, and lifecycle evidence. There is
+  no object-handle correlation or promised symbolic `CKA_CLASS`/
+  `CKA_KEY_TYPE` output.
 
 ## Unreleased — productization slice 1a
 

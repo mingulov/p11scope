@@ -45,7 +45,6 @@ pub struct InspectArgs {
 pub struct DoctorArgs {
     pub pid: Option<u32>,
     pub cgroup: Option<PathBuf>,
-    pub module: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +68,7 @@ pub const USAGE: &str = "usage:
                    [--unsafe-unvalidated-metadata]
   p11scope trace   [same scope and discovery options] [--duration <…>] [-o <out.file>]
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
-  p11scope doctor  [--pid <n>] [--cgroup <path>] [--module <provider.so>]
+  p11scope doctor  [--pid <n>] [--cgroup <path>]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
@@ -170,14 +169,18 @@ fn parse_doctor(mut args: impl Iterator<Item = String>) -> Result<DoctorArgs, Cl
     let mut doctor = DoctorArgs {
         pid: None,
         cgroup: None,
-        module: None,
     };
     while let Some(a) = args.next() {
         match a.as_str() {
             "--help" | "-h" => return Err(CliError::Help),
             "--pid" => doctor.pid = Some(require_pid(&mut args)?),
             "--cgroup" => doctor.cgroup = Some(require_value(&mut args, "--cgroup")?.into()),
-            "--module" => doctor.module = Some(require_value(&mut args, "--module")?.into()),
+            "--module" => {
+                return Err(usage_err(
+                    "doctor --module is not supported; use inspect --pid <n> --module \
+                     <provider.so> for module-specific discovery",
+                ));
+            }
             other => return Err(unknown_arg(other)),
         }
     }
@@ -336,6 +339,14 @@ mod tests {
             panic!("expected doctor")
         };
         assert_eq!((d.pid, d.cgroup), (None, None));
+    }
+
+    #[test]
+    fn doctor_rejects_unsupported_module_option() {
+        assert!(matches!(
+            parse(args(&["doctor", "--module", "/opt/provider.so"])),
+            Err(CliError::Usage(m)) if m.contains("doctor --module is not supported")
+        ));
     }
 
     #[test]

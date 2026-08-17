@@ -398,28 +398,24 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     helper, multi-module plans and per-module semantic state, `--module`/`--manifest`
     optional, evidence `discovery[]`/`authority`, schema v2. The eBPF object is unchanged.
     Scanning happens once at attach time; a module loaded later is not discovered (1b-2).
-    **Status (2026-08-17): implementation tasks and their task-local reviews are complete on
-    the recovery branch; the Task 15 documentation commit and two review-fix commits
-    reconcile the documentation and privacy boundary, and final whole-branch review is
-    pending. Range `3b7c067..fdde185` is 37 pre-Task-15 implementation/recovery commits;
-    with the three Task 15 commits, the combined 40-commit delta is 57 files, 13,706
-    insertions, 1,382 deletions (net +12,324 lines). Fresh round-3 verification: the four
-    Rust checks passed (296 tests, 0 failed), `scripts/verify-inspect-doctor.sh` reported
-    `ALL OK`, and the capture-evidence, canary, and artifact-contract self-tests passed.
-    The owner-approved shared-layer lane was rerun after every unprivileged check: broad
-    scope published exactly one bounded overlay physical-identity uncertainty (therefore
-    `PARTIAL`), both leaf scopes published zero, all exact count/zero-gap assertions passed,
-    and the script reported `ALL OK`. Owner-approved root artifact evidence from Tasks 14
-    and 17 remains: `scripts/gates.sh`, `build-release.sh`, and matrix docker, fork-scope,
-    oracle, kind-pod, and Knative lanes passed in Task 14; proxy-stack passed after Task 17
-    via the exact capacity fallback (p11-kit
-    refused whole needing 5762 more than the 512-slot ceiling, later-fitting SoftHSM2
-    attached at 68 slots / 136 probes, `PARTIAL`). `verify-discover-containers.sh` and
-    `bench-overhead.sh`: UNRUN.
-    Privileges measured at `perf_event_paranoid=4`, `ptrace_scope=1`: uprobe attach required
-    `CAP_SYS_ADMIN`; a same-UID non-descendant manifest-free scan additionally required
-    `CAP_SYS_PTRACE` or a descendant/ptrace-policy change. CI: UNRUN/PENDING — this branch was
-    not pushed and no run was observed.**
+    **Status (2026-08-17): OPEN on the owner-selected scan-only semantic-authority
+    contract and its separately reviewed implementation. Corrective Tasks 1–5 and their
+    task-local review fix rounds are implemented on the recovery branch: one capture-wide
+    attempted-I/O/cardinality budget; VMA-confined interface names; fail-closed comparable
+    file identity with the existing overlay-only uncertainty; retained process generations
+    and per-view ownership through attach; and exact per-object stale-manifest fallback.
+    These changes do not implement Slice 1b-2 and do not select a semantic-authority policy
+    by implication. Task 6 rejects unsupported `doctor --module`. Fresh local
+    unprivileged Rust checks passed (357 tests, 0 failed), as did
+    `verify-inspect-doctor.sh`, the capture-evidence self-test, the shared-layer matrix,
+    and glibc/musl container discovery. The exact privileged matrix remains failing:
+    `gates.sh`, Docker, fork, oracle, proxy, kind, Knative, and release assembly all
+    exited 1 on unchanged evidence or negative-control assertions. Knative provisioned
+    successfully before its assertion failed; these are FAIL results, not missing-tool
+    omissions. `bench-overhead.sh` is N/A because the corrective range did not change
+    the BPF/event hot path. Whole-range correctness/security reviews and CI on the exact
+    corrective evidence commit remain PENDING. No completion or security-clearance
+    claim applies while those gates remain open.**
   - **Slice 1b-2 — live discovery and `run`**: BPF loader (`_dl_debug_state`) and export
     uretprobes, `DESCRIPTORS` + attach-cookie semantics with dynamic slot allocation,
     `discovery::Engine`, `pause.rs`, `run -- cmd`, `attach_gap_ms`, mid-capture

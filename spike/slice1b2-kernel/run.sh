@@ -589,6 +589,7 @@ provision_guest() {
     local rustup_home=/var/tmp/slice1b2-rustup-home cargo_home=/var/tmp/slice1b2-cargo-home
     local repo=$source_root/source host_manifest lock_before lock_after
     local ebpf_lock_before ebpf_lock_after extracted_inventory
+    local toolchain_bin
     umask 077
     [[ $(sha256sum "$manifest" | awk '{print $1}') == "$expected_manifest_sha" ]] || return 64
     [[ $(sha256sum "$rustup_binary" | awk '{print $1}') == 4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10 ]] || return 64
@@ -667,6 +668,9 @@ PY
         >"$output/apt-install.stdout" 2>"$output/apt-install.stderr"
     "$toolchain/rustup" toolchain install 1.88.0 --profile minimal --no-self-update \
         >"$output/rustup.stdout" 2>"$output/rustup.stderr"
+    toolchain_bin=$RUSTUP_HOME/toolchains/1.88.0-x86_64-unknown-linux-gnu/bin
+    [[ -x $toolchain_bin/rustc && -x $toolchain_bin/cargo ]]
+    export PATH=$toolchain_bin:$PATH
     "$toolchain/rustup" run 1.88.0 rustc --version --verbose >"$output/rustc.txt"
     "$toolchain/rustup" run 1.88.0 cargo --version --verbose >"$output/cargo.txt"
     grep -Fx 'rustc 1.88.0 (6b00bc388 2025-06-23)' "$output/rustc.txt" >/dev/null

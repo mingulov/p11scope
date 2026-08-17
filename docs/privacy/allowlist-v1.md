@@ -43,6 +43,7 @@ one entry program per slot, and only template-bearing calls use
 
 | Value | Kernel source and guard | Output |
 | --- | --- | --- |
+| Provider module identity | Module `path`, `dev`, `ino`, whole-file `sha256`, and GNU `build_id` come from operator input, filesystem mapping names/metadata, and the pinned provider file. They are not PKCS#11 call arguments and require no provider-memory pointer dereference. | `capture.modules[]` and `evidence.discovery[]`; filesystem/operator facts only. |
 | Function identity | Attach cookie indexes a slot authenticated by fresh provider-table discovery. No function-name pointer is needed for ordinary calls. | Standard name or an explicit alias group. |
 | PID/TID | `bpf_get_current_pid_tgid`; no user-memory read. | Raw PID/TID in bounded `trace` output; process identity is internal in profile/metrics output. |
 | Cgroup id | `bpf_get_current_cgroup_id`; no user-memory read. | Numeric id and best-effort host cgroup label. |
@@ -57,7 +58,7 @@ one entry program per slot, and only template-bearing calls use
 | Template attribute types | `walk_template` reads at most `MAX_ATTRS` `CK_ATTRIBUTE.type` values. | Requested numeric types; truncation/read failure is evidence and forces `PARTIAL`. |
 | Policy booleans | Only after type lookup in `ATTR_BOOL_BITS`, `walk_template` reads `{pValue, ulValueLen}`; only `ulValueLen == 1` permits one byte at `pValue`. | Requested true/false for `CKA_TOKEN`, `CKA_PRIVATE`, `CKA_SENSITIVE`, `CKA_ENCRYPT`, `CKA_DECRYPT`, `CKA_WRAP`, `CKA_UNWRAP`, `CKA_SIGN`, `CKA_VERIFY`, `CKA_DERIVE`, and `CKA_EXTRACTABLE`. |
 | Return code and latency | Return register plus kernel monotonic timestamps. | Full-width `CK_RV`, counts, and latency aggregates/trace duration. |
-| PKCS #11 3.2 async function name | The current `capture_async_target` snapshots at most 29 bytes and authorizes by FNV-1a-64 plus length. This rejects ordinary unknown names but is not byte-exact against an attacker-chosen collision; replacing it with a fixed-size byte-exact key is a release requirement. | Numeric target id only; raw bytes/pointer do not enter a map or output. |
+| PKCS #11 3.2 async function name | `capture_async_target` snapshots one bounded C string and looks up its length plus exact bytes in the frozen 104-name standard catalog. Unknown names fail capture. | Numeric target id only; raw bytes/pointer do not enter a map or output. |
 | Async id | Descriptor-selected scalar for `C_AsyncJoin`, or one bounded output-scalar read after successful `C_AsyncGetID`. `C_AsyncComplete` uses its function return register as the completed `CK_RV`; it never dereferences `pResult`/`CK_ASYNC_DATA`. | Internal correlation key only; never rendered. |
 
 The only output-pointer dereferences are protocol necessities with narrow
@@ -69,6 +70,12 @@ guards:
   above. `C_AsyncComplete` performs no output-pointer dereference.
 
 Those scalars remain internal and are never serialized.
+
+Interface name bytes are discovery data, not capture output. `inspect` and an
+optional offline manifest may show the names they discovered; profile, metrics,
+and trace evidence publish only interface counts/classification consequences,
+never the bytes or their pointer. Slice 1b-1 added no pointer-derived capture
+field.
 
 ## No direct decoder
 
@@ -88,9 +95,9 @@ Input lengths are also refused unless they are one of the explicitly listed
 structural lengths used to validate an allowlisted decode. In particular,
 message/data/PIN/signature lengths are not captured.
 
-These are decoder-inventory statements. Until the safe policy is implemented,
-they do not prevent a hostile caller from placing one of these values behind a
-pointer and offset that an existing scalar decoder is allowed to follow.
+These are decoder-inventory statements. The default `allowlisted` policy's
+finite equality checks remain the boundary when a hostile caller aliases a
+metadata pointer into unrelated readable memory.
 
 ## Structural enforcement
 
@@ -102,9 +109,9 @@ pointer and offset that an existing scalar decoder is allowed to follow.
 - The pinned objects' `(ino, size, ctime)` are re-checked before and after
   attach (refuse to attach on change) and during capture; a change during
   capture sets `evidence.provider_changed` and forces `PARTIAL`. The observer
-  executes no provider code; discovery is the separate offline helper
-  `p11scope-discover` (executes the provider, opt-in, never launched by the
-  observer).
+  executes no provider code. The default discovery source is the target memory
+  scan; `p11scope-discover` is an optional offline helper that executes the
+  provider in its own process and is never launched by the observer.
 - `arg_u64` has explicit constant cases `0..=6`; descriptors requesting any
   higher argument are rejected before BPF publication.
 - `p11_entry` excludes template walking; `p11_entry_template` is attached only
@@ -114,9 +121,8 @@ pointer and offset that an existing scalar decoder is allowed to follow.
   offsets only. A failed/unknown layout emits no partial decode.
 - `walk_template` checks the type allowlist before reading `pValue` or
   `ulValueLen`, and checks `ulValueLen == 1` before dereferencing `pValue`.
-- `capture_async_target` keeps its bounded snapshot on the BPF stack. The safe
-  amendment replaces current hash-only authorization with byte-exact catalog
-  membership.
+- `capture_async_target` keeps its bounded snapshot on the BPF stack and uses
+  byte-exact catalog membership; no hash-only authorization path remains.
 - `CallStart` may temporarily hold protocol pointers required at return; the
   emitted `Event` and public render types have no raw-pointer output field.
 - Every kernel read/update failure has evidence that forces `PARTIAL` where it
@@ -124,9 +130,9 @@ pointer and offset that an existing scalar decoder is allowed to follow.
 
 ## Release canaries
 
-`scripts/verify-canaries.sh` is an existing gate, but is not sufficient for the
-amended release boundary until its malicious-alias and dual-policy lanes are
-implemented. It plants distinct sentinels
+`scripts/verify-canaries.sh` covers the default, feature-safe,
+unsafe-unvalidated, aggregate-only, malicious-alias, and policy-map freeze
+lanes. It plants distinct sentinels
 in PIN, username, key/value, label, id, plaintext, IV, AAD, signature, async,
 output-buffer, overlong-boolean, and arguments 7–9 positions. It then scans:
 
@@ -137,9 +143,9 @@ output-buffer, overlong-boolean, and arguments 7–9 positions. It then scans:
 
 The scanner first proves itself with a nonempty positive control. Any sentinel
 in any artifact fails the gate. The same run verifies both known GCM layouts,
-malformed-length refusal, and RSA-PSS scalar decoding. These ordinary-placement
-checks do not prove safety against an attacker deliberately aliasing a decoded
-pointer.
+malformed-length refusal, and RSA-PSS scalar decoding. The hostile-alias lanes
+deliberately place sentinels behind decoded pointers; the ordinary lanes
+independently cover the supported ABI shapes.
 
 Changes to `SlotSemantics`, `CallStart`, `Event`, `arg_u64`, `decode_params`,
 `walk_template`, `capture_async_target`, or public render fields require an

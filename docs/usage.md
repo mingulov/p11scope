@@ -5,12 +5,10 @@ how to run it, and what its output actually proves. Every number below
 cites the script that produced it — re-run the script to check it
 yourself.
 
-> **Status: unreleased.** Productization slice 1a: the lease/provenance/
-> hardened-oracle lane was removed (see
-> [ROADMAP.md](superpowers/plans/ROADMAP.md) → Productization); provider
-> identity is pinned by SHA-256 at attach and checked for in-place change
-> during capture (`evidence.provider_changed`). Discovery without the offline
-> helper, `run`/`inspect`/`doctor` and minimum-privilege tiers are Slice 1b.
+> **Status: unreleased.** Productization slice 1b-1 is implemented on the
+> current branch: manifest-free memory-scan discovery, `inspect`, `doctor`,
+> multi-module capture, and schema v2. Final whole-branch review and CI are
+> pending; live discovery and `run` remain Slice 1b-2.
 > See the
 > [safe metadata design](superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md)
 > and the
@@ -87,45 +85,60 @@ and are not decoded. Discovery enumerates `C_GetInterfaceList` but never calls
 
 ## Quickstart
 
-Point discovery at the *real* provider `.so`, not `p11-kit-proxy.so` —
-profiling the proxy layer attributes everything to p11-kit, not the real
-vendor library. The tool does not detect or warn about this today;
-getting it right is on the operator.
+Start with `inspect`: it shows every provider-shaped module the target maps.
+An optional `--module` only narrows that set. On the measured p11-kit stack,
+p11-kit's fixed closure array exceeds the 512-slot ceiling and is refused
+whole, while the later-fitting SoftHSM2 backend attaches; the report is
+explicitly `PARTIAL`, not a claim that the proxy layer was captured.
 
 ```bash
-# 1. Discover the provider's real function offsets (no privileges needed).
-p11scope-discover --module /usr/lib/softhsm/libsofthsm2.so -o manifest.json
+# 1. What can this host do, and what does the target map?
+p11scope doctor --pid 12345
+p11scope inspect --pid 12345
 
-# 2. Attach and aggregate over a running process or a cgroup.
-p11scope profile --manifest manifest.json --pid 12345 --duration 60 -o observed-profile.json
-p11scope profile --manifest manifest.json --cgroup /sys/fs/cgroup/kubepods.slice/... --mode metrics
+# 2. Attach and aggregate — no manifest, no helper, no provider code executed.
+sudo p11scope profile --pid 12345 --duration 60 -o observed-profile.json
 
-# 3. Or: stream one line per call for a short, bounded investigation.
-p11scope trace --manifest manifest.json --pid 12345 --duration 15
+# 3. Or stream one line per call.
+sudo p11scope trace --cgroup /sys/fs/cgroup/... --duration 15
 ```
+
+### Once-at-attach limit and optional offline discovery
+
+The memory scan runs once, while the attach plan is built. A provider
+`dlopen`ed after capture starts is therefore missed. If a suitable manifest was
+prepared while the same provider identity was available, pass it with
+`--manifest`; it is hash-matched against the pinned file and corroborated when
+the provider is already mapped. A helper run after the fact cannot repair a
+missed capture window. Without such a manifest, wait for Slice 1b-2 live
+discovery.
+
+`p11scope-discover --module <provider.so> -o manifest.json` is that optional
+offline path. It executes provider code in its own unprivileged process; the
+normal manifest-free path does not execute provider code. `--module` is also
+optional and only narrows the memory scan to named providers.
 
 ### Attaching to an existing Kubernetes pod
 
-Productization slice 1a removed the pod-attach wrapper
-(`scripts/attach-pod.sh`) along with the lease/provenance lane it relied on. A
-pod attach wrapper returns in Slice 1b; until then, resolve the pod's
-container to a host cgroup and PID yourself and use `--cgroup` as described
-below.
+`scripts/attach-pod.sh` resolves a pod/container to its host cgroup and runs the
+manifest-free `profile --cgroup` path. It copies no helper or provider into the
+pod. The operator still needs node access and the privileges described below.
 
 The application may already have mapped the provider at an unrelated ASLR
 address. That is expected: discovery converts each live table pointer to an
 ELF object identity plus file offset, and uprobes attach to that object/offset
 in the selected PID or cgroup. Virtual addresses never have to match.
 
-The helper reconstructs the table in its own unprivileged process; it does not
-read or inject into the target process. This relies on a provider build exposing
-the same file-backed function table in each process. Anonymous or JIT-generated
-helper targets are recorded as unattachable; a provider whose table changes by
-process or configuration is outside this release's completeness guarantee. The
-kernel keys each accepted uprobe to the pinned inode and offset, and the BPF
-scope guard runs before any argument read.
+The default scan reads the target's mapped table; it does not call into the
+provider. The optional helper reconstructs a table in its own unprivileged
+process and does not read or inject into the target. Its manifest is suitable
+only when that independently reconstructed table describes the same hash-pinned
+provider. Anonymous or JIT-generated targets and process-specific tables remain
+outside this release's completeness guarantee. The kernel keys each accepted
+uprobe to the pinned inode and offset, and the BPF scope guard runs before any
+argument read.
 
-Discovery always drops supplementary groups, UID/GID, and active, permitted,
+The optional helper always drops supplementary groups, UID/GID, and active, permitted,
 inheritable, and ambient capabilities before loading provider code, even when
 invoked from an elevated observer. The module and output directory must
 therefore be readable/writable by the invoking unprivileged identity (or the
@@ -133,29 +146,26 @@ therefore be readable/writable by the invoking unprivileged identity (or the
 restores Linux dumpability only to perform bounded reads through
 `/proc/self/mem`; it does not restore groups, IDs, or capabilities.
 
-Both `profile` and `trace` require `--manifest` and either `--pid` or
-`--cgroup`; `--cgroup` matches that cgroup and every descendant beneath it
+Both `profile` and `trace` require either `--pid` or `--cgroup`; `--module` and
+`--manifest` are repeatable optional discovery inputs. `--cgroup` matches that
+cgroup and every descendant beneath it
 (kernel ≥5.15 due to attach cookies), so pointing it at a container's or pod's
 directory reaches the workload's actual nested cgroup. `--duration` (bare seconds or `30s`/`5m`/`1h`) bounds
 either subcommand; Ctrl-C or SIGTERM also ends a capture cleanly (final frame
 printed, `-o` file written) instead of aborting it.
 
-Before either command builds an attach plan, manifest objects are
-structurally validated, opened once, and identity-matched (SHA-256 and, when
-present, build-id) against the file the manifest names; the accepted object
-is then pinned by file descriptor: `fstat` (inode, size, ctime) is recorded
-before the bytes are hashed and re-checked after, before and after attach —
-attach is refused if that identity changed (a best-effort change detector, not
-a byte-level guarantee) — and again during capture; a change during capture sets
-`evidence.provider_changed`, which forces the report `PARTIAL` and shows
-" · provider changed" on the live line. Renaming over or unlinking the pinned
-inode (for example, a package upgrade mid-capture) also bumps ctime, so it is
-reported the same conservative way. There is no separate discovery step the
-observer performs at attach time; the manifest produced by
-`p11scope-discover` is the only input.
+Before either command attaches, every accepted object from the scan or an
+optional manifest is opened once and pinned by file descriptor. The whole-file
+SHA-256 is taken at pin time; manifest identities are matched against it (and
+build-id when present). `fstat` (inode, size, ctime) is re-checked before and
+after attach and during capture. Attach is refused if that identity changes; a
+change during capture sets `evidence.provider_changed`, forces `PARTIAL`, and
+shows " · provider changed" on the live line. Renaming over or unlinking the
+pinned inode is reported by the same conservative check.
 
-**Real output**, `profile --mode metrics` against a SoftHSM2 workload
-(`scripts/verify-attach-e2e.sh`):
+**Historical pre-terminal-drain output**, `profile --mode metrics` against a
+SoftHSM2 workload (`scripts/verify-attach-e2e.sh`). Current written captures
+end `PARTIAL` even with zero concrete gaps, as explained below:
 
 ```
 FUNCTION                        CALLS    ERR      p50~      p95~      p99~ IN-FLIGHT
@@ -166,9 +176,9 @@ C_DigestInit                       50      0     2.0µs     4.1µs    65.5µs   
 Evidence: 136/136 probes attached · 68 slots · 0 aliased · 0 skipped · 0 in-flight → COMPLETE
 ```
 
-**Real output**, `trace` against the same workload (`scripts/verify-attach-e2e.sh`'s
-harness, captured while writing this doc — `sess#N` is a per-capture
-pseudonym, never the provider's raw session handle):
+**Historical pre-terminal-drain output**, `trace` against the same workload
+(`scripts/verify-attach-e2e.sh`'s harness, captured while writing this doc —
+`sess#N` is a per-capture pseudonym, never the provider's raw session handle):
 
 ```
 22:25:03.790862 pid 431682 tid 431682 sess#1 C_OpenSession → CKR_OK 4.3µs
@@ -185,37 +195,31 @@ profile output. If the ring buffer drops events, it also emits an explicit
 
 ## Privileges, per environment
 
-The BPF/procfs rows below were measured on real hosts/containers/pods, using
-`capsh`/`setpriv` and dropping capabilities one at a time and recording the
-*actual* error text — not documentation claims. Full detail, including the
-docker/kind reproduction: `docs/notes/phase4-privileges.md`. This measurement
-predates productization slice 1a's removal of the lease/provenance lane;
-`scripts/matrix/verify-fork-scope.sh` still grants `CAP_LEASE` in its
-`--cgroup` lane and has not been re-run since, so the exact current minimum
-is pending re-measurement, not a fresh number.
+The current manifest-free matrix was measured on 2026-08-17 by
+`scripts/matrix/verify-fork-scope.sh`, against a same-UID non-descendant with
+SoftHSM2 already mapped. Host: kernel 7.0.0-28-generic,
+`kernel.perf_event_paranoid=4`, `kernel.yama.ptrace_scope=1`. These rows are
+Task 14 artifact evidence; Task 15 ran no new privileged experiment.
 
-| Environment | Previously measured BPF/procfs minimum |
-| --- | --- |
-| Host process (`--pid`, same-uid target) | `CAP_SYS_ADMIN` |
-| Docker / kind (`--cgroup`, cross-uid target) | `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` |
+| Effective capability set | Discovery input | Scan result | Uprobe result |
+| --- | --- | --- | --- |
+| none | memory scan | unavailable: `ptrace`; capture exits 1 at BPF map creation | not reached |
+| `CAP_BPF` + `CAP_PERFMON` | manifest | unavailable: `ptrace` | 0/136 probes |
+| `CAP_SYS_ADMIN` | manifest | unavailable: `ptrace` | 136/136 probes |
+| `CAP_SYS_ADMIN` | memory scan | unavailable: `ptrace` | 0 probes planned/attached |
+| `CAP_SYS_ADMIN` + `CAP_SYS_PTRACE` | memory scan | available | 136/136 probes |
 
-Slice 1a removed the lease/provenance/hardened-oracle lane, so there is no
-`CAP_LEASE`, `fs.suid_dumpable=0`, or root-owned trusted exec dir requirement
-today — the tool runs with BPF capabilities plus, for cross-uid targets,
-`CAP_SYS_PTRACE`.
+On this host, `CAP_SYS_ADMIN` is required for uprobe attach;
+`CAP_BPF`+`CAP_PERFMON` does not suffice under `perf_event_paranoid=4`.
+Manifest-free scanning of this same-UID non-descendant additionally needs
+`CAP_SYS_PTRACE`. A target that is a descendant of the observer, a target that
+opts in with `PR_SET_PTRACER`, or a permissive Yama policy can remove that
+additional scan requirement. Cross-UID targets remain subject to the same
+ptrace access check. These are host-specific measurements, not a portable
+promise; run `p11scope doctor --pid <pid>` against the actual target.
 
-`CAP_BPF`+`CAP_PERFMON` alone is documented upstream as sufficient for
-BPF+uprobe work without `CAP_SYS_ADMIN` — measured here, it is **not**
-enough on a host with `kernel.perf_event_paranoid = 4` (an Ubuntu
-hardening level beyond upstream's documented 0-3 range that requires
-`CAP_SYS_ADMIN` specifically). This is a real, measured, host-specific
-fact — check `sysctl kernel.perf_event_paranoid` on your own host before
-assuming it generalizes (`docs/notes/phase4-privileges.md`).
-
-Docker/kind need the extra `CAP_SYS_PTRACE` because the observer runs on
-the host and reaches into the target's `/proc/<pid>/root`; procfs gates
-that path via `ptrace_may_access`, independent of the target file's own
-permissions.
+There is no `CAP_LEASE`, `fs.suid_dumpable=0`, or root-owned trusted exec dir
+requirement.
 
 ## Kernel floor and unsupported environments
 
@@ -332,15 +336,14 @@ Every `observed-profile.json` carries an `evidence` section
 (`docs/schema/observed-profile-v2.md`) ending in a `completeness` verdict:
 `"COMPLETE"` or `"PARTIAL"`.
 
-A `--manifest` is trusted operator input, not a proposed plan requiring
-re-discovery. Every object is structurally validated, opened once, and
-identity-matched (whole-file SHA-256, and GNU build-id when present) against
-the file the manifest names, then pinned by file descriptor; offsets must
-land in executable ELF segments. `fstat` (inode, size, ctime) is re-checked
-before and after attach — attach is refused on a mismatch — and again during
-capture, where a change sets `evidence.provider_changed` and forces the
-report `PARTIAL` instead of tearing the capture down. Inputs are capped at a
-16 MiB manifest, 256 MiB per object, and 512 MiB across all objects.
+Discovery normally scans the target's mapped memory. An optional `--manifest`
+is trusted operator input, structurally validated and corroborated against the
+scan when possible. Every accepted object is opened once, hash-matched and
+pinned by file descriptor; offsets must land in executable ELF segments.
+`fstat` (inode, size, ctime) is re-checked before and after attach — attach is
+refused on a mismatch — and during capture, where a change sets
+`evidence.provider_changed` and forces `PARTIAL`. Inputs are capped at a 16 MiB
+manifest, 256 MiB per object, and 512 MiB across all objects.
 
 **`COMPLETE`** requires that discovery found a module and planned a slot in
 it, that the memory scan could read every target, that no module was refused

@@ -10,12 +10,12 @@ table (including stripped providers with no `C_*` symbols), attaches probes by
 file offset, and produces a versioned `observed-profile.json` for migration
 assessment and incident diagnostics.
 
-> **Status: unreleased.** Productization slice 1a: the lease/provenance/
-> hardened-oracle lane was removed (see
-> [ROADMAP.md](docs/superpowers/plans/ROADMAP.md) → Productization); provider
-> identity is pinned by SHA-256 at attach and checked for in-place change
-> during capture (`evidence.provider_changed`). Discovery without the offline
-> helper, `run`/`inspect`/`doctor` and minimum-privilege tiers are Slice 1b.
+> **Status: unreleased.** Productization slice 1b-1 is implemented on the
+> current branch: manifest-free memory-scan discovery, `inspect`, `doctor`,
+> multi-module capture, and schema v2. Provider identity is pinned by SHA-256
+> at attach and checked for in-place change during capture
+> (`evidence.provider_changed`). Final whole-branch review and CI are pending;
+> live discovery and `run` remain Slice 1b-2.
 
 Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40
 table, and standard 3.0, 3.1, and 3.2 interfaces (all 104 slots published in
@@ -42,11 +42,16 @@ quantitative claim there cites the script that measured it).
   `pkcs11-lab` to validate a candidate provider against real usage:
 
   ```bash
-  p11scope-discover --module /opt/vendor/lib/pkcs11.so -o manifest.json
-  p11scope profile --manifest manifest.json --pid 12345 -o observed-profile.json
+  p11scope doctor --pid 12345
+  p11scope inspect --pid 12345
+  sudo p11scope profile --pid 12345 -o observed-profile.json
   pkcs11-check test --module /opt/candidate/lib/pkcs11.so --output-file candidate.json
   pkcs11-lab assess --profile observed-profile.json --results candidate.json
   ```
+
+  `p11scope-discover` remains available as an optional offline path when a
+  suitable manifest can be prepared for a provider the memory scan cannot
+  read; the normal path does not execute provider code.
 
   Full quickstart, real command output, and `trace` mode:
   [docs/usage.md](docs/usage.md#quickstart).
@@ -85,9 +90,11 @@ for the CLI, live output, trace lines, and an example `observed-profile.json`.
 ## Honest claims
 
 - Zero application changes, no PKCS#11 interposition, attachable to running
-  processes and containers (via a reusable manifest whose attach mapping is
-  freshly reproduced — calls *before* attach are
-  outside the capture window; there is no v1 mid-run auto-discovery). **Not**
+  processes and containers. Discovery scans mapped providers once, at attach;
+  calls *before* attach are outside the capture window, and a provider loaded
+  later is missed. A suitable manifest can supply offsets when one already
+  exists and can be hash-matched (and corroborated when the provider is
+  mapped); otherwise wait for Slice 1b-2 live discovery. **Not**
   "undetectable", **not** zero overhead: measured at roughly a **5x
   wall-clock slowdown** against unobserved SoftHSM2 — deliberately the worst
   case, since its microsecond-scale software crypto makes probe overhead
@@ -95,25 +102,22 @@ for the CLI, live output, trace lines, and an example `observed-profile.json`.
   against a millisecond-scale network HSM
   (`scripts/bench-overhead.sh`, `docs/notes/phase5-overhead.md`; full numbers
   and the event-loss finding at high call rates: [docs/usage.md](docs/usage.md#overhead-measured)).
-- Requires elevated privileges, kernel-version-dependent, x86-64 first.
-  Productization slice 1a removed the lease/provenance lane, so the
-  requirement is now just BPF capabilities — `CAP_BPF`+`CAP_PERFMON`, or
-  `CAP_SYS_ADMIN` on hosts where `kernel.perf_event_paranoid` is 3 or higher
-  (Ubuntu's default is 4) — plus `CAP_SYS_PTRACE` for cross-UID targets
-  reached through `/proc/<pid>/root`. No `CAP_LEASE`, no
-  `fs.suid_dumpable=0`, no root-owned trusted exec dir. The `--cgroup` lane in
-  `scripts/matrix/verify-fork-scope.sh` still grants `CAP_LEASE` and has
-  **not** been re-measured since the lane was removed, so treat its exact
-  minimum as pending re-measurement, not a fresh number. Every live lane that
-  *was* rerun ran as root
+- Requires elevated privileges, kernel-version-dependent, x86-64 first. On the
+  measured host (`kernel.perf_event_paranoid=4`,
+  `kernel.yama.ptrace_scope=1`), uprobe attach required `CAP_SYS_ADMIN`;
+  `CAP_BPF`+`CAP_PERFMON` did not suffice. Manifest-free scanning of a same-UID
+  non-descendant additionally required `CAP_SYS_PTRACE`, or equivalently a
+  descendant target / permissive ptrace policy. No `CAP_LEASE`, no
+  `fs.suid_dumpable=0`, no root-owned trusted exec dir
   ([docs/usage.md](docs/usage.md#privileges-per-environment)).
   Kernel floor ≥5.15; on an unsupported environment the tool fails with a
   named cause and a hint, never a panic or a raw verifier dump
   (`docs/notes/phase5-unsupported.md`).
-- Point it at the **real** provider `.so`, not `p11-kit-proxy.so` — profiling
-  the proxy layer attributes everything to p11-kit, not the real vendor
-  library. The tool does not detect or warn about this today; getting it
-  right is on the operator.
+- `inspect` shows every provider-shaped module mapped by the target; an
+  optional `--module` only narrows that set. On the measured p11-kit stack,
+  p11-kit's fixed closure array exceeds the 512-slot ceiling and is refused
+  whole, while the later-fitting SoftHSM2 backend attaches; the report is
+  explicitly `PARTIAL`, not a claim that the proxy layer was captured.
 - **Profiles, never replays.** It has only the bounded metadata decoders listed
   in the field allowlist and no intentional secret/buffer decoder. Under the
   default `allowlisted` policy this holds against hostile pointer placement,
@@ -155,11 +159,11 @@ inode metadata, and identical bytes do not prove physical identity across separa
 overlay instances, so every such collapse is published as uncertainty and forces
 `PARTIAL`; a distinct byte-identical instance could otherwise be under-counted.
 
-Discovery uses a small unprivileged helper (`p11scope-discover`) that you copy
-into the target container (`docker cp`/`kubectl cp`, then `exec`); it dlopens
-the provider in the container's own view and prints a manifest the observer
-attaches from. Privilege dropping is enforced before provider loading, even
-when discovery is launched by an elevated observer.
+The normal path scans provider tables already mapped in the target and executes
+no provider code. A provider `dlopen`ed after attach is not discovered. The
+optional unprivileged helper (`p11scope-discover`) can prepare a manifest
+offline while the same provider identity is available; a manifest cannot be
+conjured after a missed capture to make that window complete.
 
 Provider identity is pinned by SHA-256 at attach and re-checked (`fstat`
 ino/size/ctime) before, during, and after capture; a change during capture
@@ -167,9 +171,10 @@ sets `evidence.provider_changed`, which forces the report `PARTIAL`. Profile
 output is published atomically (private temp beside the target, fsync,
 rename).
 
-The helper recreates that table in its own process; it never reads or injects
-into the observed process. Uprobes are bound to the verified target inode and
-file offset, and the PID/cgroup guard executes before argument capture.
+When used, the helper recreates the table in its own process; it never reads or
+injects into the observed process. Uprobes are bound to the verified target
+inode and file offset, and the PID/cgroup guard executes before argument
+capture.
 
 ## Project family
 

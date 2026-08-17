@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — productization slice 1b-1
+
+- **Discovery**: `profile` and `trace` scan the target's mapped memory once at
+  attach, so neither a manifest nor the offline helper is required. Repeatable
+  `--module` hints and `--manifest` inputs are optional; manifests are
+  corroborated against the scan when possible.
+- **Diagnostics**: `inspect --pid` reports mapped providers, table surfaces,
+  interface discovery and pinned file identities without loading BPF;
+  `doctor` probes host/target scan, BPF and uprobe availability before capture.
+- **Multiple modules**: one capture plan can attach several providers, with
+  module-scoped session/operation/async state and explicit count-only evidence
+  when two modules publish the same target.
+- **Evidence**: profile and metrics schemas are now
+  `pkcs11-scope/observed-profile/v2` and `v2-metrics`, with
+  `capture.modules[]`, per-function module identity, `evidence.discovery[]`,
+  `authority: "hash-pinned"`, and explicit scan/corroboration/capacity gaps.
+- **Known limit**: the memory scan runs only once, while attaching. A provider
+  loaded later is missed; use a suitable pre-existing manifest when available
+  and hash-matchable, or wait for Slice 1b-2 live discovery.
+
 ## Unreleased — productization slice 1a
 
 Trust simplification. The lease/provenance/hardened-oracle authorization lane

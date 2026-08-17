@@ -398,7 +398,24 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     helper, multi-module plans and per-module semantic state, `--module`/`--manifest`
     optional, evidence `discovery[]`/`authority`, schema v2. The eBPF object is unchanged.
     Scanning happens once at attach time; a module loaded later is not discovered (1b-2).
-    **Status: IN PROGRESS (started 2026-08-16).**
+    **Status (2026-08-17): implementation tasks and their task-local reviews are complete on
+    the recovery branch; this Task 15 commit reconciles the documentation, and final
+    whole-branch review is pending. Range `3b7c067..fdde185` is 37 code commits,
+    plus this Task 15 documentation commit; combined delta across the 38 commits is 57 files,
+    13,463 insertions, 1,348 deletions (net +12,115 lines). Fresh Task 15 verification: the
+    four Rust checks passed (295 tests, 0 failed) and `scripts/verify-inspect-doctor.sh`
+    reported `ALL OK`. Owner-approved root artifact evidence from Tasks 14, 16,
+    and 17: `scripts/gates.sh`, `build-release.sh`, and matrix docker,
+    fork-scope, oracle, kind-pod, and Knative lanes passed in Task 14; shared-layer passed
+    after Task 16 with one published overlay physical-identity uncertainty (therefore
+    `PARTIAL`); proxy-stack passed after Task 17 via the exact capacity fallback (p11-kit
+    refused whole needing 5762 more than the 512-slot ceiling, later-fitting SoftHSM2
+    attached at 68 slots / 136 probes, `PARTIAL`). `verify-discover-containers.sh` and
+    `bench-overhead.sh`: UNRUN.
+    Privileges measured at `perf_event_paranoid=4`, `ptrace_scope=1`: uprobe attach required
+    `CAP_SYS_ADMIN`; a same-UID non-descendant manifest-free scan additionally required
+    `CAP_SYS_PTRACE` or a descendant/ptrace-policy change. CI: UNRUN/PENDING — this branch was
+    not pushed and no run was observed.**
   - **Slice 1b-2 — live discovery and `run`**: BPF loader (`_dl_debug_state`) and export
     uretprobes, `DESCRIPTORS` + attach-cookie semantics with dynamic slot allocation,
     `discovery::Engine`, `pause.rs`, `run -- cmd`, `attach_gap_ms`, mid-capture

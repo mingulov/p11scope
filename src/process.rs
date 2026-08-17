@@ -376,10 +376,14 @@ impl PidPin {
     /// False when the process exited or the pid was reused since `open`.
     pub fn still_the_same(&self) -> bool {
         match &self.pidfd {
-            Some(fd) => !pidfd_ready(fd).unwrap_or(false),
+            Some(fd) => pidfd_still_same_with(|| pidfd_ready(fd)),
             None => process_start_time(self.pid).ok() == self.start_time,
         }
     }
+}
+
+fn pidfd_still_same_with(ready: impl FnOnce() -> io::Result<bool>) -> bool {
+    matches!(ready(), Ok(false))
 }
 
 fn raise_nofile() -> io::Result<usize> {
@@ -541,6 +545,17 @@ mod tests {
             !later_action,
             "no later target action may follow the mismatch"
         );
+    }
+
+    /// Mutation caught: treating a failed pidfd readiness check as `Ok(false)`
+    /// would authorize a process generation whose identity could not be verified.
+    #[test]
+    fn a_pidfd_poll_error_is_never_generation_evidence() {
+        assert!(pidfd_still_same_with(|| Ok(false)));
+        assert!(!pidfd_still_same_with(|| Ok(true)));
+        assert!(!pidfd_still_same_with(|| {
+            Err(io::Error::from(io::ErrorKind::Interrupted))
+        }));
     }
 
     #[test]

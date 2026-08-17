@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::{AsRawFd as _, RawFd};
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use p11scope_manifest::identity::{
     IdentityKind, MappingFileKey, ObjectIdentity, inspect_file, inspect_file_with_reader,
@@ -86,11 +87,11 @@ fn normalize_target_path(path: &str) -> Option<String> {
     normalized.to_str().map(str::to_string)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Entry {
     raw: RawObjectInstance,
     mapping: MappingFileKey,
-    file: std::fs::File,
+    file: Arc<std::fs::File>,
     pin: Pin,
     path: String,
     sha256: String,
@@ -133,7 +134,7 @@ impl Entry {
             overlay: on_overlayfs(file.as_raw_fd())?,
             raw,
             mapping,
-            file,
+            file: Arc::new(file),
             pin,
             path,
             // `inspect_file` always records a whole-file digest.
@@ -207,7 +208,7 @@ pub struct ReconciledModule {
 /// No read leases are held:
 /// `check_unchanged` is a cheap, best-effort check, not a guarantee that the bytes
 /// cannot change between the check and Aya's attach.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PinnedObjects {
     by_id: BTreeMap<PinnedObjectId, Entry>,
     raw_to_id: BTreeMap<RawObjectInstance, PinnedObjectId>,
@@ -215,6 +216,7 @@ pub struct PinnedObjects {
     ambiguous_keys: BTreeSet<ObjectKey>,
     ambiguity_published: BTreeSet<ObjectKey>,
     ownership: BTreeMap<ProcessViewId, ViewClaims>,
+    raw_ownership: BTreeMap<ProcessViewId, BTreeSet<RawObjectInstance>>,
     next_id: u32,
     /// Latched by `check_unchanged` the first time any pin differs.
     changed: std::cell::Cell<bool>,
@@ -231,6 +233,7 @@ impl PinnedObjects {
             ambiguous_keys: BTreeSet::new(),
             ambiguity_published: BTreeSet::new(),
             ownership: BTreeMap::new(),
+            raw_ownership: BTreeMap::new(),
             next_id: 0,
             changed: std::cell::Cell::new(false),
         }
@@ -239,6 +242,7 @@ impl PinnedObjects {
     /// Folds another pin set into this capture. Exact comparable identities merge;
     /// an equal raw `ObjectKey` with any unequal full identity rejects the whole group.
     pub fn absorb(&mut self, other: PinnedObjects) -> Vec<Skipped> {
+        let other_raw_ownership = other.raw_ownership;
         let mut entries = other.by_id;
         let mut raws: BTreeMap<PinnedObjectId, Vec<RawObjectInstance>> = BTreeMap::new();
         for (raw, id) in other.raw_to_id {
@@ -287,6 +291,12 @@ impl PinnedObjects {
                     .filter(|id| self.by_id.contains_key(id)),
             );
         }
+        for (view, raws) in other_raw_ownership {
+            self.raw_ownership.entry(view).or_default().extend(
+                raws.into_iter()
+                    .filter(|raw| self.raw_to_id.contains_key(raw)),
+            );
+        }
         self.changed.set(self.changed.get() || other.changed.get());
         self.publish_ambiguities(&mut skipped);
         skipped
@@ -323,6 +333,19 @@ impl PinnedObjects {
     /// were removed so the caller can rebuild its plan from the remaining modules.
     pub fn remove_view(&mut self, view: ProcessViewId) -> Option<ViewClaims> {
         let removed = self.ownership.remove(&view)?;
+        let removed_raws = self.raw_ownership.remove(&view).unwrap_or_default();
+        let retained_raws: BTreeSet<_> = self
+            .raw_ownership
+            .values()
+            .flatten()
+            .cloned()
+            .chain(
+                self.raw_to_id
+                    .keys()
+                    .filter(|raw| raw.mount_namespace.is_none())
+                    .cloned(),
+            )
+            .collect();
         let candidates: BTreeSet<_> = removed
             .tables
             .iter()
@@ -349,7 +372,9 @@ impl PinnedObjects {
             .collect();
         let unowned: BTreeSet<_> = candidates.difference(&retained).copied().collect();
         self.by_id.retain(|id, _| !unowned.contains(id));
-        self.raw_to_id.retain(|_, id| !unowned.contains(id));
+        self.raw_to_id.retain(|raw, id| {
+            !unowned.contains(id) && (!removed_raws.contains(raw) || retained_raws.contains(raw))
+        });
         Some(removed)
     }
 
@@ -507,6 +532,9 @@ impl PinnedObjects {
         self.by_id.retain(|id, _| !ids.contains(id));
         self.raw_to_id
             .retain(|raw, id| raw.key != key && !ids.contains(id));
+        for raws in self.raw_ownership.values_mut() {
+            raws.retain(|raw| raw.key != key);
+        }
         for claims in self.ownership.values_mut() {
             claims.remove(&ids);
         }
@@ -837,7 +865,7 @@ pub fn pin_scanned_view_objects(
             return Err(exited());
         }
         let candidate = pin_scanned_object(view, raw.clone(), budget);
-        record_scanned_candidate(&mut pinned, raw, candidate, &mut skipped);
+        record_scanned_candidate(&mut pinned, view.id(), raw, candidate, &mut skipped);
     }
     if !view.still_the_same() {
         return Err(exited());
@@ -847,13 +875,17 @@ pub fn pin_scanned_view_objects(
 
 fn record_scanned_candidate(
     pinned: &mut PinnedObjects,
+    view: ProcessViewId,
     raw: RawObjectInstance,
     candidate: Result<Entry, String>,
     skipped: &mut Vec<Skipped>,
 ) {
     match candidate {
         Ok(entry) => {
-            pinned.insert_entry(entry, skipped);
+            if let Some(id) = pinned.insert_entry(entry, skipped) {
+                pinned.ownership.entry(view).or_default().pins.push(id);
+                pinned.raw_ownership.entry(view).or_default().insert(raw);
+            }
         }
         Err(reason) => {
             // A missing mapping identity or digest makes every equal raw-key
@@ -1086,7 +1118,7 @@ mod tests {
             let entry = Entry {
                 raw,
                 mapping,
-                file: std::fs::File::open("/dev/null").unwrap(),
+                file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
                 pin: Pin {
                     ino: key.inode,
                     size: 4096,
@@ -1128,6 +1160,7 @@ mod tests {
             });
             record_scanned_candidate(
                 &mut pins,
+                ProcessViewId(*view as u32),
                 raw.clone(),
                 Err(format!("/private/view-{view}.so: unavailable")),
                 &mut skipped,
@@ -1204,15 +1237,23 @@ mod tests {
             if unavailable_first {
                 record_scanned_candidate(
                     &mut pinned,
+                    ProcessViewId(0),
                     raw.clone(),
                     Err("mapping identity unavailable".into()),
                     &mut skipped,
                 );
             }
-            record_scanned_candidate(&mut pinned, raw.clone(), Ok(entry), &mut skipped);
+            record_scanned_candidate(
+                &mut pinned,
+                ProcessViewId(0),
+                raw.clone(),
+                Ok(entry),
+                &mut skipped,
+            );
             if !unavailable_first {
                 record_scanned_candidate(
                     &mut pinned,
+                    ProcessViewId(0),
                     raw,
                     Err("mapping identity unavailable".into()),
                     &mut skipped,
@@ -1258,6 +1299,7 @@ mod tests {
             });
             record_scanned_candidate(
                 &mut pins,
+                ProcessViewId(view as u32),
                 raw,
                 Err(format!(
                     "/private/view-{view}.so: ROUND1_UNAVAILABLE_ERROR_{view}"

@@ -20,9 +20,9 @@ use p11scope::process::{ProcessView, ProcessViewId};
 use p11scope::{doctor, events, inspect, metrics, plan, process, render, scope, semantics, trace};
 use p11scope_manifest::manifest::{Manifest, Resolution, SCHEMA};
 use p11scope_manifest::maps::ObjectKey;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Seek as _, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -183,6 +183,17 @@ struct Discovered {
     counters: DiscoveryCounters,
     corroborated: BTreeSet<(ProcessViewId, ObjectKey)>,
     identity_mismatches: usize,
+    scan_modules: Vec<ScannedModule>,
+    scan_pins: PinnedObjects,
+    manifest_inputs: Vec<ManifestInput>,
+    base_counters: DiscoveryCounters,
+    view_counters: BTreeMap<ProcessViewId, DiscoveryCounters>,
+}
+
+struct ManifestInput {
+    path: PathBuf,
+    manifest: Manifest,
+    pins: PinnedObjects,
 }
 
 /// How many processes of a `--cgroup` discovery scans.
@@ -193,7 +204,7 @@ const MAX_SCAN_PIDS: usize = 256;
 
 /// What the discovery pass learned besides the plan itself — everything
 /// `discovery_evidence` needs that the plan does not already carry.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct DiscoveryCounters {
     /// Manifest modules the scan contradicted; the union is attached (spec §4.12).
     conflicts: u64,
@@ -600,19 +611,20 @@ fn discover_plan(
     mut named_view: Option<ProcessView>,
 ) -> Result<Discovered> {
     let mut budget = CaptureWorkBudget::default();
-    let mut counters = DiscoveryCounters::default();
+    let mut base_counters = DiscoveryCounters::default();
+    let mut view_counters = BTreeMap::new();
     let (pids, unlisted) = scope_pids(scope);
-    counters.object_skips.extend(unlisted);
+    base_counters.object_skips.extend(unlisted);
     // The pid the operator named is the capture; a cgroup's processes are many,
     // however few happen to be in it right now.
     let named = matches!(scope, Scope::Pid(_));
-    let mut modules: Vec<ScannedModule> = Vec::new();
-    let mut pinned = PinnedObjects::empty();
+    let mut scan_modules = Vec::new();
+    let mut scan_pins = PinnedObjects::empty();
     let mut views = Vec::new();
     if pids.len() > MAX_SCAN_PIDS {
         // Published, not just noted: a provider mapped only by a process past the
         // cap is undiscovered, unprobed, and has nothing else to show for it.
-        counters.object_skips.push(Skipped {
+        base_counters.object_skips.push(Skipped {
             subject: scope_label(scope),
             reason: format!(
                 "{} processes in scope; discovery scanned the first {MAX_SCAN_PIDS} — a \
@@ -634,17 +646,19 @@ fn discover_plan(
             Ok(view) => view,
             Err(error) if named => return Err(anyhow!(error)),
             Err(error) => {
-                counters.object_skips.push(Skipped {
+                base_counters.object_skips.push(Skipped {
                     subject: "process view".into(),
                     reason: format!("the process generation could not be pinned: {error}"),
                 });
                 continue;
             }
         };
+        let mut counters = DiscoveryCounters::default();
         match scan_and_pin(&view, a, &mut budget, &mut counters) {
             Ok((found, pins)) => {
-                counters.object_skips.extend(pinned.absorb(pins));
-                modules.extend(found);
+                base_counters.object_skips.extend(scan_pins.absorb(pins));
+                scan_modules.extend(found);
+                view_counters.insert(view.id(), counters);
                 views.push(view);
             }
             // The pid the operator named *is* the capture; any other is one of many
@@ -653,7 +667,11 @@ fn discover_plan(
             Err(error) if named => return Err(error),
             Err(error) => {
                 eprintln!("p11scope: discovery skipped pid {pid}: {error:#}");
-                counters.object_skips.push(Skipped {
+                base_counters.scan_unavailable =
+                    base_counters.scan_unavailable.or(counters.scan_unavailable);
+                base_counters.scan_ms += counters.scan_ms;
+                base_counters.object_skips.extend(counters.object_skips);
+                base_counters.object_skips.push(Skipped {
                     subject: format!("pid {pid}"),
                     reason: format!("the process could not be scanned: {error:#}"),
                 });
@@ -661,18 +679,11 @@ fn discover_plan(
         }
     }
 
-    let mut accepted: Vec<Manifest> = Vec::new();
-    let mut corroborated = BTreeSet::new();
-    // Only §4.12's identity mismatch: a manifest whose bytes are not the mapped
-    // object's. Distinct from `counters.uncorroborated`, which counts manifests that
-    // were *accepted* with nothing to corroborate them.
-    let mut identity_mismatches = 0usize;
+    let mut manifest_inputs = Vec::new();
     for path in &a.manifests {
-        // Both `?`s below leave discovery: the notes accumulated so far are most
-        // useful exactly here, so they are printed before either returns.
-        let mut manifest = read_manifest_file(path).inspect_err(|_| counters.report_notes())?;
-        let manifest_pins = pin_manifest_objects(&manifest).map_err(|problems| {
-            counters.report_notes();
+        let manifest = read_manifest_file(path).inspect_err(|_| base_counters.report_notes())?;
+        let pins = pin_manifest_objects(&manifest).map_err(|problems| {
+            base_counters.report_notes();
             for problem in &problems {
                 eprintln!("p11scope: {problem}");
             }
@@ -681,151 +692,39 @@ fn discover_plan(
                 path.display()
             )
         })?;
-        let view = scan_view(&manifest, &modules, &pinned, &manifest_pins);
-        let mapped = view
-            .as_ref()
-            .and_then(|view| view.modules.first())
-            .map(|module| module.key);
-        let view_owners: BTreeSet<_> = view
-            .as_ref()
-            .into_iter()
-            .flat_map(|view| &view.modules)
-            .map(|module| module.view)
-            .collect();
-        let scan_targets = view
-            .as_ref()
-            .and_then(|view| scanned_targets(&view.modules, &pinned));
-        let own_targets = manifest_targets(&manifest, &manifest_pins);
-        let scan_empty = view.as_ref().is_some_and(|view| {
-            view.modules
-                .iter()
-                .flat_map(|module| &module.tables)
-                .all(|table| table.entries.is_empty())
+        manifest_inputs.push(ManifestInput {
+            path: path.clone(),
+            manifest,
+            pins,
         });
-        let outcome = corroborate(
-            counters.scan_unavailable.is_some(),
-            view.as_ref().map(|view| view.agrees),
-            scan_targets
-                .as_ref()
-                .zip(own_targets.as_ref())
-                .is_some_and(|(scan, own)| pinned.exactly_same_targets(scan, &manifest_pins, own)),
-            scan_empty,
-        );
-        if let Some(key) = mapped {
-            counters
-                .corroboration
-                .push((view_owners, key, corroboration_label(outcome)));
-        }
-        match outcome {
-            // Every offset it carries is already in the plan; nothing to add but the
-            // fact that a second source said the same thing.
-            Corroboration::Agreed => {
-                corroborated.extend(
-                    view.as_ref()
-                        .into_iter()
-                        .flat_map(|view| &view.modules)
-                        .map(|module| (module.view, module.key)),
-                );
-            }
-            Corroboration::ScanEmpty => {
-                // Not marked corroborated: nothing confirmed these offsets, so the
-                // module is counted as uncorroborated and the capture is PARTIAL.
-                counters.notes.push(format!(
-                    "the memory scan decoded no function table in {}; attaching the \
-                     offsets manifest {} records, uncorroborated",
-                    manifest.module_path,
-                    path.display(),
-                ));
-                retarget_to_pins(
-                    &mut manifest,
-                    view.as_ref().map_or(&[], |view| view.modules.as_slice()),
-                    &pinned,
-                    &manifest_pins,
-                );
-                accepted.push(manifest);
-                counters.object_skips.extend(pinned.absorb(manifest_pins));
-            }
-            Corroboration::Conflict => {
-                counters.conflicts += 1;
-                counters.notes.push(format!(
-                    "manifest {} and the memory scan decoded different targets in {}; \
-                     attaching the union of both",
-                    path.display(),
-                    manifest.module_path
-                ));
-                corroborated.extend(
-                    view.as_ref()
-                        .into_iter()
-                        .flat_map(|view| &view.modules)
-                        .map(|module| (module.view, module.key)),
-                );
-                retarget_to_pins(
-                    &mut manifest,
-                    view.as_ref().map_or(&[], |view| view.modules.as_slice()),
-                    &pinned,
-                    &manifest_pins,
-                );
-                accepted.push(manifest);
-                counters.object_skips.extend(pinned.absorb(manifest_pins));
-            }
-            Corroboration::Uncorroborated => {
-                // No scan pin to prefer, but the recorded identity is still not one of
-                // this capture's: it becomes the manifest's own pin.
-                retarget_to_pins(&mut manifest, &[], &pinned, &manifest_pins);
-                accepted.push(manifest);
-                counters.object_skips.extend(pinned.absorb(manifest_pins));
-            }
-            Corroboration::IdentityMismatch => {
-                identity_mismatches += 1;
-                counters.notes.push(format!(
-                    "ignoring manifest {}: the {} mapped in the target does not hash to \
-                     the sha256 it records",
-                    path.display(),
-                    manifest.module_path
-                ));
-            }
-        }
     }
 
-    counters.report_notes();
-
-    let (modules, collapsed, differed) = reconcile_scanned_modules(&modules, &mut pinned);
-    if collapsed > 0 {
-        eprintln!(
-            "p11scope: discovery: {collapsed} matching overlay mapping(s) were collapsed \
-             onto one attach target; physical identity is not provable, so published \
-             uncertainty makes this capture PARTIAL"
-        );
-    }
-    counters.object_skips.extend(differed);
-
-    let plan = build_current_plan(
-        &modules,
-        &accepted,
-        &pinned,
-        &mut counters,
-        &corroborated,
-        identity_mismatches,
-    )?;
-    for refused in &plan.modules_skipped {
+    let mut discovered = Discovered {
+        plan: plan::build_from_reconciled_modules(&[]),
+        pinned: PinnedObjects::empty(),
+        discovery: render::DiscoveryEvidence::default(),
+        views,
+        modules: Vec::new(),
+        manifests: Vec::new(),
+        counters: DiscoveryCounters::default(),
+        corroborated: BTreeSet::new(),
+        identity_mismatches: 0,
+        scan_modules,
+        scan_pins,
+        manifest_inputs,
+        base_counters,
+        view_counters,
+    };
+    rebuild_discovered(&mut discovered)?;
+    discovered.counters.report_notes();
+    for refused in &discovered.plan.modules_skipped {
         eprintln!(
             "p11scope: module refused: {} — {}",
             refused.subject, refused.reason
         );
     }
-    counters.report(&plan);
-    let discovery = discovery_evidence(&plan, &pinned, &counters);
-    Ok(Discovered {
-        plan,
-        pinned,
-        discovery,
-        views,
-        modules,
-        manifests: accepted,
-        counters,
-        corroborated,
-        identity_mismatches,
-    })
+    discovered.counters.report(&discovered.plan);
+    Ok(discovered)
 }
 
 fn build_current_plan(
@@ -1139,17 +1038,153 @@ fn module_label(plan: &plan::AttachPlan) -> String {
 const STALE_VIEW_REASON: &str = "accepted process generation changed during attach preparation; its discovery claims were removed";
 
 fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
+    let mut counters = discovered.base_counters.clone();
+    for view in discovered.view_counters.values() {
+        counters.scan_unavailable = counters.scan_unavailable.or(view.scan_unavailable);
+        counters.scan_ms += view.scan_ms;
+        counters.object_skips.extend(view.object_skips.clone());
+    }
+    let mut pinned = discovered.scan_pins.clone();
+    let mut accepted = Vec::new();
+    let mut corroborated = BTreeSet::new();
+    let mut identity_mismatches = 0usize;
+    for input in &discovered.manifest_inputs {
+        let mut manifest = input.manifest.clone();
+        let manifest_pins = &input.pins;
+        let view = scan_view(&manifest, &discovered.scan_modules, &pinned, manifest_pins);
+        let mapped = view
+            .as_ref()
+            .and_then(|view| view.modules.first())
+            .map(|module| module.key);
+        let view_owners: BTreeSet<_> = view
+            .as_ref()
+            .into_iter()
+            .flat_map(|view| &view.modules)
+            .map(|module| module.view)
+            .collect();
+        let scan_targets = view
+            .as_ref()
+            .and_then(|view| scanned_targets(&view.modules, &pinned));
+        let own_targets = manifest_targets(&manifest, manifest_pins);
+        let scan_empty = view.as_ref().is_some_and(|view| {
+            view.modules
+                .iter()
+                .flat_map(|module| &module.tables)
+                .all(|table| table.entries.is_empty())
+        });
+        let outcome = corroborate(
+            counters.scan_unavailable.is_some(),
+            view.as_ref().map(|view| view.agrees),
+            scan_targets
+                .as_ref()
+                .zip(own_targets.as_ref())
+                .is_some_and(|(scan, own)| pinned.exactly_same_targets(scan, manifest_pins, own)),
+            scan_empty,
+        );
+        if let Some(key) = mapped {
+            counters
+                .corroboration
+                .push((view_owners, key, corroboration_label(outcome)));
+        }
+        match outcome {
+            Corroboration::Agreed => {
+                corroborated.extend(
+                    view.as_ref()
+                        .into_iter()
+                        .flat_map(|view| &view.modules)
+                        .map(|module| (module.view, module.key)),
+                );
+            }
+            Corroboration::ScanEmpty => {
+                counters.notes.push(format!(
+                    "the memory scan decoded no function table in {}; attaching the \
+                     offsets manifest {} records, uncorroborated",
+                    manifest.module_path,
+                    input.path.display(),
+                ));
+                retarget_to_pins(
+                    &mut manifest,
+                    view.as_ref().map_or(&[], |view| view.modules.as_slice()),
+                    &pinned,
+                    manifest_pins,
+                );
+                accepted.push(manifest);
+                counters
+                    .object_skips
+                    .extend(pinned.absorb(manifest_pins.clone()));
+            }
+            Corroboration::Conflict => {
+                counters.conflicts += 1;
+                counters.notes.push(format!(
+                    "manifest {} and the memory scan decoded different targets in {}; \
+                     attaching the union of both",
+                    input.path.display(),
+                    manifest.module_path
+                ));
+                corroborated.extend(
+                    view.as_ref()
+                        .into_iter()
+                        .flat_map(|view| &view.modules)
+                        .map(|module| (module.view, module.key)),
+                );
+                retarget_to_pins(
+                    &mut manifest,
+                    view.as_ref().map_or(&[], |view| view.modules.as_slice()),
+                    &pinned,
+                    manifest_pins,
+                );
+                accepted.push(manifest);
+                counters
+                    .object_skips
+                    .extend(pinned.absorb(manifest_pins.clone()));
+            }
+            Corroboration::Uncorroborated => {
+                retarget_to_pins(&mut manifest, &[], &pinned, manifest_pins);
+                accepted.push(manifest);
+                counters
+                    .object_skips
+                    .extend(pinned.absorb(manifest_pins.clone()));
+            }
+            Corroboration::IdentityMismatch => {
+                identity_mismatches += 1;
+                counters.notes.push(format!(
+                    "ignoring manifest {}: the {} mapped in the target does not hash to \
+                     the sha256 it records",
+                    input.path.display(),
+                    manifest.module_path
+                ));
+            }
+        }
+    }
+
+    let (modules, collapsed, differed) =
+        reconcile_scanned_modules(&discovered.scan_modules, &mut pinned);
+    if collapsed > 0 {
+        eprintln!(
+            "p11scope: discovery: {collapsed} matching overlay mapping(s) were collapsed \
+             onto one attach target; physical identity is not provable, so published \
+             uncertainty makes this capture PARTIAL"
+        );
+    }
+    counters.object_skips.extend(differed);
     let plan = build_current_plan(
-        &discovered.modules,
-        &discovered.manifests,
-        &discovered.pinned,
-        &mut discovered.counters,
-        &discovered.corroborated,
-        discovered.identity_mismatches,
-    )?;
-    let discovery = discovery_evidence(&plan, &discovered.pinned, &discovered.counters);
+        &modules,
+        &accepted,
+        &pinned,
+        &mut counters,
+        &corroborated,
+        identity_mismatches,
+    )
+    .inspect_err(|_| counters.report_notes())?;
+    let discovery = discovery_evidence(&plan, &pinned, &counters);
     discovered.plan = plan;
+    discovered.pinned = pinned;
     discovered.discovery = discovery;
+    discovered.modules = modules;
+    discovered.manifests = accepted;
+    discovered.counters = counters;
+    discovered.corroborated = corroborated;
+    discovered.identity_mismatches = identity_mismatches;
     Ok(())
 }
 
@@ -1167,21 +1202,12 @@ fn remove_stale_views(discovered: &mut Discovered, stale: &[ProcessViewId]) -> R
         bail!("lifecycle check did not identify an accepted process view");
     }
     discovered
-        .modules
-        .retain(|module| !stale.contains(&module.scanned.view));
-    discovered
-        .corroborated
-        .retain(|(view, _)| !stale.contains(view));
-    for (views, _, _) in &mut discovered.counters.corroboration {
-        views.retain(|view| !stale.contains(view));
-    }
-    discovered
-        .counters
-        .corroboration
-        .retain(|(views, _, _)| !views.is_empty());
+        .scan_modules
+        .retain(|module| !stale.contains(&module.view));
     for view in stale {
-        discovered.pinned.remove_view(view);
-        discovered.counters.object_skips.push(Skipped {
+        discovered.scan_pins.remove_view(view);
+        discovered.view_counters.remove(&view);
+        discovered.base_counters.object_skips.push(Skipped {
             subject: "process view".into(),
             reason: STALE_VIEW_REASON.into(),
         });
@@ -1771,9 +1797,11 @@ mod tests {
     use p11scope::discovery::identity::{
         PinnedObjectId, ReconciledModule, pin_scanned_objects, reconcile_scanned_modules,
     };
-    use p11scope::discovery::scan::{ScannedEntry, scan_pid};
+    use p11scope::discovery::scan::{ScannedEntry, ScannedTable, scan_pid};
     use std::cell::Cell;
+    use std::collections::BTreeMap;
     use std::os::unix::fs::MetadataExt as _;
+    use std::path::PathBuf;
 
     fn current_mount_namespace() -> p11scope::process::MountNamespaceId {
         let metadata = std::fs::metadata("/proc/self/ns/mnt").unwrap();
@@ -1804,7 +1832,69 @@ mod tests {
             counters: DiscoveryCounters::default(),
             corroborated: BTreeSet::new(),
             identity_mismatches: 0,
+            scan_modules: Vec::new(),
+            scan_pins: PinnedObjects::empty(),
+            manifest_inputs: Vec::new(),
+            base_counters: DiscoveryCounters::default(),
+            view_counters: BTreeMap::new(),
         }
+    }
+
+    fn discovered_from_inputs(
+        views: Vec<ProcessView>,
+        scan_modules: Vec<ScannedModule>,
+        scan_pins: PinnedObjects,
+        manifest_inputs: Vec<ManifestInput>,
+    ) -> Discovered {
+        let mut discovered = lifecycle_discovered(views);
+        discovered.scan_modules = scan_modules;
+        discovered.scan_pins = scan_pins;
+        discovered.manifest_inputs = manifest_inputs;
+        rebuild_discovered(&mut discovered).unwrap();
+        discovered
+    }
+
+    fn same_object_scan_and_manifest(
+        scan_offset: u64,
+    ) -> (
+        ProcessView,
+        Vec<ScannedModule>,
+        PinnedObjects,
+        ManifestInput,
+    ) {
+        let (mut modules, pins) = pinned_self();
+        assert_eq!(modules.len(), 1);
+        let summary = pins.pinned().next().unwrap();
+        let (path, key, sha256) = (
+            summary.path.to_string(),
+            summary.key,
+            summary.sha256.to_string(),
+        );
+        modules[0].tables.push(ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: vec![ScannedEntry {
+                name: "C_Sign",
+                object: key,
+                object_path: path.clone(),
+                file_offset: scan_offset,
+            }],
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x7000,
+        });
+        let manifest = manifest_naming(&path, Some(sha256));
+        let input = ManifestInput {
+            path: PathBuf::from("manifest.json"),
+            pins: pin_as_manifest_object(&path),
+            manifest,
+        };
+        (
+            ProcessView::open(ProcessViewId(0), std::process::id()).unwrap(),
+            modules,
+            pins,
+            input,
+        )
     }
 
     #[derive(Debug)]
@@ -1938,6 +2028,128 @@ mod tests {
             "every stale post-start pass tears down its whole session"
         );
         drop(session);
+    }
+
+    /// Mutation caught: retaining only the initial `Agreed` outcome drops the
+    /// manifest's valid offsets when its sole agreeing scan owner is retired.
+    #[test]
+    fn stale_sole_owner_agreement_falls_back_to_the_retained_manifest() {
+        let (view, modules, pins, input) = same_object_scan_and_manifest(0x40);
+        let stale = view.id();
+        let mut discovered = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+        assert_eq!(discovered.plan.slots.len(), 1);
+        assert_eq!(discovered.plan.modules[0].source, "scan+manifest");
+
+        remove_stale_views(&mut discovered, &[stale]).unwrap();
+
+        assert_eq!(discovered.plan.slots.len(), 1);
+        assert_eq!(discovered.plan.slots[0].names, ["C_Sign"]);
+        assert_eq!(discovered.plan.slots[0].file_offset, 0x40);
+        assert_eq!(discovered.plan.modules[0].source, "manifest");
+        assert_eq!(discovered.counters.uncorroborated, 1);
+        assert_eq!(discovered.identity_mismatches, 0);
+    }
+
+    /// Mutation caught: a stale path-matching view's mismatch must not remain
+    /// latched and abort the rebuild after that view's scan slot is subtracted.
+    #[test]
+    fn stale_only_identity_mismatch_becomes_manifest_fallback_for_stable_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("provider.so");
+        std::fs::copy("/bin/sh", &provider).unwrap();
+        let path = provider.display().to_string();
+        let own = pin_as_manifest_object(&path);
+        let old_sha = own.pinned().next().unwrap().sha256.to_string();
+        let manifest = manifest_naming(&path, Some(old_sha));
+
+        let replacement = dir.path().join("replacement.so");
+        std::fs::copy("/bin/true", &replacement).unwrap();
+        std::fs::rename(&replacement, &provider).unwrap();
+        let file = p11scope_manifest::identity::open_object(&provider).unwrap();
+        let mapping = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
+        let key = ObjectKey {
+            device: p11scope_manifest::maps::Device {
+                major: mapping.device_major,
+                minor: mapping.device_minor,
+            },
+            inode: mapping.inode,
+        };
+        let module = ScannedModule {
+            view: ProcessViewId(0),
+            mount_namespace: current_mount_namespace(),
+            key,
+            path: path.clone(),
+            exports: vec!["C_GetFunctionList".into()],
+            tables: vec![ScannedTable {
+                version: (2, 40),
+                walk: "full",
+                entries: vec![ScannedEntry {
+                    name: "C_Sign",
+                    object: key,
+                    object_path: path.clone(),
+                    file_offset: 0x80,
+                }],
+                null_entries: vec![],
+                unpinned: vec![],
+                address: 0x7000,
+            }],
+            interfaces: vec![],
+        };
+        let (scan_pins, skipped) = pin_scanned_objects(
+            std::process::id(),
+            std::slice::from_ref(&module),
+            &mut CaptureWorkBudget::default(),
+        )
+        .unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let stale = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let stable = ProcessView::open(ProcessViewId(1), std::process::id()).unwrap();
+        let stale_id = stale.id();
+        let input = ManifestInput {
+            path: PathBuf::from("stale-manifest.json"),
+            manifest,
+            pins: own,
+        };
+        let mut discovered =
+            discovered_from_inputs(vec![stale, stable], vec![module], scan_pins, vec![input]);
+        assert_eq!(discovered.identity_mismatches, 1);
+        assert_eq!(
+            discovered.plan.slots.len(),
+            1,
+            "the scan initially keeps capture viable"
+        );
+
+        remove_stale_views(&mut discovered, &[stale_id]).unwrap();
+
+        assert_eq!(
+            discovered.views.len(),
+            1,
+            "the unrelated stable view remains"
+        );
+        assert_eq!(discovered.identity_mismatches, 0);
+        assert_eq!(discovered.plan.modules[0].source, "manifest");
+        assert_eq!(discovered.plan.slots[0].names, ["C_Sign"]);
+    }
+
+    /// Mutation caught: subtracting the only conflicting scan owner must recompute
+    /// the manifest as uncorroborated instead of preserving stale conflict evidence.
+    #[test]
+    fn stale_conflict_owner_is_removed_from_final_counter_and_corroboration() {
+        let (view, modules, pins, input) = same_object_scan_and_manifest(0x80);
+        let stale = view.id();
+        let mut discovered = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+        assert_eq!(discovered.counters.conflicts, 1);
+        assert_eq!(discovered.plan.slots.len(), 2);
+
+        remove_stale_views(&mut discovered, &[stale]).unwrap();
+
+        assert_eq!(discovered.counters.conflicts, 0);
+        assert_eq!(discovered.plan.slots.len(), 1);
+        assert_eq!(discovered.plan.modules[0].source, "manifest");
+        assert_eq!(
+            discovered.discovery.modules[0].corroboration,
+            ["uncorroborated"]
+        );
     }
 
     struct FailingWriter {

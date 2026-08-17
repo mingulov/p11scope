@@ -238,6 +238,112 @@ fn retiring_one_shared_namespace_view_keeps_only_the_stable_views_claims() {
     assert_eq!(plan.slots[0].object, stable_target);
 }
 
+/// Mutation caught: recording ownership only after provider reconciliation leaks
+/// target pins opened for a view whose provider was rejected.
+#[test]
+fn retiring_a_rejected_provider_view_removes_its_unplanned_pins_and_raw_aliases() {
+    use p11scope::discovery::identity::{pin_scanned_view_objects, reconcile_scanned_modules};
+    use p11scope::discovery::scan::{ScannedEntry, ScannedModule, ScannedTable};
+    use p11scope::process::ProcessView;
+
+    let d = tmpdir("manifest_pinning_rejected_provider_retirement");
+    let provider = cc_so(&d, "rejected_provider", "int provider(void){return 1;}\n");
+    let unique = cc_so(&d, "unique_target", "int unique(void){return 2;}\n");
+    let shared = cc_so(&d, "shared_target", "int shared(void){return 3;}\n");
+    let view_id = ProcessViewId(23);
+    let mut rejected_provider = manifest_key(&provider);
+    rejected_provider.inode = rejected_provider.inode.wrapping_add(1);
+    let module = ScannedModule {
+        view: view_id,
+        mount_namespace: current_mount_namespace(),
+        key: rejected_provider,
+        path: provider.display().to_string(),
+        exports: vec!["C_GetFunctionList".into()],
+        tables: vec![ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: vec![
+                ScannedEntry {
+                    name: "C_Sign",
+                    object: manifest_key(&unique),
+                    object_path: unique.display().to_string(),
+                    file_offset: first_executable_offset(&unique),
+                },
+                ScannedEntry {
+                    name: "C_Verify",
+                    object: manifest_key(&shared),
+                    object_path: shared.display().to_string(),
+                    file_offset: first_executable_offset(&shared),
+                },
+            ],
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x1000,
+        }],
+        interfaces: vec![],
+    };
+    let view = ProcessView::open(view_id, std::process::id()).unwrap();
+    let (local, skipped) = pin_scanned_view_objects(
+        &view,
+        std::slice::from_ref(&module),
+        &mut CaptureWorkBudget::default(),
+    )
+    .unwrap();
+    assert!(
+        skipped
+            .iter()
+            .any(|skip| skip.reason.contains("identity_mismatch")),
+        "the provider must be rejected while its targets pin: {skipped:?}"
+    );
+    let mut pinned = p11scope::discovery::identity::PinnedObjects::empty();
+    pinned.absorb(local);
+    pinned.absorb(
+        p11scope::discovery::identity::pin_manifest_objects(&manifest_for(&shared)).unwrap(),
+    );
+    let unique_id = pinned
+        .id_for_scanned(
+            &module,
+            manifest_key(&unique),
+            &unique.display().to_string(),
+        )
+        .expect("the rejected provider's unique target was opened");
+    let shared_scan_id = pinned
+        .id_for_scanned(
+            &module,
+            manifest_key(&shared),
+            &shared.display().to_string(),
+        )
+        .expect("the rejected provider's shared target was opened");
+    let shared_manifest_id = pinned
+        .id_for_manifest(manifest_key(&shared), &shared.display().to_string())
+        .expect("the manifest independently owns the shared target");
+    assert_eq!(shared_scan_id, shared_manifest_id);
+    let (reconciled, _, _) = reconcile_scanned_modules(std::slice::from_ref(&module), &mut pinned);
+    assert!(reconciled.is_empty(), "the provider itself was rejected");
+
+    pinned
+        .remove_view(view_id)
+        .expect("every scan-opened pin is owned before reconciliation");
+
+    assert!(pinned.attach_path_for(unique_id).is_err());
+    assert!(
+        pinned
+            .id_for_scanned(
+                &module,
+                manifest_key(&shared),
+                &shared.display().to_string()
+            )
+            .is_none(),
+        "the retired view's raw alias must be removed even when its fd is shared"
+    );
+    assert!(pinned.attach_path_for(shared_manifest_id).is_ok());
+    assert_eq!(
+        pinned.id_for_manifest(manifest_key(&shared), &shared.display().to_string()),
+        Some(shared_manifest_id),
+        "the retained manifest keeps its exact pin and alias"
+    );
+}
+
 #[test]
 fn changed_object_is_refused_naming_the_file() {
     let d = tmpdir("manifest_pinning_bad");

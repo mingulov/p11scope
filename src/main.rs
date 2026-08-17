@@ -5,7 +5,9 @@
 use anyhow::{Context as _, Result, anyhow, bail};
 use p11scope::attach::{CapturePolicy, Scope, Session};
 use p11scope::cli::{self, CaptureArgs, CliError, Command, Kind, ScopeArg};
-use p11scope::discovery::identity::{PinnedObjects, pin_manifest_objects, pin_scanned_objects};
+use p11scope::discovery::identity::{
+    PinnedObjects, merge_mappings_of_one_file, pin_manifest_objects, pin_scanned_objects,
+};
 use p11scope::discovery::scan::{
     ScanLimits, ScanOutcome, ScanRequest, ScannedModule, Skipped, scan_pid,
 };
@@ -606,7 +608,11 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
         match scan_and_pin(*pid, a, limits, &mut counters) {
             Ok((found, pins)) => {
                 pinned.absorb(pins);
-                // A provider ten pods map is one module: merged by object identity.
+                // Ten processes of one container map one object under one key; ten
+                // containers of one image map it under ten (each mount has its own
+                // anonymous device). Only the first case is a key match, so this
+                // dedupe cannot see the second — `merge_mappings_of_one_file` below
+                // is what collapses those, once every process has been pinned.
                 for module in found {
                     if !modules.iter().any(|known| known.key == module.key) {
                         modules.push(module);
@@ -625,6 +631,17 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
                 });
             }
         }
+    }
+
+    // Before everything else: two mappings of one physical file are one module and
+    // one attach target, or every call through it is counted once per mount.
+    let collapsed = merge_mappings_of_one_file(&mut modules, &pinned);
+    if collapsed > 0 {
+        eprintln!(
+            "p11scope: discovery: {collapsed} further mapping(s) of an already-discovered \
+             provider file were collapsed — containers sharing an image layer map one \
+             inode through their own mounts, and one file is one attach target"
+        );
     }
 
     // Before corroboration: an entry nothing pinned is not a target either source

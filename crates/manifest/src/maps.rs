@@ -10,6 +10,12 @@ pub struct Device {
     pub minor: u64,
 }
 
+/// What `/proc/<pid>/maps` says a mapping is: the *mount's* device, not the file's
+/// `st_dev`. So this identifies a mapping, never a physical file — overlayfs and
+/// btrfs give one file a different anonymous device per mount, and one inode number
+/// can repeat across filesystems. Neither half is an identity on its own; see
+/// `p11scope::discovery::identity::merge_mappings_of_one_file` before letting two of
+/// these decide that there are two files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ObjectKey {
     pub device: Device,

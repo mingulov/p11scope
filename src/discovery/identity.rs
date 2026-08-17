@@ -19,7 +19,7 @@ use crate::discovery::scan::{ScanLimits, ScannedModule, Skipped};
 use crate::manifest_input::{MAX_TOTAL_OBJECT_BYTES, validate_structure};
 use crate::process::PidPin;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Pin {
     ino: u64,
     size: u64,
@@ -460,6 +460,101 @@ pub fn pin_scanned_objects(
     ))
 }
 
+/// Collapses every mapping of one physical file onto the single key this capture
+/// pinned for it, and drops the modules that were only a second view of a module
+/// already here. Returns how many keys were collapsed.
+///
+/// `ObjectKey` is `(device, inode)`, and that pair identifies a *mapping*, not a
+/// file: `/proc/<pid>/maps` renders the mount's device, and overlayfs gives every
+/// mount its own anonymous one (btrfs does the same per subvolume). Two containers
+/// started from one image therefore show one file as `[0,102]:56317450` and
+/// `[0,104]:56317450` — two keys, two modules, two slots. A uprobe is registered per
+/// `(inode, offset)`, so both slots are two registrations on *one* point: both fire
+/// for every call from either container, every count doubles, and nothing in the
+/// document says so (neither slot is shared by two modules, so `module_ambiguous`
+/// stays 0 and every entry reads as attributed). N pods from one image inflate N×,
+/// which is the ordinary Kubernetes shape, so this is not an edge case.
+///
+/// Two pins are the same file when everything this capture recorded about the inode
+/// is identical — its number, its size, its ctime and the whole-file SHA-256 — and
+/// only the device differs. The device is *deliberately* not part of that test:
+/// `IdentitySource::Stat` already records that on overlay and btrfs it cannot be
+/// corroborated at all, and `hint_gate` in `scan.rs` reaches the same conclusion from
+/// the other side. Do not add it back; that is the defect this exists to prevent.
+///
+/// Why this cannot merge two *different* providers, which would be the worse fault:
+/// an inode number is unique only within a filesystem, so two unrelated files can
+/// share one — but they would also have to hash to the same SHA-256, i.e. be
+/// byte-identical, and to have been last metadata-changed in the same nanosecond at
+/// the same length. Even in that case the two files are the same provider build with
+/// the same offsets, so no call is ever attributed to a provider it did not go
+/// through; the only cost is that calls through the second copy go uncounted. The
+/// failure mode is therefore bounded to under-counting one duplicate deployment,
+/// never to conflating two providers.
+///
+/// A target two *different* modules both publish is a different thing entirely and
+/// is untouched here: those have different digests, so they keep their own keys, and
+/// `plan::merge` still gives that shared target one slot marked ambiguous and
+/// COUNT_ONLY.
+pub fn merge_mappings_of_one_file(
+    modules: &mut Vec<ScannedModule>,
+    pinned: &PinnedObjects,
+) -> usize {
+    let mut first: BTreeMap<(Pin, &str), ObjectKey> = BTreeMap::new();
+    let mut canonical: BTreeMap<ObjectKey, ObjectKey> = BTreeMap::new();
+    for (key, entry) in &pinned.by_key {
+        // An object nothing hashed has no content to be identified by; absence is
+        // never evidence of sameness.
+        if entry.sha256.is_empty() {
+            continue;
+        }
+        match first.entry((entry.pin, entry.sha256.as_str())) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(*key);
+            }
+            std::collections::btree_map::Entry::Occupied(kept) => {
+                canonical.insert(*key, *kept.get());
+            }
+        }
+    }
+    if canonical.is_empty() {
+        return 0;
+    }
+    for module in modules.iter_mut() {
+        if let Some(key) = canonical.get(&module.key) {
+            module.key = *key;
+        }
+        // A table entry may land in a dependency rather than in the module that
+        // published it, and that dependency is shared through the same mounts.
+        for entry in module
+            .tables
+            .iter_mut()
+            .flat_map(|table| &mut table.entries)
+        {
+            if let Some(key) = canonical.get(&entry.object) {
+                entry.object = *key;
+            }
+        }
+    }
+    // What is left is one module per file. The mapping that decoded the most wins:
+    // one process's `/proc/<pid>/mem` can be unreadable, or over the scan's byte
+    // caps, while another mapping of the same file was read in full — and a module
+    // with no entries must not shadow the one with the targets to attach.
+    let decoded = |module: &ScannedModule| -> usize {
+        module.tables.iter().map(|table| table.entries.len()).sum()
+    };
+    let mut kept: Vec<ScannedModule> = Vec::new();
+    for module in std::mem::take(modules) {
+        match kept.iter_mut().find(|known| known.key == module.key) {
+            Some(known) if decoded(&module) > decoded(known) => *known = module,
+            Some(_) => {}
+            None => kept.push(module),
+        }
+    }
+    *modules = kept;
+    canonical.len()
+}
+
 fn pin_scanned_object(
     pid: u32,
     key: ObjectKey,
@@ -508,4 +603,146 @@ fn pin_scanned_object(
         &inspected.identity,
         found,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discovery::scan::{ScannedEntry, ScannedTable};
+
+    const SHA: &str = "b4e608e4";
+    /// The inode and the two overlay device numbers a two-container docker run
+    /// really produced (`102:56317450` and `104:56317450`).
+    const INODE: u64 = 56_317_450;
+    const PATH: &str = "/usr/lib/softhsm/libsofthsm2.so";
+
+    fn overlay(minor: u64) -> ObjectKey {
+        ObjectKey {
+            device: Device { major: 0, minor },
+            inode: INODE,
+        }
+    }
+
+    fn module(key: ObjectKey) -> ScannedModule {
+        ScannedModule {
+            key,
+            path: PATH.into(),
+            exports: vec!["C_GetFunctionList".into()],
+            tables: vec![ScannedTable {
+                version: (2, 40),
+                walk: "full",
+                entries: vec![ScannedEntry {
+                    name: "C_Initialize",
+                    object: key,
+                    object_path: PATH.into(),
+                    file_offset: 0x1000,
+                }],
+                null_entries: vec![],
+                unpinned: vec![],
+                address: 0x7000,
+            }],
+            interfaces: vec![],
+        }
+    }
+
+    /// A pin set as `pin_scanned_objects` builds it, but written out directly: the
+    /// two mappings this is about live in two mount namespaces, so reaching this
+    /// state through the real scan needs two containers.
+    fn pins(entries: &[(ObjectKey, &str, Pin)]) -> PinnedObjects {
+        PinnedObjects {
+            by_key: entries
+                .iter()
+                .map(|(key, sha, pin)| {
+                    (
+                        *key,
+                        Entry {
+                            file: std::fs::File::open("/dev/null").unwrap(),
+                            pin: *pin,
+                            path: PATH.into(),
+                            sha256: (*sha).into(),
+                            build_id: None,
+                            identity_source: IdentitySource::Stat.label(),
+                            note: None,
+                        },
+                    )
+                })
+                .collect(),
+            changed: std::cell::Cell::new(false),
+        }
+    }
+
+    fn pin(ctime: i64) -> Pin {
+        Pin {
+            ino: INODE,
+            size: 4096,
+            ctime: (ctime, 7),
+        }
+    }
+
+    /// Two containers started from one image map the *same* physical file through
+    /// their own overlay mounts: one inode, one digest, and a different anonymous
+    /// device each. A uprobe is registered per `(inode, offset)`, so two slots here
+    /// are two registrations on one point — both fire for every call from either
+    /// container and every count is doubled with nothing saying so.
+    #[test]
+    fn two_mappings_of_one_file_are_one_module_and_one_slot() {
+        let mut modules = vec![module(overlay(104)), module(overlay(102))];
+        let pinned = pins(&[(overlay(104), SHA, pin(1)), (overlay(102), SHA, pin(1))]);
+
+        assert_eq!(merge_mappings_of_one_file(&mut modules, &pinned), 1);
+        let plan = crate::plan::build_from_modules(&modules);
+        assert_eq!(plan.slots.len(), 1, "{:?}", plan.slots);
+        assert_eq!(plan.modules.len(), 1, "{:?}", plan.modules);
+        // One module reached by two mounts is not two modules claiming one target:
+        // the slot keeps its semantics and the capture stays attributed.
+        assert_eq!(plan.slots[0].module_ids.len(), 1);
+        assert!(!plan.slots[0].semantic_ambiguous);
+        assert_eq!(plan.module_ambiguous, 0);
+        assert_eq!(plan.entries_seen, 1, "one file published one table");
+        // Every plan key is still one this capture pinned — `Session::start`
+        // resolves by key alone and has no fallback.
+        assert!(pinned.attach_path_for(plan.slots[0].object).is_ok());
+        assert!(pinned.attach_path_for(plan.modules[0].key).is_ok());
+    }
+
+    /// The dangerous direction. Inode numbers are unique only per filesystem, so two
+    /// genuinely different providers on two real devices can share one — and merging
+    /// them would be a worse defect than the double-counting above.
+    #[test]
+    fn two_different_files_sharing_an_inode_number_are_never_merged() {
+        let real = |minor| ObjectKey {
+            device: Device { major: 8, minor },
+            inode: INODE,
+        };
+        for pins in [
+            // Same inode number, different bytes: two providers, two modules.
+            pins(&[(real(1), SHA, pin(1)), (real(17), "0badc0de", pin(1))]),
+            // Same inode number and the same bytes, but not the same inode: two
+            // copies of one build, each its own file and its own attach target.
+            pins(&[(real(1), SHA, pin(1)), (real(17), SHA, pin(2))]),
+            // Nothing hashed either one, so nothing identifies them.
+            pins(&[(real(1), "", pin(1)), (real(17), "", pin(1))]),
+        ] {
+            let mut modules = vec![module(real(1)), module(real(17))];
+            assert_eq!(merge_mappings_of_one_file(&mut modules, &pins), 0);
+            let plan = crate::plan::build_from_modules(&modules);
+            assert_eq!(plan.modules.len(), 2, "{:?}", plan.modules);
+            assert_eq!(plan.slots.len(), 2, "{:?}", plan.slots);
+        }
+    }
+
+    /// The mapping that decoded nothing — its process's `/proc/<pid>/mem` was
+    /// unreadable, or it was over the scan's byte caps — must not shadow the one
+    /// that read the tables just because it was scanned first.
+    #[test]
+    fn the_mapping_that_decoded_the_tables_is_the_one_kept() {
+        let mut empty = module(overlay(104));
+        empty.tables.clear();
+        let mut modules = vec![empty, module(overlay(102))];
+        let pinned = pins(&[(overlay(104), SHA, pin(1)), (overlay(102), SHA, pin(1))]);
+
+        assert_eq!(merge_mappings_of_one_file(&mut modules, &pinned), 1);
+        assert_eq!(modules.len(), 1);
+        assert_eq!(crate::plan::build_from_modules(&modules).slots.len(), 1);
+    }
 }

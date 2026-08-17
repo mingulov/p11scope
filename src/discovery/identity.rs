@@ -302,6 +302,18 @@ impl PinnedObjects {
         skipped
     }
 
+    /// Builds disposable capture-local identity state from pristine per-view pins.
+    /// Cloning shares the already-opened files through `Arc`; it neither reopens nor
+    /// duplicates an fd, and destructive collision handling cannot alter a source.
+    pub fn aggregate_views<'a>(views: impl IntoIterator<Item = &'a Self>) -> (Self, Vec<Skipped>) {
+        let mut aggregate = Self::empty();
+        let mut skipped = Vec::new();
+        for view in views {
+            skipped.extend(aggregate.absorb(view.clone()));
+        }
+        (aggregate, skipped)
+    }
+
     /// The path Aya reopens for this object: an fd this capture holds, never a name
     /// resolved again through a namespace that may not mean the same file.
     pub fn attach_path_for(&self, id: PinnedObjectId) -> Result<PathBuf, String> {
@@ -1144,6 +1156,38 @@ mod tests {
         pin_set(entries, false)
     }
 
+    fn view_pin(
+        module: &ScannedModule,
+        mapping_mount_id: u64,
+        sha256: &str,
+        ctime: i64,
+        overlay: bool,
+    ) -> PinnedObjects {
+        let raw = RawObjectInstance::scanned(module, module.key, &module.path).unwrap();
+        let entry = Entry {
+            mapping: MappingFileKey {
+                mount_id: mapping_mount_id,
+                device_major: module.key.device.major,
+                device_minor: module.key.device.minor,
+                inode: module.key.inode,
+            },
+            raw,
+            file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            pin: Pin {
+                ino: module.key.inode,
+                size: 4096,
+                ctime: (ctime, 7),
+            },
+            path: module.path.clone(),
+            sha256: sha256.into(),
+            build_id: None,
+            overlay,
+        };
+        let mut pins = PinnedObjects::empty();
+        pins.insert_entry(entry, &mut Vec::new());
+        pins
+    }
+
     fn unavailable_pins(key: ObjectKey, views: &[u64]) -> (PinnedObjects, Vec<Skipped>) {
         let mut raw = image_pins(&[(key, "aaaaaaaa", 1)])
             .by_id
@@ -1220,6 +1264,130 @@ mod tests {
         );
         assert_eq!(skipped.len(), 1, "{skipped:?}");
         assert!(skipped[0].reason.contains("physical identity is ambiguous"));
+    }
+
+    #[test]
+    fn fresh_view_aggregation_restores_the_stable_original_pin_in_both_orders() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let mut stable_module = module(key);
+        stable_module.view = ProcessViewId(1);
+        stable_module.mount_namespace.inode = 1;
+        let mut stale_module = stable_module.clone();
+        stale_module.view = ProcessViewId(2);
+        stale_module.mount_namespace.inode = 2;
+        let stable = view_pin(&stable_module, 11, "aaaaaaaa", 1, false);
+        let stale = view_pin(&stale_module, 12, "aaaaaaaa", 1, false);
+        let original = stable
+            .attach_path_for(stable.pinned().next().unwrap().id)
+            .unwrap();
+
+        for sources in [vec![&stable, &stale], vec![&stale, &stable]] {
+            let (rejected, skipped) = PinnedObjects::aggregate_views(sources);
+            assert_eq!(rejected.pinned().count(), 0);
+            assert_eq!(ambiguity_count(&skipped), 1, "{skipped:?}");
+        }
+
+        let (mut rebuilt, skipped) = PinnedObjects::aggregate_views([&stable]);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let (modules, collapsed, lost) =
+            reconcile_scanned_modules(std::slice::from_ref(&stable_module), &mut rebuilt);
+        assert_eq!((collapsed, lost.len()), (0, 0), "{lost:?}");
+        let plan = crate::plan::build_from_reconciled_modules(&modules);
+        assert_eq!(plan.slots.len(), 1);
+        assert_eq!(
+            rebuilt.attach_path_for(plan.slots[0].object).unwrap(),
+            original,
+            "the retry must reuse the originally opened stable fd"
+        );
+        assert!(
+            rebuilt
+                .id_for_scanned(&stable_module, stable_module.key, &stable_module.path)
+                .is_some(),
+            "the stable raw alias must be rebuilt"
+        );
+    }
+
+    #[test]
+    fn fresh_view_aggregation_recomputes_collision_evidence_from_survivors() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let source = |view, mapping_mount_id| {
+            let mut module = module(key);
+            module.view = ProcessViewId(view);
+            module.mount_namespace.inode = u64::from(view);
+            view_pin(&module, mapping_mount_id, "aaaaaaaa", 1, false)
+        };
+        let stable = source(1, 11);
+        let stale = source(2, 12);
+        let remaining_collision = source(3, 13);
+
+        let (_, initial) = PinnedObjects::aggregate_views([&stable, &stale]);
+        assert_eq!(ambiguity_count(&initial), 1, "{initial:?}");
+
+        let (restored, after_retirement) = PinnedObjects::aggregate_views([&stable]);
+        assert_eq!(restored.pinned().count(), 1);
+        assert_eq!(
+            ambiguity_count(&after_retirement),
+            0,
+            "stale-view-caused collision evidence leaked into the retry"
+        );
+
+        let (still_rejected, remaining) =
+            PinnedObjects::aggregate_views([&stable, &remaining_collision]);
+        assert_eq!(still_rejected.pinned().count(), 0);
+        assert_eq!(
+            ambiguity_count(&remaining),
+            1,
+            "a collision between retained views must remain PARTIAL"
+        );
+    }
+
+    #[test]
+    fn fresh_view_aggregation_drops_retired_overlay_uncertainty_and_keeps_one_slot() {
+        let stable_module = module(overlay(102));
+        let stale_module = module(overlay(104));
+        let stable = view_pin(&stable_module, 103, SHA, 1, true);
+        let stale = view_pin(&stale_module, 105, SHA, 1, true);
+
+        let (mut initial, mut initial_lost) = PinnedObjects::aggregate_views([&stable, &stale]);
+        let (modules, collapsed, lost) =
+            reconcile_scanned_modules(&[stable_module.clone(), stale_module], &mut initial);
+        initial_lost.extend(lost);
+        assert_eq!(collapsed, 1);
+        assert_eq!(
+            crate::plan::build_from_reconciled_modules(&modules)
+                .slots
+                .len(),
+            1
+        );
+        assert!(
+            initial_lost
+                .iter()
+                .any(|skip| skip.reason.contains("cannot prove physical identity")),
+            "{initial_lost:?}"
+        );
+
+        let (mut rebuilt, mut after_retirement) = PinnedObjects::aggregate_views([&stable]);
+        let (modules, collapsed, lost) = reconcile_scanned_modules(&[stable_module], &mut rebuilt);
+        after_retirement.extend(lost);
+        assert_eq!(collapsed, 0);
+        assert_eq!(
+            crate::plan::build_from_reconciled_modules(&modules)
+                .slots
+                .len(),
+            1
+        );
+        assert!(
+            after_retirement
+                .iter()
+                .all(|skip| !skip.reason.contains("cannot prove physical identity")),
+            "retired overlay uncertainty leaked into the retry: {after_retirement:?}"
+        );
     }
 
     #[test]

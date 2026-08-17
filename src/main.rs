@@ -183,11 +183,15 @@ struct Discovered {
     counters: DiscoveryCounters,
     corroborated: BTreeSet<(ProcessViewId, ObjectKey)>,
     identity_mismatches: usize,
-    scan_modules: Vec<ScannedModule>,
-    scan_pins: PinnedObjects,
+    scan_inputs: BTreeMap<ProcessViewId, ScanInput>,
     manifest_inputs: Vec<ManifestInput>,
     base_counters: DiscoveryCounters,
-    view_counters: BTreeMap<ProcessViewId, DiscoveryCounters>,
+}
+
+struct ScanInput {
+    modules: Vec<ScannedModule>,
+    pins: PinnedObjects,
+    counters: DiscoveryCounters,
 }
 
 struct ManifestInput {
@@ -612,14 +616,12 @@ fn discover_plan(
 ) -> Result<Discovered> {
     let mut budget = CaptureWorkBudget::default();
     let mut base_counters = DiscoveryCounters::default();
-    let mut view_counters = BTreeMap::new();
     let (pids, unlisted) = scope_pids(scope);
     base_counters.object_skips.extend(unlisted);
     // The pid the operator named is the capture; a cgroup's processes are many,
     // however few happen to be in it right now.
     let named = matches!(scope, Scope::Pid(_));
-    let mut scan_modules = Vec::new();
-    let mut scan_pins = PinnedObjects::empty();
+    let mut scan_inputs = BTreeMap::new();
     let mut views = Vec::new();
     if pids.len() > MAX_SCAN_PIDS {
         // Published, not just noted: a provider mapped only by a process past the
@@ -656,9 +658,14 @@ fn discover_plan(
         let mut counters = DiscoveryCounters::default();
         match scan_and_pin(&view, a, &mut budget, &mut counters) {
             Ok((found, pins)) => {
-                base_counters.object_skips.extend(scan_pins.absorb(pins));
-                scan_modules.extend(found);
-                view_counters.insert(view.id(), counters);
+                scan_inputs.insert(
+                    view.id(),
+                    ScanInput {
+                        modules: found,
+                        pins,
+                        counters,
+                    },
+                );
                 views.push(view);
             }
             // The pid the operator named *is* the capture; any other is one of many
@@ -709,11 +716,9 @@ fn discover_plan(
         counters: DiscoveryCounters::default(),
         corroborated: BTreeSet::new(),
         identity_mismatches: 0,
-        scan_modules,
-        scan_pins,
+        scan_inputs,
         manifest_inputs,
         base_counters,
-        view_counters,
     };
     rebuild_discovered(&mut discovered)?;
     discovered.counters.report_notes();
@@ -1039,19 +1044,27 @@ const STALE_VIEW_REASON: &str = "accepted process generation changed during atta
 
 fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
     let mut counters = discovered.base_counters.clone();
-    for view in discovered.view_counters.values() {
-        counters.scan_unavailable = counters.scan_unavailable.or(view.scan_unavailable);
-        counters.scan_ms += view.scan_ms;
-        counters.object_skips.extend(view.object_skips.clone());
+    let mut scan_modules = Vec::new();
+    for input in discovered.scan_inputs.values() {
+        counters.scan_unavailable = counters
+            .scan_unavailable
+            .or(input.counters.scan_unavailable);
+        counters.scan_ms += input.counters.scan_ms;
+        counters
+            .object_skips
+            .extend(input.counters.object_skips.clone());
+        scan_modules.extend(input.modules.clone());
     }
-    let mut pinned = discovered.scan_pins.clone();
+    let (mut pinned, aggregation_skips) =
+        PinnedObjects::aggregate_views(discovered.scan_inputs.values().map(|input| &input.pins));
+    counters.object_skips.extend(aggregation_skips);
     let mut accepted = Vec::new();
     let mut corroborated = BTreeSet::new();
     let mut identity_mismatches = 0usize;
     for input in &discovered.manifest_inputs {
         let mut manifest = input.manifest.clone();
         let manifest_pins = &input.pins;
-        let view = scan_view(&manifest, &discovered.scan_modules, &pinned, manifest_pins);
+        let view = scan_view(&manifest, &scan_modules, &pinned, manifest_pins);
         let mapped = view
             .as_ref()
             .and_then(|view| view.modules.first())
@@ -1157,8 +1170,7 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
         }
     }
 
-    let (modules, collapsed, differed) =
-        reconcile_scanned_modules(&discovered.scan_modules, &mut pinned);
+    let (modules, collapsed, differed) = reconcile_scanned_modules(&scan_modules, &mut pinned);
     if collapsed > 0 {
         eprintln!(
             "p11scope: discovery: {collapsed} matching overlay mapping(s) were collapsed \
@@ -1201,12 +1213,8 @@ fn remove_stale_views(discovered: &mut Discovered, stale: &[ProcessViewId]) -> R
     if removed == 0 {
         bail!("lifecycle check did not identify an accepted process view");
     }
-    discovered
-        .scan_modules
-        .retain(|module| !stale.contains(&module.view));
     for view in stale {
-        discovered.scan_pins.remove_view(view);
-        discovered.view_counters.remove(&view);
+        discovered.scan_inputs.remove(&view);
         discovered.base_counters.object_skips.push(Skipped {
             subject: "process view".into(),
             reason: STALE_VIEW_REASON.into(),
@@ -1832,11 +1840,9 @@ mod tests {
             counters: DiscoveryCounters::default(),
             corroborated: BTreeSet::new(),
             identity_mismatches: 0,
-            scan_modules: Vec::new(),
-            scan_pins: PinnedObjects::empty(),
+            scan_inputs: BTreeMap::new(),
             manifest_inputs: Vec::new(),
             base_counters: DiscoveryCounters::default(),
-            view_counters: BTreeMap::new(),
         }
     }
 
@@ -1847,8 +1853,18 @@ mod tests {
         manifest_inputs: Vec<ManifestInput>,
     ) -> Discovered {
         let mut discovered = lifecycle_discovered(views);
-        discovered.scan_modules = scan_modules;
-        discovered.scan_pins = scan_pins;
+        let view = scan_modules
+            .first()
+            .expect("test scan input has one process view")
+            .view;
+        discovered.scan_inputs.insert(
+            view,
+            ScanInput {
+                modules: scan_modules,
+                pins: scan_pins,
+                counters: DiscoveryCounters::default(),
+            },
+        );
         discovered.manifest_inputs = manifest_inputs;
         rebuild_discovered(&mut discovered).unwrap();
         discovered

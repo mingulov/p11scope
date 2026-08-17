@@ -263,8 +263,8 @@ enum Corroboration {
 fn corroborate(
     scan_unavailable: bool,
     identity: Option<bool>,
-    manifest_targets: &BTreeSet<(String, u64)>,
-    scanned_targets: &BTreeSet<(String, u64)>,
+    targets_agree: bool,
+    scan_empty: bool,
 ) -> Corroboration {
     match identity {
         // A scan that could not read memory found no tables to compare against;
@@ -272,10 +272,10 @@ fn corroborate(
         _ if scan_unavailable => Corroboration::Uncorroborated,
         None => Corroboration::Uncorroborated,
         Some(false) => Corroboration::IdentityMismatch,
-        Some(true) if manifest_targets == scanned_targets => Corroboration::Agreed,
+        Some(true) if targets_agree => Corroboration::Agreed,
         // Nothing decoded is not a contradiction: the manifest is the only
         // source that ever had offsets here.
-        Some(true) if scanned_targets.is_empty() => Corroboration::ScanEmpty,
+        Some(true) if scan_empty => Corroboration::ScanEmpty,
         Some(true) => Corroboration::Conflict,
     }
 }
@@ -297,8 +297,8 @@ fn scan_view<'a>(
     let sha = m
         .objects
         .iter()
-        .find(|o| o.path == m.module_path)
-        .and_then(|o| o.identity.sha256.as_deref());
+        .find(|object| object.path == m.module_path)
+        .and_then(|object| object.identity.sha256.as_deref());
     let own = manifest_pins.id_for_path(&m.module_path);
     let exact: Vec<&ScannedModule> = modules
         .iter()
@@ -334,24 +334,29 @@ fn scan_view<'a>(
     })
 }
 
-/// {object SHA-256, file offset} for every entry the scan decoded — the comparison
-/// a manifest can be held against without depending on device and inode numbers.
-fn scanned_targets(modules: &[&ScannedModule], pinned: &PinnedObjects) -> BTreeSet<(String, u64)> {
+/// Capture-local opened object and file offset for every entry the scan decoded.
+fn scanned_targets(
+    modules: &[&ScannedModule],
+    pinned: &PinnedObjects,
+) -> Option<BTreeSet<(PinnedObjectId, u64)>> {
     modules
         .iter()
         .flat_map(|module| {
             module.tables.iter().flat_map(move |table| {
-                table.entries.iter().filter_map(move |entry| {
+                table.entries.iter().map(move |entry| {
                     let id = pinned.id_for_scanned(module, entry.object, &entry.object_path)?;
-                    Some((pinned.summary(id)?.sha256.to_string(), entry.file_offset))
+                    Some((id, entry.file_offset))
                 })
             })
         })
         .collect()
 }
 
-/// The same set as a manifest records it.
-fn manifest_targets(m: &Manifest) -> BTreeSet<(String, u64)> {
+/// The same set resolved through the manifest's exact opened pins in this capture.
+fn manifest_targets(
+    m: &Manifest,
+    pinned: &PinnedObjects,
+) -> Option<BTreeSet<(PinnedObjectId, u64)>> {
     m.surfaces
         .iter()
         .flat_map(|surface| &surface.functions)
@@ -361,10 +366,11 @@ fn manifest_targets(m: &Manifest) -> BTreeSet<(String, u64)> {
                 file_offset,
             } => {
                 let record = m.objects.iter().find(|o| o.id == object)?;
-                Some((record.identity.sha256.clone()?, file_offset))
+                Some((record, file_offset))
             }
             _ => None,
         })
+        .map(|(record, file_offset)| Some((pinned.id_for_path(&record.path)?, file_offset)))
         .collect()
 }
 
@@ -658,14 +664,24 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
             .as_ref()
             .and_then(|view| view.modules.first())
             .map(|module| module.key);
+        let scan_targets = view
+            .as_ref()
+            .and_then(|view| scanned_targets(&view.modules, &pinned));
+        let own_targets = manifest_targets(&manifest, &manifest_pins);
+        let scan_empty = view.as_ref().is_some_and(|view| {
+            view.modules
+                .iter()
+                .flat_map(|module| &module.tables)
+                .all(|table| table.entries.is_empty())
+        });
         let outcome = corroborate(
             counters.scan_unavailable.is_some(),
             view.as_ref().map(|view| view.agrees),
-            &manifest_targets(&manifest),
-            &view
+            scan_targets
                 .as_ref()
-                .map(|view| scanned_targets(&view.modules, &pinned))
-                .unwrap_or_default(),
+                .zip(own_targets.as_ref())
+                .is_some_and(|(scan, own)| pinned.exactly_same_targets(scan, &manifest_pins, own)),
+            scan_empty,
         );
         counters
             .corroboration
@@ -1745,13 +1761,6 @@ mod tests {
         }
     }
 
-    fn targets(offsets: &[u64]) -> BTreeSet<(String, u64)> {
-        offsets
-            .iter()
-            .map(|offset| ("11".repeat(32), *offset))
-            .collect()
-    }
-
     /// Our own executable, scanned and pinned the way a capture pins a provider:
     /// a real `PinnedObjects` with one key in it, with no privileges needed.
     fn pinned_self() -> (Vec<ScannedModule>, PinnedObjects) {
@@ -2349,14 +2358,18 @@ mod tests {
         let view = scan_view(&m, &modules, &pinned, &own).expect("mapped and pinned");
         assert_eq!(view.modules[0].key, summary.key);
         assert!(view.agrees, "the recorded sha256 is the pinned one");
+        let manifest_target = manifest_targets(&m, &own).unwrap();
+        assert_eq!(manifest_target.len(), 1);
+        let (manifest_target, manifest_offset) = manifest_target.iter().next().unwrap();
+        assert_eq!(*manifest_offset, 0x40);
         assert_eq!(
-            manifest_targets(&m),
-            BTreeSet::from([(sha.clone(), 0x40)]),
-            "manifest targets are keyed by object hash, not by device/inode"
+            own.summary(*manifest_target).unwrap().path,
+            path,
+            "manifest targets resolve through their exact opened pin"
         );
         assert_eq!(
             scanned_targets(&view.modules, &pinned),
-            BTreeSet::new(),
+            Some(BTreeSet::new()),
             "our own executable publishes no PKCS#11 table"
         );
 
@@ -2429,6 +2442,186 @@ mod tests {
         assert_eq!(
             view.modules[0].path, modules[1].path,
             "digest equality selected the first distinct ordinary file"
+        );
+    }
+
+    #[test]
+    fn byte_identical_distinct_entry_objects_conflict_and_attach_the_union() {
+        use p11scope::discovery::scan::ScannedTable;
+        use p11scope_manifest::manifest::{
+            Acquisition, FunctionRecord, ObjectRecord, ProvenanceObject, SurfaceRecord,
+            SurfaceSource, Version, WalkOutcome,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let module_path = dir.path().join("module.so");
+        let scanned_target_path = dir.path().join("scanned-target.so");
+        let manifest_target_path = dir.path().join("manifest-target.so");
+        for path in [&module_path, &scanned_target_path, &manifest_target_path] {
+            std::fs::copy("/bin/sh", path).unwrap();
+        }
+
+        let opened = |path: &Path| {
+            let file = p11scope_manifest::identity::open_object(path).unwrap();
+            let mapping = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
+            let inspected = p11scope_manifest::identity::inspect_file(&file).unwrap();
+            (mapping, inspected)
+        };
+        let (module_mapping, module_inspected) = opened(&module_path);
+        let (scanned_mapping, scanned_inspected) = opened(&scanned_target_path);
+        let (manifest_mapping, manifest_inspected) = opened(&manifest_target_path);
+        assert_eq!(
+            scanned_inspected.identity.sha256, manifest_inspected.identity.sha256,
+            "the witness requires equal bytes"
+        );
+        assert_ne!(
+            scanned_mapping.inode, manifest_mapping.inode,
+            "the witness requires distinct opened objects"
+        );
+        let offset = scanned_inspected.executable_ranges[0].0;
+        let key = |mapping: p11scope_manifest::identity::MappingFileKey| ObjectKey {
+            device: p11scope_manifest::maps::Device {
+                major: mapping.device_major,
+                minor: mapping.device_minor,
+            },
+            inode: mapping.inode,
+        };
+        let module = ScannedModule {
+            view: ProcessViewId(0),
+            mount_namespace: current_mount_namespace(),
+            key: key(module_mapping),
+            path: module_path.display().to_string(),
+            exports: vec!["C_GetFunctionList".into()],
+            tables: vec![ScannedTable {
+                version: (2, 40),
+                walk: "full",
+                entries: vec![ScannedEntry {
+                    name: "C_Initialize",
+                    object: key(scanned_mapping),
+                    object_path: scanned_target_path.display().to_string(),
+                    file_offset: offset,
+                }],
+                null_entries: vec![],
+                unpinned: vec![],
+                address: 0x7000,
+            }],
+            interfaces: vec![],
+        };
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        });
+        let (mut scan_pins, skipped) = pin_scanned_objects(
+            std::process::id(),
+            std::slice::from_ref(&module),
+            &mut budget,
+        )
+        .unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+
+        let object = |id, path: &Path, identity| ObjectRecord {
+            id,
+            path: path.display().to_string(),
+            identity,
+        };
+        let provenance = |path: &Path,
+                          mapping: p11scope_manifest::identity::MappingFileKey,
+                          identity| ProvenanceObject {
+            path: path.display().to_string(),
+            device_major: mapping.device_major,
+            device_minor: mapping.device_minor,
+            inode: mapping.inode,
+            identity,
+        };
+        let mut manifest = Manifest {
+            schema: SCHEMA.into(),
+            module_path: module_path.display().to_string(),
+            objects: vec![
+                object(0, &module_path, module_inspected.identity.clone()),
+                object(
+                    1,
+                    &manifest_target_path,
+                    manifest_inspected.identity.clone(),
+                ),
+            ],
+            provenance_objects: vec![
+                provenance(&module_path, module_mapping, module_inspected.identity),
+                provenance(
+                    &manifest_target_path,
+                    manifest_mapping,
+                    manifest_inspected.identity,
+                ),
+            ],
+            interface_list: Acquisition::Absent,
+            surfaces: vec![SurfaceRecord {
+                source: SurfaceSource::LegacyFunctionList,
+                acquisition: Acquisition::Ok,
+                version: Some(Version {
+                    major: 2,
+                    minor: 40,
+                }),
+                walk: WalkOutcome::Full,
+                functions: pkcs11_module::FUNCTION_LIST_FIELDS
+                    .iter()
+                    .map(|field| FunctionRecord {
+                        name: field.name.into(),
+                        resolution: Resolution::Resolved {
+                            object: 1,
+                            file_offset: offset,
+                        },
+                    })
+                    .collect(),
+            }],
+            vendor_interfaces: vec![],
+            alias_groups: vec![],
+        };
+        let manifest_pins = pin_manifest_objects(&manifest).unwrap();
+        let view = scan_view(
+            &manifest,
+            std::slice::from_ref(&module),
+            &scan_pins,
+            &manifest_pins,
+        )
+        .expect("the module itself exact-matches");
+        let scanned_targets = scanned_targets(&view.modules, &scan_pins).unwrap();
+        let manifest_targets = manifest_targets(&manifest, &manifest_pins).unwrap();
+        let outcome = corroborate(
+            false,
+            Some(view.agrees),
+            scan_pins.exactly_same_targets(&scanned_targets, &manifest_pins, &manifest_targets),
+            scanned_targets.is_empty(),
+        );
+        assert_eq!(
+            outcome,
+            Corroboration::Conflict,
+            "equal digest/offset must not suppress a distinct opened target"
+        );
+
+        retarget_to_pins(&mut manifest, &view.modules, &scan_pins, &manifest_pins);
+        assert!(scan_pins.absorb(manifest_pins).is_empty());
+        let (modules, _, uncertainty) =
+            reconcile_scanned_modules(std::slice::from_ref(&module), &mut scan_pins);
+        assert!(uncertainty.is_empty(), "{uncertainty:?}");
+        let plan = plan::build_from_sources(&modules, &[manifest], &scan_pins);
+        assert_eq!(plan.slots.len(), 2, "both exact opened targets must attach");
+        assert_eq!(
+            plan.slots
+                .iter()
+                .map(|slot| slot.object)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2,
+            "the union must retain two distinct capture-local identities"
+        );
+        let mut counters = DiscoveryCounters {
+            conflicts: 1,
+            ..DiscoveryCounters::default()
+        };
+        counters.corroboration.push((module.key, "conflict"));
+        assert_eq!(
+            discovery_evidence(&plan, &scan_pins, &counters).conflicts,
+            1,
+            "the conflict is the bounded evidence that forces PARTIAL"
         );
     }
 
@@ -2525,44 +2718,43 @@ mod tests {
     /// capture claims about it.
     #[test]
     fn the_corroboration_outcomes() {
-        let recorded = targets(&[0x10, 0x20]);
         // 1. Not mapped in scope: the manifest stands on its own.
         assert_eq!(
-            corroborate(false, None, &recorded, &BTreeSet::new()),
+            corroborate(false, None, false, true),
             Corroboration::Uncorroborated
         );
         // 2. Mapped, same {object, offset} set: corroborated.
         assert_eq!(
-            corroborate(false, Some(true), &recorded, &targets(&[0x10, 0x20])),
+            corroborate(false, Some(true), true, false),
             Corroboration::Agreed
         );
         // 3. Mapped, the sets differ: a conflict (the caller attaches the union).
         assert_eq!(
-            corroborate(false, Some(true), &recorded, &targets(&[0x10, 0x30])),
+            corroborate(false, Some(true), false, false),
             Corroboration::Conflict
         );
         // 3b. Mapped and identity-matched, but the scan decoded no table at all:
         // the documented use of `--manifest`, not two sources contradicting each
         // other. Reported as uncorroborated, never as a disagreement.
         assert_eq!(
-            corroborate(false, Some(true), &recorded, &BTreeSet::new()),
+            corroborate(false, Some(true), false, true),
             Corroboration::ScanEmpty
         );
         // Two empty sets are not a scan-empty case: nothing was recorded either.
         assert_eq!(
-            corroborate(false, Some(true), &BTreeSet::new(), &BTreeSet::new()),
+            corroborate(false, Some(true), true, true),
             Corroboration::Agreed
         );
         // 4. Mapped, but the bytes are not the ones the manifest recorded.
         assert_eq!(
-            corroborate(false, Some(false), &recorded, &recorded),
+            corroborate(false, Some(false), true, false),
             Corroboration::IdentityMismatch
         );
         // A scan that could not read memory found no tables to disagree with, so it
         // never turns a usable manifest into a conflict or a mismatch.
         for identity in [None, Some(true), Some(false)] {
             assert_eq!(
-                corroborate(true, identity, &recorded, &BTreeSet::new()),
+                corroborate(true, identity, false, true),
                 Corroboration::Uncorroborated,
                 "{identity:?}"
             );

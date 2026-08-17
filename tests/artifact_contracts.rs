@@ -327,6 +327,24 @@ fn every_script_parses_with_sh_n() {
     }
 }
 
+#[test]
+fn linux_permission_denial_classifier_accepts_eacces_and_eperm_only() {
+    let status = Command::new("sh")
+        .args([
+            "-c",
+            ". scripts/lib.sh; \
+             printf '%s\n' 'open failed: Permission denied' | is_linux_permission_denial && \
+             printf '%s\n' 'BPF_MAP_CREATE failed: Operation not permitted' | is_linux_permission_denial && \
+             ! printf '%s\n' 'BPF_MAP_CREATE failed: Invalid argument' | is_linux_permission_denial",
+        ])
+        .status()
+        .expect("exercise the Linux permission-denial classifier");
+    assert!(
+        status.success(),
+        "the denial classifier rejected its contract"
+    );
+}
+
 /// `scripts/attach-pod.sh` runs `p11scope profile --cgroup` against a pod the
 /// operator names, so every name it accepts reaches a kubectl JSONPath filter
 /// and a cgroup search. Its refusals are the contract, and they must hold with

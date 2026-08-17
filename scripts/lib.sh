@@ -15,6 +15,12 @@ require_non_root_caller() {
     }
 }
 
+# Linux reports permission refusal as EACCES or EPERM depending on which
+# privileged operation failed. Both are denial; neither authorizes proceeding.
+is_linux_permission_denial() {
+    grep -Eq 'Permission denied|Operation not permitted'
+}
+
 cleanup_step() {
     "$@"
     cleanup_step_status=$?

@@ -293,8 +293,23 @@ fn merge(
             corroborated: false,
             skipped: Vec::new(),
         });
+        let mut seen_targets = BTreeSet::new();
+        let mut seen_skips = BTreeSet::new();
+        let mut seen_tables = Vec::new();
+        let mut seen_surfaces = Vec::new();
+        let mut group_surfaces = Vec::new();
+        let mut group_skips = Vec::new();
         for module in group {
+            debug_assert_eq!(
+                module.entries_seen,
+                module.targets.len() + module.skipped.len()
+            );
+            let mut target_occurrences = BTreeMap::new();
             for target in &module.targets {
+                let record = (target.name.to_string(), target.object, target.file_offset);
+                let occurrence = target_occurrences.entry(record.clone()).or_insert(0usize);
+                seen_targets.insert((module.source, record.0, record.1, record.2, *occurrence));
+                *occurrence += 1;
                 let position = *positions
                     .entry((target.object, target.file_offset))
                     .or_insert_with(|| {
@@ -321,18 +336,59 @@ fn merge(
             if summary.source != module.source {
                 summary.source = "scan+manifest";
             }
-            summary.tables.extend(module.tables);
+            let mut module_tables = Vec::new();
+            for table in module.tables {
+                let occurrence = module_tables
+                    .iter()
+                    .filter(|known| *known == &table)
+                    .count();
+                module_tables.push(table.clone());
+                if !seen_tables.iter().any(|(source, known, known_occurrence)| {
+                    *source == module.source && known == &table && *known_occurrence == occurrence
+                }) {
+                    seen_tables.push((module.source, table.clone(), occurrence));
+                    summary.tables.push(table);
+                }
+            }
             // Never summed across sources: the scan and a manifest describing one
             // provider both count *its* interfaces, so adding them reports two where
             // there is one — on exactly the corroborated path this slice is built
             // around. Each source sees a subset (the scan only records an interface
             // whose table it decoded), so the most any one saw is the honest number.
             summary.interfaces = summary.interfaces.max(module.interfaces);
-            summary.skipped.extend(module.skipped.iter().cloned());
-            surfaces.extend(module.surfaces);
-            skipped.extend(module.skipped);
-            entries_seen += module.entries_seen;
+            let mut module_surfaces = Vec::new();
+            for surface in module.surfaces {
+                let occurrence = module_surfaces
+                    .iter()
+                    .filter(|known| *known == &surface)
+                    .count();
+                module_surfaces.push(surface.clone());
+                if !seen_surfaces
+                    .iter()
+                    .any(|(source, known, known_occurrence)| {
+                        *source == module.source
+                            && known == &surface
+                            && *known_occurrence == occurrence
+                    })
+                {
+                    seen_surfaces.push((module.source, surface.clone(), occurrence));
+                    group_surfaces.push(surface);
+                }
+            }
+            let mut skip_occurrences = BTreeMap::new();
+            for skip in module.skipped {
+                let record = (skip.subject.clone(), skip.reason.clone());
+                let occurrence = skip_occurrences.entry(record.clone()).or_insert(0usize);
+                if seen_skips.insert((module.source, record.0, record.1, *occurrence)) {
+                    summary.skipped.push(skip.clone());
+                    group_skips.push(skip);
+                }
+                *occurrence += 1;
+            }
         }
+        entries_seen += seen_targets.len() + seen_skips.len();
+        surfaces.extend(group_surfaces);
+        skipped.extend(group_skips);
     }
 
     let slots: Vec<Slot> = building

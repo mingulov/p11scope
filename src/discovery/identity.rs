@@ -11,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 
 use p11scope_manifest::identity::{
     IdentityKind, MappingFileKey, ObjectIdentity, inspect_file, inspect_file_with_reader,
-    mapping_file_key, open_object,
+    mapping_file_key, mapping_file_key_in_mountinfo, open_object,
 };
 use p11scope_manifest::manifest::{Manifest, Resolution};
 use p11scope_manifest::maps::{Device, ObjectKey};
@@ -212,6 +212,7 @@ pub struct PinnedObjects {
     by_id: BTreeMap<PinnedObjectId, Entry>,
     raw_to_id: BTreeMap<RawObjectInstance, PinnedObjectId>,
     rejected_keys: BTreeSet<ObjectKey>,
+    ambiguity_emitted: BTreeSet<ObjectKey>,
     ownership: BTreeMap<ProcessViewId, ViewClaims>,
     next_id: u32,
     /// Latched by `check_unchanged` the first time any pin differs.
@@ -226,6 +227,7 @@ impl PinnedObjects {
             by_id: BTreeMap::new(),
             raw_to_id: BTreeMap::new(),
             rejected_keys: BTreeSet::new(),
+            ambiguity_emitted: BTreeSet::new(),
             ownership: BTreeMap::new(),
             next_id: 0,
             changed: std::cell::Cell::new(false),
@@ -257,8 +259,9 @@ impl PinnedObjects {
             }
         }
         for key in other.rejected_keys {
-            self.reject_key(key, &mut skipped);
+            self.reject_observation(key, &mut skipped);
         }
+        self.ambiguity_emitted.extend(other.ambiguity_emitted);
         for (view, claims) in other.ownership {
             let ours = self.ownership.entry(view).or_default();
             ours.tables.extend(
@@ -343,6 +346,31 @@ impl PinnedObjects {
             .is_some_and(|(left, right)| ordinary_identity_equal(left, right))
     }
 
+    /// Exact equality for target sets whose IDs belong to separate pin stores.
+    /// Numeric IDs are never compared across stores; the ordered key is the same
+    /// complete opened-file identity used by `exactly_matches`, plus the offset.
+    pub fn exactly_same_targets(
+        &self,
+        targets: &BTreeSet<(PinnedObjectId, u64)>,
+        other: &Self,
+        other_targets: &BTreeSet<(PinnedObjectId, u64)>,
+    ) -> bool {
+        let keys = |pinned: &Self, targets: &BTreeSet<(PinnedObjectId, u64)>| {
+            let keys: Option<BTreeSet<_>> = targets
+                .iter()
+                .map(|(id, offset)| {
+                    let entry = pinned.by_id.get(id)?;
+                    (!entry.sha256.is_empty())
+                        .then(|| (entry.mapping, entry.pin, entry.sha256.clone(), *offset))
+                })
+                .collect();
+            keys.filter(|keys| keys.len() == targets.len())
+        };
+        keys(self, targets)
+            .zip(keys(other, other_targets))
+            .is_some_and(|(ours, theirs)| ours == theirs)
+    }
+
     pub fn id_for_scanned(
         &self,
         module: &ScannedModule,
@@ -391,7 +419,7 @@ impl PinnedObjects {
     fn insert_entry(&mut self, entry: Entry, skipped: &mut Vec<Skipped>) -> Option<PinnedObjectId> {
         let key = entry.raw.key;
         if self.rejected_keys.contains(&key) {
-            skipped.push(ambiguous_identity_skip());
+            self.emit_ambiguity(key, skipped);
             return None;
         }
         let same_key: Vec<PinnedObjectId> = self
@@ -444,6 +472,23 @@ impl PinnedObjects {
             claims.remove(&ids);
         }
         if !ids.is_empty() {
+            self.emit_ambiguity(key, skipped);
+        }
+    }
+
+    /// Records another member of a group that is already known only as rejected.
+    /// The first unavailable observation establishes fail-closed state; the second
+    /// establishes the finite collision-group ambiguity, once per raw key.
+    fn reject_observation(&mut self, key: ObjectKey, skipped: &mut Vec<Skipped>) {
+        let repeated = self.rejected_keys.contains(&key);
+        self.reject_key(key, skipped);
+        if repeated {
+            self.emit_ambiguity(key, skipped);
+        }
+    }
+
+    fn emit_ambiguity(&mut self, key: ObjectKey, skipped: &mut Vec<Skipped>) {
+        if self.ambiguity_emitted.insert(key) {
             skipped.push(ambiguous_identity_skip());
         }
     }
@@ -489,6 +534,14 @@ fn overlay_uncertainty(entry: &Entry, kept: &Entry) -> Skipped {
 /// incomparable and fails closed; `st_dev` is never substituted.
 fn identity_of(file: &std::fs::File) -> Result<MappingFileKey, String> {
     mapping_file_key(file).map_err(|error| format!("mapping identity unavailable: {error}"))
+}
+
+fn identity_of_in_mountinfo(
+    file: &std::fs::File,
+    mountinfo: &str,
+) -> Result<MappingFileKey, String> {
+    mapping_file_key_in_mountinfo(file, mountinfo)
+        .map_err(|error| format!("mapping identity unavailable: {error}"))
 }
 
 fn object_key(mapping: MappingFileKey) -> ObjectKey {
@@ -724,12 +777,19 @@ pub fn pin_scanned_view_objects(
 
     let exited = || "process generation exited during discovery".to_string();
     let mut pinned = PinnedObjects::empty();
+    if wanted.is_empty() {
+        if !view.still_the_same() {
+            return Err(exited());
+        }
+        return Ok((pinned, skipped));
+    }
+    let mountinfo = view.mountinfo()?;
     for raw in wanted {
         // Opening through /proc/<pid>/root is a per-pid action (spec §4.5).
         if !view.still_the_same() {
             return Err(exited());
         }
-        let candidate = pin_scanned_object(view, raw.clone(), budget);
+        let candidate = pin_scanned_object(view, raw.clone(), &mountinfo, budget);
         record_scanned_candidate(&mut pinned, raw, candidate, &mut skipped);
     }
     if !view.still_the_same() {
@@ -752,7 +812,7 @@ fn record_scanned_candidate(
             // A missing mapping identity or digest makes every equal raw-key
             // observation incomparable. Remember the failed member so a candidate
             // from another process view cannot become receiver-wins authority.
-            pinned.reject_key(raw.key, skipped);
+            pinned.reject_observation(raw.key, skipped);
             skipped.push(Skipped {
                 subject: raw.path,
                 reason,
@@ -858,11 +918,12 @@ pub fn reconcile_scanned_modules(
 fn pin_scanned_object(
     view: &ProcessView,
     raw: RawObjectInstance,
+    mountinfo: &str,
     budget: &mut CaptureWorkBudget,
 ) -> Result<Entry, String> {
     // The target's own filesystem view: a container's object is never copied out.
     let file = open_object(Path::new(&format!("/proc/{}/root{}", view.pid(), raw.path)))?;
-    let found = identity_of(&file)?;
+    let found = identity_of_in_mountinfo(&file, mountinfo)?;
     if object_key(found) != raw.key {
         return Err(format!(
             "identity_mismatch: the mapping is {:?} but {} now opens as {:?} \
@@ -1093,6 +1154,59 @@ mod tests {
     }
 
     #[test]
+    fn two_unavailable_same_key_observations_emit_one_bounded_ambiguity() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let raw = image_pins(&[(key, "aaaaaaaa", 1)])
+            .by_id
+            .pop_first()
+            .unwrap()
+            .1
+            .raw;
+        let mut aggregate = PinnedObjects::empty();
+        let mut skipped = Vec::new();
+        for view in 1..=2 {
+            let mut pins = PinnedObjects::empty();
+            let mut raw = raw.clone();
+            raw.mount_namespace = Some(MountNamespaceId {
+                device: 1,
+                inode: view,
+            });
+            record_scanned_candidate(
+                &mut pins,
+                raw,
+                Err(format!(
+                    "/private/view-{view}.so: ROUND1_UNAVAILABLE_ERROR_{view}"
+                )),
+                &mut skipped,
+            );
+            skipped.extend(aggregate.absorb(pins));
+        }
+
+        assert_eq!(aggregate.pinned().count(), 0);
+        let ambiguity: Vec<_> = skipped
+            .iter()
+            .filter(|skip| skip.reason.contains("physical identity is ambiguous"))
+            .collect();
+        assert_eq!(
+            ambiguity.len(),
+            1,
+            "the second unavailable member must emit exactly one collision category: {skipped:?}"
+        );
+        let public = crate::render::capture_skipped_out(ambiguity[0]);
+        let rendered = serde_json::to_string(&public).unwrap();
+        assert_eq!(
+            public.reason,
+            "physical identity is ambiguous; the collision group was not attached"
+        );
+        for private in ["/private/", "ROUND1_UNAVAILABLE_ERROR", "view-1", "view-2"] {
+            assert!(!rendered.contains(private), "leaked {private}: {rendered}");
+        }
+    }
+
+    #[test]
     fn same_raw_key_overlay_candidates_keep_the_explicit_partial_exception() {
         let key = ObjectKey {
             device: Device {
@@ -1231,9 +1345,11 @@ mod tests {
         assert!(!plan.slots[0].semantic_ambiguous);
         assert_eq!(plan.module_ambiguous, 0);
         assert_eq!(
-            plan.entries_seen, 2,
-            "both process views retain their table claims"
+            plan.entries_seen, 1,
+            "duplicate view claims stay in ownership, not public table cardinality"
         );
+        assert_eq!(plan.modules[0].tables.len(), 1);
+        assert_eq!(plan.surfaces.len(), 1);
         // Every plan reference is a capture-local pin ID; attach has no raw-key or
         // pathname fallback.
         assert!(pinned.attach_path_for(plan.slots[0].object).is_ok());
@@ -1392,11 +1508,11 @@ mod tests {
         // identity uncertainty; neither view's target is lost.
         assert_eq!(lost.len(), 1, "{lost:?}");
         assert!(lost[0].reason.contains("cannot prove physical identity"));
+        let plan = crate::plan::build_from_reconciled_modules(&modules);
+        assert_eq!(plan.slots.len(), 2);
         assert_eq!(
-            crate::plan::build_from_reconciled_modules(&modules)
-                .slots
-                .len(),
-            2
+            plan.entries_seen, 2,
+            "the shared entry is one record and the patched target extends its union"
         );
 
         // Reversed: the mapping that wins on count is missing a target the other had.

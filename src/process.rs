@@ -251,6 +251,26 @@ impl ProcessView {
     pub fn still_the_same(&self) -> bool {
         self.pin.still_the_same()
     }
+
+    /// Reads the mount table belonging to this retained process generation.
+    /// Callers use it only with fds opened through this view's `/proc/<pid>/root`.
+    pub(crate) fn mountinfo(&self) -> Result<String, String> {
+        let exited = || {
+            format!(
+                "pid {} exited while its mount table was being read",
+                self.pid()
+            )
+        };
+        if !self.still_the_same() {
+            return Err(exited());
+        }
+        let mountinfo = std::fs::read_to_string(format!("/proc/{}/mountinfo", self.pid()))
+            .map_err(|error| format!("cannot read pid {}'s mount table: {error}", self.pid()))?;
+        if !self.still_the_same() {
+            return Err(exited());
+        }
+        Ok(mountinfo)
+    }
 }
 
 /// A process identity that survives PID reuse. `pidfd_open` is exact; the

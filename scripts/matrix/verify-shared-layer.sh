@@ -139,7 +139,7 @@ UNPRIV_RC=$?
 set -e
 printf '%s\n' "$UNPRIV_OUT"
 [ "$UNPRIV_RC" -ne 0 ] || { echo "unprivileged profile unexpectedly succeeded"; exit 1; }
-printf '%s\n' "$UNPRIV_OUT" | grep -Fq 'Permission denied' \
+printf '%s\n' "$UNPRIV_OUT" | is_linux_permission_denial \
     || { echo "unprivileged run failed for an unexpected reason" >&2; exit 1; }
 
 run_capture() {

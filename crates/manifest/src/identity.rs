@@ -95,6 +95,19 @@ pub fn open_object(path: &Path) -> Result<std::fs::File, String> {
 /// subvolume device while maps reports the containing mount's device.
 #[cfg(feature = "identify")]
 pub fn mapping_file_key(file: &std::fs::File) -> Result<MappingFileKey, String> {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|error| format!("reading mount table failed: {error}"))?;
+    mapping_file_key_in_mountinfo(file, &mountinfo)
+}
+
+/// Resolves an opened fd's mount ID in the mount table of the process view
+/// through which it was opened. Mount IDs name mounts, not global devices, so a
+/// foreign `/proc/<pid>/root` fd must not be resolved through the observer's table.
+#[cfg(feature = "identify")]
+pub fn mapping_file_key_in_mountinfo(
+    file: &std::fs::File,
+    mountinfo: &str,
+) -> Result<MappingFileKey, String> {
     use std::os::unix::fs::MetadataExt as _;
 
     let metadata = file
@@ -109,8 +122,6 @@ pub fn mapping_file_key(file: &std::fs::File) -> Result<MappingFileKey, String> 
     let parsed_mount_id = mount_id
         .parse()
         .map_err(|_| format!("invalid fd mount identity {mount_id:?}"))?;
-    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
-        .map_err(|error| format!("reading mount table failed: {error}"))?;
     let device = mountinfo
         .lines()
         .find_map(|line| {
@@ -279,4 +290,34 @@ fn unavailable(note: String) -> ObjectIdentity {
 #[cfg(feature = "identify")]
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(all(test, feature = "identify"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_process_view_mount_table_controls_the_mapping_device() {
+        let file = open_object(Path::new("/bin/sh")).unwrap();
+        let observer = mapping_file_key(&file).unwrap();
+        let target_major = observer.device_major.saturating_add(1);
+        let target_minor = observer.device_minor.saturating_add(1);
+        let target_mountinfo = format!(
+            "{} 1 {target_major}:{target_minor} / /target rw - ext4 /dev/target rw\n",
+            observer.mount_id
+        );
+
+        let found = mapping_file_key_in_mountinfo(&file, &target_mountinfo).unwrap();
+        assert_eq!(found.mount_id, observer.mount_id);
+        assert_eq!(
+            (found.device_major, found.device_minor),
+            (target_major, target_minor),
+            "an fd opened through a retained process view must resolve in that view's mount table"
+        );
+        assert_eq!(found.inode, observer.inode, "inode still comes from fstat");
+        let error =
+            mapping_file_key_in_mountinfo(&file, "999999 1 8:1 / /other rw - ext4 /dev/other rw\n")
+                .expect_err("an absent view-local mount ID must remain incomparable");
+        assert!(error.contains("is missing from the mount table"), "{error}");
+    }
 }

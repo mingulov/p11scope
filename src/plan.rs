@@ -425,21 +425,32 @@ fn lower_scanned(module: &ScannedModule) -> Discovered<'_> {
     }
 }
 
-/// The (device, inode) discovery recorded for a manifest object. Identity lives
-/// in `provenance_objects`; `objects[]` carries only paths and hashes. Matching by
-/// path first and by whole-file hash second is what `validate_structure` guarantees
-/// (every object's sha256 is in the provenance closure).
-fn object_key(m: &Manifest, object: &ObjectRecord) -> Option<ObjectKey> {
-    let provenance = m
-        .provenance_objects
+/// Which `provenance_objects[]` record carries the identity of an `objects[]` record.
+/// Matching by path first and by whole-file hash second is what `validate_structure`
+/// guarantees (every object's sha256 is in the provenance closure); the two paths are
+/// *not* the same string in general — `p11scope-discover` writes `objects[].path` as
+/// the `--module` argument was spelled and `provenance_objects[].path` as
+/// `/proc/self/maps` renders it, which differ for any provider named by symlink.
+///
+/// Public because `main.rs::retarget_to_pins` rewrites the record this returns before
+/// the plan is built: one relation used by both, rather than two written against
+/// different fields, which is exactly how they drifted apart once already.
+pub fn provenance_of(m: &Manifest, object: &ObjectRecord) -> Option<usize> {
+    m.provenance_objects
         .iter()
-        .find(|p| p.path == object.path)
+        .position(|p| p.path == object.path)
         .or_else(|| {
             let sha256 = object.identity.sha256.as_deref()?;
             m.provenance_objects
                 .iter()
-                .find(|p| p.identity.sha256.as_deref() == Some(sha256))
-        })?;
+                .position(|p| p.identity.sha256.as_deref() == Some(sha256))
+        })
+}
+
+/// The (device, inode) discovery recorded for a manifest object. Identity lives
+/// in `provenance_objects`; `objects[]` carries only paths and hashes.
+fn object_key(m: &Manifest, object: &ObjectRecord) -> Option<ObjectKey> {
+    let provenance = &m.provenance_objects[provenance_of(m, object)?];
     Some(ObjectKey {
         device: Device {
             major: provenance.device_major,

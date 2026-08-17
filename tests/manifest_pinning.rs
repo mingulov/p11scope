@@ -238,8 +238,19 @@ fn symlink_is_pinned_and_non_executable_offsets_are_refused() {
     symlink_manifest.module_path = link.display().to_string();
     symlink_manifest.objects[0].path = link.display().to_string();
     let pinned = p11scope::discovery::identity::pin_manifest_objects(&symlink_manifest).unwrap();
+    // Note the shape: `objects[0].path` is the symlink the operator named, while
+    // `provenance_objects[0].path` is what a mapping of it shows — the two pathnames
+    // in one manifest that `p11scope-discover` produces for any provider named
+    // through a symlink. A pin is filed under the *object's* path and keyed by the
+    // identity that path resolves to; `main.rs::retarget_to_pins` relies on exactly
+    // that pairing to replace a stale recorded identity with the live one.
+    let summary = pinned.pinned().next().expect("one object is pinned");
+    assert_eq!(pinned.pinned().count(), 1);
+    assert_eq!(summary.path, symlink_manifest.objects[0].path);
+    assert_ne!(summary.path, symlink_manifest.provenance_objects[0].path);
+    assert_eq!(summary.key, manifest_key(&link));
     let attach = pinned
-        .attach_path_for(manifest_key(&link))
+        .attach_path_for(summary.key)
         .expect("a symlinked object is pinned by the identity it resolves to");
     let replacement = cc_so(&d, "replacement", "int f(void){return 2;}\n");
     std::fs::remove_file(&link).unwrap();

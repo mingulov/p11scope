@@ -353,20 +353,29 @@ fn retarget_to_pins(
             )
         })
         .collect();
-    for provenance in &mut m.provenance_objects {
-        let sha = provenance.identity.sha256.as_deref();
-        let Some(summary) = scan_pins
-            .pinned()
-            .find(|p| seen.contains(&p.key) && Some(p.sha256) == sha)
-            // This manifest's own pins are indexed by the path the manifest names,
-            // so the fallback is an exact match, not a guess by content.
-            .or_else(|| own_pins.pinned().find(|p| p.path == provenance.path))
-        else {
-            continue;
-        };
-        provenance.device_major = summary.key.device.major;
-        provenance.device_minor = summary.key.device.minor;
-        provenance.inode = summary.key.inode;
+    // Driven from `objects[]`, because that is what was pinned: `pin_manifest_objects`
+    // opens `ObjectRecord.path` and files the pin under it, so the own-pin lookup below
+    // is an exact match rather than a second guess at which record describes which
+    // file. `plan::provenance_of` then says which provenance record the plan will read
+    // that object's identity from — the same relation, so the record rewritten here is
+    // always the record read there.
+    let updates: Vec<(usize, ObjectKey)> = m
+        .objects
+        .iter()
+        .filter_map(|object| {
+            let sha = object.identity.sha256.as_deref();
+            let summary = scan_pins
+                .pinned()
+                .find(|p| seen.contains(&p.key) && Some(p.sha256) == sha)
+                .or_else(|| own_pins.pinned().find(|p| p.path == object.path))?;
+            Some((plan::provenance_of(m, object)?, summary.key))
+        })
+        .collect();
+    for (index, key) in updates {
+        let provenance = &mut m.provenance_objects[index];
+        provenance.device_major = key.device.major;
+        provenance.device_minor = key.device.minor;
+        provenance.inode = key.inode;
     }
 }
 
@@ -479,10 +488,10 @@ fn scan_and_pin(
 /// Drops every table entry whose object was not pinned, returning one `Skipped` per
 /// drop. `pin_scanned_objects` skips an object it cannot open, identify or afford to
 /// hash rather than failing the capture (spec §4.10) — so an entry pointing into one
-/// has no attach path of its own. Left in the plan it would either fail the whole
-/// attach (the opposite of what that skip is for) or, now that manifest pins share
-/// the set, fall back to `attach_path(object_path)` and probe the *observer's* file
-/// at the target's pathname, which in a container is a different file entirely.
+/// has no attach path of its own, and `Session::start` resolves slots by key with no
+/// fallback. Keeping such an entry would fail the whole attach, which is the opposite
+/// of what that per-object skip exists for: this is the scanned half of "every key in
+/// a plan is one this capture pinned".
 fn drop_unpinned_entries(modules: &mut [ScannedModule], pinned: &PinnedObjects) -> Vec<Skipped> {
     let mut dropped = Vec::new();
     for module in modules {
@@ -552,7 +561,10 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<(plan::AttachPlan, Pi
 
     let mut accepted: Vec<Manifest> = Vec::new();
     let mut corroborated: Vec<ObjectKey> = Vec::new();
-    let mut ignored = 0usize;
+    // Only §4.12's identity mismatch: a manifest whose bytes are not the mapped
+    // object's. Distinct from `counters.uncorroborated`, which counts manifests that
+    // were *accepted* with nothing to corroborate them.
+    let mut identity_mismatches = 0usize;
     for path in &a.manifests {
         let mut manifest = read_manifest_file(path)?;
         let manifest_pins = pin_manifest_objects(&manifest).map_err(|problems| {
@@ -604,7 +616,7 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<(plan::AttachPlan, Pi
                 pinned.absorb(manifest_pins);
             }
             Corroboration::IdentityMismatch => {
-                ignored += 1;
+                identity_mismatches += 1;
                 counters.notes.push(format!(
                     "ignoring manifest {}: the {} mapped in the target does not hash to \
                      the sha256 it records",
@@ -634,10 +646,11 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<(plan::AttachPlan, Pi
         .count() as u64;
     // Ignoring a manifest is only fatal when it was the sole discovery source and
     // nothing else found a table (spec §4.12).
-    if ignored > 0 && plan.slots.is_empty() {
+    if identity_mismatches > 0 && plan.slots.is_empty() {
         bail!(
-            "every --manifest was ignored (see the lines above) and no other discovery \
-             source found a function table"
+            "{identity_mismatches} --manifest input(s) were ignored as stale — their \
+             recorded sha256 is not the mapped object's (see the lines above) — and no \
+             discovery source found a function table"
         );
     }
     // The merge refuses an over-capacity module whole rather than attaching a
@@ -1479,6 +1492,36 @@ mod tests {
         (modules, pinned)
     }
 
+    /// The pin `pin_manifest_objects` produces for one manifest object: filed under
+    /// the path the manifest names (`ObjectRecord.path`, which it opens), keyed by the
+    /// identity that path resolves to right now. Built through `pin_scanned_objects`
+    /// only because reaching `pin_manifest_objects` needs a canonical full function
+    /// list; the `Entry` — the only thing a retarget reads — is the same one.
+    fn pin_as_manifest_object(object_path: &str) -> PinnedObjects {
+        let file = p11scope_manifest::identity::open_object(Path::new(object_path)).unwrap();
+        let found = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
+        let (pins, skipped) = pin_scanned_objects(
+            std::process::id(),
+            &[ScannedModule {
+                key: ObjectKey {
+                    device: p11scope_manifest::maps::Device {
+                        major: found.device_major,
+                        minor: found.device_minor,
+                    },
+                    inode: found.inode,
+                },
+                path: object_path.to_string(),
+                exports: vec![],
+                tables: vec![],
+                interfaces: vec![],
+            }],
+            ScanLimits::default(),
+        )
+        .unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        pins
+    }
+
     fn entry(name: &'static str, object: ObjectKey, file_offset: u64) -> ScannedEntry {
         ScannedEntry {
             name,
@@ -1542,34 +1585,12 @@ mod tests {
         let (_, mut pins) = pinned_self();
         let collision = pins.pinned().next().unwrap().key;
 
-        // A second, unrelated file, pinned the way every object is: under the identity
-        // it has right now. (`pin_manifest_objects` would need a canonical full
-        // function list to reach this point; the `Entry` it produces is this one.)
+        // A second, unrelated file.
         let dir = tempfile::tempdir().unwrap();
         let provider = dir.path().join("provider.so");
         std::fs::copy("/bin/sh", &provider).unwrap();
         let path = provider.display().to_string();
-        let file = p11scope_manifest::identity::open_object(&provider).unwrap();
-        let found = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
-        let (own, skipped) = pin_scanned_objects(
-            std::process::id(),
-            &[ScannedModule {
-                key: ObjectKey {
-                    device: p11scope_manifest::maps::Device {
-                        major: found.device_major,
-                        minor: found.device_minor,
-                    },
-                    inode: found.inode,
-                },
-                path: path.clone(),
-                exports: vec![],
-                tables: vec![],
-                interfaces: vec![],
-            }],
-            ScanLimits::default(),
-        )
-        .unwrap();
-        assert!(skipped.is_empty(), "{skipped:?}");
+        let own = pin_as_manifest_object(&path);
 
         let mut m = manifest_naming(&path, Some("11".repeat(32)));
         // The stale pair, here colliding with the live pin of a different file.
@@ -1588,6 +1609,61 @@ mod tests {
             "a manifest slot must attach into its own object, never into whatever \
              live pin happens to share the identity it recorded"
         );
+    }
+
+    /// `p11scope-discover` writes `objects[].path` as the `--module` argument was
+    /// spelled and `provenance_objects[].path` as `/proc/self/maps` renders it — the
+    /// resolved target. Any provider named through a symlink (`libykcs11.so` →
+    /// `.so.2.x`, usrmerge `/lib` → `/usr/lib`) therefore has two different pathnames
+    /// in one manifest, and a retarget that looked the pin up by the provenance path
+    /// would find none: the recorded pair would survive into the plan, which either
+    /// resolves to an unrelated file that shares it or fails to resolve at all.
+    #[test]
+    fn a_manifest_naming_its_object_and_its_provenance_differently_is_still_retargeted() {
+        let (_, mut pins) = pinned_self();
+        let collision = pins.pinned().next().unwrap().key;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("provider.so.2.4");
+        std::fs::copy("/bin/sh", &real).unwrap();
+        let link = dir.path().join("provider.so");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (link_path, real_path) = (link.display().to_string(), real.display().to_string());
+
+        let own = pin_as_manifest_object(&link_path);
+        pins.absorb(pin_as_manifest_object(&link_path));
+
+        // A pair nothing pins (a manifest reused after a rebuild — the case pinning
+        // exists to support), then one colliding with a live pin of another file.
+        for recorded in [
+            ObjectKey {
+                device: p11scope_manifest::maps::Device {
+                    major: 0xffff,
+                    minor: 0xffff,
+                },
+                inode: u64::MAX,
+            },
+            collision,
+        ] {
+            let mut m = manifest_naming(&link_path, Some("11".repeat(32)));
+            m.provenance_objects[0].path = real_path.clone();
+            m.provenance_objects[0].device_major = recorded.device.major;
+            m.provenance_objects[0].device_minor = recorded.device.minor;
+            m.provenance_objects[0].inode = recorded.inode;
+
+            retarget_to_pins(&mut m, None, &pins, &own);
+
+            let plan = plan::build_from_sources(&[], std::slice::from_ref(&m));
+            let attach = pins.attach_path_for(plan.slots[0].object).expect(
+                "a manifest whose recorded identity is not the live one must still \
+                 resolve — that reuse is what pinning by build-id and sha256 is for",
+            );
+            assert_eq!(
+                std::fs::metadata(&attach).unwrap().ino(),
+                std::fs::metadata(&real).unwrap().ino(),
+                "recorded {recorded:?} must not decide what gets attached"
+            );
+        }
     }
 
     /// The glue that picks among the four §4.12 outcomes: which scanned module a

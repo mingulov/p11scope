@@ -344,6 +344,59 @@ fn a_table_running_past_the_file_backed_data_is_recorded_not_silently_lost() {
     );
 }
 
+/// The same obligation with no hint in sight. An object that exports a registry
+/// entry point is one the *tool itself* classified as a provider: it reaches
+/// `discovery[]` and `capture.modules[]` as a module this capture observed. If
+/// its table is built at run time, nothing was ever probed in it — and with no
+/// entry to skip, no attach to fail and no counter to raise, a capture that
+/// found any other provider publishes COMPLETE over the gap.
+#[test]
+fn an_unhinted_object_the_tool_called_a_provider_says_when_it_yielded_no_table() {
+    let dir = tmp("scan-unhinted-empty");
+    let so = dir.join("tableless.so");
+    let c = dir.join("tableless.c");
+    std::fs::write(
+        &c,
+        "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+    )
+    .unwrap();
+    assert!(
+        Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&so)
+            .arg(&c)
+            .status()
+            .unwrap()
+            .success()
+    );
+    load_and_populate_ignoring_missing_entry(&so);
+    let ScanOutcome::Scanned {
+        modules, skipped, ..
+    } = scan_self(&[])
+    else {
+        panic!("scan must be available")
+    };
+    assert!(
+        modules
+            .iter()
+            .any(|m| m.path.ends_with("tableless.so") && m.tables.is_empty()),
+        "the export makes it a module this capture reports: {modules:?}"
+    );
+    let reasons: Vec<&str> = skipped
+        .iter()
+        .filter(|s| s.subject.ends_with("tableless.so"))
+        .map(|s| s.reason.as_str())
+        .collect();
+    assert!(
+        reasons.iter().any(|r| r.contains("no function table")),
+        "a provider that yielded no table must say so: {skipped:?}"
+    );
+    assert!(
+        !reasons.iter().any(|r| r.contains("hint")),
+        "nobody hinted this module; no reason may claim one: {reasons:?}"
+    );
+}
+
 #[test]
 fn a_hinted_object_with_no_table_says_so() {
     let dir = tmp("scan-hinted-empty");

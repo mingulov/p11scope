@@ -89,6 +89,17 @@ def require(condition, message):
         raise AssertionError(message)
 
 
+def digest_ok(carrier):
+    """A whole-file SHA-256 is present and well-formed.
+
+    `sha256` is `null` for an object this capture never pinned — an absence, not
+    an empty digest — so the null must be rejected as a stated failure rather
+    than crash the length check.
+    """
+    digest = carrier["sha256"]
+    return isinstance(digest, str) and len(digest) == 64
+
+
 def exact_counters(evidence, allowances=None):
     allowances = allowances or {}
     unknown = set(allowances) - set(COUNTERS)
@@ -132,8 +143,7 @@ def exact_common(evidence, *, aliases, skipped, in_flight):
     require(evidence["authority"] == "hash-pinned", f"unexpected authority: {evidence['authority']}")
     require(evidence["discovery"], "evidence.discovery is empty: nothing was discovered")
     for module in evidence["discovery"]:
-        digest = module["sha256"]
-        require(digest and len(digest) == 64, f"module without a whole-file digest: {module}")
+        require(digest_ok(module), f"module without a whole-file digest: {module}")
         require(module["sources"], f"module with no discovery source: {module}")
     require(evidence["modules_skipped"] == [], f"modules refused: {evidence['modules_skipped']}")
     require(evidence["scan_unavailable"] is None, evidence["scan_unavailable"])
@@ -184,7 +194,10 @@ def exact_capture_modules(document):
     require(modules, "capture.modules is empty: the document names no provider")
     for module in modules:
         require(module["path"], f"module without a path: {module}")
-        require(len(module["sha256"]) == 64, f"module without a whole-file digest: {module}")
+        # `sha256` is null for an object nothing pinned — never in a lane that
+        # attached probes, and the guard keeps that a stated rejection rather
+        # than a TypeError traceback.
+        require(digest_ok(module), f"module without a whole-file digest: {module}")
         require(isinstance(module["ino"], int) and module["ino"] > 0, f"module inode: {module}")
         require(len(module["dev"]) == 2, f"module device: {module}")
     require(
@@ -194,6 +207,17 @@ def exact_capture_modules(document):
         ],
         "capture.modules[] and evidence.discovery[] disagree about what was observed",
     )
+    # Every count is attributed to a module the document names, or to nobody at
+    # all with the reason stated. An identity that matches no declared module
+    # would make the attribution unverifiable, which is the point of publishing it.
+    identities = [{key: module[key] for key in ("dev", "ino", "sha256")} for module in modules]
+    for item in document["functions"]:
+        owner, ambiguous = item["module"], item["module_ambiguous"]
+        if owner is None:
+            require(ambiguous is True, f"unattributed function without a reason: {item}")
+            continue
+        require(ambiguous is False, f"attributed function marked ambiguous: {item}")
+        require(owner in identities, f"function attributed to an undeclared module: {item}")
 
 
 def load_json(path):
@@ -354,6 +378,15 @@ MODULE_FIXTURE = {
 }
 
 
+def function_items(pairs):
+    """`functions[]` items as v2 emits them: every count attributed to a module."""
+    identity = {key: MODULE_FIXTURE[key] for key in ("dev", "ino", "sha256")}
+    return [
+        {"names": names, "calls": calls, "module": identity, "module_ambiguous": False}
+        for names, calls in pairs
+    ]
+
+
 def discovery_fixture():
     return [
         dict(
@@ -431,13 +464,12 @@ def self_test():
         mode="metrics",
         privacy="aggregate-only",
     )
-    clean["functions"] = [
-        {"names": ["C_GetFunctionList"], "calls": 1},
-        {"names": ["C_Initialize"], "calls": 1},
-    ]
+    clean["functions"] = function_items(
+        [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
+    )
     validate_clean_metrics(clean, {"C_Initialize": 1})
     bad = copy.deepcopy(clean)
-    bad["functions"].append({"names": ["C_Unexpected"], "calls": 1})
+    bad["functions"] += function_items([(["C_Unexpected"], 1)])
     rejected(lambda: validate_clean_metrics(bad, {"C_Initialize": 1}))
     print("unexpected positive function rejected: OK")
     bad = copy.deepcopy(clean)
@@ -479,7 +511,7 @@ def self_test():
         mode="metrics",
         privacy="aggregate-only",
     )
-    aggregate["functions"] = [{"names": ["C_GetInterfaceList"], "calls": 25}]
+    aggregate["functions"] = function_items([(["C_GetInterfaceList"], 25)])
     validate_canary("aggregate-only-metrics", aggregate)
     bad = copy.deepcopy(aggregate)
     bad["functions"][0]["calls"] = 24
@@ -516,17 +548,16 @@ def self_test():
         unmatched_closes=1,
     )
     induced["G3"] = document_fixture(g3)
-    induced["G3"]["functions"] = [
-        {"names": [name], "calls": calls}
-        for name, calls in G3_COUNTS.items()
-    ]
+    induced["G3"]["functions"] = function_items(
+        [([name], calls) for name, calls in G3_COUNTS.items()]
+    )
     g4 = copy.deepcopy(version)
     g4.update(in_flight_at_end=9, start_insert_failures=8)
     induced["G4"] = document_fixture(g4)
     g5 = copy.deepcopy(version)
     g5.update(rv_update_failures=9, unregistered_mechanisms=6, async_orphans=1)
     induced["G5"] = document_fixture(g5)
-    induced["G5"]["functions"] = [{"names": ["C_Initialize"], "calls": 11}]
+    induced["G5"]["functions"] = function_items([(["C_Initialize"], 11)])
     for lane, document in induced.items():
         validate_induced(lane, document)
         bad = copy.deepcopy(document)
@@ -607,6 +638,22 @@ def self_test():
         mutate(bad)
         rejected(lambda bad=bad: exact_capture_modules(bad))
     print("capture.modules[] matches the discovery record exactly: OK")
+
+    # Per-function attribution: to a module the document declares, or to nobody
+    # with the reason stated. Nothing in between.
+    for mutate in (
+        lambda d: d["functions"][0]["module"].update(ino=999),
+        lambda d: d["functions"][0].update(module=None, module_ambiguous=False),
+        lambda d: d["functions"][0].update(module_ambiguous=True),
+        lambda d: d["functions"][0]["module"].update(sha256=None),
+    ):
+        bad = copy.deepcopy(clean)
+        mutate(bad)
+        rejected(lambda bad=bad: exact_capture_modules(bad))
+    unattributed = copy.deepcopy(clean)
+    unattributed["functions"][0].update(module=None, module_ambiguous=True)
+    exact_capture_modules(unattributed)
+    print("every count is attributed to a declared module or to nobody: OK")
     print("self-test: OK")
 
 

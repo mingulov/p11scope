@@ -406,31 +406,63 @@ fn retarget_to_pins(
 /// Every pid discovery must look at. `--cgroup` matches the named cgroup and every
 /// descendant during capture, so discovery walks the same tree: a pod's processes
 /// live in its container cgroups, never in `cgroup.procs` of the pod directory.
-fn scope_pids(scope: &Scope) -> Vec<u32> {
+/// A subtree the observer cannot read is a set of processes that were never even
+/// listed, let alone scanned: the losses are returned, not swallowed, so they end
+/// up in `evidence.skipped` like every other thing discovery could not do.
+fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
     let path = match scope {
-        Scope::Pid(pid) => return vec![*pid],
+        Scope::Pid(pid) => return (vec![*pid], Vec::new()),
         Scope::Cgroup { path, .. } => path,
     };
     let mut pids = Vec::new();
+    let mut lost = Vec::new();
     let mut stack = vec![path.clone()];
     while let Some(dir) = stack.pop() {
-        if let Ok(text) = std::fs::read_to_string(dir.join("cgroup.procs")) {
-            pids.extend(
+        match std::fs::read_to_string(dir.join("cgroup.procs")) {
+            Ok(text) => pids.extend(
                 text.lines()
                     .filter_map(|line| line.trim().parse::<u32>().ok()),
-            );
+            ),
+            // Absent is not unreadable: a directory in the tree that is not a
+            // cgroup has no `cgroup.procs` and hides nothing. Anything else —
+            // permission, I/O — means processes exist here that were never listed.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => lost.push(Skipped {
+                subject: dir.display().to_string(),
+                reason: format!(
+                    "cgroup.procs could not be read ({error}); no process of this cgroup \
+                     was scanned"
+                ),
+            }),
         }
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    stack.push(entry.path());
+        match std::fs::read_dir(&dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        stack.push(entry.path());
+                    }
                 }
             }
+            Err(error) => lost.push(Skipped {
+                subject: dir.display().to_string(),
+                reason: format!(
+                    "the cgroup directory could not be listed ({error}); any process \
+                     below it was never discovered"
+                ),
+            }),
         }
     }
     pids.sort_unstable();
     pids.dedup();
-    pids
+    (pids, lost)
+}
+
+/// What a scope-wide loss is filed under: the cgroup path, or the pid.
+fn scope_label(scope: &Scope) -> String {
+    match scope {
+        Scope::Pid(pid) => format!("pid {pid}"),
+        Scope::Cgroup { path, .. } => path.display().to_string(),
+    }
 }
 
 /// Zero modules is not an error (spec §4.10) — but an operator whose provider was
@@ -546,17 +578,24 @@ fn drop_unpinned_entries(modules: &mut [ScannedModule], pinned: &PinnedObjects) 
 fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
     let limits = ScanLimits::default();
     let mut counters = DiscoveryCounters::default();
-    let pids = scope_pids(scope);
+    let (pids, unlisted) = scope_pids(scope);
+    counters.object_skips.extend(unlisted);
     // The pid the operator named is the capture; a cgroup's processes are many,
     // however few happen to be in it right now.
     let named = matches!(scope, Scope::Pid(_));
     let mut modules: Vec<ScannedModule> = Vec::new();
     let mut pinned = PinnedObjects::empty();
     if pids.len() > MAX_SCAN_PIDS {
-        counters.notes.push(format!(
-            "{} processes in scope; discovery scanned the first {MAX_SCAN_PIDS}",
-            pids.len()
-        ));
+        // Published, not just noted: a provider mapped only by a process past the
+        // cap is undiscovered, unprobed, and has nothing else to show for it.
+        counters.object_skips.push(Skipped {
+            subject: scope_label(scope),
+            reason: format!(
+                "{} processes in scope; discovery scanned the first {MAX_SCAN_PIDS} — a \
+                 provider mapped only by one of the rest was never discovered",
+                pids.len()
+            ),
+        });
     }
     for pid in pids.iter().take(MAX_SCAN_PIDS) {
         match scan_and_pin(*pid, a, limits, &mut counters) {
@@ -570,9 +609,16 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
                 }
             }
             // The pid the operator named *is* the capture; any other is one of many
-            // in a cgroup, and may legitimately exit between listing and scanning.
+            // in a cgroup, and may legitimately exit between listing and scanning —
+            // legitimate, but still a process whose providers went unexamined.
             Err(error) if named => return Err(error),
-            Err(error) => eprintln!("p11scope: discovery skipped pid {pid}: {error:#}"),
+            Err(error) => {
+                eprintln!("p11scope: discovery skipped pid {pid}: {error:#}");
+                counters.object_skips.push(Skipped {
+                    subject: format!("pid {pid}"),
+                    reason: format!("the process could not be scanned: {error:#}"),
+                });
+            }
         }
     }
 
@@ -1835,11 +1881,22 @@ mod tests {
         );
 
         // A cgroup scans many processes mapping the same provider; one loss is
-        // one line, however many processes hit it.
-        let doubled: Vec<Skipped> = skips.iter().chain(skips.iter()).cloned().collect();
+        // one line however many processes hit it — and two *different* losses
+        // are still two, which a dedupe that collapsed by subject would lose.
+        let other = Skipped {
+            subject: skips[0].subject.clone(),
+            reason: "a second, different loss of the same object".into(),
+        };
+        let mixed: Vec<Skipped> = skips
+            .iter()
+            .chain(skips.iter())
+            .cloned()
+            .chain([other.clone()])
+            .collect();
         let mut plan = plan::build_from_modules(&modules);
-        record_object_skips(&mut plan, &doubled);
-        assert_eq!(plan.skipped.len(), skips.len(), "{:?}", plan.skipped);
+        record_object_skips(&mut plan, &mixed);
+        assert_eq!(plan.skipped.len(), skips.len() + 1, "{:?}", plan.skipped);
+        assert!(plan.skipped.contains(&other), "{:?}", plan.skipped);
     }
 
     fn plan_with(slots: usize, refused: usize) -> plan::AttachPlan {
@@ -2248,12 +2305,48 @@ mod tests {
         std::fs::create_dir_all(&leaf).unwrap();
         std::fs::write(root.path().join("cgroup.procs"), "11\n").unwrap();
         std::fs::write(leaf.join("cgroup.procs"), "22\n33\n\n22\n").unwrap();
-        let pids = scope_pids(&Scope::Cgroup {
+        let (pids, lost) = scope_pids(&Scope::Cgroup {
             id: 0,
             path: root.path().to_path_buf(),
         });
         assert_eq!(pids, vec![11, 22, 33], "deduplicated, descendants included");
-        assert_eq!(scope_pids(&Scope::Pid(7)), vec![7]);
+        assert_eq!(lost, vec![], "every directory was readable");
+        assert_eq!(scope_pids(&Scope::Pid(7)).0, vec![7]);
+
+        // A subtree the observer cannot read is not an empty subtree: the
+        // processes in it were never listed, so their providers were never
+        // discovered, and nothing else in the document would say so. An *absent*
+        // cgroup.procs (the intermediate directory above) is not a loss — it is
+        // not a cgroup — which is why the first assertion above sees none.
+        // SAFETY: geteuid() is always safe. Root reads a 0o000 directory anyway,
+        // so the denial below is not reproducible there.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = std::fs::metadata(&leaf).unwrap().permissions();
+        permissions.set_mode(0o000);
+        std::fs::set_permissions(&leaf, permissions).unwrap();
+        let (pids, lost) = scope_pids(&Scope::Cgroup {
+            id: 0,
+            path: root.path().to_path_buf(),
+        });
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(pids, vec![11], "only the readable cgroup's process");
+        assert_eq!(
+            lost.len(),
+            2,
+            "the file and the listing both failed: {lost:?}"
+        );
+        assert!(
+            lost.iter().all(|s| s.subject.ends_with("container.scope")),
+            "{lost:?}"
+        );
+        assert!(
+            lost.iter().any(|s| s.reason.contains("cgroup.procs"))
+                && lost.iter().any(|s| s.reason.contains("never discovered")),
+            "{lost:?}"
+        );
     }
 
     /// Finding nothing is not an error, so the only thing that keeps the operator

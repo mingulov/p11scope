@@ -75,7 +75,7 @@ Metrics mode emits only `schema`, `capture`, `evidence`, and `functions`.
 | `modules[].path` | string | The pathname the source that found it saw. **Not an identity, and not necessarily openable by the observer**: for a module the memory scan found, this is a path in the *target's* mount namespace, which may name a different file — or none — on the host. |
 | `modules[].dev` | `[major, minor]` | Device of the object, as `/proc/<pid>/maps` renders it. |
 | `modules[].ino` | integer | Inode of the object. |
-| `modules[].sha256` | string | Whole-file digest, taken once at pin time. |
+| `modules[].sha256` | string or `null` | Whole-file digest, taken once at pin time. `null` — never `""` — when nothing pinned the object, so no digest was ever taken; that module was discovered but never authorized, and the capture cannot have probed it. |
 | `modules[].build_id` | string or `null` | GNU build-id when the object carries one. |
 
 `capture.modules[]` is a projection of `evidence.discovery[]` in the same order,
@@ -127,7 +127,7 @@ per source.
 | `corroboration[]` | Which §4.12 outcome each source pairing produced — one entry per `--manifest` that named this object, since `--manifest` is repeatable and one outcome must not hide another. Values: `single_source` (no manifest named it), `agreed`, `conflict` (both decoded targets and they differ), `scan_empty` (the scan pinned this object but decoded no table in it — the documented use of `--manifest`, counted as uncorroborated rather than as a disagreement), `uncorroborated` (not mapped in scope, or no scan), `identity_mismatch` (a `--manifest` naming this object was ignored: the mapped bytes are not the ones it records). |
 | `tables[]` | `{version: [major, minor], entries, source}` per function table published, one entry per source that saw it. |
 | `interfaces` | How many interfaces were seen — **the most any one source saw, never the sum across sources**: the scan and a manifest describing one provider each count its interfaces, and each sees a subset (the scan records only an interface whose table it decoded), so this is a lower bound. **Never their names**: those are bytes read out of a provider's memory, and `p11scope inspect` is where they are shown. |
-| `skipped[]` | This module's own unattachable records, `{name, reason}` — the same records as the top-level `skipped`, attributed to the module that published them. |
+| `skipped[]` | This module's own unattachable records, `{name, reason}` — a **subset** of the top-level `skipped`, attributed to the module that published them. The difference between the two lists is exactly the losses no module owns: objects discovery could not read at all, processes it could not scan, and a cgroup subtree it could not list. A top-level entry that appears in no module's list is one of those. |
 
 `identity_mismatch` is decided per *manifest*, not per object: the observer
 compares the SHA-256 of the object at `module_path` and, on a mismatch, ignores
@@ -211,7 +211,7 @@ One item per attach slot:
 | --- | --- |
 | `names` | Every standard function name resolving to the target. |
 | `aliased` | Whether more than one name shares the target. |
-| `module` | `{dev, ino, sha256}` of the module these counts belong to, matching one `capture.modules[]` entry; `null` when two modules publish this target. |
+| `module` | `{dev, ino, sha256}` of the module these counts belong to, matching one `capture.modules[]` entry (its `sha256` may be `null` on the same terms); `null` when two modules publish this target. |
 | `module_ambiguous` | True exactly when `module` is `null` because two modules claim the slot. The counts are real; the owner is not knowable and is never guessed. |
 | `calls` | Returns observed by the aggregate map. |
 | `errors` | Nonzero returns excluding `CKR_PENDING`. |

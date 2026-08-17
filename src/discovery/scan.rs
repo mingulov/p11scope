@@ -208,10 +208,15 @@ fn decode_candidate(
         // Clauses 1–4 held, so this really looks like a table header; only clause 5
         // failed. Recording it is what keeps the .bss-spill gap visible instead of
         // silently returning an empty module (coordinator ruling, 2026-08-16).
+        // No `address` here: the reason is published in the capture document, and a
+        // target's runtime layout is not something a shareable artifact carries
+        // (the same rule that keeps interface names out). The version, the sizes
+        // and the object identity say what was lost; where it lived is a local
+        // debugging detail, and `p11scope inspect` prints table addresses.
         truncated.push(format!(
-            "table header for {}.{} at {address:#x} extends past the object's \
-             file-backed data ({len} bytes needed, {} available); a table built at \
-             run time in .bss or on the heap is outside the memory scan's reach",
+            "a {}.{} table header extends past the object's file-backed data ({len} \
+             bytes needed, {} available); a table built at run time in .bss or on the \
+             heap is outside the memory scan's reach",
             version.0,
             version.1,
             snapshot.len().saturating_sub(offset),
@@ -429,11 +434,14 @@ fn read_mapping(mem: &File, entry: &MapEntry) -> (Vec<u8>, Option<String>) {
         };
         match mem.read_at(&mut bytes[done..done + want], at) {
             Ok(0) => {
-                short = Some(format!("read at {at:#x} returned no bytes"));
+                // Addresses stay out of the reason: it is published in the capture
+                // document, which does not carry a target's runtime layout. The
+                // byte counts say exactly how much of the mapping went unexamined.
+                short = Some("the read returned no bytes".to_string());
                 break;
             }
             Err(error) => {
-                short = Some(format!("read at {at:#x} failed: {error}"));
+                short = Some(format!("the read failed: {error}"));
                 break;
             }
             Ok(read) => done += read,
@@ -441,10 +449,7 @@ fn read_mapping(mem: &File, entry: &MapEntry) -> (Vec<u8>, Option<String>) {
     }
     bytes.truncate(done);
     let short = short.map(|cause| {
-        format!(
-            "partial snapshot of the mapping at {:#x}: read {done} of {len} bytes: {cause}",
-            entry.start
-        )
+        format!("partial snapshot of one data mapping: read {done} of {len} bytes: {cause}")
     });
     (bytes, short)
 }
@@ -703,14 +708,24 @@ pub fn scan_pid(request: &ScanRequest<'_>) -> Result<ScanOutcome, String> {
         for (index, interface) in module.interfaces.iter_mut().enumerate() {
             interface.index = index;
         }
-        // An operator who named this module explicitly is owed an answer when it
-        // yielded nothing, rather than an empty report with no explanation.
-        if hinted && module.tables.is_empty() {
+        // A module that yielded nothing is owed an answer, whoever decided it was a
+        // provider: an operator who named it with `--module`, or this scan itself,
+        // which classified it by its exports and will report it in `discovery[]` and
+        // `capture.modules[]` as a module the capture observed. Without this the
+        // gap has nothing to show — no entry to skip, no attach to fail, no counter.
+        if module.tables.is_empty() {
+            let named = if hinted {
+                "matched a --module hint; "
+            } else {
+                ""
+            };
             skipped.push(Skipped {
                 subject: module.path.clone(),
-                reason: "matched a --module hint but no function table was found in its \
-                         file-backed data"
-                    .into(),
+                reason: format!(
+                    "{named}no function table was found in its file-backed data; a table \
+                     built at run time in .bss or on the heap is outside the memory \
+                     scan's reach"
+                ),
             });
         }
         modules.push(module);
@@ -800,12 +815,15 @@ mod tests {
         assert_eq!(truncated.len(), 1, "{truncated:?}");
         assert!(
             truncated[0].contains("2.40")
-                && truncated[0].contains("0x7000")
                 && truncated[0].contains("552 bytes needed")
                 && truncated[0].contains("88 available"),
             "{}",
             truncated[0]
         );
+        // This reason is published in the capture document, which carries no
+        // runtime address of the target — the same rule that keeps interface
+        // names out of it.
+        assert!(!truncated[0].contains("0x7000"), "{}", truncated[0]);
         // Ordinary data must not generate this diagnostic.
         assert!(detect_tables(&vec![0u8; 4096], 0x7000, &maps).1.is_empty());
     }

@@ -32,6 +32,10 @@ pub struct DiscoveryEvidence {
     pub module_ambiguous: u64,
     /// Modules refused whole at the slot ceiling — never attached in part.
     pub modules_skipped: Vec<SkippedOut>,
+    /// Optional-manifest objects ignored only because one exact scan-opened
+    /// replacement table covered every dropped claim. Numeric manifest/object
+    /// ordinals and replacement identity are bounded and path/PID-free.
+    pub manifest_object_fallbacks: Vec<ManifestObjectFallback>,
     /// `Some("ptrace")` when the memory scan could not run.
     pub scan_unavailable: Option<String>,
     pub scan_ms: u64,
@@ -46,10 +50,26 @@ impl Default for DiscoveryEvidence {
             uncorroborated: 0,
             module_ambiguous: 0,
             modules_skipped: Vec::new(),
+            manifest_object_fallbacks: Vec::new(),
             scan_unavailable: None,
             scan_ms: 0,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ManifestObjectFallback {
+    pub manifest: u32,
+    pub object: u32,
+    pub reason: &'static str,
+    pub replacement: ManifestReplacement,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ManifestReplacement {
+    pub dev: (u64, u64),
+    pub ino: u64,
+    pub sha256: String,
 }
 
 /// One object this capture pinned. `path` is the pathname the source that found
@@ -1346,6 +1366,47 @@ mod tests {
             ev.verdict();
             assert_eq!(ev.completeness, "PARTIAL");
         }
+    }
+
+    #[test]
+    fn manifest_object_fallback_renders_exact_bounded_path_free_partial_evidence() {
+        let mut ev = evidence();
+        ev.discovery.uncorroborated = 1;
+        ev.discovery.manifest_object_fallbacks = vec![ManifestObjectFallback {
+            manifest: 2,
+            object: 7,
+            reason: "identity_mismatch",
+            replacement: ManifestReplacement {
+                dev: (8, 1),
+                ino: 19,
+                sha256: "ab".repeat(32),
+            },
+        }];
+        ev.verdict();
+
+        let profile = profile_json(
+            &reports_fixture(),
+            &ev,
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(profile["evidence"]["completeness"], "PARTIAL");
+        assert_eq!(
+            profile["evidence"]["manifest_object_fallbacks"],
+            serde_json::json!([{
+                "manifest": 2,
+                "object": 7,
+                "reason": "identity_mismatch",
+                "replacement": {
+                    "dev": [8, 1],
+                    "ino": 19,
+                    "sha256": "ab".repeat(32),
+                },
+            }])
+        );
+        let rendered = profile.to_string();
+        assert!(!rendered.contains("/private/"));
+        assert!(!rendered.contains("pid"));
     }
 
     #[test]

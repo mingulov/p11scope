@@ -5,9 +5,12 @@
 use anyhow::{Context as _, Result, anyhow, bail};
 use p11scope::attach::{CapturePolicy, Scope, Session};
 use p11scope::cli::{self, CaptureArgs, CliError, Command, Kind, ScopeArg};
+#[cfg(test)]
+use p11scope::discovery::identity::pin_manifest_objects;
 use p11scope::discovery::identity::{
-    PinnedObjectId, PinnedObjects, ReconciledModule, pin_manifest_objects,
-    pin_scanned_view_objects, reconcile_scanned_modules,
+    ManifestStaleReason, PinnedObjectId, PinnedObjects, ReconciledModule, StaleManifestObject,
+    pin_manifest_objects_deferred, pin_scanned_view_objects, reconcile_scanned_modules,
+    target_paths_equal,
 };
 #[cfg(test)]
 use p11scope::discovery::scan::ScanLimits;
@@ -198,6 +201,15 @@ struct ManifestInput {
     path: PathBuf,
     manifest: Manifest,
     pins: PinnedObjects,
+    stale: Vec<StaleManifestObject>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManifestFallback {
+    manifest: u32,
+    object: u32,
+    reason: ManifestStaleReason,
+    replacement: PinnedObjectId,
 }
 
 /// How many processes of a `--cgroup` discovery scans.
@@ -228,6 +240,8 @@ struct DiscoveryCounters {
     /// tell an agreement from a conflict instead of publishing a counter with
     /// nothing to explain it.
     corroboration: Vec<(BTreeSet<ProcessViewId>, ObjectKey, &'static str)>,
+    /// Stale manifest objects replaced only by exact scan-opened objects.
+    manifest_fallbacks: Vec<ManifestFallback>,
 }
 
 impl DiscoveryCounters {
@@ -358,9 +372,18 @@ fn scan_view<'a>(
 }
 
 /// Capture-local opened object and file offset for every entry the scan decoded.
+#[cfg(test)]
 fn scanned_targets(
     modules: &[&ScannedModule],
     pinned: &PinnedObjects,
+) -> Option<BTreeSet<(PinnedObjectId, u64)>> {
+    scanned_targets_without(modules, pinned, &BTreeSet::new())
+}
+
+fn scanned_targets_without(
+    modules: &[&ScannedModule],
+    pinned: &PinnedObjects,
+    ignored: &BTreeSet<PinnedObjectId>,
 ) -> Option<BTreeSet<(PinnedObjectId, u64)>> {
     modules
         .iter()
@@ -368,11 +391,12 @@ fn scanned_targets(
             module.tables.iter().flat_map(move |table| {
                 table.entries.iter().map(move |entry| {
                     let id = pinned.id_for_scanned(module, entry.object, &entry.object_path)?;
-                    Some((id, entry.file_offset))
+                    Some((!ignored.contains(&id)).then_some((id, entry.file_offset)))
                 })
             })
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()
+        .map(|targets| targets.into_iter().flatten().collect())
 }
 
 /// The same set resolved through the manifest's exact opened pins in this capture.
@@ -689,20 +713,21 @@ fn discover_plan(
     let mut manifest_inputs = Vec::new();
     for path in &a.manifests {
         let manifest = read_manifest_file(path).inspect_err(|_| base_counters.report_notes())?;
-        let pins = pin_manifest_objects(&manifest).map_err(|problems| {
+        let pinning = pin_manifest_objects_deferred(&manifest).map_err(|error| {
             base_counters.report_notes();
-            for problem in &problems {
+            for problem in error.problems() {
                 eprintln!("p11scope: {problem}");
             }
             anyhow!(
-                "manifest {} does not match the current files; refusing to attach",
+                "manifest {} is not a usable trusted input; refusing to attach",
                 path.display()
             )
         })?;
         manifest_inputs.push(ManifestInput {
             path: path.clone(),
             manifest,
-            pins,
+            pins: pinning.pins,
+            stale: pinning.stale,
         });
     }
 
@@ -739,6 +764,7 @@ fn build_current_plan(
     counters: &mut DiscoveryCounters,
     corroborated: &BTreeSet<(ProcessViewId, ObjectKey)>,
     identity_mismatches: usize,
+    manifest_fallbacks: usize,
 ) -> Result<plan::AttachPlan> {
     // Every plan reference is a capture-local pinned ID. Raw mapping keys remain
     // evidence only and cannot select an attach fd.
@@ -756,12 +782,11 @@ fn build_current_plan(
             }
         }
     }
-    counters.uncorroborated = uncorroborated_count(&plan, identity_mismatches);
-    if identity_mismatches > 0 && plan.slots.is_empty() {
+    counters.uncorroborated = uncorroborated_count(&plan, identity_mismatches, manifest_fallbacks);
+    if identity_mismatches + manifest_fallbacks > 0 && plan.slots.is_empty() {
         bail!(
-            "{identity_mismatches} --manifest input(s) were ignored as stale — their \
-             recorded sha256 is not the mapped object's (see the lines above) — and no \
-             discovery source found a function table"
+            "{} stale --manifest input object(s) had no usable planned replacement, and no discovery source found a function table",
+            identity_mismatches + manifest_fallbacks
         );
     }
     if let Some(error) = refusal_error(&plan) {
@@ -776,13 +801,17 @@ fn build_current_plan(
 /// the filter cannot see it — and a stale manifest supplied for exactly the
 /// provider the scan cannot read leaves that provider unobserved with nothing
 /// else in the document to notice. Counted here, it forces `PARTIAL`.
-fn uncorroborated_count(plan: &plan::AttachPlan, identity_mismatches: usize) -> u64 {
+fn uncorroborated_count(
+    plan: &plan::AttachPlan,
+    identity_mismatches: usize,
+    manifest_fallbacks: usize,
+) -> u64 {
     let uncorroborated = plan
         .modules
         .iter()
         .filter(|m| m.source.contains("manifest") && !m.corroborated)
         .count();
-    (uncorroborated + identity_mismatches) as u64
+    (uncorroborated + identity_mismatches + manifest_fallbacks) as u64
 }
 
 /// Folds the scan's own object-level losses into the plan's skip list, where
@@ -878,12 +907,32 @@ fn discovery_evidence(
             }
         })
         .collect();
+    let manifest_object_fallbacks = counters
+        .manifest_fallbacks
+        .iter()
+        .map(|fallback| {
+            let replacement = pinned
+                .summary(fallback.replacement)
+                .expect("every fallback replacement remains pinned in the final plan");
+            render::ManifestObjectFallback {
+                manifest: fallback.manifest,
+                object: fallback.object,
+                reason: fallback.reason.label(),
+                replacement: render::ManifestReplacement {
+                    dev: (replacement.key.device.major, replacement.key.device.minor),
+                    ino: replacement.key.inode,
+                    sha256: replacement.sha256.to_string(),
+                },
+            }
+        })
+        .collect();
     render::DiscoveryEvidence {
         modules,
         conflicts: counters.conflicts,
         uncorroborated: counters.uncorroborated,
         module_ambiguous: plan.module_ambiguous as u64,
         modules_skipped: plan.modules_skipped.iter().map(skipped_out).collect(),
+        manifest_object_fallbacks,
         scan_unavailable: counters.scan_unavailable.map(str::to_string),
         scan_ms: counters.scan_ms,
         ..render::DiscoveryEvidence::default()
@@ -1042,6 +1091,148 @@ fn module_label(plan: &plan::AttachPlan) -> String {
 
 const STALE_VIEW_REASON: &str = "accepted process generation changed during attach preparation; its discovery claims were removed";
 
+fn manifest_object_key(manifest: &Manifest, object: u32) -> Option<(ObjectKey, &str)> {
+    let object = manifest.objects.iter().find(|record| record.id == object)?;
+    let provenance = &manifest.provenance_objects[plan::provenance_of(manifest, object)?];
+    Some((
+        ObjectKey {
+            device: p11scope_manifest::maps::Device {
+                major: provenance.device_major,
+                minor: provenance.device_minor,
+            },
+            inode: provenance.inode,
+        },
+        provenance.path.as_str(),
+    ))
+}
+
+fn claims_covered(
+    needed: &BTreeMap<((u8, u8), String), usize>,
+    available: &BTreeMap<((u8, u8), String), usize>,
+) -> bool {
+    needed
+        .iter()
+        .all(|(claim, count)| available.get(claim).is_some_and(|seen| seen >= count))
+}
+
+/// Finds one scan-opened object whose raw claim matches the manifest's validated
+/// object/provenance relation and whose table covers every claim that fallback
+/// would drop. The raw relation only selects the candidate; the returned
+/// `PinnedObjectId` is the sole attach authority.
+fn scanned_replacement(
+    manifest: &Manifest,
+    stale: &StaleManifestObject,
+    modules: &[ScannedModule],
+    pinned: &PinnedObjects,
+    manifest_pins: &PinnedObjects,
+) -> Option<PinnedObjectId> {
+    let object = manifest
+        .objects
+        .iter()
+        .find(|object| object.id == stale.object)?;
+    let (recorded_key, provenance_path) = manifest_object_key(manifest, stale.object)?;
+    let is_module = object.path == manifest.module_path;
+    let module_owners: BTreeSet<_> = if is_module {
+        BTreeSet::new()
+    } else {
+        let view = scan_view(manifest, modules, pinned, manifest_pins)?;
+        if !view.agrees {
+            return None;
+        }
+        view.modules
+            .iter()
+            .map(|module| (module.view, module.key))
+            .collect()
+    };
+    let mut needed = BTreeMap::new();
+    for surface in &manifest.surfaces {
+        for function in &surface.functions {
+            let Resolution::Resolved { object, .. } = function.resolution else {
+                continue;
+            };
+            if is_module || object == stale.object {
+                let version = surface
+                    .version
+                    .map(|version| (version.major, version.minor))?;
+                *needed
+                    .entry((version, function.name.clone()))
+                    .or_insert(0usize) += 1;
+            }
+        }
+    }
+
+    let relation_matches = |key: ObjectKey, path: &str| {
+        key == recorded_key
+            && (target_paths_equal(path, &object.path) || target_paths_equal(path, provenance_path))
+    };
+    let mut replacements = BTreeSet::new();
+    for module in modules {
+        if !is_module && !module_owners.contains(&(module.view, module.key)) {
+            continue;
+        }
+        let module_id = pinned.id_for_scanned(module, module.key, &module.path);
+        if is_module
+            && !module_id.is_some_and(|id| {
+                relation_matches(module.key, &module.path)
+                    && pinned
+                        .summary(id)
+                        .is_some_and(|summary| summary.key == recorded_key)
+            })
+        {
+            continue;
+        }
+        let mut available = BTreeMap::new();
+        let mut target_ids = BTreeSet::new();
+        for table in &module.tables {
+            for entry in &table.entries {
+                let Some(id) = pinned.id_for_scanned(module, entry.object, &entry.object_path)
+                else {
+                    continue;
+                };
+                let relevant = if is_module {
+                    true
+                } else {
+                    relation_matches(entry.object, &entry.object_path)
+                        && pinned
+                            .summary(id)
+                            .is_some_and(|summary| summary.key == recorded_key)
+                };
+                if relevant {
+                    *available
+                        .entry((table.version, entry.name.to_string()))
+                        .or_insert(0usize) += 1;
+                    target_ids.insert(id);
+                }
+            }
+        }
+        if !claims_covered(&needed, &available) {
+            continue;
+        }
+        if is_module {
+            if let Some(id) = module_id
+                && !available.is_empty()
+            {
+                replacements.insert(id);
+            }
+        } else if target_ids.len() == 1 {
+            replacements.extend(target_ids);
+        }
+    }
+    let replacement = replacements.pop_first()?;
+    replacements.is_empty().then_some(replacement)
+}
+
+fn drop_manifest_targets(manifest: &mut Manifest, stale: &BTreeSet<u32>) {
+    for surface in &mut manifest.surfaces {
+        surface.functions.retain(|function| {
+            !matches!(
+                function.resolution,
+                Resolution::Resolved { object, .. } if stale.contains(&object)
+            )
+        });
+    }
+}
+
 fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
     let mut counters = discovered.base_counters.clone();
     let mut scan_modules = Vec::new();
@@ -1061,9 +1252,75 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
     let mut accepted = Vec::new();
     let mut corroborated = BTreeSet::new();
     let mut identity_mismatches = 0usize;
-    for input in &discovered.manifest_inputs {
+    for (manifest_index, input) in discovered.manifest_inputs.iter().enumerate() {
         let mut manifest = input.manifest.clone();
         let manifest_pins = &input.pins;
+        let mut stale_ids = BTreeSet::new();
+        let mut stale_replacements = BTreeSet::new();
+        let manifest_number = u32::try_from(manifest_index)
+            .map_err(|_| anyhow!("too many --manifest inputs to identify fallback evidence"))?;
+        for stale in &input.stale {
+            let Some(replacement) =
+                scanned_replacement(&manifest, stale, &scan_modules, &pinned, manifest_pins)
+            else {
+                counters.report_notes();
+                bail!(
+                    "stale manifest object {} from {} ({}) has no exact, complete scanned replacement table",
+                    stale.object,
+                    input.path.display(),
+                    stale.reason.label(),
+                );
+            };
+            if counters.manifest_fallbacks.len() >= p11scope_ebpf_common::MAX_SLOTS as usize {
+                bail!(
+                    "more than {} stale manifest objects require fallback",
+                    p11scope_ebpf_common::MAX_SLOTS
+                );
+            }
+            stale_ids.insert(stale.object);
+            if !stale_replacements.insert(replacement) {
+                bail!(
+                    "manifest {} maps more than one stale object to the same scanned replacement",
+                    input.path.display()
+                );
+            }
+            counters.manifest_fallbacks.push(ManifestFallback {
+                manifest: manifest_number,
+                object: stale.object,
+                reason: stale.reason,
+                replacement,
+            });
+            counters.notes.push(format!(
+                "ignoring stale object {} from manifest {} ({}) because the memory scan pinned an exact replacement and covered every dropped function claim",
+                stale.object,
+                input.path.display(),
+                stale.reason.label(),
+            ));
+        }
+        let stale_module = manifest
+            .objects
+            .iter()
+            .find(|object| object.path == manifest.module_path)
+            .is_some_and(|object| stale_ids.contains(&object.id));
+        if stale_module {
+            let matched: Vec<_> = scan_modules
+                .iter()
+                .filter(|module| {
+                    pinned
+                        .id_for_scanned(module, module.key, &module.path)
+                        .is_some_and(|id| stale_replacements.contains(&id))
+                })
+                .collect();
+            if let Some(first) = matched.first() {
+                counters.corroboration.push((
+                    matched.iter().map(|module| module.view).collect(),
+                    first.key,
+                    "object_fallback",
+                ));
+            }
+            continue;
+        }
+        drop_manifest_targets(&mut manifest, &stale_ids);
         let view = scan_view(&manifest, &scan_modules, &pinned, manifest_pins);
         let mapped = view
             .as_ref()
@@ -1077,7 +1334,7 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
             .collect();
         let scan_targets = view
             .as_ref()
-            .and_then(|view| scanned_targets(&view.modules, &pinned));
+            .and_then(|view| scanned_targets_without(&view.modules, &pinned, &stale_replacements));
         let own_targets = manifest_targets(&manifest, manifest_pins);
         let scan_empty = view.as_ref().is_some_and(|view| {
             view.modules
@@ -1179,6 +1436,18 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
         );
     }
     counters.object_skips.extend(differed);
+    if let Some(fallback) = counters
+        .manifest_fallbacks
+        .iter()
+        .find(|fallback| pinned.summary(fallback.replacement).is_none())
+    {
+        bail!(
+            "manifest {} object {} lost its exact scanned replacement during identity reconciliation",
+            fallback.manifest,
+            fallback.object
+        );
+    }
+    let manifest_fallbacks = counters.manifest_fallbacks.len();
     let plan = build_current_plan(
         &modules,
         &accepted,
@@ -1186,8 +1455,25 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
         &mut counters,
         &corroborated,
         identity_mismatches,
+        manifest_fallbacks,
     )
     .inspect_err(|_| counters.report_notes())?;
+    if let Some(fallback) = counters.manifest_fallbacks.iter().find(|fallback| {
+        !plan
+            .modules
+            .iter()
+            .any(|module| module.object == fallback.replacement)
+            && !plan
+                .slots
+                .iter()
+                .any(|slot| slot.object == fallback.replacement)
+    }) {
+        bail!(
+            "manifest {} object {} has no scanned replacement in the final attach plan",
+            fallback.manifest,
+            fallback.object
+        );
+    }
     let discovery = discovery_evidence(&plan, &pinned, &counters);
     discovered.plan = plan;
     discovered.pinned = pinned;
@@ -1803,7 +2089,8 @@ fn fmt_rfc3339(t: SystemTime) -> String {
 mod tests {
     use super::*;
     use p11scope::discovery::identity::{
-        PinnedObjectId, ReconciledModule, pin_scanned_objects, reconcile_scanned_modules,
+        ManifestStaleReason, PinnedObjectId, ReconciledModule, pin_manifest_objects_deferred,
+        pin_scanned_objects, reconcile_scanned_modules,
     };
     use p11scope::discovery::scan::{ScannedEntry, ScannedTable, scan_pid};
     use std::cell::Cell;
@@ -1904,6 +2191,7 @@ mod tests {
             path: PathBuf::from("manifest.json"),
             pins: pin_as_manifest_object(&path),
             manifest,
+            stale: Vec::new(),
         };
         (
             ProcessView::open(ProcessViewId(0), std::process::id()).unwrap(),
@@ -1911,6 +2199,354 @@ mod tests {
             pins,
             input,
         )
+    }
+
+    fn object_facts(path: &Path) -> (ObjectKey, p11scope_manifest::identity::ObjectIdentity, u64) {
+        let file = p11scope_manifest::identity::open_object(path).unwrap();
+        let mapping = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
+        let inspected = p11scope_manifest::identity::inspect_file(&file).unwrap();
+        (
+            ObjectKey {
+                device: p11scope_manifest::maps::Device {
+                    major: mapping.device_major,
+                    minor: mapping.device_minor,
+                },
+                inode: mapping.inode,
+            },
+            inspected.identity,
+            inspected.executable_ranges[0].0,
+        )
+    }
+
+    fn valid_manifest_for(paths: &[PathBuf], targets: &[u32]) -> Manifest {
+        use p11scope_manifest::manifest::*;
+
+        assert_eq!(targets.len(), 67);
+        let facts: Vec<_> = paths.iter().map(|path| object_facts(path)).collect();
+        Manifest {
+            schema: SCHEMA.to_string(),
+            module_path: paths[0].display().to_string(),
+            objects: paths
+                .iter()
+                .zip(&facts)
+                .enumerate()
+                .map(|(id, (path, (_, identity, _)))| ObjectRecord {
+                    id: id as u32,
+                    path: path.display().to_string(),
+                    identity: identity.clone(),
+                })
+                .collect(),
+            provenance_objects: paths
+                .iter()
+                .zip(&facts)
+                .map(|(path, (key, identity, _))| ProvenanceObject {
+                    path: path.display().to_string(),
+                    device_major: key.device.major,
+                    device_minor: key.device.minor,
+                    inode: key.inode,
+                    identity: identity.clone(),
+                })
+                .collect(),
+            interface_list: Acquisition::Absent,
+            surfaces: vec![SurfaceRecord {
+                source: SurfaceSource::LegacyFunctionList,
+                acquisition: Acquisition::Ok,
+                version: Some(Version { major: 2, minor: 0 }),
+                walk: WalkOutcome::Full,
+                functions: pkcs11_module::FUNCTION_LIST_FIELDS[..67]
+                    .iter()
+                    .zip(targets)
+                    .map(|(field, object)| FunctionRecord {
+                        name: field.name.into(),
+                        resolution: Resolution::Resolved {
+                            object: *object,
+                            file_offset: facts[*object as usize].2,
+                        },
+                    })
+                    .collect(),
+            }],
+            vendor_interfaces: vec![],
+            alias_groups: vec![],
+        }
+    }
+
+    fn scanned_manifest_replacement(paths: &[PathBuf], targets: &[u32]) -> ScannedModule {
+        let facts: Vec<_> = paths.iter().map(|path| object_facts(path)).collect();
+        ScannedModule {
+            view: ProcessViewId(0),
+            mount_namespace: current_mount_namespace(),
+            key: facts[0].0,
+            path: paths[0].display().to_string(),
+            exports: vec!["C_GetFunctionList".into()],
+            tables: vec![ScannedTable {
+                version: (2, 0),
+                walk: "full",
+                entries: pkcs11_module::FUNCTION_LIST_FIELDS[..67]
+                    .iter()
+                    .zip(targets)
+                    .map(|(field, object)| ScannedEntry {
+                        name: field.name,
+                        object: facts[*object as usize].0,
+                        object_path: paths[*object as usize].display().to_string(),
+                        file_offset: facts[*object as usize].2,
+                    })
+                    .collect(),
+                null_entries: vec![],
+                unpinned: vec![],
+                address: 0x7000,
+            }],
+            interfaces: vec![],
+        }
+    }
+
+    fn manifest_input_from_pinning(path: &str, manifest: Manifest) -> ManifestInput {
+        let pinning = pin_manifest_objects_deferred(&manifest).unwrap();
+        ManifestInput {
+            path: PathBuf::from(path),
+            manifest,
+            pins: pinning.pins,
+            stale: pinning.stale,
+        }
+    }
+
+    fn pin_scan(module: &ScannedModule) -> PinnedObjects {
+        let (pins, skipped) = pin_scanned_objects(
+            std::process::id(),
+            std::slice::from_ref(module),
+            &mut CaptureWorkBudget::default(),
+        )
+        .unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        pins
+    }
+
+    #[test]
+    fn discovery_open_stale_manifest_object_uses_only_the_exact_scanned_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("provider.so");
+        std::fs::copy("/bin/sh", &provider).unwrap();
+        let paths = vec![provider.clone()];
+        let targets = vec![0; 67];
+        let manifest = valid_manifest_for(&paths, &targets);
+        let scan = scanned_manifest_replacement(&paths, &targets);
+        let scan_offset = scan.tables[0].entries[0].file_offset;
+        let scan_pins = pin_scan(&scan);
+        std::fs::remove_file(&provider).unwrap();
+        let input = manifest_input_from_pinning("open-stale.json", manifest);
+        assert_eq!(input.stale[0].reason, ManifestStaleReason::OpenStale);
+
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let stale_view = view.id();
+        let mut discovered = discovered_from_inputs(vec![view], vec![scan], scan_pins, vec![input]);
+
+        assert_eq!(discovered.plan.modules[0].source, "scan");
+        assert_eq!(discovered.plan.slots.len(), 1);
+        assert_eq!(discovered.plan.slots[0].file_offset, scan_offset);
+        assert_eq!(discovered.counters.manifest_fallbacks.len(), 1);
+        assert_eq!(discovered.counters.uncorroborated, 1);
+        assert_eq!(discovered.discovery.manifest_object_fallbacks.len(), 1);
+
+        let error = remove_stale_views(&mut discovered, &[stale_view])
+            .expect_err("fallback must be recomputed from the surviving pristine views");
+        assert!(
+            error.to_string().contains("stale manifest object"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn discovery_identity_stale_object_drops_every_manifest_target_and_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("provider.so");
+        std::fs::copy("/bin/sh", &provider).unwrap();
+        let paths = vec![provider.clone()];
+        let targets = vec![0; 67];
+        let mut manifest = valid_manifest_for(&paths, &targets);
+        for function in &mut manifest.surfaces[0].functions {
+            let Resolution::Resolved { file_offset, .. } = &mut function.resolution else {
+                unreachable!()
+            };
+            *file_offset = 0xdead_beef;
+        }
+        std::fs::copy("/bin/true", &provider).unwrap();
+        let scan = scanned_manifest_replacement(&paths, &targets);
+        let scan_offset = scan.tables[0].entries[0].file_offset;
+        let scan_pins = pin_scan(&scan);
+        let input = manifest_input_from_pinning("identity-stale.json", manifest);
+        assert_eq!(input.stale[0].reason, ManifestStaleReason::IdentityMismatch);
+
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let discovered = discovered_from_inputs(vec![view], vec![scan], scan_pins, vec![input]);
+
+        assert!(
+            discovered
+                .plan
+                .slots
+                .iter()
+                .all(|slot| slot.file_offset == scan_offset && slot.file_offset != 0xdead_beef)
+        );
+        assert_eq!(discovered.plan.modules[0].source, "scan");
+        assert_eq!(discovered.counters.manifest_fallbacks.len(), 1);
+    }
+
+    #[test]
+    fn discovery_mixed_manifest_drops_only_the_stale_dependency_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("provider.so");
+        let replaced = dir.path().join("replaced.so");
+        std::fs::copy("/bin/sh", &provider).unwrap();
+        std::fs::copy("/bin/sh", &replaced).unwrap();
+        let paths = vec![provider.clone(), replaced.clone()];
+        let mut targets = vec![0; 67];
+        targets[0] = 1;
+        let mut manifest = valid_manifest_for(&paths, &targets);
+        let Resolution::Resolved { file_offset, .. } =
+            &mut manifest.surfaces[0].functions[0].resolution
+        else {
+            unreachable!()
+        };
+        *file_offset = 0xdead_beef;
+
+        std::fs::copy("/bin/true", &replaced).unwrap();
+        let scan = scanned_manifest_replacement(&paths, &targets);
+        let provider_offset = scan.tables[0].entries[1].file_offset;
+        let replacement_offset = scan.tables[0].entries[0].file_offset;
+        let scan_pins = pin_scan(&scan);
+        let input = manifest_input_from_pinning("mixed-valid.json", manifest);
+        assert_eq!(input.stale.len(), 1);
+        assert_eq!(input.stale[0].object, 1);
+
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let discovered = discovered_from_inputs(vec![view], vec![scan], scan_pins, vec![input]);
+
+        let offsets: BTreeSet<_> = discovered
+            .plan
+            .slots
+            .iter()
+            .map(|slot| slot.file_offset)
+            .collect();
+        assert_eq!(
+            offsets,
+            BTreeSet::from([provider_offset, replacement_offset])
+        );
+        assert!(!offsets.contains(&0xdead_beef));
+        assert_eq!(discovered.counters.manifest_fallbacks.len(), 1);
+        assert_eq!(discovered.discovery.manifest_object_fallbacks.len(), 1);
+        assert!(
+            discovered.discovery.modules[0]
+                .corroboration
+                .contains(&"agreed"),
+            "{:?}",
+            discovered.discovery.modules[0].corroboration,
+        );
+    }
+
+    #[test]
+    fn discovery_dependency_fallback_rejects_an_unrelated_modules_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("provider.so");
+        let replaced = dir.path().join("replaced.so");
+        let unrelated = dir.path().join("unrelated.so");
+        for path in [&provider, &replaced, &unrelated] {
+            std::fs::copy("/bin/sh", path).unwrap();
+        }
+        let paths = vec![provider.clone(), replaced.clone()];
+        let mut manifest_targets = vec![0; 67];
+        manifest_targets[0] = 1;
+        let manifest = valid_manifest_for(&paths, &manifest_targets);
+
+        std::fs::copy("/bin/true", &replaced).unwrap();
+        let owner_scan = scanned_manifest_replacement(&paths, &vec![0; 67]);
+        let unrelated_scan =
+            scanned_manifest_replacement(&[unrelated, replaced], &manifest_targets);
+        let modules = vec![owner_scan, unrelated_scan];
+        let (pins, skipped) = pin_scanned_objects(
+            std::process::id(),
+            &modules,
+            &mut CaptureWorkBudget::default(),
+        )
+        .unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let input = manifest_input_from_pinning("unrelated.json", manifest);
+        assert_eq!(input.stale.len(), 1);
+
+        let mut discovered = lifecycle_discovered(vec![
+            ProcessView::open(ProcessViewId(0), std::process::id()).unwrap(),
+        ]);
+        discovered.scan_inputs.insert(
+            ProcessViewId(0),
+            ScanInput {
+                modules,
+                pins,
+                counters: DiscoveryCounters::default(),
+            },
+        );
+        discovered.manifest_inputs.push(input);
+
+        let error = rebuild_discovered(&mut discovered)
+            .expect_err("only the exact manifest module's scan view may replace its dependency");
+        assert!(error.to_string().contains("object 1"), "{error:#}");
+    }
+
+    #[test]
+    fn discovery_open_stale_sole_source_is_fatal_after_scan_availability_is_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("provider.so");
+        std::fs::copy("/bin/sh", &provider).unwrap();
+        let manifest = valid_manifest_for(&[provider.clone()], &vec![0; 67]);
+        std::fs::remove_file(&provider).unwrap();
+        let input = manifest_input_from_pinning("sole-source.json", manifest);
+        let mut discovered = lifecycle_discovered(Vec::new());
+        discovered.manifest_inputs.push(input);
+
+        let error = rebuild_discovered(&mut discovered).expect_err("no scan replacement is fatal");
+        assert!(
+            error.to_string().contains("stale manifest object"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn discovery_mixed_manifest_cannot_hide_a_stale_sole_source_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("provider.so");
+        let replaced = dir.path().join("replaced.so");
+        let sole = dir.path().join("sole.so");
+        for path in [&provider, &replaced, &sole] {
+            std::fs::copy("/bin/sh", path).unwrap();
+        }
+        let mut targets = vec![0; 67];
+        targets[0] = 1;
+        targets[1] = 2;
+        let manifest = valid_manifest_for(
+            &[provider.clone(), replaced.clone(), sole.clone()],
+            &targets,
+        );
+        std::fs::copy("/bin/true", &replaced).unwrap();
+        std::fs::remove_file(&sole).unwrap();
+
+        let mut scan_targets = targets.clone();
+        scan_targets[1] = 0;
+        let scan = scanned_manifest_replacement(&[provider, replaced], &scan_targets);
+        let scan_pins = pin_scan(&scan);
+        let input = manifest_input_from_pinning("mixed.json", manifest);
+        assert_eq!(input.stale.len(), 2);
+        let mut discovered = lifecycle_discovered(vec![
+            ProcessView::open(ProcessViewId(0), std::process::id()).unwrap(),
+        ]);
+        discovered.scan_inputs.insert(
+            ProcessViewId(0),
+            ScanInput {
+                modules: vec![scan],
+                pins: scan_pins,
+                counters: DiscoveryCounters::default(),
+            },
+        );
+        discovered.manifest_inputs.push(input);
+
+        let error = rebuild_discovered(&mut discovered)
+            .expect_err("the second stale object has no scanned replacement");
+        assert!(error.to_string().contains("object 2"), "{error:#}");
     }
 
     #[derive(Debug)]
@@ -2125,6 +2761,7 @@ mod tests {
             path: PathBuf::from("stale-manifest.json"),
             manifest,
             pins: own,
+            stale: Vec::new(),
         };
         let mut discovered =
             discovered_from_inputs(vec![stale, stable], vec![module], scan_pins, vec![input]);
@@ -2766,16 +3403,21 @@ mod tests {
     #[test]
     fn an_ignored_stale_manifest_is_counted_as_uncorroborated() {
         let mut plan = plan_with(1, 0);
-        assert_eq!(uncorroborated_count(&plan, 0), 0, "a scanned module is not");
         assert_eq!(
-            uncorroborated_count(&plan, 1),
+            uncorroborated_count(&plan, 0, 0),
+            0,
+            "a scanned module is not"
+        );
+        assert_eq!(
+            uncorroborated_count(&plan, 1, 0),
             1,
             "an ignored manifest must reach a counter, or it reaches none"
         );
         plan.modules[0].source = "manifest";
-        assert_eq!(uncorroborated_count(&plan, 1), 2, "both are counted");
+        assert_eq!(uncorroborated_count(&plan, 1, 0), 2, "both are counted");
         plan.modules[0].corroborated = true;
-        assert_eq!(uncorroborated_count(&plan, 0), 0);
+        assert_eq!(uncorroborated_count(&plan, 0, 0), 0);
+        assert_eq!(uncorroborated_count(&plan, 0, 1), 1);
     }
 
     /// Both §4.12 outcomes that attach a union mark the module corroborated, so

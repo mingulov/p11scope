@@ -365,6 +365,62 @@ fn changed_object_is_refused_naming_the_file() {
 }
 
 #[test]
+fn stale_manifest_objects_are_typed_individually_for_scan_fallback() {
+    use p11scope::discovery::identity::{ManifestStaleReason, pin_manifest_objects_deferred};
+
+    let d = tmpdir("manifest_pinning_typed_stale");
+    let so = cc_so(&d, "changed", "int f(void){return 1;}\n");
+    let m = manifest_for(&so);
+    let _ = cc_so(
+        &d,
+        "changed",
+        "int f(void){return 2;} int g(void){return 3;}\n",
+    );
+
+    let pinned = pin_manifest_objects_deferred(&m).expect("staleness is deferred, not fatal");
+    assert_eq!(pinned.pins.pinned().count(), 0);
+    assert_eq!(pinned.stale.len(), 1);
+    assert_eq!(pinned.stale[0].object, 0);
+    assert_eq!(
+        pinned.stale[0].reason,
+        ManifestStaleReason::IdentityMismatch
+    );
+}
+
+#[test]
+fn a_missing_locator_is_stale_but_malformed_and_other_open_failures_are_fatal() {
+    use p11scope::discovery::identity::{
+        ManifestPinError, ManifestStaleReason, pin_manifest_objects_deferred,
+    };
+
+    let d = tmpdir("manifest_pinning_typed_open_stale");
+    let so = cc_so(&d, "gone", "int f(void){return 1;}\n");
+    let m = manifest_for(&so);
+    std::fs::remove_file(&so).unwrap();
+    let pinned = pin_manifest_objects_deferred(&m).expect("ENOENT is decided after scanning");
+    assert_eq!(pinned.stale.len(), 1);
+    assert_eq!(pinned.stale[0].reason, ManifestStaleReason::OpenStale);
+
+    let mut malformed = m.clone();
+    malformed.module_path = "relative.so".into();
+    assert!(matches!(
+        pin_manifest_objects_deferred(&malformed),
+        Err(ManifestPinError::Invalid(_))
+    ));
+
+    let directory = d.join("not-a-file");
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut non_regular = manifest_for(&PathBuf::from("/bin/sh"));
+    non_regular.module_path = directory.display().to_string();
+    non_regular.objects[0].path = directory.display().to_string();
+    non_regular.provenance_objects[0].path = directory.display().to_string();
+    assert!(matches!(
+        pin_manifest_objects_deferred(&non_regular),
+        Err(ManifestPinError::Fatal(_))
+    ));
+}
+
+#[test]
 fn vanished_object_is_refused() {
     let d = tmpdir("manifest_pinning_gone");
     let so = cc_so(&d, "gone", "int f(void){return 1;}\n");

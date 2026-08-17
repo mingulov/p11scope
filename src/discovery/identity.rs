@@ -87,6 +87,15 @@ fn normalize_target_path(path: &str) -> Option<String> {
     normalized.to_str().map(str::to_string)
 }
 
+/// Path spelling is only part of a validated manifest-to-scan relation, never
+/// attach identity. Exposed so the orchestrator uses the same normalization as
+/// the raw aliases that resolve to `PinnedObjectId`.
+pub fn target_paths_equal(left: &str, right: &str) -> bool {
+    normalize_target_path(left)
+        .zip(normalize_target_path(right))
+        .is_some_and(|(left, right)| left == right)
+}
+
 #[derive(Debug, Clone)]
 struct Entry {
     raw: RawObjectInstance,
@@ -642,26 +651,108 @@ fn object_key(mapping: MappingFileKey) -> ObjectKey {
 /// Structural validation + open + size cap + identity match + executable-offset check.
 /// Opens, identifies, and pins every object. Errors are aggregated so an
 /// operator sees every stale or malformed target in one run.
-pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> {
-    let mut problems = validate_structure(m);
-    if !problems.is_empty() {
-        return Err(problems);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestStaleReason {
+    OpenStale,
+    IdentityMismatch,
+}
+
+impl ManifestStaleReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenStale => "open_stale",
+            Self::IdentityMismatch => "identity_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleManifestObject {
+    pub object: u32,
+    pub path: String,
+    pub reason: ManifestStaleReason,
+    diagnostic: String,
+}
+
+impl StaleManifestObject {
+    pub fn diagnostic(&self) -> &str {
+        &self.diagnostic
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ManifestPinning {
+    pub pins: PinnedObjects,
+    pub stale: Vec<StaleManifestObject>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestPinError {
+    Invalid(Vec<String>),
+    Fatal(Vec<String>),
+}
+
+impl ManifestPinError {
+    pub fn problems(&self) -> &[String] {
+        match self {
+            Self::Invalid(problems) | Self::Fatal(problems) => problems,
+        }
+    }
+}
+
+fn classify_locator_error(kind: std::io::ErrorKind) -> Option<ManifestStaleReason> {
+    (kind == std::io::ErrorKind::NotFound).then_some(ManifestStaleReason::OpenStale)
+}
+
+/// Classifies only a locator that no longer resolves as deferred staleness. Every
+/// opened object's remaining checks are fatal except an exact recorded-identity
+/// mismatch; the caller may ignore either stale class only after a scan-opened
+/// replacement is proven.
+pub fn pin_manifest_objects_deferred(m: &Manifest) -> Result<ManifestPinning, ManifestPinError> {
+    let structural = validate_structure(m);
+    if !structural.is_empty() {
+        return Err(ManifestPinError::Invalid(structural));
     }
 
+    let mut problems = Vec::new();
+    let mut stale = Vec::new();
     let mut pinned = Vec::new();
     let mut total_object_bytes = 0u64;
     for object in &m.objects {
-        if !object.identity.reusable {
-            problems.push(format!(
-                "{}: manifest identity is not reusable ({})",
-                object.path,
-                object
-                    .identity
-                    .note
-                    .as_deref()
-                    .unwrap_or("no identity recorded")
-            ));
-            continue;
+        let path = Path::new(&object.path);
+        match path.try_exists() {
+            Ok(true) => {}
+            Ok(false) => {
+                stale.push(StaleManifestObject {
+                    object: object.id,
+                    path: object.path.clone(),
+                    reason: ManifestStaleReason::OpenStale,
+                    diagnostic: format!(
+                        "{}: the manifest object locator no longer resolves",
+                        object.path
+                    ),
+                });
+                continue;
+            }
+            Err(error) => {
+                if let Some(reason) = classify_locator_error(error.kind()) {
+                    stale.push(StaleManifestObject {
+                        object: object.id,
+                        path: object.path.clone(),
+                        reason,
+                        diagnostic: format!(
+                            "{}: the manifest object locator no longer resolves",
+                            object.path
+                        ),
+                    });
+                } else {
+                    problems.push(format!(
+                        "{}: cannot inspect the file locator now ({error})",
+                        object.path
+                    ));
+                }
+                continue;
+            }
         }
         let file = match open_object(Path::new(&object.path)) {
             Ok(file) => file,
@@ -695,7 +786,7 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
         pinned.push((object, file, pin));
     }
     if !problems.is_empty() {
-        return Err(problems);
+        return Err(ManifestPinError::Fatal(problems));
     }
 
     let mut opened = BTreeMap::new();
@@ -726,23 +817,55 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
                 continue;
             }
         }
+        let mapping = match identity_of(&file) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                problems.push(format!("{}: {error}", object.path));
+                continue;
+            }
+        };
+        let key = object_key(mapping);
+        let Some(raw) = RawObjectInstance::manifest(key, object.path.clone()) else {
+            problems.push(format!("{}: object path cannot be normalized", object.path));
+            continue;
+        };
+        let entry = match Entry::new(
+            file,
+            pin,
+            object.path.clone(),
+            &inspected.identity,
+            raw,
+            mapping,
+        ) {
+            Ok(entry) => entry,
+            Err(error) => {
+                problems.push(format!("{}: {error}", object.path));
+                continue;
+            }
+        };
         if inspected.identity.kind != object.identity.kind
             || inspected.identity.value != object.identity.value
             || inspected.identity.sha256 != object.identity.sha256
         {
-            problems.push(format!(
-                "{}: identity changed since discovery (manifest {:?} {} sha256 {}, current {:?} {} sha256 {}) — re-run `p11scope-discover`",
-                object.path,
-                object.identity.kind,
-                object.identity.value.as_deref().unwrap_or("-"),
-                object.identity.sha256.as_deref().unwrap_or("-"),
-                inspected.identity.kind,
-                inspected.identity.value.as_deref().unwrap_or("-"),
-                inspected.identity.sha256.as_deref().unwrap_or("-"),
-            ));
+            stale.push(StaleManifestObject {
+                object: object.id,
+                path: object.path.clone(),
+                reason: ManifestStaleReason::IdentityMismatch,
+                diagnostic: format!(
+                    "{}: identity changed since discovery (manifest {:?} {} sha256 {}, current {:?} {} sha256 {}) — re-run `p11scope-discover`",
+                    object.path,
+                    object.identity.kind,
+                    object.identity.value.as_deref().unwrap_or("-"),
+                    object.identity.sha256.as_deref().unwrap_or("-"),
+                    inspected.identity.kind,
+                    inspected.identity.value.as_deref().unwrap_or("-"),
+                    inspected.identity.sha256.as_deref().unwrap_or("-"),
+                ),
+            });
+            drop(entry);
             continue;
         }
-        opened.insert(object.id, (object.path.clone(), file, inspected, pin));
+        opened.insert(object.id, (entry, inspected));
     }
 
     for surface in &m.surfaces {
@@ -754,41 +877,23 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
             else {
                 continue;
             };
-            if let Some((path, _, inspected, _)) = opened.get(&object)
+            if let Some((entry, inspected)) = opened.get(&object)
                 && !inspected.contains_executable_offset(file_offset)
             {
                 problems.push(format!(
                     "{}: {}+{file_offset:#x} is outside every executable ELF segment",
-                    function.name, path
+                    function.name, entry.path
                 ));
             }
         }
     }
 
     if !problems.is_empty() {
-        return Err(problems);
+        return Err(ManifestPinError::Fatal(problems));
     }
     let mut result = PinnedObjects::empty();
-    for (path, file, inspected, pin) in opened.into_values() {
-        let mapping = match identity_of(&file) {
-            Ok(found) => found,
-            Err(error) => {
-                problems.push(format!("{path}: {error}"));
-                continue;
-            }
-        };
-        let key = object_key(mapping);
-        let Some(raw) = RawObjectInstance::manifest(key, path.clone()) else {
-            problems.push(format!("{path}: object path cannot be normalized"));
-            continue;
-        };
-        let entry = match Entry::new(file, pin, path.clone(), &inspected.identity, raw, mapping) {
-            Ok(entry) => entry,
-            Err(error) => {
-                problems.push(format!("{path}: {error}"));
-                continue;
-            }
-        };
+    for (entry, _) in opened.into_values() {
+        let path = entry.path.clone();
         let mut skipped = Vec::new();
         if result.insert_entry(entry, &mut skipped).is_none() {
             problems.extend(
@@ -799,9 +904,25 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
         }
     }
     if !problems.is_empty() {
-        return Err(problems);
+        return Err(ManifestPinError::Fatal(problems));
     }
-    Ok(result)
+    Ok(ManifestPinning {
+        pins: result,
+        stale,
+    })
+}
+
+/// Strict compatibility API for callers that have no scan fallback context.
+pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> {
+    match pin_manifest_objects_deferred(m) {
+        Ok(result) if result.stale.is_empty() => Ok(result.pins),
+        Ok(result) => Err(result
+            .stale
+            .into_iter()
+            .map(|stale| stale.diagnostic)
+            .collect()),
+        Err(error) => Err(error.problems().to_vec()),
+    }
 }
 
 /// Opens, identity-checks, hashes once and pins every object the scan named. Objects
@@ -1224,6 +1345,22 @@ mod tests {
     fn fstatfs_failure_is_an_error_not_non_overlay() {
         let error = on_overlayfs(-1).expect_err("an invalid fd must not mean non-overlay");
         assert!(error.contains("fstatfs failed"), "{error}");
+    }
+
+    #[test]
+    fn only_not_found_is_a_deferred_open_staleness() {
+        assert_eq!(
+            classify_locator_error(std::io::ErrorKind::NotFound),
+            Some(ManifestStaleReason::OpenStale)
+        );
+        for fatal in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::OutOfMemory,
+            std::io::ErrorKind::Other,
+        ] {
+            assert_eq!(classify_locator_error(fatal), None, "{fatal:?}");
+        }
     }
 
     #[test]

@@ -102,7 +102,8 @@ Discovery and attachment:
 | `authority` | How every probed object was authorized. `"hash-pinned"` is the only value this version emits: pinned by fd, hashed once with SHA-256, and re-checked by `fstat` `(ino, size, ctime)` during the capture. |
 | `discovery[]` | One entry per discovered module — see below. |
 | `discovery_conflicts` | Manifests whose recorded targets differ from the ones the scan decoded in the same object; the union is attached (spec §4.12). Forces `PARTIAL`. |
-| `discovery_uncorroborated` | Modules whose offsets nothing corroborated: not mapped in scope, no scan, or a scan that decoded no table there — plus every `--manifest` ignored as stale (§4.12 case 4), which has no module of its own in `discovery[]` and would otherwise raise no counter at all. Forces `PARTIAL`. |
+| `discovery_uncorroborated` | Modules whose offsets nothing corroborated: not mapped in scope, no scan, or a scan that decoded no table there — plus every stale manifest object safely replaced by the scan and every freshly pinned manifest module rejected by an exact target-object mismatch. Forces `PARTIAL`. |
+| `manifest_object_fallbacks[]` | Stale optional-manifest objects ignored only after one exact scan-opened replacement table covered every dropped function claim. Each record is path/PID-free: `{manifest, object, reason, replacement}`, where `manifest` and `object` are bounded numeric ordinals, `reason` is exactly `open_stale` or `identity_mismatch`, and `replacement` is the scan-owned `{dev, ino, sha256}` also present in `discovery[]`. At most 512 records. Each record contributes one to `discovery_uncorroborated` and forces `PARTIAL`. A missing, ambiguous, incomplete, or final-plan-absent replacement is fatal rather than published. |
 | `module_ambiguous` | Attach slots two modules both publish: counted, never attributed. Forces `PARTIAL`. |
 | `modules_skipped[]` | Modules refused whole at the `MAX_SLOTS` attach ceiling, `{name, reason}` — a module is never attached in part. Forces `PARTIAL`; fatal only when the refusal leaves nothing to attach at all. |
 | `scan_unavailable` | `null`, or why the memory scan could not run (e.g. `"ptrace"`). Objects are still identified from `maps` + `.dynsym`, but no table is decoded, so any `--manifest` offsets stand alone. Forces `PARTIAL` in its own right: under `--cgroup` one unreadable process among readable ones still plans slots, so nothing else would notice. |
@@ -124,17 +125,29 @@ per source.
 | `objects[]` | Every object this module's **planned slots** attach into; a table entry may resolve into a dependency rather than into the module that published it, and an entry that never became a slot is in `skipped` instead. Each carries the same identity fields plus `identity_source` (`"mountinfo"` when the whole `{dev, ino}` was comparable against the mapping, `"stat"` when only the inode was, `"unpinned"` when this capture pinned nothing and compared nothing) and `note`, the reason for a downgrade. |
 | `sources[]` | `["scan"]`, `["manifest"]`, or both. |
 | `corroborated` | Whether a second source described the same targets. |
-| `corroboration[]` | Which §4.12 outcome each source pairing produced — one entry per `--manifest` that named this object, since `--manifest` is repeatable and one outcome must not hide another. Values: `single_source` (no manifest named it), `agreed`, `conflict` (both decoded targets and they differ), `scan_empty` (the scan pinned this object but decoded no table in it — the documented use of `--manifest`, counted as uncorroborated rather than as a disagreement), `uncorroborated` (not mapped in scope, or no scan), `identity_mismatch` (a `--manifest` naming this object was ignored: the mapped bytes are not the ones it records). |
+| `corroboration[]` | Which §4.12 outcome each source pairing produced — one entry per `--manifest` that named this object, since `--manifest` is repeatable and one outcome must not hide another. Values: `single_source` (no manifest named it), `agreed`, `conflict` (both decoded targets and they differ), `scan_empty` (the scan pinned this object but decoded no table in it — the documented use of `--manifest`, counted as uncorroborated rather than as a disagreement), `uncorroborated` (not mapped in scope, or no scan), `identity_mismatch` (the manifest's freshly opened module object and the target's scan-opened module are different exact objects), and `object_fallback` (the module object itself was stale and `manifest_object_fallbacks[]` names the scan-owned replacement). |
 | `tables[]` | `{version: [major, minor], entries, source}` per function table published, one entry per source that saw it. |
 | `interfaces` | How many interfaces were seen — **the most any one source saw, never the sum across sources**: the scan and a manifest describing one provider each count its interfaces, and each sees a subset (the scan records only an interface whose table it decoded), so this is a lower bound. **Never their names**: those are bytes read out of a provider's memory, and `p11scope inspect` is where they are shown. |
 | `skipped[]` | The **table entries** this module published that no probe could attach to, `{name, reason}` — a subset of the top-level `skipped`, attributed to the module whose table carried them. It is deliberately not every loss involving this module: a loss recorded *about* the object as a whole — it could not be read, it was over the byte caps, its snapshot ended early, no table was decoded in it — has no entry to attribute, so it appears only in the top-level list as `discovery subject`. Read this list as "records this module published and lost", and the top-level list as the complete set; do not treat their difference as a category. |
 
-`identity_mismatch` is decided per *manifest*, not per object: the observer
-compares the SHA-256 of the object at `module_path` and, on a mismatch, ignores
-that whole manifest rather than that one object. A manifest whose *dependency*
-diverged is therefore not detected by this check. The divergent dependency is
-still pinned and hashed independently and its digest appears in `objects[]`, but
-nothing compares it against the manifest's record of it.
+Optional-input staleness is decided per object before planning. A locator that
+no longer resolves is `open_stale`; an object that opens, remains stable through
+its one hash, but disagrees with its recorded identity is `identity_mismatch`.
+Neither status is enough to continue. The validated manifest object/provenance
+relation must select exactly one scan-opened `PinnedObjectId`, and the decoded
+tables of one exact scan module/view must cover every manifest function claim
+removed for that object.
+Only then is the object's manifest pin and every manifest-derived offset/slot/
+target for it dropped and a `manifest_object_fallbacks[]` record published. A
+stale module object drops its whole manifest table, because that table itself
+belongs to the stale object. Fresh objects in a mixed manifest remain eligible.
+Permission and arbitrary I/O failures, malformed input, an incomparable
+identity, incomplete scan coverage, or a stale sole source remain fatal.
+
+The `corroboration[]` value `identity_mismatch` is narrower: it describes a
+freshly valid manifest module object that is not the exact object mapped in the
+target. It is a source-pairing outcome, not the per-object stale-input result
+recorded in `manifest_object_fallbacks[]`.
 
 Kernel/event loss:
 
@@ -307,7 +320,7 @@ Added:
   manifest was corroborated by the scan and how, its tables and interface count,
   and anything skipped.
 - `evidence.discovery_conflicts`, `evidence.discovery_uncorroborated`,
-  `evidence.module_ambiguous`, `evidence.modules_skipped[]`,
+  `evidence.manifest_object_fallbacks[]`, `evidence.module_ambiguous`, `evidence.modules_skipped[]`,
   `evidence.scan_unavailable`, `evidence.scan_ms`.
 - Each of those, and an empty `discovery[]` or `slots: 0`, forces `PARTIAL`.
 - `evidence.skipped` additionally carries object-level losses (a provider

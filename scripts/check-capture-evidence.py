@@ -46,6 +46,8 @@ COUNTERS = (
     "discovery_uncorroborated",
     "module_ambiguous",
 )
+MAX_MANIFEST_OBJECT_FALLBACKS = 512
+MANIFEST_STALE_REASONS = {"open_stale", "identity_mismatch"}
 
 # The version-matrix provider, seen two ways. Both are measured, both are exact.
 #
@@ -154,6 +156,93 @@ def exact_counters(evidence, allowances=None):
         require(evidence[name] == wanted, f"{name}: want {wanted}, got {evidence[name]}")
 
 
+def exact_manifest_object_fallbacks(evidence):
+    """Every stale object is bound to one scan-opened identity, never a path."""
+    fallbacks = evidence["manifest_object_fallbacks"]
+    require(isinstance(fallbacks, list), "manifest_object_fallbacks is not an array")
+    require(
+        len(fallbacks) <= MAX_MANIFEST_OBJECT_FALLBACKS,
+        f"too many manifest object fallbacks: {len(fallbacks)}",
+    )
+    scan_identities = set()
+    for module in evidence["discovery"]:
+        require(
+            {"sources", "objects", "corroborated", "corroboration"} <= set(module),
+            f"incomplete discovery module: {module}",
+        )
+        if "scan" not in module["sources"]:
+            continue
+        for carrier in [module, *module["objects"]]:
+            if digest_ok(carrier):
+                scan_identities.add(
+                    (tuple(carrier["dev"]), carrier["ino"], carrier["sha256"])
+                )
+
+    seen_objects = set()
+    seen_replacements = set()
+    for fallback in fallbacks:
+        require(
+            set(fallback) == {"manifest", "object", "reason", "replacement"},
+            f"unexpected manifest fallback shape: {fallback}",
+        )
+        manifest, object_id = fallback["manifest"], fallback["object"]
+        require(
+            isinstance(manifest, int) and not isinstance(manifest, bool) and 0 <= manifest <= 0xFFFFFFFF,
+            f"invalid manifest fallback ordinal: {fallback}",
+        )
+        require(
+            isinstance(object_id, int) and not isinstance(object_id, bool) and 0 <= object_id < 512,
+            f"invalid manifest object id: {fallback}",
+        )
+        require(fallback["reason"] in MANIFEST_STALE_REASONS, fallback)
+        replacement = fallback["replacement"]
+        require(set(replacement) == {"dev", "ino", "sha256"}, fallback)
+        require(
+            isinstance(replacement["dev"], list)
+            and len(replacement["dev"]) == 2
+            and all(isinstance(part, int) and not isinstance(part, bool) and part >= 0 for part in replacement["dev"]),
+            fallback,
+        )
+        require(
+            isinstance(replacement["ino"], int)
+            and not isinstance(replacement["ino"], bool)
+            and replacement["ino"] > 0
+            and digest_ok(replacement),
+            fallback,
+        )
+        identity = (
+            tuple(replacement["dev"]),
+            replacement["ino"],
+            replacement["sha256"],
+        )
+        require(identity in scan_identities, f"fallback is not scan-owned: {fallback}")
+        require(
+            (manifest, object_id) not in seen_objects,
+            f"duplicate manifest object fallback: {fallback}",
+        )
+        require(
+            (manifest, identity) not in seen_replacements,
+            f"one scan object cannot hide two stale objects in one manifest: {fallback}",
+        )
+        seen_objects.add((manifest, object_id))
+        seen_replacements.add((manifest, identity))
+
+    standalone = sum(
+        "manifest" in module["sources"] and not module["corroborated"]
+        for module in evidence["discovery"]
+    )
+    ignored_manifests = sum(
+        outcome == "identity_mismatch"
+        for module in evidence["discovery"]
+        for outcome in module["corroboration"]
+    )
+    expected = standalone + ignored_manifests + len(fallbacks)
+    require(
+        evidence["discovery_uncorroborated"] == expected,
+        f"discovery_uncorroborated: want {expected}, got {evidence['discovery_uncorroborated']}",
+    )
+
+
 def surface_signature(evidence):
     surfaces = evidence["surfaces"]
     require(surfaces, "evidence.surfaces is empty")
@@ -221,6 +310,7 @@ def exact_common(evidence, *, aliases, skipped, in_flight, discovery_skipped=0):
     # probes must name what it attached them into, and how it was authorized.
     require(evidence["authority"] == "hash-pinned", f"unexpected authority: {evidence['authority']}")
     require(evidence["discovery"], "evidence.discovery is empty: nothing was discovered")
+    exact_manifest_object_fallbacks(evidence)
     for module in evidence["discovery"]:
         require(digest_ok(module), f"module without a whole-file digest: {module}")
         require(module["sources"], f"module with no discovery source: {module}")
@@ -277,6 +367,7 @@ def exact_capture_modules(document):
     must carry the identity the probes were authorized against, never just a
     pathname (which for a scanned module is the target's, not the observer's).
     """
+    exact_manifest_object_fallbacks(document["evidence"])
     modules = document["capture"]["modules"]
     require(modules, "capture.modules is empty: the document names no provider")
     for module in modules:
@@ -668,6 +759,7 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
     return {
         "authority": "hash-pinned",
         "discovery": discovery_fixture(sources),
+        "manifest_object_fallbacks": [],
         "modules_skipped": [],
         "scan_unavailable": None,
         "scan_ms": 3,
@@ -1066,6 +1158,41 @@ def self_test():
         bad["discovery"][0]["sha256"] = digest
         rejected(lambda bad=bad: terminal_capture_is_clean(bad))
     print("discovery evidence is required and gap-free: OK")
+
+    fallback = copy.deepcopy(clean)
+    replacement = {
+        key: fallback["evidence"]["discovery"][0][key]
+        for key in ("dev", "ino", "sha256")
+    }
+    fallback["evidence"]["manifest_object_fallbacks"] = [
+        {
+            "manifest": 0,
+            "object": 0,
+            "reason": "open_stale",
+            "replacement": replacement,
+        }
+    ]
+    fallback["evidence"]["discovery_uncorroborated"] = 1
+    terminal_capture_is_clean(fallback["evidence"], uncorroborated=1)
+    exact_capture_modules(fallback)
+    for mutate in (
+        lambda d: d["evidence"]["manifest_object_fallbacks"][0].update(reason="/private/path"),
+        lambda d: d["evidence"]["manifest_object_fallbacks"][0]["replacement"].update(ino=999),
+        lambda d: d["evidence"].update(discovery_uncorroborated=0),
+        lambda d: d["evidence"]["manifest_object_fallbacks"][0].update(path="/private/p11.so"),
+    ):
+        bad = copy.deepcopy(fallback)
+        mutate(bad)
+        rejected(lambda bad=bad: exact_capture_modules(bad))
+    hidden_sole_source = copy.deepcopy(fallback)
+    second = copy.deepcopy(
+        hidden_sole_source["evidence"]["manifest_object_fallbacks"][0]
+    )
+    second["object"] = 1
+    hidden_sole_source["evidence"]["manifest_object_fallbacks"].append(second)
+    hidden_sole_source["evidence"]["discovery_uncorroborated"] = 2
+    rejected(lambda: exact_capture_modules(hidden_sole_source))
+    print("manifest fallback is per object, scan-owned, bounded, and path-free: OK")
 
     exact_capture_modules(clean)
     for mutate in (

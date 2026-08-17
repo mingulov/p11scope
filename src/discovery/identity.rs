@@ -983,4 +983,34 @@ mod tests {
             "{target_loss:?}"
         );
     }
+
+    #[test]
+    fn target_loss_names_discarded_incoming_mapping_when_existing_wins() {
+        let mut existing = module(overlay(102));
+        existing.path = "/attached/libsofthsm2.so".into();
+        let mut extra = existing.tables[0].entries[0].clone();
+        extra.name = "C_Sign";
+        extra.file_offset = 0x3000;
+        existing.tables[0].entries.push(extra);
+
+        let mut incoming = module(overlay(104));
+        incoming.path = "/discarded/libsofthsm2.so".into();
+        incoming.tables[0].entries[0].file_offset = 0x2000;
+        let mut modules = vec![existing, incoming];
+        let pinned = pins(&[(overlay(102), SHA, 1), (overlay(104), SHA, 1)]);
+
+        let (_, lost) = collapse_overlay_mappings(&mut modules, &pinned);
+        let target_loss: Vec<_> = lost
+            .iter()
+            .filter(|skip| skip.reason.contains("1 target(s)"))
+            .collect();
+        assert_eq!(target_loss.len(), 1, "{lost:?}");
+        assert!(
+            target_loss[0]
+                .subject
+                .starts_with("/discarded/libsofthsm2.so")
+                && target_loss[0].subject.contains("minor: 104"),
+            "{target_loss:?}"
+        );
+    }
 }

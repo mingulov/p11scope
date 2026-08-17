@@ -205,6 +205,41 @@ pub struct MountNamespaceId {
     pub inode: u64,
 }
 
+fn mount_namespace_id(pid: u32) -> Result<MountNamespaceId, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::metadata(format!("/proc/{pid}/ns/mnt"))
+        .map_err(|error| format!("cannot identify process mount namespace: {error}"))?;
+    Ok(MountNamespaceId {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn ensure_same_mount_namespace(
+    retained: MountNamespaceId,
+    current: MountNamespaceId,
+) -> Result<(), String> {
+    if current == retained {
+        Ok(())
+    } else {
+        Err("process mount namespace changed during discovery".into())
+    }
+}
+
+fn open_then_mountinfo_checked<T>(
+    mut ensure_retained: impl FnMut() -> Result<(), String>,
+    open: impl FnOnce() -> Result<T, String>,
+    read_mountinfo: impl FnOnce() -> Result<String, String>,
+) -> Result<(T, String), String> {
+    ensure_retained()?;
+    let opened = open()?;
+    ensure_retained()?;
+    let mountinfo = read_mountinfo()?;
+    ensure_retained()?;
+    Ok((opened, mountinfo))
+}
+
 /// One accepted process generation and its filesystem view. Task 4 uses the pin
 /// through scan/open/hash; the later lifecycle task can retain this value and recheck
 /// it before subtracting this view's claims.
@@ -216,11 +251,8 @@ pub struct ProcessView {
 
 impl ProcessView {
     pub fn open(id: ProcessViewId, pid: u32) -> Result<Self, String> {
-        use std::os::unix::fs::MetadataExt as _;
-
         let pin = PidPin::open(pid)?;
-        let metadata = std::fs::metadata(format!("/proc/{pid}/ns/mnt"))
-            .map_err(|error| format!("cannot identify pid {pid}'s mount namespace: {error}"))?;
+        let mount_namespace = mount_namespace_id(pid)?;
         if !pin.still_the_same() {
             return Err(format!(
                 "pid {pid} exited while its mount namespace was identified"
@@ -228,10 +260,7 @@ impl ProcessView {
         }
         Ok(Self {
             id,
-            mount_namespace: MountNamespaceId {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            },
+            mount_namespace,
             pin,
         })
     }
@@ -252,24 +281,39 @@ impl ProcessView {
         self.pin.still_the_same()
     }
 
-    /// Reads the mount table belonging to this retained process generation.
-    /// Callers use it only with fds opened through this view's `/proc/<pid>/root`.
-    pub(crate) fn mountinfo(&self) -> Result<String, String> {
+    fn ensure_retained(&self) -> Result<(), String> {
         let exited = || {
             format!(
-                "pid {} exited while its mount table was being read",
+                "pid {} exited while its mount namespace was being checked",
                 self.pid()
             )
         };
         if !self.still_the_same() {
             return Err(exited());
         }
-        let mountinfo = std::fs::read_to_string(format!("/proc/{}/mountinfo", self.pid()))
-            .map_err(|error| format!("cannot read pid {}'s mount table: {error}", self.pid()))?;
+        let current = mount_namespace_id(self.pid())?;
         if !self.still_the_same() {
             return Err(exited());
         }
-        Ok(mountinfo)
+        ensure_same_mount_namespace(self.mount_namespace, current)
+    }
+
+    /// Opens one object through this retained process view before reading the
+    /// matching mount table. The fd keeps its mount alive while its exact `mnt_id`
+    /// is resolved, and both process generation and mount namespace are rechecked.
+    pub(crate) fn open_then_mountinfo<T>(
+        &self,
+        open: impl FnOnce() -> Result<T, String>,
+    ) -> Result<(T, String), String> {
+        open_then_mountinfo_checked(
+            || self.ensure_retained(),
+            open,
+            || {
+                std::fs::read_to_string(format!("/proc/{}/mountinfo", self.pid())).map_err(
+                    |error| format!("cannot read pid {}'s mount table: {error}", self.pid()),
+                )
+            },
+        )
     }
 }
 
@@ -376,8 +420,72 @@ fn process_start_time(pid: u32) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn mountinfo_is_read_only_after_the_fd_is_open_with_retained_rechecks() {
+        let events = RefCell::new(Vec::new());
+        let (opened, mountinfo) = open_then_mountinfo_checked(
+            || {
+                events.borrow_mut().push("check");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("open");
+                Ok(17)
+            },
+            || {
+                events.borrow_mut().push("mountinfo");
+                Ok("17 1 8:1 / / rw - ext4 /dev/root rw\n".into())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(opened, 17);
+        assert!(mountinfo.starts_with("17 1 8:1"));
+        assert_eq!(
+            *events.borrow(),
+            ["check", "open", "check", "mountinfo", "check"],
+            "a table read before the fd open, or without both later rechecks, can authorize the wrong mount"
+        );
+    }
+
+    #[test]
+    fn a_changed_mount_namespace_after_open_is_rejected_before_table_use() {
+        let retained = MountNamespaceId {
+            device: 1,
+            inode: 11,
+        };
+        let changed = MountNamespaceId {
+            device: 1,
+            inode: 12,
+        };
+        let checks = Cell::new(0);
+        let table_reads = Cell::new(0);
+        let error = open_then_mountinfo_checked(
+            || {
+                let current = if checks.get() == 0 { retained } else { changed };
+                checks.set(checks.get() + 1);
+                ensure_same_mount_namespace(retained, current)
+            },
+            || Ok(()),
+            || {
+                table_reads.set(table_reads.get() + 1);
+                Ok(String::new())
+            },
+        )
+        .expect_err("a namespace switch after open must fail closed");
+
+        assert!(error.contains("mount namespace changed"), "{error}");
+        assert_eq!(checks.get(), 2, "the fd open needs an immediate recheck");
+        assert_eq!(
+            table_reads.get(),
+            0,
+            "a changed view must not supply a table"
+        );
+    }
 
     #[test]
     fn low_pidfd_budget_demotes_without_global_failure() {

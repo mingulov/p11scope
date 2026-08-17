@@ -212,7 +212,8 @@ pub struct PinnedObjects {
     by_id: BTreeMap<PinnedObjectId, Entry>,
     raw_to_id: BTreeMap<RawObjectInstance, PinnedObjectId>,
     rejected_keys: BTreeSet<ObjectKey>,
-    ambiguity_emitted: BTreeSet<ObjectKey>,
+    ambiguous_keys: BTreeSet<ObjectKey>,
+    ambiguity_published: BTreeSet<ObjectKey>,
     ownership: BTreeMap<ProcessViewId, ViewClaims>,
     next_id: u32,
     /// Latched by `check_unchanged` the first time any pin differs.
@@ -227,7 +228,8 @@ impl PinnedObjects {
             by_id: BTreeMap::new(),
             raw_to_id: BTreeMap::new(),
             rejected_keys: BTreeSet::new(),
-            ambiguity_emitted: BTreeSet::new(),
+            ambiguous_keys: BTreeSet::new(),
+            ambiguity_published: BTreeSet::new(),
             ownership: BTreeMap::new(),
             next_id: 0,
             changed: std::cell::Cell::new(false),
@@ -259,9 +261,10 @@ impl PinnedObjects {
             }
         }
         for key in other.rejected_keys {
-            self.reject_observation(key, &mut skipped);
+            self.reject_observation(key);
         }
-        self.ambiguity_emitted.extend(other.ambiguity_emitted);
+        self.ambiguous_keys.extend(other.ambiguous_keys);
+        self.ambiguity_published.extend(other.ambiguity_published);
         for (view, claims) in other.ownership {
             let ours = self.ownership.entry(view).or_default();
             ours.tables.extend(
@@ -285,6 +288,7 @@ impl PinnedObjects {
             );
         }
         self.changed.set(self.changed.get() || other.changed.get());
+        self.publish_ambiguities(&mut skipped);
         skipped
     }
 
@@ -419,7 +423,7 @@ impl PinnedObjects {
     fn insert_entry(&mut self, entry: Entry, skipped: &mut Vec<Skipped>) -> Option<PinnedObjectId> {
         let key = entry.raw.key;
         if self.rejected_keys.contains(&key) {
-            self.emit_ambiguity(key, skipped);
+            self.ambiguous_keys.insert(key);
             return None;
         }
         let same_key: Vec<PinnedObjectId> = self
@@ -445,7 +449,7 @@ impl PinnedObjects {
             return Some(id);
         }
         if !same_key.is_empty() {
-            self.reject_key(key, skipped);
+            self.reject_key(key);
             return None;
         }
         let id = PinnedObjectId(self.next_id);
@@ -458,7 +462,7 @@ impl PinnedObjects {
         Some(id)
     }
 
-    fn reject_key(&mut self, key: ObjectKey, skipped: &mut Vec<Skipped>) {
+    fn reject_key(&mut self, key: ObjectKey) {
         self.rejected_keys.insert(key);
         let ids: BTreeSet<PinnedObjectId> = self
             .by_id
@@ -472,23 +476,29 @@ impl PinnedObjects {
             claims.remove(&ids);
         }
         if !ids.is_empty() {
-            self.emit_ambiguity(key, skipped);
+            self.ambiguous_keys.insert(key);
         }
     }
 
     /// Records another member of a group that is already known only as rejected.
     /// The first unavailable observation establishes fail-closed state; the second
     /// establishes the finite collision-group ambiguity, once per raw key.
-    fn reject_observation(&mut self, key: ObjectKey, skipped: &mut Vec<Skipped>) {
+    fn reject_observation(&mut self, key: ObjectKey) {
         let repeated = self.rejected_keys.contains(&key);
-        self.reject_key(key, skipped);
+        self.reject_key(key);
         if repeated {
-            self.emit_ambiguity(key, skipped);
+            self.ambiguous_keys.insert(key);
         }
     }
 
-    fn emit_ambiguity(&mut self, key: ObjectKey, skipped: &mut Vec<Skipped>) {
-        if self.ambiguity_emitted.insert(key) {
+    fn publish_ambiguities(&mut self, skipped: &mut Vec<Skipped>) {
+        for key in self
+            .ambiguous_keys
+            .difference(&self.ambiguity_published)
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            self.ambiguity_published.insert(key);
             skipped.push(ambiguous_identity_skip());
         }
     }
@@ -737,7 +747,10 @@ pub fn pin_scanned_objects(
         .first()
         .map_or(ProcessViewId(0), |module| module.view);
     let view = ProcessView::open(id, pid)?;
-    pin_scanned_view_objects(&view, modules, budget)
+    let (local, mut skipped) = pin_scanned_view_objects(&view, modules, budget)?;
+    let mut aggregate = PinnedObjects::empty();
+    skipped.extend(aggregate.absorb(local));
+    Ok((aggregate, skipped))
 }
 
 pub fn pin_scanned_view_objects(
@@ -783,13 +796,12 @@ pub fn pin_scanned_view_objects(
         }
         return Ok((pinned, skipped));
     }
-    let mountinfo = view.mountinfo()?;
     for raw in wanted {
         // Opening through /proc/<pid>/root is a per-pid action (spec §4.5).
         if !view.still_the_same() {
             return Err(exited());
         }
-        let candidate = pin_scanned_object(view, raw.clone(), &mountinfo, budget);
+        let candidate = pin_scanned_object(view, raw.clone(), budget);
         record_scanned_candidate(&mut pinned, raw, candidate, &mut skipped);
     }
     if !view.still_the_same() {
@@ -812,7 +824,7 @@ fn record_scanned_candidate(
             // A missing mapping identity or digest makes every equal raw-key
             // observation incomparable. Remember the failed member so a candidate
             // from another process view cannot become receiver-wins authority.
-            pinned.reject_observation(raw.key, skipped);
+            pinned.reject_observation(raw.key);
             skipped.push(Skipped {
                 subject: raw.path,
                 reason,
@@ -918,12 +930,13 @@ pub fn reconcile_scanned_modules(
 fn pin_scanned_object(
     view: &ProcessView,
     raw: RawObjectInstance,
-    mountinfo: &str,
     budget: &mut CaptureWorkBudget,
 ) -> Result<Entry, String> {
     // The target's own filesystem view: a container's object is never copied out.
-    let file = open_object(Path::new(&format!("/proc/{}/root{}", view.pid(), raw.path)))?;
-    let found = identity_of_in_mountinfo(&file, mountinfo)?;
+    let (file, mountinfo) = view.open_then_mountinfo(|| {
+        open_object(Path::new(&format!("/proc/{}/root{}", view.pid(), raw.path)))
+    })?;
+    let found = identity_of_in_mountinfo(&file, &mountinfo)?;
     if object_key(found) != raw.key {
         return Err(format!(
             "identity_mismatch: the mapping is {:?} but {} now opens as {:?} \
@@ -1064,6 +1077,37 @@ mod tests {
         pin_set(entries, false)
     }
 
+    fn unavailable_pins(key: ObjectKey, views: &[u64]) -> (PinnedObjects, Vec<Skipped>) {
+        let mut raw = image_pins(&[(key, "aaaaaaaa", 1)])
+            .by_id
+            .pop_first()
+            .unwrap()
+            .1
+            .raw;
+        let mut pins = PinnedObjects::empty();
+        let mut skipped = Vec::new();
+        for view in views {
+            raw.mount_namespace = Some(MountNamespaceId {
+                device: 1,
+                inode: *view,
+            });
+            record_scanned_candidate(
+                &mut pins,
+                raw.clone(),
+                Err(format!("/private/view-{view}.so: unavailable")),
+                &mut skipped,
+            );
+        }
+        (pins, skipped)
+    }
+
+    fn ambiguity_count(skipped: &[Skipped]) -> usize {
+        skipped
+            .iter()
+            .filter(|skip| skip.reason.contains("physical identity is ambiguous"))
+            .count()
+    }
+
     #[test]
     fn fstatfs_failure_is_an_error_not_non_overlay() {
         let error = on_overlayfs(-1).expect_err("an invalid fd must not mean non-overlay");
@@ -1144,6 +1188,9 @@ mod tests {
                 0,
                 "an unavailable group member left an attachable candidate"
             );
+            let mut aggregate = PinnedObjects::empty();
+            skipped.extend(aggregate.absorb(pinned));
+            assert_eq!(aggregate.pinned().count(), 0);
             assert!(
                 skipped
                     .iter()
@@ -1204,6 +1251,77 @@ mod tests {
         for private in ["/private/", "ROUND1_UNAVAILABLE_ERROR", "view-1", "view-2"] {
             assert!(!rendered.contains(private), "leaked {private}: {rendered}");
         }
+    }
+
+    #[test]
+    fn aggregate_rejection_plus_a_later_local_collision_publishes_once() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let mut aggregate = PinnedObjects::empty();
+        let mut skipped = Vec::new();
+
+        let (first, first_skips) = unavailable_pins(key, &[1]);
+        skipped.extend(first_skips);
+        skipped.extend(aggregate.absorb(first));
+        assert_eq!(aggregate.pinned().count(), 0);
+        assert_eq!(ambiguity_count(&skipped), 0);
+
+        let (later, later_skips) = unavailable_pins(key, &[2, 3]);
+        skipped.extend(later_skips);
+        skipped.extend(aggregate.absorb(later));
+
+        assert_eq!(aggregate.pinned().count(), 0);
+        assert_eq!(
+            ambiguity_count(&skipped),
+            1,
+            "a local collision must not publish separately from the aggregate: {skipped:?}"
+        );
+    }
+
+    #[test]
+    fn separate_later_view_collisions_publish_once_for_the_capture() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let mut aggregate = PinnedObjects::empty();
+        let mut skipped = Vec::new();
+
+        for views in [[10, 11], [20, 21]] {
+            let (local, local_skips) = unavailable_pins(key, &views);
+            skipped.extend(local_skips);
+            skipped.extend(aggregate.absorb(local));
+        }
+
+        assert_eq!(aggregate.pinned().count(), 0);
+        assert_eq!(
+            ambiguity_count(&skipped),
+            1,
+            "each per-view set must not publish the capture-wide category: {skipped:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_unavailable_collision_keys_each_publish_once() {
+        let first = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let second = ObjectKey {
+            device: Device { major: 8, minor: 2 },
+            inode: INODE + 1,
+        };
+        let mut aggregate = PinnedObjects::empty();
+        let mut skipped = Vec::new();
+        for (key, views) in [(first, [1, 2]), (second, [3, 4])] {
+            let (local, local_skips) = unavailable_pins(key, &views);
+            skipped.extend(local_skips);
+            skipped.extend(aggregate.absorb(local));
+        }
+
+        assert_eq!(ambiguity_count(&skipped), 2, "{skipped:?}");
     }
 
     #[test]

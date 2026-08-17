@@ -2512,9 +2512,10 @@ mod tests {
             .arg(temp.path())
             .env("PATH", &path)
             .env("DF_AVAILABLE", "2147483647")
-            .status()
+            .output()
             .unwrap();
-        assert!(!short.success());
+        assert!(!short.status.success());
+        assert_eq!(short.stdout, b"before-overlay=2147483647\n");
 
         let existing = temp.path().join("existing");
         std::fs::create_dir(&existing).unwrap();

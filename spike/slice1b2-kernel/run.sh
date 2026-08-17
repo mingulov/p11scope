@@ -85,8 +85,8 @@ require_free_bytes() {
     local label=$1 path=$2 available
     available=$(df --output=avail -B1 "$path" | tail -n 1)
     [[ $available =~ ^[0-9]+$ ]] || return 64
-    (( available >= 2147483648 )) || return 64
     printf '%s=%s\n' "$label" "$available"
+    (( available >= 2147483648 )) || return 64
 }
 
 qemu_preflight() {

@@ -1,6 +1,6 @@
 use p11scope::discovery::scan::CaptureWorkBudget;
 use p11scope::manifest_input::{MAX_MANIFEST_BYTES, read_manifest};
-use p11scope::process::{MountNamespaceId, ProcessViewId};
+use p11scope::process::{MountNamespaceId, ProcessView, ProcessViewId};
 use p11scope_manifest::identity::{IdentityKind, ObjectIdentity};
 use p11scope_manifest::manifest::*;
 use std::os::unix::fs::MetadataExt as _;
@@ -385,6 +385,180 @@ fn stale_manifest_objects_are_typed_individually_for_scan_fallback() {
         pinned.stale[0].reason,
         ManifestStaleReason::IdentityMismatch
     );
+}
+
+#[test]
+fn proc_root_manifest_without_its_retained_process_view_fails_closed() {
+    let d = tmpdir("manifest_pinning_proc_root_unbound");
+    let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
+    let locator = PathBuf::from(format!("/proc/{}/root{}", std::process::id(), so.display()));
+    let manifest = manifest_for(&locator);
+
+    let errors = p11scope::discovery::identity::pin_manifest_objects(&manifest)
+        .expect_err("a proc-root locator without its retained process view is not authoritative");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("no exact retained process view")),
+        "{errors:?}"
+    );
+}
+
+fn retarget_manifest(manifest: &mut Manifest, path: String) {
+    manifest.module_path.clone_from(&path);
+    manifest.objects[0].path.clone_from(&path);
+    manifest.provenance_objects[0].path = path;
+}
+
+#[test]
+fn proc_root_manifest_uses_its_exact_retained_process_view() {
+    use p11scope::discovery::identity::pin_manifest_objects_deferred_in_views;
+
+    let d = tmpdir("manifest_pinning_proc_root_retained");
+    let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
+    let pid = std::process::id();
+    let locator = PathBuf::from(format!("/proc/{pid}/root{}", so.display()));
+    let manifest = manifest_for(&locator);
+    let view = ProcessView::open(ProcessViewId(17), pid).unwrap();
+
+    let pinning = pin_manifest_objects_deferred_in_views(&manifest, &[view]).unwrap();
+    assert!(pinning.stale.is_empty());
+    assert_eq!(pinning.pins.pinned().count(), 1);
+}
+
+#[test]
+fn proc_root_manifest_rejects_ambiguous_spellings() {
+    use p11scope::discovery::identity::{ManifestPinError, pin_manifest_objects_deferred_in_views};
+
+    let d = tmpdir("manifest_pinning_proc_root_ambiguous");
+    let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
+    let pid = std::process::id();
+    let canonical = PathBuf::from(format!("/proc/{pid}/root{}", so.display()));
+    let base = manifest_for(&canonical);
+    let view = ProcessView::open(ProcessViewId(18), pid).unwrap();
+    let directory = so.parent().unwrap();
+    let file = so.file_name().unwrap().to_str().unwrap();
+    let spellings = [
+        format!("/proc/self/root{}", so.display()),
+        format!("/proc/thread-self/root{}", so.display()),
+        format!("/proc/0{pid}/root{}", so.display()),
+        format!("//proc/{pid}/root{}", so.display()),
+        format!("/proc/{pid}//root{}", so.display()),
+        format!("/proc/{pid}/root/{}", so.display()),
+        format!("/proc/{pid}/task/{pid}/root{}", so.display()),
+        format!("/proc/{pid}/root/proc/self/root{}", so.display()),
+        format!("/proc/{pid}/root{}/./{file}", directory.display()),
+        format!("/proc/{pid}/root{}/{file}/../{file}", directory.display()),
+    ];
+
+    for path in spellings {
+        let mut manifest = base.clone();
+        retarget_manifest(&mut manifest, path.clone());
+        let error = pin_manifest_objects_deferred_in_views(&manifest, std::slice::from_ref(&view))
+            .expect_err("ambiguous proc-root spelling must fail closed");
+        assert!(
+            matches!(error, ManifestPinError::Fatal(ref errors)
+                if errors.iter().any(|error| error.contains("canonical /proc/<pid>/root"))),
+            "{path}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn proc_root_parent_alias_cannot_erase_the_retained_view_boundary() {
+    let pid = std::process::id();
+    let mut manifest = manifest_for(Path::new("/bin/sh"));
+    retarget_manifest(&mut manifest, format!("/proc/{pid}/root/../bin/sh"));
+
+    let errors = p11scope::discovery::identity::pin_manifest_objects(&manifest)
+        .expect_err("normalization must not turn a proc-root alias into a host locator");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("canonical /proc/<pid>/root")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn proc_root_prefix_alias_cannot_hide_an_erased_view_boundary() {
+    let pid = std::process::id();
+    let base = manifest_for(Path::new("/bin/sh"));
+    for path in [
+        format!("/./proc/{pid}/root/../bin/sh"),
+        format!("/tmp/../proc/{pid}/root/../bin/sh"),
+        format!("/../proc/{pid}/root/../bin/sh"),
+        format!("/./proc/{pid}/root/../../../bin/sh"),
+    ] {
+        let mut manifest = base.clone();
+        retarget_manifest(&mut manifest, path.clone());
+        let errors = p11scope::discovery::identity::pin_manifest_objects(&manifest)
+            .expect_err("a prefixed proc-root alias must not become a host locator");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("canonical /proc/<pid>/root")),
+            "{path}: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn proc_root_manifest_rejects_a_pid_not_in_the_retained_views() {
+    use p11scope::discovery::identity::{ManifestPinError, pin_manifest_objects_deferred_in_views};
+
+    let d = tmpdir("manifest_pinning_proc_root_wrong_view");
+    let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    let locator = PathBuf::from(format!("/proc/{}/root{}", child.id(), so.display()));
+    let manifest = manifest_for(&locator);
+    let observer = ProcessView::open(ProcessViewId(19), std::process::id()).unwrap();
+
+    let error = pin_manifest_objects_deferred_in_views(&manifest, &[observer])
+        .expect_err("a different retained pid cannot authorize this locator");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(
+        matches!(error, ManifestPinError::Fatal(ref errors)
+            if errors.iter().any(|error| error.contains("no exact retained process view"))),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn proc_root_manifest_rejects_a_stale_retained_process_view() {
+    use p11scope::discovery::identity::{ManifestPinError, pin_manifest_objects_deferred_in_views};
+
+    let d = tmpdir("manifest_pinning_proc_root_stale_view");
+    let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    let locator = PathBuf::from(format!("/proc/{}/root{}", child.id(), so.display()));
+    let manifest = manifest_for(&locator);
+    let view = ProcessView::open(ProcessViewId(20), child.id()).unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let error = pin_manifest_objects_deferred_in_views(&manifest, &[view])
+        .expect_err("a stale retained process generation must fail closed");
+    assert!(
+        matches!(error, ManifestPinError::Fatal(ref errors)
+            if errors.iter().any(|error| error.contains("exited"))),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn ordinary_host_manifest_behavior_is_unchanged_with_retained_views() {
+    use p11scope::discovery::identity::pin_manifest_objects_deferred_in_views;
+
+    let d = tmpdir("manifest_pinning_host_with_views");
+    let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
+    let manifest = manifest_for(&so);
+    let view = ProcessView::open(ProcessViewId(21), std::process::id()).unwrap();
+
+    let pinning = pin_manifest_objects_deferred_in_views(&manifest, &[view]).unwrap();
+    assert!(pinning.stale.is_empty());
+    assert_eq!(pinning.pins.pinned().count(), 1);
 }
 
 #[test]

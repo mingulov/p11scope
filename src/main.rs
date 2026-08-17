@@ -9,7 +9,7 @@ use p11scope::cli::{self, CaptureArgs, CliError, Command, Kind, ScopeArg};
 use p11scope::discovery::identity::pin_manifest_objects;
 use p11scope::discovery::identity::{
     ManifestStaleReason, PinnedObjectId, PinnedObjects, ReconciledModule, StaleManifestObject,
-    pin_manifest_objects_deferred, pin_scanned_view_objects, reconcile_scanned_modules,
+    pin_manifest_objects_deferred_in_views, pin_scanned_view_objects, reconcile_scanned_modules,
     target_paths_equal,
 };
 #[cfg(test)]
@@ -768,16 +768,17 @@ fn discover_plan(
     let mut manifest_inputs = Vec::new();
     for path in &a.manifests {
         let manifest = read_manifest_file(path).inspect_err(|_| base_counters.report_notes())?;
-        let pinning = pin_manifest_objects_deferred(&manifest).map_err(|error| {
-            base_counters.report_notes();
-            for problem in error.problems() {
-                eprintln!("p11scope: {problem}");
-            }
-            anyhow!(
-                "manifest {} is not a usable trusted input; refusing to attach",
-                path.display()
-            )
-        })?;
+        let pinning =
+            pin_manifest_objects_deferred_in_views(&manifest, &views).map_err(|error| {
+                base_counters.report_notes();
+                for problem in error.problems() {
+                    eprintln!("p11scope: {problem}");
+                }
+                anyhow!(
+                    "manifest {} is not a usable trusted input; refusing to attach",
+                    path.display()
+                )
+            })?;
         manifest_inputs.push(ManifestInput {
             path: path.clone(),
             manifest,

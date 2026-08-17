@@ -726,11 +726,142 @@ fn classify_locator_error(kind: std::io::ErrorKind) -> Option<ManifestStaleReaso
     (kind == std::io::ErrorKind::NotFound).then_some(ManifestStaleReason::OpenStale)
 }
 
+fn has_proc_root_component(path: &Path) -> bool {
+    let mut stack = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                stack.pop();
+            }
+            Component::Normal(component) => {
+                let process_root = stack.len() == 2 && stack[0] == "proc" && component == "root";
+                let task_root = stack.len() == 4
+                    && stack[0] == "proc"
+                    && stack[2] == "task"
+                    && component == "root";
+                if process_root || task_root {
+                    return true;
+                }
+                stack.push(component);
+            }
+            Component::Prefix(_) => return false,
+        }
+    }
+    false
+}
+
+fn retained_view_for_manifest_locator<'a>(
+    path: &str,
+    views: &'a [ProcessView],
+) -> Result<Option<&'a ProcessView>, String> {
+    let canonical = || {
+        format!(
+            "{path}: proc-root manifest locators must use canonical /proc/<pid>/root/<path> spelling"
+        )
+    };
+    let raw_proc_root = has_proc_root_component(Path::new(path));
+    let Some(normalized) = normalize_target_path(path) else {
+        return Ok(None);
+    };
+    if raw_proc_root && path != normalized {
+        return Err(canonical());
+    }
+    let Some(proc_path) = normalized.strip_prefix("/proc/") else {
+        return if raw_proc_root {
+            Err(canonical())
+        } else {
+            Ok(None)
+        };
+    };
+    let components: Vec<_> = proc_path.split('/').collect();
+    let Some(root) = components.iter().position(|component| *component == "root") else {
+        return if raw_proc_root {
+            Err(canonical())
+        } else {
+            Ok(None)
+        };
+    };
+    if path != normalized || root != 1 || components.len() < 3 {
+        return Err(canonical());
+    }
+    let pid = components[0].parse::<u32>().map_err(|_| canonical())?;
+    if pid == 0 || components[0] != pid.to_string() {
+        return Err(canonical());
+    }
+    if components[2..].iter().any(|component| component.is_empty())
+        || components.get(2) == Some(&"proc")
+    {
+        return Err(canonical());
+    }
+    let mut matching = views.iter().filter(|view| view.pid() == pid);
+    let Some(view) = matching.next() else {
+        return Err(format!(
+            "{path}: no exact retained process view exists for pid {pid}"
+        ));
+    };
+    if matching.next().is_some() {
+        return Err(format!(
+            "{path}: more than one retained process view exists for pid {pid}"
+        ));
+    }
+    Ok(Some(view))
+}
+
+enum ManifestLocatorOpen {
+    Opened(std::fs::File),
+    Stale,
+    Fatal(String),
+}
+
+fn open_manifest_locator(path: &Path) -> ManifestLocatorOpen {
+    match path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return ManifestLocatorOpen::Stale,
+        Err(error) => {
+            if classify_locator_error(error.kind()).is_some() {
+                return ManifestLocatorOpen::Stale;
+            }
+            return ManifestLocatorOpen::Fatal(format!(
+                "{}: cannot inspect the file locator now ({error})",
+                path.display()
+            ));
+        }
+    }
+    match open_object(path) {
+        Ok(file) => ManifestLocatorOpen::Opened(file),
+        Err(error) => ManifestLocatorOpen::Fatal(format!(
+            "{}: cannot open the file now ({error})",
+            path.display()
+        )),
+    }
+}
+
+fn identity_of_manifest(
+    file: &std::fs::File,
+    retained_mountinfo: Option<&str>,
+) -> Result<MappingFileKey, String> {
+    match retained_mountinfo {
+        Some(mountinfo) => identity_of_in_mountinfo(file, mountinfo),
+        None => identity_of(file),
+    }
+}
+
 /// Classifies only a locator that no longer resolves as deferred staleness. Every
 /// opened object's remaining checks are fatal except an exact recorded-identity
 /// mismatch; the caller may ignore either stale class only after a scan-opened
 /// replacement is proven.
 pub fn pin_manifest_objects_deferred(m: &Manifest) -> Result<ManifestPinning, ManifestPinError> {
+    pin_manifest_objects_deferred_in_views(m, &[])
+}
+
+/// Pins manifest objects, binding canonical `/proc/<pid>/root/...` locators to the
+/// exact process generation already retained from capture scope. Ordinary host
+/// paths continue to resolve in the observer's filesystem view.
+pub fn pin_manifest_objects_deferred_in_views(
+    m: &Manifest,
+    views: &[ProcessView],
+) -> Result<ManifestPinning, ManifestPinError> {
     let structural = validate_structure(m);
     if !structural.is_empty() {
         return Err(ManifestPinError::Invalid(structural));
@@ -742,9 +873,38 @@ pub fn pin_manifest_objects_deferred(m: &Manifest) -> Result<ManifestPinning, Ma
     let mut total_object_bytes = 0u64;
     for object in &m.objects {
         let path = Path::new(&object.path);
-        match path.try_exists() {
-            Ok(true) => {}
-            Ok(false) => {
+        let retained = match retained_view_for_manifest_locator(&object.path, views) {
+            Ok(retained) => retained,
+            Err(binding_error) => {
+                // Preserve the actionable permission diagnostic for an inaccessible
+                // locator, but never open or accept an unbound proc-root object.
+                match path.try_exists() {
+                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                        problems.push(format!(
+                            "{}: cannot inspect the file locator now ({error})",
+                            object.path
+                        ));
+                    }
+                    _ => problems.push(binding_error),
+                }
+                continue;
+            }
+        };
+        let (opened, mountinfo) = match retained {
+            Some(view) => {
+                match view.open_then_mountinfo(|| Ok::<_, String>(open_manifest_locator(path))) {
+                    Ok((opened, mountinfo)) => (opened, Some(mountinfo)),
+                    Err(error) => {
+                        problems.push(format!("{}: {error}", object.path));
+                        continue;
+                    }
+                }
+            }
+            None => (open_manifest_locator(path), None),
+        };
+        let file = match opened {
+            ManifestLocatorOpen::Opened(file) => file,
+            ManifestLocatorOpen::Stale => {
                 stale.push(StaleManifestObject {
                     object: object.id,
                     path: object.path.clone(),
@@ -756,33 +916,8 @@ pub fn pin_manifest_objects_deferred(m: &Manifest) -> Result<ManifestPinning, Ma
                 });
                 continue;
             }
-            Err(error) => {
-                if let Some(reason) = classify_locator_error(error.kind()) {
-                    stale.push(StaleManifestObject {
-                        object: object.id,
-                        path: object.path.clone(),
-                        reason,
-                        diagnostic: format!(
-                            "{}: the manifest object locator no longer resolves",
-                            object.path
-                        ),
-                    });
-                } else {
-                    problems.push(format!(
-                        "{}: cannot inspect the file locator now ({error})",
-                        object.path
-                    ));
-                }
-                continue;
-            }
-        }
-        let file = match open_object(Path::new(&object.path)) {
-            Ok(file) => file,
-            Err(error) => {
-                problems.push(format!(
-                    "{}: cannot open the file now ({error})",
-                    object.path
-                ));
+            ManifestLocatorOpen::Fatal(error) => {
+                problems.push(error);
                 continue;
             }
         };
@@ -805,14 +940,14 @@ pub fn pin_manifest_objects_deferred(m: &Manifest) -> Result<ManifestPinning, Ma
             continue;
         }
         total_object_bytes = total;
-        pinned.push((object, file, pin));
+        pinned.push((object, file, pin, mountinfo));
     }
     if !problems.is_empty() {
         return Err(ManifestPinError::Fatal(problems));
     }
 
     let mut opened = BTreeMap::new();
-    for (object, file, pin) in pinned {
+    for (object, file, pin, mountinfo) in pinned {
         let inspected = match inspect_file(&file) {
             Ok(inspected) => inspected,
             Err(error) => {
@@ -859,7 +994,7 @@ pub fn pin_manifest_objects_deferred(m: &Manifest) -> Result<ManifestPinning, Ma
         if !offsets_valid {
             continue;
         }
-        let mapping = match identity_of(&file) {
+        let mapping = match identity_of_manifest(&file, mountinfo.as_deref()) {
             Ok(mapping) => mapping,
             Err(error) => {
                 problems.push(format!("{}: {error}", object.path));
@@ -1383,6 +1518,27 @@ mod tests {
         ] {
             assert_eq!(classify_locator_error(fatal), None, "{fatal:?}");
         }
+    }
+
+    #[test]
+    fn retained_mount_table_controls_manifest_mapping_identity() {
+        let file = open_object(Path::new("/bin/sh")).unwrap();
+        let observer = identity_of_manifest(&file, None).unwrap();
+        let target_major = observer.device_major.saturating_add(1);
+        let target_minor = observer.device_minor.saturating_add(1);
+        let target_mountinfo = format!(
+            "{} 1 {target_major}:{target_minor} / /target rw - ext4 /dev/target rw\n",
+            observer.mount_id
+        );
+
+        let retained = identity_of_manifest(&file, Some(&target_mountinfo)).unwrap();
+        assert_eq!(retained.mount_id, observer.mount_id);
+        assert_eq!(
+            (retained.device_major, retained.device_minor),
+            (target_major, target_minor),
+            "manifest identity must use the retained view table, not observer mountinfo"
+        );
+        assert_eq!(retained.inode, observer.inode);
     }
 
     #[test]

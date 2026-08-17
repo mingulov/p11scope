@@ -248,6 +248,7 @@ private_start_lane() {
         -netdev "user,id=n1,hostfwd=tcp:127.0.0.1:$port-:22" \
         -device virtio-net-pci,netdev=n1 -display none -serial "file:$run_dir/runtime.serial.log" \
         -no-reboot -daemonize -pidfile "$run_dir/qemu.pid" || return 64
+    chmod 0600 "$run_dir/runtime.serial.log" || return 64
     PRIVATE_QEMU_PID=$(cat "$run_dir/qemu.pid") || return 64
     [[ $PRIVATE_QEMU_PID =~ ^[0-9]+$ ]] || return 64
     ps -ww -p "$PRIVATE_QEMU_PID" -o pid=,args= >"$run_dir/qemu.argv.txt" || return 64
@@ -315,7 +316,11 @@ private_finish_lane() {
     sha256sum "$PRIVATE_RETAINED" >"$PRIVATE_RUN_DIR/retained.after.sha256" || post_rc=64
     cmp "$PRIVATE_RUN_DIR/retained.before.sha256" "$PRIVATE_RUN_DIR/retained.after.sha256" || post_rc=64
     require_free_bytes after-shutdown "$PRIVATE_RUN_DIR" >"$PRIVATE_RUN_DIR/free-space.after-shutdown.txt" || post_rc=64
-    (( shutdown_rc == 0 && post_rc == 0 && forced == 0 && unexpected_exit == 0 )) || return 64
+    ss -H -ltn "sport = :$PRIVATE_PORT" >"$PRIVATE_RUN_DIR/listener.after.txt" || post_rc=64
+    [[ ! -s $PRIVATE_RUN_DIR/listener.after.txt ]] || post_rc=64
+    grep -F 'reboot: Power down' "$PRIVATE_RUN_DIR/runtime.serial.log" \
+        >"$PRIVATE_RUN_DIR/power-down.txt" || post_rc=64
+    (( (shutdown_rc == 0 || shutdown_rc == 255) && post_rc == 0 && forced == 0 && unexpected_exit == 0 )) || return 64
 }
 
 validate_execution_bundle() {

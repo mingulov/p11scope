@@ -372,6 +372,8 @@ seen = {}
 with tarfile.open(archive, "r:") as bundle:
     for member in bundle:
         parts = member.name.split("/")
+        if member.isdir() and member.name == "source":
+            continue
         if not member.name.startswith("source/") or member.name.startswith("/") or any(part in ("", ".", "..") for part in parts[:-1]):
             raise SystemExit(64)
         if member.isdir(): continue
@@ -491,6 +493,8 @@ members = []
 with tarfile.open(archive, "r:") as bundle:
     for member in bundle:
         parts = member.name.split("/")
+        if member.isdir() and member.name == "source":
+            continue
         if not member.name.startswith("source/") or member.name.startswith("/") or any(part in ("", ".", "..") for part in parts[:-1]):
             raise SystemExit(64)
         if member.isdir():
@@ -598,6 +602,8 @@ seen = {}
 with tarfile.open(archive, "r:") as bundle:
     for member in bundle:
         parts = member.name.split("/")
+        if member.isdir() and member.name == "source":
+            continue
         if not member.name.startswith("source/") or member.name.startswith("/") or any(part in ("", ".", "..") for part in parts[:-1]):
             raise SystemExit(64)
         if member.isdir():

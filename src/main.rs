@@ -8,8 +8,10 @@ use p11scope::cli::{self, CaptureArgs, CliError, Command, Kind, ScopeArg};
 use p11scope::discovery::identity::{
     PinnedObjects, collapse_overlay_mappings, pin_manifest_objects, pin_scanned_objects,
 };
+#[cfg(test)]
+use p11scope::discovery::scan::ScanLimits;
 use p11scope::discovery::scan::{
-    ScanLimits, ScanOutcome, ScanRequest, ScannedModule, Skipped, scan_pid,
+    CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, Skipped, scan_pid,
 };
 use p11scope::manifest_input::read_manifest;
 use p11scope::output::AtomicFile;
@@ -175,10 +177,8 @@ struct Discovered {
 
 /// How many processes of a `--cgroup` discovery scans.
 ///
-/// ponytail: a flat cap, not a byte budget. A pod is a handful of processes; a
-/// cgroup with thousands would otherwise pay the per-pid scan budget thousands of
-/// times. Upgrade path if that ever bites: carry `ScanLimits::total_bytes` across
-/// pids instead of counting them.
+/// ponytail: the capture byte budget already bounds work; this flat cap also bounds
+/// `/proc` inventory overhead for cgroups containing thousands of processes.
 const MAX_SCAN_PIDS: usize = 256;
 
 /// What the discovery pass learned besides the plan itself — everything
@@ -511,18 +511,20 @@ fn read_manifest_file(path: &Path) -> Result<Manifest> {
 fn scan_and_pin(
     pid: u32,
     a: &CaptureArgs,
-    limits: ScanLimits,
+    budget: &mut CaptureWorkBudget,
     counters: &mut DiscoveryCounters,
 ) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
-    let outcome = scan_pid(&ScanRequest {
-        pid,
-        hints: &a.modules,
-        hooks: &a.hooks,
-        limits,
-    })
+    let outcome = scan_pid(
+        &ScanRequest {
+            pid,
+            hints: &a.modules,
+            hooks: &a.hooks,
+        },
+        budget,
+    )
     .map_err(|error| anyhow!("scanning pid {pid}: {error}"))?;
     counters.scan_unavailable = counters.scan_unavailable.or(outcome.unavailable_reason());
-    let (pinned, pin_skips) = pin_scanned_objects(pid, outcome.modules(), limits)
+    let (pinned, pin_skips) = pin_scanned_objects(pid, outcome.modules(), budget)
         .map_err(|error| anyhow!("pinning the objects of pid {pid}: {error}"))?;
     // Printed *and* kept: an object discovery could not read is a provider that
     // may never have been observed, and a report that only prints it leaves the
@@ -583,7 +585,7 @@ fn drop_unpinned_entries(modules: &mut [ScannedModule], pinned: &PinnedObjects) 
 /// Discovery for one capture: scan the scope, read and corroborate any manifests,
 /// merge into one plan, pin every object, and record how all of it was found.
 fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
-    let limits = ScanLimits::default();
+    let mut budget = CaptureWorkBudget::default();
     let mut counters = DiscoveryCounters::default();
     let (pids, unlisted) = scope_pids(scope);
     counters.object_skips.extend(unlisted);
@@ -605,7 +607,7 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
         });
     }
     for pid in pids.iter().take(MAX_SCAN_PIDS) {
-        match scan_and_pin(*pid, a, limits, &mut counters) {
+        match scan_and_pin(*pid, a, &mut budget, &mut counters) {
             Ok((found, pins)) => {
                 pinned.absorb(pins);
                 // Ten processes of one container map one object under one key; ten
@@ -1757,21 +1759,74 @@ mod tests {
             per_object_bytes: u64::MAX,
             total_bytes: u64::MAX,
         };
-        let outcome = scan_pid(&ScanRequest {
-            pid: std::process::id(),
-            hints: &[exe],
-            hooks: &hooks,
-            limits,
-        })
+        let mut budget = CaptureWorkBudget::new(limits);
+        let outcome = scan_pid(
+            &ScanRequest {
+                pid: std::process::id(),
+                hints: &[exe],
+                hooks: &hooks,
+            },
+            &mut budget,
+        )
         .unwrap();
         let modules = outcome.modules().to_vec();
-        let (pinned, _) = pin_scanned_objects(std::process::id(), &modules, limits).unwrap();
+        let (pinned, _) = pin_scanned_objects(std::process::id(), &modules, &mut budget).unwrap();
         assert_eq!(
             pinned.pinned().count(),
             1,
             "the hinted executable is pinned"
         );
         (modules, pinned)
+    }
+
+    #[test]
+    fn coordinator_reuses_one_budget_across_process_scans_and_hashes() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let exe = std::env::current_exe().unwrap();
+        let inode = std::fs::metadata(&exe).unwrap().ino();
+        let maps = p11scope_manifest::maps::parse_maps(&std::fs::read("/proc/self/maps").unwrap())
+            .unwrap();
+        let scan_bytes: u64 = maps
+            .iter()
+            .filter(|m| m.inode == inode && m.permissions[0] == b'r' && m.permissions[2] != b'x')
+            .map(|m| m.end - m.start)
+            .sum();
+        let hash_bytes = std::fs::metadata(&exe).unwrap().len();
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: scan_bytes.max(hash_bytes),
+            total_bytes: scan_bytes + hash_bytes,
+        });
+        let args = CaptureArgs {
+            kind: Kind::Profile,
+            modules: vec![exe],
+            manifests: vec![],
+            hooks: p11scope::discovery::hooks::HookRegistry::builtin(),
+            scope: ScopeArg::Pid(std::process::id()),
+            metrics: false,
+            duration: None,
+            out: None,
+            unsafe_requested: false,
+        };
+        let mut counters = DiscoveryCounters::default();
+        let (_, first) =
+            scan_and_pin(std::process::id(), &args, &mut budget, &mut counters).unwrap();
+        let (_, second) =
+            scan_and_pin(std::process::id(), &args, &mut budget, &mut counters).unwrap();
+        assert_eq!(first.pinned().count(), 1);
+        assert_eq!(
+            second.pinned().count(),
+            0,
+            "the later scan cannot renew bytes"
+        );
+        assert!(
+            counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.reason.contains("too_large")),
+            "budget exhaustion must remain explicit: {:?}",
+            counters.object_skips
+        );
     }
 
     /// The pin `pin_manifest_objects` produces for one manifest object: filed under
@@ -1797,7 +1852,7 @@ mod tests {
                 tables: vec![],
                 interfaces: vec![],
             }],
-            ScanLimits::default(),
+            &mut CaptureWorkBudget::default(),
         )
         .unwrap();
         assert!(skipped.is_empty(), "{skipped:?}");
@@ -2015,7 +2070,12 @@ mod tests {
             per_object_bytes: 1024,
             total_bytes: 1024,
         };
-        let (pinned, skips) = pin_scanned_objects(std::process::id(), &modules, tiny).unwrap();
+        let (pinned, skips) = pin_scanned_objects(
+            std::process::id(),
+            &modules,
+            &mut CaptureWorkBudget::new(tiny),
+        )
+        .unwrap();
         assert_eq!(pinned.pinned().count(), 0, "nothing could be pinned");
         assert!(!skips.is_empty(), "the scan reported the loss");
 

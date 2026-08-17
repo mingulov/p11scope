@@ -22,6 +22,9 @@ const INTERFACE_NAME_CAP: usize = 64;
 const INTERFACE_BYTES: usize = 3 * WORD;
 const READ_CHUNK: usize = 1024 * 1024;
 const STANDARD_INTERFACE_NAME: &[u8] = b"PKCS 11";
+const MAX_TABLE_CANDIDATES: usize = 512;
+const MAX_DECODED_TABLE_ENTRIES: usize = 512 * 104;
+const MAX_INTERFACE_RECORDS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanLimits {
@@ -38,12 +41,114 @@ impl Default for ScanLimits {
     }
 }
 
+/// One capture's concrete discovery allowance. Memory snapshots and file hashes
+/// spend the same byte total; cardinality counters stop decoded-record amplification.
+#[derive(Debug)]
+pub struct CaptureWorkBudget {
+    limits: ScanLimits,
+    attempted_io_bytes: u64,
+    table_candidates: usize,
+    decoded_table_entries: usize,
+    interface_records: usize,
+    table_exhaustion_reported: bool,
+    interface_exhaustion_reported: bool,
+}
+
+impl CaptureWorkBudget {
+    pub fn new(limits: ScanLimits) -> Self {
+        Self {
+            limits,
+            attempted_io_bytes: 0,
+            table_candidates: 0,
+            decoded_table_entries: 0,
+            interface_records: 0,
+            table_exhaustion_reported: false,
+            interface_exhaustion_reported: false,
+        }
+    }
+
+    pub fn limits(&self) -> ScanLimits {
+        self.limits
+    }
+
+    pub fn attempted_io_bytes(&self) -> u64 {
+        self.attempted_io_bytes
+    }
+
+    pub(crate) fn charge_io(&mut self, bytes: u64) -> bool {
+        let Some(running) = self.attempted_io_bytes.checked_add(bytes) else {
+            return false;
+        };
+        if bytes > self.limits.per_object_bytes || running > self.limits.total_bytes {
+            return false;
+        }
+        self.attempted_io_bytes = running;
+        true
+    }
+
+    fn admit_table(&mut self, entries: usize) -> bool {
+        let Some(decoded) = self.decoded_table_entries.checked_add(entries) else {
+            return false;
+        };
+        if self.table_candidates == MAX_TABLE_CANDIDATES || decoded > MAX_DECODED_TABLE_ENTRIES {
+            return false;
+        }
+        self.table_candidates += 1;
+        self.decoded_table_entries = decoded;
+        true
+    }
+
+    fn tables_exhausted(&self) -> bool {
+        self.table_candidates == MAX_TABLE_CANDIDATES
+            || self.decoded_table_entries == MAX_DECODED_TABLE_ENTRIES
+    }
+
+    fn table_exhaustion_reason(&mut self) -> Option<String> {
+        if std::mem::replace(&mut self.table_exhaustion_reported, true) {
+            None
+        } else {
+            Some(format!(
+                "capture table decode ceiling reached ({MAX_TABLE_CANDIDATES} candidates, \
+                 {MAX_DECODED_TABLE_ENTRIES} entries); remaining table data was not decoded"
+            ))
+        }
+    }
+
+    fn admit_interface(&mut self) -> bool {
+        if self.interface_records == MAX_INTERFACE_RECORDS {
+            return false;
+        }
+        self.interface_records += 1;
+        true
+    }
+
+    fn interfaces_exhausted(&self) -> bool {
+        self.interface_records == MAX_INTERFACE_RECORDS
+    }
+
+    fn interface_exhaustion_reason(&mut self) -> Option<String> {
+        if std::mem::replace(&mut self.interface_exhaustion_reported, true) {
+            None
+        } else {
+            Some(format!(
+                "capture interface decode ceiling reached ({MAX_INTERFACE_RECORDS} records); \
+                 remaining interface data was not decoded"
+            ))
+        }
+    }
+}
+
+impl Default for CaptureWorkBudget {
+    fn default() -> Self {
+        Self::new(ScanLimits::default())
+    }
+}
+
 pub struct ScanRequest<'a> {
     pub pid: u32,
     /// `--module` hints; empty means "every object exporting a registry symbol".
     pub hints: &'a [PathBuf],
     pub hooks: &'a HookRegistry,
-    pub limits: ScanLimits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,67 +298,92 @@ fn decode_candidate(
     base_address: u64,
     maps: &[MapEntry],
     mapped: &std::ops::Range<u64>,
-    truncated: &mut Vec<String>,
-) -> Option<(ScannedTable, usize)> {
-    let word = u64::from_ne_bytes(
-        snapshot
-            .get(offset..offset.checked_add(WORD)?)?
-            .try_into()
-            .ok()?,
-    );
-    let (version, spans, walk) = spans_for(word)?;
-    let len = span_bytes(spans)?;
-    let address = base_address.checked_add(offset as u64)?;
-    let Some(bytes) = snapshot.get(offset..offset.checked_add(len)?) else {
-        // Clauses 1–4 held, so this really looks like a table header; only clause 5
-        // failed. Recording it is what keeps the .bss-spill gap visible instead of
-        // silently returning an empty module (coordinator ruling, 2026-08-16).
-        // No `address` here: the reason is published in the capture document, and a
-        // target's runtime layout is not something a shareable artifact carries
-        // (the same rule that keeps interface names out). The version, the sizes
-        // and the object identity say what was lost; where it lived is a local
-        // debugging detail, and `p11scope inspect` prints table addresses.
-        truncated.push(format!(
-            "a {}.{} table header extends past the object's file-backed data ({len} \
-             bytes needed, {} available); a table built at run time in .bss or on the \
-             heap is outside the memory scan's reach",
-            version.0,
-            version.1,
-            snapshot.len().saturating_sub(offset),
-        ));
-        return None;
+    budget: &mut CaptureWorkBudget,
+) -> Result<Option<(ScannedTable, usize)>, ()> {
+    let Some(raw_word) = offset
+        .checked_add(WORD)
+        .and_then(|end| snapshot.get(offset..end))
+    else {
+        return Ok(None);
+    };
+    let word = u64::from_ne_bytes(raw_word.try_into().expect("one word"));
+    let Some((version, spans, walk)) = spans_for(word) else {
+        return Ok(None);
+    };
+    let Some(len) = span_bytes(spans) else {
+        return Ok(None);
+    };
+    let Some(address) = base_address.checked_add(offset as u64) else {
+        return Ok(None);
+    };
+    let Some(bytes) = offset
+        .checked_add(len)
+        .and_then(|end| snapshot.get(offset..end))
+    else {
+        return Ok(None);
     };
 
-    let mut entries = Vec::new();
-    let mut null_entries = Vec::new();
+    // Validate the whole candidate before reserving or allocating decoded records.
     let mut non_null = 0usize;
     for span in spans {
-        let values = read_fn_pointers(bytes, span.fields()).ok()?;
-        for (name, value) in values {
+        for field in span.fields() {
+            let Some(raw) = field
+                .offset
+                .checked_add(WORD)
+                .and_then(|end| bytes.get(field.offset..end))
+            else {
+                return Ok(None);
+            };
+            let value = usize::from_ne_bytes(raw.try_into().expect("one pointer"));
             if value == 0 {
-                null_entries.push(name);
                 continue;
             }
             non_null += 1;
             if !mapped.contains(&(value as u64)) {
-                return None; // outside every mapping ⇒ resolve would say Unmapped
+                return Ok(None); // outside every mapping ⇒ resolve would say Unmapped
+            }
+            let Resolved::File {
+                permissions, path, ..
+            } = resolve(maps, value as u64)
+            else {
+                return Ok(None); // anonymous or unmapped ⇒ not a function table
+            };
+            if permissions[2] != b'x' {
+                return Ok(None); // a pointer into data ⇒ not a function table
+            }
+            let MappedPath::Usable(_) = path else {
+                return Ok(None); // deleted/ambiguous pathname ⇒ cannot become an attach target
+            };
+        }
+    }
+    if non_null == 0 {
+        return Ok(None);
+    }
+    let decoded_entries = spans.iter().map(|span| span.fields().len()).sum();
+    if !budget.admit_table(decoded_entries) {
+        return Err(());
+    }
+
+    let mut entries = Vec::with_capacity(non_null);
+    let mut null_entries = Vec::with_capacity(decoded_entries - non_null);
+    for span in spans {
+        for (name, value) in read_fn_pointers(bytes, span.fields()).expect("validated above") {
+            if value == 0 {
+                null_entries.push(name);
+                continue;
             }
             let Resolved::File {
                 path,
                 file_offset,
                 device,
                 inode,
-                permissions,
                 ..
             } = resolve(maps, value as u64)
             else {
-                return None; // anonymous or unmapped ⇒ not a function table
+                unreachable!("validated above")
             };
-            if permissions[2] != b'x' {
-                return None; // a pointer into data ⇒ not a function table
-            }
             let MappedPath::Usable(path) = path else {
-                return None; // deleted/ambiguous pathname ⇒ cannot become an attach target
+                unreachable!("validated above")
             };
             entries.push(ScannedEntry {
                 name,
@@ -263,10 +393,7 @@ fn decode_candidate(
             });
         }
     }
-    if non_null == 0 {
-        return None;
-    }
-    Some((
+    Ok(Some((
         ScannedTable {
             version,
             walk,
@@ -276,35 +403,41 @@ fn decode_candidate(
             address,
         },
         len,
-    ))
+    )))
 }
 
 /// Every 8-byte-aligned candidate in one snapshot, longest match kept on overlap.
-/// The second return is the reasons for candidates whose header parsed but whose body
-/// ran past the snapshot — the caller turns each into a `Skipped`.
+/// The second return carries the one bounded exhaustion reason, if decoding stopped.
 fn detect_tables(
     snapshot: &[u8],
     base_address: u64,
     maps: &[MapEntry],
+    budget: &mut CaptureWorkBudget,
 ) -> (Vec<ScannedTable>, Vec<String>) {
     // One pass over the maps here saves a linear `resolve` scan per rejected word.
     let (low, high) = maps.iter().fold((u64::MAX, 0), |(low, high), entry| {
         (low.min(entry.start), high.max(entry.end))
     });
     let mapped = low..high;
-    let mut truncated = Vec::new();
+    let mut skipped = Vec::new();
     let mut found: Vec<(usize, usize, ScannedTable)> = Vec::new();
     let mut offset = 0usize;
     while offset + WORD <= snapshot.len() {
-        if let Some((table, len)) = decode_candidate(
-            snapshot,
-            offset,
-            base_address,
-            maps,
-            &mapped,
-            &mut truncated,
-        ) {
-            found.push((offset, len, table));
+        if budget.tables_exhausted() {
+            if let Some(reason) = budget.table_exhaustion_reason() {
+                skipped.push(reason);
+            }
+            break;
+        }
+        match decode_candidate(snapshot, offset, base_address, maps, &mapped, budget) {
+            Ok(Some((table, len))) => found.push((offset, len, table)),
+            Ok(None) => {}
+            Err(()) => {
+                if let Some(reason) = budget.table_exhaustion_reason() {
+                    skipped.push(reason);
+                }
+                break;
+            }
         }
         offset += WORD;
     }
@@ -323,7 +456,7 @@ fn detect_tables(
     kept.sort_by_key(|(start, _, _)| *start);
     (
         kept.into_iter().map(|(_, _, table)| table).collect(),
-        truncated,
+        skipped,
     )
 }
 
@@ -335,7 +468,8 @@ fn scan_interfaces(
     tables: &[ScannedTable],
     maps: &[MapEntry],
     key: ObjectKey,
-) -> Vec<ScannedInterface> {
+    budget: &mut CaptureWorkBudget,
+) -> (Vec<ScannedInterface>, Vec<String>) {
     let word_at = |offset: usize| -> Option<u64> {
         Some(u64::from_ne_bytes(
             snapshot
@@ -345,8 +479,15 @@ fn scan_interfaces(
         ))
     };
     let mut found = Vec::new();
+    let mut skipped = Vec::new();
     let mut offset = 0usize;
     while offset + INTERFACE_BYTES <= snapshot.len() {
+        if budget.interfaces_exhausted() {
+            if let Some(reason) = budget.interface_exhaustion_reason() {
+                skipped.push(reason);
+            }
+            break;
+        }
         let scanned = (|| {
             let name_ptr = word_at(offset)?;
             let table_ptr = word_at(offset + WORD)?;
@@ -355,6 +496,9 @@ fn scan_interfaces(
             // is just data. Requiring a decoded table also keeps the byte budget —
             // only the provider's own mappings are ever read.
             let table = tables.iter().position(|t| t.address == table_ptr)?;
+            if !budget.admit_interface() {
+                return None;
+            }
             // Privacy boundary: a triple is accepted on `table_ptr` alone, so the name
             // pointer of a look-alike structure could aim anywhere. Only this object's
             // own readable pages — where a provider keeps its interface names — are
@@ -390,7 +534,7 @@ fn scan_interfaces(
         }
         offset += WORD;
     }
-    found
+    (found, skipped)
 }
 
 /// A NUL-terminated name of at most `INTERFACE_NAME_CAP` bytes, or `None` when the
@@ -517,7 +661,10 @@ fn hint_gate(
     ))
 }
 
-pub fn scan_pid(request: &ScanRequest<'_>) -> Result<ScanOutcome, String> {
+pub fn scan_pid(
+    request: &ScanRequest<'_>,
+    budget: &mut CaptureWorkBudget,
+) -> Result<ScanOutcome, String> {
     let started = Instant::now();
     let pid = request.pid;
     let maps = parse_maps(
@@ -548,7 +695,6 @@ pub fn scan_pid(request: &ScanRequest<'_>) -> Result<ScanOutcome, String> {
     let hint_ids: Vec<Option<(u64, u64)>> =
         request.hints.iter().map(|h| hint_identity(h)).collect();
     let mut hint_matched = vec![false; request.hints.len()];
-    let mut total_bytes = 0u64;
 
     for (key, group) in candidate_groups(&maps) {
         // A group with no `/`-rooted pathname (memfd, pseudo-path) is still a real
@@ -661,24 +807,23 @@ pub fn scan_pid(request: &ScanRequest<'_>) -> Result<ScanOutcome, String> {
         let object_bytes = data.iter().try_fold(0u64, |sum, entry| {
             sum.checked_add(entry.end.checked_sub(entry.start)?)
         });
-        let running = object_bytes.and_then(|bytes| total_bytes.checked_add(bytes));
-        if object_bytes.is_none_or(|bytes| bytes > request.limits.per_object_bytes)
-            || running.is_none_or(|running| running > request.limits.total_bytes)
-        {
+        let admitted = object_bytes.is_some_and(|bytes| budget.charge_io(bytes));
+        if !admitted {
             let object_bytes = object_bytes.map_or("unrepresentable".into(), |b| b.to_string());
+            let limits = budget.limits();
             skipped.push(Skipped {
                 subject,
                 reason: format!(
                     "too_large ({object_bytes} readable data bytes; caps are \
-                     {} per object and {} per capture, {total_bytes} already read)",
-                    request.limits.per_object_bytes, request.limits.total_bytes
+                     {} per object and {} per capture, {} already attempted)",
+                    limits.per_object_bytes,
+                    limits.total_bytes,
+                    budget.attempted_io_bytes()
                 ),
             });
             modules.push(module);
             continue;
         }
-        total_bytes = running.unwrap_or(total_bytes);
-
         let mut snapshots = Vec::with_capacity(data.len());
         for entry in &data {
             let (bytes, short) = read_mapping(mem, entry);
@@ -693,17 +838,21 @@ pub fn scan_pid(request: &ScanRequest<'_>) -> Result<ScanOutcome, String> {
             snapshots.push((entry.start, bytes));
         }
         for (base, snapshot) in &snapshots {
-            let (tables, truncated) = detect_tables(snapshot, *base, &maps);
+            let (tables, exhausted) = detect_tables(snapshot, *base, &maps, budget);
             module.tables.extend(tables);
-            skipped.extend(truncated.into_iter().map(|reason| Skipped {
+            skipped.extend(exhausted.into_iter().map(|reason| Skipped {
                 subject: module.path.clone(),
                 reason,
             }));
         }
         for (_, snapshot) in &snapshots {
-            module
-                .interfaces
-                .extend(scan_interfaces(snapshot, mem, &module.tables, &maps, key));
+            let (interfaces, exhausted) =
+                scan_interfaces(snapshot, mem, &module.tables, &maps, key, budget);
+            module.interfaces.extend(interfaces);
+            skipped.extend(exhausted.into_iter().map(|reason| Skipped {
+                subject: module.path.clone(),
+                reason,
+            }));
         }
         for (index, interface) in module.interfaces.iter_mut().enumerate() {
             interface.index = index;
@@ -789,7 +938,8 @@ mod tests {
         }
         let inner = 8 + 30 * 8;
         snapshot[inner..inner + 8].copy_from_slice(&0x2802u64.to_ne_bytes());
-        let (tables, truncated) = detect_tables(&snapshot, 0x7000, &maps);
+        let (tables, truncated) =
+            detect_tables(&snapshot, 0x7000, &maps, &mut CaptureWorkBudget::default());
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].version, (3, 2));
         assert_eq!(tables[0].address, 0x7000);
@@ -800,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    fn a_header_whose_body_runs_past_the_snapshot_is_recorded_not_dropped() {
+    fn a_header_whose_body_runs_past_the_snapshot_is_not_a_candidate() {
         let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();
         // A 2.40 header with only 10 of its 68 slots inside the snapshot: exactly the
         // shape of a table whose .bss has spilled into an anonymous mapping.
@@ -810,22 +960,70 @@ mod tests {
             let at = 8 + slot * 8;
             snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_ne_bytes());
         }
-        let (tables, truncated) = detect_tables(&snapshot, 0x7000, &maps);
+        let (tables, truncated) =
+            detect_tables(&snapshot, 0x7000, &maps, &mut CaptureWorkBudget::default());
         assert!(tables.is_empty(), "an incomplete table is never decoded");
-        assert_eq!(truncated.len(), 1, "{truncated:?}");
-        assert!(
-            truncated[0].contains("2.40")
-                && truncated[0].contains("552 bytes needed")
-                && truncated[0].contains("88 available"),
-            "{}",
-            truncated[0]
-        );
-        // This reason is published in the capture document, which carries no
-        // runtime address of the target — the same rule that keeps interface
-        // names out of it.
-        assert!(!truncated[0].contains("0x7000"), "{}", truncated[0]);
+        assert!(truncated.is_empty(), "a version word alone is not evidence");
         // Ordinary data must not generate this diagnostic.
-        assert!(detect_tables(&vec![0u8; 4096], 0x7000, &maps).1.is_empty());
+        assert!(
+            detect_tables(
+                &vec![0u8; 4096],
+                0x7000,
+                &maps,
+                &mut CaptureWorkBudget::default()
+            )
+            .1
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn dense_candidates_and_interfaces_stop_at_capture_caps() {
+        let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();
+        let table_len = 8 + 104 * 8;
+        let mut snapshot = vec![0u8; 513 * table_len];
+        for table in 0..513 {
+            let base = table * table_len;
+            snapshot[base..base + 8].copy_from_slice(&0x0203u64.to_ne_bytes());
+            for slot in 0..104 {
+                let at = base + 8 + slot * 8;
+                snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_ne_bytes());
+            }
+        }
+        let mut budget = CaptureWorkBudget::default();
+        let (tables, skipped) = detect_tables(&snapshot, 0x7000, &maps, &mut budget);
+        assert_eq!(tables.len(), 512, "candidate amplification must be bounded");
+        assert_eq!(
+            tables
+                .iter()
+                .map(|table| table.entries.len())
+                .sum::<usize>(),
+            53_248,
+            "decoded entry amplification must be bounded"
+        );
+        assert_eq!(skipped.len(), 1, "one bounded exhaustion result");
+
+        let table = tables[0].clone();
+        let mut interfaces = vec![0u8; 513 * INTERFACE_BYTES];
+        for interface in 0..513 {
+            let base = interface * INTERFACE_BYTES;
+            interfaces[base + WORD..base + 2 * WORD].copy_from_slice(&table.address.to_ne_bytes());
+        }
+        let mem = tempfile::tempfile().unwrap();
+        assert_eq!(
+            scan_interfaces(
+                &interfaces,
+                &mem,
+                &[table],
+                &maps,
+                ObjectKey::of(&maps[0]),
+                &mut budget
+            )
+            .0
+            .len(),
+            512,
+            "interface amplification must be bounded"
+        );
     }
 
     /// Case 3 is the one that matters and the one no end-to-end test can reach here:
@@ -887,19 +1085,53 @@ mod tests {
             snapshot[8..16].copy_from_slice(&bad.to_ne_bytes());
             snapshot
         };
-        assert_eq!(detect_tables(&build(0x1600), 0x2000, &maps).0.len(), 1);
-        assert!(detect_tables(&build(0x2500), 0x2000, &maps).0.is_empty()); // rw- data
-        assert!(detect_tables(&build(0x9000), 0x2000, &maps).0.is_empty()); // unmapped
+        assert_eq!(
+            detect_tables(
+                &build(0x1600),
+                0x2000,
+                &maps,
+                &mut CaptureWorkBudget::default()
+            )
+            .0
+            .len(),
+            1
+        );
+        assert!(
+            detect_tables(
+                &build(0x2500),
+                0x2000,
+                &maps,
+                &mut CaptureWorkBudget::default()
+            )
+            .0
+            .is_empty()
+        ); // rw- data
+        assert!(
+            detect_tables(
+                &build(0x9000),
+                0x2000,
+                &maps,
+                &mut CaptureWorkBudget::default()
+            )
+            .0
+            .is_empty()
+        ); // unmapped
         // Every slot NULL: a zeroed page is not a table.
         assert!(
-            detect_tables(&vec![0u8; 8 + 68 * 8], 0x2000, &maps)
-                .0
-                .is_empty()
+            detect_tables(
+                &vec![0u8; 8 + 68 * 8],
+                0x2000,
+                &maps,
+                &mut CaptureWorkBudget::default()
+            )
+            .0
+            .is_empty()
         );
         // One NULL slot among live ones is legitimate evidence, not a rejection.
         let mut with_null = build(0x1600);
         with_null[16..24].copy_from_slice(&0u64.to_ne_bytes());
-        let (tables, _) = detect_tables(&with_null, 0x2000, &maps);
+        let (tables, _) =
+            detect_tables(&with_null, 0x2000, &maps, &mut CaptureWorkBudget::default());
         assert_eq!(tables[0].null_entries.len(), 1);
         assert_eq!(tables[0].entries.len(), 67);
     }

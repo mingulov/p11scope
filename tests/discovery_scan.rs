@@ -7,7 +7,9 @@
 //! process image and then scans that image.
 
 use p11scope::discovery::hooks::HookRegistry;
-use p11scope::discovery::scan::{ScanLimits, ScanOutcome, ScanRequest, scan_pid};
+use p11scope::discovery::scan::{
+    CaptureWorkBudget, ScanLimits, ScanOutcome, ScanRequest, scan_pid,
+};
 use p11scope_manifest::manifest::{Resolution, SurfaceSource};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -61,12 +63,15 @@ fn load_and_populate(so: &Path) {
 
 fn scan_self(hints: &[PathBuf]) -> ScanOutcome {
     let hooks = HookRegistry::builtin();
-    scan_pid(&ScanRequest {
-        pid: std::process::id(),
-        hints,
-        hooks: &hooks,
-        limits: ScanLimits::default(),
-    })
+    let mut budget = CaptureWorkBudget::default();
+    scan_pid(
+        &ScanRequest {
+            pid: std::process::id(),
+            hints,
+            hooks: &hooks,
+        },
+        &mut budget,
+    )
     .expect("scanning our own process must not fail")
 }
 
@@ -304,13 +309,10 @@ fn load_and_populate_ignoring_missing_entry(so: &Path) {
     assert!(!handle.is_null(), "dlopen {}", so.display());
 }
 
-/// The fixture's later tables (`t32` onwards) sit in the `.bss` spill, an *anonymous*
-/// mapping the scan deliberately will not attribute to the object; `t31` straddles the
-/// end of the file-backed page. Neither is decoded — but neither may vanish silently,
-/// or an operator whose provider builds its table at run time gets an empty report with
-/// no explanation.
+/// A version word at the end of file-backed data does not satisfy the detector's
+/// complete-body clause and therefore is not evidence of a truncated table.
 #[test]
-fn a_table_running_past_the_file_backed_data_is_recorded_not_silently_lost() {
+fn a_table_header_running_past_file_backed_data_is_silently_ignored() {
     let dir = tmp("scan-truncated");
     let so = build_fixture(&dir, "truncated", &["-DMATRIX_INTERFACES=0"]);
     load_and_populate(&so);
@@ -326,21 +328,9 @@ fn a_table_running_past_the_file_backed_data_is_recorded_not_silently_lost() {
         .find(|m| m.path.ends_with("truncated.so"))
         .unwrap();
     assert!(!module.tables.is_empty(), "{module:?}");
-    let extends_past: Vec<&str> = skipped
-        .iter()
-        .filter(|s| s.subject.ends_with("truncated.so") && s.reason.contains("extends past"))
-        .map(|s| s.reason.as_str())
-        .collect();
     assert!(
-        !extends_past.is_empty(),
-        "a header whose body runs past the object's file-backed data must be recorded; \
-         got {skipped:?}"
-    );
-    assert!(
-        extends_past
-            .iter()
-            .all(|r| r.contains("bytes needed") && r.contains("outside the memory scan's reach")),
-        "{extends_past:?}"
+        !skipped.iter().any(|s| s.reason.contains("extends past")),
+        "a version word without its complete pointer body is not a candidate: {skipped:?}"
     );
 }
 
@@ -449,17 +439,20 @@ fn the_per_capture_byte_cap_accumulates_across_objects() {
     let budget = readable_data_bytes(&first);
     assert_eq!(budget, readable_data_bytes(&second), "fixtures must match");
     let hooks = HookRegistry::builtin();
+    let mut budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 64 * 1024 * 1024,
+        total_bytes: budget,
+    });
     let ScanOutcome::Scanned {
         modules, skipped, ..
-    } = scan_pid(&ScanRequest {
-        pid: std::process::id(),
-        hints: &[first.clone(), second.clone()],
-        hooks: &hooks,
-        limits: ScanLimits {
-            per_object_bytes: 64 * 1024 * 1024,
-            total_bytes: budget,
+    } = scan_pid(
+        &ScanRequest {
+            pid: std::process::id(),
+            hints: &[first.clone(), second.clone()],
+            hooks: &hooks,
         },
-    })
+        &mut budget,
+    )
     .unwrap()
     else {
         panic!("scan must be available")
@@ -481,20 +474,67 @@ fn the_per_capture_byte_cap_accumulates_across_objects() {
 }
 
 #[test]
+fn separate_process_scans_cannot_renew_the_capture_byte_budget() {
+    let dir = tmp("scan-shared-capture-cap");
+    let first = build_fixture(&dir, "shared-a", &["-DMATRIX_INTERFACES=0"]);
+    let second = build_fixture(&dir, "shared-b", &["-DMATRIX_INTERFACES=0"]);
+    load_and_populate(&first);
+    load_and_populate(&second);
+    let total_bytes = readable_data_bytes(&first);
+    assert_eq!(total_bytes, readable_data_bytes(&second));
+    let hooks = HookRegistry::builtin();
+    let limits = ScanLimits {
+        per_object_bytes: 64 * 1024 * 1024,
+        total_bytes,
+    };
+    let mut budget = CaptureWorkBudget::new(limits);
+    let first_outcome = scan_pid(
+        &ScanRequest {
+            pid: std::process::id(),
+            hints: &[first],
+            hooks: &hooks,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let second_outcome = scan_pid(
+        &ScanRequest {
+            pid: std::process::id(),
+            hints: &[second],
+            hooks: &hooks,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    assert!(first_outcome.modules().iter().any(|m| !m.tables.is_empty()));
+    assert!(
+        second_outcome.modules().iter().all(|m| m.tables.is_empty())
+            && second_outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains("too_large")),
+        "a later process scan must not receive a fresh capture allowance: {second_outcome:?}"
+    );
+}
+
+#[test]
 fn the_per_object_byte_cap_is_enforced_as_a_skip_not_a_truncation() {
     let dir = tmp("scan-cap");
     let so = build_fixture(&dir, "capped", &["-DMATRIX_INTERFACES=0"]);
     load_and_populate(&so);
     let hooks = HookRegistry::builtin();
-    let outcome = scan_pid(&ScanRequest {
-        pid: std::process::id(),
-        hints: &[so.clone()],
-        hooks: &hooks,
-        limits: ScanLimits {
-            per_object_bytes: 1,
-            total_bytes: 512 * 1024 * 1024,
+    let mut budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 1,
+        total_bytes: 512 * 1024 * 1024,
+    });
+    let outcome = scan_pid(
+        &ScanRequest {
+            pid: std::process::id(),
+            hints: &[so.clone()],
+            hooks: &hooks,
         },
-    })
+        &mut budget,
+    )
     .unwrap();
     let ScanOutcome::Scanned {
         modules, skipped, ..
@@ -548,12 +588,15 @@ fn an_unreadable_proc_mem_is_reported_as_unavailable_not_as_an_error() {
 
     let exe = std::fs::read_link(format!("/proc/{pid}/exe")).expect("target exe link");
     let hooks = HookRegistry::builtin();
-    let outcome = scan_pid(&ScanRequest {
-        pid,
-        hints: &[exe.clone()],
-        hooks: &hooks,
-        limits: ScanLimits::default(),
-    });
+    let mut budget = CaptureWorkBudget::default();
+    let outcome = scan_pid(
+        &ScanRequest {
+            pid,
+            hints: &[exe.clone()],
+            hooks: &hooks,
+        },
+        &mut budget,
+    );
     for pid in &pids {
         let _ = Command::new("kill").arg(pid.to_string()).status();
     }
@@ -645,17 +688,20 @@ fn inspect_renders_a_scanned_fixture_end_to_end() {
     let so = build_fixture(&dir, "inspected", &["-DMATRIX_INTERFACES=0"]);
     load_and_populate(&so);
     let hooks = HookRegistry::builtin();
-    let outcome = scan_pid(&ScanRequest {
-        pid: std::process::id(),
-        hints: &[so.clone()],
-        hooks: &hooks,
-        limits: ScanLimits::default(),
-    })
+    let mut budget = CaptureWorkBudget::default();
+    let outcome = scan_pid(
+        &ScanRequest {
+            pid: std::process::id(),
+            hints: &[so.clone()],
+            hooks: &hooks,
+        },
+        &mut budget,
+    )
     .unwrap();
     let (pinned, _) = p11scope::discovery::identity::pin_scanned_objects(
         std::process::id(),
         outcome.modules(),
-        ScanLimits::default(),
+        &mut budget,
     )
     .unwrap();
     let text = p11scope::inspect::render_text(std::process::id(), &outcome, &pinned);

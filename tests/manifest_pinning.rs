@@ -1,3 +1,4 @@
+use p11scope::discovery::scan::CaptureWorkBudget;
 use p11scope::manifest_input::{MAX_MANIFEST_BYTES, read_manifest};
 use p11scope_manifest::identity::{IdentityKind, ObjectIdentity};
 use p11scope_manifest::manifest::*;
@@ -129,8 +130,6 @@ fn matching_identity_is_accepted() {
 /// by the recorded path for a manifest one).
 #[test]
 fn scan_and_manifest_pins_merge_into_one_set() {
-    use p11scope::discovery::scan::ScanLimits;
-
     let d = tmpdir("manifest_pinning_absorb");
     let so = cc_so(&d, "absorbed", "int f(void){return 1;}\n");
     let manifest_pins =
@@ -140,7 +139,7 @@ fn scan_and_manifest_pins_merge_into_one_set() {
     let (mut pinned, _) = p11scope::discovery::identity::pin_scanned_objects(
         std::process::id(),
         &modules,
-        ScanLimits::default(),
+        &mut CaptureWorkBudget::default(),
     )
     .unwrap();
     pinned.absorb(manifest_pins);
@@ -584,16 +583,18 @@ fn a_pid_pin_detects_process_exit() {
 /// process with it as the hint, so the modules are the scan's real view of us.
 fn scan_self() -> (PathBuf, Vec<p11scope::discovery::scan::ScannedModule>) {
     use p11scope::discovery::hooks::HookRegistry;
-    use p11scope::discovery::scan::{ScanLimits, ScanOutcome, ScanRequest, scan_pid};
+    use p11scope::discovery::scan::{ScanOutcome, ScanRequest, scan_pid};
 
     let hooks = HookRegistry::builtin();
     let exe = std::env::current_exe().unwrap();
-    let outcome = scan_pid(&ScanRequest {
-        pid: std::process::id(),
-        hints: &[exe.clone()],
-        hooks: &hooks,
-        limits: ScanLimits::default(),
-    })
+    let outcome = scan_pid(
+        &ScanRequest {
+            pid: std::process::id(),
+            hints: &[exe.clone()],
+            hooks: &hooks,
+        },
+        &mut CaptureWorkBudget::default(),
+    )
     .unwrap();
     let ScanOutcome::Scanned { modules, .. } = outcome else {
         panic!("/proc/self/mem is always readable")
@@ -603,13 +604,11 @@ fn scan_self() -> (PathBuf, Vec<p11scope::discovery::scan::ScannedModule>) {
 
 #[test]
 fn scanned_objects_are_pinned_hashed_and_attachable() {
-    use p11scope::discovery::scan::ScanLimits;
-
     let (exe, modules) = scan_self();
     let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
         std::process::id(),
         &modules,
-        ScanLimits::default(),
+        &mut CaptureWorkBudget::default(),
     )
     .unwrap();
     assert!(
@@ -637,7 +636,7 @@ fn scanned_objects_are_pinned_hashed_and_attachable() {
 
 #[test]
 fn a_retargeted_path_is_skipped_as_an_identity_mismatch() {
-    use p11scope::discovery::scan::{ScanLimits, ScannedModule};
+    use p11scope::discovery::scan::ScannedModule;
     use p11scope_manifest::maps::{Device, ObjectKey};
 
     // The path the scan named still resolves — to a different inode than the mapping
@@ -656,7 +655,7 @@ fn a_retargeted_path_is_skipped_as_an_identity_mismatch() {
     let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
         std::process::id(),
         &[module],
-        ScanLimits::default(),
+        &mut CaptureWorkBudget::default(),
     )
     .unwrap();
     assert_eq!(pinned.pinned().count(), 0, "a mismatch must not be pinned");
@@ -688,7 +687,7 @@ fn a_retargeted_path_is_skipped_as_an_identity_mismatch() {
     let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
         std::process::id(),
         &[module],
-        ScanLimits::default(),
+        &mut CaptureWorkBudget::default(),
     )
     .unwrap();
     match pinned.pinned().next() {
@@ -726,7 +725,7 @@ fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
         let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
             std::process::id(),
             &modules,
-            limits,
+            &mut CaptureWorkBudget::new(limits),
         )
         .unwrap();
         assert_eq!(
@@ -743,4 +742,52 @@ fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
             "the reason must name the object's size and the cap it broke: {reason}"
         );
     }
+}
+
+#[test]
+fn a_failed_hash_attempt_still_consumes_the_capture_budget() {
+    use p11scope::discovery::scan::{ScanLimits, ScannedModule};
+
+    let dir = tmpdir("failed-hash-budget");
+    let valid = cc_so(&dir, "valid-budget", "int exported(void) { return 0; }");
+    let invalid = dir.join("invalid-budget.so");
+    let mut bytes = std::fs::read(&valid).unwrap();
+    bytes[..4].copy_from_slice(b"NOPE");
+    std::fs::write(&invalid, bytes).unwrap();
+    let len = std::fs::metadata(&valid).unwrap().len();
+    assert_eq!(len, std::fs::metadata(&invalid).unwrap().len());
+    let module = |path: &Path| ScannedModule {
+        key: manifest_key(path),
+        path: path.display().to_string(),
+        exports: vec![],
+        tables: vec![],
+        interfaces: vec![],
+    };
+    let limits = ScanLimits {
+        per_object_bytes: len,
+        total_bytes: len,
+    };
+    let mut budget = CaptureWorkBudget::new(limits);
+    let (_, failed) = p11scope::discovery::identity::pin_scanned_objects(
+        std::process::id(),
+        &[module(&invalid)],
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(failed.len(), 1, "the invalid ELF must fail after its read");
+    let (retry, skipped) = p11scope::discovery::identity::pin_scanned_objects(
+        std::process::id(),
+        &[module(&valid)],
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(
+        retry.pinned().count(),
+        0,
+        "a retry cannot regain spent bytes"
+    );
+    assert!(
+        skipped.iter().any(|skip| skip.reason.contains("too_large")),
+        "the shared budget exhaustion must be explicit: {skipped:?}"
+    );
 }

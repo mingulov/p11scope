@@ -7,7 +7,7 @@
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::{PinnedObjects, pin_scanned_objects};
 use crate::discovery::scan::{
-    ScanLimits, ScanOutcome, ScanRequest, ScannedModule, Skipped, scan_pid,
+    CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, Skipped, scan_pid,
 };
 use crate::process::PidPin;
 use anyhow::Result;
@@ -261,12 +261,8 @@ pub fn run(pid: u32, hints: &[PathBuf], hooks: &HookRegistry, json: bool) -> Res
     // names nothing at all (no pidfd, no /proc/<pid>/stat).
     PidPin::open(pid).map_err(anyhow::Error::msg)?;
 
-    let outcome = match scan_pid(&ScanRequest {
-        pid,
-        hints,
-        hooks,
-        limits: ScanLimits::default(),
-    }) {
+    let mut budget = CaptureWorkBudget::default();
+    let outcome = match scan_pid(&ScanRequest { pid, hints, hooks }, &mut budget) {
         Ok(outcome) => outcome,
         Err(error) => {
             println!("p11scope: cannot inspect pid {pid}: {error}");
@@ -274,8 +270,8 @@ pub fn run(pid: u32, hints: &[PathBuf], hooks: &HookRegistry, json: bool) -> Res
         }
     };
 
-    let (pinned, pin_skips) = pin_scanned_objects(pid, outcome.modules(), ScanLimits::default())
-        .map_err(anyhow::Error::msg)?;
+    let (pinned, pin_skips) =
+        pin_scanned_objects(pid, outcome.modules(), &mut budget).map_err(anyhow::Error::msg)?;
     let outcome = with_extra_skips(outcome, pin_skips);
 
     if json {

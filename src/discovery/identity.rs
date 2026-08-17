@@ -15,7 +15,7 @@ use p11scope_manifest::identity::{
 use p11scope_manifest::manifest::{Manifest, Resolution};
 use p11scope_manifest::maps::{Device, ObjectKey};
 
-use crate::discovery::scan::{ScanLimits, ScannedModule, Skipped};
+use crate::discovery::scan::{CaptureWorkBudget, ScannedModule, Skipped};
 use crate::manifest_input::{MAX_TOTAL_OBJECT_BYTES, validate_structure};
 use crate::process::PidPin;
 
@@ -444,7 +444,7 @@ pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> 
 pub fn pin_scanned_objects(
     pid: u32,
     modules: &[ScannedModule],
-    limits: ScanLimits,
+    budget: &mut CaptureWorkBudget,
 ) -> Result<(PinnedObjects, Vec<Skipped>), String> {
     let pin = PidPin::open(pid)?;
     // Both the table-owning modules and every object a table entry points into: an
@@ -460,13 +460,12 @@ pub fn pin_scanned_objects(
     let exited = || format!("pid {pid} exited during discovery");
     let mut by_key = BTreeMap::new();
     let mut skipped = Vec::new();
-    let mut total_bytes = 0u64;
     for (key, path) in wanted {
         // Opening through /proc/<pid>/root is a per-pid action (spec §4.5).
         if !pin.still_the_same() {
             return Err(exited());
         }
-        match pin_scanned_object(pid, key, path, limits, &mut total_bytes) {
+        match pin_scanned_object(pid, key, path, budget) {
             Ok(entry) => {
                 by_key.insert(key, entry);
             }
@@ -647,8 +646,7 @@ fn pin_scanned_object(
     pid: u32,
     key: ObjectKey,
     path: &str,
-    limits: ScanLimits,
-    total_bytes: &mut u64,
+    budget: &mut CaptureWorkBudget,
 ) -> Result<Entry, String> {
     // The target's own filesystem view: a container's object is never copied out.
     let file = open_object(Path::new(&format!("/proc/{pid}/root{path}")))?;
@@ -664,19 +662,16 @@ fn pin_scanned_object(
     let before = pin_of(&file)?;
     // Checked before the hash, which reads the object whole. Over budget is a skip,
     // never a partial digest.
-    match total_bytes.checked_add(before.size) {
-        Some(running)
-            if before.size <= limits.per_object_bytes && running <= limits.total_bytes =>
-        {
-            *total_bytes = running
-        }
-        _ => {
-            return Err(format!(
-                "too_large ({} bytes; caps are {} per object and {} per capture, \
-                 {total_bytes} already pinned)",
-                before.size, limits.per_object_bytes, limits.total_bytes
-            ));
-        }
+    if !budget.charge_io(before.size) {
+        let limits = budget.limits();
+        return Err(format!(
+            "too_large ({} bytes; caps are {} per object and {} per capture, {} \
+             already attempted)",
+            before.size,
+            limits.per_object_bytes,
+            limits.total_bytes,
+            budget.attempted_io_bytes()
+        ));
     }
     let inspected = inspect_file(&file)?;
     // The pin was taken before the bytes were hashed; a write that lands during the

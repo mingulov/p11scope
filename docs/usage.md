@@ -332,7 +332,7 @@ Every `observed-profile.json` carries an `evidence` section
 (`docs/schema/observed-profile-v2.md`) ending in a `completeness` verdict:
 `"COMPLETE"` or `"PARTIAL"`.
 
-Manifests are trusted operator input, not proposed plans requiring
+A `--manifest` is trusted operator input, not a proposed plan requiring
 re-discovery. Every object is structurally validated, opened once, and
 identity-matched (whole-file SHA-256, and GNU build-id when present) against
 the file the manifest names, then pinned by file descriptor; offsets must
@@ -342,11 +342,16 @@ capture, where a change sets `evidence.provider_changed` and forces the
 report `PARTIAL` instead of tearing the capture down. Inputs are capped at a
 16 MiB manifest, 256 MiB per object, and 512 MiB across all objects.
 
-**`COMPLETE`** requires every manifest surface to be fully acquired and
-walked, every planned probe attached, and zero discovery, START/RV/ring,
-cgroup, process-identity, semantic-state, fork, cancellation, async,
-template, or parameter-decode gaps. The schema document lists every field
-and the four explicitly informational exceptions.
+**`COMPLETE`** requires that discovery found a module and planned a slot in
+it, that the memory scan could read every target, that no module was refused
+at the attach ceiling, that no module's targets went uncorroborated,
+conflicted or ambiguous, that every discovery surface was fully acquired and
+walked, that every planned probe attached, and that there are zero START/RV/
+ring, cgroup, process-identity, semantic-state, fork, cancellation, async,
+template, or parameter-decode gaps. A capture that observed nothing has no
+failure to report, so "found something" is part of the verdict rather than
+something a reader has to check separately. The schema document lists every
+field and the four explicitly informational exceptions.
 
 **In a written profile you will not see `COMPLETE`.** Detaching a perf link
 stops new probe invocations but does not wait for BPF callbacks already

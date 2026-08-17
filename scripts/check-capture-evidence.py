@@ -132,7 +132,8 @@ def exact_common(evidence, *, aliases, skipped, in_flight):
     require(evidence["authority"] == "hash-pinned", f"unexpected authority: {evidence['authority']}")
     require(evidence["discovery"], "evidence.discovery is empty: nothing was discovered")
     for module in evidence["discovery"]:
-        require(len(module["sha256"]) == 64, f"module without a whole-file digest: {module}")
+        digest = module["sha256"]
+        require(digest and len(digest) == 64, f"module without a whole-file digest: {module}")
         require(module["sources"], f"module with no discovery source: {module}")
     require(evidence["modules_skipped"] == [], f"modules refused: {evidence['modules_skipped']}")
     require(evidence["scan_unavailable"] is None, evidence["scan_unavailable"])
@@ -360,7 +361,7 @@ def discovery_fixture():
             objects=[dict(MODULE_FIXTURE, identity_source="mountinfo", note=None)],
             sources=["scan"],
             corroborated=False,
-            corroboration="single_source",
+            corroboration=["single_source"],
             tables=[{"version": [2, 40], "entries": 68, "source": "scan"}],
             interfaces=0,
             skipped=[],
@@ -588,9 +589,10 @@ def self_test():
         bad = copy.deepcopy(clean["evidence"])
         bad[field] = value
         rejected(lambda bad=bad: terminal_capture_is_clean(bad))
-    bad = copy.deepcopy(clean["evidence"])
-    bad["discovery"][0]["sha256"] = ""
-    rejected(lambda bad=bad: terminal_capture_is_clean(bad))
+    for digest in ("", None):
+        bad = copy.deepcopy(clean["evidence"])
+        bad["discovery"][0]["sha256"] = digest
+        rejected(lambda bad=bad: terminal_capture_is_clean(bad))
     print("discovery evidence is required and gap-free: OK")
 
     exact_capture_modules(clean)

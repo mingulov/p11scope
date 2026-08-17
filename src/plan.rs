@@ -67,6 +67,8 @@ pub struct ModuleSummary {
     pub key: ObjectKey,
     pub path: String,
     pub tables: Vec<TableSummary>,
+    /// The most interfaces any one source saw, never the sum across sources —
+    /// two sources describing one provider both count its interfaces.
     pub interfaces: usize,
     /// "scan" | "manifest".
     pub source: &'static str,
@@ -311,7 +313,12 @@ fn merge(
             summary.source = "scan+manifest";
         }
         summary.tables.extend(module.tables);
-        summary.interfaces += module.interfaces;
+        // Never summed across sources: the scan and a manifest describing one
+        // provider both count *its* interfaces, so adding them reports two where
+        // there is one — on exactly the corroborated path this slice is built
+        // around. Each source sees a subset (the scan only records an interface
+        // whose table it decoded), so the most any one saw is the honest number.
+        summary.interfaces = summary.interfaces.max(module.interfaces);
         summary.skipped.extend(module.skipped.iter().cloned());
         surfaces.extend(module.surfaces);
         skipped.extend(module.skipped);
@@ -852,9 +859,19 @@ mod tests {
     /// target COUNT_ONLY and force PARTIAL, turning `--manifest` into a trapdoor.
     #[test]
     fn a_manifest_and_a_scan_of_the_same_object_are_one_module() {
-        use crate::discovery::scan::{ScannedEntry, ScannedTable};
+        use crate::discovery::scan::{ScannedEntry, ScannedInterface, ScannedTable};
 
-        let m = manifest_with(vec![resolved("C_Sign", 0x10), resolved("C_Login", 0x50)]);
+        let mut m = manifest_with(vec![resolved("C_Sign", 0x10), resolved("C_Login", 0x50)]);
+        // Both sources describe the same one standard interface of the same
+        // provider — the shape that made the old sum report two.
+        m.surfaces[0].source = SurfaceSource::Interface {
+            index: 0,
+            raw_name_hex: Some("504b4353203131".into()),
+            name_lossy: Some("PKCS 11".into()),
+            name_error: None,
+            flags: 1,
+            classification: InterfaceClassification::ExactStandard,
+        };
         let entry = |name: &'static str, file_offset| ScannedEntry {
             name,
             object: TEST_OBJECT,
@@ -873,7 +890,13 @@ mod tests {
                 unpinned: vec![],
                 address: 0x7000,
             }],
-            interfaces: vec![],
+            interfaces: vec![ScannedInterface {
+                index: 0,
+                name_class: "exact_standard",
+                name_lossy: Some("PKCS 11".into()),
+                flags: 1,
+                table: Some(0),
+            }],
         };
 
         let p = build_from_sources(std::slice::from_ref(&scanned), std::slice::from_ref(&m));
@@ -887,8 +910,14 @@ mod tests {
             assert_eq!(slot.module_ids, vec![ModuleId(0)], "{slot:?}");
             assert!(!slot.semantic_ambiguous, "{slot:?}");
         }
-        // Both sources' tables stay visible as evidence.
+        // Both sources' tables stay visible as evidence — they declare their own
+        // source, so two entries for one table is honest. `interfaces` is a flat
+        // count with nowhere to say that, so it must never double.
         assert_eq!(p.modules[0].tables.len(), 2);
+        assert_eq!(
+            p.modules[0].interfaces, 1,
+            "one provider, one interface, described twice"
+        );
     }
 
     #[test]

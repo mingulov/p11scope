@@ -59,11 +59,14 @@ impl Default for DiscoveryEvidence {
 pub struct ObjectSummary {
     pub dev: (u64, u64),
     pub ino: u64,
-    pub sha256: String,
+    /// `None` when nothing pinned this object, so no digest was ever taken —
+    /// an absence, never an empty digest.
+    pub sha256: Option<String>,
     pub path: String,
     pub build_id: Option<String>,
     /// `"mountinfo"` when the whole `{dev, ino}` was comparable against the
-    /// mapping, `"stat"` when only the inode was.
+    /// mapping, `"stat"` when only the inode was, `"unpinned"` when this
+    /// capture never pinned the object and compared nothing.
     pub identity_source: &'static str,
     /// Why `identity_source` is `"stat"` rather than `"mountinfo"`.
     pub note: Option<String>,
@@ -75,28 +78,33 @@ pub struct ObjectSummary {
 pub struct DiscoveredModule {
     pub dev: (u64, u64),
     pub ino: u64,
-    pub sha256: String,
+    /// `None` when nothing pinned the module object itself.
+    pub sha256: Option<String>,
     pub path: String,
     pub build_id: Option<String>,
-    /// Every object this module's table entries resolve into — a forwarded
-    /// entry lands in a dependency, not in the module that published it.
+    /// Every object this module's **planned slots** attach into — a forwarded
+    /// entry lands in a dependency, not in the module that published it. An
+    /// entry that never became a slot is in `skipped`, not here.
     pub objects: Vec<ObjectSummary>,
     /// `"scan"`, `"manifest"`, or both.
     pub sources: Vec<&'static str>,
     /// A second source described the same targets (spec §4.12).
     pub corroborated: bool,
-    /// Which §4.12 outcome produced `corroborated`, so an agreement and a
-    /// conflict are never indistinguishable in the record:
+    /// Which §4.12 outcome each source pairing produced, so an agreement and a
+    /// conflict are never indistinguishable in the record. One entry per
+    /// `--manifest` that named this object, so two manifests naming one object
+    /// show both outcomes rather than the first hiding the second:
     /// `single_source` (nothing to corroborate against), `agreed`, `conflict`
     /// (both sources decoded targets and they differ), `scan_empty` (the scan
     /// pinned this object but decoded no table in it — the documented use of
     /// `--manifest`), `uncorroborated` (not mapped in scope, or no scan),
     /// `identity_mismatch` (a manifest naming this object was ignored: the
     /// mapped bytes are not the ones it records).
-    pub corroboration: &'static str,
+    pub corroboration: Vec<&'static str>,
     pub tables: Vec<TableSummary>,
-    /// How many interfaces were seen. Never their names: those are bytes read
-    /// out of the target and stay in `inspect` (spec §4.3, allowlist v1).
+    /// How many interfaces were seen — the most any one source saw, never the
+    /// sum across sources. Never their names: those are bytes read out of the
+    /// target and stay in `inspect` (spec §4.3, allowlist v1).
     pub interfaces: usize,
     /// This module's own unattachable entries, and why.
     pub skipped: Vec<SkippedOut>,
@@ -213,11 +221,15 @@ impl Evidence {
     /// was truncated, no mechanism's parameter decode failed on every
     /// single observed call, and no pinned provider object changed.
     ///
-    /// Discovery gates it too, and two of those conditions are the ones a
-    /// gap-counting verdict gets wrong on its own: a capture that discovered
-    /// no module, and one that discovered a module but planned no slot in it,
-    /// both have nothing to fail — no attach was attempted, no entry was
+    /// Discovery gates it too, and three of those conditions are the ones a
+    /// gap-counting verdict gets wrong on its own: a capture that discovered no
+    /// module, one that discovered a module but planned no slot in it (every
+    /// ptrace-refused capture: `ScanOutcome::Unavailable` still names the
+    /// objects, with no tables), and one whose scan could not read a target at
+    /// all. Each has nothing to fail — no attach was attempted, no entry was
     /// skipped — and would otherwise report COMPLETE having observed nothing.
+    /// `scan_unavailable` is only transitively covered by `slots` for `--pid`;
+    /// a cgroup with one readable and one unreadable process needs its own.
     pub fn verdict(&mut self) {
         let surfaces_complete = self
             .surfaces
@@ -226,6 +238,7 @@ impl Evidence {
         let interface_list_complete = !self.interface_list.starts_with("error:");
         let discovery_complete = !self.discovery.modules.is_empty()
             && self.slots > 0
+            && self.discovery.scan_unavailable.is_none()
             && self.discovery.conflicts == 0
             && self.discovery.uncorroborated == 0
             && self.discovery.module_ambiguous == 0
@@ -529,7 +542,7 @@ pub fn live(
 struct ModuleRef {
     dev: (u64, u64),
     ino: u64,
-    sha256: String,
+    sha256: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -594,6 +607,8 @@ fn functions_out(reports: &[SlotReport], modules: &[DiscoveredModule]) -> Vec<Fu
                     ino: m.ino,
                     sha256: m.sha256.clone(),
                 }),
+            // Kept next to `module` on purpose: a reader that only checks for a
+            // null module must not have to know why it is null.
             module_ambiguous: r.module_ambiguous,
             calls: r.calls,
             errors: r.errors,
@@ -888,7 +903,7 @@ pub struct CaptureMeta<'a> {
     pub policy: CapturePolicy,
 }
 
-/// The v1 `observed-profile.json` document. `functions` comes from the
+/// The v2 `observed-profile.json` document. `functions` comes from the
 /// aggregate maps (count authority); `mechanisms`/`sessions`/`logins`/
 /// `cgroups` come from the semantic state machine, the only place that
 /// reconstructs mechanism/session/login/cgroup context from the event
@@ -1093,13 +1108,13 @@ mod tests {
         DiscoveredModule {
             dev: (8, 1),
             ino: 11,
-            sha256: sha.clone(),
+            sha256: Some(sha.clone()),
             path: "/opt/p11.so".into(),
             build_id: Some("aabb".into()),
             objects: vec![ObjectSummary {
                 dev: (8, 1),
                 ino: 11,
-                sha256: sha,
+                sha256: Some(sha),
                 path: "/opt/p11.so".into(),
                 build_id: Some("aabb".into()),
                 identity_source: "mountinfo",
@@ -1107,7 +1122,7 @@ mod tests {
             }],
             sources: vec!["scan"],
             corroborated: false,
-            corroboration: "single_source",
+            corroboration: vec!["single_source"],
             tables: vec![crate::plan::TableSummary {
                 version: (2, 40),
                 entries: 68,
@@ -1182,6 +1197,9 @@ mod tests {
                     reason: "capacity".into(),
                 })
             },
+            // Only `--pid` gets this transitively from `slots == 0`: a cgroup
+            // with one readable and one unreadable process still plans slots.
+            |e: &mut Evidence| e.discovery.scan_unavailable = Some("ptrace".into()),
         ] {
             let mut ev = evidence();
             mutate(&mut ev);

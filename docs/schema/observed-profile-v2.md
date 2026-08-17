@@ -93,7 +93,7 @@ Discovery and attachment:
 | `attached_probes` | Successful probe attachments; two per fully attached slot. |
 | `attach_failures` | Per-slot attachment errors. |
 | `aliased` | Name groups that share one address and therefore one count. |
-| `skipped` | Unattachable discovered entries and reasons: a NULL table slot, an entry whose object could not be pinned, an unresolvable manifest record. |
+| `skipped` | Everything discovery could not use, and why. Entries: a NULL table slot, an entry whose object could not be pinned, an unresolvable manifest record. Whole objects: a mapping with no usable pathname (a memfd, or a file deleted under a running process), exports that could not be read, an object over the byte caps, a snapshot that ended early on a read error. An object-level skip is the only record of a provider that was never decoded at all — its module contributes no table, so nothing else in the document would show it. Deduplicated: one loss is one entry however many processes of a `--cgroup` hit it. |
 | `surfaces` | Source, acquisition status, walk outcome, and function count for every surface. |
 | `vendor_interfaces` | Present but undecoded interfaces. |
 | `interface_list` | `C_GetInterfaceList` acquisition outcome. |
@@ -102,10 +102,10 @@ Discovery and attachment:
 | `authority` | How every probed object was authorized. `"hash-pinned"` is the only value this version emits: pinned by fd, hashed once with SHA-256, and re-checked by `fstat` `(ino, size, ctime)` during the capture. |
 | `discovery[]` | One entry per discovered module — see below. |
 | `discovery_conflicts` | Manifests whose recorded targets differ from the ones the scan decoded in the same object; the union is attached (spec §4.12). Forces `PARTIAL`. |
-| `discovery_uncorroborated` | Modules whose offsets nothing corroborated: not mapped in scope, no scan, or a scan that decoded no table there. Forces `PARTIAL`. |
+| `discovery_uncorroborated` | Modules whose offsets nothing corroborated: not mapped in scope, no scan, or a scan that decoded no table there — plus every `--manifest` ignored as stale (§4.12 case 4), which has no module of its own in `discovery[]` and would otherwise raise no counter at all. Forces `PARTIAL`. |
 | `module_ambiguous` | Attach slots two modules both publish: counted, never attributed. Forces `PARTIAL`. |
 | `modules_skipped[]` | Modules refused whole at the `MAX_SLOTS` attach ceiling, `{name, reason}` — a module is never attached in part. Forces `PARTIAL`; fatal only when the refusal leaves nothing to attach at all. |
-| `scan_unavailable` | `null`, or why the memory scan could not run (e.g. `"ptrace"`). Objects are still identified from `maps` + `.dynsym`, but no table is decoded, so any `--manifest` offsets stand alone. |
+| `scan_unavailable` | `null`, or why the memory scan could not run (e.g. `"ptrace"`). Objects are still identified from `maps` + `.dynsym`, but no table is decoded, so any `--manifest` offsets stand alone. Forces `PARTIAL` in its own right: under `--cgroup` one unreadable process among readable ones still plans slots, so nothing else would notice. |
 | `scan_ms` | Wall time the memory scan took, summed over the scanned processes. |
 
 `table_entries` counts every record discovery decoded, including the ones no
@@ -120,13 +120,13 @@ per source.
 
 | Field | Meaning |
 | --- | --- |
-| `dev`, `ino`, `sha256`, `path`, `build_id` | Identity of the module — same fields, and the same path caveat, as `capture.modules[]`. |
-| `objects[]` | Every object this module's attached entries live in; a table entry may resolve into a dependency rather than into the module that published it. Each carries the same identity fields plus `identity_source` (`"mountinfo"` when the whole `{dev, ino}` was comparable against the mapping, `"stat"` when only the inode was, `"unpinned"` when no pin backs it) and `note`, the reason for a downgrade. |
+| `dev`, `ino`, `sha256`, `path`, `build_id` | Identity of the module — same fields, and the same path caveat, as `capture.modules[]`. `sha256` is `null` when nothing pinned the object, never `""`: no digest was taken. |
+| `objects[]` | Every object this module's **planned slots** attach into; a table entry may resolve into a dependency rather than into the module that published it, and an entry that never became a slot is in `skipped` instead. Each carries the same identity fields plus `identity_source` (`"mountinfo"` when the whole `{dev, ino}` was comparable against the mapping, `"stat"` when only the inode was, `"unpinned"` when this capture pinned nothing and compared nothing) and `note`, the reason for a downgrade. |
 | `sources[]` | `["scan"]`, `["manifest"]`, or both. |
 | `corroborated` | Whether a second source described the same targets. |
-| `corroboration` | Which §4.12 outcome produced it: `single_source` (only one source described this module), `agreed`, `conflict` (both decoded targets and they differ), `scan_empty` (the scan pinned this object but decoded no table in it — the documented use of `--manifest`, counted as uncorroborated rather than as a disagreement), `uncorroborated` (not mapped in scope, or no scan), `identity_mismatch` (a `--manifest` naming this object was ignored: the mapped bytes are not the ones it records). |
+| `corroboration[]` | Which §4.12 outcome each source pairing produced — one entry per `--manifest` that named this object, since `--manifest` is repeatable and one outcome must not hide another. Values: `single_source` (no manifest named it), `agreed`, `conflict` (both decoded targets and they differ), `scan_empty` (the scan pinned this object but decoded no table in it — the documented use of `--manifest`, counted as uncorroborated rather than as a disagreement), `uncorroborated` (not mapped in scope, or no scan), `identity_mismatch` (a `--manifest` naming this object was ignored: the mapped bytes are not the ones it records). |
 | `tables[]` | `{version: [major, minor], entries, source}` per function table published, one entry per source that saw it. |
-| `interfaces` | How many interfaces were seen. **Never their names**: those are bytes read out of a provider's memory, and `p11scope inspect` is where they are shown. |
+| `interfaces` | How many interfaces were seen — **the most any one source saw, never the sum across sources**: the scan and a manifest describing one provider each count its interfaces, and each sees a subset (the scan records only an interface whose table it decoded), so this is a lower bound. **Never their names**: those are bytes read out of a provider's memory, and `p11scope inspect` is where they are shown. |
 | `skipped[]` | This module's own unattachable records, `{name, reason}` — the same records as the top-level `skipped`, attributed to the module that published them. |
 
 `identity_mismatch` is decided per *manifest*, not per object: the observer
@@ -181,7 +181,9 @@ planned probe attached, and zero ambiguity/loss fields. It additionally requires
 that discovery found something and planned something: **an empty `discovery[]`,
 or `slots: 0`, is always `PARTIAL`**. A capture that observed nothing has no
 attach failure and no skip to report, so gap counters alone would call it
-complete — the most misleading verdict this tool could publish. The only nonzero
+complete — the most misleading verdict this tool could publish. `slots: 0` is
+not a rare case: a scan refused `/proc/<pid>/mem` still names every mapped
+object, with no tables, so any ptrace-refused capture lands there. The only nonzero
 fields permitted in a complete document are the explicitly informational
 `process_tracking_fallbacks`, `orphan_ops`, `unmatched_closes`, and
 `shape_decode_failures`. An alternate or null interface name can be walked as
@@ -308,6 +310,8 @@ Added:
   `evidence.module_ambiguous`, `evidence.modules_skipped[]`,
   `evidence.scan_unavailable`, `evidence.scan_ms`.
 - Each of those, and an empty `discovery[]` or `slots: 0`, forces `PARTIAL`.
+- `evidence.skipped` additionally carries object-level losses (a provider
+  discovery could not read at all), which v1.4 only printed to stderr.
 
 Deferred to Slice 1b-2 (same v2, nothing is published yet): `attach_gap_ms`,
 `pause`, `child_still_running` and the live-discovery loss counters

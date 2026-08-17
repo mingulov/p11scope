@@ -192,6 +192,11 @@ struct DiscoveryCounters {
     scan_ms: u64,
     /// Manifest objects ignored, and why — evidence, never silence.
     notes: Vec<String>,
+    /// Objects discovery saw but could not use at all: a mapping with no usable
+    /// pathname, exports it could not read, one over the byte caps, a snapshot
+    /// that ended early. Whole modules, not entries — the module they belong to
+    /// publishes no table, so nothing else in the plan records the loss.
+    object_skips: Vec<Skipped>,
     /// Which §4.12 outcome each corroborated module got, so `discovery[]` can
     /// tell an agreement from a conflict instead of publishing a counter with
     /// nothing to explain it.
@@ -478,19 +483,17 @@ fn scan_and_pin(
     })
     .map_err(|error| anyhow!("scanning pid {pid}: {error}"))?;
     counters.scan_unavailable = counters.scan_unavailable.or(outcome.unavailable_reason());
-    for skipped in outcome.skipped() {
-        eprintln!(
-            "p11scope: discovery skipped {} — {}",
-            skipped.subject, skipped.reason
-        );
-    }
     let (pinned, pin_skips) = pin_scanned_objects(pid, outcome.modules(), limits)
         .map_err(|error| anyhow!("pinning the objects of pid {pid}: {error}"))?;
-    for skipped in &pin_skips {
+    // Printed *and* kept: an object discovery could not read is a provider that
+    // may never have been observed, and a report that only prints it leaves the
+    // document claiming a clean capture.
+    for skipped in outcome.skipped().iter().chain(&pin_skips) {
         eprintln!(
             "p11scope: discovery skipped {} — {}",
             skipped.subject, skipped.reason
         );
+        counters.object_skips.push(skipped.clone());
     }
     let modules = match outcome {
         ScanOutcome::Scanned {
@@ -678,8 +681,10 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
     counters.report_notes();
 
     // Each dropped record stayed on the table it came from, so the plan counts
-    // it as seen and files its skip under its own module: nothing to add here.
+    // it as seen and files its skip under its own module. The scan's object-level
+    // losses have no module to be filed under and are added here.
     let mut plan = plan::build_from_sources(&modules, &accepted);
+    record_object_skips(&mut plan, &counters.object_skips);
     for key in &corroborated {
         if let Some(summary) = plan.modules.iter_mut().find(|m| m.key == *key) {
             summary.corroborated = true;
@@ -688,11 +693,7 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
             }
         }
     }
-    counters.uncorroborated = plan
-        .modules
-        .iter()
-        .filter(|m| m.source.contains("manifest") && !m.corroborated)
-        .count() as u64;
+    counters.uncorroborated = uncorroborated_count(&plan, identity_mismatches);
     // Ignoring a manifest is only fatal when it was the sole discovery source and
     // nothing else found a table (spec §4.12).
     if identity_mismatches > 0 && plan.slots.is_empty() {
@@ -719,6 +720,32 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
         pinned,
         discovery,
     })
+}
+
+/// Modules whose offsets nothing corroborated, plus every `--manifest` ignored
+/// as stale (§4.12 case 4). An ignored manifest never becomes a plan module, so
+/// the filter cannot see it — and a stale manifest supplied for exactly the
+/// provider the scan cannot read leaves that provider unobserved with nothing
+/// else in the document to notice. Counted here, it forces `PARTIAL`.
+fn uncorroborated_count(plan: &plan::AttachPlan, identity_mismatches: usize) -> u64 {
+    let uncorroborated = plan
+        .modules
+        .iter()
+        .filter(|m| m.source.contains("manifest") && !m.corroborated)
+        .count();
+    (uncorroborated + identity_mismatches) as u64
+}
+
+/// Folds the scan's own object-level losses into the plan's skip list, where
+/// `Evidence::verdict` already turns any skip into `PARTIAL`. Deduplicated:
+/// a `--cgroup` scans every process in the tree, and one provider ten of them
+/// map is one loss, not ten lines of the same one.
+fn record_object_skips(plan: &mut plan::AttachPlan, skips: &[Skipped]) {
+    for skip in skips {
+        if !plan.skipped.contains(skip) {
+            plan.skipped.push(skip.clone());
+        }
+    }
 }
 
 /// The merge refuses an over-capacity module whole rather than attaching a
@@ -755,7 +782,9 @@ fn discovery_evidence(
         render::ObjectSummary {
             dev: (key.device.major, key.device.minor),
             ino: key.inode,
-            sha256: pin.map(|p| p.sha256.to_string()).unwrap_or_default(),
+            // Absent, not empty: nothing hashed it, so there is no digest to
+            // report — an empty string would read as one.
+            sha256: pin.map(|p| p.sha256.to_string()),
             path: pin.map_or_else(|| path.to_string(), |p| p.path.to_string()),
             build_id: pin.and_then(|p| p.build_id.map(str::to_string)),
             identity_source: pin.map_or("unpinned", |p| p.identity_source),
@@ -783,22 +812,11 @@ fn discovery_evidence(
                 objects,
                 sources: m.source.split('+').collect(),
                 corroborated: m.corroborated,
-                corroboration: counters
-                    .corroboration
-                    .iter()
-                    .find(|(key, _)| *key == m.key)
-                    .map_or_else(
-                        || {
-                            if !m.source.contains("manifest") {
-                                "single_source"
-                            } else if m.corroborated {
-                                "agreed"
-                            } else {
-                                "uncorroborated"
-                            }
-                        },
-                        |(_, label)| label,
-                    ),
+                // Every outcome recorded against this object, not the first:
+                // `--manifest` is repeatable, and two manifests naming one
+                // object would otherwise render one outcome beside a
+                // `corroborated` the other produced.
+                corroboration: corroboration_of(counters, m),
                 tables: m.tables.clone(),
                 interfaces: m.interfaces,
                 skipped: m.skipped.iter().map(skipped_out).collect(),
@@ -815,6 +833,28 @@ fn discovery_evidence(
         scan_ms: counters.scan_ms,
         ..render::DiscoveryEvidence::default()
     }
+}
+
+/// Every §4.12 outcome recorded against this module's object — one per
+/// `--manifest` that named it. Empty only when no manifest did, which the
+/// record states as `single_source` rather than as silence.
+fn corroboration_of(counters: &DiscoveryCounters, m: &plan::ModuleSummary) -> Vec<&'static str> {
+    let recorded: Vec<&'static str> = counters
+        .corroboration
+        .iter()
+        .filter(|(key, _)| *key == m.key)
+        .map(|(_, label)| *label)
+        .collect();
+    if !recorded.is_empty() {
+        return recorded;
+    }
+    vec![if !m.source.contains("manifest") {
+        "single_source"
+    } else if m.corroborated {
+        "agreed"
+    } else {
+        "uncorroborated"
+    }]
 }
 
 fn skipped_out(s: &Skipped) -> render::SkippedOut {
@@ -1749,6 +1789,57 @@ mod tests {
         assert_eq!(plan.skipped.len(), 1, "{:?}", plan.skipped);
         assert_eq!(plan.skipped[0].subject, "C_Verify");
         assert_eq!(plan.modules[0].skipped, plan.skipped);
+        // The reason the drop is recorded on the table rather than added to the
+        // total afterwards: per-surface counts and the total stay one number.
+        assert_eq!(
+            plan.surfaces.iter().map(|s| s.functions).sum::<usize>(),
+            plan.entries_seen,
+            "every record counted in table_entries belongs to a surface"
+        );
+    }
+
+    /// An object the scan could not read at all is the loss `discovery[]` cannot
+    /// show: the module it belonged to contributes no table, so it produces no
+    /// entry to skip, no attach to fail and no counter to raise. Printed and
+    /// dropped, it leaves a document whose every field says the capture was
+    /// clean while a provider went unobserved.
+    #[test]
+    fn an_object_the_scan_could_not_read_is_published_not_only_printed() {
+        let (modules, _) = pinned_self();
+        // The same objects, pinned under a cap they cannot fit: every one is
+        // skipped, exactly as a memfd, a deleted file or an unreadable mapping
+        // would be — without needing one.
+        let tiny = ScanLimits {
+            per_object_bytes: 1024,
+            total_bytes: 1024,
+        };
+        let (pinned, skips) = pin_scanned_objects(std::process::id(), &modules, tiny).unwrap();
+        assert_eq!(pinned.pinned().count(), 0, "nothing could be pinned");
+        assert!(!skips.is_empty(), "the scan reported the loss");
+
+        let mut modules = modules;
+        drop_unpinned_entries(&mut modules, &pinned);
+        let mut plan = plan::build_from_modules(&modules);
+        assert!(
+            plan.skipped.is_empty(),
+            "the module published no table, so nothing else records the loss: {:?}",
+            plan.skipped
+        );
+
+        record_object_skips(&mut plan, &skips);
+        assert_eq!(plan.skipped.len(), skips.len(), "{:?}", plan.skipped);
+        assert!(
+            plan.skipped.iter().any(|s| s.reason.contains("too_large")),
+            "{:?}",
+            plan.skipped
+        );
+
+        // A cgroup scans many processes mapping the same provider; one loss is
+        // one line, however many processes hit it.
+        let doubled: Vec<Skipped> = skips.iter().chain(skips.iter()).cloned().collect();
+        let mut plan = plan::build_from_modules(&modules);
+        record_object_skips(&mut plan, &doubled);
+        assert_eq!(plan.skipped.len(), skips.len(), "{:?}", plan.skipped);
     }
 
     fn plan_with(slots: usize, refused: usize) -> plan::AttachPlan {
@@ -1831,6 +1922,24 @@ mod tests {
         );
     }
 
+    /// A manifest ignored as stale is the one §4.12 outcome with no module of
+    /// its own in the plan — and the one most likely to be covering a provider
+    /// the scan cannot read, which is then observed by nobody.
+    #[test]
+    fn an_ignored_stale_manifest_is_counted_as_uncorroborated() {
+        let mut plan = plan_with(1, 0);
+        assert_eq!(uncorroborated_count(&plan, 0), 0, "a scanned module is not");
+        assert_eq!(
+            uncorroborated_count(&plan, 1),
+            1,
+            "an ignored manifest must reach a counter, or it reaches none"
+        );
+        plan.modules[0].source = "manifest";
+        assert_eq!(uncorroborated_count(&plan, 1), 2, "both are counted");
+        plan.modules[0].corroborated = true;
+        assert_eq!(uncorroborated_count(&plan, 0), 0);
+    }
+
     /// Both §4.12 outcomes that attach a union mark the module corroborated, so
     /// without the outcome itself an agreement and a conflict are the same
     /// record — and `discovery_conflicts` would have nothing explaining it.
@@ -1849,7 +1958,7 @@ mod tests {
                 ..DiscoveryCounters::default()
             };
             let evidence = discovery_evidence(&plan, &PinnedObjects::empty(), &counters);
-            assert_eq!(evidence.modules[0].corroboration, label);
+            assert_eq!(evidence.modules[0].corroboration, vec![label]);
         }
         // Nothing recorded: one source described it, and the record says so
         // rather than implying a second source failed to.
@@ -1858,7 +1967,7 @@ mod tests {
             &PinnedObjects::empty(),
             &DiscoveryCounters::default(),
         );
-        assert_eq!(evidence.modules[0].corroboration, "single_source");
+        assert_eq!(evidence.modules[0].corroboration, vec!["single_source"]);
         assert_eq!(evidence.modules[0].sources, vec!["scan"]);
     }
 

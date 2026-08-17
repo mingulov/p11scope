@@ -2,19 +2,25 @@
 pub mod common;
 
 use std::collections::BTreeMap;
+use std::error::Error;
+use std::ffi::CStr;
 use std::fmt;
 use std::fs::File;
-use std::io;
+use std::io::{self, Read as _, Write as _};
+use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::fs::{
     DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
 };
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest as _, Sha256};
+
+unsafe impl aya::Pod for common::StateKey {}
+unsafe impl aya::Pod for common::StartState {}
 
 pub fn decode_discovery_record(bytes: &[u8]) -> Result<common::DiscoveryRecord, &'static str> {
     if bytes.len() != std::mem::size_of::<common::DiscoveryRecord>() {
@@ -340,6 +346,12 @@ impl ChildGuard {
         }
         self.resume_attempted = true;
         pidfd_send_signal(self.original_pidfd.as_raw_fd(), libc::SIGCONT)
+    }
+
+    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+        let status = self.child.wait()?;
+        self.reaped = true;
+        Ok(status)
     }
 }
 
@@ -902,7 +914,869 @@ pub fn validate_evidence_export(path: &Path, gate: EvidenceGate) -> Result<(), S
     Ok(())
 }
 
-fn main() {}
+#[derive(Clone)]
+struct GateMetadata {
+    source_commit: String,
+    source_manifest_sha256: String,
+    execution_manifest_sha256: String,
+    build_evidence_sha256: String,
+    bpf_sha256: String,
+    runner_sha256: String,
+    fixture_sha256: String,
+    kernel_release: String,
+    arch: String,
+    glibc_version: String,
+    lane: String,
+    run_id: String,
+}
+
+impl GateMetadata {
+    fn record(
+        &self,
+        pass: bool,
+        failure_category: &str,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut value = serde_json::Map::new();
+        value.insert("schema_version".into(), 1.into());
+        value.insert("source_commit".into(), self.source_commit.clone().into());
+        value.insert(
+            "source_manifest_sha256".into(),
+            self.source_manifest_sha256.clone().into(),
+        );
+        value.insert(
+            "execution_manifest_sha256".into(),
+            self.execution_manifest_sha256.clone().into(),
+        );
+        value.insert(
+            "build_evidence_sha256".into(),
+            self.build_evidence_sha256.clone().into(),
+        );
+        value.insert("bpf_sha256".into(), self.bpf_sha256.clone().into());
+        value.insert("runner_sha256".into(), self.runner_sha256.clone().into());
+        value.insert("fixture_sha256".into(), self.fixture_sha256.clone().into());
+        value.insert("kernel_release".into(), self.kernel_release.clone().into());
+        value.insert("arch".into(), self.arch.clone().into());
+        value.insert("glibc_version".into(), self.glibc_version.clone().into());
+        value.insert("lane".into(), self.lane.clone().into());
+        value.insert("run_id".into(), self.run_id.clone().into());
+        value.insert("gate".into(), "A".into());
+        value.insert("pass".into(), pass.into());
+        value.insert("failure_category".into(), failure_category.into());
+        value
+    }
+}
+
+struct GateAPaths {
+    source_manifest: PathBuf,
+    build_evidence: PathBuf,
+    execution_manifest: PathBuf,
+    bpf: PathBuf,
+    fixture: PathBuf,
+    out: PathBuf,
+}
+
+fn parse_gate_a_args(args: &[String]) -> Result<GateAPaths, &'static str> {
+    if args.len() != 12 {
+        return Err("gate-a arguments");
+    }
+    let mut values = BTreeMap::new();
+    for pair in args.chunks_exact(2) {
+        if !matches!(
+            pair[0].as_str(),
+            "--source-manifest"
+                | "--build-evidence"
+                | "--execution-manifest"
+                | "--bpf"
+                | "--fixture"
+                | "--out"
+        ) || values.insert(pair[0].as_str(), pair[1].as_str()).is_some()
+        {
+            return Err("gate-a arguments");
+        }
+    }
+    let path = |name| {
+        values
+            .get(name)
+            .map(PathBuf::from)
+            .ok_or("gate-a arguments")
+    };
+    Ok(GateAPaths {
+        source_manifest: path("--source-manifest")?,
+        build_evidence: path("--build-evidence")?,
+        execution_manifest: path("--execution-manifest")?,
+        bpf: path("--bpf")?,
+        fixture: path("--fixture")?,
+        out: path("--out")?,
+    })
+}
+
+fn read_regular(path: &Path, ceiling: u64) -> Result<Vec<u8>, &'static str> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| "input metadata")?;
+    if !metadata.is_file() || metadata.len() > ceiling {
+        return Err("input is not a bounded regular file");
+    }
+    std::fs::read(path).map_err(|_| "input read")
+}
+
+fn json_string<'a>(value: &'a serde_json::Value, name: &str) -> Result<&'a str, &'static str> {
+    value
+        .as_object()
+        .and_then(|object| object.get(name))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("manifest field")
+}
+
+fn kernel_release() -> Result<String, &'static str> {
+    // SAFETY: uname initializes the provided structure on success.
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut uts) } != 0 {
+        return Err("uname");
+    }
+    // SAFETY: uname fields are NUL-terminated C strings.
+    Ok(unsafe { CStr::from_ptr(uts.release.as_ptr()) }
+        .to_str()
+        .map_err(|_| "kernel release")?
+        .to_owned())
+}
+
+fn glibc_version() -> Result<String, &'static str> {
+    // SAFETY: glibc returns a process-lifetime NUL-terminated version string.
+    let version = unsafe { CStr::from_ptr(libc::gnu_get_libc_version()) };
+    Ok(format!(
+        "glibc {}",
+        version.to_str().map_err(|_| "glibc version")?
+    ))
+}
+
+fn kernel_matches(actual: &str, prefix: &str) -> bool {
+    actual == prefix
+        || actual
+            .strip_prefix(prefix)
+            .is_some_and(|tail| tail.starts_with('.') || tail.starts_with('-'))
+}
+
+#[allow(clippy::type_complexity)]
+fn validate_gate_provenance(
+    paths: &GateAPaths,
+) -> Result<(GateMetadata, Vec<u8>, File, BTreeMap<String, u64>), &'static str> {
+    if unsafe { libc::geteuid() } != 0 || std::env::consts::ARCH != "x86_64" {
+        return Err("guest identity");
+    }
+    let source_bytes = read_regular(&paths.source_manifest, 4 * 1024 * 1024)?;
+    let build_bytes = read_regular(&paths.build_evidence, 16 * 1024 * 1024)?;
+    let execution_bytes = read_regular(&paths.execution_manifest, 1024 * 1024)?;
+    let bpf_bytes = read_regular(&paths.bpf, 16 * 1024 * 1024)?;
+    let runner_bytes = read_regular(
+        &std::env::current_exe().map_err(|_| "runner path")?,
+        64 * 1024 * 1024,
+    )?;
+    let mut fixture = File::open(&paths.fixture).map_err(|_| "fixture open")?;
+    let mut fixture_bytes = Vec::new();
+    fixture
+        .read_to_end(&mut fixture_bytes)
+        .map_err(|_| "fixture read")?;
+    if fixture_bytes.len() > 64 * 1024 * 1024 {
+        return Err("fixture size");
+    }
+    let source: serde_json::Value =
+        serde_json::from_slice(&source_bytes).map_err(|_| "source manifest")?;
+    let execution: serde_json::Value =
+        serde_json::from_slice(&execution_bytes).map_err(|_| "execution manifest")?;
+    let source_sha256 = sha256_hex(&source_bytes);
+    let build_sha256 = sha256_hex(&build_bytes);
+    let execution_sha256 = sha256_hex(&execution_bytes);
+    let bpf_sha256 = sha256_hex(&bpf_bytes);
+    let runner_sha256 = sha256_hex(&runner_bytes);
+    let fixture_sha256 = sha256_hex(&fixture_bytes);
+    for (name, actual) in [
+        ("source_manifest_sha256", source_sha256.as_str()),
+        ("build_evidence_sha256", build_sha256.as_str()),
+        ("bpf_sha256", bpf_sha256.as_str()),
+        ("runner_sha256", runner_sha256.as_str()),
+        ("fixture_sha256", fixture_sha256.as_str()),
+    ] {
+        if json_string(&execution, name)? != actual {
+            return Err("execution manifest digest mismatch");
+        }
+    }
+    if json_string(&source, "bpf_sha256")? != bpf_sha256 {
+        return Err("source manifest BPF mismatch");
+    }
+    let source_commit = json_string(&source, "source_commit")?;
+    if !valid_hex(source_commit, 40) || json_string(&execution, "source_commit")? != source_commit {
+        return Err("source commit mismatch");
+    }
+    let kernel = kernel_release()?;
+    let glibc = glibc_version()?;
+    let lane = if kernel_matches(&kernel, "5.15") && glibc == "glibc 2.35" {
+        "5.15"
+    } else if kernel_matches(&kernel, "6.8") && glibc == "glibc 2.39" {
+        "6.8"
+    } else {
+        return Err("guest kernel or glibc identity");
+    };
+    let mut offsets = BTreeMap::new();
+    for symbol in [
+        "spike_get_function_list",
+        "spike_get_interface_list",
+        "spike_pointer_target",
+    ] {
+        let offset = p11scope_manifest::elf::symbol_file_offset(&fixture, symbol)
+            .map_err(|_| "fixture ELF")?
+            .ok_or("fixture symbol")?;
+        offsets.insert(symbol.to_owned(), offset);
+    }
+    Ok((
+        GateMetadata {
+            source_commit: source_commit.to_owned(),
+            source_manifest_sha256: source_sha256,
+            execution_manifest_sha256: execution_sha256,
+            build_evidence_sha256: build_sha256,
+            bpf_sha256,
+            runner_sha256,
+            fixture_sha256,
+            kernel_release: kernel,
+            arch: "x86_64".into(),
+            glibc_version: glibc,
+            lane: lane.into(),
+            run_id: format!("interim-{lane}-a"),
+        },
+        bpf_bytes,
+        fixture,
+        offsets,
+    ))
+}
+
+fn write_json_line(file: &mut File, value: serde_json::Value) -> Result<(), &'static str> {
+    serde_json::to_writer(&mut *file, &value).map_err(|_| "JSON write")?;
+    file.write_all(b"\n").map_err(|_| "JSON write")
+}
+
+fn map_fact_from_info(name: &str, info: &aya::maps::MapInfo) -> Result<MapFact, &'static str> {
+    let map_type = match info.map_type().map_err(|_| "map info")? {
+        aya::maps::MapType::RingBuf => "ringbuf",
+        aya::maps::MapType::Hash => "hash",
+        aya::maps::MapType::Array => "array",
+        _ => return Err("map type"),
+    };
+    let logical_value_bytes = if map_type == "ringbuf" {
+        u64::from(info.max_entries())
+    } else {
+        u64::from(info.value_size()) * u64::from(info.max_entries())
+    };
+    Ok(MapFact {
+        map: name.into(),
+        map_type: map_type.into(),
+        key_size: info.key_size(),
+        value_size: info.value_size(),
+        max_entries: info.max_entries(),
+        logical_value_bytes,
+    })
+}
+
+fn map_info(map: &aya::maps::Map) -> Result<aya::maps::MapInfo, &'static str> {
+    match map {
+        aya::maps::Map::Array(map)
+        | aya::maps::Map::HashMap(map)
+        | aya::maps::Map::RingBuf(map) => map.info().map_err(|_| "map info"),
+        _ => Err("map type"),
+    }
+}
+
+fn verifier_error_chain(error: &(dyn Error + 'static)) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        text.push_str("\ncaused_by=");
+        text.push_str(&error.to_string());
+        source = error.source();
+    }
+    text
+}
+
+fn runtime_symbol_address_from_maps(
+    maps: &str,
+    expected_device: &str,
+    expected_inode: u64,
+    symbol_offset: u64,
+) -> Result<u64, &'static str> {
+    let parse_device = |value: &str| {
+        let (major, minor) = value.split_once(':')?;
+        Some((
+            u64::from_str_radix(major, 16).ok()?,
+            u64::from_str_radix(minor, 16).ok()?,
+        ))
+    };
+    let expected_device = parse_device(expected_device).ok_or("fixture device")?;
+    for line in maps.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 5
+            || !fields[1].contains('x')
+            || parse_device(fields[3]) != Some(expected_device)
+            || fields[4].parse::<u64>().ok() != Some(expected_inode)
+        {
+            continue;
+        }
+        let Some((start, end)) = fields[0].split_once('-') else {
+            continue;
+        };
+        let Ok(start) = u64::from_str_radix(start, 16) else {
+            continue;
+        };
+        let Ok(end) = u64::from_str_radix(end, 16) else {
+            continue;
+        };
+        let Ok(file_offset) = u64::from_str_radix(fields[2], 16) else {
+            continue;
+        };
+        if symbol_offset >= file_offset && symbol_offset - file_offset < end - start {
+            return Ok(start + symbol_offset - file_offset);
+        }
+    }
+    Err("fixture executable mapping")
+}
+
+fn runtime_symbol_address(
+    pid: u32,
+    symbol_offset: u64,
+    fixture: &File,
+) -> Result<u64, &'static str> {
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).map_err(|_| "process maps")?;
+    let metadata = fixture.metadata().map_err(|_| "fixture metadata")?;
+    let device = format!(
+        "{:x}:{:x}",
+        libc::major(metadata.dev()),
+        libc::minor(metadata.dev())
+    );
+    runtime_symbol_address_from_maps(&maps, &device, metadata.ino(), symbol_offset)
+}
+
+fn read_counters(
+    counters: &aya::maps::Array<aya::maps::MapData, u64>,
+) -> Result<[u64; 5], &'static str> {
+    let mut values = [0u64; 5];
+    for (index, value) in values.iter_mut().enumerate() {
+        *value = counters
+            .get(&(index as u32), 0)
+            .map_err(|_| "counter read")?;
+    }
+    Ok(values)
+}
+
+fn raw_records(
+    ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
+) -> Result<Vec<common::DiscoveryRecord>, &'static str> {
+    let mut records = Vec::new();
+    while let Some(item) = ring.next() {
+        records.push(decode_discovery_record(&item)?);
+    }
+    Ok(records)
+}
+
+fn record_facts(record: &common::DiscoveryRecord, expected_pointer: u64) -> RecordFacts {
+    let pointers = &record.pointers[..usize::from(record.usable_n)];
+    RecordFacts {
+        usable_n: record.usable_n,
+        pointers_attempted: record.pointers_attempted,
+        completed_prefix: record.completed_prefix,
+        name_class: match record.name_class {
+            1 => NameClass::ExactStandard,
+            2 => NameClass::Other,
+            3 => NameClass::Null,
+            4 => NameClass::Unreadable,
+            _ => NameClass::NotApplicable,
+        },
+        all_usable_pointers_nonzero: pointers.iter().all(|pointer| *pointer != 0),
+        all_usable_pointers_equal_fixture: pointers
+            .iter()
+            .all(|pointer| *pointer == expected_pointer),
+    }
+}
+
+fn attach_program(
+    ebpf: &mut aya::Ebpf,
+    program_name: &str,
+    offset: u64,
+    fixture: &Path,
+    child_pid: u32,
+    cookie: u64,
+) -> Result<aya::programs::uprobe::UProbeLinkId, &'static str> {
+    use aya::programs::UProbe;
+    use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeScope};
+    let program: &mut UProbe = ebpf
+        .program_mut(program_name)
+        .ok_or("program missing")?
+        .try_into()
+        .map_err(|_| "program type")?;
+    let scope = UProbeScope::OneProcess(NonZeroU32::new(child_pid).ok_or("child pid is zero")?);
+    let point = UProbeAttachPoint {
+        location: UProbeAttachLocation::AbsoluteOffset(offset),
+        cookie: Some(cookie),
+    };
+    program
+        .attach(point, fixture, scope)
+        .map_err(|_| "program attach")
+}
+
+fn detach_program(
+    ebpf: &mut aya::Ebpf,
+    program_name: &str,
+    link: aya::programs::uprobe::UProbeLinkId,
+) -> Result<(), &'static str> {
+    let program: &mut aya::programs::UProbe = ebpf
+        .program_mut(program_name)
+        .ok_or("program missing")?
+        .try_into()
+        .map_err(|_| "program type")?;
+    program.detach(link).map_err(|_| "program detach")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_gate_a_case(
+    ebpf: &mut aya::Ebpf,
+    ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
+    counters: &aya::maps::Array<aya::maps::MapData, u64>,
+    start: &aya::maps::HashMap<aya::maps::MapData, common::StateKey, common::StartState>,
+    fixture: &Path,
+    offsets: &BTreeMap<String, u64>,
+    fixture_file: &File,
+    case: GateACaseId,
+    case_number: u8,
+) -> Result<GateACaseFacts, &'static str> {
+    let (case_name, entry_name, return_name, target_name, expected_kind) = match case {
+        GateACaseId::Full104 => (
+            "FULL_104",
+            "function_list_entry",
+            "function_list_return",
+            "spike_get_function_list",
+            1,
+        ),
+        GateACaseId::GuardAfter7 => (
+            "GUARD_AFTER_7",
+            "function_list_entry",
+            "function_list_return",
+            "spike_get_function_list",
+            1,
+        ),
+        GateACaseId::UnreadableTable => (
+            "UNREADABLE_TABLE",
+            "function_list_entry",
+            "function_list_return",
+            "spike_get_function_list",
+            1,
+        ),
+        GateACaseId::UnreadablePp => (
+            "UNREADABLE_PP",
+            "function_list_entry",
+            "function_list_return",
+            "spike_get_function_list",
+            1,
+        ),
+        GateACaseId::Interfaces17 => (
+            "INTERFACE",
+            "interface_list_entry",
+            "interface_list_return",
+            "spike_get_interface_list",
+            2,
+        ),
+    };
+    if !raw_records(ring)?.is_empty() {
+        return Err("record surplus before case");
+    }
+    let before = read_counters(counters)?;
+    let mut command = Command::new(fixture);
+    command
+        .arg("--gate-a")
+        .arg(case_name)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = spawn_pinned_child(&mut command).map_err(|_| "gated child")?;
+    let expected_pointer = runtime_symbol_address(
+        child.pid(),
+        *offsets
+            .get("spike_pointer_target")
+            .ok_or("fixture offset")?,
+        fixture_file,
+    )?;
+    let target_offset = *offsets.get(target_name).ok_or("fixture offset")?;
+    let entry_link = attach_program(
+        ebpf,
+        entry_name,
+        target_offset,
+        fixture,
+        child.pid(),
+        u64::from(case_number),
+    )?;
+    let return_link = match attach_program(
+        ebpf,
+        return_name,
+        target_offset,
+        fixture,
+        child.pid(),
+        u64::from(case_number),
+    ) {
+        Ok(link) => link,
+        Err(error) => {
+            let _ = detach_program(ebpf, entry_name, entry_link);
+            return Err(error);
+        }
+    };
+    child.release().map_err(|_| "child release")?;
+    let child_status = child.wait().map_err(|_| "child wait")?;
+    let return_detached = detach_program(ebpf, return_name, return_link).is_ok();
+    let entry_detached = detach_program(ebpf, entry_name, entry_link).is_ok();
+    if !child_status.success() {
+        return Err("fixture child status");
+    }
+    let records = raw_records(ring)?;
+    if records.iter().enumerate().any(|(index, record)| {
+        record.case_id != case_number
+            || record.kind != expected_kind
+            || (case == GateACaseId::Interfaces17 && usize::from(record.interface_index) != index)
+    }) {
+        return Err("record identity");
+    }
+    let after = read_counters(counters)?;
+    let start_empty = start.keys().next().is_none();
+    Ok(GateACaseFacts {
+        case,
+        entry_attach_attempts: 1,
+        entry_attach_accepted: true,
+        return_attach_attempts: 1,
+        return_attach_accepted: true,
+        entry_link_detached: entry_detached,
+        return_link_detached: return_detached,
+        records: records
+            .iter()
+            .map(|record| record_facts(record, expected_pointer))
+            .collect(),
+        counters_before: before,
+        counters_after: after,
+        start_empty,
+    })
+}
+
+fn gate_a_case_json(
+    metadata: &GateMetadata,
+    facts: &GateACaseFacts,
+    pass: bool,
+) -> serde_json::Value {
+    let mut value = metadata.record(pass, if pass { "none" } else { "oracle" });
+    value.insert("record_type".into(), "case".into());
+    value.insert(
+        "case".into(),
+        match facts.case {
+            GateACaseId::Full104 => "FULL_104",
+            GateACaseId::GuardAfter7 => "GUARD_AFTER_7",
+            GateACaseId::UnreadableTable => "UNREADABLE_TABLE",
+            GateACaseId::UnreadablePp => "UNREADABLE_PP",
+            GateACaseId::Interfaces17 => "INTERFACE",
+        }
+        .into(),
+    );
+    value.insert(
+        "entry_attach_attempts".into(),
+        facts.entry_attach_attempts.into(),
+    );
+    value.insert(
+        "entry_attach_accepted".into(),
+        facts.entry_attach_accepted.into(),
+    );
+    value.insert(
+        "return_attach_attempts".into(),
+        facts.return_attach_attempts.into(),
+    );
+    value.insert(
+        "return_attach_accepted".into(),
+        facts.return_attach_accepted.into(),
+    );
+    value.insert(
+        "entry_link_detached".into(),
+        facts.entry_link_detached.into(),
+    );
+    value.insert(
+        "return_link_detached".into(),
+        facts.return_link_detached.into(),
+    );
+    value.insert("start_empty".into(), facts.start_empty.into());
+    value.insert("record_count".into(), facts.records.len().into());
+    value.insert(
+        "counters_before".into(),
+        serde_json::json!(facts.counters_before),
+    );
+    value.insert(
+        "counters_after".into(),
+        serde_json::json!(facts.counters_after),
+    );
+    value.insert(
+        "counter_deltas".into(),
+        serde_json::json!(
+            facts
+                .counters_after
+                .iter()
+                .zip(facts.counters_before)
+                .map(|(after, before)| after.saturating_sub(before))
+                .collect::<Vec<_>>()
+        ),
+    );
+    value.insert(
+        "records".into(),
+        serde_json::Value::Array(
+            facts
+                .records
+                .iter()
+                .map(discovery_json_projection)
+                .collect(),
+        ),
+    );
+    serde_json::Value::Object(value)
+}
+
+fn run_gate_a(paths: GateAPaths) -> Result<bool, &'static str> {
+    // SAFETY: setting a process-local restrictive umask has no memory-safety preconditions.
+    unsafe { libc::umask(0o077) };
+    create_private_dir(&paths.out).map_err(|_| "output directory")?;
+    let mut environment =
+        create_private_file(&paths.out.join("environment.txt")).map_err(|_| "environment file")?;
+    let mut manifest_digests = create_private_file(&paths.out.join("manifest-digests.txt"))
+        .map_err(|_| "manifest digest file")?;
+    let mut verifier_log =
+        create_private_file(&paths.out.join("verifier.log")).map_err(|_| "verifier log")?;
+    let mut verifier_results = create_private_file(&paths.out.join("verifier-results.jsonl"))
+        .map_err(|_| "verifier results")?;
+    let mut cases_file =
+        create_private_file(&paths.out.join("gate-a-cases.jsonl")).map_err(|_| "case results")?;
+    let mut runner_status =
+        create_private_file(&paths.out.join("runner-status.txt")).map_err(|_| "runner status")?;
+
+    let (metadata, bpf_bytes, fixture_file, offsets) = validate_gate_provenance(&paths)?;
+    writeln!(
+        environment,
+        "kernel_release={}\narch={}\nglibc_version={}\nlane={}",
+        metadata.kernel_release, metadata.arch, metadata.glibc_version, metadata.lane
+    )
+    .map_err(|_| "environment write")?;
+    writeln!(
+        manifest_digests,
+        "source_manifest_sha256={}\nexecution_manifest_sha256={}\nbuild_evidence_sha256={}\nbpf_sha256={}\nrunner_sha256={}\nfixture_sha256={}",
+        metadata.source_manifest_sha256,
+        metadata.execution_manifest_sha256,
+        metadata.build_evidence_sha256,
+        metadata.bpf_sha256,
+        metadata.runner_sha256,
+        metadata.fixture_sha256
+    )
+    .map_err(|_| "manifest digest write")?;
+
+    let mut loader = aya::EbpfLoader::new();
+    loader.verifier_log_level(aya::VerifierLogLevel::VERBOSE | aya::VerifierLogLevel::STATS);
+    let mut ebpf = match loader.load(&bpf_bytes) {
+        Ok(ebpf) => ebpf,
+        Err(error) => {
+            writeln!(
+                verifier_log,
+                "object=interim outcome=rejected\n{}",
+                verifier_error_chain(&error)
+            )
+            .map_err(|_| "verifier write")?;
+            writeln!(runner_status, "status=FAIL\nfailure_category=object_load")
+                .map_err(|_| "runner status write")?;
+            return Ok(false);
+        }
+    };
+
+    let programs = [
+        "function_list_entry",
+        "function_list_return",
+        "interface_list_entry",
+        "interface_list_return",
+    ];
+    let mut all_loaded = true;
+    for program_name in programs {
+        let result = (|| -> Result<(), Box<dyn Error>> {
+            let program: &mut aya::programs::UProbe = ebpf
+                .program_mut(program_name)
+                .ok_or("program missing")?
+                .try_into()?;
+            program.load()?;
+            Ok(())
+        })();
+        let accepted = result.is_ok();
+        all_loaded &= accepted;
+        let mut value = metadata.record(accepted, if accepted { "none" } else { "verifier" });
+        value.insert("program".into(), program_name.into());
+        value.insert("load_attempted".into(), true.into());
+        value.insert("accepted".into(), accepted.into());
+        value.insert(
+            "success_log_contract".into(),
+            if accepted {
+                "accepted_line_only"
+            } else {
+                "rejection_error_chain"
+            }
+            .into(),
+        );
+        write_json_line(&mut verifier_results, serde_json::Value::Object(value))?;
+        if let Err(error) = result {
+            writeln!(
+                verifier_log,
+                "program={program_name} outcome=rejected error_chain={}",
+                verifier_error_chain(error.as_ref())
+            )
+            .map_err(|_| "verifier write")?;
+        } else {
+            writeln!(
+                verifier_log,
+                "program={program_name} outcome=accepted success_verifier_text=unavailable_aya_0_14"
+            )
+            .map_err(|_| "verifier write")?;
+        }
+    }
+
+    let mut map_facts = Vec::new();
+    for name in ["EVENTS", "DISCOVERY", "START", "COUNTERS"] {
+        let info = map_info(ebpf.map(name).ok_or("map missing")?)?;
+        let fact = map_fact_from_info(name, &info)?;
+        let mut value = metadata.record(false, "pending");
+        value.insert("record_type".into(), "map".into());
+        value.insert("map".into(), fact.map.clone().into());
+        value.insert("map_type".into(), fact.map_type.clone().into());
+        value.insert("key_size".into(), fact.key_size.into());
+        value.insert("value_size".into(), fact.value_size.into());
+        value.insert("max_entries".into(), fact.max_entries.into());
+        value.insert(
+            "logical_value_bytes".into(),
+            fact.logical_value_bytes.into(),
+        );
+        write_json_line(&mut cases_file, serde_json::Value::Object(value))?;
+        map_facts.push(fact);
+    }
+    if !all_loaded {
+        writeln!(runner_status, "status=FAIL\nfailure_category=verifier")
+            .map_err(|_| "runner status write")?;
+        return Ok(false);
+    }
+
+    let mut ring = aya::maps::RingBuf::try_from(ebpf.take_map("DISCOVERY").ok_or("discovery map")?)
+        .map_err(|_| "discovery ring")?;
+    let counters =
+        aya::maps::Array::<_, u64>::try_from(ebpf.take_map("COUNTERS").ok_or("counter map")?)
+            .map_err(|_| "counter map")?;
+    let start = aya::maps::HashMap::<_, common::StateKey, common::StartState>::try_from(
+        ebpf.take_map("START").ok_or("start map")?,
+    )
+    .map_err(|_| "start map")?;
+    let mut case_facts = Vec::new();
+    for (number, case) in [
+        GateACaseId::Full104,
+        GateACaseId::GuardAfter7,
+        GateACaseId::UnreadableTable,
+        GateACaseId::UnreadablePp,
+        GateACaseId::Interfaces17,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let facts = match run_gate_a_case(
+            &mut ebpf,
+            &mut ring,
+            &counters,
+            &start,
+            &paths.fixture,
+            &offsets,
+            &fixture_file,
+            case,
+            number as u8 + 1,
+        ) {
+            Ok(facts) => facts,
+            Err(error) => {
+                writeln!(verifier_log, "runtime_failure={error}")
+                    .map_err(|_| "runtime failure write")?;
+                writeln!(runner_status, "status=FAIL\nfailure_category=runtime")
+                    .map_err(|_| "runner status write")?;
+                return Ok(false);
+            }
+        };
+        let pass = gate_a_case_pass(&facts);
+        write_json_line(&mut cases_file, gate_a_case_json(&metadata, &facts, pass))?;
+        case_facts.push(facts);
+    }
+    let pass = map_facts
+        == [
+            MapFact {
+                map: "EVENTS".into(),
+                map_type: "ringbuf".into(),
+                key_size: 0,
+                value_size: 0,
+                max_entries: 262_144,
+                logical_value_bytes: 262_144,
+            },
+            MapFact {
+                map: "DISCOVERY".into(),
+                map_type: "ringbuf".into(),
+                key_size: 0,
+                value_size: 0,
+                max_entries: 65_536,
+                logical_value_bytes: 65_536,
+            },
+            MapFact {
+                map: "START".into(),
+                map_type: "hash".into(),
+                key_size: 16,
+                value_size: 16,
+                max_entries: 64,
+                logical_value_bytes: 1_024,
+            },
+            MapFact {
+                map: "COUNTERS".into(),
+                map_type: "array".into(),
+                key_size: 4,
+                value_size: 8,
+                max_entries: 5,
+                logical_value_bytes: 40,
+            },
+        ]
+        && case_facts.iter().all(gate_a_case_pass)
+        && read_counters(&counters)? == [0, 5, 0, 1, 0]
+        && start.keys().next().is_none();
+    writeln!(
+        runner_status,
+        "status={}\nfailure_category={}",
+        if pass { "PASS" } else { "FAIL" },
+        if pass { "none" } else { "oracle" }
+    )
+    .map_err(|_| "runner status write")?;
+    Ok(pass)
+}
+
+fn self_check() -> Result<(), &'static str> {
+    let kernel = kernel_release()?;
+    let glibc = glibc_version()?;
+    if std::env::consts::ARCH != "x86_64"
+        || !((kernel_matches(&kernel, "5.15") && glibc == "glibc 2.35")
+            || (kernel_matches(&kernel, "6.8") && glibc == "glibc 2.39"))
+    {
+        return Err("guest identity");
+    }
+    Ok(())
+}
+
+fn main() {
+    let args = std::env::args().collect::<Vec<_>>();
+    let result = match args.get(1).map(String::as_str) {
+        Some("--self-check") if args.len() == 2 => self_check().map(|()| true),
+        Some("gate-a") => parse_gate_a_args(&args[2..]).and_then(run_gate_a),
+        _ => Err("usage"),
+    };
+    match result {
+        Ok(true) => {}
+        Ok(false) => std::process::exit(1),
+        Err(error) => {
+            eprintln!("slice1b2-runner: {error}");
+            std::process::exit(2);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1655,7 +2529,51 @@ mod tests {
             disabled.stderr,
             b"vm-start unavailable until complete lifecycle is implemented\n"
         );
-        assert!(std::fs::read_dir(existing).unwrap().next().is_none());
+        assert!(std::fs::read_dir(&existing).unwrap().next().is_none());
+
+        let export = temp.path().join("export");
+        std::fs::create_dir(&export).unwrap();
+        let lifecycle = Command::new(script)
+            .arg("gate-a-lane")
+            .arg("jammy")
+            .arg(temp.path())
+            .arg(&existing)
+            .arg(&export)
+            .output()
+            .unwrap();
+        assert_eq!(lifecycle.status.code(), Some(64));
+        assert_eq!(
+            lifecycle.stderr,
+            b"gate-a-lane requires new run and export directories\n"
+        );
+    }
+
+    #[test]
+    fn vm_cleanup_cannot_launder_an_intermediate_postcheck_failure() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("vm-cleanup-failure");
+        let retained = temp.path().join("retained.qcow2");
+        let official = temp.path().join("official.qcow2");
+        std::fs::write(&retained, b"retained").unwrap();
+        std::fs::write(&official, b"official").unwrap();
+        std::fs::set_permissions(&retained, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let status = Command::new("bash")
+            .arg("-c")
+            .arg(concat!(
+                "source \"$1\"; ",
+                "PRIVATE_QEMU_PID=; PRIVATE_RUN_DIR=$2; PRIVATE_RETAINED=$3; ",
+                "PRIVATE_OFFICIAL=$4; private_finish_lane"
+            ))
+            .arg("bash")
+            .arg(script)
+            .arg(temp.path())
+            .arg(&retained)
+            .arg(&official)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success());
     }
 
     fn shell_lines(script: &str, body: &str, args: &[&OsStr]) -> Vec<String> {
@@ -1719,6 +2637,138 @@ mod tests {
     }
 
     #[test]
+    fn source_and_execution_bundles_refuse_reuse() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("bundle-reuse");
+        let build = Command::new(script)
+            .arg("build-bpf")
+            .arg(temp.path())
+            .output()
+            .unwrap();
+        assert_eq!(build.status.code(), Some(64));
+        assert_eq!(build.stderr, b"build-bpf requires a new output directory\n");
+        let freeze = Command::new(script)
+            .arg("freeze-execution")
+            .arg(temp.path())
+            .arg(temp.path())
+            .arg(temp.path())
+            .output()
+            .unwrap();
+        assert_eq!(freeze.status.code(), Some(64));
+        assert_eq!(
+            freeze.stderr,
+            b"freeze-execution requires a new bundle directory\n"
+        );
+    }
+
+    #[test]
+    fn gate_a_fixture_exposes_five_single_release_cases() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("gate-a-fixture");
+        let fixture = temp.path().join("fixture");
+        let build = Command::new(script)
+            .arg("build-fixture")
+            .arg(&fixture)
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "fixture build failed: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        for case in [
+            "FULL_104",
+            "GUARD_AFTER_7",
+            "UNREADABLE_TABLE",
+            "UNREADABLE_PP",
+            "INTERFACE",
+        ] {
+            let mut child = Command::new(&fixture)
+                .arg("--gate-a")
+                .arg(case)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            thread::sleep(Duration::from_millis(25));
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "{case} exited before its release byte"
+            );
+            child.stdin.take().unwrap().write_all(b"X").unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{case} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                output.stdout,
+                format!("fixture-gate-a: OK case={case}\n").as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn ebpf_source_freezes_four_program_verifier_contract() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ebpf/src/main.rs"))
+                .unwrap();
+        for program in [
+            "function_list_entry",
+            "function_list_return",
+            "interface_list_entry",
+            "interface_list_return",
+        ] {
+            assert_eq!(source.matches(&format!("pub fn {program}(")).count(), 1);
+        }
+        for map in ["EVENTS", "DISCOVERY", "START", "COUNTERS"] {
+            assert_eq!(source.matches(&format!("static {map}:")).count(), 1);
+        }
+        assert!(source.contains("RingBuf::with_byte_size(262_144, 0)"));
+        assert!(source.contains("RingBuf::with_byte_size(65_536, 0)"));
+        assert!(source.contains("HashMap::with_max_entries(64, 0)"));
+        assert!(source.contains("Array::with_max_entries(5, 0)"));
+        assert!(source.contains("while pointer_index < 104"));
+        assert!(source.contains("while interface_index < 16"));
+        assert!(source.contains("while word < 112"));
+        assert!(
+            source.contains("START.insert(&key, &state, aya_ebpf::bindings::BPF_NOEXIST as u64)")
+        );
+        assert!(!source.contains("BPF_ANY"));
+        assert_eq!(
+            source
+                .matches("// SAFETY: reserve owns one writable 896-byte entry;")
+                .count(),
+            1
+        );
+        let unsafe_start = source
+            .find("unsafe {\n        let mut word = 0usize;")
+            .unwrap();
+        let unsafe_end = source[unsafe_start..].find("\n    }").unwrap() + unsafe_start;
+        let submit = source.find("entry.submit(0);").unwrap();
+        assert!(
+            submit > unsafe_end,
+            "submit must remain outside raw initialization"
+        );
+    }
+
+    #[test]
+    fn runtime_symbol_address_uses_exact_fixture_mapping() {
+        let maps = concat!(
+            "1000-2000 r-xp 00000000 08:01 41 /private/wrong\n",
+            "4000-5000 r-xp 00001000 08:02 42 /private/fixture\n",
+        );
+        assert_eq!(
+            runtime_symbol_address_from_maps(maps, "08:02", 42, 0x1a20),
+            Ok(0x4a20)
+        );
+        assert!(runtime_symbol_address_from_maps(maps, "08:02", 43, 0x1a20).is_err());
+    }
+
+    #[test]
     fn ssh_argv_exclusively_pins_approved_ed25519_host() {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
         let temp = TestDir::new("ssh");
@@ -1767,6 +2817,19 @@ mod tests {
     }
 
     #[test]
+    fn qemu_preflight_requires_exact_retained_tool_versions() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let status = Command::new("bash")
+            .arg("-c")
+            .arg("source \"$1\"; qemu_preflight")
+            .arg("bash")
+            .arg(script)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
     fn provisioning_rejects_overrides_and_requires_new_private_tool_homes() {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
         let temp = TestDir::new("provision");
@@ -1780,10 +2843,7 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(disabled.status.code(), Some(64));
-        assert_eq!(
-            disabled.stderr,
-            b"provision-jammy unavailable until source and tool provenance are verified\n"
-        );
+        assert_eq!(disabled.stderr, b"provision-jammy arguments\n");
 
         let rejected = Command::new("bash")
             .arg("-c")

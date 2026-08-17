@@ -269,6 +269,25 @@ static int parse_fd(const char *text) {
     return (int)value;
 }
 
+static int run_gate_a_case(const char *name) {
+    read_byte(STDIN_FILENO);
+    if (strcmp(name, "FULL_104") == 0) {
+        run_function_case(840, 0, 0);
+    } else if (strcmp(name, "GUARD_AFTER_7") == 0) {
+        run_function_case(64, 0, 0);
+    } else if (strcmp(name, "UNREADABLE_TABLE") == 0) {
+        run_function_case(840, 1, 0);
+    } else if (strcmp(name, "UNREADABLE_PP") == 0) {
+        run_function_case(840, 0, 1);
+    } else if (strcmp(name, "INTERFACE") == 0) {
+        run_interface_case();
+    } else {
+        return 2;
+    }
+    printf("fixture-gate-a: OK case=%s\n", name);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--self-check") == 0) {
         self_check();
@@ -278,6 +297,13 @@ int main(int argc, char **argv) {
         run_signal_case(STDIN_FILENO, parse_fd(argv[2]), parse_fd(argv[3]));
         return 0;
     }
-    fputs("usage: fixture {--self-check|--signal READY_FD MARKER_FD}\n", stderr);
+    if (argc == 3 && strcmp(argv[1], "--gate-a") == 0) {
+        int result = run_gate_a_case(argv[2]);
+        if (result == 0) {
+            return 0;
+        }
+    }
+    fputs("usage: fixture {--self-check|--gate-a CASE|--signal READY_FD MARKER_FD}\n",
+          stderr);
     return 2;
 }

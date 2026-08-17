@@ -93,7 +93,7 @@ reclaim_root_output "$WORK/observed.json"
 
 echo "=== verify: two providers, kept apart ==="
 python3 - "$WORK/observed.json" <<'PY'
-import importlib.util, json, re, sys
+import importlib.util, json, sys
 
 spec = importlib.util.spec_from_file_location(
     "check_capture_evidence", "scripts/check-capture-evidence.py"
@@ -109,39 +109,10 @@ oracle.exact_capture_modules(doc)
 
 modules = doc["capture"]["modules"]
 if len(modules) == 1:
+    oracle.validate_proxy_capacity_fallback(doc)
     module = modules[0]
-    assert "softhsm" in module["path"].lower(), module["path"]
-    assert "p11-kit" not in module["path"].lower(), module["path"]
-    assert len(ev["discovery"]) == 1, ev["discovery"]
-    assert ev["discovery"][0]["sources"] == ["scan"], ev["discovery"]
-    assert ev["authority"] == "hash-pinned", ev["authority"]
-    assert ev["scan_unavailable"] is None, ev["scan_unavailable"]
-    assert ev["completeness"] == "PARTIAL", ev["completeness"]
-    assert ev["slots"] == 68, ev["slots"]
-    assert ev["attached_probes"] == 136, ev["attached_probes"]
-    assert ev["attach_failures"] == [], ev["attach_failures"]
-    assert ev["module_ambiguous"] == 0, ev["module_ambiguous"]
-    assert len(ev["modules_skipped"]) == 1, ev["modules_skipped"]
     refused = ev["modules_skipped"][0]
-    assert "p11-kit" in refused["name"].lower(), refused
-    match = re.fullmatch(
-        r"module needs ([0-9]+) more of the 512 attach slots; 0 are in use "
-        r"— refusing to attach a prefix",
-        refused["reason"],
-    )
-    assert match and int(match.group(1)) > 512, refused
-    assert len(doc["functions"]) == 68, len(doc["functions"])
-    identity = (module["sha256"], tuple(module["dev"]), module["ino"])
-    called = 0
-    for item in doc["functions"]:
-        assert item["module_ambiguous"] is False, item
-        if not item["calls"]:
-            continue
-        called += item["calls"]
-        owner = item["module"]
-        assert owner is not None, item
-        assert (owner["sha256"], tuple(owner["dev"]), owner["ino"]) == identity, item
-    assert called > 0, "the SoftHSM2 backend handled no calls"
+    called = sum(item["calls"] for item in doc["functions"])
     print("proxy stack capacity fallback: OK")
     print("  module:", module["path"])
     print("  slots:", ev["slots"], "probes:", ev["attached_probes"], "calls:", called)

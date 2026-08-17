@@ -3,6 +3,7 @@
 
 import copy
 import json
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -293,6 +294,87 @@ def exact_capture_modules(document):
             continue
         require(ambiguous is False, f"attributed function marked ambiguous: {item}")
         require(owner in identities, f"function attributed to an undeclared module: {item}")
+
+
+def validate_proxy_capacity_fallback(document):
+    """The exact p11-kit-over-capacity/SoftHSM2-attached live shape."""
+    require(document["schema"] == "pkcs11-scope/observed-profile/v2-metrics", document["schema"])
+    require(document["capture"]["mode"] == "metrics", document["capture"])
+    require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
+    exact_capture_modules(document)
+
+    evidence = document["evidence"]
+    exact_shape(evidence, 68, 68, 136, LEGACY_SURFACES, 0, "absent")
+    exact_counters(evidence)
+    require(evidence["attach_failures"] == [], evidence["attach_failures"])
+    require(evidence["aliased"] == [], evidence["aliased"])
+    require(evidence["in_flight_at_end"] == 0, evidence["in_flight_at_end"])
+    require(evidence["templates_truncated"] is False, "templates were truncated")
+    require(evidence["provider_changed"] is False, "a pinned provider object changed")
+    require(evidence["authority"] == "hash-pinned", evidence["authority"])
+    require(evidence["scan_unavailable"] is None, evidence["scan_unavailable"])
+    require(evidence["completeness"] == "PARTIAL", evidence["completeness"])
+
+    modules = document["capture"]["modules"]
+    require(len(modules) == 1, [module["path"] for module in modules])
+    module = modules[0]
+    require("softhsm" in module["path"].lower(), module["path"])
+    require("p11-kit" not in module["path"].lower(), module["path"])
+    discovery = evidence["discovery"]
+    require(len(discovery) == 1, discovery)
+    require(discovery[0]["sources"] == ["scan"], discovery)
+    require(discovery[0]["corroborated"] is False, discovery)
+    require(discovery[0]["corroboration"] == ["single_source"], discovery)
+    require(discovery[0]["interfaces"] == 0, discovery)
+    require(discovery[0]["skipped"] == [], discovery)
+    require(
+        discovery[0]["tables"] == [{"version": [2, 40], "entries": 68, "source": "scan"}],
+        discovery,
+    )
+    objects = discovery[0]["objects"]
+    require(len(objects) == 1, objects)
+    target = objects[0]
+    identity = {key: module[key] for key in ("dev", "ino", "sha256")}
+    require(
+        {key: target[key] for key in identity} == identity,
+        f"attached target is not the SoftHSM2 module object: {target}",
+    )
+    require(target["path"] == module["path"], target)
+    require("p11-kit" not in target["path"].lower(), target)
+
+    refused = evidence["modules_skipped"]
+    require(len(refused) == 1, refused)
+    require("p11-kit" in refused[0]["name"].lower(), refused)
+    match = re.fullmatch(
+        r"module needs ([0-9]+) more of the 512 attach slots; 0 are in use "
+        r"— refusing to attach a prefix",
+        refused[0]["reason"],
+    )
+    require(match and int(match.group(1)) > 512, refused)
+
+    scan_skips = evidence["skipped"]
+    require(len(scan_skips) == 3, f"unexpected scan skips: {scan_skips}")
+    for skip in scan_skips:
+        require("p11-kit" in skip["name"].lower(), skip)
+        require(
+            re.fullmatch(
+                r"a 3\.0 table header extends past the object's file-backed data "
+                r"\([0-9]+ bytes needed, [0-9]+ available\); a table built at run time "
+                r"in \.bss or on the heap is outside the memory scan's reach",
+                skip["reason"],
+            ),
+            skip,
+        )
+
+    functions = document["functions"]
+    require(len(functions) == 68, len(functions))
+    called = 0
+    for item in functions:
+        require(item["module_ambiguous"] is False, item)
+        require(item["module"] == identity, item)
+        require(isinstance(item["calls"], int) and item["calls"] >= 0, item)
+        called += item["calls"]
+    require(called > 0, "the SoftHSM2 backend handled no calls")
 
 
 def load_json(path):
@@ -686,6 +768,48 @@ def self_test():
                 )
             )
     print("clean metrics discovery source is exact in all three lanes: OK")
+
+    proxy = copy.deepcopy(clean)
+    soft_path = "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
+    proxy["capture"]["modules"][0]["path"] = soft_path
+    proxy["evidence"]["discovery"][0]["path"] = soft_path
+    proxy["evidence"]["discovery"][0]["objects"][0]["path"] = soft_path
+    proxy["evidence"]["modules_skipped"] = [
+        {
+            "name": "/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.3.1",
+            "reason": "module needs 5762 more of the 512 attach slots; 0 are in use "
+            "— refusing to attach a prefix",
+        }
+    ]
+    proxy["evidence"]["skipped"] = [
+        {
+            "name": "/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.3.1",
+            "reason": "a 3.0 table header extends past the object's file-backed data "
+            f"(744 bytes needed, {available} available); a table built at run time in "
+            ".bss or on the heap is outside the memory scan's reach",
+        }
+        for available in (712, 680, 616)
+    ]
+    proxy["functions"] = function_items(
+        [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
+        + [([f"C_Unused_{index}"], 0) for index in range(66)]
+    )
+    validate_proxy_capacity_fallback(proxy)
+    for mutate in (
+        lambda d: d["evidence"]["discovery"][0]["objects"][0].update(
+            path="/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.3.1", ino=999
+        ),
+        lambda d: d["evidence"].update(event_loss=1),
+        lambda d: d["evidence"]["modules_skipped"][0].update(reason="capacity"),
+        lambda d: d["functions"][0]["module"].update(ino=999),
+        lambda d: d["evidence"].update(completeness="COMPLETE"),
+        lambda d: d["evidence"].update(slots=67),
+        lambda d: [item.update(calls=0) for item in d["functions"]],
+    ):
+        bad = copy.deepcopy(proxy)
+        mutate(bad)
+        rejected(lambda bad=bad: validate_proxy_capacity_fallback(bad))
+    print("proxy capacity fallback accepts only its exact evidence shape: OK")
 
     version = evidence_fixture(
         VERSION_SURFACES_SCANNED,

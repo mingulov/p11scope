@@ -230,6 +230,17 @@ fn merge(
     interface_list: String,
 ) -> AttachPlan {
     let capacity = MAX_SLOTS as usize;
+    let mut groups: Vec<Vec<Discovered<'_>>> = Vec::new();
+    let mut group_positions: BTreeMap<ObjectKey, usize> = BTreeMap::new();
+    for module in discovered {
+        let position = *group_positions.entry(module.key).or_insert_with(|| {
+            let position = groups.len();
+            groups.push(Vec::new());
+            position
+        });
+        groups[position].push(module);
+    }
+
     let mut positions: BTreeMap<(ObjectKey, u64), usize> = BTreeMap::new();
     let mut building: Vec<Building> = Vec::new();
     let mut modules = Vec::new();
@@ -237,16 +248,19 @@ fn merge(
     let mut skipped = Vec::new();
     let mut surfaces = Vec::new();
     let mut entries_seen = 0usize;
-    for module in discovered {
-        let wanted: BTreeSet<(ObjectKey, u64)> = module
-            .targets
+    for group in groups {
+        let key = group[0].key;
+        let path = group[0].path;
+        let source = group[0].source;
+        let wanted: BTreeSet<(ObjectKey, u64)> = group
             .iter()
+            .flat_map(|module| &module.targets)
             .map(|target| (target.object, target.file_offset))
             .filter(|target| !positions.contains_key(target))
             .collect();
         if building.len() + wanted.len() > capacity {
             modules_skipped.push(Skipped {
-                subject: module.path.to_string(),
+                subject: path.to_string(),
                 reason: format!(
                     "module needs {} more of the {MAX_SLOTS} attach slots; {} are in use \
                      — refusing to attach a prefix",
@@ -261,63 +275,57 @@ fn merge(
         // corroborating a scanned module must not read as two rivals claiming the same
         // target: that would make every corroborated slot COUNT_ONLY (§4.7) and turn
         // the fallback `--manifest` of §4.12 into a trapdoor.
-        let id = match modules
-            .iter()
-            .position(|existing: &ModuleSummary| existing.key == module.key)
-        {
-            Some(index) => ModuleId(index as u32),
-            None => {
-                modules.push(ModuleSummary {
-                    id: ModuleId(modules.len() as u32),
-                    key: module.key,
-                    path: module.path.to_string(),
-                    tables: Vec::new(),
-                    interfaces: 0,
-                    source: module.source,
-                    corroborated: false,
-                    skipped: Vec::new(),
-                });
-                ModuleId(modules.len() as u32 - 1)
-            }
-        };
-        for target in &module.targets {
-            let position = *positions
-                .entry((target.object, target.file_offset))
-                .or_insert_with(|| {
-                    building.push(Building {
-                        object: target.object,
-                        object_path: target.object_path.to_string(),
-                        file_offset: target.file_offset,
-                        names: Vec::new(),
-                        fork_safe: true,
-                        module_ids: Vec::new(),
+        let id = ModuleId(modules.len() as u32);
+        modules.push(ModuleSummary {
+            id,
+            key,
+            path: path.to_string(),
+            tables: Vec::new(),
+            interfaces: 0,
+            source,
+            corroborated: false,
+            skipped: Vec::new(),
+        });
+        for module in group {
+            for target in &module.targets {
+                let position = *positions
+                    .entry((target.object, target.file_offset))
+                    .or_insert_with(|| {
+                        building.push(Building {
+                            object: target.object,
+                            object_path: target.object_path.to_string(),
+                            file_offset: target.file_offset,
+                            names: Vec::new(),
+                            fork_safe: true,
+                            module_ids: Vec::new(),
+                        });
+                        building.len() - 1
                     });
-                    building.len() - 1
-                });
-            let slot = &mut building[position];
-            // A module reaching one target under two names is aliasing, not module
-            // ambiguity, so each module is recorded at most once per slot.
-            if !slot.module_ids.contains(&id) {
-                slot.module_ids.push(id);
+                let slot = &mut building[position];
+                // A module reaching one target under two names is aliasing, not module
+                // ambiguity, so each module is recorded at most once per slot.
+                if !slot.module_ids.contains(&id) {
+                    slot.module_ids.push(id);
+                }
+                slot.names.push(target.name.to_string());
+                slot.fork_safe &= target.fork_safe;
             }
-            slot.names.push(target.name.to_string());
-            slot.fork_safe &= target.fork_safe;
+            let summary = &mut modules[id.0 as usize];
+            if summary.source != module.source {
+                summary.source = "scan+manifest";
+            }
+            summary.tables.extend(module.tables);
+            // Never summed across sources: the scan and a manifest describing one
+            // provider both count *its* interfaces, so adding them reports two where
+            // there is one — on exactly the corroborated path this slice is built
+            // around. Each source sees a subset (the scan only records an interface
+            // whose table it decoded), so the most any one saw is the honest number.
+            summary.interfaces = summary.interfaces.max(module.interfaces);
+            summary.skipped.extend(module.skipped.iter().cloned());
+            surfaces.extend(module.surfaces);
+            skipped.extend(module.skipped);
+            entries_seen += module.entries_seen;
         }
-        let summary = &mut modules[id.0 as usize];
-        if summary.source != module.source {
-            summary.source = "scan+manifest";
-        }
-        summary.tables.extend(module.tables);
-        // Never summed across sources: the scan and a manifest describing one
-        // provider both count *its* interfaces, so adding them reports two where
-        // there is one — on exactly the corroborated path this slice is built
-        // around. Each source sees a subset (the scan only records an interface
-        // whose table it decoded), so the most any one saw is the honest number.
-        summary.interfaces = summary.interfaces.max(module.interfaces);
-        summary.skipped.extend(module.skipped.iter().cloned());
-        surfaces.extend(module.surfaces);
-        skipped.extend(module.skipped);
-        entries_seen += module.entries_seen;
     }
 
     let slots: Vec<Slot> = building
@@ -644,6 +652,37 @@ mod tests {
         )
     }
 
+    fn scanned_with(
+        key: ObjectKey,
+        path: &str,
+        offsets: impl IntoIterator<Item = u64>,
+    ) -> ScannedModule {
+        use crate::discovery::scan::{ScannedEntry, ScannedTable};
+
+        ScannedModule {
+            key,
+            path: path.into(),
+            exports: vec!["C_GetFunctionList".into()],
+            tables: vec![ScannedTable {
+                version: (2, 40),
+                walk: "full",
+                entries: offsets
+                    .into_iter()
+                    .map(|file_offset| ScannedEntry {
+                        name: "C_Sign",
+                        object: key,
+                        object_path: path.into(),
+                        file_offset,
+                    })
+                    .collect(),
+                null_entries: vec![],
+                unpinned: vec![],
+                address: 0x7000,
+            }],
+            interfaces: vec![],
+        }
+    }
+
     #[test]
     fn one_slot_per_unique_target_and_aliases_flagged() {
         let m = manifest_with(vec![
@@ -913,6 +952,70 @@ mod tests {
             p.modules[0].interfaces, 1,
             "one provider, one interface, described twice"
         );
+    }
+
+    #[test]
+    fn an_oversized_scan_cannot_be_reattached_through_a_manifest_subset() {
+        let later = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 99,
+        };
+        let scanned = [
+            scanned_with(TEST_OBJECT, "/opt/p11.so", (0..513).map(|i| i * 8)),
+            scanned_with(later, "/opt/later.so", [0x9000, 0x9010]),
+        ];
+        let manifest = manifest_with(vec![resolved("C_Sign", 0)]);
+
+        let p = build_from_sources(&scanned, std::slice::from_ref(&manifest));
+        assert_eq!(p.slots.len(), 2, "only the later distinct module fits");
+        assert!(p.slots.iter().all(|slot| slot.object == later));
+        assert_eq!(p.modules.len(), 1);
+        assert_eq!(p.modules[0].path, "/opt/later.so");
+        assert_eq!(p.modules[0].source, "scan");
+        assert_eq!(p.modules_skipped.len(), 1);
+        assert_eq!(p.modules_skipped[0].subject, "/opt/p11.so");
+        assert!(
+            p.modules_skipped[0]
+                .reason
+                .contains("module needs 513 more")
+        );
+        assert!(p.modules_skipped[0].reason.contains("0 are in use"));
+    }
+
+    #[test]
+    fn an_overflowing_scan_manifest_union_refuses_the_whole_module() {
+        let later = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 99,
+        };
+        let scanned = [
+            scanned_with(TEST_OBJECT, "/opt/p11.so", [0, 8]),
+            scanned_with(later, "/opt/later.so", [0x9000, 0x9010]),
+        ];
+        let manifest = manifest_with((0..513).map(|i| resolved("C_Sign", i * 8)).collect());
+
+        let p = build_from_sources(&scanned, std::slice::from_ref(&manifest));
+        assert_eq!(
+            p.slots.len(),
+            2,
+            "no scan prefix of the refused module remains"
+        );
+        assert!(p.slots.iter().all(|slot| slot.object == later));
+        assert_eq!(p.modules.len(), 1);
+        assert_eq!(p.modules[0].path, "/opt/later.so");
+        assert_eq!(
+            p.modules[0].tables.len(),
+            1,
+            "later-module evidence stays complete"
+        );
+        assert_eq!(p.modules_skipped.len(), 1);
+        assert_eq!(p.modules_skipped[0].subject, "/opt/p11.so");
+        assert!(
+            p.modules_skipped[0]
+                .reason
+                .contains("module needs 513 more")
+        );
+        assert!(p.modules_skipped[0].reason.contains("0 are in use"));
     }
 
     #[test]

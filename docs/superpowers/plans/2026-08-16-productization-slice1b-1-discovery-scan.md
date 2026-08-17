@@ -1715,9 +1715,9 @@ pub fn build_from_modules(modules: &[ScannedModule]) -> AttachPlan;
    two modules is attached once (no double counting), its slot is marked ambiguous by
    carrying two `module_ids`, its semantics degrade to `COUNT_ONLY`, and `module_ambiguous`
    is incremented — spec §4.7.
-2. **Capacity is refused whole, never truncated.** With `MAX_SLOTS = 512`, modules are added
-   in discovery order; the first module that would exceed the ceiling and every module after
-   it go to `modules_skipped` with the reason, and the plan keeps the modules that fit.
+2. **Capacity is refused whole, never truncated.** With `MAX_SLOTS = 512`, actual modules are
+   considered in first-seen discovery order; each module whose complete scan/manifest union
+   would exceed the ceiling goes to `modules_skipped`, and later distinct modules are still considered.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1830,7 +1830,7 @@ exactly one merge implementation. Concretely:
   `semantic_ambiguous = true`, `module_ambiguous += 1`); on a miss allocate the next index.
 - Per-module capacity: compute the module's unique new targets before inserting; if
   `used + new > MAX_SLOTS`, push `Skipped { subject: module.path, reason: format!("module needs {new} more of the {MAX_SLOTS} attach slots; {used} are in use — refusing to attach a prefix") }`
-  and skip the whole module (and every later one, so the report is deterministic).
+  and skip the whole module; continue with the next actual module in first-seen order.
 - Names per slot: collect, sort, dedup, then `kinds::descriptor_slot(&names)` exactly as
   today; ambiguity from aliasing and ambiguity from shared modules both land on
   `COUNT_ONLY`.
@@ -2932,4 +2932,3 @@ struct in the same commit that adds it — if executed strictly in order, add th
 and have T12 return a placeholder-free tuple until then, or execute T13 before T12. **Chosen
 order: T12 then T13**, with T12's `discover_plan` returning the plan and pins only, and T13
 adding `DiscoveryEvidence` plus the call that fills it.
-

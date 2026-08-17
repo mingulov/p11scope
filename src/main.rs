@@ -443,6 +443,11 @@ fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
                     }
                 }
             }
+            // Gone, not hidden — the same rule as above, and the container
+            // cgroups this walks churn constantly. A cgroup is only removable
+            // once it is empty, so a directory that vanished between its
+            // parent's listing and this read held no process to lose.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => lost.push(Skipped {
                 subject: dir.display().to_string(),
                 reason: format!(
@@ -2312,6 +2317,17 @@ mod tests {
         assert_eq!(pids, vec![11, 22, 33], "deduplicated, descendants included");
         assert_eq!(lost, vec![], "every directory was readable");
         assert_eq!(scope_pids(&Scope::Pid(7)).0, vec![7]);
+
+        // A cgroup that is gone by the time the walk reaches it — container
+        // cgroups churn constantly, and one is removable only when empty — held
+        // no process to lose, on either read. Claiming otherwise would publish a
+        // false loss and force PARTIAL on ordinary pod turnover.
+        let (pids, lost) = scope_pids(&Scope::Cgroup {
+            id: 0,
+            path: root.path().join("vanished.scope"),
+        });
+        assert_eq!(pids, Vec::<u32>::new());
+        assert_eq!(lost, vec![], "a cgroup that no longer exists is not a loss");
 
         // A subtree the observer cannot read is not an empty subtree: the
         // processes in it were never listed, so their providers were never

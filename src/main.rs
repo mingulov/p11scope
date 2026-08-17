@@ -897,7 +897,7 @@ fn discovery_evidence(
                 corroboration: corroboration_of(counters, m),
                 tables: m.tables.clone(),
                 interfaces: m.interfaces,
-                skipped: m.skipped.iter().map(skipped_out).collect(),
+                skipped: m.skipped.iter().map(render::capture_skipped_out).collect(),
             }
         })
         .collect();
@@ -1871,6 +1871,133 @@ mod tests {
             plan.entries_seen,
             "every record counted in table_entries belongs to a surface"
         );
+    }
+
+    #[test]
+    fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
+        let raw = Skipped {
+            subject: "C_Sign".into(),
+            reason: "/private/ROUND4_OBJECT_PATH_SENTINEL.so was not pinned: \
+                     ROUND4_ERROR_CHAIN_SENTINEL"
+                .into(),
+        };
+        let module = ScannedModule {
+            key: ObjectKey {
+                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                inode: 42,
+            },
+            path: "/opt/p11.so".into(),
+            exports: vec![],
+            tables: vec![p11scope::discovery::scan::ScannedTable {
+                version: (2, 40),
+                walk: "full",
+                entries: vec![],
+                null_entries: vec![],
+                unpinned: vec![raw.clone()],
+                address: 0x7000,
+            }],
+            interfaces: vec![],
+        };
+        let plan = plan::build_from_modules(&[module]);
+        assert_eq!(plan.skipped, vec![raw.clone()]);
+        assert_eq!(plan.modules[0].skipped, vec![raw]);
+
+        let discovery = discovery_evidence(
+            &plan,
+            &PinnedObjects::empty(),
+            &DiscoveryCounters::default(),
+        );
+        let mut evidence = render::Evidence {
+            table_entries: plan.entries_seen,
+            slots: plan.slots.len(),
+            attached_probes: 0,
+            attach_failures: vec![],
+            aliased: vec![],
+            skipped: plan
+                .skipped
+                .iter()
+                .map(render::capture_skipped_out)
+                .collect(),
+            in_flight_at_end: 0,
+            surfaces: plan.surfaces.clone(),
+            vendor_interfaces: 0,
+            interface_list: "absent".into(),
+            event_loss: 0,
+            start_insert_failures: 0,
+            unmatched_returns: 0,
+            rv_update_failures: 0,
+            cgroup_scope_failures: 0,
+            semantic_capture_failures: 0,
+            unregistered_mechanisms: 0,
+            template_tail_failures: 0,
+            process_tracking_fallbacks: 0,
+            process_tracking_failures: 0,
+            process_tracking_evictions: 0,
+            state_reconciliations: 0,
+            session_cancel_ambiguities: 0,
+            session_cancel_unknown_flags: 0,
+            operation_state_imports: 0,
+            auth_state_ambiguities: 0,
+            async_target_failures: 0,
+            async_orphans: 0,
+            async_duplicates: 0,
+            async_evictions: 0,
+            fork_state_ambiguities: 0,
+            semantic_state_drops: 0,
+            pending_at_end: 0,
+            malformed_records: 0,
+            orphan_ops: 0,
+            unmatched_closes: 0,
+            shape_decode_failures: 0,
+            shape_decode_total_failures: 0,
+            templates_truncated: false,
+            provider_changed: false,
+            discovery,
+            completeness: "UNKNOWN",
+        };
+        evidence.verdict();
+        let profile_capture = render::CaptureMeta {
+            started: "t0",
+            ended: "t1",
+            kernel: "test",
+            policy: CapturePolicy::Allowlisted,
+        };
+        let state = semantics::State::with_policy(&plan, CapturePolicy::Allowlisted);
+        let profile = render::profile_json(&[], &evidence, &state, &profile_capture);
+        let metrics_capture = render::CaptureMeta {
+            policy: CapturePolicy::AggregateOnly,
+            ..profile_capture
+        };
+        let metrics = render::json(&[], &evidence, &metrics_capture);
+        let trace = trace::evidence_line(&evidence, CapturePolicy::Allowlisted);
+
+        for rendered in [
+            serde_json::to_string(&profile).unwrap(),
+            serde_json::to_string(&metrics).unwrap(),
+            trace,
+        ] {
+            for sentinel in ["ROUND4_OBJECT_PATH_SENTINEL", "ROUND4_ERROR_CHAIN_SENTINEL"] {
+                assert!(
+                    !rendered.contains(sentinel),
+                    "leaked {sentinel}: {rendered}"
+                );
+            }
+        }
+        for document in [profile, metrics] {
+            assert_eq!(document["evidence"]["completeness"], "PARTIAL");
+            assert_eq!(document["evidence"]["skipped"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                document["evidence"]["discovery"][0]["skipped"],
+                document["evidence"]["skipped"]
+            );
+            assert_eq!(
+                document["evidence"]["skipped"][0],
+                serde_json::json!({
+                    "name": "C_Sign",
+                    "reason": "function entry unavailable",
+                })
+            );
+        }
     }
 
     /// An object the scan could not read at all is the loss `discovery[]` cannot

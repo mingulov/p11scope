@@ -48,6 +48,8 @@ COUNTERS = (
 )
 MAX_MANIFEST_OBJECT_FALLBACKS = 512
 MANIFEST_STALE_REASONS = {"open_stale", "identity_mismatch"}
+ALLOWED_SOURCE_ARRAYS = (["scan"], ["manifest"], ["scan", "manifest"])
+U64_MAX = (1 << 64) - 1
 
 # The version-matrix provider, seen two ways. Both are measured, both are exact.
 #
@@ -144,7 +146,34 @@ def digest_ok(carrier):
     than crash the length check.
     """
     digest = carrier["sha256"]
-    return isinstance(digest, str) and len(digest) == 64
+    return isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+
+
+def u64(value, *, positive=False):
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and (value > 0 if positive else value >= 0)
+        and value <= U64_MAX
+    )
+
+
+def exact_identity(carrier):
+    require(
+        isinstance(carrier["dev"], list)
+        and len(carrier["dev"]) == 2
+        and all(u64(part) for part in carrier["dev"]),
+        f"invalid object device: {carrier}",
+    )
+    require(u64(carrier["ino"], positive=True), f"invalid object inode: {carrier}")
+    require(digest_ok(carrier), f"invalid object digest: {carrier}")
+
+
+def exact_sources(carrier):
+    require(
+        carrier["sources"] in ALLOWED_SOURCE_ARRAYS,
+        f"invalid discovery sources: {carrier}",
+    )
 
 
 def exact_counters(evidence, allowances=None):
@@ -170,10 +199,14 @@ def exact_manifest_object_fallbacks(evidence):
             {"sources", "objects", "corroborated", "corroboration"} <= set(module),
             f"incomplete discovery module: {module}",
         )
-        if "scan" not in module["sources"]:
-            continue
-        for carrier in [module, *module["objects"]]:
-            if digest_ok(carrier):
+        exact_sources(module)
+        exact_identity(module)
+        if "scan" in module["sources"]:
+            scan_identities.add((tuple(module["dev"]), module["ino"], module["sha256"]))
+        for carrier in module["objects"]:
+            exact_sources(carrier)
+            exact_identity(carrier)
+            if "scan" in carrier["sources"]:
                 scan_identities.add(
                     (tuple(carrier["dev"]), carrier["ino"], carrier["sha256"])
                 )
@@ -187,7 +220,9 @@ def exact_manifest_object_fallbacks(evidence):
         )
         manifest, object_id = fallback["manifest"], fallback["object"]
         require(
-            isinstance(manifest, int) and not isinstance(manifest, bool) and 0 <= manifest <= 0xFFFFFFFF,
+            isinstance(manifest, int)
+            and not isinstance(manifest, bool)
+            and 0 <= manifest <= 0xFFFFFFFF,
             f"invalid manifest fallback ordinal: {fallback}",
         )
         require(
@@ -197,19 +232,7 @@ def exact_manifest_object_fallbacks(evidence):
         require(fallback["reason"] in MANIFEST_STALE_REASONS, fallback)
         replacement = fallback["replacement"]
         require(set(replacement) == {"dev", "ino", "sha256"}, fallback)
-        require(
-            isinstance(replacement["dev"], list)
-            and len(replacement["dev"]) == 2
-            and all(isinstance(part, int) and not isinstance(part, bool) and part >= 0 for part in replacement["dev"]),
-            fallback,
-        )
-        require(
-            isinstance(replacement["ino"], int)
-            and not isinstance(replacement["ino"], bool)
-            and replacement["ino"] > 0
-            and digest_ok(replacement),
-            fallback,
-        )
+        exact_identity(replacement)
         identity = (
             tuple(replacement["dev"]),
             replacement["ino"],
@@ -221,11 +244,11 @@ def exact_manifest_object_fallbacks(evidence):
             f"duplicate manifest object fallback: {fallback}",
         )
         require(
-            (manifest, identity) not in seen_replacements,
-            f"one scan object cannot hide two stale objects in one manifest: {fallback}",
+            identity not in seen_replacements,
+            f"one scan object cannot hide two stale objects: {fallback}",
         )
         seen_objects.add((manifest, object_id))
-        seen_replacements.add((manifest, identity))
+        seen_replacements.add(identity)
 
     standalone = sum(
         "manifest" in module["sources"] and not module["corroborated"]
@@ -312,8 +335,11 @@ def exact_common(evidence, *, aliases, skipped, in_flight, discovery_skipped=0):
     require(evidence["discovery"], "evidence.discovery is empty: nothing was discovered")
     exact_manifest_object_fallbacks(evidence)
     for module in evidence["discovery"]:
-        require(digest_ok(module), f"module without a whole-file digest: {module}")
-        require(module["sources"], f"module with no discovery source: {module}")
+        exact_identity(module)
+        exact_sources(module)
+        for object_ in module["objects"]:
+            exact_identity(object_)
+            exact_sources(object_)
     require(evidence["modules_skipped"] == [], f"modules refused: {evidence['modules_skipped']}")
     require(evidence["scan_unavailable"] is None, evidence["scan_unavailable"])
     require(evidence["completeness"] == "PARTIAL", evidence["completeness"])
@@ -375,9 +401,7 @@ def exact_capture_modules(document):
         # `sha256` is null for an object nothing pinned — never in a lane that
         # attached probes, and the guard keeps that a stated rejection rather
         # than a TypeError traceback.
-        require(digest_ok(module), f"module without a whole-file digest: {module}")
-        require(isinstance(module["ino"], int) and module["ino"] > 0, f"module inode: {module}")
-        require(len(module["dev"]) == 2, f"module device: {module}")
+        exact_identity(module)
     require(
         modules == [
             {key: module[key] for key in ("path", "dev", "ino", "sha256", "build_id")}
@@ -737,7 +761,14 @@ def discovery_fixture(sources=("scan",)):
     return [
         dict(
             MODULE_FIXTURE,
-            objects=[dict(MODULE_FIXTURE, identity_source="mountinfo", note=None)],
+            objects=[
+                dict(
+                    MODULE_FIXTURE,
+                    identity_source="mountinfo",
+                    note=None,
+                    sources=sources.copy(),
+                )
+            ],
             sources=sources,
             corroborated=corroborated,
             corroboration=["conflict"] if corroborated else ["single_source"],
@@ -1184,10 +1215,42 @@ def self_test():
         bad = copy.deepcopy(fallback)
         mutate(bad)
         rejected(lambda bad=bad: exact_capture_modules(bad))
+
+    bogus_source = copy.deepcopy(fallback)
+    bogus_source["evidence"]["discovery"][0]["sources"] = ["scan", "bogus"]
+    rejected(lambda: exact_capture_modules(bogus_source))
+
+    non_hex = copy.deepcopy(fallback)
+    bad_digest = "g" * 64
+    non_hex["evidence"]["discovery"][0]["sha256"] = bad_digest
+    non_hex["capture"]["modules"][0]["sha256"] = bad_digest
+    non_hex["evidence"]["manifest_object_fallbacks"][0]["replacement"]["sha256"] = bad_digest
+    for function in non_hex["functions"]:
+        function["module"]["sha256"] = bad_digest
+    rejected(lambda: exact_capture_modules(non_hex))
+
+    out_of_range = copy.deepcopy(fallback)
+    bad_device = [1 << 64, 1]
+    out_of_range["evidence"]["discovery"][0]["dev"] = bad_device
+    out_of_range["capture"]["modules"][0]["dev"] = bad_device
+    out_of_range["evidence"]["manifest_object_fallbacks"][0]["replacement"]["dev"] = bad_device
+    for function in out_of_range["functions"]:
+        function["module"]["dev"] = bad_device
+    rejected(lambda: exact_capture_modules(out_of_range))
+
+    inherited_object_source = copy.deepcopy(fallback)
+    nested = inherited_object_source["evidence"]["discovery"][0]["objects"][0]
+    nested.update(dev=[8, 2], ino=12, sha256="22" * 32, sources=["manifest"])
+    inherited_object_source["evidence"]["manifest_object_fallbacks"][0]["replacement"] = {
+        key: nested[key] for key in ("dev", "ino", "sha256")
+    }
+    rejected(lambda: exact_capture_modules(inherited_object_source))
+
     hidden_sole_source = copy.deepcopy(fallback)
     second = copy.deepcopy(
         hidden_sole_source["evidence"]["manifest_object_fallbacks"][0]
     )
+    second["manifest"] = 1
     second["object"] = 1
     hidden_sole_source["evidence"]["manifest_object_fallbacks"].append(second)
     hidden_sole_source["evidence"]["discovery_uncorroborated"] = 2

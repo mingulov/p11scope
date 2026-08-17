@@ -92,6 +92,8 @@ pub struct ObjectSummary {
     pub identity_source: &'static str,
     /// Why `identity_source` is `"stat"` rather than `"mountinfo"`.
     pub note: Option<String>,
+    /// Exact canonical ownership: `scan`, `manifest`, or both.
+    pub sources: Vec<&'static str>,
 }
 
 /// One module discovery found, with everything known about how it was found.
@@ -1188,6 +1190,7 @@ mod tests {
                 build_id: Some("aabb".into()),
                 identity_source: "mountinfo",
                 note: None,
+                sources: vec!["scan"],
             }],
             sources: vec!["scan"],
             corroborated: false,

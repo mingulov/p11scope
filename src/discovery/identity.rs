@@ -345,6 +345,28 @@ impl PinnedObjects {
         })
     }
 
+    /// Canonical, finite source ownership for one opened capture-local object.
+    /// Raw aliases remain private; output only needs to distinguish scan and
+    /// optional-manifest authority.
+    pub fn sources(&self, id: PinnedObjectId) -> Vec<&'static str> {
+        let mut scan = false;
+        let mut manifest = false;
+        for (raw, observed) in &self.raw_to_id {
+            if *observed != id {
+                continue;
+            }
+            if raw.mount_namespace.is_some() {
+                scan = true;
+            } else {
+                manifest = true;
+            }
+        }
+        [scan.then_some("scan"), manifest.then_some("manifest")]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
     pub fn view_claims(&self, view: ProcessViewId) -> Option<&ViewClaims> {
         self.ownership.get(&view)
     }
@@ -817,6 +839,26 @@ pub fn pin_manifest_objects_deferred(m: &Manifest) -> Result<ManifestPinning, Ma
                 continue;
             }
         }
+        let mut offsets_valid = true;
+        for function in m.surfaces.iter().flat_map(|surface| &surface.functions) {
+            let Resolution::Resolved {
+                object: target,
+                file_offset,
+            } = function.resolution
+            else {
+                continue;
+            };
+            if target == object.id && !inspected.contains_executable_offset(file_offset) {
+                problems.push(format!(
+                    "{}: {}+{file_offset:#x} is outside every executable ELF segment",
+                    function.name, object.path
+                ));
+                offsets_valid = false;
+            }
+        }
+        if !offsets_valid {
+            continue;
+        }
         let mapping = match identity_of(&file) {
             Ok(mapping) => mapping,
             Err(error) => {
@@ -866,26 +908,6 @@ pub fn pin_manifest_objects_deferred(m: &Manifest) -> Result<ManifestPinning, Ma
             continue;
         }
         opened.insert(object.id, (entry, inspected));
-    }
-
-    for surface in &m.surfaces {
-        for function in &surface.functions {
-            let Resolution::Resolved {
-                object,
-                file_offset,
-            } = function.resolution
-            else {
-                continue;
-            };
-            if let Some((entry, inspected)) = opened.get(&object)
-                && !inspected.contains_executable_offset(file_offset)
-            {
-                problems.push(format!(
-                    "{}: {}+{file_offset:#x} is outside every executable ELF segment",
-                    function.name, entry.path
-                ));
-            }
-        }
     }
 
     if !problems.is_empty() {

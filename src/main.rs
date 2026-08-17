@@ -15,9 +15,10 @@ use p11scope::discovery::identity::{
 #[cfg(test)]
 use p11scope::discovery::scan::ScanLimits;
 use p11scope::discovery::scan::{
-    CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, Skipped, scan_process_view,
+    CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, ScannedTable, Skipped,
+    scan_process_view,
 };
-use p11scope::manifest_input::read_manifest;
+use p11scope::manifest_input::{read_manifest, validate_structure};
 use p11scope::output::AtomicFile;
 use p11scope::process::{ProcessView, ProcessViewId};
 use p11scope::{doctor, events, inspect, metrics, plan, process, render, scope, semantics, trace};
@@ -204,12 +205,74 @@ struct ManifestInput {
     stale: Vec<StaleManifestObject>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ManifestFallback {
     manifest: u32,
     object: u32,
     reason: ManifestStaleReason,
     replacement: PinnedObjectId,
+    proof: BoundFallbackProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingManifestFallback {
+    manifest: u32,
+    object: u32,
+    reason: ManifestStaleReason,
+    candidate: CandidateFallbackProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SurfaceRequirement {
+    version: (u8, u8),
+    all_names: BTreeMap<String, usize>,
+    resolved_names: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TableClaims {
+    all_names: BTreeMap<String, usize>,
+    resolved_names: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CandidateTableProof {
+    address: u64,
+    requirement: SurfaceRequirement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CandidateFallbackProof {
+    module_view: ProcessViewId,
+    module_key: ObjectKey,
+    module_path: String,
+    recorded_key: ObjectKey,
+    object_path: String,
+    provenance_path: String,
+    is_module: bool,
+    replacement: PinnedObjectId,
+    tables: Vec<CandidateTableProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RequiredTarget {
+    object: PinnedObjectId,
+    file_offset: u64,
+    name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundTableProof {
+    address: u64,
+    version: (u8, u8),
+    entries: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundFallbackProof {
+    module: PinnedObjectId,
+    tables: Vec<BoundTableProof>,
+    required_targets: BTreeMap<RequiredTarget, usize>,
 }
 
 /// How many processes of a `--cgroup` discovery scans.
@@ -873,6 +936,7 @@ fn discovery_evidence(
             build_id: pin.build_id.map(str::to_string),
             identity_source: pin.identity_source,
             note: pin.note.map(str::to_string),
+            sources: pinned.sources(id),
         }
     };
     let modules = plan
@@ -1106,32 +1170,183 @@ fn manifest_object_key(manifest: &Manifest, object: u32) -> Option<(ObjectKey, &
     ))
 }
 
-fn claims_covered(
-    needed: &BTreeMap<((u8, u8), String), usize>,
-    available: &BTreeMap<((u8, u8), String), usize>,
-) -> bool {
+fn claims_covered(needed: &BTreeMap<String, usize>, available: &BTreeMap<String, usize>) -> bool {
     needed
         .iter()
         .all(|(claim, count)| available.get(claim).is_some_and(|seen| seen >= count))
 }
 
-/// Finds one scan-opened object whose raw claim matches the manifest's validated
-/// object/provenance relation and whose table covers every claim that fallback
-/// would drop. The raw relation only selects the candidate; the returned
-/// `PinnedObjectId` is the sole attach authority.
+fn fallback_requirements(
+    manifest: &Manifest,
+    stale: u32,
+    is_module: bool,
+) -> Option<Vec<SurfaceRequirement>> {
+    let mut requirements = Vec::new();
+    for surface in &manifest.surfaces {
+        let mut all_names = BTreeMap::new();
+        let mut resolved_names = BTreeMap::new();
+        for function in &surface.functions {
+            let affected = is_module
+                || matches!(
+                    function.resolution,
+                    Resolution::Resolved { object, .. } if object == stale
+                );
+            if !affected {
+                continue;
+            }
+            *all_names.entry(function.name.clone()).or_insert(0) += 1;
+            if matches!(function.resolution, Resolution::Resolved { .. }) {
+                *resolved_names.entry(function.name.clone()).or_insert(0) += 1;
+            }
+        }
+        if all_names.is_empty() {
+            continue;
+        }
+        let version = surface
+            .version
+            .map(|version| (version.major, version.minor))?;
+        requirements.push(SurfaceRequirement {
+            version,
+            all_names,
+            resolved_names,
+        });
+    }
+    (!requirements.is_empty()).then_some(requirements)
+}
+
+fn relation_matches(proof: &CandidateFallbackProof, key: ObjectKey, path: &str) -> bool {
+    key == proof.recorded_key
+        && (target_paths_equal(path, &proof.object_path)
+            || target_paths_equal(path, &proof.provenance_path))
+}
+
+fn raw_table_claims(
+    module: &ScannedModule,
+    table: &ScannedTable,
+    pinned: &PinnedObjects,
+    proof: &CandidateFallbackProof,
+) -> TableClaims {
+    let mut all_names = BTreeMap::new();
+    let mut resolved_names = BTreeMap::new();
+    for entry in &table.entries {
+        *all_names.entry(entry.name.to_string()).or_insert(0) += 1;
+        let relevant = proof.is_module
+            || relation_matches(proof, entry.object, &entry.object_path)
+                && pinned
+                    .id_for_scanned(module, entry.object, &entry.object_path)
+                    .and_then(|id| pinned.summary(id))
+                    .is_some_and(|summary| summary.key == proof.recorded_key);
+        if relevant
+            && pinned
+                .id_for_scanned(module, entry.object, &entry.object_path)
+                .is_some()
+        {
+            *resolved_names.entry(entry.name.to_string()).or_insert(0) += 1;
+        }
+    }
+    for name in &table.null_entries {
+        *all_names.entry((*name).to_string()).or_insert(0) += 1;
+    }
+    for skipped in &table.unpinned {
+        *all_names.entry(skipped.subject.clone()).or_insert(0) += 1;
+    }
+    TableClaims {
+        all_names,
+        resolved_names,
+    }
+}
+
+fn requirement_covered(
+    requirement: &SurfaceRequirement,
+    table: &ScannedTable,
+    claims: &TableClaims,
+) -> bool {
+    table.version == requirement.version
+        && claims_covered(&requirement.all_names, &claims.all_names)
+        && claims_covered(&requirement.resolved_names, &claims.resolved_names)
+}
+
+fn assign_table(
+    surface: usize,
+    candidates: &[Vec<usize>],
+    seen: &mut [bool],
+    owners: &mut [Option<usize>],
+) -> bool {
+    for &table in &candidates[surface] {
+        if seen[table] {
+            continue;
+        }
+        seen[table] = true;
+        if owners[table].is_none() || assign_table(owners[table].unwrap(), candidates, seen, owners)
+        {
+            owners[table] = Some(surface);
+            return true;
+        }
+    }
+    false
+}
+
+fn injective_table_assignment(
+    requirements: &[SurfaceRequirement],
+    tables: &[ScannedTable],
+    claims: &[TableClaims],
+) -> Option<Vec<usize>> {
+    let candidates: Vec<Vec<usize>> = requirements
+        .iter()
+        .map(|requirement| {
+            tables
+                .iter()
+                .zip(claims)
+                .enumerate()
+                .filter_map(|(index, (table, claims))| {
+                    requirement_covered(requirement, table, claims).then_some(index)
+                })
+                .collect()
+        })
+        .collect();
+    if candidates.iter().any(Vec::is_empty) {
+        return None;
+    }
+    let mut owners = vec![None; tables.len()];
+    for surface in 0..requirements.len() {
+        if !assign_table(
+            surface,
+            &candidates,
+            &mut vec![false; tables.len()],
+            &mut owners,
+        ) {
+            return None;
+        }
+    }
+    let mut selected = vec![usize::MAX; requirements.len()];
+    for (table, surface) in owners.into_iter().enumerate() {
+        if let Some(surface) = surface {
+            selected[surface] = table;
+        }
+    }
+    selected
+        .iter()
+        .all(|table| *table != usize::MAX)
+        .then_some(selected)
+}
+
+/// Locates one exact scan module and an injective table proof for every manifest
+/// surface this stale object would remove. Raw paths and mapping keys only locate
+/// this pending candidate; reconciliation binds it to canonical opened identities.
 fn scanned_replacement(
     manifest: &Manifest,
     stale: &StaleManifestObject,
     modules: &[ScannedModule],
     pinned: &PinnedObjects,
     manifest_pins: &PinnedObjects,
-) -> Option<PinnedObjectId> {
+) -> Option<CandidateFallbackProof> {
     let object = manifest
         .objects
         .iter()
         .find(|object| object.id == stale.object)?;
     let (recorded_key, provenance_path) = manifest_object_key(manifest, stale.object)?;
     let is_module = object.path == manifest.module_path;
+    let requirements = fallback_requirements(manifest, stale.object, is_module)?;
     let module_owners: BTreeSet<_> = if is_module {
         BTreeSet::new()
     } else {
@@ -1144,36 +1359,26 @@ fn scanned_replacement(
             .map(|module| (module.view, module.key))
             .collect()
     };
-    let mut needed = BTreeMap::new();
-    for surface in &manifest.surfaces {
-        for function in &surface.functions {
-            let Resolution::Resolved { object, .. } = function.resolution else {
-                continue;
-            };
-            if is_module || object == stale.object {
-                let version = surface
-                    .version
-                    .map(|version| (version.major, version.minor))?;
-                *needed
-                    .entry((version, function.name.clone()))
-                    .or_insert(0usize) += 1;
-            }
-        }
-    }
-
-    let relation_matches = |key: ObjectKey, path: &str| {
-        key == recorded_key
-            && (target_paths_equal(path, &object.path) || target_paths_equal(path, provenance_path))
-    };
-    let mut replacements = BTreeSet::new();
+    let mut selected: Option<CandidateFallbackProof> = None;
     for module in modules {
         if !is_module && !module_owners.contains(&(module.view, module.key)) {
             continue;
         }
         let module_id = pinned.id_for_scanned(module, module.key, &module.path);
+        let locator = CandidateFallbackProof {
+            module_view: module.view,
+            module_key: module.key,
+            module_path: module.path.clone(),
+            recorded_key,
+            object_path: object.path.clone(),
+            provenance_path: provenance_path.to_string(),
+            is_module,
+            replacement: PinnedObjectId(u32::MAX),
+            tables: Vec::new(),
+        };
         if is_module
             && !module_id.is_some_and(|id| {
-                relation_matches(module.key, &module.path)
+                relation_matches(&locator, module.key, &module.path)
                     && pinned
                         .summary(id)
                         .is_some_and(|summary| summary.key == recorded_key)
@@ -1181,56 +1386,271 @@ fn scanned_replacement(
         {
             continue;
         }
-        let mut available = BTreeMap::new();
-        let mut target_ids = BTreeSet::new();
-        for table in &module.tables {
-            for entry in &table.entries {
-                let Some(id) = pinned.id_for_scanned(module, entry.object, &entry.object_path)
-                else {
-                    continue;
-                };
-                let relevant = if is_module {
-                    true
-                } else {
-                    relation_matches(entry.object, &entry.object_path)
-                        && pinned
-                            .summary(id)
-                            .is_some_and(|summary| summary.key == recorded_key)
-                };
-                if relevant {
-                    *available
-                        .entry((table.version, entry.name.to_string()))
-                        .or_insert(0usize) += 1;
-                    target_ids.insert(id);
-                }
-            }
-        }
-        if !claims_covered(&needed, &available) {
+        let claims: Vec<_> = module
+            .tables
+            .iter()
+            .map(|table| raw_table_claims(module, table, pinned, &locator))
+            .collect();
+        let Some(assignment) = injective_table_assignment(&requirements, &module.tables, &claims)
+        else {
             continue;
-        }
-        if is_module {
-            if let Some(id) = module_id
-                && !available.is_empty()
-            {
-                replacements.insert(id);
+        };
+        let replacement = if is_module {
+            module_id?
+        } else {
+            let target_ids: BTreeSet<_> = assignment
+                .iter()
+                .flat_map(|table| &module.tables[*table].entries)
+                .filter(|entry| relation_matches(&locator, entry.object, &entry.object_path))
+                .filter_map(|entry| pinned.id_for_scanned(module, entry.object, &entry.object_path))
+                .collect();
+            if target_ids.len() != 1 {
+                continue;
             }
-        } else if target_ids.len() == 1 {
-            replacements.extend(target_ids);
+            *target_ids.first()?
+        };
+        let candidate = CandidateFallbackProof {
+            replacement,
+            tables: assignment
+                .into_iter()
+                .zip(requirements.iter().cloned())
+                .map(|(table, requirement)| CandidateTableProof {
+                    address: module.tables[table].address,
+                    requirement,
+                })
+                .collect(),
+            ..locator
+        };
+        match &selected {
+            Some(existing) if existing.replacement != candidate.replacement => return None,
+            Some(_) => {}
+            None => selected = Some(candidate),
         }
     }
-    let replacement = replacements.pop_first()?;
-    replacements.is_empty().then_some(replacement)
+    selected
 }
 
-fn drop_manifest_targets(manifest: &mut Manifest, stale: &BTreeSet<u32>) {
-    for surface in &mut manifest.surfaces {
-        surface.functions.retain(|function| {
-            !matches!(
-                function.resolution,
-                Resolution::Resolved { object, .. } if stale.contains(&object)
-            )
+fn bound_table_claims(
+    module: &ReconciledModule,
+    table: usize,
+    proof: &CandidateFallbackProof,
+) -> TableClaims {
+    let table_record = &module.scanned.tables[table];
+    let mut all_names = BTreeMap::new();
+    let mut resolved_names = BTreeMap::new();
+    for entry in &table_record.entries {
+        *all_names.entry(entry.name.to_string()).or_insert(0) += 1;
+        if proof.is_module || relation_matches(proof, entry.object, &entry.object_path) {
+            *resolved_names.entry(entry.name.to_string()).or_insert(0) += 1;
+        }
+    }
+    for name in &table_record.null_entries {
+        *all_names.entry((*name).to_string()).or_insert(0) += 1;
+    }
+    for skipped in &table_record.unpinned {
+        *all_names.entry(skipped.subject.clone()).or_insert(0) += 1;
+    }
+    TableClaims {
+        all_names,
+        resolved_names,
+    }
+}
+
+fn bind_fallback_proof(
+    candidate: &CandidateFallbackProof,
+    modules: &[ReconciledModule],
+) -> Option<(PinnedObjectId, BoundFallbackProof)> {
+    let mut matching = modules.iter().filter(|module| {
+        module.scanned.view == candidate.module_view
+            && module.scanned.key == candidate.module_key
+            && module.scanned.path == candidate.module_path
+    });
+    let module = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    let mut bound_tables = Vec::with_capacity(candidate.tables.len());
+    let mut required_targets = BTreeMap::new();
+    let mut replacement_ids = BTreeSet::new();
+    for table_proof in &candidate.tables {
+        let mut matching = module
+            .scanned
+            .tables
+            .iter()
+            .enumerate()
+            .filter(|(_, table)| table.address == table_proof.address);
+        let (table_index, table) = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        let claims = bound_table_claims(module, table_index, candidate);
+        if !requirement_covered(&table_proof.requirement, table, &claims) {
+            return None;
+        }
+        for (name, count) in &table_proof.requirement.resolved_names {
+            let mut remaining = *count;
+            for (entry, object) in table.entries.iter().zip(&module.entry_objects[table_index]) {
+                if entry.name != name
+                    || !candidate.is_module
+                        && !relation_matches(candidate, entry.object, &entry.object_path)
+                {
+                    continue;
+                }
+                replacement_ids.insert(*object);
+                *required_targets
+                    .entry(RequiredTarget {
+                        object: *object,
+                        file_offset: entry.file_offset,
+                        name: name.clone(),
+                    })
+                    .or_insert(0) += 1;
+                remaining -= 1;
+                if remaining == 0 {
+                    break;
+                }
+            }
+            if remaining != 0 {
+                return None;
+            }
+        }
+        bound_tables.push(BoundTableProof {
+            address: table.address,
+            version: table.version,
+            entries: table.entries.len(),
         });
     }
+    let replacement = if candidate.is_module {
+        module.object
+    } else {
+        if replacement_ids.len() != 1 {
+            return None;
+        }
+        *replacement_ids.first()?
+    };
+    Some((
+        replacement,
+        BoundFallbackProof {
+            module: module.object,
+            tables: bound_tables,
+            required_targets,
+        },
+    ))
+}
+
+const FALLBACK_UNUSABLE_REASON: &str = "superseded by exact scan fallback";
+
+fn filter_manifest_fallbacks(manifest: &mut Manifest, stale: &BTreeSet<u32>) -> Result<()> {
+    for surface in &mut manifest.surfaces {
+        for function in &mut surface.functions {
+            if matches!(
+                function.resolution,
+                Resolution::Resolved { object, .. } if stale.contains(&object)
+            ) {
+                function.resolution = Resolution::UnusableFile {
+                    reason: FALLBACK_UNUSABLE_REASON.into(),
+                    path_hex: String::new(),
+                };
+            }
+        }
+    }
+
+    let provenance: Vec<Option<usize>> = manifest
+        .objects
+        .iter()
+        .map(|object| plan::provenance_of(manifest, object))
+        .collect();
+    let mut ids = BTreeMap::new();
+    let mut objects = Vec::new();
+    let mut kept_provenance = BTreeSet::new();
+    for (index, object) in manifest.objects.iter().enumerate() {
+        if stale.contains(&object.id) {
+            continue;
+        }
+        let new_id = u32::try_from(objects.len()).expect("manifest object cap fits u32");
+        ids.insert(object.id, new_id);
+        let mut object = object.clone();
+        object.id = new_id;
+        objects.push(object);
+        if let Some(provenance) = provenance[index] {
+            kept_provenance.insert(provenance);
+        }
+    }
+    manifest.objects = objects;
+    manifest.provenance_objects = std::mem::take(&mut manifest.provenance_objects)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, object)| kept_provenance.contains(&index).then_some(object))
+        .collect();
+    for surface in &mut manifest.surfaces {
+        for function in &mut surface.functions {
+            if let Resolution::Resolved { object, .. } = &mut function.resolution {
+                *object = ids[object];
+            }
+        }
+    }
+    manifest.alias_groups.retain_mut(|group| {
+        let Some(object) = ids.get(&group.object).copied() else {
+            return false;
+        };
+        group.object = object;
+        true
+    });
+    let problems = validate_structure(manifest);
+    if !problems.is_empty() {
+        bail!(
+            "manifest became structurally invalid after stale-object fallback: {}",
+            problems.join("; ")
+        );
+    }
+    Ok(())
+}
+
+fn fallback_proof_in_plan(proof: &BoundFallbackProof, plan: &plan::AttachPlan) -> bool {
+    let mut table_addresses = BTreeSet::new();
+    if proof
+        .tables
+        .iter()
+        .any(|table| !table_addresses.insert(table.address))
+    {
+        return false;
+    }
+    let mut modules = plan
+        .modules
+        .iter()
+        .filter(|module| module.object == proof.module);
+    let Some(module) = modules.next() else {
+        return false;
+    };
+    if modules.next().is_some() {
+        return false;
+    }
+    let mut available_tables = BTreeMap::new();
+    for table in module.tables.iter().filter(|table| table.source == "scan") {
+        *available_tables
+            .entry((table.version, table.entries))
+            .or_insert(0usize) += 1;
+    }
+    let mut required_tables = BTreeMap::new();
+    for table in &proof.tables {
+        *required_tables
+            .entry((table.version, table.entries))
+            .or_insert(0usize) += 1;
+    }
+    if required_tables.iter().any(|(table, count)| {
+        available_tables
+            .get(table)
+            .is_none_or(|available| available < count)
+    }) {
+        return false;
+    }
+    proof.required_targets.keys().all(|required| {
+        plan.slots.iter().any(|slot| {
+            slot.object == required.object
+                && slot.file_offset == required.file_offset
+                && slot.names.iter().any(|name| name == &required.name)
+                && slot.module_ids.contains(&module.id)
+        })
+    })
 }
 
 fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
@@ -1250,6 +1670,7 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
         PinnedObjects::aggregate_views(discovered.scan_inputs.values().map(|input| &input.pins));
     counters.object_skips.extend(aggregation_skips);
     let mut accepted = Vec::new();
+    let mut pending_fallbacks = Vec::new();
     let mut corroborated = BTreeSet::new();
     let mut identity_mismatches = 0usize;
     for (manifest_index, input) in discovered.manifest_inputs.iter().enumerate() {
@@ -1257,10 +1678,11 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
         let manifest_pins = &input.pins;
         let mut stale_ids = BTreeSet::new();
         let mut stale_replacements = BTreeSet::new();
+        let mut stale_candidates = Vec::new();
         let manifest_number = u32::try_from(manifest_index)
             .map_err(|_| anyhow!("too many --manifest inputs to identify fallback evidence"))?;
         for stale in &input.stale {
-            let Some(replacement) =
+            let Some(candidate) =
                 scanned_replacement(&manifest, stale, &scan_modules, &pinned, manifest_pins)
             else {
                 counters.report_notes();
@@ -1271,24 +1693,25 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
                     stale.reason.label(),
                 );
             };
-            if counters.manifest_fallbacks.len() >= p11scope_ebpf_common::MAX_SLOTS as usize {
+            if pending_fallbacks.len() >= p11scope_ebpf_common::MAX_SLOTS as usize {
                 bail!(
                     "more than {} stale manifest objects require fallback",
                     p11scope_ebpf_common::MAX_SLOTS
                 );
             }
             stale_ids.insert(stale.object);
-            if !stale_replacements.insert(replacement) {
+            if !stale_replacements.insert(candidate.replacement) {
                 bail!(
                     "manifest {} maps more than one stale object to the same scanned replacement",
                     input.path.display()
                 );
             }
-            counters.manifest_fallbacks.push(ManifestFallback {
+            stale_candidates.push(candidate.clone());
+            pending_fallbacks.push(PendingManifestFallback {
                 manifest: manifest_number,
                 object: stale.object,
                 reason: stale.reason,
-                replacement,
+                candidate,
             });
             counters.notes.push(format!(
                 "ignoring stale object {} from manifest {} ({}) because the memory scan pinned an exact replacement and covered every dropped function claim",
@@ -1306,9 +1729,11 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
             let matched: Vec<_> = scan_modules
                 .iter()
                 .filter(|module| {
-                    pinned
-                        .id_for_scanned(module, module.key, &module.path)
-                        .is_some_and(|id| stale_replacements.contains(&id))
+                    stale_candidates.iter().any(|candidate| {
+                        module.view == candidate.module_view
+                            && module.key == candidate.module_key
+                            && module.path == candidate.module_path
+                    })
                 })
                 .collect();
             if let Some(first) = matched.first() {
@@ -1320,7 +1745,9 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
             }
             continue;
         }
-        drop_manifest_targets(&mut manifest, &stale_ids);
+        if !stale_ids.is_empty() {
+            filter_manifest_fallbacks(&mut manifest, &stale_ids)?;
+        }
         let view = scan_view(&manifest, &scan_modules, &pinned, manifest_pins);
         let mapped = view
             .as_ref()
@@ -1436,16 +1863,27 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
         );
     }
     counters.object_skips.extend(differed);
-    if let Some(fallback) = counters
-        .manifest_fallbacks
-        .iter()
-        .find(|fallback| pinned.summary(fallback.replacement).is_none())
-    {
-        bail!(
-            "manifest {} object {} lost its exact scanned replacement during identity reconciliation",
-            fallback.manifest,
-            fallback.object
-        );
+    let mut replacements = BTreeSet::new();
+    for pending in pending_fallbacks {
+        let Some((replacement, proof)) = bind_fallback_proof(&pending.candidate, &modules) else {
+            bail!(
+                "manifest {} object {} lost its exact scanned fallback proof during identity reconciliation",
+                pending.manifest,
+                pending.object
+            );
+        };
+        if !replacements.insert(replacement) {
+            bail!(
+                "more than one stale manifest object maps to the same canonical scanned replacement"
+            );
+        }
+        counters.manifest_fallbacks.push(ManifestFallback {
+            manifest: pending.manifest,
+            object: pending.object,
+            reason: pending.reason,
+            replacement,
+            proof,
+        });
     }
     let manifest_fallbacks = counters.manifest_fallbacks.len();
     let plan = build_current_plan(
@@ -1458,18 +1896,13 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
         manifest_fallbacks,
     )
     .inspect_err(|_| counters.report_notes())?;
-    if let Some(fallback) = counters.manifest_fallbacks.iter().find(|fallback| {
-        !plan
-            .modules
-            .iter()
-            .any(|module| module.object == fallback.replacement)
-            && !plan
-                .slots
-                .iter()
-                .any(|slot| slot.object == fallback.replacement)
-    }) {
+    if let Some(fallback) = counters
+        .manifest_fallbacks
+        .iter()
+        .find(|fallback| !fallback_proof_in_plan(&fallback.proof, &plan))
+    {
         bail!(
-            "manifest {} object {} has no scanned replacement in the final attach plan",
+            "manifest {} object {} has no complete scanned fallback proof in the final attach plan",
             fallback.manifest,
             fallback.object
         );
@@ -2089,10 +2522,14 @@ fn fmt_rfc3339(t: SystemTime) -> String {
 mod tests {
     use super::*;
     use p11scope::discovery::identity::{
-        ManifestStaleReason, PinnedObjectId, ReconciledModule, pin_manifest_objects_deferred,
-        pin_scanned_objects, reconcile_scanned_modules,
+        ManifestPinError, ManifestStaleReason, PinnedObjectId, ReconciledModule,
+        pin_manifest_objects_deferred, pin_scanned_objects, reconcile_scanned_modules,
     };
     use p11scope::discovery::scan::{ScannedEntry, ScannedTable, scan_pid};
+    use p11scope_manifest::manifest::{
+        Acquisition, AliasEntry, AliasGroup, FunctionRecord, InterfaceClassification,
+        SurfaceRecord, SurfaceSource, Version, WalkOutcome,
+    };
     use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::os::unix::fs::MetadataExt as _;
@@ -2355,7 +2792,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_identity_stale_object_drops_every_manifest_target_and_offset() {
+    fn discovery_identity_stale_object_with_invalid_offset_is_fatal_before_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let provider = dir.path().join("provider.so");
         std::fs::copy("/bin/sh", &provider).unwrap();
@@ -2369,24 +2806,164 @@ mod tests {
             *file_offset = 0xdead_beef;
         }
         std::fs::copy("/bin/true", &provider).unwrap();
-        let scan = scanned_manifest_replacement(&paths, &targets);
-        let scan_offset = scan.tables[0].entries[0].file_offset;
-        let scan_pins = pin_scan(&scan);
-        let input = manifest_input_from_pinning("identity-stale.json", manifest);
-        assert_eq!(input.stale[0].reason, ManifestStaleReason::IdentityMismatch);
-
-        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
-        let discovered = discovered_from_inputs(vec![view], vec![scan], scan_pins, vec![input]);
-
+        let error = pin_manifest_objects_deferred(&manifest)
+            .expect_err("invalid executable offsets stay fatal before stale fallback");
         assert!(
-            discovered
-                .plan
-                .slots
-                .iter()
-                .all(|slot| slot.file_offset == scan_offset && slot.file_offset != 0xdead_beef)
+            matches!(
+                &error,
+                ManifestPinError::Fatal(problems)
+                    if problems.iter().any(|problem| problem.contains("outside every executable"))
+            ),
+            "{error:?}"
         );
-        assert_eq!(discovered.plan.modules[0].source, "scan");
-        assert_eq!(discovered.counters.manifest_fallbacks.len(), 1);
+    }
+
+    #[test]
+    fn discovery_complementary_partial_tables_do_not_cover_one_stale_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("provider.so");
+        std::fs::copy("/bin/sh", &provider).unwrap();
+        let paths = vec![provider.clone()];
+        let targets = vec![0; 67];
+        let manifest = valid_manifest_for(&paths, &targets);
+        std::fs::copy("/bin/ls", &provider).unwrap();
+        let mut scan = scanned_manifest_replacement(&paths, &targets);
+        let mut second = scan.tables[0].clone();
+        let midpoint = scan.tables[0].entries.len() / 2;
+        second.entries = scan.tables[0].entries.split_off(midpoint);
+        second.address += 0x1000;
+        scan.tables.push(second);
+        let pins = pin_scan(&scan);
+        let input = manifest_input_from_pinning("partial-tables.json", manifest);
+        let mut discovered = lifecycle_discovered(vec![
+            ProcessView::open(ProcessViewId(0), std::process::id()).unwrap(),
+        ]);
+        discovered.scan_inputs.insert(
+            ProcessViewId(0),
+            ScanInput {
+                modules: vec![scan],
+                pins,
+                counters: DiscoveryCounters::default(),
+            },
+        );
+        discovered.manifest_inputs.push(input);
+
+        let error = rebuild_discovered(&mut discovered)
+            .expect_err("two partial tables cannot manufacture one complete proof");
+        assert!(error.to_string().contains("object 0"), "{error:#}");
+    }
+
+    #[test]
+    fn discovery_one_duplicate_table_cannot_prove_two_manifest_surfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("provider.so");
+        std::fs::copy("/bin/sh", &provider).unwrap();
+        let paths = vec![provider.clone()];
+        let targets = vec![0; 67];
+        let mut manifest = valid_manifest_for(&paths, &targets);
+        manifest.interface_list = Acquisition::Ok;
+        manifest.surfaces[0] = SurfaceRecord {
+            source: SurfaceSource::LegacyFunctionList,
+            acquisition: Acquisition::Absent,
+            version: None,
+            walk: WalkOutcome::NotWalked,
+            functions: vec![],
+        };
+        let functions: Vec<_> = pkcs11_module::FUNCTION_LIST_FIELDS
+            .iter()
+            .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS)
+            .map(|field| FunctionRecord {
+                name: field.name.into(),
+                resolution: Resolution::Resolved {
+                    object: 0,
+                    file_offset: object_facts(&provider).2,
+                },
+            })
+            .collect();
+        let interface = |index| SurfaceRecord {
+            source: SurfaceSource::Interface {
+                index,
+                raw_name_hex: Some("504b4353203131".into()),
+                name_lossy: Some("PKCS 11".into()),
+                name_error: None,
+                flags: 0,
+                classification: InterfaceClassification::ExactStandard,
+            },
+            acquisition: Acquisition::Ok,
+            version: Some(Version { major: 3, minor: 0 }),
+            walk: WalkOutcome::Full,
+            functions: functions.clone(),
+        };
+        manifest.surfaces.extend([interface(0), interface(1)]);
+        std::fs::copy("/bin/ls", &provider).unwrap();
+        let mut scan = scanned_manifest_replacement(&paths, &targets);
+        let (key, _, offset) = object_facts(&provider);
+        scan.tables[0].version = (3, 0);
+        scan.tables[0].entries = pkcs11_module::FUNCTION_LIST_FIELDS
+            .iter()
+            .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS)
+            .flat_map(|field| {
+                std::iter::repeat_n(
+                    ScannedEntry {
+                        name: field.name,
+                        object: key,
+                        object_path: provider.display().to_string(),
+                        file_offset: offset,
+                    },
+                    2,
+                )
+            })
+            .collect();
+        let pins = pin_scan(&scan);
+        let input = manifest_input_from_pinning("duplicate-table.json", manifest);
+        let mut discovered = lifecycle_discovered(vec![
+            ProcessView::open(ProcessViewId(0), std::process::id()).unwrap(),
+        ]);
+        discovered.scan_inputs.insert(
+            ProcessViewId(0),
+            ScanInput {
+                modules: vec![scan],
+                pins,
+                counters: DiscoveryCounters::default(),
+            },
+        );
+        discovered.manifest_inputs.push(input);
+
+        let error = rebuild_discovered(&mut discovered)
+            .expect_err("one table cannot be reused for two manifest surfaces");
+        assert!(error.to_string().contains("object 0"), "{error:#}");
+    }
+
+    #[test]
+    fn discovery_stale_module_requires_coverage_for_unresolved_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("provider.so");
+        std::fs::copy("/bin/sh", &provider).unwrap();
+        let paths = vec![provider.clone()];
+        let targets = vec![0; 67];
+        let mut manifest = valid_manifest_for(&paths, &targets);
+        manifest.surfaces[0].functions[66].resolution = Resolution::NullPointer;
+        std::fs::copy("/bin/ls", &provider).unwrap();
+        let mut scan = scanned_manifest_replacement(&paths, &targets);
+        scan.tables[0].entries.pop();
+        let pins = pin_scan(&scan);
+        let input = manifest_input_from_pinning("unresolved-claim.json", manifest);
+        let mut discovered = lifecycle_discovered(vec![
+            ProcessView::open(ProcessViewId(0), std::process::id()).unwrap(),
+        ]);
+        discovered.scan_inputs.insert(
+            ProcessViewId(0),
+            ScanInput {
+                modules: vec![scan],
+                pins,
+                counters: DiscoveryCounters::default(),
+            },
+        );
+        discovered.manifest_inputs.push(input);
+
+        let error = rebuild_discovered(&mut discovered)
+            .expect_err("discarded unresolved records still require table coverage");
+        assert!(error.to_string().contains("object 0"), "{error:#}");
     }
 
     #[test]
@@ -2394,23 +2971,56 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = dir.path().join("provider.so");
         let replaced = dir.path().join("replaced.so");
-        std::fs::copy("/bin/sh", &provider).unwrap();
-        std::fs::copy("/bin/sh", &replaced).unwrap();
-        let paths = vec![provider.clone(), replaced.clone()];
+        let fresh = dir.path().join("fresh.so");
+        for path in [&provider, &replaced, &fresh] {
+            std::fs::copy("/bin/sh", path).unwrap();
+        }
+        let paths = vec![provider.clone(), replaced.clone(), fresh.clone()];
         let mut targets = vec![0; 67];
         targets[0] = 1;
+        targets[1] = 2;
+        targets[2] = 2;
+        targets[3] = 1;
         let mut manifest = valid_manifest_for(&paths, &targets);
-        let Resolution::Resolved { file_offset, .. } =
-            &mut manifest.surfaces[0].functions[0].resolution
-        else {
-            unreachable!()
-        };
-        *file_offset = 0xdead_beef;
+        let stale_offset = object_facts(&replaced).2;
+        let fresh_offset = object_facts(&fresh).2;
+        manifest.alias_groups = vec![
+            AliasGroup {
+                object: 1,
+                file_offset: stale_offset,
+                entries: vec![
+                    AliasEntry {
+                        surface: 0,
+                        name: manifest.surfaces[0].functions[0].name.clone(),
+                    },
+                    AliasEntry {
+                        surface: 0,
+                        name: manifest.surfaces[0].functions[3].name.clone(),
+                    },
+                ],
+            },
+            AliasGroup {
+                object: 2,
+                file_offset: fresh_offset,
+                entries: vec![
+                    AliasEntry {
+                        surface: 0,
+                        name: manifest.surfaces[0].functions[1].name.clone(),
+                    },
+                    AliasEntry {
+                        surface: 0,
+                        name: manifest.surfaces[0].functions[2].name.clone(),
+                    },
+                ],
+            },
+        ];
 
-        std::fs::copy("/bin/true", &replaced).unwrap();
-        let scan = scanned_manifest_replacement(&paths, &targets);
-        let provider_offset = scan.tables[0].entries[1].file_offset;
-        let replacement_offset = scan.tables[0].entries[0].file_offset;
+        std::fs::copy("/bin/ls", &replaced).unwrap();
+        let mut scan_targets = targets.clone();
+        scan_targets[1] = 0;
+        scan_targets[2] = 0;
+        let mut scan = scanned_manifest_replacement(&paths, &scan_targets);
+        scan.tables[0].entries[4].file_offset += 1;
         let scan_pins = pin_scan(&scan);
         let input = manifest_input_from_pinning("mixed-valid.json", manifest);
         assert_eq!(input.stale.len(), 1);
@@ -2419,25 +3029,82 @@ mod tests {
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let discovered = discovered_from_inputs(vec![view], vec![scan], scan_pins, vec![input]);
 
-        let offsets: BTreeSet<_> = discovered
-            .plan
-            .slots
-            .iter()
-            .map(|slot| slot.file_offset)
-            .collect();
-        assert_eq!(
-            offsets,
-            BTreeSet::from([provider_offset, replacement_offset])
-        );
-        assert!(!offsets.contains(&0xdead_beef));
         assert_eq!(discovered.counters.manifest_fallbacks.len(), 1);
         assert_eq!(discovered.discovery.manifest_object_fallbacks.len(), 1);
-        assert!(
-            discovered.discovery.modules[0]
-                .corroboration
-                .contains(&"agreed"),
-            "{:?}",
-            discovered.discovery.modules[0].corroboration,
+        assert_eq!(discovered.manifests.len(), 1);
+        let filtered = &discovered.manifests[0];
+        assert_eq!(filtered.surfaces.len(), 1);
+        assert_eq!(filtered.surfaces[0].walk, WalkOutcome::Full);
+        assert_eq!(filtered.surfaces[0].functions.len(), 67);
+        for index in [0, 3] {
+            assert!(matches!(
+                &filtered.surfaces[0].functions[index].resolution,
+                Resolution::UnusableFile { reason, path_hex }
+                    if reason == "superseded by exact scan fallback" && path_hex.is_empty()
+            ));
+        }
+        for index in [1, 2] {
+            assert!(matches!(
+                filtered.surfaces[0].functions[index].resolution,
+                Resolution::Resolved { object: 1, file_offset } if file_offset == fresh_offset
+            ));
+        }
+        assert_eq!(
+            filtered
+                .objects
+                .iter()
+                .map(|object| (object.id, object.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, provider.to_str().unwrap()),
+                (1, fresh.to_str().unwrap())
+            ]
+        );
+        assert_eq!(
+            filtered
+                .provenance_objects
+                .iter()
+                .map(|object| object.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![provider.to_str().unwrap(), fresh.to_str().unwrap()]
+        );
+        assert_eq!(filtered.alias_groups.len(), 1);
+        assert_eq!(filtered.alias_groups[0].object, 1);
+        assert_eq!(filtered.alias_groups[0].entries.len(), 2);
+        let module_objects = &discovered.discovery.modules[0].objects;
+        let sources_for = |path: &Path| {
+            let key = object_facts(path).0;
+            module_objects
+                .iter()
+                .find(|object| {
+                    object.dev == (key.device.major, key.device.minor) && object.ino == key.inode
+                })
+                .map(|object| object.sources.as_slice())
+        };
+        assert_eq!(
+            sources_for(&provider),
+            Some(["scan", "manifest"].as_slice())
+        );
+        assert_eq!(sources_for(&replaced), Some(["scan"].as_slice()));
+        assert_eq!(sources_for(&fresh), Some(["manifest"].as_slice()));
+        assert_eq!(discovered.plan.entries_seen, 134);
+        assert_eq!(discovered.plan.surfaces.len(), 2);
+        assert_eq!(
+            discovered.plan.modules[0]
+                .tables
+                .iter()
+                .map(|table| (table.source, table.entries))
+                .collect::<Vec<_>>(),
+            vec![("scan", 67), ("manifest", 67)]
+        );
+        assert_eq!(
+            discovered
+                .plan
+                .skipped
+                .iter()
+                .filter(|skip| skip.reason == "superseded by exact scan fallback")
+                .count(),
+            2
         );
     }
 
@@ -2455,7 +3122,7 @@ mod tests {
         manifest_targets[0] = 1;
         let manifest = valid_manifest_for(&paths, &manifest_targets);
 
-        std::fs::copy("/bin/true", &replaced).unwrap();
+        std::fs::copy("/bin/ls", &replaced).unwrap();
         let owner_scan = scanned_manifest_replacement(&paths, &vec![0; 67]);
         let unrelated_scan =
             scanned_manifest_replacement(&[unrelated, replaced], &manifest_targets);
@@ -2486,6 +3153,93 @@ mod tests {
         let error = rebuild_discovered(&mut discovered)
             .expect_err("only the exact manifest module's scan view may replace its dependency");
         assert!(error.to_string().contains("object 1"), "{error:#}");
+    }
+
+    #[test]
+    fn discovery_fallback_fails_when_the_proof_module_is_refused_at_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("provider.so");
+        let replaced = dir.path().join("replaced.so");
+        let unrelated = dir.path().join("unrelated.so");
+        for path in [&provider, &replaced, &unrelated] {
+            std::fs::copy("/bin/sh", path).unwrap();
+        }
+        let paths = vec![provider.clone(), replaced.clone()];
+        let mut targets = vec![0; 67];
+        targets[0] = 1;
+        let manifest = valid_manifest_for(&paths, &targets);
+        std::fs::copy("/bin/ls", &replaced).unwrap();
+
+        let mut proof_module = scanned_manifest_replacement(&paths, &targets);
+        let (provider_key, _, _) = object_facts(&provider);
+        proof_module.tables[0]
+            .entries
+            .extend(
+                (0..p11scope_ebpf_common::MAX_SLOTS).map(|index| ScannedEntry {
+                    name: "C_Initialize",
+                    object: provider_key,
+                    object_path: provider.display().to_string(),
+                    file_offset: 0x1000_0000 + u64::from(index),
+                }),
+            );
+        let unrelated_module = scanned_manifest_replacement(&[unrelated, replaced], &targets);
+        let modules = vec![proof_module, unrelated_module];
+        let (pins, skipped) = pin_scanned_objects(
+            std::process::id(),
+            &modules,
+            &mut CaptureWorkBudget::default(),
+        )
+        .unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let input = manifest_input_from_pinning("capacity-proof.json", manifest);
+        let mut discovered = lifecycle_discovered(vec![
+            ProcessView::open(ProcessViewId(0), std::process::id()).unwrap(),
+        ]);
+        discovered.scan_inputs.insert(
+            ProcessViewId(0),
+            ScanInput {
+                modules,
+                pins,
+                counters: DiscoveryCounters::default(),
+            },
+        );
+        discovered.manifest_inputs.push(input);
+
+        let error = rebuild_discovered(&mut discovered).expect_err(
+            "an unrelated admitted module using the dependency cannot preserve the proof",
+        );
+        assert!(error.to_string().contains("proof"), "{error:#}");
+    }
+
+    #[test]
+    fn discovery_fallback_binding_rejects_a_proof_table_lost_during_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("provider.so");
+        std::fs::copy("/bin/sh", &provider).unwrap();
+        let paths = vec![provider.clone()];
+        let targets = vec![0; 67];
+        let manifest = valid_manifest_for(&paths, &targets);
+        std::fs::copy("/bin/ls", &provider).unwrap();
+        let scan = scanned_manifest_replacement(&paths, &targets);
+        let mut pins = pin_scan(&scan);
+        let input = manifest_input_from_pinning("reconciliation-loss.json", manifest);
+        let proof = scanned_replacement(
+            &input.manifest,
+            &input.stale[0],
+            std::slice::from_ref(&scan),
+            &pins,
+            &input.pins,
+        )
+        .expect("the pristine scan table proves the pending fallback");
+        let (mut reconciled, _, _) =
+            reconcile_scanned_modules(std::slice::from_ref(&scan), &mut pins);
+        reconciled[0].scanned.tables.clear();
+        reconciled[0].entry_objects.clear();
+
+        assert!(
+            bind_fallback_proof(&proof, &reconciled).is_none(),
+            "a candidate locator is not proof after its exact table is gone"
+        );
     }
 
     #[test]
@@ -2522,7 +3276,7 @@ mod tests {
             &[provider.clone(), replaced.clone(), sole.clone()],
             &targets,
         );
-        std::fs::copy("/bin/true", &replaced).unwrap();
+        std::fs::copy("/bin/ls", &replaced).unwrap();
         std::fs::remove_file(&sole).unwrap();
 
         let mut scan_targets = targets.clone();

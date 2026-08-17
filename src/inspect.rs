@@ -108,6 +108,7 @@ fn render_module(out: &mut String, module: &ScannedModule, pinned: &PinnedObject
                 "unreadable" => "(unreadable)",
                 _ => "(unknown)",
             });
+        let name = name.escape_default();
         let target = interface
             .table
             .and_then(|index| module.tables.get(index))
@@ -347,6 +348,22 @@ mod tests {
         assert!(
             out.contains("PKCS 11"),
             "inspect may show interface names: {out}"
+        );
+    }
+
+    #[test]
+    fn text_escapes_interface_name_quotes_and_ascii_controls() {
+        let mut outcome = sample();
+        let ScanOutcome::Scanned { modules, .. } = &mut outcome else {
+            unreachable!()
+        };
+        modules[0].interfaces[0].name_lossy = Some("quote\"\\\n\r\t\u{1b}".into());
+
+        let out = render_text(4242, &outcome, &PinnedObjects::empty());
+        assert!(out.contains(r#""quote\"\\\n\r\t\u{1b}""#), "{out:?}");
+        assert!(
+            !out.contains("quote\"\\\n"),
+            "raw controls reached text output: {out:?}"
         );
     }
 

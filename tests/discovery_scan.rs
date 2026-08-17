@@ -12,6 +12,8 @@ use p11scope::discovery::scan::{
 };
 use p11scope_manifest::manifest::{Resolution, SurfaceSource};
 use std::collections::BTreeMap;
+use std::os::fd::AsRawFd as _;
+use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -197,8 +199,10 @@ static char vendor_name[] = "Acme Vendor ABI";
 
 static CK_INTERFACE published[] = {
     {standard_name, &published_table, 0},
-    {vendor_name, &published_table, 0},
+    {vendor_name, &published_table, 0x55},
 };
+
+void p11scope_set_vendor_name(char *name) { published[1].pInterfaceName = name; }
 
 CK_RV C_GetFunctionList(void **out) {
     if (!out) return 1;
@@ -258,6 +262,125 @@ fn interfaces_are_recorded_with_their_name_class() {
             .all(|i| i.table.is_some_and(|index| index < module.tables.len())),
         "{:?}",
         module.interfaces
+    );
+}
+
+#[test]
+fn interface_names_do_not_cross_readable_vmas() {
+    const PREFIX: &[u8] = b"EDGE";
+    const ADJACENT: &[u8] = b"ADJACENT_SECRET\0";
+
+    let dir = tmp("scan-interface-vma-boundary");
+    let source = dir.join("interface_array.c");
+    std::fs::write(&source, INTERFACE_ARRAY_FIXTURE).unwrap();
+    let so = compile(&dir, "vma-ifaces", &source, &[]);
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+    assert!(page.is_power_of_two());
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&so)
+        .unwrap();
+    let first_offset = file.metadata().unwrap().len().next_multiple_of(page as u64);
+    file.set_len(first_offset + 3 * page as u64).unwrap();
+    file.write_all_at(PREFIX, first_offset + page as u64 - PREFIX.len() as u64)
+        .unwrap();
+    file.write_all_at(ADJACENT, first_offset + 2 * page as u64)
+        .unwrap();
+
+    let reserved = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            2 * page,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(reserved, libc::MAP_FAILED);
+    let first = unsafe {
+        libc::mmap(
+            reserved,
+            page,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE | libc::MAP_FIXED,
+            file.as_raw_fd(),
+            first_offset as libc::off_t,
+        )
+    };
+    assert_eq!(first, reserved);
+    let second_address = unsafe { reserved.cast::<u8>().add(page).cast() };
+    let second = unsafe {
+        libc::mmap(
+            second_address,
+            page,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE | libc::MAP_FIXED,
+            file.as_raw_fd(),
+            (first_offset + 2 * page as u64) as libc::off_t,
+        )
+    };
+    assert_eq!(second, second_address);
+    let name = unsafe { reserved.cast::<u8>().add(page - PREFIX.len()) };
+
+    load_and_populate(&so);
+    let path = std::ffi::CString::new(so.to_str().unwrap()).unwrap();
+    let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    assert!(!handle.is_null());
+    let symbol = std::ffi::CString::new("p11scope_set_vendor_name").unwrap();
+    let setter = unsafe { libc::dlsym(handle, symbol.as_ptr()) };
+    assert!(!setter.is_null());
+    let setter: extern "C" fn(*mut libc::c_char) = unsafe { std::mem::transmute(setter) };
+    setter(name.cast());
+
+    let maps = p11scope_manifest::maps::parse_maps(
+        &std::fs::read(format!("/proc/{}/maps", std::process::id())).unwrap(),
+    )
+    .unwrap();
+    let name_address = name as u64;
+    let containing = maps
+        .iter()
+        .find(|entry| entry.start <= name_address && name_address < entry.end)
+        .unwrap();
+    assert_eq!(containing.end, name_address + PREFIX.len() as u64);
+    let adjacent = maps
+        .iter()
+        .find(|entry| entry.start == containing.end)
+        .unwrap();
+    assert_eq!(
+        (adjacent.device, adjacent.inode),
+        (containing.device, containing.inode)
+    );
+
+    let outcome = scan_self(&[so.clone()]);
+    assert_eq!(unsafe { libc::munmap(reserved, 2 * page) }, 0);
+    let module = outcome
+        .modules()
+        .iter()
+        .find(|module| module.path.ends_with("vma-ifaces.so"))
+        .unwrap();
+    let boundary = module
+        .interfaces
+        .iter()
+        .find(|interface| interface.flags == 0x55)
+        .unwrap();
+    assert_eq!(boundary.name_class, "unreadable");
+    assert_eq!(boundary.name_lossy, None);
+
+    let text = p11scope::inspect::render_text(
+        std::process::id(),
+        &outcome,
+        &p11scope::discovery::identity::PinnedObjects::empty(),
+    );
+    assert!(
+        !text.contains("EDGE"),
+        "unterminated prefix became a name: {text}"
+    );
+    assert!(
+        !text.contains("ADJACENT_SECRET"),
+        "adjacent VMA bytes became a name: {text}"
     );
 }
 

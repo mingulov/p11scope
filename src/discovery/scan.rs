@@ -189,9 +189,9 @@ pub struct ScannedTable {
 pub struct ScannedInterface {
     pub index: usize,
     /// "exact_standard" | "other" | "null" | "unreadable". "unreadable" covers all
-    /// three ways a name does not become text: the read failed, the name ran past
-    /// `INTERFACE_NAME_CAP`, or the pointer was outside this object's readable pages
-    /// and was deliberately not dereferenced.
+    /// ways a name does not become text: the read failed, no NUL appeared before the
+    /// mapping end or `INTERFACE_NAME_CAP`, or the pointer was outside this object's
+    /// readable pages and was deliberately not dereferenced.
     pub name_class: &'static str,
     /// Kept for `inspect` and manifests only; never rendered in capture output.
     pub name_lossy: Option<String>,
@@ -514,27 +514,37 @@ fn scan_interfaces(
             // pointer of a look-alike structure could aim anywhere. Only this object's
             // own readable pages — where a provider keeps its interface names — are
             // ever dereferenced; anything else is recorded without being read.
-            let readable_here = matches!(
+            let mapping_end = matches!(
                 resolve(maps, name_ptr),
                 Resolved::File {
                     device, inode, permissions, ..
                 } if permissions[0] == b'r' && ObjectKey { device, inode } == key
-            );
+            )
+            .then(|| {
+                maps.iter()
+                    .find(|entry| entry.start <= name_ptr && name_ptr < entry.end)
+                    .map(|entry| entry.end)
+            })
+            .flatten();
             let (name_class, name_lossy) = match name_ptr {
                 0 => ("null", None),
-                _ if !readable_here => ("unreadable", None),
-                _ => match read_name(mem, name_ptr, budget, operation_bytes) {
-                    Ok(Some(raw)) if raw == STANDARD_INTERFACE_NAME => (
-                        "exact_standard",
-                        Some(String::from_utf8_lossy(&raw).into_owned()),
-                    ),
-                    Ok(Some(raw)) => ("other", Some(String::from_utf8_lossy(&raw).into_owned())),
-                    Ok(None) => ("unreadable", None),
-                    Err(()) => {
-                        io_exhausted = true;
-                        ("unreadable", None)
+                _ if mapping_end.is_none() => ("unreadable", None),
+                _ => {
+                    match read_name(mem, name_ptr, mapping_end.unwrap(), budget, operation_bytes) {
+                        Ok(Some(raw)) if raw == STANDARD_INTERFACE_NAME => (
+                            "exact_standard",
+                            Some(String::from_utf8_lossy(&raw).into_owned()),
+                        ),
+                        Ok(Some(raw)) => {
+                            ("other", Some(String::from_utf8_lossy(&raw).into_owned()))
+                        }
+                        Ok(None) => ("unreadable", None),
+                        Err(()) => {
+                            io_exhausted = true;
+                            ("unreadable", None)
+                        }
                     }
-                },
+                }
             };
             Some(ScannedInterface {
                 index: 0,
@@ -557,17 +567,22 @@ fn scan_interfaces(
 }
 
 /// A NUL-terminated name of at most `INTERFACE_NAME_CAP` bytes, or `None` when the
-/// target memory could not be read or the name runs past the cap.
+/// target memory could not be read or the name reaches the mapping end or cap.
 fn read_name(
     mem: &File,
     address: u64,
+    mapping_end: u64,
     budget: &mut CaptureWorkBudget,
     operation_bytes: &mut u64,
 ) -> Result<Option<Vec<u8>>, ()> {
-    let mut raw: Vec<u8> = Vec::with_capacity(INTERFACE_NAME_CAP);
-    while raw.len() < INTERFACE_NAME_CAP {
+    let Some(mapping_bytes) = mapping_end.checked_sub(address) else {
+        return Ok(None);
+    };
+    let limit = mapping_bytes.min(INTERFACE_NAME_CAP as u64) as usize;
+    let mut raw: Vec<u8> = Vec::with_capacity(limit);
+    while raw.len() < limit {
         let mut chunk = [0u8; 32];
-        let want = chunk.len().min(INTERFACE_NAME_CAP - raw.len());
+        let want = chunk.len().min(limit - raw.len());
         let Some(at) = address.checked_add(raw.len() as u64) else {
             return Ok(None);
         };

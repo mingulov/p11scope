@@ -134,6 +134,41 @@ fn capacity_overflow_skips_whole_modules_and_says_which() {
     );
 }
 
+#[test]
+fn an_oversized_module_does_not_refuse_a_later_module_that_fits() {
+    let oversized_entries: Vec<(&'static str, u64, u64)> = (0..513u64)
+        .map(|i| ("C_Sign", 1, 0x1000 + i * 0x10))
+        .collect();
+    let plan = build_from_modules(&[
+        module(1, "/opt/oversized.so", &oversized_entries),
+        module(
+            2,
+            "/opt/small.so",
+            &[("C_Initialize", 2, 0x100), ("C_Sign", 2, 0x200)],
+        ),
+    ]);
+
+    assert_eq!(
+        plan.slots.len(),
+        2,
+        "the later module fits and must attach whole"
+    );
+    assert!(plan.slots.iter().all(|slot| slot.object.inode == 2));
+    assert_eq!(plan.modules.len(), 1);
+    assert_eq!(plan.modules[0].path, "/opt/small.so");
+    assert!(plan.slots.len() <= p11scope_ebpf_common::MAX_SLOTS as usize);
+    assert_eq!(
+        plan.modules_skipped.len(),
+        1,
+        "only the oversized module is refused"
+    );
+    assert_eq!(plan.modules_skipped[0].subject, "/opt/oversized.so");
+    let reason = &plan.modules_skipped[0].reason;
+    assert!(reason.contains("module needs 513 more"), "{reason}");
+    assert!(reason.contains("0 are in use"), "{reason}");
+    assert!(reason.contains("512 attach slots"), "{reason}");
+}
+
 // Session-scoped semantic state is keyed by the module that issued the handle:
 // a proxy and the backend it loads live in one process and each hand out their
 // own handle space, so handle 5 from one is not handle 5 from the other.

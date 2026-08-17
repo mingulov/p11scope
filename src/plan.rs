@@ -237,10 +237,6 @@ fn merge(
     let mut skipped = Vec::new();
     let mut surfaces = Vec::new();
     let mut entries_seen = 0usize;
-    // Once one module does not fit, every later one is refused too: which of the
-    // remaining modules happens to overlap an attached one must not decide the report.
-    let mut refusing = false;
-
     for module in discovered {
         let wanted: BTreeSet<(ObjectKey, u64)> = module
             .targets
@@ -248,8 +244,7 @@ fn merge(
             .map(|target| (target.object, target.file_offset))
             .filter(|target| !positions.contains_key(target))
             .collect();
-        if refusing || building.len() + wanted.len() > capacity {
-            refusing = true;
+        if building.len() + wanted.len() > capacity {
             modules_skipped.push(Skipped {
                 subject: module.path.to_string(),
                 reason: format!(

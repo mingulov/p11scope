@@ -6,16 +6,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::{AsRawFd as _, RawFd};
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 
 use p11scope_manifest::identity::{
-    IdentityKind, ObjectIdentity, inspect_file, mapping_file_key, open_object,
+    IdentityKind, ObjectIdentity, inspect_file, inspect_file_with_reader, mapping_file_key,
+    open_object,
 };
 use p11scope_manifest::manifest::{Manifest, Resolution};
 use p11scope_manifest::maps::{Device, ObjectKey};
 
-use crate::discovery::scan::{CaptureWorkBudget, ScannedModule, Skipped};
+use crate::discovery::scan::{CaptureWorkBudget, IO_CEILING_REASON, ScannedModule, Skipped};
 use crate::manifest_input::{MAX_TOTAL_OBJECT_BYTES, validate_structure};
 use crate::process::PidPin;
 
@@ -660,20 +661,26 @@ fn pin_scanned_object(
         ));
     }
     let before = pin_of(&file)?;
-    // Checked before the hash, which reads the object whole. Over budget is a skip,
-    // never a partial digest.
-    if !budget.charge_io(before.size) {
+    // The per-file rule can be decided from metadata. Aggregate admission happens
+    // incrementally at the reader below, and a partial digest is never trusted.
+    if before.size > budget.limits().per_object_bytes {
         let limits = budget.limits();
         return Err(format!(
-            "too_large ({} bytes; caps are {} per object and {} per capture, {} \
-             already attempted)",
-            before.size,
-            limits.per_object_bytes,
-            limits.total_bytes,
-            budget.attempted_io_bytes()
+            "too_large ({} bytes; per-object cap is {})",
+            before.size, limits.per_object_bytes,
         ));
     }
-    let inspected = inspect_file(&file)?;
+    let mut operation_bytes = 0u64;
+    let inspected = inspect_file_with_reader(&file, |file, bytes, offset| {
+        let allowed = budget.allowed_io(operation_bytes, bytes.len());
+        if allowed == 0 {
+            return Err(std::io::Error::other(IO_CEILING_REASON));
+        }
+        let read = file.read_at(&mut bytes[..allowed], offset)?;
+        budget.record_io(read);
+        operation_bytes += read as u64;
+        Ok(read)
+    })?;
     // The pin was taken before the bytes were hashed; a write that lands during the
     // hash must not become the baseline the capture trusts.
     if pin_of(&file)? != before {

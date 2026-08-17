@@ -153,7 +153,16 @@ pub fn open_regular(path: &Path) -> Result<std::fs::File, String> {
 
 #[cfg(feature = "identify")]
 pub fn inspect_file(file: &std::fs::File) -> Result<InspectedObject, String> {
-    let data = read_object_bytes(file)?;
+    inspect_file_with_reader(file, |file, bytes, offset| file.read_at(bytes, offset))
+}
+
+/// Inspect one object while letting a caller enforce accounting at each actual read.
+#[cfg(feature = "identify")]
+pub fn inspect_file_with_reader(
+    file: &std::fs::File,
+    reader: impl FnMut(&std::fs::File, &mut [u8], u64) -> std::io::Result<usize>,
+) -> Result<InspectedObject, String> {
+    let data = read_object_bytes_with(file, reader)?;
     let object = object::File::parse(&*data)
         .map_err(|error| format!("not parseable as an object file: {error}"))?;
     if object.format() != BinaryFormat::Elf {
@@ -205,6 +214,14 @@ pub fn inspect_file(file: &std::fs::File) -> Result<InspectedObject, String> {
 
 #[cfg(feature = "identify")]
 pub(crate) fn read_object_bytes(file: &std::fs::File) -> Result<Vec<u8>, String> {
+    read_object_bytes_with(file, |file, bytes, offset| file.read_at(bytes, offset))
+}
+
+#[cfg(feature = "identify")]
+fn read_object_bytes_with(
+    file: &std::fs::File,
+    mut reader: impl FnMut(&std::fs::File, &mut [u8], u64) -> std::io::Result<usize>,
+) -> Result<Vec<u8>, String> {
     let metadata = file
         .metadata()
         .map_err(|error| format!("metadata failed: {error}"))?;
@@ -220,16 +237,23 @@ pub(crate) fn read_object_bytes(file: &std::fs::File) -> Result<Vec<u8>, String>
     let len: usize = len
         .try_into()
         .map_err(|_| "object length does not fit usize")?;
-    let mut data = vec![0u8; len];
-    let mut done = 0;
-    while done < data.len() {
-        let read = file
-            .read_at(&mut data[done..], done as u64)
-            .map_err(|error| format!("read failed: {error}"))?;
+    let mut data = Vec::with_capacity(len.min(1024 * 1024));
+    while data.len() < len {
+        let done = data.len();
+        let want = (len - done).min(1024 * 1024);
+        data.resize(done + want, 0);
+        let read = match reader(file, &mut data[done..], done as u64) {
+            Ok(read) => read,
+            Err(error) => {
+                data.truncate(done);
+                return Err(format!("read failed: {error}"));
+            }
+        };
         if read == 0 {
-            return Err(format!("short read: {done} of {} bytes", data.len()));
+            data.truncate(done);
+            return Err(format!("short read: {done} of {len} bytes"));
         }
-        done += read;
+        data.truncate(done + read);
     }
     Ok(data)
 }

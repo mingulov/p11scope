@@ -466,7 +466,7 @@ fn the_per_capture_byte_cap_accumulates_across_objects() {
     assert_eq!(
         skipped
             .iter()
-            .filter(|s| s.reason.contains("too_large"))
+            .filter(|s| s.reason.contains("capture attempted-I/O ceiling"))
             .count(),
         1,
         "the object over the running total must be reported: {skipped:?}"
@@ -512,7 +512,7 @@ fn separate_process_scans_cannot_renew_the_capture_byte_budget() {
             && second_outcome
                 .skipped()
                 .iter()
-                .any(|skip| skip.reason.contains("too_large")),
+                .any(|skip| skip.reason.contains("capture attempted-I/O ceiling")),
         "a later process scan must not receive a fresh capture allowance: {second_outcome:?}"
     );
 }
@@ -555,6 +555,41 @@ fn the_per_object_byte_cap_is_enforced_as_a_skip_not_a_truncation() {
     assert!(
         skipped.iter().any(|s| s.reason.contains("too_large")),
         "the cap must be reported as too_large: {skipped:?}"
+    );
+}
+
+#[test]
+fn scan_budget_charges_only_the_prefix_read_before_aggregate_exhaustion() {
+    let dir = tmp("scan-prefix-budget");
+    let so = build_fixture(&dir, "prefix-capped", &["-DMATRIX_INTERFACES=0"]);
+    load_and_populate(&so);
+    let total_bytes = readable_data_bytes(&so) - 1;
+    let hooks = HookRegistry::builtin();
+    let mut budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 64 * 1024 * 1024,
+        total_bytes,
+    });
+    let outcome = scan_pid(
+        &ScanRequest {
+            pid: std::process::id(),
+            hints: &[so],
+            hooks: &hooks,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(
+        budget.attempted_io_bytes(),
+        total_bytes,
+        "only the bytes actually read before the next refused read are charged"
+    );
+    assert!(
+        outcome
+            .skipped()
+            .iter()
+            .any(|skip| skip.reason.contains("capture") && skip.reason.contains("ceiling")),
+        "the unread remainder must be explicit: {:?}",
+        outcome.skipped()
     );
 }
 

@@ -1337,6 +1337,41 @@ mod tests {
     }
 
     #[test]
+    fn bounded_decode_omissions_render_finite_partial_evidence() {
+        use crate::discovery::scan::Skipped;
+
+        for reason in [
+            "capture table decode ceiling reached (512 candidates, 53248 entries); remaining \
+             table data was not decoded",
+            "capture interface decode ceiling reached (512 records); remaining interface data \
+             was not decoded",
+        ] {
+            let mut ev = evidence();
+            ev.skipped = vec![capture_skipped_out(&Skipped {
+                subject: "/private/provider.so".into(),
+                reason: reason.into(),
+            })];
+            ev.verdict();
+            assert_eq!(ev.completeness, "PARTIAL");
+            let profile = profile_json(
+                &reports_fixture(),
+                &ev,
+                &state_fixture(),
+                &capture_fixture(),
+            );
+            assert_eq!(profile["evidence"]["completeness"], "PARTIAL");
+            assert_eq!(
+                profile["evidence"]["skipped"][0],
+                serde_json::json!({
+                    "name": "discovery subject",
+                    "reason": "discovery unavailable",
+                })
+            );
+            assert!(!profile.to_string().contains("/private/provider.so"));
+        }
+    }
+
+    #[test]
     fn v2_json_publishes_modules_and_per_function_module_identity() {
         let v = profile_json(
             &reports_fixture(),

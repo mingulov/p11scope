@@ -712,36 +712,64 @@ fn an_object_over_the_byte_budget_is_skipped_naming_the_cap() {
     let (exe, modules) = scan_self();
     // Sized from live data: one byte under the object the scan actually reported.
     let len = std::fs::metadata(&exe).unwrap().len();
-    for limits in [
-        ScanLimits {
-            per_object_bytes: len - 1,
-            total_bytes: u64::MAX,
-        },
-        ScanLimits {
-            per_object_bytes: u64::MAX,
-            total_bytes: len - 1,
-        },
-    ] {
-        let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
-            std::process::id(),
-            &modules,
-            &mut CaptureWorkBudget::new(limits),
-        )
-        .unwrap();
-        assert_eq!(
-            pinned.pinned().count(),
-            0,
-            "an object over budget is never hashed"
-        );
-        assert_eq!(skipped.len(), 1, "{skipped:?}");
-        let reason = &skipped[0].reason;
-        assert!(
-            reason.starts_with("too_large")
-                && reason.contains(&format!("{len} bytes"))
-                && reason.contains(&(len - 1).to_string()),
-            "the reason must name the object's size and the cap it broke: {reason}"
-        );
-    }
+    let limits = ScanLimits {
+        per_object_bytes: len - 1,
+        total_bytes: u64::MAX,
+    };
+    let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
+        std::process::id(),
+        &modules,
+        &mut CaptureWorkBudget::new(limits),
+    )
+    .unwrap();
+    assert_eq!(
+        pinned.pinned().count(),
+        0,
+        "an object over budget is never hashed"
+    );
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    let reason = &skipped[0].reason;
+    assert!(
+        reason.starts_with("too_large")
+            && reason.contains(&format!("{len} bytes"))
+            && reason.contains(&(len - 1).to_string()),
+        "the reason must name the object's size and the cap it broke: {reason}"
+    );
+}
+
+#[test]
+fn hash_budget_charges_the_prefix_read_before_aggregate_exhaustion() {
+    use p11scope::discovery::scan::ScanLimits;
+
+    let (exe, modules) = scan_self();
+    let len = std::fs::metadata(exe).unwrap().len();
+    let total_bytes = len - 1;
+    let mut budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: len,
+        total_bytes,
+    });
+    let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
+        std::process::id(),
+        &modules,
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(
+        pinned.pinned().count(),
+        0,
+        "a partial digest is never trusted"
+    );
+    assert_eq!(
+        budget.attempted_io_bytes(),
+        total_bytes,
+        "the completed prefix remains charged"
+    );
+    assert!(
+        skipped
+            .iter()
+            .any(|skip| skip.reason.contains("capture") && skip.reason.contains("ceiling")),
+        "the unread hash remainder must be explicit: {skipped:?}"
+    );
 }
 
 #[test]
@@ -787,7 +815,9 @@ fn a_failed_hash_attempt_still_consumes_the_capture_budget() {
         "a retry cannot regain spent bytes"
     );
     assert!(
-        skipped.iter().any(|skip| skip.reason.contains("too_large")),
+        skipped
+            .iter()
+            .any(|skip| skip.reason.contains("capture attempted-I/O ceiling")),
         "the shared budget exhaustion must be explicit: {skipped:?}"
     );
 }

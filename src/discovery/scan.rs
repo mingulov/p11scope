@@ -25,6 +25,8 @@ const STANDARD_INTERFACE_NAME: &[u8] = b"PKCS 11";
 const MAX_TABLE_CANDIDATES: usize = 512;
 const MAX_DECODED_TABLE_ENTRIES: usize = 512 * 104;
 const MAX_INTERFACE_RECORDS: usize = 512;
+pub(crate) const IO_CEILING_REASON: &str =
+    "capture attempted-I/O ceiling reached; remaining provider bytes were not read";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanLimits {
@@ -75,15 +77,22 @@ impl CaptureWorkBudget {
         self.attempted_io_bytes
     }
 
-    pub(crate) fn charge_io(&mut self, bytes: u64) -> bool {
-        let Some(running) = self.attempted_io_bytes.checked_add(bytes) else {
-            return false;
-        };
-        if bytes > self.limits.per_object_bytes || running > self.limits.total_bytes {
-            return false;
-        }
-        self.attempted_io_bytes = running;
-        true
+    pub(crate) fn allowed_io(&self, operation_bytes: u64, wanted: usize) -> usize {
+        let operation_left = self.limits.per_object_bytes.saturating_sub(operation_bytes);
+        let capture_left = self
+            .limits
+            .total_bytes
+            .saturating_sub(self.attempted_io_bytes);
+        wanted.min(
+            operation_left
+                .min(capture_left)
+                .try_into()
+                .unwrap_or(usize::MAX),
+        )
+    }
+
+    pub(crate) fn record_io(&mut self, bytes: usize) {
+        self.attempted_io_bytes += bytes as u64;
     }
 
     fn admit_table(&mut self, entries: usize) -> bool {
@@ -469,6 +478,7 @@ fn scan_interfaces(
     maps: &[MapEntry],
     key: ObjectKey,
     budget: &mut CaptureWorkBudget,
+    operation_bytes: &mut u64,
 ) -> (Vec<ScannedInterface>, Vec<String>) {
     let word_at = |offset: usize| -> Option<u64> {
         Some(u64::from_ne_bytes(
@@ -480,6 +490,7 @@ fn scan_interfaces(
     };
     let mut found = Vec::new();
     let mut skipped = Vec::new();
+    let mut io_exhausted = false;
     let mut offset = 0usize;
     while offset + INTERFACE_BYTES <= snapshot.len() {
         if budget.interfaces_exhausted() {
@@ -512,13 +523,17 @@ fn scan_interfaces(
             let (name_class, name_lossy) = match name_ptr {
                 0 => ("null", None),
                 _ if !readable_here => ("unreadable", None),
-                _ => match read_name(mem, name_ptr) {
-                    Some(raw) if raw == STANDARD_INTERFACE_NAME => (
+                _ => match read_name(mem, name_ptr, budget, operation_bytes) {
+                    Ok(Some(raw)) if raw == STANDARD_INTERFACE_NAME => (
                         "exact_standard",
                         Some(String::from_utf8_lossy(&raw).into_owned()),
                     ),
-                    Some(raw) => ("other", Some(String::from_utf8_lossy(&raw).into_owned())),
-                    None => ("unreadable", None),
+                    Ok(Some(raw)) => ("other", Some(String::from_utf8_lossy(&raw).into_owned())),
+                    Ok(None) => ("unreadable", None),
+                    Err(()) => {
+                        io_exhausted = true;
+                        ("unreadable", None)
+                    }
                 },
             };
             Some(ScannedInterface {
@@ -532,6 +547,10 @@ fn scan_interfaces(
         if let Some(scanned) = scanned {
             found.push(scanned);
         }
+        if io_exhausted {
+            skipped.push(IO_CEILING_REASON.into());
+            break;
+        }
         offset += WORD;
     }
     (found, skipped)
@@ -539,23 +558,36 @@ fn scan_interfaces(
 
 /// A NUL-terminated name of at most `INTERFACE_NAME_CAP` bytes, or `None` when the
 /// target memory could not be read or the name runs past the cap.
-fn read_name(mem: &File, address: u64) -> Option<Vec<u8>> {
+fn read_name(
+    mem: &File,
+    address: u64,
+    budget: &mut CaptureWorkBudget,
+    operation_bytes: &mut u64,
+) -> Result<Option<Vec<u8>>, ()> {
     let mut raw: Vec<u8> = Vec::with_capacity(INTERFACE_NAME_CAP);
     while raw.len() < INTERFACE_NAME_CAP {
         let mut chunk = [0u8; 32];
         let want = chunk.len().min(INTERFACE_NAME_CAP - raw.len());
-        let at = address.checked_add(raw.len() as u64)?;
-        let read = match mem.read_at(&mut chunk[..want], at) {
-            Ok(0) | Err(_) => return None,
+        let Some(at) = address.checked_add(raw.len() as u64) else {
+            return Ok(None);
+        };
+        let allowed = budget.allowed_io(*operation_bytes, want);
+        if allowed == 0 {
+            return Err(());
+        }
+        let read = match mem.read_at(&mut chunk[..allowed], at) {
+            Ok(0) | Err(_) => return Ok(None),
             Ok(read) => read,
         };
+        budget.record_io(read);
+        *operation_bytes += read as u64;
         if let Some(nul) = chunk[..read].iter().position(|byte| *byte == 0) {
             raw.extend_from_slice(&chunk[..nul]);
-            return Some(raw);
+            return Ok(Some(raw));
         }
         raw.extend_from_slice(&chunk[..read]);
     }
-    None
+    Ok(None)
 }
 
 /// `entry.start..entry.end` from the target, in ≤1 MiB chunks. A partial read simply
@@ -563,21 +595,35 @@ fn read_name(mem: &File, address: u64) -> Option<Vec<u8>> {
 /// what was read so far. The second return says why it stopped short — everything past
 /// that point went unscanned, and the caller must record that rather than imply it was
 /// examined and found empty.
-fn read_mapping(mem: &File, entry: &MapEntry) -> (Vec<u8>, Option<String>) {
+fn read_mapping(
+    mem: &File,
+    entry: &MapEntry,
+    budget: &mut CaptureWorkBudget,
+    operation_bytes: &mut u64,
+) -> (Vec<u8>, Option<String>, bool) {
     let Some(len) = entry.end.checked_sub(entry.start).map(|len| len as usize) else {
-        return (Vec::new(), None);
+        return (Vec::new(), None, false);
     };
-    let mut bytes = vec![0u8; len];
+    let mut bytes = Vec::with_capacity(len.min(READ_CHUNK));
     let mut done = 0usize;
     let mut short = None;
+    let mut exhausted = false;
     while done < len {
-        let want = READ_CHUNK.min(len - done);
+        let requested = READ_CHUNK.min(len - done);
+        let want = budget.allowed_io(*operation_bytes, requested);
+        if want == 0 {
+            short = Some(IO_CEILING_REASON.to_string());
+            exhausted = true;
+            break;
+        }
         let Some(at) = entry.start.checked_add(done as u64) else {
             short = Some("address arithmetic overflowed".to_string());
             break;
         };
-        match mem.read_at(&mut bytes[done..done + want], at) {
+        bytes.resize(done + want, 0);
+        match mem.read_at(&mut bytes[done..], at) {
             Ok(0) => {
+                bytes.truncate(done);
                 // Addresses stay out of the reason: it is published in the capture
                 // document, which does not carry a target's runtime layout. The
                 // byte counts say exactly how much of the mapping went unexamined.
@@ -585,17 +631,26 @@ fn read_mapping(mem: &File, entry: &MapEntry) -> (Vec<u8>, Option<String>) {
                 break;
             }
             Err(error) => {
+                bytes.truncate(done);
                 short = Some(format!("the read failed: {error}"));
                 break;
             }
-            Ok(read) => done += read,
+            Ok(read) => {
+                bytes.truncate(done + read);
+                budget.record_io(read);
+                *operation_bytes += read as u64;
+                done += read;
+            }
         }
     }
-    bytes.truncate(done);
     let short = short.map(|cause| {
-        format!("partial snapshot of one data mapping: read {done} of {len} bytes: {cause}")
+        if exhausted {
+            cause
+        } else {
+            format!("partial snapshot of one data mapping: read {done} of {len} bytes: {cause}")
+        }
     });
-    (bytes, short)
+    (bytes, short, exhausted)
 }
 
 /// File-backed mappings grouped by object, keeping groups that carry code.
@@ -807,26 +862,24 @@ pub fn scan_pid(
         let object_bytes = data.iter().try_fold(0u64, |sum, entry| {
             sum.checked_add(entry.end.checked_sub(entry.start)?)
         });
-        let admitted = object_bytes.is_some_and(|bytes| budget.charge_io(bytes));
-        if !admitted {
+        if object_bytes.is_none_or(|bytes| bytes > budget.limits().per_object_bytes) {
             let object_bytes = object_bytes.map_or("unrepresentable".into(), |b| b.to_string());
             let limits = budget.limits();
             skipped.push(Skipped {
                 subject,
                 reason: format!(
-                    "too_large ({object_bytes} readable data bytes; caps are \
-                     {} per object and {} per capture, {} already attempted)",
-                    limits.per_object_bytes,
-                    limits.total_bytes,
-                    budget.attempted_io_bytes()
+                    "too_large ({object_bytes} readable data bytes; per-object cap is {})",
+                    limits.per_object_bytes
                 ),
             });
             modules.push(module);
             continue;
         }
         let mut snapshots = Vec::with_capacity(data.len());
+        let mut operation_bytes = 0u64;
+        let mut io_exhausted = false;
         for entry in &data {
-            let (bytes, short) = read_mapping(mem, entry);
+            let (bytes, short, exhausted) = read_mapping(mem, entry, budget, &mut operation_bytes);
             // Bytes past a failed read were never examined; saying nothing here would
             // present a partial decode as a complete one.
             if let Some(reason) = short {
@@ -836,6 +889,10 @@ pub fn scan_pid(
                 });
             }
             snapshots.push((entry.start, bytes));
+            if exhausted {
+                io_exhausted = true;
+                break;
+            }
         }
         for (base, snapshot) in &snapshots {
             let (tables, exhausted) = detect_tables(snapshot, *base, &maps, budget);
@@ -846,13 +903,25 @@ pub fn scan_pid(
             }));
         }
         for (_, snapshot) in &snapshots {
-            let (interfaces, exhausted) =
-                scan_interfaces(snapshot, mem, &module.tables, &maps, key, budget);
+            let (interfaces, exhausted) = scan_interfaces(
+                snapshot,
+                mem,
+                &module.tables,
+                &maps,
+                key,
+                budget,
+                &mut operation_bytes,
+            );
             module.interfaces.extend(interfaces);
+            let interface_io_exhausted = exhausted.iter().any(|reason| reason == IO_CEILING_REASON);
             skipped.extend(exhausted.into_iter().map(|reason| Skipped {
                 subject: module.path.clone(),
                 reason,
             }));
+            if interface_io_exhausted {
+                io_exhausted = true;
+                break;
+            }
         }
         for (index, interface) in module.interfaces.iter_mut().enumerate() {
             interface.index = index;
@@ -862,7 +931,7 @@ pub fn scan_pid(
         // which classified it by its exports and will report it in `discovery[]` and
         // `capture.modules[]` as a module the capture observed. Without this the
         // gap has nothing to show — no entry to skip, no attach to fail, no counter.
-        if module.tables.is_empty() {
+        if module.tables.is_empty() && !io_exhausted {
             let named = if hinted {
                 "matched a --module hint; "
             } else {
@@ -1010,20 +1079,73 @@ mod tests {
             interfaces[base + WORD..base + 2 * WORD].copy_from_slice(&table.address.to_ne_bytes());
         }
         let mem = tempfile::tempfile().unwrap();
+        let mut operation_bytes = 0;
+        let (interfaces, interface_skips) = scan_interfaces(
+            &interfaces,
+            &mem,
+            &[table],
+            &maps,
+            ObjectKey::of(&maps[0]),
+            &mut budget,
+            &mut operation_bytes,
+        );
         assert_eq!(
-            scan_interfaces(
-                &interfaces,
-                &mem,
-                &[table],
-                &maps,
-                ObjectKey::of(&maps[0]),
-                &mut budget
-            )
-            .0
-            .len(),
+            interfaces.len(),
             512,
             "interface amplification must be bounded"
         );
+        assert_eq!(interface_skips.len(), 1, "one bounded exhaustion result");
+        assert_eq!(
+            interface_skips[0],
+            "capture interface decode ceiling reached (512 records); remaining interface data \
+             was not decoded"
+        );
+    }
+
+    #[test]
+    fn interface_name_reads_share_the_capture_io_budget() {
+        let maps = parse_maps(
+            b"0-1000 r--p 00000000 08:01 7 /lib/provider.so\n\
+              1000-3000 r-xp 00001000 08:01 7 /lib/provider.so\n",
+        )
+        .unwrap();
+        let name_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(name_file.path(), b"_PKCS 11\0").unwrap();
+        let mem = File::open(name_file.path()).unwrap();
+        let table = ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: vec![],
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x7000,
+        };
+        let mut snapshot = vec![0u8; INTERFACE_BYTES];
+        snapshot[..WORD].copy_from_slice(&1u64.to_ne_bytes());
+        snapshot[WORD..2 * WORD].copy_from_slice(&table.address.to_ne_bytes());
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: 64,
+            total_bytes: 1,
+        });
+        let mut operation_bytes = 0;
+        let (interfaces, skipped) = scan_interfaces(
+            &snapshot,
+            &mem,
+            &[table],
+            &maps,
+            ObjectKey::of(&maps[0]),
+            &mut budget,
+            &mut operation_bytes,
+        );
+        assert_eq!(interfaces.len(), 1);
+        assert_eq!(interfaces[0].name_class, "unreadable");
+        assert_eq!(budget.attempted_io_bytes(), 1);
+        assert_eq!(
+            skipped.len(),
+            1,
+            "the unread name remainder is one omission"
+        );
+        assert_eq!(skipped[0], IO_CEILING_REASON);
     }
 
     /// Case 3 is the one that matters and the one no end-to-end test can reach here:
@@ -1059,7 +1181,9 @@ mod tests {
         std::fs::write(file.path(), vec![7u8; 64]).unwrap();
         let mem = File::open(file.path()).unwrap();
         let entry = &parse_maps(b"0-1000 rw-p 00000000 08:01 7 /lib/provider.so\n").unwrap()[0];
-        let (bytes, short) = read_mapping(&mem, entry);
+        let (bytes, short, exhausted) =
+            read_mapping(&mem, entry, &mut CaptureWorkBudget::default(), &mut 0);
+        assert!(!exhausted);
         assert_eq!(bytes, vec![7u8; 64], "what was read is kept");
         let short = short.expect("a short snapshot must say so");
         assert!(

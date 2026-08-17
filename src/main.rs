@@ -1823,7 +1823,7 @@ mod tests {
             counters
                 .object_skips
                 .iter()
-                .any(|skip| skip.reason.contains("too_large")),
+                .any(|skip| skip.reason.contains("capture attempted-I/O ceiling")),
             "budget exhaustion must remain explicit: {:?}",
             counters.object_skips
         );

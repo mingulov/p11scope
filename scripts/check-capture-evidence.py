@@ -88,6 +88,19 @@ VERSION_SHAPE_SCANNED = (1216, 104, 208, VERSION_SURFACES_SCANNED, 1, "ok")
 # an object-level skip naming the provider, not a lost table entry.
 VERSION_SCAN_SKIPS = 3
 DISCOVERY_SUBJECT = "discovery subject"
+DISCOVERY_UNAVAILABLE = "discovery unavailable"
+ENTRY_UNAVAILABLE = "function entry unavailable"
+TABLE_UNAVAILABLE = "function table unavailable in file-backed data"
+SHARED_OVERLAY_UNCERTAINTY = (
+    "shared-overlay physical identity is uncertain; a distinct byte-identical "
+    "instance may be unobserved"
+)
+DISCOVERY_REASONS = {
+    DISCOVERY_UNAVAILABLE,
+    TABLE_UNAVAILABLE,
+    SHARED_OVERLAY_UNCERTAINTY,
+}
+ENTRY_REASONS = {"null pointer", ENTRY_UNAVAILABLE}
 G1_SURFACES = Counter({("full", 68): 1, ("full", 92): 1, ("not_walked", 0): 1})
 LEGACY_SURFACES = Counter({("full", 68): 1})
 
@@ -180,10 +193,13 @@ def entry_skips(evidence):
 def discovery_skips(evidence):
     """Object/process/scope losses after capture-output subject bounding."""
     for item in evidence["skipped"]:
+        entry = item["name"].startswith("C_")
         require(
-            item["name"].startswith("C_") or item["name"] == DISCOVERY_SUBJECT,
+            entry or item["name"] == DISCOVERY_SUBJECT,
             f"unbounded capture skip subject: {item}",
         )
+        allowed = ENTRY_REASONS if entry else DISCOVERY_REASONS
+        require(item["reason"] in allowed, f"unbounded capture skip reason: {item}")
     return [item for item in evidence["skipped"] if item["name"] == DISCOVERY_SUBJECT]
 
 
@@ -351,15 +367,7 @@ def validate_proxy_capacity_fallback(document):
     require(len(scan_skips) == 3, f"unexpected scan skips: {scan_skips}")
     for skip in scan_skips:
         require(skip["name"] == DISCOVERY_SUBJECT, skip)
-        require(
-            re.fullmatch(
-                r"a 3\.0 table header extends past the object's file-backed data "
-                r"\([0-9]+ bytes needed, [0-9]+ available\); a table built at run time "
-                r"in \.bss or on the heap is outside the memory scan's reach",
-                skip["reason"],
-            ),
-            skip,
-        )
+        require(skip["reason"] == TABLE_UNAVAILABLE, skip)
 
     functions = document["functions"]
     require(len(functions) == 68, len(functions))
@@ -408,7 +416,9 @@ CLEAN_DISCOVERY = {
 }
 
 
-def validate_clean_metrics(document, expected, multiplier=1, *, discovery="scan"):
+def validate_clean_metrics(
+    document, expected, multiplier=1, *, discovery="scan", discovery_skipped=0
+):
     """SoftHSM2 counted exactly, with discovery stated rather than assumed."""
     require(discovery in CLEAN_DISCOVERY, f"unknown clean-metrics discovery: {discovery}")
     wanted_sources, allowances = CLEAN_DISCOVERY[discovery]
@@ -418,7 +428,13 @@ def validate_clean_metrics(document, expected, multiplier=1, *, discovery="scan"
     require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
     evidence = document["evidence"]
     exact_shape(evidence, 68, 68, 136, LEGACY_SURFACES, 0, "absent")
-    exact_common(evidence, aliases=[], skipped=[], in_flight=0)
+    exact_common(
+        evidence,
+        aliases=[],
+        skipped=[],
+        in_flight=0,
+        discovery_skipped=discovery_skipped,
+    )
     exact_counters(evidence, allowances)
     sources = [module["sources"] for module in evidence["discovery"]]
     require(sources == [wanted_sources], f"unexpected discovery sources: {sources}")
@@ -440,6 +456,21 @@ def validate_clean_metrics(document, expected, multiplier=1, *, discovery="scan"
     require("C_GetFunctionList" not in wanted, "expected-count file must omit bootstrap")
     wanted["C_GetFunctionList"] = multiplier
     require(dict(actual) == wanted, f"positive function counts: want {wanted}, got {dict(actual)}")
+
+
+def validate_shared_layer_metrics(document, expected, multiplier=1):
+    """Clean metrics plus exactly one bounded shared-overlay uncertainty."""
+    validate_clean_metrics(
+        document,
+        expected,
+        multiplier,
+        discovery_skipped=1,
+    )
+    require(
+        document["evidence"]["skipped"]
+        == [{"name": DISCOVERY_SUBJECT, "reason": SHARED_OVERLAY_UNCERTAINTY}],
+        f"unexpected shared-overlay uncertainty: {document['evidence']['skipped']}",
+    )
 
 
 def validate_canary(lane, document):
@@ -629,7 +660,7 @@ def discovery_fixture(sources=("scan",)):
 # An object-level scan loss after capture-output subject bounding.
 DISCOVERY_SKIP = {
     "name": DISCOVERY_SUBJECT,
-    "reason": "a 3.0 table header extends past the object's file-backed data",
+    "reason": TABLE_UNAVAILABLE,
 }
 
 
@@ -702,6 +733,26 @@ def self_test():
         [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
     )
     validate_clean_metrics(clean, {"C_Initialize": 1})
+    shared = copy.deepcopy(clean)
+    shared["evidence"]["skipped"] = [
+        {
+            "name": DISCOVERY_SUBJECT,
+            "reason": SHARED_OVERLAY_UNCERTAINTY,
+        }
+    ]
+    validate_shared_layer_metrics(shared, {"C_Initialize": 1})
+    for mutate in (
+        lambda d: d["evidence"].update(skipped=[]),
+        lambda d: d["evidence"]["skipped"].append(
+            copy.deepcopy(d["evidence"]["skipped"][0])
+        ),
+        lambda d: d["evidence"]["skipped"][0].update(reason="discovery unavailable"),
+        lambda d: d["evidence"].update(event_loss=1),
+    ):
+        bad = copy.deepcopy(shared)
+        mutate(bad)
+        rejected(lambda bad=bad: validate_shared_layer_metrics(bad, {"C_Initialize": 1}))
+    print("shared-layer metrics permits exactly one bounded overlay uncertainty: OK")
     bad = copy.deepcopy(clean)
     bad["functions"] += function_items([(["C_Unexpected"], 1)])
     rejected(lambda: validate_clean_metrics(bad, {"C_Initialize": 1}))
@@ -778,11 +829,9 @@ def self_test():
     proxy["evidence"]["skipped"] = [
         {
             "name": DISCOVERY_SUBJECT,
-            "reason": "a 3.0 table header extends past the object's file-backed data "
-            f"(744 bytes needed, {available} available); a table built at run time in "
-            ".bss or on the heap is outside the memory scan's reach",
+            "reason": TABLE_UNAVAILABLE,
         }
-        for available in (712, 680, 616)
+        for _ in range(3)
     ]
     proxy["functions"] = function_items(
         [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
@@ -829,7 +878,16 @@ def self_test():
         bad = copy.deepcopy(safe)
         bad["evidence"]["skipped"][0]["name"] = leaked_subject
         rejected(lambda bad=bad: validate_canary("default-safe-profile", bad))
-    print("capture skip subjects are bounded before JSON output: OK")
+    for leaked_reason in (
+        "/home/operator/private/bystander",
+        "scanning pid 4242: /proc/4242/maps",
+        "/sys/fs/cgroup/user.slice/private.scope",
+        "arbitrary error-chain text",
+    ):
+        bad = copy.deepcopy(safe)
+        bad["evidence"]["skipped"][0]["reason"] = leaked_reason
+        rejected(lambda bad=bad: validate_canary("default-safe-profile", bad))
+    print("capture skip names and reasons are bounded before JSON output: OK")
     bad = copy.deepcopy(safe)
     bad["evidence"]["attached_probes"] = 206
     rejected(lambda: validate_canary("default-safe-profile", bad))
@@ -1045,7 +1103,14 @@ def main(argv):
         self_test()
         return
     require(len(argv) >= 1, "usage: check-capture-evidence.py MODE ...")
-    if argv[0].startswith("clean-metrics") and len(argv) in (3, 4):
+    if argv[0] == "shared-layer-metrics" and len(argv) in (3, 4):
+        multiplier = int(argv[3]) if len(argv) == 4 else 1
+        validate_shared_layer_metrics(
+            load_json(argv[1]),
+            expected_counts(argv[2]),
+            multiplier,
+        )
+    elif argv[0].startswith("clean-metrics") and len(argv) in (3, 4):
         discovery = argv[0][len("clean-metrics") :].lstrip("-") or "scan"
         multiplier = int(argv[3]) if len(argv) == 4 else 1
         validate_clean_metrics(
@@ -1063,6 +1128,7 @@ def main(argv):
         raise AssertionError(
             "usage: check-capture-evidence.py "
             "clean-metrics[-corroborated|-manifest-only] OUTPUT EXPECTED [MULTIPLIER] | "
+            "shared-layer-metrics OUTPUT EXPECTED [MULTIPLIER] | "
             "canary LANE OUTPUT | induced G[1-5] OUTPUT | --self-test"
         )
 

@@ -2,6 +2,8 @@
 //! that lost information never reads as complete.
 
 use crate::attach::CapturePolicy;
+use crate::discovery::scan::Skipped;
+use crate::kinds;
 use crate::metrics::{SlotReport, percentile_ns};
 use crate::plan::TableSummary;
 use serde::Serialize;
@@ -210,6 +212,49 @@ pub struct Evidence {
 pub struct SkippedOut {
     pub name: String,
     pub reason: String,
+}
+
+const DISCOVERY_SUBJECT: &str = "discovery subject";
+const DISCOVERY_UNAVAILABLE: &str = "discovery unavailable";
+const ENTRY_UNAVAILABLE: &str = "function entry unavailable";
+const TABLE_UNAVAILABLE: &str = "function table unavailable in file-backed data";
+const SHARED_OVERLAY_UNCERTAINTY: &str = "shared-overlay physical identity is uncertain; a distinct byte-identical instance may be unobserved";
+
+/// Convert an untyped internal discovery loss into the finite public capture
+/// record. Detailed paths, process identities, and error chains remain in
+/// diagnostics; capture output keeps only the categorical loss needed to make
+/// completeness honest.
+pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
+    let function = kinds::function_id(&s.subject).is_some();
+    let reason = if function {
+        if s.reason == "null pointer" {
+            "null pointer"
+        } else {
+            ENTRY_UNAVAILABLE
+        }
+    } else if s
+        .reason
+        .contains("cannot prove physical identity across overlay instances")
+    {
+        SHARED_OVERLAY_UNCERTAINTY
+    } else if s
+        .reason
+        .contains("table header extends past the object's file-backed data")
+        || s.reason
+            .contains("no function table was found in its file-backed data")
+    {
+        TABLE_UNAVAILABLE
+    } else {
+        DISCOVERY_UNAVAILABLE
+    };
+    SkippedOut {
+        name: if function {
+            s.subject.clone()
+        } else {
+            DISCOVERY_SUBJECT.into()
+        },
+        reason: reason.into(),
+    }
 }
 
 impl Evidence {
@@ -1149,6 +1194,89 @@ mod tests {
             ended: "t1",
             kernel: "6.8.0",
             policy: CapturePolicy::Allowlisted,
+        }
+    }
+
+    #[test]
+    fn capture_skip_records_exclude_private_subjects_and_reasons_from_profile_and_metrics() {
+        use crate::discovery::scan::Skipped;
+
+        let skips = [
+            Skipped {
+                subject: "/private/SUBJECT_PATH_SENTINEL".into(),
+                reason: "mapped /private/REASON_PATH_SENTINEL could not be read".into(),
+            },
+            Skipped {
+                subject: "pid 424242991".into(),
+                reason: "scanning pid 424242992: /proc/424242992/maps: ERROR_CHAIN_SENTINEL"
+                    .into(),
+            },
+            Skipped {
+                subject: "/sys/fs/cgroup/CGROUP_SUBJECT_SENTINEL.scope".into(),
+                reason: "cgroup /sys/fs/cgroup/CGROUP_REASON_SENTINEL.scope failed".into(),
+            },
+            Skipped {
+                subject: "C_Sign".into(),
+                reason: "/private/ENTRY_REASON_SENTINEL.so was not pinned".into(),
+            },
+            Skipped {
+                subject: "/private/OVERLAY_SUBJECT_SENTINEL.so".into(),
+                reason: "mapping OVERLAY_KEY_SENTINEL was collapsed by the overlayfs + inode metadata + SHA-256 heuristic, which cannot prove physical identity across overlay instances; /private/OVERLAY_REASON_SENTINEL.so would not be probed".into(),
+            },
+        ];
+        let mut ev = evidence();
+        ev.skipped = skips.iter().map(capture_skipped_out).collect();
+        ev.verdict();
+
+        let profile = profile_json(
+            &reports_fixture(),
+            &ev,
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        let metrics = json(&reports_fixture(), &ev, &capture_fixture());
+        let expected = [
+            ("discovery subject", "discovery unavailable"),
+            ("discovery subject", "discovery unavailable"),
+            ("discovery subject", "discovery unavailable"),
+            ("C_Sign", "function entry unavailable"),
+            (
+                "discovery subject",
+                "shared-overlay physical identity is uncertain; a distinct byte-identical instance may be unobserved",
+            ),
+        ];
+
+        for document in [profile, metrics] {
+            let records = document["evidence"]["skipped"].as_array().unwrap();
+            let actual: Vec<(&str, &str)> = records
+                .iter()
+                .map(|item| {
+                    (
+                        item["name"].as_str().unwrap(),
+                        item["reason"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(actual, expected);
+            let rendered = serde_json::to_string(&document).unwrap();
+            for sentinel in [
+                "SUBJECT_PATH_SENTINEL",
+                "REASON_PATH_SENTINEL",
+                "424242991",
+                "424242992",
+                "ERROR_CHAIN_SENTINEL",
+                "CGROUP_SUBJECT_SENTINEL",
+                "CGROUP_REASON_SENTINEL",
+                "ENTRY_REASON_SENTINEL",
+                "OVERLAY_KEY_SENTINEL",
+                "OVERLAY_SUBJECT_SENTINEL",
+                "OVERLAY_REASON_SENTINEL",
+            ] {
+                assert!(
+                    !rendered.contains(sentinel),
+                    "leaked {sentinel}: {rendered}"
+                );
+            }
         }
     }
 

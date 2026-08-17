@@ -13,9 +13,7 @@ use p11scope::discovery::scan::{
 };
 use p11scope::manifest_input::read_manifest;
 use p11scope::output::AtomicFile;
-use p11scope::{
-    doctor, events, inspect, kinds, metrics, plan, process, render, scope, semantics, trace,
-};
+use p11scope::{doctor, events, inspect, metrics, plan, process, render, scope, semantics, trace};
 use p11scope_manifest::manifest::{Manifest, Resolution, SCHEMA};
 use p11scope_manifest::maps::ObjectKey;
 use std::collections::BTreeSet;
@@ -944,20 +942,6 @@ fn skipped_out(s: &Skipped) -> render::SkippedOut {
     }
 }
 
-/// Capture output keeps exact standard entry names, but scan and scope losses
-/// share this untyped field after discovery merges them. Fail closed rather
-/// than publish a mapped path, PID label, cgroup path, or future unknown label.
-fn capture_skipped_out(s: &Skipped) -> render::SkippedOut {
-    render::SkippedOut {
-        name: if kinds::function_id(&s.subject).is_some() {
-            s.subject.clone()
-        } else {
-            "discovery subject".into()
-        },
-        reason: s.reason.clone(),
-    }
-}
-
 fn corroboration_label(outcome: Corroboration) -> &'static str {
     match outcome {
         Corroboration::Uncorroborated => "uncorroborated",
@@ -1534,7 +1518,11 @@ fn evidence_for(
             .filter(|s| s.aliased)
             .map(|s| s.names.clone())
             .collect(),
-        skipped: plan.skipped.iter().map(capture_skipped_out).collect(),
+        skipped: plan
+            .skipped
+            .iter()
+            .map(render::capture_skipped_out)
+            .collect(),
         in_flight_at_end: reports.iter().map(|r| r.in_flight).sum(),
         surfaces: plan.surfaces.clone(),
         vendor_interfaces: plan.vendor_interfaces,
@@ -1984,61 +1972,6 @@ mod tests {
             vendor_interfaces: 0,
             interface_list: "absent".into(),
             module_ambiguous: 0,
-        }
-    }
-
-    #[test]
-    fn capture_skip_json_bounds_scan_and_cgroup_subjects() {
-        let skips = [
-            Skipped {
-                subject: "/home/operator/private/bystander".into(),
-                reason: "too_large: mapped object exceeds the byte cap".into(),
-            },
-            Skipped {
-                subject: "pid 4242".into(),
-                reason: "the process could not be scanned".into(),
-            },
-            Skipped {
-                subject: "/sys/fs/cgroup/user.slice/private.scope".into(),
-                reason: "cgroup.procs could not be read".into(),
-            },
-            Skipped {
-                subject: "C_Sign".into(),
-                reason: "null pointer".into(),
-            },
-            Skipped {
-                subject: "C_NotAStandardFunction".into(),
-                reason: "unclassified discovery loss".into(),
-            },
-        ];
-
-        let json = serde_json::to_value(skips.iter().map(capture_skipped_out).collect::<Vec<_>>())
-            .unwrap();
-        let names: Vec<&str> = json
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|item| item["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            names,
-            [
-                "discovery subject",
-                "discovery subject",
-                "discovery subject",
-                "C_Sign",
-                "discovery subject",
-            ]
-        );
-        assert_eq!(json[0]["reason"], skips[0].reason);
-        let rendered = serde_json::to_string(&json).unwrap();
-        for secret in [
-            "/home/operator/private/bystander",
-            "pid 4242",
-            "/sys/fs/cgroup/user.slice/private.scope",
-            "C_NotAStandardFunction",
-        ] {
-            assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
         }
     }
 

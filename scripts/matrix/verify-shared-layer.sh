@@ -228,10 +228,9 @@ assert ev["attached_probes"] == 2 * ev["slots"], (ev["attached_probes"], ev["slo
 # predicate is heuristic. Require exactly one published uncertainty in broad scope
 # and none in either leaf scope. Capture output bounds its subject so a
 # bystander mapping path or process identity cannot escape into evidence.
-uncertainty = [
-    item for item in ev["skipped"]
-    if "cannot prove physical identity" in item["reason"]
-]
+reason = ("shared-overlay physical identity is uncertain; a distinct "
+          "byte-identical instance may be unobserved")
+uncertainty = [item for item in ev["skipped"] if item["reason"] == reason]
 assert len(uncertainty) == expected_collapses, (expected_collapses, uncertainty)
 assert all(item["name"] == "discovery subject" for item in uncertainty), uncertainty
 
@@ -247,7 +246,9 @@ assert not repeated, (
 )
 print("one shared-layer module; collapse uncertainties:", len(uncertainty), modules[0]["ino"])
 SHARED
-    python3 scripts/check-capture-evidence.py clean-metrics \
+    checker=clean-metrics
+    [ "$expected_collapses" -eq 0 ] || checker=shared-layer-metrics
+    python3 scripts/check-capture-evidence.py "$checker" \
         "$WORK/$label.json" spike/expected.txt "$multiplier"
 }
 

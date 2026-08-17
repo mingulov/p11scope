@@ -399,18 +399,20 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     optional, evidence `discovery[]`/`authority`, schema v2. The eBPF object is unchanged.
     Scanning happens once at attach time; a module loaded later is not discovered (1b-2).
     **Status (2026-08-17): implementation tasks and their task-local reviews are complete on
-    the recovery branch; the Task 15 documentation commit and its round-1 review-fix commit
+    the recovery branch; the Task 15 documentation commit and two review-fix commits
     reconcile the documentation and privacy boundary, and final whole-branch review is
     pending. Range `3b7c067..fdde185` is 37 pre-Task-15 implementation/recovery commits;
-    with the two Task 15 commits, the combined 39-commit delta is 57 files, 13,578
-    insertions, 1,384 deletions (net +12,194 lines). Fresh round-2 verification: the four
+    with the three Task 15 commits, the combined 40-commit delta is 57 files, 13,706
+    insertions, 1,382 deletions (net +12,324 lines). Fresh round-3 verification: the four
     Rust checks passed (296 tests, 0 failed), `scripts/verify-inspect-doctor.sh` reported
-    `ALL OK`, and the capture-evidence and canary self-tests passed. Owner-approved root
-    artifact evidence from Tasks 14, 16,
-    and 17: `scripts/gates.sh`, `build-release.sh`, and matrix docker,
-    fork-scope, oracle, kind-pod, and Knative lanes passed in Task 14; shared-layer passed
-    after Task 16 with one published overlay physical-identity uncertainty (therefore
-    `PARTIAL`); proxy-stack passed after Task 17 via the exact capacity fallback (p11-kit
+    `ALL OK`, and the capture-evidence, canary, and artifact-contract self-tests passed.
+    The owner-approved shared-layer lane was rerun after every unprivileged check: broad
+    scope published exactly one bounded overlay physical-identity uncertainty (therefore
+    `PARTIAL`), both leaf scopes published zero, all exact count/zero-gap assertions passed,
+    and the script reported `ALL OK`. Owner-approved root artifact evidence from Tasks 14
+    and 17 remains: `scripts/gates.sh`, `build-release.sh`, and matrix docker, fork-scope,
+    oracle, kind-pod, and Knative lanes passed in Task 14; proxy-stack passed after Task 17
+    via the exact capacity fallback (p11-kit
     refused whole needing 5762 more than the 512-slot ceiling, later-fitting SoftHSM2
     attached at 68 slots / 136 probes, `PARTIAL`). `verify-discover-containers.sh` and
     `bench-overhead.sh`: UNRUN.

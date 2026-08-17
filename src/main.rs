@@ -2318,20 +2318,33 @@ mod tests {
         // discovered, and nothing else in the document would say so. An *absent*
         // cgroup.procs (the intermediate directory above) is not a loss — it is
         // not a cgroup — which is why the first assertion above sees none.
-        // SAFETY: geteuid() is always safe. Root reads a 0o000 directory anyway,
-        // so the denial below is not reproducible there.
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
+        //
+        // Root reads a mode-000 directory, so the denial is not reproducible
+        // there. Both configurations assert — a test that steps aside under the
+        // very privilege level the gates run at is a green that proves nothing.
+        // Which claim applies is decided by what this process can actually do
+        // rather than by its uid: root with CAP_DAC_OVERRIDE dropped is denied
+        // like anyone else, and would fail a uid-based branch for the wrong
+        // reason.
         use std::os::unix::fs::PermissionsExt as _;
         let mut permissions = std::fs::metadata(&leaf).unwrap().permissions();
         permissions.set_mode(0o000);
         std::fs::set_permissions(&leaf, permissions).unwrap();
+        let denied = std::fs::read_dir(&leaf).is_err();
         let (pids, lost) = scope_pids(&Scope::Cgroup {
             id: 0,
             path: root.path().to_path_buf(),
         });
         std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !denied {
+            assert_eq!(
+                pids,
+                vec![11, 22, 33],
+                "the mode change denied this observer nothing, so nothing is missed"
+            );
+            assert_eq!(lost, vec![], "nothing was denied, so nothing is a loss");
+            return;
+        }
         assert_eq!(pids, vec![11], "only the readable cgroup's process");
         assert_eq!(
             lost.len(),

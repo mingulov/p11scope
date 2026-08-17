@@ -729,7 +729,8 @@ PY
         gcc --version | head -n 1
         ld --version | head -n 1
         dpkg-query -W -f='${Package}\t${Version}\n' gcc libc6-dev binutils ca-certificates
-        find /var/lib/apt/lists -type f -print0 | sort -z | xargs -0 sha256sum
+        find /var/lib/apt/lists -maxdepth 1 -type f -readable ! -name lock -print0 \
+            | sort -z | xargs -0 sha256sum
         cat "$output/cargo-cache.sha256" "$output/cargo-sources.sha256"
         cat "$output/runner-version-info.txt" "$output/fixture-version-info.txt"
     } >"$output/build-evidence.txt"

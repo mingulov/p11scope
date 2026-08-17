@@ -10,12 +10,20 @@ pub struct Device {
     pub minor: u64,
 }
 
-/// What `/proc/<pid>/maps` says a mapping is: the *mount's* device, not the file's
-/// `st_dev`. So this identifies a mapping, never a physical file — overlayfs and
-/// btrfs give one file a different anonymous device per mount, and one inode number
-/// can repeat across filesystems. Neither half is an identity on its own; see
-/// `p11scope::discovery::identity::merge_mappings_of_one_file` before letting two of
-/// these decide that there are two files.
+/// What `/proc/<pid>/maps` says a mapping is: `inode->i_sb->s_dev`, the device of the
+/// *superblock* the mapping was reached through, not the file's `st_dev`. So this
+/// identifies a mapping, never a physical file, and it is wrong in both directions:
+///
+///  - one file, two keys — an overlay mount reports the underlying inode's number
+///    under its own anonymous superblock device, so every container of one image
+///    spells one provider differently. See
+///    `p11scope::discovery::identity::merge_mappings_of_one_file` before letting two
+///    of these decide that there are two files.
+///  - two files, one key — an inode number is unique only within a filesystem. On
+///    btrfs it is not even unique within one: subvolumes number inodes independently
+///    while maps renders the one filesystem-wide `s_dev` (the per-subvolume anonymous
+///    device is `st_dev`, which maps never shows), so two snapshot clones of a
+///    provider collide here. Pre-existing and untouched by the merge above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ObjectKey {
     pub device: Device,

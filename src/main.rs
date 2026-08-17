@@ -633,17 +633,6 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
         }
     }
 
-    // Before everything else: two mappings of one physical file are one module and
-    // one attach target, or every call through it is counted once per mount.
-    let collapsed = merge_mappings_of_one_file(&mut modules, &pinned);
-    if collapsed > 0 {
-        eprintln!(
-            "p11scope: discovery: {collapsed} further mapping(s) of an already-discovered \
-             provider file were collapsed — containers sharing an image layer map one \
-             inode through their own mounts, and one file is one attach target"
-        );
-    }
-
     // Before corroboration: an entry nothing pinned is not a target either source
     // can be held to, and must never reach the plan.
     let unpinned = drop_unpinned_entries(&mut modules, &pinned);
@@ -653,6 +642,29 @@ fn discover_plan(a: &CaptureArgs, scope: &Scope) -> Result<Discovered> {
             skipped.subject, skipped.reason
         );
     }
+
+    // Then, and only then: two mappings of one physical file are one module and one
+    // attach target, or every call through it is counted once per mount. After the
+    // drop above, so the mapping this keeps is chosen on targets that can actually be
+    // attached — otherwise an entry can win that choice and then be dropped as
+    // unpinned, with the mapping that could have attached it already gone. The order
+    // is otherwise immaterial: the collapse only ever maps a pinned key onto another
+    // pinned key, so it drops exactly the same entries either way.
+    let (collapsed, differed) = merge_mappings_of_one_file(&mut modules, &pinned);
+    if collapsed > 0 {
+        eprintln!(
+            "p11scope: discovery: {collapsed} further mapping(s) of an already-discovered \
+             provider file were collapsed — containers sharing an image layer map one \
+             inode through their own mounts, and one file is one attach target"
+        );
+    }
+    for skipped in &differed {
+        eprintln!(
+            "p11scope: discovery skipped {} — {}",
+            skipped.subject, skipped.reason
+        );
+    }
+    counters.object_skips.extend(differed);
 
     let mut accepted: Vec<Manifest> = Vec::new();
     let mut corroborated: Vec<ObjectKey> = Vec::new();

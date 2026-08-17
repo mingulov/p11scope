@@ -4,7 +4,7 @@
 //! provenance-checked verification path it replaces was removed by
 //! Productization Slice 1a (formerly `src/verify.rs`, restorable from history).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
@@ -86,6 +86,26 @@ struct Entry {
     build_id: Option<String>,
     identity_source: &'static str,
     note: Option<String>,
+    /// Whether this object was opened through an overlayfs mount — the only
+    /// filesystem that shows one physical file under a different device per mount.
+    /// Read once here rather than at use: it is a property of how this capture
+    /// opened the object, like every other field of the pin.
+    overlay: bool,
+}
+
+/// `OVERLAYFS_SUPER_MAGIC`. `ovl_statfs` reports the underlying filesystem's numbers
+/// but overrides `f_type` with the overlay's own magic, so this answers "was this file
+/// reached *through* an overlay mount", which is the question, and not "what is it
+/// ultimately stored on".
+const OVERLAYFS_SUPER_MAGIC: u64 = 0x794c_7630;
+
+fn on_overlayfs(file: &std::fs::File) -> bool {
+    let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `fstatfs` fills `buf` for a valid fd and is only read on success.
+    unsafe {
+        libc::fstatfs(file.as_raw_fd(), buf.as_mut_ptr()) == 0
+            && buf.assume_init().f_type as u64 == OVERLAYFS_SUPER_MAGIC
+    }
 }
 
 impl Entry {
@@ -97,6 +117,7 @@ impl Entry {
         found: FoundIdentity,
     ) -> Self {
         Self {
+            overlay: on_overlayfs(&file),
             file,
             pin,
             path,
@@ -462,12 +483,14 @@ pub fn pin_scanned_objects(
 
 /// Collapses every mapping of one physical file onto the single key this capture
 /// pinned for it, and drops the modules that were only a second view of a module
-/// already here. Returns how many keys were collapsed.
+/// already here. Returns how many keys were collapsed, and what the mapping that was
+/// kept cannot reach.
 ///
 /// `ObjectKey` is `(device, inode)`, and that pair identifies a *mapping*, not a
-/// file: `/proc/<pid>/maps` renders the mount's device, and overlayfs gives every
-/// mount its own anonymous one (btrfs does the same per subvolume). Two containers
-/// started from one image therefore show one file as `[0,102]:56317450` and
+/// file: `/proc/<pid>/maps` renders `i_sb->s_dev`, the superblock the mapping was
+/// reached through, and an overlay mount reports the *underlying* inode's number under
+/// its own anonymous superblock device. Two containers started from one image
+/// therefore show one file as `[0,102]:56317450` and
 /// `[0,104]:56317450` — two keys, two modules, two slots. A uprobe is registered per
 /// `(inode, offset)`, so both slots are two registrations on *one* point: both fire
 /// for every call from either container, every count doubles, and nothing in the
@@ -475,37 +498,59 @@ pub fn pin_scanned_objects(
 /// stays 0 and every entry reads as attributed). N pods from one image inflate N×,
 /// which is the ordinary Kubernetes shape, so this is not an edge case.
 ///
-/// Two pins are the same file when everything this capture recorded about the inode
-/// is identical — its number, its size, its ctime and the whole-file SHA-256 — and
-/// only the device differs. The device is *deliberately* not part of that test:
-/// `IdentitySource::Stat` already records that on overlay and btrfs it cannot be
-/// corroborated at all, and `hint_gate` in `scan.rs` reaches the same conclusion from
-/// the other side. Do not add it back; that is the defect this exists to prevent.
+/// Two pins are the same file when **both were opened through an overlay mount** and
+/// everything this capture recorded about the inode is identical — its number, its
+/// size, its ctime and the whole-file SHA-256 — with only the device differing. The
+/// device is *deliberately* not compared: `IdentitySource::Stat` already records that
+/// on an overlay it cannot be corroborated at all, and `hint_gate` in `scan.rs`
+/// attributes a `--module` hint on inode number and size alone for the same reason.
+/// Do not compare it here; that is the defect this exists to prevent.
 ///
-/// Why this cannot merge two *different* providers, which would be the worse fault:
-/// an inode number is unique only within a filesystem, so two unrelated files can
-/// share one — but they would also have to hash to the same SHA-256, i.e. be
-/// byte-identical, and to have been last metadata-changed in the same nanosecond at
-/// the same length. Even in that case the two files are the same provider build with
-/// the same offsets, so no call is ever attributed to a provider it did not go
-/// through; the only cost is that calls through the second copy go uncounted. The
-/// failure mode is therefore bounded to under-counting one duplicate deployment,
-/// never to conflating two providers.
+/// The overlay gate is what makes the content test safe, and it is not belt-and-braces.
+/// Content alone would merge **two mounts of two byte-identical filesystem images**
+/// (squashfs, erofs, iso, a loop-mounted ext4): those are two superblocks holding two
+/// genuinely distinct kernel inodes that carry the image's inode number, size and ctime
+/// *verbatim*, so every content conjunct holds by construction rather than by
+/// coincidence. A uprobe on one would not fire for the other, and merging them would
+/// silently drop the second mount's calls — the same class of silent wrongness as the
+/// double count, in the other direction. Overlayfs is the only filesystem that shows
+/// one file under several superblock devices; on NFS and FUSE the per-mount anonymous
+/// device accompanies genuinely distinct inodes, so excluding them is right too.
+///
+/// With the gate, merging two *different* providers is not reachable: they would have
+/// to be byte-identical (same SHA-256), the same length, last metadata-changed in the
+/// same nanosecond, carry the same inode number, and both be reached through overlay
+/// mounts — which report the *underlying* inode, so equal numbers there mean the same
+/// underlying inode. And even then, byte-identical means the same build with the same
+/// offsets, so no call could be attributed to a provider it did not go through; the
+/// bound is under-counting a duplicate, never conflating two providers.
+///
+/// Two shapes deliberately do **not** merge, and keep the double count:
+///  - one process reaching the file through an overlay and another reaching the same
+///    file directly (an overlay whose lowerdir is the very path the other maps). No
+///    container runtime builds that; a hand-rolled `mount -t overlay` could.
+///  - an overlay with `xino` disabled that numbers inodes from its own pool instead of
+///    passing the underlying inode's number through: `Pin.ino` then differs and nothing
+///    here fires.
 ///
 /// A target two *different* modules both publish is a different thing entirely and
 /// is untouched here: those have different digests, so they keep their own keys, and
 /// `plan::merge` still gives that shared target one slot marked ambiguous and
 /// COUNT_ONLY.
+///
+/// Call this *after* `drop_unpinned_entries`, so the election below counts targets that
+/// can actually be attached rather than merely decoded.
 pub fn merge_mappings_of_one_file(
     modules: &mut Vec<ScannedModule>,
     pinned: &PinnedObjects,
-) -> usize {
+) -> (usize, Vec<Skipped>) {
     let mut first: BTreeMap<(Pin, &str), ObjectKey> = BTreeMap::new();
     let mut canonical: BTreeMap<ObjectKey, ObjectKey> = BTreeMap::new();
     for (key, entry) in &pinned.by_key {
-        // An object nothing hashed has no content to be identified by; absence is
-        // never evidence of sameness.
-        if entry.sha256.is_empty() {
+        // An object nothing hashed has no content to be identified by, and one not
+        // reached through an overlay has no reason to show two devices: absence of
+        // evidence is never evidence of sameness.
+        if entry.sha256.is_empty() || !entry.overlay {
             continue;
         }
         match first.entry((entry.pin, entry.sha256.as_str())) {
@@ -518,7 +563,7 @@ pub fn merge_mappings_of_one_file(
         }
     }
     if canonical.is_empty() {
-        return 0;
+        return (0, Vec::new());
     }
     for module in modules.iter_mut() {
         if let Some(key) = canonical.get(&module.key) {
@@ -536,23 +581,58 @@ pub fn merge_mappings_of_one_file(
             }
         }
     }
-    // What is left is one module per file. The mapping that decoded the most wins:
-    // one process's `/proc/<pid>/mem` can be unreadable, or over the scan's byte
-    // caps, while another mapping of the same file was read in full — and a module
-    // with no entries must not shadow the one with the targets to attach.
-    let decoded = |module: &ScannedModule| -> usize {
-        module.tables.iter().map(|table| table.entries.len()).sum()
+    // What is left is one module per file, and only one of them can be attached: the
+    // probe is on the inode, so a second registration would be the double count again.
+    // The mapping with the most attachable targets wins — one process's
+    // `/proc/<pid>/mem` can be unreadable, or over the scan's byte caps, while another
+    // mapping of the same file was read in full, and an empty module must not shadow
+    // the one with targets to attach.
+    //
+    // Tables are read from *per-process* memory, so the loser can legitimately hold
+    // targets the winner does not: an in-memory patch applied in one container, or a
+    // dependency mapped only in one mount namespace. Those cannot be attached and are
+    // reported as skipped rather than dropped — a loss with no record is exactly the
+    // silence this whole task is about.
+    let targets = |module: &ScannedModule| -> BTreeSet<(ObjectKey, u64)> {
+        module
+            .tables
+            .iter()
+            .flat_map(|table| &table.entries)
+            .map(|entry| (entry.object, entry.file_offset))
+            .collect()
     };
+    let mut lost = Vec::new();
     let mut kept: Vec<ScannedModule> = Vec::new();
     for module in std::mem::take(modules) {
-        match kept.iter_mut().find(|known| known.key == module.key) {
-            Some(known) if decoded(&module) > decoded(known) => *known = module,
-            Some(_) => {}
-            None => kept.push(module),
+        let Some(position) = kept.iter().position(|known| known.key == module.key) else {
+            kept.push(module);
+            continue;
+        };
+        let (here, there) = (targets(&module), targets(&kept[position]));
+        let wins = here.len() > there.len();
+        let missing = if wins {
+            there.difference(&here).count()
+        } else {
+            here.difference(&there).count()
+        };
+        if missing > 0 {
+            lost.push(Skipped {
+                subject: module.path.clone(),
+                reason: format!(
+                    "one physical file is one attach target, and the mapping attached \
+                     here does not publish {missing} target(s) another mapping of it \
+                     decoded; those are not probed — the two processes' function tables \
+                     differ (a table patched in memory, or a dependency mapped in only \
+                     one mount namespace)"
+                ),
+            });
+        }
+        if wins {
+            kept[position] = module;
         }
     }
     *modules = kept;
-    canonical.len()
+    (canonical.len(), lost)
 }
 
 fn pin_scanned_object(
@@ -647,22 +727,28 @@ mod tests {
 
     /// A pin set as `pin_scanned_objects` builds it, but written out directly: the
     /// two mappings this is about live in two mount namespaces, so reaching this
-    /// state through the real scan needs two containers.
-    fn pins(entries: &[(ObjectKey, &str, Pin)]) -> PinnedObjects {
+    /// state through the real scan needs two containers. Each entry is
+    /// `(key, sha256, ctime)`; the pin's inode is the key's, as a real pin's always is.
+    fn pin_set(entries: &[(ObjectKey, &str, i64)], overlay: bool) -> PinnedObjects {
         PinnedObjects {
             by_key: entries
                 .iter()
-                .map(|(key, sha, pin)| {
+                .map(|(key, sha, ctime)| {
                     (
                         *key,
                         Entry {
                             file: std::fs::File::open("/dev/null").unwrap(),
-                            pin: *pin,
+                            pin: Pin {
+                                ino: key.inode,
+                                size: 4096,
+                                ctime: (*ctime, 7),
+                            },
                             path: PATH.into(),
                             sha256: (*sha).into(),
                             build_id: None,
                             identity_source: IdentitySource::Stat.label(),
                             note: None,
+                            overlay,
                         },
                     )
                 })
@@ -671,12 +757,14 @@ mod tests {
         }
     }
 
-    fn pin(ctime: i64) -> Pin {
-        Pin {
-            ino: INODE,
-            size: 4096,
-            ctime: (ctime, 7),
-        }
+    /// Objects opened through a container's overlay mount — the shape this is about.
+    fn pins(entries: &[(ObjectKey, &str, i64)]) -> PinnedObjects {
+        pin_set(entries, true)
+    }
+
+    /// The same objects, opened on a real filesystem rather than through an overlay.
+    fn image_pins(entries: &[(ObjectKey, &str, i64)]) -> PinnedObjects {
+        pin_set(entries, false)
     }
 
     /// Two containers started from one image map the *same* physical file through
@@ -687,9 +775,12 @@ mod tests {
     #[test]
     fn two_mappings_of_one_file_are_one_module_and_one_slot() {
         let mut modules = vec![module(overlay(104)), module(overlay(102))];
-        let pinned = pins(&[(overlay(104), SHA, pin(1)), (overlay(102), SHA, pin(1))]);
+        let pinned = pins(&[(overlay(104), SHA, 1), (overlay(102), SHA, 1)]);
 
-        assert_eq!(merge_mappings_of_one_file(&mut modules, &pinned), 1);
+        assert_eq!(
+            merge_mappings_of_one_file(&mut modules, &pinned),
+            (1, vec![])
+        );
         let plan = crate::plan::build_from_modules(&modules);
         assert_eq!(plan.slots.len(), 1, "{:?}", plan.slots);
         assert_eq!(plan.modules.len(), 1, "{:?}", plan.modules);
@@ -705,6 +796,32 @@ mod tests {
         assert!(pinned.attach_path_for(plan.modules[0].key).is_ok());
     }
 
+    /// Two mounts of two byte-identical filesystem images (squashfs, erofs, iso, a
+    /// loop-mounted ext4) are two superblocks — two devices — holding two genuinely
+    /// distinct kernel inodes that carry the image's inode number, size and ctime
+    /// *verbatim*. Every content conjunct is satisfied by construction rather than by
+    /// coincidence, so nothing about the bytes can separate them; a uprobe on one does
+    /// not fire for the other, and merging them silently drops the second mount's calls.
+    /// Only the overlay gate can tell this apart from the case above: the content is
+    /// identical in both, which is exactly the point.
+    #[test]
+    fn two_mounts_of_one_filesystem_image_are_not_merged() {
+        let image = |minor| ObjectKey {
+            device: Device { major: 7, minor },
+            inode: INODE,
+        };
+        let mut modules = vec![module(image(0)), module(image(1))];
+        let pinned = image_pins(&[(image(0), SHA, 1), (image(1), SHA, 1)]);
+
+        assert_eq!(
+            merge_mappings_of_one_file(&mut modules, &pinned),
+            (0, vec![])
+        );
+        let plan = crate::plan::build_from_modules(&modules);
+        assert_eq!(plan.slots.len(), 2, "{:?}", plan.slots);
+        assert_eq!(plan.modules.len(), 2, "{:?}", plan.modules);
+    }
+
     /// The dangerous direction. Inode numbers are unique only per filesystem, so two
     /// genuinely different providers on two real devices can share one — and merging
     /// them would be a worse defect than the double-counting above.
@@ -716,33 +833,125 @@ mod tests {
         };
         for pins in [
             // Same inode number, different bytes: two providers, two modules.
-            pins(&[(real(1), SHA, pin(1)), (real(17), "0badc0de", pin(1))]),
+            pins(&[(real(1), SHA, 1), (real(17), "0badc0de", 1)]),
             // Same inode number and the same bytes, but not the same inode: two
             // copies of one build, each its own file and its own attach target.
-            pins(&[(real(1), SHA, pin(1)), (real(17), SHA, pin(2))]),
+            pins(&[(real(1), SHA, 1), (real(17), SHA, 2)]),
             // Nothing hashed either one, so nothing identifies them.
-            pins(&[(real(1), "", pin(1)), (real(17), "", pin(1))]),
+            pins(&[(real(1), "", 1), (real(17), "", 1)]),
         ] {
             let mut modules = vec![module(real(1)), module(real(17))];
-            assert_eq!(merge_mappings_of_one_file(&mut modules, &pins), 0);
+            assert_eq!(merge_mappings_of_one_file(&mut modules, &pins), (0, vec![]));
             let plan = crate::plan::build_from_modules(&modules);
             assert_eq!(plan.modules.len(), 2, "{:?}", plan.modules);
             assert_eq!(plan.slots.len(), 2, "{:?}", plan.slots);
         }
     }
 
+    /// Two *different* providers — different digests, so never merged — in two
+    /// containers, both forwarding into one shared dependency. The dependency is one
+    /// file reached through two overlay mounts, so it is one slot claimed by two
+    /// modules: Task 8's rule, which must still hold after the collapse. Without the
+    /// rewrite of *entry* objects this is two slots and `module_ambiguous` reads 0 —
+    /// the ambiguity would vanish rather than be reported.
+    #[test]
+    fn one_dependency_reached_through_two_mounts_is_one_ambiguous_slot() {
+        const DEP: u64 = 56_317_999;
+        let dep = |minor| ObjectKey {
+            device: Device { major: 0, minor },
+            inode: DEP,
+        };
+        let forwarding = |device_minor, dependency| {
+            let mut module = module(overlay(device_minor));
+            module.tables[0].entries[0].object = dependency;
+            module
+        };
+        let mut modules = vec![forwarding(102, dep(102)), forwarding(104, dep(104))];
+        let pinned = pins(&[
+            // The two providers happen to share an inode number too: only their
+            // digests separate them, and that is enough.
+            (overlay(102), "aaaaaaaa", 1),
+            (overlay(104), "bbbbbbbb", 1),
+            (dep(102), "dddddddd", 1),
+            (dep(104), "dddddddd", 1),
+        ]);
+
+        assert_eq!(
+            merge_mappings_of_one_file(&mut modules, &pinned),
+            (1, vec![])
+        );
+        let plan = crate::plan::build_from_modules(&modules);
+        assert_eq!(plan.modules.len(), 2, "{:?}", plan.modules);
+        assert_eq!(plan.slots.len(), 1, "{:?}", plan.slots);
+        assert_eq!(plan.slots[0].module_ids.len(), 2);
+        assert!(plan.slots[0].semantic_ambiguous);
+        assert_eq!(
+            plan.slots[0].semantics,
+            p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+        );
+        assert_eq!(plan.module_ambiguous, 1);
+    }
+
     /// The mapping that decoded nothing — its process's `/proc/<pid>/mem` was
     /// unreadable, or it was over the scan's byte caps — must not shadow the one
-    /// that read the tables just because it was scanned first.
+    /// that read the tables just because it was scanned first. Its emptiness is not
+    /// a loss of its own: the object skip that caused it is already published.
     #[test]
     fn the_mapping_that_decoded_the_tables_is_the_one_kept() {
         let mut empty = module(overlay(104));
         empty.tables.clear();
         let mut modules = vec![empty, module(overlay(102))];
-        let pinned = pins(&[(overlay(104), SHA, pin(1)), (overlay(102), SHA, pin(1))]);
+        let pinned = pins(&[(overlay(104), SHA, 1), (overlay(102), SHA, 1)]);
 
-        assert_eq!(merge_mappings_of_one_file(&mut modules, &pinned), 1);
+        assert_eq!(
+            merge_mappings_of_one_file(&mut modules, &pinned),
+            (1, vec![])
+        );
         assert_eq!(modules.len(), 1);
         assert_eq!(crate::plan::build_from_modules(&modules).slots.len(), 1);
+    }
+
+    /// Function tables are read from *per-process* memory, so two mappings of one file
+    /// can decode different targets — a table patched in memory in one container, or a
+    /// dependency mapped in only one mount namespace. Only one of them can be attached
+    /// (the probe is on the inode), so the difference is a real loss, and a loss with
+    /// no record is the silence this whole fix is about.
+    #[test]
+    fn targets_only_the_discarded_mapping_decoded_are_reported_not_dropped() {
+        let mut patched = module(overlay(104));
+        let mut extra = patched.tables[0].entries[0].clone();
+        extra.name = "C_Sign";
+        extra.file_offset = 0x9000;
+        patched.tables[0].entries.push(extra);
+        let mut modules = vec![module(overlay(102)), patched];
+        let pinned = pins(&[(overlay(102), SHA, 1), (overlay(104), SHA, 1)]);
+
+        let (collapsed, lost) = merge_mappings_of_one_file(&mut modules, &pinned);
+        assert_eq!(collapsed, 1);
+        // The richer mapping wins, so nothing is lost — the record is only for what
+        // the *kept* mapping cannot reach.
+        assert_eq!(lost, vec![], "the mapping with more targets was kept");
+        assert_eq!(crate::plan::build_from_modules(&modules).slots.len(), 2);
+
+        // Reversed: the mapping that wins on count is missing a target the other had.
+        let mut a = module(overlay(102));
+        a.tables[0].entries[0].file_offset = 0x1000;
+        let mut b = module(overlay(104));
+        b.tables[0].entries[0].file_offset = 0x2000;
+        b.tables[0].entries.push(ScannedEntry {
+            name: "C_Sign",
+            object: overlay(104),
+            object_path: PATH.into(),
+            file_offset: 0x3000,
+        });
+        let mut modules = vec![a, b];
+        let (_, lost) = merge_mappings_of_one_file(&mut modules, &pinned);
+        assert_eq!(lost.len(), 1, "{lost:?}");
+        assert_eq!(lost[0].subject, PATH);
+        assert!(
+            lost[0].reason.contains("1 target(s)") && lost[0].reason.contains("not probed"),
+            "{:?}",
+            lost[0]
+        );
     }
 }

@@ -332,16 +332,21 @@ pub fn signal_return(ctx: RetProbeContext) -> u32 {
     let pid_tgid = helpers::bpf_get_current_pid_tgid();
     // SAFETY: the probe context is the kernel-provided context for this attachment.
     let case_id = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) } as u8;
+    // SAFETY: these helpers take no pointers, and SIGSTOP is a valid scalar signal.
+    let (hook_ts_ns, send_signal_rc) = unsafe {
+        (
+            helpers::bpf_ktime_get_ns(),
+            helpers::bpf_send_signal(19) as i64,
+        )
+    };
     // SAFETY: reserve owns one writable 32-byte entry; four u64 writes initialize every byte,
-    // no reference/read/submit occurs before initialization, and SIGSTOP is a valid scalar signal.
+    // and no reference/read/submit occurs before initialization.
     unsafe {
         let mut word = 0usize;
         while word < 4 {
             core::ptr::write(words.add(word), 0);
             word += 1;
         }
-        let hook_ts_ns = helpers::bpf_ktime_get_ns();
-        let send_signal_rc = helpers::bpf_send_signal(19) as i64;
         core::ptr::write(core::ptr::addr_of_mut!((*raw).hook_ts_ns), hook_ts_ns);
         core::ptr::write(core::ptr::addr_of_mut!((*raw).pid_tgid), pid_tgid);
         core::ptr::write(

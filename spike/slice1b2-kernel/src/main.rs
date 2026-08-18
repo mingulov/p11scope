@@ -3707,6 +3707,19 @@ mod tests {
             .success()
     }
 
+    fn shell_validate_gate_b_semantics(script: &str, path: &Path, expected_rc: u8) -> bool {
+        Command::new("bash")
+            .arg("-c")
+            .arg("source \"$1\"; validate_gate_b_semantics \"$2\" \"$3\"")
+            .arg("bash")
+            .arg(script)
+            .arg(path)
+            .arg(expected_rc.to_string())
+            .status()
+            .unwrap()
+            .success()
+    }
+
     #[test]
     fn canonical_gate_export_requires_four_verifier_records_and_matching_final_status() {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
@@ -3815,7 +3828,7 @@ mod tests {
             serde_json::from_str(std::fs::read_to_string(&timing).unwrap().trim()).unwrap();
         record["pass"] = false.into();
         record["failure_category"] = "runtime".into();
-        record["runtime_failure_reason"] = "child exit timeout".into();
+        record["runtime_failure_reason"] = "task stat".into();
         std::fs::write(&timing, record.to_string() + "\n").unwrap();
         std::fs::write(
             runtime_failure.join("runner-status.txt"),
@@ -3823,6 +3836,36 @@ mod tests {
         )
         .unwrap();
         assert!(shell_validate_gate_b_export(script, &runtime_failure, 1));
+        let runtime_reasons = shell_lines(script, "source \"$1\"; gate_b_runtime_reasons", &[]);
+        assert_eq!(runtime_reasons.len(), 30);
+        assert_eq!(
+            runtime_reasons
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            runtime_reasons.len()
+        );
+        let production_source = std::fs::read_to_string(file!()).unwrap();
+        let production_source = production_source.split_once("#[cfg(test)]").unwrap().0;
+        for reason in &runtime_reasons {
+            assert!(
+                production_source.contains(&format!("\"{reason}\"")),
+                "validator reason is not produced by Gate B: {reason}"
+            );
+            record["runtime_failure_reason"] = reason.clone().into();
+            std::fs::write(&timing, record.to_string() + "\n").unwrap();
+            assert!(
+                shell_validate_gate_b_semantics(script, &runtime_failure, 1),
+                "rejected reachable Gate B runtime reason: {reason}"
+            );
+        }
+        record["runtime_failure_reason"] = "unknown runtime reason".into();
+        std::fs::write(&timing, record.to_string() + "\n").unwrap();
+        assert!(!shell_validate_gate_b_semantics(
+            script,
+            &runtime_failure,
+            1
+        ));
 
         let oracle_failure = temp.path().join("valid-oracle-failure");
         fake_canonical_gate_b_export(&oracle_failure, 2, 1, "none");
@@ -4563,18 +4606,28 @@ mod tests {
         assert!(source.contains("DISCOVERY.reserve::<SignalRecord>(0)"));
         assert!(source.contains("increment_counter(LATE_HITS)"));
         let signal = source.find("pub fn signal_return(").unwrap();
-        let timestamp = source[signal..]
-            .find("helpers::bpf_ktime_get_ns()")
-            .unwrap()
-            + signal;
-        let send = source[signal..]
-            .find("helpers::bpf_send_signal(19)")
-            .unwrap()
-            + signal;
+        let signal_end = source[signal..].find("pub fn late_hit(").unwrap() + signal;
+        let signal_source = &source[signal..signal_end];
+        let timestamp = signal_source.find("helpers::bpf_ktime_get_ns()").unwrap();
+        let send = signal_source.find("helpers::bpf_send_signal(19)").unwrap();
+        let unsafe_start = signal_source
+            .find("unsafe {\n        let mut word = 0usize;")
+            .unwrap();
+        let unsafe_end = signal_source[unsafe_start..].find("\n    }").unwrap() + unsafe_start;
+        let submit = signal_source.find("entry.submit(0);").unwrap();
         assert!(
             timestamp < send,
             "timestamp must be sampled immediately before SIGSTOP"
         );
+        assert!(
+            send < unsafe_start,
+            "timestamp and signal helpers must remain outside the raw-write unsafe block"
+        );
+        assert!(
+            submit > unsafe_end,
+            "signal submit must remain outside raw initialization"
+        );
+        assert!(!signal_source[unsafe_start..unsafe_end].contains("helpers::bpf_"));
         assert!(
             source.contains("START.insert(&key, &state, aya_ebpf::bindings::BPF_NOEXIST as u64)")
         );
@@ -4585,13 +4638,14 @@ mod tests {
                 .count(),
             1
         );
-        let unsafe_start = source
+        let discovery_unsafe_start = source
             .find("unsafe {\n        let mut word = 0usize;")
             .unwrap();
-        let unsafe_end = source[unsafe_start..].find("\n    }").unwrap() + unsafe_start;
-        let submit = source.find("entry.submit(0);").unwrap();
+        let discovery_unsafe_end =
+            source[discovery_unsafe_start..].find("\n    }").unwrap() + discovery_unsafe_start;
+        let discovery_submit = source.find("entry.submit(0);").unwrap();
         assert!(
-            submit > unsafe_end,
+            discovery_submit > discovery_unsafe_end,
             "submit must remain outside raw initialization"
         );
 

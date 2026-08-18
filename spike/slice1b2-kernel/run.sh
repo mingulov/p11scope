@@ -239,6 +239,41 @@ for name in ["environment.txt", "manifest-digests.txt", "verifier.log"]:
 PY
 }
 
+gate_b_runtime_reasons() {
+    cat <<'REASONS'
+cancellation pipe
+cancelled_sigint
+cancelled_sigterm
+signal record surplus
+counter read
+fixture pipes
+fixture pipe flags
+gated child
+pidfd authority
+fixture offset
+fixture ready timeout
+pipe byte
+task list
+task id
+task stat
+stat comm delimiter
+stat state
+task set
+task count
+child release
+signal record timeout
+signal record length is not 32 bytes
+signal record identity
+poll
+stop timing
+marker byte
+marker read
+monotonic clock
+child exit timeout
+child wait
+REASONS
+}
+
 gate_b_semantics_python() {
     cat <<'PY'
 import json, math, os, sys
@@ -246,15 +281,11 @@ directory, expected_rc = sys.argv[1:]
 if expected_rc not in {"0", "1"}:
     raise SystemExit(64)
 programs = ["signal_return", "late_hit"]
-runtime_reasons = {
-    "cancellation pipe", "cancelled_sigint", "cancelled_sigterm", "signal record surplus",
-    "counter read", "fixture pipes", "fixture pipe flags", "gated child", "pidfd authority",
-    "fixture offset", "fixture ready timeout", "pipe byte", "task list", "task id",
-    "stat comm delimiter", "stat state", "task set", "task count", "child release",
-    "signal record timeout", "signal record length is not 32 bytes", "signal record identity",
-    "poll", "stop timing", "marker byte", "marker read", "monotonic clock",
-    "child exit timeout", "child wait",
-}
+runtime_reasons = set("""
+PY
+    gate_b_runtime_reasons
+    cat <<'PY'
+""".splitlines())
 def json_lines(name):
     with open(os.path.join(directory, name), encoding="utf-8") as stream:
         return [json.loads(line) for line in stream if line.strip()]

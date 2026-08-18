@@ -151,6 +151,11 @@ pub struct Evidence {
     /// Discovered entries with no attachable target, and why. Also published
     /// per module in `discovery[].skipped`.
     pub skipped: Vec<SkippedOut>,
+    /// Planned slots whose scan-only names are not authorized for semantic
+    /// interpretation. Derived from the plan; public v2 derives the same fact
+    /// from discovery provenance instead of serializing a duplicate counter.
+    #[serde(skip)]
+    pub semantic_unverified_slots: usize,
     pub in_flight_at_end: u64,
     /// Per-surface discovery provenance (walk outcome, acquisition status).
     /// A surface that was not fully walked or failed to acquire means
@@ -317,6 +322,7 @@ impl Evidence {
         self.completeness = if discovery_complete
             && self.attach_failures.is_empty()
             && self.skipped.is_empty()
+            && self.semantic_unverified_slots == 0
             && self.aliased.is_empty()
             && self.in_flight_at_end == 0
             && surfaces_complete
@@ -466,6 +472,7 @@ pub fn live(
         || ev.semantic_capture_failures > 0
         || ev.unregistered_mechanisms > 0
         || ev.template_tail_failures > 0
+        || ev.semantic_unverified_slots > 0
         || state_gaps > 0
         || ev.malformed_records > 0
         || ev.templates_truncated
@@ -545,6 +552,17 @@ pub fn live(
             evidence_line.push_str(&format!(
                 " {} template tail calls failed",
                 ev.template_tail_failures
+            ));
+        }
+        if ev.semantic_unverified_slots > 0 {
+            evidence_line.push_str(&format!(
+                " {} semantics-unverified/count-only slot{}",
+                ev.semantic_unverified_slots,
+                if ev.semantic_unverified_slots == 1 {
+                    ""
+                } else {
+                    "s"
+                }
             ));
         }
         if state_gaps > 0 {
@@ -1103,6 +1121,7 @@ mod tests {
         SlotReport {
             names: vec![name.into()],
             aliased,
+            semantic_authorized: true,
             module: None,
             module_ambiguous: false,
             calls,
@@ -1132,6 +1151,7 @@ mod tests {
             attach_failures: vec![],
             aliased: vec![],
             skipped: vec![],
+            semantic_unverified_slots: 0,
             in_flight_at_end: 0,
             surfaces: vec![ok_surface()],
             vendor_interfaces: 0,
@@ -1320,6 +1340,27 @@ mod tests {
         let mut ev = evidence();
         ev.verdict();
         assert_eq!(ev.completeness, "COMPLETE");
+    }
+
+    #[test]
+    fn unverified_semantic_authority_alone_forces_partial() {
+        let mut ev = evidence();
+        ev.semantic_unverified_slots = 1;
+        ev.verdict();
+
+        assert_eq!(ev.completeness, "PARTIAL");
+        let output = live(
+            &reports_fixture(),
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+        );
+        assert!(
+            output.contains("1 semantics-unverified/count-only slot"),
+            "{output}"
+        );
     }
 
     #[test]

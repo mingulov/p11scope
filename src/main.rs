@@ -2461,6 +2461,11 @@ fn evidence_for(
             .iter()
             .map(render::capture_skipped_out)
             .collect(),
+        semantic_unverified_slots: plan
+            .slots
+            .iter()
+            .filter(|slot| !slot.semantic_authorized)
+            .count(),
         in_flight_at_end: reports.iter().map(|r| r.in_flight).sum(),
         surfaces: plan.surfaces.clone(),
         vendor_interfaces: plan.vendor_interfaces,
@@ -4007,6 +4012,7 @@ mod tests {
                 .iter()
                 .map(render::capture_skipped_out)
                 .collect(),
+            semantic_unverified_slots: 0,
             in_flight_at_end: 0,
             surfaces: plan.surfaces.clone(),
             vendor_interfaces: 0,

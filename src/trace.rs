@@ -245,18 +245,28 @@ impl<'a> Tracer<'a> {
         process: ProcessKey,
         state: &mut State,
     ) -> String {
-        let pre = (ev.session != SESSION_NONE)
+        let slot = self.plan.slots.iter().find(|slot| slot.index == ev.slot);
+        let semantic = slot
+            .is_some_and(|slot| slot.semantics != p11scope_ebpf_common::SlotSemantics::COUNT_ONLY);
+        let pre = (semantic && ev.session != SESSION_NONE)
             .then(|| state.session_pseudonym_process(process, ev.slot, ev.session))
             .flatten();
         state.observe_process(process, ev);
         let session = pre.or_else(|| {
-            (ev.session != SESSION_NONE)
+            (semantic && ev.session != SESSION_NONE)
                 .then(|| state.session_pseudonym_process(process, ev.slot, ev.session))
                 .flatten()
         });
         let wall_ns = self.wall_ns_for(ev.ts_ns);
-        let function = function_name(self.plan, ev.slot);
-        format_line(ev, wall_ns, &function, session)
+        let mut function = function_name(self.plan, ev.slot);
+        if slot.is_some_and(|slot| !slot.semantic_authorized) {
+            function.push_str(" [semantics unverified]");
+        }
+        let mut rendered = *ev;
+        if !semantic {
+            rendered.capture = 0;
+        }
+        format_line(&rendered, wall_ns, &function, session)
     }
 }
 
@@ -395,6 +405,7 @@ mod tests {
             attach_failures: vec![],
             aliased: vec![],
             skipped: vec![],
+            semantic_unverified_slots: 0,
             in_flight_at_end: 0,
             surfaces: vec![],
             vendor_interfaces: 0,
@@ -543,6 +554,37 @@ mod tests {
             state.session_pseudonym(100, 0, 0xDEAD_BEEF).is_none(),
             "mapping retired after close"
         );
+    }
+
+    #[test]
+    fn unverified_slot_is_explicit_and_semantically_empty() {
+        let mut plan = test_plan();
+        plan.slots.truncate(1);
+        plan.slots[0].semantic_authorized = false;
+        plan.slots[0].semantics = p11scope_ebpf_common::SlotSemantics::COUNT_ONLY;
+        let mut state = State::new(&plan);
+        let mut tracer = Tracer::new(&plan);
+        let mut event = open_event(100, 0xdead_beef);
+        event.capture = capture::MECHANISM_VALUE;
+        event.mechanism = pkcs11_proxy_ng_types::CkMechanismType::AES_GCM.0;
+        event.shape = shape::GCM;
+        event.p0 = 12;
+        event.p1 = 16;
+        event.p2 = 128;
+
+        let line = tracer.on_event(&event, &mut state);
+
+        assert!(
+            line.contains("C_OpenSession [semantics unverified]"),
+            "{line}"
+        );
+        assert!(line.contains("CKR_OK"), "{line}");
+        for forbidden in ["sess#", "CKM_", "deadbeef", "/opt/"] {
+            assert!(!line.contains(forbidden), "leaked {forbidden}: {line}");
+        }
+        assert!(state.mechanisms().is_empty());
+        assert_eq!(state.sessions().opened, 0);
+        assert_eq!(state.pending_at_end(), 0);
     }
 
     #[test]

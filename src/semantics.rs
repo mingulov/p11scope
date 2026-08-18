@@ -1383,6 +1383,9 @@ impl State {
             }
         }
         let Some(meta) = meta else { return };
+        if meta.semantics == p11scope_ebpf_common::SlotSemantics::COUNT_ONLY {
+            return;
+        }
 
         if ev.session != SESSION_NONE
             && self
@@ -2398,6 +2401,40 @@ mod tests {
             interface_list: "absent".into(),
             module_ambiguous: 0,
         }
+    }
+
+    #[test]
+    fn unverified_count_only_slot_creates_no_semantic_state() {
+        let mut plan = test_plan();
+        plan.slots.truncate(1);
+        plan.slots[0].semantic_authorized = false;
+        plan.slots[0].semantics = p11scope_ebpf_common::SlotSemantics::COUNT_ONLY;
+        plan.entries_seen = 1;
+        let mut state = State::new(&plan);
+        let hostile = Event {
+            slot: 0,
+            pid_tgid: pid_tgid(100),
+            cgroup_id: 7,
+            session: 0xdead_beef,
+            mechanism: 0x1087,
+            capture: capture::MECHANISM_VALUE,
+            user_type: 1,
+            shape: shape::GCM,
+            attr_types: [0x100; 8],
+            attr_count: 8,
+            attr_total: 9,
+            rv: CkRv::PENDING.0,
+            ..Event::default()
+        };
+
+        state.observe(&hostile);
+
+        assert_eq!(state.cgroups()[&7].calls, 1, "aggregate evidence remains");
+        assert!(state.mechanisms().is_empty());
+        assert_eq!(state.sessions(), SessionStats::default());
+        assert!(state.logins().is_empty());
+        assert!(state.templates().is_empty());
+        assert_eq!(state.pending_at_end(), 0);
     }
 
     /// An `*Init` event carrying a decoded (or not-decoded) parameter shape.

@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 pub struct SlotReport {
     pub names: Vec<String>,
     pub aliased: bool,
+    pub semantic_authorized: bool,
     /// The module these counts belong to; `None` when two modules publish this
     /// target and neither can be credited (spec §4.7).
     pub module: Option<ModuleId>,
@@ -72,6 +73,7 @@ pub fn read(session: &Session, plan: &AttachPlan) -> Result<Vec<SlotReport>> {
         out.push(SlotReport {
             names: slot.names.clone(),
             aliased: slot.aliased,
+            semantic_authorized: slot.semantic_authorized,
             module: plan.module_of_slot(slot.index),
             module_ambiguous: slot.module_ids.len() >= 2,
             calls: acc.returned,

@@ -956,6 +956,90 @@ gate_b_lane() {
     gate_lane b "$@"
 }
 
+diag_lane() {
+    local lane=$1 bundle=$2 run_dir=$3
+    local remote=/var/tmp/p11scope-slice1b2/bundle
+    local lane_rc=64 finish_rc=0 rc=0 name remote_command
+    [[ ! -e $run_dir && ! -L $run_dir ]] || {
+        printf 'diag-lane requires a new run directory\n' >&2
+        return 64
+    }
+    validate_execution_bundle "$bundle" || return
+    exec {lifecycle_lock}>/tmp/p11scope-slice1b2-spike-vm.lock
+    flock -n "$lifecycle_lock" || return 64
+    PRIVATE_QEMU_PID=
+    PRIVATE_LANE_OWNED=0
+    PRIVATE_LANE_CLEANUP=idle
+    PRIVATE_LANE_INTERRUPTED=0
+    PRIVATE_FINISH_RC=0
+    private_arm_lane_traps
+    private_start_lane "$lane" "$run_dir" || {
+        private_cleanup_lane || true
+        private_disarm_lane_traps
+        return 64
+    }
+    strict_ssh "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" \
+        "test ! -e /var/tmp/p11scope-slice1b2 && mkdir -m 0700 /var/tmp/p11scope-slice1b2 && mkdir -m 0700 $remote" \
+        >"$run_dir/bundle-mkdir.stdout" 2>"$run_dir/bundle-mkdir.stderr" || rc=64
+    if (( rc == 0 )); then
+        local -a scp
+        mapfile -d '' -t scp < <(scp_argv "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT")
+        for name in slice1b2-kernel-ebpf slice1b2-runner; do
+            timeout 120s "${scp[@]}" "$bundle/$name" "p11scope@127.0.0.1:$remote/$name" \
+                >>"$run_dir/scp.stdout" 2>>"$run_dir/scp.stderr" || rc=64
+        done
+    fi
+    (cd "$bundle" && sha256sum slice1b2-kernel-ebpf slice1b2-runner) >"$run_dir/bundle.host.sha256"
+    if (( rc == 0 )); then
+        strict_ssh "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" \
+            "cd $remote && sha256sum slice1b2-kernel-ebpf slice1b2-runner" \
+            >"$run_dir/bundle.guest.sha256" 2>"$run_dir/bundle-hash.stderr" || rc=64
+        cmp "$run_dir/bundle.host.sha256" "$run_dir/bundle.guest.sha256" || rc=64
+    fi
+    if (( rc == 0 )); then
+        strict_ssh "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" 'systemd-detect-virt; uname -r' \
+            >"$run_dir/virt.txt" 2>&1 || rc=64
+    fi
+    if (( rc == 0 )); then
+        local -a ssh
+        mapfile -d '' -t ssh < <(ssh_argv "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT")
+        remote_command="sudo -n timeout --signal=TERM --kill-after=5s 600s $remote/slice1b2-runner gate-a-diag $remote/slice1b2-kernel-ebpf /var/tmp/p11scope-slice1b2/diag"
+        if timeout 660s "${ssh[@]}" p11scope@127.0.0.1 "$remote_command" \
+            >"$run_dir/diag.stdout" 2>"$run_dir/diag.stderr"; then
+            rc=0
+        else
+            rc=$?
+        fi
+        printf '%s\n' "$rc" >"$run_dir/diag.status"
+        case "$rc" in
+            0) printf 'PASS\n' >"$run_dir/diag.outcome"; lane_rc=0 ;;
+            1) printf 'FAIL\n' >"$run_dir/diag.outcome"; lane_rc=1 ;;
+            124)
+                if quiesce_gate_runner "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" \
+                    "$remote/slice1b2-runner" >"$run_dir/quiesce.stdout" 2>"$run_dir/quiesce.stderr"; then
+                    printf 'TIMEOUT\n' >"$run_dir/diag.outcome"
+                    lane_rc=2
+                else
+                    rc=64
+                fi
+                ;;
+            *) rc=64 ;;
+        esac
+    fi
+    if (( rc == 0 || rc == 1 || rc == 124 )); then
+        local -a scp
+        mapfile -d '' -t scp < <(scp_argv "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT")
+        timeout 120s "${scp[@]}" \
+            "p11scope@127.0.0.1:/var/tmp/p11scope-slice1b2/diag/diag.jsonl" \
+            "$run_dir/diag.jsonl" || rc=64
+    fi
+    private_cleanup_lane || finish_rc=$?
+    private_disarm_lane_traps
+    (( finish_rc == 0 )) || return 64
+    (( rc == 0 || rc == 1 || rc == 124 )) || return 64
+    return "$lane_rc"
+}
+
 build_bpf() {
     local output=$1 here root object rustc_verbose
     [[ ! -e $output && ! -L $output ]] || {
@@ -1340,8 +1424,12 @@ run_main() {
             [[ $# == 5 ]] || return 64
             gate_b_lane "$2" "$3" "$4" "$5"
             ;;
+        diag-lane)
+            [[ $# == 4 ]] || return 64
+            diag_lane "$2" "$3" "$4"
+            ;;
         *)
-            printf 'usage: run.sh {build-fixture OUT|build-bpf NEW_OUT|freeze-execution SOURCE BUILD NEW_BUNDLE|provision-jammy ARCHIVE MANIFEST MANIFEST_SHA NEW_RUN_DIR NEW_BUILD_OUT|vm-start LANE NEW_RUN_DIR|gate-a-lane LANE BUNDLE NEW_RUN_DIR NEW_EXPORT|gate-b-lane LANE BUNDLE NEW_RUN_DIR NEW_EXPORT}\n' >&2
+            printf 'usage: run.sh {build-fixture OUT|build-bpf NEW_OUT|freeze-execution SOURCE BUILD NEW_BUNDLE|provision-jammy ARCHIVE MANIFEST MANIFEST_SHA NEW_RUN_DIR NEW_BUILD_OUT|vm-start LANE NEW_RUN_DIR|gate-a-lane LANE BUNDLE NEW_RUN_DIR NEW_EXPORT|gate-b-lane LANE BUNDLE NEW_RUN_DIR NEW_EXPORT|diag-lane LANE BUNDLE NEW_RUN_DIR}\n' >&2
             return 64
             ;;
     esac

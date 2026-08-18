@@ -4790,7 +4790,7 @@ mod tests {
         );
         let remote = std::fs::read_to_string(run.join("remote-command.txt")).unwrap();
         assert!(remote.contains(
-            "sudo -n timeout --signal=TERM --kill-after=5s 120s /var/tmp/p11scope-slice1b2/bundle/slice1b2-runner gate-a"
+            "sudo -n taskset -c 0 timeout --signal=TERM --kill-after=5s 120s /var/tmp/p11scope-slice1b2/bundle/slice1b2-runner gate-a"
         ));
     }
 
@@ -4837,7 +4837,7 @@ mod tests {
         assert!(!export.exists());
         let remote = std::fs::read_to_string(run.join("remote-command.txt")).unwrap();
         assert!(remote.contains(
-            "sudo -n timeout --signal=TERM --kill-after=5s 120s /var/tmp/p11scope-slice1b2/bundle/slice1b2-runner gate-b --runs 20"
+            "sudo -n taskset -c 0 timeout --signal=TERM --kill-after=5s 120s /var/tmp/p11scope-slice1b2/bundle/slice1b2-runner gate-b --runs 20"
         ));
     }
 

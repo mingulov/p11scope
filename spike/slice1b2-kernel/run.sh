@@ -995,7 +995,11 @@ gate_lane() {
         *) gate_rc=64 ;;
     esac
     if (( gate_rc == 0 )); then
-        remote_command="sudo -n timeout --signal=TERM --kill-after=5s 120s $remote/slice1b2-runner $gate_name$gate_args --source-manifest $remote/source-elf.manifest --build-evidence $remote/build-evidence.txt --execution-manifest $remote/execution.manifest --bpf $remote/slice1b2-kernel-ebpf --fixture $remote/slice1b2-fixture --out $gate_dir"
+        # pin the runner to the first guest CPU: its attach burst is the
+        # busiest runnable task during the pre-release window and would
+        # otherwise preempt the fixture's spinning stop-hook waiter on the
+        # second CPU, whose resume boundary would swallow the group stop
+        remote_command="sudo -n taskset -c 0 timeout --signal=TERM --kill-after=5s 120s $remote/slice1b2-runner $gate_name$gate_args --source-manifest $remote/source-elf.manifest --build-evidence $remote/build-evidence.txt --execution-manifest $remote/execution.manifest --bpf $remote/slice1b2-kernel-ebpf --fixture $remote/slice1b2-fixture --out $gate_dir"
         if gate_ssh "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" "$remote_command" \
             >"$run_dir/$gate_name.stdout" 2>"$run_dir/$gate_name.stderr"; then
             gate_rc=0

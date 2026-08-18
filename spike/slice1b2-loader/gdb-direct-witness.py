@@ -4,6 +4,7 @@ import os
 import struct
 
 FAMILY = os.environ["SPIKE_FAMILY"]
+LOAD_KIND = os.environ.get("SPIKE_LOAD_KIND", "dlopen")
 RDEBUG_R_STATE_OFFSET = 24
 with open(os.environ["SPIKE_META"], encoding="utf-8") as f:
     META = json.load(f)
@@ -47,7 +48,7 @@ def binding(pid, role):
                 detail = (
                     "path=%s dev=%s/%d inode=%d/%d map=[0x%x-0x%x) map_offset=0x%x "
                     "p_offset=0x%x p_vaddr=0x%x bias=0x%x symbol=0x%x address=0x%x"
-                    % (obj["path"], m["dev_text"], obj["dev"], m["inode"], obj["inode"], m["start"], m["end"], m["offset"],
+                    % (obj["path"], m["dev_text"], m["dev"], obj["inode"], obj["inode"], m["start"], m["end"], m["offset"],
                        p["offset"], p["vaddr"], base, symbol, address)
                 )
                 return (address, detail), None
@@ -94,6 +95,9 @@ def direct_witness(pid):
         return "FAIL_UNEQUAL", detail
     return "PASS_EQUAL", detail
 
+def classify_witness(witness):
+    return {"PASS_EQUAL": "PASS", "FAIL_ZERO": "FAIL", "FAIL_UNEQUAL": "FAIL"}.get(witness, "BLOCKED")
+
 class DlopenBreakpoint(gdb.Breakpoint):
     def stop(self):
         global seen_dlopen
@@ -103,8 +107,13 @@ class DlopenBreakpoint(gdb.Breakpoint):
 
 class LoaderBreakpoint(gdb.Breakpoint):
     def stop(self):
-        global seen_add, decisive_done, classification
         pid = gdb.selected_inferior().pid
+        if LOAD_KIND == "initial_set":
+            return self.stop_initial_set(pid)
+        return self.stop_dlopen(pid)
+
+    def stop_dlopen(self, pid):
+        global seen_add, decisive_done, classification
         witness, detail = direct_witness(pid)
         if FAMILY == "glibc":
             state, state_detail = r_state(pid)
@@ -116,7 +125,7 @@ class LoaderBreakpoint(gdb.Breakpoint):
                     out("GDB_GLIBC_POST_DLOPEN_RT_ADD")
                 elif state == 0 and seen_add:
                     decisive_done = True
-                    classification = {"PASS_EQUAL": "PASS", "FAIL_ZERO": "FAIL", "FAIL_UNEQUAL": "FAIL"}.get(witness, "BLOCKED")
+                    classification = classify_witness(witness)
                     out("GDB_GLIBC_DECISIVE_FIRST_RT_CONSISTENT classification=%s witness=%s" % (classification, witness))
         else:
             out("GDB_LOADER family=musl phase=%s witness=%s %s" %
@@ -125,6 +134,40 @@ class LoaderBreakpoint(gdb.Breakpoint):
                 decisive_done = True
                 classification = "PASS"
                 out("GDB_MUSL_USABLE_DIRECT_EQUAL")
+        return False
+
+    def stop_initial_set(self, pid):
+        global decisive_done, classification
+        dso_bound, dso_reason = binding(pid, "dso")
+        mapped = dso_bound is not None
+        if FAMILY == "glibc":
+            state, state_detail = r_state(pid)
+            if not decisive_done:
+                if mapped and state == 0:
+                    witness, detail = direct_witness(pid)
+                    decisive_done = True
+                    classification = classify_witness(witness)
+                    out("GDB_GLIBC_INITIAL_SET_DECISIVE_RT_CONSISTENT classification=%s witness=%s %s" %
+                        (classification, witness, detail))
+                else:
+                    out("GDB_LOADER family=glibc load_kind=initial_set phase=INITIAL_LINK_SET PRE_MAPPING r_state=%s witness=BLOCKED %s dso=%s" %
+                        (state, state_detail, "mapped" if mapped else dso_reason))
+            else:
+                out("GDB_LOADER family=glibc load_kind=initial_set phase=POST_DECISIVE r_state=%s %s" % (state, state_detail))
+        else:
+            if not decisive_done:
+                if not mapped:
+                    out("GDB_LOADER family=musl load_kind=initial_set phase=INITIAL_LINK_SET PRE_MAPPING witness=BLOCKED dso=%s" % dso_reason)
+                else:
+                    witness, detail = direct_witness(pid)
+                    if witness == "PASS_EQUAL":
+                        decisive_done = True
+                        classification = "PASS"
+                        out("GDB_MUSL_INITIAL_SET_USABLE_DIRECT_EQUAL %s" % detail)
+                    else:
+                        out("GDB_LOADER family=musl load_kind=initial_set phase=INITIAL_LINK_SET witness=%s %s" % (witness, detail))
+            else:
+                out("GDB_LOADER family=musl load_kind=initial_set phase=POST_DECISIVE witness=PASS_EQUAL")
         return False
 
 class CtorBreakpoint(gdb.Breakpoint):
@@ -147,7 +190,8 @@ DlopenBreakpoint("dlopen")
 LoaderBreakpoint("_dl_debug_state")
 CtorBreakpoint("fixture_ctor_marker")
 gdb.execute("run")
-if not seen_dlopen or not ctor_seen or not decisive_done:
+complete = ctor_seen and decisive_done and (LOAD_KIND == "initial_set" or seen_dlopen)
+if not complete:
     classification = "BLOCKED"
-out("GDB_FINAL_CLASSIFICATION=%s seen_dlopen=%s seen_add=%s decisive_done=%s ctor_seen=%s" %
-    (classification, seen_dlopen, seen_add, decisive_done, ctor_seen))
+out("GDB_FINAL_CLASSIFICATION=%s seen_dlopen=%s seen_add=%s decisive_done=%s ctor_seen=%s load_kind=%s" %
+    (classification, seen_dlopen, seen_add, decisive_done, ctor_seen, LOAD_KIND))

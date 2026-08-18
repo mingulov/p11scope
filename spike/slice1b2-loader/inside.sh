@@ -10,11 +10,12 @@ if [ "${SPIKE_BASH:-}" != 1 ]; then
 fi
 set -euo pipefail
 
+kind=${SPIKE_LOAD_KIND:-dlopen}
 status=BLOCKED
 step=init
-trap 'rc=$?; printf "INNER_FINAL_STATUS=%s rc=%s step=%s\\n" "$status" "$rc" "$step"' EXIT
+trap 'rc=$?; printf "INNER_FINAL_STATUS=%s rc=%s step=%s kind=%s\\n" "$status" "$rc" "$step" "$kind"' EXIT
 
-echo "INNER_BEGIN family=$family image_ref=$image_ref lane=$lane"
+echo "INNER_BEGIN family=$family image_ref=$image_ref lane=$lane kind=$kind"
 step=install_tools
 if [ "$family" = musl ]; then
     apk add --no-cache build-base gdb binutils file python3
@@ -30,27 +31,76 @@ id
 grep '^CapEff:' /proc/self/status
 if [ -r /proc/sys/kernel/yama/ptrace_scope ]; then echo "YAMA_PTRACE_SCOPE=$(cat /proc/sys/kernel/yama/ptrace_scope)"; else echo 'YAMA_PTRACE_SCOPE=unavailable'; fi
 if [ -r /proc/self/attr/current ]; then echo "LSM_CURRENT=$(cat /proc/self/attr/current)"; else echo 'LSM_CURRENT=unavailable'; fi
+if [ "$family" = glibc ]; then
+    dpkg-query -W -f 'LIBC6_VERSION=${Version}\n' libc6
+    echo "GNU_LIBC_VERSION=$(getconf GNU_LIBC_VERSION)"
+fi
 echo "ENVIRONMENT_BOUNDARY=recorded-effective-container-state; SYS_PTRACE/seccomp-unconfined-are-command-line-relaxations-not-minimum-authority-claim"
 echo "STEP_OK=$step"
 
+if [ "$family" = glibc ]; then
+    step=source_provenance
+    # Enable deb-src for both deb822 (.sources) and classic (.list) layouts.
+    sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+    if [ -f /etc/apt/sources.list ] && grep -q '^deb ' /etc/apt/sources.list; then
+        grep '^deb ' /etc/apt/sources.list | sed 's/^deb /deb-src /' >> /etc/apt/sources.list
+    fi
+    apt-get update -qq
+    apt-get install -y -qq --no-install-recommends dpkg-dev
+    mkdir -p /work
+    cd /work
+    if apt-get source -qq glibc >provenance-aptsource.log 2>&1; then
+        echo "PROVENANCE_APT_SOURCE=ok"
+        dsc=$(ls -1 /work/glibc_*.dsc 2>/dev/null | head -1)
+        echo "PROVENANCE_DSC=$(basename "$dsc")"
+        sha256sum "$dsc"
+        grep -E '^(Package|Version): ' "$dsc" || true
+        dl_open=$(find /work -maxdepth 2 -path '*/elf/dl-open.c' | head -1)
+        echo "PROVENANCE_DL_OPEN_PATH=$dl_open"
+        sha256sum "$dl_open"
+        echo "PROVENANCE_DL_OPEN_BEGIN"
+        grep -n -B12 -A6 -E '_dl_debug_state|dl_open_worker' "$dl_open" || true
+        echo "PROVENANCE_DL_OPEN_END"
+        echo "PROVENANCE_DEBIAN_PATCHES_TOUCHING_DL_OPEN_BEGIN"
+        hits=$(grep -l 'dl-open\.c' /work/glibc-*/debian/patches/* 2>/dev/null || true)
+        if [ -n "$hits" ]; then
+            echo "$hits"
+            for p in $hits; do echo "--- $p"; grep -n 'dl-open' "$p" | head -5 || true; done
+        else
+            echo NONE
+        fi
+        echo "PROVENANCE_DEBIAN_PATCHES_TOUCHING_DL_OPEN_END"
+    else
+        echo "PROVENANCE_SOURCE_UNAVAILABLE"
+        cat provenance-aptsource.log || true
+        case "$lane" in
+            glibc-241-debian13|glibc-24x-ubuntu2604) exit 4 ;;
+        esac
+    fi
+    cd /
+    echo "STEP_OK=$step"
+fi
+
 step=copy_sources
 mkdir -p /work
-cp /evidence/round2/fixture.c /evidence/round2/dso.c /evidence/round2/elf_meta.py \
-    /evidence/round2/gdb-direct-witness.py /evidence/round2/rdebug-layout.c /work/
+cp /evidence/round3/fixture.c /evidence/round3/fixture-needed.c /evidence/round3/dso.c /evidence/round3/elf_meta.py \
+    /evidence/round3/gdb-direct-witness.py /evidence/round3/rdebug-layout.c /work/
 cd /work
-sha256sum fixture.c dso.c elf_meta.py gdb-direct-witness.py rdebug-layout.c
+sha256sum fixture.c fixture-needed.c dso.c elf_meta.py gdb-direct-witness.py rdebug-layout.c
 echo "STEP_OK=$step"
 
 step=compile
 gcc -shared -fPIC -g -Wl,--build-id -o libfixture.so dso.c
 gcc -g -Wl,--build-id -o fixture fixture.c -ldl
+gcc -g -Wl,--build-id -o fixture-needed fixture-needed.c -L. -lfixture -Wl,-rpath,'$ORIGIN'
 if [ "$family" = glibc ]; then
     gcc -g -Wl,--build-id -o rdebug-layout rdebug-layout.c
     ./rdebug-layout
 fi
-file fixture libfixture.so
-sha256sum fixture libfixture.so
-readelf -nW fixture libfixture.so
+file fixture fixture-needed libfixture.so
+sha256sum fixture fixture-needed libfixture.so
+readelf -nW fixture fixture-needed libfixture.so
+echo "DT_NEEDED_FIXTURE_NEEDED_BEGIN"; readelf -dW fixture-needed | grep -E 'NEEDED|RPATH|RUNPATH' || true; echo "DT_NEEDED_FIXTURE_NEEDED_END"
 echo "STEP_OK=$step"
 
 step=loader_and_object_identity
@@ -96,16 +146,21 @@ echo "DIRECT_META_BEGIN"; cat direct-meta.json; echo "DIRECT_META_END"
 echo "STEP_OK=$step"
 
 step=retain_artifacts
-artifact_dir="/evidence/round2/artifacts/$lane"
+artifact_dir="/evidence/round3/artifacts/${lane}-${kind}"
 mkdir -p "$artifact_dir"
-cp fixture libfixture.so direct-meta.json "$artifact_dir/"
-sha256sum "$artifact_dir/fixture" "$artifact_dir/libfixture.so" "$artifact_dir/direct-meta.json"
+cp fixture fixture-needed libfixture.so direct-meta.json "$artifact_dir/"
+sha256sum "$artifact_dir/fixture" "$artifact_dir/fixture-needed" "$artifact_dir/libfixture.so" "$artifact_dir/direct-meta.json"
 echo "STEP_OK=$step"
 
 step=runtime_gdb
+if [ "$kind" = initial_set ]; then
+    target=./fixture-needed
+else
+    target=./fixture
+fi
 set +e
 SPIKE_FAMILY="$family" SPIKE_META=/work/direct-meta.json \
-    gdb -q --batch -x gdb-direct-witness.py --args ./fixture > gdb-direct.log 2>&1
+    gdb -q --batch -x gdb-direct-witness.py --args "$target" > gdb-direct.log 2>&1
 gdb_rc=$?
 set -e
 cat gdb-direct.log

@@ -410,15 +410,19 @@ semantic authority. Its implementation and independent review remain open.
   `/home/user/src/m/pkcs11-scope-codex-slice1b-1/.superpowers/sdd/slice1b2-kernel-spike-design/task-2-review.md`
 - Gate B report/review:
   `/home/user/src/m/pkcs11-scope-codex-slice1b-1/.superpowers/sdd/slice1b2-kernel-spike-design/task-3-{report,review}.md`
-- Loader/libc report: `/tmp/slice1b2-loader-spikes.md`
+- Loader/libc report:
+  `~/src/m/pkcs11-scope-evidence/slice1b2/analyses/slice1b2-loader-spikes.md`
 - Loader corrective analysis:
-  `/tmp/slice1b2-loader-corrective-analysis.md`
+  `~/src/m/pkcs11-scope-evidence/slice1b2/analyses/slice1b2-loader-corrective-analysis.md`
 - Slice 1b-1 semantic-authority contract:
   `/home/user/src/m/pkcs11-scope-codex-slice1b-1/docs/superpowers/specs/2026-08-18-slice1b1-semantic-authority-contract.md`
 - Approved corrective design:
   `/home/user/src/m/pkcs11-scope-codex-slice1b-1/docs/superpowers/specs/2026-08-18-slice1b2-corrective-live-discovery-design.md`
-- Final corrective-design review: `/tmp/slice1b2-corrective-spec-review.md`
+- Final corrective-design review:
+  `~/src/m/pkcs11-scope-evidence/slice1b2/analyses/slice1b2-corrective-spec-review.md`
 - Raw Gate A evidence:
-  `/tmp/p11scope-slice1b2-task2-fd98a02-gatea-{jammy,noble}-evidence`
+  `~/src/m/pkcs11-scope-evidence/slice1b2/gate-a/p11scope-slice1b2-task2-fd98a02-gatea-{jammy,noble}-evidence`
 - Raw longer diagnostics:
-  `/tmp/p11scope-slice1b2-task2-fd98a02-diagnostic-*`
+  `~/src/m/pkcs11-scope-evidence/slice1b2/gate-a/p11scope-slice1b2-task2-fd98a02-diagnostic-*`
+- Tracked loader witness harness: `spike/slice1b2-loader/`
+  (evidence-root layout and pinned digests: `docs/notes/slice1b2/README.md`)

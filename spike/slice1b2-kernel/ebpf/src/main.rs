@@ -376,7 +376,6 @@ pub fn signal_return(ctx: RetProbeContext) -> u32 {
                 { core::intrinsics::AtomicOrdering::Acquire },
             >(core::ptr::addr_of_mut!((*state).arg0), PAUSE_ARMED, PAUSE_REQUESTED)
                 .1
-                != 0
         },
         None => false,
     };

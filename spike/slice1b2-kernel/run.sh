@@ -239,6 +239,152 @@ for name in ["environment.txt", "manifest-digests.txt", "verifier.log"]:
 PY
 }
 
+gate_b_semantics_python() {
+    cat <<'PY'
+import json, math, os, sys
+directory, expected_rc = sys.argv[1:]
+if expected_rc not in {"0", "1"}:
+    raise SystemExit(64)
+programs = ["signal_return", "late_hit"]
+runtime_reasons = {
+    "cancellation pipe", "cancelled_sigint", "cancelled_sigterm", "signal record surplus",
+    "counter read", "fixture pipes", "fixture pipe flags", "gated child", "pidfd authority",
+    "fixture offset", "fixture ready timeout", "pipe byte", "task list", "task id",
+    "stat comm delimiter", "stat state", "task set", "task count", "child release",
+    "signal record timeout", "signal record length is not 32 bytes", "signal record identity",
+    "poll", "stop timing", "marker byte", "marker read", "monotonic clock",
+    "child exit timeout", "child wait",
+}
+def json_lines(name):
+    with open(os.path.join(directory, name), encoding="utf-8") as stream:
+        return [json.loads(line) for line in stream if line.strip()]
+try:
+    verifier = json_lines("verifier-results.jsonl")
+    timing = json_lines("signal-timing.jsonl")
+    with open(os.path.join(directory, "runner-status.txt"), encoding="utf-8") as stream:
+        status_lines = [line.rstrip("\n") for line in stream]
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(64)
+if len(verifier) != 2 or [item.get("program") for item in verifier] != programs:
+    raise SystemExit(64)
+if any(
+    item.get("load_attempted") is not True
+    or not isinstance(item.get("accepted"), bool)
+    or not isinstance(item.get("pass"), bool)
+    or item.get("failure_category") != ("none" if item["accepted"] else "verifier")
+    or item.get("success_log_contract") != ("accepted_line_only" if item["accepted"] else "rejection_error_chain")
+    for item in verifier
+):
+    raise SystemExit(64)
+expected_status = "PASS" if expected_rc == "0" else "FAIL"
+if len(status_lines) != 2 or status_lines[0] != f"status={expected_status}":
+    raise SystemExit(64)
+category = status_lines[1].removeprefix("failure_category=") if status_lines[1].startswith("failure_category=") else ""
+if [item.get("signal_run") for item in timing] != list(range(1, len(timing) + 1)) or len(timing) > 20:
+    raise SystemExit(64)
+
+u64 = ["hook_ts_ns", "last_attach_ts_ns", "late_hits"]
+i64 = ["send_signal_rc", "pidfd_resume_rc"]
+u32 = ["expected_task_count", "stopped_snapshot_1_count", "stopped_snapshot_2_count", "post_attach_task_count"]
+attempts = ["signal_attach_attempts", "late_attach_attempts", "pidfd_resume_attempts"]
+booleans = [
+    "stop_request_accepted",
+    "stopped_snapshot_1_exact_expected_task_set", "stopped_snapshot_1_all_tasks_stopped",
+    "stopped_snapshot_2_exact_expected_task_set", "stopped_snapshot_2_all_tasks_stopped",
+    "pre_stop_marker_observed", "post_attach_exact_expected_task_set",
+    "post_attach_all_tasks_stopped", "post_attach_marker_observed",
+    "signal_attach_accepted", "late_attach_accepted", "signal_link_detached",
+    "late_link_detached", "resume_via_original_pidfd", "post_resume_marker_observed", "reaped",
+]
+def well_formed(item):
+    if not isinstance(item.get("pass"), bool) or item.get("failure_category") not in {"none", "runtime", "oracle"}:
+        return False
+    if any(type(item.get(name)) is not int or not 0 <= item[name] <= 0xffffffffffffffff for name in u64):
+        return False
+    if any(type(item.get(name)) is not int or not -(1 << 63) <= item[name] < (1 << 63) for name in i64):
+        return False
+    if any(type(item.get(name)) is not int or not 0 <= item[name] <= 0xffffffff for name in u32):
+        return False
+    if any(type(item.get(name)) is not int or item[name] not in {0, 1} for name in attempts):
+        return False
+    if any(not isinstance(item.get(name), bool) for name in booleans):
+        return False
+    if type(item.get("child_exit")) is not int or not -(1 << 31) <= item["child_exit"] < (1 << 31):
+        return False
+    gap = item.get("attach_gap_ms")
+    if not isinstance(gap, (int, float)) or isinstance(gap, bool) or not math.isfinite(gap):
+        return False
+    if item["signal_attach_accepted"] and item["signal_attach_attempts"] != 1:
+        return False
+    if item["late_attach_accepted"] and item["late_attach_attempts"] != 1:
+        return False
+    if item["signal_link_detached"] and not item["signal_attach_accepted"]:
+        return False
+    if item["late_link_detached"] and not item["late_attach_accepted"]:
+        return False
+    if item["resume_via_original_pidfd"] and item["pidfd_resume_attempts"] != 1:
+        return False
+    return True
+def oracle(item):
+    gap = item["last_attach_ts_ns"] - item["hook_ts_ns"]
+    return (
+        item["hook_ts_ns"] != 0 and item["send_signal_rc"] == 0
+        and item["stop_request_accepted"] is True and item["expected_task_count"] == 2
+        and item["stopped_snapshot_1_count"] == item["expected_task_count"]
+        and item["stopped_snapshot_2_count"] == item["expected_task_count"]
+        and item["stopped_snapshot_1_exact_expected_task_set"] is True
+        and item["stopped_snapshot_1_all_tasks_stopped"] is True
+        and item["stopped_snapshot_2_exact_expected_task_set"] is True
+        and item["stopped_snapshot_2_all_tasks_stopped"] is True
+        and item["pre_stop_marker_observed"] is False
+        and item["post_attach_task_count"] == item["expected_task_count"]
+        and item["post_attach_exact_expected_task_set"] is True
+        and item["post_attach_all_tasks_stopped"] is True
+        and item["post_attach_marker_observed"] is False
+        and item["signal_attach_attempts"] == 1 and item["signal_attach_accepted"] is True
+        and item["late_attach_attempts"] == 1 and item["late_attach_accepted"] is True
+        and item["signal_link_detached"] is True and item["late_link_detached"] is True
+        and gap >= 0 and item["attach_gap_ms"] == gap / 1000000.0
+        and item["pidfd_resume_attempts"] == 1 and item["pidfd_resume_rc"] == 0
+        and item["resume_via_original_pidfd"] is True
+        and item["post_resume_marker_observed"] is True and item["late_hits"] == 1
+        and item["child_exit"] == 0 and item["reaped"] is True
+    )
+if any(not well_formed(item) for item in timing):
+    raise SystemExit(64)
+accepted = all(item["accepted"] for item in verifier)
+if expected_status == "PASS":
+    if category != "none" or not accepted or len(timing) != 20:
+        raise SystemExit(64)
+    if any(item.get("failure_category") != "none" or "runtime_failure_reason" in item or not oracle(item) for item in timing):
+        raise SystemExit(64)
+elif category == "verifier":
+    if accepted or timing:
+        raise SystemExit(64)
+elif category == "runtime":
+    if not accepted or not timing:
+        raise SystemExit(64)
+    if any(item.get("failure_category") != "none" or "runtime_failure_reason" in item or not oracle(item) for item in timing[:-1]):
+        raise SystemExit(64)
+    last = timing[-1]
+    if last.get("failure_category") != "runtime" or last.get("runtime_failure_reason") not in runtime_reasons:
+        raise SystemExit(64)
+elif category == "oracle":
+    if not accepted or not timing:
+        raise SystemExit(64)
+    if any(item.get("failure_category") != "none" or "runtime_failure_reason" in item or not oracle(item) for item in timing[:-1]):
+        raise SystemExit(64)
+    last = timing[-1]
+    if last.get("failure_category") != "oracle" or "runtime_failure_reason" in last or oracle(last):
+        raise SystemExit(64)
+else:
+    raise SystemExit(64)
+for name in ["environment.txt", "manifest-digests.txt", "verifier.log"]:
+    if os.path.getsize(os.path.join(directory, name)) == 0:
+        raise SystemExit(64)
+PY
+}
+
 remote_export_script() {
     local gate=$1 varying
     local -a files
@@ -281,6 +427,14 @@ REMOTE_EXPORT
         cat <<'REMOTE_EXPORT'
 PY
 REMOTE_EXPORT
+    else
+        cat <<'REMOTE_EXPORT'
+python3 - "$directory" "$expected_rc" <<'PY'
+REMOTE_EXPORT
+        gate_b_semantics_python
+        cat <<'REMOTE_EXPORT'
+PY
+REMOTE_EXPORT
     fi
     cat <<'REMOTE_EXPORT'
 exec tar --format=posix --no-recursion -C "$directory" -cf - "$@"
@@ -320,7 +474,11 @@ validate_local_export() {
         total=$((total + size))
     done
     (( total <= 16777216 )) || return 64
-    [[ $gate != a ]] || validate_gate_a_semantics "$directory" "$expected_rc" || return 64
+    case "$gate" in
+        a) validate_gate_a_semantics "$directory" "$expected_rc" || return 64 ;;
+        b) validate_gate_b_semantics "$directory" "$expected_rc" || return 64 ;;
+        *) return 64 ;;
+    esac
     [[ ! -e $directory.sha256 && ! -L $directory.sha256 ]] || return 64
     (cd "$directory" && sha256sum "${files[@]}") >"$directory.sha256"
     chmod 0600 "$directory.sha256"
@@ -329,6 +487,11 @@ validate_local_export() {
 validate_gate_a_semantics() {
     local directory=$1 expected_rc=$2
     gate_a_semantics_python | python3 - "$directory" "$expected_rc"
+}
+
+validate_gate_b_semantics() {
+    local directory=$1 expected_rc=$2
+    gate_b_semantics_python | python3 - "$directory" "$expected_rc"
 }
 
 validate_backing_chain_file() {
@@ -650,11 +813,17 @@ with open(script, "rb") as stream:
 PY
 }
 
-gate_a_lane() {
-    local lane=$1 bundle=$2 run_dir=$3 export_dir=$4 remote=/var/tmp/p11scope-slice1b2/bundle
-    local gate_dir gate_rc=0 finish_rc=0 lane_rc=64 name remote_command
+gate_lane() {
+    local gate=$1 lane=$2 bundle=$3 run_dir=$4 export_dir=$5
+    local remote=/var/tmp/p11scope-slice1b2/bundle gate_name gate_args gate_dir
+    local gate_rc=0 finish_rc=0 lane_rc=64 name remote_command
+    case "$gate" in
+        a) gate_name=gate-a; gate_args= ;;
+        b) gate_name=gate-b; gate_args=' --runs 20' ;;
+        *) return 64 ;;
+    esac
     [[ ! -e $run_dir && ! -L $run_dir && ! -e $export_dir && ! -L $export_dir ]] || {
-        printf 'gate-a-lane requires new run and export directories\n' >&2
+        printf '%s-lane requires new run and export directories\n' "$gate_name" >&2
         return 64
     }
     validate_execution_bundle "$bundle" || return
@@ -697,32 +866,32 @@ gate_a_lane() {
             >"$run_dir/self-check.stdout" 2>"$run_dir/self-check.stderr" || gate_rc=64
     fi
     case "$lane" in
-        jammy) gate_dir=/var/tmp/p11scope-slice1b2/interim-5.15-a ;;
-        noble) gate_dir=/var/tmp/p11scope-slice1b2/interim-6.8-a ;;
+        jammy) gate_dir=/var/tmp/p11scope-slice1b2/interim-5.15-$gate ;;
+        noble) gate_dir=/var/tmp/p11scope-slice1b2/interim-6.8-$gate ;;
         *) gate_rc=64 ;;
     esac
     if (( gate_rc == 0 )); then
-        remote_command="sudo -n timeout --signal=TERM --kill-after=5s 120s $remote/slice1b2-runner gate-a --source-manifest $remote/source-elf.manifest --build-evidence $remote/build-evidence.txt --execution-manifest $remote/execution.manifest --bpf $remote/slice1b2-kernel-ebpf --fixture $remote/slice1b2-fixture --out $gate_dir"
+        remote_command="sudo -n timeout --signal=TERM --kill-after=5s 120s $remote/slice1b2-runner $gate_name$gate_args --source-manifest $remote/source-elf.manifest --build-evidence $remote/build-evidence.txt --execution-manifest $remote/execution.manifest --bpf $remote/slice1b2-kernel-ebpf --fixture $remote/slice1b2-fixture --out $gate_dir"
         if gate_ssh "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" "$remote_command" \
-            >"$run_dir/gate-a.stdout" 2>"$run_dir/gate-a.stderr"; then
+            >"$run_dir/$gate_name.stdout" 2>"$run_dir/$gate_name.stderr"; then
             gate_rc=0
         else
             gate_rc=$?
         fi
-        printf '%s\n' "$gate_rc" >"$run_dir/gate-a.status" || gate_rc=64
+        printf '%s\n' "$gate_rc" >"$run_dir/$gate_name.status" || gate_rc=64
         case "$gate_rc" in
             0|1)
                 lane_rc=$gate_rc
-                export_evidence a "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" "$gate_dir" "$export_dir" "$lane_rc" \
+                export_evidence "$gate" "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" "$gate_dir" "$export_dir" "$lane_rc" \
                     >"$run_dir/export.stdout" 2>"$run_dir/export.stderr" || gate_rc=64
                 if (( gate_rc == 0 || gate_rc == 1 )); then
-                    validate_local_export a "$export_dir" "$lane_rc" || gate_rc=64
+                    validate_local_export "$gate" "$export_dir" "$lane_rc" || gate_rc=64
                 fi
                 if (( gate_rc == 0 || gate_rc == 1 )); then
                     if (( lane_rc == 0 )); then
-                        printf 'PASS\n' >"$run_dir/gate-a.outcome" || gate_rc=64
+                        printf 'PASS\n' >"$run_dir/$gate_name.outcome" || gate_rc=64
                     else
-                        printf 'FAIL\n' >"$run_dir/gate-a.outcome" || gate_rc=64
+                        printf 'FAIL\n' >"$run_dir/$gate_name.outcome" || gate_rc=64
                     fi
                 fi
                 (( gate_rc == 0 || gate_rc == 1 )) || lane_rc=64
@@ -730,7 +899,7 @@ gate_a_lane() {
             124)
                 if quiesce_gate_runner "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" \
                     "$remote/slice1b2-runner" >"$run_dir/quiesce.stdout" 2>"$run_dir/quiesce.stderr"; then
-                    printf 'TIMEOUT\n' >"$run_dir/gate-a.outcome" || gate_rc=64
+                    printf 'TIMEOUT\n' >"$run_dir/$gate_name.outcome" || gate_rc=64
                     (( gate_rc == 124 )) && lane_rc=2
                 else
                     gate_rc=64
@@ -746,6 +915,14 @@ gate_a_lane() {
     (( finish_rc == 0 )) || return 64
     (( lane_rc == 0 || lane_rc == 1 || lane_rc == 2 )) || return 64
     return "$lane_rc"
+}
+
+gate_a_lane() {
+    gate_lane a "$@"
+}
+
+gate_b_lane() {
+    gate_lane b "$@"
 }
 
 build_bpf() {
@@ -1128,8 +1305,12 @@ run_main() {
             [[ $# == 5 ]] || return 64
             gate_a_lane "$2" "$3" "$4" "$5"
             ;;
+        gate-b-lane)
+            [[ $# == 5 ]] || return 64
+            gate_b_lane "$2" "$3" "$4" "$5"
+            ;;
         *)
-            printf 'usage: run.sh {build-fixture OUT|build-bpf NEW_OUT|freeze-execution SOURCE BUILD NEW_BUNDLE|provision-jammy ARCHIVE MANIFEST MANIFEST_SHA NEW_RUN_DIR NEW_BUILD_OUT|vm-start LANE NEW_RUN_DIR|gate-a-lane LANE BUNDLE NEW_RUN_DIR NEW_EXPORT}\n' >&2
+            printf 'usage: run.sh {build-fixture OUT|build-bpf NEW_OUT|freeze-execution SOURCE BUILD NEW_BUNDLE|provision-jammy ARCHIVE MANIFEST MANIFEST_SHA NEW_RUN_DIR NEW_BUILD_OUT|vm-start LANE NEW_RUN_DIR|gate-a-lane LANE BUNDLE NEW_RUN_DIR NEW_EXPORT|gate-b-lane LANE BUNDLE NEW_RUN_DIR NEW_EXPORT}\n' >&2
             return 64
             ;;
     esac

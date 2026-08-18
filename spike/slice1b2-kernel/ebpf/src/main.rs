@@ -9,12 +9,14 @@ use aya_ebpf::helpers;
 use aya_ebpf::macros::{map, uprobe, uretprobe};
 use aya_ebpf::maps::{Array, HashMap, RingBuf};
 use aya_ebpf::programs::{ProbeContext, RetProbeContext};
-use common::{DiscoveryRecord, StartState, StateKey};
+use aya_ebpf::EbpfContext as _;
+use common::{DiscoveryRecord, SignalRecord, StartState, StateKey};
 
 const RING_LOSS: u32 = 0;
 const READ_FAILURES: u32 = 1;
 const STATE_FAILURES: u32 = 2;
 const TRUNCATED: u32 = 3;
+const LATE_HITS: u32 = 4;
 const FUNCTION_LIST: u8 = 1;
 const INTERFACE: u8 = 2;
 const EXACT_STANDARD: u8 = 1;
@@ -316,6 +318,45 @@ pub fn interface_list_return(ctx: RetProbeContext) -> u32 {
         }
         interface_index += 1;
     }
+    0
+}
+
+#[uretprobe]
+pub fn signal_return(ctx: RetProbeContext) -> u32 {
+    let Some(mut entry) = DISCOVERY.reserve::<SignalRecord>(0) else {
+        increment_counter(RING_LOSS);
+        return 0;
+    };
+    let raw = entry.as_mut_ptr();
+    let words = raw.cast::<u64>();
+    let pid_tgid = helpers::bpf_get_current_pid_tgid();
+    // SAFETY: the probe context is the kernel-provided context for this attachment.
+    let case_id = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) } as u8;
+    // SAFETY: reserve owns one writable 32-byte entry; four u64 writes initialize every byte,
+    // no reference/read/submit occurs before initialization, and SIGSTOP is a valid scalar signal.
+    unsafe {
+        let mut word = 0usize;
+        while word < 4 {
+            core::ptr::write(words.add(word), 0);
+            word += 1;
+        }
+        let hook_ts_ns = helpers::bpf_ktime_get_ns();
+        let send_signal_rc = helpers::bpf_send_signal(19) as i64;
+        core::ptr::write(core::ptr::addr_of_mut!((*raw).hook_ts_ns), hook_ts_ns);
+        core::ptr::write(core::ptr::addr_of_mut!((*raw).pid_tgid), pid_tgid);
+        core::ptr::write(
+            core::ptr::addr_of_mut!((*raw).send_signal_rc),
+            send_signal_rc,
+        );
+        core::ptr::write(core::ptr::addr_of_mut!((*raw).case_id), case_id);
+    }
+    entry.submit(0);
+    0
+}
+
+#[uprobe]
+pub fn late_hit(_ctx: ProbeContext) -> u32 {
+    increment_counter(LATE_HITS);
     0
 }
 

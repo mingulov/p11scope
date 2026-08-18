@@ -29,6 +29,8 @@ const GATE_A_PROGRAMS: [&str; 4] = [
     "interface_list_return",
 ];
 
+const GATE_B_PROGRAMS: [&str; 2] = ["signal_return", "late_hit"];
+
 pub fn decode_discovery_record(bytes: &[u8]) -> Result<common::DiscoveryRecord, &'static str> {
     if bytes.len() != std::mem::size_of::<common::DiscoveryRecord>() {
         return Err("discovery record length is not 896 bytes");
@@ -186,7 +188,7 @@ pub fn gate_a_case_pass(facts: &GateACaseFacts) -> bool {
         && delta.as_slice() == expected_delta
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SignalTimingFacts {
     pub hook_ts_ns: u64,
     pub send_signal_rc: i64,
@@ -352,13 +354,42 @@ impl ChildGuard {
             return Err(io::Error::other("child resume was already attempted"));
         }
         self.resume_attempted = true;
-        pidfd_send_signal(self.original_pidfd.as_raw_fd(), libc::SIGCONT)
+        let result = pidfd_send_signal(self.original_pidfd.as_raw_fd(), libc::SIGCONT);
+        if result.is_ok() {
+            self.may_be_stopped = false;
+        }
+        result
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
         let status = self.child.wait()?;
         self.reaped = true;
         Ok(status)
+    }
+
+    fn terminate(&mut self) -> CleanupFacts {
+        let may_be_stopped = self.may_be_stopped;
+        let mut facts = CleanupFacts {
+            may_be_stopped,
+            ..CleanupFacts::default()
+        };
+        if self.reaped {
+            facts.reaped = true;
+            return facts;
+        }
+        if self.may_be_stopped && !self.resume_attempted {
+            self.resume_attempted = true;
+            facts.resume_attempts = 1;
+            facts.resume_via_original_pidfd = true;
+            if pidfd_send_signal(self.original_pidfd.as_raw_fd(), libc::SIGCONT).is_ok() {
+                self.may_be_stopped = false;
+            }
+        }
+        facts.kill_via_original_pidfd = true;
+        let _ = pidfd_send_signal(self.original_pidfd.as_raw_fd(), libc::SIGKILL);
+        self.reaped = self.child.wait().is_ok();
+        facts.reaped = self.reaped;
+        facts
     }
 }
 
@@ -419,15 +450,7 @@ pub fn spawn_pinned_child(command: &mut Command) -> Result<ChildGuard, SpawnFail
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if self.reaped {
-            return;
-        }
-        if self.may_be_stopped && !self.resume_attempted {
-            self.resume_attempted = true;
-            let _ = pidfd_send_signal(self.original_pidfd.as_raw_fd(), libc::SIGCONT);
-        }
-        let _ = pidfd_send_signal(self.original_pidfd.as_raw_fd(), libc::SIGKILL);
-        self.reaped = self.child.wait().is_ok();
+        let _ = self.terminate();
     }
 }
 
@@ -562,6 +585,42 @@ impl Cancellation {
                     libc::SIGTERM => Ok(Cancelled::Sigterm),
                     _ => Err(io::Error::other("unknown cancellation signal")),
                 };
+            }
+        }
+    }
+
+    fn check(&self) -> io::Result<Option<Cancelled>> {
+        let mut pollfd = libc::pollfd {
+            fd: self.read.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            // SAFETY: pollfd is one initialized element and remains valid for the call.
+            let result = unsafe { libc::poll(&mut pollfd, 1, 0) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if result == 0 {
+                return Ok(None);
+            }
+            let mut byte = 0u8;
+            // SAFETY: byte is writable for one byte and the read descriptor remains owned.
+            let read =
+                unsafe { libc::read(self.read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) };
+            if read == 1 {
+                return match i32::from(byte) {
+                    libc::SIGINT => Ok(Some(Cancelled::Sigint)),
+                    libc::SIGTERM => Ok(Some(Cancelled::Sigterm)),
+                    _ => Err(io::Error::other("unknown cancellation signal")),
+                };
+            }
+            if read < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+                return Ok(None);
             }
         }
     }
@@ -943,6 +1002,15 @@ impl GateMetadata {
         pass: bool,
         failure_category: &str,
     ) -> serde_json::Map<String, serde_json::Value> {
+        self.record_for_gate("A", pass, failure_category)
+    }
+
+    fn record_for_gate(
+        &self,
+        gate: &str,
+        pass: bool,
+        failure_category: &str,
+    ) -> serde_json::Map<String, serde_json::Value> {
         let mut value = serde_json::Map::new();
         value.insert("schema_version".into(), 1.into());
         value.insert("source_commit".into(), self.source_commit.clone().into());
@@ -966,7 +1034,7 @@ impl GateMetadata {
         value.insert("glibc_version".into(), self.glibc_version.clone().into());
         value.insert("lane".into(), self.lane.clone().into());
         value.insert("run_id".into(), self.run_id.clone().into());
-        value.insert("gate".into(), "A".into());
+        value.insert("gate".into(), gate.into());
         value.insert("pass".into(), pass.into());
         value.insert("failure_category".into(), failure_category.into());
         value
@@ -1015,6 +1083,15 @@ fn parse_gate_a_args(args: &[String]) -> Result<GateAPaths, &'static str> {
         fixture: path("--fixture")?,
         out: path("--out")?,
     })
+}
+
+fn parse_gate_b_args(args: &[String]) -> Result<GateAPaths, &'static str> {
+    if args.first().map(String::as_str) != Some("--runs")
+        || args.get(1).map(String::as_str) != Some("20")
+    {
+        return Err("gate-b arguments");
+    }
+    parse_gate_a_args(&args[2..]).map_err(|_| "gate-b arguments")
 }
 
 fn read_regular(path: &Path, ceiling: u64) -> Result<Vec<u8>, &'static str> {
@@ -1152,6 +1229,21 @@ fn validate_gate_provenance(
         fixture,
         offsets,
     ))
+}
+
+#[allow(clippy::type_complexity)]
+fn validate_gate_b_provenance(
+    paths: &GateAPaths,
+) -> Result<(GateMetadata, Vec<u8>, File, BTreeMap<String, u64>), &'static str> {
+    let (mut metadata, bpf, fixture, mut offsets) = validate_gate_provenance(paths)?;
+    for symbol in ["spike_stop_hook", "spike_late_target"] {
+        let offset = p11scope_manifest::elf::symbol_file_offset(&fixture, symbol)
+            .map_err(|_| "fixture ELF")?
+            .ok_or("fixture symbol")?;
+        offsets.insert(symbol.to_owned(), offset);
+    }
+    metadata.run_id = format!("interim-{}-b", metadata.lane);
+    Ok((metadata, bpf, fixture, offsets))
 }
 
 fn write_json_line(file: &mut File, value: serde_json::Value) -> Result<(), &'static str> {
@@ -1336,6 +1428,204 @@ fn detach_program(
         .try_into()
         .map_err(|_| "program type")?;
     program.detach(link).map_err(|_| "program detach")
+}
+
+fn cancellation_failure(cancellation: &Cancellation) -> Result<(), &'static str> {
+    match cancellation.check().map_err(|_| "cancellation pipe")? {
+        Some(Cancelled::Sigint) => Err("cancelled_sigint"),
+        Some(Cancelled::Sigterm) => Err("cancelled_sigterm"),
+        None => Ok(()),
+    }
+}
+
+fn poll_readable(
+    fd: i32,
+    cancellation: &Cancellation,
+    timeout: Duration,
+    timeout_reason: &'static str,
+) -> Result<(), &'static str> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        cancellation_failure(cancellation)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(timeout_reason);
+        }
+        let timeout_ms = i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX);
+        let mut pollfds = [
+            libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: cancellation.read.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: pollfds contains two initialized entries and remains valid for the call.
+        let result = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, timeout_ms) };
+        if result < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err("poll");
+        }
+        cancellation_failure(cancellation)?;
+        if pollfds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            return Ok(());
+        }
+    }
+}
+
+fn read_expected_byte(
+    fd: i32,
+    expected: u8,
+    cancellation: &Cancellation,
+    timeout: Duration,
+    timeout_reason: &'static str,
+) -> Result<(), &'static str> {
+    poll_readable(fd, cancellation, timeout, timeout_reason)?;
+    loop {
+        cancellation_failure(cancellation)?;
+        let mut byte = 0u8;
+        // SAFETY: byte is writable for one byte and fd remains owned by the caller.
+        let read = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+        if read == 1 && byte == expected {
+            return Ok(());
+        }
+        if read < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err("pipe byte");
+    }
+}
+
+fn drain_marker(fd: i32, cancellation: &Cancellation) -> Result<bool, &'static str> {
+    let mut observed = false;
+    loop {
+        cancellation_failure(cancellation)?;
+        let mut byte = 0u8;
+        // SAFETY: byte is writable for one byte and fd is a live nonblocking pipe.
+        let read = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+        if read == 1 {
+            if byte != b'M' {
+                return Err("marker byte");
+            }
+            observed = true;
+            continue;
+        }
+        if read == 0 {
+            return Ok(observed);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Ok(observed);
+        }
+        return Err("marker read");
+    }
+}
+
+fn clear_cloexec(fd: i32) -> Result<(), &'static str> {
+    // SAFETY: F_GETFD/F_SETFD operate on the caller-owned descriptor and scalar flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } != 0 {
+        return Err("fixture pipe flags");
+    }
+    Ok(())
+}
+
+fn monotonic_ns() -> Result<u64, &'static str> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: time points to writable storage for CLOCK_MONOTONIC.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
+        return Err("monotonic clock");
+    }
+    u64::try_from(time.tv_sec)
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000_000_000))
+        .and_then(|seconds| {
+            u64::try_from(time.tv_nsec)
+                .ok()
+                .and_then(|nanos| seconds.checked_add(nanos))
+        })
+        .ok_or("monotonic clock")
+}
+
+fn task_states(pid: u32) -> Result<BTreeMap<u32, u8>, &'static str> {
+    let mut tasks = BTreeMap::new();
+    let directory = std::fs::read_dir(format!("/proc/{pid}/task")).map_err(|_| "task list")?;
+    for entry in directory {
+        let entry = entry.map_err(|_| "task list")?;
+        let tid = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or("task id")?;
+        let stat = std::fs::read_to_string(entry.path().join("stat")).map_err(|_| "task stat")?;
+        if tasks.insert(tid, parse_task_state(&stat)?).is_some() {
+            return Err("task set");
+        }
+    }
+    Ok(tasks)
+}
+
+#[derive(Clone, Copy, Default)]
+struct StopSnapshot {
+    count: u32,
+    exact_expected_task_set: bool,
+    all_tasks_stopped: bool,
+}
+
+fn stop_snapshot(pid: u32, expected: &BTreeMap<u32, u8>) -> Result<StopSnapshot, &'static str> {
+    let actual = task_states(pid)?;
+    Ok(StopSnapshot {
+        count: u32::try_from(actual.len()).map_err(|_| "task count")?,
+        exact_expected_task_set: actual.keys().eq(expected.keys()),
+        all_tasks_stopped: !actual.is_empty() && actual.values().all(|state| *state == b'T'),
+    })
+}
+
+fn wait_signal_record(
+    ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
+    cancellation: &Cancellation,
+) -> Result<common::SignalRecord, &'static str> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        cancellation_failure(cancellation)?;
+        if let Some(item) = ring.next() {
+            return decode_signal_record(&item);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("signal record timeout");
+        }
+        let timeout_ms = i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX);
+        let mut pollfds = [
+            libc::pollfd {
+                fd: ring.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: cancellation.read.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: pollfds contains initialized entries and remains valid for the call.
+        let result = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, timeout_ms) };
+        if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return Err("poll");
+        }
+    }
 }
 
 type GateACaseFailure = Box<(GateACaseFacts, &'static str)>;
@@ -1797,6 +2087,412 @@ fn run_gate_a(paths: GateAPaths) -> Result<bool, &'static str> {
     Ok(pass)
 }
 
+fn signal_timing_json(
+    metadata: &GateMetadata,
+    run: u8,
+    facts: &SignalTimingFacts,
+    pass: bool,
+    runtime_failure_reason: Option<&str>,
+) -> serde_json::Value {
+    let mut value = metadata.record_for_gate(
+        "B",
+        pass,
+        if runtime_failure_reason.is_some() {
+            "runtime"
+        } else if pass {
+            "none"
+        } else {
+            "oracle"
+        },
+    );
+    if let Some(reason) = runtime_failure_reason {
+        value.insert("runtime_failure_reason".into(), reason.into());
+    }
+    value.insert("signal_run".into(), run.into());
+    macro_rules! insert_facts {
+        ($($field:ident),+ $(,)?) => {
+            $(value.insert(stringify!($field).into(), serde_json::json!(facts.$field));)+
+        };
+    }
+    insert_facts!(
+        hook_ts_ns,
+        send_signal_rc,
+        stop_request_accepted,
+        expected_task_count,
+        stopped_snapshot_1_count,
+        stopped_snapshot_2_count,
+        stopped_snapshot_1_exact_expected_task_set,
+        stopped_snapshot_1_all_tasks_stopped,
+        stopped_snapshot_2_exact_expected_task_set,
+        stopped_snapshot_2_all_tasks_stopped,
+        pre_stop_marker_observed,
+        post_attach_task_count,
+        post_attach_exact_expected_task_set,
+        post_attach_all_tasks_stopped,
+        post_attach_marker_observed,
+        signal_attach_attempts,
+        signal_attach_accepted,
+        late_attach_attempts,
+        late_attach_accepted,
+        signal_link_detached,
+        late_link_detached,
+        last_attach_ts_ns,
+        attach_gap_ms,
+        pidfd_resume_attempts,
+        pidfd_resume_rc,
+        resume_via_original_pidfd,
+        post_resume_marker_observed,
+        late_hits,
+        child_exit,
+        reaped,
+    );
+    serde_json::Value::Object(value)
+}
+
+fn sleep_checked(cancellation: &Cancellation, duration: Duration) -> Result<(), &'static str> {
+    cancellation_failure(cancellation)?;
+    std::thread::sleep(duration);
+    cancellation_failure(cancellation)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_gate_b_case(
+    ebpf: &mut aya::Ebpf,
+    ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
+    counters: &aya::maps::Array<aya::maps::MapData, u64>,
+    fixture: &Path,
+    offsets: &BTreeMap<String, u64>,
+    cancellation: &Cancellation,
+    run: u8,
+) -> (SignalTimingFacts, Option<&'static str>) {
+    let mut facts = SignalTimingFacts::default();
+    let mut child = None;
+    let mut signal_link = None;
+    let mut late_link = None;
+    let result = (|| -> Result<(), &'static str> {
+        cancellation_failure(cancellation)?;
+        if ring.next().is_some() {
+            return Err("signal record surplus");
+        }
+        let counters_before = read_counters(counters)?;
+        let (ready_reader, ready_writer) =
+            pipe_pair(libc::O_CLOEXEC | libc::O_NONBLOCK).map_err(|_| "fixture pipes")?;
+        let (marker_reader, marker_writer) =
+            pipe_pair(libc::O_CLOEXEC | libc::O_NONBLOCK).map_err(|_| "fixture pipes")?;
+        clear_cloexec(ready_writer.as_raw_fd())?;
+        clear_cloexec(marker_writer.as_raw_fd())?;
+        let mut command = Command::new(fixture);
+        command
+            .arg("--signal")
+            .arg(ready_writer.as_raw_fd().to_string())
+            .arg(marker_writer.as_raw_fd().to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        child = match spawn_pinned_child(&mut command) {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                facts.reaped = error.reaped;
+                return Err("gated child");
+            }
+        };
+        drop(ready_writer);
+        drop(marker_writer);
+        let guard = child.as_mut().ok_or("gated child")?;
+        cancellation_failure(cancellation)?;
+        pidfd_send_signal(guard.original_pidfd.as_raw_fd(), 0).map_err(|_| "pidfd authority")?;
+
+        facts.signal_attach_attempts = 1;
+        signal_link = attach_program(
+            ebpf,
+            "signal_return",
+            *offsets.get("spike_stop_hook").ok_or("fixture offset")?,
+            fixture,
+            guard.pid(),
+            u64::from(run),
+        )
+        .ok();
+        facts.signal_attach_accepted = signal_link.is_some();
+        if signal_link.is_none() {
+            return Ok(());
+        }
+
+        read_expected_byte(
+            ready_reader.as_raw_fd(),
+            b'R',
+            cancellation,
+            Duration::from_secs(5),
+            "fixture ready timeout",
+        )?;
+        cancellation_failure(cancellation)?;
+        let expected = task_states(guard.pid())?;
+        facts.expected_task_count = u32::try_from(expected.len()).map_err(|_| "task count")?;
+        if facts.expected_task_count != 2 {
+            return Ok(());
+        }
+
+        guard.mark_may_be_stopped();
+        guard.release().map_err(|_| "child release")?;
+        let record = wait_signal_record(ring, cancellation)?;
+        let record_pid = (record.pid_tgid >> 32) as u32;
+        let record_tid = record.pid_tgid as u32;
+        if record.case_id != run
+            || record_pid != guard.pid()
+            || !expected.contains_key(&record_tid)
+            || record.reserved_zero != [0; 7]
+        {
+            return Err("signal record identity");
+        }
+        facts.hook_ts_ns = record.hook_ts_ns;
+        facts.send_signal_rc = record.send_signal_rc;
+        facts.stop_request_accepted = record.send_signal_rc == 0;
+
+        let snapshot_start = Instant::now();
+        sleep_checked(cancellation, Duration::from_millis(1))?;
+        let first = stop_snapshot(guard.pid(), &expected)?;
+        sleep_checked(cancellation, Duration::from_millis(1))?;
+        let second = stop_snapshot(guard.pid(), &expected)?;
+        if snapshot_start.elapsed() > Duration::from_millis(100) {
+            return Err("stop timing");
+        }
+        facts.stopped_snapshot_1_count = first.count;
+        facts.stopped_snapshot_1_exact_expected_task_set = first.exact_expected_task_set;
+        facts.stopped_snapshot_1_all_tasks_stopped = first.all_tasks_stopped;
+        facts.stopped_snapshot_2_count = second.count;
+        facts.stopped_snapshot_2_exact_expected_task_set = second.exact_expected_task_set;
+        facts.stopped_snapshot_2_all_tasks_stopped = second.all_tasks_stopped;
+        facts.pre_stop_marker_observed = drain_marker(marker_reader.as_raw_fd(), cancellation)?;
+        if !facts.stop_request_accepted
+            || !first.exact_expected_task_set
+            || !first.all_tasks_stopped
+            || !second.exact_expected_task_set
+            || !second.all_tasks_stopped
+            || facts.pre_stop_marker_observed
+        {
+            return Ok(());
+        }
+
+        facts.late_attach_attempts = 1;
+        late_link = attach_program(
+            ebpf,
+            "late_hit",
+            *offsets.get("spike_late_target").ok_or("fixture offset")?,
+            fixture,
+            guard.pid(),
+            u64::from(run),
+        )
+        .ok();
+        facts.late_attach_accepted = late_link.is_some();
+        if late_link.is_none() {
+            return Ok(());
+        }
+        facts.last_attach_ts_ns = monotonic_ns()?;
+        facts.attach_gap_ms = facts
+            .last_attach_ts_ns
+            .checked_sub(facts.hook_ts_ns)
+            .map_or(0.0, |gap| gap as f64 / 1_000_000.0);
+
+        cancellation_failure(cancellation)?;
+        let third = stop_snapshot(guard.pid(), &expected)?;
+        facts.post_attach_task_count = third.count;
+        facts.post_attach_exact_expected_task_set = third.exact_expected_task_set;
+        facts.post_attach_all_tasks_stopped = third.all_tasks_stopped;
+        facts.post_attach_marker_observed = drain_marker(marker_reader.as_raw_fd(), cancellation)?;
+        if !third.exact_expected_task_set
+            || !third.all_tasks_stopped
+            || facts.post_attach_marker_observed
+        {
+            return Ok(());
+        }
+
+        facts.pidfd_resume_attempts = 1;
+        facts.resume_via_original_pidfd = true;
+        if guard.resume_once().is_err() {
+            facts.pidfd_resume_rc = -1;
+            return Ok(());
+        }
+        facts.pidfd_resume_rc = 0;
+        match read_expected_byte(
+            marker_reader.as_raw_fd(),
+            b'M',
+            cancellation,
+            Duration::from_secs(5),
+            "post-resume marker timeout",
+        ) {
+            Ok(()) => facts.post_resume_marker_observed = true,
+            Err(reason @ ("cancelled_sigint" | "cancelled_sigterm" | "cancellation pipe")) => {
+                return Err(reason);
+            }
+            Err(_) => return Ok(()),
+        }
+        poll_readable(
+            guard.original_pidfd.as_raw_fd(),
+            cancellation,
+            Duration::from_secs(5),
+            "child exit timeout",
+        )?;
+        let status = guard.wait().map_err(|_| "child wait")?;
+        facts.reaped = true;
+        facts.child_exit = status.code().unwrap_or(-1);
+        let counters_after = read_counters(counters)?;
+        facts.late_hits = counters_after[4].saturating_sub(counters_before[4]);
+        if ring.next().is_some() {
+            return Err("signal record surplus");
+        }
+        Ok(())
+    })();
+
+    if let Some(link) = late_link {
+        facts.late_link_detached = detach_program(ebpf, "late_hit", link).is_ok();
+    }
+    if let Some(link) = signal_link {
+        facts.signal_link_detached = detach_program(ebpf, "signal_return", link).is_ok();
+    }
+    if let Some(guard) = child.as_mut()
+        && !guard.reaped
+    {
+        let cleanup = guard.terminate();
+        if cleanup.resume_attempts == 1 && facts.pidfd_resume_attempts == 0 {
+            facts.pidfd_resume_attempts = 1;
+            facts.resume_via_original_pidfd = cleanup.resume_via_original_pidfd;
+            facts.pidfd_resume_rc = if guard.may_be_stopped { -1 } else { 0 };
+        }
+        facts.reaped = cleanup.reaped;
+        facts.child_exit = -1;
+    }
+    (facts, result.err())
+}
+
+fn run_gate_b(paths: GateAPaths) -> Result<bool, &'static str> {
+    // SAFETY: setting a process-local restrictive umask has no memory-safety preconditions.
+    unsafe { libc::umask(0o077) };
+    create_private_dir(&paths.out).map_err(|_| "output directory")?;
+    let mut environment =
+        create_private_file(&paths.out.join("environment.txt")).map_err(|_| "environment file")?;
+    let mut manifest_digests = create_private_file(&paths.out.join("manifest-digests.txt"))
+        .map_err(|_| "manifest digest file")?;
+    let mut verifier_log =
+        create_private_file(&paths.out.join("verifier.log")).map_err(|_| "verifier log")?;
+    let mut verifier_results = create_private_file(&paths.out.join("verifier-results.jsonl"))
+        .map_err(|_| "verifier results")?;
+    let mut timings = create_private_file(&paths.out.join("signal-timing.jsonl"))
+        .map_err(|_| "signal timing results")?;
+    let mut runner_status =
+        create_private_file(&paths.out.join("runner-status.txt")).map_err(|_| "runner status")?;
+    let cancellation = Cancellation::install().map_err(|_| "cancellation pipe")?;
+
+    let (metadata, bpf_bytes, _fixture_file, offsets) = validate_gate_b_provenance(&paths)?;
+    writeln!(
+        environment,
+        "kernel_release={}\narch={}\nglibc_version={}\nlane={}",
+        metadata.kernel_release, metadata.arch, metadata.glibc_version, metadata.lane
+    )
+    .map_err(|_| "environment write")?;
+    writeln!(
+        manifest_digests,
+        "source_manifest_sha256={}\nexecution_manifest_sha256={}\nbuild_evidence_sha256={}\nbpf_sha256={}\nrunner_sha256={}\nfixture_sha256={}",
+        metadata.source_manifest_sha256,
+        metadata.execution_manifest_sha256,
+        metadata.build_evidence_sha256,
+        metadata.bpf_sha256,
+        metadata.runner_sha256,
+        metadata.fixture_sha256
+    )
+    .map_err(|_| "manifest digest write")?;
+
+    let mut loader = aya::EbpfLoader::new();
+    loader.verifier_log_level(aya::VerifierLogLevel::VERBOSE | aya::VerifierLogLevel::STATS);
+    let mut ebpf = loader.load(&bpf_bytes).map_err(|_| "object load")?;
+    let mut all_loaded = true;
+    for program_name in GATE_B_PROGRAMS {
+        let result = (|| -> Result<(), Box<dyn Error>> {
+            let program: &mut aya::programs::UProbe = ebpf
+                .program_mut(program_name)
+                .ok_or("program missing")?
+                .try_into()?;
+            program.load()?;
+            Ok(())
+        })();
+        let accepted = result.is_ok();
+        all_loaded &= accepted;
+        let mut value =
+            metadata.record_for_gate("B", accepted, if accepted { "none" } else { "verifier" });
+        value.insert("program".into(), program_name.into());
+        value.insert("load_attempted".into(), true.into());
+        value.insert("accepted".into(), accepted.into());
+        value.insert(
+            "success_log_contract".into(),
+            if accepted {
+                "accepted_line_only"
+            } else {
+                "rejection_error_chain"
+            }
+            .into(),
+        );
+        write_json_line(&mut verifier_results, serde_json::Value::Object(value))?;
+        if let Err(error) = result {
+            writeln!(
+                verifier_log,
+                "program={program_name} outcome=rejected error_chain={}",
+                verifier_error_chain(error.as_ref())
+            )
+            .map_err(|_| "verifier write")?;
+        } else {
+            writeln!(
+                verifier_log,
+                "program={program_name} outcome=accepted success_verifier_text=unavailable_aya_0_14"
+            )
+            .map_err(|_| "verifier write")?;
+        }
+    }
+    if !all_loaded {
+        writeln!(runner_status, "status=FAIL\nfailure_category=verifier")
+            .map_err(|_| "runner status write")?;
+        return Ok(false);
+    }
+
+    let mut ring = aya::maps::RingBuf::try_from(ebpf.take_map("DISCOVERY").ok_or("discovery map")?)
+        .map_err(|_| "discovery ring")?;
+    let counters =
+        aya::maps::Array::<_, u64>::try_from(ebpf.take_map("COUNTERS").ok_or("counter map")?)
+            .map_err(|_| "counter map")?;
+    let mut completed = 0u8;
+    let mut final_category = "none";
+    for run in 1..=20 {
+        let (facts, runtime_failure_reason) = run_gate_b_case(
+            &mut ebpf,
+            &mut ring,
+            &counters,
+            &paths.fixture,
+            &offsets,
+            &cancellation,
+            run,
+        );
+        let pass = runtime_failure_reason.is_none() && signal_oracle_pass(&facts);
+        write_json_line(
+            &mut timings,
+            signal_timing_json(&metadata, run, &facts, pass, runtime_failure_reason),
+        )?;
+        completed = run;
+        if runtime_failure_reason.is_some() || !pass {
+            final_category = if runtime_failure_reason.is_some() {
+                "runtime"
+            } else {
+                "oracle"
+            };
+            break;
+        }
+    }
+    let pass = completed == 20 && final_category == "none";
+    writeln!(
+        runner_status,
+        "status={}\nfailure_category={}",
+        if pass { "PASS" } else { "FAIL" },
+        final_category
+    )
+    .map_err(|_| "runner status write")?;
+    Ok(pass)
+}
+
 fn self_check() -> Result<(), &'static str> {
     let kernel = kernel_release()?;
     let glibc = glibc_version()?;
@@ -1814,6 +2510,7 @@ fn main() {
     let result = match args.get(1).map(String::as_str) {
         Some("--self-check") if args.len() == 2 => self_check().map(|()| true),
         Some("gate-a") => parse_gate_a_args(&args[2..]).and_then(run_gate_a),
+        Some("gate-b") => parse_gate_b_args(&args[2..]).and_then(run_gate_b),
         _ => Err("usage"),
     };
     match result {
@@ -2145,6 +2842,60 @@ mod tests {
     }
 
     #[test]
+    fn signal_oracle_rejects_each_binding_timing_mutation() {
+        let valid = valid_signal();
+        for mutation in 0..30 {
+            let mut changed = valid.clone();
+            match mutation {
+                0 => changed.hook_ts_ns = 0,
+                1 => changed.send_signal_rc = -1,
+                2 => changed.stop_request_accepted = false,
+                3 => changed.expected_task_count = 3,
+                4 => changed.stopped_snapshot_1_count = 1,
+                5 => changed.stopped_snapshot_2_count = 1,
+                6 => changed.stopped_snapshot_1_exact_expected_task_set = false,
+                7 => changed.stopped_snapshot_1_all_tasks_stopped = false,
+                8 => changed.stopped_snapshot_2_exact_expected_task_set = false,
+                9 => changed.stopped_snapshot_2_all_tasks_stopped = false,
+                10 => changed.pre_stop_marker_observed = true,
+                11 => changed.post_attach_task_count = 1,
+                12 => changed.post_attach_exact_expected_task_set = false,
+                13 => changed.post_attach_all_tasks_stopped = false,
+                14 => changed.post_attach_marker_observed = true,
+                15 => changed.signal_attach_attempts = 0,
+                16 => changed.signal_attach_attempts = 2,
+                17 => changed.signal_attach_accepted = false,
+                18 => changed.late_attach_attempts = 0,
+                19 => changed.late_attach_attempts = 2,
+                20 => changed.late_attach_accepted = false,
+                21 => changed.signal_link_detached = false,
+                22 => changed.late_link_detached = false,
+                23 => changed.last_attach_ts_ns = changed.hook_ts_ns - 1,
+                24 => changed.attach_gap_ms = 2.0,
+                25 => changed.pidfd_resume_attempts = 2,
+                26 => changed.pidfd_resume_rc = -1,
+                27 => changed.resume_via_original_pidfd = false,
+                28 => changed.post_resume_marker_observed = false,
+                29 => changed.late_hits = 2,
+                _ => unreachable!(),
+            }
+            assert!(
+                !signal_oracle_pass(&changed),
+                "accepted binding signal mutation {mutation}"
+            );
+        }
+        for mutate in [
+            |facts: &mut SignalTimingFacts| facts.late_hits = 0,
+            |facts: &mut SignalTimingFacts| facts.child_exit = 1,
+            |facts: &mut SignalTimingFacts| facts.reaped = false,
+        ] {
+            let mut changed = valid.clone();
+            mutate(&mut changed);
+            assert!(!signal_oracle_pass(&changed));
+        }
+    }
+
+    #[test]
     fn stat_parser_uses_last_close_paren_space() {
         let stat = "321 (worker) with ) chars) T 1 2 3 4";
         assert_eq!(parse_task_state(stat), Ok(b'T'));
@@ -2235,6 +2986,61 @@ mod tests {
         assert!(error.kill_succeeded);
         assert!(error.reaped);
         assert!(!marker.exists(), "the gated child reached its call path");
+    }
+
+    #[test]
+    fn successful_original_pidfd_resume_disarms_stopped_cleanup() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("IFS= read -r _; sleep 30");
+        let mut guard = spawn_pinned_child(&mut command).unwrap();
+        guard.mark_may_be_stopped();
+        pidfd_send_signal(guard.original_pidfd.as_raw_fd(), libc::SIGSTOP).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", guard.pid())).unwrap();
+            if parse_task_state(&stat).unwrap() == b'T' {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child did not enter stopped state"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        guard.resume_once().unwrap();
+        assert!(guard.resume_attempted);
+        assert!(
+            !guard.may_be_stopped,
+            "successful original-pidfd resume must disarm stopped cleanup"
+        );
+    }
+
+    #[test]
+    fn failure_after_stop_resumes_once_then_kills_and_reaps_with_original_pidfd() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("IFS= read -r _; sleep 30");
+        let mut guard = spawn_pinned_child(&mut command).unwrap();
+        guard.mark_may_be_stopped();
+        pidfd_send_signal(guard.original_pidfd.as_raw_fd(), libc::SIGSTOP).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while parse_task_state(
+            &std::fs::read_to_string(format!("/proc/{}/stat", guard.pid())).unwrap(),
+        )
+        .unwrap()
+            != b'T'
+        {
+            assert!(Instant::now() < deadline, "child did not stop");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let pid = guard.pid();
+        let cleanup = guard.terminate();
+        assert!(cleanup_oracle_pass(cleanup));
+        assert_eq!(cleanup.resume_attempts, 1);
+        assert!(cleanup.resume_via_original_pidfd);
+        assert!(cleanup.kill_via_original_pidfd);
+        assert!(cleanup.reaped);
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     }
 
     fn signal_child(signal: Cancelled, ready: &Path, marker: &Path) {
@@ -2803,6 +3609,104 @@ mod tests {
             .success()
     }
 
+    fn signal_timing_value(run: usize, facts: &SignalTimingFacts) -> serde_json::Value {
+        serde_json::json!({
+            "signal_run": run,
+            "hook_ts_ns": facts.hook_ts_ns,
+            "send_signal_rc": facts.send_signal_rc,
+            "stop_request_accepted": facts.stop_request_accepted,
+            "expected_task_count": facts.expected_task_count,
+            "stopped_snapshot_1_count": facts.stopped_snapshot_1_count,
+            "stopped_snapshot_2_count": facts.stopped_snapshot_2_count,
+            "stopped_snapshot_1_exact_expected_task_set": facts.stopped_snapshot_1_exact_expected_task_set,
+            "stopped_snapshot_1_all_tasks_stopped": facts.stopped_snapshot_1_all_tasks_stopped,
+            "stopped_snapshot_2_exact_expected_task_set": facts.stopped_snapshot_2_exact_expected_task_set,
+            "stopped_snapshot_2_all_tasks_stopped": facts.stopped_snapshot_2_all_tasks_stopped,
+            "pre_stop_marker_observed": facts.pre_stop_marker_observed,
+            "post_attach_task_count": facts.post_attach_task_count,
+            "post_attach_exact_expected_task_set": facts.post_attach_exact_expected_task_set,
+            "post_attach_all_tasks_stopped": facts.post_attach_all_tasks_stopped,
+            "post_attach_marker_observed": facts.post_attach_marker_observed,
+            "signal_attach_attempts": facts.signal_attach_attempts,
+            "signal_attach_accepted": facts.signal_attach_accepted,
+            "late_attach_attempts": facts.late_attach_attempts,
+            "late_attach_accepted": facts.late_attach_accepted,
+            "signal_link_detached": facts.signal_link_detached,
+            "late_link_detached": facts.late_link_detached,
+            "last_attach_ts_ns": facts.last_attach_ts_ns,
+            "attach_gap_ms": facts.attach_gap_ms,
+            "pidfd_resume_attempts": facts.pidfd_resume_attempts,
+            "pidfd_resume_rc": facts.pidfd_resume_rc,
+            "resume_via_original_pidfd": facts.resume_via_original_pidfd,
+            "post_resume_marker_observed": facts.post_resume_marker_observed,
+            "late_hits": facts.late_hits,
+            "child_exit": facts.child_exit,
+            "reaped": facts.reaped,
+            "pass": signal_oracle_pass(facts),
+            "failure_category": if signal_oracle_pass(facts) { "none" } else { "oracle" },
+        })
+    }
+
+    fn fake_canonical_gate_b_export(
+        path: &Path,
+        verifier_count: usize,
+        runs: usize,
+        category: &str,
+    ) {
+        std::fs::create_dir(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let programs = ["signal_return", "late_hit"];
+        let verifier = programs[..verifier_count]
+            .iter()
+            .enumerate()
+            .map(|(index, program)| {
+                let accepted = category != "verifier" || index + 1 != verifier_count;
+                serde_json::json!({
+                    "program": program,
+                    "accepted": accepted,
+                    "load_attempted": true,
+                    "success_log_contract": if accepted { "accepted_line_only" } else { "rejection_error_chain" },
+                    "pass": accepted,
+                    "failure_category": if accepted { "none" } else { "verifier" },
+                })
+                .to_string()
+                    + "\n"
+            })
+            .collect::<String>();
+        let timing = (1..=runs)
+            .map(|run| signal_timing_value(run, &valid_signal()).to_string() + "\n")
+            .collect::<String>();
+        let status = if category == "none" { "PASS" } else { "FAIL" };
+        for (name, contents) in [
+            ("environment.txt", "kernel_release=test\n".to_owned()),
+            ("manifest-digests.txt", "bpf_sha256=test\n".to_owned()),
+            ("verifier.log", "program=test outcome=accepted\n".to_owned()),
+            ("verifier-results.jsonl", verifier),
+            ("signal-timing.jsonl", timing),
+            (
+                "runner-status.txt",
+                format!("status={status}\nfailure_category={category}\n"),
+            ),
+        ] {
+            let file = path.join(name);
+            std::fs::write(&file, contents).unwrap();
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    fn shell_validate_gate_b_export(script: &str, path: &Path, expected_rc: u8) -> bool {
+        Command::new("bash")
+            .arg("-c")
+            .arg("source \"$1\"; validate_local_export b \"$2\" \"$3\"")
+            .arg("bash")
+            .arg(script)
+            .arg(path)
+            .arg(expected_rc.to_string())
+            .status()
+            .unwrap()
+            .success()
+    }
+
     #[test]
     fn canonical_gate_export_requires_four_verifier_records_and_matching_final_status() {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
@@ -2889,6 +3793,161 @@ mod tests {
             accepted,
             [("map", true), ("counter", true), ("start", true)]
         );
+    }
+
+    #[test]
+    fn gate_b_semantics_recompute_all_runs_and_reject_contradictions() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("gate-b-semantics");
+        let valid = temp.path().join("valid");
+        fake_canonical_gate_b_export(&valid, 2, 20, "none");
+        assert!(shell_validate_gate_b_export(script, &valid, 0));
+
+        let verifier_failure = temp.path().join("valid-verifier-failure");
+        fake_canonical_gate_b_export(&verifier_failure, 2, 20, "verifier");
+        std::fs::write(verifier_failure.join("signal-timing.jsonl"), "").unwrap();
+        assert!(shell_validate_gate_b_export(script, &verifier_failure, 1));
+
+        let runtime_failure = temp.path().join("valid-runtime-failure");
+        fake_canonical_gate_b_export(&runtime_failure, 2, 1, "none");
+        let timing = runtime_failure.join("signal-timing.jsonl");
+        let mut record: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&timing).unwrap().trim()).unwrap();
+        record["pass"] = false.into();
+        record["failure_category"] = "runtime".into();
+        record["runtime_failure_reason"] = "child exit timeout".into();
+        std::fs::write(&timing, record.to_string() + "\n").unwrap();
+        std::fs::write(
+            runtime_failure.join("runner-status.txt"),
+            "status=FAIL\nfailure_category=runtime\n",
+        )
+        .unwrap();
+        assert!(shell_validate_gate_b_export(script, &runtime_failure, 1));
+
+        let oracle_failure = temp.path().join("valid-oracle-failure");
+        fake_canonical_gate_b_export(&oracle_failure, 2, 1, "none");
+        let timing = oracle_failure.join("signal-timing.jsonl");
+        let mut record: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&timing).unwrap().trim()).unwrap();
+        record["late_hits"] = 0.into();
+        record["pass"] = false.into();
+        record["failure_category"] = "oracle".into();
+        std::fs::write(&timing, record.to_string() + "\n").unwrap();
+        std::fs::write(
+            oracle_failure.join("runner-status.txt"),
+            "status=FAIL\nfailure_category=oracle\n",
+        )
+        .unwrap();
+        assert!(shell_validate_gate_b_export(script, &oracle_failure, 1));
+
+        for runs in [19, 21] {
+            let path = temp.path().join(format!("runs-{runs}"));
+            fake_canonical_gate_b_export(&path, 2, runs, "none");
+            assert!(
+                !shell_validate_gate_b_export(script, &path, 0),
+                "accepted {runs} Gate B runs"
+            );
+        }
+        for verifier_count in [1, 2] {
+            let path = temp.path().join(format!("verifier-{verifier_count}"));
+            fake_canonical_gate_b_export(&path, verifier_count, 20, "none");
+            if verifier_count == 2 {
+                let verifier = path.join("verifier-results.jsonl");
+                let mut records = std::fs::read_to_string(&verifier)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .collect::<Vec<_>>();
+                records[1]["accepted"] = false.into();
+                records[1]["pass"] = false.into();
+                records[1]["failure_category"] = "verifier".into();
+                records[1]["success_log_contract"] = "rejection_error_chain".into();
+                std::fs::write(
+                    verifier,
+                    records
+                        .iter()
+                        .map(|record| record.to_string() + "\n")
+                        .collect::<String>(),
+                )
+                .unwrap();
+            }
+            assert!(
+                !shell_validate_gate_b_export(script, &path, 0),
+                "accepted contradictory verifier evidence {verifier_count}"
+            );
+        }
+
+        let contradictory = temp.path().join("contradictory-category");
+        fake_canonical_gate_b_export(&contradictory, 2, 20, "none");
+        std::fs::write(
+            contradictory.join("runner-status.txt"),
+            "status=FAIL\nfailure_category=verifier\n",
+        )
+        .unwrap();
+        assert!(!shell_validate_gate_b_export(script, &contradictory, 1));
+
+        for mutation in 0..33 {
+            let path = temp.path().join(format!("mutation-{mutation}"));
+            fake_canonical_gate_b_export(&path, 2, 20, "none");
+            let timing = path.join("signal-timing.jsonl");
+            let mut records = std::fs::read_to_string(&timing)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            let record = &mut records[0];
+            match mutation {
+                0 => record["hook_ts_ns"] = 0.into(),
+                1 => record["send_signal_rc"] = (-1).into(),
+                2 => record["stop_request_accepted"] = false.into(),
+                3 => record["expected_task_count"] = 3.into(),
+                4 => record["stopped_snapshot_1_count"] = 1.into(),
+                5 => record["stopped_snapshot_2_count"] = 1.into(),
+                6 => record["stopped_snapshot_1_exact_expected_task_set"] = false.into(),
+                7 => record["stopped_snapshot_1_all_tasks_stopped"] = false.into(),
+                8 => record["stopped_snapshot_2_exact_expected_task_set"] = false.into(),
+                9 => record["stopped_snapshot_2_all_tasks_stopped"] = false.into(),
+                10 => record["pre_stop_marker_observed"] = true.into(),
+                11 => record["post_attach_task_count"] = 1.into(),
+                12 => record["post_attach_exact_expected_task_set"] = false.into(),
+                13 => record["post_attach_all_tasks_stopped"] = false.into(),
+                14 => record["post_attach_marker_observed"] = true.into(),
+                15 => record["signal_attach_attempts"] = 0.into(),
+                16 => record["signal_attach_attempts"] = 2.into(),
+                17 => record["signal_attach_accepted"] = false.into(),
+                18 => record["late_attach_attempts"] = 0.into(),
+                19 => record["late_attach_attempts"] = 2.into(),
+                20 => record["late_attach_accepted"] = false.into(),
+                21 => record["signal_link_detached"] = false.into(),
+                22 => record["late_link_detached"] = false.into(),
+                23 => record["last_attach_ts_ns"] = 999_999.into(),
+                24 => record["attach_gap_ms"] = 2.0.into(),
+                25 => record["pidfd_resume_attempts"] = 0.into(),
+                26 => record["pidfd_resume_attempts"] = 2.into(),
+                27 => record["pidfd_resume_rc"] = (-1).into(),
+                28 => record["resume_via_original_pidfd"] = false.into(),
+                29 => record["post_resume_marker_observed"] = false.into(),
+                30 => record["late_hits"] = 0.into(),
+                31 => record["late_hits"] = 2.into(),
+                32 => {
+                    record["child_exit"] = 1.into();
+                    record["reaped"] = false.into();
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(
+                timing,
+                records
+                    .iter()
+                    .map(|record| record.to_string() + "\n")
+                    .collect::<String>(),
+            )
+            .unwrap();
+            assert!(
+                !shell_validate_gate_b_export(script, &path, 0),
+                "accepted Gate B mutation {mutation}"
+            );
+        }
     }
 
     #[test]
@@ -3012,6 +4071,53 @@ mod tests {
         let remote = std::fs::read_to_string(run.join("remote-command.txt")).unwrap();
         assert!(remote.contains(
             "sudo -n timeout --signal=TERM --kill-after=5s 120s /var/tmp/p11scope-slice1b2/bundle/slice1b2-runner gate-a"
+        ));
+    }
+
+    #[test]
+    fn gate_b_timeout_is_quiesced_not_exported_and_cleaned_up() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("gate-b-timeout-outcome");
+        let bundle = temp.path().join("bundle");
+        let run = temp.path().join("run");
+        let export = temp.path().join("export");
+        fake_gate_bundle(&bundle);
+        let body = concat!(
+            "source \"$1\"; shift; ",
+            "validate_execution_bundle() { return 0; }; ",
+            "private_start_lane() { mkdir -m 0700 \"$2\"; PRIVATE_RUN_DIR=$2; PRIVATE_KNOWN_HOSTS=/known; PRIVATE_PORT=2222; PRIVATE_LANE_OWNED=1; return 0; }; ",
+            "strict_ssh() { return 0; }; cmp() { return 0; }; ",
+            "scp_argv() { printf '%s\\0' /bin/true; }; ",
+            "gate_ssh() { printf '%s\\n' \"$*\" >\"$PRIVATE_RUN_DIR/remote-command.txt\"; return 124; }; ",
+            "quiesce_gate_runner() { : >\"$PRIVATE_RUN_DIR/quiesced\"; return 0; }; ",
+            "export_evidence() { : >\"$PRIVATE_RUN_DIR/export-called\"; return 0; }; ",
+            "validate_local_export() { : >\"$PRIVATE_RUN_DIR/validate-called\"; return 0; }; ",
+            "private_finish_lane() { : >\"$PRIVATE_RUN_DIR/cleaned\"; return 0; }; ",
+            "set +e; gate_b_lane jammy \"$1\" \"$2\" \"$3\"; rc=$?; set +e; printf 'rc=%s\\n' \"$rc\""
+        );
+        let output = {
+            let _serial = VM_TEST_LOCK.lock().unwrap();
+            shell_output(
+                script,
+                body,
+                &[bundle.as_os_str(), run.as_os_str(), export.as_os_str()],
+            )
+        };
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"rc=2\n");
+        assert_eq!(std::fs::read(run.join("gate-b.status")).unwrap(), b"124\n");
+        assert_eq!(
+            std::fs::read(run.join("gate-b.outcome")).unwrap(),
+            b"TIMEOUT\n"
+        );
+        assert!(run.join("quiesced").exists());
+        assert!(run.join("cleaned").exists());
+        assert!(!run.join("export-called").exists());
+        assert!(!run.join("validate-called").exists());
+        assert!(!export.exists());
+        let remote = std::fs::read_to_string(run.join("remote-command.txt")).unwrap();
+        assert!(remote.contains(
+            "sudo -n timeout --signal=TERM --kill-after=5s 120s /var/tmp/p11scope-slice1b2/bundle/slice1b2-runner gate-b --runs 20"
         ));
     }
 
@@ -3417,7 +4523,7 @@ mod tests {
     }
 
     #[test]
-    fn ebpf_source_freezes_four_program_verifier_contract() {
+    fn ebpf_source_freezes_six_program_four_map_signal_contract() {
         let source =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ebpf/src/main.rs"))
                 .unwrap();
@@ -3426,6 +4532,8 @@ mod tests {
             "function_list_return",
             "interface_list_entry",
             "interface_list_return",
+            "signal_return",
+            "late_hit",
         ] {
             assert_eq!(source.matches(&format!("pub fn {program}(")).count(), 1);
         }
@@ -3435,7 +4543,7 @@ mod tests {
         assert_eq!(
             source.matches("#[uprobe]\npub fn ").count()
                 + source.matches("#[uretprobe]\npub fn ").count(),
-            4,
+            6,
             "an extra public BPF program must be rejected"
         );
         assert_eq!(
@@ -3452,6 +4560,21 @@ mod tests {
         assert!(source.contains("#[inline(never)]\nfn emit_interface("));
         assert!(source.contains("if !emit_interface("));
         assert!(source.contains("while word < 112"));
+        assert!(source.contains("DISCOVERY.reserve::<SignalRecord>(0)"));
+        assert!(source.contains("increment_counter(LATE_HITS)"));
+        let signal = source.find("pub fn signal_return(").unwrap();
+        let timestamp = source[signal..]
+            .find("helpers::bpf_ktime_get_ns()")
+            .unwrap()
+            + signal;
+        let send = source[signal..]
+            .find("helpers::bpf_send_signal(19)")
+            .unwrap()
+            + signal;
+        assert!(
+            timestamp < send,
+            "timestamp must be sampled immediately before SIGSTOP"
+        );
         assert!(
             source.contains("START.insert(&key, &state, aya_ebpf::bindings::BPF_NOEXIST as u64)")
         );
@@ -3474,19 +4597,43 @@ mod tests {
 
         let host = std::fs::read_to_string(file!()).unwrap();
         let declaration = ["const GATE_A_", "PROGRAMS: [&str; 4] = ["].concat();
-        let load_results = ["write_json_line(&mut verifier_", "results"].concat();
+        let load_writer = ["write_json_line(&mut verifier_", "results"].concat();
         let child_loop = ["for (number, case) in ", "["].concat();
         let declaration = host.find(&declaration).unwrap();
         let load_loop = host.find("for program_name in GATE_A_PROGRAMS").unwrap();
-        let load_results = host[load_loop..].find(&load_results).unwrap() + load_loop;
-        let child_loop = host[load_results..].find(&child_loop).unwrap() + load_results;
-        assert!(declaration < load_loop && load_loop < load_results && load_results < child_loop);
+        let load_result = host[load_loop..].find(&load_writer).unwrap() + load_loop;
+        let child_loop = host[load_result..].find(&child_loop).unwrap() + load_result;
+        assert!(declaration < load_loop && load_loop < load_result && load_result < child_loop);
+        let gate_b_declaration = host.find("const GATE_B_PROGRAMS: [&str; 2]").unwrap();
+        let gate_b_load_loop = host.find("for program_name in GATE_B_PROGRAMS").unwrap();
+        let gate_b_load_result =
+            host[gate_b_load_loop..].find(&load_writer).unwrap() + gate_b_load_loop;
+        let gate_b_child_loop = host[gate_b_load_result..]
+            .find("for run in 1..=20")
+            .unwrap()
+            + gate_b_load_result;
+        assert!(
+            gate_b_declaration < gate_b_load_loop
+                && gate_b_load_loop < gate_b_load_result
+                && gate_b_load_result < gate_b_child_loop
+        );
         assert_eq!(
             host.matches(&["write_json_line(&mut verifier_", "results"].concat())
                 .count(),
-            1,
-            "the four-element load loop must be the only verifier-result writer"
+            2,
+            "each gate's pre-child load loop must be its only verifier-result writer"
         );
+        let case_start = host.find("fn run_gate_b_case(").unwrap();
+        let gate_start = host[case_start..].find("fn run_gate_b(").unwrap() + case_start;
+        let case_source = &host[case_start..gate_start];
+        assert!(case_source.contains("if let Some(link) = late_link"));
+        assert!(case_source.contains("detach_program(ebpf, \"late_hit\", link)"));
+        assert!(case_source.contains("if let Some(link) = signal_link"));
+        assert!(case_source.contains("detach_program(ebpf, \"signal_return\", link)"));
+        let self_check = host[gate_start..].find("fn self_check(").unwrap() + gate_start;
+        let gate_source = &host[gate_start..self_check];
+        assert!(gate_source.contains("if runtime_failure_reason.is_some() || !pass"));
+        assert!(gate_source.contains("break;"));
     }
 
     #[test]

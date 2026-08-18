@@ -2749,15 +2749,20 @@ mod tests {
         for (index, case) in case_names[..case_count].iter().enumerate() {
             let failed = (category == "runtime" && index + 1 == case_count)
                 || (category == "oracle" && index == 2);
+            let final_case = case_count == case_names.len() && index + 1 == case_count;
+            let (before, after, deltas) = if final_case {
+                ([0, 4, 0, 1, 0], [0, 5, 0, 1, 0], [0, 1, 0, 0, 0])
+            } else {
+                ([0; 5], [0; 5], [0; 5])
+            };
             let mut value = serde_json::json!({
                 "record_type": "case", "case": case,
                 "entry_attach_attempts": 1, "entry_attach_accepted": true,
                 "return_attach_attempts": 1, "return_attach_accepted": true,
                 "entry_link_detached": true, "return_link_detached": true,
                 "start_empty": true, "record_count": 0,
-                "counters_before": [0, 0, 0, 0, 0],
-                "counters_after": [0, 0, 0, 0, 0],
-                "counter_deltas": [0, 0, 0, 0, 0], "records": [],
+                "counters_before": before, "counters_after": after,
+                "counter_deltas": deltas, "records": [],
                 "pass": !failed,
                 "failure_category": if failed { category } else { "none" },
             });
@@ -2839,6 +2844,51 @@ mod tests {
             .unwrap();
             assert!(!shell_validate_gate_export(script, &path, 1), "{category}");
         }
+    }
+
+    #[test]
+    fn oracle_fail_accepts_map_counter_or_start_witness_but_not_exact_aggregate() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("gate-oracle-aggregate");
+        let mut accepted = Vec::new();
+        for witness in ["map", "counter", "start"] {
+            let path = temp.path().join(witness);
+            fake_canonical_gate_export(&path, 4, "none");
+            let cases_path = path.join("gate-a-cases.jsonl");
+            let mut records = std::fs::read_to_string(&cases_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            match witness {
+                "map" => {
+                    records[0]["max_entries"] = 131_072.into();
+                    records[0]["logical_value_bytes"] = 131_072.into();
+                }
+                "counter" => {
+                    let last = records.last_mut().unwrap();
+                    last["counters_after"][1] = 4.into();
+                    last["counter_deltas"][1] = 0.into();
+                }
+                "start" => records.last_mut().unwrap()["start_empty"] = false.into(),
+                _ => unreachable!(),
+            }
+            let contents = records
+                .iter()
+                .map(|record| record.to_string() + "\n")
+                .collect::<String>();
+            std::fs::write(&cases_path, contents).unwrap();
+            std::fs::write(
+                path.join("runner-status.txt"),
+                "status=FAIL\nfailure_category=oracle\n",
+            )
+            .unwrap();
+            accepted.push((witness, shell_validate_gate_export(script, &path, 1)));
+        }
+        assert_eq!(
+            accepted,
+            [("map", true), ("counter", true), ("start", true)]
+        );
     }
 
     #[test]

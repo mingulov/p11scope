@@ -152,10 +152,17 @@ map_facts = [
 ]
 if len(records) != len(map_records) + len(case_records) or len(map_records) != 4:
     raise SystemExit(64)
+actual_map_facts = []
 for item, expected in zip(map_records, map_facts):
     actual = tuple(item.get(name) for name in ["map", "map_type", "key_size", "value_size", "max_entries", "logical_value_bytes"])
-    if actual != expected or any(type(value) is not int for value in actual[2:]) or item.get("pass") is not False or item.get("failure_category") != "pending":
+    if actual[0] != expected[0] or actual[1] not in {"ringbuf", "hash", "array"}:
         raise SystemExit(64)
+    if any(type(value) is not int for value in actual[2:]) or any(not 0 <= value <= 0xffffffff for value in actual[2:5]) or not 0 <= actual[5] <= 0xffffffffffffffff:
+        raise SystemExit(64)
+    if item.get("pass") is not False or item.get("failure_category") != "pending":
+        raise SystemExit(64)
+    actual_map_facts.append(actual)
+maps_exact = actual_map_facts == map_facts
 case_names = [item.get("case") for item in case_records]
 if case_names != cases[:len(case_names)]:
     raise SystemExit(64)
@@ -202,8 +209,9 @@ expected_status = "PASS" if expected_rc == "0" else "FAIL"
 if len(status_lines) != 2 or status_lines[0] != f"status={expected_status}":
     raise SystemExit(64)
 category = status_lines[1].removeprefix("failure_category=") if status_lines[1].startswith("failure_category=") else ""
+final_aggregate_exact = bool(case_records) and case_records[-1]["counters_after"] == [0, 5, 0, 1, 0] and case_records[-1]["start_empty"] is True
 if expected_status == "PASS":
-    if category != "none" or not all(item["accepted"] for item in verifier) or case_names != cases or any(item["pass"] is not True or item.get("failure_category") != "none" or "runtime_failure_reason" in item for item in case_records):
+    if category != "none" or not maps_exact or not final_aggregate_exact or not all(item["accepted"] for item in verifier) or case_names != cases or any(item["pass"] is not True or item.get("failure_category") != "none" or "runtime_failure_reason" in item for item in case_records):
         raise SystemExit(64)
 elif category == "verifier":
     if all(item["accepted"] for item in verifier) or case_records:
@@ -217,9 +225,11 @@ elif category == "runtime":
     if last["pass"] is not False or last.get("failure_category") != "runtime" or last.get("runtime_failure_reason") not in runtime_reasons:
         raise SystemExit(64)
 elif category == "oracle":
-    if not all(item["accepted"] for item in verifier) or case_names != cases or not any(item["pass"] is False for item in case_records):
+    if not all(item["accepted"] for item in verifier) or case_names != cases:
         raise SystemExit(64)
     if any(item.get("failure_category") != ("none" if item["pass"] else "oracle") or "runtime_failure_reason" in item for item in case_records):
+        raise SystemExit(64)
+    if maps_exact and final_aggregate_exact and all(item["pass"] is True for item in case_records):
         raise SystemExit(64)
 else:
     raise SystemExit(64)

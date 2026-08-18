@@ -5339,6 +5339,12 @@ mod tests {
             reserve < zeroing && zeroing < cas && cas < send && send < submit,
             "order must be reserve -> zero words -> CAS -> single signal -> submit"
         );
+        let delay = signal_source.find("STOP_SIGNAL_DELAY_POLLS").unwrap();
+        assert!(
+            cas < delay && delay < send,
+            "the bounded winner delay must sit between the stop-owner CAS and the signal helper"
+        );
+        assert!(source.contains("const STOP_SIGNAL_DELAY_POLLS: u64 = 50_000;"));
         assert!(signal_source.contains("pause_owner_key()"));
         assert!(signal_source.contains("PAUSE_ARMED"));
         assert!(signal_source.contains("PAUSE_REQUESTED"));

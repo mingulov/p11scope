@@ -22,6 +22,13 @@ use sha2::{Digest as _, Sha256};
 unsafe impl aya::Pod for common::StateKey {}
 unsafe impl aya::Pod for common::StartState {}
 
+const GATE_A_PROGRAMS: [&str; 4] = [
+    "function_list_entry",
+    "function_list_return",
+    "interface_list_entry",
+    "interface_list_return",
+];
+
 pub fn decode_discovery_record(bytes: &[u8]) -> Result<common::DiscoveryRecord, &'static str> {
     if bytes.len() != std::mem::size_of::<common::DiscoveryRecord>() {
         return Err("discovery record length is not 896 bytes");
@@ -1331,6 +1338,12 @@ fn detach_program(
     program.detach(link).map_err(|_| "program detach")
 }
 
+type GateACaseFailure = Box<(GateACaseFacts, &'static str)>;
+
+fn gate_a_case_failure(facts: GateACaseFacts, reason: &'static str) -> GateACaseFailure {
+    Box::new((facts, reason))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_gate_a_case(
     ebpf: &mut aya::Ebpf,
@@ -1342,7 +1355,7 @@ fn run_gate_a_case(
     fixture_file: &File,
     case: GateACaseId,
     case_number: u8,
-) -> Result<GateACaseFacts, &'static str> {
+) -> Result<GateACaseFacts, GateACaseFailure> {
     let (case_name, entry_name, return_name, target_name, expected_kind) = match case {
         GateACaseId::Full104 => (
             "FULL_104",
@@ -1380,33 +1393,56 @@ fn run_gate_a_case(
             2,
         ),
     };
-    if !raw_records(ring)?.is_empty() {
-        return Err("record surplus before case");
+    let mut facts = GateACaseFacts {
+        case,
+        entry_attach_attempts: 0,
+        entry_attach_accepted: false,
+        return_attach_attempts: 0,
+        return_attach_accepted: false,
+        entry_link_detached: false,
+        return_link_detached: false,
+        records: Vec::new(),
+        counters_before: [0; 5],
+        counters_after: [0; 5],
+        start_empty: false,
+    };
+    macro_rules! partial {
+        ($result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(reason) => return Err(gate_a_case_failure(facts, reason)),
+            }
+        };
     }
-    let before = read_counters(counters)?;
+    if !partial!(raw_records(ring)).is_empty() {
+        return Err(gate_a_case_failure(facts, "record surplus before case"));
+    }
+    facts.counters_before = partial!(read_counters(counters));
+    facts.counters_after = facts.counters_before;
     let mut command = Command::new(fixture);
     command
         .arg("--gate-a")
         .arg(case_name)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut child = spawn_pinned_child(&mut command).map_err(|_| "gated child")?;
-    let expected_pointer = runtime_symbol_address(
+    let mut child = partial!(spawn_pinned_child(&mut command).map_err(|_| "gated child"));
+    let expected_pointer = partial!(runtime_symbol_address(
         child.pid(),
-        *offsets
-            .get("spike_pointer_target")
-            .ok_or("fixture offset")?,
+        *partial!(offsets.get("spike_pointer_target").ok_or("fixture offset")),
         fixture_file,
-    )?;
-    let target_offset = *offsets.get(target_name).ok_or("fixture offset")?;
-    let entry_link = attach_program(
+    ));
+    let target_offset = *partial!(offsets.get(target_name).ok_or("fixture offset"));
+    facts.entry_attach_attempts = 1;
+    let entry_link = partial!(attach_program(
         ebpf,
         entry_name,
         target_offset,
         fixture,
         child.pid(),
         u64::from(case_number),
-    )?;
+    ));
+    facts.entry_attach_accepted = true;
+    facts.return_attach_attempts = 1;
     let return_link = match attach_program(
         ebpf,
         return_name,
@@ -1415,53 +1451,63 @@ fn run_gate_a_case(
         child.pid(),
         u64::from(case_number),
     ) {
-        Ok(link) => link,
+        Ok(link) => {
+            facts.return_attach_accepted = true;
+            link
+        }
         Err(error) => {
-            let _ = detach_program(ebpf, entry_name, entry_link);
-            return Err(error);
+            facts.entry_link_detached = detach_program(ebpf, entry_name, entry_link).is_ok();
+            return Err(gate_a_case_failure(facts, error));
         }
     };
-    child.release().map_err(|_| "child release")?;
-    let child_status = child.wait().map_err(|_| "child wait")?;
-    let return_detached = detach_program(ebpf, return_name, return_link).is_ok();
-    let entry_detached = detach_program(ebpf, entry_name, entry_link).is_ok();
+    let release = child.release();
+    let child_status = if release.is_ok() {
+        child.wait().map_err(|_| "child wait")
+    } else {
+        Err("child release")
+    };
+    facts.return_link_detached = detach_program(ebpf, return_name, return_link).is_ok();
+    facts.entry_link_detached = detach_program(ebpf, entry_name, entry_link).is_ok();
+    let child_status = partial!(child_status);
     if !child_status.success() {
-        return Err("fixture child status");
+        return Err(gate_a_case_failure(facts, "fixture child status"));
     }
-    let records = raw_records(ring)?;
+    let records = partial!(raw_records(ring));
     if records.iter().enumerate().any(|(index, record)| {
         record.case_id != case_number
             || record.kind != expected_kind
             || (case == GateACaseId::Interfaces17 && usize::from(record.interface_index) != index)
     }) {
-        return Err("record identity");
+        return Err(gate_a_case_failure(facts, "record identity"));
     }
-    let after = read_counters(counters)?;
-    let start_empty = start.keys().next().is_none();
-    Ok(GateACaseFacts {
-        case,
-        entry_attach_attempts: 1,
-        entry_attach_accepted: true,
-        return_attach_attempts: 1,
-        return_attach_accepted: true,
-        entry_link_detached: entry_detached,
-        return_link_detached: return_detached,
-        records: records
-            .iter()
-            .map(|record| record_facts(record, expected_pointer))
-            .collect(),
-        counters_before: before,
-        counters_after: after,
-        start_empty,
-    })
+    facts.records = records
+        .iter()
+        .map(|record| record_facts(record, expected_pointer))
+        .collect();
+    facts.counters_after = partial!(read_counters(counters));
+    facts.start_empty = start.keys().next().is_none();
+    Ok(facts)
 }
 
 fn gate_a_case_json(
     metadata: &GateMetadata,
     facts: &GateACaseFacts,
     pass: bool,
+    runtime_failure_reason: Option<&str>,
 ) -> serde_json::Value {
-    let mut value = metadata.record(pass, if pass { "none" } else { "oracle" });
+    let mut value = metadata.record(
+        pass,
+        if runtime_failure_reason.is_some() {
+            "runtime"
+        } else if pass {
+            "none"
+        } else {
+            "oracle"
+        },
+    );
+    if let Some(reason) = runtime_failure_reason {
+        value.insert("runtime_failure_reason".into(), reason.into());
+    }
     value.insert("record_type".into(), "case".into());
     value.insert(
         "case".into(),
@@ -1585,14 +1631,8 @@ fn run_gate_a(paths: GateAPaths) -> Result<bool, &'static str> {
         }
     };
 
-    let programs = [
-        "function_list_entry",
-        "function_list_return",
-        "interface_list_entry",
-        "interface_list_return",
-    ];
     let mut all_loaded = true;
-    for program_name in programs {
+    for program_name in GATE_A_PROGRAMS {
         let result = (|| -> Result<(), Box<dyn Error>> {
             let program: &mut aya::programs::UProbe = ebpf
                 .program_mut(program_name)
@@ -1690,6 +1730,11 @@ fn run_gate_a(paths: GateAPaths) -> Result<bool, &'static str> {
         ) {
             Ok(facts) => facts,
             Err(error) => {
+                let (facts, error) = *error;
+                write_json_line(
+                    &mut cases_file,
+                    gate_a_case_json(&metadata, &facts, false, Some(error)),
+                )?;
                 writeln!(verifier_log, "runtime_failure={error}")
                     .map_err(|_| "runtime failure write")?;
                 writeln!(runner_status, "status=FAIL\nfailure_category=runtime")
@@ -1698,7 +1743,10 @@ fn run_gate_a(paths: GateAPaths) -> Result<bool, &'static str> {
             }
         };
         let pass = gate_a_case_pass(&facts);
-        write_json_line(&mut cases_file, gate_a_case_json(&metadata, &facts, pass))?;
+        write_json_line(
+            &mut cases_file,
+            gate_a_case_json(&metadata, &facts, pass, None),
+        )?;
         case_facts.push(facts);
     }
     let pass = map_facts
@@ -1785,11 +1833,13 @@ mod tests {
     use std::mem::{align_of, offset_of, size_of};
     use std::os::unix::process::ExitStatusExt as _;
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    static VM_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     struct TestDir(PathBuf);
 
@@ -1878,6 +1928,49 @@ mod tests {
             ),
             gate_case(GateACaseId::Interfaces17, interfaces, [0, 2, 0, 1, 0]),
         ]
+    }
+
+    fn test_gate_metadata() -> GateMetadata {
+        GateMetadata {
+            source_commit: "a".repeat(40),
+            source_manifest_sha256: "b".repeat(64),
+            execution_manifest_sha256: "c".repeat(64),
+            build_evidence_sha256: "d".repeat(64),
+            bpf_sha256: "e".repeat(64),
+            runner_sha256: "f".repeat(64),
+            fixture_sha256: "1".repeat(64),
+            kernel_release: "5.15.0-test".into(),
+            arch: "x86_64".into(),
+            glibc_version: "glibc 2.35".into(),
+            lane: "5.15".into(),
+            run_id: "test-run".into(),
+        }
+    }
+
+    #[test]
+    fn runtime_failure_record_retains_partial_attach_and_detach_facts() {
+        let facts = GateACaseFacts {
+            case: GateACaseId::Full104,
+            entry_attach_attempts: 1,
+            entry_attach_accepted: true,
+            return_attach_attempts: 1,
+            return_attach_accepted: false,
+            entry_link_detached: true,
+            return_link_detached: false,
+            records: Vec::new(),
+            counters_before: [0; 5],
+            counters_after: [0; 5],
+            start_empty: false,
+        };
+        let value = gate_a_case_json(&test_gate_metadata(), &facts, false, Some("return attach"));
+        assert_eq!(value["failure_category"], "runtime");
+        assert_eq!(value["runtime_failure_reason"], "return attach");
+        assert_eq!(value["entry_attach_attempts"], 1);
+        assert_eq!(value["entry_attach_accepted"], true);
+        assert_eq!(value["return_attach_attempts"], 1);
+        assert_eq!(value["return_attach_accepted"], false);
+        assert_eq!(value["entry_link_detached"], true);
+        assert_eq!(value["return_link_detached"], false);
     }
 
     fn valid_signal() -> SignalTimingFacts {
@@ -2550,7 +2643,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_a_verifier_execution_has_a_distinct_120_second_bound() {
+    fn gate_a_verifier_execution_has_a_strictly_larger_outer_ssh_bound() {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
         let temp = TestDir::new("gate-timeout");
         let bin = temp.path().join("bin");
@@ -2571,7 +2664,346 @@ mod tests {
             "gate SSH failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(output.stdout, b"120s\n");
+        assert_eq!(output.stdout, b"150s\n");
+    }
+
+    fn fake_gate_bundle(path: &Path) {
+        std::fs::create_dir(path).unwrap();
+        for name in [
+            "source-elf.manifest",
+            "build-evidence.txt",
+            "execution.manifest",
+            "slice1b2-kernel-ebpf",
+            "slice1b2-fixture",
+            "slice1b2-runner",
+        ] {
+            std::fs::write(path.join(name), name).unwrap();
+        }
+    }
+
+    fn shell_output(script: &str, body: &str, args: &[&OsStr]) -> std::process::Output {
+        let mut command = Command::new("bash");
+        command.arg("-c").arg(body).arg("bash").arg(script);
+        command.args(args).output().unwrap()
+    }
+
+    fn fake_canonical_gate_export(path: &Path, verifier_count: usize, status: &str) {
+        std::fs::create_dir(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let programs = [
+            "function_list_entry",
+            "function_list_return",
+            "interface_list_entry",
+            "interface_list_return",
+        ];
+        let verifier = programs[..verifier_count]
+            .iter()
+            .map(|program| {
+                format!("{{\"program\":\"{program}\",\"accepted\":true,\"load_attempted\":true}}\n")
+            })
+            .collect::<String>();
+        let mut cases = ["EVENTS", "DISCOVERY", "START", "COUNTERS"]
+            .iter()
+            .map(|map| format!("{{\"record_type\":\"map\",\"map\":\"{map}\"}}\n"))
+            .collect::<String>();
+        for case in [
+            "FULL_104",
+            "GUARD_AFTER_7",
+            "UNREADABLE_TABLE",
+            "UNREADABLE_PP",
+            "INTERFACE",
+        ] {
+            cases.push_str(&format!(
+                "{{\"record_type\":\"case\",\"case\":\"{case}\"}}\n"
+            ));
+        }
+        for (name, contents) in [
+            ("environment.txt", "kernel_release=test\n".to_owned()),
+            ("manifest-digests.txt", "bpf_sha256=test\n".to_owned()),
+            ("verifier.log", "program=test outcome=accepted\n".to_owned()),
+            ("verifier-results.jsonl", verifier),
+            ("gate-a-cases.jsonl", cases),
+            (
+                "runner-status.txt",
+                format!(
+                    "status={status}\nfailure_category={}\n",
+                    if status == "PASS" { "none" } else { "oracle" }
+                ),
+            ),
+        ] {
+            let file = path.join(name);
+            std::fs::write(&file, contents).unwrap();
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    fn shell_validate_gate_export(script: &str, path: &Path, expected_rc: u8) -> bool {
+        Command::new("bash")
+            .arg("-c")
+            .arg("source \"$1\"; validate_local_export a \"$2\" \"$3\"")
+            .arg("bash")
+            .arg(script)
+            .arg(path)
+            .arg(expected_rc.to_string())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    #[test]
+    fn canonical_gate_export_requires_four_verifier_records_and_matching_final_status() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("gate-export-semantics");
+        let valid = temp.path().join("valid");
+        fake_canonical_gate_export(&valid, 4, "PASS");
+        assert!(shell_validate_gate_export(script, &valid, 0));
+
+        let short = temp.path().join("short");
+        fake_canonical_gate_export(&short, 3, "PASS");
+        assert!(!shell_validate_gate_export(script, &short, 0));
+
+        let mismatch = temp.path().join("mismatch");
+        fake_canonical_gate_export(&mismatch, 4, "PASS");
+        assert!(!shell_validate_gate_export(script, &mismatch, 1));
+    }
+
+    #[test]
+    fn canonical_validation_failure_does_not_publish_gate_outcome() {
+        let _serial = VM_TEST_LOCK.lock().unwrap();
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("gate-invalid-outcome");
+        let bundle = temp.path().join("bundle");
+        let run = temp.path().join("run");
+        let export = temp.path().join("export");
+        fake_gate_bundle(&bundle);
+        let body = concat!(
+            "source \"$1\"; shift; validate_execution_bundle() { return 0; }; ",
+            "private_start_lane() { mkdir -m 0700 \"$2\"; PRIVATE_RUN_DIR=$2; PRIVATE_KNOWN_HOSTS=/known; PRIVATE_PORT=2222; PRIVATE_LANE_OWNED=1; }; ",
+            "strict_ssh() { return 0; }; cmp() { return 0; }; scp_argv() { printf '%s\\0' /bin/true; }; ",
+            "gate_ssh() { return 0; }; export_evidence() { mkdir -m 0700 \"$5\"; }; ",
+            "validate_local_export() { return 64; }; private_finish_lane() { return 0; }; ",
+            "set +e; gate_a_lane jammy \"$1\" \"$2\" \"$3\"; printf 'rc=%s\\n' \"$?\""
+        );
+        let output = shell_output(
+            script,
+            body,
+            &[bundle.as_os_str(), run.as_os_str(), export.as_os_str()],
+        );
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"rc=64\n");
+        assert!(!run.join("gate-a.outcome").exists());
+    }
+
+    #[test]
+    fn gate_a_timeout_is_quiesced_not_exported_and_cleaned_up() {
+        let _serial = VM_TEST_LOCK.lock().unwrap();
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("gate-timeout-outcome");
+        let bundle = temp.path().join("bundle");
+        let run = temp.path().join("run");
+        let export = temp.path().join("export");
+        let bin = temp.path().join("bin");
+        let timeout_log = temp.path().join("timeouts.txt");
+        fake_gate_bundle(&bundle);
+        std::fs::create_dir(&bin).unwrap();
+        let timeout = bin.join("timeout");
+        std::fs::write(
+            &timeout,
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >>\"$TIMEOUT_LOG\"\nshift\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&timeout, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let body = concat!(
+            "source \"$1\"; shift; ",
+            "validate_execution_bundle() { return 0; }; ",
+            "private_start_lane() { mkdir -m 0700 \"$2\"; PRIVATE_RUN_DIR=$2; PRIVATE_KNOWN_HOSTS=/known; PRIVATE_PORT=2222; PRIVATE_LANE_OWNED=1; return 0; }; ",
+            "strict_ssh() { return 0; }; cmp() { return 0; }; ",
+            "scp_argv() { printf '%s\\0' /bin/true; }; ",
+            "gate_ssh() { printf '%s\\n' \"$*\" >\"$PRIVATE_RUN_DIR/remote-command.txt\"; return 124; }; ",
+            "quiesce_gate_runner() { : >\"$PRIVATE_RUN_DIR/quiesced\"; return 0; }; ",
+            "export_evidence() { : >\"$PRIVATE_RUN_DIR/export-called\"; return 0; }; ",
+            "validate_local_export() { : >\"$PRIVATE_RUN_DIR/validate-called\"; return 0; }; ",
+            "private_finish_lane() { : >\"$PRIVATE_RUN_DIR/cleaned\"; return 0; }; ",
+            "set +e; gate_a_lane jammy \"$1\" \"$2\" \"$3\"; rc=$?; set +e; printf 'rc=%s\\n' \"$rc\""
+        );
+        let mut command = Command::new("bash");
+        command
+            .arg("-c")
+            .arg(body)
+            .arg("bash")
+            .arg(script)
+            .args([&bundle, &run, &export])
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("TIMEOUT_LOG", &timeout_log);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "timeout lane failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"rc=2\n");
+        assert_eq!(std::fs::read(run.join("gate-a.status")).unwrap(), b"124\n");
+        assert_eq!(
+            std::fs::read(run.join("gate-a.outcome")).unwrap(),
+            b"TIMEOUT\n"
+        );
+        assert!(run.join("quiesced").exists());
+        assert!(run.join("cleaned").exists());
+        assert!(!run.join("export-called").exists());
+        assert!(!run.join("validate-called").exists());
+        assert!(!export.exists());
+        assert_eq!(
+            std::fs::read_to_string(timeout_log).unwrap(),
+            "120s\n120s\n120s\n120s\n120s\n120s\n"
+        );
+        let remote = std::fs::read_to_string(run.join("remote-command.txt")).unwrap();
+        assert!(remote.contains(
+            "sudo -n timeout --signal=TERM --kill-after=5s 120s /var/tmp/p11scope-slice1b2/bundle/slice1b2-runner gate-a"
+        ));
+    }
+
+    #[test]
+    fn lane_cleanup_runs_when_start_fails_after_daemon_pidfile() {
+        let _serial = VM_TEST_LOCK.lock().unwrap();
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("post-daemon-cleanup");
+        let bundle = temp.path().join("bundle");
+        let run = temp.path().join("run");
+        let export = temp.path().join("export");
+        fake_gate_bundle(&bundle);
+        let body = concat!(
+            "source \"$1\"; shift; ",
+            "validate_execution_bundle() { return 0; }; ",
+            "private_start_lane() { mkdir -m 0700 \"$2\"; PRIVATE_RUN_DIR=$2; PRIVATE_LANE_OWNED=1; PRIVATE_QEMU_PID=; printf '12345\\n' >\"$2/qemu.pid\"; return 64; }; ",
+            "private_finish_lane() { : >\"$PRIVATE_RUN_DIR/cleaned\"; return 0; }; ",
+            "set +e; gate_a_lane jammy \"$1\" \"$2\" \"$3\"; rc=$?; set +e; printf 'rc=%s\\n' \"$rc\""
+        );
+        let output = shell_output(
+            script,
+            body,
+            &[bundle.as_os_str(), run.as_os_str(), export.as_os_str()],
+        );
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"rc=64\n");
+        assert!(run.join("cleaned").exists());
+    }
+
+    #[test]
+    fn cleanup_pid_recovery_requires_exact_qemu_runtime_process() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("qemu-pid-recovery");
+        let run = temp.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        let runtime = run.join("runtime.qcow2");
+        std::fs::write(&runtime, b"runtime").unwrap();
+        let mut qemu = Command::new("bash")
+            .arg("-c")
+            .arg(concat!(
+                "exec -a qemu-system-x86_64 /bin/sh -c ",
+                "'while :; do /bin/sleep 1; done' ",
+                "\"file=$1,if=virtio,format=qcow2\""
+            ))
+            .arg("bash")
+            .arg(&runtime)
+            .spawn()
+            .unwrap();
+        std::fs::write(run.join("qemu.pid"), format!("{}\n", qemu.id())).unwrap();
+        let mut recovered = None;
+        for _ in 0..50 {
+            let output = Command::new("bash")
+                .arg("-c")
+                .arg(concat!(
+                    "source \"$1\"; PRIVATE_RUN_DIR=$2; PRIVATE_QEMU_PID=; ",
+                    "private_recover_qemu_pid && printf '%s\\n' \"$PRIVATE_QEMU_PID\""
+                ))
+                .arg("bash")
+                .arg(script)
+                .arg(&run)
+                .output()
+                .unwrap();
+            if output.status.success() {
+                recovered = Some(output.stdout);
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+        assert_eq!(recovered.unwrap(), format!("{}\n", qemu.id()).as_bytes());
+
+        std::fs::write(run.join("qemu.pid"), format!("{}\n", std::process::id())).unwrap();
+        let unrelated = Command::new("bash")
+            .arg("-c")
+            .arg("source \"$1\"; PRIVATE_RUN_DIR=$2; PRIVATE_QEMU_PID=; private_recover_qemu_pid")
+            .arg("bash")
+            .arg(script)
+            .arg(&run)
+            .status()
+            .unwrap();
+        assert!(!unrelated.success());
+    }
+
+    #[test]
+    fn exit_trap_cleans_up_after_post_copy_host_failure() {
+        let _serial = VM_TEST_LOCK.lock().unwrap();
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("post-copy-cleanup");
+        let bundle = temp.path().join("bundle");
+        let run = temp.path().join("run");
+        let export = temp.path().join("export");
+        fake_gate_bundle(&bundle);
+        let body = concat!(
+            "set -e; source \"$1\"; shift; ",
+            "validate_execution_bundle() { return 0; }; ",
+            "private_start_lane() { mkdir -m 0700 \"$2\"; PRIVATE_RUN_DIR=$2; PRIVATE_KNOWN_HOSTS=/known; PRIVATE_PORT=2222; PRIVATE_LANE_OWNED=1; return 0; }; ",
+            "strict_ssh() { return 0; }; scp_argv() { printf '%s\\0' /bin/true; }; ",
+            "sha256sum() { return 1; }; ",
+            "private_finish_lane() { : >\"$PRIVATE_RUN_DIR/cleaned\"; return 0; }; ",
+            "gate_a_lane jammy \"$1\" \"$2\" \"$3\""
+        );
+        let output = shell_output(
+            script,
+            body,
+            &[bundle.as_os_str(), run.as_os_str(), export.as_os_str()],
+        );
+        assert!(!output.status.success());
+        assert!(run.join("cleaned").exists());
+    }
+
+    #[test]
+    fn provisioning_exit_trap_cleans_up_after_post_copy_failure() {
+        let _serial = VM_TEST_LOCK.lock().unwrap();
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("provision-post-copy-cleanup");
+        let archive = temp.path().join("source.tar");
+        let manifest = temp.path().join("manifest.json");
+        let run = temp.path().join("run");
+        let build = temp.path().join("build");
+        std::fs::write(&archive, b"archive").unwrap();
+        std::fs::write(&manifest, b"manifest").unwrap();
+        let body = concat!(
+            "set -e; source \"$1\"; shift; ",
+            "validate_source_inputs() { return 0; }; ",
+            "sha256sum() { printf '4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10  fake\\n'; }; ",
+            "private_start_lane() { mkdir -m 0700 \"$2\"; PRIVATE_RUN_DIR=$2; PRIVATE_KNOWN_HOSTS=/known; PRIVATE_PORT=2222; PRIVATE_LANE_OWNED=1; return 0; }; ",
+            "strict_ssh() { return 0; }; strict_ssh_long() { return 0; }; ",
+            "scp_argv() { printf '%s\\0' /bin/true; }; ",
+            "chmod() { return 1; }; ",
+            "private_finish_lane() { : >\"$PRIVATE_RUN_DIR/cleaned\"; return 0; }; ",
+            "provision_jammy \"$1\" \"$2\" expected \"$3\" \"$4\""
+        );
+        let output = shell_output(
+            script,
+            body,
+            &[
+                archive.as_os_str(),
+                manifest.as_os_str(),
+                run.as_os_str(),
+                build.as_os_str(),
+            ],
+        );
+        assert!(!output.status.success());
+        assert!(run.join("cleaned").exists());
     }
 
     #[test]
@@ -2753,6 +3185,17 @@ mod tests {
         for map in ["EVENTS", "DISCOVERY", "START", "COUNTERS"] {
             assert_eq!(source.matches(&format!("static {map}:")).count(), 1);
         }
+        assert_eq!(
+            source.matches("#[uprobe]\npub fn ").count()
+                + source.matches("#[uretprobe]\npub fn ").count(),
+            4,
+            "an extra public BPF program must be rejected"
+        );
+        assert_eq!(
+            source.matches("#[map]\nstatic ").count(),
+            4,
+            "an extra BPF map must be rejected"
+        );
         assert!(source.contains("RingBuf::with_byte_size(262_144, 0)"));
         assert!(source.contains("RingBuf::with_byte_size(65_536, 0)"));
         assert!(source.contains("HashMap::with_max_entries(64, 0)"));
@@ -2780,6 +3223,22 @@ mod tests {
         assert!(
             submit > unsafe_end,
             "submit must remain outside raw initialization"
+        );
+
+        let host = std::fs::read_to_string(file!()).unwrap();
+        let declaration = ["const GATE_A_", "PROGRAMS: [&str; 4] = ["].concat();
+        let load_results = ["write_json_line(&mut verifier_", "results"].concat();
+        let child_loop = ["for (number, case) in ", "["].concat();
+        let declaration = host.find(&declaration).unwrap();
+        let load_loop = host.find("for program_name in GATE_A_PROGRAMS").unwrap();
+        let load_results = host[load_loop..].find(&load_results).unwrap() + load_loop;
+        let child_loop = host[load_results..].find(&child_loop).unwrap() + load_results;
+        assert!(declaration < load_loop && load_loop < load_results && load_results < child_loop);
+        assert_eq!(
+            host.matches(&["write_json_line(&mut verifier_", "results"].concat())
+                .count(),
+            1,
+            "the four-element load loop must be the only verifier-result writer"
         );
     }
 

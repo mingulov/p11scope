@@ -111,11 +111,60 @@ fixed_inventory() {
     esac
 }
 
+gate_a_semantics_python() {
+    cat <<'PY'
+import json, os, sys
+directory, expected_rc = sys.argv[1:]
+if expected_rc not in {"0", "1"}:
+    raise SystemExit(64)
+programs = [
+    "function_list_entry", "function_list_return",
+    "interface_list_entry", "interface_list_return",
+]
+maps = ["EVENTS", "DISCOVERY", "START", "COUNTERS"]
+cases = ["FULL_104", "GUARD_AFTER_7", "UNREADABLE_TABLE", "UNREADABLE_PP", "INTERFACE"]
+def json_lines(name):
+    with open(os.path.join(directory, name), encoding="utf-8") as stream:
+        return [json.loads(line) for line in stream if line.strip()]
+try:
+    verifier = json_lines("verifier-results.jsonl")
+    records = json_lines("gate-a-cases.jsonl")
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(64)
+if len(verifier) != 4 or [item.get("program") for item in verifier] != programs:
+    raise SystemExit(64)
+if any(item.get("load_attempted") is not True or not isinstance(item.get("accepted"), bool) for item in verifier):
+    raise SystemExit(64)
+map_names = [item.get("map") for item in records if item.get("record_type") == "map"]
+case_names = [item.get("case") for item in records if item.get("record_type") == "case"]
+if len(records) != len(map_names) + len(case_names) or map_names != maps or len(case_names) != len(set(case_names)) or any(name not in cases for name in case_names):
+    raise SystemExit(64)
+try:
+    with open(os.path.join(directory, "runner-status.txt"), encoding="utf-8") as stream:
+        status_lines = [line.rstrip("\n") for line in stream]
+except (OSError, UnicodeError):
+    raise SystemExit(64)
+expected_status = "PASS" if expected_rc == "0" else "FAIL"
+if len(status_lines) != 2 or status_lines[0] != f"status={expected_status}":
+    raise SystemExit(64)
+category = status_lines[1].removeprefix("failure_category=") if status_lines[1].startswith("failure_category=") else ""
+if expected_status == "PASS":
+    if category != "none" or case_names != cases or not all(item["accepted"] for item in verifier):
+        raise SystemExit(64)
+elif category not in {"verifier", "runtime", "oracle"}:
+    raise SystemExit(64)
+for name in ["environment.txt", "manifest-digests.txt", "verifier.log"]:
+    if os.path.getsize(os.path.join(directory, name)) == 0:
+        raise SystemExit(64)
+PY
+}
+
 remote_export_script() {
     cat <<'REMOTE_EXPORT'
 set -eu
 directory=$1
 varying=$2
+expected_rc=$3
 test "$(stat -c '%u:%a' -- "$directory")" = 0:700
 set -- environment.txt manifest-digests.txt verifier.log verifier-results.jsonl "$varying" runner-status.txt
 test "$(find "$directory" -mindepth 1 -maxdepth 1 -printf . | wc -c)" -eq 6
@@ -133,12 +182,17 @@ for name do
     total=$((total + size))
 done
 test "$total" -le 16777216
+python3 - "$directory" "$expected_rc" <<'PY'
+REMOTE_EXPORT
+    gate_a_semantics_python
+    cat <<'REMOTE_EXPORT'
+PY
 exec tar --format=posix --no-recursion -C "$directory" -cf - "$@"
 REMOTE_EXPORT
 }
 
 export_evidence() {
-    local gate=$1 known_hosts=$2 port=$3 remote_dir=$4 new_host_dir=$5 varying remote_command
+    local gate=$1 known_hosts=$2 port=$3 remote_dir=$4 new_host_dir=$5 expected_rc=$6 varying remote_command
     local -a ssh files
     [[ $remote_dir =~ ^/var/tmp/p11scope-slice1b2/[A-Za-z0-9._/-]+$ && $remote_dir != *..* ]] || return 64
     [[ ! -e $new_host_dir && ! -L $new_host_dir ]] || return 64
@@ -147,14 +201,14 @@ export_evidence() {
     mapfile -d '' -t ssh < <(ssh_argv "$known_hosts" "$port")
     mapfile -t files < <(fixed_inventory "$gate")
     varying=${files[4]}
-    remote_command="sudo -n sh -s -- $remote_dir $varying"
+    remote_command="sudo -n sh -s -- $remote_dir $varying $expected_rc"
     remote_export_script \
         | timeout 120s "${ssh[@]}" p11scope@127.0.0.1 "$remote_command" \
         | tar --no-same-owner --no-same-permissions -C "$new_host_dir" -xf -
 }
 
 validate_local_export() {
-    local gate=$1 directory=$2 name size total=0
+    local gate=$1 directory=$2 expected_rc=$3 name size total=0
     local -a files
     [[ -d $directory && ! -L $directory && $(stat -c '%u:%a' "$directory") == "$(id -u):700" ]] || return 64
     mapfile -t files < <(fixed_inventory "$gate")
@@ -170,9 +224,15 @@ validate_local_export() {
         total=$((total + size))
     done
     (( total <= 16777216 )) || return 64
+    [[ $gate != a ]] || validate_gate_a_semantics "$directory" "$expected_rc" || return 64
     [[ ! -e $directory.sha256 && ! -L $directory.sha256 ]] || return 64
     (cd "$directory" && sha256sum "${files[@]}") >"$directory.sha256"
     chmod 0600 "$directory.sha256"
+}
+
+validate_gate_a_semantics() {
+    local directory=$1 expected_rc=$2
+    gate_a_semantics_python | python3 - "$directory" "$expected_rc"
 }
 
 validate_backing_chain_file() {
@@ -209,7 +269,7 @@ gate_ssh() {
     shift 2
     local -a ssh
     mapfile -d '' -t ssh < <(ssh_argv "$known_hosts" "$port")
-    timeout 120s "${ssh[@]}" p11scope@127.0.0.1 "$@"
+    timeout 150s "${ssh[@]}" p11scope@127.0.0.1 "$@"
 }
 
 strict_ssh_long() {
@@ -251,14 +311,16 @@ private_start_lane() {
     PRIVATE_PORT=$port
     PRIVATE_FINGERPRINT=$fingerprint
     PRIVATE_KNOWN_HOSTS=$run_dir/known_hosts
+    PRIVATE_LANE_OWNED=1
     qemu-system-x86_64 -accel tcg,thread=multi -cpu max -machine q35 -m 1024 -smp 2 \
         -drive "file=$run_dir/runtime.qcow2,if=virtio,format=qcow2" \
         -netdev "user,id=n1,hostfwd=tcp:127.0.0.1:$port-:22" \
         -device virtio-net-pci,netdev=n1 -display none -serial "file:$run_dir/runtime.serial.log" \
         -no-reboot -daemonize -pidfile "$run_dir/qemu.pid" || return 64
-    chmod 0600 "$run_dir/runtime.serial.log" || return 64
     PRIVATE_QEMU_PID=$(cat "$run_dir/qemu.pid") || return 64
     [[ $PRIVATE_QEMU_PID =~ ^[0-9]+$ ]] || return 64
+    private_recover_qemu_pid || return 64
+    chmod 0600 "$run_dir/runtime.serial.log" || return 64
     ps -ww -p "$PRIVATE_QEMU_PID" -o pid=,args= >"$run_dir/qemu.argv.txt" || return 64
     local attempt
     for attempt in $(seq 1 120); do
@@ -292,8 +354,61 @@ private_start_lane() {
     return 64
 }
 
+private_recover_qemu_pid() {
+    local candidate=${PRIVATE_QEMU_PID-} argument matched=0
+    local -a command
+    if [[ -z $candidate && -n ${PRIVATE_RUN_DIR-} && -r $PRIVATE_RUN_DIR/qemu.pid ]]; then
+        candidate=$(<"$PRIVATE_RUN_DIR/qemu.pid") || return 64
+    fi
+    [[ $candidate =~ ^[0-9]+$ && -r /proc/$candidate/cmdline ]] || return 64
+    mapfile -d '' -t command <"/proc/$candidate/cmdline" || return 64
+    [[ ${command[0]##*/} == qemu-system-x86_64 ]] || return 64
+    for argument in "${command[@]}"; do
+        if [[ $argument == *"file=$PRIVATE_RUN_DIR/runtime.qcow2,"* ]]; then
+            matched=1
+        fi
+    done
+    (( matched == 1 )) || return 64
+    PRIVATE_QEMU_PID=$candidate
+}
+
+private_cleanup_lane() {
+    local rc
+    [[ ${PRIVATE_LANE_OWNED-0} == 1 ]] || return 0
+    if [[ ${PRIVATE_LANE_CLEANED-0} == 1 ]]; then
+        return "${PRIVATE_FINISH_RC-0}"
+    fi
+    PRIVATE_LANE_CLEANED=1
+    if private_finish_lane; then rc=0; else rc=$?; fi
+    PRIVATE_FINISH_RC=$rc
+    PRIVATE_LANE_OWNED=0
+    return "$rc"
+}
+
+private_lane_trap() {
+    local signal=$1
+    private_cleanup_lane || true
+    if [[ $signal != EXIT ]]; then
+        trap - EXIT INT TERM
+        exit 64
+    fi
+}
+
+private_arm_lane_traps() {
+    trap 'private_lane_trap EXIT' EXIT
+    trap 'private_lane_trap INT' INT
+    trap 'private_lane_trap TERM' TERM
+}
+
+private_disarm_lane_traps() {
+    trap - EXIT INT TERM
+}
+
 private_finish_lane() {
     local shutdown_rc=0 post_rc=0 forced=0 unexpected_exit=0 attempt
+    if [[ ${PRIVATE_LANE_OWNED-0} == 1 ]] && ! private_recover_qemu_pid; then
+        post_rc=64
+    fi
     if [[ -n ${PRIVATE_QEMU_PID-} && -r /proc/$PRIVATE_QEMU_PID/stat ]]; then
         strict_ssh "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" sudo -n shutdown -h now \
             >"$PRIVATE_RUN_DIR/shutdown.stdout" 2>"$PRIVATE_RUN_DIR/shutdown.stderr" || shutdown_rc=$?
@@ -329,6 +444,12 @@ private_finish_lane() {
     grep -F 'reboot: Power down' "$PRIVATE_RUN_DIR/runtime.serial.log" \
         >"$PRIVATE_RUN_DIR/power-down.txt" || post_rc=64
     (( (shutdown_rc == 0 || shutdown_rc == 255) && post_rc == 0 && forced == 0 && unexpected_exit == 0 )) || return 64
+}
+
+quiesce_gate_runner() {
+    local known_hosts=$1 port=$2 runner=$3
+    strict_ssh "$known_hosts" "$port" \
+        "sudo -n timeout --signal=TERM --kill-after=5s 15s sh -c 'for process in /proc/[0-9]*; do test \"\$(readlink \"\$process/exe\" 2>/dev/null)\" = \"\$1\" || continue; kill -TERM \"\${process##*/}\" 2>/dev/null || :; done; while :; do found=0; for process in /proc/[0-9]*; do test \"\$(readlink \"\$process/exe\" 2>/dev/null)\" = \"\$1\" || continue; found=1; done; test \"\$found\" -eq 0 && exit 0; sleep 1; done' sh $runner"
 }
 
 validate_execution_bundle() {
@@ -408,7 +529,7 @@ PY
 
 gate_a_lane() {
     local lane=$1 bundle=$2 run_dir=$3 export_dir=$4 remote=/var/tmp/p11scope-slice1b2/bundle
-    local gate_dir gate_rc=0 finish_rc=0 name
+    local gate_dir gate_rc=0 finish_rc=0 lane_rc=64 name remote_command
     [[ ! -e $run_dir && ! -L $run_dir && ! -e $export_dir && ! -L $export_dir ]] || {
         printf 'gate-a-lane requires new run and export directories\n' >&2
         return 64
@@ -417,8 +538,13 @@ gate_a_lane() {
     exec {lifecycle_lock}>/tmp/p11scope-slice1b2-spike-vm.lock
     flock -n "$lifecycle_lock" || return 64
     PRIVATE_QEMU_PID=
+    PRIVATE_LANE_OWNED=0
+    PRIVATE_LANE_CLEANED=0
+    PRIVATE_FINISH_RC=0
+    private_arm_lane_traps
     private_start_lane "$lane" "$run_dir" || {
-        [[ -z ${PRIVATE_QEMU_PID-} ]] || private_finish_lane || true
+        private_cleanup_lane || true
+        private_disarm_lane_traps
         return 64
     }
     strict_ssh "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" \
@@ -429,7 +555,7 @@ gate_a_lane() {
         mapfile -d '' -t scp < <(scp_argv "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT")
         for name in source-elf.manifest build-evidence.txt execution.manifest \
             slice1b2-kernel-ebpf slice1b2-fixture slice1b2-runner; do
-            "${scp[@]}" "$bundle/$name" "p11scope@127.0.0.1:$remote/$name" \
+            timeout 120s "${scp[@]}" "$bundle/$name" "p11scope@127.0.0.1:$remote/$name" \
                 >>"$run_dir/scp.stdout" 2>>"$run_dir/scp.stderr" || gate_rc=64
         done
     fi
@@ -452,21 +578,50 @@ gate_a_lane() {
         *) gate_rc=64 ;;
     esac
     if (( gate_rc == 0 )); then
-        set +e
-        gate_ssh "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" \
-            "sudo -n $remote/slice1b2-runner gate-a --source-manifest $remote/source-elf.manifest --build-evidence $remote/build-evidence.txt --execution-manifest $remote/execution.manifest --bpf $remote/slice1b2-kernel-ebpf --fixture $remote/slice1b2-fixture --out $gate_dir" \
-            >"$run_dir/gate-a.stdout" 2>"$run_dir/gate-a.stderr"
-        gate_rc=$?
-        set -e
-        printf '%s\n' "$gate_rc" >"$run_dir/gate-a.status"
-        export_evidence a "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" "$gate_dir" "$export_dir" \
-            >"$run_dir/export.stdout" 2>"$run_dir/export.stderr" || gate_rc=64
-        validate_local_export a "$export_dir" || gate_rc=64
+        remote_command="sudo -n timeout --signal=TERM --kill-after=5s 120s $remote/slice1b2-runner gate-a --source-manifest $remote/source-elf.manifest --build-evidence $remote/build-evidence.txt --execution-manifest $remote/execution.manifest --bpf $remote/slice1b2-kernel-ebpf --fixture $remote/slice1b2-fixture --out $gate_dir"
+        if gate_ssh "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" "$remote_command" \
+            >"$run_dir/gate-a.stdout" 2>"$run_dir/gate-a.stderr"; then
+            gate_rc=0
+        else
+            gate_rc=$?
+        fi
+        printf '%s\n' "$gate_rc" >"$run_dir/gate-a.status" || gate_rc=64
+        case "$gate_rc" in
+            0|1)
+                lane_rc=$gate_rc
+                export_evidence a "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" "$gate_dir" "$export_dir" "$lane_rc" \
+                    >"$run_dir/export.stdout" 2>"$run_dir/export.stderr" || gate_rc=64
+                if (( gate_rc == 0 || gate_rc == 1 )); then
+                    validate_local_export a "$export_dir" "$lane_rc" || gate_rc=64
+                fi
+                if (( gate_rc == 0 || gate_rc == 1 )); then
+                    if (( lane_rc == 0 )); then
+                        printf 'PASS\n' >"$run_dir/gate-a.outcome" || gate_rc=64
+                    else
+                        printf 'FAIL\n' >"$run_dir/gate-a.outcome" || gate_rc=64
+                    fi
+                fi
+                (( gate_rc == 0 || gate_rc == 1 )) || lane_rc=64
+                ;;
+            124)
+                if quiesce_gate_runner "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" \
+                    "$remote/slice1b2-runner" >"$run_dir/quiesce.stdout" 2>"$run_dir/quiesce.stderr"; then
+                    printf 'TIMEOUT\n' >"$run_dir/gate-a.outcome" || gate_rc=64
+                    (( gate_rc == 124 )) && lane_rc=2
+                else
+                    gate_rc=64
+                fi
+                ;;
+            *)
+                gate_rc=64
+                ;;
+        esac
     fi
-    private_finish_lane || finish_rc=$?
+    private_cleanup_lane || finish_rc=$?
+    private_disarm_lane_traps
     (( finish_rc == 0 )) || return 64
-    (( gate_rc == 0 || gate_rc == 1 )) || return 64
-    return "$gate_rc"
+    (( lane_rc == 0 || lane_rc == 1 || lane_rc == 2 )) || return 64
+    return "$lane_rc"
 }
 
 build_bpf() {
@@ -755,8 +910,13 @@ provision_jammy() {
     exec {lifecycle_lock}>/tmp/p11scope-slice1b2-spike-vm.lock
     flock -n "$lifecycle_lock" || return 64
     PRIVATE_QEMU_PID=
+    PRIVATE_LANE_OWNED=0
+    PRIVATE_LANE_CLEANED=0
+    PRIVATE_FINISH_RC=0
+    private_arm_lane_traps
     private_start_lane jammy "$run_dir" || {
-        [[ -z ${PRIVATE_QEMU_PID-} ]] || private_finish_lane || true
+        private_cleanup_lane || true
+        private_disarm_lane_traps
         return 64
     }
     strict_ssh "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" \
@@ -790,7 +950,8 @@ provision_jammy() {
         done
         chmod 0600 "$build_out"/*
     fi
-    private_finish_lane || finish_rc=$?
+    private_cleanup_lane || finish_rc=$?
+    private_disarm_lane_traps
     (( finish_rc == 0 && rc == 0 )) || return 64
 }
 

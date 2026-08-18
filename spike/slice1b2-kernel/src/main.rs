@@ -249,8 +249,8 @@ pub fn signal_oracle_pass(facts: &SignalTimingFacts) -> bool {
         && facts.coalesced_records == 1
         && facts.signal_helper_calls == 1
         && facts.winner_case_id != facts.coalesced_case_id
-        && facts.winner_case_id == 1
-        && facts.coalesced_case_id == 2
+        && ((facts.winner_case_id == 1 && facts.coalesced_case_id == 2)
+            || (facts.winner_case_id == 2 && facts.coalesced_case_id == 1))
         && facts.stopped_snapshot_1_count == facts.expected_task_count
         && facts.stopped_snapshot_2_count == facts.expected_task_count
         && facts.stopped_snapshot_1_exact_expected_task_set
@@ -3449,6 +3449,17 @@ mod tests {
         assert!(!signal_oracle_pass(&facts));
         facts.attached_while_stopped = 2;
         facts.final_start_entries = 1;
+        assert!(!signal_oracle_pass(&facts));
+        facts.final_start_entries = 0;
+        // the CAS is symmetric: either thread may win, both finite case IDs
+        // must appear exactly once across the winner and coalescer
+        facts.winner_case_id = 2;
+        facts.coalesced_case_id = 1;
+        assert!(signal_oracle_pass(&facts));
+        facts.coalesced_case_id = 2;
+        assert!(!signal_oracle_pass(&facts));
+        facts.coalesced_case_id = 1;
+        facts.winner_case_id = 3;
         assert!(!signal_oracle_pass(&facts));
     }
 

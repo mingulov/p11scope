@@ -88,6 +88,23 @@ via Aya's `VERBOSE` retry loop, the historical 16,777,679-byte log whose
 finishes with the canonical verdict (Noble TCG 17.9 s vs the historical
 "no verdict inside 600 s").
 
+### After Task 3's flat initializer (diagnostic; tracked Gate A rerun is Task 5)
+
+With the 112 flat `write_volatile` zero stores (object
+`896c8205…`, bundle `bundles/flatinit-f4baac0-bundle/`, source `f4baac0`;
+`check-init-shape.py` PASS is part of `build-bpf`), the same diagnostic lane
+accepts **all four programs on both kernels**:
+
+| Lane | Kernel | `interface_list_return` | `function_list_return` insns |
+| --- | --- | --- | --- |
+| jammy KVM | 5.15.0-187 | accepted in 150 ms (insns `null` on 5.15) | `null` |
+| noble KVM | 6.8.0-137 | accepted in 38 ms, **149,033 verified insns** | 2,629 |
+
+149,033 processed insns is 6.7× under the 1 M limit — the ×16 prediction
+basis above held (predicted ≈179k). The `function_list_return` shrink
+(11,175 → 2,629) confirms the memset-shaped initializer was also that
+program's dominant cost. No ceiling, cap, timeout, or oracle value changed.
+
 ## KVM lane (D1 one-time enablement; Task 1)
 
 `P11SCOPE_SPIKE_ACCEL=kvm` selects `-accel kvm -cpu host` (default stays

@@ -1,5 +1,7 @@
 #![no_std]
 #![no_main]
+#![feature(core_intrinsics)]
+#![allow(internal_features)]
 
 #[allow(dead_code)]
 #[path = "../../common.rs"]
@@ -11,6 +13,7 @@ use aya_ebpf::maps::{Array, HashMap, RingBuf};
 use aya_ebpf::programs::{ProbeContext, RetProbeContext};
 use aya_ebpf::EbpfContext as _;
 use common::{DiscoveryRecord, SignalRecord, StartState, StateKey};
+use common::{COALESCED_NO_HELPER, PAUSE_ARMED, PAUSE_REQUESTED};
 
 const RING_LOSS: u32 = 0;
 const READ_FAILURES: u32 = 1;
@@ -332,38 +335,72 @@ pub fn interface_list_return(ctx: RetProbeContext) -> u32 {
     0
 }
 
+/// Group key: tgid in the high half, zero low half (a real thread key always has a nonzero TID),
+/// cookie u64::MAX. Namespace-disjoint from every entry/return key (§5.2).
+fn pause_owner_key() -> StateKey {
+    StateKey {
+        pid_tgid: (helpers::bpf_get_current_pid_tgid() >> 32) << 32,
+        attach_cookie: u64::MAX,
+    }
+}
+
 #[uretprobe]
 pub fn signal_return(ctx: RetProbeContext) -> u32 {
+    let pid_tgid = helpers::bpf_get_current_pid_tgid();
+    // SAFETY: the probe context is the kernel-provided context for this attachment.
+    let case_id = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) } as u8;
+    // 2. reserve before any authorization is consumed; loss sends no signal and leaves ARMED intact
     let Some(mut entry) = DISCOVERY.reserve::<SignalRecord>(0) else {
         increment_counter(RING_LOSS);
         return 0;
     };
     let raw = entry.as_mut_ptr();
     let words = raw.cast::<u64>();
-    let pid_tgid = helpers::bpf_get_current_pid_tgid();
-    // SAFETY: the probe context is the kernel-provided context for this attachment.
-    let case_id = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) } as u8;
+    // 3. helper-independent initialization (four zero words)
+    // SAFETY: reserve owns one writable 32-byte entry; four volatile u64 writes initialize every byte.
+    unsafe {
+        core::ptr::write_volatile(words.add(0), 0u64);
+        core::ptr::write_volatile(words.add(1), 0u64);
+        core::ptr::write_volatile(words.add(2), 0u64);
+        core::ptr::write_volatile(words.add(3), 0u64);
+    }
+    // 4. atomically ARMED -> REQUESTED; only the winner may call the signal helper.
+    //    `core::sync::atomic::AtomicU64::compare_exchange` does not exist on bpfel-unknown-none
+    //    (the target has atomic load/store only); the core intrinsic lowers to BPF_CMPXCHG.
+    let won = match START.get_ptr_mut(&pause_owner_key()) {
+        // SAFETY: the pointer addresses a live map value; this CAS is the only BPF writer of arg0.
+        Some(state) => unsafe {
+            core::intrinsics::atomic_cxchg::<
+                u64,
+                { core::intrinsics::AtomicOrdering::AcqRel },
+                { core::intrinsics::AtomicOrdering::Acquire },
+            >(core::ptr::addr_of_mut!((*state).arg0), PAUSE_ARMED, PAUSE_REQUESTED)
+                .1
+                != 0
+        },
+        None => false,
+    };
+    // 5. winner: timestamp immediately before the single SIGSTOP request; nonwinner: causal timestamp + coalesced status
     // SAFETY: these helpers take no pointers, and SIGSTOP is a valid scalar signal.
     let (hook_ts_ns, send_signal_rc) = unsafe {
-        (
-            helpers::bpf_ktime_get_ns(),
-            helpers::bpf_send_signal(19) as i64,
-        )
-    };
-    // SAFETY: reserve owns one writable 32-byte entry; four u64 writes initialize every byte,
-    // and no reference/read/submit occurs before initialization.
-    unsafe {
-        let mut word = 0usize;
-        while word < 4 {
-            core::ptr::write(words.add(word), 0);
-            word += 1;
+        if won {
+            (
+                helpers::bpf_ktime_get_ns(),
+                helpers::bpf_send_signal(19) as i64,
+            )
+        } else {
+            (
+                helpers::bpf_ktime_get_ns(),
+                COALESCED_NO_HELPER,
+            )
         }
+    };
+    // 6. finish initialization, submit
+    // SAFETY: same reserved entry; all fields written after the zero words.
+    unsafe {
         core::ptr::write(core::ptr::addr_of_mut!((*raw).hook_ts_ns), hook_ts_ns);
         core::ptr::write(core::ptr::addr_of_mut!((*raw).pid_tgid), pid_tgid);
-        core::ptr::write(
-            core::ptr::addr_of_mut!((*raw).send_signal_rc),
-            send_signal_rc,
-        );
+        core::ptr::write(core::ptr::addr_of_mut!((*raw).send_signal_rc), send_signal_rc);
         core::ptr::write(core::ptr::addr_of_mut!((*raw).case_id), case_id);
     }
     entry.submit(0);

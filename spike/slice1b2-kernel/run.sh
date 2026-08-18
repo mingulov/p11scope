@@ -262,10 +262,15 @@ task set
 task count
 child release
 signal record timeout
+second signal record timeout
 signal record length is not 32 bytes
 signal record identity
 poll
-stop timing
+deadline overflow
+clock reversal
+start map insert
+start map remove
+start map read
 marker byte
 marker read
 monotonic clock
@@ -314,19 +319,70 @@ category = status_lines[1].removeprefix("failure_category=") if status_lines[1].
 if [item.get("signal_run") for item in timing] != list(range(1, len(timing) + 1)) or len(timing) > 20:
     raise SystemExit(64)
 
-u64 = ["hook_ts_ns", "last_attach_ts_ns", "late_hits"]
+u64 = ["hook_ts_ns", "last_attach_ts_ns", "late_hits", "winner_records",
+       "coalesced_records", "signal_helper_calls", "required_attach_keys",
+       "attached_while_stopped", "final_start_entries", "stop_wait_ceiling_us"]
 i64 = ["send_signal_rc", "pidfd_resume_rc"]
-u32 = ["expected_task_count", "stopped_snapshot_1_count", "stopped_snapshot_2_count", "post_attach_task_count"]
-attempts = ["signal_attach_attempts", "late_attach_attempts", "pidfd_resume_attempts"]
+u32 = ["expected_task_count", "stopped_snapshot_1_count", "stopped_snapshot_2_count",
+       "post_attach_task_count", "markers_after_resume"]
+u8 = ["winner_case_id", "coalesced_case_id"]
+attach_attempts = ["signal_attach_attempts", "late_attach_attempts"]
+attempts = ["pidfd_resume_attempts"]
 booleans = [
     "stop_request_accepted",
     "stopped_snapshot_1_exact_expected_task_set", "stopped_snapshot_1_all_tasks_stopped",
     "stopped_snapshot_2_exact_expected_task_set", "stopped_snapshot_2_all_tasks_stopped",
     "pre_stop_marker_observed", "post_attach_exact_expected_task_set",
     "post_attach_all_tasks_stopped", "post_attach_marker_observed",
+    "drain_empty", "queue_empty_before_resume", "owner_removed",
     "signal_attach_accepted", "late_attach_accepted", "signal_link_detached",
     "late_link_detached", "resume_via_original_pidfd", "post_resume_marker_observed", "reaped",
 ]
+def sample_well_formed(sample):
+    if not isinstance(sample, dict):
+        return False
+    if type(sample.get("elapsed_us")) is not int or sample["elapsed_us"] < 0:
+        return False
+    if type(sample.get("task_count")) is not int or not 0 <= sample["task_count"] <= 0xffffffff:
+        return False
+    if any(not isinstance(sample.get(name), bool) for name in ["exact_expected_task_set", "all_tasks_stopped"]):
+        return False
+    counts = sample.get("state_counts")
+    if not isinstance(counts, list) or len(counts) != 9:
+        return False
+    if any(type(count) is not int or isinstance(count, bool) or count < 0 for count in counts):
+        return False
+    return sum(counts) == sample["task_count"]
+def samples_well_formed(item):
+    samples = item.get("samples")
+    if not isinstance(samples, list) or len(samples) > 101:
+        return False
+    if any(not sample_well_formed(sample) for sample in samples):
+        return False
+    if any(
+        samples[index + 1]["elapsed_us"] <= samples[index]["elapsed_us"]
+        for index in range(len(samples) - 1)
+    ):
+        return False
+    confirmation = item.get("confirmation_sample_indexes")
+    if confirmation is not None:
+        if not isinstance(confirmation, list) or len(confirmation) != 2:
+            return False
+        if any(type(index) is not int or isinstance(index, bool) or index < 0 for index in confirmation):
+            return False
+        first, second = confirmation
+        if second != first + 1 or second >= len(samples):
+            return False
+        for index in (first, second):
+            if samples[index]["exact_expected_task_set"] is not True or samples[index]["all_tasks_stopped"] is not True:
+                return False
+        if samples[second]["elapsed_us"] - samples[first]["elapsed_us"] < 1000:
+            return False
+        if samples[second]["elapsed_us"] > 100000:
+            return False
+    if item.get("stop_wait_ceiling_us") != 100000:
+        return False
+    return True
 def well_formed(item):
     if not isinstance(item.get("pass"), bool) or item.get("failure_category") not in {"none", "runtime", "oracle"}:
         return False
@@ -336,18 +392,24 @@ def well_formed(item):
         return False
     if any(type(item.get(name)) is not int or not 0 <= item[name] <= 0xffffffff for name in u32):
         return False
+    if any(type(item.get(name)) is not int or not 0 <= item[name] <= 0xff for name in u8):
+        return False
+    if any(type(item.get(name)) is not int or item[name] not in {0, 1, 2} for name in attach_attempts):
+        return False
     if any(type(item.get(name)) is not int or item[name] not in {0, 1} for name in attempts):
         return False
     if any(not isinstance(item.get(name), bool) for name in booleans):
         return False
     if type(item.get("child_exit")) is not int or not -(1 << 31) <= item["child_exit"] < (1 << 31):
         return False
+    if not samples_well_formed(item):
+        return False
     gap = item.get("attach_gap_ms")
     if not isinstance(gap, (int, float)) or isinstance(gap, bool) or not math.isfinite(gap):
         return False
-    if item["signal_attach_accepted"] and item["signal_attach_attempts"] != 1:
+    if item["signal_attach_accepted"] and item["signal_attach_attempts"] != 2:
         return False
-    if item["late_attach_accepted"] and item["late_attach_attempts"] != 1:
+    if item["late_attach_accepted"] and item["late_attach_attempts"] != 2:
         return False
     if item["signal_link_detached"] and not item["signal_attach_accepted"]:
         return False
@@ -361,24 +423,34 @@ def oracle(item):
     return (
         item["hook_ts_ns"] != 0 and item["send_signal_rc"] == 0
         and item["stop_request_accepted"] is True and item["expected_task_count"] == 2
+        and item["winner_records"] == 1 and item["coalesced_records"] == 1
+        and item["signal_helper_calls"] == 1
+        and item["winner_case_id"] != item["coalesced_case_id"]
+        and {item["winner_case_id"], item["coalesced_case_id"]} == {1, 2}
         and item["stopped_snapshot_1_count"] == item["expected_task_count"]
         and item["stopped_snapshot_2_count"] == item["expected_task_count"]
         and item["stopped_snapshot_1_exact_expected_task_set"] is True
         and item["stopped_snapshot_1_all_tasks_stopped"] is True
         and item["stopped_snapshot_2_exact_expected_task_set"] is True
         and item["stopped_snapshot_2_all_tasks_stopped"] is True
+        and item["confirmation_sample_indexes"] is not None
         and item["pre_stop_marker_observed"] is False
+        and item["drain_empty"] is True and item["required_attach_keys"] == 2
         and item["post_attach_task_count"] == item["expected_task_count"]
         and item["post_attach_exact_expected_task_set"] is True
         and item["post_attach_all_tasks_stopped"] is True
         and item["post_attach_marker_observed"] is False
-        and item["signal_attach_attempts"] == 1 and item["signal_attach_accepted"] is True
-        and item["late_attach_attempts"] == 1 and item["late_attach_accepted"] is True
+        and item["attached_while_stopped"] == 2
+        and item["queue_empty_before_resume"] is True
+        and item["signal_attach_attempts"] == 2 and item["signal_attach_accepted"] is True
+        and item["late_attach_attempts"] == 2 and item["late_attach_accepted"] is True
         and item["signal_link_detached"] is True and item["late_link_detached"] is True
         and gap >= 0 and item["attach_gap_ms"] == gap / 1000000.0
         and item["pidfd_resume_attempts"] == 1 and item["pidfd_resume_rc"] == 0
         and item["resume_via_original_pidfd"] is True
-        and item["post_resume_marker_observed"] is True and item["late_hits"] == 1
+        and item["owner_removed"] is True and item["final_start_entries"] == 0
+        and item["post_resume_marker_observed"] is True
+        and item["markers_after_resume"] == 2 and item["late_hits"] == 2
         and item["child_exit"] == 0 and item["reaped"] is True
     )
 if any(not well_formed(item) for item in timing):
@@ -1088,6 +1160,13 @@ build_bpf() {
     install -m 0600 "$object" "$output/slice1b2-kernel-ebpf"
     objdump_bin=$(rustc +nightly --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-objdump
     python3 "$here/check-init-shape.py" "$output/slice1b2-kernel-ebpf" "$objdump_bin" || return 64
+    local cmpxchg_count
+    cmpxchg_count=$("$objdump_bin" -d "$output/slice1b2-kernel-ebpf" \
+        | sed -n '/<signal_return>:/,/^$/p' | grep -c cmpxchg_64 || true)
+    if [[ $cmpxchg_count != 1 ]]; then
+        printf 'signal_return must contain exactly one cmpxchg_64 (found %s)\n' "$cmpxchg_count" >&2
+        return 64
+    fi
     printf '%s\n' "$rustc_verbose" >"$output/nightly.txt"
     python3 - "$output/source.tar" "$output/slice1b2-kernel-ebpf" \
         "$(git -C "$root" rev-parse HEAD)" "$output/source-elf.manifest" <<'PY'
@@ -1403,7 +1482,7 @@ build_fixture() {
     gcc -std=c11 -O2 -Wall -Wextra -Werror -pthread -fno-lto -Wl,--export-dynamic \
         -o "$output" "$here/fixture.c"
     disassembly=$(objdump -dr "$output")
-    for target in spike_get_function_list spike_get_interface_list spike_stop_hook spike_late_target; do
+    for target in spike_get_function_list spike_get_interface_list spike_stop_hook spike_stop_hook_b spike_late_target spike_late_target_b; do
         nm -D "$output" | awk -v target="$target" '$3 == target { found=1 } END { exit !found }'
         grep -E "call(q)?[[:space:]].*<$target(@plt)?>" <<<"$disassembly" >/dev/null
     done

@@ -55,7 +55,15 @@ PROBE_TARGET void spike_stop_hook(void) {
     __asm__ __volatile__("" ::: "memory");
 }
 
+PROBE_TARGET void spike_stop_hook_b(void) {
+    __asm__ __volatile__("" ::: "memory");
+}
+
 PROBE_TARGET void spike_late_target(void) {
+    __asm__ __volatile__("" ::: "memory");
+}
+
+PROBE_TARGET void spike_late_target_b(void) {
     __asm__ __volatile__("" ::: "memory");
 }
 
@@ -190,7 +198,10 @@ static void read_byte(int fd) {
 struct worker_args {
     int ready;
     int release;
+    int marker;
 };
+
+static pthread_barrier_t hook_barrier;
 
 static void *worker_main(void *opaque) {
     struct worker_args *args = opaque;
@@ -203,6 +214,10 @@ static void *worker_main(void *opaque) {
         }
     }
     read_byte(args->release);
+    pthread_barrier_wait(&hook_barrier);
+    spike_stop_hook_b();
+    write_byte(args->marker, 'N');
+    spike_late_target_b();
     return NULL;
 }
 
@@ -213,7 +228,15 @@ static void run_signal_case(int release_fd, int fixture_ready_fd, int marker_fd)
         perror("pipe");
         exit(1);
     }
-    struct worker_args args = {.ready = worker_ready[1], .release = worker_release[0]};
+    if (pthread_barrier_init(&hook_barrier, NULL, 2) != 0) {
+        fputs("pthread_barrier_init failed\n", stderr);
+        exit(1);
+    }
+    struct worker_args args = {
+        .ready = worker_ready[1],
+        .release = worker_release[0],
+        .marker = marker_fd,
+    };
     pthread_t worker;
     if (pthread_create(&worker, NULL, worker_main, &args) != 0) {
         fputs("pthread_create failed\n", stderr);
@@ -222,15 +245,17 @@ static void run_signal_case(int release_fd, int fixture_ready_fd, int marker_fd)
     read_byte(worker_ready[0]);
     write_byte(fixture_ready_fd, 'R');
     read_byte(release_fd);
+    write_byte(worker_release[1], 'X');
+    pthread_barrier_wait(&hook_barrier);
     spike_stop_hook();
     write_byte(marker_fd, 'M');
     spike_late_target();
-    write_byte(worker_release[1], 'X');
     void *worker_result = NULL;
     if (pthread_join(worker, &worker_result) != 0 || worker_result != NULL) {
         fputs("worker failed\n", stderr);
         exit(1);
     }
+    pthread_barrier_destroy(&hook_barrier);
     close(worker_release[0]);
     close(worker_release[1]);
     close(worker_ready[0]);

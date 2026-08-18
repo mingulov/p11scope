@@ -45,3 +45,12 @@ pub struct StartState {
     pub arg0: u64,
     pub arg1: u64,
 }
+
+// §5.2/§5.3 pause-owner protocol constants (no record layout change).
+pub const PAUSE_ARMED: u64 = 1;
+pub const PAUSE_REQUESTED: u64 = 2;
+pub const COALESCED_NO_HELPER: i64 = i64::MIN;
+pub const SIGNAL_COOKIE_A: u64 = 1;
+pub const SIGNAL_COOKIE_B: u64 = 2;
+/// UAPI `BPF_NOEXIST` map-update flag (aya does not export it host-side).
+pub const BPF_NOEXIST_FLAG: u64 = 1;

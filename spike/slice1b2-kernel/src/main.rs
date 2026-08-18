@@ -194,17 +194,29 @@ pub struct SignalTimingFacts {
     pub send_signal_rc: i64,
     pub stop_request_accepted: bool,
     pub expected_task_count: u32,
+    pub winner_records: u64,
+    pub coalesced_records: u64,
+    pub signal_helper_calls: u64,
+    pub winner_case_id: u8,
+    pub coalesced_case_id: u8,
     pub stopped_snapshot_1_count: u32,
     pub stopped_snapshot_2_count: u32,
     pub stopped_snapshot_1_exact_expected_task_set: bool,
     pub stopped_snapshot_1_all_tasks_stopped: bool,
     pub stopped_snapshot_2_exact_expected_task_set: bool,
     pub stopped_snapshot_2_all_tasks_stopped: bool,
+    pub confirmation_sample_indexes: Option<(usize, usize)>,
+    pub samples: Vec<StopSnapshot>,
     pub pre_stop_marker_observed: bool,
+    pub drain_empty: bool,
+    pub required_attach_keys: u64,
     pub post_attach_task_count: u32,
     pub post_attach_exact_expected_task_set: bool,
     pub post_attach_all_tasks_stopped: bool,
     pub post_attach_marker_observed: bool,
+    pub attached_while_stopped: u64,
+    pub queue_empty_before_resume: bool,
+    pub markers_after_resume: u32,
     pub signal_attach_attempts: u8,
     pub signal_attach_accepted: bool,
     pub late_attach_attempts: u8,
@@ -216,6 +228,8 @@ pub struct SignalTimingFacts {
     pub pidfd_resume_attempts: u8,
     pub pidfd_resume_rc: i64,
     pub resume_via_original_pidfd: bool,
+    pub owner_removed: bool,
+    pub final_start_entries: u64,
     pub post_resume_marker_observed: bool,
     pub late_hits: u64,
     pub child_exit: i32,
@@ -231,20 +245,31 @@ pub fn signal_oracle_pass(facts: &SignalTimingFacts) -> bool {
         && facts.send_signal_rc == 0
         && facts.stop_request_accepted
         && facts.expected_task_count == 2
+        && facts.winner_records == 1
+        && facts.coalesced_records == 1
+        && facts.signal_helper_calls == 1
+        && facts.winner_case_id != facts.coalesced_case_id
+        && facts.winner_case_id == 1
+        && facts.coalesced_case_id == 2
         && facts.stopped_snapshot_1_count == facts.expected_task_count
         && facts.stopped_snapshot_2_count == facts.expected_task_count
         && facts.stopped_snapshot_1_exact_expected_task_set
         && facts.stopped_snapshot_1_all_tasks_stopped
         && facts.stopped_snapshot_2_exact_expected_task_set
         && facts.stopped_snapshot_2_all_tasks_stopped
+        && facts.confirmation_sample_indexes.is_some()
         && !facts.pre_stop_marker_observed
+        && facts.drain_empty
+        && facts.required_attach_keys == 2
         && facts.post_attach_task_count == facts.expected_task_count
         && facts.post_attach_exact_expected_task_set
         && facts.post_attach_all_tasks_stopped
         && !facts.post_attach_marker_observed
-        && facts.signal_attach_attempts == 1
+        && facts.attached_while_stopped == 2
+        && facts.queue_empty_before_resume
+        && facts.signal_attach_attempts == 2
         && facts.signal_attach_accepted
-        && facts.late_attach_attempts == 1
+        && facts.late_attach_attempts == 2
         && facts.late_attach_accepted
         && facts.signal_link_detached
         && facts.late_link_detached
@@ -253,8 +278,11 @@ pub fn signal_oracle_pass(facts: &SignalTimingFacts) -> bool {
         && facts.pidfd_resume_attempts == 1
         && facts.pidfd_resume_rc == 0
         && facts.resume_via_original_pidfd
+        && facts.owner_removed
+        && facts.final_start_entries == 0
         && facts.post_resume_marker_observed
-        && facts.late_hits == 1
+        && facts.markers_after_resume == 2
+        && facts.late_hits == 2
         && facts.child_exit == 0
         && facts.reaped
 }
@@ -451,6 +479,88 @@ pub fn spawn_pinned_child(command: &mut Command) -> Result<ChildGuard, SpawnFail
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.terminate();
+    }
+}
+
+trait PauseOwnerMap {
+    fn insert_armed(&mut self, key: &common::StateKey) -> Result<(), &'static str>;
+    fn remove_owner(&mut self, key: &common::StateKey) -> Result<(), &'static str>;
+    fn entry_count(&self) -> Result<u64, &'static str>;
+}
+
+impl PauseOwnerMap
+    for aya::maps::HashMap<aya::maps::MapData, common::StateKey, common::StartState>
+{
+    fn insert_armed(&mut self, key: &common::StateKey) -> Result<(), &'static str> {
+        self.insert(
+            key,
+            common::StartState {
+                arg0: common::PAUSE_ARMED,
+                arg1: 0,
+            },
+            common::BPF_NOEXIST_FLAG,
+        )
+        .map(|_| ())
+        .map_err(|_| "start map insert")
+    }
+
+    fn remove_owner(&mut self, key: &common::StateKey) -> Result<(), &'static str> {
+        self.remove(key).map(|_| ()).map_err(|_| "start map remove")
+    }
+
+    fn entry_count(&self) -> Result<u64, &'static str> {
+        let mut count = 0u64;
+        for key in self.keys() {
+            let _ = key.map_err(|_| "start map read")?;
+            count += 1;
+        }
+        Ok(count)
+    }
+}
+
+/// State machine for the START group-key entry (§5.2). The runner removes the entry
+/// through the guard on every exit path — `close_after_resume()` immediately after
+/// the single successful original-pidfd resume (before markers/exit), or the
+/// post-cleanup `disarm_for_cleanup()` (ordered after ChildGuard cleanup, so a
+/// stopped child is resumed exactly once first). The guard never resumes a child.
+struct PauseOwnerGuard {
+    key: common::StateKey,
+    armed: bool,
+    closed: bool,
+}
+
+impl PauseOwnerGuard {
+    fn new(key: common::StateKey) -> Self {
+        Self {
+            key,
+            armed: true,
+            closed: false,
+        }
+    }
+
+    fn close_after_resume<M: PauseOwnerMap>(&mut self, map: &mut M) -> Result<bool, &'static str> {
+        if self.closed {
+            return Ok(true);
+        }
+        map.remove_owner(&self.key)?;
+        self.closed = true;
+        self.armed = false;
+        Ok(true)
+    }
+
+    fn start_entries<M: PauseOwnerMap>(&self, map: &M) -> Result<u64, &'static str> {
+        map.entry_count()
+    }
+
+    fn needs_removal(&self) -> bool {
+        self.armed && !self.closed
+    }
+
+    fn disarm_for_cleanup<M: PauseOwnerMap>(&mut self, map: &mut M) {
+        if self.needs_removal() {
+            let _ = map.remove_owner(&self.key);
+        }
+        self.armed = false;
     }
 }
 
@@ -1236,7 +1346,12 @@ fn validate_gate_b_provenance(
     paths: &GateAPaths,
 ) -> Result<(GateMetadata, Vec<u8>, File, BTreeMap<String, u64>), &'static str> {
     let (mut metadata, bpf, fixture, mut offsets) = validate_gate_provenance(paths)?;
-    for symbol in ["spike_stop_hook", "spike_late_target"] {
+    for symbol in [
+        "spike_stop_hook",
+        "spike_stop_hook_b",
+        "spike_late_target",
+        "spike_late_target_b",
+    ] {
         let offset = p11scope_manifest::elf::symbol_file_offset(&fixture, symbol)
             .map_err(|_| "fixture ELF")?
             .ok_or("fixture symbol")?;
@@ -1510,7 +1625,7 @@ fn drain_marker(fd: i32, cancellation: &Cancellation) -> Result<bool, &'static s
         // SAFETY: byte is writable for one byte and fd is a live nonblocking pipe.
         let read = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
         if read == 1 {
-            if byte != b'M' {
+            if byte != b'M' && byte != b'N' {
                 return Err("marker byte");
             }
             observed = true;
@@ -1528,6 +1643,44 @@ fn drain_marker(fd: i32, cancellation: &Cancellation) -> Result<bool, &'static s
         }
         return Err("marker read");
     }
+}
+
+/// Reads the two post-resume markers ('M' main thread, 'N' worker) in any order.
+/// Returns how many distinct markers were observed within the timeout.
+fn read_markers_after_resume(
+    fd: i32,
+    cancellation: &Cancellation,
+) -> Result<(bool, bool), &'static str> {
+    let mut seen_m = false;
+    let mut seen_n = false;
+    while !(seen_m && seen_n) {
+        poll_readable(
+            fd,
+            cancellation,
+            Duration::from_secs(5),
+            "post-resume marker timeout",
+        )?;
+        cancellation_failure(cancellation)?;
+        let mut byte = 0u8;
+        // SAFETY: byte is writable for one byte and fd is a live nonblocking pipe.
+        let read = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+        if read == 1 && byte == b'M' && !seen_m {
+            seen_m = true;
+            continue;
+        }
+        if read == 1 && byte == b'N' && !seen_n {
+            seen_n = true;
+            continue;
+        }
+        if read < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if read == 1 {
+            return Err("marker byte");
+        }
+        return Err("pipe byte");
+    }
+    Ok((seen_m, seen_n))
 }
 
 fn clear_cloexec(fd: i32) -> Result<(), &'static str> {
@@ -1577,19 +1730,60 @@ fn task_states(pid: u32) -> Result<BTreeMap<u32, u8>, &'static str> {
     Ok(tasks)
 }
 
-#[derive(Clone, Copy, Default)]
-struct StopSnapshot {
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StopSnapshot {
+    elapsed_us: u64,
     count: u32,
     exact_expected_task_set: bool,
     all_tasks_stopped: bool,
+    state_counts: [u32; 9],
 }
 
 fn stop_snapshot(pid: u32, expected: &BTreeMap<u32, u8>) -> Result<StopSnapshot, &'static str> {
     let actual = task_states(pid)?;
-    Ok(StopSnapshot {
+    let mut snapshot = StopSnapshot {
+        elapsed_us: 0,
         count: u32::try_from(actual.len()).map_err(|_| "task count")?,
         exact_expected_task_set: actual.keys().eq(expected.keys()),
         all_tasks_stopped: !actual.is_empty() && actual.values().all(|state| *state == b'T'),
+        state_counts: [0; 9],
+    };
+    for state in actual.values() {
+        let bucket = b"RSDTtZXI"
+            .iter()
+            .position(|known| *known == *state)
+            .unwrap_or(8);
+        snapshot.state_counts[bucket] += 1;
+    }
+    Ok(snapshot)
+}
+
+const STOP_WAIT_CEILING_US: u64 = 100_000;
+
+fn confirm(samples: &[StopSnapshot]) -> Option<(usize, usize)> {
+    for index in 0..samples.len().saturating_sub(1) {
+        let first = &samples[index];
+        let second = &samples[index + 1];
+        if first.exact_expected_task_set
+            && first.all_tasks_stopped
+            && second.exact_expected_task_set
+            && second.all_tasks_stopped
+            && second.elapsed_us.saturating_sub(first.elapsed_us) >= 1_000
+            && second.elapsed_us <= STOP_WAIT_CEILING_US
+        {
+            return Some((index, index + 1));
+        }
+    }
+    None
+}
+
+fn sample_value(snapshot: &StopSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "elapsed_us": snapshot.elapsed_us,
+        "task_count": snapshot.count,
+        "exact_expected_task_set": snapshot.exact_expected_task_set,
+        "all_tasks_stopped": snapshot.all_tasks_stopped,
+        "state_counts": snapshot.state_counts,
     })
 }
 
@@ -1597,17 +1791,29 @@ fn wait_signal_record(
     ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
     cancellation: &Cancellation,
 ) -> Result<common::SignalRecord, &'static str> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline_ns = monotonic_ns()?
+        .checked_add(5_000_000_000)
+        .ok_or("monotonic clock")?;
+    wait_signal_record_until(ring, cancellation, deadline_ns, "signal record timeout")
+}
+
+fn wait_signal_record_until(
+    ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
+    cancellation: &Cancellation,
+    deadline_ns: u64,
+    timeout_reason: &'static str,
+) -> Result<common::SignalRecord, &'static str> {
     loop {
         cancellation_failure(cancellation)?;
         if let Some(item) = ring.next() {
             return decode_signal_record(&item);
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err("signal record timeout");
+        let now_ns = monotonic_ns()?;
+        if now_ns >= deadline_ns {
+            return Err(timeout_reason);
         }
-        let timeout_ms = i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX);
+        let timeout_ms = i32::try_from((deadline_ns - now_ns) / 1_000_000).unwrap_or(i32::MAX);
+        let timeout_ms = timeout_ms.clamp(1, 5_000);
         let mut pollfds = [
             libc::pollfd {
                 fd: ring.as_raw_fd(),
@@ -1626,6 +1832,17 @@ fn wait_signal_record(
             return Err("poll");
         }
     }
+}
+
+fn drain_signal_ring_to_empty(
+    ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
+) -> Result<u64, &'static str> {
+    let mut drained = 0u64;
+    while let Some(item) = ring.next() {
+        decode_signal_record(&item)?;
+        drained += 1;
+    }
+    Ok(drained)
 }
 
 type GateACaseFailure = Box<(GateACaseFacts, &'static str)>;
@@ -2119,6 +2336,11 @@ fn signal_timing_json(
         send_signal_rc,
         stop_request_accepted,
         expected_task_count,
+        winner_records,
+        coalesced_records,
+        signal_helper_calls,
+        winner_case_id,
+        coalesced_case_id,
         stopped_snapshot_1_count,
         stopped_snapshot_2_count,
         stopped_snapshot_1_exact_expected_task_set,
@@ -2126,10 +2348,15 @@ fn signal_timing_json(
         stopped_snapshot_2_exact_expected_task_set,
         stopped_snapshot_2_all_tasks_stopped,
         pre_stop_marker_observed,
+        drain_empty,
+        required_attach_keys,
         post_attach_task_count,
         post_attach_exact_expected_task_set,
         post_attach_all_tasks_stopped,
         post_attach_marker_observed,
+        attached_while_stopped,
+        queue_empty_before_resume,
+        markers_after_resume,
         signal_attach_attempts,
         signal_attach_accepted,
         late_attach_attempts,
@@ -2141,34 +2368,49 @@ fn signal_timing_json(
         pidfd_resume_attempts,
         pidfd_resume_rc,
         resume_via_original_pidfd,
+        owner_removed,
+        final_start_entries,
         post_resume_marker_observed,
         late_hits,
         child_exit,
         reaped,
     );
+    value.insert(
+        "stop_wait_ceiling_us".into(),
+        serde_json::json!(STOP_WAIT_CEILING_US),
+    );
+    value.insert(
+        "confirmation_sample_indexes".into(),
+        match facts.confirmation_sample_indexes {
+            Some((first, second)) => serde_json::json!([first, second]),
+            None => serde_json::Value::Null,
+        },
+    );
+    value.insert(
+        "samples".into(),
+        serde_json::Value::Array(facts.samples.iter().map(sample_value).collect::<Vec<_>>()),
+    );
     serde_json::Value::Object(value)
 }
 
-fn sleep_checked(cancellation: &Cancellation, duration: Duration) -> Result<(), &'static str> {
-    cancellation_failure(cancellation)?;
-    std::thread::sleep(duration);
-    cancellation_failure(cancellation)
-}
+type StartMap = aya::maps::HashMap<aya::maps::MapData, common::StateKey, common::StartState>;
 
 #[allow(clippy::too_many_arguments)]
 fn run_gate_b_case(
     ebpf: &mut aya::Ebpf,
     ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
     counters: &aya::maps::Array<aya::maps::MapData, u64>,
+    start: &mut StartMap,
     fixture: &Path,
     offsets: &BTreeMap<String, u64>,
     cancellation: &Cancellation,
-    run: u8,
+    _run: u8,
 ) -> (SignalTimingFacts, Option<&'static str>) {
     let mut facts = SignalTimingFacts::default();
     let mut child = None;
-    let mut signal_link = None;
-    let mut late_link = None;
+    let mut signal_links = Vec::new();
+    let mut late_links = Vec::new();
+    let mut owner: Option<PauseOwnerGuard> = None;
     let result = (|| -> Result<(), &'static str> {
         cancellation_failure(cancellation)?;
         if ring.next().is_some() {
@@ -2201,21 +2443,6 @@ fn run_gate_b_case(
         cancellation_failure(cancellation)?;
         pidfd_send_signal(guard.original_pidfd.as_raw_fd(), 0).map_err(|_| "pidfd authority")?;
 
-        facts.signal_attach_attempts = 1;
-        signal_link = attach_program(
-            ebpf,
-            "signal_return",
-            *offsets.get("spike_stop_hook").ok_or("fixture offset")?,
-            fixture,
-            guard.pid(),
-            u64::from(run),
-        )
-        .ok();
-        facts.signal_attach_accepted = signal_link.is_some();
-        if signal_link.is_none() {
-            return Ok(());
-        }
-
         read_expected_byte(
             ready_reader.as_raw_fd(),
             b'R',
@@ -2230,30 +2457,123 @@ fn run_gate_b_case(
             return Ok(());
         }
 
+        // arm: insert ARMED under the group key before releasing the child (§5.2)
+        let owner_key = common::StateKey {
+            pid_tgid: u64::from(guard.pid()) << 32,
+            attach_cookie: u64::MAX,
+        };
+        start.insert_armed(&owner_key)?;
+        owner = Some(PauseOwnerGuard::new(owner_key));
+
+        // attach signal_return at BOTH stop hooks (cookies 1 = A, 2 = B), then release
+        for (target, cookie) in [
+            ("spike_stop_hook", common::SIGNAL_COOKIE_A),
+            ("spike_stop_hook_b", common::SIGNAL_COOKIE_B),
+        ] {
+            facts.signal_attach_attempts += 1;
+            match attach_program(
+                ebpf,
+                "signal_return",
+                *offsets.get(target).ok_or("fixture offset")?,
+                fixture,
+                guard.pid(),
+                cookie,
+            ) {
+                Ok(link) => signal_links.push(link),
+                Err(_) => return Ok(()),
+            }
+        }
+        facts.signal_attach_accepted = true;
+
         guard.mark_may_be_stopped();
         guard.release().map_err(|_| "child release")?;
-        let record = wait_signal_record(ring, cancellation)?;
-        let record_pid = (record.pid_tgid >> 32) as u32;
-        let record_tid = record.pid_tgid as u32;
-        if record.case_id != run
-            || record_pid != guard.pid()
-            || !expected.contains_key(&record_tid)
-            || record.reserved_zero != [0; 7]
-        {
+        // read exactly two records; the second must arrive inside the same causal window
+        let rec_a = wait_signal_record(ring, cancellation)?;
+        let causal_deadline_ns = rec_a
+            .hook_ts_ns
+            .checked_add(STOP_WAIT_CEILING_US * 1_000)
+            .ok_or("deadline overflow")?;
+        let rec_b = wait_signal_record_until(
+            ring,
+            cancellation,
+            causal_deadline_ns,
+            "second signal record timeout",
+        )?;
+        for record in [&rec_a, &rec_b] {
+            let record_pid = (record.pid_tgid >> 32) as u32;
+            let record_tid = record.pid_tgid as u32;
+            if (record.case_id != 1 && record.case_id != 2)
+                || record_pid != guard.pid()
+                || !expected.contains_key(&record_tid)
+                || record.reserved_zero != [0; 7]
+            {
+                return Err("signal record identity");
+            }
+        }
+        if rec_a.case_id == rec_b.case_id {
             return Err("signal record identity");
         }
-        facts.hook_ts_ns = record.hook_ts_ns;
-        facts.send_signal_rc = record.send_signal_rc;
-        facts.stop_request_accepted = record.send_signal_rc == 0;
+        let second_record_late = rec_a
+            .hook_ts_ns
+            .min(rec_b.hook_ts_ns)
+            .checked_add(STOP_WAIT_CEILING_US * 1_000)
+            .ok_or("deadline overflow")?
+            < monotonic_ns()?;
+        let winner = [&rec_a, &rec_b]
+            .into_iter()
+            .filter(|record| record.send_signal_rc != common::COALESCED_NO_HELPER)
+            .count();
+        facts.winner_records = winner as u64;
+        facts.coalesced_records = 2 - winner as u64;
+        facts.signal_helper_calls = winner as u64;
+        let (win, lost) = if rec_a.send_signal_rc != common::COALESCED_NO_HELPER {
+            (rec_a, rec_b)
+        } else {
+            (rec_b, rec_a)
+        };
+        facts.winner_case_id = win.case_id;
+        facts.coalesced_case_id = lost.case_id;
+        facts.hook_ts_ns = win.hook_ts_ns;
+        facts.send_signal_rc = win.send_signal_rc;
+        facts.stop_request_accepted = win.send_signal_rc == 0;
 
-        let snapshot_start = Instant::now();
-        sleep_checked(cancellation, Duration::from_millis(1))?;
-        let first = stop_snapshot(guard.pid(), &expected)?;
-        sleep_checked(cancellation, Duration::from_millis(1))?;
-        let second = stop_snapshot(guard.pid(), &expected)?;
-        if snapshot_start.elapsed() > Duration::from_millis(100) {
-            return Err("stop timing");
+        // observe: >= 1 ms cadence, absolute deadline hook_ts + 100 ms, sample stamped AFTER its /proc reads complete
+        let deadline_ns = facts
+            .hook_ts_ns
+            .checked_add(STOP_WAIT_CEILING_US * 1_000)
+            .ok_or("deadline overflow")?;
+        let mut samples: Vec<StopSnapshot> = Vec::with_capacity(101);
+        loop {
+            cancellation_failure(cancellation)?;
+            if monotonic_ns()? > deadline_ns || samples.len() >= 101 {
+                break;
+            }
+            let mut snap = stop_snapshot(guard.pid(), &expected)?;
+            let done = monotonic_ns()?;
+            snap.elapsed_us = done.checked_sub(facts.hook_ts_ns).ok_or("clock reversal")? / 1_000;
+            samples.push(snap);
+            if confirm(&samples).is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
+        facts.samples = samples;
+        let confirmed = confirm(&facts.samples);
+        facts.confirmation_sample_indexes = confirmed;
+        let (first, second) = match confirmed {
+            Some((i, j)) => (facts.samples[i], facts.samples[j]),
+            None => {
+                let last = facts.samples.len();
+                (
+                    facts
+                        .samples
+                        .get(last.saturating_sub(2))
+                        .copied()
+                        .unwrap_or_default(),
+                    facts.samples.last().copied().unwrap_or_default(),
+                )
+            }
+        };
         facts.stopped_snapshot_1_count = first.count;
         facts.stopped_snapshot_1_exact_expected_task_set = first.exact_expected_task_set;
         facts.stopped_snapshot_1_all_tasks_stopped = first.all_tasks_stopped;
@@ -2262,29 +2582,37 @@ fn run_gate_b_case(
         facts.stopped_snapshot_2_all_tasks_stopped = second.all_tasks_stopped;
         facts.pre_stop_marker_observed = drain_marker(marker_reader.as_raw_fd(), cancellation)?;
         if !facts.stop_request_accepted
-            || !first.exact_expected_task_set
-            || !first.all_tasks_stopped
-            || !second.exact_expected_task_set
-            || !second.all_tasks_stopped
+            || second_record_late
+            || confirmed.is_none()
             || facts.pre_stop_marker_observed
         {
             return Ok(());
         }
 
-        facts.late_attach_attempts = 1;
-        late_link = attach_program(
-            ebpf,
-            "late_hit",
-            *offsets.get("spike_late_target").ok_or("fixture offset")?,
-            fixture,
-            guard.pid(),
-            u64::from(run),
-        )
-        .ok();
-        facts.late_attach_accepted = late_link.is_some();
-        if late_link.is_none() {
-            return Ok(());
+        // drain-to-empty: with all tasks stopped there is no exact-child producer left
+        facts.drain_empty = drain_signal_ring_to_empty(ring)? == 0;
+        facts.required_attach_keys = 2;
+        for (target, cookie) in [
+            ("spike_late_target", common::SIGNAL_COOKIE_A),
+            ("spike_late_target_b", common::SIGNAL_COOKIE_B),
+        ] {
+            facts.late_attach_attempts += 1;
+            match attach_program(
+                ebpf,
+                "late_hit",
+                *offsets.get(target).ok_or("fixture offset")?,
+                fixture,
+                guard.pid(),
+                cookie,
+            ) {
+                Ok(link) => {
+                    late_links.push(link);
+                    facts.attached_while_stopped += 1;
+                }
+                Err(_) => return Ok(()),
+            }
         }
+        facts.late_attach_accepted = facts.attached_while_stopped == 2;
         facts.last_attach_ts_ns = monotonic_ns()?;
         facts.attach_gap_ms = facts
             .last_attach_ts_ns
@@ -2303,6 +2631,7 @@ fn run_gate_b_case(
         {
             return Ok(());
         }
+        facts.queue_empty_before_resume = drain_signal_ring_to_empty(ring)? == 0;
 
         facts.pidfd_resume_attempts = 1;
         facts.resume_via_original_pidfd = true;
@@ -2311,14 +2640,22 @@ fn run_gate_b_case(
             return Ok(());
         }
         facts.pidfd_resume_rc = 0;
-        match read_expected_byte(
-            marker_reader.as_raw_fd(),
-            b'M',
-            cancellation,
-            Duration::from_secs(5),
-            "post-resume marker timeout",
-        ) {
-            Ok(()) => facts.post_resume_marker_observed = true,
+        // §5.2: REQUESTED is removed immediately after the one successful original-pidfd
+        // resume — before waiting for markers/exit
+        facts.owner_removed = owner
+            .as_mut()
+            .ok_or("start map remove")?
+            .close_after_resume(start)?;
+        facts.final_start_entries = owner
+            .as_ref()
+            .ok_or("start map read")?
+            .start_entries(start)?;
+
+        match read_markers_after_resume(marker_reader.as_raw_fd(), cancellation) {
+            Ok((seen_m, seen_n)) => {
+                facts.markers_after_resume = u32::from(seen_m) + u32::from(seen_n);
+                facts.post_resume_marker_observed = seen_m && seen_n;
+            }
             Err(reason @ ("cancelled_sigint" | "cancelled_sigterm" | "cancellation pipe")) => {
                 return Err(reason);
             }
@@ -2341,11 +2678,19 @@ fn run_gate_b_case(
         Ok(())
     })();
 
-    if let Some(link) = late_link {
-        facts.late_link_detached = detach_program(ebpf, "late_hit", link).is_ok();
+    if !late_links.is_empty() {
+        let mut all_detached = true;
+        for link in late_links.drain(..) {
+            all_detached &= detach_program(ebpf, "late_hit", link).is_ok();
+        }
+        facts.late_link_detached = all_detached;
     }
-    if let Some(link) = signal_link {
-        facts.signal_link_detached = detach_program(ebpf, "signal_return", link).is_ok();
+    if !signal_links.is_empty() {
+        let mut all_detached = true;
+        for link in signal_links.drain(..) {
+            all_detached &= detach_program(ebpf, "signal_return", link).is_ok();
+        }
+        facts.signal_link_detached = all_detached;
     }
     if let Some(guard) = child.as_mut()
         && !guard.reaped
@@ -2358,6 +2703,9 @@ fn run_gate_b_case(
         }
         facts.reaped = cleanup.reaped;
         facts.child_exit = -1;
+    }
+    if let Some(owner) = owner.as_mut() {
+        owner.disarm_for_cleanup(start);
     }
     (facts, result.err())
 }
@@ -2455,6 +2803,8 @@ fn run_gate_b(paths: GateAPaths) -> Result<bool, &'static str> {
     let counters =
         aya::maps::Array::<_, u64>::try_from(ebpf.take_map("COUNTERS").ok_or("counter map")?)
             .map_err(|_| "counter map")?;
+    let mut start = aya::maps::HashMap::try_from(ebpf.take_map("START").ok_or("start map")?)
+        .map_err(|_| "start map")?;
     let mut completed = 0u8;
     let mut final_category = "none";
     for run in 1..=20 {
@@ -2462,6 +2812,7 @@ fn run_gate_b(paths: GateAPaths) -> Result<bool, &'static str> {
             &mut ebpf,
             &mut ring,
             &counters,
+            &mut start,
             &paths.fixture,
             &offsets,
             &cancellation,
@@ -2794,20 +3145,47 @@ mod tests {
             send_signal_rc: 0,
             stop_request_accepted: true,
             expected_task_count: 2,
+            winner_records: 1,
+            coalesced_records: 1,
+            signal_helper_calls: 1,
+            winner_case_id: 1,
+            coalesced_case_id: 2,
             stopped_snapshot_1_count: 2,
             stopped_snapshot_2_count: 2,
             stopped_snapshot_1_exact_expected_task_set: true,
             stopped_snapshot_1_all_tasks_stopped: true,
             stopped_snapshot_2_exact_expected_task_set: true,
             stopped_snapshot_2_all_tasks_stopped: true,
+            confirmation_sample_indexes: Some((0, 1)),
+            samples: vec![
+                StopSnapshot {
+                    elapsed_us: 2_000,
+                    count: 2,
+                    exact_expected_task_set: true,
+                    all_tasks_stopped: true,
+                    state_counts: [0, 0, 0, 2, 0, 0, 0, 0, 0],
+                },
+                StopSnapshot {
+                    elapsed_us: 3_100,
+                    count: 2,
+                    exact_expected_task_set: true,
+                    all_tasks_stopped: true,
+                    state_counts: [0, 0, 0, 2, 0, 0, 0, 0, 0],
+                },
+            ],
             pre_stop_marker_observed: false,
+            drain_empty: true,
+            required_attach_keys: 2,
             post_attach_task_count: 2,
             post_attach_exact_expected_task_set: true,
             post_attach_all_tasks_stopped: true,
             post_attach_marker_observed: false,
-            signal_attach_attempts: 1,
+            attached_while_stopped: 2,
+            queue_empty_before_resume: true,
+            markers_after_resume: 2,
+            signal_attach_attempts: 2,
             signal_attach_accepted: true,
-            late_attach_attempts: 1,
+            late_attach_attempts: 2,
             late_attach_accepted: true,
             signal_link_detached: true,
             late_link_detached: true,
@@ -2816,11 +3194,17 @@ mod tests {
             pidfd_resume_attempts: 1,
             pidfd_resume_rc: 0,
             resume_via_original_pidfd: true,
+            owner_removed: true,
+            final_start_entries: 0,
             post_resume_marker_observed: true,
-            late_hits: 1,
+            late_hits: 2,
             child_exit: 0,
             reaped: true,
         }
+    }
+
+    fn passing_facts() -> SignalTimingFacts {
+        valid_signal()
     }
 
     fn valid_maps() -> Vec<MapFact> {
@@ -2981,10 +3365,10 @@ mod tests {
                 13 => changed.post_attach_all_tasks_stopped = false,
                 14 => changed.post_attach_marker_observed = true,
                 15 => changed.signal_attach_attempts = 0,
-                16 => changed.signal_attach_attempts = 2,
+                16 => changed.signal_attach_attempts = 3,
                 17 => changed.signal_attach_accepted = false,
                 18 => changed.late_attach_attempts = 0,
-                19 => changed.late_attach_attempts = 2,
+                19 => changed.late_attach_attempts = 3,
                 20 => changed.late_attach_accepted = false,
                 21 => changed.signal_link_detached = false,
                 22 => changed.late_link_detached = false,
@@ -2994,7 +3378,7 @@ mod tests {
                 26 => changed.pidfd_resume_rc = -1,
                 27 => changed.resume_via_original_pidfd = false,
                 28 => changed.post_resume_marker_observed = false,
-                29 => changed.late_hits = 2,
+                29 => changed.late_hits = 0,
                 _ => unreachable!(),
             }
             assert!(
@@ -3011,6 +3395,117 @@ mod tests {
             mutate(&mut changed);
             assert!(!signal_oracle_pass(&changed));
         }
+    }
+
+    #[test]
+    fn confirmation_requires_two_all_t_samples_1ms_apart_before_deadline() {
+        let s = |elapsed_us: u64, ok: bool| StopSnapshot {
+            elapsed_us,
+            count: 2,
+            exact_expected_task_set: ok,
+            all_tasks_stopped: ok,
+            state_counts: [0; 9],
+        };
+        assert_eq!(confirm(&[s(1000, false), s(2000, false)]), None);
+        assert_eq!(
+            confirm(&[s(1000, false), s(2100, true), s(3200, true)]),
+            Some((1, 2))
+        );
+        assert_eq!(confirm(&[s(1000, true), s(1500, true)]), None);
+        assert_eq!(confirm(&[s(99_000, true), s(100_500, true)]), None);
+        assert_eq!(
+            confirm(&[s(1000, true), s(2000, false), s(3000, true), s(4100, true)]),
+            Some((2, 3))
+        );
+    }
+
+    #[test]
+    fn signal_oracle_requires_one_winner_one_coalesced_and_closed_drain() {
+        let mut facts = passing_facts();
+        assert!(signal_oracle_pass(&facts));
+        facts.coalesced_records = 0;
+        assert!(!signal_oracle_pass(&facts));
+        facts.coalesced_records = 1;
+        facts.winner_records = 2;
+        assert!(!signal_oracle_pass(&facts));
+        facts.winner_records = 1;
+        facts.drain_empty = false;
+        assert!(!signal_oracle_pass(&facts));
+        facts.drain_empty = true;
+        facts.attached_while_stopped = 1;
+        assert!(!signal_oracle_pass(&facts));
+        facts.attached_while_stopped = 2;
+        facts.final_start_entries = 1;
+        assert!(!signal_oracle_pass(&facts));
+    }
+
+    struct FakeStartMap(Vec<(common::StateKey, common::StartState)>);
+
+    impl FakeStartMap {
+        fn new() -> Self {
+            Self(Vec::new())
+        }
+    }
+
+    impl PauseOwnerMap for FakeStartMap {
+        fn insert_armed(&mut self, key: &common::StateKey) -> Result<(), &'static str> {
+            self.0.push((
+                *key,
+                common::StartState {
+                    arg0: common::PAUSE_ARMED,
+                    arg1: 0,
+                },
+            ));
+            Ok(())
+        }
+
+        fn remove_owner(&mut self, key: &common::StateKey) -> Result<(), &'static str> {
+            self.0.retain(|(existing, _)| existing != key);
+            Ok(())
+        }
+
+        fn entry_count(&self) -> Result<u64, &'static str> {
+            Ok(self.0.len() as u64)
+        }
+    }
+
+    fn armed_fake(key: common::StateKey) -> FakeStartMap {
+        let mut map = FakeStartMap::new();
+        map.insert_armed(&key).unwrap();
+        map
+    }
+
+    #[test]
+    fn pause_owner_guard_removes_entry_on_every_exit_path() {
+        let key = common::StateKey {
+            pid_tgid: 42 << 32,
+            attach_cookie: u64::MAX,
+        };
+        // (i) attach failure after arming: cleanup disarm removes the armed entry
+        let mut map = armed_fake(key);
+        let mut owner = PauseOwnerGuard::new(key);
+        assert!(owner.needs_removal());
+        owner.disarm_for_cleanup(&mut map);
+        assert_eq!(map.entry_count().unwrap(), 0);
+        // (ii) cancellation during observation: same cleanup path, never resumes
+        let mut map = armed_fake(key);
+        let mut owner = PauseOwnerGuard::new(key);
+        owner.disarm_for_cleanup(&mut map);
+        assert_eq!(map.entry_count().unwrap(), 0);
+        // (iii) unconfirmed attempt: entry removed after cleanup
+        let mut map = armed_fake(key);
+        let mut owner = PauseOwnerGuard::new(key);
+        assert!(!owner.closed);
+        owner.disarm_for_cleanup(&mut map);
+        assert_eq!(map.entry_count().unwrap(), 0);
+        // (iv) happy path: close_after_resume removes the entry before markers are read
+        let mut map = armed_fake(key);
+        let mut owner = PauseOwnerGuard::new(key);
+        assert!(owner.close_after_resume(&mut map).unwrap());
+        let entries_after_close = owner.start_entries(&map).unwrap();
+        owner.disarm_for_cleanup(&mut map);
+        assert_eq!(entries_after_close, 0);
+        assert_eq!(map.entry_count().unwrap(), 0);
     }
 
     #[test]
@@ -3728,23 +4223,44 @@ mod tests {
     }
 
     fn signal_timing_value(run: usize, facts: &SignalTimingFacts) -> serde_json::Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "signal_run": run,
             "hook_ts_ns": facts.hook_ts_ns,
             "send_signal_rc": facts.send_signal_rc,
             "stop_request_accepted": facts.stop_request_accepted,
             "expected_task_count": facts.expected_task_count,
+            "winner_records": facts.winner_records,
+            "coalesced_records": facts.coalesced_records,
+            "signal_helper_calls": facts.signal_helper_calls,
+            "winner_case_id": facts.winner_case_id,
+            "coalesced_case_id": facts.coalesced_case_id,
             "stopped_snapshot_1_count": facts.stopped_snapshot_1_count,
             "stopped_snapshot_2_count": facts.stopped_snapshot_2_count,
             "stopped_snapshot_1_exact_expected_task_set": facts.stopped_snapshot_1_exact_expected_task_set,
             "stopped_snapshot_1_all_tasks_stopped": facts.stopped_snapshot_1_all_tasks_stopped,
             "stopped_snapshot_2_exact_expected_task_set": facts.stopped_snapshot_2_exact_expected_task_set,
             "stopped_snapshot_2_all_tasks_stopped": facts.stopped_snapshot_2_all_tasks_stopped,
+            "stop_wait_ceiling_us": 100_000,
+            "confirmation_sample_indexes": facts.confirmation_sample_indexes,
+            "samples": facts.samples.iter().map(|snapshot| serde_json::json!({
+                "elapsed_us": snapshot.elapsed_us,
+                "task_count": snapshot.count,
+                "exact_expected_task_set": snapshot.exact_expected_task_set,
+                "all_tasks_stopped": snapshot.all_tasks_stopped,
+                "state_counts": snapshot.state_counts,
+            })).collect::<Vec<_>>(),
             "pre_stop_marker_observed": facts.pre_stop_marker_observed,
+            "drain_empty": facts.drain_empty,
+            "required_attach_keys": facts.required_attach_keys,
+        });
+        let extra = serde_json::json!({
             "post_attach_task_count": facts.post_attach_task_count,
             "post_attach_exact_expected_task_set": facts.post_attach_exact_expected_task_set,
             "post_attach_all_tasks_stopped": facts.post_attach_all_tasks_stopped,
             "post_attach_marker_observed": facts.post_attach_marker_observed,
+            "attached_while_stopped": facts.attached_while_stopped,
+            "queue_empty_before_resume": facts.queue_empty_before_resume,
+            "markers_after_resume": facts.markers_after_resume,
             "signal_attach_attempts": facts.signal_attach_attempts,
             "signal_attach_accepted": facts.signal_attach_accepted,
             "late_attach_attempts": facts.late_attach_attempts,
@@ -3756,13 +4272,22 @@ mod tests {
             "pidfd_resume_attempts": facts.pidfd_resume_attempts,
             "pidfd_resume_rc": facts.pidfd_resume_rc,
             "resume_via_original_pidfd": facts.resume_via_original_pidfd,
+            "owner_removed": facts.owner_removed,
+            "final_start_entries": facts.final_start_entries,
             "post_resume_marker_observed": facts.post_resume_marker_observed,
             "late_hits": facts.late_hits,
             "child_exit": facts.child_exit,
             "reaped": facts.reaped,
             "pass": signal_oracle_pass(facts),
             "failure_category": if signal_oracle_pass(facts) { "none" } else { "oracle" },
-        })
+        });
+        for (name, field) in extra.as_object().unwrap() {
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(name.clone(), field.clone());
+        }
+        value
     }
 
     fn fake_canonical_gate_b_export(
@@ -3955,7 +4480,7 @@ mod tests {
         .unwrap();
         assert!(shell_validate_gate_b_export(script, &runtime_failure, 1));
         let runtime_reasons = shell_lines(script, "source \"$1\"; gate_b_runtime_reasons", &[]);
-        assert_eq!(runtime_reasons.len(), 30);
+        assert_eq!(runtime_reasons.len(), 35);
         assert_eq!(
             runtime_reasons
                 .iter()
@@ -4047,7 +4572,7 @@ mod tests {
         .unwrap();
         assert!(!shell_validate_gate_b_export(script, &contradictory, 1));
 
-        for mutation in 0..33 {
+        for mutation in 0..43 {
             let path = temp.path().join(format!("mutation-{mutation}"));
             fake_canonical_gate_b_export(&path, 2, 20, "none");
             let timing = path.join("signal-timing.jsonl");
@@ -4074,10 +4599,10 @@ mod tests {
                 13 => record["post_attach_all_tasks_stopped"] = false.into(),
                 14 => record["post_attach_marker_observed"] = true.into(),
                 15 => record["signal_attach_attempts"] = 0.into(),
-                16 => record["signal_attach_attempts"] = 2.into(),
+                16 => record["signal_attach_attempts"] = 3.into(),
                 17 => record["signal_attach_accepted"] = false.into(),
                 18 => record["late_attach_attempts"] = 0.into(),
-                19 => record["late_attach_attempts"] = 2.into(),
+                19 => record["late_attach_attempts"] = 3.into(),
                 20 => record["late_attach_accepted"] = false.into(),
                 21 => record["signal_link_detached"] = false.into(),
                 22 => record["late_link_detached"] = false.into(),
@@ -4089,11 +4614,21 @@ mod tests {
                 28 => record["resume_via_original_pidfd"] = false.into(),
                 29 => record["post_resume_marker_observed"] = false.into(),
                 30 => record["late_hits"] = 0.into(),
-                31 => record["late_hits"] = 2.into(),
+                31 => record["late_hits"] = 3.into(),
                 32 => {
                     record["child_exit"] = 1.into();
                     record["reaped"] = false.into();
                 }
+                33 => record["winner_records"] = 2.into(),
+                34 => record["coalesced_records"] = 0.into(),
+                35 => record["drain_empty"] = false.into(),
+                36 => record["attached_while_stopped"] = 1.into(),
+                37 => record["final_start_entries"] = 1.into(),
+                38 => record["owner_removed"] = false.into(),
+                39 => record["queue_empty_before_resume"] = false.into(),
+                40 => record["markers_after_resume"] = 1.into(),
+                41 => record["winner_case_id"] = 2.into(),
+                42 => record["confirmation_sample_indexes"] = serde_json::Value::Null,
                 _ => unreachable!(),
             }
             std::fs::write(
@@ -4746,29 +5281,44 @@ mod tests {
         assert!(!source.contains("while word < 112"));
         assert!(source.contains("DISCOVERY.reserve::<SignalRecord>(0)"));
         assert!(source.contains("increment_counter(LATE_HITS)"));
+        assert!(source.contains("#![feature(core_intrinsics)]"));
+        assert!(source.contains("#![allow(internal_features)]"));
         let signal = source.find("pub fn signal_return(").unwrap();
         let signal_end = source[signal..].find("pub fn late_hit(").unwrap() + signal;
         let signal_source = &source[signal..signal_end];
-        let timestamp = signal_source.find("helpers::bpf_ktime_get_ns()").unwrap();
-        let send = signal_source.find("helpers::bpf_send_signal(19)").unwrap();
-        let unsafe_start = signal_source
-            .find("unsafe {\n        let mut word = 0usize;")
+        let reserve = signal_source
+            .find("DISCOVERY.reserve::<SignalRecord>(0)")
             .unwrap();
-        let unsafe_end = signal_source[unsafe_start..].find("\n    }").unwrap() + unsafe_start;
+        let zeroing = signal_source
+            .find("core::ptr::write_volatile(words.add(0)")
+            .unwrap();
+        let cas = signal_source
+            .find("core::intrinsics::atomic_cxchg")
+            .unwrap();
+        let send = signal_source.find("helpers::bpf_send_signal(19)").unwrap();
         let submit = signal_source.find("entry.submit(0);").unwrap();
-        assert!(
-            timestamp < send,
-            "timestamp must be sampled immediately before SIGSTOP"
+        assert_eq!(
+            signal_source
+                .matches("helpers::bpf_send_signal(19)")
+                .count(),
+            1,
+            "the signal helper must appear exactly once in signal_return"
+        );
+        assert_eq!(
+            signal_source
+                .matches("core::ptr::write_volatile(words.add(")
+                .count(),
+            4,
+            "four flat zero words initialize the reserved entry"
         );
         assert!(
-            send < unsafe_start,
-            "timestamp and signal helpers must remain outside the raw-write unsafe block"
+            reserve < zeroing && zeroing < cas && cas < send && send < submit,
+            "order must be reserve -> zero words -> CAS -> single signal -> submit"
         );
-        assert!(
-            submit > unsafe_end,
-            "signal submit must remain outside raw initialization"
-        );
-        assert!(!signal_source[unsafe_start..unsafe_end].contains("helpers::bpf_"));
+        assert!(signal_source.contains("pause_owner_key()"));
+        assert!(signal_source.contains("PAUSE_ARMED"));
+        assert!(signal_source.contains("PAUSE_REQUESTED"));
+        assert!(signal_source.contains("COALESCED_NO_HELPER"));
         assert!(
             source.contains("START.insert(&key, &state, aya_ebpf::bindings::BPF_NOEXIST as u64)")
         );
@@ -4819,10 +5369,11 @@ mod tests {
         let case_start = host.find("fn run_gate_b_case(").unwrap();
         let gate_start = host[case_start..].find("fn run_gate_b(").unwrap() + case_start;
         let case_source = &host[case_start..gate_start];
-        assert!(case_source.contains("if let Some(link) = late_link"));
+        assert!(case_source.contains("if !late_links.is_empty()"));
         assert!(case_source.contains("detach_program(ebpf, \"late_hit\", link)"));
-        assert!(case_source.contains("if let Some(link) = signal_link"));
+        assert!(case_source.contains("if !signal_links.is_empty()"));
         assert!(case_source.contains("detach_program(ebpf, \"signal_return\", link)"));
+        assert!(case_source.contains("disarm_for_cleanup(start)"));
         let self_check = host[gate_start..].find("fn self_check(").unwrap() + gate_start;
         let gate_source = &host[gate_start..self_check];
         assert!(gate_source.contains("if runtime_failure_reason.is_some() || !pass"));

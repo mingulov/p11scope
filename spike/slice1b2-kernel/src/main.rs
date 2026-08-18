@@ -2505,12 +2505,90 @@ fn self_check() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// One finite JSON line per program: no raw verifier text beyond a 2 KiB tail.
+fn diag_line(
+    program: &str,
+    outcome: Result<Option<u32>, (Option<i32>, String)>,
+    duration_ms: u128,
+) -> String {
+    let mut v = serde_json::Map::new();
+    v.insert("program".into(), program.into());
+    v.insert(
+        "duration_ms".into(),
+        u64::try_from(duration_ms).unwrap_or(u64::MAX).into(),
+    );
+    match outcome {
+        Ok(insns) => {
+            v.insert("accepted".into(), true.into());
+            v.insert("verified_insns".into(), insns.into()); // None on 5.15 (bpf_prog_info field added in 5.16)
+        }
+        Err((errno, log)) => {
+            v.insert("accepted".into(), false.into());
+            v.insert("errno".into(), errno.into());
+            v.insert("log_bytes".into(), (log.len() as u64).into());
+            let tail: String = log
+                .chars()
+                .rev()
+                .take(2048)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            v.insert("log_tail".into(), tail.into());
+        }
+    }
+    serde_json::Value::Object(v).to_string()
+}
+
+/// Diagnostic-only (D2) Gate A verdict lane: one STATS-only load per program,
+/// never the frozen VERBOSE | STATS gate. Records the first-attempt errno that
+/// Aya's retry loop would otherwise discard, plus bounded verifier stats.
+fn run_gate_a_diag(bpf_path: &str, out_dir: &str) -> Result<bool, &'static str> {
+    std::fs::create_dir_all(out_dir).map_err(|_| "out dir")?;
+    let bytes = std::fs::read(bpf_path).map_err(|_| "bpf read")?;
+    let mut sink =
+        std::fs::File::create(format!("{out_dir}/diag.jsonl")).map_err(|_| "diag file")?;
+    let mut loader = aya::EbpfLoader::new();
+    loader.verifier_log_level(aya::VerifierLogLevel::STATS); // no per-insn text; failure reason + stats only
+    let mut ebpf = loader.load(&bytes).map_err(|_| "object load")?;
+    let mut all = true;
+    for name in GATE_A_PROGRAMS {
+        let started = Instant::now();
+        let outcome: Result<Option<u32>, (Option<i32>, String)> = match ebpf.program_mut(name) {
+            None => Err((None, "program missing".into())),
+            Some(program) => match <&mut aya::programs::UProbe>::try_from(program) {
+                Err(error) => Err((None, error.to_string())),
+                Ok(program) => match program.load() {
+                    Ok(()) => Ok(program
+                        .info()
+                        .ok()
+                        .and_then(|info| info.verified_instruction_count())),
+                    Err(aya::programs::ProgramError::LoadError {
+                        io_error,
+                        verifier_log,
+                    }) => Err((io_error.raw_os_error(), verifier_log.to_string())),
+                    Err(other) => Err((None, other.to_string())),
+                },
+            },
+        };
+        all &= outcome.is_ok();
+        writeln!(
+            sink,
+            "{}",
+            diag_line(name, outcome, started.elapsed().as_millis())
+        )
+        .map_err(|_| "diag write")?;
+    }
+    Ok(all)
+}
+
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
     let result = match args.get(1).map(String::as_str) {
         Some("--self-check") if args.len() == 2 => self_check().map(|()| true),
         Some("gate-a") => parse_gate_a_args(&args[2..]).and_then(run_gate_a),
         Some("gate-b") => parse_gate_b_args(&args[2..]).and_then(run_gate_b),
+        Some("gate-a-diag") if args.len() == 4 => run_gate_a_diag(&args[2], &args[3]),
         _ => Err("usage"),
     };
     match result {
@@ -2534,6 +2612,46 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn gate_a_diag_line_has_finite_fields() {
+        let line = diag_line(
+            "interface_list_return",
+            Err((
+                Some(7),
+                "processed 1000001 insns (limit 1000000) max_states_per_insn 4 total_states 25000 peak_states 2000 mark_read 90"
+                    .to_string(),
+            )),
+            1234,
+        );
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["program"], "interface_list_return");
+        assert_eq!(v["accepted"], false);
+        assert_eq!(v["errno"], 7);
+        assert_eq!(v["duration_ms"], 1234);
+        assert!(
+            v["log_tail"]
+                .as_str()
+                .unwrap()
+                .contains("processed 1000001 insns")
+        );
+        assert!(v["log_bytes"].as_u64().unwrap() < 4096);
+    }
+
+    #[test]
+    fn gate_a_diag_line_accepted_line_has_no_errno_and_tails_at_2k() {
+        let long = "x".repeat(5000);
+        let line = diag_line("function_list_return", Ok(Some(4421)), 9);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["accepted"], true);
+        assert_eq!(v["verified_insns"], 4421);
+        assert!(v.get("errno").is_none() || v["errno"].is_null());
+        let rejected = diag_line("p", Err((None, long)), 1);
+        let v: serde_json::Value = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(v["errno"], serde_json::Value::Null);
+        assert_eq!(v["log_bytes"], 5000u64);
+        assert_eq!(v["log_tail"].as_str().unwrap().len(), 2048);
+    }
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     static VM_TEST_LOCK: Mutex<()> = Mutex::new(());

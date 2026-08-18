@@ -2687,7 +2687,7 @@ mod tests {
         command.args(args).output().unwrap()
     }
 
-    fn fake_canonical_gate_export(path: &Path, verifier_count: usize, status: &str) {
+    fn fake_canonical_gate_export(path: &Path, verifier_count: usize, category: &str) {
         std::fs::create_dir(path).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let programs = [
@@ -2698,25 +2698,76 @@ mod tests {
         ];
         let verifier = programs[..verifier_count]
             .iter()
-            .map(|program| {
-                format!("{{\"program\":\"{program}\",\"accepted\":true,\"load_attempted\":true}}\n")
+            .enumerate()
+            .map(|(index, program)| {
+                let accepted = category != "verifier" || index != verifier_count - 1;
+                serde_json::json!({
+                    "program": program,
+                    "accepted": accepted,
+                    "load_attempted": true,
+                    "success_log_contract": if accepted { "accepted_line_only" } else { "rejection_error_chain" },
+                    "pass": accepted,
+                    "failure_category": if accepted { "none" } else { "verifier" },
+                })
+                .to_string()
+                    + "\n"
             })
             .collect::<String>();
-        let mut cases = ["EVENTS", "DISCOVERY", "START", "COUNTERS"]
+        let map_facts = [
+            ("EVENTS", "ringbuf", 0, 0, 262_144, 262_144),
+            ("DISCOVERY", "ringbuf", 0, 0, 65_536, 65_536),
+            ("START", "hash", 16, 16, 64, 1_024),
+            ("COUNTERS", "array", 4, 8, 5, 40),
+        ];
+        let mut cases = map_facts
             .iter()
-            .map(|map| format!("{{\"record_type\":\"map\",\"map\":\"{map}\"}}\n"))
+            .map(
+                |(map, map_type, key_size, value_size, max_entries, logical_value_bytes)| {
+                    serde_json::json!({
+                        "record_type": "map", "map": map, "map_type": map_type,
+                        "key_size": key_size, "value_size": value_size,
+                        "max_entries": max_entries, "logical_value_bytes": logical_value_bytes,
+                        "pass": false, "failure_category": "pending",
+                    })
+                    .to_string()
+                        + "\n"
+                },
+            )
             .collect::<String>();
-        for case in [
+        let case_names = [
             "FULL_104",
             "GUARD_AFTER_7",
             "UNREADABLE_TABLE",
             "UNREADABLE_PP",
             "INTERFACE",
-        ] {
-            cases.push_str(&format!(
-                "{{\"record_type\":\"case\",\"case\":\"{case}\"}}\n"
-            ));
+        ];
+        let case_count = match category {
+            "verifier" => 0,
+            "runtime" => 2,
+            _ => case_names.len(),
+        };
+        for (index, case) in case_names[..case_count].iter().enumerate() {
+            let failed = (category == "runtime" && index + 1 == case_count)
+                || (category == "oracle" && index == 2);
+            let mut value = serde_json::json!({
+                "record_type": "case", "case": case,
+                "entry_attach_attempts": 1, "entry_attach_accepted": true,
+                "return_attach_attempts": 1, "return_attach_accepted": true,
+                "entry_link_detached": true, "return_link_detached": true,
+                "start_empty": true, "record_count": 0,
+                "counters_before": [0, 0, 0, 0, 0],
+                "counters_after": [0, 0, 0, 0, 0],
+                "counter_deltas": [0, 0, 0, 0, 0], "records": [],
+                "pass": !failed,
+                "failure_category": if failed { category } else { "none" },
+            });
+            if category == "runtime" && failed {
+                value["runtime_failure_reason"] = "child wait".into();
+            }
+            cases.push_str(&value.to_string());
+            cases.push('\n');
         }
+        let status = if category == "none" { "PASS" } else { "FAIL" };
         for (name, contents) in [
             ("environment.txt", "kernel_release=test\n".to_owned()),
             ("manifest-digests.txt", "bpf_sha256=test\n".to_owned()),
@@ -2725,10 +2776,7 @@ mod tests {
             ("gate-a-cases.jsonl", cases),
             (
                 "runner-status.txt",
-                format!(
-                    "status={status}\nfailure_category={}\n",
-                    if status == "PASS" { "none" } else { "oracle" }
-                ),
+                format!("status={status}\nfailure_category={category}\n"),
             ),
         ] {
             let file = path.join(name);
@@ -2755,16 +2803,71 @@ mod tests {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
         let temp = TestDir::new("gate-export-semantics");
         let valid = temp.path().join("valid");
-        fake_canonical_gate_export(&valid, 4, "PASS");
+        fake_canonical_gate_export(&valid, 4, "none");
         assert!(shell_validate_gate_export(script, &valid, 0));
 
         let short = temp.path().join("short");
-        fake_canonical_gate_export(&short, 3, "PASS");
+        fake_canonical_gate_export(&short, 3, "none");
         assert!(!shell_validate_gate_export(script, &short, 0));
 
         let mismatch = temp.path().join("mismatch");
-        fake_canonical_gate_export(&mismatch, 4, "PASS");
+        fake_canonical_gate_export(&mismatch, 4, "none");
         assert!(!shell_validate_gate_export(script, &mismatch, 1));
+    }
+
+    #[test]
+    fn canonical_gate_categories_require_consistent_finite_records() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("gate-export-categories");
+        for category in ["verifier", "runtime", "oracle"] {
+            let path = temp.path().join(category);
+            fake_canonical_gate_export(&path, 4, category);
+            assert!(shell_validate_gate_export(script, &path, 1), "{category}");
+        }
+
+        for (category, source) in [
+            ("verifier", "oracle"),
+            ("runtime", "oracle"),
+            ("oracle", "none"),
+        ] {
+            let path = temp.path().join(format!("contradictory-{category}"));
+            fake_canonical_gate_export(&path, 4, source);
+            std::fs::write(
+                path.join("runner-status.txt"),
+                format!("status=FAIL\nfailure_category={category}\n"),
+            )
+            .unwrap();
+            assert!(!shell_validate_gate_export(script, &path, 1), "{category}");
+        }
+    }
+
+    #[test]
+    fn gate_b_remote_export_omits_gate_a_semantics() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg("source \"$1\"; remote_export_script b")
+            .arg("bash")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let generated = String::from_utf8(output.stdout).unwrap();
+        assert!(generated.contains("gate=b"));
+        assert!(generated.contains("signal-timing.jsonl"));
+        assert!(!generated.contains("gate-a-cases.jsonl"));
+        let mut syntax = Command::new("bash")
+            .arg("-n")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        syntax
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(generated.as_bytes())
+            .unwrap();
+        assert!(syntax.wait().unwrap().success());
     }
 
     #[test]
@@ -2901,10 +3004,13 @@ mod tests {
             .arg(concat!(
                 "exec -a qemu-system-x86_64 /bin/sh -c ",
                 "'while :; do /bin/sleep 1; done' ",
-                "\"file=$1,if=virtio,format=qcow2\""
+                "\"file=$1,if=virtio,format=qcow2\" ",
+                "user,id=n1,hostfwd=tcp:127.0.0.1:2222-:22 ",
+                "\"file:$2/runtime.serial.log\" \"$2/qemu.pid\""
             ))
             .arg("bash")
             .arg(&runtime)
+            .arg(&run)
             .spawn()
             .unwrap();
         std::fs::write(run.join("qemu.pid"), format!("{}\n", qemu.id())).unwrap();
@@ -2913,7 +3019,7 @@ mod tests {
             let output = Command::new("bash")
                 .arg("-c")
                 .arg(concat!(
-                    "source \"$1\"; PRIVATE_RUN_DIR=$2; PRIVATE_QEMU_PID=; ",
+                    "source \"$1\"; PRIVATE_RUN_DIR=$2; PRIVATE_PORT=2222; PRIVATE_QEMU_PID=; ",
                     "private_recover_qemu_pid && printf '%s\\n' \"$PRIVATE_QEMU_PID\""
                 ))
                 .arg("bash")
@@ -2934,13 +3040,104 @@ mod tests {
         std::fs::write(run.join("qemu.pid"), format!("{}\n", std::process::id())).unwrap();
         let unrelated = Command::new("bash")
             .arg("-c")
-            .arg("source \"$1\"; PRIVATE_RUN_DIR=$2; PRIVATE_QEMU_PID=; private_recover_qemu_pid")
+            .arg("source \"$1\"; PRIVATE_RUN_DIR=$2; PRIVATE_PORT=2222; PRIVATE_QEMU_PID=; private_recover_qemu_pid")
             .arg("bash")
             .arg(script)
             .arg(&run)
             .status()
             .unwrap();
         assert!(!unrelated.success());
+    }
+
+    #[test]
+    fn cleanup_never_waits_or_signals_a_failed_qemu_identity() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("qemu-pid-refusal");
+        let run = temp.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        let events = temp.path().join("events");
+        let body = concat!(
+            "source \"$1\"; PRIVATE_LANE_OWNED=1; PRIVATE_RUN_DIR=$2; ",
+            "PRIVATE_QEMU_PID=$$; PRIVATE_KNOWN_HOSTS=/known; PRIVATE_PORT=2222; ",
+            "EVENT_LOG=$3; sleep() { printf 'sleep\\n' >>\"$EVENT_LOG\"; }; ",
+            "kill() { printf 'kill\\n' >>\"$EVENT_LOG\"; }; ",
+            "strict_ssh() { return 255; }; set +e; private_finish_lane; exit 0"
+        );
+        let output = shell_output(script, body, &[run.as_os_str(), events.as_os_str()]);
+        assert!(output.status.success());
+        assert!(!events.exists(), "invalid PID was waited or signaled");
+    }
+
+    #[test]
+    fn cleanup_revalidates_qemu_identity_before_forced_kill() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("qemu-pid-revalidate");
+        let run = temp.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        let events = temp.path().join("events");
+        let body = concat!(
+            "source \"$1\"; PRIVATE_LANE_OWNED=1; PRIVATE_RUN_DIR=$2; PRIVATE_QEMU_PID=$$; ",
+            "PRIVATE_KNOWN_HOSTS=/known; PRIVATE_PORT=2222; recoveries=0; ",
+            "private_recover_qemu_pid() { recoveries=$((recoveries + 1)); ",
+            "if (( recoveries == 1 )); then return 0; fi; PRIVATE_QEMU_PID=; return 64; }; ",
+            "strict_ssh() { return 255; }; sleep() { :; }; ",
+            "EVENT_LOG=$3; kill() { printf 'kill\\n' >>\"$EVENT_LOG\"; }; set +e; private_finish_lane; ",
+            "printf '%s\\n' \"$recoveries\" >\"$3.recoveries\"; exit 0"
+        );
+        let output = shell_output(script, body, &[run.as_os_str(), events.as_os_str()]);
+        assert!(output.status.success());
+        assert!(!events.exists(), "stale PID was forcibly signaled");
+        assert!(
+            std::fs::read_to_string(events.with_extension("recoveries"))
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap()
+                >= 2
+        );
+    }
+
+    #[test]
+    fn cleanup_defers_int_and_term_until_finish_completes() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        for (name, signal) in [("INT", libc::SIGINT), ("TERM", libc::SIGTERM)] {
+            let temp = TestDir::new("cleanup-signal");
+            let started = temp.path().join("started");
+            let release = temp.path().join("release");
+            let finished = temp.path().join("finished");
+            let body = concat!(
+                "source \"$1\"; PRIVATE_LANE_OWNED=1; PRIVATE_LANE_CLEANUP=idle; ",
+                "PRIVATE_LANE_INTERRUPTED=0; PRIVATE_FINISH_RC=0; private_arm_lane_traps; ",
+                "STARTED=$2; RELEASE=$3; FINISHED=$4; private_finish_lane() { ",
+                ": >\"$STARTED\"; while [[ ! -e $RELEASE ]]; do /bin/sleep 0.01; done; ",
+                ": >\"$FINISHED\"; return 0; }; ",
+                "set +e; private_cleanup_lane; rc=$?; private_disarm_lane_traps; ",
+                "printf 'rc=%s\\n' \"$rc\""
+            );
+            let child = Command::new("bash")
+                .arg("-c")
+                .arg(body)
+                .arg("bash")
+                .arg(script)
+                .args([&started, &release, &finished])
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            for _ in 0..200 {
+                if started.exists() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(started.exists(), "{name} cleanup did not start");
+            assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+            thread::sleep(Duration::from_millis(25));
+            std::fs::write(&release, b"release").unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{name}");
+            assert_eq!(output.stdout, b"rc=64\n", "{name}");
+            assert!(finished.exists(), "{name} abandoned cleanup");
+        }
     }
 
     #[test]

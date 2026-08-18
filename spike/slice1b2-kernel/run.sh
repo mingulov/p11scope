@@ -133,12 +133,66 @@ except (OSError, UnicodeError, json.JSONDecodeError):
     raise SystemExit(64)
 if len(verifier) != 4 or [item.get("program") for item in verifier] != programs:
     raise SystemExit(64)
-if any(item.get("load_attempted") is not True or not isinstance(item.get("accepted"), bool) for item in verifier):
+if any(
+    item.get("load_attempted") is not True
+    or not isinstance(item.get("accepted"), bool)
+    or item.get("pass") is not item["accepted"]
+    or item.get("failure_category") != ("none" if item["accepted"] else "verifier")
+    or item.get("success_log_contract") != ("accepted_line_only" if item["accepted"] else "rejection_error_chain")
+    for item in verifier
+):
     raise SystemExit(64)
-map_names = [item.get("map") for item in records if item.get("record_type") == "map"]
-case_names = [item.get("case") for item in records if item.get("record_type") == "case"]
-if len(records) != len(map_names) + len(case_names) or map_names != maps or len(case_names) != len(set(case_names)) or any(name not in cases for name in case_names):
+map_records = [item for item in records if item.get("record_type") == "map"]
+case_records = [item for item in records if item.get("record_type") == "case"]
+map_facts = [
+    ("EVENTS", "ringbuf", 0, 0, 262144, 262144),
+    ("DISCOVERY", "ringbuf", 0, 0, 65536, 65536),
+    ("START", "hash", 16, 16, 64, 1024),
+    ("COUNTERS", "array", 4, 8, 5, 40),
+]
+if len(records) != len(map_records) + len(case_records) or len(map_records) != 4:
     raise SystemExit(64)
+for item, expected in zip(map_records, map_facts):
+    actual = tuple(item.get(name) for name in ["map", "map_type", "key_size", "value_size", "max_entries", "logical_value_bytes"])
+    if actual != expected or any(type(value) is not int for value in actual[2:]) or item.get("pass") is not False or item.get("failure_category") != "pending":
+        raise SystemExit(64)
+case_names = [item.get("case") for item in case_records]
+if case_names != cases[:len(case_names)]:
+    raise SystemExit(64)
+runtime_reasons = {
+    "record surplus before case", "counter read", "gated child", "fixture offset",
+    "process maps", "fixture metadata", "fixture device", "fixture executable mapping",
+    "program missing", "program type", "child pid is zero", "program attach",
+    "child wait", "child release", "fixture child status", "record identity",
+    "discovery record length is not 896 bytes",
+}
+for item in case_records:
+    for name in ["entry_attach_accepted", "return_attach_accepted", "entry_link_detached", "return_link_detached", "start_empty", "pass"]:
+        if not isinstance(item.get(name), bool):
+            raise SystemExit(64)
+    attempts = [item.get("entry_attach_attempts"), item.get("return_attach_attempts")]
+    if any(type(value) is not int or value not in {0, 1} for value in attempts):
+        raise SystemExit(64)
+    if item["entry_attach_accepted"] and attempts[0] != 1 or item["return_attach_accepted"] and attempts[1] != 1:
+        raise SystemExit(64)
+    if item["entry_link_detached"] and not item["entry_attach_accepted"] or item["return_link_detached"] and not item["return_attach_accepted"]:
+        raise SystemExit(64)
+    before, after, deltas = (item.get(name) for name in ["counters_before", "counters_after", "counter_deltas"])
+    if any(not isinstance(value, list) or len(value) != 5 or any(not isinstance(n, int) or isinstance(n, bool) or n < 0 for n in value) for value in [before, after, deltas]):
+        raise SystemExit(64)
+    if deltas != [max(a - b, 0) for a, b in zip(after, before)]:
+        raise SystemExit(64)
+    if not isinstance(item.get("record_count"), int) or isinstance(item["record_count"], bool) or not 0 <= item["record_count"] <= 16:
+        raise SystemExit(64)
+    if not isinstance(item.get("records"), list) or len(item["records"]) != item["record_count"]:
+        raise SystemExit(64)
+    for record in item["records"]:
+        if record.get("name_class") not in {"exact_standard", "other", "null", "unreadable", "not_applicable"}:
+            raise SystemExit(64)
+        if any(not isinstance(record.get(name), int) or isinstance(record[name], bool) or not 0 <= record[name] <= 104 for name in ["usable_n", "pointers_attempted", "completed_prefix"]):
+            raise SystemExit(64)
+        if any(not isinstance(record.get(name), bool) for name in ["all_usable_pointers_nonzero", "all_usable_pointers_equal_fixture"]):
+            raise SystemExit(64)
 try:
     with open(os.path.join(directory, "runner-status.txt"), encoding="utf-8") as stream:
         status_lines = [line.rstrip("\n") for line in stream]
@@ -149,9 +203,25 @@ if len(status_lines) != 2 or status_lines[0] != f"status={expected_status}":
     raise SystemExit(64)
 category = status_lines[1].removeprefix("failure_category=") if status_lines[1].startswith("failure_category=") else ""
 if expected_status == "PASS":
-    if category != "none" or case_names != cases or not all(item["accepted"] for item in verifier):
+    if category != "none" or not all(item["accepted"] for item in verifier) or case_names != cases or any(item["pass"] is not True or item.get("failure_category") != "none" or "runtime_failure_reason" in item for item in case_records):
         raise SystemExit(64)
-elif category not in {"verifier", "runtime", "oracle"}:
+elif category == "verifier":
+    if all(item["accepted"] for item in verifier) or case_records:
+        raise SystemExit(64)
+elif category == "runtime":
+    if not all(item["accepted"] for item in verifier) or not case_records:
+        raise SystemExit(64)
+    if any(item["pass"] is not True or item.get("failure_category") != "none" or "runtime_failure_reason" in item for item in case_records[:-1]):
+        raise SystemExit(64)
+    last = case_records[-1]
+    if last["pass"] is not False or last.get("failure_category") != "runtime" or last.get("runtime_failure_reason") not in runtime_reasons:
+        raise SystemExit(64)
+elif category == "oracle":
+    if not all(item["accepted"] for item in verifier) or case_names != cases or not any(item["pass"] is False for item in case_records):
+        raise SystemExit(64)
+    if any(item.get("failure_category") != ("none" if item["pass"] else "oracle") or "runtime_failure_reason" in item for item in case_records):
+        raise SystemExit(64)
+else:
     raise SystemExit(64)
 for name in ["environment.txt", "manifest-digests.txt", "verifier.log"]:
     if os.path.getsize(os.path.join(directory, name)) == 0:
@@ -160,11 +230,21 @@ PY
 }
 
 remote_export_script() {
+    local gate=$1 varying
+    local -a files
+    [[ $gate == a || $gate == b ]] || return 64
+    mapfile -t files < <(fixed_inventory "$gate") || return 64
+    varying=${files[4]}
     cat <<'REMOTE_EXPORT'
 set -eu
-directory=$1
-varying=$2
-expected_rc=$3
+gate=$1
+directory=$2
+varying=$3
+expected_rc=$4
+REMOTE_EXPORT
+    printf 'expected_gate=%s\nexpected_varying=%s\n' "$gate" "$varying"
+    cat <<'REMOTE_EXPORT'
+test "$gate" = "$expected_gate" && test "$varying" = "$expected_varying"
 test "$(stat -c '%u:%a' -- "$directory")" = 0:700
 set -- environment.txt manifest-digests.txt verifier.log verifier-results.jsonl "$varying" runner-status.txt
 test "$(find "$directory" -mindepth 1 -maxdepth 1 -printf . | wc -c)" -eq 6
@@ -182,11 +262,17 @@ for name do
     total=$((total + size))
 done
 test "$total" -le 16777216
+REMOTE_EXPORT
+    if [[ $gate == a ]]; then
+        cat <<'REMOTE_EXPORT'
 python3 - "$directory" "$expected_rc" <<'PY'
 REMOTE_EXPORT
-    gate_a_semantics_python
-    cat <<'REMOTE_EXPORT'
+        gate_a_semantics_python
+        cat <<'REMOTE_EXPORT'
 PY
+REMOTE_EXPORT
+    fi
+    cat <<'REMOTE_EXPORT'
 exec tar --format=posix --no-recursion -C "$directory" -cf - "$@"
 REMOTE_EXPORT
 }
@@ -201,8 +287,8 @@ export_evidence() {
     mapfile -d '' -t ssh < <(ssh_argv "$known_hosts" "$port")
     mapfile -t files < <(fixed_inventory "$gate")
     varying=${files[4]}
-    remote_command="sudo -n sh -s -- $remote_dir $varying $expected_rc"
-    remote_export_script \
+    remote_command="sudo -n sh -s -- $gate $remote_dir $varying $expected_rc"
+    remote_export_script "$gate" \
         | timeout 120s "${ssh[@]}" p11scope@127.0.0.1 "$remote_command" \
         | tar --no-same-owner --no-same-permissions -C "$new_host_dir" -xf -
 }
@@ -355,38 +441,50 @@ private_start_lane() {
 }
 
 private_recover_qemu_pid() {
-    local candidate=${PRIVATE_QEMU_PID-} argument matched=0
+    local candidate=${PRIVATE_QEMU_PID-} argument expected matched
     local -a command
     if [[ -z $candidate && -n ${PRIVATE_RUN_DIR-} && -r $PRIVATE_RUN_DIR/qemu.pid ]]; then
-        candidate=$(<"$PRIVATE_RUN_DIR/qemu.pid") || return 64
+        candidate=$(<"$PRIVATE_RUN_DIR/qemu.pid") || candidate=
     fi
+    PRIVATE_QEMU_PID=
     [[ $candidate =~ ^[0-9]+$ && -r /proc/$candidate/cmdline ]] || return 64
     mapfile -d '' -t command <"/proc/$candidate/cmdline" || return 64
     [[ ${command[0]##*/} == qemu-system-x86_64 ]] || return 64
-    for argument in "${command[@]}"; do
-        if [[ $argument == *"file=$PRIVATE_RUN_DIR/runtime.qcow2,"* ]]; then
-            matched=1
-        fi
+    for expected in \
+        "file=$PRIVATE_RUN_DIR/runtime.qcow2,if=virtio,format=qcow2" \
+        "user,id=n1,hostfwd=tcp:127.0.0.1:$PRIVATE_PORT-:22" \
+        "file:$PRIVATE_RUN_DIR/runtime.serial.log" "$PRIVATE_RUN_DIR/qemu.pid"; do
+        matched=0
+        for argument in "${command[@]}"; do
+            [[ $argument != "$expected" ]] || matched=1
+        done
+        (( matched == 1 )) || return 64
     done
-    (( matched == 1 )) || return 64
     PRIVATE_QEMU_PID=$candidate
 }
 
 private_cleanup_lane() {
     local rc
-    [[ ${PRIVATE_LANE_OWNED-0} == 1 ]] || return 0
-    if [[ ${PRIVATE_LANE_CLEANED-0} == 1 ]]; then
+    [[ ${PRIVATE_LANE_OWNED-0} == 1 ]] || { [[ ${PRIVATE_LANE_INTERRUPTED-0} != 1 ]] && return 0 || return 64; }
+    if [[ ${PRIVATE_LANE_CLEANUP-idle} == done ]]; then
         return "${PRIVATE_FINISH_RC-0}"
     fi
-    PRIVATE_LANE_CLEANED=1
+    [[ ${PRIVATE_LANE_CLEANUP-idle} == idle ]] || return 64
+    PRIVATE_LANE_CLEANUP=running
     if private_finish_lane; then rc=0; else rc=$?; fi
+    (( PRIVATE_LANE_INTERRUPTED != 1 )) || rc=64
     PRIVATE_FINISH_RC=$rc
+    PRIVATE_LANE_CLEANUP=done
     PRIVATE_LANE_OWNED=0
     return "$rc"
 }
 
 private_lane_trap() {
     local signal=$1
+    if [[ $signal != EXIT && ${PRIVATE_LANE_CLEANUP-idle} == running ]]; then
+        PRIVATE_LANE_INTERRUPTED=1
+        return 0
+    fi
     private_cleanup_lane || true
     if [[ $signal != EXIT ]]; then
         trap - EXIT INT TERM
@@ -405,7 +503,7 @@ private_disarm_lane_traps() {
 }
 
 private_finish_lane() {
-    local shutdown_rc=0 post_rc=0 forced=0 unexpected_exit=0 attempt
+    local shutdown_rc=0 post_rc=0 forced=0 unexpected_exit=0 attempt wait_rc=0
     if [[ ${PRIVATE_LANE_OWNED-0} == 1 ]] && ! private_recover_qemu_pid; then
         post_rc=64
     fi
@@ -414,17 +512,32 @@ private_finish_lane() {
             >"$PRIVATE_RUN_DIR/shutdown.stdout" 2>"$PRIVATE_RUN_DIR/shutdown.stderr" || shutdown_rc=$?
         printf '%s\n' "$shutdown_rc" >"$PRIVATE_RUN_DIR/shutdown.status" || post_rc=64
         for attempt in $(seq 1 120); do
-            [[ ! -r /proc/$PRIVATE_QEMU_PID/stat ]] && break
+            if [[ ! -r /proc/$PRIVATE_QEMU_PID/stat ]]; then
+                PRIVATE_QEMU_PID=
+                break
+            fi
+            private_recover_qemu_pid || { wait_rc=64; break; }
             sleep 1
         done
-        if [[ -r /proc/$PRIVATE_QEMU_PID/stat ]]; then
-            kill "$PRIVATE_QEMU_PID" || true
+        (( wait_rc == 0 )) || post_rc=64
+        if [[ -n $PRIVATE_QEMU_PID && -r /proc/$PRIVATE_QEMU_PID/stat ]]; then
+            if ! private_recover_qemu_pid; then
+                post_rc=64
+            elif ! kill "$PRIVATE_QEMU_PID"; then
+                post_rc=64
+            else
+                forced=1
+            fi
             for attempt in $(seq 1 10); do
-                [[ ! -r /proc/$PRIVATE_QEMU_PID/stat ]] && break
+                [[ -n $PRIVATE_QEMU_PID ]] || break
+                if [[ ! -r /proc/$PRIVATE_QEMU_PID/stat ]]; then
+                    PRIVATE_QEMU_PID=
+                    break
+                fi
+                private_recover_qemu_pid || { post_rc=64; break; }
                 sleep 1
             done
-            [[ ! -r /proc/$PRIVATE_QEMU_PID/stat ]] || return 64
-            forced=1
+            [[ -z $PRIVATE_QEMU_PID || ! -r /proc/$PRIVATE_QEMU_PID/stat ]] || post_rc=64
         fi
     elif [[ -n ${PRIVATE_QEMU_PID-} ]]; then
         unexpected_exit=1
@@ -539,7 +652,8 @@ gate_a_lane() {
     flock -n "$lifecycle_lock" || return 64
     PRIVATE_QEMU_PID=
     PRIVATE_LANE_OWNED=0
-    PRIVATE_LANE_CLEANED=0
+    PRIVATE_LANE_CLEANUP=idle
+    PRIVATE_LANE_INTERRUPTED=0
     PRIVATE_FINISH_RC=0
     private_arm_lane_traps
     private_start_lane "$lane" "$run_dir" || {
@@ -911,7 +1025,8 @@ provision_jammy() {
     flock -n "$lifecycle_lock" || return 64
     PRIVATE_QEMU_PID=
     PRIVATE_LANE_OWNED=0
-    PRIVATE_LANE_CLEANED=0
+    PRIVATE_LANE_CLEANUP=idle
+    PRIVATE_LANE_INTERRUPTED=0
     PRIVATE_FINISH_RC=0
     private_arm_lane_traps
     private_start_lane jammy "$run_dir" || {

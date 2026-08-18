@@ -4720,7 +4720,30 @@ mod tests {
         assert!(source.contains("while interface_index < 16"));
         assert!(source.contains("#[inline(never)]\nfn emit_interface("));
         assert!(source.contains("if !emit_interface("));
-        assert!(source.contains("while word < 112"));
+        let invocation = source
+            .split("zero_words!(words;")
+            .nth(1)
+            .expect("zero_words! invocation")
+            .split(')')
+            .next()
+            .unwrap();
+        let mut indexes: Vec<usize> = invocation
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let raw_len = indexes.len();
+        indexes.sort_unstable();
+        indexes.dedup();
+        assert_eq!(raw_len, 112, "each index exactly once");
+        assert_eq!(
+            indexes,
+            (0..112).collect::<Vec<_>>(),
+            "complete index set 0..=111"
+        );
+        assert!(source.contains("core::ptr::write_volatile($words.add($k), 0u64)"));
+        assert!(!source.contains("while word < 112"));
         assert!(source.contains("DISCOVERY.reserve::<SignalRecord>(0)"));
         assert!(source.contains("increment_counter(LATE_HITS)"));
         let signal = source.find("pub fn signal_return(").unwrap();
@@ -4756,9 +4779,7 @@ mod tests {
                 .count(),
             1
         );
-        let discovery_unsafe_start = source
-            .find("unsafe {\n        let mut word = 0usize;")
-            .unwrap();
+        let discovery_unsafe_start = source.find("unsafe {\n        zero_words!(words;").unwrap();
         let discovery_unsafe_end =
             source[discovery_unsafe_start..].find("\n    }").unwrap() + discovery_unsafe_start;
         let discovery_submit = source.find("entry.submit(0);").unwrap();

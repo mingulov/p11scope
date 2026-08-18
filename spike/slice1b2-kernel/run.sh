@@ -1086,6 +1086,8 @@ build_bpf() {
         >"$output/bpf-build.stdout" 2>"$output/bpf-build.stderr"
     object=$here/ebpf/target/bpfel-unknown-none/release/slice1b2-kernel-ebpf
     install -m 0600 "$object" "$output/slice1b2-kernel-ebpf"
+    objdump_bin=$(rustc +nightly --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-objdump
+    python3 "$here/check-init-shape.py" "$output/slice1b2-kernel-ebpf" "$objdump_bin" || return 64
     printf '%s\n' "$rustc_verbose" >"$output/nightly.txt"
     python3 - "$output/source.tar" "$output/slice1b2-kernel-ebpf" \
         "$(git -C "$root" rev-parse HEAD)" "$output/source-elf.manifest" <<'PY'

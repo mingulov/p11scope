@@ -84,6 +84,13 @@ struct EmitArgs {
     read_table: bool,
 }
 
+/// Corrective design §4.1: exactly 112 straight-line `write_volatile(words.add(K), 0u64)` calls,
+/// K = 0..=111, each once. Volatile keeps LLVM from re-folding them into `memset`, whose BPF
+/// lowering is an 896-iteration byte loop that exhausts the verifier under the 16-interface fan-out.
+macro_rules! zero_words {
+    ($words:expr; $($k:literal),* $(,)?) => { $( core::ptr::write_volatile($words.add($k), 0u64); )* };
+}
+
 fn emit_discovery(args: &EmitArgs) {
     let Some(mut entry) = DISCOVERY.reserve::<DiscoveryRecord>(0) else {
         increment_counter(RING_LOSS);
@@ -99,11 +106,15 @@ fn emit_discovery(args: &EmitArgs) {
     // SAFETY: reserve owns one writable 896-byte entry; DiscoveryRecord is repr(C), aligned to 8,
     // 112 u64 writes cover it exactly, and no reference/read/submit occurs before initialization.
     unsafe {
-        let mut word = 0usize;
-        while word < 112 {
-            core::ptr::write(words.add(word), 0);
-            word += 1;
-        }
+        zero_words!(words;
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+            16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+            32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+            48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+            64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
+            80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95,
+            96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111,
+        );
         if args.read_table {
             match helpers::bpf_probe_read_user(args.table_ptr as *const [u8; 2]) {
                 Ok(version) => {

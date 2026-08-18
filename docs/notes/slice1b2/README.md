@@ -16,7 +16,7 @@ separately permissioned (corrective design §9.4).
 | `gate-b/` | Gate B evidence exports and run dirs (Task 5 campaign `final6-*`, retained iteration/failing-run evidence `final1`–`final5`, `task4-*`) |
 | `loader/` | Loader witness harness canonical round-2 transcripts and artifacts (`loader/round2/`), retained round-1 diagnostics (`loader/round1/`) |
 | `bundles/` | Frozen execution bundles (`task4-37c5b41-bundle/`: runner, fixture, `slice1b2-kernel-ebpf`, manifests; `diag-9da22b6-bundle/`: same BPF + fixture bytes re-frozen with the `gate-a-diag` runner) |
-| `MANIFEST.sha256` | SHA-256 of every file in the root except itself. Digest: `e4fb5bdac88d2f737a1dd283f5ccca5510d2cafc9239253e56698274f8f614ef` |
+| `MANIFEST.sha256` | SHA-256 of every file in the root except itself (2,794 files after Task 6). Digest: `004ccdfded0361d65765aff7016023ae4ba08f7f49a3e58b0d438c89cc90b5bf` |
 
 The tracked, scrubbed witness harness itself is `spike/slice1b2-loader/`
 (repo-relative `run-lanes.sh`, lane-filterable, driven by
@@ -164,4 +164,29 @@ jammy before the campaign).
 
 ## Loader precontrols (Task 6) and event-path facts (Task 7)
 
-(filled by Tasks 6–7.)
+### Task 6 — released-glibc controls and DT_NEEDED precontrols (COMPLETE)
+
+Harness commits `d374bb2` (lanes/kind/provenance), `fedcb1e` (dl-open.c discovery
+depth fix), `cfb9975` (provenance grep widened to the signalling lines); full
+provenance in `glibc-31986-provenance.md`.
+
+Lanes run from committed HEADs on `spike/slice1b2-gates`; transcripts at
+`loader/<lane>-<kind>-transcript.log`, per-run artifacts under `loader/round3/artifacts/<lane>-<kind>/`
+(the round-2 snapshot is preserved untouched). Container names `p11scope-slice1b2-r3-*`.
+
+- **Step 2 (dlopen, new lanes)**: `glibc-241-debian13` (libc6 2.41-12+deb13u3) **PASS**
+  and `glibc-24x-ubuntu2604` (libc6 2.43-2ubuntu2.3) **PASS** — first post-`RT_ADD`
+  `RT_CONSISTENT` witness `PASS_EQUAL` before ctor; source provenance shows
+  `_dl_relocate_object` (dl-open.c:486) before `_dl_debug_change_state (r, RT_CONSISTENT)`
+  (dl-open.c:784) in the as-shipped 2.41 source; no reverting patch.
+  A first attempt (`glibc-241-debian13-dlopen-attempt1-harness-bug.log`) BLOCKED on a
+  harness bug (find depth); preserved.
+- **Step 4 (initial_set, all five lanes)**: **PASS ×5** — 2.35, 2.39, 2.41, 2.43, musl.
+  Each glibc transcript retains the earlier startup hit as `PRE_MAPPING`
+  (`r_state=1`, witness `BLOCKED`) before the decisive `RT_CONSISTENT` hit.
+  This confirms the bug-31986 defect is **dlopen-path-specific**: startup signals
+  `RT_CONSISTENT` after relocation on every glibc tested (as the `43db5e2c` commit
+  message states), while the round-2 dlopen transcripts keep `FAIL_ZERO` on 2.35/2.39.
+- Round-2 history (dlopen kind) unchanged: 2.35/2.39 `FAIL` (`FAIL_ZERO`), musl `PASS`.
+
+(Task 7 pending.)

@@ -39,6 +39,9 @@ pub struct Slot {
     /// the group, never to one name.
     pub aliased: bool,
     pub semantics: SlotSemantics,
+    /// True only when every surviving canonical-name claim at this exact
+    /// pinned target is operator-attested. Scan-only claims stay count-only.
+    pub semantic_authorized: bool,
     /// At least one name was unknown, the aliased names disagreed, or two
     /// modules claim this target.
     pub semantic_ambiguous: bool,
@@ -202,6 +205,7 @@ struct Target<'a> {
     object_path: &'a str,
     file_offset: u64,
     fork_safe: bool,
+    semantic_authorized: bool,
 }
 
 /// One module lowered for `merge`.
@@ -224,7 +228,7 @@ struct Building {
     object: PinnedObjectId,
     object_path: String,
     file_offset: u64,
-    names: Vec<String>,
+    name_authority: BTreeMap<String, bool>,
     fork_safe: bool,
     module_ids: Vec<ModuleId>,
 }
@@ -308,7 +312,7 @@ fn merge(
             for target in &module.targets {
                 let record = (target.name.to_string(), target.object, target.file_offset);
                 let occurrence = target_occurrences.entry(record.clone()).or_insert(0usize);
-                seen_targets.insert((module.source, record.0, record.1, record.2, *occurrence));
+                seen_targets.insert((record.0, record.1, record.2, *occurrence));
                 *occurrence += 1;
                 let position = *positions
                     .entry((target.object, target.file_offset))
@@ -317,7 +321,7 @@ fn merge(
                             object: target.object,
                             object_path: target.object_path.to_string(),
                             file_offset: target.file_offset,
-                            names: Vec::new(),
+                            name_authority: BTreeMap::new(),
                             fork_safe: true,
                             module_ids: Vec::new(),
                         });
@@ -329,7 +333,10 @@ fn merge(
                 if !slot.module_ids.contains(&id) {
                     slot.module_ids.push(id);
                 }
-                slot.names.push(target.name.to_string());
+                slot.name_authority
+                    .entry(target.name.to_string())
+                    .and_modify(|authorized| *authorized |= target.semantic_authorized)
+                    .or_insert(target.semantic_authorized);
                 slot.fork_safe &= target.fork_safe;
             }
             let summary = &mut modules[id.0 as usize];
@@ -394,10 +401,10 @@ fn merge(
     let slots: Vec<Slot> = building
         .into_iter()
         .enumerate()
-        .map(|(index, mut slot)| {
-            slot.names.sort();
-            slot.names.dedup();
-            let (semantics, semantic_ambiguous) = crate::kinds::descriptor_slot(&slot.names);
+        .map(|(index, slot)| {
+            let names: Vec<_> = slot.name_authority.keys().cloned().collect();
+            let semantic_authorized = slot.name_authority.values().all(|value| *value);
+            let (semantics, semantic_ambiguous) = crate::kinds::descriptor_slot(&names);
             // Counts through a target two modules both publish cannot be attributed
             // to either, so the slot may not carry semantics — it is counted, and the
             // report says it was not attributed.
@@ -407,13 +414,14 @@ fn merge(
                 object: slot.object,
                 object_path: slot.object_path,
                 file_offset: slot.file_offset,
-                aliased: slot.names.len() >= 2,
-                names: slot.names,
-                semantics: if shared {
+                aliased: names.len() >= 2,
+                names,
+                semantics: if shared || !semantic_authorized {
                     SlotSemantics::COUNT_ONLY
                 } else {
                     semantics
                 },
+                semantic_authorized,
                 semantic_ambiguous: semantic_ambiguous || shared,
                 fork_safe: slot.fork_safe,
                 module_ids: slot.module_ids,
@@ -534,6 +542,7 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
                 object_path: &entry.object_path,
                 file_offset: entry.file_offset,
                 fork_safe,
+                semantic_authorized: false,
             },
         ));
         skipped.extend(table.null_entries.iter().map(|name| Skipped {
@@ -680,6 +689,7 @@ fn lower_manifest(
                         object_path: &record.path,
                         file_offset: *file_offset,
                         fork_safe,
+                        semantic_authorized: true,
                     });
                 }
                 Resolution::NullPointer => skip("null pointer".into()),
@@ -880,6 +890,97 @@ mod tests {
     }
 
     #[test]
+    fn scan_only_target_is_unverified_and_count_only() {
+        let scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
+
+        let plan = build_from_reconciled_modules(std::slice::from_ref(&scanned));
+
+        assert_eq!(plan.slots.len(), 1);
+        assert_eq!(plan.entries_seen, 1);
+        assert_eq!(plan.slots[0].names, ["C_Sign"]);
+        assert_eq!(plan.slots[0].semantics, SlotSemantics::COUNT_ONLY);
+        assert!(!plan.slots[0].semantic_authorized);
+        assert!(
+            !plan.slots[0].semantic_ambiguous,
+            "missing semantic authority is not alias or module ambiguity"
+        );
+    }
+
+    #[test]
+    fn identical_scan_and_manifest_claim_counts_one_entry() {
+        let scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
+        let manifest = manifest_with(vec![resolved("C_Sign", 0x10)]);
+
+        let plan = build_from_test_sources(
+            std::slice::from_ref(&scanned),
+            std::slice::from_ref(&manifest),
+        );
+
+        assert_eq!(plan.modules.len(), 1);
+        assert_eq!(plan.modules[0].tables.len(), 2, "both sources stay visible");
+        assert_eq!(plan.slots.len(), 1);
+        assert_eq!(plan.entries_seen, 1, "one published table position");
+        assert!(plan.slots[0].semantic_authorized);
+        assert_eq!(
+            plan.slots[0].semantics,
+            crate::kinds::descriptor("C_Sign").unwrap()
+        );
+    }
+
+    #[test]
+    fn manifest_cannot_authorize_a_different_name_at_the_same_target() {
+        let scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
+        let manifest = manifest_with(vec![resolved("C_Login", 0x10)]);
+
+        let plan = build_from_test_sources(
+            std::slice::from_ref(&scanned),
+            std::slice::from_ref(&manifest),
+        );
+
+        assert_eq!(plan.slots.len(), 1);
+        assert_eq!(plan.slots[0].names, ["C_Login", "C_Sign"]);
+        assert!(!plan.slots[0].semantic_authorized);
+        assert_eq!(plan.slots[0].semantics, SlotSemantics::COUNT_ONLY);
+        assert!(plan.slots[0].semantic_ambiguous);
+    }
+
+    #[test]
+    fn raw_key_cannot_authorize_a_distinct_pinned_object() {
+        let mut scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
+        let scanned_object = PinnedObjectId(200);
+        scanned.object = scanned_object;
+        scanned.entry_objects[0][0] = scanned_object;
+        let manifest = manifest_with(vec![resolved("C_Sign", 0x10)]);
+        let manifest_object = PinnedObjectId(100);
+
+        let plan = build_from_sources_with(
+            std::slice::from_ref(&scanned),
+            std::slice::from_ref(&manifest),
+            |_, _| Some(manifest_object),
+        );
+
+        assert_eq!(plan.slots.len(), 2, "distinct pinned objects stay distinct");
+        let scan_slot = plan
+            .slots
+            .iter()
+            .find(|slot| slot.object == scanned_object)
+            .unwrap();
+        assert_eq!(scan_slot.semantics, SlotSemantics::COUNT_ONLY);
+        assert!(!scan_slot.semantic_authorized);
+        assert!(!scan_slot.semantic_ambiguous);
+        let manifest_slot = plan
+            .slots
+            .iter()
+            .find(|slot| slot.object == manifest_object)
+            .unwrap();
+        assert_eq!(
+            manifest_slot.semantics,
+            crate::kinds::descriptor("C_Sign").unwrap()
+        );
+        assert!(manifest_slot.semantic_authorized);
+    }
+
+    #[test]
     fn unresolvable_entries_become_skipped_evidence() {
         let m = manifest_with(vec![
             resolved("C_Sign", 0x10),
@@ -996,6 +1097,7 @@ mod tests {
                     names: vec!["C_Initialize".into()],
                     aliased: false,
                     semantics: SlotSemantics::COUNT_ONLY,
+                    semantic_authorized: true,
                     semantic_ambiguous: false,
                     fork_safe: false,
                     module_ids: vec![ModuleId(0)],

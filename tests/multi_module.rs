@@ -71,6 +71,19 @@ fn build_from_modules(modules: &[p11scope::discovery::scan::ScannedModule]) -> A
     build_from_reconciled_modules(&reconciled)
 }
 
+/// These tests exercise module-scoped semantic state, not discovery trust.
+/// Model the accepted-manifest authority their semantic inputs require.
+fn build_authorized_from_modules(
+    modules: &[p11scope::discovery::scan::ScannedModule],
+) -> AttachPlan {
+    let mut plan = build_from_modules(modules);
+    for slot in &mut plan.slots {
+        slot.semantic_authorized = true;
+        slot.semantics = p11scope::kinds::descriptor_slot(&slot.names).0;
+    }
+    plan
+}
+
 #[test]
 fn equal_raw_keys_with_distinct_pinned_objects_never_share_slots() {
     let reconcile = |module, object, targets: Vec<u32>| ReconciledModule {
@@ -302,7 +315,7 @@ fn session_event(slot: u32, handle: u64) -> Event {
 
 #[test]
 fn equal_session_handles_from_two_modules_do_not_interact() {
-    let plan = build_from_modules(&[
+    let plan = build_authorized_from_modules(&[
         module(
             10,
             "/opt/proxy.so",
@@ -372,7 +385,7 @@ fn equal_session_handles_from_two_modules_do_not_interact() {
 
 #[test]
 fn one_modules_finalize_does_not_retire_another_modules_state() {
-    let plan = build_from_modules(&[
+    let plan = build_authorized_from_modules(&[
         module(
             10,
             "/opt/proxy.so",
@@ -433,7 +446,7 @@ fn a_second_finalize_reporting_not_initialized_stays_within_its_module() {
     // The standard idempotent teardown: C_Finalize, then C_Finalize again,
     // which the module answers CKR_CRYPTOKI_NOT_INITIALIZED. That answer is
     // about the module that gave it, never about the process.
-    let plan = build_from_modules(&[
+    let plan = build_authorized_from_modules(&[
         module(
             10,
             "/opt/proxy.so",

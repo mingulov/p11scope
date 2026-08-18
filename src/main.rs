@@ -827,10 +827,14 @@ fn build_current_plan(
     let mut plan = plan::build_from_sources(modules, manifests, pinned);
     record_object_skips(&mut plan, &counters.object_skips);
     for (view, key) in corroborated {
-        if modules
+        if let Some(object) = modules
             .iter()
-            .any(|module| module.scanned.view == *view && module.scanned.key == *key)
-            && let Some(summary) = plan.modules.iter_mut().find(|module| module.key == *key)
+            .find(|module| module.scanned.view == *view && module.scanned.key == *key)
+            .map(|module| module.object)
+            && let Some(summary) = plan
+                .modules
+                .iter_mut()
+                .find(|module| module.object == object)
         {
             summary.corroborated = true;
             if summary.source == "scan" {
@@ -1784,6 +1788,16 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
                         .flat_map(|view| &view.modules)
                         .map(|module| (module.view, module.key)),
                 );
+                retarget_to_pins(
+                    &mut manifest,
+                    view.as_ref().map_or(&[], |view| view.modules.as_slice()),
+                    &pinned,
+                    manifest_pins,
+                );
+                accepted.push(manifest);
+                counters
+                    .object_skips
+                    .extend(pinned.absorb(manifest_pins.clone()));
             }
             Corroboration::ScanEmpty => {
                 counters.notes.push(format!(
@@ -2772,6 +2786,11 @@ mod tests {
         assert_eq!(discovered.plan.modules[0].source, "scan");
         assert_eq!(discovered.plan.slots.len(), 1);
         assert_eq!(discovered.plan.slots[0].file_offset, scan_offset);
+        assert!(!discovered.plan.slots[0].semantic_authorized);
+        assert_eq!(
+            discovered.plan.slots[0].semantics,
+            p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+        );
         assert_eq!(discovered.counters.manifest_fallbacks.len(), 1);
         assert_eq!(discovered.counters.uncorroborated, 1);
         assert_eq!(discovered.discovery.manifest_object_fallbacks.len(), 1);
@@ -3080,7 +3099,10 @@ mod tests {
         );
         assert_eq!(sources_for(&replaced), Some(["scan"].as_slice()));
         assert_eq!(sources_for(&fresh), Some(["manifest"].as_slice()));
-        assert_eq!(discovered.plan.entries_seen, 134);
+        assert_eq!(
+            discovered.plan.entries_seen, 72,
+            "62 exact scan/manifest claims count once; distinct claims remain"
+        );
         assert_eq!(discovered.plan.surfaces.len(), 2);
         assert_eq!(
             discovered.plan.modules[0]
@@ -3438,12 +3460,22 @@ mod tests {
         let mut discovered = discovered_from_inputs(vec![view], modules, pins, vec![input]);
         assert_eq!(discovered.plan.slots.len(), 1);
         assert_eq!(discovered.plan.modules[0].source, "scan+manifest");
+        assert!(
+            discovered.plan.slots[0].semantic_authorized,
+            "an agreed explicit manifest remains an exact plan claim"
+        );
+        assert_eq!(
+            discovered.plan.slots[0].semantics,
+            p11scope::kinds::descriptor("C_Sign").unwrap()
+        );
+        assert_eq!(discovered.plan.entries_seen, 1);
 
         remove_stale_views(&mut discovered, &[stale]).unwrap();
 
         assert_eq!(discovered.plan.slots.len(), 1);
         assert_eq!(discovered.plan.slots[0].names, ["C_Sign"]);
         assert_eq!(discovered.plan.slots[0].file_offset, 0x40);
+        assert!(discovered.plan.slots[0].semantic_authorized);
         assert_eq!(discovered.plan.modules[0].source, "manifest");
         assert_eq!(discovered.counters.uncorroborated, 1);
         assert_eq!(discovered.identity_mismatches, 0);
@@ -3550,6 +3582,67 @@ mod tests {
             discovered.discovery.modules[0].corroboration,
             ["uncorroborated"]
         );
+    }
+
+    #[test]
+    fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
+        let key = ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 42,
+        };
+        let module = |view, object, path: &str, offset| ReconciledModule {
+            object,
+            entry_objects: vec![vec![object]],
+            scanned: ScannedModule {
+                view,
+                mount_namespace: current_mount_namespace(),
+                key,
+                path: path.into(),
+                exports: vec!["C_GetFunctionList".into()],
+                tables: vec![ScannedTable {
+                    version: (2, 40),
+                    walk: "full",
+                    entries: vec![ScannedEntry {
+                        name: "C_Sign",
+                        object: key,
+                        object_path: path.into(),
+                        file_offset: offset,
+                    }],
+                    null_entries: vec![],
+                    unpinned: vec![],
+                    address: 0x7000 + offset,
+                }],
+                interfaces: vec![],
+            },
+        };
+        let first = module(ProcessViewId(0), PinnedObjectId(100), "/first.so", 0x10);
+        let second = module(ProcessViewId(1), PinnedObjectId(200), "/second.so", 0x20);
+        let mut counters = DiscoveryCounters::default();
+        let plan = build_current_plan(
+            &[first, second],
+            &[],
+            &PinnedObjects::empty(),
+            &mut counters,
+            &[(ProcessViewId(1), key)].into_iter().collect(),
+            0,
+            0,
+        )
+        .unwrap();
+
+        let first = plan
+            .modules
+            .iter()
+            .find(|module| module.object == PinnedObjectId(100))
+            .unwrap();
+        let second = plan
+            .modules
+            .iter()
+            .find(|module| module.object == PinnedObjectId(200))
+            .unwrap();
+        assert!(!first.corroborated);
+        assert_eq!(first.source, "scan");
+        assert!(second.corroborated);
+        assert_eq!(second.source, "scan+manifest");
     }
 
     struct FailingWriter {
@@ -4066,6 +4159,7 @@ mod tests {
                     names: vec!["C_Sign".into()],
                     aliased: false,
                     semantics: p11scope_ebpf_common::SlotSemantics::COUNT_ONLY,
+                    semantic_authorized: true,
                     semantic_ambiguous: false,
                     fork_safe: false,
                     module_ids: vec![plan::ModuleId(0)],

@@ -1,7 +1,6 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
-#include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stddef.h>
@@ -199,60 +198,41 @@ static void read_byte(int fd) {
 
 struct worker_args {
     int ready;
-    int release;
     int marker;
 };
 
 static pthread_barrier_t marker_barrier;
 
-static atomic_int hook_arrived;
-static atomic_int hook_go;
+static atomic_int hook_release;
 
-static void hook_spin_barrier(void) {
-    /* Two-party user-mode spin barrier. Both threads must leave toward their
-     * stop hooks from user mode within nanoseconds of each other: the CAS
-     * winner's SIGSTOP can only stop the sibling at a kernel return-to-user
-     * boundary, so once the sibling has entered its uprobe (int3) its record
-     * is submitted before the stop can bite. A futex barrier releases the
-     * woken thread through the kernel and loses that race about half the
-     * time; this spin barrier leaves both threads in user mode. The spin is
-     * bounded (200 ms) so a missing peer can never hang the child. */
-    int previous = atomic_fetch_add_explicit(&hook_arrived, 1, memory_order_acq_rel);
-    if (previous == 1) {
-        atomic_store_explicit(&hook_go, 1, memory_order_release);
-        return;
-    }
+static void *worker_main(void *opaque) {
+    struct worker_args *args = opaque;
+    write_byte(args->ready, 'W');
+    /* Pre-position this thread in user mode before the host releases the
+     * child: a pending SIGSTOP can only stop this thread at a kernel
+     * return-to-user boundary, so after the main thread stores hook_release
+     * both threads run straight to their stop hooks with no kernel transit,
+     * and the CAS winner's SIGSTOP cannot preempt the sibling's uprobe (its
+     * record is submitted inside the kernel before the stop can bite).
+     * Bounded (2 s) so a missing release can never hang the child. */
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
     long spins = 0;
-    while (!atomic_load_explicit(&hook_go, memory_order_acquire)) {
+    while (!atomic_load_explicit(&hook_release, memory_order_acquire)) {
         if ((++spins & 0xffff) == 0) {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
             long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000L
                 + (now.tv_nsec - start.tv_nsec) / 1000000L;
-            if (elapsed_ms > 200) {
-                break;
+            if (elapsed_ms > 2000) {
+                fputs("worker release timeout\n", stderr);
+                return (void *)1;
             }
         }
 #if defined(__x86_64__)
         __asm__ __volatile__("pause");
 #endif
     }
-}
-
-static void *worker_main(void *opaque) {
-    struct worker_args *args = opaque;
-    write_byte(args->ready, 'W');
-    struct pollfd pollfd = {.fd = args->release, .events = POLLIN, .revents = 0};
-    while (poll(&pollfd, 1, -1) < 0) {
-        if (errno != EINTR) {
-            perror("poll");
-            return (void *)1;
-        }
-    }
-    read_byte(args->release);
-    hook_spin_barrier();
     spike_stop_hook_b();
     /* the CAS winner is stopped at its hook exit, so neither thread can pass
      * this barrier before the host resumes the process: markers are provably
@@ -265,8 +245,7 @@ static void *worker_main(void *opaque) {
 
 static void run_signal_case(int release_fd, int fixture_ready_fd, int marker_fd) {
     int worker_ready[2];
-    int worker_release[2];
-    if (pipe(worker_ready) != 0 || pipe(worker_release) != 0) {
+    if (pipe(worker_ready) != 0) {
         perror("pipe");
         exit(1);
     }
@@ -276,7 +255,6 @@ static void run_signal_case(int release_fd, int fixture_ready_fd, int marker_fd)
     }
     struct worker_args args = {
         .ready = worker_ready[1],
-        .release = worker_release[0],
         .marker = marker_fd,
     };
     pthread_t worker;
@@ -287,8 +265,9 @@ static void run_signal_case(int release_fd, int fixture_ready_fd, int marker_fd)
     read_byte(worker_ready[0]);
     write_byte(fixture_ready_fd, 'R');
     read_byte(release_fd);
-    write_byte(worker_release[1], 'X');
-    hook_spin_barrier();
+    /* the worker is already spinning in user mode on this flag: both threads
+     * reach their stop hooks from user mode with no kernel transit */
+    atomic_store_explicit(&hook_release, 1, memory_order_release);
     spike_stop_hook();
     pthread_barrier_wait(&marker_barrier);
     write_byte(marker_fd, 'M');
@@ -299,8 +278,6 @@ static void run_signal_case(int release_fd, int fixture_ready_fd, int marker_fd)
         exit(1);
     }
     pthread_barrier_destroy(&marker_barrier);
-    close(worker_release[0]);
-    close(worker_release[1]);
     close(worker_ready[0]);
     close(worker_ready[1]);
 }

@@ -742,6 +742,8 @@ private_recover_qemu_pid() {
     PRIVATE_QEMU_PID=
     [[ $candidate =~ ^[0-9]+$ && -r /proc/$candidate/cmdline ]] || return 64
     mapfile -d '' -t command <"/proc/$candidate/cmdline" || return 64
+    # A reaped-or-zombie qemu has an empty cmdline; it cannot be confirmed live.
+    (( ${#command[@]} > 0 )) || return 64
     [[ ${command[0]##*/} == qemu-system-x86_64 ]] || return 64
     for expected in \
         "file=$PRIVATE_RUN_DIR/runtime.qcow2,if=virtio,format=qcow2" \
@@ -809,6 +811,12 @@ private_finish_lane() {
                 PRIVATE_QEMU_PID=
                 break
             fi
+            # An exited-but-unreaped qemu is a zombie with empty cmdline; treat it as gone
+            # instead of crashing private_recover_qemu_pid on its empty argv.
+            if [[ $(awk '{print $3}' /proc/$PRIVATE_QEMU_PID/stat 2>/dev/null) == Z ]]; then
+                PRIVATE_QEMU_PID=
+                break
+            fi
             private_recover_qemu_pid || { wait_rc=64; break; }
             sleep 1
         done
@@ -824,6 +832,10 @@ private_finish_lane() {
             for attempt in $(seq 1 10); do
                 [[ -n $PRIVATE_QEMU_PID ]] || break
                 if [[ ! -r /proc/$PRIVATE_QEMU_PID/stat ]]; then
+                    PRIVATE_QEMU_PID=
+                    break
+                fi
+                if [[ $(awk '{print $3}' /proc/$PRIVATE_QEMU_PID/stat 2>/dev/null) == Z ]]; then
                     PRIVATE_QEMU_PID=
                     break
                 fi

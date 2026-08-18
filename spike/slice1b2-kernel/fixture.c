@@ -3,12 +3,14 @@
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PROBE_TARGET __attribute__((noinline, used, visibility("default")))
@@ -201,8 +203,43 @@ struct worker_args {
     int marker;
 };
 
-static pthread_barrier_t hook_barrier;
 static pthread_barrier_t marker_barrier;
+
+static atomic_int hook_arrived;
+static atomic_int hook_go;
+
+static void hook_spin_barrier(void) {
+    /* Two-party user-mode spin barrier. Both threads must leave toward their
+     * stop hooks from user mode within nanoseconds of each other: the CAS
+     * winner's SIGSTOP can only stop the sibling at a kernel return-to-user
+     * boundary, so once the sibling has entered its uprobe (int3) its record
+     * is submitted before the stop can bite. A futex barrier releases the
+     * woken thread through the kernel and loses that race about half the
+     * time; this spin barrier leaves both threads in user mode. The spin is
+     * bounded (200 ms) so a missing peer can never hang the child. */
+    int previous = atomic_fetch_add_explicit(&hook_arrived, 1, memory_order_acq_rel);
+    if (previous == 1) {
+        atomic_store_explicit(&hook_go, 1, memory_order_release);
+        return;
+    }
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    long spins = 0;
+    while (!atomic_load_explicit(&hook_go, memory_order_acquire)) {
+        if ((++spins & 0xffff) == 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000L
+                + (now.tv_nsec - start.tv_nsec) / 1000000L;
+            if (elapsed_ms > 200) {
+                break;
+            }
+        }
+#if defined(__x86_64__)
+        __asm__ __volatile__("pause");
+#endif
+    }
+}
 
 static void *worker_main(void *opaque) {
     struct worker_args *args = opaque;
@@ -215,7 +252,7 @@ static void *worker_main(void *opaque) {
         }
     }
     read_byte(args->release);
-    pthread_barrier_wait(&hook_barrier);
+    hook_spin_barrier();
     spike_stop_hook_b();
     /* the CAS winner is stopped at its hook exit, so neither thread can pass
      * this barrier before the host resumes the process: markers are provably
@@ -233,8 +270,7 @@ static void run_signal_case(int release_fd, int fixture_ready_fd, int marker_fd)
         perror("pipe");
         exit(1);
     }
-    if (pthread_barrier_init(&hook_barrier, NULL, 2) != 0
-        || pthread_barrier_init(&marker_barrier, NULL, 2) != 0) {
+    if (pthread_barrier_init(&marker_barrier, NULL, 2) != 0) {
         fputs("pthread_barrier_init failed\n", stderr);
         exit(1);
     }
@@ -252,7 +288,7 @@ static void run_signal_case(int release_fd, int fixture_ready_fd, int marker_fd)
     write_byte(fixture_ready_fd, 'R');
     read_byte(release_fd);
     write_byte(worker_release[1], 'X');
-    pthread_barrier_wait(&hook_barrier);
+    hook_spin_barrier();
     spike_stop_hook();
     pthread_barrier_wait(&marker_barrier);
     write_byte(marker_fd, 'M');
@@ -263,7 +299,6 @@ static void run_signal_case(int release_fd, int fixture_ready_fd, int marker_fd)
         exit(1);
     }
     pthread_barrier_destroy(&marker_barrier);
-    pthread_barrier_destroy(&hook_barrier);
     close(worker_release[0]);
     close(worker_release[1]);
     close(worker_ready[0]);

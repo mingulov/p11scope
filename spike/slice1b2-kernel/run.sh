@@ -1005,6 +1005,16 @@ gate_lane() {
         printf '%s\n' "$gate_rc" >"$run_dir/$gate_name.status" || gate_rc=64
         case "$gate_rc" in
             0|1)
+                # Preserve the raw guest evidence in the private run directory
+                # before export validation can fail the lane: a later export or
+                # validator failure must never destroy the facts it rejected.
+                local -a guest_files
+                mapfile -t guest_files < <(fixed_inventory "$gate")
+                gate_ssh "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" \
+                    "sudo -n tar --format=posix --no-recursion -C $gate_dir -cf - ${guest_files[*]}" \
+                    >"$run_dir/guest-evidence.tar" 2>"$run_dir/guest-evidence.stderr" || {
+                    rm -f "$run_dir/guest-evidence.tar"
+                }
                 lane_rc=$gate_rc
                 export_evidence "$gate" "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" "$gate_dir" "$export_dir" "$lane_rc" \
                     >"$run_dir/export.stdout" 2>"$run_dir/export.stderr" || gate_rc=64

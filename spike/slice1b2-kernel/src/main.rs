@@ -1933,11 +1933,24 @@ fn run_gate_a_case(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let mut child = partial!(spawn_pinned_child(&mut command).map_err(|_| "gated child"));
-    let expected_pointer = partial!(runtime_symbol_address(
-        child.pid(),
-        *partial!(offsets.get("spike_pointer_target").ok_or("fixture offset")),
-        fixture_file,
-    ));
+    let pointer_offset = *partial!(offsets.get("spike_pointer_target").ok_or("fixture offset"));
+    // fork() returns before the child's exec() completes; until then /proc/<pid>/maps
+    // still shows the runner image, so resolve the fixture mapping with a bounded retry
+    let expected_pointer = partial!({
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match runtime_symbol_address(child.pid(), pointer_offset, fixture_file) {
+                Ok(address) => break Ok(address),
+                Err(reason @ ("process maps" | "fixture executable mapping")) => {
+                    if std::time::Instant::now() >= deadline {
+                        break Err(reason);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(reason) => break Err(reason),
+            }
+        }
+    });
     let target_offset = *partial!(offsets.get(target_name).ok_or("fixture offset"));
     facts.entry_attach_attempts = 1;
     let entry_link = partial!(attach_program(

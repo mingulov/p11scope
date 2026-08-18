@@ -572,6 +572,7 @@ strict_ssh_long() {
 
 private_start_lane() {
     local lane=$1 run_dir=$2 config retained official initial_serial port fingerprint
+    local accel_name boot_start boot_ok=0
     qemu_preflight || return
     config=$(lane_config "$lane") || return
     IFS='|' read -r retained initial_serial port fingerprint <<<"$config"
@@ -595,6 +596,14 @@ private_start_lane() {
     validate_backing_chain_file "$run_dir/backing-chain.before.json" \
         "$run_dir/runtime.qcow2" "$retained" "$official" || return 64
     require_free_bytes before-boot "$run_dir" >"$run_dir/free-space.before-boot.txt" || return 64
+    accel_name=${P11SCOPE_SPIKE_ACCEL:-tcg}
+    local -a accel
+    case "$accel_name" in
+        kvm) [[ -w /dev/kvm ]] || return 64; accel=(-accel kvm -cpu host) ;;
+        tcg) accel=(-accel tcg,thread=multi -cpu max) ;;
+        *) return 64 ;;
+    esac
+    printf 'accel=%s\n' "$accel_name" >"$run_dir/host-accel.txt" || return 64
     PRIVATE_RUN_DIR=$run_dir
     PRIVATE_RETAINED=$retained
     PRIVATE_OFFICIAL=$official
@@ -602,7 +611,8 @@ private_start_lane() {
     PRIVATE_FINGERPRINT=$fingerprint
     PRIVATE_KNOWN_HOSTS=$run_dir/known_hosts
     PRIVATE_LANE_OWNED=1
-    qemu-system-x86_64 -accel tcg,thread=multi -cpu max -machine q35 -m 1024 -smp 2 \
+    boot_start=$(date +%s.%N)
+    qemu-system-x86_64 "${accel[@]}" -machine q35 -m 1024 -smp 2 \
         -drive "file=$run_dir/runtime.qcow2,if=virtio,format=qcow2" \
         -netdev "user,id=n1,hostfwd=tcp:127.0.0.1:$port-:22" \
         -device virtio-net-pci,netdev=n1 -display none -serial "file:$run_dir/runtime.serial.log" \
@@ -635,12 +645,19 @@ private_start_lane() {
     ssh-keygen -lf "$PRIVATE_KNOWN_HOSTS" -E sha256 >"$run_dir/hostkey-fingerprint.txt" || return 64
     grep -F "$fingerprint" "$run_dir/hostkey-fingerprint.txt" >/dev/null || return 64
     for attempt in $(seq 1 120); do
-        if strict_ssh "$PRIVATE_KNOWN_HOSTS" "$port" true \
+        if strict_ssh "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" true \
             >"$run_dir/ssh-ready.stdout" 2>"$run_dir/ssh-ready.stderr"; then
-            return 0
+            boot_ok=1
+            break
         fi
         sleep 1
     done
+    if (( boot_ok )); then
+        awk -v s="$boot_start" -v e="$(date +%s.%N)" \
+            'BEGIN { printf "boot_to_ssh_s=%.3f\n", e - s }' \
+            >"$run_dir/boot-to-ssh.txt"
+        return 0
+    fi
     return 64
 }
 
@@ -890,6 +907,10 @@ gate_lane() {
             "cd $remote && sha256sum source-elf.manifest build-evidence.txt execution.manifest slice1b2-kernel-ebpf slice1b2-fixture slice1b2-runner" \
             >"$run_dir/bundle.guest.sha256" 2>"$run_dir/bundle-hash.stderr" || gate_rc=64
         cmp "$run_dir/bundle.host.sha256" "$run_dir/bundle.guest.sha256" || gate_rc=64
+    fi
+    if (( gate_rc == 0 )); then
+        strict_ssh "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" 'systemd-detect-virt; uname -r' \
+            >"$run_dir/virt.txt" 2>&1 || gate_rc=64
     fi
     if (( gate_rc == 0 )) && [[ $lane == noble ]]; then
         strict_ssh "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" \

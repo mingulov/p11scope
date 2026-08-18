@@ -65,7 +65,7 @@ if [ "$family" = glibc ]; then
             echo "PROVENANCE_DL_OPEN_PATH=$dl_open"
             sha256sum "$dl_open"
             echo "PROVENANCE_DL_OPEN_BEGIN"
-            grep -n -B12 -A6 -E '_dl_debug_state|dl_open_worker' "$dl_open" || true
+            grep -n -B12 -A6 -E '_dl_debug_state|dl_open_worker|_dl_debug_change_state|RT_CONSISTENT|_dl_relocate_object' "$dl_open" || true
             echo "PROVENANCE_DL_OPEN_END"
         fi
         echo "PROVENANCE_DEBIAN_PATCHES_TOUCHING_DL_OPEN_BEGIN"

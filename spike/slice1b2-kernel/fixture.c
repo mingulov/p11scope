@@ -202,6 +202,7 @@ struct worker_args {
 };
 
 static pthread_barrier_t hook_barrier;
+static pthread_barrier_t marker_barrier;
 
 static void *worker_main(void *opaque) {
     struct worker_args *args = opaque;
@@ -216,6 +217,10 @@ static void *worker_main(void *opaque) {
     read_byte(args->release);
     pthread_barrier_wait(&hook_barrier);
     spike_stop_hook_b();
+    /* the CAS winner is stopped at its hook exit, so neither thread can pass
+     * this barrier before the host resumes the process: markers are provably
+     * absent while stopped (spec §5.3: no protected marker before attach) */
+    pthread_barrier_wait(&marker_barrier);
     write_byte(args->marker, 'N');
     spike_late_target_b();
     return NULL;
@@ -228,7 +233,8 @@ static void run_signal_case(int release_fd, int fixture_ready_fd, int marker_fd)
         perror("pipe");
         exit(1);
     }
-    if (pthread_barrier_init(&hook_barrier, NULL, 2) != 0) {
+    if (pthread_barrier_init(&hook_barrier, NULL, 2) != 0
+        || pthread_barrier_init(&marker_barrier, NULL, 2) != 0) {
         fputs("pthread_barrier_init failed\n", stderr);
         exit(1);
     }
@@ -248,6 +254,7 @@ static void run_signal_case(int release_fd, int fixture_ready_fd, int marker_fd)
     write_byte(worker_release[1], 'X');
     pthread_barrier_wait(&hook_barrier);
     spike_stop_hook();
+    pthread_barrier_wait(&marker_barrier);
     write_byte(marker_fd, 'M');
     spike_late_target();
     void *worker_result = NULL;
@@ -255,6 +262,7 @@ static void run_signal_case(int release_fd, int fixture_ready_fd, int marker_fd)
         fputs("worker failed\n", stderr);
         exit(1);
     }
+    pthread_barrier_destroy(&marker_barrier);
     pthread_barrier_destroy(&hook_barrier);
     close(worker_release[0]);
     close(worker_release[1]);

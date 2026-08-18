@@ -13,10 +13,10 @@ separately permissioned (corrective design §9.4).
 | --- | --- |
 | `analyses/` | The four design-pinned corrective analyses plus every other retained `slice1b2-*.md` analysis/report from `/tmp` (raw addresses and paths inside; private) |
 | `gate-a/` | Retained Gate A six-file evidence exports and `.sha256` inventories (jammy, noble), the retained longer-diagnostic exports, and the D2 diagnostic lane run dirs (`diag-*`; disposable `runtime.qcow2` overlays deleted after each verified clean shutdown — retained bases were hash-pinned before/after in `retained.*.sha256`) |
-| `gate-b/` | Gate B exports (appended when produced) |
+| `gate-b/` | Gate B evidence exports and run dirs (Task 5 campaign `final6-*`, retained iteration/failing-run evidence `final1`–`final5`, `task4-*`) |
 | `loader/` | Loader witness harness canonical round-2 transcripts and artifacts (`loader/round2/`), retained round-1 diagnostics (`loader/round1/`) |
 | `bundles/` | Frozen execution bundles (`task4-37c5b41-bundle/`: runner, fixture, `slice1b2-kernel-ebpf`, manifests; `diag-9da22b6-bundle/`: same BPF + fixture bytes re-frozen with the `gate-a-diag` runner) |
-| `MANIFEST.sha256` | SHA-256 of every file in the root except itself. Digest: `a7b8d0ba62b0b9a528fd77dc937d58020abf74559815d3a1a06f80abad0b0bf7` |
+| `MANIFEST.sha256` | SHA-256 of every file in the root except itself. Digest: `e4fb5bdac88d2f737a1dd283f5ccca5510d2cafc9239253e56698274f8f614ef` |
 
 The tracked, scrubbed witness harness itself is `spike/slice1b2-loader/`
 (repo-relative `run-lanes.sh`, lane-filterable, driven by
@@ -120,8 +120,47 @@ under KVM as expected).
 
 ## Final A/B campaign (Task 5)
 
-(filled by Task 5: frozen bundle digests, campaign identity incl. `accel`,
-per-kernel results.)
+Frozen bundle `bundles/final6-9daeb53-bundle/` (source `9daeb53`):
+`slice1b2-kernel-ebpf` `fa3b6e13e87e16419793c2156220212776ebd29d223cd124f5363e3c710f3bfc`,
+`slice1b2-runner` `3982fa59c78f3eef87d18af48703866f1856d74ed08de226b0c3902db112573a`,
+`slice1b2-fixture` `a07b3469f33c96d8df1ebcd31dae763abd8b80fb7bc57b8f755005930d05ecf3`
+(guest-built), `source-elf.manifest` `77483986d0db7946541fa54b498b43ee416628790a3ff5c993baa47da1081f6d`.
+Campaign `20260818T223024`, all lanes under one accelerator (**kvm**, recorded
+in each run dir's `host-accel.txt`/`virt.txt`); 16/104 ceilings and every
+oracle value unchanged. One post-freeze harness-only fix `8090f26`
+(zombie-qemu cleanup race; no kernel/runner/fixture byte changed):
+
+- diag `diag-final6-{jammy,noble}-kvm-…`: PASS, all four programs accepted.
+- Gate A `final6-gatea-{jammy,noble}-kvm-…`: PASS (4 accepted programs,
+  5 cases, 4 maps each).
+- Gate B jammy `final6-jammy-kvm-…-boot{1,2,3}`: 3×20 = **60/60 PASS**.
+- Gate B noble `final6-noble-kvm-…-boot{1,2,3}` + `…-boot1b` (rerun):
+  boot1 was **semantic 20/20 PASS** (`runner-status.txt status=PASS`) but its
+  lane exit was FAIL rc=1 — the pre-fix zombie-qemu cleanup crash aborted
+  after evidence export (post-shutdown immutability checks missing for that
+  boot; evidence retained under the boot1 dir). boots 2/3 and the clean
+  rerun boot1b: **60/60 PASS** with full post-checks.
+- Gate B totals: **120/120 semantic PASS** across 5.15 and 6.8.
+- Confirmation timing (winner→both-stopped sample gap, µs): jammy
+  min/median/max 1079/1146/1526; noble 1120/1141/1494 (80 runs incl.
+  boot1). Winner split jammy 30/30, noble 44/36 — the symmetric CAS wins
+  from either hook.
+
+Three fixture/oracle races were root-caused and fixed before the final
+campaign (`fa07ee3` marker barrier, `d0c3e6a` Gate A maps-read retry,
+`7207d1d` oracle case-ID order), then the decisive Gate B hook-phase race:
+ftrace ground truth (iter5/iter6 traces under `gate-b/final5-*` and
+`/tmp` iteration logs; preserved in the failing-run evidence) shows the
+CAS loser reaching return-to-user with the group stop already pending —
+its deferred uprobe handler never runs, so its record is never submitted
+(`second signal record timeout`). Fixes, in order: `f90d2af`/`98ba017`
+user-mode spin barrier + pre-positioned release (50%→~75% completion),
+`1c970d2` CPU pinning + RT worker + `taskset -c 0` lane runners (~38%
+under load), and the decisive `9daeb53` bounded **winner-side delay** in
+`signal_return` (50,000 ktime polls between the owner CAS and the single
+`bpf_send_signal(19)`, verifier-provable on 5.15 where a wall-clock loop
+is rejected as infinite; iteration `iter7`: 8×20 = 160/160 PASS on
+jammy before the campaign).
 
 ## Loader precontrols (Task 6) and event-path facts (Task 7)
 

@@ -612,47 +612,92 @@ releasing the barrier. It does not resolve libc, walk dependencies, read
 
 One session-local userspace registry has capacity exactly 256, matching the
 existing `MAX_SCAN_PIDS` scope bound. Context IDs are monotonically allocated
-from 1 through 256 and never reused. Each immutable descriptor contains the
-process generation, pinned loader identity/digest, hook virtual/file offsets,
-optional state metadata/delta, link identity, and live/tombstoned lifecycle.
-Insertion precedes link attachment. A failed attachment tombstones the entry;
-a live entry is tombstoned only after its link detaches. Descriptors remain
-until all loader links are detached and the discovery ring is drained at
-session end, then the registry is removed.
+from 1 through 256 and never reused. Each slot separates:
+
+- an immutable context payload containing the process generation, pinned
+  loader identity/digest, hook virtual/file offsets, and optional state
+  metadata/delta; and
+- a mutable registration shell with exactly the phases `prepared`, `attached`,
+  and `tombstoned`, plus the optional userspace link binding.
+
+Userspace inserts the payload and a `prepared` shell before link attachment.
+Successful attachment binds the returned link and changes only the shell to
+`attached`; failed attachment changes only the shell to `tombstoned`. If link
+binding after kernel attachment fails, userspace detaches that link before
+tombstoning. At session end every `attached` link is detached first and its
+shell is then tombstoned. Tombstoned payloads remain available to decode
+already-queued records until every loader link is detached and the discovery
+ring is drained; only then is the whole registry removed. The immutable
+payload never changes, and neither a tombstone nor final removal permits ID
+reuse. A decoder accepts an `attached` shell or a tombstoned shell that retains
+the former successful link binding during this final drain. It rejects a
+`prepared` shell and an attach-failure tombstone that has no former link.
 
 The loader attach cookie is one exact `u64` encoding:
 
 ```text
 bits 0..7   = context_id - 1
 bit 8       = state_present
-bits 9..63  = signed 55-bit two's-complement delta
+bits 9..63  = state payload
 ```
 
-The encoder rejects a delta outside `[-2^54, 2^54 - 1]`; BPF decodes it with
-`(cookie as i64) >> 9`. `state_present = 0` requires the encoded delta to be
-zero; any other combination is malformed. A loader record copies bits 0..7
-into its existing `case_id`; userspace adds one and validates the immutable
-descriptor and exact generation. There is no loader-context BPF map and no
-public context ID.
+The exact encodings are:
 
-At the hook, after scope and reservation, BPF obtains
-`hook_runtime_ip = bpf_get_func_ip(ctx)`, rejects zero, applies the signed delta
-with checked add/subtract to obtain `_r_debug`, then checked-adds exactly 24 and,
-only when `state_present`, reads `r_state` with bounded
-`bpf_probe_read_user` as one 4-byte value. Gate C must prove on both kernels that
-`hook_runtime_ip == load_bias + hook_vaddr`, the derived debug address equals
-`load_bias + _r_debug_vaddr`, and the read uses that exact field offset before
-any state-dependent classification. Overflow, helper failure, or a formula
-mismatch never drops the every-hit record.
+```text
+id_bits = u64(context_id - 1)
+state absent  = id_bits | (1 << 9)
+state present = id_bits | (1 << 8)
+                | ((u64(delta) & ((1 << 55) - 1)) << 9)
+```
+
+For `state_present = 0`, the unsigned payload in bits 9..63 is exactly the
+nonzero validity sentinel `1`, not a delta. For `state_present = 1`, the
+payload is a signed 55-bit two's-complement delta in
+`[-2^54, 2^54 - 1]`, including zero. Thus all 256 IDs have distinct nonzero
+encodings in both modes: context 1 with absent state is `512`, while context 1
+with present state and zero delta is `256`.
+
+BPF rejects a zero cookie before extracting an ID. It then reads
+`state_present` and the unsigned payload. When state is absent it accepts only
+payload `1` and never interprets that payload as a delta. When state is present
+it decodes the delta only then, using
+`(cookie as i64) >> 9`. A loader record copies bits 0..7 into its existing
+`case_id` only after this validation; userspace widens the byte, adds one, and
+validates the immutable payload, registration shell, and exact generation.
+There is no loader-context BPF map and no public context ID.
+
+At the hook, after scope and reservation, a zero cookie or invalid absent-state
+payload sets existing internal `DiscoveryRecord.status_flags` bit `0x04`,
+meaning exactly `loader_context_invalid`, and submits the fully initialized
+every-hit record. That path extracts no context ID, performs no registry
+lookup, IP/delta arithmetic, state read, attachment, or classification.
+Userspace consumes the flag before `case_id`, increments the existing
+`discovery_truncated` accumulator exactly once, sets
+`initial_set_capture = none`, forces `PARTIAL`, and refuses context-derived
+attachment. The bit is internal finite status, not a new field or public
+output; bits `0x01` and `0x02` retain their existing meanings.
+
+For a valid cookie, BPF obtains
+`hook_runtime_ip = bpf_get_func_ip(ctx)`, rejects zero, and, only when
+`state_present`, applies the signed delta with checked add/subtract to obtain
+`_r_debug`, checked-adds exactly 24, and reads `r_state` with bounded
+`bpf_probe_read_user` as one 4-byte value. It performs no delta arithmetic or
+state read when state is absent. Gate C must prove on both kernels that
+`hook_runtime_ip == load_bias + hook_vaddr`, and, when state is present, the
+derived debug address equals `load_bias + _r_debug_vaddr` and the read uses
+that exact field offset before any state-dependent classification. Overflow,
+helper failure, or a formula mismatch never drops the every-hit record.
 
 The existing BPF `state_read_failures` counter owns state-address/helper
-failures. Registry exhaustion, an unknown/out-of-range context, generation or
-loader mismatch, or an undecodable record contributes exactly once to the
-existing userspace `discovery_truncated` accumulator, makes
+failures only; an invalid or missing cookie is a context-decode failure, not a
+state-read failure. Registry exhaustion, an unknown/unregistered context,
+invalid registration state, generation or loader mismatch, invalid-cookie
+flag, or another undecodable record contributes exactly once to the existing
+userspace `discovery_truncated` accumulator, makes
 `initial_set_capture = none`, and forces `PARTIAL`; unsafe identity refuses the
-attachment. A state-absent loader can still emit every hit, but cannot satisfy a
-state-dependent catalog predicate. No ID is recycled to reinterpret a queued
-record.
+attachment. A state-absent loader can still emit every hit, but cannot satisfy
+a state-dependent catalog predicate. No ID is recycled to reinterpret a
+queued record.
 
 The corrective C spike uses this same cookie/IP/state path. Its fixture-only
 relocation witness is read with bounded `bpf_probe_read_user` and serialized
@@ -661,38 +706,49 @@ context IDs are never evidence output; the witness and constructor marker do
 not become production ABI. GDB or `/proc/<pid>/mem` evidence is not a
 substitute.
 
-### 7.4 Event-time tuple binding and initial-set predicate
+### 7.4 Event-time tuple binding and product capture predicate
 
-Pre-exec eligibility requires the exact loader identity and attached hook, not
-a guessed companion libc. At each candidate qualifying event, userspace first
+Pre-exec binding requires the exact loader identity and attached hook, not a
+guessed companion libc. At each candidate qualifying event, userspace first
 matches the record's context/generation, refreshes target mappings, revalidates
-the mapped loader against its pinned descriptor, then pins and hashes the actual
-mapped companion libc. Only that event-time
+the mapped loader against its immutable context payload, then pins and hashes
+the actual mapped companion libc. Only that event-time
 `{architecture, loader SHA-256, companion-libc SHA-256}` tuple may select a
 catalog candidate. Failure or absence leaves timing `unproven` and
 `initial_set_capture = none`; there is no pre-exec libc resolution or generic
 loader resolver.
 
-A tuple's `initial_set = qualified_pre_constructor` remains capability only. A
-particular capture is initial-set eligible only when all of these are true:
+A Gate C timing candidate is created only by the separate non-circular §8.2
+qualification predicate. After final multi-artifact review promotes that exact
+candidate, the tuple's `initial_set = qualified_pre_constructor` remains
+capability only. A particular product capture is initial-set eligible only when
+all of these are true:
 
 1. the target is the observer's owned, unreaped `run` child;
 2. its pinned PT_INTERP loader/context and exact hook were armed before the
    parent released the pre-exec barrier;
 3. the event-time context, process generation, loader mapping, and actual
    companion-libc tuple all revalidate;
-4. the cookie/IP formula and every state/witness predicate required by the
-   tuple passed;
+4. its nonzero cookie, registry payload/shell, hook-IP formula, and every
+   state/witness predicate required by the tuple passed;
 5. the tuple has reviewed `initial_set = qualified_pre_constructor` product
    capability;
 6. no relevant loader event, state/context read, identity transition, or
    discovery record was lost;
-7. any resulting live attach window satisfies §5.7 independently.
+7. the exact causal live attach window is protected under §5.7: its confirmed
+   owner attaches every required key before the one original-pidfd resume.
 
-The existing after-`sched_process_exec` attachment model does not satisfy this
-predicate. An executable whose direct PT_INTERP cannot be pinned and armed, a
-shebang/exec chain that cannot be bound, registry exhaustion, external
-`--pid`/`--cgroup`, and any late attachment have
+Qualification-time mapping/export `protected` is only a candidate predicate;
+the product capture must still prove item 7 for its actual window. A
+qualification-time mapping/export result of `unproven` creates no protection
+entry, so a capture relying on that path has
+`initial_set_capture = none` and sticky `PARTIAL` even if the tuple's timing
+capability is later promoted. Timing never substitutes for protection.
+
+The existing after-`sched_process_exec` attachment model does not satisfy the
+product predicate. An executable whose direct PT_INTERP cannot be pinned and
+armed, a shebang/exec chain that cannot be bound, registry exhaustion,
+external `--pid`/`--cgroup`, and any late attachment have
 `initial_set_capture = none` and force `PARTIAL`. Pause success after exec does
 not retroactively make pre-exec arming eligible.
 
@@ -747,6 +803,18 @@ attempt. A lane stops promotion on its first finite failure but retains it; the
 remaining predeclared safe diagnostic lanes continue unless lifecycle or host
 safety fails.
 
+The locked preflight exhaustively round-trips context IDs 1 through 256 for
+absent state, present state with zero delta, and the two signed-delta bounds. It
+rejects zero and every absent-state payload other than sentinel `1`. On each
+control/kernel pair, before the counted attempts, the same product-shaped
+loader program is also attached once to a bounded single-hit fixture hook using
+Aya's no-cookie form. The missing-cookie negative requires one
+`loader_context_invalid` record, no context lookup/IP or state operation,
+`discovery_truncated += 1`, `initial_set_capture = none`, no derived
+attachment/classification, and clean link teardown. This is a preflight oracle,
+not a new lane, and does not change any 20-attempt count. Any mismatch is Gate C
+operational FAIL.
+
 ### 8.2 Attempt validity and finite classifications
 
 Evidence validity is separate from capability classification. Every attempt
@@ -783,6 +851,29 @@ best-effort product path sticky `PARTIAL`. Either result must be consistent;
 operational error is never reclassified as `unproven`. This is private
 qualification/catalog metadata and adds no public evidence key.
 
+The separate **Gate C initial-set qualification predicate** is satisfied for
+one positive primary attempt only when all of these are true:
+
+1. while the owned direct-ELF child is behind its pre-exec barrier, the exact
+   PT_INTERP loader is pinned/hashed and its exact debug-state hook is attached
+   with a valid nonzero cookie whose registry shell is `attached`, all before
+   release;
+2. the row's qualifying initial-set hit is received before constructor entry
+   and resolves to that exact immutable context payload and process generation;
+3. at the event, the mapped loader and actual companion libc are pinned,
+   hashed, and revalidated as the row's exact tuple;
+4. the cookie decode, hook-IP formula, state-present read when required, and
+   row-specific witness/order predicates all pass; and
+5. no relevant loader-hit or ring/record loss, state/context read failure,
+   identity mismatch, provenance, timeout, cleanup, lifecycle, or other
+   operational error occurs.
+
+This predicate contains no existing or promoted capability prerequisite and no
+mapping/export protection prerequisite. It can therefore create the first
+timing-capability candidate. The independent `protected|unproven`
+mapping/export classification above neither upgrades nor vetoes that timing
+classification; it controls only whether a protection candidate exists.
+
 ### 8.3 Predeclared control matrix and effects
 
 The expected outcome/effect table is frozen before execution. “Classification”
@@ -795,10 +886,10 @@ or kernels are inconsistent and **FAIL**.
 | glibc 2.35 | `dlopen` | Mandatory `known_pre_relocation`: first post-`RT_ADD` `RT_CONSISTENT` witness remains zero. | Classify `protected|unproven`. | Expected negative is a valid C result with no positive entry. Any positive is negative-control FAIL and creates no entry. |
 | glibc 2.39 | `dlopen` | Mandatory `known_pre_relocation`: first post-`RT_ADD` `RT_CONSISTENT` witness remains zero. | Classify `protected|unproven`. | Expected negative is a valid C result with no positive entry. Any positive is negative-control FAIL and creates no entry. |
 | Alpine/musl control | `dlopen` | Mandatory `qualified_pre_constructor`: at least one post-load hit has equal witness before constructor; earlier empty hits are permitted. | Classify `protected|unproven`. | A negative/unproven result fails C and creates no entry. A valid positive is a candidate. |
-| Fixed-glibc candidate | `initial_set` | Classification lane: stable `qualified_pre_constructor|known_pre_relocation|unproven`; positive also requires §7.4. | Classify `protected|unproven`. | Positive creates a candidate; stable negative/unproven is valid C with no entry; inconsistency fails C. |
-| glibc 2.35 | `initial_set` | Classification lane: stable `qualified_pre_constructor|known_pre_relocation|unproven`; positive requires §7.4; no zero-at-consistent expectation. | Classify `protected|unproven`. | Positive creates a candidate; stable negative/unproven is valid C with no entry; the `dlopen` negative grants nothing; inconsistency fails C. |
-| glibc 2.39 | `initial_set` | Classification lane: stable `qualified_pre_constructor|known_pre_relocation|unproven`; positive requires §7.4; no zero-at-consistent expectation. | Classify `protected|unproven`. | Positive creates a candidate; stable negative/unproven is valid C with no entry; the `dlopen` negative grants nothing; inconsistency fails C. |
-| Alpine/musl control | `initial_set` | Classification lane: stable `qualified_pre_constructor|known_pre_relocation|unproven`; positive requires a pre-constructor equal hit and §7.4. | Classify `protected|unproven`. | Positive creates a candidate; stable negative/unproven is valid C with no entry; inconsistency fails C. |
+| Fixed-glibc candidate | `initial_set` | Classification lane: stable `qualified_pre_constructor|known_pre_relocation|unproven`; positive requires the §8.2 Gate C initial-set qualification predicate. | Classify `protected|unproven` independently. | Positive creates a timing candidate; stable negative/unproven is valid C with no timing entry; inconsistency fails C. |
+| glibc 2.35 | `initial_set` | Classification lane: stable `qualified_pre_constructor|known_pre_relocation|unproven`; positive requires the §8.2 Gate C initial-set qualification predicate; no zero-at-consistent expectation. | Classify `protected|unproven` independently. | Positive creates a timing candidate; stable negative/unproven is valid C with no timing entry; the `dlopen` negative grants nothing; inconsistency fails C. |
+| glibc 2.39 | `initial_set` | Classification lane: stable `qualified_pre_constructor|known_pre_relocation|unproven`; positive requires the §8.2 Gate C initial-set qualification predicate; no zero-at-consistent expectation. | Classify `protected|unproven` independently. | Positive creates a timing candidate; stable negative/unproven is valid C with no timing entry; the `dlopen` negative grants nothing; inconsistency fails C. |
+| Alpine/musl control | `initial_set` | Classification lane: stable `qualified_pre_constructor|known_pre_relocation|unproven`; positive requires a pre-constructor equal hit and the §8.2 Gate C initial-set qualification predicate. | Classify `protected|unproven` independently. | Positive creates a timing candidate; stable negative/unproven is valid C with no timing entry; inconsistency fails C. |
 | Fixed-glibc candidate | `dlopen` return fallback | Timing `none`; constructor and DT_NEEDED blind. | Observe the explicit post-return call only. | Required fallback oracle; PASS authorizes only exact post-return best effort, failure fails C, no timing entry. |
 | glibc 2.35 | `dlopen` return fallback | Timing `none`; constructor and DT_NEEDED blind. | Observe the explicit post-return call only. | Required fallback oracle; PASS authorizes only exact post-return best effort, failure fails C, no timing entry. |
 | glibc 2.39 | `dlopen` return fallback | Timing `none`; constructor and DT_NEEDED blind. | Observe the explicit post-return call only. | Required fallback oracle; PASS authorizes only exact post-return best effort, failure fails C, no timing entry. |
@@ -807,6 +898,14 @@ or kernels are inconsistent and **FAIL**.
 The zero-at-consistent negative is therefore scoped only to glibc 2.35/2.39
 `dlopen`. Fixed-glibc and musl `dlopen` are the two mandatory positive controls;
 failure of either makes Gate C FAIL even when the failure is a clean negative.
+
+For rows 5–8, timing and mapping/export are orthogonal results. A timing
+positive with mapping/export `unproven` is consistent and creates only the
+timing candidate; it creates no protection candidate and cannot make a product
+capture eligible under §7.4. Stable `unproven` protection remains sticky
+`PARTIAL`. A stable `protected` result may create the separate protection
+candidate, but the eventual product capture must still prove its own exact
+causal window protected before resume.
 
 ### 8.4 `dlopen_return` fallback oracle
 
@@ -847,7 +946,7 @@ future reviewed implementation range.
 | `discovery_ring_loss` | All failed `DISCOVERY` reservations across loader, exec, and export records; forces `PARTIAL`. | BPF `COUNTERS`; renderer never derives it from received records. |
 | `discovery_state_failures` | Export entry-state no-overwrite/cleanup failures; forces `PARTIAL`. | BPF `COUNTERS`. |
 | `discovery_read_failures` | Export table/interface bounded user-read failures only; forces `PARTIAL`. It excludes loader-state reads. | BPF `COUNTERS`. |
-| `discovery_truncated` | Source-declared truncations in successfully received records plus userspace discovery-record decode failures, including loader-registry capacity refusal or an unknown/out-of-range/stale context; forces `PARTIAL`. | One discovery-engine accumulator; each record flag, decoder result, or refused context feeds it once. |
+| `discovery_truncated` | Source-declared truncations in successfully received records plus userspace discovery-record decode failures, including `loader_context_invalid`, loader-registry capacity refusal, or an unknown/unregistered/stale context; forces `PARTIAL`. | One discovery-engine accumulator; each record flag, decoder result, or refused context feeds it once. |
 
 Call-event `event_loss`, `malformed_records`, and semantic counters retain their
 existing owners. Existing `attached_probes` and `attach_failures` remain owned
@@ -950,20 +1049,22 @@ sentinels for:
 - `_r_debug`, table, and function-pointer values;
 - raw loader/interface name bytes;
 - private proof/source IDs and raw task identifiers;
-- packed loader attach cookies, context IDs, signed deltas, and
-  process-generation values wherever they can enter an internal record; plus
-  pause/loader context values in every observer-owned live map.
+- packed loader attach cookies, the absent-state validity sentinel, context
+  IDs, signed deltas, and process-generation values wherever they can enter an
+  internal record; plus pause/loader context values in every observer-owned
+  live map.
 
 It scans profile JSON, metrics JSON, trace output, observer/workload logs,
 private temporary output, and every map owned by the exact live observer map
 IDs. The scanner proves its positive control first. Public output must contain
 only the finite aggregates. The positive-control fixture injects distinctive
-valid cookie/context/delta sentinels and proves they are found when deliberately
-placed in a scanned output/log/map surface, then absent from the release
-artifacts. Private spike bundles are separately permissioned and are not
-release output. Any new public render field, discovery record,
-pause map value, loader context, or catalog representation requires allowlist
-review and canary update before release.
+valid cookie/context/delta and absent-state-sentinel values and proves they are
+found when deliberately placed in a scanned output/log/map surface, then absent
+from the release artifacts. The zero-cookie negative remains private finite
+oracle evidence; it does not publish a raw cookie. Private spike bundles are
+separately permissioned and are not release output. Any new public render
+field, discovery record, pause map value, loader context, or catalog
+representation requires allowlist review and canary update before release.
 
 ## 10. Doctor, errors, privileges, and lifecycle
 
@@ -1083,19 +1184,26 @@ review confirms all of the following:
   attaches the full required set before resume; timing never substitutes;
 - every debug-state hit is handled and capability selection uses only exact
   architecture/loader/libc digests;
-- the exact 256-entry monotonic registry, cookie layout, IP-relative state read,
-  lifecycle/counters, and event-time companion-libc binding are frozen without
-  a context map, resolver, pre-exec libc lookup, or `/proc/<pid>/mem` read;
+- the exact 256-entry monotonic registry separates immutable context payload
+  from mutable link/lifecycle registration, preserves detach/tombstone/drain
+  order, and never reuses an ID;
+- the cookie layout uses absent-state payload sentinel `1`, preserves signed
+  present-state delta zero, rejects zero before lookup, and has a missing-cookie
+  negative; IP-relative state reads and event-time companion-libc binding are
+  frozen without a context map, resolver, pre-exec libc lookup, or
+  `/proc/<pid>/mem` read;
 - current loader tuples are controls, not product entries, and initial-set
-  eligibility requires the exact pre-exec loader hook plus event-time tuple for
-  the capture;
+  qualification uses the non-circular §8.2 pre-exec/event-time predicate while
+  later product eligibility separately requires promoted exact capability and
+  a protected causal live window;
 - public evidence has one finite vocabulary, one owner per counter, no public
   timeline or loader/proof identity, and all privacy/canary obligations are
   explicit;
 - Gate B is exactly three cold boots × 20 children per kernel, and Gate C has
   fixed-glibc, exact-negative glibc, and musl controls on 5.15/6.8;
-- Gate C separates attempt validity from the exact control/load-kind timing,
-  mapping/export, and `dlopen_return` fallback effects in §8.3–§8.4;
+- Gate C separates attempt validity, initial-set timing qualification,
+  independent mapping/export protection, and `dlopen_return` fallback effects
+  in §8.2–§8.4; protection `unproven` remains sticky `PARTIAL`;
 - gate order, dependency invalidation, exact negative retention, final
   multi-artifact re-gate, and the no-production/no-Task-5 boundary are explicit;
 - no unresolved design value, adaptive threshold, rerun-until-green rule, or

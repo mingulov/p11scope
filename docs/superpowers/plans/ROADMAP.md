@@ -398,8 +398,11 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     helper, multi-module plans and per-module semantic state, `--module`/`--manifest`
     optional, evidence `discovery[]`/`authority`, schema v2. The eBPF object is unchanged.
     Scanning happens once at attach time; a module loaded later is not discovered (1b-2).
-    **Status (2026-08-17): OPEN on the owner-selected scan-only semantic-authority
-    contract and its separately reviewed implementation. Corrective Tasks 1–5 and their
+    **Status (2026-08-18): Contract A with explicit-manifest operator attestation is
+    owner-selected; its separately reviewed implementation and evidence remain OPEN.
+    Scan-only claims are count-only, `PARTIAL`, and semantically unjoinable; accepted
+    manifest claims may authorize only the exact pinned object + offset + canonical
+    name. Corrective Tasks 1–5 and their
     task-local review fix rounds are implemented on the recovery branch: one capture-wide
     attempted-I/O/cardinality budget; VMA-confined interface names; fail-closed comparable
     file identity with the existing overlay-only uncertainty; retained process generations

@@ -55,12 +55,19 @@ if [ "$family" = glibc ]; then
         echo "PROVENANCE_DSC=$(basename "$dsc")"
         sha256sum "$dsc"
         grep -E '^(Package|Version): ' "$dsc" || true
-        dl_open=$(find /work -maxdepth 2 -path '*/elf/dl-open.c' | head -1)
-        echo "PROVENANCE_DL_OPEN_PATH=$dl_open"
-        sha256sum "$dl_open"
-        echo "PROVENANCE_DL_OPEN_BEGIN"
-        grep -n -B12 -A6 -E '_dl_debug_state|dl_open_worker' "$dl_open" || true
-        echo "PROVENANCE_DL_OPEN_END"
+        dl_open=$(find /work -maxdepth 3 -path '*/elf/dl-open.c' | head -1)
+        if [ -z "$dl_open" ]; then
+            echo "PROVENANCE_DL_OPEN_MISSING"
+            case "$lane" in
+                glibc-241-debian13|glibc-24x-ubuntu2604) exit 4 ;;
+            esac
+        else
+            echo "PROVENANCE_DL_OPEN_PATH=$dl_open"
+            sha256sum "$dl_open"
+            echo "PROVENANCE_DL_OPEN_BEGIN"
+            grep -n -B12 -A6 -E '_dl_debug_state|dl_open_worker' "$dl_open" || true
+            echo "PROVENANCE_DL_OPEN_END"
+        fi
         echo "PROVENANCE_DEBIAN_PATCHES_TOUCHING_DL_OPEN_BEGIN"
         hits=$(grep -l 'dl-open\.c' /work/glibc-*/debian/patches/* 2>/dev/null || true)
         if [ -n "$hits" ]; then

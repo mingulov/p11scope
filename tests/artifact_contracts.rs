@@ -627,6 +627,37 @@ fn usage_documents_every_subcommand_and_capture_needs_no_manifest() {
 }
 
 #[test]
+fn operator_docs_preserve_semantic_authority_limits() {
+    for (path, statement) in [
+        (
+            "README.md",
+            "Live and terminal evidence are PARTIAL while scan-only semantic claims remain",
+        ),
+        (
+            "docs/usage.md",
+            "P11Lab joins reject scan-only and conflict modules",
+        ),
+        (
+            "CHANGELOG.md",
+            "Slice 1b-2 live acquisition remains future work",
+        ),
+        (
+            "docs/superpowers/plans/ROADMAP.md",
+            "Implementation complete, independent review and privileged matrix pending",
+        ),
+    ] {
+        assert!(
+            read(path)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains(statement),
+            "{path} is missing: {statement}"
+        );
+    }
+}
+
+#[test]
 fn gate_scripts_pin_the_toolchain() {
     for path in [
         "scripts/verify-canaries.sh",

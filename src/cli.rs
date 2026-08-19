@@ -72,9 +72,8 @@ pub const USAGE: &str = "usage:
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
---module narrows the scan to named providers; --manifest supplies offsets for a provider the
-scan cannot read and is corroborated against the scan when possible. Scanning happens once,
-at attach time.
+--module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
+scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning happens once, at attach time.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
 every descendant (kernel >= 5.15). Provider identity is pinned by SHA-256 at attach and
@@ -464,5 +463,19 @@ mod tests {
             parse_capture(Kind::Profile, args(&["--help"])).unwrap_err(),
             CliError::Help
         );
+    }
+
+    #[test]
+    fn help_states_manifest_attestation_and_scan_only_limits() {
+        for statement in [
+            "--manifest is explicit operator attestation of exact accepted function-name/offset claims",
+            "scan-only discovery is semantics-unverified and count-only",
+            "aggregate counts/RVs/latency remain available",
+        ] {
+            assert!(
+                USAGE.contains(statement),
+                "missing help statement: {statement}"
+            );
+        }
     }
 }

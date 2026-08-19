@@ -11,10 +11,10 @@ file offset, and produces a versioned `observed-profile.json` for migration
 assessment and incident diagnostics.
 
 > **Status: unreleased; Slice 1b-1 remains open.** Its memory-scan discovery,
-> `inspect`, `doctor`, multi-module capture, schema v2, and corrective Tasks
-> 1–5 are implemented on this branch. The owner-selected scan-only semantic-
-> authority contract, its separately reviewed implementation, final whole-range
-> correctness/security reviews, and CI on the exact final commit are pending.
+> `inspect`, `doctor`, multi-module capture, schema v2, corrective Tasks 1–5,
+> and the owner-selected semantic-authority implementation are complete. The
+> independent whole-range correctness/security reviews, exact-candidate
+> privileged/container matrix, and CI remain pending.
 > Loader/export hooks and `run` remain Slice 1b-2 and are not present here.
 
 Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40
@@ -53,7 +53,10 @@ quantitative claim there cites the script that measured it).
 
   `p11scope-discover` remains available as an optional offline path when a
   suitable manifest can be prepared for a provider the memory scan cannot
-  read; the normal path does not execute provider code.
+  read; the normal path does not execute provider code. `--manifest` is explicit
+  operator attestation of exact accepted function-name/offset claims. Scan-only
+  discovery is semantics-unverified and count-only, while aggregate
+  counts/RVs/latency remain available.
 
   Full quickstart, real command output, and `trace` mode:
   [docs/usage.md](docs/usage.md#quickstart).
@@ -198,18 +201,16 @@ sets `evidence.provider_changed`, which forces the report `PARTIAL`. Profile
 output is published atomically (private temp beside the target, fsync,
 rename).
 
-Memory scanning is heuristic discovery. The owner decision on whether a
-scan-only match may authorize semantic descriptors is still open; this branch
-does not resolve that policy by documentation. Until one of the recorded
-contracts is selected, implemented, and independently reviewed, Slice 1b-1 has
-no completion or security-clearance claim.
+Memory scanning is heuristic discovery. Live and terminal evidence are PARTIAL
+while scan-only semantic claims remain. P11Lab joins reject scan-only and
+conflict modules; an accepted manifest may authorize only its exact pinned
+object, offset, and canonical function name. Slice 1b-2 live acquisition
+remains future work. Slice 1b-1 remains open until independent whole-range
+reviews and the exact-candidate privileged matrix are complete.
 
-Fresh local Task 6 evidence is mixed: all four Rust checks (357 tests),
-`scripts/verify-inspect-doctor.sh`, the capture-evidence self-test, shared-layer
-matrix, and glibc/musl container-discovery matrix passed. The aggregate gate,
-Docker, fork, external-oracle, proxy, kind, Knative, and release-assembly
-commands exited 1 on unchanged evidence/negative-control assertions. Those
-failures remain open; CI and whole-range reviews are pending.
+Fresh final-candidate unprivileged results are recorded in the Task 4 handoff.
+No privileged/container matrix has run on this candidate; historical matrix
+results are not current evidence. CI and whole-range reviews remain pending.
 
 When used, the helper recreates the table in its own process; it never reads or
 injects into the observed process. Uprobes are bound to the verified target

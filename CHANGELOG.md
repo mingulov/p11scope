@@ -2,21 +2,19 @@
 
 ## Unreleased — productization slice 1b-1
 
-Slice 1b-1 remains open. Corrective Tasks 1–5 are implemented, but the owner
-decision and separately reviewed implementation for scan-only semantic
-authority, whole-range correctness/security reviews, and CI on the exact final
-commit are pending. Loader/export hooks and `run` remain Slice 1b-2.
-
-Task 6 local verification is mixed: the Rust suite (357 tests), inspect/doctor,
-capture-evidence self-test, shared-layer, and glibc/musl container-discovery
-lanes passed. The aggregate gate, Docker, fork, external-oracle, proxy, kind,
-Knative, and release-assembly commands exited 1 on unchanged assertions and
-remain unresolved; CI and whole-range reviews have not run.
+Slice 1b-1 remains open. Corrective Tasks 1–5 and the owner-selected
+semantic-authority implementation are complete; independent whole-range
+correctness/security reviews, the exact-candidate privileged/container matrix,
+and CI remain pending. Slice 1b-2 live acquisition remains future work.
 
 - **Discovery**: `profile` and `trace` scan the target's mapped memory once at
   attach, so neither a manifest nor the offline helper is required. Repeatable
   `--module` hints and `--manifest` inputs are optional; manifests are
-  corroborated against the scan when possible.
+  corroborated against the scan when possible. `--manifest` is explicit operator
+  attestation of exact accepted function-name/offset claims. Scan-only discovery
+  is semantics-unverified and count-only; aggregate counts/RVs/latency remain
+  available, but live and terminal evidence are PARTIAL while those claims remain.
+  P11Lab joins reject scan-only and conflict modules.
 - **Diagnostics**: `inspect --pid` reports mapped providers, table surfaces,
   interface discovery and pinned file identities without loading BPF;
   `doctor` probes host/target scan, BPF and uprobe availability before capture.

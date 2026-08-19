@@ -398,27 +398,19 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     helper, multi-module plans and per-module semantic state, `--module`/`--manifest`
     optional, evidence `discovery[]`/`authority`, schema v2. The eBPF object is unchanged.
     Scanning happens once at attach time; a module loaded later is not discovered (1b-2).
-    **Status (2026-08-18): Contract A with explicit-manifest operator attestation is
-    owner-selected; its separately reviewed implementation and evidence remain OPEN.
-    Scan-only claims are count-only, `PARTIAL`, and semantically unjoinable; accepted
-    manifest claims may authorize only the exact pinned object + offset + canonical
-    name. Corrective Tasks 1–5 and their
+    **Status (2026-08-19): Contract A with explicit-manifest operator attestation is
+    implemented. Scan-only claims are count-only, `PARTIAL`, and semantically
+    unjoinable; accepted manifest claims may authorize only the exact pinned object +
+    offset + canonical name. Corrective Tasks 1–5 and their
     task-local review fix rounds are implemented on the recovery branch: one capture-wide
     attempted-I/O/cardinality budget; VMA-confined interface names; fail-closed comparable
     file identity with the existing overlay-only uncertainty; retained process generations
     and per-view ownership through attach; and exact per-object stale-manifest fallback.
-    These changes do not implement Slice 1b-2 and do not select a semantic-authority policy
-    by implication. Task 6 rejects unsupported `doctor --module`. Fresh local
-    unprivileged Rust checks passed (357 tests, 0 failed), as did
-    `verify-inspect-doctor.sh`, the capture-evidence self-test, the shared-layer matrix,
-    and glibc/musl container discovery. The exact privileged matrix remains failing:
-    `gates.sh`, Docker, fork, oracle, proxy, kind, Knative, and release assembly all
-    exited 1 on unchanged evidence or negative-control assertions. Knative provisioned
-    successfully before its assertion failed; these are FAIL results, not missing-tool
-    omissions. `bench-overhead.sh` is N/A because the corrective range did not change
-    the BPF/event hot path. Whole-range correctness/security reviews and CI on the exact
-    corrective evidence commit remain PENDING. No completion or security-clearance
-    claim applies while those gates remain open.**
+    These changes do not implement Slice 1b-2. Task 6 rejects unsupported
+    `doctor --module`. Implementation complete, independent review and privileged
+    matrix pending: fresh full-range correctness/security review, exact-candidate
+    privileged/container matrices, and CI must still be reconciled. No completion
+    or security-clearance claim applies while those gates remain open.**
   - **Slice 1b-2 — live discovery and `run`**: BPF loader (`_dl_debug_state`) and export
     uretprobes, `DESCRIPTORS` + attach-cookie semantics with dynamic slot allocation,
     `discovery::Engine`, `pause.rs`, `run -- cmd`, `attach_gap_ms`, mid-capture

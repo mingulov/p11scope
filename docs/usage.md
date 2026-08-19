@@ -6,10 +6,10 @@ name the script that produced them so they can be reproduced; fixed
 implementation limits are code contracts, not measurements.
 
 > **Status: unreleased; Slice 1b-1 remains open.** Memory-scan discovery,
-> `inspect`, `doctor`, multi-module capture, schema v2, and corrective Tasks
-> 1–5 are implemented on this branch. The owner-selected scan-only semantic-
-> authority contract, its separately reviewed implementation, final whole-range
-> correctness/security reviews, and CI on the exact final commit are pending.
+> `inspect`, `doctor`, multi-module capture, schema v2, corrective Tasks 1–5,
+> and the owner-selected semantic-authority implementation are complete. The
+> independent whole-range correctness/security reviews, exact-candidate
+> privileged/container matrix, and CI remain pending.
 > Loader/export hooks and `run` remain Slice 1b-2 and are not present here.
 > See the
 > [safe metadata design](superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md)
@@ -121,10 +121,12 @@ sudo p11scope trace --cgroup /sys/fs/cgroup/... --duration 15
 The memory scan runs once, while the attach plan is built. A provider
 `dlopen`ed after capture starts is therefore missed. If a suitable manifest was
 prepared while the same provider identity was available, pass it with
-`--manifest`; it is hash-matched against the pinned file and corroborated when
-the provider is already mapped. A helper run after the fact cannot repair a
-missed capture window. Without such a manifest, wait for Slice 1b-2 live
-discovery.
+`--manifest`; it is explicit operator attestation of exact accepted
+function-name/offset claims, hash-matched against the pinned file, and
+corroborated when the provider is already mapped. Scan-only discovery is
+semantics-unverified and count-only, but aggregate counts/RVs/latency remain
+available. A helper run after the fact cannot repair a missed capture window.
+Without such a manifest, wait for Slice 1b-2 live acquisition.
 
 `p11scope-discover --module <provider.so> -o manifest.json` is that optional
 offline path. It executes provider code in its own unprivileged process; the
@@ -365,9 +367,10 @@ Every `observed-profile.json` carries an `evidence` section
 `"COMPLETE"` or `"PARTIAL"`.
 
 Discovery normally scans the target's mapped memory. An optional `--manifest`
-is trusted operator input, structurally validated and corroborated against the
-scan when possible. Every accepted object is opened once, hash-matched and
-pinned by file descriptor; offsets must land in executable ELF segments.
+is explicit operator attestation of exact accepted function-name/offset claims,
+structurally validated and corroborated against the scan when possible. Every
+accepted object is opened once, hash-matched and pinned by file descriptor;
+offsets must land in executable ELF segments.
 `fstat` (inode, size, ctime) is re-checked before and after attach — attach is
 refused on a mismatch — and during capture, where a change sets
 `evidence.provider_changed` and forces `PARTIAL`. Inputs are capped at a 16 MiB
@@ -387,7 +390,7 @@ or arbitrary I/O failure, incomparable identity, non-executable offsets, an
 ambiguous/incomplete replacement, and a stale sole source remain fatal.
 
 **`COMPLETE`** requires that discovery found a module and planned a slot in
-it, that the memory scan could read every target, that no module was refused
+it, that no scan-only semantic claim remains, that the memory scan could read every target, that no module was refused
 at the attach ceiling, that no module's targets went uncorroborated,
 conflicted or ambiguous, that every discovery surface was fully acquired and
 walked, that every planned probe attached, and that there are zero START/RV/
@@ -411,20 +414,19 @@ diffing against older notes that record `COMPLETE` rows, this is the reason.
 not a claim that deliberately malicious native provider code truthfully
 implements the ABI role named in its own function table.
 
-Memory scanning itself is heuristic discovery. The separate owner decision on
-whether a scan-only table match may authorize semantic descriptors is still
-open; this document does not select a contract by implication. Slice 1b-1
-remains open until the selected contract is implemented and independently
-reviewed.
+Memory scanning itself is heuristic discovery. Scan-only discovery is
+semantics-unverified and count-only: it retains aggregate
+counts/RVs/latency but creates no semantic interpretation. Live and terminal
+evidence are PARTIAL while scan-only semantic claims remain. P11Lab joins reject
+scan-only and conflict modules. An accepted manifest authorizes only the exact
+pinned object, offset, and canonical function name it attests; stale fallback,
+hash agreement, path identity, and raw `{dev,ino}` never transfer that
+attestation. Slice 1b-2 live acquisition remains future work.
 
-The fresh Task 6 local matrix is not all-green. The four Rust checks (357
-tests), inspect/doctor script, capture-evidence self-test, shared-layer matrix,
-and glibc/musl container-discovery matrix passed. `scripts/gates.sh` and the
-Docker, fork, external-oracle, proxy, kind, Knative, and release-assembly
-commands exited 1 on their unchanged assertions. Knative installation and
-scale-to-zero readiness succeeded before its negative-control wording assertion
-failed. These failures are neither omitted nor converted to CI evidence; CI and
-whole-range reviews remain pending.
+Slice 1b-1 implementation is complete, but independent whole-range
+correctness/security reviews, the exact-candidate privileged/container matrix,
+and CI remain pending. No completion or security-clearance claim applies while
+those gates remain open.
 
 **`PARTIAL`** is forced by any single gap in that list — an attach
 failure, ring-buffer loss, a template the in-kernel walk couldn't finish

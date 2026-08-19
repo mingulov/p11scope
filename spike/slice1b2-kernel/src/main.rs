@@ -2627,6 +2627,7 @@ fn run_gate_b_case(
         Err(reason) => return (facts, Some(reason)),
     };
     let mut counters_final = false;
+    let mut protocol_tail_completed = false;
     let result = (|| -> Result<(), &'static str> {
         cancellation_failure(cancellation)?;
         if ring.next().is_some() {
@@ -2980,9 +2981,19 @@ fn run_gate_b_case(
         if ring.next().is_some() {
             return Err("signal record surplus");
         }
+        protocol_tail_completed = true;
         Ok(())
     })();
 
+    if !protocol_tail_completed {
+        // honest partial-attach evidence: the full sets were accepted only if
+        // every attempt produced a link, whatever later step failed
+        facts.signal_attach_accepted =
+            facts.signal_attach_attempts == 2 && signal_links.len() == 2;
+        facts.late_attach_accepted = u64::from(facts.late_attach_attempts)
+            == facts.required_attach_keys
+            && facts.attached_while_stopped == u64::from(facts.late_attach_attempts);
+    }
     if !late_links.is_empty() {
         let mut all_detached = true;
         for link in late_links.drain(..) {
@@ -5320,6 +5331,14 @@ mod tests {
         // failing attempts still export ring-loss and late-hit counter deltas
         assert!(body.contains("counter_delta("));
         assert!(body.contains("if !counters_final"));
+        // and honest partial-attach evidence: the completion flag gates the
+        // recomputation of the attach-set acceptance at cleanup time
+        assert!(body.contains("protocol_tail_completed = true;"));
+        assert_eq!(
+            body.matches("if !protocol_tail_completed").count(),
+            1,
+            "exactly one cleanup-time honest-attach computation"
+        );
     }
 
     #[test]
@@ -5327,20 +5346,28 @@ mod tests {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
         let temp = TestDir::new("gate-b-failure-shapes");
 
-        // runtime failure before the outcome split: no owner was ever recorded
-        let mut pre_split = SignalTimingFacts::default();
-        pre_split.reaped = true;
-        pre_split.child_exit = -1;
-        let path = temp.path().join("pre-split-runtime");
-        fake_canonical_gate_b_export_facts(&path, 2, 1, "runtime", &pre_split);
-        mark_runtime_failure(&path, "task stat");
+        // runtime failure after both signal hooks attached but before the
+        // first record: cleanup resumed the pending stop once via the
+        // original pidfd
+        let mut child_release = SignalTimingFacts::default();
+        child_release.expected_task_count = 2;
+        child_release.signal_attach_attempts = 2;
+        child_release.signal_attach_accepted = true;
+        child_release.signal_link_detached = true;
+        child_release.pidfd_resume_attempts = 1;
+        child_release.reaped = true;
+        child_release.child_exit = -1;
+        let path = temp.path().join("child-release");
+        fake_canonical_gate_b_export_facts(&path, 2, 1, "runtime", &child_release);
+        mark_runtime_failure(&path, "child release");
         assert!(
             shell_validate_gate_b_export(script, &path, 1),
-            "pre-split runtime failures must classify as runtime, not malformed"
+            "post-attach runtime failures must classify as runtime, not malformed"
         );
 
         // runtime failure after owner 1 resumed but before the deferred hook's
-        // record arrived: owner 2 was armed but never established
+        // record arrived: owner 2 was armed but never established; the single
+        // owner-1 late link was detached by cleanup
         let mut deferred_timeout = valid_signal();
         deferred_timeout.coalesced_records = 0;
         deferred_timeout.coalesced_case_id = 0;
@@ -5350,7 +5377,7 @@ mod tests {
         deferred_timeout.attached_while_stopped = 1;
         deferred_timeout.late_attach_attempts = 1;
         deferred_timeout.late_attach_accepted = false;
-        deferred_timeout.late_link_detached = false;
+        deferred_timeout.late_link_detached = true;
         deferred_timeout.markers_after_resume = 0;
         deferred_timeout.post_resume_marker_observed = false;
         deferred_timeout.owner_removed = false;
@@ -5379,11 +5406,60 @@ mod tests {
         stop2_unconfirmed.owner_removed = false;
         stop2_unconfirmed.final_start_entries = 1;
         stop2_unconfirmed.child_exit = -1;
+        stop2_unconfirmed.attached_while_stopped = 1;
+        stop2_unconfirmed.late_attach_attempts = 1;
+        stop2_unconfirmed.late_attach_accepted = false;
+        stop2_unconfirmed.late_link_detached = true;
         let path = temp.path().join("stop2-unconfirmed");
         fake_canonical_gate_b_export_facts(&path, 2, 1, "oracle", &stop2_unconfirmed);
         assert!(
             shell_validate_gate_b_export(script, &path, 1),
             "unconfirmed-stop-2 oracle failures must classify as oracle, not malformed"
+        );
+
+        // runtime failure: cancellation landed while stop 2 was being sampled,
+        // after owner 2's record arrived
+        let mut cancelled_sampling = valid_two_owner_signal();
+        cancelled_sampling.pidfd_resume_attempts = 1;
+        cancelled_sampling.confirmation_sample_indexes_2 = None;
+        cancelled_sampling.samples_2 = Vec::new();
+        cancelled_sampling.owner2_drain_empty = false;
+        cancelled_sampling.post_attach2_task_count = 0;
+        cancelled_sampling.post_attach2_exact_expected_task_set = false;
+        cancelled_sampling.post_attach2_all_tasks_stopped = false;
+        cancelled_sampling.markers_after_resume = 0;
+        cancelled_sampling.post_resume_marker_observed = false;
+        cancelled_sampling.owner_removed = false;
+        cancelled_sampling.final_start_entries = 1;
+        cancelled_sampling.child_exit = -1;
+        cancelled_sampling.attached_while_stopped = 1;
+        cancelled_sampling.late_attach_attempts = 1;
+        cancelled_sampling.late_attach_accepted = false;
+        cancelled_sampling.late_link_detached = true;
+        let path = temp.path().join("cancelled-sampling");
+        fake_canonical_gate_b_export_facts(&path, 2, 1, "runtime", &cancelled_sampling);
+        mark_runtime_failure(&path, "cancelled_sigterm");
+        assert!(
+            shell_validate_gate_b_export(script, &path, 1),
+            "mid-sampling cancellation must classify as runtime, not malformed"
+        );
+
+        // oracle failure: resume 2 itself failed, then cleanup attempted one
+        // more resume, exhausting the attempt budget
+        let mut resume2_errno = valid_two_owner_signal();
+        resume2_errno.pidfd_resume_attempts = 3;
+        resume2_errno.pidfd_resume_rc_2 = -1;
+        resume2_errno.markers_after_resume = 0;
+        resume2_errno.post_resume_marker_observed = false;
+        resume2_errno.owner_removed = false;
+        resume2_errno.final_start_entries = 1;
+        resume2_errno.child_exit = -1;
+        resume2_errno.late_attach_accepted = false;
+        let path = temp.path().join("resume2-errno");
+        fake_canonical_gate_b_export_facts(&path, 2, 1, "oracle", &resume2_errno);
+        assert!(
+            shell_validate_gate_b_export(script, &path, 1),
+            "failed-resume-2 oracle failures must classify as oracle, not malformed"
         );
     }
 
@@ -5438,6 +5514,7 @@ mod tests {
             ("clean", " 2: r2 = 0x0\n 3: r3 = 0x1\n", 0),
             ("short-backward", " 2: if r9 != 0x0 goto -0x3\n 3: r3 = 0x1\n", 1),
             ("long-backward", " 2: gotol -0x4\n 3: r3 = 0x1\n", 1),
+            ("backward-call", " 2: call -0x2\n 3: r3 = 0x1\n", 1),
         ] {
             let dir = temp.path().join(name);
             std::fs::create_dir(&dir).unwrap();

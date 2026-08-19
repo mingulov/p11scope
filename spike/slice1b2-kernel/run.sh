@@ -424,7 +424,7 @@ def well_formed(item):
         return False
     if any(type(item.get(name)) is not int or item[name] not in {0, 1, 2} for name in attach_attempts):
         return False
-    if any(type(item.get(name)) is not int or item[name] not in {0, 1, 2} for name in attempts):
+    if any(type(item.get(name)) is not int or item[name] not in {0, 1, 2, 3} for name in attempts):
         return False
     if any(not isinstance(item.get(name), bool) for name in booleans):
         return False
@@ -439,11 +439,11 @@ def well_formed(item):
         return False
     if item["late_attach_accepted"] and item["late_attach_attempts"] != 2:
         return False
-    if item["signal_link_detached"] and not item["signal_attach_accepted"]:
+    if item["signal_link_detached"] and not item["signal_attach_accepted"] and item["failure_category"] == "none":
         return False
-    if item["late_link_detached"] and not item["late_attach_accepted"]:
+    if item["late_link_detached"] and not item["late_attach_accepted"] and item["failure_category"] == "none":
         return False
-    if item["resume_via_original_pidfd"] and item["pidfd_resume_attempts"] not in {1, 2}:
+    if item["resume_via_original_pidfd"] and item["pidfd_resume_attempts"] not in {1, 2, 3}:
         return False
     if item["pause_owners"] == 0:
         # an attempt that failed before a second pause owner was established:
@@ -485,11 +485,11 @@ def well_formed(item):
         ]):
             return False
     else:
-        if item["pidfd_resume_attempts"] not in {1, 2}:
+        if item["pidfd_resume_attempts"] not in {1, 2, 3}:
             return False
         if item["pidfd_resume_attempts"] == 1 and item["pidfd_resume_rc_2"] != 0:
             return False
-        if item["samples_2"] == []:
+        if item["samples_2"] == [] and item["failure_category"] == "none":
             return False
     return True
 def oracle(item):

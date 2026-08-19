@@ -60,7 +60,7 @@ window = insns[cas + 1 : send]
 if len(window) > 32:
     fail(f"delay-shaped window: {len(window)} instructions between CAS and send_signal")
 for ins in window:
-    if re.search(r"\bgoto[l]?\s+-\d+", ins):
+    if re.search(r"\bgoto[l]?\s+-\d+|\bcall\s+-\d+", ins):
         fail(f"backward branch (loop/poll shape) between CAS and send_signal: {ins}")
 nearest_call = next((ins for ins in reversed(insns[:send]) if ins.startswith("call")), None)
 if not KTIME.fullmatch(nearest_call or ""):

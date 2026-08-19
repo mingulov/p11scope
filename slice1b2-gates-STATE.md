@@ -34,8 +34,22 @@ Work ONLY in this worktree. Goal: no-busy-wait Gate B pause protocol (old winner
 
 ## Workflow position
 
-DONE: implementation → reviews 1-3 → all fixes → tests/gates green → BUNDLE FROZEN (record below).
-NEXT: 6 serialized campaign lanes → cleanup verification → report → STOP for controller review.
+DONE: implementation → reviews 1-3 → all fixes → tests/gates green → bundle frozen → CAMPAIGN COMPLETE (120/120 PASS) → cleanup verified → evidence sealed → report written.
+NOW: STOPPED for controller review. No merge/push/release/production edits.
+
+## Campaign record (2026-08-19, complete)
+
+- All 6 predeclared lanes run under KVM (`sg kvm`), serialized via the VM lifecycle lock; fresh overlay + cold boot per lane; 20 children each; no reruns.
+- jammy-kvm-boot1/2/3 (5.15.0-187-generic, glibc 2.35): PASS 20/20 each.
+- noble-kvm-boot1/2/3 (6.8.0-137-generic, glibc 2.39): PASS 20/20 each.
+- Total: 120 PASS / 0 FAIL / 0 TIMEOUT. Every attempt validated as outcome B (pause_owners=2, 2 resumes both rc=0, owner-2 confirmed pause, post-attach exact/all-T/no-marker). ring_loss=0 and late_hits=2 (oracle-required) in all 120 records. Export validation (frozen Python oracle) passed per lane (gate-b-lane rc 0).
+- Honest observation: outcome A never occurred (0/120) — sibling-handler deferral dominated on both kernels under the barrier-released fixture; outcome A remains oracle-validated but unexercised.
+- Cleanup verified: all lanes `reboot: Power down`; host 0 qemu-system processes, 0 QEMU/ssh listeners; per-lane listener.after.txt empty; backing images intact under /tmp/p11scope-slice1b2-vms/; 13.2G free on /.
+- Evidence sealed at E (0700/0600, verified `find` non-compliant count 0):
+  - E/campaign-summary.json sha256=fb090d4e1b99955a36dd0a00648c06de2db2829e3cdba34b21844eb4290a2d10
+  - E/REPORT.md sha256=8ce36eac28ed9526b973d9d120b857ec7d19a8a9f5e67d8ff086a91f9029c517
+  - E/EVIDENCE.sha256 (lists every file in E except itself; 373 entries; `sha256sum -c` VERIFY_OK) sha256=e95aac331ccde295d8e387c973ca5008345b6ccfc8da78393cdff2da14e4158c
+- Canonical evidence manifest NOT modified (controller curates).
 
 ## Freeze record (2026-08-19)
 

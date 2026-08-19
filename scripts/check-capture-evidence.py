@@ -622,11 +622,7 @@ def validate_proxy_capacity_fallback(document):
     )
     require(match and int(match.group(1)) > 512, refused)
 
-    scan_skips = evidence["skipped"]
-    require(len(scan_skips) == 3, f"unexpected scan skips: {scan_skips}")
-    for skip in scan_skips:
-        require(skip["name"] == DISCOVERY_SUBJECT, skip)
-        require(skip["reason"] == TABLE_UNAVAILABLE, skip)
+    require(evidence["skipped"] == [], evidence["skipped"])
 
     functions = document["functions"]
     require(len(functions) == 68, len(functions))
@@ -1209,13 +1205,7 @@ def self_test():
             "— refusing to attach a prefix",
         }
     ]
-    proxy["evidence"]["skipped"] = [
-        {
-            "name": DISCOVERY_SUBJECT,
-            "reason": TABLE_UNAVAILABLE,
-        }
-        for _ in range(3)
-    ]
+    proxy["evidence"]["skipped"] = []
     proxy["functions"] = function_items(
         [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
         + [([f"C_Unused_{index}"], 0) for index in range(66)]
@@ -1225,6 +1215,7 @@ def self_test():
         lambda d: d["evidence"]["discovery"][0]["objects"][0].update(
             path="/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.3.1", ino=999
         ),
+        lambda d: d["evidence"]["skipped"].append(dict(DISCOVERY_SKIP)),
         lambda d: d["evidence"].update(event_loss=1),
         lambda d: d["evidence"]["modules_skipped"][0].update(reason="capacity"),
         lambda d: d["functions"][0]["module"].update(ino=999),

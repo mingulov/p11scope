@@ -1262,7 +1262,7 @@ fn run_startup_flow(
             && invalid_records == 0
             && state_read_failures == 0
             && cookie_zero_hits == 0
-            && func_ip_zero_hits == 0
+            && func_ip_zero_hits <= loader_hits
             && ring_loss == 0
             && state_failures == 0
             && start_empty
@@ -2732,7 +2732,7 @@ fn run_protect_attempt(
     let [
         l_ring_loss,
         l_state_failures,
-        _l_loader_hits,
+        l_loader_hits,
         l_state_read_failures,
         l_cookie_zero,
         l_func_ip_zero,
@@ -2764,7 +2764,7 @@ fn run_protect_attempt(
         && l_state_failures == 0
         && l_state_read_failures == 0
         && l_cookie_zero == 0
-        && l_func_ip_zero == 0
+        && l_func_ip_zero <= l_loader_hits
         && a_ring_loss == 0
         && a_read_failures == 0
         && a_state_failures == 0
@@ -3055,9 +3055,8 @@ fn validate_protect_provenance(paths: &ProtectPaths) -> Result<ProtectSetup, &'s
 
     let kernel = kernel_release()?;
     let glibc = glibc_version()?;
-    // Task 8 endpoints: host 7.0 (glibc 2.39) and the Noble guest 6.8/2.39.
-    // Jammy 5.15 is structurally excluded: bpf_get_func_ip returns 0 there
-    // (Task 7), which gates off the pause path this experiment needs.
+    // Task 8 endpoints: host 7.0 (glibc 2.39) and the Noble guest 6.8/2.39;
+    // Jammy is optional in the approved experiment and is not selected here.
     let lane = if kernel_matches(&kernel, "7.0") && glibc == "glibc 2.39" {
         "7.0"
     } else if kernel_matches(&kernel, "6.8") && glibc == "glibc 2.39" {
@@ -3617,10 +3616,37 @@ mod tests {
         let validation_index = source
             .find("let invalid = zero_cookie || invalid_absent;")
             .expect("cookie validation");
-        let ip_index = source.find("helpers::bpf_get_func_ip").expect("IP read");
+        assert!(source.contains("fn uprobe_runtime_ip(ctx: &ProbeContext) -> u64"));
+        let runtime_ip = source.find("fn uprobe_runtime_ip(").unwrap();
+        let runtime_ip_end = source[runtime_ip..].find("\n}").unwrap() + runtime_ip;
+        let runtime_ip_source = &source[runtime_ip..=runtime_ip_end];
+        let helper_ip = runtime_ip_source
+            .find("helpers::bpf_get_func_ip(ctx.as_ptr())")
+            .expect("primary IP helper");
+        let helper_zero_counter = runtime_ip_source
+            .find("increment_counter(FUNC_IP_ZERO_HITS)")
+            .expect("helper-zero counter");
+        let regs_ip = runtime_ip_source
+            .find("(*ctx.regs).rip as u64")
+            .expect("x86-64 pt_regs fallback");
+        assert!(
+            helper_ip < helper_zero_counter && helper_zero_counter < regs_ip,
+            "the helper must remain primary and every fallback must be counted"
+        );
+        let ip_index = source.find("uprobe_runtime_ip(ctx)").expect("IP read");
         let pause_index = source.find("pause_owner_key())").expect("pause path");
         assert!(validation_index < ip_index);
         assert!(pause_index > ip_index);
+        let winner = source[pause_index..].find("if won {").unwrap() + pause_index;
+        let winner_timestamp = source[winner..]
+            .find("hook_ts_ns = unsafe { helpers::bpf_ktime_get_ns() };")
+            .expect("winner timestamp")
+            + winner;
+        let send = source[winner..]
+            .find("helpers::bpf_send_signal(19)")
+            .expect("signal helper")
+            + winner;
+        assert!(winner < winner_timestamp && winner_timestamp < send);
         // one 4-byte r_state read at the frozen offset
         assert!(source.contains("R_STATE_OFFSET"));
         assert!(source.contains("bpf_probe_read_user(address as *const u32)"));

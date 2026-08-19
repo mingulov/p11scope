@@ -677,9 +677,14 @@ Userspace consumes the flag before `case_id`, increments the existing
 attachment. The bit is internal finite status, not a new field or public
 output; bits `0x01` and `0x02` retain their existing meanings.
 
-For a valid cookie, BPF obtains
-`hook_runtime_ip = bpf_get_func_ip(ctx)`, rejects zero, and, only when
-`state_present`, applies the signed delta with checked add/subtract to obtain
+For a valid cookie, BPF first obtains
+`hook_runtime_ip = bpf_get_func_ip(ctx)`. On Linux x86-64 only, a zero helper
+result falls back to the adjusted uprobe address in `pt_regs.rip`; the helper
+remains authoritative whenever it is nonzero, and each fallback is counted in
+private spike evidence. BPF rejects the record only when both sources are zero.
+Gate C must prove the same exact runtime-IP formula on every endpoint, so this
+fallback cannot authorize an offset merely because it is nonzero. When
+`state_present`, BPF applies the signed delta with checked add/subtract to obtain
 `_r_debug`, checked-adds exactly 24, and reads `r_state` with bounded
 `bpf_probe_read_user` as one 4-byte value. It performs no delta arithmetic or
 state read when state is absent. Gate C must prove on both kernels that

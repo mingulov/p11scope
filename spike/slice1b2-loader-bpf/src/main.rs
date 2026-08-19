@@ -21,8 +21,8 @@ const LOADER_HITS: u32 = 2;
 const STATE_READ_FAILURES: u32 = 3;
 /// Diagnostic: hits whose attach cookie was the zero cookie (§7.3 negative).
 const COOKIE_ZERO_HITS: u32 = 4;
-/// Diagnostic: hits where bpf_get_func_ip returned zero (kernel without
-/// uprobe func-IP support, e.g. 5.15 perf uprobes).
+/// Diagnostic: hits where the primary helper returned zero and the x86-64
+/// probe-register fallback was used.
 const FUNC_IP_ZERO_HITS: u32 = 5;
 /// Corrective design §7.3: loader event records reuse the existing 896-byte
 /// DiscoveryRecord with `kind = LOADER = 3`.
@@ -67,8 +67,22 @@ fn pause_owner_key() -> StateKey {
     }
 }
 
+/// `bpf_get_func_ip` is the stable primary source, but Ubuntu's 5.15 uprobe
+/// path returns zero. The x86-64 uprobe handler presents the adjusted probe
+/// address in `pt_regs.rip`, so use that field only when the helper is empty.
+#[inline(always)]
+fn uprobe_runtime_ip(ctx: &ProbeContext) -> u64 {
+    // SAFETY: the probe context is the kernel-provided context for this attachment.
+    let helper_ip = unsafe { helpers::bpf_get_func_ip(ctx.as_ptr()) };
+    if helper_ip != 0 {
+        return helper_ip;
+    }
+    increment_counter(FUNC_IP_ZERO_HITS);
+    // SAFETY: this spike is Linux x86-64-only and ProbeContext owns a valid pt_regs pointer.
+    unsafe { (*ctx.regs).rip as u64 }
+}
+
 struct LoaderArgs {
-    hook_ts_ns: u64,
     pid_tgid: u64,
     cookie: u64,
 }
@@ -122,14 +136,14 @@ fn emit_discovery(ctx: &ProbeContext, args: &LoaderArgs) {
     let mut status: u8 = 0;
     let mut hook_ip: u64 = 0;
     let mut r_state: u32 = 0;
+    // SAFETY: this helper takes no pointers and has no preconditions.
+    let mut hook_ts_ns = unsafe { helpers::bpf_ktime_get_ns() };
     if !invalid {
         // 5. §7.3 valid path: hook IP (reject zero), then only when state is
         //    present apply the checked signed delta and make exactly one
         //    4-byte r_state read; overflow/helper failure never drops the record.
-        // SAFETY: the probe context is the kernel-provided context for this attachment.
-        hook_ip = unsafe { helpers::bpf_get_func_ip(ctx.as_ptr()) };
+        hook_ip = uprobe_runtime_ip(ctx);
         if hook_ip == 0 {
-            increment_counter(FUNC_IP_ZERO_HITS);
             status |= STATUS_CONTEXT_INVALID;
         } else if state_present {
             // §7.3: checked signed delta, then checked-add exactly 24. Overflow is a
@@ -169,7 +183,9 @@ fn emit_discovery(ctx: &ProbeContext, args: &LoaderArgs) {
             None => false,
         };
         if won {
-            // SAFETY: the helper takes no pointers and SIGSTOP is a valid scalar signal.
+            // The causal timestamp is sampled immediately before the one signal request.
+            // SAFETY: these helpers take no pointers and SIGSTOP is a valid scalar signal.
+            hook_ts_ns = unsafe { helpers::bpf_ktime_get_ns() };
             let _ = unsafe { helpers::bpf_send_signal(19) };
         } else {
             status |= STATUS_COALESCED;
@@ -178,7 +194,7 @@ fn emit_discovery(ctx: &ProbeContext, args: &LoaderArgs) {
     // 7. finish initialization and submit the every-hit record
     // SAFETY: same reserved entry; all fields written after the zero stores.
     unsafe {
-        core::ptr::write(core::ptr::addr_of_mut!((*raw).hook_ts_ns), args.hook_ts_ns);
+        core::ptr::write(core::ptr::addr_of_mut!((*raw).hook_ts_ns), hook_ts_ns);
         core::ptr::write(core::ptr::addr_of_mut!((*raw).pid_tgid), args.pid_tgid);
         core::ptr::write(core::ptr::addr_of_mut!((*raw).table_ptr), hook_ip);
         core::ptr::write(core::ptr::addr_of_mut!((*raw).kind), LOADER);
@@ -205,8 +221,6 @@ pub fn dl_debug_state(ctx: ProbeContext) -> u32 {
     emit_discovery(
         &ctx,
         &LoaderArgs {
-            // SAFETY: these helpers take no pointers and have no preconditions.
-            hook_ts_ns: unsafe { helpers::bpf_ktime_get_ns() },
             pid_tgid: helpers::bpf_get_current_pid_tgid(),
             cookie,
         },

@@ -386,7 +386,7 @@ pub fn signal_return(ctx: RetProbeContext) -> u32 {
         },
         None => false,
     };
-    // 5. winner: timestamp at the hook, then a bounded ktime delay so the nonwinner's
+    // 5. winner: bounded ktime delay so the nonwinner's
     //    handler (int3 -> uprobe -> this program) can reserve and submit its own record
     //    before the group stop can suppress it (observed on 5.15/6.8: the nonwinner is
     //    stopped at return-to-user before its deferred uprobe handler runs); only then
@@ -394,13 +394,13 @@ pub fn signal_return(ctx: RetProbeContext) -> u32 {
     // SAFETY: these helpers take no pointers, and SIGSTOP is a valid scalar signal.
     let (hook_ts_ns, send_signal_rc) = unsafe {
         if won {
-            let ts = helpers::bpf_ktime_get_ns();
             let mut polls: u64 = 0;
             while polls < STOP_SIGNAL_DELAY_POLLS {
                 let _ = helpers::bpf_ktime_get_ns();
                 polls += 1;
             }
-            (ts, helpers::bpf_send_signal(19) as i64)
+            let hook_ts_ns = helpers::bpf_ktime_get_ns();
+            (hook_ts_ns, helpers::bpf_send_signal(19) as i64)
         } else {
             (
                 helpers::bpf_ktime_get_ns(),

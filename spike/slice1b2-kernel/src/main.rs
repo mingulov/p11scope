@@ -5340,9 +5340,12 @@ mod tests {
             "order must be reserve -> zero words -> CAS -> single signal -> submit"
         );
         let delay = signal_source.find("STOP_SIGNAL_DELAY_POLLS").unwrap();
+        let winner_timestamp = signal_source
+            .find("let hook_ts_ns = helpers::bpf_ktime_get_ns();")
+            .expect("winner timestamp");
         assert!(
-            cas < delay && delay < send,
-            "the bounded winner delay must sit between the stop-owner CAS and the signal helper"
+            cas < delay && delay < winner_timestamp && winner_timestamp < send,
+            "the timestamp must be taken after the bounded delay and immediately before the signal helper"
         );
         assert!(source.contains("const STOP_SIGNAL_DELAY_POLLS: u64 = 50_000;"));
         assert!(signal_source.contains("pause_owner_key()"));

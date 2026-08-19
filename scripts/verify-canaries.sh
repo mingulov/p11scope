@@ -243,7 +243,7 @@ def assert_scan_only_hostile_output(doc, text, hostile):
     assert evidence["table_entries"] == evidence["slots"] == 1, evidence
     assert evidence["attached_probes"] == 2, evidence
     assert evidence["surfaces"] == [{
-        "source": "scan", "walk": "full", "acquisition": "ok", "functions": 1,
+        "source": "/opt/p11.so table 2.40", "walk": "full", "acquisition": "ok", "functions": 1,
     }], evidence
     assert len(evidence["discovery"]) == 1, evidence
     discovered = evidence["discovery"][0]
@@ -774,7 +774,7 @@ if work == "--self-test":
             "completeness": "PARTIAL", "table_entries": 1, "slots": 1,
             "attached_probes": 2,
             "surfaces": [{
-                "source": "scan", "walk": "full", "acquisition": "ok",
+                "source": "/opt/p11.so table 2.40", "walk": "full", "acquisition": "ok",
                 "functions": 1,
             }],
             "discovery": [{

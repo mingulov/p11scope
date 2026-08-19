@@ -9,8 +9,8 @@ use p11scope::cli::{self, CaptureArgs, CliError, Command, Kind, ScopeArg};
 use p11scope::discovery::identity::pin_manifest_objects;
 use p11scope::discovery::identity::{
     ManifestStaleReason, PinnedObjectId, PinnedObjects, ReconciledModule, StaleManifestObject,
-    pin_manifest_objects_deferred_in_views, pin_scanned_view_objects, reconcile_scanned_modules,
-    target_paths_equal,
+    bind_scanned_modules, canonicalize_scanned_overlays, pin_manifest_objects_deferred_in_views,
+    pin_scanned_view_objects, target_paths_equal,
 };
 #[cfg(test)]
 use p11scope::discovery::scan::ScanLimits;
@@ -1795,6 +1795,15 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
     let (mut pinned, aggregation_skips) =
         PinnedObjects::aggregate_views(discovered.scan_inputs.values().map(|input| &input.pins));
     counters.object_skips.extend(aggregation_skips);
+    let (collapsed, overlay_skips) = canonicalize_scanned_overlays(&mut pinned);
+    if collapsed > 0 {
+        eprintln!(
+            "p11scope: discovery: {collapsed} matching overlay mapping(s) were collapsed \
+             onto one attach target; physical identity is not provable, so published \
+             uncertainty makes this capture PARTIAL"
+        );
+    }
+    counters.object_skips.extend(overlay_skips);
     let mut accepted = Vec::new();
     let mut pending_fallbacks = Vec::new();
     let mut pending_outcomes = Vec::new();
@@ -1977,14 +1986,7 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
         }
     }
 
-    let (modules, collapsed, differed) = reconcile_scanned_modules(&scan_modules, &mut pinned);
-    if collapsed > 0 {
-        eprintln!(
-            "p11scope: discovery: {collapsed} matching overlay mapping(s) were collapsed \
-             onto one attach target; physical identity is not provable, so published \
-             uncertainty makes this capture PARTIAL"
-        );
-    }
+    let (modules, differed) = bind_scanned_modules(&scan_modules, &mut pinned);
     counters.object_skips.extend(differed);
     let corroborated =
         bind_pending_corroboration(pending_outcomes, &modules, &pinned, &mut counters)?;
@@ -3920,7 +3922,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_corroboration_follows_the_final_overlay_canonical_id() {
+    fn pending_fallback_outcome_follows_the_final_overlay_canonical_id_without_authority() {
         let key = ObjectKey {
             device: p11scope_manifest::maps::Device {
                 major: 0,
@@ -3961,7 +3963,7 @@ mod tests {
                 owners: vec![OutcomeOwner::Scan(ScanOutcomeLocator::module(
                     &second.scanned,
                 ))],
-                label: "agreed",
+                label: "object_fallback",
             }],
             &[first, second],
             &PinnedObjects::empty(),
@@ -3969,11 +3971,17 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(corroborated, [PinnedObjectId(200)].into_iter().collect());
+        assert!(
+            corroborated.is_empty(),
+            "a scan-only overlay collapse can bind fallback evidence but never semantic authority"
+        );
         assert_eq!(
             counters.corroboration,
-            vec![([PinnedObjectId(200)].into_iter().collect(), "agreed")],
-            "the overlay peer's locator binds to its final canonical ID, never a stale pre-remap ID"
+            vec![(
+                [PinnedObjectId(200)].into_iter().collect(),
+                "object_fallback"
+            )],
+            "the overlay peer's fallback locator binds to its final canonical ID, never a stale pre-remap ID"
         );
     }
 

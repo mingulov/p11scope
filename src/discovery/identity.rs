@@ -263,9 +263,10 @@ impl PinnedObjects {
             let Some(mut entry) = entries.remove(&old_id) else {
                 continue;
             };
+            let incoming_scan_only = instances.iter().all(|raw| raw.mount_namespace.is_some());
             let raw = instances.remove(0);
             entry.raw = raw.clone();
-            let id = self.insert_entry(entry, &mut skipped);
+            let id = self.insert_entry_with_aliases(entry, incoming_scan_only, &mut skipped);
             if let Some(id) = id {
                 id_map.insert(old_id, id);
                 for raw in instances {
@@ -524,6 +525,16 @@ impl PinnedObjects {
     }
 
     fn insert_entry(&mut self, entry: Entry, skipped: &mut Vec<Skipped>) -> Option<PinnedObjectId> {
+        let incoming_scan_only = entry.raw.mount_namespace.is_some();
+        self.insert_entry_with_aliases(entry, incoming_scan_only, skipped)
+    }
+
+    fn insert_entry_with_aliases(
+        &mut self,
+        entry: Entry,
+        incoming_scan_only: bool,
+        skipped: &mut Vec<Skipped>,
+    ) -> Option<PinnedObjectId> {
         let key = entry.raw.key;
         if self.rejected_keys.contains(&key) {
             self.ambiguous_keys.insert(key);
@@ -542,14 +553,14 @@ impl PinnedObjects {
             self.raw_to_id.insert(entry.raw, id);
             return Some(id);
         }
-        if let Some(id) = same_key
-            .iter()
-            .copied()
-            .find(|id| overlay_identity_equal(&self.by_id[id], &entry))
-        {
-            skipped.push(overlay_uncertainty(&entry, &self.by_id[&id]));
-            self.raw_to_id.insert(entry.raw, id);
-            return Some(id);
+        if incoming_scan_only {
+            if let Some(id) = same_key.iter().copied().find(|id| {
+                self.aliases_are_scan_only(*id) && overlay_identity_equal(&self.by_id[id], &entry)
+            }) {
+                skipped.push(overlay_uncertainty(&entry, &self.by_id[&id]));
+                self.raw_to_id.insert(entry.raw, id);
+                return Some(id);
+            }
         }
         if !same_key.is_empty() {
             self.reject_key(key);
@@ -563,6 +574,17 @@ impl PinnedObjects {
         self.raw_to_id.insert(entry.raw.clone(), id);
         self.by_id.insert(id, entry);
         Some(id)
+    }
+
+    fn aliases_are_scan_only(&self, id: PinnedObjectId) -> bool {
+        let mut aliases = self
+            .raw_to_id
+            .iter()
+            .filter_map(|(raw, observed)| (*observed == id).then_some(raw));
+        aliases
+            .next()
+            .is_some_and(|raw| raw.mount_namespace.is_some())
+            && aliases.all(|raw| raw.mount_namespace.is_some())
     }
 
     fn reject_key(&mut self, key: ObjectKey) {
@@ -1190,19 +1212,15 @@ fn record_scanned_candidate(
     }
 }
 
-/// Resolves every process-view-local mapping reference to a capture-local opened
-/// object. Ordinary identities merge only when their complete mapping identity,
-/// pin metadata, and digest agree. The one pre-existing exception is the bounded
-/// overlayfs heuristic, which preserves all process views and publishes uncertainty.
-pub fn reconcile_scanned_modules(
-    modules: &[ScannedModule],
-    pinned: &mut PinnedObjects,
-) -> (Vec<ReconciledModule>, usize, Vec<Skipped>) {
+/// Collapses only scan-owned overlay aliases that have matching pinned metadata and
+/// digests. Manifest aliases remain exact inputs: the overlay heuristic never gives
+/// them a scan peer's capture-local identity.
+pub fn canonicalize_scanned_overlays(pinned: &mut PinnedObjects) -> (usize, Vec<Skipped>) {
     let mut first: BTreeMap<(Pin, &str), PinnedObjectId> = BTreeMap::new();
     let mut canonical: BTreeMap<PinnedObjectId, PinnedObjectId> = BTreeMap::new();
     let mut lost = Vec::new();
     for (id, entry) in &pinned.by_id {
-        if entry.sha256.is_empty() || !entry.overlay {
+        if entry.sha256.is_empty() || !entry.overlay || !pinned.aliases_are_scan_only(*id) {
             continue;
         }
         match first.entry((entry.pin, entry.sha256.as_str())) {
@@ -1227,8 +1245,18 @@ pub fn reconcile_scanned_modules(
     for id in canonical.keys() {
         pinned.by_id.remove(id);
     }
+    (canonical.len(), lost)
+}
 
+/// Resolves every process-view-local mapping reference to its final capture-local
+/// opened identity. It does not apply overlay heuristics, so callers can bind after
+/// manifest absorption without moving manifest authority between scan peers.
+pub fn bind_scanned_modules(
+    modules: &[ScannedModule],
+    pinned: &mut PinnedObjects,
+) -> (Vec<ReconciledModule>, Vec<Skipped>) {
     let mut reconciled = Vec::new();
+    let mut lost = Vec::new();
     for module in modules {
         let Some(object) = pinned.id_for_scanned(module, module.key, &module.path) else {
             lost.push(Skipped {
@@ -1281,7 +1309,21 @@ pub fn reconcile_scanned_modules(
             entry_objects,
         });
     }
-    (reconciled, canonical.len(), lost)
+    (reconciled, lost)
+}
+
+/// Resolves every process-view-local mapping reference to a capture-local opened
+/// object. Ordinary identities merge only when their complete mapping identity,
+/// pin metadata, and digest agree. The bounded overlayfs heuristic is scan-only and
+/// preserves all process views while publishing uncertainty.
+pub fn reconcile_scanned_modules(
+    modules: &[ScannedModule],
+    pinned: &mut PinnedObjects,
+) -> (Vec<ReconciledModule>, usize, Vec<Skipped>) {
+    let (collapsed, mut lost) = canonicalize_scanned_overlays(pinned);
+    let (reconciled, binding_lost) = bind_scanned_modules(modules, pinned);
+    lost.extend(binding_lost);
+    (reconciled, collapsed, lost)
 }
 
 fn pin_scanned_object(
@@ -1343,6 +1385,11 @@ fn pin_scanned_object(
 mod tests {
     use super::*;
     use crate::discovery::scan::{ScannedEntry, ScannedTable};
+    use p11scope_manifest::identity::{IdentityKind, ObjectIdentity};
+    use p11scope_manifest::manifest::{
+        Acquisition, FunctionRecord, ObjectRecord, ProvenanceObject, SurfaceRecord, SurfaceSource,
+        Version, WalkOutcome,
+    };
 
     const SHA: &str = "b4e608e4";
     /// The inode and the two overlay device numbers a two-container docker run
@@ -1432,6 +1479,61 @@ mod tests {
     /// The same objects, opened on a real filesystem rather than through an overlay.
     fn image_pins(entries: &[(ObjectKey, &str, i64)]) -> PinnedObjects {
         pin_set(entries, false)
+    }
+
+    fn manifest_pins(key: ObjectKey, sha256: &str, ctime: i64) -> PinnedObjects {
+        let mut pins = pin_set(&[(key, sha256, ctime)], true);
+        let (raw, id) = pins.raw_to_id.pop_first().expect("one scan raw alias");
+        assert!(raw.mount_namespace.is_some());
+        let raw = RawObjectInstance::manifest(key, PATH.into()).expect("absolute manifest path");
+        pins.by_id.get_mut(&id).expect("entry for raw alias").raw = raw.clone();
+        pins.raw_to_id.insert(raw, id);
+        pins
+    }
+
+    fn manifest_for(key: ObjectKey) -> Manifest {
+        let identity = ObjectIdentity {
+            kind: IdentityKind::GnuBuildId,
+            value: Some("fixture".into()),
+            sha256: Some(SHA.repeat(8)),
+            reusable: true,
+            note: None,
+        };
+        Manifest {
+            schema: "test".into(),
+            module_path: PATH.into(),
+            objects: vec![ObjectRecord {
+                id: 0,
+                path: PATH.into(),
+                identity: identity.clone(),
+            }],
+            provenance_objects: vec![ProvenanceObject {
+                path: PATH.into(),
+                device_major: key.device.major,
+                device_minor: key.device.minor,
+                inode: key.inode,
+                identity,
+            }],
+            interface_list: Acquisition::Absent,
+            surfaces: vec![SurfaceRecord {
+                source: SurfaceSource::LegacyFunctionList,
+                acquisition: Acquisition::Ok,
+                version: Some(Version {
+                    major: 2,
+                    minor: 40,
+                }),
+                walk: WalkOutcome::Full,
+                functions: vec![FunctionRecord {
+                    name: "C_Initialize".into(),
+                    resolution: Resolution::Resolved {
+                        object: 0,
+                        file_offset: 0x1000,
+                    },
+                }],
+            }],
+            vendor_interfaces: vec![],
+            alias_groups: vec![],
+        }
     }
 
     fn view_pin(
@@ -1907,6 +2009,142 @@ mod tests {
                 .contains("cannot prove physical identity across overlay instances"),
             "{skipped:?}"
         );
+    }
+
+    #[test]
+    fn manifest_attestation_cannot_cross_a_scan_only_overlay_collapse() {
+        let a = module(overlay(102));
+        let b = module(overlay(104));
+        let mut pinned = pins(&[(a.key, SHA, 1), (b.key, SHA, 1)]);
+
+        let (_, collapsed, initial_uncertainty) =
+            reconcile_scanned_modules(&[a.clone(), b.clone()], &mut pinned);
+        assert_eq!(collapsed, 1);
+        assert_eq!(initial_uncertainty.len(), 1, "{initial_uncertainty:?}");
+
+        assert!(pinned.absorb(manifest_pins(b.key, SHA, 1)).is_empty());
+        let (scanned, _, _) = reconcile_scanned_modules(&[a.clone(), b.clone()], &mut pinned);
+        let scan_id = pinned
+            .id_for_scanned(&a, a.key, &a.path)
+            .expect("canonical scan pin");
+        let manifest_id = pinned
+            .id_for_manifest(b.key, PATH)
+            .expect("exact manifest pin");
+        let plan = crate::plan::build_from_sources(&scanned, &[manifest_for(b.key)], &pinned);
+        let scan_slot = plan
+            .slots
+            .iter()
+            .find(|slot| slot.object == scan_id)
+            .expect("scan overlay slot");
+
+        assert!(
+            !scan_slot.semantic_authorized,
+            "an exact manifest for overlay B must not authorize uncertain scan peer A"
+        );
+        assert_eq!(
+            scan_slot.semantics,
+            p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+        );
+        let manifest_slot = plan
+            .slots
+            .iter()
+            .find(|slot| slot.object == manifest_id)
+            .expect("manifest B remains a distinct pinned object");
+        assert!(manifest_slot.semantic_authorized);
+        assert_ne!(scan_id, manifest_id);
+    }
+
+    #[test]
+    fn same_raw_key_overlay_exception_never_crosses_sources_in_either_absorb_order() {
+        let key = overlay(102);
+        for manifest_first in [false, true] {
+            let scan = pins(&[(key, SHA, 1)]);
+            let mut manifest = manifest_pins(key, SHA, 1);
+            manifest
+                .by_id
+                .values_mut()
+                .next()
+                .expect("manifest entry")
+                .mapping
+                .mount_id += 1;
+            let (mut first, second) = if manifest_first {
+                (manifest, scan)
+            } else {
+                (scan, manifest)
+            };
+
+            let skipped = first.absorb(second);
+
+            assert_eq!(
+                first.pinned().count(),
+                0,
+                "cross-source overlay fallback must reject the same raw key ({manifest_first})"
+            );
+            assert_eq!(ambiguity_count(&skipped), 1, "{skipped:?}");
+        }
+    }
+
+    #[test]
+    fn overlay_merge_rejects_a_scan_peer_when_the_candidate_has_a_manifest_alias() {
+        let key = overlay(102);
+        let mut pinned = pins(&[(key, SHA, 1)]);
+        assert!(pinned.absorb(manifest_pins(key, SHA, 1)).is_empty());
+        let id = pinned
+            .id_for_scanned(&module(key), key, PATH)
+            .expect("exact scan alias");
+        assert_eq!(pinned.sources(id), ["scan", "manifest"]);
+
+        let mut peer = pins(&[(key, SHA, 1)]);
+        peer.by_id
+            .values_mut()
+            .next()
+            .expect("scan peer")
+            .mapping
+            .mount_id += 1;
+        let skipped = pinned.absorb(peer);
+
+        assert_eq!(
+            pinned.pinned().count(),
+            0,
+            "a mixed candidate group must not receive another scan peer through overlay equality"
+        );
+        assert_eq!(ambiguity_count(&skipped), 1, "{skipped:?}");
+    }
+
+    #[test]
+    fn overlay_merge_rejects_a_mixed_incoming_group() {
+        let key = overlay(102);
+        let mut receiver = pins(&[(key, SHA, 1)]);
+        let mut incoming = pins(&[(key, SHA, 1)]);
+        incoming
+            .by_id
+            .values_mut()
+            .next()
+            .expect("incoming scan pin")
+            .mapping
+            .mount_id += 1;
+        let mut incoming_manifest = manifest_pins(key, SHA, 1);
+        incoming_manifest
+            .by_id
+            .values_mut()
+            .next()
+            .expect("incoming manifest pin")
+            .mapping
+            .mount_id += 1;
+        assert!(incoming.absorb(incoming_manifest).is_empty());
+        let id = incoming
+            .id_for_scanned(&module(key), key, PATH)
+            .expect("incoming scan alias");
+        assert_eq!(incoming.sources(id), ["scan", "manifest"]);
+
+        let skipped = receiver.absorb(incoming);
+
+        assert_eq!(
+            receiver.pinned().count(),
+            0,
+            "a mixed incoming group must not use overlay equality to join a scan-only peer"
+        );
+        assert_eq!(ambiguity_count(&skipped), 1, "{skipped:?}");
     }
 
     #[test]

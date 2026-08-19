@@ -2377,10 +2377,7 @@ fn run_protect_attempt(
             if mode == "hidden" {
                 // Slot addresses derive from the entry probe's stored argument:
                 // arg0 -> table pointer -> the 104 relocated slot pointers.
-                let arg_key = common::StateKey {
-                    pid_tgid: (pid as u64) << 32,
-                    attach_cookie: EXPORT_COOKIE,
-                };
+                let arg_key = main_thread_start_key(pid, EXPORT_COOKIE);
                 let state = ab_start.get(&arg_key, 0).map_err(|_| "start map read")?;
                 let table_ptr = u64::from_le_bytes(
                     read_child_memory(pid, state.arg0, 8)?[..8]
@@ -2904,6 +2901,14 @@ fn hidden_race_measurement_complete(
     slot_pairs.is_some_and(|count| count <= PROVIDER_TABLE_POINTERS as u64)
         && window_us.is_some()
         && escaped.is_some()
+}
+
+fn main_thread_start_key(pid: i32, attach_cookie: u64) -> common::StateKey {
+    let id = u64::from(pid as u32);
+    common::StateKey {
+        pid_tgid: (id << 32) | id,
+        attach_cookie,
+    }
 }
 
 fn median(values: &mut [u64]) -> Option<u64> {
@@ -3864,5 +3869,12 @@ mod tests {
             Some(25),
             Some(true)
         ));
+    }
+
+    #[test]
+    fn per_call_start_key_keeps_both_tgid_and_tid() {
+        let key = main_thread_start_key(0x1234, EXPORT_COOKIE);
+        assert_eq!(key.pid_tgid, 0x1234_0000_1234);
+        assert_eq!(key.attach_cookie, EXPORT_COOKIE);
     }
 }

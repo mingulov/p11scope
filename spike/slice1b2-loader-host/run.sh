@@ -811,7 +811,7 @@ build_bpf() {
         return 64
     }
     here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-    root=$(cd "$here/../.." && pwd)
+    root=$(cd "$here/.." && pwd)
     [[ -z $(git -C "$root" status --porcelain --untracked-files=all) ]] || {
         printf 'build-bpf requires clean HEAD\n' >&2
         return 64

@@ -10,11 +10,11 @@ table (including stripped providers with no `C_*` symbols), attaches probes by
 file offset, and produces a versioned `observed-profile.json` for migration
 assessment and incident diagnostics.
 
-> **Status: unreleased; Slice 1b-1 remains open.** Its memory-scan discovery,
+> **Status: unreleased; Slice 1b-1 local evidence is complete.** Its memory-scan discovery,
 > `inspect`, `doctor`, multi-module capture, schema v2, corrective Tasks 1–5,
-> and the owner-selected semantic-authority implementation are complete. The
-> independent whole-range correctness/security reviews, exact-candidate
-> privileged/container matrix, and CI remain pending.
+> and the owner-selected semantic-authority implementation are complete. Final
+> whole-range correctness/security reviews and the exact-candidate local matrix
+> passed on 2026-08-19. CI remains pending.
 > Loader/export hooks and `run` remain Slice 1b-2 and are not present here.
 
 Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40
@@ -205,12 +205,13 @@ Memory scanning is heuristic discovery. Live and terminal evidence are PARTIAL
 while scan-only semantic claims remain. P11Lab joins reject scan-only and
 conflict modules; an accepted manifest may authorize only its exact pinned
 object, offset, and canonical function name. Slice 1b-2 live acquisition
-remains future work. Slice 1b-1 remains open until independent whole-range
-reviews and the exact-candidate privileged matrix are complete.
+remains future work. Final whole-range correctness/security reviews and the
+exact-candidate local matrix passed on 2026-08-19; Slice 1b-1 remains
+unreleased while CI remains pending.
 
-Fresh final-candidate unprivileged results are recorded in the Task 4 handoff.
-No privileged/container matrix has run on this candidate; historical matrix
-results are not current evidence. CI and whole-range reviews remain pending.
+Fresh final-candidate unprivileged, privileged, container, Kubernetes, and
+release results are recorded in the Task 4 handoff. No remote CI result is
+claimed.
 
 When used, the helper recreates the table in its own process; it never reads or
 injects into the observed process. Uprobes are bound to the verified target

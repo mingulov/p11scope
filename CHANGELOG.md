@@ -2,10 +2,10 @@
 
 ## Unreleased — productization slice 1b-1
 
-Slice 1b-1 remains open. Corrective Tasks 1–5 and the owner-selected
-semantic-authority implementation are complete; independent whole-range
-correctness/security reviews, the exact-candidate privileged/container matrix,
-and CI remain pending. Slice 1b-2 live acquisition remains future work.
+Corrective Tasks 1–5 and the owner-selected semantic-authority implementation
+are complete. Final whole-range correctness/security reviews and the
+exact-candidate local matrix passed on 2026-08-19. CI remains pending, so this
+slice is still unreleased. Slice 1b-2 live acquisition remains future work.
 
 - **Discovery**: `profile` and `trace` scan the target's mapped memory once at
   attach, so neither a manifest nor the offline helper is required. Repeatable

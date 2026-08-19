@@ -641,10 +641,7 @@ fn operator_docs_preserve_semantic_authority_limits() {
             "CHANGELOG.md",
             "Slice 1b-2 live acquisition remains future work",
         ),
-        (
-            "docs/superpowers/plans/ROADMAP.md",
-            "Implementation complete, independent review and privileged matrix pending",
-        ),
+        ("docs/superpowers/plans/ROADMAP.md", "CI remains pending"),
     ] {
         assert!(
             read(path)
@@ -653,6 +650,44 @@ fn operator_docs_preserve_semantic_authority_limits() {
                 .join(" ")
                 .contains(statement),
             "{path} is missing: {statement}"
+        );
+    }
+
+    for path in [
+        "README.md",
+        "docs/usage.md",
+        "CHANGELOG.md",
+        "docs/superpowers/plans/ROADMAP.md",
+    ] {
+        let document = read(path).split_whitespace().collect::<Vec<_>>().join(" ");
+        for statement in [
+            "Final whole-range correctness/security reviews and the exact-candidate local matrix passed on 2026-08-19",
+            "CI remains pending",
+        ] {
+            assert!(
+                document.contains(statement),
+                "{path} is missing: {statement}"
+            );
+        }
+    }
+
+    for path in ["README.md", "docs/usage.md", "CHANGELOG.md"] {
+        assert!(read(path).to_lowercase().contains("unreleased"), "{path}");
+    }
+    for path in ["docs/usage.md", "docs/superpowers/plans/ROADMAP.md"] {
+        let document = read(path).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            document.contains("no release or security-clearance claim"),
+            "{path}"
+        );
+    }
+    for path in ["README.md", "docs/usage.md"] {
+        let document = read(path).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            document.contains(
+                "Loader/export hooks and `run` remain Slice 1b-2 and are not present here"
+            ),
+            "{path}"
         );
     }
 }

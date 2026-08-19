@@ -407,10 +407,9 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     file identity with the existing overlay-only uncertainty; retained process generations
     and per-view ownership through attach; and exact per-object stale-manifest fallback.
     These changes do not implement Slice 1b-2. Task 6 rejects unsupported
-    `doctor --module`. Implementation complete, independent review and privileged
-    matrix pending: fresh full-range correctness/security review, exact-candidate
-    privileged/container matrices, and CI must still be reconciled. No completion
-    or security-clearance claim applies while those gates remain open.**
+    `doctor --module`. Final whole-range correctness/security reviews and the
+    exact-candidate local matrix passed on 2026-08-19. CI remains pending, so no
+    release or security-clearance claim applies yet.**
   - **Slice 1b-2 — live discovery and `run`**: BPF loader (`_dl_debug_state`) and export
     uretprobes, `DESCRIPTORS` + attach-cookie semantics with dynamic slot allocation,
     `discovery::Engine`, `pause.rs`, `run -- cmd`, `attach_gap_ms`, mid-capture

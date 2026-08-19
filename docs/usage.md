@@ -5,11 +5,11 @@ how to run it, and what its output actually proves. Measured examples below
 name the script that produced them so they can be reproduced; fixed
 implementation limits are code contracts, not measurements.
 
-> **Status: unreleased; Slice 1b-1 remains open.** Memory-scan discovery,
+> **Status: unreleased; Slice 1b-1 local evidence is complete.** Memory-scan discovery,
 > `inspect`, `doctor`, multi-module capture, schema v2, corrective Tasks 1–5,
-> and the owner-selected semantic-authority implementation are complete. The
-> independent whole-range correctness/security reviews, exact-candidate
-> privileged/container matrix, and CI remain pending.
+> and the owner-selected semantic-authority implementation are complete. Final
+> whole-range correctness/security reviews and the exact-candidate local matrix
+> passed on 2026-08-19. CI remains pending.
 > Loader/export hooks and `run` remain Slice 1b-2 and are not present here.
 > See the
 > [safe metadata design](superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md)
@@ -423,10 +423,9 @@ pinned object, offset, and canonical function name it attests; stale fallback,
 hash agreement, path identity, and raw `{dev,ino}` never transfer that
 attestation. Slice 1b-2 live acquisition remains future work.
 
-Slice 1b-1 implementation is complete, but independent whole-range
-correctness/security reviews, the exact-candidate privileged/container matrix,
-and CI remain pending. No completion or security-clearance claim applies while
-those gates remain open.
+Slice 1b-1 implementation is complete. Final whole-range correctness/security
+reviews and the exact-candidate local matrix passed on 2026-08-19. CI remains
+pending, so no release or security-clearance claim applies yet.
 
 **`PARTIAL`** is forced by any single gap in that list — an attach
 failure, ring-buffer loss, a template the in-kernel walk couldn't finish

@@ -14,9 +14,10 @@ separately permissioned (corrective design §9.4).
 | `analyses/` | The four design-pinned corrective analyses plus every other retained `slice1b2-*.md` analysis/report from `/tmp` (raw addresses and paths inside; private) |
 | `gate-a/` | Retained Gate A six-file evidence exports and `.sha256` inventories (jammy, noble), the retained longer-diagnostic exports, and the D2 diagnostic lane run dirs (`diag-*`; disposable `runtime.qcow2` overlays deleted after each verified clean shutdown — retained bases were hash-pinned before/after in `retained.*.sha256`) |
 | `gate-b/` | Gate B evidence exports and run dirs (Task 5 campaign `final6-*`, retained iteration/failing-run evidence `final1`–`final5`, `task4-*`) |
-| `loader/` | Loader witness harness canonical round-2 transcripts and artifacts (`loader/round2/`), retained round-1 diagnostics (`loader/round1/`) |
-| `bundles/` | Frozen execution bundles (`task4-37c5b41-bundle/`: runner, fixture, `slice1b2-kernel-ebpf`, manifests; `diag-9da22b6-bundle/`: same BPF + fixture bytes re-frozen with the `gate-a-diag` runner) |
-| `MANIFEST.sha256` | SHA-256 of every file in the root except itself (2,794 files after Task 6). Digest: `004ccdfded0361d65765aff7016023ae4ba08f7f49a3e58b0d438c89cc90b5bf` |
+| `loader/` | Loader witness harness canonical round-2 transcripts and artifacts (`loader/round2/`), retained round-1 diagnostics (`loader/round1/`), round-3 released-glibc precontrols (`loader/round3/`) |
+| `loader-artifact/` | Task 7 loader-event lanes (`{jammy,noble}-20ecebd/`: five-file exports + `.sha256`) |
+| `bundles/` | Frozen execution bundles (`task4-37c5b41-bundle/`: runner, fixture, `slice1b2-kernel-ebpf`, manifests; `diag-9da22b6-bundle/`: same BPF + fixture bytes re-frozen with the `gate-a-diag` runner; `final6-9daeb53-bundle/`: Task 5 campaign; `loader-*-bundle/`: Task 7 loader artifact rounds) |
+| `MANIFEST.sha256` | SHA-256 of every file in the root except itself (2,830 files after Task 7). Digest: `5f1b0165256f65dd865166992b91827be44293b25fb7f0b273d2b61776d70fe9` |
 
 The tracked, scrubbed witness harness itself is `spike/slice1b2-loader/`
 (repo-relative `run-lanes.sh`, lane-filterable, driven by
@@ -189,4 +190,49 @@ Lanes run from committed HEADs on `spike/slice1b2-gates`; transcripts at
   message states), while the round-2 dlopen transcripts keep `FAIL_ZERO` on 2.35/2.39.
 - Round-2 history (dlopen kind) unchanged: 2.35/2.39 `FAIL` (`FAIL_ZERO`), musl `PASS`.
 
-(Task 7 pending.)
+(Task 7 below.)
+
+### Task 7 — minimal ptrace-free loader event program (COMPLETE)
+
+Artifact crates `spike/slice1b2-loader-bpf/` (own aya-ebpf crate: `dl_debug_state`
+uprobe on the 896-byte `DiscoveryRecord`, kind LOADER=3, §7.3 cookie
+validation, 112 flat volatile zero stores guarded by `check-init-shape.py`,
+§5.3 owner-CAS pause path, every-hit record) and `spike/slice1b2-loader-host/`
+(own Rust 1.88 runner: cookie round-trip, 256-slot monotonic registry,
+pre-exec attach through the fixture `PT_INTERP`, §8.1 no-cookie negative,
+own `run.sh` lanes; the A/B `spike/slice1b2-kernel/` artifact is untouched —
+freeze boundary respected). Commits `7b33632`..`23f853a` (highlights:
+`9ba2ade` lane-kernel prefix match fix, `6d53950` `.bss` `_r_debug` + exec-gated
+bias + invalid-cause counters, `20ecebd` facts row categories, `eee28e9`
+validator startup-only `loader_sha256`, `23f853a` export-dir cleanup).
+
+Frozen bundle `bundles/loader-20ecebd-bundle/` (source commit `20ecebd`):
+`slice1b2-loader-bpf` `e20988ad8504a47bf27c0d6e1de6dd354634508ae5c246acfac671b0b6f95e60`,
+`slice1b2-runner` `bbf43c23889f807019dd7bb2b5ba471358676c016557f3fad210343dcb673298`,
+`slice1b2-fixture` `f84b8aace82bbb18fa2c96ec05eddafbfedbef09102429e00292d70155d1a872`,
+`source-elf.manifest` `b07be4204ceb129458137189b942e921b77c72ef1db7139a721e6c02c1347342`.
+Lane evidence under `loader-artifact/{jammy,noble}-20ecebd/` (final lanes run
+from `23f853a` harness; the runner/bpf bytes are the frozen `20ecebd` bundle).
+
+- **Noble 6.8 (glibc 2.39), KVM: PASS.** `loader-diag` accepted; startup flow:
+  2 hits with `r_states == [1, 0]` (`RT_ADD` then `RT_CONSISTENT`),
+  `formula_holds` (hook IP == load bias + `_dl_debug_state` vaddr),
+  `derived_debug_address_ok` (hook IP + cookie delta == load bias + `_r_debug`
+  vaddr), 0 invalid records, 0 read failures, START empty at exit, registry
+  decodable after tombstone; no-cookie negative: exactly one
+  `loader_context_invalid` record, `cookie_zero_hits == 1`, no IP/state/case-id
+  operation. `runner-status`: `PASS / none`.
+- **Jammy 5.15 (glibc 2.35), KVM: FAIL(oracle) — kernel limitation proven.**
+  The program loads (diag PASS), cookies ARE delivered (`cookie_zero_hits == 0`),
+  the `.bss` `_r_debug` delta is carried (`state_present_delta == true`), the
+  no-cookie negative PASSES, but `func_ip_zero_hits == 2`: **`bpf_get_func_ip`
+  returns 0 for perf uprobes on 5.15.0-187**, so both startup records take the
+  `loader_context_invalid` path (status 0x04) and the formula/r_state oracles
+  cannot hold. This is a first-class endpoint fact for D3: a 5.15-compatible
+  hook-IP derivation (e.g. reading `pt_regs.ip` from the probe context) would
+  be a spec change, not taken unilaterally.
+- Fix provenance (earlier lanes under `bundles/loader-{9ba2ade,6d53950}-bundle/`,
+  preserved): `state_present_delta == false` on both guests was the host-side
+  `.bss` rejection; `formula_holds == false` on 6.8 was the pre-`execve` bias
+  poll reading the runner-inherited loader mapping (now gated on
+  `/proc/<pid>/exe` == fixture).

@@ -291,6 +291,8 @@ program missing
 program type
 program detach
 pidfd resume
+pidfd kill
+child reap
 accepted stop ledger
 successor marker
 successor signal record timeout
@@ -342,6 +344,8 @@ def uint(value, bits=64):
     return type(value) is int and 0 <= value < (1 << bits)
 def sint(value):
     return type(value) is int and -(1 << 63) <= value < (1 << 63)
+def optional_sint(value):
+    return value is None or sint(value)
 def sample_well_formed(sample):
     if not isinstance(sample, dict):
         return False
@@ -386,7 +390,7 @@ def samples_well_formed(item):
             return False
     return True
 def cycle_well_formed(cycle):
-    u64 = ["hook_ts_ns", "cycle_deadline_ns", "last_attach_ts_ns", "late_hits",
+    u64 = ["hook_ts_ns", "cycle_deadline_ns", "last_attach_ts_ns", "resume_completed_ns", "late_hits",
            "winner_records", "coalesced_records", "signal_helper_calls",
            "required_attach_keys", "attached_while_stopped"]
     u32 = ["expected_task_count", "stopped_snapshot_1_count", "stopped_snapshot_2_count",
@@ -400,7 +404,8 @@ def cycle_well_formed(cycle):
         "post_attach_exact_expected_task_set", "post_attach_all_tasks_stopped",
         "post_attach_marker_observed", "queue_empty_before_resume", "signal_attach_accepted",
         "late_attach_accepted", "resume_via_original_pidfd", "owner_removed",
-        "post_resume_marker_observed",
+        "post_resume_marker_observed", "successor_installed_while_stopped",
+        "successor_boundary_all_tasks_stopped",
     ]
     if not isinstance(cycle, dict) or any(not uint(cycle.get(name)) for name in u64):
         return False
@@ -459,6 +464,7 @@ def common_cycle(cycle):
         and gap >= 0 and cycle["attach_gap_ms"] == gap / 1000000.0
         and cycle["pidfd_resume_attempts"] == 1 and cycle["pidfd_resume_rc"] == 0
         and cycle["resume_via_original_pidfd"] is True and cycle["owner_removed"] is True
+        and cycle["resume_completed_ns"] >= cycle["last_attach_ts_ns"]
     )
 def outcome_a_cycle(cycle):
     return (
@@ -475,8 +481,32 @@ def outcome_b_cycle(cycle, final):
         and cycle["coalesced_send_signal_rcs"] == [] and cycle["winner_case_id"] in {1, 2}
         and cycle["coalesced_case_id"] == 0 and cycle["required_attach_keys"] == 1
         and cycle["attached_while_stopped"] == 1 and cycle["late_attach_attempts"] == 1
-        and (not final or (cycle["post_resume_marker_observed"] is True and cycle["markers_after_resume"] == 2 and cycle["late_hits"] == 2))
-        and (final or (cycle["post_resume_marker_observed"] is False and cycle["markers_after_resume"] == 0 and cycle["late_hits"] == 0))
+        and (not final or (cycle["successor_installed_while_stopped"] is False and cycle["successor_boundary_all_tasks_stopped"] is False and cycle["post_resume_marker_observed"] is True and cycle["markers_after_resume"] == 2 and cycle["late_hits"] == 2))
+        and (final or (cycle["successor_installed_while_stopped"] is True and cycle["successor_boundary_all_tasks_stopped"] is True and cycle["post_resume_marker_observed"] is False and cycle["markers_after_resume"] == 0 and cycle["late_hits"] == 0))
+    )
+def cleanup_well_formed(cleanup):
+    if not isinstance(cleanup, dict):
+        return False
+    if any(not uint(cleanup.get(name), 8) for name in ["resume_attempts", "protective_resume_attempts"]):
+        return False
+    if any(not isinstance(cleanup.get(name), bool) for name in [
+        "may_be_stopped", "resume_via_original_pidfd", "protective_resume_via_original_pidfd",
+        "kill_via_original_pidfd", "reap_attempted", "reaped",
+    ]):
+        return False
+    return all(optional_sint(cleanup.get(name)) for name in [
+        "resume_rc", "protective_resume_rc", "kill_rc", "reap_rc",
+    ])
+def cleanup_is_clean(cleanup):
+    return (
+        cleanup["may_be_stopped"] is False and cleanup["resume_attempts"] == 0
+        and cleanup["protective_resume_attempts"] == 0
+        and cleanup["resume_via_original_pidfd"] is False and cleanup["resume_rc"] is None
+        and cleanup["protective_resume_via_original_pidfd"] is False
+        and cleanup["protective_resume_rc"] is None
+        and cleanup["kill_via_original_pidfd"] is False and cleanup["kill_rc"] is None
+        and cleanup["reap_attempted"] is False and cleanup["reap_rc"] is None
+        and cleanup["reaped"] is True
     )
 def well_formed(item):
     if not isinstance(item.get("pass"), bool) or item.get("failure_category") not in {"none", "runtime", "oracle"}:
@@ -492,17 +522,26 @@ def well_formed(item):
         and uint(item.get("final_start_entries"))
         and type(item.get("child_exit")) is int and -(1 << 31) <= item["child_exit"] < (1 << 31)
         and isinstance(item.get("reaped"), bool)
+        and cleanup_well_formed(item.get("cleanup"))
+        and uint(item.get("cleanup_failures"), 8)
+        and isinstance(item.get("cleanup_drain_failed"), bool)
+        and isinstance(item.get("cleanup_map_read_failed"), bool)
+        and isinstance(item.get("cleanup_map_remove_failed"), bool)
     )
 def oracle(item):
     cycles = item["cycles"]
     global_ok = (item["signal_link_detached"] is True and item["late_link_detached"] is True
-                 and item["final_start_entries"] == 0 and item["child_exit"] == 0 and item["reaped"] is True)
+                 and item["final_start_entries"] == 0 and item["child_exit"] == 0 and item["reaped"] is True
+                 and item["cleanup_failures"] == 0 and item["cleanup_map_read_failed"] is False
+                 and item["cleanup_drain_failed"] is False
+                 and item["cleanup_map_remove_failed"] is False and cleanup_is_clean(item["cleanup"]))
     if item["outcome"] == "A":
         return global_ok and len(cycles) == 1 and outcome_a_cycle(cycles[0])
     if item["outcome"] == "B":
         return (global_ok and len(cycles) == 2 and outcome_b_cycle(cycles[0], False)
                 and outcome_b_cycle(cycles[1], True)
-                and cycles[0]["winner_case_id"] != cycles[1]["winner_case_id"])
+                and cycles[0]["winner_case_id"] != cycles[1]["winner_case_id"]
+                and cycles[0]["resume_completed_ns"] < cycles[1]["hook_ts_ns"])
     return False
 if any(not well_formed(item) for item in timing):
     raise SystemExit(64)

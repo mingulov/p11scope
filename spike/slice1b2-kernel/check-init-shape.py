@@ -11,6 +11,55 @@ import re, subprocess, sys
 def fail(msg):
     sys.exit(f"FAIL: {msg}")
 
+def normalized_pause_region(lines):
+    region, after_cas = [], False
+    for line in lines:
+        instruction = re.sub(r"^[0-9a-f]+:\s+", "", line.strip())
+        instruction = re.sub(r"\s+", " ", instruction)
+        instruction = re.sub(r"goto [+-]0x[0-9a-f]+(?: <[^>]+>)?", "goto TARGET", instruction)
+        if "cmpxchg_64" in instruction:
+            after_cas = True
+        if after_cas:
+            region.append(instruction)
+    return region
+
+PAUSE_POST_CAS_FINGERPRINT = [
+    "r0 = cmpxchg_64(r1 + 0x0, r0, r3)",
+    "if r0 == 0x1 goto TARGET",
+    "r2 = 0x0",
+    "r2 &= 0x1",
+    "if r2 != 0x0 goto TARGET",
+    "r9 = -0x8000000000000000 ll",
+    "call 0x5",
+    "goto TARGET",
+    "*(u32 *)(r10 - 0x10) = r9",
+    "r2 = r10",
+    "r2 += -0x10",
+    "r1 = 0x0 ll",
+    "R_BPF_64_64 COUNTERS",
+    "call 0x1",
+    "if r0 == 0x0 goto TARGET",
+    "r1 = *(u64 *)(r0 + 0x0)",
+    "r1 += 0x1",
+    "*(u64 *)(r0 + 0x0) = r1",
+    "goto TARGET",
+    "call 0x5",
+    "*(u64 *)(r10 - 0x18) = r0",
+    "r1 = 0x13",
+    "call 0x6d",
+    "r9 = r0",
+    "r0 = *(u64 *)(r10 - 0x18)",
+    "*(u8 *)(r8 + 0x18) = r7",
+    "*(u64 *)(r8 + 0x10) = r9",
+    "*(u64 *)(r8 + 0x8) = r6",
+    "*(u64 *)(r8 + 0x0) = r0",
+    "r1 = r8",
+    "r2 = 0x0",
+    "call 0x84",
+    "r0 = 0x0",
+    "exit",
+]
+
 def pause_source_guard(path):
     source = open(path, encoding="utf-8").read()
     signal = source[source.index("pub fn signal_return("):source.index("pub fn late_hit(")]
@@ -25,11 +74,40 @@ def pause_source_guard(path):
         r"\(hook_ts_ns, send_signal_rc\)\s*\} else \{",
         region,
     )
-    if not winner or region.count("helpers::bpf_send_signal(19)") != 1:
+    helpers_after_cas = re.findall(r"helpers::([A-Za-z_][A-Za-z0-9_]*)", region)
+    if (
+        not winner
+        or helpers_after_cas != [
+            "bpf_ktime_get_ns",
+            "bpf_send_signal",
+            "bpf_ktime_get_ns",
+        ]
+    ):
         fail("pause winner must read ktime immediately before one SIGSTOP helper")
-    winner_helpers = re.findall(r"helpers::([A-Za-z_][A-Za-z0-9_]*)", winner.group(0))
-    if winner_helpers != ["bpf_ktime_get_ns", "bpf_send_signal"]:
-        fail("pause winner path has an unapproved helper")
+    tuple_start = signal.index("let (hook_ts_ns, send_signal_rc) = unsafe {")
+    before_tuple = re.sub(r"//[^\n]*|\s+", "", signal[cas:tuple_start])
+    if not before_tuple.endswith("None=>false,};"):
+        fail("pause winner has a post-CAS forward sequence")
+    straight_line = re.sub(
+        r"//[^\n]*|\s+",
+        "",
+        signal[tuple_start:submit + len("entry.submit(0);")],
+    )
+    expected_straight_line = (
+        "let(hook_ts_ns,send_signal_rc)=unsafe{ifwon{"
+        "lethook_ts_ns=helpers::bpf_ktime_get_ns();"
+        "letsend_signal_rc=helpers::bpf_send_signal(19)asi64;"
+        "(hook_ts_ns,send_signal_rc)}else{"
+        "(helpers::bpf_ktime_get_ns(),COALESCED_NO_HELPER,)}};"
+        "unsafe{"
+        "core::ptr::write(core::ptr::addr_of_mut!((*raw).hook_ts_ns),hook_ts_ns);"
+        "core::ptr::write(core::ptr::addr_of_mut!((*raw).pid_tgid),pid_tgid);"
+        "core::ptr::write(core::ptr::addr_of_mut!((*raw).send_signal_rc),send_signal_rc);"
+        "core::ptr::write(core::ptr::addr_of_mut!((*raw).case_id),case_id);"
+        "}entry.submit(0);"
+    )
+    if straight_line != expected_straight_line:
+        fail("pause winner must use the exact straight-line clock/signal/store/submit path")
 
 if len(sys.argv) >= 2 and sys.argv[1] == "--pause-source-only":
     if len(sys.argv) != 3:
@@ -144,17 +222,6 @@ if pause_source is not None:
         fail("signal_return must contain exactly one cmpxchg_64")
     if re.search(r"\bgoto -", signal_lines):
         fail("signal_return has a backward edge")
-    calls_after_cas = signal_lines[signal_lines.index("cmpxchg_64"):]
-    call_ids = re.findall(r"\bcall (0x[0-9a-f]+|[0-9]+)", calls_after_cas)
-    # `0x1` is map_lookup_elem on the nonwinner/missing-authorization loss
-    # branch.  The source guard above is path-specific for the winner; this
-    # object guard freezes the shared codegen facts (no back edge, one CAS,
-    # one send helper, one terminal submit) without rejecting that fallback.
-    allowed_calls = {"0x1", "1", "0x5", "5", "0x6d", "109", "0x84", "132"}
-    if any(call not in allowed_calls for call in call_ids):
-        fail(f"unapproved helper after pause CAS: {call_ids}")
-    if sum(call in {"0x6d", "109"} for call in call_ids) != 1:
-        fail("signal_return must contain exactly one bpf_send_signal helper")
-    if sum(call in {"0x84", "132"} for call in call_ids) != 1:
-        fail("signal_return must terminate in exactly one ringbuf submit helper")
+    if normalized_pause_region(signal_lines.splitlines()) != PAUSE_POST_CAS_FINGERPRINT:
+        fail("signal_return post-CAS instruction fingerprint changed")
 print("PASS: 112 aligned u64 zero stores at record offsets 0..888 before any record use; no memset / back edge in the region")

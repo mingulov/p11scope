@@ -7,6 +7,37 @@ SHA-256 manifest, and this file carries only digests, pointers, and finite
 facts. Nothing under that root is release output; private spike bundles are
 separately permissioned (corrective design §9.4).
 
+## Final research-plan handoff (2026-08-19)
+
+Final source commit `a227dabe7ab0fb62eee6ec9cca1f4afbad46eb03`:
+
+- A/B BPF `e4973fd03ffb4d24cd81ab6c84c395ad18c90e23e28ae782c48328f4fce8b069`:
+  Gate A PASS on Jammy 5.15 and Noble 6.8; Gate B KVM campaign PASS 120/120
+  (three boots × 20 per kernel). Confirmed-stop latency min/median/max was
+  1175/1250/3132 µs on Jammy and 1200/1245/3973 µs on Noble.
+- The same Noble Gate B campaign under TCG is retained as
+  `TIMEOUT / INCOMPLETE` (three boots, no first verifier record within 120 s).
+  STATS-only diagnostic accepted `signal_return` with 150,091 verified
+  instructions in 1028 ms under KVM and 253,049 ms under TCG. KVM is therefore
+  the supported research-gate accelerator; the BPF was not rejected.
+- Loader BPF `0bc026b49db29f5e6beb220ca988b9a1da8af071c912109eab94bb6a9e74a877`:
+  ptrace-free event path PASS on both kernels, including the 5.15 runtime-IP
+  fallback and the no-cookie negative.
+- Task 8: 160/160 independently validated attempts across host 7.0 and Noble
+  6.8. One pause covers exported symbols; hidden table constructor calls
+  escaped 40/40 one-pause attempts and were covered 40/40 with a second owned
+  pause. Decision D3 is **no**: Task 9's timing catalog is skipped on the
+  critical path. See `attach-first-vs-timing-catalog.md`.
+
+This completes the research plan, not Slice 1b-2 product support. P4 remains:
+land Slice 1b-1, then implement `discovery::Engine`, dynamic slots/cookies,
+loss/completeness evidence, and the explicit two-pause `run` policy.
+
+The remaining sections preserve the earlier campaigns and failure progression
+for provenance. Their `UNRUN`, `FAIL`, and `TIMEOUT / INCOMPLETE` results stay
+valid for those exact campaign identities; the final handoff is additional
+evidence from later frozen artifacts.
+
 ## Evidence root layout
 
 | Path (under `~/src/m/pkcs11-scope-evidence/slice1b2/`) | Contents |
@@ -16,8 +47,10 @@ separately permissioned (corrective design §9.4).
 | `gate-b/` | Gate B evidence exports and run dirs (Task 5 campaign `final6-*`, retained iteration/failing-run evidence `final1`–`final5`, `task4-*`) |
 | `loader/` | Loader witness harness canonical round-2 transcripts and artifacts (`loader/round2/`), retained round-1 diagnostics (`loader/round1/`), round-3 released-glibc precontrols (`loader/round3/`) |
 | `loader-artifact/` | Task 7 loader-event lanes (`{jammy,noble}-20ecebd/`: five-file exports + `.sha256`) |
-| `bundles/` | Frozen execution bundles (`task4-37c5b41-bundle/`: runner, fixture, `slice1b2-kernel-ebpf`, manifests; `diag-9da22b6-bundle/`: same BPF + fixture bytes re-frozen with the `gate-a-diag` runner; `final6-9daeb53-bundle/`: Task 5 campaign; `loader-*-bundle/`: Task 7 loader artifact rounds) |
-| `MANIFEST.sha256` | SHA-256 of every file in the root except itself (2,830 files after Task 7). Digest: `5f1b0165256f65dd865166992b91827be44293b25fb7f0b273d2b61776d70fe9` |
+| `task8/` | Final host/Noble attach-first evidence for exported/hidden providers with one/two pauses |
+| `bundles/` | Frozen execution bundles, including final `final-a227dab-bundle/`, `loader-a227dab-bundle/`, and the bounded `gateb-stats-a227dab-bundle/` diagnostic |
+| `diagnostics/` | Bounded STATS-only diagnostics and their exact private patch/bundle identities; never canonical gate replacements |
+| `MANIFEST.sha256` | SHA-256 of every file in the root except itself (3,196 files after Task 8). Digest: `dee02a5418bea166aa22eaaebd1bc13cd68d6fd9822f27c53fa7970835954d86` |
 
 The tracked, scrubbed witness harness itself is `spike/slice1b2-loader/`
 (repo-relative `run-lanes.sh`, lane-filterable, driven by
@@ -37,7 +70,7 @@ final six-program spike BPF object `d405edee…` is inside
 `bundles/task4-37c5b41-bundle/slice1b2-kernel-ebpf`; canonical loader
 transcripts are under `loader/round2/`.
 
-## Gate status (two lines each, from the open-issues note)
+## Historical pre-corrective gate status
 
 - **Gate A (four discovery programs):** `TIMEOUT / INCOMPLETE` on both 5.15
   and 6.8; exactly 3/4 accepted records. The existing fourth-program shape is
@@ -119,7 +152,7 @@ and are never mixed inside one campaign. One-time provision under KVM:
 diagnostic table above (kvm 13.7/13.9 s vs tcg 55.7/86.2 s; both < 60 s
 under KVM as expected).
 
-## Final A/B campaign (Task 5)
+## Retained earlier A/B campaign (Task 5)
 
 Frozen bundle `bundles/final6-9daeb53-bundle/` (source `9daeb53`):
 `slice1b2-kernel-ebpf` `fa3b6e13e87e16419793c2156220212776ebd29d223cd124f5363e3c710f3bfc`,
@@ -192,7 +225,7 @@ Lanes run from committed HEADs on `spike/slice1b2-gates`; transcripts at
 
 (Task 7 below.)
 
-### Task 7 — minimal ptrace-free loader event program (COMPLETE)
+### Task 7 — initial ptrace-free loader event rounds (historical)
 
 Artifact crates `spike/slice1b2-loader-bpf/` (own aya-ebpf crate: `dl_debug_state`
 uprobe on the 896-byte `DiscoveryRecord`, kind LOADER=3, §7.3 cookie
@@ -236,3 +269,8 @@ from `23f853a` harness; the runner/bpf bytes are the frozen `20ecebd` bundle).
   `.bss` rejection; `formula_holds == false` on 6.8 was the pre-`execve` bias
   poll reading the runner-inherited loader mapping (now gated on
   `/proc/<pid>/exe` == fixture).
+
+The final `7cfda3d` correction validates the x86-64 runtime-IP fallback on
+5.15 without accepting arbitrary hook addresses. The re-frozen `a227dab`
+loader bundle then passed Jammy and Noble, including the no-cookie negative;
+those final results and hashes are in the handoff at the top of this file.

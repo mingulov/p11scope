@@ -8,21 +8,23 @@ keeps spike evidence distinct from production support.
 
 ## Current status (supersedes older status wording below)
 
-The superseding corrective design is complete and independently approved at
-commit `fd3a0e1cdeaaf9e134d827af90d9af4252675969` in the isolated development
-worktree. The final review found 0 Critical, 0 Important, and 0 Minor design
-defects. This is design approval, not product support.
+The corrective research implementation is complete through Task 8 at commit
+`a227dabe7ab0fb62eee6ec9cca1f4afbad46eb03`. Task 9 was deliberately skipped
+after Task 8 resolved decision D3. This is spike evidence, not product support.
 
 | Work item | Current result | Consequence |
 | --- | --- | --- |
-| Gate A: four discovery programs | `TIMEOUT / INCOMPLETE` on both 5.15 and 6.8; exactly 3/4 accepted records | The existing fourth-program shape is not promotable. The approved constant-offset initializer and final unchanged A/B object still must be implemented and rerun. |
-| Gate B: pause/attach timing | Historical Jammy variance; Noble passed; a later Jammy run also passed | The old sample loop did not actually wait for its stated 100 ms bound. The corrected 100 ms aggregate oracle is designed but UNRUN, so pause remains default `never` and unprotected capture remains `PARTIAL`. |
-| Gate C: loader/glibc timing | Direct current-build controls complete; corrected product-shaped campaign UNRUN | Exact fixed-glibc, negative glibc 2.35/2.39, musl, DT_NEEDED, and `dlopen` controls must run before any loader capability is promoted. |
-| Slice 1b-1 semantic authority | Owner-approved; TDD implementation in progress | An accepted explicit manifest attests only its exact pinned object + offset + canonical name. Scan-only claims remain count-only/PARTIAL. Final implementation review and gates are still pending. |
+| Gate A: four discovery programs | **PASS** on Jammy 5.15 and Noble 6.8 with the final frozen A/B object | The constant-offset record initializer removed the verifier-state explosion without lowering the 16-interface or 104-function limits. |
+| Gate B: pause/attach timing | Final KVM campaign **120/120 PASS** (3×20 on each kernel) | The same frozen Noble lanes under TCG remain `TIMEOUT / INCOMPLETE`. STATS-only accepts `signal_return` in 1028 ms under KVM and 253,049 ms under TCG (150,091 verified instructions), proving acceleration is the compatibility boundary; verbose logging adds cost but the BPF is accepted. |
+| Loader event path | **PASS** on Jammy 5.15 and Noble 6.8 | The ptrace-free `_dl_debug_state` uprobe works on both; 5.15 uses the validated runtime-IP fallback because `bpf_get_func_ip` returns zero there. |
+| Attach-first experiment | **160/160 retained attempts validated** across host and Noble | One pause covers exported providers. Hidden-table constructor calls escape with one pause but are covered with the measured second pause. Task 9's timing catalog is not on the critical path. |
+| Slice 1b-1 semantic authority | Owner-approved implementation exists on the recovery line; integration remains separate | An accepted explicit manifest attests only its exact pinned object + offset + canonical name. Scan-only claims remain count-only/PARTIAL. |
 
-No kernel bisection is currently required. The next work is implementation of
-the approved finite gates, followed by the same frozen artifacts on the two
-required kernels.
+No kernel bisection is required. The remaining work is production integration:
+land Slice 1b-1, then implement the live discovery engine, dynamic attachment,
+completeness evidence, and the two-pause `run` policy. KVM is required for the
+supported 120-second research gate; TCG is retained as an explicit unsupported
+speed result, not a kernel or BPF failure.
 
 ## What works with and without a manifest
 
@@ -56,6 +58,9 @@ startup.
 
 ## What `TIMEOUT / INCOMPLETE` means
 
+This section describes the retained pre-corrective Gate A campaign. The final
+flat-initializer Gate A campaign passes on both required kernels.
+
 The Gate A runner had to load four discovery programs and then write exactly
 one verifier-result record for each load plus a finalized runner status.
 
@@ -86,8 +91,7 @@ is retained here as a known artifact defect rather than rewritten silently.
 
 ### I1. `interface_list_return` is not verifier-compatible in its current shape
 
-**Status:** confirmed component; corrective design approved, implementation
-and rerun pending.
+**Status:** resolved in the spike; final Gate A PASS on both required kernels.
 
 The failing program combines an 896-byte ring-buffer record, bounded
 interface iteration (`< 16`), bounded function-pointer reads (`< 104`), name
@@ -106,38 +110,30 @@ The same 896-byte emitter loads when called once for a function list, so the
 problem is most likely the large initialization/table-read worker under the
 bounded 16-interface fan-out rather than the record size alone.
 
-**Consequence:** the current BPF record/control-flow shape cannot be copied
-into production. Raising the timeout merely waits longer for an unusable
-program and does not make production startup acceptable.
-
-**Next evidence:** implement the approved flat constant-offset initializer and
-semantic disassembly guard, then run the final unchanged A/B object on 5.15
-and 6.8 while recording load duration, result, error chain, and bounded private
-verifier-log facts. If it remains NON-PASS, stop and revise the design from the
-new verifier evidence. Do not silently lower the 16-interface or 104-function
-ceilings, and do not add tail-call/chunk machinery speculatively.
+**Resolution:** 112 straight-line constant-offset `u64` stores plus the
+semantic disassembly guard produced final object `e4973fd0…`; all four
+programs and the exact Gate A oracle passed on 5.15 and 6.8. The 16/104 limits,
+four-map boundary, record layout, and failure accounting were unchanged.
 
 ### I2. The diagnostic verifier log conflicts with the evidence cap
 
-**Status:** confirmed harness/design contradiction.
+**Status:** bounded diagnostic works; frozen verbose campaign limitation remains.
 
 Aya retries verifier loads with increasing log buffers. The Jammy rejection
 rendered 16,777,679 bytes, while the gate permits at most 8 MiB for the
 verifier log and 16 MiB total. The diagnostic therefore cannot be promoted to
 a canonical tracked FAIL.
 
-**Consequence:** the existing result remains `TIMEOUT / INCOMPLETE`. Increasing
-the production evidence cap would expose a large kernel diagnostic and would
-not solve verifier compatibility.
-
-**Next evidence:** the approved design keeps full raw verifier text private and
-uses bounded finite failure facts (program, errno, duration, completeness,
-known original size, and private-log digest). Implement and test that contract;
-never claim the bounded summary is the full verifier log.
+**Resolution and consequence:** STATS-only diagnostics retain bounded finite
+facts. On the final object, Noble accepted the large Gate B `signal_return`
+program with 150,091 verified instructions in 1028 ms under KVM and 253,049 ms
+under TCG. All three frozen `VERBOSE | STATS` TCG lanes stalled beyond 120
+seconds before their first result; those historical lanes stay
+`TIMEOUT / INCOMPLETE`. The unchanged frozen KVM campaign completed 120/120.
 
 ### I3. The glibc loader-hook timing assumption is false for the two tested distro builds
 
-**Status:** reproduced on Ubuntu glibc 2.35 and 2.39; upstream-fix build untested.
+**Status:** reproduced negatives and released fixed-build positives complete.
 
 For both tested builds, the first post-`RT_ADD` `_dl_debug_state` callback with
 `r_state == RT_CONSISTENT` occurred while the fixture's ordinary
@@ -165,14 +161,12 @@ portable promise that relocations were complete. Source:
 pre-constructor attachment point on the supported Ubuntu 22.04/24.04 builds.
 `dlopen` return is later still and necessarily misses constructor-first calls.
 
-**Next evidence:** run the same direct-memory witness against:
-
-1. an upstream glibc build proven to contain both commits;
-2. any supported distro package that backports them;
-3. one exact package without them as the negative control.
-
-Record the loader build ID and commit/backport provenance. Select hook behavior
-by verified loader identity/capability, not by a broad `glibc >= X` rule.
+**Resolution:** `dlopen` remains negative on glibc 2.35/2.39 and is positive on
+source-proven Debian 13 glibc 2.41 and Ubuntu 26.04 glibc 2.43. `initial_set`
+is positive on all five tested glibc/musl controls. Selection remains by exact
+loader/libc identity and provenance, never a version comparison. Task 8 then
+showed that the two-pause attach-first protocol covers hidden-table constructor
+calls without putting a relocation-timing catalog on the product critical path.
 
 ### I4. musl hook support is exact-build evidence, not an ABI guarantee
 
@@ -200,9 +194,10 @@ rescan a stable view, compare exact mapping identities, attach idempotently,
 and purge stale/ambiguous modules. Repeated `RT_ADD`/`RT_DELETE` cycles and
 namespace-local instances must not double-attach or cross-attribute.
 
-### I6. No-ptrace production discovery is still feasible, but the spike did not prove it
+### I6. No-ptrace production discovery is feasible and proved by the spike
 
-**Status:** architectural path available; production path unimplemented.
+**Status:** ptrace-free event source PASS on both required kernels; production
+integration remains unimplemented.
 
 The loader timing spike used `/proc/<pid>/mem` only to obtain an independent,
 direct experimental witness. Production eBPF hooks can use
@@ -210,19 +205,23 @@ direct experimental witness. Production eBPF hooks can use
 values, interface descriptors, and function tables. That kernel-context read
 does not require `CAP_SYS_PTRACE` or `/proc/<pid>/mem`.
 
+The final loader artifact observed `RT_ADD → RT_CONSISTENT` on both guests,
+validated its cookie/registry and no-cookie negative, and used a runtime-IP
+fallback on 5.15 where `bpf_get_func_ip` returns zero for the uprobe.
+
 **Consequence:** Slice 1b-2 can remove ptrace as a discovery dependency, but it
 still needs the privileges accepted by BPF/uprobe attachment on the host
 (`CAP_BPF` plus `CAP_PERFMON` where sufficient, otherwise `CAP_SYS_ADMIN`). A
 BPF read failure must produce bounded unavailable/PARTIAL evidence; it must not
 fall back silently to procfs.
 
-### I7. Pause/resume timing is not yet an empirical result
+### I7. Pause/resume timing is now an empirical result
 
-**Status:** the historical runner and evidence are complete but inconsistent:
-Task 3 produced Jammy FAIL at run 19 and Noble PASS 20/20; Task 4 produced
-PASS 20/20 on both. The corrective analysis found that the old runner sampled
-near 1 ms and 2 ms but never actually waited up to its declared 100 ms bound.
-The corrected design is approved; its campaign is UNRUN.
+**Status:** corrected protocol implemented and exercised. The final KVM Gate B
+campaign is 120/120 PASS (60 per kernel). The separate Noble TCG campaign is
+`TIMEOUT / INCOMPLETE` before trials, while its STATS diagnostic accepts both
+BPF programs after 253 seconds. Task 8 independently completed 160/160
+host/Noble attempts.
 
 `bpf_send_signal(SIGSTOP) == 0` means the request was accepted, not that the
 thread group was already stopped. Gate B therefore requires two exact all-`T`
@@ -230,13 +229,12 @@ task snapshots, no post-hook marker before resume, one late attach, a third
 stopped snapshot, then exactly one `pidfd_send_signal(SIGCONT)` through the
 original pidfd. It runs 20 fresh children per kernel.
 
-**Consequence:** pause cannot be advertised as zero-gap or safe-by-default.
-The corrected runner must use the real 100 ms observation loop, aggregate
-transition evidence, reserve-before-signal ordering, exact queue closure, and
-the original pidfd for cleanup. Pause remains default `never`; an unprotected
-live window is truthfully `PARTIAL`. Only `run -- command` children are
-eligible; external numeric PIDs must never be paused because PID reuse can
-target an unrelated process.
+**Consequence:** one pause is sufficient for exported-provider symbols but not
+for hidden table functions: constructor calls escaped in all 40 one-pause
+hidden attempts. The second owned pause attached all 104 slots before the call
+in all 40 host/Noble attempts. Production should keep pause opt-in, expose the
+live window as `PARTIAL` when unprotected, and permit stopping only owned
+`run -- command` children through the original pidfd.
 
 ### I8. Dynamic attach and evidence semantics are still production work
 
@@ -267,7 +265,7 @@ continue to state this until live hooks and the discovery engine are present.
 These are separate changes. A successful result in one package does not close
 the others.
 
-### P1. Make Gate A verifier-compatible
+### P1. Make Gate A verifier-compatible — research complete
 
 - Replace the verifier-hostile record-initialization/control-flow shape in
   `interface_list_return` while preserving the literal 16-interface and
@@ -283,7 +281,7 @@ zero-initialization shape, or a bounded program split may be researched, but it
 must preserve the same observable limits and be re-reviewed before changing
 the frozen gate.
 
-### P2. Make Gate B pause timing repeatable
+### P2. Make Gate B pause timing repeatable — research complete
 
 - Use one capture-level pause owner and one original pidfd per fresh child.
 - Reserve the event before requesting `SIGSTOP`; record request acceptance
@@ -300,7 +298,7 @@ variance—not a broad kernel bisection. Useful variables are scheduler/TCG
 timing, `/proc/<pid>/task/*/stat` transition timing, group-stop observation,
 pidfd resume ordering, and exact sample timestamps.
 
-### P3. Qualify loader hooks per exact build
+### P3. Qualify loader hooks per exact build — precontrols complete
 
 - Build and hash one glibc candidate containing `43db5e2c...` and
   `ac73067c...`, including its exact loader and companion libc identities.
@@ -339,22 +337,33 @@ qualifies an event source.
   claim cannot transfer authority.
 - Conflicts and stale fallbacks remain conservative.
 
-This owner-approved work is currently in TDD implementation. It makes current
-manifest-free behavior honest; it does not implement late discovery.
+The recovery line contains the owner-approved implementation, but its landing
+and final integration review remain separate. It makes current manifest-free
+behavior honest; it does not implement late discovery.
 
-## Suggested external research questions
+## P4/P5 production handoff
 
-1. Which exact compiler-generated paths dominate verifier states in
-   `interface_list_return`, and which minimal code-generation change removes
-   them without lowering the 16/104 bounds or privacy checks?
-2. Does an exact glibc build containing both bug-31986 commits produce a usable
-   `_dl_debug_state` hit after relocation and before constructors for `dlopen`?
-3. Which released distro packages contain those exact fixes or backports, as
-   proven by source provenance/build ID rather than version inference?
-4. Why did byte-identical Jammy Gate B evidence fail once and pass later, and
-   does the corrected 100 ms aggregate oracle produce a stable 20/20 result?
-5. Can the final frozen A/B/C artifacts pass unchanged on both required
-   kernels without raising timeouts, evidence caps, or privileges?
+- **P5 first:** the recovery line contains the semantic-authority work starting
+  at `906753a`; land it only after its separate final review and gates.
+- **P4 next:** after P5 lands, implement `discovery::Engine`, dynamic slots and
+  attach cookies, completeness/loss evidence, and the explicit two-pause
+  `run -- command` policy. D3 is **no**, so corrective-design §7.2 catalog
+  promotion, §8.3 rows 1/4/5–8, and §11 step 2 move off the product critical
+  path into optional diagnostics. The every-hit loader event source and
+  attach-first/two-pause path remain required product inputs.
+
+## Research questions and results
+
+1. The byte-loop initializer dominated verifier states. Straight-line
+   constant-offset stores pass without lowering the 16/104 bounds.
+2. Source-proven glibc 2.41 and 2.43 produce the usable post-relocation
+   `dlopen` hit; glibc 2.35/2.39 remain negative controls.
+3. Debian 13 and Ubuntu 26.04 provide the tested fixed packages, bound by
+   source provenance, loader/libc hashes, and runtime witnesses.
+4. The corrected 100 ms owner protocol is stable in the final KVM campaign.
+   TCG is too slow for the 120-second frozen loader bound, not a BPF rejection.
+5. The final A/B and loader artifacts pass unchanged on both required kernels
+   under KVM. Task 8 additionally passes all 160 host/Noble attempts.
 
 The useful handoff from external research is raw, reproducible evidence:
 exact source commit/package, build IDs and SHA-256 values, kernel, toolchain,
@@ -363,31 +372,16 @@ controls. Version-only conclusions or one successful retry are not enough.
 
 ## Do we need more kernels?
 
-Not as the immediate next move. The two required compatibility endpoints—an
-Ubuntu 5.15 kernel and an Ubuntu 6.8 kernel—already reproduce the same
-fourth-program bottleneck. Adding several arbitrary kernels would add cost
-without isolating which program feature causes it.
-
-The efficient order is:
-
-1. finish and independently review the approved Slice 1b-1 semantic-authority
-   implementation;
-2. implement the approved Gate A constant-offset initializer and corrected
-   Gate B 100 ms aggregate oracle;
-3. rerun the final unchanged A/B artifact on the existing 5.15 and 6.8 guests;
-4. run the approved Gate C controls, including one exact fixed-glibc build;
-5. add another kernel only if the same frozen artifact differs between the two
-   mandatory endpoints or new verifier evidence makes the distinction useful.
-
-The libc matrix is different: one additional glibc build containing the
-upstream bug-31986 commits is necessary because it tests a specific loader
-semantic, not a kernel-verifier variation.
+No. The same final A/B and loader artifacts pass on the required Ubuntu 5.15
+and 6.8 endpoints. Add a kernel only when product integration differs on those
+two endpoints or a supported deployment introduces a new compatibility floor.
+Loader qualification remains per exact loader/libc identity, not per kernel.
 
 ## Product decision implied by current evidence
 
-Slice 1b-2 should continue, but the present large `interface_list_return`
-program and unconditional glibc hook assumption must not be promoted into
-production. The likely product model remains:
+Slice 1b-2 should continue using the proved flat initializer, ptrace-free
+every-hit loader hook, and explicit two-pause policy. It must not promote an
+unqualified glibc timing assumption. The product model is:
 
 - live discovery is best-effort and always exposes completeness evidence;
 - pause is an explicit `run` option until timing proves a stronger default;
@@ -397,12 +391,23 @@ production. The likely product model remains:
 - no-ptrace BPF-side reads are the production path;
 - unsupported loader/verifier combinations fail closed or remain PARTIAL.
 
-The semantic-authority owner gate is resolved: scan-only tables are
+The semantic-authority policy is resolved: scan-only tables are
 heuristic/count-only/PARTIAL and excluded from semantic P11Lab joins; exact
 live acquisition or an accepted exact pinned operator-manifest claim may grant
-semantic authority. Its implementation and independent review remain open.
+semantic authority. Landing that recovery-line implementation remains separate.
 
 ## Authoritative evidence pointers
+
+- Final evidence inventory: `~/src/m/pkcs11-scope-evidence/slice1b2/MANIFEST.sha256`
+  (`dee02a5418bea166aa22eaaebd1bc13cd68d6fd9822f27c53fa7970835954d86`)
+- Final Gate A/B bundles and campaigns:
+  `~/src/m/pkcs11-scope-evidence/slice1b2/{bundles/final-a227dab-bundle,gate-a/final-a227dab-kvm-*,gate-b/final-a227dab-kvm-*}`
+- Final loader event campaigns:
+  `~/src/m/pkcs11-scope-evidence/slice1b2/loader-artifact/{jammy,noble}-a227dab`
+- Final attach-first experiment: `~/src/m/pkcs11-scope-evidence/slice1b2/task8/`
+  and `docs/notes/slice1b2/attach-first-vs-timing-catalog.md`
+
+Historical design and negative evidence remain at:
 
 - Kernel Gate A report:
   `/home/user/src/m/pkcs11-scope-codex-slice1b-1/.superpowers/sdd/slice1b2-kernel-spike-design/task-2-report.md`

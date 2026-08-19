@@ -422,7 +422,13 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
   - **Slice 1b-2 — live discovery and `run`**: BPF loader (`_dl_debug_state`) and export
     uretprobes, `DESCRIPTORS` + attach-cookie semantics with dynamic slot allocation,
     `discovery::Engine`, `pause.rs`, `run -- cmd`, `attach_gap_ms`, mid-capture
-    module-ambiguity purge. Plan written after 1b-1 lands.
+    module-ambiguity purge. **Research status (2026-08-19): final frozen Gate A
+    PASS on 5.15/6.8; Gate B KVM campaign PASS 120/120 (the retained Noble TCG
+    campaign is TIMEOUT/INCOMPLETE because the accepted 150,091-insn program
+    takes 253 s under TCG); ptrace-free loader event path PASS on both kernels;
+    attach-first experiment PASS 160/160 and proves a second owned pause covers
+    hidden-table constructor calls. Task 9 timing catalog skipped by D3. Product
+    implementation remains OPEN and starts only after Slice 1b-1 lands.**
 - **Slice 2 — capture quality**: ring/epoll, budgets, safe-policy params, per-module profile
   sections, filters, snapshots.
 - **Slice 3 — structure**: module split, evidence plumbing, docs consolidation, multi-kernel CI.

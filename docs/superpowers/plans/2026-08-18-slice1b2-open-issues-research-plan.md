@@ -10,6 +10,11 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-18-slice1b2-corrective-live-discovery-design.md` (on `codex/slice1b-1-recovery`, approved at `fd3a0e1`; section numbers below refer to it) and the note `docs/notes/slice1b2-open-issues-and-consequences.md` (issue register I1–I9, packages P1–P5). This plan covers P1, P2, P3 and research questions 1–5. P4/P5 are out of scope (P5 is in progress on the recovery branch; P4 follows 1b-1 landing).
 
+**Execution status (2026-08-19):** Tasks 0–8 and 10 are complete at the
+`a227dab` evidence identity plus this documentation handoff. D3 is **no**, so
+conditional Task 9 was deliberately skipped. The unchecked boxes below are
+the preserved execution recipe, not current pending-work indicators.
+
 ## Review log
 
 Rev 1 (621 lines) was reviewed 2026-08-18 and returned "useful, not safe to execute". Changes in rev 2, by blocker: (1) Gate A wording — the *incompleteness/ENOSPC* is a logging+speed artifact, the rejection is real; (2) Task 0 curates < 1 MB of harness + canonical finite evidence, tracks no analyses with raw addresses/paths, copies no run/provision/qcow2 directories; (3) the object guard is now path-scoped, base-register-agnostic, alias/spill-tracking, and ignores unrelated `memset` (§4.2); (4) Task 4 implements the whole revised Gate B (§5.2–§5.3, §6.1–§6.2) and fixes the deadline stamping bug; the campaign moved to Task 5 on one final frozen A/B object; (5) the ptrace-free loader event program is mandatory (Task 7) with the approved nonzero-sentinel cookie (§7.3); only relocation-witness/catalog lanes are conditional (Task 9); (6) the attach-first experiment (Task 8) tests hidden-table providers and claims only what it measures. Order follows the reviewer's shortest order.
@@ -850,7 +855,9 @@ Run only if D3 keeps loader-timing qualification on the critical path. Extends T
 - **D1 — approved for all local test lanes** ("approving everything for tests — whatever is useful"): VM lanes with guest `sudo`, one-time KVM enablement, Docker `SYS_PTRACE`/seccomp-unconfined lanes, host-root diagnostics on `7.0.0-28`, and Task 8's `loader-protect`. Task 9 still lists its concrete lanes when its steps are written (informational; the blanket local approval covers it unless the owner says otherwise).
 - **D2 — STATS-only diagnostic lane: proceed** (the owner asked what "without patching Aya" means and is open to contributions — see the note under D2 below). The lane itself needs no Aya change.
 - **D4 — released packages** (Debian 13 candidate; Ubuntu 26.04 precontrol/spare) with source provenance + runtime witness.
-- **Executor:** the recovery-branch worker (codex, or GLM-5.3 if feasible) — not the author of this plan; the plan is committed to `main` as the handoff. D3 (after Task 8) and D5 (only if Task 3 still fails) remain open.
+- **Executor:** the isolated `spike/slice1b2-gates` worker. D3 is **no** after
+  Task 8; D5 was not triggered because the flat-store object passes both
+  required kernels.
 
 ### Decision texts (as put to the owner)
 

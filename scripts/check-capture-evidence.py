@@ -330,6 +330,15 @@ def exact_manifest_object_fallbacks(evidence):
         seen_objects.add((manifest, object_id))
         seen_replacements.add(identity)
 
+    for module in evidence["discovery"]:
+        fallback_outcomes = module["corroboration"].count("object_fallback")
+        if fallback_outcomes:
+            identity = (tuple(module["dev"]), module["ino"], module["sha256"])
+            require(
+                fallback_outcomes == 1 and identity in seen_replacements,
+                f"object_fallback has no exact replacement evidence: {module}",
+            )
+
     standalone = sum(
         "manifest" in module["sources"] and not module["corroborated"]
         for module in evidence["discovery"]
@@ -499,6 +508,12 @@ def exact_capture_modules(document):
     }
     ineligible = False
     for item in document["functions"]:
+        names = item["names"]
+        require(isinstance(names, list) and names, f"function without names: {item}")
+        require(
+            isinstance(item["aliased"], bool) and item["aliased"] == (len(names) > 1),
+            f"function alias flag disagrees with names: {item}",
+        )
         owner, ambiguous = item["module"], item["module_ambiguous"]
         if owner is None:
             require(ambiguous is True, f"unattributed function without a reason: {item}")
@@ -1076,6 +1091,9 @@ def self_test():
             "aliased function is not semantic-joinable",
         )
     )
+    forged_alias = copy.deepcopy(manifest_only)
+    forged_alias["functions"][0]["names"].append("C_Alias")
+    rejected(lambda: exact_capture_modules(forged_alias))
     unattributed = copy.deepcopy(manifest_only)
     unattributed["functions"][0].update(module=None, module_ambiguous=True)
     rejected(
@@ -1367,6 +1385,7 @@ def self_test():
             "replacement": replacement,
         }
     ]
+    fallback["evidence"]["discovery"][0]["corroboration"] = ["object_fallback"]
     fallback["evidence"]["discovery_uncorroborated"] = 1
     terminal_capture_is_clean(fallback["evidence"], uncorroborated=1)
     exact_capture_modules(fallback)
@@ -1420,6 +1439,9 @@ def self_test():
     bad = copy.deepcopy(clean)
     bad["evidence"]["discovery"][0]["objects"][0]["sources"] = ["bogus"]
     semantic_mutations.append(("unknown object source", bad))
+    bad = copy.deepcopy(clean)
+    bad["evidence"]["discovery"][0]["corroboration"] = ["object_fallback"]
+    semantic_mutations.append(("object fallback without evidence", bad))
     for label, bad in semantic_mutations:
         rejected(lambda bad=bad: exact_capture_modules(bad))
     print("semantic source/corroboration mutations are rejected: OK")

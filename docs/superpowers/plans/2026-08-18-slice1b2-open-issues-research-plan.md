@@ -11,9 +11,10 @@
 **Spec:** `docs/superpowers/specs/2026-08-18-slice1b2-corrective-live-discovery-design.md` (on `codex/slice1b-1-recovery`, approved at `fd3a0e1`; section numbers below refer to it) and the note `docs/notes/slice1b2-open-issues-and-consequences.md` (issue register I1–I9, packages P1–P5). This plan covers P1, P2, P3 and research questions 1–5. P4/P5 are out of scope (P5 is in progress on the recovery branch; P4 follows 1b-1 landing).
 
 **Execution status (2026-08-19):** Tasks 0–8 and 10 are complete at the
-`a227dab` evidence identity plus this documentation handoff. D3 is **no**, so
-conditional Task 9 was deliberately skipped. The unchecked boxes below are
-the preserved execution recipe, not current pending-work indicators.
+`a227dab` evidence identity plus this documentation handoff. D3 is **no**.
+Task 9 is an optional private diagnostic and remains `UNRUN`; it requires a
+new, explicit owner activation. The unchecked boxes below are the preserved
+execution recipe, not current pending-work indicators.
 
 ## Review log
 
@@ -53,7 +54,7 @@ Rev 2 review (2026-08-18) returned NEEDS FIXES with seven items; rev 3 resolves 
 | 6 | Released-glibc (2.41+) and DT_NEEDED precontrols in containers | 0 | 4 h | Q2, Q3, P3 inputs |
 | 7 | Mandatory minimal ptrace-free loader event program (§7.3 cookie, every-hit record) | 3 | 1–2 d | I6, P3/P4 prerequisite |
 | 8 | Attach-first experiment (hidden-table fixture) + memo | 4, 6, 7 | 1–2 d | design scope of P3/P4 (D3) |
-| 9 | *(conditional on D3)* relocation witness / catalog lanes (§8, 12 rows) | 7, 8 | 2–3 d | P3 second half |
+| 9 | Dormant private relocation-witness diagnostic (§8, 12 rows) | 7, 8, new approval | 2–3 d | optional comparison only |
 | 10 | Update the note, ROADMAP status, hand-off | all | 1 h | — |
 
 Task 6 (containers) runs in parallel with 2–5 (VMs). Do not add kernels (note § "Do we need more kernels?" stands).
@@ -750,7 +751,7 @@ git commit -am "spike(loader): released fixed-glibc controls (Debian 13, Ubuntu 
 - Modify: `spike/slice1b2-kernel/run.sh` is **not** modified; the loader artifact gets its own `spike/slice1b2-loader-host/run.sh` (VM lane functions copied from the A/B script, own bundle inventory)
 
 **Interfaces:**
-- Produces: the loader BPF object with its complete declared inventory — maps `DISCOVERY` (ring, 65,536 B), `START` (hash, 64; used at the §5.2 group key for the pause owner and nothing else), `COUNTERS` (array: `RING_LOSS`, `STATE_FAILURES`, `LOADER_HITS`, `STATE_READ_FAILURES`); program `dl_debug_state` (`#[uprobe]`), which emits the **existing 896-byte `DiscoveryRecord`** (`kind = LOADER = 3`, `case_id = context_id - 1`, `status_flags` bit `0x04 = loader_context_invalid`, `announced_count = r_state`, `table_ptr = hook_ip` — private, never serialized) initialized with the same 112 flat volatile stores and checked by the same `check-init-shape.py` (§4.4: every emitter of the 896-byte record passes the guard). The hook also runs the §5.3 pause path (reserve → `ARMED → REQUESTED` CAS → single `bpf_send_signal` for the winner) so Task 8 can pause at loader hits; `SignalRecord` is not used here — the winner/coalesced status goes into `status_flags` bit `0x02 = coalesced_no_helper` exactly as §5.3 specifies for the product record. Host: `cookie_encode(context_id: u16, delta: Option<i64>) -> u64`, `cookie_decode(u64) -> Result<(u16, Option<i64>), CookieError>`, `slice1b2-loader-host loader-hit CHILD_ARGV…`. Task 8 and Task 9 attach this program.
+- Produces: the loader BPF object with its complete declared inventory — maps `DISCOVERY` (ring, 65,536 B), `START` (hash, 64; used at the §5.2 group key for the pause owner and nothing else), `COUNTERS` (array, six entries: `RING_LOSS`, `STATE_FAILURES`, `LOADER_HITS`, `STATE_READ_FAILURES`, `COOKIE_ZERO_HITS`, `FUNC_IP_ZERO_HITS`); program `dl_debug_state` (`#[uprobe]`), which emits the **existing 896-byte `DiscoveryRecord`** (`kind = LOADER = 3`, `case_id = context_id - 1`, `status_flags` bit `0x04 = loader_context_invalid`, `announced_count = r_state`, `table_ptr = hook_ip` — private, never serialized) initialized with the same 112 flat volatile stores and checked by the same `check-init-shape.py` (§4.4: every emitter of the 896-byte record passes the guard). The hook also runs the §5.3 pause path (reserve → `ARMED → REQUESTED` CAS → single `bpf_send_signal` for the winner) so Task 8 can pause at loader hits; `SignalRecord` is not used here — the winner/coalesced status goes into `status_flags` bit `0x02 = coalesced_no_helper` exactly as §5.3 specifies for the product record. Host: `cookie_encode(context_id: u16, delta: Option<i64>) -> u64`, `cookie_decode(u64) -> Result<(u16, Option<i64>), CookieError>`, `slice1b2-loader-host loader-hit CHILD_ARGV…`. Task 8 and Task 9 attach this program.
 - Endpoints: proved on **Jammy 5.15 and Noble 6.8** (both), host 7.0 optional diagnostic.
 
 - [ ] **Step 1: RED — cookie round-trip tests exactly as the §8.1 preflight**
@@ -836,9 +837,130 @@ git commit -am "spike(loader): own artifact — product-shaped ptrace-free _dl_d
 
 ---
 
-### Task 9 (conditional on D3): relocation witness / catalog lanes (§8, 12 rows)
+### Task 9 (dormant; D3 = no): private relocation-witness diagnostic (§8, 12 rows)
 
-Run only if D3 keeps loader-timing qualification on the critical path. Extends Task 7's program with the fixture-only witness read via a bounded `r_map` walk (≤ 64 `link_map` entries: `l_addr @+0`, `l_name @+8`, `l_ld @+16`, `l_next @+24`), matching `l_name` against a ≤ 32-byte suffix supplied through an array map, `probe_read_user(l_addr + witness_vaddr)` vs `libc l_addr + puts_vaddr`, serialized only as `zero|equal|unequal|unreadable`. Then the §8.1–§8.4 lanes: exactly four controls (the one fixed-glibc candidate = Debian 13 from Task 6, 2.35, 2.39, musl) × `dlopen`/`initial_set`/`dlopen_return` × 20 attempts × both kernels, expectations frozen from Task 6's precontrols and §8.3. Detailed steps are written when D3 is decided.
+**Status:** `UNRUN`. Task 8 selected attach-first protection, so this task is
+off the product and release critical paths. Run it only after a new owner
+request explicitly names these lanes. Its result cannot create a capability
+catalog entry, change product policy, clear `PARTIAL`, satisfy Gate C, or
+satisfy corrective-design §11 step 2.
+
+**Activation boundary:** before implementation, commit an amendment that
+freezes the exact Task-9-only categorical record ABI and independent validator;
+the complete map/program inventory; per-attempt and per-lane deadlines;
+verifier-log, per-file, and total-output byte caps; private evidence root; and
+the exact source/toolchain/fixture/control identities. Do not inherit the
+frozen Gate A/B 120-second or 8/16-MiB caps. Without that amendment and separate
+privileged-lane approval, this task stays `UNRUN`.
+
+**Artifact boundary:** derive a separate diagnostic object from the frozen
+Task 7 loader artifact; never modify or relabel the Task 5 A/B object or the
+Task 7 evidence object. Freeze maps `DISCOVERY` (65,536-byte ring), `START`
+(64-entry hash, including the §5.2 pause-owner group key), `COUNTERS` (the six
+actual entries `RING_LOSS`, `STATE_FAILURES`, `LOADER_HITS`,
+`STATE_READ_FAILURES`, `COOKIE_ZERO_HITS`, `FUNC_IP_ZERO_HITS`), and one
+single-entry bounded witness-config array. That entry has exactly two
+length-prefixed raw-byte selectors, `fixture_suffix` and `libc_suffix`, each
+1–32 bytes, not NUL-terminated, with an all-zero unused tail, plus the two
+ELF-relative offsets `witness_vaddr` and `puts_vaddr`; its byte layout is frozen
+by the activation amendment. Program inventory is only `dl_debug_state`. The
+new record contains only finite categories needed by the oracle. Raw path/name,
+runtime address/pointer, PID/TID, cookie, context ID, and delta data stay in the
+private run and are never serialized. Do not overload `DiscoveryRecord` fields
+with Task 9 meanings.
+
+- [ ] **Step 1: Implement the bounded witness and structural guards.** Preserve
+  Task 7 ordering: first validate a nonzero cookie, resolve its attached context,
+  validate the hook IP, and obtain present `_r_debug` state. Only that valid
+  path may read the witness config, walk at most 64 x86-64 `link_map` entries,
+  and read `l_addr @+0`, `l_name @+8`, `l_ld @+16`, and `l_next @+24`.
+  Invalid-cookie, absent-state, or failed-context/IP paths submit their finite
+  Task 7 status and return without a config read, walk, or witness
+  classification. Match only the two configured suffixes. Compare the target
+  fixture's `l_addr + witness_vaddr` value with libc's
+  `l_addr + puts_vaddr`. Emit only `zero|equal|unequal|unreadable`. Unit tests
+  mutate every bound/category; disassembly/source guards prove the bounded walk,
+  the existing nonzero-cookie rules, and the unchanged pause-owner protocol.
+
+- [ ] **Step 2: Freeze one diagnostic bundle per control.** Controls are exactly
+  Debian 13 glibc 2.41 (the sole fixed-glibc candidate), Ubuntu 22.04 glibc
+  2.35, Ubuntu 24.04 glibc 2.39, and Alpine 3.24.1 musl. Record exact commit and
+  clean tree, source/file manifest, Rust/nightly/LLVM identities, BPF/host/
+  fixture/validator hashes, loader/libc/interpreter digests and build IDs,
+  program/map/ABI inventory, caps/deadlines, oracle version, parent campaign,
+  and the private evidence-manifest digest. The same control bundle bytes run
+  unchanged on Jammy 5.15 and Noble 6.8.
+
+- [ ] **Step 3: Run eight no-cookie preflights.** Before counted attempts, attach
+  the same diagnostic program once per control/kernel pair with Aya's no-cookie
+  form. Require one `loader_context_invalid` record and no context lookup,
+  runtime-IP/state operation, derived classification, or stale `START` owner;
+  require `discovery_truncated += 1`, `initial_set_capture = none`, and clean
+  teardown. A mismatch is `DIAGNOSTIC FAIL`. These 4 × 2 = **8** preflights are
+  mandatory for `DIAGNOSTIC PASS` but are not part of the counted matrix.
+
+- [ ] **Step 4: Run the full 12-row matrix.** Run 20 fresh attempts for each of
+  four controls × three load kinds (`dlopen`, `initial_set`, forced
+  `dlopen_return`) × two kernels: **480 counted attempts**. Preserve every
+  attempt. Continue safe predeclared rows after a finite diagnostic failure;
+  stop the campaign after lifecycle or host-safety failure. Each row's
+  classification must be identical across all 20 attempts and both kernels;
+  mixed attempts or kernels are `DIAGNOSTIC FAIL`.
+
+  Every counted attempt must have exact bundle/loader/libc/fixture/interpreter/
+  hook provenance; a valid §7.3 cookie and hook-IP formula; verifier-accepted
+  programs; complete records; and zero unexpected helper, ring, stale-context,
+  identity, privacy, timeout, cleanup, or lifecycle errors. Explicit pause
+  attempts also satisfy the revised pause oracle. An operational/oracle error is
+  `DIAGNOSTIC FAIL`, never a capability `unproven` result.
+
+  A valid primary attempt yields exactly one timing category:
+  `qualified_pre_constructor` means an equal nonzero witness before constructor
+  with every row-order predicate satisfied; `known_pre_relocation` means the
+  predeclared event had a zero/unequal witness before constructor; `unproven`
+  means a complete attempt had no conclusive qualified event; `none` is reserved
+  for forced `dlopen_return` and unavailable strategies. Mapping/export is
+  `protected` only when the exact mapping was pinned, its export was attached
+  while the causal owner was confirmed stopped, and the constructor's first
+  fixture `C_Initialize` was observed. A clean absence is `unproven`; any attach,
+  marker, record, or lifecycle error is `DIAGNOSTIC FAIL`. Mapping/export never
+  upgrades timing.
+
+  | Control | Load kind | Required timing result | Independent mapping/export result |
+  | --- | --- | --- | --- |
+  | Debian 13 glibc 2.41 | `dlopen` | `qualified_pre_constructor`: `RT_ADD`, first following `RT_CONSISTENT`, equal witness before constructor. | `protected|unproven` |
+  | glibc 2.35 | `dlopen` | `known_pre_relocation`: first post-`RT_ADD` `RT_CONSISTENT` witness remains zero. | `protected|unproven` |
+  | glibc 2.39 | `dlopen` | `known_pre_relocation`: first post-`RT_ADD` `RT_CONSISTENT` witness remains zero. | `protected|unproven` |
+  | Alpine 3.24.1 musl | `dlopen` | `qualified_pre_constructor`: at least one post-load equal witness before constructor; earlier empty hits allowed. | `protected|unproven` |
+  | Debian 13 glibc 2.41 | `initial_set` | Stable `qualified_pre_constructor|known_pre_relocation|unproven`; positive satisfies all five §8.2 initial-set predicates. | `protected|unproven` independently |
+  | glibc 2.35 | `initial_set` | Stable `qualified_pre_constructor|known_pre_relocation|unproven`; positive satisfies all five §8.2 predicates; no zero-at-consistent expectation. | `protected|unproven` independently |
+  | glibc 2.39 | `initial_set` | Stable `qualified_pre_constructor|known_pre_relocation|unproven`; positive satisfies all five §8.2 predicates; no zero-at-consistent expectation. | `protected|unproven` independently |
+  | Alpine 3.24.1 musl | `initial_set` | Stable `qualified_pre_constructor|known_pre_relocation|unproven`; positive is pre-constructor equal and satisfies all five §8.2 predicates. | `protected|unproven` independently |
+  | Debian 13 glibc 2.41 | forced `dlopen_return` | Timing `none`; constructor and DT_NEEDED blind; observe only the exact post-return call. | Fallback ordering oracle |
+  | glibc 2.35 | forced `dlopen_return` | Timing `none`; constructor and DT_NEEDED blind; observe only the exact post-return call. | Fallback ordering oracle |
+  | glibc 2.39 | forced `dlopen_return` | Timing `none`; constructor and DT_NEEDED blind; observe only the exact post-return call. | Fallback ordering oracle |
+  | Alpine 3.24.1 musl | forced `dlopen_return` | Timing `none`; constructor and DT_NEEDED blind; observe only the exact post-return call. | Fallback ordering oracle |
+
+  For `initial_set`, a positive requires exactly the five non-circular §8.2
+  facts: pre-exec loader pin/hash/hook/cookie before release; qualifying hit
+  before constructor for the exact context/process generation; event-time
+  loader and companion-libc identity; cookie/IP/state/witness/order validity;
+  and no relevant loss or operational error. Mapping/export protection is
+  classified separately and never upgrades timing. For forced
+  `dlopen_return`, all 20 attempts per pair must prove no constructor/DT_NEEDED
+  coverage and then observe the explicit post-return
+  `C_GetFunctionList`/`C_Initialize` call.
+
+- [ ] **Step 5: Independently recompute and report.** Run the repository's four
+  Rust gates; loader-host `fmt`, locked `check`, `test`, and Clippy; the locked
+  frozen-nightly loader-BPF build; `check-init-shape.py`; and `bash -n` on the
+  loader run script. Require both-kernel verifier acceptance, exact
+  ABI/inventory/cap checks, the independent eight-preflight plus 480-attempt
+  oracle, and a privacy canary covering every live observer map. All eight
+  preflights and all 480 complete attempts matching the frozen predicates yield
+  `DIAGNOSTIC PASS` only. Any operational,
+  provenance, privacy, validator, or row-predicate error is `DIAGNOSTIC FAIL`;
+  an expired finite bound is `TIMEOUT/INCOMPLETE`; no activation is `UNRUN`.
 
 ---
 
@@ -849,14 +971,14 @@ Run only if D3 keeps loader-timing qualification on the critical path. Extends T
 - Modify: `docs/superpowers/plans/ROADMAP.md` Slice 1b-2 bullet (gate status line only)
 
 - [ ] **Step 1: Rewrite the status table with finite results** — Gate A: frozen `PASS` on both kernels, canonical `FAIL`, or a retained `TIMEOUT/INCOMPLETE` if that is what the frozen lane produced (diagnostic errno/`processed`/`peak_states` figures labelled as such next to it, never replacing it); revised Gate B: `n/120` with campaign identity, accelerator, confirming-latency range per kernel; loader: precontrol results per loader and load kind (incl. 2.41+), Task 7 event-path facts, D3 outcome. Every historical negative stays in the ledger; the "6.8.0-71" report typo stays labelled as a known artifact defect.
-- [ ] **Step 2: Hand-off list for P4/P5** — P5 is on the recovery branch (`906753a`); P4 (`discovery::Engine`, dynamic slots, `run`, pause coordinator, loader every-hit runtime) is written only after 1b-1 lands and D3 is decided; list which design sections D3 would move from product path to diagnostics (§7.2 catalog promotion, §8.3 rows 1/4/5–8, §11 step 2) — or keep.
+- [ ] **Step 2: Hand-off list for P4/P5** — P5 is on the recovery branch (`906753a`); P4 (`discovery::Engine`, dynamic slots, `run`, pause coordinator, loader every-hit runtime) is written only after 1b-1 lands. D3 is no: catalog promotion and §8.3 timing qualification stay diagnostic-only unless a later approved design changes that boundary.
 - [ ] **Step 3: Commit** `docs: slice 1b-2 open issues — results of the research plan; gate status; hand-off`.
 
 ---
 
 ## Owner decisions — recorded 2026-08-18
 
-- **D1 — approved for all local test lanes** ("approving everything for tests — whatever is useful"): VM lanes with guest `sudo`, one-time KVM enablement, Docker `SYS_PTRACE`/seccomp-unconfined lanes, host-root diagnostics on `7.0.0-28`, and Task 8's `loader-protect`. Task 9 still lists its concrete lanes when its steps are written (informational; the blanket local approval covers it unless the owner says otherwise).
+- **D1 — approved for the completed local test lanes** ("approving everything for tests — whatever is useful"): VM lanes with guest `sudo`, one-time KVM enablement, Docker `SYS_PTRACE`/seccomp-unconfined lanes, host-root diagnostics on `7.0.0-28`, and Task 8's `loader-protect`. Dormant Task 9 is excluded and asks separately.
 - **D2 — STATS-only diagnostic lane: proceed** (the owner asked what "without patching Aya" means and is open to contributions — see the note under D2 below). The lane itself needs no Aya change.
 - **D4 — released packages** (Debian 13 candidate; Ubuntu 26.04 precontrol/spare) with source provenance + runtime witness.
 - **Executor:** the isolated `spike/slice1b2-gates` worker. D3 is **no** after
@@ -868,7 +990,7 @@ Run only if D3 keeps loader-timing qualification on the critical path. Extends T
 - **D1 — privileged lanes, decided per lane:** (a) VM lanes with guest `sudo` (Tasks 2, 3, 5, 7); (b) diagnostic root runs on the host kernel (Tasks 2, 7, 8); (c) Docker `SYS_PTRACE`/seccomp-unconfined lanes (Task 6); (d) one-time KVM enablement (`usermod -aG kvm user` recommended; Task 1); (e) Task 8 `loader-protect` runs. Anything not approved is recorded UNRUN; Task 9 asks separately.
 - **D2 — STATS-only diagnostic lane.** Accept `gate-a-diag` output (errno, `processed insns`, `peak_states`, ≤ 2 KiB tail) as I2's "bounded finite failure facts", clearly labelled diagnostic; the frozen gate keeps `VERBOSE | STATS`. Recommended: yes — it is the only way to learn the initial errno without patching Aya.
   *What "without patching Aya" means:* Aya 0.14's `retry_with_verifier_logs` (`src/sys/bpf.rs:1404-1434`) tries once with no log, then retries with growing `VERBOSE` buffers up to 16 MiB and returns only the *last* attempt's errno — the first-attempt errno (the real verdict) is lost and the log can only be capped by choosing a smaller log level. Choosing `STATS` (this lane) needs no library change. An **upstream Aya contribution** would make the frozen `VERBOSE | STATS` gate itself yield bounded facts: (i) keep the first-attempt `io_error` in `ProgramError::LoadError` (or a `first_errno` field) instead of the ENOSPC of the last retry; (ii) an `EbpfLoader::verifier_log_max_bytes(n)` cap so the retry loop stops growing at the caller's bound (the gate's 8 MiB) instead of the hard-coded `u32::MAX >> 8`; (iii) optionally, on kernels ≥ 6.4, request the rotating log so the *tail* (failure reason + stats) is retained within a small buffer. Each is a small, self-contained PR (`aya-obj`/`aya` `sys/bpf.rs`, `programs/mod.rs`) with unit tests against a fake syscall; the owner is open to contributing it. It is **optional and off the critical path** — Task 2 works with the released 0.14 — and if merged, the spike would pin the new Aya version only at a new campaign identity (D-boundary in Task 5).
-- **D3 — attach-first protection vs timing catalog** (Task 8 memo, decided from measurements). Determines whether Task 9 runs.
+- **D3 — no.** Task 8 selected attach-first protection. Task 9 remains an optional private diagnostic and does not run without a new explicit request.
 - **D4 — fixed-glibc controls from released packages instead of a source build.** §7.2 says "reproducible exact tuple built from source containing `43db5e2c`"; Debian 13 / Ubuntu 26.04 packages with recorded source provenance (`apt-get source`, `dl-open.c` ordering, no reverting patch), loader/libc digests, build IDs, and the same runtime witness preserve the "exact tuple + witness" rule. Recommended: yes.
 - **D5 — fork if Task 3's flat-store object still fails the verifier.** The options the design rejected stay rejected (chunked records, tail calls, per-interface programs, smaller ceilings). Remaining in-contract option: keep `interface_list_return` as the *enumerator* (16 interface descriptors — name class, flags, table pointer — no 104-pointer loop) and read a table at the **`C_GetInterface` return** hook — one table per hit, the same verifier shape as `function_list_return`, and the hook whose result the application actually uses. The 16-interface and 104-pointer ceilings stay literal; only *which* hook reads the table changes, so it needs a short design amendment (program inventory, oracle cases) and owner sign-off before any VM run.
 
@@ -877,13 +999,13 @@ Run only if D3 keeps loader-timing qualification on the critical path. Extends T
 | Q (note § "Suggested external research questions") | Task |
 | --- | --- |
 | 1. Which code paths dominate verifier states; minimal codegen change | 2 (`verified_insns` per program, failing errno) + 3 (flat stores) |
-| 2. Fixed glibc gives a usable pre-constructor `dlopen` hit | 6 (precontrol) → 9 (product-shaped, if D3 keeps it) |
+| 2. Fixed glibc gives a usable pre-constructor `dlopen` hit | 6 (precontrol); 9 only if the dormant diagnostic is separately activated |
 | 3. Which released packages contain the fix, by provenance | 6 Step 1 (containment proof + source provenance + digests) |
 | 4. Why Jammy Gate B failed once and passed later; is 100 ms stable | 4 (real wait + timeline) + 5 (campaign; accelerator diagnostic) |
-| 5. Do the frozen A/B/C artifacts pass unchanged on both kernels | 5 (A/B), 9 (C, if kept) |
+| 5. Do the frozen A/B/C artifacts pass unchanged on both kernels | 5 (A/B); 9 is optional diagnostic C evidence only |
 
 ## Self-review notes
 
 - Spec coverage: P1 → Task 3 (+ Task 5 rerun); P2 → Task 4 (§5.2 owner key/CAS, §5.3 order and predicates 1–9, §6.1 fields, §6.2 six lanes and 120/120) + Task 5; P3 → Tasks 6, 7, 9 (§7.2 controls, §7.3 cookie/registry/no-cookie negative, §8.1 fixture incl. DT_NEEDED and `dlopen`-return harness in Task 9); I2 → Task 2; I6 → Task 7; I5/I8/I9 → out of scope (P4), listed in Task 10.
-- Deviations from the approved design are only D2, D4, D5 (and D3 if the owner takes it), all labelled; nothing changes frozen oracle semantics silently; the A/B object is frozen once (Task 5) after Tasks 3+4.
+- Deviations from the approved design are only D2, D4, and D5, all labelled; D3 is no and Task 9 is dormant. Nothing changes frozen oracle semantics silently; the A/B object is frozen once (Task 5) after Tasks 3+4.
 - Names used across tasks: `StopSnapshot` (extended), `confirm`, `sample_value`, `STOP_WAIT_CEILING_US`, `pause_owner_key`, `PAUSE_ARMED/REQUESTED`, `COALESCED_NO_HELPER` (Task 4; reused by 8); `diag_line`/`run_gate_a_diag`/`diag-lane` (Task 2; reused by 3, 5); `cookie_encode/decode`, `LOADER_HITS`, `STATE_READ_FAILURES`, `PauseOwnerGuard`, `wait_signal_record_until` (Tasks 4/7; reused by 8, 9); `SPIKE_LOAD_KIND` (Task 6; reused by 9); `P11SCOPE_SPIKE_ACCEL` (Task 1; recorded by 2–5).

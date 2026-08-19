@@ -645,8 +645,8 @@ CLEAN_DISCOVERY = {
     # The scan alone: no manifest was passed.
     "scan": (["scan"], {}),
     # Both, and they agreed: the manifest's offsets are confirmed by the target's
-    # own mapped bytes, and the two surface sets merge into one rather than
-    # double-counting.
+    # own mapped bytes. Both source surfaces remain visible, while their exact
+    # targets count only once.
     "corroborated": (["scan", "manifest"], {}),
     # The manifest alone, because the target has not mapped the provider yet when
     # the observer attaches — a stopped process released by SIGCONT, a pod that
@@ -667,7 +667,12 @@ def validate_clean_metrics(
     require(document["capture"]["mode"] == "metrics", document["capture"])
     require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
     evidence = document["evidence"]
-    exact_shape(evidence, 68, 68, 136, LEGACY_SURFACES, 0, "absent")
+    surfaces = (
+        LEGACY_SURFACES + LEGACY_SURFACES
+        if discovery == "corroborated"
+        else LEGACY_SURFACES
+    )
+    exact_shape(evidence, 68, 68, 136, surfaces, 0, "absent")
     exact_common(
         evidence,
         aliases=[],
@@ -683,6 +688,15 @@ def validate_clean_metrics(
         corroborated == [discovery == "corroborated"],
         f"unexpected corroboration: {evidence['discovery']}",
     )
+    if discovery == "corroborated":
+        wanted_surface_sources = Counter(
+            ("legacy_function_list", f"{evidence['discovery'][0]['path']} table 2.40")
+        )
+        surface_sources = Counter(surface["source"] for surface in evidence["surfaces"])
+        require(
+            surface_sources == wanted_surface_sources,
+            f"unexpected corroborated surface sources: {evidence['surfaces']}",
+        )
     exact_capture_modules(document)
 
     actual = Counter()
@@ -1049,8 +1063,10 @@ def self_test():
         [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
     )
     corroborated_evidence = evidence_fixture(
-        LEGACY_SURFACES, sources=("scan", "manifest")
+        LEGACY_SURFACES + LEGACY_SURFACES, sources=("scan", "manifest")
     )
+    corroborated_evidence["surfaces"][0]["source"] = "/opt/p11.so table 2.40"
+    corroborated_evidence["surfaces"][1]["source"] = "legacy_function_list"
     corroborated_evidence.update(table_entries=68, slots=68, attached_probes=136)
     corroborated = document_fixture(
         corroborated_evidence,
@@ -1145,6 +1161,18 @@ def self_test():
                 )
             )
     print("clean metrics discovery source is exact in all three lanes: OK")
+    duplicate_manifest_surface = copy.deepcopy(corroborated)
+    duplicate_manifest_surface["evidence"]["surfaces"][0]["source"] = (
+        "legacy_function_list"
+    )
+    rejected(
+        lambda: validate_clean_metrics(
+            duplicate_manifest_surface,
+            {"C_Initialize": 1},
+            discovery="corroborated",
+        )
+    )
+    print("corroborated clean metrics requires one surface per source: OK")
 
     proxy = copy.deepcopy(clean)
     soft_path = "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"

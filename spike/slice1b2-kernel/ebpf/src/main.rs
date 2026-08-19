@@ -20,13 +20,6 @@ const READ_FAILURES: u32 = 1;
 const STATE_FAILURES: u32 = 2;
 const TRUNCATED: u32 = 3;
 const LATE_HITS: u32 = 4;
-/// Bounded winner-side delay between the stop-owner CAS and the single SIGSTOP
-/// request. Sized so the nonwinner's handler (observed 10-30 us) always completes
-/// and submits first, and far below the 100 ms stop-observation ceiling. The
-/// 5.15 verifier cannot prove termination of a wall-clock (ktime-delta) loop, so
-/// the delay is expressed as a bounded poll count; each poll is a ktime helper
-/// call (~tens of ns), so 50000 polls reliably exceed 250 us.
-const STOP_SIGNAL_DELAY_POLLS: u64 = 50_000;
 const FUNCTION_LIST: u8 = 1;
 const INTERFACE: u8 = 2;
 const EXACT_STANDARD: u8 = 1;
@@ -386,21 +379,14 @@ pub fn signal_return(ctx: RetProbeContext) -> u32 {
         },
         None => false,
     };
-    // 5. winner: bounded ktime delay so the nonwinner's
-    //    handler (int3 -> uprobe -> this program) can reserve and submit its own record
-    //    before the group stop can suppress it (observed on 5.15/6.8: the nonwinner is
-    //    stopped at return-to-user before its deferred uprobe handler runs); only then
-    //    the single SIGSTOP request. Nonwinner: causal timestamp + coalesced status.
+    // 5. winner: timestamp immediately before its sole SIGSTOP request.
+    //    Nonwinner: causal timestamp and the finite coalesced/no-helper status.
     // SAFETY: these helpers take no pointers, and SIGSTOP is a valid scalar signal.
     let (hook_ts_ns, send_signal_rc) = unsafe {
         if won {
-            let mut polls: u64 = 0;
-            while polls < STOP_SIGNAL_DELAY_POLLS {
-                let _ = helpers::bpf_ktime_get_ns();
-                polls += 1;
-            }
             let hook_ts_ns = helpers::bpf_ktime_get_ns();
-            (hook_ts_ns, helpers::bpf_send_signal(19) as i64)
+            let send_signal_rc = helpers::bpf_send_signal(19) as i64;
+            (hook_ts_ns, send_signal_rc)
         } else {
             (
                 helpers::bpf_ktime_get_ns(),

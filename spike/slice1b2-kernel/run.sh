@@ -267,15 +267,34 @@ signal record length is not 32 bytes
 signal record identity
 poll
 deadline overflow
+deadline before dequeue
+deadline after dequeue
+record deadline
 clock reversal
 start map insert
 start map remove
 start map read
+duplicate winner
+successor prearm
+accepted resume retry
+successor before resume
+successor resolution
+protective resume
+owner close before accepted resume
 marker byte
 marker read
 monotonic clock
 child exit timeout
+child exit
 child wait
+program missing
+program type
+program detach
+pidfd resume
+accepted stop ledger
+successor marker
+successor signal record timeout
+successor signal record
 REASONS
 }
 
@@ -318,26 +337,11 @@ if len(status_lines) != 2 or status_lines[0] != f"status={expected_status}":
 category = status_lines[1].removeprefix("failure_category=") if status_lines[1].startswith("failure_category=") else ""
 if [item.get("signal_run") for item in timing] != list(range(1, len(timing) + 1)) or len(timing) > 20:
     raise SystemExit(64)
-
-u64 = ["hook_ts_ns", "last_attach_ts_ns", "late_hits", "winner_records",
-       "coalesced_records", "signal_helper_calls", "required_attach_keys",
-       "attached_while_stopped", "final_start_entries", "stop_wait_ceiling_us"]
-i64 = ["send_signal_rc", "pidfd_resume_rc"]
-u32 = ["expected_task_count", "stopped_snapshot_1_count", "stopped_snapshot_2_count",
-       "post_attach_task_count", "markers_after_resume"]
-u8 = ["winner_case_id", "coalesced_case_id"]
-attach_attempts = ["signal_attach_attempts", "late_attach_attempts"]
-attempts = ["pidfd_resume_attempts"]
-booleans = [
-    "stop_request_accepted",
-    "stopped_snapshot_1_exact_expected_task_set", "stopped_snapshot_1_all_tasks_stopped",
-    "stopped_snapshot_2_exact_expected_task_set", "stopped_snapshot_2_all_tasks_stopped",
-    "pre_stop_marker_observed", "post_attach_exact_expected_task_set",
-    "post_attach_all_tasks_stopped", "post_attach_marker_observed",
-    "drain_empty", "queue_empty_before_resume", "owner_removed",
-    "signal_attach_accepted", "late_attach_accepted", "signal_link_detached",
-    "late_link_detached", "resume_via_original_pidfd", "post_resume_marker_observed", "reaped",
-]
+MIN = -(1 << 63)
+def uint(value, bits=64):
+    return type(value) is int and 0 <= value < (1 << bits)
+def sint(value):
+    return type(value) is int and -(1 << 63) <= value < (1 << 63)
 def sample_well_formed(sample):
     if not isinstance(sample, dict):
         return False
@@ -380,79 +384,126 @@ def samples_well_formed(item):
             return False
         if samples[second]["elapsed_us"] > 100000:
             return False
-    if item.get("stop_wait_ceiling_us") != 100000:
-        return False
     return True
+def cycle_well_formed(cycle):
+    u64 = ["hook_ts_ns", "cycle_deadline_ns", "last_attach_ts_ns", "late_hits",
+           "winner_records", "coalesced_records", "signal_helper_calls",
+           "required_attach_keys", "attached_while_stopped"]
+    u32 = ["expected_task_count", "stopped_snapshot_1_count", "stopped_snapshot_2_count",
+           "post_attach_task_count", "markers_after_resume"]
+    u8 = ["winner_case_id", "coalesced_case_id", "signal_attach_attempts", "late_attach_attempts",
+          "pidfd_resume_attempts"]
+    booleans = [
+        "stop_request_accepted", "stopped_snapshot_1_exact_expected_task_set",
+        "stopped_snapshot_1_all_tasks_stopped", "stopped_snapshot_2_exact_expected_task_set",
+        "stopped_snapshot_2_all_tasks_stopped", "pre_stop_marker_observed", "drain_empty",
+        "post_attach_exact_expected_task_set", "post_attach_all_tasks_stopped",
+        "post_attach_marker_observed", "queue_empty_before_resume", "signal_attach_accepted",
+        "late_attach_accepted", "resume_via_original_pidfd", "owner_removed",
+        "post_resume_marker_observed",
+    ]
+    if not isinstance(cycle, dict) or any(not uint(cycle.get(name)) for name in u64):
+        return False
+    if any(not uint(cycle.get(name), 32) for name in u32):
+        return False
+    if any(not uint(cycle.get(name), 8) for name in u8):
+        return False
+    if not sint(cycle.get("send_signal_rc")) or not sint(cycle.get("pidfd_resume_rc")):
+        return False
+    if any(not isinstance(cycle.get(name), bool) for name in booleans):
+        return False
+    if any(cycle[name] not in {0, 1, 2} for name in ["signal_attach_attempts", "late_attach_attempts"]):
+        return False
+    if cycle["pidfd_resume_attempts"] not in {0, 1}:
+        return False
+    for name in ["record_before_dequeue_ns", "record_after_decode_ns", "record_hook_ts_ns"]:
+        if not isinstance(cycle.get(name), list) or any(not uint(value) for value in cycle[name]):
+            return False
+    coalesced = cycle.get("coalesced_send_signal_rcs")
+    if not isinstance(coalesced, list) or any(not sint(value) for value in coalesced):
+        return False
+    gap = cycle.get("attach_gap_ms")
+    if not isinstance(gap, (int, float)) or isinstance(gap, bool) or not math.isfinite(gap):
+        return False
+    return samples_well_formed(cycle)
+def causal(cycle):
+    count = cycle["winner_records"] + cycle["coalesced_records"]
+    return (
+        count <= 2
+        and cycle["hook_ts_ns"] != 0
+        and cycle["cycle_deadline_ns"] == cycle["hook_ts_ns"] + 100000000
+        and all(len(cycle[name]) == count for name in ["record_before_dequeue_ns", "record_after_decode_ns", "record_hook_ts_ns"])
+        and all(0 < value <= cycle["cycle_deadline_ns"] for name in ["record_before_dequeue_ns", "record_after_decode_ns", "record_hook_ts_ns"] for value in cycle[name])
+        and all(before <= after and hook <= after for before, after, hook in zip(cycle["record_before_dequeue_ns"], cycle["record_after_decode_ns"], cycle["record_hook_ts_ns"]))
+    )
+def common_cycle(cycle):
+    gap = cycle["last_attach_ts_ns"] - cycle["hook_ts_ns"]
+    return (
+        causal(cycle) and cycle["send_signal_rc"] == 0 and cycle["stop_request_accepted"] is True
+        and cycle["expected_task_count"] == 2 and cycle["winner_records"] == 1
+        and cycle["signal_helper_calls"] == 1
+        and cycle["stopped_snapshot_1_count"] == 2 and cycle["stopped_snapshot_2_count"] == 2
+        and cycle["stopped_snapshot_1_exact_expected_task_set"] is True
+        and cycle["stopped_snapshot_1_all_tasks_stopped"] is True
+        and cycle["stopped_snapshot_2_exact_expected_task_set"] is True
+        and cycle["stopped_snapshot_2_all_tasks_stopped"] is True
+        and cycle["confirmation_sample_indexes"] is not None
+        and cycle["pre_stop_marker_observed"] is False and cycle["drain_empty"] is True
+        and cycle["post_attach_task_count"] == 2
+        and cycle["post_attach_exact_expected_task_set"] is True
+        and cycle["post_attach_all_tasks_stopped"] is True
+        and cycle["post_attach_marker_observed"] is False
+        and cycle["queue_empty_before_resume"] is True
+        and cycle["signal_attach_attempts"] == 2 and cycle["signal_attach_accepted"] is True
+        and cycle["late_attach_accepted"] is True
+        and gap >= 0 and cycle["attach_gap_ms"] == gap / 1000000.0
+        and cycle["pidfd_resume_attempts"] == 1 and cycle["pidfd_resume_rc"] == 0
+        and cycle["resume_via_original_pidfd"] is True and cycle["owner_removed"] is True
+    )
+def outcome_a_cycle(cycle):
+    return (
+        common_cycle(cycle) and cycle["coalesced_records"] == 1
+        and cycle["coalesced_send_signal_rcs"] == [MIN]
+        and {cycle["winner_case_id"], cycle["coalesced_case_id"]} == {1, 2}
+        and cycle["required_attach_keys"] == 2 and cycle["attached_while_stopped"] == 2
+        and cycle["late_attach_attempts"] == 2 and cycle["post_resume_marker_observed"] is True
+        and cycle["markers_after_resume"] == 2 and cycle["late_hits"] == 2
+    )
+def outcome_b_cycle(cycle, final):
+    return (
+        common_cycle(cycle) and cycle["coalesced_records"] == 0
+        and cycle["coalesced_send_signal_rcs"] == [] and cycle["winner_case_id"] in {1, 2}
+        and cycle["coalesced_case_id"] == 0 and cycle["required_attach_keys"] == 1
+        and cycle["attached_while_stopped"] == 1 and cycle["late_attach_attempts"] == 1
+        and (not final or (cycle["post_resume_marker_observed"] is True and cycle["markers_after_resume"] == 2 and cycle["late_hits"] == 2))
+        and (final or (cycle["post_resume_marker_observed"] is False and cycle["markers_after_resume"] == 0 and cycle["late_hits"] == 0))
+    )
 def well_formed(item):
     if not isinstance(item.get("pass"), bool) or item.get("failure_category") not in {"none", "runtime", "oracle"}:
         return False
-    if any(type(item.get(name)) is not int or not 0 <= item[name] <= 0xffffffffffffffff for name in u64):
+    if item.get("outcome") not in {"A", "B", None} or not isinstance(item.get("cycles"), list) or len(item["cycles"]) > 2:
         return False
-    if any(type(item.get(name)) is not int or not -(1 << 63) <= item[name] < (1 << 63) for name in i64):
+    if any(not cycle_well_formed(cycle) for cycle in item["cycles"]):
         return False
-    if any(type(item.get(name)) is not int or not 0 <= item[name] <= 0xffffffff for name in u32):
-        return False
-    if any(type(item.get(name)) is not int or not 0 <= item[name] <= 0xff for name in u8):
-        return False
-    if any(type(item.get(name)) is not int or item[name] not in {0, 1, 2} for name in attach_attempts):
-        return False
-    if any(type(item.get(name)) is not int or item[name] not in {0, 1} for name in attempts):
-        return False
-    if any(not isinstance(item.get(name), bool) for name in booleans):
-        return False
-    if type(item.get("child_exit")) is not int or not -(1 << 31) <= item["child_exit"] < (1 << 31):
-        return False
-    if not samples_well_formed(item):
-        return False
-    gap = item.get("attach_gap_ms")
-    if not isinstance(gap, (int, float)) or isinstance(gap, bool) or not math.isfinite(gap):
-        return False
-    if item["signal_attach_accepted"] and item["signal_attach_attempts"] != 2:
-        return False
-    if item["late_attach_accepted"] and item["late_attach_attempts"] != 2:
-        return False
-    if item["signal_link_detached"] and not item["signal_attach_accepted"]:
-        return False
-    if item["late_link_detached"] and not item["late_attach_accepted"]:
-        return False
-    if item["resume_via_original_pidfd"] and item["pidfd_resume_attempts"] != 1:
-        return False
-    return True
-def oracle(item):
-    gap = item["last_attach_ts_ns"] - item["hook_ts_ns"]
     return (
-        item["hook_ts_ns"] != 0 and item["send_signal_rc"] == 0
-        and item["stop_request_accepted"] is True and item["expected_task_count"] == 2
-        and item["winner_records"] == 1 and item["coalesced_records"] == 1
-        and item["signal_helper_calls"] == 1
-        and item["winner_case_id"] != item["coalesced_case_id"]
-        and {item["winner_case_id"], item["coalesced_case_id"]} == {1, 2}
-        and item["stopped_snapshot_1_count"] == item["expected_task_count"]
-        and item["stopped_snapshot_2_count"] == item["expected_task_count"]
-        and item["stopped_snapshot_1_exact_expected_task_set"] is True
-        and item["stopped_snapshot_1_all_tasks_stopped"] is True
-        and item["stopped_snapshot_2_exact_expected_task_set"] is True
-        and item["stopped_snapshot_2_all_tasks_stopped"] is True
-        and item["confirmation_sample_indexes"] is not None
-        and item["pre_stop_marker_observed"] is False
-        and item["drain_empty"] is True and item["required_attach_keys"] == 2
-        and item["post_attach_task_count"] == item["expected_task_count"]
-        and item["post_attach_exact_expected_task_set"] is True
-        and item["post_attach_all_tasks_stopped"] is True
-        and item["post_attach_marker_observed"] is False
-        and item["attached_while_stopped"] == 2
-        and item["queue_empty_before_resume"] is True
-        and item["signal_attach_attempts"] == 2 and item["signal_attach_accepted"] is True
-        and item["late_attach_attempts"] == 2 and item["late_attach_accepted"] is True
-        and item["signal_link_detached"] is True and item["late_link_detached"] is True
-        and gap >= 0 and item["attach_gap_ms"] == gap / 1000000.0
-        and item["pidfd_resume_attempts"] == 1 and item["pidfd_resume_rc"] == 0
-        and item["resume_via_original_pidfd"] is True
-        and item["owner_removed"] is True and item["final_start_entries"] == 0
-        and item["post_resume_marker_observed"] is True
-        and item["markers_after_resume"] == 2 and item["late_hits"] == 2
-        and item["child_exit"] == 0 and item["reaped"] is True
+        item.get("stop_wait_ceiling_us") == 100000
+        and isinstance(item.get("signal_link_detached"), bool)
+        and isinstance(item.get("late_link_detached"), bool)
+        and uint(item.get("final_start_entries"))
+        and type(item.get("child_exit")) is int and -(1 << 31) <= item["child_exit"] < (1 << 31)
+        and isinstance(item.get("reaped"), bool)
     )
+def oracle(item):
+    cycles = item["cycles"]
+    global_ok = (item["signal_link_detached"] is True and item["late_link_detached"] is True
+                 and item["final_start_entries"] == 0 and item["child_exit"] == 0 and item["reaped"] is True)
+    if item["outcome"] == "A":
+        return global_ok and len(cycles) == 1 and outcome_a_cycle(cycles[0])
+    if item["outcome"] == "B":
+        return (global_ok and len(cycles) == 2 and outcome_b_cycle(cycles[0], False)
+                and outcome_b_cycle(cycles[1], True)
+                and cycles[0]["winner_case_id"] != cycles[1]["winner_case_id"])
+    return False
 if any(not well_formed(item) for item in timing):
     raise SystemExit(64)
 accepted = all(item["accepted"] for item in verifier)
@@ -1203,7 +1254,8 @@ build_bpf() {
     object=$here/ebpf/target/bpfel-unknown-none/release/slice1b2-kernel-ebpf
     install -m 0600 "$object" "$output/slice1b2-kernel-ebpf"
     objdump_bin=$(rustc +nightly --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-objdump
-    python3 "$here/check-init-shape.py" "$output/slice1b2-kernel-ebpf" "$objdump_bin" || return 64
+    python3 "$here/check-init-shape.py" "$output/slice1b2-kernel-ebpf" "$objdump_bin" \
+        --pause-source "$here/ebpf/src/main.rs" || return 64
     local cmpxchg_count
     cmpxchg_count=$("$objdump_bin" -d "$output/slice1b2-kernel-ebpf" \
         | sed -n '/<signal_return>:/,/^$/p' | grep -c cmpxchg_64 || true)

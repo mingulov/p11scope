@@ -191,7 +191,17 @@ pub fn gate_a_case_pass(facts: &GateACaseFacts) -> bool {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SignalTimingFacts {
     pub hook_ts_ns: u64,
+    /// The one absolute winner-relative deadline for this accepted cycle.
+    /// These finite timestamps deliberately describe observation timing only;
+    /// raw SignalRecord identity stays private to the runner.
+    pub cycle_deadline_ns: u64,
+    pub record_before_dequeue_ns: Vec<u64>,
+    pub record_after_decode_ns: Vec<u64>,
+    pub record_hook_ts_ns: Vec<u64>,
     pub send_signal_rc: i64,
+    /// Private finite statuses for every coalesced sibling.  The only valid
+    /// value is the ABI sentinel; a case ID never stands in for this fact.
+    pub coalesced_send_signal_rcs: Vec<i64>,
     pub stop_request_accepted: bool,
     pub expected_task_count: u32,
     pub winner_records: u64,
@@ -236,21 +246,82 @@ pub struct SignalTimingFacts {
     pub reaped: bool,
 }
 
-pub fn signal_oracle_pass(facts: &SignalTimingFacts) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GateBOutcome {
+    A,
+    B,
+}
+
+impl GateBOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::A => "A",
+            Self::B => "B",
+        }
+    }
+}
+
+/// Private Gate B evidence for one child.  The record intentionally contains
+/// only finite cycle facts; PID/TID, addresses, map keys, and signal records
+/// remain in-memory only.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GateBTimingFacts {
+    pub outcome: Option<GateBOutcome>,
+    pub cycles: Vec<SignalTimingFacts>,
+    pub signal_link_detached: bool,
+    pub late_link_detached: bool,
+    pub final_start_entries: u64,
+    pub child_exit: i32,
+    pub reaped: bool,
+}
+
+const STOP_WAIT_CEILING_US: u64 = 100_000;
+const STOP_WAIT_CEILING_NS: u64 = STOP_WAIT_CEILING_US * 1_000;
+
+fn cycle_deadline_ns(hook_ts_ns: u64) -> Result<u64, &'static str> {
+    hook_ts_ns
+        .checked_add(STOP_WAIT_CEILING_NS)
+        .ok_or("deadline overflow")
+}
+
+fn causal_cycle_pass(facts: &SignalTimingFacts) -> bool {
+    let record_count = facts
+        .winner_records
+        .checked_add(facts.coalesced_records)
+        .and_then(|count| usize::try_from(count).ok())
+        .filter(|count| *count <= 2);
+    facts.cycle_deadline_ns == cycle_deadline_ns(facts.hook_ts_ns).ok().unwrap_or(0)
+        && record_count.is_some_and(|count| {
+            facts.record_before_dequeue_ns.len() == count
+                && facts.record_after_decode_ns.len() == count
+                && facts.record_hook_ts_ns.len() == count
+        })
+        && facts
+            .record_before_dequeue_ns
+            .iter()
+            .chain(&facts.record_after_decode_ns)
+            .chain(&facts.record_hook_ts_ns)
+            .all(|timestamp| *timestamp != 0 && *timestamp <= facts.cycle_deadline_ns)
+        && facts
+            .record_before_dequeue_ns
+            .iter()
+            .zip(&facts.record_after_decode_ns)
+            .zip(&facts.record_hook_ts_ns)
+            .all(|((before, after), hook)| before <= after && hook <= after)
+}
+
+fn common_accepted_cycle_pass(facts: &SignalTimingFacts) -> bool {
     let Some(gap_ns) = facts.last_attach_ts_ns.checked_sub(facts.hook_ts_ns) else {
         return false;
     };
     let expected_gap_ms = gap_ns as f64 / 1_000_000.0;
     facts.hook_ts_ns != 0
+        && causal_cycle_pass(facts)
         && facts.send_signal_rc == 0
         && facts.stop_request_accepted
         && facts.expected_task_count == 2
         && facts.winner_records == 1
-        && facts.coalesced_records == 1
         && facts.signal_helper_calls == 1
-        && facts.winner_case_id != facts.coalesced_case_id
-        && ((facts.winner_case_id == 1 && facts.coalesced_case_id == 2)
-            || (facts.winner_case_id == 2 && facts.coalesced_case_id == 1))
         && facts.stopped_snapshot_1_count == facts.expected_task_count
         && facts.stopped_snapshot_2_count == facts.expected_task_count
         && facts.stopped_snapshot_1_exact_expected_task_set
@@ -260,31 +331,87 @@ pub fn signal_oracle_pass(facts: &SignalTimingFacts) -> bool {
         && facts.confirmation_sample_indexes.is_some()
         && !facts.pre_stop_marker_observed
         && facts.drain_empty
-        && facts.required_attach_keys == 2
         && facts.post_attach_task_count == facts.expected_task_count
         && facts.post_attach_exact_expected_task_set
         && facts.post_attach_all_tasks_stopped
         && !facts.post_attach_marker_observed
-        && facts.attached_while_stopped == 2
         && facts.queue_empty_before_resume
         && facts.signal_attach_attempts == 2
         && facts.signal_attach_accepted
-        && facts.late_attach_attempts == 2
         && facts.late_attach_accepted
-        && facts.signal_link_detached
-        && facts.late_link_detached
         && facts.attach_gap_ms.is_finite()
         && (facts.attach_gap_ms - expected_gap_ms).abs() <= f64::EPSILON
         && facts.pidfd_resume_attempts == 1
         && facts.pidfd_resume_rc == 0
         && facts.resume_via_original_pidfd
         && facts.owner_removed
+}
+
+pub fn signal_oracle_pass(facts: &SignalTimingFacts) -> bool {
+    common_accepted_cycle_pass(facts)
+        && facts.coalesced_records == 1
+        && facts.coalesced_send_signal_rcs == [common::COALESCED_NO_HELPER]
+        && facts.winner_case_id != facts.coalesced_case_id
+        && ((facts.winner_case_id == 1 && facts.coalesced_case_id == 2)
+            || (facts.winner_case_id == 2 && facts.coalesced_case_id == 1))
+        && facts.required_attach_keys == 2
+        && facts.attached_while_stopped == 2
+        && facts.late_attach_attempts == 2
+        && facts.signal_link_detached
+        && facts.late_link_detached
         && facts.final_start_entries == 0
         && facts.post_resume_marker_observed
         && facts.markers_after_resume == 2
         && facts.late_hits == 2
         && facts.child_exit == 0
         && facts.reaped
+}
+
+fn deferred_cycle_pass(facts: &SignalTimingFacts, final_cycle: bool) -> bool {
+    common_accepted_cycle_pass(facts)
+        && facts.coalesced_records == 0
+        && facts.coalesced_send_signal_rcs.is_empty()
+        && (facts.winner_case_id == common::SIGNAL_COOKIE_A as u8
+            || facts.winner_case_id == common::SIGNAL_COOKIE_B as u8)
+        && facts.coalesced_case_id == 0
+        && facts.required_attach_keys == 1
+        && facts.attached_while_stopped == 1
+        && facts.late_attach_attempts == 1
+        && if final_cycle {
+            facts.post_resume_marker_observed
+                && facts.markers_after_resume == 2
+                && facts.late_hits == 2
+        } else {
+            !facts.post_resume_marker_observed
+                && facts.markers_after_resume == 0
+                && facts.late_hits == 0
+        }
+}
+
+pub fn gate_b_oracle_pass(facts: &GateBTimingFacts) -> bool {
+    match facts.outcome {
+        Some(GateBOutcome::A) => {
+            facts.cycles.len() == 1
+                && signal_oracle_pass(&facts.cycles[0])
+                && facts.signal_link_detached
+                && facts.late_link_detached
+                && facts.final_start_entries == 0
+                && facts.child_exit == 0
+                && facts.reaped
+        }
+        Some(GateBOutcome::B) => {
+            facts.cycles.len() == 2
+                && deferred_cycle_pass(&facts.cycles[0], false)
+                && deferred_cycle_pass(&facts.cycles[1], true)
+                && facts.cycles[0].winner_case_id != facts.cycles[1].winner_case_id
+                && facts.signal_link_detached
+                && facts.late_link_detached
+                && facts.final_start_entries == 0
+                && facts.child_exit == 0
+                && facts.reaped
+        }
+        None => false,
+    }
 }
 
 pub fn parse_task_state(stat: &str) -> Result<u8, &'static str> {
@@ -329,16 +456,22 @@ pub fn make_manifest_read_only(file: &File) -> io::Result<()> {
 pub struct CleanupFacts {
     pub may_be_stopped: bool,
     pub resume_attempts: u8,
+    pub protective_resume_attempts: u8,
     pub resume_via_original_pidfd: bool,
+    pub resume_rc: Option<i64>,
     pub kill_via_original_pidfd: bool,
+    pub kill_rc: Option<i64>,
     pub reaped: bool,
 }
 
 pub fn cleanup_oracle_pass(facts: CleanupFacts) -> bool {
     facts.resume_attempts <= 1
+        && facts.protective_resume_attempts <= 1
         && (facts.resume_attempts == 0 || facts.resume_via_original_pidfd)
+        && (facts.resume_attempts == 0 || facts.resume_rc.is_some())
         && (!facts.may_be_stopped || facts.resume_attempts == 1)
         && facts.kill_via_original_pidfd
+        && facts.kill_rc == Some(0)
         && facts.reaped
 }
 
@@ -361,6 +494,8 @@ pub struct ChildGuard {
     release_writer: OwnedFd,
     may_be_stopped: bool,
     resume_attempted: bool,
+    accepted_resume_attempts: u8,
+    protective_resume_attempted: bool,
     reaped: bool,
 }
 
@@ -369,7 +504,9 @@ impl ChildGuard {
         self.child.id()
     }
 
-    pub fn mark_may_be_stopped(&mut self) {
+    /// Called only after a decoded, exact-generation accepted winner has been
+    /// written to the matching PauseOwnerGuard ledger.
+    fn mark_accepted_stop(&mut self) {
         self.may_be_stopped = true;
     }
 
@@ -378,10 +515,32 @@ impl ChildGuard {
     }
 
     pub fn resume_once(&mut self) -> io::Result<()> {
-        if self.resume_attempted {
+        if self.accepted_resume_attempts != 0 {
             return Err(io::Error::other("child resume was already attempted"));
         }
+        self.resume_accepted(false)
+    }
+
+    fn resume_accepted(&mut self, retain_stop_guard: bool) -> io::Result<()> {
+        if self.accepted_resume_attempts >= 2 {
+            return Err(io::Error::other("accepted resume limit"));
+        }
         self.resume_attempted = true;
+        self.accepted_resume_attempts += 1;
+        let result = pidfd_send_signal(self.original_pidfd.as_raw_fd(), libc::SIGCONT);
+        if result.is_ok() && !retain_stop_guard {
+            self.may_be_stopped = false;
+        }
+        result
+    }
+
+    fn resume_successor_protective_once(&mut self) -> io::Result<()> {
+        if self.protective_resume_attempted {
+            return Err(io::Error::other(
+                "successor protective resume was already attempted",
+            ));
+        }
+        self.protective_resume_attempted = true;
         let result = pidfd_send_signal(self.original_pidfd.as_raw_fd(), libc::SIGCONT);
         if result.is_ok() {
             self.may_be_stopped = false;
@@ -405,16 +564,19 @@ impl ChildGuard {
             facts.reaped = true;
             return facts;
         }
-        if self.may_be_stopped && !self.resume_attempted {
+        if self.may_be_stopped && !self.resume_attempted && !self.protective_resume_attempted {
             self.resume_attempted = true;
             facts.resume_attempts = 1;
             facts.resume_via_original_pidfd = true;
-            if pidfd_send_signal(self.original_pidfd.as_raw_fd(), libc::SIGCONT).is_ok() {
+            let resume = pidfd_send_signal(self.original_pidfd.as_raw_fd(), libc::SIGCONT);
+            facts.resume_rc = Some(if resume.is_ok() { 0 } else { -1 });
+            if resume.is_ok() {
                 self.may_be_stopped = false;
             }
         }
-        facts.kill_via_original_pidfd = true;
-        let _ = pidfd_send_signal(self.original_pidfd.as_raw_fd(), libc::SIGKILL);
+        let kill = pidfd_send_signal(self.original_pidfd.as_raw_fd(), libc::SIGKILL);
+        facts.kill_via_original_pidfd = kill.is_ok();
+        facts.kill_rc = Some(if kill.is_ok() { 0 } else { -1 });
         self.reaped = self.child.wait().is_ok();
         facts.reaped = self.reaped;
         facts
@@ -447,6 +609,8 @@ where
             release_writer,
             may_be_stopped: false,
             resume_attempted: false,
+            accepted_resume_attempts: 0,
+            protective_resume_attempted: false,
             reaped: false,
         }),
         Err(pidfd_error) => {
@@ -518,15 +682,48 @@ impl PauseOwnerMap
     }
 }
 
-/// State machine for the START group-key entry (§5.2). The runner removes the entry
-/// through the guard on every exit path — `close_after_resume()` immediately after
-/// the single successful original-pidfd resume (before markers/exit), or the
-/// post-cleanup `disarm_for_cleanup()` (ordered after ChildGuard cleanup, so a
-/// stopped child is resumed exactly once first). The guard never resumes a child.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SuccessorResolution {
+    None,
+    Unconsumed,
+    Accepted,
+    Rejected,
+    Unresolved,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PauseEpoch {
+    authorization_consumed: bool,
+    accepted_request: bool,
+    accepted_cycle_resume_attempted: bool,
+    accepted_cycle_resume_rc: Option<i64>,
+    successor_installed: bool,
+    successor_resolution: SuccessorResolution,
+    successor_protective_resume_attempted: bool,
+}
+
+impl Default for PauseEpoch {
+    fn default() -> Self {
+        Self {
+            authorization_consumed: false,
+            accepted_request: false,
+            accepted_cycle_resume_attempted: false,
+            accepted_cycle_resume_rc: None,
+            successor_installed: false,
+            successor_resolution: SuccessorResolution::None,
+            successor_protective_resume_attempted: false,
+        }
+    }
+}
+
+/// State machine for the one current START owner and its one permitted successor.
+/// The guard never owns a second pidfd; it records which original-pidfd resume is
+/// required so the runner can perform it after all fallible cleanup steps.
 struct PauseOwnerGuard {
     key: common::StateKey,
     armed: bool,
     closed: bool,
+    epoch: PauseEpoch,
 }
 
 impl PauseOwnerGuard {
@@ -535,12 +732,112 @@ impl PauseOwnerGuard {
             key,
             armed: true,
             closed: false,
+            epoch: PauseEpoch::default(),
         }
+    }
+
+    fn mark_accepted_request(&mut self) -> Result<(), &'static str> {
+        if !self.armed || self.epoch.authorization_consumed {
+            return Err("duplicate winner");
+        }
+        self.epoch.authorization_consumed = true;
+        self.epoch.accepted_request = true;
+        Ok(())
+    }
+
+    fn mark_rejected_request(&mut self) -> Result<(), &'static str> {
+        if !self.armed || self.epoch.authorization_consumed {
+            return Err("duplicate winner");
+        }
+        self.epoch.authorization_consumed = true;
+        Ok(())
+    }
+
+    fn prearm_successor_before_resume<M: PauseOwnerMap>(
+        &mut self,
+        map: &mut M,
+        all_tasks_stopped: bool,
+    ) -> Result<(), &'static str> {
+        if !all_tasks_stopped || !self.epoch.accepted_request || self.epoch.successor_installed {
+            return Err("successor prearm");
+        }
+        map.remove_owner(&self.key)?;
+        map.insert_armed(&self.key)?;
+        self.armed = true;
+        self.closed = false;
+        self.epoch.successor_installed = true;
+        self.epoch.successor_resolution = SuccessorResolution::Unconsumed;
+        Ok(())
+    }
+
+    fn record_current_resume(&mut self, rc: i64) -> Result<(), &'static str> {
+        if !self.epoch.accepted_request || self.epoch.accepted_cycle_resume_attempted {
+            return Err("accepted resume retry");
+        }
+        self.epoch.accepted_cycle_resume_attempted = true;
+        self.epoch.accepted_cycle_resume_rc = Some(rc);
+        Ok(())
+    }
+
+    fn current_resume_required(&self) -> bool {
+        self.epoch.accepted_request && !self.epoch.accepted_cycle_resume_attempted
+    }
+
+    fn accept_successor_request(&mut self) -> Result<(), &'static str> {
+        if !self.epoch.successor_installed
+            || self.epoch.successor_resolution != SuccessorResolution::Unconsumed
+            || self.epoch.accepted_cycle_resume_rc != Some(0)
+        {
+            return Err("successor before resume");
+        }
+        self.epoch.successor_resolution = SuccessorResolution::Accepted;
+        self.epoch = PauseEpoch {
+            authorization_consumed: true,
+            accepted_request: true,
+            ..PauseEpoch::default()
+        };
+        Ok(())
+    }
+
+    fn reject_successor_request(&mut self) -> Result<(), &'static str> {
+        if !self.epoch.successor_installed
+            || self.epoch.successor_resolution != SuccessorResolution::Unconsumed
+        {
+            return Err("successor resolution");
+        }
+        self.epoch.successor_resolution = SuccessorResolution::Rejected;
+        Ok(())
+    }
+
+    fn mark_successor_unresolved(&mut self) {
+        if self.epoch.successor_installed
+            && self.epoch.successor_resolution == SuccessorResolution::Unconsumed
+        {
+            self.epoch.successor_resolution = SuccessorResolution::Unresolved;
+        }
+    }
+
+    fn needs_protective_successor_resume(&self) -> bool {
+        self.epoch.successor_installed
+            && self.epoch.successor_resolution == SuccessorResolution::Unresolved
+            && self.epoch.accepted_cycle_resume_rc == Some(0)
+            && !self.epoch.successor_protective_resume_attempted
+    }
+
+    fn record_protective_successor_resume(&mut self) -> Result<(), &'static str> {
+        if !self.needs_protective_successor_resume() {
+            return Err("protective resume");
+        }
+        self.epoch.successor_protective_resume_attempted = true;
+        Ok(())
     }
 
     fn close_after_resume<M: PauseOwnerMap>(&mut self, map: &mut M) -> Result<bool, &'static str> {
         if self.closed {
             return Ok(true);
+        }
+        if !self.epoch.accepted_request || self.epoch.accepted_cycle_resume_rc != Some(0) {
+            return Err("owner close before accepted resume");
         }
         map.remove_owner(&self.key)?;
         self.closed = true;
@@ -556,11 +853,15 @@ impl PauseOwnerGuard {
         self.armed && !self.closed
     }
 
-    fn disarm_for_cleanup<M: PauseOwnerMap>(&mut self, map: &mut M) {
+    fn disarm_for_cleanup_result<M: PauseOwnerMap>(
+        &mut self,
+        map: &mut M,
+    ) -> Result<(), &'static str> {
         if self.needs_removal() {
-            let _ = map.remove_owner(&self.key);
+            map.remove_owner(&self.key)?;
         }
         self.armed = false;
+        Ok(())
     }
 }
 
@@ -1545,6 +1846,24 @@ fn detach_program(
     program.detach(link).map_err(|_| "program detach")
 }
 
+/// Detach every already-owned link even if an earlier detach failed; callers
+/// retain the first error while continuing the rest of teardown.
+fn detach_all_program_links(
+    ebpf: &mut aya::Ebpf,
+    program_name: &str,
+    links: &mut Vec<aya::programs::uprobe::UProbeLinkId>,
+) -> Result<(), &'static str> {
+    let mut first_failure = None;
+    for link in links.drain(..) {
+        if let Err(reason) = detach_program(ebpf, program_name, link)
+            && first_failure.is_none()
+        {
+            first_failure = Some(reason);
+        }
+    }
+    first_failure.map_or(Ok(()), Err)
+}
+
 fn cancellation_failure(cancellation: &Cancellation) -> Result<(), &'static str> {
     match cancellation.check().map_err(|_| "cancellation pipe")? {
         Some(Cancelled::Sigint) => Err("cancelled_sigint"),
@@ -1758,8 +2077,6 @@ fn stop_snapshot(pid: u32, expected: &BTreeMap<u32, u8>) -> Result<StopSnapshot,
     Ok(snapshot)
 }
 
-const STOP_WAIT_CEILING_US: u64 = 100_000;
-
 fn confirm(samples: &[StopSnapshot]) -> Option<(usize, usize)> {
     for index in 0..samples.len().saturating_sub(1) {
         let first = &samples[index];
@@ -1787,33 +2104,47 @@ fn sample_value(snapshot: &StopSnapshot) -> serde_json::Value {
     })
 }
 
-fn wait_signal_record(
-    ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
-    cancellation: &Cancellation,
-) -> Result<common::SignalRecord, &'static str> {
-    let deadline_ns = monotonic_ns()?
-        .checked_add(5_000_000_000)
-        .ok_or("monotonic clock")?;
-    wait_signal_record_until(ring, cancellation, deadline_ns, "signal record timeout")
+#[derive(Clone, Copy, Debug)]
+struct ReceivedSignalRecord {
+    record: common::SignalRecord,
+    before_dequeue_ns: u64,
+    after_decode_ns: u64,
 }
 
-fn wait_signal_record_until(
+fn record_within_cycle_deadline(record: ReceivedSignalRecord, deadline_ns: u64) -> bool {
+    record.before_dequeue_ns <= record.after_decode_ns
+        && record.record.hook_ts_ns <= record.after_decode_ns
+        && record.before_dequeue_ns <= deadline_ns
+        && record.after_decode_ns <= deadline_ns
+        && record.record.hook_ts_ns <= deadline_ns
+}
+
+fn wait_optional_received_signal_record_until(
     ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
     cancellation: &Cancellation,
     deadline_ns: u64,
-    timeout_reason: &'static str,
-) -> Result<common::SignalRecord, &'static str> {
+) -> Result<Option<ReceivedSignalRecord>, &'static str> {
     loop {
         cancellation_failure(cancellation)?;
+        let before_dequeue_ns = monotonic_ns()?;
+        if before_dequeue_ns > deadline_ns {
+            return Ok(None);
+        }
         if let Some(item) = ring.next() {
-            return decode_signal_record(&item);
+            let record = decode_signal_record(&item)?;
+            let after_decode_ns = monotonic_ns()?;
+            if after_decode_ns > deadline_ns {
+                return Err("deadline after dequeue");
+            }
+            return Ok(Some(ReceivedSignalRecord {
+                record,
+                before_dequeue_ns,
+                after_decode_ns,
+            }));
         }
-        let now_ns = monotonic_ns()?;
-        if now_ns >= deadline_ns {
-            return Err(timeout_reason);
-        }
-        let timeout_ms = i32::try_from((deadline_ns - now_ns) / 1_000_000).unwrap_or(i32::MAX);
-        let timeout_ms = timeout_ms.clamp(1, 5_000);
+        let timeout_ms = i32::try_from((deadline_ns - before_dequeue_ns) / 1_000_000)
+            .unwrap_or(i32::MAX)
+            .clamp(1, 5_000);
         let mut pollfds = [
             libc::pollfd {
                 fd: ring.as_raw_fd(),
@@ -1834,13 +2165,255 @@ fn wait_signal_record_until(
     }
 }
 
-fn drain_signal_ring_to_empty(
+/// Inspect only what is already queued for the current accepted cycle.  Unlike
+/// the liveness wait below, an absent sibling is the valid deferred Outcome B
+/// shape and must leave the cycle's 100 ms confirmation budget intact.
+fn take_available_received_signal_record_until(
     ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
+    deadline_ns: u64,
+) -> Result<Option<ReceivedSignalRecord>, &'static str> {
+    let before_dequeue_ns = monotonic_ns()?;
+    if before_dequeue_ns > deadline_ns {
+        return Err("deadline before dequeue");
+    }
+    let Some(item) = ring.next() else {
+        return Ok(None);
+    };
+    let record = decode_signal_record(&item)?;
+    let after_decode_ns = monotonic_ns()?;
+    if after_decode_ns > deadline_ns {
+        return Err("deadline after dequeue");
+    }
+    Ok(Some(ReceivedSignalRecord {
+        record,
+        before_dequeue_ns,
+        after_decode_ns,
+    }))
+}
+
+fn wait_received_signal_record_until(
+    ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
+    cancellation: &Cancellation,
+) -> Result<ReceivedSignalRecord, &'static str> {
+    let deadline_ns = monotonic_ns()?
+        .checked_add(5_000_000_000)
+        .ok_or("monotonic clock")?;
+    wait_optional_received_signal_record_until(ring, cancellation, deadline_ns)?
+        .ok_or("signal record timeout")
+}
+
+fn wait_received_signal_record_by_deadline(
+    ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
+    cancellation: &Cancellation,
+    deadline_ns: u64,
+    timeout_reason: &'static str,
+) -> Result<ReceivedSignalRecord, &'static str> {
+    let record = wait_optional_received_signal_record_until(ring, cancellation, deadline_ns)?
+        .ok_or(timeout_reason)?;
+    if !record_within_cycle_deadline(record, deadline_ns) {
+        return Err("record deadline");
+    }
+    Ok(record)
+}
+
+/// The successor must be observed promptly after owner 1's successful resume,
+/// but its own winner timestamp begins a fresh 100 ms cycle.  The liveness
+/// bound therefore does not become a second-cycle safety deadline.
+fn wait_successor_record(
+    ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
+    cancellation: &Cancellation,
+    marker_fd: i32,
+    original_pidfd: i32,
+) -> Result<ReceivedSignalRecord, &'static str> {
+    let deadline_ns = monotonic_ns()?
+        .checked_add(5_000_000_000)
+        .ok_or("monotonic clock")?;
+    loop {
+        cancellation_failure(cancellation)?;
+        if drain_marker(marker_fd, cancellation)? {
+            return Err("successor marker");
+        }
+        let before_dequeue_ns = monotonic_ns()?;
+        if before_dequeue_ns > deadline_ns {
+            return Err("successor signal record timeout");
+        }
+        if let Some(item) = ring.next() {
+            let record = decode_signal_record(&item)?;
+            let after_decode_ns = monotonic_ns()?;
+            if after_decode_ns > deadline_ns {
+                return Err("deadline after dequeue");
+            }
+            return Ok(ReceivedSignalRecord {
+                record,
+                before_dequeue_ns,
+                after_decode_ns,
+            });
+        }
+        let timeout_ms = i32::try_from((deadline_ns - before_dequeue_ns) / 1_000_000)
+            .unwrap_or(i32::MAX)
+            .clamp(1, 5_000);
+        let mut pollfds = [
+            libc::pollfd {
+                fd: ring.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: cancellation.read.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: marker_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: original_pidfd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: pollfds remains valid and each descriptor is owned by the runner.
+        let result = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, timeout_ms) };
+        if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return Err("poll");
+        }
+        cancellation_failure(cancellation)?;
+        if pollfds[2].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            return Err("successor marker");
+        }
+        if pollfds[3].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            return Err("child exit");
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SignalRequest {
+    Accepted,
+    Coalesced,
+    Rejected,
+}
+
+fn signal_request(record: &common::SignalRecord) -> SignalRequest {
+    match record.send_signal_rc {
+        0 => SignalRequest::Accepted,
+        common::COALESCED_NO_HELPER => SignalRequest::Coalesced,
+        _ => SignalRequest::Rejected,
+    }
+}
+
+fn validate_signal_record(
+    record: &common::SignalRecord,
+    child_pid: u32,
+    expected: &BTreeMap<u32, u8>,
+    expected_case: Option<u8>,
+) -> Result<(), &'static str> {
+    let record_pid = (record.pid_tgid >> 32) as u32;
+    let record_tid = record.pid_tgid as u32;
+    if (record.case_id != common::SIGNAL_COOKIE_A as u8
+        && record.case_id != common::SIGNAL_COOKIE_B as u8)
+        || expected_case.is_some_and(|case_id| record.case_id != case_id)
+        || record_pid != child_pid
+        || !expected.contains_key(&record_tid)
+        || record.hook_ts_ns == 0
+        || record.reserved_zero != [0; 7]
+    {
+        return Err("signal record identity");
+    }
+    Ok(())
+}
+
+fn remember_record_timing(facts: &mut SignalTimingFacts, record: ReceivedSignalRecord) {
+    facts
+        .record_before_dequeue_ns
+        .push(record.before_dequeue_ns);
+    facts.record_after_decode_ns.push(record.after_decode_ns);
+    facts.record_hook_ts_ns.push(record.record.hook_ts_ns);
+}
+
+fn accepted_cycle_facts(
+    winner: ReceivedSignalRecord,
+    observed: &[ReceivedSignalRecord],
+    expected_task_count: u32,
+) -> Result<SignalTimingFacts, &'static str> {
+    let deadline_ns = cycle_deadline_ns(winner.record.hook_ts_ns)?;
+    if observed
+        .iter()
+        .copied()
+        .any(|record| !record_within_cycle_deadline(record, deadline_ns))
+    {
+        return Err("record deadline");
+    }
+    let mut facts = SignalTimingFacts {
+        hook_ts_ns: winner.record.hook_ts_ns,
+        cycle_deadline_ns: deadline_ns,
+        send_signal_rc: winner.record.send_signal_rc,
+        stop_request_accepted: true,
+        expected_task_count,
+        winner_records: 1,
+        signal_helper_calls: 1,
+        winner_case_id: winner.record.case_id,
+        signal_attach_attempts: 2,
+        signal_attach_accepted: true,
+        ..SignalTimingFacts::default()
+    };
+    for record in observed {
+        remember_record_timing(&mut facts, *record);
+    }
+    Ok(facts)
+}
+
+fn drain_signal_ring_to_empty_until(
+    ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
+    deadline_ns: u64,
 ) -> Result<u64, &'static str> {
     let mut drained = 0u64;
-    while let Some(item) = ring.next() {
-        decode_signal_record(&item)?;
+    loop {
+        let before_dequeue_ns = monotonic_ns()?;
+        if before_dequeue_ns > deadline_ns {
+            return Err("deadline before dequeue");
+        }
+        let Some(item) = ring.next() else {
+            return Ok(drained);
+        };
+        let record = decode_signal_record(&item)?;
+        let after_decode_ns = monotonic_ns()?;
+        if !record_within_cycle_deadline(
+            ReceivedSignalRecord {
+                record,
+                before_dequeue_ns,
+                after_decode_ns,
+            },
+            deadline_ns,
+        ) {
+            return Err("record deadline");
+        }
         drained += 1;
+    }
+}
+
+/// A rejected helper consumes its authorization without stopping the child.
+/// Keep decoding until its fixed window closes, then prove one final empty
+/// read so a same-epoch coalescer cannot be silently left for a new epoch.
+fn drain_signal_ring_through_deadline(
+    ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
+    cancellation: &Cancellation,
+    deadline_ns: u64,
+) -> Result<u64, &'static str> {
+    let mut drained = 0u64;
+    while let Some(record) =
+        wait_optional_received_signal_record_until(ring, cancellation, deadline_ns)?
+    {
+        if !record_within_cycle_deadline(record, deadline_ns) {
+            return Err("record deadline");
+        }
+        drained += 1;
+    }
+    if let Some(item) = ring.next() {
+        let _ = decode_signal_record(&item)?;
+        return Err("record deadline");
     }
     Ok(drained)
 }
@@ -2317,28 +2890,8 @@ fn run_gate_a(paths: GateAPaths) -> Result<bool, &'static str> {
     Ok(pass)
 }
 
-fn signal_timing_json(
-    metadata: &GateMetadata,
-    run: u8,
-    facts: &SignalTimingFacts,
-    pass: bool,
-    runtime_failure_reason: Option<&str>,
-) -> serde_json::Value {
-    let mut value = metadata.record_for_gate(
-        "B",
-        pass,
-        if runtime_failure_reason.is_some() {
-            "runtime"
-        } else if pass {
-            "none"
-        } else {
-            "oracle"
-        },
-    );
-    if let Some(reason) = runtime_failure_reason {
-        value.insert("runtime_failure_reason".into(), reason.into());
-    }
-    value.insert("signal_run".into(), run.into());
+fn signal_cycle_json(facts: &SignalTimingFacts) -> serde_json::Value {
+    let mut value = serde_json::Map::new();
     macro_rules! insert_facts {
         ($($field:ident),+ $(,)?) => {
             $(value.insert(stringify!($field).into(), serde_json::json!(facts.$field));)+
@@ -2346,7 +2899,12 @@ fn signal_timing_json(
     }
     insert_facts!(
         hook_ts_ns,
+        cycle_deadline_ns,
+        record_before_dequeue_ns,
+        record_after_decode_ns,
+        record_hook_ts_ns,
         send_signal_rc,
+        coalesced_send_signal_rcs,
         stop_request_accepted,
         expected_task_count,
         winner_records,
@@ -2374,23 +2932,14 @@ fn signal_timing_json(
         signal_attach_accepted,
         late_attach_attempts,
         late_attach_accepted,
-        signal_link_detached,
-        late_link_detached,
         last_attach_ts_ns,
         attach_gap_ms,
         pidfd_resume_attempts,
         pidfd_resume_rc,
         resume_via_original_pidfd,
         owner_removed,
-        final_start_entries,
         post_resume_marker_observed,
         late_hits,
-        child_exit,
-        reaped,
-    );
-    value.insert(
-        "stop_wait_ceiling_us".into(),
-        serde_json::json!(STOP_WAIT_CEILING_US),
     );
     value.insert(
         "confirmation_sample_indexes".into(),
@@ -2406,7 +2955,206 @@ fn signal_timing_json(
     serde_json::Value::Object(value)
 }
 
+fn signal_timing_json(
+    metadata: &GateMetadata,
+    run: u8,
+    facts: &GateBTimingFacts,
+    pass: bool,
+    runtime_failure_reason: Option<&str>,
+) -> serde_json::Value {
+    let mut value = metadata.record_for_gate(
+        "B",
+        pass,
+        if runtime_failure_reason.is_some() {
+            "runtime"
+        } else if pass {
+            "none"
+        } else {
+            "oracle"
+        },
+    );
+    if let Some(reason) = runtime_failure_reason {
+        value.insert("runtime_failure_reason".into(), reason.into());
+    }
+    value.insert("signal_run".into(), run.into());
+    value.insert(
+        "outcome".into(),
+        facts
+            .outcome
+            .map(|outcome| outcome.as_str().into())
+            .unwrap_or(serde_json::Value::Null),
+    );
+    value.insert(
+        "cycles".into(),
+        serde_json::Value::Array(facts.cycles.iter().map(signal_cycle_json).collect()),
+    );
+    value.insert(
+        "signal_link_detached".into(),
+        facts.signal_link_detached.into(),
+    );
+    value.insert("late_link_detached".into(), facts.late_link_detached.into());
+    value.insert(
+        "final_start_entries".into(),
+        facts.final_start_entries.into(),
+    );
+    value.insert("child_exit".into(), facts.child_exit.into());
+    value.insert("reaped".into(), facts.reaped.into());
+    value.insert(
+        "stop_wait_ceiling_us".into(),
+        serde_json::json!(STOP_WAIT_CEILING_US),
+    );
+    serde_json::Value::Object(value)
+}
+
 type StartMap = aya::maps::HashMap<aya::maps::MapData, common::StateKey, common::StartState>;
+
+fn late_target(case_id: u8) -> Result<(&'static str, u64), &'static str> {
+    match case_id {
+        value if value == common::SIGNAL_COOKIE_A as u8 => {
+            Ok(("spike_late_target", common::SIGNAL_COOKIE_A))
+        }
+        value if value == common::SIGNAL_COOKIE_B as u8 => {
+            Ok(("spike_late_target_b", common::SIGNAL_COOKIE_B))
+        }
+        _ => Err("signal record identity"),
+    }
+}
+
+/// Complete exactly one already-accepted Gate B stop.  Its caller has decoded
+/// the winner, recorded the owner responsibility, and marked ChildGuard before
+/// entering this fallible path.
+#[allow(clippy::too_many_arguments)]
+fn complete_accepted_cycle(
+    ebpf: &mut aya::Ebpf,
+    ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
+    start: &mut StartMap,
+    fixture: &Path,
+    offsets: &BTreeMap<String, u64>,
+    cancellation: &Cancellation,
+    marker_fd: i32,
+    guard: &mut ChildGuard,
+    owner: &mut PauseOwnerGuard,
+    expected: &BTreeMap<u32, u8>,
+    facts: &mut SignalTimingFacts,
+    late_links: &mut Vec<aya::programs::uprobe::UProbeLinkId>,
+    case_ids: &[u8],
+    prearm_successor: bool,
+) -> Result<bool, &'static str> {
+    if !causal_cycle_pass(facts) {
+        return Ok(false);
+    }
+    let deadline_ns = facts.cycle_deadline_ns;
+    let mut samples: Vec<StopSnapshot> = Vec::with_capacity(101);
+    loop {
+        cancellation_failure(cancellation)?;
+        if monotonic_ns()? > deadline_ns || samples.len() >= 101 {
+            break;
+        }
+        let mut sample = stop_snapshot(guard.pid(), expected)?;
+        let done = monotonic_ns()?;
+        sample.elapsed_us = done.checked_sub(facts.hook_ts_ns).ok_or("clock reversal")? / 1_000;
+        samples.push(sample);
+        if confirm(&samples).is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    facts.samples = samples;
+    facts.confirmation_sample_indexes = confirm(&facts.samples);
+    let (first, second) = match facts.confirmation_sample_indexes {
+        Some((first, second)) => (facts.samples[first], facts.samples[second]),
+        None => return Ok(false),
+    };
+    facts.stopped_snapshot_1_count = first.count;
+    facts.stopped_snapshot_1_exact_expected_task_set = first.exact_expected_task_set;
+    facts.stopped_snapshot_1_all_tasks_stopped = first.all_tasks_stopped;
+    facts.stopped_snapshot_2_count = second.count;
+    facts.stopped_snapshot_2_exact_expected_task_set = second.exact_expected_task_set;
+    facts.stopped_snapshot_2_all_tasks_stopped = second.all_tasks_stopped;
+    facts.pre_stop_marker_observed = drain_marker(marker_fd, cancellation)?;
+    if facts.pre_stop_marker_observed {
+        return Ok(false);
+    }
+    facts.drain_empty = drain_signal_ring_to_empty_until(ring, deadline_ns)? == 0;
+    if !facts.drain_empty {
+        return Ok(false);
+    }
+
+    facts.required_attach_keys = case_ids.len() as u64;
+    for case_id in case_ids {
+        let (target, cookie) = late_target(*case_id)?;
+        facts.late_attach_attempts += 1;
+        match attach_program(
+            ebpf,
+            "late_hit",
+            *offsets.get(target).ok_or("fixture offset")?,
+            fixture,
+            guard.pid(),
+            cookie,
+        ) {
+            Ok(link) => {
+                late_links.push(link);
+                facts.attached_while_stopped += 1;
+            }
+            Err(_) => return Ok(false),
+        }
+    }
+    facts.late_attach_accepted = facts.attached_while_stopped == facts.required_attach_keys;
+    facts.last_attach_ts_ns = monotonic_ns()?;
+    facts.attach_gap_ms = facts
+        .last_attach_ts_ns
+        .checked_sub(facts.hook_ts_ns)
+        .map_or(0.0, |gap| gap as f64 / 1_000_000.0);
+    if !facts.late_attach_accepted {
+        return Ok(false);
+    }
+
+    cancellation_failure(cancellation)?;
+    let post_attach = stop_snapshot(guard.pid(), expected)?;
+    facts.post_attach_task_count = post_attach.count;
+    facts.post_attach_exact_expected_task_set = post_attach.exact_expected_task_set;
+    facts.post_attach_all_tasks_stopped = post_attach.all_tasks_stopped;
+    facts.post_attach_marker_observed = drain_marker(marker_fd, cancellation)?;
+    facts.queue_empty_before_resume = drain_signal_ring_to_empty_until(ring, deadline_ns)? == 0;
+    if !facts.post_attach_exact_expected_task_set
+        || !facts.post_attach_all_tasks_stopped
+        || facts.post_attach_marker_observed
+        || !facts.queue_empty_before_resume
+    {
+        return Ok(false);
+    }
+
+    if prearm_successor {
+        owner.prearm_successor_before_resume(start, true)?;
+        // The successor is now ARMED, but both exact threads must still be T
+        // before owner 1 is allowed to resume and expose it.
+        let successor_boundary = stop_snapshot(guard.pid(), expected)?;
+        if !successor_boundary.exact_expected_task_set
+            || !successor_boundary.all_tasks_stopped
+            || drain_marker(marker_fd, cancellation)?
+            || drain_signal_ring_to_empty_until(ring, deadline_ns)? != 0
+        {
+            return Ok(false);
+        }
+    }
+
+    facts.pidfd_resume_attempts = 1;
+    facts.resume_via_original_pidfd = true;
+    let resume = guard.resume_accepted(prearm_successor);
+    let resume_rc = if resume.is_ok() { 0 } else { -1 };
+    facts.pidfd_resume_rc = resume_rc;
+    owner.record_current_resume(resume_rc)?;
+    if resume.is_err() {
+        return Ok(false);
+    }
+    facts.owner_removed = if prearm_successor {
+        true // owner 1's REQUESTED value was replaced by its successor ARMED value
+    } else {
+        owner.close_after_resume(start)?
+    };
+    facts.final_start_entries = owner.start_entries(start)?;
+    Ok(true)
+}
 
 #[allow(clippy::too_many_arguments)]
 fn run_gate_b_case(
@@ -2418,18 +3166,19 @@ fn run_gate_b_case(
     offsets: &BTreeMap<String, u64>,
     cancellation: &Cancellation,
     _run: u8,
-) -> (SignalTimingFacts, Option<&'static str>) {
-    let mut facts = SignalTimingFacts::default();
+) -> (GateBTimingFacts, Option<&'static str>) {
+    let mut facts = GateBTimingFacts::default();
     let mut child = None;
     let mut signal_links = Vec::new();
     let mut late_links = Vec::new();
     let mut owner: Option<PauseOwnerGuard> = None;
+    let mut counters_before = [0; 5];
     let result = (|| -> Result<(), &'static str> {
         cancellation_failure(cancellation)?;
         if ring.next().is_some() {
             return Err("signal record surplus");
         }
-        let counters_before = read_counters(counters)?;
+        counters_before = read_counters(counters)?;
         let (ready_reader, ready_writer) =
             pipe_pair(libc::O_CLOEXEC | libc::O_NONBLOCK).map_err(|_| "fixture pipes")?;
         let (marker_reader, marker_writer) =
@@ -2465,8 +3214,8 @@ fn run_gate_b_case(
         )?;
         cancellation_failure(cancellation)?;
         let expected = task_states(guard.pid())?;
-        facts.expected_task_count = u32::try_from(expected.len()).map_err(|_| "task count")?;
-        if facts.expected_task_count != 2 {
+        let expected_task_count = u32::try_from(expected.len()).map_err(|_| "task count")?;
+        if expected_task_count != 2 {
             return Ok(());
         }
 
@@ -2483,7 +3232,6 @@ fn run_gate_b_case(
             ("spike_stop_hook", common::SIGNAL_COOKIE_A),
             ("spike_stop_hook_b", common::SIGNAL_COOKIE_B),
         ] {
-            facts.signal_attach_attempts += 1;
             match attach_program(
                 ebpf,
                 "signal_return",
@@ -2496,178 +3244,219 @@ fn run_gate_b_case(
                 Err(_) => return Ok(()),
             }
         }
-        facts.signal_attach_accepted = true;
 
-        guard.mark_may_be_stopped();
         guard.release().map_err(|_| "child release")?;
-        // read exactly two records; the second must arrive inside the same causal window
-        let rec_a = wait_signal_record(ring, cancellation)?;
-        let causal_deadline_ns = rec_a
-            .hook_ts_ns
-            .checked_add(STOP_WAIT_CEILING_US * 1_000)
-            .ok_or("deadline overflow")?;
-        let rec_b = wait_signal_record_until(
-            ring,
-            cancellation,
-            causal_deadline_ns,
-            "second signal record timeout",
-        )?;
-        for record in [&rec_a, &rec_b] {
-            let record_pid = (record.pid_tgid >> 32) as u32;
-            let record_tid = record.pid_tgid as u32;
-            if (record.case_id != 1 && record.case_id != 2)
-                || record_pid != guard.pid()
-                || !expected.contains_key(&record_tid)
-                || record.reserved_zero != [0; 7]
-            {
-                return Err("signal record identity");
-            }
-        }
-        if rec_a.case_id == rec_b.case_id {
-            return Err("signal record identity");
-        }
-        let second_record_late = rec_a
-            .hook_ts_ns
-            .min(rec_b.hook_ts_ns)
-            .checked_add(STOP_WAIT_CEILING_US * 1_000)
-            .ok_or("deadline overflow")?
-            < monotonic_ns()?;
-        let winner = [&rec_a, &rec_b]
-            .into_iter()
-            .filter(|record| record.send_signal_rc != common::COALESCED_NO_HELPER)
-            .count();
-        facts.winner_records = winner as u64;
-        facts.coalesced_records = 2 - winner as u64;
-        facts.signal_helper_calls = winner as u64;
-        let (win, lost) = if rec_a.send_signal_rc != common::COALESCED_NO_HELPER {
-            (rec_a, rec_b)
-        } else {
-            (rec_b, rec_a)
-        };
-        facts.winner_case_id = win.case_id;
-        facts.coalesced_case_id = lost.case_id;
-        facts.hook_ts_ns = win.hook_ts_ns;
-        facts.send_signal_rc = win.send_signal_rc;
-        facts.stop_request_accepted = win.send_signal_rc == 0;
-
-        // observe: >= 1 ms cadence, absolute deadline hook_ts + 100 ms, sample stamped AFTER its /proc reads complete
-        let deadline_ns = facts
-            .hook_ts_ns
-            .checked_add(STOP_WAIT_CEILING_US * 1_000)
-            .ok_or("deadline overflow")?;
-        let mut samples: Vec<StopSnapshot> = Vec::with_capacity(101);
-        loop {
-            cancellation_failure(cancellation)?;
-            if monotonic_ns()? > deadline_ns || samples.len() >= 101 {
-                break;
-            }
-            let mut snap = stop_snapshot(guard.pid(), &expected)?;
-            let done = monotonic_ns()?;
-            snap.elapsed_us = done.checked_sub(facts.hook_ts_ns).ok_or("clock reversal")? / 1_000;
-            samples.push(snap);
-            if confirm(&samples).is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        facts.samples = samples;
-        let confirmed = confirm(&facts.samples);
-        facts.confirmation_sample_indexes = confirmed;
-        let (first, second) = match confirmed {
-            Some((i, j)) => (facts.samples[i], facts.samples[j]),
-            None => {
-                let last = facts.samples.len();
-                (
-                    facts
-                        .samples
-                        .get(last.saturating_sub(2))
-                        .copied()
-                        .unwrap_or_default(),
-                    facts.samples.last().copied().unwrap_or_default(),
-                )
-            }
-        };
-        facts.stopped_snapshot_1_count = first.count;
-        facts.stopped_snapshot_1_exact_expected_task_set = first.exact_expected_task_set;
-        facts.stopped_snapshot_1_all_tasks_stopped = first.all_tasks_stopped;
-        facts.stopped_snapshot_2_count = second.count;
-        facts.stopped_snapshot_2_exact_expected_task_set = second.exact_expected_task_set;
-        facts.stopped_snapshot_2_all_tasks_stopped = second.all_tasks_stopped;
-        facts.pre_stop_marker_observed = drain_marker(marker_reader.as_raw_fd(), cancellation)?;
-        if !facts.stop_request_accepted
-            || second_record_late
-            || confirmed.is_none()
-            || facts.pre_stop_marker_observed
-        {
-            return Ok(());
-        }
-
-        // drain-to-empty: with all tasks stopped there is no exact-child producer left
-        facts.drain_empty = drain_signal_ring_to_empty(ring)? == 0;
-        facts.required_attach_keys = 2;
-        for (target, cookie) in [
-            ("spike_late_target", common::SIGNAL_COOKIE_A),
-            ("spike_late_target_b", common::SIGNAL_COOKIE_B),
-        ] {
-            facts.late_attach_attempts += 1;
-            match attach_program(
-                ebpf,
-                "late_hit",
-                *offsets.get(target).ok_or("fixture offset")?,
-                fixture,
-                guard.pid(),
-                cookie,
-            ) {
-                Ok(link) => {
-                    late_links.push(link);
-                    facts.attached_while_stopped += 1;
+        let first_record = wait_received_signal_record_until(ring, cancellation)?;
+        validate_signal_record(&first_record.record, guard.pid(), &expected, None)?;
+        let owner_guard = owner.as_mut().ok_or("start map remove")?;
+        match signal_request(&first_record.record) {
+            SignalRequest::Accepted => {
+                // The accepted-stop ledger and ChildGuard mark happen before
+                // another clock read, ring operation, sample, marker, or attach.
+                owner_guard.mark_accepted_request()?;
+                guard.mark_accepted_stop();
+                if !owner_guard.current_resume_required() {
+                    return Err("accepted stop ledger");
                 }
-                Err(_) => return Ok(()),
+                let deadline_ns = cycle_deadline_ns(first_record.record.hook_ts_ns)?;
+                match take_available_received_signal_record_until(ring, deadline_ns)? {
+                    Some(sibling) => {
+                        validate_signal_record(&sibling.record, guard.pid(), &expected, None)?;
+                        if !record_within_cycle_deadline(sibling, deadline_ns)
+                            || sibling.record.case_id == first_record.record.case_id
+                            || signal_request(&sibling.record) != SignalRequest::Coalesced
+                        {
+                            return Err("signal record identity");
+                        }
+                        let mut cycle = accepted_cycle_facts(
+                            first_record,
+                            &[first_record, sibling],
+                            expected_task_count,
+                        )?;
+                        cycle.coalesced_records = 1;
+                        cycle.coalesced_case_id = sibling.record.case_id;
+                        cycle.coalesced_send_signal_rcs = vec![sibling.record.send_signal_rc];
+                        let case_ids = [cycle.winner_case_id, cycle.coalesced_case_id];
+                        if complete_accepted_cycle(
+                            ebpf,
+                            ring,
+                            start,
+                            fixture,
+                            offsets,
+                            cancellation,
+                            marker_reader.as_raw_fd(),
+                            guard,
+                            owner_guard,
+                            &expected,
+                            &mut cycle,
+                            &mut late_links,
+                            &case_ids,
+                            false,
+                        )? {
+                            facts.outcome = Some(GateBOutcome::A);
+                            facts.cycles.push(cycle);
+                        }
+                    }
+                    None => {
+                        let mut first_cycle = accepted_cycle_facts(
+                            first_record,
+                            &[first_record],
+                            expected_task_count,
+                        )?;
+                        let case_ids = [first_cycle.winner_case_id];
+                        if !complete_accepted_cycle(
+                            ebpf,
+                            ring,
+                            start,
+                            fixture,
+                            offsets,
+                            cancellation,
+                            marker_reader.as_raw_fd(),
+                            guard,
+                            owner_guard,
+                            &expected,
+                            &mut first_cycle,
+                            &mut late_links,
+                            &case_ids,
+                            true,
+                        )? {
+                            return Ok(());
+                        }
+                        let successor = wait_successor_record(
+                            ring,
+                            cancellation,
+                            marker_reader.as_raw_fd(),
+                            guard.original_pidfd.as_raw_fd(),
+                        )?;
+                        validate_signal_record(
+                            &successor.record,
+                            guard.pid(),
+                            &expected,
+                            Some(
+                                if first_cycle.winner_case_id == common::SIGNAL_COOKIE_A as u8 {
+                                    common::SIGNAL_COOKIE_B as u8
+                                } else {
+                                    common::SIGNAL_COOKIE_A as u8
+                                },
+                            ),
+                        )?;
+                        let successor_request = signal_request(&successor.record);
+                        if successor_request != SignalRequest::Accepted {
+                            if successor_request == SignalRequest::Rejected {
+                                owner_guard.reject_successor_request()?;
+                            }
+                            return Err("successor signal record");
+                        }
+                        // A successor record is accepted only after owner 1's
+                        // original-pidfd resume reported success in its ledger.
+                        owner_guard.accept_successor_request()?;
+                        guard.mark_accepted_stop();
+                        if !owner_guard.current_resume_required() {
+                            return Err("accepted stop ledger");
+                        }
+                        let mut second_cycle =
+                            accepted_cycle_facts(successor, &[successor], expected_task_count)?;
+                        let case_ids = [second_cycle.winner_case_id];
+                        if complete_accepted_cycle(
+                            ebpf,
+                            ring,
+                            start,
+                            fixture,
+                            offsets,
+                            cancellation,
+                            marker_reader.as_raw_fd(),
+                            guard,
+                            owner_guard,
+                            &expected,
+                            &mut second_cycle,
+                            &mut late_links,
+                            &case_ids,
+                            false,
+                        )? {
+                            facts.outcome = Some(GateBOutcome::B);
+                            facts.cycles.push(first_cycle);
+                            facts.cycles.push(second_cycle);
+                        }
+                    }
+                }
+            }
+            SignalRequest::Coalesced => {
+                // A coalescer has only a provisional bound.  The winner below
+                // establishes the canonical deadline and revalidates this item.
+                let provisional_deadline = cycle_deadline_ns(first_record.record.hook_ts_ns)?;
+                let winner = wait_received_signal_record_by_deadline(
+                    ring,
+                    cancellation,
+                    provisional_deadline,
+                    "second signal record timeout",
+                )?;
+                validate_signal_record(&winner.record, guard.pid(), &expected, None)?;
+                match signal_request(&winner.record) {
+                    SignalRequest::Accepted => {
+                        if winner.record.case_id == first_record.record.case_id {
+                            return Err("signal record identity");
+                        }
+                        owner_guard.mark_accepted_request()?;
+                        guard.mark_accepted_stop();
+                        if !owner_guard.current_resume_required() {
+                            return Err("accepted stop ledger");
+                        }
+                        let mut cycle = accepted_cycle_facts(
+                            winner,
+                            &[first_record, winner],
+                            expected_task_count,
+                        )?;
+                        cycle.coalesced_records = 1;
+                        cycle.coalesced_case_id = first_record.record.case_id;
+                        cycle.coalesced_send_signal_rcs = vec![first_record.record.send_signal_rc];
+                        let case_ids = [cycle.winner_case_id, cycle.coalesced_case_id];
+                        if complete_accepted_cycle(
+                            ebpf,
+                            ring,
+                            start,
+                            fixture,
+                            offsets,
+                            cancellation,
+                            marker_reader.as_raw_fd(),
+                            guard,
+                            owner_guard,
+                            &expected,
+                            &mut cycle,
+                            &mut late_links,
+                            &case_ids,
+                            false,
+                        )? {
+                            facts.outcome = Some(GateBOutcome::A);
+                            facts.cycles.push(cycle);
+                        }
+                    }
+                    SignalRequest::Rejected => {
+                        owner_guard.mark_rejected_request()?;
+                        owner_guard.disarm_for_cleanup_result(start)?;
+                        let deadline_ns = cycle_deadline_ns(winner.record.hook_ts_ns)?;
+                        let _ =
+                            drain_signal_ring_through_deadline(ring, cancellation, deadline_ns)?;
+                    }
+                    SignalRequest::Coalesced => return Err("signal record identity"),
+                }
+            }
+            SignalRequest::Rejected => {
+                owner_guard.mark_rejected_request()?;
+                let deadline_ns = cycle_deadline_ns(first_record.record.hook_ts_ns)?;
+                owner_guard.disarm_for_cleanup_result(start)?;
+                // This includes the required deadline-bounded final empty read;
+                // no ChildGuard stop obligation exists for a proved rejection.
+                let _ = drain_signal_ring_through_deadline(ring, cancellation, deadline_ns)?;
             }
         }
-        facts.late_attach_accepted = facts.attached_while_stopped == 2;
-        facts.last_attach_ts_ns = monotonic_ns()?;
-        facts.attach_gap_ms = facts
-            .last_attach_ts_ns
-            .checked_sub(facts.hook_ts_ns)
-            .map_or(0.0, |gap| gap as f64 / 1_000_000.0);
 
-        cancellation_failure(cancellation)?;
-        let third = stop_snapshot(guard.pid(), &expected)?;
-        facts.post_attach_task_count = third.count;
-        facts.post_attach_exact_expected_task_set = third.exact_expected_task_set;
-        facts.post_attach_all_tasks_stopped = third.all_tasks_stopped;
-        facts.post_attach_marker_observed = drain_marker(marker_reader.as_raw_fd(), cancellation)?;
-        if !third.exact_expected_task_set
-            || !third.all_tasks_stopped
-            || facts.post_attach_marker_observed
-        {
+        let Some(last_cycle) = facts.cycles.last_mut() else {
             return Ok(());
-        }
-        facts.queue_empty_before_resume = drain_signal_ring_to_empty(ring)? == 0;
-
-        facts.pidfd_resume_attempts = 1;
-        facts.resume_via_original_pidfd = true;
-        if guard.resume_once().is_err() {
-            facts.pidfd_resume_rc = -1;
-            return Ok(());
-        }
-        facts.pidfd_resume_rc = 0;
-        // §5.2: REQUESTED is removed immediately after the one successful original-pidfd
-        // resume — before waiting for markers/exit
-        facts.owner_removed = owner
-            .as_mut()
-            .ok_or("start map remove")?
-            .close_after_resume(start)?;
-        facts.final_start_entries = owner
-            .as_ref()
-            .ok_or("start map read")?
-            .start_entries(start)?;
-
+        };
         match read_markers_after_resume(marker_reader.as_raw_fd(), cancellation) {
             Ok((seen_m, seen_n)) => {
-                facts.markers_after_resume = u32::from(seen_m) + u32::from(seen_n);
-                facts.post_resume_marker_observed = seen_m && seen_n;
+                last_cycle.markers_after_resume = u32::from(seen_m) + u32::from(seen_n);
+                last_cycle.post_resume_marker_observed = seen_m && seen_n;
             }
             Err(reason @ ("cancelled_sigint" | "cancelled_sigterm" | "cancellation pipe")) => {
                 return Err(reason);
@@ -2684,43 +3473,85 @@ fn run_gate_b_case(
         facts.reaped = true;
         facts.child_exit = status.code().unwrap_or(-1);
         let counters_after = read_counters(counters)?;
-        facts.late_hits = counters_after[4].saturating_sub(counters_before[4]);
+        last_cycle.late_hits = counters_after[4].saturating_sub(counters_before[4]);
         if ring.next().is_some() {
             return Err("signal record surplus");
         }
         Ok(())
     })();
 
+    let mut failure = result.err();
     if !late_links.is_empty() {
-        let mut all_detached = true;
-        for link in late_links.drain(..) {
-            all_detached &= detach_program(ebpf, "late_hit", link).is_ok();
-        }
-        facts.late_link_detached = all_detached;
+        facts.late_link_detached = match detach_all_program_links(ebpf, "late_hit", &mut late_links)
+        {
+            Ok(()) => true,
+            Err(reason) => {
+                if failure.is_none() {
+                    failure = Some(reason);
+                }
+                false
+            }
+        };
     }
     if !signal_links.is_empty() {
-        let mut all_detached = true;
-        for link in signal_links.drain(..) {
-            all_detached &= detach_program(ebpf, "signal_return", link).is_ok();
+        facts.signal_link_detached =
+            match detach_all_program_links(ebpf, "signal_return", &mut signal_links) {
+                Ok(()) => true,
+                Err(reason) => {
+                    if failure.is_none() {
+                        failure = Some(reason);
+                    }
+                    false
+                }
+            };
+    }
+    // Teardown stays ordered and non-short-circuiting: detached links cannot
+    // create a new record; drain/decode before removing authorization; only an
+    // unresolved pre-armed successor can earn the separate protective resume.
+    let drain_deadline = monotonic_ns().and_then(cycle_deadline_ns);
+    match drain_deadline.and_then(|deadline| drain_signal_ring_to_empty_until(ring, deadline)) {
+        Ok(_) => {}
+        Err(reason) if failure.is_none() => failure = Some(reason),
+        Err(_) => {}
+    }
+    if let Some(owner_guard) = owner.as_mut() {
+        if failure.is_some() || facts.outcome.is_none() {
+            owner_guard.mark_successor_unresolved();
         }
-        facts.signal_link_detached = all_detached;
+        if let Err(reason) = owner_guard.disarm_for_cleanup_result(start)
+            && failure.is_none()
+        {
+            failure = Some(reason);
+        }
+        if owner_guard.needs_protective_successor_resume() {
+            if let Some(guard) = child.as_mut() {
+                if let Err(reason) = owner_guard.record_protective_successor_resume()
+                    && failure.is_none()
+                {
+                    failure = Some(reason);
+                }
+                if guard.resume_successor_protective_once().is_err() && failure.is_none() {
+                    failure = Some("pidfd resume");
+                }
+            }
+        }
+        facts.final_start_entries = owner_guard.start_entries(start).unwrap_or(u64::MAX);
     }
     if let Some(guard) = child.as_mut()
         && !guard.reaped
     {
         let cleanup = guard.terminate();
-        if cleanup.resume_attempts == 1 && facts.pidfd_resume_attempts == 0 {
-            facts.pidfd_resume_attempts = 1;
-            facts.resume_via_original_pidfd = cleanup.resume_via_original_pidfd;
-            facts.pidfd_resume_rc = if guard.may_be_stopped { -1 } else { 0 };
-        }
         facts.reaped = cleanup.reaped;
         facts.child_exit = -1;
     }
-    if let Some(owner) = owner.as_mut() {
-        owner.disarm_for_cleanup(start);
+    for cycle in &mut facts.cycles {
+        cycle.signal_link_detached = facts.signal_link_detached;
+        cycle.late_link_detached = facts.late_link_detached;
+        cycle.final_start_entries = facts.final_start_entries;
+        cycle.child_exit = facts.child_exit;
+        cycle.reaped = facts.reaped;
     }
-    (facts, result.err())
+    (facts, failure)
 }
 
 fn run_gate_b(paths: GateAPaths) -> Result<bool, &'static str> {
@@ -2831,7 +3662,7 @@ fn run_gate_b(paths: GateAPaths) -> Result<bool, &'static str> {
             &cancellation,
             run,
         );
-        let pass = runtime_failure_reason.is_none() && signal_oracle_pass(&facts);
+        let pass = runtime_failure_reason.is_none() && gate_b_oracle_pass(&facts);
         write_json_line(
             &mut timings,
             signal_timing_json(&metadata, run, &facts, pass, runtime_failure_reason),
@@ -3042,6 +3873,21 @@ mod tests {
         }
     }
 
+    fn wait_for_child_stop(guard: &ChildGuard) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", guard.pid())).unwrap();
+            if parse_task_state(&stat).unwrap() == b'T' {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child did not enter stopped state"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn record(usable_n: u8, attempted: u8, completed: u8, name_class: NameClass) -> RecordFacts {
         RecordFacts {
             usable_n,
@@ -3155,7 +4001,12 @@ mod tests {
     fn valid_signal() -> SignalTimingFacts {
         SignalTimingFacts {
             hook_ts_ns: 1_000_000,
+            cycle_deadline_ns: 101_000_000,
+            record_before_dequeue_ns: vec![1_001_000, 1_002_000],
+            record_after_decode_ns: vec![1_001_100, 1_002_100],
+            record_hook_ts_ns: vec![1_000_000, 1_000_100],
             send_signal_rc: 0,
+            coalesced_send_signal_rcs: vec![common::COALESCED_NO_HELPER],
             stop_request_accepted: true,
             expected_task_count: 2,
             winner_records: 1,
@@ -3403,6 +4254,24 @@ mod tests {
             |facts: &mut SignalTimingFacts| facts.late_hits = 0,
             |facts: &mut SignalTimingFacts| facts.child_exit = 1,
             |facts: &mut SignalTimingFacts| facts.reaped = false,
+            |facts: &mut SignalTimingFacts| facts.cycle_deadline_ns += 1,
+            |facts: &mut SignalTimingFacts| {
+                facts.record_before_dequeue_ns[0] = facts.cycle_deadline_ns + 1
+            },
+            |facts: &mut SignalTimingFacts| {
+                facts.record_after_decode_ns[0] = facts.cycle_deadline_ns + 1
+            },
+            |facts: &mut SignalTimingFacts| {
+                facts.record_hook_ts_ns[0] = facts.cycle_deadline_ns + 1
+            },
+            |facts: &mut SignalTimingFacts| {
+                facts.record_hook_ts_ns[0] = facts.record_after_decode_ns[0] + 1
+            },
+            |facts: &mut SignalTimingFacts| facts.coalesced_send_signal_rcs = vec![0],
+            |facts: &mut SignalTimingFacts| {
+                facts.winner_records = u64::MAX;
+                facts.coalesced_records = 1;
+            },
         ] {
             let mut changed = valid.clone();
             mutate(&mut changed);
@@ -3509,27 +4378,171 @@ mod tests {
         let mut map = armed_fake(key);
         let mut owner = PauseOwnerGuard::new(key);
         assert!(owner.needs_removal());
-        owner.disarm_for_cleanup(&mut map);
+        owner.disarm_for_cleanup_result(&mut map).unwrap();
         assert_eq!(map.entry_count().unwrap(), 0);
         // (ii) cancellation during observation: same cleanup path, never resumes
         let mut map = armed_fake(key);
         let mut owner = PauseOwnerGuard::new(key);
-        owner.disarm_for_cleanup(&mut map);
+        owner.disarm_for_cleanup_result(&mut map).unwrap();
         assert_eq!(map.entry_count().unwrap(), 0);
         // (iii) unconfirmed attempt: entry removed after cleanup
         let mut map = armed_fake(key);
         let mut owner = PauseOwnerGuard::new(key);
         assert!(!owner.closed);
-        owner.disarm_for_cleanup(&mut map);
+        owner.disarm_for_cleanup_result(&mut map).unwrap();
         assert_eq!(map.entry_count().unwrap(), 0);
         // (iv) happy path: close_after_resume removes the entry before markers are read
         let mut map = armed_fake(key);
         let mut owner = PauseOwnerGuard::new(key);
+        owner.mark_accepted_request().unwrap();
+        owner.record_current_resume(0).unwrap();
         assert!(owner.close_after_resume(&mut map).unwrap());
         let entries_after_close = owner.start_entries(&map).unwrap();
-        owner.disarm_for_cleanup(&mut map);
+        owner.disarm_for_cleanup_result(&mut map).unwrap();
         assert_eq!(entries_after_close, 0);
         assert_eq!(map.entry_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn pause_owner_guard_enforces_a_b_and_unresolved_successor_lifecycles() {
+        let key = common::StateKey {
+            pid_tgid: 42 << 32,
+            attach_cookie: u64::MAX,
+        };
+
+        let mut map = armed_fake(key);
+        let mut outcome_a = PauseOwnerGuard::new(key);
+        outcome_a.mark_accepted_request().unwrap();
+        assert!(outcome_a.current_resume_required());
+        outcome_a.record_current_resume(0).unwrap();
+        outcome_a.close_after_resume(&mut map).unwrap();
+        assert_eq!(map.entry_count().unwrap(), 0);
+
+        let mut map = armed_fake(key);
+        let mut outcome_b = PauseOwnerGuard::new(key);
+        outcome_b.mark_accepted_request().unwrap();
+        outcome_b
+            .prearm_successor_before_resume(&mut map, true)
+            .unwrap();
+        assert_eq!(map.entry_count().unwrap(), 1);
+        assert_eq!(
+            outcome_b.accept_successor_request(),
+            Err("successor before resume"),
+            "a successor cannot become owner 2 before owner 1 resumes"
+        );
+        outcome_b.record_current_resume(0).unwrap();
+        outcome_b.accept_successor_request().unwrap();
+        assert!(outcome_b.current_resume_required());
+        outcome_b.record_current_resume(0).unwrap();
+        outcome_b.close_after_resume(&mut map).unwrap();
+        assert_eq!(map.entry_count().unwrap(), 0);
+
+        let mut map = armed_fake(key);
+        let mut unresolved = PauseOwnerGuard::new(key);
+        unresolved.mark_accepted_request().unwrap();
+        unresolved
+            .prearm_successor_before_resume(&mut map, true)
+            .unwrap();
+        unresolved.record_current_resume(0).unwrap();
+        unresolved.mark_successor_unresolved();
+        unresolved.disarm_for_cleanup_result(&mut map).unwrap();
+        assert!(unresolved.needs_protective_successor_resume());
+        unresolved.record_protective_successor_resume().unwrap();
+        assert!(!unresolved.needs_protective_successor_resume());
+        assert_eq!(map.entry_count().unwrap(), 0);
+
+        let mut map = armed_fake(key);
+        let mut rejected = PauseOwnerGuard::new(key);
+        rejected.mark_rejected_request().unwrap();
+        assert!(!rejected.current_resume_required());
+        rejected.disarm_for_cleanup_result(&mut map).unwrap();
+        assert_eq!(map.entry_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn rejected_epoch_is_sticky_and_cannot_accept_a_delayed_winner() {
+        let key = common::StateKey {
+            pid_tgid: 42 << 32,
+            attach_cookie: u64::MAX,
+        };
+        let mut map = armed_fake(key);
+        let mut owner = PauseOwnerGuard::new(key);
+        owner.mark_rejected_request().unwrap();
+        assert_eq!(owner.mark_accepted_request(), Err("duplicate winner"));
+        assert_eq!(
+            owner.prearm_successor_before_resume(&mut map, true),
+            Err("successor prearm")
+        );
+        owner.disarm_for_cleanup_result(&mut map).unwrap();
+        assert_eq!(map.entry_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn causal_deadline_requires_pre_dequeue_post_decode_and_record_timestamp_checks() {
+        let deadline = cycle_deadline_ns(1_000).unwrap();
+        let received = ReceivedSignalRecord {
+            record: common::SignalRecord {
+                hook_ts_ns: deadline,
+                ..common::SignalRecord::default()
+            },
+            before_dequeue_ns: deadline,
+            after_decode_ns: deadline,
+        };
+        assert!(record_within_cycle_deadline(received, deadline));
+        assert!(!record_within_cycle_deadline(
+            ReceivedSignalRecord {
+                before_dequeue_ns: deadline + 1,
+                ..received
+            },
+            deadline
+        ));
+        assert!(!record_within_cycle_deadline(
+            ReceivedSignalRecord {
+                after_decode_ns: deadline + 1,
+                ..received
+            },
+            deadline
+        ));
+        assert!(!record_within_cycle_deadline(
+            ReceivedSignalRecord {
+                record: common::SignalRecord {
+                    hook_ts_ns: deadline + 1,
+                    ..received.record
+                },
+                ..received
+            },
+            deadline
+        ));
+        assert_eq!(cycle_deadline_ns(u64::MAX), Err("deadline overflow"));
+    }
+
+    #[test]
+    fn signal_status_uses_only_zero_as_accepted_and_min_as_coalesced() {
+        let mut record = common::SignalRecord {
+            send_signal_rc: 0,
+            ..common::SignalRecord::default()
+        };
+        assert_eq!(signal_request(&record), SignalRequest::Accepted);
+        record.send_signal_rc = common::COALESCED_NO_HELPER;
+        assert_eq!(signal_request(&record), SignalRequest::Coalesced);
+        for status in [-1, 1] {
+            record.send_signal_rc = status;
+            assert_eq!(signal_request(&record), SignalRequest::Rejected);
+        }
+    }
+
+    #[test]
+    fn reservation_failure_leaves_armed_authorization_unconsumed() {
+        let key = common::StateKey {
+            pid_tgid: 42 << 32,
+            attach_cookie: u64::MAX,
+        };
+        let map = armed_fake(key);
+        let owner = PauseOwnerGuard::new(key);
+        // Reservation precedes the BPF CAS.  A lost reserve is therefore not
+        // an owner and leaves the already-published ARMED authorization live.
+        assert!(!owner.current_resume_required());
+        assert_eq!(map.entry_count().unwrap(), 1);
     }
 
     #[test]
@@ -3563,8 +4576,11 @@ mod tests {
         let valid = CleanupFacts {
             may_be_stopped: true,
             resume_attempts: 1,
+            protective_resume_attempts: 0,
             resume_via_original_pidfd: true,
+            resume_rc: Some(0),
             kill_via_original_pidfd: true,
+            kill_rc: Some(0),
             reaped: true,
         };
         assert!(cleanup_oracle_pass(valid));
@@ -3584,8 +4600,11 @@ mod tests {
         let unstopped = CleanupFacts {
             may_be_stopped: false,
             resume_attempts: 0,
+            protective_resume_attempts: 0,
             resume_via_original_pidfd: false,
+            resume_rc: None,
             kill_via_original_pidfd: true,
+            kill_rc: Some(0),
             reaped: true,
         };
         assert!(cleanup_oracle_pass(unstopped));
@@ -3600,6 +4619,7 @@ mod tests {
         assert!(cleanup_oracle_pass(CleanupFacts {
             resume_attempts: 1,
             resume_via_original_pidfd: true,
+            resume_rc: Some(0),
             ..unstopped
         }));
     }
@@ -3630,20 +4650,9 @@ mod tests {
         let mut command = Command::new("sh");
         command.arg("-c").arg("IFS= read -r _; sleep 30");
         let mut guard = spawn_pinned_child(&mut command).unwrap();
-        guard.mark_may_be_stopped();
+        guard.mark_accepted_stop();
         pidfd_send_signal(guard.original_pidfd.as_raw_fd(), libc::SIGSTOP).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            let stat = std::fs::read_to_string(format!("/proc/{}/stat", guard.pid())).unwrap();
-            if parse_task_state(&stat).unwrap() == b'T' {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "child did not enter stopped state"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
+        wait_for_child_stop(&guard);
         guard.resume_once().unwrap();
         assert!(guard.resume_attempted);
         assert!(
@@ -3657,18 +4666,9 @@ mod tests {
         let mut command = Command::new("sh");
         command.arg("-c").arg("IFS= read -r _; sleep 30");
         let mut guard = spawn_pinned_child(&mut command).unwrap();
-        guard.mark_may_be_stopped();
+        guard.mark_accepted_stop();
         pidfd_send_signal(guard.original_pidfd.as_raw_fd(), libc::SIGSTOP).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while parse_task_state(
-            &std::fs::read_to_string(format!("/proc/{}/stat", guard.pid())).unwrap(),
-        )
-        .unwrap()
-            != b'T'
-        {
-            assert!(Instant::now() < deadline, "child did not stop");
-            thread::sleep(Duration::from_millis(10));
-        }
+        wait_for_child_stop(&guard);
         let pid = guard.pid();
         let cleanup = guard.terminate();
         assert!(cleanup_oracle_pass(cleanup));
@@ -3680,6 +4680,56 @@ mod tests {
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     }
 
+    #[test]
+    fn unresolved_successor_uses_one_distinct_protective_resume() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("IFS= read -r _; sleep 30");
+        let mut guard = spawn_pinned_child(&mut command).unwrap();
+        guard.mark_accepted_stop();
+        pidfd_send_signal(guard.original_pidfd.as_raw_fd(), libc::SIGSTOP).unwrap();
+        wait_for_child_stop(&guard);
+
+        guard.resume_accepted(true).unwrap();
+        assert!(
+            guard.may_be_stopped,
+            "pre-armed successor keeps the guard armed"
+        );
+        pidfd_send_signal(guard.original_pidfd.as_raw_fd(), libc::SIGSTOP).unwrap();
+        wait_for_child_stop(&guard);
+        guard.resume_successor_protective_once().unwrap();
+        assert!(guard.protective_resume_attempted);
+        assert!(guard.resume_successor_protective_once().is_err());
+
+        let cleanup = guard.terminate();
+        assert_eq!(cleanup.resume_attempts, 0);
+        assert!(cleanup.reaped);
+    }
+
+    #[test]
+    fn unaccepted_child_cleanup_never_performs_a_resume() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("IFS= read -r _; sleep 30");
+        let mut guard = spawn_pinned_child(&mut command).unwrap();
+        // No decoded accepted winner means ChildGuard has no resume debt.
+        let cleanup = guard.terminate();
+        assert_eq!(
+            cleanup.resume_attempts, 0,
+            "a stop obligation begins only after decoding an accepted winner"
+        );
+        assert!(cleanup.reaped);
+    }
+
+    #[test]
+    fn two_cycle_oracle_accepts_only_the_valid_deferred_successor_branch() {
+        let facts = valid_gate_b_outcome_b();
+        assert!(common_accepted_cycle_pass(&facts.cycles[0]));
+        assert!(common_accepted_cycle_pass(&facts.cycles[1]));
+        assert!(deferred_cycle_pass(&facts.cycles[0], false));
+        assert!(deferred_cycle_pass(&facts.cycles[1], true));
+        assert!(gate_b_oracle_pass(&facts));
+        assert!(!signal_oracle_pass(&facts.cycles[0]));
+    }
+
     fn signal_child(signal: Cancelled, ready: &Path, marker: &Path) {
         let cancellation = Cancellation::install().unwrap();
         let mut command = Command::new("sh");
@@ -3689,7 +4739,7 @@ mod tests {
             .arg("sh")
             .arg(marker);
         let mut guard = spawn_pinned_child(&mut command).unwrap();
-        guard.mark_may_be_stopped();
+        guard.mark_accepted_stop();
         let child_pid = guard.pid();
         std::fs::write(ready, b"ready").unwrap();
         assert_eq!(cancellation.wait(Duration::from_secs(5)).unwrap(), signal);
@@ -4246,72 +5296,64 @@ mod tests {
             .success()
     }
 
-    fn signal_timing_value(run: usize, facts: &SignalTimingFacts) -> serde_json::Value {
-        let mut value = serde_json::json!({
-            "signal_run": run,
-            "hook_ts_ns": facts.hook_ts_ns,
-            "send_signal_rc": facts.send_signal_rc,
-            "stop_request_accepted": facts.stop_request_accepted,
-            "expected_task_count": facts.expected_task_count,
-            "winner_records": facts.winner_records,
-            "coalesced_records": facts.coalesced_records,
-            "signal_helper_calls": facts.signal_helper_calls,
-            "winner_case_id": facts.winner_case_id,
-            "coalesced_case_id": facts.coalesced_case_id,
-            "stopped_snapshot_1_count": facts.stopped_snapshot_1_count,
-            "stopped_snapshot_2_count": facts.stopped_snapshot_2_count,
-            "stopped_snapshot_1_exact_expected_task_set": facts.stopped_snapshot_1_exact_expected_task_set,
-            "stopped_snapshot_1_all_tasks_stopped": facts.stopped_snapshot_1_all_tasks_stopped,
-            "stopped_snapshot_2_exact_expected_task_set": facts.stopped_snapshot_2_exact_expected_task_set,
-            "stopped_snapshot_2_all_tasks_stopped": facts.stopped_snapshot_2_all_tasks_stopped,
-            "stop_wait_ceiling_us": 100_000,
-            "confirmation_sample_indexes": facts.confirmation_sample_indexes,
-            "samples": facts.samples.iter().map(|snapshot| serde_json::json!({
-                "elapsed_us": snapshot.elapsed_us,
-                "task_count": snapshot.count,
-                "exact_expected_task_set": snapshot.exact_expected_task_set,
-                "all_tasks_stopped": snapshot.all_tasks_stopped,
-                "state_counts": snapshot.state_counts,
-            })).collect::<Vec<_>>(),
-            "pre_stop_marker_observed": facts.pre_stop_marker_observed,
-            "drain_empty": facts.drain_empty,
-            "required_attach_keys": facts.required_attach_keys,
-        });
-        let extra = serde_json::json!({
-            "post_attach_task_count": facts.post_attach_task_count,
-            "post_attach_exact_expected_task_set": facts.post_attach_exact_expected_task_set,
-            "post_attach_all_tasks_stopped": facts.post_attach_all_tasks_stopped,
-            "post_attach_marker_observed": facts.post_attach_marker_observed,
-            "attached_while_stopped": facts.attached_while_stopped,
-            "queue_empty_before_resume": facts.queue_empty_before_resume,
-            "markers_after_resume": facts.markers_after_resume,
-            "signal_attach_attempts": facts.signal_attach_attempts,
-            "signal_attach_accepted": facts.signal_attach_accepted,
-            "late_attach_attempts": facts.late_attach_attempts,
-            "late_attach_accepted": facts.late_attach_accepted,
-            "signal_link_detached": facts.signal_link_detached,
-            "late_link_detached": facts.late_link_detached,
-            "last_attach_ts_ns": facts.last_attach_ts_ns,
-            "attach_gap_ms": facts.attach_gap_ms,
-            "pidfd_resume_attempts": facts.pidfd_resume_attempts,
-            "pidfd_resume_rc": facts.pidfd_resume_rc,
-            "resume_via_original_pidfd": facts.resume_via_original_pidfd,
-            "owner_removed": facts.owner_removed,
-            "final_start_entries": facts.final_start_entries,
-            "post_resume_marker_observed": facts.post_resume_marker_observed,
-            "late_hits": facts.late_hits,
-            "child_exit": facts.child_exit,
-            "reaped": facts.reaped,
-            "pass": signal_oracle_pass(facts),
-            "failure_category": if signal_oracle_pass(facts) { "none" } else { "oracle" },
-        });
-        for (name, field) in extra.as_object().unwrap() {
-            value
-                .as_object_mut()
-                .unwrap()
-                .insert(name.clone(), field.clone());
+    fn valid_gate_b_outcome_a() -> GateBTimingFacts {
+        GateBTimingFacts {
+            outcome: Some(GateBOutcome::A),
+            cycles: vec![valid_signal()],
+            signal_link_detached: true,
+            late_link_detached: true,
+            final_start_entries: 0,
+            child_exit: 0,
+            reaped: true,
         }
-        value
+    }
+
+    fn valid_gate_b_outcome_b() -> GateBTimingFacts {
+        let mut first = valid_signal();
+        first.coalesced_records = 0;
+        first.coalesced_case_id = 0;
+        first.coalesced_send_signal_rcs.clear();
+        first.required_attach_keys = 1;
+        first.attached_while_stopped = 1;
+        first.late_attach_attempts = 1;
+        first.record_before_dequeue_ns.truncate(1);
+        first.record_after_decode_ns.truncate(1);
+        first.record_hook_ts_ns.truncate(1);
+        first.post_resume_marker_observed = false;
+        first.markers_after_resume = 0;
+        first.late_hits = 0;
+        let mut second = first.clone();
+        second.hook_ts_ns += 10_000;
+        second.cycle_deadline_ns = cycle_deadline_ns(second.hook_ts_ns).unwrap();
+        second.last_attach_ts_ns = second.hook_ts_ns + 1_000_000;
+        second.attach_gap_ms = 1.0;
+        second.record_before_dequeue_ns = vec![second.hook_ts_ns + 1];
+        second.record_after_decode_ns = vec![second.hook_ts_ns + 2];
+        second.record_hook_ts_ns = vec![second.hook_ts_ns];
+        second.winner_case_id = 2;
+        second.post_resume_marker_observed = true;
+        second.markers_after_resume = 2;
+        second.late_hits = 2;
+        GateBTimingFacts {
+            outcome: Some(GateBOutcome::B),
+            cycles: vec![first, second],
+            signal_link_detached: true,
+            late_link_detached: true,
+            final_start_entries: 0,
+            child_exit: 0,
+            reaped: true,
+        }
+    }
+
+    fn signal_timing_value(run: usize, facts: &GateBTimingFacts) -> serde_json::Value {
+        let pass = gate_b_oracle_pass(facts);
+        signal_timing_json(
+            &test_gate_metadata(),
+            u8::try_from(run).unwrap(),
+            facts,
+            pass,
+            None,
+        )
     }
 
     fn fake_canonical_gate_b_export(
@@ -4341,7 +5383,7 @@ mod tests {
             })
             .collect::<String>();
         let timing = (1..=runs)
-            .map(|run| signal_timing_value(run, &valid_signal()).to_string() + "\n")
+            .map(|run| signal_timing_value(run, &valid_gate_b_outcome_a()).to_string() + "\n")
             .collect::<String>();
         let status = if category == "none" { "PASS" } else { "FAIL" };
         for (name, contents) in [
@@ -4483,6 +5525,33 @@ mod tests {
         fake_canonical_gate_b_export(&valid, 2, 20, "none");
         assert!(shell_validate_gate_b_export(script, &valid, 0));
 
+        let deferred = temp.path().join("valid-deferred");
+        fake_canonical_gate_b_export(&deferred, 2, 20, "none");
+        let deferred_facts = valid_gate_b_outcome_b();
+        std::fs::write(
+            deferred.join("signal-timing.jsonl"),
+            (1..=20)
+                .map(|run| signal_timing_value(run, &deferred_facts).to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        assert!(shell_validate_gate_b_export(script, &deferred, 0));
+        let mut deferred_records = std::fs::read_to_string(deferred.join("signal-timing.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        deferred_records[0]["cycles"][1]["winner_case_id"] = 1.into();
+        std::fs::write(
+            deferred.join("signal-timing.jsonl"),
+            deferred_records
+                .iter()
+                .map(|record| record.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        assert!(!shell_validate_gate_b_export(script, &deferred, 0));
+
         let verifier_failure = temp.path().join("valid-verifier-failure");
         fake_canonical_gate_b_export(&verifier_failure, 2, 20, "verifier");
         std::fs::write(verifier_failure.join("signal-timing.jsonl"), "").unwrap();
@@ -4504,7 +5573,7 @@ mod tests {
         .unwrap();
         assert!(shell_validate_gate_b_export(script, &runtime_failure, 1));
         let runtime_reasons = shell_lines(script, "source \"$1\"; gate_b_runtime_reasons", &[]);
-        assert_eq!(runtime_reasons.len(), 35);
+        assert_eq!(runtime_reasons.len(), 54);
         assert_eq!(
             runtime_reasons
                 .iter()
@@ -4539,7 +5608,7 @@ mod tests {
         let timing = oracle_failure.join("signal-timing.jsonl");
         let mut record: serde_json::Value =
             serde_json::from_str(std::fs::read_to_string(&timing).unwrap().trim()).unwrap();
-        record["late_hits"] = 0.into();
+        record["cycles"][0]["late_hits"] = 0.into();
         record["pass"] = false.into();
         record["failure_category"] = "oracle".into();
         std::fs::write(&timing, record.to_string() + "\n").unwrap();
@@ -4596,7 +5665,7 @@ mod tests {
         .unwrap();
         assert!(!shell_validate_gate_b_export(script, &contradictory, 1));
 
-        for mutation in 0..43 {
+        for mutation in 0..50 {
             let path = temp.path().join(format!("mutation-{mutation}"));
             fake_canonical_gate_b_export(&path, 2, 20, "none");
             let timing = path.join("signal-timing.jsonl");
@@ -4606,53 +5675,61 @@ mod tests {
                 .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
                 .collect::<Vec<_>>();
             let record = &mut records[0];
+            let cycle = &mut record["cycles"][0];
             match mutation {
-                0 => record["hook_ts_ns"] = 0.into(),
-                1 => record["send_signal_rc"] = (-1).into(),
-                2 => record["stop_request_accepted"] = false.into(),
-                3 => record["expected_task_count"] = 3.into(),
-                4 => record["stopped_snapshot_1_count"] = 1.into(),
-                5 => record["stopped_snapshot_2_count"] = 1.into(),
-                6 => record["stopped_snapshot_1_exact_expected_task_set"] = false.into(),
-                7 => record["stopped_snapshot_1_all_tasks_stopped"] = false.into(),
-                8 => record["stopped_snapshot_2_exact_expected_task_set"] = false.into(),
-                9 => record["stopped_snapshot_2_all_tasks_stopped"] = false.into(),
-                10 => record["pre_stop_marker_observed"] = true.into(),
-                11 => record["post_attach_task_count"] = 1.into(),
-                12 => record["post_attach_exact_expected_task_set"] = false.into(),
-                13 => record["post_attach_all_tasks_stopped"] = false.into(),
-                14 => record["post_attach_marker_observed"] = true.into(),
-                15 => record["signal_attach_attempts"] = 0.into(),
-                16 => record["signal_attach_attempts"] = 3.into(),
-                17 => record["signal_attach_accepted"] = false.into(),
-                18 => record["late_attach_attempts"] = 0.into(),
-                19 => record["late_attach_attempts"] = 3.into(),
-                20 => record["late_attach_accepted"] = false.into(),
+                0 => cycle["hook_ts_ns"] = 0.into(),
+                1 => cycle["send_signal_rc"] = (-1).into(),
+                2 => cycle["stop_request_accepted"] = false.into(),
+                3 => cycle["expected_task_count"] = 3.into(),
+                4 => cycle["stopped_snapshot_1_count"] = 1.into(),
+                5 => cycle["stopped_snapshot_2_count"] = 1.into(),
+                6 => cycle["stopped_snapshot_1_exact_expected_task_set"] = false.into(),
+                7 => cycle["stopped_snapshot_1_all_tasks_stopped"] = false.into(),
+                8 => cycle["stopped_snapshot_2_exact_expected_task_set"] = false.into(),
+                9 => cycle["stopped_snapshot_2_all_tasks_stopped"] = false.into(),
+                10 => cycle["pre_stop_marker_observed"] = true.into(),
+                11 => cycle["post_attach_task_count"] = 1.into(),
+                12 => cycle["post_attach_exact_expected_task_set"] = false.into(),
+                13 => cycle["post_attach_all_tasks_stopped"] = false.into(),
+                14 => cycle["post_attach_marker_observed"] = true.into(),
+                15 => cycle["signal_attach_attempts"] = 0.into(),
+                16 => cycle["signal_attach_attempts"] = 3.into(),
+                17 => cycle["signal_attach_accepted"] = false.into(),
+                18 => cycle["late_attach_attempts"] = 0.into(),
+                19 => cycle["late_attach_attempts"] = 3.into(),
+                20 => cycle["late_attach_accepted"] = false.into(),
                 21 => record["signal_link_detached"] = false.into(),
                 22 => record["late_link_detached"] = false.into(),
-                23 => record["last_attach_ts_ns"] = 999_999.into(),
-                24 => record["attach_gap_ms"] = 2.0.into(),
-                25 => record["pidfd_resume_attempts"] = 0.into(),
-                26 => record["pidfd_resume_attempts"] = 2.into(),
-                27 => record["pidfd_resume_rc"] = (-1).into(),
-                28 => record["resume_via_original_pidfd"] = false.into(),
-                29 => record["post_resume_marker_observed"] = false.into(),
-                30 => record["late_hits"] = 0.into(),
-                31 => record["late_hits"] = 3.into(),
+                23 => cycle["last_attach_ts_ns"] = 999_999.into(),
+                24 => cycle["attach_gap_ms"] = 2.0.into(),
+                25 => cycle["pidfd_resume_attempts"] = 0.into(),
+                26 => cycle["pidfd_resume_attempts"] = 2.into(),
+                27 => cycle["pidfd_resume_rc"] = (-1).into(),
+                28 => cycle["resume_via_original_pidfd"] = false.into(),
+                29 => cycle["post_resume_marker_observed"] = false.into(),
+                30 => cycle["late_hits"] = 0.into(),
+                31 => cycle["late_hits"] = 3.into(),
                 32 => {
                     record["child_exit"] = 1.into();
                     record["reaped"] = false.into();
                 }
-                33 => record["winner_records"] = 2.into(),
-                34 => record["coalesced_records"] = 0.into(),
-                35 => record["drain_empty"] = false.into(),
-                36 => record["attached_while_stopped"] = 1.into(),
+                33 => cycle["winner_records"] = 2.into(),
+                34 => cycle["coalesced_records"] = 0.into(),
+                35 => cycle["drain_empty"] = false.into(),
+                36 => cycle["attached_while_stopped"] = 1.into(),
                 37 => record["final_start_entries"] = 1.into(),
-                38 => record["owner_removed"] = false.into(),
-                39 => record["queue_empty_before_resume"] = false.into(),
-                40 => record["markers_after_resume"] = 1.into(),
-                41 => record["winner_case_id"] = 2.into(),
-                42 => record["confirmation_sample_indexes"] = serde_json::Value::Null,
+                38 => cycle["owner_removed"] = false.into(),
+                39 => cycle["queue_empty_before_resume"] = false.into(),
+                40 => cycle["markers_after_resume"] = 1.into(),
+                41 => cycle["winner_case_id"] = 2.into(),
+                42 => cycle["confirmation_sample_indexes"] = serde_json::Value::Null,
+                43 => cycle["cycle_deadline_ns"] = 101_000_001.into(),
+                44 => cycle["record_before_dequeue_ns"][0] = 101_000_001.into(),
+                45 => cycle["record_after_decode_ns"][0] = 101_000_001.into(),
+                46 => cycle["record_hook_ts_ns"][0] = 101_000_001.into(),
+                47 => cycle["record_hook_ts_ns"][0] = 1_001_101.into(),
+                48 => cycle["coalesced_send_signal_rcs"] = serde_json::json!([0]),
+                49 => record["outcome"] = "B".into(),
                 _ => unreachable!(),
             }
             std::fs::write(
@@ -5427,15 +6504,27 @@ mod tests {
             reserve < zeroing && zeroing < cas && cas < send && send < submit,
             "order must be reserve -> zero words -> CAS -> single signal -> submit"
         );
-        let delay = signal_source.find("STOP_SIGNAL_DELAY_POLLS").unwrap();
+        let post_cas = &signal_source[cas..submit];
+        assert!(
+            !post_cas.contains("STOP_SIGNAL_DELAY_POLLS")
+                && !post_cas.contains("while ")
+                && !post_cas.contains("loop {")
+                && !post_cas.contains("for "),
+            "the winner path must not busy-wait after the authorization CAS"
+        );
         let winner_timestamp = signal_source
             .find("let hook_ts_ns = helpers::bpf_ktime_get_ns();")
             .expect("winner timestamp");
         assert!(
-            cas < delay && delay < winner_timestamp && winner_timestamp < send,
-            "the timestamp must be taken after the bounded delay and immediately before the signal helper"
+            cas < winner_timestamp
+                && winner_timestamp < send
+                && signal_source[winner_timestamp..send]
+                    .starts_with(
+                        "let hook_ts_ns = helpers::bpf_ktime_get_ns();\n            let send_signal_rc = "
+                    ),
+            "the winner timestamp must immediately precede the sole signal helper"
         );
-        assert!(source.contains("const STOP_SIGNAL_DELAY_POLLS: u64 = 50_000;"));
+        assert!(!source.contains("const STOP_SIGNAL_DELAY_POLLS"));
         assert!(signal_source.contains("pause_owner_key()"));
         assert!(signal_source.contains("PAUSE_ARMED"));
         assert!(signal_source.contains("PAUSE_REQUESTED"));
@@ -5491,14 +6580,132 @@ mod tests {
         let gate_start = host[case_start..].find("fn run_gate_b(").unwrap() + case_start;
         let case_source = &host[case_start..gate_start];
         assert!(case_source.contains("if !late_links.is_empty()"));
-        assert!(case_source.contains("detach_program(ebpf, \"late_hit\", link)"));
+        assert!(host.contains("fn detach_all_program_links("));
+        assert!(
+            case_source.contains("detach_all_program_links(ebpf, \"late_hit\", &mut late_links)")
+        );
         assert!(case_source.contains("if !signal_links.is_empty()"));
-        assert!(case_source.contains("detach_program(ebpf, \"signal_return\", link)"));
-        assert!(case_source.contains("disarm_for_cleanup(start)"));
+        assert!(
+            case_source
+                .contains("detach_all_program_links(ebpf, \"signal_return\", &mut signal_links)")
+        );
+        assert!(case_source.contains("disarm_for_cleanup_result(start)"));
         let self_check = host[gate_start..].find("fn self_check(").unwrap() + gate_start;
         let gate_source = &host[gate_start..self_check];
         assert!(gate_source.contains("if runtime_failure_reason.is_some() || !pass"));
         assert!(gate_source.contains("break;"));
+    }
+
+    #[test]
+    fn amended_gate_b_source_contract_rejects_the_historical_single_owner_path() {
+        let ebpf =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ebpf/src/main.rs"))
+                .unwrap();
+        let runner = std::fs::read_to_string(file!()).unwrap();
+        let runner = runner.split_once("#[cfg(test)]").unwrap().0;
+        let shell =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh")).unwrap();
+        let signal = &ebpf
+            [ebpf.find("pub fn signal_return(").unwrap()..ebpf.find("pub fn late_hit(").unwrap()];
+        let mut violations = Vec::new();
+        if signal.contains("STOP_SIGNAL_DELAY_POLLS") || signal.contains("while ") {
+            violations.push("busy_wait_after_cas");
+        }
+        if !runner.contains("prearm_successor_before_resume")
+            || !runner.contains("wait_successor_record")
+        {
+            violations.push("owner_2_lifecycle_missing");
+        }
+        if !runner.contains("cycle_deadline_ns")
+            || !runner.contains("deadline before dequeue")
+            || !runner.contains("deadline after dequeue")
+            || !runner.contains("drain_signal_ring_through_deadline")
+        {
+            violations.push("causal_deadline_missing");
+        }
+        if !shell.contains("outcome") || !shell.contains("cycles") {
+            violations.push("amended_branch_validator_missing");
+        }
+        let accepted_branch = runner.find("SignalRequest::Accepted => {").unwrap();
+        let accepted_source = &runner[accepted_branch..];
+        let accepted_branch_end = accepted_source.find("SignalRequest::Coalesced =>").unwrap();
+        let accepted_source = &accepted_source[..accepted_branch_end];
+        let ledger = accepted_source
+            .find("owner_guard.mark_accepted_request()?")
+            .unwrap();
+        let stop_guard = accepted_source.find("guard.mark_accepted_stop();").unwrap();
+        let next_fallible_wait = accepted_source
+            .find("take_available_received_signal_record_until")
+            .unwrap();
+        if !(ledger < stop_guard && stop_guard < next_fallible_wait) {
+            violations.push("accepted_stop_mark_order_missing");
+        }
+        let case_start = runner.find("fn run_gate_b_case(").unwrap();
+        let cleanup =
+            &runner[case_start..runner[case_start..].find("fn run_gate_b(").unwrap() + case_start];
+        let cleanup_positions = [
+            cleanup.find("detach_all_program_links(ebpf, \"late_hit\", &mut late_links)"),
+            cleanup.find("detach_all_program_links(ebpf, \"signal_return\", &mut signal_links)"),
+            cleanup.rfind("drain_signal_ring_to_empty_until"),
+            cleanup.rfind("disarm_for_cleanup_result(start)"),
+            cleanup.find("resume_successor_protective_once"),
+            cleanup.find("guard.terminate()"),
+        ]
+        .into_iter()
+        .collect::<Option<Vec<_>>>();
+        if cleanup_positions
+            .as_ref()
+            .is_none_or(|positions| positions.windows(2).any(|pair| pair[0] >= pair[1]))
+        {
+            violations.push("cleanup_order_missing");
+        }
+        assert_eq!(violations, Vec::<&str>::new());
+    }
+
+    #[test]
+    fn pause_shape_guard_accepts_only_the_straight_line_winner_path() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/check-init-shape.py");
+        let source = concat!(env!("CARGO_MANIFEST_DIR"), "/ebpf/src/main.rs");
+        let temp = TestDir::new("pause-shape");
+        let candidate = temp.path().join("main.rs");
+        let run_guard = |path: &Path| {
+            Command::new("python3")
+                .args([script, "--pause-source-only"])
+                .arg(path)
+                .output()
+                .unwrap()
+        };
+        std::fs::copy(source, &candidate).unwrap();
+        let pass = run_guard(&candidate);
+        assert!(
+            pass.status.success(),
+            "{}",
+            String::from_utf8_lossy(&pass.stderr)
+        );
+
+        let mut delayed = std::fs::read_to_string(&candidate).unwrap();
+        delayed = delayed.replacen(
+            "let send_signal_rc = helpers::bpf_send_signal(19) as i64;",
+            "while helpers::bpf_ktime_get_ns() == 0 {}\n            let send_signal_rc = helpers::bpf_send_signal(19) as i64;",
+            1,
+        );
+        std::fs::write(&candidate, delayed).unwrap();
+        let reject = run_guard(&candidate);
+        assert!(!reject.status.success());
+        assert!(String::from_utf8_lossy(&reject.stderr).contains("post-CAS loop"));
+
+        let extra_helper = std::fs::read_to_string(source)
+            .unwrap()
+            .replacen(
+                "let send_signal_rc = helpers::bpf_send_signal(19) as i64;",
+                "let _ = helpers::bpf_get_prandom_u32();\n            let send_signal_rc = helpers::bpf_send_signal(19) as i64;",
+                1,
+            );
+        std::fs::write(&candidate, extra_helper).unwrap();
+        assert!(
+            !run_guard(&candidate).status.success(),
+            "an extra winner-path helper must be rejected"
+        );
     }
 
     #[test]

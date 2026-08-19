@@ -8,8 +8,44 @@ are FAIL. Base-register agnostic (aliases, +=, u64 spills/reloads). Unrelated me
 elsewhere in the ELF are not checked. Exit 0 PASS, 1 FAIL."""
 import re, subprocess, sys
 
+def fail(msg):
+    sys.exit(f"FAIL: {msg}")
+
+def pause_source_guard(path):
+    source = open(path, encoding="utf-8").read()
+    signal = source[source.index("pub fn signal_return("):source.index("pub fn late_hit(")]
+    cas = signal.index("core::intrinsics::atomic_cxchg")
+    submit = signal.index("entry.submit(0);")
+    region = signal[cas:submit]
+    if "STOP_SIGNAL_DELAY_POLLS" in source or re.search(r"\b(?:while|loop|for)\b", region):
+        fail("pause winner path has a post-CAS loop or delay")
+    winner = re.search(
+        r"if won \{\s*let hook_ts_ns = helpers::bpf_ktime_get_ns\(\);\s*"
+        r"let send_signal_rc = helpers::bpf_send_signal\(19\) as i64;\s*"
+        r"\(hook_ts_ns, send_signal_rc\)\s*\} else \{",
+        region,
+    )
+    if not winner or region.count("helpers::bpf_send_signal(19)") != 1:
+        fail("pause winner must read ktime immediately before one SIGSTOP helper")
+    winner_helpers = re.findall(r"helpers::([A-Za-z_][A-Za-z0-9_]*)", winner.group(0))
+    if winner_helpers != ["bpf_ktime_get_ns", "bpf_send_signal"]:
+        fail("pause winner path has an unapproved helper")
+
+if len(sys.argv) >= 2 and sys.argv[1] == "--pause-source-only":
+    if len(sys.argv) != 3:
+        sys.exit("usage: check-init-shape.py --pause-source-only SOURCE")
+    pause_source_guard(sys.argv[2])
+    print("PASS: pause source has reserve/init/CAS/ktime/send/submit without a post-CAS loop")
+    raise SystemExit(0)
+
 obj = sys.argv[1]
-objdump = sys.argv[2] if len(sys.argv) > 2 else "llvm-objdump"
+objdump = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "llvm-objdump"
+pause_source = None
+if "--pause-source" in sys.argv:
+    pause_index = sys.argv.index("--pause-source")
+    if pause_index + 1 >= len(sys.argv) or pause_index + 2 != len(sys.argv):
+        sys.exit("usage: check-init-shape.py OBJECT [OBJDUMP] [--pause-source SOURCE]")
+    pause_source = sys.argv[pause_index + 1]
 out = subprocess.run([objdump, "-dr", "--no-show-raw-insn", obj], capture_output=True, text=True, check=True).stdout
 m = re.search(r"^[0-9a-f]+ <\S*emit_discovery>:\n", out, re.M)      # symbol may be mangled
 if not m:
@@ -23,10 +59,6 @@ LOAD = re.compile(rf"(r\d+) = \*\((u8|u16|u32|u64) \*\)\((r\d+) ([+-]) ({NUM})\)
 NEEDED = set(range(0, 896, 8))
 val = lambda s: int(s, 0)
 off = lambda sign, n: val(n) if sign == "+" else -val(n)
-
-
-def fail(msg):
-    sys.exit(f"FAIL: {msg}")
 
 
 regs, spills, zero, done = {}, {}, set(), set()   # reg->record offset; stack slot->record offset; zero regs; zeroed offsets
@@ -101,4 +133,28 @@ else:
     if in_region:
         fail(f"initializer incomplete: {len(done)}/112 offsets; missing {sorted(NEEDED - done)[:6]}…")
     fail("no 896-byte bpf_ringbuf_reserve found in emit_discovery")
+
+if pause_source is not None:
+    pause_source_guard(pause_source)
+    signal_match = re.search(r"^[0-9a-f]+ <\S*signal_return>:\n", out, re.M)
+    if not signal_match:
+        fail("signal_return not found")
+    signal_lines = out[signal_match.end():].split("\n\n", 1)[0]
+    if signal_lines.count("cmpxchg_64") != 1:
+        fail("signal_return must contain exactly one cmpxchg_64")
+    if re.search(r"\bgoto -", signal_lines):
+        fail("signal_return has a backward edge")
+    calls_after_cas = signal_lines[signal_lines.index("cmpxchg_64"):]
+    call_ids = re.findall(r"\bcall (0x[0-9a-f]+|[0-9]+)", calls_after_cas)
+    # `0x1` is map_lookup_elem on the nonwinner/missing-authorization loss
+    # branch.  The source guard above is path-specific for the winner; this
+    # object guard freezes the shared codegen facts (no back edge, one CAS,
+    # one send helper, one terminal submit) without rejecting that fallback.
+    allowed_calls = {"0x1", "1", "0x5", "5", "0x6d", "109", "0x84", "132"}
+    if any(call not in allowed_calls for call in call_ids):
+        fail(f"unapproved helper after pause CAS: {call_ids}")
+    if sum(call in {"0x6d", "109"} for call in call_ids) != 1:
+        fail("signal_return must contain exactly one bpf_send_signal helper")
+    if sum(call in {"0x84", "132"} for call in call_ids) != 1:
+        fail("signal_return must terminate in exactly one ringbuf submit helper")
 print("PASS: 112 aligned u64 zero stores at record offsets 0..888 before any record use; no memset / back edge in the region")

@@ -317,9 +317,14 @@ export_evidence() {
     local -a ssh
     mapfile -d '' -t ssh < <(ssh_argv "$known_hosts" "$port")
     remote_command="sudo -n sh -s -- $remote_dir $expected_rc"
-    remote_export_script \
+    # A failed export or extraction must not leave a stale directory that
+    # blocks the next lane attempt from creating it fresh.
+    if ! remote_export_script \
         | timeout 120s "${ssh[@]}" p11scope@127.0.0.1 "$remote_command" \
-        | tar --no-same-owner --no-same-permissions -C "$new_host_dir" -xf -
+        | tar --no-same-owner --no-same-permissions -C "$new_host_dir" -xf -; then
+        rm -rf "$new_host_dir"
+        return 64
+    fi
 }
 
 validate_local_export() {

@@ -1162,10 +1162,10 @@ fn prearm_successor_for_cleanup<M: PauseOwnerMap>(
 fn reject_successor_with_deadline(
     owner: &mut PauseOwnerGuard,
     deadline_ns: u64,
-    rejection_deadline: &mut Option<u64>,
+    teardown_deadline: &mut Option<u64>,
 ) -> Result<(), &'static str> {
     owner.record_winner_deadline(deadline_ns);
-    *rejection_deadline = Some(deadline_ns);
+    *teardown_deadline = Some(deadline_ns);
     owner.reject_successor_request()
 }
 
@@ -1287,13 +1287,13 @@ fn finish_gate_b_cleanup<M, F>(
     owner: Option<&mut PauseOwnerGuard>,
     mut child: Option<&mut ChildGuard>,
     start: &mut M,
-    rejection_deadline: Option<u64>,
+    teardown_deadline: Option<u64>,
     drain: F,
 ) where
     M: PauseOwnerMap,
     F: FnOnce(Option<u64>) -> Result<(), &'static str>,
 {
-    retain_cleanup_drain_result(facts, failure, drain(rejection_deadline));
+    retain_cleanup_drain_result(facts, failure, drain(teardown_deadline));
     if let Some(owner_guard) = owner {
         // The post-drain START read, not the existence of a failure, decides
         // whether a pre-armed successor is unresolved.  ARMED/absent proves
@@ -2664,6 +2664,43 @@ fn wait_received_signal_record_by_deadline(
     Ok(record)
 }
 
+/// A coalescer starts a provisional bounded wait.  Once its peer arrives, the
+/// peer's timestamp replaces that bound and validates both records.
+fn wait_coalesced_winner<S, W>(
+    state: &mut S,
+    coalescer: ReceivedSignalRecord,
+    child_pid: u32,
+    expected: &BTreeMap<u32, u8>,
+    teardown_deadline: &mut Option<u64>,
+    mut wait: W,
+) -> Result<(ReceivedSignalRecord, u64), &'static str>
+where
+    W: FnMut(&mut S, u64) -> Result<ReceivedSignalRecord, &'static str>,
+{
+    let provisional_deadline = cycle_deadline_ns(coalescer.record.hook_ts_ns)?;
+    // This precedes validation and waiting so every failure path retains the
+    // coalescer-relative closure bound instead of reusing an earlier epoch.
+    *teardown_deadline = Some(provisional_deadline);
+    validate_signal_record(&coalescer.record, child_pid, expected, None)?;
+    if !record_within_cycle_deadline(coalescer, provisional_deadline) {
+        return Err("record deadline");
+    }
+
+    let winner = wait(state, provisional_deadline)?;
+    let deadline_ns = cycle_deadline_ns(winner.record.hook_ts_ns)?;
+    *teardown_deadline = Some(deadline_ns);
+    validate_signal_record(&winner.record, child_pid, expected, None)?;
+    if winner.record.case_id == coalescer.record.case_id {
+        return Err("signal record identity");
+    }
+    if !record_within_cycle_deadline(coalescer, deadline_ns)
+        || !record_within_cycle_deadline(winner, deadline_ns)
+    {
+        return Err("record deadline");
+    }
+    Ok((winner, deadline_ns))
+}
+
 /// The successor must be observed promptly after owner 1's successful resume,
 /// but its own winner timestamp begins a fresh 100 ms cycle.  The liveness
 /// bound therefore does not become a second-cycle safety deadline.
@@ -2886,16 +2923,26 @@ where
     E: FnMut(&mut S) -> Result<bool, &'static str>,
 {
     let mut drained = 0u64;
-    while let Some(record) = wait_until(state, deadline_ns)? {
-        if !record_within_cycle_deadline(record, deadline_ns) {
-            return Err("record deadline");
+    let mut malformed = None;
+    loop {
+        match wait_until(state, deadline_ns) {
+            Ok(Some(record)) => {
+                if !record_within_cycle_deadline(record, deadline_ns) {
+                    return Err("record deadline");
+                }
+                drained += 1;
+            }
+            Ok(None) => break,
+            Err(reason @ "signal record length is not 32 bytes") => {
+                malformed.get_or_insert(reason);
+            }
+            Err(reason) => return Err(reason),
         }
-        drained += 1;
     }
     if !final_empty(state)? {
         return Err("record deadline");
     }
-    Ok(drained)
+    malformed.map_or(Ok(drained), Err)
 }
 
 fn drain_signal_ring_through_deadline(
@@ -3747,7 +3794,7 @@ fn run_gate_b_case(
     let mut late_links = Vec::new();
     let mut owner: Option<PauseOwnerGuard> = None;
     let mut counters_before = [0; 5];
-    let mut rejection_deadline = None;
+    let mut teardown_deadline = None;
     let result = (|| -> Result<(), &'static str> {
         cancellation_failure(cancellation)?;
         if ring.next().is_some() {
@@ -3867,59 +3914,90 @@ fn run_gate_b_case(
                             marker_reader.as_raw_fd(),
                             guard.original_pidfd.as_raw_fd(),
                         )?;
-                        validate_signal_record(
-                            &successor.record,
-                            guard.pid(),
-                            &expected,
-                            Some(
-                                if first_cycle.winner_case_id == common::SIGNAL_COOKIE_A as u8 {
-                                    common::SIGNAL_COOKIE_B as u8
-                                } else {
-                                    common::SIGNAL_COOKIE_A as u8
-                                },
-                            ),
-                        )?;
-                        let successor_deadline = cycle_deadline_ns(successor.record.hook_ts_ns)?;
-                        let successor_request = signal_request(&successor.record);
-                        if successor_request != SignalRequest::Accepted {
-                            if successor_request == SignalRequest::Rejected {
+                        let expected_successor_case =
+                            if first_cycle.winner_case_id == common::SIGNAL_COOKIE_A as u8 {
+                                common::SIGNAL_COOKIE_B as u8
+                            } else {
+                                common::SIGNAL_COOKIE_A as u8
+                            };
+                        let (winner, deadline_ns, coalesced_sibling) =
+                            if signal_request(&successor.record) == SignalRequest::Coalesced {
+                                let (winner, deadline_ns) = wait_coalesced_winner(
+                                    ring,
+                                    successor,
+                                    guard.pid(),
+                                    &expected,
+                                    &mut teardown_deadline,
+                                    |ring, deadline_ns| {
+                                        wait_received_signal_record_by_deadline(
+                                            ring,
+                                            cancellation,
+                                            deadline_ns,
+                                            "second signal record timeout",
+                                        )
+                                    },
+                                )?;
+                                (winner, deadline_ns, Some(successor))
+                            } else {
+                                validate_signal_record(
+                                    &successor.record,
+                                    guard.pid(),
+                                    &expected,
+                                    Some(expected_successor_case),
+                                )?;
+                                (
+                                    successor,
+                                    cycle_deadline_ns(successor.record.hook_ts_ns)?,
+                                    None,
+                                )
+                            };
+                        match signal_request(&winner.record) {
+                            SignalRequest::Accepted => {
+                                // A successor record is accepted only after owner 1's
+                                // original-pidfd resume reported success in its ledger.
+                                owner_guard.accept_successor_request()?;
+                                guard.mark_accepted_stop();
+                                if !owner_guard.current_resume_required() {
+                                    return Err("accepted stop ledger");
+                                }
+                                owner_guard.record_winner_deadline(deadline_ns);
+                                let mut second_cycle =
+                                    accepted_cycle_facts(winner, &[winner], expected_task_count)?;
+                                let shape = complete_accepted_cycle(
+                                    ebpf,
+                                    ring,
+                                    start,
+                                    fixture,
+                                    offsets,
+                                    cancellation,
+                                    marker_reader.as_raw_fd(),
+                                    guard,
+                                    owner_guard,
+                                    &expected,
+                                    &mut second_cycle,
+                                    &mut late_links,
+                                    coalesced_sibling.as_slice(),
+                                    false,
+                                )?;
+                                facts.cycles.push(second_cycle);
+                                if shape.is_some() {
+                                    teardown_deadline = None;
+                                }
+                                if coalesced_sibling.is_none()
+                                    && shape == Some(AcceptedCycleShape::Single)
+                                {
+                                    facts.outcome = Some(GateBOutcome::B);
+                                }
+                            }
+                            SignalRequest::Rejected => {
                                 reject_successor_with_deadline(
                                     owner_guard,
-                                    successor_deadline,
-                                    &mut rejection_deadline,
+                                    deadline_ns,
+                                    &mut teardown_deadline,
                                 )?;
+                                return Err("successor signal record");
                             }
-                            return Err("successor signal record");
-                        }
-                        // A successor record is accepted only after owner 1's
-                        // original-pidfd resume reported success in its ledger.
-                        owner_guard.accept_successor_request()?;
-                        guard.mark_accepted_stop();
-                        if !owner_guard.current_resume_required() {
-                            return Err("accepted stop ledger");
-                        }
-                        owner_guard.record_winner_deadline(successor_deadline);
-                        let mut second_cycle =
-                            accepted_cycle_facts(successor, &[successor], expected_task_count)?;
-                        let shape = complete_accepted_cycle(
-                            ebpf,
-                            ring,
-                            start,
-                            fixture,
-                            offsets,
-                            cancellation,
-                            marker_reader.as_raw_fd(),
-                            guard,
-                            owner_guard,
-                            &expected,
-                            &mut second_cycle,
-                            &mut late_links,
-                            &[],
-                            false,
-                        )?;
-                        facts.cycles.push(second_cycle);
-                        if shape == Some(AcceptedCycleShape::Single) {
-                            facts.outcome = Some(GateBOutcome::B);
+                            SignalRequest::Coalesced => return Err("signal record identity"),
                         }
                     }
                     Some(AcceptedCycleShape::Single) | None => {
@@ -3928,28 +4006,29 @@ fn run_gate_b_case(
                 }
             }
             SignalRequest::Coalesced => {
-                // A coalescer has only a provisional bound.  The winner below
-                // establishes the canonical deadline and revalidates this item.
-                let provisional_deadline = cycle_deadline_ns(first_record.record.hook_ts_ns)?;
-                let winner = wait_received_signal_record_by_deadline(
+                let (winner, deadline_ns) = wait_coalesced_winner(
                     ring,
-                    cancellation,
-                    provisional_deadline,
-                    "second signal record timeout",
+                    first_record,
+                    guard.pid(),
+                    &expected,
+                    &mut teardown_deadline,
+                    |ring, deadline_ns| {
+                        wait_received_signal_record_by_deadline(
+                            ring,
+                            cancellation,
+                            deadline_ns,
+                            "second signal record timeout",
+                        )
+                    },
                 )?;
-                validate_signal_record(&winner.record, guard.pid(), &expected, None)?;
                 match signal_request(&winner.record) {
                     SignalRequest::Accepted => {
-                        if winner.record.case_id == first_record.record.case_id {
-                            return Err("signal record identity");
-                        }
                         owner_guard.mark_accepted_request()?;
                         guard.mark_accepted_stop();
                         if !owner_guard.current_resume_required() {
                             return Err("accepted stop ledger");
                         }
-                        owner_guard
-                            .record_winner_deadline(cycle_deadline_ns(winner.record.hook_ts_ns)?);
+                        owner_guard.record_winner_deadline(deadline_ns);
                         let mut cycle =
                             accepted_cycle_facts(winner, &[winner], expected_task_count)?;
                         let shape = complete_accepted_cycle(
@@ -3972,11 +4051,12 @@ fn run_gate_b_case(
                             facts.outcome = Some(GateBOutcome::A);
                         }
                         facts.cycles.push(cycle);
+                        if shape.is_some() {
+                            teardown_deadline = None;
+                        }
                     }
                     SignalRequest::Rejected => {
-                        let deadline_ns = cycle_deadline_ns(winner.record.hook_ts_ns)?;
                         owner_guard.record_winner_deadline(deadline_ns);
-                        rejection_deadline = Some(deadline_ns);
                         owner_guard.mark_rejected_request()?;
                         return Ok(());
                     }
@@ -3986,7 +4066,7 @@ fn run_gate_b_case(
             SignalRequest::Rejected => {
                 let deadline_ns = cycle_deadline_ns(first_record.record.hook_ts_ns)?;
                 owner_guard.record_winner_deadline(deadline_ns);
-                rejection_deadline = Some(deadline_ns);
+                teardown_deadline = Some(deadline_ns);
                 owner_guard.mark_rejected_request()?;
                 return Ok(());
             }
@@ -4046,7 +4126,7 @@ fn run_gate_b_case(
     // Detached links cannot create a new record.  The shared coordinator then
     // drains/decode before authorization removal, ledger-authorized resumes,
     // and terminal kill/reap without short-circuiting any failure.
-    let ordinary_drain_deadline = rejection_deadline.is_none().then(|| {
+    let ordinary_drain_deadline = teardown_deadline.is_none().then(|| {
         if failure.is_some() {
             owner
                 .as_ref()
@@ -4063,8 +4143,8 @@ fn run_gate_b_case(
         owner.as_mut(),
         child.as_mut(),
         start,
-        rejection_deadline,
-        |rejected_deadline| match rejected_deadline {
+        teardown_deadline,
+        |teardown_deadline| match teardown_deadline {
             Some(deadline) => drain_signal_ring_through_deadline(ring, deadline).map(|_| ()),
             None => ordinary_drain_deadline
                 .expect("ordinary drain deadline")
@@ -5409,6 +5489,197 @@ mod tests {
         assert!(facts.reaped);
         assert_eq!(failure, Some("successor resolution"));
         assert_eq!(cancellation.check().unwrap(), Some(Cancelled::Sigint));
+    }
+
+    #[test]
+    fn deferred_coalescer_waits_for_distinct_winner_then_assigns_one_sibling() {
+        let child_pid = 42;
+        let tid = 7;
+        let expected = BTreeMap::from([(tid, b'T')]);
+        let received = |case_id, send_signal_rc, hook_ts_ns| ReceivedSignalRecord {
+            record: common::SignalRecord {
+                hook_ts_ns,
+                pid_tgid: u64::from(child_pid) << 32 | u64::from(tid),
+                send_signal_rc,
+                case_id,
+                ..common::SignalRecord::default()
+            },
+            before_dequeue_ns: hook_ts_ns + 1,
+            after_decode_ns: hook_ts_ns + 2,
+        };
+        let direct = received(common::SIGNAL_COOKIE_B as u8, 0, 1_000);
+        validate_signal_record(
+            &direct.record,
+            child_pid,
+            &expected,
+            Some(common::SIGNAL_COOKIE_B as u8),
+        )
+        .unwrap();
+        assert!(
+            validate_signal_record(
+                &received(common::SIGNAL_COOKIE_A as u8, 0, 1_000).record,
+                child_pid,
+                &expected,
+                Some(common::SIGNAL_COOKIE_B as u8),
+            )
+            .is_err()
+        );
+
+        let coalescer = received(
+            common::SIGNAL_COOKIE_B as u8,
+            common::COALESCED_NO_HELPER,
+            2_000,
+        );
+        let winner = received(common::SIGNAL_COOKIE_A as u8, 0, 3_000);
+        let provisional_deadline = cycle_deadline_ns(coalescer.record.hook_ts_ns).unwrap();
+        let canonical_deadline = cycle_deadline_ns(winner.record.hook_ts_ns).unwrap();
+        let mut teardown_deadline = Some(cycle_deadline_ns(1).unwrap());
+        let mut queued = Some(winner);
+        let (resolved, canonical) = wait_coalesced_winner(
+            &mut queued,
+            coalescer,
+            child_pid,
+            &expected,
+            &mut teardown_deadline,
+            |queued, deadline| {
+                assert_eq!(deadline, provisional_deadline);
+                Ok(queued.take().unwrap())
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved.record.hook_ts_ns, winner.record.hook_ts_ns);
+        assert_eq!(resolved.record.case_id, winner.record.case_id);
+        assert_eq!(resolved.record.send_signal_rc, winner.record.send_signal_rc);
+        assert_eq!(resolved.before_dequeue_ns, winner.before_dequeue_ns);
+        assert_eq!(resolved.after_decode_ns, winner.after_decode_ns);
+        assert_eq!(canonical, canonical_deadline);
+        assert_eq!(teardown_deadline, Some(canonical_deadline));
+
+        let mut same_case = Some(received(common::SIGNAL_COOKIE_B as u8, 0, 3_000));
+        assert_eq!(
+            wait_coalesced_winner(
+                &mut same_case,
+                coalescer,
+                child_pid,
+                &expected,
+                &mut teardown_deadline,
+                |same_case, deadline| {
+                    assert_eq!(deadline, provisional_deadline);
+                    Ok(same_case.take().unwrap())
+                },
+            )
+            .unwrap_err(),
+            "signal record identity"
+        );
+
+        let mut facts = accepted_cycle_facts(resolved, &[resolved], 2).unwrap();
+        assign_stopped_siblings(&mut facts, &[coalescer]).unwrap();
+        assert_eq!(facts.coalesced_records, 1);
+        assert_eq!(facts.coalesced_case_id, common::SIGNAL_COOKIE_B as u8);
+        assert!(assign_stopped_siblings(&mut facts, &[coalescer]).is_err());
+
+        let mut gate = valid_gate_b_outcome_b();
+        gate.cycles[1].coalesced_records = 1;
+        gate.cycles[1].coalesced_case_id = common::SIGNAL_COOKIE_B as u8;
+        gate.cycles[1].coalesced_send_signal_rcs = vec![common::COALESCED_NO_HELPER];
+        assert!(!deferred_cycle_pass(&gate.cycles[1], true));
+        assert!(!gate_b_oracle_pass(&gate));
+    }
+
+    #[test]
+    fn coalesced_winner_wait_errors_keep_its_provisional_teardown_deadline() {
+        let child_pid = 42;
+        let tid = 7;
+        let expected = BTreeMap::from([(tid, b'T')]);
+        let coalescer = ReceivedSignalRecord {
+            record: common::SignalRecord {
+                hook_ts_ns: 2_000,
+                pid_tgid: u64::from(child_pid) << 32 | u64::from(tid),
+                send_signal_rc: common::COALESCED_NO_HELPER,
+                case_id: common::SIGNAL_COOKIE_A as u8,
+                ..common::SignalRecord::default()
+            },
+            before_dequeue_ns: 2_001,
+            after_decode_ns: 2_002,
+        };
+        let provisional_deadline = cycle_deadline_ns(coalescer.record.hook_ts_ns).unwrap();
+        for reason in [
+            "cancelled_sigint",
+            "second signal record timeout",
+            "signal record length is not 32 bytes",
+        ] {
+            let mut teardown_deadline = Some(cycle_deadline_ns(1).unwrap());
+            assert_eq!(
+                wait_coalesced_winner(
+                    &mut (),
+                    coalescer,
+                    child_pid,
+                    &expected,
+                    &mut teardown_deadline,
+                    |_, deadline| {
+                        assert_eq!(deadline, provisional_deadline);
+                        Err(reason)
+                    },
+                )
+                .unwrap_err(),
+                reason
+            );
+            assert_eq!(teardown_deadline, Some(provisional_deadline));
+        }
+    }
+
+    #[test]
+    fn malformed_rejected_record_closes_before_coordinator_retains_decode_failure() {
+        let key = common::StateKey {
+            pid_tgid: 42 << 32,
+            attach_cookie: u64::MAX,
+        };
+        let mut map = armed_fake(key);
+        let mut owner = PauseOwnerGuard::new(key);
+        owner.mark_rejected_request().unwrap();
+        let malformed = decode_signal_record(&[0; 31]).unwrap_err();
+        let deadline = cycle_deadline_ns(1_000).unwrap();
+        let mut drain_state = (0u8, 0u8);
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("IFS= read -r _; sleep 30");
+        let mut guard = spawn_pinned_child(&mut command).unwrap();
+        let mut facts = GateBTimingFacts::default();
+        let mut failure = None;
+        finish_gate_b_cleanup(
+            &mut facts,
+            &mut failure,
+            Some(&mut owner),
+            Some(&mut guard),
+            &mut map,
+            Some(deadline),
+            |seen_deadline| {
+                assert_eq!(seen_deadline, Some(deadline));
+                drain_rejected_records_through_deadline(
+                    &mut drain_state,
+                    deadline,
+                    |state, wait_deadline| {
+                        assert_eq!(wait_deadline, deadline);
+                        state.0 += 1;
+                        if state.0 == 1 {
+                            Err(malformed)
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                    |state| {
+                        state.1 += 1;
+                        Ok(true)
+                    },
+                )
+                .map(|_| ())
+            },
+        );
+        assert_eq!(drain_state, (2, 1));
+        assert_eq!(failure, Some(malformed));
+        assert!(facts.cleanup_drain_failed);
+        assert_eq!(facts.cleanup_failures, 1);
+        assert_eq!(map.entry_count().unwrap(), 0);
+        assert!(facts.reaped);
     }
 
     #[test]

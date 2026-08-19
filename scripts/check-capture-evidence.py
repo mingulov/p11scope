@@ -49,6 +49,17 @@ COUNTERS = (
 MAX_MANIFEST_OBJECT_FALLBACKS = 512
 MANIFEST_STALE_REASONS = {"open_stale", "identity_mismatch"}
 ALLOWED_SOURCE_ARRAYS = (["scan"], ["manifest"], ["scan", "manifest"])
+ALLOWED_TABLE_SOURCES = {"scan", "manifest"}
+ALLOWED_CORROBORATION = {
+    "single_source",
+    "agreed",
+    "conflict",
+    "scan_empty",
+    "uncorroborated",
+    "identity_mismatch",
+    "object_fallback",
+}
+COMPARABLE_CORROBORATION = {"agreed", "conflict"}
 U64_MAX = (1 << 64) - 1
 
 # The version-matrix provider, seen two ways. Both are measured, both are exact.
@@ -176,6 +187,74 @@ def exact_sources(carrier):
     )
 
 
+def semantic_join_eligible(function, module):
+    """Whether unchanged v2 evidence authorizes semantic consumer joins."""
+    if function["module"] is None or function["module_ambiguous"] or function["aliased"]:
+        return False
+    sources = module["sources"]
+    outcomes = set(module["corroboration"])
+    if sources == ["manifest"]:
+        return True
+    return (
+        sources == ["scan", "manifest"]
+        and "agreed" in outcomes
+        and not outcomes.intersection({"conflict", "identity_mismatch", "object_fallback"})
+    )
+
+
+def exact_discovery_semantics(evidence):
+    conflicts = 0
+    for module in evidence["discovery"]:
+        require(
+            {"sources", "corroborated", "corroboration", "tables"} <= set(module),
+            f"incomplete discovery module: {module}",
+        )
+        exact_sources(module)
+        require(isinstance(module["corroborated"], bool), module)
+        outcomes = module["corroboration"]
+        require(isinstance(outcomes, list) and outcomes, f"invalid corroboration: {module}")
+        require(
+            all(outcome in ALLOWED_CORROBORATION for outcome in outcomes),
+            f"invalid corroboration: {module}",
+        )
+        outcome_set = set(outcomes)
+        sources = module["sources"]
+        if sources == ["scan"]:
+            source_outcomes_ok = outcomes == ["single_source"] or outcome_set <= {
+                "identity_mismatch",
+                "object_fallback",
+            }
+        elif sources == ["manifest"]:
+            source_outcomes_ok = outcome_set == {"uncorroborated"}
+        else:
+            source_outcomes_ok = not outcome_set.intersection(
+                {"single_source", "uncorroborated"}
+            ) and bool(outcome_set.intersection({"agreed", "conflict", "scan_empty"}))
+        require(
+            source_outcomes_ok,
+            f"corroboration disagrees with exact sources: {module}",
+        )
+        comparable = bool(outcome_set.intersection(COMPARABLE_CORROBORATION))
+        require(
+            module["corroborated"] == comparable,
+            f"corroborated disagrees with exact outcomes: {module}",
+        )
+        conflicts += outcomes.count("conflict")
+        for table in module["tables"]:
+            source = table["source"]
+            require(source in ALLOWED_TABLE_SOURCES, f"invalid table source: {table}")
+            require(source in module["sources"], f"table source absent from module: {module}")
+    require(
+        evidence["discovery_conflicts"] == conflicts,
+        f"discovery_conflicts: want {conflicts}, got {evidence['discovery_conflicts']}",
+    )
+    if any(module["sources"] == ["scan"] for module in evidence["discovery"]):
+        require(
+            evidence["completeness"] == "PARTIAL",
+            "scan-only semantic evidence cannot be COMPLETE",
+        )
+
+
 def exact_counters(evidence, allowances=None):
     allowances = allowances or {}
     unknown = set(allowances) - set(COUNTERS)
@@ -187,6 +266,7 @@ def exact_counters(evidence, allowances=None):
 
 def exact_manifest_object_fallbacks(evidence):
     """Every stale object is bound to one scan-opened identity, never a path."""
+    exact_discovery_semantics(evidence)
     fallbacks = evidence["manifest_object_fallbacks"]
     require(isinstance(fallbacks, list), "manifest_object_fallbacks is not an array")
     require(
@@ -413,13 +493,26 @@ def exact_capture_modules(document):
     # all with the reason stated. An identity that matches no declared module
     # would make the attribution unverifiable, which is the point of publishing it.
     identities = [{key: module[key] for key in ("dev", "ino", "sha256")} for module in modules]
+    discovery_by_identity = {
+        (tuple(module["dev"]), module["ino"], module["sha256"]): module
+        for module in document["evidence"]["discovery"]
+    }
+    ineligible = False
     for item in document["functions"]:
         owner, ambiguous = item["module"], item["module_ambiguous"]
         if owner is None:
             require(ambiguous is True, f"unattributed function without a reason: {item}")
+            ineligible = True
             continue
         require(ambiguous is False, f"attributed function marked ambiguous: {item}")
         require(owner in identities, f"function attributed to an undeclared module: {item}")
+        identity = (tuple(owner["dev"]), owner["ino"], owner["sha256"])
+        ineligible |= not semantic_join_eligible(item, discovery_by_identity[identity])
+    if ineligible:
+        require(
+            document["evidence"]["completeness"] == "PARTIAL",
+            "semantically ineligible functions cannot be COMPLETE",
+        )
 
 
 def validate_proxy_capacity_fallback(document):
@@ -750,7 +843,13 @@ def function_items(pairs):
     """`functions[]` items as v2 emits them: every count attributed to a module."""
     identity = {key: MODULE_FIXTURE[key] for key in ("dev", "ino", "sha256")}
     return [
-        {"names": names, "calls": calls, "module": identity, "module_ambiguous": False}
+        {
+            "names": names,
+            "calls": calls,
+            "module": identity,
+            "module_ambiguous": False,
+            "aliased": len(names) > 1,
+        }
         for names, calls in pairs
     ]
 
@@ -758,6 +857,13 @@ def function_items(pairs):
 def discovery_fixture(sources=("scan",)):
     sources = list(sources)
     corroborated = sources == ["scan", "manifest"]
+    outcome = (
+        "agreed"
+        if corroborated
+        else "uncorroborated"
+        if sources == ["manifest"]
+        else "single_source"
+    )
     return [
         dict(
             MODULE_FIXTURE,
@@ -771,8 +877,11 @@ def discovery_fixture(sources=("scan",)):
             ],
             sources=sources,
             corroborated=corroborated,
-            corroboration=["conflict"] if corroborated else ["single_source"],
-            tables=[{"version": [2, 40], "entries": 68, "source": "scan"}],
+            corroboration=[outcome],
+            tables=[
+                {"version": [2, 40], "entries": 68, "source": source}
+                for source in sources
+            ],
             interfaces=0,
             skipped=[],
         )
@@ -925,6 +1034,60 @@ def self_test():
         "corroborated": corroborated,
         "manifest-only": manifest_only,
     }
+    require(
+        semantic_join_eligible(
+            manifest_only["functions"][0], manifest_only["evidence"]["discovery"][0]
+        ),
+        "explicit manifest attestation must be eligible",
+    )
+    require(
+        semantic_join_eligible(
+            corroborated["functions"][0], corroborated["evidence"]["discovery"][0]
+        ),
+        "exact agreed scan+manifest must be eligible",
+    )
+    rejected(
+        lambda: require(
+            semantic_join_eligible(
+                clean["functions"][0], clean["evidence"]["discovery"][0]
+            ),
+            "scan-only function is not semantic-joinable",
+        )
+    )
+    conflict = copy.deepcopy(corroborated)
+    conflict["evidence"]["discovery"][0]["corroboration"] = ["conflict"]
+    conflict["evidence"]["discovery_conflicts"] = 1
+    exact_capture_modules(conflict)
+    rejected(
+        lambda: require(
+            semantic_join_eligible(
+                conflict["functions"][0], conflict["evidence"]["discovery"][0]
+            ),
+            "conflict function is not semantic-joinable",
+        )
+    )
+    aliased = copy.deepcopy(manifest_only)
+    aliased["functions"][0]["aliased"] = True
+    rejected(
+        lambda: require(
+            semantic_join_eligible(
+                aliased["functions"][0], aliased["evidence"]["discovery"][0]
+            ),
+            "aliased function is not semantic-joinable",
+        )
+    )
+    unattributed = copy.deepcopy(manifest_only)
+    unattributed["functions"][0].update(module=None, module_ambiguous=True)
+    rejected(
+        lambda: require(
+            semantic_join_eligible(
+                unattributed["functions"][0],
+                unattributed["evidence"]["discovery"][0],
+            ),
+            "unattributed function is not semantic-joinable",
+        )
+    )
+    print("semantic join eligibility is exact and conservative: OK")
     for discovery, document in documents.items():
         validate_clean_metrics(document, {"C_Initialize": 1}, discovery=discovery)
         for other in documents:
@@ -990,6 +1153,7 @@ def self_test():
         interface_list="ok",
         discovery_conflicts=1,
     )
+    version["discovery"][0]["corroboration"] = ["conflict"]
     safe = document_fixture(copy.deepcopy(version))
     safe["evidence"].update(SAFE_ALLOWANCES)
     validate_canary("default-safe-profile", safe)
@@ -1219,6 +1383,46 @@ def self_test():
     bogus_source = copy.deepcopy(fallback)
     bogus_source["evidence"]["discovery"][0]["sources"] = ["scan", "bogus"]
     rejected(lambda: exact_capture_modules(bogus_source))
+
+    semantic_mutations = []
+    bad = copy.deepcopy(clean)
+    bad["evidence"]["discovery"][0]["tables"][0]["source"] = "bogus"
+    semantic_mutations.append(("unknown table source", bad))
+    bad = copy.deepcopy(clean)
+    bad["evidence"]["discovery"][0]["corroboration"] = ["bogus"]
+    semantic_mutations.append(("unknown corroboration", bad))
+    bad = copy.deepcopy(manifest_only)
+    bad["evidence"]["discovery"][0]["corroboration"] = ["single_source"]
+    semantic_mutations.append(("manifest-only single-source outcome", bad))
+    bad = copy.deepcopy(corroborated)
+    bad["evidence"]["discovery"][0].update(
+        corroborated=False, corroboration=["agreed"]
+    )
+    bad["evidence"]["discovery_uncorroborated"] = 1
+    semantic_mutations.append(("agreed marked uncorroborated", bad))
+    bad = copy.deepcopy(corroborated)
+    bad["evidence"]["discovery"][0].update(
+        corroborated=False, corroboration=["conflict"]
+    )
+    bad["evidence"]["discovery_conflicts"] = 1
+    bad["evidence"]["discovery_uncorroborated"] = 1
+    semantic_mutations.append(("conflict marked uncorroborated", bad))
+    bad = copy.deepcopy(clean)
+    bad["evidence"]["discovery"][0]["corroborated"] = True
+    semantic_mutations.append(("corroborated without a comparable outcome", bad))
+    bad = copy.deepcopy(corroborated)
+    bad["evidence"]["discovery"][0]["corroboration"] = ["conflict"]
+    bad["evidence"]["discovery_conflicts"] = 0
+    semantic_mutations.append(("conflict counter mismatch", bad))
+    bad = copy.deepcopy(clean)
+    bad["evidence"]["completeness"] = "COMPLETE"
+    semantic_mutations.append(("scan-only complete", bad))
+    bad = copy.deepcopy(clean)
+    bad["evidence"]["discovery"][0]["objects"][0]["sources"] = ["bogus"]
+    semantic_mutations.append(("unknown object source", bad))
+    for label, bad in semantic_mutations:
+        rejected(lambda bad=bad: exact_capture_modules(bad))
+    print("semantic source/corroboration mutations are rejected: OK")
 
     non_hex = copy.deepcopy(fallback)
     bad_digest = "g" * 64

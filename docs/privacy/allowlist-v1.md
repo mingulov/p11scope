@@ -25,12 +25,12 @@ in full: an allowed fixed-offset read can be redirected to unrelated readable
 bytes. `bpf_probe_read_user` prevents a target fault; it does not validate C
 type or provenance in either policy.
 
-It also assumes the explicitly selected native provider truthfully exposes
-PKCS #11 ABI functions in its own tables. A malicious provider is already
-arbitrary native code in the observed application and is outside that semantic
-guarantee. A manifest is trusted operator input, structurally validated and
-hash-matched against the pinned object; the observer executes no provider
-code.
+Provider tables are not semantic authority merely because a provider exposed
+them. `scan` is bounded heuristic discovery; scan-only slots remain count-only
+aggregate observations. A manifest is explicit operator attestation under the
+Slice 1b-1 contract, structurally validated and hash-matched against the
+pinned object; the observer executes no provider code. Hash pinning authorizes
+object bytes and offsets, not semantic joins.
 
 The controlling policy is `kinds::descriptor`. Each of the 104 published
 PKCS #11 3.2 function-table slots has an explicit `SlotSemantics` descriptor;
@@ -44,7 +44,7 @@ one entry program per slot, and only template-bearing calls use
 | Value | Policy | Kernel source and guard | Output |
 | --- | --- | --- | --- |
 | Provider module identity | All modes | Module `path`, `dev`, `ino`, whole-file `sha256`, and GNU `build_id` come from operator input, filesystem mapping names/metadata, and the pinned provider file. They are not PKCS#11 call arguments and require no provider-memory pointer dereference. | `capture.modules[]` and `evidence.discovery[]`; filesystem/operator facts only. |
-| Function identity | All modes | Attach cookie indexes a slot from a current memory scan or a trusted operator manifest. Hash pinning binds the selected offsets to the opened bytes; a manifest that the scan cannot corroborate forces `PARTIAL`. No function-name pointer is needed for ordinary calls. | Standard name or an explicit alias group. |
+| Function identity | All modes | Attach cookie indexes a slot from a current memory scan or explicit operator manifest attestation. Hash pinning binds the selected offsets to the opened bytes; a manifest that the scan cannot corroborate forces `PARTIAL`. No function-name pointer is needed for ordinary calls. | Standard name or an explicit alias group. Scan-only, aliased, and ambiguous slots remain count-only. |
 | PID/TID | All modes | `bpf_get_current_pid_tgid`; no user-memory read. | Privileged internal correlation state in every mode; only bounded `trace` output serializes raw PID/TID. Profile and metrics do not publish it. |
 | Cgroup id | All modes | `bpf_get_current_cgroup_id`; no user-memory read. | Numeric id and best-effort host cgroup label. |
 | Discovery skip record | All modes | Scan, pinning, process, and scope losses share one untyped internal record after aggregation. Exact standard function names survive; every other name becomes `discovery subject`. Reasons come only from the five finite categories documented by the v2 schema; unknown/internal reasons become `discovery unavailable`. | `evidence.skipped[]`; never an arbitrary mapped path, numeric PID label, `/proc/<pid>` path, cgroup path, unknown name, or raw error chain. The categorical reason, number of distinct losses, and resulting `PARTIAL` verdict remain intact. |
@@ -128,6 +128,7 @@ metadata pointer into unrelated readable memory.
   emitted `Event` and public render types have no raw-pointer output field.
 - Every kernel read/update failure has evidence that forces `PARTIAL` where it
   can affect attribution.
+- Count-only reduces provider-memory reads and adds no allowlisted field.
 
 ## Release canaries
 

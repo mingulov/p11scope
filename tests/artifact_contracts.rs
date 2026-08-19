@@ -519,6 +519,7 @@ aggregate-only-metrics default metrics"
 
     let lanes = run_ok("sh", &["scripts/verify-canaries.sh", "--self-test"]);
     assert!(lanes.contains("canary lane assertion self-test: OK"));
+    assert!(lanes.contains("scan-only aggregate decoy exposes calls/RVs/latency only: OK"));
     assert!(lanes.contains("raw binary alias scanner self-test: OK"));
     assert!(lanes.contains("unsafe raw template oracle self-test: OK"));
     assert!(lanes.contains("raw policy oracle self-test: OK"));

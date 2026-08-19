@@ -44,6 +44,24 @@ Do not derive function totals by summing mechanism totals: one initialized
 operation can cover several later function calls, and a capture can start in
 the middle of an operation.
 
+## Semantic-join authority
+
+`scan` is bounded heuristic discovery, not semantic acquisition. A
+`manifest` is explicit operator attestation under the Slice 1b-1 contract.
+`hash-pinned` authorizes object bytes and offsets only; it does not make a
+discovered table semantically authoritative.
+
+`corroborated` summarizes whether a comparable `agreed` or `conflict` outcome
+was recorded for the final module. Consumers use the exact
+`corroboration[]` outcome array for decisions. Scan-only rows are aggregate
+observations and never semantic joins. A conflict module is wholly ineligible
+for semantic joins in v2. A public fallback record cannot distinguish a module
+fallback from a dependency fallback, so it never restores semantic eligibility.
+
+Count-only is a reduction in provider-memory reads and adds no allowlisted
+field. Metrics therefore exposes aggregate calls, return values, and latency,
+not descriptor-selected semantic state.
+
 ## Top-level objects
 
 Profile mode always emits:
@@ -124,7 +142,7 @@ per source.
 | `dev`, `ino`, `sha256`, `path`, `build_id` | Identity of the module — same fields, and the same path caveat, as `capture.modules[]`. `sha256` is `null` when nothing pinned the object, never `""`: no digest was taken. |
 | `objects[]` | Every object this module's **planned slots** attach into; a table entry may resolve into a dependency rather than into the module that published it, and an entry that never became a slot is in `skipped` instead. Each carries the same identity fields plus `identity_source` (`"mountinfo"` when the whole `{dev, ino}` was comparable against the mapping, `"stat"` when only the inode was, `"unpinned"` when this capture pinned nothing and compared nothing), `note`, and its own exact canonical `sources`. Object ownership is not inherited from the containing module. |
 | `sources[]` | Exactly `["scan"]`, `["manifest"]`, or `["scan", "manifest"]`, in that canonical order. The same exact arrays apply independently to each `objects[].sources`. |
-| `corroborated` | Whether a second source described the same targets. |
+| `corroborated` | True exactly when at least one comparable `agreed` or `conflict` outcome was recorded for this final module. It is a summary only; consumers use the exact `corroboration[]` array for semantic decisions. |
 | `corroboration[]` | Which §4.12 outcome each source pairing produced — one entry per `--manifest` that named this object, since `--manifest` is repeatable and one outcome must not hide another. Values: `single_source` (no manifest named it), `agreed`, `conflict` (both decoded targets and they differ), `scan_empty` (the scan pinned this object but decoded no table in it — the documented use of `--manifest`, counted as uncorroborated rather than as a disagreement), `uncorroborated` (not mapped in scope, or no scan), `identity_mismatch` (the manifest's freshly opened module object and the target's scan-opened module are different exact objects), and `object_fallback` (the module object itself was stale and `manifest_object_fallbacks[]` names the scan-owned replacement). |
 | `tables[]` | `{version: [major, minor], entries, source}` per function table published, one entry per source that saw it. |
 | `interfaces` | How many interfaces were seen — **the most any one source saw, never the sum across sources**: the scan and a manifest describing one provider each count its interfaces, and each sees a subset (the scan records only an interface whose table it decoded), so this is a lower bound. **Never their names**: those are bytes read out of a provider's memory, and `p11scope inspect` is where they are shown. |

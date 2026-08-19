@@ -420,9 +420,11 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     feasibility evidence; promotion is blocked and the amended no-busy-wait
     campaign is UNRUN. The retained Noble TCG Gate B campaign is
     TIMEOUT/INCOMPLETE because the accepted 150,091-insn program takes 253 s
-    under TCG. The ptrace-free loader event path passed on both kernels;
-    attach-first experiment PASS 160/160 and proves a second owned pause covers
-    hidden-table constructor calls. Task 9 timing catalog was skipped by D3.
+    under TCG. The ptrace-free loader event path passed on both kernels. The
+    attach-first experiment recorded 160/160 for its narrow fixture, but it is
+    historical diagnostic evidence only: non-promotable, zero product attempts,
+    and not proof of generic initial-set or all-export-ABI coverage. Task 9
+    timing catalog was skipped by D3.
     Product implementation remains OPEN and starts only after Slice 1b-1
     lands. See the
     [pause amendment](../specs/2026-08-19-slice1b2-no-busy-wait-pause-amendment.md).**

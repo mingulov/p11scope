@@ -1,0 +1,1302 @@
+# Slice 1b-2 Live Discovery and `run` — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: use
+> `superpowers:subagent-driven-development` to execute this plan task by task.
+> Use `superpowers:test-driven-development` for every behavior change,
+> `superpowers:systematic-debugging` for unexpected results, and
+> `superpowers:requesting-code-review` before each task commit. Do not begin a
+> later task while an earlier task has unresolved review findings.
+
+**Goal:** Discover and attach PKCS#11 providers that appear after capture start,
+without requiring a manifest or executing provider code, and add an owned-child
+`run -- CMD` lane whose explicit pause policy can protect live attachment
+windows without a BPF busy-wait.
+
+**Architecture:** Keep the Slice 1b-1 scan/pin/reconcile/plan pipeline as the
+single identity and table authority. First move static slot semantics into one
+capture-independent frozen `DESCRIPTORS` table selected by the attach cookie;
+then make slot allocation and links additive. A separate `DISCOVERY` ring feeds
+one concrete `discovery::Engine`, which revalidates retained process generations,
+refreshes mappings, reuses the existing bounded scanner and pinning code, and
+adds exact targets to the live session. Loader and export hooks provide event
+timing and ptrace-free table records. Only an owned, unreaped `run` child may be
+paused, and its coordinator follows the approved no-busy-wait amendment with
+one original pidfd and fail-closed cleanup.
+
+**Tech Stack:** Rust 1.88, edition 2024, Linux x86-64, existing `aya = 0.14`,
+`aya-ebpf = 0.2.1`, `object`, `libc`, `signal-hook`, Python 3 contract checkers,
+POSIX/Bash gate scripts, and the retained Jammy 5.15/Noble 6.8 QEMU/KVM assets.
+No new crate is planned.
+
+## Authority and starting state
+
+- Implementation base: `c68aa169672b91ed7a387a17afa282b4afa6d022`
+  (`docs: amend slice 1b-2 pause protocol`), whose parent is the reviewed Slice
+  1b-1 closeout `5f3bd607032057f8d04ced55fcb27ba185193416`.
+- Binding product contract:
+  `docs/superpowers/specs/2026-08-18-slice1b2-corrective-live-discovery-design.md`.
+- Binding pause correction, which supersedes conflicting pause/Gate B wording:
+  `docs/superpowers/specs/2026-08-19-slice1b2-no-busy-wait-pause-amendment.md`.
+- Proposed D3 scope correction, which conservatively implements the recorded
+  D3=`no` decision by removing the timing-catalog promotion requirement while
+  retaining `PARTIAL` completeness, loader/context, and attach-first gates:
+  `docs/superpowers/specs/2026-08-19-slice1b2-d3-scope-amendment.md`.
+- Unchanged architecture facts may be taken from
+  `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust-design.md`;
+  its older timing and pause assumptions are not authoritative.
+- `docs/superpowers/plans/ROADMAP.md` controls phase order and promotion.
+- The historical 120/120 busy-wait campaign and the later 120/120 no-delay
+  outcome-B campaign are feasibility evidence only. Neither is promotable.
+- The historical Task 8 attach-first 160/160 experiment is likewise
+  non-promotable and contributes zero product attempts; it covered a narrower
+  fixture/export-return experiment and is replaced by the frozen Task 9
+  product campaign.
+- Historical research-plan Task 9 timing-catalog work remains owner-declined
+  (`D3 = no`). The product
+  therefore ships no guessed loader tuple. An empty compiled-in catalog is
+  valid: every-hit discovery continues, timing is `unproven`, and completeness
+  remains honestly `PARTIAL` where required.
+
+## Global constraints
+
+1. Preserve `docs/privacy/allowlist-v1.md` until the explicit evidence task;
+   that task may list only the approved aggregate vocabulary and must add
+   matching canary negatives in the same commit.
+2. Preserve scan-only semantic authority: live/scan targets are count-only
+   unless an accepted manifest authorizes the exact final pinned object,
+   offset, and canonical name. Live discovery never promotes semantic authority.
+3. Reuse `ProcessView`, `CaptureWorkBudget`, `PinnedObjects`,
+   `rebuild_discovered`, `AttachPlan`, `SlotSemantics`, and the existing
+   process/object lifecycle checks. Do not add a second scanner, pin cache,
+   manifest model, or process-identity type.
+4. Policy maps remain published, verified, and frozen before the first probe.
+   Only data/lifecycle maps explicitly named by the design remain writable.
+5. One slot space, monotonically allocated up to `MAX_SLOTS = 512`; no slot ID,
+   loader context ID, or pause epoch is reused in one capture.
+6. No new public loader/pause PID/TID/task set, path/digest/build ID for loader/libc,
+   runtime address, pointer, cookie, context ID, signed delta, signal record,
+   marker, interface-name bytes, or per-event loader/pause timeline. The
+   existing separately allowlisted trace PID/TID contract is unchanged.
+7. No pause for `--pid` or `--cgroup`. Omitted `run --pause` is exactly `never`.
+   `auto|always` are not enabled until the corrected Gate B campaign passes.
+8. No new privilege. `/proc/<pid>/mem` denial degrades scan coverage but must
+   not disable ptrace-free loader/export events. Pause uses only the owned
+   child's original pidfd and same-credential signal authority.
+9. Each task begins with a source/caller trace and a witnessed RED before
+   production behavior changes. Each task ends with an independent review,
+   exact final gates, one scoped commit, and a clean status readback.
+10. Do not track generated BPF objects, VM images, logs, evidence, or reports
+    under `.superpowers/sdd`. Private campaign evidence remains outside Git.
+11. Privileged, VM, or container commands run only at the task that names them,
+    after an unprivileged review checkpoint, explicit owner approval for that
+    lane, and using new output paths. Without approval the lane is `UNRUN` and
+    cannot contribute to completion. Both kernel lanes run regardless of the
+    first result; no rerun-until-green.
+12. Every task must leave these commands green unless its own RED is being
+    captured:
+
+```sh
+cargo +1.88 fmt --all -- --check
+cargo +1.88 check --locked --workspace --all-targets
+cargo +1.88 test --locked --workspace --all-targets
+cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+## Dependency graph and checkpoints
+
+```text
+Task 0 approve the D3 scope amendment and this plan
+  -> Task 1 corrected isolated A/B candidate
+  -> Task 2 A/B kernel campaign (pause promotion gate)
+
+Task 3 descriptor/cookie static migration
+  -> Task 4 dynamic slots and links
+Task 2 reviewed PASS + Task 4
+  -> Task 5 production discovery ABI/BPF
+  -> Task 6 loader contexts and discovery engine
+  -> Task 7 owned run child and pause coordinator (requires Task 2 PASS)
+  -> Task 8 capture loops, evidence, privacy, and doctor
+  -> Task 9 product/provider/kernel integration
+  -> Task 10 final multi-artifact review and local integration
+```
+
+Tasks 3–4 may be implemented while a reviewed Task 2 campaign is running. Task
+5 and every later task require an independently reviewed Task 2 PASS because
+the production BPF inventory includes the pause path. A non-PASS leaves only
+the already-existing research evidence and any completed static refactor; it
+adds no dormant `auto|always` code and cannot complete Slice 1b-2.
+
+## Task 0: Approve the D3 scope amendment and implementation plan
+
+**Purpose:** Remove the only contradictory promotion boundary before source
+implementation.
+
+**Files:**
+
+- Add: `docs/superpowers/specs/2026-08-19-slice1b2-d3-scope-amendment.md`
+- Add: `docs/superpowers/plans/2026-08-19-slice1b2-production.md`
+- Modify: `docs/superpowers/plans/ROADMAP.md`
+
+- [ ] Independently review the D3 amendment against the corrective design,
+  research decision, retained Task 6–8 evidence, privacy contract, and ROADMAP.
+- [ ] Confirm the replacement critical path is: mandatory product-shaped
+  ptrace-free every-hit/context preflight, 480-primary-plus-40-fallback
+  both-kernel attach-first campaign, corrected A/B campaign, and
+  production/provider/kernel gates; the 480-attempt relocation-witness catalog
+  remains dormant.
+- [ ] Confirm an empty catalog leaves timing `unproven`,
+  `initial_set_capture.none`, and final `PARTIAL`; attach-first success protects
+  only an observed live window and creates no replacement timing proof.
+- [ ] Independently review this plan for task dependency, executable RED/GREEN
+  boundaries, file/caller accuracy, lifecycle/privacy coverage, and YAGNI.
+- [ ] Resolve every finding, correct the historical attach-first disposition in
+  ROADMAP, run document consistency/placeholder/fence/diff checks, and commit
+  exactly these three documentation files before Task 1.
+
+Commit message: `docs: plan slice 1b-2 live discovery`
+
+## Task 1: Correct and freeze the isolated A/B candidate
+
+**Purpose:** Replace both historical Gate B protocols with the exact approved
+no-busy-wait state machine while preserving the flat-initializer Gate A.
+
+**Files:**
+
+- Modify: `spike/slice1b2-kernel/common.rs`
+- Modify: `spike/slice1b2-kernel/ebpf/src/main.rs`
+- Modify: `spike/slice1b2-kernel/src/main.rs`
+- Modify: `spike/slice1b2-kernel/run.sh`
+- Modify only if the concurrent return-marker contract requires it:
+  `spike/slice1b2-kernel/fixture.c`
+- Preserve: `spike/slice1b2-kernel/check-init-shape.py` semantics and the exact
+  four-map/six-program inventory
+
+### Step 1: Freeze the RED contract
+
+- [ ] Trace every producer, record decoder, owner transition, child-guard exit,
+  validator branch, and shell lifecycle caller before editing.
+- [ ] Add source/object guards that reject `STOP_SIGNAL_DELAY_POLLS`, any loop,
+  backward edge, busy wait, or unapproved helper between winner CAS and
+  terminal ring submit. Permit only the exact clock read and winner's sole
+  signal helper; require `ktime` immediately before that helper.
+- [ ] Add deterministic state-machine tests for:
+  - reservation failure consuming no `ARMED` authorization;
+  - accepted owner state recorded before every fallible userspace action;
+  - Outcome A: one winner, one coalesced record, one attach closure, one resume;
+  - Outcome B: first owner closes, successor is pre-armed while all tasks remain
+    stopped, first owner resumes, deferred hook wins owner 2, then a second full
+    closure and second resume;
+  - successor consumption before the first resume is lifecycle FAIL;
+  - accepted owner-2 confirmation timeout or cancellation retains and performs
+    its original-pidfd resume obligation;
+  - cancellation after successor pre-arm/resume but before decode treats the
+    successor as unresolved, removes authorization, and performs the one
+    separately recorded protective resume before kill/reap;
+  - monotonic deadline checked before dequeue, immediately after dequeue/decode,
+    and against the record timestamp;
+  - rejected helper request removes authorization, drains through deadline plus
+    one empty read, performs no `SIGCONT`, and does not rearm that child;
+  - an ordinary failed `auto` epoch becomes sticky partial and cannot accept a
+    delayed record into a later epoch;
+  - Ctrl-C, SIGTERM, timeout, attach failure, malformed record, ring loss,
+    duplicate winner, unknown record, resume failure, and guard drop all run
+    non-short-circuiting cleanup;
+  - exactly one original-pidfd resume per accepted stop plus at most one distinct
+    protective successor resume in the amendment's exact unresolved state;
+  - Rust runner and Python/shell validator reject the same mutated branch,
+    lifecycle, timing, and inventory facts;
+  - coalesced-before-winner arrival uses only a provisional deadline and is
+    revalidated against the winner-relative deadline;
+  - teardown order is detach -> bounded drain/decode -> authorization removal
+    -> ledger-authorized protective resume -> kill/reap;
+  - final `START` empty and every link detached.
+- [ ] Add semantic-export mutations for every finite category and both valid
+  outcome branches. Preserve `TIMEOUT/INCOMPLETE` as distinct from canonical
+  runner FAIL and environment failure.
+- [ ] Freeze private `SignalRecord.send_signal_rc == i64::MIN` as exactly
+  coalesced/no-helper; zero is accepted helper request and every other value is
+  the real signed helper return. No validator may infer this from case order.
+
+Run the focused suite and retain the failures before production edits:
+
+```sh
+cargo +1.88 test --locked --manifest-path spike/slice1b2-kernel/Cargo.toml \
+  -- --nocapture
+```
+
+Expected RED: the retained busy-wait/source contract, owner-2 cleanup, causal
+deadline, and one-winner/one-resume oracle cannot satisfy the new assertions.
+
+### Step 2: Implement the minimum corrected protocol
+
+- [ ] Keep the four maps `EVENTS`, `DISCOVERY`, `START`, `COUNTERS`, the six
+  programs, 896-byte record, 104/16 bounds, and flat 112-store initializer.
+- [ ] Reuse the disjoint Gate B group key in `START`; do not add a fifth map.
+- [ ] Implement reserve/init -> CAS -> `ktime` -> one helper -> straight stores
+  -> submit, with no post-signal spin or wait.
+- [ ] Represent exactly one current owner and one successor authorization in
+  userspace. Store no raw process identity in exported evidence.
+- [ ] Mark accepted-stop cleanup responsibility before any fallible sample,
+  drain, attach, detach, marker, or evidence operation.
+- [ ] Make cleanup idempotent and non-short-circuiting: resume obligations,
+  link detach, owner removal, kill/reap, evidence close, VM cleanup, and final
+  status are each attempted and each result retained.
+- [ ] Use one absolute 100 ms winner-relative deadline per accepted cycle; the
+  second record never resets it.
+- [ ] Keep the fixture genuinely concurrent. A serialized/barrier-only control
+  may diagnose scheduling but cannot satisfy the campaign oracle.
+
+### Step 3: Verify and review before any VM
+
+```sh
+cargo +1.88 fmt --manifest-path spike/slice1b2-kernel/Cargo.toml --all -- --check
+cargo +1.88 check --locked --manifest-path spike/slice1b2-kernel/Cargo.toml --all-targets
+cargo +1.88 test --locked --manifest-path spike/slice1b2-kernel/Cargo.toml
+cargo +1.88 clippy --locked --manifest-path spike/slice1b2-kernel/Cargo.toml \
+  --all-targets -- -D warnings
+bash -n spike/slice1b2-kernel/run.sh
+```
+
+- [ ] Run the locked BPF build into a new private directory and apply
+  `check-init-shape.py`, exact map/program inventory, `llvm-objdump -dr`, and
+  the no-busy-wait semantic guard.
+- [ ] Compile the fixture with `-Werror`, run its self-check, and inspect the
+  protected call sites with `objdump -dr`.
+- [ ] Request an independent source/lifecycle review. Fix all Critical,
+  Important, and Minor findings with new RED/GREEN evidence.
+- [ ] Commit the reviewed source once. Freeze source archive, manifest, BPF,
+  host runner, fixture, validator, common ABI, caps, timeouts, and oracle hashes.
+
+Commit message: `spike: correct slice 1b-2 pause protocol`
+
+## Task 2: Run the amended A/B kernel campaign
+
+**Purpose:** Decide whether `auto|always` may enter product implementation.
+This task changes no source after the candidate freeze.
+
+**Private outputs:** one new mode-0700 campaign root outside Git, with one
+manifest binding every source/tool/binary/kernel/oracle dependency.
+
+### Step 1: Preflight
+
+- [ ] Obtain explicit owner approval for the VM/root campaign immediately
+  before execution. Without it, record Task 2 `UNRUN` and stop the pause path.
+- [ ] Verify clean candidate commit, exact frozen hashes, signed/retained VM
+  bases, QEMU identity, SSH host keys, backing chains, lifecycle lock, free
+  space, and absence of QEMU/NBD/listeners.
+- [ ] Provision/build one fresh guest bundle if the frozen candidate bytes are
+  not already guest-built. Verify shutdown, base immutability, qemu-img, and
+  post-space before campaign use.
+- [ ] Do not modify a timeout, cap, fixture, validator, or oracle after freeze.
+
+### Step 2: Run every predeclared lane
+
+- [ ] Gate A once on Jammy 5.15 and once on Noble 6.8, identical final A/B
+  bytes. Require four accepted verifier records, five exact cases, four maps,
+  canonical status, bounded logs, privacy, and empty `START`.
+- [ ] Gate B exactly three cold boots x 20 fresh children on Jammy and the same
+  on Noble. Both kernels run even if the first lane fails.
+- [ ] Each child must classify exclusively as Outcome A or Outcome B and satisfy
+  its full causal, attach, marker, resume, cleanup, and record inventory.
+- [ ] Preserve every first failure and every negative. Do not replace a failed
+  row, mix accelerator identities, or rerun until a preferred branch appears.
+
+Use only the reviewed `run.sh` public lifecycle commands. A representative
+shape is:
+
+```sh
+bash spike/slice1b2-kernel/run.sh gate-a-lane jammy "$BUNDLE" "$RUN" "$EXPORT"
+bash spike/slice1b2-kernel/run.sh gate-b-lane jammy "$BUNDLE" "$RUN" "$EXPORT"
+```
+
+### Step 3: Independent campaign review
+
+- [ ] Recompute hashes, program/map/verifier cardinalities, all 120 Gate B
+  predicates, privacy, cleanup, and base/bundle immutability independently.
+- [ ] PASS requires both Gate A lanes and all six Gate B lanes. Any timeout,
+  incomplete evidence, lifecycle error, oracle mismatch, or unclassified child
+  is non-PASS.
+- [ ] Record the exact disposition in the note and ROADMAP without rewriting
+  historical evidence.
+
+No product commit is made here. A reviewed PASS unlocks Task 5 and the rest of
+the production path. A non-PASS stops that path; it does not authorize a
+reduced or dormant pause implementation.
+
+## Task 3: Migrate static attachment to descriptor cookies
+
+**Purpose:** Make later dynamic slots possible without changing current static
+capture behavior.
+
+**Files:**
+
+- Modify: `crates/ebpf-common/src/lib.rs`
+- Modify: `crates/ebpf/src/main.rs`
+- Modify: `src/kinds.rs`
+- Modify: `src/plan.rs`
+- Modify: `src/attach.rs`
+- Modify: `scripts/check-bpf-map-defs.py`
+- Modify: `scripts/verify-canaries.sh`
+- Modify: `scripts/verify-induced-gaps.sh`
+- Modify: `tests/artifact_contracts.rs`
+
+### Step 1: Write RED ABI and behavior tests
+
+- [ ] Freeze `DESCRIPTORS[0] == SlotSemantics::COUNT_ONLY` and one descriptor
+  for each canonical published function, with no capture-dependent contents.
+- [ ] Freeze attach-cookie layout:
+
+```rust
+pub const fn attach_cookie(slot: u32, descriptor: u32) -> u64 {
+    u64::from(slot) | (u64::from(descriptor) << 32)
+}
+pub const fn cookie_slot(cookie: u64) -> u32;
+pub const fn cookie_descriptor(cookie: u64) -> u32;
+```
+
+  These helpers define `SlotAttachCookie` semantics only. The loader context
+  cookie has the unrelated §7.3 bit layout and must use separately named
+  encode/decode functions in `discovery::loader`; neither decoder is reused by
+  the other program family.
+
+- [ ] Test round trips at zero and maxima, out-of-range descriptor fail-closed
+  to `COUNT_ONLY`, and slot indices unchanged in `STATS`, `RV_COUNTS`, `START`,
+  and `Event.slot`.
+- [ ] Test exact canonical-name descriptor selection, agreeing aliases, unknown
+  names, conflicting aliases, and scan-only targets. Scan-only remains
+  count-only regardless of a known function name.
+- [ ] Test map publication/readback/freeze occurs before every attachment and
+  no `SLOT_SEMANTICS` map remains in the object or artifact contracts.
+- [ ] Run current planner, metrics, semantics, trace, manifest, and attach tests
+  as RED against the absent API/map.
+
+### Step 2: Perform the static-only migration
+
+- [ ] Reuse `SlotSemantics`; do not introduce a parallel descriptor struct.
+- [ ] Add a stable descriptor index to `Slot`. Build the fixed descriptor slice
+  once in `kinds.rs`; index 0 is count-only.
+- [ ] Replace `SLOT_SEMANTICS` with fixed `DESCRIPTORS`. Publish every entry,
+  read it back, and freeze it in `Session::start_inner` before program attach.
+- [ ] Decode slot and descriptor independently in BPF. Unknown descriptor index
+  yields count-only semantics without changing aggregate counting.
+- [ ] Encode both indices at the existing entry/return attach sites. Keep the
+  static `AttachPlan`, attachment order, failure accounting, and output exact.
+
+### Step 3: Verify and review
+
+```sh
+cargo +1.88 test --locked --lib kinds
+cargo +1.88 test --locked --lib plan
+cargo +1.88 test --locked --lib attach
+cargo +1.88 test --locked --test artifact_contracts
+```
+
+- [ ] Run all global gates and the existing unprivileged canary/checker
+  self-tests.
+- [ ] Independently review ABI compatibility, policy-map freeze ordering,
+  fail-closed descriptor handling, semantic authority, and absence of dynamic
+  behavior in this commit.
+
+Commit message: `refactor: select slot descriptors by attach cookie`
+
+## Task 4: Extend `AttachPlan` with monotonic slots and link lifecycle
+
+**Purpose:** Allow exact targets discovered later to attach without reloading the
+BPF object or mutating a frozen policy map.
+
+**Files:**
+
+- Modify: `src/plan.rs`
+- Modify: `src/attach.rs`
+- Modify: `src/metrics.rs`
+- Modify: `src/semantics.rs`
+- Modify: `src/trace.rs`
+- Modify: `tests/multi_module.rs`
+
+### Step 1: Freeze runtime invariants with RED tests
+
+Extend the existing plan; do not add a peer slot table, trait, or alternate
+planner:
+
+```rust
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub struct AttachKey {
+    pub object: PinnedObjectId,
+    pub file_offset: u64,
+}
+
+// Private implementation detail of AttachPlan.
+// exact key -> monotonically allocated slot; retired slots remain reserved
+```
+
+- [ ] Test initial `AttachPlan` insertion preserves today's indices and reports.
+- [ ] Test a later exact key receives the next slot and attaches one entry/return
+  pair with the encoded descriptor cookie.
+- [ ] Test an existing key is never attached twice; names/module ownership merge
+  into its userspace metadata only.
+- [ ] Test a module that would cross `MAX_SLOTS` is refused whole and no prefix
+  is attached.
+- [ ] Test a shared target changes to count-only/module-ambiguous, purges all
+  semantic state for every affected process/module, and leaves aggregate counts.
+- [ ] Test a failed return attach suppresses its entry attach and produces one
+  exact finite failure; another module can still attach.
+- [ ] Test retire detaches every link for the affected module/key, purges state,
+  never reuses the slot, and preserves already-collected aggregate counters.
+- [ ] Test `Session::detach_producers` and `Drop` detach static, dynamic, loader,
+  and export links without short-circuiting after one failure.
+- [ ] Test metrics/trace lookup works for slots added after capture start and an
+  unknown slot stays count-only/unattributed.
+
+### Step 2: Split load from additive attachment
+
+- [ ] Extend `AttachPlan` with one private `BTreeMap<AttachKey, usize>` and
+  monotonic retired-slot set. At 512 entries this needs no dependency, cache,
+  peer planner, or new module.
+- [ ] Add one transactional `AttachPlan::extend_exact` operation that validates
+  capacity, identity, ownership, descriptors, and every target before mutating
+  the plan, and returns the finite attachment/retirement delta.
+- [ ] Refactor `Session::start` into a policy/load phase and an additive
+  `attach_plan`/`attach_targets` phase. Keep a wrapper that performs both for the
+  existing static callers until Task 8 moves them.
+- [ ] Store every Aya link ID needed for precise retirement and terminal detach.
+  Never rely on numeric PID or a reopened path; attach via retained pinned fds.
+- [ ] Keep slot allocation in userspace. Dynamic data-map keys may appear after
+  freeze; descriptor/policy maps may not.
+- [ ] Add `State::sync_plan`/`purge_modules` and `Tracer::sync_plan` using the
+  same `AttachPlan` snapshot. Do not create a second slot-to-module index.
+- [ ] On exact shared-target ambiguity, mark both module owners incomplete and
+  purge semantic state before accepting another event through that slot.
+
+### Step 3: Verify static equivalence and dynamic behavior
+
+```sh
+cargo +1.88 test --locked --lib plan
+cargo +1.88 test --locked --lib attach
+cargo +1.88 test --locked --test multi_module
+cargo +1.88 test --locked --lib semantics
+cargo +1.88 test --locked --lib trace
+```
+
+- [ ] Run the existing attach-evidence unit/integration tests without privileged
+  attachment and prove the initial static report is byte-for-byte unchanged.
+- [ ] Independently review slot non-reuse, capacity atomicity, link ownership,
+  shared-target purge, frozen-map ordering, and terminal cleanup.
+
+Commit message: `refactor: support additive live attachment slots`
+
+## Task 5: Add the production discovery ABI and BPF programs
+
+**Purpose:** Emit bounded loader/export/exec facts and pause requests from the
+production object while keeping all private bytes out of public output.
+
+**Promotion prerequisite:** Task 2 independently reviewed PASS. Do not add an
+unproved dormant pause program or `PAUSE_PIDS` map.
+
+**Files:**
+
+- Modify: `crates/ebpf-common/src/lib.rs`
+- Modify: `crates/ebpf-common/Cargo.toml`
+- Modify: `crates/ebpf/src/main.rs`
+- Modify: `crates/ebpf/Cargo.toml`
+- Modify: `build.rs`
+- Modify: `src/events.rs`
+- Modify: `src/scope.rs`
+- Modify: `src/attach.rs`
+- Add: `scripts/check-live-discovery-object.py`
+- Modify: `scripts/check-bpf-map-defs.py`
+- Modify: `tests/artifact_contracts.rs`
+
+### Step 1: Define and RED-test one bounded ABI
+
+- [ ] Add one `#[repr(C)]`, 896-byte, alignment-8 `DiscoveryRecord` shared by
+  product host/eBPF. Freeze every field offset, 104 pointer words, 16 interface
+  records/classes, and all reserved-zero bytes.
+- [ ] Add finite record kinds for loader, function-list return, interface-list
+  return, interface return, exec, and exit. Unknown kinds fail decoding and
+  increment userspace `discovery_truncated` once.
+- [ ] Preserve status bits: `0x01 = read_failure`,
+  `0x02 = coalesced_no_helper`, `0x04 = loader_context_invalid`. Unknown bits
+  are malformed/truncated, never ignored.
+- [ ] Add exact kernel counter indices for ring loss, export state failures,
+  export bounded-read failures, loader hits, and loader state-read failures.
+  Do not reuse call-event `EVIDENCE` cells.
+- [ ] Test signed helper return encoding, source/host record decode, short/long
+  rejection, all-zero reserved fields, truncation limits, and no raw value
+  renderer path.
+- [ ] Add a product-object initializer guard that fails before implementation:
+  every reservation path must have exactly 112 aligned volatile zero stores for
+  offsets `0..=888`, no duplicate/narrow spill, no initializer call/back-edge,
+  no field read before completion, and submit last. It must scope itself to the
+  record reservation/use region rather than reject unrelated ELF `memset`.
+
+### Step 2: Add maps and programs without enabling userspace pause
+
+- [ ] Add `DISCOVERY` (64 KiB ring), export entry-state map, discovery counters,
+  and `PAUSE_PIDS`. Keep `PAUSE_PIDS` writable; it is authorization data, not
+  capture policy. Add the static pause-enabled config bit only at load time.
+- [ ] Change `PID_FILTER` values from `u8` to nonzero `u64` capture-generation
+  tokens, preserving the existing key/capacity. Non-pause PID scopes use the
+  fixed token `1`; an owned `run` session allocates one nonzero token and binds
+  it privately to its retained original `PidPin`.
+- [ ] Freeze `PauseKey` as `#[repr(C)] { tgid: u32, pad: u32,
+  generation_token: u64 }` and `PAUSE_PIDS` as
+  `HashMap<PauseKey, u64>` with capacity one; values remain exactly
+  `ARMED = 1` or `REQUESTED = 2`. BPF obtains the token from the already scoped
+  current-TGID `PID_FILTER` lookup and must match the full pause key before CAS.
+  Userspace revalidates the bound `PidPin` immediately before insertion and
+  after record decode, removes authorization and detaches pause-capable links
+  before reap, and never reuses the token in one capture. No token map, token
+  record field, or public epoch is added.
+- [ ] Thread the token through one narrow API:
+  `Session::start(..., pause_generation: Option<NonZeroU64>)` passes it to
+  `scope::publish`, stores it privately, and `Session::arm_pause` constructs the
+  full key from that stored value rather than accepting another token. Existing
+  callers pass `None` and publish PID token `1` with pause disabled; only owned
+  `run` passes `Some`.
+- [ ] RED-test exact PID_FILTER readback equals the Session token, `PauseKey.pad`
+  is zero, and full-key equality is required. A zero or mismatched token must
+  perform no CAS, signal helper, or record submission; authorization removal
+  uses the same full key.
+- [ ] Add the pause-enabled `CONFIG` bit through `src/scope.rs`, read it back,
+  and include every new frozen policy map in `src/attach.rs`'s exact freeze
+  inventory. Unknown bits or missing/unfrozen policy maps fail load.
+- [ ] Implement loader every-hit uprobe with the §7.3 cookie/IP/state path:
+  zero cookie rejected before lookup; absent-state sentinel and present zero
+  delta remain distinct; `bpf_get_func_ip` plus x86-64 RIP fallback; optional
+  one 4-byte `r_state` read at exact `+24`; invalid context sets `0x04` and
+  performs no state arithmetic/read.
+- [ ] Increment scoped loader hits before ring reservation. Count only actual
+  state-address/helper read failures in loader state-read failures; cookie or
+  registry failures belong to context/truncation accounting instead.
+- [ ] Keep loader-cookie decode separate from slot-cookie decode. The loader
+  path has no BPF context registry map: the cookie carries bounded arithmetic
+  inputs, while userspace validates the monotonic registry shell after decode.
+- [ ] Implement separate entry/return programs for function-list,
+  interface-list, and interface ABIs. Entry state is no-overwrite and cleaned on
+  every return. Read only successful outputs, at most 104 function pointers,
+  at most 16 interfaces, and only enough interface-name bytes to classify then
+  discard them.
+- [ ] Reuse `discovery::hooks::HookRegistry` for standard, NSC/FC, and explicit
+  `--hook-symbol` names/ABI selection. Do not add another symbol registry in
+  BPF or userspace.
+- [ ] Add exec/leader-exit records needed by run/cgroup lifecycle. Exit cleanup
+  does not establish process identity and never authorizes numeric-PID reuse.
+- [ ] Implement the amendment's reserve/init/CAS/timestamp/helper/submit pause
+  path, but leave userspace `PAUSE_PIDS` empty in this task. No copied delay,
+  post-signal polling, or hidden rearm logic.
+- [ ] Use the frozen-nightly-supported `core::intrinsics::atomic_cxchg` pattern
+  already proved by the research artifact and require `cmpxchg_64` in
+  disassembly. Do not add `target-cpu=v3` or emulate CAS in userspace.
+- [ ] Add a `small-discovery-ring` test build wired through both eBPF manifests
+  and the existing build script; do not add a runtime sizing option.
+
+### Step 3: Prove source/object shape before runtime use
+
+```sh
+cargo +1.88 test --locked -p p11scope-ebpf-common
+cargo +1.88 test --locked --test artifact_contracts
+cargo +1.88 check --locked --workspace --all-targets
+```
+
+- [ ] Locked nightly BPF build passes the semantic 112-store guard on every
+  production discovery emitter, exact ABI/map/program inventory, helper and
+  bounded-loop disassembly assertions, and no-busy-wait guard.
+- [ ] Run the one object validator explicitly:
+
+```sh
+python3 scripts/check-live-discovery-object.py --self-test
+python3 scripts/check-live-discovery-object.py \
+  --object "$BPF_OBJECT" --manifest "$BPF_INVENTORY"
+```
+
+  It owns the 112-store region check, exact map/program/ABI/helper inventory,
+  cookie namespaces, bounded loops, `cmpxchg_64`, and no-busy-wait assertions.
+- [ ] Unit-test export state failure, read failure, truncation, invalid cookie,
+  missing cookie, coalesced/no-helper, and ring reservation loss independently.
+- [ ] Independently review verifier safety, unsafe-block scope, helper ordering,
+  map mutability, counter ownership, privacy, and the lack of userspace arming.
+
+Commit message: `feat: emit bounded live discovery records`
+
+## Task 6: Bind loader contexts and build the incremental discovery engine
+
+**Purpose:** Turn private discovery records into exact pinned targets and
+additive attachments by reusing the Slice 1b-1 pipeline.
+
+**Files:**
+
+- Create: `src/discovery/loader.rs`
+- Create: `src/discovery/engine.rs`
+- Modify: `crates/manifest/src/elf.rs`
+- Modify: `crates/manifest/tests/elf.rs`
+- Modify: `src/discovery/mod.rs`
+- Modify: `src/discovery/scan.rs`
+- Modify: `src/discovery/identity.rs`
+- Modify: `src/events.rs`
+- Modify: `src/attach.rs`
+- Modify: `src/main.rs`
+- Modify: `tests/discovery_scan.rs`
+- Create: `tests/live_discovery.rs`
+
+### Step 1: RED-test the exact loader registry
+
+Use one fixed-capacity concrete registry, not a generic arena:
+
+```rust
+const MAX_LOADER_CONTEXTS: usize = 256;
+
+struct LoaderContext {
+    // immutable payload: generation, exact pinned loader, hook/state vaddrs
+    // mutable shell: prepared | attached(link) | tombstoned
+}
+```
+
+- [ ] Test monotonic IDs 1..=256, no reuse after detach/tombstone, and the 257th
+  context refusing with one `discovery_truncated` contribution.
+- [ ] Add only the missing ELF facts to the existing manifest ELF parser:
+  direct PT_INTERP bytes and a defined symbol's link-time virtual address.
+  Reuse existing `exports_matching`/`symbol_file_offset`; do not add a second
+  ELF module or reread the file once per fact.
+- [ ] Test cookie examples exactly: absent state/context 1 -> `512`, present
+  zero delta/context 1 -> `256`, zero invalid, signed positive/negative delta
+  round trips, and overflow refusal.
+- [ ] Test `prepared -> attached -> tombstoned -> removed` ordering; detach link,
+  tombstone, drain queued records, then remove. A queued old record can never
+  resolve as a new context.
+- [ ] Test generation, loader mapping, pinned identity, hook-IP formula, and
+  actual mapped companion-libc binding at event time. Any mismatch is one
+  finite truncated/context failure and no scan/attach action.
+- [ ] Freeze an empty compiled-in timing catalog. Unknown/current tuples remain
+  `unproven`; they still use every-hit discovery. Do not add runtime config,
+  package-name matching, version matching, or public catalog identity.
+
+### Step 2: RED-test the engine as one direct state machine
+
+- [ ] Construct engine tests from real `ProcessView`, `ScanInput`,
+  `PinnedObjects`, and fixture mappings. Synthetic records may drive scheduling,
+  but table/object/plan results must come from the real scanner/pinner/planner.
+- [ ] Test an initial scan plan attaches once, then a fixture `dlopen`/export
+  record produces only the new exact module/targets.
+- [ ] Test duplicate loader/export hits are idempotent and never move the
+  earliest causal timestamp later.
+- [ ] Test a known pinned object exposing an additional table/target set later
+  attaches only the delta and records the changed live surface without
+  reallocating or double-attaching prior keys.
+- [ ] Test ptrace-denied scan with a valid export record still pins mapped
+  objects and attaches count-only targets; scan unavailability remains visible.
+- [ ] Test scan/live agreement, conflict union, manifest exact authority, and
+  live targets remaining count-only.
+- [ ] Test ring loss, malformed record, read failure, state failure, context
+  failure, capacity, attach failure, zero modules, and unknown loader all make
+  the right sticky completeness loss without aborting safe discovery.
+- [ ] Test cgroup view addition/removal and named-PID generation change. Every
+  per-view action checks the retained generation before and after reads/attach.
+- [ ] Test a later raw-key/full-identity collision prospectively before commit.
+  If it would invalidate an already attached `PinnedObjectId`, retire and
+  detach the complete affected module/key set, purge semantic state, publish
+  ambiguity/PARTIAL, and never reuse slots. It must not silently remap a live
+  attachment or let receiver order choose authority.
+- [ ] Test a later exact shared target performs the Task 4 ambiguity purge but
+  remains attached once for aggregate counting.
+- [ ] Test capture-wide scan/hash/table/interface/process/context/slot budgets
+  are cumulative across initial, periodic, and event-triggered work. A new
+  event never renews a budget.
+
+### Step 3: Implement the minimum engine
+
+- [ ] Mechanically move the existing `Discovered` state,
+  `rebuild_discovered`, stale-view retirement, manifest-input handling, and
+  final-ID binding from `main.rs` into `discovery::Engine` first, with existing
+  tests unchanged. Extend that one path; do not wrap or duplicate it.
+- [ ] `DiscoveryDrain` decodes and drains only `DISCOVERY`; it does not share
+  malformed/loss ownership with call events.
+- [ ] `Engine` directly owns retained views, pristine scan inputs, manifests,
+  loader registry, cumulative `CaptureWorkBudget`, the one extended
+  `AttachPlan`, earliest causal timestamps, and sticky discovery completeness.
+  `Session` owns only Aya link lifecycles and applies deltas returned by that
+  plan. Do not create source traits, a peer slot table, or a second public
+  module model.
+- [ ] On every valid loader hit: revalidate context/generation, refresh maps,
+  pin exact new mapped candidates, attach standard export hooks, and invoke the
+  bounded scanner when available. Do not gate event handling on `RT_CONSISTENT`.
+- [ ] On every valid export record: resolve pointers against a fresh mapping
+  snapshot, pin every target object exactly, lower into existing scanned/manifest
+  shapes, reconcile, plan, and attach only the delta.
+- [ ] Periodically scan newly observed cgroup views within the existing 256-view
+  cap. PID scope remains one generation and does not follow forks.
+- [ ] Compute per-module attach gap from earliest causal event to the timestamp
+  immediately after the last required successful attach. Loss makes it `null`;
+  a later event never substitutes the missing start.
+- [ ] Keep identity merge transactional: apply an incoming pin set to a clone,
+  determine retirements/remaps first, then detach/purge and commit. Never call a
+  destructive `absorb` on live state before deciding the effect on attachments.
+
+### Step 4: Verify and review
+
+```sh
+cargo +1.88 test --locked --lib discovery
+cargo +1.88 test --locked --test discovery_scan
+cargo +1.88 test --locked --test live_discovery
+cargo +1.88 test --locked --test manifest_pinning
+cargo +1.88 test --locked --test multi_module
+```
+
+- [ ] Run all global gates, checker/canary self-tests, and the locked product
+  BPF shape guards.
+- [ ] Independently review identity transactionality, exact-ID authority,
+  cumulative budgets, stale-view retirement, idempotence, causal timestamps,
+  dynamic link cleanup, and public privacy.
+
+Commit message: `feat: attach providers from live discovery events`
+
+## Task 7: Add the owned-child `run` lifecycle and pause coordinator
+
+**Promotion prerequisite:** Task 2 independently reviewed PASS. If it is not
+PASS, this task is `UNRUN`; do not add dormant `auto|always` code.
+
+**Files:**
+
+- Create: `src/run.rs`
+- Create: `src/discovery/pause.rs`
+- Modify: `src/process.rs`
+- Modify: `src/discovery/mod.rs`
+- Modify: `src/attach.rs`
+- Modify: `src/cli.rs`
+- Modify: `src/lib.rs`
+- Modify: `src/main.rs`
+- Create: `tests/run_lifecycle.rs`
+- Create: `tests/pause.rs`
+
+### Step 1: RED-test original-pidfd child ownership
+
+- [ ] Add `PidPin` methods for same-generation signal-authority probe and signal
+  delivery through its retained original pidfd. Do not expose the fd or add a
+  numeric-PID signal fallback.
+- [ ] Test child fork, `setsid`, private pre-exec barrier, exact exec errno/127,
+  normal exit status, signal -> `128 + signal`, wait/reap, duration timeout,
+  process-group TERM then KILL, first/second Ctrl-C, and SIGTERM forwarding.
+- [ ] Test PATH-resolved direct ELF, absolute ELF, shebang, retargeted executable,
+  and exec-chain cases. A direct ELF whose pinned executable/PT_INTERP
+  revalidates after exec may pre-arm the exact loader hook; every empty-catalog
+  case still records `initial_set_capture = none` and `PARTIAL`.
+- [ ] Test a PID-reuse/generation mismatch prevents the next child action.
+- [ ] Test every failure after fork closes barrier fds and kills/reaps the owned
+  child; every failure after an accepted stop also performs the exact resume
+  obligation first.
+- [ ] Test `child_still_running` is true only when duration ends and the child is
+  deliberately left running; it is absent from non-`run` output. Before the
+  observer returns, every pause authorization/owner is closed, the child is not
+  stopped, and observer links/maps are detached even though the child is not
+  reaped by this command.
+
+### Step 2: RED-test the amendment as a pure coordinator
+
+Use injected monotonic clock, task-state reader, queue drain, attach action, map
+action, marker, pidfd signal, and cleanup actions. Keep real-fd lifecycle tests
+separate; do not create a framework or async runtime.
+
+- [ ] Omission and `never` create no owner, map entry, signal, or pause counter.
+- [ ] `auto|always` outside an owned `run` child are refused by parsing/caller
+  validation before BPF state changes.
+- [ ] Preflight freezes expected task set and proves original-pidfd signal
+  authority, binds one nonzero capture-generation token, and revalidates the
+  same `PidPin` before inserting the full `{tgid, token}` `ARMED` key or
+  releasing the barrier.
+- [ ] One owner accepts one winner; coalesced records expand only its required
+  attach set. Reservation loss before CAS consumes no authorization but becomes
+  one finite attempt under explicit pause.
+- [ ] Two exact-set/all-`T` snapshots at least 1 ms apart, both no later than the
+  absolute 100 ms deadline, are mandatory. A changed task set, non-T state,
+  `/proc` error, future timestamp, arithmetic overflow, or deadline crossing is
+  finite failure.
+- [ ] Poll task state no more frequently than once per millisecond and never
+  reset the winner-relative deadline after queue delivery or a second record.
+- [ ] While an authorization is `ARMED` or an owner is active, service the
+  discovery queue on a monotonic 1 ms cadence so the ordinary capture refresh
+  interval cannot consume the 100 ms causal budget. This explicit-pause-only
+  polling is the intentional Slice 1b-2 ceiling; add epoll only if later
+  measurement shows it is needed.
+- [ ] After confirmation: drain exact-child records to empty, freeze keys,
+  attach all keys, take a third all-T snapshot, verify marker absent and queue
+  empty, then issue exactly one original-pidfd resume.
+- [ ] Outcome A closes one owner. Outcome B pre-arms exactly one successor while
+  all tasks remain stopped, resumes owner 1, accepts only the other deferred
+  case into owner 2, then repeats the entire closure. No third owner.
+- [ ] Rejected helper, malformed/unknown/duplicate/unaccounted record, ring
+  loss, attach failure, marker race, map error, cancellation, detach failure,
+  resume failure, and child exit cover every amendment cleanup branch.
+- [ ] `auto` non-lifecycle failure safely closes the epoch, increments partial,
+  disables rearming for that child, and remains sticky. `always` returns a
+  required failure after safe resume/owner cleanup, then the owned-child guard
+  terminates and reaps the command. Lifecycle failure is never rendered partial.
+- [ ] `pause_confirmed + pause_partial == pause_attempts` for every normal
+  result and the `none|sigstop|partial` lattice is exact.
+
+Run REDs before implementation:
+
+```sh
+cargo +1.88 test --locked --test run_lifecycle -- --nocapture
+cargo +1.88 test --locked --test pause -- --nocapture
+```
+
+### Step 3: Implement one owner guard and one child guard
+
+- [ ] `OwnedChild` owns barrier, process group, original `PidPin`, wait/reap,
+  timeout, and forwarding. `PauseOwnerGuard` owns the accepted-stop obligation,
+  authorization entry, exact records/keys, links, and resume/cleanup state.
+- [ ] Mark `may_be_stopped` immediately when an accepted helper result is
+  decoded, before any fallible operation.
+- [ ] Cleanup is idempotent and non-short-circuiting. Signal handlers defer to
+  the owner cleanup rather than re-entering it.
+- [ ] `Session` exposes finite `arm_pause`, state read/remove, and discovery
+  queue operations; it does not own child policy.
+- [ ] Insert successor `ARMED` only at the amendment's pre-resume boundary and
+  remove it on resume failure/cancellation. A consumed successor before resume
+  is lifecycle FAIL.
+- [ ] The coordinator calls the Task 6 engine attachment method; it does not
+  duplicate map parsing, scanning, pinning, planning, or link creation.
+
+### Step 4: Verify and review
+
+```sh
+cargo +1.88 test --locked --test run_lifecycle
+cargo +1.88 test --locked --test pause
+cargo +1.88 test --locked --lib process
+cargo +1.88 test --locked --lib cli
+```
+
+- [ ] Run all global gates and locked BPF/source guards.
+- [ ] Independently review every early return, signal path, owner transition,
+  map mutation, deadline read, drain closure, original-pidfd action, kill/reap,
+  link detach, and counter update.
+
+Commit message: `feat: coordinate owned-child live discovery pauses`
+
+## Task 8: Integrate capture loops, CLI, evidence, privacy, and doctor
+
+**Purpose:** Make live discovery and `run` usable while publishing only the
+approved finite aggregate contract.
+
+**Files:**
+
+- Modify: `src/cli.rs`
+- Modify: `src/main.rs`
+- Modify: `src/events.rs`
+- Modify: `src/metrics.rs`
+- Modify: `src/semantics.rs`
+- Modify: `src/trace.rs`
+- Modify: `src/render.rs`
+- Modify: `src/doctor.rs`
+- Modify: `docs/schema/observed-profile-v2.md`
+- Modify: `docs/privacy/allowlist-v1.md`
+- Modify: `scripts/check-capture-evidence.py`
+- Modify: `scripts/verify-canaries.sh`
+- Modify: `tests/artifact_contracts.rs`
+- Add or modify focused CLI/render/doctor integration tests as needed
+
+### Step 1: RED-test the public contract
+
+- [ ] Add `RunArgs` with capture options, `--trace`, exact
+  `--pause never|auto|always`, `--kill-on-timeout`, and `-- CMD ARGS...`.
+  Reject scope flags under `run`, pause under other commands, an empty command,
+  and unknown pause values. Omission equals `never`. This task starts only
+  after reviewed Gate B PASS; before that point `auto|always` do not exist as
+  accepted CLI behavior.
+- [ ] Test profile/metrics/trace final evidence contains exactly:
+  `attach_gap_ms`, `pause`, `pause_attempts`, `pause_confirmed`,
+  `pause_partial`, optional run-only `child_still_running`, four discovery loss
+  counters, and the always-present finite `loader_discovery` aggregate.
+- [ ] Freeze every `loader_discovery` key: strategies
+  `debug_state_every_hit|dlopen_return|unavailable`; both timing groups
+  `qualified_pre_constructor|known_pre_relocation|unproven|none`;
+  `initial_set_capture.eligible|none`; plus `hits` and
+  `state_read_failures`. Every value is u64 and every key is always present.
+- [ ] Test every u64 domain, nullable gap, exact enum, required key, and owner
+  relationship. No duplicate/derived counter and no raw internal identity.
+- [ ] Test strategy/timing/capture counts deduplicate the exact internal process
+  generation plus optional bound tuple once, while `hits` and state-read
+  failures come only from their BPF counters and never received-record counts.
+- [ ] Test `PARTIAL` is sticky for scan-only semantic authority, any unprotected
+  live window, loss/truncation/read/state/context failure, loader fallback or
+  unproven timing, pause partial, attach failure, identity ambiguity, changed
+  provider, zero modules, or initial-set capture none.
+- [ ] With the exact empty catalog, test debug-state timing is `unproven` and
+  both `qualified_pre_constructor`/`known_pre_relocation` counts stay zero.
+  `initial_set_capture.eligible` also stays zero and final output is `PARTIAL`,
+  including after a fully protected observed window.
+- [ ] Test a fully protected exact window removes only its corresponding live
+  gap; it cannot erase another evidence gap.
+- [ ] Test metrics and trace see slots added mid-capture; terminal detach occurs
+  before final drain/snapshot and retains the existing honesty boundary for
+  in-flight callbacks.
+- [ ] Test doctor finite classifications, nonzero requested-lane refusal, and
+  that no BPF program/link/map survives doctor exit.
+- [ ] Freeze doctor rows for loader build `bound|unbound`, debug-state hook
+  `available|unavailable`, per-load timing, loader-state live read, live export
+  reads, memory scan, run initial-set capture, and pause default/arming. Ordinary
+  output never prints the identity/proof behind a row.
+- [ ] Test verifier, helper, ring, export-state/read, loader-state/context,
+  identity, attachment, pause observation, timing arithmetic, resume, detach,
+  cancellation, kill/reap, provenance, validator, timeout, and environment
+  errors retain distinct finite internal/operator categories. Only the exact
+  aggregate owners named by the schema share public counters.
+- [ ] Extend checker/canary mutation suites before renderer changes. Inject raw
+  loader/pause PID/TID/task set into every new aggregate/object location, plus
+  loader/libc path/digest/build ID, addresses, pointers,
+  cookie/context/delta/sentinel, signal record, interface-name bytes, marker,
+  and observer-owned map values; positive controls must be detected first. The
+  checker permits PID/TID only in the pre-existing ordinary call-event trace
+  fields already named by the allowlist, never in loader/pause evidence.
+
+### Step 2: Integrate one polling loop
+
+- [ ] Keep one profile loop and one trace loop. Each tick drains discovery,
+  lets `Engine` extend `AttachPlan` and apply attachment deltas, drains call events,
+  snapshots metrics/counters, and checks retained generations/objects.
+- [ ] `pause=never` keeps the existing refresh cadence. An ARMED/active explicit
+  pause delegates to the coordinator's 1 ms bounded loop and returns to the
+  ordinary capture loop only after owner closure; it never sleeps through an
+  accepted stop.
+- [ ] If Aya borrowing prevents simultaneous ring readers, make each drain own
+  its taken map handle. Do not add threads, channels, epoll, or an async runtime
+  in this slice.
+- [ ] Initial capture still uses `discover_plan`; move its accepted state into
+  `Engine` rather than rescanning/reopening. Manifests stay repeatable exact
+  operator inputs and retain Slice 1b-1 authority/fallback rules.
+- [ ] `run` arms pre-exec loader context before releasing the child barrier when
+  exact PT_INTERP binding is safe. Otherwise it proceeds with
+  `initial_set_capture = none`, sticky `PARTIAL`, and the selected pause policy.
+- [ ] Derive output solely from engine/session/coordinator owners. Discard
+  loader/pause identities before constructing render types.
+
+### Step 3: Update schema, allowlist, checker, and canaries together
+
+- [ ] Document the exact fields/types/owners and completeness lattice in schema
+  v2. Do not publish a new schema ID because v2 is still unpublished.
+- [ ] Add only approved aggregate fields to the privacy allowlist. Preserve the
+  prohibition on object-handle correlation and symbolic CKA values.
+- [ ] Checker verifies exact key sets, u64 ranges, enum values, aggregate
+  cardinalities, run-only field presence, and payload absence.
+- [ ] Canary scans profile, metrics, trace, logs, private temp output, and every
+  map owned by the exact observer map IDs. Keep existing sentinels and use
+  structural field checks so the pre-existing allowlisted call-event trace
+  PID/TID positions do not mask or falsely trigger new loader/pause identities.
+- [ ] Keep public capability prose out of README/usage until Task 9 runtime and
+  CI evidence pass. Schema and allowlist text in this task describe the exact
+  emitted contract, not promotion status.
+
+### Step 4: Verify and review
+
+```sh
+python3 scripts/check-capture-evidence.py --self-test
+sh scripts/verify-canaries.sh --self-test
+cargo +1.88 test --locked --lib cli
+cargo +1.88 test --locked --lib render
+cargo +1.88 test --locked --lib doctor
+cargo +1.88 test --locked --test artifact_contracts
+```
+
+- [ ] Run all global gates, shell syntax checks, locked product BPF guards, and
+  fresh behavioral fixtures.
+- [ ] Independently review CLI refusal, loop ordering, dynamic synchronization,
+  completeness, schema/checker exactness, privacy allowlist, canary coverage,
+  doctor cleanup, and documentation claim boundaries.
+
+Commit message: `feat: expose live discovery and owned run evidence`
+
+## Task 9: Run product integration, provider, and kernel gates
+
+**Purpose:** Prove the exact production candidate, not the isolated spike, on
+real process/provider/container shapes and both supported kernel baselines.
+
+**Files:**
+
+- Modify: `scripts/verify-attach-e2e.sh`
+- Modify: `scripts/verify-induced-gaps.sh`
+- Modify: `scripts/verify-inspect-doctor.sh`
+- Modify: `scripts/verify-discover-containers.sh`
+- Modify: `scripts/verify-canaries.sh`
+- Add: `scripts/verify-live-discovery-preflight.sh`
+- Add: `scripts/check-live-discovery-evidence.py`
+- Add: `tests/fixtures/live-discovery-provider.c`
+- Add: `tests/fixtures/live-discovery-driver.c`
+- Modify as required: `scripts/matrix/*.sh`, `scripts/lib.sh`,
+  `scripts/attach-pod.sh`, `scripts/gates.sh`, `scripts/build-release.sh`,
+  `scripts/bench-overhead.sh`
+- Modify: `.github/workflows/ci.yml`
+- Modify: `tests/artifact_contracts.rs`
+- Update notes only after observed results
+
+### Step 1: Add self-testing gates before privileged execution
+
+- [ ] Build deterministic fixture lanes for provider present at start, provider
+  loaded later by `dlopen`, exported tables, hidden tables, two providers,
+  shared exact target, raw-key/full-identity collision, child exec failure,
+  ring/state/read/truncation loss, pause partial, and zero modules.
+- [ ] Build the production fixtures independently from the historical research
+  binary. One provider source compiles with
+  `P11SCOPE_EXPORT_TABLES=1|0` into reviewed exported/hidden bytes; each byte
+  identity is used unchanged by a DT_NEEDED driver and a `dlopen` driver and
+  implements all three standard return ABIs with per-surface
+  constructor/application markers. The
+  source may adapt the already-reviewed research behavior, but no old binary or
+  campaign row is reused. Freeze compiler/linker identity and exact commands,
+  including `-std=c11 -O2 -Wall -Wextra -Werror -fPIC`, shared-library
+  `-Wl,-z,defs`, and driver `-ldl -pthread`, then hash sources and outputs into
+  the execution manifest.
+- [ ] Each script gets syntax and nonprivileged `--self-test` mutations for its
+  exact validator. A mutation must fail for every claimed oracle field.
+- [ ] Freeze the production map/program/ABI/helper inventory and apply the
+  112-store/no-busy-wait guards to the exact release BPF object.
+- [ ] Freeze a production lifecycle validator distinct from the A/B spike's
+  four-map oracle.
+- [ ] `scripts/verify-live-discovery-preflight.sh` builds the exact product
+  object and drives the same frozen preflight on Jammy and Noble. Its canonical
+  PASS requires: every production program accepted; all 256 context IDs and
+  the absent/present/signed-delta cookie boundaries; zero-cookie and Aya
+  no-cookie short-circuit before registry/IP/state work; exact function-IP and
+  x86-64 fallback arithmetic; PT_INTERP/load-bias and `r_state +24`; lifecycle
+  tombstone/drain; privacy; and distinct capacity, stale, generation, identity,
+  and state-read outcomes.
+- [ ] The exact unprivileged and evidence commands are frozen before the first
+  privileged run:
+
+```sh
+python3 scripts/check-live-discovery-object.py \
+  --object "$BPF_OBJECT" --manifest "$BPF_INVENTORY"
+python3 scripts/check-live-discovery-evidence.py --self-test
+bash scripts/verify-live-discovery-preflight.sh --self-test
+python3 scripts/check-live-discovery-evidence.py \
+  --campaign "$CAMPAIGN_ROOT" --manifest "$EXECUTION_MANIFEST"
+```
+
+  The Python validator owns finite lifecycle/campaign semantics; the shell
+  owns environment setup and cleanup only.
+- [ ] The freeze step creates one new mode-0700 `PRIVATE_ROOT` and defines the
+  command inputs as exact files under it:
+  `BPF_OBJECT=$PRIVATE_ROOT/frozen/p11scope-ebpf`,
+  `BPF_INVENTORY=$PRIVATE_ROOT/frozen/bpf-inventory.json`,
+  `CAMPAIGN_ROOT=$PRIVATE_ROOT/campaign`, and
+  `EXECUTION_MANIFEST=$PRIVATE_ROOT/execution-manifest.json`. No script searches
+  for or guesses an input path.
+- [ ] Before the first non-self-test runtime attempt, freeze one execution
+  manifest containing the exact source, product BPF, runner, validators, caps,
+  deadlines, cold-boot/container topology, kernel/base identities,
+  `initial_set`/DT_NEEDED and `dlopen` load kinds, exported/hidden provider
+  bytes, exact interpreter/loader/companion-libc identities and digests,
+  debug-state/export hook symbol identities and pinned file offsets, their
+  source/tool provenance, and separate constructor/application markers plus
+  target sets for
+  `C_GetFunctionList`, `C_GetInterfaceList`, and `C_GetInterface`. No row,
+  fixture, validator, or manifest is replaced after execution begins.
+- [ ] Obtain explicit owner approval for each root, VM, and container lane
+  immediately before execution. An unapproved lane is `UNRUN` and blocks Slice
+  completion.
+
+### Step 2: Exercise real providers and deployment shapes
+
+- [ ] SoftHSM2 direct: initial scan and a late `dlopen` under `run --pause never`
+  and, when Task 2 passed, `auto` and `always`; exact aggregate counts and honest
+  first-window protection status while empty-catalog completeness stays
+  `PARTIAL`.
+- [ ] p11-kit proxy + SoftHSM2 backend: both modules discovered/attributed,
+  shared targets attached once, semantic ambiguity purged, within 512 slots.
+- [ ] Existing deterministic fixture providers cover 2.00/2.40/3.0/3.2,
+  alternate/null names, aliases, lazy dependency, hidden/exported tables.
+- [ ] Ptrace-denied non-descendant target: scan unavailable, loader/export BPF
+  path still produces bounded live discovery and `PARTIAL` rather than zero
+  findings or fatal scan failure.
+- [ ] Docker and kind: discover providers in container mount/process views
+  without copying them out; validate host/container identity handling.
+- [ ] Shared-layer, fork/cgroup, oracle, Knative, induced-gap, privacy canary,
+  release-build, and overhead lanes retain existing oracles and cleanup.
+- [ ] Benchmark `run --pause never` separately from explicit `auto`; report the
+  explicit-pause 1 ms userspace polling cost rather than folding it into normal
+  capture overhead or adding epoll speculatively.
+- [ ] CI builds the exact production BPF object and runs the unprivileged plus
+  hosted SoftHSM live-discovery lane. Hosted-kernel success is useful evidence,
+  not a substitute for the frozen 5.15/6.8 campaign. An actual required
+  workflow run must be observed green before Slice completion; local success
+  cannot relabel CI pending.
+- [ ] Kryoptic/NSS/other provider expansion is post-Slice 1b-2 unless already
+  locally available with no new dependency or oracle ambiguity. It cannot
+  replace the mandatory SoftHSM/proxy/fixture matrix.
+
+### Step 3: Run exact production kernel controls
+
+- [ ] Fresh Jammy 5.15 and Noble 6.8 overlays, same frozen production source,
+  BPF, runner, fixtures, schema, checker, caps, and oracle.
+- [ ] Both kernels load every production program and verify the complete
+  production map/program/helper inventory. Run initial, late exported, late
+  hidden, no-cookie, invalid-cookie, registry-capacity, scan-denied, loss, and
+  lifecycle controls declared before the first boot.
+- [ ] On each retained glibc 2.35, glibc 2.39, glibc 2.41+, and Alpine/musl
+  fixture, bind the exact interpreter/loader/libc identities, exercise the
+  every-hit hook and all supported exact export-return attachments, and retain
+  the timing classification only as a diagnostic. Also retain `dlopen_return`
+  fallback effects without promoting package/version names or a timing catalog.
+- [ ] Run the D3 amendment's exact production attach-first campaign:
+  initial-set/dlopen x exported/hidden x public `never|auto|always` x 20
+  children x two kernels = 480 primary attempts, plus 20 forced
+  `dlopen_return` fallback attempts per kernel. Every child exercises all three
+  standard return ABIs with predeclared per-surface markers. `never` rows
+  require no owner/signal, eventual bounded attachment where available,
+  initial-set capture none, and `PARTIAL`. `auto` rows require exact safe
+  closure for every observed window. Sticky partial with rearming disabled is
+  valid runtime failure handling but makes that primary campaign row non-PASS.
+  `always` rows require the same closure and command failure after safe cleanup
+  for any missed window. Mixed, missing, timed-out, replaced, lifecycle-failed,
+  privacy-failed, or unclassified rows are campaign non-PASS. Add no private
+  pause-count switch to the product runner. Every successful `auto|always` row
+  still requires timing `unproven`, initial-set capture none, and final
+  `PARTIAL`; attach-first success does not upgrade them.
+- [ ] Exercise forced `dlopen_return` only when the exact pinned debug-state
+  hook is absent, unresolved, or unsafe and an exact pinned companion libc
+  supplies the reviewed fallback offset. Each row proves only the explicit
+  post-return call, no constructor or DT_NEEDED coverage, timing none,
+  initial-set capture none, and `PARTIAL`. Any other activation or a row
+  failure is required-lane non-PASS and authorizes no fallback.
+- [ ] When Task 2 passed, product Outcome A/B pause integration must satisfy the
+  amendment on both kernels. The isolated six-lane Task 2 campaign remains the
+  repeatability authority; product lanes prove integration only.
+- [ ] All overlays, listeners, NBDs, children, stopped owners, links, and maps
+  are quiesced. Retained bases and frozen bundles remain byte-identical.
+
+### Step 4: Review the complete evidence
+
+- [ ] Independently recompute every canonical hash, inventory, record count,
+  provider oracle, completeness decision, privacy scan, lifecycle result, and
+  negative classification from raw bounded evidence.
+- [ ] A failed or unavailable optional provider is not hidden; a required
+  SoftHSM/proxy/fixture/kernel/product lane is campaign non-PASS.
+- [ ] Confirm the historical Task 8 160/160 attach-first artifact remains
+  diagnostic/non-promotable with zero attempts in this campaign.
+- [ ] Run a security diff review of the whole Slice 1b-2 range, focusing BPF
+  memory bounds, attach cookies, mutable maps, process identity, pidfd signal
+  authority, `/proc` namespace paths, public privacy, cleanup, and fail-closed
+  error classification.
+
+Commit message for reviewed gate/script changes: `test: gate slice 1b-2 live discovery`
+
+## Task 10: Final multi-artifact closeout and local integration
+
+**Purpose:** Prove every contract against the exact final tree and merge only a
+fully reviewed Slice 1b-2 result locally.
+
+**Files:**
+
+- Modify: `docs/superpowers/plans/ROADMAP.md`
+- Modify: `docs/notes/slice1b2/README.md`
+- Modify: `docs/notes/slice1b2-open-issues-and-consequences.md`
+- Modify: `CHANGELOG.md`
+- Modify: `README.md`
+- Modify: `docs/usage.md`
+- Modify: `tests/artifact_contracts.rs`
+- Modify only other factual operator docs needed by final evidence
+
+### Step 1: Freeze the final dependency graph
+
+- [ ] Record exact source/tree, toolchain, BPF/runner/fixture/checker/schema,
+  map/program/ABI, cap/deadline/oracle, kernel/userland, and campaign hashes for
+  isolated A/B, retained diagnostic C inputs, D3 attach-first, and production
+  nodes. Dormant catalog lanes are not fabricated as a required node.
+- [ ] Verify every dependency edge. A changed shared source/ABI reruns every
+  naming node; a schema-only change reruns schema/privacy/product integration,
+  not unrelated spike verifier lanes.
+- [ ] Preserve negative and historical evidence with its original disposition.
+  Do not relabel feasibility PASS as promotion evidence.
+
+### Step 2: Requirement-by-requirement completion audit
+
+- [ ] Audit every numbered requirement in the corrective design, pause
+  amendment, and accepted D3 amendment against exact
+  source, tests, raw campaign artifacts, validators, and public docs.
+- [ ] Classify each as proved, contradicted, incomplete, weak/indirect, or
+  missing. Continue work for every non-proved required item.
+- [ ] Confirm Slice 1b-1 manifest authority, privacy allowlist, capture budgets,
+  process/object identities, and existing provider matrices did not regress.
+- [ ] Confirm no generated output, private evidence, raw identifier, or unrelated
+  main-worktree file is tracked.
+- [ ] Confirm the required CI workflow was actually observed green on the exact
+  final branch tip including the documentation/artifact-contract commit. Any
+  later change reruns CI. If push/workflow authority is unavailable, leave
+  Slice 1b-2 and ROADMAP completion pending; local integration alone is not
+  completion.
+
+### Step 3: Fresh final verification
+
+```sh
+cargo +1.88 fmt --all -- --check
+cargo +1.88 check --locked --workspace --all-targets
+cargo +1.88 test --locked --workspace --all-targets
+cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings
+python3 scripts/check-capture-evidence.py --self-test
+sh scripts/verify-canaries.sh --self-test
+git diff --check
+```
+
+- [ ] Re-run every final required local gate whose named dependency changed.
+- [ ] Obtain independent correctness, lifecycle/evidence, privacy/security, and
+  minimality reviews of the exact final range. Resolve all findings by TDD and
+  rerun affected gates.
+- [ ] Update ROADMAP/notes only with observed exact outcomes. Required CI must
+  be observed green; release, publish, and security-clearance remain pending
+  unless separately observed.
+- [ ] Only after Task 9 runtime gates and its candidate CI pass, update
+  README/usage with factual
+  capability boundaries: no manifest is required for bounded live discovery;
+  late `dlopen` is observed through supported hooks; all empty-catalog captures
+  remain `PARTIAL`; external PID/cgroup windows are unpaused; owned `run` pause
+  is explicit; only the owned child generation is followed; arbitrary
+  descendants/nonstandard providers are not guaranteed; and observer SIGKILL
+  during an accepted stop plus third-party stop interaction remain residuals.
+- [ ] After independent review and all local checks pass, commit the final
+  documentation/artifact-contract changes, then observe required CI green on
+  that exact branch tip. Do not change the candidate after the green run; any
+  required fix repeats review, commit, affected local gates, and CI.
+
+### Step 4: Integrate locally
+
+- [ ] Use `superpowers:finishing-a-development-branch` to compare the reviewed
+  branch with local main, preserve unrelated/untracked user work, and merge the
+  exact reviewed commits locally without pushing, tagging, packaging, or
+  publishing.
+- [ ] Re-run the four AGENTS gates and status/diff checks on merged main.
+- [ ] Keep the broader persistent development goal active for later slices;
+  Slice 1b-2 completion is not the end of product development.
+
+Final documentation commit: `docs: close slice 1b-2 live discovery`
+
+## Effort and critical-path estimate
+
+| Work | Expected focused effort | Expected elapsed time |
+| --- | ---: | ---: |
+| Plan review/fix/commit | 4–8 h | < 1 working day |
+| Correct A/B candidate + review | 1–2 days | 1–3 days |
+| A/B VM campaign + review | 4–8 h hands-on | 8–20 h elapsed |
+| Descriptor + dynamic slot migration | 1–2 days | 1–3 days |
+| Product BPF + loader/engine | 2–4 days | 3–6 days |
+| `run`/pause + public contract | 2–3 days | 2–5 days |
+| Provider/kernel/final reviews | 2–4 days | 3–7 days |
+
+Nominal critical path is 7–12 focused working days. Verifier, lifecycle, or
+cross-kernel corrective rounds can make the realistic calendar range 2–3
+weeks. These are planning ranges, not permission to skip a failed gate.
+
+## Plan self-review checklist
+
+- [ ] Every binding requirement maps to one task, test, campaign, and owner.
+- [ ] Amendment supersedes historical pause behavior everywhere.
+- [ ] No speculative dependency, trait, async runtime, generic resolver,
+  external-target pause, new public identity, or timing catalog was added.
+- [ ] Scan/pin/reconcile/manifest authority has one implementation.
+- [ ] Dynamic policy uses frozen descriptors and mutable data indices only.
+- [ ] Exact identity collisions cannot remap already attached state silently.
+- [ ] Gate A/B, loader/context preflight, and production artifacts have
+  distinct inventories and validators; historical Gate C remains dormant and
+  contributes no product gate.
+- [ ] Privileged/runtime gates occur only after source review and exact freeze.
+- [ ] Public schema, allowlist, checker, and canaries change atomically.
+- [ ] Historical evidence remains truthful and non-promotable.
+- [ ] Final completion requires exact evidence, not absence of failing tests.

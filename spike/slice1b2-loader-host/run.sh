@@ -196,7 +196,7 @@ def well_formed(item):
     names = bools_startup() if item.get("flow") == "loader_startup" else bools_negative()
     if any(not isinstance(item.get(name), bool) for name in names):
         return False
-    if not isinstance(item.get("loader_sha256"), str) or len(item["loader_sha256"]) != 64:
+    if item.get("flow") == "loader_startup" and (not isinstance(item.get("loader_sha256"), str) or len(item["loader_sha256"]) != 64):
         return False
     before = item.get("counters_before")
     after = item.get("counters_after")

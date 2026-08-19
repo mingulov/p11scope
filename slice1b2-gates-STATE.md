@@ -34,8 +34,27 @@ Work ONLY in this worktree. Goal: no-busy-wait Gate B pause protocol (old winner
 
 ## Workflow position
 
-DONE: implementation → review 1 → fixes → review 2 → fixes → review 3 → fixes → all tests/gates green → commit (this).
-NEXT: freeze bundle (`build-bpf` + `build-fixture` + `freeze-execution`, record hashes) → VM lock → campaigns: 3× gate-b-lane jammy + 3× noble, 20 children each, KVM via `sg kvm`, serialized, all lanes run regardless of FAIL → VM cleanup verification (listeners, backing images, free space) → evidence to /home/user/src/m/p11scope-ws/incoming/slice1b2-no-delay-gateb-2026-08-19/ (0700/0600) → report + exact hashes → STOP for controller review.
+DONE: implementation → reviews 1-3 → all fixes → tests/gates green → BUNDLE FROZEN (record below).
+NEXT: 6 serialized campaign lanes → cleanup verification → report → STOP for controller review.
+
+## Freeze record (2026-08-19)
+
+- Evidence root E=/home/user/src/m/p11scope-ws/incoming/slice1b2-no-delay-gateb-2026-08-19 (0700).
+- source_commit=0b63350771391e2cdc0a8ffc30b5a763f590ef2b (branch spike/slice1b2-gates).
+- E/source-build: host nightly (1.97.0-nightly e50aa6fba, LLVM 22.1.4) `build-bpf`; check-init-shape PASS + check-signal-shape PASS (20-insn acyclic window).
+- E/guest-build: provision-jammy KVM guest build (guest rustc 1.88.0, cargo build/test 0, fixture self-check 0), build-evidence.txt captured.
+- E/bundle (6 files) + E/bundle.sha256:
+  - bpf_sha256=53b168f94341862c1d445447751578260d029f9784d6ec8d9bd1df043681d829
+  - runner_sha256=1875e303e36dc1554267470206d25f7b1997be66d2d7fd3bdc36d88338ad7e8d
+  - fixture_sha256=bb83cc08c692ee0acf2cb095835355f93815af8327a56f164645d171ce5fab04
+  - source_manifest_sha256=3780bf98a5eea1be08270c33841a879761a120cac9c5a8661651d4ee69d3c19f
+  - build_evidence_sha256=3e0ade7d894defdb2052147a973c70940aab5edc6c8b6767ce8b940fe839e59c
+  - execution.manifest sha256=21dbf7eeb65bf64423ecab9a7375fb505d538b5caa3ac56ab4b6e119c0fc5a15
+- Oracle frozen: run.sh validator + Rust oracle as of 0b63350; NOT to be weakened after results.
+
+## Campaign plan (predeclared; all lanes run regardless of earlier FAIL)
+
+For boot 1..3 jammy then boot 1..3 noble: `P11SCOPE_SPIKE_ACCEL=kvm sg kvm -c 'bash spike/slice1b2-kernel/run.sh gate-b-lane {lane} $E/bundle $E/gate-b/{lane}-kvm-boot{N} $E/gate-b/{lane}-kvm-boot{N}-evidence'`. Each lane = fresh overlay (cold boot), 20 children, serialized via /tmp/p11scope-slice1b2-spike-vm.lock. Record PASS/FAIL/TIMEOUT honestly per lane.
 
 ## Key run.sh interfaces (verified)
 

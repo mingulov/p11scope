@@ -385,7 +385,22 @@ def timeline_well_formed(item, samples_name, confirmation_name):
             return False
         if samples[second]["elapsed_us"] > 100000:
             return False
+        if list(confirmation) != list(first_confirmable_pair(samples)):
+            return False
     return True
+def first_confirmable_pair(samples):
+    for index in range(len(samples) - 1):
+        first, second = samples[index], samples[index + 1]
+        if (
+            first["exact_expected_task_set"] is True
+            and first["all_tasks_stopped"] is True
+            and second["exact_expected_task_set"] is True
+            and second["all_tasks_stopped"] is True
+            and second["elapsed_us"] - first["elapsed_us"] >= 1000
+            and second["elapsed_us"] <= 100000
+        ):
+            return (index, index + 1)
+    return None
 def samples_well_formed(item):
     if not timeline_well_formed(item, "samples", "confirmation_sample_indexes"):
         return False
@@ -397,7 +412,7 @@ def samples_well_formed(item):
 def well_formed(item):
     if not isinstance(item.get("pass"), bool) or item.get("failure_category") not in {"none", "runtime", "oracle"}:
         return False
-    if item.get("pause_owners") not in {1, 2}:
+    if item.get("pause_owners") not in {0, 1, 2}:
         return False
     if any(type(item.get(name)) is not int or not 0 <= item[name] <= 0xffffffffffffffff for name in u64):
         return False
@@ -430,7 +445,29 @@ def well_formed(item):
         return False
     if item["resume_via_original_pidfd"] and item["pidfd_resume_attempts"] not in {1, 2}:
         return False
-    if item["pause_owners"] == 1:
+    if item["pause_owners"] == 0:
+        # an attempt that failed before a second pause owner was established:
+        # every owner-2 fact must stay unset, so the failure reason is the
+        # only story the record tells
+        if item["deferred_records"] not in {0, 1}:
+            return False
+        if item["deferred_records"] != 1 and item["owner2_armed_while_stopped"] is not False:
+            return False
+        if item["owner2_case_id"] != 0 or item["hook_ts_ns_2"] != 0:
+            return False
+        if item["send_signal_rc_2"] != 0 or item["pidfd_resume_rc_2"] != 0:
+            return False
+        if item["samples_2"] != [] or item.get("confirmation_sample_indexes_2") is not None:
+            return False
+        if item["post_attach2_task_count"] != 0:
+            return False
+        if any(item.get(name) is not False for name in [
+            "pre_stop2_marker_observed", "owner2_drain_empty",
+            "post_attach2_exact_expected_task_set", "post_attach2_all_tasks_stopped",
+            "post_attach2_marker_observed",
+        ]):
+            return False
+    elif item["pause_owners"] == 1:
         if item["pidfd_resume_attempts"] != 1:
             return False
         if item["deferred_records"] != 0 or item["owner2_case_id"] != 0:
@@ -448,7 +485,9 @@ def well_formed(item):
         ]):
             return False
     else:
-        if item["pidfd_resume_attempts"] != 2:
+        if item["pidfd_resume_attempts"] not in {1, 2}:
+            return False
+        if item["pidfd_resume_attempts"] == 1 and item["pidfd_resume_rc_2"] != 0:
             return False
         if item["samples_2"] == []:
             return False
@@ -496,6 +535,8 @@ def oracle(item):
             and item["deferred_records"] == 0
             and item["pidfd_resume_attempts"] == 1
         )
+    if item["pause_owners"] != 2:
+        return False
     return (
         item["winner_records"] == 2 and item["coalesced_records"] == 0
         and item["signal_helper_calls"] == 2

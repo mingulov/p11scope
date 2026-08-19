@@ -1566,6 +1566,13 @@ fn read_counters(
     Ok(values)
 }
 
+fn counter_delta(before: &[u64; 5], after: &[u64; 5], index: usize) -> u64 {
+    after
+        .get(index)
+        .unwrap_or(&0)
+        .saturating_sub(*before.get(index).unwrap_or(&0))
+}
+
 fn raw_records(
     ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
 ) -> Result<Vec<common::DiscoveryRecord>, &'static str> {
@@ -2615,12 +2622,16 @@ fn run_gate_b_case(
     let mut signal_links = Vec::new();
     let mut late_links = Vec::new();
     let mut owner: Option<PauseOwnerGuard> = None;
+    let counters_before = match read_counters(counters) {
+        Ok(values) => values,
+        Err(reason) => return (facts, Some(reason)),
+    };
+    let mut counters_final = false;
     let result = (|| -> Result<(), &'static str> {
         cancellation_failure(cancellation)?;
         if ring.next().is_some() {
             return Err("signal record surplus");
         }
-        let counters_before = read_counters(counters)?;
         let (ready_reader, ready_writer) =
             pipe_pair(libc::O_CLOEXEC | libc::O_NONBLOCK).map_err(|_| "fixture pipes")?;
         let (marker_reader, marker_writer) =
@@ -2744,7 +2755,7 @@ fn run_gate_b_case(
             .filter(|record| record.send_signal_rc != common::COALESCED_NO_HELPER)
             .count();
         let coalesced = records.len() - winners;
-        if records.len() > 2 || winners == 0 {
+        if records.len() > 2 || winners != 1 {
             return Err("signal record surplus");
         }
         facts.winner_records = winners as u64;
@@ -2759,6 +2770,9 @@ fn run_gate_b_case(
         }
         facts.required_attach_keys = 2;
         let deferred = records.len() == 1;
+        if !deferred {
+            facts.pause_owners = 1;
+        }
         let (owner1_late_target, owner2_late_target) = if facts.winner_case_id == 1 {
             ("spike_late_target", "spike_late_target_b")
         } else {
@@ -2820,7 +2834,6 @@ fn run_gate_b_case(
             start.insert_armed(&owner_key)?;
             owner = Some(PauseOwnerGuard::new(owner_key));
             facts.owner2_armed_while_stopped = true;
-            guard.mark_may_be_stopped();
             facts.pidfd_resume_attempts += 1;
             facts.resume_via_original_pidfd = true;
             if guard.resume_once().is_err() {
@@ -2858,6 +2871,9 @@ fn run_gate_b_case(
             {
                 return Ok(());
             }
+            // stop 2 is confirmed: the second owned stop must be resumed
+            // exactly once, so only now may a second resume be requested
+            guard.mark_may_be_stopped();
             facts.owner2_drain_empty = drain_signal_ring_to_empty(ring)?.is_empty();
             if !facts.owner2_drain_empty {
                 return Ok(());
@@ -2958,8 +2974,9 @@ fn run_gate_b_case(
         facts.reaped = true;
         facts.child_exit = status.code().unwrap_or(-1);
         let counters_after = read_counters(counters)?;
-        facts.ring_loss = counters_after[0].saturating_sub(counters_before[0]);
-        facts.late_hits = counters_after[4].saturating_sub(counters_before[4]);
+        facts.ring_loss = counter_delta(&counters_before, &counters_after, 0);
+        facts.late_hits = counter_delta(&counters_before, &counters_after, 4);
+        counters_final = true;
         if ring.next().is_some() {
             return Err("signal record surplus");
         }
@@ -2998,6 +3015,14 @@ fn run_gate_b_case(
     }
     if let Some(owner) = owner.as_mut() {
         owner.disarm_for_cleanup(start);
+    }
+    if !counters_final
+        && let Ok(counters_after) = read_counters(counters)
+    {
+        // a failing attempt still exports ring-loss and late-hit deltas: ring
+        // loss is a hard-FAIL signal wherever it happens
+        facts.ring_loss = counter_delta(&counters_before, &counters_after, 0);
+        facts.late_hits = counter_delta(&counters_before, &counters_after, 4);
     }
     (facts, result.err())
 }
@@ -4860,6 +4885,27 @@ mod tests {
         }
     }
 
+    fn mark_runtime_failure(path: &Path, reason: &str) {
+        let timing = path.join("signal-timing.jsonl");
+        let mut records = std::fs::read_to_string(&timing)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let record = records.last_mut().unwrap();
+        record["pass"] = false.into();
+        record["failure_category"] = "runtime".into();
+        record["runtime_failure_reason"] = reason.into();
+        std::fs::write(
+            &timing,
+            records
+                .iter()
+                .map(|record| record.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+    }
+
     fn shell_validate_gate_b_export(script: &str, path: &Path, expected_rc: u8) -> bool {
         Command::new("bash")
             .arg("-c")
@@ -5215,6 +5261,209 @@ mod tests {
             assert!(
                 !shell_validate_gate_b_export(script, &path, 0),
                 "accepted Gate B two-owner mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_counter_deltas_saturate() {
+        let before = [10u64, 0, 0, 0, 4];
+        assert_eq!(counter_delta(&before, &[10, 0, 0, 0, 7], 0), 0);
+        assert_eq!(counter_delta(&before, &[12, 0, 0, 0, 4], 4), 0);
+        assert_eq!(counter_delta(&before, &[12, 0, 0, 0, 9], 0), 2);
+        assert_eq!(counter_delta(&before, &[12, 0, 0, 0, 9], 4), 5);
+        assert_eq!(counter_delta(&[0; 5], &[0; 5], 9), 0);
+    }
+
+    #[test]
+    fn runner_source_freezes_two_owner_resume_protocol() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
+        let start = source.find("fn run_gate_b_case(").expect("run_gate_b_case");
+        let end = start
+            + source[start..]
+                .find("\nfn run_gate_b(")
+                .expect("next function after run_gate_b_case");
+        let body = &source[start..end];
+        // outcome A records its single confirmed owner as soon as the record
+        // pair drains
+        let deferred = body
+            .find("let deferred = records.len() == 1;")
+            .expect("deferred split");
+        let owners_a: Vec<usize> = body
+            .match_indices("facts.pause_owners = 1;")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(owners_a.len(), 1, "outcome A must set its owner count once");
+        assert!(deferred < owners_a[0]);
+        // a double winner is an explicit surplus, not a silent outcome-A shape
+        assert!(body.contains("records.len() > 2 || winners != 1"));
+        // exactly two marks, one per owned stop: before resume 1, and after
+        // stop 2 is confirmed but before resume 2
+        let marks: Vec<usize> = body
+            .match_indices("guard.mark_may_be_stopped();")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(marks.len(), 2, "exactly two stop marks: one per owned stop");
+        let resume_1 = body
+            .find("facts.pidfd_resume_attempts += 1;")
+            .expect("resume 1 accounting");
+        assert!(marks[0] < resume_1, "the first mark covers resume 1");
+        let confirmed_2 = body.find("confirmed_2.is_none()").expect("stop 2 gate");
+        let resume_2 = body
+            .find("facts.pidfd_resume_rc_2 = 0;")
+            .expect("resume 2 accounting");
+        assert!(
+            confirmed_2 < marks[1] && marks[1] < resume_2,
+            "the second mark belongs to the confirmed second stop"
+        );
+        // failing attempts still export ring-loss and late-hit counter deltas
+        assert!(body.contains("counter_delta("));
+        assert!(body.contains("if !counters_final"));
+    }
+
+    #[test]
+    fn gate_b_semantics_classify_honest_failure_shapes() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("gate-b-failure-shapes");
+
+        // runtime failure before the outcome split: no owner was ever recorded
+        let mut pre_split = SignalTimingFacts::default();
+        pre_split.reaped = true;
+        pre_split.child_exit = -1;
+        let path = temp.path().join("pre-split-runtime");
+        fake_canonical_gate_b_export_facts(&path, 2, 1, "runtime", &pre_split);
+        mark_runtime_failure(&path, "task stat");
+        assert!(
+            shell_validate_gate_b_export(script, &path, 1),
+            "pre-split runtime failures must classify as runtime, not malformed"
+        );
+
+        // runtime failure after owner 1 resumed but before the deferred hook's
+        // record arrived: owner 2 was armed but never established
+        let mut deferred_timeout = valid_signal();
+        deferred_timeout.coalesced_records = 0;
+        deferred_timeout.coalesced_case_id = 0;
+        deferred_timeout.pause_owners = 0;
+        deferred_timeout.deferred_records = 1;
+        deferred_timeout.owner2_armed_while_stopped = true;
+        deferred_timeout.attached_while_stopped = 1;
+        deferred_timeout.late_attach_attempts = 1;
+        deferred_timeout.late_attach_accepted = false;
+        deferred_timeout.late_link_detached = false;
+        deferred_timeout.markers_after_resume = 0;
+        deferred_timeout.post_resume_marker_observed = false;
+        deferred_timeout.owner_removed = false;
+        deferred_timeout.final_start_entries = 1;
+        deferred_timeout.child_exit = -1;
+        deferred_timeout.late_hits = 1;
+        let path = temp.path().join("deferred-timeout");
+        fake_canonical_gate_b_export_facts(&path, 2, 1, "runtime", &deferred_timeout);
+        mark_runtime_failure(&path, "signal record timeout");
+        assert!(
+            shell_validate_gate_b_export(script, &path, 1),
+            "deferred-path runtime failures must classify as runtime, not malformed"
+        );
+
+        // oracle failure: the deferred hook won owner 2 but its stop never
+        // confirmed, so resume 2 never happened
+        let mut stop2_unconfirmed = valid_two_owner_signal();
+        stop2_unconfirmed.pidfd_resume_attempts = 1;
+        stop2_unconfirmed.confirmation_sample_indexes_2 = None;
+        stop2_unconfirmed.owner2_drain_empty = false;
+        stop2_unconfirmed.post_attach2_task_count = 0;
+        stop2_unconfirmed.post_attach2_exact_expected_task_set = false;
+        stop2_unconfirmed.post_attach2_all_tasks_stopped = false;
+        stop2_unconfirmed.markers_after_resume = 0;
+        stop2_unconfirmed.post_resume_marker_observed = false;
+        stop2_unconfirmed.owner_removed = false;
+        stop2_unconfirmed.final_start_entries = 1;
+        stop2_unconfirmed.child_exit = -1;
+        let path = temp.path().join("stop2-unconfirmed");
+        fake_canonical_gate_b_export_facts(&path, 2, 1, "oracle", &stop2_unconfirmed);
+        assert!(
+            shell_validate_gate_b_export(script, &path, 1),
+            "unconfirmed-stop-2 oracle failures must classify as oracle, not malformed"
+        );
+    }
+
+    #[test]
+    fn gate_b_semantics_reject_a_later_confirmation_pair() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("gate-b-confirmation-pair");
+        let path = temp.path().join("later-pair");
+        fake_canonical_gate_b_export(&path, 2, 20, "none");
+        let timing = path.join("signal-timing.jsonl");
+        let mut records = std::fs::read_to_string(&timing)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let record = &mut records[0];
+        let sample = |elapsed: u64| {
+            serde_json::json!({
+                "elapsed_us": elapsed,
+                "task_count": 2,
+                "exact_expected_task_set": true,
+                "all_tasks_stopped": true,
+                "state_counts": [0, 0, 0, 2, 0, 0, 0, 0, 0],
+            })
+        };
+        record["samples"] = serde_json::json!([sample(2_000), sample(3_100), sample(4_200)]);
+        record["confirmation_sample_indexes"] = serde_json::json!([1, 2]);
+        std::fs::write(
+            &timing,
+            records
+                .iter()
+                .map(|record| record.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        assert!(
+            !shell_validate_gate_b_export(script, &path, 0),
+            "a later valid pair must be rejected: the first confirmable pair is binding"
+        );
+    }
+
+    #[test]
+    fn signal_shape_guard_rejects_backward_jumps_including_long_form() {
+        let script_path = concat!(env!("CARGO_MANIFEST_DIR"), "/check-signal-shape.py");
+        let temp = TestDir::new("signal-shape-guard");
+        let disasm = |window: &str| {
+            format!(
+                "1234 <signal_return>:\n 0: r1 = 0x1\n 1: cmpxchg_64 *(u64 *)(r1 + 0)\n{window} 4: call 0x5\n 5: r0 = 0x13\n 6: call 0x6d\n 7: exit\n"
+            )
+        };
+        for (name, window, expected_code) in [
+            ("clean", " 2: r2 = 0x0\n 3: r3 = 0x1\n", 0),
+            ("short-backward", " 2: if r9 != 0x0 goto -0x3\n 3: r3 = 0x1\n", 1),
+            ("long-backward", " 2: gotol -0x4\n 3: r3 = 0x1\n", 1),
+        ] {
+            let dir = temp.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            let dumper = dir.join("objdump");
+            std::fs::write(
+                &dumper,
+                format!("#!/bin/sh\ncat <<'ASM'\n{}ASM\n", disasm(window)),
+            )
+            .unwrap();
+            std::fs::set_permissions(
+                &dumper,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            let obj = dir.join("fake.o");
+            std::fs::write(&obj, b"").unwrap();
+            let status = Command::new("python3")
+                .arg(script_path)
+                .arg(&obj)
+                .arg(&dumper)
+                .status()
+                .unwrap();
+            assert_eq!(
+                status.code(),
+                Some(expected_code),
+                "synthetic window {name} must exit {expected_code}"
             );
         }
     }

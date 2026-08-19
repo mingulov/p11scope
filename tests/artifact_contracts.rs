@@ -519,6 +519,7 @@ aggregate-only-metrics default metrics"
     assert!(lanes.contains("unsafe raw template oracle self-test: OK"));
     assert!(lanes.contains("raw policy oracle self-test: OK"));
     assert!(lanes.contains("full CallStart safe defaults self-test: OK"));
+    assert!(lanes.contains("scan-only hostile output contract: OK"));
     assert!(lanes.contains("canary matrix 988/104/208 with 16 mixed surfaces: OK"));
     let mut sentinels = canary_literals(&read("scripts/fixtures/canary_workload.c"));
     sentinels.extend(canary_literals(&read(

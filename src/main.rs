@@ -177,7 +177,6 @@ struct Discovered {
     modules: Vec<ReconciledModule>,
     manifests: Vec<Manifest>,
     counters: DiscoveryCounters,
-    corroborated: BTreeSet<(ProcessViewId, ObjectKey)>,
     identity_mismatches: usize,
     scan_inputs: BTreeMap<ProcessViewId, ScanInput>,
     manifest_inputs: Vec<ManifestInput>,
@@ -212,6 +211,49 @@ struct PendingManifestFallback {
     object: u32,
     reason: ManifestStaleReason,
     candidate: CandidateFallbackProof,
+}
+
+/// Private raw scan instance that can be resolved only against the final
+/// reconciled module set. It deliberately includes a process view and pathname:
+/// a raw map key alone cannot select a peer.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ScanOutcomeLocator {
+    view: ProcessViewId,
+    key: ObjectKey,
+    path: String,
+}
+
+impl ScanOutcomeLocator {
+    fn module(module: &ScannedModule) -> Self {
+        Self {
+            view: module.view,
+            key: module.key,
+            path: module.path.clone(),
+        }
+    }
+}
+
+/// Private raw manifest instance captured from the opened manifest pin before
+/// recorded provenance is retargeted. It is never a public key/path relation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ManifestOutcomeLocator {
+    key: ObjectKey,
+    path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum OutcomeOwner {
+    Scan(ScanOutcomeLocator),
+    Manifest(ManifestOutcomeLocator),
+}
+
+/// One rendered corroboration item. `Vec` preserves the repeatable
+/// `--manifest` input order; its owners become final pinned IDs only after every
+/// accepted manifest has been absorbed and scans have been reconciled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingCorroboration {
+    owners: Vec<OutcomeOwner>,
+    label: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -795,7 +837,6 @@ fn discover_plan(
         modules: Vec::new(),
         manifests: Vec::new(),
         counters: DiscoveryCounters::default(),
-        corroborated: BTreeSet::new(),
         identity_mismatches: 0,
         scan_inputs,
         manifest_inputs,
@@ -818,7 +859,7 @@ fn build_current_plan(
     manifests: &[Manifest],
     pinned: &PinnedObjects,
     counters: &mut DiscoveryCounters,
-    corroborated: &BTreeSet<(ProcessViewId, ObjectKey)>,
+    corroborated: &BTreeSet<PinnedObjectId>,
     identity_mismatches: usize,
     manifest_fallbacks: usize,
 ) -> Result<plan::AttachPlan> {
@@ -826,15 +867,11 @@ fn build_current_plan(
     // evidence only and cannot select an attach fd.
     let mut plan = plan::build_from_sources(modules, manifests, pinned);
     record_object_skips(&mut plan, &counters.object_skips);
-    for (view, key) in corroborated {
-        if let Some(object) = modules
-            .iter()
-            .find(|module| module.scanned.view == *view && module.scanned.key == *key)
-            .map(|module| module.object)
-            && let Some(summary) = plan
-                .modules
-                .iter_mut()
-                .find(|module| module.object == object)
+    for object in corroborated {
+        if let Some(summary) = plan
+            .modules
+            .iter_mut()
+            .find(|module| module.object == *object)
         {
             summary.corroborated = true;
             if summary.source == "scan" {
@@ -1037,6 +1074,98 @@ fn corroboration_label(outcome: Corroboration) -> &'static str {
         Corroboration::ScanEmpty => "scan_empty",
         Corroboration::IdentityMismatch => "identity_mismatch",
     }
+}
+
+fn manifest_outcome_locator(
+    manifest: &Manifest,
+    pins: &PinnedObjects,
+) -> Option<ManifestOutcomeLocator> {
+    let mut modules = manifest
+        .objects
+        .iter()
+        .filter(|object| object.path == manifest.module_path);
+    let object = modules.next()?;
+    if modules.next().is_some() {
+        return None;
+    }
+    let id = pins.id_for_path(&object.path)?;
+    let summary = pins.summary(id)?;
+    Some(ManifestOutcomeLocator {
+        key: summary.key,
+        path: object.path.clone(),
+    })
+}
+
+fn pending_corroboration(
+    view: Option<&ScanView<'_>>,
+    manifest: &Manifest,
+    manifest_pins: &PinnedObjects,
+    label: &'static str,
+) -> Result<PendingCorroboration> {
+    let owners: Vec<_> = view
+        .map(|view| {
+            view.modules
+                .iter()
+                .map(|module| OutcomeOwner::Scan(ScanOutcomeLocator::module(module)))
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            manifest_outcome_locator(manifest, manifest_pins)
+                .map(OutcomeOwner::Manifest)
+                .into_iter()
+                .collect()
+        });
+    if owners.is_empty() {
+        bail!(
+            "an accepted manifest outcome had no exact opened object instance to bind after reconciliation"
+        );
+    }
+    Ok(PendingCorroboration { owners, label })
+}
+
+fn resolve_outcome_owner(
+    owner: &OutcomeOwner,
+    modules: &[ReconciledModule],
+    pinned: &PinnedObjects,
+) -> Option<PinnedObjectId> {
+    match owner {
+        OutcomeOwner::Scan(locator) => {
+            let mut matching = modules.iter().filter(|module| {
+                module.scanned.view == locator.view
+                    && module.scanned.key == locator.key
+                    && target_paths_equal(&module.scanned.path, &locator.path)
+            });
+            let module = matching.next()?;
+            matching.next().is_none().then_some(module.object)
+        }
+        OutcomeOwner::Manifest(locator) => pinned.id_for_manifest(locator.key, &locator.path),
+    }
+}
+
+fn bind_pending_corroboration(
+    pending: Vec<PendingCorroboration>,
+    modules: &[ReconciledModule],
+    pinned: &PinnedObjects,
+    counters: &mut DiscoveryCounters,
+) -> Result<BTreeSet<PinnedObjectId>> {
+    let mut corroborated = BTreeSet::new();
+    for outcome in pending {
+        let objects: Option<BTreeSet<_>> = outcome
+            .owners
+            .iter()
+            .map(|owner| resolve_outcome_owner(owner, modules, pinned))
+            .collect();
+        let Some(objects) = objects.filter(|objects| !objects.is_empty()) else {
+            bail!(
+                "an accepted manifest outcome lost its exact final object during identity reconciliation"
+            );
+        };
+        if matches!(outcome.label, "agreed" | "conflict") {
+            corroborated.extend(&objects);
+        }
+        counters.corroboration.push((objects, outcome.label));
+    }
+    Ok(corroborated)
 }
 
 /// Prints every attach failure — shared by `profile` and `trace`, which
@@ -1666,18 +1795,9 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
     let (mut pinned, aggregation_skips) =
         PinnedObjects::aggregate_views(discovered.scan_inputs.values().map(|input| &input.pins));
     counters.object_skips.extend(aggregation_skips);
-    let (modules, collapsed, differed) = reconcile_scanned_modules(&scan_modules, &mut pinned);
-    if collapsed > 0 {
-        eprintln!(
-            "p11scope: discovery: {collapsed} matching overlay mapping(s) were collapsed \
-             onto one attach target; physical identity is not provable, so published \
-             uncertainty makes this capture PARTIAL"
-        );
-    }
-    counters.object_skips.extend(differed);
     let mut accepted = Vec::new();
     let mut pending_fallbacks = Vec::new();
-    let mut corroborated = BTreeSet::new();
+    let mut pending_outcomes = Vec::new();
     let mut identity_mismatches = 0usize;
     for (manifest_index, input) in discovered.manifest_inputs.iter().enumerate() {
         let mut manifest = input.manifest.clone();
@@ -1742,25 +1862,25 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
                     })
                 })
                 .collect();
-            let objects: BTreeSet<_> = matched
+            let owners: Vec<_> = matched
                 .iter()
-                .filter_map(|module| pinned.id_for_scanned(module, module.key, &module.path))
+                .map(|module| OutcomeOwner::Scan(ScanOutcomeLocator::module(module)))
                 .collect();
-            if !objects.is_empty() {
-                counters.corroboration.push((objects, "object_fallback"));
+            if owners.is_empty() {
+                bail!(
+                    "stale manifest module had no exact scanned object instance to bind after reconciliation"
+                );
             }
+            pending_outcomes.push(PendingCorroboration {
+                owners,
+                label: "object_fallback",
+            });
             continue;
         }
         if !stale_ids.is_empty() {
             filter_manifest_fallbacks(&mut manifest, &stale_ids)?;
         }
         let view = scan_view(&manifest, &scan_modules, &pinned, manifest_pins);
-        let outcome_objects: BTreeSet<_> = view
-            .as_ref()
-            .into_iter()
-            .flat_map(|view| &view.modules)
-            .filter_map(|module| pinned.id_for_scanned(module, module.key, &module.path))
-            .collect();
         let scan_targets = view
             .as_ref()
             .and_then(|view| scanned_targets_without(&view.modules, &pinned, &stale_replacements));
@@ -1780,19 +1900,16 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
                 .is_some_and(|(scan, own)| pinned.exactly_same_targets(scan, manifest_pins, own)),
             scan_empty,
         );
-        if !outcome_objects.is_empty() {
-            counters
-                .corroboration
-                .push((outcome_objects, corroboration_label(outcome)));
+        if outcome != Corroboration::IdentityMismatch {
+            pending_outcomes.push(pending_corroboration(
+                view.as_ref(),
+                &manifest,
+                manifest_pins,
+                corroboration_label(outcome),
+            )?);
         }
         match outcome {
             Corroboration::Agreed => {
-                corroborated.extend(
-                    view.as_ref()
-                        .into_iter()
-                        .flat_map(|view| &view.modules)
-                        .map(|module| (module.view, module.key)),
-                );
                 retarget_to_pins(
                     &mut manifest,
                     view.as_ref().map_or(&[], |view| view.modules.as_slice()),
@@ -1830,12 +1947,6 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
                     input.path.display(),
                     manifest.module_path
                 ));
-                corroborated.extend(
-                    view.as_ref()
-                        .into_iter()
-                        .flat_map(|view| &view.modules)
-                        .map(|module| (module.view, module.key)),
-                );
                 retarget_to_pins(
                     &mut manifest,
                     view.as_ref().map_or(&[], |view| view.modules.as_slice()),
@@ -1865,6 +1976,18 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
             }
         }
     }
+
+    let (modules, collapsed, differed) = reconcile_scanned_modules(&scan_modules, &mut pinned);
+    if collapsed > 0 {
+        eprintln!(
+            "p11scope: discovery: {collapsed} matching overlay mapping(s) were collapsed \
+             onto one attach target; physical identity is not provable, so published \
+             uncertainty makes this capture PARTIAL"
+        );
+    }
+    counters.object_skips.extend(differed);
+    let corroborated =
+        bind_pending_corroboration(pending_outcomes, &modules, &pinned, &mut counters)?;
 
     let mut replacements = BTreeSet::new();
     for pending in pending_fallbacks {
@@ -1917,7 +2040,6 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
     discovered.modules = modules;
     discovered.manifests = accepted;
     discovered.counters = counters;
-    discovered.corroborated = corroborated;
     discovered.identity_mismatches = identity_mismatches;
     Ok(())
 }
@@ -2570,7 +2692,6 @@ mod tests {
             modules: Vec::new(),
             manifests: Vec::new(),
             counters: DiscoveryCounters::default(),
-            corroborated: BTreeSet::new(),
             identity_mismatches: 0,
             scan_inputs: BTreeMap::new(),
             manifest_inputs: Vec::new(),
@@ -3586,6 +3707,143 @@ mod tests {
     }
 
     #[test]
+    fn repeated_manifest_only_outcomes_preserve_order_and_multiplicity() {
+        let (_, pins) = pinned_self();
+        let summary = pins.pinned().next().unwrap();
+        let path = summary.path.to_string();
+        let sha256 = summary.sha256.to_string();
+        let input = |name| ManifestInput {
+            path: PathBuf::from(name),
+            manifest: manifest_naming(&path, Some(sha256.clone())),
+            pins: pin_as_manifest_object(&path),
+            stale: Vec::new(),
+        };
+        let mut discovered = lifecycle_discovered(Vec::new());
+        discovered.manifest_inputs = vec![input("first.json"), input("second.json")];
+
+        rebuild_discovered(&mut discovered).unwrap();
+
+        assert_eq!(discovered.plan.modules.len(), 1);
+        assert_eq!(
+            discovered.discovery.modules[0].corroboration,
+            ["uncorroborated", "uncorroborated"],
+            "one accepted outcome must remain visible for each repeated --manifest input"
+        );
+    }
+
+    #[test]
+    fn repeated_manifest_outcomes_recompute_after_the_scan_owner_is_removed() {
+        let (view, modules, pins, input) = same_object_scan_and_manifest(0x40);
+        let stale = view.id();
+        let mut duplicate = ManifestInput {
+            path: PathBuf::from("duplicate-manifest.json"),
+            manifest: input.manifest.clone(),
+            pins: pin_as_manifest_object(&input.manifest.module_path),
+            stale: Vec::new(),
+        };
+        let Resolution::Resolved { file_offset, .. } =
+            &mut duplicate.manifest.surfaces[0].functions[0].resolution
+        else {
+            unreachable!()
+        };
+        *file_offset = 0x80;
+        let mut discovered =
+            discovered_from_inputs(vec![view], modules, pins, vec![input, duplicate]);
+
+        assert_eq!(
+            discovered.discovery.modules[0].corroboration,
+            ["agreed", "conflict"],
+            "outcomes retain repeated manifest input order"
+        );
+
+        remove_stale_views(&mut discovered, &[stale]).unwrap();
+
+        assert_eq!(discovered.plan.modules.len(), 1);
+        assert_eq!(
+            discovered.discovery.modules[0].corroboration,
+            ["uncorroborated", "uncorroborated"],
+            "rebuilds must retain each accepted manifest outcome, not synthesize one"
+        );
+    }
+
+    #[test]
+    fn later_manifest_identity_collision_drops_stale_scan_ids_before_planning() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("provider.so");
+        let dependency = dir.path().join("dependency.so");
+        std::fs::copy("/bin/sh", &provider).unwrap();
+        std::fs::copy("/bin/sh", &dependency).unwrap();
+        let paths = vec![provider.clone(), dependency.clone()];
+        let targets = vec![1; 67];
+        let scan = scanned_manifest_replacement(&paths, &targets);
+        let dependency_key = scan.tables[0].entries[0].object;
+        let scan_pins = pin_scan(&scan);
+
+        // `copy` truncates the existing file: its raw map key remains the same,
+        // while its opened pin and hash become incomparable to the scan's pin.
+        std::fs::copy("/bin/true", &dependency).unwrap();
+        let input = manifest_input_from_pinning(
+            "later-collision.json",
+            valid_manifest_for(&paths, &targets),
+        );
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let stale = view.id();
+        let mut discovered = lifecycle_discovered(vec![view]);
+        discovered.scan_inputs.insert(
+            stale,
+            ScanInput {
+                modules: vec![scan],
+                pins: scan_pins,
+                counters: DiscoveryCounters::default(),
+            },
+        );
+        discovered.manifest_inputs.push(input);
+
+        rebuild_discovered(&mut discovered).unwrap();
+
+        assert!(
+            discovered
+                .plan
+                .modules
+                .iter()
+                .all(|module| discovered.pinned.summary(module.object).is_some()),
+            "no pre-absorption module ID may reach the final plan"
+        );
+        assert!(
+            discovered
+                .plan
+                .slots
+                .iter()
+                .all(|slot| discovered.pinned.summary(slot.object).is_some()),
+            "no pre-absorption dependency ID may reach the final plan"
+        );
+        assert!(
+            discovered.plan.slots.iter().all(|slot| {
+                discovered
+                    .pinned
+                    .summary(slot.object)
+                    .is_none_or(|summary| summary.key != dependency_key)
+            }),
+            "the rejected collision group cannot lend its old dependency offsets"
+        );
+        assert_eq!(
+            discovered.discovery.modules[0].corroboration,
+            ["conflict"],
+            "the surviving exact provider owns the conflict outcome"
+        );
+
+        remove_stale_views(&mut discovered, &[stale]).unwrap();
+        assert!(
+            discovered
+                .plan
+                .slots
+                .iter()
+                .all(|slot| discovered.pinned.summary(slot.object).is_some()),
+            "a stable-view rebuild resolves fresh final IDs from pristine inputs"
+        );
+    }
+
+    #[test]
     fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
         let key = ObjectKey {
             device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
@@ -3617,14 +3875,15 @@ mod tests {
             },
         };
         let first = module(ProcessViewId(0), PinnedObjectId(100), "/first.so", 0x10);
-        let second = module(ProcessViewId(1), PinnedObjectId(200), "/second.so", 0x20);
+        let second = module(ProcessViewId(0), PinnedObjectId(200), "/second.so", 0x20);
         let mut counters = DiscoveryCounters::default();
         let plan = build_current_plan(
             &[first, second],
             &[],
             &PinnedObjects::empty(),
             &mut counters,
-            &[(ProcessViewId(1), key)].into_iter().collect(),
+            // The exact final object, not its equal-key peer, owns the outcome.
+            &[PinnedObjectId(200)].into_iter().collect(),
             0,
             0,
         )
@@ -3657,6 +3916,118 @@ mod tests {
             corroboration_of(&counters, second),
             ["conflict"],
             "the exact reconciled module retains its outcome array"
+        );
+    }
+
+    #[test]
+    fn pending_corroboration_follows_the_final_overlay_canonical_id() {
+        let key = ObjectKey {
+            device: p11scope_manifest::maps::Device {
+                major: 0,
+                minor: 102,
+            },
+            inode: 42,
+        };
+        let module = |view: ProcessViewId, path: &str| ReconciledModule {
+            object: PinnedObjectId(200),
+            entry_objects: vec![vec![PinnedObjectId(200)]],
+            scanned: ScannedModule {
+                view,
+                mount_namespace: current_mount_namespace(),
+                key,
+                path: path.into(),
+                exports: vec!["C_GetFunctionList".into()],
+                tables: vec![ScannedTable {
+                    version: (2, 40),
+                    walk: "full",
+                    entries: vec![ScannedEntry {
+                        name: "C_Sign",
+                        object: key,
+                        object_path: path.into(),
+                        file_offset: 0x10,
+                    }],
+                    null_entries: vec![],
+                    unpinned: vec![],
+                    address: 0x7000,
+                }],
+                interfaces: vec![],
+            },
+        };
+        let first = module(ProcessViewId(0), "/overlay/first.so");
+        let second = module(ProcessViewId(1), "/overlay/second.so");
+        let mut counters = DiscoveryCounters::default();
+        let corroborated = bind_pending_corroboration(
+            vec![PendingCorroboration {
+                owners: vec![OutcomeOwner::Scan(ScanOutcomeLocator::module(
+                    &second.scanned,
+                ))],
+                label: "agreed",
+            }],
+            &[first, second],
+            &PinnedObjects::empty(),
+            &mut counters,
+        )
+        .unwrap();
+
+        assert_eq!(corroborated, [PinnedObjectId(200)].into_iter().collect());
+        assert_eq!(
+            counters.corroboration,
+            vec![([PinnedObjectId(200)].into_iter().collect(), "agreed")],
+            "the overlay peer's locator binds to its final canonical ID, never a stale pre-remap ID"
+        );
+    }
+
+    #[test]
+    fn pending_corroboration_rebuild_resolves_the_current_final_id() {
+        let key = ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 42,
+        };
+        let module = |object| ReconciledModule {
+            object,
+            entry_objects: vec![vec![object]],
+            scanned: ScannedModule {
+                view: ProcessViewId(0),
+                mount_namespace: current_mount_namespace(),
+                key,
+                path: "/stable-view.so".into(),
+                exports: vec!["C_GetFunctionList".into()],
+                tables: vec![ScannedTable {
+                    version: (2, 40),
+                    walk: "full",
+                    entries: vec![ScannedEntry {
+                        name: "C_Sign",
+                        object: key,
+                        object_path: "/stable-view.so".into(),
+                        file_offset: 0x10,
+                    }],
+                    null_entries: vec![],
+                    unpinned: vec![],
+                    address: 0x7000,
+                }],
+                interfaces: vec![],
+            },
+        };
+        let first = module(PinnedObjectId(10));
+        let owner = OutcomeOwner::Scan(ScanOutcomeLocator::module(&first.scanned));
+        let second = module(PinnedObjectId(20));
+        let mut counters = DiscoveryCounters::default();
+        let corroborated = bind_pending_corroboration(
+            vec![PendingCorroboration {
+                owners: vec![owner],
+                label: "conflict",
+            }],
+            &[second],
+            &PinnedObjects::empty(),
+            &mut counters,
+        )
+        .unwrap();
+
+        assert_eq!(corroborated, [PinnedObjectId(20)].into_iter().collect());
+        assert_eq!(
+            counters.corroboration,
+            vec![([PinnedObjectId(20)].into_iter().collect(), "conflict")],
+            "a rebuild cannot retain an earlier capture-local numeric ID"
         );
     }
 

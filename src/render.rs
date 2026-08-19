@@ -1365,35 +1365,58 @@ mod tests {
 
     #[test]
     fn scan_only_count_only_event_keeps_aggregate_output_and_no_semantic_payload() {
+        use crate::discovery::identity::ReconciledModule;
+        use crate::discovery::scan::{ScannedEntry, ScannedModule, ScannedTable};
+        use crate::process::{MountNamespaceId, ProcessViewId};
         use p11scope_ebpf_common::{Event, SlotSemantics, bucket_of, capture};
+        use p11scope_manifest::maps::{Device, ObjectKey};
 
-        let plan = crate::plan::AttachPlan {
-            slots: vec![crate::plan::Slot {
-                index: 0,
-                object: crate::plan::TEST_PINNED_OBJECT,
-                object_path: "/opt/p11.so".into(),
-                file_offset: 0x10,
-                names: vec!["C_OpenSession".into()],
-                aliased: false,
-                semantics: SlotSemantics::COUNT_ONLY,
-                semantic_authorized: false,
-                semantic_ambiguous: false,
-                fork_safe: false,
-                module_ids: vec![crate::plan::ModuleId(0)],
-            }],
-            entries_seen: 1,
-            ..empty_plan()
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 42,
         };
+        let plan = crate::plan::build_from_reconciled_modules(&[ReconciledModule {
+            object: crate::plan::TEST_PINNED_OBJECT,
+            entry_objects: vec![vec![crate::plan::TEST_PINNED_OBJECT]],
+            scanned: ScannedModule {
+                view: ProcessViewId(0),
+                mount_namespace: MountNamespaceId {
+                    device: 1,
+                    inode: 1,
+                },
+                key,
+                path: "/opt/p11.so".into(),
+                exports: vec!["C_GetFunctionList".into()],
+                tables: vec![ScannedTable {
+                    version: (2, 40),
+                    walk: "full",
+                    entries: vec![ScannedEntry {
+                        name: "C_OpenSession",
+                        object: key,
+                        object_path: "/opt/p11.so".into(),
+                        file_offset: 0x10,
+                    }],
+                    null_entries: vec![],
+                    unpinned: vec![],
+                    address: 0x7000,
+                }],
+                interfaces: vec![],
+            },
+        }]);
+        assert_eq!(plan.entries_seen, 1);
+        assert_eq!(plan.slots.len(), 1);
+        assert_eq!(plan.slots[0].semantics, SlotSemantics::COUNT_ONLY);
+        assert!(!plan.slots[0].semantic_authorized);
         let mut state = crate::semantics::State::with_policy(&plan, CapturePolicy::Allowlisted);
-        let hostile = Event {
-            ts_ns: 0,
+        let hostile = |index, rv| Event {
+            ts_ns: index * 1_000,
             duration_ns: 100,
             pid_tgid: (100u64 << 32) | 1,
             cgroup_id: 7,
             session: 0xdead_beef,
             mechanism: 0xa11c_e000_0000_0000,
             capture: capture::MECHANISM_VALUE,
-            rv: pkcs11_proxy_ng_types::CkRv::PENDING.0,
+            rv,
             p0: 0xa11c_e000_0000_0001,
             p1: 0xa11c_e000_0000_0002,
             p2: 0xa11c_e000_0000_0003,
@@ -1407,7 +1430,25 @@ mod tests {
             attr_bools_seen: 0xff,
             ..Event::default()
         };
-        state.observe(&hostile);
+        let events: Vec<_> = (0..25u64)
+            .map(|index| {
+                hostile(
+                    index,
+                    if index < 17 {
+                        0
+                    } else if index < 20 {
+                        pkcs11_proxy_ng_types::CkRv::GENERAL_ERROR.0
+                    } else {
+                        pkcs11_proxy_ng_types::CkRv::PENDING.0
+                    },
+                )
+            })
+            .collect();
+        let mut tracer = crate::trace::Tracer::new(&plan);
+        let lines: Vec<_> = events
+            .iter()
+            .map(|event| tracer.on_event(event, &mut state))
+            .collect();
 
         let mut report = report("C_OpenSession", 25, 0, false);
         report.semantic_authorized = false;
@@ -1416,18 +1457,87 @@ mod tests {
         report.total_ns = 2_500;
         report.max_ns = 100;
         report.buckets[bucket_of(100) as usize] = 25;
-        report.rv_counts.insert(0, 20);
+        report.rv_counts.insert(0, 17);
+        report
+            .rv_counts
+            .insert(pkcs11_proxy_ng_types::CkRv::GENERAL_ERROR.0, 3);
         report
             .rv_counts
             .insert(pkcs11_proxy_ng_types::CkRv::PENDING.0, 5);
+        let observed_rvs =
+            events
+                .iter()
+                .fold(std::collections::BTreeMap::new(), |mut counts, event| {
+                    *counts.entry(event.rv).or_insert(0) += 1;
+                    counts
+                });
+        assert_eq!(report.rv_counts, observed_rvs);
+        assert_eq!(
+            report.errors,
+            events
+                .iter()
+                .filter(|event| {
+                    event.rv != 0 && event.rv != pkcs11_proxy_ng_types::CkRv::PENDING.0
+                })
+                .count() as u64
+        );
+        assert_eq!(
+            report.total_ns,
+            events.iter().map(|event| event.duration_ns).sum::<u64>()
+        );
+        assert_eq!(
+            report.max_ns,
+            events.iter().map(|event| event.duration_ns).max().unwrap()
+        );
 
         let mut ev = evidence();
-        ev.table_entries = 1;
-        ev.slots = 1;
+        ev.table_entries = plan.entries_seen;
+        ev.slots = plan.slots.len();
         ev.attached_probes = 2;
         ev.semantic_unverified_slots = 1;
-        ev.surfaces[0].source = "scan".into();
+        ev.surfaces = plan.surfaces.clone();
+        let discovered = &mut ev.discovery.modules[0];
+        discovered.dev = (key.device.major, key.device.minor);
+        discovered.ino = key.inode;
+        discovered.path = plan.modules[0].path.clone();
+        discovered.objects[0].dev = discovered.dev;
+        discovered.objects[0].ino = discovered.ino;
+        discovered.objects[0].path = discovered.path.clone();
+        discovered.tables = plan.modules[0].tables.clone();
+        discovered.interfaces = plan.modules[0].interfaces;
         ev.verdict();
+
+        assert_eq!(
+            state.cgroups()[&7].calls,
+            report.calls,
+            "the fixture must send every aggregate call through State"
+        );
+        assert_eq!(state.cgroups()[&7].errors, report.errors);
+        assert!(state.mechanisms().is_empty());
+        assert_eq!(state.sessions(), crate::semantics::SessionStats::default());
+        assert!(state.logins().is_empty());
+        assert!(state.templates().is_empty());
+        assert_eq!(
+            ev.surfaces[0].functions, ev.table_entries,
+            "the scan table, surface, and public table-entry count must agree"
+        );
+        assert_eq!(ev.discovery.modules[0].tables, plan.modules[0].tables);
+        assert_eq!(lines.len(), report.calls as usize);
+        for (event, line) in events.iter().zip(&lines) {
+            let rv = match event.rv {
+                0 => "CKR_OK",
+                value if value == pkcs11_proxy_ng_types::CkRv::GENERAL_ERROR.0 => {
+                    "CKR_GENERAL_ERROR"
+                }
+                value if value == pkcs11_proxy_ng_types::CkRv::PENDING.0 => "CKR_PENDING",
+                value => unreachable!("unexpected fixture RV {value:#x}"),
+            };
+            assert_eq!(
+                &line[15..],
+                format!(" pid 100 tid 1 C_OpenSession [semantics unverified] → {rv} 100ns"),
+                "the generated trace must retain every aggregate RV without semantic payload"
+            );
+        }
         let profile = profile_json(&[report], &ev, &state, &capture_fixture());
 
         assert_eq!(profile["evidence"]["completeness"], "PARTIAL");
@@ -1442,12 +1552,22 @@ mod tests {
         assert_eq!(
             function["rv_counts"],
             serde_json::json!({
-                "0x0000000000000000": 20,
+                "0x0000000000000000": 17,
+                "0x0000000000000005": 3,
                 "0x0000000000000204": 5,
             })
         );
-        assert_eq!(function["latency_ns"]["total"], 2_500);
-        assert_eq!(function["latency_ns"]["max"], 100);
+        assert_eq!(
+            function["latency_ns"],
+            serde_json::json!({
+                "approximate": true,
+                "p50": 64,
+                "p95": 64,
+                "p99": 64,
+                "total": 2_500,
+                "max": 100,
+            })
+        );
         assert_eq!(profile["mechanisms"], serde_json::json!([]));
         assert_eq!(
             profile["sessions"],
@@ -1462,23 +1582,30 @@ mod tests {
         );
         assert_eq!(profile["logins"], serde_json::json!({}));
         assert_eq!(profile["templates"]["operations"], serde_json::json!([]));
-        assert_eq!(profile["cgroups"][0]["calls"], 1);
+        assert_eq!(profile["cgroups"][0]["calls"], 25);
+        assert_eq!(profile["cgroups"][0]["errors"], 3);
         assert_eq!(profile["cgroups"][0]["mechanisms"], serde_json::json!([]));
 
-        let rendered = profile.to_string();
+        let rendered = format!("{profile}\n{}", lines.join("\n"));
         for value in [
-            hostile.session,
-            hostile.mechanism,
-            hostile.p0,
-            hostile.p1,
-            hostile.p2,
-            u64::from(hostile.user_type),
-            hostile.attr_types[0],
+            events[0].session,
+            events[0].mechanism,
+            events[0].p0,
+            events[0].p1,
+            events[0].p2,
+            u64::from(events[0].user_type),
+            events[0].attr_types[0],
         ] {
-            assert!(
-                !rendered.contains(&value.to_string()),
-                "scan-only semantic payload leaked: {value:#x} in {rendered}"
-            );
+            for spelling in [
+                value.to_string(),
+                format!("0x{value:x}"),
+                format!("0x{value:016x}"),
+            ] {
+                assert!(
+                    !rendered.contains(&spelling),
+                    "scan-only semantic payload leaked: {spelling} in {rendered}"
+                );
+            }
         }
     }
 

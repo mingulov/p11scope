@@ -234,6 +234,70 @@ def assert_aggregate_metrics(doc):
     assert sum(item["calls"] for item in doc["functions"]) == 25, doc["functions"]
 
 
+def assert_scan_only_hostile_output(doc, text, hostile):
+    """The scan-only COUNT_ONLY rendering contract, independent of live BPF."""
+    assert doc["capture"]["mode"] == "profile", doc["capture"]
+    assert doc["capture"]["privacy_mode"] == "allowlisted", doc["capture"]
+    profile_terminal(doc)
+    evidence = doc["evidence"]
+    assert evidence["table_entries"] == evidence["slots"] == 1, evidence
+    assert evidence["attached_probes"] == 2, evidence
+    assert evidence["surfaces"] == [{
+        "source": "scan", "walk": "full", "acquisition": "ok", "functions": 1,
+    }], evidence
+    assert len(evidence["discovery"]) == 1, evidence
+    discovered = evidence["discovery"][0]
+    module = {"dev": [8, 1], "ino": 42, "sha256": "11" * 32}
+    assert {field: discovered[field] for field in module} == module, discovered
+    assert discovered["sources"] == ["scan"], discovered
+    assert discovered["tables"] == [
+        {"version": [2, 40], "entries": 1, "source": "scan"},
+    ], discovered
+    assert doc["capture"]["modules"] == [{
+        **module, "path": "/opt/p11.so", "build_id": "aabb",
+    }], doc["capture"]
+    assert doc["functions"] == [{
+        "names": ["C_OpenSession"], "aliased": False, "module": module,
+        "module_ambiguous": False, "calls": 25, "errors": 3,
+        "pending_returns": 5, "in_flight": 0,
+        "latency_ns": {
+            "approximate": True, "p50": 64, "p95": 64, "p99": 64,
+            "total": 2500, "max": 100,
+        },
+        "rv_counts": {
+            "0x0000000000000000": 17,
+            "0x0000000000000005": 3,
+            "0x0000000000000204": 5,
+        },
+    }], doc["functions"]
+    assert doc["mechanisms"] == [], doc["mechanisms"]
+    assert doc["sessions"] == {
+        "opened": 0, "inherited": 0, "closed": 0, "async_opened": 0,
+        "peak_concurrent": 0, "balance": 0,
+    }, doc["sessions"]
+    assert doc["logins"] == {}, doc["logins"]
+    assert doc["templates"]["operations"] == [], doc["templates"]
+    assert doc["cgroups"] == [{
+        "cgroup_id": 7, "label": None, "calls": 25, "errors": 3,
+        "mechanisms": [],
+    }], doc["cgroups"]
+    rendered = json.dumps(doc, sort_keys=True) + "\n" + text
+    for sentinel in hostile:
+        assert sentinel not in rendered, f"scan-only output leaked {sentinel}"
+    assert text.startswith("CAPTURE privacy=allowlisted\n"), text[:200]
+    terminal = trace_terminal(text, "allowlisted")
+    assert terminal["table_entries"] == terminal["slots"] == 1, terminal
+    assert terminal["attached_probes"] == 2, terminal
+    assert terminal["semantic_capture_failures"] == 0, terminal
+    events = [line for line in text.splitlines()
+              if line and not line.startswith(("CAPTURE ", "EVIDENCE ", "LOST "))]
+    assert events == [
+        "00:00:00.000000 pid 100 tid 1 C_OpenSession [semantics unverified] → CKR_OK 100ns",
+        "00:00:00.000001 pid 100 tid 1 C_OpenSession [semantics unverified] → CKR_GENERAL_ERROR 100ns",
+        "00:00:00.000024 pid 100 tid 1 C_OpenSession [semantics unverified] → CKR_PENDING 100ns",
+    ], events
+
+
 def read_json(path):
     with open(path, encoding="utf-8") as handle:
         return json.load(handle)
@@ -687,6 +751,81 @@ if work == "--self-test":
         "functions": [{"calls": 25}],
     }
     assert_aggregate_metrics(aggregate)
+
+    # This preserves the artifact-side output/privacy contract. The
+    # producer-shaped Rust test proves the State/Tracer path; this oracle keeps
+    # its exact scan-only rendered shape and hostile-output refusal in canaries.
+    hostile = [
+        "CANARY_SCAN_ONLY_SESSION_PAYLOAD",
+        "CANARY_SCAN_ONLY_MECHANISM_PAYLOAD",
+        "CANARY_SCAN_ONLY_ARGUMENT_PAYLOAD",
+    ]
+    scan_module = {"dev": [8, 1], "ino": 42, "sha256": "11" * 32}
+    scan_only = {
+        "schema": "pkcs11-scope/observed-profile/v2",
+        "capture": {
+            "start": "t0", "end": "t1", "mode": "profile",
+            "privacy_mode": "allowlisted", "kernel": "6.8.0",
+            "modules": [{
+                **scan_module, "path": "/opt/p11.so", "build_id": "aabb",
+            }],
+        },
+        "evidence": {
+            "completeness": "PARTIAL", "table_entries": 1, "slots": 1,
+            "attached_probes": 2,
+            "surfaces": [{
+                "source": "scan", "walk": "full", "acquisition": "ok",
+                "functions": 1,
+            }],
+            "discovery": [{
+                **scan_module, "path": "/opt/p11.so", "build_id": "aabb",
+                "sources": ["scan"],
+                "tables": [{"version": [2, 40], "entries": 1, "source": "scan"}],
+            }],
+        },
+        "functions": [{
+            "names": ["C_OpenSession"], "aliased": False, "module": scan_module,
+            "module_ambiguous": False, "calls": 25, "errors": 3,
+            "pending_returns": 5, "in_flight": 0,
+            "latency_ns": {
+                "approximate": True, "p50": 64, "p95": 64, "p99": 64,
+                "total": 2500, "max": 100,
+            },
+            "rv_counts": {
+                "0x0000000000000000": 17,
+                "0x0000000000000005": 3,
+                "0x0000000000000204": 5,
+            },
+        }],
+        "mechanisms": [],
+        "sessions": {
+            "opened": 0, "inherited": 0, "closed": 0, "async_opened": 0,
+            "peak_concurrent": 0, "balance": 0,
+        },
+        "logins": {}, "templates": {"operations": []},
+        "cgroups": [{
+            "cgroup_id": 7, "label": None, "calls": 25, "errors": 3,
+            "mechanisms": [],
+        }],
+    }
+    scan_terminal = {
+        "completeness": "PARTIAL", "privacy_mode": "allowlisted",
+        "capture_aborted": None, "final_drain": False, "counters_available": True,
+        "table_entries": 1, "slots": 1, "attached_probes": 2,
+        "semantic_capture_failures": 0,
+    }
+    scan_trace = "CAPTURE privacy=allowlisted\n" + "\n".join([
+        "00:00:00.000000 pid 100 tid 1 C_OpenSession [semantics unverified] → CKR_OK 100ns",
+        "00:00:00.000001 pid 100 tid 1 C_OpenSession [semantics unverified] → CKR_GENERAL_ERROR 100ns",
+        "00:00:00.000024 pid 100 tid 1 C_OpenSession [semantics unverified] → CKR_PENDING 100ns",
+    ]) + "\nEVIDENCE " + json.dumps(scan_terminal)
+    assert_scan_only_hostile_output(scan_only, scan_trace, hostile)
+    reject("scan-only hostile trace payload", lambda: assert_scan_only_hostile_output(
+        scan_only,
+        scan_trace.replace("CKR_PENDING", "CKR_PENDING " + hostile[0]),
+        hostile,
+    ))
+    print("scan-only hostile output contract: OK")
 
     for family, sentinel in sorted(fixture_sentinels().items()):
         control = positive_control_content(sentinel)

@@ -758,6 +758,16 @@ private_recover_qemu_pid() {
     PRIVATE_QEMU_PID=$candidate
 }
 
+private_qemu_exited() {
+    local candidate=$1 state
+    [[ ! -r /proc/$candidate/stat ]] && return 0
+    state=$(awk '{print $3}' "/proc/$candidate/stat" 2>/dev/null) || {
+        [[ ! -r /proc/$candidate/stat ]]
+        return
+    }
+    [[ $state == Z ]]
+}
+
 private_cleanup_lane() {
     local rc
     [[ ${PRIVATE_LANE_OWNED-0} == 1 ]] || { [[ ${PRIVATE_LANE_INTERRUPTED-0} != 1 ]] && return 0 || return 64; }
@@ -798,7 +808,7 @@ private_disarm_lane_traps() {
 }
 
 private_finish_lane() {
-    local shutdown_rc=0 post_rc=0 forced=0 unexpected_exit=0 attempt wait_rc=0
+    local shutdown_rc=0 post_rc=0 forced=0 unexpected_exit=0 attempt candidate wait_rc=0
     if [[ ${PRIVATE_LANE_OWNED-0} == 1 ]] && ! private_recover_qemu_pid; then
         post_rc=64
     fi
@@ -817,7 +827,11 @@ private_finish_lane() {
                 PRIVATE_QEMU_PID=
                 break
             fi
-            private_recover_qemu_pid || { wait_rc=64; break; }
+            candidate=$PRIVATE_QEMU_PID
+            if ! private_recover_qemu_pid; then
+                private_qemu_exited "$candidate" && PRIVATE_QEMU_PID= || wait_rc=64
+                break
+            fi
             sleep 1
         done
         (( wait_rc == 0 )) || post_rc=64
@@ -839,7 +853,11 @@ private_finish_lane() {
                     PRIVATE_QEMU_PID=
                     break
                 fi
-                private_recover_qemu_pid || { post_rc=64; break; }
+                candidate=$PRIVATE_QEMU_PID
+                if ! private_recover_qemu_pid; then
+                    private_qemu_exited "$candidate" && PRIVATE_QEMU_PID= || post_rc=64
+                    break
+                fi
                 sleep 1
             done
             [[ -z $PRIVATE_QEMU_PID || ! -r /proc/$PRIVATE_QEMU_PID/stat ]] || post_rc=64

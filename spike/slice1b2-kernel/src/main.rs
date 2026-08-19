@@ -4974,6 +4974,94 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_accepts_a_qemu_exit_racing_identity_revalidation() {
+        for (name, script) in [
+            ("kernel", concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh")),
+            (
+                "loader",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../slice1b2-loader-host/run.sh"
+                ),
+            ),
+        ] {
+            let temp = TestDir::new(&format!("qemu-exit-race-{name}"));
+            let run = temp.path().join("run");
+            std::fs::create_dir(&run).unwrap();
+            let retained = temp.path().join("retained.qcow2");
+            let official = temp.path().join("official.qcow2");
+            std::fs::write(&retained, b"retained").unwrap();
+            std::fs::write(&official, b"official").unwrap();
+            std::fs::set_permissions(&retained, std::fs::Permissions::from_mode(0o444)).unwrap();
+            std::fs::write(run.join("runtime.qcow2"), b"runtime").unwrap();
+            std::fs::write(run.join("runtime.serial.log"), b"reboot: Power down\n").unwrap();
+            std::fs::write(run.join("retained.before.sha256"), b"same\n").unwrap();
+            let body = concat!(
+                "source \"$1\"; /bin/sleep 60 & PRIVATE_QEMU_PID=$!; ",
+                "PRIVATE_LANE_OWNED=1; PRIVATE_RUN_DIR=$2; PRIVATE_RETAINED=$3; ",
+                "PRIVATE_OFFICIAL=$4; PRIVATE_KNOWN_HOSTS=/known; PRIVATE_PORT=2222; recoveries=0; ",
+                "private_recover_qemu_pid() { recoveries=$((recoveries + 1)); ",
+                "if (( recoveries == 1 )); then return 0; fi; candidate=$PRIVATE_QEMU_PID; ",
+                "/bin/kill \"$candidate\"; wait \"$candidate\" 2>/dev/null; PRIVATE_QEMU_PID=; return 64; }; ",
+                "strict_ssh() { return 0; }; qemu-img() { return 0; }; ",
+                "validate_backing_chain_file() { return 0; }; sha256sum() { printf 'same\\n'; }; ",
+                "require_free_bytes() { printf '%s=1\\n' \"$1\"; }; ss() { return 0; }; ",
+                "private_finish_lane"
+            );
+            let output = shell_output(
+                script,
+                body,
+                &[run.as_os_str(), retained.as_os_str(), official.as_os_str()],
+            );
+            assert!(
+                output.status.success(),
+                "{name} misclassified a confirmed exited QEMU: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_accepts_an_unreaped_qemu_as_exited() {
+        for (name, script) in [
+            ("kernel", concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh")),
+            (
+                "loader",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../slice1b2-loader-host/run.sh"
+                ),
+            ),
+        ] {
+            let mut child = Command::new("/bin/true").spawn().unwrap();
+            let pid = child.id().to_string();
+            let stat = format!("/proc/{pid}/stat");
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let state = std::fs::read_to_string(&stat)
+                    .ok()
+                    .and_then(|line| line.rsplit_once(") ").map(|(_, tail)| tail.as_bytes()[0]));
+                if state == Some(b'Z') {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "child did not become a zombie");
+                thread::sleep(Duration::from_millis(1));
+            }
+            let output = shell_output(
+                script,
+                "source \"$1\"; private_qemu_exited \"$2\"",
+                &[OsStr::new(&pid)],
+            );
+            child.wait().unwrap();
+            assert!(
+                output.status.success(),
+                "{name} rejected a zombie QEMU: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
     fn cleanup_defers_int_and_term_until_finish_completes() {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
         for (name, signal) in [("INT", libc::SIGINT), ("TERM", libc::SIGTERM)] {

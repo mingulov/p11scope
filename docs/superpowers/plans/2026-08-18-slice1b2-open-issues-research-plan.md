@@ -1,5 +1,14 @@
 # Slice 1b-2 Open Issues — Research and Improvement Plan (rev 3, after two reviews)
 
+> **Historical execution plan (2026-08-19):** Tasks 0–8 and 10 ran, but the
+> later no-busy-wait campaign and its controller review supersede the promotion
+> wording in Tasks 4–5. The retained 120/120 result is frozen-oracle, pre-fix,
+> outcome-B-only feasibility evidence; promotion is blocked. The replacement
+> campaign is UNRUN and is controlled by the
+> [pause amendment](../specs/2026-08-19-slice1b2-no-busy-wait-pause-amendment.md).
+> Task 9 remains dormant. The unchecked boxes below preserve the historical
+> recipe; they are not current execution instructions.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. This plan is **input to the worker already running on `codex/slice1b-1-recovery`**; it proposes, it does not override the owner-approved corrective design. Where it deviates, the deviation is named and needs an owner decision (§ Owner decisions).
 
 **Goal:** Turn the open Slice 1b-2 gates (A verifier, revised B pause, C loader timing, ptrace-free loader events) from `TIMEOUT / INCOMPLETE / UNRUN` into finite results that satisfy the approved corrective design, using the cheapest evidence lanes that still satisfy it, and decide with an experiment how much of the loader-timing machinery the product needs.

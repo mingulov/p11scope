@@ -414,12 +414,18 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     uretprobes, `DESCRIPTORS` + attach-cookie semantics with dynamic slot allocation,
     `discovery::Engine`, `pause.rs`, `run -- cmd`, `attach_gap_ms`, mid-capture
     module-ambiguity purge. **Research status (2026-08-19): final frozen Gate A
-    PASS on 5.15/6.8; Gate B KVM campaign PASS 120/120 (the retained Noble TCG
-    campaign is TIMEOUT/INCOMPLETE because the accepted 150,091-insn program
-    takes 253 s under TCG); ptrace-free loader event path PASS on both kernels;
+    PASS on 5.15/6.8. The frozen-oracle Gate B KVM campaign recorded 120/120,
+    all as outcome B, but controller review found owner-2 cleanup and outcome-A
+    causal-deadline defects plus an oracle mismatch. It is immutable pre-fix
+    feasibility evidence; promotion is blocked and the amended no-busy-wait
+    campaign is UNRUN. The retained Noble TCG Gate B campaign is
+    TIMEOUT/INCOMPLETE because the accepted 150,091-insn program takes 253 s
+    under TCG. The ptrace-free loader event path passed on both kernels;
     attach-first experiment PASS 160/160 and proves a second owned pause covers
-    hidden-table constructor calls. Task 9 timing catalog skipped by D3. Product
-    implementation remains OPEN and starts only after Slice 1b-1 lands.**
+    hidden-table constructor calls. Task 9 timing catalog was skipped by D3.
+    Product implementation remains OPEN and starts only after Slice 1b-1
+    lands. See the
+    [pause amendment](../specs/2026-08-19-slice1b2-no-busy-wait-pause-amendment.md).**
 - **Slice 2 — capture quality**: ring/epoll, budgets, safe-policy params, per-module profile
   sections, filters, snapshots.
 - **Slice 3 — structure**: module split, evidence plumbing, docs consolidation, multi-kernel CI.

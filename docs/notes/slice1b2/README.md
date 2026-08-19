@@ -7,7 +7,15 @@ SHA-256 manifest, and this file carries only digests, pointers, and finite
 facts. Nothing under that root is release output; private spike bundles are
 separately permissioned (corrective design §9.4).
 
-## Final research-plan handoff (2026-08-19)
+## Historical research-plan handoff (2026-08-19)
+
+The exact results below remain immutable, but their former promotion wording
+is superseded. The `a227dab` Gate B object used a winner-side busy wait. A later
+no-busy-wait frozen campaign recorded 120/120, all as outcome B, but controller
+and independent review found owner-2 cleanup, outcome-A causal-deadline, and
+oracle-contract defects. Neither campaign is product evidence. Promotion is
+blocked; the amended campaign is `UNRUN` under
+`docs/superpowers/specs/2026-08-19-slice1b2-no-busy-wait-pause-amendment.md`.
 
 Final source commit `a227dabe7ab0fb62eee6ec9cca1f4afbad46eb03`:
 
@@ -29,9 +37,10 @@ Final source commit `a227dabe7ab0fb62eee6ec9cca1f4afbad46eb03`:
   pause. Decision D3 is **no**: Task 9's timing catalog is skipped on the
   critical path. See `attach-first-vs-timing-catalog.md`.
 
-This completes the research plan, not Slice 1b-2 product support. P4 remains:
-land Slice 1b-1, then implement `discovery::Engine`, dynamic slots/cookies,
-loss/completeness evidence, and the explicit two-pause `run` policy.
+This completed the historical research plan, not Slice 1b-2 product support.
+P4 remains: land Slice 1b-1, implement and re-prove the amended no-busy-wait
+A/B lifecycle, then implement `discovery::Engine`, dynamic slots/cookies, and
+loss/completeness evidence.
 
 The remaining sections preserve the earlier campaigns and failure progression
 for provenance. Their `UNRUN`, `FAIL`, and `TIMEOUT / INCOMPLETE` results stay

@@ -12,19 +12,29 @@ The corrective research implementation is complete through Task 8 at commit
 `a227dabe7ab0fb62eee6ec9cca1f4afbad46eb03`. Task 9 was deliberately skipped
 after Task 8 resolved decision D3. This is spike evidence, not product support.
 
+The later pause-protocol disposition supersedes the older promotion wording
+below. The `a227dab` Gate B campaign used a winner-side busy wait and is not a
+product candidate. A later no-busy-wait frozen campaign recorded 120/120, all
+as outcome B, but controller and independent review found owner-2 cleanup,
+outcome-A causal-deadline, and oracle-contract defects. Both campaigns remain
+immutable feasibility evidence. Promotion is blocked; the amended campaign is
+UNRUN and is governed by
+`docs/superpowers/specs/2026-08-19-slice1b2-no-busy-wait-pause-amendment.md`.
+
 | Work item | Current result | Consequence |
 | --- | --- | --- |
 | Gate A: four discovery programs | **PASS** on Jammy 5.15 and Noble 6.8 with the final frozen A/B object | The constant-offset record initializer removed the verifier-state explosion without lowering the 16-interface or 104-function limits. |
-| Gate B: pause/attach timing | Final KVM campaign **120/120 PASS** (3×20 on each kernel) | The same frozen Noble lanes under TCG remain `TIMEOUT / INCOMPLETE`. STATS-only accepts `signal_return` in 1028 ms under KVM and 253,049 ms under TCG (150,091 verified instructions), proving acceleration is the compatibility boundary; verbose logging adds cost but the BPF is accepted. |
+| Gate B: pause/attach timing | Two frozen campaigns recorded **120/120**, but neither is promotable | The first used a busy wait; the later no-delay campaign was outcome-B-only and has reviewed lifecycle/oracle defects. The amended campaign is `UNRUN`. The same frozen Noble lanes under TCG remain `TIMEOUT / INCOMPLETE`; STATS-only still proves the verifier accepts the program under sufficient acceleration. |
 | Loader event path | **PASS** on Jammy 5.15 and Noble 6.8 | The ptrace-free `_dl_debug_state` uprobe works on both; 5.15 uses the validated runtime-IP fallback because `bpf_get_func_ip` returns zero there. |
 | Attach-first experiment | **160/160 retained attempts validated** across host and Noble | One pause covers exported providers. Hidden-table constructor calls escape with one pause but are covered with the measured second pause. Task 9's timing catalog is not on the critical path. |
 | Slice 1b-1 semantic authority | Owner-approved implementation exists on the recovery line; integration remains separate | An accepted explicit manifest attests only its exact pinned object + offset + canonical name. Scan-only claims remain count-only/PARTIAL. |
 
 No kernel bisection is required. The remaining work is production integration:
-land Slice 1b-1, then implement the live discovery engine, dynamic attachment,
-completeness evidence, and the two-pause `run` policy. KVM is required for the
-supported 120-second research gate; TCG is retained as an explicit unsupported
-speed result, not a kernel or BPF failure.
+land Slice 1b-1, implement the reviewed no-busy-wait A/B pause protocol, rerun
+its full campaign, then implement the live discovery engine, dynamic
+attachment, and completeness evidence. KVM is required for the supported
+120-second research gate; TCG is retained as an explicit unsupported speed
+result, not a kernel or BPF failure.
 
 ## What works with and without a manifest
 
@@ -217,11 +227,12 @@ fall back silently to procfs.
 
 ### I7. Pause/resume timing is now an empirical result
 
-**Status:** corrected protocol implemented and exercised. The final KVM Gate B
-campaign is 120/120 PASS (60 per kernel). The separate Noble TCG campaign is
-`TIMEOUT / INCOMPLETE` before trials, while its STATS diagnostic accepts both
-BPF programs after 253 seconds. Task 8 independently completed 160/160
-host/Noble attempts.
+**Status:** feasibility exercised; promotion blocked. The older busy-wait KVM
+campaign and the later no-delay, outcome-B-only campaign each recorded 120/120,
+but neither satisfies the reviewed product contract. The separate Noble TCG
+campaign is `TIMEOUT / INCOMPLETE` before trials, while its STATS diagnostic
+accepts both BPF programs after 253 seconds. Task 8 independently completed
+160/160 host/Noble attempts.
 
 `bpf_send_signal(SIGSTOP) == 0` means the request was accepted, not that the
 thread group was already stopped. Gate B therefore requires two exact all-`T`
@@ -231,10 +242,11 @@ original pidfd. It runs 20 fresh children per kernel.
 
 **Consequence:** one pause is sufficient for exported-provider symbols but not
 for hidden table functions: constructor calls escaped in all 40 one-pause
-hidden attempts. The second owned pause attached all 104 slots before the call
-in all 40 host/Noble attempts. Production should keep pause opt-in, expose the
-live window as `PARTIAL` when unprotected, and permit stopping only owned
-`run -- command` children through the original pidfd.
+hidden attempts. A second owned pause attached all 104 slots before the call in
+all 40 host/Noble attempts. Production must implement the amended no-busy-wait
+A/B lifecycle, keep pause opt-in, expose the live window as `PARTIAL` when
+unprotected, and stop only owned `run -- command` children through the original
+pidfd. A fresh reviewed campaign is mandatory before promotion.
 
 ### I8. Dynamic attach and evidence semantics are still production work
 
@@ -281,7 +293,7 @@ zero-initialization shape, or a bounded program split may be researched, but it
 must preserve the same observable limits and be re-reviewed before changing
 the frozen gate.
 
-### P2. Make Gate B pause timing repeatable — research complete
+### P2. Make Gate B pause timing repeatable — feasibility shown, promotion blocked
 
 - Use one capture-level pause owner and one original pidfd per fresh child.
 - Reserve the event before requesting `SIGSTOP`; record request acceptance
@@ -297,6 +309,9 @@ The first research step is repeatability/root-cause data on the existing 5.15
 variance—not a broad kernel bisection. Useful variables are scheduler/TCG
 timing, `/proc/<pid>/task/*/stat` transition timing, group-stop observation,
 pidfd resume ordering, and exact sample timestamps.
+
+The reviewed no-busy-wait amendment supersedes this historical recipe. Its
+implementation, oracle, freeze, and full six-lane campaign remain `UNRUN`.
 
 ### P3. Qualify loader hooks per exact build — precontrols complete
 
@@ -360,10 +375,12 @@ behavior honest; it does not implement late discovery.
    `dlopen` hit; glibc 2.35/2.39 remain negative controls.
 3. Debian 13 and Ubuntu 26.04 provide the tested fixed packages, bound by
    source provenance, loader/libc hashes, and runtime witnesses.
-4. The corrected 100 ms owner protocol is stable in the final KVM campaign.
-   TCG is too slow for the 120-second frozen loader bound, not a BPF rejection.
-5. The final A/B and loader artifacts pass unchanged on both required kernels
-   under KVM. Task 8 additionally passes all 160 host/Noble attempts.
+4. The retained KVM campaigns demonstrated pause feasibility, but their
+   busy-wait or reviewed lifecycle/oracle defects block promotion. TCG is too
+   slow for the 120-second frozen loader bound, not a BPF rejection.
+5. The retained A/B and loader artifacts ran on both required kernels under
+   KVM. Task 8 additionally passed all 160 host/Noble attempts; the amended
+   Gate B artifact and campaign remain `UNRUN`.
 
 The useful handoff from external research is raw, reproducible evidence:
 exact source commit/package, build IDs and SHA-256 values, kernel, toolchain,
@@ -379,8 +396,9 @@ Loader qualification remains per exact loader/libc identity, not per kernel.
 
 ## Product decision implied by current evidence
 
-Slice 1b-2 should continue using the proved flat initializer, ptrace-free
-every-hit loader hook, and explicit two-pause policy. It must not promote an
+Slice 1b-2 should continue using the proved flat initializer and ptrace-free
+every-hit loader hook, then implement and re-prove the reviewed no-busy-wait
+A/B pause protocol. It must not promote either retained pause campaign or an
 unqualified glibc timing assumption. The product model is:
 
 - live discovery is best-effort and always exposes completeness evidence;

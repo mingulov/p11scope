@@ -179,17 +179,20 @@ def bools_negative():
 def well_formed(item):
     if not isinstance(item.get("pass"), bool) or item.get("failure_category") not in {"none", "oracle", "runtime"}:
         return False
-    if item.get("failure_category") == "runtime" and item.get("runtime_failure_reason") not in runtime_reasons:
-        return False
+    if item.get("failure_category") == "runtime":
+        # A runtime row records the metadata envelope plus the reason; the
+        # flow never executed, so it carries no flow facts.
+        return item.get("runtime_failure_reason") in runtime_reasons and item.get("pass") is False
     for name in u64:
         value = item.get(name)
         if type(value) is not int or isinstance(value, bool) or not 0 <= value <= 0xffffffffffffffff:
             return False
     states = item.get("r_states")
-    if not isinstance(states, list) or len(states) > 8:
-        return False
-    if any(type(state) is not int or isinstance(state, bool) or not 0 <= state <= 0xffffffff for state in states):
-        return False
+    if item.get("flow") == "loader_startup":
+        if not isinstance(states, list) or len(states) > 8:
+            return False
+        if any(type(state) is not int or isinstance(state, bool) or not 0 <= state <= 0xffffffff for state in states):
+            return False
     names = bools_startup() if item.get("flow") == "loader_startup" else bools_negative()
     if any(not isinstance(item.get(name), bool) for name in names):
         return False
@@ -241,18 +244,31 @@ elif category == "verifier":
 elif category == "runtime":
     if not accepted or not facts:
         raise SystemExit(64)
-    if any(item.get("failure_category") != "none" or "runtime_failure_reason" in item or not oracle(item) for item in facts[:-1]):
-        raise SystemExit(64)
+    for item in facts[:-1]:
+        if "runtime_failure_reason" in item:
+            raise SystemExit(64)
+        if item.get("failure_category") == "none" and not oracle(item):
+            raise SystemExit(64)
+        if item.get("failure_category") == "oracle" and oracle(item):
+            raise SystemExit(64)
+        if item.get("failure_category") not in ("none", "oracle"):
+            raise SystemExit(64)
     last = facts[-1]
     if last.get("failure_category") != "runtime" or last.get("runtime_failure_reason") not in runtime_reasons:
         raise SystemExit(64)
 elif category == "oracle":
     if not accepted or len(facts) != 2:
         raise SystemExit(64)
-    if any(item.get("failure_category") != "none" or "runtime_failure_reason" in item or not oracle(item) for item in facts[:-1]):
-        raise SystemExit(64)
-    last = facts[-1]
-    if last.get("failure_category") != "oracle" or "runtime_failure_reason" in last or oracle(last):
+    for item in facts:
+        if "runtime_failure_reason" in item:
+            raise SystemExit(64)
+        if item.get("failure_category") == "none" and not oracle(item):
+            raise SystemExit(64)
+        if item.get("failure_category") == "oracle" and oracle(item):
+            raise SystemExit(64)
+        if item.get("failure_category") not in ("none", "oracle"):
+            raise SystemExit(64)
+    if not any(item.get("failure_category") == "oracle" for item in facts):
         raise SystemExit(64)
 else:
     raise SystemExit(64)

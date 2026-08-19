@@ -900,13 +900,37 @@ fn run_loader_hit(paths: LoaderPaths) -> Result<bool, &'static str> {
             (false, facts)
         }
     };
-    write_json_line(&mut facts_file, serde_json::Value::Object(positive_facts))?;
-    if !positive_pass {
-        writeln!(verifier_log, "runtime_failure=loader_startup")
+    // The positive row carries the metadata envelope (schema, digests, lane)
+    // plus its per-flow oracle outcome; an oracle failure still runs the
+    // negative flow so every lane exports complete evidence.
+    let positive_runtime = positive_facts
+        .get("runtime_failure_reason")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let mut positive_row = metadata.record(
+        positive_pass,
+        if positive_runtime.is_some() {
+            "runtime"
+        } else if positive_pass {
+            "none"
+        } else {
+            "oracle"
+        },
+    );
+    for (key, value) in positive_facts {
+        positive_row.insert(key, value);
+    }
+    write_json_line(&mut facts_file, serde_json::Value::Object(positive_row))?;
+    if let Some(reason) = positive_runtime.as_deref() {
+        writeln!(verifier_log, "runtime_failure=loader_startup:{reason}")
             .map_err(|_| "runtime failure write")?;
         writeln!(runner_status, "status=FAIL\nfailure_category=runtime")
             .map_err(|_| "runner status write")?;
         return Ok(false);
+    }
+    if !positive_pass {
+        writeln!(verifier_log, "oracle_failure=loader_startup")
+            .map_err(|_| "oracle failure write")?;
     }
 
     // Flow 2: §8.1 no-cookie negative on the fixture's single-hit hook.
@@ -930,19 +954,46 @@ fn run_loader_hit(paths: LoaderPaths) -> Result<bool, &'static str> {
             (false, facts)
         }
     };
-    write_json_line(&mut facts_file, serde_json::Value::Object(negative_facts))?;
-    if !negative_pass {
-        writeln!(verifier_log, "runtime_failure=no_cookie_negative")
+    let negative_runtime = negative_facts
+        .get("runtime_failure_reason")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let mut negative_row = metadata.record(
+        negative_pass,
+        if negative_runtime.is_some() {
+            "runtime"
+        } else if negative_pass {
+            "none"
+        } else {
+            "oracle"
+        },
+    );
+    for (key, value) in negative_facts {
+        negative_row.insert(key, value);
+    }
+    write_json_line(&mut facts_file, serde_json::Value::Object(negative_row))?;
+    if let Some(reason) = negative_runtime.as_deref() {
+        writeln!(verifier_log, "runtime_failure=no_cookie_negative:{reason}")
             .map_err(|_| "runtime failure write")?;
+    } else if !negative_pass {
+        writeln!(verifier_log, "oracle_failure=no_cookie_negative")
+            .map_err(|_| "oracle failure write")?;
     }
 
     let start_empty = start.keys().next().is_none();
-    let pass = negative_pass && start_empty;
+    let pass = positive_pass && negative_pass && start_empty;
+    let final_category = if !pass && negative_runtime.is_some() {
+        "runtime"
+    } else if !pass {
+        "oracle"
+    } else {
+        "none"
+    };
     writeln!(
         runner_status,
         "status={}\nfailure_category={}",
         if pass { "PASS" } else { "FAIL" },
-        if pass { "none" } else { "oracle" }
+        final_category
     )
     .map_err(|_| "runner status write")?;
     Ok(pass)

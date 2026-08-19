@@ -271,13 +271,9 @@ fn capture_evidence_checker_self_test() {
         "bootstrap function exact count required: OK",
         "clean metrics multiplier is exact: OK",
         "clean metrics discovery source is exact in all three lanes: OK",
-        // The scan now contributes to the same capture as the manifest: the
-        // version-matrix numbers are re-derived from a rooted run, not the
-        // helper's alone. 988 -> 1216 entries and 13 -> 16 surfaces because
-        // three of the provider's tables are also readable from its mapped
-        // bytes; 104 slots and 208 probes are unchanged, because a slot is one
-        // {object, offset} however many sources named it.
-        "canary matrix 1216/104/208 with 16 mixed surfaces: OK",
+        // The scan contributes three per-source table records, while exact
+        // target occurrences remain deduplicated across scan and manifest.
+        "canary matrix 988/104/208 with 16 mixed surfaces: OK",
         "canary scan contribution is required: OK",
         "canary freeze lane is manifest-only 988/104/208 with 13 surfaces: OK",
         "canary safe exact allowances: OK",
@@ -519,12 +515,11 @@ aggregate-only-metrics default metrics"
 
     let lanes = run_ok("sh", &["scripts/verify-canaries.sh", "--self-test"]);
     assert!(lanes.contains("canary lane assertion self-test: OK"));
-    assert!(lanes.contains("scan-only aggregate decoy exposes calls/RVs/latency only: OK"));
     assert!(lanes.contains("raw binary alias scanner self-test: OK"));
     assert!(lanes.contains("unsafe raw template oracle self-test: OK"));
     assert!(lanes.contains("raw policy oracle self-test: OK"));
     assert!(lanes.contains("full CallStart safe defaults self-test: OK"));
-    assert!(lanes.contains("canary matrix 1216/104/208 with 16 mixed surfaces: OK"));
+    assert!(lanes.contains("canary matrix 988/104/208 with 16 mixed surfaces: OK"));
     let mut sentinels = canary_literals(&read("scripts/fixtures/canary_workload.c"));
     sentinels.extend(canary_literals(&read(
         "scripts/fixtures/privacy-stack-workload.c",

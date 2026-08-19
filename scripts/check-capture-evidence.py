@@ -91,14 +91,14 @@ VERSION_SURFACES = Counter(
 #
 # What the union does *not* change is the attach plan: 104 slots and 208 probes,
 # exactly as before, because a slot is one {object, file offset} however many
-# sources named it. `table_entries` and `surfaces` do change: they count entries
-# and surfaces per source, so the three scanned tables add 68+68+92 = 228
-# entries (988 -> 1216) and three surfaces (13 -> 16).
+# sources named it. `surfaces` keeps the per-source records, so the three scan
+# tables add three surfaces (13 -> 16). `table_entries` counts exact target
+# occurrences across sources, so this scan subset does not add another 228.
 VERSION_SURFACES_SCANNED = VERSION_SURFACES + Counter(
     {("full", 68): 2, ("full", 92): 1}
 )
 VERSION_SHAPE_MANIFEST_ONLY = (988, 104, 208, VERSION_SURFACES, 1, "ok")
-VERSION_SHAPE_SCANNED = (1216, 104, 208, VERSION_SURFACES_SCANNED, 1, "ok")
+VERSION_SHAPE_SCANNED = (988, 104, 208, VERSION_SURFACES_SCANNED, 1, "ok")
 # The three tables the scan cannot reach in the version-matrix provider. Each is
 # an object-level skip naming the provider, not a lost table entry.
 VERSION_SCAN_SKIPS = 3
@@ -187,9 +187,14 @@ def exact_sources(carrier):
     )
 
 
-def semantic_join_eligible(function, module):
+def semantic_join_eligible(function, module, *, has_manifest_object_fallback):
     """Whether unchanged v2 evidence authorizes semantic consumer joins."""
-    if function["module"] is None or function["module_ambiguous"] or function["aliased"]:
+    if (
+        has_manifest_object_fallback
+        or function["module"] is None
+        or function["module_ambiguous"]
+        or function["aliased"]
+    ):
         return False
     sources = module["sources"]
     outcomes = set(module["corroboration"])
@@ -338,6 +343,12 @@ def exact_manifest_object_fallbacks(evidence):
                 fallback_outcomes == 1 and identity in seen_replacements,
                 f"object_fallback has no exact replacement evidence: {module}",
             )
+
+    # This relation is deliberately one-way. A fallback for a dependency has no
+    # public function/module relation in v2, so requiring every fallback to
+    # render an `object_fallback` outcome would invent unsafe reverse evidence.
+    # Consumers instead make all semantic joins ineligible when any fallback is
+    # present (see `semantic_join_eligible`).
 
     standalone = sum(
         "manifest" in module["sources"] and not module["corroborated"]
@@ -522,7 +533,13 @@ def exact_capture_modules(document):
         require(ambiguous is False, f"attributed function marked ambiguous: {item}")
         require(owner in identities, f"function attributed to an undeclared module: {item}")
         identity = (tuple(owner["dev"]), owner["ino"], owner["sha256"])
-        ineligible |= not semantic_join_eligible(item, discovery_by_identity[identity])
+        ineligible |= not semantic_join_eligible(
+            item,
+            discovery_by_identity[identity],
+            has_manifest_object_fallback=bool(
+                document["evidence"]["manifest_object_fallbacks"]
+            ),
+        )
     if ineligible:
         require(
             document["evidence"]["completeness"] == "PARTIAL",
@@ -1051,20 +1068,26 @@ def self_test():
     }
     require(
         semantic_join_eligible(
-            manifest_only["functions"][0], manifest_only["evidence"]["discovery"][0]
+            manifest_only["functions"][0],
+            manifest_only["evidence"]["discovery"][0],
+            has_manifest_object_fallback=False,
         ),
         "explicit manifest attestation must be eligible",
     )
     require(
         semantic_join_eligible(
-            corroborated["functions"][0], corroborated["evidence"]["discovery"][0]
+            corroborated["functions"][0],
+            corroborated["evidence"]["discovery"][0],
+            has_manifest_object_fallback=False,
         ),
         "exact agreed scan+manifest must be eligible",
     )
     rejected(
         lambda: require(
             semantic_join_eligible(
-                clean["functions"][0], clean["evidence"]["discovery"][0]
+                clean["functions"][0],
+                clean["evidence"]["discovery"][0],
+                has_manifest_object_fallback=False,
             ),
             "scan-only function is not semantic-joinable",
         )
@@ -1076,7 +1099,9 @@ def self_test():
     rejected(
         lambda: require(
             semantic_join_eligible(
-                conflict["functions"][0], conflict["evidence"]["discovery"][0]
+                conflict["functions"][0],
+                conflict["evidence"]["discovery"][0],
+                has_manifest_object_fallback=False,
             ),
             "conflict function is not semantic-joinable",
         )
@@ -1086,7 +1111,9 @@ def self_test():
     rejected(
         lambda: require(
             semantic_join_eligible(
-                aliased["functions"][0], aliased["evidence"]["discovery"][0]
+                aliased["functions"][0],
+                aliased["evidence"]["discovery"][0],
+                has_manifest_object_fallback=False,
             ),
             "aliased function is not semantic-joinable",
         )
@@ -1101,6 +1128,7 @@ def self_test():
             semantic_join_eligible(
                 unattributed["functions"][0],
                 unattributed["evidence"]["discovery"][0],
+                has_manifest_object_fallback=False,
             ),
             "unattributed function is not semantic-joinable",
         )
@@ -1164,7 +1192,7 @@ def self_test():
         discovery_skipped=VERSION_SCAN_SKIPS,
     )
     version.update(
-        table_entries=1216,
+        table_entries=988,
         slots=104,
         attached_probes=208,
         vendor_interfaces=1,
@@ -1196,7 +1224,13 @@ def self_test():
     bad = copy.deepcopy(safe)
     bad["evidence"]["attached_probes"] = 206
     rejected(lambda: validate_canary("default-safe-profile", bad))
-    print("canary matrix 1216/104/208 with 16 mixed surfaces: OK")
+    # The same exact target seen in both sources is one table entry. Source
+    # provenance still retains all sixteen table records, so changing this to
+    # their summed entry total must be rejected.
+    bad = copy.deepcopy(safe)
+    bad["evidence"]["table_entries"] = 1216
+    rejected(lambda: validate_canary("default-safe-profile", bad))
+    print("canary matrix 988/104/208 with 16 mixed surfaces: OK")
     # The scan's own contribution is not optional: dropping the three tables it
     # decoded, or the conflict they imply, must fail.
     bad = copy.deepcopy(safe)
@@ -1389,6 +1423,30 @@ def self_test():
     fallback["evidence"]["discovery_uncorroborated"] = 1
     terminal_capture_is_clean(fallback["evidence"], uncorroborated=1)
     exact_capture_modules(fallback)
+
+    # A stale dependency fallback has no public module/function relation. The
+    # remaining module can still read as agreed, but v2 must not infer that its
+    # other functions inherited manifest attestation from the dropped dependency.
+    stale_dependency = copy.deepcopy(corroborated)
+    stale_dependency["evidence"]["manifest_object_fallbacks"] = [
+        {
+            "manifest": 0,
+            "object": 1,
+            "reason": "open_stale",
+            "replacement": replacement,
+        }
+    ]
+    stale_dependency["evidence"]["discovery_uncorroborated"] = 1
+    exact_capture_modules(stale_dependency)
+    require(
+        not semantic_join_eligible(
+            stale_dependency["functions"][0],
+            stale_dependency["evidence"]["discovery"][0],
+            has_manifest_object_fallback=True,
+        ),
+        "any public fallback makes v2 semantic joins ineligible",
+    )
+    print("public fallback blocks every v2 semantic join: OK")
     for mutate in (
         lambda d: d["evidence"]["manifest_object_fallbacks"][0].update(reason="/private/path"),
         lambda d: d["evidence"]["manifest_object_fallbacks"][0]["replacement"].update(ino=999),

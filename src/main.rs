@@ -294,7 +294,7 @@ struct DiscoveryCounters {
     /// Which §4.12 outcome each corroborated module got, so `discovery[]` can
     /// tell an agreement from a conflict instead of publishing a counter with
     /// nothing to explain it.
-    corroboration: Vec<(BTreeSet<ProcessViewId>, ObjectKey, &'static str)>,
+    corroboration: Vec<(BTreeSet<PinnedObjectId>, &'static str)>,
     /// Stale manifest objects replaced only by exact scan-opened objects.
     manifest_fallbacks: Vec<ManifestFallback>,
 }
@@ -1007,8 +1007,8 @@ fn corroboration_of(counters: &DiscoveryCounters, m: &plan::ModuleSummary) -> Ve
     let recorded: Vec<&'static str> = counters
         .corroboration
         .iter()
-        .filter(|(_, key, _)| *key == m.key)
-        .map(|(_, _, label)| *label)
+        .filter(|(objects, _)| objects.contains(&m.object))
+        .map(|(_, label)| *label)
         .collect();
     if !recorded.is_empty() {
         return recorded;
@@ -1666,6 +1666,15 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
     let (mut pinned, aggregation_skips) =
         PinnedObjects::aggregate_views(discovered.scan_inputs.values().map(|input| &input.pins));
     counters.object_skips.extend(aggregation_skips);
+    let (modules, collapsed, differed) = reconcile_scanned_modules(&scan_modules, &mut pinned);
+    if collapsed > 0 {
+        eprintln!(
+            "p11scope: discovery: {collapsed} matching overlay mapping(s) were collapsed \
+             onto one attach target; physical identity is not provable, so published \
+             uncertainty makes this capture PARTIAL"
+        );
+    }
+    counters.object_skips.extend(differed);
     let mut accepted = Vec::new();
     let mut pending_fallbacks = Vec::new();
     let mut corroborated = BTreeSet::new();
@@ -1733,12 +1742,12 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
                     })
                 })
                 .collect();
-            if let Some(first) = matched.first() {
-                counters.corroboration.push((
-                    matched.iter().map(|module| module.view).collect(),
-                    first.key,
-                    "object_fallback",
-                ));
+            let objects: BTreeSet<_> = matched
+                .iter()
+                .filter_map(|module| pinned.id_for_scanned(module, module.key, &module.path))
+                .collect();
+            if !objects.is_empty() {
+                counters.corroboration.push((objects, "object_fallback"));
             }
             continue;
         }
@@ -1746,15 +1755,11 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
             filter_manifest_fallbacks(&mut manifest, &stale_ids)?;
         }
         let view = scan_view(&manifest, &scan_modules, &pinned, manifest_pins);
-        let mapped = view
-            .as_ref()
-            .and_then(|view| view.modules.first())
-            .map(|module| module.key);
-        let view_owners: BTreeSet<_> = view
+        let outcome_objects: BTreeSet<_> = view
             .as_ref()
             .into_iter()
             .flat_map(|view| &view.modules)
-            .map(|module| module.view)
+            .filter_map(|module| pinned.id_for_scanned(module, module.key, &module.path))
             .collect();
         let scan_targets = view
             .as_ref()
@@ -1775,10 +1780,10 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
                 .is_some_and(|(scan, own)| pinned.exactly_same_targets(scan, manifest_pins, own)),
             scan_empty,
         );
-        if let Some(key) = mapped {
+        if !outcome_objects.is_empty() {
             counters
                 .corroboration
-                .push((view_owners, key, corroboration_label(outcome)));
+                .push((outcome_objects, corroboration_label(outcome)));
         }
         match outcome {
             Corroboration::Agreed => {
@@ -1861,15 +1866,6 @@ fn rebuild_discovered(discovered: &mut Discovered) -> Result<()> {
         }
     }
 
-    let (modules, collapsed, differed) = reconcile_scanned_modules(&scan_modules, &mut pinned);
-    if collapsed > 0 {
-        eprintln!(
-            "p11scope: discovery: {collapsed} matching overlay mapping(s) were collapsed \
-             onto one attach target; physical identity is not provable, so published \
-             uncertainty makes this capture PARTIAL"
-        );
-    }
-    counters.object_skips.extend(differed);
     let mut replacements = BTreeSet::new();
     for pending in pending_fallbacks {
         let Some((replacement, proof)) = bind_fallback_proof(&pending.candidate, &modules) else {
@@ -3648,6 +3644,20 @@ mod tests {
         assert_eq!(first.source, "scan");
         assert!(second.corroborated);
         assert_eq!(second.source, "scan+manifest");
+
+        counters
+            .corroboration
+            .push(([PinnedObjectId(200)].into_iter().collect(), "conflict"));
+        assert_eq!(
+            corroboration_of(&counters, first),
+            ["single_source"],
+            "a raw-key peer must not contribute public outcome evidence"
+        );
+        assert_eq!(
+            corroboration_of(&counters, second),
+            ["conflict"],
+            "the exact reconciled module retains its outcome array"
+        );
     }
 
     struct FailingWriter {
@@ -4273,7 +4283,7 @@ mod tests {
     #[test]
     fn the_module_record_says_which_corroboration_outcome_it_got() {
         let (plan, pins) = plan_with_pins(1, 0);
-        let key = plan.modules[0].key;
+        let object = plan.modules[0].object;
         for (outcome, label) in [
             (Corroboration::Agreed, "agreed"),
             (Corroboration::Conflict, "conflict"),
@@ -4281,11 +4291,7 @@ mod tests {
             (Corroboration::IdentityMismatch, "identity_mismatch"),
         ] {
             let counters = DiscoveryCounters {
-                corroboration: vec![(
-                    [ProcessViewId(0)].into_iter().collect(),
-                    key,
-                    corroboration_label(outcome),
-                )],
+                corroboration: vec![([object].into_iter().collect(), corroboration_label(outcome))],
                 ..DiscoveryCounters::default()
             };
             let evidence = discovery_evidence(&plan, &pins, &counters);
@@ -4663,7 +4669,7 @@ mod tests {
         };
         counters
             .corroboration
-            .push(([module.view].into_iter().collect(), module.key, "conflict"));
+            .push(([modules[0].object].into_iter().collect(), "conflict"));
         assert_eq!(
             discovery_evidence(&plan, &scan_pins, &counters).conflicts,
             1,

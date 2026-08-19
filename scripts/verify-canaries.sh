@@ -157,6 +157,9 @@ def assert_safe_profile(doc):
 def assert_safe_trace(text):
     assert text.startswith("CAPTURE privacy=allowlisted\n"), text[:200]
     ev = trace_terminal(text, "allowlisted")
+    events = [line for line in text.splitlines()
+              if line and not line.startswith(("CAPTURE ", "EVIDENCE ", "LOST "))]
+    assert events, "safe trace has no rendered call"
     assert "C_DigestInit 0x250" in text, "registered mechanism missing from trace"
     for value in set(ALIASES.values()) | {MAXIMUM}:
         assert str(value) not in text and f"0x{value:x}" not in text, value
@@ -229,22 +232,6 @@ def assert_aggregate_metrics(doc):
     assert doc["capture"]["privacy_mode"] == "aggregate-only"
     profile_terminal(doc, "pkcs11-scope/observed-profile/v2-metrics")
     assert sum(item["calls"] for item in doc["functions"]) == 25, doc["functions"]
-
-
-def assert_scan_only_aggregate_decoy(doc, trace, hostile):
-    assert_aggregate_metrics(doc)
-    assert doc["evidence"]["discovery"] == [{
-        "sources": ["scan"],
-        "tables": [{"version": [2, 40], "entries": 68, "source": "scan"}],
-    }], doc["evidence"]
-    assert doc["functions"] == [{
-        "names": ["C_DigestInit"], "calls": 25, "errors": 0,
-        "pending_returns": 0, "in_flight": 0,
-        "latency_ns": {"approximate": True, "p50": 10, "p95": 10,
-                       "p99": 10, "total": 250, "max": 10},
-        "rv_counts": {"0x0000000000000000": 25},
-    }], doc["functions"]
-    assert hostile not in json.dumps(doc) and hostile not in trace
 
 
 def read_json(path):
@@ -609,6 +596,9 @@ if work == "--self-test":
     reject("safe trace alias", lambda: assert_safe_trace(
         safe_trace.replace("C_DigestInit 0x250", f"C_DigestInit 0x250 0x{UNKNOWN:x}")
     ))
+    reject("safe trace needs rendered call", lambda: assert_safe_trace(
+        "CAPTURE privacy=allowlisted\nEVIDENCE " + json.dumps(terminal("allowlisted", 3, 2))
+    ))
 
     pss = [{
         "shape": "rsa_pkcs_pss", "hash_alg": ALIASES["pss_hash"],
@@ -697,29 +687,6 @@ if work == "--self-test":
         "functions": [{"calls": 25}],
     }
     assert_aggregate_metrics(aggregate)
-    hostile = "CANARY_SCAN_ONLY_DESCRIPTOR_PAYLOAD"
-    scan_only_decoy = json.loads(json.dumps(aggregate))
-    scan_only_decoy["evidence"]["discovery"] = [{
-        "sources": ["scan"],
-        "tables": [{"version": [2, 40], "entries": 68, "source": "scan"}],
-    }]
-    scan_only_decoy["functions"] = [{
-        "names": ["C_DigestInit"], "calls": 25, "errors": 0,
-        "pending_returns": 0, "in_flight": 0,
-        "latency_ns": {"approximate": True, "p50": 10, "p95": 10,
-                       "p99": 10, "total": 250, "max": 10},
-        "rv_counts": {"0x0000000000000000": 25},
-    }]
-    aggregate_trace = "CAPTURE privacy=aggregate-only\\nC_DigestInit rv=0 latency=10\\n"
-    assert_scan_only_aggregate_decoy(scan_only_decoy, aggregate_trace, hostile)
-    decoy = json.loads(json.dumps(scan_only_decoy))
-    decoy["mechanisms"] = [{"mechanism": UNKNOWN, "params": [hostile]}]
-    reject("scan-only aggregate semantic state", lambda:
-           assert_scan_only_aggregate_decoy(decoy, aggregate_trace, hostile))
-    reject("scan-only aggregate trace payload", lambda:
-           assert_scan_only_aggregate_decoy(
-               scan_only_decoy, aggregate_trace + hostile, hostile))
-    print("scan-only aggregate decoy exposes calls/RVs/latency only: OK")
 
     for family, sentinel in sorted(fixture_sentinels().items()):
         control = positive_control_content(sentinel)

@@ -564,26 +564,44 @@ mod tests {
         plan.slots[0].semantics = p11scope_ebpf_common::SlotSemantics::COUNT_ONLY;
         let mut state = State::new(&plan);
         let mut tracer = Tracer::new(&plan);
+        tracer.anchor = Some((0, 0));
         let mut event = open_event(100, 0xdead_beef);
         event.capture = capture::MECHANISM_VALUE;
         event.mechanism = pkcs11_proxy_ng_types::CkMechanismType::AES_GCM.0;
         event.shape = shape::GCM;
-        event.p0 = 12;
-        event.p1 = 16;
-        event.p2 = 128;
+        event.p0 = 0xa11c_e000_0000_0001;
+        event.p1 = 0xa11c_e000_0000_0002;
+        event.p2 = 0xa11c_e000_0000_0003;
+        event.user_type = 0xa11c_e004;
+        event.attr_types = [0xa11c_e005; 8];
+        event.attr_count = 8;
+        event.attr_total = 9;
+        event.attr_bools = 0xff;
+        event.attr_bools_seen = 0xff;
 
         let line = tracer.on_event(&event, &mut state);
 
-        assert!(
-            line.contains("C_OpenSession [semantics unverified]"),
-            "{line}"
+        assert_eq!(
+            line,
+            "00:00:00.000000 pid 100 tid 1 C_OpenSession [semantics unverified] → CKR_OK 18.0µs"
         );
-        assert!(line.contains("CKR_OK"), "{line}");
-        for forbidden in ["sess#", "CKM_", "deadbeef", "/opt/"] {
+        for forbidden in [
+            "sess#",
+            "CKM_",
+            "deadbeef",
+            "a11ce00000000001",
+            "a11ce00000000002",
+            "a11ce00000000003",
+            "a11ce004",
+            "a11ce005",
+            "/opt/",
+        ] {
             assert!(!line.contains(forbidden), "leaked {forbidden}: {line}");
         }
         assert!(state.mechanisms().is_empty());
         assert_eq!(state.sessions().opened, 0);
+        assert!(state.logins().is_empty());
+        assert!(state.templates().is_empty());
         assert_eq!(state.pending_at_end(), 0);
     }
 

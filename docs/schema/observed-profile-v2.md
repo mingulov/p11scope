@@ -106,7 +106,7 @@ Discovery and attachment:
 
 | Field | Meaning |
 | --- | --- |
-| `table_entries` | Function records discovery decoded across every walked surface. |
+| `table_entries` | Function records discovery decoded across every walked surface, with the same exact target occurrence deduplicated across sources. |
 | `slots` | Unique `{object, file_offset}` targets. |
 | `attached_probes` | Successful probe attachments; two per fully attached slot. |
 | `attach_failures` | Per-slot attachment errors. |
@@ -127,13 +127,13 @@ Discovery and attachment:
 | `scan_unavailable` | `null`, or why the memory scan could not run (e.g. `"ptrace"`). Objects are still identified from `maps` + `.dynsym`, but no table is decoded, so any `--manifest` offsets stand alone. Forces `PARTIAL` in its own right: under `--cgroup` one unreadable process among readable ones still plans slots, so nothing else would notice. |
 | `scan_ms` | Wall time the memory scan took, summed over the scanned processes. |
 
-`table_entries` counts every record discovery decoded, including the ones no
-probe can reach: a NULL table slot, and an entry whose object could not be
-pinned. Both are counted here *and* listed in `skipped`, so `slots` against
-`table_entries` reads as attached against seen. A `--manifest` overlapping a
-scanned module contributes its own records too, so an entry both sources
-describe is seen twice and attached once; `discovery[].tables[]` shows the split
-per source.
+`table_entries` counts every exact target occurrence discovery decoded,
+including the ones no probe can reach: a NULL table slot, and an entry whose
+object could not be pinned. Both are counted here *and* listed in `skipped`, so
+`slots` against `table_entries` reads as attached against seen. A `--manifest`
+overlapping a scanned module does not add a second count for the same exact
+target occurrence; distinct claims and true repeated occurrences remain
+separate. `discovery[].tables[]` still shows one table record per source.
 
 ### `evidence.discovery[]`
 

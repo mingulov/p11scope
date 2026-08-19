@@ -2420,9 +2420,14 @@ mod tests {
             capture: capture::MECHANISM_VALUE,
             user_type: 1,
             shape: shape::GCM,
+            p0: 0xa11c_e000_0000_0001,
+            p1: 0xa11c_e000_0000_0002,
+            p2: 0xa11c_e000_0000_0003,
             attr_types: [0x100; 8],
             attr_count: 8,
             attr_total: 9,
+            attr_bools: 0xff,
+            attr_bools_seen: 0xff,
             rv: CkRv::PENDING.0,
             ..Event::default()
         };

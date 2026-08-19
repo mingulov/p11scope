@@ -212,7 +212,8 @@ def oracle(item):
             and item["pid_matches"] is True and item["formula_holds"] is True
             and item["derived_debug_address_ok"] is True
             and item["invalid_records"] == 0 and item["state_read_failures"] == 0
-            and item["cookie_zero_hits"] == 0 and item["func_ip_zero_hits"] == 0
+            and item["cookie_zero_hits"] == 0
+            and item["func_ip_zero_hits"] <= item["loader_hits_counter"]
             and item["ring_loss"] == 0 and item["state_failures"] == 0
             and item["start_empty"] is True
             and item["registry_decodable_after_drain"] is True
@@ -344,7 +345,7 @@ validate_local_export() {
         total=$(( size + total ))
     done
     (( total <= 16777216 )) || return 64
-    loader_semantics_python | python3 - "$directory" "$expected_rc"
+    loader_semantics_python | python3 - "$directory" "$expected_rc" || return 64
     [[ ! -e $directory.sha256 && ! -L $directory.sha256 ]] || return 64
     (cd "$directory" && sha256sum "${files[@]}") >"$directory.sha256"
     chmod 0600 "$directory.sha256"

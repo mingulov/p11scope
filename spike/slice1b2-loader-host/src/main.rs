@@ -3680,6 +3680,107 @@ mod tests {
         assert!(lines[1].starts_with("/tmp/p11scope-slice1b2-vms/noble/overlay.qcow2|"));
     }
 
+    fn write_loader_export(func_ip_zero_hits: u64) -> PathBuf {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let directory = std::env::temp_dir().join(format!(
+            "slice1b2-loader-export-{}-{}",
+            std::process::id(),
+            monotonic_ns().unwrap()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let verifier = serde_json::json!({
+            "program": "dl_debug_state",
+            "load_attempted": true,
+            "accepted": true,
+            "pass": true,
+            "failure_category": "none",
+            "success_log_contract": "accepted_line_only"
+        });
+        let startup = serde_json::json!({
+            "flow": "loader_startup", "pass": true, "failure_category": "none",
+            "hits": 2, "invalid_records": 0, "ring_loss": 0, "state_failures": 0,
+            "loader_hits_counter": 2, "state_read_failures": 0, "cookie_zero_hits": 0,
+            "func_ip_zero_hits": func_ip_zero_hits, "r_states": [1, 0], "pid_matches": true,
+            "formula_holds": true, "derived_debug_address_ok": true, "start_empty": true,
+            "registry_decodable_after_drain": true, "state_present_delta": true,
+            "loader_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "counters_before": [0, 0, 0, 0, 0, 0], "counters_after": [0, 0, 2, 0, 0, 2]
+        });
+        let negative = serde_json::json!({
+            "flow": "no_cookie_negative", "pass": true, "failure_category": "none",
+            "hits": 1, "invalid_records": 1, "ring_loss": 0, "state_failures": 0,
+            "loader_hits_counter": 1, "state_read_failures": 0, "cookie_zero_hits": 1,
+            "func_ip_zero_hits": 0, "exactly_one_invalid": true, "no_ip_operation": true,
+            "no_state_operation": true, "no_context_id_copied": true
+        });
+        for (name, contents) in [
+            ("environment.txt", "kernel_release=5.15\n".to_owned()),
+            ("verifier.log", "accepted\n".to_owned()),
+            ("verifier-results.jsonl", format!("{verifier}\n")),
+            ("loader-facts.jsonl", format!("{startup}\n{negative}\n")),
+            (
+                "runner-status.txt",
+                "status=PASS\nfailure_category=none\n".to_owned(),
+            ),
+        ] {
+            let path = directory.join(name);
+            std::fs::write(&path, contents).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        directory
+    }
+
+    fn remove_loader_export(directory: &Path) {
+        let _ = std::fs::remove_file(format!("{}.sha256", directory.display()));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn shell_oracle_accepts_the_counted_runtime_ip_fallback() {
+        let directory = write_loader_export(2);
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let status = std::process::Command::new("bash")
+            .args([
+                "-c",
+                "source \"$1\"; loader_semantics_python | python3 - \"$2\" 0",
+                "bash",
+                script,
+            ])
+            .arg(&directory)
+            .status()
+            .unwrap();
+        remove_loader_export(&directory);
+        assert!(
+            status.success(),
+            "the shell oracle rejected the valid fallback row"
+        );
+    }
+
+    #[test]
+    fn local_export_validator_propagates_semantic_rejection() {
+        let directory = write_loader_export(3);
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let status = std::process::Command::new("bash")
+            .args([
+                "-c",
+                "source \"$1\"; validate_local_export \"$2\" 0",
+                "bash",
+                script,
+            ])
+            .arg(&directory)
+            .status()
+            .unwrap();
+        remove_loader_export(&directory);
+        assert!(
+            !status.success(),
+            "the local validator ignored semantic rejection"
+        );
+    }
+
     #[test]
     fn pidfd_child_resumes_only_owned_stops_and_never_signals_after_reap() {
         let mut child = std::process::Command::new("/bin/sleep")

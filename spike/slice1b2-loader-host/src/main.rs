@@ -2122,6 +2122,7 @@ fn run_protect_attempt(
     let mut pause2_confirmation_gap_us: Option<u64> = None;
     let mut pause2_r_state: Option<u32> = None;
     let mut slot_pairs: Option<u64> = None;
+    let mut slot_attach_failures = 0u64;
     let mut export_to_slot_attach_us: Option<u64> = None;
     let mut child_exit_zero = false;
 
@@ -2452,6 +2453,7 @@ fn run_protect_attempt(
                     .copied();
                 if let Some(record) = export {
                     let t_seen = Instant::now();
+                    let mut attached = 0u64;
                     for index in 0..PROVIDER_TABLE_POINTERS {
                         let pointer = record.pointers[index];
                         let vaddr = pointer
@@ -2460,19 +2462,25 @@ fn run_protect_attempt(
                         let offset =
                             vaddr_to_file_offset(&plan.bytes, vaddr).ok_or("slot offset")?;
                         let cookie = index as u64 + 1;
-                        attach_probe_pair(
+                        if attach_probe_pair(
                             ab_ebpf,
                             &mut ab_links,
                             provider_path,
                             pid,
                             offset,
                             cookie,
-                        )?;
+                        )
+                        .is_err()
+                        {
+                            slot_attach_failures += 1;
+                            break;
+                        }
+                        attached += 1;
                         if index == 0 {
                             c_init_cookie = Some(cookie);
                         }
                     }
-                    slot_pairs = Some(PROVIDER_TABLE_POINTERS as u64);
+                    slot_pairs = Some(attached);
                     export_to_slot_attach_us = Some((Instant::now() - t_seen).as_micros() as u64);
                     slot_pending = false;
                 }
@@ -2610,6 +2618,7 @@ fn run_protect_attempt(
         "slot_pairs_attached".into(),
         slot_pairs.map_or(serde_json::Value::Null, |value| value.into()),
     );
+    facts.insert("slot_attach_failures".into(), slot_attach_failures.into());
     facts.insert(
         "export_to_slot_attach_us".into(),
         export_to_slot_attach_us.map_or(serde_json::Value::Null, |value| value.into()),
@@ -2777,9 +2786,11 @@ fn run_protect_attempt(
                 && pause2_confirmed == Some(true)
                 && pause2_r_state.is_some()
         }
-        ("hidden", false) => {
-            slot_pairs == Some(PROVIDER_TABLE_POINTERS as u64) && export_to_slot_attach_us.is_some()
-        }
+        ("hidden", false) => hidden_race_measurement_complete(
+            slot_pairs,
+            export_to_slot_attach_us,
+            ctor_init_escaped,
+        ),
         ("hidden", true) => {
             slot_pairs == Some(PROVIDER_TABLE_POINTERS as u64)
                 && export_to_slot_attach_us.is_some()
@@ -2883,6 +2894,16 @@ fn vaddr_to_file_offset(bytes: &[u8], vaddr: u64) -> Option<u64> {
         }
     }
     None
+}
+
+fn hidden_race_measurement_complete(
+    slot_pairs: Option<u64>,
+    window_us: Option<u64>,
+    escaped: Option<bool>,
+) -> bool {
+    slot_pairs.is_some_and(|count| count <= PROVIDER_TABLE_POINTERS as u64)
+        && window_us.is_some()
+        && escaped.is_some()
 }
 
 fn median(values: &mut [u64]) -> Option<u64> {
@@ -3819,5 +3840,29 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn hidden_one_pause_accepts_a_bounded_race_measurement_not_only_full_attachment() {
+        assert!(hidden_race_measurement_complete(
+            Some(0),
+            Some(25),
+            Some(true)
+        ));
+        assert!(hidden_race_measurement_complete(
+            Some(PROVIDER_TABLE_POINTERS as u64),
+            Some(100),
+            Some(false)
+        ));
+        assert!(!hidden_race_measurement_complete(
+            None,
+            Some(25),
+            Some(true)
+        ));
+        assert!(!hidden_race_measurement_complete(
+            Some((PROVIDER_TABLE_POINTERS + 1) as u64),
+            Some(25),
+            Some(true)
+        ));
     }
 }

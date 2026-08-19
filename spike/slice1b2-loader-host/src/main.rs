@@ -461,6 +461,7 @@ fn loader_load_bias(
     dev_major: u64,
     dev_minor: u64,
     inode: u64,
+    canonical_path: &Path,
 ) -> Result<u64, &'static str> {
     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).map_err(|_| "process maps")?;
     let mut best: Option<u64> = None;
@@ -479,7 +480,10 @@ fn loader_load_bias(
         ) else {
             continue;
         };
-        if major != dev_major || minor != dev_minor || map_inode != inode {
+        let path_matches = fields
+            .get(5)
+            .is_some_and(|path| Path::new(path) == canonical_path);
+        if map_inode != inode || ((major != dev_major || minor != dev_minor) && !path_matches) {
             continue;
         }
         let Some((start, _end)) = fields[0].split_once('-') else {
@@ -497,6 +501,12 @@ fn loader_load_bias(
         best = Some(best.map_or(bias, |current: u64| current.min(bias)));
     }
     best.ok_or("loader executable mapping")
+}
+
+fn canonical_loader_path(pid: i32, interp: &Path) -> Result<PathBuf, &'static str> {
+    let relative = interp.strip_prefix("/").map_err(|_| "loader path")?;
+    std::fs::canonicalize(PathBuf::from(format!("/proc/{pid}/root")).join(relative))
+        .map_err(|_| "loader path")
 }
 
 // ---------------------------------------------------------------------------
@@ -1125,13 +1135,16 @@ fn run_startup_flow(
         loop {
             records.extend(drain_loader_records(ring).map_err(|_| "ring drain")?);
             if bias.is_none() && child_execed(child.pid, fixture) {
-                if let Ok(found) = loader_load_bias(
-                    child.pid,
-                    loader_dev_major,
-                    loader_dev_minor,
-                    loader_meta.ino(),
-                ) {
-                    bias = Some(found);
+                if let Ok(path) = canonical_loader_path(child.pid, &interp) {
+                    if let Ok(found) = loader_load_bias(
+                        child.pid,
+                        loader_dev_major,
+                        loader_dev_minor,
+                        loader_meta.ino(),
+                        &path,
+                    ) {
+                        bias = Some(found);
+                    }
                 }
             }
             let hits = records
@@ -2215,11 +2228,13 @@ fn run_protect_attempt(
             return Err("provider mapping");
         }
         let provider_bias = path_load_bias(pid, provider_path)?;
+        let loader_path = canonical_loader_path(pid, &loader_identity.interp)?;
         let ldso_bias = loader_load_bias(
             pid,
             loader_identity.dev_major,
             loader_identity.dev_minor,
             loader_identity.inode,
+            &loader_path,
         )?;
         if let Some(record) = loader_records
             .iter()
@@ -3785,5 +3800,24 @@ mod tests {
         assert!(parsed.second_pause);
         args.extend(["--out".to_owned(), "/again".to_owned()]);
         assert!(parse_protect_args(&args).is_err());
+    }
+
+    #[test]
+    fn proc_root_loader_identity_matches_its_mapping() {
+        let bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let interp = elf_interp(&bytes).unwrap();
+        let pid = std::process::id() as i32;
+        let metadata = std::fs::metadata(&interp).unwrap();
+        let path = canonical_loader_path(pid, &interp).unwrap();
+        assert!(
+            loader_load_bias(
+                pid,
+                u64::from(libc::major(metadata.dev())),
+                u64::from(libc::minor(metadata.dev())),
+                metadata.ino(),
+                &path,
+            )
+            .is_ok()
+        );
     }
 }

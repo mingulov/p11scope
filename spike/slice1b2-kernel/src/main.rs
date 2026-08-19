@@ -2990,8 +2990,8 @@ fn run_gate_b_case(
         // every attempt produced a link, whatever later step failed
         facts.signal_attach_accepted =
             facts.signal_attach_attempts == 2 && signal_links.len() == 2;
-        facts.late_attach_accepted = u64::from(facts.late_attach_attempts)
-            == facts.required_attach_keys
+        facts.late_attach_accepted = facts.late_attach_attempts > 0
+            && u64::from(facts.late_attach_attempts) == facts.required_attach_keys
             && facts.attached_while_stopped == u64::from(facts.late_attach_attempts);
     }
     if !late_links.is_empty() {
@@ -5339,6 +5339,11 @@ mod tests {
             1,
             "exactly one cleanup-time honest-attach computation"
         );
+        // the recompute must never accept an empty attach set vacuously
+        assert!(
+            body.contains("facts.late_attach_attempts > 0"),
+            "cleanup-time acceptance requires at least one late attach attempt"
+        );
     }
 
     #[test]
@@ -5460,6 +5465,40 @@ mod tests {
         assert!(
             shell_validate_gate_b_export(script, &path, 1),
             "failed-resume-2 oracle failures must classify as oracle, not malformed"
+        );
+
+        // oracle failure: outcome A's single resume failed, then cleanup
+        // attempted the exactly-once resume, doubling the attempt count
+        let mut resume1_errno = valid_signal();
+        resume1_errno.pidfd_resume_attempts = 2;
+        resume1_errno.pidfd_resume_rc = -1;
+        resume1_errno.markers_after_resume = 0;
+        resume1_errno.post_resume_marker_observed = false;
+        resume1_errno.owner_removed = false;
+        resume1_errno.final_start_entries = 1;
+        resume1_errno.child_exit = -1;
+        let path = temp.path().join("resume1-errno");
+        fake_canonical_gate_b_export_facts(&path, 2, 1, "oracle", &resume1_errno);
+        assert!(
+            shell_validate_gate_b_export(script, &path, 1),
+            "failed-resume-1 oracle failures must classify as oracle, not malformed"
+        );
+
+        // runtime failure before any late attach was attempted: the honest
+        // cleanup recompute must leave the late attach set unaccepted
+        let mut pre_drain = SignalTimingFacts::default();
+        pre_drain.expected_task_count = 2;
+        pre_drain.signal_attach_attempts = 2;
+        pre_drain.signal_attach_accepted = true;
+        pre_drain.signal_link_detached = true;
+        pre_drain.reaped = true;
+        pre_drain.child_exit = -1;
+        let path = temp.path().join("pre-drain-timeout");
+        fake_canonical_gate_b_export_facts(&path, 2, 1, "runtime", &pre_drain);
+        mark_runtime_failure(&path, "signal record timeout");
+        assert!(
+            shell_validate_gate_b_export(script, &path, 1),
+            "pre-drain runtime failures with an untouched late attach set must classify as runtime"
         );
     }
 

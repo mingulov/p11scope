@@ -468,7 +468,9 @@ def well_formed(item):
         ]):
             return False
     elif item["pause_owners"] == 1:
-        if item["pidfd_resume_attempts"] != 1:
+        if item["pidfd_resume_attempts"] not in {1, 2}:
+            return False
+        if item["pidfd_resume_attempts"] == 2 and item["pidfd_resume_rc"] != -1:
             return False
         if item["deferred_records"] != 0 or item["owner2_case_id"] != 0:
             return False

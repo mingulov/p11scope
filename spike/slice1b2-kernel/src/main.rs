@@ -199,6 +199,14 @@ pub struct SignalTimingFacts {
     pub signal_helper_calls: u64,
     pub winner_case_id: u8,
     pub coalesced_case_id: u8,
+    pub ring_loss: u64,
+    /// 1 when one confirmed owner drained both hook records (outcome A);
+    /// 2 when the deferred sibling hook won a separately armed second owner
+    /// (outcome B). Any other value is invalid.
+    pub pause_owners: u8,
+    /// Records whose handler never ran under owner 1 and only executed after
+    /// its resume (outcome B: exactly 1; outcome A: 0).
+    pub deferred_records: u64,
     pub stopped_snapshot_1_count: u32,
     pub stopped_snapshot_2_count: u32,
     pub stopped_snapshot_1_exact_expected_task_set: bool,
@@ -216,6 +224,18 @@ pub struct SignalTimingFacts {
     pub post_attach_marker_observed: bool,
     pub attached_while_stopped: u64,
     pub queue_empty_before_resume: bool,
+    pub owner2_case_id: u8,
+    pub owner2_armed_while_stopped: bool,
+    pub hook_ts_ns_2: u64,
+    pub send_signal_rc_2: i64,
+    pub pre_stop2_marker_observed: bool,
+    pub owner2_drain_empty: bool,
+    pub confirmation_sample_indexes_2: Option<(usize, usize)>,
+    pub samples_2: Vec<StopSnapshot>,
+    pub post_attach2_task_count: u32,
+    pub post_attach2_exact_expected_task_set: bool,
+    pub post_attach2_all_tasks_stopped: bool,
+    pub post_attach2_marker_observed: bool,
     pub markers_after_resume: u32,
     pub signal_attach_attempts: u8,
     pub signal_attach_accepted: bool,
@@ -227,6 +247,7 @@ pub struct SignalTimingFacts {
     pub attach_gap_ms: f64,
     pub pidfd_resume_attempts: u8,
     pub pidfd_resume_rc: i64,
+    pub pidfd_resume_rc_2: i64,
     pub resume_via_original_pidfd: bool,
     pub owner_removed: bool,
     pub final_start_entries: u64,
@@ -241,23 +262,19 @@ pub fn signal_oracle_pass(facts: &SignalTimingFacts) -> bool {
         return false;
     };
     let expected_gap_ms = gap_ns as f64 / 1_000_000.0;
-    facts.hook_ts_ns != 0
+    let common = facts.hook_ts_ns != 0
         && facts.send_signal_rc == 0
         && facts.stop_request_accepted
         && facts.expected_task_count == 2
-        && facts.winner_records == 1
-        && facts.coalesced_records == 1
-        && facts.signal_helper_calls == 1
-        && facts.winner_case_id != facts.coalesced_case_id
-        && ((facts.winner_case_id == 1 && facts.coalesced_case_id == 2)
-            || (facts.winner_case_id == 2 && facts.coalesced_case_id == 1))
+        && facts.ring_loss == 0
         && facts.stopped_snapshot_1_count == facts.expected_task_count
         && facts.stopped_snapshot_2_count == facts.expected_task_count
         && facts.stopped_snapshot_1_exact_expected_task_set
         && facts.stopped_snapshot_1_all_tasks_stopped
         && facts.stopped_snapshot_2_exact_expected_task_set
         && facts.stopped_snapshot_2_all_tasks_stopped
-        && facts.confirmation_sample_indexes.is_some()
+        && confirm(&facts.samples).is_some()
+        && confirm(&facts.samples) == facts.confirmation_sample_indexes
         && !facts.pre_stop_marker_observed
         && facts.drain_empty
         && facts.required_attach_keys == 2
@@ -275,16 +292,70 @@ pub fn signal_oracle_pass(facts: &SignalTimingFacts) -> bool {
         && facts.late_link_detached
         && facts.attach_gap_ms.is_finite()
         && (facts.attach_gap_ms - expected_gap_ms).abs() <= f64::EPSILON
-        && facts.pidfd_resume_attempts == 1
-        && facts.pidfd_resume_rc == 0
         && facts.resume_via_original_pidfd
+        && facts.pidfd_resume_rc == 0
         && facts.owner_removed
         && facts.final_start_entries == 0
         && facts.post_resume_marker_observed
         && facts.markers_after_resume == 2
         && facts.late_hits == 2
         && facts.child_exit == 0
-        && facts.reaped
+        && facts.reaped;
+    if !common {
+        return false;
+    }
+    match facts.pause_owners {
+        // Outcome A: both distinct hook records drain under one pause owner.
+        1 => {
+            facts.winner_records == 1
+                && facts.coalesced_records == 1
+                && facts.signal_helper_calls == 1
+                && facts.winner_case_id != facts.coalesced_case_id
+                && ((facts.winner_case_id == 1 && facts.coalesced_case_id == 2)
+                    || (facts.winner_case_id == 2 && facts.coalesced_case_id == 1))
+                && facts.deferred_records == 0
+                && facts.pidfd_resume_attempts == 1
+                && facts.pidfd_resume_rc_2 == 0
+                && facts.owner2_case_id == 0
+                && facts.hook_ts_ns_2 == 0
+                && facts.send_signal_rc_2 == 0
+                && !facts.owner2_armed_while_stopped
+                && !facts.pre_stop2_marker_observed
+                && !facts.owner2_drain_empty
+                && facts.confirmation_sample_indexes_2.is_none()
+                && facts.samples_2.is_empty()
+                && facts.post_attach2_task_count == 0
+                && !facts.post_attach2_exact_expected_task_set
+                && !facts.post_attach2_all_tasks_stopped
+                && !facts.post_attach2_marker_observed
+        }
+        // Outcome B: the deferred sibling hook wins a separately armed second
+        // owner and completes its own confirmed pause before its marker.
+        2 => {
+            facts.winner_records == 2
+                && facts.coalesced_records == 0
+                && facts.signal_helper_calls == 2
+                && facts.coalesced_case_id == 0
+                && facts.deferred_records == 1
+                && facts.winner_case_id != facts.owner2_case_id
+                && ((facts.winner_case_id == 1 && facts.owner2_case_id == 2)
+                    || (facts.winner_case_id == 2 && facts.owner2_case_id == 1))
+                && facts.hook_ts_ns_2 != 0
+                && facts.send_signal_rc_2 == 0
+                && facts.owner2_armed_while_stopped
+                && !facts.pre_stop2_marker_observed
+                && facts.owner2_drain_empty
+                && facts.confirmation_sample_indexes_2.is_some()
+                && confirm(&facts.samples_2) == facts.confirmation_sample_indexes_2
+                && facts.post_attach2_task_count == facts.expected_task_count
+                && facts.post_attach2_exact_expected_task_set
+                && facts.post_attach2_all_tasks_stopped
+                && !facts.post_attach2_marker_observed
+                && facts.pidfd_resume_attempts == 2
+                && facts.pidfd_resume_rc_2 == 0
+        }
+        _ => false,
+    }
 }
 
 pub fn parse_task_state(stat: &str) -> Result<u8, &'static str> {
@@ -360,7 +431,7 @@ pub struct ChildGuard {
     original_pidfd: OwnedFd,
     release_writer: OwnedFd,
     may_be_stopped: bool,
-    resume_attempted: bool,
+    resume_attempts: u8,
     reaped: bool,
 }
 
@@ -377,11 +448,16 @@ impl ChildGuard {
         write_byte(self.release_writer.as_raw_fd(), 1)
     }
 
+    /// Resumes the owned child once through the original pidfd. Allowed only
+    /// while a stop may be pending, so each owned stop is resumed exactly
+    /// once: a second confirmed pause owner must re-mark the child first.
     pub fn resume_once(&mut self) -> io::Result<()> {
-        if self.resume_attempted {
-            return Err(io::Error::other("child resume was already attempted"));
+        if !self.may_be_stopped {
+            return Err(io::Error::other(
+                "child resume requires a possibly-stopped child",
+            ));
         }
-        self.resume_attempted = true;
+        self.resume_attempts = self.resume_attempts.saturating_add(1);
         let result = pidfd_send_signal(self.original_pidfd.as_raw_fd(), libc::SIGCONT);
         if result.is_ok() {
             self.may_be_stopped = false;
@@ -405,8 +481,8 @@ impl ChildGuard {
             facts.reaped = true;
             return facts;
         }
-        if self.may_be_stopped && !self.resume_attempted {
-            self.resume_attempted = true;
+        if self.may_be_stopped {
+            self.resume_attempts = self.resume_attempts.saturating_add(1);
             facts.resume_attempts = 1;
             facts.resume_via_original_pidfd = true;
             if pidfd_send_signal(self.original_pidfd.as_raw_fd(), libc::SIGCONT).is_ok() {
@@ -446,7 +522,7 @@ where
             original_pidfd,
             release_writer,
             may_be_stopped: false,
-            resume_attempted: false,
+            resume_attempts: 0,
             reaped: false,
         }),
         Err(pidfd_error) => {
@@ -539,6 +615,19 @@ impl PauseOwnerGuard {
     }
 
     fn close_after_resume<M: PauseOwnerMap>(&mut self, map: &mut M) -> Result<bool, &'static str> {
+        if self.closed {
+            return Ok(true);
+        }
+        map.remove_owner(&self.key)?;
+        self.closed = true;
+        self.armed = false;
+        Ok(true)
+    }
+
+    /// Removes the owner entry while the group is still stopped, immediately
+    /// before arming the next owner of the same key (outcome B). Safe because
+    /// a fully stopped task group cannot run a hook in between.
+    fn close_while_stopped<M: PauseOwnerMap>(&mut self, map: &mut M) -> Result<bool, &'static str> {
         if self.closed {
             return Ok(true);
         }
@@ -1836,11 +1925,10 @@ fn wait_signal_record_until(
 
 fn drain_signal_ring_to_empty(
     ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
-) -> Result<u64, &'static str> {
-    let mut drained = 0u64;
+) -> Result<Vec<common::SignalRecord>, &'static str> {
+    let mut drained = Vec::new();
     while let Some(item) = ring.next() {
-        decode_signal_record(&item)?;
-        drained += 1;
+        drained.push(decode_signal_record(&item)?);
     }
     Ok(drained)
 }
@@ -2354,6 +2442,9 @@ fn signal_timing_json(
         signal_helper_calls,
         winner_case_id,
         coalesced_case_id,
+        ring_loss,
+        pause_owners,
+        deferred_records,
         stopped_snapshot_1_count,
         stopped_snapshot_2_count,
         stopped_snapshot_1_exact_expected_task_set,
@@ -2369,6 +2460,16 @@ fn signal_timing_json(
         post_attach_marker_observed,
         attached_while_stopped,
         queue_empty_before_resume,
+        owner2_case_id,
+        owner2_armed_while_stopped,
+        hook_ts_ns_2,
+        send_signal_rc_2,
+        pre_stop2_marker_observed,
+        owner2_drain_empty,
+        post_attach2_task_count,
+        post_attach2_exact_expected_task_set,
+        post_attach2_all_tasks_stopped,
+        post_attach2_marker_observed,
         markers_after_resume,
         signal_attach_attempts,
         signal_attach_accepted,
@@ -2380,6 +2481,7 @@ fn signal_timing_json(
         attach_gap_ms,
         pidfd_resume_attempts,
         pidfd_resume_rc,
+        pidfd_resume_rc_2,
         resume_via_original_pidfd,
         owner_removed,
         final_start_entries,
@@ -2403,10 +2505,99 @@ fn signal_timing_json(
         "samples".into(),
         serde_json::Value::Array(facts.samples.iter().map(sample_value).collect::<Vec<_>>()),
     );
+    value.insert(
+        "confirmation_sample_indexes_2".into(),
+        match facts.confirmation_sample_indexes_2 {
+            Some((first, second)) => serde_json::json!([first, second]),
+            None => serde_json::Value::Null,
+        },
+    );
+    value.insert(
+        "samples_2".into(),
+        serde_json::Value::Array(facts.samples_2.iter().map(sample_value).collect::<Vec<_>>()),
+    );
     serde_json::Value::Object(value)
 }
 
 type StartMap = aya::maps::HashMap<aya::maps::MapData, common::StateKey, common::StartState>;
+
+/// Validates one drained phase-1 signal record against the exact child.
+fn validate_signal_record(
+    record: &common::SignalRecord,
+    child_pid: u32,
+    expected: &BTreeMap<u32, u8>,
+) -> Result<(), &'static str> {
+    let record_pid = (record.pid_tgid >> 32) as u32;
+    let record_tid = record.pid_tgid as u32;
+    if (record.case_id != 1 && record.case_id != 2)
+        || record_pid != child_pid
+        || !expected.contains_key(&record_tid)
+        || record.reserved_zero != [0; 7]
+    {
+        return Err("signal record identity");
+    }
+    Ok(())
+}
+
+/// Samples the exact expected task set at >= 1 ms cadence until the group stop
+/// is confirmed by two exact-set/all-T samples or the absolute deadline
+/// (`hook_ts_ns + 100 ms`) expires; each sample is stamped after its /proc
+/// reads complete.
+/// The two consecutive exact-set/all-T sample indexes that confirm a stop.
+type ConfirmationPair = (usize, usize);
+
+fn sample_until_confirmed(
+    pid: u32,
+    expected: &BTreeMap<u32, u8>,
+    hook_ts_ns: u64,
+    cancellation: &Cancellation,
+) -> Result<(Vec<StopSnapshot>, Option<ConfirmationPair>), &'static str> {
+    let deadline_ns = hook_ts_ns
+        .checked_add(STOP_WAIT_CEILING_US * 1_000)
+        .ok_or("deadline overflow")?;
+    let mut samples: Vec<StopSnapshot> = Vec::with_capacity(101);
+    loop {
+        cancellation_failure(cancellation)?;
+        if monotonic_ns()? > deadline_ns || samples.len() >= 101 {
+            break;
+        }
+        let mut snap = stop_snapshot(pid, expected)?;
+        let done = monotonic_ns()?;
+        snap.elapsed_us = done.checked_sub(hook_ts_ns).ok_or("clock reversal")? / 1_000;
+        samples.push(snap);
+        if confirm(&samples).is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let confirmed = confirm(&samples);
+    Ok((samples, confirmed))
+}
+
+/// Fills the two serialized confirmation snapshots from the confirmed sample
+/// pair, or the last two samples when the stop never confirmed.
+fn record_confirmation_snapshots(facts: &mut SignalTimingFacts) {
+    let (first, second) = match facts.confirmation_sample_indexes {
+        Some((i, j)) => (facts.samples[i], facts.samples[j]),
+        None => {
+            let last = facts.samples.len();
+            (
+                facts
+                    .samples
+                    .get(last.saturating_sub(2))
+                    .copied()
+                    .unwrap_or_default(),
+                facts.samples.last().copied().unwrap_or_default(),
+            )
+        }
+    };
+    facts.stopped_snapshot_1_count = first.count;
+    facts.stopped_snapshot_1_exact_expected_task_set = first.exact_expected_task_set;
+    facts.stopped_snapshot_1_all_tasks_stopped = first.all_tasks_stopped;
+    facts.stopped_snapshot_2_count = second.count;
+    facts.stopped_snapshot_2_exact_expected_task_set = second.exact_expected_task_set;
+    facts.stopped_snapshot_2_all_tasks_stopped = second.all_tasks_stopped;
+}
 
 #[allow(clippy::too_many_arguments)]
 fn run_gate_b_case(
@@ -2470,7 +2661,7 @@ fn run_gate_b_case(
             return Ok(());
         }
 
-        // arm: insert ARMED under the group key before releasing the child (§5.2)
+        // arm owner 1: insert ARMED under the group key before releasing the child (§5.2)
         let owner_key = common::StateKey {
             pid_tgid: u64::from(guard.pid()) << 32,
             attach_cookie: u64::MAX,
@@ -2500,115 +2691,90 @@ fn run_gate_b_case(
 
         guard.mark_may_be_stopped();
         guard.release().map_err(|_| "child release")?;
-        // read exactly two records; the second must arrive inside the same causal window
+        // Phase 1, first record: the winner's handler always ran (it sent the
+        // stop), so one record must arrive under the ring-liveness bound.
         let rec_a = wait_signal_record(ring, cancellation)?;
-        let causal_deadline_ns = rec_a
-            .hook_ts_ns
-            .checked_add(STOP_WAIT_CEILING_US * 1_000)
-            .ok_or("deadline overflow")?;
-        let rec_b = wait_signal_record_until(
-            ring,
-            cancellation,
-            causal_deadline_ns,
-            "second signal record timeout",
-        )?;
-        for record in [&rec_a, &rec_b] {
-            let record_pid = (record.pid_tgid >> 32) as u32;
-            let record_tid = record.pid_tgid as u32;
-            if (record.case_id != 1 && record.case_id != 2)
-                || record_pid != guard.pid()
-                || !expected.contains_key(&record_tid)
-                || record.reserved_zero != [0; 7]
-            {
-                return Err("signal record identity");
-            }
+        validate_signal_record(&rec_a, guard.pid(), &expected)?;
+        let mut records = vec![rec_a];
+        // If the first record is the coalesced sibling, the winner record is
+        // mandatory inside the same causal window.
+        if records[0].send_signal_rc == common::COALESCED_NO_HELPER {
+            let causal_deadline_ns = records[0]
+                .hook_ts_ns
+                .checked_add(STOP_WAIT_CEILING_US * 1_000)
+                .ok_or("deadline overflow")?;
+            let rec_b = wait_signal_record_until(
+                ring,
+                cancellation,
+                causal_deadline_ns,
+                "second signal record timeout",
+            )?;
+            validate_signal_record(&rec_b, guard.pid(), &expected)?;
+            records.push(rec_b);
         }
-        if rec_a.case_id == rec_b.case_id {
-            return Err("signal record identity");
-        }
-        let second_record_late = rec_a
-            .hook_ts_ns
-            .min(rec_b.hook_ts_ns)
-            .checked_add(STOP_WAIT_CEILING_US * 1_000)
-            .ok_or("deadline overflow")?
-            < monotonic_ns()?;
-        let winner = [&rec_a, &rec_b]
-            .into_iter()
-            .filter(|record| record.send_signal_rc != common::COALESCED_NO_HELPER)
-            .count();
-        facts.winner_records = winner as u64;
-        facts.coalesced_records = 2 - winner as u64;
-        facts.signal_helper_calls = winner as u64;
-        let (win, lost) = if rec_a.send_signal_rc != common::COALESCED_NO_HELPER {
-            (rec_a, rec_b)
-        } else {
-            (rec_b, rec_a)
-        };
-        facts.winner_case_id = win.case_id;
-        facts.coalesced_case_id = lost.case_id;
-        facts.hook_ts_ns = win.hook_ts_ns;
-        facts.send_signal_rc = win.send_signal_rc;
-        facts.stop_request_accepted = win.send_signal_rc == 0;
+        let winner1 = records
+            .iter()
+            .find(|record| record.send_signal_rc != common::COALESCED_NO_HELPER)
+            .ok_or("winner record missing")?;
+        facts.hook_ts_ns = winner1.hook_ts_ns;
+        facts.send_signal_rc = winner1.send_signal_rc;
+        facts.stop_request_accepted = winner1.send_signal_rc == 0;
+        facts.winner_case_id = winner1.case_id;
 
-        // observe: >= 1 ms cadence, absolute deadline hook_ts + 100 ms, sample stamped AFTER its /proc reads complete
-        let deadline_ns = facts
-            .hook_ts_ns
-            .checked_add(STOP_WAIT_CEILING_US * 1_000)
-            .ok_or("deadline overflow")?;
-        let mut samples: Vec<StopSnapshot> = Vec::with_capacity(101);
-        loop {
-            cancellation_failure(cancellation)?;
-            if monotonic_ns()? > deadline_ns || samples.len() >= 101 {
-                break;
-            }
-            let mut snap = stop_snapshot(guard.pid(), &expected)?;
-            let done = monotonic_ns()?;
-            snap.elapsed_us = done.checked_sub(facts.hook_ts_ns).ok_or("clock reversal")? / 1_000;
-            samples.push(snap);
-            if confirm(&samples).is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        // observe stop 1: confirm or the absolute 100 ms deadline expires
+        let (samples, confirmed) =
+            sample_until_confirmed(guard.pid(), &expected, facts.hook_ts_ns, cancellation)?;
         facts.samples = samples;
-        let confirmed = confirm(&facts.samples);
         facts.confirmation_sample_indexes = confirmed;
-        let (first, second) = match confirmed {
-            Some((i, j)) => (facts.samples[i], facts.samples[j]),
-            None => {
-                let last = facts.samples.len();
-                (
-                    facts
-                        .samples
-                        .get(last.saturating_sub(2))
-                        .copied()
-                        .unwrap_or_default(),
-                    facts.samples.last().copied().unwrap_or_default(),
-                )
-            }
-        };
-        facts.stopped_snapshot_1_count = first.count;
-        facts.stopped_snapshot_1_exact_expected_task_set = first.exact_expected_task_set;
-        facts.stopped_snapshot_1_all_tasks_stopped = first.all_tasks_stopped;
-        facts.stopped_snapshot_2_count = second.count;
-        facts.stopped_snapshot_2_exact_expected_task_set = second.exact_expected_task_set;
-        facts.stopped_snapshot_2_all_tasks_stopped = second.all_tasks_stopped;
+        record_confirmation_snapshots(&mut facts);
         facts.pre_stop_marker_observed = drain_marker(marker_reader.as_raw_fd(), cancellation)?;
-        if !facts.stop_request_accepted
-            || second_record_late
-            || confirmed.is_none()
-            || facts.pre_stop_marker_observed
-        {
+        if !facts.stop_request_accepted || confirmed.is_none() || facts.pre_stop_marker_observed {
             return Ok(());
         }
 
-        // drain-to-empty: with all tasks stopped there is no exact-child producer left
-        facts.drain_empty = drain_signal_ring_to_empty(ring)? == 0;
+        // drain-to-empty: with all tasks stopped no exact-child producer is
+        // left, so the phase-1 record truth is final here
+        for record in drain_signal_ring_to_empty(ring)? {
+            validate_signal_record(&record, guard.pid(), &expected)?;
+            records.push(record);
+        }
+        facts.drain_empty = true;
+        let winners = records
+            .iter()
+            .filter(|record| record.send_signal_rc != common::COALESCED_NO_HELPER)
+            .count();
+        let coalesced = records.len() - winners;
+        if records.len() > 2 || winners == 0 {
+            return Err("signal record surplus");
+        }
+        facts.winner_records = winners as u64;
+        facts.coalesced_records = coalesced as u64;
+        facts.signal_helper_calls = winners as u64;
+        if records.len() == 2
+            && let Some(lost) = records
+                .iter()
+                .find(|record| record.send_signal_rc == common::COALESCED_NO_HELPER)
+        {
+            facts.coalesced_case_id = lost.case_id;
+        }
         facts.required_attach_keys = 2;
-        for (target, cookie) in [
-            ("spike_late_target", common::SIGNAL_COOKIE_A),
-            ("spike_late_target_b", common::SIGNAL_COOKIE_B),
-        ] {
+        let deferred = records.len() == 1;
+        let (owner1_late_target, owner2_late_target) = if facts.winner_case_id == 1 {
+            ("spike_late_target", "spike_late_target_b")
+        } else {
+            ("spike_late_target_b", "spike_late_target")
+        };
+        let owner1_targets: &[(&str, u64)] = if deferred {
+            &[(owner1_late_target, u64::from(facts.winner_case_id))]
+        } else {
+            &[
+                ("spike_late_target", common::SIGNAL_COOKIE_A),
+                ("spike_late_target_b", common::SIGNAL_COOKIE_B),
+            ]
+        };
+
+        // attach owner 1's required set while the group stays stopped
+        for &(target, cookie) in owner1_targets {
             facts.late_attach_attempts += 1;
             match attach_program(
                 ebpf,
@@ -2625,12 +2791,7 @@ fn run_gate_b_case(
                 Err(_) => return Ok(()),
             }
         }
-        facts.late_attach_accepted = facts.attached_while_stopped == 2;
         facts.last_attach_ts_ns = monotonic_ns()?;
-        facts.attach_gap_ms = facts
-            .last_attach_ts_ns
-            .checked_sub(facts.hook_ts_ns)
-            .map_or(0.0, |gap| gap as f64 / 1_000_000.0);
 
         cancellation_failure(cancellation)?;
         let third = stop_snapshot(guard.pid(), &expected)?;
@@ -2644,25 +2805,138 @@ fn run_gate_b_case(
         {
             return Ok(());
         }
-        facts.queue_empty_before_resume = drain_signal_ring_to_empty(ring)? == 0;
+        facts.queue_empty_before_resume = drain_signal_ring_to_empty(ring)?.is_empty();
 
-        facts.pidfd_resume_attempts = 1;
-        facts.resume_via_original_pidfd = true;
-        if guard.resume_once().is_err() {
-            facts.pidfd_resume_rc = -1;
-            return Ok(());
+        if deferred {
+            // Outcome B: owner 1 closes its entire attach set, then arms owner 2
+            // while the group is still stopped, and resumes exactly once. The
+            // deferred sibling hook must then win owner 2 and complete a
+            // separate confirmed pause before its caller's post-return marker.
+            facts.deferred_records = 1;
+            owner
+                .as_mut()
+                .ok_or("start map remove")?
+                .close_while_stopped(start)?;
+            start.insert_armed(&owner_key)?;
+            owner = Some(PauseOwnerGuard::new(owner_key));
+            facts.owner2_armed_while_stopped = true;
+            guard.mark_may_be_stopped();
+            facts.pidfd_resume_attempts += 1;
+            facts.resume_via_original_pidfd = true;
+            if guard.resume_once().is_err() {
+                facts.pidfd_resume_rc = -1;
+                return Ok(());
+            }
+
+            // the deferred hook's handler runs at the resume boundary
+            let rec2 = wait_signal_record(ring, cancellation)?;
+            validate_signal_record(&rec2, guard.pid(), &expected)?;
+            if rec2.case_id == facts.winner_case_id {
+                return Err("signal record identity");
+            }
+            facts.owner2_case_id = rec2.case_id;
+            facts.hook_ts_ns_2 = rec2.hook_ts_ns;
+            facts.send_signal_rc_2 = rec2.send_signal_rc;
+            if rec2.send_signal_rc == 0 {
+                facts.winner_records += 1;
+                facts.signal_helper_calls += 1;
+            } else if rec2.send_signal_rc == common::COALESCED_NO_HELPER {
+                facts.coalesced_records += 1;
+            }
+            facts.pause_owners = 2;
+
+            // observe stop 2 under the same absolute 100 ms deadline
+            let (samples_2, confirmed_2) =
+                sample_until_confirmed(guard.pid(), &expected, facts.hook_ts_ns_2, cancellation)?;
+            facts.samples_2 = samples_2;
+            facts.confirmation_sample_indexes_2 = confirmed_2;
+            facts.pre_stop2_marker_observed =
+                drain_marker(marker_reader.as_raw_fd(), cancellation)?;
+            if facts.send_signal_rc_2 != 0
+                || confirmed_2.is_none()
+                || facts.pre_stop2_marker_observed
+            {
+                return Ok(());
+            }
+            facts.owner2_drain_empty = drain_signal_ring_to_empty(ring)?.is_empty();
+            if !facts.owner2_drain_empty {
+                return Ok(());
+            }
+
+            // attach the deferred hook's required set while stopped again
+            facts.late_attach_attempts += 1;
+            match attach_program(
+                ebpf,
+                "late_hit",
+                *offsets.get(owner2_late_target).ok_or("fixture offset")?,
+                fixture,
+                guard.pid(),
+                u64::from(facts.owner2_case_id),
+            ) {
+                Ok(link) => {
+                    late_links.push(link);
+                    facts.attached_while_stopped += 1;
+                }
+                Err(_) => return Ok(()),
+            }
+            facts.last_attach_ts_ns = monotonic_ns()?;
+
+            cancellation_failure(cancellation)?;
+            let third2 = stop_snapshot(guard.pid(), &expected)?;
+            facts.post_attach2_task_count = third2.count;
+            facts.post_attach2_exact_expected_task_set = third2.exact_expected_task_set;
+            facts.post_attach2_all_tasks_stopped = third2.all_tasks_stopped;
+            facts.post_attach2_marker_observed =
+                drain_marker(marker_reader.as_raw_fd(), cancellation)?;
+            if !third2.exact_expected_task_set
+                || !third2.all_tasks_stopped
+                || facts.post_attach2_marker_observed
+            {
+                return Ok(());
+            }
+            facts.queue_empty_before_resume &= drain_signal_ring_to_empty(ring)?.is_empty();
+
+            facts.pidfd_resume_attempts += 1;
+            if guard.resume_once().is_err() {
+                facts.pidfd_resume_rc_2 = -1;
+                return Ok(());
+            }
+            facts.pidfd_resume_rc_2 = 0;
+            facts.owner_removed = owner
+                .as_mut()
+                .ok_or("start map remove")?
+                .close_after_resume(start)?;
+            facts.final_start_entries = owner
+                .as_ref()
+                .ok_or("start map read")?
+                .start_entries(start)?;
+        } else {
+            // Outcome A: both hook records drained under one pause owner; one
+            // resume releases the group and both markers follow.
+            facts.pidfd_resume_attempts = 1;
+            facts.resume_via_original_pidfd = true;
+            if guard.resume_once().is_err() {
+                facts.pidfd_resume_rc = -1;
+                return Ok(());
+            }
+            facts.pidfd_resume_rc = 0;
+            // §5.2: REQUESTED is removed immediately after the one successful
+            // original-pidfd resume — before waiting for markers/exit
+            facts.owner_removed = owner
+                .as_mut()
+                .ok_or("start map remove")?
+                .close_after_resume(start)?;
+            facts.final_start_entries = owner
+                .as_ref()
+                .ok_or("start map read")?
+                .start_entries(start)?;
         }
-        facts.pidfd_resume_rc = 0;
-        // §5.2: REQUESTED is removed immediately after the one successful original-pidfd
-        // resume — before waiting for markers/exit
-        facts.owner_removed = owner
-            .as_mut()
-            .ok_or("start map remove")?
-            .close_after_resume(start)?;
-        facts.final_start_entries = owner
-            .as_ref()
-            .ok_or("start map read")?
-            .start_entries(start)?;
+        facts.late_attach_accepted =
+            facts.attached_while_stopped == 2 && facts.late_attach_attempts == 2;
+        facts.attach_gap_ms = facts
+            .last_attach_ts_ns
+            .checked_sub(facts.hook_ts_ns)
+            .map_or(0.0, |gap| gap as f64 / 1_000_000.0);
 
         match read_markers_after_resume(marker_reader.as_raw_fd(), cancellation) {
             Ok((seen_m, seen_n)) => {
@@ -2684,6 +2958,7 @@ fn run_gate_b_case(
         facts.reaped = true;
         facts.child_exit = status.code().unwrap_or(-1);
         let counters_after = read_counters(counters)?;
+        facts.ring_loss = counters_after[0].saturating_sub(counters_before[0]);
         facts.late_hits = counters_after[4].saturating_sub(counters_before[4]);
         if ring.next().is_some() {
             return Err("signal record surplus");
@@ -2709,10 +2984,14 @@ fn run_gate_b_case(
         && !guard.reaped
     {
         let cleanup = guard.terminate();
-        if cleanup.resume_attempts == 1 && facts.pidfd_resume_attempts == 0 {
-            facts.pidfd_resume_attempts = 1;
-            facts.resume_via_original_pidfd = cleanup.resume_via_original_pidfd;
-            facts.pidfd_resume_rc = if guard.may_be_stopped { -1 } else { 0 };
+        if cleanup.resume_attempts == 1 {
+            facts.pidfd_resume_attempts = facts.pidfd_resume_attempts.saturating_add(1);
+            facts.resume_via_original_pidfd &= cleanup.resume_via_original_pidfd;
+            if facts.pidfd_resume_attempts == 1 {
+                facts.pidfd_resume_rc = if guard.may_be_stopped { -1 } else { 0 };
+            } else {
+                facts.pidfd_resume_rc_2 = if guard.may_be_stopped { -1 } else { 0 };
+            }
         }
         facts.reaped = cleanup.reaped;
         facts.child_exit = -1;
@@ -3163,6 +3442,9 @@ mod tests {
             signal_helper_calls: 1,
             winner_case_id: 1,
             coalesced_case_id: 2,
+            ring_loss: 0,
+            pause_owners: 1,
+            deferred_records: 0,
             stopped_snapshot_1_count: 2,
             stopped_snapshot_2_count: 2,
             stopped_snapshot_1_exact_expected_task_set: true,
@@ -3195,6 +3477,18 @@ mod tests {
             post_attach_marker_observed: false,
             attached_while_stopped: 2,
             queue_empty_before_resume: true,
+            owner2_case_id: 0,
+            owner2_armed_while_stopped: false,
+            hook_ts_ns_2: 0,
+            send_signal_rc_2: 0,
+            pre_stop2_marker_observed: false,
+            owner2_drain_empty: false,
+            confirmation_sample_indexes_2: None,
+            samples_2: Vec::new(),
+            post_attach2_task_count: 0,
+            post_attach2_exact_expected_task_set: false,
+            post_attach2_all_tasks_stopped: false,
+            post_attach2_marker_observed: false,
             markers_after_resume: 2,
             signal_attach_attempts: 2,
             signal_attach_accepted: true,
@@ -3206,6 +3500,7 @@ mod tests {
             attach_gap_ms: 1.0,
             pidfd_resume_attempts: 1,
             pidfd_resume_rc: 0,
+            pidfd_resume_rc_2: 0,
             resume_via_original_pidfd: true,
             owner_removed: true,
             final_start_entries: 0,
@@ -3214,6 +3509,30 @@ mod tests {
             child_exit: 0,
             reaped: true,
         }
+    }
+
+    fn valid_two_owner_signal() -> SignalTimingFacts {
+        let mut facts = valid_signal();
+        facts.winner_records = 2;
+        facts.coalesced_records = 0;
+        facts.signal_helper_calls = 2;
+        facts.coalesced_case_id = 0;
+        facts.pause_owners = 2;
+        facts.deferred_records = 1;
+        facts.owner2_case_id = 2;
+        facts.owner2_armed_while_stopped = true;
+        facts.hook_ts_ns_2 = 5_000_000;
+        facts.send_signal_rc_2 = 0;
+        facts.owner2_drain_empty = true;
+        facts.confirmation_sample_indexes_2 = Some((0, 1));
+        facts.samples_2 = facts.samples.clone();
+        facts.post_attach2_task_count = 2;
+        facts.post_attach2_exact_expected_task_set = true;
+        facts.post_attach2_all_tasks_stopped = true;
+        facts.pidfd_resume_attempts = 2;
+        facts.last_attach_ts_ns = 10_000_000;
+        facts.attach_gap_ms = 9.0;
+        facts
     }
 
     fn passing_facts() -> SignalTimingFacts {
@@ -3451,6 +3770,9 @@ mod tests {
         facts.final_start_entries = 1;
         assert!(!signal_oracle_pass(&facts));
         facts.final_start_entries = 0;
+        facts.ring_loss = 1;
+        assert!(!signal_oracle_pass(&facts));
+        facts.ring_loss = 0;
         // the CAS is symmetric: either thread may win, both finite case IDs
         // must appear exactly once across the winner and coalescer
         facts.winner_case_id = 2;
@@ -3461,6 +3783,118 @@ mod tests {
         facts.coalesced_case_id = 1;
         facts.winner_case_id = 3;
         assert!(!signal_oracle_pass(&facts));
+    }
+
+    #[test]
+    fn signal_oracle_accepts_the_two_owner_deferred_outcome() {
+        let facts = valid_two_owner_signal();
+        assert!(signal_oracle_pass(&facts));
+        // the deferred sibling may win from either hook
+        let mut swapped = facts.clone();
+        swapped.winner_case_id = 2;
+        swapped.owner2_case_id = 1;
+        assert!(signal_oracle_pass(&swapped));
+    }
+
+    #[test]
+    fn signal_oracle_rejects_each_two_owner_binding_mutation() {
+        let valid = valid_two_owner_signal();
+        for mutation in 0..20 {
+            let mut changed = valid.clone();
+            match mutation {
+                0 => changed.pause_owners = 1,
+                1 => changed.pause_owners = 3,
+                2 => changed.deferred_records = 0,
+                3 => changed.deferred_records = 2,
+                4 => changed.winner_records = 1,
+                5 => changed.coalesced_records = 1,
+                6 => changed.signal_helper_calls = 1,
+                7 => changed.winner_case_id = changed.owner2_case_id,
+                8 => changed.owner2_case_id = 0,
+                9 => changed.hook_ts_ns_2 = 0,
+                10 => changed.send_signal_rc_2 = -1,
+                11 => changed.owner2_armed_while_stopped = false,
+                12 => changed.pre_stop2_marker_observed = true,
+                13 => changed.owner2_drain_empty = false,
+                14 => changed.confirmation_sample_indexes_2 = None,
+                15 => changed.post_attach2_task_count = 1,
+                16 => changed.post_attach2_all_tasks_stopped = false,
+                17 => changed.post_attach2_marker_observed = true,
+                18 => changed.pidfd_resume_attempts = 1,
+                19 => changed.pidfd_resume_rc_2 = -1,
+                _ => unreachable!(),
+            }
+            assert!(
+                !signal_oracle_pass(&changed),
+                "accepted two-owner mutation {mutation}"
+            );
+        }
+        // outcome A facts with a leftover second-owner fact must not pass as A
+        let mut leaked = valid_signal();
+        leaked.owner2_armed_while_stopped = true;
+        assert!(!signal_oracle_pass(&leaked));
+        // and the owner-2 samples must confirm, not merely exist
+        let mut unconfirmed2 = valid.clone();
+        unconfirmed2.samples_2 = vec![StopSnapshot {
+            elapsed_us: 500,
+            count: 2,
+            exact_expected_task_set: true,
+            all_tasks_stopped: false,
+            state_counts: [2, 0, 0, 0, 0, 0, 0, 0, 0],
+        }];
+        unconfirmed2.confirmation_sample_indexes_2 = None;
+        assert!(!signal_oracle_pass(&unconfirmed2));
+        let mut mismatched2 = valid.clone();
+        mismatched2.confirmation_sample_indexes_2 = Some((1, 0));
+        assert!(!signal_oracle_pass(&mismatched2));
+    }
+
+    #[test]
+    fn fixture_source_freezes_two_hook_concurrent_marker_contract() {
+        let fixture =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/fixture.c")).unwrap();
+        for target in [
+            "PROBE_TARGET void spike_stop_hook(void)",
+            "PROBE_TARGET void spike_stop_hook_b(void)",
+            "PROBE_TARGET void spike_late_target(void)",
+            "PROBE_TARGET void spike_late_target_b(void)",
+        ] {
+            assert!(fixture.contains(target), "missing {target}");
+        }
+        assert_eq!(
+            fixture
+                .matches("pthread_barrier_wait(&hook_barrier);")
+                .count(),
+            2
+        );
+        assert_eq!(
+            fixture
+                .matches("pthread_barrier_wait(&marker_barrier);")
+                .count(),
+            2
+        );
+        // distinct immediate post-return markers, each behind the marker barrier
+        assert!(fixture.contains("write_byte(args->marker, 'N');"));
+        assert!(fixture.contains("write_byte(marker_fd, 'M');"));
+        // no race-shaping machinery may remain: the two hooks race honestly
+        // and either validated outcome may occur
+        for banned in [
+            "sched_setscheduler",
+            "sched_setaffinity",
+            "SCHED_FIFO",
+            "cpu_set_t",
+            "hook_release",
+            "atomic_load",
+            "atomic_store",
+            "touch_code_page",
+            "clock_gettime",
+            "NPROCESSORS",
+        ] {
+            assert!(
+                !fixture.contains(banned),
+                "fixture must not contain {banned}"
+            );
+        }
     }
 
     struct FakeStartMap(Vec<(common::StateKey, common::StartState)>);
@@ -3530,6 +3964,31 @@ mod tests {
         owner.disarm_for_cleanup(&mut map);
         assert_eq!(entries_after_close, 0);
         assert_eq!(map.entry_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn pause_owner_guard_supports_two_owner_close_arm_close_sequence() {
+        let key = common::StateKey {
+            pid_tgid: 7 << 32,
+            attach_cookie: u64::MAX,
+        };
+        let mut map = armed_fake(key);
+        let mut owner1 = PauseOwnerGuard::new(key);
+        // outcome B: owner 1 closes while still stopped, owner 2 arms on the
+        // same group key, then owner 2 closes after its own resume
+        assert!(owner1.close_while_stopped(&mut map).unwrap());
+        assert!(!owner1.needs_removal());
+        map.insert_armed(&key).unwrap();
+        let mut owner2 = PauseOwnerGuard::new(key);
+        assert_eq!(map.entry_count().unwrap(), 1);
+        assert!(owner2.close_after_resume(&mut map).unwrap());
+        assert_eq!(map.entry_count().unwrap(), 0);
+        // the inert owner-1 guard must never remove owner 2's entry
+        owner1.disarm_for_cleanup(&mut map);
+        owner2.disarm_for_cleanup(&mut map);
+        assert_eq!(map.entry_count().unwrap(), 0);
+        // double close stays inert and true
+        assert!(owner2.close_after_resume(&mut map).unwrap());
     }
 
     #[test]
@@ -3645,11 +4104,19 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         guard.resume_once().unwrap();
-        assert!(guard.resume_attempted);
+        assert_eq!(guard.resume_attempts, 1);
         assert!(
             !guard.may_be_stopped,
             "successful original-pidfd resume must disarm stopped cleanup"
         );
+        guard.resume_once().unwrap_err();
+        assert_eq!(
+            guard.resume_attempts, 1,
+            "a resume without a possibly-pending stop must be refused"
+        );
+        guard.mark_may_be_stopped();
+        guard.resume_once().unwrap();
+        assert_eq!(guard.resume_attempts, 2);
     }
 
     #[test]
@@ -4276,6 +4743,27 @@ mod tests {
             "pre_stop_marker_observed": facts.pre_stop_marker_observed,
             "drain_empty": facts.drain_empty,
             "required_attach_keys": facts.required_attach_keys,
+            "ring_loss": facts.ring_loss,
+            "pause_owners": facts.pause_owners,
+            "deferred_records": facts.deferred_records,
+            "owner2_case_id": facts.owner2_case_id,
+            "owner2_armed_while_stopped": facts.owner2_armed_while_stopped,
+            "hook_ts_ns_2": facts.hook_ts_ns_2,
+            "send_signal_rc_2": facts.send_signal_rc_2,
+            "pre_stop2_marker_observed": facts.pre_stop2_marker_observed,
+            "owner2_drain_empty": facts.owner2_drain_empty,
+            "confirmation_sample_indexes_2": facts.confirmation_sample_indexes_2,
+            "samples_2": facts.samples_2.iter().map(|snapshot| serde_json::json!({
+                "elapsed_us": snapshot.elapsed_us,
+                "task_count": snapshot.count,
+                "exact_expected_task_set": snapshot.exact_expected_task_set,
+                "all_tasks_stopped": snapshot.all_tasks_stopped,
+                "state_counts": snapshot.state_counts,
+            })).collect::<Vec<_>>(),
+            "post_attach2_task_count": facts.post_attach2_task_count,
+            "post_attach2_exact_expected_task_set": facts.post_attach2_exact_expected_task_set,
+            "post_attach2_all_tasks_stopped": facts.post_attach2_all_tasks_stopped,
+            "post_attach2_marker_observed": facts.post_attach2_marker_observed,
         });
         let extra = serde_json::json!({
             "post_attach_task_count": facts.post_attach_task_count,
@@ -4295,6 +4783,7 @@ mod tests {
             "attach_gap_ms": facts.attach_gap_ms,
             "pidfd_resume_attempts": facts.pidfd_resume_attempts,
             "pidfd_resume_rc": facts.pidfd_resume_rc,
+            "pidfd_resume_rc_2": facts.pidfd_resume_rc_2,
             "resume_via_original_pidfd": facts.resume_via_original_pidfd,
             "owner_removed": facts.owner_removed,
             "final_start_entries": facts.final_start_entries,
@@ -4320,6 +4809,16 @@ mod tests {
         runs: usize,
         category: &str,
     ) {
+        fake_canonical_gate_b_export_facts(path, verifier_count, runs, category, &valid_signal());
+    }
+
+    fn fake_canonical_gate_b_export_facts(
+        path: &Path,
+        verifier_count: usize,
+        runs: usize,
+        category: &str,
+        facts: &SignalTimingFacts,
+    ) {
         std::fs::create_dir(path).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let programs = ["signal_return", "late_hit"];
@@ -4341,7 +4840,7 @@ mod tests {
             })
             .collect::<String>();
         let timing = (1..=runs)
-            .map(|run| signal_timing_value(run, &valid_signal()).to_string() + "\n")
+            .map(|run| signal_timing_value(run, facts).to_string() + "\n")
             .collect::<String>();
         let status = if category == "none" { "PASS" } else { "FAIL" };
         for (name, contents) in [
@@ -4504,7 +5003,7 @@ mod tests {
         .unwrap();
         assert!(shell_validate_gate_b_export(script, &runtime_failure, 1));
         let runtime_reasons = shell_lines(script, "source \"$1\"; gate_b_runtime_reasons", &[]);
-        assert_eq!(runtime_reasons.len(), 35);
+        assert_eq!(runtime_reasons.len(), 36);
         assert_eq!(
             runtime_reasons
                 .iter()
@@ -4666,6 +5165,56 @@ mod tests {
             assert!(
                 !shell_validate_gate_b_export(script, &path, 0),
                 "accepted Gate B mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_b_semantics_accept_and_mutate_the_two_owner_outcome() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("gate-b-two-owner");
+        let valid = temp.path().join("valid");
+        fake_canonical_gate_b_export_facts(&valid, 2, 20, "none", &valid_two_owner_signal());
+        assert!(shell_validate_gate_b_export(script, &valid, 0));
+
+        for mutation in 0..14 {
+            let path = temp.path().join(format!("two-owner-mutation-{mutation}"));
+            fake_canonical_gate_b_export_facts(&path, 2, 20, "none", &valid_two_owner_signal());
+            let timing = path.join("signal-timing.jsonl");
+            let mut records = std::fs::read_to_string(&timing)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            let record = &mut records[0];
+            match mutation {
+                0 => record["pause_owners"] = 1.into(),
+                1 => record["pause_owners"] = 3.into(),
+                2 => record["deferred_records"] = 0.into(),
+                3 => record["owner2_case_id"] = 1.into(),
+                4 => record["hook_ts_ns_2"] = 0.into(),
+                5 => record["send_signal_rc_2"] = (-1).into(),
+                6 => record["owner2_armed_while_stopped"] = false.into(),
+                7 => record["pre_stop2_marker_observed"] = true.into(),
+                8 => record["owner2_drain_empty"] = false.into(),
+                9 => record["confirmation_sample_indexes_2"] = serde_json::Value::Null,
+                10 => record["post_attach2_all_tasks_stopped"] = false.into(),
+                11 => record["pidfd_resume_rc_2"] = (-1).into(),
+                12 => record["ring_loss"] = 1.into(),
+                13 => record["samples_2"] = Vec::<serde_json::Value>::new().into(),
+                _ => unreachable!(),
+            }
+            std::fs::write(
+                timing,
+                records
+                    .iter()
+                    .map(|record| record.to_string() + "\n")
+                    .collect::<String>(),
+            )
+            .unwrap();
+            assert!(
+                !shell_validate_gate_b_export(script, &path, 0),
+                "accepted Gate B two-owner mutation {mutation}"
             );
         }
     }
@@ -5427,15 +5976,28 @@ mod tests {
             reserve < zeroing && zeroing < cas && cas < send && send < submit,
             "order must be reserve -> zero words -> CAS -> single signal -> submit"
         );
-        let delay = signal_source.find("STOP_SIGNAL_DELAY_POLLS").unwrap();
         let winner_timestamp = signal_source
             .find("let hook_ts_ns = helpers::bpf_ktime_get_ns();")
             .expect("winner timestamp");
         assert!(
-            cas < delay && delay < winner_timestamp && winner_timestamp < send,
-            "the timestamp must be taken after the bounded delay and immediately before the signal helper"
+            cas < winner_timestamp && winner_timestamp < send,
+            "the timestamp must be taken immediately before the single signal request"
         );
-        assert!(source.contains("const STOP_SIGNAL_DELAY_POLLS: u64 = 50_000;"));
+        let timestamp_end =
+            winner_timestamp + "let hook_ts_ns = helpers::bpf_ktime_get_ns();".len();
+        let send_prelude = &signal_source[timestamp_end..send];
+        assert!(
+            send_prelude.matches('\n').count() <= 1,
+            "nothing may sit between the winner timestamp and the signal helper"
+        );
+        assert!(
+            !source.contains("STOP_SIGNAL_DELAY_POLLS"),
+            "no winner-side delay constant may exist"
+        );
+        assert!(
+            !signal_source.contains("while polls"),
+            "no winner-side polling loop may exist"
+        );
         assert!(signal_source.contains("pause_owner_key()"));
         assert!(signal_source.contains("PAUSE_ARMED"));
         assert!(signal_source.contains("PAUSE_REQUESTED"));

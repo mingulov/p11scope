@@ -263,6 +263,7 @@ task count
 child release
 signal record timeout
 second signal record timeout
+winner record missing
 signal record length is not 32 bytes
 signal record identity
 poll
@@ -321,11 +322,12 @@ if [item.get("signal_run") for item in timing] != list(range(1, len(timing) + 1)
 
 u64 = ["hook_ts_ns", "last_attach_ts_ns", "late_hits", "winner_records",
        "coalesced_records", "signal_helper_calls", "required_attach_keys",
-       "attached_while_stopped", "final_start_entries", "stop_wait_ceiling_us"]
-i64 = ["send_signal_rc", "pidfd_resume_rc"]
+       "attached_while_stopped", "final_start_entries", "stop_wait_ceiling_us",
+       "ring_loss", "deferred_records", "hook_ts_ns_2"]
+i64 = ["send_signal_rc", "pidfd_resume_rc", "pidfd_resume_rc_2", "send_signal_rc_2"]
 u32 = ["expected_task_count", "stopped_snapshot_1_count", "stopped_snapshot_2_count",
-       "post_attach_task_count", "markers_after_resume"]
-u8 = ["winner_case_id", "coalesced_case_id"]
+       "post_attach_task_count", "markers_after_resume", "post_attach2_task_count"]
+u8 = ["winner_case_id", "coalesced_case_id", "pause_owners", "owner2_case_id"]
 attach_attempts = ["signal_attach_attempts", "late_attach_attempts"]
 attempts = ["pidfd_resume_attempts"]
 booleans = [
@@ -337,6 +339,9 @@ booleans = [
     "drain_empty", "queue_empty_before_resume", "owner_removed",
     "signal_attach_accepted", "late_attach_accepted", "signal_link_detached",
     "late_link_detached", "resume_via_original_pidfd", "post_resume_marker_observed", "reaped",
+    "owner2_armed_while_stopped", "pre_stop2_marker_observed", "owner2_drain_empty",
+    "post_attach2_exact_expected_task_set", "post_attach2_all_tasks_stopped",
+    "post_attach2_marker_observed",
 ]
 def sample_well_formed(sample):
     if not isinstance(sample, dict):
@@ -353,8 +358,8 @@ def sample_well_formed(sample):
     if any(type(count) is not int or isinstance(count, bool) or count < 0 for count in counts):
         return False
     return sum(counts) == sample["task_count"]
-def samples_well_formed(item):
-    samples = item.get("samples")
+def timeline_well_formed(item, samples_name, confirmation_name):
+    samples = item.get(samples_name)
     if not isinstance(samples, list) or len(samples) > 101:
         return False
     if any(not sample_well_formed(sample) for sample in samples):
@@ -364,7 +369,7 @@ def samples_well_formed(item):
         for index in range(len(samples) - 1)
     ):
         return False
-    confirmation = item.get("confirmation_sample_indexes")
+    confirmation = item.get(confirmation_name)
     if confirmation is not None:
         if not isinstance(confirmation, list) or len(confirmation) != 2:
             return False
@@ -380,11 +385,19 @@ def samples_well_formed(item):
             return False
         if samples[second]["elapsed_us"] > 100000:
             return False
+    return True
+def samples_well_formed(item):
+    if not timeline_well_formed(item, "samples", "confirmation_sample_indexes"):
+        return False
+    if not timeline_well_formed(item, "samples_2", "confirmation_sample_indexes_2"):
+        return False
     if item.get("stop_wait_ceiling_us") != 100000:
         return False
     return True
 def well_formed(item):
     if not isinstance(item.get("pass"), bool) or item.get("failure_category") not in {"none", "runtime", "oracle"}:
+        return False
+    if item.get("pause_owners") not in {1, 2}:
         return False
     if any(type(item.get(name)) is not int or not 0 <= item[name] <= 0xffffffffffffffff for name in u64):
         return False
@@ -396,7 +409,7 @@ def well_formed(item):
         return False
     if any(type(item.get(name)) is not int or item[name] not in {0, 1, 2} for name in attach_attempts):
         return False
-    if any(type(item.get(name)) is not int or item[name] not in {0, 1} for name in attempts):
+    if any(type(item.get(name)) is not int or item[name] not in {0, 1, 2} for name in attempts):
         return False
     if any(not isinstance(item.get(name), bool) for name in booleans):
         return False
@@ -415,18 +428,37 @@ def well_formed(item):
         return False
     if item["late_link_detached"] and not item["late_attach_accepted"]:
         return False
-    if item["resume_via_original_pidfd"] and item["pidfd_resume_attempts"] != 1:
+    if item["resume_via_original_pidfd"] and item["pidfd_resume_attempts"] not in {1, 2}:
         return False
+    if item["pause_owners"] == 1:
+        if item["pidfd_resume_attempts"] != 1:
+            return False
+        if item["deferred_records"] != 0 or item["owner2_case_id"] != 0:
+            return False
+        if item["hook_ts_ns_2"] != 0 or item["send_signal_rc_2"] != 0 or item["pidfd_resume_rc_2"] != 0:
+            return False
+        if item["samples_2"] != [] or item.get("confirmation_sample_indexes_2") is not None:
+            return False
+        if item["post_attach2_task_count"] != 0:
+            return False
+        if any(item.get(name) is not False for name in [
+            "owner2_armed_while_stopped", "pre_stop2_marker_observed", "owner2_drain_empty",
+            "post_attach2_exact_expected_task_set", "post_attach2_all_tasks_stopped",
+            "post_attach2_marker_observed",
+        ]):
+            return False
+    else:
+        if item["pidfd_resume_attempts"] != 2:
+            return False
+        if item["samples_2"] == []:
+            return False
     return True
 def oracle(item):
     gap = item["last_attach_ts_ns"] - item["hook_ts_ns"]
-    return (
+    common = (
         item["hook_ts_ns"] != 0 and item["send_signal_rc"] == 0
         and item["stop_request_accepted"] is True and item["expected_task_count"] == 2
-        and item["winner_records"] == 1 and item["coalesced_records"] == 1
-        and item["signal_helper_calls"] == 1
-        and item["winner_case_id"] != item["coalesced_case_id"]
-        and {item["winner_case_id"], item["coalesced_case_id"]} == {1, 2}
+        and item["ring_loss"] == 0
         and item["stopped_snapshot_1_count"] == item["expected_task_count"]
         and item["stopped_snapshot_2_count"] == item["expected_task_count"]
         and item["stopped_snapshot_1_exact_expected_task_set"] is True
@@ -446,12 +478,41 @@ def oracle(item):
         and item["late_attach_attempts"] == 2 and item["late_attach_accepted"] is True
         and item["signal_link_detached"] is True and item["late_link_detached"] is True
         and gap >= 0 and item["attach_gap_ms"] == gap / 1000000.0
-        and item["pidfd_resume_attempts"] == 1 and item["pidfd_resume_rc"] == 0
+        and item["pidfd_resume_rc"] == 0
         and item["resume_via_original_pidfd"] is True
         and item["owner_removed"] is True and item["final_start_entries"] == 0
         and item["post_resume_marker_observed"] is True
         and item["markers_after_resume"] == 2 and item["late_hits"] == 2
         and item["child_exit"] == 0 and item["reaped"] is True
+    )
+    if not common:
+        return False
+    if item["pause_owners"] == 1:
+        return (
+            item["winner_records"] == 1 and item["coalesced_records"] == 1
+            and item["signal_helper_calls"] == 1
+            and item["winner_case_id"] != item["coalesced_case_id"]
+            and {item["winner_case_id"], item["coalesced_case_id"]} == {1, 2}
+            and item["deferred_records"] == 0
+            and item["pidfd_resume_attempts"] == 1
+        )
+    return (
+        item["winner_records"] == 2 and item["coalesced_records"] == 0
+        and item["signal_helper_calls"] == 2
+        and item["coalesced_case_id"] == 0
+        and item["deferred_records"] == 1
+        and item["winner_case_id"] != item["owner2_case_id"]
+        and {item["winner_case_id"], item["owner2_case_id"]} == {1, 2}
+        and item["hook_ts_ns_2"] != 0 and item["send_signal_rc_2"] == 0
+        and item["owner2_armed_while_stopped"] is True
+        and item["pre_stop2_marker_observed"] is False
+        and item["owner2_drain_empty"] is True
+        and item["confirmation_sample_indexes_2"] is not None
+        and item["post_attach2_task_count"] == item["expected_task_count"]
+        and item["post_attach2_exact_expected_task_set"] is True
+        and item["post_attach2_all_tasks_stopped"] is True
+        and item["post_attach2_marker_observed"] is False
+        and item["pidfd_resume_attempts"] == 2 and item["pidfd_resume_rc_2"] == 0
     )
 if any(not well_formed(item) for item in timing):
     raise SystemExit(64)
@@ -1025,10 +1086,8 @@ gate_lane() {
         *) gate_rc=64 ;;
     esac
     if (( gate_rc == 0 )); then
-        # pin the runner to the first guest CPU: its attach burst is the
-        # busiest runnable task during the pre-release window and would
-        # otherwise preempt the fixture's spinning stop-hook waiter on the
-        # second CPU, whose resume boundary would swallow the group stop
+        # pin the runner to the first guest CPU so its attach bursts stay off
+        # the fixture's concurrent stop-hook pair on the second CPU
         remote_command="sudo -n taskset -c 0 timeout --signal=TERM --kill-after=5s 120s $remote/slice1b2-runner $gate_name$gate_args --source-manifest $remote/source-elf.manifest --build-evidence $remote/build-evidence.txt --execution-manifest $remote/execution.manifest --bpf $remote/slice1b2-kernel-ebpf --fixture $remote/slice1b2-fixture --out $gate_dir"
         if gate_ssh "$PRIVATE_KNOWN_HOSTS" "$PRIVATE_PORT" "$remote_command" \
             >"$run_dir/$gate_name.stdout" 2>"$run_dir/$gate_name.stderr"; then
@@ -1204,13 +1263,7 @@ build_bpf() {
     install -m 0600 "$object" "$output/slice1b2-kernel-ebpf"
     objdump_bin=$(rustc +nightly --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-objdump
     python3 "$here/check-init-shape.py" "$output/slice1b2-kernel-ebpf" "$objdump_bin" || return 64
-    local cmpxchg_count
-    cmpxchg_count=$("$objdump_bin" -d "$output/slice1b2-kernel-ebpf" \
-        | sed -n '/<signal_return>:/,/^$/p' | grep -c cmpxchg_64 || true)
-    if [[ $cmpxchg_count != 1 ]]; then
-        printf 'signal_return must contain exactly one cmpxchg_64 (found %s)\n' "$cmpxchg_count" >&2
-        return 64
-    fi
+    python3 "$here/check-signal-shape.py" "$output/slice1b2-kernel-ebpf" "$objdump_bin" || return 64
     printf '%s\n' "$rustc_verbose" >"$output/nightly.txt"
     python3 - "$output/source.tar" "$output/slice1b2-kernel-ebpf" \
         "$(git -C "$root" rev-parse HEAD)" "$output/source-elf.manifest" <<'PY'

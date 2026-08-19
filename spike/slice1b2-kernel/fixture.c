@@ -2,15 +2,12 @@
 
 #include <errno.h>
 #include <pthread.h>
-#include <sched.h>
-#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <time.h>
 #include <unistd.h>
 
 #define PROBE_TARGET __attribute__((noinline, used, visibility("default")))
@@ -202,93 +199,34 @@ struct worker_args {
     int marker;
 };
 
+static pthread_barrier_t hook_barrier;
+
 static pthread_barrier_t marker_barrier;
-
-static atomic_int hook_release;
-
-static void pin_cpu_and_realtime(int cpu, int priority) {
-    /* The stop-hook pair is a two-thread race against a group stop: a
-     * guest-side preemption of the spinning waiter is resumed through a
-     * return-to-user boundary, and if the stop owner's SIGSTOP is pending
-     * by then the waiter stops before its uprobe can run and its record is
-     * never submitted.  Giving the waiter its own CPU under SCHED_FIFO
-     * makes guest preemption impossible; failures (self-check without
-     * privileges) simply fall back to the default scheduler. */
-    long count = sysconf(_SC_NPROCESSORS_ONLN);
-    if (count > cpu) {
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        CPU_SET((unsigned)cpu, &set);
-        (void)sched_setaffinity(0, sizeof(set), &set);
-    }
-    if (priority > 0) {
-        struct sched_param param = {.sched_priority = priority};
-        (void)sched_setscheduler(0, SCHED_FIFO, &param);
-    }
-}
 
 static void *worker_main(void *opaque) {
     struct worker_args *args = opaque;
-    /* own the second CPU for the whole pre-release spin so only an
-     * interrupt (never a guest reschedule) can intervene before the hook */
-    pin_cpu_and_realtime(1, 1);
     write_byte(args->ready, 'W');
-    /* Pre-position this thread in user mode before the host releases the
-     * child: a pending SIGSTOP can only stop this thread at a kernel
-     * return-to-user boundary, so after the main thread stores hook_release
-     * both threads run straight to their stop hooks with no kernel transit,
-     * and the CAS winner's SIGSTOP cannot preempt the sibling's uprobe (its
-     * record is submitted inside the kernel before the stop can bite).
-     * Bounded (2 s) so a missing release can never hang the child. */
-    struct timespec start;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    long spins = 0;
-    while (!atomic_load_explicit(&hook_release, memory_order_acquire)) {
-        if ((++spins & 0xffff) == 0) {
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000L
-                + (now.tv_nsec - start.tv_nsec) / 1000000L;
-            if (elapsed_ms > 2000) {
-                fputs("worker release timeout\n", stderr);
-                return (void *)1;
-            }
-        }
-#if defined(__x86_64__)
-        __asm__ __volatile__("pause");
-#endif
-    }
+    /* reach the two distinct stop hooks concurrently with the main thread */
+    pthread_barrier_wait(&hook_barrier);
     spike_stop_hook_b();
-    /* the CAS winner is stopped at its hook exit, so neither thread can pass
-     * this barrier before the host resumes the process: markers are provably
-     * absent while stopped (spec §5.3: no protected marker before attach) */
+    /* while any confirmed pause owner holds the group stopped, neither thread
+     * can pass this barrier (each waits for the other), so both markers are
+     * provably absent until a resume releases the owner's stop (§5.3: no
+     * protected marker before attach) */
     pthread_barrier_wait(&marker_barrier);
     write_byte(args->marker, 'N');
     spike_late_target_b();
     return NULL;
 }
 
-static void touch_code_page(const void *function) {
-    /* Each gate-B child is a fresh exec, so the hook code pages start cold.
-     * A cold instruction fetch after hook_release faults (~us), and the stop
-     * owner's pending group stop is delivered at that fault's return-to-user
-     * boundary before the hook's uprobe can run - the loser's record would
-     * never be submitted.  Reading one byte makes the page resident before
-     * the stop window opens (uprobe breakpoints are already installed). */
-    volatile const unsigned char *first = (const unsigned char *)function;
-    (void)*first;
-}
-
 static void run_signal_case(int release_fd, int fixture_ready_fd, int marker_fd) {
-    /* keep the main thread off the waiter's CPU: it is blocked in the
-     * kernel until release, and the runner is pinned to this CPU too */
-    pin_cpu_and_realtime(0, 0);
     int worker_ready[2];
     if (pipe(worker_ready) != 0) {
         perror("pipe");
         exit(1);
     }
-    if (pthread_barrier_init(&marker_barrier, NULL, 2) != 0) {
+    if (pthread_barrier_init(&hook_barrier, NULL, 2) != 0
+        || pthread_barrier_init(&marker_barrier, NULL, 2) != 0) {
         fputs("pthread_barrier_init failed\n", stderr);
         exit(1);
     }
@@ -304,16 +242,12 @@ static void run_signal_case(int release_fd, int fixture_ready_fd, int marker_fd)
     read_byte(worker_ready[0]);
     write_byte(fixture_ready_fd, 'R');
     read_byte(release_fd);
-    /* fault the hook and late-target code pages in while no stop can be
-     * pending: after the flag store both threads run lockstep to their
-     * uprobe'd hooks with every page they touch on that path resident */
-    touch_code_page((const void *)spike_stop_hook);
-    touch_code_page((const void *)spike_stop_hook_b);
-    touch_code_page((const void *)spike_late_target);
-    touch_code_page((const void *)spike_late_target_b);
-    /* the worker is already spinning in user mode on this flag: both threads
-     * reach their stop hooks from user mode with no kernel transit */
-    atomic_store_explicit(&hook_release, 1, memory_order_release);
+    /* both threads leave this barrier's futex wake together and reach their
+     * distinct uprobe'd stop hooks with no winner-side shaping of the race:
+     * whichever handler wins the owner CAS stops the group; the sibling's
+     * record either drains under that owner or its hook is deferred until the
+     * host's separately validated second owner */
+    pthread_barrier_wait(&hook_barrier);
     spike_stop_hook();
     pthread_barrier_wait(&marker_barrier);
     write_byte(marker_fd, 'M');
@@ -323,6 +257,7 @@ static void run_signal_case(int release_fd, int fixture_ready_fd, int marker_fd)
         fputs("worker failed\n", stderr);
         exit(1);
     }
+    pthread_barrier_destroy(&hook_barrier);
     pthread_barrier_destroy(&marker_barrier);
     close(worker_ready[0]);
     close(worker_ready[1]);

@@ -17,6 +17,11 @@ def normalized_pause_region(lines):
         instruction = re.sub(r"^[0-9a-f]+:\s+", "", line.strip())
         instruction = re.sub(r"\s+", " ", instruction)
         instruction = re.sub(r"goto [+-]0x[0-9a-f]+(?: <[^>]+>)?", "goto TARGET", instruction)
+        instruction = re.sub(
+            r"(\*\(u(?:8|16|32|64) \*\)\(r\d+ [+-] (?:0x[0-9a-f]+|-?\d+)\) = )w(\d+)$",
+            r"\1r\2",
+            instruction,
+        )
         if "cmpxchg_64" in instruction:
             after_cas = True
         if after_cas:
@@ -59,6 +64,30 @@ PAUSE_POST_CAS_FINGERPRINT = [
     "r0 = 0x0",
     "exit",
 ]
+
+def pause_fingerprint_matches(lines):
+    return normalized_pause_region(lines) == PAUSE_POST_CAS_FINGERPRINT
+
+def pause_fingerprint_self_test():
+    def normalize(lines):
+        return pause_fingerprint_matches(
+            [f"{index:04x}: {line}" for index, line in enumerate(lines)]
+        )
+
+    nightly = list(PAUSE_POST_CAS_FINGERPRINT)
+    nightly[8] = "*(u32 *)(r10 - 0x10) = w9"
+    nightly[25] = "*(u8 *)(r8 + 0x18) = w7"
+    if not normalize(nightly):
+        fail("pause store-register aliases were rejected")
+    for old, new in [
+        ("r2 &= 0x1", "w2 &= 0x1"),
+        ("*(u32 *)(r10 - 0x10) = w9", "*(u16 *)(r10 - 0x10) = w9"),
+        ("*(u32 *)(r10 - 0x10) = w9", "*(u32 *)(r10 - 0x10) = w8"),
+    ]:
+        mutated = list(nightly)
+        mutated[mutated.index(old)] = new
+        if normalize(mutated):
+            fail("pause semantic mutation was accepted")
 
 def pause_source_guard(path):
     source = open(path, encoding="utf-8").read()
@@ -114,6 +143,11 @@ if len(sys.argv) >= 2 and sys.argv[1] == "--pause-source-only":
         sys.exit("usage: check-init-shape.py --pause-source-only SOURCE")
     pause_source_guard(sys.argv[2])
     print("PASS: pause source has reserve/init/CAS/ktime/send/submit without a post-CAS loop")
+    raise SystemExit(0)
+
+if len(sys.argv) == 2 and sys.argv[1] == "--pause-fingerprint-self-test":
+    pause_fingerprint_self_test()
+    print("PASS: pause store aliases accepted; ALU, width, and source mutations rejected")
     raise SystemExit(0)
 
 obj = sys.argv[1]
@@ -222,6 +256,6 @@ if pause_source is not None:
         fail("signal_return must contain exactly one cmpxchg_64")
     if re.search(r"\bgoto -", signal_lines):
         fail("signal_return has a backward edge")
-    if normalized_pause_region(signal_lines.splitlines()) != PAUSE_POST_CAS_FINGERPRINT:
+    if not pause_fingerprint_matches(signal_lines.splitlines()):
         fail("signal_return post-CAS instruction fingerprint changed")
 print("PASS: 112 aligned u64 zero stores at record offsets 0..888 before any record use; no memset / back edge in the region")

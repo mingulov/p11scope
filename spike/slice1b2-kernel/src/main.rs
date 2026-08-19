@@ -570,6 +570,7 @@ pub struct ChildGuard {
     successor_stop_possible: bool,
     protective_resume_attempted: bool,
     reaped: bool,
+    terminal_cleanup: Option<CleanupFacts>,
 }
 
 impl ChildGuard {
@@ -612,10 +613,10 @@ impl ChildGuard {
     }
 
     pub fn resume_once(&mut self) -> io::Result<()> {
-        self.resume_current_once(false)
+        self.resume_current_once()
     }
 
-    fn resume_current_once(&mut self, retain_stop_guard: bool) -> io::Result<()> {
+    fn resume_current_once(&mut self) -> io::Result<()> {
         if self.current_resume_attempted {
             return Err(io::Error::other(
                 "current child resume was already attempted",
@@ -626,28 +627,29 @@ impl ChildGuard {
         self.current_resume_attempted = true;
         let result = pidfd_send_signal(self.original_pidfd.as_raw_fd(), libc::SIGCONT);
         self.current_resume_rc = Some(if result.is_ok() { 0 } else { -1 });
-        if result.is_ok() && !retain_stop_guard && !self.successor_stop_possible {
+        if result.is_ok() && !self.successor_stop_possible {
             self.may_be_stopped = false;
         }
         result
     }
 
-    fn resume_accepted(&mut self, retain_stop_guard: bool) -> io::Result<()> {
+    fn resume_accepted(&mut self) -> io::Result<()> {
         if self.current_resume_attempted {
             return Err(io::Error::other("accepted resume limit"));
         }
-        if retain_stop_guard {
-            self.mark_successor_stop_possible();
-        }
-        self.resume_current_once(retain_stop_guard)
+        self.resume_current_once()
     }
 
     fn resume_unresolved_once(&mut self) -> io::Result<()> {
-        self.resume_current_once(false)
+        self.resume_current_once()
+    }
+
+    fn can_resume_successor_protective(&self) -> bool {
+        !self.protective_resume_attempted && self.successor_stop_possible
     }
 
     fn resume_successor_protective_once(&mut self) -> io::Result<()> {
-        if self.protective_resume_attempted || !self.successor_stop_possible {
+        if !self.can_resume_successor_protective() {
             return Err(io::Error::other(
                 "successor protective resume was already attempted",
             ));
@@ -688,10 +690,22 @@ impl ChildGuard {
         if ready < 0 {
             return Err(io::Error::last_os_error());
         }
-        self.wait()
+        if pollfd.revents & libc::POLLIN == 0 {
+            return Err(io::Error::other("child reap readiness"));
+        }
+        match self.child.try_wait()? {
+            Some(status) => {
+                self.reaped = true;
+                Ok(status)
+            }
+            None => Err(io::Error::other("child reap not ready")),
+        }
     }
 
     fn terminate(&mut self) -> CleanupFacts {
+        if let Some(facts) = self.terminal_cleanup {
+            return facts;
+        }
         let may_be_stopped = self.may_be_stopped;
         let mut facts = CleanupFacts {
             may_be_stopped,
@@ -699,13 +713,14 @@ impl ChildGuard {
         };
         if self.reaped {
             facts.reaped = true;
+            self.terminal_cleanup = Some(facts);
             return facts;
         }
         facts.resume_rc = self.current_resume_rc;
         if self.may_be_stopped && !self.current_resume_attempted {
             facts.resume_attempts = 1;
             facts.resume_via_original_pidfd = true;
-            let resume = self.resume_current_once(false);
+            let resume = self.resume_current_once();
             facts.resume_rc = Some(if resume.is_ok() { 0 } else { -1 });
         }
         if self.successor_stop_possible
@@ -728,6 +743,7 @@ impl ChildGuard {
         };
         facts.reap_rc = Some(if self.reaped { 0 } else { -1 });
         facts.reaped = self.reaped;
+        self.terminal_cleanup = Some(facts);
         facts
     }
 }
@@ -762,6 +778,7 @@ where
             successor_stop_possible: false,
             protective_resume_attempted: false,
             reaped: false,
+            terminal_cleanup: None,
         }),
         Err(pidfd_error) => {
             let kill_succeeded = child.kill().is_ok();
@@ -1126,6 +1143,32 @@ impl PauseOwnerGuard {
     }
 }
 
+/// Once owner 2 is armed, record the matching child-side protective debt before
+/// any later boundary can fail.  The owner map write remains the authority;
+/// ChildGuard only carries the original-pidfd cleanup obligation it creates.
+fn prearm_successor_for_cleanup<M: PauseOwnerMap>(
+    owner: &mut PauseOwnerGuard,
+    guard: &mut ChildGuard,
+    map: &mut M,
+    all_tasks_stopped: bool,
+) -> Result<(), &'static str> {
+    owner.prearm_successor_before_resume(map, all_tasks_stopped)?;
+    guard.mark_successor_stop_possible();
+    Ok(())
+}
+
+/// Store the rejection deadline before the fallible owner transition so teardown
+/// must finish the exact winner-relative drain even if that transition fails.
+fn reject_successor_with_deadline(
+    owner: &mut PauseOwnerGuard,
+    deadline_ns: u64,
+    rejection_deadline: &mut Option<u64>,
+) -> Result<(), &'static str> {
+    owner.record_winner_deadline(deadline_ns);
+    *rejection_deadline = Some(deadline_ns);
+    owner.reject_successor_request()
+}
+
 /// Fulfil every currently ledger-authorized resume without making a new pidfd
 /// or numeric-PID decision.  It deliberately records each debt before its
 /// syscall and can perform the one distinct successor-protective resume only
@@ -1145,7 +1188,7 @@ fn complete_cleanup_resumes(owner: &mut PauseOwnerGuard, guard: &mut ChildGuard)
         facts.resume_attempts = 1;
         facts.resume_via_original_pidfd = true;
         let resume = if accepted {
-            guard.resume_accepted(false)
+            guard.resume_accepted()
         } else {
             guard.resume_unresolved_once()
         };
@@ -1155,7 +1198,7 @@ fn complete_cleanup_resumes(owner: &mut PauseOwnerGuard, guard: &mut ChildGuard)
             let _ = owner.record_current_resume(rc);
         }
     }
-    if owner.needs_protective_successor_resume() {
+    if owner.needs_protective_successor_resume() && guard.can_resume_successor_protective() {
         let _ = owner.record_protective_successor_resume();
         facts.protective_resume_attempts = 1;
         facts.protective_resume_via_original_pidfd = true;
@@ -1231,6 +1274,65 @@ fn retain_cleanup_owner_result(
     }
     if !retained && let Err(reason) = result {
         retain_cleanup_failure(facts, failure, reason);
+    }
+}
+
+/// Complete the shared post-detach teardown without short-circuiting.  The
+/// caller supplies only its ring drain; map ownership, pidfd resumes, and
+/// terminal child cleanup stay in one lifecycle order for production and the
+/// failure-injection tests.
+fn finish_gate_b_cleanup<M, F>(
+    facts: &mut GateBTimingFacts,
+    failure: &mut Option<&'static str>,
+    owner: Option<&mut PauseOwnerGuard>,
+    mut child: Option<&mut ChildGuard>,
+    start: &mut M,
+    rejection_deadline: Option<u64>,
+    drain: F,
+) where
+    M: PauseOwnerMap,
+    F: FnOnce(Option<u64>) -> Result<(), &'static str>,
+{
+    retain_cleanup_drain_result(facts, failure, drain(rejection_deadline));
+    if let Some(owner_guard) = owner {
+        // The post-drain START read, not the existence of a failure, decides
+        // whether a pre-armed successor is unresolved.  ARMED/absent proves
+        // no stop debt; REQUESTED or an unreadable state creates one.
+        let disarm = owner_guard.disarm_for_cleanup_result(start);
+        retain_cleanup_owner_result(facts, failure, owner_guard, disarm);
+        facts.cleanup_map_read_failed |= owner_guard.cleanup_map_read_failed;
+        facts.cleanup_map_remove_failed |= owner_guard.cleanup_map_remove_failed;
+        if let Some(guard) = child.as_deref_mut() {
+            let cleanup = complete_cleanup_resumes(owner_guard, guard);
+            if cleanup.resume_rc == Some(-1) || cleanup.protective_resume_rc == Some(-1) {
+                retain_cleanup_failure(facts, failure, "pidfd resume");
+            }
+            merge_cleanup_facts(&mut facts.cleanup, cleanup);
+        }
+        match owner_guard.cleanup_start_entries(start) {
+            Ok(entries) => facts.final_start_entries = entries,
+            Err(reason) => {
+                facts.final_start_entries = u64::MAX;
+                facts.cleanup_map_read_failed = true;
+                retain_cleanup_failure(facts, failure, reason);
+            }
+        }
+    }
+    if let Some(guard) = child.as_deref_mut()
+        && !guard.reaped
+    {
+        let cleanup = guard.terminate();
+        if cleanup.kill_rc == Some(-1) {
+            retain_cleanup_failure(facts, failure, "pidfd kill");
+        }
+        if cleanup.reap_rc == Some(-1) {
+            retain_cleanup_failure(facts, failure, "child reap");
+        }
+        merge_cleanup_facts(&mut facts.cleanup, cleanup);
+        facts.reaped = cleanup.reaped;
+        facts.child_exit = -1;
+    } else if child.as_deref().is_some_and(|guard| guard.reaped) {
+        facts.cleanup.reaped = true;
     }
 }
 
@@ -2490,11 +2592,13 @@ fn record_within_cycle_deadline(record: ReceivedSignalRecord, deadline_ns: u64) 
 
 fn wait_optional_received_signal_record_until(
     ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
-    cancellation: &Cancellation,
+    cancellation: Option<&Cancellation>,
     deadline_ns: u64,
 ) -> Result<Option<ReceivedSignalRecord>, &'static str> {
     loop {
-        cancellation_failure(cancellation)?;
+        if let Some(cancellation) = cancellation {
+            cancellation_failure(cancellation)?;
+        }
         let before_dequeue_ns = monotonic_ns()?;
         if before_dequeue_ns > deadline_ns {
             return Ok(None);
@@ -2521,13 +2625,14 @@ fn wait_optional_received_signal_record_until(
                 revents: 0,
             },
             libc::pollfd {
-                fd: cancellation.read.as_raw_fd(),
+                fd: cancellation.map_or(-1, |cancellation| cancellation.read.as_raw_fd()),
                 events: libc::POLLIN,
                 revents: 0,
             },
         ];
+        let count = if cancellation.is_some() { 2 } else { 1 };
         // SAFETY: pollfds contains initialized entries and remains valid for the call.
-        let result = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, timeout_ms) };
+        let result = unsafe { libc::poll(pollfds.as_mut_ptr(), count, timeout_ms) };
         if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
             return Err("poll");
         }
@@ -2541,7 +2646,7 @@ fn wait_received_signal_record_until(
     let deadline_ns = monotonic_ns()?
         .checked_add(5_000_000_000)
         .ok_or("monotonic clock")?;
-    wait_optional_received_signal_record_until(ring, cancellation, deadline_ns)?
+    wait_optional_received_signal_record_until(ring, Some(cancellation), deadline_ns)?
         .ok_or("signal record timeout")
 }
 
@@ -2551,7 +2656,7 @@ fn wait_received_signal_record_by_deadline(
     deadline_ns: u64,
     timeout_reason: &'static str,
 ) -> Result<ReceivedSignalRecord, &'static str> {
-    let record = wait_optional_received_signal_record_until(ring, cancellation, deadline_ns)?
+    let record = wait_optional_received_signal_record_until(ring, Some(cancellation), deadline_ns)?
         .ok_or(timeout_reason)?;
     if !record_within_cycle_deadline(record, deadline_ns) {
         return Err("record deadline");
@@ -2770,25 +2875,45 @@ fn drain_signal_ring_to_empty_until(
 /// A rejected helper consumes its authorization without stopping the child.
 /// Keep decoding until its fixed window closes, then prove one final empty
 /// read so a same-epoch coalescer cannot be silently left for a new epoch.
-fn drain_signal_ring_through_deadline(
-    ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
-    cancellation: &Cancellation,
+fn drain_rejected_records_through_deadline<S, W, E>(
+    state: &mut S,
     deadline_ns: u64,
-) -> Result<u64, &'static str> {
+    mut wait_until: W,
+    mut final_empty: E,
+) -> Result<u64, &'static str>
+where
+    W: FnMut(&mut S, u64) -> Result<Option<ReceivedSignalRecord>, &'static str>,
+    E: FnMut(&mut S) -> Result<bool, &'static str>,
+{
     let mut drained = 0u64;
-    while let Some(record) =
-        wait_optional_received_signal_record_until(ring, cancellation, deadline_ns)?
-    {
+    while let Some(record) = wait_until(state, deadline_ns)? {
         if !record_within_cycle_deadline(record, deadline_ns) {
             return Err("record deadline");
         }
         drained += 1;
     }
-    if let Some(item) = ring.next() {
-        let _ = decode_signal_record(&item)?;
+    if !final_empty(state)? {
         return Err("record deadline");
     }
     Ok(drained)
+}
+
+fn drain_signal_ring_through_deadline(
+    ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
+    deadline_ns: u64,
+) -> Result<u64, &'static str> {
+    drain_rejected_records_through_deadline(
+        ring,
+        deadline_ns,
+        |ring, deadline_ns| wait_optional_received_signal_record_until(ring, None, deadline_ns),
+        |ring| match ring.next() {
+            Some(item) => {
+                let _ = decode_signal_record(&item)?;
+                Ok(false)
+            }
+            None => Ok(true),
+        },
+    )
 }
 
 type GateACaseFailure = Box<(GateACaseFacts, &'static str)>;
@@ -3447,6 +3572,24 @@ fn accepted_cycle_shape(facts: &SignalTimingFacts, allow_successor: bool) -> Acc
     }
 }
 
+/// Resume an already-ledgered accepted cycle.  A failed original-pidfd resume
+/// is a runtime lifecycle failure, never an oracle-shaped incomplete cycle.
+fn complete_accepted_cycle_resume(
+    guard: &mut ChildGuard,
+    owner: &mut PauseOwnerGuard,
+    facts: &mut SignalTimingFacts,
+) -> Result<(), &'static str> {
+    facts.pidfd_resume_attempts = 1;
+    facts.resume_via_original_pidfd = true;
+    let resume = guard.resume_accepted();
+    let resume_rc = if resume.is_ok() { 0 } else { -1 };
+    facts.pidfd_resume_rc = resume_rc;
+    owner.record_current_resume(resume_rc)?;
+    resume.map_err(|_| "pidfd resume")?;
+    facts.resume_completed_ns = monotonic_ns()?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn complete_accepted_cycle(
     ebpf: &mut aya::Ebpf,
@@ -3562,7 +3705,7 @@ fn complete_accepted_cycle(
     }
 
     if shape == AcceptedCycleShape::Deferred {
-        owner.prearm_successor_before_resume(start, true)?;
+        prearm_successor_for_cleanup(owner, guard, start, true)?;
         facts.successor_installed_while_stopped = true;
         // The successor is now ARMED, but both exact threads must still be T
         // before owner 1 is allowed to resume and expose it.
@@ -3577,16 +3720,7 @@ fn complete_accepted_cycle(
         facts.successor_boundary_all_tasks_stopped = true;
     }
 
-    facts.pidfd_resume_attempts = 1;
-    facts.resume_via_original_pidfd = true;
-    let resume = guard.resume_accepted(shape == AcceptedCycleShape::Deferred);
-    let resume_rc = if resume.is_ok() { 0 } else { -1 };
-    facts.pidfd_resume_rc = resume_rc;
-    owner.record_current_resume(resume_rc)?;
-    if resume.is_err() {
-        return Ok(None);
-    }
-    facts.resume_completed_ns = monotonic_ns()?;
+    complete_accepted_cycle_resume(guard, owner, facts)?;
     facts.owner_removed = if shape == AcceptedCycleShape::Deferred {
         true // owner 1's REQUESTED value was replaced by its successor ARMED value
     } else {
@@ -3749,9 +3883,11 @@ fn run_gate_b_case(
                         let successor_request = signal_request(&successor.record);
                         if successor_request != SignalRequest::Accepted {
                             if successor_request == SignalRequest::Rejected {
-                                owner_guard.record_winner_deadline(successor_deadline);
-                                owner_guard.reject_successor_request()?;
-                                rejection_deadline = Some(successor_deadline);
+                                reject_successor_with_deadline(
+                                    owner_guard,
+                                    successor_deadline,
+                                    &mut rejection_deadline,
+                                )?;
                             }
                             return Err("successor signal record");
                         }
@@ -3840,8 +3976,8 @@ fn run_gate_b_case(
                     SignalRequest::Rejected => {
                         let deadline_ns = cycle_deadline_ns(winner.record.hook_ts_ns)?;
                         owner_guard.record_winner_deadline(deadline_ns);
-                        owner_guard.mark_rejected_request()?;
                         rejection_deadline = Some(deadline_ns);
+                        owner_guard.mark_rejected_request()?;
                         return Ok(());
                     }
                     SignalRequest::Coalesced => return Err("signal record identity"),
@@ -3850,8 +3986,8 @@ fn run_gate_b_case(
             SignalRequest::Rejected => {
                 let deadline_ns = cycle_deadline_ns(first_record.record.hook_ts_ns)?;
                 owner_guard.record_winner_deadline(deadline_ns);
-                owner_guard.mark_rejected_request()?;
                 rejection_deadline = Some(deadline_ns);
+                owner_guard.mark_rejected_request()?;
                 return Ok(());
             }
         }
@@ -3907,68 +4043,34 @@ fn run_gate_b_case(
                 }
             };
     }
-    // Teardown stays ordered and non-short-circuiting: detached links cannot
-    // create a new record; drain/decode before removing authorization; only an
-    // unresolved pre-armed successor can earn the separate protective resume.
-    let drain_result = match rejection_deadline {
-        Some(deadline) => {
-            drain_signal_ring_through_deadline(ring, cancellation, deadline).map(|_| ())
+    // Detached links cannot create a new record.  The shared coordinator then
+    // drains/decode before authorization removal, ledger-authorized resumes,
+    // and terminal kill/reap without short-circuiting any failure.
+    let ordinary_drain_deadline = rejection_deadline.is_none().then(|| {
+        if failure.is_some() {
+            owner
+                .as_ref()
+                .and_then(PauseOwnerGuard::cleanup_deadline_ns)
+                .map(Ok)
+                .unwrap_or_else(|| monotonic_ns().and_then(cycle_deadline_ns))
+        } else {
+            monotonic_ns().and_then(cycle_deadline_ns)
         }
-        None => {
-            let deadline = if failure.is_some() {
-                owner
-                    .as_ref()
-                    .and_then(PauseOwnerGuard::cleanup_deadline_ns)
-                    .map(Ok)
-                    .unwrap_or_else(|| monotonic_ns().and_then(cycle_deadline_ns))
-            } else {
-                monotonic_ns().and_then(cycle_deadline_ns)
-            };
-            deadline
-                .and_then(|deadline| drain_signal_ring_to_empty_until(ring, deadline).map(|_| ()))
-        }
-    };
-    retain_cleanup_drain_result(&mut facts, &mut failure, drain_result);
-    if let Some(owner_guard) = owner.as_mut() {
-        // The post-drain START read, not the existence of a failure, decides
-        // whether a pre-armed successor is unresolved.  ARMED/absent proves
-        // no stop debt; REQUESTED or an unreadable state creates one.
-        let disarm = owner_guard.disarm_for_cleanup_result(start);
-        retain_cleanup_owner_result(&mut facts, &mut failure, owner_guard, disarm);
-        facts.cleanup_map_read_failed |= owner_guard.cleanup_map_read_failed;
-        facts.cleanup_map_remove_failed |= owner_guard.cleanup_map_remove_failed;
-        if let Some(guard) = child.as_mut() {
-            let cleanup = complete_cleanup_resumes(owner_guard, guard);
-            if cleanup.resume_rc == Some(-1) || cleanup.protective_resume_rc == Some(-1) {
-                retain_cleanup_failure(&mut facts, &mut failure, "pidfd resume");
-            }
-            merge_cleanup_facts(&mut facts.cleanup, cleanup);
-        }
-        match owner_guard.cleanup_start_entries(start) {
-            Ok(entries) => facts.final_start_entries = entries,
-            Err(reason) => {
-                facts.final_start_entries = u64::MAX;
-                facts.cleanup_map_read_failed = true;
-                retain_cleanup_failure(&mut facts, &mut failure, reason);
-            }
-        }
-    }
-    if let Some(guard) = child.as_mut()
-        && !guard.reaped
-    {
-        let cleanup = guard.terminate();
-        if cleanup.kill_rc == Some(-1) {
-            retain_cleanup_failure(&mut facts, &mut failure, "pidfd kill");
-        }
-        if cleanup.reap_rc == Some(-1) {
-            retain_cleanup_failure(&mut facts, &mut failure, "child reap");
-        }
-        merge_cleanup_facts(&mut facts.cleanup, cleanup);
-        facts.reaped = cleanup.reaped;
-        facts.child_exit = -1;
-    } else if child.as_ref().is_some_and(|guard| guard.reaped) {
-        facts.cleanup.reaped = true;
-    }
+    });
+    finish_gate_b_cleanup(
+        &mut facts,
+        &mut failure,
+        owner.as_mut(),
+        child.as_mut(),
+        start,
+        rejection_deadline,
+        |rejected_deadline| match rejected_deadline {
+            Some(deadline) => drain_signal_ring_through_deadline(ring, deadline).map(|_| ()),
+            None => ordinary_drain_deadline
+                .expect("ordinary drain deadline")
+                .and_then(|deadline| drain_signal_ring_to_empty_until(ring, deadline).map(|_| ())),
+        },
+    );
     for cycle in &mut facts.cycles {
         cycle.signal_link_detached = facts.signal_link_detached;
         cycle.late_link_detached = facts.late_link_detached;
@@ -5005,17 +5107,15 @@ mod tests {
         let mut map = armed_fake(key);
         let mut owner = PauseOwnerGuard::new(key);
         owner.mark_accepted_request().unwrap();
-        owner
-            .prearm_successor_before_resume(&mut map, true)
-            .unwrap();
 
         let mut command = Command::new("sh");
         command.arg("-c").arg("IFS= read -r _; sleep 30");
         let mut guard = spawn_pinned_child(&mut command).unwrap();
+        prearm_successor_for_cleanup(&mut owner, &mut guard, &mut map, true).unwrap();
         guard.mark_accepted_stop();
         pidfd_send_signal(guard.original_pidfd.as_raw_fd(), libc::SIGSTOP).unwrap();
         wait_for_child_stop(&guard);
-        guard.resume_accepted(true).unwrap();
+        guard.resume_accepted().unwrap();
         owner.record_current_resume(0).unwrap();
 
         // The detached/drained START read still says ARMED: no hook consumed
@@ -5084,7 +5184,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_pidfd_kill_uses_a_bounded_nonblocking_reap_attempt() {
+    fn terminal_cleanup_is_idempotent_after_pidfd_failure() {
         let mut command = Command::new("sh");
         command.arg("-c").arg("IFS= read -r _; sleep 30");
         let mut guard = spawn_pinned_child(&mut command).unwrap();
@@ -5098,6 +5198,71 @@ mod tests {
         assert_eq!(cleanup.reap_rc, Some(-1));
         assert!(!cleanup.reaped);
         guard.original_pidfd = real_pidfd;
+        assert_eq!(guard.terminate(), cleanup);
+
+        // The guard owns the original identity again only so the test can
+        // collect its deliberately still-live child.  Its own cleanup latch
+        // must not re-enter the failed terminal sequence.
+        pidfd_send_signal(guard.original_pidfd.as_raw_fd(), libc::SIGKILL).unwrap();
+        guard.wait().unwrap();
+    }
+
+    #[test]
+    fn prearmed_successor_failure_performs_the_real_protective_resume() {
+        let key = common::StateKey {
+            pid_tgid: 42 << 32,
+            attach_cookie: u64::MAX,
+        };
+        let mut map = armed_fake(key);
+        let mut owner = PauseOwnerGuard::new(key);
+        owner.mark_accepted_request().unwrap();
+
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("IFS= read -r _; sleep 30");
+        let mut guard = spawn_pinned_child(&mut command).unwrap();
+        guard.mark_accepted_stop();
+        pidfd_send_signal(guard.original_pidfd.as_raw_fd(), libc::SIGSTOP).unwrap();
+        wait_for_child_stop(&guard);
+        prearm_successor_for_cleanup(&mut owner, &mut guard, &mut map, true).unwrap();
+        // This is the START state left by a successor that consumed the
+        // pre-arm immediately before a later owner-1 boundary failure.
+        map.entries[0].1.arg0 = common::PAUSE_REQUESTED;
+
+        let mut facts = GateBTimingFacts::default();
+        let mut failure = Some("successor boundary");
+        finish_gate_b_cleanup(
+            &mut facts,
+            &mut failure,
+            Some(&mut owner),
+            Some(&mut guard),
+            &mut map,
+            None,
+            |_| Ok(()),
+        );
+        assert_eq!(failure, Some("successor boundary"));
+        assert_eq!(facts.cleanup.resume_attempts, 1);
+        assert_eq!(facts.cleanup.resume_rc, Some(0));
+        assert_eq!(facts.cleanup.protective_resume_attempts, 1);
+        assert!(facts.cleanup.protective_resume_via_original_pidfd);
+        assert_eq!(facts.cleanup.protective_resume_rc, Some(0));
+        assert!(facts.cleanup.reaped);
+    }
+
+    #[test]
+    fn wait_after_kill_requires_pollin_without_blocking_child_wait() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 0.25");
+        let mut guard = spawn_pinned_child(&mut command).unwrap();
+        let (not_a_pidfd, writer) = pipe_pair(libc::O_CLOEXEC).unwrap();
+        drop(writer); // a pipe read end is immediately POLLHUP, never a pidfd POLLIN.
+        let real_pidfd = std::mem::replace(&mut guard.original_pidfd, not_a_pidfd);
+
+        let started = Instant::now();
+        let result = guard.wait_after_kill();
+        let elapsed = started.elapsed();
+        guard.original_pidfd = real_pidfd;
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_millis(100), "{elapsed:?}");
         assert!(guard.terminate().reaped);
     }
 
@@ -5110,7 +5275,8 @@ mod tests {
         guard.mark_accepted_stop();
         pidfd_send_signal(guard.original_pidfd.as_raw_fd(), libc::SIGSTOP).unwrap();
         wait_for_child_stop(&guard);
-        guard.resume_accepted(true).unwrap();
+        guard.mark_successor_stop_possible();
+        guard.resume_accepted().unwrap();
 
         // The successor has won and stopped the same original child.  Its
         // timeout/cancellation cleanup cannot inherit owner 1's resume bit.
@@ -5132,17 +5298,15 @@ mod tests {
         let mut map = armed_fake(key);
         let mut owner = PauseOwnerGuard::new(key);
         owner.mark_accepted_request().unwrap();
-        owner
-            .prearm_successor_before_resume(&mut map, true)
-            .unwrap();
         let mut command = Command::new("sh");
         command.arg("-c").arg("IFS= read -r _; sleep 30");
         let mut guard = spawn_pinned_child(&mut command).unwrap();
+        prearm_successor_for_cleanup(&mut owner, &mut guard, &mut map, true).unwrap();
 
         guard.mark_accepted_stop();
         pidfd_send_signal(guard.original_pidfd.as_raw_fd(), libc::SIGSTOP).unwrap();
         wait_for_child_stop(&guard);
-        guard.resume_accepted(true).unwrap();
+        guard.resume_accepted().unwrap();
         owner.record_current_resume(0).unwrap();
         owner.accept_successor_request().unwrap();
         pidfd_send_signal(guard.original_pidfd.as_raw_fd(), libc::SIGSTOP).unwrap();
@@ -5181,7 +5345,74 @@ mod tests {
     }
 
     #[test]
-    fn rejected_successor_retains_its_winner_relative_cleanup_deadline() {
+    fn rejected_successor_drain_survives_cancellation_and_reject_error() {
+        let _serial = VM_TEST_LOCK.lock().unwrap();
+        let key = common::StateKey {
+            pid_tgid: 42 << 32,
+            attach_cookie: u64::MAX,
+        };
+        let mut map = armed_fake(key);
+        let mut owner = PauseOwnerGuard::new(key);
+        let deadline = cycle_deadline_ns(7_000).unwrap();
+        let mut rejection_deadline = None;
+        let reject = reject_successor_with_deadline(&mut owner, deadline, &mut rejection_deadline)
+            .unwrap_err();
+        assert_eq!(reject, "successor resolution");
+        assert_eq!(
+            rejection_deadline,
+            Some(deadline),
+            "the winner-relative drain survives a fallible successor rejection"
+        );
+
+        let cancellation = Cancellation::install().unwrap();
+        write_byte(cancellation.write.as_raw_fd(), libc::SIGINT as u8).unwrap();
+        let received = ReceivedSignalRecord {
+            record: common::SignalRecord {
+                hook_ts_ns: deadline,
+                ..common::SignalRecord::default()
+            },
+            before_dequeue_ns: deadline,
+            after_decode_ns: deadline,
+        };
+        let mut drain_state = ([Some(received), None].into_iter(), 0u8);
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("IFS= read -r _; sleep 30");
+        let mut guard = spawn_pinned_child(&mut command).unwrap();
+        let mut facts = GateBTimingFacts::default();
+        let mut failure = Some(reject);
+        finish_gate_b_cleanup(
+            &mut facts,
+            &mut failure,
+            Some(&mut owner),
+            Some(&mut guard),
+            &mut map,
+            rejection_deadline,
+            |seen_deadline| {
+                assert_eq!(seen_deadline, Some(deadline));
+                drain_rejected_records_through_deadline(
+                    &mut drain_state,
+                    deadline,
+                    |state, wait_deadline| {
+                        assert_eq!(wait_deadline, deadline);
+                        Ok(state.0.next().unwrap())
+                    },
+                    |state| {
+                        state.1 += 1;
+                        Ok(true)
+                    },
+                )
+                .map(|_| ())
+            },
+        );
+        assert_eq!(drain_state.1, 1);
+        assert_eq!(map.entry_count().unwrap(), 0);
+        assert!(facts.reaped);
+        assert_eq!(failure, Some("successor resolution"));
+        assert_eq!(cancellation.check().unwrap(), Some(Cancelled::Sigint));
+    }
+
+    #[test]
+    fn accepted_resume_failure_is_runtime_and_terminal_cleanup_is_single_pass() {
         let key = common::StateKey {
             pid_tgid: 42 << 32,
             attach_cookie: u64::MAX,
@@ -5189,16 +5420,85 @@ mod tests {
         let mut map = armed_fake(key);
         let mut owner = PauseOwnerGuard::new(key);
         owner.mark_accepted_request().unwrap();
-        owner
-            .prearm_successor_before_resume(&mut map, true)
-            .unwrap();
-        owner.record_current_resume(0).unwrap();
-        owner.reject_successor_request().unwrap();
-        owner.record_winner_deadline(cycle_deadline_ns(7_000).unwrap());
-        assert_eq!(
-            owner.cleanup_deadline_ns(),
-            Some(cycle_deadline_ns(7_000).unwrap())
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("IFS= read -r _; sleep 30");
+        let mut guard = spawn_pinned_child(&mut command).unwrap();
+        guard.mark_accepted_stop();
+        pidfd_send_signal(guard.original_pidfd.as_raw_fd(), libc::SIGSTOP).unwrap();
+        wait_for_child_stop(&guard);
+
+        let (not_a_pidfd, _writer) = pipe_pair(libc::O_CLOEXEC).unwrap();
+        let real_pidfd = std::mem::replace(&mut guard.original_pidfd, not_a_pidfd);
+        let mut cycle = SignalTimingFacts::default();
+        let resume = complete_accepted_cycle_resume(&mut guard, &mut owner, &mut cycle);
+        assert_eq!(resume, Err("pidfd resume"));
+        assert_eq!(cycle.pidfd_resume_attempts, 1);
+        assert_eq!(cycle.pidfd_resume_rc, -1);
+        guard.original_pidfd = real_pidfd;
+
+        let mut facts = GateBTimingFacts::default();
+        let mut failure = resume.err();
+        finish_gate_b_cleanup(
+            &mut facts,
+            &mut failure,
+            Some(&mut owner),
+            Some(&mut guard),
+            &mut map,
+            None,
+            |_| Ok(()),
         );
+        let record = signal_timing_json(&test_gate_metadata(), 1, &facts, false, failure);
+        assert_eq!(record["failure_category"], "runtime");
+        assert_eq!(record["runtime_failure_reason"], "pidfd resume");
+        let first = guard.terminate();
+        assert_eq!(guard.terminate(), first);
+        assert!(first.reaped);
+    }
+
+    #[test]
+    fn cleanup_coordinator_continues_after_drain_map_resume_kill_and_reap_failures() {
+        let key = common::StateKey {
+            pid_tgid: 42 << 32,
+            attach_cookie: u64::MAX,
+        };
+        let mut map = armed_fake(key);
+        map.fail_owner_state = true;
+        map.fail_remove = true;
+        let mut owner = PauseOwnerGuard::new(key);
+        owner.mark_accepted_request().unwrap();
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("IFS= read -r _; sleep 30");
+        let mut guard = spawn_pinned_child(&mut command).unwrap();
+        guard.mark_accepted_stop();
+        pidfd_send_signal(guard.original_pidfd.as_raw_fd(), libc::SIGSTOP).unwrap();
+        wait_for_child_stop(&guard);
+
+        let (not_a_pidfd, _writer) = pipe_pair(libc::O_CLOEXEC).unwrap();
+        let real_pidfd = std::mem::replace(&mut guard.original_pidfd, not_a_pidfd);
+        let mut facts = GateBTimingFacts::default();
+        let mut failure = None;
+        finish_gate_b_cleanup(
+            &mut facts,
+            &mut failure,
+            Some(&mut owner),
+            Some(&mut guard),
+            &mut map,
+            Some(cycle_deadline_ns(1_000).unwrap()),
+            |_| Err("record deadline"),
+        );
+        assert_eq!(failure, Some("record deadline"));
+        assert!(facts.cleanup_drain_failed);
+        assert!(facts.cleanup_map_read_failed);
+        assert!(facts.cleanup_map_remove_failed);
+        assert_eq!(facts.cleanup_failures, 6);
+        assert_eq!(facts.cleanup.resume_attempts, 1);
+        assert_eq!(facts.cleanup.resume_rc, Some(-1));
+        assert_eq!(facts.cleanup.kill_rc, Some(-1));
+        assert_eq!(facts.cleanup.reap_rc, Some(-1));
+
+        guard.original_pidfd = real_pidfd;
+        pidfd_send_signal(guard.original_pidfd.as_raw_fd(), libc::SIGKILL).unwrap();
+        guard.wait().unwrap();
     }
 
     #[test]
@@ -5489,7 +5789,8 @@ mod tests {
         pidfd_send_signal(guard.original_pidfd.as_raw_fd(), libc::SIGSTOP).unwrap();
         wait_for_child_stop(&guard);
 
-        guard.resume_accepted(true).unwrap();
+        guard.mark_successor_stop_possible();
+        guard.resume_accepted().unwrap();
         assert!(
             guard.may_be_stopped,
             "pre-armed successor keeps the guard armed"
@@ -7485,7 +7786,8 @@ mod tests {
             case_source
                 .contains("detach_all_program_links(ebpf, \"signal_return\", &mut signal_links)")
         );
-        assert!(case_source.contains("disarm_for_cleanup_result(start)"));
+        assert!(host.contains("fn finish_gate_b_cleanup<"));
+        assert!(case_source.contains("finish_gate_b_cleanup("));
         let self_check = host[gate_start..].find("fn self_check(").unwrap() + gate_start;
         let gate_source = &host[gate_start..self_check];
         assert!(gate_source.contains("if runtime_failure_reason.is_some() || !pass"));
@@ -7507,7 +7809,7 @@ mod tests {
         if signal.contains("STOP_SIGNAL_DELAY_POLLS") || signal.contains("while ") {
             violations.push("busy_wait_after_cas");
         }
-        if !runner.contains("prearm_successor_before_resume")
+        if !runner.contains("prearm_successor_for_cleanup")
             || !runner.contains("wait_successor_record")
         {
             violations.push("owner_2_lifecycle_missing");
@@ -7535,21 +7837,33 @@ mod tests {
             violations.push("accepted_stop_mark_order_missing");
         }
         let case_start = runner.find("fn run_gate_b_case(").unwrap();
-        let cleanup =
-            &runner[case_start..runner[case_start..].find("fn run_gate_b(").unwrap() + case_start];
-        let cleanup_positions = [
-            cleanup.find("detach_all_program_links(ebpf, \"late_hit\", &mut late_links)"),
-            cleanup.find("detach_all_program_links(ebpf, \"signal_return\", &mut signal_links)"),
-            cleanup.rfind("drain_signal_ring_to_empty_until"),
-            cleanup.rfind("disarm_for_cleanup_result(start)"),
-            cleanup.find("complete_cleanup_resumes(owner_guard, guard)"),
-            cleanup.find("guard.terminate()"),
+        let case_end = runner[case_start..].find("fn run_gate_b(").unwrap() + case_start;
+        let case = &runner[case_start..case_end];
+        let coordinator_start = runner.find("fn finish_gate_b_cleanup<").unwrap();
+        let coordinator_end =
+            runner[coordinator_start..].find("fn pipe_pair(").unwrap() + coordinator_start;
+        let coordinator = &runner[coordinator_start..coordinator_end];
+        let case_positions = [
+            case.find("detach_all_program_links(ebpf, \"late_hit\", &mut late_links)"),
+            case.find("detach_all_program_links(ebpf, \"signal_return\", &mut signal_links)"),
+            case.rfind("finish_gate_b_cleanup("),
         ]
         .into_iter()
         .collect::<Option<Vec<_>>>();
-        if cleanup_positions
+        let coordinator_positions = [
+            coordinator.find("retain_cleanup_drain_result"),
+            coordinator.find("disarm_for_cleanup_result(start)"),
+            coordinator.find("complete_cleanup_resumes(owner_guard, guard)"),
+            coordinator.find("guard.terminate()"),
+        ]
+        .into_iter()
+        .collect::<Option<Vec<_>>>();
+        if case_positions
             .as_ref()
             .is_none_or(|positions| positions.windows(2).any(|pair| pair[0] >= pair[1]))
+            || coordinator_positions
+                .as_ref()
+                .is_none_or(|positions| positions.windows(2).any(|pair| pair[0] >= pair[1]))
         {
             violations.push("cleanup_order_missing");
         }
@@ -7624,6 +7938,23 @@ mod tests {
             !run_guard(&candidate).status.success(),
             "an arbitrary post-CAS forward sequence must be rejected"
         );
+    }
+
+    #[test]
+    fn pause_object_guard_self_test_rejects_semantic_mutations() {
+        let output = Command::new("python3")
+            .args([
+                concat!(env!("CARGO_MANIFEST_DIR"), "/check-init-shape.py"),
+                "--pause-fingerprint-self-test",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("mutations rejected"));
     }
 
     #[test]

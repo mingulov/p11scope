@@ -167,7 +167,8 @@ impl LoaderRegistry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SymbolLocation {
     pub vaddr: u64,
-    pub file_offset: u64,
+    /// `None` when the symbol lives in a non-file-backed region (`.bss`).
+    pub file_offset: Option<u64>,
 }
 
 fn parse_elf(bytes: &[u8]) -> Result<object::File<'_>, &'static str> {
@@ -179,8 +180,10 @@ fn parse_elf(bytes: &[u8]) -> Result<object::File<'_>, &'static str> {
     Ok(object)
 }
 
-/// Virtual address + file offset of one symbol (dynsym first, then symtab).
-/// Only addresses backed by actual file bytes qualify.
+/// Virtual address + optional file offset of one symbol (dynsym first, then
+/// symtab). `file_offset` is `None` for symbols outside any file-backed
+/// segment — e.g. glibc keeps `_r_debug` in `.bss`, which still yields a
+/// usable vaddr for the §7.3 delta.
 pub fn elf_symbol(bytes: &[u8], name: &str) -> Result<Option<SymbolLocation>, &'static str> {
     use object::{Object as _, ObjectSegment as _, ObjectSymbol as _};
     let object = parse_elf(bytes)?;
@@ -201,12 +204,10 @@ pub fn elf_symbol(bytes: &[u8], name: &str) -> Result<Option<SymbolLocation>, &'
         if symbol.name() != Ok(name) || symbol.address() == 0 {
             continue;
         }
-        if let Some(offset) = file_offset(symbol.address()) {
-            return Ok(Some(SymbolLocation {
-                vaddr: symbol.address(),
-                file_offset: offset,
-            }));
-        }
+        return Ok(Some(SymbolLocation {
+            vaddr: symbol.address(),
+            file_offset: file_offset(symbol.address()),
+        }));
     }
     Ok(None)
 }
@@ -444,6 +445,17 @@ fn kill_and_reap(pid: i32) {
 // mappings in the still-running child's /proc/<pid>/maps.
 // ---------------------------------------------------------------------------
 
+/// True once the child's `/proc/<pid>/exe` points at the fixture: before
+/// `execve` the forked child still shows the runner's image (including its
+/// own inherited loader mapping), which would yield the wrong load bias.
+fn child_execed(pid: i32, fixture: &Path) -> bool {
+    let exe = format!("/proc/{pid}/exe");
+    match std::fs::read_link(&exe) {
+        Ok(target) => target == fixture,
+        Err(_) => false,
+    }
+}
+
 fn loader_load_bias(
     pid: i32,
     dev_major: u64,
@@ -530,8 +542,8 @@ fn detach_program(
 
 fn read_counters(
     counters: &aya::maps::Array<aya::maps::MapData, u64>,
-) -> Result<[u64; 4], &'static str> {
-    let mut values = [0u64; 4];
+) -> Result<[u64; 6], &'static str> {
+    let mut values = [0u64; 6];
     for (index, value) in values.iter_mut().enumerate() {
         *value = counters
             .get(&(index as u32), 0)
@@ -753,7 +765,7 @@ fn validate_loader_provenance(
         },
         bpf_bytes,
         fixture_bytes,
-        hook.file_offset,
+        hook.file_offset.ok_or("fixture symbol file offset")?,
     ))
 }
 
@@ -936,7 +948,7 @@ fn run_loader_hit(paths: LoaderPaths) -> Result<bool, &'static str> {
     Ok(pass)
 }
 
-fn counters_fact(values: [u64; 4]) -> serde_json::Value {
+fn counters_fact(values: &[u64]) -> serde_json::Value {
     serde_json::Value::Array(
         values
             .iter()
@@ -945,13 +957,12 @@ fn counters_fact(values: [u64; 4]) -> serde_json::Value {
     )
 }
 
-fn diff_counters(before: [u64; 4], after: [u64; 4]) -> [u64; 4] {
-    [
-        after[0].saturating_sub(before[0]),
-        after[1].saturating_sub(before[1]),
-        after[2].saturating_sub(before[2]),
-        after[3].saturating_sub(before[3]),
-    ]
+fn diff_counters(before: &[u64; 6], after: &[u64; 6]) -> [u64; 6] {
+    let mut delta = [0u64; 6];
+    for (index, slot) in delta.iter_mut().enumerate() {
+        *slot = after[index].saturating_sub(before[index]);
+    }
+    delta
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -959,7 +970,7 @@ fn run_startup_flow(
     ebpf: &mut aya::Ebpf,
     ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
     counters: &aya::maps::Array<aya::maps::MapData, u64>,
-    counters_before: [u64; 4],
+    counters_before: [u64; 6],
     start: &mut aya::maps::HashMap<aya::maps::MapData, common::StateKey, common::StartState>,
     registry: &mut LoaderRegistry,
     fixture: &Path,
@@ -978,6 +989,9 @@ fn run_startup_flow(
         let hook = elf_symbol(&loader_bytes, "_dl_debug_state")
             .map_err(|_| "loader ELF")?
             .ok_or("loader symbol")?;
+        // The attach offset must be file-backed; `_r_debug` may legitimately
+        // sit in `.bss` (glibc), so only its vaddr is required for the delta.
+        let hook_file_offset = hook.file_offset.ok_or("loader symbol file offset")?;
         let r_debug = elf_symbol(&loader_bytes, "_r_debug").map_err(|_| "loader ELF")?;
         let delta = match r_debug {
             Some(r_debug) => {
@@ -1001,7 +1015,7 @@ fn run_startup_flow(
                 loader_device: loader_meta.dev(),
                 loader_inode: loader_meta.ino(),
                 hook_vaddr: hook.vaddr,
-                hook_file_offset: hook.file_offset,
+                hook_file_offset,
                 r_debug_vaddr: r_debug.map(|symbol| symbol.vaddr),
                 delta,
             })
@@ -1009,7 +1023,7 @@ fn run_startup_flow(
         let cookie = common::cookie_encode(context_id, delta);
         let link = match attach_program(
             ebpf,
-            hook.file_offset,
+            hook_file_offset,
             &interp,
             child.pid as u32,
             Some(cookie),
@@ -1040,7 +1054,7 @@ fn run_startup_flow(
         let mut bias: Option<u64> = None;
         loop {
             records.extend(drain_loader_records(ring).map_err(|_| "ring drain")?);
-            if bias.is_none() {
+            if bias.is_none() && child_execed(child.pid, fixture) {
                 if let Ok(found) = loader_load_bias(
                     child.pid,
                     loader_dev_major,
@@ -1117,8 +1131,15 @@ fn run_startup_flow(
             .filter(|record| record.status_flags & STATUS_CONTEXT_INVALID != 0)
             .count();
         let start_empty = start.keys().next().is_none();
-        let counters_delta = diff_counters(counters_before, counters_after);
-        let [ring_loss, state_failures, loader_hits, state_read_failures] = counters_delta;
+        let counters_delta = diff_counters(&counters_before, &counters_after);
+        let [
+            ring_loss,
+            state_failures,
+            loader_hits,
+            state_read_failures,
+            cookie_zero_hits,
+            func_ip_zero_hits,
+        ] = counters_delta;
         let decodable = registry.decodable(context_id);
 
         // §9/§7.3: only counts, enums, booleans, digests — never raw addresses,
@@ -1143,8 +1164,10 @@ fn run_startup_flow(
         facts.insert("state_failures".into(), state_failures.into());
         facts.insert("loader_hits_counter".into(), loader_hits.into());
         facts.insert("state_read_failures".into(), state_read_failures.into());
-        facts.insert("counters_before".into(), counters_fact(counters_before));
-        facts.insert("counters_after".into(), counters_fact(counters_after));
+        facts.insert("cookie_zero_hits".into(), cookie_zero_hits.into());
+        facts.insert("func_ip_zero_hits".into(), func_ip_zero_hits.into());
+        facts.insert("counters_before".into(), counters_fact(&counters_before));
+        facts.insert("counters_after".into(), counters_fact(&counters_after));
         facts.insert("start_empty".into(), start_empty.into());
         facts.insert("registry_decodable_after_drain".into(), decodable.into());
         facts.insert("loader_sha256".into(), sha256_hex(&loader_bytes).into());
@@ -1155,6 +1178,8 @@ fn run_startup_flow(
             && derived_debug_ok
             && invalid_records == 0
             && state_read_failures == 0
+            && cookie_zero_hits == 0
+            && func_ip_zero_hits == 0
             && ring_loss == 0
             && state_failures == 0
             && start_empty
@@ -1221,8 +1246,14 @@ fn run_no_cookie_flow(
         let no_ip_op = invalid.iter().all(|record| record.table_ptr == 0);
         let no_state_op = invalid.iter().all(|record| record.announced_count == 0);
         let no_case_id = invalid.iter().all(|record| record.case_id == 0);
-        let [ring_loss, state_failures, loader_hits, state_read_failures] =
-            diff_counters(before, after);
+        let [
+            ring_loss,
+            state_failures,
+            loader_hits,
+            state_read_failures,
+            cookie_zero_hits,
+            func_ip_zero_hits,
+        ] = diff_counters(&before, &after);
 
         let mut facts = serde_json::Map::new();
         facts.insert("hits".into(), (hits.len() as u64).into());
@@ -1235,11 +1266,14 @@ fn run_no_cookie_flow(
         facts.insert("state_failures".into(), state_failures.into());
         facts.insert("loader_hits_counter".into(), loader_hits.into());
         facts.insert("state_read_failures".into(), state_read_failures.into());
+        facts.insert("cookie_zero_hits".into(), cookie_zero_hits.into());
+        facts.insert("func_ip_zero_hits".into(), func_ip_zero_hits.into());
         let pass = exactly_one_invalid
             && no_ip_op
             && no_state_op
             && no_case_id
             && loader_hits == 1
+            && cookie_zero_hits == 1
             && state_read_failures == 0
             && ring_loss == 0
             && state_failures == 0;
@@ -1461,13 +1495,17 @@ mod tests {
         let hook = elf_symbol(&loader_bytes, "_dl_debug_state")
             .unwrap()
             .expect("host loader symbol");
-        assert!(hook.vaddr != 0 && hook.file_offset != 0);
-        if let Some(r_debug) = elf_symbol(&loader_bytes, "_r_debug").unwrap() {
-            let delta = (r_debug.vaddr as i64)
-                .checked_sub(hook.vaddr as i64)
-                .unwrap();
-            assert!(delta.abs() <= (1i64 << 54));
-        }
+        assert!(hook.vaddr != 0 && hook.file_offset.is_some());
+        // glibc keeps `_r_debug` outside the file-backed image (`.bss`), so
+        // only its vaddr is guaranteed — and that is all the §7.3 delta needs.
+        let r_debug = elf_symbol(&loader_bytes, "_r_debug")
+            .unwrap()
+            .expect("host loader _r_debug symbol");
+        assert_ne!(r_debug.vaddr, 0);
+        let delta = (r_debug.vaddr as i64)
+            .checked_sub(hook.vaddr as i64)
+            .unwrap();
+        assert!(delta.abs() <= (1i64 << 54));
     }
 
     #[test]
@@ -1482,7 +1520,7 @@ mod tests {
         let validation_index = source
             .find("let invalid = zero_cookie || invalid_absent;")
             .expect("cookie validation");
-        let ip_index = source.find("bpf_get_func_ip").expect("IP read");
+        let ip_index = source.find("helpers::bpf_get_func_ip").expect("IP read");
         let pause_index = source.find("pause_owner_key())").expect("pause path");
         assert!(validation_index < ip_index);
         assert!(pause_index > ip_index);

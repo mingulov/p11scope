@@ -171,9 +171,9 @@ if (
 flows = [item.get("flow") for item in facts]
 if len(facts) > 2 or flows != ["loader_startup", "no_cookie_negative"][:len(flows)]:
     raise SystemExit(64)
-u64 = ["hits", "invalid_records", "ring_loss", "state_failures", "loader_hits_counter", "state_read_failures"]
+u64 = ["hits", "invalid_records", "ring_loss", "state_failures", "loader_hits_counter", "state_read_failures", "cookie_zero_hits", "func_ip_zero_hits"]
 def bools_startup():
-    return ["pid_matches", "formula_holds", "derived_debug_address_ok", "start_empty", "registry_decodable_after_drain"]
+    return ["pid_matches", "formula_holds", "derived_debug_address_ok", "start_empty", "registry_decodable_after_drain", "state_present_delta"]
 def bools_negative():
     return ["exactly_one_invalid", "no_ip_operation", "no_state_operation", "no_context_id_copied"]
 def well_formed(item):
@@ -199,7 +199,7 @@ def well_formed(item):
     after = item.get("counters_after")
     if item.get("flow") == "loader_startup":
         for counts in [before, after]:
-            if not isinstance(counts, list) or len(counts) != 4 or any(type(n) is not int or isinstance(n, bool) or n < 0 for n in counts):
+            if not isinstance(counts, list) or len(counts) != 6 or any(type(n) is not int or isinstance(n, bool) or n < 0 for n in counts):
                 return False
     return True
 def oracle(item):
@@ -209,6 +209,7 @@ def oracle(item):
             and item["pid_matches"] is True and item["formula_holds"] is True
             and item["derived_debug_address_ok"] is True
             and item["invalid_records"] == 0 and item["state_read_failures"] == 0
+            and item["cookie_zero_hits"] == 0 and item["func_ip_zero_hits"] == 0
             and item["ring_loss"] == 0 and item["state_failures"] == 0
             and item["start_empty"] is True
             and item["registry_decodable_after_drain"] is True
@@ -219,6 +220,7 @@ def oracle(item):
         and item["no_ip_operation"] is True and item["no_state_operation"] is True
         and item["no_context_id_copied"] is True
         and item["loader_hits_counter"] == 1 and item["state_read_failures"] == 0
+        and item["cookie_zero_hits"] == 1 and item["func_ip_zero_hits"] == 0
         and item["ring_loss"] == 0 and item["state_failures"] == 0
     )
 if any(not well_formed(item) for item in facts):

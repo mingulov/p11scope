@@ -19,6 +19,11 @@ const RING_LOSS: u32 = 0;
 const STATE_FAILURES: u32 = 1;
 const LOADER_HITS: u32 = 2;
 const STATE_READ_FAILURES: u32 = 3;
+/// Diagnostic: hits whose attach cookie was the zero cookie (§7.3 negative).
+const COOKIE_ZERO_HITS: u32 = 4;
+/// Diagnostic: hits where bpf_get_func_ip returned zero (kernel without
+/// uprobe func-IP support, e.g. 5.15 perf uprobes).
+const FUNC_IP_ZERO_HITS: u32 = 5;
 /// Corrective design §7.3: loader event records reuse the existing 896-byte
 /// DiscoveryRecord with `kind = LOADER = 3`.
 const LOADER: u8 = 3;
@@ -36,7 +41,7 @@ static DISCOVERY: RingBuf = RingBuf::with_byte_size(65_536, 0);
 static START: HashMap<StateKey, StartState> = HashMap::with_max_entries(64, 0);
 
 #[map]
-static COUNTERS: Array<u64> = Array::with_max_entries(4, 0);
+static COUNTERS: Array<u64> = Array::with_max_entries(6, 0);
 
 fn increment_counter(index: u32) {
     if let Some(value) = COUNTERS.get_ptr_mut(index) {
@@ -105,6 +110,9 @@ fn emit_discovery(ctx: &ProbeContext, args: &LoaderArgs) {
     //    other than sentinel 1, is loader_context_invalid — no ID extraction, no
     //    IP/delta arithmetic, no state read, no pause.
     let zero_cookie = args.cookie == 0;
+    if zero_cookie {
+        increment_counter(COOKIE_ZERO_HITS);
+    }
     let state_present = args.cookie & COOKIE_STATE_PRESENT != 0;
     let invalid_absent = !state_present && args.cookie >> COOKIE_PAYLOAD_SHIFT != 1;
     let invalid = zero_cookie || invalid_absent;
@@ -121,6 +129,7 @@ fn emit_discovery(ctx: &ProbeContext, args: &LoaderArgs) {
         // SAFETY: the probe context is the kernel-provided context for this attachment.
         hook_ip = unsafe { helpers::bpf_get_func_ip(ctx.as_ptr()) };
         if hook_ip == 0 {
+            increment_counter(FUNC_IP_ZERO_HITS);
             status |= STATUS_CONTEXT_INVALID;
         } else if state_present {
             // §7.3: checked signed delta, then checked-add exactly 24. Overflow is a

@@ -303,11 +303,10 @@ fn glibc_version() -> Result<String, &'static str> {
 }
 
 fn kernel_matches(actual: &str, prefix: &str) -> bool {
-    actual.split('.').next() == Some(prefix)
-        || actual == prefix
+    actual == prefix
         || actual
-            .strip_suffix("-generic")
-            .is_some_and(|base| base.split('.').next() == Some(prefix))
+            .strip_prefix(prefix)
+            .is_some_and(|tail| tail.starts_with('.') || tail.starts_with('-'))
 }
 
 // ---------------------------------------------------------------------------
@@ -1364,6 +1363,17 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_matches_accepts_lane_kernels_only_by_prefix() {
+        assert!(kernel_matches("5.15.0-187-generic", "5.15"));
+        assert!(kernel_matches("6.8.0-137-generic", "6.8"));
+        assert!(kernel_matches("5.15", "5.15"));
+        assert!(!kernel_matches("5.15.0-187-generic", "6.8"));
+        assert!(!kernel_matches("6.8.0-137-generic", "5.15"));
+        assert!(!kernel_matches("51.5.0", "5.15"));
+        assert!(!kernel_matches("6.89.0", "6.8"));
+    }
 
     #[test]
     fn cookie_round_trip_covers_all_contexts_and_bounds() {

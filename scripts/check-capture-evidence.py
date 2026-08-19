@@ -84,10 +84,10 @@ VERSION_SURFACES = Counter(
 )
 # SCANNED — the canary workload maps the provider *before* attach, so both
 # sources describe it. Only three of the provider's thirteen tables live in the
-# object's file-backed data; the other ten are built at run time in .bss, which
-# the memory scan cannot reach and says so (three object-level skips). So the
-# scan's set is a strict subset of the manifest's, the two sets differ, and
-# §4.12 records one `discovery_conflict` and attaches their union.
+# object's file-backed data; the other ten are built at run time in .bss. The
+# scan decoded a nonempty file-backed subset, so the runtime-only tables are not
+# object-level scan failures. The differing source sets are recorded by one
+# `discovery_conflict` and exact per-source table records.
 #
 # What the union does *not* change is the attach plan: 104 slots and 208 probes,
 # exactly as before, because a slot is one {object, file offset} however many
@@ -99,9 +99,20 @@ VERSION_SURFACES_SCANNED = VERSION_SURFACES + Counter(
 )
 VERSION_SHAPE_MANIFEST_ONLY = (988, 104, 208, VERSION_SURFACES, 1, "ok")
 VERSION_SHAPE_SCANNED = (988, 104, 208, VERSION_SURFACES_SCANNED, 1, "ok")
-# The three tables the scan cannot reach in the version-matrix provider. Each is
-# an object-level skip naming the provider, not a lost table entry.
-VERSION_SCAN_SKIPS = 3
+VERSION_TABLES_MANIFEST_ONLY = Counter(
+    {
+        ("manifest", (0, 0), 0): 1,
+        ("manifest", (2, 40), 68): 3,
+        ("manifest", (3, 0), 92): 2,
+        ("manifest", (3, 1), 92): 2,
+        ("manifest", (3, 2), 104): 3,
+        ("manifest", (3, 9), 104): 1,
+        ("manifest", (4, 0), 0): 1,
+    }
+)
+VERSION_TABLES_SCANNED = VERSION_TABLES_MANIFEST_ONLY + Counter(
+    {("scan", (2, 40), 68): 2, ("scan", (3, 0), 92): 1}
+)
 DISCOVERY_SUBJECT = "discovery subject"
 DISCOVERY_UNAVAILABLE = "discovery unavailable"
 ENTRY_UNAVAILABLE = "function entry unavailable"
@@ -374,6 +385,14 @@ def surface_signature(evidence):
         f"surface acquisition failure: {surfaces}",
     )
     return Counter((surface["walk"], surface["functions"]) for surface in surfaces)
+
+
+def table_signature(evidence):
+    require(len(evidence["discovery"]) == 1, evidence["discovery"])
+    return Counter(
+        (table["source"], tuple(table["version"]), table["entries"])
+        for table in evidence["discovery"][0]["tables"]
+    )
 
 
 def exact_shape(evidence, table_entries, slots, probes, surfaces, vendor, interface_list):
@@ -756,12 +775,16 @@ def validate_canary(lane, document):
     exact_shape(
         evidence, *(VERSION_SHAPE_SCANNED if scanned else VERSION_SHAPE_MANIFEST_ONLY)
     )
+    wanted_tables = VERSION_TABLES_SCANNED if scanned else VERSION_TABLES_MANIFEST_ONLY
+    require(
+        table_signature(evidence) == wanted_tables,
+        f"unexpected discovery tables: {evidence['discovery']}",
+    )
     exact_common(
         evidence,
         aliases=[],
         skipped=[],
         in_flight=0,
-        discovery_skipped=VERSION_SCAN_SKIPS if scanned else 0,
     )
     allowances = dict(
         SAFE_ALLOWANCES if policy == "safe" else UNSAFE_ALLOWANCES if policy == "unsafe" else {}
@@ -1217,8 +1240,13 @@ def self_test():
     version = evidence_fixture(
         VERSION_SURFACES_SCANNED,
         sources=("scan", "manifest"),
-        discovery_skipped=VERSION_SCAN_SKIPS,
+        discovery_skipped=0,
     )
+    version["discovery"][0]["tables"] = [
+        {"source": source, "version": list(table_version), "entries": entries}
+        for (source, table_version, entries), count in VERSION_TABLES_SCANNED.items()
+        for _ in range(count)
+    ]
     version.update(
         table_entries=988,
         slots=104,
@@ -1231,23 +1259,26 @@ def self_test():
     safe = document_fixture(copy.deepcopy(version))
     safe["evidence"].update(SAFE_ALLOWANCES)
     validate_canary("default-safe-profile", safe)
+    bounded_skips = copy.deepcopy(safe["evidence"])
+    bounded_skips["skipped"] = [dict(DISCOVERY_SKIP)]
+    discovery_skips(bounded_skips)
     for leaked_subject in (
         "/home/operator/private/bystander",
         "pid 4242",
         "/sys/fs/cgroup/user.slice/private.scope",
     ):
-        bad = copy.deepcopy(safe)
-        bad["evidence"]["skipped"][0]["name"] = leaked_subject
-        rejected(lambda bad=bad: validate_canary("default-safe-profile", bad))
+        bad = copy.deepcopy(bounded_skips)
+        bad["skipped"][0]["name"] = leaked_subject
+        rejected(lambda bad=bad: discovery_skips(bad))
     for leaked_reason in (
         "/home/operator/private/bystander",
         "scanning pid 4242: /proc/4242/maps",
         "/sys/fs/cgroup/user.slice/private.scope",
         "arbitrary error-chain text",
     ):
-        bad = copy.deepcopy(safe)
-        bad["evidence"]["skipped"][0]["reason"] = leaked_reason
-        rejected(lambda bad=bad: validate_canary("default-safe-profile", bad))
+        bad = copy.deepcopy(bounded_skips)
+        bad["skipped"][0]["reason"] = leaked_reason
+        rejected(lambda bad=bad: discovery_skips(bad))
     print("capture skip names and reasons are bounded before JSON output: OK")
     bad = copy.deepcopy(safe)
     bad["evidence"]["attached_probes"] = 206
@@ -1259,13 +1290,17 @@ def self_test():
     bad["evidence"]["table_entries"] = 1216
     rejected(lambda: validate_canary("default-safe-profile", bad))
     print("canary matrix 988/104/208 with 16 mixed surfaces: OK")
-    # The scan's own contribution is not optional: dropping the three tables it
-    # decoded, or the conflict they imply, must fail.
+    # The scan's own contribution is not optional: dropping the three exact
+    # source-labelled tables it decoded, or the conflict they imply, must fail.
     bad = copy.deepcopy(safe)
     bad["evidence"]["discovery_conflicts"] = 0
     rejected(lambda: validate_canary("default-safe-profile", bad))
     bad = copy.deepcopy(safe)
-    bad["evidence"]["skipped"] = []
+    bad["evidence"]["discovery"][0]["tables"] = [
+        table
+        for table in bad["evidence"]["discovery"][0]["tables"]
+        if table["source"] != "scan"
+    ]
     rejected(lambda: validate_canary("default-safe-profile", bad))
     bad = copy.deepcopy(safe)
     bad["evidence"]["discovery"][0]["sources"] = ["manifest"]
@@ -1274,6 +1309,11 @@ def self_test():
 
     # The freeze lane: same provider, same policy, manifest alone.
     freeze_evidence = evidence_fixture(VERSION_SURFACES, sources=("manifest",))
+    freeze_evidence["discovery"][0]["tables"] = [
+        {"source": source, "version": list(table_version), "entries": entries}
+        for (source, table_version, entries), count in VERSION_TABLES_MANIFEST_ONLY.items()
+        for _ in range(count)
+    ]
     freeze_evidence.update(
         table_entries=988,
         slots=104,

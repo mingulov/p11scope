@@ -986,6 +986,7 @@ fn discovery_evidence(
                 .collect();
             let identity = summary_of(m.object, &m.path);
             render::DiscoveredModule {
+                id: m.id,
                 dev: identity.dev,
                 ino: identity.ino,
                 sha256: identity.sha256,

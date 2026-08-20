@@ -5,7 +5,7 @@ use crate::attach::CapturePolicy;
 use crate::discovery::scan::Skipped;
 use crate::kinds;
 use crate::metrics::{SlotReport, percentile_ns};
-use crate::plan::TableSummary;
+use crate::plan::{ModuleId, TableSummary};
 use serde::Serialize;
 use std::time::Duration;
 
@@ -100,6 +100,10 @@ pub struct ObjectSummary {
 /// Same path caveat as `ObjectSummary`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct DiscoveredModule {
+    /// Capture-local stable ownership ID. It is renderer metadata only and is
+    /// deliberately absent from the public report schema.
+    #[serde(skip)]
+    pub id: ModuleId,
     pub dev: (u64, u64),
     pub ino: u64,
     /// `None` when nothing pinned the module object itself.
@@ -680,8 +684,9 @@ fn latency_out(
 
 /// Per-name call/error/latency counts from the **aggregate BPF maps** —
 /// the count authority in every mode (see module docs on `functions`
-/// sourcing in both renderers). `modules` is `evidence.discovery[]`, indexed
-/// by `ModuleId` — the same list `capture.modules[]` renders.
+/// sourcing in both renderers). `modules` is the current compact
+/// `evidence.discovery[]` snapshot, so stable `ModuleId`s are matched rather
+/// than treated as vector offsets.
 fn functions_out(reports: &[SlotReport], modules: &[DiscoveredModule]) -> Vec<FunctionOut> {
     reports
         .iter()
@@ -690,7 +695,7 @@ fn functions_out(reports: &[SlotReport], modules: &[DiscoveredModule]) -> Vec<Fu
             aliased: r.aliased,
             module: r
                 .module
-                .and_then(|id| modules.get(id.0 as usize))
+                .and_then(|id| modules.iter().find(|module| module.id == id))
                 .map(|m| ModuleRef {
                     dev: m.dev,
                     ino: m.ino,
@@ -717,9 +722,9 @@ fn functions_out(reports: &[SlotReport], modules: &[DiscoveredModule]) -> Vec<Fu
         .collect()
 }
 
-/// `capture.modules[]`: the identity of every discovered module, in `ModuleId`
-/// order. A projection of `evidence.discovery[]` rather than a second list, so
-/// the two can never disagree about what this capture observed.
+/// `capture.modules[]`: the identity of every currently discovered module. A
+/// projection of `evidence.discovery[]` rather than a second list, so the two
+/// can never disagree about what this capture observed.
 fn capture_modules(ev: &Evidence) -> Vec<serde_json::Value> {
     ev.discovery
         .modules
@@ -1197,6 +1202,7 @@ mod tests {
     fn discovered_fixture() -> DiscoveredModule {
         let sha = "11".repeat(32);
         DiscoveredModule {
+            id: ModuleId(0),
             dev: (8, 1),
             ino: 11,
             sha256: Some(sha.clone()),
@@ -1229,6 +1235,24 @@ mod tests {
         let mut r = report("C_Sign", 1, 0, false);
         r.module = Some(crate::plan::ModuleId(0));
         vec![r]
+    }
+
+    #[test]
+    fn functions_out_attributes_a_holey_stable_module_id_to_its_module() {
+        let mut b = discovered_fixture();
+        b.id = ModuleId(1);
+        b.ino = 22;
+        b.path = "/opt/b.so".into();
+        let mut c = discovered_fixture();
+        c.id = ModuleId(2);
+        c.ino = 33;
+        c.path = "/opt/c.so".into();
+        let mut report = report("C_Sign", 1, 0, false);
+        report.module = Some(crate::plan::ModuleId(1));
+
+        let out = functions_out(&[report], &[b, c]);
+
+        assert_eq!(out[0].module.as_ref().unwrap().ino, 22);
     }
 
     fn state_fixture() -> crate::semantics::State {

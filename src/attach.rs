@@ -280,6 +280,10 @@ fn detach_selected_with<T>(
         .collect()
 }
 
+fn attached_probes_after_detach(attached: usize) -> usize {
+    attached
+}
+
 /// Renders `e` and every `.source()` beneath it, joined by `: `. Several
 /// of aya's error variants (e.g. `ProgramError::SyscallError`) are
 /// `#[error(transparent)]`, so `{e}` alone prints only the outer
@@ -878,11 +882,7 @@ impl Session {
                 first_error = Some(anyhow!(message));
             }
         }
-        self.attached = self
-            .links
-            .iter()
-            .filter(|link| matches!(link, RegisteredLink::UProbe { .. }))
-            .count();
+        self.attached = attached_probes_after_detach(self.attached);
         first_error.map_or(Ok(()), Err)
     }
 
@@ -1048,6 +1048,11 @@ mod tests {
             attempted,
             [("p11_return", 0), ("p11_return", 1), ("p11_entry", 1),]
         );
+    }
+
+    #[test]
+    fn terminal_detach_retains_cumulative_attached_probe_evidence() {
+        assert_eq!(attached_probes_after_detach(136), 136);
     }
 
     #[test]

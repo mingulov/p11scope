@@ -176,8 +176,24 @@ mod tests {
             semantic_authorized: true,
             semantic_ambiguous: false,
             fork_safe: false,
-            module_ids: vec![],
+            module_ids: vec![ModuleId(0)],
         }
+    }
+
+    fn exact_plan(slots: Vec<crate::plan::Slot>) -> AttachPlan {
+        let mut plan = AttachPlan::from_slots(slots);
+        plan.modules = vec![crate::plan::ModuleSummary {
+            id: ModuleId(0),
+            object: crate::plan::TEST_PINNED_OBJECT,
+            key: crate::plan::TEST_OBJECT,
+            path: "/proc/self/fd/42".into(),
+            tables: vec![],
+            interfaces: 0,
+            source: "manifest",
+            corroborated: false,
+            skipped: vec![],
+        }];
+        plan
     }
 
     #[test]
@@ -204,9 +220,9 @@ mod tests {
 
     #[test]
     fn slot_reports_use_new_plan_slots_without_a_second_lookup_table() {
-        let mut plan = AttachPlan::from_slots(vec![slot(0, "C_OpenSession")]);
+        let mut plan = exact_plan(vec![slot(0, "C_OpenSession")]);
         let delta = plan
-            .extend_exact(AttachPlan::from_slots(vec![
+            .extend_exact(exact_plan(vec![
                 slot(0, "C_OpenSession"),
                 slot(1, "C_Sign"),
             ]))
@@ -224,7 +240,7 @@ mod tests {
 
         assert_eq!(report.names, ["C_Sign"]);
         assert_eq!(report.calls, 3);
-        assert_eq!(report.module, None);
+        assert_eq!(report.module, Some(ModuleId(0)));
         assert_eq!(
             plan.module_of_slot(99),
             None,

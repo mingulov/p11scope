@@ -252,18 +252,7 @@ impl AttachPlan {
         self.validate_slot_index()?;
         rebuilt.validate_slot_index()?;
         self.remap_modules(&mut rebuilt)?;
-
-        let additional = rebuilt
-            .slot_by_key
-            .keys()
-            .filter(|key| !self.slot_by_key.contains_key(key))
-            .count();
-        if self.slots.len() + additional > MAX_SLOTS as usize {
-            return Err(format!(
-                "live attach requires {} allocated slots but only {MAX_SLOTS} are available; refusing to attach a prefix",
-                self.slots.len() + additional
-            ));
-        }
+        self.refuse_over_capacity_modules(&mut rebuilt);
 
         let mut slots = self.slots.clone();
         let mut slot_by_key = self.slot_by_key.clone();
@@ -290,13 +279,20 @@ impl AttachPlan {
                 let mut updated = slot.clone();
                 updated.index = old.index;
                 if old.descriptor_index != updated.descriptor_index {
-                    if old.descriptor_index == 0 || updated.descriptor_index != 0 {
-                        return Err(format!(
-                            "slot {} descriptor cannot change from {} to {} after policy freeze",
-                            old.index, old.descriptor_index, updated.descriptor_index
-                        ));
+                    if old.descriptor_index != 0
+                        && updated.descriptor_index != 0
+                        && old.semantics == updated.semantics
+                    {
+                        updated.descriptor_index = old.descriptor_index;
+                    } else {
+                        if old.descriptor_index == 0 || updated.descriptor_index != 0 {
+                            return Err(format!(
+                                "slot {} descriptor cannot change from {} to {} after policy freeze",
+                                old.index, old.descriptor_index, updated.descriptor_index
+                            ));
+                        }
+                        delta.replace.push(updated.clone());
                     }
-                    delta.replace.push(updated.clone());
                 }
                 slots[position] = updated;
             } else {
@@ -375,7 +371,7 @@ impl AttachPlan {
             if slot.descriptor_index != 0
                 && (!slot.semantic_authorized
                     || slot.semantic_ambiguous
-                    || slot.module_ids.len() >= 2)
+                    || slot.module_ids.len() != 1)
             {
                 return Err(format!(
                     "slot {} has a semantic descriptor without one unambiguous authorized owner",
@@ -409,6 +405,41 @@ impl AttachPlan {
             return Err("exact attach index points outside the slot vector".into());
         }
         Ok(())
+    }
+
+    fn refuse_over_capacity_modules(&self, rebuilt: &mut AttachPlan) {
+        let mut accepted = BTreeSet::new();
+        let mut added = BTreeSet::new();
+        for module in &rebuilt.modules {
+            let needed: BTreeSet<_> = rebuilt
+                .slots
+                .iter()
+                .filter(|slot| slot.module_ids.contains(&module.id))
+                .map(AttachKey::of)
+                .filter(|key| !self.slot_by_key.contains_key(key) && !added.contains(key))
+                .collect();
+            if self.slots.len() + added.len() + needed.len() > MAX_SLOTS as usize {
+                rebuilt.modules_skipped.push(Skipped {
+                    subject: module.path.clone(),
+                    reason: format!(
+                        "module needs {} more of the {MAX_SLOTS} attach slots; {} are in use \
+                         — refusing to attach a prefix",
+                        needed.len(),
+                        self.slots.len() + added.len()
+                    ),
+                });
+            } else {
+                added.extend(needed);
+                accepted.insert(module.id);
+            }
+        }
+        rebuilt
+            .modules
+            .retain(|module| accepted.contains(&module.id));
+        for slot in &mut rebuilt.slots {
+            slot.module_ids.retain(|id| accepted.contains(id));
+        }
+        rebuilt.slots.retain(|slot| !slot.module_ids.is_empty());
     }
 
     fn remap_modules(&self, rebuilt: &mut AttachPlan) -> Result<(), String> {
@@ -1698,6 +1729,142 @@ mod tests {
         assert!(delta.replace.is_empty());
         assert!(delta.retire.is_empty());
         assert_eq!(plan.slots[0].object_path, "/new/metadata-only-path.so");
+    }
+
+    #[test]
+    fn extend_exact_merges_agreeing_alias_metadata_without_changing_the_cookie() {
+        let object = PinnedObjectId(1);
+        let set_pin = crate::kinds::function_id("C_SetPIN").unwrap() + 1;
+        let init_pin = crate::kinds::function_id("C_InitPIN").unwrap() + 1;
+        let mut initial = exact_slot(0, object, 0x10, set_pin, vec![ModuleId(0)]);
+        initial.names = vec!["C_SetPIN".into()];
+        let mut plan = exact_plan(vec![initial], vec![exact_module(0, object)]);
+        let mut rebuilt = exact_slot(0, object, 0x10, init_pin, vec![ModuleId(0)]);
+        rebuilt.names = vec!["C_InitPIN".into(), "C_SetPIN".into()];
+        rebuilt.aliased = true;
+
+        let delta = plan
+            .extend_exact(exact_plan(vec![rebuilt], vec![exact_module(0, object)]))
+            .unwrap();
+
+        assert!(delta.new.is_empty());
+        assert!(delta.replace.is_empty());
+        assert_eq!(plan.slots[0].descriptor_index, set_pin);
+        assert_eq!(plan.slots[0].names, ["C_InitPIN", "C_SetPIN"]);
+    }
+
+    #[test]
+    fn extend_exact_refuses_only_a_crossing_module_after_retirement() {
+        let old = PinnedObjectId(10);
+        let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
+        let mut plan = exact_plan(
+            (0..511)
+                .map(|index| {
+                    exact_slot(
+                        index,
+                        old,
+                        u64::from(index) * 8,
+                        descriptor,
+                        vec![ModuleId(0)],
+                    )
+                })
+                .collect(),
+            vec![exact_module(0, old)],
+        );
+        plan.extend_exact(exact_plan(
+            (0..500)
+                .map(|index| {
+                    exact_slot(
+                        index,
+                        old,
+                        u64::from(index) * 8,
+                        descriptor,
+                        vec![ModuleId(0)],
+                    )
+                })
+                .collect(),
+            vec![exact_module(0, old)],
+        ))
+        .unwrap();
+
+        let crossing = PinnedObjectId(11);
+        let later = PinnedObjectId(12);
+        let rebuilt = exact_plan(
+            (0..500)
+                .map(|index| {
+                    exact_slot(
+                        index,
+                        old,
+                        u64::from(index) * 8,
+                        descriptor,
+                        vec![ModuleId(0)],
+                    )
+                })
+                .chain((0..3).map(|offset| {
+                    exact_slot(
+                        500 + offset,
+                        crossing,
+                        0x1000 + u64::from(offset) * 8,
+                        descriptor,
+                        vec![ModuleId(1)],
+                    )
+                }))
+                .chain(std::iter::once(exact_slot(
+                    503,
+                    later,
+                    0x2000,
+                    descriptor,
+                    vec![ModuleId(2)],
+                )))
+                .collect(),
+            vec![
+                exact_module(0, old),
+                exact_module(1, crossing),
+                exact_module(2, later),
+            ],
+        );
+
+        let delta = plan.extend_exact(rebuilt).unwrap();
+
+        assert_eq!(delta.new.len(), 1);
+        assert_eq!(delta.new[0].index, 511);
+        assert_eq!(delta.new[0].object, later);
+        assert!(plan.slots.iter().all(|slot| slot.object != crossing));
+        assert_eq!(
+            plan.modules
+                .iter()
+                .map(|module| module.id)
+                .collect::<Vec<_>>(),
+            [ModuleId(0), ModuleId(2)]
+        );
+        assert_eq!(plan.modules_skipped.len(), 1);
+        assert_eq!(plan.modules_skipped[0].subject, "/opt/module11.so");
+    }
+
+    #[test]
+    fn extend_exact_rejects_a_semantic_descriptor_without_an_owner() {
+        let object = PinnedObjectId(1);
+        let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
+        let mut plan = exact_plan(
+            vec![exact_slot(0, object, 0x10, descriptor, vec![ModuleId(0)])],
+            vec![exact_module(0, object)],
+        );
+        let before = plan.clone();
+        let rebuilt = exact_plan(
+            vec![
+                exact_slot(0, object, 0x10, descriptor, vec![ModuleId(0)]),
+                exact_slot(1, object, 0x20, descriptor, vec![]),
+            ],
+            vec![exact_module(0, object)],
+        );
+
+        let error = plan.extend_exact(rebuilt).unwrap_err();
+
+        assert!(
+            error.contains("one unambiguous authorized owner"),
+            "{error}"
+        );
+        assert_eq!(plan, before);
     }
 
     #[test]

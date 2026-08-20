@@ -49,13 +49,15 @@ All four reserved bytes are zero. Every reservation path performs exactly 112
 aligned volatile zero stores covering offsets `0..=888`; the private field is
 privately decoded and validated by the host, but never enters the public
 schema, evidence, or rendering. A CAS winner stores the sign-extended return
-from its one `bpf_send_signal` call. A coalesced record
-stores `i64::MIN` and status `0x02`; an ordinary unarmed or pause-ineligible
-record stores zero. A loader context-invalid record stores zero and performs
-no authorization CAS or signal helper call. Userspace accepts zero as an
-accepted request only for the exact generation epoch in which BPF consumed
-`ARMED -> REQUESTED`; status `0x02` is valid if and only if the field is
-`i64::MIN`. The value alone never proves acceptance.
+from its one `bpf_send_signal` call. A coalesced record sets status bit `0x02`
+and stores `i64::MIN`; any independently valid status bit remains set, so an
+export read failure plus coalescing is status `0x03`. An ordinary unarmed or
+pause-ineligible record stores zero. A loader context-invalid record stores
+zero and performs no authorization CAS or signal helper call. Userspace
+accepts zero as an accepted request only for the exact generation epoch in
+which BPF consumed `ARMED -> REQUESTED`. For every record, status bit `0x02`
+is set if and only if the field is `i64::MIN`. The value alone never proves
+acceptance.
 
 ## 2. Binding evidence and disposition
 

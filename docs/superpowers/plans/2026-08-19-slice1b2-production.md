@@ -547,11 +547,13 @@ program, but userspace arming remains disabled until Task 7.
   `[1]` export state failures, `[2]` export bounded-read failures, `[3]`
   loader hits, and `[4]` loader state-read failures. Do not reuse call-event
   `EVIDENCE` cells. The CAS winner stores the sign-extended helper result in
-  `send_signal_rc`; a coalesced/no-helper record stores `i64::MIN`, an ordinary
-  unarmed or pause-ineligible record stores zero, and a context-invalid loader
-  record stores zero. Zero is accepted as a request only for the exact
-  generation epoch whose `ARMED -> REQUESTED` CAS was consumed; status 0x02 is
-  valid if and only if the field is `i64::MIN`.
+  `send_signal_rc`; a coalesced/no-helper record sets status bit `0x02` and
+  stores `i64::MIN`, while an independently observed export read failure keeps
+  bit `0x01` set and therefore yields status `0x03`. An ordinary unarmed or
+  pause-ineligible record stores zero, and a context-invalid loader record
+  stores zero. Zero is accepted as a request only for the exact generation
+  epoch whose `ARMED -> REQUESTED` CAS was consumed. For every record, status
+  bit `0x02` is set if and only if the field is `i64::MIN`.
 - [ ] Test kind/status/field legality, signed helper return encoding,
   source/host record decode, short/long rejection, all-zero reserved fields,
   truncation limits, and no raw value renderer path.
@@ -697,12 +699,42 @@ cargo +1.88 check --locked --workspace --all-targets
 - [ ] Locked nightly BPF build passes the semantic 112-store guard on every
   production discovery emitter, exact ABI/map/program inventory, helper and
   bounded-loop disassembly assertions, and no-busy-wait guard.
-- [ ] Run the one object validator explicitly:
+- [ ] Run the one object-validator interface on all four exact variants. This
+  block declares every path before use and creates each manifest from source
+  only before checking the corresponding fresh object:
 
 ```sh
+set -eu
+TASK5_OBJECT_ROOT="$(mktemp -d /tmp/p11scope-task5-object.XXXXXX)"
+trap 'rm -rf "$TASK5_OBJECT_ROOT"' EXIT
+SOURCE="$(realpath crates/ebpf/src/main.rs)"
+DEFAULT_TARGET="$TASK5_OBJECT_ROOT/default-target"
+UNSAFE_TARGET="$TASK5_OBJECT_ROOT/unsafe-target"
+SMALL_RING_TARGET="$TASK5_OBJECT_ROOT/small-ring-target"
+SMALL_DISCOVERY_TARGET="$TASK5_OBJECT_ROOT/small-discovery-ring-target"
+DEFAULT_OBJECT="$DEFAULT_TARGET/bpfel-unknown-none/release/p11scope-ebpf"
+UNSAFE_OBJECT="$UNSAFE_TARGET/bpfel-unknown-none/release/p11scope-ebpf"
+SMALL_RING_OBJECT="$SMALL_RING_TARGET/bpfel-unknown-none/release/p11scope-ebpf"
+SMALL_DISCOVERY_OBJECT="$SMALL_DISCOVERY_TARGET/bpfel-unknown-none/release/p11scope-ebpf"
+DEFAULT_MANIFEST="$TASK5_OBJECT_ROOT/default.manifest.json"
+UNSAFE_MANIFEST="$TASK5_OBJECT_ROOT/unsafe.manifest.json"
+SMALL_RING_MANIFEST="$TASK5_OBJECT_ROOT/small-ring.manifest.json"
+SMALL_DISCOVERY_MANIFEST="$TASK5_OBJECT_ROOT/small-discovery-ring.manifest.json"
+
+cargo +nightly build --locked --release --target bpfel-unknown-none -Z build-std=core --manifest-path crates/ebpf/Cargo.toml --target-dir "$DEFAULT_TARGET"
+cargo +nightly build --locked --release --target bpfel-unknown-none -Z build-std=core --manifest-path crates/ebpf/Cargo.toml --target-dir "$UNSAFE_TARGET" --features unsafe-unvalidated-metadata
+cargo +nightly build --locked --release --target bpfel-unknown-none -Z build-std=core --manifest-path crates/ebpf/Cargo.toml --target-dir "$SMALL_RING_TARGET" --features small-ring
+cargo +nightly build --locked --release --target bpfel-unknown-none -Z build-std=core --manifest-path crates/ebpf/Cargo.toml --target-dir "$SMALL_DISCOVERY_TARGET" --features small-discovery-ring
+
 python3 scripts/check-live-discovery-object.py --self-test
-python3 scripts/check-live-discovery-object.py \
-  --object "$BPF_OBJECT" --manifest "$BPF_INVENTORY"
+python3 scripts/check-live-discovery-object.py --write-test-manifest --source "$SOURCE" --variant default --output "$DEFAULT_MANIFEST"
+python3 scripts/check-live-discovery-object.py --write-test-manifest --source "$SOURCE" --variant unsafe --output "$UNSAFE_MANIFEST"
+python3 scripts/check-live-discovery-object.py --write-test-manifest --source "$SOURCE" --variant small-ring --output "$SMALL_RING_MANIFEST"
+python3 scripts/check-live-discovery-object.py --write-test-manifest --source "$SOURCE" --variant small-discovery-ring --output "$SMALL_DISCOVERY_MANIFEST"
+python3 scripts/check-live-discovery-object.py --source "$SOURCE" --object "$DEFAULT_OBJECT" --manifest "$DEFAULT_MANIFEST"
+python3 scripts/check-live-discovery-object.py --source "$SOURCE" --object "$UNSAFE_OBJECT" --manifest "$UNSAFE_MANIFEST"
+python3 scripts/check-live-discovery-object.py --source "$SOURCE" --object "$SMALL_RING_OBJECT" --manifest "$SMALL_RING_MANIFEST"
+python3 scripts/check-live-discovery-object.py --source "$SOURCE" --object "$SMALL_DISCOVERY_OBJECT" --manifest "$SMALL_DISCOVERY_MANIFEST"
 ```
 
   It owns the 112-store region check, exact map/program/ABI/helper inventory,
@@ -1172,6 +1204,7 @@ real process/provider/container shapes and both supported kernel baselines.
 
 ```sh
 python3 scripts/check-live-discovery-object.py \
+  --source "$BPF_SOURCE" \
   --object "$BPF_OBJECT" --manifest "$BPF_INVENTORY"
 python3 scripts/check-live-discovery-evidence.py --self-test
 bash scripts/verify-live-discovery-preflight.sh --self-test
@@ -1182,14 +1215,17 @@ python3 scripts/check-live-discovery-evidence.py \
   The Python validator owns finite lifecycle/campaign semantics; the shell
   owns environment setup and cleanup only.
 - [ ] The freeze step creates one new mode-0700 `PRIVATE_ROOT` and defines the
-  command inputs as exact files under it:
+  command inputs before use. `BPF_SOURCE` is the canonical
+  `realpath crates/ebpf/src/main.rs` from the exact clean candidate and is
+  hashed/rechecked by the execution manifest; the generated inputs are exact
+  files under the private root:
   `BPF_OBJECT=$PRIVATE_ROOT/frozen/p11scope-ebpf`,
   `BPF_INVENTORY=$PRIVATE_ROOT/frozen/bpf-inventory.json`,
   `CAMPAIGN_ROOT=$PRIVATE_ROOT/campaign`, and
   `EXECUTION_MANIFEST=$PRIVATE_ROOT/execution-manifest.json`. No script searches
   for or guesses an input path.
 - [ ] Before the first non-self-test runtime attempt, freeze one execution
-  manifest containing the exact source, product BPF, runner, validators, caps,
+  manifest containing the exact `BPF_SOURCE`, product BPF, runner, validators, caps,
   deadlines, cold-boot/container topology, kernel/base identities,
   `initial_set`/DT_NEEDED and `dlopen` load kinds, exported/hidden provider
   bytes, exact interpreter/loader/companion-libc identities and digests,

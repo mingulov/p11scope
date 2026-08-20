@@ -26,10 +26,36 @@ does not:
 - authorize external-target pause, a numeric-PID signal fallback, a fresh
   pidfd, a busy-wait, an adaptive deadline, or a signal resend within one
   cycle;
-- change `DiscoveryRecord`, public evidence fields, privacy, schema, loader
-  qualification, dynamic-slot semantics, or any capture limit; or
+- change public evidence fields, privacy, schema, loader qualification,
+  dynamic-slot semantics, or any capture limit; the private helper-result tail
+  correction stated in §1.1 changes no public evidence field or schema; or
 - authorize production implementation before this amendment and the resulting
   production plan pass independent review.
+
+### 1.1 Production record tail and helper result
+
+The corrective live-discovery design's §5.3 record wording and its
+no-record-change assumption are superseded only as follows. The production
+`DiscoveryRecord` remains 896 bytes with alignment 8, and its existing public
+fields and offsets remain unchanged through `announced_count @880`. Its final
+private bytes are exactly:
+
+```text
+reserved_tail_zero: [u8; 4] @884
+send_signal_rc: i64 @888
+```
+
+All four reserved bytes are zero. Every reservation path performs exactly 112
+aligned volatile zero stores covering offsets `0..=888`; the private field is
+privately decoded and validated by the host, but never enters the public
+schema, evidence, or rendering. A CAS winner stores the sign-extended return
+from its one `bpf_send_signal` call. A coalesced record
+stores `i64::MIN` and status `0x02`; an ordinary unarmed or pause-ineligible
+record stores zero. A loader context-invalid record stores zero and performs
+no authorization CAS or signal helper call. Userspace accepts zero as an
+accepted request only for the exact generation epoch in which BPF consumed
+`ARMED -> REQUESTED`; status `0x02` is valid if and only if the field is
+`i64::MIN`. The value alone never proves acceptance.
 
 ## 2. Binding evidence and disposition
 
@@ -95,8 +121,9 @@ Every eligible hook performs this exact order:
 3. initialize every helper-independent byte;
 4. atomically compare/exchange `ARMED -> REQUESTED`;
 5. if it won, take `hook_ts_ns` immediately before one
-   `bpf_send_signal(SIGSTOP)` and store the signed return; otherwise take its
-   timestamp and store the finite coalesced/no-helper status;
+   `bpf_send_signal(SIGSTOP)` and store its sign-extended return in the private
+   `send_signal_rc`; otherwise take its timestamp and store the finite
+   coalesced/no-helper status;
 6. finish initialization and submit.
 
 There is no loop, poll, delay, or scheduler yield from the authorization CAS

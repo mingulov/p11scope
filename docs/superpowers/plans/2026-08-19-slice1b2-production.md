@@ -490,8 +490,10 @@ Commit message: `refactor: support additive live attachment slots`
 **Purpose:** Emit bounded loader/export/exec facts and pause requests from the
 production object while keeping all private bytes out of public output.
 
-**Promotion prerequisite:** Task 2 independently reviewed PASS. Do not add an
-unproved dormant pause program or `PAUSE_PIDS` map.
+**Promotion prerequisite:** Task 2 independently reviewed PASS. If Task 2 is
+not PASS, Task 5 remains `UNRUN` and adds no Task 5 source, map, or program
+code. After Task 2 PASS, this task may add the production pause ABI, map, and
+program, but userspace arming remains disabled until Task 7.
 
 **Files:**
 
@@ -503,6 +505,8 @@ unproved dormant pause program or `PAUSE_PIDS` map.
 - Modify: `src/events.rs`
 - Modify: `src/scope.rs`
 - Modify: `src/attach.rs`
+- Modify: `src/discovery/hooks.rs`
+- Modify: `src/main.rs`
 - Add: `scripts/check-live-discovery-object.py`
 - Modify: `scripts/check-bpf-map-defs.py`
 - Modify: `tests/artifact_contracts.rs`
@@ -510,20 +514,47 @@ unproved dormant pause program or `PAUSE_PIDS` map.
 ### Step 1: Define and RED-test one bounded ABI
 
 - [ ] Add one `#[repr(C)]`, 896-byte, alignment-8 `DiscoveryRecord` shared by
-  product host/eBPF. Freeze every field offset, 104 pointer words, 16 interface
-  records/classes, and all reserved-zero bytes.
-- [ ] Add finite record kinds for loader, function-list return, interface-list
-  return, interface return, exec, and exit. Unknown kinds fail decoding and
-  increment userspace `discovery_truncated` once.
-- [ ] Preserve status bits: `0x01 = read_failure`,
-  `0x02 = coalesced_no_helper`, `0x04 = loader_context_invalid`. Unknown bits
-  are malformed/truncated, never ignored.
+  product host/eBPF. Freeze every field offset, including 104 pointer words,
+  16 interface records/classes, `announced_count @880`,
+  `reserved_tail_zero: [u8; 4] @884`, and private `send_signal_rc: i64 @888`.
+  All four tail bytes are zero; the host privately decodes and validates the
+  field, but it never enters the public schema, evidence, or rendering.
+- [ ] Freeze the finite kinds: `1=function_list_return`,
+  `2=interface_list_element_return`, `3=loader`, `4=interface_return`,
+  `5=exec`, and `6=leader_exit`; every other kind is malformed and increments
+  userspace `discovery_truncated` once. Freeze name classes as `0=N/A`,
+  `1=exact_standard`, `2=other`, `3=null`, and `4=unreadable`.
+- [ ] Freeze status legality: kinds 1, 2, and 4 allow any subset of bits
+  `0x01` and `0x02` only (status `0`, `0x01`, `0x02`, or `0x03`); kind 3
+  permits exactly `0`, `0x02`, or `0x04` and never `0x02|0x04`; kind 5
+  permits `0` or `0x02`; kind 6 permits only `0`. Any other bit pattern is
+  malformed. `0x01=read_failure`, `0x02=coalesced_no_helper`, and
+  `0x04=loader_context_invalid`.
+- [ ] Freeze field legality: `table_ptr` is the export-table address for kinds
+  1, 2, and 4; a nonzero loader runtime hook IP is valid only for kind 3 with
+  status 0 or 0x02; otherwise it is zero. Kind 3 status 0x04 has zero
+  `table_ptr`, `case_id`, `announced_count`, and context fields and performs no
+  context/IP/delta/state work. `interface_flags` is used only by kinds 2 and
+  4; `case_id` is the validated loader context-id-minus-one (zero for 0x04);
+  `interface_index` is only kind 2 and is 0..15; `symbol_id` is only kinds 1,
+  2, and 4; `announced_count` is the saturated interface count for kind 2,
+  loader `r_state` for kind 3, and zero otherwise.
+- [ ] Freeze bounded-read fields: `usable_n` is zero after a submitted read
+  failure and otherwise is the usable prefix; `completed_prefix <=
+  pointers_attempted <= 104`; unused pointer words and reserved bytes are
+  zero.
 - [ ] Add exact kernel counter indices for ring loss, export state failures,
   export bounded-read failures, loader hits, and loader state-read failures.
-  Do not reuse call-event `EVIDENCE` cells.
-- [ ] Test signed helper return encoding, source/host record decode, short/long
-  rejection, all-zero reserved fields, truncation limits, and no raw value
-  renderer path.
+  Do not reuse call-event `EVIDENCE` cells. The CAS winner stores the
+  sign-extended helper result in `send_signal_rc`; a coalesced/no-helper record
+  stores `i64::MIN`, an ordinary unarmed or pause-ineligible record stores
+  zero, and a context-invalid loader record stores zero. Zero is accepted as
+  a request only for the exact generation epoch whose `ARMED -> REQUESTED`
+  CAS was consumed; status 0x02 is valid if and only if the field is
+  `i64::MIN`.
+- [ ] Test kind/status/field legality, signed helper return encoding,
+  source/host record decode, short/long rejection, all-zero reserved fields,
+  truncation limits, and no raw value renderer path.
 - [ ] Add a product-object initializer guard that fails before implementation:
   every reservation path must have exactly 112 aligned volatile zero stores for
   offsets `0..=888`, no duplicate/narrow spill, no initializer call/back-edge,
@@ -532,35 +563,68 @@ unproved dormant pause program or `PAUSE_PIDS` map.
 
 ### Step 2: Add maps and programs without enabling userspace pause
 
-- [ ] Add `DISCOVERY` (64 KiB ring), export entry-state map, discovery counters,
-  and `PAUSE_PIDS`. Keep `PAUSE_PIDS` writable; it is authorization data, not
-  capture policy. Add the static pause-enabled config bit only at load time.
-- [ ] Change `PID_FILTER` values from `u8` to nonzero `u64` capture-generation
-  tokens, preserving the existing key/capacity. Non-pause PID scopes use the
-  fixed token `1`; an owned `run` session allocates one nonzero token and binds
-  it privately to its retained original `PidPin`.
+- [ ] Freeze the runtime maps exactly: `DISCOVERY` is a 65,536-byte ring;
+  `DISCOVERY_STATE` is `HashMap<StateKey, StartState>` with key/value sizes
+  16/16 and capacity 64; `COUNTERS` is `PerCpuArray<u64>` with capacity 5;
+  and `PAUSE_PIDS` is `HashMap<PauseKey, u64>` with key/value sizes 16/8 and
+  capacity 1. The four runtime maps declare flags `0`, remain writable, and
+  are not frozen. `DISCOVERY_STATE` uses required `BPF_NOEXIST` insertion and
+  return-path removal; every capacity-64 insertion failure is counted and
+  forces partial.
+  `COUNTERS` is summed in userspace at indices ring loss, export state
+  failures, export bounded-read failures, loader hits, and loader state-read
+  failures.
+- [ ] Change `PID_FILTER` to `HashMap<u32, u64>` (key/value sizes 4/8,
+  capacity 1024, `BPF_F_RDONLY_PROG`). Every published PID token is nonzero.
+  Non-pause PID scopes use fixed token `1`; an owned `run` session allocates
+  one nonzero token and binds it privately to its retained original `PidPin`.
+  Define `FLAG_PAUSE_ENABLED = 1 << 5`; set it only for an owned PID scope
+  with `Some` generation.
 - [ ] Freeze `PauseKey` as `#[repr(C)] { tgid: u32, pad: u32,
-  generation_token: u64 }` and `PAUSE_PIDS` as
-  `HashMap<PauseKey, u64>` with capacity one; values remain exactly
-  `ARMED = 1` or `REQUESTED = 2`. BPF obtains the token from the already scoped
-  current-TGID `PID_FILTER` lookup and must match the full pause key before CAS.
+  generation_token: u64 }`; `pad` is zero and values are exactly `ARMED = 1`
+  or `REQUESTED = 2`. BPF obtains the token from the already scoped current-
+  TGID `PID_FILTER` lookup and must match the full pause key before CAS. For
+  `PAUSE_PIDS`, BPF performs only exact-key lookup and CAS; it never inserts or
+  removes, and userspace owns both operations. `PAUSE_PIDS` is excluded from
+  the frozen policy inventory.
   Userspace revalidates the bound `PidPin` immediately before insertion and
   after record decode, removes authorization and detaches pause-capable links
   before reap, and never reuses the token in one capture. No token map, token
   record field, or public epoch is added.
+- [ ] Enforce the scope matrix: PID + `None` publishes token 1 with pause off;
+  cgroup + `None` leaves `PID_FILTER` empty with pause off; PID + `Some` is
+  pause-enabled only for the owned run PID and its exact token; external
+  `--pid` and cgroup + `Some` refuse before any mutation. When PID_FILTER
+  scope is enabled, a missing or zero token emits no record; cgroup scope
+  bypasses PID_FILTER. An absent exact `PAUSE_PIDS` key, including a stale
+  key for another generation, emits an ordinary discovery record with
+  `send_signal_rc = 0` and performs no CAS/helper call. If arm readback does
+  not match, `arm_pause()` performs no insertion and nothing is armed.
 - [ ] Thread the token through one narrow API:
-  `Session::start(..., pause_generation: Option<NonZeroU64>)` passes it to
-  `scope::publish`, stores it privately, and `Session::arm_pause` constructs the
-  full key from that stored value rather than accepting another token. Existing
-  callers pass `None` and publish PID token `1` with pause disabled; only owned
-  `run` passes `Some`.
-- [ ] RED-test exact PID_FILTER readback equals the Session token, `PauseKey.pad`
-  is zero, and full-key equality is required. A zero or mismatched token must
-  perform no CAS, signal helper, or record submission; authorization removal
-  uses the same full key.
+  `Session::start(..., pause_generation: Option<NonZeroU64>)` has exactly that
+  preserved argument and the exact two existing non-run callers pass `None`;
+  only the owned-run path introduced in Task 7 may pass `Some`. After
+  `scope::publish` validates that argument, private `Option<PauseKey>` is
+  `Some` only when derived from the
+  exact owned PID/token and otherwise is `None`; `None` has no pause key even
+  though PID scope publishes token 1. Crate-internal `arm_pause()` takes no
+  PID or token, is the sole userspace insertion path, and has no Task 5
+  caller. `Session`'s mutable `Ebpf` is non-public; the separate `src/main.rs`
+  binary uses only fixed-purpose visible drain/read methods and exposes no
+  mutable `Ebpf` or map handle.
+- [ ] RED-test no arming: the exact two existing `start` callers pass `None`,
+  `start`, `start_inner`, and `scope::publish` never insert or arm,
+  `arm_pause()` is the sole production insertion path, and no production arm
+  caller exists in Task 5. Also test exact PID_FILTER token readback,
+  `PauseKey.pad == 0`, full-key equality, and that zero/mismatched tokens
+  perform no CAS, helper, or record submission; authorization removal uses the
+  same full key.
 - [ ] Add the pause-enabled `CONFIG` bit through `src/scope.rs`, read it back,
-  and include every new frozen policy map in `src/attach.rs`'s exact freeze
-  inventory. Unknown bits or missing/unfrozen policy maps fail load.
+  and include this frozen policy inventory in `src/attach.rs`: `CONFIG`,
+  `PID_FILTER`, `CGROUP_FILTER`, `DESCRIPTORS`, `ASYNC_FUNCTIONS`, and
+  `MECH_SHAPE`; unsafe mode additionally requires `ATTR_BOOL_BITS` and the
+  separately published, read-back, and frozen `TEMPLATE_TAIL`. Unknown bits
+  or missing/unfrozen policy maps fail load.
 - [ ] Implement loader every-hit uprobe with the §7.3 cookie/IP/state path:
   zero cookie rejected before lookup; absent-state sentinel and present zero
   delta remain distinct; `bpf_get_func_ip` plus x86-64 RIP fallback; optional
@@ -572,14 +636,25 @@ unproved dormant pause program or `PAUSE_PIDS` map.
 - [ ] Keep loader-cookie decode separate from slot-cookie decode. The loader
   path has no BPF context registry map: the cookie carries bounded arithmetic
   inputs, while userspace validates the monotonic registry shell after decode.
+- [ ] Add one product object inventory for both manifests: the added programs
+  are `dl_debug_state`, `function_list_entry`, `function_list_return`,
+  `interface_list_entry`, `interface_list_return`, `interface_entry`,
+  `interface_return`, `sched_process_exec`, and `sched_process_exit`. The
+  default object has exactly 12 programs and 15 maps; unsafe has exactly 16
+  programs and 17 maps.
 - [ ] Implement separate entry/return programs for function-list,
   interface-list, and interface ABIs. Entry state is no-overwrite and cleaned on
   every return. Read only successful outputs, at most 104 function pointers,
   at most 16 interfaces, and only enough interface-name bytes to classify then
   discard them.
-- [ ] Reuse `discovery::hooks::HookRegistry` for standard, NSC/FC, and explicit
-  `--hook-symbol` names/ABI selection. Do not add another symbol registry in
-  BPF or userspace.
+- [ ] Add `src/discovery/hooks.rs` and use one `HookRegistry` for standard,
+  NSC/FC, and explicit `--hook-symbol` names/ABI selection, with the Task 4
+  link registry shared by loader, export, and tracepoint links. Reserve ID 0;
+  insertion positions are one-based; built-ins receive IDs 1..=5 in the
+  current `BUILTIN` order; custom hooks append; duplicate replacement retains
+  its ID. Export attach cookies are exactly `u64(symbol_id)`, and the decoder
+  requires symbol ID, ABI, and kind to agree. Do not add another symbol
+  registry in BPF or userspace.
 - [ ] Add exec/leader-exit records needed by run/cgroup lifecycle. Exit cleanup
   does not establish process identity and never authorizes numeric-PID reuse.
 - [ ] Implement the amendment's reserve/init/CAS/timestamp/helper/submit pause
@@ -588,8 +663,10 @@ unproved dormant pause program or `PAUSE_PIDS` map.
 - [ ] Use the frozen-nightly-supported `core::intrinsics::atomic_cxchg` pattern
   already proved by the research artifact and require `cmpxchg_64` in
   disassembly. Do not add `target-cpu=v3` or emulate CAS in userspace.
-- [ ] Add a `small-discovery-ring` test build wired through both eBPF manifests
-  and the existing build script; do not add a runtime sizing option.
+- [ ] Add a distinct test-only `small-discovery-ring` build wired through both
+  eBPF manifests and the existing build script; it changes only `DISCOVERY`
+  from 65,536 to 4,096. Preserve the existing `small-ring` fixture and its
+  `EVENTS` behavior; do not add a runtime sizing option.
 
 ### Step 3: Prove source/object shape before runtime use
 
@@ -849,8 +926,9 @@ cargo +1.88 test --locked --test pause -- --nocapture
   decoded, before any fallible operation.
 - [ ] Cleanup is idempotent and non-short-circuiting. Signal handlers defer to
   the owner cleanup rather than re-entering it.
-- [ ] `Session` exposes finite `arm_pause`, state read/remove, and discovery
-  queue operations; it does not own child policy.
+- [ ] `Session` exposes crate-internal finite `arm_pause()` with no PID/token
+  arguments, state read/remove, and discovery queue operations; it does not
+  expose mutable `Ebpf`/map handles or own child policy.
 - [ ] Insert successor `ARMED` only at the amendment's pre-resume boundary and
   remove it on resume failure/cancellation. A consumed successor before resume
   is lifecycle FAIL.

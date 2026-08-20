@@ -1,4 +1,4 @@
-use p11scope::discovery::scan::CaptureWorkBudget;
+use p11scope::discovery::scan::{CaptureWorkBudget, ScanLimits};
 use p11scope::manifest_input::{MAX_MANIFEST_BYTES, read_manifest};
 use p11scope::process::{MountNamespaceId, ProcessView, ProcessViewId};
 use p11scope_manifest::identity::{IdentityKind, ObjectIdentity};
@@ -23,6 +23,13 @@ fn tmpdir(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     d
+}
+
+fn self_binary_budget() -> CaptureWorkBudget {
+    CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: u64::MAX,
+        total_bytes: u64::MAX,
+    })
 }
 
 /// Build a .so with a caller-chosen build-id so two builds differ.
@@ -147,7 +154,7 @@ fn scan_and_manifest_pins_merge_into_one_set() {
     let (mut pinned, _) = p11scope::discovery::identity::pin_scanned_objects(
         std::process::id(),
         &modules,
-        &mut CaptureWorkBudget::default(),
+        &mut self_binary_budget(),
     )
     .unwrap();
     pinned.absorb(manifest_pins);
@@ -1062,7 +1069,7 @@ fn scan_self() -> (PathBuf, Vec<p11scope::discovery::scan::ScannedModule>) {
             hints: &[exe.clone()],
             hooks: &hooks,
         },
-        &mut CaptureWorkBudget::default(),
+        &mut self_binary_budget(),
     )
     .unwrap();
     let ScanOutcome::Scanned { modules, .. } = outcome else {
@@ -1077,7 +1084,7 @@ fn scanned_objects_are_pinned_hashed_and_attachable() {
     let (pinned, skipped) = p11scope::discovery::identity::pin_scanned_objects(
         std::process::id(),
         &modules,
-        &mut CaptureWorkBudget::default(),
+        &mut self_binary_budget(),
     )
     .unwrap();
     assert!(

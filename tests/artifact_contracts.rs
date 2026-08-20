@@ -98,6 +98,7 @@ fn assert_live_discovery_host_contract(
     scope: &str,
     events: &str,
     hooks: &str,
+    engine: &str,
     main: &str,
 ) -> Result<(), String> {
     assert_exact_policy_map_metadata_contract(attach)?;
@@ -202,13 +203,14 @@ fn assert_live_discovery_host_contract(
         require_contract_marker(scope, marker, contract)?;
     }
 
-    if main.matches("Session::start(").count() != 2
-        || main
-            .matches("Session::start(plan, &scope, pinned, policy, None)")
+    if main.contains("Session::start(")
+        || engine.matches("Session::start(").count() != 1
+        || engine
+            .matches("Session::start(plan, scope, pinned, policy, None)")
             .count()
-            != 2
+            != 1
     {
-        return Err("the exact two binary Session::start callers must pass None".into());
+        return Err("Engine must own exactly one unarmed Session::start caller".into());
     }
     if main.contains("events::Drain::new(&mut session.ebpf)")
         || main.matches("session.event_drain()?").count() != 2
@@ -897,35 +899,52 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_unarmed() {
     let scope = read("src/scope.rs");
     let events = read("src/events.rs");
     let hooks = read("src/discovery/hooks.rs");
+    let engine = read("src/discovery/engine.rs");
     let main = read("src/main.rs");
 
-    assert_live_discovery_host_contract(&attach, &scope, &events, &hooks, &main).unwrap();
+    assert_live_discovery_host_contract(&attach, &scope, &events, &hooks, &engine, &main).unwrap();
 
     let public_ebpf = attach.replacen("pub(crate) ebpf: Ebpf,", "pub ebpf: Ebpf,", 1);
     assert!(
-        assert_live_discovery_host_contract(&public_ebpf, &scope, &events, &hooks, &main).is_err(),
+        assert_live_discovery_host_contract(&public_ebpf, &scope, &events, &hooks, &engine, &main,)
+            .is_err(),
         "a mutable Ebpf must not escape to the binary or external callers"
     );
     let fabricated = attach.replacen("    tgid: u32,", "    pub tgid: u32,", 1);
     assert!(
-        assert_live_discovery_host_contract(&fabricated, &scope, &events, &hooks, &main).is_err(),
+        assert_live_discovery_host_contract(&fabricated, &scope, &events, &hooks, &engine, &main,)
+            .is_err(),
         "the owned capability fields must remain opaque"
     );
-    let armed_binary = main.replacen(
-        "Session::start(plan, &scope, pinned, policy, None)",
-        "Session::start(plan, &scope, pinned, policy, Some(capability))",
+    let armed_engine = engine.replacen(
+        "Session::start(plan, scope, pinned, policy, None)",
+        "Session::start(plan, scope, pinned, policy, Some(capability))",
         1,
     );
     assert!(
-        assert_live_discovery_host_contract(&attach, &scope, &events, &hooks, &armed_binary)
-            .is_err(),
+        assert_live_discovery_host_contract(
+            &attach,
+            &scope,
+            &events,
+            &hooks,
+            &armed_engine,
+            &main,
+        )
+        .is_err(),
         "Task 5 must not gain a present-capability caller"
     );
     let shared_malformed =
         events.replacen("struct DiscoveryDrain<'a>", "struct GenericDrain<'a>", 1);
     assert!(
-        assert_live_discovery_host_contract(&attach, &scope, &shared_malformed, &hooks, &main)
-            .is_err(),
+        assert_live_discovery_host_contract(
+            &attach,
+            &scope,
+            &shared_malformed,
+            &hooks,
+            &engine,
+            &main,
+        )
+        .is_err(),
         "DISCOVERY must keep its own fixed-purpose drain owner"
     );
     let drifted_cgroup_metadata = attach.replacen(
@@ -939,6 +958,7 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_unarmed() {
             &scope,
             &events,
             &hooks,
+            &engine,
             &main,
         )
         .is_err(),
@@ -955,6 +975,7 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_unarmed() {
             &scope,
             &events,
             &hooks,
+            &engine,
             &main,
         )
         .is_err(),

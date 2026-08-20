@@ -543,15 +543,15 @@ program, but userspace arming remains disabled until Task 7.
   failure and otherwise is the usable prefix; `completed_prefix <=
   pointers_attempted <= 104`; unused pointer words and reserved bytes are
   zero.
-- [ ] Add exact kernel counter indices for ring loss, export state failures,
-  export bounded-read failures, loader hits, and loader state-read failures.
-  Do not reuse call-event `EVIDENCE` cells. The CAS winner stores the
-  sign-extended helper result in `send_signal_rc`; a coalesced/no-helper record
-  stores `i64::MIN`, an ordinary unarmed or pause-ineligible record stores
-  zero, and a context-invalid loader record stores zero. Zero is accepted as
-  a request only for the exact generation epoch whose `ARMED -> REQUESTED`
-  CAS was consumed; status 0x02 is valid if and only if the field is
-  `i64::MIN`.
+- [ ] Freeze the kernel counter ABI numerically: `COUNTERS[0]` is ring loss,
+  `[1]` export state failures, `[2]` export bounded-read failures, `[3]`
+  loader hits, and `[4]` loader state-read failures. Do not reuse call-event
+  `EVIDENCE` cells. The CAS winner stores the sign-extended helper result in
+  `send_signal_rc`; a coalesced/no-helper record stores `i64::MIN`, an ordinary
+  unarmed or pause-ineligible record stores zero, and a context-invalid loader
+  record stores zero. Zero is accepted as a request only for the exact
+  generation epoch whose `ARMED -> REQUESTED` CAS was consumed; status 0x02 is
+  valid if and only if the field is `i64::MIN`.
 - [ ] Test kind/status/field legality, signed helper return encoding,
   source/host record decode, short/long rejection, all-zero reserved fields,
   truncation limits, and no raw value renderer path.
@@ -571,9 +571,9 @@ program, but userspace arming remains disabled until Task 7.
   are not frozen. `DISCOVERY_STATE` uses required `BPF_NOEXIST` insertion and
   return-path removal; every capacity-64 insertion failure is counted and
   forces partial.
-  `COUNTERS` is summed in userspace at indices ring loss, export state
-  failures, export bounded-read failures, loader hits, and loader state-read
-  failures.
+  `COUNTERS` is summed in userspace with the fixed indices `0` ring loss, `1`
+  export state failures, `2` export bounded-read failures, `3` loader hits,
+  and `4` loader state-read failures.
 - [ ] Change `PID_FILTER` to `HashMap<u32, u64>` (key/value sizes 4/8,
   capacity 1024, `BPF_F_RDONLY_PROG`). Every published PID token is nonzero.
   Non-pause PID scopes use fixed token `1`; an owned `run` session allocates
@@ -594,12 +594,14 @@ program, but userspace arming remains disabled until Task 7.
 - [ ] Enforce the scope matrix: PID + `None` publishes token 1 with pause off;
   cgroup + `None` leaves `PID_FILTER` empty with pause off; PID + `Some` is
   pause-enabled only for the owned run PID and its exact token; external
-  `--pid` and cgroup + `Some` refuse before any mutation. When PID_FILTER
-  scope is enabled, a missing or zero token emits no record; cgroup scope
-  bypasses PID_FILTER. An absent exact `PAUSE_PIDS` key, including a stale
-  key for another generation, emits an ordinary discovery record with
-  `send_signal_rc = 0` and performs no CAS/helper call. If arm readback does
-  not match, `arm_pause()` performs no insertion and nothing is armed.
+  `--pid` and cgroup + `Some` refuse before any mutation. When a PID scope
+  uses `PID_FILTER`, a missing or zero token emits
+  no record; cgroup scope bypasses PID_FILTER. After valid scope, an absent
+  exact `PAUSE_PIDS` key, including a stale key for another generation, emits
+  an ordinary discovery record with `send_signal_rc = 0` and performs no
+  CAS/helper call. Separately, if `arm_pause()` observes a `PID_FILTER`
+  readback token mismatch, it performs no `PAUSE_PIDS` insertion or arm; this
+  mismatch does not suppress ordinary discovery from an otherwise valid scope.
 - [ ] Thread the token through one narrow API:
   `Session::start(..., pause_generation: Option<NonZeroU64>)` has exactly that
   preserved argument and the exact two existing non-run callers pass `None`;
@@ -616,9 +618,11 @@ program, but userspace arming remains disabled until Task 7.
   `start`, `start_inner`, and `scope::publish` never insert or arm,
   `arm_pause()` is the sole production insertion path, and no production arm
   caller exists in Task 5. Also test exact PID_FILTER token readback,
-  `PauseKey.pad == 0`, full-key equality, and that zero/mismatched tokens
-  perform no CAS, helper, or record submission; authorization removal uses the
-  same full key.
+  `PauseKey.pad == 0`, and full-key equality. Split the negative cases: a
+  missing/zero `PID_FILTER` token under PID scope submits no record; an
+  `arm_pause()` `PID_FILTER` readback mismatch inserts/arms nothing; and an
+  absent/stale exact `PAUSE_PIDS` key submits the ordinary rc-zero record with
+  no CAS/helper. Authorization removal uses the same full key.
 - [ ] Add the pause-enabled `CONFIG` bit through `src/scope.rs`, read it back,
   and include this frozen policy inventory in `src/attach.rs`: `CONFIG`,
   `PID_FILTER`, `CGROUP_FILTER`, `DESCRIPTORS`, `ASYNC_FUNCTIONS`, and
@@ -647,7 +651,7 @@ program, but userspace arming remains disabled until Task 7.
   every return. Read only successful outputs, at most 104 function pointers,
   at most 16 interfaces, and only enough interface-name bytes to classify then
   discard them.
-- [ ] Add `src/discovery/hooks.rs` and use one `HookRegistry` for standard,
+- [ ] Extend the existing `src/discovery/hooks.rs` and use one `HookRegistry` for standard,
   NSC/FC, and explicit `--hook-symbol` names/ABI selection, with the Task 4
   link registry shared by loader, export, and tracepoint links. Reserve ID 0;
   insertion positions are one-based; built-ins receive IDs 1..=5 in the
@@ -688,6 +692,8 @@ python3 scripts/check-live-discovery-object.py \
 ```
 
   It owns the 112-store region check, exact map/program/ABI/helper inventory,
+  including `COUNTERS[0..4] = {ring_loss, export_state_failures,
+  export_bounded_read_failures, loader_hits, loader_state_read_failures}`,
   cookie namespaces, bounded loops, `cmpxchg_64`, and no-busy-wait assertions.
 - [ ] Unit-test export state failure, read failure, truncation, invalid cookie,
   missing cookie, coalesced/no-helper, and ring reservation loss independently.

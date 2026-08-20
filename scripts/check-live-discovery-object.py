@@ -564,10 +564,39 @@ def reservation_loss_contract(disassembly):
                 for index, line in enumerate(failure)
                 if re.search(r"R_BPF_64_64\s+COUNTERS\s*$", line)
             ]
+            counter_instructions = (
+                instructions(failure[counters[0] :]) if len(counters) == 1 else []
+            )
+            lookup = next(
+                (
+                    index
+                    for index, (_, text) in enumerate(counter_instructions)
+                    if re.search(r"\bcall 0x1\b", text)
+                ),
+                None,
+            )
+            update = (
+                [text for _, text in counter_instructions[lookup + 1 : lookup + 5]]
+                if lookup is not None
+                else []
+            )
+            loaded = (
+                re.search(r"\br(?P<value>\d+) = \*\(u64 \*\)\(r0 \+ 0x0\)\s*$", update[1])
+                if len(update) == 4
+                and re.search(r"\bif r0 == 0x0 goto ", update[0])
+                else None
+            )
             if (
                 len(counters) != 1
                 or finite_counter_key(lines, branch + 1 + counters[0]) != 0
-                or not any("call 0x1" in line for line in failure[counters[0] :])
+                or loaded is None
+                or not re.search(
+                    rf"\br{loaded.group('value')} \+= 0x1\s*$", update[2]
+                )
+                or not re.search(
+                    rf"\*\(u64 \*\)\(r0 \+ 0x0\) = r{loaded.group('value')}\s*$",
+                    update[3],
+                )
             ):
                 return False
     return len(reservation_functions) == 3 and {
@@ -779,17 +808,21 @@ def _initializer_block(function, tail=""):
         "       4:\tr3 = 0x0",
         "       5:\tcall 0x83",
         "       6:\tr6 = r0",
-        "       7:\tif r6 != 0x0 goto +0x3",
+        "       7:\tif r6 != 0x0 goto +0x7",
         "       8:\t*(u32 *)(r10 - 0x4) = r7",
         "\t\t0000000000000040:  R_BPF_64_64\tCOUNTERS",
         "       9:\tcall 0x1",
-        "      10:\tgoto +0x70",
+        "      10:\tif r0 == 0x0 goto +0x74",
+        "      11:\tr1 = *(u64 *)(r0 + 0x0)",
+        "      12:\tr1 += 0x1",
+        "      13:\t*(u64 *)(r0 + 0x0) = r1",
+        "      14:\tgoto +0x70",
     ]
     lines.extend(
-        f"{11 + index:8}:\t*(u64 *)(r6 + 0x{index * 8:x}) = r7"
+        f"{15 + index:8}:\t*(u64 *)(r6 + 0x{index * 8:x}) = r7"
         for index in range(112)
     )
-    lines.append("     123:\tcall 0x84")
+    lines.append("     127:\tcall 0x84")
     if tail:
         lines.extend(tail.splitlines())
     return "\n".join(lines)
@@ -865,10 +898,10 @@ def _bounded_disassembly():
 
 
 def _producer_disassembly():
-    loader_tail = """     124:\tr1 = 0x4
-     125:\tr7 = -0x8000000000000000 ll
-     127:\tif r0 == 0x2 goto +0x0
-     128:\tif r0 == 0x2 goto +0x0
+    loader_tail = """     128:\tr1 = 0x4
+     129:\tr7 = -0x8000000000000000 ll
+     131:\tif r0 == 0x2 goto +0x0
+     132:\tif r0 == 0x2 goto +0x0
 \t\t0000000000000400:  R_BPF_64_64\tPAUSE_PIDS"""
     entry = """0000000000000000 <{name}>:
        0:\tr4 = 0x1
@@ -1015,7 +1048,7 @@ def self_test():
     initializer_mutations = [
         (
             "initializer success branch retarget",
-            initializer.replace("if r6 != 0x0 goto +0x3", "if r6 != 0x0 goto +0x2", 1),
+            initializer.replace("if r6 != 0x0 goto +0x7", "if r6 != 0x0 goto +0x6", 1),
         ),
         (
             "111 object stores",
@@ -1024,8 +1057,8 @@ def self_test():
         (
             "113 object stores",
             initializer.replace(
-                "     123:\tcall 0x84",
-                "     123:\t*(u64 *)(r6 + 0x380) = r7\n     124:\tcall 0x84",
+                "     127:\tcall 0x84",
+                "     127:\t*(u64 *)(r6 + 0x380) = r7\n     128:\tcall 0x84",
                 1,
             ),
         ),
@@ -1107,9 +1140,11 @@ def self_test():
         ("state insertion cleanup", producer.replace("       2:\tcall 0x3", "       2:\tcall 0x2", 1)),
         ("state return removal", producer.replace("       1:\tcall 0x3", "       1:\tcall 0x2", 1)),
         ("bounded-read failure counter", producer.replace("call 0x70", "call 0x71")),
-        ("invalid-loader marker", producer.replace("     124:\tr1 = 0x4", "     124:\tr1 = 0x0")),
+        ("invalid-loader marker", producer.replace("     128:\tr1 = 0x4", "     128:\tr1 = 0x0")),
         ("coalesced pause sentinel", producer.replace("r7 = -0x8000000000000000 ll", "r7 = 0x0", 1)),
         ("ring-reservation loss counter", producer.replace("R_BPF_64_64\tCOUNTERS", "R_BPF_64_64\tNOT_COUNTERS", 1)),
+        ("ring-reservation loss increment", producer.replace("      12:\tr1 += 0x1", "      12:\tr1 += 0x0", 1)),
+        ("ring-reservation loss store", producer.replace("      13:\t*(u64 *)(r0 + 0x0) = r1", "      13:\tr2 = r1", 1)),
     ]:
         if producer_object_contract(mutation):
             raise AssertionError(f"mutation accepted: {label}")

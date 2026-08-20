@@ -65,6 +65,49 @@ fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<
         "missing descriptor count-only fallback",
     )?;
 
+    let primary_and_templates = contract_section(
+        ebpf,
+        "pub fn p11_entry(ctx: ProbeContext) -> u32 {",
+        "pub fn p11_entry_template_second",
+    )?;
+    for (marker, contract) in [
+        ("p11_entry_impl::<0>(ctx)", "p11_entry descriptor consumer"),
+        (
+            "p11_entry_impl::<1>(ctx)",
+            "p11_entry_template descriptor consumer",
+        ),
+        (
+            "p11_entry_impl::<2>(ctx)",
+            "p11_entry_template_types descriptor consumer",
+        ),
+        (
+            "p11_entry_impl::<3>(ctx)",
+            "p11_entry_template_pair descriptor consumer",
+        ),
+    ] {
+        require_contract_marker(primary_and_templates, marker, contract)?;
+    }
+
+    let template_second = contract_section(
+        ebpf,
+        "pub fn p11_entry_template_second(ctx: ProbeContext) -> u32 {",
+        "fn store_start",
+    )?;
+    for (marker, contract) in [
+        ("let slot = slot_of(&ctx);", "template-second low-word slot"),
+        (
+            "let key = StartKey {\n        pid_tgid: helpers::bpf_get_current_pid_tgid(),\n        slot,\n        _pad: 0,\n    };",
+            "template-second START slot",
+        ),
+        ("START.get_ptr_mut(&key)", "template-second START lookup"),
+        (
+            "let semantics = semantics_of(&ctx);",
+            "template-second descriptor consumer",
+        ),
+    ] {
+        require_contract_marker(template_second, marker, contract)?;
+    }
+
     let entry = contract_section(
         ebpf,
         "fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {",
@@ -76,6 +119,10 @@ fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<
         (
             "let key = StartKey { pid_tgid: helpers::bpf_get_current_pid_tgid(), slot, _pad: 0 };",
             "entry START slot",
+        ),
+        (
+            "let semantics = semantics_of(&ctx);",
+            "entry descriptor consumer",
         ),
     ] {
         require_contract_marker(entry, marker, contract)?;
@@ -105,6 +152,10 @@ fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<
             "return RV_COUNTS update",
         ),
         ("\n        slot,\n        target_function:", "Event.slot"),
+        (
+            "let semantics = semantics_of(&ctx);",
+            "return descriptor consumer",
+        ),
     ] {
         require_contract_marker(returned, marker, contract)?;
     }
@@ -564,6 +615,26 @@ fn descriptor_cookie_and_publication_source_guard_rejects_contract_regressions()
     assert!(
         assert_static_descriptor_cookie_contract(&attach, &no_count_only_fallback).is_err(),
         "a missing descriptor must remain count-only"
+    );
+
+    let template_second_high_word_slot = ebpf.replacen(
+        "let key = StartKey {\n        pid_tgid: helpers::bpf_get_current_pid_tgid(),\n        slot,\n        _pad: 0,\n    };\n    let Some(start) = START.get_ptr_mut(&key)",
+        "let key = StartKey {\n        pid_tgid: helpers::bpf_get_current_pid_tgid(),\n        slot: cookie_descriptor(cookie_of(&ctx)),\n        _pad: 0,\n    };\n    let Some(start) = START.get_ptr_mut(&key)",
+        1,
+    );
+    let bypassed_primary_semantics = ebpf.replacen(
+        "    let semantics = semantics_of(&ctx);\n    let mut start = CallStart {",
+        "    let semantics = SlotSemantics::COUNT_ONLY;\n    let mut start = CallStart {",
+        1,
+    );
+    assert_eq!(
+        [
+            assert_static_descriptor_cookie_contract(&attach, &template_second_high_word_slot)
+                .is_err(),
+            assert_static_descriptor_cookie_contract(&attach, &bypassed_primary_semantics).is_err(),
+        ],
+        [true, true],
+        "the template-tail slot and every descriptor consumer must use the shared cookie path"
     );
 
     let partial_descriptor_write = attach.replacen(

@@ -16,6 +16,135 @@ fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         .0
 }
 
+fn contract_section<'a>(source: &'a str, start: &str, end: &str) -> Result<&'a str, String> {
+    source
+        .split_once(start)
+        .ok_or_else(|| format!("missing contract section start: {start}"))?
+        .1
+        .split_once(end)
+        .map(|(section, _)| section)
+        .ok_or_else(|| format!("missing contract section end: {end}"))
+}
+
+fn require_contract_marker(section: &str, marker: &str, contract: &str) -> Result<(), String> {
+    if section.contains(marker) {
+        Ok(())
+    } else {
+        Err(format!("{contract} missing {marker:?}"))
+    }
+}
+
+fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<(), String> {
+    const COOKIE: &str = "cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),";
+
+    let return_attach =
+        contract_section(attach, "program_mut(\"p11_return\")", "let entry_programs")?;
+    require_contract_marker(return_attach, COOKIE, "p11_return attach cookie")?;
+
+    let entry_attach = contract_section(
+        attach,
+        "for prog_name in entry_programs {",
+        "\n\n        Ok(Self {",
+    )?;
+    require_contract_marker(entry_attach, COOKIE, "p11_entry attach cookie")?;
+
+    let cookie = contract_section(ebpf, "fn slot_of<C>", "/// Decode allowlisted")?;
+    require_contract_marker(
+        cookie,
+        "cookie_slot(cookie_of(ctx))",
+        "low cookie word slot decode",
+    )?;
+    require_contract_marker(
+        cookie,
+        "DESCRIPTORS\n        .get(cookie_descriptor(cookie_of(ctx)))",
+        "high cookie word descriptor lookup",
+    )?;
+    require_contract_marker(
+        cookie,
+        ".unwrap_or(SlotSemantics::COUNT_ONLY)",
+        "missing descriptor count-only fallback",
+    )?;
+
+    let entry = contract_section(
+        ebpf,
+        "fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {",
+        "#[uretprobe]",
+    )?;
+    for (marker, contract) in [
+        ("let slot = slot_of(&ctx);", "entry low-word slot"),
+        ("STATS.get_ptr_mut(slot)", "entry STATS slot"),
+        (
+            "let key = StartKey { pid_tgid: helpers::bpf_get_current_pid_tgid(), slot, _pad: 0 };",
+            "entry START slot",
+        ),
+    ] {
+        require_contract_marker(entry, marker, contract)?;
+    }
+
+    let returned = contract_section(
+        ebpf,
+        "pub fn p11_return(ctx: RetProbeContext) -> u32 {",
+        "#[tracepoint(category = \"sched\", name = \"sched_process_fork\")]",
+    )?;
+    for (marker, contract) in [
+        ("let slot = slot_of(&ctx);", "return low-word slot"),
+        (
+            "let key = StartKey { pid_tgid: helpers::bpf_get_current_pid_tgid(), slot, _pad: 0 };",
+            "return START slot",
+        ),
+        ("START.get(&key)", "return START lookup"),
+        ("START.remove(&key)", "return START removal"),
+        ("STATS.get_ptr_mut(slot)", "return STATS slot"),
+        (
+            "let rk = RvKey { slot, _pad: 0, rv };",
+            "return RV_COUNTS slot",
+        ),
+        ("RV_COUNTS.get(&rk)", "return RV_COUNTS lookup"),
+        (
+            "RV_COUNTS.insert(&rk, &(prev + 1), 0)",
+            "return RV_COUNTS update",
+        ),
+        ("\n        slot,\n        target_function:", "Event.slot"),
+    ] {
+        require_contract_marker(returned, marker, contract)?;
+    }
+    Ok(())
+}
+
+fn assert_descriptor_publication_contract(attach: &str) -> Result<(), String> {
+    let publication =
+        contract_section(attach, "fn publish_descriptors", "fn publish_async_catalog")?;
+    for (marker, contract) in [
+        (
+            "let expected = crate::kinds::DESCRIPTORS.to_vec();",
+            "fixed descriptor inventory",
+        ),
+        (
+            "for (index, value) in expected.iter().copied().enumerate() {",
+            "complete descriptor write loop",
+        ),
+        (
+            "semantics.set(index as u32, value, 0)?;",
+            "descriptor map write",
+        ),
+        (
+            "let actual = semantics.iter().collect::<Result<Vec<_>, _>>()?;",
+            "complete descriptor readback",
+        ),
+        (
+            "if actual != expected {",
+            "exact descriptor readback comparison",
+        ),
+        (
+            "bail!(\"DESCRIPTORS exact readback differs from the fixed inventory\");",
+            "inexact descriptor readback refusal",
+        ),
+    ] {
+        require_contract_marker(publication, marker, contract)?;
+    }
+    Ok(())
+}
+
 fn canary_literals(source: &str) -> std::collections::BTreeSet<String> {
     source
         .split('"')
@@ -403,6 +532,58 @@ fn immutable_policy_maps() {
 }
 
 #[test]
+fn descriptor_cookie_and_publication_source_guard_rejects_contract_regressions() {
+    let attach = read("src/attach.rs");
+    let ebpf = read("crates/ebpf/src/main.rs");
+
+    assert_static_descriptor_cookie_contract(&attach, &ebpf).unwrap();
+    assert_descriptor_publication_contract(&attach).unwrap();
+
+    let dropped_return_descriptor = attach.replacen(
+        "cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),",
+        "cookie: Some(attach_cookie(slot.index, 0)),",
+        1,
+    );
+    assert!(
+        assert_static_descriptor_cookie_contract(&dropped_return_descriptor, &ebpf).is_err(),
+        "the return attach site must carry the descriptor word"
+    );
+
+    let high_word_stats = ebpf.replacen(
+        "if let Some(stats) = STATS.get_ptr_mut(slot) {",
+        "if let Some(stats) = STATS.get_ptr_mut(cookie_descriptor(cookie_of(&ctx))) {",
+        1,
+    );
+    assert!(
+        assert_static_descriptor_cookie_contract(&attach, &high_word_stats).is_err(),
+        "a slot consumer must not use the descriptor word"
+    );
+
+    let no_count_only_fallback =
+        ebpf.replacen(".unwrap_or(SlotSemantics::COUNT_ONLY)", ".unwrap()", 1);
+    assert!(
+        assert_static_descriptor_cookie_contract(&attach, &no_count_only_fallback).is_err(),
+        "a missing descriptor must remain count-only"
+    );
+
+    let partial_descriptor_write = attach.replacen(
+        "expected.iter().copied().enumerate()",
+        "expected.iter().copied().take(1).enumerate()",
+        1,
+    );
+    assert!(
+        assert_descriptor_publication_contract(&partial_descriptor_write).is_err(),
+        "publication must write every fixed descriptor"
+    );
+
+    let changed_readback_refusal = attach.replacen("if actual != expected {", "if false {", 1);
+    assert!(
+        assert_descriptor_publication_contract(&changed_readback_refusal).is_err(),
+        "publication must refuse an inexact descriptor readback"
+    );
+}
+
+#[test]
 fn descriptors_are_published_read_back_and_frozen_before_probe_attachment() {
     let source = read("src/attach.rs");
     let publish = source
@@ -417,10 +598,7 @@ fn descriptors_are_published_read_back_and_frozen_before_probe_attachment() {
     let uprobe_attach = source
         .find("prog.attach(point")
         .expect("Session must attach uprobes");
-    let publication = &source[source.find("fn publish_descriptors").unwrap()
-        ..source.find("fn publish_async_catalog").unwrap()];
-
-    assert!(publication.contains("let actual = semantics.iter()"));
+    assert_descriptor_publication_contract(&source).unwrap();
     assert!(publish < descriptor_freeze);
     assert!(descriptor_freeze < fork_attach);
     assert!(descriptor_freeze < uprobe_attach);

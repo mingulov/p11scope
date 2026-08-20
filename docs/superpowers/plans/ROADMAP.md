@@ -430,7 +430,17 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     KVM access disappeared before Noble booted, so Noble and all Gate B lanes
     are UNRUN. No replacement was made and Task 5 remains locked. A new complete
     campaign requires stable real `kvm` group membership and fresh owner
-    approval.
+    approval. **Stable-group rerun (2026-08-20):** the approved replacement
+    campaign completed all eight KVM lanes on one frozen identity. Gate A
+    passed on both kernels; Gate B was Jammy FAIL/PASS/PASS and Noble
+    FAIL/FAIL/FAIL, retaining 58 positive rows and four canonical Outcome-B
+    oracle negatives. Each negative fails only the strict comparison between
+    the prior cycle's post-syscall `resume_completed_ns` sample and the resumed
+    child's earlier hook timestamp (18–74 us), while successor consumption and
+    every stopped-set/attach/drain/resume/marker/cleanup predicate pass.
+    Independent review classifies this as an oracle/proof timestamp defect,
+    not an observed unsafe pause, but the campaign remains NON-PASS and Task 5
+    stays locked pending a reviewed correction and a new qualifying campaign.
     Product implementation remains OPEN and starts only after Slice 1b-1
     lands. See the
     [pause amendment](../specs/2026-08-19-slice1b2-no-busy-wait-pause-amendment.md).**

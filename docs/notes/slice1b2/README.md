@@ -300,3 +300,30 @@ The final `7cfda3d` correction validates the x86-64 runtime-IP fallback on
 5.15 without accepting arbitrary hook addresses. The re-frozen `a227dab`
 loader bundle then passed Jammy and Noble, including the no-cookie negative;
 those final results and hashes are in the handoff at the top of this file.
+
+## Stable-group amended Gate A/B campaign (2026-08-20)
+
+The owner-approved no-replacement KVM campaign is sealed at
+`/home/user/src/m/p11scope-ws/incoming/slice1b2-task2-rerun-3f25771.4Si1QPK5`.
+It used one frozen identity (source `3f257716`, BPF `53b168f9`, runner
+`c5855403`, fixture `a07b3469`) on Jammy 5.15 and Noble 6.8. Both Gate A
+lanes passed with all four programs accepted and all five cases passing.
+
+Gate B completed all six predeclared cold boots without replacement: Jammy
+returned FAIL/PASS/PASS and Noble returned FAIL/FAIL/FAIL. The six exports
+retain 62 children, of which 58 are positive; the four canonical Outcome-B
+oracle negatives occur at Jammy-1 run 2, Noble-1 run 1, Noble-2 run 3, and
+Noble-3 run 16. They fail
+only the strict relation `cycle1.resume_completed_ns < cycle2.hook_ts_ns`:
+the successor hook precedes the observer's post-`pidfd_send_signal` clock
+sample by 18–74 us, while successor dequeue/acceptance occurs after the
+successful resume and every stopped-set, attach, drain, marker, cleanup,
+exit/reap, and empty-START predicate holds. Independent review therefore
+classifies this as an oracle/proof timestamp defect, not an observed unsafe
+pause or environment failure; the frozen rows remain canonical FAIL.
+
+The self-excluding evidence ledger (`75dea80c…`) verifies all 878 entries;
+the post-review handoff is `221dc0ed…`. Campaign verdict is **NON-PASS** and
+Task 5 remains locked. A correction must prove successful prior resume before
+successor consumption without requiring the earlier BPF hook timestamp to
+follow a later userspace clock sample, then receive review and a new campaign.

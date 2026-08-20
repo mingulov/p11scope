@@ -21,13 +21,13 @@ fn pid_tid(pid_tgid: u64) -> (u32, u32) {
     ((pid_tgid >> 32) as u32, pid_tgid as u32)
 }
 
-/// Function name(s) at a slot, from the attach plan — the same grouping
-/// `render::label` uses for aliased slots, joined the same way.
-fn function_name(plan: &AttachPlan, slot: u32) -> String {
-    plan.slots
-        .iter()
-        .find(|s| s.index == slot)
-        .map(|s| s.names.join("|"))
+/// Function name(s) at a slot, from the current plan snapshot — the same
+/// grouping `render::label` uses for aliased slots, joined the same way.
+fn function_name(slots: &[Option<TraceSlot>], slot: u32) -> String {
+    slots
+        .get(slot as usize)
+        .and_then(Option::as_ref)
+        .map(|slot| slot.names.join("|"))
         .unwrap_or_else(|| format!("slot#{slot}"))
 }
 
@@ -200,8 +200,33 @@ pub fn evidence_line(ev: &render::Evidence, policy: CapturePolicy) -> String {
 /// anchor (kernel timestamps are boot-relative monotonic, not epoch —
 /// see `p11scope_ebpf_common::Event::ts_ns`) and the session-pseudonym
 /// lookup, which `semantics::State` owns.
-pub struct Tracer<'a> {
-    plan: &'a AttachPlan,
+#[derive(Clone)]
+struct TraceSlot {
+    names: Vec<String>,
+    semantics: p11scope_ebpf_common::SlotSemantics,
+    semantic_authorized: bool,
+}
+
+fn trace_slots(plan: &AttachPlan) -> Vec<Option<TraceSlot>> {
+    let mut slots = Vec::new();
+    for slot in &plan.slots {
+        let index = slot.index as usize;
+        if index >= slots.len() {
+            slots.resize_with(index + 1, || None);
+        }
+        if plan.is_active(slot.index) {
+            slots[index] = Some(TraceSlot {
+                names: slot.names.clone(),
+                semantics: slot.semantics,
+                semantic_authorized: slot.semantic_authorized,
+            });
+        }
+    }
+    slots
+}
+
+pub struct Tracer {
+    slots: Vec<Option<TraceSlot>>,
     /// (first observed event's kernel monotonic ts_ns, wall-clock ns at
     /// that same moment) — every later line's wall time is this anchor
     /// plus the kernel-monotonic delta, so line-to-line spacing tracks
@@ -210,9 +235,18 @@ pub struct Tracer<'a> {
     anchor: Option<(u64, u128)>,
 }
 
-impl<'a> Tracer<'a> {
-    pub fn new(plan: &'a AttachPlan) -> Self {
-        Self { plan, anchor: None }
+impl Tracer {
+    pub fn new(plan: &AttachPlan) -> Self {
+        Self {
+            slots: trace_slots(plan),
+            anchor: None,
+        }
+    }
+
+    /// Replaces the minimal display metadata from the same plan snapshot that
+    /// updates semantic state; no immutable plan borrow survives a live sync.
+    pub fn sync_plan(&mut self, plan: &AttachPlan) {
+        self.slots = trace_slots(plan);
     }
 
     fn wall_ns_for(&mut self, ts_ns: u64) -> u128 {
@@ -245,8 +279,13 @@ impl<'a> Tracer<'a> {
         process: ProcessKey,
         state: &mut State,
     ) -> String {
-        let slot = self.plan.slots.iter().find(|slot| slot.index == ev.slot);
+        let slot = self
+            .slots
+            .get(ev.slot as usize)
+            .and_then(Option::as_ref)
+            .cloned();
         let semantic = slot
+            .as_ref()
             .is_some_and(|slot| slot.semantics != p11scope_ebpf_common::SlotSemantics::COUNT_ONLY);
         let pre = (semantic && ev.session != SESSION_NONE)
             .then(|| state.session_pseudonym_process(process, ev.slot, ev.session))
@@ -258,8 +297,8 @@ impl<'a> Tracer<'a> {
                 .flatten()
         });
         let wall_ns = self.wall_ns_for(ev.ts_ns);
-        let mut function = function_name(self.plan, ev.slot);
-        if slot.is_some_and(|slot| !slot.semantic_authorized) {
+        let mut function = function_name(&self.slots, ev.slot);
+        if slot.as_ref().is_some_and(|slot| !slot.semantic_authorized) {
             function.push_str(" [semantics unverified]");
         }
         let mut rendered = *ev;
@@ -477,46 +516,38 @@ mod tests {
     }
 
     fn test_plan() -> AttachPlan {
-        AttachPlan {
-            slots: vec![
-                crate::plan::Slot {
-                    index: 0,
-                    descriptor_index: crate::kinds::function_id("C_OpenSession").unwrap() + 1,
-                    object: crate::plan::TEST_PINNED_OBJECT,
-                    object_path: "/opt/p11.so".into(),
-                    file_offset: 0x10,
-                    names: vec!["C_OpenSession".into()],
-                    aliased: false,
-                    semantics: crate::kinds::descriptor("C_OpenSession").unwrap(),
-                    semantic_authorized: true,
-                    semantic_ambiguous: false,
-                    fork_safe: false,
-                    module_ids: vec![crate::plan::ModuleId(0)],
-                },
-                crate::plan::Slot {
-                    index: 1,
-                    descriptor_index: crate::kinds::function_id("C_CloseSession").unwrap() + 1,
-                    object: crate::plan::TEST_PINNED_OBJECT,
-                    object_path: "/opt/p11.so".into(),
-                    file_offset: 0x20,
-                    names: vec!["C_CloseSession".into()],
-                    aliased: false,
-                    semantics: crate::kinds::descriptor("C_CloseSession").unwrap(),
-                    semantic_authorized: true,
-                    semantic_ambiguous: false,
-                    fork_safe: false,
-                    module_ids: vec![crate::plan::ModuleId(0)],
-                },
-            ],
-            modules: vec![],
-            skipped: vec![],
-            modules_skipped: vec![],
-            entries_seen: 2,
-            surfaces: vec![],
-            vendor_interfaces: 0,
-            interface_list: "absent".into(),
-            module_ambiguous: 0,
-        }
+        let mut plan = AttachPlan::from_slots(vec![
+            crate::plan::Slot {
+                index: 0,
+                descriptor_index: crate::kinds::function_id("C_OpenSession").unwrap() + 1,
+                object: crate::plan::TEST_PINNED_OBJECT,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x10,
+                names: vec!["C_OpenSession".into()],
+                aliased: false,
+                semantics: crate::kinds::descriptor("C_OpenSession").unwrap(),
+                semantic_authorized: true,
+                semantic_ambiguous: false,
+                fork_safe: false,
+                module_ids: vec![crate::plan::ModuleId(0)],
+            },
+            crate::plan::Slot {
+                index: 1,
+                descriptor_index: crate::kinds::function_id("C_CloseSession").unwrap() + 1,
+                object: crate::plan::TEST_PINNED_OBJECT,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x20,
+                names: vec!["C_CloseSession".into()],
+                aliased: false,
+                semantics: crate::kinds::descriptor("C_CloseSession").unwrap(),
+                semantic_authorized: true,
+                semantic_ambiguous: false,
+                fork_safe: false,
+                module_ids: vec![crate::plan::ModuleId(0)],
+            },
+        ]);
+        plan.entries_seen = 2;
+        plan
     }
 
     fn open_event(pid: u32, session: u64) -> Event {
@@ -628,5 +659,38 @@ mod tests {
             first_ts, second_ts,
             "distinct kernel timestamps must render distinct wall times"
         );
+    }
+
+    #[test]
+    fn sync_plan_resolves_new_slots_and_keeps_unknown_slots_count_only() {
+        let mut plan = test_plan();
+        let mut state = State::new(&plan);
+        let mut tracer = Tracer::new(&plan);
+        tracer.anchor = Some((0, 0));
+
+        let mut added = plan.slots[0].clone();
+        added.index = 2;
+        added.names = vec!["C_Sign".into()];
+        added.descriptor_index = crate::kinds::function_id("C_Sign").unwrap() + 1;
+        added.semantics = crate::kinds::descriptor("C_Sign").unwrap();
+        plan.slots.push(added);
+        tracer.sync_plan(&plan);
+        state.sync_plan(&plan);
+
+        let mut dynamic = open_event(100, 7);
+        dynamic.slot = 2;
+        dynamic.capture = capture::MECHANISM_VALUE;
+        dynamic.mechanism = pkcs11_proxy_ng_types::CkMechanismType::AES_GCM.0;
+        let dynamic_line = tracer.on_event(&dynamic, &mut state);
+        assert!(
+            dynamic_line.contains(" C_Sign CKM_AES_GCM"),
+            "{dynamic_line}"
+        );
+
+        let mut unknown = dynamic;
+        unknown.slot = 99;
+        let unknown_line = tracer.on_event(&unknown, &mut state);
+        assert!(unknown_line.contains(" slot#99 →"), "{unknown_line}");
+        assert!(!unknown_line.contains("CKM_"), "{unknown_line}");
     }
 }

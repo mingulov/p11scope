@@ -66,8 +66,8 @@ mod corrective_tests {
     }
 
     fn plan_with_fork(names: &[&str], fork_safe: bool) -> AttachPlan {
-        AttachPlan {
-            slots: names
+        let mut plan = AttachPlan::from_slots(
+            names
                 .iter()
                 .enumerate()
                 .map(|(index, name)| Slot {
@@ -85,15 +85,9 @@ mod corrective_tests {
                     module_ids: vec![crate::plan::ModuleId(0)],
                 })
                 .collect(),
-            modules: vec![],
-            skipped: vec![],
-            modules_skipped: vec![],
-            entries_seen: names.len(),
-            surfaces: vec![],
-            vendor_interfaces: 0,
-            interface_list: "absent".into(),
-            module_ambiguous: 0,
-        }
+        );
+        plan.entries_seen = names.len();
+        plan
     }
 
     fn event(plan: &AttachPlan, name: &str, session: u64, rv: u64) -> Event {
@@ -1008,6 +1002,7 @@ struct SlotMeta {
     function_id: Option<u32>,
     fork_safe: bool,
     module: ModuleId,
+    module_ids: Vec<ModuleId>,
 }
 
 impl SlotMeta {
@@ -1240,6 +1235,42 @@ pub struct State {
     state_keys: usize,
 }
 
+fn slot_metadata(plan: &AttachPlan) -> Vec<Option<SlotMeta>> {
+    let mut slots = Vec::new();
+    for slot in &plan.slots {
+        let index = slot.index as usize;
+        if index >= slots.len() {
+            slots.resize_with(index + 1, || None);
+        }
+        if !plan.is_active(slot.index) {
+            continue;
+        }
+        slots[index] = Some(SlotMeta {
+            names: slot.names.clone(),
+            aliased: slot.aliased,
+            semantics: slot.semantics,
+            function_id: (slot.names.len() == 1)
+                .then(|| crate::kinds::function_id(&slot.names[0]))
+                .flatten(),
+            fork_safe: slot.fork_safe,
+            module: plan.module_of_slot(slot.index).unwrap_or(MODULE_UNRESOLVED),
+            module_ids: slot.module_ids.clone(),
+        });
+    }
+    slots
+}
+
+fn slot_semantics_changed(previous: &SlotMeta, next: Option<&SlotMeta>) -> bool {
+    let Some(next) = next else {
+        return true;
+    };
+    previous.semantics != next.semantics
+        || previous.function_id != next.function_id
+        || previous.fork_safe != next.fork_safe
+        || previous.module != next.module
+        || previous.module_ids != next.module_ids
+}
+
 impl State {
     pub fn new(plan: &AttachPlan) -> Self {
         Self::with_policy(plan, CapturePolicy::Allowlisted)
@@ -1255,26 +1286,9 @@ impl State {
     }
 
     fn with_key_limit(plan: &AttachPlan, policy: CapturePolicy, state_key_limit: usize) -> Self {
-        let mut slots = Vec::new();
-        for slot in &plan.slots {
-            let index = slot.index as usize;
-            if index >= slots.len() {
-                slots.resize_with(index + 1, || None);
-            }
-            slots[index] = Some(SlotMeta {
-                names: slot.names.clone(),
-                aliased: slot.aliased,
-                semantics: slot.semantics,
-                function_id: (slot.names.len() == 1)
-                    .then(|| crate::kinds::function_id(&slot.names[0]))
-                    .flatten(),
-                fork_safe: slot.fork_safe,
-                module: plan.module_of_slot(slot.index).unwrap_or(MODULE_UNRESOLVED),
-            });
-        }
         Self {
             policy,
-            slots,
+            slots: slot_metadata(plan),
             current_process: BTreeMap::new(),
             next_pseudonym: BTreeMap::new(),
             open: BTreeMap::new(),
@@ -1296,6 +1310,61 @@ impl State {
             state_key_limit,
             state_keys: 0,
         }
+    }
+
+    /// Replaces the plan snapshot used for future events. A descriptor or
+    /// ownership change invalidates any semantic state that the old slot may
+    /// have produced, so it is purged before this method returns.
+    pub fn sync_plan(&mut self, plan: &AttachPlan) {
+        let slots = slot_metadata(plan);
+        let mut affected = BTreeSet::new();
+        for (index, previous) in self.slots.iter().enumerate() {
+            let Some(previous) = previous else {
+                continue;
+            };
+            let next = slots.get(index).and_then(Option::as_ref);
+            if slot_semantics_changed(previous, next) {
+                affected.extend(previous.module_ids.iter().copied());
+                if let Some(next) = next {
+                    affected.extend(next.module_ids.iter().copied());
+                }
+            }
+        }
+        self.slots = slots;
+        self.purge_modules(&affected);
+    }
+
+    /// Removes state attached to the listed modules across every observed
+    /// process without manufacturing close/reconciliation events. The derived
+    /// semantic aggregates are intentionally cleared too: they lack a module
+    /// dimension, so retaining them could preserve facts from a downgraded
+    /// descriptor. Kernel aggregate counters remain in their BPF maps.
+    pub fn purge_modules(&mut self, modules: &BTreeSet<ModuleId>) {
+        if modules.is_empty() {
+            return;
+        }
+        self.evidence.state_reconciliations += 1;
+        let mut processes = BTreeSet::new();
+        processes.extend(self.current_process.values().copied());
+        processes.extend(self.next_pseudonym.keys().copied());
+        processes.extend(self.open.keys().map(|(process, _)| *process));
+        processes.extend(self.active_ops.keys().map(|(process, _, _)| *process));
+        processes.extend(self.find_active.iter().map(|(process, _)| *process));
+        processes.extend(self.inherited_ambiguous.iter().map(|(process, _)| *process));
+        processes.extend(self.pending.keys().map(|(process, _, _)| *process));
+        processes.extend(self.detached.values().map(|detached| detached.process));
+        for process in processes {
+            for module in modules {
+                self.clear_scope(process, Some(*module), false);
+            }
+        }
+        self.mechanisms.clear();
+        self.templates.clear();
+        self.logins.clear();
+        self.cgroups.clear();
+        self.sessions = SessionStats::default();
+        self.orphan_ops = 0;
+        self.unmatched_closes = 0;
     }
 
     // ponytail: admissions are a monotonic per-capture budget. Replace with
@@ -2031,7 +2100,12 @@ impl State {
     /// Returns whether *this scope* held any state before the sweep, so a
     /// module-scoped call cannot report a reconciliation on the strength of
     /// another module's live state.
-    fn retire_scope(&mut self, process: ProcessKey, module: Option<ModuleId>) -> u64 {
+    fn clear_scope(
+        &mut self,
+        process: ProcessKey,
+        module: Option<ModuleId>,
+        count_closed: bool,
+    ) -> u64 {
         let had_state = self.has_scope_state(process, module);
         let owned = scoped(process, module);
         let sessions: Vec<SessionRef> = self
@@ -2041,7 +2115,11 @@ impl State {
             .map(|(_, session)| *session)
             .collect();
         for session in &sessions {
-            self.retire_session(process, *session);
+            let existed = self.open.remove(&(process, *session)).is_some();
+            self.clear_session_state(process, *session);
+            if existed && count_closed {
+                self.sessions.closed += 1;
+            }
         }
         // Sessions the capture never saw opening leave state behind that no
         // `retire_session` above could have reached.
@@ -2070,6 +2148,10 @@ impl State {
             }
         }
         u64::from(had_state)
+    }
+
+    fn retire_scope(&mut self, process: ProcessKey, module: Option<ModuleId>) -> u64 {
+        self.clear_scope(process, module, true)
     }
 
     pub fn fork_process(&mut self, parent: ProcessKey, child: ProcessKey) {
@@ -2385,25 +2467,17 @@ mod tests {
     // 3 C_Sign          4 C_SignFinal      5 C_Login
     // 6 C_FindObjectsInit (template)
     fn test_plan() -> AttachPlan {
-        AttachPlan {
-            slots: vec![
-                slot(0, &["C_OpenSession"], fnkind::OPEN_SESSION),
-                slot(1, &["C_CloseSession"], fnkind::SESSION_ARG0),
-                slot(2, &["C_SignInit"], fnkind::INIT_WITH_MECH),
-                slot(3, &["C_Sign"], fnkind::SESSION_ARG0),
-                slot(4, &["C_SignFinal"], fnkind::SESSION_ARG0),
-                slot(5, &["C_Login"], fnkind::LOGIN),
-                slot(6, &["C_FindObjectsInit"], fnkind::TEMPLATE_ARG1),
-            ],
-            modules: vec![],
-            skipped: vec![],
-            modules_skipped: vec![],
-            entries_seen: 7,
-            surfaces: vec![],
-            vendor_interfaces: 0,
-            interface_list: "absent".into(),
-            module_ambiguous: 0,
-        }
+        let mut plan = AttachPlan::from_slots(vec![
+            slot(0, &["C_OpenSession"], fnkind::OPEN_SESSION),
+            slot(1, &["C_CloseSession"], fnkind::SESSION_ARG0),
+            slot(2, &["C_SignInit"], fnkind::INIT_WITH_MECH),
+            slot(3, &["C_Sign"], fnkind::SESSION_ARG0),
+            slot(4, &["C_SignFinal"], fnkind::SESSION_ARG0),
+            slot(5, &["C_Login"], fnkind::LOGIN),
+            slot(6, &["C_FindObjectsInit"], fnkind::TEMPLATE_ARG1),
+        ]);
+        plan.entries_seen = 7;
+        plan
     }
 
     #[test]
@@ -3018,5 +3092,51 @@ mod tests {
             "the init call and the following op both attributed"
         );
         assert_eq!(m.errors, 0);
+    }
+
+    #[test]
+    fn sync_plan_purges_every_process_for_a_slot_downgraded_to_count_only() {
+        let mut plan = test_plan();
+        plan.slots[1].module_ids = vec![ModuleId(1)];
+        let mut state = State::new(&plan);
+        let first = ProcessKey::from_pid(100);
+        let second = ProcessKey::from_pid(200);
+        state.observe_process(first, &ev(100, 0, fnkind::OPEN_SESSION, 1, MECH_NONE, 0, 1));
+        state.observe_process(
+            second,
+            &ev(200, 0, fnkind::OPEN_SESSION, 2, MECH_NONE, 0, 1),
+        );
+        let second_module_session = SessionRef {
+            module: ModuleId(1),
+            handle: 9,
+        };
+        state.open.insert(
+            (second, second_module_session),
+            SessionInfo {
+                pseudonym: 1,
+                slot: 1,
+                fork_safe: false,
+            },
+        );
+        assert!(state.has_process_state(first));
+        assert!(state.has_process_state(second));
+
+        plan.slots[0].descriptor_index = 0;
+        plan.slots[0].semantics = p11scope_ebpf_common::SlotSemantics::COUNT_ONLY;
+        plan.slots[0].semantic_authorized = false;
+        plan.slots[0].semantic_ambiguous = true;
+        plan.slots[0].module_ids = vec![ModuleId(0), ModuleId(1)];
+        state.sync_plan(&plan);
+
+        assert!(!state.has_process_state(first));
+        assert!(!state.has_process_state(second));
+        assert!(
+            !state.open.contains_key(&(second, second_module_session)),
+            "a newly ambiguous co-owner's prior process state is purged too"
+        );
+        assert!(state.mechanisms().is_empty());
+        assert!(state.templates().is_empty());
+        assert!(state.logins().is_empty());
+        assert_eq!(state.semantic_evidence().state_reconciliations, 1);
     }
 }

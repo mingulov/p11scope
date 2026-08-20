@@ -2213,8 +2213,9 @@ fn capture_profile(
         std::thread::sleep(Duration::from_secs(1));
     }
 
-    session.detach_producers()?;
-    pinned.check_unchanged().map_err(anyhow::Error::msg)?;
+    let detach = session.detach_producers();
+    // A detach error is retained until after this terminal drain. Do not put a
+    // fallible provider check between those two operations.
     if profile {
         malformed_records += drain_events(&mut session, &mut state, &mut process_tracker)?;
     }
@@ -2271,6 +2272,7 @@ fn capture_profile(
         out_file.commit().map_err(anyhow::Error::msg)?;
     }
 
+    detach?;
     drop(session);
     Ok(())
 }
@@ -2383,7 +2385,7 @@ fn capture_trace(
         std::thread::sleep(Duration::from_millis(200));
     }
 
-    session.detach_producers()?;
+    let detach = session.detach_producers();
     // Drain everything currently visible after detach, then report the closing
     // loss line. Kernel detach does not wait for callbacks already executing
     // on another CPU, so terminal evidence below remains explicitly PARTIAL.
@@ -2436,6 +2438,7 @@ fn capture_trace(
         f.flush().context("flushing trace output file")?;
     }
 
+    detach?;
     drop(session);
     Ok(())
 }
@@ -2489,7 +2492,7 @@ fn drain_trace_events<W: Write>(
     session: &mut Session,
     state: &mut semantics::State,
     tracker: &mut process::Tracker,
-    tracer: &mut trace::Tracer<'_>,
+    tracer: &mut trace::Tracer,
     stdout: &mut dyn Write,
     stdout_open: &mut bool,
     out_file: &mut Option<W>,
@@ -4141,17 +4144,7 @@ mod tests {
 
     #[test]
     fn fork_only_traffic_does_not_consume_process_tracking_budget() {
-        let plan = plan::AttachPlan {
-            slots: vec![],
-            modules: vec![],
-            skipped: vec![],
-            modules_skipped: vec![],
-            entries_seen: 0,
-            surfaces: vec![],
-            vendor_interfaces: 0,
-            interface_list: "absent".into(),
-            module_ambiguous: 0,
-        };
+        let plan = plan::AttachPlan::from_slots(vec![]);
         let mut state = semantics::State::new(&plan);
         let mut tracker = process::Tracker::with_limits(0, 1);
         for parent in 100_000..100_100u32 {
@@ -4544,8 +4537,8 @@ mod tests {
     }
 
     fn plan_with(slots: usize, refused: usize) -> plan::AttachPlan {
-        plan::AttachPlan {
-            slots: (0..slots)
+        let mut plan = plan::AttachPlan::from_slots(
+            (0..slots)
                 .map(|index| plan::Slot {
                     index: index as u32,
                     descriptor_index: 0,
@@ -4561,33 +4554,29 @@ mod tests {
                     module_ids: vec![plan::ModuleId(0)],
                 })
                 .collect(),
-            modules: vec![plan::ModuleSummary {
-                id: plan::ModuleId(0),
-                object: PinnedObjectId(42),
-                key: ObjectKey {
-                    device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
-                    inode: 42,
-                },
-                path: "/opt/p11.so".into(),
-                tables: vec![],
-                interfaces: 0,
-                source: "scan",
-                corroborated: false,
-                skipped: vec![],
-            }],
+        );
+        plan.modules = vec![plan::ModuleSummary {
+            id: plan::ModuleId(0),
+            object: PinnedObjectId(42),
+            key: ObjectKey {
+                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                inode: 42,
+            },
+            path: "/opt/p11.so".into(),
+            tables: vec![],
+            interfaces: 0,
+            source: "scan",
+            corroborated: false,
             skipped: vec![],
-            modules_skipped: (0..refused)
-                .map(|i| Skipped {
-                    subject: format!("/opt/big{i}.so"),
-                    reason: "module needs 600 more of the 512 attach slots".into(),
-                })
-                .collect(),
-            entries_seen: slots,
-            surfaces: vec![],
-            vendor_interfaces: 0,
-            interface_list: "absent".into(),
-            module_ambiguous: 0,
-        }
+        }];
+        plan.modules_skipped = (0..refused)
+            .map(|i| Skipped {
+                subject: format!("/opt/big{i}.so"),
+                reason: "module needs 600 more of the 512 attach slots".into(),
+            })
+            .collect();
+        plan.entries_seen = slots;
+        plan
     }
 
     fn plan_with_pins(slots: usize, refused: usize) -> (plan::AttachPlan, PinnedObjects) {

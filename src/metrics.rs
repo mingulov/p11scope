@@ -37,6 +37,28 @@ pub struct SlotReport {
     pub rv_counts: BTreeMap<u64, u64>,
 }
 
+fn slot_report(
+    plan: &AttachPlan,
+    slot: &crate::plan::Slot,
+    acc: SlotStats,
+    rv_counts: BTreeMap<u64, u64>,
+) -> SlotReport {
+    SlotReport {
+        names: slot.names.clone(),
+        aliased: slot.aliased,
+        semantic_authorized: slot.semantic_authorized,
+        module: plan.module_of_slot(slot.index),
+        module_ambiguous: slot.module_ids.len() >= 2,
+        calls: acc.returned,
+        errors: acc.errors,
+        in_flight: acc.entered.saturating_sub(acc.returned),
+        total_ns: acc.total_ns,
+        max_ns: acc.max_ns,
+        buckets: acc.buckets,
+        rv_counts,
+    }
+}
+
 pub fn read(session: &Session, plan: &AttachPlan) -> Result<Vec<SlotReport>> {
     let stats: PerCpuArray<_, SlotStats> =
         PerCpuArray::try_from(session.ebpf.map("STATS").context("STATS map")?)?;
@@ -70,20 +92,12 @@ pub fn read(session: &Session, plan: &AttachPlan) -> Result<Vec<SlotReport>> {
                 acc.buckets[i] += b;
             }
         }
-        out.push(SlotReport {
-            names: slot.names.clone(),
-            aliased: slot.aliased,
-            semantic_authorized: slot.semantic_authorized,
-            module: plan.module_of_slot(slot.index),
-            module_ambiguous: slot.module_ids.len() >= 2,
-            calls: acc.returned,
-            errors: acc.errors,
-            in_flight: acc.entered.saturating_sub(acc.returned),
-            total_ns: acc.total_ns,
-            max_ns: acc.max_ns,
-            buckets: acc.buckets,
-            rv_counts: rv_by_slot.remove(&slot.index).unwrap_or_default(),
-        });
+        out.push(slot_report(
+            plan,
+            slot,
+            acc,
+            rv_by_slot.remove(&slot.index).unwrap_or_default(),
+        ));
     }
     Ok(out)
 }
@@ -148,6 +162,24 @@ mod tests {
     use super::*;
     use p11scope_ebpf_common::bucket_of;
 
+    fn slot(index: u32, name: &str) -> crate::plan::Slot {
+        let descriptor_index = crate::kinds::function_id(name).unwrap() + 1;
+        crate::plan::Slot {
+            index,
+            descriptor_index,
+            object: crate::plan::TEST_PINNED_OBJECT,
+            object_path: "/proc/self/fd/42".into(),
+            file_offset: 0x10 + u64::from(index) * 8,
+            names: vec![name.into()],
+            aliased: false,
+            semantics: crate::kinds::DESCRIPTORS[descriptor_index as usize],
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![],
+        }
+    }
+
     #[test]
     fn percentiles_come_from_bucket_lower_bounds() {
         let mut b = [0u64; LATENCY_BUCKETS];
@@ -168,5 +200,35 @@ mod tests {
     fn empty_buckets_have_no_percentile() {
         let b = [0u64; LATENCY_BUCKETS];
         assert_eq!(percentile_ns(&b, 0.5), None);
+    }
+
+    #[test]
+    fn slot_reports_use_new_plan_slots_without_a_second_lookup_table() {
+        let mut plan = AttachPlan::from_slots(vec![slot(0, "C_OpenSession")]);
+        let delta = plan
+            .extend_exact(AttachPlan::from_slots(vec![
+                slot(0, "C_OpenSession"),
+                slot(1, "C_Sign"),
+            ]))
+            .unwrap();
+        assert_eq!(delta.new[0].index, 1);
+        let report = slot_report(
+            &plan,
+            &plan.slots[1],
+            SlotStats {
+                returned: 3,
+                ..SlotStats::ZERO
+            },
+            BTreeMap::new(),
+        );
+
+        assert_eq!(report.names, ["C_Sign"]);
+        assert_eq!(report.calls, 3);
+        assert_eq!(report.module, None);
+        assert_eq!(
+            plan.module_of_slot(99),
+            None,
+            "unknown slots are unattributed"
+        );
     }
 }

@@ -2090,17 +2090,7 @@ mod tests {
     }
 
     fn empty_plan() -> crate::plan::AttachPlan {
-        crate::plan::AttachPlan {
-            slots: vec![],
-            modules: vec![],
-            skipped: vec![],
-            modules_skipped: vec![],
-            entries_seen: 0,
-            surfaces: vec![],
-            vendor_interfaces: 0,
-            interface_list: "absent".into(),
-            module_ambiguous: 0,
-        }
+        crate::plan::AttachPlan::from_slots(vec![])
     }
 
     #[test]
@@ -2193,23 +2183,20 @@ mod tests {
     fn profile_json_mechanisms_carry_verbatim_id_hex_ops_and_null_params() {
         use p11scope_ebpf_common::{Event, USER_TYPE_NONE};
 
-        let plan = crate::plan::AttachPlan {
-            slots: vec![crate::plan::Slot {
-                index: 0,
-                descriptor_index: crate::kinds::function_id("C_SignInit").unwrap() + 1,
-                object: crate::plan::TEST_PINNED_OBJECT,
-                object_path: "/opt/p11.so".into(),
-                file_offset: 0x10,
-                names: vec!["C_SignInit".into()],
-                aliased: false,
-                semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
-                semantic_authorized: true,
-                semantic_ambiguous: false,
-                fork_safe: false,
-                module_ids: vec![crate::plan::ModuleId(0)],
-            }],
-            ..empty_plan()
-        };
+        let plan = crate::plan::AttachPlan::from_slots(vec![crate::plan::Slot {
+            index: 0,
+            descriptor_index: crate::kinds::function_id("C_SignInit").unwrap() + 1,
+            object: crate::plan::TEST_PINNED_OBJECT,
+            object_path: "/opt/p11.so".into(),
+            file_offset: 0x10,
+            names: vec!["C_SignInit".into()],
+            aliased: false,
+            semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        }]);
         let mut state = crate::semantics::State::new(&plan);
         let vendor_id: u64 = 0x8000_1042;
         state.observe(&Event {
@@ -2291,23 +2278,20 @@ mod tests {
     }
 
     fn init_plan() -> crate::plan::AttachPlan {
-        crate::plan::AttachPlan {
-            slots: vec![crate::plan::Slot {
-                index: 0,
-                descriptor_index: crate::kinds::function_id("C_SignInit").unwrap() + 1,
-                object: crate::plan::TEST_PINNED_OBJECT,
-                object_path: "/opt/p11.so".into(),
-                file_offset: 0x10,
-                names: vec!["C_SignInit".into()],
-                aliased: false,
-                semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
-                semantic_authorized: true,
-                semantic_ambiguous: false,
-                fork_safe: false,
-                module_ids: vec![crate::plan::ModuleId(0)],
-            }],
-            ..empty_plan()
-        }
+        crate::plan::AttachPlan::from_slots(vec![crate::plan::Slot {
+            index: 0,
+            descriptor_index: crate::kinds::function_id("C_SignInit").unwrap() + 1,
+            object: crate::plan::TEST_PINNED_OBJECT,
+            object_path: "/opt/p11.so".into(),
+            file_offset: 0x10,
+            names: vec!["C_SignInit".into()],
+            aliased: false,
+            semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        }])
     }
 
     #[test]
@@ -2527,23 +2511,20 @@ mod tests {
     }
 
     fn template_plan() -> crate::plan::AttachPlan {
-        crate::plan::AttachPlan {
-            slots: vec![crate::plan::Slot {
-                index: 0,
-                descriptor_index: crate::kinds::function_id("C_FindObjectsInit").unwrap() + 1,
-                object: crate::plan::TEST_PINNED_OBJECT,
-                object_path: "/opt/p11.so".into(),
-                file_offset: 0x20,
-                names: vec!["C_FindObjectsInit".into()],
-                aliased: false,
-                semantics: crate::kinds::descriptor("C_FindObjectsInit").unwrap(),
-                semantic_authorized: true,
-                semantic_ambiguous: false,
-                fork_safe: false,
-                module_ids: vec![crate::plan::ModuleId(0)],
-            }],
-            ..empty_plan()
-        }
+        crate::plan::AttachPlan::from_slots(vec![crate::plan::Slot {
+            index: 0,
+            descriptor_index: crate::kinds::function_id("C_FindObjectsInit").unwrap() + 1,
+            object: crate::plan::TEST_PINNED_OBJECT,
+            object_path: "/opt/p11.so".into(),
+            file_offset: 0x20,
+            names: vec!["C_FindObjectsInit".into()],
+            aliased: false,
+            semantics: crate::kinds::descriptor("C_FindObjectsInit").unwrap(),
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        }])
     }
 
     fn template_event(

@@ -2,11 +2,12 @@
 //! each slot; the attach cookie carries the slot index.
 
 use crate::discovery::identity::PinnedObjects;
-use crate::plan::AttachPlan;
+use crate::plan::{AttachPlan, Slot};
 use anyhow::{Context as _, Result, anyhow, bail};
 use aya::Ebpf;
 use aya::maps::{Array, HashMap, Map, MapType, ProgramArray};
-use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeScope};
+use aya::programs::trace_point::TracePointLinkId;
+use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeLinkId, UProbeScope};
 use aya::programs::{TracePoint, UProbe};
 use p11scope_ebpf_common::{
     ARG_NONE, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
@@ -14,7 +15,7 @@ use p11scope_ebpf_common::{
     MAX_DESCRIPTORS, SlotSemantics, attach_cookie,
 };
 use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::mem::{size_of, size_of_val};
 use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::path::PathBuf;
@@ -183,9 +184,11 @@ impl CapturePolicy {
 pub struct Session {
     pub ebpf: Ebpf,
     attach_failures: Vec<(u32, String)>,
+    detach_failures: Vec<String>,
     attached: usize,
     policy: CapturePolicy,
-    fork_attached: bool,
+    uprobe_scope: UProbeScope,
+    links: Vec<RegisteredLink>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,25 +197,87 @@ enum ProducerProgram {
     TracePoint(&'static str),
 }
 
+/// One link whose lifetime this session owns. Task 5 extends this same list for
+/// its loader/export programs; Task 4 only records programs that already exist.
+enum RegisteredLink {
+    UProbe {
+        program: &'static str,
+        slot: u32,
+        id: UProbeLinkId,
+    },
+    TracePoint {
+        program: &'static str,
+        id: TracePointLinkId,
+    },
+}
+
+impl RegisteredLink {
+    fn producer(&self) -> ProducerProgram {
+        match self {
+            Self::UProbe { program, .. } => ProducerProgram::UProbe(program),
+            Self::TracePoint { program, .. } => ProducerProgram::TracePoint(program),
+        }
+    }
+
+    fn slot(&self) -> Option<u32> {
+        match self {
+            Self::UProbe { slot, .. } => Some(*slot),
+            Self::TracePoint { .. } => None,
+        }
+    }
+}
+
+#[cfg(test)]
 fn detach_producers_with(
     policy: CapturePolicy,
     fork_attached: bool,
     mut detach: impl FnMut(ProducerProgram) -> Result<()>,
 ) -> Result<()> {
-    detach(ProducerProgram::UProbe("p11_entry"))?;
+    let mut first_error = None;
+    let mut detach_one = |producer| {
+        if let Err(error) = detach(producer) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    };
+    detach_one(ProducerProgram::UProbe("p11_entry"));
     if policy.uses_unsafe_decoders() {
         for name in [
             "p11_entry_template",
             "p11_entry_template_types",
             "p11_entry_template_pair",
         ] {
-            detach(ProducerProgram::UProbe(name))?;
+            detach_one(ProducerProgram::UProbe(name));
         }
     }
     if fork_attached {
-        detach(ProducerProgram::TracePoint("sched_process_fork"))?;
+        detach_one(ProducerProgram::TracePoint("sched_process_fork"));
     }
-    detach(ProducerProgram::UProbe("p11_return"))
+    detach_one(ProducerProgram::UProbe("p11_return"));
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Detaches each concrete registered link in producer order. A program can
+/// own many links (one per static or dynamic slot), so ordering the producers
+/// is not enough: every individual link must receive one best-effort attempt.
+fn detach_selected_with<T>(
+    mut selected: Vec<(ProducerProgram, T)>,
+    mut detach: impl FnMut(T) -> Result<()>,
+) -> Vec<anyhow::Error> {
+    selected.sort_by_key(|(producer, _)| match producer {
+        ProducerProgram::UProbe("p11_entry") => 0,
+        ProducerProgram::UProbe("p11_entry_template") => 1,
+        ProducerProgram::UProbe("p11_entry_template_types") => 2,
+        ProducerProgram::UProbe("p11_entry_template_pair") => 3,
+        ProducerProgram::TracePoint("sched_process_fork") => 4,
+        ProducerProgram::UProbe("p11_return") => 5,
+        _ => 6,
+    });
+    selected
+        .into_iter()
+        .filter_map(|(_, link)| detach(link).err())
+        .collect()
 }
 
 /// Renders `e` and every `.source()` beneath it, joined by `: `. Several
@@ -251,6 +316,59 @@ fn entry_program(semantics: &SlotSemantics, policy: CapturePolicy) -> &'static s
     } else {
         "p11_entry"
     }
+}
+
+struct AttachOutcome {
+    attached: usize,
+    failures: Vec<(u32, String)>,
+}
+
+/// Keeps the static return-then-entry ordering intact while making the one
+/// per-slot dependency explicit: no entry link exists unless its return link
+/// was created first. The closures are the existing Aya lifecycle seam and
+/// make the failure policy testable without a privileged attachment.
+fn attach_targets_with(
+    slots: &[Slot],
+    policy: CapturePolicy,
+    mut attach: impl FnMut(&'static str, &Slot) -> Result<()>,
+) -> AttachOutcome {
+    let mut attached = 0;
+    let mut failures = Vec::new();
+    let mut return_attached = BTreeSet::new();
+    for slot in slots {
+        match attach("p11_return", slot) {
+            Ok(()) => {
+                attached += 1;
+                return_attached.insert(slot.index);
+            }
+            Err(error) => failures.push((slot.index, format!("{error:#}"))),
+        }
+    }
+
+    let entry_programs: &[&str] = if policy.uses_unsafe_decoders() {
+        &[
+            "p11_entry",
+            "p11_entry_template",
+            "p11_entry_template_types",
+            "p11_entry_template_pair",
+        ]
+    } else {
+        &["p11_entry"]
+    };
+    for program in entry_programs {
+        for slot in slots {
+            if !return_attached.contains(&slot.index)
+                || entry_program(&slot.semantics, policy) != *program
+            {
+                continue;
+            }
+            match attach(program, slot) {
+                Ok(()) => attached += 1,
+                Err(error) => failures.push((slot.index, format!("{error:#}"))),
+            }
+        }
+    }
+    AttachOutcome { attached, failures }
 }
 
 fn standard_async_catalog() -> Result<BTreeMap<FunctionNameKey, u32>> {
@@ -480,7 +598,10 @@ impl Session {
                 "a pinned provider object changed before attach; refusing to observe changed bytes"
             );
         }
-        let session = Self::start_inner(plan, scope, objects, policy)
+        let mut session = Self::start_inner(scope, policy)
+            .map_err(|e| anyhow!("{e:#}\n{UNSUPPORTED_ENV_HINT}"))?;
+        session
+            .attach_plan(plan, objects)
             .map_err(|e| anyhow!("{e:#}\n{UNSUPPORTED_ENV_HINT}"))?;
         // The error path drops `session`, which detaches every probe.
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
@@ -491,12 +612,7 @@ impl Session {
         Ok(session)
     }
 
-    fn start_inner(
-        plan: &AttachPlan,
-        scope: &Scope,
-        objects: &PinnedObjects,
-        policy: CapturePolicy,
-    ) -> Result<Self> {
+    fn start_inner(scope: &Scope, policy: CapturePolicy) -> Result<Self> {
         if policy.uses_unsafe_decoders() && !cfg!(feature = "unsafe-unvalidated-metadata") {
             bail!("unsafe-unvalidated-metadata policy is absent from this eBPF object");
         }
@@ -528,27 +644,6 @@ impl Session {
             // process-wide and the filter map decides.
             Scope::Cgroup { .. } => UProbeScope::AllProcesses,
         };
-
-        let mut attach_failures = Vec::new();
-        let mut attached = 0usize;
-        let attach_paths: Vec<PathBuf> = plan
-            .slots
-            .iter()
-            // By capture-local pinned ID only. Reconciliation removes scanned entries
-            // without a comparable opened identity, and `main.rs::retarget_to_pins`
-            // replaces manifest identities recorded on another host or boot with the
-            // identity of the object pinned now. A slot that does not resolve here is
-            // a discovery bug, and failing is the right answer:
-            // there is deliberately no by-path fallback, because `slot.object_path` is
-            // the *target's* pathname, which in a container names a different file in
-            // this namespace (`PinnedObjects` has no path index at all, so this cannot
-            // be reintroduced by accident).
-            .map(|slot| {
-                objects
-                    .attach_path_for(slot.object)
-                    .map_err(anyhow::Error::msg)
-            })
-            .collect::<Result<_>>()?;
 
         let programs: &[&str] = if unsafe_enabled {
             &[
@@ -582,86 +677,166 @@ impl Session {
         publish_and_freeze_template_tail(&mut ebpf, unsafe_enabled)
             .context("publishing and freezing TEMPLATE_TAIL")?;
 
-        let fork_attached = matches!(scope, Scope::Cgroup { .. }) && policy.uses_events();
-        if fork_attached {
+        let mut links = Vec::new();
+        if matches!(scope, Scope::Cgroup { .. }) && policy.uses_events() {
             let fork: &mut TracePoint = ebpf
                 .program_mut("sched_process_fork")
                 .context("program sched_process_fork missing from object")?
                 .try_into()?;
             fork.load().context("loading sched_process_fork")?;
-            fork.attach("sched", "sched_process_fork")
+            let id = fork
+                .attach("sched", "sched_process_fork")
                 .context("attaching sched_process_fork")?;
-        }
-
-        let mut return_attached = vec![false; plan.slots.len()];
-        {
-            let prog: &mut UProbe = ebpf.program_mut("p11_return").unwrap().try_into()?;
-            for (position, slot) in plan.slots.iter().enumerate() {
-                let point = UProbeAttachPoint {
-                    location: UProbeAttachLocation::AbsoluteOffset(slot.file_offset),
-                    cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),
-                };
-                match prog.attach(point, &attach_paths[position], uprobe_scope) {
-                    Ok(_) => {
-                        attached += 1;
-                        return_attached[position] = true;
-                    }
-                    Err(e) => attach_failures.push((
-                        slot.index,
-                        format!(
-                            "p11_return at {}+{:#x}: {}",
-                            slot.object_path,
-                            slot.file_offset,
-                            error_chain(&e)
-                        ),
-                    )),
-                }
-            }
-        }
-        let entry_programs: &[&str] = if unsafe_enabled {
-            &[
-                "p11_entry",
-                "p11_entry_template",
-                "p11_entry_template_types",
-                "p11_entry_template_pair",
-            ]
-        } else {
-            &["p11_entry"]
-        };
-        for prog_name in entry_programs {
-            let prog: &mut UProbe = ebpf.program_mut(prog_name).unwrap().try_into()?;
-            for (position, slot) in plan.slots.iter().enumerate() {
-                if !return_attached[position]
-                    || entry_program(&slot.semantics, policy) != *prog_name
-                {
-                    continue;
-                }
-                let point = UProbeAttachPoint {
-                    location: UProbeAttachLocation::AbsoluteOffset(slot.file_offset),
-                    cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),
-                };
-                match prog.attach(point, &attach_paths[position], uprobe_scope) {
-                    Ok(_) => attached += 1,
-                    Err(e) => attach_failures.push((
-                        slot.index,
-                        format!(
-                            "{prog_name} at {}+{:#x}: {}",
-                            slot.object_path,
-                            slot.file_offset,
-                            error_chain(&e)
-                        ),
-                    )),
-                }
-            }
+            links.push(RegisteredLink::TracePoint {
+                program: "sched_process_fork",
+                id,
+            });
         }
 
         Ok(Self {
             ebpf,
-            attach_failures,
-            attached,
+            attach_failures: vec![],
+            detach_failures: vec![],
+            attached: 0,
             policy,
-            fork_attached,
+            uprobe_scope,
+            links,
         })
+    }
+
+    /// Attaches every active target that this session has not already linked.
+    /// The static `start` wrapper calls this once; live discovery supplies the
+    /// same complete plan snapshot later without reloading or republishing maps.
+    pub(crate) fn attach_plan(&mut self, plan: &AttachPlan, objects: &PinnedObjects) -> Result<()> {
+        if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
+            bail!(
+                "a pinned provider object changed before attach; refusing to observe changed bytes"
+            );
+        }
+        let targets: Vec<_> = plan
+            .slots
+            .iter()
+            .filter(|slot| plan.is_active(slot.index) && !self.has_slot_link(slot.index))
+            .cloned()
+            .collect();
+        self.attach_targets(&targets, objects)?;
+        if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
+            bail!(
+                "a pinned provider object changed while attaching; refusing to observe changed bytes"
+            );
+        }
+        Ok(())
+    }
+
+    /// Attaches a finite set of fresh slots and returns those whose return link
+    /// could not be established. An entry is never attempted for such a slot.
+    pub(crate) fn attach_targets(
+        &mut self,
+        targets: &[Slot],
+        objects: &PinnedObjects,
+    ) -> Result<Vec<u32>> {
+        let mut requested = BTreeSet::new();
+        if let Some(slot) = targets.iter().find(|slot| !requested.insert(slot.index)) {
+            bail!("slot {} was requested for attachment twice", slot.index);
+        }
+        if let Some(slot) = targets.iter().find(|slot| self.has_slot_link(slot.index)) {
+            bail!("slot {} already has an owned probe link", slot.index);
+        }
+        let attach_paths: BTreeMap<_, _> = targets
+            .iter()
+            // By capture-local pinned ID only. There is deliberately no by-path
+            // fallback: a target pathname can name a different object here.
+            .map(|slot| {
+                objects
+                    .attach_path_for(slot.object)
+                    .map(|path| (slot.index, path))
+                    .map_err(anyhow::Error::msg)
+            })
+            .collect::<Result<_>>()?;
+        let scope = self.uprobe_scope;
+        let ebpf = &mut self.ebpf;
+        let links = &mut self.links;
+        let outcome = attach_targets_with(targets, self.policy, |program, slot| {
+            let path = attach_paths
+                .get(&slot.index)
+                .expect("every selected target has a retained pinned path");
+            let point = UProbeAttachPoint {
+                location: UProbeAttachLocation::AbsoluteOffset(slot.file_offset),
+                cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),
+            };
+            let prog: &mut UProbe = ebpf
+                .program_mut(program)
+                .with_context(|| format!("program {program} missing from object"))?
+                .try_into()?;
+            match prog.attach(point, path, scope) {
+                Ok(id) => {
+                    links.push(RegisteredLink::UProbe {
+                        program,
+                        slot: slot.index,
+                        id,
+                    });
+                    Ok(())
+                }
+                Err(error) => Err(anyhow!(
+                    "{program} at {}+{:#x}: {}",
+                    slot.object_path,
+                    slot.file_offset,
+                    error_chain(&error)
+                )),
+            }
+        });
+        self.attached += outcome.attached;
+        let failed: Vec<_> = outcome.failures.iter().map(|(slot, _)| *slot).collect();
+        self.attach_failures.extend(outcome.failures);
+        Ok(failed)
+    }
+
+    /// Applies the attachment half of a descriptor downgrade after the caller
+    /// has detached the old links and synchronized semantic consumers. A failed
+    /// replacement cannot fall back to the frozen descriptor it replaced.
+    pub fn replace_targets(
+        &mut self,
+        plan: &mut AttachPlan,
+        replace: &[Slot],
+        objects: &PinnedObjects,
+    ) -> Result<()> {
+        if let Some(slot) = replace.iter().find(|slot| self.has_slot_link(slot.index)) {
+            bail!(
+                "replacement slot {} still has an old link; detach and synchronize it before reattach",
+                slot.index
+            );
+        }
+        let failed: BTreeSet<_> = match self.attach_targets(replace, objects) {
+            Ok(failed) => failed.into_iter().collect(),
+            Err(error) => {
+                for slot in replace {
+                    self.attach_failures
+                        .push((slot.index, format!("replacement attach: {error:#}")));
+                    plan.deactivate(slot.index);
+                }
+                return Err(error);
+            }
+        };
+        let failed_slots: Vec<_> = replace
+            .iter()
+            .filter(|slot| failed.contains(&slot.index))
+            .cloned()
+            .collect();
+        // An entry failure still leaves a successful return link behind. Remove
+        // it before retiring the slot so failed replacement evidence is exact.
+        let detach = self.detach_slots(&failed_slots);
+        for slot in &failed_slots {
+            plan.deactivate(slot.index);
+        }
+        detach?;
+        Ok(())
+    }
+
+    /// Detaches all slot links selected by a finite retirement/replacement
+    /// delta. Each attempt is made even if an earlier Aya detach failed.
+    pub fn detach_slots(&mut self, slots: &[Slot]) -> Result<()> {
+        let slots: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
+        self.detach_links(|link| link.slot().is_some_and(|slot| slots.contains(&slot)))
     }
 
     /// Detach every event/map producer while keeping the maps and ring reader
@@ -670,30 +845,70 @@ impl Session {
     /// removed last. Kernel detach does not wait for callbacks already running
     /// on another CPU; callers must not claim that the terminal drain is final.
     pub fn detach_producers(&mut self) -> Result<()> {
-        let ebpf = &mut self.ebpf;
-        detach_producers_with(self.policy, self.fork_attached, |producer| {
-            match producer {
-                ProducerProgram::UProbe(name) => {
-                    let program: &mut UProbe = ebpf
-                        .program_mut(name)
-                        .with_context(|| format!("program {name} missing during detach"))?
-                        .try_into()?;
-                    program
-                        .unload()
-                        .with_context(|| format!("detaching {name}"))?;
-                }
-                ProducerProgram::TracePoint(name) => {
-                    let program: &mut TracePoint = ebpf
-                        .program_mut(name)
-                        .with_context(|| format!("program {name} missing during detach"))?
-                        .try_into()?;
-                    program
-                        .unload()
-                        .with_context(|| format!("detaching {name}"))?;
-                }
+        self.detach_links(|_| true)
+    }
+
+    fn has_slot_link(&self, slot: u32) -> bool {
+        self.links.iter().any(|link| link.slot() == Some(slot))
+    }
+
+    fn detach_links(&mut self, mut select: impl FnMut(&RegisteredLink) -> bool) -> Result<()> {
+        let mut selected = Vec::new();
+        let mut retained = Vec::new();
+        for link in std::mem::take(&mut self.links) {
+            if select(&link) {
+                selected.push(link);
+            } else {
+                retained.push(link);
             }
-            Ok(())
-        })
+        }
+        self.links = retained;
+
+        let mut first_error = None;
+        for error in detach_selected_with(
+            selected
+                .into_iter()
+                .map(|link| (link.producer(), link))
+                .collect(),
+            |link| self.detach_link(link),
+        ) {
+            let message = format!("{error:#}");
+            self.detach_failures.push(message.clone());
+            if first_error.is_none() {
+                first_error = Some(anyhow!(message));
+            }
+        }
+        self.attached = self
+            .links
+            .iter()
+            .filter(|link| matches!(link, RegisteredLink::UProbe { .. }))
+            .count();
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn detach_link(&mut self, link: RegisteredLink) -> Result<()> {
+        match link {
+            RegisteredLink::UProbe { program, id, .. } => (|| {
+                let probe: &mut UProbe = self
+                    .ebpf
+                    .program_mut(program)
+                    .with_context(|| format!("program {program} missing during detach"))?
+                    .try_into()?;
+                probe
+                    .detach(id)
+                    .with_context(|| format!("detaching {program}"))
+            })(),
+            RegisteredLink::TracePoint { program, id } => (|| {
+                let tracepoint: &mut TracePoint = self
+                    .ebpf
+                    .program_mut(program)
+                    .with_context(|| format!("program {program} missing during detach"))?
+                    .try_into()?;
+                tracepoint
+                    .detach(id)
+                    .with_context(|| format!("detaching {program}"))
+            })(),
+        }
     }
 
     /// Attach points that failed — reported as an evidence gap, never
@@ -702,9 +917,20 @@ impl Session {
         &self.attach_failures
     }
 
+    /// Detach failures remain available after the terminal best-effort drain.
+    pub fn detach_failures(&self) -> &[String] {
+        &self.detach_failures
+    }
+
     /// Successful attachments across both programs (2 per fully-attached slot).
     pub fn attached_probes(&self) -> usize {
         self.attached
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let _ = self.detach_producers();
     }
 }
 
@@ -786,8 +1012,46 @@ mod tests {
     use super::*;
     use p11scope_ebpf_common::{ARG_NONE, SlotSemantics};
 
+    fn test_slot(index: u32) -> crate::plan::Slot {
+        crate::plan::Slot {
+            index,
+            descriptor_index: 0,
+            object: crate::plan::TEST_PINNED_OBJECT,
+            object_path: "/proc/self/fd/42".into(),
+            file_offset: 0x10 + u64::from(index) * 8,
+            names: vec!["C_Sign".into()],
+            aliased: false,
+            semantics: SlotSemantics::COUNT_ONLY,
+            semantic_authorized: false,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        }
+    }
+
     #[test]
-    fn terminal_detach_orders_selected_producers_and_stops_on_error() {
+    fn return_failure_suppresses_its_entry_without_blocking_another_slot() {
+        let slots = [test_slot(0), test_slot(1)];
+        let mut attempted = Vec::new();
+        let outcome = attach_targets_with(&slots, CapturePolicy::Allowlisted, |program, slot| {
+            attempted.push((program, slot.index));
+            if program == "p11_return" && slot.index == 0 {
+                anyhow::bail!("injected return failure")
+            }
+            Ok(())
+        });
+
+        assert_eq!(outcome.attached, 2, "slot 1 gets its entry/return pair");
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].0, 0);
+        assert_eq!(
+            attempted,
+            [("p11_return", 0), ("p11_return", 1), ("p11_entry", 1),]
+        );
+    }
+
+    #[test]
+    fn terminal_detach_orders_every_static_and_dynamic_link_and_keeps_going_after_error() {
         let mut safe = Vec::new();
         detach_producers_with(CapturePolicy::Allowlisted, false, |producer| {
             safe.push(producer);
@@ -847,7 +1111,33 @@ mod tests {
             [
                 ProducerProgram::UProbe("p11_entry"),
                 ProducerProgram::UProbe("p11_entry_template"),
+                ProducerProgram::UProbe("p11_entry_template_types"),
+                ProducerProgram::UProbe("p11_entry_template_pair"),
+                ProducerProgram::UProbe("p11_return"),
             ]
+        );
+
+        let mut links = Vec::new();
+        let errors = detach_selected_with(
+            vec![
+                (ProducerProgram::UProbe("p11_return"), 0),
+                (ProducerProgram::UProbe("p11_entry"), 1),
+                (ProducerProgram::UProbe("p11_entry"), 2),
+                (ProducerProgram::UProbe("p11_return"), 3),
+            ],
+            |link| {
+                links.push(link);
+                if link == 1 {
+                    anyhow::bail!("injected dynamic-link detach failure")
+                }
+                Ok(())
+            },
+        );
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            links,
+            [1, 2, 0, 3],
+            "both dynamic links are attempted after one fails"
         );
     }
 

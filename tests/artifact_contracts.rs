@@ -37,16 +37,33 @@ fn require_contract_marker(section: &str, marker: &str, contract: &str) -> Resul
 fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<(), String> {
     const COOKIE: &str = "cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),";
 
-    let return_attach =
-        contract_section(attach, "program_mut(\"p11_return\")", "let entry_programs")?;
-    require_contract_marker(return_attach, COOKIE, "p11_return attach cookie")?;
-
-    let entry_attach = contract_section(
+    let scheduling = contract_section(
         attach,
-        "for prog_name in entry_programs {",
-        "\n\n        Ok(Self {",
+        "fn attach_targets_with(",
+        "fn standard_async_catalog",
     )?;
-    require_contract_marker(entry_attach, COOKIE, "p11_entry attach cookie")?;
+    require_contract_marker(
+        scheduling,
+        "attach(\"p11_return\", slot)",
+        "return-before-entry scheduling",
+    )?;
+    require_contract_marker(
+        scheduling,
+        "for program in entry_programs {",
+        "entry scheduling",
+    )?;
+    require_contract_marker(
+        scheduling,
+        "!return_attached.contains(&slot.index)",
+        "return failure entry suppression",
+    )?;
+    let attach_targets = contract_section(
+        attach,
+        "pub(crate) fn attach_targets(",
+        "pub fn replace_targets",
+    )?;
+    require_contract_marker(attach_targets, COOKIE, "shared slot attach cookie")?;
+    require_contract_marker(attach_targets, "prog.attach(point", "Aya uprobe attachment")?;
 
     let cookie = contract_section(ebpf, "fn slot_of<C>", "/// Decode allowlisted")?;
     require_contract_marker(
@@ -664,7 +681,7 @@ fn descriptors_are_published_read_back_and_frozen_before_probe_attachment() {
         .find("freeze_map(\n            \"DESCRIPTORS\",")
         .expect("Session must freeze descriptors");
     let fork_attach = source
-        .find("fork.attach(")
+        .find(".attach(\"sched\", \"sched_process_fork\")")
         .expect("Session must attach the fork probe");
     let uprobe_attach = source
         .find("prog.attach(point")

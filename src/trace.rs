@@ -481,6 +481,7 @@ mod tests {
             slots: vec![
                 crate::plan::Slot {
                     index: 0,
+                    descriptor_index: crate::kinds::function_id("C_OpenSession").unwrap() + 1,
                     object: crate::plan::TEST_PINNED_OBJECT,
                     object_path: "/opt/p11.so".into(),
                     file_offset: 0x10,
@@ -494,6 +495,7 @@ mod tests {
                 },
                 crate::plan::Slot {
                     index: 1,
+                    descriptor_index: crate::kinds::function_id("C_CloseSession").unwrap() + 1,
                     object: crate::plan::TEST_PINNED_OBJECT,
                     object_path: "/opt/p11.so".into(),
                     file_offset: 0x20,
@@ -562,6 +564,7 @@ mod tests {
         plan.slots.truncate(1);
         plan.slots[0].semantic_authorized = false;
         plan.slots[0].semantics = p11scope_ebpf_common::SlotSemantics::COUNT_ONLY;
+        plan.slots[0].descriptor_index = 0;
         let mut state = State::new(&plan);
         let mut tracer = Tracer::new(&plan);
         tracer.anchor = Some((0, 0));

@@ -72,6 +72,7 @@ mod corrective_tests {
                 .enumerate()
                 .map(|(index, name)| Slot {
                     index: index as u32,
+                    descriptor_index: crate::kinds::function_id(name).unwrap() + 1,
                     object: crate::plan::TEST_PINNED_OBJECT,
                     object_path: "/opt/p11.so".into(),
                     file_offset: index as u64 * 16,
@@ -2361,9 +2362,11 @@ mod tests {
     fn slot(index: u32, names: &[&str], _kind: u32) -> Slot {
         let names = names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let aliased = names.len() >= 2;
-        let (semantics, semantic_ambiguous) = crate::kinds::descriptor_slot(&names);
+        let (descriptor_index, semantic_ambiguous) = crate::kinds::descriptor_index(&names);
+        let semantics = crate::kinds::DESCRIPTORS[descriptor_index as usize];
         Slot {
             index,
+            descriptor_index,
             object: crate::plan::TEST_PINNED_OBJECT,
             object_path: "/opt/p11.so".into(),
             file_offset: index as u64 * 0x10,
@@ -2409,6 +2412,7 @@ mod tests {
         plan.slots.truncate(1);
         plan.slots[0].semantic_authorized = false;
         plan.slots[0].semantics = p11scope_ebpf_common::SlotSemantics::COUNT_ONLY;
+        plan.slots[0].descriptor_index = 0;
         plan.entries_seen = 1;
         let mut state = State::new(&plan);
         let hostile = Event {

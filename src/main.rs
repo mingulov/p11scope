@@ -4548,6 +4548,7 @@ mod tests {
             slots: (0..slots)
                 .map(|index| plan::Slot {
                     index: index as u32,
+                    descriptor_index: 0,
                     object: PinnedObjectId(42),
                     object_path: "/opt/p11.so".into(),
                     file_offset: index as u64 * 8,

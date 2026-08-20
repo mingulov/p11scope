@@ -1,6 +1,6 @@
 //! p11scope BPF programs. A lightweight or template-aware entry program
 //! plus one return program serve every attach point. The attach cookie
-//! carries the slot index, so 68+ probes share a small fixed program set
+//! carries the slot and descriptor indices, so 68+ probes share a small fixed program set
 //! rather than per-function copies. Cookies need kernel >= 5.15.
 #![no_std]
 #![no_main]
@@ -19,9 +19,9 @@ use p11scope_ebpf_common::{
     EVIDENCE_START_INSERT_FAILURES, EVIDENCE_UNMATCHED_RETURNS,
     EVIDENCE_UNREGISTERED_MECHANISMS, Event, FLAG_CGROUP_FILTER, FLAG_PID_FILTER,
     FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED, FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE,
-    FunctionNameKey, MAX_ATTRS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, RING_BYTES, RV_ENTRIES,
+    FunctionNameKey, MAX_ATTRS, MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, RING_BYTES, RV_ENTRIES,
     RvKey, SESSION_NONE, START_ENTRIES, SlotSemantics, SlotStats, StartKey, USER_TYPE_NONE,
-    bucket_of, capture, event_type, lifecycle, return_allows_mechanism, shape, valid_config,
+    bucket_of, capture, cookie_descriptor, cookie_slot, event_type, lifecycle, return_allows_mechanism, shape, valid_config,
 };
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use p11scope_ebpf_common::{
@@ -47,8 +47,8 @@ static START: HashMap<StartKey, CallStart> = HashMap::with_max_entries(START_ENT
 static RV_COUNTS: PerCpuHashMap<RvKey, u64> = PerCpuHashMap::with_max_entries(RV_ENTRIES, 0);
 
 #[map]
-static SLOT_SEMANTICS: Array<SlotSemantics> =
-    Array::with_max_entries(MAX_SLOTS, BPF_F_RDONLY_PROG);
+static DESCRIPTORS: Array<SlotSemantics> =
+    Array::with_max_entries(MAX_DESCRIPTORS, BPF_F_RDONLY_PROG);
 
 /// Mechanism id -> parameter shape code, published by userspace from
 /// proxy-ng's registry. An unknown mechanism id looks up empty and is
@@ -113,11 +113,28 @@ fn scope_flags() -> Option<u64> {
     None
 }
 
+fn cookie_of<C>(ctx: &C) -> u64
+where
+    C: aya_ebpf::EbpfContext,
+{
+    unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) }
+}
+
 fn slot_of<C>(ctx: &C) -> u32
 where
     C: aya_ebpf::EbpfContext,
 {
-    (unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) }) as u32
+    cookie_slot(cookie_of(ctx))
+}
+
+fn semantics_of<C>(ctx: &C) -> SlotSemantics
+where
+    C: aya_ebpf::EbpfContext,
+{
+    DESCRIPTORS
+        .get(cookie_descriptor(cookie_of(ctx)))
+        .copied()
+        .unwrap_or(SlotSemantics::COUNT_ONLY)
 }
 
 /// Decode allowlisted `CK_MECHANISM` parameters for `shape` at `pmech`,
@@ -425,10 +442,7 @@ pub fn p11_entry_template_second(ctx: ProbeContext) -> u32 {
         bump_evidence(EVIDENCE_TEMPLATE_TAIL_FAILURES);
         return 0;
     };
-    let semantics = SLOT_SEMANTICS
-        .get(slot)
-        .copied()
-        .unwrap_or(SlotSemantics::COUNT_ONLY);
+    let semantics = semantics_of(&ctx);
     // SAFETY: START owns this per-thread/per-slot value until the return
     // probe removes it; the primary entry program has already inserted it.
     let start = unsafe { &mut *start };
@@ -482,7 +496,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {
         record_aggregate_start(&key);
         return 0;
     }
-    let semantics = SLOT_SEMANTICS.get(slot).copied().unwrap_or(SlotSemantics::COUNT_ONLY);
+    let semantics = semantics_of(&ctx);
     let mut start = CallStart {
         ts_ns: unsafe { helpers::bpf_ktime_get_ns() },
         session: SESSION_NONE,
@@ -690,7 +704,7 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
         return 0;
     }
 
-    let semantics = SLOT_SEMANTICS.get(slot).copied().unwrap_or(SlotSemantics::COUNT_ONLY);
+    let semantics = semantics_of(&ctx);
     let mut mechanism = start.mechanism;
     let mut capture_flags = start.capture;
     if flags & FLAG_POLICY_ALLOWLISTED != 0

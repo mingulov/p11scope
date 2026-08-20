@@ -106,7 +106,7 @@ SAFE_MAPS = {
         "MECH_SHAPE": (1, 8, 4, 1_024, 128),
         "PID_FILTER": (1, 4, 1, 1_024, 128),
         "RV_COUNTS": (5, 16, 8, 4_096),
-        "SLOT_SEMANTICS": (2, 4, 18, 512, 128),
+        "DESCRIPTORS": (2, 4, 18, 105, 128),
         "START": (1, 16, 272, 16_384),
         "STATS": (6, 4, 296, 512),
     }.items()

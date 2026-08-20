@@ -4,8 +4,9 @@
 //! argument shape could touch a PIN pointer, so ambiguity never guesses.
 
 use p11scope_ebpf_common::{
-    SlotSemantics, direct, lifecycle, operation, semantic_flags, transition,
+    MAX_DESCRIPTORS, SlotSemantics, direct, lifecycle, operation, semantic_flags, transition,
 };
+use std::sync::LazyLock;
 
 pub fn function_id(name: &str) -> Option<u32> {
     pkcs11_module::FUNCTION_LIST_FIELDS
@@ -16,15 +17,53 @@ pub fn function_id(name: &str) -> Option<u32> {
         .map(|index| index as u32)
 }
 
-pub fn descriptor_slot(names: &[String]) -> (SlotSemantics, bool) {
-    let Some(first) = names.first().and_then(|name| descriptor(name)) else {
-        return (SlotSemantics::COUNT_ONLY, !names.is_empty());
-    };
-    if names.iter().all(|name| descriptor(name) == Some(first)) {
-        (first, false)
-    } else {
-        (SlotSemantics::COUNT_ONLY, true)
+/// Fixed capture-independent descriptors. Index zero is count-only; each
+/// canonical published function follows at `function_id(name) + 1`.
+pub static DESCRIPTORS: LazyLock<[SlotSemantics; MAX_DESCRIPTORS as usize]> = LazyLock::new(|| {
+    let mut descriptors = [SlotSemantics::COUNT_ONLY; MAX_DESCRIPTORS as usize];
+    for (index, field) in pkcs11_module::FUNCTION_LIST_FIELDS
+        .iter()
+        .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS)
+        .chain(pkcs11_module::FUNCTION_LIST_3_2_EXTRA_FIELDS)
+        .enumerate()
+    {
+        descriptors[index + 1] = descriptor(field.name)
+            .unwrap_or_else(|| panic!("{} lacks a capture descriptor", field.name));
     }
+    descriptors
+});
+
+/// Select one fixed descriptor for one static target. Unknown names and
+/// conflicting aliases must remain count-only; agreeing aliases choose the
+/// lowest canonical function id, independent of discovery ordering.
+pub fn descriptor_index(names: &[String]) -> (u32, bool) {
+    if names.is_empty() {
+        return (0, false);
+    }
+
+    let mut index: Option<u32> = None;
+    let mut selected = SlotSemantics::COUNT_ONLY;
+    for name in names {
+        let Some(function_id) = function_id(name) else {
+            return (0, true);
+        };
+        let candidate = DESCRIPTORS[(function_id + 1) as usize];
+        if let Some(previous) = index {
+            if candidate != selected {
+                return (0, true);
+            }
+            index = Some(previous.min(function_id + 1));
+        } else {
+            selected = candidate;
+            index = Some(function_id + 1);
+        }
+    }
+    (index.unwrap_or(0), false)
+}
+
+pub fn descriptor_slot(names: &[String]) -> (SlotSemantics, bool) {
+    let (index, ambiguous) = descriptor_index(names);
+    (DESCRIPTORS[index as usize], ambiguous)
 }
 
 fn session(operations: u16, transition: u8) -> SlotSemantics {
@@ -404,5 +443,36 @@ mod tests {
         let (descriptor, ambiguous) = descriptor_slot(&disagreeing);
         assert!(ambiguous);
         assert_eq!(descriptor, SlotSemantics::COUNT_ONLY);
+    }
+
+    /// Mutation caught: a reordered, incomplete, or permissive descriptor
+    /// inventory could grant capture semantics to an unknown or conflicting target.
+    #[test]
+    fn descriptor_indices_are_canonical_and_fail_closed() {
+        assert_eq!(DESCRIPTORS[0], SlotSemantics::COUNT_ONLY);
+        assert_eq!(DESCRIPTORS.len(), 105);
+        for field in pkcs11_module::FUNCTION_LIST_FIELDS
+            .iter()
+            .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS)
+            .chain(pkcs11_module::FUNCTION_LIST_3_2_EXTRA_FIELDS)
+        {
+            let index = function_id(field.name).unwrap() + 1;
+            assert_eq!(DESCRIPTORS[index as usize], descriptor(field.name).unwrap());
+        }
+
+        let sign = vec!["C_SignInit".to_string()];
+        assert_eq!(
+            descriptor_index(&sign),
+            (function_id("C_SignInit").unwrap() + 1, false)
+        );
+        let aliases = vec!["C_InitPIN".to_string(), "C_SetPIN".to_string()];
+        assert_eq!(
+            descriptor_index(&aliases),
+            (function_id("C_InitPIN").unwrap() + 1, false)
+        );
+        let unknown = vec!["C_NotAStandardFunction".to_string()];
+        assert_eq!(descriptor_index(&unknown), (0, true));
+        let conflicting = vec!["C_SignInit".to_string(), "C_VerifyInit".to_string()];
+        assert_eq!(descriptor_index(&conflicting), (0, true));
     }
 }

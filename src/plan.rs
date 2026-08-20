@@ -27,6 +27,9 @@ pub struct ModuleId(pub u32);
 #[derive(Debug, Clone, PartialEq)]
 pub struct Slot {
     pub index: u32,
+    /// Fixed descriptor selected by the static attach cookie. Zero is
+    /// count-only; canonical descriptors are `function_id + 1`.
+    pub descriptor_index: u32,
     /// The object the probe attaches into — a table entry may legally point
     /// into a dependency rather than the module that published it.
     pub object: PinnedObjectId,
@@ -404,13 +407,19 @@ fn merge(
         .map(|(index, slot)| {
             let names: Vec<_> = slot.name_authority.keys().cloned().collect();
             let semantic_authorized = slot.name_authority.values().all(|value| *value);
-            let (semantics, semantic_ambiguous) = crate::kinds::descriptor_slot(&names);
+            let (descriptor_index, semantic_ambiguous) = crate::kinds::descriptor_index(&names);
+            let semantics = crate::kinds::DESCRIPTORS[descriptor_index as usize];
             // Counts through a target two modules both publish cannot be attributed
             // to either, so the slot may not carry semantics — it is counted, and the
             // report says it was not attributed.
             let shared = slot.module_ids.len() >= 2;
             Slot {
                 index: index as u32,
+                descriptor_index: if shared || !semantic_authorized {
+                    0
+                } else {
+                    descriptor_index
+                },
                 object: slot.object,
                 object_path: slot.object_path,
                 file_offset: slot.file_offset,
@@ -1091,6 +1100,7 @@ mod tests {
             slots: (0..count)
                 .map(|index| Slot {
                     index: index as u32,
+                    descriptor_index: 0,
                     object: PinnedObjectId(42),
                     object_path: "/opt/p11.so".into(),
                     file_offset: index as u64 * 8,
@@ -1117,6 +1127,37 @@ mod tests {
         assert!(error.contains("requires 513"));
         assert!(error.contains("only 512"));
         assert!(error.contains("refusing to attach a prefix"));
+    }
+
+    /// Mutation caught: allowing a scan-only or ambiguous target to retain a
+    /// canonical descriptor would make semantic capture depend on discovery.
+    #[test]
+    fn slot_descriptor_indices_follow_manifest_authority() {
+        let mut scan = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
+        scan.scanned.tables[0].entries[0].name = "C_SignInit";
+        let scan = build_from_test_sources(&[scan], &[]);
+        assert_eq!(scan.slots[0].descriptor_index, 0);
+
+        let manifest = build(&manifest_with(vec![resolved("C_SignInit", 0x10)]));
+        assert_eq!(
+            manifest.slots[0].descriptor_index,
+            crate::kinds::function_id("C_SignInit").unwrap() + 1
+        );
+
+        let aliases = build(&manifest_with(vec![
+            resolved("C_InitPIN", 0x10),
+            resolved("C_SetPIN", 0x10),
+        ]));
+        assert_eq!(
+            aliases.slots[0].descriptor_index,
+            crate::kinds::function_id("C_InitPIN").unwrap() + 1
+        );
+
+        let conflict = build(&manifest_with(vec![
+            resolved("C_SignInit", 0x10),
+            resolved("C_VerifyInit", 0x10),
+        ]));
+        assert_eq!(conflict.slots[0].descriptor_index, 0);
     }
 
     #[test]

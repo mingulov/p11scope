@@ -8,6 +8,26 @@
 /// 512 covers the 104-entry 3.2 table several times over.
 pub const MAX_SLOTS: u32 = 512;
 
+/// Fixed static policy descriptors: count-only plus the 104 canonical
+/// PKCS#11 function-table entries.
+pub const MAX_DESCRIPTORS: u32 = 105;
+
+/// Encode one static-slot attachment cookie. The low word remains the slot so
+/// STATS, RV_COUNTS, START, and Event.slot keep their existing ABI.
+pub const fn attach_cookie(slot: u32, descriptor: u32) -> u64 {
+    slot as u64 | ((descriptor as u64) << 32)
+}
+
+/// Decode the aggregate slot from a static-slot attachment cookie.
+pub const fn cookie_slot(cookie: u64) -> u32 {
+    cookie as u32
+}
+
+/// Decode the fixed descriptor index from a static-slot attachment cookie.
+pub const fn cookie_descriptor(cookie: u64) -> u32 {
+    (cookie >> 32) as u32
+}
+
 /// No argument is captured for this descriptor field.
 pub const ARG_NONE: u8 = u8::MAX;
 
@@ -552,6 +572,24 @@ mod tests {
         assert_eq!(core::mem::size_of::<SlotSemantics>(), 18);
         assert_eq!(core::mem::align_of::<SlotSemantics>(), 2);
         assert_eq!(ARG_NONE, u8::MAX);
+    }
+
+    /// Mutation caught: treating the full cookie as a slot corrupts the
+    /// existing aggregate-map keys when a descriptor is selected.
+    #[test]
+    fn slot_attach_cookie_keeps_slot_and_descriptor_in_separate_words() {
+        assert_eq!(attach_cookie(0, 0), 0);
+        assert_eq!(cookie_slot(attach_cookie(0, 0)), 0);
+        assert_eq!(cookie_descriptor(attach_cookie(0, 0)), 0);
+
+        let cookie = attach_cookie(0x1234_5678, 0x9abc_def0);
+        assert_eq!(cookie, 0x9abc_def0_1234_5678);
+        assert_eq!(cookie_slot(cookie), 0x1234_5678);
+        assert_eq!(cookie_descriptor(cookie), 0x9abc_def0);
+
+        let maximum = attach_cookie(u32::MAX, u32::MAX);
+        assert_eq!(cookie_slot(maximum), u32::MAX);
+        assert_eq!(cookie_descriptor(maximum), u32::MAX);
     }
 
     #[test]

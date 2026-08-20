@@ -2196,6 +2196,7 @@ mod tests {
         let plan = crate::plan::AttachPlan {
             slots: vec![crate::plan::Slot {
                 index: 0,
+                descriptor_index: crate::kinds::function_id("C_SignInit").unwrap() + 1,
                 object: crate::plan::TEST_PINNED_OBJECT,
                 object_path: "/opt/p11.so".into(),
                 file_offset: 0x10,
@@ -2293,6 +2294,7 @@ mod tests {
         crate::plan::AttachPlan {
             slots: vec![crate::plan::Slot {
                 index: 0,
+                descriptor_index: crate::kinds::function_id("C_SignInit").unwrap() + 1,
                 object: crate::plan::TEST_PINNED_OBJECT,
                 object_path: "/opt/p11.so".into(),
                 file_offset: 0x10,
@@ -2528,6 +2530,7 @@ mod tests {
         crate::plan::AttachPlan {
             slots: vec![crate::plan::Slot {
                 index: 0,
+                descriptor_index: crate::kinds::function_id("C_FindObjectsInit").unwrap() + 1,
                 object: crate::plan::TEST_PINNED_OBJECT,
                 object_path: "/opt/p11.so".into(),
                 file_offset: 0x20,

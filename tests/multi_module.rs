@@ -79,7 +79,9 @@ fn build_authorized_from_modules(
     let mut plan = build_from_modules(modules);
     for slot in &mut plan.slots {
         slot.semantic_authorized = true;
-        slot.semantics = p11scope::kinds::descriptor_slot(&slot.names).0;
+        let (descriptor_index, _) = p11scope::kinds::descriptor_index(&slot.names);
+        slot.descriptor_index = descriptor_index;
+        slot.semantics = p11scope::kinds::DESCRIPTORS[descriptor_index as usize];
     }
     plan
 }

@@ -384,18 +384,46 @@ fn immutable_policy_maps() {
     for name in [
         "CONFIG",
         "PID_FILTER",
-        "SLOT_SEMANTICS",
+        "DESCRIPTORS",
         "ASYNC_FUNCTIONS",
         "MECH_SHAPE",
     ] {
         assert_eq!(definitions[name][FLAGS], BPF_F_RDONLY_PROG, "{name}");
     }
+    assert!(
+        !definitions.contains_key("SLOT_SEMANTICS"),
+        "the static slot policy must be selected by attach cookie"
+    );
     assert_eq!(definitions["CGROUP_FILTER"][FLAGS], 0);
     assert!(!definitions.contains_key("ATTR_BOOL_BITS"));
     assert!(!definitions.contains_key("TEMPLATE_TAIL"));
     for name in ["STATS", "START", "RV_COUNTS", "EVENTS", "EVIDENCE"] {
         assert_eq!(definitions[name][FLAGS], 0, "dynamic map {name}");
     }
+}
+
+#[test]
+fn descriptors_are_published_read_back_and_frozen_before_probe_attachment() {
+    let source = read("src/attach.rs");
+    let publish = source
+        .find("publish_descriptors(&mut ebpf)")
+        .expect("Session must publish descriptors");
+    let descriptor_freeze = source
+        .find("freeze_map(\n            \"DESCRIPTORS\",")
+        .expect("Session must freeze descriptors");
+    let fork_attach = source
+        .find("fork.attach(")
+        .expect("Session must attach the fork probe");
+    let uprobe_attach = source
+        .find("prog.attach(point")
+        .expect("Session must attach uprobes");
+    let publication = &source[source.find("fn publish_descriptors").unwrap()
+        ..source.find("fn publish_async_catalog").unwrap()];
+
+    assert!(publication.contains("let actual = semantics.iter()"));
+    assert!(publish < descriptor_freeze);
+    assert!(descriptor_freeze < fork_attach);
+    assert!(descriptor_freeze < uprobe_attach);
 }
 
 #[test]

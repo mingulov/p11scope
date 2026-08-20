@@ -10,8 +10,8 @@ use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeScope
 use aya::programs::{TracePoint, UProbe};
 use p11scope_ebpf_common::{
     ARG_NONE, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
-    FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, FUNCTION_NAME_MAX_BYTES, FunctionNameKey, MAX_SLOTS,
-    SlotSemantics,
+    FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, FUNCTION_NAME_MAX_BYTES, FunctionNameKey,
+    MAX_DESCRIPTORS, SlotSemantics, attach_cookie,
 };
 use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
 use std::collections::BTreeMap;
@@ -23,7 +23,7 @@ const BASE_POLICY_MAPS: [&str; 6] = [
     "CONFIG",
     "PID_FILTER",
     "CGROUP_FILTER",
-    "SLOT_SEMANTICS",
+    "DESCRIPTORS",
     "ASYNC_FUNCTIONS",
     "MECH_SHAPE",
 ];
@@ -277,51 +277,32 @@ fn standard_async_catalog() -> Result<BTreeMap<FunctionNameKey, u32>> {
     Ok(catalog)
 }
 
-fn publish_slot_semantics(ebpf: &mut Ebpf, plan: &AttachPlan) -> Result<()> {
-    let mut expected = vec![SlotSemantics::COUNT_ONLY; MAX_SLOTS as usize];
-    let mut seen = std::collections::BTreeSet::new();
-    for slot in &plan.slots {
-        if !seen.insert(slot.index) {
-            bail!("attach plan repeats slot {}", slot.index);
-        }
-        let target = expected
-            .get_mut(slot.index as usize)
-            .with_context(|| format!("slot {} exceeds SLOT_SEMANTICS capacity", slot.index))?;
-        if let Some(index) = slot.semantics.argument_indices().find(|index| *index > 6) {
-            bail!(
-                "slot {} requests forbidden argument index {index}",
-                slot.index
-            );
-        }
-        *target = slot.semantics;
-    }
-
+fn publish_descriptors(ebpf: &mut Ebpf) -> Result<()> {
+    let expected = crate::kinds::DESCRIPTORS.to_vec();
     let info = policy_map_data(
-        "SLOT_SEMANTICS",
-        ebpf.map("SLOT_SEMANTICS").context("SLOT_SEMANTICS map")?,
+        "DESCRIPTORS",
+        ebpf.map("DESCRIPTORS").context("DESCRIPTORS map")?,
     )?
     .info()
-    .context("reading SLOT_SEMANTICS map info")?;
-    if info.map_type()? != MapType::Array || info.max_entries() != MAX_SLOTS {
+    .context("reading DESCRIPTORS map info")?;
+    if info.map_type()? != MapType::Array || info.max_entries() != MAX_DESCRIPTORS {
         bail!(
-            "SLOT_SEMANTICS has type {:?} and capacity {}, expected Array and {}",
+            "DESCRIPTORS has type {:?} and capacity {}, expected Array and {}",
             info.map_type()?,
             info.max_entries(),
-            MAX_SLOTS
+            MAX_DESCRIPTORS
         );
     }
-    let mut semantics: Array<_, SlotSemantics> = Array::try_from(
-        ebpf.map_mut("SLOT_SEMANTICS")
-            .context("SLOT_SEMANTICS map")?,
-    )?;
+    let mut semantics: Array<_, SlotSemantics> =
+        Array::try_from(ebpf.map_mut("DESCRIPTORS").context("DESCRIPTORS map")?)?;
     for (index, value) in expected.iter().copied().enumerate() {
         semantics.set(index as u32, value, 0)?;
     }
     let semantics: Array<_, SlotSemantics> =
-        Array::try_from(ebpf.map("SLOT_SEMANTICS").context("SLOT_SEMANTICS map")?)?;
+        Array::try_from(ebpf.map("DESCRIPTORS").context("DESCRIPTORS map")?)?;
     let actual = semantics.iter().collect::<Result<Vec<_>, _>>()?;
     if actual != expected {
-        bail!("SLOT_SEMANTICS exact readback differs from the attach plan");
+        bail!("DESCRIPTORS exact readback differs from the fixed inventory");
     }
     Ok(())
 }
@@ -405,7 +386,7 @@ fn publish_attribute_catalog(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
 
 fn freeze_published_maps(ebpf: &Ebpf) -> Result<()> {
     for name in BASE_POLICY_MAPS {
-        if name == "SLOT_SEMANTICS" {
+        if name == "DESCRIPTORS" {
             continue;
         }
         freeze_map(name, ebpf.map(name).with_context(|| format!("{name} map"))?)?;
@@ -522,7 +503,7 @@ impl Session {
         let mut ebpf = Ebpf::load(crate::EBPF_OBJECT).context("loading BPF object")?;
         crate::scope::publish(&mut ebpf, scope, policy)
             .context("publishing scope and capture policy")?;
-        publish_slot_semantics(&mut ebpf, plan).context("publishing SLOT_SEMANTICS")?;
+        publish_descriptors(&mut ebpf).context("publishing DESCRIPTORS")?;
         publish_async_catalog(&mut ebpf).context("publishing ASYNC_FUNCTIONS")?;
         {
             // Embedded defaults: this binary ships statically and has no
@@ -589,15 +570,15 @@ impl Session {
             prog.load()
                 .with_context(|| format!("loading {prog_name}"))?;
         }
-        // Linux can constant-fold frozen one-entry arrays, but returns its
-        // internal ENOTSUPP for direct reads from this 512-entry array.
+        // Linux can constant-fold frozen arrays, but returns its internal
+        // ENOTSUPP for direct reads before the program is loaded.
         // Loading first avoids that kernel path; freezing still precedes every
         // attachment, so no probe can observe mutable policy.
         freeze_map(
-            "SLOT_SEMANTICS",
-            ebpf.map("SLOT_SEMANTICS").context("SLOT_SEMANTICS map")?,
+            "DESCRIPTORS",
+            ebpf.map("DESCRIPTORS").context("DESCRIPTORS map")?,
         )
-        .context("freezing SLOT_SEMANTICS")?;
+        .context("freezing DESCRIPTORS")?;
         publish_and_freeze_template_tail(&mut ebpf, unsafe_enabled)
             .context("publishing and freezing TEMPLATE_TAIL")?;
 
@@ -618,7 +599,7 @@ impl Session {
             for (position, slot) in plan.slots.iter().enumerate() {
                 let point = UProbeAttachPoint {
                     location: UProbeAttachLocation::AbsoluteOffset(slot.file_offset),
-                    cookie: Some(slot.index as u64),
+                    cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),
                 };
                 match prog.attach(point, &attach_paths[position], uprobe_scope) {
                     Ok(_) => {
@@ -657,7 +638,7 @@ impl Session {
                 }
                 let point = UProbeAttachPoint {
                     location: UProbeAttachLocation::AbsoluteOffset(slot.file_offset),
-                    cookie: Some(slot.index as u64),
+                    cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),
                 };
                 match prog.attach(point, &attach_paths[position], uprobe_scope) {
                     Ok(_) => attached += 1,
@@ -878,7 +859,7 @@ mod tests {
                 "CONFIG",
                 "PID_FILTER",
                 "CGROUP_FILTER",
-                "SLOT_SEMANTICS",
+                "DESCRIPTORS",
                 "ASYNC_FUNCTIONS",
                 "MECH_SHAPE",
             ]

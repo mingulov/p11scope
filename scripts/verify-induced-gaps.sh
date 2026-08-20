@@ -166,7 +166,7 @@ freeze_policy_maps() {
     manifest=$3
     sudo python3 - "$manifest" "$WORK/freeze-policy-map-ids" <<'PY'
 import json, os, sys
-expected = {"CONFIG", "PID_FILTER", "CGROUP_FILTER", "SLOT_SEMANTICS",
+expected = {"CONFIG", "PID_FILTER", "CGROUP_FILTER", "DESCRIPTORS",
             "ASYNC_FUNCTIONS", "MECH_SHAPE", "ATTR_BOOL_BITS", "TEMPLATE_TAIL"}
 items = {item["name"]: item['id'] for item in json.load(open(sys.argv[1]))}
 assert set(items) >= expected, (set(items), expected)

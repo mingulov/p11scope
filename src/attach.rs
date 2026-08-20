@@ -280,8 +280,8 @@ fn detach_selected_with<T>(
         .collect()
 }
 
-fn attached_probes_after_detach(attached: usize) -> usize {
-    attached
+fn attached_probes_after_detach(attached: usize, live_attached: usize, terminal: bool) -> usize {
+    if terminal { attached } else { live_attached }
 }
 
 /// Renders `e` and every `.source()` beneath it, joined by `: `. Several
@@ -840,7 +840,10 @@ impl Session {
     /// delta. Each attempt is made even if an earlier Aya detach failed.
     pub fn detach_slots(&mut self, slots: &[Slot]) -> Result<()> {
         let slots: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
-        self.detach_links(|link| link.slot().is_some_and(|slot| slots.contains(&slot)))
+        self.detach_links(
+            |link| link.slot().is_some_and(|slot| slots.contains(&slot)),
+            false,
+        )
     }
 
     /// Detach every event/map producer while keeping the maps and ring reader
@@ -849,14 +852,18 @@ impl Session {
     /// removed last. Kernel detach does not wait for callbacks already running
     /// on another CPU; callers must not claim that the terminal drain is final.
     pub fn detach_producers(&mut self) -> Result<()> {
-        self.detach_links(|_| true)
+        self.detach_links(|_| true, true)
     }
 
     fn has_slot_link(&self, slot: u32) -> bool {
         self.links.iter().any(|link| link.slot() == Some(slot))
     }
 
-    fn detach_links(&mut self, mut select: impl FnMut(&RegisteredLink) -> bool) -> Result<()> {
+    fn detach_links(
+        &mut self,
+        mut select: impl FnMut(&RegisteredLink) -> bool,
+        terminal: bool,
+    ) -> Result<()> {
         let mut selected = Vec::new();
         let mut retained = Vec::new();
         for link in std::mem::take(&mut self.links) {
@@ -867,6 +874,11 @@ impl Session {
             }
         }
         self.links = retained;
+        let live_attached = self
+            .links
+            .iter()
+            .filter(|link| matches!(link, RegisteredLink::UProbe { .. }))
+            .count();
 
         let mut first_error = None;
         for error in detach_selected_with(
@@ -882,7 +894,7 @@ impl Session {
                 first_error = Some(anyhow!(message));
             }
         }
-        self.attached = attached_probes_after_detach(self.attached);
+        self.attached = attached_probes_after_detach(self.attached, live_attached, terminal);
         first_error.map_or(Ok(()), Err)
     }
 
@@ -1051,8 +1063,22 @@ mod tests {
     }
 
     #[test]
-    fn terminal_detach_retains_cumulative_attached_probe_evidence() {
-        assert_eq!(attached_probes_after_detach(136), 136);
+    fn replacing_a_slot_recounts_live_attachments_but_terminal_drain_keeps_evidence() {
+        let initial =
+            attach_targets_with(&[test_slot(0)], CapturePolicy::Allowlisted, |_, _| Ok(()));
+        assert_eq!(initial.attached, 2);
+
+        let after_live_detach = attached_probes_after_detach(initial.attached, 0, false);
+        assert_eq!(after_live_detach, 0);
+
+        let replacement =
+            attach_targets_with(&[test_slot(0)], CapturePolicy::Allowlisted, |_, _| Ok(()));
+        let attached_after_replacement = after_live_detach + replacement.attached;
+        assert_eq!(attached_after_replacement, 2);
+        assert_eq!(
+            attached_probes_after_detach(attached_after_replacement, 0, true),
+            2
+        );
     }
 
     #[test]

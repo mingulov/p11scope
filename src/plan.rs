@@ -224,6 +224,35 @@ impl AttachPlan {
         }
     }
 
+    /// Rebuilds the one complete, capacity-aware snapshot a live caller passes
+    /// unchanged to [`Self::extend_exact`]. Historical allocations remain
+    /// reserved; active exact keys consume no additional slot.
+    pub fn rebuild_from_sources(
+        &self,
+        scanned: &[ReconciledModule],
+        manifests: &[Manifest],
+        pinned: &PinnedObjects,
+    ) -> AttachPlan {
+        self.rebuild_from_sources_with(scanned, manifests, |key, path| {
+            pinned.id_for_manifest(key, path)
+        })
+    }
+
+    fn rebuild_from_sources_with(
+        &self,
+        scanned: &[ReconciledModule],
+        manifests: &[Manifest],
+        pinned_id: impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId>,
+    ) -> AttachPlan {
+        build_from_sources_with(
+            scanned,
+            manifests,
+            pinned_id,
+            self.slots.len(),
+            &self.slot_by_key,
+        )
+    }
+
     /// True while this slot still accepts probes. Retired slots remain in
     /// `slots` so their already-collected aggregate-map cells stay stable.
     pub fn is_active(&self, slot: u32) -> bool {
@@ -252,7 +281,7 @@ impl AttachPlan {
         self.validate_slot_index()?;
         rebuilt.validate_slot_index()?;
         self.remap_modules(&mut rebuilt)?;
-        self.refuse_over_capacity_modules(&mut rebuilt);
+        self.validate_extension_capacity(&rebuilt)?;
 
         let mut slots = self.slots.clone();
         let mut slot_by_key = self.slot_by_key.clone();
@@ -320,6 +349,22 @@ impl AttachPlan {
             .filter(|slot| slot.module_ids.len() >= 2)
             .count();
         Ok(delta)
+    }
+
+    fn validate_extension_capacity(&self, rebuilt: &AttachPlan) -> Result<(), String> {
+        let additions = rebuilt
+            .slots
+            .iter()
+            .filter(|slot| !self.slot_by_key.contains_key(&AttachKey::of(slot)))
+            .count();
+        let required = self.slots.len() + additions;
+        if required > MAX_SLOTS as usize {
+            return Err(format!(
+                "attach plan requires {required} allocated slots but only {MAX_SLOTS} are available; \
+                 refusing to attach a prefix"
+            ));
+        }
+        Ok(())
     }
 
     /// A failed replacement must not revive the old descriptor or reuse its
@@ -405,41 +450,6 @@ impl AttachPlan {
             return Err("exact attach index points outside the slot vector".into());
         }
         Ok(())
-    }
-
-    fn refuse_over_capacity_modules(&self, rebuilt: &mut AttachPlan) {
-        let mut accepted = BTreeSet::new();
-        let mut added = BTreeSet::new();
-        for module in &rebuilt.modules {
-            let needed: BTreeSet<_> = rebuilt
-                .slots
-                .iter()
-                .filter(|slot| slot.module_ids.contains(&module.id))
-                .map(AttachKey::of)
-                .filter(|key| !self.slot_by_key.contains_key(key) && !added.contains(key))
-                .collect();
-            if self.slots.len() + added.len() + needed.len() > MAX_SLOTS as usize {
-                rebuilt.modules_skipped.push(Skipped {
-                    subject: module.path.clone(),
-                    reason: format!(
-                        "module needs {} more of the {MAX_SLOTS} attach slots; {} are in use \
-                         — refusing to attach a prefix",
-                        needed.len(),
-                        self.slots.len() + added.len()
-                    ),
-                });
-            } else {
-                added.extend(needed);
-                accepted.insert(module.id);
-            }
-        }
-        rebuilt
-            .modules
-            .retain(|module| accepted.contains(&module.id));
-        for slot in &mut rebuilt.slots {
-            slot.module_ids.retain(|id| accepted.contains(id));
-        }
-        rebuilt.slots.retain(|slot| !slot.module_ids.is_empty());
     }
 
     fn remap_modules(&self, rebuilt: &mut AttachPlan) -> Result<(), String> {
@@ -556,6 +566,8 @@ fn merge(
     discovered: Vec<Discovered<'_>>,
     vendor_interfaces: usize,
     interface_list: String,
+    allocated_slots: usize,
+    existing_slots: &BTreeMap<AttachKey, usize>,
 ) -> AttachPlan {
     let capacity = MAX_SLOTS as usize;
     let mut groups: Vec<Vec<Discovered<'_>>> = Vec::new();
@@ -576,29 +588,37 @@ fn merge(
     let mut skipped = Vec::new();
     let mut surfaces = Vec::new();
     let mut entries_seen = 0usize;
+    let mut allocated_slots = allocated_slots;
     for group in groups {
         let key = group[0].key;
         let object = group[0].object;
         let path = group[0].path;
         let source = group[0].source;
-        let wanted: BTreeSet<(PinnedObjectId, u64)> = group
+        let wanted: BTreeSet<AttachKey> = group
             .iter()
             .flat_map(|module| &module.targets)
-            .map(|target| (target.object, target.file_offset))
-            .filter(|target| !positions.contains_key(target))
+            .map(|target| AttachKey {
+                object: target.object,
+                file_offset: target.file_offset,
+            })
+            .filter(|target| {
+                !positions.contains_key(&(target.object, target.file_offset))
+                    && !existing_slots.contains_key(target)
+            })
             .collect();
-        if building.len() + wanted.len() > capacity {
+        if allocated_slots + wanted.len() > capacity {
             modules_skipped.push(Skipped {
                 subject: path.to_string(),
                 reason: format!(
                     "module needs {} more of the {MAX_SLOTS} attach slots; {} are in use \
                      — refusing to attach a prefix",
                     wanted.len(),
-                    building.len()
+                    allocated_slots
                 ),
             });
             continue;
         }
+        allocated_slots += wanted.len();
 
         // One object is one module however many sources described it. A manifest
         // corroborating a scanned module must not read as two rivals claiming the same
@@ -773,6 +793,8 @@ pub fn build_from_reconciled_modules(modules: &[ReconciledModule]) -> AttachPlan
         modules.iter().map(lower_scanned).collect(),
         0,
         "absent".into(),
+        0,
+        &BTreeMap::new(),
     )
 }
 
@@ -785,15 +807,21 @@ pub fn build_from_sources(
     manifests: &[Manifest],
     pinned: &PinnedObjects,
 ) -> AttachPlan {
-    build_from_sources_with(scanned, manifests, |key, path| {
-        pinned.id_for_manifest(key, path)
-    })
+    build_from_sources_with(
+        scanned,
+        manifests,
+        |key, path| pinned.id_for_manifest(key, path),
+        0,
+        &BTreeMap::new(),
+    )
 }
 
 fn build_from_sources_with(
     scanned: &[ReconciledModule],
     manifests: &[Manifest],
     mut pinned_id: impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId>,
+    allocated_slots: usize,
+    existing_slots: &BTreeMap<AttachKey, usize>,
 ) -> AttachPlan {
     let mut discovered: Vec<Discovered<'_>> = scanned.iter().map(lower_scanned).collect();
     let mut orphaned = Vec::new();
@@ -812,6 +840,8 @@ fn build_from_sources_with(
             || "absent".to_string(),
             |m| acquisition_label(&m.interface_list),
         ),
+        allocated_slots,
+        existing_slots,
     );
     plan.skipped.extend(orphaned);
     plan
@@ -819,9 +849,13 @@ fn build_from_sources_with(
 
 #[cfg(test)]
 fn build_from_test_sources(scanned: &[ReconciledModule], manifests: &[Manifest]) -> AttachPlan {
-    build_from_sources_with(scanned, manifests, |key, _| {
-        u32::try_from(key.inode).ok().map(PinnedObjectId)
-    })
+    build_from_sources_with(
+        scanned,
+        manifests,
+        |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
+        0,
+        &BTreeMap::new(),
+    )
 }
 
 fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
@@ -944,6 +978,8 @@ fn build(m: &Manifest) -> AttachPlan {
         discovered.into_iter().collect(),
         m.vendor_interfaces.len(),
         acquisition_label(&m.interface_list),
+        0,
+        &BTreeMap::new(),
     );
     plan.skipped.extend(orphaned);
     plan
@@ -1281,6 +1317,8 @@ mod tests {
             std::slice::from_ref(&scanned),
             std::slice::from_ref(&manifest),
             |_, _| Some(manifest_object),
+            0,
+            &BTreeMap::new(),
         );
 
         assert_eq!(plan.slots.len(), 2, "distinct pinned objects stay distinct");
@@ -1667,6 +1705,39 @@ mod tests {
         plan
     }
 
+    fn discovered_for_capacity(
+        object: PinnedObjectId,
+        path: &'static str,
+        targets: impl IntoIterator<Item = (PinnedObjectId, u64)>,
+    ) -> Discovered<'static> {
+        let targets: Vec<_> = targets
+            .into_iter()
+            .map(|(object, file_offset)| Target {
+                name: "C_Sign",
+                object,
+                object_path: "/proc/self/fd/target",
+                file_offset,
+                fork_safe: false,
+                semantic_authorized: true,
+            })
+            .collect();
+        Discovered {
+            object,
+            key: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: u64::from(object.0),
+            },
+            path,
+            source: "manifest",
+            tables: vec![],
+            interfaces: 0,
+            surfaces: vec![],
+            entries_seen: targets.len(),
+            targets,
+            skipped: vec![],
+        }
+    }
+
     #[test]
     fn extend_exact_keeps_initial_slots_and_indices_unchanged() {
         let object = PinnedObjectId(1);
@@ -1756,32 +1827,19 @@ mod tests {
     #[test]
     fn extend_exact_refuses_only_a_crossing_module_after_retirement() {
         let old = PinnedObjectId(10);
-        let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
+        let old_key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: u64::from(old.0),
+        };
         let mut plan = exact_plan(
             (0..511)
-                .map(|index| {
-                    exact_slot(
-                        index,
-                        old,
-                        u64::from(index) * 8,
-                        descriptor,
-                        vec![ModuleId(0)],
-                    )
-                })
+                .map(|index| exact_slot(index, old, u64::from(index) * 8, 0, vec![ModuleId(0)]))
                 .collect(),
             vec![exact_module(0, old)],
         );
         plan.extend_exact(exact_plan(
             (0..500)
-                .map(|index| {
-                    exact_slot(
-                        index,
-                        old,
-                        u64::from(index) * 8,
-                        descriptor,
-                        vec![ModuleId(0)],
-                    )
-                })
+                .map(|index| exact_slot(index, old, u64::from(index) * 8, 0, vec![ModuleId(0)]))
                 .collect(),
             vec![exact_module(0, old)],
         ))
@@ -1789,39 +1847,29 @@ mod tests {
 
         let crossing = PinnedObjectId(11);
         let later = PinnedObjectId(12);
-        let rebuilt = exact_plan(
-            (0..500)
-                .map(|index| {
-                    exact_slot(
-                        index,
-                        old,
-                        u64::from(index) * 8,
-                        descriptor,
-                        vec![ModuleId(0)],
-                    )
-                })
-                .chain((0..3).map(|offset| {
-                    exact_slot(
-                        500 + offset,
-                        crossing,
-                        0x1000 + u64::from(offset) * 8,
-                        descriptor,
-                        vec![ModuleId(1)],
-                    )
-                }))
-                .chain(std::iter::once(exact_slot(
-                    503,
-                    later,
-                    0x2000,
-                    descriptor,
-                    vec![ModuleId(2)],
-                )))
-                .collect(),
-            vec![
-                exact_module(0, old),
-                exact_module(1, crossing),
-                exact_module(2, later),
+        let pinned = PinnedObjects::empty();
+        let rebuilt = plan.rebuild_from_sources(
+            &[
+                scanned_with(old_key, "/opt/old.so", (0..500).map(|index| index * 8)),
+                scanned_with(
+                    ObjectKey {
+                        device: Device { major: 8, minor: 1 },
+                        inode: u64::from(crossing.0),
+                    },
+                    "/opt/crossing.so",
+                    [0x1000, 0x1008, 0x1010],
+                ),
+                scanned_with(
+                    ObjectKey {
+                        device: Device { major: 8, minor: 1 },
+                        inode: u64::from(later.0),
+                    },
+                    "/opt/later.so",
+                    [0x2000],
+                ),
             ],
+            &[],
+            &pinned,
         );
 
         let delta = plan.extend_exact(rebuilt).unwrap();
@@ -1835,10 +1883,123 @@ mod tests {
                 .iter()
                 .map(|module| module.id)
                 .collect::<Vec<_>>(),
-            [ModuleId(0), ModuleId(2)]
+            [ModuleId(0), ModuleId(1)]
         );
         assert_eq!(plan.modules_skipped.len(), 1);
-        assert_eq!(plan.modules_skipped[0].subject, "/opt/module11.so");
+        assert_eq!(plan.modules_skipped[0].subject, "/opt/crossing.so");
+    }
+
+    #[test]
+    fn capacity_rejection_retires_every_existing_key_and_admits_a_later_module() {
+        let existing = PinnedObjectId(10);
+        let later = PinnedObjectId(12);
+        let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
+        let mut plan = exact_plan(
+            (0..511)
+                .map(|index| {
+                    exact_slot(
+                        index,
+                        existing,
+                        u64::from(index) * 8,
+                        descriptor,
+                        vec![ModuleId(0)],
+                    )
+                })
+                .collect(),
+            vec![exact_module(0, existing)],
+        );
+        let pinned = PinnedObjects::empty();
+        let rebuilt = plan.rebuild_from_sources(
+            &[
+                scanned_with(
+                    ObjectKey {
+                        device: Device { major: 8, minor: 1 },
+                        inode: u64::from(existing.0),
+                    },
+                    "/opt/existing-crossing.so",
+                    [0, 0x1000, 0x1008],
+                ),
+                scanned_with(
+                    ObjectKey {
+                        device: Device { major: 8, minor: 1 },
+                        inode: u64::from(later.0),
+                    },
+                    "/opt/later-fitting.so",
+                    [0x2000],
+                ),
+            ],
+            &[],
+            &pinned,
+        );
+
+        assert_eq!(rebuilt.modules.len(), 1);
+        assert_eq!(rebuilt.modules[0].object, later);
+        assert_eq!(rebuilt.modules_skipped.len(), 1);
+        assert_eq!(
+            rebuilt.modules_skipped[0].subject,
+            "/opt/existing-crossing.so"
+        );
+
+        let delta = plan.extend_exact(rebuilt).unwrap();
+
+        assert_eq!(delta.retire.len(), 511);
+        assert!(delta.retire.iter().all(|slot| slot.object == existing));
+        assert!((0..511).all(|slot| !plan.is_active(slot)));
+        assert_eq!(delta.new.len(), 1);
+        assert_eq!(delta.new[0].index, 511);
+        assert_eq!(delta.new[0].object, later);
+        assert!(plan.is_active(511));
+    }
+
+    #[test]
+    fn a_rejected_shared_claimant_cannot_downgrade_an_accepted_slot() {
+        let accepted = PinnedObjectId(1);
+        let rejected = PinnedObjectId(2);
+        let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
+        let mut plan = exact_plan(
+            (0..511)
+                .map(|index| {
+                    exact_slot(
+                        index,
+                        accepted,
+                        u64::from(index) * 8,
+                        descriptor,
+                        vec![ModuleId(0)],
+                    )
+                })
+                .collect(),
+            vec![exact_module(0, accepted)],
+        );
+        let rebuilt = merge(
+            vec![
+                discovered_for_capacity(accepted, "/opt/accepted.so", [(accepted, 0)]),
+                discovered_for_capacity(
+                    rejected,
+                    "/opt/rejected.so",
+                    [(accepted, 0), (rejected, 0x1000), (rejected, 0x1008)],
+                ),
+            ],
+            0,
+            "absent".into(),
+            plan.slots.len(),
+            &plan.slot_by_key,
+        );
+
+        assert_eq!(rebuilt.modules.len(), 1);
+        assert_eq!(rebuilt.modules[0].object, accepted);
+        assert_eq!(rebuilt.modules_skipped.len(), 1);
+        assert_eq!(rebuilt.modules_skipped[0].subject, "/opt/rejected.so");
+        assert_eq!(rebuilt.slots.len(), 1);
+        assert_eq!(rebuilt.slots[0].descriptor_index, descriptor);
+        assert!(!rebuilt.slots[0].semantic_ambiguous);
+        assert_eq!(rebuilt.slots[0].module_ids, [ModuleId(0)]);
+
+        let delta = plan.extend_exact(rebuilt).unwrap();
+
+        assert!(delta.replace.is_empty());
+        assert_eq!(plan.slots[0].descriptor_index, descriptor);
+        assert!(!plan.slots[0].semantic_ambiguous);
+        assert_eq!(plan.slots[0].module_ids, [ModuleId(0)]);
     }
 
     #[test]

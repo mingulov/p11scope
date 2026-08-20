@@ -579,7 +579,7 @@ program, but userspace arming remains disabled until Task 7.
   Non-pause PID scopes use fixed token `1`; an owned `run` session allocates
   one nonzero token and binds it privately to its retained original `PidPin`.
   Define `FLAG_PAUSE_ENABLED = 1 << 5`; set it only for an owned PID scope
-  with `Some` generation.
+  with `Some(OwnedPauseGeneration)`.
 - [ ] Freeze `PauseKey` as `#[repr(C)] { tgid: u32, pad: u32,
   generation_token: u64 }`; `pad` is zero and values are exactly `ARMED = 1`
   or `REQUESTED = 2`. BPF obtains the token from the already scoped current-
@@ -592,8 +592,9 @@ program, but userspace arming remains disabled until Task 7.
   before reap, and never reuses the token in one capture. No token map, token
   record field, or public epoch is added.
 - [ ] Enforce the scope matrix: PID + `None` publishes token 1 with pause off;
-  cgroup + `None` leaves `PID_FILTER` empty with pause off; PID + `Some` is
-  pause-enabled only for the owned run PID and its exact token; external
+  cgroup + `None` leaves `PID_FILTER` empty with pause off; PID +
+  `Some(OwnedPauseGeneration)` is pause-enabled only for the owned run PID and
+  its exact token; external
   `--pid` and cgroup + `Some` refuse before any mutation. When a PID scope
   uses `PID_FILTER`, a missing or zero token emits
   no record; cgroup scope bypasses PID_FILTER. After valid scope, an absent
@@ -602,18 +603,24 @@ program, but userspace arming remains disabled until Task 7.
   CAS/helper call. Separately, if `arm_pause()` observes a `PID_FILTER`
   readback token mismatch, it performs no `PAUSE_PIDS` insertion or arm; this
   mismatch does not suppress ordinary discovery from an otherwise valid scope.
-- [ ] Thread the token through one narrow API:
-  `Session::start(..., pause_generation: Option<NonZeroU64>)` has exactly that
-  preserved argument and the exact two existing non-run callers pass `None`;
-  only the owned-run path introduced in Task 7 may pass `Some`. After
-  `scope::publish` validates that argument, private `Option<PauseKey>` is
-  `Some` only when derived from the
-  exact owned PID/token and otherwise is `None`; `None` has no pause key even
-  though PID scope publishes token 1. Crate-internal `arm_pause()` takes no
-  PID or token, is the sole userspace insertion path, and has no Task 5
-  caller. `Session`'s mutable `Ebpf` is non-public; the separate `src/main.rs`
-  binary uses only fixed-purpose visible drain/read methods and exposes no
-  mutable `Ebpf` or map handle.
+- [ ] Define in `src/attach.rs` the public opaque capability exactly as
+  `pub struct OwnedPauseGeneration { tgid: u32, generation: NonZeroU64 }` with
+  both fields private. It has no public constructor, `from_parts`/conversion,
+  field accessor, or public way to fabricate the exact PID/token state.
+  Preserve the final API as
+  `Session::start(..., pause_generation: Option<OwnedPauseGeneration>)`.
+  Before any map mutation, `Session` rejects `Some(capability)` unless the
+  scope is `Scope::Pid(pid)` and `capability.tgid == pid`; cgroup + `Some` and
+  a PID/tgid mismatch refuse before scope/config/PID_FILTER/PAUSE_PIDS
+  publication. After this precondition passes and `scope::publish` succeeds,
+  private `Option<PauseKey>` is `Some` only for that exact owned PID/token and
+  otherwise is `None`; `None` has no pause key even though PID scope publishes
+  token 1. The exact two existing binary callers pass `None`; Task 5 has no
+  `Some` caller or capability constructor. Crate-internal `arm_pause()` takes
+  no PID or token, is the sole userspace insertion path, and has no Task 5
+  caller. `Session`'s mutable `Ebpf` is non-public; the separate
+  `src/main.rs` binary uses only fixed-purpose visible drain/read methods and
+  exposes no mutable `Ebpf` or map handle.
 - [ ] RED-test no arming: the exact two existing `start` callers pass `None`,
   `start`, `start_inner`, and `scope::publish` never insert or arm,
   `arm_pause()` is the sole production insertion path, and no production arm
@@ -623,6 +630,13 @@ program, but userspace arming remains disabled until Task 7.
   `arm_pause()` `PID_FILTER` readback mismatch inserts/arms nothing; and an
   absent/stale exact `PAUSE_PIDS` key submits the ordinary rc-zero record with
   no CAS/helper. Authorization removal uses the same full key.
+- [ ] Add source and mutation guards before production implementation: prove
+  `OwnedPauseGeneration` fields are private, no public constructor or raw
+  token/parts conversion exists, the exact two existing `Session::start`
+  callers pass `None`, and Task 5 contains no `Some` caller or constructor.
+  The only permitted constructor/caller is the Task 7 path below. Mutate a
+  PID/tgid mismatch and a cgroup + capability case and assert refusal occurs
+  before any CONFIG, PID_FILTER, PAUSE_PIDS, link, or other map mutation.
 - [ ] Add the pause-enabled `CONFIG` bit through `src/scope.rs`, read it back,
   and include this frozen policy inventory in `src/attach.rs`: `CONFIG`,
   `PID_FILTER`, `CGROUP_FILTER`, `DESCRIPTORS`, `ASYNC_FUNCTIONS`, and
@@ -883,9 +897,14 @@ separate; do not create a framework or async runtime.
 - [ ] `auto|always` outside an owned `run` child are refused by parsing/caller
   validation before BPF state changes.
 - [ ] Preflight freezes expected task set and proves original-pidfd signal
-  authority, binds one nonzero capture-generation token, and revalidates the
-  same `PidPin` before inserting the full `{tgid, token}` `ARMED` key or
-  releasing the barrier.
+  authority while holding the private `OwnedChild`. Task 7 then invokes the
+  sole `OwnedPauseGeneration::from_owned_child(&OwnedChild)` crate-private
+  constructor in `attach.rs`, requiring that `OwnedChild`
+  (not merely a `PidPin`) and reading its exact owned PID plus private nonzero
+  generation into `OwnedPauseGeneration`. It accepts no caller-supplied raw
+  PID or token. The coordinator revalidates the same `PidPin` immediately
+  before inserting the full `{tgid, token}` `ARMED` key and again after every
+  record decode; only then may it release the barrier.
 - [ ] One owner accepts one winner; coalesced records expand only its required
   attach set. Reservation loss before CAS consumes no authorization but becomes
   one finite attempt under explicit pause.
@@ -932,6 +951,11 @@ cargo +1.88 test --locked --test pause -- --nocapture
   decoded, before any fallible operation.
 - [ ] Cleanup is idempotent and non-short-circuiting. Signal handlers defer to
   the owner cleanup rather than re-entering it.
+- [ ] The only `Some(OwnedPauseGeneration)` construction and caller is this
+  owned-run path: its `attach.rs` crate-private constructor requires the
+  private `OwnedChild`, binds the exact owned PID and generation, and cannot be
+  reached from a `PidPin`-only or Task 5 path. No public constructor or raw
+  token conversion exists.
 - [ ] `Session` exposes crate-internal finite `arm_pause()` with no PID/token
   arguments, state read/remove, and discovery queue operations; it does not
   expose mutable `Ebpf`/map handles or own child policy.

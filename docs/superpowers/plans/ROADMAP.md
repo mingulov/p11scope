@@ -441,8 +441,16 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     Independent review classifies this as an oracle/proof timestamp defect,
     not an observed unsafe pause, but the campaign remains NON-PASS and Task 5
     stays locked pending a reviewed correction and a new qualifying campaign.
-    Product implementation remains OPEN and starts only after Slice 1b-1
-    lands. See the
+    **Corrected-oracle campaign (2026-08-20):** the reviewed correction at
+    `ae96c451` replaced that overconstrained timestamp comparison with the
+    required successful-resume-before-successor-dequeue boundary, without
+    changing BPF, maps, fixture, protocol, privacy, or timeout. The fixed KVM
+    matrix passed Gate A 2/2 and Gate B 120/120 (72 Outcome A, 48 Outcome B),
+    all eight lanes rc0 with no retries. The 943-entry ledger and independent
+    semantic/privacy/lifecycle review passed. Task 2 is complete and Task 5
+    is eligible, but has not started pending the owner-requested architecture
+    discussion. Product implementation remains OPEN and starts only after
+    Slice 1b-1 lands. See the
     [pause amendment](../specs/2026-08-19-slice1b2-no-busy-wait-pause-amendment.md).**
 - **Slice 2 — capture quality**: ring/epoll, budgets, safe-policy params, per-module profile
   sections, filters, snapshots.

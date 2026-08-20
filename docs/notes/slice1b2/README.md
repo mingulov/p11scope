@@ -327,3 +327,26 @@ the post-review handoff is `221dc0ed…`. Campaign verdict is **NON-PASS** and
 Task 5 remains locked. A correction must prove successful prior resume before
 successor consumption without requiring the earlier BPF hook timestamp to
 follow a later userspace clock sample, then receive review and a new campaign.
+
+## Corrected-oracle Gate A/B campaign (2026-08-20)
+
+The independently approved correction observes the required boundary directly:
+for Outcome B, successor dequeue must follow the prior successful resume.  It
+does not require the resumed child's earlier BPF hook timestamp to follow a
+later userspace clock sample.  BPF, maps, fixture, pause protocol, privacy
+schema, and the 100-ms bound are unchanged.
+
+The owner-approved no-replacement KVM campaign is sealed at
+`/home/user/src/m/p11scope-ws/incoming/slice1b2-task2-oracle-ae96c45.gqMe2UcI`
+on source `ae96c451`.  Gate A passed on Jammy 5.15 and Noble 6.8.  Gate B
+completed all six fixed cold boots: **120/120 PASS**, with 72 Outcome A and 48
+Outcome B rows.  All eight lanes returned rc0; no retry, replacement, timeout,
+or verifier/runtime/oracle/privacy/cleanup failure occurred.  Outcome-B
+successor dequeue followed successful prior resume by 5–139 us.
+
+The self-excluding ledger (`fb4a8bd8…`) verifies 943/943 entries.  Independent
+review (`task-2-review.md`, `bb515f46…`) recomputed both Gate A lanes, all 120
+Gate B rows, privacy/provenance, KVM/kernel identity, QCOW lifecycle, and
+cleanup and returned **APPROVED**.  Task 2 is complete and Task 5 is eligible;
+Task 5 has not started and is paused for the owner-requested architecture
+discussion.

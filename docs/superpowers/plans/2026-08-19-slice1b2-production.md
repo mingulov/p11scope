@@ -793,9 +793,12 @@ struct LoaderContext {
 - [ ] Test `prepared -> attached -> tombstoned -> removed` ordering; detach link,
   tombstone, drain queued records, then remove. A queued old record can never
   resolve as a new context.
-- [ ] Test generation, loader mapping, pinned identity, hook-IP formula, and
-  actual mapped companion-libc binding at event time. Any mismatch is one
-  finite truncated/context failure and no scan/attach action.
+- [ ] Test generation, exact loader mapping, pinned identity, and hook-IP
+  formula at event time. With D3=`no` and the compiled-in timing catalog
+  empty, do not select, guess, or bind a companion libc: timing remains
+  `unproven`, `initial_set_capture = none`, and completeness is sticky
+  `PARTIAL`. Any loader-context mismatch is one finite truncated/context
+  failure and no scan/attach action.
 - [ ] Freeze an empty compiled-in timing catalog. Unknown/current tuples remain
   `unproven`; they still use every-hit discovery. Do not add runtime config,
   package-name matching, version matching, or public catalog identity.

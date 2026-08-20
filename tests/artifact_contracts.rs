@@ -34,6 +34,163 @@ fn require_contract_marker(section: &str, marker: &str, contract: &str) -> Resul
     }
 }
 
+fn require_before(source: &str, first: &str, second: &str, contract: &str) -> Result<(), String> {
+    let first = source
+        .find(first)
+        .ok_or_else(|| format!("{contract} missing first marker {first:?}"))?;
+    let second = source
+        .find(second)
+        .ok_or_else(|| format!("{contract} missing second marker {second:?}"))?;
+    if first < second {
+        Ok(())
+    } else {
+        Err(format!("{contract} is out of order"))
+    }
+}
+
+fn assert_live_discovery_host_contract(
+    attach: &str,
+    scope: &str,
+    events: &str,
+    hooks: &str,
+    main: &str,
+) -> Result<(), String> {
+    for (marker, contract) in [
+        (
+            "pub struct OwnedPauseGeneration {\n    tgid: u32,\n    generation: NonZeroU64,\n}",
+            "opaque owned pause capability",
+        ),
+        ("pub(crate) ebpf: Ebpf,", "crate-only mutable Ebpf"),
+        (
+            "pause_generation: Option<OwnedPauseGeneration>,",
+            "five-argument Session start",
+        ),
+        (
+            "pub fn event_drain(&mut self) -> Result<events::Drain<'_>>",
+            "fixed-purpose public EVENTS drain",
+        ),
+        (
+            "pub(crate) fn discovery_drain(",
+            "crate-only DISCOVERY drain",
+        ),
+        (
+            "fn arm_pause(&mut self)",
+            "argument-free crate-internal pause arm",
+        ),
+    ] {
+        require_contract_marker(attach, marker, contract)?;
+    }
+    for (marker, contract) in [
+        (
+            "struct DiscoveryDrain<'a>",
+            "separate discovery drain owner",
+        ),
+        (
+            "ring: aya::maps::RingBuf<&'a mut MapData>,\n    malformed: u64,",
+            "independent drain malformed owner",
+        ),
+    ] {
+        require_contract_marker(events, marker, contract)?;
+    }
+    for (marker, contract) in [
+        ("pub fn id(&self, name: &str)", "stable hook ID lookup"),
+        ("pub fn by_id(&self, id: u32)", "stable hook reverse lookup"),
+    ] {
+        require_contract_marker(hooks, marker, contract)?;
+    }
+
+    for banned in ["pub tgid:", "pub generation:", "from_parts", "into_parts"] {
+        if attach.contains(banned) {
+            return Err(format!("opaque pause capability exposes {banned:?}"));
+        }
+    }
+    require_before(
+        attach,
+        "let pause_key = pause_key_for(",
+        "Self::start_inner(",
+        "owned capability validation before load",
+    )?;
+    require_before(
+        attach,
+        "crate::scope::publish(&mut ebpf, scope, policy, generation_token)",
+        "freeze_published_maps(&ebpf)",
+        "scope publication before base freeze",
+    )?;
+    require_before(
+        attach,
+        "freeze_published_maps(&ebpf)",
+        "for prog_name in programs",
+        "base freeze before program load",
+    )?;
+    require_before(
+        attach,
+        "for prog_name in programs",
+        "freeze_map(\n            \"DESCRIPTORS\"",
+        "all program loads before descriptor freeze",
+    )?;
+    require_before(
+        attach,
+        "publish_and_freeze_template_tail(&mut ebpf, object_has_unsafe, unsafe_enabled)",
+        ".attach(\"sched\", \"sched_process_fork\")",
+        "tail publication before first producer attach",
+    )?;
+
+    for (marker, contract) in [
+        (
+            "pub(crate) fn publish(",
+            "crate-only raw generation-token publication",
+        ),
+        ("HashMap<_, u32, u64>", "u64 PID_FILTER value"),
+        ("generation_token.unwrap_or(1)", "fixed ordinary PID token"),
+        ("FLAG_PAUSE_ENABLED", "pause config bit"),
+        ("key_size() != 4", "PID_FILTER key width readback"),
+        ("value_size() != 8", "PID_FILTER value width readback"),
+        (
+            "map_flags() != BPF_F_RDONLY_PROG",
+            "PID_FILTER flag readback",
+        ),
+    ] {
+        require_contract_marker(scope, marker, contract)?;
+    }
+
+    if main.matches("Session::start(").count() != 2
+        || main
+            .matches("Session::start(plan, &scope, pinned, policy, None)")
+            .count()
+            != 2
+    {
+        return Err("the exact two binary Session::start callers must pass None".into());
+    }
+    if main.contains("events::Drain::new(&mut session.ebpf)")
+        || main.matches("session.event_drain()?").count() != 2
+    {
+        return Err("the binary must use only the fixed-purpose event drain seam".into());
+    }
+    if attach.matches("map_mut(\"PAUSE_PIDS\")").count() != 1
+        || attach.matches("arm_pause(").count() != 1
+        || scope.contains("PAUSE_PIDS")
+    {
+        return Err("Task 5 must have one dormant arming insertion site and no caller".into());
+    }
+    for (marker, contract) in [
+        (
+            "let object_has_unsafe = cfg!(feature = \"unsafe-unvalidated-metadata\");",
+            "object-feature inventory selection",
+        ),
+        (
+            "let programs = expected_programs(object_has_unsafe);",
+            "complete object program load",
+        ),
+        (
+            "publish_and_freeze_template_tail(&mut ebpf, object_has_unsafe, unsafe_enabled)",
+            "safe-policy handling in the unsafe object",
+        ),
+    ] {
+        require_contract_marker(attach, marker, contract)?;
+    }
+    Ok(())
+}
+
 fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<(), String> {
     const COOKIE: &str = "cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),";
 
@@ -134,7 +291,7 @@ fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<
         ("let slot = slot_of(&ctx);", "entry low-word slot"),
         ("STATS.get_ptr_mut(slot)", "entry STATS slot"),
         (
-            "let key = StartKey { pid_tgid: helpers::bpf_get_current_pid_tgid(), slot, _pad: 0 };",
+            "let key = StartKey {\n        pid_tgid: helpers::bpf_get_current_pid_tgid(),\n        slot,\n        _pad: 0,\n    };",
             "entry START slot",
         ),
         (
@@ -153,7 +310,7 @@ fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<
     for (marker, contract) in [
         ("let slot = slot_of(&ctx);", "return low-word slot"),
         (
-            "let key = StartKey { pid_tgid: helpers::bpf_get_current_pid_tgid(), slot, _pad: 0 };",
+            "let key = StartKey {\n        pid_tgid: helpers::bpf_get_current_pid_tgid(),\n        slot,\n        _pad: 0,\n    };",
             "return START slot",
         ),
         ("START.get(&key)", "return START lookup"),
@@ -594,7 +751,17 @@ fn immutable_policy_maps() {
     assert_eq!(definitions["CGROUP_FILTER"][FLAGS], 0);
     assert!(!definitions.contains_key("ATTR_BOOL_BITS"));
     assert!(!definitions.contains_key("TEMPLATE_TAIL"));
-    for name in ["STATS", "START", "RV_COUNTS", "EVENTS", "EVIDENCE"] {
+    for name in [
+        "STATS",
+        "START",
+        "RV_COUNTS",
+        "EVENTS",
+        "EVIDENCE",
+        "DISCOVERY",
+        "DISCOVERY_STATE",
+        "COUNTERS",
+        "PAUSE_PIDS",
+    ] {
         assert_eq!(definitions[name][FLAGS], 0, "dynamic map {name}");
     }
 }
@@ -669,6 +836,118 @@ fn descriptor_cookie_and_publication_source_guard_rejects_contract_regressions()
         assert_descriptor_publication_contract(&changed_readback_refusal).is_err(),
         "publication must refuse an inexact descriptor readback"
     );
+}
+
+#[test]
+fn live_discovery_host_contract_is_opaque_fixed_purpose_and_unarmed() {
+    let attach = read("src/attach.rs");
+    let scope = read("src/scope.rs");
+    let events = read("src/events.rs");
+    let hooks = read("src/discovery/hooks.rs");
+    let main = read("src/main.rs");
+
+    assert_live_discovery_host_contract(&attach, &scope, &events, &hooks, &main).unwrap();
+
+    let public_ebpf = attach.replacen("pub(crate) ebpf: Ebpf,", "pub ebpf: Ebpf,", 1);
+    assert!(
+        assert_live_discovery_host_contract(&public_ebpf, &scope, &events, &hooks, &main).is_err(),
+        "a mutable Ebpf must not escape to the binary or external callers"
+    );
+    let fabricated = attach.replacen("    tgid: u32,", "    pub tgid: u32,", 1);
+    assert!(
+        assert_live_discovery_host_contract(&fabricated, &scope, &events, &hooks, &main).is_err(),
+        "the owned capability fields must remain opaque"
+    );
+    let armed_binary = main.replacen(
+        "Session::start(plan, &scope, pinned, policy, None)",
+        "Session::start(plan, &scope, pinned, policy, Some(capability))",
+        1,
+    );
+    assert!(
+        assert_live_discovery_host_contract(&attach, &scope, &events, &hooks, &armed_binary)
+            .is_err(),
+        "Task 5 must not gain a present-capability caller"
+    );
+    let shared_malformed =
+        events.replacen("struct DiscoveryDrain<'a>", "struct GenericDrain<'a>", 1);
+    assert!(
+        assert_live_discovery_host_contract(&attach, &scope, &shared_malformed, &hooks, &main)
+            .is_err(),
+        "DISCOVERY must keep its own fixed-purpose drain owner"
+    );
+}
+
+#[test]
+fn live_discovery_bpf_classification_is_exact_and_output_only() {
+    let source = read("crates/ebpf/src/main.rs");
+    let export = between(&source, "fn emit_export(", "fn export_symbol_id");
+    assert!(
+        export.contains("let mut bytes = [0u8; 9];"),
+        "the ninth byte must distinguish an exact standard name from a longer prefix"
+    );
+    assert!(
+        export.contains("read == 8 && bytes[..8] == *b\"PKCS 11\\0\""),
+        "interface classification must require the exact eight-byte string"
+    );
+
+    let listed = between(
+        &source,
+        "pub fn interface_list_return(ctx: RetProbeContext) -> u32 {",
+        "#[uprobe]\npub fn interface_entry",
+    );
+    let output_null = listed
+        .find("if state.arg0 == 0")
+        .expect("the valid count-query form must not read a null output array");
+    let loop_start = listed
+        .find("while interface_index < 16")
+        .expect("bounded interface loop");
+    assert!(output_null < loop_start);
+
+    for path in ["src/render.rs", "src/trace.rs", "src/output.rs"] {
+        assert!(
+            !read(path).contains("send_signal_rc"),
+            "private helper result escaped into {path}"
+        );
+    }
+}
+
+#[test]
+fn live_discovery_checker_rejects_mutations_and_noncanonical_source() {
+    let output = Command::new("python3")
+        .args(["scripts/check-live-discovery-object.py", "--self-test"])
+        .output()
+        .expect("run live-discovery checker self-test");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for marker in [
+        "live discovery source mutations rejected: OK",
+        "live discovery object mutations rejected: OK",
+        "unrelated memset positive control: OK",
+    ] {
+        assert!(stdout.contains(marker), "checker self-test misses {marker}");
+    }
+
+    let directory = tempfile::tempdir().expect("temporary checker directory");
+    let manifest = directory.path().join("manifest.json");
+    let rejected = Command::new("python3")
+        .args([
+            "scripts/check-live-discovery-object.py",
+            "--write-test-manifest",
+            "--source",
+            "crates/ebpf/src/main.rs",
+            "--variant",
+            "default",
+            "--output",
+        ])
+        .arg(&manifest)
+        .output()
+        .expect("reject noncanonical live-discovery source");
+    assert!(!rejected.status.success());
+    assert!(!manifest.exists());
 }
 
 #[test]

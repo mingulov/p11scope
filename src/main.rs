@@ -21,7 +21,7 @@ use p11scope::discovery::scan::{
 use p11scope::manifest_input::{read_manifest, validate_structure};
 use p11scope::output::AtomicFile;
 use p11scope::process::{ProcessView, ProcessViewId};
-use p11scope::{doctor, events, inspect, metrics, plan, process, render, scope, semantics, trace};
+use p11scope::{doctor, inspect, metrics, plan, process, render, scope, semantics, trace};
 use p11scope_manifest::manifest::{Manifest, Resolution, SCHEMA};
 use p11scope_manifest::maps::ObjectKey;
 use std::collections::{BTreeMap, BTreeSet};
@@ -2129,7 +2129,7 @@ fn capture_profile(
         &mut discovered,
         named,
         process::stale_view_ids,
-        |plan, pinned| Session::start(plan, &scope, pinned, policy),
+        |plan, pinned| Session::start(plan, &scope, pinned, policy, None),
     )
     .context("starting attach session")?;
     let Discovered {
@@ -2156,7 +2156,7 @@ fn capture_profile(
                         state: &mut semantics::State,
                         tracker: &mut process::Tracker|
      -> Result<u64> {
-        let mut drain = events::Drain::new(&mut session.ebpf)?;
+        let mut drain = session.event_drain()?;
         drain.poll(|ev| {
             if observe_fork(tracker, state, &ev) {
                 return;
@@ -2323,7 +2323,7 @@ fn capture_trace(
         &mut discovered,
         named,
         process::stale_view_ids,
-        |plan, pinned| Session::start(plan, &scope, pinned, policy),
+        |plan, pinned| Session::start(plan, &scope, pinned, policy, None),
     )
     .context("starting attach session")?;
     let Discovered {
@@ -2498,7 +2498,7 @@ fn drain_trace_events<W: Write>(
     stdout_open: &mut bool,
     out_file: &mut Option<W>,
 ) -> Result<u64> {
-    let mut drain = events::Drain::new(&mut session.ebpf)?;
+    let mut drain = session.event_drain()?;
     let mut write_error = None;
     drain.poll(|ev| {
         if observe_fork(tracker, state, &ev) {

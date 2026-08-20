@@ -5,10 +5,14 @@ use crate::attach::{CapturePolicy, Scope};
 use anyhow::{Context as _, Result, bail};
 use aya::Ebpf;
 use aya::maps::{Array, CgroupArray, HashMap, MapType};
-use p11scope_ebpf_common::{CFG_FLAGS, FLAG_CGROUP_FILTER, FLAG_PID_FILTER, valid_config};
+use p11scope_ebpf_common::{
+    CFG_FLAGS, FLAG_CGROUP_FILTER, FLAG_PAUSE_ENABLED, FLAG_PID_FILTER, valid_config,
+};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::Path;
+
+const BPF_F_RDONLY_PROG: u32 = 1 << 7;
 
 /// A cgroup's kernel id is its directory inode number — the value returned
 /// by `bpf_get_current_cgroup_id()` for a task directly inside it. Scope
@@ -54,12 +58,24 @@ pub fn label(root: &Path, target: u64) -> Option<String> {
 /// Publishes one exact scope and policy and verifies every supported
 /// readback. The cgroup descriptor opened for `--cgroup` is dropped on return —
 /// the kernel holds its own cgroup reference through the map.
-pub fn publish(ebpf: &mut Ebpf, scope: &Scope, policy: CapturePolicy) -> Result<()> {
+pub(crate) fn publish(
+    ebpf: &mut Ebpf,
+    scope: &Scope,
+    policy: CapturePolicy,
+    generation_token: Option<u64>,
+) -> Result<()> {
+    if generation_token == Some(0) {
+        bail!("pause generation token must be non-zero");
+    }
+    if generation_token.is_some() && !matches!(scope, Scope::Pid(_)) {
+        bail!("pause generation requires PID scope");
+    }
     let scope_flag = match scope {
         Scope::Pid(_) => FLAG_PID_FILTER,
         Scope::Cgroup { .. } => FLAG_CGROUP_FILTER,
     };
-    let config = scope_flag | policy.config_bit();
+    let pause_flag = generation_token.map_or(0, |_| FLAG_PAUSE_ENABLED);
+    let config = scope_flag | policy.config_bit() | pause_flag;
     if !valid_config(config) {
         bail!("refusing invalid CONFIG {config:#x}");
     }
@@ -70,11 +86,19 @@ pub fn publish(ebpf: &mut Ebpf, scope: &Scope, policy: CapturePolicy) -> Result<
     )?
     .info()
     .context("reading PID_FILTER map info")?;
-    if pid_info.map_type()? != MapType::Hash || pid_info.max_entries() != 1024 {
+    if pid_info.map_type()? != MapType::Hash
+        || pid_info.key_size() != 4
+        || pid_info.value_size() != 8
+        || pid_info.max_entries() != 1024
+        || pid_info.map_flags() != BPF_F_RDONLY_PROG
+    {
         bail!(
-            "PID_FILTER has type {:?} and capacity {}, expected Hash and 1024",
+            "PID_FILTER has type {:?}, key/value {}/{}, capacity {}, flags {:#x}; expected Hash, 4/8, 1024, {BPF_F_RDONLY_PROG:#x}",
             pid_info.map_type()?,
-            pid_info.max_entries()
+            pid_info.key_size(),
+            pid_info.value_size(),
+            pid_info.max_entries(),
+            pid_info.map_flags()
         );
     }
 
@@ -99,10 +123,11 @@ pub fn publish(ebpf: &mut Ebpf, scope: &Scope, policy: CapturePolicy) -> Result<
             if *pid == 0 {
                 bail!("pid must be non-zero");
             }
-            let mut m: HashMap<_, u32, u8> =
+            let mut m: HashMap<_, u32, u64> =
                 HashMap::try_from(ebpf.map_mut("PID_FILTER").context("PID_FILTER map")?)?;
-            m.insert(*pid, 1, 0)?;
-            expected_pids.insert(*pid, 1);
+            let token = generation_token.unwrap_or(1);
+            m.insert(*pid, token, 0)?;
+            expected_pids.insert(*pid, token);
         }
         Scope::Cgroup { id, path } => {
             use std::os::unix::fs::MetadataExt as _;
@@ -127,7 +152,7 @@ pub fn publish(ebpf: &mut Ebpf, scope: &Scope, policy: CapturePolicy) -> Result<
         }
     }
 
-    let pids: HashMap<_, u32, u8> =
+    let pids: HashMap<_, u32, u64> =
         HashMap::try_from(ebpf.map("PID_FILTER").context("PID_FILTER map")?)?;
     let actual_pids = pids.iter().collect::<Result<BTreeMap<_, _>, _>>()?;
     if actual_pids != expected_pids {

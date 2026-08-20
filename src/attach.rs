@@ -2,6 +2,7 @@
 //! each slot; the attach cookie carries the slot index.
 
 use crate::discovery::identity::PinnedObjects;
+use crate::events;
 use crate::plan::{AttachPlan, Slot};
 use anyhow::{Context as _, Result, anyhow, bail};
 use aya::Ebpf;
@@ -12,11 +13,12 @@ use aya::programs::{TracePoint, UProbe};
 use p11scope_ebpf_common::{
     ARG_NONE, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
     FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, FUNCTION_NAME_MAX_BYTES, FunctionNameKey,
-    MAX_DESCRIPTORS, SlotSemantics, attach_cookie,
+    MAX_DESCRIPTORS, PAUSE_ARMED, PauseKey, SlotSemantics, attach_cookie,
 };
 use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::mem::{size_of, size_of_val};
+use std::num::NonZeroU64;
 use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::path::PathBuf;
 
@@ -30,6 +32,26 @@ const BASE_POLICY_MAPS: [&str; 6] = [
 ];
 const FEATURE_POLICY_MAPS: [&str; 1] = ["ATTR_BOOL_BITS"];
 const TAIL_POLICY_MAP: &str = "TEMPLATE_TAIL";
+const DEFAULT_PROGRAMS: [&str; 12] = [
+    "p11_entry",
+    "p11_return",
+    "sched_process_fork",
+    "dl_debug_state",
+    "function_list_entry",
+    "function_list_return",
+    "interface_list_entry",
+    "interface_list_return",
+    "interface_entry",
+    "interface_return",
+    "sched_process_exec",
+    "sched_process_exit",
+];
+const UNSAFE_PROGRAMS: [&str; 4] = [
+    "p11_entry_template",
+    "p11_entry_template_types",
+    "p11_entry_template_pair",
+    "p11_entry_template_second",
+];
 
 #[repr(C)]
 #[derive(Default)]
@@ -181,13 +203,38 @@ impl CapturePolicy {
     }
 }
 
+pub struct OwnedPauseGeneration {
+    tgid: u32,
+    generation: NonZeroU64,
+}
+
+fn pause_key_for(
+    scope: &Scope,
+    capability: Option<&OwnedPauseGeneration>,
+) -> Result<Option<PauseKey>> {
+    match (scope, capability) {
+        (_, None) => Ok(None),
+        (Scope::Pid(pid), Some(capability)) if *pid == capability.tgid => Ok(Some(PauseKey {
+            tgid: capability.tgid,
+            pad: 0,
+            generation_token: capability.generation.get(),
+        })),
+        (Scope::Pid(pid), Some(capability)) => bail!(
+            "owned pause generation PID {} does not match selected PID {pid}",
+            capability.tgid
+        ),
+        (Scope::Cgroup { .. }, Some(_)) => bail!("owned pause generation requires PID scope"),
+    }
+}
+
 pub struct Session {
-    pub ebpf: Ebpf,
+    pub(crate) ebpf: Ebpf,
     attach_failures: Vec<(u32, String)>,
     detach_failures: Vec<String>,
     attached: usize,
     policy: CapturePolicy,
     uprobe_scope: UProbeScope,
+    pause_key: Option<PauseKey>,
     links: Vec<RegisteredLink>,
 }
 
@@ -521,12 +568,95 @@ fn freeze_published_maps(ebpf: &Ebpf) -> Result<()> {
     Ok(())
 }
 
-fn publish_and_freeze_template_tail(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
+fn validate_runtime_map(
+    ebpf: &Ebpf,
+    name: &str,
+    map_type: MapType,
+    key_size: u32,
+    value_size: u32,
+    max_entries: u32,
+) -> Result<()> {
+    let map = ebpf.map(name).with_context(|| format!("{name} map"))?;
+    let data = match map {
+        Map::HashMap(map) | Map::PerCpuArray(map) | Map::RingBuf(map) => map,
+        other => bail!("refusing unexpected {name} runtime map variant {other:?}"),
+    };
+    let info = data
+        .info()
+        .with_context(|| format!("reading {name} map info"))?;
+    if info.map_type()? != map_type
+        || info.key_size() != key_size
+        || info.value_size() != value_size
+        || info.max_entries() != max_entries
+        || info.map_flags() != 0
+    {
+        bail!(
+            "{name} has type {:?}, key/value {}/{}, capacity {}, flags {:#x}; expected {map_type:?}, {key_size}/{value_size}, {max_entries}, 0",
+            info.map_type()?,
+            info.key_size(),
+            info.value_size(),
+            info.max_entries(),
+            info.map_flags()
+        );
+    }
+    Ok(())
+}
+
+fn validate_runtime_maps(ebpf: &Ebpf) -> Result<()> {
+    validate_runtime_map(
+        ebpf,
+        "DISCOVERY",
+        MapType::RingBuf,
+        0,
+        0,
+        p11scope_ebpf_common::DISCOVERY_BYTES,
+    )?;
+    validate_runtime_map(ebpf, "DISCOVERY_STATE", MapType::Hash, 16, 16, 64)?;
+    validate_runtime_map(
+        ebpf,
+        "COUNTERS",
+        MapType::PerCpuArray,
+        4,
+        8,
+        p11scope_ebpf_common::DISCOVERY_COUNTER_CELLS,
+    )?;
+    validate_runtime_map(ebpf, "PAUSE_PIDS", MapType::Hash, 16, 8, 1)
+}
+
+fn expected_programs(unsafe_enabled: bool) -> BTreeSet<&'static str> {
+    DEFAULT_PROGRAMS
+        .into_iter()
+        .chain(
+            unsafe_enabled
+                .then_some(UNSAFE_PROGRAMS)
+                .into_iter()
+                .flatten(),
+        )
+        .collect()
+}
+
+fn validate_program_inventory(ebpf: &Ebpf, unsafe_enabled: bool) -> Result<()> {
+    let expected = expected_programs(unsafe_enabled);
+    let actual: BTreeSet<_> = ebpf.programs().map(|(name, _)| name).collect();
+    if actual != expected {
+        bail!("eBPF program inventory {actual:?} differs from {expected:?}");
+    }
+    Ok(())
+}
+
+fn publish_and_freeze_template_tail(
+    ebpf: &mut Ebpf,
+    object_has_unsafe: bool,
+    enabled: bool,
+) -> Result<()> {
     if ebpf.map(TAIL_POLICY_MAP).is_none() {
-        if enabled {
+        if object_has_unsafe {
             bail!("{TAIL_POLICY_MAP} is missing from the diagnostic eBPF object");
         }
         return Ok(());
+    }
+    if !object_has_unsafe {
+        bail!("{TAIL_POLICY_MAP} must be absent from the default eBPF object");
     }
     let info = policy_map_data(
         TAIL_POLICY_MAP,
@@ -596,13 +726,15 @@ impl Session {
         scope: &Scope,
         objects: &PinnedObjects,
         policy: CapturePolicy,
+        pause_generation: Option<OwnedPauseGeneration>,
     ) -> Result<Self> {
+        let pause_key = pause_key_for(scope, pause_generation.as_ref())?;
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!(
                 "a pinned provider object changed before attach; refusing to observe changed bytes"
             );
         }
-        let mut session = Self::start_inner(scope, policy)
+        let mut session = Self::start_inner(scope, policy, pause_key)
             .map_err(|e| anyhow!("{e:#}\n{UNSUPPORTED_ENV_HINT}"))?;
         session
             .attach_plan(plan, objects)
@@ -616,12 +748,22 @@ impl Session {
         Ok(session)
     }
 
-    fn start_inner(scope: &Scope, policy: CapturePolicy) -> Result<Self> {
+    fn start_inner(
+        scope: &Scope,
+        policy: CapturePolicy,
+        pause_key: Option<PauseKey>,
+    ) -> Result<Self> {
         if policy.uses_unsafe_decoders() && !cfg!(feature = "unsafe-unvalidated-metadata") {
             bail!("unsafe-unvalidated-metadata policy is absent from this eBPF object");
         }
         let mut ebpf = Ebpf::load(crate::EBPF_OBJECT).context("loading BPF object")?;
-        crate::scope::publish(&mut ebpf, scope, policy)
+        let object_has_unsafe = cfg!(feature = "unsafe-unvalidated-metadata");
+        let unsafe_enabled = object_has_unsafe && policy.uses_unsafe_decoders();
+        validate_runtime_maps(&ebpf).context("validating live-discovery runtime maps")?;
+        validate_program_inventory(&ebpf, object_has_unsafe)
+            .context("validating exact eBPF program inventory")?;
+        let generation_token = pause_key.map(|key| key.generation_token);
+        crate::scope::publish(&mut ebpf, scope, policy, generation_token)
             .context("publishing scope and capture policy")?;
         publish_descriptors(&mut ebpf).context("publishing DESCRIPTORS")?;
         publish_async_catalog(&mut ebpf).context("publishing ASYNC_FUNCTIONS")?;
@@ -634,8 +776,6 @@ impl Session {
                 .map_err(|e| anyhow!("loading mechanism registry: {e}"))?;
             crate::shapes::publish(&mut ebpf, &registry).context("publishing MECH_SHAPE")?;
         }
-        let unsafe_enabled =
-            cfg!(feature = "unsafe-unvalidated-metadata") && policy.uses_unsafe_decoders();
         publish_attribute_catalog(&mut ebpf, unsafe_enabled)
             .context("publishing ATTR_BOOL_BITS")?;
         freeze_published_maps(&ebpf).context("freezing published policy maps")?;
@@ -649,25 +789,23 @@ impl Session {
             Scope::Cgroup { .. } => UProbeScope::AllProcesses,
         };
 
-        let programs: &[&str] = if unsafe_enabled {
-            &[
-                "p11_return",
-                "p11_entry",
-                "p11_entry_template",
-                "p11_entry_template_types",
-                "p11_entry_template_pair",
-                "p11_entry_template_second",
-            ]
-        } else {
-            &["p11_return", "p11_entry"]
-        };
+        let programs = expected_programs(object_has_unsafe);
         for prog_name in programs {
-            let prog: &mut UProbe = ebpf
-                .program_mut(prog_name)
-                .with_context(|| format!("program {prog_name} missing from object"))?
-                .try_into()?;
-            prog.load()
-                .with_context(|| format!("loading {prog_name}"))?;
+            if prog_name.starts_with("sched_process_") {
+                let prog: &mut TracePoint = ebpf
+                    .program_mut(prog_name)
+                    .with_context(|| format!("program {prog_name} missing from object"))?
+                    .try_into()?;
+                prog.load()
+                    .with_context(|| format!("loading {prog_name}"))?;
+            } else {
+                let prog: &mut UProbe = ebpf
+                    .program_mut(prog_name)
+                    .with_context(|| format!("program {prog_name} missing from object"))?
+                    .try_into()?;
+                prog.load()
+                    .with_context(|| format!("loading {prog_name}"))?;
+            }
         }
         // Linux can constant-fold frozen arrays, but returns its internal
         // ENOTSUPP for direct reads before the program is loaded.
@@ -678,7 +816,7 @@ impl Session {
             ebpf.map("DESCRIPTORS").context("DESCRIPTORS map")?,
         )
         .context("freezing DESCRIPTORS")?;
-        publish_and_freeze_template_tail(&mut ebpf, unsafe_enabled)
+        publish_and_freeze_template_tail(&mut ebpf, object_has_unsafe, unsafe_enabled)
             .context("publishing and freezing TEMPLATE_TAIL")?;
 
         let mut links = Vec::new();
@@ -687,7 +825,6 @@ impl Session {
                 .program_mut("sched_process_fork")
                 .context("program sched_process_fork missing from object")?
                 .try_into()?;
-            fork.load().context("loading sched_process_fork")?;
             let id = fork
                 .attach("sched", "sched_process_fork")
                 .context("attaching sched_process_fork")?;
@@ -704,6 +841,7 @@ impl Session {
             attached: 0,
             policy,
             uprobe_scope,
+            pause_key,
             links,
         })
     }
@@ -921,6 +1059,48 @@ impl Session {
                     .with_context(|| format!("detaching {program}"))
             })(),
         }
+    }
+
+    pub fn event_drain(&mut self) -> Result<events::Drain<'_>> {
+        events::Drain::new(&mut self.ebpf)
+    }
+
+    #[allow(dead_code)] // Task 6 owns the first caller.
+    pub(crate) fn discovery_drain(&mut self) -> Result<events::DiscoveryDrain<'_>> {
+        events::DiscoveryDrain::new(&mut self.ebpf)
+    }
+
+    #[allow(dead_code)] // Task 7 owns the first caller.
+    pub(crate) fn arm_pause(&mut self) -> Result<()> {
+        let key = self
+            .pause_key
+            .context("this session has no owned pause generation")?;
+        let pid_filter: HashMap<_, u32, u64> =
+            HashMap::try_from(self.ebpf.map("PID_FILTER").context("PID_FILTER map")?)?;
+        let token = pid_filter
+            .get(&key.tgid, 0)
+            .context("reading back owned PID_FILTER generation token")?;
+        if token == 0 || token != key.generation_token {
+            bail!("PID_FILTER generation token changed; refusing to arm pause");
+        }
+
+        let mut pauses: HashMap<_, PauseKey, u64> =
+            HashMap::try_from(self.ebpf.map_mut("PAUSE_PIDS").context("PAUSE_PIDS map")?)?;
+        pauses.insert(key, PAUSE_ARMED, 0)?;
+        let actual = match pauses.get(&key, 0) {
+            Ok(actual) => actual,
+            Err(error) => {
+                let _ = pauses.remove(&key);
+                return Err(error).context("reading back PAUSE_PIDS authorization");
+            }
+        };
+        if actual != PAUSE_ARMED {
+            pauses
+                .remove(&key)
+                .context("removing inexact PAUSE_PIDS authorization")?;
+            bail!("PAUSE_PIDS exact full-key readback differs from ARMED");
+        }
+        Ok(())
     }
 
     /// Attach points that failed — reported as an evidence gap, never
@@ -1309,5 +1489,34 @@ mod tests {
         assert!(!line.contains(&format!("{raw_async_id:x}")));
         assert!(!line.contains(&raw_session.to_string()));
         assert!(!line.contains(&raw_async_id.to_string()));
+    }
+
+    /// Mutation caught: a caller can bind an owned generation capability to a
+    /// cgroup or a different PID before the load/mutation barrier.
+    #[test]
+    fn pause_capability_is_validated_into_one_private_full_key() {
+        let capability = OwnedPauseGeneration {
+            tgid: 42,
+            generation: std::num::NonZeroU64::new(99).unwrap(),
+        };
+        assert!(pause_key_for(&Scope::Pid(41), Some(&capability)).is_err());
+        assert!(
+            pause_key_for(
+                &Scope::Cgroup {
+                    id: 1,
+                    path: "/sys/fs/cgroup".into(),
+                },
+                Some(&capability),
+            )
+            .is_err()
+        );
+
+        let key = pause_key_for(&Scope::Pid(42), Some(&capability))
+            .unwrap()
+            .unwrap();
+        assert_eq!(key.tgid, 42);
+        assert_eq!(key.pad, 0);
+        assert_eq!(key.generation_token, 99);
+        assert!(pause_key_for(&Scope::Pid(42), None).unwrap().is_none());
     }
 }

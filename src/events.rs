@@ -7,20 +7,28 @@
 use anyhow::{Context as _, Result};
 use aya::Ebpf;
 use aya::maps::MapData;
-use p11scope_ebpf_common::Event;
+use p11scope_ebpf_common::{DiscoveryRecord, Event, valid_discovery_record};
 use std::mem::size_of;
+
+fn decode_exact<T: aya::Pod>(bytes: &[u8]) -> Option<T> {
+    if bytes.len() != size_of::<T>() {
+        return None;
+    }
+    // SAFETY: the exact length was checked and all shared transport types are
+    // repr(C) Pod values. Ring records need not satisfy T's alignment.
+    Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) })
+}
 
 /// Decodes one ring-buffer record into an `Event`, or `None` if its
 /// length doesn't match `size_of::<Event>()`.
 pub fn decode(bytes: &[u8]) -> Option<Event> {
-    if bytes.len() != size_of::<Event>() {
-        return None;
-    }
-    // SAFETY: length just verified above; `Event` is `#[repr(C)]`, `Pod`
-    // (any bit pattern is a valid value, per ebpf-common), and
-    // `read_unaligned` tolerates the ring buffer's unaligned record
-    // storage.
-    Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<Event>()) })
+    decode_exact(bytes)
+}
+
+#[allow(dead_code)] // Task 6 owns the first caller.
+pub(crate) fn decode_discovery(bytes: &[u8]) -> Option<DiscoveryRecord> {
+    let record = decode_exact(bytes)?;
+    valid_discovery_record(&record).then_some(record)
 }
 
 /// Drains the `EVENTS` ring buffer, handing each well-formed record to a
@@ -31,7 +39,7 @@ pub struct Drain<'a> {
 }
 
 impl<'a> Drain<'a> {
-    pub fn new(ebpf: &'a mut Ebpf) -> Result<Self> {
+    pub(crate) fn new(ebpf: &'a mut Ebpf) -> Result<Self> {
         let ring = aya::maps::RingBuf::try_from(ebpf.map_mut("EVENTS").context("EVENTS map")?)?;
         Ok(Self { ring, malformed: 0 })
     }
@@ -52,9 +60,41 @@ impl<'a> Drain<'a> {
     }
 }
 
+/// Fixed-purpose owner for the private live-discovery ring. Its malformed
+/// count is deliberately independent from the public call-event transport.
+#[allow(dead_code)] // Task 6 owns the first caller.
+pub(crate) struct DiscoveryDrain<'a> {
+    ring: aya::maps::RingBuf<&'a mut MapData>,
+    malformed: u64,
+}
+
+impl<'a> DiscoveryDrain<'a> {
+    pub(crate) fn new(ebpf: &'a mut Ebpf) -> Result<Self> {
+        let ring =
+            aya::maps::RingBuf::try_from(ebpf.map_mut("DISCOVERY").context("DISCOVERY map")?)?;
+        Ok(Self { ring, malformed: 0 })
+    }
+
+    #[allow(dead_code)] // Task 6 owns the first caller.
+    pub(crate) fn poll(&mut self, mut f: impl FnMut(DiscoveryRecord)) {
+        while let Some(item) = self.ring.next() {
+            match decode_discovery(&item) {
+                Some(record) => f(record),
+                None => self.malformed += 1,
+            }
+        }
+    }
+
+    #[allow(dead_code)] // Task 6 owns the first caller.
+    pub(crate) fn malformed(&self) -> u64 {
+        self.malformed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
 
     fn sample_event() -> Event {
         Event {
@@ -120,5 +160,36 @@ mod tests {
     #[test]
     fn empty_slice_is_rejected() {
         assert!(decode(&[]).is_none());
+    }
+
+    fn discovery_bytes(record: &DiscoveryRecord) -> Vec<u8> {
+        // SAFETY: the shared repr(C) record is transported as these exact raw
+        // bytes by the kernel ring buffer.
+        unsafe {
+            std::slice::from_raw_parts(
+                (record as *const DiscoveryRecord).cast::<u8>(),
+                size_of::<DiscoveryRecord>(),
+            )
+            .to_vec()
+        }
+    }
+
+    /// Mutation caught: DISCOVERY is decoded with Event's size/validator or
+    /// malformed discovery records leak into the Task 6 consumer.
+    #[test]
+    fn discovery_decode_is_exact_and_independent_from_events() {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_LEADER_EXIT;
+        record.pid_tgid = 7u64 << 32;
+        let bytes = discovery_bytes(&record);
+        assert_eq!(decode_discovery(&bytes).unwrap().pid_tgid, 7u64 << 32);
+        assert!(decode_discovery(&bytes[..bytes.len() - 1]).is_none());
+        let mut long = bytes.clone();
+        long.push(0);
+        assert!(decode_discovery(&long).is_none());
+
+        let mut malformed = record;
+        malformed.reserved_tail_zero[0] = 1;
+        assert!(decode_discovery(&discovery_bytes(&malformed)).is_none());
     }
 }

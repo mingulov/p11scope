@@ -85,6 +85,25 @@ impl HookRegistry {
             .find(|(n, _)| n == name)
             .map(|(_, abi)| *abi)
     }
+
+    /// Stable one-based symbol identifier used as the export attach cookie.
+    pub fn id(&self, name: &str) -> Option<u32> {
+        self.entries
+            .iter()
+            .position(|(candidate, _)| candidate == name)
+            .and_then(|position| u32::try_from(position + 1).ok())
+    }
+
+    pub fn by_id(&self, id: u32) -> Option<(&str, HookAbi)> {
+        let position = usize::try_from(id.checked_sub(1)?).ok()?;
+        self.entries
+            .get(position)
+            .map(|(name, abi)| (name.as_str(), *abi))
+    }
+
+    pub fn export_cookie(&self, name: &str) -> Option<u64> {
+        self.id(name).map(u64::from)
+    }
 }
 
 impl Default for HookRegistry {
@@ -150,5 +169,29 @@ mod tests {
         }
         // A name with a NUL or whitespace could never be an ELF symbol.
         assert!(r.add_spec("has space").is_err());
+    }
+
+    /// Mutation caught: rebuilding IDs from the current ABI or vector length
+    /// changes an existing export cookie when a duplicate is replaced.
+    #[test]
+    fn ids_are_one_based_stable_and_duplicates_keep_their_id() {
+        let mut r = HookRegistry::builtin();
+        for (position, (name, abi)) in BUILTIN.iter().enumerate() {
+            let id = (position + 1) as u32;
+            assert_eq!(r.id(name), Some(id));
+            assert_eq!(r.by_id(id), Some((*name, *abi)));
+            assert_eq!(r.export_cookie(name), Some(u64::from(id)));
+        }
+        assert_eq!(r.by_id(0), None);
+
+        r.add_spec("V_GetTable:interfacelist").unwrap();
+        let id = r.id("V_GetTable").unwrap();
+        assert_eq!(id, 6);
+        r.add_spec("V_GetTable:interface").unwrap();
+        assert_eq!(r.id("V_GetTable"), Some(id));
+        assert_eq!(r.by_id(id), Some(("V_GetTable", HookAbi::Interface)));
+
+        r.add_spec("V_Other").unwrap();
+        assert_eq!(r.id("V_Other"), Some(7));
     }
 }

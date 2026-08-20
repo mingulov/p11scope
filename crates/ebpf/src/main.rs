@@ -4,24 +4,38 @@
 //! rather than per-function copies. Cookies need kernel >= 5.15.
 #![no_std]
 #![no_main]
+#![feature(core_intrinsics)]
+#![allow(internal_features)]
 
-use aya_ebpf::macros::{map, tracepoint, uprobe, uretprobe};
 use aya_ebpf::bindings::BPF_F_RDONLY_PROG;
-use aya_ebpf::maps::{Array, CgroupArray, HashMap, PerCpuArray, PerCpuHashMap, RingBuf};
+use aya_ebpf::macros::{map, tracepoint, uprobe, uretprobe};
+use aya_ebpf::maps::ring_buf::RingBufEntry;
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use aya_ebpf::maps::ProgramArray;
+use aya_ebpf::maps::{Array, CgroupArray, HashMap, PerCpuArray, PerCpuHashMap, RingBuf};
 use aya_ebpf::programs::{ProbeContext, RetProbeContext, TracePointContext};
-use aya_ebpf::helpers;
+use aya_ebpf::{helpers, EbpfContext as _};
 use core::mem::MaybeUninit;
 use p11scope_ebpf_common::{
-    ARG_NONE, CFG_FLAGS, CallStart, EVIDENCE_CELLS, EVIDENCE_CGROUP_SCOPE_FAILURES,
+    bucket_of, capture, cookie_descriptor, cookie_slot, event_type, lifecycle,
+    return_allows_mechanism, shape, valid_config, CallStart, DiscoveryRecord, Event,
+    FunctionNameKey, PauseKey, RvKey, SlotSemantics, SlotStats, StartKey, StartState, StateKey,
+    ARG_NONE, CFG_FLAGS, COALESCED_NO_HELPER_RC, DISCOVERY_BYTES, DISCOVERY_COUNTER_CELLS,
+    DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES, DISCOVERY_COUNTER_EXPORT_STATE_FAILURES,
+    DISCOVERY_COUNTER_LOADER_HITS, DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES,
+    DISCOVERY_COUNTER_RING_LOSS, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
+    DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
+    DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER, DISCOVERY_NAME_EXACT_STANDARD,
+    DISCOVERY_NAME_NA, DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER, DISCOVERY_NAME_UNREADABLE,
+    DISCOVERY_STATUS_COALESCED_NO_HELPER, DISCOVERY_STATUS_LOADER_CONTEXT_INVALID,
+    DISCOVERY_STATUS_READ_FAILURE, EVIDENCE_CELLS, EVIDENCE_CGROUP_SCOPE_FAILURES,
     EVIDENCE_RING_LOSS, EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
-    EVIDENCE_START_INSERT_FAILURES, EVIDENCE_UNMATCHED_RETURNS,
-    EVIDENCE_UNREGISTERED_MECHANISMS, Event, FLAG_CGROUP_FILTER, FLAG_PID_FILTER,
-    FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED, FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE,
-    FunctionNameKey, MAX_ATTRS, MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, RING_BYTES, RV_ENTRIES,
-    RvKey, SESSION_NONE, START_ENTRIES, SlotSemantics, SlotStats, StartKey, USER_TYPE_NONE,
-    bucket_of, capture, cookie_descriptor, cookie_slot, event_type, lifecycle, return_allows_mechanism, shape, valid_config,
+    EVIDENCE_START_INSERT_FAILURES, EVIDENCE_UNMATCHED_RETURNS, EVIDENCE_UNREGISTERED_MECHANISMS,
+    FLAG_CGROUP_FILTER, FLAG_PAUSE_ENABLED, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE,
+    FLAG_POLICY_ALLOWLISTED, FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, LOADER_STATE_ABSENT_SENTINEL,
+    LOADER_STATE_PRESENT, MAX_ATTRS, MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE,
+    PAUSE_ARMED, PAUSE_REQUESTED, RING_BYTES, RV_ENTRIES, R_STATE_OFFSET, SESSION_NONE,
+    START_ENTRIES, USER_TYPE_NONE,
 };
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use p11scope_ebpf_common::{
@@ -32,7 +46,7 @@ use p11scope_ebpf_common::{
 static CONFIG: Array<u64> = Array::with_max_entries(1, BPF_F_RDONLY_PROG);
 
 #[map]
-static PID_FILTER: HashMap<u32, u8> = HashMap::with_max_entries(1024, BPF_F_RDONLY_PROG);
+static PID_FILTER: HashMap<u32, u64> = HashMap::with_max_entries(1024, BPF_F_RDONLY_PROG);
 
 #[map]
 static CGROUP_FILTER: CgroupArray = CgroupArray::with_max_entries(1, 0);
@@ -80,6 +94,18 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(RING_BYTES, 0);
 #[map]
 static EVIDENCE: PerCpuArray<u64> = PerCpuArray::with_max_entries(EVIDENCE_CELLS, 0);
 
+#[map]
+static DISCOVERY: RingBuf = RingBuf::with_byte_size(DISCOVERY_BYTES, 0);
+
+#[map]
+static DISCOVERY_STATE: HashMap<StateKey, StartState> = HashMap::with_max_entries(64, 0);
+
+#[map]
+static COUNTERS: PerCpuArray<u64> = PerCpuArray::with_max_entries(DISCOVERY_COUNTER_CELLS, 0);
+
+#[map]
+static PAUSE_PIDS: HashMap<PauseKey, u64> = HashMap::with_max_entries(1, 0);
+
 /// Does this call belong to the capture scope? With no filter configured
 /// nothing is observed — scope is always explicit (design spec: no
 /// magical system-wide capture).
@@ -89,20 +115,39 @@ fn bump_evidence(index: u32) {
     }
 }
 
-fn scope_flags() -> Option<u64> {
+#[derive(Clone, Copy)]
+struct ScopeAuth {
+    flags: u64,
+    tgid: u32,
+    generation_token: u64,
+}
+
+fn scope_auth() -> Option<ScopeAuth> {
     let flags = CONFIG.get(CFG_FLAGS).copied().unwrap_or(0);
     if !valid_config(flags) {
         return None;
     }
+    let pid_tgid = helpers::bpf_get_current_pid_tgid();
+    let tgid = (pid_tgid >> 32) as u32;
     if flags & FLAG_PID_FILTER != 0 {
-        let tgid = (helpers::bpf_get_current_pid_tgid() >> 32) as u32;
-        if unsafe { PID_FILTER.get(&tgid) }.is_some() {
-            return Some(flags);
+        let token = unsafe { PID_FILTER.get(&tgid) }.copied().unwrap_or(0);
+        if token != 0 {
+            return Some(ScopeAuth {
+                flags,
+                tgid,
+                generation_token: token,
+            });
         }
     }
     if flags & FLAG_CGROUP_FILTER != 0 {
         match CGROUP_FILTER.current_task_under_cgroup(0) {
-            Ok(true) => return Some(flags),
+            Ok(true) => {
+                return Some(ScopeAuth {
+                    flags,
+                    tgid,
+                    generation_token: 0,
+                });
+            }
             Ok(false) => return None,
             Err(_) => {
                 bump_evidence(EVIDENCE_CGROUP_SCOPE_FAILURES);
@@ -111,6 +156,681 @@ fn scope_flags() -> Option<u64> {
         }
     }
     None
+}
+
+fn scope_flags() -> Option<u64> {
+    scope_auth().map(|scope| scope.flags)
+}
+
+fn bump_discovery_counter(index: u32) {
+    if let Some(value) = COUNTERS.get_ptr_mut(index) {
+        // SAFETY: PerCpuArray gives this CPU exclusive access to its cell.
+        unsafe { *value += 1 };
+    }
+}
+
+/// One source-bounded reservation/initializer path for every private
+/// discovery record. The object checker proves that this always-inlined region
+/// becomes 112 aligned u64 zero stores before any field use or submit.
+#[inline(always)]
+fn reserve_discovery() -> Option<RingBufEntry<DiscoveryRecord>> {
+    let Some(mut entry) = DISCOVERY.reserve::<DiscoveryRecord>(0) else {
+        bump_discovery_counter(DISCOVERY_COUNTER_RING_LOSS);
+        return None;
+    };
+    let raw = entry.as_mut_ptr();
+    let words = raw.cast::<u64>();
+    // SAFETY: the reservation owns exactly one aligned 896-byte record. These
+    // straight-line volatile stores cover word indices 0..=111 exactly once.
+    unsafe {
+        // TASK5_DISCOVERY_INITIALIZER_BEGIN
+        core::ptr::write_volatile(words.add(0), 0u64);
+        core::ptr::write_volatile(words.add(1), 0u64);
+        core::ptr::write_volatile(words.add(2), 0u64);
+        core::ptr::write_volatile(words.add(3), 0u64);
+        core::ptr::write_volatile(words.add(4), 0u64);
+        core::ptr::write_volatile(words.add(5), 0u64);
+        core::ptr::write_volatile(words.add(6), 0u64);
+        core::ptr::write_volatile(words.add(7), 0u64);
+        core::ptr::write_volatile(words.add(8), 0u64);
+        core::ptr::write_volatile(words.add(9), 0u64);
+        core::ptr::write_volatile(words.add(10), 0u64);
+        core::ptr::write_volatile(words.add(11), 0u64);
+        core::ptr::write_volatile(words.add(12), 0u64);
+        core::ptr::write_volatile(words.add(13), 0u64);
+        core::ptr::write_volatile(words.add(14), 0u64);
+        core::ptr::write_volatile(words.add(15), 0u64);
+        core::ptr::write_volatile(words.add(16), 0u64);
+        core::ptr::write_volatile(words.add(17), 0u64);
+        core::ptr::write_volatile(words.add(18), 0u64);
+        core::ptr::write_volatile(words.add(19), 0u64);
+        core::ptr::write_volatile(words.add(20), 0u64);
+        core::ptr::write_volatile(words.add(21), 0u64);
+        core::ptr::write_volatile(words.add(22), 0u64);
+        core::ptr::write_volatile(words.add(23), 0u64);
+        core::ptr::write_volatile(words.add(24), 0u64);
+        core::ptr::write_volatile(words.add(25), 0u64);
+        core::ptr::write_volatile(words.add(26), 0u64);
+        core::ptr::write_volatile(words.add(27), 0u64);
+        core::ptr::write_volatile(words.add(28), 0u64);
+        core::ptr::write_volatile(words.add(29), 0u64);
+        core::ptr::write_volatile(words.add(30), 0u64);
+        core::ptr::write_volatile(words.add(31), 0u64);
+        core::ptr::write_volatile(words.add(32), 0u64);
+        core::ptr::write_volatile(words.add(33), 0u64);
+        core::ptr::write_volatile(words.add(34), 0u64);
+        core::ptr::write_volatile(words.add(35), 0u64);
+        core::ptr::write_volatile(words.add(36), 0u64);
+        core::ptr::write_volatile(words.add(37), 0u64);
+        core::ptr::write_volatile(words.add(38), 0u64);
+        core::ptr::write_volatile(words.add(39), 0u64);
+        core::ptr::write_volatile(words.add(40), 0u64);
+        core::ptr::write_volatile(words.add(41), 0u64);
+        core::ptr::write_volatile(words.add(42), 0u64);
+        core::ptr::write_volatile(words.add(43), 0u64);
+        core::ptr::write_volatile(words.add(44), 0u64);
+        core::ptr::write_volatile(words.add(45), 0u64);
+        core::ptr::write_volatile(words.add(46), 0u64);
+        core::ptr::write_volatile(words.add(47), 0u64);
+        core::ptr::write_volatile(words.add(48), 0u64);
+        core::ptr::write_volatile(words.add(49), 0u64);
+        core::ptr::write_volatile(words.add(50), 0u64);
+        core::ptr::write_volatile(words.add(51), 0u64);
+        core::ptr::write_volatile(words.add(52), 0u64);
+        core::ptr::write_volatile(words.add(53), 0u64);
+        core::ptr::write_volatile(words.add(54), 0u64);
+        core::ptr::write_volatile(words.add(55), 0u64);
+        core::ptr::write_volatile(words.add(56), 0u64);
+        core::ptr::write_volatile(words.add(57), 0u64);
+        core::ptr::write_volatile(words.add(58), 0u64);
+        core::ptr::write_volatile(words.add(59), 0u64);
+        core::ptr::write_volatile(words.add(60), 0u64);
+        core::ptr::write_volatile(words.add(61), 0u64);
+        core::ptr::write_volatile(words.add(62), 0u64);
+        core::ptr::write_volatile(words.add(63), 0u64);
+        core::ptr::write_volatile(words.add(64), 0u64);
+        core::ptr::write_volatile(words.add(65), 0u64);
+        core::ptr::write_volatile(words.add(66), 0u64);
+        core::ptr::write_volatile(words.add(67), 0u64);
+        core::ptr::write_volatile(words.add(68), 0u64);
+        core::ptr::write_volatile(words.add(69), 0u64);
+        core::ptr::write_volatile(words.add(70), 0u64);
+        core::ptr::write_volatile(words.add(71), 0u64);
+        core::ptr::write_volatile(words.add(72), 0u64);
+        core::ptr::write_volatile(words.add(73), 0u64);
+        core::ptr::write_volatile(words.add(74), 0u64);
+        core::ptr::write_volatile(words.add(75), 0u64);
+        core::ptr::write_volatile(words.add(76), 0u64);
+        core::ptr::write_volatile(words.add(77), 0u64);
+        core::ptr::write_volatile(words.add(78), 0u64);
+        core::ptr::write_volatile(words.add(79), 0u64);
+        core::ptr::write_volatile(words.add(80), 0u64);
+        core::ptr::write_volatile(words.add(81), 0u64);
+        core::ptr::write_volatile(words.add(82), 0u64);
+        core::ptr::write_volatile(words.add(83), 0u64);
+        core::ptr::write_volatile(words.add(84), 0u64);
+        core::ptr::write_volatile(words.add(85), 0u64);
+        core::ptr::write_volatile(words.add(86), 0u64);
+        core::ptr::write_volatile(words.add(87), 0u64);
+        core::ptr::write_volatile(words.add(88), 0u64);
+        core::ptr::write_volatile(words.add(89), 0u64);
+        core::ptr::write_volatile(words.add(90), 0u64);
+        core::ptr::write_volatile(words.add(91), 0u64);
+        core::ptr::write_volatile(words.add(92), 0u64);
+        core::ptr::write_volatile(words.add(93), 0u64);
+        core::ptr::write_volatile(words.add(94), 0u64);
+        core::ptr::write_volatile(words.add(95), 0u64);
+        core::ptr::write_volatile(words.add(96), 0u64);
+        core::ptr::write_volatile(words.add(97), 0u64);
+        core::ptr::write_volatile(words.add(98), 0u64);
+        core::ptr::write_volatile(words.add(99), 0u64);
+        core::ptr::write_volatile(words.add(100), 0u64);
+        core::ptr::write_volatile(words.add(101), 0u64);
+        core::ptr::write_volatile(words.add(102), 0u64);
+        core::ptr::write_volatile(words.add(103), 0u64);
+        core::ptr::write_volatile(words.add(104), 0u64);
+        core::ptr::write_volatile(words.add(105), 0u64);
+        core::ptr::write_volatile(words.add(106), 0u64);
+        core::ptr::write_volatile(words.add(107), 0u64);
+        core::ptr::write_volatile(words.add(108), 0u64);
+        core::ptr::write_volatile(words.add(109), 0u64);
+        core::ptr::write_volatile(words.add(110), 0u64);
+        core::ptr::write_volatile(words.add(111), 0u64);
+        // TASK5_DISCOVERY_INITIALIZER_END
+    }
+    Some(entry)
+}
+
+#[inline(always)]
+// TASK5_PAUSE_WRITER_BEGIN
+fn finish_discovery_record(
+    mut entry: RingBufEntry<DiscoveryRecord>,
+    scope: ScopeAuth,
+    eligible: bool,
+    pid_tgid: u64,
+    mut status_flags: u8,
+) {
+    let raw = entry.as_mut_ptr();
+    let (hook_ts_ns, send_signal_rc) =
+        if eligible && scope.flags & FLAG_PAUSE_ENABLED != 0 && scope.generation_token != 0 {
+            let key = PauseKey {
+                tgid: scope.tgid,
+                pad: 0,
+                generation_token: scope.generation_token,
+            };
+            if let Some(value) = PAUSE_PIDS.get_ptr_mut(&key) {
+                // SAFETY: the pointer is the exact live map value for the full
+                // generation key; this is the only kernel writer.
+                let (previous, won) = unsafe {
+                    core::intrinsics::atomic_cxchg::<
+                        u64,
+                        { core::intrinsics::AtomicOrdering::AcqRel },
+                        { core::intrinsics::AtomicOrdering::Acquire },
+                    >(value, PAUSE_ARMED, PAUSE_REQUESTED)
+                };
+                if won {
+                    // SAFETY: the causal timestamp is immediately before the one
+                    // finite SIGSTOP request and both helpers take scalar inputs.
+                    let hook_ts_ns = unsafe { helpers::bpf_ktime_get_ns() };
+                    let send_signal_rc = unsafe { helpers::bpf_send_signal(19) } as i64;
+                    (hook_ts_ns, send_signal_rc)
+                } else if previous == PAUSE_REQUESTED {
+                    status_flags |= DISCOVERY_STATUS_COALESCED_NO_HELPER;
+                    (
+                        unsafe { helpers::bpf_ktime_get_ns() },
+                        COALESCED_NO_HELPER_RC,
+                    )
+                } else {
+                    (unsafe { helpers::bpf_ktime_get_ns() }, 0)
+                }
+            } else {
+                (unsafe { helpers::bpf_ktime_get_ns() }, 0)
+            }
+        } else {
+            (unsafe { helpers::bpf_ktime_get_ns() }, 0)
+        };
+    // SAFETY: the shared initializer and all producer-specific writes finish
+    // before this terminal timestamp/result sequence.
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).hook_ts_ns), hook_ts_ns);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).pid_tgid), pid_tgid);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).status_flags), status_flags);
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*raw).send_signal_rc),
+            send_signal_rc,
+        );
+    }
+    entry.submit(0);
+}
+// TASK5_PAUSE_WRITER_END
+
+const EXPORT_SOURCE_FUNCTION_LIST: u8 = 1;
+const EXPORT_SOURCE_INTERFACE_DIRECT: u8 = 2;
+const EXPORT_SOURCE_INTERFACE_INDIRECT: u8 = 3;
+
+struct ExportArgs {
+    kind: u8,
+    source: u8,
+    interface_index: u8,
+    symbol_id: u32,
+    announced_count: u32,
+    address: u64,
+}
+
+fn table_slots(version_major: u8, version_minor: u8) -> u8 {
+    match (version_major, version_minor) {
+        (2, 0) => 67,
+        (2, _) => 68,
+        (3, 0 | 1) => 92,
+        (3, 2..) => 104,
+        _ => 0,
+    }
+}
+
+#[inline(never)]
+fn emit_export(args: &ExportArgs, scope: ScopeAuth) {
+    let Some(mut entry) = reserve_discovery() else {
+        return;
+    };
+    let raw = entry.as_mut_ptr();
+    let mut read_failed = false;
+    let mut table_ptr = 0u64;
+    let mut interface_flags = 0u64;
+    let mut name_class = DISCOVERY_NAME_NA;
+
+    if args.source == EXPORT_SOURCE_FUNCTION_LIST {
+        match unsafe { helpers::bpf_probe_read_user(args.address as *const u64) } {
+            Ok(pointer) if pointer != 0 => table_ptr = pointer,
+            _ => read_failed = true,
+        }
+    } else {
+        let interface_address = if args.source == EXPORT_SOURCE_INTERFACE_INDIRECT {
+            match unsafe { helpers::bpf_probe_read_user(args.address as *const u64) } {
+                Ok(pointer) => pointer,
+                Err(_) => {
+                    read_failed = true;
+                    0
+                }
+            }
+        } else {
+            args.address
+        };
+        if interface_address == 0 {
+            name_class = DISCOVERY_NAME_UNREADABLE;
+            read_failed = true;
+        } else {
+            match unsafe { helpers::bpf_probe_read_user(interface_address as *const [u64; 3]) } {
+                Ok([name, table, flags]) => {
+                    table_ptr = table;
+                    interface_flags = flags;
+                    if name == 0 {
+                        name_class = DISCOVERY_NAME_NULL;
+                    } else {
+                        let mut bytes = [0u8; 9];
+                        let read = unsafe {
+                            helpers::generated::bpf_probe_read_user_str(
+                                bytes.as_mut_ptr().cast(),
+                                bytes.len() as u32,
+                                name as *const core::ffi::c_void,
+                            )
+                        };
+                        if read < 0 {
+                            name_class = DISCOVERY_NAME_UNREADABLE;
+                            read_failed = true;
+                        } else if read == 8 && bytes[..8] == *b"PKCS 11\0" {
+                            name_class = DISCOVERY_NAME_EXACT_STANDARD;
+                        } else {
+                            name_class = DISCOVERY_NAME_OTHER;
+                        }
+                    }
+                }
+                Err(_) => {
+                    name_class = DISCOVERY_NAME_UNREADABLE;
+                    read_failed = true;
+                }
+            }
+        }
+    }
+
+    let read_table =
+        args.source == EXPORT_SOURCE_FUNCTION_LIST || name_class == DISCOVERY_NAME_EXACT_STANDARD;
+    let mut version_major = 0u8;
+    let mut version_minor = 0u8;
+    let mut attempted = 0u8;
+    let mut completed = 0u8;
+    let mut usable = 0u8;
+    if read_table && !read_failed {
+        match unsafe { helpers::bpf_probe_read_user(table_ptr as *const [u8; 2]) } {
+            Ok(version) => {
+                version_major = version[0];
+                version_minor = version[1];
+                usable = table_slots(version_major, version_minor);
+                let mut pointer_index = 0usize;
+                while pointer_index < 104 {
+                    if pointer_index >= usable as usize {
+                        break;
+                    }
+                    attempted += 1;
+                    let Some(address) = table_ptr
+                        .checked_add(8)
+                        .and_then(|base| base.checked_add(pointer_index as u64 * 8))
+                    else {
+                        read_failed = true;
+                        break;
+                    };
+                    match unsafe { helpers::bpf_probe_read_user(address as *const u64) } {
+                        Ok(pointer) => {
+                            // SAFETY: pointer_index is statically bounded below
+                            // DISCOVERY_POINTERS and the record is initialized.
+                            unsafe {
+                                core::ptr::write_volatile(
+                                    core::ptr::addr_of_mut!((*raw).pointers[pointer_index]),
+                                    pointer,
+                                );
+                            }
+                            completed += 1;
+                        }
+                        Err(_) => {
+                            read_failed = true;
+                            break;
+                        }
+                    }
+                    pointer_index += 1;
+                }
+            }
+            Err(_) => read_failed = true,
+        }
+    }
+    if read_failed {
+        usable = 0;
+        bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
+    }
+
+    let status = if read_failed {
+        DISCOVERY_STATUS_READ_FAILURE
+    } else {
+        0
+    };
+    // SAFETY: the shared initializer completed before every field write.
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).table_ptr), table_ptr);
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*raw).interface_flags),
+            interface_flags,
+        );
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).kind), args.kind);
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*raw).interface_index),
+            args.interface_index,
+        );
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).name_class), name_class);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).usable_n), usable);
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*raw).pointers_attempted),
+            attempted,
+        );
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).completed_prefix), completed);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).version_major), version_major);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).version_minor), version_minor);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).symbol_id), args.symbol_id);
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*raw).announced_count),
+            args.announced_count,
+        );
+    }
+    let pid_tgid = helpers::bpf_get_current_pid_tgid();
+    finish_discovery_record(entry, scope, true, pid_tgid, status);
+}
+
+fn export_symbol_id<C: aya_ebpf::EbpfContext>(ctx: &C) -> Option<u32> {
+    let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
+    let symbol_id = u32::try_from(cookie).ok()?;
+    (symbol_id != 0).then_some(symbol_id)
+}
+
+fn export_state_key<C: aya_ebpf::EbpfContext>(ctx: &C) -> Option<StateKey> {
+    export_symbol_id(ctx)?;
+    Some(StateKey {
+        pid_tgid: helpers::bpf_get_current_pid_tgid(),
+        attach_cookie: unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) },
+    })
+}
+
+fn insert_export_state(ctx: &ProbeContext, state: StartState) {
+    if scope_auth().is_none() {
+        return;
+    }
+    let Some(key) = export_state_key(ctx) else {
+        return;
+    };
+    if DISCOVERY_STATE
+        .insert(&key, &state, aya_ebpf::bindings::BPF_NOEXIST as u64)
+        .is_err()
+    {
+        let _ = DISCOVERY_STATE.remove(&key);
+        bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
+    }
+}
+
+fn take_export_state(ctx: &RetProbeContext, scoped: bool) -> Option<(StateKey, StartState)> {
+    let key = export_state_key(ctx)?;
+    let state = unsafe { DISCOVERY_STATE.get(&key) }.copied();
+    let removed = DISCOVERY_STATE.remove(&key).is_ok();
+    if state.is_none() || !removed {
+        if scoped {
+            bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
+        }
+        return None;
+    }
+    state.map(|state| (key, state))
+}
+
+#[uprobe]
+pub fn function_list_entry(ctx: ProbeContext) -> u32 {
+    insert_export_state(
+        &ctx,
+        StartState {
+            arg0: ctx.arg::<u64>(0).unwrap_or(0),
+            arg1: 0,
+        },
+    );
+    0
+}
+
+#[uretprobe]
+pub fn function_list_return(ctx: RetProbeContext) -> u32 {
+    let scope = scope_auth();
+    let Some((key, state)) = take_export_state(&ctx, scope.is_some()) else {
+        return 0;
+    };
+    let Some(scope) = scope else {
+        return 0;
+    };
+    let rv: u64 = ctx.ret();
+    if rv == 0 {
+        emit_export(
+            &ExportArgs {
+                kind: DISCOVERY_KIND_FUNCTION_LIST_RETURN,
+                source: EXPORT_SOURCE_FUNCTION_LIST,
+                interface_index: 0,
+                symbol_id: key.attach_cookie as u32,
+                announced_count: 0,
+                address: state.arg0,
+            },
+            scope,
+        );
+    }
+    0
+}
+
+#[uprobe]
+pub fn interface_list_entry(ctx: ProbeContext) -> u32 {
+    insert_export_state(
+        &ctx,
+        StartState {
+            arg0: ctx.arg::<u64>(0).unwrap_or(0),
+            arg1: ctx.arg::<u64>(1).unwrap_or(0),
+        },
+    );
+    0
+}
+
+#[uretprobe]
+pub fn interface_list_return(ctx: RetProbeContext) -> u32 {
+    let scope = scope_auth();
+    let Some((key, state)) = take_export_state(&ctx, scope.is_some()) else {
+        return 0;
+    };
+    let Some(scope) = scope else {
+        return 0;
+    };
+    let rv: u64 = ctx.ret();
+    if rv != 0 {
+        return 0;
+    }
+    let Ok(count) = (unsafe { helpers::bpf_probe_read_user(state.arg1 as *const u64) }) else {
+        bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
+        return 0;
+    };
+    let announced_count = count.min(u32::MAX as u64) as u32;
+    if state.arg0 == 0 {
+        return 0;
+    }
+    let mut interface_index = 0usize;
+    while interface_index < 16 {
+        if interface_index as u64 >= count {
+            break;
+        }
+        let Some(address) = state.arg0.checked_add(interface_index as u64 * 24) else {
+            bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
+            break;
+        };
+        emit_export(
+            &ExportArgs {
+                kind: DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN,
+                source: EXPORT_SOURCE_INTERFACE_DIRECT,
+                interface_index: interface_index as u8,
+                symbol_id: key.attach_cookie as u32,
+                announced_count,
+                address,
+            },
+            scope,
+        );
+        interface_index += 1;
+    }
+    0
+}
+
+#[uprobe]
+pub fn interface_entry(ctx: ProbeContext) -> u32 {
+    insert_export_state(
+        &ctx,
+        StartState {
+            arg0: ctx.arg::<u64>(2).unwrap_or(0),
+            arg1: 0,
+        },
+    );
+    0
+}
+
+#[uretprobe]
+pub fn interface_return(ctx: RetProbeContext) -> u32 {
+    let scope = scope_auth();
+    let Some((key, state)) = take_export_state(&ctx, scope.is_some()) else {
+        return 0;
+    };
+    let Some(scope) = scope else {
+        return 0;
+    };
+    let rv: u64 = ctx.ret();
+    if rv == 0 {
+        emit_export(
+            &ExportArgs {
+                kind: DISCOVERY_KIND_INTERFACE_RETURN,
+                source: EXPORT_SOURCE_INTERFACE_INDIRECT,
+                interface_index: 0,
+                symbol_id: key.attach_cookie as u32,
+                announced_count: 0,
+                address: state.arg0,
+            },
+            scope,
+        );
+    }
+    0
+}
+
+fn loader_cookie_of(ctx: &ProbeContext) -> u64 {
+    unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) }
+}
+
+fn loader_runtime_ip(ctx: &ProbeContext) -> u64 {
+    let helper_ip = unsafe { helpers::bpf_get_func_ip(ctx.as_ptr()) };
+    if helper_ip != 0 {
+        helper_ip
+    } else {
+        // Linux x86-64 uprobe pt_regs contains the adjusted runtime IP.
+        unsafe { (*ctx.regs).rip as u64 }
+    }
+}
+
+#[uprobe]
+pub fn dl_debug_state(ctx: ProbeContext) -> u32 {
+    let Some(scope) = scope_auth() else {
+        return 0;
+    };
+    bump_discovery_counter(DISCOVERY_COUNTER_LOADER_HITS);
+    let Some(mut entry) = reserve_discovery() else {
+        return 0;
+    };
+    let raw = entry.as_mut_ptr();
+    let pid_tgid = helpers::bpf_get_current_pid_tgid();
+    let cookie = loader_cookie_of(&ctx);
+    let state_present = cookie & LOADER_STATE_PRESENT != 0;
+    let payload = cookie >> 9;
+    if cookie == 0 || (!state_present && payload != LOADER_STATE_ABSENT_SENTINEL) {
+        // SAFETY: invalid-cookie records stay zero outside these finite fields.
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).kind), DISCOVERY_KIND_LOADER);
+        }
+        finish_discovery_record(
+            entry,
+            scope,
+            false,
+            pid_tgid,
+            DISCOVERY_STATUS_LOADER_CONTEXT_INVALID,
+        );
+        return 0;
+    }
+
+    let hook_ip = loader_runtime_ip(&ctx);
+    if hook_ip == 0 {
+        bump_discovery_counter(DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES);
+        entry.discard(0);
+        return 0;
+    }
+    let mut r_state = 0u32;
+    if state_present {
+        let delta = (cookie as i64) >> 9;
+        let r_debug = if delta >= 0 {
+            hook_ip.checked_add(delta as u64)
+        } else {
+            hook_ip.checked_sub(delta.unsigned_abs())
+        };
+        let address = r_debug.and_then(|address| address.checked_add(R_STATE_OFFSET));
+        match address {
+            Some(address) => match unsafe { helpers::bpf_probe_read_user(address as *const u32) } {
+                Ok(value) => r_state = value,
+                Err(_) => bump_discovery_counter(DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES),
+            },
+            None => bump_discovery_counter(DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES),
+        }
+    }
+    // SAFETY: the shared initializer completed before every field write.
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).table_ptr), hook_ip);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).kind), DISCOVERY_KIND_LOADER);
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*raw).case_id),
+            (cookie & 0xff) as u8,
+        );
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).announced_count), r_state);
+    }
+    finish_discovery_record(entry, scope, true, pid_tgid, 0);
+    0
+}
+
+#[inline(never)]
+fn emit_lifecycle(kind: u8, scope: ScopeAuth, pause_eligible: bool) {
+    let Some(mut entry) = reserve_discovery() else {
+        return;
+    };
+    let raw = entry.as_mut_ptr();
+    // SAFETY: the shared initializer completed before every field write.
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).kind), kind);
+    }
+    let pid_tgid = helpers::bpf_get_current_pid_tgid();
+    finish_discovery_record(entry, scope, pause_eligible, pid_tgid, 0);
+}
+
+#[tracepoint(category = "sched", name = "sched_process_exec")]
+pub fn sched_process_exec(_ctx: TracePointContext) -> u32 {
+    if let Some(scope) = scope_auth() {
+        emit_lifecycle(DISCOVERY_KIND_EXEC, scope, true);
+    }
+    0
+}
+
+#[tracepoint(category = "sched", name = "sched_process_exit")]
+pub fn sched_process_exit(_ctx: TracePointContext) -> u32 {
+    let pid_tgid = helpers::bpf_get_current_pid_tgid();
+    if pid_tgid as u32 != (pid_tgid >> 32) as u32 {
+        return 0;
+    }
+    if let Some(scope) = scope_auth() {
+        emit_lifecycle(DISCOVERY_KIND_LEADER_EXIT, scope, false);
+    }
+    0
 }
 
 fn cookie_of<C>(ctx: &C) -> u64
@@ -285,7 +1005,9 @@ fn walk_template<const TYPES_ONLY: bool, const SECOND: bool>(
             continue;
         }
         let bool_type = attr_type as u32;
-        let Some(mask) = (unsafe { ATTR_BOOL_BITS.get(&bool_type) }).copied() else { continue };
+        let Some(mask) = (unsafe { ATTR_BOOL_BITS.get(&bool_type) }).copied() else {
+            continue;
+        };
         // Read the two remaining CK_ATTRIBUTE fields together only after
         // the type allowlist matched. This preserves the privacy order while
         // keeping the verifier from exploring two independent read failures.
@@ -333,7 +1055,9 @@ fn arg_u64(ctx: &ProbeContext, index: u8) -> Result<u64, ()> {
         5 => ctx.arg::<u64>(5).ok_or(()),
         6 => {
             let rsp = unsafe { (*ctx.regs).rsp as u64 };
-            let Some(address) = rsp.checked_add(8) else { return Err(()) };
+            let Some(address) = rsp.checked_add(8) else {
+                return Err(());
+            };
             match unsafe { helpers::bpf_probe_read_user(address as *const u64) } {
                 Ok(value) => Ok(value),
                 Err(_) => Err(()),
@@ -362,7 +1086,9 @@ fn capture_scalar(ctx: &ProbeContext, index: u8, start: &mut CallStart) -> Optio
 }
 
 fn capture_async_target(ctx: &ProbeContext, index: u8, start: &mut CallStart) {
-    let Some(pointer) = capture_scalar(ctx, index, start) else { return };
+    let Some(pointer) = capture_scalar(ctx, index, start) else {
+        return;
+    };
     if pointer == 0 {
         capture_failure(start);
         return;
@@ -491,7 +1217,11 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {
         // copy; there is no cross-CPU aliasing to race with.
         unsafe { (*stats).entered += 1 };
     }
-    let key = StartKey { pid_tgid: helpers::bpf_get_current_pid_tgid(), slot, _pad: 0 };
+    let key = StartKey {
+        pid_tgid: helpers::bpf_get_current_pid_tgid(),
+        slot,
+        _pad: 0,
+    };
     if flags & FLAG_POLICY_AGGREGATE != 0 {
         record_aggregate_start(&key);
         return 0;
@@ -587,7 +1317,11 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {
             }
             Some(pointer) => {
                 start.capture = (start.capture & !capture::OUTPUT_MASK)
-                    | if pointer == 0 { capture::OUTPUT_NULL } else { capture::OUTPUT_NON_NULL };
+                    | if pointer == 0 {
+                        capture::OUTPUT_NULL
+                    } else {
+                        capture::OUTPUT_NON_NULL
+                    };
                 if semantics.lifecycle == lifecycle::OPEN_SESSION {
                     start.out_ptr = pointer;
                 }
@@ -603,8 +1337,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {
             // payload, which the BPF verifier rejects even though Rust would
             // test both discriminants before use.
             if let Some(template) = capture_scalar(&ctx, semantics.template0_arg, &mut start) {
-                if let Some(count) =
-                    capture_scalar(&ctx, semantics.template_count0_arg, &mut start)
+                if let Some(count) = capture_scalar(&ctx, semantics.template_count0_arg, &mut start)
                 {
                     if TEMPLATE_MODE == 2 {
                         walk_template::<true, false>(template, count, &mut start);
@@ -651,7 +1384,11 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
     if slot >= MAX_SLOTS {
         return 0;
     }
-    let key = StartKey { pid_tgid: helpers::bpf_get_current_pid_tgid(), slot, _pad: 0 };
+    let key = StartKey {
+        pid_tgid: helpers::bpf_get_current_pid_tgid(),
+        slot,
+        _pad: 0,
+    };
     let Some(flags) = scope_flags() else {
         // Entry-time scope owns this pairing record. If a task migrates out
         // of a selected cgroup mid-call, clean it up without emitting an
@@ -727,7 +1464,10 @@ pub fn p11_return(ctx: RetProbeContext) -> u32 {
         }
     }
     let mut session = start.session;
-    if semantics.lifecycle == lifecycle::OPEN_SESSION && start.out_ptr != 0 && (rv == 0 || rv == 0x204) {
+    if semantics.lifecycle == lifecycle::OPEN_SESSION
+        && start.out_ptr != 0
+        && (rv == 0 || rv == 0x204)
+    {
         // C_OpenSession wrote the handle by now. Only trust it on success.
         match unsafe { helpers::bpf_probe_read_user(start.out_ptr as *const u64) } {
             Ok(value) => session = value,
@@ -800,8 +1540,12 @@ pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
     // (16), parent_pid (4), child_comm (16), child_pid (4).
     // SAFETY: offsets are fixed by the sched_process_fork tracepoint ABI
     // described above and each read stays within that record.
-    let Ok(parent) = (unsafe { ctx.read_at::<u32>(24) }) else { return 0 };
-    let Ok(child) = (unsafe { ctx.read_at::<u32>(44) }) else { return 0 };
+    let Ok(parent) = (unsafe { ctx.read_at::<u32>(24) }) else {
+        return 0;
+    };
+    let Ok(child) = (unsafe { ctx.read_at::<u32>(44) }) else {
+        return 0;
+    };
     let ev = Event {
         pid_tgid: (parent as u64) << 32,
         session: child as u64,

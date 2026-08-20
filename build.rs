@@ -31,6 +31,7 @@ fn main() {
     // leaves the build byte-for-byte identical to before this flag existed.
     println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_RING");
     println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_STATE_MAPS");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_SMALL_DISCOVERY_RING");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA");
     let small_ring = matches!(
         env::var("P11SCOPE_SMALL_RING").as_deref(),
@@ -38,6 +39,10 @@ fn main() {
     );
     let small_state_maps = matches!(
         env::var("P11SCOPE_SMALL_STATE_MAPS").as_deref(),
+        Ok("1") | Ok("true")
+    );
+    let small_discovery_ring = matches!(
+        env::var("P11SCOPE_SMALL_DISCOVERY_RING").as_deref(),
         Ok("1") | Ok("true")
     );
 
@@ -73,6 +78,9 @@ fn main() {
     }
     if small_state_maps {
         features.push("small-state-maps");
+    }
+    if small_discovery_ring {
+        features.push("small-discovery-ring");
     }
     if env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some() {
         features.push("unsafe-unvalidated-metadata");

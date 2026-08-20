@@ -101,10 +101,14 @@ SAFE_MAPS = {
         "ASYNC_FUNCTIONS": (1, 32, 4, 128, 128),
         "CGROUP_FILTER": (8, 4, 4, 1),
         "CONFIG": (2, 4, 8, 1, 128),
+        "COUNTERS": (6, 4, 8, 5),
+        "DISCOVERY": (27, 0, 0, 65_536),
+        "DISCOVERY_STATE": (1, 16, 16, 64),
         "EVENTS": (27, 0, 0, 262_144),
         "EVIDENCE": (6, 4, 8, 8),
         "MECH_SHAPE": (1, 8, 4, 1_024, 128),
-        "PID_FILTER": (1, 4, 1, 1_024, 128),
+        "PAUSE_PIDS": (1, 16, 8, 1),
+        "PID_FILTER": (1, 4, 8, 1_024, 128),
         "RV_COUNTS": (5, 16, 8, 4_096),
         "DESCRIPTORS": (2, 4, 18, 105, 128),
         "START": (1, 16, 272, 16_384),
@@ -115,7 +119,20 @@ UNSAFE_MAPS = SAFE_MAPS | {
     "ATTR_BOOL_BITS": map_def(1, 4, 4, 16, 128),
     "TEMPLATE_TAIL": map_def(3, 4, 4, 1),
 }
-SAFE_PROGRAMS = {"p11_entry", "p11_return", "sched_process_fork"}
+SAFE_PROGRAMS = {
+    "p11_entry",
+    "p11_return",
+    "sched_process_fork",
+    "dl_debug_state",
+    "function_list_entry",
+    "function_list_return",
+    "interface_list_entry",
+    "interface_list_return",
+    "interface_entry",
+    "interface_return",
+    "sched_process_exec",
+    "sched_process_exit",
+}
 UNSAFE_PROGRAMS = SAFE_PROGRAMS | {
     "p11_entry_template", "p11_entry_template_pair",
     "p11_entry_template_second", "p11_entry_template_types",
@@ -142,6 +159,15 @@ def validate_policy_inventory(safe, unsafe):
 
 
 def self_test():
+    assert SAFE_MAPS["DISCOVERY"] == map_def(27, 0, 0, 65_536)
+    assert SAFE_MAPS["DISCOVERY_STATE"] == map_def(1, 16, 16, 64)
+    assert SAFE_MAPS["COUNTERS"] == map_def(6, 4, 8, 5)
+    assert SAFE_MAPS["PAUSE_PIDS"] == map_def(1, 16, 8, 1)
+    assert SAFE_MAPS["PID_FILTER"] == map_def(1, 4, 8, 1_024, 128)
+    assert len(SAFE_MAPS) == 15
+    assert len(UNSAFE_MAPS) == 17
+    assert len(SAFE_PROGRAMS) == 12
+    assert len(UNSAFE_PROGRAMS) == 16
     good = (SAFE_MAPS, SAFE_PROGRAMS, {"p11_entry"})
     diagnostic = (
         UNSAFE_MAPS,

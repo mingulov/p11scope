@@ -173,6 +173,7 @@ pub const FLAG_CGROUP_FILTER: u64 = 1 << 1;
 pub const FLAG_POLICY_ALLOWLISTED: u64 = 1 << 2;
 pub const FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA: u64 = 1 << 3;
 pub const FLAG_POLICY_AGGREGATE: u64 = 1 << 4;
+pub const FLAG_PAUSE_ENABLED: u64 = 1 << 5;
 
 /// A loaded program may observe only an explicitly selected scope under one
 /// immutable capture policy. Unknown and multi-bit configurations fail closed.
@@ -186,7 +187,8 @@ pub const fn valid_config(flags: u64) -> bool {
         | FLAG_CGROUP_FILTER
         | FLAG_POLICY_ALLOWLISTED
         | FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA
-        | FLAG_POLICY_AGGREGATE;
+        | FLAG_POLICY_AGGREGATE
+        | FLAG_PAUSE_ENABLED;
     matches!(scope, FLAG_PID_FILTER | FLAG_CGROUP_FILTER)
         && matches!(
             policy,
@@ -195,6 +197,236 @@ pub const fn valid_config(flags: u64) -> bool {
                 | FLAG_POLICY_AGGREGATE
         )
         && flags & !known == 0
+        && (flags & FLAG_PAUSE_ENABLED == 0 || scope == FLAG_PID_FILTER)
+}
+
+pub const DISCOVERY_KIND_FUNCTION_LIST_RETURN: u8 = 1;
+pub const DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN: u8 = 2;
+pub const DISCOVERY_KIND_LOADER: u8 = 3;
+pub const DISCOVERY_KIND_INTERFACE_RETURN: u8 = 4;
+pub const DISCOVERY_KIND_EXEC: u8 = 5;
+pub const DISCOVERY_KIND_LEADER_EXIT: u8 = 6;
+
+pub const DISCOVERY_NAME_NA: u8 = 0;
+pub const DISCOVERY_NAME_EXACT_STANDARD: u8 = 1;
+pub const DISCOVERY_NAME_OTHER: u8 = 2;
+pub const DISCOVERY_NAME_NULL: u8 = 3;
+pub const DISCOVERY_NAME_UNREADABLE: u8 = 4;
+
+pub const DISCOVERY_STATUS_READ_FAILURE: u8 = 0x01;
+pub const DISCOVERY_STATUS_COALESCED_NO_HELPER: u8 = 0x02;
+pub const DISCOVERY_STATUS_LOADER_CONTEXT_INVALID: u8 = 0x04;
+
+pub const DISCOVERY_COUNTER_RING_LOSS: u32 = 0;
+pub const DISCOVERY_COUNTER_EXPORT_STATE_FAILURES: u32 = 1;
+pub const DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES: u32 = 2;
+pub const DISCOVERY_COUNTER_LOADER_HITS: u32 = 3;
+pub const DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES: u32 = 4;
+pub const DISCOVERY_COUNTER_CELLS: u32 = 5;
+
+pub const PAUSE_ARMED: u64 = 1;
+pub const PAUSE_REQUESTED: u64 = 2;
+pub const COALESCED_NO_HELPER_RC: i64 = i64::MIN;
+
+pub const DISCOVERY_POINTERS: usize = 104;
+pub const DISCOVERY_INTERFACES: u8 = 16;
+#[cfg(not(feature = "small-discovery-ring"))]
+pub const DISCOVERY_BYTES: u32 = 65_536;
+#[cfg(feature = "small-discovery-ring")]
+pub const DISCOVERY_BYTES: u32 = 4_096;
+
+pub const LOADER_CONTEXT_ID_MASK: u64 = 0xff;
+pub const LOADER_STATE_PRESENT: u64 = 1 << 8;
+pub const LOADER_STATE_SHIFT: u32 = 9;
+pub const LOADER_STATE_PAYLOAD_MASK: u64 = (1u64 << 55) - 1;
+pub const LOADER_STATE_ABSENT_SENTINEL: u64 = 1;
+pub const R_STATE_OFFSET: u64 = 24;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DiscoveryRecord {
+    pub hook_ts_ns: u64,
+    pub pid_tgid: u64,
+    pub table_ptr: u64,
+    pub interface_flags: u64,
+    pub pointers: [u64; DISCOVERY_POINTERS],
+    pub kind: u8,
+    pub case_id: u8,
+    pub interface_index: u8,
+    pub name_class: u8,
+    pub status_flags: u8,
+    pub usable_n: u8,
+    pub pointers_attempted: u8,
+    pub completed_prefix: u8,
+    pub version_major: u8,
+    pub version_minor: u8,
+    pub reserved_zero: [u8; 2],
+    pub symbol_id: u32,
+    pub announced_count: u32,
+    pub reserved_tail_zero: [u8; 4],
+    pub send_signal_rc: i64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct StateKey {
+    pub pid_tgid: u64,
+    pub attach_cookie: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct StartState {
+    pub arg0: u64,
+    pub arg1: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct PauseKey {
+    pub tgid: u32,
+    pub pad: u32,
+    pub generation_token: u64,
+}
+
+fn zero_discovery_payload(record: &DiscoveryRecord) -> bool {
+    record.table_ptr == 0
+        && record.interface_flags == 0
+        && record.pointers.iter().all(|pointer| *pointer == 0)
+        && record.interface_index == 0
+        && record.name_class == DISCOVERY_NAME_NA
+        && record.usable_n == 0
+        && record.pointers_attempted == 0
+        && record.completed_prefix == 0
+        && record.version_major == 0
+        && record.version_minor == 0
+        && record.symbol_id == 0
+}
+
+fn valid_export_prefix(record: &DiscoveryRecord) -> bool {
+    if record.pointers_attempted as usize > DISCOVERY_POINTERS
+        || record.completed_prefix > record.pointers_attempted
+        || record.usable_n > record.completed_prefix
+        || (record.status_flags & DISCOVERY_STATUS_READ_FAILURE != 0 && record.usable_n != 0)
+        || (record.status_flags & DISCOVERY_STATUS_READ_FAILURE == 0
+            && record.usable_n != record.completed_prefix)
+    {
+        return false;
+    }
+    record.pointers[record.completed_prefix as usize..]
+        .iter()
+        .all(|pointer| *pointer == 0)
+}
+
+/// Structural validation owned by the raw transport. Loader registry and
+/// process-generation agreement remain Task 6 responsibilities.
+pub fn valid_discovery_record(record: &DiscoveryRecord) -> bool {
+    if record.reserved_zero != [0; 2]
+        || record.reserved_tail_zero != [0; 4]
+        || (record.status_flags & DISCOVERY_STATUS_COALESCED_NO_HELPER != 0)
+            != (record.send_signal_rc == COALESCED_NO_HELPER_RC)
+        || (record.send_signal_rc != COALESCED_NO_HELPER_RC
+            && record.send_signal_rc != i64::from(record.send_signal_rc as i32))
+    {
+        return false;
+    }
+
+    match record.kind {
+        DISCOVERY_KIND_FUNCTION_LIST_RETURN => {
+            record.status_flags <= 0x03
+                && record.case_id == 0
+                && record.interface_index == 0
+                && record.name_class == DISCOVERY_NAME_NA
+                && record.interface_flags == 0
+                && record.symbol_id != 0
+                && record.announced_count == 0
+                && (record.table_ptr != 0
+                    || record.status_flags & DISCOVERY_STATUS_READ_FAILURE != 0)
+                && valid_export_prefix(record)
+        }
+        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN => {
+            record.status_flags <= 0x03
+                && record.case_id == 0
+                && record.interface_index < DISCOVERY_INTERFACES
+                && record.announced_count > u32::from(record.interface_index)
+                && matches!(
+                    record.name_class,
+                    DISCOVERY_NAME_EXACT_STANDARD
+                        | DISCOVERY_NAME_OTHER
+                        | DISCOVERY_NAME_NULL
+                        | DISCOVERY_NAME_UNREADABLE
+                )
+                && record.symbol_id != 0
+                && valid_export_prefix(record)
+                && (record.name_class == DISCOVERY_NAME_EXACT_STANDARD
+                    || (record.usable_n == 0
+                        && record.pointers_attempted == 0
+                        && record.completed_prefix == 0
+                        && record.version_major == 0
+                        && record.version_minor == 0))
+        }
+        DISCOVERY_KIND_LOADER => {
+            record.interface_flags == 0
+                && record.pointers.iter().all(|pointer| *pointer == 0)
+                && record.interface_index == 0
+                && record.name_class == DISCOVERY_NAME_NA
+                && record.usable_n == 0
+                && record.pointers_attempted == 0
+                && record.completed_prefix == 0
+                && record.version_major == 0
+                && record.version_minor == 0
+                && record.symbol_id == 0
+                && match record.status_flags {
+                    0 | DISCOVERY_STATUS_COALESCED_NO_HELPER => {
+                        record.table_ptr != 0 && record.announced_count <= 2
+                    }
+                    DISCOVERY_STATUS_LOADER_CONTEXT_INVALID => {
+                        record.table_ptr == 0
+                            && record.case_id == 0
+                            && record.announced_count == 0
+                            && record.send_signal_rc == 0
+                    }
+                    _ => false,
+                }
+        }
+        DISCOVERY_KIND_INTERFACE_RETURN => {
+            record.status_flags <= 0x03
+                && record.case_id == 0
+                && record.interface_index == 0
+                && matches!(
+                    record.name_class,
+                    DISCOVERY_NAME_EXACT_STANDARD
+                        | DISCOVERY_NAME_OTHER
+                        | DISCOVERY_NAME_NULL
+                        | DISCOVERY_NAME_UNREADABLE
+                )
+                && record.symbol_id != 0
+                && record.announced_count == 0
+                && valid_export_prefix(record)
+                && (record.name_class == DISCOVERY_NAME_EXACT_STANDARD
+                    || (record.usable_n == 0
+                        && record.pointers_attempted == 0
+                        && record.completed_prefix == 0
+                        && record.version_major == 0
+                        && record.version_minor == 0))
+        }
+        DISCOVERY_KIND_EXEC => {
+            matches!(
+                record.status_flags,
+                0 | DISCOVERY_STATUS_COALESCED_NO_HELPER
+            ) && record.case_id == 0
+                && record.announced_count == 0
+                && zero_discovery_payload(record)
+        }
+        DISCOVERY_KIND_LEADER_EXIT => {
+            record.status_flags == 0
+                && record.case_id == 0
+                && record.announced_count == 0
+                && record.send_signal_rc == 0
+                && zero_discovery_payload(record)
+        }
+        _ => false,
+    }
 }
 
 /// Per-slot aggregates. `entered - returned` is the in-flight count;
@@ -286,6 +518,14 @@ unsafe impl aya::Pod for StartKey {}
 unsafe impl aya::Pod for RvKey {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for SlotSemantics {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for DiscoveryRecord {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for StateKey {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for StartState {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for PauseKey {}
 
 /// Mechanism parameter shape codes. Userspace maps the registry's shape
 /// string to one of these and publishes it into MECH_SHAPE, keyed by
@@ -686,6 +926,346 @@ mod tests {
         assert_ne!(MECH_NONE, 0x250);
         assert_ne!(USER_TYPE_NONE, 1);
         assert_ne!(SESSION_NONE, 0);
+    }
+
+    /// Mutation caught: any field reorder, type-width change, or tail reuse
+    /// makes host and BPF disagree about the private discovery transport.
+    #[test]
+    fn discovery_transport_has_the_exact_frozen_layout() {
+        assert_eq!(core::mem::size_of::<DiscoveryRecord>(), 896);
+        assert_eq!(core::mem::align_of::<DiscoveryRecord>(), 8);
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, hook_ts_ns), 0);
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, pid_tgid), 8);
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, table_ptr), 16);
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, interface_flags), 24);
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, pointers), 32);
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, kind), 864);
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, case_id), 865);
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, interface_index), 866);
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, name_class), 867);
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, status_flags), 868);
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, usable_n), 869);
+        assert_eq!(
+            core::mem::offset_of!(DiscoveryRecord, pointers_attempted),
+            870
+        );
+        assert_eq!(
+            core::mem::offset_of!(DiscoveryRecord, completed_prefix),
+            871
+        );
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, version_major), 872);
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, version_minor), 873);
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, reserved_zero), 874);
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, symbol_id), 876);
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, announced_count), 880);
+        assert_eq!(
+            core::mem::offset_of!(DiscoveryRecord, reserved_tail_zero),
+            884
+        );
+        assert_eq!(core::mem::offset_of!(DiscoveryRecord, send_signal_rc), 888);
+
+        for size in [
+            core::mem::size_of::<StateKey>(),
+            core::mem::size_of::<StartState>(),
+            core::mem::size_of::<PauseKey>(),
+        ] {
+            assert_eq!(size, 16);
+        }
+        for align in [
+            core::mem::align_of::<StateKey>(),
+            core::mem::align_of::<StartState>(),
+            core::mem::align_of::<PauseKey>(),
+        ] {
+            assert_eq!(align, 8);
+        }
+        let key = PauseKey {
+            tgid: 7,
+            pad: 0,
+            generation_token: 9,
+        };
+        assert_eq!(key.pad, 0);
+    }
+
+    /// Mutation caught: reordering a counter silently assigns one kernel loss
+    /// class to the wrong userspace evidence owner.
+    #[test]
+    fn discovery_counter_and_status_values_are_frozen() {
+        assert_eq!(DISCOVERY_KIND_FUNCTION_LIST_RETURN, 1);
+        assert_eq!(DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, 2);
+        assert_eq!(DISCOVERY_KIND_LOADER, 3);
+        assert_eq!(DISCOVERY_KIND_INTERFACE_RETURN, 4);
+        assert_eq!(DISCOVERY_KIND_EXEC, 5);
+        assert_eq!(DISCOVERY_KIND_LEADER_EXIT, 6);
+        assert_eq!(DISCOVERY_NAME_NA, 0);
+        assert_eq!(DISCOVERY_NAME_EXACT_STANDARD, 1);
+        assert_eq!(DISCOVERY_NAME_OTHER, 2);
+        assert_eq!(DISCOVERY_NAME_NULL, 3);
+        assert_eq!(DISCOVERY_NAME_UNREADABLE, 4);
+        assert_eq!(DISCOVERY_STATUS_READ_FAILURE, 0x01);
+        assert_eq!(DISCOVERY_STATUS_COALESCED_NO_HELPER, 0x02);
+        assert_eq!(DISCOVERY_STATUS_LOADER_CONTEXT_INVALID, 0x04);
+        assert_eq!(PAUSE_ARMED, 1);
+        assert_eq!(PAUSE_REQUESTED, 2);
+        assert_eq!(COALESCED_NO_HELPER_RC, i64::MIN);
+        assert_eq!(DISCOVERY_COUNTER_RING_LOSS, 0);
+        assert_eq!(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, 1);
+        assert_eq!(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES, 2);
+        assert_eq!(DISCOVERY_COUNTER_LOADER_HITS, 3);
+        assert_eq!(DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, 4);
+        assert_eq!(DISCOVERY_COUNTER_CELLS, 5);
+    }
+
+    fn discovery_record(kind: u8) -> DiscoveryRecord {
+        let mut record: DiscoveryRecord = unsafe { core::mem::zeroed() };
+        record.kind = kind;
+        record
+    }
+
+    fn function_list_record() -> DiscoveryRecord {
+        let mut record = discovery_record(DISCOVERY_KIND_FUNCTION_LIST_RETURN);
+        record.table_ptr = 0x1000;
+        record.symbol_id = 1;
+        record
+    }
+
+    /// Mutation caught: a malformed private value or phase-owned field reaches
+    /// Task 6 as if it were a structurally valid discovery fact.
+    #[test]
+    fn discovery_record_validation_is_finite_and_phase_local() {
+        let mut export = function_list_record();
+        export.version_major = 3;
+        export.version_minor = 2;
+        export.pointers[0] = 0x2000;
+        export.usable_n = 1;
+        export.pointers_attempted = 1;
+        export.completed_prefix = 1;
+        assert!(valid_discovery_record(&export));
+
+        export.status_flags = DISCOVERY_STATUS_READ_FAILURE | DISCOVERY_STATUS_COALESCED_NO_HELPER;
+        export.send_signal_rc = COALESCED_NO_HELPER_RC;
+        export.usable_n = 0;
+        assert!(valid_discovery_record(&export));
+        export.send_signal_rc = 0;
+        assert!(!valid_discovery_record(&export));
+        export.send_signal_rc = COALESCED_NO_HELPER_RC;
+        export.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+        assert!(!valid_discovery_record(&export));
+
+        let mut non_loader_case = discovery_record(DISCOVERY_KIND_EXEC);
+        non_loader_case.case_id = 1;
+        assert!(!valid_discovery_record(&non_loader_case));
+
+        let mut invalid_loader = discovery_record(DISCOVERY_KIND_LOADER);
+        invalid_loader.status_flags = DISCOVERY_STATUS_LOADER_CONTEXT_INVALID;
+        assert!(valid_discovery_record(&invalid_loader));
+        invalid_loader.case_id = 1;
+        assert!(!valid_discovery_record(&invalid_loader));
+
+        let mut wrong_count = discovery_record(DISCOVERY_KIND_FUNCTION_LIST_RETURN);
+        wrong_count.symbol_id = 1;
+        wrong_count.announced_count = 1;
+        assert!(!valid_discovery_record(&wrong_count));
+
+        let mut interface = discovery_record(DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN);
+        interface.symbol_id = 2;
+        interface.name_class = DISCOVERY_NAME_OTHER;
+        interface.interface_index = 4;
+        interface.announced_count = 4;
+        assert!(!valid_discovery_record(&interface));
+        interface.announced_count = 5;
+        assert!(valid_discovery_record(&interface));
+
+        let mut loader = discovery_record(DISCOVERY_KIND_LOADER);
+        loader.table_ptr = 0x3000;
+        loader.announced_count = 2;
+        assert!(valid_discovery_record(&loader));
+        loader.announced_count = 3;
+        assert!(!valid_discovery_record(&loader));
+    }
+
+    /// Mutation caught: an arbitrary 64-bit private value is accepted as a
+    /// helper return even though bpf_send_signal returns a signed 32-bit int.
+    #[test]
+    fn discovery_private_result_is_zero_sentinel_or_sign_extended_i32() {
+        let mut record = function_list_record();
+        for rc in [0, 1, -1, i64::from(i32::MAX), i64::from(i32::MIN)] {
+            record.send_signal_rc = rc;
+            assert!(valid_discovery_record(&record), "rc={rc}");
+        }
+        record.send_signal_rc = i64::from(i32::MAX) + 1;
+        assert!(!valid_discovery_record(&record));
+        record.send_signal_rc = i64::from(i32::MIN) - 1;
+        assert!(!valid_discovery_record(&record));
+        record.send_signal_rc = COALESCED_NO_HELPER_RC;
+        assert!(!valid_discovery_record(&record));
+        record.status_flags = DISCOVERY_STATUS_COALESCED_NO_HELPER;
+        assert!(valid_discovery_record(&record));
+    }
+
+    /// Mutation caught: a producer-owned field, finite status, prefix bound,
+    /// or required zero is silently accepted for the wrong record kind.
+    #[test]
+    fn discovery_kind_fields_and_bounds_are_structurally_exact() {
+        let mut record = function_list_record();
+        for status in [
+            0,
+            DISCOVERY_STATUS_READ_FAILURE,
+            DISCOVERY_STATUS_COALESCED_NO_HELPER,
+            DISCOVERY_STATUS_READ_FAILURE | DISCOVERY_STATUS_COALESCED_NO_HELPER,
+        ] {
+            record.status_flags = status;
+            record.send_signal_rc = if status & DISCOVERY_STATUS_COALESCED_NO_HELPER != 0 {
+                COALESCED_NO_HELPER_RC
+            } else {
+                0
+            };
+            record.usable_n = 0;
+            assert!(valid_discovery_record(&record), "status={status:#x}");
+        }
+        record.status_flags = DISCOVERY_STATUS_LOADER_CONTEXT_INVALID;
+        record.send_signal_rc = 0;
+        assert!(!valid_discovery_record(&record));
+
+        let mut malformed = function_list_record();
+        malformed.reserved_zero[0] = 1;
+        assert!(!valid_discovery_record(&malformed));
+        malformed = function_list_record();
+        malformed.reserved_tail_zero[3] = 1;
+        assert!(!valid_discovery_record(&malformed));
+        for mutate in [
+            |value: &mut DiscoveryRecord| value.case_id = 1,
+            |value: &mut DiscoveryRecord| value.interface_index = 1,
+            |value: &mut DiscoveryRecord| value.name_class = DISCOVERY_NAME_OTHER,
+            |value: &mut DiscoveryRecord| value.interface_flags = 1,
+            |value: &mut DiscoveryRecord| value.symbol_id = 0,
+            |value: &mut DiscoveryRecord| value.announced_count = 1,
+        ] {
+            let mut value = function_list_record();
+            mutate(&mut value);
+            assert!(!valid_discovery_record(&value));
+        }
+        malformed = function_list_record();
+        malformed.table_ptr = 0;
+        assert!(!valid_discovery_record(&malformed));
+        malformed.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+        assert!(valid_discovery_record(&malformed));
+
+        malformed = function_list_record();
+        malformed.pointers_attempted = 105;
+        assert!(!valid_discovery_record(&malformed));
+        malformed = function_list_record();
+        malformed.pointers_attempted = 1;
+        malformed.completed_prefix = 2;
+        assert!(!valid_discovery_record(&malformed));
+        malformed = function_list_record();
+        malformed.pointers_attempted = 1;
+        malformed.completed_prefix = 1;
+        malformed.usable_n = 2;
+        assert!(!valid_discovery_record(&malformed));
+        malformed = function_list_record();
+        malformed.pointers[1] = 7;
+        assert!(!valid_discovery_record(&malformed));
+        malformed = function_list_record();
+        malformed.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+        malformed.usable_n = 1;
+        malformed.pointers_attempted = 1;
+        malformed.completed_prefix = 1;
+        malformed.pointers[0] = 7;
+        assert!(!valid_discovery_record(&malformed));
+
+        let mut listed = discovery_record(DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN);
+        listed.symbol_id = 2;
+        listed.name_class = DISCOVERY_NAME_OTHER;
+        listed.interface_index = 15;
+        listed.announced_count = 16;
+        listed.interface_flags = 7;
+        assert!(valid_discovery_record(&listed));
+        listed.interface_index = 16;
+        assert!(!valid_discovery_record(&listed));
+        listed.interface_index = 15;
+        listed.announced_count = 15;
+        assert!(!valid_discovery_record(&listed));
+
+        let mut direct = discovery_record(DISCOVERY_KIND_INTERFACE_RETURN);
+        direct.symbol_id = 3;
+        direct.name_class = DISCOVERY_NAME_NULL;
+        direct.interface_flags = 9;
+        assert!(valid_discovery_record(&direct));
+        direct.interface_index = 1;
+        assert!(!valid_discovery_record(&direct));
+        direct.interface_index = 0;
+        direct.announced_count = 1;
+        assert!(!valid_discovery_record(&direct));
+
+        let mut loader = discovery_record(DISCOVERY_KIND_LOADER);
+        loader.table_ptr = 0x3000;
+        loader.case_id = u8::MAX;
+        for r_state in 0..=2 {
+            loader.announced_count = r_state;
+            assert!(valid_discovery_record(&loader));
+        }
+        loader.announced_count = 3;
+        assert!(!valid_discovery_record(&loader));
+        loader.announced_count = 0;
+        loader.interface_flags = 1;
+        assert!(!valid_discovery_record(&loader));
+
+        let mut invalid_loader = discovery_record(DISCOVERY_KIND_LOADER);
+        invalid_loader.status_flags = DISCOVERY_STATUS_LOADER_CONTEXT_INVALID;
+        assert!(valid_discovery_record(&invalid_loader));
+        for mutate in [
+            |value: &mut DiscoveryRecord| value.table_ptr = 1,
+            |value: &mut DiscoveryRecord| value.case_id = 1,
+            |value: &mut DiscoveryRecord| value.announced_count = 1,
+            |value: &mut DiscoveryRecord| value.send_signal_rc = 1,
+        ] {
+            let mut value = invalid_loader;
+            mutate(&mut value);
+            assert!(!valid_discovery_record(&value));
+        }
+
+        let mut exec = discovery_record(DISCOVERY_KIND_EXEC);
+        assert!(valid_discovery_record(&exec));
+        exec.status_flags = DISCOVERY_STATUS_COALESCED_NO_HELPER;
+        exec.send_signal_rc = COALESCED_NO_HELPER_RC;
+        assert!(valid_discovery_record(&exec));
+        exec.table_ptr = 1;
+        assert!(!valid_discovery_record(&exec));
+
+        let mut exit = discovery_record(DISCOVERY_KIND_LEADER_EXIT);
+        assert!(valid_discovery_record(&exit));
+        exit.status_flags = DISCOVERY_STATUS_COALESCED_NO_HELPER;
+        exit.send_signal_rc = COALESCED_NO_HELPER_RC;
+        assert!(!valid_discovery_record(&exit));
+
+        assert!(!valid_discovery_record(&discovery_record(0)));
+        assert!(!valid_discovery_record(&discovery_record(7)));
+    }
+
+    /// Mutation caught: pause can be enabled for a cgroup or without the PID
+    /// filter that supplies the exact nonzero generation token.
+    #[test]
+    fn pause_config_is_pid_only() {
+        assert!(valid_config(
+            FLAG_PID_FILTER | FLAG_POLICY_ALLOWLISTED | FLAG_PAUSE_ENABLED
+        ));
+        assert!(!valid_config(
+            FLAG_CGROUP_FILTER | FLAG_POLICY_ALLOWLISTED | FLAG_PAUSE_ENABLED
+        ));
+        assert!(!valid_config(FLAG_PAUSE_ENABLED | FLAG_POLICY_ALLOWLISTED));
+    }
+
+    /// Mutation caught: one test-only ring feature accidentally shrinks the
+    /// unrelated production event ring.
+    #[test]
+    fn discovery_ring_feature_changes_only_discovery() {
+        #[cfg(not(feature = "small-discovery-ring"))]
+        assert_eq!(DISCOVERY_BYTES, 65_536);
+        #[cfg(feature = "small-discovery-ring")]
+        {
+            assert_eq!(DISCOVERY_BYTES, 4_096);
+            assert_eq!(RING_BYTES, 262_144);
+        }
     }
 }
 

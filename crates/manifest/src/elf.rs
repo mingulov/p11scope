@@ -102,6 +102,7 @@ impl ElfSnapshot {
         let object = parse(&data)?;
         let interpreter = interpreter(&object)?;
         let mut executable_ranges = Vec::new();
+        let data_len = data.len() as u64;
         for segment in object.segments() {
             segment
                 .address()
@@ -112,6 +113,9 @@ impl ElfSnapshot {
                 let end = start
                     .checked_add(size)
                     .ok_or_else(|| "segment file range overflows u64".to_string())?;
+                if end > data_len {
+                    return Err("segment file range extends past the ELF bytes".into());
+                }
                 (start, end)
             };
             if segment.permissions().executable() {

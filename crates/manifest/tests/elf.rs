@@ -196,6 +196,18 @@ fn malformed_and_overflowing_program_header_ranges_are_refused() {
     std::fs::write(&exe, bytes).unwrap();
     let file = p11scope_manifest::identity::open_object(&exe).unwrap();
     assert!(ElfSnapshot::read(&file).is_err());
+
+    let exe = cc_exe(&d, "past-eof-range", "int main(void) { return 0; }\n");
+    let mut bytes = std::fs::read(&exe).unwrap();
+    let header = program_header(&bytes, elf::PT_LOAD, true);
+    let past_end_size = bytes.len() as u64;
+    bytes[header.start + 32..header.start + 40].copy_from_slice(&past_end_size.to_le_bytes());
+    std::fs::write(&exe, bytes).unwrap();
+    let file = p11scope_manifest::identity::open_object(&exe).unwrap();
+    assert!(
+        ElfSnapshot::read(&file).is_err(),
+        "a non-overflowing PT_LOAD range past EOF must be refused"
+    );
 }
 
 #[test]

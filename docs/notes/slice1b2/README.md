@@ -7,6 +7,23 @@ SHA-256 manifest, and this file carries only digests, pointers, and finite
 facts. Nothing under that root is release output; private spike bundles are
 separately permissioned (corrective design §9.4).
 
+## Amended-candidate campaign attempt (2026-08-20)
+
+The reviewed no-busy-wait candidate
+`7babebd5f4910014e39320bd9b3ab61242434283` remains non-promotable. In its
+owner-approved KVM campaign, Jammy 5.15 Gate A produced a canonical PASS, but
+the temporary host `/dev/kvm` ACL disappeared before the Noble VM booted. The
+controller returned environment/lifecycle rc64 before QEMU, restored the
+original ACL, and stopped without a replacement lane. Noble and all six Gate B
+lanes are therefore UNRUN; this is not a kernel/verifier FAIL or TIMEOUT.
+
+The frozen private ledger is
+`p11scope-ws/incoming/slice1b2-task2-7babebd.baBalY3Y/preflight/post-run-evidence.tsv`
+(SHA-256 `23e4d2a04c24462de70d3cb1e5bf659fb66bac31d7fb6c0a53e0d5f918507c15`).
+Independent review classified the campaign **ENVIRONMENT/LIFECYCLE NON-PASS**.
+A fresh process in the already-configured `kvm` group can access `/dev/kvm`,
+but a new complete campaign requires separate owner approval.
+
 ## Historical research-plan handoff (2026-08-19)
 
 The exact results below remain immutable, but their former promotion wording
@@ -14,7 +31,7 @@ is superseded. The `a227dab` Gate B object used a winner-side busy wait. A later
 no-busy-wait frozen campaign recorded 120/120, all as outcome B, but controller
 and independent review found owner-2 cleanup, outcome-A causal-deadline, and
 oracle-contract defects. Neither campaign is product evidence. Promotion is
-blocked; the amended campaign is `UNRUN` under
+blocked; no complete amended-candidate campaign has run under
 `docs/superpowers/specs/2026-08-19-slice1b2-no-busy-wait-pause-amendment.md`.
 
 Final source commit `a227dabe7ab0fb62eee6ec9cca1f4afbad46eb03`:

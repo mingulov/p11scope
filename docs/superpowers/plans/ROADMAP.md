@@ -424,7 +424,13 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     attach-first experiment recorded 160/160 for its narrow fixture, but it is
     historical diagnostic evidence only: non-promotable, zero product attempts,
     and not proof of generic initial-set or all-export-ABI coverage. Task 9
-    timing catalog was skipped by D3.
+    timing catalog was skipped by D3. **Amended-candidate status (2026-08-20):**
+    Task 1 is reviewed, but its first owner-approved KVM campaign is
+    environment/lifecycle NON-PASS. Jammy 5.15 Gate A passed; transient host
+    KVM access disappeared before Noble booted, so Noble and all Gate B lanes
+    are UNRUN. No replacement was made and Task 5 remains locked. A new complete
+    campaign requires stable real `kvm` group membership and fresh owner
+    approval.
     Product implementation remains OPEN and starts only after Slice 1b-1
     lands. See the
     [pause amendment](../specs/2026-08-19-slice1b2-no-busy-wait-pause-amendment.md).**

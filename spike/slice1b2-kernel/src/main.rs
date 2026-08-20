@@ -244,9 +244,9 @@ pub struct SignalTimingFacts {
     pub pidfd_resume_attempts: u8,
     pub pidfd_resume_rc: i64,
     pub resume_via_original_pidfd: bool,
-    /// Monotonic completion timestamp for this cycle's successful
-    /// original-pidfd resume.  It relates owner 2's winner to owner 1 without
-    /// exporting a process identity.
+    /// Monotonic observer timestamp after this cycle's successful
+    /// original-pidfd resume. Outcome B compares it with owner 2's later
+    /// pre-dequeue sample; owner 2's hook may run before this sample is taken.
     pub resume_completed_ns: u64,
     pub owner_removed: bool,
     pub final_start_entries: u64,
@@ -464,7 +464,10 @@ pub fn gate_b_oracle_pass(facts: &GateBTimingFacts) -> bool {
                 && deferred_cycle_pass(&facts.cycles[0], false)
                 && deferred_cycle_pass(&facts.cycles[1], true)
                 && facts.cycles[0].winner_case_id != facts.cycles[1].winner_case_id
-                && facts.cycles[0].resume_completed_ns < facts.cycles[1].hook_ts_ns
+                && facts.cycles[1]
+                    .record_before_dequeue_ns
+                    .first()
+                    .is_some_and(|before| facts.cycles[0].resume_completed_ns <= *before)
                 && facts.signal_link_detached
                 && facts.late_link_detached
                 && facts.final_start_entries == 0
@@ -6754,17 +6757,34 @@ mod tests {
         assert!(!signal_oracle_pass(&facts.cycles[0]));
     }
 
-    #[test]
-    fn deferred_oracle_rejects_cycle_two_that_precedes_owner_one_resume_boundary() {
+    fn outcome_b_with_early_successor_hook(record_before_dequeue_ns: u64) -> GateBTimingFacts {
         let mut facts = valid_gate_b_outcome_b();
-        let first_hook = facts.cycles[0].hook_ts_ns;
+        let first_resume = facts.cycles[0].resume_completed_ns;
         let second = &mut facts.cycles[1];
-        second.hook_ts_ns = first_hook;
-        second.cycle_deadline_ns = cycle_deadline_ns(first_hook).unwrap();
-        second.last_attach_ts_ns = first_hook + 1_000_000;
-        second.record_before_dequeue_ns = vec![first_hook + 1];
-        second.record_after_decode_ns = vec![first_hook + 2];
-        second.record_hook_ts_ns = vec![first_hook];
+        second.hook_ts_ns = first_resume - 50_000;
+        second.cycle_deadline_ns = cycle_deadline_ns(second.hook_ts_ns).unwrap();
+        second.last_attach_ts_ns = first_resume + 1_000_000;
+        second.attach_gap_ms = (second.last_attach_ts_ns - second.hook_ts_ns) as f64 / 1_000_000.0;
+        second.resume_completed_ns = second.last_attach_ts_ns + 1_000;
+        second.record_before_dequeue_ns = vec![record_before_dequeue_ns];
+        second.record_after_decode_ns = vec![record_before_dequeue_ns + 1];
+        second.record_hook_ts_ns = vec![second.hook_ts_ns];
+        facts
+    }
+
+    #[test]
+    fn deferred_oracle_accepts_hook_before_post_resume_sample_when_dequeue_follows_resume() {
+        let facts = valid_gate_b_outcome_b();
+        let first_resume = facts.cycles[0].resume_completed_ns;
+        let facts = outcome_b_with_early_successor_hook(first_resume);
+        assert!(gate_b_oracle_pass(&facts));
+    }
+
+    #[test]
+    fn deferred_oracle_rejects_cycle_two_dequeued_before_owner_one_resume_boundary() {
+        let facts = valid_gate_b_outcome_b();
+        let first_resume = facts.cycles[0].resume_completed_ns;
+        let facts = outcome_b_with_early_successor_hook(first_resume - 1);
         assert!(!gate_b_oracle_pass(&facts));
     }
 
@@ -7486,6 +7506,10 @@ mod tests {
     }
 
     fn shell_validate_gate_b_export(script: &str, path: &Path, expected_rc: u8) -> bool {
+        let sidecar = PathBuf::from(format!("{}.sha256", path.display()));
+        if sidecar.exists() {
+            std::fs::remove_file(sidecar).unwrap();
+        }
         Command::new("bash")
             .arg("-c")
             .arg("source \"$1\"; validate_local_export b \"$2\" \"$3\"")
@@ -7509,6 +7533,43 @@ mod tests {
             .status()
             .unwrap()
             .success()
+    }
+
+    #[test]
+    fn shell_oracle_orders_outcome_b_by_dequeue_after_successful_resume() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("gate-b-resume-dequeue-order");
+        let path = temp.path().join("campaign-shaped");
+        fake_canonical_gate_b_export(&path, 2, 20, "none");
+
+        let baseline = valid_gate_b_outcome_b();
+        let first_resume = baseline.cycles[0].resume_completed_ns;
+        let campaign_shaped = outcome_b_with_early_successor_hook(first_resume);
+        let timing = (1..=20)
+            .map(|run| {
+                let mut value = signal_timing_value(run, &campaign_shaped);
+                value["pass"] = true.into();
+                value["failure_category"] = "none".into();
+                value.to_string() + "\n"
+            })
+            .collect::<String>();
+        std::fs::write(path.join("signal-timing.jsonl"), &timing).unwrap();
+        assert!(shell_validate_gate_b_export(script, &path, 0));
+
+        let mut records = timing
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        records[0]["cycles"][1]["record_before_dequeue_ns"][0] = (first_resume - 1).into();
+        std::fs::write(
+            path.join("signal-timing.jsonl"),
+            records
+                .iter()
+                .map(|record| record.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        assert!(!shell_validate_gate_b_export(script, &path, 0));
     }
 
     #[test]
@@ -7620,8 +7681,10 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
-        deferred_records[0]["cycles"][0]["resume_completed_ns"] =
-            deferred_records[0]["cycles"][1]["hook_ts_ns"].clone();
+        let first_resume = deferred_records[0]["cycles"][0]["resume_completed_ns"]
+            .as_u64()
+            .unwrap();
+        deferred_records[0]["cycles"][1]["record_before_dequeue_ns"][0] = (first_resume - 1).into();
         std::fs::write(
             deferred.join("signal-timing.jsonl"),
             deferred_records

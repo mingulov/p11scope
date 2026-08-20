@@ -541,7 +541,7 @@ def oracle(item):
         return (global_ok and len(cycles) == 2 and outcome_b_cycle(cycles[0], False)
                 and outcome_b_cycle(cycles[1], True)
                 and cycles[0]["winner_case_id"] != cycles[1]["winner_case_id"]
-                and cycles[0]["resume_completed_ns"] < cycles[1]["hook_ts_ns"])
+                and cycles[0]["resume_completed_ns"] <= cycles[1]["record_before_dequeue_ns"][0])
     return False
 if any(not well_formed(item) for item in timing):
     raise SystemExit(64)

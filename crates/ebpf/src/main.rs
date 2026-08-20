@@ -17,10 +17,12 @@ use aya_ebpf::programs::{ProbeContext, RetProbeContext, TracePointContext};
 use aya_ebpf::{helpers, EbpfContext as _};
 use core::mem::MaybeUninit;
 use p11scope_ebpf_common::{
-    bucket_of, capture, cookie_descriptor, cookie_slot, event_type, lifecycle,
-    return_allows_mechanism, shape, valid_config, CallStart, DiscoveryRecord, Event,
-    FunctionNameKey, PauseKey, RvKey, SlotSemantics, SlotStats, StartKey, StartState, StateKey,
-    ARG_NONE, CFG_FLAGS, COALESCED_NO_HELPER_RC, DISCOVERY_BYTES, DISCOVERY_COUNTER_CELLS,
+    bucket_of, capture, cookie_descriptor, cookie_slot, discovery_pause_coalesced,
+    discovery_pause_enabled, discovery_state_take_failed, discovery_table_slots,
+    discovery_usable_prefix, event_type, lifecycle, return_allows_mechanism, shape, valid_config,
+    valid_loader_cookie, CallStart, DiscoveryRecord, Event, FunctionNameKey, PauseKey, RvKey,
+    SlotSemantics, SlotStats, StartKey, StartState, StateKey, ARG_NONE, CFG_FLAGS,
+    COALESCED_NO_HELPER_RC, DISCOVERY_BYTES, DISCOVERY_COUNTER_CELLS,
     DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES, DISCOVERY_COUNTER_EXPORT_STATE_FAILURES,
     DISCOVERY_COUNTER_LOADER_HITS, DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES,
     DISCOVERY_COUNTER_RING_LOSS, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
@@ -31,11 +33,10 @@ use p11scope_ebpf_common::{
     DISCOVERY_STATUS_READ_FAILURE, EVIDENCE_CELLS, EVIDENCE_CGROUP_SCOPE_FAILURES,
     EVIDENCE_RING_LOSS, EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
     EVIDENCE_START_INSERT_FAILURES, EVIDENCE_UNMATCHED_RETURNS, EVIDENCE_UNREGISTERED_MECHANISMS,
-    FLAG_CGROUP_FILTER, FLAG_PAUSE_ENABLED, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE,
-    FLAG_POLICY_ALLOWLISTED, FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, LOADER_STATE_ABSENT_SENTINEL,
-    LOADER_STATE_PRESENT, MAX_ATTRS, MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE,
-    PAUSE_ARMED, PAUSE_REQUESTED, RING_BYTES, RV_ENTRIES, R_STATE_OFFSET, SESSION_NONE,
-    START_ENTRIES, USER_TYPE_NONE,
+    FLAG_CGROUP_FILTER, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
+    FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, LOADER_STATE_PRESENT, MAX_ATTRS, MAX_DESCRIPTORS,
+    MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, PAUSE_ARMED, PAUSE_REQUESTED, RING_BYTES, RV_ENTRIES,
+    R_STATE_OFFSET, SESSION_NONE, START_ENTRIES, USER_TYPE_NONE,
 };
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use p11scope_ebpf_common::{
@@ -312,7 +313,7 @@ fn finish_discovery_record(
 ) {
     let raw = entry.as_mut_ptr();
     let (hook_ts_ns, send_signal_rc) =
-        if eligible && scope.flags & FLAG_PAUSE_ENABLED != 0 && scope.generation_token != 0 {
+        if discovery_pause_enabled(eligible, scope.flags, scope.generation_token) {
             let key = PauseKey {
                 tgid: scope.tgid,
                 pad: 0,
@@ -334,7 +335,7 @@ fn finish_discovery_record(
                     let hook_ts_ns = unsafe { helpers::bpf_ktime_get_ns() };
                     let send_signal_rc = unsafe { helpers::bpf_send_signal(19) } as i64;
                     (hook_ts_ns, send_signal_rc)
-                } else if previous == PAUSE_REQUESTED {
+                } else if discovery_pause_coalesced(previous, won) {
                     status_flags |= DISCOVERY_STATUS_COALESCED_NO_HELPER;
                     (
                         unsafe { helpers::bpf_ktime_get_ns() },
@@ -375,16 +376,6 @@ struct ExportArgs {
     symbol_id: u32,
     announced_count: u32,
     address: u64,
-}
-
-fn table_slots(version_major: u8, version_minor: u8) -> u8 {
-    match (version_major, version_minor) {
-        (2, 0) => 67,
-        (2, _) => 68,
-        (3, 0 | 1) => 92,
-        (3, 2..) => 104,
-        _ => 0,
-    }
 }
 
 #[inline(never)]
@@ -458,16 +449,15 @@ fn emit_export(args: &ExportArgs, scope: ScopeAuth) {
     let mut version_minor = 0u8;
     let mut attempted = 0u8;
     let mut completed = 0u8;
-    let mut usable = 0u8;
     if read_table && !read_failed {
         match unsafe { helpers::bpf_probe_read_user(table_ptr as *const [u8; 2]) } {
             Ok(version) => {
                 version_major = version[0];
                 version_minor = version[1];
-                usable = table_slots(version_major, version_minor);
+                let slots = discovery_table_slots(version_major, version_minor);
                 let mut pointer_index = 0usize;
                 while pointer_index < 104 {
-                    if pointer_index >= usable as usize {
+                    if pointer_index >= slots as usize {
                         break;
                     }
                     attempted += 1;
@@ -502,9 +492,9 @@ fn emit_export(args: &ExportArgs, scope: ScopeAuth) {
         }
     }
     if read_failed {
-        usable = 0;
         bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
     }
+    let usable = discovery_usable_prefix(read_failed, completed);
 
     let status = if read_failed {
         DISCOVERY_STATUS_READ_FAILURE
@@ -576,7 +566,7 @@ fn take_export_state(ctx: &RetProbeContext, scoped: bool) -> Option<(StateKey, S
     let key = export_state_key(ctx)?;
     let state = unsafe { DISCOVERY_STATE.get(&key) }.copied();
     let removed = DISCOVERY_STATE.remove(&key).is_ok();
-    if state.is_none() || !removed {
+    if discovery_state_take_failed(state.is_some(), removed) {
         if scoped {
             bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
         }
@@ -746,8 +736,7 @@ pub fn dl_debug_state(ctx: ProbeContext) -> u32 {
     let pid_tgid = helpers::bpf_get_current_pid_tgid();
     let cookie = loader_cookie_of(&ctx);
     let state_present = cookie & LOADER_STATE_PRESENT != 0;
-    let payload = cookie >> 9;
-    if cookie == 0 || (!state_present && payload != LOADER_STATE_ABSENT_SENTINEL) {
+    if !valid_loader_cookie(cookie) {
         // SAFETY: invalid-cookie records stay zero outside these finite fields.
         unsafe {
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).kind), DISCOVERY_KIND_LOADER);

@@ -242,6 +242,42 @@ pub const LOADER_STATE_PAYLOAD_MASK: u64 = (1u64 << 55) - 1;
 pub const LOADER_STATE_ABSENT_SENTINEL: u64 = 1;
 pub const R_STATE_OFFSET: u64 = 24;
 
+pub const fn discovery_table_slots(version_major: u8, version_minor: u8) -> u8 {
+    match (version_major, version_minor) {
+        (2, 0) => 67,
+        (2, _) => 68,
+        (3, 0 | 1) => 92,
+        (3, 2..) => 104,
+        _ => 0,
+    }
+}
+
+pub const fn discovery_usable_prefix(read_failed: bool, completed: u8) -> u8 {
+    if read_failed {
+        0
+    } else {
+        completed
+    }
+}
+
+pub const fn valid_loader_cookie(cookie: u64) -> bool {
+    let state_present = cookie & LOADER_STATE_PRESENT != 0;
+    let payload = cookie >> LOADER_STATE_SHIFT;
+    cookie != 0 && (state_present || payload == LOADER_STATE_ABSENT_SENTINEL)
+}
+
+pub const fn discovery_pause_enabled(eligible: bool, flags: u64, generation_token: u64) -> bool {
+    eligible && flags & FLAG_PAUSE_ENABLED != 0 && generation_token != 0
+}
+
+pub const fn discovery_pause_coalesced(previous: u64, won: bool) -> bool {
+    !won && previous == PAUSE_REQUESTED
+}
+
+pub const fn discovery_state_take_failed(state_present: bool, removed: bool) -> bool {
+    !state_present || !removed
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DiscoveryRecord {
@@ -964,6 +1000,14 @@ mod tests {
         );
         assert_eq!(core::mem::offset_of!(DiscoveryRecord, send_signal_rc), 888);
 
+        assert_eq!(core::mem::offset_of!(StateKey, pid_tgid), 0);
+        assert_eq!(core::mem::offset_of!(StateKey, attach_cookie), 8);
+        assert_eq!(core::mem::offset_of!(StartState, arg0), 0);
+        assert_eq!(core::mem::offset_of!(StartState, arg1), 8);
+        assert_eq!(core::mem::offset_of!(PauseKey, tgid), 0);
+        assert_eq!(core::mem::offset_of!(PauseKey, pad), 4);
+        assert_eq!(core::mem::offset_of!(PauseKey, generation_token), 8);
+
         for size in [
             core::mem::size_of::<StateKey>(),
             core::mem::size_of::<StartState>(),
@@ -984,6 +1028,34 @@ mod tests {
             generation_token: 9,
         };
         assert_eq!(key.pad, 0);
+    }
+
+    #[test]
+    fn discovery_producer_decisions_cover_the_finite_edges() {
+        assert_eq!(discovery_table_slots(2, 0), 67);
+        assert_eq!(discovery_table_slots(2, 40), 68);
+        assert_eq!(discovery_table_slots(3, 1), 92);
+        assert_eq!(discovery_table_slots(3, 2), 104);
+        assert_eq!(discovery_table_slots(4, 0), 0);
+        assert_eq!(discovery_usable_prefix(false, 104), 104);
+        assert_eq!(discovery_usable_prefix(true, 67), 0);
+
+        assert!(!valid_loader_cookie(0));
+        assert!(!valid_loader_cookie(1));
+        assert!(valid_loader_cookie((LOADER_STATE_ABSENT_SENTINEL << 9) | 7));
+        assert!(valid_loader_cookie(LOADER_STATE_PRESENT | 7));
+
+        assert!(!discovery_pause_enabled(false, FLAG_PAUSE_ENABLED, 7));
+        assert!(!discovery_pause_enabled(true, 0, 7));
+        assert!(!discovery_pause_enabled(true, FLAG_PAUSE_ENABLED, 0));
+        assert!(discovery_pause_enabled(true, FLAG_PAUSE_ENABLED, 7));
+        assert!(!discovery_pause_coalesced(PAUSE_ARMED, false));
+        assert!(!discovery_pause_coalesced(PAUSE_REQUESTED, true));
+        assert!(discovery_pause_coalesced(PAUSE_REQUESTED, false));
+
+        assert!(!discovery_state_take_failed(true, true));
+        assert!(discovery_state_take_failed(false, true));
+        assert!(discovery_state_take_failed(true, false));
     }
 
     /// Mutation caught: reordering a counter silently assigns one kernel loss

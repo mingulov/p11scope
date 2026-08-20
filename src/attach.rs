@@ -17,20 +17,80 @@ use p11scope_ebpf_common::{
 };
 use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
 use std::collections::{BTreeMap, BTreeSet};
-use std::mem::{size_of, size_of_val};
+use std::mem::size_of_val;
 use std::num::NonZeroU64;
 use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::path::PathBuf;
 
-const BASE_POLICY_MAPS: [&str; 6] = [
-    "CONFIG",
-    "PID_FILTER",
-    "CGROUP_FILTER",
-    "DESCRIPTORS",
-    "ASYNC_FUNCTIONS",
-    "MECH_SHAPE",
+const BPF_F_RDONLY_PROG: u32 = 1 << 7;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ExactMapMetadata {
+    map_type: MapType,
+    key_size: u32,
+    value_size: u32,
+    max_entries: u32,
+    flags: u32,
+}
+
+const fn map_metadata(
+    map_type: MapType,
+    key_size: u32,
+    value_size: u32,
+    max_entries: u32,
+    flags: u32,
+) -> ExactMapMetadata {
+    ExactMapMetadata {
+        map_type,
+        key_size,
+        value_size,
+        max_entries,
+        flags,
+    }
+}
+
+const BASE_POLICY_MAPS: [(&str, ExactMapMetadata); 6] = [
+    (
+        "CONFIG",
+        map_metadata(MapType::Array, 4, 8, 1, BPF_F_RDONLY_PROG),
+    ),
+    (
+        "PID_FILTER",
+        map_metadata(MapType::Hash, 4, 8, 1_024, BPF_F_RDONLY_PROG),
+    ),
+    (
+        "CGROUP_FILTER",
+        map_metadata(MapType::CgroupArray, 4, 4, 1, 0),
+    ),
+    (
+        "DESCRIPTORS",
+        map_metadata(MapType::Array, 4, 18, MAX_DESCRIPTORS, BPF_F_RDONLY_PROG),
+    ),
+    (
+        "ASYNC_FUNCTIONS",
+        map_metadata(MapType::Hash, 32, 4, 128, BPF_F_RDONLY_PROG),
+    ),
+    (
+        "MECH_SHAPE",
+        map_metadata(
+            MapType::Hash,
+            8,
+            4,
+            p11scope_ebpf_common::MAX_MECH_SHAPES,
+            BPF_F_RDONLY_PROG,
+        ),
+    ),
 ];
-const FEATURE_POLICY_MAPS: [&str; 1] = ["ATTR_BOOL_BITS"];
+const FEATURE_POLICY_MAPS: [(&str, ExactMapMetadata); 2] = [
+    (
+        "ATTR_BOOL_BITS",
+        map_metadata(MapType::Hash, 4, 4, 16, BPF_F_RDONLY_PROG),
+    ),
+    (
+        "TEMPLATE_TAIL",
+        map_metadata(MapType::ProgramArray, 4, 4, 1, 0),
+    ),
+];
 const TAIL_POLICY_MAP: &str = "TEMPLATE_TAIL";
 const DEFAULT_PROGRAMS: [&str; 12] = [
     "p11_entry",
@@ -66,6 +126,46 @@ pub(crate) fn policy_map_data<'a>(name: &str, map: &'a Map) -> Result<&'a aya::m
         }
         other => bail!("refusing unexpected {name} policy map variant {other:?}"),
     }
+}
+
+fn validate_map_metadata(
+    name: &str,
+    data: &aya::maps::MapData,
+    expected: ExactMapMetadata,
+) -> Result<()> {
+    let info = data
+        .info()
+        .with_context(|| format!("reading {name} map info"))?;
+    let actual = ExactMapMetadata {
+        map_type: info.map_type()?,
+        key_size: info.key_size(),
+        value_size: info.value_size(),
+        max_entries: info.max_entries(),
+        flags: info.map_flags(),
+    };
+    if actual != expected {
+        bail!("{name} metadata {actual:?} differs from exact expected {expected:?}");
+    }
+    Ok(())
+}
+
+fn validate_policy_map(ebpf: &Ebpf, name: &str, expected: ExactMapMetadata) -> Result<()> {
+    let map = ebpf.map(name).with_context(|| format!("{name} map"))?;
+    validate_map_metadata(name, policy_map_data(name, map)?, expected)
+}
+
+fn validate_policy_maps(ebpf: &Ebpf, object_has_unsafe: bool) -> Result<()> {
+    for (name, expected) in BASE_POLICY_MAPS {
+        validate_policy_map(ebpf, name, expected)?;
+    }
+    for (name, expected) in FEATURE_POLICY_MAPS {
+        if object_has_unsafe {
+            validate_policy_map(ebpf, name, expected)?;
+        } else if ebpf.map(name).is_some() {
+            bail!("{name} must be absent from the default eBPF object");
+        }
+    }
+    Ok(())
 }
 
 fn freeze_map(name: &str, map: &Map) -> Result<()> {
@@ -448,20 +548,6 @@ fn standard_async_catalog() -> Result<BTreeMap<FunctionNameKey, u32>> {
 
 fn publish_descriptors(ebpf: &mut Ebpf) -> Result<()> {
     let expected = crate::kinds::DESCRIPTORS.to_vec();
-    let info = policy_map_data(
-        "DESCRIPTORS",
-        ebpf.map("DESCRIPTORS").context("DESCRIPTORS map")?,
-    )?
-    .info()
-    .context("reading DESCRIPTORS map info")?;
-    if info.map_type()? != MapType::Array || info.max_entries() != MAX_DESCRIPTORS {
-        bail!(
-            "DESCRIPTORS has type {:?} and capacity {}, expected Array and {}",
-            info.map_type()?,
-            info.max_entries(),
-            MAX_DESCRIPTORS
-        );
-    }
     let mut semantics: Array<_, SlotSemantics> =
         Array::try_from(ebpf.map_mut("DESCRIPTORS").context("DESCRIPTORS map")?)?;
     for (index, value) in expected.iter().copied().enumerate() {
@@ -478,24 +564,6 @@ fn publish_descriptors(ebpf: &mut Ebpf) -> Result<()> {
 
 fn publish_async_catalog(ebpf: &mut Ebpf) -> Result<()> {
     let expected = standard_async_catalog()?;
-
-    let info = policy_map_data(
-        "ASYNC_FUNCTIONS",
-        ebpf.map("ASYNC_FUNCTIONS").context("ASYNC_FUNCTIONS map")?,
-    )?
-    .info()
-    .context("reading ASYNC_FUNCTIONS map info")?;
-    if info.map_type()? != MapType::Hash
-        || info.max_entries() != 128
-        || info.key_size() != size_of::<FunctionNameKey>() as u32
-    {
-        bail!(
-            "ASYNC_FUNCTIONS has type {:?}, key size {}, and capacity {}, expected Hash, 32, and 128",
-            info.map_type()?,
-            info.key_size(),
-            info.max_entries()
-        );
-    }
     let mut functions: HashMap<_, FunctionNameKey, u32> = HashMap::try_from(
         ebpf.map_mut("ASYNC_FUNCTIONS")
             .context("ASYNC_FUNCTIONS map")?,
@@ -513,22 +581,12 @@ fn publish_async_catalog(ebpf: &mut Ebpf) -> Result<()> {
 }
 
 fn publish_attribute_catalog(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
-    let Some(map) = ebpf.map("ATTR_BOOL_BITS") else {
+    let Some(_) = ebpf.map("ATTR_BOOL_BITS") else {
         if enabled {
             bail!("ATTR_BOOL_BITS is missing from the diagnostic eBPF object");
         }
         return Ok(());
     };
-    let info = policy_map_data("ATTR_BOOL_BITS", map)?
-        .info()
-        .context("reading ATTR_BOOL_BITS map info")?;
-    if info.map_type()? != MapType::Hash || info.max_entries() != 16 {
-        bail!(
-            "ATTR_BOOL_BITS has type {:?} and capacity {}, expected Hash and 16",
-            info.map_type()?,
-            info.max_entries()
-        );
-    }
     let expected = if enabled {
         p11scope_ebpf_common::attr_bool::TYPES_AND_BITS
             .into_iter()
@@ -554,13 +612,16 @@ fn publish_attribute_catalog(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
 }
 
 fn freeze_published_maps(ebpf: &Ebpf) -> Result<()> {
-    for name in BASE_POLICY_MAPS {
+    for (name, _) in BASE_POLICY_MAPS {
         if name == "DESCRIPTORS" {
             continue;
         }
         freeze_map(name, ebpf.map(name).with_context(|| format!("{name} map"))?)?;
     }
-    for name in FEATURE_POLICY_MAPS {
+    for (name, _) in FEATURE_POLICY_MAPS {
+        if name == TAIL_POLICY_MAP {
+            continue;
+        }
         if let Some(map) = ebpf.map(name) {
             freeze_map(name, map)?;
         }
@@ -581,25 +642,11 @@ fn validate_runtime_map(
         Map::HashMap(map) | Map::PerCpuArray(map) | Map::RingBuf(map) => map,
         other => bail!("refusing unexpected {name} runtime map variant {other:?}"),
     };
-    let info = data
-        .info()
-        .with_context(|| format!("reading {name} map info"))?;
-    if info.map_type()? != map_type
-        || info.key_size() != key_size
-        || info.value_size() != value_size
-        || info.max_entries() != max_entries
-        || info.map_flags() != 0
-    {
-        bail!(
-            "{name} has type {:?}, key/value {}/{}, capacity {}, flags {:#x}; expected {map_type:?}, {key_size}/{value_size}, {max_entries}, 0",
-            info.map_type()?,
-            info.key_size(),
-            info.value_size(),
-            info.max_entries(),
-            info.map_flags()
-        );
-    }
-    Ok(())
+    validate_map_metadata(
+        name,
+        data,
+        map_metadata(map_type, key_size, value_size, max_entries, 0),
+    )
 }
 
 fn validate_runtime_maps(ebpf: &Ebpf) -> Result<()> {
@@ -658,20 +705,6 @@ fn publish_and_freeze_template_tail(
     if !object_has_unsafe {
         bail!("{TAIL_POLICY_MAP} must be absent from the default eBPF object");
     }
-    let info = policy_map_data(
-        TAIL_POLICY_MAP,
-        ebpf.map(TAIL_POLICY_MAP).context("TEMPLATE_TAIL map")?,
-    )?
-    .info()
-    .context("reading TEMPLATE_TAIL map info")?;
-    if info.map_type()? != MapType::ProgramArray || info.max_entries() != 1 {
-        bail!(
-            "TEMPLATE_TAIL has type {:?} and capacity {}, expected ProgramArray and 1",
-            info.map_type()?,
-            info.max_entries()
-        );
-    }
-
     if enabled {
         let (tail_fd, expected_id) = {
             let tail: &UProbe = ebpf
@@ -759,6 +792,8 @@ impl Session {
         let mut ebpf = Ebpf::load(crate::EBPF_OBJECT).context("loading BPF object")?;
         let object_has_unsafe = cfg!(feature = "unsafe-unvalidated-metadata");
         let unsafe_enabled = object_has_unsafe && policy.uses_unsafe_decoders();
+        validate_policy_maps(&ebpf, object_has_unsafe)
+            .context("validating exact policy-map metadata")?;
         validate_runtime_maps(&ebpf).context("validating live-discovery runtime maps")?;
         validate_program_inventory(&ebpf, object_has_unsafe)
             .context("validating exact eBPF program inventory")?;
@@ -1355,7 +1390,7 @@ mod tests {
     #[test]
     fn immutable_map_inventory_covers_every_authorization_input() {
         assert_eq!(
-            BASE_POLICY_MAPS,
+            BASE_POLICY_MAPS.map(|(name, _)| name),
             [
                 "CONFIG",
                 "PID_FILTER",
@@ -1365,7 +1400,10 @@ mod tests {
                 "MECH_SHAPE",
             ]
         );
-        assert_eq!(FEATURE_POLICY_MAPS, ["ATTR_BOOL_BITS"]);
+        assert_eq!(
+            FEATURE_POLICY_MAPS.map(|(name, _)| name),
+            ["ATTR_BOOL_BITS", "TEMPLATE_TAIL"]
+        );
         assert_eq!(TAIL_POLICY_MAP, "TEMPLATE_TAIL");
     }
 

@@ -74,9 +74,12 @@ def pause_contract(source):
         fail("pause writer must contain exactly one SIGSTOP helper source site")
     cas = pause.index("core::intrinsics::atomic_cxchg")
     signal = pause.index("helpers::bpf_send_signal(19)")
-    timestamp = pause.rfind("helpers::bpf_ktime_get_ns()", cas, signal)
+    winner_prefix = pause[cas:signal]
+    timestamp = pause.find("helpers::bpf_ktime_get_ns()", cas, signal)
     if timestamp < cas:
         fail("pause winner timestamp must follow CAS and precede SIGSTOP")
+    if winner_prefix.count("helpers::") != 1:
+        fail("another helper separates the successful CAS and winner timestamp")
     between = pause[timestamp + len("helpers::bpf_ktime_get_ns()") : signal]
     if "helpers::" in between:
         fail("another helper separates the winner timestamp and SIGSTOP")
@@ -147,13 +150,14 @@ def sha256(data):
 def expected_manifest_values(variant):
     if variant not in VARIANTS:
         fail(f"unknown variant {variant!r}")
+    maps, programs = expected_inventory(variant)
     return {
         "record_size": 896,
         "record_align": 8,
         "counter_indices": COUNTERS,
         "initializer_words": 112,
         "initializer_indices": list(range(112)),
-        "inventory": f"p11scope-live-discovery-{variant}/v1",
+        "inventory": {"maps": maps, "programs": sorted(programs)},
     }
 
 
@@ -206,6 +210,19 @@ def function_blocks(disassembly):
     return blocks
 
 
+def line_pc(line):
+    match = re.match(r"\s*(\d+):", line)
+    return int(match.group(1)) if match else None
+
+
+def relative_target(pc, text):
+    branch = re.search(r"\bgoto (?P<sign>[+-])0x(?P<distance>[0-9a-f]+)\b", text)
+    if not branch:
+        return None
+    distance = int(branch.group("distance"), 16)
+    return pc + 1 + (distance if branch.group("sign") == "+" else -distance)
+
+
 def initializer_regions(disassembly):
     regions = []
     for function, lines in function_blocks(disassembly).items():
@@ -251,23 +268,47 @@ def initializer_regions(disassembly):
                     break
             if candidate is None:
                 fail(f"{function}: missing exact 112-store initializer")
-            start, _, base, zero, stores = candidate
+            start, end, base, zero, stores = candidate
             prefix = "\n".join(lines[:start])
             if not re.search(rf"r{zero} = 0x0\b", prefix):
                 fail(f"{function}: initializer source register is not proven zero")
+            success_branches = []
+            for line in lines[reserve + 1 : start]:
+                pc = line_pc(line)
+                if pc is None or not re.search(rf"\bif r{base} != 0x0 goto ", line):
+                    continue
+                success_branches.append(relative_target(pc, line))
+            if len(success_branches) != 1 or success_branches[0] is None:
+                fail(
+                    f"{function}: reservation must have one finite success branch"
+                )
+            target = success_branches[0]
+            target_index = next(
+                (index for index, line in enumerate(lines) if line_pc(line) == target),
+                None,
+            )
+            if target_index is None or not (reserve < target_index <= start):
+                fail(f"{function}: successful reservation does not enter the initializer")
+            for line in lines[target_index:start]:
+                if line_pc(line) is not None and not re.search(
+                    r"\*\(u(?:8|16|32|64) \*\)\(r10 - 0x[0-9a-f]+\) =", line
+                ):
+                    fail(f"{function}: non-stack operation precedes initialization: {line!r}")
             before_init = "\n".join(lines[reserve + 1 : start])
             if re.search(rf"= \*\([^)]*\)\(r{base} \+", before_init):
                 fail(f"{function}: record field read precedes initialization")
             if "call 0x84" in before_init:
                 fail(f"{function}: record submit precedes initialization")
+            trailing = "\n".join(lines[end:])
+            if re.search(
+                rf"\*\(u64 \*\)\(r{base} \+ 0x(?:38[0-9a-f]|3[9a-f][0-9a-f]|[4-9a-f][0-9a-f]{{2,}})\) = r{zero}\b",
+                trailing,
+            ):
+                fail(f"{function}: initializer writes beyond the 896-byte record")
             regions.append(
                 {
                     "function": function,
                     "offsets": stores,
-                    "narrow": False,
-                    "back_edge": False,
-                    "premature_read": False,
-                    "premature_submit": False,
                 }
             )
     return regions
@@ -282,46 +323,82 @@ def instructions(lines):
     return parsed
 
 
-def winner_finishes_without_helper(lines, signal_index):
+def instruction_graph(lines):
     insns = instructions(lines)
+    positions = {pc for pc, _ in insns}
+    graph = {}
+    for index, (pc, text) in enumerate(insns):
+        following = insns[index + 1][0] if index + 1 < len(insns) else None
+        target = relative_target(pc, text)
+        edges = []
+        if target is not None:
+            if target not in positions:
+                fail(f"branch from instruction {pc} targets missing instruction {target}")
+            edges.append(target)
+            if re.search(r"\bif .*\bgoto ", text) and following is not None:
+                edges.append(following)
+        elif not re.search(r"\bexit\s*$", text) and following is not None:
+            edges.append(following)
+        graph[pc] = edges
+    return insns, graph
+
+
+def reachable(graph, starts, blocked=frozenset()):
+    seen = set()
+    pending = list(starts)
+    while pending:
+        pc = pending.pop()
+        if pc in seen or pc in blocked:
+            continue
+        seen.add(pc)
+        pending.extend(graph.get(pc, ()))
+    return seen
+
+
+def nodes_on_paths(graph, start, target):
+    forward = reachable(graph, [start])
+    reverse = {pc: [] for pc in graph}
+    for pc, edges in graph.items():
+        for edge in edges:
+            reverse.setdefault(edge, []).append(pc)
+    return forward & reachable(reverse, [target])
+
+
+def winner_finishes_without_helper(lines, signal_index):
+    insns, graph = instruction_graph(lines)
     signal_pc = int(re.match(r"\s*(\d+):", lines[signal_index]).group(1))
-    positions = {pc: index for index, (pc, _) in enumerate(insns)}
-    index = positions[signal_pc] + 1
+    texts = dict(insns)
+    pending = [(pc, {}) for pc in graph.get(signal_pc, ())]
     visited = set()
-    stores = {}
-    while index < len(insns):
-        pc, text = insns[index]
-        if pc in visited:
-            return False
-        visited.add(pc)
+    submitted = False
+    while pending:
+        pc, stores = pending.pop()
+        state = (
+            pc,
+            tuple((base, tuple(sorted(offsets))) for base, offsets in sorted(stores.items())),
+        )
+        if state in visited:
+            continue
+        visited.add(state)
+        text = texts[pc]
         if re.search(r"\bcall 0x84\b", text):
-            bases = [
-                base
-                for base, offsets in stores.items()
-                if {0, 8, 0x364, 0x378}.issubset(offsets)
-            ]
-            return bool(bases)
+            if not any({0, 8, 0x364, 0x378}.issubset(offsets) for offsets in stores.values()):
+                return False
+            submitted = True
+            continue
         if re.search(r"\bcall 0x", text):
             return False
         store = ANY_OBJECT_STORE.search(text)
         if store:
+            stores = {base: set(offsets) for base, offsets in stores.items()}
             stores.setdefault(store.group("base"), set()).add(
                 int(store.group("offset"), 16)
             )
-        if re.search(r"\bif .*\bgoto [+-]0x", text):
+        edges = graph.get(pc, ())
+        if not edges:
             return False
-        branch = re.search(r"\bgoto (?P<sign>[+-])0x(?P<distance>[0-9a-f]+)\b", text)
-        if branch:
-            distance = int(branch.group("distance"), 16)
-            target = pc + 1 + (distance if branch.group("sign") == "+" else -distance)
-            if target not in positions:
-                return False
-            index = positions[target]
-            continue
-        if "goto " in text:
-            return False
-        index += 1
-    return False
+        pending.extend((edge, stores) for edge in edges)
+    return submitted
 
 
 def pause_object_contract(disassembly):
@@ -342,9 +419,24 @@ def pause_object_contract(disassembly):
     for _, lines, cas, signals in signal_blocks:
         if len(cas) != 1 or len(signals) != 1 or cas[0] >= signals[0]:
             return False
-        between = "\n".join(lines[cas[0] : signals[0]])
-        timestamp = between.rfind("call 0x5")
-        if timestamp < 0 or "call 0x" in between[timestamp + len("call 0x5") :]:
+        insns, graph = instruction_graph(lines)
+        pcs = [pc for pc, _ in insns]
+        texts = dict(insns)
+        cas_pc = line_pc(lines[cas[0]])
+        signal_pc = line_pc(lines[signals[0]])
+        cas_position = pcs.index(cas_pc)
+        if cas_position + 1 >= len(pcs):
+            return False
+        start = pcs[cas_position + 1]
+        winner_path = nodes_on_paths(graph, start, signal_pc)
+        helper_calls = [
+            pc
+            for pc in winner_path
+            if pc != signal_pc and re.search(r"\bcall (?:-?0x[0-9a-f]+)\b", texts[pc])
+        ]
+        if len(helper_calls) != 1 or not re.search(r"\bcall 0x5\b", texts[helper_calls[0]]):
+            return False
+        if signal_pc in reachable(graph, [start], {helper_calls[0]}):
             return False
         if not winner_finishes_without_helper(lines, signals[0]):
             return False
@@ -374,41 +466,176 @@ def bounded_object_contract(disassembly):
     return export_bounds and interface_bounds
 
 
-def object_counter_uses(disassembly):
-    uses = []
+def cookie_object_contract(disassembly):
+    blocks = function_blocks(disassembly)
+    loader = "\n".join(blocks.get("dl_debug_state", []))
+    if len(re.findall(r"\bcall 0xae\b", loader)) != 1:
+        return False
+    if not all(
+        marker in loader for marker in ("&= 0x100", "&= -0x200", "s>>= 0x9")
+    ):
+        return False
+    export_programs = (
+        "function_list_entry",
+        "function_list_return",
+        "interface_list_entry",
+        "interface_list_return",
+        "interface_entry",
+        "interface_return",
+    )
+    for name in export_programs:
+        block = "\n".join(blocks.get(name, []))
+        if (
+            len(re.findall(r"\bcall 0xae\b", block)) != 2
+            or "= -0x100000000 ll" not in block
+            or "= -0xffffffff ll" not in block
+            or re.search(r"(?:s)?>>= 0x20\b", block)
+        ):
+            return False
+    return not re.search(r"(?:s)?>>= 0x20\b", loader)
+
+
+def finite_counter_key(lines, relocation):
     key_store = re.compile(
         r"\*\(u32 \*\)\(r10 - 0x[0-9a-f]+\) = r(?P<register>\d+)"
     )
+    stored = next(
+        (
+            (index, match.group("register"))
+            for index in range(relocation - 1, max(-1, relocation - 12), -1)
+            if (match := key_store.search(lines[index]))
+        ),
+        None,
+    )
+    if stored is None:
+        return None
+    store_index, register = stored
+    assignment = re.compile(
+        rf"\br{register} = (?P<sign>-?)0x(?P<value>[0-9a-f]+)\b"
+    )
+    for index in range(store_index - 1, -1, -1):
+        if match := assignment.search(lines[index]):
+            value = int(match.group("value"), 16)
+            return -value if match.group("sign") else value
+        if re.search(rf"\br{register} =", lines[index]):
+            break
+    return None
+
+
+def reservation_loss_contract(disassembly):
+    reservation_functions = set()
+    for function, lines in function_blocks(disassembly).items():
+        for relocation in [
+            index
+            for index, line in enumerate(lines)
+            if re.search(r"R_BPF_64_64\s+DISCOVERY\s*$", line)
+        ]:
+            reservation_functions.add(function)
+            reserve = next(
+                (
+                    index
+                    for index in range(relocation, min(len(lines), relocation + 10))
+                    if "call 0x83" in lines[index]
+                ),
+                None,
+            )
+            if reserve is None:
+                return False
+            branch = next(
+                (
+                    index
+                    for index in range(reserve + 1, min(len(lines), reserve + 8))
+                    if re.search(r"\bif r(?P<base>\d+) != 0x0 goto ", lines[index])
+                ),
+                None,
+            )
+            if branch is None:
+                return False
+            target = relative_target(line_pc(lines[branch]), lines[branch])
+            target_index = next(
+                (index for index, line in enumerate(lines) if line_pc(line) == target),
+                None,
+            )
+            if target_index is None or target_index <= branch:
+                return False
+            failure = lines[branch + 1 : target_index]
+            counters = [
+                index
+                for index, line in enumerate(failure)
+                if re.search(r"R_BPF_64_64\s+COUNTERS\s*$", line)
+            ]
+            if (
+                len(counters) != 1
+                or finite_counter_key(lines, branch + 1 + counters[0]) != 0
+                or not any("call 0x1" in line for line in failure[counters[0] :])
+            ):
+                return False
+    return len(reservation_functions) == 3 and {
+        next((name for name in reservation_functions if name.endswith("emit_export")), None),
+        next((name for name in reservation_functions if name.endswith("emit_lifecycle")), None),
+        "dl_debug_state",
+    } == reservation_functions
+
+
+def producer_object_contract(disassembly):
+    blocks = function_blocks(disassembly)
+    entry_names = ("function_list_entry", "interface_list_entry", "interface_entry")
+    return_names = ("function_list_return", "interface_list_return", "interface_return")
+    for name in entry_names:
+        block = "\n".join(blocks.get(name, []))
+        if (
+            len(re.findall(r"R_BPF_64_64\s+DISCOVERY_STATE\s*$", block, re.MULTILINE))
+            < 2
+            or "call 0x2" not in block
+            or "call 0x3" not in block
+            or not re.search(r"\br4 = 0x1\b", block)
+            or not re.search(r"R_BPF_64_64\s+COUNTERS\s*$", block, re.MULTILINE)
+        ):
+            return False
+    for name in return_names:
+        block = "\n".join(blocks.get(name, []))
+        if (
+            len(re.findall(r"R_BPF_64_64\s+DISCOVERY_STATE\s*$", block, re.MULTILINE))
+            < 3
+            or "call 0x1" not in block
+            or len(re.findall(r"\bcall 0x3\b", block)) < 2
+            or not re.search(r"R_BPF_64_64\s+COUNTERS\s*$", block, re.MULTILINE)
+        ):
+            return False
+
+    export = "\n".join(blocks.get("interface_list_return", []))
+    if "call 0x70" not in export or not re.search(
+        r"R_BPF_64_64\s+COUNTERS\s*$", export, re.MULTILINE
+    ):
+        return False
+
+    loader = "\n".join(blocks.get("dl_debug_state", []))
+    if (
+        "= -0x8000000000000000 ll" not in loader
+        or len(re.findall(r"\bif r\d+ == 0x2 goto ", loader)) < 2
+        or not re.search(r"R_BPF_64_64\s+PAUSE_PIDS\s*$", loader, re.MULTILINE)
+    ):
+        return False
+
+    for name in ("dl_debug_state",):
+        block = "\n".join(blocks.get(name, []))
+        if "= 0x4" not in block:
+            return False
+
+    return reservation_loss_contract(disassembly)
+
+
+def object_counter_uses(disassembly):
+    uses = []
     for function, lines in function_blocks(disassembly).items():
         for relocation in [
             index
             for index, line in enumerate(lines)
             if re.search(r"R_BPF_64_64\s+COUNTERS\s*$", line)
         ]:
-            stored = next(
-                (
-                    (index, match.group("register"))
-                    for index in range(relocation - 1, max(-1, relocation - 12), -1)
-                    if (match := key_store.search(lines[index]))
-                ),
-                None,
-            )
-            if stored is None:
-                fail(f"{function}: COUNTERS lookup has no finite u32 stack key")
-            store_index, register = stored
-            assignment = re.compile(
-                rf"\br{register} = (?P<sign>-?)0x(?P<value>[0-9a-f]+)\b"
-            )
-            key = None
-            for index in range(store_index - 1, -1, -1):
-                if match := assignment.search(lines[index]):
-                    value = int(match.group("value"), 16)
-                    key = -value if match.group("sign") else value
-                    break
-                if re.search(rf"\br{register} =", lines[index]):
-                    break
+            key = finite_counter_key(lines, relocation)
             if key is None:
-                fail(f"{function}: COUNTERS key register is not a direct finite constant")
+                fail(f"{function}: COUNTERS lookup has no finite u32 stack key")
             uses.append((function, key))
     return uses
 
@@ -438,7 +665,7 @@ def counter_ownership_contract(uses):
 
 def inspect_object(path, source, variant):
     checker = map_checker()
-    maps, programs, symbols = checker["inspect"](str(path))
+    maps, programs, _ = checker["inspect"](str(path))
     disassembly = subprocess.run(
         ["llvm-objdump", "-dr", str(path)],
         capture_output=True,
@@ -451,7 +678,6 @@ def inspect_object(path, source, variant):
     return {
         "maps": maps,
         "programs": programs,
-        "symbols": symbols,
         "initializer_regions": regions,
         "record_size": max(offsets, default=-8) + 8,
         "record_align": min(
@@ -467,11 +693,11 @@ def inspect_object(path, source, variant):
             str(index): COUNTERS[str(index)] for index in {key for _, key in counter_uses}
         },
         "counter_ownership": counter_ownership_contract(counter_uses),
-        "cookie_namespaces_distinct": "fn loader_cookie_of(" in source
-        and "cookie_slot(cookie_of(ctx))" in source,
+        "cookie_namespaces_distinct": cookie_object_contract(disassembly),
         "bounded": "while pointer_index < 104" in source
         and "while interface_index < 16" in source
         and bounded_object_contract(disassembly),
+        "producer_edges": producer_object_contract(disassembly),
         "cmpxchg_count": disassembly.count("cmpxchg_64"),
         "signal_count": len(re.findall(r"call 0x6d\b", disassembly)),
         "pause_order": pause_object_contract(disassembly),
@@ -491,83 +717,22 @@ def object_contract(facts, variant):
         (facts["counter_ownership"], "counter ownership differs"),
         (facts["cookie_namespaces_distinct"], "cookie namespaces collide"),
         (facts["bounded"], "bounded 104/16 source loops are absent"),
+        (facts["producer_edges"], "producer edge contract differs"),
         (facts["cmpxchg_count"] == 3, "cmpxchg_64 inventory differs"),
         (facts["signal_count"] == 3, "signal helper inventory differs"),
         (facts["pause_order"], "CAS/timestamp/signal/result/submit order differs"),
+        (facts["unrelated_memset"], "unrelated memset positive control is absent"),
         (len(facts["initializer_regions"]) == 3, "initializer copy inventory differs"),
     ]
     for region in facts["initializer_regions"]:
         checks.extend(
             [
                 (region["offsets"] == list(range(0, 896, 8)), "initializer offsets differ"),
-                (not region["narrow"], "initializer contains a narrow store"),
-                (not region["back_edge"], "initializer contains a back edge"),
-                (not region["premature_read"], "initializer has a premature field read"),
-                (not region["premature_submit"], "initializer has a premature submit"),
             ]
         )
     for okay, message in checks:
         if not okay:
             fail(message)
-
-
-def synthetic_object_facts(variant):
-    maps, programs = expected_inventory(variant)
-    region = {
-        "function": "synthetic",
-        "offsets": list(range(0, 896, 8)),
-        "narrow": False,
-        "back_edge": False,
-        "premature_read": False,
-        "premature_submit": False,
-    }
-    return {
-        "maps": maps,
-        "programs": programs,
-        "symbols": {"memset"},
-        "initializer_regions": [copy.deepcopy(region) for _ in range(3)],
-        "record_size": 896,
-        "record_align": 8,
-        "counter_indices": COUNTERS,
-        "counter_ownership": True,
-        "cookie_namespaces_distinct": True,
-        "bounded": True,
-        "cmpxchg_count": 3,
-        "signal_count": 3,
-        "pause_order": True,
-        "unrelated_memset": True,
-        "variant": variant,
-    }
-
-
-def object_mutations(facts):
-    mutations = []
-
-    def changed(label, mutate):
-        value = copy.deepcopy(facts)
-        mutate(value)
-        mutations.append((label, value))
-
-    changed("111 object stores", lambda value: value["initializer_regions"][0]["offsets"].pop())
-    changed("113 object stores", lambda value: value["initializer_regions"][0]["offsets"].append(896))
-    changed("duplicate object offset", lambda value: value["initializer_regions"][0]["offsets"].__setitem__(111, 880))
-    changed("narrow object spill", lambda value: value["initializer_regions"][0].__setitem__("narrow", True))
-    changed("initializer back edge", lambda value: value["initializer_regions"][0].__setitem__("back_edge", True))
-    changed("premature object read", lambda value: value["initializer_regions"][0].__setitem__("premature_read", True))
-    changed("premature object submit", lambda value: value["initializer_regions"][0].__setitem__("premature_submit", True))
-    changed("missing cmpxchg_64", lambda value: value.__setitem__("cmpxchg_count", 2))
-    changed("missing signal helper", lambda value: value.__setitem__("signal_count", 2))
-    changed("wrong helper ordering", lambda value: value.__setitem__("pause_order", False))
-    changed("unbounded object loop", lambda value: value.__setitem__("bounded", False))
-    changed("wrong record size", lambda value: value.__setitem__("record_size", 888))
-    changed("wrong record alignment", lambda value: value.__setitem__("record_align", 4))
-    changed("wrong map flags", lambda value: value["maps"]["PAUSE_PIDS"].__setitem__("flags", 128))
-    changed("wrong map size", lambda value: value["maps"]["PID_FILTER"].__setitem__("value_size", 1))
-    changed("wrong counter permutation", lambda value: value.__setitem__("counter_indices", {**COUNTERS, "4": "loader_hits"}))
-    changed("wrong counter owner", lambda value: value.__setitem__("counter_ownership", False))
-    changed("wrong program inventory", lambda value: value["programs"].remove("dl_debug_state"))
-    changed("cookie collision", lambda value: value.__setitem__("cookie_namespaces_distinct", False))
-    return mutations
 
 
 def _initializer(stores=range(112)):
@@ -602,6 +767,137 @@ def _source(stores=range(112)):
             _pause(),
         ]
     )
+
+
+def _initializer_block(function, tail=""):
+    lines = [
+        f"0000000000000000 <{function}>:",
+        "       0:\tr7 = 0x0",
+        "       1:\tr1 = 0x0 ll",
+        "\t\t0000000000000008:  R_BPF_64_64\tDISCOVERY",
+        "       3:\tr2 = 0x380",
+        "       4:\tr3 = 0x0",
+        "       5:\tcall 0x83",
+        "       6:\tr6 = r0",
+        "       7:\tif r6 != 0x0 goto +0x3",
+        "       8:\t*(u32 *)(r10 - 0x4) = r7",
+        "\t\t0000000000000040:  R_BPF_64_64\tCOUNTERS",
+        "       9:\tcall 0x1",
+        "      10:\tgoto +0x70",
+    ]
+    lines.extend(
+        f"{11 + index:8}:\t*(u64 *)(r6 + 0x{index * 8:x}) = r7"
+        for index in range(112)
+    )
+    lines.append("     123:\tcall 0x84")
+    if tail:
+        lines.extend(tail.splitlines())
+    return "\n".join(lines)
+
+
+def _initializer_disassembly(loader_tail=""):
+    return "\n".join(
+        [
+            _initializer_block("fixture_emit_export"),
+            _initializer_block("fixture_emit_lifecycle"),
+            _initializer_block("dl_debug_state", loader_tail),
+        ]
+    )
+
+
+def _pause_disassembly():
+    block = """0000000000000000 <pause{index}>:
+       0:\tr0 = cmpxchg_64(r1 + 0x0, r0, r3)
+       1:\tif r0 == 0x1 goto +0x4
+       2:\tr7 = -0x8000000000000000 ll
+       3:\tif r0 == 0x2 goto +0x0
+       4:\tcall 0x5
+       5:\tgoto +0x7
+       6:\tcall 0x5
+       7:\tr1 = 0x13
+       8:\tcall 0x6d
+       9:\t*(u64 *)(r6 + 0x0) = r7
+      10:\t*(u64 *)(r6 + 0x8) = r7
+      11:\t*(u64 *)(r6 + 0x364) = r7
+      12:\t*(u64 *)(r6 + 0x378) = r7
+      13:\tcall 0x84
+      14:\texit"""
+    return "\n".join(block.format(index=index) for index in range(3))
+
+
+def _cookie_disassembly():
+    loader = """0000000000000000 <dl_debug_state>:
+       0:\tcall 0xae
+       1:\tr1 &= 0x100
+       2:\tr1 &= -0x200
+       3:\tr1 s>>= 0x9
+       4:\texit"""
+    export = """0000000000000000 <{name}>:
+       0:\tcall 0xae
+       1:\tr1 = -0x100000000 ll
+       3:\tr1 = -0xffffffff ll
+       5:\tcall 0xae
+       6:\texit"""
+    names = (
+        "function_list_entry",
+        "function_list_return",
+        "interface_list_entry",
+        "interface_list_return",
+        "interface_entry",
+        "interface_return",
+    )
+    return "\n".join([loader] + [export.format(name=name) for name in names])
+
+
+def _bounded_disassembly():
+    return """0000000000000000 <fixture_emit_export>:
+       0:\tr1 = 0x43
+       1:\tr2 = 0x44
+       2:\tr3 = 0x5c
+       3:\tr4 = 0x68
+       4:\tif r1 > r2 goto -0x1
+       5:\texit
+0000000000000000 <interface_list_return>:
+       0:\tif r7 > 0xe goto +0x2
+       1:\tr7 += 0x1
+       2:\tgoto -0x3
+       3:\texit"""
+
+
+def _producer_disassembly():
+    loader_tail = """     124:\tr1 = 0x4
+     125:\tr7 = -0x8000000000000000 ll
+     127:\tif r0 == 0x2 goto +0x0
+     128:\tif r0 == 0x2 goto +0x0
+\t\t0000000000000400:  R_BPF_64_64\tPAUSE_PIDS"""
+    entry = """0000000000000000 <{name}>:
+       0:\tr4 = 0x1
+\t\t0000000000000000:  R_BPF_64_64\tDISCOVERY_STATE
+       1:\tcall 0x2
+\t\t0000000000000008:  R_BPF_64_64\tDISCOVERY_STATE
+       2:\tcall 0x3
+\t\t0000000000000010:  R_BPF_64_64\tCOUNTERS
+       3:\texit"""
+    returned = """0000000000000000 <{name}>:
+\t\t0000000000000000:  R_BPF_64_64\tDISCOVERY_STATE
+       0:\tcall 0x1
+\t\t0000000000000008:  R_BPF_64_64\tDISCOVERY_STATE
+       1:\tcall 0x3
+\t\t0000000000000010:  R_BPF_64_64\tDISCOVERY_STATE
+       2:\tcall 0x3
+\t\t0000000000000018:  R_BPF_64_64\tCOUNTERS
+       3:\tcall 0x70
+       4:\texit"""
+    parts = [_initializer_disassembly(loader_tail)]
+    parts.extend(
+        entry.format(name=name)
+        for name in ("function_list_entry", "interface_list_entry", "interface_entry")
+    )
+    parts.extend(
+        returned.format(name=name)
+        for name in ("function_list_return", "interface_list_return", "interface_return")
+    )
+    return "\n".join(parts)
 
 
 def _reject(action, label):
@@ -663,6 +959,15 @@ def self_test():
         ),
         "winner timestamp not immediately before helper",
     )
+    _reject(
+        lambda: source_contract(
+            good.replace(
+                "if previous == PAUSE_ARMED {\n    let hook_ts_ns",
+                "if previous == PAUSE_ARMED {\n    let _early = helpers::bpf_get_prandom_u32();\n    let hook_ts_ns",
+            )
+        ),
+        "helper between CAS and winner timestamp",
+    )
     timestamp_before_cas = good.replace(
         "let previous = core::intrinsics::atomic_cxchg::<u64, AcqRel, Acquire>(value, PAUSE_ARMED, PAUSE_REQUESTED);",
         "let hook_ts_ns = helpers::bpf_ktime_get_ns();\nlet previous = core::intrinsics::atomic_cxchg::<u64, AcqRel, Acquire>(value, PAUSE_ARMED, PAUSE_REQUESTED);",
@@ -702,10 +1007,112 @@ def self_test():
         "pause submit before final result stores",
     )
 
-    facts = synthetic_object_facts("default")
-    object_contract(facts, "default")
-    for label, mutation in object_mutations(facts):
-        _reject(lambda mutation=mutation: object_contract(mutation, "default"), label)
+    initializer = _initializer_disassembly()
+    if len(initializer_regions(initializer)) != 3:
+        raise AssertionError("valid initializer disassembly fixture was rejected")
+    if not reservation_loss_contract(initializer):
+        raise AssertionError("valid reservation-loss disassembly fixture was rejected")
+    initializer_mutations = [
+        (
+            "initializer success branch retarget",
+            initializer.replace("if r6 != 0x0 goto +0x3", "if r6 != 0x0 goto +0x2", 1),
+        ),
+        (
+            "111 object stores",
+            initializer.replace("*(u64 *)(r6 + 0x378) = r7\n", "", 1),
+        ),
+        (
+            "113 object stores",
+            initializer.replace(
+                "     123:\tcall 0x84",
+                "     123:\t*(u64 *)(r6 + 0x380) = r7\n     124:\tcall 0x84",
+                1,
+            ),
+        ),
+        (
+            "narrow object spill",
+            initializer.replace(
+                "*(u64 *)(r6 + 0x38) = r7",
+                "*(u32 *)(r6 + 0x38) = r7",
+                1,
+            ),
+        ),
+        (
+            "initializer back edge",
+            initializer.replace("*(u64 *)(r6 + 0x38) = r7", "goto -0x1", 1),
+        ),
+        (
+            "premature object read",
+            initializer.replace(
+                "*(u64 *)(r6 + 0x38) = r7",
+                "r1 = *(u64 *)(r6 + 0x38)",
+                1,
+            ),
+        ),
+        (
+            "premature object submit",
+            initializer.replace("*(u64 *)(r6 + 0x38) = r7", "call 0x84", 1),
+        ),
+    ]
+    for label, mutation in initializer_mutations:
+        _reject(lambda mutation=mutation: initializer_regions(mutation), label)
+    _reject(
+        lambda: reservation_loss_contract(
+            initializer.replace("R_BPF_64_64\tCOUNTERS", "R_BPF_64_64\tNOT_COUNTERS", 1)
+        )
+        or fail("ring-reservation loss path accepted without counter zero"),
+        "ring-reservation loss counter",
+    )
+
+    pause = _pause_disassembly()
+    if not pause_object_contract(pause):
+        raise AssertionError("valid pause disassembly fixture was rejected")
+    for label, mutation in [
+        (
+            "object helper between CAS and winner timestamp",
+            pause.replace("       6:\tcall 0x5\n       7:\tr1 = 0x13", "       6:\tcall 0x7\n       7:\tcall 0x5", 1),
+        ),
+        ("missing object timestamp", pause.replace("       6:\tcall 0x5", "       6:\tr1 = 0x0", 1)),
+        ("post-signal object helper", pause.replace("       9:\t*(u64 *)(r6 + 0x0) = r7", "       9:\tcall 0x7", 1)),
+        ("post-signal object back edge", pause.replace("      10:\t*(u64 *)(r6 + 0x8) = r7", "      10:\tgoto -0x2", 1)),
+    ]:
+        if pause_object_contract(mutation):
+            raise AssertionError(f"mutation accepted: {label}")
+
+    cookie = _cookie_disassembly()
+    if not cookie_object_contract(cookie):
+        raise AssertionError("valid cookie disassembly fixture was rejected")
+    if cookie_object_contract(cookie.replace("       0:\tcall 0xae", "       0:\tcall 0x5", 1)):
+        raise AssertionError("mutation accepted: missing loader cookie")
+    if cookie_object_contract(
+        cookie.replace("       5:\tcall 0xae", "       5:\tr1 >>= 0x20\n       6:\tcall 0xae", 1)
+    ):
+        raise AssertionError("mutation accepted: export cookie slot collision")
+
+    bounded = _bounded_disassembly()
+    if not bounded_object_contract(bounded):
+        raise AssertionError("valid bounded-loop disassembly fixture was rejected")
+    for label, mutation in [
+        ("104-slot cap", bounded.replace("r4 = 0x68", "r4 = 0x69")),
+        ("16-interface cap", bounded.replace("r7 > 0xe", "r7 > 0xf")),
+    ]:
+        if bounded_object_contract(mutation):
+            raise AssertionError(f"mutation accepted: {label}")
+
+    producer = _producer_disassembly()
+    if not producer_object_contract(producer):
+        raise AssertionError("valid producer-edge disassembly fixture was rejected")
+    for label, mutation in [
+        ("state insert no-overwrite", producer.replace("       0:\tr4 = 0x1", "       0:\tr4 = 0x0", 1)),
+        ("state insertion cleanup", producer.replace("       2:\tcall 0x3", "       2:\tcall 0x2", 1)),
+        ("state return removal", producer.replace("       1:\tcall 0x3", "       1:\tcall 0x2", 1)),
+        ("bounded-read failure counter", producer.replace("call 0x70", "call 0x71")),
+        ("invalid-loader marker", producer.replace("     124:\tr1 = 0x4", "     124:\tr1 = 0x0")),
+        ("coalesced pause sentinel", producer.replace("r7 = -0x8000000000000000 ll", "r7 = 0x0", 1)),
+        ("ring-reservation loss counter", producer.replace("R_BPF_64_64\tCOUNTERS", "R_BPF_64_64\tNOT_COUNTERS", 1)),
+    ]:
+        if producer_object_contract(mutation):
+            raise AssertionError(f"mutation accepted: {label}")
 
     manifest = test_manifest(Path("/canonical/main.rs"), "default", good)
     _reject(
@@ -727,6 +1134,17 @@ def self_test():
             "default",
         ),
         "initializer-region digest mismatch",
+    )
+    wrong_inventory = copy.deepcopy(manifest)
+    wrong_inventory["expected"]["inventory"]["programs"].remove("dl_debug_state")
+    _reject(
+        lambda: manifest_contract(
+            wrong_inventory,
+            Path("/canonical/main.rs"),
+            good,
+            "default",
+        ),
+        "exact inventory mismatch",
     )
     _reject(
         lambda: validate_manifest_output(

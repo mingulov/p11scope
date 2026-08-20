@@ -4,15 +4,13 @@
 use crate::attach::{CapturePolicy, Scope};
 use anyhow::{Context as _, Result, bail};
 use aya::Ebpf;
-use aya::maps::{Array, CgroupArray, HashMap, MapType};
+use aya::maps::{Array, CgroupArray, HashMap};
 use p11scope_ebpf_common::{
     CFG_FLAGS, FLAG_CGROUP_FILTER, FLAG_PAUSE_ENABLED, FLAG_PID_FILTER, valid_config,
 };
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::Path;
-
-const BPF_F_RDONLY_PROG: u32 = 1 << 7;
 
 /// A cgroup's kernel id is its directory inode number — the value returned
 /// by `bpf_get_current_cgroup_id()` for a task directly inside it. Scope
@@ -80,42 +78,6 @@ pub(crate) fn publish(
         bail!("refusing invalid CONFIG {config:#x}");
     }
 
-    let pid_info = crate::attach::policy_map_data(
-        "PID_FILTER",
-        ebpf.map("PID_FILTER").context("PID_FILTER map")?,
-    )?
-    .info()
-    .context("reading PID_FILTER map info")?;
-    if pid_info.map_type()? != MapType::Hash
-        || pid_info.key_size() != 4
-        || pid_info.value_size() != 8
-        || pid_info.max_entries() != 1024
-        || pid_info.map_flags() != BPF_F_RDONLY_PROG
-    {
-        bail!(
-            "PID_FILTER has type {:?}, key/value {}/{}, capacity {}, flags {:#x}; expected Hash, 4/8, 1024, {BPF_F_RDONLY_PROG:#x}",
-            pid_info.map_type()?,
-            pid_info.key_size(),
-            pid_info.value_size(),
-            pid_info.max_entries(),
-            pid_info.map_flags()
-        );
-    }
-
-    let cgroup_info = crate::attach::policy_map_data(
-        "CGROUP_FILTER",
-        ebpf.map("CGROUP_FILTER").context("CGROUP_FILTER map")?,
-    )?
-    .info()
-    .context("reading CGROUP_FILTER map info")?;
-    if cgroup_info.map_type()? != MapType::CgroupArray || cgroup_info.max_entries() != 1 {
-        bail!(
-            "CGROUP_FILTER has type {:?} and capacity {}, expected CgroupArray and 1",
-            cgroup_info.map_type()?,
-            cgroup_info.max_entries()
-        );
-    }
-
     let mut expected_pids = BTreeMap::new();
     let mut cgroup_file = None;
     match scope {
@@ -133,6 +95,8 @@ pub(crate) fn publish(
             use std::os::unix::fs::MetadataExt as _;
             let directory =
                 File::open(path).with_context(|| format!("opening cgroup {}", path.display()))?;
+            let mut groups: CgroupArray<_> =
+                CgroupArray::try_from(ebpf.map_mut("CGROUP_FILTER").context("CGROUP_FILTER map")?)?;
             let opened_id = directory
                 .metadata()
                 .with_context(|| format!("reading opened cgroup {}", path.display()))?
@@ -145,8 +109,8 @@ pub(crate) fn publish(
                     opened_id
                 );
             }
-            let mut groups: CgroupArray<_> =
-                CgroupArray::try_from(ebpf.map_mut("CGROUP_FILTER").context("CGROUP_FILTER map")?)?;
+            // CgroupArray has no userspace lookup; exact metadata, this
+            // opened-FD inode check, and successful set are the content proof.
             groups.set(0, directory.try_clone()?, 0)?;
             cgroup_file = Some(directory);
         }
@@ -159,17 +123,6 @@ pub(crate) fn publish(
         bail!("PID_FILTER exact readback differs from the selected scope");
     }
 
-    let config_info =
-        crate::attach::policy_map_data("CONFIG", ebpf.map("CONFIG").context("CONFIG map")?)?
-            .info()
-            .context("reading CONFIG map info")?;
-    if config_info.map_type()? != MapType::Array || config_info.max_entries() != 1 {
-        bail!(
-            "CONFIG has type {:?} and capacity {}, expected Array and 1",
-            config_info.map_type()?,
-            config_info.max_entries()
-        );
-    }
     let mut cfg: Array<_, u64> = Array::try_from(ebpf.map_mut("CONFIG").context("CONFIG map")?)?;
     cfg.set(CFG_FLAGS, config, 0)?;
     let cfg: Array<_, u64> = Array::try_from(ebpf.map("CONFIG").context("CONFIG map")?)?;

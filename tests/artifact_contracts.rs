@@ -48,6 +48,51 @@ fn require_before(source: &str, first: &str, second: &str, contract: &str) -> Re
     }
 }
 
+fn assert_exact_policy_map_metadata_contract(attach: &str) -> Result<(), String> {
+    let declarations =
+        contract_section(attach, "const BASE_POLICY_MAPS:", "const TAIL_POLICY_MAP:")?;
+    let compact: String = declarations
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>()
+        .replace(",)", ")");
+    for expected in [
+        "(\"CONFIG\",map_metadata(MapType::Array,4,8,1,BPF_F_RDONLY_PROG))",
+        "(\"PID_FILTER\",map_metadata(MapType::Hash,4,8,1_024,BPF_F_RDONLY_PROG))",
+        "(\"CGROUP_FILTER\",map_metadata(MapType::CgroupArray,4,4,1,0))",
+        "(\"DESCRIPTORS\",map_metadata(MapType::Array,4,18,MAX_DESCRIPTORS,BPF_F_RDONLY_PROG))",
+        "(\"ASYNC_FUNCTIONS\",map_metadata(MapType::Hash,32,4,128,BPF_F_RDONLY_PROG))",
+        "(\"MECH_SHAPE\",map_metadata(MapType::Hash,8,4,p11scope_ebpf_common::MAX_MECH_SHAPES,BPF_F_RDONLY_PROG))",
+        "(\"ATTR_BOOL_BITS\",map_metadata(MapType::Hash,4,4,16,BPF_F_RDONLY_PROG))",
+        "(\"TEMPLATE_TAIL\",map_metadata(MapType::ProgramArray,4,4,1,0))",
+    ] {
+        if !compact.contains(expected) {
+            return Err(format!("exact policy-map metadata missing {expected}"));
+        }
+    }
+
+    let validator = contract_section(attach, "fn validate_map_metadata(", "fn freeze_map(")?;
+    for marker in [
+        "map_type: info.map_type()?",
+        "key_size: info.key_size()",
+        "value_size: info.value_size()",
+        "max_entries: info.max_entries()",
+        "flags: info.map_flags()",
+        "if actual != expected",
+        "for (name, expected) in BASE_POLICY_MAPS",
+        "for (name, expected) in FEATURE_POLICY_MAPS",
+        "{name} must be absent from the default eBPF object",
+    ] {
+        require_contract_marker(validator, marker, "exact policy-map metadata validator")?;
+    }
+    require_before(
+        attach,
+        "validate_policy_maps(&ebpf, object_has_unsafe)",
+        "crate::scope::publish(&mut ebpf, scope, policy, generation_token)",
+        "exact policy-map metadata before publication",
+    )
+}
+
 fn assert_live_discovery_host_contract(
     attach: &str,
     scope: &str,
@@ -55,6 +100,7 @@ fn assert_live_discovery_host_contract(
     hooks: &str,
     main: &str,
 ) -> Result<(), String> {
+    assert_exact_policy_map_metadata_contract(attach)?;
     for (marker, contract) in [
         (
             "pub struct OwnedPauseGeneration {\n    tgid: u32,\n    generation: NonZeroU64,\n}",
@@ -143,11 +189,14 @@ fn assert_live_discovery_host_contract(
         ("HashMap<_, u32, u64>", "u64 PID_FILTER value"),
         ("generation_token.unwrap_or(1)", "fixed ordinary PID token"),
         ("FLAG_PAUSE_ENABLED", "pause config bit"),
-        ("key_size() != 4", "PID_FILTER key width readback"),
-        ("value_size() != 8", "PID_FILTER value width readback"),
+        ("File::open(path)", "opened cgroup descriptor"),
         (
-            "map_flags() != BPF_F_RDONLY_PROG",
-            "PID_FILTER flag readback",
+            "let opened_id = directory",
+            "opened cgroup inode revalidation",
+        ),
+        (
+            "groups.set(0, directory.try_clone()?, 0)?",
+            "cgroup insertion proof",
         ),
     ] {
         require_contract_marker(scope, marker, contract)?;
@@ -831,7 +880,11 @@ fn descriptor_cookie_and_publication_source_guard_rejects_contract_regressions()
         "publication must write every fixed descriptor"
     );
 
-    let changed_readback_refusal = attach.replacen("if actual != expected {", "if false {", 1);
+    let changed_readback_refusal = attach.replacen(
+        "if actual != expected {\n        bail!(\"DESCRIPTORS exact readback differs",
+        "if false {\n        bail!(\"DESCRIPTORS exact readback differs",
+        1,
+    );
     assert!(
         assert_descriptor_publication_contract(&changed_readback_refusal).is_err(),
         "publication must refuse an inexact descriptor readback"
@@ -874,6 +927,38 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_unarmed() {
         assert_live_discovery_host_contract(&attach, &scope, &shared_malformed, &hooks, &main)
             .is_err(),
         "DISCOVERY must keep its own fixed-purpose drain owner"
+    );
+    let drifted_cgroup_metadata = attach.replacen(
+        "map_metadata(MapType::CgroupArray, 4, 4, 1, 0)",
+        "map_metadata(MapType::CgroupArray, 4, 8, 1, 0)",
+        1,
+    );
+    assert!(
+        assert_live_discovery_host_contract(
+            &drifted_cgroup_metadata,
+            &scope,
+            &events,
+            &hooks,
+            &main,
+        )
+        .is_err(),
+        "CGROUP_FILTER value-width drift must fail the exact metadata contract"
+    );
+    let skipped_policy_barrier = attach.replacen(
+        "        validate_policy_maps(&ebpf, object_has_unsafe)",
+        "        skip_policy_validation(&ebpf, object_has_unsafe)",
+        1,
+    );
+    assert!(
+        assert_live_discovery_host_contract(
+            &skipped_policy_barrier,
+            &scope,
+            &events,
+            &hooks,
+            &main,
+        )
+        .is_err(),
+        "policy-map metadata must be validated before publication"
     );
 }
 

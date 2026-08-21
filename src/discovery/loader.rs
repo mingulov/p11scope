@@ -6,7 +6,7 @@ use p11scope_ebpf_common::{
 use p11scope_manifest::elf::SymbolFact;
 use p11scope_manifest::maps::MapEntry;
 
-use crate::discovery::identity::PinnedObjectId;
+use crate::discovery::identity::{PinnedObjectId, PinnedObjects};
 use crate::process::ProcessViewId;
 
 pub(crate) const MAX_LOADER_CONTEXTS: usize = 256;
@@ -188,6 +188,11 @@ impl LoaderRegistry {
         self.contexts.get(usize::from(id.get() - 1))?.as_ref()
     }
 
+    pub(crate) fn is_tombstoned(&self, id: LoaderContextId) -> bool {
+        self.context(id)
+            .is_some_and(|context| context.state == LoaderContextState::Tombstoned)
+    }
+
     fn context_mut(&mut self, id: LoaderContextId) -> Result<&mut LoaderContext, String> {
         self.contexts
             .get_mut(usize::from(id.get().saturating_sub(1)))
@@ -335,6 +340,19 @@ impl LoaderRegistry {
                 context
                     .as_ref()
                     .filter(|context| context.spec.view == view)
+                    .map(|_| LoaderContextId((index + 1) as u16))
+            })
+            .collect()
+    }
+
+    pub(crate) fn contexts_missing_from(&self, pinned: &PinnedObjects) -> Vec<LoaderContextId> {
+        self.contexts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, context)| {
+                context
+                    .as_ref()
+                    .filter(|context| pinned.summary(context.spec.loader).is_none())
                     .map(|_| LoaderContextId((index + 1) as u16))
             })
             .collect()

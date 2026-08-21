@@ -66,6 +66,7 @@ struct ScanInput {
 
 type InventoryScan = (ProcessViewId, Vec<ScannedModule>, PinnedObjects);
 type InventoryScanOutcome = (Vec<InventoryScan>, BTreeSet<u32>, Vec<Skipped>);
+type PendingViewRetirements = BTreeMap<ProcessViewId, bool>;
 
 struct ManifestInput {
     path: PathBuf,
@@ -89,6 +90,7 @@ struct ApplyOutcome {
     committed: bool,
     changed: bool,
     stale_views: BTreeSet<ProcessViewId>,
+    missing_contexts: Vec<LoaderContextId>,
     static_completions: Vec<(BTreeSet<plan::ModuleId>, Option<u64>)>,
     static_failures: BTreeSet<plan::ModuleId>,
 }
@@ -101,6 +103,19 @@ impl ApplyOutcome {
                     .push((slot.module_ids.iter().copied().collect(), timestamp));
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct CandidateAdmission {
+    stale_views: BTreeSet<ProcessViewId>,
+    missing_contexts: Vec<LoaderContextId>,
+    targets_ok: bool,
+}
+
+impl CandidateAdmission {
+    fn requires_conservative_apply(&self, mutation_started: bool) -> bool {
+        mutation_started && !self.targets_ok
     }
 }
 
@@ -2197,6 +2212,46 @@ fn candidate_identity_is_complete(
             .all(|slot| !plan.is_active(slot.index) || pinned.summary(slot.object).is_some())
 }
 
+fn candidate_admission(
+    views: &[ProcessView],
+    extra_views: &[&ProcessView],
+    candidate_views: &BTreeSet<ProcessViewId>,
+    loader_registry: &LoaderRegistry,
+    candidate_pins: &PinnedObjects,
+    targets_ok: bool,
+) -> CandidateAdmission {
+    CandidateAdmission {
+        stale_views: stale_process_views(views, extra_views, candidate_views),
+        missing_contexts: loader_registry.contexts_missing_from(candidate_pins),
+        targets_ok,
+    }
+}
+
+fn block_unperformed_static(
+    candidate_plan: &mut plan::AttachPlan,
+    delta: &plan::AttachDelta,
+    outcome: &mut ApplyOutcome,
+) {
+    for slot in delta.new.iter().chain(&delta.replace) {
+        outcome
+            .static_failures
+            .extend(slot.module_ids.iter().copied());
+        candidate_plan.deactivate(slot.index);
+    }
+}
+
+fn lose_unperformed_dynamic_owner(
+    timings: &mut CausalTimings,
+    module: Option<plan::ModuleId>,
+    already_attached: bool,
+) {
+    if !already_attached {
+        if let Some(module) = module {
+            timings.lose(module);
+        }
+    }
+}
+
 fn delta_module_ids(delta: &plan::AttachDelta) -> BTreeSet<plan::ModuleId> {
     delta
         .new
@@ -2392,6 +2447,18 @@ fn validate_loader_record_context<'a>(
             record.table_ptr,
             record.hook_ts_ns,
         )
+    }
+}
+
+fn terminal_record_for(
+    terminal_owner: LoaderContextId,
+    record: DiscoveryRecord,
+) -> QueuedDiscoveryRecord {
+    let owns_record = record.kind == DISCOVERY_KIND_LOADER
+        && LoaderContextId::from_case_id(record.case_id) == terminal_owner;
+    QueuedDiscoveryRecord {
+        record,
+        terminal_owner: owns_record.then_some(terminal_owner),
     }
 }
 
@@ -2684,8 +2751,31 @@ impl Engine {
             .cloned()
             .collect();
         let target_modules = delta_module_ids(&candidate.delta);
-        outcome.stale_views = stale_process_views(&self.views, extra_views, &candidate.views);
-        if !outcome.stale_views.is_empty() {
+        let targets_ok = preflighted
+            || session
+                .preflight_targets(&targets, &candidate.pinned)
+                .is_ok();
+        let admission = candidate_admission(
+            &self.views,
+            extra_views,
+            &candidate.views,
+            &self.loader_registry,
+            &candidate.pinned,
+            targets_ok,
+        );
+        let generation_stale = !admission.stale_views.is_empty();
+        outcome.stale_views = admission.stale_views;
+        outcome.missing_contexts = admission.missing_contexts;
+        if !outcome.missing_contexts.is_empty() {
+            outcome.static_failures = target_modules;
+            *additions_allowed = false;
+            self.mark_partial(
+                "live discovery identity",
+                "candidate identity conflicted with an active loader context; the context was selected for conservative retirement before rebuild",
+            );
+            return Ok(outcome);
+        }
+        if generation_stale {
             outcome.static_failures = target_modules;
             *additions_allowed = false;
             self.mark_partial(
@@ -2694,11 +2784,7 @@ impl Engine {
             );
             return Ok(outcome);
         }
-        if !preflighted
-            && session
-                .preflight_targets(&targets, &candidate.pinned)
-                .is_err()
-        {
+        if !admission.targets_ok {
             outcome.static_failures = target_modules;
             self.mark_partial(
                 "live discovery transaction",
@@ -2723,9 +2809,7 @@ impl Engine {
         }
         let may_add = *additions_allowed;
         if !may_add {
-            for slot in candidate.delta.new.iter().chain(&candidate.delta.replace) {
-                candidate.plan.deactivate(slot.index);
-            }
+            block_unperformed_static(&mut candidate.plan, &candidate.delta, &mut outcome);
             if detach_failed {
                 self.mark_partial(
                     "live discovery detach",
@@ -2964,9 +3048,7 @@ impl Engine {
         record: &DiscoveryRecord,
         session: &mut Session,
         additions_allowed: &mut bool,
-        records: &mut Vec<QueuedDiscoveryRecord>,
-        pending_removal: &mut Vec<LoaderContextId>,
-        pending_stale: &mut BTreeSet<ProcessViewId>,
+        pending_views: &mut PendingViewRetirements,
     ) -> Result<bool> {
         if interface_list_is_truncated(record) {
             self.discovery_truncated = self.discovery_truncated.saturating_add(1);
@@ -3017,14 +3099,7 @@ impl Engine {
         self.observe_causal_timing(&observed, record.hook_ts_ns);
         let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
         self.record_apply_timing(&outcome);
-        self.queue_stale_views(
-            &outcome.stale_views,
-            session,
-            records,
-            pending_removal,
-            pending_stale,
-            additions_allowed,
-        );
+        self.queue_apply_outcome(&outcome, pending_views);
         Ok(outcome.changed)
     }
 
@@ -3033,9 +3108,7 @@ impl Engine {
         queued: QueuedDiscoveryRecord,
         session: &mut Session,
         additions_allowed: &mut bool,
-        records: &mut Vec<QueuedDiscoveryRecord>,
-        pending_removal: &mut Vec<LoaderContextId>,
-        pending_stale: &mut BTreeSet<ProcessViewId>,
+        pending_views: &mut PendingViewRetirements,
     ) -> Result<bool> {
         let record = &queued.record;
         let terminal_owner = queued.terminal_owner;
@@ -3128,20 +3201,9 @@ impl Engine {
         self.observe_causal_timing(&observed, record.hook_ts_ns);
         let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
         self.record_apply_timing(&outcome);
-        self.queue_stale_views(
-            &outcome.stale_views,
-            session,
-            records,
-            pending_removal,
-            pending_stale,
-            additions_allowed,
-        );
+        self.queue_apply_outcome(&outcome, pending_views);
         let changed = outcome.changed;
-        if terminal_owner.is_none()
-            && outcome.committed
-            && outcome.stale_views.is_empty()
-            && *additions_allowed
-        {
+        if terminal_owner.is_none() && outcome.committed && outcome.stale_views.is_empty() {
             let retire = self.attach_export_hooks(
                 context_id,
                 self.views[position].id(),
@@ -3151,14 +3213,7 @@ impl Engine {
             );
             if retire {
                 let view = self.views[position].id();
-                self.queue_stale_views(
-                    &[view].into_iter().collect(),
-                    session,
-                    records,
-                    pending_removal,
-                    pending_stale,
-                    additions_allowed,
-                );
+                self.queue_stale_views(&[view].into_iter().collect(), pending_views);
             }
         }
         Ok(changed)
@@ -3181,10 +3236,7 @@ impl Engine {
             return true;
         };
         let mut retire = false;
-        'modules: for module in modules {
-            if !*additions_allowed {
-                break;
-            }
+        for module in modules {
             let Some(object) = self.pinned.id_for_scanned(module, module.key, &module.path) else {
                 continue;
             };
@@ -3199,9 +3251,6 @@ impl Engine {
                 .file_for(object)
                 .and_then(|file| ElfSnapshot::read(file).ok());
             for name in &module.exports {
-                if !*additions_allowed {
-                    break;
-                }
                 let Some(abi) = self.hooks.abi(name) else {
                     continue;
                 };
@@ -3225,6 +3274,19 @@ impl Engine {
                     );
                     continue;
                 };
+                if !*additions_allowed {
+                    lose_unperformed_dynamic_owner(
+                        &mut self.timings,
+                        module_id,
+                        session.has_dynamic_export(
+                            context,
+                            (object, fact.file_offset),
+                            cookie,
+                            abi,
+                        ),
+                    );
+                    continue;
+                }
                 let detach_failures = session.detach_failures().len();
                 let attach = generation_checked_mutation(
                     || {
@@ -3277,7 +3339,6 @@ impl Engine {
                             "live export hook",
                             "the process generation changed around a dynamic export attachment",
                         );
-                        break 'modules;
                     }
                 }
             }
@@ -3290,9 +3351,7 @@ impl Engine {
         position: usize,
         session: &mut Session,
         additions_allowed: &mut bool,
-        records: &mut Vec<QueuedDiscoveryRecord>,
-        pending_removal: &mut Vec<LoaderContextId>,
-        pending_stale: &mut BTreeSet<ProcessViewId>,
+        pending_views: &mut PendingViewRetirements,
     ) -> std::result::Result<bool, LoaderArmFailure> {
         let view_id = self.views[position].id();
         if !self.loader_registry.ids_for_view(view_id).is_empty() {
@@ -3439,14 +3498,7 @@ impl Engine {
             let outcome = self
                 .apply_candidate(session, candidate, additions_allowed, false, &[])
                 .map_err(LoaderArmFailure::invariant)?;
-            self.queue_stale_views(
-                &outcome.stale_views,
-                session,
-                records,
-                pending_removal,
-                pending_stale,
-                additions_allowed,
-            );
+            self.queue_apply_outcome(&outcome, pending_views);
             return Ok(outcome.changed);
         };
         let prepared = match self.loader_registry.preflight(LoaderContextSpec {
@@ -3466,14 +3518,7 @@ impl Engine {
         let outcome = self
             .apply_candidate(session, candidate, additions_allowed, false, &[])
             .map_err(LoaderArmFailure::invariant)?;
-        self.queue_stale_views(
-            &outcome.stale_views,
-            session,
-            records,
-            pending_removal,
-            pending_stale,
-            additions_allowed,
-        );
+        self.queue_apply_outcome(&outcome, pending_views);
         let changed = outcome.changed;
         if !outcome.committed || !outcome.stale_views.is_empty() || !*additions_allowed {
             return Ok(changed);
@@ -3541,14 +3586,7 @@ impl Engine {
                 "live loader arming",
                 "loader generation, mapping, or pinned identity changed during attach",
             );
-            self.queue_stale_views(
-                &[view_id].into_iter().collect(),
-                session,
-                records,
-                pending_removal,
-                pending_stale,
-                additions_allowed,
-            );
+            self.queue_stale_views(&[view_id].into_iter().collect(), pending_views);
             if matches!(self.scope, Scope::Pid(_)) {
                 return Err(LoaderArmFailure::ordinary(anyhow!(
                     "the named process generation changed during loader attachment"
@@ -3563,20 +3601,11 @@ impl Engine {
         position: usize,
         session: &mut Session,
         additions_allowed: &mut bool,
-        records: &mut Vec<QueuedDiscoveryRecord>,
-        pending_removal: &mut Vec<LoaderContextId>,
-        pending_stale: &mut BTreeSet<ProcessViewId>,
+        pending_views: &mut PendingViewRetirements,
     ) -> Result<bool> {
         let named = matches!(self.scope, Scope::Pid(_));
         let view_id = self.views[position].id();
-        let result = self.arm_loader_for_view(
-            position,
-            session,
-            additions_allowed,
-            records,
-            pending_removal,
-            pending_stale,
-        );
+        let result = self.arm_loader_for_view(position, session, additions_allowed, pending_views);
         let generation_valid = self
             .views
             .get(position)
@@ -3593,14 +3622,7 @@ impl Engine {
             }
             LoaderArmOutcome::Invariant(error) => Err(error),
             LoaderArmOutcome::GenerationLost { changed, failure } => {
-                self.queue_stale_views(
-                    &[view_id].into_iter().collect(),
-                    session,
-                    records,
-                    pending_removal,
-                    pending_stale,
-                    additions_allowed,
-                );
+                self.queue_stale_views(&[view_id].into_iter().collect(), pending_views);
                 self.mark_live_loss(
                     "live loader arming",
                     "the process generation changed before the loader-arm postcheck",
@@ -3621,18 +3643,18 @@ impl Engine {
         &mut self,
         view: ProcessViewId,
         session: &mut Session,
-        records: &mut Vec<QueuedDiscoveryRecord>,
-        pending_removal: &mut Vec<LoaderContextId>,
         additions_allowed: &mut bool,
-    ) {
+        pending_views: &mut PendingViewRetirements,
+    ) -> Result<(bool, bool)> {
+        let mut changed = false;
         for context_id in self.loader_registry.ids_for_view(view) {
-            if pending_removal.contains(&context_id) {
-                continue;
-            }
             let Some(context) = self.loader_registry.context(context_id).cloned() else {
                 continue;
             };
-            if context.was_attached {
+            if self.loader_registry.is_tombstoned(context_id) {
+                // A prior one-shot retirement reached its terminal state but
+                // could not remove the registry entry. Never detach it twice.
+            } else if context.was_attached {
                 let detach_failed = session.detach_dynamic_context(context_id);
                 if detach_failed {
                     *additions_allowed = false;
@@ -3644,60 +3666,71 @@ impl Engine {
                 match begin_attached_retirement_with(&mut self.loader_registry, context_id, || {
                     Self::collect_discovery_records(session)
                 }) {
-                    Ok(drained) => {
-                        pending_removal.push(context_id);
-                        match drained {
-                            Ok((mut owned, malformed)) => {
-                                self.record_malformed_discovery(malformed);
-                                if self.update_counter_snapshot(session).is_err() {
-                                    self.mark_live_loss(
-                                        "live discovery counters",
-                                        "the post-detach producer snapshot could not be read",
-                                    );
-                                }
-                                records.extend(owned.drain(..).map(|record| {
-                                    QueuedDiscoveryRecord {
-                                        record,
-                                        terminal_owner: Some(context_id),
-                                    }
-                                }));
+                    Ok(Ok((owned, malformed))) => {
+                        self.record_malformed_discovery(malformed);
+                        if self.update_counter_snapshot(session).is_err() {
+                            self.mark_live_loss(
+                                "live discovery counters",
+                                "the post-detach producer snapshot could not be read",
+                            );
+                        }
+                        for record in owned {
+                            let queued = terminal_record_for(context_id, record);
+                            match self.dispatch_discovery_record(
+                                queued,
+                                session,
+                                additions_allowed,
+                                pending_views,
+                            ) {
+                                Ok(plan_changed) => changed |= plan_changed,
+                                Err(_) => self.mark_live_loss(
+                                    "live discovery record",
+                                    "a structurally valid private terminal record failed exact live resolution",
+                                ),
                             }
-                            Err(_) => self.mark_live_loss(
-                                "live loader retirement",
-                                "the post-detach private discovery drain failed",
-                            ),
                         }
                     }
-                    Err(_) => self.mark_partial(
+                    Ok(Err(_)) => self.mark_live_loss(
                         "live loader retirement",
-                        "an attached loader context could not enter its terminal tombstone state",
+                        "the post-detach private discovery drain failed",
                     ),
+                    Err(_) => {
+                        *additions_allowed = false;
+                        self.mark_partial(
+                            "live loader retirement",
+                            "an attached loader context could not enter its terminal tombstone state",
+                        );
+                        return Ok((changed, false));
+                    }
                 }
-            } else {
-                let cancelled = self.loader_registry.cancel_prepared(context_id).is_ok();
-                if !cancelled || self.loader_registry.remove(context_id).is_err() {
-                    self.mark_partial(
-                        "live loader retirement",
-                        "a prepared loader context could not be cancelled and removed",
-                    );
-                }
+            } else if self.loader_registry.cancel_prepared(context_id).is_err() {
+                *additions_allowed = false;
+                self.mark_partial(
+                    "live loader retirement",
+                    "a prepared loader context could not be cancelled",
+                );
+                return Ok((changed, false));
+            }
+            if self.loader_registry.remove(context_id).is_err() {
+                *additions_allowed = false;
+                self.mark_partial(
+                    "live loader retirement",
+                    "a tombstoned loader context could not be removed",
+                );
+                return Ok((changed, false));
             }
         }
+        Ok((changed, true))
     }
 
     fn queue_stale_views(
         &mut self,
         stale: &BTreeSet<ProcessViewId>,
-        session: &mut Session,
-        records: &mut Vec<QueuedDiscoveryRecord>,
-        pending_removal: &mut Vec<LoaderContextId>,
-        pending_stale: &mut BTreeSet<ProcessViewId>,
-        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
     ) {
         for view in stale {
-            if !pending_stale.insert(*view) {
-                continue;
-            }
+            let newly_generation_lost = !*pending_views.entry(*view).or_default();
+            pending_views.insert(*view, true);
             if let Some(pid) = self
                 .views
                 .iter()
@@ -3706,17 +3739,69 @@ impl Engine {
             {
                 self.refresh_requested.insert(pid);
             }
-            self.retire_loader_contexts(
-                *view,
-                session,
-                records,
-                pending_removal,
-                additions_allowed,
-            );
-            self.mark_live_loss(
-                "live discovery generation",
-                "a retained process generation changed and was scheduled for conservative cleanup",
-            );
+            if newly_generation_lost {
+                self.mark_live_loss(
+                    "live discovery generation",
+                    "a retained process generation changed and was scheduled for conservative cleanup",
+                );
+            }
+        }
+    }
+
+    fn queue_apply_outcome(
+        &mut self,
+        outcome: &ApplyOutcome,
+        pending_views: &mut PendingViewRetirements,
+    ) {
+        for context_id in &outcome.missing_contexts {
+            let Some(context) = self.loader_registry.context(*context_id) else {
+                continue;
+            };
+            let view = context.spec.view;
+            pending_views.entry(view).or_default();
+            if let Some(pid) = self
+                .views
+                .iter()
+                .find(|candidate| candidate.id() == view)
+                .map(ProcessView::pid)
+            {
+                self.refresh_requested.insert(pid);
+            }
+        }
+        self.queue_stale_views(&outcome.stale_views, pending_views);
+    }
+
+    fn dispatch_discovery_record(
+        &mut self,
+        queued: QueuedDiscoveryRecord,
+        session: &mut Session,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+    ) -> Result<bool> {
+        let record = queued.record;
+        match record.kind {
+            DISCOVERY_KIND_FUNCTION_LIST_RETURN
+            | DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN
+            | DISCOVERY_KIND_INTERFACE_RETURN => {
+                self.process_export_record(&record, session, additions_allowed, pending_views)
+            }
+            DISCOVERY_KIND_LOADER => {
+                self.process_loader_record(queued, session, additions_allowed, pending_views)
+            }
+            DISCOVERY_KIND_EXEC | DISCOVERY_KIND_LEADER_EXIT => {
+                let pid = (record.pid_tgid >> 32) as u32;
+                self.refresh_requested.insert(pid);
+                if let Some(view) = self
+                    .views
+                    .iter()
+                    .find(|view| view.pid() == pid)
+                    .map(ProcessView::id)
+                {
+                    self.queue_stale_views(&[view].into_iter().collect(), pending_views);
+                }
+                Ok(false)
+            }
+            _ => Ok(false),
         }
     }
 
@@ -3724,119 +3809,48 @@ impl Engine {
         &mut self,
         session: &mut Session,
         records: &mut Vec<QueuedDiscoveryRecord>,
-        pending_removal: &mut Vec<LoaderContextId>,
-        pending_stale: &mut BTreeSet<ProcessViewId>,
+        pending_views: &mut PendingViewRetirements,
         additions_allowed: &mut bool,
     ) -> Result<bool> {
         let mut changed = false;
-        let mut cursor = 0;
         let mut named_generation_lost = false;
         loop {
-            while cursor < records.len() {
-                let end = records.len();
-                let mut lifecycle_views = BTreeSet::new();
-                for queued in &records[cursor..end] {
-                    let record = &queued.record;
-                    if !matches!(
-                        record.kind,
-                        DISCOVERY_KIND_EXEC | DISCOVERY_KIND_LEADER_EXIT
-                    ) {
-                        continue;
-                    }
-                    let pid = (record.pid_tgid >> 32) as u32;
-                    self.refresh_requested.insert(pid);
-                    if let Some(view) = self
-                        .views
-                        .iter()
-                        .find(|view| view.pid() == pid)
-                        .map(ProcessView::id)
-                    {
-                        lifecycle_views.insert(view);
-                    }
+            for queued in std::mem::take(records) {
+                match self.dispatch_discovery_record(
+                    queued,
+                    session,
+                    additions_allowed,
+                    pending_views,
+                ) {
+                    Ok(plan_changed) => changed |= plan_changed,
+                    Err(_) => self.mark_live_loss(
+                        "live discovery record",
+                        "a structurally valid private record failed exact live resolution",
+                    ),
                 }
-                for view in lifecycle_views {
-                    self.retire_loader_contexts(
-                        view,
-                        session,
-                        records,
-                        pending_removal,
-                        additions_allowed,
-                    );
-                }
-
-                for index in cursor..end {
-                    let queued = records[index];
-                    let record = queued.record;
-                    let outcome = match record.kind {
-                        DISCOVERY_KIND_FUNCTION_LIST_RETURN
-                        | DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN
-                        | DISCOVERY_KIND_INTERFACE_RETURN => self.process_export_record(
-                            &record,
-                            session,
-                            additions_allowed,
-                            records,
-                            pending_removal,
-                            pending_stale,
-                        ),
-                        DISCOVERY_KIND_LOADER => self.process_loader_record(
-                            queued,
-                            session,
-                            additions_allowed,
-                            records,
-                            pending_removal,
-                            pending_stale,
-                        ),
-                        DISCOVERY_KIND_EXEC | DISCOVERY_KIND_LEADER_EXIT => Ok(false),
-                        _ => Ok(false),
-                    };
-                    match outcome {
-                        Ok(plan_changed) => changed |= plan_changed,
-                        Err(_) => self.mark_live_loss(
-                            "live discovery record",
-                            "a structurally valid private record failed exact live resolution",
-                        ),
-                    }
-                }
-                cursor = end;
             }
-
-            records.clear();
-            cursor = 0;
-            self.finish_retired_contexts(pending_removal);
-            if pending_stale.is_empty() {
+            if pending_views.is_empty() {
                 break;
             }
-            named_generation_lost |= matches!(self.scope, Scope::Pid(_));
-            for view in std::mem::take(pending_stale) {
+            for (view, mut generation_lost) in std::mem::take(pending_views) {
+                generation_lost |= pending_views.remove(&view).unwrap_or(false);
+                let (retirement_changed, complete) =
+                    self.retire_loader_contexts(view, session, additions_allowed, pending_views)?;
+                generation_lost |= pending_views.remove(&view).unwrap_or(false);
+                named_generation_lost |= generation_lost && matches!(self.scope, Scope::Pid(_));
+                changed |= retirement_changed;
+                if !complete {
+                    continue;
+                }
                 let outcome = self.retire_view_candidate(view, session, additions_allowed)?;
                 changed |= outcome.changed;
-                if !outcome.stale_views.is_empty() {
-                    self.queue_stale_views(
-                        &outcome.stale_views,
-                        session,
-                        records,
-                        pending_removal,
-                        pending_stale,
-                        additions_allowed,
-                    );
-                }
+                self.queue_apply_outcome(&outcome, pending_views);
             }
         }
         if named_generation_lost {
             bail!("the named process generation changed during live discovery");
         }
         Ok(changed)
-    }
-
-    fn finish_retired_contexts(&mut self, pending: &mut Vec<LoaderContextId>) {
-        for context in std::mem::take(pending) {
-            if self.loader_registry.remove(context).is_err() {
-                self.mark_partial(
-                    "live loader retirement",
-                    "a tombstoned loader context could not be removed",
-                );
-            }
-        }
     }
 
     fn scan_inventory_views(
@@ -3915,13 +3929,13 @@ impl Engine {
         Ok(candidate)
     }
 
-    fn inventory_candidate_preflighted(
+    fn inventory_candidate_admission(
         &self,
         session: &Session,
         candidate: &LiveCandidate,
         removed: &BTreeSet<ProcessViewId>,
         new_views: &[(ProcessView, Vec<ScannedModule>, PinnedObjects)],
-    ) -> bool {
+    ) -> CandidateAdmission {
         let targets: Vec<_> = candidate
             .delta
             .new
@@ -3929,14 +3943,25 @@ impl Engine {
             .chain(&candidate.delta.replace)
             .cloned()
             .collect();
-        self.views
-            .iter()
-            .filter(|view| !removed.contains(&view.id()))
-            .all(ProcessView::still_the_same)
-            && new_views.iter().all(|(view, _, _)| view.still_the_same())
-            && session
+        let mut required_views = candidate.views.clone();
+        required_views.extend(
+            self.views
+                .iter()
+                .filter(|view| !removed.contains(&view.id()))
+                .map(ProcessView::id),
+        );
+        required_views.extend(new_views.iter().map(|(view, _, _)| view.id()));
+        let extra_views: Vec<_> = new_views.iter().map(|(view, _, _)| view).collect();
+        candidate_admission(
+            &self.views,
+            &extra_views,
+            &required_views,
+            &self.loader_registry,
+            &candidate.pinned,
+            session
                 .preflight_targets(&targets, &candidate.pinned)
-                .is_ok()
+                .is_ok(),
+        )
     }
 
     fn refresh_inventory(
@@ -3944,8 +3969,7 @@ impl Engine {
         session: &mut Session,
         additions_allowed: &mut bool,
         records: &mut Vec<QueuedDiscoveryRecord>,
-        pending_removal: &mut Vec<LoaderContextId>,
-        pending_stale: &mut BTreeSet<ProcessViewId>,
+        pending_views: &mut PendingViewRetirements,
     ) -> Result<bool> {
         if matches!(self.scope, Scope::Pid(_)) {
             let stale: BTreeSet<_> = self
@@ -3955,19 +3979,11 @@ impl Engine {
                 .map(ProcessView::id)
                 .collect();
             if !stale.is_empty() {
-                self.queue_stale_views(
-                    &stale,
-                    session,
-                    records,
-                    pending_removal,
-                    pending_stale,
-                    additions_allowed,
-                );
+                self.queue_stale_views(&stale, pending_views);
                 let _ = self.process_discovery_records(
                     session,
                     records,
-                    pending_removal,
-                    pending_stale,
+                    pending_views,
                     additions_allowed,
                 )?;
                 bail!("the named process generation changed during capture");
@@ -3990,7 +4006,7 @@ impl Engine {
             });
         }
         let desired: BTreeSet<_> = pids.into_iter().take(MAX_SCAN_PIDS).collect();
-        let removed: BTreeSet<_> = self
+        let mut removed: BTreeSet<_> = self
             .views
             .iter()
             .filter(|view| {
@@ -4080,7 +4096,34 @@ impl Engine {
             refreshed_scans.iter().map(|(view, _, _)| *view).collect();
         let candidate =
             self.inventory_candidate(&removed, &refreshed_scans, &new_views, skipped.clone())?;
-        if !self.inventory_candidate_preflighted(session, &candidate, &removed, &new_views) {
+        let admission =
+            self.inventory_candidate_admission(session, &candidate, &removed, &new_views);
+        if !admission.stale_views.is_empty() {
+            let retained_ids: BTreeSet<_> = self.views.iter().map(ProcessView::id).collect();
+            let retained_stale: BTreeSet<_> = admission
+                .stale_views
+                .intersection(&retained_ids)
+                .copied()
+                .collect();
+            self.queue_stale_views(&retained_stale, pending_views);
+            for (view, _, _) in &new_views {
+                if admission.stale_views.contains(&view.id()) {
+                    self.refresh_requested.insert(view.pid());
+                    failed_refresh_pids.insert(view.pid());
+                }
+            }
+            self.mark_live_loss(
+                "live inventory generation",
+                "an exact retained or newly opened process generation changed during inventory preflight",
+            );
+            return self.process_discovery_records(
+                session,
+                records,
+                pending_views,
+                additions_allowed,
+            );
+        }
+        if !admission.targets_ok && admission.missing_contexts.is_empty() {
             self.mark_partial(
                 "live inventory transaction",
                 "candidate preflight failed; canonical identity, plan, and links were unchanged",
@@ -4088,22 +4131,55 @@ impl Engine {
             return Ok(false);
         }
 
-        for view in removed.iter().chain(&refreshed_ok) {
-            self.retire_loader_contexts(
-                *view,
-                session,
-                records,
-                pending_removal,
-                additions_allowed,
-            );
+        for context_id in &admission.missing_contexts {
+            let Some(context) = self.loader_registry.context(*context_id) else {
+                continue;
+            };
+            let view = context.spec.view;
+            if !removed.contains(&view) {
+                refreshed_ok.insert(view);
+            }
+            if let Some(pid) = self
+                .views
+                .iter()
+                .find(|candidate| candidate.id() == view)
+                .map(ProcessView::pid)
+            {
+                self.refresh_requested.insert(pid);
+            }
         }
-        let mut changed = self.process_discovery_records(
-            session,
-            records,
-            pending_removal,
-            pending_stale,
-            additions_allowed,
-        )?;
+
+        let mut changed = false;
+        let mut mutation_started = false;
+        let mut failed_retirements = BTreeSet::new();
+        let retirement_views: BTreeSet<_> = removed.union(&refreshed_ok).copied().collect();
+        for view in &retirement_views {
+            mutation_started |= !self.loader_registry.ids_for_view(*view).is_empty();
+            let (retirement_changed, complete) =
+                self.retire_loader_contexts(*view, session, additions_allowed, pending_views)?;
+            changed |= retirement_changed;
+            mutation_started |= retirement_changed;
+            if !complete {
+                failed_retirements.insert(*view);
+                if let Some(pid) = self
+                    .views
+                    .iter()
+                    .find(|candidate| candidate.id() == *view)
+                    .map(ProcessView::pid)
+                {
+                    failed_refresh_pids.insert(pid);
+                    self.refresh_requested.insert(pid);
+                }
+            }
+        }
+        removed.retain(|view| !failed_retirements.contains(view));
+        refreshed_ok.retain(|view| !failed_retirements.contains(view));
+        let completed_retirements: BTreeSet<_> = retirement_views
+            .difference(&failed_retirements)
+            .copied()
+            .collect();
+        changed |=
+            self.process_discovery_records(session, records, pending_views, additions_allowed)?;
 
         let (rescanned, failed_rescan_pids, rescan_skips) =
             self.scan_inventory_views(&refreshed_ok, "a post-retirement inventory refresh failed");
@@ -4111,19 +4187,79 @@ impl Engine {
         skipped.extend(rescan_skips);
         refreshed_scans = rescanned;
         refreshed_ok = refreshed_scans.iter().map(|(view, _, _)| *view).collect();
-        let candidate =
+        refreshed_ok.retain(|view| !failed_retirements.contains(view));
+        refreshed_scans.retain(|(view, _, _)| refreshed_ok.contains(view));
+        let mut candidate =
             self.inventory_candidate(&removed, &refreshed_scans, &new_views, skipped)?;
-        if !self.inventory_candidate_preflighted(session, &candidate, &removed, &new_views) {
+        let admission =
+            self.inventory_candidate_admission(session, &candidate, &removed, &new_views);
+        if !admission.stale_views.is_empty() || !admission.missing_contexts.is_empty() {
+            let retained_ids: BTreeSet<_> = self.views.iter().map(ProcessView::id).collect();
+            let retained_stale: BTreeSet<_> = admission
+                .stale_views
+                .intersection(&retained_ids)
+                .copied()
+                .collect();
+            for (view, _, _) in &new_views {
+                if admission.stale_views.contains(&view.id()) {
+                    self.refresh_requested.insert(view.pid());
+                    failed_refresh_pids.insert(view.pid());
+                }
+            }
+            if !admission.stale_views.is_empty() {
+                self.mark_live_loss(
+                    "live inventory generation",
+                    "an exact retained or newly opened process generation changed during post-retirement preflight",
+                );
+            }
+            let outcome = ApplyOutcome {
+                stale_views: retained_stale,
+                missing_contexts: admission.missing_contexts,
+                ..ApplyOutcome::default()
+            };
+            let cleanup_needed =
+                !outcome.stale_views.is_empty() || !outcome.missing_contexts.is_empty();
+            self.queue_apply_outcome(&outcome, pending_views);
+            changed |=
+                self.process_discovery_records(session, records, pending_views, additions_allowed)?;
+            if cleanup_needed {
+                *additions_allowed = false;
+                let candidate =
+                    self.inventory_candidate(&completed_retirements, &[], &[], Vec::new())?;
+                let cleanup =
+                    self.apply_candidate(session, candidate, additions_allowed, true, &[])?;
+                self.record_apply_timing(&cleanup);
+                self.queue_apply_outcome(&cleanup, pending_views);
+                changed |= cleanup.changed;
+                changed |= self.process_discovery_records(
+                    session,
+                    records,
+                    pending_views,
+                    additions_allowed,
+                )?;
+            }
+            if matches!(self.scope, Scope::Pid(_)) && !outcome.stale_views.is_empty() {
+                bail!("the named process generation changed during inventory preflight");
+            }
+            return Ok(changed);
+        }
+        let conservative_only = admission.requires_conservative_apply(mutation_started);
+        if !admission.targets_ok {
             self.mark_partial(
                 "live inventory transaction",
-                "post-retirement candidate preflight failed; canonical identity, plan, and links were unchanged",
+                "post-retirement candidate preflight failed; conservative retirements were committed and additions were blocked",
             );
-            return Ok(changed);
+            if !mutation_started {
+                return Ok(changed);
+            }
+            *additions_allowed = false;
+            candidate = self.inventory_candidate(&completed_retirements, &[], &[], Vec::new())?;
         }
 
         let extra_views: Vec<_> = new_views.iter().map(|(view, _, _)| view).collect();
         let outcome =
             self.apply_candidate(session, candidate, additions_allowed, true, &extra_views)?;
+        self.record_apply_timing(&outcome);
         for view in &outcome.stale_views {
             if let Some(pid) = new_views
                 .iter()
@@ -4133,32 +4269,35 @@ impl Engine {
                 self.refresh_requested.insert(pid);
             }
         }
-        self.queue_stale_views(
-            &outcome.stale_views,
-            session,
-            records,
-            pending_removal,
-            pending_stale,
-            additions_allowed,
-        );
+        self.queue_apply_outcome(&outcome, pending_views);
         changed |= outcome.changed;
-        changed |= self.process_discovery_records(
-            session,
-            records,
-            pending_removal,
-            pending_stale,
-            additions_allowed,
-        )?;
+        changed |=
+            self.process_discovery_records(session, records, pending_views, additions_allowed)?;
         if !outcome.committed || !outcome.stale_views.is_empty() {
             return Ok(changed);
         }
 
+        if conservative_only || !*additions_allowed {
+            failed_refresh_pids.extend(retirement_views.iter().filter_map(|view| {
+                self.views
+                    .iter()
+                    .find(|candidate| candidate.id() == *view)
+                    .map(ProcessView::pid)
+            }));
+            failed_refresh_pids.extend(new_views.iter().map(|(view, _, _)| view.pid()));
+        }
         self.refresh_requested
             .retain(|pid| failed_refresh_pids.contains(pid));
-        let new_view_ids: BTreeSet<_> = new_views.iter().map(|(view, _, _)| view.id()).collect();
+        let new_view_ids: BTreeSet<_> = if conservative_only {
+            BTreeSet::new()
+        } else {
+            new_views.iter().map(|(view, _, _)| view.id()).collect()
+        };
         self.views.retain(|view| !removed.contains(&view.id()));
-        for (view, _, _) in new_views {
-            self.views.push(view);
+        if !conservative_only {
+            for (view, _, _) in new_views {
+                self.views.push(view);
+            }
         }
         for view in removed.iter().chain(&refreshed_ok) {
             self.scan_inputs.remove(view);
@@ -4174,14 +4313,7 @@ impl Engine {
                 })
                 .collect();
             arm_refreshed_views_with(&arm, |position| {
-                self.arm_loader_or_partial(
-                    position,
-                    session,
-                    additions_allowed,
-                    records,
-                    pending_removal,
-                    pending_stale,
-                )
+                self.arm_loader_or_partial(position, session, additions_allowed, pending_views)
             })
         } else {
             Ok(false)
@@ -4193,13 +4325,8 @@ impl Engine {
             }
             Err(error) => Some(error),
         };
-        let cleanup = self.process_discovery_records(
-            session,
-            records,
-            pending_removal,
-            pending_stale,
-            additions_allowed,
-        );
+        let cleanup =
+            self.process_discovery_records(session, records, pending_views, additions_allowed);
         if let Some(error) = fatal {
             return Err(error);
         }
@@ -4224,21 +4351,18 @@ impl Engine {
         self.update_counter_snapshot(session)?;
 
         let mut additions_allowed = true;
-        let mut pending_removal = Vec::new();
-        let mut pending_stale = BTreeSet::new();
+        let mut pending_views = PendingViewRetirements::new();
         let mut changed = self.process_discovery_records(
             session,
             &mut records,
-            &mut pending_removal,
-            &mut pending_stale,
+            &mut pending_views,
             &mut additions_allowed,
         )?;
         changed |= self.refresh_inventory(
             session,
             &mut additions_allowed,
             &mut records,
-            &mut pending_removal,
-            &mut pending_stale,
+            &mut pending_views,
         )?;
         record_object_skips(&mut self.plan, &self.counters.object_skips);
         self.discovery = discovery_evidence(&self.plan, &self.pinned, &self.counters);
@@ -4284,17 +4408,14 @@ impl Engine {
             })?;
         let mut additions_allowed = true;
         let mut records = Vec::new();
-        let mut pending_removal = Vec::new();
-        let mut pending_stale = BTreeSet::new();
+        let mut pending_views = PendingViewRetirements::new();
         let mut fatal = None;
         for position in 0..self.views.len() {
             match self.arm_loader_or_partial(
                 position,
                 &mut session,
                 &mut additions_allowed,
-                &mut records,
-                &mut pending_removal,
-                &mut pending_stale,
+                &mut pending_views,
             ) {
                 Ok(_) => {}
                 Err(error) => {
@@ -4306,8 +4427,7 @@ impl Engine {
         let cleanup = self.process_discovery_records(
             &mut session,
             &mut records,
-            &mut pending_removal,
-            &mut pending_stale,
+            &mut pending_views,
             &mut additions_allowed,
         );
         if let Some(error) = fatal {
@@ -4477,6 +4597,7 @@ mod tests {
             committed: true,
             changed: true,
             stale_views: [stale].into_iter().collect(),
+            missing_contexts: Vec::new(),
             static_completions: vec![([completed].into_iter().collect(), Some(20))],
             static_failures: [failed].into_iter().collect(),
         };
@@ -4487,6 +4608,81 @@ mod tests {
         assert_eq!(engine.timings.gap_ns(failed), None);
         assert_eq!(outcome.stale_views, [stale].into_iter().collect());
         assert!(outcome.committed && outcome.changed);
+    }
+
+    #[test]
+    fn closed_additions_gate_loses_every_unperformed_exact_owner() {
+        let first = plan::ModuleId(3);
+        let second = plan::ModuleId(4);
+        let duplicate = plan::ModuleId(5);
+        let slots = vec![
+            plan::Slot {
+                index: 0,
+                descriptor_index: 0,
+                object: PinnedObjectId(7),
+                object_path: "/opt/first.so".into(),
+                file_offset: 0x10,
+                names: vec!["C_Sign".into()],
+                aliased: false,
+                semantics: p11scope_ebpf_common::SlotSemantics::COUNT_ONLY,
+                semantic_authorized: false,
+                semantic_ambiguous: false,
+                fork_safe: false,
+                module_ids: vec![first],
+            },
+            plan::Slot {
+                index: 1,
+                descriptor_index: 0,
+                object: PinnedObjectId(8),
+                object_path: "/opt/second.so".into(),
+                file_offset: 0x20,
+                names: vec!["C_Verify".into()],
+                aliased: false,
+                semantics: p11scope_ebpf_common::SlotSemantics::COUNT_ONLY,
+                semantic_authorized: false,
+                semantic_ambiguous: false,
+                fork_safe: false,
+                module_ids: vec![second],
+            },
+        ];
+        let delta = plan::AttachDelta {
+            new: vec![slots[0].clone()],
+            replace: vec![slots[1].clone()],
+            retire: Vec::new(),
+        };
+        let mut candidate_plan = plan::AttachPlan::from_slots(slots);
+        let mut outcome = ApplyOutcome::default();
+        block_unperformed_static(&mut candidate_plan, &delta, &mut outcome);
+
+        assert_eq!(
+            outcome.static_failures,
+            [first, second].into_iter().collect(),
+            "an already-closed gate owns every skipped new/replacement slot"
+        );
+        assert!(!candidate_plan.is_active(0));
+        assert!(!candidate_plan.is_active(1));
+
+        let mut timings = CausalTimings::default();
+        for module in [first, second, duplicate] {
+            timings.observe(module, 10);
+        }
+        timings.complete(duplicate, 15);
+        lose_unperformed_dynamic_owner(&mut timings, Some(first), false);
+        lose_unperformed_dynamic_owner(&mut timings, Some(second), false);
+        lose_unperformed_dynamic_owner(&mut timings, Some(duplicate), true);
+        for module in [first, second] {
+            timings.complete(module, 30);
+            assert_eq!(
+                timings.gap_ns(module),
+                None,
+                "later work cannot substitute for required work skipped by the closed gate"
+            );
+        }
+        assert_eq!(
+            timings.gap_ns(duplicate),
+            Some(5),
+            "an already-attached dynamic pair is not unperformed work"
+        );
     }
 
     #[test]
@@ -4664,6 +4860,44 @@ mod tests {
         engine.plan = plan::build_from_reconciled_modules(&provider_modules);
         engine.pinned = provider_pins;
         engine.modules = provider_modules;
+        let rejected_loader = engine.plan.modules[0].object;
+
+        let context_spec = |view| LoaderContextSpec {
+            view,
+            loader: rejected_loader,
+            mapping: MapEntry {
+                start: 0x4000,
+                end: 0x5000,
+                file_offset: 0x2000,
+                permissions: *b"r-xp",
+                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                inode: 7,
+                raw_path: Some(b"/lib/ld.so".to_vec()),
+            },
+            hook: p11scope_manifest::elf::SymbolFact {
+                virtual_address: 0x2100,
+                file_offset: 0x2100,
+            },
+            state: None,
+        };
+        let prepared = engine
+            .loader_registry
+            .preflight(context_spec(ProcessViewId(80)))
+            .unwrap();
+        let prepared = engine.loader_registry.prepare(prepared).unwrap();
+        let attached = engine
+            .loader_registry
+            .preflight(context_spec(ProcessViewId(81)))
+            .unwrap();
+        let attached = engine.loader_registry.prepare(attached).unwrap();
+        engine.loader_registry.mark_attached(attached).unwrap();
+        let tombstoned = engine
+            .loader_registry
+            .preflight(context_spec(ProcessViewId(82)))
+            .unwrap();
+        let tombstoned = engine.loader_registry.prepare(tombstoned).unwrap();
+        engine.loader_registry.mark_attached(tombstoned).unwrap();
+        engine.loader_registry.tombstone(tombstoned).unwrap();
 
         std::fs::OpenOptions::new()
             .append(true)
@@ -4700,7 +4934,67 @@ mod tests {
             &candidate.modules,
             &candidate.pinned
         ));
+        let admission = candidate_admission(
+            &engine.views,
+            &[],
+            &candidate.views,
+            &engine.loader_registry,
+            &candidate.pinned,
+            true,
+        );
+        assert_eq!(
+            admission.missing_contexts,
+            vec![prepared, attached, tombstoned],
+            "Prepared, Attached, and Tombstoned loader pins are all candidate evidence"
+        );
         assert_eq!(unsafe { libc::munmap(address, len) }, 0);
+    }
+
+    #[test]
+    fn candidate_admission_keeps_exact_retained_and_local_stale_view_ids() {
+        fn exited_view(id: ProcessViewId) -> ProcessView {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let view = ProcessView::open(id, child.id()).unwrap();
+            child.kill().unwrap();
+            child.wait().unwrap();
+            assert!(!view.still_the_same());
+            view
+        }
+
+        let retained = exited_view(ProcessViewId(90));
+        let local_new = exited_view(ProcessViewId(91));
+        let candidate_views = [retained.id(), local_new.id()].into_iter().collect();
+        let admission = candidate_admission(
+            std::slice::from_ref(&retained),
+            &[&local_new],
+            &candidate_views,
+            &LoaderRegistry::default(),
+            &PinnedObjects::empty(),
+            false,
+        );
+
+        assert_eq!(admission.stale_views, candidate_views);
+        assert!(!admission.targets_ok);
+    }
+
+    #[test]
+    fn post_retirement_target_failure_requires_conservative_apply() {
+        let failed = CandidateAdmission {
+            targets_ok: false,
+            ..CandidateAdmission::default()
+        };
+
+        assert!(
+            !failed.requires_conservative_apply(false),
+            "a pure preflight failure leaves the transaction unchanged"
+        );
+        assert!(
+            failed.requires_conservative_apply(true),
+            "after dynamic retirement the same failure must commit conservative subtraction"
+        );
     }
 
     #[test]
@@ -4863,10 +5157,8 @@ mod tests {
         order.borrow_mut().push("process");
         let mut engine = Engine::empty();
         engine.loader_registry = registry;
-        let mut pending = vec![context];
-        engine.finish_retired_contexts(&mut pending);
+        engine.loader_registry.remove(context).unwrap();
         order.borrow_mut().push("remove");
-        assert!(pending.is_empty());
         assert!(
             engine
                 .loader_registry
@@ -4894,6 +5186,82 @@ mod tests {
             *order.borrow(),
             ["detach", "drain", "process", "remove", "arm"]
         );
+    }
+
+    #[test]
+    fn serial_terminal_drain_never_claims_another_attached_context() {
+        use p11scope_manifest::elf::SymbolFact;
+        use p11scope_manifest::maps::Device;
+
+        let mapping = MapEntry {
+            start: 0x4000,
+            end: 0x5000,
+            file_offset: 0x2000,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode: 7,
+            raw_path: Some(b"/lib/ld.so".to_vec()),
+        };
+        let mut registry = LoaderRegistry::default();
+        let mut prepare = |view, loader| {
+            let prepared = registry
+                .preflight(LoaderContextSpec {
+                    view,
+                    loader,
+                    mapping: mapping.clone(),
+                    hook: SymbolFact {
+                        virtual_address: 0x2100,
+                        file_offset: 0x2100,
+                    },
+                    state: None,
+                })
+                .unwrap();
+            let context = registry.prepare(prepared).unwrap();
+            registry.mark_attached(context).unwrap();
+            context
+        };
+        let first = prepare(ProcessViewId(3), PinnedObjectId(9));
+        let second = prepare(ProcessViewId(4), PinnedObjectId(10));
+
+        registry.tombstone(first).unwrap();
+        let mut second_hit: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        second_hit.kind = DISCOVERY_KIND_LOADER;
+        second_hit.case_id = (second.get() - 1) as u8;
+        second_hit.table_ptr = 0x4100;
+        second_hit.hook_ts_ns = 10;
+        let queued = terminal_record_for(first, second_hit);
+        assert_eq!(
+            queued.terminal_owner, None,
+            "A's global drain cannot grant terminal authority to B's record"
+        );
+        let failures = registry.context_failures();
+        validate_loader_record_context(
+            &mut registry,
+            queued.terminal_owner,
+            &queued.record,
+            ProcessViewId(4),
+            PinnedObjectId(10),
+            &mapping,
+        )
+        .expect("B remains Attached while A's drained batch is dispatched");
+        assert_eq!(registry.context_failures(), failures);
+        registry.remove(first).unwrap();
+
+        registry.tombstone(second).unwrap();
+        let queued = terminal_record_for(second, second_hit);
+        assert_eq!(queued.terminal_owner, Some(second));
+        validate_loader_record_context(
+            &mut registry,
+            queued.terminal_owner,
+            &queued.record,
+            ProcessViewId(4),
+            PinnedObjectId(10),
+            &mapping,
+        )
+        .expect("B receives terminal authority only from B's own drain");
+        registry.remove(second).unwrap();
+        assert!(registry.ids_for_view(ProcessViewId(3)).is_empty());
+        assert!(registry.ids_for_view(ProcessViewId(4)).is_empty());
     }
 
     #[test]

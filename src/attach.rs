@@ -538,6 +538,14 @@ type SlotCompletion = (u32, Option<u64>);
 type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
 type ReplacementAttachResult = (Vec<SlotCompletion>, bool);
 
+fn export_programs(abi: HookAbi) -> (&'static str, &'static str) {
+    match abi {
+        HookAbi::FunctionList => ("function_list_entry", "function_list_return"),
+        HookAbi::InterfaceList => ("interface_list_entry", "interface_list_return"),
+        HookAbi::Interface => ("interface_entry", "interface_return"),
+    }
+}
+
 pub(crate) fn monotonic_ns() -> Option<u64> {
     let mut timestamp = std::mem::MaybeUninit::<libc::timespec>::uninit();
     // SAFETY: `clock_gettime` initializes `timestamp` on success.
@@ -1074,11 +1082,7 @@ impl Session {
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!("a pinned export object changed before dynamic attach");
         }
-        let (entry_program, return_program) = match abi {
-            HookAbi::FunctionList => ("function_list_entry", "function_list_return"),
-            HookAbi::InterfaceList => ("interface_list_entry", "interface_list_return"),
-            HookAbi::Interface => ("interface_entry", "interface_return"),
-        };
+        let (entry_program, return_program) = export_programs(abi);
         if self.has_dynamic_link(context, return_program, object, file_offset, cookie) {
             return Ok((false, None));
         }
@@ -1150,6 +1154,17 @@ impl Session {
             });
         }
         Ok((true, monotonic_ns()))
+    }
+
+    pub(crate) fn has_dynamic_export(
+        &self,
+        context: LoaderContextId,
+        target: (PinnedObjectId, u64),
+        cookie: u64,
+        abi: HookAbi,
+    ) -> bool {
+        let (_, return_program) = export_programs(abi);
+        self.has_dynamic_link(context, return_program, target.0, target.1, cookie)
     }
 
     fn has_dynamic_link(

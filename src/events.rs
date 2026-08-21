@@ -25,7 +25,6 @@ pub fn decode(bytes: &[u8]) -> Option<Event> {
     decode_exact(bytes)
 }
 
-#[allow(dead_code)] // Task 6 owns the first caller.
 pub(crate) fn decode_discovery(bytes: &[u8]) -> Option<DiscoveryRecord> {
     let record = decode_exact(bytes)?;
     valid_discovery_record(&record).then_some(record)
@@ -62,7 +61,6 @@ impl<'a> Drain<'a> {
 
 /// Fixed-purpose owner for the private live-discovery ring. Its malformed
 /// count is deliberately independent from the public call-event transport.
-#[allow(dead_code)] // Task 6 owns the first caller.
 pub(crate) struct DiscoveryDrain<'a> {
     ring: aya::maps::RingBuf<&'a mut MapData>,
     malformed: u64,
@@ -75,7 +73,6 @@ impl<'a> DiscoveryDrain<'a> {
         Ok(Self { ring, malformed: 0 })
     }
 
-    #[allow(dead_code)] // Task 6 owns the first caller.
     pub(crate) fn poll(&mut self, mut f: impl FnMut(DiscoveryRecord)) {
         while let Some(item) = self.ring.next() {
             match decode_discovery(&item) {
@@ -85,7 +82,6 @@ impl<'a> DiscoveryDrain<'a> {
         }
     }
 
-    #[allow(dead_code)] // Task 6 owns the first caller.
     pub(crate) fn malformed(&self) -> u64 {
         self.malformed
     }

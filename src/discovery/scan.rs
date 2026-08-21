@@ -96,7 +96,7 @@ impl CaptureWorkBudget {
         self.attempted_io_bytes += bytes as u64;
     }
 
-    fn admit_table(&mut self, entries: usize) -> bool {
+    pub(crate) fn admit_table(&mut self, entries: usize) -> bool {
         let Some(decoded) = self.decoded_table_entries.checked_add(entries) else {
             return false;
         };
@@ -124,7 +124,7 @@ impl CaptureWorkBudget {
         }
     }
 
-    fn admit_interface(&mut self) -> bool {
+    pub(crate) fn admit_interface(&mut self) -> bool {
         if self.interface_records == MAX_INTERFACE_RECORDS {
             return false;
         }
@@ -263,7 +263,7 @@ impl ScanOutcome {
 
 /// Version word → the field spans that describe that layout. Returns `None` when the
 /// word is not a plausible `CK_VERSION` header or the layout is one we refuse to walk.
-fn spans_for(word: u64) -> Option<((u8, u8), &'static [TableSpan], &'static str)> {
+pub(crate) fn spans_for(word: u64) -> Option<((u8, u8), &'static [TableSpan], &'static str)> {
     if word & !0xffff != 0 {
         return None;
     }

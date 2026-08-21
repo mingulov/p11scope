@@ -1,23 +1,32 @@
 //! Initial and incremental provider discovery ownership.
 
-use crate::attach::{CapturePolicy, Scope, Session};
+use crate::attach::{CapturePolicy, CounterSnapshot, Scope, Session};
 use crate::cli::CaptureArgs;
+use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
     ManifestStaleReason, PinnedObjectId, PinnedObjects, ReconciledModule, StaleManifestObject,
     bind_scanned_modules, canonicalize_scanned_overlays, pin_manifest_objects_deferred_in_views,
     pin_scanned_view_objects, target_paths_equal,
 };
-use crate::discovery::loader::LoaderRegistry;
+use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::scan::{
-    CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, ScannedTable, Skipped,
-    scan_process_view,
+    CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
+    ScannedTable, Skipped, scan_process_view, spans_for,
 };
 use crate::manifest_input::{read_manifest, validate_structure};
 use crate::process::{self, ProcessView, ProcessViewId};
 use crate::{plan, render};
 use anyhow::{Context as _, Result, anyhow, bail};
+use p11scope_ebpf_common::{
+    DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
+    DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
+    DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER, DISCOVERY_NAME_EXACT_STANDARD,
+    DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER, DISCOVERY_STATUS_LOADER_CONTEXT_INVALID,
+    DiscoveryRecord, valid_discovery_record,
+};
+use p11scope_manifest::elf::ElfSnapshot;
 use p11scope_manifest::manifest::{Manifest, Resolution, SCHEMA};
-use p11scope_manifest::maps::ObjectKey;
+use p11scope_manifest::maps::{MapEntry, MappedPath, ObjectKey, Resolved, parse_maps, resolve};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -36,6 +45,13 @@ pub struct Engine {
     budget: CaptureWorkBudget,
     next_view_id: u32,
     loader_registry: LoaderRegistry,
+    scope: Scope,
+    hooks: HookRegistry,
+    module_hints: Vec<PathBuf>,
+    counter_snapshot: CounterSnapshot,
+    malformed_discovery: u64,
+    refresh_requested: BTreeSet<u32>,
+    loader_records_accepted: u64,
 }
 
 struct ScanInput {
@@ -49,6 +65,13 @@ struct ManifestInput {
     manifest: Manifest,
     pins: PinnedObjects,
     stale: Vec<StaleManifestObject>,
+}
+
+struct LiveCandidate {
+    pinned: PinnedObjects,
+    modules: Vec<ReconciledModule>,
+    plan: plan::AttachPlan,
+    delta: plan::AttachDelta,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -521,15 +544,16 @@ fn read_manifest_file(path: &Path) -> Result<Manifest> {
 /// see but not read is exactly the gap an operator needs to know about.
 fn scan_and_pin(
     view: &ProcessView,
-    a: &CaptureArgs,
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
     budget: &mut CaptureWorkBudget,
     counters: &mut DiscoveryCounters,
 ) -> Result<(Vec<ScannedModule>, PinnedObjects)> {
     let outcome = scan_process_view(
         &ScanRequest {
             pid: view.pid(),
-            hints: &a.modules,
-            hooks: &a.hooks,
+            hints,
+            hooks,
         },
         view,
         budget,
@@ -568,6 +592,9 @@ fn discover_plan(
     mut named_view: Option<ProcessView>,
 ) -> Result<Engine> {
     let mut discovered = Engine::empty();
+    discovered.scope = scope.clone();
+    discovered.hooks = a.hooks.clone();
+    discovered.module_hints = a.modules.clone();
     let (pids, unlisted) = scope_pids(scope);
     discovered.base_counters.object_skips.extend(unlisted);
     // The pid the operator named is the capture; a cgroup's processes are many,
@@ -607,7 +634,13 @@ fn discover_plan(
         };
         discovered.retain_view_id(view.id())?;
         let mut counters = DiscoveryCounters::default();
-        match scan_and_pin(&view, a, &mut discovered.budget, &mut counters) {
+        match scan_and_pin(
+            &view,
+            &a.modules,
+            &a.hooks,
+            &mut discovered.budget,
+            &mut counters,
+        ) {
             Ok((found, pins)) => {
                 discovered.scan_inputs.insert(
                     view.id(),
@@ -1816,6 +1849,215 @@ fn start_retained_with<S>(
         remove_stale_views(discovered, &stale)?;
     }
 }
+
+fn export_abi(kind: u8) -> Option<HookAbi> {
+    match kind {
+        DISCOVERY_KIND_FUNCTION_LIST_RETURN => Some(HookAbi::FunctionList),
+        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN => Some(HookAbi::InterfaceList),
+        DISCOVERY_KIND_INTERFACE_RETURN => Some(HookAbi::Interface),
+        _ => None,
+    }
+}
+
+fn name_class(class: u8) -> &'static str {
+    match class {
+        DISCOVERY_NAME_EXACT_STANDARD => "exact_standard",
+        DISCOVERY_NAME_OTHER => "other",
+        DISCOVERY_NAME_NULL => "null",
+        _ => "unreadable",
+    }
+}
+
+/// Lowers one already-decoded export record through the same table-layout and
+/// mapping authority as the memory scanner. Runtime addresses and custom hook
+/// names remain private inputs to the candidate transaction.
+fn lower_export_record(
+    view: &ProcessView,
+    maps: &[MapEntry],
+    hooks: &HookRegistry,
+    record: &DiscoveryRecord,
+    budget: &mut CaptureWorkBudget,
+) -> Result<Option<ScannedModule>, String> {
+    if !valid_discovery_record(record) {
+        return Err("malformed discovery record reached export lowering".into());
+    }
+    let Some(expected_abi) = export_abi(record.kind) else {
+        return Err("non-export discovery record reached export lowering".into());
+    };
+    let Some((hook_name, abi)) = hooks.by_id(record.symbol_id) else {
+        return Err("export record names an unknown private hook ID".into());
+    };
+    if abi != expected_abi {
+        return Err("export record kind disagrees with its private hook ABI".into());
+    }
+    if record.usable_n == 0 {
+        return Ok(None);
+    }
+    if !view.still_the_same() {
+        return Err("process generation changed before export lowering".into());
+    }
+
+    let Resolved::File {
+        path: MappedPath::Usable(owner_path),
+        device: owner_device,
+        inode: owner_inode,
+        permissions: owner_permissions,
+        ..
+    } = resolve(maps, record.table_ptr)
+    else {
+        return Ok(None);
+    };
+    if owner_inode == 0 || owner_permissions[0] != b'r' {
+        return Ok(None);
+    }
+
+    let word = u64::from(record.version_major) | (u64::from(record.version_minor) << 8);
+    let Some((version, spans, walk)) = spans_for(word) else {
+        return Ok(None);
+    };
+    let usable = usize::from(record.usable_n);
+    if usable > spans.iter().map(|span| span.fields().len()).sum() {
+        return Ok(None);
+    }
+    if !budget.admit_table(usable)
+        || (matches!(
+            record.kind,
+            DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN | DISCOVERY_KIND_INTERFACE_RETURN
+        ) && !budget.admit_interface())
+    {
+        return Ok(None);
+    }
+
+    let mut entries = Vec::new();
+    let mut null_entries = Vec::new();
+    for (field, pointer) in spans
+        .iter()
+        .flat_map(|span| span.fields())
+        .take(usable)
+        .zip(record.pointers)
+    {
+        if pointer == 0 {
+            null_entries.push(field.name);
+            continue;
+        }
+        let Resolved::File {
+            path: MappedPath::Usable(path),
+            file_offset,
+            device,
+            inode,
+            permissions,
+            ..
+        } = resolve(maps, pointer)
+        else {
+            return Ok(None);
+        };
+        if inode == 0 || permissions[2] != b'x' {
+            return Ok(None);
+        }
+        entries.push(ScannedEntry {
+            name: field.name,
+            object: ObjectKey { device, inode },
+            object_path: path.display().to_string(),
+            file_offset,
+        });
+    }
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    let interfaces = match record.kind {
+        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN | DISCOVERY_KIND_INTERFACE_RETURN => {
+            vec![ScannedInterface {
+                index: usize::from(record.interface_index),
+                name_class: name_class(record.name_class),
+                name_lossy: None,
+                flags: record.interface_flags,
+                table: Some(0),
+            }]
+        }
+        _ => Vec::new(),
+    };
+    let module = ScannedModule {
+        view: view.id(),
+        mount_namespace: view.mount_namespace(),
+        key: ObjectKey {
+            device: owner_device,
+            inode: owner_inode,
+        },
+        path: owner_path.display().to_string(),
+        exports: vec![hook_name.to_string()],
+        tables: vec![ScannedTable {
+            version,
+            walk,
+            entries,
+            null_entries,
+            unpinned: Vec::new(),
+            address: record.table_ptr,
+        }],
+        interfaces,
+    };
+    if !view.still_the_same() {
+        return Err("process generation changed during export lowering".into());
+    }
+    Ok(Some(module))
+}
+
+fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedModule) {
+    let Some(existing) = modules.iter_mut().find(|module| {
+        module.view == incoming.view
+            && module.mount_namespace == incoming.mount_namespace
+            && module.key == incoming.key
+            && module.path == incoming.path
+    }) else {
+        modules.push(incoming);
+        return;
+    };
+    for export in incoming.exports.drain(..) {
+        if !existing.exports.contains(&export) {
+            existing.exports.push(export);
+        }
+    }
+    let mut table_indices = Vec::new();
+    for table in incoming.tables.drain(..) {
+        let index = existing.tables.iter().position(|known| *known == table);
+        table_indices.push(index.unwrap_or_else(|| {
+            existing.tables.push(table);
+            existing.tables.len() - 1
+        }));
+    }
+    for mut interface in incoming.interfaces.drain(..) {
+        interface.table = interface
+            .table
+            .and_then(|index| table_indices.get(index).copied());
+        if !existing.interfaces.contains(&interface) {
+            existing.interfaces.push(interface);
+        }
+    }
+}
+
+fn usable_path(maps: &[MapEntry], mapping: &MapEntry) -> Option<PathBuf> {
+    match resolve(maps, mapping.start) {
+        Resolved::File {
+            path: MappedPath::Usable(path),
+            inode,
+            ..
+        } if inode != 0 => Some(path),
+        _ => None,
+    }
+}
+
+fn mapped_object(view: &ProcessView, mapping: &MapEntry, path: &Path) -> ScannedModule {
+    ScannedModule {
+        view: view.id(),
+        mount_namespace: view.mount_namespace(),
+        key: ObjectKey::of(mapping),
+        path: path.display().to_string(),
+        exports: Vec::new(),
+        tables: Vec::new(),
+        interfaces: Vec::new(),
+    }
+}
+
 impl Engine {
     fn empty() -> Self {
         Self {
@@ -1833,10 +2075,20 @@ impl Engine {
             budget: CaptureWorkBudget::default(),
             next_view_id: 0,
             loader_registry: LoaderRegistry::default(),
+            scope: Scope::Pid(std::process::id()),
+            hooks: HookRegistry::builtin(),
+            module_hints: Vec::new(),
+            counter_snapshot: CounterSnapshot::default(),
+            malformed_discovery: 0,
+            refresh_requested: BTreeSet::new(),
+            loader_records_accepted: 0,
         }
     }
 
     fn allocate_view_id(&mut self) -> Result<ProcessViewId> {
+        if self.next_view_id as usize >= MAX_SCAN_PIDS {
+            bail!("capture process-view capacity {MAX_SCAN_PIDS} is exhausted");
+        }
         let id = ProcessViewId(self.next_view_id);
         self.next_view_id = self
             .next_view_id
@@ -1846,11 +2098,1074 @@ impl Engine {
     }
 
     fn retain_view_id(&mut self, id: ProcessViewId) -> Result<()> {
+        if id.0 as usize >= MAX_SCAN_PIDS {
+            bail!("capture process-view capacity {MAX_SCAN_PIDS} is exhausted");
+        }
         let next =
             id.0.checked_add(1)
                 .ok_or_else(|| anyhow!("process view ID space exhausted"))?;
         self.next_view_id = self.next_view_id.max(next);
         Ok(())
+    }
+
+    fn mark_partial(&mut self, subject: &str, reason: &str) {
+        let skipped = Skipped {
+            subject: subject.into(),
+            reason: reason.into(),
+        };
+        if !self.counters.object_skips.contains(&skipped) {
+            self.counters.object_skips.push(skipped);
+        }
+    }
+
+    fn read_maps(view: &ProcessView) -> Result<Vec<MapEntry>> {
+        let pid = view.pid();
+        let bytes = view
+            .run_while_same(|| std::fs::read(format!("/proc/{pid}/maps")))
+            .map_err(anyhow::Error::msg)??;
+        parse_maps(&bytes).map_err(anyhow::Error::msg)
+    }
+
+    fn scan_retained_view(
+        view: &ProcessView,
+        module_hints: &[PathBuf],
+        hooks: &HookRegistry,
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<(Vec<ScannedModule>, PinnedObjects, DiscoveryCounters)> {
+        let mut counters = DiscoveryCounters::default();
+        let (modules, pins) = scan_and_pin(view, module_hints, hooks, budget, &mut counters)?;
+        Ok((modules, pins, counters))
+    }
+
+    fn absorb_scan_counters(&mut self, counters: DiscoveryCounters) -> Vec<Skipped> {
+        self.counters.scan_unavailable =
+            self.counters.scan_unavailable.or(counters.scan_unavailable);
+        self.counters.scan_ms = self.counters.scan_ms.saturating_add(counters.scan_ms);
+        counters.object_skips
+    }
+
+    fn live_candidate(
+        &mut self,
+        mut pinned: PinnedObjects,
+        mut raw_modules: Vec<ScannedModule>,
+        skipped: Vec<Skipped>,
+    ) -> Result<LiveCandidate> {
+        for skip in skipped {
+            if !self.counters.object_skips.contains(&skip) {
+                self.counters.object_skips.push(skip);
+            }
+        }
+        raw_modules.retain(|module| {
+            !pinned.rejects(module.key)
+                && !module
+                    .tables
+                    .iter()
+                    .flat_map(|table| &table.entries)
+                    .any(|entry| pinned.rejects(entry.object))
+        });
+        pinned.reset_derived_claims();
+        let (modules, binding_skips) = bind_scanned_modules(&raw_modules, &mut pinned);
+        for skip in binding_skips {
+            if !self.counters.object_skips.contains(&skip) {
+                self.counters.object_skips.push(skip);
+            }
+        }
+        let mut rebuilt = self
+            .plan
+            .rebuild_from_sources(&modules, &self.manifests, &pinned);
+        record_object_skips(&mut rebuilt, &self.counters.object_skips);
+        let mut candidate_plan = self.plan.clone();
+        let delta = candidate_plan
+            .extend_exact(rebuilt)
+            .map_err(anyhow::Error::msg)?;
+        Ok(LiveCandidate {
+            pinned,
+            modules,
+            plan: candidate_plan,
+            delta,
+        })
+    }
+
+    fn apply_candidate(
+        &mut self,
+        session: &mut Session,
+        mut candidate: LiveCandidate,
+        additions_allowed: &mut bool,
+        preflighted: bool,
+    ) -> Result<(bool, bool)> {
+        let targets: Vec<_> = candidate
+            .delta
+            .new
+            .iter()
+            .chain(&candidate.delta.replace)
+            .cloned()
+            .collect();
+        let generations_valid = candidate.modules.iter().all(|module| {
+            self.views
+                .iter()
+                .find(|view| view.id() == module.scanned.view)
+                .is_some_and(ProcessView::still_the_same)
+        });
+        if !preflighted
+            && (!generations_valid
+                || session
+                    .preflight_targets(&targets, &candidate.pinned)
+                    .is_err())
+        {
+            self.mark_partial(
+                "live discovery transaction",
+                "candidate preflight failed; canonical identity, plan, and links were unchanged",
+            );
+            return Ok((false, false));
+        }
+
+        let selected: Vec<_> = candidate
+            .delta
+            .retire
+            .iter()
+            .chain(&candidate.delta.replace)
+            .cloned()
+            .collect();
+        let detach_failed = session.detach_slots(&selected).is_err();
+        if detach_failed {
+            *additions_allowed = false;
+        }
+        let may_add = *additions_allowed;
+        if !may_add {
+            for slot in candidate.delta.new.iter().chain(&candidate.delta.replace) {
+                candidate.plan.deactivate(slot.index);
+            }
+            if detach_failed {
+                self.mark_partial(
+                    "live discovery detach",
+                    "a one-shot detach failed; additions and replacements were blocked for this cycle",
+                );
+            }
+        } else {
+            match session.attach_targets(&candidate.delta.new, &candidate.pinned) {
+                Ok(failed) => {
+                    let failed_slots: Vec<_> = candidate
+                        .delta
+                        .new
+                        .iter()
+                        .filter(|slot| failed.contains(&slot.index))
+                        .cloned()
+                        .collect();
+                    if session.detach_slots(&failed_slots).is_err() {
+                        *additions_allowed = false;
+                        self.mark_partial(
+                            "live discovery detach",
+                            "a partial new-slot detach failed once and was not retried",
+                        );
+                    }
+                    for slot in failed_slots {
+                        candidate.plan.deactivate(slot.index);
+                    }
+                }
+                Err(_) => {
+                    for slot in &candidate.delta.new {
+                        candidate.plan.deactivate(slot.index);
+                    }
+                    self.mark_partial(
+                        "live discovery attach",
+                        "one or more new exact targets could not be attached",
+                    );
+                }
+            }
+            if *additions_allowed {
+                let detach_failures = session.detach_failures().len();
+                if session
+                    .replace_targets(
+                        &mut candidate.plan,
+                        &candidate.delta.replace,
+                        &candidate.pinned,
+                    )
+                    .is_err()
+                {
+                    if session.detach_failures().len() > detach_failures {
+                        *additions_allowed = false;
+                    }
+                    self.mark_partial(
+                        "live discovery replacement",
+                        "one or more downgraded exact targets could not be replaced",
+                    );
+                }
+            } else {
+                for slot in &candidate.delta.replace {
+                    candidate.plan.deactivate(slot.index);
+                }
+            }
+        }
+        record_object_skips(&mut candidate.plan, &self.counters.object_skips);
+        let changed = candidate.plan != self.plan;
+        self.pinned = candidate.pinned;
+        self.modules = candidate.modules;
+        self.plan = candidate.plan;
+        self.discovery = discovery_evidence(&self.plan, &self.pinned, &self.counters);
+        Ok((true, changed))
+    }
+
+    fn update_counter_snapshot(&mut self, session: &Session) -> Result<()> {
+        let next = session.counter_snapshot()?;
+        if !self.counter_snapshot.replace_with(next) {
+            self.mark_partial(
+                "live discovery counters",
+                "a producer counter decreased; the prior absolute snapshot was retained",
+            );
+            return Ok(());
+        }
+        if self.counter_snapshot.ring_loss > 0 {
+            self.mark_partial(
+                "live discovery transport",
+                "the kernel could not reserve one or more private discovery records",
+            );
+        }
+        if self.counter_snapshot.export_state_failures > 0
+            || self.counter_snapshot.export_bounded_read_failures > 0
+        {
+            self.mark_partial(
+                "live export discovery",
+                "the kernel reported export state or bounded-read failures",
+            );
+        }
+        if self.counter_snapshot.loader_state_read_failures > 0 {
+            self.mark_partial(
+                "live loader discovery",
+                "the kernel reported loader-state read failures",
+            );
+        }
+        Ok(())
+    }
+
+    fn process_export_record(
+        &mut self,
+        record: &DiscoveryRecord,
+        session: &mut Session,
+        additions_allowed: &mut bool,
+    ) -> Result<bool> {
+        let pid = (record.pid_tgid >> 32) as u32;
+        let Some(position) = self.views.iter().position(|view| view.pid() == pid) else {
+            self.refresh_requested.insert(pid);
+            self.mark_partial(
+                "live export discovery",
+                "an export record had no retained process generation",
+            );
+            return Ok(false);
+        };
+        let lowered = {
+            let view = &self.views[position];
+            let maps = Self::read_maps(view)?;
+            lower_export_record(view, &maps, &self.hooks, record, &mut self.budget)
+        };
+        let Some(lowered) = lowered.map_err(|error| anyhow!(error))? else {
+            self.mark_partial(
+                "live export discovery",
+                "an export table had no usable exact file-backed owner and prefix",
+            );
+            return Ok(false);
+        };
+        let (pins, pin_skips) = {
+            let view = &self.views[position];
+            pin_scanned_view_objects(view, std::slice::from_ref(&lowered), &mut self.budget)
+                .map_err(anyhow::Error::msg)?
+        };
+        let mut candidate_pins = self.pinned.clone();
+        let mut skipped = pin_skips;
+        skipped.extend(candidate_pins.absorb(pins));
+        let mut raw_modules: Vec<_> = self
+            .modules
+            .iter()
+            .map(|module| module.scanned.clone())
+            .collect();
+        merge_scanned_module(&mut raw_modules, lowered);
+        let candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
+        let (_, changed) = self.apply_candidate(session, candidate, additions_allowed, false)?;
+        Ok(changed)
+    }
+
+    fn process_loader_record(
+        &mut self,
+        record: &DiscoveryRecord,
+        session: &mut Session,
+        additions_allowed: &mut bool,
+    ) -> Result<bool> {
+        if self.loader_records_accepted >= self.counter_snapshot.loader_hits {
+            self.mark_partial(
+                "live loader discovery",
+                "a loader record had no producer-counter authority",
+            );
+            return Ok(false);
+        }
+        self.loader_records_accepted = self.loader_records_accepted.saturating_add(1);
+        if record.status_flags & DISCOVERY_STATUS_LOADER_CONTEXT_INVALID != 0 {
+            self.loader_registry.reject_hit();
+            self.mark_partial(
+                "live loader discovery",
+                "the kernel rejected a loader context before userspace resolution",
+            );
+            return Ok(false);
+        }
+        let pid = (record.pid_tgid >> 32) as u32;
+        let Some(position) = self.views.iter().position(|view| view.pid() == pid) else {
+            self.loader_registry.reject_hit();
+            self.refresh_requested.insert(pid);
+            self.mark_partial(
+                "live loader discovery",
+                "a loader hit had no retained process generation",
+            );
+            return Ok(false);
+        };
+        let context_id = LoaderContextId::from_case_id(record.case_id);
+        let Some(context) = self.loader_registry.context(context_id).cloned() else {
+            self.loader_registry.reject_hit();
+            self.mark_partial(
+                "live loader discovery",
+                "a loader hit named a retired or unknown context",
+            );
+            return Ok(false);
+        };
+        let maps = Self::read_maps(&self.views[position])?;
+        let Some(mapping) = maps
+            .iter()
+            .find(|mapping| (mapping.start..mapping.end).contains(&record.table_ptr))
+            .cloned()
+        else {
+            self.loader_registry.reject_hit();
+            self.mark_partial(
+                "live loader discovery",
+                "a loader hook address no longer resolved to a mapping",
+            );
+            return Ok(false);
+        };
+        if context.spec.view != self.views[position].id()
+            || context.spec.mapping != mapping
+            || !self.pinned.check_unchanged().unwrap_or(false)
+            || self
+                .pinned
+                .summary(context.spec.loader)
+                .is_none_or(|summary| summary.key != ObjectKey::of(&mapping))
+        {
+            self.loader_registry.reject_hit();
+            self.mark_partial(
+                "live loader discovery",
+                "a loader hit failed generation, mapping, identity, or hook-IP validation",
+            );
+            return Ok(false);
+        }
+        if self
+            .loader_registry
+            .validate_hit(
+                record.case_id,
+                self.views[position].id(),
+                context.spec.loader,
+                &mapping,
+                record.table_ptr,
+                record.hook_ts_ns,
+            )
+            .is_err()
+        {
+            self.mark_partial(
+                "live loader discovery",
+                "a loader hit failed generation, mapping, identity, or hook-IP validation",
+            );
+            return Ok(false);
+        }
+
+        let (found, fresh_pins, scan_counters) = Self::scan_retained_view(
+            &self.views[position],
+            &self.module_hints,
+            &self.hooks,
+            &mut self.budget,
+        )?;
+        let mut skipped = self.absorb_scan_counters(scan_counters);
+        let export_modules = found.clone();
+        let mut candidate_pins = self.pinned.clone();
+        skipped.extend(candidate_pins.replace_view_pins(
+            self.views[position].id(),
+            fresh_pins,
+            &[context.spec.loader],
+        ));
+        let mut raw_modules: Vec<_> = self
+            .modules
+            .iter()
+            .filter(|module| module.scanned.view != self.views[position].id())
+            .map(|module| module.scanned.clone())
+            .collect();
+        for module in found {
+            merge_scanned_module(&mut raw_modules, module);
+        }
+        let candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
+        let (committed, changed) =
+            self.apply_candidate(session, candidate, additions_allowed, false)?;
+        if committed && *additions_allowed {
+            self.attach_export_hooks(
+                context_id,
+                self.views[position].pid(),
+                &export_modules,
+                session,
+                additions_allowed,
+            );
+        }
+        Ok(changed)
+    }
+
+    fn attach_export_hooks(
+        &mut self,
+        context: LoaderContextId,
+        pid: u32,
+        modules: &[ScannedModule],
+        session: &mut Session,
+        additions_allowed: &mut bool,
+    ) {
+        for module in modules {
+            if !*additions_allowed {
+                break;
+            }
+            let Some(object) = self.pinned.id_for_scanned(module, module.key, &module.path) else {
+                continue;
+            };
+            let snapshot = self
+                .pinned
+                .file_for(object)
+                .and_then(|file| ElfSnapshot::read(file).ok());
+            for name in &module.exports {
+                if !*additions_allowed {
+                    break;
+                }
+                let Some(abi) = self.hooks.abi(name) else {
+                    continue;
+                };
+                let Some(cookie) = self.hooks.export_cookie(name) else {
+                    continue;
+                };
+                let fact = snapshot.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .defined_symbol(name)
+                        .ok()
+                        .flatten()
+                        .filter(|fact| snapshot.is_executable_offset(fact.file_offset))
+                });
+                let Some(fact) = fact else {
+                    self.mark_partial(
+                        "live export hook",
+                        "an export hook was absent or outside an executable ELF segment",
+                    );
+                    continue;
+                };
+                let detach_failures = session.detach_failures().len();
+                if session
+                    .attach_dynamic_export(
+                        context,
+                        pid,
+                        (object, fact.file_offset),
+                        cookie,
+                        abi,
+                        &self.pinned,
+                    )
+                    .is_err()
+                {
+                    if session.detach_failures().len() > detach_failures {
+                        *additions_allowed = false;
+                    }
+                    self.mark_partial(
+                        "live export hook",
+                        "a fixed-purpose dynamic export attachment failed",
+                    );
+                }
+            }
+        }
+    }
+
+    fn arm_loader_for_view(&mut self, position: usize, session: &mut Session) -> Result<()> {
+        let view_id = self.views[position].id();
+        if !self.loader_registry.ids_for_view(view_id).is_empty() {
+            return Ok(());
+        }
+        let maps = Self::read_maps(&self.views[position])?;
+        let pid = self.views[position].pid();
+        let executable_target = self.views[position]
+            .run_while_same(|| std::fs::read_link(format!("/proc/{pid}/exe")))
+            .map_err(anyhow::Error::msg)??;
+        let executable_inode = self.views[position]
+            .run_while_same(|| std::fs::metadata(format!("/proc/{pid}/exe")))
+            .map_err(anyhow::Error::msg)?
+            .ok()
+            .map(|metadata| std::os::unix::fs::MetadataExt::ino(&metadata));
+        let Some(executable_mapping) = maps
+            .iter()
+            .filter(|mapping| mapping.inode != 0 && mapping.permissions[2] == b'x')
+            .find(|mapping| {
+                executable_inode == Some(mapping.inode)
+                    && usable_path(&maps, mapping).is_some_and(|path| path == executable_target)
+            })
+            .cloned()
+        else {
+            self.mark_partial(
+                "live loader arming",
+                "the retained executable had no fresh matching file-backed executable mapping",
+            );
+            return Ok(());
+        };
+        let Some(executable_path) = usable_path(&maps, &executable_mapping) else {
+            self.mark_partial(
+                "live loader arming",
+                "the retained executable mapping had no usable pathname",
+            );
+            return Ok(());
+        };
+        let executable_module =
+            mapped_object(&self.views[position], &executable_mapping, &executable_path);
+        let (executable_pins, mut skipped) = pin_scanned_view_objects(
+            &self.views[position],
+            std::slice::from_ref(&executable_module),
+            &mut self.budget,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let Some(executable_id) = executable_pins.id_for_scanned(
+            &executable_module,
+            executable_module.key,
+            &executable_module.path,
+        ) else {
+            self.mark_partial(
+                "live loader arming",
+                "the retained executable could not be pinned exactly",
+            );
+            return Ok(());
+        };
+        let executable_snapshot = ElfSnapshot::read(
+            executable_pins
+                .file_for(executable_id)
+                .expect("the just-pinned executable has its retained file"),
+        )
+        .map_err(anyhow::Error::msg)?;
+        let Some(interpreter) = executable_snapshot.interpreter() else {
+            return Ok(());
+        };
+        let interpreter = PathBuf::from(
+            std::str::from_utf8(interpreter)
+                .map_err(|_| anyhow!("retained executable PT_INTERP is not UTF-8"))?,
+        );
+        if !interpreter.is_absolute() {
+            self.mark_partial(
+                "live loader arming",
+                "the retained executable PT_INTERP was not an absolute path",
+            );
+            return Ok(());
+        }
+        let interpreter_metadata = self.views[position]
+            .run_while_same(|| {
+                std::fs::metadata(format!("/proc/{}/root{}", pid, interpreter.display()))
+            })
+            .map_err(anyhow::Error::msg)??;
+        let interpreter_inode = std::os::unix::fs::MetadataExt::ino(&interpreter_metadata);
+        let loader_group: Vec<_> = maps
+            .iter()
+            .filter(|mapping| {
+                mapping.inode != 0
+                    && mapping.permissions[2] == b'x'
+                    && mapping.inode == interpreter_inode
+                    && usable_path(&maps, mapping).is_some_and(|path| path == interpreter)
+            })
+            .cloned()
+            .collect();
+        let Some(first_loader_mapping) = loader_group.first() else {
+            self.mark_partial(
+                "live loader arming",
+                "PT_INTERP had no fresh matching file-backed executable loader mapping",
+            );
+            return Ok(());
+        };
+        if usable_path(&maps, first_loader_mapping).is_none() {
+            self.mark_partial(
+                "live loader arming",
+                "the exact loader mapping had no usable pathname",
+            );
+            return Ok(());
+        }
+        let loader_module =
+            mapped_object(&self.views[position], first_loader_mapping, &interpreter);
+        let (loader_pins, loader_skips) = pin_scanned_view_objects(
+            &self.views[position],
+            std::slice::from_ref(&loader_module),
+            &mut self.budget,
+        )
+        .map_err(anyhow::Error::msg)?;
+        skipped.extend(loader_skips);
+        let Some(local_loader_id) =
+            loader_pins.id_for_scanned(&loader_module, loader_module.key, &loader_module.path)
+        else {
+            self.mark_partial(
+                "live loader arming",
+                "the exact loader mapping could not be pinned",
+            );
+            return Ok(());
+        };
+        let loader_snapshot = ElfSnapshot::read(
+            loader_pins
+                .file_for(local_loader_id)
+                .expect("the just-pinned loader has its retained file"),
+        )
+        .map_err(anyhow::Error::msg)?;
+        let Some(hook) = loader_snapshot
+            .defined_symbol("_dl_debug_state")
+            .map_err(anyhow::Error::msg)?
+            .filter(|hook| loader_snapshot.is_executable_offset(hook.file_offset))
+        else {
+            self.mark_partial(
+                "live loader arming",
+                "the exact loader had no executable _dl_debug_state definition",
+            );
+            return Ok(());
+        };
+        let Some(loader_mapping) = loader_group.into_iter().find(|mapping| {
+            let len = mapping.end.saturating_sub(mapping.start);
+            (mapping.file_offset..mapping.file_offset.saturating_add(len))
+                .contains(&hook.file_offset)
+        }) else {
+            self.mark_partial(
+                "live loader arming",
+                "_dl_debug_state did not resolve inside the exact executable loader mapping",
+            );
+            return Ok(());
+        };
+        let state = loader_snapshot
+            .defined_symbol("_r_debug")
+            .map_err(anyhow::Error::msg)?;
+
+        let mut candidate_pins = self.pinned.clone();
+        skipped.extend(candidate_pins.absorb(executable_pins));
+        skipped.extend(candidate_pins.absorb(loader_pins));
+        for skip in skipped {
+            if !self.counters.object_skips.contains(&skip) {
+                self.counters.object_skips.push(skip);
+            }
+        }
+        let Some(loader) =
+            candidate_pins.id_for_scanned(&loader_module, loader_module.key, &loader_module.path)
+        else {
+            self.mark_partial(
+                "live loader arming",
+                "the loader lost canonical identity during reconciliation",
+            );
+            return Ok(());
+        };
+        let context = self
+            .loader_registry
+            .prepare(LoaderContextSpec {
+                view: view_id,
+                loader,
+                mapping: loader_mapping.clone(),
+                hook,
+                state,
+            })
+            .map_err(anyhow::Error::msg)?;
+        let cookie = self
+            .loader_registry
+            .context(context)
+            .expect("prepared loader context is present")
+            .cookie;
+        match session.attach_dynamic_loader(
+            context,
+            pid,
+            loader,
+            hook.file_offset,
+            cookie,
+            &candidate_pins,
+        ) {
+            Ok(()) => {
+                self.loader_registry
+                    .mark_attached(context)
+                    .map_err(anyhow::Error::msg)?;
+                let postchecked = self.views[position].still_the_same()
+                    && candidate_pins.check_unchanged().unwrap_or(false)
+                    && Self::read_maps(&self.views[position])
+                        .is_ok_and(|maps| maps.contains(&loader_mapping));
+                if postchecked {
+                    self.pinned = candidate_pins;
+                    self.discovery = discovery_evidence(&self.plan, &self.pinned, &self.counters);
+                } else {
+                    let detach_failed = session.detach_dynamic_context(context);
+                    self.loader_registry
+                        .tombstone(context)
+                        .map_err(anyhow::Error::msg)?;
+                    self.loader_registry
+                        .remove(context)
+                        .map_err(anyhow::Error::msg)?;
+                    self.mark_partial(
+                        "live loader arming",
+                        if detach_failed {
+                            "loader postcheck failed and its one-shot detach also failed"
+                        } else {
+                            "loader generation, mapping, or pinned identity changed during attach"
+                        },
+                    );
+                }
+            }
+            Err(_) => {
+                self.loader_registry
+                    .cancel_prepared(context)
+                    .map_err(anyhow::Error::msg)?;
+                self.loader_registry
+                    .remove(context)
+                    .map_err(anyhow::Error::msg)?;
+                self.mark_partial(
+                    "live loader arming",
+                    "the fixed-purpose loader attachment failed",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn retire_loader_contexts(
+        &mut self,
+        view: ProcessViewId,
+        session: &mut Session,
+        pending_removal: &mut Vec<LoaderContextId>,
+        additions_allowed: &mut bool,
+    ) {
+        for context_id in self.loader_registry.ids_for_view(view) {
+            let Some(context) = self.loader_registry.context(context_id).cloned() else {
+                continue;
+            };
+            let transition = if context.was_attached {
+                if session.detach_dynamic_context(context_id) {
+                    *additions_allowed = false;
+                    self.mark_partial(
+                        "live loader detach",
+                        "a one-shot dynamic detach failed; replacement was blocked for this cycle",
+                    );
+                }
+                self.loader_registry.tombstone(context_id)
+            } else {
+                self.loader_registry.cancel_prepared(context_id)
+            };
+            if transition.is_ok() {
+                pending_removal.push(context_id);
+            } else {
+                self.mark_partial(
+                    "live loader retirement",
+                    "a loader context could not enter its terminal tombstone state",
+                );
+            }
+        }
+    }
+
+    fn remove_tombstoned_contexts(&mut self, pending: Vec<LoaderContextId>) {
+        for context in pending {
+            if self.loader_registry.remove(context).is_err() {
+                self.mark_partial(
+                    "live loader retirement",
+                    "a tombstoned loader context could not be removed",
+                );
+            }
+        }
+    }
+
+    fn refresh_inventory(
+        &mut self,
+        session: &mut Session,
+        mut additions_allowed: bool,
+    ) -> Result<bool> {
+        if matches!(self.scope, Scope::Pid(_)) && self.refresh_requested.is_empty() {
+            return Ok(false);
+        }
+        let (pids, mut skipped) = scope_pids(&self.scope);
+        if pids.len() > MAX_SCAN_PIDS {
+            skipped.push(Skipped {
+                subject: scope_label(&self.scope),
+                reason: format!(
+                    "{} processes in scope; live discovery scanned the first {MAX_SCAN_PIDS}",
+                    pids.len()
+                ),
+            });
+        }
+        let desired: BTreeSet<_> = pids.into_iter().take(MAX_SCAN_PIDS).collect();
+        if matches!(self.scope, Scope::Pid(_))
+            && self.views.first().is_none_or(|view| !view.still_the_same())
+        {
+            bail!("the named process generation changed during capture");
+        }
+
+        let removed: BTreeSet<_> = self
+            .views
+            .iter()
+            .filter(|view| {
+                !view.still_the_same()
+                    || (matches!(self.scope, Scope::Cgroup { .. })
+                        && !desired.contains(&view.pid()))
+            })
+            .map(ProcessView::id)
+            .collect();
+        let refreshed: BTreeSet<_> = self
+            .views
+            .iter()
+            .filter(|view| {
+                !removed.contains(&view.id()) && self.refresh_requested.contains(&view.pid())
+            })
+            .map(ProcessView::id)
+            .collect();
+        let known_pids: BTreeSet<_> = self
+            .views
+            .iter()
+            .filter(|view| !removed.contains(&view.id()))
+            .map(ProcessView::pid)
+            .collect();
+        let new_pids: Vec<_> = desired.difference(&known_pids).copied().collect();
+        if removed.is_empty() && refreshed.is_empty() && new_pids.is_empty() {
+            self.refresh_requested.clear();
+            for skip in skipped {
+                self.mark_partial(&skip.subject, &skip.reason);
+            }
+            return Ok(false);
+        }
+
+        let mut refreshed_scans = Vec::new();
+        let mut failed_refresh_pids = BTreeSet::new();
+        for view_id in &refreshed {
+            let position = self
+                .views
+                .iter()
+                .position(|view| view.id() == *view_id)
+                .expect("refreshed view remains retained");
+            match Self::scan_retained_view(
+                &self.views[position],
+                &self.module_hints,
+                &self.hooks,
+                &mut self.budget,
+            ) {
+                Ok((modules, pins, counters)) => {
+                    skipped.extend(self.absorb_scan_counters(counters));
+                    refreshed_scans.push((*view_id, modules, pins));
+                }
+                Err(error) => {
+                    failed_refresh_pids.insert(self.views[position].pid());
+                    skipped.push(Skipped {
+                        subject: "process view".into(),
+                        reason: format!("a requested inventory refresh failed: {error:#}"),
+                    });
+                }
+            }
+        }
+
+        let mut new_views = Vec::new();
+        for pid in new_pids {
+            let id = match self.allocate_view_id() {
+                Ok(id) => id,
+                Err(_) => {
+                    skipped.push(Skipped {
+                        subject: "process view".into(),
+                        reason: format!(
+                            "capture process-view capacity {MAX_SCAN_PIDS} was exhausted; remaining generations were not scanned"
+                        ),
+                    });
+                    break;
+                }
+            };
+            let view = match ProcessView::open(id, pid) {
+                Ok(view) => view,
+                Err(error) => {
+                    failed_refresh_pids.insert(pid);
+                    skipped.push(Skipped {
+                        subject: format!("pid {pid}"),
+                        reason: format!("the process generation could not be retained: {error}"),
+                    });
+                    continue;
+                }
+            };
+            match Self::scan_retained_view(&view, &self.module_hints, &self.hooks, &mut self.budget)
+            {
+                Ok((modules, pins, counters)) => {
+                    skipped.extend(self.absorb_scan_counters(counters));
+                    new_views.push((view, modules, pins));
+                }
+                Err(error) => {
+                    failed_refresh_pids.insert(pid);
+                    skipped.push(Skipped {
+                        subject: format!("pid {pid}"),
+                        reason: format!("the process generation could not be scanned: {error:#}"),
+                    });
+                }
+            }
+        }
+
+        let refreshed_ok: BTreeSet<_> = refreshed_scans.iter().map(|(view, _, _)| *view).collect();
+        let mut candidate_pins = self.pinned.clone();
+        for view in &removed {
+            candidate_pins.remove_view(*view);
+        }
+        let mut raw_modules: Vec<_> = self
+            .modules
+            .iter()
+            .filter(|module| {
+                !removed.contains(&module.scanned.view)
+                    && !refreshed_ok.contains(&module.scanned.view)
+            })
+            .map(|module| module.scanned.clone())
+            .collect();
+        for (view, modules, pins) in refreshed_scans {
+            skipped.extend(candidate_pins.replace_view_pins(view, pins, &[]));
+            for module in modules {
+                merge_scanned_module(&mut raw_modules, module);
+            }
+        }
+        for (view, modules, pins) in &mut new_views {
+            skipped.extend(candidate_pins.absorb(std::mem::replace(pins, PinnedObjects::empty())));
+            for module in std::mem::take(modules) {
+                merge_scanned_module(&mut raw_modules, module);
+            }
+            if !view.still_the_same() {
+                skipped.push(Skipped {
+                    subject: "process view".into(),
+                    reason: STALE_VIEW_REASON.into(),
+                });
+            }
+        }
+        let candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
+        let targets: Vec<_> = candidate
+            .delta
+            .new
+            .iter()
+            .chain(&candidate.delta.replace)
+            .cloned()
+            .collect();
+        let generations_valid = self
+            .views
+            .iter()
+            .filter(|view| !removed.contains(&view.id()))
+            .all(ProcessView::still_the_same)
+            && new_views.iter().all(|(view, _, _)| view.still_the_same());
+        if !generations_valid
+            || session
+                .preflight_targets(&targets, &candidate.pinned)
+                .is_err()
+        {
+            self.mark_partial(
+                "live inventory transaction",
+                "candidate preflight failed; canonical identity, plan, and links were unchanged",
+            );
+            return Ok(false);
+        }
+
+        let mut pending = Vec::new();
+        for view in removed.iter().chain(&refreshed_ok) {
+            self.retire_loader_contexts(*view, session, &mut pending, &mut additions_allowed);
+        }
+        let (committed, changed) =
+            self.apply_candidate(session, candidate, &mut additions_allowed, true)?;
+        self.remove_tombstoned_contexts(pending);
+        if !committed {
+            return Ok(false);
+        }
+        self.refresh_requested
+            .retain(|pid| failed_refresh_pids.contains(pid));
+        let new_view_ids: BTreeSet<_> = new_views.iter().map(|(view, _, _)| view.id()).collect();
+        self.views.retain(|view| !removed.contains(&view.id()));
+        for (view, _, _) in new_views {
+            self.views.push(view);
+        }
+        for view in removed.iter().chain(&refreshed_ok) {
+            self.scan_inputs.remove(view);
+        }
+        if additions_allowed {
+            let arm: Vec<_> = self
+                .views
+                .iter()
+                .enumerate()
+                .filter_map(|(position, view)| {
+                    (refreshed_ok.contains(&view.id()) || new_view_ids.contains(&view.id()))
+                        .then_some(position)
+                })
+                .collect();
+            for position in arm {
+                self.arm_loader_for_view(position, session)?;
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Drains private discovery records into owned storage, drops the map
+    /// borrow, then applies identity/link transactions. Callers synchronize
+    /// semantic consumers immediately when this reports a plan change, before
+    /// draining the ordinary event ring.
+    pub fn drain_discovery(&mut self, session: &mut Session) -> Result<bool> {
+        let (records, malformed) = {
+            let mut records = Vec::new();
+            let mut drain = session.discovery_drain()?;
+            drain.poll(|record| records.push(record));
+            (records, drain.malformed())
+        };
+        if malformed > 0 {
+            self.malformed_discovery = self.malformed_discovery.saturating_add(malformed);
+            self.mark_partial(
+                "live discovery transport",
+                "one or more malformed private discovery records were discarded",
+            );
+        }
+        self.update_counter_snapshot(session)?;
+
+        let mut additions_allowed = true;
+        let mut pending_removal = Vec::new();
+        let mut lifecycle_views = BTreeSet::new();
+        for record in &records {
+            if !matches!(
+                record.kind,
+                DISCOVERY_KIND_EXEC | DISCOVERY_KIND_LEADER_EXIT
+            ) {
+                continue;
+            }
+            let pid = (record.pid_tgid >> 32) as u32;
+            self.refresh_requested.insert(pid);
+            if let Some(view) = self
+                .views
+                .iter()
+                .find(|view| view.pid() == pid)
+                .map(ProcessView::id)
+            {
+                lifecycle_views.insert(view);
+            }
+        }
+        for view in lifecycle_views {
+            self.retire_loader_contexts(
+                view,
+                session,
+                &mut pending_removal,
+                &mut additions_allowed,
+            );
+        }
+
+        let mut changed = false;
+        for record in &records {
+            let outcome = match record.kind {
+                DISCOVERY_KIND_FUNCTION_LIST_RETURN
+                | DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN
+                | DISCOVERY_KIND_INTERFACE_RETURN => {
+                    self.process_export_record(record, session, &mut additions_allowed)
+                }
+                DISCOVERY_KIND_LOADER => {
+                    self.process_loader_record(record, session, &mut additions_allowed)
+                }
+                DISCOVERY_KIND_EXEC | DISCOVERY_KIND_LEADER_EXIT => Ok(false),
+                _ => Ok(false),
+            };
+            match outcome {
+                Ok(plan_changed) => changed |= plan_changed,
+                Err(_) => {
+                    self.mark_partial(
+                        "live discovery record",
+                        "a structurally valid private record failed exact live resolution",
+                    );
+                }
+            }
+        }
+        // Records queued before retirement were already moved into `records`;
+        // tombstoned contexts reject them above. Removal now makes later stale
+        // records fail context resolution permanently, with no ID reuse.
+        self.remove_tombstoned_contexts(pending_removal);
+        changed |= self.refresh_inventory(session, additions_allowed)?;
+        record_object_skips(&mut self.plan, &self.counters.object_skips);
+        self.discovery = discovery_evidence(&self.plan, &self.pinned, &self.counters);
+        Ok(changed)
     }
 
     /// Performs the existing one-shot initial discovery pass.
@@ -1882,18 +3197,31 @@ impl Engine {
         )
     }
 
-    pub fn start_session(&mut self, scope: &Scope, policy: CapturePolicy) -> Result<Session> {
-        let named = matches!(scope, Scope::Pid(_));
-        start_retained_with(self, named, process::stale_view_ids, |plan, pinned| {
-            Session::start(plan, scope, pinned, policy, None)
-        })
+    pub fn start_session(&mut self, policy: CapturePolicy) -> Result<Session> {
+        let retained_scope = self.scope.clone();
+        let named = matches!(retained_scope, Scope::Pid(_));
+        let scope = &retained_scope;
+        let mut session =
+            start_retained_with(self, named, process::stale_view_ids, |plan, pinned| {
+                Session::start(plan, scope, pinned, policy, None)
+            })?;
+        for position in 0..self.views.len() {
+            if self.arm_loader_for_view(position, &mut session).is_err() {
+                self.mark_partial(
+                    "live loader arming",
+                    "an existing retained view could not be armed exactly",
+                );
+            }
+        }
+        record_object_skips(&mut self.plan, &self.counters.object_skips);
+        self.discovery = discovery_evidence(&self.plan, &self.pinned, &self.counters);
+        Ok(session)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{Kind, ScopeArg};
     use crate::discovery::identity::{
         ManifestPinError, ManifestStaleReason, PinnedObjectId, ReconciledModule,
         pin_manifest_objects, pin_manifest_objects_deferred, pin_scanned_objects,
@@ -1908,6 +3236,215 @@ mod tests {
     use std::cell::Cell;
     use std::os::unix::fs::MetadataExt as _;
     use std::path::PathBuf;
+
+    #[test]
+    fn engine_lowers_export_table_owner_and_prefix() {
+        use p11scope_ebpf_common::{
+            DISCOVERY_KIND_FUNCTION_LIST_RETURN, DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN,
+            DISCOVERY_STATUS_READ_FAILURE, DiscoveryRecord,
+        };
+        use p11scope_manifest::maps::{MappedPath, Resolved, parse_maps, resolve};
+
+        let view = ProcessView::open(ProcessViewId(41), std::process::id()).unwrap();
+        let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let executable = executable.canonicalize().unwrap_or(executable);
+        let owner = maps
+            .iter()
+            .find(|mapping| {
+                mapping.inode != 0
+                    && mapping.permissions[0] == b'r'
+                    && mapping.permissions[2] != b'x'
+                    && matches!(
+                        resolve(&maps, mapping.start),
+                        Resolved::File {
+                            path: MappedPath::Usable(ref path),
+                            ..
+                        } if path == &executable
+                    )
+            })
+            .expect("the test executable has a file-backed data mapping");
+        let code = maps
+            .iter()
+            .find(|mapping| {
+                mapping.inode == owner.inode
+                    && mapping.device == owner.device
+                    && mapping.permissions[2] == b'x'
+            })
+            .expect("the test executable has a matching code mapping");
+
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+        record.symbol_id = 1;
+        record.table_ptr = owner.start;
+        record.version_major = 2;
+        record.version_minor = 40;
+        record.pointers[0] = code.start;
+        record.pointers_attempted = 1;
+        record.completed_prefix = 1;
+        record.usable_n = 1;
+
+        let hooks = crate::discovery::hooks::HookRegistry::builtin();
+        let limits = ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        };
+        let mut budget = CaptureWorkBudget::new(limits);
+        let lowered = lower_export_record(&view, &maps, &hooks, &record, &mut budget)
+            .expect("the structurally valid record lowers")
+            .expect("one usable pointer gives one table");
+        assert_eq!(lowered.view, view.id());
+        assert_eq!(lowered.key, ObjectKey::of(owner));
+        assert_eq!(lowered.tables.len(), 1);
+        assert_eq!(lowered.tables[0].entries.len(), 1);
+        assert_eq!(lowered.tables[0].entries[0].object, ObjectKey::of(code));
+
+        let mut interface_record = record;
+        interface_record.kind = DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN;
+        interface_record.symbol_id = 2;
+        interface_record.table_ptr += 8;
+        interface_record.interface_index = 3;
+        interface_record.announced_count = 4;
+        interface_record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        let interface = lower_export_record(&view, &maps, &hooks, &interface_record, &mut budget)
+            .unwrap()
+            .unwrap();
+        let mut merged = vec![lowered.clone()];
+        merge_scanned_module(&mut merged, interface);
+        assert_eq!(merged[0].interfaces[0].table, Some(1));
+
+        let mut wrong_hook = record;
+        wrong_hook.symbol_id = 2;
+        assert!(
+            lower_export_record(&view, &maps, &hooks, &wrong_hook, &mut budget).is_err(),
+            "the retained symbol ABI must agree with the record kind"
+        );
+        wrong_hook.symbol_id = u32::MAX;
+        assert!(
+            lower_export_record(&view, &maps, &hooks, &wrong_hook, &mut budget).is_err(),
+            "unknown private symbol IDs have no hook authority"
+        );
+
+        let (mut pins, skipped) =
+            pin_scanned_objects(view.pid(), std::slice::from_ref(&lowered), &mut budget).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let reconciled = reconcile_for_test(&[lowered], &mut pins);
+        assert_eq!(
+            plan::build_from_reconciled_modules(&reconciled).slots.len(),
+            1
+        );
+
+        record.status_flags = DISCOVERY_STATUS_READ_FAILURE;
+        record.usable_n = 0;
+        assert!(
+            lower_export_record(&view, &maps, &hooks, &record, &mut budget)
+                .expect("the completed raw prefix is structurally valid")
+                .is_none(),
+            "a read-failed completed prefix is not target authority"
+        );
+
+        record.status_flags = 0;
+        record.usable_n = 1;
+        record.table_ptr = maps
+            .iter()
+            .find(|mapping| mapping.inode == 0 && mapping.permissions[0] == b'r')
+            .expect("this process has an anonymous readable mapping")
+            .start;
+        assert!(
+            lower_export_record(&view, &maps, &hooks, &record, &mut budget)
+                .expect("an anonymous table owner is a count-only outcome")
+                .is_none(),
+            "an anonymous mapping cannot own a live table"
+        );
+    }
+
+    #[test]
+    fn post_session_rebuild_preserves_canonical_ids() {
+        let (modules, canonical) = pinned_self();
+        let original = canonical
+            .id_for_scanned(&modules[0], modules[0].key, &modules[0].path)
+            .unwrap();
+        let (_, incoming) = pinned_self();
+        let mut engine = Engine::empty();
+        engine.pinned = canonical;
+        let mut candidate_pins = engine.pinned.clone();
+        let skipped = candidate_pins.absorb(incoming);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let candidate = engine
+            .live_candidate(candidate_pins, modules.clone(), skipped)
+            .unwrap();
+        assert_eq!(
+            candidate
+                .pinned
+                .id_for_scanned(&modules[0], modules[0].key, &modules[0].path)
+                .unwrap(),
+            original,
+            "an exact post-session observation reuses the canonical object ID"
+        );
+        assert_eq!(
+            engine.pinned.pinned().count(),
+            candidate.pinned.pinned().count()
+        );
+
+        let mut preserved = engine.pinned.clone();
+        assert!(
+            preserved
+                .replace_view_pins(modules[0].view, PinnedObjects::empty(), &[original])
+                .is_empty()
+        );
+        assert_eq!(
+            preserved.id_for_scanned(&modules[0], modules[0].key, &modules[0].path),
+            Some(original),
+            "an active loader context can retain its exact pin across a view rescan"
+        );
+    }
+
+    #[test]
+    fn manifest_pins_are_not_rehashed_by_event() {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        use std::os::fd::AsRawFd as _;
+
+        let exe = std::env::current_exe().unwrap();
+        let pins = pin_as_manifest_object(exe.to_str().unwrap());
+        let id = pins.pinned().next().unwrap().id;
+        let file = pins
+            .file_for(id)
+            .expect("the manifest pin retains its opened file");
+        let before = file.metadata().unwrap().ino();
+        let mut borrowed = file;
+        borrowed.seek(SeekFrom::Start(0)).unwrap();
+        let mut magic = [0; 4];
+        borrowed.read_exact(&mut magic).unwrap();
+        assert_eq!(&magic, b"\x7fELF");
+        assert_eq!(file.metadata().unwrap().ino(), before);
+        let retained_fd = file.as_raw_fd();
+        assert!(pins.check_unchanged().unwrap());
+
+        let mut engine = Engine::empty();
+        engine.pinned = pins;
+        let candidate = engine
+            .live_candidate(engine.pinned.clone(), Vec::new(), Vec::new())
+            .unwrap();
+        assert_eq!(
+            candidate.pinned.file_for(id).unwrap().as_raw_fd(),
+            retained_fd,
+            "an event candidate shares the retained manifest descriptor"
+        );
+    }
+
+    #[test]
+    fn scope_refresh_uses_engine_owned_scope_and_monotonic_view_ids() {
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Pid(std::process::id());
+        let first = engine.allocate_view_id().unwrap();
+        let second = engine.allocate_view_id().unwrap();
+        assert_eq!((first, second), (ProcessViewId(0), ProcessViewId(1)));
+        assert_eq!(scope_pids(&engine.scope).0, vec![std::process::id()]);
+
+        engine.next_view_id = MAX_SCAN_PIDS as u32;
+        assert!(engine.allocate_view_id().is_err());
+        assert_eq!(engine.next_view_id, MAX_SCAN_PIDS as u32);
+    }
 
     fn current_mount_namespace() -> crate::process::MountNamespaceId {
         let metadata = std::fs::metadata("/proc/self/ns/mnt").unwrap();
@@ -3341,22 +4878,15 @@ mod tests {
             per_object_bytes: scan_bytes.max(hash_bytes),
             total_bytes: scan_bytes + hash_bytes,
         });
-        let args = CaptureArgs {
-            kind: Kind::Profile,
-            modules: vec![exe],
-            manifests: vec![],
-            hooks: crate::discovery::hooks::HookRegistry::builtin(),
-            scope: ScopeArg::Pid(std::process::id()),
-            metrics: false,
-            duration: None,
-            out: None,
-            unsafe_requested: false,
-        };
+        let hints = vec![exe];
+        let hooks = HookRegistry::builtin();
         let mut counters = DiscoveryCounters::default();
         let first_view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
-        let (_, first) = scan_and_pin(&first_view, &args, &mut budget, &mut counters).unwrap();
+        let (_, first) =
+            scan_and_pin(&first_view, &hints, &hooks, &mut budget, &mut counters).unwrap();
         let second_view = ProcessView::open(ProcessViewId(1), std::process::id()).unwrap();
-        let (_, second) = scan_and_pin(&second_view, &args, &mut budget, &mut counters).unwrap();
+        let (_, second) =
+            scan_and_pin(&second_view, &hints, &hooks, &mut budget, &mut counters).unwrap();
         assert_eq!(first.pinned().count(), 1);
         assert_eq!(
             second.pinned().count(),

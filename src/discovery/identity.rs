@@ -333,6 +333,88 @@ impl PinnedObjects {
             .ok_or_else(|| format!("object {id:?} was not pinned"))
     }
 
+    /// Borrows the already-opened object behind a canonical capture-local ID.
+    /// Live discovery uses this for ELF facts without reopening a pathname or
+    /// recomputing the pin's identity digest.
+    pub(crate) fn file_for(&self, id: PinnedObjectId) -> Option<&std::fs::File> {
+        self.by_id.get(&id).map(|entry| entry.file.as_ref())
+    }
+
+    /// Replaces the raw ownership for one retained process generation while
+    /// keeping exact canonical entries available for ID reuse. The incoming
+    /// pin set was built through the same `ProcessView`; unequal full identity
+    /// for an equal raw key therefore follows the ordinary collision path.
+    pub(crate) fn replace_view_pins(
+        &mut self,
+        view: ProcessViewId,
+        incoming: PinnedObjects,
+        preserve: &[PinnedObjectId],
+    ) -> Vec<Skipped> {
+        self.ownership.remove(&view);
+        let preserved: BTreeSet<_> = preserve.iter().copied().collect();
+        let preserved_raws: BTreeSet<_> = self
+            .raw_ownership
+            .remove(&view)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|raw| {
+                self.raw_to_id
+                    .get(raw)
+                    .is_some_and(|id| preserved.contains(id))
+            })
+            .collect();
+        let skipped = self.absorb(incoming);
+        let preserved_raws: BTreeSet<_> = preserved_raws
+            .into_iter()
+            .filter(|raw| {
+                self.raw_to_id
+                    .get(raw)
+                    .is_some_and(|id| preserved.contains(id))
+            })
+            .collect();
+        if !preserved_raws.is_empty() {
+            self.raw_ownership
+                .entry(view)
+                .or_default()
+                .extend(preserved_raws);
+            self.ownership
+                .entry(view)
+                .or_default()
+                .pins
+                .extend(preserved.iter().filter(|id| self.by_id.contains_key(id)));
+        }
+
+        let retained_raws: BTreeSet<_> = self
+            .raw_ownership
+            .values()
+            .flatten()
+            .cloned()
+            .chain(
+                self.raw_to_id
+                    .keys()
+                    .filter(|raw| raw.mount_namespace.is_none())
+                    .cloned(),
+            )
+            .collect();
+        self.raw_to_id.retain(|raw, _| retained_raws.contains(raw));
+        let retained_ids: BTreeSet<_> = self.raw_to_id.values().copied().collect();
+        self.by_id.retain(|id, _| retained_ids.contains(id));
+        skipped
+    }
+
+    /// Clears plan-derived table/target claims before the canonical raw module
+    /// set is rebound. Opened pin ownership remains intact.
+    pub(crate) fn reset_derived_claims(&mut self) {
+        for claims in self.ownership.values_mut() {
+            claims.tables.clear();
+            claims.targets.clear();
+        }
+    }
+
+    pub(crate) fn rejects(&self, key: ObjectKey) -> bool {
+        self.rejected_keys.contains(&key)
+    }
+
     /// Every pinned object, for `discovery[]`.
     pub fn pinned(&self) -> impl Iterator<Item = PinnedSummary<'_>> {
         self.by_id.iter().map(|(id, entry)| PinnedSummary {

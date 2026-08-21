@@ -1,19 +1,24 @@
 //! Loading and attaching. One selected entry uprobe + one uretprobe serve
 //! each slot; the attach cookie carries the slot index.
 
-use crate::discovery::identity::PinnedObjects;
+use crate::discovery::hooks::HookAbi;
+use crate::discovery::identity::{PinnedObjectId, PinnedObjects};
+use crate::discovery::loader::LoaderContextId;
 use crate::events;
 use crate::plan::{AttachPlan, Slot};
 use anyhow::{Context as _, Result, anyhow, bail};
 use aya::Ebpf;
-use aya::maps::{Array, HashMap, Map, MapType, ProgramArray};
+use aya::maps::{Array, HashMap, Map, MapType, PerCpuArray, ProgramArray};
 use aya::programs::trace_point::TracePointLinkId;
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeLinkId, UProbeScope};
 use aya::programs::{TracePoint, UProbe};
 use p11scope_ebpf_common::{
-    ARG_NONE, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
-    FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, FUNCTION_NAME_MAX_BYTES, FunctionNameKey,
-    MAX_DESCRIPTORS, PAUSE_ARMED, PauseKey, SlotSemantics, attach_cookie,
+    ARG_NONE, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
+    DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
+    DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
+    FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED, FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
+    FUNCTION_NAME_MAX_BYTES, FunctionNameKey, MAX_DESCRIPTORS, PAUSE_ARMED, PauseKey,
+    SlotSemantics, attach_cookie,
 };
 use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -344,8 +349,8 @@ enum ProducerProgram {
     TracePoint(&'static str),
 }
 
-/// One link whose lifetime this session owns. Task 5 extends this same list for
-/// its loader/export programs; Task 4 only records programs that already exist.
+/// One link whose lifetime this session owns. Static, loader/export, and
+/// lifecycle links all remain in this one registry.
 enum RegisteredLink {
     UProbe {
         program: &'static str,
@@ -356,12 +361,22 @@ enum RegisteredLink {
         program: &'static str,
         id: TracePointLinkId,
     },
+    DynamicUProbe {
+        program: &'static str,
+        context: LoaderContextId,
+        object: PinnedObjectId,
+        file_offset: u64,
+        cookie: u64,
+        id: UProbeLinkId,
+    },
 }
 
 impl RegisteredLink {
     fn producer(&self) -> ProducerProgram {
         match self {
-            Self::UProbe { program, .. } => ProducerProgram::UProbe(program),
+            Self::UProbe { program, .. } | Self::DynamicUProbe { program, .. } => {
+                ProducerProgram::UProbe(program)
+            }
             Self::TracePoint { program, .. } => ProducerProgram::TracePoint(program),
         }
     }
@@ -369,9 +384,49 @@ impl RegisteredLink {
     fn slot(&self) -> Option<u32> {
         match self {
             Self::UProbe { slot, .. } => Some(*slot),
-            Self::TracePoint { .. } => None,
+            Self::TracePoint { .. } | Self::DynamicUProbe { .. } => None,
         }
     }
+
+    fn context(&self) -> Option<LoaderContextId> {
+        match self {
+            Self::DynamicUProbe { context, .. } => Some(*context),
+            Self::UProbe { .. } | Self::TracePoint { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CounterSnapshot {
+    pub(crate) ring_loss: u64,
+    pub(crate) export_state_failures: u64,
+    pub(crate) export_bounded_read_failures: u64,
+    pub(crate) loader_hits: u64,
+    pub(crate) loader_state_read_failures: u64,
+}
+
+impl CounterSnapshot {
+    pub(crate) fn replace_with(&mut self, next: Self) -> bool {
+        let nondecreasing = next.ring_loss >= self.ring_loss
+            && next.export_state_failures >= self.export_state_failures
+            && next.export_bounded_read_failures >= self.export_bounded_read_failures
+            && next.loader_hits >= self.loader_hits
+            && next.loader_state_read_failures >= self.loader_state_read_failures;
+        if nondecreasing {
+            *self = next;
+        }
+        nondecreasing
+    }
+}
+
+fn counter_snapshot_with(mut read: impl FnMut(u32) -> Result<u64>) -> Result<CounterSnapshot> {
+    Ok(CounterSnapshot {
+        ring_loss: read(DISCOVERY_COUNTER_RING_LOSS)?,
+        export_state_failures: read(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES)?,
+        export_bounded_read_failures: read(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES)?,
+        loader_hits: read(DISCOVERY_COUNTER_LOADER_HITS)?,
+        loader_state_read_failures: read(DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES)?,
+    })
 }
 
 #[cfg(test)]
@@ -868,6 +923,16 @@ impl Session {
                 id,
             });
         }
+        for program in ["sched_process_exec", "sched_process_exit"] {
+            let tracepoint: &mut TracePoint = ebpf
+                .program_mut(program)
+                .with_context(|| format!("program {program} missing from object"))?
+                .try_into()?;
+            let id = tracepoint
+                .attach("sched", program)
+                .with_context(|| format!("attaching {program}"))?;
+            links.push(RegisteredLink::TracePoint { program, id });
+        }
 
         Ok(Self {
             ebpf,
@@ -879,6 +944,216 @@ impl Session {
             pause_key,
             links,
         })
+    }
+
+    pub(crate) fn counter_snapshot(&self) -> Result<CounterSnapshot> {
+        let counters: PerCpuArray<_, u64> =
+            PerCpuArray::try_from(self.ebpf.map("COUNTERS").context("COUNTERS map")?)?;
+        let read = |index| -> Result<u64> {
+            Ok(counters
+                .get(&index, 0)?
+                .iter()
+                .copied()
+                .fold(0u64, u64::saturating_add))
+        };
+        counter_snapshot_with(read)
+    }
+
+    pub(crate) fn preflight_targets(
+        &self,
+        targets: &[Slot],
+        objects: &PinnedObjects,
+    ) -> Result<()> {
+        if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
+            bail!("a pinned provider object changed before live attachment");
+        }
+        for target in targets {
+            objects
+                .attach_path_for(target.object)
+                .map_err(anyhow::Error::msg)?;
+            let _ = attach_cookie(target.index, target.descriptor_index);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn attach_dynamic_loader(
+        &mut self,
+        context: LoaderContextId,
+        pid: u32,
+        object: PinnedObjectId,
+        file_offset: u64,
+        cookie: u64,
+        objects: &PinnedObjects,
+    ) -> Result<()> {
+        if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
+            bail!("a pinned loader object changed before dynamic attach");
+        }
+        if self.has_dynamic_link(context, "dl_debug_state", object, file_offset, cookie) {
+            return Ok(());
+        }
+        let path = objects
+            .attach_path_for(object)
+            .map_err(anyhow::Error::msg)?;
+        let point = UProbeAttachPoint {
+            location: UProbeAttachLocation::AbsoluteOffset(file_offset),
+            cookie: Some(cookie),
+        };
+        let program = "dl_debug_state";
+        let probe: &mut UProbe = self
+            .ebpf
+            .program_mut(program)
+            .with_context(|| format!("program {program} missing from object"))?
+            .try_into()?;
+        let scope = UProbeScope::OneProcess(
+            std::num::NonZeroU32::new(pid).context("dynamic loader PID must be non-zero")?,
+        );
+        match probe.attach(point, &path, scope) {
+            Ok(id) => {
+                self.links.push(RegisteredLink::DynamicUProbe {
+                    program,
+                    context,
+                    object,
+                    file_offset,
+                    cookie,
+                    id,
+                });
+                self.attached += 1;
+                Ok(())
+            }
+            Err(error) => {
+                let message = format!(
+                    "{program} at object {:?}+{file_offset:#x}: {}",
+                    object,
+                    error_chain(&error)
+                );
+                Err(anyhow!(message))
+            }
+        }
+    }
+
+    pub(crate) fn attach_dynamic_export(
+        &mut self,
+        context: LoaderContextId,
+        pid: u32,
+        target: (PinnedObjectId, u64),
+        cookie: u64,
+        abi: HookAbi,
+        objects: &PinnedObjects,
+    ) -> Result<()> {
+        let (object, file_offset) = target;
+        if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
+            bail!("a pinned export object changed before dynamic attach");
+        }
+        let (entry_program, return_program) = match abi {
+            HookAbi::FunctionList => ("function_list_entry", "function_list_return"),
+            HookAbi::InterfaceList => ("interface_list_entry", "interface_list_return"),
+            HookAbi::Interface => ("interface_entry", "interface_return"),
+        };
+        if self.has_dynamic_link(context, return_program, object, file_offset, cookie) {
+            return Ok(());
+        }
+        let path = objects
+            .attach_path_for(object)
+            .map_err(anyhow::Error::msg)?;
+        let point = || UProbeAttachPoint {
+            location: UProbeAttachLocation::AbsoluteOffset(file_offset),
+            cookie: Some(cookie),
+        };
+        let scope = UProbeScope::OneProcess(
+            std::num::NonZeroU32::new(pid).context("dynamic export PID must be non-zero")?,
+        );
+        let return_id = {
+            let probe: &mut UProbe = self
+                .ebpf
+                .program_mut(return_program)
+                .with_context(|| format!("program {return_program} missing from object"))?
+                .try_into()?;
+            probe.attach(point(), &path, scope).map_err(|error| {
+                anyhow!(
+                    "{return_program} at object {:?}+{file_offset:#x}: {}",
+                    object,
+                    error_chain(&error)
+                )
+            })?
+        };
+        let entry_id = {
+            let probe: &mut UProbe = self
+                .ebpf
+                .program_mut(entry_program)
+                .with_context(|| format!("program {entry_program} missing from object"))?
+                .try_into()?;
+            match probe.attach(point(), &path, scope) {
+                Ok(id) => id,
+                Err(error) => {
+                    let message = format!(
+                        "{entry_program} at object {:?}+{file_offset:#x}: {}",
+                        object,
+                        error_chain(&error)
+                    );
+                    let probe: &mut UProbe = self
+                        .ebpf
+                        .program_mut(return_program)
+                        .with_context(|| {
+                            format!("program {return_program} missing during partial detach")
+                        })?
+                        .try_into()?;
+                    if let Err(error) = probe.detach(return_id) {
+                        self.detach_failures.push(format!(
+                            "detaching partial {return_program}: {}",
+                            error_chain(&error)
+                        ));
+                    }
+                    return Err(anyhow!(message));
+                }
+            }
+        };
+        // Register entry first so selective and terminal drains stop new state
+        // before removing the matching return consumer.
+        for (program, id) in [(entry_program, entry_id), (return_program, return_id)] {
+            self.links.push(RegisteredLink::DynamicUProbe {
+                program,
+                context,
+                object,
+                file_offset,
+                cookie,
+                id,
+            });
+        }
+        self.attached += 2;
+        Ok(())
+    }
+
+    fn has_dynamic_link(
+        &self,
+        context: LoaderContextId,
+        program: &'static str,
+        object: PinnedObjectId,
+        file_offset: u64,
+        cookie: u64,
+    ) -> bool {
+        self.links.iter().any(|link| {
+            matches!(
+                link,
+                RegisteredLink::DynamicUProbe {
+                    program: linked_program,
+                    context: linked_context,
+                    object: linked_object,
+                    file_offset: linked_offset,
+                    cookie: linked_cookie,
+                    ..
+                } if *linked_program == program
+                    && *linked_context == context
+                    && *linked_object == object
+                    && *linked_offset == file_offset
+                    && *linked_cookie == cookie
+            )
+        })
+    }
+
+    pub(crate) fn detach_dynamic_context(&mut self, context: LoaderContextId) -> bool {
+        let failures = self.detach_failures.len();
+        let _ = self.detach_links(|link| link.context() == Some(context), false);
+        self.detach_failures.len() != failures
     }
 
     /// Attaches every active target that this session has not already linked.
@@ -1050,7 +1325,12 @@ impl Session {
         let live_attached = self
             .links
             .iter()
-            .filter(|link| matches!(link, RegisteredLink::UProbe { .. }))
+            .filter(|link| {
+                matches!(
+                    link,
+                    RegisteredLink::UProbe { .. } | RegisteredLink::DynamicUProbe { .. }
+                )
+            })
             .count();
 
         let mut first_error = None;
@@ -1093,6 +1373,16 @@ impl Session {
                     .detach(id)
                     .with_context(|| format!("detaching {program}"))
             })(),
+            RegisteredLink::DynamicUProbe { program, id, .. } => (|| {
+                let probe: &mut UProbe = self
+                    .ebpf
+                    .program_mut(program)
+                    .with_context(|| format!("program {program} missing during detach"))?
+                    .try_into()?;
+                probe
+                    .detach(id)
+                    .with_context(|| format!("detaching {program}"))
+            })(),
         }
     }
 
@@ -1100,7 +1390,6 @@ impl Session {
         events::Drain::new(&mut self.ebpf)
     }
 
-    #[allow(dead_code)] // Task 6 owns the first caller.
     pub(crate) fn discovery_drain(&mut self) -> Result<events::DiscoveryDrain<'_>> {
         events::DiscoveryDrain::new(&mut self.ebpf)
     }
@@ -1254,6 +1543,80 @@ mod tests {
             fork_safe: false,
             module_ids: vec![crate::plan::ModuleId(0)],
         }
+    }
+
+    #[test]
+    fn failed_dynamic_detach_is_sticky_and_blocks_replacement() {
+        let attempted = std::cell::RefCell::new(Vec::new());
+        let errors = detach_selected_with(
+            vec![
+                (ProducerProgram::UProbe("dynamic"), 1u8),
+                (ProducerProgram::UProbe("dynamic"), 2),
+            ],
+            |link| {
+                attempted.borrow_mut().push(link);
+                if link == 1 {
+                    anyhow::bail!("injected dynamic detach failure")
+                }
+                Ok(())
+            },
+        );
+
+        assert_eq!(*attempted.borrow(), [1, 2], "every detach is one-shot");
+        assert_eq!(errors.len(), 1);
+
+        let replacement_attempted = std::cell::Cell::new(false);
+        if errors.is_empty() {
+            replacement_attempted.set(true);
+        }
+        assert!(
+            !replacement_attempted.get(),
+            "no replacement may follow a failed detach in the same cycle"
+        );
+    }
+
+    #[test]
+    fn discovery_counter_snapshots_are_absolute_and_regressions_fail_closed() {
+        let cells: [&[u64]; 5] = [&[1, 2], &[3, 4], &[5, 6], &[7, 8], &[9, 10]];
+        let first = counter_snapshot_with(|index| {
+            Ok(cells[index as usize]
+                .iter()
+                .copied()
+                .fold(0u64, u64::saturating_add))
+        })
+        .unwrap();
+        assert_eq!(first.ring_loss, 3);
+        assert_eq!(first.export_state_failures, 7);
+        assert_eq!(first.export_bounded_read_failures, 11);
+        assert_eq!(first.loader_hits, 15);
+        assert_eq!(first.loader_state_read_failures, 19);
+
+        let mut retained = CounterSnapshot::default();
+        assert!(retained.replace_with(first));
+        assert_eq!(retained, first);
+        let cells: [&[u64]; 5] = [&[2, 2], &[4, 4], &[6, 6], &[8, 8], &[10, 10]];
+        let next = counter_snapshot_with(|index| {
+            Ok(cells[index as usize]
+                .iter()
+                .copied()
+                .fold(0u64, u64::saturating_add))
+        })
+        .unwrap();
+        assert!(retained.replace_with(next));
+        assert_eq!(
+            retained.loader_hits, 16,
+            "absolute values are replaced, not added"
+        );
+
+        let decreased = CounterSnapshot {
+            ring_loss: next.ring_loss - 1,
+            ..next
+        };
+        assert!(!retained.replace_with(decreased));
+        assert_eq!(
+            retained, next,
+            "a regressing cell retains the prior authority"
+        );
     }
 
     #[test]

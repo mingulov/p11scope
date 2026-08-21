@@ -1,6 +1,7 @@
+#[cfg(test)]
+use p11scope_ebpf_common::{LOADER_CONTEXT_ID_MASK, valid_loader_cookie};
 use p11scope_ebpf_common::{
-    LOADER_CONTEXT_ID_MASK, LOADER_STATE_ABSENT_SENTINEL, LOADER_STATE_PRESENT, LOADER_STATE_SHIFT,
-    valid_loader_cookie,
+    LOADER_STATE_ABSENT_SENTINEL, LOADER_STATE_PRESENT, LOADER_STATE_SHIFT,
 };
 use p11scope_manifest::elf::SymbolFact;
 use p11scope_manifest::maps::MapEntry;
@@ -9,27 +10,27 @@ use crate::discovery::identity::PinnedObjectId;
 use crate::process::ProcessViewId;
 
 pub(crate) const MAX_LOADER_CONTEXTS: usize = 256;
-#[allow(dead_code, reason = "remove in Task 6 checkpoint D")]
 const MIN_STATE_DELTA: i64 = -(1_i64 << 54);
-#[allow(dead_code, reason = "remove in Task 6 checkpoint D")]
 const MAX_STATE_DELTA: i64 = (1_i64 << 54) - 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code, reason = "remove in Task 6 checkpoint D")]
 pub(crate) struct LoaderContextId(u16);
 
-#[allow(dead_code, reason = "remove in Task 6 checkpoint D")]
 impl LoaderContextId {
     pub(crate) fn get(self) -> u16 {
         self.0
     }
 
-    pub(crate) fn case_id(self) -> u8 {
+    #[cfg(test)]
+    fn case_id(self) -> u8 {
         (self.0 - 1) as u8
+    }
+
+    pub(crate) fn from_case_id(case_id: u8) -> Self {
+        Self(u16::from(case_id) + 1)
     }
 }
 
-#[allow(dead_code, reason = "remove in Task 6 checkpoint D")]
 pub(crate) fn encode_loader_cookie(
     context_id: u16,
     state_delta: Option<i64>,
@@ -49,8 +50,8 @@ pub(crate) fn encode_loader_cookie(
     }
 }
 
-#[allow(dead_code, reason = "remove in Task 6 checkpoint D")]
-pub(crate) fn decode_loader_cookie(cookie: u64) -> Result<(LoaderContextId, Option<i64>), String> {
+#[cfg(test)]
+fn decode_loader_cookie(cookie: u64) -> Result<(LoaderContextId, Option<i64>), String> {
     if !valid_loader_cookie(cookie) {
         return Err(format!("invalid loader cookie {cookie:#x}"));
     }
@@ -61,7 +62,6 @@ pub(crate) fn decode_loader_cookie(cookie: u64) -> Result<(LoaderContextId, Opti
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code, reason = "remove in Task 6 checkpoint D")]
 pub(crate) struct LoaderContextSpec {
     pub(crate) view: ProcessViewId,
     pub(crate) loader: PinnedObjectId,
@@ -71,7 +71,6 @@ pub(crate) struct LoaderContextSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code, reason = "remove in Task 6 checkpoint D")]
 enum LoaderContextState {
     Prepared,
     Attached,
@@ -79,7 +78,6 @@ enum LoaderContextState {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code, reason = "remove in Task 6 checkpoint D")]
 pub(crate) struct LoaderContext {
     pub(crate) spec: LoaderContextSpec,
     pub(crate) cookie: u64,
@@ -108,7 +106,6 @@ impl Default for LoaderRegistry {
 }
 
 impl LoaderRegistry {
-    #[allow(dead_code, reason = "remove in Task 6 checkpoint D")]
     pub(crate) fn prepare(&mut self, spec: LoaderContextSpec) -> Result<LoaderContextId, String> {
         if self.allocated == MAX_LOADER_CONTEXTS {
             self.discovery_truncated = self.discovery_truncated.saturating_add(1);
@@ -146,12 +143,10 @@ impl LoaderRegistry {
         Ok(id)
     }
 
-    #[allow(dead_code, reason = "remove in Task 6 checkpoint D")]
     pub(crate) fn context(&self, id: LoaderContextId) -> Option<&LoaderContext> {
         self.contexts.get(usize::from(id.get() - 1))?.as_ref()
     }
 
-    #[allow(dead_code, reason = "remove in Task 6 checkpoint D")]
     fn context_mut(&mut self, id: LoaderContextId) -> Result<&mut LoaderContext, String> {
         self.contexts
             .get_mut(usize::from(id.get().saturating_sub(1)))
@@ -159,7 +154,6 @@ impl LoaderRegistry {
             .ok_or_else(|| format!("loader context {} is not active", id.get()))
     }
 
-    #[allow(dead_code, reason = "remove in Task 6 checkpoint D")]
     pub(crate) fn mark_attached(&mut self, id: LoaderContextId) -> Result<(), String> {
         let context = self.context_mut(id)?;
         if context.state != LoaderContextState::Prepared {
@@ -170,7 +164,6 @@ impl LoaderRegistry {
         Ok(())
     }
 
-    #[allow(dead_code, reason = "remove in Task 6 checkpoint D")]
     pub(crate) fn tombstone(&mut self, id: LoaderContextId) -> Result<(), String> {
         let context = self.context_mut(id)?;
         if context.state != LoaderContextState::Attached {
@@ -180,7 +173,15 @@ impl LoaderRegistry {
         Ok(())
     }
 
-    #[allow(dead_code, reason = "remove in Task 6 checkpoint D")]
+    pub(crate) fn cancel_prepared(&mut self, id: LoaderContextId) -> Result<(), String> {
+        let context = self.context_mut(id)?;
+        if context.state != LoaderContextState::Prepared {
+            return Err(format!("loader context {} is not prepared", id.get()));
+        }
+        context.state = LoaderContextState::Tombstoned;
+        Ok(())
+    }
+
     pub(crate) fn remove(&mut self, id: LoaderContextId) -> Result<(), String> {
         let index = usize::from(id.get().saturating_sub(1));
         let context = self
@@ -195,7 +196,6 @@ impl LoaderRegistry {
         Ok(())
     }
 
-    #[allow(dead_code, reason = "remove in Task 6 checkpoint D")]
     pub(crate) fn validate_hit(
         &mut self,
         case_id: u8,
@@ -236,9 +236,25 @@ impl LoaderRegistry {
     pub(crate) fn context_failures(&self) -> u64 {
         self.context_failures
     }
+
+    pub(crate) fn reject_hit(&mut self) {
+        self.context_failures = self.context_failures.saturating_add(1);
+    }
+
+    pub(crate) fn ids_for_view(&self, view: ProcessViewId) -> Vec<LoaderContextId> {
+        self.contexts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, context)| {
+                context
+                    .as_ref()
+                    .filter(|context| context.spec.view == view)
+                    .map(|_| LoaderContextId((index + 1) as u16))
+            })
+            .collect()
+    }
 }
 
-#[allow(dead_code, reason = "remove in Task 6 checkpoint D")]
 fn signed_delta(address: u64, base: u64) -> Result<i64, String> {
     if address >= base {
         i64::try_from(address - base).map_err(|_| "loader state delta overflows i64".into())
@@ -348,7 +364,14 @@ mod tests {
         assert!(registry.tombstone(first).is_err());
         assert!(registry.remove(first).is_err());
 
-        for expected in 2..=MAX_LOADER_CONTEXTS as u16 {
+        let cancelled = registry.prepare(spec(None)).unwrap();
+        assert_eq!(cancelled.get(), 2);
+        registry.cancel_prepared(cancelled).unwrap();
+        assert!(!registry.context(cancelled).unwrap().was_attached);
+        registry.remove(cancelled).unwrap();
+        assert!(registry.context(cancelled).is_none());
+
+        for expected in 3..=MAX_LOADER_CONTEXTS as u16 {
             let id = registry.prepare(spec(None)).unwrap();
             assert_eq!(id.get(), expected);
             registry.mark_attached(id).unwrap();

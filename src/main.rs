@@ -131,10 +131,8 @@ fn cmd_capture(a: CaptureArgs) -> Result<()> {
     }
     let stop = install_stop_flag()?;
     match kind {
-        Kind::Profile => {
-            capture_profile(engine, scope, policy, a.duration, a.out.as_deref(), &stop)
-        }
-        Kind::Trace => capture_trace(engine, scope, policy, a.duration, a.out.as_deref(), &stop),
+        Kind::Profile => capture_profile(engine, policy, a.duration, a.out.as_deref(), &stop),
+        Kind::Trace => capture_trace(engine, policy, a.duration, a.out.as_deref(), &stop),
     }
 }
 
@@ -267,7 +265,6 @@ fn module_label(plan: &plan::AttachPlan) -> String {
 
 fn capture_profile(
     engine: Engine,
-    scope: Scope,
     policy: CapturePolicy,
     duration: Option<Duration>,
     out: Option<&Path>,
@@ -284,19 +281,15 @@ fn capture_profile(
     let mut stdout_sink = std::io::stdout().lock();
     let stdout: &mut dyn Write = &mut stdout_sink;
     let mut session = engine
-        .start_session(&scope, policy)
+        .start_session(policy)
         .context("starting attach session")?;
-    let plan = engine.plan();
-    let pinned = engine.pinned();
-    let discovery = engine.discovery();
-    let module_label = module_label(plan);
     report_attach_failures(&session);
     let profile = policy.uses_events();
     let mode = if profile { "profile" } else { "metrics" };
 
     // Only `--mode profile` decodes the event stream; `--mode metrics` never
     // drains the ring buffer, so it stays the lighter, maps-only level.
-    let mut state = semantics::State::with_policy(plan, policy);
+    let mut state = semantics::State::with_policy(engine.plan(), policy);
     let mut process_tracker = process::Tracker::new();
     if policy.uses_unsafe_decoders() {
         load_mech_shapes(&mut state)?;
@@ -325,9 +318,15 @@ fn capture_profile(
     let wall_start = SystemTime::now();
     let clock = Instant::now();
     loop {
-        pinned.check_unchanged().map_err(anyhow::Error::msg)?;
+        engine
+            .pinned()
+            .check_unchanged()
+            .map_err(anyhow::Error::msg)?;
         let elapsed = clock.elapsed();
         retire_exited(&mut process_tracker, &mut state);
+        if engine.drain_discovery(&mut session)? {
+            state.sync_plan(engine.plan());
+        }
         if should_stop(interrupted, elapsed, duration) {
             break;
         }
@@ -338,20 +337,30 @@ fn capture_profile(
         if !profile {
             kernel_evidence.ring_loss = 0;
         }
-        let reports = metrics::read(&session, plan)?;
+        let reports = metrics::read(&session, engine.plan())?;
         let ev = evidence_for(
-            plan,
+            engine.plan(),
             &session,
             &reports,
             kernel_evidence,
             process_tracker.evidence(),
             malformed_records,
             &state,
-            pinned.provider_changed(),
-            discovery,
+            engine.pinned().provider_changed(),
+            engine.discovery(),
         );
-        let frame = render::live(&reports, &ev, elapsed, &module_label, mode, policy);
-        pinned.check_unchanged().map_err(anyhow::Error::msg)?;
+        let frame = render::live(
+            &reports,
+            &ev,
+            elapsed,
+            &module_label(engine.plan()),
+            mode,
+            policy,
+        );
+        engine
+            .pinned()
+            .check_unchanged()
+            .map_err(anyhow::Error::msg)?;
         write_stdout(
             stdout,
             &mut stdout_open,
@@ -371,27 +380,37 @@ fn capture_profile(
         malformed_records += drain_events(&mut session, &mut state, &mut process_tracker)?;
     }
     retire_exited(&mut process_tracker, &mut state);
-    let reports = metrics::read(&session, plan)?;
+    let reports = metrics::read(&session, engine.plan())?;
     let mut kernel_evidence = metrics::kernel_evidence(&session)?;
     if !profile {
         kernel_evidence.ring_loss = 0;
     }
     // Last look before the evidence that the final frame and the `-o` report
     // are built from, so an in-place provider change is reflected in both.
-    pinned.check_unchanged().map_err(anyhow::Error::msg)?;
+    engine
+        .pinned()
+        .check_unchanged()
+        .map_err(anyhow::Error::msg)?;
     let mut ev = evidence_for(
-        plan,
+        engine.plan(),
         &session,
         &reports,
         kernel_evidence,
         process_tracker.evidence(),
         malformed_records,
         &state,
-        pinned.provider_changed(),
-        discovery,
+        engine.pinned().provider_changed(),
+        engine.discovery(),
     );
     ev.mark_terminal_drain_unproven();
-    let frame = render::live(&reports, &ev, clock.elapsed(), &module_label, mode, policy);
+    let frame = render::live(
+        &reports,
+        &ev,
+        clock.elapsed(),
+        &module_label(engine.plan()),
+        mode,
+        policy,
+    );
     write_stdout(
         stdout,
         &mut stdout_open,
@@ -448,7 +467,6 @@ fn write_json_report(file: &mut std::fs::File, j: &serde_json::Value) -> Result<
 /// enough that folding it into `profile`'s loop would tangle both.
 fn capture_trace(
     engine: Engine,
-    scope: Scope,
     policy: CapturePolicy,
     duration: Option<Duration>,
     out: Option<&Path>,
@@ -469,19 +487,16 @@ fn capture_trace(
     let mut stdout_sink = std::io::stdout().lock();
     let stdout: &mut dyn Write = &mut stdout_sink;
     let mut session = engine
-        .start_session(&scope, policy)
+        .start_session(policy)
         .context("starting attach session")?;
-    let plan = engine.plan();
-    let pinned = engine.pinned();
-    let discovery = engine.discovery();
     report_attach_failures(&session);
 
-    let mut state = semantics::State::with_policy(plan, policy);
+    let mut state = semantics::State::with_policy(engine.plan(), policy);
     let mut process_tracker = process::Tracker::new();
     if policy.uses_unsafe_decoders() {
         load_mech_shapes(&mut state)?;
     }
-    let mut tracer = trace::Tracer::new(plan);
+    let mut tracer = trace::Tracer::new(engine.plan());
 
     let mut stdout_open = true;
     let mut malformed_records: u64 = 0;
@@ -494,8 +509,15 @@ fn capture_trace(
         out_file,
     )?;
     loop {
-        pinned.check_unchanged().map_err(anyhow::Error::msg)?;
+        engine
+            .pinned()
+            .check_unchanged()
+            .map_err(anyhow::Error::msg)?;
         let elapsed = clock.elapsed();
+        if engine.drain_discovery(&mut session)? {
+            state.sync_plan(engine.plan());
+            tracer.sync_plan(engine.plan());
+        }
         if should_stop(interrupted, elapsed, duration) {
             break;
         }
@@ -509,7 +531,10 @@ fn capture_trace(
             out_file,
         )?;
         retire_exited(&mut process_tracker, &mut state);
-        pinned.check_unchanged().map_err(anyhow::Error::msg)?;
+        engine
+            .pinned()
+            .check_unchanged()
+            .map_err(anyhow::Error::msg)?;
         report_trace_loss(
             &session,
             &mut last_reported_loss,
@@ -541,7 +566,10 @@ fn capture_trace(
         out_file,
     )?;
     retire_exited(&mut process_tracker, &mut state);
-    pinned.check_unchanged().map_err(anyhow::Error::msg)?;
+    engine
+        .pinned()
+        .check_unchanged()
+        .map_err(anyhow::Error::msg)?;
     report_trace_loss(
         &session,
         &mut last_reported_loss,
@@ -549,20 +577,23 @@ fn capture_trace(
         &mut stdout_open,
         out_file,
     )?;
-    let reports = metrics::read(&session, plan)?;
+    let reports = metrics::read(&session, engine.plan())?;
     // Last look before the evidence line the trace ends with, so an in-place
     // provider change is reflected in it.
-    pinned.check_unchanged().map_err(anyhow::Error::msg)?;
+    engine
+        .pinned()
+        .check_unchanged()
+        .map_err(anyhow::Error::msg)?;
     let mut evidence = evidence_for(
-        plan,
+        engine.plan(),
         &session,
         &reports,
         metrics::kernel_evidence(&session)?,
         process_tracker.evidence(),
         malformed_records,
         &state,
-        pinned.provider_changed(),
-        discovery,
+        engine.pinned().provider_changed(),
+        engine.discovery(),
     );
     evidence.mark_terminal_drain_unproven();
     emit_trace_line(

@@ -988,12 +988,12 @@ impl Session {
         file_offset: u64,
         cookie: u64,
         objects: &PinnedObjects,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!("a pinned loader object changed before dynamic attach");
         }
         if self.has_dynamic_link(context, "dl_debug_state", object, file_offset, cookie) {
-            return Ok(());
+            return Ok(false);
         }
         let path = objects
             .attach_path_for(object)
@@ -1021,7 +1021,7 @@ impl Session {
                     cookie,
                     id,
                 });
-                Ok(())
+                Ok(true)
             }
             Err(error) => {
                 let message = format!(
@@ -1042,7 +1042,7 @@ impl Session {
         cookie: u64,
         abi: HookAbi,
         objects: &PinnedObjects,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let (object, file_offset) = target;
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!("a pinned export object changed before dynamic attach");
@@ -1053,7 +1053,7 @@ impl Session {
             HookAbi::Interface => ("interface_entry", "interface_return"),
         };
         if self.has_dynamic_link(context, return_program, object, file_offset, cookie) {
-            return Ok(());
+            return Ok(false);
         }
         let path = objects
             .attach_path_for(object)
@@ -1122,7 +1122,7 @@ impl Session {
                 id,
             });
         }
-        Ok(())
+        Ok(true)
     }
 
     fn has_dynamic_link(

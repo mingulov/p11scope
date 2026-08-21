@@ -87,6 +87,18 @@ pub(crate) struct LoaderContext {
     pub(crate) earliest_hit_ns: Option<u64>,
 }
 
+#[derive(Debug)]
+pub(crate) struct PreparedLoaderContext {
+    id: LoaderContextId,
+    context: LoaderContext,
+}
+
+impl PreparedLoaderContext {
+    pub(crate) fn cookie(&self) -> u64 {
+        self.context.cookie
+    }
+}
+
 pub(crate) struct LoaderRegistry {
     contexts: [Option<LoaderContext>; MAX_LOADER_CONTEXTS],
     allocated: usize,
@@ -106,9 +118,12 @@ impl Default for LoaderRegistry {
 }
 
 impl LoaderRegistry {
-    pub(crate) fn prepare(&mut self, spec: LoaderContextSpec) -> Result<LoaderContextId, String> {
+    /// Computes every finite context/cookie requirement without changing registry state.
+    pub(crate) fn preflight(
+        &self,
+        spec: LoaderContextSpec,
+    ) -> Result<PreparedLoaderContext, String> {
         if self.allocated == MAX_LOADER_CONTEXTS {
-            self.discovery_truncated = self.discovery_truncated.saturating_add(1);
             return Err("loader context capacity 256 is exhausted".into());
         }
         if spec.mapping.permissions[2] != b'x' || spec.mapping.inode == 0 {
@@ -131,16 +146,42 @@ impl LoaderRegistry {
             .transpose()?;
         let id = LoaderContextId((self.allocated + 1) as u16);
         let cookie = encode_loader_cookie(id.get(), state_delta)?;
-        self.contexts[self.allocated] = Some(LoaderContext {
-            spec,
-            cookie,
-            expected_hook_ip,
-            state: LoaderContextState::Prepared,
-            was_attached: false,
-            earliest_hit_ns: None,
-        });
+        Ok(PreparedLoaderContext {
+            id,
+            context: LoaderContext {
+                spec,
+                cookie,
+                expected_hook_ip,
+                state: LoaderContextState::Prepared,
+                was_attached: false,
+                earliest_hit_ns: None,
+            },
+        })
+    }
+
+    /// Commits a successfully preflighted context. In this single-threaded registry,
+    /// any failure here is an internal lifecycle invariant, not an ordinary refusal.
+    pub(crate) fn prepare(
+        &mut self,
+        prepared: PreparedLoaderContext,
+    ) -> Result<LoaderContextId, String> {
+        let expected = LoaderContextId((self.allocated.saturating_add(1)) as u16);
+        if self.allocated == MAX_LOADER_CONTEXTS
+            || prepared.id != expected
+            || self.contexts[self.allocated].is_some()
+        {
+            return Err("preflighted loader context no longer matches registry state".into());
+        }
+        let id = prepared.id;
+        self.contexts[self.allocated] = Some(prepared.context);
         self.allocated += 1;
         Ok(id)
+    }
+
+    pub(crate) fn record_preflight_failure(&mut self) {
+        if self.allocated == MAX_LOADER_CONTEXTS {
+            self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+        }
     }
 
     pub(crate) fn context(&self, id: LoaderContextId) -> Option<&LoaderContext> {
@@ -299,6 +340,11 @@ mod tests {
         }
     }
 
+    fn prepare(registry: &mut LoaderRegistry, spec: LoaderContextSpec) -> LoaderContextId {
+        let prepared = registry.preflight(spec).unwrap();
+        registry.prepare(prepared).unwrap()
+    }
+
     #[test]
     fn loader_registry_enforces_monotonic_contexts_and_retirement() {
         assert_eq!(encode_loader_cookie(1, None).unwrap(), 512);
@@ -306,7 +352,7 @@ mod tests {
         assert!(decode_loader_cookie(0).is_err());
 
         let mut registry = LoaderRegistry::default();
-        let first = registry.prepare(spec(None)).unwrap();
+        let first = prepare(&mut registry, spec(None));
         assert_eq!(first.get(), 1);
         let context = registry.context(first).unwrap();
         assert_eq!(context.cookie, 512);
@@ -364,7 +410,7 @@ mod tests {
         assert!(registry.tombstone(first).is_err());
         assert!(registry.remove(first).is_err());
 
-        let cancelled = registry.prepare(spec(None)).unwrap();
+        let cancelled = prepare(&mut registry, spec(None));
         assert_eq!(cancelled.get(), 2);
         registry.cancel_prepared(cancelled).unwrap();
         assert!(!registry.context(cancelled).unwrap().was_attached);
@@ -372,13 +418,20 @@ mod tests {
         assert!(registry.context(cancelled).is_none());
 
         for expected in 3..=MAX_LOADER_CONTEXTS as u16 {
-            let id = registry.prepare(spec(None)).unwrap();
+            let id = prepare(&mut registry, spec(None));
             assert_eq!(id.get(), expected);
             registry.mark_attached(id).unwrap();
             registry.tombstone(id).unwrap();
             registry.remove(id).unwrap();
         }
-        assert!(registry.prepare(spec(None)).is_err());
+        let allocated = registry.allocated;
+        let truncated = registry.discovery_truncated();
+        let error = registry.preflight(spec(None)).unwrap_err();
+        assert_eq!(registry.allocated, allocated);
+        assert_eq!(registry.discovery_truncated(), truncated);
+        assert!(registry.ids_for_view(ProcessViewId(7)).is_empty());
+        registry.record_preflight_failure();
+        assert!(error.contains("capacity 256"), "{error}");
         assert_eq!(registry.discovery_truncated(), 1);
         assert_eq!(registry.context_failures(), 1);
     }
@@ -407,7 +460,7 @@ mod tests {
     #[test]
     fn loader_hit_requires_generation_mapping_identity_and_hook_ip() {
         let mut registry = LoaderRegistry::default();
-        let id = registry.prepare(spec(Some(0x2100))).unwrap();
+        let id = prepare(&mut registry, spec(Some(0x2100)));
         assert_eq!(registry.context(id).unwrap().cookie, 256);
         registry.mark_attached(id).unwrap();
 

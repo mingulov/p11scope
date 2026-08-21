@@ -531,6 +531,24 @@ fn entry_program(semantics: &SlotSemantics, policy: CapturePolicy) -> &'static s
 struct AttachOutcome {
     attached: usize,
     failures: Vec<(u32, String)>,
+    completed: Vec<SlotCompletion>,
+}
+
+type SlotCompletion = (u32, Option<u64>);
+type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
+type ReplacementAttachResult = (Vec<SlotCompletion>, bool);
+
+pub(crate) fn monotonic_ns() -> Option<u64> {
+    let mut timestamp = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: `clock_gettime` initializes `timestamp` on success.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, timestamp.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: the successful call above initialized `timestamp`.
+    let timestamp = unsafe { timestamp.assume_init() };
+    let seconds = u64::try_from(timestamp.tv_sec).ok()?;
+    let nanos = u64::try_from(timestamp.tv_nsec).ok()?;
+    seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
 }
 
 /// Keeps the static return-then-entry ordering intact while making the one
@@ -541,9 +559,11 @@ fn attach_targets_with(
     slots: &[Slot],
     policy: CapturePolicy,
     mut attach: impl FnMut(&'static str, &Slot) -> Result<()>,
+    mut completed_at: impl FnMut(&Slot) -> Option<u64>,
 ) -> AttachOutcome {
     let mut attached = 0;
     let mut failures = Vec::new();
+    let mut completed = Vec::new();
     let mut return_attached = BTreeSet::new();
     for slot in slots {
         match attach("p11_return", slot) {
@@ -573,12 +593,19 @@ fn attach_targets_with(
                 continue;
             }
             match attach(program, slot) {
-                Ok(()) => attached += 1,
+                Ok(()) => {
+                    attached += 1;
+                    completed.push((slot.index, completed_at(slot)));
+                }
                 Err(error) => failures.push((slot.index, format!("{error:#}"))),
             }
         }
     }
-    AttachOutcome { attached, failures }
+    AttachOutcome {
+        attached,
+        failures,
+        completed,
+    }
 }
 
 fn standard_async_catalog() -> Result<BTreeMap<FunctionNameKey, u32>> {
@@ -1042,7 +1069,7 @@ impl Session {
         cookie: u64,
         abi: HookAbi,
         objects: &PinnedObjects,
-    ) -> Result<bool> {
+    ) -> Result<(bool, Option<u64>)> {
         let (object, file_offset) = target;
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!("a pinned export object changed before dynamic attach");
@@ -1053,7 +1080,7 @@ impl Session {
             HookAbi::Interface => ("interface_entry", "interface_return"),
         };
         if self.has_dynamic_link(context, return_program, object, file_offset, cookie) {
-            return Ok(false);
+            return Ok((false, None));
         }
         let path = objects
             .attach_path_for(object)
@@ -1122,7 +1149,7 @@ impl Session {
                 id,
             });
         }
-        Ok(true)
+        Ok((true, monotonic_ns()))
     }
 
     fn has_dynamic_link(
@@ -1173,7 +1200,7 @@ impl Session {
             .filter(|slot| plan.is_active(slot.index) && !self.has_slot_link(slot.index))
             .cloned()
             .collect();
-        self.attach_targets(&targets, objects)?;
+        let _ = self.attach_targets(&targets, objects)?;
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!(
                 "a pinned provider object changed while attaching; refusing to observe changed bytes"
@@ -1188,7 +1215,7 @@ impl Session {
         &mut self,
         targets: &[Slot],
         objects: &PinnedObjects,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<TargetAttachResult> {
         let mut requested = BTreeSet::new();
         if let Some(slot) = targets.iter().find(|slot| !requested.insert(slot.index)) {
             bail!("slot {} was requested for attachment twice", slot.index);
@@ -1210,39 +1237,44 @@ impl Session {
         let scope = self.uprobe_scope;
         let ebpf = &mut self.ebpf;
         let links = &mut self.links;
-        let outcome = attach_targets_with(targets, self.policy, |program, slot| {
-            let path = attach_paths
-                .get(&slot.index)
-                .expect("every selected target has a retained pinned path");
-            let point = UProbeAttachPoint {
-                location: UProbeAttachLocation::AbsoluteOffset(slot.file_offset),
-                cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),
-            };
-            let prog: &mut UProbe = ebpf
-                .program_mut(program)
-                .with_context(|| format!("program {program} missing from object"))?
-                .try_into()?;
-            match prog.attach(point, path, scope) {
-                Ok(id) => {
-                    links.push(RegisteredLink::UProbe {
-                        program,
-                        slot: slot.index,
-                        id,
-                    });
-                    Ok(())
+        let outcome = attach_targets_with(
+            targets,
+            self.policy,
+            |program, slot| {
+                let path = attach_paths
+                    .get(&slot.index)
+                    .expect("every selected target has a retained pinned path");
+                let point = UProbeAttachPoint {
+                    location: UProbeAttachLocation::AbsoluteOffset(slot.file_offset),
+                    cookie: Some(attach_cookie(slot.index, slot.descriptor_index)),
+                };
+                let prog: &mut UProbe = ebpf
+                    .program_mut(program)
+                    .with_context(|| format!("program {program} missing from object"))?
+                    .try_into()?;
+                match prog.attach(point, path, scope) {
+                    Ok(id) => {
+                        links.push(RegisteredLink::UProbe {
+                            program,
+                            slot: slot.index,
+                            id,
+                        });
+                        Ok(())
+                    }
+                    Err(error) => Err(anyhow!(
+                        "{program} at {}+{:#x}: {}",
+                        slot.object_path,
+                        slot.file_offset,
+                        error_chain(&error)
+                    )),
                 }
-                Err(error) => Err(anyhow!(
-                    "{program} at {}+{:#x}: {}",
-                    slot.object_path,
-                    slot.file_offset,
-                    error_chain(&error)
-                )),
-            }
-        });
+            },
+            |_| monotonic_ns(),
+        );
         self.attached += outcome.attached;
         let failed: Vec<_> = outcome.failures.iter().map(|(slot, _)| *slot).collect();
         self.attach_failures.extend(outcome.failures);
-        Ok(failed)
+        Ok((failed, outcome.completed))
     }
 
     /// Applies the attachment half of a descriptor downgrade after the caller
@@ -1253,15 +1285,15 @@ impl Session {
         plan: &mut AttachPlan,
         replace: &[Slot],
         objects: &PinnedObjects,
-    ) -> Result<()> {
+    ) -> Result<ReplacementAttachResult> {
         if let Some(slot) = replace.iter().find(|slot| self.has_slot_link(slot.index)) {
             bail!(
                 "replacement slot {} still has an old link; detach and synchronize it before reattach",
                 slot.index
             );
         }
-        let failed: BTreeSet<_> = match self.attach_targets(replace, objects) {
-            Ok(failed) => failed.into_iter().collect(),
+        let (failed, completed) = match self.attach_targets(replace, objects) {
+            Ok(outcome) => outcome,
             Err(error) => {
                 for slot in replace {
                     self.attach_failures
@@ -1271,6 +1303,7 @@ impl Session {
                 return Err(error);
             }
         };
+        let failed: BTreeSet<_> = failed.into_iter().collect();
         let failed_slots: Vec<_> = replace
             .iter()
             .filter(|slot| failed.contains(&slot.index))
@@ -1282,8 +1315,7 @@ impl Session {
         for slot in &failed_slots {
             plan.deactivate(slot.index);
         }
-        detach?;
-        Ok(())
+        Ok((completed, detach.is_err()))
     }
 
     /// Detaches all slot links selected by a finite retirement/replacement
@@ -1618,17 +1650,23 @@ mod tests {
     fn return_failure_suppresses_its_entry_without_blocking_another_slot() {
         let slots = [test_slot(0), test_slot(1)];
         let mut attempted = Vec::new();
-        let outcome = attach_targets_with(&slots, CapturePolicy::Allowlisted, |program, slot| {
-            attempted.push((program, slot.index));
-            if program == "p11_return" && slot.index == 0 {
-                anyhow::bail!("injected return failure")
-            }
-            Ok(())
-        });
+        let outcome = attach_targets_with(
+            &slots,
+            CapturePolicy::Allowlisted,
+            |program, slot| {
+                attempted.push((program, slot.index));
+                if program == "p11_return" && slot.index == 0 {
+                    anyhow::bail!("injected return failure")
+                }
+                Ok(())
+            },
+            |_| Some(10),
+        );
 
         assert_eq!(outcome.attached, 2, "slot 1 gets its entry/return pair");
         assert_eq!(outcome.failures.len(), 1);
         assert_eq!(outcome.failures[0].0, 0);
+        assert_eq!(outcome.completed, [(1, Some(10))]);
         assert_eq!(
             attempted,
             [("p11_return", 0), ("p11_return", 1), ("p11_entry", 1),]
@@ -1636,16 +1674,59 @@ mod tests {
     }
 
     #[test]
+    fn static_slot_completion_is_timestamped_before_later_slot_work() {
+        let slots = [test_slot(0), test_slot(1)];
+        let events = std::cell::RefCell::new(Vec::new());
+        let timestamp = std::cell::Cell::new(20u64);
+        let outcome = attach_targets_with(
+            &slots,
+            CapturePolicy::Allowlisted,
+            |program, slot| {
+                events.borrow_mut().push((program, slot.index));
+                Ok(())
+            },
+            |slot: &Slot| {
+                let now = timestamp.get();
+                timestamp.set(now + 10);
+                events.borrow_mut().push(("completed", slot.index));
+                Some(now)
+            },
+        );
+
+        assert_eq!(outcome.completed, [(0, Some(20)), (1, Some(30))]);
+        assert_eq!(
+            *events.borrow(),
+            [
+                ("p11_return", 0),
+                ("p11_return", 1),
+                ("p11_entry", 0),
+                ("completed", 0),
+                ("p11_entry", 1),
+                ("completed", 1),
+            ],
+            "each completion clock is read immediately after its successful slot pair"
+        );
+    }
+
+    #[test]
     fn replacing_a_slot_recounts_live_attachments_but_terminal_drain_keeps_evidence() {
-        let initial =
-            attach_targets_with(&[test_slot(0)], CapturePolicy::Allowlisted, |_, _| Ok(()));
+        let initial = attach_targets_with(
+            &[test_slot(0)],
+            CapturePolicy::Allowlisted,
+            |_, _| Ok(()),
+            |_| Some(10),
+        );
         assert_eq!(initial.attached, 2);
 
         let after_live_detach = attached_probes_after_detach(initial.attached, 0, false);
         assert_eq!(after_live_detach, 0);
 
-        let replacement =
-            attach_targets_with(&[test_slot(0)], CapturePolicy::Allowlisted, |_, _| Ok(()));
+        let replacement = attach_targets_with(
+            &[test_slot(0)],
+            CapturePolicy::Allowlisted,
+            |_, _| Ok(()),
+            |_| Some(20),
+        );
         let attached_after_replacement = after_live_detach + replacement.attached;
         assert_eq!(attached_after_replacement, 2);
         assert_eq!(

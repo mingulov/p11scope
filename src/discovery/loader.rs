@@ -247,8 +247,53 @@ impl LoaderRegistry {
         timestamp_ns: u64,
     ) -> Result<&LoaderContext, String> {
         let id = LoaderContextId(u16::from(case_id) + 1);
+        self.validate_hit_in_state(
+            id,
+            LoaderContextState::Attached,
+            view,
+            loader,
+            mapping,
+            hook_ip,
+            timestamp_ns,
+        )
+    }
+
+    pub(crate) fn validate_terminal_hit(
+        &mut self,
+        id: LoaderContextId,
+        view: ProcessViewId,
+        loader: PinnedObjectId,
+        mapping: &MapEntry,
+        hook_ip: u64,
+        timestamp_ns: u64,
+    ) -> Result<&LoaderContext, String> {
+        self.validate_hit_in_state(
+            id,
+            LoaderContextState::Tombstoned,
+            view,
+            loader,
+            mapping,
+            hook_ip,
+            timestamp_ns,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "fixed loader-record identity boundary; grouping one caller shape adds boilerplate"
+    )]
+    fn validate_hit_in_state(
+        &mut self,
+        id: LoaderContextId,
+        state: LoaderContextState,
+        view: ProcessViewId,
+        loader: PinnedObjectId,
+        mapping: &MapEntry,
+        hook_ip: u64,
+        timestamp_ns: u64,
+    ) -> Result<&LoaderContext, String> {
         let valid = self.context(id).is_some_and(|context| {
-            context.state == LoaderContextState::Attached
+            context.state == state
                 && context.spec.view == view
                 && context.spec.loader == loader
                 && context.spec.mapping == *mapping

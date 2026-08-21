@@ -870,6 +870,94 @@ mod corrective_tests {
             state.retained_dynamic_keys()
         );
     }
+
+    #[test]
+    fn refused_hidden_ambiguity_purges_unchanged_second_owner_state() {
+        let a = ModuleId(0);
+        let c = ModuleId(1);
+        let process = ProcessKey::from_pid(100);
+        let mut current = plan(&[
+            "C_OpenSession", // K, currently owned only by A.
+            "C_OpenSession", // Unique C target used to open sessions.
+            "C_SignInit",
+            "C_SignFinal",
+            "C_AsyncGetID",
+            "C_CloseSession",
+        ]);
+        for slot in &mut current.slots[1..] {
+            slot.module_ids = vec![c];
+        }
+        let descriptor = current.slots[0].descriptor_index;
+        let mut state = State::new(&current);
+        let mut tracer = crate::trace::Tracer::new(&current);
+
+        state.observe_process(process, &open(&current, 10, 1));
+        for session in [20, 21] {
+            let mut opened = open(&current, session, 2);
+            opened.slot = 1;
+            state.observe_process(process, &opened);
+        }
+        state.observe_process(process, &mechanism(&current, "C_SignInit", 20, 0x101, 0));
+        state.observe_process(
+            process,
+            &event(&current, "C_SignFinal", 20, CkRv::PENDING.0),
+        );
+        let mut get_id = event(&current, "C_AsyncGetID", 20, CkRv::OK.0);
+        get_id.target_function = crate::kinds::function_id("C_SignFinal").unwrap();
+        get_id.async_value = 42;
+        state.observe_process(process, &get_id);
+        state.observe_process(
+            process,
+            &event(&current, "C_SignFinal", 21, CkRv::PENDING.0),
+        );
+
+        assert!(state.has_scope_state(process, Some(a)));
+        assert!(state.has_scope_state(process, Some(c)));
+        assert!(!state.active_ops.is_empty());
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.detached.len(), 1);
+
+        let mut shared = current.slots.clone();
+        shared[0].descriptor_index = 0;
+        shared[0].semantics = p11scope_ebpf_common::SlotSemantics::COUNT_ONLY;
+        shared[0].semantic_authorized = false;
+        shared[0].semantic_ambiguous = true;
+        shared[0].module_ids = vec![a, c];
+        let refused = AttachPlan::from_slots(shared);
+        assert_eq!(refused.slots[0].descriptor_index, 0);
+        assert!(current.latch_ambiguity_from(&refused));
+
+        state.sync_plan(&current);
+        tracer.sync_plan(&current);
+
+        assert_eq!(current.slots[0].descriptor_index, descriptor);
+        assert_eq!(current.slots[0].module_ids, [a]);
+        assert_eq!(current.module_of_slot(0), None);
+        assert!(!state.has_scope_state(process, Some(a)));
+        assert!(!state.has_scope_state(process, Some(c)));
+        assert!(state.open.is_empty());
+        assert!(state.active_ops.is_empty());
+        assert!(state.pending.is_empty());
+        assert!(state.detached.is_empty());
+        assert_eq!(state.sessions(), SessionStats::default());
+        assert!(!state.has_process_state(process));
+
+        let reconciliations = state.semantic_evidence().state_reconciliations;
+        state.sync_plan(&current);
+        assert_eq!(
+            state.semantic_evidence().state_reconciliations,
+            reconciliations,
+            "an already-latched snapshot does not purge again"
+        );
+
+        let line = tracer.on_event_process(
+            &event(&current, "C_CloseSession", 20, CkRv::OK.0),
+            process,
+            &mut state,
+        );
+        assert!(!line.contains("sess#"), "stale C pseudonym leaked: {line}");
+        assert!(!state.has_process_state(process));
+    }
 }
 
 /// Aggregate stats for one template-bearing operation (`C_FindObjectsInit`,
@@ -1318,17 +1406,38 @@ impl State {
     pub fn sync_plan(&mut self, plan: &AttachPlan) {
         let slots = slot_metadata(plan);
         let mut affected = BTreeSet::new();
+        let mut hidden_ambiguity = false;
         for (index, previous) in self.slots.iter().enumerate() {
             let Some(previous) = previous else {
                 continue;
             };
             let next = slots.get(index).and_then(Option::as_ref);
+            hidden_ambiguity |= previous.semantics
+                != p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+                && next.is_some_and(|next| {
+                    next.semantics == p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+                })
+                && plan.slots.get(index).is_some_and(|slot| {
+                    slot.descriptor_index != 0
+                        && slot.semantics != p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+                        && slot.module_ids.len() < 2
+                        && plan.slot_is_module_ambiguous(slot.index)
+                });
             if slot_semantics_changed(previous, next) {
                 affected.extend(previous.module_ids.iter().copied());
                 if let Some(next) = next {
                     affected.extend(next.module_ids.iter().copied());
                 }
             }
+        }
+        if hidden_ambiguity {
+            affected.extend(
+                self.slots
+                    .iter()
+                    .chain(&slots)
+                    .flatten()
+                    .flat_map(|slot| slot.module_ids.iter().copied()),
+            );
         }
         self.slots = slots;
         self.purge_modules(&affected);

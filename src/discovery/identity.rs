@@ -111,6 +111,16 @@ struct Entry {
     overlay: bool,
 }
 
+/// Capture-private ownership key for causal timing. Numeric pin/module IDs and
+/// path spellings are intentionally absent: this is the same complete opened
+/// identity used by ordinary pin reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PinnedTimingKey {
+    mapping: MappingFileKey,
+    pin: Pin,
+    sha256: String,
+}
+
 /// `OVERLAYFS_SUPER_MAGIC`. `ovl_statfs` reports the underlying filesystem's numbers
 /// but overrides `f_type` with the overlay's own magic, so this answers "was this file
 /// reached *through* an overlay mount", which is the question, and not "what is it
@@ -550,6 +560,15 @@ impl PinnedObjects {
             .get(&id)
             .zip(other.by_id.get(&other_id))
             .is_some_and(|(left, right)| ordinary_identity_equal(left, right))
+    }
+
+    pub(crate) fn owned_timing_key(&self, id: PinnedObjectId) -> Option<PinnedTimingKey> {
+        let entry = self.by_id.get(&id)?;
+        (!entry.sha256.is_empty()).then(|| PinnedTimingKey {
+            mapping: entry.mapping,
+            pin: entry.pin,
+            sha256: entry.sha256.clone(),
+        })
     }
 
     /// Exact equality for target sets whose IDs belong to separate pin stores.
@@ -1788,6 +1807,49 @@ mod tests {
         assert!(replay.rejects(key));
         assert_eq!(replay.pinned().count(), 0);
         assert_eq!(ambiguity_count(&replay_skips), 1, "{replay_skips:?}");
+    }
+
+    #[test]
+    fn owned_timing_key_matches_only_the_full_opened_identity() {
+        let first_key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let other_key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE + 1,
+        };
+        let first = image_pins(&[(first_key, "aaaaaaaa", 1)]);
+        let mut shifted = image_pins(&[(other_key, "bbbbbbbb", 2)]);
+        assert!(
+            shifted
+                .absorb(image_pins(&[(first_key, "aaaaaaaa", 1)]))
+                .is_empty()
+        );
+        let changed = image_pins(&[(first_key, "cccccccc", 1)]);
+
+        let first_id = first.pinned().next().unwrap().id;
+        let shifted_id = shifted
+            .pinned()
+            .find(|pin| pin.key == first_key)
+            .unwrap()
+            .id;
+        let changed_id = changed.pinned().next().unwrap().id;
+
+        assert_ne!(
+            first_id, shifted_id,
+            "the fixture uses different allocators"
+        );
+        assert_eq!(
+            first.owned_timing_key(first_id),
+            shifted.owned_timing_key(shifted_id),
+            "capture-local numeric IDs do not define timing ownership"
+        );
+        assert_ne!(
+            first.owned_timing_key(first_id),
+            changed.owned_timing_key(changed_id),
+            "an unequal full opened identity cannot inherit timing"
+        );
     }
 
     #[test]

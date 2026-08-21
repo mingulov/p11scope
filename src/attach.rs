@@ -367,8 +367,37 @@ enum RegisteredLink {
         object: PinnedObjectId,
         file_offset: u64,
         cookie: u64,
+        abi: Option<HookAbi>,
         id: UProbeLinkId,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DynamicExportIdentity {
+    pub(crate) object: PinnedObjectId,
+    pub(crate) file_offset: u64,
+    pub(crate) cookie: u64,
+    pub(crate) abi: HookAbi,
+}
+
+fn dynamic_export_snapshot_with<T>(
+    links: &[T],
+    context: LoaderContextId,
+    mut identity: impl FnMut(&T) -> (LoaderContextId, Option<DynamicExportIdentity>),
+) -> Vec<DynamicExportIdentity> {
+    let mut snapshot = Vec::new();
+    for link in links {
+        let (linked_context, export) = identity(link);
+        if linked_context != context {
+            continue;
+        }
+        if let Some(export) = export
+            && !snapshot.contains(&export)
+        {
+            snapshot.push(export);
+        }
+    }
+    snapshot
 }
 
 impl RegisteredLink {
@@ -1054,6 +1083,7 @@ impl Session {
                     object,
                     file_offset,
                     cookie,
+                    abi: None,
                     id,
                 });
                 Ok(true)
@@ -1150,6 +1180,7 @@ impl Session {
                 object,
                 file_offset,
                 cookie,
+                abi: Some(abi),
                 id,
             });
         }
@@ -1194,10 +1225,32 @@ impl Session {
         })
     }
 
-    pub(crate) fn detach_dynamic_context(&mut self, context: LoaderContextId) -> bool {
+    pub(crate) fn detach_dynamic_context(
+        &mut self,
+        context: LoaderContextId,
+    ) -> (Vec<DynamicExportIdentity>, bool) {
+        let snapshot = dynamic_export_snapshot_with(&self.links, context, |link| match link {
+            RegisteredLink::DynamicUProbe {
+                context,
+                object,
+                file_offset,
+                cookie,
+                abi,
+                ..
+            } => (
+                *context,
+                abi.map(|abi| DynamicExportIdentity {
+                    object: *object,
+                    file_offset: *file_offset,
+                    cookie: *cookie,
+                    abi,
+                }),
+            ),
+            RegisteredLink::UProbe { .. } | RegisteredLink::TracePoint { .. } => (context, None),
+        });
         let failures = self.detach_failures.len();
         let _ = self.detach_links(|link| link.context() == Some(context), false);
-        self.detach_failures.len() != failures
+        (snapshot, self.detach_failures.len() != failures)
     }
 
     /// Attaches every active target that this session has not already linked.
@@ -1615,6 +1668,33 @@ mod tests {
             "the public count includes only the two static slot programs"
         );
         assert_eq!(attached_probes_after_detach(2, 2, false), 2);
+    }
+
+    #[test]
+    fn dynamic_export_snapshot_is_exact_and_deduplicates_the_link_pair() {
+        let context = LoaderContextId::from_case_id(0);
+        let other = LoaderContextId::from_case_id(1);
+        let exact = DynamicExportIdentity {
+            object: PinnedObjectId(7),
+            file_offset: 0x10,
+            cookie: 3,
+            abi: HookAbi::FunctionList,
+        };
+        let different = DynamicExportIdentity {
+            file_offset: 0x20,
+            ..exact
+        };
+        let links = [
+            (context, Some(exact)),
+            (context, Some(exact)),
+            (context, Some(different)),
+            (other, Some(exact)),
+            (context, None),
+        ];
+
+        let snapshot = dynamic_export_snapshot_with(&links, context, |link| *link);
+
+        assert_eq!(snapshot, [exact, different]);
     }
 
     #[test]

@@ -1,12 +1,12 @@
 //! Initial and incremental provider discovery ownership.
 
-use crate::attach::{CapturePolicy, CounterSnapshot, Scope, Session};
+use crate::attach::{CapturePolicy, CounterSnapshot, DynamicExportIdentity, Scope, Session};
 use crate::cli::CaptureArgs;
 use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
-    ManifestStaleReason, PinnedObjectId, PinnedObjects, ReconciledModule, StaleManifestObject,
-    bind_scanned_modules, canonicalize_scanned_overlays, pin_manifest_objects_deferred_in_views,
-    pin_scanned_view_objects, target_paths_equal,
+    ManifestStaleReason, PinnedObjectId, PinnedObjects, PinnedTimingKey, ReconciledModule,
+    StaleManifestObject, bind_scanned_modules, canonicalize_scanned_overlays,
+    pin_manifest_objects_deferred_in_views, pin_scanned_view_objects, target_paths_equal,
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::scan::{
@@ -57,6 +57,7 @@ pub struct Engine {
     timings: CausalTimings,
     discovery_truncated: u64,
     pending_rejected_keys: BTreeSet<ObjectKey>,
+    pending_retirements: BTreeSet<ProcessViewId>,
 }
 
 struct ScanInput {
@@ -92,17 +93,27 @@ struct ApplyOutcome {
     changed: bool,
     stale_views: BTreeSet<ProcessViewId>,
     missing_contexts: Vec<LoaderContextId>,
-    static_completions: Vec<(BTreeSet<plan::ModuleId>, Option<u64>)>,
-    static_failures: BTreeSet<plan::ModuleId>,
+    static_completions: Vec<(BTreeSet<PinnedTimingKey>, Option<u64>)>,
+    static_failures: BTreeSet<PinnedTimingKey>,
     newly_rejected_keys: BTreeSet<ObjectKey>,
 }
 
 impl ApplyOutcome {
-    fn record_completions(&mut self, slots: &[plan::Slot], completed: Vec<(u32, Option<u64>)>) {
+    fn record_completions(
+        &mut self,
+        slots: &[plan::Slot],
+        owners: &BTreeMap<plan::ModuleId, PinnedTimingKey>,
+        completed: Vec<(u32, Option<u64>)>,
+    ) {
         for (index, timestamp) in completed {
             if let Some(slot) = slots.iter().find(|slot| slot.index == index) {
-                self.static_completions
-                    .push((slot.module_ids.iter().copied().collect(), timestamp));
+                self.static_completions.push((
+                    slot.module_ids
+                        .iter()
+                        .filter_map(|module| owners.get(module).cloned())
+                        .collect(),
+                    timestamp,
+                ));
             }
         }
     }
@@ -125,10 +136,10 @@ impl CandidateAdmission {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DynamicExportWork {
     context: LoaderContextId,
-    module: Option<plan::ModuleId>,
+    module: Option<PinnedTimingKey>,
     object: PinnedObjectId,
     file_offset: u64,
     cookie: u64,
@@ -136,10 +147,11 @@ struct DynamicExportWork {
     already_attached: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct QueuedDiscoveryRecord {
     record: DiscoveryRecord,
     terminal_owner: Option<LoaderContextId>,
+    terminal_exports: Vec<DynamicExportIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -151,7 +163,7 @@ struct ModuleTiming {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CausalTimings {
-    modules: BTreeMap<plan::ModuleId, ModuleTiming>,
+    modules: BTreeMap<PinnedTimingKey, ModuleTiming>,
     invalidated: bool,
 }
 
@@ -162,8 +174,8 @@ impl CausalTimings {
         timing.attach_complete_ns = None;
     }
 
-    fn observe(&mut self, module: plan::ModuleId, timestamp_ns: u64) {
-        let timing = self.modules.entry(module).or_default();
+    fn observe(&mut self, module: &PinnedTimingKey, timestamp_ns: u64) {
+        let timing = self.modules.entry(module.clone()).or_default();
         if self.invalidated || timing.lost {
             Self::clear(timing);
             return;
@@ -176,8 +188,8 @@ impl CausalTimings {
         );
     }
 
-    fn complete(&mut self, module: plan::ModuleId, timestamp_ns: u64) {
-        let timing = self.modules.entry(module).or_default();
+    fn complete(&mut self, module: &PinnedTimingKey, timestamp_ns: u64) {
+        let timing = self.modules.entry(module.clone()).or_default();
         if self.invalidated
             || timing.lost
             || timing
@@ -195,8 +207,8 @@ impl CausalTimings {
         );
     }
 
-    fn lose(&mut self, module: plan::ModuleId) {
-        Self::clear(self.modules.entry(module).or_default());
+    fn lose(&mut self, module: &PinnedTimingKey) {
+        Self::clear(self.modules.entry(module.clone()).or_default());
     }
 
     fn invalidate(&mut self) {
@@ -205,8 +217,8 @@ impl CausalTimings {
     }
 
     #[cfg(test)]
-    fn gap_ns(&self, module: plan::ModuleId) -> Option<u64> {
-        let timing = self.modules.get(&module)?;
+    fn gap_ns(&self, module: &PinnedTimingKey) -> Option<u64> {
+        let timing = self.modules.get(module)?;
         (!timing.lost)
             .then_some((timing.first_causal_ns?, timing.attach_complete_ns?))
             .and_then(|(first, last)| last.checked_sub(first))
@@ -2249,12 +2261,15 @@ fn candidate_admission(
 fn block_unperformed_static(
     candidate_plan: &mut plan::AttachPlan,
     delta: &plan::AttachDelta,
+    owners: &BTreeMap<plan::ModuleId, PinnedTimingKey>,
     outcome: &mut ApplyOutcome,
 ) {
     for slot in delta.new.iter().chain(&delta.replace) {
-        outcome
-            .static_failures
-            .extend(slot.module_ids.iter().copied());
+        outcome.static_failures.extend(
+            slot.module_ids
+                .iter()
+                .filter_map(|module| owners.get(module).cloned()),
+        );
         candidate_plan.deactivate(slot.index);
     }
 }
@@ -2262,26 +2277,40 @@ fn block_unperformed_static(
 fn lose_unperformed_dynamic_work(timings: &mut CausalTimings, work: &[DynamicExportWork]) {
     for work in work {
         if !work.already_attached {
-            if let Some(module) = work.module {
+            if let Some(module) = &work.module {
                 timings.lose(module);
             }
         }
     }
 }
 
-fn delta_module_ids(delta: &plan::AttachDelta) -> BTreeSet<plan::ModuleId> {
+fn delta_timing_keys(
+    delta: &plan::AttachDelta,
+    owners: &BTreeMap<plan::ModuleId, PinnedTimingKey>,
+) -> BTreeSet<PinnedTimingKey> {
     delta
         .new
         .iter()
         .chain(&delta.replace)
-        .flat_map(|slot| slot.module_ids.iter().copied())
+        .flat_map(|slot| slot.module_ids.iter())
+        .filter_map(|module| owners.get(module).cloned())
         .collect()
 }
 
-fn candidate_module_ids(
+fn slot_timing_keys(
+    slot: &plan::Slot,
+    owners: &BTreeMap<plan::ModuleId, PinnedTimingKey>,
+) -> Vec<PinnedTimingKey> {
+    slot.module_ids
+        .iter()
+        .filter_map(|module| owners.get(module).cloned())
+        .collect()
+}
+
+fn candidate_timing_keys(
     candidate: &LiveCandidate,
     scanned: &[ScannedModule],
-) -> BTreeSet<plan::ModuleId> {
+) -> BTreeSet<PinnedTimingKey> {
     scanned
         .iter()
         .filter_map(|module| {
@@ -2289,17 +2318,25 @@ fn candidate_module_ids(
                 .pinned
                 .id_for_scanned(module, module.key, &module.path)
         })
-        .filter_map(|object| {
+        .filter_map(|object| candidate.pinned.owned_timing_key(object))
+        .collect()
+}
+
+fn candidate_timing_owners(candidate: &LiveCandidate) -> BTreeMap<plan::ModuleId, PinnedTimingKey> {
+    candidate
+        .plan
+        .modules
+        .iter()
+        .filter_map(|module| {
             candidate
-                .plan
-                .modules
-                .iter()
-                .find(|module| module.object == object)
-                .map(|module| module.id)
+                .pinned
+                .owned_timing_key(module.object)
+                .map(|key| (module.id, key))
         })
         .collect()
 }
 
+#[cfg(test)]
 fn candidate_sources_without_view(
     pinned: &PinnedObjects,
     modules: &[ReconciledModule],
@@ -2313,6 +2350,18 @@ fn candidate_sources_without_view(
         .map(|module| module.scanned.clone())
         .collect();
     (pinned, modules)
+}
+
+fn completed_retirement_intent(
+    removed: &BTreeSet<ProcessViewId>,
+    context_views: &BTreeSet<ProcessViewId>,
+    failed: &BTreeSet<ProcessViewId>,
+) -> BTreeSet<ProcessViewId> {
+    removed
+        .union(context_views)
+        .filter(|view| !failed.contains(view))
+        .copied()
+        .collect()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2469,6 +2518,7 @@ fn validate_loader_record_context<'a>(
 
 fn terminal_record_for(
     terminal_owner: LoaderContextId,
+    terminal_exports: &[DynamicExportIdentity],
     record: DiscoveryRecord,
 ) -> QueuedDiscoveryRecord {
     let owns_record = record.kind == DISCOVERY_KIND_LOADER
@@ -2476,6 +2526,11 @@ fn terminal_record_for(
     QueuedDiscoveryRecord {
         record,
         terminal_owner: owns_record.then_some(terminal_owner),
+        terminal_exports: if owns_record {
+            terminal_exports.to_vec()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -2518,6 +2573,7 @@ impl Engine {
             timings: CausalTimings::default(),
             discovery_truncated: 0,
             pending_rejected_keys: BTreeSet::new(),
+            pending_retirements: BTreeSet::new(),
         }
     }
 
@@ -2569,22 +2625,22 @@ impl Engine {
         self.timings.invalidate();
     }
 
-    fn observe_causal_timing(&mut self, modules: &BTreeSet<plan::ModuleId>, timestamp_ns: u64) {
+    fn observe_causal_timing(&mut self, modules: &BTreeSet<PinnedTimingKey>, timestamp_ns: u64) {
         for module in modules {
-            self.timings.observe(*module, timestamp_ns);
+            self.timings.observe(module, timestamp_ns);
         }
     }
 
     fn complete_causal_timing(
         &mut self,
-        modules: &BTreeSet<plan::ModuleId>,
+        modules: &BTreeSet<PinnedTimingKey>,
         completed: Option<u64>,
     ) {
         for module in modules {
             if completed.is_none() {
-                self.timings.lose(*module);
+                self.timings.lose(module);
             } else if let Some(completed) = completed {
-                self.timings.complete(*module, completed);
+                self.timings.complete(module, completed);
             }
         }
         if completed.is_none() && !modules.is_empty() {
@@ -2600,7 +2656,7 @@ impl Engine {
             self.complete_causal_timing(modules, *completed);
         }
         for module in &outcome.static_failures {
-            self.timings.lose(*module);
+            self.timings.lose(module);
         }
     }
 
@@ -2655,6 +2711,8 @@ impl Engine {
         mut raw_modules: Vec<ScannedModule>,
         skipped: Vec<Skipped>,
     ) -> Result<LiveCandidate> {
+        self.pending_rejected_keys
+            .extend(pinned.newly_rejected_keys(&self.pinned));
         for skip in skipped {
             if !self.counters.object_skips.contains(&skip) {
                 self.counters.object_skips.push(skip);
@@ -2752,12 +2810,20 @@ impl Engine {
         Ok((candidate, loader))
     }
 
-    fn rejected_key_candidate(&mut self, keys: &BTreeSet<ObjectKey>) -> Result<LiveCandidate> {
+    fn conservative_candidate(
+        &mut self,
+        retirements: &BTreeSet<ProcessViewId>,
+        keys: &BTreeSet<ObjectKey>,
+    ) -> Result<LiveCandidate> {
         let mut pinned = self.pinned.clone();
+        for view in retirements {
+            pinned.remove_view(*view);
+        }
         let skipped = pinned.reapply_rejected_keys(keys);
         let raw_modules = self
             .modules
             .iter()
+            .filter(|module| !retirements.contains(&module.scanned.view))
             .map(|module| module.scanned.clone())
             .collect();
         self.live_candidate(pinned, raw_modules, skipped)
@@ -2779,7 +2845,8 @@ impl Engine {
             .chain(&candidate.delta.replace)
             .cloned()
             .collect();
-        let target_modules = delta_module_ids(&candidate.delta);
+        let timing_owners = candidate_timing_owners(&candidate);
+        let target_modules = delta_timing_keys(&candidate.delta, &timing_owners);
         let targets_ok = preflighted
             || session
                 .preflight_targets(&targets, &candidate.pinned)
@@ -2836,11 +2903,16 @@ impl Engine {
             *additions_allowed = false;
             outcome
                 .static_failures
-                .extend(target_modules.iter().copied());
+                .extend(target_modules.iter().cloned());
         }
         let may_add = *additions_allowed;
         if !may_add {
-            block_unperformed_static(&mut candidate.plan, &candidate.delta, &mut outcome);
+            block_unperformed_static(
+                &mut candidate.plan,
+                &candidate.delta,
+                &timing_owners,
+                &mut outcome,
+            );
             if detach_failed {
                 self.mark_partial(
                     "live discovery detach",
@@ -2863,7 +2935,7 @@ impl Engine {
             if let Some(attach) = attach {
                 match attach {
                     Ok((failed, completed)) => {
-                        outcome.record_completions(&candidate.delta.new, completed);
+                        outcome.record_completions(&candidate.delta.new, &timing_owners, completed);
                         let failed_slots: Vec<_> = candidate
                             .delta
                             .new
@@ -2881,7 +2953,7 @@ impl Engine {
                         for slot in failed_slots {
                             outcome
                                 .static_failures
-                                .extend(slot.module_ids.iter().copied());
+                                .extend(slot_timing_keys(&slot, &timing_owners));
                             candidate.plan.deactivate(slot.index);
                         }
                     }
@@ -2889,7 +2961,7 @@ impl Engine {
                         for slot in &candidate.delta.new {
                             outcome
                                 .static_failures
-                                .extend(slot.module_ids.iter().copied());
+                                .extend(slot_timing_keys(slot, &timing_owners));
                             candidate.plan.deactivate(slot.index);
                         }
                         self.mark_partial(
@@ -2919,7 +2991,11 @@ impl Engine {
                 generation_lost |= replacement_stale;
                 match replacement {
                     Some(Ok((completed, failed_detach))) => {
-                        outcome.record_completions(&candidate.delta.replace, completed);
+                        outcome.record_completions(
+                            &candidate.delta.replace,
+                            &timing_owners,
+                            completed,
+                        );
                         if failed_detach {
                             *additions_allowed = false;
                             self.mark_partial(
@@ -2931,7 +3007,7 @@ impl Engine {
                             if !candidate.plan.is_active(slot.index) {
                                 outcome
                                     .static_failures
-                                    .extend(slot.module_ids.iter().copied());
+                                    .extend(slot_timing_keys(slot, &timing_owners));
                             }
                         }
                     }
@@ -2941,7 +3017,7 @@ impl Engine {
                                 .delta
                                 .replace
                                 .iter()
-                                .flat_map(|slot| slot.module_ids.iter().copied()),
+                                .flat_map(|slot| slot_timing_keys(slot, &timing_owners)),
                         );
                         if session.detach_failures().len() > detach_failures {
                             *additions_allowed = false;
@@ -2957,7 +3033,7 @@ impl Engine {
                 for slot in &candidate.delta.replace {
                     outcome
                         .static_failures
-                        .extend(slot.module_ids.iter().copied());
+                        .extend(slot_timing_keys(slot, &timing_owners));
                     candidate.plan.deactivate(slot.index);
                 }
             }
@@ -3023,19 +3099,6 @@ impl Engine {
         self.discovery = discovery_evidence(&self.plan, &self.pinned, &self.counters);
         outcome.committed = true;
         Ok(outcome)
-    }
-
-    fn retire_view_candidate(
-        &mut self,
-        view: ProcessViewId,
-        session: &mut Session,
-        additions_allowed: &mut bool,
-    ) -> Result<ApplyOutcome> {
-        *additions_allowed = false;
-        let (pinned, raw_modules) =
-            candidate_sources_without_view(&self.pinned, &self.modules, view);
-        let candidate = self.live_candidate(pinned, raw_modules, Vec::new())?;
-        self.apply_candidate(session, candidate, additions_allowed, false, &[])
     }
 
     fn update_counter_snapshot(&mut self, session: &Session) -> Result<()> {
@@ -3126,7 +3189,7 @@ impl Engine {
         merge_scanned_module(&mut raw_modules, lowered);
         let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
         candidate.views.insert(self.views[position].id());
-        let observed = candidate_module_ids(&candidate, std::slice::from_ref(&observed_module));
+        let observed = candidate_timing_keys(&candidate, std::slice::from_ref(&observed_module));
         self.observe_causal_timing(&observed, record.hook_ts_ns);
         let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
         self.record_apply_timing(&outcome);
@@ -3141,8 +3204,12 @@ impl Engine {
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
     ) -> Result<bool> {
-        let record = &queued.record;
-        let terminal_owner = queued.terminal_owner;
+        let QueuedDiscoveryRecord {
+            record,
+            terminal_owner,
+            terminal_exports,
+        } = queued;
+        let record = &record;
         if self.loader_records_accepted >= self.counter_snapshot.loader_hits {
             self.mark_live_loss(
                 "live loader discovery",
@@ -3228,10 +3295,16 @@ impl Engine {
         }
         let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
         candidate.views.insert(self.views[position].id());
-        let observed = candidate_module_ids(&candidate, &export_modules);
+        let observed = candidate_timing_keys(&candidate, &export_modules);
         self.observe_causal_timing(&observed, record.hook_ts_ns);
-        let dynamic_work =
-            self.collect_dynamic_export_work(context_id, &export_modules, &candidate, session);
+        let dynamic_work = self.collect_dynamic_export_work(
+            context_id,
+            &export_modules,
+            &candidate,
+            session,
+            terminal_owner.is_some(),
+            &terminal_exports,
+        );
         let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
         self.record_apply_timing(&outcome);
         self.queue_apply_outcome(&outcome, pending_views);
@@ -3259,6 +3332,8 @@ impl Engine {
         modules: &[ScannedModule],
         candidate: &LiveCandidate,
         session: &Session,
+        terminal: bool,
+        terminal_exports: &[DynamicExportIdentity],
     ) -> Vec<DynamicExportWork> {
         let mut work = Vec::new();
         for module in modules {
@@ -3268,12 +3343,7 @@ impl Engine {
             else {
                 continue;
             };
-            let module_id = candidate
-                .plan
-                .modules
-                .iter()
-                .find(|candidate| candidate.object == object)
-                .map(|candidate| candidate.id);
+            let timing_key = candidate.pinned.owned_timing_key(object);
             let snapshot = candidate
                 .pinned
                 .file_for(object)
@@ -3293,8 +3363,8 @@ impl Engine {
                         .filter(|fact| snapshot.is_executable_offset(fact.file_offset))
                 });
                 let Some(fact) = fact else {
-                    if let Some(module_id) = module_id {
-                        self.timings.lose(module_id);
+                    if let Some(timing_key) = &timing_key {
+                        self.timings.lose(timing_key);
                     }
                     self.mark_partial(
                         "live export hook",
@@ -3304,17 +3374,21 @@ impl Engine {
                 };
                 work.push(DynamicExportWork {
                     context,
-                    module: module_id,
+                    module: timing_key.clone(),
                     object,
                     file_offset: fact.file_offset,
                     cookie,
                     abi,
-                    already_attached: session.has_dynamic_export(
-                        context,
-                        (object, fact.file_offset),
-                        cookie,
-                        abi,
-                    ),
+                    already_attached: if terminal {
+                        terminal_exports.contains(&DynamicExportIdentity {
+                            object,
+                            file_offset: fact.file_offset,
+                            cookie,
+                            abi,
+                        })
+                    } else {
+                        session.has_dynamic_export(context, (object, fact.file_offset), cookie, abi)
+                    },
                 });
             }
         }
@@ -3343,7 +3417,7 @@ impl Engine {
                 continue;
             }
             if !*additions_allowed {
-                if let Some(module) = work.module {
+                if let Some(module) = &work.module {
                     self.timings.lose(module);
                 }
                 continue;
@@ -3370,13 +3444,16 @@ impl Engine {
             match attach {
                 GenerationMutation::Committed(Ok((added, completed))) => {
                     if added {
-                        if let Some(module) = work.module {
-                            self.complete_causal_timing(&[module].into_iter().collect(), completed);
+                        if let Some(module) = &work.module {
+                            self.complete_causal_timing(
+                                &[module.clone()].into_iter().collect(),
+                                completed,
+                            );
                         }
                     }
                 }
                 GenerationMutation::Committed(Err(_)) => {
-                    if let Some(module) = work.module {
+                    if let Some(module) = &work.module {
                         self.timings.lose(module);
                     }
                     if session.detach_failures().len() > detach_failures {
@@ -3388,7 +3465,7 @@ impl Engine {
                     );
                 }
                 GenerationMutation::PrecheckFailed | GenerationMutation::PostcheckFailed(_) => {
-                    if let Some(module) = work.module {
+                    if let Some(module) = &work.module {
                         self.timings.lose(module);
                     }
                     *additions_allowed = false;
@@ -3712,7 +3789,7 @@ impl Engine {
                 // A prior one-shot retirement reached its terminal state but
                 // could not remove the registry entry. Never detach it twice.
             } else if context.was_attached {
-                let detach_failed = session.detach_dynamic_context(context_id);
+                let (terminal_exports, detach_failed) = session.detach_dynamic_context(context_id);
                 if detach_failed {
                     *additions_allowed = false;
                     self.mark_partial(
@@ -3732,7 +3809,7 @@ impl Engine {
                             );
                         }
                         for record in owned {
-                            let queued = terminal_record_for(context_id, record);
+                            let queued = terminal_record_for(context_id, &terminal_exports, record);
                             match self.dispatch_discovery_record(
                                 queued,
                                 session,
@@ -3835,31 +3912,56 @@ impl Engine {
         self.queue_stale_views(&outcome.stale_views, pending_views);
     }
 
-    fn replay_pending_rejections(
+    fn queue_conservative_outcome(
+        &mut self,
+        outcome: &ApplyOutcome,
+        retirements: &BTreeSet<ProcessViewId>,
+        rejected_keys: &BTreeSet<ObjectKey>,
+        pending_views: &mut PendingViewRetirements,
+    ) -> bool {
+        self.queue_apply_outcome(outcome, pending_views);
+        if outcome.committed {
+            self.pending_retirements
+                .retain(|view| !retirements.contains(view));
+            self.pending_rejected_keys
+                .retain(|key| !rejected_keys.contains(key));
+        }
+        outcome.changed
+    }
+
+    fn replay_pending_conservative(
         &mut self,
         session: &mut Session,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
-    ) -> Result<ApplyOutcome> {
-        let keys = std::mem::take(&mut self.pending_rejected_keys);
-        let candidate = match self.rejected_key_candidate(&keys) {
+    ) -> ApplyOutcome {
+        let retirements = self.pending_retirements.clone();
+        let keys = self.pending_rejected_keys.clone();
+        *additions_allowed = false;
+        let candidate = match self.conservative_candidate(&retirements, &keys) {
             Ok(candidate) => candidate,
-            Err(error) => {
-                self.pending_rejected_keys.extend(keys);
-                return Err(error);
+            Err(_) => {
+                self.mark_partial(
+                    "live discovery transaction",
+                    "a pending conservative candidate could not be rebuilt and remains queued",
+                );
+                return ApplyOutcome::default();
             }
         };
         let outcome = match self.apply_candidate(session, candidate, additions_allowed, false, &[])
         {
             Ok(outcome) => outcome,
-            Err(error) => {
-                self.pending_rejected_keys.extend(keys);
-                return Err(error);
+            Err(_) => {
+                self.mark_partial(
+                    "live discovery transaction",
+                    "a pending conservative candidate could not be applied and remains queued",
+                );
+                return ApplyOutcome::default();
             }
         };
         self.record_apply_timing(&outcome);
-        self.queue_apply_outcome(&outcome, pending_views);
-        Ok(outcome)
+        self.queue_conservative_outcome(&outcome, &retirements, &keys, pending_views);
+        outcome
     }
 
     fn dispatch_discovery_record(
@@ -3905,7 +4007,7 @@ impl Engine {
     ) -> Result<bool> {
         let mut changed = false;
         let mut named_generation_lost = false;
-        let mut rejection_replay_attempted = false;
+        let mut conservative_replay_attempted = false;
         loop {
             for queued in std::mem::take(records) {
                 match self.dispatch_discovery_record(
@@ -3922,14 +4024,16 @@ impl Engine {
                 }
             }
             if pending_views.is_empty() {
-                if self.pending_rejected_keys.is_empty() || rejection_replay_attempted {
+                if (self.pending_rejected_keys.is_empty() && self.pending_retirements.is_empty())
+                    || conservative_replay_attempted
+                {
                     break;
                 }
-                rejection_replay_attempted = true;
+                conservative_replay_attempted = true;
                 let outcome =
-                    self.replay_pending_rejections(session, additions_allowed, pending_views)?;
+                    self.replay_pending_conservative(session, additions_allowed, pending_views);
                 changed |= outcome.changed;
-                if pending_views.is_empty() {
+                if !outcome.committed && pending_views.is_empty() {
                     break;
                 }
             }
@@ -3943,10 +4047,8 @@ impl Engine {
                 if !complete {
                     continue;
                 }
-                rejection_replay_attempted = false;
-                let outcome = self.retire_view_candidate(view, session, additions_allowed)?;
-                changed |= outcome.changed;
-                self.queue_apply_outcome(&outcome, pending_views);
+                self.pending_retirements.insert(view);
+                conservative_replay_attempted = false;
             }
         }
         if named_generation_lost {
@@ -4262,9 +4364,13 @@ impl Engine {
         let mut changed = false;
         let mut mutation_started = false;
         let mut failed_retirements = BTreeSet::new();
+        let mut context_retirements = BTreeSet::new();
         let retirement_views: BTreeSet<_> = removed.union(&refreshed_ok).copied().collect();
         for view in &retirement_views {
-            mutation_started |= !self.loader_registry.ids_for_view(*view).is_empty();
+            if !self.loader_registry.ids_for_view(*view).is_empty() {
+                mutation_started = true;
+                context_retirements.insert(*view);
+            }
             let (retirement_changed, complete) =
                 self.retire_loader_contexts(*view, session, additions_allowed, pending_views)?;
             changed |= retirement_changed;
@@ -4284,12 +4390,19 @@ impl Engine {
         }
         removed.retain(|view| !failed_retirements.contains(view));
         refreshed_ok.retain(|view| !failed_retirements.contains(view));
-        let completed_retirements: BTreeSet<_> = retirement_views
-            .difference(&failed_retirements)
-            .copied()
-            .collect();
+        let completed_retirements =
+            completed_retirement_intent(&removed, &context_retirements, &failed_retirements);
+        self.pending_retirements
+            .extend(completed_retirements.iter().copied());
         changed |=
             self.process_discovery_records(session, records, pending_views, additions_allowed)?;
+        if !self.pending_retirements.is_empty() || !self.pending_rejected_keys.is_empty() {
+            self.mark_partial(
+                "live inventory transaction",
+                "completed conservative retirement remains queued for a later current-state rebuild",
+            );
+            return Ok(changed);
+        }
 
         let (rescanned, failed_rescan_pids, rescan_skips) =
             self.scan_inventory_views(&refreshed_ok, "a post-retirement inventory refresh failed");
@@ -4299,7 +4412,7 @@ impl Engine {
         refreshed_ok = refreshed_scans.iter().map(|(view, _, _)| *view).collect();
         refreshed_ok.retain(|view| !failed_retirements.contains(view));
         refreshed_scans.retain(|(view, _, _)| refreshed_ok.contains(view));
-        let mut candidate =
+        let candidate =
             self.inventory_candidate(&removed, &refreshed_scans, &new_views, skipped)?;
         let admission =
             self.inventory_candidate_admission(session, &candidate, &removed, &new_views);
@@ -4330,33 +4443,15 @@ impl Engine {
                 missing_contexts: admission.missing_contexts,
                 ..ApplyOutcome::default()
             };
-            let cleanup_needed = conservative_only
-                || !outcome.stale_views.is_empty()
-                || !outcome.missing_contexts.is_empty();
             self.queue_apply_outcome(&outcome, pending_views);
             changed |=
                 self.process_discovery_records(session, records, pending_views, additions_allowed)?;
-            if cleanup_needed {
+            if conservative_only {
                 *additions_allowed = false;
-                let candidate =
-                    self.inventory_candidate(&completed_retirements, &[], &[], Vec::new())?;
-                let cleanup =
-                    self.apply_candidate(session, candidate, additions_allowed, true, &[])?;
-                self.record_apply_timing(&cleanup);
-                self.queue_apply_outcome(&cleanup, pending_views);
-                changed |= cleanup.changed;
-                changed |= self.process_discovery_records(
-                    session,
-                    records,
-                    pending_views,
-                    additions_allowed,
-                )?;
-                if cleanup.committed {
-                    self.views.retain(|view| !removed.contains(&view.id()));
-                    for view in removed.iter().chain(&refreshed_ok) {
-                        self.scan_inputs.remove(view);
-                    }
-                }
+            }
+            self.views.retain(|view| !removed.contains(&view.id()));
+            for view in removed.iter().chain(&refreshed_ok) {
+                self.scan_inputs.remove(view);
             }
             if matches!(self.scope, Scope::Pid(_)) && !outcome.stale_views.is_empty() {
                 bail!("the named process generation changed during inventory preflight");
@@ -4368,11 +4463,10 @@ impl Engine {
                 "live inventory transaction",
                 "post-retirement candidate preflight failed; conservative retirements were committed and additions were blocked",
             );
-            if !mutation_started {
-                return Ok(changed);
+            if mutation_started {
+                *additions_allowed = false;
             }
-            *additions_allowed = false;
-            candidate = self.inventory_candidate(&completed_retirements, &[], &[], Vec::new())?;
+            return Ok(changed);
         }
 
         let extra_views: Vec<_> = new_views.iter().map(|(view, _, _)| view).collect();
@@ -4464,6 +4558,7 @@ impl Engine {
             .map(|record| QueuedDiscoveryRecord {
                 record,
                 terminal_owner: None,
+                terminal_exports: Vec::new(),
             })
             .collect();
         self.record_malformed_discovery(malformed);
@@ -4477,12 +4572,14 @@ impl Engine {
             &mut pending_views,
             &mut additions_allowed,
         )?;
-        changed |= self.refresh_inventory(
-            session,
-            &mut additions_allowed,
-            &mut records,
-            &mut pending_views,
-        )?;
+        if self.pending_retirements.is_empty() && self.pending_rejected_keys.is_empty() {
+            changed |= self.refresh_inventory(
+                session,
+                &mut additions_allowed,
+                &mut records,
+                &mut pending_views,
+            )?;
+        }
         record_object_skips(&mut self.plan, &self.counters.object_skips);
         self.discovery = discovery_evidence(&self.plan, &self.pinned, &self.counters);
         Ok(changed)
@@ -4580,7 +4677,7 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
     use std::path::PathBuf;
 
-    fn dynamic_export_work(module: plan::ModuleId, already_attached: bool) -> DynamicExportWork {
+    fn dynamic_export_work(module: PinnedTimingKey, already_attached: bool) -> DynamicExportWork {
         DynamicExportWork {
             context: LoaderContextId::from_case_id(0),
             module: Some(module),
@@ -4590,6 +4687,46 @@ mod tests {
             abi: HookAbi::FunctionList,
             already_attached,
         }
+    }
+
+    fn timing_key(index: usize) -> PinnedTimingKey {
+        static KEYS: std::sync::OnceLock<Vec<PinnedTimingKey>> = std::sync::OnceLock::new();
+        KEYS.get_or_init(|| {
+            let view = ProcessView::open(ProcessViewId(99), std::process::id()).unwrap();
+            let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+            let mut keys = Vec::new();
+            for mapping in maps
+                .iter()
+                .filter(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
+            {
+                let Resolved::File {
+                    path: MappedPath::Usable(path),
+                    ..
+                } = resolve(&maps, mapping.start)
+                else {
+                    continue;
+                };
+                let module = mapped_object(&view, mapping, &path);
+                let pins = pin_test_module(&view, &module);
+                let object = pins
+                    .id_for_scanned(&module, module.key, &module.path)
+                    .unwrap();
+                let key = pins.owned_timing_key(object).unwrap();
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+                if keys.len() == 3 {
+                    break;
+                }
+            }
+            assert_eq!(
+                keys.len(),
+                3,
+                "the test process has three executable objects"
+            );
+            keys
+        })[index]
+            .clone()
     }
 
     #[test]
@@ -4618,35 +4755,57 @@ mod tests {
 
     #[test]
     fn causal_gap_stays_none_after_loss_then_later_record() {
-        let module = plan::ModuleId(7);
+        let module = timing_key(0);
         let mut timings = CausalTimings::default();
         timings.invalidate();
-        timings.observe(module, 20);
-        timings.complete(module, 50);
-        assert_eq!(timings.gap_ns(module), None);
+        timings.observe(&module, 20);
+        timings.complete(&module, 50);
+        assert_eq!(timings.gap_ns(&module), None);
 
         let mut intact = CausalTimings::default();
-        intact.observe(module, 20);
-        intact.observe(module, 40);
-        intact.complete(module, 50);
+        intact.observe(&module, 20);
+        intact.observe(&module, 40);
+        intact.complete(&module, 50);
         assert_eq!(
-            intact.gap_ns(module),
+            intact.gap_ns(&module),
             Some(30),
             "a later hit cannot replace the first accepted causal timestamp"
         );
     }
 
     #[test]
-    fn causal_completion_tracks_the_last_new_required_attachment() {
-        let module = plan::ModuleId(7);
+    fn causal_timing_does_not_follow_a_reused_candidate_module_id() {
+        let first = timing_key(0);
+        let second = timing_key(1);
+        assert_ne!(first, second);
+
         let mut timings = CausalTimings::default();
-        timings.observe(module, 10);
-        timings.complete(module, 12);
-        timings.observe(module, 20);
-        timings.complete(module, 25);
+        timings.observe(&first, 10);
+        timings.lose(&first);
+        timings.observe(&second, 20);
+        timings.complete(&second, 30);
+        timings.observe(&first, 40);
+        timings.complete(&first, 50);
+
+        assert_eq!(timings.gap_ns(&second), Some(10));
+        assert_eq!(
+            timings.gap_ns(&first),
+            None,
+            "the refused physical module keeps its loss after reappearance"
+        );
+    }
+
+    #[test]
+    fn causal_completion_tracks_the_last_new_required_attachment() {
+        let module = timing_key(0);
+        let mut timings = CausalTimings::default();
+        timings.observe(&module, 10);
+        timings.complete(&module, 12);
+        timings.observe(&module, 20);
+        timings.complete(&module, 25);
 
         assert_eq!(
-            timings.gap_ns(module),
+            timings.gap_ns(&module),
             Some(15),
             "completion advances after later genuinely new required work"
         );
@@ -4666,10 +4825,10 @@ mod tests {
 
         assert!(candidate.delta.new.is_empty());
         assert!(candidate.delta.replace.is_empty());
-        let observed = candidate_module_ids(&candidate, &raw_modules);
+        let observed = candidate_timing_keys(&candidate, &raw_modules);
         assert_eq!(observed.len(), 1, "the stable duplicate still has an owner");
         engine.observe_causal_timing(&observed, 10);
-        assert_eq!(engine.timings.gap_ns(*observed.first().unwrap()), None);
+        assert_eq!(engine.timings.gap_ns(observed.first().unwrap()), None);
 
         engine.observe_causal_timing(&observed, 30);
         engine.record_apply_timing(&ApplyOutcome {
@@ -4677,30 +4836,30 @@ mod tests {
             ..ApplyOutcome::default()
         });
         assert_eq!(
-            engine.timings.gap_ns(*observed.first().unwrap()),
+            engine.timings.gap_ns(observed.first().unwrap()),
             Some(30),
             "later work keeps the earlier accepted observation"
         );
         engine.observe_causal_timing(&observed, 50);
-        assert_eq!(engine.timings.gap_ns(*observed.first().unwrap()), Some(30));
+        assert_eq!(engine.timings.gap_ns(observed.first().unwrap()), Some(30));
         engine.invalidate_causal_timing();
         engine.observe_causal_timing(&observed, 60);
         engine.complete_causal_timing(&observed, Some(70));
-        assert_eq!(engine.timings.gap_ns(*observed.first().unwrap()), None);
+        assert_eq!(engine.timings.gap_ns(observed.first().unwrap()), None);
     }
 
     #[test]
     fn each_module_uses_its_own_immediate_attach_completion() {
-        let first = plan::ModuleId(3);
-        let second = plan::ModuleId(4);
+        let first = timing_key(0);
+        let second = timing_key(1);
         let mut engine = Engine::empty();
-        engine.timings.observe(first, 10);
-        engine.timings.observe(second, 10);
-        engine.complete_causal_timing(&[first].into_iter().collect(), Some(20));
-        engine.complete_causal_timing(&[second].into_iter().collect(), Some(35));
+        engine.timings.observe(&first, 10);
+        engine.timings.observe(&second, 10);
+        engine.complete_causal_timing(&[first.clone()].into_iter().collect(), Some(20));
+        engine.complete_causal_timing(&[second.clone()].into_iter().collect(), Some(35));
 
-        assert_eq!(engine.timings.gap_ns(first), Some(10));
-        assert_eq!(engine.timings.gap_ns(second), Some(25));
+        assert_eq!(engine.timings.gap_ns(&first), Some(10));
+        assert_eq!(engine.timings.gap_ns(&second), Some(25));
     }
 
     #[test]
@@ -4718,35 +4877,37 @@ mod tests {
 
     #[test]
     fn apply_outcome_keeps_static_timing_and_generation_loss_ownership() {
-        let completed = plan::ModuleId(3);
-        let failed = plan::ModuleId(4);
+        let completed = timing_key(0);
+        let failed = timing_key(1);
         let stale = ProcessViewId(9);
         let mut engine = Engine::empty();
-        engine.timings.observe(completed, 10);
-        engine.timings.observe(failed, 10);
+        engine.timings.observe(&completed, 10);
+        engine.timings.observe(&failed, 10);
         let outcome = ApplyOutcome {
             committed: true,
             changed: true,
             stale_views: [stale].into_iter().collect(),
             missing_contexts: Vec::new(),
-            static_completions: vec![([completed].into_iter().collect(), Some(20))],
-            static_failures: [failed].into_iter().collect(),
+            static_completions: vec![([completed.clone()].into_iter().collect(), Some(20))],
+            static_failures: [failed.clone()].into_iter().collect(),
             newly_rejected_keys: BTreeSet::new(),
         };
 
         engine.record_apply_timing(&outcome);
 
-        assert_eq!(engine.timings.gap_ns(completed), Some(10));
-        assert_eq!(engine.timings.gap_ns(failed), None);
+        assert_eq!(engine.timings.gap_ns(&completed), Some(10));
+        assert_eq!(engine.timings.gap_ns(&failed), None);
         assert_eq!(outcome.stale_views, [stale].into_iter().collect());
         assert!(outcome.committed && outcome.changed);
     }
 
     #[test]
     fn closed_additions_gate_loses_every_unperformed_exact_owner() {
-        let first = plan::ModuleId(3);
-        let second = plan::ModuleId(4);
-        let duplicate = plan::ModuleId(5);
+        let first_id = plan::ModuleId(3);
+        let second_id = plan::ModuleId(4);
+        let first = timing_key(0);
+        let second = timing_key(1);
+        let duplicate = timing_key(2);
         let slots = vec![
             plan::Slot {
                 index: 0,
@@ -4760,7 +4921,7 @@ mod tests {
                 semantic_authorized: false,
                 semantic_ambiguous: false,
                 fork_safe: false,
-                module_ids: vec![first],
+                module_ids: vec![first_id],
             },
             plan::Slot {
                 index: 1,
@@ -4774,7 +4935,7 @@ mod tests {
                 semantic_authorized: false,
                 semantic_ambiguous: false,
                 fork_safe: false,
-                module_ids: vec![second],
+                module_ids: vec![second_id],
             },
         ];
         let delta = plan::AttachDelta {
@@ -4784,30 +4945,33 @@ mod tests {
         };
         let mut candidate_plan = plan::AttachPlan::from_slots(slots);
         let mut outcome = ApplyOutcome::default();
-        block_unperformed_static(&mut candidate_plan, &delta, &mut outcome);
+        let owners = [(first_id, first.clone()), (second_id, second.clone())]
+            .into_iter()
+            .collect();
+        block_unperformed_static(&mut candidate_plan, &delta, &owners, &mut outcome);
 
         assert_eq!(
             outcome.static_failures,
-            [first, second].into_iter().collect(),
+            [first.clone(), second.clone()].into_iter().collect(),
             "an already-closed gate owns every skipped new/replacement slot"
         );
         assert!(!candidate_plan.is_active(0));
         assert!(!candidate_plan.is_active(1));
 
         let mut timings = CausalTimings::default();
-        for module in [first, second, duplicate] {
+        for module in [&first, &second, &duplicate] {
             timings.observe(module, 10);
         }
-        timings.complete(duplicate, 15);
+        timings.complete(&duplicate, 15);
         lose_unperformed_dynamic_work(
             &mut timings,
             &[
-                dynamic_export_work(first, false),
-                dynamic_export_work(second, false),
-                dynamic_export_work(duplicate, true),
+                dynamic_export_work(first.clone(), false),
+                dynamic_export_work(second.clone(), false),
+                dynamic_export_work(duplicate.clone(), true),
             ],
         );
-        for module in [first, second] {
+        for module in [&first, &second] {
             timings.complete(module, 30);
             assert_eq!(
                 timings.gap_ns(module),
@@ -4816,7 +4980,7 @@ mod tests {
             );
         }
         assert_eq!(
-            timings.gap_ns(duplicate),
+            timings.gap_ns(&duplicate),
             Some(5),
             "an already-attached dynamic pair is not unperformed work"
         );
@@ -4824,27 +4988,80 @@ mod tests {
 
     #[test]
     fn refused_dynamic_only_candidate_loses_its_exact_owner() {
-        let module = plan::ModuleId(3);
+        let module = timing_key(0);
         let mut timings = CausalTimings::default();
-        timings.observe(module, 10);
+        timings.observe(&module, 10);
         let refused = ApplyOutcome {
             missing_contexts: vec![LoaderContextId::from_case_id(0)],
             ..ApplyOutcome::default()
         };
-        let work = [dynamic_export_work(module, false)];
+        let work = [dynamic_export_work(module.clone(), false)];
 
         if refused.committed && refused.stale_views.is_empty() {
-            timings.complete(module, 20);
+            timings.complete(&module, 20);
         } else {
             lose_unperformed_dynamic_work(&mut timings, &work);
         }
-        timings.complete(module, 30);
+        timings.complete(&module, 30);
 
         assert_eq!(
-            timings.gap_ns(module),
+            timings.gap_ns(&module),
             None,
             "a later attach cannot substitute for dynamic work skipped by candidate refusal"
         );
+    }
+
+    #[test]
+    fn tagged_terminal_export_snapshot_preserves_only_the_exact_duplicate() {
+        let object = PinnedObjectId(7);
+        let module = timing_key(0);
+        let context = LoaderContextId::from_case_id(0);
+        let exact = crate::attach::DynamicExportIdentity {
+            object,
+            file_offset: 0x10,
+            cookie: 1,
+            abi: HookAbi::FunctionList,
+        };
+        let snapshot = vec![exact];
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_LOADER;
+        record.case_id = 0;
+        let queued = terminal_record_for(context, &snapshot, record);
+        assert_eq!(queued.terminal_owner, Some(context));
+        assert_eq!(queued.terminal_exports, snapshot);
+
+        let mut timings = CausalTimings::default();
+        timings.observe(&module, 10);
+        timings.complete(&module, 20);
+        let duplicate = DynamicExportWork {
+            context,
+            module: Some(module.clone()),
+            object,
+            file_offset: exact.file_offset,
+            cookie: exact.cookie,
+            abi: exact.abi,
+            already_attached: queued.terminal_exports.contains(&exact),
+        };
+        lose_unperformed_dynamic_work(&mut timings, std::slice::from_ref(&duplicate));
+        assert_eq!(timings.gap_ns(&module), Some(10));
+
+        let absent = DynamicExportWork {
+            file_offset: 0x20,
+            already_attached: queued.terminal_exports.contains(
+                &crate::attach::DynamicExportIdentity {
+                    file_offset: 0x20,
+                    ..exact
+                },
+            ),
+            ..duplicate.clone()
+        };
+        lose_unperformed_dynamic_work(&mut timings, std::slice::from_ref(&absent));
+        assert_eq!(timings.gap_ns(&module), None);
+
+        record.case_id = 1;
+        let other = terminal_record_for(context, &snapshot, record);
+        assert_eq!(other.terminal_owner, None);
+        assert!(other.terminal_exports.is_empty());
     }
 
     #[test]
@@ -5127,8 +5344,10 @@ mod tests {
         engine.loader_registry.tombstone(attached).unwrap();
         engine.loader_registry.remove(attached).unwrap();
         engine.loader_registry.remove(tombstoned).unwrap();
-        let keys = std::mem::take(&mut engine.pending_rejected_keys);
-        let replay = engine.rejected_key_candidate(&keys).unwrap();
+        let keys = engine.pending_rejected_keys.clone();
+        let replay = engine
+            .conservative_candidate(&BTreeSet::new(), &keys)
+            .unwrap();
         assert!(
             replay.pinned.rejects(loader_module.key),
             "serial context cleanup cannot discard the collision that selected it"
@@ -5139,6 +5358,101 @@ mod tests {
             "the fresh post-cleanup candidate must retain the affected provider retirement"
         );
         assert_eq!(unsafe { libc::munmap(address, len) }, 0);
+    }
+
+    #[test]
+    fn live_candidate_captures_rejected_keys_before_fallible_plan_extension() {
+        let (_, raw_modules, mut pins, _) = same_object_scan_and_manifest(0x10);
+        let modules = reconcile_for_test(&raw_modules, &mut pins);
+        let mut engine = Engine::empty();
+        engine.plan = plan::build_from_reconciled_modules(&modules);
+        assert_eq!(engine.plan.slots.len(), 1);
+        engine.plan.slots[0].descriptor_index += 1;
+        engine.plan.slots[0].semantics = p11scope_ebpf_common::SlotSemantics::COUNT_ONLY;
+        engine.plan.slots[0].semantic_ambiguous = true;
+        engine.pinned = pins;
+        engine.modules = modules;
+
+        let rejected = ObjectKey {
+            device: p11scope_manifest::maps::Device {
+                major: 254,
+                minor: 1,
+            },
+            inode: u64::MAX - 1,
+        };
+        let mut candidate_pins = engine.pinned.clone();
+        assert!(
+            candidate_pins
+                .reapply_rejected_keys(&[rejected].into_iter().collect())
+                .is_empty()
+        );
+
+        assert!(
+            engine
+                .live_candidate(candidate_pins, raw_modules, Vec::new())
+                .is_err(),
+            "the fixture reaches the fallible plan-extension boundary"
+        );
+
+        assert_eq!(
+            engine.pending_rejected_keys,
+            [rejected].into_iter().collect(),
+            "later plan construction cannot erase the already-proved rejection"
+        );
+    }
+
+    #[test]
+    fn conservative_intent_survives_refusal_until_current_candidate_commits() {
+        let (_, raw_modules, mut pins, _) = same_object_scan_and_manifest(0x10);
+        let modules = reconcile_for_test(&raw_modules, &mut pins);
+        let retired = raw_modules[0].view;
+        let rejected = pins.pinned().next().unwrap().key;
+        let mut engine = Engine::empty();
+        engine.plan = plan::build_from_reconciled_modules(&modules);
+        engine.pinned = pins;
+        engine.modules = modules;
+        engine.pending_retirements.insert(retired);
+        engine.pending_rejected_keys.insert(rejected);
+
+        let retirements = engine.pending_retirements.clone();
+        let rejected_keys = engine.pending_rejected_keys.clone();
+        let candidate = engine
+            .conservative_candidate(&retirements, &rejected_keys)
+            .unwrap();
+        assert!(candidate.delta.new.is_empty());
+        assert!(candidate.delta.replace.is_empty());
+        assert!(candidate.plan.modules.is_empty());
+        assert!(candidate.pinned.rejects(rejected));
+
+        let mut pending_views = PendingViewRetirements::new();
+        let refused = ApplyOutcome {
+            stale_views: [ProcessViewId(91)].into_iter().collect(),
+            newly_rejected_keys: rejected_keys.clone(),
+            ..ApplyOutcome::default()
+        };
+        assert!(!engine.queue_conservative_outcome(
+            &refused,
+            &retirements,
+            &rejected_keys,
+            &mut pending_views,
+        ));
+        assert_eq!(engine.pending_retirements, retirements);
+        assert_eq!(engine.pending_rejected_keys, rejected_keys);
+
+        let committed = ApplyOutcome {
+            committed: true,
+            changed: true,
+            newly_rejected_keys: rejected_keys.clone(),
+            ..ApplyOutcome::default()
+        };
+        assert!(engine.queue_conservative_outcome(
+            &committed,
+            &retirements,
+            &rejected_keys,
+            &mut pending_views,
+        ));
+        assert!(engine.pending_retirements.is_empty());
+        assert!(engine.pending_rejected_keys.is_empty());
     }
 
     #[test]
@@ -5186,6 +5500,19 @@ mod tests {
         assert!(
             failed.requires_conservative_apply(true),
             "after dynamic retirement the same failure must commit conservative subtraction"
+        );
+    }
+
+    #[test]
+    fn context_free_refresh_does_not_create_retirement_intent() {
+        let removed = [ProcessViewId(1)].into_iter().collect();
+        let context_views = [ProcessViewId(2)].into_iter().collect();
+        let failed = [ProcessViewId(3)].into_iter().collect();
+
+        assert_eq!(
+            completed_retirement_intent(&removed, &context_views, &failed),
+            [ProcessViewId(1), ProcessViewId(2)].into_iter().collect(),
+            "removed views and successful context retirements persist; a context-free refresh does not"
         );
     }
 
@@ -5317,6 +5644,7 @@ mod tests {
         let ordinary = QueuedDiscoveryRecord {
             record: queued,
             terminal_owner: None,
+            terminal_exports: Vec::new(),
         };
         assert!(
             validate_loader_record_context(
@@ -5349,6 +5677,7 @@ mod tests {
         let terminal = QueuedDiscoveryRecord {
             record: queued,
             terminal_owner: Some(context),
+            terminal_exports: Vec::new(),
         };
         validate_loader_record_context(
             &mut registry,
@@ -5439,7 +5768,7 @@ mod tests {
         second_hit.case_id = (second.get() - 1) as u8;
         second_hit.table_ptr = 0x4100;
         second_hit.hook_ts_ns = 10;
-        let queued = terminal_record_for(first, second_hit);
+        let queued = terminal_record_for(first, &[], second_hit);
         assert_eq!(
             queued.terminal_owner, None,
             "A's global drain cannot grant terminal authority to B's record"
@@ -5458,7 +5787,7 @@ mod tests {
         registry.remove(first).unwrap();
 
         registry.tombstone(second).unwrap();
-        let queued = terminal_record_for(second, second_hit);
+        let queued = terminal_record_for(second, &[], second_hit);
         assert_eq!(queued.terminal_owner, Some(second));
         validate_loader_record_context(
             &mut registry,

@@ -308,13 +308,13 @@ impl AttachPlan {
                 let mut updated = slot.clone();
                 updated.index = old.index;
                 if old.descriptor_index != updated.descriptor_index {
-                    if old.descriptor_index != 0
-                        && updated.descriptor_index != 0
-                        && old.semantics == updated.semantics
-                    {
+                    if old.descriptor_index == 0 {
+                        updated.descriptor_index = 0;
+                        updated.semantics = SlotSemantics::COUNT_ONLY;
+                    } else if updated.descriptor_index != 0 && old.semantics == updated.semantics {
                         updated.descriptor_index = old.descriptor_index;
                     } else {
-                        if old.descriptor_index == 0 || updated.descriptor_index != 0 {
+                        if updated.descriptor_index != 0 {
                             return Err(format!(
                                 "slot {} descriptor cannot change from {} to {} after policy freeze",
                                 old.index, old.descriptor_index, updated.descriptor_index
@@ -1822,6 +1822,41 @@ mod tests {
         assert!(delta.replace.is_empty());
         assert_eq!(plan.slots[0].descriptor_index, set_pin);
         assert_eq!(plan.slots[0].names, ["C_InitPIN", "C_SetPIN"]);
+    }
+
+    #[test]
+    fn extend_exact_keeps_frozen_count_only_when_one_shared_owner_survives() {
+        let first = PinnedObjectId(1);
+        let surviving = PinnedObjectId(2);
+        let target = PinnedObjectId(3);
+        let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
+        let mut plan = exact_plan(
+            vec![exact_slot(
+                0,
+                target,
+                0x10,
+                0,
+                vec![ModuleId(0), ModuleId(1)],
+            )],
+            vec![exact_module(0, first), exact_module(1, surviving)],
+        );
+        let rebuilt = exact_plan(
+            vec![exact_slot(0, target, 0x10, descriptor, vec![ModuleId(1)])],
+            vec![exact_module(1, surviving)],
+        );
+
+        let delta = plan.extend_exact(rebuilt).unwrap();
+
+        assert!(delta.new.is_empty());
+        assert!(
+            delta.replace.is_empty(),
+            "the frozen cookie is not replaced"
+        );
+        assert!(delta.retire.is_empty());
+        assert_eq!(plan.slots[0].descriptor_index, 0);
+        assert_eq!(plan.slots[0].semantics, SlotSemantics::COUNT_ONLY);
+        assert_eq!(plan.slots[0].module_ids, [ModuleId(1)]);
+        assert_eq!(plan.module_ambiguous, 0);
     }
 
     #[test]

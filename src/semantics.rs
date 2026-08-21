@@ -873,6 +873,23 @@ mod corrective_tests {
 
     #[test]
     fn refused_hidden_ambiguity_purges_unchanged_second_owner_state() {
+        assert_hidden_ambiguity_purges_unchanged_second_owner_state(false, false);
+    }
+
+    #[test]
+    fn inactive_refused_hidden_ambiguity_purges_unchanged_second_owner_state() {
+        assert_hidden_ambiguity_purges_unchanged_second_owner_state(true, false);
+    }
+
+    #[test]
+    fn inactive_committed_hidden_ambiguity_purges_unchanged_second_owner_state() {
+        assert_hidden_ambiguity_purges_unchanged_second_owner_state(true, true);
+    }
+
+    fn assert_hidden_ambiguity_purges_unchanged_second_owner_state(
+        deactivate: bool,
+        commit_shared: bool,
+    ) {
         let a = ModuleId(0);
         let c = ModuleId(1);
         let process = ProcessKey::from_pid(100);
@@ -925,13 +942,28 @@ mod corrective_tests {
         shared[0].module_ids = vec![a, c];
         let refused = AttachPlan::from_slots(shared);
         assert_eq!(refused.slots[0].descriptor_index, 0);
-        assert!(current.latch_ambiguity_from(&refused));
+        if commit_shared {
+            current = refused;
+        } else {
+            assert!(current.latch_ambiguity_from(&refused));
+        }
+        if deactivate {
+            current.deactivate(0);
+            assert!(!current.is_active(0));
+        }
 
         state.sync_plan(&current);
         tracer.sync_plan(&current);
 
-        assert_eq!(current.slots[0].descriptor_index, descriptor);
-        assert_eq!(current.slots[0].module_ids, [a]);
+        assert_eq!(
+            current.slots[0].descriptor_index,
+            if commit_shared { 0 } else { descriptor }
+        );
+        if commit_shared {
+            assert_eq!(current.slots[0].module_ids, [a, c]);
+        } else {
+            assert_eq!(current.slots[0].module_ids, [a]);
+        }
         assert_eq!(current.module_of_slot(0), None);
         assert!(!state.has_scope_state(process, Some(a)));
         assert!(!state.has_scope_state(process, Some(c)));
@@ -1330,7 +1362,7 @@ fn slot_metadata(plan: &AttachPlan) -> Vec<Option<SlotMeta>> {
         if index >= slots.len() {
             slots.resize_with(index + 1, || None);
         }
-        if !plan.is_active(slot.index) {
+        if !plan.is_active(slot.index) && !plan.slot_is_module_ambiguous(slot.index) {
             continue;
         }
         slots[index] = Some(SlotMeta {

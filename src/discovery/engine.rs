@@ -128,11 +128,12 @@ struct CandidateAdmission {
 }
 
 impl CandidateAdmission {
+    fn refuses_candidate(&self) -> bool {
+        !self.targets_ok || !self.stale_views.is_empty() || !self.missing_contexts.is_empty()
+    }
+
     fn requires_conservative_apply(&self, mutation_started: bool) -> bool {
-        mutation_started
-            && (!self.targets_ok
-                || !self.stale_views.is_empty()
-                || !self.missing_contexts.is_empty())
+        mutation_started && self.refuses_candidate()
     }
 }
 
@@ -2868,6 +2869,7 @@ impl Engine {
             &self.pinned,
             targets_ok,
         );
+        outcome.changed |= self.latch_candidate_ambiguity(&candidate.plan);
         let generation_stale = !admission.stale_views.is_empty();
         outcome.stale_views = admission.stale_views;
         outcome.missing_contexts = admission.missing_contexts;
@@ -3098,7 +3100,7 @@ impl Engine {
             );
         }
         record_object_skips(&mut candidate.plan, &self.counters.object_skips);
-        outcome.changed = candidate.plan != self.plan;
+        outcome.changed |= candidate.plan != self.plan;
         self.pinned = candidate.pinned;
         self.modules = candidate.modules;
         self.plan = candidate.plan;
@@ -3107,6 +3109,14 @@ impl Engine {
         self.discovery = discovery_evidence(&self.plan, &self.pinned, &self.counters);
         outcome.committed = true;
         Ok(outcome)
+    }
+
+    fn latch_candidate_ambiguity(&mut self, candidate: &plan::AttachPlan) -> bool {
+        if !self.plan.latch_ambiguity_from(candidate) {
+            return false;
+        }
+        self.discovery.module_ambiguous = self.plan.module_ambiguous as u64;
+        true
     }
 
     fn update_counter_snapshot(&mut self, session: &Session) -> Result<()> {
@@ -4311,6 +4321,7 @@ impl Engine {
             self.inventory_candidate(&removed, &refreshed_scans, &new_views, skipped.clone())?;
         let admission =
             self.inventory_candidate_admission(session, &candidate, &removed, &new_views);
+        let mut changed = self.latch_candidate_ambiguity(&candidate.plan);
         self.pending_rejected_keys
             .extend(admission.newly_rejected_keys.iter().copied());
         if !admission.stale_views.is_empty() {
@@ -4331,24 +4342,18 @@ impl Engine {
                 "live inventory generation",
                 "an exact retained or newly opened process generation changed during inventory preflight",
             );
-            return self.process_discovery_records(
-                session,
-                records,
-                pending_views,
-                additions_allowed,
-            );
+            changed |=
+                self.process_discovery_records(session, records, pending_views, additions_allowed)?;
+            return Ok(changed);
         }
         if !admission.targets_ok && admission.missing_contexts.is_empty() {
             self.mark_partial(
                 "live inventory transaction",
                 "candidate preflight failed; canonical identity, plan, and links were unchanged",
             );
-            return self.process_discovery_records(
-                session,
-                records,
-                pending_views,
-                additions_allowed,
-            );
+            changed |=
+                self.process_discovery_records(session, records, pending_views, additions_allowed)?;
+            return Ok(changed);
         }
 
         for context_id in &admission.missing_contexts {
@@ -4369,7 +4374,6 @@ impl Engine {
             }
         }
 
-        let mut changed = false;
         let mut mutation_started = false;
         let mut failed_retirements = BTreeSet::new();
         let mut context_retirements = BTreeSet::new();
@@ -4424,6 +4428,7 @@ impl Engine {
             self.inventory_candidate(&removed, &refreshed_scans, &new_views, skipped)?;
         let admission =
             self.inventory_candidate_admission(session, &candidate, &removed, &new_views);
+        changed |= self.latch_candidate_ambiguity(&candidate.plan);
         self.pending_rejected_keys
             .extend(admission.newly_rejected_keys.iter().copied());
         let conservative_only = admission.requires_conservative_apply(mutation_started);
@@ -5589,6 +5594,82 @@ mod tests {
             failed.requires_conservative_apply(true),
             "after dynamic retirement the same failure must commit conservative subtraction"
         );
+    }
+
+    #[test]
+    fn every_pre_mutation_refusal_latches_shared_active_slot_provenance() {
+        fn plans() -> (plan::AttachPlan, plan::AttachPlan, u32) {
+            let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
+            let mut current = plan_with(1, 0);
+            current.slots[0].descriptor_index = descriptor;
+            current.slots[0].semantics = crate::kinds::DESCRIPTORS[descriptor as usize];
+            let mut rebuilt = current.clone();
+            let mut second = rebuilt.modules[0].clone();
+            second.id = plan::ModuleId(1);
+            second.object = PinnedObjectId(43);
+            second.key.inode = 43;
+            second.path = "/opt/peer.so".into();
+            rebuilt.modules.push(second);
+            rebuilt.slots[0].descriptor_index = 0;
+            rebuilt.slots[0].semantics = p11scope_ebpf_common::SlotSemantics::COUNT_ONLY;
+            rebuilt.slots[0].semantic_ambiguous = true;
+            rebuilt.slots[0].module_ids.push(plan::ModuleId(1));
+            let mut candidate = current.clone();
+            let delta = candidate.extend_exact(rebuilt).unwrap();
+            assert_eq!(delta.replace.len(), 1);
+            (current, candidate, descriptor)
+        }
+
+        let refusals = [
+            (
+                "target preflight",
+                CandidateAdmission {
+                    targets_ok: false,
+                    ..CandidateAdmission::default()
+                },
+            ),
+            (
+                "stale generation",
+                CandidateAdmission {
+                    stale_views: [ProcessViewId(91)].into_iter().collect(),
+                    targets_ok: true,
+                    ..CandidateAdmission::default()
+                },
+            ),
+            (
+                "missing loader context",
+                CandidateAdmission {
+                    missing_contexts: vec![LoaderContextId::from_case_id(7)],
+                    targets_ok: true,
+                    ..CandidateAdmission::default()
+                },
+            ),
+        ];
+
+        for (label, admission) in refusals {
+            let (current, candidate, descriptor) = plans();
+            let mut engine = Engine::empty();
+            engine.plan = current;
+
+            assert!(admission.refuses_candidate(), "{label}");
+            assert!(
+                engine.latch_candidate_ambiguity(&candidate),
+                "{label} must report a canonical semantic change"
+            );
+            assert_eq!(engine.plan.slots[0].descriptor_index, descriptor, "{label}");
+            assert_eq!(
+                engine.plan.slots[0].module_ids,
+                [plan::ModuleId(0)],
+                "{label}"
+            );
+            assert_eq!(engine.plan.module_of_slot(0), None, "{label}");
+            assert_eq!(engine.plan.module_ambiguous, 1, "{label}");
+            assert_eq!(engine.discovery.module_ambiguous, 1, "{label}");
+            assert!(
+                !engine.latch_candidate_ambiguity(&candidate),
+                "{label} must be idempotent"
+            );
+        }
     }
 
     #[test]

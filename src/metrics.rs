@@ -302,4 +302,45 @@ mod tests {
         assert!(report.module_ambiguous);
         assert_eq!(plan.module_ambiguous, 1);
     }
+
+    #[test]
+    fn refused_shared_candidate_keeps_existing_counts_but_removes_attribution() {
+        let target = crate::discovery::identity::PinnedObjectId(10);
+        let mut current = slot(0, "C_Sign");
+        current.object = target;
+        let descriptor = current.descriptor_index;
+        let mut plan = exact_plan(vec![current]);
+
+        let mut shared = slot(0, "C_Sign");
+        shared.object = target;
+        shared.descriptor_index = 0;
+        shared.semantics = p11scope_ebpf_common::SlotSemantics::COUNT_ONLY;
+        shared.semantic_ambiguous = true;
+        shared.module_ids = vec![ModuleId(0), ModuleId(1)];
+        let mut rebuilt = AttachPlan::from_slots(vec![shared]);
+        rebuilt.modules = vec![module(0), module(1)];
+        rebuilt.modules[0].object = crate::plan::TEST_PINNED_OBJECT;
+        rebuilt.modules[0].key = crate::plan::TEST_OBJECT;
+        let mut candidate = plan.clone();
+        assert_eq!(candidate.extend_exact(rebuilt).unwrap().replace.len(), 1);
+
+        assert!(plan.latch_ambiguity_from(&candidate));
+        let report = slot_report(
+            &plan,
+            &plan.slots[0],
+            SlotStats {
+                returned: 7,
+                ..SlotStats::ZERO
+            },
+            BTreeMap::new(),
+        );
+
+        assert_eq!(plan.slots[0].descriptor_index, descriptor);
+        assert_eq!(report.calls, 7);
+        assert_eq!(report.module, None);
+        assert!(report.module_ambiguous);
+
+        plan.extend_exact(candidate).unwrap();
+        assert_eq!(plan.module_of_slot(0), None);
+    }
 }

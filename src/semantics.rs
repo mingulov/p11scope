@@ -1248,7 +1248,7 @@ fn slot_metadata(plan: &AttachPlan) -> Vec<Option<SlotMeta>> {
         slots[index] = Some(SlotMeta {
             names: slot.names.clone(),
             aliased: slot.aliased,
-            semantics: slot.semantics,
+            semantics: plan.effective_semantics(slot),
             function_id: (slot.names.len() == 1)
                 .then(|| crate::kinds::function_id(&slot.names[0]))
                 .flatten(),
@@ -3138,5 +3138,43 @@ mod tests {
         assert!(state.templates().is_empty());
         assert!(state.logins().is_empty());
         assert_eq!(state.semantic_evidence().state_reconciliations, 1);
+    }
+
+    #[test]
+    fn sync_plan_treats_sticky_module_ambiguity_as_count_only() {
+        let mut plan = test_plan();
+        let descriptor = plan.slots[0].descriptor_index;
+        let mut state = State::new(&plan);
+        let process = ProcessKey::from_pid(100);
+        state.observe_process(
+            process,
+            &ev(100, 0, fnkind::OPEN_SESSION, 1, MECH_NONE, 0, 1),
+        );
+        assert!(state.has_process_state(process));
+
+        let mut shared = plan.slots.clone();
+        shared[0].module_ids.push(ModuleId(1));
+        let candidate = AttachPlan::from_slots(shared);
+        assert!(plan.latch_ambiguity_from(&candidate));
+        state.sync_plan(&plan);
+
+        assert_eq!(plan.slots[0].descriptor_index, descriptor);
+        assert_ne!(
+            plan.slots[0].semantics,
+            p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+        );
+        assert_eq!(
+            state.slots[0].as_ref().unwrap().semantics,
+            p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+        );
+        assert!(!state.has_process_state(process));
+        state.observe_process(
+            process,
+            &ev(100, 0, fnkind::OPEN_SESSION, 2, MECH_NONE, 0, 2),
+        );
+        assert!(
+            !state.has_process_state(process),
+            "the still-attached old cookie is consumed without semantic state"
+        );
     }
 }

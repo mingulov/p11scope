@@ -286,6 +286,34 @@ impl AttachPlan {
         self.historically_ambiguous_slots.contains(&(slot as usize))
     }
 
+    pub(crate) fn effective_semantics(&self, slot: &Slot) -> SlotSemantics {
+        if self.slot_is_module_ambiguous(slot.index) {
+            SlotSemantics::COUNT_ONLY
+        } else {
+            slot.semantics
+        }
+    }
+
+    /// Retains only the aggregate-cell provenance a fully reconciled candidate
+    /// proved about already-active exact targets. Candidate identities and
+    /// topology remain local until their transaction commits.
+    pub(crate) fn latch_ambiguity_from(&mut self, candidate: &Self) -> bool {
+        let before = self.historically_ambiguous_slots.len();
+        for (key, candidate_position) in &candidate.slot_by_key {
+            if !candidate
+                .historically_ambiguous_slots
+                .contains(candidate_position)
+            {
+                continue;
+            }
+            if let Some(current_position) = self.slot_by_key.get(key) {
+                self.historically_ambiguous_slots.insert(*current_position);
+            }
+        }
+        self.module_ambiguous = self.historically_ambiguous_slots.len();
+        self.historically_ambiguous_slots.len() != before
+    }
+
     /// Applies a complete fresh planner snapshot without changing already
     /// allocated slot IDs. Only a semantic downgrade to descriptor zero may
     /// replace an existing exact target; descriptors are frozen before any
@@ -335,7 +363,9 @@ impl AttachPlan {
                     updated.names.sort();
                     updated.names.dedup();
                     updated.aliased |= old.aliased || updated.names.len() >= 2;
-                    updated.semantic_ambiguous = true;
+                    if old.descriptor_index == 0 || updated.descriptor_index == 0 {
+                        updated.semantic_ambiguous = true;
+                    }
                 }
                 if old.descriptor_index != updated.descriptor_index {
                     if old.descriptor_index == 0 {
@@ -1878,6 +1908,58 @@ mod tests {
         assert_eq!(plan.slots[0].module_ids, [ModuleId(1)]);
         assert_eq!(plan.slots[0].names, ["C_Sign", "C_SignRecover"]);
         assert!(plan.slots[0].aliased);
+        assert_eq!(plan.module_of_slot(0), None);
+        assert_eq!(plan.module_ambiguous, 1);
+    }
+
+    #[test]
+    fn refused_shared_candidate_latches_only_the_current_exact_slot() {
+        let first = PinnedObjectId(1);
+        let second = PinnedObjectId(2);
+        let target = PinnedObjectId(3);
+        let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
+        let mut plan = exact_plan(
+            vec![exact_slot(0, target, 0x10, descriptor, vec![ModuleId(0)])],
+            vec![exact_module(0, first)],
+        );
+        let original_slots = plan.slots.clone();
+        let mut shared = exact_slot(0, target, 0x10, 0, vec![ModuleId(0), ModuleId(1)]);
+        shared.semantic_ambiguous = true;
+        let mut candidate = plan.clone();
+        let delta = candidate
+            .extend_exact(exact_plan(
+                vec![shared],
+                vec![exact_module(0, first), exact_module(1, second)],
+            ))
+            .unwrap();
+        assert_eq!(delta.replace.len(), 1);
+
+        assert!(plan.latch_ambiguity_from(&candidate));
+
+        assert_eq!(plan.slots, original_slots, "candidate topology stays local");
+        assert_eq!(plan.slots[0].descriptor_index, descriptor);
+        assert_eq!(plan.module_of_slot(0), None);
+        assert_eq!(plan.module_ambiguous, 1);
+        assert!(
+            !plan.latch_ambiguity_from(&candidate),
+            "the capture-lifetime loss fact is idempotent"
+        );
+
+        let sole_owner = exact_plan(
+            vec![exact_slot(0, target, 0x10, descriptor, vec![ModuleId(0)])],
+            vec![exact_module(0, first)],
+        );
+        plan.extend_exact(sole_owner.clone()).unwrap();
+        assert_eq!(plan.slots[0].descriptor_index, descriptor);
+        assert_eq!(plan.module_of_slot(0), None);
+        assert_eq!(
+            plan.effective_semantics(&plan.slots[0]),
+            SlotSemantics::COUNT_ONLY
+        );
+        plan.extend_exact(sole_owner).unwrap();
+
+        plan.extend_exact(candidate).unwrap();
+        assert_eq!(plan.slots[0].descriptor_index, 0);
         assert_eq!(plan.module_of_slot(0), None);
         assert_eq!(plan.module_ambiguous, 1);
     }

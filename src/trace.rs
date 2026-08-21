@@ -217,7 +217,7 @@ fn trace_slots(plan: &AttachPlan) -> Vec<Option<TraceSlot>> {
         if plan.is_active(slot.index) {
             slots[index] = Some(TraceSlot {
                 names: slot.names.clone(),
-                semantics: slot.semantics,
+                semantics: plan.effective_semantics(slot),
                 semantic_authorized: slot.semantic_authorized,
             });
         }
@@ -692,5 +692,30 @@ mod tests {
         let unknown_line = tracer.on_event(&unknown, &mut state);
         assert!(unknown_line.contains(" slot#99 →"), "{unknown_line}");
         assert!(!unknown_line.contains("CKM_"), "{unknown_line}");
+    }
+
+    #[test]
+    fn sync_plan_treats_sticky_module_ambiguity_as_count_only() {
+        let mut plan = test_plan();
+        let descriptor = plan.slots[0].descriptor_index;
+        let mut tracer = Tracer::new(&plan);
+        let mut state = State::new(&plan);
+        tracer.anchor = Some((0, 0));
+
+        let mut shared = plan.slots.clone();
+        shared[0].module_ids.push(crate::plan::ModuleId(1));
+        let candidate = AttachPlan::from_slots(shared);
+        assert!(plan.latch_ambiguity_from(&candidate));
+        tracer.sync_plan(&plan);
+        state.sync_plan(&plan);
+
+        let line = tracer.on_event(&open_event(100, 0xdead_beef), &mut state);
+        assert_eq!(plan.slots[0].descriptor_index, descriptor);
+        assert_eq!(
+            tracer.slots[0].as_ref().unwrap().semantics,
+            p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+        );
+        assert!(!line.contains("sess#"), "{line}");
+        assert!(!state.pid_has_process_state(100));
     }
 }

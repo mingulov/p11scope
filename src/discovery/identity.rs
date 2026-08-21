@@ -237,6 +237,8 @@ pub struct PinnedObjects {
     ownership: BTreeMap<ProcessViewId, ViewClaims>,
     raw_ownership: BTreeMap<ProcessViewId, BTreeSet<RawObjectInstance>>,
     next_id: u32,
+    /// Sticky proof loss from either accepted scan-only overlay heuristic.
+    overlay_uncertain: bool,
     /// Latched by `check_unchanged` the first time any pin differs.
     changed: std::cell::Cell<bool>,
 }
@@ -254,6 +256,7 @@ impl PinnedObjects {
             ownership: BTreeMap::new(),
             raw_ownership: BTreeMap::new(),
             next_id: 0,
+            overlay_uncertain: false,
             changed: std::cell::Cell::new(false),
         }
     }
@@ -261,6 +264,7 @@ impl PinnedObjects {
     /// Folds another pin set into this capture. Exact comparable identities merge;
     /// an equal raw `ObjectKey` with any unequal full identity rejects the whole group.
     pub fn absorb(&mut self, other: PinnedObjects) -> Vec<Skipped> {
+        let other_overlay_uncertain = other.overlay_uncertain;
         let other_raw_ownership = other.raw_ownership;
         let mut entries = other.by_id;
         let mut raws: BTreeMap<PinnedObjectId, Vec<RawObjectInstance>> = BTreeMap::new();
@@ -318,8 +322,13 @@ impl PinnedObjects {
             );
         }
         self.changed.set(self.changed.get() || other.changed.get());
+        self.overlay_uncertain |= other_overlay_uncertain;
         self.publish_ambiguities(&mut skipped);
         skipped
+    }
+
+    pub(crate) fn has_overlay_uncertainty(&self) -> bool {
+        self.overlay_uncertain
     }
 
     pub(crate) fn newly_rejected_keys(&self, committed: &Self) -> BTreeSet<ObjectKey> {
@@ -675,6 +684,7 @@ impl PinnedObjects {
                 self.aliases_are_scan_only(*id) && overlay_identity_equal(&self.by_id[id], &entry)
             }) {
                 skipped.push(overlay_uncertainty(&entry, &self.by_id[&id]));
+                self.overlay_uncertain = true;
                 self.raw_to_id.insert(entry.raw, id);
                 return Some(id);
             }
@@ -1362,6 +1372,7 @@ pub fn canonicalize_scanned_overlays(pinned: &mut PinnedObjects) -> (usize, Vec<
     for id in canonical.keys() {
         pinned.by_id.remove(id);
     }
+    pinned.overlay_uncertain |= !canonical.is_empty();
     (canonical.len(), lost)
 }
 
@@ -1499,29 +1510,24 @@ fn pin_scanned_object(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_fixture {
     use super::*;
     use crate::discovery::scan::{ScannedEntry, ScannedTable};
-    use p11scope_manifest::identity::{IdentityKind, ObjectIdentity};
-    use p11scope_manifest::manifest::{
-        Acquisition, FunctionRecord, ObjectRecord, ProvenanceObject, SurfaceRecord, SurfaceSource,
-        Version, WalkOutcome,
-    };
 
-    const SHA: &str = "b4e608e4";
+    pub(crate) const SHA: &str = "b4e608e4";
     /// The inode and the two overlay device numbers a two-container docker run
     /// really produced (`102:56317450` and `104:56317450`).
-    const INODE: u64 = 56_317_450;
-    const PATH: &str = "/usr/lib/softhsm/libsofthsm2.so";
+    pub(crate) const INODE: u64 = 56_317_450;
+    pub(crate) const PATH: &str = "/usr/lib/softhsm/libsofthsm2.so";
 
-    fn overlay(minor: u64) -> ObjectKey {
+    pub(crate) fn overlay(minor: u64) -> ObjectKey {
         ObjectKey {
             device: Device { major: 0, minor },
             inode: INODE,
         }
     }
 
-    fn module(key: ObjectKey) -> ScannedModule {
+    pub(crate) fn module(key: ObjectKey) -> ScannedModule {
         ScannedModule {
             view: ProcessViewId(key.device.minor as u32),
             mount_namespace: MountNamespaceId {
@@ -1552,46 +1558,64 @@ mod tests {
     /// two mappings this is about live in two mount namespaces, so reaching this
     /// state through the real scan needs two containers. Each entry is
     /// `(key, sha256, ctime)`; the pin's inode is the key's, as a real pin's always is.
-    fn pin_set(entries: &[(ObjectKey, &str, i64)], overlay: bool) -> PinnedObjects {
+    pub(crate) fn pin_set(entries: &[(ObjectKey, &str, i64)], overlay: bool) -> PinnedObjects {
         let mut result = PinnedObjects::empty();
         for (key, sha, ctime) in entries {
-            let raw = RawObjectInstance {
-                mount_namespace: Some(MountNamespaceId {
-                    device: 1,
-                    inode: key.device.minor,
-                }),
-                key: *key,
-                path: PATH.into(),
-            };
-            let mapping = MappingFileKey {
-                mount_id: key.device.minor + 1,
-                device_major: key.device.major,
-                device_minor: key.device.minor,
-                inode: key.inode,
-            };
-            let entry = Entry {
-                raw,
-                mapping,
-                file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
-                pin: Pin {
-                    ino: key.inode,
-                    size: 4096,
-                    ctime: (*ctime, 7),
-                },
-                path: PATH.into(),
-                sha256: (*sha).into(),
-                build_id: None,
-                overlay,
-            };
+            let mut pins = view_pin(&module(*key), key.device.minor + 1, sha, *ctime, overlay);
+            let entry = pins.by_id.pop_first().unwrap().1;
             result.insert_entry(entry, &mut Vec::new());
         }
         result
     }
 
     /// Objects opened through a container's overlay mount — the shape this is about.
-    fn pins(entries: &[(ObjectKey, &str, i64)]) -> PinnedObjects {
+    pub(crate) fn pins(entries: &[(ObjectKey, &str, i64)]) -> PinnedObjects {
         pin_set(entries, true)
     }
+
+    pub(crate) fn view_pin(
+        module: &ScannedModule,
+        mapping_mount_id: u64,
+        sha256: &str,
+        ctime: i64,
+        overlay: bool,
+    ) -> PinnedObjects {
+        let raw = RawObjectInstance::scanned(module, module.key, &module.path).unwrap();
+        let entry = Entry {
+            mapping: MappingFileKey {
+                mount_id: mapping_mount_id,
+                device_major: module.key.device.major,
+                device_minor: module.key.device.minor,
+                inode: module.key.inode,
+            },
+            raw,
+            file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            pin: Pin {
+                ino: module.key.inode,
+                size: 4096,
+                ctime: (ctime, 7),
+            },
+            path: module.path.clone(),
+            sha256: sha256.into(),
+            build_id: None,
+            overlay,
+        };
+        let mut pins = PinnedObjects::empty();
+        pins.insert_entry(entry, &mut Vec::new());
+        pins
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_fixture::{INODE, PATH, SHA, module, overlay, pin_set, pins, view_pin};
+    use super::*;
+    use crate::discovery::scan::ScannedEntry;
+    use p11scope_manifest::identity::{IdentityKind, ObjectIdentity};
+    use p11scope_manifest::manifest::{
+        Acquisition, FunctionRecord, ObjectRecord, ProvenanceObject, SurfaceRecord, SurfaceSource,
+        Version, WalkOutcome,
+    };
 
     /// The same objects, opened on a real filesystem rather than through an overlay.
     fn image_pins(entries: &[(ObjectKey, &str, i64)]) -> PinnedObjects {
@@ -1651,38 +1675,6 @@ mod tests {
             vendor_interfaces: vec![],
             alias_groups: vec![],
         }
-    }
-
-    fn view_pin(
-        module: &ScannedModule,
-        mapping_mount_id: u64,
-        sha256: &str,
-        ctime: i64,
-        overlay: bool,
-    ) -> PinnedObjects {
-        let raw = RawObjectInstance::scanned(module, module.key, &module.path).unwrap();
-        let entry = Entry {
-            mapping: MappingFileKey {
-                mount_id: mapping_mount_id,
-                device_major: module.key.device.major,
-                device_minor: module.key.device.minor,
-                inode: module.key.inode,
-            },
-            raw,
-            file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
-            pin: Pin {
-                ino: module.key.inode,
-                size: 4096,
-                ctime: (ctime, 7),
-            },
-            path: module.path.clone(),
-            sha256: sha256.into(),
-            build_id: None,
-            overlay,
-        };
-        let mut pins = PinnedObjects::empty();
-        pins.insert_entry(entry, &mut Vec::new());
-        pins
     }
 
     fn unavailable_pins(key: ObjectKey, views: &[u64]) -> (PinnedObjects, Vec<Skipped>) {

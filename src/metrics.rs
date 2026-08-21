@@ -23,7 +23,7 @@ pub struct SlotReport {
     /// The module these counts belong to; `None` when two modules publish this
     /// target and neither can be credited (spec §4.7).
     pub module: Option<ModuleId>,
-    /// True exactly when `module` is `None` because the target is shared.
+    /// True exactly when `module` is `None` because the slot was ever shared.
     pub module_ambiguous: bool,
     /// Completed calls (entry and return both observed).
     pub calls: u64,
@@ -48,7 +48,7 @@ fn slot_report(
         aliased: slot.aliased,
         semantic_authorized: slot.semantic_authorized,
         module: plan.module_of_slot(slot.index),
-        module_ambiguous: slot.module_ids.len() >= 2,
+        module_ambiguous: plan.slot_is_module_ambiguous(slot.index),
         calls: acc.returned,
         errors: acc.errors,
         in_flight: acc.entered.saturating_sub(acc.returned),
@@ -196,6 +196,24 @@ mod tests {
         plan
     }
 
+    fn module(id: u32) -> crate::plan::ModuleSummary {
+        let object = crate::discovery::identity::PinnedObjectId(id + 1);
+        crate::plan::ModuleSummary {
+            id: ModuleId(id),
+            object,
+            key: p11scope_manifest::maps::ObjectKey {
+                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                inode: u64::from(object.0),
+            },
+            path: format!("/proc/self/fd/{}", object.0),
+            tables: vec![],
+            interfaces: 0,
+            source: "manifest",
+            corroborated: false,
+            skipped: vec![],
+        }
+    }
+
     #[test]
     fn percentiles_come_from_bucket_lower_bounds() {
         let mut b = [0u64; LATENCY_BUCKETS];
@@ -246,5 +264,42 @@ mod tests {
             None,
             "unknown slots are unattributed"
         );
+    }
+
+    #[test]
+    fn historical_shared_slot_counts_stay_unattributed_after_one_owner_survives() {
+        let target = crate::discovery::identity::PinnedObjectId(10);
+        let mut shared = slot(0, "C_Sign");
+        shared.object = target;
+        shared.descriptor_index = 0;
+        shared.semantics = p11scope_ebpf_common::SlotSemantics::COUNT_ONLY;
+        shared.semantic_ambiguous = true;
+        shared.module_ids = vec![ModuleId(0), ModuleId(1)];
+        let mut plan = AttachPlan::from_slots(vec![shared]);
+        plan.modules = vec![module(0), module(1)];
+
+        let mut survivor = slot(0, "C_Sign");
+        survivor.object = target;
+        survivor.module_ids = vec![ModuleId(1)];
+        let mut rebuilt = AttachPlan::from_slots(vec![survivor]);
+        rebuilt.modules = vec![module(1)];
+
+        plan.extend_exact(rebuilt).unwrap();
+        let report = slot_report(
+            &plan,
+            &plan.slots[0],
+            SlotStats {
+                returned: 7,
+                ..SlotStats::ZERO
+            },
+            BTreeMap::new(),
+        );
+
+        assert_eq!(plan.slots[0].module_ids, [ModuleId(1)]);
+        assert_eq!(plan.slots[0].descriptor_index, 0);
+        assert_eq!(report.calls, 7);
+        assert_eq!(report.module, None);
+        assert!(report.module_ambiguous);
+        assert_eq!(plan.module_ambiguous, 1);
     }
 }

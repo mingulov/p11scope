@@ -1929,6 +1929,9 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
             fallback.object
         );
     }
+    if pinned.has_overlay_uncertainty() {
+        discovered.invalidate_causal_timing();
+    }
     let discovery = discovery_evidence(&plan, &pinned, &counters);
     discovered.plan = plan;
     discovered.pinned = pinned;
@@ -2709,10 +2712,15 @@ impl Engine {
         &mut self,
         mut pinned: PinnedObjects,
         mut raw_modules: Vec<ScannedModule>,
-        skipped: Vec<Skipped>,
+        mut skipped: Vec<Skipped>,
     ) -> Result<LiveCandidate> {
         self.pending_rejected_keys
             .extend(pinned.newly_rejected_keys(&self.pinned));
+        let (_, overlay_skips) = canonicalize_scanned_overlays(&mut pinned);
+        skipped.extend(overlay_skips);
+        if self.pinned.has_overlay_uncertainty() || pinned.has_overlay_uncertainty() {
+            self.invalidate_causal_timing();
+        }
         for skip in skipped {
             if !self.counters.object_skips.contains(&skip) {
                 self.counters.object_skips.push(skip);
@@ -4659,6 +4667,10 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::identity::test_fixture::{
+        SHA as OVERLAY_SHA, module as overlay_module, overlay as overlay_key, pins as overlay_pins,
+        view_pin as overlay_view_pin,
+    };
     use crate::discovery::identity::{
         ManifestPinError, ManifestStaleReason, PinnedObjectId, ReconciledModule,
         pin_manifest_objects, pin_manifest_objects_deferred, pin_scanned_objects,
@@ -4729,6 +4741,22 @@ mod tests {
             .clone()
     }
 
+    fn engine_with_overlay(minor: u64) -> (Engine, ScannedModule, PinnedObjectId, PinnedTimingKey) {
+        let module = overlay_module(overlay_key(minor));
+        let mut pins = overlay_pins(&[(module.key, OVERLAY_SHA, 1)]);
+        let object = pins
+            .id_for_scanned(&module, module.key, &module.path)
+            .unwrap();
+        let timing = pins.owned_timing_key(object).unwrap();
+        let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&module), &mut pins);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let mut engine = Engine::empty();
+        engine.plan = plan::build_from_reconciled_modules(&modules);
+        engine.pinned = pins;
+        engine.modules = modules;
+        (engine, module, object, timing)
+    }
+
     #[test]
     fn interface_truncation_is_recorded_once_for_a_17_entry_invocation() {
         use p11scope_ebpf_common::DISCOVERY_INTERFACES;
@@ -4793,6 +4821,66 @@ mod tests {
             None,
             "the refused physical module keeps its loss after reappearance"
         );
+    }
+
+    #[test]
+    fn live_overlay_peer_keeps_one_stable_slot_without_new_attach_work() {
+        let (mut engine, first, original, _) = engine_with_overlay(104);
+        let second = overlay_module(overlay_key(102));
+        let mut candidate_pins = engine.pinned.clone();
+        let skipped = candidate_pins.absorb(overlay_pins(&[(second.key, OVERLAY_SHA, 1)]));
+
+        let candidate = engine
+            .live_candidate(candidate_pins, vec![first.clone(), second.clone()], skipped)
+            .unwrap();
+
+        assert_eq!(
+            candidate
+                .pinned
+                .id_for_scanned(&first, first.key, &first.path),
+            Some(original)
+        );
+        assert_eq!(
+            candidate
+                .pinned
+                .id_for_scanned(&second, second.key, &second.path),
+            Some(original),
+            "the later overlay peer must use the already committed canonical ID"
+        );
+        assert_eq!(candidate.plan.modules.len(), 1);
+        assert_eq!(candidate.plan.slots.len(), 1);
+        assert!(candidate.delta.new.is_empty());
+        assert_eq!(engine.counters.object_skips.len(), 1);
+    }
+
+    #[test]
+    fn same_key_overlay_uncertainty_keeps_causal_timing_null() {
+        let (mut engine, module, _, kept_timing) = engine_with_overlay(102);
+        engine.timings.observe(&kept_timing, 10);
+        engine.timings.complete(&kept_timing, 20);
+        assert_eq!(engine.timings.gap_ns(&kept_timing), Some(10));
+
+        let incoming = overlay_view_pin(&module, 999, OVERLAY_SHA, 1, true);
+        let incoming_object = incoming
+            .id_for_scanned(&module, module.key, &module.path)
+            .unwrap();
+        let incoming_timing = incoming.owned_timing_key(incoming_object).unwrap();
+        assert_ne!(kept_timing, incoming_timing);
+        let mut candidate_pins = engine.pinned.clone();
+        let skipped = candidate_pins.absorb(incoming);
+        assert_eq!(skipped.len(), 1, "the accepted heuristic stays explicit");
+
+        let candidate = engine
+            .live_candidate(candidate_pins, vec![module.clone()], skipped)
+            .unwrap();
+        let observed = candidate_timing_keys(&candidate, std::slice::from_ref(&module));
+        engine.observe_causal_timing(&observed, 30);
+        engine.complete_causal_timing(&observed, Some(40));
+        engine.timings.observe(&incoming_timing, 35);
+        engine.timings.complete(&incoming_timing, 45);
+
+        assert_eq!(engine.timings.gap_ns(&kept_timing), None);
+        assert_eq!(engine.timings.gap_ns(&incoming_timing), None);
     }
 
     #[test]

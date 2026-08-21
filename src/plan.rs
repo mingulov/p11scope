@@ -172,6 +172,10 @@ pub struct AttachPlan {
     // Slot indices never leave this set during one capture. Their historical
     // aggregate-map cells remain readable but may not receive new links.
     retired_slots: BTreeSet<usize>,
+    // Aggregate cells are capture-lifetime state. Once counts in a slot may
+    // belong to more than one module, later owner retirement cannot make those
+    // historical counts attributable to the survivor.
+    historically_ambiguous_slots: BTreeSet<usize>,
 }
 
 /// The one physical attachment identity. A pathname is diagnostic data, not
@@ -202,6 +206,11 @@ pub struct AttachDelta {
 impl AttachPlan {
     pub fn from_slots(slots: Vec<Slot>) -> Self {
         let mut slot_by_key = BTreeMap::new();
+        let historically_ambiguous_slots: BTreeSet<_> = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(position, slot)| (slot.module_ids.len() >= 2).then_some(position))
+            .collect();
         for (position, slot) in slots.iter().enumerate() {
             assert_eq!(slot.index as usize, position, "slot indices must be dense");
             assert!(
@@ -218,9 +227,10 @@ impl AttachPlan {
             surfaces: vec![],
             vendor_interfaces: 0,
             interface_list: "absent".into(),
-            module_ambiguous: 0,
+            module_ambiguous: historically_ambiguous_slots.len(),
             slot_by_key,
             retired_slots: BTreeSet::new(),
+            historically_ambiguous_slots,
         }
     }
 
@@ -261,16 +271,19 @@ impl AttachPlan {
     }
 
     /// The module a slot's counts belong to, or `None` when no single module
-    /// can own them (unknown slot, or a target two modules both hand out).
+    /// can own them (unknown slot, or a target two modules ever both handed out).
     pub fn module_of_slot(&self, slot: u32) -> Option<ModuleId> {
-        if !self.is_active(slot) {
+        if !self.is_active(slot) || self.slot_is_module_ambiguous(slot) {
             return None;
         }
         self.slots
-            .iter()
-            .find(|s| s.index == slot)
+            .get(slot as usize)
             .filter(|s| s.module_ids.len() == 1)
             .map(|s| s.module_ids[0])
+    }
+
+    pub(crate) fn slot_is_module_ambiguous(&self, slot: u32) -> bool {
+        self.historically_ambiguous_slots.contains(&(slot as usize))
     }
 
     /// Applies a complete fresh planner snapshot without changing already
@@ -286,6 +299,13 @@ impl AttachPlan {
         let mut slots = self.slots.clone();
         let mut slot_by_key = self.slot_by_key.clone();
         let mut retired_slots = self.retired_slots.clone();
+        let mut historically_ambiguous_slots = self.historically_ambiguous_slots.clone();
+        historically_ambiguous_slots.extend(
+            self.slots
+                .iter()
+                .enumerate()
+                .filter_map(|(position, slot)| (slot.module_ids.len() >= 2).then_some(position)),
+        );
         let mut delta = AttachDelta {
             new: vec![],
             replace: vec![],
@@ -304,9 +324,19 @@ impl AttachPlan {
         for slot in &rebuilt.slots {
             let key = AttachKey::of(slot);
             if let Some(position) = self.slot_by_key.get(&key).copied() {
-                let old = &slots[position];
+                let old = slots[position].clone();
                 let mut updated = slot.clone();
                 updated.index = old.index;
+                if updated.module_ids.len() >= 2 {
+                    historically_ambiguous_slots.insert(position);
+                }
+                if historically_ambiguous_slots.contains(&position) {
+                    updated.names.extend(old.names);
+                    updated.names.sort();
+                    updated.names.dedup();
+                    updated.aliased |= old.aliased || updated.names.len() >= 2;
+                    updated.semantic_ambiguous = true;
+                }
                 if old.descriptor_index != updated.descriptor_index {
                     if old.descriptor_index == 0 {
                         updated.descriptor_index = 0;
@@ -327,6 +357,9 @@ impl AttachPlan {
             } else {
                 let mut added = slot.clone();
                 added.index = slots.len() as u32;
+                if added.module_ids.len() >= 2 {
+                    historically_ambiguous_slots.insert(slots.len());
+                }
                 slot_by_key.insert(key, slots.len());
                 delta.new.push(added.clone());
                 slots.push(added);
@@ -343,11 +376,8 @@ impl AttachPlan {
         self.interface_list = rebuilt.interface_list;
         self.slot_by_key = slot_by_key;
         self.retired_slots = retired_slots;
-        self.module_ambiguous = self
-            .slots
-            .iter()
-            .filter(|slot| slot.module_ids.len() >= 2)
-            .count();
+        self.historically_ambiguous_slots = historically_ambiguous_slots;
+        self.module_ambiguous = self.historically_ambiguous_slots.len();
         Ok(delta)
     }
 
@@ -378,11 +408,7 @@ impl AttachPlan {
         self.retired_slots.insert(position);
         self.slot_by_key
             .remove(&AttachKey::of(&self.slots[position]));
-        self.module_ambiguous = self
-            .slots
-            .iter()
-            .filter(|slot| slot.module_ids.len() >= 2)
-            .count();
+        self.module_ambiguous = self.historically_ambiguous_slots.len();
     }
 
     fn validate_slot_index(&self) -> Result<(), String> {
@@ -773,8 +799,6 @@ fn merge(
             }
         })
         .collect();
-    let module_ambiguous = slots.iter().filter(|s| s.module_ids.len() >= 2).count();
-
     let mut plan = AttachPlan::from_slots(slots);
     plan.modules = modules;
     plan.skipped = skipped;
@@ -783,7 +807,6 @@ fn merge(
     plan.surfaces = surfaces;
     plan.vendor_interfaces = vendor_interfaces;
     plan.interface_list = interface_list;
-    plan.module_ambiguous = module_ambiguous;
     plan
 }
 
@@ -1830,14 +1853,11 @@ mod tests {
         let surviving = PinnedObjectId(2);
         let target = PinnedObjectId(3);
         let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
+        let mut shared = exact_slot(0, target, 0x10, 0, vec![ModuleId(0), ModuleId(1)]);
+        shared.names.push("C_SignRecover".into());
+        shared.aliased = true;
         let mut plan = exact_plan(
-            vec![exact_slot(
-                0,
-                target,
-                0x10,
-                0,
-                vec![ModuleId(0), ModuleId(1)],
-            )],
+            vec![shared],
             vec![exact_module(0, first), exact_module(1, surviving)],
         );
         let rebuilt = exact_plan(
@@ -1856,7 +1876,10 @@ mod tests {
         assert_eq!(plan.slots[0].descriptor_index, 0);
         assert_eq!(plan.slots[0].semantics, SlotSemantics::COUNT_ONLY);
         assert_eq!(plan.slots[0].module_ids, [ModuleId(1)]);
-        assert_eq!(plan.module_ambiguous, 0);
+        assert_eq!(plan.slots[0].names, ["C_Sign", "C_SignRecover"]);
+        assert!(plan.slots[0].aliased);
+        assert_eq!(plan.module_of_slot(0), None);
+        assert_eq!(plan.module_ambiguous, 1);
     }
 
     #[test]

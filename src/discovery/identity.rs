@@ -312,6 +312,22 @@ impl PinnedObjects {
         skipped
     }
 
+    pub(crate) fn newly_rejected_keys(&self, committed: &Self) -> BTreeSet<ObjectKey> {
+        self.rejected_keys
+            .difference(&committed.rejected_keys)
+            .copied()
+            .collect()
+    }
+
+    pub(crate) fn reapply_rejected_keys(&mut self, keys: &BTreeSet<ObjectKey>) -> Vec<Skipped> {
+        for key in keys {
+            self.reject_observation(*key);
+        }
+        let mut skipped = Vec::new();
+        self.publish_ambiguities(&mut skipped);
+        skipped
+    }
+
     /// Builds disposable capture-local identity state from pristine per-view pins.
     /// Cloning shares the already-opened files through `Arc`; it neither reopens nor
     /// duplicates an fd, and destructive collision handling cannot alter a source.
@@ -1751,6 +1767,7 @@ mod tests {
             inode: INODE,
         };
         let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
+        let committed = first.clone();
         let mut second = image_pins(&[(key, "aaaaaaaa", 1)]);
         second.by_id.values_mut().next().unwrap().mapping.mount_id += 1;
 
@@ -1763,6 +1780,14 @@ mod tests {
         );
         assert_eq!(skipped.len(), 1, "{skipped:?}");
         assert!(skipped[0].reason.contains("physical identity is ambiguous"));
+
+        let rejected = first.newly_rejected_keys(&committed);
+        assert_eq!(rejected, [key].into_iter().collect());
+        let mut replay = committed;
+        let replay_skips = replay.reapply_rejected_keys(&rejected);
+        assert!(replay.rejects(key));
+        assert_eq!(replay.pinned().count(), 0);
+        assert_eq!(ambiguity_count(&replay_skips), 1, "{replay_skips:?}");
     }
 
     #[test]

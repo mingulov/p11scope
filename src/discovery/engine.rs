@@ -56,6 +56,7 @@ pub struct Engine {
     loader_records_accepted: u64,
     timings: CausalTimings,
     discovery_truncated: u64,
+    pending_rejected_keys: BTreeSet<ObjectKey>,
 }
 
 struct ScanInput {
@@ -93,6 +94,7 @@ struct ApplyOutcome {
     missing_contexts: Vec<LoaderContextId>,
     static_completions: Vec<(BTreeSet<plan::ModuleId>, Option<u64>)>,
     static_failures: BTreeSet<plan::ModuleId>,
+    newly_rejected_keys: BTreeSet<ObjectKey>,
 }
 
 impl ApplyOutcome {
@@ -111,12 +113,27 @@ struct CandidateAdmission {
     stale_views: BTreeSet<ProcessViewId>,
     missing_contexts: Vec<LoaderContextId>,
     targets_ok: bool,
+    newly_rejected_keys: BTreeSet<ObjectKey>,
 }
 
 impl CandidateAdmission {
     fn requires_conservative_apply(&self, mutation_started: bool) -> bool {
-        mutation_started && !self.targets_ok
+        mutation_started
+            && (!self.targets_ok
+                || !self.stale_views.is_empty()
+                || !self.missing_contexts.is_empty())
     }
+}
+
+#[derive(Clone, Copy)]
+struct DynamicExportWork {
+    context: LoaderContextId,
+    module: Option<plan::ModuleId>,
+    object: PinnedObjectId,
+    file_offset: u64,
+    cookie: u64,
+    abi: HookAbi,
+    already_attached: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -2218,12 +2235,14 @@ fn candidate_admission(
     candidate_views: &BTreeSet<ProcessViewId>,
     loader_registry: &LoaderRegistry,
     candidate_pins: &PinnedObjects,
+    committed_pins: &PinnedObjects,
     targets_ok: bool,
 ) -> CandidateAdmission {
     CandidateAdmission {
         stale_views: stale_process_views(views, extra_views, candidate_views),
         missing_contexts: loader_registry.contexts_missing_from(candidate_pins),
         targets_ok,
+        newly_rejected_keys: candidate_pins.newly_rejected_keys(committed_pins),
     }
 }
 
@@ -2240,14 +2259,12 @@ fn block_unperformed_static(
     }
 }
 
-fn lose_unperformed_dynamic_owner(
-    timings: &mut CausalTimings,
-    module: Option<plan::ModuleId>,
-    already_attached: bool,
-) {
-    if !already_attached {
-        if let Some(module) = module {
-            timings.lose(module);
+fn lose_unperformed_dynamic_work(timings: &mut CausalTimings, work: &[DynamicExportWork]) {
+    for work in work {
+        if !work.already_attached {
+            if let Some(module) = work.module {
+                timings.lose(module);
+            }
         }
     }
 }
@@ -2500,6 +2517,7 @@ impl Engine {
             loader_records_accepted: 0,
             timings: CausalTimings::default(),
             discovery_truncated: 0,
+            pending_rejected_keys: BTreeSet::new(),
         }
     }
 
@@ -2734,6 +2752,17 @@ impl Engine {
         Ok((candidate, loader))
     }
 
+    fn rejected_key_candidate(&mut self, keys: &BTreeSet<ObjectKey>) -> Result<LiveCandidate> {
+        let mut pinned = self.pinned.clone();
+        let skipped = pinned.reapply_rejected_keys(keys);
+        let raw_modules = self
+            .modules
+            .iter()
+            .map(|module| module.scanned.clone())
+            .collect();
+        self.live_candidate(pinned, raw_modules, skipped)
+    }
+
     fn apply_candidate(
         &mut self,
         session: &mut Session,
@@ -2761,11 +2790,13 @@ impl Engine {
             &candidate.views,
             &self.loader_registry,
             &candidate.pinned,
+            &self.pinned,
             targets_ok,
         );
         let generation_stale = !admission.stale_views.is_empty();
         outcome.stale_views = admission.stale_views;
         outcome.missing_contexts = admission.missing_contexts;
+        outcome.newly_rejected_keys = admission.newly_rejected_keys;
         if !outcome.missing_contexts.is_empty() {
             outcome.static_failures = target_modules;
             *additions_allowed = false;
@@ -3199,15 +3230,16 @@ impl Engine {
         candidate.views.insert(self.views[position].id());
         let observed = candidate_module_ids(&candidate, &export_modules);
         self.observe_causal_timing(&observed, record.hook_ts_ns);
+        let dynamic_work =
+            self.collect_dynamic_export_work(context_id, &export_modules, &candidate, session);
         let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
         self.record_apply_timing(&outcome);
         self.queue_apply_outcome(&outcome, pending_views);
         let changed = outcome.changed;
         if terminal_owner.is_none() && outcome.committed && outcome.stale_views.is_empty() {
-            let retire = self.attach_export_hooks(
-                context_id,
+            let retire = self.attach_export_work(
                 self.views[position].id(),
-                &export_modules,
+                &dynamic_work,
                 session,
                 additions_allowed,
             );
@@ -3215,38 +3247,34 @@ impl Engine {
                 let view = self.views[position].id();
                 self.queue_stale_views(&[view].into_iter().collect(), pending_views);
             }
+        } else {
+            lose_unperformed_dynamic_work(&mut self.timings, &dynamic_work);
         }
         Ok(changed)
     }
 
-    fn attach_export_hooks(
+    fn collect_dynamic_export_work(
         &mut self,
         context: LoaderContextId,
-        view: ProcessViewId,
         modules: &[ScannedModule],
-        session: &mut Session,
-        additions_allowed: &mut bool,
-    ) -> bool {
-        let Some(pid) = self
-            .views
-            .iter()
-            .find(|candidate| candidate.id() == view)
-            .map(ProcessView::pid)
-        else {
-            return true;
-        };
-        let mut retire = false;
+        candidate: &LiveCandidate,
+        session: &Session,
+    ) -> Vec<DynamicExportWork> {
+        let mut work = Vec::new();
         for module in modules {
-            let Some(object) = self.pinned.id_for_scanned(module, module.key, &module.path) else {
+            let Some(object) = candidate
+                .pinned
+                .id_for_scanned(module, module.key, &module.path)
+            else {
                 continue;
             };
-            let module_id = self
+            let module_id = candidate
                 .plan
                 .modules
                 .iter()
                 .find(|candidate| candidate.object == object)
                 .map(|candidate| candidate.id);
-            let snapshot = self
+            let snapshot = candidate
                 .pinned
                 .file_for(object)
                 .and_then(|file| ElfSnapshot::read(file).ok());
@@ -3274,72 +3302,101 @@ impl Engine {
                     );
                     continue;
                 };
-                if !*additions_allowed {
-                    lose_unperformed_dynamic_owner(
-                        &mut self.timings,
-                        module_id,
-                        session.has_dynamic_export(
-                            context,
-                            (object, fact.file_offset),
-                            cookie,
-                            abi,
-                        ),
-                    );
-                    continue;
+                work.push(DynamicExportWork {
+                    context,
+                    module: module_id,
+                    object,
+                    file_offset: fact.file_offset,
+                    cookie,
+                    abi,
+                    already_attached: session.has_dynamic_export(
+                        context,
+                        (object, fact.file_offset),
+                        cookie,
+                        abi,
+                    ),
+                });
+            }
+        }
+        work
+    }
+
+    fn attach_export_work(
+        &mut self,
+        view: ProcessViewId,
+        work: &[DynamicExportWork],
+        session: &mut Session,
+        additions_allowed: &mut bool,
+    ) -> bool {
+        let Some(pid) = self
+            .views
+            .iter()
+            .find(|candidate| candidate.id() == view)
+            .map(ProcessView::pid)
+        else {
+            lose_unperformed_dynamic_work(&mut self.timings, work);
+            return true;
+        };
+        let mut retire = false;
+        for work in work {
+            if work.already_attached {
+                continue;
+            }
+            if !*additions_allowed {
+                if let Some(module) = work.module {
+                    self.timings.lose(module);
                 }
-                let detach_failures = session.detach_failures().len();
-                let attach = generation_checked_mutation(
-                    || {
-                        self.views
-                            .iter()
-                            .find(|candidate| candidate.id() == view)
-                            .is_some_and(ProcessView::still_the_same)
-                    },
-                    || {
-                        session.attach_dynamic_export(
-                            context,
-                            pid,
-                            (object, fact.file_offset),
-                            cookie,
-                            abi,
-                            &self.pinned,
-                        )
-                    },
-                );
-                match attach {
-                    GenerationMutation::Committed(Ok((added, completed))) => {
-                        if added {
-                            if let Some(module_id) = module_id {
-                                self.complete_causal_timing(
-                                    &[module_id].into_iter().collect(),
-                                    completed,
-                                );
-                            }
+                continue;
+            }
+            let detach_failures = session.detach_failures().len();
+            let attach = generation_checked_mutation(
+                || {
+                    self.views
+                        .iter()
+                        .find(|candidate| candidate.id() == view)
+                        .is_some_and(ProcessView::still_the_same)
+                },
+                || {
+                    session.attach_dynamic_export(
+                        work.context,
+                        pid,
+                        (work.object, work.file_offset),
+                        work.cookie,
+                        work.abi,
+                        &self.pinned,
+                    )
+                },
+            );
+            match attach {
+                GenerationMutation::Committed(Ok((added, completed))) => {
+                    if added {
+                        if let Some(module) = work.module {
+                            self.complete_causal_timing(&[module].into_iter().collect(), completed);
                         }
                     }
-                    GenerationMutation::Committed(Err(_)) => {
-                        if let Some(module_id) = module_id {
-                            self.timings.lose(module_id);
-                        }
-                        if session.detach_failures().len() > detach_failures {
-                            *additions_allowed = false;
-                        }
-                        self.mark_partial(
-                            "live export hook",
-                            "a fixed-purpose dynamic export attachment failed",
-                        );
+                }
+                GenerationMutation::Committed(Err(_)) => {
+                    if let Some(module) = work.module {
+                        self.timings.lose(module);
                     }
-                    GenerationMutation::PrecheckFailed | GenerationMutation::PostcheckFailed(_) => {
-                        if let Some(module_id) = module_id {
-                            self.timings.lose(module_id);
-                        }
+                    if session.detach_failures().len() > detach_failures {
                         *additions_allowed = false;
-                        retire = true;
-                        self.mark_partial(
-                            "live export hook",
-                            "the process generation changed around a dynamic export attachment",
-                        );
                     }
+                    self.mark_partial(
+                        "live export hook",
+                        "a fixed-purpose dynamic export attachment failed",
+                    );
+                }
+                GenerationMutation::PrecheckFailed | GenerationMutation::PostcheckFailed(_) => {
+                    if let Some(module) = work.module {
+                        self.timings.lose(module);
+                    }
+                    *additions_allowed = false;
+                    retire = true;
+                    self.mark_partial(
+                        "live export hook",
+                        "the process generation changed around a dynamic export attachment",
+                    );
                 }
             }
         }
@@ -3753,6 +3810,13 @@ impl Engine {
         outcome: &ApplyOutcome,
         pending_views: &mut PendingViewRetirements,
     ) {
+        if outcome.committed {
+            self.pending_rejected_keys
+                .retain(|key| !outcome.newly_rejected_keys.contains(key));
+        } else {
+            self.pending_rejected_keys
+                .extend(outcome.newly_rejected_keys.iter().copied());
+        }
         for context_id in &outcome.missing_contexts {
             let Some(context) = self.loader_registry.context(*context_id) else {
                 continue;
@@ -3769,6 +3833,33 @@ impl Engine {
             }
         }
         self.queue_stale_views(&outcome.stale_views, pending_views);
+    }
+
+    fn replay_pending_rejections(
+        &mut self,
+        session: &mut Session,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+    ) -> Result<ApplyOutcome> {
+        let keys = std::mem::take(&mut self.pending_rejected_keys);
+        let candidate = match self.rejected_key_candidate(&keys) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                self.pending_rejected_keys.extend(keys);
+                return Err(error);
+            }
+        };
+        let outcome = match self.apply_candidate(session, candidate, additions_allowed, false, &[])
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.pending_rejected_keys.extend(keys);
+                return Err(error);
+            }
+        };
+        self.record_apply_timing(&outcome);
+        self.queue_apply_outcome(&outcome, pending_views);
+        Ok(outcome)
     }
 
     fn dispatch_discovery_record(
@@ -3814,6 +3905,7 @@ impl Engine {
     ) -> Result<bool> {
         let mut changed = false;
         let mut named_generation_lost = false;
+        let mut rejection_replay_attempted = false;
         loop {
             for queued in std::mem::take(records) {
                 match self.dispatch_discovery_record(
@@ -3830,7 +3922,16 @@ impl Engine {
                 }
             }
             if pending_views.is_empty() {
-                break;
+                if self.pending_rejected_keys.is_empty() || rejection_replay_attempted {
+                    break;
+                }
+                rejection_replay_attempted = true;
+                let outcome =
+                    self.replay_pending_rejections(session, additions_allowed, pending_views)?;
+                changed |= outcome.changed;
+                if pending_views.is_empty() {
+                    break;
+                }
             }
             for (view, mut generation_lost) in std::mem::take(pending_views) {
                 generation_lost |= pending_views.remove(&view).unwrap_or(false);
@@ -3842,6 +3943,7 @@ impl Engine {
                 if !complete {
                     continue;
                 }
+                rejection_replay_attempted = false;
                 let outcome = self.retire_view_candidate(view, session, additions_allowed)?;
                 changed |= outcome.changed;
                 self.queue_apply_outcome(&outcome, pending_views);
@@ -3958,6 +4060,7 @@ impl Engine {
             &required_views,
             &self.loader_registry,
             &candidate.pinned,
+            &self.pinned,
             session
                 .preflight_targets(&targets, &candidate.pinned)
                 .is_ok(),
@@ -4098,6 +4201,8 @@ impl Engine {
             self.inventory_candidate(&removed, &refreshed_scans, &new_views, skipped.clone())?;
         let admission =
             self.inventory_candidate_admission(session, &candidate, &removed, &new_views);
+        self.pending_rejected_keys
+            .extend(admission.newly_rejected_keys.iter().copied());
         if !admission.stale_views.is_empty() {
             let retained_ids: BTreeSet<_> = self.views.iter().map(ProcessView::id).collect();
             let retained_stale: BTreeSet<_> = admission
@@ -4128,7 +4233,12 @@ impl Engine {
                 "live inventory transaction",
                 "candidate preflight failed; canonical identity, plan, and links were unchanged",
             );
-            return Ok(false);
+            return self.process_discovery_records(
+                session,
+                records,
+                pending_views,
+                additions_allowed,
+            );
         }
 
         for context_id in &admission.missing_contexts {
@@ -4193,6 +4303,9 @@ impl Engine {
             self.inventory_candidate(&removed, &refreshed_scans, &new_views, skipped)?;
         let admission =
             self.inventory_candidate_admission(session, &candidate, &removed, &new_views);
+        self.pending_rejected_keys
+            .extend(admission.newly_rejected_keys.iter().copied());
+        let conservative_only = admission.requires_conservative_apply(mutation_started);
         if !admission.stale_views.is_empty() || !admission.missing_contexts.is_empty() {
             let retained_ids: BTreeSet<_> = self.views.iter().map(ProcessView::id).collect();
             let retained_stale: BTreeSet<_> = admission
@@ -4217,8 +4330,9 @@ impl Engine {
                 missing_contexts: admission.missing_contexts,
                 ..ApplyOutcome::default()
             };
-            let cleanup_needed =
-                !outcome.stale_views.is_empty() || !outcome.missing_contexts.is_empty();
+            let cleanup_needed = conservative_only
+                || !outcome.stale_views.is_empty()
+                || !outcome.missing_contexts.is_empty();
             self.queue_apply_outcome(&outcome, pending_views);
             changed |=
                 self.process_discovery_records(session, records, pending_views, additions_allowed)?;
@@ -4237,13 +4351,18 @@ impl Engine {
                     pending_views,
                     additions_allowed,
                 )?;
+                if cleanup.committed {
+                    self.views.retain(|view| !removed.contains(&view.id()));
+                    for view in removed.iter().chain(&refreshed_ok) {
+                        self.scan_inputs.remove(view);
+                    }
+                }
             }
             if matches!(self.scope, Scope::Pid(_)) && !outcome.stale_views.is_empty() {
                 bail!("the named process generation changed during inventory preflight");
             }
             return Ok(changed);
         }
-        let conservative_only = admission.requires_conservative_apply(mutation_started);
         if !admission.targets_ok {
             self.mark_partial(
                 "live inventory transaction",
@@ -4461,6 +4580,18 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
     use std::path::PathBuf;
 
+    fn dynamic_export_work(module: plan::ModuleId, already_attached: bool) -> DynamicExportWork {
+        DynamicExportWork {
+            context: LoaderContextId::from_case_id(0),
+            module: Some(module),
+            object: PinnedObjectId(7),
+            file_offset: 0x10,
+            cookie: 1,
+            abi: HookAbi::FunctionList,
+            already_attached,
+        }
+    }
+
     #[test]
     fn interface_truncation_is_recorded_once_for_a_17_entry_invocation() {
         use p11scope_ebpf_common::DISCOVERY_INTERFACES;
@@ -4600,6 +4731,7 @@ mod tests {
             missing_contexts: Vec::new(),
             static_completions: vec![([completed].into_iter().collect(), Some(20))],
             static_failures: [failed].into_iter().collect(),
+            newly_rejected_keys: BTreeSet::new(),
         };
 
         engine.record_apply_timing(&outcome);
@@ -4667,9 +4799,14 @@ mod tests {
             timings.observe(module, 10);
         }
         timings.complete(duplicate, 15);
-        lose_unperformed_dynamic_owner(&mut timings, Some(first), false);
-        lose_unperformed_dynamic_owner(&mut timings, Some(second), false);
-        lose_unperformed_dynamic_owner(&mut timings, Some(duplicate), true);
+        lose_unperformed_dynamic_work(
+            &mut timings,
+            &[
+                dynamic_export_work(first, false),
+                dynamic_export_work(second, false),
+                dynamic_export_work(duplicate, true),
+            ],
+        );
         for module in [first, second] {
             timings.complete(module, 30);
             assert_eq!(
@@ -4682,6 +4819,31 @@ mod tests {
             timings.gap_ns(duplicate),
             Some(5),
             "an already-attached dynamic pair is not unperformed work"
+        );
+    }
+
+    #[test]
+    fn refused_dynamic_only_candidate_loses_its_exact_owner() {
+        let module = plan::ModuleId(3);
+        let mut timings = CausalTimings::default();
+        timings.observe(module, 10);
+        let refused = ApplyOutcome {
+            missing_contexts: vec![LoaderContextId::from_case_id(0)],
+            ..ApplyOutcome::default()
+        };
+        let work = [dynamic_export_work(module, false)];
+
+        if refused.committed && refused.stale_views.is_empty() {
+            timings.complete(module, 20);
+        } else {
+            lose_unperformed_dynamic_work(&mut timings, &work);
+        }
+        timings.complete(module, 30);
+
+        assert_eq!(
+            timings.gap_ns(module),
+            None,
+            "a later attach cannot substitute for dynamic work skipped by candidate refusal"
         );
     }
 
@@ -4940,12 +5102,41 @@ mod tests {
             &candidate.views,
             &engine.loader_registry,
             &candidate.pinned,
+            &engine.pinned,
             true,
         );
         assert_eq!(
             admission.missing_contexts,
             vec![prepared, attached, tombstoned],
             "Prepared, Attached, and Tombstoned loader pins are all candidate evidence"
+        );
+
+        assert!(candidate.pinned.rejects(loader_module.key));
+        let rejected_keys = candidate.pinned.newly_rejected_keys(&engine.pinned);
+        let outcome = ApplyOutcome {
+            missing_contexts: admission.missing_contexts.clone(),
+            newly_rejected_keys: rejected_keys.clone(),
+            ..ApplyOutcome::default()
+        };
+        let mut pending_views = PendingViewRetirements::new();
+        engine.queue_apply_outcome(&outcome, &mut pending_views);
+        assert_eq!(engine.pending_rejected_keys, rejected_keys);
+        drop(candidate);
+        engine.loader_registry.cancel_prepared(prepared).unwrap();
+        engine.loader_registry.remove(prepared).unwrap();
+        engine.loader_registry.tombstone(attached).unwrap();
+        engine.loader_registry.remove(attached).unwrap();
+        engine.loader_registry.remove(tombstoned).unwrap();
+        let keys = std::mem::take(&mut engine.pending_rejected_keys);
+        let replay = engine.rejected_key_candidate(&keys).unwrap();
+        assert!(
+            replay.pinned.rejects(loader_module.key),
+            "serial context cleanup cannot discard the collision that selected it"
+        );
+        assert_eq!(
+            replay.delta.retire.len(),
+            1,
+            "the fresh post-cleanup candidate must retain the affected provider retirement"
         );
         assert_eq!(unsafe { libc::munmap(address, len) }, 0);
     }
@@ -4973,6 +5164,7 @@ mod tests {
             &candidate_views,
             &LoaderRegistry::default(),
             &PinnedObjects::empty(),
+            &PinnedObjects::empty(),
             false,
         );
 
@@ -4994,6 +5186,24 @@ mod tests {
         assert!(
             failed.requires_conservative_apply(true),
             "after dynamic retirement the same failure must commit conservative subtraction"
+        );
+    }
+
+    #[test]
+    fn post_retirement_local_new_stale_requires_conservative_apply() {
+        let stale = CandidateAdmission {
+            stale_views: [ProcessViewId(91)].into_iter().collect(),
+            targets_ok: true,
+            ..CandidateAdmission::default()
+        };
+
+        assert!(
+            !stale.requires_conservative_apply(false),
+            "a pre-mutation local generation loss leaves canonical topology unchanged"
+        );
+        assert!(
+            stale.requires_conservative_apply(true),
+            "after dynamic retirement local-only staleness still requires static subtraction"
         );
     }
 

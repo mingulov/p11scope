@@ -486,6 +486,10 @@ fn attached_probes_after_detach(attached: usize, live_attached: usize, terminal:
     if terminal { attached } else { live_attached }
 }
 
+fn static_attached_links_with<T>(links: &[T], mut slot: impl FnMut(&T) -> Option<u32>) -> usize {
+    links.iter().filter(|link| slot(link).is_some()).count()
+}
+
 /// Renders `e` and every `.source()` beneath it, joined by `: `. Several
 /// of aya's error variants (e.g. `ProgramError::SyscallError`) are
 /// `#[error(transparent)]`, so `{e}` alone prints only the outer
@@ -1017,7 +1021,6 @@ impl Session {
                     cookie,
                     id,
                 });
-                self.attached += 1;
                 Ok(())
             }
             Err(error) => {
@@ -1119,7 +1122,6 @@ impl Session {
                 id,
             });
         }
-        self.attached += 2;
         Ok(())
     }
 
@@ -1322,16 +1324,7 @@ impl Session {
             }
         }
         self.links = retained;
-        let live_attached = self
-            .links
-            .iter()
-            .filter(|link| {
-                matches!(
-                    link,
-                    RegisteredLink::UProbe { .. } | RegisteredLink::DynamicUProbe { .. }
-                )
-            })
-            .count();
+        let live_attached = static_attached_links_with(&self.links, RegisteredLink::slot);
 
         let mut first_error = None;
         for error in detach_selected_with(
@@ -1564,15 +1557,17 @@ mod tests {
 
         assert_eq!(*attempted.borrow(), [1, 2], "every detach is one-shot");
         assert_eq!(errors.len(), 1);
+    }
 
-        let replacement_attempted = std::cell::Cell::new(false);
-        if errors.is_empty() {
-            replacement_attempted.set(true);
-        }
-        assert!(
-            !replacement_attempted.get(),
-            "no replacement may follow a failed detach in the same cycle"
+    #[test]
+    fn dynamic_links_do_not_change_attached_probes_after_detach() {
+        let links = [Some(0), Some(0), None, None, None];
+        assert_eq!(
+            static_attached_links_with(&links, |slot| *slot),
+            2,
+            "the public count includes only the two static slot programs"
         );
+        assert_eq!(attached_probes_after_detach(2, 2, false), 2);
     }
 
     #[test]

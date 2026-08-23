@@ -155,7 +155,7 @@ pub(crate) trait PauseIo {
         Ok(false)
     }
 
-    fn stop_candidate_seen(&self) -> bool {
+    fn take_stop_candidate_seen(&mut self) -> bool {
         false
     }
 }
@@ -428,6 +428,7 @@ impl PauseCoordinator {
         io: &mut impl PauseIo,
         received: TimedItem,
     ) -> Result<(), PauseError> {
+        self.take_stop_candidate_seen(io);
         self.failure_deadline
             .get_or_insert_with(|| received.after_ns.checked_add(CYCLE_NS).unwrap_or(u64::MAX));
         match io.cancelled() {
@@ -669,7 +670,7 @@ impl PauseCoordinator {
         let outcome = match io.apply_batch(records, Some(deadline), true) {
             Ok(outcome) => outcome,
             Err(error) => {
-                self.epoch.zero_candidate |= io.stop_candidate_seen();
+                self.take_stop_candidate_seen(io);
                 return self.fail_cycle(io, error, false);
             }
         };
@@ -962,9 +963,7 @@ impl PauseCoordinator {
         ) {
             errors.push(error);
         }
-        let stop_candidate_seen = io.stop_candidate_seen();
-        self.epoch.zero_candidate |= stop_candidate_seen;
-        self.may_be_stopped |= stop_candidate_seen;
+        self.take_stop_candidate_seen(io);
         match io.authorization() {
             Ok(Some(PAUSE_REQUESTED)) => {
                 self.may_be_stopped = true;
@@ -1106,9 +1105,7 @@ impl PauseCoordinator {
         if let Err(error) = io.apply_batch(records, Some(deadline), false) {
             errors.push(error);
         }
-        let stop_candidate_seen = io.stop_candidate_seen();
-        self.epoch.zero_candidate |= stop_candidate_seen;
-        self.may_be_stopped |= stop_candidate_seen;
+        self.take_stop_candidate_seen(io);
         match io.authorization() {
             Ok(Some(PAUSE_REQUESTED)) => {
                 if self.epoch.rejected {
@@ -1223,6 +1220,12 @@ impl PauseCoordinator {
             self.counters.attempts = self.counters.attempts.saturating_add(1);
             self.attempt_open = true;
         }
+    }
+
+    fn take_stop_candidate_seen(&mut self, io: &mut impl PauseIo) {
+        let seen = io.take_stop_candidate_seen();
+        self.epoch.zero_candidate |= seen;
+        self.may_be_stopped |= seen;
     }
 
     fn policy_error(
@@ -1408,8 +1411,8 @@ impl PauseIo for SessionPauseIo<'_> {
         (self.cancelled)()
     }
 
-    fn stop_candidate_seen(&self) -> bool {
-        self.stop_candidate_seen
+    fn take_stop_candidate_seen(&mut self) -> bool {
+        std::mem::take(&mut self.stop_candidate_seen)
     }
 }
 
@@ -1743,9 +1746,6 @@ mod tests {
                     self.applied.push(record);
                 }
             }
-            if self.revalidation_consumes_winner {
-                self.authorization = Some(PAUSE_REQUESTED);
-            }
             Ok(PauseRevalidationOutcome::Complete(PauseBatchOutcome {
                 required_complete: self.revalidation_required_complete,
             }))
@@ -1792,8 +1792,11 @@ mod tests {
             Ok(self.cancelled)
         }
 
-        fn stop_candidate_seen(&self) -> bool {
-            self.revalidation_consumes_winner || self.retirement_stop_candidate_seen
+        fn take_stop_candidate_seen(&mut self) -> bool {
+            let seen = self.revalidation_consumes_winner || self.retirement_stop_candidate_seen;
+            self.revalidation_consumes_winner = false;
+            self.retirement_stop_candidate_seen = false;
+            seen
         }
     }
 
@@ -2322,6 +2325,39 @@ mod tests {
             1,
             "the coordinator ledger owns the consumed winner's protective resume"
         );
+    }
+
+    #[test]
+    fn completed_owner_debt_does_not_resume_an_unconsumed_successor() {
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_ARMED),
+            revalidation_required_complete: false,
+            revalidation_item: Some(DiscoveryItem::Record(record(1, 0, false))),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.revalidate_after_release(&mut io).unwrap();
+
+        assert_eq!(io.revalidation_pause_owned, [true, true]);
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1,
+            "owner 1 debt must not invent a resume for the ARMED successor"
+        );
+        assert_eq!(
+            coordinator.counters(),
+            PauseCounters {
+                attempts: 2,
+                confirmed: 1,
+                partial: 1,
+            }
+        );
+        assert!(coordinator.counters().valid());
+        assert_eq!(io.authorization, None);
+        assert!(!coordinator.is_armed());
+        assert!(!coordinator.rearming_enabled());
     }
 
     #[test]

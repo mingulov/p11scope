@@ -30,6 +30,31 @@ use std::path::PathBuf;
 
 const BPF_F_RDONLY_PROG: u32 = 1 << 7;
 
+#[derive(Debug)]
+pub(crate) enum DynamicLoaderAttachFailure {
+    KernelUnavailable(anyhow::Error),
+    Provenance(anyhow::Error),
+    Registry(anyhow::Error),
+    ProgramMissing,
+    ProgramType(anyhow::Error),
+    InvalidPid,
+}
+
+impl std::fmt::Display for DynamicLoaderAttachFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KernelUnavailable(error)
+            | Self::Provenance(error)
+            | Self::Registry(error)
+            | Self::ProgramType(error) => write!(formatter, "{error:#}"),
+            Self::ProgramMissing => {
+                formatter.write_str("program dl_debug_state missing from object")
+            }
+            Self::InvalidPid => formatter.write_str("dynamic loader PID must be non-zero"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ExactMapMetadata {
     map_type: MapType,
@@ -1064,16 +1089,21 @@ impl Session {
         file_offset: u64,
         cookie: u64,
         objects: &PinnedObjects,
-    ) -> Result<bool> {
-        if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
-            bail!("a pinned loader object changed before dynamic attach");
+    ) -> std::result::Result<bool, DynamicLoaderAttachFailure> {
+        if !objects
+            .check_unchanged()
+            .map_err(|error| DynamicLoaderAttachFailure::Provenance(anyhow!(error)))?
+        {
+            return Err(DynamicLoaderAttachFailure::Provenance(anyhow!(
+                "a pinned loader object changed before dynamic attach"
+            )));
         }
         if self.has_dynamic_link(context, "dl_debug_state", object, file_offset, cookie) {
             return Ok(false);
         }
         let path = objects
             .attach_path_for(object)
-            .map_err(anyhow::Error::msg)?;
+            .map_err(|error| DynamicLoaderAttachFailure::Registry(anyhow!(error)))?;
         let point = UProbeAttachPoint {
             location: UProbeAttachLocation::AbsoluteOffset(file_offset),
             cookie: Some(cookie),
@@ -1082,10 +1112,11 @@ impl Session {
         let probe: &mut UProbe = self
             .ebpf
             .program_mut(program)
-            .with_context(|| format!("program {program} missing from object"))?
-            .try_into()?;
+            .ok_or(DynamicLoaderAttachFailure::ProgramMissing)?
+            .try_into()
+            .map_err(|error| DynamicLoaderAttachFailure::ProgramType(anyhow::Error::from(error)))?;
         let scope = UProbeScope::OneProcess(
-            std::num::NonZeroU32::new(pid).context("dynamic loader PID must be non-zero")?,
+            std::num::NonZeroU32::new(pid).ok_or(DynamicLoaderAttachFailure::InvalidPid)?,
         );
         match probe.attach(point, &path, scope) {
             Ok(id) => {
@@ -1106,7 +1137,9 @@ impl Session {
                     object,
                     error_chain(&error)
                 );
-                Err(anyhow!(message))
+                Err(DynamicLoaderAttachFailure::KernelUnavailable(anyhow!(
+                    message
+                )))
             }
         }
     }

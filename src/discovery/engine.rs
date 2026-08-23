@@ -1,7 +1,8 @@
 //! Initial and incremental provider discovery ownership.
 
 use crate::attach::{
-    CapturePolicy, CounterSnapshot, DynamicExportIdentity, OwnedPauseGeneration, Scope, Session,
+    CapturePolicy, CounterSnapshot, DynamicExportIdentity, DynamicLoaderAttachFailure,
+    OwnedPauseGeneration, Scope, Session,
 };
 use crate::cli::CaptureArgs;
 use crate::discovery::hooks::{HookAbi, HookRegistry};
@@ -73,6 +74,30 @@ type InventoryScan = (ProcessViewId, Vec<ScannedModule>, PinnedObjects);
 type InventoryScanOutcome = (Vec<InventoryScan>, BTreeSet<u32>, Vec<Skipped>);
 type PendingViewRetirements = BTreeMap<ProcessViewId, bool>;
 type DiscoveryCollector<'a> = dyn FnMut(&mut Session) -> Result<(Vec<DiscoveryRecord>, u64)> + 'a;
+
+pub(crate) struct DeferredDiscoveryItem {
+    pub(crate) before_ns: u64,
+    pub(crate) after_ns: u64,
+    pub(crate) item: crate::events::DiscoveryItem,
+}
+
+impl std::fmt::Debug for DeferredDiscoveryItem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeferredDiscoveryItem")
+            .field("before_ns", &self.before_ns)
+            .field("after_ns", &self.after_ns)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for DeferredDiscoveryItem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("pause-owned discovery item requires coordinator classification")
+    }
+}
+
+impl std::error::Error for DeferredDiscoveryItem {}
 
 struct ManifestInput {
     path: PathBuf,
@@ -2485,12 +2510,18 @@ enum OwnedLoaderPrearmOutcome {
 }
 
 fn classify_owned_prearm_attach(
-    attach: GenerationMutation<Result<bool>>,
+    attach: GenerationMutation<std::result::Result<bool, DynamicLoaderAttachFailure>>,
 ) -> OwnedPrearmAttachDisposition {
     match attach {
         GenerationMutation::Committed(Ok(true)) => OwnedPrearmAttachDisposition::Attached,
-        GenerationMutation::Committed(Err(error)) => OwnedPrearmAttachDisposition::Unavailable {
-            reason: error.to_string(),
+        GenerationMutation::Committed(Err(DynamicLoaderAttachFailure::KernelUnavailable(
+            error,
+        ))) => OwnedPrearmAttachDisposition::Unavailable {
+            reason: format!("{error:#}"),
+        },
+        GenerationMutation::Committed(Err(error)) => OwnedPrearmAttachDisposition::Lifecycle {
+            producer_exists: false,
+            reason: format!("dynamic loader attachment invariant failed: {error}"),
         },
         GenerationMutation::PrecheckFailed => OwnedPrearmAttachDisposition::Lifecycle {
             producer_exists: false,
@@ -3925,20 +3956,29 @@ impl Engine {
                     .map_err(|error| LoaderArmFailure::invariant(anyhow!(error)))?;
                 true
             }
-            GenerationMutation::Committed(Err(_)) => {
+            GenerationMutation::Committed(Err(error)) => {
                 self.loader_registry
                     .cancel_prepared(context)
                     .map_err(|error| LoaderArmFailure::invariant(anyhow!(error)))?;
                 self.loader_registry
                     .remove(context)
                     .map_err(|error| LoaderArmFailure::invariant(anyhow!(error)))?;
-                self.mark_partial(
-                    "live loader arming",
-                    "the fixed-purpose loader attachment failed",
-                );
-                false
+                match error {
+                    DynamicLoaderAttachFailure::KernelUnavailable(_) => {
+                        self.mark_partial(
+                            "live loader arming",
+                            "the fixed-purpose loader attachment failed",
+                        );
+                        false
+                    }
+                    error => {
+                        return Err(LoaderArmFailure::invariant(anyhow!(
+                            "dynamic loader attachment invariant failed: {error}"
+                        )));
+                    }
+                }
             }
-            GenerationMutation::PrecheckFailed | GenerationMutation::PostcheckFailed(Err(_)) => {
+            GenerationMutation::PrecheckFailed => {
                 self.loader_registry
                     .cancel_prepared(context)
                     .map_err(|error| LoaderArmFailure::invariant(anyhow!(error)))?;
@@ -3946,6 +3986,21 @@ impl Engine {
                     .remove(context)
                     .map_err(|error| LoaderArmFailure::invariant(anyhow!(error)))?;
                 true
+            }
+            GenerationMutation::PostcheckFailed(Err(error)) => {
+                self.loader_registry
+                    .cancel_prepared(context)
+                    .map_err(|error| LoaderArmFailure::invariant(anyhow!(error)))?;
+                self.loader_registry
+                    .remove(context)
+                    .map_err(|error| LoaderArmFailure::invariant(anyhow!(error)))?;
+                if matches!(&error, DynamicLoaderAttachFailure::KernelUnavailable(_)) {
+                    true
+                } else {
+                    return Err(LoaderArmFailure::invariant(anyhow!(
+                        "dynamic loader attachment invariant failed around generation change: {error}"
+                    )));
+                }
             }
         };
         if generation_lost {
@@ -4312,6 +4367,7 @@ impl Engine {
                             }
                         }
                     }
+                    Ok(Err(error)) if error.is::<DeferredDiscoveryItem>() => return Err(error),
                     Ok(Err(_)) => {
                         closure.fail();
                         self.mark_live_loss(
@@ -5573,13 +5629,32 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_prearm_attach_unavailability_is_the_only_fallback() {
+    fn typed_prearm_attach_unavailability_is_the_only_fallback() {
+        use crate::attach::DynamicLoaderAttachFailure;
+
         assert!(matches!(
-            classify_owned_prearm_attach(GenerationMutation::Committed(Err(anyhow!(
-                "kernel loader attach unavailable"
-            )))),
+            classify_owned_prearm_attach(GenerationMutation::Committed(Err(
+                DynamicLoaderAttachFailure::KernelUnavailable(anyhow!(
+                    "kernel loader attach unavailable"
+                ))
+            ))),
             OwnedPrearmAttachDisposition::Unavailable { .. }
         ));
+        for failure in [
+            DynamicLoaderAttachFailure::Provenance(anyhow!("pinned identity changed")),
+            DynamicLoaderAttachFailure::Registry(anyhow!("attach path unavailable")),
+            DynamicLoaderAttachFailure::ProgramMissing,
+            DynamicLoaderAttachFailure::ProgramType(anyhow!("wrong Aya program type")),
+            DynamicLoaderAttachFailure::InvalidPid,
+        ] {
+            assert!(matches!(
+                classify_owned_prearm_attach(GenerationMutation::Committed(Err(failure))),
+                OwnedPrearmAttachDisposition::Lifecycle {
+                    producer_exists: false,
+                    ..
+                }
+            ));
+        }
         assert!(matches!(
             classify_owned_prearm_attach(GenerationMutation::PrecheckFailed),
             OwnedPrearmAttachDisposition::Lifecycle {

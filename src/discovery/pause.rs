@@ -1,7 +1,11 @@
 #![allow(dead_code)] // Task 8 wires this reviewed internal coordinator into the binary loop.
 
 use crate::run::OwnedChild;
-use crate::{attach, attach::Session, discovery::engine::Engine};
+use crate::{
+    attach,
+    attach::Session,
+    discovery::engine::{DeferredDiscoveryItem, Engine},
+};
 use p11scope_ebpf_common::{
     COALESCED_NO_HELPER_RC, DISCOVERY_STATUS_COALESCED_NO_HELPER, DiscoveryRecord, PAUSE_ARMED,
     PAUSE_REQUESTED,
@@ -131,7 +135,10 @@ pub(crate) trait PauseIo {
         deadline: Option<u64>,
         additions_allowed: bool,
     ) -> Result<PauseBatchOutcome, String>;
-    fn revalidate_after_release(&mut self, pause_owned: bool) -> Result<PauseBatchOutcome, String>;
+    fn revalidate_after_release(
+        &mut self,
+        pause_owned: bool,
+    ) -> Result<PauseRevalidationOutcome, String>;
     fn marker_seen(&mut self) -> Result<bool, String>;
     fn resume(&mut self) -> Result<(), String>;
     fn detach_pause_links(&mut self) -> Result<(), String>;
@@ -156,6 +163,12 @@ pub(crate) trait PauseIo {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PauseBatchOutcome {
     pub(crate) required_complete: bool,
+}
+
+#[allow(clippy::large_enum_variant)] // The frozen 896-byte item stays allocation-free in transfer.
+pub(crate) enum PauseRevalidationOutcome {
+    Complete(PauseBatchOutcome),
+    Deferred(TimedItem),
 }
 
 #[derive(Debug, Default)]
@@ -318,28 +331,40 @@ impl PauseCoordinator {
         &mut self,
         io: &mut impl PauseIo,
     ) -> Result<(), PauseError> {
-        let pause_owned = self.policy != PausePolicy::Never;
-        if pause_owned && !self.armed {
-            self.begin_attempt();
-            return self.fail_cycle(
-                io,
-                "owned-child revalidation started without an armed pause",
-                true,
-            );
-        }
-        match io.revalidate_after_release(pause_owned) {
-            Ok(outcome) if outcome.required_complete => Ok(()),
-            Ok(_) => {
-                self.begin_attempt();
-                self.fail_cycle(
-                    io,
-                    "post-release loader revalidation did not close required discovery",
-                    false,
-                )
-            }
-            Err(error) => {
-                self.begin_attempt();
-                self.fail_cycle(io, error, false)
+        loop {
+            let pause_owned = self.armed || self.attempt_open || self.may_be_stopped;
+            match io.revalidate_after_release(pause_owned) {
+                Ok(PauseRevalidationOutcome::Deferred(received)) if pause_owned => {
+                    self.service_received(io, received)?;
+                }
+                Ok(PauseRevalidationOutcome::Deferred(_)) => {
+                    return Err(Self::policy_error(
+                        self.policy,
+                        "ordinary revalidation returned a pause-owned discovery item",
+                        true,
+                    ));
+                }
+                Ok(PauseRevalidationOutcome::Complete(outcome))
+                    if outcome.required_complete || !pause_owned =>
+                {
+                    return Ok(());
+                }
+                Ok(PauseRevalidationOutcome::Complete(_)) => {
+                    self.begin_attempt();
+                    return self.fail_cycle(
+                        io,
+                        "post-release loader revalidation did not close required discovery",
+                        false,
+                    );
+                }
+                Err(_) if !pause_owned && self.policy == PausePolicy::Auto => return Ok(()),
+                Err(error) if !pause_owned => {
+                    return Err(Self::policy_error(self.policy, error, true));
+                }
+                Err(error) => {
+                    self.begin_attempt();
+                    return self.fail_cycle(io, error, false);
+                }
             }
         }
     }
@@ -396,6 +421,14 @@ impl PauseCoordinator {
             }
             return Ok(());
         };
+        self.service_received(io, received)
+    }
+
+    fn service_received(
+        &mut self,
+        io: &mut impl PauseIo,
+        received: TimedItem,
+    ) -> Result<(), PauseError> {
         self.failure_deadline
             .get_or_insert_with(|| received.after_ns.checked_add(CYCLE_NS).unwrap_or(u64::MAX));
         match io.cancelled() {
@@ -1307,20 +1340,38 @@ impl PauseIo for SessionPauseIo<'_> {
         })
     }
 
-    fn revalidate_after_release(&mut self, pause_owned: bool) -> Result<PauseBatchOutcome, String> {
+    fn revalidate_after_release(
+        &mut self,
+        pause_owned: bool,
+    ) -> Result<PauseRevalidationOutcome, String> {
         let child = self.child;
         let stop_candidate_seen = &mut self.stop_candidate_seen;
         let mut collect = |session: &mut Session| {
             collect_timed_retirement(session, child, None, stop_candidate_seen, pause_owned)
         };
-        let outcome = self
-            .engine
-            .revalidate_owned_session_with(self.child, self.session, &mut collect)
-            .map_err(|error| format!("owned-child revalidation failed: {error:#}"))?;
+        let outcome =
+            match self
+                .engine
+                .revalidate_owned_session_with(self.child, self.session, &mut collect)
+            {
+                Ok(outcome) => outcome,
+                Err(error) => match error.downcast::<DeferredDiscoveryItem>() {
+                    Ok(deferred) => {
+                        return Ok(PauseRevalidationOutcome::Deferred(TimedItem {
+                            before_ns: deferred.before_ns,
+                            after_ns: deferred.after_ns,
+                            item: deferred.item,
+                        }));
+                    }
+                    Err(error) => {
+                        return Err(format!("owned-child revalidation failed: {error:#}"));
+                    }
+                },
+            };
         self.plan_changed |= outcome.changed;
-        Ok(PauseBatchOutcome {
+        Ok(PauseRevalidationOutcome::Complete(PauseBatchOutcome {
             required_complete: outcome.required_complete,
-        })
+        }))
     }
 
     fn marker_seen(&mut self) -> Result<bool, String> {
@@ -1377,12 +1428,6 @@ fn collect_timed_retirement(
             ));
         }
         let item = session.discovery_dequeue()?;
-        if let Some(DiscoveryItem::Record(record)) = item.as_ref()
-            && exact_pid(record) == child.pid()
-            && record.send_signal_rc == 0
-        {
-            *stop_candidate_seen = true;
-        }
         let after_ns =
             attach::monotonic_ns().ok_or_else(|| anyhow::anyhow!("monotonic clock read failed"))?;
         if deadline.is_some_and(|deadline| after_ns > deadline) {
@@ -1397,9 +1442,19 @@ fn collect_timed_retirement(
             ));
         }
         if pause_owned && deadline.is_none() {
-            return Err(anyhow::anyhow!(
-                "pause-owned revalidation observed discovery before coordinator assignment"
-            ));
+            return Err(DeferredDiscoveryItem {
+                before_ns,
+                after_ns,
+                item,
+            }
+            .into());
+        }
+        if let DiscoveryItem::Record(record) = &item
+            && pause_owned
+            && exact_pid(record) == child.pid()
+            && record.send_signal_rc == 0
+        {
+            *stop_candidate_seen = true;
         }
         match item {
             DiscoveryItem::Malformed => {
@@ -1463,7 +1518,7 @@ fn parse_task_state(stat: &[u8]) -> Option<u8> {
         .flatten()
 }
 
-struct TimedItem {
+pub(crate) struct TimedItem {
     before_ns: u64,
     after_ns: u64,
     item: DiscoveryItem,
@@ -1523,6 +1578,8 @@ mod tests {
         fallback_ring_loss: u64,
         revalidation_required_complete: bool,
         revalidation_consumes_winner: bool,
+        revalidation_item: Option<DiscoveryItem>,
+        revalidation_pause_owned: Vec<bool>,
     }
 
     impl Default for FakeIo {
@@ -1549,6 +1606,8 @@ mod tests {
                 fallback_ring_loss: 0,
                 revalidation_required_complete: true,
                 revalidation_consumes_winner: false,
+                revalidation_item: None,
+                revalidation_pause_owned: Vec::new(),
             }
         }
     }
@@ -1631,15 +1690,32 @@ mod tests {
 
         fn revalidate_after_release(
             &mut self,
-            _pause_owned: bool,
-        ) -> Result<PauseBatchOutcome, String> {
+            pause_owned: bool,
+        ) -> Result<PauseRevalidationOutcome, String> {
             self.events.push("revalidate");
+            self.revalidation_pause_owned.push(pause_owned);
+            if let Some(item) = self.revalidation_item.take() {
+                if pause_owned {
+                    self.authorization = Some(PAUSE_REQUESTED);
+                    self.revalidation_consumes_winner = matches!(
+                        &item,
+                        DiscoveryItem::Record(record) if record.send_signal_rc == 0
+                    );
+                    return Ok(PauseRevalidationOutcome::Deferred(TimedItem {
+                        before_ns: 1,
+                        after_ns: 2,
+                        item,
+                    }));
+                } else if let DiscoveryItem::Record(record) = item {
+                    self.applied.push(record);
+                }
+            }
             if self.revalidation_consumes_winner {
                 self.authorization = Some(PAUSE_REQUESTED);
             }
-            Ok(PauseBatchOutcome {
+            Ok(PauseRevalidationOutcome::Complete(PauseBatchOutcome {
                 required_complete: self.revalidation_required_complete,
-            })
+            }))
         }
 
         fn marker_seen(&mut self) -> Result<bool, String> {
@@ -2193,6 +2269,73 @@ mod tests {
             1,
             "the coordinator ledger owns the consumed winner's protective resume"
         );
+    }
+
+    #[test]
+    fn post_release_negative_helper_is_classified_before_failure_cleanup() {
+        let rejected = record(10, i64::from(-libc::EPERM), false);
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_ARMED),
+            revalidation_required_complete: false,
+            revalidation_item: Some(DiscoveryItem::Record(rejected)),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.revalidate_after_release(&mut io).unwrap();
+
+        assert_eq!(io.revalidation_pause_owned, [true, false]);
+        assert_eq!(io.applied.len(), 1);
+        assert_eq!(io.applied[0].send_signal_rc, rejected.send_signal_rc);
+        assert_eq!(io.authorization, None);
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            0,
+            "a real negative helper cannot create a protective resume obligation"
+        );
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(coordinator.counters().valid());
+    }
+
+    #[test]
+    fn never_revalidation_uses_only_the_ordinary_retirement_route() {
+        let ordinary = record(10, 0, false);
+        let mut io = FakeIo {
+            revalidation_required_complete: false,
+            revalidation_item: Some(DiscoveryItem::Record(ordinary)),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Never, 41, 9, stopped());
+
+        coordinator.revalidate_after_release(&mut io).unwrap();
+
+        assert_eq!(io.revalidation_pause_owned, [false]);
+        assert_eq!(io.applied.len(), 1);
+        assert_eq!(io.applied[0].send_signal_rc, ordinary.send_signal_rc);
+        assert_eq!(io.events, ["revalidate"]);
+        assert_eq!(io.authorization, None);
+        assert_eq!(coordinator.counters(), PauseCounters::default());
+        assert!(coordinator.counters().valid());
+    }
+
+    #[test]
+    fn disabled_auto_revalidation_keeps_the_single_arm_failure_attempt() {
+        let mut io = FakeIo {
+            same_generation: false,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        io.same_generation = true;
+        io.revalidation_item = Some(DiscoveryItem::Record(record(10, 0, false)));
+
+        coordinator.revalidate_after_release(&mut io).unwrap();
+
+        assert_eq!(io.revalidation_pause_owned, [false]);
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(coordinator.counters().valid());
+        assert!(!io.events.contains(&"resume"));
     }
 
     #[test]

@@ -4,4 +4,5 @@ pub mod engine;
 pub mod hooks;
 pub mod identity;
 pub(crate) mod loader;
+pub(crate) mod pause;
 pub mod scan;

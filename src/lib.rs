@@ -13,6 +13,7 @@ pub mod output;
 pub mod plan;
 pub mod process;
 pub mod render;
+pub(crate) mod run;
 pub mod scope;
 pub mod semantics;
 pub mod shapes;

@@ -6,9 +6,10 @@ use crate::discovery::identity::{PinnedObjectId, PinnedObjects};
 use crate::discovery::loader::LoaderContextId;
 use crate::events;
 use crate::plan::{AttachPlan, Slot};
+use crate::run::OwnedChild;
 use anyhow::{Context as _, Result, anyhow, bail};
 use aya::Ebpf;
-use aya::maps::{Array, HashMap, Map, MapType, PerCpuArray, ProgramArray};
+use aya::maps::{Array, HashMap, Map, MapError, MapType, PerCpuArray, ProgramArray};
 use aya::programs::trace_point::TracePointLinkId;
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeLinkId, UProbeScope};
 use aya::programs::{TracePoint, UProbe};
@@ -308,9 +309,19 @@ impl CapturePolicy {
     }
 }
 
-pub struct OwnedPauseGeneration {
+pub(crate) struct OwnedPauseGeneration {
     tgid: u32,
     generation: NonZeroU64,
+}
+
+impl OwnedPauseGeneration {
+    #[allow(dead_code)] // Task 8 invokes the reviewed owned-run Engine route.
+    pub(crate) fn from_owned_child(child: &OwnedChild) -> Self {
+        Self {
+            tgid: child.pid(),
+            generation: child.generation(),
+        }
+    }
 }
 
 fn pause_key_for(
@@ -339,6 +350,7 @@ pub struct Session {
     attached: usize,
     policy: CapturePolicy,
     uprobe_scope: UProbeScope,
+    #[allow(dead_code)] // Task 8 drives the Task 7 pause coordinator.
     pause_key: Option<PauseKey>,
     links: Vec<RegisteredLink>,
 }
@@ -877,7 +889,7 @@ lockdown mode, a kernel below the supported floor (>= 5.15), missing BTF \
 docs/notes/phase5-unsupported.md for what each looks like when observed.";
 
 impl Session {
-    pub fn start(
+    pub(crate) fn start(
         plan: &AttachPlan,
         scope: &Scope,
         objects: &PinnedObjects,
@@ -1483,11 +1495,12 @@ impl Session {
         events::Drain::new(&mut self.ebpf)
     }
 
-    pub(crate) fn discovery_drain(&mut self) -> Result<events::DiscoveryDrain<'_>> {
-        events::DiscoveryDrain::new(&mut self.ebpf)
+    pub(crate) fn discovery_dequeue(&mut self) -> Result<Option<events::DiscoveryItem>> {
+        let mut drain = events::DiscoveryDrain::new(&mut self.ebpf)?;
+        Ok(drain.dequeue())
     }
 
-    #[allow(dead_code)] // Task 7 owns the first caller.
+    #[allow(dead_code)] // Task 8 drives the Task 7 pause coordinator.
     pub(crate) fn arm_pause(&mut self) -> Result<()> {
         let key = self
             .pause_key
@@ -1518,6 +1531,40 @@ impl Session {
             bail!("PAUSE_PIDS exact full-key readback differs from ARMED");
         }
         Ok(())
+    }
+
+    #[allow(dead_code)] // Task 8 drives the Task 7 pause coordinator.
+    pub(crate) fn pause_state(&self) -> Result<Option<u64>> {
+        let key = self
+            .pause_key
+            .context("this session has no owned pause generation")?;
+        let pauses: HashMap<_, PauseKey, u64> =
+            HashMap::try_from(self.ebpf.map("PAUSE_PIDS").context("PAUSE_PIDS map")?)?;
+        match pauses.get(&key, 0) {
+            Ok(state) => Ok(Some(state)),
+            Err(MapError::KeyNotFound) => Ok(None),
+            Err(error) => Err(error).context("reading PAUSE_PIDS authorization"),
+        }
+    }
+
+    #[allow(dead_code)] // Task 8 drives the Task 7 pause coordinator.
+    pub(crate) fn remove_pause(&mut self) -> Result<Option<u64>> {
+        let key = self
+            .pause_key
+            .context("this session has no owned pause generation")?;
+        let mut pauses: HashMap<_, PauseKey, u64> =
+            HashMap::try_from(self.ebpf.map_mut("PAUSE_PIDS").context("PAUSE_PIDS map")?)?;
+        let state = match pauses.get(&key, 0) {
+            Ok(state) => Some(state),
+            Err(MapError::KeyNotFound) => None,
+            Err(error) => return Err(error).context("reading PAUSE_PIDS before removal"),
+        };
+        if state.is_some() {
+            pauses
+                .remove(&key)
+                .context("removing PAUSE_PIDS authorization")?;
+        }
+        Ok(state)
     }
 
     /// Attach points that failed — reported as an evidence gap, never

@@ -30,6 +30,13 @@ pub(crate) fn decode_discovery(bytes: &[u8]) -> Option<DiscoveryRecord> {
     valid_discovery_record(&record).then_some(record)
 }
 
+#[derive(Clone, Copy)]
+#[allow(clippy::large_enum_variant)] // The fixed 896-byte ring ABI stays allocation-free per dequeue.
+pub(crate) enum DiscoveryItem {
+    Record(DiscoveryRecord),
+    Malformed,
+}
+
 /// Drains the `EVENTS` ring buffer, handing each well-formed record to a
 /// caller-supplied closure and counting the rest as malformed.
 pub struct Drain<'a> {
@@ -63,27 +70,21 @@ impl<'a> Drain<'a> {
 /// count is deliberately independent from the public call-event transport.
 pub(crate) struct DiscoveryDrain<'a> {
     ring: aya::maps::RingBuf<&'a mut MapData>,
-    malformed: u64,
 }
 
 impl<'a> DiscoveryDrain<'a> {
     pub(crate) fn new(ebpf: &'a mut Ebpf) -> Result<Self> {
         let ring =
             aya::maps::RingBuf::try_from(ebpf.map_mut("DISCOVERY").context("DISCOVERY map")?)?;
-        Ok(Self { ring, malformed: 0 })
+        Ok(Self { ring })
     }
 
-    pub(crate) fn poll(&mut self, mut f: impl FnMut(DiscoveryRecord)) {
-        while let Some(item) = self.ring.next() {
-            match decode_discovery(&item) {
-                Some(record) => f(record),
-                None => self.malformed += 1,
-            }
+    pub(crate) fn dequeue(&mut self) -> Option<DiscoveryItem> {
+        let item = self.ring.next()?;
+        match decode_discovery(&item) {
+            Some(record) => Some(DiscoveryItem::Record(record)),
+            None => Some(DiscoveryItem::Malformed),
         }
-    }
-
-    pub(crate) fn malformed(&self) -> u64 {
-        self.malformed
     }
 }
 

@@ -1,6 +1,8 @@
 //! Initial and incremental provider discovery ownership.
 
-use crate::attach::{CapturePolicy, CounterSnapshot, DynamicExportIdentity, Scope, Session};
+use crate::attach::{
+    CapturePolicy, CounterSnapshot, DynamicExportIdentity, OwnedPauseGeneration, Scope, Session,
+};
 use crate::cli::CaptureArgs;
 use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
@@ -15,6 +17,7 @@ use crate::discovery::scan::{
 };
 use crate::manifest_input::{read_manifest, validate_structure};
 use crate::process::{self, ProcessView, ProcessViewId};
+use crate::run::OwnedChild;
 use crate::{plan, render};
 use anyhow::{Context as _, Result, anyhow, bail};
 use p11scope_ebpf_common::{
@@ -2674,9 +2677,16 @@ impl Engine {
 
     fn collect_discovery_records(session: &mut Session) -> Result<(Vec<DiscoveryRecord>, u64)> {
         let mut records = Vec::new();
-        let mut drain = session.discovery_drain()?;
-        drain.poll(|record| records.push(record));
-        Ok((records, drain.malformed()))
+        let mut malformed = 0u64;
+        while let Some(item) = session.discovery_dequeue()? {
+            match item {
+                crate::events::DiscoveryItem::Record(record) => records.push(record),
+                crate::events::DiscoveryItem::Malformed => {
+                    malformed = malformed.saturating_add(1);
+                }
+            }
+        }
+        Ok((records, malformed))
     }
 
     fn record_malformed_discovery(&mut self, malformed: u64) {
@@ -4566,6 +4576,15 @@ impl Engine {
     /// draining the ordinary event ring.
     pub fn drain_discovery(&mut self, session: &mut Session) -> Result<bool> {
         let (records, malformed) = Self::collect_discovery_records(session)?;
+        self.apply_discovery_batch(session, records, malformed)
+    }
+
+    pub(crate) fn apply_discovery_batch(
+        &mut self,
+        session: &mut Session,
+        records: Vec<DiscoveryRecord>,
+        malformed: u64,
+    ) -> Result<bool> {
         let mut records: Vec<_> = records
             .into_iter()
             .map(|record| QueuedDiscoveryRecord {
@@ -4628,12 +4647,29 @@ impl Engine {
     }
 
     pub fn start_session(&mut self, policy: CapturePolicy) -> Result<Session> {
+        self.start_session_with(policy, None)
+    }
+
+    #[allow(dead_code)] // Task 8 invokes this reviewed library-internal route.
+    pub(crate) fn start_owned_session(
+        &mut self,
+        policy: CapturePolicy,
+        child: &OwnedChild,
+    ) -> Result<Session> {
+        self.start_session_with(policy, Some(OwnedPauseGeneration::from_owned_child(child)))
+    }
+
+    fn start_session_with(
+        &mut self,
+        policy: CapturePolicy,
+        mut pause_generation: Option<OwnedPauseGeneration>,
+    ) -> Result<Session> {
         let retained_scope = self.scope.clone();
         let named = matches!(retained_scope, Scope::Pid(_));
         let scope = &retained_scope;
         let mut session =
             start_retained_with(self, named, process::stale_view_ids, |plan, pinned| {
-                Session::start(plan, scope, pinned, policy, None)
+                Session::start(plan, scope, pinned, policy, pause_generation.take())
             })?;
         let mut additions_allowed = true;
         let mut records = Vec::new();

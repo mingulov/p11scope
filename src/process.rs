@@ -380,6 +380,35 @@ impl PidPin {
             None => process_start_time(self.pid).ok() == self.start_time,
         }
     }
+
+    /// Proves that this pin retained the original pidfd and that the kernel
+    /// still grants signal authority for that exact process generation.
+    pub(crate) fn probe_signal_authority(&self) -> Result<(), String> {
+        self.send_signal(0)
+    }
+
+    /// Sends through the retained original pidfd. A `/proc` fallback pin is
+    /// identity evidence only and can never become signal authority.
+    pub(crate) fn send_signal(&self, signal: i32) -> Result<(), String> {
+        let fd = self
+            .pidfd
+            .as_ref()
+            .ok_or_else(|| "process pin has no original pidfd signal authority".to_string())?;
+        pidfd_send_signal(fd, signal)
+            .map_err(|error| format!("pidfd signal {signal} for pid {} failed: {error}", self.pid))
+    }
+
+    pub(crate) fn wait_ready(&self, timeout: Option<std::time::Duration>) -> io::Result<bool> {
+        let fd = self
+            .pidfd
+            .as_ref()
+            .ok_or_else(|| io::Error::other("process pin has no original pidfd"))?;
+        let timeout_ms = match timeout {
+            None => -1,
+            Some(duration) => i32::try_from(duration.as_millis()).unwrap_or(i32::MAX),
+        };
+        pidfd_ready_with_timeout(fd, timeout_ms)
+    }
 }
 
 fn pidfd_still_same_with(ready: impl FnOnce() -> io::Result<bool>) -> bool {
@@ -420,17 +449,39 @@ fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
 }
 
 fn pidfd_ready(fd: &OwnedFd) -> io::Result<bool> {
+    pidfd_ready_with_timeout(fd, 0)
+}
+
+fn pidfd_ready_with_timeout(fd: &OwnedFd, timeout_ms: i32) -> io::Result<bool> {
     let mut pollfd = libc::pollfd {
         fd: fd.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };
-    // SAFETY: one valid pollfd for a nonblocking poll.
-    let result = unsafe { libc::poll(&mut pollfd, 1, 0) };
+    // SAFETY: one valid pollfd and a finite or conventional infinite timeout.
+    let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
     if result < 0 {
         Err(io::Error::last_os_error())
     } else {
-        Ok(result > 0)
+        Ok(result > 0 && pollfd.revents & libc::POLLIN != 0)
+    }
+}
+
+fn pidfd_send_signal(fd: &OwnedFd, signal: i32) -> io::Result<()> {
+    // SAFETY: fd is the retained pidfd; siginfo is null and flags are zero.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -451,6 +502,7 @@ fn process_start_time(pid: u32) -> io::Result<u64> {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+    use std::os::unix::process::ExitStatusExt as _;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
@@ -556,6 +608,24 @@ mod tests {
         assert!(!pidfd_still_same_with(|| {
             Err(io::Error::from(io::ErrorKind::Interrupted))
         }));
+    }
+
+    #[test]
+    fn original_pidfd_is_the_only_signal_authority() {
+        let mut child = Command::new("sleep").arg("10").spawn().unwrap();
+        let pin = PidPin::open(child.id()).unwrap();
+        pin.probe_signal_authority().unwrap();
+        pin.send_signal(libc::SIGTERM).unwrap();
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+
+        let fallback = PidPin {
+            pid: std::process::id(),
+            pidfd: None,
+            start_time: process_start_time(std::process::id()).ok(),
+        };
+        assert!(fallback.probe_signal_authority().is_err());
+        assert!(fallback.send_signal(0).is_err());
     }
 
     #[test]

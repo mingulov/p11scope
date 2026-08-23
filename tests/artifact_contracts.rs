@@ -104,7 +104,7 @@ fn assert_live_discovery_host_contract(
     assert_exact_policy_map_metadata_contract(attach)?;
     for (marker, contract) in [
         (
-            "pub struct OwnedPauseGeneration {\n    tgid: u32,\n    generation: NonZeroU64,\n}",
+            "pub(crate) struct OwnedPauseGeneration {\n    tgid: u32,\n    generation: NonZeroU64,\n}",
             "opaque owned pause capability",
         ),
         ("pub(crate) ebpf: Ebpf,", "crate-only mutable Ebpf"),
@@ -117,8 +117,8 @@ fn assert_live_discovery_host_contract(
             "fixed-purpose public EVENTS drain",
         ),
         (
-            "pub(crate) fn discovery_drain(",
-            "crate-only DISCOVERY drain",
+            "pub(crate) fn discovery_dequeue(",
+            "crate-only one-item DISCOVERY dequeue",
         ),
         (
             "fn arm_pause(&mut self)",
@@ -133,8 +133,8 @@ fn assert_live_discovery_host_contract(
             "separate discovery drain owner",
         ),
         (
-            "ring: aya::maps::RingBuf<&'a mut MapData>,\n    malformed: u64,",
-            "independent drain malformed owner",
+            "pub(crate) enum DiscoveryItem {\n    Record(DiscoveryRecord),\n    Malformed,\n}",
+            "explicit one-item discovery outcome",
         ),
     ] {
         require_contract_marker(events, marker, contract)?;
@@ -206,22 +206,39 @@ fn assert_live_discovery_host_contract(
     if main.contains("Session::start(")
         || engine.matches("Session::start(").count() != 1
         || engine
-            .matches("Session::start(plan, scope, pinned, policy, None)")
+            .matches("Session::start(plan, scope, pinned, policy, pause_generation.take())")
+            .count()
+            != 1
+        || engine
+            .matches("self.start_session_with(policy, None)")
+            .count()
+            != 1
+        || engine
+            .matches("Some(OwnedPauseGeneration::from_owned_child(child))")
+            .count()
+            != 1
+        || attach
+            .matches("fn from_owned_child(child: &OwnedChild)")
             .count()
             != 1
     {
-        return Err("Engine must own exactly one unarmed Session::start caller".into());
+        return Err(
+            "Engine must own one shared Session::start route and one owned-child capability caller"
+                .into(),
+        );
     }
     if main.contains("events::Drain::new(&mut session.ebpf)")
         || main.matches("session.event_drain()?").count() != 2
     {
         return Err("the binary must use only the fixed-purpose event drain seam".into());
     }
-    if attach.matches("map_mut(\"PAUSE_PIDS\")").count() != 1
+    if attach.matches("map_mut(\"PAUSE_PIDS\")").count() != 2
         || attach.matches("arm_pause(").count() != 1
+        || attach.matches("pause_state(").count() != 1
+        || attach.matches("remove_pause(").count() != 1
         || scope.contains("PAUSE_PIDS")
     {
-        return Err("Task 5 must have one dormant arming insertion site and no caller".into());
+        return Err("Task 7 must keep the exact internal pause authorization surface".into());
     }
     for (marker, contract) in [
         (
@@ -240,6 +257,85 @@ fn assert_live_discovery_host_contract(
         require_contract_marker(attach, marker, contract)?;
     }
     Ok(())
+}
+
+fn assert_owned_run_pause_internal_contract(
+    attach: &str,
+    events: &str,
+    engine: &str,
+    library: &str,
+    main: &str,
+    pause: &str,
+    run: &str,
+) -> Result<(), String> {
+    for (source, marker, contract) in [
+        (library, "pub(crate) mod run;", "crate-private run module"),
+        (
+            pause,
+            "pub(crate) struct PauseCoordinator",
+            "crate-private pause coordinator",
+        ),
+        (
+            pause,
+            "pub(crate) struct SessionPauseIo",
+            "fixed Session/Engine pause adapter",
+        ),
+        (
+            run,
+            "pub(crate) struct OwnedChild",
+            "crate-private owned child",
+        ),
+        (
+            attach,
+            "fn from_owned_child(child: &OwnedChild)",
+            "owned-child-only capability",
+        ),
+        (
+            events,
+            "pub(crate) enum DiscoveryItem",
+            "one-item discovery result",
+        ),
+        (
+            engine,
+            "Some(OwnedPauseGeneration::from_owned_child(child))",
+            "sole present-capability construction",
+        ),
+        (
+            pause,
+            ".apply_discovery_batch(self.session, records, std::mem::take(&mut self.malformed))",
+            "sole Engine discovery application authority",
+        ),
+        (
+            pause,
+            "self.child.pin().send_signal(libc::SIGCONT)",
+            "original-pidfd resume authority",
+        ),
+    ] {
+        require_contract_marker(source, marker, contract)?;
+    }
+    if main.contains("OwnedChild")
+        || main.contains("PauseCoordinator")
+        || library.contains("pub mod run;")
+        || attach.contains("pub struct OwnedPauseGeneration")
+        || engine
+            .matches("Some(OwnedPauseGeneration::from_owned_child(child))")
+            .count()
+            != 1
+    {
+        return Err("Task 7 machinery must remain internal and owned-child-only".into());
+    }
+    require_before(
+        pause,
+        "let before_ns = io.now_ns()?;",
+        "let item = io.dequeue()?;",
+        "clock before each discovery dequeue",
+    )?;
+    require_before(
+        pause,
+        "let item = io.dequeue()?;",
+        "let after_ns = io.now_ns()?;",
+        "clock after each discovery dequeue",
+    )
 }
 
 fn assert_static_descriptor_cookie_contract(attach: &str, ebpf: &str) -> Result<(), String> {
@@ -894,15 +990,37 @@ fn descriptor_cookie_and_publication_source_guard_rejects_contract_regressions()
 }
 
 #[test]
-fn live_discovery_host_contract_is_opaque_fixed_purpose_and_unarmed() {
+fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
     let attach = read("src/attach.rs");
     let scope = read("src/scope.rs");
     let events = read("src/events.rs");
     let hooks = read("src/discovery/hooks.rs");
     let engine = read("src/discovery/engine.rs");
+    let library = read("src/lib.rs");
     let main = read("src/main.rs");
+    let pause = read("src/discovery/pause.rs");
+    let run = read("src/run.rs");
 
     assert_live_discovery_host_contract(&attach, &scope, &events, &hooks, &engine, &main).unwrap();
+    assert_owned_run_pause_internal_contract(
+        &attach, &events, &engine, &library, &main, &pause, &run,
+    )
+    .unwrap();
+
+    let public_run = library.replacen("pub(crate) mod run;", "pub mod run;", 1);
+    assert!(
+        assert_owned_run_pause_internal_contract(
+            &attach,
+            &events,
+            &engine,
+            &public_run,
+            &main,
+            &pause,
+            &run,
+        )
+        .is_err(),
+        "Task 7 must not broaden the public library surface"
+    );
 
     let public_ebpf = attach.replacen("pub(crate) ebpf: Ebpf,", "pub ebpf: Ebpf,", 1);
     assert!(
@@ -917,8 +1035,8 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_unarmed() {
         "the owned capability fields must remain opaque"
     );
     let armed_engine = engine.replacen(
-        "Session::start(plan, scope, pinned, policy, None)",
-        "Session::start(plan, scope, pinned, policy, Some(capability))",
+        "self.start_session_with(policy, None)",
+        "self.start_owned_session(policy, child)",
         1,
     );
     assert!(
@@ -931,7 +1049,7 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_unarmed() {
             &main,
         )
         .is_err(),
-        "Task 5 must not gain a present-capability caller"
+        "ordinary start must not gain an owned pause capability"
     );
     let shared_malformed =
         events.replacen("struct DiscoveryDrain<'a>", "struct GenericDrain<'a>", 1);

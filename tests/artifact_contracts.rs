@@ -210,11 +210,11 @@ fn assert_live_discovery_host_contract(
             .count()
             != 1
         || engine
-            .matches("self.start_session_with(policy, None)")
+            .matches("self.start_session_with(policy, None, None)")
             .count()
             != 1
         || engine
-            .matches("Some(OwnedPauseGeneration::from_owned_child(child))")
+            .matches("let generation = OwnedPauseGeneration::from_owned_child(child);")
             .count()
             != 1
         || attach
@@ -297,12 +297,12 @@ fn assert_owned_run_pause_internal_contract(
         ),
         (
             engine,
-            "Some(OwnedPauseGeneration::from_owned_child(child))",
+            "let generation = OwnedPauseGeneration::from_owned_child(child);",
             "sole present-capability construction",
         ),
         (
             pause,
-            ".apply_discovery_batch(self.session, records, std::mem::take(&mut self.malformed))",
+            ".apply_discovery_batch_with(",
             "sole Engine discovery application authority",
         ),
         (
@@ -318,7 +318,7 @@ fn assert_owned_run_pause_internal_contract(
         || library.contains("pub mod run;")
         || attach.contains("pub struct OwnedPauseGeneration")
         || engine
-            .matches("Some(OwnedPauseGeneration::from_owned_child(child))")
+            .matches("let generation = OwnedPauseGeneration::from_owned_child(child);")
             .count()
             != 1
     {
@@ -1035,7 +1035,7 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
         "the owned capability fields must remain opaque"
     );
     let armed_engine = engine.replacen(
-        "self.start_session_with(policy, None)",
+        "self.start_session_with(policy, None, None)",
         "self.start_owned_session(policy, child)",
         1,
     );

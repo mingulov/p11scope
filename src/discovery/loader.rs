@@ -65,7 +65,10 @@ fn decode_loader_cookie(cookie: u64) -> Result<(LoaderContextId, Option<i64>), S
 pub(crate) struct LoaderContextSpec {
     pub(crate) view: ProcessViewId,
     pub(crate) loader: PinnedObjectId,
-    pub(crate) mapping: MapEntry,
+    /// Existing-view contexts freeze a mapped range. A direct-ELF pre-exec
+    /// context deliberately leaves the future load base unbound and validates
+    /// the actual mapping from the first record instead.
+    pub(crate) mapping: Option<MapEntry>,
     pub(crate) hook: SymbolFact,
     pub(crate) state: Option<SymbolFact>,
 }
@@ -81,7 +84,7 @@ enum LoaderContextState {
 pub(crate) struct LoaderContext {
     pub(crate) spec: LoaderContextSpec,
     pub(crate) cookie: u64,
-    expected_hook_ip: u64,
+    expected_hook_ip: Option<u64>,
     state: LoaderContextState,
     pub(crate) was_attached: bool,
     pub(crate) earliest_hit_ns: Option<u64>,
@@ -126,20 +129,11 @@ impl LoaderRegistry {
         if self.allocated == MAX_LOADER_CONTEXTS {
             return Err("loader context capacity 256 is exhausted".into());
         }
-        if spec.mapping.permissions[2] != b'x' || spec.mapping.inode == 0 {
-            return Err("loader hook mapping is not a file-backed executable mapping".into());
-        }
-        let hook_delta = spec
-            .hook
-            .file_offset
-            .checked_sub(spec.mapping.file_offset)
-            .ok_or_else(|| "loader hook file offset precedes its mapping".to_string())?;
         let expected_hook_ip = spec
             .mapping
-            .start
-            .checked_add(hook_delta)
-            .filter(|ip| *ip < spec.mapping.end)
-            .ok_or_else(|| "loader hook IP is outside its mapping".to_string())?;
+            .as_ref()
+            .map(|mapping| expected_hook_ip(mapping, spec.hook.file_offset))
+            .transpose()?;
         let state_delta = spec
             .state
             .map(|state| signed_delta(state.virtual_address, spec.hook.virtual_address))
@@ -301,8 +295,18 @@ impl LoaderRegistry {
             context.state == state
                 && context.spec.view == view
                 && context.spec.loader == loader
-                && context.spec.mapping == *mapping
-                && context.expected_hook_ip == hook_ip
+                && context
+                    .spec
+                    .mapping
+                    .as_ref()
+                    .is_none_or(|expected| expected == mapping)
+                && context.expected_hook_ip.map_or_else(
+                    || {
+                        expected_hook_ip(mapping, context.spec.hook.file_offset).ok()
+                            == Some(hook_ip)
+                    },
+                    |expected| expected == hook_ip,
+                )
         });
         if !valid {
             self.context_failures = self.context_failures.saturating_add(1);
@@ -359,6 +363,20 @@ impl LoaderRegistry {
     }
 }
 
+fn expected_hook_ip(mapping: &MapEntry, hook_file_offset: u64) -> Result<u64, String> {
+    if mapping.permissions[2] != b'x' || mapping.inode == 0 {
+        return Err("loader hook mapping is not a file-backed executable mapping".into());
+    }
+    let hook_delta = hook_file_offset
+        .checked_sub(mapping.file_offset)
+        .ok_or_else(|| "loader hook file offset precedes its mapping".to_string())?;
+    mapping
+        .start
+        .checked_add(hook_delta)
+        .filter(|ip| *ip < mapping.end)
+        .ok_or_else(|| "loader hook IP is outside its mapping".to_string())
+}
+
 fn signed_delta(address: u64, base: u64) -> Result<i64, String> {
     if address >= base {
         i64::try_from(address - base).map_err(|_| "loader state delta overflows i64".into())
@@ -391,7 +409,7 @@ mod tests {
         LoaderContextSpec {
             view: ProcessViewId(7),
             loader: PinnedObjectId(9),
-            mapping: mapping(),
+            mapping: Some(mapping()),
             hook: SymbolFact {
                 virtual_address: 0x2100,
                 file_offset: 0x2100,
@@ -570,5 +588,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(registry.context(id).unwrap().earliest_hit_ns, Some(40));
+    }
+
+    #[test]
+    fn preexec_context_validates_the_actual_future_mapping_without_a_load_base() {
+        let mut registry = LoaderRegistry::default();
+        let mut context = spec(None);
+        context.mapping = None;
+        let id = prepare(&mut registry, context);
+        registry.mark_attached(id).unwrap();
+
+        registry
+            .validate_hit(
+                id.case_id(),
+                ProcessViewId(7),
+                PinnedObjectId(9),
+                &mapping(),
+                0x4000_0100,
+                5,
+            )
+            .unwrap();
+        assert!(
+            registry
+                .validate_hit(
+                    id.case_id(),
+                    ProcessViewId(7),
+                    PinnedObjectId(9),
+                    &mapping(),
+                    0x4000_0101,
+                    6,
+                )
+                .is_err()
+        );
     }
 }

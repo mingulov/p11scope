@@ -13,6 +13,7 @@ pub(crate) use crate::events::DiscoveryItem;
 
 const CYCLE_NS: u64 = 100_000_000;
 const SAMPLE_NS: u64 = 1_000_000;
+const MAX_FAILURE_ITEMS: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PausePolicy {
@@ -124,7 +125,12 @@ pub(crate) trait PauseIo {
     fn arm(&mut self) -> Result<(), String>;
     fn authorization(&mut self) -> Result<Option<u64>, String>;
     fn remove_authorization(&mut self) -> Result<Option<u64>, String>;
-    fn apply_batch(&mut self, records: Vec<DiscoveryRecord>) -> Result<(), String>;
+    fn apply_batch(
+        &mut self,
+        records: Vec<DiscoveryRecord>,
+        deadline: Option<u64>,
+        additions_allowed: bool,
+    ) -> Result<PauseBatchOutcome, String>;
     fn marker_seen(&mut self) -> Result<bool, String>;
     fn resume(&mut self) -> Result<(), String>;
     fn detach_pause_links(&mut self) -> Result<(), String>;
@@ -140,11 +146,21 @@ pub(crate) trait PauseIo {
     fn cancelled(&mut self) -> Result<bool, String> {
         Ok(false)
     }
+
+    fn stop_candidate_seen(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PauseBatchOutcome {
+    pub(crate) required_complete: bool,
 }
 
 #[derive(Debug, Default)]
 struct PauseEpoch {
     authorization_consumed: bool,
+    zero_candidate: bool,
     accepted: bool,
     rejected: bool,
     resume_attempted: bool,
@@ -167,6 +183,8 @@ pub(crate) struct PauseCoordinator {
     attempt_open: bool,
     ring_loss_baseline: u64,
     active_deadline: Option<u64>,
+    failure_deadline: Option<u64>,
+    failure_items: usize,
     pending_records: Vec<DiscoveryRecord>,
     cycles: u8,
     cleaning: bool,
@@ -228,6 +246,8 @@ impl PauseCoordinator {
             attempt_open: false,
             ring_loss_baseline: 0,
             active_deadline: None,
+            failure_deadline: None,
+            failure_items: 0,
             pending_records: Vec::new(),
             cycles: 0,
             cleaning: false,
@@ -257,15 +277,26 @@ impl PauseCoordinator {
         if self.armed {
             return Ok(ArmResult::Armed);
         }
-        if !io
-            .same_generation(self.pid, self.generation)
-            .map_err(|error| Self::policy_error(self.policy, error, true))?
-        {
-            return self.arm_failed("owned child generation changed before pause arm");
+        let same_generation = match io.same_generation(self.pid, self.generation) {
+            Ok(same) => same,
+            Err(error) => {
+                self.begin_attempt();
+                return self
+                    .fail_cycle(io, error, true)
+                    .map(|()| ArmResult::Disabled);
+            }
+        };
+        if !same_generation {
+            return self.arm_failed(io, "owned child generation changed before pause arm");
         }
         self.ring_loss_baseline = match io.ring_loss() {
             Ok(loss) => loss,
-            Err(error) => return Err(Self::policy_error(self.policy, error, true)),
+            Err(error) => {
+                self.begin_attempt();
+                return self
+                    .fail_cycle(io, error, true)
+                    .map(|()| ArmResult::Disabled);
+            }
         };
         if let Err(error) = io.arm() {
             return self.arm_cleanup_failed(io, error, false);
@@ -282,7 +313,12 @@ impl PauseCoordinator {
         }
     }
 
-    fn arm_failed(&mut self, message: impl Into<String>) -> Result<ArmResult, PauseError> {
+    fn arm_failed(
+        &mut self,
+        io: &mut impl PauseIo,
+        message: impl Into<String>,
+    ) -> Result<ArmResult, PauseError> {
+        let message = message.into();
         self.counters.attempts = self.counters.attempts.saturating_add(1);
         self.rearming_enabled = false;
         match self.policy {
@@ -290,7 +326,10 @@ impl PauseCoordinator {
                 self.counters.partial = self.counters.partial.saturating_add(1);
                 Ok(ArmResult::Disabled)
             }
-            PausePolicy::Always => Err(PauseError::one(message, true, false)),
+            PausePolicy::Always => match self.terminal_cleanup(io) {
+                Ok(()) => Err(PauseError::one(message, true, false)),
+                Err(error) => Err(error),
+            },
             PausePolicy::Never => Ok(ArmResult::Disabled),
         }
     }
@@ -327,13 +366,16 @@ impl PauseCoordinator {
             }
             return Ok(());
         };
+        self.failure_deadline
+            .get_or_insert_with(|| received.after_ns.checked_add(CYCLE_NS).unwrap_or(u64::MAX));
         match io.cancelled() {
             Ok(false) => {}
             Ok(true) => return self.fail_cycle(io, "pause coordination cancelled", true),
             Err(error) => return self.fail_cycle(io, error, true),
         }
         let DiscoveryItem::Record(first) = received.item else {
-            return self.fail_cycle(io, "malformed discovery record in pause epoch", true);
+            self.begin_attempt();
+            return self.fail_cycle(io, "malformed discovery record in pause epoch", false);
         };
         self.pending_records.push(first);
         if exact_pid(&first) != self.pid {
@@ -356,7 +398,8 @@ impl PauseCoordinator {
                 }
             }
             return io
-                .apply_batch(std::mem::take(&mut self.pending_records))
+                .apply_batch(std::mem::take(&mut self.pending_records), None, true)
+                .map(|_| ())
                 .map_err(|error| Self::policy_error(self.policy, error, false));
         }
         let state = match io.authorization() {
@@ -364,9 +407,18 @@ impl PauseCoordinator {
             Err(error) => return self.fail_cycle(io, error, true),
         };
         if state != Some(PAUSE_REQUESTED) {
+            if self.epoch.zero_candidate {
+                self.begin_attempt();
+                return self.fail_cycle(
+                    io,
+                    "zero stop candidate did not retain REQUESTED authorization",
+                    false,
+                );
+            }
             self.may_be_stopped = false;
             return io
-                .apply_batch(std::mem::take(&mut self.pending_records))
+                .apply_batch(std::mem::take(&mut self.pending_records), None, true)
+                .map(|_| ())
                 .map_err(|error| Self::policy_error(self.policy, error, false));
         }
         self.may_be_stopped = true;
@@ -375,13 +427,16 @@ impl PauseCoordinator {
         if successor && !self.epoch.resume_succeeded {
             return self.fail_cycle(io, "successor was consumed before prior resume", true);
         }
+        let zero_candidate = self.epoch.zero_candidate;
         self.epoch = PauseEpoch {
             authorization_consumed: true,
+            zero_candidate,
             ..PauseEpoch::default()
         };
 
         let mut records = Vec::new();
         let winner = if first.send_signal_rc == COALESCED_NO_HELPER_RC {
+            self.failure_items = 1;
             if first.status_flags & DISCOVERY_STATUS_COALESCED_NO_HELPER == 0 {
                 return self.fail_cycle(io, "unknown coalesced record status", false);
             }
@@ -389,11 +444,19 @@ impl PauseCoordinator {
                 Ok(deadline) => deadline,
                 Err(error) => return self.fail_cycle(io, error, false),
             };
+            self.active_deadline = Some(provisional);
             if let Err(error) = validate_received(&received, first.hook_ts_ns, provisional) {
                 return self.fail_cycle(io, error, false);
             }
             records.push(first);
             loop {
+                if self.failure_items >= MAX_FAILURE_ITEMS {
+                    return self.fail_cycle(
+                        io,
+                        "coalesced record had no winner within the item budget",
+                        false,
+                    );
+                }
                 let next = match self.timed_dequeue(io, Some(provisional)) {
                     Ok(next) => next,
                     Err(error) => return self.fail_cycle(io, error, false),
@@ -422,6 +485,7 @@ impl PauseCoordinator {
                     );
                 }
                 if record.send_signal_rc == COALESCED_NO_HELPER_RC {
+                    self.failure_items += 1;
                     if record.status_flags & DISCOVERY_STATUS_COALESCED_NO_HELPER == 0 {
                         return self.fail_cycle(io, "unknown coalesced record status", false);
                     }
@@ -439,6 +503,17 @@ impl PauseCoordinator {
             (received, first)
         };
         let (winner_received, winner_record) = winner;
+        if winner_record.send_signal_rc < 0 {
+            self.epoch.rejected = true;
+            self.epoch.zero_candidate = false;
+            self.may_be_stopped = false;
+            self.pending_records.clear();
+            let deadline = cycle_deadline(winner_record.hook_ts_ns)
+                .unwrap_or_else(|_| self.failure_deadline.unwrap_or(u64::MAX));
+            self.active_deadline = Some(deadline);
+            records.push(winner_record);
+            return self.reject_cycle(io, deadline, records);
+        }
         if winner_record.status_flags & DISCOVERY_STATUS_COALESCED_NO_HELPER != 0 {
             return self.fail_cycle(io, "winner carried coalesced status", false);
         }
@@ -462,10 +537,7 @@ impl PauseCoordinator {
         records.push(winner_record);
 
         if winner_record.send_signal_rc != 0 {
-            self.epoch.rejected = true;
-            self.may_be_stopped = false;
-            self.pending_records.clear();
-            return self.reject_cycle(io, deadline, records);
+            return self.fail_cycle(io, "winner carried an unknown helper result", false);
         }
         self.may_be_stopped = true;
         let ring_loss = match io.ring_loss() {
@@ -520,6 +592,9 @@ impl PauseCoordinator {
             records.push(record);
             self.pending_records.push(record);
         }
+        if let Err(error) = self.check_ring_loss(io) {
+            return self.fail_cycle(io, error, false);
+        }
         let marker_seen = match io.marker_seen() {
             Ok(seen) => seen,
             Err(error) => return self.fail_cycle(io, error, true),
@@ -529,8 +604,15 @@ impl PauseCoordinator {
         }
         let record_count = records.len();
         self.pending_records.clear();
-        if let Err(error) = io.apply_batch(records) {
-            return self.fail_cycle(io, error, false);
+        let outcome = match io.apply_batch(records, Some(deadline), true) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.epoch.zero_candidate |= io.stop_candidate_seen();
+                return self.fail_cycle(io, error, false);
+            }
+        };
+        if !outcome.required_complete {
+            return self.fail_cycle(io, "one or more frozen required attachments failed", false);
         }
         if let Err(error) = io.wait_one_ms() {
             return self.fail_cycle(io, error, true);
@@ -552,6 +634,7 @@ impl PauseCoordinator {
         }
 
         let install_successor = record_count == 1 && self.cycles == 0 && self.rearming_enabled;
+        let mut successor_baseline = None;
         if install_successor {
             if let Err(error) = io.remove_authorization() {
                 return self.fail_cycle(io, error, true);
@@ -566,6 +649,10 @@ impl PauseCoordinator {
             if authorization != Some(PAUSE_ARMED) {
                 return self.fail_cycle(io, "successor was consumed before prior resume", true);
             }
+            successor_baseline = match io.ring_loss() {
+                Ok(loss) => Some(loss),
+                Err(error) => return self.fail_cycle(io, error, true),
+            };
             self.epoch.successor_installed = true;
             self.epoch.successor_unresolved = true;
             if let Err(error) = io.wait_one_ms() {
@@ -595,6 +682,9 @@ impl PauseCoordinator {
             Ok(true) => return self.fail_cycle(io, "pause coordination cancelled", true),
             Err(error) => return self.fail_cycle(io, error, true),
         }
+        if let Err(error) = self.check_ring_loss(io) {
+            return self.fail_cycle(io, error, false);
+        }
         self.epoch.resume_attempted = true;
         if let Err(error) = io.resume() {
             return self.fail_cycle(io, error, true);
@@ -603,12 +693,16 @@ impl PauseCoordinator {
         self.counters.confirmed = self.counters.confirmed.saturating_add(1);
         self.attempt_open = false;
         self.active_deadline = None;
+        self.failure_deadline = None;
+        self.failure_items = 0;
         self.cycles = self.cycles.saturating_add(1);
         self.armed = install_successor;
         if !install_successor {
             self.may_be_stopped = false;
             self.epoch = PauseEpoch::default();
         } else {
+            self.ring_loss_baseline = successor_baseline
+                .expect("an installed successor froze its stopped ring-loss baseline");
             self.epoch = PauseEpoch {
                 successor_installed: true,
                 successor_unresolved: true,
@@ -621,15 +715,40 @@ impl PauseCoordinator {
         Ok(())
     }
 
+    fn check_ring_loss(&mut self, io: &mut impl PauseIo) -> Result<(), String> {
+        let loss = io.ring_loss()?;
+        if loss > self.ring_loss_baseline {
+            Err("discovery ring loss in pause epoch".into())
+        } else {
+            Ok(())
+        }
+    }
+
     fn reject_cycle(
         &mut self,
         io: &mut impl PauseIo,
         deadline: u64,
         mut records: Vec<DiscoveryRecord>,
     ) -> Result<(), PauseError> {
+        if self.policy == PausePolicy::Always {
+            self.pending_records.append(&mut records);
+            let cleanup = self.terminal_cleanup(io);
+            return match cleanup {
+                Ok(()) => Err(PauseError::one(
+                    "pause helper rejected SIGSTOP",
+                    true,
+                    false,
+                )),
+                Err(error) => Err(error),
+            };
+        }
         let mut retained_error = None;
         let mut lifecycle_errors = Vec::new();
-        loop {
+        if let Err(error) = io.remove_authorization() {
+            lifecycle_errors.push(error);
+        }
+        self.armed = false;
+        while self.failure_items < MAX_FAILURE_ITEMS {
             match self.timed_dequeue(io, Some(deadline)) {
                 Ok(None) => match io.now_ns() {
                     Ok(now) if now < deadline => {
@@ -651,9 +770,11 @@ impl PauseCoordinator {
                     && record.send_signal_rc == COALESCED_NO_HELPER_RC
                     && record.status_flags & DISCOVERY_STATUS_COALESCED_NO_HELPER != 0 =>
                 {
+                    self.failure_items += 1;
                     records.push(record);
                 }
                 Ok(Some(_)) => {
+                    self.failure_items += 1;
                     retained_error
                         .get_or_insert_with(|| "rejected epoch contained an invalid record".into());
                 }
@@ -663,10 +784,7 @@ impl PauseCoordinator {
                 }
             }
         }
-        if let Err(error) = io.remove_authorization() {
-            lifecycle_errors.push(error);
-        }
-        if let Err(error) = io.apply_batch(records) {
+        if let Err(error) = io.apply_batch(records, Some(deadline), true) {
             retained_error.get_or_insert(error);
         }
         match io.same_generation(self.pid, self.generation) {
@@ -677,11 +795,14 @@ impl PauseCoordinator {
         self.may_be_stopped = false;
         self.armed = false;
         self.rearming_enabled = false;
-        self.epoch = PauseEpoch::default();
         self.active_deadline = None;
+        self.failure_deadline = None;
+        self.failure_items = 0;
         if !lifecycle_errors.is_empty() {
-            return Err(PauseError::from_lifecycle(lifecycle_errors));
+            self.pending_records.clear();
+            return self.terminal_cleanup_with_errors(io, lifecycle_errors);
         }
+        self.epoch = PauseEpoch::default();
         self.finish_nonconfirmed(
             retained_error.unwrap_or_else(|| "pause helper rejected SIGSTOP".into()),
         )
@@ -718,6 +839,7 @@ impl PauseCoordinator {
             // A zero helper result is a stop candidate, not proof. This mark
             // deliberately precedes the post-dequeue clock and every map read.
             self.may_be_stopped = true;
+            self.epoch.zero_candidate = true;
         }
         let after_ns = io.now_ns()?;
         if deadline.is_some_and(|deadline| after_ns > deadline) {
@@ -737,20 +859,36 @@ impl PauseCoordinator {
         &mut self,
         io: &mut impl PauseIo,
         message: impl Into<String>,
-        mut lifecycle: bool,
+        lifecycle: bool,
     ) -> Result<(), PauseError> {
         let message = message.into();
+        self.rearming_enabled = false;
+        if lifecycle || self.policy == PausePolicy::Always {
+            let cleanup = self.terminal_cleanup(io);
+            return match cleanup {
+                Ok(()) if lifecycle => Err(PauseError::from_lifecycle(vec![message])),
+                Ok(()) => Err(PauseError::one(message, true, false)),
+                Err(error) => Err(error),
+            };
+        }
         let mut errors = vec![message.clone()];
-        loop {
-            match self.timed_dequeue(io, self.active_deadline) {
+        let deadline = self.failure_bound(io, &mut errors);
+        while self.failure_items < MAX_FAILURE_ITEMS {
+            match self.timed_dequeue(io, Some(deadline)) {
                 Ok(Some(TimedItem {
                     item: DiscoveryItem::Record(record),
                     ..
-                })) => self.pending_records.push(record),
+                })) => {
+                    self.failure_items += 1;
+                    self.pending_records.push(record);
+                }
                 Ok(Some(TimedItem {
                     item: DiscoveryItem::Malformed,
                     ..
-                })) => errors.push("malformed discovery record during failure cleanup".into()),
+                })) => {
+                    self.failure_items += 1;
+                    errors.push("malformed discovery record during failure cleanup".into());
+                }
                 Ok(None) => break,
                 Err(error) => {
                     errors.push(error);
@@ -758,9 +896,14 @@ impl PauseCoordinator {
                 }
             }
         }
-        if let Err(error) = io.apply_batch(std::mem::take(&mut self.pending_records)) {
+        if let Err(error) = io.apply_batch(
+            std::mem::take(&mut self.pending_records),
+            Some(deadline),
+            true,
+        ) {
             errors.push(error);
         }
+        self.epoch.zero_candidate |= io.stop_candidate_seen();
         match io.authorization() {
             Ok(Some(PAUSE_REQUESTED)) => {
                 self.may_be_stopped = true;
@@ -768,27 +911,28 @@ impl PauseCoordinator {
                 self.begin_attempt();
             }
             Ok(Some(PAUSE_ARMED)) | Ok(None) => {
-                if self.epoch.successor_installed && !self.epoch.accepted {
+                if !self.epoch.zero_candidate && !self.epoch.accepted {
                     self.epoch.successor_unresolved = false;
                     self.may_be_stopped = false;
+                    self.epoch.authorization_consumed = false;
                 }
             }
             Ok(Some(_)) => {
                 errors.push("unknown pause authorization state".into());
-                lifecycle = true;
                 self.may_be_stopped = true;
                 self.epoch.authorization_consumed = true;
+                return self.terminal_cleanup_with_errors(io, errors);
             }
             Err(error) => {
                 errors.push(error);
-                lifecycle = true;
                 self.may_be_stopped = true;
                 self.epoch.authorization_consumed = true;
+                return self.terminal_cleanup_with_errors(io, errors);
             }
         }
         if let Err(error) = io.remove_authorization() {
             errors.push(error);
-            lifecycle = true;
+            return self.terminal_cleanup_with_errors(io, errors);
         }
         self.armed = false;
         self.rearming_enabled = false;
@@ -796,13 +940,15 @@ impl PauseCoordinator {
             self.epoch.resume_attempted = true;
             if let Err(error) = io.resume() {
                 errors.push(error);
-                return Err(PauseError::from_lifecycle(errors));
+                return self.terminal_cleanup_with_errors(io, errors);
             }
             self.epoch.resume_succeeded = true;
             self.may_be_stopped = false;
         } else if !self.epoch.accepted
+            && !self.epoch.rejected
             && self.may_be_stopped
             && (self.epoch.authorization_consumed
+                || self.epoch.zero_candidate
                 || (self.epoch.successor_installed
                     && self.epoch.successor_unresolved
                     && self.epoch.resume_succeeded))
@@ -811,16 +957,15 @@ impl PauseCoordinator {
             self.epoch.protective_resume_attempted = true;
             if let Err(error) = io.resume() {
                 errors.push(error);
-                lifecycle = true;
+                return self.terminal_cleanup_with_errors(io, errors);
             } else {
                 self.may_be_stopped = false;
             }
         }
         self.epoch = PauseEpoch::default();
         self.active_deadline = None;
-        if lifecycle {
-            return Err(PauseError::from_lifecycle(errors));
-        }
+        self.failure_deadline = None;
+        self.failure_items = 0;
         self.finish_nonconfirmed(message)
     }
 
@@ -838,27 +983,47 @@ impl PauseCoordinator {
     }
 
     pub(crate) fn cleanup(&mut self, io: &mut impl PauseIo) -> Result<(), PauseError> {
+        self.terminal_cleanup(io)
+    }
+
+    fn terminal_cleanup(&mut self, io: &mut impl PauseIo) -> Result<(), PauseError> {
+        self.terminal_cleanup_with_errors(io, Vec::new())
+    }
+
+    fn terminal_cleanup_with_errors(
+        &mut self,
+        io: &mut impl PauseIo,
+        mut errors: Vec<String>,
+    ) -> Result<(), PauseError> {
         if self.cleaned || self.cleaning {
-            return Ok(());
+            return if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(PauseError::from_lifecycle(errors))
+            };
         }
         self.cleaning = true;
-        let mut errors = Vec::new();
         if let Err(error) = io.detach_pause_links() {
             errors.push(error);
         }
         let mut records = std::mem::take(&mut self.pending_records);
-        loop {
-            match self.timed_dequeue(io, None) {
+        let deadline = self.failure_bound(io, &mut errors);
+        while self.failure_items < MAX_FAILURE_ITEMS {
+            match self.timed_dequeue(io, Some(deadline)) {
                 Ok(Some(TimedItem {
                     item: DiscoveryItem::Malformed,
                     ..
                 })) => {
+                    self.failure_items += 1;
                     errors.push("malformed discovery record during cleanup".into());
                 }
                 Ok(Some(TimedItem {
                     item: DiscoveryItem::Record(record),
                     ..
-                })) => records.push(record),
+                })) => {
+                    self.failure_items += 1;
+                    records.push(record);
+                }
                 Ok(None) => break,
                 Err(error) => {
                     errors.push(error);
@@ -866,19 +1031,26 @@ impl PauseCoordinator {
                 }
             }
         }
-        if let Err(error) = io.apply_batch(records) {
+        if let Err(error) = io.apply_batch(records, Some(deadline), false) {
             errors.push(error);
         }
+        self.epoch.zero_candidate |= io.stop_candidate_seen();
         match io.authorization() {
             Ok(Some(PAUSE_REQUESTED)) => {
-                self.may_be_stopped = true;
-                self.epoch.authorization_consumed = true;
-                self.epoch.successor_unresolved |= self.epoch.successor_installed;
+                if self.epoch.rejected {
+                    self.may_be_stopped = false;
+                    self.epoch.authorization_consumed = false;
+                } else {
+                    self.may_be_stopped = true;
+                    self.epoch.authorization_consumed = true;
+                    self.epoch.successor_unresolved |= self.epoch.successor_installed;
+                }
             }
             Ok(Some(PAUSE_ARMED)) | Ok(None) => {
-                if self.epoch.successor_installed && !self.epoch.accepted {
+                if !self.epoch.zero_candidate && !self.epoch.accepted {
                     self.epoch.successor_unresolved = false;
                     self.may_be_stopped = false;
+                    self.epoch.authorization_consumed = false;
                 }
             }
             Ok(Some(_)) => {
@@ -905,8 +1077,10 @@ impl PauseCoordinator {
                 self.epoch.resume_succeeded = true;
             }
         } else if !self.epoch.accepted
+            && !self.epoch.rejected
             && self.may_be_stopped
             && (self.epoch.authorization_consumed
+                || self.epoch.zero_candidate
                 || (self.epoch.successor_installed
                     && self.epoch.successor_unresolved
                     && self.epoch.resume_succeeded))
@@ -926,6 +1100,23 @@ impl PauseCoordinator {
         } else {
             Err(PauseError::from_lifecycle(errors))
         }
+    }
+
+    fn failure_bound(&mut self, io: &mut impl PauseIo, errors: &mut Vec<String>) -> u64 {
+        if let Some(deadline) = self.active_deadline.or(self.failure_deadline) {
+            self.failure_deadline = Some(deadline);
+            return deadline;
+        }
+        let now = match io.now_ns() {
+            Ok(now) => now,
+            Err(error) => {
+                errors.push(error);
+                u64::MAX.saturating_sub(CYCLE_NS)
+            }
+        };
+        let deadline = now.checked_add(CYCLE_NS).unwrap_or(u64::MAX);
+        self.failure_deadline = Some(deadline);
+        deadline
     }
 
     pub(crate) fn counters(&self) -> PauseCounters {
@@ -975,6 +1166,7 @@ pub(crate) struct SessionPauseIo<'a> {
     cancelled: &'a dyn Fn() -> Result<bool, String>,
     plan_changed: bool,
     malformed: u64,
+    stop_candidate_seen: bool,
 }
 
 impl<'a> SessionPauseIo<'a> {
@@ -993,6 +1185,7 @@ impl<'a> SessionPauseIo<'a> {
             cancelled,
             plan_changed: false,
             malformed: 0,
+            stop_candidate_seen: false,
         }
     }
 
@@ -1044,13 +1237,31 @@ impl PauseIo for SessionPauseIo<'_> {
             .map_err(|error| format!("pause authorization removal failed: {error:#}"))
     }
 
-    fn apply_batch(&mut self, records: Vec<DiscoveryRecord>) -> Result<(), String> {
-        let changed = self
+    fn apply_batch(
+        &mut self,
+        records: Vec<DiscoveryRecord>,
+        deadline: Option<u64>,
+        additions_allowed: bool,
+    ) -> Result<PauseBatchOutcome, String> {
+        let child = self.child;
+        let stop_candidate_seen = &mut self.stop_candidate_seen;
+        let mut collect = |session: &mut Session| {
+            collect_timed_retirement(session, child, deadline, stop_candidate_seen)
+        };
+        let outcome = self
             .engine
-            .apply_discovery_batch(self.session, records, std::mem::take(&mut self.malformed))
+            .apply_discovery_batch_with(
+                self.session,
+                records,
+                std::mem::take(&mut self.malformed),
+                additions_allowed,
+                &mut collect,
+            )
             .map_err(|error| format!("discovery batch application failed: {error:#}"))?;
-        self.plan_changed |= changed;
-        Ok(())
+        self.plan_changed |= outcome.changed;
+        Ok(PauseBatchOutcome {
+            required_complete: outcome.required_complete,
+        })
     }
 
     fn marker_seen(&mut self) -> Result<bool, String> {
@@ -1083,6 +1294,76 @@ impl PauseIo for SessionPauseIo<'_> {
     fn cancelled(&mut self) -> Result<bool, String> {
         (self.cancelled)()
     }
+
+    fn stop_candidate_seen(&self) -> bool {
+        self.stop_candidate_seen
+    }
+}
+
+fn collect_timed_retirement(
+    session: &mut Session,
+    child: &OwnedChild,
+    deadline: Option<u64>,
+    stop_candidate_seen: &mut bool,
+) -> Result<(Vec<DiscoveryRecord>, u64), anyhow::Error> {
+    let mut records = Vec::new();
+    let mut malformed = 0u64;
+    loop {
+        let before_ns =
+            attach::monotonic_ns().ok_or_else(|| anyhow::anyhow!("monotonic clock read failed"))?;
+        if deadline.is_some_and(|deadline| before_ns > deadline) {
+            return Err(anyhow::anyhow!(
+                "deadline crossed before nested discovery dequeue"
+            ));
+        }
+        let item = session.discovery_dequeue()?;
+        if let Some(DiscoveryItem::Record(record)) = item.as_ref()
+            && exact_pid(record) == child.pid()
+            && record.send_signal_rc == 0
+        {
+            *stop_candidate_seen = true;
+        }
+        let after_ns =
+            attach::monotonic_ns().ok_or_else(|| anyhow::anyhow!("monotonic clock read failed"))?;
+        if deadline.is_some_and(|deadline| after_ns > deadline) {
+            return Err(anyhow::anyhow!(
+                "deadline crossed after nested discovery dequeue"
+            ));
+        }
+        let Some(item) = item else { break };
+        if !child.pin().still_the_same() {
+            return Err(anyhow::anyhow!(
+                "owned child generation changed after nested discovery decode"
+            ));
+        }
+        match item {
+            DiscoveryItem::Malformed => {
+                malformed = malformed.saturating_add(1);
+                return Ok((records, malformed));
+            }
+            DiscoveryItem::Record(record) => {
+                if let Some(deadline) = deadline {
+                    let received = TimedItem {
+                        before_ns,
+                        after_ns,
+                        item: DiscoveryItem::Record(record),
+                    };
+                    validate_received(&received, record.hook_ts_ns, deadline)
+                        .map_err(anyhow::Error::msg)?;
+                    if exact_pid(&record) != child.pid()
+                        || record.send_signal_rc != COALESCED_NO_HELPER_RC
+                        || record.status_flags & DISCOVERY_STATUS_COALESCED_NO_HELPER == 0
+                    {
+                        return Err(anyhow::anyhow!(
+                            "duplicate or unaccounted nested pause record"
+                        ));
+                    }
+                }
+                records.push(record);
+            }
+        }
+    }
+    Ok((records, malformed))
 }
 
 fn read_task_states(pid: u32) -> Result<BTreeMap<u32, u8>, String> {
@@ -1134,6 +1415,9 @@ fn cycle_deadline(hook_ns: u64) -> Result<u64, String> {
 }
 
 fn validate_received(received: &TimedItem, record_ns: u64, deadline: u64) -> Result<(), String> {
+    if received.after_ns < received.before_ns {
+        return Err("monotonic dequeue clocks were reversed".into());
+    }
     if received.before_ns > deadline || received.after_ns > deadline || record_ns > deadline {
         return Err("pause causal deadline crossed".into());
     }
@@ -1166,10 +1450,12 @@ mod tests {
         fail_read: bool,
         fail_resume: bool,
         fail_apply: bool,
+        required_complete: bool,
         fail_wait: bool,
         cancelled: bool,
         same_generation: bool,
-        ring_loss: u64,
+        ring_losses: VecDeque<Result<u64, String>>,
+        fallback_ring_loss: u64,
     }
 
     impl Default for FakeIo {
@@ -1188,10 +1474,12 @@ mod tests {
                 fail_read: false,
                 fail_resume: false,
                 fail_apply: false,
+                required_complete: true,
                 fail_wait: false,
                 cancelled: false,
                 same_generation: true,
-                ring_loss: 0,
+                ring_losses: VecDeque::new(),
+                fallback_ring_loss: 0,
             }
         }
     }
@@ -1252,13 +1540,24 @@ mod tests {
             Ok(self.authorization.take())
         }
 
-        fn apply_batch(&mut self, records: Vec<DiscoveryRecord>) -> Result<(), String> {
-            self.events.push("apply");
-            if self.fail_apply {
+        fn apply_batch(
+            &mut self,
+            records: Vec<DiscoveryRecord>,
+            _deadline: Option<u64>,
+            additions_allowed: bool,
+        ) -> Result<PauseBatchOutcome, String> {
+            self.events.push(if additions_allowed {
+                "apply"
+            } else {
+                "account"
+            });
+            if self.fail_apply && additions_allowed {
                 return Err("apply".into());
             }
             self.applied.extend(records);
-            Ok(())
+            Ok(PauseBatchOutcome {
+                required_complete: self.required_complete,
+            })
         }
 
         fn marker_seen(&mut self) -> Result<bool, String> {
@@ -1288,7 +1587,14 @@ mod tests {
         }
 
         fn ring_loss(&mut self) -> Result<u64, String> {
-            Ok(self.ring_loss)
+            match self.ring_losses.pop_front() {
+                Some(Ok(loss)) => {
+                    self.fallback_ring_loss = loss;
+                    Ok(loss)
+                }
+                Some(Err(error)) => Err(error),
+                None => Ok(self.fallback_ring_loss),
+            }
         }
 
         fn cancelled(&mut self) -> Result<bool, String> {
@@ -1645,7 +1951,7 @@ mod tests {
     fn reservation_loss_is_one_finite_unstopped_auto_attempt() {
         let mut io = FakeIo {
             authorization: Some(PAUSE_ARMED),
-            ring_loss: 1,
+            fallback_ring_loss: 1,
             ..FakeIo::default()
         };
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
@@ -1713,6 +2019,182 @@ mod tests {
     }
 
     #[test]
+    fn rejected_helper_is_classified_before_all_timestamp_failures() {
+        let cases = [
+            (u64::MAX, VecDeque::new()),
+            (10, VecDeque::from([Ok(100_000_011), Ok(100_000_012)])),
+            (100, VecDeque::from([Ok(50), Ok(60)])),
+            (10, VecDeque::from([Ok(20), Ok(19)])),
+        ];
+        for (timestamp, now) in cases {
+            let mut io = successful_io(vec![record(timestamp, -libc::EPERM as i64, false)]);
+            if !now.is_empty() {
+                io.now = now;
+            }
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.arm_for_test();
+
+            coordinator.service(&mut io).unwrap();
+
+            assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+            assert!(!io.events.contains(&"resume"));
+            assert_eq!(io.authorization, None);
+        }
+    }
+
+    #[test]
+    fn required_failure_uses_terminal_detach_before_accounting_and_resume() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.fail_apply = true;
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(error.required());
+        let detach = io
+            .events
+            .iter()
+            .position(|event| *event == "detach")
+            .unwrap();
+        let resume = io
+            .events
+            .iter()
+            .position(|event| *event == "resume")
+            .unwrap();
+        assert!(detach < resume);
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "detach").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn real_incomplete_batch_outcome_cannot_confirm_the_pause() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.required_complete = false;
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert_eq!(coordinator.counters().confirmed, 0);
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn required_prearm_generation_failure_uses_the_terminal_route() {
+        let mut io = FakeIo {
+            same_generation: false,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+
+        let error = coordinator.arm(&mut io).unwrap_err();
+
+        assert!(error.required());
+        assert_eq!(io.events.first(), Some(&"detach"));
+        assert!(!io.events.contains(&"resume"));
+    }
+
+    #[test]
+    fn ring_loss_is_rechecked_after_drain_and_immediately_before_resume() {
+        for losses in [
+            VecDeque::from([Ok(0), Ok(0), Ok(1)]),
+            VecDeque::from([Ok(0), Ok(0), Ok(0), Ok(1)]),
+        ] {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            io.ring_losses = losses;
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.ring_loss_baseline = io.ring_loss().unwrap();
+            coordinator.arm_for_test();
+
+            coordinator.service(&mut io).unwrap();
+
+            assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+            assert_eq!(
+                io.events.iter().filter(|event| **event == "resume").count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn no_winner_failure_cleanup_has_one_fixed_item_budget() {
+        let sibling = record(10, COALESCED_NO_HELPER_RC, true);
+        let mut io = successful_io(Vec::new());
+        io.queue = std::iter::repeat_n(Ok(Some(DiscoveryItem::Record(sibling))), 500)
+            .chain(std::iter::once(Ok(None)))
+            .collect();
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert!(
+            io.events
+                .iter()
+                .filter(|event| **event == "dequeue")
+                .count()
+                <= 128
+        );
+        assert_eq!(io.authorization, None);
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+    }
+
+    #[test]
+    fn initial_armed_or_absent_clears_only_unconsumed_resume_debt() {
+        for authorization in [Some(PAUSE_ARMED), None] {
+            let mut io = FakeIo {
+                authorization,
+                ..FakeIo::default()
+            };
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.begin_attempt();
+            coordinator.may_be_stopped = true;
+            coordinator.epoch.authorization_consumed = true;
+
+            coordinator.cleanup(&mut io).unwrap();
+
+            assert!(!io.events.contains(&"resume"));
+        }
+
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.authorization = Some(PAUSE_ARMED);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.service(&mut io).unwrap();
+        coordinator.cleanup(&mut io).unwrap();
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_auto_epoch_is_partial_not_lifecycle() {
+        let mut io = FakeIo {
+            queue: VecDeque::from([Ok(Some(DiscoveryItem::Malformed)), Ok(None)]),
+            authorization: Some(PAUSE_REQUESTED),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    #[test]
     fn rejected_helper_map_removal_failure_is_lifecycle_not_partial() {
         let mut io = successful_io(vec![record(10, -libc::EPERM as i64, false)]);
         io.fail_remove = true;
@@ -1742,7 +2224,7 @@ mod tests {
         assert_eq!(
             io.events,
             [
-                "detach", "dequeue", "dequeue", "apply", "read", "remove", "resume"
+                "detach", "dequeue", "dequeue", "account", "read", "remove", "resume"
             ],
             "cleanup must retain failures without short-circuiting before resume"
         );

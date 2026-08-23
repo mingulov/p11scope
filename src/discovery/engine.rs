@@ -72,6 +72,7 @@ struct ScanInput {
 type InventoryScan = (ProcessViewId, Vec<ScannedModule>, PinnedObjects);
 type InventoryScanOutcome = (Vec<InventoryScan>, BTreeSet<u32>, Vec<Skipped>);
 type PendingViewRetirements = BTreeMap<ProcessViewId, bool>;
+type DiscoveryCollector<'a> = dyn FnMut(&mut Session) -> Result<(Vec<DiscoveryRecord>, u64)> + 'a;
 
 struct ManifestInput {
     path: PathBuf,
@@ -99,6 +100,39 @@ struct ApplyOutcome {
     static_completions: Vec<(BTreeSet<PinnedTimingKey>, Option<u64>)>,
     static_failures: BTreeSet<PinnedTimingKey>,
     newly_rejected_keys: BTreeSet<ObjectKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiscoveryBatchOutcome {
+    pub(crate) changed: bool,
+    pub(crate) required_complete: bool,
+}
+
+struct PauseClosure {
+    required_complete: bool,
+}
+
+impl PauseClosure {
+    fn new(additions_allowed: bool) -> Self {
+        Self {
+            required_complete: additions_allowed,
+        }
+    }
+
+    fn observe_apply(&mut self, outcome: &ApplyOutcome) {
+        self.required_complete &= outcome.committed
+            && outcome.stale_views.is_empty()
+            && outcome.missing_contexts.is_empty()
+            && outcome.static_failures.is_empty();
+    }
+
+    fn fail(&mut self) {
+        self.required_complete = false;
+    }
+
+    fn required_complete(&self) -> bool {
+        self.required_complete
+    }
 }
 
 impl ApplyOutcome {
@@ -3171,6 +3205,7 @@ impl Engine {
         session: &mut Session,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
+        closure: &mut PauseClosure,
     ) -> Result<bool> {
         if interface_list_is_truncated(record) {
             self.discovery_truncated = self.discovery_truncated.saturating_add(1);
@@ -3220,6 +3255,7 @@ impl Engine {
         let observed = candidate_timing_keys(&candidate, std::slice::from_ref(&observed_module));
         self.observe_causal_timing(&observed, record.hook_ts_ns);
         let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
+        closure.observe_apply(&outcome);
         self.record_apply_timing(&outcome);
         self.queue_apply_outcome(&outcome, pending_views);
         Ok(outcome.changed)
@@ -3231,6 +3267,7 @@ impl Engine {
         session: &mut Session,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
+        closure: &mut PauseClosure,
     ) -> Result<bool> {
         let QueuedDiscoveryRecord {
             record,
@@ -3271,7 +3308,11 @@ impl Engine {
             );
         };
         if context.spec.view != self.views[position].id()
-            || context.spec.mapping != *mapping
+            || context
+                .spec
+                .mapping
+                .as_ref()
+                .is_some_and(|expected| expected != mapping)
             || !self.pinned.check_unchanged().unwrap_or(false)
             || self
                 .pinned
@@ -3334,16 +3375,20 @@ impl Engine {
             &terminal_exports,
         );
         let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
+        closure.observe_apply(&outcome);
         self.record_apply_timing(&outcome);
         self.queue_apply_outcome(&outcome, pending_views);
         let changed = outcome.changed;
         if terminal_owner.is_none() && outcome.committed && outcome.stale_views.is_empty() {
-            let retire = self.attach_export_work(
+            let (retire, dynamic_complete) = self.attach_export_work(
                 self.views[position].id(),
                 &dynamic_work,
                 session,
                 additions_allowed,
             );
+            if !dynamic_complete {
+                closure.fail();
+            }
             if retire {
                 let view = self.views[position].id();
                 self.queue_stale_views(&[view].into_iter().collect(), pending_views);
@@ -3429,7 +3474,7 @@ impl Engine {
         work: &[DynamicExportWork],
         session: &mut Session,
         additions_allowed: &mut bool,
-    ) -> bool {
+    ) -> (bool, bool) {
         let Some(pid) = self
             .views
             .iter()
@@ -3437,14 +3482,16 @@ impl Engine {
             .map(ProcessView::pid)
         else {
             lose_unperformed_dynamic_work(&mut self.timings, work);
-            return true;
+            return (true, false);
         };
         let mut retire = false;
+        let mut complete = true;
         for work in work {
             if work.already_attached {
                 continue;
             }
             if !*additions_allowed {
+                complete = false;
                 if let Some(module) = &work.module {
                     self.timings.lose(module);
                 }
@@ -3481,6 +3528,7 @@ impl Engine {
                     }
                 }
                 GenerationMutation::Committed(Err(_)) => {
+                    complete = false;
                     if let Some(module) = &work.module {
                         self.timings.lose(module);
                     }
@@ -3493,6 +3541,7 @@ impl Engine {
                     );
                 }
                 GenerationMutation::PrecheckFailed | GenerationMutation::PostcheckFailed(_) => {
+                    complete = false;
                     if let Some(module) = &work.module {
                         self.timings.lose(module);
                     }
@@ -3505,7 +3554,7 @@ impl Engine {
                 }
             }
         }
-        retire
+        (retire, complete)
     }
 
     fn arm_loader_for_view(
@@ -3666,7 +3715,7 @@ impl Engine {
         let prepared = match self.loader_registry.preflight(LoaderContextSpec {
             view: view_id,
             loader,
-            mapping: loader_mapping.clone(),
+            mapping: Some(loader_mapping.clone()),
             hook,
             state,
         }) {
@@ -3758,6 +3807,188 @@ impl Engine {
         Ok(changed)
     }
 
+    fn arm_owned_loader_before_release(
+        &mut self,
+        child: &OwnedChild,
+        session: &mut Session,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+    ) -> Result<bool> {
+        let Some(prepared_executable) = child.prepared_executable() else {
+            self.mark_partial(
+                "owned initial-set discovery",
+                "the run target was not a revalidated direct ELF with one absolute PT_INTERP",
+            );
+            return Ok(false);
+        };
+        if !matches!(self.scope, Scope::Pid(pid) if pid == child.pid()) {
+            self.mark_partial(
+                "owned initial-set discovery",
+                "the retained Engine scope did not name the owned child exactly",
+            );
+            return Ok(false);
+        }
+        let Some(position) = self.views.iter().position(|view| {
+            view.pid() == child.pid() && view.still_the_same() && child.pin().still_the_same()
+        }) else {
+            self.mark_partial(
+                "owned initial-set discovery",
+                "the owned child generation was not retained behind its pre-exec barrier",
+            );
+            return Ok(false);
+        };
+        if !prepared_executable.unchanged()? {
+            self.mark_partial(
+                "owned initial-set discovery",
+                "the intended executable or PT_INTERP changed before pre-exec loader attachment",
+            );
+            return Ok(false);
+        }
+
+        let view_id = self.views[position].id();
+        let loader_metadata = prepared_executable.interpreter_file().metadata()?;
+        let loader_module = ScannedModule {
+            view: view_id,
+            mount_namespace: self.views[position].mount_namespace(),
+            key: metadata_object_key(&loader_metadata),
+            path: prepared_executable.interpreter().display().to_string(),
+            exports: Vec::new(),
+            tables: Vec::new(),
+            interfaces: Vec::new(),
+        };
+        let (loader_pins, skipped) = pin_scanned_view_objects(
+            &self.views[position],
+            std::slice::from_ref(&loader_module),
+            &mut self.budget,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let Some(local_loader) =
+            loader_pins.id_for_scanned(&loader_module, loader_module.key, &loader_module.path)
+        else {
+            self.mark_partial(
+                "owned initial-set discovery",
+                "the exact PT_INTERP could not be pinned through the owned child root",
+            );
+            return Ok(false);
+        };
+        let loader_snapshot = ElfSnapshot::read(
+            loader_pins
+                .file_for(local_loader)
+                .expect("the just-pinned pre-exec loader has its retained file"),
+        )
+        .map_err(anyhow::Error::msg)?;
+        let Some(hook) = loader_snapshot
+            .defined_symbol("_dl_debug_state")
+            .map_err(anyhow::Error::msg)?
+            .filter(|hook| loader_snapshot.is_executable_offset(hook.file_offset))
+        else {
+            self.mark_partial(
+                "owned initial-set discovery",
+                "the exact PT_INTERP had no executable _dl_debug_state definition",
+            );
+            return Ok(false);
+        };
+        let state = loader_snapshot
+            .defined_symbol("_r_debug")
+            .map_err(anyhow::Error::msg)?;
+        let (candidate, loader) =
+            self.loader_candidate(view_id, &loader_module, &loader_pins, local_loader, skipped)?;
+        let Some(loader) = loader else {
+            self.mark_partial(
+                "owned initial-set discovery",
+                "the exact PT_INTERP lost canonical identity before pre-exec attachment",
+            );
+            return Ok(false);
+        };
+        let prepared_context = match self.loader_registry.preflight(LoaderContextSpec {
+            view: view_id,
+            loader,
+            mapping: None,
+            hook,
+            state,
+        }) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.loader_registry.record_preflight_failure();
+                self.mark_partial("owned initial-set discovery", &error);
+                return Ok(false);
+            }
+        };
+        let cookie = prepared_context.cookie();
+        let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
+        self.queue_apply_outcome(&outcome, pending_views);
+        if !outcome.committed || !outcome.stale_views.is_empty() || !*additions_allowed {
+            self.mark_partial(
+                "owned initial-set discovery",
+                "the exact PT_INTERP identity could not be committed before barrier release",
+            );
+            return Ok(outcome.changed);
+        }
+        let context = self
+            .loader_registry
+            .prepare(prepared_context)
+            .map_err(anyhow::Error::msg)?;
+        let attach = generation_checked_mutation(
+            || {
+                self.views[position].still_the_same()
+                    && child.pin().still_the_same()
+                    && prepared_executable.unchanged().unwrap_or(false)
+                    && self.pinned.check_unchanged().unwrap_or(false)
+            },
+            || {
+                session.attach_dynamic_loader(
+                    context,
+                    child.pid(),
+                    loader,
+                    hook.file_offset,
+                    cookie,
+                    &self.pinned,
+                )
+            },
+        );
+        match attach {
+            GenerationMutation::Committed(Ok(true)) => {
+                self.loader_registry
+                    .mark_attached(context)
+                    .map_err(anyhow::Error::msg)?;
+                Ok(true)
+            }
+            GenerationMutation::PostcheckFailed(Ok(true)) => {
+                self.loader_registry
+                    .mark_attached(context)
+                    .map_err(anyhow::Error::msg)?;
+                let (_, detach_failed) = session.detach_dynamic_context(context);
+                self.loader_registry
+                    .tombstone(context)
+                    .and_then(|()| self.loader_registry.remove(context))
+                    .map_err(anyhow::Error::msg)?;
+                if detach_failed {
+                    *additions_allowed = false;
+                }
+                self.mark_partial(
+                    "owned initial-set discovery",
+                    "the direct-ELF/PT_INTERP identity changed around pre-exec attachment",
+                );
+                Ok(false)
+            }
+            GenerationMutation::Committed(Ok(false))
+            | GenerationMutation::PostcheckFailed(Ok(false))
+            | GenerationMutation::Committed(Err(_))
+            | GenerationMutation::PostcheckFailed(Err(_))
+            | GenerationMutation::PrecheckFailed => {
+                self.loader_registry
+                    .cancel_prepared(context)
+                    .and_then(|()| self.loader_registry.remove(context))
+                    .map_err(anyhow::Error::msg)?;
+                self.mark_partial(
+                    "owned initial-set discovery",
+                    "the exact PT_INTERP loader hook could not be attached before barrier release",
+                );
+                Ok(false)
+            }
+        }
+    }
+
     fn arm_loader_or_partial(
         &mut self,
         position: usize,
@@ -3807,6 +4038,8 @@ impl Engine {
         session: &mut Session,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
+        collect: &mut DiscoveryCollector<'_>,
+        closure: &mut PauseClosure,
     ) -> Result<(bool, bool)> {
         let mut changed = false;
         for context_id in self.loader_registry.ids_for_view(view) {
@@ -3819,6 +4052,7 @@ impl Engine {
             } else if context.was_attached {
                 let (terminal_exports, detach_failed) = session.detach_dynamic_context(context_id);
                 if detach_failed {
+                    closure.fail();
                     *additions_allowed = false;
                     self.mark_partial(
                         "live loader detach",
@@ -3826,11 +4060,15 @@ impl Engine {
                     );
                 }
                 match begin_attached_retirement_with(&mut self.loader_registry, context_id, || {
-                    Self::collect_discovery_records(session)
+                    collect(session)
                 }) {
                     Ok(Ok((owned, malformed))) => {
+                        if malformed != 0 {
+                            closure.fail();
+                        }
                         self.record_malformed_discovery(malformed);
                         if self.update_counter_snapshot(session).is_err() {
+                            closure.fail();
                             self.mark_live_loss(
                                 "live discovery counters",
                                 "the post-detach producer snapshot could not be read",
@@ -3843,20 +4081,28 @@ impl Engine {
                                 session,
                                 additions_allowed,
                                 pending_views,
+                                closure,
                             ) {
                                 Ok(plan_changed) => changed |= plan_changed,
-                                Err(_) => self.mark_live_loss(
-                                    "live discovery record",
-                                    "a structurally valid private terminal record failed exact live resolution",
-                                ),
+                                Err(_) => {
+                                    closure.fail();
+                                    self.mark_live_loss(
+                                        "live discovery record",
+                                        "a structurally valid private terminal record failed exact live resolution",
+                                    );
+                                }
                             }
                         }
                     }
-                    Ok(Err(_)) => self.mark_live_loss(
-                        "live loader retirement",
-                        "the post-detach private discovery drain failed",
-                    ),
+                    Ok(Err(_)) => {
+                        closure.fail();
+                        self.mark_live_loss(
+                            "live loader retirement",
+                            "the post-detach private discovery drain failed",
+                        );
+                    }
                     Err(_) => {
+                        closure.fail();
                         *additions_allowed = false;
                         self.mark_partial(
                             "live loader retirement",
@@ -3998,17 +4244,26 @@ impl Engine {
         session: &mut Session,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
+        closure: &mut PauseClosure,
     ) -> Result<bool> {
         let record = queued.record;
         match record.kind {
             DISCOVERY_KIND_FUNCTION_LIST_RETURN
             | DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN
-            | DISCOVERY_KIND_INTERFACE_RETURN => {
-                self.process_export_record(&record, session, additions_allowed, pending_views)
-            }
-            DISCOVERY_KIND_LOADER => {
-                self.process_loader_record(queued, session, additions_allowed, pending_views)
-            }
+            | DISCOVERY_KIND_INTERFACE_RETURN => self.process_export_record(
+                &record,
+                session,
+                additions_allowed,
+                pending_views,
+                closure,
+            ),
+            DISCOVERY_KIND_LOADER => self.process_loader_record(
+                queued,
+                session,
+                additions_allowed,
+                pending_views,
+                closure,
+            ),
             DISCOVERY_KIND_EXEC | DISCOVERY_KIND_LEADER_EXIT => {
                 let pid = (record.pid_tgid >> 32) as u32;
                 self.refresh_requested.insert(pid);
@@ -4032,6 +4287,8 @@ impl Engine {
         records: &mut Vec<QueuedDiscoveryRecord>,
         pending_views: &mut PendingViewRetirements,
         additions_allowed: &mut bool,
+        collect: &mut DiscoveryCollector<'_>,
+        closure: &mut PauseClosure,
     ) -> Result<bool> {
         let mut changed = false;
         let mut named_generation_lost = false;
@@ -4043,12 +4300,16 @@ impl Engine {
                     session,
                     additions_allowed,
                     pending_views,
+                    closure,
                 ) {
                     Ok(plan_changed) => changed |= plan_changed,
-                    Err(_) => self.mark_live_loss(
-                        "live discovery record",
-                        "a structurally valid private record failed exact live resolution",
-                    ),
+                    Err(_) => {
+                        closure.fail();
+                        self.mark_live_loss(
+                            "live discovery record",
+                            "a structurally valid private record failed exact live resolution",
+                        );
+                    }
                 }
             }
             if pending_views.is_empty() {
@@ -4060,6 +4321,7 @@ impl Engine {
                 conservative_replay_attempted = true;
                 let outcome =
                     self.replay_pending_conservative(session, additions_allowed, pending_views);
+                closure.observe_apply(&outcome);
                 changed |= outcome.changed;
                 if !outcome.committed && pending_views.is_empty() {
                     break;
@@ -4067,8 +4329,14 @@ impl Engine {
             }
             for (view, mut generation_lost) in std::mem::take(pending_views) {
                 generation_lost |= pending_views.remove(&view).unwrap_or(false);
-                let (retirement_changed, complete) =
-                    self.retire_loader_contexts(view, session, additions_allowed, pending_views)?;
+                let (retirement_changed, complete) = self.retire_loader_contexts(
+                    view,
+                    session,
+                    additions_allowed,
+                    pending_views,
+                    collect,
+                    closure,
+                )?;
                 generation_lost |= pending_views.remove(&view).unwrap_or(false);
                 named_generation_lost |= generation_lost && matches!(self.scope, Scope::Pid(_));
                 changed |= retirement_changed;
@@ -4203,6 +4471,8 @@ impl Engine {
         additions_allowed: &mut bool,
         records: &mut Vec<QueuedDiscoveryRecord>,
         pending_views: &mut PendingViewRetirements,
+        collect: &mut DiscoveryCollector<'_>,
+        closure: &mut PauseClosure,
     ) -> Result<bool> {
         if matches!(self.scope, Scope::Pid(_)) {
             let stale: BTreeSet<_> = self
@@ -4218,6 +4488,8 @@ impl Engine {
                     records,
                     pending_views,
                     additions_allowed,
+                    collect,
+                    closure,
                 )?;
                 bail!("the named process generation changed during capture");
             }
@@ -4352,8 +4624,14 @@ impl Engine {
                 "live inventory generation",
                 "an exact retained or newly opened process generation changed during inventory preflight",
             );
-            changed |=
-                self.process_discovery_records(session, records, pending_views, additions_allowed)?;
+            changed |= self.process_discovery_records(
+                session,
+                records,
+                pending_views,
+                additions_allowed,
+                collect,
+                closure,
+            )?;
             return Ok(changed);
         }
         if !admission.targets_ok && admission.missing_contexts.is_empty() {
@@ -4361,8 +4639,14 @@ impl Engine {
                 "live inventory transaction",
                 "candidate preflight failed; canonical identity, plan, and links were unchanged",
             );
-            changed |=
-                self.process_discovery_records(session, records, pending_views, additions_allowed)?;
+            changed |= self.process_discovery_records(
+                session,
+                records,
+                pending_views,
+                additions_allowed,
+                collect,
+                closure,
+            )?;
             return Ok(changed);
         }
 
@@ -4393,8 +4677,14 @@ impl Engine {
                 mutation_started = true;
                 context_retirements.insert(*view);
             }
-            let (retirement_changed, complete) =
-                self.retire_loader_contexts(*view, session, additions_allowed, pending_views)?;
+            let (retirement_changed, complete) = self.retire_loader_contexts(
+                *view,
+                session,
+                additions_allowed,
+                pending_views,
+                collect,
+                closure,
+            )?;
             changed |= retirement_changed;
             mutation_started |= retirement_changed;
             if !complete {
@@ -4416,8 +4706,14 @@ impl Engine {
             completed_retirement_intent(&removed, &context_retirements, &failed_retirements);
         self.pending_retirements
             .extend(completed_retirements.iter().copied());
-        changed |=
-            self.process_discovery_records(session, records, pending_views, additions_allowed)?;
+        changed |= self.process_discovery_records(
+            session,
+            records,
+            pending_views,
+            additions_allowed,
+            collect,
+            closure,
+        )?;
         if !self.pending_retirements.is_empty() || !self.pending_rejected_keys.is_empty() {
             self.mark_partial(
                 "live inventory transaction",
@@ -4467,8 +4763,14 @@ impl Engine {
                 ..ApplyOutcome::default()
             };
             self.queue_apply_outcome(&outcome, pending_views);
-            changed |=
-                self.process_discovery_records(session, records, pending_views, additions_allowed)?;
+            changed |= self.process_discovery_records(
+                session,
+                records,
+                pending_views,
+                additions_allowed,
+                collect,
+                closure,
+            )?;
             if conservative_only {
                 *additions_allowed = false;
             }
@@ -4506,9 +4808,16 @@ impl Engine {
             }
         }
         self.queue_apply_outcome(&outcome, pending_views);
+        closure.observe_apply(&outcome);
         changed |= outcome.changed;
-        changed |=
-            self.process_discovery_records(session, records, pending_views, additions_allowed)?;
+        changed |= self.process_discovery_records(
+            session,
+            records,
+            pending_views,
+            additions_allowed,
+            collect,
+            closure,
+        )?;
         if !outcome.committed || !outcome.stale_views.is_empty() {
             return Ok(changed);
         }
@@ -4561,8 +4870,14 @@ impl Engine {
             }
             Err(error) => Some(error),
         };
-        let cleanup =
-            self.process_discovery_records(session, records, pending_views, additions_allowed);
+        let cleanup = self.process_discovery_records(
+            session,
+            records,
+            pending_views,
+            additions_allowed,
+            collect,
+            closure,
+        );
         if let Some(error) = fatal {
             return Err(error);
         }
@@ -4585,6 +4900,19 @@ impl Engine {
         records: Vec<DiscoveryRecord>,
         malformed: u64,
     ) -> Result<bool> {
+        let mut collect = Self::collect_discovery_records;
+        self.apply_discovery_batch_with(session, records, malformed, true, &mut collect)
+            .map(|outcome| outcome.changed)
+    }
+
+    pub(crate) fn apply_discovery_batch_with(
+        &mut self,
+        session: &mut Session,
+        records: Vec<DiscoveryRecord>,
+        malformed: u64,
+        additions_allowed: bool,
+        collect: &mut DiscoveryCollector<'_>,
+    ) -> Result<DiscoveryBatchOutcome> {
         let mut records: Vec<_> = records
             .into_iter()
             .map(|record| QueuedDiscoveryRecord {
@@ -4596,13 +4924,16 @@ impl Engine {
         self.record_malformed_discovery(malformed);
         self.update_counter_snapshot(session)?;
 
-        let mut additions_allowed = true;
+        let mut additions_allowed = additions_allowed;
+        let mut closure = PauseClosure::new(additions_allowed && malformed == 0);
         let mut pending_views = PendingViewRetirements::new();
         let mut changed = self.process_discovery_records(
             session,
             &mut records,
             &mut pending_views,
             &mut additions_allowed,
+            collect,
+            &mut closure,
         )?;
         if self.pending_retirements.is_empty() && self.pending_rejected_keys.is_empty() {
             changed |= self.refresh_inventory(
@@ -4610,11 +4941,16 @@ impl Engine {
                 &mut additions_allowed,
                 &mut records,
                 &mut pending_views,
+                collect,
+                &mut closure,
             )?;
         }
         record_object_skips(&mut self.plan, &self.counters.object_skips);
         self.discovery = discovery_evidence(&self.plan, &self.pinned, &self.counters);
-        Ok(changed)
+        Ok(DiscoveryBatchOutcome {
+            changed,
+            required_complete: closure.required_complete() && additions_allowed,
+        })
     }
 
     /// Performs the existing one-shot initial discovery pass.
@@ -4647,22 +4983,95 @@ impl Engine {
     }
 
     pub fn start_session(&mut self, policy: CapturePolicy) -> Result<Session> {
-        self.start_session_with(policy, None)
+        self.start_session_with(policy, None, None)
     }
 
     #[allow(dead_code)] // Task 8 invokes this reviewed library-internal route.
     pub(crate) fn start_owned_session(
         &mut self,
         policy: CapturePolicy,
-        child: &OwnedChild,
+        child: &mut OwnedChild,
     ) -> Result<Session> {
-        self.start_session_with(policy, Some(OwnedPauseGeneration::from_owned_child(child)))
+        let generation = OwnedPauseGeneration::from_owned_child(child);
+        self.start_session_with(policy, Some(generation), Some(child))
+    }
+
+    /// Task 8 calls this only after its coordinator armed the pause epoch and
+    /// released the barrier. A changed direct target, shebang, or later exec
+    /// chain retires the speculative pre-exec context and uses the ordinary
+    /// exact mapped-loader route without upgrading empty-catalog evidence.
+    #[allow(dead_code)] // Task 8 invokes this after its pause arm and barrier release.
+    pub(crate) fn revalidate_owned_session(
+        &mut self,
+        child: &OwnedChild,
+        session: &mut Session,
+    ) -> Result<bool> {
+        let Some(view) = self
+            .views
+            .iter()
+            .find(|view| view.pid() == child.pid())
+            .map(ProcessView::id)
+        else {
+            self.mark_partial(
+                "owned initial-set discovery",
+                "the owned child generation was absent after barrier release",
+            );
+            return Ok(false);
+        };
+        let direct_stable = child.revalidate_after_exec().unwrap_or(false);
+        let mut additions_allowed = true;
+        let mut records = Vec::new();
+        let mut pending_views = PendingViewRetirements::new();
+        let mut collect = Self::collect_discovery_records;
+        let mut closure = PauseClosure::new(true);
+        if direct_stable && !self.loader_registry.ids_for_view(view).is_empty() {
+            return Ok(true);
+        }
+        if !self.loader_registry.ids_for_view(view).is_empty() {
+            let (_, complete) = self.retire_loader_contexts(
+                view,
+                session,
+                &mut additions_allowed,
+                &mut pending_views,
+                &mut collect,
+                &mut closure,
+            )?;
+            additions_allowed &= complete;
+        }
+        self.mark_partial(
+            "owned initial-set discovery",
+            "the direct executable identity did not revalidate after exec; ordinary live discovery remains the fallback",
+        );
+        let mut changed = false;
+        for position in 0..self.views.len() {
+            if !self.views[position].still_the_same() {
+                continue;
+            }
+            changed |= self.arm_loader_or_partial(
+                position,
+                session,
+                &mut additions_allowed,
+                &mut pending_views,
+            )?;
+        }
+        changed |= self.process_discovery_records(
+            session,
+            &mut records,
+            &mut pending_views,
+            &mut additions_allowed,
+            &mut collect,
+            &mut closure,
+        )?;
+        record_object_skips(&mut self.plan, &self.counters.object_skips);
+        self.discovery = discovery_evidence(&self.plan, &self.pinned, &self.counters);
+        Ok(changed)
     }
 
     fn start_session_with(
         &mut self,
         policy: CapturePolicy,
         mut pause_generation: Option<OwnedPauseGeneration>,
+        owned_child: Option<&OwnedChild>,
     ) -> Result<Session> {
         let retained_scope = self.scope.clone();
         let named = matches!(retained_scope, Scope::Pid(_));
@@ -4674,18 +5083,45 @@ impl Engine {
         let mut additions_allowed = true;
         let mut records = Vec::new();
         let mut pending_views = PendingViewRetirements::new();
+        let mut collect = Self::collect_discovery_records;
+        let mut closure = PauseClosure::new(true);
         let mut fatal = None;
-        for position in 0..self.views.len() {
-            match self.arm_loader_or_partial(
-                position,
+        if let Some(child) = owned_child {
+            let _ = match self.arm_owned_loader_before_release(
+                child,
                 &mut session,
                 &mut additions_allowed,
                 &mut pending_views,
             ) {
-                Ok(_) => {}
-                Err(error) => {
-                    fatal = Some(error);
-                    break;
+                Ok(prearmed) => prearmed,
+                Err(_) => {
+                    self.mark_partial(
+                        "owned initial-set discovery",
+                        "the exact direct-ELF loader pre-arm failed; ordinary post-exec discovery remains the fallback",
+                    );
+                    false
+                }
+            };
+            self.mark_partial(
+                "owned initial-set discovery",
+                "the empty timing catalog leaves initial-set capture unproven",
+            );
+        } else {
+            for position in 0..self.views.len() {
+                if !self.views[position].still_the_same() {
+                    continue;
+                }
+                match self.arm_loader_or_partial(
+                    position,
+                    &mut session,
+                    &mut additions_allowed,
+                    &mut pending_views,
+                ) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        fatal = Some(error);
+                        break;
+                    }
                 }
             }
         }
@@ -4694,6 +5130,8 @@ impl Engine {
             &mut records,
             &mut pending_views,
             &mut additions_allowed,
+            &mut collect,
+            &mut closure,
         );
         if let Some(error) = fatal {
             return Err(error);
@@ -4780,6 +5218,58 @@ mod tests {
             keys
         })[index]
             .clone()
+    }
+
+    #[test]
+    fn pause_closure_preserves_real_required_attachment_failure() {
+        let failed = timing_key(0);
+        let outcome = ApplyOutcome {
+            committed: true,
+            static_failures: [failed].into_iter().collect(),
+            ..ApplyOutcome::default()
+        };
+        let mut closure = PauseClosure::new(true);
+
+        closure.observe_apply(&outcome);
+
+        assert!(!closure.required_complete());
+    }
+
+    #[test]
+    fn loader_retirement_never_owns_an_untimed_session_dequeue() {
+        let source = include_str!("engine.rs");
+        let retirement = source
+            .split_once("    fn retire_loader_contexts(")
+            .unwrap()
+            .1
+            .split_once("    fn queue_stale_views(")
+            .unwrap()
+            .0;
+        assert!(!retirement.contains("Self::collect_discovery_records(session)"));
+        assert!(retirement.contains("collect(session)"));
+    }
+
+    #[test]
+    fn owned_session_prearms_while_exclusively_borrowing_the_unreleased_child() {
+        let source = include_str!("engine.rs");
+        let owned_entry = source
+            .split_once("    pub(crate) fn start_owned_session(")
+            .unwrap()
+            .1
+            .split_once("    pub(crate) fn revalidate_owned_session(")
+            .unwrap()
+            .0;
+        assert!(owned_entry.contains("child: &mut OwnedChild"));
+        let route = source
+            .split_once("    fn start_session_with(")
+            .unwrap()
+            .1
+            .split_once("\n    }\n}")
+            .unwrap()
+            .0;
+        assert!(route.contains("arm_owned_loader_before_release("));
+        assert!(!route.contains("child.release()"));
+        assert!(source.contains("child.revalidate_after_exec()"));
     }
 
     fn engine_with_overlay(minor: u64) -> (Engine, ScannedModule, PinnedObjectId, PinnedTimingKey) {
@@ -5373,7 +5863,7 @@ mod tests {
         let context_spec = |view| LoaderContextSpec {
             view,
             loader: rejected_loader,
-            mapping: MapEntry {
+            mapping: Some(MapEntry {
                 start: 0x4000,
                 end: 0x5000,
                 file_offset: 0x2000,
@@ -5381,7 +5871,7 @@ mod tests {
                 device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
                 inode: 7,
                 raw_path: Some(b"/lib/ld.so".to_vec()),
-            },
+            }),
             hook: p11scope_manifest::elf::SymbolFact {
                 virtual_address: 0x2100,
                 file_offset: 0x2100,
@@ -5805,7 +6295,7 @@ mod tests {
             .preflight(LoaderContextSpec {
                 view: ProcessViewId(3),
                 loader: PinnedObjectId(9),
-                mapping: mapping.clone(),
+                mapping: Some(mapping.clone()),
                 hook: SymbolFact {
                     virtual_address: 0x2100,
                     file_offset: 0x2100,
@@ -5915,7 +6405,7 @@ mod tests {
             .preflight(LoaderContextSpec {
                 view: ProcessViewId(3),
                 loader: PinnedObjectId(9),
-                mapping,
+                mapping: Some(mapping),
                 hook: SymbolFact {
                     virtual_address: 0x2100,
                     file_offset: 0x2100,
@@ -5952,7 +6442,7 @@ mod tests {
                 .preflight(LoaderContextSpec {
                     view,
                     loader,
-                    mapping: mapping.clone(),
+                    mapping: Some(mapping.clone()),
                     hook: SymbolFact {
                         virtual_address: 0x2100,
                         file_offset: 0x2100,

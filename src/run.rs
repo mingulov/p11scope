@@ -115,8 +115,8 @@ impl PreparedExecutable {
         &self.path
     }
 
-    pub(crate) fn interpreter(&self) -> Option<&Path> {
-        Some(&self.interpreter)
+    pub(crate) fn interpreter(&self) -> &Path {
+        &self.interpreter
     }
 
     pub(crate) fn file(&self) -> &File {
@@ -660,7 +660,7 @@ mod tests {
     fn path_absolute_shebang_retarget_and_exec_chain_prearm_classification_is_conservative() {
         let path = PreparedExecutable::resolve("sh".as_ref()).unwrap().unwrap();
         assert!(path.path().is_absolute());
-        assert!(path.interpreter().is_some());
+        let _: &Path = path.interpreter();
         assert!(path.interpreter_file().metadata().is_ok());
         assert!(path.unchanged().unwrap());
         assert!(

@@ -88,11 +88,11 @@ impl PauseError {
         }
     }
 
-    fn from_lifecycle(messages: Vec<String>) -> Self {
+    fn many(messages: Vec<String>, required: bool, lifecycle: bool) -> Self {
         Self {
             messages,
-            required: false,
-            lifecycle: true,
+            required,
+            lifecycle,
         }
     }
 
@@ -131,6 +131,7 @@ pub(crate) trait PauseIo {
         deadline: Option<u64>,
         additions_allowed: bool,
     ) -> Result<PauseBatchOutcome, String>;
+    fn revalidate_after_release(&mut self, pause_owned: bool) -> Result<PauseBatchOutcome, String>;
     fn marker_seen(&mut self) -> Result<bool, String>;
     fn resume(&mut self) -> Result<(), String>;
     fn detach_pause_links(&mut self) -> Result<(), String>;
@@ -313,6 +314,36 @@ impl PauseCoordinator {
         }
     }
 
+    pub(crate) fn revalidate_after_release(
+        &mut self,
+        io: &mut impl PauseIo,
+    ) -> Result<(), PauseError> {
+        let pause_owned = self.policy != PausePolicy::Never;
+        if pause_owned && !self.armed {
+            self.begin_attempt();
+            return self.fail_cycle(
+                io,
+                "owned-child revalidation started without an armed pause",
+                true,
+            );
+        }
+        match io.revalidate_after_release(pause_owned) {
+            Ok(outcome) if outcome.required_complete => Ok(()),
+            Ok(_) => {
+                self.begin_attempt();
+                self.fail_cycle(
+                    io,
+                    "post-release loader revalidation did not close required discovery",
+                    false,
+                )
+            }
+            Err(error) => {
+                self.begin_attempt();
+                self.fail_cycle(io, error, false)
+            }
+        }
+    }
+
     fn arm_failed(
         &mut self,
         io: &mut impl PauseIo,
@@ -326,10 +357,9 @@ impl PauseCoordinator {
                 self.counters.partial = self.counters.partial.saturating_add(1);
                 Ok(ArmResult::Disabled)
             }
-            PausePolicy::Always => match self.terminal_cleanup(io) {
-                Ok(()) => Err(PauseError::one(message, true, false)),
-                Err(error) => Err(error),
-            },
+            PausePolicy::Always => self
+                .terminal_cleanup_with_cause(io, vec![message], true, false)
+                .map(|()| ArmResult::Disabled),
             PausePolicy::Never => Ok(ArmResult::Disabled),
         }
     }
@@ -732,15 +762,12 @@ impl PauseCoordinator {
     ) -> Result<(), PauseError> {
         if self.policy == PausePolicy::Always {
             self.pending_records.append(&mut records);
-            let cleanup = self.terminal_cleanup(io);
-            return match cleanup {
-                Ok(()) => Err(PauseError::one(
-                    "pause helper rejected SIGSTOP",
-                    true,
-                    false,
-                )),
-                Err(error) => Err(error),
-            };
+            return self.terminal_cleanup_with_cause(
+                io,
+                vec!["pause helper rejected SIGSTOP".into()],
+                true,
+                false,
+            );
         }
         let mut retained_error = None;
         let mut lifecycle_errors = Vec::new();
@@ -864,12 +891,12 @@ impl PauseCoordinator {
         let message = message.into();
         self.rearming_enabled = false;
         if lifecycle || self.policy == PausePolicy::Always {
-            let cleanup = self.terminal_cleanup(io);
-            return match cleanup {
-                Ok(()) if lifecycle => Err(PauseError::from_lifecycle(vec![message])),
-                Ok(()) => Err(PauseError::one(message, true, false)),
-                Err(error) => Err(error),
-            };
+            return self.terminal_cleanup_with_cause(
+                io,
+                vec![message],
+                !lifecycle && self.policy == PausePolicy::Always,
+                lifecycle,
+            );
         }
         let mut errors = vec![message.clone()];
         let deadline = self.failure_bound(io, &mut errors);
@@ -987,21 +1014,32 @@ impl PauseCoordinator {
     }
 
     fn terminal_cleanup(&mut self, io: &mut impl PauseIo) -> Result<(), PauseError> {
-        self.terminal_cleanup_with_errors(io, Vec::new())
+        self.terminal_cleanup_with_cause(io, Vec::new(), false, false)
     }
 
     fn terminal_cleanup_with_errors(
         &mut self,
         io: &mut impl PauseIo,
+        errors: Vec<String>,
+    ) -> Result<(), PauseError> {
+        self.terminal_cleanup_with_cause(io, errors, false, true)
+    }
+
+    fn terminal_cleanup_with_cause(
+        &mut self,
+        io: &mut impl PauseIo,
         mut errors: Vec<String>,
+        required: bool,
+        lifecycle: bool,
     ) -> Result<(), PauseError> {
         if self.cleaned || self.cleaning {
             return if errors.is_empty() {
                 Ok(())
             } else {
-                Err(PauseError::from_lifecycle(errors))
+                Err(PauseError::many(errors, required, lifecycle))
             };
         }
+        let initiating_errors = errors.len();
         self.cleaning = true;
         if let Err(error) = io.detach_pause_links() {
             errors.push(error);
@@ -1098,7 +1136,12 @@ impl PauseCoordinator {
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(PauseError::from_lifecycle(errors))
+            let cleanup_failed = errors.len() > initiating_errors;
+            Err(PauseError::many(
+                errors,
+                required,
+                lifecycle || cleanup_failed,
+            ))
         }
     }
 
@@ -1246,7 +1289,7 @@ impl PauseIo for SessionPauseIo<'_> {
         let child = self.child;
         let stop_candidate_seen = &mut self.stop_candidate_seen;
         let mut collect = |session: &mut Session| {
-            collect_timed_retirement(session, child, deadline, stop_candidate_seen)
+            collect_timed_retirement(session, child, deadline, stop_candidate_seen, true)
         };
         let outcome = self
             .engine
@@ -1258,6 +1301,22 @@ impl PauseIo for SessionPauseIo<'_> {
                 &mut collect,
             )
             .map_err(|error| format!("discovery batch application failed: {error:#}"))?;
+        self.plan_changed |= outcome.changed;
+        Ok(PauseBatchOutcome {
+            required_complete: outcome.required_complete,
+        })
+    }
+
+    fn revalidate_after_release(&mut self, pause_owned: bool) -> Result<PauseBatchOutcome, String> {
+        let child = self.child;
+        let stop_candidate_seen = &mut self.stop_candidate_seen;
+        let mut collect = |session: &mut Session| {
+            collect_timed_retirement(session, child, None, stop_candidate_seen, pause_owned)
+        };
+        let outcome = self
+            .engine
+            .revalidate_owned_session_with(self.child, self.session, &mut collect)
+            .map_err(|error| format!("owned-child revalidation failed: {error:#}"))?;
         self.plan_changed |= outcome.changed;
         Ok(PauseBatchOutcome {
             required_complete: outcome.required_complete,
@@ -1305,6 +1364,7 @@ fn collect_timed_retirement(
     child: &OwnedChild,
     deadline: Option<u64>,
     stop_candidate_seen: &mut bool,
+    pause_owned: bool,
 ) -> Result<(Vec<DiscoveryRecord>, u64), anyhow::Error> {
     let mut records = Vec::new();
     let mut malformed = 0u64;
@@ -1334,6 +1394,11 @@ fn collect_timed_retirement(
         if !child.pin().still_the_same() {
             return Err(anyhow::anyhow!(
                 "owned child generation changed after nested discovery decode"
+            ));
+        }
+        if pause_owned && deadline.is_none() {
+            return Err(anyhow::anyhow!(
+                "pause-owned revalidation observed discovery before coordinator assignment"
             ));
         }
         match item {
@@ -1456,6 +1521,8 @@ mod tests {
         same_generation: bool,
         ring_losses: VecDeque<Result<u64, String>>,
         fallback_ring_loss: u64,
+        revalidation_required_complete: bool,
+        revalidation_consumes_winner: bool,
     }
 
     impl Default for FakeIo {
@@ -1480,6 +1547,8 @@ mod tests {
                 same_generation: true,
                 ring_losses: VecDeque::new(),
                 fallback_ring_loss: 0,
+                revalidation_required_complete: true,
+                revalidation_consumes_winner: false,
             }
         }
     }
@@ -1560,6 +1629,19 @@ mod tests {
             })
         }
 
+        fn revalidate_after_release(
+            &mut self,
+            _pause_owned: bool,
+        ) -> Result<PauseBatchOutcome, String> {
+            self.events.push("revalidate");
+            if self.revalidation_consumes_winner {
+                self.authorization = Some(PAUSE_REQUESTED);
+            }
+            Ok(PauseBatchOutcome {
+                required_complete: self.revalidation_required_complete,
+            })
+        }
+
         fn marker_seen(&mut self) -> Result<bool, String> {
             Ok(self.marker)
         }
@@ -1599,6 +1681,10 @@ mod tests {
 
         fn cancelled(&mut self) -> Result<bool, String> {
             Ok(self.cancelled)
+        }
+
+        fn stop_candidate_seen(&self) -> bool {
+            self.revalidation_consumes_winner
         }
     }
 
@@ -2087,6 +2173,29 @@ mod tests {
     }
 
     #[test]
+    fn post_release_revalidation_remains_owned_by_the_pause_ledger() {
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_ARMED),
+            revalidation_required_complete: false,
+            revalidation_consumes_winner: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.revalidate_after_release(&mut io).unwrap();
+
+        assert_eq!(io.events.first(), Some(&"revalidate"));
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert_eq!(io.authorization, None);
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1,
+            "the coordinator ledger owns the consumed winner's protective resume"
+        );
+    }
+
+    #[test]
     fn required_prearm_generation_failure_uses_the_terminal_route() {
         let mut io = FakeIo {
             same_generation: false,
@@ -2099,6 +2208,61 @@ mod tests {
         assert!(error.required());
         assert_eq!(io.events.first(), Some(&"detach"));
         assert!(!io.events.contains(&"resume"));
+    }
+
+    #[test]
+    fn terminal_preserves_required_failure_and_cleanup_errors() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.fail_apply = true;
+        io.fail_detach = true;
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(error.required());
+        assert!(error.lifecycle());
+        assert!(error.to_string().contains("apply"));
+        assert!(error.to_string().contains("detach"));
+        assert!(io.events.contains(&"account"));
+        assert!(io.events.contains(&"remove"));
+        assert!(io.events.contains(&"resume"));
+    }
+
+    #[test]
+    fn terminal_preserves_rejected_helper_and_cleanup_errors() {
+        let mut io = successful_io(vec![record(10, -libc::EPERM as i64, false)]);
+        io.fail_detach = true;
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(error.required());
+        assert!(error.lifecycle());
+        assert!(error.to_string().contains("rejected SIGSTOP"));
+        assert!(error.to_string().contains("detach"));
+        assert!(io.events.contains(&"account"));
+        assert!(io.events.contains(&"remove"));
+    }
+
+    #[test]
+    fn terminal_preserves_required_prearm_and_cleanup_errors() {
+        let mut io = FakeIo {
+            same_generation: false,
+            fail_detach: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+
+        let error = coordinator.arm(&mut io).unwrap_err();
+
+        assert!(error.required());
+        assert!(error.lifecycle());
+        assert!(error.to_string().contains("generation changed"));
+        assert!(error.to_string().contains("detach"));
+        assert!(io.events.contains(&"account"));
+        assert!(io.events.contains(&"remove"));
     }
 
     #[test]

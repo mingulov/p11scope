@@ -357,7 +357,6 @@ impl PauseCoordinator {
                         false,
                     );
                 }
-                Err(_) if !pause_owned && self.policy == PausePolicy::Auto => return Ok(()),
                 Err(error) if !pause_owned => {
                     return Err(Self::policy_error(self.policy, error, true));
                 }
@@ -963,7 +962,9 @@ impl PauseCoordinator {
         ) {
             errors.push(error);
         }
-        self.epoch.zero_candidate |= io.stop_candidate_seen();
+        let stop_candidate_seen = io.stop_candidate_seen();
+        self.epoch.zero_candidate |= stop_candidate_seen;
+        self.may_be_stopped |= stop_candidate_seen;
         match io.authorization() {
             Ok(Some(PAUSE_REQUESTED)) => {
                 self.may_be_stopped = true;
@@ -1105,7 +1106,9 @@ impl PauseCoordinator {
         if let Err(error) = io.apply_batch(records, Some(deadline), false) {
             errors.push(error);
         }
-        self.epoch.zero_candidate |= io.stop_candidate_seen();
+        let stop_candidate_seen = io.stop_candidate_seen();
+        self.epoch.zero_candidate |= stop_candidate_seen;
+        self.may_be_stopped |= stop_candidate_seen;
         match io.authorization() {
             Ok(Some(PAUSE_REQUESTED)) => {
                 if self.epoch.rejected {
@@ -1417,26 +1420,51 @@ fn collect_timed_retirement(
     stop_candidate_seen: &mut bool,
     pause_owned: bool,
 ) -> Result<(Vec<DiscoveryRecord>, u64), anyhow::Error> {
+    collect_timed_retirement_with(
+        child.pid(),
+        deadline,
+        stop_candidate_seen,
+        pause_owned,
+        || attach::monotonic_ns().ok_or_else(|| anyhow::anyhow!("monotonic clock read failed")),
+        || session.discovery_dequeue(),
+        || child.pin().still_the_same(),
+    )
+}
+
+fn collect_timed_retirement_with(
+    child_pid: u32,
+    deadline: Option<u64>,
+    stop_candidate_seen: &mut bool,
+    pause_owned: bool,
+    mut now_ns: impl FnMut() -> Result<u64, anyhow::Error>,
+    mut dequeue: impl FnMut() -> Result<Option<DiscoveryItem>, anyhow::Error>,
+    mut same_generation: impl FnMut() -> bool,
+) -> Result<(Vec<DiscoveryRecord>, u64), anyhow::Error> {
     let mut records = Vec::new();
     let mut malformed = 0u64;
     loop {
-        let before_ns =
-            attach::monotonic_ns().ok_or_else(|| anyhow::anyhow!("monotonic clock read failed"))?;
+        let before_ns = now_ns()?;
         if deadline.is_some_and(|deadline| before_ns > deadline) {
             return Err(anyhow::anyhow!(
                 "deadline crossed before nested discovery dequeue"
             ));
         }
-        let item = session.discovery_dequeue()?;
-        let after_ns =
-            attach::monotonic_ns().ok_or_else(|| anyhow::anyhow!("monotonic clock read failed"))?;
+        let item = dequeue()?;
+        if let Some(DiscoveryItem::Record(record)) = item.as_ref()
+            && pause_owned
+            && exact_pid(record) == child_pid
+            && record.send_signal_rc == 0
+        {
+            *stop_candidate_seen = true;
+        }
+        let after_ns = now_ns()?;
         if deadline.is_some_and(|deadline| after_ns > deadline) {
             return Err(anyhow::anyhow!(
                 "deadline crossed after nested discovery dequeue"
             ));
         }
         let Some(item) = item else { break };
-        if !child.pin().still_the_same() {
+        if !same_generation() {
             return Err(anyhow::anyhow!(
                 "owned child generation changed after nested discovery decode"
             ));
@@ -1448,13 +1476,6 @@ fn collect_timed_retirement(
                 item,
             }
             .into());
-        }
-        if let DiscoveryItem::Record(record) = &item
-            && pause_owned
-            && exact_pid(record) == child.pid()
-            && record.send_signal_rc == 0
-        {
-            *stop_candidate_seen = true;
         }
         match item {
             DiscoveryItem::Malformed => {
@@ -1470,7 +1491,7 @@ fn collect_timed_retirement(
                     };
                     validate_received(&received, record.hook_ts_ns, deadline)
                         .map_err(anyhow::Error::msg)?;
-                    if exact_pid(&record) != child.pid()
+                    if exact_pid(&record) != child_pid
                         || record.send_signal_rc != COALESCED_NO_HELPER_RC
                         || record.status_flags & DISCOVERY_STATUS_COALESCED_NO_HELPER == 0
                     {
@@ -1579,6 +1600,9 @@ mod tests {
         revalidation_required_complete: bool,
         revalidation_consumes_winner: bool,
         revalidation_item: Option<DiscoveryItem>,
+        revalidation_deferred: Option<TimedItem>,
+        revalidation_error: Option<String>,
+        retirement_stop_candidate_seen: bool,
         revalidation_pause_owned: Vec<bool>,
     }
 
@@ -1607,6 +1631,9 @@ mod tests {
                 revalidation_required_complete: true,
                 revalidation_consumes_winner: false,
                 revalidation_item: None,
+                revalidation_deferred: None,
+                revalidation_error: None,
+                retirement_stop_candidate_seen: false,
                 revalidation_pause_owned: Vec::new(),
             }
         }
@@ -1694,6 +1721,12 @@ mod tests {
         ) -> Result<PauseRevalidationOutcome, String> {
             self.events.push("revalidate");
             self.revalidation_pause_owned.push(pause_owned);
+            if let Some(error) = self.revalidation_error.take() {
+                return Err(error);
+            }
+            if let Some(deferred) = self.revalidation_deferred.take() {
+                return Ok(PauseRevalidationOutcome::Deferred(deferred));
+            }
             if let Some(item) = self.revalidation_item.take() {
                 if pause_owned {
                     self.authorization = Some(PAUSE_REQUESTED);
@@ -1760,7 +1793,7 @@ mod tests {
         }
 
         fn stop_candidate_seen(&self) -> bool {
-            self.revalidation_consumes_winner
+            self.revalidation_consumes_winner || self.retirement_stop_candidate_seen
         }
     }
 
@@ -1810,6 +1843,26 @@ mod tests {
             authorization: Some(PAUSE_REQUESTED),
             ..FakeIo::default()
         }
+    }
+
+    fn collect_owned_retirement_for_test(
+        item: DiscoveryItem,
+        post_clock: Result<u64, anyhow::Error>,
+        same_generation: bool,
+    ) -> (Result<(Vec<DiscoveryRecord>, u64), anyhow::Error>, bool) {
+        let mut clocks = VecDeque::from([Ok(1), post_clock]);
+        let mut item = Some(item);
+        let mut stop_candidate_seen = false;
+        let result = collect_timed_retirement_with(
+            41,
+            None,
+            &mut stop_candidate_seen,
+            true,
+            || clocks.pop_front().expect("one before and one after clock"),
+            || Ok(item.take()),
+            || same_generation,
+        );
+        (result, stop_candidate_seen)
     }
 
     #[test]
@@ -2272,6 +2325,108 @@ mod tests {
     }
 
     #[test]
+    fn post_release_zero_before_post_clock_failure_protectively_resumes() {
+        let (result, stop_candidate_seen) = collect_owned_retirement_for_test(
+            DiscoveryItem::Record(record(10, 0, false)),
+            Err(anyhow::anyhow!("post-clock")),
+            true,
+        );
+        let error = match result {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("the injected post-dequeue clock must fail"),
+        };
+        assert!(stop_candidate_seen);
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_ARMED),
+            revalidation_error: Some(error),
+            retirement_stop_candidate_seen: stop_candidate_seen,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.revalidate_after_release(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(coordinator.counters().valid());
+        assert_eq!(io.authorization, None);
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn post_release_zero_before_generation_failure_protectively_resumes() {
+        let (result, stop_candidate_seen) = collect_owned_retirement_for_test(
+            DiscoveryItem::Record(record(10, 0, false)),
+            Ok(2),
+            false,
+        );
+        let error = match result {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("the injected generation check must fail"),
+        };
+        assert!(stop_candidate_seen);
+        let mut io = FakeIo {
+            revalidation_error: Some(error),
+            retirement_stop_candidate_seen: stop_candidate_seen,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.revalidate_after_release(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(coordinator.counters().valid());
+        assert_eq!(io.authorization, None);
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn post_release_zero_before_classification_cancellation_protectively_resumes() {
+        let (result, stop_candidate_seen) = collect_owned_retirement_for_test(
+            DiscoveryItem::Record(record(10, 0, false)),
+            Ok(2),
+            true,
+        );
+        let deferred = match result {
+            Err(error) => error
+                .downcast::<DeferredDiscoveryItem>()
+                .expect("owned revalidation must transfer the already-clocked item"),
+            Ok(_) => panic!("owned revalidation must defer coordinator classification"),
+        };
+        assert!(stop_candidate_seen);
+        let mut io = FakeIo {
+            cancelled: true,
+            revalidation_deferred: Some(TimedItem {
+                before_ns: deferred.before_ns,
+                after_ns: deferred.after_ns,
+                item: deferred.item,
+            }),
+            retirement_stop_candidate_seen: stop_candidate_seen,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.revalidate_after_release(&mut io).unwrap_err();
+
+        assert!(error.lifecycle());
+        assert_eq!(coordinator.counters(), PauseCounters::default());
+        assert!(coordinator.counters().valid());
+        assert_eq!(io.authorization, None);
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    #[test]
     fn post_release_negative_helper_is_classified_before_failure_cleanup() {
         let rejected = record(10, i64::from(-libc::EPERM), false);
         let mut io = FakeIo {
@@ -2336,6 +2491,54 @@ mod tests {
         assert_eq!(coordinator.counters(), PauseCounters::partial(1));
         assert!(coordinator.counters().valid());
         assert!(!io.events.contains(&"resume"));
+    }
+
+    #[test]
+    fn disabled_auto_revalidation_error_is_lifecycle_without_pause_side_effects() {
+        let mut io = FakeIo {
+            same_generation: false,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        let counters = coordinator.counters();
+        io.same_generation = true;
+        io.revalidation_error = Some("dynamic loader attachment invariant failed".into());
+
+        let error = coordinator.revalidate_after_release(&mut io).unwrap_err();
+
+        assert!(error.lifecycle());
+        assert!(!error.required());
+        assert_eq!(coordinator.counters(), counters);
+        assert!(coordinator.counters().valid());
+        assert_eq!(io.revalidation_pause_owned, [false]);
+        assert_eq!(io.events, ["revalidate"]);
+        assert_eq!(io.authorization, None);
+    }
+
+    #[test]
+    fn ordinary_retirement_zero_never_creates_pause_debt() {
+        let mut clocks = VecDeque::from([Ok(1), Ok(2), Ok(3), Ok(4)]);
+        let mut items = VecDeque::from([
+            Ok(Some(DiscoveryItem::Record(record(10, 0, false)))),
+            Ok(None),
+        ]);
+        let mut stop_candidate_seen = false;
+
+        let (records, malformed) = collect_timed_retirement_with(
+            41,
+            None,
+            &mut stop_candidate_seen,
+            false,
+            || clocks.pop_front().expect("two clocks per dequeue"),
+            || items.pop_front().expect("one item then empty"),
+            || true,
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(malformed, 0);
+        assert!(!stop_candidate_seen);
     }
 
     #[test]

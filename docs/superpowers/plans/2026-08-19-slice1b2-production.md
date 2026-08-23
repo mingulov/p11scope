@@ -884,6 +884,15 @@ Commit message: `feat: attach providers from live discovery events`
 
 ## Task 7: Add the owned-child `run` lifecycle and pause coordinator
 
+**Reviewed boundary correction (2026-08-23):** Task 7 implements and tests the
+owned-child and pause machinery inside the library. Task 8 owns the public
+`RunArgs`, binary dispatch/polling integration, render/schema wiring, and the
+external CLI/lifecycle acceptance tests. This supersedes only the older file
+and test placement below: `src/main.rs` is a separate binary crate, and making
+the coordinator public solely so Task 7 could wire it would broaden the API
+before Task 8's complete public contract exists. The behavior and safety gates
+in this task remain mandatory.
+
 **Promotion prerequisite:** Task 2 independently reviewed PASS. If it is not
 PASS, this task is `UNRUN`; do not add dormant `auto|always` code.
 
@@ -894,11 +903,11 @@ PASS, this task is `UNRUN`; do not add dormant `auto|always` code.
 - Modify: `src/process.rs`
 - Modify: `src/discovery/mod.rs`
 - Modify: `src/attach.rs`
-- Modify: `src/cli.rs`
+- Modify: `src/events.rs`
+- Modify: `src/discovery/engine.rs`
 - Modify: `src/lib.rs`
-- Modify: `src/main.rs`
-- Create: `tests/run_lifecycle.rs`
-- Create: `tests/pause.rs`
+- Modify: `tests/artifact_contracts.rs`
+- Test in: `src/run.rs`, `src/process.rs`, and `src/discovery/pause.rs`
 
 ### Step 1: RED-test original-pidfd child ownership
 
@@ -911,7 +920,8 @@ PASS, this task is `UNRUN`; do not add dormant `auto|always` code.
 - [ ] Test PATH-resolved direct ELF, absolute ELF, shebang, retargeted executable,
   and exec-chain cases. A direct ELF whose pinned executable/PT_INTERP
   revalidates after exec may pre-arm the exact loader hook; every empty-catalog
-  case still records `initial_set_capture = none` and `PARTIAL`.
+  case, including a stable direct ELF with a confirmed pause, still has timing
+  `unproven`, records `initial_set_capture = none`, and is sticky `PARTIAL`.
 - [ ] Test a PID-reuse/generation mismatch prevents the next child action.
 - [ ] Test every failure after fork closes barrier fds and kills/reaps the owned
   child; every failure after an accepted stop also performs the exact resume
@@ -937,9 +947,20 @@ separate; do not create a framework or async runtime.
   constructor in `attach.rs`, requiring that `OwnedChild`
   (not merely a `PidPin`) and reading its exact owned PID plus private nonzero
   generation into `OwnedPauseGeneration`. It accepts no caller-supplied raw
-  PID or token. The coordinator revalidates the same `PidPin` immediately
+  PID or token. `OwnedChild` allocates exactly one nonzero generation for the
+  capture, never reuses it, and binds it to the retained original pidfd; a
+  fallback-only `PidPin` cannot authorize pause. The coordinator revalidates
+  the same `PidPin` immediately
   before inserting the full `{tgid, token}` `ARMED` key and again after every
   record decode; only then may it release the barrier.
+- [ ] A decoded exact-child `send_signal_rc == 0` is only a stop candidate:
+  ordinary unarmed records also store zero. Set `may_be_stopped` immediately
+  on that candidate, before the post-dequeue clock, map read, generation check,
+  cancellation check, or any other fallible action. Also set it immediately
+  when the exact full key reads `REQUESTED`. Accept a winner only when the
+  active authorization epoch and exact-key `REQUESTED` state agree. A consumed
+  epoch with a malformed/lost winner or an unresolved successor retains its
+  one owner/protective-resume obligation.
 - [ ] One owner accepts one winner; coalesced records expand only its required
   attach set. Reservation loss before CAS consumes no authorization but becomes
   one finite attempt under explicit pause.
@@ -954,6 +975,12 @@ separate; do not create a framework or async runtime.
   interval cannot consume the 100 ms causal budget. This explicit-pause-only
   polling is the intentional Slice 1b-2 ceiling; add epoll only if later
   measurement shows it is needed.
+- [ ] `DiscoveryDrain` exposes one crate-private dequeue result exactly as
+  `Record|Malformed`. Read the monotonic clock before and after every dequeue,
+  including malformed records, and validate the same absolute deadline. Drop
+  the ring borrow before applying one frozen batch through the existing Engine
+  scanner/planner/registry/link authority. Top-level and nested retirement
+  drains use this same injected collector; no second ring owner exists.
 - [ ] After confirmation: drain exact-child records to empty, freeze keys,
   attach all keys, take a third all-T snapshot, verify marker absent and queue
   empty, then issue exactly one original-pidfd resume.
@@ -970,11 +997,12 @@ separate; do not create a framework or async runtime.
 - [ ] `pause_confirmed + pause_partial == pause_attempts` for every normal
   result and the `none|sigstop|partial` lattice is exact.
 
-Run REDs before implementation:
+Run REDs before implementation (the pure machinery remains private unit code;
+Task 8 adds the external CLI/lifecycle tests):
 
 ```sh
-cargo +1.88 test --locked --test run_lifecycle -- --nocapture
-cargo +1.88 test --locked --test pause -- --nocapture
+cargo +1.88 test --locked --lib run::tests -- --nocapture
+cargo +1.88 test --locked --lib discovery::pause::tests -- --nocapture
 ```
 
 ### Step 3: Implement one owner guard and one child guard
@@ -986,6 +1014,15 @@ cargo +1.88 test --locked --test pause -- --nocapture
   decoded, before any fallible operation.
 - [ ] Cleanup is idempotent and non-short-circuiting. Signal handlers defer to
   the owner cleanup rather than re-entering it.
+- [ ] Every terminal path — first/second SIGINT, SIGTERM, duration timeout,
+  exec failure, child exit, cancellation, and guard drop — funnels through the
+  same order before forwarding, killing, reaping, or deliberately releasing a
+  still-running child: detach pause-capable links; bounded drain/decode;
+  read/remove authorization; ledger-authorized accepted/protective original-
+  pidfd resume. A second signal records escalation but cannot re-enter cleanup.
+  Timeout escalation starts its fixed five-second grace only after process-
+  group SIGTERM was actually forwarded. Duration without `--kill-on-timeout`
+  returns observer success after safe detach and leaves the child running.
 - [ ] The only `Some(OwnedPauseGeneration)` construction and caller is this
   owned-run path: its `attach.rs` crate-private constructor requires the
   private `OwnedChild`, binds the exact owned PID and generation, and cannot be
@@ -1003,10 +1040,10 @@ cargo +1.88 test --locked --test pause -- --nocapture
 ### Step 4: Verify and review
 
 ```sh
-cargo +1.88 test --locked --test run_lifecycle
-cargo +1.88 test --locked --test pause
+cargo +1.88 test --locked --lib run::tests
+cargo +1.88 test --locked --lib discovery::pause::tests
 cargo +1.88 test --locked --lib process
-cargo +1.88 test --locked --lib cli
+cargo +1.88 test --locked --test artifact_contracts
 ```
 
 - [ ] Run all global gates and locked BPF/source guards.
@@ -1031,6 +1068,8 @@ approved finite aggregate contract.
 - Modify: `src/trace.rs`
 - Modify: `src/render.rs`
 - Modify: `src/doctor.rs`
+- Create: `tests/run_lifecycle.rs`
+- Create: `tests/pause.rs`
 - Modify: `docs/schema/observed-profile-v2.md`
 - Modify: `docs/privacy/allowlist-v1.md`
 - Modify: `scripts/check-capture-evidence.py`
@@ -1046,6 +1085,10 @@ approved finite aggregate contract.
   and unknown pause values. Omission equals `never`. This task starts only
   after reviewed Gate B PASS; before that point `auto|always` do not exist as
   accepted CLI behavior.
+- [ ] Add the external owned-run lifecycle and pause acceptance tests here.
+  They exercise the one narrow public high-level production facade used by the
+  binary; low-level coordinator clocks, maps, drains, guards, and injected
+  actions remain crate-private and are not exported for tests.
 - [ ] Test profile/metrics/trace final evidence contains exactly:
   `attach_gap_ms`, `pause`, `pause_attempts`, `pause_confirmed`,
   `pause_partial`, optional run-only `child_still_running`, four discovery loss

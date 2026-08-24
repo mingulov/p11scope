@@ -10,7 +10,7 @@ implementation limits are code contracts, not measurements.
 > and the owner-selected semantic-authority implementation are complete. Final
 > whole-range correctness/security reviews and the exact-candidate local matrix
 > passed on 2026-08-19. CI remains pending.
-> Loader/export hooks and `run` remain Slice 1b-2 and are not present here.
+> Slice 1b-2 live discovery is wired internally, but public `run` is absent and the live path remains unsupported and unreleased pending Tasks 6E–10.
 > See the
 > [safe metadata design](superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md)
 > and the
@@ -421,7 +421,8 @@ evidence are PARTIAL while scan-only semantic claims remain. P11Lab joins reject
 scan-only and conflict modules. An accepted manifest authorizes only the exact
 pinned object, offset, and canonical function name it attests; stale fallback,
 hash agreement, path identity, and raw `{dev,ino}` never transfer that
-attestation. Slice 1b-2 live acquisition remains future work.
+attestation. Slice 1b-2 live discovery is wired internally, but public `run`,
+capture-history correction, and the required runtime gates remain incomplete.
 
 Slice 1b-1 implementation is complete. Final whole-range correctness/security
 reviews and the exact-candidate local matrix passed on 2026-08-19. CI remains

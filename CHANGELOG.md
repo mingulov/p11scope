@@ -5,7 +5,8 @@
 Corrective Tasks 1–5 and the owner-selected semantic-authority implementation
 are complete. Final whole-range correctness/security reviews and the
 exact-candidate local matrix passed on 2026-08-19. CI remains pending, so this
-slice is still unreleased. Slice 1b-2 live acquisition remains future work.
+slice is still unreleased. Slice 1b-2 live discovery is wired internally, but
+public `run`, capture-history correction, and runtime gates remain incomplete.
 
 - **Discovery**: `profile` and `trace` scan the target's mapped memory once at
   attach, so neither a manifest nor the offline helper is required. Repeatable
@@ -30,9 +31,10 @@ slice is still unreleased. Slice 1b-2 live acquisition remains future work.
   Top-level skip records retain exact standard function names but bound all
   other names and reasons to finite categories, so cgroup scans do not publish
   bystander paths, numeric PID labels, `/proc/<pid>` paths, or raw error chains.
-- **Known limit**: the memory scan runs only once, while attaching. A provider
-  loaded later is missed; use a suitable pre-existing manifest when available
-  and hash-matchable, or wait for Slice 1b-2 live discovery.
+- **Promotion limit**: accepted Slice 1b-1 evidence covers the initial memory
+  scan. This branch wires later loader/export discovery internally, but late
+  provider coverage remains unsupported until Tasks 6E–10 pass. Use a suitable
+  pre-existing manifest when available and hash-matchable.
 - **Corrective work bounds**: one 512 MiB attempted-I/O budget covers all
   memory scans and scan-sourced hashes in a capture (64 MiB per operation),
   with ceilings of 512 accepted tables, 53,248 decoded entries, 512 interfaces,

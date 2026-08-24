@@ -1436,7 +1436,7 @@ fn operator_docs_preserve_semantic_authority_limits() {
         ),
         (
             "CHANGELOG.md",
-            "Slice 1b-2 live acquisition remains future work",
+            "Slice 1b-2 live discovery is wired internally",
         ),
         ("docs/superpowers/plans/ROADMAP.md", "CI remains pending"),
     ] {
@@ -1482,7 +1482,7 @@ fn operator_docs_preserve_semantic_authority_limits() {
         let document = read(path).split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             document.contains(
-                "Loader/export hooks and `run` remain Slice 1b-2 and are not present here"
+                "Slice 1b-2 live discovery is wired internally, but public `run` is absent and the live path remains unsupported and unreleased pending Tasks 6E–10"
             ),
             "{path}"
         );

@@ -447,10 +447,14 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     changing BPF, maps, fixture, protocol, privacy, or timeout. The fixed KVM
     matrix passed Gate A 2/2 and Gate B 120/120 (72 Outcome A, 48 Outcome B),
     all eight lanes rc0 with no retries. The 943-entry ledger and independent
-    semantic/privacy/lifecycle review passed. Task 2 is complete and Task 5
-    is eligible, but has not started pending the owner-requested architecture
-    discussion. Product implementation remains OPEN and starts only after
-    Slice 1b-1 lands. See the
+    semantic/privacy/lifecycle review passed. Task 2 is complete. **Product
+    checkpoint (2026-08-24):** Tasks 3–7 are implemented and independently
+    reviewed on the isolated productization branch. A short-lived Docker
+    diagnostic exposed capture-history ownership loss after ordinary exit, so
+    the newly formalized Task 6E history/lifecycle correction blocks Task 8.
+    Public `run`, supported live-capture claims, Task 9 runtime evidence,
+    required CI, release, and security clearance remain incomplete or
+    unclaimed. See the
     [pause amendment](../specs/2026-08-19-slice1b2-no-busy-wait-pause-amendment.md).**
 - **Slice 2 — capture quality**: ring/epoll, budgets, safe-policy params, per-module profile
   sections, filters, snapshots.

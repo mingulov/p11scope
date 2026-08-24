@@ -15,7 +15,7 @@ assessment and incident diagnostics.
 > and the owner-selected semantic-authority implementation are complete. Final
 > whole-range correctness/security reviews and the exact-candidate local matrix
 > passed on 2026-08-19. CI remains pending.
-> Loader/export hooks and `run` remain Slice 1b-2 and are not present here.
+> Slice 1b-2 live discovery is wired internally, but public `run` is absent and the live path remains unsupported and unreleased pending Tasks 6E–10.
 
 Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40
 table, and standard 3.0, 3.1, and 3.2 interfaces (all 104 slots published in
@@ -95,11 +95,13 @@ for the CLI, live output, trace lines, and an example `observed-profile.json`.
 ## Honest claims
 
 - Zero application changes, no PKCS#11 interposition, attachable to running
-  processes and containers. Discovery scans mapped providers once, at attach;
-  calls *before* attach are outside the capture window, and a provider loaded
-  later is missed. A suitable manifest can supply offsets when one already
-  exists and can be hash-matched (and corroborated when the provider is
-  mapped); otherwise wait for Slice 1b-2 live discovery. **Not**
+  processes and containers. The accepted Slice 1b-1 contract scans mapped
+  providers at attach; calls *before* attach are outside the capture window.
+  This branch also wires internal live discovery, but capture-history
+  correctness and product gates remain incomplete, so late-provider coverage
+  is not yet a supported claim. A suitable manifest can still supply offsets
+  when one already exists and can be hash-matched (and corroborated when the
+  provider is mapped). **Not**
   "undetectable", **not** zero overhead: measured at roughly a **5x
   wall-clock slowdown** against unobserved SoftHSM2 — deliberately the worst
   case, since its microsecond-scale software crypto makes probe overhead
@@ -189,8 +191,9 @@ inode metadata, and identical bytes do not prove physical identity across separa
 overlay instances, so every such collapse is published as uncertainty and forces
 `PARTIAL`; a distinct byte-identical instance could otherwise be under-counted.
 
-The normal path scans provider tables already mapped in the target and executes
-no provider code. A provider `dlopen`ed after attach is not discovered. The
+Initial discovery scans provider tables already mapped in the target and
+executes no provider code. Internal loader/export hooks can react to later
+loads, but that path remains unsupported pending Tasks 6E–10. The
 optional unprivileged helper (`p11scope-discover`) can prepare a manifest
 offline while the same provider identity is available; a manifest cannot be
 conjured after a missed capture to make that window complete.
@@ -204,8 +207,9 @@ rename).
 Memory scanning is heuristic discovery. Live and terminal evidence are PARTIAL
 while scan-only semantic claims remain. P11Lab joins reject scan-only and
 conflict modules; an accepted manifest may authorize only its exact pinned
-object, offset, and canonical function name. Slice 1b-2 live acquisition
-remains future work. Final whole-range correctness/security reviews and the
+object, offset, and canonical function name. Slice 1b-2 live discovery is wired
+internally, but public `run`, capture-history correction, runtime gates, and CI
+remain incomplete. Final whole-range correctness/security reviews and the
 exact-candidate local matrix passed on 2026-08-19; Slice 1b-1 remains
 unreleased while CI remains pending.
 

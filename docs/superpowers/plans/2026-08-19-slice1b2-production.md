@@ -56,6 +56,15 @@ No new crate is planned.
   therefore ships no guessed loader tuple. An empty compiled-in catalog is
   valid: every-hit discovery continues, timing is `unproven`, and completeness
   remains honestly `PARTIAL` where required.
+- **Implementation checkpoint (2026-08-24):** Tasks 3–7 are implemented and
+  independently reviewed on the isolated productization branch. A short-lived
+  Docker diagnostic then exposed capture-history ownership loss after ordinary
+  workload exit. Task 6E below is a newly required correction and blocks Task
+  8. This is implementation status only: public `run`, supported live-capture
+  claims, product runtime gates, required CI, release, and security clearance
+  remain incomplete or unclaimed. This dated checkpoint supersedes the
+  historical unchecked implementation boxes below; those boxes are retained as
+  the original task contract, not current status.
 
 ## Global constraints
 
@@ -88,10 +97,12 @@ No new crate is planned.
 10. Do not track generated BPF objects, VM images, logs, evidence, or reports
     under `.superpowers/sdd`. Private campaign evidence remains outside Git.
 11. Privileged, VM, or container commands run only at the task that names them,
-    after an unprivileged review checkpoint, explicit owner approval for that
-    lane, and using new output paths. Without approval the lane is `UNRUN` and
-    cannot contribute to completion. Both kernel lanes run regardless of the
-    first result; no rerun-until-green.
+    after an unprivileged review checkpoint and using new output paths. The
+    owner granted standing approval on 2026-08-24 for this exact worktree's
+    named host/container tests; do not ask again for those lanes. A materially
+    new external VM/target still needs explicit approval. An unapproved lane is
+    `UNRUN` and cannot contribute to completion. Both kernel lanes run
+    regardless of the first result; no rerun-until-green.
 12. Every task must leave these commands green unless its own RED is being
     captured:
 
@@ -116,6 +127,7 @@ Task 2 reviewed PASS + Task 4
   -> Task 5 production discovery ABI/BPF
   -> Task 6 loader contexts and discovery engine
   -> Task 7 owned run child and pause coordinator (requires Task 2 PASS)
+  -> Task 6E capture-history and lifecycle ownership correction
   -> Task 8 capture loops, evidence, privacy, and doctor
   -> Task 9 product/provider/kernel integration
   -> Task 10 final multi-artifact review and local integration
@@ -126,6 +138,10 @@ Tasks 3–4 may be implemented while a reviewed Task 2 campaign is running. Task
 the production BPF inventory includes the pause path. A non-PASS leaves only
 the already-existing research evidence and any completed static refactor; it
 adds no dormant `auto|always` code and cannot complete Slice 1b-2.
+
+Task 7's accepted review remains valid for its stated pause/owned-child scope.
+Its earlier readiness verdict is qualified by the subsequently discovered Task
+6E dependency; Task 8 cannot start until Task 6E is independently accepted.
 
 ## Task 0: Approve the D3 scope amendment and implementation plan
 
@@ -1053,6 +1069,218 @@ cargo +1.88 test --locked --test artifact_contracts
 
 Commit message: `feat: coordinate owned-child live discovery pauses`
 
+## Task 6E: Preserve capture history across live-resource retirement
+
+**Purpose:** Correct the ownership boundary exposed by the short-lived Docker
+diagnostic before any public Task 8 integration. Links, pins, process views,
+loader contexts, and current topology must retire normally; accepted discovery,
+allocated aggregate cells, successful static endpoints, exact attribution, and
+semantic capture facts must survive for the capture lifetime.
+
+**Evidence boundary (2026-08-24):** On the saved diagnostic, the first frame
+records one provider, 68 slots, and 136/136 successful endpoints. After ordinary
+workload exit, the final frame retains the expected calls but reports no
+provider, zero endpoints, and one semantic reconciliation. Final JSON has
+`table_entries=0` and unambiguous calls with `module=null`; the strict checker
+rejects it. This is artifact evidence from an older source-bound run, not a
+fresh runtime result for this task. The exact audit is saved privately as
+`task-6-e-gap-audit.md`.
+
+**Files:**
+
+- Modify: `src/attach.rs`
+- Modify: `src/plan.rs`
+- Modify: `src/process.rs`
+- Modify: `src/discovery/engine.rs`
+- Modify: `src/discovery/pause.rs`
+- Modify: `src/metrics.rs`
+- Modify: `src/semantics.rs`
+- Modify: `src/trace.rs`
+- Modify focused owner/contract tests only as required
+
+No public CLI, renderer, JSON/schema, privacy allowlist, BPF/common ABI, build
+script, or dependency change belongs to Task 6E. If the final diff crosses one
+of those boundaries, stop and re-evaluate its named downstream gates.
+
+### Step 1: RED-test the active/history boundary
+
+- [ ] Test `Session` records successful static endpoints as the lifetime set
+  `(slot, return|entry)`. Selective/terminal detach and replacement do not erase
+  or double-count it; a failed side remains absent and a genuinely new slot
+  adds only its actual successes. Dynamic loader/export/lifecycle links never
+  contribute.
+- [ ] Test both ordinary and owned starts publish accepted history exactly once
+  at their common successful return. A failure after static attach, loader arm,
+  deferred retirement, or provisional candidate publishes nothing into a
+  retry.
+- [ ] Test unload-to-empty and exact reload restore one provider ID and one set
+  of occurrences through the same `PinnedTimingKey`; a new exact identity,
+  including a zero-slot or capacity-refused provider, receives a fresh
+  non-reused ID.
+- [ ] Test decoded occurrences are recorded before slot-capacity admission. A
+  planner/history fixture with 513 exact decoded entries retains all 513, zero
+  slots, and one whole-module refusal; an otherwise empty runtime capture keeps
+  the existing fatal `refusal_error`. Module-free process/scope/object losses
+  have their own exact deduplication key.
+- [ ] Test same-provider refresh deduplicates entry/table/surface/skip facts;
+  distinct providers accumulate. Manifest ordinals/source occurrences remain
+  distinct. Later exact collision invalidation cannot resurrect an earlier
+  corroboration or manifest-fallback proof.
+- [ ] Test pre-mutation candidate refusal imports no positive provider facts or
+  endpoints. A fully reconciled rejected co-owner still latches conservative
+  ambiguity on an existing aggregate cell. A post-mutation generation failure
+  retains actual slot/endpoint facts but no unaccepted provider owner.
+- [ ] Distinguish identity-accepted decoded facts refused only by attach-slot
+  capacity from identity/preflight/provisional candidate refusal. The first
+  contributes decoded occurrence/refusal history but no public accepted module;
+  the second contributes no positive history.
+- [ ] Test partial target retirement cannot make current diagnostics dereference
+  a retired pin. Current diagnostics use active slots; capture facts own the
+  detached retired identity.
+
+### Step 2: Implement three owners, not a peer planner
+
+- [ ] `Session` remains the sole live Aya/link owner and separately retains the
+  successful static endpoint set. `attached_probes()` reports that lifetime
+  evidence; live-link selection remains derived from `Session::links`.
+- [ ] `AttachPlan` remains the sole topology/allocation owner. Keep monotonic
+  allocated slots and add only the smallest aggregate-owner state needed to
+  distinguish `unowned`, one stable `ModuleId`, and permanently ambiguous.
+  Expose separate active-owner and aggregate/decode-owner accessors. Retired
+  slots retain frozen decode metadata; a real descriptor/owner/ambiguity
+  downgrade remains immediate and count-only. Do not duplicate this slot-owner
+  ledger in Engine capture facts.
+- [ ] Engine capture facts own a checked monotonic module allocator and a
+  bijection between exact `PinnedTimingKey` and `ModuleId`. Resolve candidate
+  provider IDs through it before final plan binding. The same exact identity
+  reuses its ID after an empty interval; unequal rebinding is refused and
+  recorded as loss. A zero-slot/capacity-refused provider ID is private
+  deduplication state, not a positive public discovery module. Gaps in the
+  private numeric sequence are allowed; reuse is not.
+- [ ] Engine capture facts retain sanitized accepted module snapshots, exact
+  decoded occurrence sets, module-free losses, and field-specific discovery
+  outcomes. They translate accepted provider identities into owner deltas
+  applied to `AttachPlan` but retain no peer slot-owner ledger. They are
+  structurally unable to contain
+  `File`, `PinnedObjects`, `ProcessView`, Aya/link IDs, loader contexts, pause
+  keys, cookies, raw addresses, or unallowlisted provider bytes.
+- [ ] Represent corroboration/fallback invalidation as a field-specific
+  tombstone or final conservative outcome. A generic union must never restore a
+  proof invalidated by a later exact identity collision.
+- [ ] Positive topology and occurrence facts merge only from an accepted final
+  candidate. Actual endpoint successes merge at the Session attach seam.
+  Sticky counter/loss/ambiguity facts merge at an error-safe batch finalizer,
+  including rejected and error returns, under field-specific rules rather than
+  generic sum/max/append.
+- [ ] Replace the ambiguous `committed` boundary with an explicit accepted,
+  conservative-retirement, or refused disposition. Postcheck loss commits only
+  cleaned active pins/modules/views and pruned corroboration/fallback proofs;
+  it retains only real monotonic slot allocations/endpoints. Finish every
+  fallible identity/planner translation before mutation; after mutation,
+  require one complete non-short-circuiting cleanup path rather than a
+  speculative full rollback.
+- [ ] Stage capture-fact changes for the whole `start_session_with` attempt and
+  publish them once only after success. Both ordinary and owned routes use this
+  seam; failure restores both prior capture history and aggregate-owner
+  publication while normal active cleanup still runs.
+
+### Step 3: Correct deferred and process lifecycle ownership
+
+- [ ] Deferred pause-owned discovery round-trips the dequeue clocks plus one
+  terminal-drain authority containing the tombstoned loader owner and exact
+  export snapshot. That authority covers every matching record in the complete
+  coordinator-owned batch, not only its first deferred record. A second
+  simultaneous authority is an invariant failure.
+- [ ] A private batch result distinguishes unconsumed transfer from a batch
+  whose dispatch began. Retry only an unconsumed batch; after consumption,
+  continue cleanup from the Engine journal without dispatching it twice. Pass
+  pause ownership explicitly so an ordinary deadline-less batch cannot trigger
+  another pause deferral.
+- [ ] Persist retirement intent in Engine before any fallible nested drain.
+  Replace the boolean with `ExecRefresh`, `ExpectedRemoval`, and
+  `GenerationLost`; merging is deterministic, with expected removal dominating
+  exec and genuine loss dominating both. Clean cgroup membership departure is
+  expected removal, not generation loss.
+- [ ] Bind an exec/exit record to the retained process-view interval using its
+  existing kernel monotonic `hook_ts_ns`, a userspace monotonic view-admission
+  lower bound, and the existing `PidPin` generation check. A delayed record from
+  an older numeric-PID generation cannot retire the current view. Store the
+  selected `ProcessViewId`; never authorize later cleanup by a second PID lookup.
+- [ ] `ExecRefresh` requires the original pin still current, retires old
+  loader/module state, and refreshes that retained generation. An observed
+  leader exit becomes `ExpectedRemoval` only for a timestamp-matched view and
+  finalizes only after its original pin reports exited. Expected removal
+  completes context/plan cleanup, removes its view and scan input, requests no
+  numeric-PID refresh, and does not make named-PID capture fatal. Genuine
+  revalidation, generation, transport,
+  identity, read, state, context, and truncation failures remain sticky loss and
+  `PARTIAL`.
+- [ ] Cover direct ELF, shebang, exec-chain, duplicate exec, exec+exit in one
+  batch, delayed old-generation exit/PID reuse, exit-before-pin-readiness,
+  expected named exit, clean cgroup departure, retry after an unconsumed
+  deferred error, consumed-batch idempotence, and real stale-generation loss.
+
+### Step 4: Preserve semantic and trace history without weakening invalidation
+
+- [ ] Metrics reads all allocated aggregate cells and uses the aggregate owner,
+  including an inactive sole-owner cell. An inactive ambiguous/unowned cell
+  stays unattributed. Active attachment decisions continue to use active
+  topology only.
+- [ ] `State` and `Tracer` retain frozen metadata for every allocated slot so an
+  older event drained after discovery retirement still has the correct name,
+  descriptor, and module owner. A slot is never reused, so no grace timer or
+  second event queue is needed.
+- [ ] Ordinary slot inactivity and process exit preserve capture-lifetime
+  mechanism, template, login, session, and cgroup aggregates and add no state
+  reconciliation. A changed descriptor, owner, or latched ambiguity purges all
+  affected process state and non-module-dimensional aggregates; increment
+  reconciliation exactly once only when data was actually invalidated.
+- [ ] RED-test nonempty mechanism/session/template/login/cgroup aggregates plus
+  a trailing event across expected exit with reconciliation zero; empty real
+  invalidation with reconciliation zero; nonempty owner/descriptor/ambiguity
+  invalidation before trace rendering; and inactive sole-owner metrics retaining
+  exact attribution.
+- [ ] Freeze Task 8's orchestration requirement: after discovery, synchronize
+  State/Tracer immediately so descriptor, owner, and ambiguity invalidations
+  take effect before another event can be interpreted, while unchanged retired
+  slots keep their frozen decode metadata. Then drain already-queued call
+  events and only afterward retire exited process state. Synthetic
+  exit-before-finalization output must keep exact call attribution, while an
+  invalidated slot must never emit a semantic trace line that cannot be
+  retracted.
+
+### Step 5: Verify and independently review
+
+Run focused owner tests first, then:
+
+```sh
+cargo +1.88 test --locked --lib attach::tests
+cargo +1.88 test --locked --lib plan::tests
+cargo +1.88 test --locked --lib discovery::engine::tests
+cargo +1.88 test --locked --lib discovery::pause::tests
+cargo +1.88 test --locked --lib semantics::tests
+cargo +1.88 test --locked --lib trace::tests
+cargo +1.88 test --locked --lib metrics::tests
+python3 scripts/check-capture-evidence.py --self-test
+sh scripts/verify-canaries.sh --self-test
+cargo +1.88 test --locked --test artifact_contracts
+```
+
+- [ ] Run all global gates and `git diff --check`; read back exact HEAD and
+  clean status after the scoped commit.
+- [ ] Run the existing live-discovery/object/checker self-tests and statically
+  prove the diff changes no BPF/common ABI, dependency, schema, allowlist, CLI,
+  or renderer.
+- [ ] Independently review accepted-history transactionality, exact identity,
+  PID-reuse resistance, deferred terminal authority, every error/retry path,
+  semantic invalidation, privacy, and active-resource release.
+- [ ] Do not run a container merely to close Task 6E. Its saved artifact remains
+  the pre-fix negative oracle; Task 8 first proves the public synthetic
+  active-to-empty projection, and Task 9 performs fresh source-bound runtime
+  validation.
+
+Commit message: `fix: retain capture facts across live retirement`
+
 ## Task 8: Integrate capture loops, CLI, evidence, privacy, and doctor
 
 **Purpose:** Make live discovery and `run` usable while publishing only the
@@ -1093,6 +1321,18 @@ approved finite aggregate contract.
   `attach_gap_ms`, `pause`, `pause_attempts`, `pause_confirmed`,
   `pause_partial`, optional run-only `child_still_running`, four discovery loss
   counters, and the always-present finite `loader_discovery` aggregate.
+- [ ] Extend each function row with `module_unresolved`, true exactly when a
+  real allocated aggregate cell has no accepted sole owner (for example an
+  actual post-mutation endpoint followed by failed generation validation).
+  `module`, `module_ambiguous`, and `module_unresolved` are an exact exclusive
+  relation: nonnull/false/false, null/true/false, or null/false/true. Unresolved
+  forces `PARTIAL`; it is not relabelled as two-module ambiguity.
+- [ ] Add one synthetic active-to-empty lifecycle fixture for profile, metrics,
+  trace, and final JSON. After ordinary exit it retains historical modules,
+  exact table entries, surfaces/skips, allocated slots, successful endpoints,
+  aggregate calls, and exact function-module references while active links and
+  views are empty. It reports neither an exit-generated discovery loss nor a
+  false state reconciliation.
 - [ ] Freeze every `loader_discovery` key: strategies
   `debug_state_every_hit|dlopen_return|unavailable`; both timing groups
   `qualified_pre_constructor|known_pre_relocation|unproven|none`;
@@ -1134,12 +1374,19 @@ approved finite aggregate contract.
   and observer-owned map values; positive controls must be detected first. The
   checker permits PID/TID only in the pre-existing ordinary call-event trace
   fields already named by the allowlist, never in loader/pause evidence.
+- [ ] Extend the strict checker with active-to-empty positive evidence and
+  mutations for missing history and an undeclared slot owner. Reject
+  `module=null,module_ambiguous=false,module_unresolved=false`; an explicitly
+  unowned post-mutation/loss cell is null/false/true and forces `PARTIAL`. Do
+  not relax the checker to accept the saved broken Docker artifact.
 
 ### Step 2: Integrate one polling loop
 
 - [ ] Keep one profile loop and one trace loop. Each tick drains discovery,
-  lets `Engine` extend `AttachPlan` and apply attachment deltas, drains call events,
-  snapshots metrics/counters, and checks retained generations/objects.
+  lets `Engine` extend `AttachPlan` and apply attachment deltas, synchronizes
+  immediate semantic/trace invalidations while preserving unchanged retired
+  decode metadata, drains call events, retires exited process state, snapshots
+  metrics/counters, and checks retained generations/objects.
 - [ ] `pause=never` keeps the existing refresh cadence. An ARMED/active explicit
   pause delegates to the coordinator's 1 ms bounded loop and returns to the
   ordinary capture loop only after owner closure; it never sleeps through an
@@ -1153,13 +1400,35 @@ approved finite aggregate contract.
 - [ ] `run` arms pre-exec loader context before releasing the child barrier when
   exact PT_INTERP binding is safe. Otherwise it proceeds with
   `initial_set_capture = none`, sticky `PARTIAL`, and the selected pause policy.
-- [ ] Derive output solely from engine/session/coordinator owners. Discard
-  loader/pause identities before constructing render types.
+- [ ] Freeze the consumer map explicitly. Metrics and function attribution use
+  capture aggregate owners; semantic attachment decisions use active topology;
+  final evidence/discovery and module labels use sanitized capture facts;
+  coordinator fields use only its finite aggregate owner. Discard loader/pause
+  identities before constructing render types.
+- [ ] The binary is a separate crate: expose one immutable public
+  `Engine::capture_facts()` view containing only render-ready sanitized history
+  and aggregate getters. Keep `PinnedTimingKey`, internal occurrence keys,
+  files/pins/views, loader/pause identities, and mutable owner state private.
+- [ ] Choose and test one live-heading policy so current topology cannot print
+  “no modules discovered” beside retained historical calls. Every ordinary
+  heading uses capture-lifetime provider facts; active topology is omitted
+  unless a future explicitly labelled diagnostic adds it. The terminal frame
+  and JSON use the same capture facts.
+- [ ] A named target's expected exit triggers normal final drain/finalization
+  and observer success even without interrupt/duration expiry. A cgroup capture
+  continues when one member exits and stops only by its normal capture policy.
 
 ### Step 3: Update schema, allowlist, checker, and canaries together
 
 - [ ] Document the exact fields/types/owners and completeness lattice in schema
   v2. Do not publish a new schema ID because v2 is still unpublished.
+- [ ] State that modules, discovery, table entries, allocated slots, successful
+  endpoints, and aggregate ownership are capture-lifetime accepted facts, not a
+  claim that their links, pins, or process views remain active at render time.
+- [ ] Document the exact `module_unresolved` relation separately from
+  two-module ambiguity and add that one finite boolean to the allowlist/canary
+  mutations. Publish no reason string, process identity, path, cookie, or
+  internal owner key with it.
 - [ ] Add only approved aggregate fields to the privacy allowlist. Preserve the
   prohibition on object-handle correlation and symbolic CKA values.
 - [ ] Checker verifies exact key sets, u64 ranges, enum values, aggregate
@@ -1171,6 +1440,11 @@ approved finite aggregate contract.
 - [ ] Keep public capability prose out of README/usage until Task 9 runtime and
   CI evidence pass. Schema and allowlist text in this task describe the exact
   emitted contract, not promotion status.
+- [ ] Preserve the non-promotional status wording established after Task 7:
+  internal loader/export and owned-run components exist, but public integration
+  and runtime gates remain incomplete. Remove only the public-path “scan once”
+  limit that Task 8 actually replaces; do not claim supported capability before
+  Task 9 and exact-tip CI.
 
 ### Step 4: Verify and review
 
@@ -1280,9 +1554,10 @@ python3 scripts/check-live-discovery-evidence.py \
   target sets for
   `C_GetFunctionList`, `C_GetInterfaceList`, and `C_GetInterface`. No row,
   fixture, validator, or manifest is replaced after execution begins.
-- [ ] Obtain explicit owner approval for each root, VM, and container lane
-  immediately before execution. An unapproved lane is `UNRUN` and blocks Slice
-  completion.
+- [ ] Apply the recorded 2026-08-24 standing approval to this exact worktree's
+  named root/container lanes after the unprivileged review checkpoint. Ask only
+  for a materially new external VM/target. An unapproved required lane is
+  `UNRUN` and blocks Slice completion.
 
 ### Step 2: Exercise real providers and deployment shapes
 
@@ -1298,7 +1573,18 @@ python3 scripts/check-live-discovery-evidence.py \
   path still produces bounded live discovery and `PARTIAL` rather than zero
   findings or fatal scan failure.
 - [ ] Docker and kind: discover providers in container mount/process views
-  without copying them out; validate host/container identity handling.
+  without copying them out; validate host/container identity handling. Keep the
+  short-lived Docker ordering in which the workload exits before observer
+  finalization. Its required final evidence is 68 decoded entries, 68 allocated
+  slots, 136 successful static endpoints, one retained provider, exact call
+  attribution, `C_GenerateRandom=100`, `C_Digest=50`, `C_DigestInit=50`,
+  `C_CloseSession=10`, `C_OpenSession=10`, `C_GetInfo=3`, and one each of
+  `C_Finalize`, `C_GetFunctionList`, `C_GetSlotList`, and `C_Initialize`; no
+  retirement-generated skips; and `state_reconciliations=0`. Before final
+  projection the exited workload has zero active slots/links/views/loader
+  contexts/pins; after observer exit no observer BPF resource remains. The
+  strict clean-metrics checker passes. Extending workload lifetime does not
+  satisfy this regression.
 - [ ] Shared-layer, fork/cgroup, oracle, Knative, induced-gap, privacy canary,
   release-build, and overhead lanes retain existing oracles and cleanup.
 - [ ] Benchmark `run --pause never` separately from explicit `auto`; report the

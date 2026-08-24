@@ -103,7 +103,10 @@ struct CaptureFacts {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum DecodedOccurrence {
-    ScanTarget {
+    /// One exact decoded target occurrence, in the one keyspace every source
+    /// shares: a manifest corroborating a scanned entry names the same
+    /// occurrence and is counted once, as the schema requires.
+    Target {
         module: plan::ModuleId,
         name: String,
         object: PinnedTimingKey,
@@ -127,7 +130,7 @@ enum DecodedOccurrence {
 impl DecodedOccurrence {
     fn module(&self) -> plan::ModuleId {
         match self {
-            Self::ScanTarget { module, .. }
+            Self::Target { module, .. }
             | Self::ScanSkip { module, .. }
             | Self::ManifestFunction { module, .. } => *module,
         }
@@ -234,6 +237,27 @@ fn manifest_acquisition_label(acquisition: &Acquisition) -> String {
         Acquisition::Empty => "empty".into(),
         Acquisition::Error { detail } => format!("error: {detail}"),
     }
+}
+
+/// The exact target a manifest function resolves to, in the identity the scan
+/// records its decoded entries under. `None` for every record the scan cannot
+/// have decoded the same target for: an unresolved pointer, or an object with
+/// no comparable pinned identity — the cases `manifest_function_skip` reports.
+fn manifest_function_target(
+    manifest: &Manifest,
+    pinned: &PinnedObjects,
+    resolution: &Resolution,
+) -> Option<(PinnedTimingKey, u64)> {
+    let Resolution::Resolved {
+        object,
+        file_offset,
+    } = resolution
+    else {
+        return None;
+    };
+    let (key, path) = capture_manifest_object_key(manifest, *object)?;
+    let id = pinned.id_for_manifest(key, path)?;
+    Some((pinned.owned_timing_key(id)?, *file_offset))
 }
 
 fn manifest_function_skip(
@@ -530,7 +554,7 @@ impl CaptureFacts {
                     })?;
                     let fact = (entry.name.to_string(), object, entry.file_offset);
                     let occurrence = targets.entry(fact.clone()).or_insert(0usize);
-                    history.decoded.insert(DecodedOccurrence::ScanTarget {
+                    history.decoded.insert(DecodedOccurrence::Target {
                         module: owner,
                         name: fact.0,
                         object: fact.1,
@@ -563,6 +587,10 @@ impl CaptureFacts {
             }
         }
 
+        // Occurrences of one exact target across every accepted manifest: a
+        // repeated claim stays its own occurrence (ordinals remain distinct),
+        // while the first one meets the scan's occurrence 0 and merges with it.
+        let mut manifest_targets = BTreeMap::new();
         for (manifest, manifest_ordinal) in manifests.iter().zip(manifest_ordinals) {
             let object = manifest_module_object(manifest, pinned).ok_or_else(|| {
                 anyhow!(
@@ -607,7 +635,25 @@ impl CaptureFacts {
                         surface: surface_index,
                         function: function_index,
                     };
-                    history.decoded.insert(key.clone());
+                    match manifest_function_target(manifest, pinned, &function.resolution) {
+                        Some((object, file_offset)) => {
+                            let fact = (function.name.clone(), object, file_offset);
+                            let occurrence = manifest_targets.entry(fact.clone()).or_insert(0usize);
+                            history.decoded.insert(DecodedOccurrence::Target {
+                                module: owner,
+                                name: fact.0,
+                                object: fact.1,
+                                file_offset: fact.2,
+                                occurrence: *occurrence,
+                            });
+                            *occurrence += 1;
+                        }
+                        // Nothing the scan can have decoded too: it is counted
+                        // under its own manifest-record identity, and skipped.
+                        None => {
+                            history.decoded.insert(key.clone());
+                        }
+                    }
                     if let Some(skipped) = manifest_function_skip(
                         manifest,
                         pinned,
@@ -8175,6 +8221,44 @@ mod tests {
         engine.project_capture_facts();
         assert_eq!(engine.discovery.modules.len(), 2);
         assert_eq!(engine.plan.entries_seen, 2);
+    }
+
+    /// `table_entries` counts an exact target occurrence once however many
+    /// sources decoded it (`docs/schema/observed-profile-v2.md`: "A `--manifest`
+    /// overlapping a scanned module does not add a second count for the same
+    /// exact target occurrence; distinct claims and true repeated occurrences
+    /// remain separate"). The planner already merges that way; publication must
+    /// not undo it by counting the scan's target and the manifest's function as
+    /// two entries.
+    #[test]
+    fn capture_facts_count_a_corroborated_entry_once_across_both_surfaces() {
+        let (view, modules, pins, input) = same_object_scan_and_manifest(0x40);
+        let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+        assert_eq!(engine.plan.entries_seen, 1, "the planner counts it once");
+        assert_eq!(engine.plan.surfaces.len(), 2, "one scan and one manifest");
+
+        engine.publish_current_capture_facts().unwrap();
+
+        assert_eq!(
+            engine.plan.entries_seen, 1,
+            "the corroborating manifest must not add a second count"
+        );
+        assert_eq!(
+            engine.plan.surfaces.len(),
+            2,
+            "each source keeps its own surface record"
+        );
+
+        // The other direction: a manifest claim the scan did not decode is a
+        // distinct entry, not a duplicate of the one it did.
+        let (view, modules, pins, input) = same_object_scan_and_manifest(0x80);
+        let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+        assert_eq!(engine.plan.entries_seen, 2);
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(
+            engine.plan.entries_seen, 2,
+            "a distinct claim stays a distinct entry"
+        );
     }
 
     #[test]

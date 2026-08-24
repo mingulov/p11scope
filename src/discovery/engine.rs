@@ -71,6 +71,24 @@ pub struct Engine {
     ready_expected_removals: BTreeSet<ProcessViewId>,
     expected_target_exit_pending: Option<ProcessViewId>,
     expected_target_exit: bool,
+    /// The deduplicated bound-context set behind `loader_discovery`'s
+    /// strategy/timing/capture counts (design §9.2). Keyed by the exact
+    /// internal `{process generation, optional bound tuple}` — the loader
+    /// context id stands for the bound tuple and is absent when binding
+    /// failed — so one context contributes exactly once no matter how many
+    /// records it produces. All identity stays out: only the classification
+    /// is kept, and it is all that can be rendered.
+    loader_contexts: BTreeMap<(ProcessViewId, Option<u16>), LoaderContextClass>,
+}
+
+/// One exact live-loader context, classified. `bound` is the §9.2 strategy
+/// (`debug_state_every_hit` when the exact `_dl_debug_state` context was
+/// armed, `unavailable` otherwise); `initial_set` selects which of the two
+/// timing groups it counts in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LoaderContextClass {
+    bound: bool,
+    initial_set: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1334,6 +1352,25 @@ impl CausalTimings {
     fn invalidate(&mut self) {
         self.invalidated = true;
         self.modules.values_mut().for_each(Self::clear);
+    }
+
+    /// The capture-level gap: the maximum of the defined per-module gaps and
+    /// `null` when none is defined (design §5.5). Subtraction is checked and a
+    /// lost or invalidated module never contributes an invented zero.
+    fn max_gap_ms(&self) -> Option<u64> {
+        if self.invalidated {
+            return None;
+        }
+        self.modules
+            .values()
+            .filter(|timing| !timing.lost)
+            .filter_map(|timing| {
+                timing
+                    .attach_complete_ns?
+                    .checked_sub(timing.first_causal_ns?)
+            })
+            .max()
+            .map(|ns| ns / 1_000_000)
     }
 
     #[cfg(test)]
@@ -3890,6 +3927,92 @@ impl Engine {
             ready_expected_removals: BTreeSet::new(),
             expected_target_exit_pending: None,
             expected_target_exit: false,
+            loader_contexts: BTreeMap::new(),
+        }
+    }
+
+    /// Classifies the exact live-loader context this view owns after an arming
+    /// attempt. Re-arming the same context updates its entry rather than
+    /// adding a second — that is what makes the published counts per-context
+    /// and not per-record — and a context never changes load kind once
+    /// recorded, so a later ordinary refresh cannot relabel the pre-exec
+    /// initial-set context as an ordinary `dlopen` one.
+    fn record_loader_arm(&mut self, view: ProcessViewId, initial_set: bool) {
+        let bound = self
+            .loader_registry
+            .ids_for_view(view)
+            .into_iter()
+            .find(|id| !self.loader_registry.is_tombstoned(*id));
+        let class = LoaderContextClass {
+            bound: bound.is_some(),
+            initial_set,
+        };
+        self.loader_contexts
+            .entry((view, bound.map(LoaderContextId::get)))
+            .and_modify(|known| known.bound = class.bound)
+            .or_insert(class);
+    }
+
+    /// The always-present finite live-loader aggregate (design §9.2). The two
+    /// BPF-owned counters come only from the producer counter snapshot; the
+    /// classification groups come only from the deduplicated context set.
+    /// Received-record counts feed neither.
+    pub fn loader_discovery(&self) -> render::LoaderDiscovery {
+        let mut aggregate = render::LoaderDiscovery {
+            hits: self.counter_snapshot.loader_hits,
+            state_read_failures: self.counter_snapshot.loader_state_read_failures,
+            ..render::LoaderDiscovery::default()
+        };
+        for class in self.loader_contexts.values() {
+            let timing = if class.initial_set {
+                // Exactly one initial-set context per owned run, and the empty
+                // catalog can never make it eligible (D3 amendment §3).
+                aggregate.initial_set_capture.none =
+                    aggregate.initial_set_capture.none.saturating_add(1);
+                &mut aggregate.initial_set_timing
+            } else {
+                &mut aggregate.dlopen_timing
+            };
+            if class.bound {
+                timing.unproven = timing.unproven.saturating_add(1);
+                aggregate.strategies.debug_state_every_hit =
+                    aggregate.strategies.debug_state_every_hit.saturating_add(1);
+            } else {
+                timing.none = timing.none.saturating_add(1);
+                aggregate.strategies.unavailable =
+                    aggregate.strategies.unavailable.saturating_add(1);
+            }
+        }
+        aggregate
+    }
+
+    /// True once a named target's expected exit has been fully finalized:
+    /// its view, links, and pending work are all released. Never true for a
+    /// cgroup capture, which continues when one member exits.
+    pub fn expected_target_exit(&self) -> bool {
+        self.expected_target_exit
+    }
+
+    /// The one immutable public view of capture-lifetime facts (plan Task 8
+    /// Step 2). Everything here is already sanitized: it is built from the
+    /// projected discovery evidence and finite aggregates only, never from
+    /// pins, views, files, timing keys, or loader/pause identity.
+    pub fn capture_facts(&self) -> render::CaptureFacts {
+        render::CaptureFacts {
+            discovery: self.discovery.clone(),
+            table_entries: self.plan.entries_seen,
+            slots: self.plan.slots.len(),
+            attach_gap_ms: self.timings.max_gap_ms(),
+            loader_discovery: self.loader_discovery(),
+            discovery_ring_loss: self.counter_snapshot.ring_loss,
+            discovery_state_failures: self.counter_snapshot.export_state_failures,
+            discovery_read_failures: self.counter_snapshot.export_bounded_read_failures,
+            // One accumulator, each source feeding it once (design §9.1).
+            discovery_truncated: self
+                .discovery_truncated
+                .saturating_add(self.malformed_discovery)
+                .saturating_add(self.loader_registry.discovery_truncated())
+                .saturating_add(self.loader_registry.context_failures()),
         }
     }
 
@@ -5594,6 +5717,7 @@ impl Engine {
             .views
             .get(position)
             .is_some_and(|view| view.id() == view_id && view.still_the_same());
+        self.record_loader_arm(view_id, false);
         match loader_arm_outcome(generation_valid, result) {
             LoaderArmOutcome::Changed(changed) => Ok(changed),
             LoaderArmOutcome::OrdinaryFailure => {
@@ -6100,6 +6224,15 @@ impl Engine {
         self.queue_stale_views(&outcome.stale_views, pending_views);
     }
 
+    /// Only a *named* target's expected removal can end a capture: a cgroup
+    /// capture continues when one member exits and stops only by its normal
+    /// capture policy. One place decides that, so the two scopes cannot drift.
+    fn arm_expected_target_exit(&mut self, view: ProcessViewId) {
+        if matches!(self.scope, Scope::Pid(_)) {
+            self.expected_target_exit_pending = Some(view);
+        }
+    }
+
     fn finalize_expected_target_exit(&mut self) {
         let Some(view) = self.expected_target_exit_pending else {
             return;
@@ -6358,9 +6491,7 @@ impl Engine {
                 if cause == RetirementCause::ExpectedRemoval {
                     self.views.retain(|candidate| candidate.id() != view);
                     self.scan_inputs.remove(&view);
-                    if matches!(self.scope, Scope::Pid(_)) {
-                        self.expected_target_exit_pending = Some(view);
-                    }
+                    self.arm_expected_target_exit(view);
                 }
                 conservative_replay_attempted = false;
             }
@@ -7195,6 +7326,15 @@ impl Engine {
                     &mut additions_allowed,
                     &mut pending_views,
                 )?;
+                // One initial-set context per owned run, armed or not.
+                if let Some(view) = self
+                    .views
+                    .iter()
+                    .find(|view| view.pid() == child.pid())
+                    .map(ProcessView::id)
+                {
+                    self.record_loader_arm(view, true);
+                }
                 self.mark_partial(
                     "owned initial-set discovery",
                     "the empty timing catalog leaves initial-set capture unproven",
@@ -8534,6 +8674,103 @@ mod tests {
                 Err("must not poll".to_string())
             })
             .unwrap()
+        );
+    }
+
+    /// Plan Task 8 Step 1 checkbox 8, deferred to Step 2 because it needs the
+    /// crate-private `DiscoveryItem`/record path: strategy, timing, and
+    /// capture counts deduplicate the exact internal
+    /// `{process generation, optional bound tuple}` once, while `hits` and
+    /// `state_read_failures` come only from their BPF counters and never from
+    /// received-record counts.
+    #[test]
+    fn loader_counts_deduplicate_one_context_and_take_hits_only_from_bpf_counters() {
+        let view = ProcessViewId(3);
+        let mut engine = Engine::empty();
+
+        // Same context, recorded on every tick of a live capture: one context,
+        // one strategy count, one timing count, one capture count.
+        for _ in 0..5 {
+            engine.record_loader_arm(view, true);
+        }
+        let aggregate = engine.loader_discovery();
+        assert_eq!(aggregate.strategies.unavailable, 1);
+        assert_eq!(aggregate.initial_set_timing.none, 1);
+        assert_eq!(aggregate.initial_set_capture.none, 1);
+        assert_eq!(aggregate.initial_set_capture.eligible, 0);
+        assert_eq!(aggregate.dlopen_timing, render::LoaderTiming::default());
+
+        // A second exact process generation is a second context.
+        engine.record_loader_arm(ProcessViewId(4), false);
+        let aggregate = engine.loader_discovery();
+        assert_eq!(aggregate.strategies.unavailable, 2);
+        assert_eq!(aggregate.dlopen_timing.none, 1);
+        assert_eq!(
+            aggregate.initial_set_capture.none, 1,
+            "an ordinary dlopen context is not a second initial-set capture"
+        );
+
+        // Records are not counts. Dispatching loader records moves neither
+        // `hits` nor `state_read_failures`; only the BPF producer counters do.
+        engine.loader_records_accepted = 9;
+        assert_eq!(engine.loader_discovery().hits, 0);
+        assert_eq!(engine.loader_discovery().state_read_failures, 0);
+        engine.counter_snapshot.loader_hits = 7;
+        engine.counter_snapshot.loader_state_read_failures = 2;
+        let aggregate = engine.loader_discovery();
+        assert_eq!(aggregate.hits, 7);
+        assert_eq!(aggregate.state_read_failures, 2);
+        assert_eq!(
+            aggregate.strategies.unavailable, 2,
+            "a producer counter is not a classification"
+        );
+
+        // `capture_facts()` publishes the BPF-owned discovery losses verbatim
+        // and derives the truncation accumulator, never a second copy of the
+        // loader state-read counter.
+        engine.counter_snapshot.ring_loss = 4;
+        engine.counter_snapshot.export_state_failures = 5;
+        engine.counter_snapshot.export_bounded_read_failures = 6;
+        engine.discovery_truncated = 1;
+        engine.malformed_discovery = 2;
+        let facts = engine.capture_facts();
+        assert_eq!(facts.discovery_losses(), [4, 5, 6, 3]);
+        assert_eq!(
+            facts.attach_gap_ms(),
+            None,
+            "an unmeasured gap is never zero"
+        );
+    }
+
+    /// Plan Task 8 Step 2: a named target's expected exit is what ends the
+    /// capture the ordinary way, with no interrupt and no `--duration`. A
+    /// cgroup capture never reaches that state when one member exits — it
+    /// stops only by its normal capture policy — and the asymmetry lives in
+    /// exactly one place: only `Scope::Pid` arms the pending marker.
+    #[test]
+    fn only_a_named_targets_expected_exit_finishes_the_capture() {
+        let view = ProcessViewId(21);
+
+        let mut named = Engine::empty();
+        named.scope = Scope::Pid(1);
+        assert!(!named.expected_target_exit(), "nothing has exited yet");
+        named.arm_expected_target_exit(view);
+        named.finalize_expected_target_exit();
+        assert!(
+            named.expected_target_exit(),
+            "a named target's expected exit must end the capture"
+        );
+
+        let mut cgroup = Engine::empty();
+        cgroup.scope = Scope::Cgroup {
+            id: 7,
+            path: "/sys/fs/cgroup/p11scope.test".into(),
+        };
+        cgroup.arm_expected_target_exit(view);
+        cgroup.finalize_expected_target_exit();
+        assert!(
+            !cgroup.expected_target_exit(),
+            "one cgroup member exiting must not end a cgroup capture"
         );
     }
 
@@ -12690,6 +12927,19 @@ mod tests {
             shape_decode_failures: 0,
             shape_decode_total_failures: 0,
             templates_truncated: false,
+            attach_gap_ms: None,
+            pause: "none",
+            pause_attempts: 0,
+            pause_confirmed: 0,
+            pause_partial: 0,
+            child_still_running: None,
+            discovery_ring_loss: 0,
+            discovery_state_failures: 0,
+            discovery_read_failures: 0,
+            discovery_truncated: 0,
+            loader_discovery: render::LoaderDiscovery::default(),
+            unprotected_live_windows: 0,
+            module_unresolved_slots: 0,
             provider_changed: false,
             discovery,
             completeness: "UNKNOWN",

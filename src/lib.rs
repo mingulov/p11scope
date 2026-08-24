@@ -19,6 +19,11 @@ pub mod semantics;
 pub mod shapes;
 pub mod trace;
 
+/// The whole public production surface of the capture loops. `run` stays a
+/// crate-private module: the owned child, the pause coordinator, its clocks,
+/// maps, drains, guards and injected actions are unreachable from outside.
+pub use run::{OwnedRunOutcome, capture, run_owned};
+
 /// The BPF object, built by build.rs. Alignment matters: aya parses it
 /// as ELF in place.
 pub static EBPF_OBJECT: &[u8] =

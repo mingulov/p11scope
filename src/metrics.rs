@@ -25,6 +25,11 @@ pub struct SlotReport {
     pub module: Option<ModuleId>,
     /// True exactly when `module` is `None` because the slot was ever shared.
     pub module_ambiguous: bool,
+    /// True exactly when `module` is `None` for the other reason: a real
+    /// allocated aggregate cell with no accepted sole owner (for example an
+    /// endpoint whose post-mutation generation validation failed). Exclusive
+    /// with `module_ambiguous` by construction.
+    pub module_unresolved: bool,
     /// Completed calls (entry and return both observed).
     pub calls: u64,
     pub errors: u64,
@@ -43,12 +48,17 @@ fn slot_report(
     acc: SlotStats,
     rv_counts: BTreeMap<u64, u64>,
 ) -> SlotReport {
+    let module = plan.module_of_slot(slot.index);
+    let module_ambiguous = plan.slot_is_module_ambiguous(slot.index);
     SlotReport {
         names: slot.names.clone(),
         aliased: slot.aliased,
         semantic_authorized: slot.semantic_authorized,
-        module: plan.module_of_slot(slot.index),
-        module_ambiguous: plan.slot_is_module_ambiguous(slot.index),
+        module,
+        module_ambiguous,
+        // The exclusive third case, derived from the other two rather than
+        // from a second owner list that could drift out of step with them.
+        module_unresolved: module.is_none() && !module_ambiguous,
         calls: acc.returned,
         errors: acc.errors,
         in_flight: acc.entered.saturating_sub(acc.returned),
@@ -285,6 +295,7 @@ mod tests {
         assert_eq!(report.calls, 7);
         assert_eq!(report.module, Some(ModuleId(0)));
         assert!(!report.module_ambiguous);
+        assert!(!report.module_unresolved);
 
         let mut shared = slot(0, "C_Sign");
         shared.module_ids = vec![ModuleId(0), ModuleId(1)];
@@ -298,6 +309,10 @@ mod tests {
         );
         assert_eq!(shared_report.module, None);
         assert!(shared_report.module_ambiguous);
+        assert!(
+            !shared_report.module_unresolved,
+            "two-module ambiguity is not an unresolved owner"
+        );
 
         let mut unowned = slot(0, "C_Sign");
         unowned.module_ids.clear();
@@ -311,6 +326,11 @@ mod tests {
         );
         assert_eq!(unowned_report.module, None);
         assert!(!unowned_report.module_ambiguous);
+        assert!(
+            unowned_report.module_unresolved,
+            "an allocated cell with no accepted sole owner is unresolved, \
+             never a silent null"
+        );
     }
 
     #[test]

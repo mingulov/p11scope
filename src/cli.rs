@@ -109,7 +109,7 @@ pub const USAGE: &str = "usage:
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
-scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning happens once, at attach time.
+scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
 run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup. --pause
 selects what run may do to its own child while it observes loading: never (default) touches
 nothing, auto only when the child would otherwise load unobserved, always on every load.

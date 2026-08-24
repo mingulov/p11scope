@@ -20,12 +20,11 @@ const CYCLE_NS: u64 = 100_000_000;
 const SAMPLE_NS: u64 = 1_000_000;
 const MAX_FAILURE_ITEMS: usize = 128;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PausePolicy {
-    Never,
-    Auto,
-    Always,
-}
+/// One source of truth for the policy: the coordinator uses the exact type the
+/// CLI parses, so a spelling can never mean one thing at the command line and
+/// another here. Re-used, not re-exported: `discovery::pause` stays
+/// crate-private.
+pub(crate) use crate::cli::PausePolicy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PauseStatus {

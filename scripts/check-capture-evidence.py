@@ -485,7 +485,15 @@ def exact_loader_discovery(evidence):
     for group, keys in LOADER_DISCOVERY_GROUPS.items():
         value = aggregate[group]
         require(isinstance(value, dict), f"loader_discovery.{group} is not an object: {value!r}")
-        require(tuple(value) == keys, f"loader_discovery.{group} key set: {list(value)}")
+        # The key *set* is the freeze. JSON objects carry no order the
+        # renderer can promise: `serde_json` is built without `preserve_order`,
+        # so a real artifact's keys arrive sorted, not in declaration order.
+        # Set equality still refuses both a missing key and an added one, which
+        # is the whole point of the closed aggregate.
+        require(
+            set(value) == set(keys),
+            f"loader_discovery.{group} key set: {sorted(value)}",
+        )
         for key in keys:
             require(u64(value[key]), f"loader_discovery.{group}.{key}: {value[key]!r}")
     for counter in LOADER_DISCOVERY_COUNTERS:

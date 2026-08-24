@@ -100,6 +100,7 @@ fn assert_live_discovery_host_contract(
     hooks: &str,
     engine: &str,
     main: &str,
+    run: &str,
 ) -> Result<(), String> {
     assert_exact_policy_map_metadata_contract(attach)?;
     for (marker, contract) in [
@@ -204,6 +205,7 @@ fn assert_live_discovery_host_contract(
     }
 
     if main.contains("Session::start(")
+        || run.contains("Session::start(")
         || engine.matches("Session::start(").count() != 1
         || engine
             .matches("Session::start(plan, scope, pinned, policy, pause_generation.take())")
@@ -227,8 +229,15 @@ fn assert_live_discovery_host_contract(
                 .into(),
         );
     }
+    // Task 8 Step 2 moved the one profile loop and the one trace loop out of
+    // the binary into `src/run.rs`, so `profile`, `trace` and `run` share
+    // exactly one of each. The seam contract follows the loops: neither the
+    // binary nor the loop module may reach past `Session::event_drain`, and
+    // the two drains are still exactly the periodic one and the terminal one.
     if main.contains("events::Drain::new(&mut session.ebpf)")
-        || main.matches("session.event_drain()?").count() != 2
+        || main.contains("session.event_drain()?")
+        || run.contains("events::Drain::new(&mut session.ebpf)")
+        || run.matches("session.event_drain()?").count() != 2
     {
         return Err("the binary must use only the fixed-purpose event drain seam".into());
     }
@@ -1001,7 +1010,8 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
     let pause = read("src/discovery/pause.rs");
     let run = read("src/run.rs");
 
-    assert_live_discovery_host_contract(&attach, &scope, &events, &hooks, &engine, &main).unwrap();
+    assert_live_discovery_host_contract(&attach, &scope, &events, &hooks, &engine, &main, &run)
+        .unwrap();
     assert_owned_run_pause_internal_contract(
         &attach, &events, &engine, &library, &main, &pause, &run,
     )
@@ -1024,14 +1034,30 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
 
     let public_ebpf = attach.replacen("pub(crate) ebpf: Ebpf,", "pub ebpf: Ebpf,", 1);
     assert!(
-        assert_live_discovery_host_contract(&public_ebpf, &scope, &events, &hooks, &engine, &main,)
-            .is_err(),
+        assert_live_discovery_host_contract(
+            &public_ebpf,
+            &scope,
+            &events,
+            &hooks,
+            &engine,
+            &main,
+            &run,
+        )
+        .is_err(),
         "a mutable Ebpf must not escape to the binary or external callers"
     );
     let fabricated = attach.replacen("    tgid: u32,", "    pub tgid: u32,", 1);
     assert!(
-        assert_live_discovery_host_contract(&fabricated, &scope, &events, &hooks, &engine, &main,)
-            .is_err(),
+        assert_live_discovery_host_contract(
+            &fabricated,
+            &scope,
+            &events,
+            &hooks,
+            &engine,
+            &main,
+            &run,
+        )
+        .is_err(),
         "the owned capability fields must remain opaque"
     );
     let armed_engine = engine.replacen(
@@ -1047,6 +1073,7 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
             &hooks,
             &armed_engine,
             &main,
+            &run,
         )
         .is_err(),
         "ordinary start must not gain an owned pause capability"
@@ -1061,6 +1088,7 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
             &hooks,
             &engine,
             &main,
+            &run,
         )
         .is_err(),
         "DISCOVERY must keep its own fixed-purpose drain owner"
@@ -1078,6 +1106,7 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
             &hooks,
             &engine,
             &main,
+            &run,
         )
         .is_err(),
         "CGROUP_FILTER value-width drift must fail the exact metadata contract"
@@ -1095,6 +1124,7 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
             &hooks,
             &engine,
             &main,
+            &run,
         )
         .is_err(),
         "policy-map metadata must be validated before publication"
@@ -1539,5 +1569,426 @@ fn gate_scripts_pin_the_toolchain() {
                 );
             }
         }
+    }
+}
+
+/// Task 8 Step 2's ordering sentence, frozen where the loops live: "Each tick
+/// drains discovery, lets `Engine` extend `AttachPlan` and apply attachment
+/// deltas, synchronizes immediate semantic/trace invalidations while
+/// preserving unchanged retired decode metadata, drains call events, retires
+/// exited process state, snapshots metrics/counters, and checks retained
+/// generations/objects."
+///
+/// The synchronization step landing before the event drain and the snapshot is
+/// what makes a slot discovered mid-capture visible to metrics and to trace in
+/// the same tick it arrived; the terminal section is what keeps detach ahead of
+/// the final drain and snapshot, with the in-flight honesty boundary intact.
+#[test]
+fn both_capture_loops_keep_the_one_frozen_per_tick_ordering() {
+    let run = read("src/run.rs");
+    let profile = between(&run, "fn capture_profile(", "fn write_json_report(");
+    let trace = between(&run, "fn capture_trace(", "\n/// Prints (and, if given,");
+
+    for (name, source, tick_end, sync) in [
+        (
+            "profile",
+            profile,
+            "    // The owned child is resumed",
+            "state.sync_plan(engine.plan());",
+        ),
+        (
+            "trace",
+            trace,
+            "    if let Some(owned) = owned.as_deref_mut() {",
+            "tracer.sync_plan(engine.plan());",
+        ),
+    ] {
+        let tick = between(
+            source,
+            "    loop {\n        let elapsed = clock.elapsed();",
+            tick_end,
+        );
+        let drain_events = if name == "profile" {
+            "drain_events(session, &mut state, &mut process_tracker)"
+        } else {
+            "drain_trace_events(\n            session,"
+        };
+        let snapshot = if name == "profile" {
+            "metrics::kernel_evidence(session)?"
+        } else {
+            "report_trace_loss("
+        };
+        for (first, second, contract) in [
+            (
+                "drain_discovery_tick(engine, session,",
+                sync,
+                "discovery drain before its immediate invalidation sync",
+            ),
+            (
+                sync,
+                drain_events,
+                "invalidation sync before the call-event drain",
+            ),
+            (
+                drain_events,
+                "retire_exited(&mut process_tracker, &mut state);",
+                "call-event drain before exited-process retirement",
+            ),
+            (
+                "retire_exited(&mut process_tracker, &mut state);",
+                snapshot,
+                "exited-process retirement before the metrics/counter snapshot",
+            ),
+            (
+                snapshot,
+                ".check_unchanged()",
+                "metrics/counter snapshot before the retained generation/object check",
+            ),
+        ] {
+            require_before(tick, first, second, &format!("{name} tick: {contract}")).unwrap();
+        }
+    }
+
+    // Terminal: detach the producers, then drain, then snapshot. A fallible
+    // provider check must not sit between the detach and its drain.
+    require_before(
+        profile,
+        "let detach = session.detach_producers();",
+        "        malformed_records += drain_events(session, &mut state, &mut process_tracker)?;\n    }\n    retire_exited",
+        "profile terminal detach before the final drain",
+    )
+    .unwrap();
+    require_before(
+        profile,
+        "let detach = session.detach_producers();",
+        "    let reports = metrics::read(session, engine.plan())?;\n    let mut kernel_evidence",
+        "profile terminal detach before the final snapshot",
+    )
+    .unwrap();
+    require_before(
+        trace,
+        "let detach = session.detach_producers();",
+        "    let reports = metrics::read(session, engine.plan())?;",
+        "trace terminal detach before the final snapshot",
+    )
+    .unwrap();
+    // The owned child is settled before any terminal evidence is built, so
+    // `child_still_running` is reported rather than guessed after the fact.
+    for source in [profile, trace] {
+        require_before(
+            source,
+            "owned.finish(engine, session, interrupted)?;",
+            "let detach = session.detach_producers();",
+            "owned-child settlement before terminal evidence",
+        )
+        .unwrap();
+    }
+    // And the honesty boundary the plan says to retain is still there.
+    assert!(
+        profile.contains("ev.mark_terminal_drain_unproven();"),
+        "the profile terminal snapshot must stay explicitly unproven"
+    );
+    assert!(
+        trace.contains("evidence.mark_terminal_drain_unproven();"),
+        "the trace terminal evidence must stay explicitly unproven"
+    );
+}
+
+/// CI viability (8.1 review, Important 1): after Task 8 Step 2 the extended
+/// checker contract that `scripts/verify-attach-e2e.sh` runs over *real*
+/// artifacts must be satisfiable by the real renderer's output.
+///
+/// This proves it without privileges and without a container: the document
+/// below is produced by the production renderer — `render::json` over a real
+/// `render::Evidence` and real `metrics::SlotReport` rows — and is then handed
+/// to the checker's own extended functions, imported from the script itself
+/// rather than reimplemented here. Positive control first: the real output is
+/// accepted, and only then is a mutation shown to be rejected, so an accepting
+/// run cannot be a broken driver.
+#[test]
+fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
+    use p11scope::plan::{ModuleId, SurfaceSummary, TableSummary};
+    use p11scope::render::{DiscoveredModule, DiscoveryEvidence, Evidence, ObjectSummary};
+
+    let object = ObjectSummary {
+        dev: (8, 1),
+        ino: 4242,
+        sha256: Some("11".repeat(32)),
+        path: "/opt/p11.so".into(),
+        build_id: Some("aabb".into()),
+        identity_source: "mountinfo",
+        note: None,
+        sources: vec!["scan"],
+    };
+    let module = DiscoveredModule {
+        id: ModuleId(0),
+        dev: object.dev,
+        ino: object.ino,
+        sha256: object.sha256.clone(),
+        path: object.path.clone(),
+        build_id: object.build_id.clone(),
+        objects: vec![object],
+        sources: vec!["scan"],
+        corroborated: false,
+        corroboration: vec!["single_source"],
+        tables: vec![TableSummary {
+            version: (2, 40),
+            entries: 68,
+            source: "scan",
+        }],
+        interfaces: 0,
+        skipped: vec![],
+    };
+    let mut evidence = Evidence {
+        table_entries: 68,
+        slots: 68,
+        attached_probes: 136,
+        attach_failures: vec![],
+        aliased: vec![],
+        skipped: vec![],
+        semantic_unverified_slots: 0,
+        in_flight_at_end: 0,
+        surfaces: vec![SurfaceSummary {
+            source: "legacy_function_list".into(),
+            walk: "full".into(),
+            acquisition: "ok".into(),
+            functions: 68,
+        }],
+        vendor_interfaces: 0,
+        interface_list: "absent".into(),
+        event_loss: 0,
+        start_insert_failures: 0,
+        unmatched_returns: 0,
+        rv_update_failures: 0,
+        cgroup_scope_failures: 0,
+        semantic_capture_failures: 0,
+        unregistered_mechanisms: 0,
+        template_tail_failures: 0,
+        process_tracking_fallbacks: 0,
+        process_tracking_failures: 0,
+        process_tracking_evictions: 0,
+        state_reconciliations: 0,
+        session_cancel_ambiguities: 0,
+        session_cancel_unknown_flags: 0,
+        operation_state_imports: 0,
+        auth_state_ambiguities: 0,
+        async_target_failures: 0,
+        async_orphans: 0,
+        async_duplicates: 0,
+        async_evictions: 0,
+        fork_state_ambiguities: 0,
+        semantic_state_drops: 0,
+        pending_at_end: 0,
+        malformed_records: 0,
+        orphan_ops: 0,
+        unmatched_closes: 0,
+        shape_decode_failures: 0,
+        shape_decode_total_failures: 0,
+        templates_truncated: false,
+        provider_changed: false,
+        // A capture that lived through live loader discovery: exactly the
+        // shape a real `verify-attach-e2e.sh` lane now produces.
+        attach_gap_ms: Some(7),
+        pause: "none",
+        pause_attempts: 0,
+        pause_confirmed: 0,
+        pause_partial: 0,
+        child_still_running: None,
+        discovery_ring_loss: 0,
+        discovery_state_failures: 0,
+        discovery_read_failures: 0,
+        discovery_truncated: 0,
+        loader_discovery: p11scope::render::LoaderDiscovery {
+            strategies: p11scope::render::LoaderStrategies {
+                debug_state_every_hit: 1,
+                ..Default::default()
+            },
+            dlopen_timing: p11scope::render::LoaderTiming {
+                unproven: 1,
+                ..Default::default()
+            },
+            initial_set_timing: Default::default(),
+            initial_set_capture: Default::default(),
+            hits: 4,
+            state_read_failures: 0,
+        },
+        unprotected_live_windows: 1,
+        module_unresolved_slots: 0,
+        discovery: DiscoveryEvidence {
+            modules: vec![module],
+            ..DiscoveryEvidence::default()
+        },
+        completeness: "UNKNOWN",
+    };
+    evidence.verdict();
+    assert_eq!(evidence.completeness, "PARTIAL");
+
+    let mut owned = p11scope::metrics::SlotReport {
+        names: vec!["C_Sign".into()],
+        aliased: false,
+        semantic_authorized: true,
+        module: Some(ModuleId(0)),
+        module_ambiguous: false,
+        module_unresolved: false,
+        calls: 3,
+        errors: 0,
+        in_flight: 0,
+        total_ns: 0,
+        max_ns: 0,
+        buckets: [0; p11scope_ebpf_common::LATENCY_BUCKETS],
+        rv_counts: Default::default(),
+    };
+    let mut unresolved = owned.clone();
+    unresolved.names = vec!["C_Encrypt".into()];
+    unresolved.module = None;
+    unresolved.module_unresolved = true;
+    let mut ambiguous = owned.clone();
+    ambiguous.names = vec!["C_Digest".into()];
+    ambiguous.module = None;
+    ambiguous.module_ambiguous = true;
+    owned.calls = 1;
+
+    let document = p11scope::render::json(
+        &[owned, unresolved, ambiguous],
+        &evidence,
+        &p11scope::render::CaptureMeta {
+            started: "1970-01-01T00:00:00Z",
+            ended: "1970-01-01T00:00:01Z",
+            kernel: "6.8.0",
+            policy: p11scope::attach::CapturePolicy::AggregateOnly,
+        },
+    );
+
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("checker-viability");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rendered.json");
+    fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+    // The driver imports the checker by path and runs exactly the extended
+    // contract `exact_common`/`exact_capture_modules` now reach.
+    let driver = r#"
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("checker", "scripts/check-capture-evidence.py")
+checker = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(checker)
+document = json.load(open(sys.argv[1]))
+checker.exact_live_discovery_evidence(document["evidence"])
+checker.exact_module_ownership(document)
+checker.exact_active_to_empty(document)
+print("accepted")
+"#;
+    let accepted = std::process::Command::new("python3")
+        .args(["-c", driver])
+        .arg(&path)
+        .output()
+        .expect("running python3");
+    assert!(
+        accepted.status.success(),
+        "the real renderer output is not checker-viable:\n{}\n{}",
+        String::from_utf8_lossy(&accepted.stdout),
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+
+    // Positive control passed; now the same driver must reject a mutation.
+    let mut broken = document.clone();
+    broken["evidence"]
+        .as_object_mut()
+        .unwrap()
+        .remove("loader_discovery");
+    let broken_path = dir.join("mutated.json");
+    fs::write(&broken_path, serde_json::to_vec_pretty(&broken).unwrap()).unwrap();
+    let rejected = std::process::Command::new("python3")
+        .args(["-c", driver])
+        .arg(&broken_path)
+        .output()
+        .expect("running python3");
+    assert!(
+        !rejected.status.success(),
+        "the checker accepted a document with no loader_discovery"
+    );
+}
+
+/// Task 8 Step 2, "Freeze the consumer map explicitly": metrics and function
+/// attribution use capture aggregate owners; semantic attachment decisions use
+/// active topology; final evidence/discovery and module labels use sanitized
+/// capture facts; coordinator fields use only its own finite aggregate.
+#[test]
+fn the_capture_loop_consumer_map_is_frozen() {
+    let run = read("src/run.rs");
+    let evidence = between(
+        &run,
+        "fn evidence_for(",
+        "\n/// `SystemTime` \u{2192} an RFC3339",
+    );
+
+    // Final evidence and discovery: sanitized capture facts, never the live
+    // plan's own counts.
+    for marker in [
+        "let facts = engine.capture_facts();",
+        "table_entries: facts.table_entries()",
+        "slots: facts.slots()",
+        "attach_gap_ms: facts.attach_gap_ms()",
+        "loader_discovery: facts.loader_discovery()",
+        "discovery: facts.discovery().clone()",
+        "facts.discovery_losses()",
+    ] {
+        assert!(evidence.contains(marker), "consumer map lost {marker:?}");
+    }
+    for forbidden in ["plan.entries_seen", "plan.slots.len()"] {
+        assert!(
+            !evidence.contains(forbidden),
+            "published history was taken from active topology: {forbidden}"
+        );
+    }
+
+    // Metrics and function attribution: the capture aggregate owners the
+    // `SlotReport` rows already carry.
+    assert!(
+        evidence.contains(".filter(|report| report.module_unresolved)"),
+        "ownership must come from the aggregate owner rows"
+    );
+
+    // Coordinator fields: only its own finite aggregate, never its identity.
+    for marker in [
+        "let pause = owned.map_or_else(Default::default, |owned| owned.coordinator.counters());",
+        "pause_attempts: pause.attempts",
+        "pause_confirmed: pause.confirmed",
+        "pause_partial: pause.partial",
+    ] {
+        assert!(evidence.contains(marker), "consumer map lost {marker:?}");
+    }
+    for forbidden in ["child.pid()", "coordinator.generation()", "child.pin()"] {
+        assert!(
+            !evidence.contains(forbidden),
+            "a loader/pause identity reached a render type: {forbidden}"
+        );
+    }
+
+    // Module labels: capture-lifetime facts only. The old active-topology
+    // label is gone, and every heading goes through the one policy.
+    assert!(
+        !run.contains("fn module_label("),
+        "the active-topology heading must not survive"
+    );
+    // Two headings exist at all: the profile loop's live frame and its
+    // terminal frame. The trace loop prints no heading, and its terminal
+    // evidence line is rendered from the same `Evidence` the JSON uses.
+    assert_eq!(
+        run.matches(".heading()").count(),
+        2,
+        "every live and terminal heading must come from capture facts"
+    );
+
+    // Semantic attachment decisions still read the active topology.
+    for marker in [
+        "semantics::State::with_policy(engine.plan(), policy)",
+        "state.sync_plan(engine.plan());",
+        "trace::Tracer::new(engine.plan())",
+        "tracer.sync_plan(engine.plan());",
+    ] {
+        assert!(
+            run.contains(marker),
+            "semantic attachment must keep active topology: {marker:?}"
+        );
     }
 }

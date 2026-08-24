@@ -3989,15 +3989,21 @@ impl Engine {
     ) -> Result<(Vec<DiscoveryRecord>, u64)> {
         let mut records = Vec::new();
         let mut malformed = 0u64;
-        while let Some(item) = session.discovery_dequeue()? {
-            match item {
-                crate::events::DiscoveryItem::Record(record) => records.push(record),
-                crate::events::DiscoveryItem::Malformed => {
+        loop {
+            match session.discovery_dequeue() {
+                Ok(Some(crate::events::DiscoveryItem::Record(record))) => records.push(record),
+                Ok(Some(crate::events::DiscoveryItem::Malformed)) => {
                     malformed = malformed.saturating_add(1);
+                }
+                Ok(None) => return Ok((records, malformed)),
+                // Whatever this drain already took off the ring is gone from
+                // the producer, so it travels with the failure as the retained
+                // prefix, exactly as the timed terminal collector does.
+                Err(error) => {
+                    return Err(IncompleteTerminalDrain::new(records, malformed, error).into());
                 }
             }
         }
-        Ok((records, malformed))
     }
 
     fn record_malformed_discovery(&mut self, malformed: u64) {
@@ -5520,13 +5526,28 @@ impl Engine {
         if detach_failed {
             errors.push("dynamic loader detach failed".into());
         }
+        let mut complete = true;
         let drained = begin_owned_prearm_retirement_with(
             &mut self.loader_registry,
             context,
             registry_attached,
             &mut errors,
-            || Self::collect_discovery_records(session),
+            || match Self::collect_discovery_records(session) {
+                // The prefix is already off the ring: retain it incomplete for
+                // the shared continuation instead of losing it with the drain.
+                Err(error) => {
+                    let incomplete = error.downcast::<IncompleteTerminalDrain>()?;
+                    complete = false;
+                    Ok((incomplete.records, incomplete.malformed))
+                }
+                drained => drained,
+            },
         );
+        if !complete {
+            errors.push(
+                "post-detach discovery drain was incomplete; its exact prefix is retained".into(),
+            );
+        }
         // This terminal cleanup uses the same authority batch and one-retry
         // predispatch journal as every other terminal detach route; it never
         // dispatches after a failed post-detach counter snapshot.
@@ -5536,7 +5557,7 @@ impl Engine {
                     if malformed != 0 {
                         errors.push("malformed discovery record during pre-arm retirement".into());
                     }
-                    self.retain_terminal_batch(records, true, malformed)?;
+                    self.retain_terminal_batch(records, complete, malformed)?;
                 }
                 let mut no_additions = false;
                 let mut closure = PauseClosure::new(false);
@@ -9645,6 +9666,63 @@ mod tests {
     }
 
     #[test]
+    fn a_mid_drain_ring_failure_retains_the_already_dequeued_prefix() {
+        let pid = std::process::id();
+        let (mut engine, owner) = Engine::retiring_loader_context(pid);
+        let unrelated = LoaderContextId::from_case_id(9);
+        let mut session = ScriptedSession::with_records([], 16);
+        session.detach_exports = vec![terminal_export()];
+        // The post-detach drain takes two records off the ring, then fails.
+        session.dequeues.extend([
+            Ok(Some(crate::events::DiscoveryItem::Record(
+                loader_record_for(owner, pid),
+            ))),
+            Ok(Some(crate::events::DiscoveryItem::Record(
+                loader_record_for(unrelated, pid),
+            ))),
+            Err(anyhow!("scripted ring read failed")),
+        ]);
+
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+            .expect("a failed terminal drain is loss, never a batch error");
+
+        assert_eq!(
+            engine.loader_records_accepted, 0,
+            "an incomplete batch dispatches nothing"
+        );
+        let batch = engine.terminal_batch.as_ref().unwrap();
+        assert_eq!(
+            batch.record_count(),
+            2,
+            "the records already off the ring stay in the retained prefix"
+        );
+        assert!(!batch.complete());
+        assert_eq!(
+            batch.tagged_owners(),
+            [Some(owner), None],
+            "only the owned record of the retained prefix carries authority"
+        );
+        let journal = engine.terminal_journal.unwrap();
+        assert!(!journal.dispatch_started && !journal.retry_used);
+
+        // The one shared continuation finishes the drain and dispatches once.
+        session
+            .dequeues
+            .push_back(Ok(Some(crate::events::DiscoveryItem::Record(
+                loader_record_for(owner, pid),
+            ))));
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+        assert_eq!(
+            engine.loader_records_accepted, 3,
+            "every dequeued record reached dispatch exactly once"
+        );
+        assert!(engine.terminal_batch.is_none());
+        assert!(engine.terminal_journal.is_none());
+        assert!(engine.loader_registry.context(owner).is_none());
+    }
+
+    #[test]
     fn terminal_predispatch_counter_failure_retains_the_exact_batch_for_one_retry() {
         let pid = std::process::id();
         let (mut engine, owner) = Engine::retiring_loader_context(pid);
@@ -9763,6 +9841,63 @@ mod tests {
         assert_eq!(
             engine.loader_records_accepted, 2,
             "the shared retry dispatches the exact batch once"
+        );
+        assert!(engine.terminal_batch.is_none());
+        assert!(engine.terminal_journal.is_none());
+        assert!(engine.loader_registry.context(owner).is_none());
+    }
+
+    #[test]
+    fn a_failed_owned_prearm_drain_retains_its_dequeued_prefix() {
+        let pid = std::process::id();
+        let (mut engine, owner) = Engine::retiring_loader_context(pid);
+        let mut session = ScriptedSession::with_records([], 16);
+        session.detach_exports = vec![terminal_export()];
+        // The pre-arm drain takes one record off the ring, then the ring fails.
+        session.dequeues.extend([
+            Ok(Some(crate::events::DiscoveryItem::Record(
+                loader_record_for(owner, pid),
+            ))),
+            Err(anyhow!("scripted ring read failed")),
+        ]);
+        let mut pending_views = PendingViewRetirements::new();
+
+        let error = engine
+            .fail_owned_prearm_attachment(
+                owner,
+                true,
+                &mut session,
+                &mut pending_views,
+                "loader registry mark-attached failed".into(),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("mark-attached"), "{error:#}");
+        assert_eq!(
+            engine.loader_records_accepted, 0,
+            "an incomplete batch dispatches nothing"
+        );
+        let batch = engine.terminal_batch.as_ref().unwrap();
+        assert_eq!(
+            batch.record_count(),
+            1,
+            "the record already off the ring stays in the retained prefix"
+        );
+        assert!(!batch.complete());
+        assert_eq!(batch.tagged_owners(), [Some(owner)]);
+        assert!(engine.loader_registry.is_tombstoned(owner));
+
+        // The one shared continuation finishes the drain and dispatches once.
+        session
+            .dequeues
+            .push_back(Ok(Some(crate::events::DiscoveryItem::Record(
+                loader_record_for(owner, pid),
+            ))));
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+        assert_eq!(
+            engine.loader_records_accepted, 2,
+            "every dequeued record reached dispatch exactly once"
         );
         assert!(engine.terminal_batch.is_none());
         assert!(engine.terminal_journal.is_none());

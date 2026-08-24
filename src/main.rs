@@ -71,6 +71,12 @@ fn run() -> Result<i32> {
         // `kind` travels inside the arguments, so both capture subcommands share
         // one arm as well as one parser.
         Ok(Command::Profile(a) | Command::Trace(a)) => cmd_capture(a).map(|()| 0),
+        // The CLI surface for `run` is accepted before its capture loop, so its
+        // refusals are stable while the owned-child integration lands. Until
+        // then the command is refused as a runtime failure, never half-run.
+        Ok(Command::Run(_)) => Err(anyhow!(
+            "run: the owned-child capture loop is not integrated in this build yet"
+        )),
         // Both of `inspect`'s hard failures — a pid that names nothing, and a target
         // that exited while its objects were being pinned — mean "the target could
         // not be read at all": one line here, exit 1, never a panic.

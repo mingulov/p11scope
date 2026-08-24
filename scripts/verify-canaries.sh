@@ -100,6 +100,59 @@ CALL_START_SIZE = 272
 EVENT_SIZE = 288
 
 
+# Loader and pause identities the observer holds privately. None of them may
+# reach profile/metrics JSON, trace output, an observer or workload log,
+# private temporary output, or an observer-owned map value (design §9.3, §9.4).
+LOADER_PAUSE_IDENTITIES = {
+    "attach_cookie": 0x5C00_11E5_0000_0200,
+    "context_id": 0xFA,
+    "delta": -4096,
+    "absent_state_sentinel": 512,
+    "process_generation": 0x0000_0007_C0FF_EE01,
+    "child_pid": 4242424,
+    "child_tid": 4242425,
+    "r_debug_vaddr": 0x7FFF_F7FF_E180,
+    "hook_ip": 0x7FFF_F7FE_1B00,
+    "marker": 0xDEAD_BEEF_CAFE_F00D,
+    "loader_path": "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+    "loader_sha256": "ab" * 32,
+    "loader_build_id": "aabbccddeeff0011",
+    "interface_name_bytes": "PKCS 11",
+}
+# A narrow value's raw 64-bit word is the same byte run any zero-padded small
+# integer produces — `512` little-endian is indistinguishable from the padding
+# around a `2` in an adjacent map slot — so scanning for it would fire on every
+# clean dump and mask the leaks that matter. Narrow values are therefore
+# searched in the spellings a leak actually takes in text (JSON, trace, logs),
+# while wide distinctive values are searched raw as well; the checker's exact
+# key sets are what close the structural case.
+DISTINCTIVE_FLOOR = 1 << 20
+
+
+def identity_patterns(values):
+    patterns = []
+    for value in values:
+        if isinstance(value, str):
+            patterns.append(value.encode())
+            continue
+        word = value & ((1 << 64) - 1)
+        patterns.append(f"0x{word:x}".encode())
+        patterns.append(f"0x{word:016x}".encode())
+        if abs(value) >= DISTINCTIVE_FLOOR:
+            patterns.append(str(value).encode())
+            patterns.append(struct.pack("<Q", word))
+            patterns.append(struct.pack(">Q", word))
+    return patterns
+
+
+def assert_no_loader_pause_identity(label, data, values=None):
+    values = list(LOADER_PAUSE_IDENTITIES.values()) if values is None else values
+    if isinstance(data, str):
+        data = data.encode()
+    for pattern in identity_patterns(values):
+        assert pattern not in data, f"{label} published loader/pause identity {pattern!r}"
+
+
 def profile_terminal(doc, schema="pkcs11-scope/observed-profile/v2"):
     assert doc["schema"] == schema, doc["schema"]
     ev = doc["evidence"]
@@ -1013,6 +1066,52 @@ if work == "--self-test":
             mutated, "feature-unsafe-profile", 0x555
         ))
     print("unsafe raw template oracle self-test: OK")
+
+    # Loader/pause identity scan. The positive control comes first: every
+    # spelling of every private value is found when it is deliberately placed
+    # in each scanned surface, so the clean result below is a real absence and
+    # not a scanner that matches nothing.
+    surfaces = ("profile json", "trace output", "observer log",
+                "private temp output", "owned map value")
+    for name, value in LOADER_PAUSE_IDENTITIES.items():
+        for pattern in identity_patterns([value]):
+            for surface in surfaces:
+                reject(
+                    f"{surface} {name}",
+                    lambda s=surface, p=pattern: assert_no_loader_pause_identity(
+                        s, b"leading" + p + b"trailing"
+                    ),
+                )
+    clean_aggregate = json.dumps({
+        "evidence": {
+            "attach_gap_ms": 7, "pause": "partial", "pause_attempts": 2,
+            "pause_confirmed": 1, "pause_partial": 1,
+            "discovery_ring_loss": 0, "discovery_state_failures": 0,
+            "discovery_read_failures": 0, "discovery_truncated": 0,
+            "loader_discovery": {
+                "strategies": {"debug_state_every_hit": 1, "dlopen_return": 0,
+                               "unavailable": 0},
+                "dlopen_timing": {"qualified_pre_constructor": 0,
+                                  "known_pre_relocation": 0, "unproven": 1,
+                                  "none": 0},
+                "initial_set_timing": {"qualified_pre_constructor": 0,
+                                       "known_pre_relocation": 0, "unproven": 1,
+                                       "none": 0},
+                "initial_set_capture": {"eligible": 0, "none": 1},
+                "hits": 4, "state_read_failures": 0,
+            },
+        },
+    })
+    assert_no_loader_pause_identity("profile json", clean_aggregate)
+    assert_no_loader_pause_identity(
+        "trace output",
+        "CAPTURE privacy=allowlisted\nC_Sign 0x0 sess#1 1.2ms\nEVIDENCE "
+        + clean_aggregate,
+    )
+    assert_no_loader_pause_identity(
+        "owned map value", struct.pack("<QQ", 1, 0) + struct.pack("<QQ", 2, 0)
+    )
+    print("loader/pause identity scanner self-test: OK")
     print("canary lane assertion self-test: OK")
     raise SystemExit
 

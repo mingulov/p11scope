@@ -45,6 +45,38 @@ COUNTERS = (
     "discovery_conflicts",
     "discovery_uncorroborated",
     "module_ambiguous",
+    # Live-discovery losses (slice 1b-2, design §9.1). Each has exactly one
+    # owner — the BPF counters or the one discovery-engine accumulator — and
+    # each forces PARTIAL. None is derived from received record counts.
+    "discovery_ring_loss",
+    "discovery_state_failures",
+    "discovery_read_failures",
+    "discovery_truncated",
+)
+
+# `evidence.loader_discovery` (design §9.2): finite, aggregate, and closed.
+# Every key is always present, every value is an unsigned 64-bit count, and
+# there is no second public copy of an internal counter or identity.
+LOADER_TIMING_KEYS = (
+    "qualified_pre_constructor",
+    "known_pre_relocation",
+    "unproven",
+    "none",
+)
+LOADER_DISCOVERY_GROUPS = {
+    "strategies": ("debug_state_every_hit", "dlopen_return", "unavailable"),
+    "dlopen_timing": LOADER_TIMING_KEYS,
+    "initial_set_timing": LOADER_TIMING_KEYS,
+    "initial_set_capture": ("eligible", "none"),
+}
+LOADER_DISCOVERY_COUNTERS = ("hits", "state_read_failures")
+PAUSE_VALUES = ("none", "sigstop", "partial")
+PAUSE_COUNTERS = ("pause_attempts", "pause_confirmed", "pause_partial")
+DISCOVERY_LOSS_COUNTERS = (
+    "discovery_ring_loss",
+    "discovery_state_failures",
+    "discovery_read_failures",
+    "discovery_truncated",
 )
 MAX_MANIFEST_OBJECT_FALLBACKS = 512
 MANIFEST_STALE_REASONS = {"open_stale", "identity_mismatch"}
@@ -434,6 +466,159 @@ def discovery_skips(evidence):
     return [item for item in evidence["skipped"] if item["name"] == DISCOVERY_SUBJECT]
 
 
+def exact_loader_discovery(evidence):
+    """`evidence.loader_discovery` is closed, finite, and count-only.
+
+    The exact key sets are the whole check: an injected identity — a raw
+    PID/TID/task set, a loader/libc path, digest or build ID, an address,
+    pointer, cookie, context id, delta, absent-state sentinel, signal record,
+    interface-name bytes, marker, or an observer-owned map value — can only
+    arrive as an extra key or a non-count value, and both are refused here
+    rather than pattern-matched out of a string.
+    """
+    aggregate = evidence["loader_discovery"]
+    require(isinstance(aggregate, dict), f"loader_discovery is not an object: {aggregate!r}")
+    require(
+        set(aggregate) == set(LOADER_DISCOVERY_GROUPS) | set(LOADER_DISCOVERY_COUNTERS),
+        f"loader_discovery key set: {sorted(aggregate)}",
+    )
+    for group, keys in LOADER_DISCOVERY_GROUPS.items():
+        value = aggregate[group]
+        require(isinstance(value, dict), f"loader_discovery.{group} is not an object: {value!r}")
+        require(tuple(value) == keys, f"loader_discovery.{group} key set: {list(value)}")
+        for key in keys:
+            require(u64(value[key]), f"loader_discovery.{group}.{key}: {value[key]!r}")
+    for counter in LOADER_DISCOVERY_COUNTERS:
+        require(u64(aggregate[counter]), f"loader_discovery.{counter}: {aggregate[counter]!r}")
+
+
+def exact_live_discovery_evidence(evidence, *, run=False):
+    """The exact fields slice 1b-2 publishes (design §5.5, §5.6, §9.1–§9.2)."""
+    missing = [
+        name
+        for name in (
+            "attach_gap_ms",
+            "pause",
+            *PAUSE_COUNTERS,
+            *DISCOVERY_LOSS_COUNTERS,
+            "loader_discovery",
+        )
+        if name not in evidence
+    ]
+    require(not missing, f"missing live discovery evidence: {missing}")
+    # The loader/pause namespace is closed at the evidence level too: PID/TID
+    # and task sets are permitted only in the pre-existing ordinary call-event
+    # trace fields the allowlist already names, never here.
+    published = {
+        "attach_gap_ms",
+        "pause",
+        "loader_discovery",
+        "child_still_running",
+        *PAUSE_COUNTERS,
+    }
+    intruders = sorted(
+        name
+        for name in evidence
+        if name not in published
+        and (
+            name.startswith(("pause", "loader", "child", "attach_gap"))
+            or name.endswith(("_pid", "_tid", "_tids", "_tasks", "_task_set"))
+        )
+    )
+    require(not intruders, f"unpublished loader/pause evidence: {intruders}")
+    gap = evidence["attach_gap_ms"]
+    require(gap is None or u64(gap), f"attach_gap_ms: {gap!r}")
+    require(evidence["pause"] in PAUSE_VALUES, f"pause: {evidence['pause']!r}")
+    for counter in PAUSE_COUNTERS:
+        require(u64(evidence[counter]), f"{counter}: {evidence[counter]!r}")
+    attempts, confirmed, partial = (evidence[name] for name in PAUSE_COUNTERS)
+    require(
+        confirmed + partial == attempts,
+        f"pause counters do not add up: {attempts} != {confirmed} + {partial}",
+    )
+    # The published value is exactly the lattice, never an independent label.
+    wanted = "none" if attempts == 0 else "partial" if partial else "sigstop"
+    require(evidence["pause"] == wanted, f"pause: want {wanted}, got {evidence['pause']}")
+    for counter in DISCOVERY_LOSS_COUNTERS:
+        require(u64(evidence[counter]), f"{counter}: {evidence[counter]!r}")
+    if run:
+        require(
+            isinstance(evidence.get("child_still_running"), bool),
+            f"run evidence must state child_still_running: {evidence.get('child_still_running')!r}",
+        )
+    else:
+        require(
+            "child_still_running" not in evidence,
+            "child_still_running is a run-only field",
+        )
+    exact_loader_discovery(evidence)
+
+
+def exact_module_ownership(document):
+    """`module`, `module_ambiguous`, `module_unresolved` are exclusive.
+
+    Exactly one of nonnull/false/false, null/true/false, or null/false/true.
+    `null,false,false` is a cell with no stated reason for its missing owner
+    and is refused; an explicitly unowned cell is null/false/true and forces
+    PARTIAL, and it is never relabelled as two-module ambiguity.
+    """
+    unresolved_seen = False
+    for item in document["functions"]:
+        require(
+            {"module", "module_ambiguous", "module_unresolved"} <= set(item),
+            f"function row states no owner relation: {item}",
+        )
+        owner, ambiguous, unresolved = (
+            item["module"],
+            item["module_ambiguous"],
+            item["module_unresolved"],
+        )
+        require(isinstance(ambiguous, bool), f"module_ambiguous is not a boolean: {item}")
+        require(isinstance(unresolved, bool), f"module_unresolved is not a boolean: {item}")
+        require(
+            (owner is not None, ambiguous, unresolved)
+            in {(True, False, False), (False, True, False), (False, False, True)},
+            f"module ownership relation: {item}",
+        )
+        unresolved_seen = unresolved_seen or unresolved
+    if unresolved_seen:
+        require(
+            document["evidence"]["completeness"] == "PARTIAL",
+            "an unresolved slot owner must force PARTIAL",
+        )
+
+
+def exact_active_to_empty(document):
+    """A capture whose target exited the ordinary way keeps its history.
+
+    Modules, table entries, surfaces and skips, allocated slots, successful
+    endpoints, aggregate calls, and the exact function-module references are
+    capture-lifetime facts. The exit itself is neither a discovery loss nor a
+    state reconciliation, and every counted call still names a declared owner.
+    """
+    evidence = document["evidence"]
+    require(evidence["discovery"], "history lost: no module survived the exit")
+    require(document["capture"]["modules"], "history lost: capture.modules is empty")
+    require(evidence["surfaces"], "history lost: no surface survived the exit")
+    for name in ("table_entries", "slots", "attached_probes"):
+        require(u64(evidence[name], positive=True), f"history lost: {name} is {evidence[name]!r}")
+    for counter in DISCOVERY_LOSS_COUNTERS:
+        require(evidence[counter] == 0, f"an ordinary exit is not a {counter}")
+    require(
+        evidence["state_reconciliations"] == 0,
+        "an ordinary exit is not a state reconciliation",
+    )
+    exact_module_ownership(document)
+    declared = {(tuple(module["dev"]), module["ino"]) for module in evidence["discovery"]}
+    for item in document["functions"]:
+        owner = item["module"]
+        if owner is not None:
+            require(
+                (tuple(owner["dev"]), owner["ino"]) in declared,
+                f"undeclared slot owner: {owner}",
+            )
+
+
 def exact_common(evidence, *, aliases, skipped, in_flight, discovery_skipped=0):
     require(evidence["attach_failures"] == [], evidence["attach_failures"])
     require(evidence["aliased"] == aliases, f"unexpected aliases: {evidence['aliased']}")
@@ -451,6 +636,7 @@ def exact_common(evidence, *, aliases, skipped, in_flight, discovery_skipped=0):
     # Discovery is the claim the whole document rests on: a lane that attached
     # probes must name what it attached them into, and how it was authorized.
     require(evidence["authority"] == "hash-pinned", f"unexpected authority: {evidence['authority']}")
+    exact_live_discovery_evidence(evidence)
     require(evidence["discovery"], "evidence.discovery is empty: nothing was discovered")
     exact_manifest_object_fallbacks(evidence)
     for module in evidence["discovery"]:
@@ -513,6 +699,7 @@ def exact_capture_modules(document):
     pathname (which for a scanned module is the target's, not the observer's).
     """
     exact_manifest_object_fallbacks(document["evidence"])
+    exact_module_ownership(document)
     modules = document["capture"]["modules"]
     require(modules, "capture.modules is empty: the document names no provider")
     for module in modules:
@@ -913,6 +1100,7 @@ def function_items(pairs):
             "calls": calls,
             "module": identity,
             "module_ambiguous": False,
+            "module_unresolved": False,
             "aliased": len(names) > 1,
         }
         for names, calls in pairs
@@ -960,6 +1148,23 @@ DISCOVERY_SKIP = {
 }
 
 
+def loader_discovery_fixture(**overrides):
+    """The always-present aggregate, zeroed. Overrides are `group.key=value`
+    spellings written as `group__key`, so a fixture states exactly the one
+    count it means to exercise."""
+    aggregate = {
+        group: {key: 0 for key in keys} for group, keys in LOADER_DISCOVERY_GROUPS.items()
+    }
+    aggregate |= {counter: 0 for counter in LOADER_DISCOVERY_COUNTERS}
+    for name, value in overrides.items():
+        group, _, key = name.partition("__")
+        if key:
+            aggregate[group][key] = value
+        else:
+            aggregate[group] = value
+    return aggregate
+
+
 def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
     return {
         "authority": "hash-pinned",
@@ -982,6 +1187,13 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
         ],
         "vendor_interfaces": 0,
         "interface_list": "absent",
+        # Live discovery published nothing: no measured hook gap, no pause
+        # authorization, and an all-zero loader aggregate that is still
+        # present, because absence of the key is not absence of the fact.
+        "attach_gap_ms": None,
+        "pause": "none",
+        **{name: 0 for name in PAUSE_COUNTERS},
+        "loader_discovery": loader_discovery_fixture(),
         **{name: 0 for name in COUNTERS},
         # A fixture is self-consistent: a module only the manifest described is
         # uncorroborated, by definition of the word.
@@ -1628,6 +1840,173 @@ def self_test():
     unattributed["functions"][0].update(module=None, module_ambiguous=True)
     exact_capture_modules(unattributed)
     print("every count is attributed to a declared module or to nobody: OK")
+
+    # ---- slice 1b-2 live-discovery evidence -----------------------------
+    # Positive control first: the exact published shape is accepted, so every
+    # rejection below is the mutation being caught and not a broken fixture.
+    live = copy.deepcopy(clean)
+    live["evidence"].update(
+        attach_gap_ms=7,
+        pause="partial",
+        pause_attempts=2,
+        pause_confirmed=1,
+        pause_partial=1,
+        loader_discovery=loader_discovery_fixture(
+            strategies__debug_state_every_hit=1,
+            dlopen_timing__unproven=1,
+            initial_set_timing__unproven=1,
+            initial_set_capture__none=1,
+            hits=4,
+            state_read_failures=0,
+        ),
+    )
+    exact_live_discovery_evidence(live["evidence"])
+    exact_capture_modules(live)
+    print("live discovery evidence positive control: OK")
+
+    for mutate in (
+        # The aggregate is closed: no key may go missing, and no key may be
+        # added — an injected identity can only arrive as one of the two.
+        lambda d: d["evidence"]["loader_discovery"].pop("hits"),
+        lambda d: d["evidence"]["loader_discovery"].pop("state_read_failures"),
+        lambda d: d["evidence"]["loader_discovery"]["strategies"].pop("unavailable"),
+        lambda d: d["evidence"]["loader_discovery"]["dlopen_timing"].pop("none"),
+        lambda d: d["evidence"]["loader_discovery"]["initial_set_capture"].pop("eligible"),
+        lambda d: d["evidence"].pop("loader_discovery"),
+        # Raw loader/pause process identity, in every new location.
+        lambda d: d["evidence"]["loader_discovery"].update(pid=4242),
+        lambda d: d["evidence"]["loader_discovery"].update(tid=4243),
+        lambda d: d["evidence"]["loader_discovery"].update(tasks=[4242, 4243]),
+        lambda d: d["evidence"]["loader_discovery"]["strategies"].update(pid=4242),
+        lambda d: d["evidence"]["loader_discovery"]["dlopen_timing"].update(tid=4243),
+        lambda d: d["evidence"]["loader_discovery"]["initial_set_timing"].update(
+            tasks=[4242]
+        ),
+        lambda d: d["evidence"]["loader_discovery"]["initial_set_capture"].update(
+            pid_tgid=18229209370626
+        ),
+        lambda d: d["evidence"].update(pause_pid=4242),
+        lambda d: d["evidence"].update(pause_tasks=[4242, 4243]),
+        # Loader/libc identity and proof.
+        lambda d: d["evidence"]["loader_discovery"].update(
+            loader="/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
+        ),
+        lambda d: d["evidence"]["loader_discovery"].update(libc_sha256="ab" * 32),
+        lambda d: d["evidence"]["loader_discovery"].update(build_id="aabbccdd"),
+        lambda d: d["evidence"]["loader_discovery"].update(proof_id=7),
+        # Addresses, pointers, cookies, contexts, deltas, sentinels, markers,
+        # signal records, interface bytes, and observer-owned map values.
+        lambda d: d["evidence"]["loader_discovery"].update(r_debug_vaddr=0x7FFFF7FFE180),
+        lambda d: d["evidence"]["loader_discovery"].update(hook_ip=0x7FFFF7FE1B00),
+        lambda d: d["evidence"]["loader_discovery"].update(attach_cookie=512),
+        lambda d: d["evidence"]["loader_discovery"].update(context_id=1),
+        lambda d: d["evidence"]["loader_discovery"].update(delta=-4096),
+        lambda d: d["evidence"]["loader_discovery"].update(absent_state_sentinel=512),
+        lambda d: d["evidence"]["loader_discovery"].update(marker=0xDEADBEEF),
+        lambda d: d["evidence"]["loader_discovery"].update(
+            signal_record={"signal": 19, "pid": 4242}
+        ),
+        lambda d: d["evidence"]["loader_discovery"].update(interface_name="PKCS 11"),
+        lambda d: d["evidence"]["loader_discovery"].update(
+            pause_pids={"4242": 1}
+        ),
+        # Counts are counts: not strings, not booleans, not negative, not
+        # floats, and never a second derived copy of an internal counter.
+        lambda d: d["evidence"]["loader_discovery"].update(hits="4"),
+        lambda d: d["evidence"]["loader_discovery"].update(hits=True),
+        lambda d: d["evidence"]["loader_discovery"].update(hits=-1),
+        lambda d: d["evidence"]["loader_discovery"].update(state_read_failures=1.5),
+        lambda d: d["evidence"]["loader_discovery"]["strategies"].update(
+            debug_state_every_hit=None
+        ),
+        # The pause lattice is derived, not labelled.
+        lambda d: d["evidence"].update(pause="sigstop"),
+        lambda d: d["evidence"].update(pause="stopped"),
+        lambda d: d["evidence"].update(pause_confirmed=2),
+        lambda d: d["evidence"].update(pause_attempts=0, pause="none"),
+        lambda d: d["evidence"].update(pause_partial=-1),
+        # A gap is a measurement or a null; never an invented zero-by-string.
+        lambda d: d["evidence"].update(attach_gap_ms="7"),
+        lambda d: d["evidence"].update(attach_gap_ms=-1),
+        # The run-only field never appears in an ordinary capture.
+        lambda d: d["evidence"].update(child_still_running=False),
+    ):
+        bad = copy.deepcopy(live)
+        mutate(bad)
+        rejected(lambda bad=bad: exact_live_discovery_evidence(bad["evidence"]))
+    print("loader/pause evidence rejects every injected identity and non-count: OK")
+
+    run_document = copy.deepcopy(live)
+    run_document["evidence"]["child_still_running"] = True
+    exact_live_discovery_evidence(run_document["evidence"], run=True)
+    for mutate in (
+        lambda d: d["evidence"].pop("child_still_running"),
+        lambda d: d["evidence"].update(child_still_running="yes"),
+        lambda d: d["evidence"].update(child_still_running=4242),
+    ):
+        bad = copy.deepcopy(run_document)
+        mutate(bad)
+        rejected(
+            lambda bad=bad: exact_live_discovery_evidence(bad["evidence"], run=True)
+        )
+    print("child_still_running is a run-only boolean: OK")
+
+    # ---- module ownership relation --------------------------------------
+    ownership = copy.deepcopy(live)
+    ownership["evidence"]["completeness"] = "PARTIAL"
+    ownership["functions"] = function_items([(["C_Sign"], 3)])
+    exact_module_ownership(ownership)
+    unresolved = copy.deepcopy(ownership)
+    unresolved["functions"][0].update(module=None, module_unresolved=True)
+    exact_module_ownership(unresolved)
+    for mutate in (
+        # No owner and no reason: the one shape the relation forbids.
+        lambda d: d["functions"][0].update(
+            module=None, module_ambiguous=False, module_unresolved=False
+        ),
+        # Unresolved is not two-module ambiguity, and never both.
+        lambda d: d["functions"][0].update(
+            module=None, module_ambiguous=True, module_unresolved=True
+        ),
+        # An owner cannot also be unowned.
+        lambda d: d["functions"][0].update(module_unresolved=True),
+        lambda d: d["functions"][0].update(module_ambiguous=True),
+        lambda d: d["functions"][0].update(module_unresolved="yes"),
+        lambda d: d["functions"][0].pop("module_unresolved"),
+    ):
+        bad = copy.deepcopy(ownership)
+        mutate(bad)
+        rejected(lambda bad=bad: exact_module_ownership(bad))
+    complete_but_unresolved = copy.deepcopy(unresolved)
+    complete_but_unresolved["evidence"]["completeness"] = "COMPLETE"
+    rejected(lambda: exact_module_ownership(complete_but_unresolved))
+    print("module ownership is an exact exclusive relation and unresolved is PARTIAL: OK")
+
+    # ---- active-to-empty lifecycle --------------------------------------
+    # The target exited normally: links, pins and views are gone, and every
+    # capture-lifetime fact is still reported.
+    exited = copy.deepcopy(live)
+    exited["evidence"].update(table_entries=68, slots=68, attached_probes=136)
+    exact_active_to_empty(exited)
+    for mutate in (
+        lambda d: d["evidence"]["discovery"].clear(),
+        lambda d: d["capture"]["modules"].clear(),
+        lambda d: d["evidence"]["surfaces"].clear(),
+        lambda d: d["evidence"].update(table_entries=0),
+        lambda d: d["evidence"].update(slots=0),
+        lambda d: d["evidence"].update(attached_probes=0),
+        lambda d: d["evidence"].update(discovery_truncated=1),
+        lambda d: d["evidence"].update(discovery_ring_loss=1),
+        lambda d: d["evidence"].update(state_reconciliations=1),
+        lambda d: d["functions"][0]["module"].update(ino=999),
+        lambda d: d["functions"][0].update(
+            module=None, module_ambiguous=False, module_unresolved=False
+        ),
+    ):
+        bad = copy.deepcopy(exited)
+        mutate(bad)
+        rejected(lambda bad=bad: exact_active_to_empty(bad))
+    print("active-to-empty keeps its history and declares every owner: OK")
     print("self-test: OK")
 
 

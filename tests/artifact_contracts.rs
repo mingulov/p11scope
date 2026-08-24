@@ -1382,6 +1382,9 @@ fn usage_documents_every_subcommand_and_capture_needs_no_manifest() {
     for line in [
         "p11scope profile",
         "p11scope trace",
+        "p11scope run",
+        "--pause never|auto|always",
+        "-- CMD [ARGS...]",
         "p11scope inspect --pid",
         "p11scope doctor",
         "p11scope-discover --module",
@@ -1411,6 +1414,33 @@ fn usage_documents_every_subcommand_and_capture_needs_no_manifest() {
     let stderr = String::from_utf8_lossy(&no_pid.stderr);
     assert_eq!(no_pid.status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("--pid"), "{stderr}");
+
+    // `run` refuses at the same usage exit code as every other subcommand: a
+    // command it was never given, and a scope flag it does not have.
+    for (arguments, expected) in [
+        (vec!["run"], "-- CMD [ARGS...]"),
+        (vec!["run", "--", ""], "-- CMD [ARGS...]"),
+        (
+            vec!["run", "--pid", "1", "--", "/bin/true"],
+            "run has no --pid or --cgroup",
+        ),
+        (
+            vec!["run", "--pause", "sometimes", "--", "/bin/true"],
+            "never|auto|always",
+        ),
+        (
+            vec!["profile", "--pid", "1", "--pause", "auto"],
+            "`p11scope run`",
+        ),
+    ] {
+        let refused = Command::new(bin)
+            .args(&arguments)
+            .output()
+            .expect("run p11scope");
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(refused.status.code(), Some(2), "{arguments:?}: {stderr}");
+        assert!(stderr.contains(expected), "{arguments:?}: {stderr}");
+    }
 
     // A pid that names nothing: one line, exit 1, never a panic or a backtrace.
     let gone = Command::new(bin)

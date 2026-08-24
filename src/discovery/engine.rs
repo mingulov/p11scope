@@ -3994,9 +3994,11 @@ impl Engine {
     }
 
     /// The one immutable public view of capture-lifetime facts (plan Task 8
-    /// Step 2). Everything here is already sanitized: it is built from the
-    /// projected discovery evidence and finite aggregates only, never from
-    /// pins, views, files, timing keys, or loader/pause identity.
+    /// Step 2). Every field is boundary-safe: no pins, views, files, timing
+    /// keys, or loader/pause identity crosses it. Most fields are the
+    /// projected discovery evidence and finite aggregates, but `table_entries`
+    /// and `slots` are the exception — they are counts read live off the
+    /// engine's own `plan`, not sourced from `self.discovery`.
     pub fn capture_facts(&self) -> render::CaptureFacts {
         render::CaptureFacts {
             discovery: self.discovery.clone(),
@@ -7082,8 +7084,20 @@ impl Engine {
     /// semantic consumers immediately when this reports a plan change, before
     /// draining the ordinary event ring.
     pub fn drain_discovery(&mut self, session: &mut Session) -> Result<bool> {
-        let (records, malformed) = Self::collect_discovery_records(session)?;
+        let (records, malformed) =
+            Self::collect_discovery_records(session).map_err(Self::generic_drain_error)?;
         self.apply_discovery_batch(session, records, malformed)
+    }
+
+    /// `drain_discovery_tick` (src/run.rs) aborts the run with `?` on this
+    /// route instead of retaining and replaying anything, so a collection
+    /// failure here must not carry the terminal routes' "N terminal
+    /// record(s) retained for retry" claim — nothing is retained.
+    fn generic_drain_error(error: anyhow::Error) -> anyhow::Error {
+        match error.downcast::<IncompleteTerminalDrain>() {
+            Ok(incomplete) => anyhow::Error::msg(incomplete.cause),
+            Err(error) => error,
+        }
     }
 
     pub(crate) fn apply_discovery_batch(
@@ -7791,6 +7805,25 @@ mod tests {
             .0;
         assert!(!retirement.contains("Self::collect_discovery_records(session)"));
         assert!(retirement.contains("collect(session)"));
+    }
+
+    /// The generic (non-terminal) drain never retries: `drain_discovery_tick`
+    /// aborts the run on `?` (src/run.rs) instead of retaining and replaying
+    /// anything. Its error text must not claim retention the terminal routes
+    /// actually perform.
+    #[test]
+    fn generic_drain_failure_states_no_retention_claim() {
+        let record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        let retained =
+            IncompleteTerminalDrain::new(vec![record], 0, anyhow!("scripted ring read failed"));
+
+        let error = Engine::generic_drain_error(retained.into());
+
+        assert_eq!(error.to_string(), "scripted ring read failed");
+        assert!(
+            !error.to_string().contains("retained"),
+            "the generic drain retains nothing across ticks: {error:#}"
+        );
     }
 
     #[test]

@@ -466,6 +466,30 @@ def discovery_skips(evidence):
     return [item for item in evidence["skipped"] if item["name"] == DISCOVERY_SUBJECT]
 
 
+# The closed loader/pause namespace. PID/TID and task sets are permitted only
+# in the pre-existing ordinary call-event trace fields the allowlist already
+# names (docs/privacy/allowlist-v1.md), never in a capture document.
+IDENTITY_PREFIXES = ("pause", "loader", "child", "attach_gap")
+IDENTITY_SUFFIXES = ("_pid", "_tid", "_tids", "_tasks", "_task_set")
+PUBLISHED_LOADER_PAUSE_FIELDS = {
+    "attach_gap_ms",
+    "pause",
+    "loader_discovery",
+    "child_still_running",
+    *PAUSE_COUNTERS,
+}
+
+
+def unpublished_identity_keys(mapping, published=()):
+    """Keys this object publishes from the closed loader/pause namespace."""
+    return sorted(
+        name
+        for name in mapping
+        if name not in published
+        and (name.startswith(IDENTITY_PREFIXES) or name.endswith(IDENTITY_SUFFIXES))
+    )
+
+
 def exact_loader_discovery(evidence):
     """`evidence.loader_discovery` is closed, finite, and count-only.
 
@@ -475,6 +499,10 @@ def exact_loader_discovery(evidence):
     interface-name bytes, marker, or an observer-owned map value — can only
     arrive as an extra key or a non-count value, and both are refused here
     rather than pattern-matched out of a string.
+
+    The cardinalities are the second half: the three classification groups are
+    one partition of the same exact bound-context set, not three independent
+    tallies, so a count with no context behind it is refused too.
     """
     aggregate = evidence["loader_discovery"]
     require(isinstance(aggregate, dict), f"loader_discovery is not an object: {aggregate!r}")
@@ -498,6 +526,25 @@ def exact_loader_discovery(evidence):
             require(u64(value[key]), f"loader_discovery.{group}.{key}: {value[key]!r}")
     for counter in LOADER_DISCOVERY_COUNTERS:
         require(u64(aggregate[counter]), f"loader_discovery.{counter}: {aggregate[counter]!r}")
+    # Every exact bound context is counted once as a strategy and once in
+    # exactly one timing group, and an initial-set context additionally states
+    # its capture outcome. `hits` and `state_read_failures` are BPF counters
+    # over records, not contexts, and are deliberately unconstrained here.
+    strategies = sum(aggregate["strategies"].values())
+    dlopen = sum(aggregate["dlopen_timing"].values())
+    initial_set = sum(aggregate["initial_set_timing"].values())
+    captures = sum(aggregate["initial_set_capture"].values())
+    require(
+        strategies == dlopen + initial_set,
+        f"loader_discovery counts {strategies} strategies for {dlopen + initial_set} timed contexts",
+    )
+    require(
+        captures == initial_set,
+        f"loader_discovery states {captures} initial-set captures for {initial_set} contexts",
+    )
+    # An owned run owns exactly one child, so it arms at most one pre-exec
+    # initial-set context; no other capture arms one at all.
+    require(initial_set <= 1, f"more than one initial-set context: {initial_set}")
 
 
 def exact_live_discovery_evidence(evidence, *, run=False):
@@ -514,25 +561,8 @@ def exact_live_discovery_evidence(evidence, *, run=False):
         if name not in evidence
     ]
     require(not missing, f"missing live discovery evidence: {missing}")
-    # The loader/pause namespace is closed at the evidence level too: PID/TID
-    # and task sets are permitted only in the pre-existing ordinary call-event
-    # trace fields the allowlist already names, never here.
-    published = {
-        "attach_gap_ms",
-        "pause",
-        "loader_discovery",
-        "child_still_running",
-        *PAUSE_COUNTERS,
-    }
-    intruders = sorted(
-        name
-        for name in evidence
-        if name not in published
-        and (
-            name.startswith(("pause", "loader", "child", "attach_gap"))
-            or name.endswith(("_pid", "_tid", "_tids", "_tasks", "_task_set"))
-        )
-    )
+    # The loader/pause namespace is closed at the evidence level too.
+    intruders = unpublished_identity_keys(evidence, PUBLISHED_LOADER_PAUSE_FIELDS)
     require(not intruders, f"unpublished loader/pause evidence: {intruders}")
     gap = evidence["attach_gap_ms"]
     require(gap is None or u64(gap), f"attach_gap_ms: {gap!r}")
@@ -569,6 +599,10 @@ def exact_module_ownership(document):
     `null,false,false` is a cell with no stated reason for its missing owner
     and is refused; an explicitly unowned cell is null/false/true and forces
     PARTIAL, and it is never relabelled as two-module ambiguity.
+
+    The unowned reason is that one finite boolean and nothing else: the row
+    publishes no reason string, process identity, path, cookie, or internal
+    owner key beside it, in the row or in its module reference.
     """
     unresolved_seen = False
     for item in document["functions"]:
@@ -576,6 +610,11 @@ def exact_module_ownership(document):
             {"module", "module_ambiguous", "module_unresolved"} <= set(item),
             f"function row states no owner relation: {item}",
         )
+        intruders = unpublished_identity_keys(item)
+        require(not intruders, f"unpublished owner identity on a function row: {intruders}")
+        if isinstance(item["module"], dict):
+            intruders = unpublished_identity_keys(item["module"])
+            require(not intruders, f"unpublished owner identity on a module ref: {intruders}")
         owner, ambiguous, unresolved = (
             item["module"],
             item["module_ambiguous"],
@@ -741,7 +780,14 @@ def exact_capture_modules(document):
         )
         owner, ambiguous = item["module"], item["module_ambiguous"]
         if owner is None:
-            require(ambiguous is True, f"unattributed function without a reason: {item}")
+            # Two stated reasons exist, and `exact_module_ownership` above has
+            # already refused every shape that states both or neither: two
+            # modules claim the slot, or the allocated cell has no accepted
+            # sole owner at all. Neither is ever guessed into an attribution.
+            require(
+                ambiguous is True or item["module_unresolved"] is True,
+                f"unattributed function without a reason: {item}",
+            )
             ineligible = True
             continue
         require(ambiguous is False, f"attributed function marked ambiguous: {item}")
@@ -1847,6 +1893,11 @@ def self_test():
     unattributed = copy.deepcopy(clean)
     unattributed["functions"][0].update(module=None, module_ambiguous=True)
     exact_capture_modules(unattributed)
+    unowned = copy.deepcopy(clean)
+    unowned["functions"][0].update(
+        module=None, module_ambiguous=False, module_unresolved=True
+    )
+    exact_capture_modules(unowned)
     print("every count is attributed to a declared module or to nobody: OK")
 
     # ---- slice 1b-2 live-discovery evidence -----------------------------
@@ -1859,8 +1910,12 @@ def self_test():
         pause_attempts=2,
         pause_confirmed=1,
         pause_partial=1,
+        # Two exact bound contexts: one ordinary `dlopen` and the owned run's
+        # one pre-exec initial-set context. Each is counted once as a strategy
+        # and once in its own timing group, and the initial-set one also states
+        # its capture outcome — the cardinality a real aggregate always obeys.
         loader_discovery=loader_discovery_fixture(
-            strategies__debug_state_every_hit=1,
+            strategies__debug_state_every_hit=2,
             dlopen_timing__unproven=1,
             initial_set_timing__unproven=1,
             initial_set_capture__none=1,
@@ -1938,6 +1993,21 @@ def self_test():
         lambda d: d["evidence"].update(attach_gap_ms=-1),
         # The run-only field never appears in an ordinary capture.
         lambda d: d["evidence"].update(child_still_running=False),
+        # Aggregate cardinalities: the strategy, timing, and initial-set groups
+        # are one partition of the same exact bound-context set, so a count that
+        # appears in one group and in no other is a fabricated context.
+        lambda d: d["evidence"]["loader_discovery"]["strategies"].update(unavailable=1),
+        lambda d: d["evidence"]["loader_discovery"]["dlopen_timing"].update(none=1),
+        lambda d: d["evidence"]["loader_discovery"]["initial_set_capture"].update(none=2),
+        # An owned run owns one child, so it has one initial-set context.
+        lambda d: d["evidence"]["loader_discovery"].update(
+            strategies={"debug_state_every_hit": 3, "dlopen_return": 0, "unavailable": 0},
+            initial_set_timing={
+                "qualified_pre_constructor": 0, "known_pre_relocation": 0,
+                "unproven": 2, "none": 0,
+            },
+            initial_set_capture={"eligible": 0, "none": 2},
+        ),
     ):
         bad = copy.deepcopy(live)
         mutate(bad)
@@ -1981,6 +2051,13 @@ def self_test():
         lambda d: d["functions"][0].update(module_ambiguous=True),
         lambda d: d["functions"][0].update(module_unresolved="yes"),
         lambda d: d["functions"][0].pop("module_unresolved"),
+        # The row that publishes the owner relation publishes nothing else from
+        # the loader/pause namespace: no internal owner key, process identity,
+        # or loader identity beside the finite boolean.
+        lambda d: d["functions"][0].update(loader_context=3),
+        lambda d: d["functions"][0].update(owner_pid=4242),
+        lambda d: d["functions"][0].update(pause_tasks=[4242, 4243]),
+        lambda d: d["functions"][0]["module"].update(loader_path="/lib/ld.so"),
     ):
         bad = copy.deepcopy(ownership)
         mutate(bad)

@@ -1875,6 +1875,7 @@ document = json.load(open(sys.argv[1]))
 checker.exact_live_discovery_evidence(document["evidence"])
 checker.exact_module_ownership(document)
 checker.exact_active_to_empty(document)
+checker.exact_capture_modules(document)
 print("accepted")
 "#;
     let accepted = std::process::Command::new("python3")
@@ -1905,6 +1906,29 @@ print("accepted")
     assert!(
         !rejected.status.success(),
         "the checker accepted a document with no loader_discovery"
+    );
+
+    // The unowned row is accepted because it states its reason, not because the
+    // checker stopped looking: the same row with no reason must be rejected.
+    let mut reasonless = document.clone();
+    reasonless["functions"][1]
+        .as_object_mut()
+        .unwrap()
+        .insert("module_unresolved".into(), serde_json::Value::Bool(false));
+    let reasonless_path = dir.join("reasonless.json");
+    fs::write(
+        &reasonless_path,
+        serde_json::to_vec_pretty(&reasonless).unwrap(),
+    )
+    .unwrap();
+    let rejected = std::process::Command::new("python3")
+        .args(["-c", driver])
+        .arg(&reasonless_path)
+        .output()
+        .expect("running python3");
+    assert!(
+        !rejected.status.success(),
+        "the checker accepted an unattributed slot with no stated reason"
     );
 }
 

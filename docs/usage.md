@@ -116,17 +116,19 @@ sudo p11scope profile --pid 12345 --duration 60 -o observed-profile.json
 sudo p11scope trace --cgroup /sys/fs/cgroup/... --duration 15
 ```
 
-### Once-at-attach limit and optional offline discovery
+### Discovery timing and optional offline discovery
 
-The memory scan runs once, while the attach plan is built. A provider
-`dlopen`ed after capture starts is therefore missed. If a suitable manifest was
-prepared while the same provider identity was available, pass it with
-`--manifest`; it is explicit operator attestation of exact accepted
+The memory scan builds the initial attach plan. Acquiring a provider `dlopen`ed
+after capture starts is implemented internally but is **not a supported
+capability in this tree**: its runtime and CI evidence are still outstanding, so
+plan a capture as though a provider loaded later may be missed. If a suitable
+manifest was prepared while the same provider identity was available, pass it
+with `--manifest`; it is explicit operator attestation of exact accepted
 function-name/offset claims, hash-matched against the pinned file, and
 corroborated when the provider is already mapped. Scan-only discovery is
 semantics-unverified and count-only, but aggregate counts/RVs/latency remain
-available. A helper run after the fact cannot repair a missed capture window.
-Without such a manifest, wait for Slice 1b-2 live acquisition.
+available. A helper run after the fact cannot repair a missed capture window,
+and `--manifest` remains the supported answer until that evidence lands.
 
 `p11scope-discover --module <provider.so> -o manifest.json` is that optional
 offline path. It executes provider code in its own unprivileged process; the

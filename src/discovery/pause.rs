@@ -3,8 +3,9 @@
 use crate::run::OwnedChild;
 use crate::{
     attach,
-    attach::Session,
-    discovery::engine::{DeferredDiscoveryItem, Engine, TerminalBatch},
+    discovery::engine::{
+        DeferredDiscoveryItem, Engine, EngineSession, IncompleteTerminalDrain, TerminalBatch,
+    },
 };
 use p11scope_ebpf_common::{
     COALESCED_NO_HELPER_RC, DISCOVERY_STATUS_COALESCED_NO_HELPER, DiscoveryRecord, PAUSE_ARMED,
@@ -1290,7 +1291,7 @@ impl PauseCoordinator {
 /// one service call; it never exposes Aya handles or creates a second scanner.
 pub(crate) struct SessionPauseIo<'a> {
     engine: &'a mut Engine,
-    session: &'a mut Session,
+    session: &'a mut dyn EngineSession,
     child: &'a OwnedChild,
     marker_seen: &'a dyn Fn() -> Result<bool, String>,
     cancelled: &'a dyn Fn() -> Result<bool, String>,
@@ -1302,7 +1303,7 @@ pub(crate) struct SessionPauseIo<'a> {
 impl<'a> SessionPauseIo<'a> {
     pub(crate) fn new(
         engine: &'a mut Engine,
-        session: &'a mut Session,
+        session: &'a mut dyn EngineSession,
         child: &'a OwnedChild,
         marker_seen: &'a dyn Fn() -> Result<bool, String>,
         cancelled: &'a dyn Fn() -> Result<bool, String>,
@@ -1377,7 +1378,7 @@ impl PauseIo for SessionPauseIo<'_> {
     ) -> Result<PauseBatchOutcome, String> {
         let child = self.child;
         let stop_candidate_seen = &mut self.stop_candidate_seen;
-        let mut collect = |session: &mut Session| {
+        let mut collect = |session: &mut dyn EngineSession| {
             collect_timed_retirement(session, child, deadline, stop_candidate_seen, pause_owned)
         };
         let terminal_dispatch = terminal_batch.is_some();
@@ -1392,17 +1393,35 @@ impl PauseIo for SessionPauseIo<'_> {
             ));
         }
         let records = terminal_dispatch.then(Vec::new).unwrap_or(records);
-        let outcome = self
-            .engine
-            .apply_discovery_batch_with(
-                self.session,
-                records,
-                std::mem::take(&mut self.malformed),
-                additions_allowed,
-                terminal_dispatch,
-                &mut collect,
-            )
-            .map_err(|error| format!("discovery batch application failed: {error:#}"))?;
+        let outcome = match self.engine.apply_discovery_batch_with(
+            self.session,
+            records,
+            std::mem::take(&mut self.malformed),
+            additions_allowed,
+            terminal_dispatch,
+            &mut collect,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let error = match error.downcast::<DeferredDiscoveryItem>() {
+                    Ok(mut deferred) => {
+                        *terminal_batch = deferred.terminal_batch.take();
+                        return Err(format!("discovery batch application failed: {deferred:#}"));
+                    }
+                    Err(error) => error,
+                };
+                if terminal_dispatch {
+                    *terminal_batch = Some(
+                        self.engine
+                            .take_terminal_batch_for_deferred()
+                            .map_err(|error| {
+                                format!("terminal discovery batch restore failed: {error:#}")
+                            })?,
+                    );
+                }
+                return Err(format!("discovery batch application failed: {error:#}"));
+            }
+        };
         self.plan_changed |= outcome.changed;
         Ok(PauseBatchOutcome {
             required_complete: outcome.required_complete,
@@ -1415,7 +1434,7 @@ impl PauseIo for SessionPauseIo<'_> {
     ) -> Result<PauseRevalidationOutcome, String> {
         let child = self.child;
         let stop_candidate_seen = &mut self.stop_candidate_seen;
-        let mut collect = |session: &mut Session| {
+        let mut collect = |session: &mut dyn EngineSession| {
             collect_timed_retirement(session, child, None, stop_candidate_seen, pause_owned)
         };
         let outcome =
@@ -1481,7 +1500,7 @@ impl PauseIo for SessionPauseIo<'_> {
 }
 
 fn collect_timed_retirement(
-    session: &mut Session,
+    session: &mut dyn EngineSession,
     child: &OwnedChild,
     deadline: Option<u64>,
     stop_candidate_seen: &mut bool,
@@ -1510,13 +1529,26 @@ fn collect_timed_retirement_with(
     let mut records = Vec::new();
     let mut malformed = 0u64;
     loop {
-        let before_ns = now_ns()?;
+        let before_ns = match now_ns() {
+            Ok(now) => now,
+            Err(error) => {
+                return Err(IncompleteTerminalDrain::new(records, malformed, error).into());
+            }
+        };
         if deadline.is_some_and(|deadline| before_ns > deadline) {
-            return Err(anyhow::anyhow!(
-                "deadline crossed before nested discovery dequeue"
-            ));
+            return Err(IncompleteTerminalDrain::new(
+                records,
+                malformed,
+                anyhow::anyhow!("deadline crossed before nested discovery dequeue"),
+            )
+            .into());
         }
-        let item = dequeue()?;
+        let item = match dequeue() {
+            Ok(item) => item,
+            Err(error) => {
+                return Err(IncompleteTerminalDrain::new(records, malformed, error).into());
+            }
+        };
         if let Some(DiscoveryItem::Record(record)) = item.as_ref()
             && pause_owned
             && exact_pid(record) == child_pid
@@ -1524,17 +1556,42 @@ fn collect_timed_retirement_with(
         {
             *stop_candidate_seen = true;
         }
-        let after_ns = now_ns()?;
+        let after_ns = match now_ns() {
+            Ok(now) => now,
+            Err(error) => {
+                match item {
+                    Some(DiscoveryItem::Record(record)) => records.push(record),
+                    Some(DiscoveryItem::Malformed) => malformed = malformed.saturating_add(1),
+                    None => {}
+                }
+                return Err(IncompleteTerminalDrain::new(records, malformed, error).into());
+            }
+        };
         if deadline.is_some_and(|deadline| after_ns > deadline) {
-            return Err(anyhow::anyhow!(
-                "deadline crossed after nested discovery dequeue"
-            ));
+            match item {
+                Some(DiscoveryItem::Record(record)) => records.push(record),
+                Some(DiscoveryItem::Malformed) => malformed = malformed.saturating_add(1),
+                None => {}
+            }
+            return Err(IncompleteTerminalDrain::new(
+                records,
+                malformed,
+                anyhow::anyhow!("deadline crossed after nested discovery dequeue"),
+            )
+            .into());
         }
         let Some(item) = item else { break };
         if !same_generation() {
-            return Err(anyhow::anyhow!(
-                "owned child generation changed after nested discovery decode"
-            ));
+            match item {
+                DiscoveryItem::Record(record) => records.push(record),
+                DiscoveryItem::Malformed => malformed = malformed.saturating_add(1),
+            }
+            return Err(IncompleteTerminalDrain::new(
+                records,
+                malformed,
+                anyhow::anyhow!("owned child generation changed after nested discovery decode"),
+            )
+            .into());
         }
         if pause_owned && deadline.is_none() {
             return Err(DeferredDiscoveryItem {
@@ -1551,6 +1608,9 @@ fn collect_timed_retirement_with(
                 return Ok((records, malformed));
             }
             DiscoveryItem::Record(record) => {
+                // The record already left the ring, so it belongs to the
+                // retained prefix before any validation may reject it.
+                records.push(record);
                 if let Some(deadline) = deadline {
                     let received = TimedItem {
                         before_ns,
@@ -1558,18 +1618,26 @@ fn collect_timed_retirement_with(
                         item: DiscoveryItem::Record(record),
                         terminal_batch: None,
                     };
-                    validate_received(&received, record.hook_ts_ns, deadline)
-                        .map_err(anyhow::Error::msg)?;
+                    if let Err(error) = validate_received(&received, record.hook_ts_ns, deadline) {
+                        return Err(IncompleteTerminalDrain::new(
+                            records,
+                            malformed,
+                            anyhow::Error::msg(error),
+                        )
+                        .into());
+                    }
                     if exact_pid(&record) != child_pid
                         || record.send_signal_rc != COALESCED_NO_HELPER_RC
                         || record.status_flags & DISCOVERY_STATUS_COALESCED_NO_HELPER == 0
                     {
-                        return Err(anyhow::anyhow!(
-                            "duplicate or unaccounted nested pause record"
-                        ));
+                        return Err(IncompleteTerminalDrain::new(
+                            records,
+                            malformed,
+                            anyhow::anyhow!("duplicate or unaccounted nested pause record"),
+                        )
+                        .into());
                     }
                 }
-                records.push(record);
             }
         }
     }
@@ -1641,10 +1709,15 @@ fn validate_received(received: &TimedItem, record_ns: u64, deadline: u64) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attach::DynamicExportIdentity;
     use crate::discovery::engine::TerminalAuthority;
+    use crate::discovery::engine::session_fixture::ScriptedSession;
+    use crate::discovery::hooks::HookAbi;
+    use crate::discovery::identity::PinnedObjectId;
+    use crate::discovery::loader::LoaderContextId;
     use p11scope_ebpf_common::{
-        COALESCED_NO_HELPER_RC, DISCOVERY_KIND_EXEC, DISCOVERY_STATUS_COALESCED_NO_HELPER,
-        DiscoveryRecord, PAUSE_ARMED, PAUSE_REQUESTED,
+        COALESCED_NO_HELPER_RC, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_LOADER,
+        DISCOVERY_STATUS_COALESCED_NO_HELPER, DiscoveryRecord, PAUSE_ARMED, PAUSE_REQUESTED,
     };
     use std::collections::{BTreeMap, VecDeque};
 
@@ -2656,6 +2729,224 @@ mod tests {
         );
     }
 
+    fn terminal_export() -> DynamicExportIdentity {
+        DynamicExportIdentity {
+            object: PinnedObjectId(7),
+            file_offset: 0x10,
+            cookie: 1,
+            abi: HookAbi::FunctionList,
+        }
+    }
+
+    fn loader_record_for(context: LoaderContextId, pid: u32) -> DiscoveryRecord {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_LOADER;
+        record.case_id = (context.get() - 1) as u8;
+        record.pid_tgid = u64::from(pid) << 32;
+        record
+    }
+
+    fn queued(context: LoaderContextId, pid: u32) -> Result<Option<DiscoveryItem>, anyhow::Error> {
+        Ok(Some(DiscoveryItem::Record(loader_record_for(context, pid))))
+    }
+
+    /// One turn of the real production adapter over the real Engine.
+    fn with_session_io<T>(
+        engine: &mut Engine,
+        session: &mut ScriptedSession,
+        child: &OwnedChild,
+        body: impl FnOnce(&mut SessionPauseIo<'_>) -> T,
+    ) -> T {
+        let marker = || -> Result<bool, String> { Ok(false) };
+        let cancelled = || -> Result<bool, String> { Ok(false) };
+        let mut io = SessionPauseIo::new(engine, session, child, &marker, &cancelled);
+        body(&mut io)
+    }
+
+    /// The real `SessionPauseIo` collector loses the ring mid-drain. Every
+    /// record it already removed stays with the tombstoned authority, and the
+    /// next adapter turn finishes and dispatches that exact batch once.
+    #[test]
+    fn an_incomplete_real_drain_retains_its_prefix_and_is_continued_through_the_adapter() {
+        let child = OwnedChild::spawn("/bin/true".into(), Vec::new()).unwrap();
+        let (mut engine, owner) = Engine::retiring_loader_context(child.pid());
+        let unrelated = LoaderContextId::from_case_id(9);
+        let mut session = ScriptedSession::with_records([], 16);
+        session.detach_exports = vec![terminal_export()];
+        session.dequeues.extend([
+            queued(owner, child.pid()),
+            Err(anyhow::anyhow!("scripted ring read failed")),
+        ]);
+
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut None)
+                .expect("a failed terminal drain is loss, never a batch error")
+        });
+
+        let batch = engine
+            .terminal_batch_for_test()
+            .expect("the exact prefix stays with its authority");
+        assert_eq!(
+            batch.record_count(),
+            1,
+            "a record already off the ring stays in the retained prefix"
+        );
+        assert!(!batch.complete());
+        assert_eq!(batch.tagged_owners(), [Some(owner)]);
+        assert_eq!(batch.authority.owner, owner);
+        assert_eq!(batch.authority.exports, [terminal_export()]);
+        assert_eq!(engine.dispatched_loader_records(), 0);
+        assert_eq!(
+            engine.loader_context_state_for_test(owner),
+            Some("tombstoned")
+        );
+
+        session.dequeues.push_back(queued(unrelated, child.pid()));
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut None)
+                .expect("the continued drain completes")
+        });
+
+        assert_eq!(
+            engine.dispatched_loader_records(),
+            2,
+            "the continuation dispatched the whole batch exactly once"
+        );
+        assert!(engine.terminal_batch_for_test().is_none());
+        assert_eq!(engine.terminal_journal_for_test(), None);
+        assert_eq!(engine.loader_context_state_for_test(owner), None);
+    }
+
+    /// The coordinator/adapter round trip: a real counter failure hands the
+    /// exact owner, export snapshot and tagged records back to the coordinator,
+    /// and the one retry installs and dispatches that batch exactly once.
+    #[test]
+    fn the_coordinator_round_trips_the_exact_terminal_owner_and_exports() {
+        let child = OwnedChild::spawn("/bin/true".into(), Vec::new()).unwrap();
+        let (mut engine, owner) = Engine::retiring_loader_context(child.pid());
+        let unrelated = LoaderContextId::from_case_id(9);
+        let mut session = ScriptedSession::with_records([], 16);
+        session.detach_exports = vec![terminal_export()];
+        session.dequeues.extend([
+            queued(unrelated, child.pid()),
+            Err(anyhow::anyhow!("scripted ring read failed")),
+        ]);
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut None)
+                .expect("a failed terminal drain is loss, never a batch error")
+        });
+        let carried = engine
+            .take_terminal_batch_for_deferred()
+            .expect("a deferral hands the exact batch to the coordinator");
+        let mut coordinator = PauseCoordinator::for_test(
+            PausePolicy::Never,
+            child.pid(),
+            child.generation().get(),
+            stopped(),
+        );
+
+        session.fail_counter_reads([true]);
+        let error = with_session_io(&mut engine, &mut session, &child, |io| {
+            coordinator
+                .service_received(
+                    io,
+                    TimedItem {
+                        before_ns: 1,
+                        after_ns: 2,
+                        item: DiscoveryItem::Record(loader_record_for(owner, child.pid())),
+                        terminal_batch: Some(carried),
+                    },
+                )
+                .unwrap_err()
+        });
+
+        assert!(
+            error
+                .to_string()
+                .contains("discovery batch application failed"),
+            "{error}"
+        );
+        let retained = coordinator
+            .terminal_batch
+            .as_ref()
+            .expect("the coordinator keeps the exact batch for its one retry");
+        assert_eq!(retained.authority.owner, owner);
+        assert_eq!(retained.authority.exports, [terminal_export()]);
+        assert_eq!(
+            retained.tagged_owners(),
+            [None, Some(owner)],
+            "only the owned record carries terminal authority"
+        );
+        assert!(retained.complete());
+        assert_eq!(engine.dispatched_loader_records(), 0);
+        assert_eq!(
+            engine.loader_context_state_for_test(owner),
+            Some("tombstoned")
+        );
+
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            coordinator
+                .service_received(
+                    io,
+                    TimedItem {
+                        before_ns: 3,
+                        after_ns: 4,
+                        item: DiscoveryItem::Record(loader_record_for(unrelated, child.pid())),
+                        terminal_batch: None,
+                    },
+                )
+                .expect("the retry applies the restored batch")
+        });
+
+        assert!(coordinator.terminal_batch.is_none());
+        assert_eq!(
+            engine.dispatched_loader_records(),
+            3,
+            "install, take and restore dispatch the whole batch exactly once"
+        );
+        assert!(engine.terminal_batch_for_test().is_none());
+        assert_eq!(engine.terminal_journal_for_test(), None);
+        assert_eq!(engine.loader_context_state_for_test(owner), None);
+    }
+
+    /// The real `revalidate_after_release` collector runs deadline-less and
+    /// unowned: it retains its records instead of raising a pause deferral no
+    /// pause owner could classify.
+    #[test]
+    fn ordinary_revalidation_through_the_real_adapter_never_defers() {
+        let child = OwnedChild::spawn("/bin/true".into(), Vec::new()).unwrap();
+        let (mut engine, owner) = Engine::retiring_loader_context(child.pid());
+        let mut session = ScriptedSession::with_records([], 16);
+        session.detach_exports = vec![terminal_export()];
+        session.dequeues.extend([
+            queued(owner, child.pid()),
+            Err(anyhow::anyhow!("scripted ring read failed")),
+            Err(anyhow::anyhow!("scripted ring read failed again")),
+        ]);
+        let mut coordinator = PauseCoordinator::for_test(
+            PausePolicy::Never,
+            child.pid(),
+            child.generation().get(),
+            stopped(),
+        );
+
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            coordinator
+                .revalidate_after_release(io)
+                .expect("an ordinary revalidation never returns a pause deferral")
+        });
+
+        let batch = engine
+            .terminal_batch_for_test()
+            .expect("the ordinary collector kept its record");
+        assert_eq!(batch.record_count(), 1);
+        assert_eq!(batch.tagged_owners(), [Some(owner)]);
+        assert!(!batch.complete());
+        assert_eq!(engine.dispatched_loader_records(), 0);
+        assert_eq!(coordinator.counters(), PauseCounters::default());
+        assert!(!coordinator.is_armed());
+    }
+
     #[test]
     fn ordinary_revalidation_rejects_a_pause_owned_deferral() {
         let mut io = FakeIo {
@@ -2742,6 +3033,97 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(malformed, 0);
         assert!(!stop_candidate_seen);
+    }
+
+    #[test]
+    fn terminal_collection_reports_the_dequeued_prefix_on_post_dequeue_failure() {
+        let mut clocks = VecDeque::from([Ok(1), Err(anyhow::anyhow!("post-clock"))]);
+        let mut items = VecDeque::from([Ok(Some(DiscoveryItem::Record(record(10, 0, false))))]);
+        let mut stop_candidate_seen = false;
+
+        let error = match collect_timed_retirement_with(
+            41,
+            Some(100),
+            &mut stop_candidate_seen,
+            true,
+            || clocks.pop_front().expect("clock for queued record"),
+            || items.pop_front().expect("queued record"),
+            || true,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("post-dequeue clock failure must retain the collected prefix"),
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("1 terminal record retained for retry"),
+            "{error:#}"
+        );
+        let retained = error.downcast::<IncompleteTerminalDrain>().unwrap();
+        assert_eq!(retained.records.len(), 1);
+        assert_eq!(retained.records[0].hook_ts_ns, 10);
+        assert_eq!(retained.malformed, 0);
+    }
+
+    /// Every post-dequeue terminal failure owns the item it already removed
+    /// from the ring: generation loss, record-timing validation, and the
+    /// duplicate/unaccounted check must all report it in the retained prefix.
+    #[test]
+    fn every_post_dequeue_terminal_failure_retains_the_current_item() {
+        let retained_by =
+            |deadline: Option<u64>, item: DiscoveryItem, record_ns: u64, same_generation: bool| {
+                let mut clocks = VecDeque::from([Ok(1), Ok(2)]);
+                let mut items = VecDeque::from([Ok(Some(item))]);
+                let mut stop_candidate_seen = false;
+                let error = match collect_timed_retirement_with(
+                    41,
+                    deadline,
+                    &mut stop_candidate_seen,
+                    true,
+                    || clocks.pop_front().expect("clock for queued record"),
+                    || items.pop_front().expect("queued record"),
+                    || same_generation,
+                ) {
+                    Err(error) => error,
+                    Ok(_) => panic!("a post-dequeue terminal failure must retain the prefix"),
+                };
+                let _ = record_ns;
+                error
+                    .downcast::<IncompleteTerminalDrain>()
+                    .expect("the terminal route reports an incomplete drain")
+            };
+
+        let generation = retained_by(None, DiscoveryItem::Record(record(1, 0, false)), 1, false);
+        assert_eq!(generation.records.len(), 1);
+        assert_eq!(generation.records[0].hook_ts_ns, 1);
+        assert_eq!(generation.malformed, 0);
+
+        let malformed_generation = retained_by(None, DiscoveryItem::Malformed, 0, false);
+        assert!(malformed_generation.records.is_empty());
+        assert_eq!(malformed_generation.malformed, 1);
+
+        let timing = retained_by(
+            Some(100),
+            DiscoveryItem::Record(record(50, COALESCED_NO_HELPER_RC, true)),
+            50,
+            true,
+        );
+        assert_eq!(timing.records.len(), 1);
+        assert_eq!(timing.records[0].hook_ts_ns, 50);
+
+        let unaccounted = retained_by(
+            Some(100),
+            DiscoveryItem::Record(record(1, 0, false)),
+            1,
+            true,
+        );
+        assert_eq!(unaccounted.records.len(), 1);
+        assert_eq!(unaccounted.records[0].hook_ts_ns, 1);
+        assert!(
+            unaccounted.to_string().contains("duplicate or unaccounted"),
+            "{unaccounted:#}"
+        );
     }
 
     #[test]

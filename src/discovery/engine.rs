@@ -732,7 +732,205 @@ struct ScanInput {
 type InventoryScan = (ProcessViewId, Vec<ScannedModule>, PinnedObjects);
 type InventoryScanOutcome = (Vec<InventoryScan>, BTreeSet<u32>, Vec<Skipped>);
 type PendingViewRetirements = BTreeMap<ProcessViewId, RetirementCause>;
-type DiscoveryCollector<'a> = dyn FnMut(&mut Session) -> Result<(Vec<DiscoveryRecord>, u64)> + 'a;
+type DiscoveryCollector<'a> =
+    dyn FnMut(&mut dyn EngineSession) -> Result<(Vec<DiscoveryRecord>, u64)> + 'a;
+type SlotCompletion = (u32, Option<u64>);
+type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
+type ReplacementAttachResult = (Vec<SlotCompletion>, bool);
+
+/// Exactly the `Session` surface the discovery/pause path already uses. It
+/// exists so the Engine/coordinator lifecycle can be driven without loading a
+/// BPF object; `Session` is the only production implementation and every method
+/// is a plain delegation to the existing inherent one.
+pub(crate) trait EngineSession {
+    fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>>;
+    fn counter_snapshot(&self) -> Result<CounterSnapshot>;
+    fn detach_failures(&self) -> &[String];
+    fn preflight_targets(&self, targets: &[plan::Slot], objects: &PinnedObjects) -> Result<()>;
+    fn attach_targets(
+        &mut self,
+        targets: &[plan::Slot],
+        objects: &PinnedObjects,
+    ) -> Result<TargetAttachResult>;
+    fn replace_targets(
+        &mut self,
+        plan: &mut plan::AttachPlan,
+        replace: &[plan::Slot],
+        objects: &PinnedObjects,
+    ) -> Result<ReplacementAttachResult>;
+    fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<()>;
+    fn has_dynamic_export(
+        &self,
+        context: LoaderContextId,
+        target: (PinnedObjectId, u64),
+        cookie: u64,
+        abi: HookAbi,
+    ) -> bool;
+    fn attach_dynamic_export(
+        &mut self,
+        context: LoaderContextId,
+        pid: u32,
+        target: (PinnedObjectId, u64),
+        cookie: u64,
+        abi: HookAbi,
+        objects: &PinnedObjects,
+    ) -> Result<(bool, Option<u64>)>;
+    fn attach_dynamic_loader(
+        &mut self,
+        context: LoaderContextId,
+        pid: u32,
+        object: PinnedObjectId,
+        file_offset: u64,
+        cookie: u64,
+        objects: &PinnedObjects,
+    ) -> std::result::Result<bool, DynamicLoaderAttachFailure>;
+    fn detach_dynamic_context(
+        &mut self,
+        context: LoaderContextId,
+    ) -> (Vec<DynamicExportIdentity>, bool);
+    fn arm_pause(&mut self) -> Result<()>;
+    fn pause_state(&self) -> Result<Option<u64>>;
+    fn remove_pause(&mut self) -> Result<Option<u64>>;
+    fn detach_producers(&mut self) -> Result<()>;
+}
+
+impl EngineSession for Session {
+    fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>> {
+        Session::discovery_dequeue(self)
+    }
+
+    fn counter_snapshot(&self) -> Result<CounterSnapshot> {
+        Session::counter_snapshot(self)
+    }
+
+    fn detach_failures(&self) -> &[String] {
+        Session::detach_failures(self)
+    }
+
+    fn preflight_targets(&self, targets: &[plan::Slot], objects: &PinnedObjects) -> Result<()> {
+        Session::preflight_targets(self, targets, objects)
+    }
+
+    fn attach_targets(
+        &mut self,
+        targets: &[plan::Slot],
+        objects: &PinnedObjects,
+    ) -> Result<TargetAttachResult> {
+        Session::attach_targets(self, targets, objects)
+    }
+
+    fn replace_targets(
+        &mut self,
+        plan: &mut plan::AttachPlan,
+        replace: &[plan::Slot],
+        objects: &PinnedObjects,
+    ) -> Result<ReplacementAttachResult> {
+        Session::replace_targets(self, plan, replace, objects)
+    }
+
+    fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<()> {
+        Session::detach_slots(self, slots)
+    }
+
+    fn has_dynamic_export(
+        &self,
+        context: LoaderContextId,
+        target: (PinnedObjectId, u64),
+        cookie: u64,
+        abi: HookAbi,
+    ) -> bool {
+        Session::has_dynamic_export(self, context, target, cookie, abi)
+    }
+
+    fn attach_dynamic_export(
+        &mut self,
+        context: LoaderContextId,
+        pid: u32,
+        target: (PinnedObjectId, u64),
+        cookie: u64,
+        abi: HookAbi,
+        objects: &PinnedObjects,
+    ) -> Result<(bool, Option<u64>)> {
+        Session::attach_dynamic_export(self, context, pid, target, cookie, abi, objects)
+    }
+
+    fn attach_dynamic_loader(
+        &mut self,
+        context: LoaderContextId,
+        pid: u32,
+        object: PinnedObjectId,
+        file_offset: u64,
+        cookie: u64,
+        objects: &PinnedObjects,
+    ) -> std::result::Result<bool, DynamicLoaderAttachFailure> {
+        Session::attach_dynamic_loader(self, context, pid, object, file_offset, cookie, objects)
+    }
+
+    fn detach_dynamic_context(
+        &mut self,
+        context: LoaderContextId,
+    ) -> (Vec<DynamicExportIdentity>, bool) {
+        Session::detach_dynamic_context(self, context)
+    }
+
+    fn arm_pause(&mut self) -> Result<()> {
+        Session::arm_pause(self)
+    }
+
+    fn pause_state(&self) -> Result<Option<u64>> {
+        Session::pause_state(self)
+    }
+
+    fn remove_pause(&mut self) -> Result<Option<u64>> {
+        Session::remove_pause(self)
+    }
+
+    fn detach_producers(&mut self) -> Result<()> {
+        Session::detach_producers(self)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct IncompleteTerminalDrain {
+    pub(crate) records: Vec<DiscoveryRecord>,
+    pub(crate) malformed: u64,
+    cause: String,
+}
+
+impl IncompleteTerminalDrain {
+    pub(crate) fn new(records: Vec<DiscoveryRecord>, malformed: u64, cause: anyhow::Error) -> Self {
+        Self {
+            records,
+            malformed,
+            cause: cause.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Debug for IncompleteTerminalDrain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IncompleteTerminalDrain")
+            .field("records", &self.records.len())
+            .field("malformed", &self.malformed)
+            .field("cause", &self.cause)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for IncompleteTerminalDrain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}; {} terminal record{} retained for retry",
+            self.cause,
+            self.records.len(),
+            if self.records.len() == 1 { "" } else { "s" },
+        )
+    }
+}
+
+impl std::error::Error for IncompleteTerminalDrain {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetirementCause {
@@ -804,9 +1002,27 @@ struct StartPublicationSnapshot {
     views: BTreeSet<ProcessViewId>,
 }
 
+/// What one `apply_candidate` actually did. `committed` used to conflate all
+/// three, so a preflight refusal and a conservative post-mutation retirement
+/// both spoke with an accepted candidate's authority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ApplyDisposition {
+    /// Nothing was mutated: canonical identity, plan, and links are unchanged,
+    /// and every retry intent the candidate would have consumed is retained.
+    #[default]
+    Refused,
+    /// Links were mutated and the Engine kept a cleaned, conservatively retired
+    /// state. It consumed its retry intent but owns no positive follow-up.
+    ConservativeRetirement,
+    /// The candidate became the Engine's exact current state. Only this may
+    /// authorize positive provider/history facts, pause completeness, dynamic
+    /// export work, and loader follow-up.
+    Accepted,
+}
+
 #[derive(Default)]
 struct ApplyOutcome {
-    committed: bool,
+    disposition: ApplyDisposition,
     changed: bool,
     stale_views: BTreeSet<ProcessViewId>,
     missing_contexts: Vec<LoaderContextId>,
@@ -909,8 +1125,16 @@ impl PauseClosure {
 }
 
 impl ApplyOutcome {
+    fn accepted(&self) -> bool {
+        self.disposition == ApplyDisposition::Accepted
+    }
+
+    fn refused(&self) -> bool {
+        self.disposition == ApplyDisposition::Refused
+    }
+
     fn required_complete(&self) -> bool {
-        self.committed
+        self.accepted()
             && self.stale_views.is_empty()
             && self.missing_contexts.is_empty()
             && self.static_failures.is_empty()
@@ -985,6 +1209,7 @@ pub(crate) struct TerminalAuthority {
 pub(crate) struct TerminalBatch {
     pub(crate) authority: TerminalAuthority,
     records: Vec<QueuedDiscoveryRecord>,
+    complete: bool,
 }
 
 impl TerminalBatch {
@@ -992,6 +1217,7 @@ impl TerminalBatch {
         Self {
             authority,
             records: Vec::new(),
+            complete: false,
         }
     }
 
@@ -1009,6 +1235,19 @@ impl TerminalBatch {
     #[cfg(test)]
     pub(crate) fn record_count(&self) -> usize {
         self.records.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete(&self) -> bool {
+        self.complete
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tagged_owners(&self) -> Vec<Option<LoaderContextId>> {
+        self.records
+            .iter()
+            .map(|queued| queued.terminal_owner)
+            .collect()
     }
 }
 
@@ -3602,24 +3841,6 @@ fn validate_loader_record_context<'a>(
     }
 }
 
-fn terminal_record_for(
-    terminal_owner: LoaderContextId,
-    terminal_exports: &[DynamicExportIdentity],
-    record: DiscoveryRecord,
-) -> QueuedDiscoveryRecord {
-    let owns_record = record.kind == DISCOVERY_KIND_LOADER
-        && LoaderContextId::from_case_id(record.case_id) == terminal_owner;
-    QueuedDiscoveryRecord {
-        record,
-        terminal_owner: owns_record.then_some(terminal_owner),
-        terminal_exports: if owns_record {
-            terminal_exports.to_vec()
-        } else {
-            Vec::new()
-        },
-    }
-}
-
 fn mapped_object(view: &ProcessView, mapping: &MapEntry, path: &Path) -> ScannedModule {
     ScannedModule {
         view: view.id(),
@@ -3763,7 +3984,9 @@ impl Engine {
         parse_maps(&bytes).map_err(anyhow::Error::msg)
     }
 
-    fn collect_discovery_records(session: &mut Session) -> Result<(Vec<DiscoveryRecord>, u64)> {
+    fn collect_discovery_records(
+        session: &mut dyn EngineSession,
+    ) -> Result<(Vec<DiscoveryRecord>, u64)> {
         let mut records = Vec::new();
         let mut malformed = 0u64;
         while let Some(item) = session.discovery_dequeue()? {
@@ -3850,7 +4073,10 @@ impl Engine {
         Ok(snapshot)
     }
 
-    fn restore_start_publication(&mut self, snapshot: StartPublicationSnapshot) -> Result<()> {
+    /// Puts back the publication the failed start attempt was built on. It has
+    /// to be infallible: a post-link fallible rebuild here would speak over the
+    /// original failure with an error about restoring from it.
+    fn restore_start_publication(&mut self, snapshot: StartPublicationSnapshot) {
         let retained_views: BTreeSet<_> = self.views.iter().map(ProcessView::id).collect();
         let removed_views: BTreeSet<_> = snapshot
             .views
@@ -3866,19 +4092,12 @@ impl Engine {
             .into_iter()
             .filter(|module| !removed_views.contains(&module.scanned.view))
             .collect();
-        let mut rebuilt = snapshot
-            .plan
-            .rebuild_from_sources(&modules, &self.manifests, &pinned);
-        self.capture_facts.bind_plan_module_ids(
-            &mut rebuilt,
-            &modules,
-            &self.manifests,
-            &pinned,
-        )?;
-        record_object_skips(&mut rebuilt, &self.counters.object_skips);
         let mut plan = snapshot.plan;
-        plan.extend_exact_with_stable_module_ids(rebuilt)
-            .map_err(anyhow::Error::msg)?;
+        // Normal active cleanup still applies: an endpoint whose exact pinned
+        // identity left with its process view stops accepting probes, and its
+        // already-accepted aggregate cell stays exactly as it was.
+        plan.retire_unpinned_targets(&pinned, plan.slots.len());
+        record_object_skips(&mut plan, &self.counters.object_skips);
 
         self.plan = plan;
         self.pinned = pinned;
@@ -3894,7 +4113,6 @@ impl Engine {
         } else {
             self.project_capture_facts();
         }
-        Ok(())
     }
 
     fn finish_start_capture_attempt<T>(
@@ -3910,8 +4128,7 @@ impl Engine {
             }
             Err(error) => {
                 self.capture_facts.rollback_stage();
-                self.restore_start_publication(snapshot)
-                    .with_context(|| format!("restoring capture state after: {error:#}"))?;
+                self.restore_start_publication(snapshot);
                 Err(error)
             }
         }
@@ -4068,7 +4285,7 @@ impl Engine {
 
     fn apply_candidate(
         &mut self,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         mut candidate: LiveCandidate,
         additions_allowed: &mut bool,
         preflighted: bool,
@@ -4128,6 +4345,10 @@ impl Engine {
             );
             return Ok(outcome);
         }
+        // The last fallible preparation this candidate needs. Past the first
+        // link mutation below there is no rollback and no early return, so
+        // identity, planner, and history work all has to be proven here.
+        self.preflight_candidate_publication(&candidate)?;
 
         let selected: Vec<_> = candidate
             .delta
@@ -4279,64 +4500,59 @@ impl Engine {
                 *additions_allowed = false;
             }
         }
+        self.finalize_candidate(
+            session,
+            candidate,
+            extra_views,
+            target_modules,
+            additions_allowed,
+            &mut outcome,
+        );
+        Ok(outcome)
+    }
+
+    /// Everything a candidate can fail at, proven before its first link
+    /// mutation. Post-mutation cleanup only ever drops sources, so a candidate
+    /// that passes here still publishes after a conservative retirement.
+    fn preflight_candidate_publication(&self, candidate: &LiveCandidate) -> Result<()> {
+        if !candidate_identity_is_complete(&candidate.plan, &candidate.modules, &candidate.pinned) {
+            bail!("live candidate lost exact pinned identity before link mutation");
+        }
+        // ponytail: proves the publication on a throwaway copy of the fact
+        // store, so the fallible surface is exact by construction rather than
+        // a second list that can drift. Swap for a dedicated preflight walk if
+        // the doubled history merge ever shows up in capture cost.
+        self.capture_facts.clone().merge_current(
+            &candidate.plan,
+            &candidate.pinned,
+            &candidate.modules,
+            &self.manifests,
+            &self.manifest_ordinals,
+            &self.counters,
+        )
+    }
+
+    /// The one complete finalization for a candidate whose links were already
+    /// mutated. It never short-circuits and never returns: a lost generation
+    /// downgrades the disposition and cleans up, it does not unwind.
+    fn finalize_candidate(
+        &mut self,
+        session: &mut dyn EngineSession,
+        mut candidate: LiveCandidate,
+        extra_views: &[&ProcessView],
+        target_modules: BTreeSet<PinnedTimingKey>,
+        additions_allowed: &mut bool,
+        outcome: &mut ApplyOutcome,
+    ) {
         outcome.stale_views = stale_process_views(&self.views, extra_views, &candidate.views);
-        if !outcome.stale_views.is_empty() {
+        let retired = !outcome.stale_views.is_empty();
+        if retired {
             *additions_allowed = false;
             outcome.static_failures.extend(target_modules);
-            let mut cleaned_pins = candidate.pinned.clone();
-            for view in &outcome.stale_views {
-                cleaned_pins.remove_view(*view);
-            }
-            let cleaned_modules: Vec<_> = candidate
-                .modules
-                .iter()
-                .filter(|module| !outcome.stale_views.contains(&module.scanned.view))
-                .cloned()
-                .collect();
-            let mut rebuilt = candidate.plan.rebuild_from_sources(
-                &cleaned_modules,
-                &self.manifests,
-                &cleaned_pins,
-            );
-            self.capture_facts.bind_plan_module_ids(
-                &mut rebuilt,
-                &cleaned_modules,
-                &self.manifests,
-                &cleaned_pins,
-            )?;
-            let cleanup = candidate
-                .plan
-                .extend_exact_with_stable_module_ids(rebuilt)
-                .map_err(anyhow::Error::msg)?;
-            let cleanup_slots: Vec<_> = cleanup
-                .retire
-                .iter()
-                .chain(&cleanup.replace)
-                .cloned()
-                .collect();
-            if session.detach_slots(&cleanup_slots).is_err() {
-                self.mark_partial(
-                    "live discovery detach",
-                    "generation loss cleanup had a one-shot detach failure",
-                );
-            }
-            for slot in &cleanup.replace {
-                candidate.plan.deactivate(slot.index);
-            }
-            commit_cleaned_candidate_identity(
-                &mut candidate,
-                cleaned_pins,
-                cleaned_modules,
-                &outcome.stale_views,
-            );
+            self.retire_stale_candidate_sources(session, &mut candidate, &outcome.stale_views);
             self.mark_partial(
                 "live discovery generation",
                 "a process generation changed after link mutation; its targets were retired before context cleanup",
-            );
-        }
-        if !candidate_identity_is_complete(&candidate.plan, &candidate.modules, &candidate.pinned) {
-            bail!(
-                "live candidate postcheck left an active module or slot without exact pinned identity"
             );
         }
         record_object_skips(&mut candidate.plan, &self.counters.object_skips);
@@ -4346,9 +4562,51 @@ impl Engine {
         self.plan = candidate.plan;
         self.counters.corroboration = candidate.corroboration;
         self.counters.manifest_fallbacks = candidate.manifest_fallbacks;
-        self.publish_current_capture_facts()?;
-        outcome.committed = true;
-        Ok(outcome)
+        outcome.disposition = if retired {
+            ApplyDisposition::ConservativeRetirement
+        } else {
+            ApplyDisposition::Accepted
+        };
+        if self.publish_current_capture_facts().is_err() {
+            // The preflight proved this for the whole candidate, so only the
+            // cleaned subset can still refuse. Keep the committed state and
+            // drop to conservative authority rather than unwinding.
+            outcome.disposition = ApplyDisposition::ConservativeRetirement;
+            self.mark_partial(
+                "live discovery evidence",
+                "the retired candidate's provider history could not be published",
+            );
+        }
+    }
+
+    /// Drops the pins, modules, proofs, and live endpoints a lost process
+    /// generation owned. Infallible on purpose: it runs after link mutation.
+    fn retire_stale_candidate_sources(
+        &mut self,
+        session: &mut dyn EngineSession,
+        candidate: &mut LiveCandidate,
+        stale_views: &BTreeSet<ProcessViewId>,
+    ) {
+        let mut cleaned_pins = candidate.pinned.clone();
+        for view in stale_views {
+            cleaned_pins.remove_view(*view);
+        }
+        let cleaned_modules: Vec<_> = candidate
+            .modules
+            .iter()
+            .filter(|module| !stale_views.contains(&module.scanned.view))
+            .cloned()
+            .collect();
+        let retired = candidate
+            .plan
+            .retire_unpinned_targets(&cleaned_pins, self.plan.slots.len());
+        if session.detach_slots(&retired).is_err() {
+            self.mark_partial(
+                "live discovery detach",
+                "generation loss cleanup had a one-shot detach failure",
+            );
+        }
+        commit_cleaned_candidate_identity(candidate, cleaned_pins, cleaned_modules, stale_views);
     }
 
     fn latch_candidate_ambiguity(&mut self, candidate: &plan::AttachPlan) -> bool {
@@ -4359,7 +4617,7 @@ impl Engine {
         true
     }
 
-    fn update_counter_snapshot(&mut self, session: &Session) -> Result<()> {
+    fn update_counter_snapshot(&mut self, session: &dyn EngineSession) -> Result<()> {
         let next = session.counter_snapshot()?;
         if !self.counter_snapshot.replace_with(next) {
             self.invalidate_causal_timing();
@@ -4398,7 +4656,7 @@ impl Engine {
     fn process_export_record(
         &mut self,
         record: &DiscoveryRecord,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
     ) -> Result<DiscoveryRecordOutcome> {
@@ -4465,7 +4723,7 @@ impl Engine {
     fn process_loader_record(
         &mut self,
         queued: QueuedDiscoveryRecord,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
     ) -> Result<DiscoveryRecordOutcome> {
@@ -4604,7 +4862,7 @@ impl Engine {
         self.queue_apply_outcome(&outcome, pending_views);
         let changed = outcome.changed;
         let mut required_complete = outcome.required_complete();
-        if terminal_owner.is_none() && outcome.committed && outcome.stale_views.is_empty() {
+        if terminal_owner.is_none() && outcome.accepted() {
             let (retire, dynamic_complete) = self.attach_export_work(
                 self.views[position].id(),
                 &dynamic_work,
@@ -4629,7 +4887,7 @@ impl Engine {
         context: LoaderContextId,
         modules: &[ScannedModule],
         candidate: &LiveCandidate,
-        session: &Session,
+        session: &dyn EngineSession,
         terminal: bool,
         terminal_exports: &[DynamicExportIdentity],
     ) -> Vec<DynamicExportWork> {
@@ -4697,7 +4955,7 @@ impl Engine {
         &mut self,
         view: ProcessViewId,
         work: &[DynamicExportWork],
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
     ) -> (bool, bool) {
         let Some(pid) = self
@@ -4785,7 +5043,7 @@ impl Engine {
     fn arm_loader_for_view(
         &mut self,
         position: usize,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
     ) -> std::result::Result<bool, LoaderArmFailure> {
@@ -4956,7 +5214,7 @@ impl Engine {
             .map_err(LoaderArmFailure::invariant)?;
         self.queue_apply_outcome(&outcome, pending_views);
         let changed = outcome.changed;
-        if !outcome.committed || !outcome.stale_views.is_empty() || !*additions_allowed {
+        if !outcome.accepted() || !*additions_allowed {
             return Ok(changed);
         }
         let context = self
@@ -5059,7 +5317,7 @@ impl Engine {
     fn arm_owned_loader_before_release(
         &mut self,
         child: &OwnedChild,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
     ) -> Result<OwnedLoaderPrearmOutcome> {
@@ -5153,7 +5411,7 @@ impl Engine {
         if !outcome.stale_views.is_empty() {
             bail!("the owned child generation changed before pre-exec loader attachment");
         }
-        if !outcome.committed || !*additions_allowed {
+        if !outcome.accepted() || !*additions_allowed {
             self.mark_partial(
                 "owned initial-set discovery",
                 "the exact PT_INTERP identity could not be committed before barrier release",
@@ -5253,7 +5511,7 @@ impl Engine {
         &mut self,
         context: LoaderContextId,
         registry_attached: bool,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         pending_views: &mut PendingViewRetirements,
         initiating_error: String,
     ) -> Result<OwnedLoaderPrearmOutcome> {
@@ -5269,29 +5527,34 @@ impl Engine {
             &mut errors,
             || Self::collect_discovery_records(session),
         );
-        if let Some((records, malformed)) = drained {
-            if malformed != 0 {
-                errors.push("malformed discovery record during pre-arm retirement".into());
-            }
-            self.record_malformed_discovery(malformed);
-            if let Err(error) = self.update_counter_snapshot(session) {
-                errors.push(format!("post-detach producer snapshot failed: {error:#}"));
-            }
-            let mut no_additions = false;
-            for record in records {
-                let queued = terminal_record_for(context, &terminal_exports, record);
-                if let Err(error) = self.dispatch_discovery_record(
-                    queued,
+        // This terminal cleanup uses the same authority batch and one-retry
+        // predispatch journal as every other terminal detach route; it never
+        // dispatches after a failed post-detach counter snapshot.
+        match self.open_terminal_journal(context, terminal_exports) {
+            Ok(()) => {
+                if let Some((records, malformed)) = drained {
+                    if malformed != 0 {
+                        errors.push("malformed discovery record during pre-arm retirement".into());
+                    }
+                    self.retain_terminal_batch(records, true, malformed)?;
+                }
+                let mut no_additions = false;
+                let mut closure = PauseClosure::new(false);
+                if let Err(error) = self.dispatch_terminal_batch(
                     session,
                     &mut no_additions,
                     pending_views,
+                    &mut closure,
                 ) {
                     errors.push(format!("pre-arm retirement accounting failed: {error:#}"));
                 }
             }
-        }
-        if let Err(error) = self.loader_registry.remove(context) {
-            errors.push(error);
+            Err(error) => {
+                errors.push(error.to_string());
+                if let Err(error) = self.loader_registry.remove(context) {
+                    errors.push(error);
+                }
+            }
         }
         bail!(errors.join("; "))
     }
@@ -5299,7 +5562,7 @@ impl Engine {
     fn arm_loader_or_partial(
         &mut self,
         position: usize,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
     ) -> Result<bool> {
@@ -5351,13 +5614,27 @@ impl Engine {
         self.loader_registry
             .tombstone(owner)
             .map_err(anyhow::Error::msg)?;
+        self.open_terminal_journal(owner, exports)?;
+        Ok(drain())
+    }
+
+    /// Opens the single authority batch plus lifecycle journal for an
+    /// already-tombstoned owner. Every terminal detach route shares it.
+    fn open_terminal_journal(
+        &mut self,
+        owner: LoaderContextId,
+        exports: Vec<DynamicExportIdentity>,
+    ) -> Result<()> {
+        if self.terminal_journal.is_some() {
+            bail!("terminal loader drain authority is already pending");
+        }
         self.terminal_batch = Some(TerminalBatch::empty(TerminalAuthority { owner, exports }));
         self.terminal_journal = Some(TerminalJournal {
             owner,
             dispatch_started: false,
             retry_used: false,
         });
-        Ok(drain())
+        Ok(())
     }
 
     fn terminal_owner(&self) -> Option<LoaderContextId> {
@@ -5367,13 +5644,76 @@ impl Engine {
     fn retain_terminal_batch(
         &mut self,
         records: impl IntoIterator<Item = DiscoveryRecord>,
+        complete: bool,
+        malformed: u64,
     ) -> Result<()> {
         let batch = self
             .terminal_batch
             .as_mut()
             .ok_or_else(|| anyhow!("terminal loader drain batch is missing"))?;
         batch.extend(records);
+        batch.complete = complete;
+        if malformed != 0 {
+            self.record_malformed_discovery(malformed);
+        }
         Ok(())
+    }
+
+    fn collect_terminal_batch(
+        &mut self,
+        session: &mut dyn EngineSession,
+        collect: &mut DiscoveryCollector<'_>,
+    ) -> Result<Result<(), anyhow::Error>> {
+        match collect(session) {
+            Ok((records, malformed)) => {
+                self.retain_terminal_batch(records, true, malformed)?;
+                Ok(Ok(()))
+            }
+            Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
+                Ok(incomplete) => {
+                    self.retain_terminal_batch(
+                        incomplete.records.clone(),
+                        false,
+                        incomplete.malformed,
+                    )?;
+                    Ok(Err(incomplete.into()))
+                }
+                Err(error) => Ok(Err(error)),
+            },
+        }
+    }
+
+    fn retry_terminal_predispatch_failure(
+        &mut self,
+        additions_allowed: &mut bool,
+        closure: &mut PauseClosure,
+    ) {
+        let Some(journal) = self.terminal_journal.as_mut() else {
+            return;
+        };
+        if journal.dispatch_started {
+            return;
+        }
+        if !journal.retry_used {
+            journal.retry_used = true;
+            self.mark_live_loss(
+                "live discovery counters",
+                "the post-detach producer snapshot could not be read; the exact terminal batch remains queued",
+            );
+            return;
+        }
+        let owner = journal.owner;
+        journal.dispatch_started = true;
+        self.terminal_batch = None;
+        if self.loader_registry.remove(owner).is_ok() {
+            self.terminal_journal = None;
+        }
+        *additions_allowed = false;
+        closure.fail();
+        self.mark_live_loss(
+            "live discovery counters",
+            "the terminal batch exhausted its one predispatch retry and was cleaned without replay",
+        );
     }
 
     pub(crate) fn install_terminal_batch(
@@ -5391,11 +5731,12 @@ impl Engine {
             bail!("terminal loader drain batch cannot be restored");
         }
         batch.extend(records);
+        batch.complete = true;
         self.terminal_batch = Some(batch);
         Ok(())
     }
 
-    fn take_terminal_batch_for_deferred(&mut self) -> Result<TerminalBatch> {
+    pub(crate) fn take_terminal_batch_for_deferred(&mut self) -> Result<TerminalBatch> {
         self.terminal_batch
             .take()
             .ok_or_else(|| anyhow!("terminal loader drain batch is missing"))
@@ -5403,7 +5744,7 @@ impl Engine {
 
     fn dispatch_terminal_batch(
         &mut self,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
         closure: &mut PauseClosure,
@@ -5426,6 +5767,10 @@ impl Engine {
             self.terminal_journal = None;
             return Ok(Some(false));
         };
+        if !batch.complete {
+            self.terminal_batch = Some(batch);
+            return Ok(None);
+        }
         let journal = self
             .terminal_journal
             .as_ref()
@@ -5434,48 +5779,19 @@ impl Engine {
             bail!("terminal loader drain batch was already dispatched");
         }
         let owner = journal.owner;
-        let mut records = match begin_discovery_batch(
-            batch.records,
-            self.update_counter_snapshot(session),
-        ) {
-            Ok(records) => records,
-            Err((_, records)) => {
-                let retry_used = self
-                    .terminal_journal
-                    .as_ref()
-                    .expect("journal checked above")
-                    .retry_used;
-                if retry_used {
-                    self.terminal_journal
-                        .as_mut()
-                        .expect("journal checked above")
-                        .dispatch_started = true;
-                    if self.loader_registry.remove(owner).is_ok() {
-                        self.terminal_journal = None;
-                    }
-                    *additions_allowed = false;
-                    closure.fail();
-                    self.mark_live_loss(
-                        "live discovery counters",
-                        "the terminal batch exhausted its one predispatch retry and was cleaned without replay",
-                    );
+        let mut records =
+            match begin_discovery_batch(batch.records, self.update_counter_snapshot(session)) {
+                Ok(records) => records,
+                Err((_, records)) => {
+                    self.terminal_batch = Some(TerminalBatch {
+                        authority: batch.authority,
+                        records,
+                        complete: true,
+                    });
+                    self.retry_terminal_predispatch_failure(additions_allowed, closure);
                     return Ok(Some(false));
                 }
-                self.terminal_journal
-                    .as_mut()
-                    .expect("journal checked above")
-                    .retry_used = true;
-                self.terminal_batch = Some(TerminalBatch {
-                    authority: batch.authority,
-                    records,
-                });
-                self.mark_live_loss(
-                    "live discovery counters",
-                    "the post-detach producer snapshot could not be read; the exact terminal batch remains queued",
-                );
-                return Ok(None);
-            }
-        };
+            };
         self.terminal_journal
             .as_mut()
             .expect("journal checked above")
@@ -5511,33 +5827,78 @@ impl Engine {
         Ok(Some(changed))
     }
 
+    /// The one authority-specific continuation. It advances an incomplete
+    /// terminal batch by exactly one collection attempt, then hands the journal
+    /// to `dispatch_terminal_batch`, which either dispatches a complete
+    /// undispatched batch or, once dispatch has started, repeats nothing but
+    /// the registry removal. Generic records never reach it.
+    fn continue_terminal_batch(
+        &mut self,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+        collect: &mut DiscoveryCollector<'_>,
+        closure: &mut PauseClosure,
+    ) -> Result<Option<bool>> {
+        if self
+            .terminal_batch
+            .as_ref()
+            .is_some_and(|batch| !batch.complete)
+        {
+            match self.collect_terminal_batch(session, collect)? {
+                Ok(()) => {}
+                Err(error) if error.is::<DeferredDiscoveryItem>() => {
+                    let mut deferred = error.downcast::<DeferredDiscoveryItem>()?;
+                    deferred.terminal_batch = Some(self.take_terminal_batch_for_deferred()?);
+                    return Err(deferred.into());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.dispatch_terminal_batch(session, additions_allowed, pending_views, closure)
+    }
+
     fn retire_loader_contexts(
         &mut self,
         view: ProcessViewId,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
         collect: &mut DiscoveryCollector<'_>,
         closure: &mut PauseClosure,
     ) -> Result<(bool, bool)> {
         let mut changed = false;
+        // A pending journal owns this retirement pass: advance it once before
+        // any other context of this view is touched, and never start a second
+        // authority while it survives.
+        if self.terminal_journal.is_some() {
+            match self.continue_terminal_batch(
+                session,
+                additions_allowed,
+                pending_views,
+                collect,
+                closure,
+            ) {
+                Ok(terminal_changed) => changed |= terminal_changed.unwrap_or(false),
+                Err(error) if error.is::<IncompleteTerminalDrain>() => {
+                    closure.fail();
+                    self.mark_live_loss(
+                        "live loader retirement",
+                        "the post-detach private discovery drain failed; the exact terminal batch remains tombstoned for retry",
+                    );
+                    return Ok((changed, false));
+                }
+                Err(error) => return Err(error),
+            }
+            if self.terminal_journal.is_some() {
+                return Ok((changed, false));
+            }
+        }
         for context_id in self.loader_registry.ids_for_view(view) {
             let Some(context) = self.loader_registry.context(context_id).cloned() else {
                 continue;
             };
             if self.loader_registry.is_tombstoned(context_id) {
-                if self.terminal_owner() == Some(context_id) {
-                    match self.dispatch_terminal_batch(
-                        session,
-                        additions_allowed,
-                        pending_views,
-                        closure,
-                    )? {
-                        Some(terminal_changed) => changed |= terminal_changed,
-                        None => return Ok((changed, false)),
-                    }
-                    continue;
-                }
                 // A prior one-shot retirement reached its terminal state but
                 // could not remove the registry entry. Never detach it twice.
             } else if context.was_attached {
@@ -5558,8 +5919,7 @@ impl Engine {
                         if malformed != 0 {
                             closure.fail();
                         }
-                        self.record_malformed_discovery(malformed);
-                        self.retain_terminal_batch(owned)?;
+                        self.retain_terminal_batch(owned, true, malformed)?;
                         match self.dispatch_terminal_batch(
                             session,
                             additions_allowed,
@@ -5575,7 +5935,14 @@ impl Engine {
                         deferred.terminal_batch = Some(self.take_terminal_batch_for_deferred()?);
                         return Err(deferred.into());
                     }
-                    Ok(Err(_)) => {
+                    Ok(Err(error)) => {
+                        if let Ok(incomplete) = error.downcast::<IncompleteTerminalDrain>() {
+                            self.retain_terminal_batch(
+                                incomplete.records,
+                                false,
+                                incomplete.malformed,
+                            )?;
+                        }
                         closure.fail();
                         self.mark_live_loss(
                             "live loader retirement",
@@ -5693,12 +6060,14 @@ impl Engine {
         outcome: &ApplyOutcome,
         pending_views: &mut PendingViewRetirements,
     ) {
-        if outcome.committed {
-            self.pending_rejected_keys
-                .retain(|key| !outcome.newly_rejected_keys.contains(key));
-        } else {
+        // Both an accepted candidate and a conservative cleanup consumed the
+        // retry intent they were built from; only a refusal retains it.
+        if outcome.refused() {
             self.pending_rejected_keys
                 .extend(outcome.newly_rejected_keys.iter().copied());
+        } else {
+            self.pending_rejected_keys
+                .retain(|key| !outcome.newly_rejected_keys.contains(key));
         }
         for context_id in &outcome.missing_contexts {
             let Some(context) = self.loader_registry.context(*context_id) else {
@@ -5736,7 +6105,7 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
     ) -> bool {
         self.queue_apply_outcome(outcome, pending_views);
-        if outcome.committed {
+        if !outcome.refused() {
             self.pending_retirements
                 .retain(|view| !retirements.contains(view));
             self.pending_rejected_keys
@@ -5747,7 +6116,7 @@ impl Engine {
 
     fn replay_pending_conservative(
         &mut self,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
     ) -> ApplyOutcome {
@@ -5820,7 +6189,7 @@ impl Engine {
     fn dispatch_discovery_record(
         &mut self,
         queued: QueuedDiscoveryRecord,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
     ) -> Result<DiscoveryRecordOutcome> {
@@ -5852,7 +6221,7 @@ impl Engine {
 
     fn process_discovery_records(
         &mut self,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         records: &mut Vec<QueuedDiscoveryRecord>,
         pending_views: &mut PendingViewRetirements,
         additions_allowed: &mut bool,
@@ -5903,7 +6272,7 @@ impl Engine {
                     self.replay_pending_conservative(session, additions_allowed, pending_views);
                 closure.observe_apply(&outcome);
                 changed |= outcome.changed;
-                if !outcome.committed && pending_views.is_empty() {
+                if outcome.refused() && pending_views.is_empty() {
                     break;
                 }
             }
@@ -6060,7 +6429,7 @@ impl Engine {
 
     fn inventory_candidate_admission(
         &self,
-        session: &Session,
+        session: &dyn EngineSession,
         candidate: &LiveCandidate,
         removed: &BTreeSet<ProcessViewId>,
         new_views: &[(ProcessView, Vec<ScannedModule>, PinnedObjects)],
@@ -6096,7 +6465,7 @@ impl Engine {
 
     fn refresh_inventory(
         &mut self,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         records: &mut Vec<QueuedDiscoveryRecord>,
         pending_views: &mut PendingViewRetirements,
@@ -6489,7 +6858,7 @@ impl Engine {
             collect,
             closure,
         )?;
-        if !outcome.committed || !outcome.stale_views.is_empty() {
+        if !outcome.accepted() {
             return Ok(changed);
         }
 
@@ -6567,7 +6936,7 @@ impl Engine {
 
     pub(crate) fn apply_discovery_batch(
         &mut self,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         records: Vec<DiscoveryRecord>,
         malformed: u64,
     ) -> Result<bool> {
@@ -6578,7 +6947,7 @@ impl Engine {
 
     pub(crate) fn apply_discovery_batch_with(
         &mut self,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         records: Vec<DiscoveryRecord>,
         malformed: u64,
         additions_allowed: bool,
@@ -6596,6 +6965,14 @@ impl Engine {
             Ok(records) => records,
             Err((error, records)) => {
                 self.pending_discovery_records = records;
+                if terminal_dispatch {
+                    let mut no_additions = false;
+                    let mut terminal_closure = PauseClosure::new(false);
+                    self.retry_terminal_predispatch_failure(
+                        &mut no_additions,
+                        &mut terminal_closure,
+                    );
+                }
                 return Err(error);
             }
         };
@@ -6612,15 +6989,16 @@ impl Engine {
             collect,
             &mut closure,
         )?;
-        if terminal_dispatch {
-            if let Some(terminal_changed) = self.dispatch_terminal_batch(
+        if terminal_dispatch
+            && let Some(terminal_changed) = self.continue_terminal_batch(
                 session,
                 &mut additions_allowed,
                 &mut pending_views,
+                collect,
                 &mut closure,
-            )? {
-                changed |= terminal_changed;
-            }
+            )?
+        {
+            changed |= terminal_changed;
         }
         if self.pending_retirements.is_empty() && self.pending_rejected_keys.is_empty() {
             changed |= self.refresh_inventory(
@@ -6691,7 +7069,7 @@ impl Engine {
     pub(crate) fn revalidate_owned_session_with(
         &mut self,
         child: &OwnedChild,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         collect: &mut DiscoveryCollector<'_>,
     ) -> Result<DiscoveryBatchOutcome> {
         let Some(view) = self
@@ -6839,8 +7217,292 @@ impl Engine {
     }
 }
 
+/// The unprivileged stand-in for the loaded `Session` at the discovery seam.
+/// Only the dequeue script, the producer counter snapshot, the link-mutation
+/// scripts, and the dynamic detach outcome are programmable; every other method
+/// is inert so a test can never mistake adapter behavior for Engine behavior.
+#[cfg(test)]
+pub(crate) mod session_fixture {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    #[derive(Default)]
+    pub(crate) struct ScriptedSession {
+        pub(crate) dequeues: VecDeque<Result<Option<crate::events::DiscoveryItem>>>,
+        pub(crate) counters: CounterSnapshot,
+        /// One entry per upcoming `counter_snapshot` call; `true` fails it.
+        counter_script: RefCell<VecDeque<bool>>,
+        pub(crate) detach_exports: Vec<DynamicExportIdentity>,
+        pub(crate) detach_failed: bool,
+        pub(crate) detached: Vec<LoaderContextId>,
+        /// Slot counts of every `detach_slots` call, in order.
+        pub(crate) detached_slots: Vec<usize>,
+        /// One entry per upcoming `detach_slots` call; `true` fails it.
+        detach_slot_script: VecDeque<bool>,
+        /// Slot counts of every `attach_targets` call, in order.
+        pub(crate) attached_slots: Vec<usize>,
+        /// Killed and reaped from inside `attach_targets`, i.e. exactly between
+        /// a generation precheck and its postcheck.
+        kill_on_attach: Option<u32>,
+        /// Refuses every `preflight_targets`, i.e. a pure preflight refusal.
+        refuse_preflight: bool,
+    }
+
+    /// SIGKILL plus `waitpid`, so the retained generation is provably gone
+    /// before the caller's postcheck reads it.
+    fn kill_and_reap(pid: u32) {
+        let pid = pid as libc::pid_t;
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    }
+
+    impl ScriptedSession {
+        /// A session whose ring holds exactly these records and whose producer
+        /// counters authorize `loader_hits` loader records.
+        pub(crate) fn with_records(
+            records: impl IntoIterator<Item = DiscoveryRecord>,
+            loader_hits: u64,
+        ) -> Self {
+            Self {
+                dequeues: records
+                    .into_iter()
+                    .map(|record| Ok(Some(crate::events::DiscoveryItem::Record(record))))
+                    .collect(),
+                counters: CounterSnapshot {
+                    loader_hits,
+                    ..CounterSnapshot::default()
+                },
+                ..Self::default()
+            }
+        }
+
+        /// Schedules the outcome of the next producer-counter reads; `true`
+        /// fails that read. Later reads succeed.
+        pub(crate) fn fail_counter_reads(&mut self, script: impl IntoIterator<Item = bool>) {
+            *self.counter_script.borrow_mut() = script.into_iter().collect();
+        }
+
+        /// A session whose next `attach_targets` kills and reaps `pid`, i.e.
+        /// loses the retained generation exactly between a link mutation's
+        /// generation precheck and its postcheck.
+        pub(crate) fn losing_generation_at_attach(pid: u32) -> Self {
+            Self {
+                kill_on_attach: Some(pid),
+                ..Self::default()
+            }
+        }
+
+        /// A session whose target preflight refuses every candidate.
+        pub(crate) fn refusing_preflight() -> Self {
+            Self {
+                refuse_preflight: true,
+                ..Self::default()
+            }
+        }
+
+        /// Schedules the outcome of the next one-shot slot detaches; `true`
+        /// fails that call. Later calls succeed.
+        pub(crate) fn fail_slot_detaches(&mut self, script: impl IntoIterator<Item = bool>) {
+            self.detach_slot_script = script.into_iter().collect();
+        }
+    }
+
+    impl EngineSession for ScriptedSession {
+        fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>> {
+            self.dequeues.pop_front().unwrap_or(Ok(None))
+        }
+
+        fn counter_snapshot(&self) -> Result<CounterSnapshot> {
+            if self
+                .counter_script
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(false)
+            {
+                bail!("scripted producer counter read failed");
+            }
+            Ok(self.counters)
+        }
+
+        fn detach_failures(&self) -> &[String] {
+            &[]
+        }
+
+        fn preflight_targets(&self, _: &[plan::Slot], _: &PinnedObjects) -> Result<()> {
+            if self.refuse_preflight {
+                bail!("scripted target preflight refused the candidate");
+            }
+            Ok(())
+        }
+
+        fn attach_targets(
+            &mut self,
+            slots: &[plan::Slot],
+            _: &PinnedObjects,
+        ) -> Result<TargetAttachResult> {
+            self.attached_slots.push(slots.len());
+            if let Some(pid) = self.kill_on_attach.take() {
+                kill_and_reap(pid);
+            }
+            Ok((Vec::new(), Vec::new()))
+        }
+
+        fn replace_targets(
+            &mut self,
+            _: &mut plan::AttachPlan,
+            _: &[plan::Slot],
+            _: &PinnedObjects,
+        ) -> Result<ReplacementAttachResult> {
+            Ok((Vec::new(), false))
+        }
+
+        fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<()> {
+            self.detached_slots.push(slots.len());
+            if self.detach_slot_script.pop_front().unwrap_or(false) {
+                bail!("scripted one-shot slot detach failed");
+            }
+            Ok(())
+        }
+
+        fn has_dynamic_export(
+            &self,
+            _: LoaderContextId,
+            _: (PinnedObjectId, u64),
+            _: u64,
+            _: HookAbi,
+        ) -> bool {
+            false
+        }
+
+        fn attach_dynamic_export(
+            &mut self,
+            _: LoaderContextId,
+            _: u32,
+            _: (PinnedObjectId, u64),
+            _: u64,
+            _: HookAbi,
+            _: &PinnedObjects,
+        ) -> Result<(bool, Option<u64>)> {
+            Ok((false, None))
+        }
+
+        fn attach_dynamic_loader(
+            &mut self,
+            _: LoaderContextId,
+            _: u32,
+            _: PinnedObjectId,
+            _: u64,
+            _: u64,
+            _: &PinnedObjects,
+        ) -> std::result::Result<bool, DynamicLoaderAttachFailure> {
+            Ok(false)
+        }
+
+        fn detach_dynamic_context(
+            &mut self,
+            context: LoaderContextId,
+        ) -> (Vec<DynamicExportIdentity>, bool) {
+            self.detached.push(context);
+            (self.detach_exports.clone(), self.detach_failed)
+        }
+
+        fn arm_pause(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn pause_state(&self) -> Result<Option<u64>> {
+            Ok(None)
+        }
+
+        fn remove_pause(&mut self) -> Result<Option<u64>> {
+            Ok(None)
+        }
+
+        fn detach_producers(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+}
+
+/// Real-lifecycle setup and observation for the crate's terminal-authority
+/// tests. Nothing here reimplements Engine behavior; it only builds the exact
+/// starting state and reports the private journal/batch it produced.
+#[cfg(test)]
+impl Engine {
+    /// One retained live view for `pid` plus one attached loader context whose
+    /// view is already queued for retirement, i.e. the state a terminal drain
+    /// starts from.
+    pub(crate) fn retiring_loader_context(pid: u32) -> (Self, LoaderContextId) {
+        use p11scope_manifest::elf::SymbolFact;
+
+        let view = ProcessView::open(ProcessViewId(0), pid).expect("a live process view");
+        let view_id = view.id();
+        let mut engine = Self::empty();
+        engine.scope = Scope::Pid(pid);
+        engine.views.push(view);
+        engine.next_view_id = 1;
+        let prepared = engine
+            .loader_registry
+            .preflight(LoaderContextSpec {
+                view: view_id,
+                loader: PinnedObjectId(9),
+                mapping: None,
+                hook: SymbolFact {
+                    virtual_address: 0x2100,
+                    file_offset: 0x2100,
+                },
+                state: None,
+            })
+            .expect("a preflighted loader context");
+        let context = engine
+            .loader_registry
+            .prepare(prepared)
+            .expect("a prepared loader context");
+        engine
+            .loader_registry
+            .mark_attached(context)
+            .expect("an attached loader context");
+        engine
+            .retirement_intents
+            .insert(view_id, RetirementCause::ExecRefresh);
+        (engine, context)
+    }
+
+    pub(crate) fn terminal_batch_for_test(&self) -> Option<&TerminalBatch> {
+        self.terminal_batch.as_ref()
+    }
+
+    /// `(owner, dispatch_started, retry_used)` of the private lifecycle journal.
+    pub(crate) fn terminal_journal_for_test(&self) -> Option<(LoaderContextId, bool, bool)> {
+        self.terminal_journal
+            .map(|journal| (journal.owner, journal.dispatch_started, journal.retry_used))
+    }
+
+    /// Loader records that passed the real producer-counter gate, i.e. the
+    /// number of records the Engine actually dispatched.
+    pub(crate) fn dispatched_loader_records(&self) -> u64 {
+        self.loader_records_accepted
+    }
+
+    pub(crate) fn loader_context_state_for_test(
+        &self,
+        context: LoaderContextId,
+    ) -> Option<&'static str> {
+        self.loader_registry.context(context).map(|_| {
+            if self.loader_registry.is_tombstoned(context) {
+                "tombstoned"
+            } else {
+                "live"
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::session_fixture::ScriptedSession;
     use super::*;
     use crate::discovery::identity::test_fixture::{
         SHA as OVERLAY_SHA, module as overlay_module, overlay as overlay_key, pins as overlay_pins,
@@ -6920,7 +7582,7 @@ mod tests {
     fn pause_closure_preserves_real_required_attachment_failure() {
         let failed = timing_key(0);
         let outcome = ApplyOutcome {
-            committed: true,
+            disposition: ApplyDisposition::Accepted,
             static_failures: [failed].into_iter().collect(),
             ..ApplyOutcome::default()
         };
@@ -6968,20 +7630,6 @@ mod tests {
             .0;
         assert!(!retirement.contains("Self::collect_discovery_records(session)"));
         assert!(retirement.contains("collect(session)"));
-    }
-
-    #[test]
-    fn ordinary_batch_dispatch_cannot_consume_terminal_authority() {
-        let source = include_str!("engine.rs");
-        let apply = source
-            .split_once("    pub(crate) fn apply_discovery_batch_with(")
-            .unwrap()
-            .1
-            .split_once("    /// Performs the existing one-shot initial discovery pass.")
-            .unwrap()
-            .0;
-        assert!(!apply.contains("terminal_authority"));
-        assert!(apply.contains("self.dispatch_terminal_batch("));
     }
 
     #[test]
@@ -7881,9 +8529,91 @@ mod tests {
         assert_eq!(engine.expected_target_exit_pending, Some(view));
 
         engine.pending_retirements.clear();
+        let owner = LoaderContextId::from_case_id(1);
+        let journal = TerminalJournal {
+            owner,
+            dispatch_started: false,
+            retry_used: false,
+        };
+        let batch = TerminalBatch::empty(TerminalAuthority {
+            owner,
+            exports: Vec::new(),
+        });
+
+        // Every terminal-journal state blocks finalization on its own: an
+        // undispatched batch, a started journal with no batch, and both.
+        for (pending_journal, pending_batch) in [
+            (Some(journal), None),
+            (
+                None,
+                Some(TerminalBatch::empty(TerminalAuthority {
+                    owner,
+                    exports: Vec::new(),
+                })),
+            ),
+            (Some(journal), Some(batch)),
+            (
+                Some(TerminalJournal {
+                    dispatch_started: true,
+                    ..journal
+                }),
+                None,
+            ),
+        ] {
+            engine.terminal_journal = pending_journal;
+            engine.terminal_batch = pending_batch;
+            engine.finalize_expected_target_exit();
+            assert!(
+                !engine.expected_target_exit,
+                "a pending terminal lifecycle state cannot prove expected exit"
+            );
+            assert_eq!(engine.expected_target_exit_pending, Some(view));
+        }
+
+        engine.terminal_batch = None;
+        engine.terminal_journal = None;
         engine.finalize_expected_target_exit();
         assert!(engine.expected_target_exit);
         assert_eq!(engine.expected_target_exit_pending, None);
+    }
+
+    /// The tombstoned registry context a real terminal drain leaves behind is
+    /// carried through detach and return: finalization stays blocked until the
+    /// continuation removes it.
+    #[test]
+    fn a_real_terminal_drain_blocks_expected_exit_until_its_journal_clears() {
+        let pid = std::process::id();
+        let (mut engine, owner) = Engine::retiring_loader_context(pid);
+        let view = engine.views[0].id();
+        let mut session = ScriptedSession::with_records([], 16);
+        session.detach_exports = vec![terminal_export()];
+        start_failed_terminal_drain(&mut engine, &mut session, owner);
+
+        let retained = std::mem::take(&mut engine.views);
+        let intents = std::mem::take(&mut engine.retirement_intents);
+        engine.expected_target_exit_pending = Some(view);
+        engine.finalize_expected_target_exit();
+
+        assert!(
+            !engine.expected_target_exit,
+            "a tombstoned context with an undispatched batch is not a clean exit"
+        );
+        assert_eq!(
+            engine.loader_context_state_for_test(owner),
+            Some("tombstoned")
+        );
+
+        engine.views = retained;
+        engine.retirement_intents = intents;
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+        assert!(engine.terminal_journal.is_none());
+        assert!(engine.loader_registry.context(owner).is_none());
+        engine.views.clear();
+        engine.retirement_intents.clear();
+        engine.pending_retirements.clear();
+        engine.finalize_expected_target_exit();
+        assert!(engine.expected_target_exit);
     }
 
     #[test]
@@ -8068,7 +8798,7 @@ mod tests {
         engine.timings.observe(&completed, 10);
         engine.timings.observe(&failed, 10);
         let outcome = ApplyOutcome {
-            committed: true,
+            disposition: ApplyDisposition::Accepted,
             changed: true,
             stale_views: [stale].into_iter().collect(),
             missing_contexts: Vec::new(),
@@ -8082,7 +8812,326 @@ mod tests {
         assert_eq!(engine.timings.gap_ns(&completed), Some(10));
         assert_eq!(engine.timings.gap_ns(&failed), None);
         assert_eq!(outcome.stale_views, [stale].into_iter().collect());
-        assert!(outcome.committed && outcome.changed);
+        assert!(outcome.accepted() && outcome.changed);
+    }
+
+    /// One provider module over a real file-backed mapping of `view`. The
+    /// table is synthetic; the identity, the pin, and the process view are all
+    /// real, which is what the transaction path is about.
+    fn provider_module(
+        view: &ProcessView,
+        mapping: &MapEntry,
+        path: &Path,
+        offset: u64,
+    ) -> ScannedModule {
+        let mut module = mapped_object(view, mapping, path);
+        module.exports = vec!["C_GetFunctionList".into()];
+        module.tables = vec![ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: vec![ScannedEntry {
+                name: "C_Initialize",
+                object: module.key,
+                object_path: module.path.clone(),
+                file_offset: offset,
+            }],
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x7000,
+        }];
+        module
+    }
+
+    /// Two provider modules over two distinct executable objects the live
+    /// child really mapped.
+    fn child_provider_modules(view: &ProcessView) -> Vec<ScannedModule> {
+        for _ in 0..200 {
+            let bytes = std::fs::read(format!("/proc/{}/maps", view.pid())).unwrap();
+            let maps = parse_maps(&bytes).unwrap();
+            let mut keys = BTreeSet::new();
+            let mut modules = Vec::new();
+            for mapping in maps
+                .iter()
+                .filter(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
+            {
+                let Resolved::File {
+                    path: MappedPath::Usable(path),
+                    ..
+                } = resolve(&maps, mapping.start)
+                else {
+                    continue;
+                };
+                if !keys.insert(ObjectKey::of(mapping)) {
+                    continue;
+                }
+                modules.push(provider_module(view, mapping, &path, 0x1000));
+                if modules.len() == 2 {
+                    return modules;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the live child never mapped two distinct file-backed objects");
+    }
+
+    fn pin_test_modules(view: &ProcessView, modules: &[ScannedModule]) -> PinnedObjects {
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        });
+        let (pins, skipped) = pin_scanned_view_objects(view, modules, &mut budget).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        pins
+    }
+
+    /// A live child, an Engine that retains one process view on it, and one
+    /// accepted provider already attached in slot 0. The returned modules are
+    /// `[accepted, peer]`; the peer is what a later candidate allocates.
+    fn engine_with_one_accepted_provider() -> (std::process::Child, Engine, Vec<ScannedModule>) {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let view = ProcessView::open(ProcessViewId(3), child.id()).unwrap();
+        let modules = child_provider_modules(&view);
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Pid(child.id());
+        engine.next_view_id = 4;
+        engine.views.push(view);
+        let pins = pin_test_modules(&engine.views[0], &modules[..1]);
+        let candidate = engine
+            .live_candidate(pins, vec![modules[0].clone()], Vec::new())
+            .unwrap();
+        assert_eq!(candidate.delta.new.len(), 1);
+        let mut session = ScriptedSession::default();
+        let mut additions = true;
+        let outcome = engine
+            .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+            .unwrap();
+        assert!(outcome.accepted(), "the first candidate is accepted whole");
+        assert_eq!(engine.plan.slots.len(), 1);
+        assert!(engine.plan.module_of_slot(0).is_some());
+        (child, engine, modules)
+    }
+
+    /// The candidate that allocates one more cell for the peer provider.
+    fn peer_candidate(engine: &mut Engine, modules: &[ScannedModule]) -> LiveCandidate {
+        let mut pins = engine.pinned.clone();
+        let skipped = pins.absorb(pin_test_modules(&engine.views[0], &modules[1..2]));
+        let candidate = engine
+            .live_candidate(pins, modules.to_vec(), skipped)
+            .unwrap();
+        assert_eq!(
+            candidate.delta.new.len(),
+            1,
+            "only the peer provider is newly allocated"
+        );
+        assert_eq!(candidate.plan.slots.len(), 2);
+        candidate
+    }
+
+    #[test]
+    fn post_mutation_generation_loss_never_owns_the_cell_it_allocated() {
+        let (child, mut engine, modules) = engine_with_one_accepted_provider();
+        let accepted_owner = engine.plan.module_of_slot(0);
+        let candidate = peer_candidate(&mut engine, &modules);
+        let mut session = ScriptedSession::losing_generation_at_attach(child.id());
+        let mut additions = true;
+
+        let outcome = engine
+            .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+            .unwrap();
+
+        assert!(!outcome.stale_views.is_empty(), "the generation was lost");
+        assert_eq!(
+            engine.plan.slots.len(),
+            2,
+            "an allocated endpoint is never given back"
+        );
+        assert!(!engine.plan.is_active(0));
+        assert!(!engine.plan.is_active(1));
+        assert_eq!(
+            engine.plan.module_of_slot(1),
+            None,
+            "a cell this candidate allocated but never got accepted owns nothing"
+        );
+        assert_eq!(
+            engine.plan.module_of_slot(0),
+            accepted_owner,
+            "an owner already accepted before the candidate stays valid"
+        );
+        assert_eq!(engine.plan.module_ambiguous, 0);
+        assert_eq!(
+            engine.pinned.pinned().count(),
+            0,
+            "the stale view's live pins are cleaned"
+        );
+        assert!(engine.modules.is_empty());
+        assert!(!additions);
+        assert!(!outcome.required_complete());
+    }
+
+    #[test]
+    fn generation_loss_cleanup_finishes_after_one_failed_detach() {
+        let (child, mut engine, modules) = engine_with_one_accepted_provider();
+        let accepted_owner = engine.plan.module_of_slot(0);
+        let candidate = peer_candidate(&mut engine, &modules);
+        let mut session = ScriptedSession::losing_generation_at_attach(child.id());
+        session.fail_slot_detaches([false, false, true]);
+        let mut additions = true;
+
+        let outcome = engine
+            .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+            .unwrap();
+
+        assert_eq!(
+            session.detached_slots.len(),
+            3,
+            "the failed one-shot cleanup detach was not retried"
+        );
+        assert_eq!(session.detached_slots[2], 2, "both endpoints were retired");
+        assert!(
+            engine
+                .counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.subject == "live discovery detach"),
+            "{:?}",
+            engine.counters.object_skips
+        );
+        assert_eq!(engine.plan.module_of_slot(1), None);
+        assert_eq!(engine.plan.module_of_slot(0), accepted_owner);
+        assert_eq!(
+            engine.pinned.pinned().count(),
+            0,
+            "cleanup finished past the detach failure"
+        );
+        assert!(engine.modules.is_empty());
+        assert!(!additions);
+        assert!(!outcome.required_complete());
+    }
+
+    #[test]
+    fn a_history_preparation_failure_never_enters_the_link_mutation() {
+        let (mut child, mut engine, modules) = engine_with_one_accepted_provider();
+        let candidate = peer_candidate(&mut engine, &modules);
+        let plan = engine.plan.clone();
+        let pins = engine.pinned.pinned().count();
+        // The accepted manifest history lost its source ordinals, so no
+        // candidate of this Engine can publish provider history.
+        engine.manifest_ordinals.push(0);
+        let mut session = ScriptedSession::default();
+        let mut additions = true;
+
+        let error = engine
+            .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+            .err()
+            .expect("history preparation refuses the candidate");
+
+        assert!(
+            format!("{error:#}").contains("source ordinals"),
+            "{error:#}"
+        );
+        assert!(
+            session.detached_slots.is_empty() && session.attached_slots.is_empty(),
+            "the link-mutation closure was never entered"
+        );
+        assert_eq!(engine.plan, plan, "the accepted plan is unchanged");
+        assert_eq!(engine.pinned.pinned().count(), pins);
+        assert!(additions, "a pre-mutation refusal keeps the additions gate");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn a_post_mutation_retirement_is_not_an_accepted_candidate() {
+        let (child, mut engine, modules) = engine_with_one_accepted_provider();
+        let view = engine.views[0].id();
+        let candidate = peer_candidate(&mut engine, &modules);
+        let mut session = ScriptedSession::losing_generation_at_attach(child.id());
+        let mut additions = true;
+
+        let retired = engine
+            .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+            .unwrap();
+
+        assert_eq!(
+            retired.disposition,
+            ApplyDisposition::ConservativeRetirement,
+            "a conservative post-mutation retirement is not an accepted candidate"
+        );
+        assert!(!retired.accepted());
+        let mut closure = PauseClosure::new(true);
+        closure.observe_apply(&retired);
+        assert!(
+            !closure.required_complete(),
+            "a retired candidate cannot confirm pause completeness"
+        );
+        let mut pending = PendingViewRetirements::new();
+        engine.pending_retirements.insert(view);
+        engine.queue_conservative_outcome(
+            &retired,
+            &[view].into_iter().collect(),
+            &BTreeSet::new(),
+            &mut pending,
+        );
+        assert!(
+            engine.pending_retirements.is_empty(),
+            "conservative cleanup clears the retry intent it consumed"
+        );
+
+        let refused_candidate = engine
+            .live_candidate(engine.pinned.clone(), Vec::new(), Vec::new())
+            .unwrap();
+        let mut refusing = ScriptedSession::refusing_preflight();
+        let refused = engine
+            .apply_candidate(&mut refusing, refused_candidate, &mut additions, false, &[])
+            .unwrap();
+
+        assert!(refused.refused());
+        engine.pending_retirements.insert(view);
+        engine.queue_conservative_outcome(
+            &refused,
+            &[view].into_iter().collect(),
+            &BTreeSet::new(),
+            &mut pending,
+        );
+        assert_eq!(
+            engine.pending_retirements,
+            [view].into_iter().collect(),
+            "a refusal retains the retry intent it never consumed"
+        );
+    }
+
+    #[test]
+    fn a_failed_start_returns_its_own_error_after_restoring_publication() {
+        let (mut engine, _, _, _) = engine_with_overlay(58);
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        engine.publish_current_capture_facts().unwrap();
+        let owner = engine.plan.module_of_slot(0);
+        let snapshot = engine.begin_start_capture_attempt().unwrap();
+
+        // A post-link rebuild has to re-derive this registry; restoration must
+        // not depend on it, and must never speak over the original failure.
+        engine
+            .capture_facts
+            .module_keys
+            .insert(plan::ModuleId(0), timing_key(0));
+
+        let result: Result<()> =
+            engine.finish_start_capture_attempt(snapshot, Err(anyhow!("late loader failure")));
+
+        assert_eq!(
+            format!("{}", result.unwrap_err()),
+            "late loader failure",
+            "restoration must not obscure the original start failure"
+        );
+        assert_eq!(engine.plan.module_of_slot(0), owner);
+        assert!(engine.capture_facts.staged.is_none());
+        assert_eq!(engine.discovery.modules.len(), 1);
     }
 
     #[test]
@@ -8181,7 +9230,7 @@ mod tests {
         };
         let work = [dynamic_export_work(module.clone(), false)];
 
-        if refused.committed && refused.stale_views.is_empty() {
+        if refused.accepted() {
             timings.complete(&module, 20);
         } else {
             lose_unperformed_dynamic_work(&mut timings, &work);
@@ -8210,7 +9259,7 @@ mod tests {
         let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
         record.kind = DISCOVERY_KIND_LOADER;
         record.case_id = 0;
-        let queued = terminal_record_for(context, &snapshot, record);
+        let queued = tagged_by_authority(context, &snapshot, record);
         assert_eq!(queued.terminal_owner, Some(context));
         assert_eq!(queued.terminal_exports, snapshot);
 
@@ -8243,7 +9292,7 @@ mod tests {
         assert_eq!(timings.gap_ns(&module), None);
 
         record.case_id = 1;
-        let other = terminal_record_for(context, &snapshot, record);
+        let other = tagged_by_authority(context, &snapshot, record);
         assert_eq!(other.terminal_owner, None);
         assert!(other.terminal_exports.is_empty());
     }
@@ -8337,7 +9386,7 @@ mod tests {
 
         assert_eq!(unrelated[0].terminal_owner, None);
         engine
-            .retain_terminal_batch([matching.record, matching.record])
+            .retain_terminal_batch([matching.record, matching.record], true, 0)
             .unwrap();
         assert!(
             engine
@@ -8399,10 +9448,366 @@ mod tests {
         let batch = engine.terminal_batch.as_ref().unwrap();
         assert_eq!(batch.authority.owner, context);
         assert_eq!(batch.authority.exports, [export]);
+        assert!(!batch.complete());
 
         assert!(engine.terminal_batch.is_some());
         assert!(engine.terminal_journal.is_some());
         engine.loader_registry.remove(context).unwrap();
+    }
+
+    #[test]
+    fn terminal_predispatch_counter_failure_uses_one_retry_before_cleanup() {
+        let (registry, context) = prepared_loader_registry();
+        let mut engine = Engine::empty();
+        engine.loader_registry = registry;
+        engine.loader_registry.mark_attached(context).unwrap();
+        engine
+            .begin_terminal_drain(context, Vec::new(), || Err::<(), _>(anyhow!("deferred")))
+            .unwrap()
+            .unwrap_err();
+        let mut additions_allowed = true;
+        let mut closure = PauseClosure::new(true);
+
+        engine.retry_terminal_predispatch_failure(&mut additions_allowed, &mut closure);
+
+        assert!(engine.terminal_journal.as_ref().unwrap().retry_used);
+        assert!(engine.loader_registry.is_tombstoned(context));
+        assert!(engine.terminal_batch.is_some());
+
+        engine.retry_terminal_predispatch_failure(&mut additions_allowed, &mut closure);
+
+        assert!(engine.terminal_journal.is_none());
+        assert!(engine.terminal_batch.is_none());
+        assert!(engine.loader_registry.context(context).is_none());
+        assert!(!additions_allowed);
+        assert!(!closure.required_complete());
+    }
+
+    /// One record put through the real production authority-tagging path.
+    fn tagged_by_authority(
+        owner: LoaderContextId,
+        exports: &[DynamicExportIdentity],
+        record: DiscoveryRecord,
+    ) -> QueuedDiscoveryRecord {
+        let mut batch = TerminalBatch::empty(TerminalAuthority {
+            owner,
+            exports: exports.to_vec(),
+        });
+        batch.extend([record]);
+        batch
+            .records
+            .into_iter()
+            .next()
+            .expect("the authority batch holds the extended record")
+    }
+
+    fn terminal_export() -> DynamicExportIdentity {
+        DynamicExportIdentity {
+            object: PinnedObjectId(7),
+            file_offset: 0x10,
+            cookie: 1,
+            abi: HookAbi::FunctionList,
+        }
+    }
+
+    fn loader_record_for(context: LoaderContextId, pid: u32) -> DiscoveryRecord {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_LOADER;
+        record.case_id = (context.get() - 1) as u8;
+        record.pid_tgid = u64::from(pid) << 32;
+        record
+    }
+
+    /// One ordinary non-terminal Engine batch through the real application
+    /// route, with the real generic collector.
+    fn apply_ordinary_batch(
+        engine: &mut Engine,
+        session: &mut ScriptedSession,
+        records: Vec<DiscoveryRecord>,
+    ) -> Result<DiscoveryBatchOutcome> {
+        let mut collect = Engine::collect_discovery_records;
+        engine.apply_discovery_batch_with(session, records, 0, true, false, &mut collect)
+    }
+
+    /// A real failed post-detach drain: the retirement route detaches,
+    /// tombstones, and keeps an undispatched authority-bearing batch.
+    fn start_failed_terminal_drain(
+        engine: &mut Engine,
+        session: &mut ScriptedSession,
+        owner: LoaderContextId,
+    ) {
+        session
+            .dequeues
+            .push_back(Err(anyhow!("scripted ring read failed")));
+        apply_ordinary_batch(engine, session, Vec::new())
+            .expect("a failed terminal drain is loss, never a batch error");
+        assert_eq!(
+            engine.terminal_journal.map(|journal| journal.owner),
+            Some(owner)
+        );
+        assert!(engine.loader_registry.is_tombstoned(owner));
+    }
+
+    #[test]
+    fn generic_apply_and_replay_never_consume_the_retained_terminal_authority() {
+        let pid = std::process::id();
+        let (mut engine, owner) = Engine::retiring_loader_context(pid);
+        let view = engine.views[0].id();
+        let unrelated = LoaderContextId::from_case_id(9);
+        let mut session = ScriptedSession::with_records([], 16);
+        session.detach_exports = vec![terminal_export()];
+        start_failed_terminal_drain(&mut engine, &mut session, owner);
+
+        // No retirement is due, so an ordinary batch cannot reach the authority.
+        engine.retirement_intents.remove(&view);
+        apply_ordinary_batch(
+            &mut engine,
+            &mut session,
+            vec![loader_record_for(unrelated, pid)],
+        )
+        .unwrap();
+
+        assert_eq!(engine.loader_records_accepted, 1);
+        let batch = engine.terminal_batch.as_ref().unwrap();
+        assert_eq!(
+            batch.record_count(),
+            0,
+            "a generic batch cannot enter the authority batch"
+        );
+        assert!(!batch.complete());
+        assert_eq!(batch.authority.exports, [terminal_export()]);
+        assert!(!engine.terminal_journal.unwrap().dispatch_started);
+
+        // The coordinator now owns the exact batch; a retirement replay may
+        // neither reconstruct nor dispatch it behind the coordinator's back.
+        let carried = engine.take_terminal_batch_for_deferred().unwrap();
+        engine
+            .retirement_intents
+            .insert(view, RetirementCause::ExecRefresh);
+        apply_ordinary_batch(
+            &mut engine,
+            &mut session,
+            vec![loader_record_for(unrelated, pid)],
+        )
+        .unwrap();
+
+        assert_eq!(
+            engine.loader_records_accepted, 2,
+            "only the two generic records were dispatched"
+        );
+        assert!(engine.terminal_batch.is_none());
+        assert_eq!(
+            engine
+                .terminal_journal
+                .map(|journal| (journal.owner, journal.dispatch_started)),
+            Some((owner, false))
+        );
+        assert!(engine.loader_registry.is_tombstoned(owner));
+        assert_eq!(carried.authority.owner, owner);
+    }
+
+    #[test]
+    fn an_incomplete_terminal_drain_is_continued_and_dispatched_exactly_once() {
+        let pid = std::process::id();
+        let (mut engine, owner) = Engine::retiring_loader_context(pid);
+        let unrelated = LoaderContextId::from_case_id(9);
+        let mut session = ScriptedSession::with_records([], 16);
+        session.detach_exports = vec![terminal_export()];
+        start_failed_terminal_drain(&mut engine, &mut session, owner);
+
+        session.dequeues.extend(
+            [
+                loader_record_for(owner, pid),
+                loader_record_for(owner, pid),
+                loader_record_for(unrelated, pid),
+            ]
+            .map(|record| Ok(Some(crate::events::DiscoveryItem::Record(record)))),
+        );
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+        assert_eq!(
+            engine.loader_records_accepted, 3,
+            "the continued batch dispatched every collected record once"
+        );
+        assert!(engine.terminal_batch.is_none());
+        assert!(engine.terminal_journal.is_none());
+        assert!(engine.loader_registry.context(owner).is_none());
+
+        engine
+            .retirement_intents
+            .insert(engine.views[0].id(), RetirementCause::ExecRefresh);
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+        assert_eq!(
+            engine.loader_records_accepted, 3,
+            "a consumed terminal batch is never collected or dispatched again"
+        );
+    }
+
+    #[test]
+    fn terminal_predispatch_counter_failure_retains_the_exact_batch_for_one_retry() {
+        let pid = std::process::id();
+        let (mut engine, owner) = Engine::retiring_loader_context(pid);
+        let unrelated = LoaderContextId::from_case_id(9);
+        let mut session = ScriptedSession::with_records(
+            [
+                loader_record_for(owner, pid),
+                loader_record_for(owner, pid),
+                loader_record_for(unrelated, pid),
+            ],
+            16,
+        );
+        session.detach_exports = vec![terminal_export()];
+        session.fail_counter_reads([false, true]);
+
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+        assert_eq!(
+            engine.loader_records_accepted, 0,
+            "a predispatch counter failure dispatches nothing"
+        );
+        let batch = engine.terminal_batch.as_ref().unwrap();
+        assert_eq!(batch.record_count(), 3);
+        assert!(batch.complete());
+        assert_eq!(batch.authority.owner, owner);
+        assert_eq!(batch.authority.exports, [terminal_export()]);
+        assert_eq!(
+            batch.tagged_owners(),
+            [Some(owner), Some(owner), None],
+            "only the owned records carry terminal authority"
+        );
+        let journal = engine.terminal_journal.unwrap();
+        assert!(journal.retry_used && !journal.dispatch_started);
+
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+        assert_eq!(
+            engine.loader_records_accepted, 3,
+            "the one retry dispatches the exact retained batch once"
+        );
+        assert!(engine.terminal_batch.is_none());
+        assert!(engine.terminal_journal.is_none());
+        assert!(engine.loader_registry.context(owner).is_none());
+    }
+
+    #[test]
+    fn an_exhausted_terminal_predispatch_retry_cleans_up_without_dispatching() {
+        let pid = std::process::id();
+        let (mut engine, owner) = Engine::retiring_loader_context(pid);
+        let mut session = ScriptedSession::with_records([loader_record_for(owner, pid)], 16);
+        session.fail_counter_reads([false, true]);
+
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+        assert!(engine.terminal_journal.unwrap().retry_used);
+
+        session.fail_counter_reads([false, true]);
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+        assert_eq!(
+            engine.loader_records_accepted, 0,
+            "an exhausted retry never replays the records it dropped"
+        );
+        assert!(engine.terminal_batch.is_none());
+        assert!(engine.terminal_journal.is_none());
+        assert!(engine.loader_registry.context(owner).is_none());
+    }
+
+    #[test]
+    fn a_failed_owned_prearm_cleanup_uses_the_shared_predispatch_journal() {
+        let pid = std::process::id();
+        let (mut engine, owner) = Engine::retiring_loader_context(pid);
+        let unrelated = LoaderContextId::from_case_id(9);
+        let mut session = ScriptedSession::with_records(
+            [
+                loader_record_for(owner, pid),
+                loader_record_for(unrelated, pid),
+            ],
+            16,
+        );
+        session.detach_exports = vec![terminal_export()];
+        session.fail_counter_reads([true]);
+        // A prior snapshot already authorized these hits, so only the routing
+        // of the failed post-detach read is under test.
+        engine.counter_snapshot = session.counters;
+        let mut pending_views = PendingViewRetirements::new();
+
+        let error = engine
+            .fail_owned_prearm_attachment(
+                owner,
+                true,
+                &mut session,
+                &mut pending_views,
+                "loader registry mark-attached failed".into(),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("mark-attached"), "{error:#}");
+        assert_eq!(
+            engine.loader_records_accepted, 0,
+            "a failed post-detach counter snapshot dispatches nothing"
+        );
+        let batch = engine.terminal_batch.as_ref().unwrap();
+        assert_eq!(batch.record_count(), 2);
+        assert!(batch.complete());
+        assert_eq!(batch.authority.exports, [terminal_export()]);
+        assert_eq!(batch.tagged_owners(), [Some(owner), None]);
+        let journal = engine.terminal_journal.unwrap();
+        assert!(journal.retry_used && !journal.dispatch_started);
+        assert!(
+            engine.loader_registry.is_tombstoned(owner),
+            "the tombstone survives the shared one retry"
+        );
+
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+        assert_eq!(
+            engine.loader_records_accepted, 2,
+            "the shared retry dispatches the exact batch once"
+        );
+        assert!(engine.terminal_batch.is_none());
+        assert!(engine.terminal_journal.is_none());
+        assert!(engine.loader_registry.context(owner).is_none());
+    }
+
+    #[test]
+    fn a_started_terminal_journal_retries_registry_cleanup_without_replaying_records() {
+        let pid = std::process::id();
+        let (mut engine, owner) = Engine::retiring_loader_context(pid);
+        let unrelated = LoaderContextId::from_case_id(9);
+        let mut session = ScriptedSession::with_records(
+            [
+                loader_record_for(owner, pid),
+                loader_record_for(unrelated, pid),
+            ],
+            16,
+        );
+        session.fail_counter_reads([false, true]);
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+        assert_eq!(engine.loader_records_accepted, 0);
+
+        // The tombstoned entry is gone before the retry, so the started journal
+        // can never finish its cleanup.
+        engine.loader_registry.remove(owner).unwrap();
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+        assert_eq!(
+            engine.loader_records_accepted, 2,
+            "the retry dispatched the exact batch once"
+        );
+        assert!(engine.terminal_batch.is_none());
+        assert!(
+            engine.terminal_journal.unwrap().dispatch_started,
+            "a failed registry removal keeps the started journal pending"
+        );
+
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+        assert_eq!(
+            engine.loader_records_accepted, 2,
+            "a started journal repeats only its registry removal"
+        );
+        assert!(engine.terminal_batch.is_none());
+        assert!(engine.terminal_journal.unwrap().dispatch_started);
     }
 
     #[test]
@@ -8781,7 +10186,7 @@ mod tests {
         assert_eq!(engine.pending_rejected_keys, rejected_keys);
 
         let committed = ApplyOutcome {
-            committed: true,
+            disposition: ApplyDisposition::Accepted,
             changed: true,
             newly_rejected_keys: rejected_keys.clone(),
             ..ApplyOutcome::default()
@@ -9213,7 +10618,7 @@ mod tests {
         second_hit.case_id = (second.get() - 1) as u8;
         second_hit.table_ptr = 0x4100;
         second_hit.hook_ts_ns = 10;
-        let queued = terminal_record_for(first, &[], second_hit);
+        let queued = tagged_by_authority(first, &[], second_hit);
         assert_eq!(
             queued.terminal_owner, None,
             "A's global drain cannot grant terminal authority to B's record"
@@ -9232,7 +10637,7 @@ mod tests {
         registry.remove(first).unwrap();
 
         registry.tombstone(second).unwrap();
-        let queued = terminal_record_for(second, &[], second_hit);
+        let queued = tagged_by_authority(second, &[], second_hit);
         assert_eq!(queued.terminal_owner, Some(second));
         validate_loader_record_context(
             &mut registry,

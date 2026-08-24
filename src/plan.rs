@@ -538,6 +538,41 @@ impl AttachPlan {
         Ok(())
     }
 
+    /// The one infallible cleanup for a candidate that lost a process
+    /// generation after its links were already mutated. Every endpoint whose
+    /// exact pinned identity left with that generation stops accepting probes,
+    /// and its module and capacity refusal go with it. Allocated slot IDs are
+    /// never given back. A cell this candidate allocated itself — index at or
+    /// past `accepted_slots` — was never accepted by anybody, so it may not
+    /// keep a sole provider owner; an already-accepted owner and latched
+    /// ambiguity both stay. Returns the endpoints the caller must detach.
+    pub(crate) fn retire_unpinned_targets(
+        &mut self,
+        pinned: &PinnedObjects,
+        accepted_slots: usize,
+    ) -> Vec<Slot> {
+        self.modules
+            .retain(|module| pinned.summary(module.object).is_some());
+        self.refused_module_objects
+            .retain(|(object, _)| pinned.summary(*object).is_some());
+        let retired: Vec<Slot> = self
+            .slots
+            .iter()
+            .filter(|slot| self.is_active(slot.index) && pinned.summary(slot.object).is_none())
+            .cloned()
+            .collect();
+        for slot in &retired {
+            self.deactivate(slot.index);
+            let position = slot.index as usize;
+            if position >= accepted_slots
+                && matches!(self.aggregate_owners[position], AggregateOwner::Sole(_))
+            {
+                self.aggregate_owners[position] = AggregateOwner::Unowned;
+            }
+        }
+        retired
+    }
+
     /// A failed replacement must not revive the old descriptor or reuse its
     /// cookie. It remains a visible, inactive aggregate slot with finite
     /// attachment evidence owned by the caller.
@@ -1974,6 +2009,32 @@ mod tests {
         assert_eq!(plan.active_module_of_slot(0), None);
         assert_eq!(plan.module_of_slot(0), Some(ModuleId(0)));
         assert_eq!(plan.slots[0], frozen);
+    }
+
+    #[test]
+    fn retiring_an_unpinned_target_keeps_latched_ambiguity_on_a_new_cell() {
+        let object = PinnedObjectId(1);
+        let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
+        let mut plan = exact_plan(
+            vec![
+                exact_slot(0, object, 0x10, descriptor, vec![ModuleId(0)]),
+                exact_slot(1, object, 0x20, descriptor, vec![ModuleId(0), ModuleId(1)]),
+            ],
+            vec![exact_module(0, object)],
+        );
+        assert_eq!(plan.module_ambiguous, 1);
+
+        // Nothing is pinned any more and no cell was accepted before this
+        // candidate, so slot 0 loses its sole owner and slot 1 stays ambiguous.
+        let retired = plan.retire_unpinned_targets(&PinnedObjects::empty(), 0);
+
+        assert_eq!(retired.len(), 2);
+        assert_eq!(plan.slots.len(), 2, "allocated cells are never given back");
+        assert_eq!(plan.module_of_slot(0), None);
+        assert_eq!(plan.module_of_slot(1), None);
+        assert!(plan.slot_is_module_ambiguous(1), "ambiguity stays sticky");
+        assert_eq!(plan.module_ambiguous, 1);
+        assert!(plan.modules.is_empty());
     }
 
     #[test]

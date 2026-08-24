@@ -13,6 +13,155 @@
 # ("doctor says what this host can do") and it holds at any ptrace_scope.
 set -eu
 cd "$(dirname "$0")/.."
+
+# This lane's oracle, in one place: inspect and doctor must agree about the
+# same target, and the host lane must report the two absent scopes as n/a.
+# `--self-test` runs the same assertions over synthetic documents and requires
+# every claimed field to refuse a mutation, unprivileged.
+assert_inspect_doctor() {
+    python3 - "$@" <<'PY'
+import copy
+import json
+import sys
+
+
+def oracle(document, doctor):
+    assert document["schema"] == "pkcs11-scope/inspect/v1", document["schema"]
+    paths = [module["path"] for module in document["modules"]]
+    # Listing the provider needs only /proc/<pid>/maps and .dynsym, so it must
+    # hold on both targets whether or not the memory scan could run.
+    assert any(path.endswith("libsofthsm2.so") for path in paths), paths
+    verdict = [line for line in doctor.splitlines() if line.startswith("verdict:")][-1]
+    scanned = document["scan"]["status"] == "scanned"
+    assert scanned == ("memory scan available" in verdict), (document["scan"], verdict)
+    if scanned:
+        # The scan decoded the provider's own table, at the version SoftHSM2
+        # publishes; a scan that "succeeded" and found nothing would be a gap.
+        tables = [
+            table
+            for module in document["modules"]
+            if module["path"].endswith("libsofthsm2.so")
+            for table in module["tables"]
+        ]
+        assert tables, document["modules"]
+        assert all(table["entries"] > 0 for table in tables), tables
+        return "inspect: OK", paths, [
+            (table["version"], table["walk"], table["entries"]) for table in tables
+        ]
+    assert document["scan"]["reason"], document["scan"]
+    return "inspect: OK (scan refused, maps-only)", paths, document["scan"]["reason"]
+
+
+def host_oracle(doctor):
+    lines = doctor.splitlines()
+    assert [line for line in lines if line.startswith("verdict:")], doctor
+    # No --pid and no --cgroup: those two lanes must be reported n/a, never failed.
+    for name in ("/proc/<pid>/maps", "cgroup path"):
+        assert any(
+            line.startswith(name) and " n/a" in line for line in lines
+        ), (name, doctor)
+
+
+def mutate(document, path, value):
+    mutated = copy.deepcopy(document)
+    cursor = mutated
+    for key in path[:-1]:
+        cursor = cursor[key]
+    cursor[path[-1]] = value
+    return mutated
+
+
+SCANNED = {
+    "schema": "pkcs11-scope/inspect/v1",
+    "scan": {"status": "scanned", "reason": None},
+    "modules": [
+        {
+            "path": "/usr/lib/softhsm/libsofthsm2.so",
+            "tables": [{"version": "2.40", "walk": "full", "entries": 68}],
+        }
+    ],
+}
+REFUSED = {
+    "schema": "pkcs11-scope/inspect/v1",
+    "scan": {"status": "refused", "reason": "ptrace_scope"},
+    "modules": [{"path": "/usr/lib/softhsm/libsofthsm2.so", "tables": []}],
+}
+SCANNED_DOCTOR = "verdict: memory scan available\n"
+REFUSED_DOCTOR = "verdict: maps only\n"
+HOST_DOCTOR = (
+    "/proc/<pid>/maps .................. n/a    no --pid\n"
+    "cgroup path ....................... n/a    no --cgroup\n"
+    "verdict: capture available\n"
+)
+
+if sys.argv[1] == "--self-test":
+    oracle(SCANNED, SCANNED_DOCTOR)
+    oracle(REFUSED, REFUSED_DOCTOR)
+    host_oracle(HOST_DOCTOR)
+    mutations = [
+        ("inspect schema", SCANNED, mutate(SCANNED, ["schema"], "other/v1"), SCANNED_DOCTOR),
+        (
+            "provider listed",
+            SCANNED,
+            mutate(SCANNED, ["modules", 0, "path"], "/usr/lib/other.so"),
+            SCANNED_DOCTOR,
+        ),
+        ("scan/doctor agreement", SCANNED, SCANNED, REFUSED_DOCTOR),
+        ("refused/doctor agreement", REFUSED, REFUSED, SCANNED_DOCTOR),
+        (
+            "decoded tables",
+            SCANNED,
+            mutate(SCANNED, ["modules", 0, "tables"], []),
+            SCANNED_DOCTOR,
+        ),
+        (
+            "decoded entries",
+            SCANNED,
+            mutate(SCANNED, ["modules", 0, "tables"], [{"version": "2.40", "walk": "full", "entries": 0}]),
+            SCANNED_DOCTOR,
+        ),
+        ("refusal reason", REFUSED, mutate(REFUSED, ["scan", "reason"], ""), REFUSED_DOCTOR),
+    ]
+    for label, _, document, doctor in mutations:
+        try:
+            oracle(document, doctor)
+        except (AssertionError, KeyError, IndexError):
+            continue
+        raise SystemExit(f"mutation accepted: {label}")
+    maps_line, cgroup_line, verdict_line = HOST_DOCTOR.splitlines(keepends=True)
+    for label, doctor in [
+        ("host verdict", maps_line + cgroup_line),
+        ("maps n/a", cgroup_line + verdict_line),
+        ("cgroup n/a", maps_line + verdict_line),
+        (
+            "maps failed not n/a",
+            maps_line.replace(" n/a ", " FAIL ") + cgroup_line + verdict_line,
+        ),
+    ]:
+        try:
+            host_oracle(doctor)
+        except (AssertionError, IndexError):
+            continue
+        raise SystemExit(f"mutation accepted: {label}")
+    print("inspect/doctor oracle mutations rejected: OK")
+    raise SystemExit(0)
+
+if sys.argv[1] == "--host":
+    host_oracle(open(sys.argv[2]).read())
+    print("doctor host lane: OK")
+    raise SystemExit(0)
+
+print(*oracle(json.load(open(sys.argv[1])), open(sys.argv[2]).read()))
+PY
+}
+
+if [ "${1-}" = "--self-test" ]; then
+    [ "$#" -eq 1 ] || { echo "usage: $0 [--self-test]" >&2; exit 2; }
+    assert_inspect_doctor --self-test
+    echo "verify-inspect-doctor self-test: OK"
+    exit 0
+fi
+
 MODULE=/usr/lib/softhsm/libsofthsm2.so
 WORK=target/inspect
 PTRACER_PID=
@@ -84,30 +233,7 @@ for pid in "$PTRACER_PID" "$PLAIN_PID"; do
     echo "=== doctor --pid $pid ==="
     "$P11SCOPE" doctor --pid "$pid" > "$WORK/doctor-$pid.txt" 2>&1 || true
     grep -q "^verdict:" "$WORK/doctor-$pid.txt" || { echo "doctor printed no verdict"; exit 1; }
-    python3 - "$WORK/inspect-$pid.json" "$WORK/doctor-$pid.txt" <<'PY'
-import json, sys
-
-doc = json.load(open(sys.argv[1]))
-assert doc["schema"] == "pkcs11-scope/inspect/v1", doc["schema"]
-paths = [m["path"] for m in doc["modules"]]
-# Listing the provider needs only /proc/<pid>/maps and .dynsym, so it must
-# hold on both targets whether or not the memory scan could run.
-assert any(p.endswith("libsofthsm2.so") for p in paths), paths
-
-verdict = [l for l in open(sys.argv[2]).read().splitlines() if l.startswith("verdict:")][-1]
-scanned = doc["scan"]["status"] == "scanned"
-assert scanned == ("memory scan available" in verdict), (doc["scan"], verdict)
-if scanned:
-    # The scan decoded the provider's own table, at the version SoftHSM2
-    # publishes; a scan that "succeeded" and found nothing would be a gap.
-    tables = [t for m in doc["modules"] if m["path"].endswith("libsofthsm2.so") for t in m["tables"]]
-    assert tables, doc["modules"]
-    assert all(t["entries"] > 0 for t in tables), tables
-    print("inspect: OK", paths, [(t["version"], t["walk"], t["entries"]) for t in tables])
-else:
-    assert doc["scan"]["reason"], doc["scan"]
-    print("inspect: OK (scan refused, maps-only)", paths, doc["scan"]["reason"])
-PY
+    assert_inspect_doctor "$WORK/inspect-$pid.json" "$WORK/doctor-$pid.txt"
 done
 
 touch "$WORK/go"
@@ -120,9 +246,6 @@ echo "=== doctor (host only) ==="
 "$P11SCOPE" doctor > "$WORK/doctor.txt" 2>&1 || true
 cat "$WORK/doctor.txt"
 echo
-grep -q "^verdict:" "$WORK/doctor.txt" || { echo "doctor printed no verdict"; exit 1; }
-# No --pid and no --cgroup: those two lanes must be reported n/a, never failed.
-grep -q "^/proc/<pid>/maps .* n/a" "$WORK/doctor.txt" || { echo "doctor did not report maps n/a"; exit 1; }
-grep -q "^cgroup path .* n/a" "$WORK/doctor.txt" || { echo "doctor did not report cgroup n/a"; exit 1; }
+assert_inspect_doctor --host "$WORK/doctor.txt"
 
 echo "=== inspect/doctor: ALL OK ==="

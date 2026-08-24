@@ -2016,3 +2016,154 @@ fn the_capture_loop_consumer_map_is_frozen() {
         );
     }
 }
+
+#[test]
+fn live_discovery_evidence_validator_rejects_every_frozen_claim_mutation() {
+    let stdout = run_ok(
+        "python3",
+        &["scripts/check-live-discovery-evidence.py", "--self-test"],
+    );
+    for marker in [
+        "frozen manifest binding: OK",
+        "exported/hidden provider byte identities differ: OK",
+        "execution manifest mutations rejected: OK",
+        "campaign row mutations rejected: OK",
+        "preflight PASS-list mutations rejected: OK",
+    ] {
+        assert!(
+            stdout.contains(marker),
+            "evidence validator self-test misses {marker}"
+        );
+    }
+
+    // The production lifecycle oracle is not the isolated A/B spike's.
+    let validator = read("scripts/check-live-discovery-evidence.py");
+    assert!(
+        validator.contains("AB_FOUR_MAP_ORACLE = (\"COUNTERS\", \"DISCOVERY\", \"DISCOVERY_STATE\", \"PAUSE_PIDS\")"),
+        "the A/B four-map oracle must stay named and rejected by the production validator"
+    );
+    for claim in [
+        "the A/B spike's four-map oracle is not the production lifecycle oracle",
+        "lifecycle did not cover the complete production map inventory",
+    ] {
+        assert!(
+            validator.contains(claim),
+            "missing lifecycle claim: {claim}"
+        );
+    }
+}
+
+#[test]
+fn live_discovery_gates_freeze_the_exact_command_inputs_and_fixture_flags() {
+    let preflight = read("scripts/verify-live-discovery-preflight.sh");
+    // The plan's frozen inputs, defined in exactly one place and never guessed.
+    for input in [
+        "printf 'BPF_OBJECT=%s/frozen/p11scope-ebpf\\n'",
+        "printf 'BPF_INVENTORY=%s/frozen/bpf-inventory.json\\n'",
+        "printf 'CAMPAIGN_ROOT=%s/campaign\\n'",
+        "printf 'EXECUTION_MANIFEST=%s/execution-manifest.json\\n'",
+    ] {
+        assert!(preflight.contains(input), "frozen input missing: {input}");
+    }
+    assert!(
+        preflight.contains("mode is $rfi_mode, want 700"),
+        "the private root must be required to be mode 0700"
+    );
+
+    let stdout = run_ok(
+        "bash",
+        &["scripts/verify-live-discovery-preflight.sh", "--self-test"],
+    );
+    assert!(
+        stdout.contains("live discovery preflight input mutations rejected: OK"),
+        "preflight self-test misses its mutation lane: {stdout}"
+    );
+
+    // Frozen fixture build flags, verbatim.
+    let validator = read("scripts/check-live-discovery-evidence.py");
+    for flags in [
+        "CFLAGS = \"-std=c11 -O2 -Wall -Wextra -Werror -fPIC\"",
+        "SHARED_LDFLAGS = \"-shared -Wl,-z,defs\"",
+        "DRIVER_LDFLAGS = \"-ldl -pthread\"",
+    ] {
+        assert!(
+            validator.contains(flags),
+            "frozen fixture flags differ: {flags}"
+        );
+    }
+}
+
+#[test]
+fn live_discovery_fixtures_have_two_byte_identities_and_three_surfaces() {
+    let provider = read("tests/fixtures/live-discovery-provider.c");
+    let driver = read("tests/fixtures/live-discovery-driver.c");
+    assert!(
+        provider.contains("#if P11SCOPE_EXPORT_TABLES")
+            && provider.contains("#define TABLE_FN static"),
+        "one provider source must compile into exported and hidden table identities"
+    );
+    for surface in ["C_GetFunctionList", "C_GetInterfaceList", "C_GetInterface"] {
+        assert!(
+            provider.contains(&format!("{surface}(")),
+            "the provider must implement {surface}"
+        );
+        assert!(
+            driver.contains(surface),
+            "both drivers must exercise {surface}"
+        );
+    }
+    // Per-surface constructor and application markers, never inferred timing.
+    assert!(
+        provider.contains("return provider_application_phase ? \"app\" : \"ctor\";"),
+        "constructor and application markers must be distinguished by phase, not timing"
+    );
+    // One driver source, both load kinds, and the frozen lane modes.
+    assert!(
+        driver.contains("#if defined(P11SCOPE_DRIVER_NEEDED)"),
+        "one driver source must serve DT_NEEDED and dlopen load kinds"
+    );
+    for mode in [
+        "needed",
+        "dlopen",
+        "pause-partial",
+        "exec-fail",
+        "zero-modules",
+    ] {
+        assert!(driver.contains(mode), "driver lane mode missing: {mode}");
+    }
+}
+
+#[test]
+fn every_gate_script_self_tests_its_own_validator() {
+    let gates = read("scripts/gates.sh");
+    let ci = read(".github/workflows/ci.yml");
+    for script in [
+        "scripts/verify-inspect-doctor.sh",
+        "scripts/verify-attach-e2e.sh",
+        "scripts/verify-induced-gaps.sh",
+        "scripts/verify-discover-containers.sh",
+        "scripts/verify-live-discovery-preflight.sh",
+    ] {
+        assert!(
+            read(script).contains("--self-test"),
+            "{script} has no nonprivileged validator self-test"
+        );
+        assert!(
+            gates.contains(script),
+            "{script} is not wired into scripts/gates.sh"
+        );
+        assert!(
+            ci.contains(&format!("{script} --self-test")),
+            "{script} --self-test is not wired into CI"
+        );
+    }
+    assert!(
+        ci.contains("python3 scripts/check-live-discovery-evidence.py --self-test"),
+        "the frozen evidence validator self-test is not wired into CI"
+    );
+    // The hosted SoftHSM live-discovery lane is Task 9 Step 2, not this step.
+    assert!(
+        !ci.contains("--run "),
+        "no privileged live-discovery lane may be enabled before the review checkpoint"
+    );
+}

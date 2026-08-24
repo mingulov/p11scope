@@ -13,6 +13,133 @@
 set -eu
 cd "$(dirname "$0")/.."
 
+ORACLE=scripts/fixtures/discover-manifest.jq
+SOFTHSM_FUNCTION_RECORDS=68
+
+# Both container lanes assert the same two things: SoftHSM2 publishes exactly
+# 68 function records, and the deterministic version-matrix manifest satisfies
+# $ORACLE. `--self-test` runs those assertions unprivileged over synthetic
+# manifests and requires every claimed field to refuse a mutation. It needs no
+# docker, no network and no container image.
+self_test() {
+    command -v jq >/dev/null || { echo "jq required"; exit 1; }
+    st_work=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-discover-selftest-XXXXXX")
+    trap 'rm -rf "$st_work"' EXIT INT TERM
+    python3 - "$st_work" "$ORACLE" "$SOFTHSM_FUNCTION_RECORDS" <<'PY'
+import copy
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+work, oracle, records = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+
+
+def surface(major, minor, count, name=None, error=None):
+    return {
+        "version": {"major": major, "minor": minor},
+        "walk": {"status": "full"},
+        "functions": [{"name": f"C_{index}"} for index in range(count)],
+        "source": {
+            "classification": "corroborated_standard_prefix" if name or error else "exact",
+            "name_lossy": name,
+            "name_error": error,
+        },
+    }
+
+
+GOOD = {
+    "surfaces": [
+        surface(2, 40, 68),
+        surface(3, 0, 92),
+        surface(3, 1, 92),
+        surface(3, 2, 104),
+        surface(3, 2, 104, name="Acme Standard ABI"),
+        surface(3, 0, 92, error="null name pointer"),
+    ],
+    "vendor_interfaces": [{"name_lossy": "Vendor Pretend"}],
+}
+
+
+def accepted(document):
+    path = work / "candidate.json"
+    path.write_text(json.dumps(document))
+    return subprocess.run(
+        ["jq", "-e", "-f", oracle, str(path)], capture_output=True
+    ).returncode == 0
+
+
+def mutate(index, **changes):
+    document = copy.deepcopy(GOOD)
+    document["surfaces"][index].update(changes)
+    return document
+
+
+def mutate_version(major, minor, **changes):
+    """Every surface publishing this version, so no sibling surface can still
+    satisfy the claim under test."""
+    document = copy.deepcopy(GOOD)
+    for entry in document["surfaces"]:
+        if entry["version"] == {"major": major, "minor": minor}:
+            entry.update(changes)
+    return document
+
+
+if not accepted(GOOD):
+    raise SystemExit("the unmutated version-matrix oracle document was rejected")
+
+mutations = [
+    ("2.40 slot count", mutate_version(2, 40, functions=[{}] * 67)),
+    ("3.0 slot count", mutate_version(3, 0, functions=[{}] * 68)),
+    ("3.1 slot count", mutate_version(3, 1, functions=[{}] * 104)),
+    ("3.2 slot count", mutate_version(3, 2, functions=[{}] * 92)),
+    ("full walk status", mutate_version(2, 40, walk={"status": "partial"})),
+    ("published version", mutate_version(2, 40, version={"major": 2, "minor": 41})),
+    (
+        "alternate name classification",
+        mutate(4, source={"classification": "vendor", "name_lossy": "Acme Standard ABI"}),
+    ),
+    (
+        "alternate name spelling",
+        mutate(4, source={"classification": "corroborated_standard_prefix", "name_lossy": "Other"}),
+    ),
+    (
+        "null name error",
+        mutate(5, source={"classification": "corroborated_standard_prefix", "name_error": None}),
+    ),
+    ("vendor interface", {**copy.deepcopy(GOOD), "vendor_interfaces": []}),
+]
+for label, document in mutations:
+    if accepted(document):
+        raise SystemExit(f"mutation accepted: {label}")
+
+# The SoftHSM record-count claim both container lanes make, with the exact
+# pattern they count with: an exact-count manifest passes and a short one does
+# not, so `test "$n" = 68` cannot pass on a truncated manifest.
+def counted(total):
+    path = work / f"softhsm-{total}.json"
+    path.write_text(
+        json.dumps({"functions": [{"name": f"C_{index}"} for index in range(total)]}, indent=2)
+    )
+    return int(
+        subprocess.run(
+            ["sh", "-c", f'grep -c \'"name": "C_\' {path}'], capture_output=True, text=True
+        ).stdout.strip()
+    )
+
+
+if counted(records) != records:
+    raise SystemExit(f"record-count oracle counted {counted(records)}, want {records}")
+if counted(records - 1) == records:
+    raise SystemExit("record-count oracle cannot distinguish a short manifest")
+print(f"discover-containers oracle mutations rejected: OK ({len(mutations)} lanes)")
+PY
+    echo "verify-discover-containers self-test: OK"
+    exit 0
+}
+
+[ "${1-}" != "--self-test" ] || { [ "$#" -eq 1 ] || exit 2; self_test; }
+
 TOKEN=$$
 GLIBC_BUILD="p11scope-discover-glibc-build-$TOKEN"
 GLIBC_RUN="p11scope-discover-glibc-run-$TOKEN"
@@ -60,17 +187,7 @@ timeout --signal=TERM --kill-after=5s 300s docker run --name "$GLIBC_RUN" --rm \
   gcc -shared -fPIC -DLEGACY_MAJOR=2 -DLEGACY_MINOR=40 -DMATRIX_INTERFACES=1 \
       -o /tmp/matrix.so /src/crates/discover/tests/fixture/version_matrix.c
   run_discover --module /tmp/matrix.so -o /tmp/matrix.json
-  jq -e '\''
-    def full($major; $minor; $count):
-      any(.surfaces[]; .version == {major:$major, minor:$minor}
-          and .walk.status == "full" and (.functions | length) == $count);
-    full(2;40;68) and full(3;0;92) and full(3;1;92) and full(3;2;104)
-    and any(.surfaces[]; .source.classification == "corroborated_standard_prefix"
-            and .source.name_lossy == "Acme Standard ABI" and (.functions | length) == 104)
-    and any(.surfaces[]; .source.classification == "corroborated_standard_prefix"
-            and .source.name_error == "null name pointer" and (.functions | length) == 92)
-    and any(.vendor_interfaces[]; .name_lossy == "Vendor Pretend")
-  '\'' /tmp/matrix.json >/dev/null
+  jq -e -f /src/scripts/fixtures/discover-manifest.jq /tmp/matrix.json >/dev/null
   echo "ubuntu glibc: SoftHSM 68 + fixture 68/92/104 + alternate/null names OK"'
 
 echo "=== musl-dynamic: build + run in rust:1.88.0-alpine ==="
@@ -94,17 +211,7 @@ timeout --signal=TERM --kill-after=5s 600s docker run --name "$MUSL_BUILD" --rm 
   gcc -shared -fPIC -DLEGACY_MAJOR=2 -DLEGACY_MINOR=40 -DMATRIX_INTERFACES=1 \
       -o /tmp/matrix.so /src/crates/discover/tests/fixture/version_matrix.c
   run_discover --module /tmp/matrix.so -o /tmp/matrix.json
-  jq -e '\''
-    def full($major; $minor; $count):
-      any(.surfaces[]; .version == {major:$major, minor:$minor}
-          and .walk.status == "full" and (.functions | length) == $count);
-    full(2;40;68) and full(3;0;92) and full(3;1;92) and full(3;2;104)
-    and any(.surfaces[]; .source.classification == "corroborated_standard_prefix"
-            and .source.name_lossy == "Acme Standard ABI" and (.functions | length) == 104)
-    and any(.surfaces[]; .source.classification == "corroborated_standard_prefix"
-            and .source.name_error == "null name pointer" and (.functions | length) == 92)
-    and any(.vendor_interfaces[]; .name_lossy == "Vendor Pretend")
-  '\'' /tmp/matrix.json >/dev/null
+  jq -e -f /src/scripts/fixtures/discover-manifest.jq /tmp/matrix.json >/dev/null
   echo "alpine musl-dynamic: SoftHSM 68 + fixture 68/92/104 + alternate/null names OK"'
 
 echo "=== container verification: ALL OK ==="

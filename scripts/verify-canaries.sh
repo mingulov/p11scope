@@ -153,6 +153,76 @@ def assert_no_loader_pause_identity(label, data, values=None):
         assert pattern not in data, f"{label} published loader/pause identity {pattern!r}"
 
 
+# The published loader/pause field names, mirroring
+# `scripts/check-capture-evidence.py`. Anything else in that namespace is an
+# identity the capture document may not carry, wherever it appears.
+PUBLISHED_LOADER_PAUSE_FIELDS = {
+    "attach_gap_ms", "pause", "pause_attempts", "pause_confirmed",
+    "pause_partial", "loader_discovery", "child_still_running",
+}
+IDENTITY_PREFIXES = ("pause", "loader", "child", "attach_gap")
+IDENTITY_SUFFIXES = ("_pid", "_tid", "_tids", "_tasks", "_task_set")
+STRING_IDENTITIES = [value for value in LOADER_PAUSE_IDENTITIES.values()
+                     if isinstance(value, str)]
+# A workload's own stderr legitimately names the interface it went looking for
+# ("no exact PKCS 11 v3.2 table"). The prohibition binds what the *observer*
+# publishes, so the target's own log is scanned for every identity except that
+# one; every observer surface is scanned for all of them.
+WORKLOAD_IDENTITIES = [value for name, value in LOADER_PAUSE_IDENTITIES.items()
+                       if name != "interface_name_bytes"]
+# `HH:MM:SS.ffffff pid P tid T [sess#N] FUNCTION[ MECHANISM] → CKR_x DURATION`
+# (src/trace.rs). The two identity positions are captured so they can be
+# removed structurally rather than by exempting the whole surface.
+TRACE_EVENT = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{6} pid \d+ tid \d+ (?P<rest>.*)$")
+
+
+def assert_json_identity_structure(label, value, path="$"):
+    """Structural field check for a capture document.
+
+    Keys are checked against the closed loader/pause namespace and strings
+    against the loader path/digest/build-id/interface-name spellings. Numbers
+    are deliberately not byte-scanned here: `rv_counts` keys, mechanism ids and
+    latency totals are allowlisted arbitrary values whose spellings collide
+    with a narrow private constant in a clean document, which is the false
+    trigger the plan forbids. The checker's exact key sets and u64 ranges close
+    the numeric case structurally instead.
+    """
+    if isinstance(value, dict):
+        for key, item in value.items():
+            published = (
+                key in PUBLISHED_LOADER_PAUSE_FIELDS
+                or not (key.startswith(IDENTITY_PREFIXES)
+                        or key.endswith(IDENTITY_SUFFIXES))
+            )
+            assert published, f"{label} publishes loader/pause identity {path}.{key}"
+            assert_json_identity_structure(label, item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            assert_json_identity_structure(label, item, f"{path}[{index}]")
+    elif isinstance(value, str):
+        assert_no_loader_pause_identity(f"{label} {path}", value, STRING_IDENTITIES)
+
+
+def trace_scannable(label, text):
+    """A trace with only its allowlisted call-event identity positions removed.
+
+    `pid`/`tid` are published output for an ordinary call event, and only
+    there. Scanning the whole surface would fire on a legitimate field;
+    exempting the whole surface would mask a leak elsewhere in the same file.
+    Every line must match one of the frozen shapes, so an unfrozen line cannot
+    smuggle an identity past either.
+    """
+    kept = []
+    for line in text.splitlines():
+        if not line or line.startswith(("CAPTURE ", "EVIDENCE ", "LOST ")):
+            kept.append(line)
+            continue
+        event = TRACE_EVENT.match(line)
+        assert event, f"{label} rendered an unfrozen trace line: {line!r}"
+        kept.append(event.group("rest"))
+    return "\n".join(kept)
+
+
 def profile_terminal(doc, schema="pkcs11-scope/observed-profile/v2"):
     assert doc["schema"] == schema, doc["schema"]
     ev = doc["evidence"]
@@ -311,7 +381,10 @@ def assert_scan_only_hostile_output(doc, text, hostile):
     }], doc["capture"]
     assert doc["functions"] == [{
         "names": ["C_OpenSession"], "aliased": False, "module": module,
-        "module_ambiguous": False, "calls": 25, "errors": 3,
+        # The owner relation is exclusive: an owned cell states both reasons
+        # false, so a leaked owner key cannot hide behind a missing field.
+        "module_ambiguous": False, "module_unresolved": False,
+        "calls": 25, "errors": 3,
         "pending_returns": 5, "in_flight": 0,
         "latency_ns": {
             "approximate": True, "p50": 64, "p95": 64, "p99": 64,
@@ -838,7 +911,8 @@ if work == "--self-test":
         },
         "functions": [{
             "names": ["C_OpenSession"], "aliased": False, "module": scan_module,
-            "module_ambiguous": False, "calls": 25, "errors": 3,
+            "module_ambiguous": False, "module_unresolved": False,
+            "calls": 25, "errors": 3,
             "pending_returns": 5, "in_flight": 0,
             "latency_ns": {
                 "approximate": True, "p50": 64, "p95": 64, "p99": 64,
@@ -878,6 +952,21 @@ if work == "--self-test":
         scan_trace.replace("CKR_PENDING", "CKR_PENDING " + hostile[0]),
         hostile,
     ))
+    # The owner relation is part of that exact shape: an owned cell may not be
+    # relabelled unowned or ambiguous, and it may not drop the boolean either.
+    for label, mutate in (
+        ("scan-only owned cell relabelled unowned",
+         lambda d: d["functions"][0].update(module=None, module_unresolved=True)),
+        ("scan-only owned cell relabelled ambiguous",
+         lambda d: d["functions"][0].update(module=None, module_ambiguous=True)),
+        ("scan-only owner relation dropped",
+         lambda d: d["functions"][0].pop("module_unresolved")),
+    ):
+        mutated = json.loads(json.dumps(scan_only))
+        mutate(mutated)
+        reject(label, lambda m=mutated: assert_scan_only_hostile_output(
+            m, scan_trace, hostile
+        ))
     print("scan-only hostile output contract: OK")
 
     for family, sentinel in sorted(fixture_sentinels().items()):
@@ -1082,14 +1171,18 @@ if work == "--self-test":
                         s, b"leading" + p + b"trailing"
                     ),
                 )
-    clean_aggregate = json.dumps({
+    clean_document = {
+        "capture": {"modules": [{"path": "/opt/p11.so", "dev": [8, 1], "ino": 42,
+                                 "sha256": "11" * 32, "build_id": "aabb"}]},
         "evidence": {
             "attach_gap_ms": 7, "pause": "partial", "pause_attempts": 2,
             "pause_confirmed": 1, "pause_partial": 1,
             "discovery_ring_loss": 0, "discovery_state_failures": 0,
             "discovery_read_failures": 0, "discovery_truncated": 0,
             "loader_discovery": {
-                "strategies": {"debug_state_every_hit": 1, "dlopen_return": 0,
+                # Two exact bound contexts: one ordinary `dlopen`, and the
+                # owned run's one pre-exec initial-set context.
+                "strategies": {"debug_state_every_hit": 2, "dlopen_return": 0,
                                "unavailable": 0},
                 "dlopen_timing": {"qualified_pre_constructor": 0,
                                   "known_pre_relocation": 0, "unproven": 1,
@@ -1101,8 +1194,15 @@ if work == "--self-test":
                 "hits": 4, "state_read_failures": 0,
             },
         },
-    })
-    assert_no_loader_pause_identity("profile json", clean_aggregate)
+        "functions": [{
+            "names": ["C_Sign"], "aliased": False,
+            "module": {"dev": [8, 1], "ino": 42, "sha256": "11" * 32},
+            "module_ambiguous": False, "module_unresolved": False,
+            "rv_counts": {"0x0000000000000200": 3, "0x00000000000000fa": 1},
+        }],
+    }
+    clean_aggregate = json.dumps(clean_document["evidence"])
+    assert_no_loader_pause_identity("profile evidence", clean_aggregate)
     assert_no_loader_pause_identity(
         "trace output",
         "CAPTURE privacy=allowlisted\nC_Sign 0x0 sess#1 1.2ms\nEVIDENCE "
@@ -1112,6 +1212,74 @@ if work == "--self-test":
         "owned map value", struct.pack("<QQ", 1, 0) + struct.pack("<QQ", 2, 0)
     )
     print("loader/pause identity scanner self-test: OK")
+
+    # Structural field checks. A published capture document carries the finite
+    # loader/pause fields and nothing else from that namespace, at any depth —
+    # and a legitimate allowlisted value whose spelling looks like a narrow
+    # private constant (an `rv_counts` key of `0x…0200` or `0x…00fa`) must not
+    # be mistaken for one.
+    assert_json_identity_structure("clean profile json", clean_document)
+    for label, mutate in (
+        # The document as a whole is checked structurally, never byte-scanned:
+        # this clean one carries `rv_counts` keys spelling `0x…0200` and
+        # `0x…00fa`, which are allowlisted full-width return codes and also the
+        # text spelling of two narrow private constants.
+        ("evidence loader path", lambda d: d["evidence"].update(
+            loader="/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2")),
+        ("evidence child pid", lambda d: d["evidence"].update(child_pid=4242424)),
+        ("nested pause identity", lambda d: d["evidence"]["loader_discovery"].update(
+            pause_tasks=[4242424, 4242425])),
+        ("function row owner key", lambda d: d["functions"][0].update(loader_context=3)),
+        ("module ref process identity", lambda d: d["functions"][0]["module"].update(
+            owner_tid=4242425)),
+        ("capture module interface bytes", lambda d: d["capture"]["modules"][0].update(
+            path="PKCS 11")),
+        ("discovered loader digest", lambda d: d["evidence"].update(
+            discovery=[{"path": "/opt/p11.so", "sha256": "ab" * 32}])),
+    ):
+        mutated = json.loads(json.dumps(clean_document))
+        mutate(mutated)
+        reject(label, lambda m=mutated: assert_json_identity_structure("profile json", m))
+
+    # The trace's two allowlisted identity positions are removed by shape, so a
+    # real PID that collides with a private constant cannot fire, while an
+    # identity anywhere else on the same line — or on an unfrozen line — still
+    # does.
+    allowlisted_trace = (
+        "CAPTURE privacy=allowlisted\n"
+        f"00:00:00.000000 pid {LOADER_PAUSE_IDENTITIES['child_pid']} "
+        f"tid {LOADER_PAUSE_IDENTITIES['child_tid']} C_Sign → CKR_OK 100ns\n"
+        "LOST 2 events\nEVIDENCE " + clean_aggregate
+    )
+    assert_no_loader_pause_identity(
+        "trace output", trace_scannable("trace output", allowlisted_trace)
+    )
+    for label, line in (
+        ("trace session identity", "00:00:00.000000 pid 100 tid 1 C_Sign "
+                                   f"sess#{LOADER_PAUSE_IDENTITIES['marker']} → CKR_OK 100ns"),
+        ("unfrozen trace line", "loader /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"),
+    ):
+        reject(label, lambda line=line: assert_no_loader_pause_identity(
+            "trace output",
+            trace_scannable("trace output", f"CAPTURE privacy=allowlisted\n{line}"),
+        ))
+
+    # The workload-log exemption is exactly one value wide: the target's own
+    # stderr may name the interface it looked for, and nothing else.
+    assert_no_loader_pause_identity(
+        "workload log", b"no exact PKCS 11 v3.2 table\n", WORKLOAD_IDENTITIES
+    )
+    reject("observer log interface bytes", lambda: assert_no_loader_pause_identity(
+        "observer log", b"no exact PKCS 11 v3.2 table\n"
+    ))
+    for label, leaked in (
+        ("workload log loader path", LOADER_PAUSE_IDENTITIES["loader_path"]),
+        ("workload log child pid", str(LOADER_PAUSE_IDENTITIES["child_pid"])),
+    ):
+        reject(label, lambda leaked=leaked: assert_no_loader_pause_identity(
+            "workload log", f"leading{leaked}trailing".encode(), WORKLOAD_IDENTITIES
+        ))
+    print("loader/pause structural field checks: OK")
     print("canary lane assertion self-test: OK")
     raise SystemExit
 
@@ -1171,6 +1339,34 @@ artifacts.extend(Path(work).glob("mapdump_*.json"))
 for lane in ("default-safe-start", "feature-safe-start", "feature-unsafe-fault"):
     artifacts.extend(Path(work) / f"{lane}.{suffix}" for suffix in
                      ("output", "observer.log", "workload.log"))
+# Loader and pause identities, over every artifact surface: the capture
+# documents, the trace streams, the observer/workload logs, the raw event
+# dumps, and every map owned by the exact observer map ids (including the
+# published copy of the private temporary START dump). Each surface is scanned
+# the way a leak into it would actually look: a capture document structurally,
+# because its allowlisted `rv_counts`/mechanism values legitimately spell
+# narrow private constants; a trace with its two allowlisted call-event
+# identity positions removed by shape, so a real PID cannot fire the scan and
+# an identity anywhere else on the line still does; a map dump as the bytes it
+# encodes, never as its `0x..` token text, whose two-hex-digit runs would match
+# a narrow spelling in every clean dump.
+for path in artifacts:
+    content = path.read_bytes()
+    if path.suffix == ".output":
+        rendered = content.decode("utf-8", "surrogateescape")
+        if rendered.lstrip().startswith("{"):
+            assert_json_identity_structure(str(path), json.loads(rendered))
+        else:
+            assert_no_loader_pause_identity(
+                str(path), trace_scannable(str(path), rendered)
+            )
+    elif path.suffix == ".json":
+        assert_no_loader_pause_identity(str(path), reconstruct(content))
+    elif path.name.endswith(".workload.log"):
+        assert_no_loader_pause_identity(str(path), content, WORKLOAD_IDENTITIES)
+    else:
+        assert_no_loader_pause_identity(str(path), content)
+
 leaks = {}
 for path in artifacts:
     content = path.read_bytes()

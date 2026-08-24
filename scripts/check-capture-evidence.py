@@ -161,6 +161,9 @@ DISCOVERY_REASONS = {
 ENTRY_REASONS = {"null pointer", ENTRY_UNAVAILABLE}
 G1_SURFACES = Counter({("full", 68): 1, ("full", 92): 1, ("not_walked", 0): 1})
 LEGACY_SURFACES = Counter({("full", 68): 1})
+# `p11scope_ebpf_common::MAX_SLOTS` (src/discovery/scan.rs, plan:83): the frozen
+# attach ceiling a whole-module capacity refusal is taken against.
+MAX_SLOTS = 512
 # What the p11-kit proxy lane's capacity-refused module really decodes on the
 # hosted lane: libp11-kit maps 64 static CK_FUNCTION_LIST_3_0 closures, 92
 # entries each. The refusal is an attach-ceiling refusal, taken after decode, so
@@ -815,8 +818,17 @@ def exact_capture_modules(document):
         )
 
 
-def validate_proxy_capacity_fallback(document):
-    """The exact p11-kit-over-capacity/SoftHSM2-attached live shape."""
+def validate_proxy_capacity_fallback(document, module_path=None):
+    """The exact p11-kit-over-capacity/SoftHSM2-attached live shape.
+
+    This is the p11-kit proxy lane's *expected* outcome, not a fallback: a real
+    libp11-kit maps its 64 static 3.0 closures into the scanned image, which is
+    thousands of decoded entries against a frozen 512-slot ceiling, so the
+    proxy module is always discovered and always refused whole
+    (plan 2026-08-19-slice1b2-production.md:1120-1136). `module_path`, when the
+    caller controls it, pins the one directly-attached module by the exact path
+    the lane configured rather than by a substring.
+    """
     require(document["schema"] == "pkcs11-scope/observed-profile/v2-metrics", document["schema"])
     require(document["capture"]["mode"] == "metrics", document["capture"])
     require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
@@ -838,6 +850,10 @@ def validate_proxy_capacity_fallback(document):
     module = modules[0]
     require("softhsm" in module["path"].lower(), module["path"])
     require("p11-kit" not in module["path"].lower(), module["path"])
+    require(
+        module_path is None or module["path"] == module_path,
+        f"attached module is not the lane's own module: {module['path']!r}",
+    )
     discovery = evidence["discovery"]
     require(len(discovery) == 1, discovery)
     require(discovery[0]["sources"] == ["scan"], discovery)
@@ -864,11 +880,11 @@ def validate_proxy_capacity_fallback(document):
     require(len(refused) == 1, refused)
     require("p11-kit" in refused[0]["name"].lower(), refused)
     match = re.fullmatch(
-        r"module needs ([0-9]+) more of the 512 attach slots; 0 are in use "
+        rf"module needs ([0-9]+) more of the {MAX_SLOTS} attach slots; 0 are in use "
         r"— refusing to attach a prefix",
         refused[0]["reason"],
     )
-    require(match and int(match.group(1)) > 512, refused)
+    require(match and int(match.group(1)) > MAX_SLOTS, refused)
 
     # Decoded occurrences are recorded *before* slot-capacity admission, so a
     # module refused only by the attach ceiling keeps every entry it decoded;
@@ -899,6 +915,8 @@ def validate_proxy_capacity_fallback(document):
     )
     # `slots`/`attached_probes` stay bounded to the one attached module: the
     # refused module contributes decoded history and no public accepted module.
+    # One slot per {object, offset} and two probes per slot: a target both
+    # providers publish is attached exactly once, through the direct module.
     for name, wanted in (
         ("table_entries", 68 + refused_entries),
         ("slots", 68),
@@ -1536,7 +1554,14 @@ def self_test():
         [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
         + [([f"C_Unused_{index}"], 0) for index in range(66)]
     )
-    validate_proxy_capacity_fallback(proxy)
+    validate_proxy_capacity_fallback(proxy, module_path=soft_path)
+    # The lane pins its own module by exact path, so a capture that attached
+    # some other SoftHSM2 build is not this lane's evidence.
+    rejected(
+        lambda: validate_proxy_capacity_fallback(
+            proxy, module_path="/opt/softhsm/libsofthsm2.so"
+        )
+    )
     for mutate in (
         lambda d: d["evidence"]["discovery"][0]["objects"][0].update(
             path="/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.3.1", ino=999
@@ -1560,6 +1585,10 @@ def self_test():
         lambda d: d["evidence"]["surfaces"].pop(),
         # A surface neither module owns is a gap, never an allowance.
         lambda d: d["evidence"]["surfaces"][-1].update(source="/usr/lib/other.so table 3.0"),
+        # A target both providers publish is attached once: two probes per
+        # slot, one reported function per slot.
+        lambda d: d["evidence"].update(attached_probes=137),
+        lambda d: d["functions"].pop(),
     ):
         bad = copy.deepcopy(proxy)
         mutate(bad)

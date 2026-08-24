@@ -20,8 +20,10 @@ import os
 from pathlib import Path
 import platform
 import re
+import runpy
 import struct
 import sys
+import tempfile
 
 work = sys.argv[1]
 REGISTERED = 0x250
@@ -49,12 +51,15 @@ POLICY_BOOLEAN_TYPES = (
     0x01, 0x02, 0x103, 0x104, 0x105, 0x106,
     0x107, 0x108, 0x10A, 0x10C, 0x162,
 )
-SAFE_MAPS = {
-    "ASYNC_FUNCTIONS", "CGROUP_FILTER", "CONFIG", "EVENTS", "EVIDENCE",
-    "MECH_SHAPE", "PID_FILTER", "RV_COUNTS", "DESCRIPTORS", "START",
-    "STATS",
-}
-FEATURE_MAPS = SAFE_MAPS | {"ATTR_BOOL_BITS", "TEMPLATE_TAIL"}
+# The owned-map inventory is read from the one checked-in BPF list rather than
+# frozen again here: a second copy went stale across Slice 1b-2 (11 names
+# against the observer's 15) and every map missing from it was a map this
+# matrix never scanned.
+BPF_MAP_DEFS = runpy.run_path(
+    "scripts/check-bpf-map-defs.py", run_name="canary_map_inventory"
+)
+SAFE_MAPS = set(BPF_MAP_DEFS["SAFE_MAPS"])
+FEATURE_MAPS = set(BPF_MAP_DEFS["UNSAFE_MAPS"])
 EXPECTED_SENTINEL_FAMILIES = {
     "PIN", "KEY", "LABEL", "ID", "PLAINTEXT", "IV", "AAD", "BOOLLONG",
     "USERNAME", "CIPHERTEXT", "SIGNATURE", "WRAPPED", "RANDOM", "OUTPUT",
@@ -98,6 +103,11 @@ FUNCTION_NONE = (1 << 32) - 1
 ARG_READ_FAILURE = 1 << 4
 CALL_START_SIZE = 272
 EVENT_SIZE = 288
+DISCOVERY_RECORD_SIZE = 896
+# Every owned ringbuf, with the exact record length its mmap oracle accepts.
+# Keyed by name only because a record layout is per-map; which maps are
+# ringbufs is decided by `type`, from the one checked-in BPF inventory.
+RING_RECORD_SIZES = {"EVENTS": EVENT_SIZE, "DISCOVERY": DISCOVERY_RECORD_SIZE}
 
 
 # Loader and pause identities the observer holds privately. None of them may
@@ -592,7 +602,13 @@ def assert_fault_starts(manifest, workload_pid):
     assert_fault_records(starts, value_total(cells[0].get("values", [])))
 
 
-def parse_ring_records(data, capacity, consumer_pos, producer_pos):
+def ring_raw_path(prefix, name):
+    """Where a ringbuf's mmap-oracled records land for the privacy scan."""
+    return Path(f"{prefix}.{name}.raw")
+
+
+def parse_ring_records(data, capacity, consumer_pos, producer_pos,
+                       record_length=EVENT_SIZE):
     assert capacity >= mmap.PAGESIZE and capacity & (capacity - 1) == 0
     assert capacity % mmap.PAGESIZE == 0 and len(data) == 2 * capacity
     assert producer_pos >= consumer_pos, "ring position wrap cannot be proved"
@@ -605,18 +621,18 @@ def parse_ring_records(data, capacity, consumer_pos, producer_pos):
         assert not header & (1 << 31), "BUSY ring record"
         assert not header & (1 << 30), "discarded ring record"
         length = header & ((1 << 30) - 1)
-        assert length == EVENT_SIZE, f"ring record size {length}, expected {EVENT_SIZE}"
+        assert length == record_length, f"ring record size {length}, expected {record_length}"
         record_size = (8 + length + 7) & ~7
-        assert record_size == 296 and position + record_size <= producer_pos
+        assert position + record_size <= producer_pos
         records.append(bytes(data[offset + 8:offset + 8 + length]))
         position += record_size
     assert position == producer_pos
     return records
 
 
-def ring_records(manifest):
+def ring_records(manifest, name="EVENTS"):
     assert platform.machine() == "x86_64", "raw ring oracle requires Linux x86-64"
-    item = manifest_map(manifest, "EVENTS")
+    item = manifest_map(manifest, name)
     assert item["oracle"] == "mmap" and "file" not in item, item
     assert item["type"] == "ringbuf" and item["key_size"] == item["value_size"] == 0, item
     map_id, capacity = item["id"], item["max_entries"]
@@ -625,13 +641,14 @@ def ring_records(manifest):
     fd = libc.syscall(321, 14, ctypes.byref(attr), ctypes.sizeof(attr))
     if fd < 0:
         error = ctypes.get_errno()
-        raise OSError(error, f"BPF_MAP_GET_FD_BY_ID for EVENTS id {map_id}")
+        raise OSError(error, f"BPF_MAP_GET_FD_BY_ID for {name} id {map_id}")
     page = mmap.PAGESIZE
     consumer = mmap.mmap(fd, page, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ, offset=0)
     producer = mmap.mmap(fd, page + 2 * capacity, flags=mmap.MAP_SHARED,
                          prot=mmap.PROT_READ, offset=page)
     before = (u64(consumer, 0), u64(producer, 0))
-    records = parse_ring_records(producer[page:], capacity, *before)
+    records = parse_ring_records(producer[page:], capacity, *before,
+                                 RING_RECORD_SIZES[name])
     after = (u64(consumer, 0), u64(producer, 0))
     producer.close()
     consumer.close()
@@ -684,24 +701,61 @@ def assert_event_records(raw_records, lane, workload_pid):
                 event["attr_seen"]) == (1, 1, 0, 0), event
 
 
-def assert_raw_events(manifest, lane, workload_pid, output):
-    raw_records = ring_records(manifest)
-    assert_event_records(raw_records, lane, workload_pid)
-    Path(output).write_bytes(b"".join(raw_records))
+def assert_raw_records(manifest, lane, workload_pid, prefix):
+    """Reads every owned ringbuf through the mmap oracle and keeps its bytes.
+
+    `EVENTS` additionally gets its frozen per-call policy oracle; the rest are
+    kept for the matrix scan, which is what makes a ringbuf a scanned privacy
+    surface rather than a map the dump loop silently walked past.
+    """
+    read = set()
+    for item in read_json(manifest):
+        if item["type"] != "ringbuf":
+            continue
+        records = ring_records(manifest, item["name"])
+        if item["name"] == "EVENTS":
+            assert_event_records(records, lane, workload_pid)
+        ring_raw_path(prefix, item["name"]).write_bytes(b"".join(records))
+        read.add(item["name"])
+    assert read == set(RING_RECORD_SIZES), f"{lane}: owned ringbufs {read} were not all read"
+
+
+def owned_map_surfaces(label, manifest, expected, prefix):
+    """Every owned map paired with the file the privacy scan reads it from.
+
+    Dispatch is by map *type*, never by name: a ringbuf has no key/value
+    iteration, so `bpftool map dump` cannot read it at all and it is read
+    through the mmap oracle instead, landing as its raw records; every other
+    map is read as its `bpftool` dump. A map with no surface on disk is a
+    failure, never a skip — an unscanned owned map is exactly the privacy hole
+    this gate exists to close.
+    """
+    names = {item["name"] for item in manifest}
+    assert names == expected, f"{label}: map inventory {names} != {expected}"
+    ids = [item['id'] for item in manifest]
+    assert all(isinstance(map_id, int) and map_id > 0 for map_id in ids), ids
+    assert len(ids) == len(set(ids)), f"{label}: duplicate observer-owned map ids {ids}"
+    surfaces = []
+    for item in manifest:
+        if item["type"] == "ringbuf":
+            assert item["oracle"] == "mmap" and "file" not in item, item
+            assert item["key_size"] == item["value_size"] == 0, item
+            path = ring_raw_path(prefix, item["name"])
+        else:
+            assert item["oracle"] == "dump", item
+            path = Path(item["file"])
+        assert path.is_file(), f"{label}: {item['name']} has no scanned surface {path}"
+        surfaces.append(path)
+    return surfaces
 
 
 def assert_exact_owned_map_inventory(lane, expected):
-    manifest = read_json(f"{work}/mapdump_manifest_{lane}.json")
-    names = {item["name"] for item in manifest}
-    assert names == expected, f"{lane}: map inventory {names} != {expected}"
-    ids = [item['id'] for item in manifest]
-    assert all(isinstance(map_id, int) and map_id > 0 for map_id in ids), ids
-    assert len(ids) == len(set(ids)), f"{lane}: duplicate observer-owned map ids {ids}"
-    for item in manifest:
-        if item["name"] == "EVENTS":
-            assert item["oracle"] == "mmap" and "file" not in item, item
-        else:
-            assert item["oracle"] == "dump" and Path(item["file"]).is_file(), item
+    return owned_map_surfaces(
+        lane,
+        read_json(f"{work}/mapdump_manifest_{lane}.json"),
+        expected,
+        f"{work}/{lane}",
+    )
 
 
 def alias_hits(content, reconstructed=b""):
@@ -729,7 +783,7 @@ def positive_control_content(value=None):
 
 
 if work == "--raw-events":
-    assert_raw_events(sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5])
+    assert_raw_records(sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5])
     raise SystemExit
 if work == "--hostile-starts":
     assert_hostile_starts(sys.argv[2], sys.argv[3], int(sys.argv[4]))
@@ -1280,6 +1334,104 @@ if work == "--self-test":
             "workload log", f"leading{leaked}trailing".encode(), WORKLOAD_IDENTITIES
         ))
     print("loader/pause structural field checks: OK")
+
+    # ------------------------------------------------------------------
+    # Owned-map inventory and scan surfaces. The inventory comes from the one
+    # checked-in BPF list, the dispatch from each map's `type`, and every owned
+    # map must end up with a file the matrix scan actually reads.
+    # ------------------------------------------------------------------
+    RINGBUF = 27
+    assert set(RING_RECORD_SIZES) == {
+        name for name, definition in BPF_MAP_DEFS["UNSAFE_MAPS"].items()
+        if definition["type"] == RINGBUF
+    }, "a new owned ringbuf needs its exact record length here"
+    assert len(SAFE_MAPS) == 15 and len(FEATURE_MAPS) == 17, (SAFE_MAPS, FEATURE_MAPS)
+    assert {"COUNTERS", "DISCOVERY", "DISCOVERY_STATE", "PAUSE_PIDS"} <= SAFE_MAPS
+    assert FEATURE_MAPS - SAFE_MAPS == {"ATTR_BOOL_BITS", "TEMPLATE_TAIL"}
+
+    with tempfile.TemporaryDirectory() as scan_dir:
+        prefix = f"{scan_dir}/default-safe-profile"
+
+        def owned_manifest():
+            manifest = []
+            for map_id, (name, definition) in enumerate(
+                sorted(BPF_MAP_DEFS["SAFE_MAPS"].items()), start=1
+            ):
+                ring = definition["type"] == RINGBUF
+                item = {
+                    "name": name, "id": map_id, "max_entries": definition["max_entries"],
+                    "key_size": definition["key_size"] if not ring else 0,
+                    "value_size": definition["value_size"] if not ring else 0,
+                    "type": "ringbuf" if ring else "hash",
+                    "oracle": "mmap" if ring else "dump",
+                }
+                if not ring:
+                    item["file"] = f"{scan_dir}/mapdump_{name}_lane.json"
+                manifest.append(item)
+            return manifest
+
+        def write_surfaces(manifest, planted=None):
+            for item in manifest:
+                if item["type"] == "ringbuf":
+                    payload = planted if planted and item["name"] == planted[0] else (b"", b"")
+                    ring_raw_path(prefix, item["name"]).write_bytes(bytes(64) + payload[1])
+                else:
+                    content = (positive_control_content(planted[1])
+                               if planted and item["name"] == planted[0]
+                               else b"[]\n")
+                    Path(item["file"]).write_bytes(content)
+
+        manifest = owned_manifest()
+        write_surfaces(manifest)
+        surfaces = owned_map_surfaces("lane", manifest, SAFE_MAPS, prefix)
+        assert len(surfaces) == 15 and all(path.is_file() for path in surfaces), surfaces
+        assert {path.name for path in surfaces} >= {
+            f"default-safe-profile.{name}.raw" for name in RING_RECORD_SIZES
+        }, surfaces
+        print("owned map inventory routes every map by type: OK")
+
+        for label, mutate in (
+            # The frozen name-keyed dispatch: every ringbuf that is not EVENTS
+            # was required to be a `bpftool map dump`, which cannot read one.
+            ("ringbuf dumped", lambda m: m[[i["name"] for i in m].index("DISCOVERY")].update(
+                oracle="dump", type="hash", file=f"{scan_dir}/mapdump_DISCOVERY_lane.json")),
+            ("non-ringbuf mmapped", lambda m: [
+                i.update(oracle="mmap") or i.pop("file") for i in m
+                if i["name"] == "DISCOVERY_STATE"]),
+            ("stale inventory", lambda m: m.pop([i["name"] for i in m].index("PAUSE_PIDS"))),
+            ("duplicate map ids", lambda m: m[1].update(id=m[0]["id"])),
+            # A surface that is not on disk is an unscanned owned map.
+            ("dump surface missing", lambda m: [
+                i.update(file=f"{scan_dir}/absent.json") for i in m
+                if i["name"] == "COUNTERS"]),
+            ("ring surface missing",
+             lambda m: ring_raw_path(prefix, "DISCOVERY").unlink()),
+        ):
+            mutated = json.loads(json.dumps(manifest))
+            mutate(mutated)
+            reject(label, lambda mutated=mutated:
+                   owned_map_surfaces("lane", mutated, SAFE_MAPS, prefix))
+        print("owned map surface mutations are all rejected: OK")
+
+        # Each Slice 1b-2 map is a scan surface in its own right: a canary
+        # planted in it must be found by the same reader the matrix uses.
+        write_surfaces(manifest)
+        for name in ("COUNTERS", "DISCOVERY", "DISCOVERY_STATE", "PAUSE_PIDS"):
+            planted = json.loads(json.dumps(manifest))
+            write_surfaces(planted, (name, SENTINELS["PIN"]))
+            found = {}
+            for path in owned_map_surfaces("lane", planted, SAFE_MAPS, prefix):
+                content = path.read_bytes()
+                hits = sentinel_hits(
+                    content, reconstruct(content) if path.suffix == ".json" else b""
+                )
+                if hits:
+                    found[path.name] = sorted(hits)
+            assert list(found.values()) == [["PIN"]], (name, found)
+            assert name in next(iter(found)), (name, found)
+            write_surfaces(manifest)
+        print("every Slice 1b-2 map is a scanned canary surface: OK")
+
     print("canary lane assertion self-test: OK")
     raise SystemExit
 
@@ -1306,8 +1458,10 @@ lanes = {
     "feature-unsafe-profile": FEATURE_MAPS, "feature-unsafe-trace": FEATURE_MAPS,
     "aggregate-only-metrics": SAFE_MAPS,
 }
-for lane, expected in lanes.items():
-    assert_exact_owned_map_inventory(lane, expected)
+lane_surfaces = {
+    lane: assert_exact_owned_map_inventory(lane, expected)
+    for lane, expected in lanes.items()
+}
 for lane in ["feature-safe-profile", "feature-safe-trace"]:
     assert read_json(f"{work}/mapdump_ATTR_BOOL_BITS_{lane}.json") == []
     assert read_json(f"{work}/mapdump_TEMPLATE_TAIL_{lane}.json") == []
@@ -1331,14 +1485,17 @@ print(f"positive control OK: scanner found PIN in {control}")
 
 artifacts = []
 for lane in lanes:
-    suffixes = ("output", "observer.log", "workload.log")
-    if lane != "aggregate-only-metrics":
-        suffixes += ("events.raw",)
-    artifacts.extend(Path(work) / f"{lane}.{suffix}" for suffix in suffixes)
+    artifacts.extend(Path(work) / f"{lane}.{suffix}" for suffix in
+                     ("output", "observer.log", "workload.log"))
+    # Every map the observer owns, as its own type says it must be read: the
+    # dump files plus the raw records the mmap oracle pulled out of each
+    # ringbuf. `owned_map_surfaces` already refused to return a missing one.
+    artifacts.extend(lane_surfaces[lane])
 artifacts.extend(Path(work).glob("mapdump_*.json"))
 for lane in ("default-safe-start", "feature-safe-start", "feature-unsafe-fault"):
     artifacts.extend(Path(work) / f"{lane}.{suffix}" for suffix in
                      ("output", "observer.log", "workload.log"))
+artifacts = list(dict.fromkeys(artifacts))
 # Loader and pause identities, over every artifact surface: the capture
 # documents, the trace streams, the observer/workload logs, the raw event
 # dumps, and every map owned by the exact observer map ids (including the
@@ -1381,10 +1538,8 @@ safe_lanes = (set(lanes) - {"feature-unsafe-profile", "feature-unsafe-trace"}) |
 for lane in safe_lanes:
     paths = [Path(work) / f"{lane}.{suffix}" for suffix in
              ("output", "observer.log", "workload.log")]
-    raw = Path(work) / f"{lane}.events.raw"
-    if raw.exists():
-        paths.append(raw)
-    paths.extend(Path(work).glob(f"mapdump_*_{lane}.json"))
+    paths.extend(lane_surfaces[lane] if lane in lane_surfaces
+                 else Path(work).glob(f"mapdump_*_{lane}.json"))
     for path in paths:
         content = path.read_bytes()
         reconstructed = reconstruct(content) if path.suffix == ".json" else b""
@@ -1524,7 +1679,7 @@ run_lane() {
     echo "=== $lane ($build $kind) ==="
     rm -f "$WORK/$lane.ready" "$WORK/$lane.go" "$WORK/$lane.output" \
         "$WORK/$lane.observer.log" "$WORK/$lane.workload.log" \
-        "$WORK/$lane.events.raw" \
+        "$WORK/$lane".*.raw \
         "$WORK"/mapdump_*_"$lane".json "$WORK/mapdump_manifest_$lane.json"
     "$WORK/canary_workload" "$PWD/$WORK/matrix-provider.so" matrix \
         "$PWD/$WORK/$lane.ready" "$PWD/$WORK/$lane.go" \
@@ -1566,9 +1721,9 @@ run_lane() {
     sudo python3 scripts/dump-owned-bpf-maps.py \
         "$OBSERVER_PID" "$WORK" "$lane" 0 16384
     assert_lanes --raw-events "$WORK/mapdump_manifest_$lane.json" "$lane" \
-        "$lane_workload_pid" "$WORK/$lane.events.raw"
+        "$lane_workload_pid" "$WORK/$lane"
     reclaim_root_output "$WORK"/mapdump_*_"$lane".json \
-        "$WORK/$lane.events.raw"
+        "$WORK/$lane".*.raw
     signal_verified_root_process CONT "$OBSERVER_PID" "$OBSERVER_STARTTIME"
     # sudo suspends itself when its command stops; resume it too or `wait`
     # below never returns (and the exited observer stays a zombie under it).
@@ -1588,9 +1743,6 @@ run_lane() {
     fi
     reclaim_root_output "$WORK/$lane.output"
     python3 scripts/check-capture-evidence.py canary "$lane" "$WORK/$lane.output"
-    # A metrics lane emits no per-call events; keep its empty raw dump out
-    # of the artifact set the matrix assertion scans.
-    [ "$kind" != metrics ] || rm -f "$WORK/$lane.events.raw"
 }
 
 echo "=== discover deterministic matrix providers ==="

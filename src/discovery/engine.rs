@@ -29,7 +29,7 @@ use p11scope_ebpf_common::{
     DiscoveryRecord, valid_discovery_record,
 };
 use p11scope_manifest::elf::ElfSnapshot;
-use p11scope_manifest::manifest::{Manifest, Resolution, SCHEMA};
+use p11scope_manifest::manifest::{Acquisition, Manifest, Resolution, SCHEMA, WalkOutcome};
 use p11scope_manifest::maps::{
     Device, MapEntry, MappedPath, ObjectKey, Resolved, parse_maps, resolve,
 };
@@ -40,9 +40,11 @@ pub struct Engine {
     plan: plan::AttachPlan,
     pinned: PinnedObjects,
     discovery: render::DiscoveryEvidence,
+    capture_facts: CaptureFacts,
     views: Vec<ProcessView>,
     modules: Vec<ReconciledModule>,
     manifests: Vec<Manifest>,
+    manifest_ordinals: Vec<u32>,
     counters: DiscoveryCounters,
     identity_mismatches: usize,
     scan_inputs: BTreeMap<ProcessViewId, ScanInput>,
@@ -51,6 +53,9 @@ pub struct Engine {
     budget: CaptureWorkBudget,
     next_view_id: u32,
     loader_registry: LoaderRegistry,
+    terminal_batch: Option<TerminalBatch>,
+    terminal_journal: Option<TerminalJournal>,
+    pending_discovery_records: Vec<QueuedDiscoveryRecord>,
     scope: Scope,
     hooks: HookRegistry,
     module_hints: Vec<PathBuf>,
@@ -62,6 +67,660 @@ pub struct Engine {
     discovery_truncated: u64,
     pending_rejected_keys: BTreeSet<ObjectKey>,
     pending_retirements: BTreeSet<ProcessViewId>,
+    retirement_intents: PendingViewRetirements,
+    ready_expected_removals: BTreeSet<ProcessViewId>,
+    expected_target_exit_pending: Option<ProcessViewId>,
+    expected_target_exit: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CaptureFacts {
+    next_module_id: u32,
+    module_ids: BTreeMap<PinnedTimingKey, plan::ModuleId>,
+    module_keys: BTreeMap<plan::ModuleId, PinnedTimingKey>,
+    history: CaptureHistory,
+    staged: Option<CaptureHistory>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum DecodedOccurrence {
+    ScanTarget {
+        module: plan::ModuleId,
+        name: String,
+        object: PinnedTimingKey,
+        file_offset: u64,
+        occurrence: usize,
+    },
+    ScanSkip {
+        module: plan::ModuleId,
+        subject: String,
+        reason: String,
+        occurrence: usize,
+    },
+    ManifestFunction {
+        module: plan::ModuleId,
+        manifest: u32,
+        surface: usize,
+        function: usize,
+    },
+}
+
+impl DecodedOccurrence {
+    fn module(&self) -> plan::ModuleId {
+        match self {
+            Self::ScanTarget { module, .. }
+            | Self::ScanSkip { module, .. }
+            | Self::ManifestFunction { module, .. } => *module,
+        }
+    }
+}
+
+impl TableOccurrence {
+    fn module(&self) -> plan::ModuleId {
+        match self {
+            Self::Scan { module, .. } | Self::Manifest { module, .. } => *module,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum SurfaceOccurrence {
+    Scan {
+        module: plan::ModuleId,
+        version: (u8, u8),
+        walk: String,
+        functions: usize,
+        occurrence: usize,
+    },
+    Manifest {
+        module: plan::ModuleId,
+        manifest: u32,
+        surface: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum TableOccurrence {
+    Scan {
+        module: plan::ModuleId,
+        version: (u8, u8),
+        entries: usize,
+        occurrence: usize,
+    },
+    Manifest {
+        module: plan::ModuleId,
+        manifest: u32,
+        surface: usize,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+struct CaptureHistory {
+    modules: BTreeMap<plan::ModuleId, render::DiscoveredModule>,
+    decoded: BTreeSet<DecodedOccurrence>,
+    surfaces: BTreeMap<SurfaceOccurrence, plan::SurfaceSummary>,
+    tables: BTreeMap<TableOccurrence, plan::TableSummary>,
+    skips: BTreeMap<DecodedOccurrence, Skipped>,
+    losses: BTreeMap<(String, String), Skipped>,
+    refusals: BTreeMap<plan::ModuleId, Skipped>,
+    fallbacks: BTreeMap<(u32, u32), render::ManifestObjectFallback>,
+    corroboration_tombstones: BTreeSet<plan::ModuleId>,
+    fallback_tombstones: BTreeSet<(u32, u32)>,
+    conflicts: u64,
+    uncorroborated: u64,
+    scan_unavailable: Option<String>,
+    scan_ms: u64,
+    vendor_interfaces: usize,
+    interface_list: String,
+}
+
+fn capture_manifest_object_key(manifest: &Manifest, object: u32) -> Option<(ObjectKey, &str)> {
+    let object = manifest.objects.iter().find(|record| record.id == object)?;
+    let provenance = &manifest.provenance_objects[plan::provenance_of(manifest, object)?];
+    Some((
+        ObjectKey {
+            device: Device {
+                major: provenance.device_major,
+                minor: provenance.device_minor,
+            },
+            inode: provenance.inode,
+        },
+        &object.path,
+    ))
+}
+
+fn manifest_module_object(manifest: &Manifest, pinned: &PinnedObjects) -> Option<PinnedObjectId> {
+    let module = manifest
+        .objects
+        .iter()
+        .find(|object| object.path == manifest.module_path)?;
+    let (key, path) = capture_manifest_object_key(manifest, module.id)?;
+    pinned.id_for_manifest(key, path)
+}
+
+fn manifest_walk_label(walk: &WalkOutcome) -> String {
+    match walk {
+        WalkOutcome::Full => "full".into(),
+        WalkOutcome::KnownPrefix => "known_prefix".into(),
+        WalkOutcome::Refused => "refused".into(),
+        WalkOutcome::NotWalked => "not_walked".into(),
+        WalkOutcome::Unreadable { detail } => format!("unreadable: {detail}"),
+    }
+}
+
+fn manifest_acquisition_label(acquisition: &Acquisition) -> String {
+    match acquisition {
+        Acquisition::Ok => "ok".into(),
+        Acquisition::Absent => "absent".into(),
+        Acquisition::Empty => "empty".into(),
+        Acquisition::Error { detail } => format!("error: {detail}"),
+    }
+}
+
+fn manifest_function_skip(
+    manifest: &Manifest,
+    pinned: &PinnedObjects,
+    name: &str,
+    resolution: &Resolution,
+) -> Option<Skipped> {
+    let reason = match resolution {
+        Resolution::Resolved { object, .. } => {
+            let Some((key, path)) = capture_manifest_object_key(manifest, *object) else {
+                return Some(Skipped {
+                    subject: name.into(),
+                    reason: if manifest.objects.iter().any(|record| record.id == *object) {
+                        format!("object id {object} has no provenance record")
+                    } else {
+                        format!("object id {object} missing from manifest")
+                    },
+                });
+            };
+            if pinned.id_for_manifest(key, path).is_some() {
+                return None;
+            }
+            format!("object id {object} has no comparable pinned identity")
+        }
+        Resolution::NullPointer => "null pointer".into(),
+        Resolution::NonFileBacked => "non-file-backed".into(),
+        Resolution::Unmapped => "unmapped".into(),
+        Resolution::UnusableFile { reason, .. } => reason.clone(),
+    };
+    Some(Skipped {
+        subject: name.into(),
+        reason,
+    })
+}
+
+impl CaptureFacts {
+    fn begin_stage(&mut self) -> Result<()> {
+        if self.staged.is_some() {
+            bail!("capture-fact transaction is already active");
+        }
+        self.staged = Some(self.history.clone());
+        Ok(())
+    }
+
+    fn commit_stage(&mut self) -> Result<()> {
+        self.history = self
+            .staged
+            .take()
+            .ok_or_else(|| anyhow!("capture-fact transaction is not active"))?;
+        Ok(())
+    }
+
+    fn rollback_stage(&mut self) {
+        self.staged = None;
+    }
+
+    fn visible_history(&self) -> &CaptureHistory {
+        self.staged.as_ref().unwrap_or(&self.history)
+    }
+
+    fn replace_visible_history(&mut self, history: CaptureHistory) {
+        if self.staged.is_some() {
+            self.staged = Some(history);
+        } else {
+            self.history = history;
+        }
+    }
+
+    fn invalidate_discovery_proofs(
+        &mut self,
+        modules: impl IntoIterator<Item = plan::ModuleId>,
+        fallbacks: impl IntoIterator<Item = (u32, u32)>,
+    ) {
+        let mut history = self.visible_history().clone();
+        for module in modules {
+            let was_corroborated = history
+                .modules
+                .get(&module)
+                .is_some_and(|snapshot| snapshot.corroborated);
+            if history.corroboration_tombstones.insert(module) && was_corroborated {
+                history.uncorroborated = history.uncorroborated.saturating_add(1);
+            }
+            if let Some(snapshot) = history.modules.get_mut(&module) {
+                snapshot.corroborated = false;
+                snapshot.corroboration = vec!["uncorroborated"];
+            }
+        }
+        for fallback in fallbacks {
+            history.fallback_tombstones.insert(fallback);
+            history.fallbacks.remove(&fallback);
+        }
+        self.replace_visible_history(history);
+    }
+
+    fn resolve_module_id(&mut self, key: &PinnedTimingKey) -> Result<plan::ModuleId> {
+        if let Some(id) = self.module_ids.get(key).copied() {
+            if self.module_keys.get(&id) != Some(key) {
+                bail!("capture module identity registry is not bijective");
+            }
+            return Ok(id);
+        }
+        let id = plan::ModuleId(self.next_module_id);
+        let next = self
+            .next_module_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("capture module ID space exhausted"))?;
+        if self.module_keys.contains_key(&id) {
+            bail!("capture module ID {id:?} was already allocated");
+        }
+        self.module_ids.insert(key.clone(), id);
+        self.module_keys.insert(id, key.clone());
+        self.next_module_id = next;
+        Ok(id)
+    }
+
+    fn bind_plan_module_ids(
+        &mut self,
+        candidate: &mut plan::AttachPlan,
+        modules: &[ReconciledModule],
+        manifests: &[Manifest],
+        pinned: &PinnedObjects,
+    ) -> Result<()> {
+        let mut stable_by_object = BTreeMap::new();
+        for object in modules
+            .iter()
+            .map(|module| module.object)
+            .chain(
+                manifests
+                    .iter()
+                    .filter_map(|manifest| manifest_module_object(manifest, pinned)),
+            )
+            .chain(candidate.modules.iter().map(|module| module.object))
+        {
+            let key = pinned.owned_timing_key(object).ok_or_else(|| {
+                anyhow!("provider object {object:?} has no exact opened identity")
+            })?;
+            let id = self.resolve_module_id(&key)?;
+            if stable_by_object
+                .insert(object, id)
+                .is_some_and(|known| known != id)
+            {
+                bail!("provider object {object:?} resolved to unequal stable module IDs");
+            }
+        }
+
+        let mut remap = BTreeMap::new();
+        let mut stable_ids = BTreeSet::new();
+        for module in &candidate.modules {
+            let stable = stable_by_object[&module.object];
+            if remap
+                .insert(module.id, stable)
+                .is_some_and(|known| known != stable)
+            {
+                bail!(
+                    "candidate module ID {:?} names unequal providers",
+                    module.id
+                );
+            }
+            if !stable_ids.insert(stable) {
+                bail!("candidate contains the same exact provider more than once");
+            }
+        }
+        let remapped_slots = candidate
+            .slots
+            .iter()
+            .map(|slot| {
+                let mut slot = slot.clone();
+                slot.module_ids = slot
+                    .module_ids
+                    .iter()
+                    .map(|id| {
+                        remap.get(id).copied().ok_or_else(|| {
+                            anyhow!(
+                                "slot {} refers to unknown candidate module {id:?}",
+                                slot.index
+                            )
+                        })
+                    })
+                    .collect::<Result<_>>()?;
+                Ok(slot)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for module in &mut candidate.modules {
+            module.id = remap[&module.id];
+        }
+        candidate.slots = remapped_slots;
+        Ok(())
+    }
+
+    fn module_id_for_object(
+        &self,
+        pinned: &PinnedObjects,
+        object: PinnedObjectId,
+    ) -> Result<plan::ModuleId> {
+        let key = pinned
+            .owned_timing_key(object)
+            .ok_or_else(|| anyhow!("provider object {object:?} has no exact opened identity"))?;
+        self.module_ids
+            .get(&key)
+            .copied()
+            .ok_or_else(|| anyhow!("provider exact identity has no stable module ID"))
+    }
+
+    fn merge_current(
+        &mut self,
+        plan: &plan::AttachPlan,
+        pinned: &PinnedObjects,
+        modules: &[ReconciledModule],
+        manifests: &[Manifest],
+        manifest_ordinals: &[u32],
+        counters: &DiscoveryCounters,
+    ) -> Result<()> {
+        if manifests.len() != manifest_ordinals.len() {
+            bail!("accepted manifest history lost its source ordinals");
+        }
+        let mut history = self.visible_history().clone();
+        let current = discovery_evidence(plan, pinned, counters);
+        for mut module in current.modules {
+            let tombstoned = history.corroboration_tombstones.contains(&module.id);
+            if tombstoned {
+                module.corroborated = false;
+                module.corroboration = vec!["uncorroborated"];
+            }
+            history
+                .modules
+                .entry(module.id)
+                .and_modify(|known| {
+                    merge_discovered_module(known, module.clone());
+                    if tombstoned {
+                        known.corroborated = false;
+                        known.corroboration = vec!["uncorroborated"];
+                    }
+                })
+                .or_insert(module);
+        }
+
+        for module in modules {
+            let owner = self.module_id_for_object(pinned, module.object)?;
+            let mut targets = BTreeMap::new();
+            let mut skips = BTreeMap::new();
+            let mut surfaces = BTreeMap::new();
+            let mut tables = BTreeMap::new();
+            for (table_index, table) in module.scanned.tables.iter().enumerate() {
+                let functions =
+                    table.entries.len() + table.null_entries.len() + table.unpinned.len();
+                let surface = (table.version, table.walk.to_string(), functions);
+                let surface_occurrence = surfaces.entry(surface.clone()).or_insert(0usize);
+                history
+                    .surfaces
+                    .entry(SurfaceOccurrence::Scan {
+                        module: owner,
+                        version: surface.0,
+                        walk: surface.1.clone(),
+                        functions,
+                        occurrence: *surface_occurrence,
+                    })
+                    .or_insert_with(|| plan::SurfaceSummary {
+                        source: format!(
+                            "{} table {}.{}",
+                            module.scanned.path, table.version.0, table.version.1
+                        ),
+                        walk: table.walk.to_string(),
+                        acquisition: "ok".into(),
+                        functions,
+                    });
+                let table_fact = (table.version, table.entries.len());
+                let table_occurrence = tables.entry(table_fact).or_insert(0usize);
+                history
+                    .tables
+                    .entry(TableOccurrence::Scan {
+                        module: owner,
+                        version: table_fact.0,
+                        entries: table_fact.1,
+                        occurrence: *table_occurrence,
+                    })
+                    .or_insert(plan::TableSummary {
+                        version: table_fact.0,
+                        entries: table_fact.1,
+                        source: "scan",
+                    });
+                *table_occurrence += 1;
+                *surface_occurrence += 1;
+
+                let objects = module.entry_objects.get(table_index).ok_or_else(|| {
+                    anyhow!("reconciled provider table has no parallel target identities")
+                })?;
+                if objects.len() != table.entries.len() {
+                    bail!("reconciled provider table target identities are incomplete");
+                }
+                for (entry, object) in table.entries.iter().zip(objects) {
+                    let object = pinned.owned_timing_key(*object).ok_or_else(|| {
+                        anyhow!("decoded target object has no exact opened identity")
+                    })?;
+                    let fact = (entry.name.to_string(), object, entry.file_offset);
+                    let occurrence = targets.entry(fact.clone()).or_insert(0usize);
+                    history.decoded.insert(DecodedOccurrence::ScanTarget {
+                        module: owner,
+                        name: fact.0,
+                        object: fact.1,
+                        file_offset: fact.2,
+                        occurrence: *occurrence,
+                    });
+                    *occurrence += 1;
+                }
+                for skipped in table
+                    .null_entries
+                    .iter()
+                    .map(|name| Skipped {
+                        subject: (*name).to_string(),
+                        reason: "null pointer".into(),
+                    })
+                    .chain(table.unpinned.iter().cloned())
+                {
+                    let fact = (skipped.subject.clone(), skipped.reason.clone());
+                    let occurrence = skips.entry(fact.clone()).or_insert(0usize);
+                    let key = DecodedOccurrence::ScanSkip {
+                        module: owner,
+                        subject: fact.0,
+                        reason: fact.1,
+                        occurrence: *occurrence,
+                    };
+                    history.decoded.insert(key.clone());
+                    history.skips.entry(key).or_insert(skipped);
+                    *occurrence += 1;
+                }
+            }
+        }
+
+        for (manifest, manifest_ordinal) in manifests.iter().zip(manifest_ordinals) {
+            let object = manifest_module_object(manifest, pinned).ok_or_else(|| {
+                anyhow!(
+                    "accepted manifest {} has no exact pinned provider identity",
+                    manifest.module_path
+                )
+            })?;
+            let owner = self.module_id_for_object(pinned, object)?;
+            for (surface_index, surface) in manifest.surfaces.iter().enumerate() {
+                let surface_key = SurfaceOccurrence::Manifest {
+                    module: owner,
+                    manifest: *manifest_ordinal,
+                    surface: surface_index,
+                };
+                history
+                    .surfaces
+                    .entry(surface_key)
+                    .or_insert_with(|| plan::SurfaceSummary {
+                        source: plan::source_label(&surface.source),
+                        walk: manifest_walk_label(&surface.walk),
+                        acquisition: manifest_acquisition_label(&surface.acquisition),
+                        functions: surface.functions.len(),
+                    });
+                history
+                    .tables
+                    .entry(TableOccurrence::Manifest {
+                        module: owner,
+                        manifest: *manifest_ordinal,
+                        surface: surface_index,
+                    })
+                    .or_insert(plan::TableSummary {
+                        version: surface
+                            .version
+                            .map_or((0, 0), |version| (version.major, version.minor)),
+                        entries: surface.functions.len(),
+                        source: "manifest",
+                    });
+                for (function_index, function) in surface.functions.iter().enumerate() {
+                    let key = DecodedOccurrence::ManifestFunction {
+                        module: owner,
+                        manifest: *manifest_ordinal,
+                        surface: surface_index,
+                        function: function_index,
+                    };
+                    history.decoded.insert(key.clone());
+                    if let Some(skipped) = manifest_function_skip(
+                        manifest,
+                        pinned,
+                        &function.name,
+                        &function.resolution,
+                    ) {
+                        history.skips.entry(key).or_insert(skipped);
+                    }
+                }
+            }
+        }
+
+        for skipped in &counters.object_skips {
+            history
+                .losses
+                .entry((skipped.subject.clone(), skipped.reason.clone()))
+                .or_insert_with(|| skipped.clone());
+        }
+        for (object, refused) in plan.refused_modules() {
+            let id = self.module_id_for_object(pinned, object)?;
+            history
+                .refusals
+                .entry(id)
+                .or_insert_with(|| refused.clone());
+        }
+        for fallback in current.manifest_object_fallbacks {
+            let key = (fallback.manifest, fallback.object);
+            if !history.fallback_tombstones.contains(&key) {
+                history.fallbacks.entry(key).or_insert(fallback);
+            }
+        }
+        history.conflicts = history.conflicts.max(current.conflicts);
+        history.uncorroborated = history.uncorroborated.max(current.uncorroborated);
+        history.scan_unavailable = history.scan_unavailable.take().or(current.scan_unavailable);
+        history.scan_ms = history.scan_ms.max(current.scan_ms);
+        history.vendor_interfaces = history.vendor_interfaces.max(plan.vendor_interfaces);
+        if history.interface_list.is_empty() || history.interface_list == "absent" {
+            history.interface_list.clone_from(&plan.interface_list);
+        }
+        self.replace_visible_history(history);
+        Ok(())
+    }
+
+    fn apply_to_plan(&self, plan: &mut plan::AttachPlan) {
+        let history = self.visible_history();
+        plan.entries_seen = history.decoded.len();
+        plan.surfaces = history.surfaces.values().cloned().collect();
+        plan.skipped = self
+            .visible_history()
+            .skips
+            .values()
+            .chain(history.losses.values())
+            .cloned()
+            .collect();
+        plan.modules_skipped = history.refusals.values().cloned().collect();
+        plan.vendor_interfaces = history.vendor_interfaces;
+        if !history.interface_list.is_empty() {
+            plan.interface_list.clone_from(&history.interface_list);
+        }
+    }
+
+    fn discovery(&self, plan: &plan::AttachPlan) -> render::DiscoveryEvidence {
+        let history = self.visible_history();
+        let modules = history
+            .modules
+            .values()
+            .cloned()
+            .map(|mut module| {
+                module.tables = history
+                    .tables
+                    .iter()
+                    .filter(|(occurrence, _)| occurrence.module() == module.id)
+                    .map(|(_, table)| table.clone())
+                    .collect();
+                module.skipped = history
+                    .skips
+                    .iter()
+                    .filter(|(occurrence, _)| occurrence.module() == module.id)
+                    .map(|(_, skipped)| render::capture_skipped_out(skipped))
+                    .collect();
+                module
+            })
+            .collect();
+        render::DiscoveryEvidence {
+            modules,
+            conflicts: history.conflicts,
+            uncorroborated: history.uncorroborated,
+            module_ambiguous: plan.module_ambiguous as u64,
+            modules_skipped: history.refusals.values().map(skipped_out).collect(),
+            manifest_object_fallbacks: history.fallbacks.values().cloned().collect(),
+            scan_unavailable: history.scan_unavailable.clone(),
+            scan_ms: history.scan_ms,
+            ..render::DiscoveryEvidence::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn module_key(&self, id: plan::ModuleId) -> Option<&PinnedTimingKey> {
+        self.module_keys.get(&id)
+    }
+}
+
+fn extend_occurrences<T: Clone + PartialEq>(retained: &mut Vec<T>, incoming: Vec<T>) {
+    let mut seen = Vec::new();
+    for item in incoming {
+        let occurrence = seen.iter().filter(|known| *known == &item).count();
+        if retained.iter().filter(|known| *known == &item).count() <= occurrence {
+            retained.push(item.clone());
+        }
+        seen.push(item);
+    }
+}
+
+fn merge_discovered_module(
+    retained: &mut render::DiscoveredModule,
+    incoming: render::DiscoveredModule,
+) {
+    extend_occurrences(&mut retained.objects, incoming.objects);
+    extend_occurrences(&mut retained.tables, incoming.tables);
+    extend_occurrences(&mut retained.skipped, incoming.skipped);
+    retained.interfaces = retained.interfaces.max(incoming.interfaces);
+    retained.corroborated |= incoming.corroborated;
+    for source in incoming.sources {
+        if !retained.sources.contains(&source) {
+            retained.sources.push(source);
+        }
+    }
+    for outcome in incoming.corroboration {
+        if !retained.corroboration.contains(&outcome) {
+            retained.corroboration.push(outcome);
+        }
+    }
 }
 
 struct ScanInput {
@@ -72,13 +731,32 @@ struct ScanInput {
 
 type InventoryScan = (ProcessViewId, Vec<ScannedModule>, PinnedObjects);
 type InventoryScanOutcome = (Vec<InventoryScan>, BTreeSet<u32>, Vec<Skipped>);
-type PendingViewRetirements = BTreeMap<ProcessViewId, bool>;
+type PendingViewRetirements = BTreeMap<ProcessViewId, RetirementCause>;
 type DiscoveryCollector<'a> = dyn FnMut(&mut Session) -> Result<(Vec<DiscoveryRecord>, u64)> + 'a;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetirementCause {
+    ExecRefresh,
+    ExpectedRemoval,
+    GenerationLost,
+}
+
+impl RetirementCause {
+    fn merge(self, incoming: Self) -> Self {
+        use RetirementCause::{ExecRefresh, ExpectedRemoval, GenerationLost};
+        match (self, incoming) {
+            (GenerationLost, _) | (_, GenerationLost) => GenerationLost,
+            (ExpectedRemoval, _) | (_, ExpectedRemoval) => ExpectedRemoval,
+            (ExecRefresh, ExecRefresh) => ExecRefresh,
+        }
+    }
+}
 
 pub(crate) struct DeferredDiscoveryItem {
     pub(crate) before_ns: u64,
     pub(crate) after_ns: u64,
     pub(crate) item: crate::events::DiscoveryItem,
+    pub(crate) terminal_batch: Option<TerminalBatch>,
 }
 
 impl std::fmt::Debug for DeferredDiscoveryItem {
@@ -116,6 +794,16 @@ struct LiveCandidate {
     manifest_fallbacks: Vec<ManifestFallback>,
 }
 
+struct StartPublicationSnapshot {
+    plan: plan::AttachPlan,
+    pinned: PinnedObjects,
+    discovery: render::DiscoveryEvidence,
+    modules: Vec<ReconciledModule>,
+    corroboration: Vec<(BTreeSet<PinnedObjectId>, &'static str)>,
+    manifest_fallbacks: Vec<ManifestFallback>,
+    views: BTreeSet<ProcessViewId>,
+}
+
 #[derive(Default)]
 struct ApplyOutcome {
     committed: bool,
@@ -131,6 +819,19 @@ struct ApplyOutcome {
 pub(crate) struct DiscoveryBatchOutcome {
     pub(crate) changed: bool,
     pub(crate) required_complete: bool,
+}
+
+type BatchStart =
+    std::result::Result<Vec<QueuedDiscoveryRecord>, (anyhow::Error, Vec<QueuedDiscoveryRecord>)>;
+
+fn begin_discovery_batch(
+    records: Vec<QueuedDiscoveryRecord>,
+    predispatch: Result<()>,
+) -> BatchStart {
+    match predispatch {
+        Ok(()) => Ok(records),
+        Err(error) => Err((error, records)),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,6 +970,69 @@ struct QueuedDiscoveryRecord {
     record: DiscoveryRecord,
     terminal_owner: Option<LoaderContextId>,
     terminal_exports: Vec<DynamicExportIdentity>,
+}
+
+#[derive(Clone)]
+pub(crate) struct TerminalAuthority {
+    pub(crate) owner: LoaderContextId,
+    pub(crate) exports: Vec<DynamicExportIdentity>,
+}
+
+/// The only transfer that may carry a tombstoned loader's final exports.  It
+/// stays separate from ordinary pending records so a later generic drain
+/// cannot accidentally consume it.
+#[derive(Clone)]
+pub(crate) struct TerminalBatch {
+    pub(crate) authority: TerminalAuthority,
+    records: Vec<QueuedDiscoveryRecord>,
+}
+
+impl TerminalBatch {
+    pub(crate) fn empty(authority: TerminalAuthority) -> Self {
+        Self {
+            authority,
+            records: Vec::new(),
+        }
+    }
+
+    pub(crate) fn extend(&mut self, records: impl IntoIterator<Item = DiscoveryRecord>) {
+        let start = self.records.len();
+        self.records
+            .extend(records.into_iter().map(|record| QueuedDiscoveryRecord {
+                record,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            }));
+        self.authority.tag_matching(&mut self.records[start..]);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_count(&self) -> usize {
+        self.records.len()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TerminalJournal {
+    owner: LoaderContextId,
+    dispatch_started: bool,
+    retry_used: bool,
+}
+
+impl TerminalAuthority {
+    fn tag_matching(&self, records: &mut [QueuedDiscoveryRecord]) -> bool {
+        let mut matched = false;
+        for queued in records {
+            if queued.record.kind == DISCOVERY_KIND_LOADER
+                && LoaderContextId::from_case_id(queued.record.case_id) == self.owner
+            {
+                queued.terminal_owner = Some(self.owner);
+                queued.terminal_exports = self.exports.clone();
+                matched = true;
+            }
+        }
+        matched
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -758,9 +1522,28 @@ fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
         }
         match std::fs::read_dir(&dir) {
             Ok(entries) => {
-                for entry in entries.flatten() {
-                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                        stack.push(entry.path());
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            lost.push(Skipped {
+                                subject: dir.display().to_string(),
+                                reason: format!(
+                                    "a cgroup directory entry could not be read ({error}); membership absence is not authoritative"
+                                ),
+                            });
+                            continue;
+                        }
+                    };
+                    match entry.file_type() {
+                        Ok(kind) if kind.is_dir() => stack.push(entry.path()),
+                        Ok(_) => {}
+                        Err(error) => lost.push(Skipped {
+                            subject: entry.path().display().to_string(),
+                            reason: format!(
+                                "a cgroup directory entry type could not be read ({error}); membership absence is not authoritative"
+                            ),
+                        }),
                     }
                 }
             }
@@ -1104,7 +1887,9 @@ fn discovery_evidence(
             let objects: Vec<render::ObjectSummary> = plan
                 .slots
                 .iter()
-                .filter(|s| s.module_ids.contains(&m.id) && seen.insert(s.object))
+                .filter(|s| {
+                    plan.is_active(s.index) && s.module_ids.contains(&m.id) && seen.insert(s.object)
+                })
                 .map(|s| summary_of(s.object, &s.object_path))
                 .collect();
             let identity = summary_of(m.object, &m.path);
@@ -1816,6 +2601,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     }
     counters.object_skips.extend(overlay_skips);
     let mut accepted = Vec::new();
+    let mut accepted_ordinals = Vec::new();
     let mut pending_fallbacks = Vec::new();
     let mut pending_outcomes = Vec::new();
     let mut identity_mismatches = 0usize;
@@ -1937,6 +2723,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
                     manifest_pins,
                 );
                 accepted.push(manifest);
+                accepted_ordinals.push(manifest_number);
                 counters
                     .object_skips
                     .extend(pinned.absorb(manifest_pins.clone()));
@@ -1955,6 +2742,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
                     manifest_pins,
                 );
                 accepted.push(manifest);
+                accepted_ordinals.push(manifest_number);
                 counters
                     .object_skips
                     .extend(pinned.absorb(manifest_pins.clone()));
@@ -1974,6 +2762,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
                     manifest_pins,
                 );
                 accepted.push(manifest);
+                accepted_ordinals.push(manifest_number);
                 counters
                     .object_skips
                     .extend(pinned.absorb(manifest_pins.clone()));
@@ -1981,6 +2770,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
             Corroboration::Uncorroborated => {
                 retarget_to_pins(&mut manifest, &[], &pinned, manifest_pins);
                 accepted.push(manifest);
+                accepted_ordinals.push(manifest_number);
                 counters
                     .object_skips
                     .extend(pinned.absorb(manifest_pins.clone()));
@@ -2025,7 +2815,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         });
     }
     let manifest_fallbacks = counters.manifest_fallbacks.len();
-    let plan = build_current_plan(
+    let mut plan = build_current_plan(
         &modules,
         &accepted,
         &pinned,
@@ -2035,6 +2825,9 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         manifest_fallbacks,
     )
     .inspect_err(|_| counters.report_notes())?;
+    discovered
+        .capture_facts
+        .bind_plan_module_ids(&mut plan, &modules, &accepted, &pinned)?;
     if let Some(fallback) = counters
         .manifest_fallbacks
         .iter()
@@ -2055,6 +2848,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     discovered.discovery = discovery;
     discovered.modules = modules;
     discovered.manifests = accepted;
+    discovered.manifest_ordinals = accepted_ordinals;
     discovered.counters = counters;
     discovered.identity_mismatches = identity_mismatches;
     Ok(())
@@ -2472,6 +3266,33 @@ fn candidate_sources_without_view(
     (pinned, modules)
 }
 
+fn commit_cleaned_candidate_identity(
+    candidate: &mut LiveCandidate,
+    pinned: PinnedObjects,
+    modules: Vec<ReconciledModule>,
+    stale_views: &BTreeSet<ProcessViewId>,
+) {
+    candidate.pinned = pinned;
+    candidate.modules = modules;
+    candidate.views.retain(|view| !stale_views.contains(view));
+    let module_objects: BTreeSet<_> = candidate
+        .plan
+        .modules
+        .iter()
+        .map(|module| module.object)
+        .collect();
+    candidate.corroboration.retain(|(objects, _)| {
+        !objects.is_empty()
+            && objects.iter().all(|object| {
+                module_objects.contains(object) && candidate.pinned.summary(*object).is_some()
+            })
+    });
+    candidate.manifest_fallbacks.retain(|fallback| {
+        candidate.pinned.summary(fallback.replacement).is_some()
+            && fallback_proof_in_plan(&fallback.proof, &candidate.plan)
+    });
+}
+
 fn completed_retirement_intent(
     removed: &BTreeSet<ProcessViewId>,
     context_views: &BTreeSet<ProcessViewId>,
@@ -2583,6 +3404,7 @@ fn generation_checked_mutation<T>(
     }
 }
 
+#[cfg(test)]
 fn begin_attached_retirement_with<T>(
     registry: &mut LoaderRegistry,
     context: LoaderContextId,
@@ -2664,6 +3486,71 @@ fn process_view_is_current(
         .chain(extra_views.iter().copied())
         .find(|view| view.id() == id)
         .is_some_and(ProcessView::still_the_same)
+}
+
+fn lifecycle_retirement(
+    views: &[ProcessView],
+    pid: u32,
+    hook_ts_ns: u64,
+    kind: u8,
+) -> Option<(ProcessViewId, RetirementCause)> {
+    let view = views
+        .iter()
+        .filter(|view| view.matches_lifecycle_event(pid, hook_ts_ns))
+        .max_by_key(|view| view.admitted_ns())?;
+    let cause = match kind {
+        DISCOVERY_KIND_EXEC => RetirementCause::ExecRefresh,
+        DISCOVERY_KIND_LEADER_EXIT => RetirementCause::ExpectedRemoval,
+        _ => return None,
+    };
+    Some((view.id(), cause))
+}
+
+fn finalize_batch_retirement_cause(
+    cause: RetirementCause,
+    original_current: bool,
+) -> RetirementCause {
+    if cause == RetirementCause::ExecRefresh && !original_current {
+        RetirementCause::GenerationLost
+    } else {
+        cause
+    }
+}
+
+fn unmatched_exec_requests_refresh(views: &[ProcessView], pid: u32) -> bool {
+    !views.iter().any(|view| view.pid() == pid)
+}
+
+fn inventory_retirement_cause(
+    original_current: bool,
+    membership_authoritative: bool,
+    still_in_scope: bool,
+    refresh_requested: bool,
+) -> Option<(RetirementCause, bool)> {
+    if membership_authoritative && !still_in_scope {
+        Some((RetirementCause::ExpectedRemoval, true))
+    } else if !original_current {
+        Some((RetirementCause::GenerationLost, false))
+    } else if refresh_requested {
+        Some((RetirementCause::ExecRefresh, false))
+    } else {
+        None
+    }
+}
+
+fn retirement_ready_with(
+    cause: RetirementCause,
+    original_exited: impl FnOnce() -> Result<bool, String>,
+) -> Result<bool, String> {
+    if cause == RetirementCause::ExpectedRemoval {
+        original_exited()
+    } else {
+        Ok(true)
+    }
+}
+
+fn retirement_ready(cause: RetirementCause, view: &ProcessView) -> Result<bool, String> {
+    retirement_ready_with(cause, || view.original_exited())
 }
 
 fn process_views_are_current(
@@ -2751,9 +3638,11 @@ impl Engine {
             plan: plan::build_from_reconciled_modules(&[]),
             pinned: PinnedObjects::empty(),
             discovery: render::DiscoveryEvidence::default(),
+            capture_facts: CaptureFacts::default(),
             views: Vec::new(),
             modules: Vec::new(),
             manifests: Vec::new(),
+            manifest_ordinals: Vec::new(),
             counters: DiscoveryCounters::default(),
             identity_mismatches: 0,
             scan_inputs: BTreeMap::new(),
@@ -2762,6 +3651,9 @@ impl Engine {
             budget: CaptureWorkBudget::default(),
             next_view_id: 0,
             loader_registry: LoaderRegistry::default(),
+            terminal_batch: None,
+            terminal_journal: None,
+            pending_discovery_records: Vec::new(),
             scope: Scope::Pid(std::process::id()),
             hooks: HookRegistry::builtin(),
             module_hints: Vec::new(),
@@ -2773,6 +3665,10 @@ impl Engine {
             discovery_truncated: 0,
             pending_rejected_keys: BTreeSet::new(),
             pending_retirements: BTreeSet::new(),
+            retirement_intents: PendingViewRetirements::new(),
+            ready_expected_removals: BTreeSet::new(),
+            expected_target_exit_pending: None,
+            expected_target_exit: false,
         }
     }
 
@@ -2911,6 +3807,116 @@ impl Engine {
         counters.object_skips
     }
 
+    fn publish_current_capture_facts(&mut self) -> Result<()> {
+        self.capture_facts.merge_current(
+            &self.plan,
+            &self.pinned,
+            &self.modules,
+            &self.manifests,
+            &self.manifest_ordinals,
+            &self.counters,
+        )?;
+        if self.capture_facts.staged.is_some() {
+            return Ok(());
+        }
+        self.project_capture_facts();
+        Ok(())
+    }
+
+    fn project_capture_facts(&mut self) {
+        self.capture_facts.apply_to_plan(&mut self.plan);
+        self.discovery = self.capture_facts.discovery(&self.plan);
+    }
+
+    fn start_publication_snapshot(&self) -> StartPublicationSnapshot {
+        StartPublicationSnapshot {
+            plan: self.plan.clone(),
+            pinned: self.pinned.clone(),
+            discovery: self.discovery.clone(),
+            modules: self.modules.clone(),
+            corroboration: self.counters.corroboration.clone(),
+            manifest_fallbacks: self.counters.manifest_fallbacks.clone(),
+            views: self.views.iter().map(ProcessView::id).collect(),
+        }
+    }
+
+    fn begin_start_capture_attempt(&mut self) -> Result<StartPublicationSnapshot> {
+        self.capture_facts.begin_stage()?;
+        let snapshot = self.start_publication_snapshot();
+        if let Err(error) = self.publish_current_capture_facts() {
+            self.capture_facts.rollback_stage();
+            return Err(error);
+        }
+        Ok(snapshot)
+    }
+
+    fn restore_start_publication(&mut self, snapshot: StartPublicationSnapshot) -> Result<()> {
+        let retained_views: BTreeSet<_> = self.views.iter().map(ProcessView::id).collect();
+        let removed_views: BTreeSet<_> = snapshot
+            .views
+            .difference(&retained_views)
+            .copied()
+            .collect();
+        let mut pinned = snapshot.pinned;
+        for view in &removed_views {
+            pinned.remove_view(*view);
+        }
+        let modules: Vec<_> = snapshot
+            .modules
+            .into_iter()
+            .filter(|module| !removed_views.contains(&module.scanned.view))
+            .collect();
+        let mut rebuilt = snapshot
+            .plan
+            .rebuild_from_sources(&modules, &self.manifests, &pinned);
+        self.capture_facts.bind_plan_module_ids(
+            &mut rebuilt,
+            &modules,
+            &self.manifests,
+            &pinned,
+        )?;
+        record_object_skips(&mut rebuilt, &self.counters.object_skips);
+        let mut plan = snapshot.plan;
+        plan.extend_exact_with_stable_module_ids(rebuilt)
+            .map_err(anyhow::Error::msg)?;
+
+        self.plan = plan;
+        self.pinned = pinned;
+        self.modules = modules;
+        self.counters.corroboration = snapshot.corroboration;
+        self.counters.manifest_fallbacks = snapshot.manifest_fallbacks;
+        if removed_views.is_empty() {
+            self.discovery = snapshot.discovery;
+        } else if self.capture_facts.history.modules.is_empty()
+            && self.capture_facts.history.decoded.is_empty()
+        {
+            self.discovery = discovery_evidence(&self.plan, &self.pinned, &self.counters);
+        } else {
+            self.project_capture_facts();
+        }
+        Ok(())
+    }
+
+    fn finish_start_capture_attempt<T>(
+        &mut self,
+        snapshot: StartPublicationSnapshot,
+        result: Result<T>,
+    ) -> Result<T> {
+        match result {
+            Ok(value) => {
+                self.capture_facts.commit_stage()?;
+                self.project_capture_facts();
+                Ok(value)
+            }
+            Err(error) => {
+                self.capture_facts.rollback_stage();
+                self.restore_start_publication(snapshot)
+                    .with_context(|| format!("restoring capture state after: {error:#}"))?;
+                Err(error)
+            }
+        }
+    }
+
     fn live_candidate(
         &mut self,
         mut pinned: PinnedObjects,
@@ -2947,42 +3953,62 @@ impl Engine {
         let mut rebuilt = self
             .plan
             .rebuild_from_sources(&modules, &self.manifests, &pinned);
+        self.capture_facts.bind_plan_module_ids(
+            &mut rebuilt,
+            &modules,
+            &self.manifests,
+            &pinned,
+        )?;
         record_object_skips(&mut rebuilt, &self.counters.object_skips);
-        let mut candidate_plan = self.plan.clone();
-        let delta = candidate_plan
-            .extend_exact(rebuilt)
-            .map_err(anyhow::Error::msg)?;
-        if !candidate_identity_is_complete(&candidate_plan, &modules, &pinned) {
-            bail!("live candidate retained an active module or slot without exact pinned identity");
-        }
-        let module_objects: BTreeSet<_> = candidate_plan
-            .modules
-            .iter()
-            .map(|module| module.object)
-            .collect();
+        let module_objects: BTreeSet<_> =
+            rebuilt.modules.iter().map(|module| module.object).collect();
         let mut corroboration = self.counters.corroboration.clone();
-        let corroboration_before = corroboration.len();
+        let mut invalidated_modules = BTreeSet::new();
         corroboration.retain(|(objects, _)| {
-            !objects.is_empty()
+            let keep = !objects.is_empty()
                 && objects.iter().all(|object| {
                     module_objects.contains(object) && pinned.summary(*object).is_some()
-                })
+                });
+            if !keep {
+                invalidated_modules.extend(
+                    self.plan
+                        .modules
+                        .iter()
+                        .filter(|module| objects.contains(&module.object))
+                        .map(|module| module.id),
+                );
+            }
+            keep
         });
         let mut manifest_fallbacks = self.counters.manifest_fallbacks.clone();
-        let fallback_before = manifest_fallbacks.len();
+        let mut invalidated_fallbacks = BTreeSet::new();
         manifest_fallbacks.retain(|fallback| {
-            pinned.summary(fallback.replacement).is_some()
-                && fallback_proof_in_plan(&fallback.proof, &candidate_plan)
+            let keep = pinned.summary(fallback.replacement).is_some()
+                && fallback_proof_in_plan(&fallback.proof, &rebuilt);
+            if !keep {
+                invalidated_fallbacks.insert((fallback.manifest, fallback.object));
+            }
+            keep
         });
-        if corroboration.len() != corroboration_before
-            || manifest_fallbacks.len() != fallback_before
-        {
+        if !invalidated_modules.is_empty() || !invalidated_fallbacks.is_empty() {
+            self.capture_facts
+                .invalidate_discovery_proofs(invalidated_modules, invalidated_fallbacks);
+            if self.capture_facts.staged.is_none() {
+                self.project_capture_facts();
+            }
             self.mark_partial(
                 "live discovery evidence",
                 "a late identity collision invalidated prior exact fallback or corroboration evidence",
             );
-            record_object_skips(&mut candidate_plan, &self.counters.object_skips);
         }
+        let mut candidate_plan = self.plan.clone();
+        let delta = candidate_plan
+            .extend_exact_with_stable_module_ids(rebuilt)
+            .map_err(anyhow::Error::msg)?;
+        if !candidate_identity_is_complete(&candidate_plan, &modules, &pinned) {
+            bail!("live candidate retained an active module or slot without exact pinned identity");
+        }
+        record_object_skips(&mut candidate_plan, &self.counters.object_skips);
         let views = modules.iter().map(|module| module.scanned.view).collect();
         Ok(LiveCandidate {
             pinned,
@@ -3267,14 +4293,20 @@ impl Engine {
                 .filter(|module| !outcome.stale_views.contains(&module.scanned.view))
                 .cloned()
                 .collect();
-            let rebuilt = candidate.plan.rebuild_from_sources(
+            let mut rebuilt = candidate.plan.rebuild_from_sources(
                 &cleaned_modules,
                 &self.manifests,
                 &cleaned_pins,
             );
+            self.capture_facts.bind_plan_module_ids(
+                &mut rebuilt,
+                &cleaned_modules,
+                &self.manifests,
+                &cleaned_pins,
+            )?;
             let cleanup = candidate
                 .plan
-                .extend_exact(rebuilt)
+                .extend_exact_with_stable_module_ids(rebuilt)
                 .map_err(anyhow::Error::msg)?;
             let cleanup_slots: Vec<_> = cleanup
                 .retire
@@ -3291,6 +4323,12 @@ impl Engine {
             for slot in &cleanup.replace {
                 candidate.plan.deactivate(slot.index);
             }
+            commit_cleaned_candidate_identity(
+                &mut candidate,
+                cleaned_pins,
+                cleaned_modules,
+                &outcome.stale_views,
+            );
             self.mark_partial(
                 "live discovery generation",
                 "a process generation changed after link mutation; its targets were retired before context cleanup",
@@ -3308,7 +4346,7 @@ impl Engine {
         self.plan = candidate.plan;
         self.counters.corroboration = candidate.corroboration;
         self.counters.manifest_fallbacks = candidate.manifest_fallbacks;
-        self.discovery = discovery_evidence(&self.plan, &self.pinned, &self.counters);
+        self.publish_current_capture_facts()?;
         outcome.committed = true;
         Ok(outcome)
     }
@@ -4301,6 +5339,178 @@ impl Engine {
         }
     }
 
+    fn begin_terminal_drain<T>(
+        &mut self,
+        owner: LoaderContextId,
+        exports: Vec<DynamicExportIdentity>,
+        drain: impl FnOnce() -> Result<T>,
+    ) -> Result<Result<T>> {
+        if self.terminal_journal.is_some() {
+            bail!("terminal loader drain authority is already pending");
+        }
+        self.loader_registry
+            .tombstone(owner)
+            .map_err(anyhow::Error::msg)?;
+        self.terminal_batch = Some(TerminalBatch::empty(TerminalAuthority { owner, exports }));
+        self.terminal_journal = Some(TerminalJournal {
+            owner,
+            dispatch_started: false,
+            retry_used: false,
+        });
+        Ok(drain())
+    }
+
+    fn terminal_owner(&self) -> Option<LoaderContextId> {
+        self.terminal_journal.map(|journal| journal.owner)
+    }
+
+    fn retain_terminal_batch(
+        &mut self,
+        records: impl IntoIterator<Item = DiscoveryRecord>,
+    ) -> Result<()> {
+        let batch = self
+            .terminal_batch
+            .as_mut()
+            .ok_or_else(|| anyhow!("terminal loader drain batch is missing"))?;
+        batch.extend(records);
+        Ok(())
+    }
+
+    pub(crate) fn install_terminal_batch(
+        &mut self,
+        mut batch: TerminalBatch,
+        records: impl IntoIterator<Item = DiscoveryRecord>,
+    ) -> Result<()> {
+        let Some(journal) = self.terminal_journal else {
+            bail!("terminal loader drain journal is missing");
+        };
+        if journal.owner != batch.authority.owner
+            || journal.dispatch_started
+            || self.terminal_batch.is_some()
+        {
+            bail!("terminal loader drain batch cannot be restored");
+        }
+        batch.extend(records);
+        self.terminal_batch = Some(batch);
+        Ok(())
+    }
+
+    fn take_terminal_batch_for_deferred(&mut self) -> Result<TerminalBatch> {
+        self.terminal_batch
+            .take()
+            .ok_or_else(|| anyhow!("terminal loader drain batch is missing"))
+    }
+
+    fn dispatch_terminal_batch(
+        &mut self,
+        session: &mut Session,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+        closure: &mut PauseClosure,
+    ) -> Result<Option<bool>> {
+        let Some(batch) = self.terminal_batch.take() else {
+            let Some(journal) = self.terminal_journal else {
+                return Ok(Some(false));
+            };
+            if !journal.dispatch_started {
+                return Ok(Some(false));
+            }
+            if self.loader_registry.remove(journal.owner).is_err() {
+                *additions_allowed = false;
+                self.mark_partial(
+                    "live loader retirement",
+                    "a dispatched tombstoned loader context could not be removed",
+                );
+                return Ok(Some(false));
+            }
+            self.terminal_journal = None;
+            return Ok(Some(false));
+        };
+        let journal = self
+            .terminal_journal
+            .as_ref()
+            .ok_or_else(|| anyhow!("terminal loader drain journal is missing"))?;
+        if journal.owner != batch.authority.owner || journal.dispatch_started {
+            bail!("terminal loader drain batch was already dispatched");
+        }
+        let owner = journal.owner;
+        let mut records = match begin_discovery_batch(
+            batch.records,
+            self.update_counter_snapshot(session),
+        ) {
+            Ok(records) => records,
+            Err((_, records)) => {
+                let retry_used = self
+                    .terminal_journal
+                    .as_ref()
+                    .expect("journal checked above")
+                    .retry_used;
+                if retry_used {
+                    self.terminal_journal
+                        .as_mut()
+                        .expect("journal checked above")
+                        .dispatch_started = true;
+                    if self.loader_registry.remove(owner).is_ok() {
+                        self.terminal_journal = None;
+                    }
+                    *additions_allowed = false;
+                    closure.fail();
+                    self.mark_live_loss(
+                        "live discovery counters",
+                        "the terminal batch exhausted its one predispatch retry and was cleaned without replay",
+                    );
+                    return Ok(Some(false));
+                }
+                self.terminal_journal
+                    .as_mut()
+                    .expect("journal checked above")
+                    .retry_used = true;
+                self.terminal_batch = Some(TerminalBatch {
+                    authority: batch.authority,
+                    records,
+                });
+                self.mark_live_loss(
+                    "live discovery counters",
+                    "the post-detach producer snapshot could not be read; the exact terminal batch remains queued",
+                );
+                return Ok(None);
+            }
+        };
+        self.terminal_journal
+            .as_mut()
+            .expect("journal checked above")
+            .dispatch_started = true;
+        let mut changed = false;
+        for queued in records.drain(..) {
+            match self.dispatch_discovery_record(queued, session, additions_allowed, pending_views)
+            {
+                Ok(outcome) => {
+                    changed |= outcome.changed();
+                    if !outcome.required_complete() {
+                        closure.fail();
+                    }
+                }
+                Err(_) => {
+                    closure.fail();
+                    self.mark_live_loss(
+                        "live discovery record",
+                        "a structurally valid private terminal record failed exact live resolution",
+                    );
+                }
+            }
+        }
+        if self.loader_registry.remove(owner).is_err() {
+            *additions_allowed = false;
+            self.mark_partial(
+                "live loader retirement",
+                "a dispatched tombstoned loader context could not be removed",
+            );
+            return Ok(Some(changed));
+        }
+        self.terminal_journal = None;
+        Ok(Some(changed))
+    }
+
     fn retire_loader_contexts(
         &mut self,
         view: ProcessViewId,
@@ -4316,9 +5526,24 @@ impl Engine {
                 continue;
             };
             if self.loader_registry.is_tombstoned(context_id) {
+                if self.terminal_owner() == Some(context_id) {
+                    match self.dispatch_terminal_batch(
+                        session,
+                        additions_allowed,
+                        pending_views,
+                        closure,
+                    )? {
+                        Some(terminal_changed) => changed |= terminal_changed,
+                        None => return Ok((changed, false)),
+                    }
+                    continue;
+                }
                 // A prior one-shot retirement reached its terminal state but
                 // could not remove the registry entry. Never detach it twice.
             } else if context.was_attached {
+                if self.terminal_journal.is_some() {
+                    bail!("terminal loader drain authority is already pending");
+                }
                 let (terminal_exports, detach_failed) = session.detach_dynamic_context(context_id);
                 if detach_failed {
                     closure.fail();
@@ -4328,52 +5553,35 @@ impl Engine {
                         "a one-shot dynamic detach failed; replacement was blocked for this cycle",
                     );
                 }
-                match begin_attached_retirement_with(&mut self.loader_registry, context_id, || {
-                    collect(session)
-                }) {
+                match self.begin_terminal_drain(context_id, terminal_exports, || collect(session)) {
                     Ok(Ok((owned, malformed))) => {
                         if malformed != 0 {
                             closure.fail();
                         }
                         self.record_malformed_discovery(malformed);
-                        if self.update_counter_snapshot(session).is_err() {
-                            closure.fail();
-                            self.mark_live_loss(
-                                "live discovery counters",
-                                "the post-detach producer snapshot could not be read",
-                            );
-                        }
-                        for record in owned {
-                            let queued = terminal_record_for(context_id, &terminal_exports, record);
-                            match self.dispatch_discovery_record(
-                                queued,
-                                session,
-                                additions_allowed,
-                                pending_views,
-                            ) {
-                                Ok(outcome) => {
-                                    changed |= outcome.changed();
-                                    if !outcome.required_complete() {
-                                        closure.fail();
-                                    }
-                                }
-                                Err(_) => {
-                                    closure.fail();
-                                    self.mark_live_loss(
-                                        "live discovery record",
-                                        "a structurally valid private terminal record failed exact live resolution",
-                                    );
-                                }
-                            }
+                        self.retain_terminal_batch(owned)?;
+                        match self.dispatch_terminal_batch(
+                            session,
+                            additions_allowed,
+                            pending_views,
+                            closure,
+                        )? {
+                            Some(terminal_changed) => changed |= terminal_changed,
+                            None => return Ok((changed, false)),
                         }
                     }
-                    Ok(Err(error)) if error.is::<DeferredDiscoveryItem>() => return Err(error),
+                    Ok(Err(error)) if error.is::<DeferredDiscoveryItem>() => {
+                        let mut deferred = error.downcast::<DeferredDiscoveryItem>()?;
+                        deferred.terminal_batch = Some(self.take_terminal_batch_for_deferred()?);
+                        return Err(deferred.into());
+                    }
                     Ok(Err(_)) => {
                         closure.fail();
                         self.mark_live_loss(
                             "live loader retirement",
-                            "the post-detach private discovery drain failed",
+                            "the post-detach private discovery drain failed; the exact terminal batch remains tombstoned for retry",
                         );
+                        return Ok((changed, false));
                     }
                     Err(_) => {
                         closure.fail();
@@ -4391,6 +5599,9 @@ impl Engine {
                     "live loader retirement",
                     "a prepared loader context could not be cancelled",
                 );
+                return Ok((changed, false));
+            }
+            if self.terminal_owner() == Some(context_id) {
                 return Ok((changed, false));
             }
             if self.loader_registry.remove(context_id).is_err() {
@@ -4411,22 +5622,69 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
     ) {
         for view in stale {
-            let newly_generation_lost = !*pending_views.entry(*view).or_default();
-            pending_views.insert(*view, true);
-            if let Some(pid) = self
-                .views
-                .iter()
-                .find(|candidate| candidate.id() == *view)
-                .map(ProcessView::pid)
-            {
-                self.refresh_requested.insert(pid);
+            self.queue_retirement(*view, RetirementCause::GenerationLost, pending_views);
+        }
+    }
+
+    fn queue_inventory_retirements(
+        &mut self,
+        retirement_views: &BTreeSet<ProcessViewId>,
+        stale: &BTreeSet<ProcessViewId>,
+        departed: &BTreeSet<ProcessViewId>,
+        pending_views: &mut PendingViewRetirements,
+    ) {
+        for view in retirement_views {
+            let cause = if stale.contains(view) {
+                RetirementCause::GenerationLost
+            } else if departed.contains(view) {
+                self.ready_expected_removals.insert(*view);
+                RetirementCause::ExpectedRemoval
+            } else {
+                RetirementCause::ExecRefresh
+            };
+            self.queue_retirement(*view, cause, pending_views);
+        }
+    }
+
+    fn queue_retirement(
+        &mut self,
+        view: ProcessViewId,
+        cause: RetirementCause,
+        pending_views: &mut PendingViewRetirements,
+    ) {
+        let previous = self.retirement_intents.get(&view).copied();
+        let cause = previous.map_or(cause, |current| current.merge(cause));
+        if cause != RetirementCause::ExpectedRemoval {
+            self.ready_expected_removals.remove(&view);
+        }
+        self.retirement_intents.insert(view, cause);
+        pending_views
+            .entry(view)
+            .and_modify(|current| *current = current.merge(cause))
+            .or_insert(cause);
+
+        if let Some(pid) = self
+            .views
+            .iter()
+            .find(|candidate| candidate.id() == view)
+            .map(ProcessView::pid)
+        {
+            match cause {
+                RetirementCause::ExpectedRemoval => {
+                    self.refresh_requested.remove(&pid);
+                }
+                RetirementCause::ExecRefresh | RetirementCause::GenerationLost => {
+                    self.refresh_requested.insert(pid);
+                }
             }
-            if newly_generation_lost {
-                self.mark_live_loss(
-                    "live discovery generation",
-                    "a retained process generation changed and was scheduled for conservative cleanup",
-                );
-            }
+        }
+        if cause == RetirementCause::GenerationLost
+            && previous != Some(RetirementCause::GenerationLost)
+        {
+            self.mark_live_loss(
+                "live discovery generation",
+                "a retained process generation changed and was scheduled for conservative cleanup",
+            );
         }
     }
 
@@ -4447,17 +5705,27 @@ impl Engine {
                 continue;
             };
             let view = context.spec.view;
-            pending_views.entry(view).or_default();
-            if let Some(pid) = self
-                .views
-                .iter()
-                .find(|candidate| candidate.id() == view)
-                .map(ProcessView::pid)
-            {
-                self.refresh_requested.insert(pid);
-            }
+            self.queue_retirement(view, RetirementCause::ExecRefresh, pending_views);
         }
         self.queue_stale_views(&outcome.stale_views, pending_views);
+    }
+
+    fn finalize_expected_target_exit(&mut self) {
+        let Some(view) = self.expected_target_exit_pending else {
+            return;
+        };
+        if self.views.is_empty()
+            && self.retirement_intents.is_empty()
+            && self.pending_retirements.is_empty()
+            && self.pending_rejected_keys.is_empty()
+            && self.loader_registry.ids_for_view(view).is_empty()
+            && self.terminal_journal.is_none()
+            && self.terminal_batch.is_none()
+            && self.pending_discovery_records.is_empty()
+        {
+            self.expected_target_exit_pending = None;
+            self.expected_target_exit = true;
+        }
     }
 
     fn queue_conservative_outcome(
@@ -4512,6 +5780,43 @@ impl Engine {
         outcome
     }
 
+    fn dispatch_lifecycle_record(
+        &mut self,
+        record: &DiscoveryRecord,
+        pending_views: &mut PendingViewRetirements,
+    ) {
+        let pid = (record.pid_tgid >> 32) as u32;
+        if let Some((view, cause)) =
+            lifecycle_retirement(&self.views, pid, record.hook_ts_ns, record.kind)
+        {
+            self.queue_retirement(view, cause, pending_views);
+        } else if record.kind == DISCOVERY_KIND_EXEC
+            && unmatched_exec_requests_refresh(&self.views, pid)
+        {
+            self.refresh_requested.insert(pid);
+        }
+    }
+
+    fn promote_stale_execs(&mut self, pending_views: &mut PendingViewRetirements) {
+        let stale_execs: Vec<_> = pending_views
+            .iter()
+            .filter_map(|(view, cause)| {
+                let original_current = self
+                    .views
+                    .iter()
+                    .find(|candidate| candidate.id() == *view)
+                    .is_some_and(ProcessView::still_the_same);
+                (*cause == RetirementCause::ExecRefresh
+                    && finalize_batch_retirement_cause(*cause, original_current)
+                        == RetirementCause::GenerationLost)
+                    .then_some(*view)
+            })
+            .collect();
+        for view in stale_execs {
+            self.queue_retirement(view, RetirementCause::GenerationLost, pending_views);
+        }
+    }
+
     fn dispatch_discovery_record(
         &mut self,
         queued: QueuedDiscoveryRecord,
@@ -4530,16 +5835,7 @@ impl Engine {
                 self.process_loader_record(queued, session, additions_allowed, pending_views)
             }
             DISCOVERY_KIND_EXEC | DISCOVERY_KIND_LEADER_EXIT => {
-                let pid = (record.pid_tgid >> 32) as u32;
-                self.refresh_requested.insert(pid);
-                if let Some(view) = self
-                    .views
-                    .iter()
-                    .find(|view| view.pid() == pid)
-                    .map(ProcessView::id)
-                {
-                    self.queue_stale_views(&[view].into_iter().collect(), pending_views);
-                }
+                self.dispatch_lifecycle_record(&record, pending_views);
                 Ok(DiscoveryRecordOutcome::applied(false, true))
             }
             _ => {
@@ -4566,6 +5862,12 @@ impl Engine {
         let mut changed = false;
         let mut named_generation_lost = false;
         let mut conservative_replay_attempted = false;
+        for (view, cause) in self.retirement_intents.clone() {
+            pending_views
+                .entry(view)
+                .and_modify(|current| *current = current.merge(cause))
+                .or_insert(cause);
+        }
         loop {
             for queued in std::mem::take(records) {
                 match self.dispatch_discovery_record(
@@ -4589,6 +5891,7 @@ impl Engine {
                     }
                 }
             }
+            self.promote_stale_execs(pending_views);
             if pending_views.is_empty() {
                 if (self.pending_rejected_keys.is_empty() && self.pending_retirements.is_empty())
                     || conservative_replay_attempted
@@ -4604,8 +5907,41 @@ impl Engine {
                     break;
                 }
             }
-            for (view, mut generation_lost) in std::mem::take(pending_views) {
-                generation_lost |= pending_views.remove(&view).unwrap_or(false);
+            for (view, mut cause) in std::mem::take(pending_views) {
+                if let Some(next) = pending_views.remove(&view) {
+                    cause = cause.merge(next);
+                }
+                if let Some(persistent) = self.retirement_intents.get(&view).copied() {
+                    cause = cause.merge(persistent);
+                }
+                let Some(retained) = self.views.iter().find(|candidate| candidate.id() == view)
+                else {
+                    self.retirement_intents.remove(&view);
+                    self.ready_expected_removals.remove(&view);
+                    continue;
+                };
+                let ready = if self.ready_expected_removals.contains(&view)
+                    && cause == RetirementCause::ExpectedRemoval
+                {
+                    Ok(true)
+                } else {
+                    retirement_ready(cause, retained)
+                };
+                match ready {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        closure.fail();
+                        *additions_allowed = false;
+                        self.mark_live_loss(
+                            "live discovery lifecycle",
+                            &format!(
+                                "the original process pin could not prove expected exit; retirement remains queued: {error}"
+                            ),
+                        );
+                        continue;
+                    }
+                }
                 let (retirement_changed, complete) = self.retire_loader_contexts(
                     view,
                     session,
@@ -4614,16 +5950,32 @@ impl Engine {
                     collect,
                     closure,
                 )?;
-                generation_lost |= pending_views.remove(&view).unwrap_or(false);
-                named_generation_lost |= generation_lost && matches!(self.scope, Scope::Pid(_));
+                if let Some(next) = pending_views.remove(&view) {
+                    cause = cause.merge(next);
+                }
+                if let Some(persistent) = self.retirement_intents.get(&view).copied() {
+                    cause = cause.merge(persistent);
+                }
+                named_generation_lost |=
+                    cause == RetirementCause::GenerationLost && matches!(self.scope, Scope::Pid(_));
                 changed |= retirement_changed;
                 if !complete {
                     continue;
                 }
                 self.pending_retirements.insert(view);
+                self.retirement_intents.remove(&view);
+                self.ready_expected_removals.remove(&view);
+                if cause == RetirementCause::ExpectedRemoval {
+                    self.views.retain(|candidate| candidate.id() != view);
+                    self.scan_inputs.remove(&view);
+                    if matches!(self.scope, Scope::Pid(_)) {
+                        self.expected_target_exit_pending = Some(view);
+                    }
+                }
                 conservative_replay_attempted = false;
             }
         }
+        self.finalize_expected_target_exit();
         if named_generation_lost {
             bail!("the named process generation changed during live discovery");
         }
@@ -4752,12 +6104,36 @@ impl Engine {
         closure: &mut PauseClosure,
     ) -> Result<bool> {
         if matches!(self.scope, Scope::Pid(_)) {
-            let stale: BTreeSet<_> = self
+            let mut stale: BTreeSet<_> = self
                 .views
                 .iter()
                 .filter(|view| !view.still_the_same())
                 .map(ProcessView::id)
                 .collect();
+            let expected: Vec<_> = stale
+                .iter()
+                .copied()
+                .filter(|view| {
+                    self.retirement_intents.get(view) == Some(&RetirementCause::ExpectedRemoval)
+                })
+                .collect();
+            for view in expected {
+                stale.remove(&view);
+                self.queue_retirement(view, RetirementCause::ExpectedRemoval, pending_views);
+            }
+            if !pending_views.is_empty() {
+                let _ = self.process_discovery_records(
+                    session,
+                    records,
+                    pending_views,
+                    additions_allowed,
+                    collect,
+                    closure,
+                )?;
+            }
+            if self.expected_target_exit && self.views.is_empty() {
+                return Ok(false);
+            }
             if !stale.is_empty() {
                 self.queue_stale_views(&stale, pending_views);
                 let _ = self.process_discovery_records(
@@ -4778,6 +6154,7 @@ impl Engine {
             }
         }
         let (pids, mut skipped) = scope_pids(&self.scope);
+        let membership_complete = skipped.is_empty() && pids.len() <= MAX_SCAN_PIDS;
         if pids.len() > MAX_SCAN_PIDS {
             skipped.push(Skipped {
                 subject: scope_label(&self.scope),
@@ -4788,23 +6165,39 @@ impl Engine {
             });
         }
         let desired: BTreeSet<_> = pids.into_iter().take(MAX_SCAN_PIDS).collect();
-        let mut removed: BTreeSet<_> = self
+        let membership_authoritative =
+            membership_complete && matches!(self.scope, Scope::Cgroup { .. });
+        let retirement_causes: BTreeMap<_, _> = self
             .views
             .iter()
-            .filter(|view| {
-                !view.still_the_same()
-                    || (matches!(self.scope, Scope::Cgroup { .. })
-                        && !desired.contains(&view.pid()))
+            .filter_map(|view| {
+                inventory_retirement_cause(
+                    view.still_the_same(),
+                    membership_authoritative,
+                    desired.contains(&view.pid()),
+                    self.refresh_requested.contains(&view.pid()),
+                )
+                .map(|cause| (view.id(), cause))
             })
-            .map(ProcessView::id)
             .collect();
-        let refreshed: BTreeSet<_> = self
-            .views
+        let stale: BTreeSet<_> = retirement_causes
             .iter()
-            .filter(|view| {
-                !removed.contains(&view.id()) && self.refresh_requested.contains(&view.pid())
+            .filter_map(|(view, (cause, _))| {
+                (*cause == RetirementCause::GenerationLost).then_some(*view)
             })
-            .map(ProcessView::id)
+            .collect();
+        let departed: BTreeSet<_> = retirement_causes
+            .iter()
+            .filter_map(|(view, (cause, ready))| {
+                (*cause == RetirementCause::ExpectedRemoval && *ready).then_some(*view)
+            })
+            .collect();
+        let mut removed: BTreeSet<_> = stale.union(&departed).copied().collect();
+        let refreshed: BTreeSet<_> = retirement_causes
+            .iter()
+            .filter_map(|(view, (cause, _))| {
+                (*cause == RetirementCause::ExecRefresh).then_some(*view)
+            })
             .collect();
         let known_pids: BTreeSet<_> = self
             .views
@@ -4949,6 +6342,7 @@ impl Engine {
         let mut failed_retirements = BTreeSet::new();
         let mut context_retirements = BTreeSet::new();
         let retirement_views: BTreeSet<_> = removed.union(&refreshed_ok).copied().collect();
+        self.queue_inventory_retirements(&retirement_views, &stale, &departed, pending_views);
         for view in &retirement_views {
             if !self.loader_registry.ids_for_view(*view).is_empty() {
                 mutation_started = true;
@@ -5178,7 +6572,7 @@ impl Engine {
         malformed: u64,
     ) -> Result<bool> {
         let mut collect = Self::collect_discovery_records;
-        self.apply_discovery_batch_with(session, records, malformed, true, &mut collect)
+        self.apply_discovery_batch_with(session, records, malformed, true, false, &mut collect)
             .map(|outcome| outcome.changed)
     }
 
@@ -5188,18 +6582,24 @@ impl Engine {
         records: Vec<DiscoveryRecord>,
         malformed: u64,
         additions_allowed: bool,
+        terminal_dispatch: bool,
         collect: &mut DiscoveryCollector<'_>,
     ) -> Result<DiscoveryBatchOutcome> {
-        let mut records: Vec<_> = records
-            .into_iter()
-            .map(|record| QueuedDiscoveryRecord {
-                record,
-                terminal_owner: None,
-                terminal_exports: Vec::new(),
-            })
-            .collect();
+        let mut queued = std::mem::take(&mut self.pending_discovery_records);
+        queued.extend(records.into_iter().map(|record| QueuedDiscoveryRecord {
+            record,
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        }));
         self.record_malformed_discovery(malformed);
-        self.update_counter_snapshot(session)?;
+        let queued = match begin_discovery_batch(queued, self.update_counter_snapshot(session)) {
+            Ok(records) => records,
+            Err((error, records)) => {
+                self.pending_discovery_records = records;
+                return Err(error);
+            }
+        };
+        let mut records = queued;
 
         let mut additions_allowed = additions_allowed;
         let mut closure = PauseClosure::new(additions_allowed && malformed == 0);
@@ -5212,6 +6612,16 @@ impl Engine {
             collect,
             &mut closure,
         )?;
+        if terminal_dispatch {
+            if let Some(terminal_changed) = self.dispatch_terminal_batch(
+                session,
+                &mut additions_allowed,
+                &mut pending_views,
+                &mut closure,
+            )? {
+                changed |= terminal_changed;
+            }
+        }
         if self.pending_retirements.is_empty() && self.pending_rejected_keys.is_empty() {
             changed |= self.refresh_inventory(
                 session,
@@ -5223,7 +6633,7 @@ impl Engine {
             )?;
         }
         record_object_skips(&mut self.plan, &self.counters.object_skips);
-        self.discovery = discovery_evidence(&self.plan, &self.pinned, &self.counters);
+        self.publish_current_capture_facts()?;
         Ok(DiscoveryBatchOutcome {
             changed,
             required_complete: closure.required_complete() && additions_allowed,
@@ -5346,7 +6756,7 @@ impl Engine {
             &mut closure,
         )?;
         record_object_skips(&mut self.plan, &self.counters.object_skips);
-        self.discovery = discovery_evidence(&self.plan, &self.pinned, &self.counters);
+        self.publish_current_capture_facts()?;
         Ok(DiscoveryBatchOutcome {
             changed,
             required_complete: closure.required_complete() && additions_allowed,
@@ -5359,64 +6769,73 @@ impl Engine {
         mut pause_generation: Option<OwnedPauseGeneration>,
         owned_child: Option<&OwnedChild>,
     ) -> Result<Session> {
+        let snapshot = self.begin_start_capture_attempt()?;
         let retained_scope = self.scope.clone();
         let named = matches!(retained_scope, Scope::Pid(_));
         let scope = &retained_scope;
         let mut session =
-            start_retained_with(self, named, process::stale_view_ids, |plan, pinned| {
+            match start_retained_with(self, named, process::stale_view_ids, |plan, pinned| {
                 Session::start(plan, scope, pinned, policy, pause_generation.take())
-            })?;
-        let mut additions_allowed = true;
-        let mut records = Vec::new();
-        let mut pending_views = PendingViewRetirements::new();
-        let mut collect = Self::collect_discovery_records;
-        let mut closure = PauseClosure::new(true);
-        let mut fatal = None;
-        if let Some(child) = owned_child {
-            let _ = self.arm_owned_loader_before_release(
-                child,
-                &mut session,
-                &mut additions_allowed,
-                &mut pending_views,
-            )?;
-            self.mark_partial(
-                "owned initial-set discovery",
-                "the empty timing catalog leaves initial-set capture unproven",
-            );
-        } else {
-            for position in 0..self.views.len() {
-                if !self.views[position].still_the_same() {
-                    continue;
+            }) {
+                Ok(session) => session,
+                Err(error) => {
+                    return self.finish_start_capture_attempt(snapshot, Err(error));
                 }
-                match self.arm_loader_or_partial(
-                    position,
+            };
+        let result = (|| {
+            let mut additions_allowed = true;
+            let mut records = Vec::new();
+            let mut pending_views = PendingViewRetirements::new();
+            let mut collect = Self::collect_discovery_records;
+            let mut closure = PauseClosure::new(true);
+            let mut fatal = None;
+            if let Some(child) = owned_child {
+                let _ = self.arm_owned_loader_before_release(
+                    child,
                     &mut session,
                     &mut additions_allowed,
                     &mut pending_views,
-                ) {
-                    Ok(_) => {}
-                    Err(error) => {
-                        fatal = Some(error);
-                        break;
+                )?;
+                self.mark_partial(
+                    "owned initial-set discovery",
+                    "the empty timing catalog leaves initial-set capture unproven",
+                );
+            } else {
+                for position in 0..self.views.len() {
+                    if !self.views[position].still_the_same() {
+                        continue;
+                    }
+                    match self.arm_loader_or_partial(
+                        position,
+                        &mut session,
+                        &mut additions_allowed,
+                        &mut pending_views,
+                    ) {
+                        Ok(_) => {}
+                        Err(error) => {
+                            fatal = Some(error);
+                            break;
+                        }
                     }
                 }
             }
-        }
-        let cleanup = self.process_discovery_records(
-            &mut session,
-            &mut records,
-            &mut pending_views,
-            &mut additions_allowed,
-            &mut collect,
-            &mut closure,
-        );
-        if let Some(error) = fatal {
-            return Err(error);
-        }
-        cleanup?;
-        record_object_skips(&mut self.plan, &self.counters.object_skips);
-        self.discovery = discovery_evidence(&self.plan, &self.pinned, &self.counters);
-        Ok(session)
+            let cleanup = self.process_discovery_records(
+                &mut session,
+                &mut records,
+                &mut pending_views,
+                &mut additions_allowed,
+                &mut collect,
+                &mut closure,
+            );
+            if let Some(error) = fatal {
+                return Err(error);
+            }
+            cleanup?;
+            record_object_skips(&mut self.plan, &self.counters.object_skips);
+            self.publish_current_capture_facts()?;
+            Ok(session)
+        })();
+        self.finish_start_capture_attempt(snapshot, result)
     }
 }
 
@@ -5549,6 +6968,20 @@ mod tests {
             .0;
         assert!(!retirement.contains("Self::collect_discovery_records(session)"));
         assert!(retirement.contains("collect(session)"));
+    }
+
+    #[test]
+    fn ordinary_batch_dispatch_cannot_consume_terminal_authority() {
+        let source = include_str!("engine.rs");
+        let apply = source
+            .split_once("    pub(crate) fn apply_discovery_batch_with(")
+            .unwrap()
+            .1
+            .split_once("    /// Performs the existing one-shot initial discovery pass.")
+            .unwrap()
+            .0;
+        assert!(!apply.contains("terminal_authority"));
+        assert!(apply.contains("self.dispatch_terminal_batch("));
     }
 
     #[test]
@@ -5685,6 +7118,422 @@ mod tests {
         engine.pinned = pins;
         engine.modules = modules;
         (engine, module, object, timing)
+    }
+
+    #[test]
+    fn capture_facts_reuses_only_the_same_exact_module_id() {
+        let first = timing_key(0);
+        let second = timing_key(1);
+        let mut facts = CaptureFacts::default();
+
+        assert_eq!(facts.resolve_module_id(&first).unwrap(), plan::ModuleId(0));
+        assert_eq!(facts.resolve_module_id(&first).unwrap(), plan::ModuleId(0));
+        assert_eq!(facts.resolve_module_id(&second).unwrap(), plan::ModuleId(1));
+        assert_eq!(facts.module_key(plan::ModuleId(0)), Some(&first));
+        assert_eq!(facts.module_key(plan::ModuleId(1)), Some(&second));
+    }
+
+    #[test]
+    fn capture_facts_bind_candidate_plan_ids_before_extension() {
+        let (first, _, _, first_key) = engine_with_overlay(20);
+        let mut facts = CaptureFacts::default();
+        let mut initial = first.plan.clone();
+        facts
+            .bind_plan_module_ids(&mut initial, &first.modules, &[], &first.pinned)
+            .unwrap();
+        let stable = initial.modules[0].id;
+        assert_eq!(stable, plan::ModuleId(0));
+        assert_eq!(initial.slots[0].module_ids, [stable]);
+
+        let mut reload = first.plan.clone();
+        facts
+            .bind_plan_module_ids(&mut reload, &first.modules, &[], &first.pinned)
+            .unwrap();
+        assert_eq!(reload.modules[0].id, stable);
+        assert_eq!(facts.module_key(stable), Some(&first_key));
+
+        let (different, _, _, different_key) = engine_with_overlay(21);
+        let mut different_plan = different.plan.clone();
+        facts
+            .bind_plan_module_ids(
+                &mut different_plan,
+                &different.modules,
+                &[],
+                &different.pinned,
+            )
+            .unwrap();
+        assert_eq!(different_plan.modules[0].id, plan::ModuleId(1));
+        assert_eq!(different_plan.slots[0].module_ids, [plan::ModuleId(1)]);
+        assert_eq!(facts.module_key(plan::ModuleId(1)), Some(&different_key));
+    }
+
+    #[test]
+    fn live_candidate_reuses_an_exact_provider_id_after_an_empty_interval() {
+        let (mut engine, first_raw, _, _) = engine_with_overlay(30);
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        let first_pins = engine.pinned.clone();
+
+        let empty = engine
+            .live_candidate(PinnedObjects::empty(), Vec::new(), Vec::new())
+            .unwrap();
+        engine.plan = empty.plan;
+        engine.pinned = empty.pinned;
+        engine.modules = empty.modules;
+
+        let reload = engine
+            .live_candidate(first_pins, vec![first_raw], Vec::new())
+            .unwrap();
+        assert_eq!(reload.plan.modules[0].id, plan::ModuleId(0));
+
+        let (different, different_raw, _, _) = engine_with_overlay(31);
+        let new_identity = engine
+            .live_candidate(different.pinned, vec![different_raw], Vec::new())
+            .unwrap();
+        assert_eq!(new_identity.plan.modules[0].id, plan::ModuleId(1));
+    }
+
+    #[test]
+    fn accepted_capture_facts_survive_empty_and_deduplicate_exact_reload() {
+        let (mut engine, _, _, _) = engine_with_overlay(40);
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        let first_plan = engine.plan.clone();
+        let first_pins = engine.pinned.clone();
+        let first_modules = engine.modules.clone();
+
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(engine.plan.entries_seen, 1);
+        assert_eq!(engine.plan.surfaces.len(), 1);
+        assert_eq!(engine.discovery.modules.len(), 1);
+
+        let empty = engine
+            .live_candidate(PinnedObjects::empty(), Vec::new(), Vec::new())
+            .unwrap();
+        engine.plan = empty.plan;
+        engine.pinned = empty.pinned;
+        engine.modules = empty.modules;
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(engine.plan.entries_seen, 1);
+        assert_eq!(engine.plan.surfaces.len(), 1);
+        assert_eq!(engine.discovery.modules.len(), 1);
+
+        engine.plan = first_plan;
+        engine.pinned = first_pins;
+        engine.modules = first_modules;
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(engine.plan.entries_seen, 1, "exact reload is not recounted");
+        assert_eq!(engine.plan.surfaces.len(), 1, "surface is not duplicated");
+        assert_eq!(engine.discovery.modules.len(), 1);
+
+        let (different, _, _, _) = engine_with_overlay(41);
+        engine.plan = different.plan;
+        engine.pinned = different.pinned;
+        engine.modules = different.modules;
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(engine.plan.entries_seen, 2);
+        assert_eq!(engine.plan.surfaces.len(), 2);
+        assert_eq!(engine.discovery.modules.len(), 2);
+    }
+
+    #[test]
+    fn accepted_capture_facts_retain_a_changed_table_at_the_same_position() {
+        let (mut engine, _, _, _) = engine_with_overlay(42);
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        engine.publish_current_capture_facts().unwrap();
+
+        engine.modules[0].scanned.tables[0].version = (3, 0);
+        engine.plan.modules[0].tables[0].version = (3, 0);
+        engine.publish_current_capture_facts().unwrap();
+
+        assert_eq!(
+            engine.discovery.modules[0]
+                .tables
+                .iter()
+                .map(|table| table.version)
+                .collect::<Vec<_>>(),
+            [(2, 40), (3, 0)]
+        );
+
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(engine.discovery.modules[0].tables.len(), 2);
+    }
+
+    #[test]
+    fn capture_fact_stage_publishes_once_or_rolls_back_whole() {
+        let (mut engine, _, _, _) = engine_with_overlay(50);
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(engine.discovery.modules.len(), 1);
+
+        let (different, _, _, _) = engine_with_overlay(51);
+        engine.capture_facts.begin_stage().unwrap();
+        engine.plan = different.plan.clone();
+        engine.pinned = different.pinned.clone();
+        engine.modules = different.modules.clone();
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(
+            engine.discovery.modules.len(),
+            1,
+            "the stage is not published before successful return"
+        );
+        engine.capture_facts.rollback_stage();
+        engine.capture_facts.apply_to_plan(&mut engine.plan);
+        engine.discovery = engine.capture_facts.discovery(&engine.plan);
+        assert_eq!(
+            engine.discovery.modules.len(),
+            1,
+            "late failure publishes nothing"
+        );
+        assert_eq!(engine.plan.entries_seen, 1);
+
+        engine.capture_facts.begin_stage().unwrap();
+        engine.publish_current_capture_facts().unwrap();
+        engine.capture_facts.commit_stage().unwrap();
+        engine.project_capture_facts();
+        assert_eq!(engine.discovery.modules.len(), 2);
+        assert_eq!(engine.plan.entries_seen, 2);
+    }
+
+    #[test]
+    fn capture_facts_keep_each_accepted_manifest_ordinal_once() {
+        let (_, pins) = pinned_self();
+        let summary = pins.pinned().next().unwrap();
+        let path = summary.path.to_string();
+        let sha256 = summary.sha256.to_string();
+        let input = |name| ManifestInput {
+            path: PathBuf::from(name),
+            manifest: manifest_naming(&path, Some(sha256.clone())),
+            pins: pin_as_manifest_object(&path),
+            stale: Vec::new(),
+        };
+        let mut engine = lifecycle_discovered(Vec::new());
+        engine.manifest_inputs = vec![input("first.json"), input("second.json")];
+        rebuild_discovered(&mut engine).unwrap();
+
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(engine.plan.entries_seen, 2);
+        assert_eq!(engine.plan.surfaces.len(), 2);
+
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(engine.plan.entries_seen, 2, "one refresh does not recount");
+        assert_eq!(
+            engine.plan.surfaces.len(),
+            2,
+            "one refresh does not duplicate"
+        );
+    }
+
+    #[test]
+    fn capture_fact_proof_tombstones_block_later_positive_refresh() {
+        let (mut engine, _, object, _) = engine_with_overlay(52);
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        let module = engine.plan.modules[0].id;
+        engine.plan.modules[0].corroborated = true;
+        engine.counters.corroboration = vec![([object].into_iter().collect(), "agreed")];
+        engine.counters.manifest_fallbacks.push(ManifestFallback {
+            manifest: 0,
+            object: 0,
+            reason: ManifestStaleReason::IdentityMismatch,
+            replacement: object,
+            proof: BoundFallbackProof {
+                module: object,
+                tables: Vec::new(),
+                required_targets: BTreeMap::new(),
+            },
+        });
+        engine.publish_current_capture_facts().unwrap();
+        assert!(engine.discovery.modules[0].corroborated);
+        assert_eq!(engine.discovery.manifest_object_fallbacks.len(), 1);
+
+        engine
+            .capture_facts
+            .invalidate_discovery_proofs([module], [(0, 0)]);
+        engine.publish_current_capture_facts().unwrap();
+
+        assert!(!engine.discovery.modules[0].corroborated);
+        assert_eq!(
+            engine.discovery.modules[0].corroboration,
+            ["uncorroborated"]
+        );
+        assert!(engine.discovery.manifest_object_fallbacks.is_empty());
+    }
+
+    #[test]
+    fn current_discovery_never_reads_an_inactive_slots_retired_pin() {
+        let (mut plan, pins) = plan_with_pins(2, 0);
+        plan.slots[1].object = PinnedObjectId(u32::MAX);
+        plan.deactivate(1);
+
+        let evidence = discovery_evidence(&plan, &pins, &DiscoveryCounters::default());
+
+        assert_eq!(evidence.modules[0].objects.len(), 1);
+    }
+
+    #[test]
+    fn capture_facts_keep_all_decoded_occurrences_for_a_capacity_refusal() {
+        let mut raw = overlay_module(overlay_key(53));
+        raw.tables[0].entries = (0..=p11scope_ebpf_common::MAX_SLOTS)
+            .map(|index| ScannedEntry {
+                name: "C_Sign",
+                object: raw.key,
+                object_path: raw.path.clone(),
+                file_offset: 8 * u64::from(index),
+            })
+            .collect();
+        let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
+        let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let mut engine = Engine::empty();
+        engine.plan = plan::build_from_reconciled_modules(&modules);
+        engine.pinned = pins;
+        engine.modules = modules;
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+
+        engine.publish_current_capture_facts().unwrap();
+
+        assert_eq!(engine.plan.entries_seen, 513);
+        assert!(engine.plan.slots.is_empty());
+        assert_eq!(engine.plan.modules_skipped.len(), 1);
+        assert!(engine.discovery.modules.is_empty());
+        assert_eq!(engine.discovery.modules_skipped.len(), 1);
+
+        engine.plan = plan::build_from_reconciled_modules(&[]);
+        engine.pinned = PinnedObjects::empty();
+        engine.modules.clear();
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(engine.plan.entries_seen, 513);
+        assert_eq!(engine.discovery.modules_skipped.len(), 1);
+    }
+
+    #[test]
+    fn capture_facts_keep_a_manifest_only_capacity_refusal() {
+        let (_, pins) = pinned_self();
+        let summary = pins.pinned().next().unwrap();
+        let path = summary.path.to_string();
+        let mut manifest = manifest_naming(&path, Some(summary.sha256.to_string()));
+        let function = manifest.surfaces[0].functions[0].clone();
+        manifest.surfaces[0].functions = (0..=p11scope_ebpf_common::MAX_SLOTS)
+            .map(|index| {
+                let mut function = function.clone();
+                function.resolution = Resolution::Resolved {
+                    object: 0,
+                    file_offset: 8 * u64::from(index),
+                };
+                function
+            })
+            .collect();
+        let manifest_pins = pin_as_manifest_object(&path);
+        retarget_to_pins(&mut manifest, &[], &PinnedObjects::empty(), &manifest_pins);
+        let (mut engine, _, _, _) = engine_with_overlay(55);
+        assert!(engine.pinned.absorb(manifest_pins).is_empty());
+        engine.manifests = vec![manifest];
+        engine.manifest_ordinals = vec![0];
+        let mut counters = DiscoveryCounters::default();
+        engine.plan = build_current_plan(
+            &engine.modules,
+            &engine.manifests,
+            &engine.pinned,
+            &mut counters,
+            &BTreeSet::new(),
+            0,
+            0,
+        )
+        .unwrap();
+        engine.counters = counters;
+        engine
+            .capture_facts
+            .bind_plan_module_ids(
+                &mut engine.plan,
+                &engine.modules,
+                &engine.manifests,
+                &engine.pinned,
+            )
+            .unwrap();
+        assert_eq!(engine.plan.modules_skipped.len(), 1);
+
+        engine.publish_current_capture_facts().unwrap();
+
+        assert_eq!(engine.plan.entries_seen, 514);
+        assert_eq!(engine.plan.slots.len(), 1);
+        assert_eq!(engine.plan.modules_skipped.len(), 1);
+        assert_eq!(engine.discovery.modules_skipped.len(), 1);
+        assert_eq!(engine.discovery.modules.len(), 1);
+    }
+
+    #[test]
+    fn start_attempt_stages_initial_facts_before_active_cleanup() {
+        let (mut engine, _, _, _) = engine_with_overlay(56);
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        assert!(engine.capture_facts.history.modules.is_empty());
+        let snapshot = engine.begin_start_capture_attempt().unwrap();
+
+        engine.plan = plan::build_from_reconciled_modules(&[]);
+        engine.pinned = PinnedObjects::empty();
+        engine.modules.clear();
+        engine.publish_current_capture_facts().unwrap();
+        engine
+            .finish_start_capture_attempt(snapshot, Ok(()))
+            .unwrap();
+
+        assert_eq!(engine.discovery.modules.len(), 1);
+        assert_eq!(engine.plan.entries_seen, 1);
+    }
+
+    #[test]
+    fn failed_start_restores_prior_aggregate_owner_after_cleanup() {
+        let (mut engine, _, _, _) = engine_with_overlay(54);
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        engine.publish_current_capture_facts().unwrap();
+        let owner = engine.plan.module_of_slot(0);
+        let snapshot = engine.begin_start_capture_attempt().unwrap();
+
+        let mut shared = engine.plan.slots[0].clone();
+        shared.module_ids.push(plan::ModuleId(99));
+        let candidate = plan::AttachPlan::from_slots(vec![shared]);
+        assert!(engine.latch_candidate_ambiguity(&candidate));
+        assert_eq!(engine.plan.module_of_slot(0), None);
+        let cleanup_ran = Cell::new(false);
+        cleanup_ran.set(true);
+
+        let result: Result<()> =
+            engine.finish_start_capture_attempt(snapshot, Err(anyhow!("late loader failure")));
+
+        assert!(result.is_err());
+        assert!(cleanup_ran.get());
+        assert_eq!(engine.plan.module_of_slot(0), owner);
+        assert_eq!(engine.plan.module_ambiguous, 0);
+        assert_eq!(engine.discovery.modules.len(), 1);
     }
 
     #[test]
@@ -5894,6 +7743,323 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_records_bind_once_to_the_admitted_process_view() {
+        let view = ProcessView::open(ProcessViewId(12), std::process::id()).unwrap();
+        let admitted = view.admitted_ns();
+        let pid = view.pid();
+
+        assert_eq!(
+            lifecycle_retirement(
+                &[view],
+                pid,
+                admitted.saturating_sub(1),
+                DISCOVERY_KIND_LEADER_EXIT,
+            ),
+            None,
+            "a delayed record from before this retained generation cannot retire it"
+        );
+
+        let view = ProcessView::open(ProcessViewId(13), std::process::id()).unwrap();
+        assert_eq!(
+            lifecycle_retirement(&[view], pid, u64::MAX, DISCOVERY_KIND_EXEC),
+            Some((ProcessViewId(13), RetirementCause::ExecRefresh))
+        );
+        let view = ProcessView::open(ProcessViewId(14), std::process::id()).unwrap();
+        assert_eq!(
+            lifecycle_retirement(&[view], pid, u64::MAX, DISCOVERY_KIND_LEADER_EXIT),
+            Some((ProcessViewId(14), RetirementCause::ExpectedRemoval))
+        );
+    }
+
+    #[test]
+    fn retirement_cause_merge_never_downgrades_real_loss() {
+        assert_eq!(
+            RetirementCause::ExecRefresh.merge(RetirementCause::ExpectedRemoval),
+            RetirementCause::ExpectedRemoval
+        );
+        assert_eq!(
+            RetirementCause::ExpectedRemoval.merge(RetirementCause::GenerationLost),
+            RetirementCause::GenerationLost
+        );
+        assert_eq!(
+            RetirementCause::GenerationLost.merge(RetirementCause::ExecRefresh),
+            RetirementCause::GenerationLost
+        );
+    }
+
+    #[test]
+    fn batch_exit_dominates_exec_before_dead_pin_promotion() {
+        let record = |kind, pid, hook_ts_ns| {
+            let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.kind = kind;
+            record.pid_tgid = u64::from(pid) << 32;
+            record.hook_ts_ns = hook_ts_ns;
+            record
+        };
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let view = ProcessView::open(ProcessViewId(18), child.id()).unwrap();
+        let hook_ts_ns = view.admitted_ns();
+        let mut engine = Engine::empty();
+        engine.views.push(view);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let mut pending = PendingViewRetirements::new();
+
+        for record in [
+            record(DISCOVERY_KIND_EXEC, child.id(), hook_ts_ns),
+            record(DISCOVERY_KIND_LEADER_EXIT, child.id(), hook_ts_ns),
+        ] {
+            engine.dispatch_lifecycle_record(&record, &mut pending);
+        }
+        engine.promote_stale_execs(&mut pending);
+
+        assert_eq!(
+            pending.get(&ProcessViewId(18)),
+            Some(&RetirementCause::ExpectedRemoval)
+        );
+        assert!(!engine.refresh_requested.contains(&child.id()));
+        assert!(
+            engine
+                .counters
+                .object_skips
+                .iter()
+                .all(|skip| skip.subject != "live discovery generation")
+        );
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let view = ProcessView::open(ProcessViewId(19), child.id()).unwrap();
+        let exec = record(DISCOVERY_KIND_EXEC, child.id(), view.admitted_ns());
+        let mut engine = Engine::empty();
+        engine.views.push(view);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let mut pending = PendingViewRetirements::new();
+        engine.dispatch_lifecycle_record(&exec, &mut pending);
+        engine.promote_stale_execs(&mut pending);
+        assert_eq!(
+            pending.get(&ProcessViewId(19)),
+            Some(&RetirementCause::GenerationLost),
+            "an exec without a matching exit remains genuine generation loss"
+        );
+    }
+
+    #[test]
+    fn expected_exit_requires_a_definitive_original_pin_result() {
+        assert!(!retirement_ready_with(RetirementCause::ExpectedRemoval, || Ok(false)).unwrap());
+        assert!(retirement_ready_with(RetirementCause::ExpectedRemoval, || Ok(true)).unwrap());
+        assert!(
+            retirement_ready_with(RetirementCause::ExpectedRemoval, || {
+                Err("original pidfd poll failed".to_string())
+            })
+            .is_err(),
+            "a transport error is loss, never exit evidence"
+        );
+        assert!(
+            retirement_ready_with(RetirementCause::ExecRefresh, || {
+                Err("must not poll".to_string())
+            })
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn expected_target_exit_completes_only_after_conservative_cleanup() {
+        let view = ProcessViewId(17);
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Pid(1);
+        engine.expected_target_exit_pending = Some(view);
+        engine.pending_retirements.insert(view);
+
+        engine.finalize_expected_target_exit();
+        assert!(!engine.expected_target_exit);
+        assert_eq!(engine.expected_target_exit_pending, Some(view));
+
+        engine.pending_retirements.clear();
+        engine.finalize_expected_target_exit();
+        assert!(engine.expected_target_exit);
+        assert_eq!(engine.expected_target_exit_pending, None);
+    }
+
+    #[test]
+    fn delayed_pre_admission_exec_cannot_refresh_a_reused_pid() {
+        let view = ProcessView::open(ProcessViewId(16), std::process::id()).unwrap();
+        let mut delayed: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        delayed.kind = DISCOVERY_KIND_EXEC;
+        delayed.pid_tgid = u64::from(view.pid()) << 32;
+        delayed.hook_ts_ns = view.admitted_ns().saturating_sub(1);
+        let mut engine = Engine::empty();
+        engine.views.push(view);
+        let mut pending = PendingViewRetirements::new();
+
+        engine.dispatch_lifecycle_record(&delayed, &mut pending);
+
+        assert!(pending.is_empty());
+        assert!(!engine.refresh_requested.contains(&std::process::id()));
+    }
+
+    #[test]
+    fn only_complete_cgroup_enumeration_authorizes_absence() {
+        assert_eq!(
+            inventory_retirement_cause(true, true, false, false),
+            Some((RetirementCause::ExpectedRemoval, true))
+        );
+        assert_eq!(
+            inventory_retirement_cause(false, true, false, false),
+            Some((RetirementCause::ExpectedRemoval, true)),
+            "authoritative absence proves clean departure even after the process exited"
+        );
+        assert_eq!(
+            inventory_retirement_cause(true, false, false, false),
+            None,
+            "unreadable or truncated membership cannot prove departure"
+        );
+        assert_eq!(
+            inventory_retirement_cause(false, false, false, false),
+            Some((RetirementCause::GenerationLost, false)),
+            "an independently stale retained pin remains genuine loss"
+        );
+        assert_eq!(
+            inventory_retirement_cause(true, false, true, true),
+            Some((RetirementCause::ExecRefresh, false))
+        );
+    }
+
+    #[test]
+    fn cgroup_departure_is_journaled_before_fallible_retirement() {
+        let view = ProcessView::open(ProcessViewId(20), std::process::id()).unwrap();
+        let mut engine = Engine::empty();
+        engine.views.push(view);
+        let retirement_views = [ProcessViewId(20)].into_iter().collect();
+        let departed = [ProcessViewId(20)].into_iter().collect();
+        let mut pending = PendingViewRetirements::new();
+
+        engine.queue_inventory_retirements(
+            &retirement_views,
+            &BTreeSet::new(),
+            &departed,
+            &mut pending,
+        );
+
+        assert_eq!(
+            engine.retirement_intents.get(&ProcessViewId(20)),
+            Some(&RetirementCause::ExpectedRemoval)
+        );
+        assert!(engine.ready_expected_removals.contains(&ProcessViewId(20)));
+        assert!(!engine.refresh_requested.contains(&std::process::id()));
+        pending.clear();
+        assert_eq!(
+            engine.retirement_intents.get(&ProcessViewId(20)),
+            Some(&RetirementCause::ExpectedRemoval),
+            "an unconsumed drain retry keeps the selected exact view"
+        );
+
+        let source = include_str!("engine.rs");
+        let refresh = source
+            .split_once("    fn refresh_inventory(")
+            .unwrap()
+            .1
+            .split_once("    /// Drains private discovery records")
+            .unwrap()
+            .0;
+        assert!(
+            refresh.find("self.queue_inventory_retirements(").unwrap()
+                < refresh.find("self.retire_loader_contexts(").unwrap()
+        );
+    }
+
+    #[test]
+    fn cgroup_walk_does_not_silently_drop_directory_entry_errors() {
+        let source = include_str!("engine.rs");
+        let walk = source
+            .split_once("fn scope_pids(")
+            .unwrap()
+            .1
+            .split_once("fn scope_label(")
+            .unwrap()
+            .0;
+
+        assert!(!walk.contains("entries.flatten()"));
+        assert!(!walk.contains("file_type().is_ok_and"));
+        assert!(walk.contains("membership absence is not authoritative"));
+    }
+
+    #[test]
+    fn retirement_intent_is_persistent_and_generation_loss_is_sticky() {
+        let view = ProcessView::open(ProcessViewId(15), std::process::id()).unwrap();
+        let mut engine = lifecycle_discovered(vec![view]);
+        let mut pending = PendingViewRetirements::new();
+
+        engine.queue_retirement(
+            ProcessViewId(15),
+            RetirementCause::ExecRefresh,
+            &mut pending,
+        );
+        engine.queue_retirement(
+            ProcessViewId(15),
+            RetirementCause::ExpectedRemoval,
+            &mut pending,
+        );
+        engine.queue_retirement(
+            ProcessViewId(15),
+            RetirementCause::GenerationLost,
+            &mut pending,
+        );
+
+        assert_eq!(
+            engine.retirement_intents.get(&ProcessViewId(15)),
+            Some(&RetirementCause::GenerationLost)
+        );
+        assert_eq!(
+            pending.get(&ProcessViewId(15)),
+            Some(&RetirementCause::GenerationLost)
+        );
+        assert!(engine.refresh_requested.contains(&std::process::id()));
+        assert_eq!(
+            engine
+                .counters
+                .object_skips
+                .iter()
+                .filter(|skip| skip.subject == "live discovery generation")
+                .count(),
+            1,
+            "the sticky loss is published once"
+        );
+    }
+
+    #[test]
+    fn expected_exit_waits_for_the_original_process_pin() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let view = ProcessView::open(ProcessViewId(16), child.id()).unwrap();
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_LEADER_EXIT;
+        record.pid_tgid = u64::from(child.id()) << 32;
+        record.hook_ts_ns = view.admitted_ns();
+        let mut engine = Engine::empty();
+        engine.views.push(view);
+        let mut pending = PendingViewRetirements::new();
+        engine.dispatch_lifecycle_record(&record, &mut pending);
+
+        assert_eq!(
+            pending.get(&ProcessViewId(16)),
+            Some(&RetirementCause::ExpectedRemoval)
+        );
+        assert!(!retirement_ready(RetirementCause::ExpectedRemoval, &engine.views[0]).unwrap());
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(retirement_ready(RetirementCause::ExpectedRemoval, &engine.views[0]).unwrap());
+    }
+
+    #[test]
     fn apply_outcome_keeps_static_timing_and_generation_loss_ownership() {
         let completed = timing_key(0);
         let failed = timing_key(1);
@@ -6080,6 +8246,163 @@ mod tests {
         let other = terminal_record_for(context, &snapshot, record);
         assert_eq!(other.terminal_owner, None);
         assert!(other.terminal_exports.is_empty());
+    }
+
+    #[test]
+    fn terminal_authority_tags_every_matching_record_in_the_owned_batch() {
+        let owner = LoaderContextId::from_case_id(2);
+        let export = DynamicExportIdentity {
+            object: PinnedObjectId(7),
+            file_offset: 0x10,
+            cookie: 1,
+            abi: HookAbi::FunctionList,
+        };
+        let mut matching: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        matching.kind = DISCOVERY_KIND_LOADER;
+        matching.case_id = (owner.get() - 1) as u8;
+        let mut unrelated = matching;
+        unrelated.case_id = unrelated.case_id.wrapping_add(1);
+        let mut records = [matching, matching, unrelated].map(|record| QueuedDiscoveryRecord {
+            record,
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        });
+        let authority = TerminalAuthority {
+            owner,
+            exports: vec![export],
+        };
+
+        assert!(authority.tag_matching(&mut records));
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.terminal_owner)
+                .collect::<Vec<_>>(),
+            [Some(owner), Some(owner), None]
+        );
+        assert_eq!(records[0].terminal_exports, [export]);
+        assert_eq!(records[1].terminal_exports, [export]);
+        assert!(records[2].terminal_exports.is_empty());
+    }
+
+    #[test]
+    fn predispatch_failure_returns_the_exact_batch_for_one_retry() {
+        let record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        let records = vec![QueuedDiscoveryRecord {
+            record,
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        }];
+
+        let (error, retained) = match begin_discovery_batch(records, Err(anyhow!("counter read"))) {
+            Err(retained) => retained,
+            Ok(_) => panic!("predispatch failure must keep ownership unconsumed"),
+        };
+        assert!(error.to_string().contains("counter read"));
+        assert_eq!(retained.len(), 1);
+
+        let dispatching = match begin_discovery_batch(retained, Ok(())) {
+            Ok(dispatching) => dispatching,
+            Err(_) => panic!("the retained batch must begin exactly once"),
+        };
+        assert_eq!(dispatching.len(), 1);
+    }
+
+    #[test]
+    fn generic_batches_cannot_consume_or_tag_terminal_authority() {
+        let owner = LoaderContextId::from_case_id(2);
+        let authority = TerminalAuthority {
+            owner,
+            exports: Vec::new(),
+        };
+        let mut engine = Engine::empty();
+        engine.terminal_journal = Some(TerminalJournal {
+            owner,
+            dispatch_started: false,
+            retry_used: false,
+        });
+        engine.terminal_batch = Some(TerminalBatch::empty(authority));
+        let queued = |case_id| {
+            let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.kind = DISCOVERY_KIND_LOADER;
+            record.case_id = case_id;
+            QueuedDiscoveryRecord {
+                record,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            }
+        };
+        let unrelated = [queued(((owner.get() - 1) as u8).wrapping_add(1))];
+        let matching = queued((owner.get() - 1) as u8);
+
+        assert_eq!(unrelated[0].terminal_owner, None);
+        engine
+            .retain_terminal_batch([matching.record, matching.record])
+            .unwrap();
+        assert!(
+            engine
+                .terminal_batch
+                .as_ref()
+                .unwrap()
+                .records
+                .iter()
+                .all(|record| record.terminal_owner == Some(owner))
+        );
+        assert!(engine.terminal_journal.is_some());
+    }
+
+    #[test]
+    fn a_second_terminal_authority_is_rejected_without_replacing_the_first() {
+        let (registry, first) = prepared_loader_registry();
+        let second = LoaderContextId::from_case_id(2);
+        let mut engine = Engine::empty();
+        engine.loader_registry = registry;
+        engine.loader_registry.mark_attached(first).unwrap();
+        let deferred = engine
+            .begin_terminal_drain(first, Vec::new(), || Err::<(), _>(anyhow!("deferred")))
+            .unwrap();
+        assert!(deferred.is_err());
+
+        let error = engine
+            .begin_terminal_drain(second, Vec::new(), || Ok(()))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("already pending"), "{error:#}");
+        assert_eq!(
+            engine
+                .terminal_journal
+                .as_ref()
+                .map(|journal| journal.owner),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn fallible_terminal_drain_keeps_tombstoned_authority_for_retry() {
+        let (registry, context) = prepared_loader_registry();
+        let export = DynamicExportIdentity {
+            object: PinnedObjectId(7),
+            file_offset: 0x10,
+            cookie: 1,
+            abi: HookAbi::FunctionList,
+        };
+        let mut engine = Engine::empty();
+        engine.loader_registry = registry;
+        engine.loader_registry.mark_attached(context).unwrap();
+
+        let drained = engine
+            .begin_terminal_drain(context, vec![export], || Err::<(), _>(anyhow!("deferred")))
+            .unwrap();
+
+        assert!(drained.is_err());
+        assert!(engine.loader_registry.is_tombstoned(context));
+        let batch = engine.terminal_batch.as_ref().unwrap();
+        assert_eq!(batch.authority.owner, context);
+        assert_eq!(batch.authority.exports, [export]);
+
+        assert!(engine.terminal_batch.is_some());
+        assert!(engine.terminal_journal.is_some());
+        engine.loader_registry.remove(context).unwrap();
     }
 
     #[test]
@@ -6673,6 +8996,34 @@ mod tests {
             0,
             "stale pins are removed before the candidate can commit"
         );
+        let remaining_reconciled: Vec<_> = modules
+            .iter()
+            .filter(|module| module.scanned.view != stale)
+            .cloned()
+            .collect();
+
+        let mut candidate = LiveCandidate {
+            pinned: pins,
+            modules,
+            plan: plan::build_from_reconciled_modules(&[]),
+            delta: plan::AttachDelta {
+                new: Vec::new(),
+                replace: Vec::new(),
+                retire: Vec::new(),
+            },
+            views: [stale].into_iter().collect(),
+            corroboration: Vec::new(),
+            manifest_fallbacks: Vec::new(),
+        };
+        commit_cleaned_candidate_identity(
+            &mut candidate,
+            remaining_pins,
+            remaining_reconciled,
+            &[stale].into_iter().collect(),
+        );
+        assert!(candidate.modules.is_empty());
+        assert!(candidate.pinned.pinned().next().is_none());
+        assert!(candidate.views.is_empty());
     }
 
     #[test]

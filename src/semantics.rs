@@ -893,17 +893,20 @@ mod corrective_tests {
         let a = ModuleId(0);
         let c = ModuleId(1);
         let process = ProcessKey::from_pid(100);
-        let mut current = plan(&[
+        let mut slots = plan(&[
             "C_OpenSession", // K, currently owned only by A.
             "C_OpenSession", // Unique C target used to open sessions.
             "C_SignInit",
             "C_SignFinal",
             "C_AsyncGetID",
             "C_CloseSession",
-        ]);
-        for slot in &mut current.slots[1..] {
+        ])
+        .slots;
+        for slot in &mut slots[1..] {
             slot.module_ids = vec![c];
         }
+        let mut current = AttachPlan::from_slots(slots);
+        current.entries_seen = 6;
         let descriptor = current.slots[0].descriptor_index;
         let mut state = State::new(&current);
         let mut tracer = crate::trace::Tracer::new(&current);
@@ -1362,9 +1365,6 @@ fn slot_metadata(plan: &AttachPlan) -> Vec<Option<SlotMeta>> {
         if index >= slots.len() {
             slots.resize_with(index + 1, || None);
         }
-        if !plan.is_active(slot.index) && !plan.slot_is_module_ambiguous(slot.index) {
-            continue;
-        }
         slots[index] = Some(SlotMeta {
             names: slot.names.clone(),
             aliased: slot.aliased,
@@ -1484,7 +1484,6 @@ impl State {
         if modules.is_empty() {
             return;
         }
-        self.evidence.state_reconciliations += 1;
         let mut processes = BTreeSet::new();
         processes.extend(self.current_process.values().copied());
         processes.extend(self.next_pseudonym.keys().copied());
@@ -1494,11 +1493,19 @@ impl State {
         processes.extend(self.inherited_ambiguous.iter().map(|(process, _)| *process));
         processes.extend(self.pending.keys().map(|(process, _, _)| *process));
         processes.extend(self.detached.values().map(|detached| detached.process));
+        let mut changed = false;
         for process in processes {
             for module in modules {
-                self.clear_scope(process, Some(*module), false);
+                changed |= self.clear_scope(process, Some(*module), false) != 0;
             }
         }
+        changed |= !self.mechanisms.is_empty()
+            || !self.templates.is_empty()
+            || !self.logins.is_empty()
+            || !self.cgroups.is_empty()
+            || self.sessions != SessionStats::default()
+            || self.orphan_ops != 0
+            || self.unmatched_closes != 0;
         self.mechanisms.clear();
         self.templates.clear();
         self.logins.clear();
@@ -1506,6 +1513,7 @@ impl State {
         self.sessions = SessionStats::default();
         self.orphan_ops = 0;
         self.unmatched_closes = 0;
+        self.evidence.state_reconciliations += u64::from(changed);
     }
 
     // ponytail: admissions are a monotonic per-capture budget. Replace with
@@ -3233,6 +3241,89 @@ mod tests {
             "the init call and the following op both attributed"
         );
         assert_eq!(m.errors, 0);
+    }
+
+    #[test]
+    fn inactive_slots_and_expected_exit_preserve_lifetime_aggregates() {
+        let mut plan = test_plan();
+        let process = ProcessKey::from_pid(100);
+        let mut state = State::with_policy(
+            &plan,
+            crate::attach::CapturePolicy::UnsafeUnvalidatedMetadata,
+        );
+
+        state.observe_process(
+            process,
+            &with_cgroup(ev(100, 0, fnkind::OPEN_SESSION, 10, MECH_NONE, 0, 5), 73),
+        );
+        state.observe_process(
+            process,
+            &with_cgroup(ev(100, 2, fnkind::INIT_WITH_MECH, 10, 0x250, 0, 100), 73),
+        );
+        state.observe_process(process, &ev_template(100, &[0x01], 1, 0, 0));
+        state.observe_process(process, &login_ev(100, 1));
+
+        let mechanisms = state.mechanisms().clone();
+        let templates = state.templates().clone();
+        let logins = state.logins().clone();
+        let sessions = state.sessions();
+        let cgroups = state.cgroups().clone();
+        assert!(!mechanisms.is_empty());
+        assert!(!templates.is_empty());
+        assert!(!logins.is_empty());
+        assert_eq!(sessions.opened, 1);
+        assert!(!cgroups.is_empty());
+
+        let allocated = plan.slots.len() as u32;
+        for slot in 0..allocated {
+            plan.deactivate(slot);
+        }
+        state.sync_plan(&plan);
+
+        assert_eq!(state.mechanisms(), &mechanisms);
+        assert_eq!(state.templates(), &templates);
+        assert_eq!(state.logins(), &logins);
+        assert_eq!(state.sessions(), sessions);
+        assert_eq!(state.cgroups(), &cgroups);
+        assert_eq!(state.semantic_evidence().state_reconciliations, 0);
+
+        let calls_before = state.mechanisms()[&0x250].calls;
+        state.observe_process(
+            process,
+            &with_cgroup(ev(100, 3, fnkind::SESSION_ARG0, 10, MECH_NONE, 0, 200), 73),
+        );
+        assert_eq!(
+            state.mechanisms()[&0x250].calls,
+            calls_before + 1,
+            "the queued call still uses the retired slot's frozen descriptor"
+        );
+
+        let mechanisms_after_trailing = state.mechanisms().clone();
+        let templates_after_trailing = state.templates().clone();
+        let logins_after_trailing = state.logins().clone();
+        let cgroups_after_trailing = state.cgroups().clone();
+        assert_eq!(state.retire_process(process), 1);
+        assert_eq!(state.mechanisms(), &mechanisms_after_trailing);
+        assert_eq!(state.templates(), &templates_after_trailing);
+        assert_eq!(state.logins(), &logins_after_trailing);
+        assert_eq!(state.cgroups(), &cgroups_after_trailing);
+        assert_eq!(state.sessions().opened, sessions.opened);
+        assert_eq!(state.sessions().closed, sessions.closed + 1);
+        assert_eq!(state.semantic_evidence().state_reconciliations, 0);
+    }
+
+    #[test]
+    fn empty_descriptor_invalidation_does_not_report_reconciliation() {
+        let mut plan = test_plan();
+        let mut state = State::new(&plan);
+
+        plan.slots[0].descriptor_index = 0;
+        plan.slots[0].semantics = p11scope_ebpf_common::SlotSemantics::COUNT_ONLY;
+        plan.slots[0].semantic_authorized = false;
+        plan.slots[0].semantic_ambiguous = true;
+        state.sync_plan(&plan);
+
+        assert_eq!(state.semantic_evidence().state_reconciliations, 0);
     }
 
     #[test]

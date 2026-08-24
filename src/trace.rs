@@ -214,13 +214,11 @@ fn trace_slots(plan: &AttachPlan) -> Vec<Option<TraceSlot>> {
         if index >= slots.len() {
             slots.resize_with(index + 1, || None);
         }
-        if plan.is_active(slot.index) {
-            slots[index] = Some(TraceSlot {
-                names: slot.names.clone(),
-                semantics: plan.effective_semantics(slot),
-                semantic_authorized: slot.semantic_authorized,
-            });
-        }
+        slots[index] = Some(TraceSlot {
+            names: slot.names.clone(),
+            semantics: plan.effective_semantics(slot),
+            semantic_authorized: slot.semantic_authorized,
+        });
     }
     slots
 }
@@ -692,6 +690,25 @@ mod tests {
         let unknown_line = tracer.on_event(&unknown, &mut state);
         assert!(unknown_line.contains(" slot#99 →"), "{unknown_line}");
         assert!(!unknown_line.contains("CKM_"), "{unknown_line}");
+    }
+
+    #[test]
+    fn sync_plan_keeps_frozen_decode_metadata_for_a_retired_slot() {
+        let mut plan = test_plan();
+        let mut state = State::new(&plan);
+        let mut tracer = Tracer::new(&plan);
+        tracer.anchor = Some((0, 0));
+
+        plan.deactivate(0);
+        state.sync_plan(&plan);
+        tracer.sync_plan(&plan);
+
+        let line = tracer.on_event(&open_event(100, 0xdead_beef), &mut state);
+
+        assert!(line.contains(" sess#1 C_OpenSession "), "{line}");
+        assert!(!line.contains("slot#0"), "{line}");
+        assert_eq!(state.sessions().opened, 1);
+        assert_eq!(state.semantic_evidence().state_reconciliations, 0);
     }
 
     #[test]

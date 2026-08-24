@@ -4,7 +4,7 @@ use crate::run::OwnedChild;
 use crate::{
     attach,
     attach::Session,
-    discovery::engine::{DeferredDiscoveryItem, Engine},
+    discovery::engine::{DeferredDiscoveryItem, Engine, TerminalBatch},
 };
 use p11scope_ebpf_common::{
     COALESCED_NO_HELPER_RC, DISCOVERY_STATUS_COALESCED_NO_HELPER, DiscoveryRecord, PAUSE_ARMED,
@@ -134,6 +134,8 @@ pub(crate) trait PauseIo {
         records: Vec<DiscoveryRecord>,
         deadline: Option<u64>,
         additions_allowed: bool,
+        pause_owned: bool,
+        terminal_batch: &mut Option<TerminalBatch>,
     ) -> Result<PauseBatchOutcome, String>;
     fn revalidate_after_release(
         &mut self,
@@ -200,6 +202,7 @@ pub(crate) struct PauseCoordinator {
     failure_deadline: Option<u64>,
     failure_items: usize,
     pending_records: Vec<DiscoveryRecord>,
+    terminal_batch: Option<TerminalBatch>,
     cycles: u8,
     cleaning: bool,
     cleaned: bool,
@@ -263,6 +266,7 @@ impl PauseCoordinator {
             failure_deadline: None,
             failure_items: 0,
             pending_records: Vec::new(),
+            terminal_batch: None,
             cycles: 0,
             cleaning: false,
             cleaned: false,
@@ -428,6 +432,17 @@ impl PauseCoordinator {
         io: &mut impl PauseIo,
         received: TimedItem,
     ) -> Result<(), PauseError> {
+        let mut received = received;
+        if let Some(batch) = received.terminal_batch.take() {
+            if self.terminal_batch.is_some() {
+                return Err(Self::policy_error(
+                    self.policy,
+                    "more than one terminal discovery batch reached the coordinator",
+                    true,
+                ));
+            }
+            self.terminal_batch = Some(batch);
+        }
         self.take_stop_candidate_seen(io);
         self.failure_deadline
             .get_or_insert_with(|| received.after_ns.checked_add(CYCLE_NS).unwrap_or(u64::MAX));
@@ -461,7 +476,13 @@ impl PauseCoordinator {
                 }
             }
             return io
-                .apply_batch(std::mem::take(&mut self.pending_records), None, true)
+                .apply_batch(
+                    std::mem::take(&mut self.pending_records),
+                    None,
+                    true,
+                    false,
+                    &mut self.terminal_batch,
+                )
                 .map(|_| ())
                 .map_err(|error| Self::policy_error(self.policy, error, false));
         }
@@ -480,7 +501,13 @@ impl PauseCoordinator {
             }
             self.may_be_stopped = false;
             return io
-                .apply_batch(std::mem::take(&mut self.pending_records), None, true)
+                .apply_batch(
+                    std::mem::take(&mut self.pending_records),
+                    None,
+                    true,
+                    false,
+                    &mut self.terminal_batch,
+                )
                 .map(|_| ())
                 .map_err(|error| Self::policy_error(self.policy, error, false));
         }
@@ -667,7 +694,13 @@ impl PauseCoordinator {
         }
         let record_count = records.len();
         self.pending_records.clear();
-        let outcome = match io.apply_batch(records, Some(deadline), true) {
+        let outcome = match io.apply_batch(
+            records,
+            Some(deadline),
+            true,
+            true,
+            &mut self.terminal_batch,
+        ) {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.take_stop_candidate_seen(io);
@@ -844,7 +877,13 @@ impl PauseCoordinator {
                 }
             }
         }
-        if let Err(error) = io.apply_batch(records, Some(deadline), true) {
+        if let Err(error) = io.apply_batch(
+            records,
+            Some(deadline),
+            true,
+            true,
+            &mut self.terminal_batch,
+        ) {
             retained_error.get_or_insert(error);
         }
         match io.same_generation(self.pid, self.generation) {
@@ -912,6 +951,7 @@ impl PauseCoordinator {
             before_ns,
             after_ns,
             item,
+            terminal_batch: None,
         }))
     }
 
@@ -960,6 +1000,8 @@ impl PauseCoordinator {
             std::mem::take(&mut self.pending_records),
             Some(deadline),
             true,
+            self.armed || self.attempt_open || self.may_be_stopped,
+            &mut self.terminal_batch,
         ) {
             errors.push(error);
         }
@@ -1102,7 +1144,13 @@ impl PauseCoordinator {
                 }
             }
         }
-        if let Err(error) = io.apply_batch(records, Some(deadline), false) {
+        if let Err(error) = io.apply_batch(
+            records,
+            Some(deadline),
+            false,
+            self.armed || self.attempt_open || self.may_be_stopped,
+            &mut self.terminal_batch,
+        ) {
             errors.push(error);
         }
         self.take_stop_candidate_seen(io);
@@ -1324,12 +1372,26 @@ impl PauseIo for SessionPauseIo<'_> {
         records: Vec<DiscoveryRecord>,
         deadline: Option<u64>,
         additions_allowed: bool,
+        pause_owned: bool,
+        terminal_batch: &mut Option<TerminalBatch>,
     ) -> Result<PauseBatchOutcome, String> {
         let child = self.child;
         let stop_candidate_seen = &mut self.stop_candidate_seen;
         let mut collect = |session: &mut Session| {
-            collect_timed_retirement(session, child, deadline, stop_candidate_seen, true)
+            collect_timed_retirement(session, child, deadline, stop_candidate_seen, pause_owned)
         };
+        let terminal_dispatch = terminal_batch.is_some();
+        if let Some(batch) = terminal_batch.take()
+            && let Err(error) = self
+                .engine
+                .install_terminal_batch(batch.clone(), records.clone())
+        {
+            *terminal_batch = Some(batch);
+            return Err(format!(
+                "terminal discovery batch restore failed: {error:#}"
+            ));
+        }
+        let records = terminal_dispatch.then(Vec::new).unwrap_or(records);
         let outcome = self
             .engine
             .apply_discovery_batch_with(
@@ -1337,6 +1399,7 @@ impl PauseIo for SessionPauseIo<'_> {
                 records,
                 std::mem::take(&mut self.malformed),
                 additions_allowed,
+                terminal_dispatch,
                 &mut collect,
             )
             .map_err(|error| format!("discovery batch application failed: {error:#}"))?;
@@ -1367,6 +1430,7 @@ impl PauseIo for SessionPauseIo<'_> {
                             before_ns: deferred.before_ns,
                             after_ns: deferred.after_ns,
                             item: deferred.item,
+                            terminal_batch: deferred.terminal_batch,
                         }));
                     }
                     Err(error) => {
@@ -1477,6 +1541,7 @@ fn collect_timed_retirement_with(
                 before_ns,
                 after_ns,
                 item,
+                terminal_batch: None,
             }
             .into());
         }
@@ -1491,6 +1556,7 @@ fn collect_timed_retirement_with(
                         before_ns,
                         after_ns,
                         item: DiscoveryItem::Record(record),
+                        terminal_batch: None,
                     };
                     validate_received(&received, record.hook_ts_ns, deadline)
                         .map_err(anyhow::Error::msg)?;
@@ -1546,6 +1612,7 @@ pub(crate) struct TimedItem {
     before_ns: u64,
     after_ns: u64,
     item: DiscoveryItem,
+    terminal_batch: Option<TerminalBatch>,
 }
 
 fn exact_pid(record: &DiscoveryRecord) -> u32 {
@@ -1574,6 +1641,7 @@ fn validate_received(received: &TimedItem, record_ns: u64, deadline: u64) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::engine::TerminalAuthority;
     use p11scope_ebpf_common::{
         COALESCED_NO_HELPER_RC, DISCOVERY_KIND_EXEC, DISCOVERY_STATUS_COALESCED_NO_HELPER,
         DiscoveryRecord, PAUSE_ARMED, PAUSE_REQUESTED,
@@ -1607,6 +1675,8 @@ mod tests {
         revalidation_error: Option<String>,
         retirement_stop_candidate_seen: bool,
         revalidation_pause_owned: Vec<bool>,
+        apply_pause_owned: Vec<bool>,
+        terminal_batches: Vec<TerminalBatch>,
     }
 
     impl Default for FakeIo {
@@ -1638,6 +1708,8 @@ mod tests {
                 revalidation_error: None,
                 retirement_stop_candidate_seen: false,
                 revalidation_pause_owned: Vec::new(),
+                apply_pause_owned: Vec::new(),
+                terminal_batches: Vec::new(),
             }
         }
     }
@@ -1703,6 +1775,8 @@ mod tests {
             records: Vec<DiscoveryRecord>,
             _deadline: Option<u64>,
             additions_allowed: bool,
+            pause_owned: bool,
+            terminal_batch: &mut Option<TerminalBatch>,
         ) -> Result<PauseBatchOutcome, String> {
             self.events.push(if additions_allowed {
                 "apply"
@@ -1711,6 +1785,10 @@ mod tests {
             });
             if self.fail_apply && additions_allowed {
                 return Err("apply".into());
+            }
+            self.apply_pause_owned.push(pause_owned);
+            if let Some(batch) = terminal_batch.take() {
+                self.terminal_batches.push(batch);
             }
             self.applied.extend(records);
             Ok(PauseBatchOutcome {
@@ -1741,6 +1819,7 @@ mod tests {
                         before_ns: 1,
                         after_ns: 2,
                         item,
+                        terminal_batch: None,
                     }));
                 } else if let DiscoveryItem::Record(record) = item {
                     self.applied.push(record);
@@ -2443,6 +2522,7 @@ mod tests {
                 before_ns: deferred.before_ns,
                 after_ns: deferred.after_ns,
                 item: deferred.item,
+                terminal_batch: deferred.terminal_batch,
             }),
             retirement_stop_candidate_seen: stop_candidate_seen,
             ..FakeIo::default()
@@ -2508,6 +2588,93 @@ mod tests {
         assert_eq!(io.authorization, None);
         assert_eq!(coordinator.counters(), PauseCounters::default());
         assert!(coordinator.counters().valid());
+    }
+
+    #[test]
+    fn classification_transfers_a_terminal_batch_to_its_cleanup_application() {
+        let owner = crate::discovery::loader::LoaderContextId::from_case_id(1);
+        let mut batch = TerminalBatch::empty(TerminalAuthority {
+            owner,
+            exports: Vec::new(),
+        });
+        batch.extend([record(10, -libc::EPERM as i64, false)]);
+        let mut io = FakeIo::default();
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Never, 41, 9, stopped());
+
+        coordinator
+            .service_received(
+                &mut io,
+                TimedItem {
+                    before_ns: 1,
+                    after_ns: 2,
+                    item: DiscoveryItem::Record(record(10, -libc::EPERM as i64, false)),
+                    terminal_batch: Some(batch),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(io.apply_pause_owned, [false]);
+        assert_eq!(io.terminal_batches.len(), 1);
+        assert_eq!(io.terminal_batches[0].authority.owner, owner);
+        assert_eq!(io.terminal_batches[0].record_count(), 1);
+    }
+
+    #[test]
+    fn failed_classification_application_keeps_the_terminal_batch_for_retry() {
+        let owner = crate::discovery::loader::LoaderContextId::from_case_id(1);
+        let mut batch = TerminalBatch::empty(TerminalAuthority {
+            owner,
+            exports: Vec::new(),
+        });
+        batch.extend([record(10, -libc::EPERM as i64, false)]);
+        let mut io = FakeIo {
+            fail_apply: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Never, 41, 9, stopped());
+
+        let error = coordinator
+            .service_received(
+                &mut io,
+                TimedItem {
+                    before_ns: 1,
+                    after_ns: 2,
+                    item: DiscoveryItem::Record(record(10, -libc::EPERM as i64, false)),
+                    terminal_batch: Some(batch),
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "apply");
+        assert!(io.terminal_batches.is_empty());
+        assert_eq!(
+            coordinator
+                .terminal_batch
+                .as_ref()
+                .map(|batch| batch.authority.owner),
+            Some(owner)
+        );
+    }
+
+    #[test]
+    fn ordinary_revalidation_rejects_a_pause_owned_deferral() {
+        let mut io = FakeIo {
+            revalidation_deferred: Some(TimedItem {
+                before_ns: 1,
+                after_ns: 2,
+                item: DiscoveryItem::Record(record(10, 0, false)),
+                terminal_batch: None,
+            }),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Never, 41, 9, stopped());
+
+        let error = coordinator.revalidate_after_release(&mut io).unwrap_err();
+
+        assert!(error.lifecycle());
+        assert!(error.to_string().contains("ordinary revalidation"));
+        assert_eq!(io.revalidation_pause_owned, [false]);
+        assert_eq!(io.events, ["revalidate"]);
     }
 
     #[test]

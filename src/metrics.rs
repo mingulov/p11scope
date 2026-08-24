@@ -267,6 +267,53 @@ mod tests {
     }
 
     #[test]
+    fn retired_slot_attribution_distinguishes_sole_ambiguous_and_unowned() {
+        let mut plan = exact_plan(vec![slot(0, "C_Sign")]);
+        plan.deactivate(0);
+
+        let report = slot_report(
+            &plan,
+            &plan.slots[0],
+            SlotStats {
+                returned: 7,
+                ..SlotStats::ZERO
+            },
+            BTreeMap::new(),
+        );
+
+        assert!(!plan.is_active(0));
+        assert_eq!(report.calls, 7);
+        assert_eq!(report.module, Some(ModuleId(0)));
+        assert!(!report.module_ambiguous);
+
+        let mut shared = slot(0, "C_Sign");
+        shared.module_ids = vec![ModuleId(0), ModuleId(1)];
+        let mut shared_plan = AttachPlan::from_slots(vec![shared]);
+        shared_plan.deactivate(0);
+        let shared_report = slot_report(
+            &shared_plan,
+            &shared_plan.slots[0],
+            SlotStats::ZERO,
+            BTreeMap::new(),
+        );
+        assert_eq!(shared_report.module, None);
+        assert!(shared_report.module_ambiguous);
+
+        let mut unowned = slot(0, "C_Sign");
+        unowned.module_ids.clear();
+        let mut unowned_plan = AttachPlan::from_slots(vec![unowned]);
+        unowned_plan.deactivate(0);
+        let unowned_report = slot_report(
+            &unowned_plan,
+            &unowned_plan.slots[0],
+            SlotStats::ZERO,
+            BTreeMap::new(),
+        );
+        assert_eq!(unowned_report.module, None);
+        assert!(!unowned_report.module_ambiguous);
+    }
+
+    #[test]
     fn historical_shared_slot_counts_stay_unattributed_after_one_owner_survives() {
         let target = crate::discovery::identity::PinnedObjectId(10);
         let mut shared = slot(0, "C_Sign");

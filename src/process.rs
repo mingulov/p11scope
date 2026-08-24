@@ -261,21 +261,39 @@ pub struct ProcessView {
     id: ProcessViewId,
     mount_namespace: MountNamespaceId,
     pin: PidPin,
+    admitted_ns: u64,
+}
+
+fn validated_with_admission_time<T>(
+    validate: impl FnOnce() -> Result<T, String>,
+    now_ns: impl FnOnce() -> Option<u64>,
+) -> Result<(T, u64), String> {
+    let retained = validate()?;
+    let admitted_ns =
+        now_ns().ok_or_else(|| "cannot read monotonic process-view admission time".to_string())?;
+    Ok((retained, admitted_ns))
 }
 
 impl ProcessView {
     pub fn open(id: ProcessViewId, pid: u32) -> Result<Self, String> {
-        let pin = PidPin::open(pid)?;
-        let mount_namespace = mount_namespace_id(pid)?;
-        if !pin.still_the_same() {
-            return Err(format!(
-                "pid {pid} exited while its mount namespace was identified"
-            ));
-        }
+        let ((pin, mount_namespace), admitted_ns) = validated_with_admission_time(
+            || {
+                let pin = PidPin::open(pid)?;
+                let mount_namespace = mount_namespace_id(pid)?;
+                if !pin.still_the_same() {
+                    return Err(format!(
+                        "pid {pid} exited while its mount namespace was identified"
+                    ));
+                }
+                Ok((pin, mount_namespace))
+            },
+            crate::attach::monotonic_ns,
+        )?;
         Ok(Self {
             id,
             mount_namespace,
             pin,
+            admitted_ns,
         })
     }
 
@@ -291,8 +309,20 @@ impl ProcessView {
         self.mount_namespace
     }
 
+    pub(crate) fn admitted_ns(&self) -> u64 {
+        self.admitted_ns
+    }
+
+    pub(crate) fn matches_lifecycle_event(&self, pid: u32, hook_ts_ns: u64) -> bool {
+        self.pid() == pid && hook_ts_ns >= self.admitted_ns
+    }
+
     pub fn still_the_same(&self) -> bool {
         self.pin.still_the_same()
+    }
+
+    pub(crate) fn original_exited(&self) -> Result<bool, String> {
+        self.pin.original_exited()
     }
 
     pub(crate) fn run_while_same<T>(&self, action: impl FnOnce() -> T) -> Result<T, String> {
@@ -381,6 +411,23 @@ impl PidPin {
         }
     }
 
+    fn original_exited(&self) -> Result<bool, String> {
+        let exited = match &self.pidfd {
+            Some(fd) => pidfd_exited_with(|| pidfd_ready(fd)),
+            None => proc_generation_exited(
+                self.start_time
+                    .ok_or_else(|| "fallback process pin has no start time".to_string())?,
+                process_start_time(self.pid),
+            ),
+        };
+        exited.map_err(|error| {
+            format!(
+                "cannot check whether original pid {} exited: {error}",
+                self.pid
+            )
+        })
+    }
+
     /// Proves that this pin retained the original pidfd and that the kernel
     /// still grants signal authority for that exact process generation.
     pub(crate) fn probe_signal_authority(&self) -> Result<(), String> {
@@ -413,6 +460,18 @@ impl PidPin {
 
 fn pidfd_still_same_with(ready: impl FnOnce() -> io::Result<bool>) -> bool {
     matches!(ready(), Ok(false))
+}
+
+fn pidfd_exited_with(ready: impl FnOnce() -> io::Result<bool>) -> io::Result<bool> {
+    ready()
+}
+
+fn proc_generation_exited(retained: u64, current: io::Result<u64>) -> io::Result<bool> {
+    match current {
+        Ok(current) => Ok(current != retained),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 fn raise_nofile() -> io::Result<usize> {
@@ -611,6 +670,30 @@ mod tests {
     }
 
     #[test]
+    fn original_exit_probe_distinguishes_exit_from_transport_failure() {
+        assert!(!pidfd_exited_with(|| Ok(false)).unwrap());
+        assert!(pidfd_exited_with(|| Ok(true)).unwrap());
+        assert_eq!(
+            pidfd_exited_with(|| Err(io::Error::from(io::ErrorKind::Interrupted)))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+
+        assert!(!proc_generation_exited(10, Ok(10)).unwrap());
+        assert!(proc_generation_exited(10, Ok(11)).unwrap());
+        assert!(
+            proc_generation_exited(10, Err(io::Error::from(io::ErrorKind::NotFound)),).unwrap()
+        );
+        assert_eq!(
+            proc_generation_exited(10, Err(io::Error::from(io::ErrorKind::PermissionDenied)))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
     fn original_pidfd_is_the_only_signal_authority() {
         let mut child = Command::new("sleep").arg("10").spawn().unwrap();
         let pin = PidPin::open(child.id()).unwrap();
@@ -659,6 +742,44 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn process_view_records_its_monotonic_admission_boundary() {
+        let before = crate::attach::monotonic_ns().unwrap();
+        let view = ProcessView::open(ProcessViewId(7), std::process::id()).unwrap();
+        let after = crate::attach::monotonic_ns().unwrap();
+
+        assert!((before..=after).contains(&view.admitted_ns()));
+    }
+
+    #[test]
+    fn lifecycle_event_must_follow_this_exact_view_admission() {
+        let view = ProcessView::open(ProcessViewId(8), std::process::id()).unwrap();
+
+        assert!(!view.matches_lifecycle_event(view.pid(), view.admitted_ns().saturating_sub(1),));
+        assert!(!view.matches_lifecycle_event(view.pid().wrapping_add(1), u64::MAX));
+        assert!(view.matches_lifecycle_event(view.pid(), view.admitted_ns()));
+    }
+
+    #[test]
+    fn admission_clock_is_read_only_after_identity_validation() {
+        let order = Cell::new(0);
+        let (retained, admitted_ns) = validated_with_admission_time(
+            || {
+                order.set(1);
+                Ok("new generation")
+            },
+            || {
+                assert_eq!(order.get(), 1);
+                Some(2)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(retained, "new generation");
+        assert_eq!(admitted_ns, 2);
+        assert!(1 < admitted_ns, "an older generation event is excluded");
     }
 
     #[test]

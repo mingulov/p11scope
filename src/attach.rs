@@ -372,7 +372,7 @@ pub struct Session {
     pub(crate) ebpf: Ebpf,
     attach_failures: Vec<(u32, String)>,
     detach_failures: Vec<String>,
-    attached: usize,
+    successful_static: BTreeSet<StaticEndpoint>,
     policy: CapturePolicy,
     uprobe_scope: UProbeScope,
     #[allow(dead_code)] // Task 8 drives the Task 7 pause coordinator.
@@ -385,6 +385,14 @@ enum ProducerProgram {
     UProbe(&'static str),
     TracePoint(&'static str),
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ProbeSide {
+    Return,
+    Entry,
+}
+
+type StaticEndpoint = (u32, ProbeSide);
 
 /// One link whose lifetime this session owns. Static, loader/export, and
 /// lifecycle links all remain in this one registry.
@@ -548,14 +556,6 @@ fn detach_selected_with<T>(
         .collect()
 }
 
-fn attached_probes_after_detach(attached: usize, live_attached: usize, terminal: bool) -> usize {
-    if terminal { attached } else { live_attached }
-}
-
-fn static_attached_links_with<T>(links: &[T], mut slot: impl FnMut(&T) -> Option<u32>) -> usize {
-    links.iter().filter(|link| slot(link).is_some()).count()
-}
-
 /// Renders `e` and every `.source()` beneath it, joined by `: `. Several
 /// of aya's error variants (e.g. `ProgramError::SyscallError`) are
 /// `#[error(transparent)]`, so `{e}` alone prints only the outer
@@ -595,7 +595,7 @@ fn entry_program(semantics: &SlotSemantics, policy: CapturePolicy) -> &'static s
 }
 
 struct AttachOutcome {
-    attached: usize,
+    successful: BTreeSet<StaticEndpoint>,
     failures: Vec<(u32, String)>,
     completed: Vec<SlotCompletion>,
 }
@@ -609,6 +609,17 @@ fn export_programs(abi: HookAbi) -> (&'static str, &'static str) {
         HookAbi::FunctionList => ("function_list_entry", "function_list_return"),
         HookAbi::InterfaceList => ("interface_list_entry", "interface_list_return"),
         HookAbi::Interface => ("interface_entry", "interface_return"),
+    }
+}
+
+fn static_endpoint(program: &str, slot: u32) -> Option<StaticEndpoint> {
+    match program {
+        "p11_return" => Some((slot, ProbeSide::Return)),
+        "p11_entry"
+        | "p11_entry_template"
+        | "p11_entry_template_types"
+        | "p11_entry_template_pair" => Some((slot, ProbeSide::Entry)),
+        _ => None,
     }
 }
 
@@ -635,14 +646,17 @@ fn attach_targets_with(
     mut attach: impl FnMut(&'static str, &Slot) -> Result<()>,
     mut completed_at: impl FnMut(&Slot) -> Option<u64>,
 ) -> AttachOutcome {
-    let mut attached = 0;
+    let mut successful = BTreeSet::new();
     let mut failures = Vec::new();
     let mut completed = Vec::new();
     let mut return_attached = BTreeSet::new();
     for slot in slots {
         match attach("p11_return", slot) {
             Ok(()) => {
-                attached += 1;
+                successful.insert(
+                    static_endpoint("p11_return", slot.index)
+                        .expect("p11_return is a static endpoint"),
+                );
                 return_attached.insert(slot.index);
             }
             Err(error) => failures.push((slot.index, format!("{error:#}"))),
@@ -668,7 +682,10 @@ fn attach_targets_with(
             }
             match attach(program, slot) {
                 Ok(()) => {
-                    attached += 1;
+                    successful.insert(
+                        static_endpoint(program, slot.index)
+                            .expect("selected entry program is a static endpoint"),
+                    );
                     completed.push((slot.index, completed_at(slot)));
                 }
                 Err(error) => failures.push((slot.index, format!("{error:#}"))),
@@ -676,7 +693,7 @@ fn attach_targets_with(
         }
     }
     AttachOutcome {
-        attached,
+        successful,
         failures,
         completed,
     }
@@ -1043,7 +1060,7 @@ impl Session {
             ebpf,
             attach_failures: vec![],
             detach_failures: vec![],
-            attached: 0,
+            successful_static: BTreeSet::new(),
             policy,
             uprobe_scope,
             pause_key,
@@ -1294,7 +1311,7 @@ impl Session {
             RegisteredLink::UProbe { .. } | RegisteredLink::TracePoint { .. } => (context, None),
         });
         let failures = self.detach_failures.len();
-        let _ = self.detach_links(|link| link.context() == Some(context), false);
+        let _ = self.detach_links(|link| link.context() == Some(context));
         (snapshot, self.detach_failures.len() != failures)
     }
 
@@ -1384,10 +1401,15 @@ impl Session {
             },
             |_| monotonic_ns(),
         );
-        self.attached += outcome.attached;
-        let failed: Vec<_> = outcome.failures.iter().map(|(slot, _)| *slot).collect();
-        self.attach_failures.extend(outcome.failures);
-        Ok((failed, outcome.completed))
+        let AttachOutcome {
+            successful,
+            failures,
+            completed,
+        } = outcome;
+        self.successful_static.extend(successful);
+        let failed: Vec<_> = failures.iter().map(|(slot, _)| *slot).collect();
+        self.attach_failures.extend(failures);
+        Ok((failed, completed))
     }
 
     /// Applies the attachment half of a descriptor downgrade after the caller
@@ -1435,10 +1457,7 @@ impl Session {
     /// delta. Each attempt is made even if an earlier Aya detach failed.
     pub fn detach_slots(&mut self, slots: &[Slot]) -> Result<()> {
         let slots: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
-        self.detach_links(
-            |link| link.slot().is_some_and(|slot| slots.contains(&slot)),
-            false,
-        )
+        self.detach_links(|link| link.slot().is_some_and(|slot| slots.contains(&slot)))
     }
 
     /// Detach every event/map producer while keeping the maps and ring reader
@@ -1447,18 +1466,14 @@ impl Session {
     /// removed last. Kernel detach does not wait for callbacks already running
     /// on another CPU; callers must not claim that the terminal drain is final.
     pub fn detach_producers(&mut self) -> Result<()> {
-        self.detach_links(|_| true, true)
+        self.detach_links(|_| true)
     }
 
     fn has_slot_link(&self, slot: u32) -> bool {
         self.links.iter().any(|link| link.slot() == Some(slot))
     }
 
-    fn detach_links(
-        &mut self,
-        mut select: impl FnMut(&RegisteredLink) -> bool,
-        terminal: bool,
-    ) -> Result<()> {
+    fn detach_links(&mut self, mut select: impl FnMut(&RegisteredLink) -> bool) -> Result<()> {
         let mut selected = Vec::new();
         let mut retained = Vec::new();
         for link in std::mem::take(&mut self.links) {
@@ -1469,7 +1484,6 @@ impl Session {
             }
         }
         self.links = retained;
-        let live_attached = static_attached_links_with(&self.links, RegisteredLink::slot);
 
         let mut first_error = None;
         for error in detach_selected_with(
@@ -1485,7 +1499,6 @@ impl Session {
                 first_error = Some(anyhow!(message));
             }
         }
-        self.attached = attached_probes_after_detach(self.attached, live_attached, terminal);
         first_error.map_or(Ok(()), Err)
     }
 
@@ -1611,9 +1624,9 @@ impl Session {
         &self.detach_failures
     }
 
-    /// Successful attachments across both programs (2 per fully-attached slot).
+    /// Lifetime successful static endpoints (2 per fully-attached slot).
     pub fn attached_probes(&self) -> usize {
-        self.attached
+        self.successful_static.len()
     }
 }
 
@@ -1740,14 +1753,33 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_links_do_not_change_attached_probes_after_detach() {
-        let links = [Some(0), Some(0), None, None, None];
+    fn only_static_slot_programs_have_endpoint_identities() {
         assert_eq!(
-            static_attached_links_with(&links, |slot| *slot),
-            2,
-            "the public count includes only the two static slot programs"
+            static_endpoint("p11_return", 7),
+            Some((7, ProbeSide::Return))
         );
-        assert_eq!(attached_probes_after_detach(2, 2, false), 2);
+        for program in [
+            "p11_entry",
+            "p11_entry_template",
+            "p11_entry_template_types",
+            "p11_entry_template_pair",
+        ] {
+            assert_eq!(static_endpoint(program, 7), Some((7, ProbeSide::Entry)));
+        }
+        for program in [
+            "dl_debug_state",
+            "function_list_entry",
+            "function_list_return",
+            "interface_list_entry",
+            "interface_list_return",
+            "interface_entry",
+            "interface_return",
+            "sched_process_fork",
+            "sched_process_exec",
+            "sched_process_exit",
+        ] {
+            assert_eq!(static_endpoint(program, 7), None, "{program}");
+        }
     }
 
     #[test]
@@ -1838,7 +1870,13 @@ mod tests {
             |_| Some(10),
         );
 
-        assert_eq!(outcome.attached, 2, "slot 1 gets its entry/return pair");
+        assert_eq!(
+            outcome.successful,
+            [(1, ProbeSide::Return), (1, ProbeSide::Entry)]
+                .into_iter()
+                .collect(),
+            "slot 1 gets its entry/return pair"
+        );
         assert_eq!(outcome.failures.len(), 1);
         assert_eq!(outcome.failures[0].0, 0);
         assert_eq!(outcome.completed, [(1, Some(10))]);
@@ -1846,6 +1884,28 @@ mod tests {
             attempted,
             [("p11_return", 0), ("p11_return", 1), ("p11_entry", 1),]
         );
+    }
+
+    #[test]
+    fn entry_failure_records_only_the_successful_return_endpoint() {
+        let outcome = attach_targets_with(
+            &[test_slot(0)],
+            CapturePolicy::Allowlisted,
+            |program, _| {
+                if program == "p11_entry" {
+                    anyhow::bail!("injected entry failure")
+                }
+                Ok(())
+            },
+            |_| Some(10),
+        );
+
+        assert_eq!(
+            outcome.successful,
+            [(0, ProbeSide::Return)].into_iter().collect()
+        );
+        assert_eq!(outcome.failures.len(), 1);
+        assert!(outcome.completed.is_empty());
     }
 
     #[test]
@@ -1884,17 +1944,15 @@ mod tests {
     }
 
     #[test]
-    fn replacing_a_slot_recounts_live_attachments_but_terminal_drain_keeps_evidence() {
+    fn replacing_a_slot_does_not_double_count_successful_endpoint_history() {
         let initial = attach_targets_with(
             &[test_slot(0)],
             CapturePolicy::Allowlisted,
             |_, _| Ok(()),
             |_| Some(10),
         );
-        assert_eq!(initial.attached, 2);
-
-        let after_live_detach = attached_probes_after_detach(initial.attached, 0, false);
-        assert_eq!(after_live_detach, 0);
+        let mut history = initial.successful;
+        assert_eq!(history.len(), 2);
 
         let replacement = attach_targets_with(
             &[test_slot(0)],
@@ -1902,12 +1960,21 @@ mod tests {
             |_, _| Ok(()),
             |_| Some(20),
         );
-        let attached_after_replacement = after_live_detach + replacement.attached;
-        assert_eq!(attached_after_replacement, 2);
+        history.extend(replacement.successful);
         assert_eq!(
-            attached_probes_after_detach(attached_after_replacement, 0, true),
-            2
+            history.len(),
+            2,
+            "the same slot's return/entry endpoint identities are lifetime-deduplicated"
         );
+
+        let new_slot = attach_targets_with(
+            &[test_slot(1)],
+            CapturePolicy::Allowlisted,
+            |_, _| Ok(()),
+            |_| Some(30),
+        );
+        history.extend(new_slot.successful);
+        assert_eq!(history.len(), 4);
     }
 
     #[test]

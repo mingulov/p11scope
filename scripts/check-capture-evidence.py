@@ -161,6 +161,14 @@ DISCOVERY_REASONS = {
 ENTRY_REASONS = {"null pointer", ENTRY_UNAVAILABLE}
 G1_SURFACES = Counter({("full", 68): 1, ("full", 92): 1, ("not_walked", 0): 1})
 LEGACY_SURFACES = Counter({("full", 68): 1})
+# What the p11-kit proxy lane's capacity-refused module really decodes on the
+# hosted lane: libp11-kit maps 64 static CK_FUNCTION_LIST_3_0 closures, 92
+# entries each. The refusal is an attach-ceiling refusal, taken after decode, so
+# every one of those entries stays counted in `table_entries`.
+PROXY_REFUSED_SURFACES = Counter({("full", 92): 64})
+PROXY_REFUSED_ENTRIES = sum(
+    entries * count for (_walk, entries), count in PROXY_REFUSED_SURFACES.items()
+)
 
 SAFE_ALLOWANCES = {
     "semantic_capture_failures": 3,
@@ -815,7 +823,6 @@ def validate_proxy_capacity_fallback(document):
     exact_capture_modules(document)
 
     evidence = document["evidence"]
-    exact_shape(evidence, 68, 68, 136, LEGACY_SURFACES, 0, "absent")
     exact_counters(evidence)
     require(evidence["attach_failures"] == [], evidence["attach_failures"])
     require(evidence["aliased"] == [], evidence["aliased"])
@@ -862,6 +869,44 @@ def validate_proxy_capacity_fallback(document):
         refused[0]["reason"],
     )
     require(match and int(match.group(1)) > 512, refused)
+
+    # Decoded occurrences are recorded *before* slot-capacity admission, so a
+    # module refused only by the attach ceiling keeps every entry it decoded;
+    # capacity bounds attachment, not discovery
+    # (plan 2026-08-19-slice1b2-production.md:1120-1136, schema v2 `table_entries`).
+    # How much that is belongs to the p11-kit build under test — this one maps
+    # 64 static 3.0 closures — so the refused contribution is derived from the
+    # surfaces the capture attributed to the refused module, never frozen at the
+    # attached module's own 68. Both modules must own every surface: an
+    # unattributable surface is a gap, not an allowance.
+    attached_surfaces = Counter()
+    refused_entries = 0
+    for surface in evidence["surfaces"]:
+        require(surface["acquisition"] == "ok", f"surface acquisition failure: {surface}")
+        if surface["source"].startswith(f"{module['path']} "):
+            attached_surfaces[(surface["walk"], surface["functions"])] += 1
+        elif surface["source"].startswith(f"{refused[0]['name']} "):
+            refused_entries += surface["functions"]
+        else:
+            require(False, f"surface belongs to neither module: {surface}")
+    require(
+        attached_surfaces == LEGACY_SURFACES,
+        f"unexpected attached-module surfaces: {dict(attached_surfaces)}",
+    )
+    require(
+        refused_entries > 0,
+        f"the capacity-refused module kept none of its decoded entries: {evidence['surfaces']}",
+    )
+    # `slots`/`attached_probes` stay bounded to the one attached module: the
+    # refused module contributes decoded history and no public accepted module.
+    for name, wanted in (
+        ("table_entries", 68 + refused_entries),
+        ("slots", 68),
+        ("attached_probes", 136),
+        ("vendor_interfaces", 0),
+        ("interface_list", "absent"),
+    ):
+        require(evidence[name] == wanted, f"{name}: want {wanted!r}, got {evidence[name]!r}")
 
     require(evidence["skipped"] == [], evidence["skipped"])
 
@@ -1464,13 +1509,28 @@ def self_test():
     proxy["capture"]["modules"][0]["path"] = soft_path
     proxy["evidence"]["discovery"][0]["path"] = soft_path
     proxy["evidence"]["discovery"][0]["objects"][0]["path"] = soft_path
+    proxy_refused = "/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.3.1"
     proxy["evidence"]["modules_skipped"] = [
         {
-            "name": "/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.3.1",
+            "name": proxy_refused,
             "reason": "module needs 5762 more of the 512 attach slots; 0 are in use "
             "— refusing to attach a prefix",
         }
     ]
+    # The refused module's decode survives its attach refusal, so the capture
+    # keeps its surfaces and counts their entries on top of the attached 68.
+    proxy["evidence"]["surfaces"][0]["source"] = f"{soft_path} table 2.40"
+    proxy["evidence"]["surfaces"] += [
+        {
+            "walk": walk,
+            "functions": functions,
+            "acquisition": "ok",
+            "source": f"{proxy_refused} table 3.0",
+        }
+        for (walk, functions), count in PROXY_REFUSED_SURFACES.items()
+        for _ in range(count)
+    ]
+    proxy["evidence"]["table_entries"] = 68 + PROXY_REFUSED_ENTRIES
     proxy["evidence"]["skipped"] = []
     proxy["functions"] = function_items(
         [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
@@ -1488,6 +1548,18 @@ def self_test():
         lambda d: d["evidence"].update(completeness="COMPLETE"),
         lambda d: d["evidence"].update(slots=67),
         lambda d: [item.update(calls=0) for item in d["functions"]],
+        # The refused module's decode is dropped rather than retained — the
+        # shape the frozen oracle demanded, and the one plan:1120-1136 forbids.
+        lambda d: d["evidence"].update(
+            table_entries=68,
+            surfaces=[s for s in d["evidence"]["surfaces"] if s["functions"] == 68],
+        ),
+        # ... or kept as surfaces but not counted, or miscounted either way.
+        lambda d: d["evidence"].update(table_entries=68),
+        lambda d: d["evidence"].update(table_entries=68 + PROXY_REFUSED_ENTRIES + 1),
+        lambda d: d["evidence"]["surfaces"].pop(),
+        # A surface neither module owns is a gap, never an allowance.
+        lambda d: d["evidence"]["surfaces"][-1].update(source="/usr/lib/other.so table 3.0"),
     ):
         bad = copy.deepcopy(proxy)
         mutate(bad)

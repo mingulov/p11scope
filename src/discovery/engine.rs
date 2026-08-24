@@ -9,7 +9,8 @@ use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
     ManifestStaleReason, PinnedObjectId, PinnedObjects, PinnedTimingKey, ReconciledModule,
     StaleManifestObject, bind_scanned_modules, canonicalize_scanned_overlays,
-    pin_manifest_objects_deferred_in_views, pin_scanned_view_objects, target_paths_equal,
+    pin_manifest_objects_deferred_in_views, pin_scanned_view_objects, retained_object_key,
+    target_paths_equal, view_object_key,
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::scan::{
@@ -3400,19 +3401,6 @@ fn exact_executable_mapping(
         .find_map(|mapping| usable_path(maps, mapping).map(|path| (mapping, path)))
 }
 
-fn metadata_object_key(metadata: &std::fs::Metadata) -> ObjectKey {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let device = metadata.dev();
-    ObjectKey {
-        device: Device {
-            major: u64::from(libc::major(device)),
-            minor: u64::from(libc::minor(device)),
-        },
-        inode: metadata.ino(),
-    }
-}
-
 fn candidate_identity_is_complete(
     plan: &plan::AttachPlan,
     modules: &[ReconciledModule],
@@ -5184,12 +5172,13 @@ impl Engine {
         }
         let maps = Self::read_maps(&self.views[position])?;
         let pid = self.views[position].pid();
-        let executable_metadata = self.views[position]
-            .run_while_same(|| std::fs::metadata(format!("/proc/{pid}/exe")))
-            .map_err(anyhow::Error::msg)?
-            .map_err(anyhow::Error::from)?;
+        let executable_identity = view_object_key(
+            &self.views[position],
+            Path::new(&format!("/proc/{pid}/exe")),
+        )
+        .map_err(anyhow::Error::msg)?;
         let Some((executable_mapping, executable_path)) =
-            exact_executable_mapping(&maps, metadata_object_key(&executable_metadata))
+            exact_executable_mapping(&maps, executable_identity)
         else {
             self.mark_partial(
                 "live loader arming",
@@ -5236,13 +5225,11 @@ impl Engine {
             );
             return Ok(false);
         }
-        let interpreter_metadata = self.views[position]
-            .run_while_same(|| {
-                std::fs::metadata(format!("/proc/{}/root{}", pid, interpreter.display()))
-            })
-            .map_err(anyhow::Error::msg)?
-            .map_err(anyhow::Error::from)?;
-        let loader_identity = metadata_object_key(&interpreter_metadata);
+        let loader_identity = view_object_key(
+            &self.views[position],
+            Path::new(&format!("/proc/{}/root{}", pid, interpreter.display())),
+        )
+        .map_err(anyhow::Error::msg)?;
         let Some((first_loader_mapping, loader_path)) =
             exact_executable_mapping(&maps, loader_identity)
         else {
@@ -5472,11 +5459,15 @@ impl Engine {
         }
 
         let view_id = self.views[position].id();
-        let loader_metadata = prepared_executable.interpreter_file().metadata()?;
+        let loader_identity = retained_object_key(
+            &self.views[position],
+            prepared_executable.interpreter_file(),
+        )
+        .map_err(anyhow::Error::msg)?;
         let loader_module = ScannedModule {
             view: view_id,
             mount_namespace: self.views[position].mount_namespace(),
-            key: metadata_object_key(&loader_metadata),
+            key: loader_identity,
             path: prepared_executable.interpreter().display().to_string(),
             exports: Vec::new(),
             tables: Vec::new(),
@@ -6118,7 +6109,11 @@ impl Engine {
             if self.terminal_owner() == Some(context_id) {
                 return Ok((changed, false));
             }
-            if self.loader_registry.remove(context_id).is_err() {
+            // A context its own terminal dispatch already removed was removed
+            // exactly once; only one still registered can fail to be removed.
+            if self.loader_registry.context(context_id).is_some()
+                && self.loader_registry.remove(context_id).is_err()
+            {
                 *additions_allowed = false;
                 self.mark_partial(
                     "live loader retirement",
@@ -6160,6 +6155,18 @@ impl Engine {
         }
     }
 
+    /// The one place every retirement intent is recorded, and therefore the one
+    /// place that decides whether a generation that is no longer current was
+    /// *lost* or simply *ended*. `still_the_same()` is false for both, so every
+    /// caller that only asks that question hands this an incoming
+    /// `GenerationLost`; the retained original pin is the stronger authority and
+    /// `run` already treats it as definitive (`should_finish`, src/run.rs). A
+    /// pin that proves the original exited names the ordinary leader-exit
+    /// transition, so the capture ends instead of failing — the `LEADER_EXIT`
+    /// record is still in the ring when the pidfd is already readable, and a
+    /// short-lived target loses that race almost every time. Loss stays loss
+    /// whenever exit cannot be proven, and an already-recorded loss stays
+    /// sticky: only the incoming cause is reclassified.
     fn queue_retirement(
         &mut self,
         view: ProcessViewId,
@@ -6167,6 +6174,11 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
     ) {
         let previous = self.retirement_intents.get(&view).copied();
+        let cause = if cause == RetirementCause::GenerationLost && self.original_exited(view) {
+            RetirementCause::ExpectedRemoval
+        } else {
+            cause
+        };
         let cause = previous.map_or(cause, |current| current.merge(cause));
         if cause != RetirementCause::ExpectedRemoval {
             self.ready_expected_removals.remove(&view);
@@ -6200,6 +6212,16 @@ impl Engine {
                 "a retained process generation changed and was scheduled for conservative cleanup",
             );
         }
+    }
+
+    /// Whether this view's retained original pin *proves* its process exited.
+    /// A poll failure or a dropped view is not exit evidence and stays false,
+    /// so an unprovable loss is never downgraded.
+    fn original_exited(&self, view: ProcessViewId) -> bool {
+        self.views
+            .iter()
+            .find(|candidate| candidate.id() == view)
+            .is_some_and(|retained| retained.original_exited() == Ok(true))
     }
 
     fn queue_apply_outcome(
@@ -8671,6 +8693,11 @@ mod tests {
                 .all(|skip| skip.subject != "live discovery generation")
         );
 
+        // An exec with no exit *record* still gets its matching exit from the
+        // stronger authority: the retained original pin. Task 9.2 defect B —
+        // the exit record is still in the ring while the pidfd is already
+        // readable, and calling that proven exit a lost generation failed
+        // `p11scope run` on every short-lived child.
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -8686,8 +8713,88 @@ mod tests {
         engine.promote_stale_execs(&mut pending);
         assert_eq!(
             pending.get(&ProcessViewId(19)),
+            Some(&RetirementCause::ExpectedRemoval),
+            "a pin that proves the original exited names the leader-exit transition"
+        );
+        assert!(
+            engine
+                .counters
+                .object_skips
+                .iter()
+                .all(|skip| skip.subject != "live discovery generation"),
+            "a proven exit is not a loss"
+        );
+
+        // Loss that cannot be proven an exit stays loss: the live-loader attach
+        // postcheck route on a generation that is still running.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let view = ProcessView::open(ProcessViewId(20), child.id()).unwrap();
+        let mut engine = Engine::empty();
+        engine.views.push(view);
+        let mut pending = PendingViewRetirements::new();
+        engine.queue_stale_views(&[ProcessViewId(20)].into_iter().collect(), &mut pending);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(
+            pending.get(&ProcessViewId(20)),
             Some(&RetirementCause::GenerationLost),
-            "an exec without a matching exit remains genuine generation loss"
+            "a live generation that changed under us is genuine loss"
+        );
+        assert!(
+            engine
+                .counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.subject == "live discovery generation"),
+            "genuine loss stays sticky and PARTIAL"
+        );
+    }
+
+    /// Task 9.2 defect B, through the real batch route. A named target that
+    /// exits while live discovery is working on it is an expected removal —
+    /// the retained pin proves it — and the capture ends the ordinary way.
+    /// Only the `LEADER_EXIT` record used to say so, and it is still in the
+    /// ring when the pidfd is already readable, so `p11scope run` on a
+    /// short-lived child failed with a false `the named process generation
+    /// changed during live discovery` and discarded the whole capture.
+    #[test]
+    fn a_named_target_that_provably_exited_ends_the_capture_rather_than_failing_it() {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let view = ProcessView::open(ProcessViewId(0), child.id()).unwrap();
+        record.kind = DISCOVERY_KIND_EXEC;
+        record.pid_tgid = u64::from(child.id()) << 32;
+        record.hook_ts_ns = view.admitted_ns();
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Pid(child.id());
+        engine.views.push(view);
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let mut session = ScriptedSession::default();
+        apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .expect("a named target's provable exit is not a live-discovery failure");
+
+        assert!(
+            engine.expected_target_exit(),
+            "the capture ends the ordinary way: {:?}",
+            engine.counters.object_skips
+        );
+        assert!(engine.views.is_empty());
+        assert!(
+            engine
+                .counters
+                .object_skips
+                .iter()
+                .all(|skip| skip.subject != "live discovery generation"),
+            "a proven exit is not a lost generation: {:?}",
+            engine.counters.object_skips
         );
     }
 
@@ -8707,6 +8814,80 @@ mod tests {
                 Err("must not poll".to_string())
             })
             .unwrap()
+        );
+    }
+
+    /// Task 9.2 defect A. An ordinary dynamically linked target binds its live
+    /// loader context through the real arming path, so no capture publishes a
+    /// `discovery unavailable` skip for a loader that is plainly there. The
+    /// executable and its PT_INTERP are located by matching `/proc/<pid>/maps`
+    /// identities, and `stat`'s `st_dev` is not that representation: on a btrfs
+    /// rootfs it is the subvolume's anonymous device, so every comparison
+    /// failed and every capture on such a host reported a false unavailable.
+    #[test]
+    fn an_ordinary_dynamic_target_binds_its_live_loader_context() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let view = ProcessView::open(ProcessViewId(0), child.id()).unwrap();
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Pid(child.id());
+        engine.views.push(view);
+
+        let mut session = ScriptedSession::default();
+        let armed = engine.arm_loader_or_partial(
+            0,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        armed.expect("arming an ordinary dynamic target is not a failure");
+
+        let skips = engine.counters.object_skips.clone();
+        let aggregate = engine.loader_discovery();
+        assert_eq!(
+            aggregate.strategies.debug_state_every_hit, 1,
+            "the loader context must bind: {skips:?}"
+        );
+        assert_eq!(aggregate.strategies.unavailable, 0, "{skips:?}");
+        assert_eq!(aggregate.dlopen_timing.none, 0, "{skips:?}");
+        assert!(
+            skips
+                .iter()
+                .all(|skip| render::capture_skipped_out(skip).reason != "discovery unavailable"),
+            "an available loader never publishes a refused discovery skip: {skips:?}"
+        );
+    }
+
+    /// Task 9.2 defect A, second half, through the real batch route. A loader
+    /// context that retires cleanly publishes nothing. Its terminal dispatch
+    /// removes the context it retired, so the view retirement that follows must
+    /// not report that same context as one it could not remove — a second
+    /// false `discovery unavailable`, reachable only once a loader actually
+    /// binds, which is why the broken binding hid it.
+    #[test]
+    fn a_cleanly_retired_loader_context_publishes_no_skip() {
+        let (mut engine, owner) = Engine::retiring_loader_context(std::process::id());
+        let mut session = ScriptedSession::with_records([], 0);
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+            .expect("an ordinary retirement batch");
+
+        assert!(engine.loader_registry.context(owner).is_none());
+        let skips = engine.counters.object_skips.clone();
+        assert!(
+            skips
+                .iter()
+                .all(|skip| skip.subject != "live loader retirement"),
+            "a context removed exactly once is not a removal failure: {skips:?}"
+        );
+        assert!(
+            skips
+                .iter()
+                .all(|skip| render::capture_skipped_out(skip).reason != "discovery unavailable"),
+            "{skips:?}"
         );
     }
 

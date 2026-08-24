@@ -809,6 +809,24 @@ fn identity_of_in_mountinfo(
         .map_err(|error| format!("mapping identity unavailable: {error}"))
 }
 
+/// The `/proc/<pid>/maps`-comparable identity of one object reached through a
+/// retained process view. Live loader arming finds the executable and its
+/// PT_INTERP by matching this against `ObjectKey::of(mapping)`, so it has to be
+/// the representation maps itself renders: `st_dev` is the btrfs subvolume's
+/// anonymous device and never equals the mount device in maps, which leaves the
+/// loader unbindable on such a rootfs.
+pub fn view_object_key(view: &ProcessView, path: &Path) -> Result<ObjectKey, String> {
+    let (file, mountinfo) = view.open_then_mountinfo(|| open_object(path))?;
+    Ok(object_key(identity_of_in_mountinfo(&file, &mountinfo)?))
+}
+
+/// The same identity for a descriptor already retained across a pre-exec
+/// barrier, which must not be reopened by path.
+pub fn retained_object_key(view: &ProcessView, file: &std::fs::File) -> Result<ObjectKey, String> {
+    let ((), mountinfo) = view.open_then_mountinfo(|| Ok(()))?;
+    Ok(object_key(identity_of_in_mountinfo(file, &mountinfo)?))
+}
+
 fn object_key(mapping: MappingFileKey) -> ObjectKey {
     ObjectKey {
         device: Device {

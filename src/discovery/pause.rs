@@ -194,6 +194,11 @@ pub(crate) struct PauseCoordinator {
     counters: PauseCounters,
     epoch: PauseEpoch,
     armed: bool,
+    /// Monotonic clock read immediately *before* the exchange that installed
+    /// the live authorization, so it is a lower bound on when the kernel could
+    /// first see it. `None` when no arm recorded one, which keeps every record
+    /// a candidate.
+    armed_at_ns: Option<u64>,
     rearming_enabled: bool,
     may_be_stopped: bool,
     attempt_open: bool,
@@ -258,6 +263,7 @@ impl PauseCoordinator {
             counters: PauseCounters::default(),
             epoch: PauseEpoch::default(),
             armed: false,
+            armed_at_ns: None,
             rearming_enabled: policy != PausePolicy::Never,
             may_be_stopped: false,
             attempt_open: false,
@@ -316,12 +322,14 @@ impl PauseCoordinator {
                     .map(|()| ArmResult::Disabled);
             }
         };
+        let armed_at = io.now_ns().ok();
         if let Err(error) = io.arm() {
             return self.arm_cleanup_failed(io, error, false);
         }
         match io.authorization() {
             Ok(Some(PAUSE_ARMED)) => {
                 self.armed = true;
+                self.armed_at_ns = armed_at;
                 Ok(ArmResult::Armed)
             }
             Ok(_) => {
@@ -475,23 +483,30 @@ impl PauseCoordinator {
                     Err(error) => return self.fail_cycle(io, error, true),
                 }
             }
-            return io
-                .apply_batch(
-                    std::mem::take(&mut self.pending_records),
-                    None,
-                    true,
-                    false,
-                    &mut self.terminal_batch,
-                )
-                .map(|_| ())
-                .map_err(|error| Self::policy_error(self.policy, error, false));
+            return self.apply_unowned(io);
+        }
+        if self.predates_arm(&first) {
+            // Not this epoch's record at all. `may_be_stopped` is left exactly
+            // as it was: whether a stop is outstanding is the authorization
+            // map's answer, and the failure and cleanup routes still read it.
+            return self.apply_unowned(io);
         }
         let state = match io.authorization() {
             Ok(state) => state,
             Err(error) => return self.fail_cycle(io, error, true),
         };
         if state != Some(PAUSE_REQUESTED) {
-            if self.epoch.zero_candidate {
+            // An exact ARMED readback refutes the candidate. The kernel is the
+            // only writer of REQUESTED and never clears it, and this arm is
+            // rewritten only by `arm` (refused while armed) and by a successor
+            // installed on a stopped child with a drained queue — so ARMED here
+            // proves no hook won this arm's CAS. A zero helper result is not
+            // proof of a stop (the producer writes the same zero when there was
+            // no authorization to win: a lifecycle record, or any hook that
+            // fired between epochs), and this one is explained. Anything else —
+            // an authorization that vanished, an unknown value — is unexplained
+            // and stays a lost stop authorization.
+            if self.epoch.zero_candidate && state != Some(PAUSE_ARMED) {
                 self.begin_attempt();
                 return self.fail_cycle(
                     io,
@@ -499,17 +514,9 @@ impl PauseCoordinator {
                     false,
                 );
             }
+            self.epoch.zero_candidate = false;
             self.may_be_stopped = false;
-            return io
-                .apply_batch(
-                    std::mem::take(&mut self.pending_records),
-                    None,
-                    true,
-                    false,
-                    &mut self.terminal_batch,
-                )
-                .map(|_| ())
-                .map_err(|error| Self::policy_error(self.policy, error, false));
+            return self.apply_unowned(io);
         }
         self.may_be_stopped = true;
         self.begin_attempt();
@@ -735,6 +742,7 @@ impl PauseCoordinator {
             if let Err(error) = io.remove_authorization() {
                 return self.fail_cycle(io, error, true);
             }
+            let armed_at = io.now_ns().ok();
             if let Err(error) = io.arm() {
                 return self.fail_cycle(io, error, true);
             }
@@ -745,6 +753,7 @@ impl PauseCoordinator {
             if authorization != Some(PAUSE_ARMED) {
                 return self.fail_cycle(io, "successor was consumed before prior resume", true);
             }
+            self.armed_at_ns = armed_at;
             successor_baseline = match io.ring_loss() {
                 Ok(loss) => Some(loss),
                 Err(error) => return self.fail_cycle(io, error, true),
@@ -809,6 +818,39 @@ impl PauseCoordinator {
         }
         debug_assert!(self.counters.valid());
         Ok(())
+    }
+
+    /// A record the live arm cannot have produced. The producer reads its
+    /// causal timestamp *after* the exchange that would have stopped the child,
+    /// so nothing older than this arm ever won it: it is an ordinary record
+    /// left in the ring from before the arm — every hook that fired between
+    /// epochs made one, carrying the same zero helper result an accepted stop
+    /// has. It is neither this epoch's winner nor a stop candidate. Without a
+    /// recorded arm clock nothing is excluded, so the loud reading stands.
+    fn predates_arm(&self, record: &DiscoveryRecord) -> bool {
+        self.armed
+            && self
+                .armed_at_ns
+                .is_some_and(|armed_at| record.hook_ts_ns < armed_at)
+    }
+
+    /// A record this coordinator's authorization did not produce. No attempt is
+    /// open, so the failure bound `service_received` installed from that record
+    /// goes with it: a later failure or cleanup drain must be bounded from its
+    /// own clock, not from a record the coordinator never owned.
+    fn apply_unowned(&mut self, io: &mut impl PauseIo) -> Result<(), PauseError> {
+        if !self.attempt_open {
+            self.failure_deadline = None;
+        }
+        io.apply_batch(
+            std::mem::take(&mut self.pending_records),
+            None,
+            true,
+            false,
+            &mut self.terminal_batch,
+        )
+        .map(|_| ())
+        .map_err(|error| Self::policy_error(self.policy, error, false))
     }
 
     fn check_ring_loss(&mut self, io: &mut impl PauseIo) -> Result<(), String> {
@@ -934,6 +976,7 @@ impl PauseCoordinator {
         if let Some(DiscoveryItem::Record(record)) = item.as_ref()
             && exact_pid(record) == self.pid
             && record.send_signal_rc == 0
+            && !self.predates_arm(record)
         {
             // A zero helper result is a stop candidate, not proof. This mark
             // deliberately precedes the post-dequeue clock and every map read.
@@ -2073,6 +2116,141 @@ mod tests {
         assert!(!ordinary.events.contains(&"resume"));
     }
 
+    /// A leader-exit record is produced *after* the arm and still carries the
+    /// zero helper result an accepted stop has — its producer is not pause
+    /// eligible, so it never enters the exchange at all. The arm clock cannot
+    /// tell it from a winner; the map can. An exact ARMED readback proves the
+    /// kernel never consumed this arm, so the child was never stopped.
+    #[test]
+    fn an_unauthorized_zero_record_does_not_cost_an_intact_arm_its_authority() {
+        for policy in [PausePolicy::Auto, PausePolicy::Always] {
+            let mut io = successful_io(vec![record(6, 0, false)]);
+            io.authorization = None;
+            io.now = VecDeque::from([Ok(5)]);
+            let mut coordinator = PauseCoordinator::for_test(policy, 41, 9, stopped());
+            assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+
+            coordinator
+                .service(&mut io)
+                .expect("an intact arm is not a lost stop authorization");
+
+            assert_eq!(
+                coordinator.counters(),
+                PauseCounters::default(),
+                "{policy:?}: an unauthorized zero record is not a stop attempt"
+            );
+            assert!(coordinator.is_armed(), "{policy:?}: the arm survives");
+            assert!(coordinator.rearming_enabled(), "{policy:?}");
+            assert_eq!(
+                io.applied.len(),
+                1,
+                "{policy:?}: the record is still applied"
+            );
+            assert!(!io.events.contains(&"resume"), "{policy:?}");
+            assert_eq!(io.authorization, Some(PAUSE_ARMED), "{policy:?}");
+        }
+    }
+
+    /// The ring still holds records from before the arm — every hook that
+    /// fired between epochs produced one, with the same zero helper result an
+    /// accepted stop has. None of them won this arm: the producer reads its
+    /// causal timestamp *after* the exchange that would have stopped the child.
+    /// Consuming the oldest as the epoch's winner mistakes the real winner,
+    /// still queued behind it, for a duplicate.
+    #[test]
+    fn a_record_older_than_the_arm_is_never_its_epoch_winner() {
+        let mut io = successful_io(vec![record(1, 0, false), record(6, 0, false)]);
+        io.authorization = None;
+        io.now = VecDeque::from([Ok(5)]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        // The record behind it is the one that won, so the map already reads
+        // REQUESTED when the leftover is dequeued.
+        io.authorization = Some(PAUSE_REQUESTED);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(
+            coordinator.counters(),
+            PauseCounters::default(),
+            "a leftover opens no attempt and loses no authority"
+        );
+        assert!(coordinator.is_armed());
+        assert!(coordinator.rearming_enabled());
+        assert_eq!(
+            io.applied.len(),
+            1,
+            "it is applied as the ordinary record it is"
+        );
+        assert!(!io.events.contains(&"resume"));
+        assert_eq!(
+            io.authorization,
+            Some(PAUSE_REQUESTED),
+            "the winner still owns the arm"
+        );
+    }
+
+    /// The other half of the same rule: a record this arm *could* have produced
+    /// is still confirmed exactly as before.
+    #[test]
+    fn a_record_the_arm_could_have_produced_still_confirms_the_stop() {
+        let mut io = successful_io(vec![record(6, 0, false)]);
+        io.authorization = None;
+        io.now = VecDeque::from([Ok(5)]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        io.authorization = Some(PAUSE_REQUESTED);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    /// Servicing a record this coordinator never owned opens no attempt, so it
+    /// must not leave a 100 ms failure bound behind either: a cleanup drain one
+    /// capture later is bounded from its own clock, not from that record.
+    #[test]
+    fn an_unowned_record_does_not_bound_a_later_cleanup_drain() {
+        let mut io = successful_io(vec![record(6, 0, false)]);
+        io.authorization = None;
+        io.now = VecDeque::from([Ok(5)]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        coordinator.service(&mut io).unwrap();
+
+        io.fallback_now = 2 * CYCLE_NS;
+        coordinator
+            .cleanup(&mut io)
+            .expect("cleanup is bounded from its own clock");
+    }
+
+    /// The loud half: without an intact arm to explain it, a zero candidate is
+    /// still an unresolved stop — one attempt, one protective resume, retired.
+    #[test]
+    fn a_zero_candidate_no_arm_explains_is_still_a_lost_stop_authorization() {
+        let mut io = successful_io(vec![record(6, 0, false)]);
+        io.authorization = None;
+        io.now = VecDeque::from([Ok(5)]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        // The authorization this arm installed is gone, and nothing consumed
+        // it: unexplained, so the candidate stands.
+        io.authorization = None;
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(!coordinator.rearming_enabled());
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
     #[test]
     fn confirmation_freezes_task_ids_not_their_pre_stop_states() {
         let mut io = successful_io(vec![record(10, 0, false)]);
@@ -2130,11 +2308,11 @@ mod tests {
         assert_eq!(io.authorization, Some(PAUSE_ARMED));
 
         io.authorization = Some(PAUSE_REQUESTED);
-        io.queue.extend([
-            Ok(Some(DiscoveryItem::Record(record(10, 0, false)))),
-            Ok(None),
-            Ok(None),
-        ]);
+        // The successor's own window: a record this second arm could have
+        // produced, not one left over from before it.
+        let second = record(io.fallback_now, 0, false);
+        io.queue
+            .extend([Ok(Some(DiscoveryItem::Record(second))), Ok(None), Ok(None)]);
         coordinator.service(&mut io).unwrap();
 
         assert_eq!(coordinator.counters(), PauseCounters::confirmed(2));
@@ -3257,16 +3435,22 @@ mod tests {
             assert!(!io.events.contains(&"resume"));
         }
 
-        let mut io = successful_io(vec![record(10, 0, false)]);
-        io.authorization = Some(PAUSE_ARMED);
-        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
-        coordinator.arm_for_test();
-        coordinator.service(&mut io).unwrap();
-        coordinator.cleanup(&mut io).unwrap();
-        assert_eq!(
-            io.events.iter().filter(|event| **event == "resume").count(),
-            1
-        );
+        // A zero candidate over an *intact* arm is refuted, not debt: ARMED is
+        // proof the kernel never consumed it. Only a candidate no arm explains
+        // keeps the protective resume.
+        for (authorization, resumes) in [(Some(PAUSE_ARMED), 0), (None, 1)] {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            io.authorization = authorization;
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.arm_for_test();
+            coordinator.service(&mut io).unwrap();
+            coordinator.cleanup(&mut io).unwrap();
+            assert_eq!(
+                io.events.iter().filter(|event| **event == "resume").count(),
+                resumes,
+                "{authorization:?}"
+            );
+        }
     }
 
     #[test]

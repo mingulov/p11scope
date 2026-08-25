@@ -2218,12 +2218,14 @@ fn discover_plan(
             Ok(view) => view,
             Err(error) if named => return Err(anyhow!(error)),
             Err(error) => {
-                let skipped = Skipped {
-                    subject: "process view".into(),
-                    reason: format!("the process generation could not be pinned: {error}"),
-                };
-                attribution::note(&skipped);
-                discovered.base_counters.object_skips.push(skipped);
+                if let Some(skipped) = unreadable_member_skip(
+                    *pid,
+                    process::generation_gone(*pid),
+                    &format!("the process generation could not be pinned: {error}"),
+                ) {
+                    attribution::note(&skipped);
+                    discovered.base_counters.object_skips.push(skipped);
+                }
                 continue;
             }
         };
@@ -2252,7 +2254,6 @@ fn discover_plan(
             // legitimate, but still a process whose providers went unexamined.
             Err(error) if named => return Err(error),
             Err(error) => {
-                eprintln!("p11scope: discovery skipped pid {pid}: {error:#}");
                 discovered.base_counters.scan_unavailable = discovered
                     .base_counters
                     .scan_unavailable
@@ -2262,12 +2263,14 @@ fn discover_plan(
                     .base_counters
                     .object_skips
                     .extend(counters.object_skips);
-                let skipped = Skipped {
-                    subject: format!("pid {pid}"),
-                    reason: format!("the process could not be scanned: {error:#}"),
-                };
-                attribution::note(&skipped);
-                discovered.base_counters.object_skips.push(skipped);
+                if let Some(skipped) = unreadable_member_skip(
+                    *pid,
+                    view.original_exited() == Ok(true),
+                    &format!("the process could not be scanned: {error:#}"),
+                ) {
+                    attribution::note(&skipped);
+                    discovered.base_counters.object_skips.push(skipped);
+                }
             }
         }
     }
@@ -4420,12 +4423,24 @@ impl Engine {
         if context.view != view {
             return false;
         }
-        pending_views.get(&view) == Some(&RetirementCause::ExecRefresh)
-            || self.refresh_requested.contains(&pid)
-            || context
-                .mapping
-                .as_ref()
-                .is_some_and(|armed| !maps.iter().any(|mapping| mapping == armed))
+        if pending_views.get(&view) == Some(&RetirementCause::ExecRefresh) {
+            return true;
+        }
+        match &context.mapping {
+            // The mapping the context was armed on is gone from a live image.
+            // Only `exec` replaces an address space wholesale, so this is the
+            // proof; an image that still holds it is loss.
+            Some(armed) => !maps.iter().any(|mapping| mapping == armed),
+            // The owned pre-exec prearm is armed on the interpreter of an
+            // executable the child has not exec'd yet, so it has no mapping to
+            // judge by and the only signal left is a refresh this capture
+            // already owes for this pid. That is weaker — `refresh_requested`
+            // is also set by `GenerationLost` and is retained for pids whose
+            // refresh failed — so it is confined to the one context shape that
+            // has no alternative, never used for a context that carries a
+            // mapping of its own.
+            None => self.refresh_requested.contains(&pid),
+        }
     }
 
     #[track_caller]
@@ -5312,17 +5327,13 @@ impl Engine {
             // unobserved — so it is counted by nothing either, neither as a
             // published skip nor as a `discovery_truncated` context failure.
             // Timing proof does go, so that stays invalidated.
-            let remapped_by_queued_exec = self.exec_replaced_the_armed_image(
-                &context.spec,
-                view_id,
-                pid,
-                &maps,
-                pending_views,
-            ) && context
-                .spec
-                .mapping
-                .as_ref()
-                .is_some_and(|expected| same_object_remapped(expected, mapping));
+            let remapped_by_queued_exec = context.spec.view == view_id
+                && pending_views.get(&view_id) == Some(&RetirementCause::ExecRefresh)
+                && context
+                    .spec
+                    .mapping
+                    .as_ref()
+                    .is_some_and(|expected| same_object_remapped(expected, mapping));
             if remapped_by_queued_exec {
                 self.invalidate_causal_timing();
             } else {
@@ -10036,6 +10047,129 @@ mod tests {
                 .iter()
                 .all(|skip| skip.subject != "live loader discovery"),
             "the armed mapping is gone from a live image, which only exec does: {skips:?}"
+        );
+    }
+
+    /// fix5 review, finding 1. `refresh_requested` is not exec evidence: it is
+    /// also filled by `GenerationLost`, and `refresh_inventory` *retains* it
+    /// for every pid whose refresh failed, so on a live target whose refresh
+    /// keeps failing it is sticky for the rest of the capture. Silencing a
+    /// hit on it claims "the refresh rescans that view whole and re-arms it",
+    /// which is exactly what did not happen. Only a context armed before its
+    /// child exec'd has no mapping of its own to judge by.
+    #[test]
+    fn a_sticky_refresh_request_does_not_excuse_a_live_armed_mapping() {
+        let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        // Armed on a mapping this live image still holds: nothing about it says
+        // `exec`.
+        let armed = maps
+            .iter()
+            .find(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
+            .expect("this process maps its own executable text")
+            .clone();
+        let pid = std::process::id();
+
+        let (mut engine, context, _) = engine_with_exec_refreshed_loader(armed);
+        engine.retirement_intents.clear();
+        engine.refresh_requested.insert(pid);
+        let mut record = loader_record_for(context, pid);
+        record.table_ptr = 0x1000;
+        let mut session = ScriptedSession::with_records([], 1);
+        apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .expect("an ordinary batch carrying one unresolvable hit");
+
+        let skips = engine.counters.object_skips.clone();
+        assert!(
+            skips
+                .iter()
+                .any(|skip| skip.subject == "live loader discovery"),
+            "a stale refresh request is not proof that an exec replaced this image: {skips:?}"
+        );
+    }
+
+    /// fix5 review, finding 2. fix4's identity branch excuses a moved mapping
+    /// only while the exec that moved it is queued as this view's
+    /// `ExecRefresh`. `same_object_remapped` already requires the mapping to
+    /// have moved, so "the armed mapping is absent from the live image" is
+    /// implied there and must not stand in for the queued refresh — that would
+    /// make fix4's precondition vacuous. The controller's ruling is that fix4's
+    /// decision stands.
+    #[test]
+    fn the_identity_branch_still_requires_a_queued_exec_refresh() {
+        let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        let observed = maps
+            .iter()
+            .find(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
+            .expect("this process maps its own executable text")
+            .clone();
+        let mut armed = observed.clone();
+        armed.start -= 0x1000_0000;
+        armed.end -= 0x1000_0000;
+
+        let (mut engine, context, _) = engine_with_exec_refreshed_loader(armed);
+        // No exec queued and no request outstanding: the mapping moved for a
+        // reason this capture cannot name.
+        engine.retirement_intents.clear();
+        engine.refresh_requested.clear();
+        let mut record = loader_record_for(context, std::process::id());
+        record.table_ptr = observed.start + 0x10;
+        let mut session = ScriptedSession::with_records([], 1);
+        apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .expect("an ordinary batch carrying one remapped hit");
+
+        let skips = engine.counters.object_skips.clone();
+        assert!(
+            skips
+                .iter()
+                .any(|skip| skip.subject == "live loader discovery"),
+            "without a queued exec refresh a moved mapping is loss, as fix4 left it: {skips:?}"
+        );
+    }
+
+    /// fix5 review, finding 3. The initial discovery pass has the same two
+    /// producers `refresh_inventory` does, and they were left carrying the pid
+    /// in their deduplication key and consulting no exit proof — so a
+    /// `--cgroup` capture attached to an already-churning workload reproduces
+    /// lane 11's multiplicity at capture start, before the live path ever runs.
+    #[test]
+    fn capture_start_members_that_ended_are_not_losses() {
+        let pids: Vec<_> = (0..3)
+            .map(|_| {
+                let mut child = std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap();
+                let pid = child.id();
+                child.kill().unwrap();
+                child.wait().unwrap();
+                pid
+            })
+            .collect();
+        let dir = tempfile::tempdir().expect("a scope directory");
+        let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+        std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+        let args = CaptureArgs {
+            kind: crate::cli::Kind::Profile,
+            modules: vec![],
+            manifests: vec![],
+            hooks: HookRegistry::builtin(),
+            scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
+            metrics: false,
+            duration: None,
+            out: None,
+            unsafe_requested: false,
+        };
+        let scope = Scope::Cgroup {
+            path: dir.path().to_path_buf(),
+            id: 0,
+        };
+
+        let engine = Engine::discover(&args, &scope, None).expect("an empty cgroup still captures");
+
+        assert!(
+            engine.plan().skipped.is_empty(),
+            "three members that ended before capture start are not three losses: {:?}",
+            engine.plan().skipped
         );
     }
 

@@ -549,7 +549,11 @@ fn pidfd_send_signal(fd: &OwnedFd, signal: i32) -> io::Result<()> {
 /// answers is not proven gone — it may even have been reused — so a caller
 /// that cannot prove the end keeps its loss.
 pub(crate) fn generation_gone(pid: u32) -> bool {
-    process_start_time(pid).is_err()
+    gone_from(process_start_time(pid))
+}
+
+fn gone_from(start_time: io::Result<u64>) -> bool {
+    start_time.is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
 }
 
 fn process_start_time(pid: u32) -> io::Result<u64> {
@@ -788,6 +792,29 @@ mod tests {
         assert_eq!(retained, "new generation");
         assert_eq!(admitted_ns, 2);
         assert!(1 < admitted_ns, "an older generation event is excluded");
+    }
+
+    /// fix5 review, finding 4. Exit proof has to *be* proof: a `/proc` entry
+    /// that is refused (hidepid, a foreign user) or unparsable says nothing
+    /// about whether the process is still there, and every other suppression
+    /// in this family degrades to "still a loss" on error. Only NotFound —
+    /// the pid names no process — is the proof.
+    #[test]
+    fn only_a_missing_process_is_proof_of_exit() {
+        assert!(gone_from(Err(io::Error::from(io::ErrorKind::NotFound))));
+        assert!(!gone_from(Ok(12345)));
+        assert!(
+            !gone_from(Err(io::Error::from_raw_os_error(libc::EACCES))),
+            "a refused /proc entry is not an exit"
+        );
+        assert!(
+            !gone_from(Err(io::Error::new(io::ErrorKind::InvalidData, "stat comm"))),
+            "an unparsable stat line is not an exit"
+        );
+        assert!(
+            !generation_gone(std::process::id()),
+            "this process is alive"
+        );
     }
 
     #[test]

@@ -411,7 +411,7 @@ impl PidPin {
         }
     }
 
-    fn original_exited(&self) -> Result<bool, String> {
+    pub(crate) fn original_exited(&self) -> Result<bool, String> {
         let exited = match &self.pidfd {
             Some(fd) => pidfd_exited_with(|| pidfd_ready(fd)),
             None => proc_generation_exited(

@@ -25,28 +25,32 @@ try:
         evidence = json.load(source)["evidence"]
 except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
     raise SystemExit(f"{row}: invalid document: {error}")
+if not isinstance(evidence, dict):
+    raise SystemExit(f"{row}: evidence is not an object")
 if evidence.get("completeness") != "PARTIAL":
     raise SystemExit(f"{row}: expected PARTIAL, got {evidence.get('completeness')!r}")
+attached_probes = evidence.get("attached_probes")
+if type(attached_probes) is not int:
+    raise SystemExit(f"{row}: attached_probes is not an integer")
 failures = evidence.get("attach_failures")
 if not isinstance(failures, list):
     raise SystemExit(f"{row}: attach_failures is not a list")
 if row == "sysadmin":
-    if evidence.get("attached_probes") != 136:
-        raise SystemExit(f"{row}: expected 136 attached probes, got {evidence.get('attached_probes')!r}")
-    if failures:
-        raise SystemExit(f"{row}: expected zero slot failures, got {failures!r}")
-    skipped = evidence.get("skipped")
-    if not isinstance(skipped, list) or not any(
-        item.get("reason") == "discovery unavailable"
-        for item in skipped
-        if isinstance(item, dict)
-    ):
-        raise SystemExit(f"{row}: missing discovery-unavailable evidence")
+    if attached_probes != 136:
+        raise SystemExit(f"{row}: expected 136 attached probes, got {attached_probes!r}")
+    if failures != []:
+        raise SystemExit(f"{row}: expected zero attach failures, got {failures!r}")
+    if evidence.get("skipped") != [{"name": "discovery subject", "reason": "discovery unavailable"}]:
+        raise SystemExit(f"{row}: expected exact discovery-unavailable skip evidence")
 elif row == "bpf-perfmon":
-    if evidence.get("attached_probes") != 0:
-        raise SystemExit(f"{row}: expected zero attached probes, got {evidence.get('attached_probes')!r}")
-    if not failures:
-        raise SystemExit(f"{row}: expected per-slot attach failures")
+    if attached_probes != 0:
+        raise SystemExit(f"{row}: expected zero attached probes, got {attached_probes!r}")
+    if len(failures) != 136:
+        raise SystemExit(f"{row}: expected 136 attach failures, got {len(failures)}")
+    if not all(type(failure) is str and "`perf_event_open` failed" in failure for failure in failures):
+        raise SystemExit(f"{row}: expected perf_event_open refusal for every attach failure")
+    if evidence.get("skipped") != []:
+        raise SystemExit(f"{row}: expected no skipped evidence")
 else:
     raise SystemExit(f"unknown capability row {row!r}")
 print(f"{row}: expected capability-tier shape")
@@ -59,24 +63,38 @@ import json
 import sys
 
 path, row, mutation = sys.argv[1:]
+perf_event_open_refusal = (
+    "p11_entry at /usr/lib/softhsm/libsofthsm2.so+0x265b0: "
+    "`perf_event_open` failed: Permission denied (os error 13)"
+)
 document = {"evidence": {
     "attached_probes": 136 if row == "sysadmin" else 0,
     "completeness": "PARTIAL",
-    "attach_failures": [] if row == "sysadmin" else ["slot 0: permission denied"],
+    "attach_failures": [] if row == "sysadmin" else [perf_event_open_refusal] * 136,
     "skipped": [{"name": "discovery subject", "reason": "discovery unavailable"}]
     if row == "sysadmin" else [],
 }}
 evidence = document["evidence"]
 if mutation == "wrong-attached":
     evidence["attached_probes"] = 135 if row == "sysadmin" else 1
+elif mutation == "boolean-attached":
+    evidence["attached_probes"] = False
 elif mutation == "complete":
     evidence["completeness"] = "COMPLETE"
-elif mutation == "missing-skip":
-    evidence["skipped"] = []
+elif mutation == "wrong-skip-name":
+    evidence["skipped"] = [{"name": "another subject", "reason": "discovery unavailable"}]
+elif mutation == "malformed-skip-reason":
+    evidence["skipped"] = [{"name": "discovery subject", "reason": ["discovery unavailable"]}]
 elif mutation == "nonempty-sysadmin-failures":
     evidence["attach_failures"] = ["slot 0: permission denied"]
-elif mutation == "empty-bpf-failures":
-    evidence["attach_failures"] = []
+elif mutation == "short-bpf-failures":
+    evidence["attach_failures"] = evidence["attach_failures"][:-1]
+elif mutation == "arbitrary-bpf-failure":
+    evidence["attach_failures"] = ["slot 0: arbitrary failure"] * 136
+elif mutation == "nonstring-bpf-failure":
+    evidence["attach_failures"][0] = None
+elif mutation == "unexpected-bpf-skip":
+    evidence["skipped"] = [{"name": "discovery subject", "reason": "discovery unavailable"}]
 elif mutation != "baseline":
     raise SystemExit(f"unknown self-test mutation {mutation!r}")
 with open(path, "w", encoding="utf-8") as output:
@@ -106,20 +124,29 @@ self_test() {
             exit 1
         fi
     }
+    reject_mutation() {
+        row=$1
+        mutation=$2
+        document="$work/$row-$mutation.json"
+        write_self_test_document "$document" "$row" "$mutation"
+        reject "$row" 0 "$document" "$mutation"
+    }
     reject sysadmin 0 "$work/missing.json" missing-document
     reject sysadmin 1 "$sysadmin" nonzero-status
-    for mutation in wrong-attached complete missing-skip nonempty-sysadmin-failures; do
-        document="$work/sysadmin-$mutation.json"
-        write_self_test_document "$document" sysadmin "$mutation"
-        reject sysadmin 0 "$document" "$mutation"
-    done
+    reject_mutation sysadmin wrong-attached
+    reject_mutation sysadmin complete
+    reject_mutation sysadmin wrong-skip-name
+    reject_mutation sysadmin malformed-skip-reason
+    reject_mutation sysadmin nonempty-sysadmin-failures
     reject bpf-perfmon 0 "$work/missing.json" missing-document
     reject bpf-perfmon 1 "$bpf_perfmon" nonzero-status
-    for mutation in wrong-attached complete empty-bpf-failures; do
-        document="$work/bpf-perfmon-$mutation.json"
-        write_self_test_document "$document" bpf-perfmon "$mutation"
-        reject bpf-perfmon 0 "$document" "$mutation"
-    done
+    reject_mutation bpf-perfmon wrong-attached
+    reject_mutation bpf-perfmon boolean-attached
+    reject_mutation bpf-perfmon complete
+    reject_mutation bpf-perfmon short-bpf-failures
+    reject_mutation bpf-perfmon arbitrary-bpf-failure
+    reject_mutation bpf-perfmon nonstring-bpf-failure
+    reject_mutation bpf-perfmon unexpected-bpf-skip
     echo "capability-tier self-test: OK"
 }
 
@@ -172,16 +199,26 @@ stop_target() {
     wait "$target"
     wait_status=$?
     set -e
-    if kill -0 "$target" 2>/dev/null; then
-        row_metadata "${CURRENT_ROW:-cleanup}" "cleanup target_pid=$target signal=$signal wait_status=$wait_status quiescent=no"
+    TARGET_PID=
+    if [ "$wait_status" -eq 127 ]; then
+        row_metadata "${CURRENT_ROW:-cleanup}" "cleanup signal=$signal wait_status=$wait_status quiescent=no"
         return 1
     fi
-    row_metadata "${CURRENT_ROW:-cleanup}" "cleanup target_pid=$target signal=$signal wait_status=$wait_status quiescent=yes"
-    TARGET_PID=
+    row_metadata "${CURRENT_ROW:-cleanup}" "cleanup signal=$signal wait_status=$wait_status quiescent=yes"
 }
-cleanup() { stop_target || echo "capability-tier cleanup could not quiesce target" >&2; }
-on_exit() { status=$?; trap - EXIT; cleanup; exit "$status"; }
-on_signal() { status=$1; trap - EXIT INT TERM; cleanup; exit "$status"; }
+cleanup() {
+    if ! stop_target; then
+        echo "capability-tier cleanup could not quiesce target" >&2
+        return 1
+    fi
+}
+on_exit() {
+    status=$?
+    trap - EXIT
+    if ! cleanup && [ "$status" -eq 0 ]; then status=1; fi
+    exit "$status"
+}
+on_signal() { status=$1; trap - EXIT INT TERM; cleanup || :; exit "$status"; }
 trap on_exit EXIT
 trap 'on_signal 130' INT
 trap 'on_signal 143' TERM

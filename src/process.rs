@@ -544,6 +544,14 @@ fn pidfd_send_signal(fd: &OwnedFd, signal: i32) -> io::Result<()> {
     }
 }
 
+/// Whether this pid names no process at all right now. It is the only exit
+/// proof available for a generation that was never pinned: a pid that still
+/// answers is not proven gone — it may even have been reused — so a caller
+/// that cannot prove the end keeps its loss.
+pub(crate) fn generation_gone(pid: u32) -> bool {
+    process_start_time(pid).is_err()
+}
+
 fn process_start_time(pid: u32) -> io::Result<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let end = stat

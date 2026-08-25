@@ -10,6 +10,7 @@
 
 use crate::attach::{CapturePolicy, Scope, Session};
 use crate::cli::{self, CaptureArgs, Kind, RunArgs, ScopeArg};
+use crate::discovery::attribution;
 use crate::discovery::engine::Engine;
 use crate::discovery::pause::{
     ArmResult, PauseCoordinator, PauseError, PauseStatus, SessionPauseIo,
@@ -1692,6 +1693,9 @@ fn evidence_for(
     // `facts` or `pause` can name a process, a path, or a proof.
     let facts = engine.capture_facts();
     let plan = engine.plan();
+    // Internal-only, stderr-only, `skip-attribution` builds only: which site
+    // raised each record the document is about to publish.
+    attribution::report(&plan.skipped);
     let [
         discovery_ring_loss,
         discovery_state_failures,

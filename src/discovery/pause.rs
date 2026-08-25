@@ -1571,7 +1571,7 @@ fn collect_timed_retirement(
         pause_owned,
         || attach::monotonic_ns().ok_or_else(|| anyhow::anyhow!("monotonic clock read failed")),
         || session.discovery_dequeue(),
-        || child.pin().still_the_same(),
+        || owned_generation_retained(child).unwrap_or(false),
     )
 }
 
@@ -2233,6 +2233,13 @@ mod tests {
             io.authorization,
             Some(PAUSE_REQUESTED),
             "the winner still owns the arm"
+        );
+        coordinator.cleanup(&mut io).unwrap();
+
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1,
+            "the requested map entry is still stop debt, so cleanup resumes the stopped child"
         );
     }
 

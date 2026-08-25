@@ -938,6 +938,7 @@ pub(crate) trait EngineSession {
     fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>>;
     fn counter_snapshot(&self) -> Result<CounterSnapshot>;
     fn detach_failures(&self) -> &[String];
+    fn lifecycle_tracking_unavailable(&self) -> Option<&str>;
     fn preflight_targets(&self, targets: &[plan::Slot], objects: &PinnedObjects) -> Result<()>;
     fn attach_targets(
         &mut self,
@@ -997,6 +998,10 @@ impl EngineSession for Session {
 
     fn detach_failures(&self) -> &[String] {
         Session::detach_failures(self)
+    }
+
+    fn lifecycle_tracking_unavailable(&self) -> Option<&str> {
+        Session::lifecycle_tracking_unavailable(self)
     }
 
     fn preflight_targets(&self, targets: &[plan::Slot], objects: &PinnedObjects) -> Result<()> {
@@ -4389,6 +4394,10 @@ impl Engine {
         if let Some(fact) = fact {
             self.mark_partial("live lifecycle tracking", fact);
         }
+    }
+
+    fn record_session_lifecycle_tracking(&mut self, session: &impl EngineSession) {
+        self.record_lifecycle_tracking_unavailable(session.lifecycle_tracking_unavailable());
     }
 
     /// A retained generation changed under an operation that needed it. Loss —
@@ -7890,7 +7899,7 @@ impl Engine {
                     return self.finish_start_capture_attempt(snapshot, Err(error));
                 }
             };
-        self.record_lifecycle_tracking_unavailable(session.lifecycle_tracking_unavailable());
+        self.record_session_lifecycle_tracking(&session);
         let result = (|| {
             let mut additions_allowed = true;
             let mut records = Vec::new();
@@ -7975,6 +7984,7 @@ pub(crate) mod session_fixture {
         counter_script: RefCell<VecDeque<bool>>,
         pub(crate) detach_exports: Vec<DynamicExportIdentity>,
         pub(crate) detach_failed: bool,
+        pub(crate) lifecycle_tracking_unavailable: Option<&'static str>,
         pub(crate) detached: Vec<LoaderContextId>,
         /// Slot counts of every `detach_slots` call, in order.
         pub(crate) detached_slots: Vec<usize>,
@@ -8068,6 +8078,10 @@ pub(crate) mod session_fixture {
 
         fn detach_failures(&self) -> &[String] {
             &[]
+        }
+
+        fn lifecycle_tracking_unavailable(&self) -> Option<&str> {
+            self.lifecycle_tracking_unavailable
         }
 
         fn preflight_targets(&self, _: &[plan::Slot], _: &PinnedObjects) -> Result<()> {
@@ -8269,10 +8283,12 @@ mod tests {
     #[test]
     fn lifecycle_tier_gap_uses_existing_public_discovery_evidence() {
         let mut engine = Engine::empty();
-        engine.record_lifecycle_tracking_unavailable(Some(
-            "live lifecycle tracking unavailable: tracefs not found",
-        ));
+        let mut session = ScriptedSession::default();
+        session.lifecycle_tracking_unavailable =
+            Some("live lifecycle tracking unavailable: tracefs not found");
+        engine.record_session_lifecycle_tracking(&session);
         record_object_skips(&mut engine.plan, &engine.counters.object_skips);
+        engine.publish_current_capture_facts().unwrap();
 
         assert_eq!(engine.plan.skipped.len(), 1);
         assert_eq!(
@@ -8281,6 +8297,10 @@ mod tests {
                 name: "discovery subject".into(),
                 reason: "discovery unavailable".into(),
             }
+        );
+        assert!(
+            !engine.plan.skipped.is_empty(),
+            "the final engine plan supplies the existing public PARTIAL projection"
         );
     }
 

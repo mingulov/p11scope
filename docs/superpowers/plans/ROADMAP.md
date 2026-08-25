@@ -357,9 +357,10 @@ partial). Slice-by-slice evidence including every deferred Minor is under
 
 ## Explicitly deferred (post-v1, in design spec's "out" list)
 
-AArch64 → first item after v1. Then, unordered and only on demonstrated need:
-live-discovery fallback mode, syscall/network correlation, DaemonSet/operator
-packaging, system-wide module discovery, security-findings layer, GUI.
+AArch64 → first item after v1. Raw tracepoint lifecycle migration is post-v1.
+Then, unordered and only on demonstrated need: live-discovery fallback mode,
+syscall/network correlation, DaemonSet/operator packaging, system-wide module
+discovery, security-findings layer, GUI.
 
 ## Productization (2026-08-15 →)
 

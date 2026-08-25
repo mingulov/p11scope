@@ -1015,6 +1015,10 @@ lockdown mode, a kernel below the supported floor (>= 5.15), missing BTF \
 (/sys/kernel/btf/vmlinux), or a restrictive kernel.perf_event_paranoid sysctl. See \
 docs/notes/phase5-unsupported.md for what each looks like when observed.";
 
+fn unsupported_environment_context(error: anyhow::Error) -> anyhow::Error {
+    error.context(UNSUPPORTED_ENV_HINT)
+}
+
 impl Session {
     pub(crate) fn start(
         plan: &AttachPlan,
@@ -1029,11 +1033,11 @@ impl Session {
                 "a pinned provider object changed before attach; refusing to observe changed bytes"
             );
         }
-        let mut session = Self::start_inner(scope, policy, pause_key)
-            .map_err(|e| anyhow!("{e:#}\n{UNSUPPORTED_ENV_HINT}"))?;
+        let mut session =
+            Self::start_inner(scope, policy, pause_key).map_err(unsupported_environment_context)?;
         session
             .attach_plan(plan, objects)
-            .map_err(|e| anyhow!("{e:#}\n{UNSUPPORTED_ENV_HINT}"))?;
+            .map_err(unsupported_environment_context)?;
         // The error path drops `session`, which detaches every probe.
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!(
@@ -1982,6 +1986,25 @@ mod tests {
                 io_error: io::Error::from(io::ErrorKind::PermissionDenied),
             }));
         assert!(tracefs_lifecycle_failure(&unexpected, "sched_process_exec").is_none());
+
+        let malformed_id =
+            anyhow::Error::from(ProgramError::TracePointError(TracePointError::FileError {
+                filename: PathBuf::from(
+                    "/sys/kernel/tracing/events/sched/sched_process_exec/id.bak",
+                ),
+                io_error: io::Error::from(io::ErrorKind::PermissionDenied),
+            }));
+        assert!(tracefs_lifecycle_failure(&malformed_id, "sched_process_exec").is_none());
+    }
+
+    #[test]
+    fn unsupported_environment_context_preserves_program_error() {
+        let error = unsupported_environment_context(
+            ProgramError::IOError(io::Error::other("tracefs not found")).into(),
+        );
+
+        assert!(format!("{error:#}").contains(UNSUPPORTED_ENV_HINT));
+        assert!(error.downcast_ref::<ProgramError>().is_some());
     }
 
     #[test]

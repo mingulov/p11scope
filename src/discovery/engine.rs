@@ -441,10 +441,10 @@ impl CaptureFacts {
                 Ok(slot)
             })
             .collect::<Result<Vec<_>>>()?;
+        candidate.rebind_module_ids(remapped_slots, &remap);
         for module in &mut candidate.modules {
             module.id = remap[&module.id];
         }
-        candidate.slots = remapped_slots;
         Ok(())
     }
 
@@ -8075,6 +8075,43 @@ mod tests {
         assert_eq!(different_plan.modules[0].id, plan::ModuleId(1));
         assert_eq!(different_plan.slots[0].module_ids, [plan::ModuleId(1)]);
         assert_eq!(facts.module_key(plan::ModuleId(1)), Some(&different_key));
+    }
+
+    /// Task 9.2b defect F. A capture-stable module ID is not the plan-local
+    /// one: any provider discovered ahead of this one takes the lower ID — a
+    /// capacity-*refused* provider included, since it is still a discovered
+    /// module with an exact identity. Binding renames the plan's modules and
+    /// its slots' owners; the aggregate cells name the same modules and must be
+    /// renamed with them. Leaving them on the pre-bind ID makes the next
+    /// extension read one provider under two IDs as two rivals and latch
+    /// `module_ambiguous` on every one of its cells — lane 03's 68 ambiguous
+    /// slots with no competing co-owner anywhere.
+    #[test]
+    fn rebinding_a_provider_to_its_stable_id_is_not_a_second_rival_owner() {
+        let (engine, _, _, _) = engine_with_overlay(50);
+        let mut facts = CaptureFacts::default();
+        // Another provider this capture discovered first holds ModuleId(0).
+        facts.resolve_module_id(&timing_key(0)).unwrap();
+
+        let mut committed = engine.plan.clone();
+        assert_eq!(committed.modules[0].id, plan::ModuleId(0));
+        facts
+            .bind_plan_module_ids(&mut committed, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        assert_eq!(committed.modules[0].id, plan::ModuleId(1));
+
+        let mut rebuilt = engine.plan.clone();
+        facts
+            .bind_plan_module_ids(&mut rebuilt, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        committed
+            .extend_exact_with_stable_module_ids(rebuilt)
+            .unwrap();
+
+        assert_eq!(
+            committed.module_ambiguous, 0,
+            "one provider under one stable ID is one owner, not two rivals"
+        );
     }
 
     #[test]

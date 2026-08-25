@@ -194,6 +194,13 @@ struct CaptureHistory {
     /// show. A fresher reading replaces it; only a corroboration tombstone
     /// revokes it.
     recorroborated: BTreeMap<plan::ModuleId, Corroboration>,
+    /// Every module the capture-end pass has ever derived a `Conflict` for.
+    /// Corroboration is revocable and replaceable, so `recorroborated` above
+    /// changes; a disagreement the capture actually observed is neither, and
+    /// counting it off that map would let a tombstone or a later agreement
+    /// decrement `discovery_conflicts`. Nothing is ever removed from this set —
+    /// it is the derived half of the same high-water mark `conflicts` is.
+    conflicted: BTreeSet<plan::ModuleId>,
     fallback_tombstones: BTreeSet<(u32, u32)>,
     conflicts: u64,
     /// The latched attach-time base only — never the published value. It stays
@@ -525,6 +532,9 @@ impl CaptureFacts {
             {
                 continue;
             }
+            if outcome == Corroboration::Conflict {
+                history.conflicted.insert(id);
+            }
             history.recorroborated.insert(id, outcome);
         }
 
@@ -809,11 +819,7 @@ impl CaptureFacts {
         // corroborations the capture-end §4.12 pass derived out of it, and the
         // revoked proofs it never counted. Kept apart until here so no order of
         // publications can let one cancel another.
-        let derived_conflicts = history
-            .recorroborated
-            .values()
-            .filter(|outcome| **outcome == Corroboration::Conflict)
-            .count() as u64;
+        let derived_conflicts = history.conflicted.len() as u64;
         let derived_corroborated = history
             .recorroborated
             .values()
@@ -8683,6 +8689,10 @@ mod tests {
             engine.discovery.uncorroborated, 0,
             "the blind attach-time outcome is re-derived at capture end"
         );
+        assert_eq!(
+            engine.discovery.conflicts, 1,
+            "the two sources decoded different targets in one object"
+        );
 
         // A second provider, corroborated when the plan was built: it is not in
         // the blind attach-time count, so revoking its proof is a new gap.
@@ -8721,6 +8731,67 @@ mod tests {
             engine.discovery.uncorroborated, 2,
             "both providers are uncorroborated now, and neither is double-counted"
         );
+        // Corroboration is revocable; a disagreement is not. The two sources
+        // did decode different targets, and no later retirement unsays it —
+        // an attach-derived conflict survives its module's tombstone through
+        // the high-water base, and a capture-end-derived one must too.
+        assert_eq!(
+            engine.discovery.conflicts, 1,
+            "a derived conflict is sticky: revoking the proof cannot lower it"
+        );
+    }
+
+    /// The other way a derived conflict can be replaced rather than revoked.
+    /// Only three of the version-matrix provider's thirteen tables live in
+    /// file-backed data; the other ten are built at run time in `.bss`, so a
+    /// scan that differs early and agrees once more of the object is decoded
+    /// is reachable. The later agreement is the better reading of the module,
+    /// but it does not unsay that the two sources once decoded different
+    /// targets.
+    #[test]
+    fn a_derived_conflict_stays_counted_when_a_later_scan_agrees() {
+        let (view, modules, pins, input) = same_object_scan_and_manifest(0x80);
+        let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+        blinded_attach_time_corroboration(&mut engine);
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(engine.discovery.conflicts, 1);
+        assert_eq!(engine.discovery.modules[0].corroboration, vec!["conflict"]);
+
+        // The same object, decoded again with the targets now agreeing.
+        let (_, agreeing, agreeing_pins, agreeing_input) = same_object_scan_and_manifest(0x40);
+        let agreed = discovered_from_inputs(
+            vec![ProcessView::open(ProcessViewId(0), std::process::id()).unwrap()],
+            agreeing,
+            agreeing_pins,
+            vec![agreeing_input],
+        );
+        engine.plan = agreed.plan;
+        engine.pinned = agreed.pinned;
+        engine.modules = agreed.modules;
+        engine.manifests = agreed.manifests;
+        engine.manifest_ordinals = agreed.manifest_ordinals;
+        blinded_attach_time_corroboration(&mut engine);
+        engine
+            .capture_facts
+            .bind_plan_module_ids(
+                &mut engine.plan,
+                &engine.modules,
+                &engine.manifests,
+                &engine.pinned,
+            )
+            .unwrap();
+        engine.publish_current_capture_facts().unwrap();
+
+        assert_eq!(
+            engine.discovery.modules[0].corroboration,
+            vec!["agreed"],
+            "the better-informed reading wins the module's own record"
+        );
+        assert_eq!(
+            engine.discovery.conflicts, 1,
+            "a disagreement the capture really observed is never decremented"
+        );
+        assert_eq!(engine.discovery.uncorroborated, 0);
     }
 
     /// The guard the re-derivation turns on: a provider the scan never reached

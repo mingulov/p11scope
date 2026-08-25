@@ -1334,6 +1334,9 @@ fn capture_profile(
         .pinned()
         .check_unchanged()
         .map_err(anyhow::Error::msg)?;
+    // A terminal-drain retry the capture proved is not a loss: judged here,
+    // at capture end, before the document that would carry the announcement.
+    engine.settle_terminal_drain();
     let mut ev = evidence_for(
         engine,
         session,
@@ -1528,6 +1531,7 @@ fn capture_trace(
         .pinned()
         .check_unchanged()
         .map_err(anyhow::Error::msg)?;
+    engine.settle_terminal_drain();
     let mut evidence = evidence_for(
         engine,
         session,

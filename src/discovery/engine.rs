@@ -2649,6 +2649,13 @@ fn bind_pending_corroboration(
 
 const STALE_VIEW_REASON: &str = "accepted process generation changed during attach preparation; its discovery claims were removed";
 
+/// The record a failed post-detach terminal drain publishes. It announces a
+/// *retry*, so it is only true while the journal that owes it is still
+/// pending; `settle_terminal_drain` judges it at capture end.
+const TERMINAL_DRAIN_SUBJECT: &str = "live loader retirement";
+const TERMINAL_DRAIN_RETRY_REASON: &str = "the post-detach private discovery drain failed; the exact terminal batch remains \
+     tombstoned for retry";
+
 /// The one published record for scope members discovery could not read.
 /// Deduplication is per exact `(subject, reason)` pair, so the pid, the view
 /// and the error text are diagnostics and must stay out of both: carrying them
@@ -6212,6 +6219,26 @@ impl Engine {
         Ok(())
     }
 
+    /// Judge the failed-drain record at capture end. It announces a *retry* —
+    /// "the exact terminal batch remains tombstoned for retry" — which is true
+    /// only while the journal that owes it is still pending. Once the journal
+    /// clears, nothing remains tombstoned: either the retry dispatched the
+    /// exact batch, or it was cleaned without replay and published that loss
+    /// under its own reason. Judged by capture end, like §4.12 corroboration
+    /// and the empty-scan rule; a journal still pending keeps the record, and
+    /// the timing proof this loss already invalidated is not given back.
+    pub(crate) fn settle_terminal_drain(&mut self) {
+        if self.terminal_journal.is_some() {
+            return;
+        }
+        let announced = Skipped {
+            subject: TERMINAL_DRAIN_SUBJECT.into(),
+            reason: TERMINAL_DRAIN_RETRY_REASON.into(),
+        };
+        self.counters.object_skips.retain(|skip| *skip != announced);
+        self.plan.skipped.retain(|skip| *skip != announced);
+    }
+
     fn terminal_owner(&self) -> Option<LoaderContextId> {
         self.terminal_journal.map(|journal| journal.owner)
     }
@@ -6462,10 +6489,7 @@ impl Engine {
                 Ok(terminal_changed) => changed |= terminal_changed.unwrap_or(false),
                 Err(error) if error.is::<IncompleteTerminalDrain>() => {
                     closure.fail();
-                    self.mark_live_loss(
-                        "live loader retirement",
-                        "the post-detach private discovery drain failed; the exact terminal batch remains tombstoned for retry",
-                    );
+                    self.mark_live_loss(TERMINAL_DRAIN_SUBJECT, TERMINAL_DRAIN_RETRY_REASON);
                     return Ok((changed, false));
                 }
                 Err(error) => return Err(error),
@@ -6524,10 +6548,7 @@ impl Engine {
                             )?;
                         }
                         closure.fail();
-                        self.mark_live_loss(
-                            "live loader retirement",
-                            "the post-detach private discovery drain failed; the exact terminal batch remains tombstoned for retry",
-                        );
+                        self.mark_live_loss(TERMINAL_DRAIN_SUBJECT, TERMINAL_DRAIN_RETRY_REASON);
                         return Ok((changed, false));
                     }
                     Err(_) => {
@@ -11487,6 +11508,62 @@ mod tests {
         );
         assert!(engine.loader_registry.is_tombstoned(owner));
         assert_eq!(carried.authority.owner, owner);
+    }
+
+    /// The failed-drain record announces a *retry*: "the exact terminal batch
+    /// remains tombstoned for retry". While the journal is pending that is
+    /// true. Once the retry lands and the journal clears, nothing remains
+    /// tombstoned and the announcement is contradicted by the same document
+    /// that carries it — so capture end judges it, like the empty-scan rule.
+    #[test]
+    fn a_terminal_drain_the_capture_retried_is_not_a_published_loss() {
+        let pid = std::process::id();
+        let (mut engine, owner) = Engine::retiring_loader_context(pid);
+        let unrelated = LoaderContextId::from_case_id(9);
+        let mut session = ScriptedSession::with_records([], 16);
+        session.detach_exports = vec![terminal_export()];
+        start_failed_terminal_drain(&mut engine, &mut session, owner);
+
+        let announced = Skipped {
+            subject: TERMINAL_DRAIN_SUBJECT.into(),
+            reason: TERMINAL_DRAIN_RETRY_REASON.into(),
+        };
+        assert_eq!(
+            announced.reason,
+            "the post-detach private discovery drain failed; the exact terminal batch remains \
+             tombstoned for retry",
+            "the published reason is unchanged"
+        );
+        assert!(
+            engine.plan.skipped.contains(&announced),
+            "a failed drain announces its retry: {:?}",
+            engine.plan.skipped
+        );
+
+        // Still owed at capture end: the announcement is true and stands.
+        engine.settle_terminal_drain();
+        assert!(engine.plan.skipped.contains(&announced));
+
+        session.dequeues.extend(
+            [
+                loader_record_for(owner, pid),
+                loader_record_for(unrelated, pid),
+            ]
+            .map(|record| Ok(Some(crate::events::DiscoveryItem::Record(record)))),
+        );
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+        assert!(engine.terminal_journal.is_none(), "the retry landed");
+
+        engine.settle_terminal_drain();
+        assert!(
+            !engine.plan.skipped.contains(&announced),
+            "a retry the capture proved leaves nothing tombstoned: {:?}",
+            engine.plan.skipped
+        );
+        assert!(
+            !engine.counters.object_skips.contains(&announced),
+            "and nothing to rebuild the record from"
+        );
     }
 
     #[test]

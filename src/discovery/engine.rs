@@ -196,7 +196,17 @@ struct CaptureHistory {
     recorroborated: BTreeMap<plan::ModuleId, Corroboration>,
     fallback_tombstones: BTreeSet<(u32, u32)>,
     conflicts: u64,
+    /// The latched attach-time base only — never the published value. It stays
+    /// a pure high-water mark of `current.uncorroborated`, so it can never drop
+    /// below what the plan reports; the derived corroborations subtracted from
+    /// it and the tombstone gaps added to it are separate facts, kept
+    /// separately and combined once, in `discovery`.
     uncorroborated: u64,
+    /// Proofs a later exact identity collision revoked, for modules that were
+    /// *not* corroborated by the capture-end re-derivation. Each is a gap the
+    /// base above never counted, so it is additive and permanent — mixing it
+    /// into the base would let another module's re-derivation subtract it away.
+    uncorroborated_tombstones: u64,
     scan_unavailable: Option<String>,
     scan_ms: u64,
     vendor_interfaces: usize,
@@ -345,13 +355,16 @@ impl CaptureFacts {
                 .modules
                 .get(&module)
                 .is_some_and(|snapshot| snapshot.corroborated);
-            if history.corroboration_tombstones.insert(module) && was_corroborated {
-                history.uncorroborated = history.uncorroborated.saturating_add(1);
+            // Revoking a *derived* corroboration is exactly dropping its
+            // subtraction: the module is a manifest module the plan reports as
+            // uncorroborated, so the latched base already counts it. Only a
+            // proof the base never counted — one the plan itself called
+            // corroborated — becomes a new gap.
+            let derived = history.recorroborated.remove(&module).is_some();
+            if history.corroboration_tombstones.insert(module) && was_corroborated && !derived {
+                history.uncorroborated_tombstones =
+                    history.uncorroborated_tombstones.saturating_add(1);
             }
-            // The tombstone revokes a re-derived outcome outright: the bump
-            // above already accounts for it, so it must not also be subtracted
-            // as a standing corroboration.
-            history.recorroborated.remove(&module);
             if let Some(snapshot) = history.modules.get_mut(&module) {
                 snapshot.corroborated = false;
                 snapshot.corroboration = vec!["uncorroborated"];
@@ -514,16 +527,6 @@ impl CaptureFacts {
             }
             history.recorroborated.insert(id, outcome);
         }
-        let derived_conflicts = history
-            .recorroborated
-            .values()
-            .filter(|outcome| **outcome == Corroboration::Conflict)
-            .count() as u64;
-        let derived_corroborated = history
-            .recorroborated
-            .values()
-            .filter(|outcome| corroboration_corroborates(**outcome))
-            .count() as u64;
 
         for mut module in current.modules {
             // A tombstone and a re-derived capture-end outcome are both the
@@ -745,18 +748,13 @@ impl CaptureFacts {
                 history.fallbacks.entry(key).or_insert(fallback);
             }
         }
-        // A conflict stays sticky: two sources really did disagree, and a later
-        // retirement does not unsay it. `uncorroborated` is the opposite kind
-        // of fact — "nothing corroborated this **by capture end**" — so a
-        // corroboration derived later must clear the blind attach-time one
-        // rather than being latched under it.
-        history.conflicts = history
-            .conflicts
-            .max(current.conflicts.saturating_add(derived_conflicts));
-        history.uncorroborated = history
-            .uncorroborated
-            .max(current.uncorroborated)
-            .saturating_sub(derived_corroborated);
+        // Both stay pure high-water marks of what the plan reports. What the
+        // capture-end re-derivation adds or removes is held in
+        // `recorroborated`, and `discovery` combines the two once — a latch
+        // that could drop below `current` would let one module's re-derivation
+        // absorb another module's tombstone gap.
+        history.conflicts = history.conflicts.max(current.conflicts);
+        history.uncorroborated = history.uncorroborated.max(current.uncorroborated);
         history.scan_unavailable = history.scan_unavailable.take().or(current.scan_unavailable);
         history.scan_ms = history.scan_ms.max(current.scan_ms);
         history.vendor_interfaces = history.vendor_interfaces.max(plan.vendor_interfaces);
@@ -807,10 +805,27 @@ impl CaptureFacts {
                 module
             })
             .collect();
+        // The three facts, combined once: the attach-time high-water mark, the
+        // corroborations the capture-end §4.12 pass derived out of it, and the
+        // revoked proofs it never counted. Kept apart until here so no order of
+        // publications can let one cancel another.
+        let derived_conflicts = history
+            .recorroborated
+            .values()
+            .filter(|outcome| **outcome == Corroboration::Conflict)
+            .count() as u64;
+        let derived_corroborated = history
+            .recorroborated
+            .values()
+            .filter(|outcome| corroboration_corroborates(**outcome))
+            .count() as u64;
         render::DiscoveryEvidence {
             modules,
-            conflicts: history.conflicts,
-            uncorroborated: history.uncorroborated,
+            conflicts: history.conflicts.saturating_add(derived_conflicts),
+            uncorroborated: history
+                .uncorroborated
+                .saturating_sub(derived_corroborated)
+                .saturating_add(history.uncorroborated_tombstones),
             module_ambiguous: plan.module_ambiguous as u64,
             modules_skipped: history.refusals.values().map(skipped_out).collect(),
             manifest_object_fallbacks: history.fallbacks.values().cloned().collect(),
@@ -8649,6 +8664,63 @@ mod tests {
         assert!(module.corroborated, "{module:?}");
         assert_eq!(engine.discovery.conflicts, 1);
         assert_eq!(engine.discovery.uncorroborated, 0);
+    }
+
+    /// A corroboration tombstone is a gap of its own, and it must survive every
+    /// later publication however many *other* modules hold a derived
+    /// corroboration. Also the only cover for the tombstone-revokes-derived
+    /// path: a derived corroboration is already inside the blind attach-time
+    /// count, so revoking it restores that contribution rather than adding a
+    /// second one.
+    #[test]
+    fn a_tombstone_gap_survives_another_modules_derived_corroboration() {
+        let (view, modules, pins, input) = same_object_scan_and_manifest(0x80);
+        let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+        blinded_attach_time_corroboration(&mut engine);
+        engine.publish_current_capture_facts().unwrap();
+        let derived = engine.discovery.modules[0].id;
+        assert_eq!(
+            engine.discovery.uncorroborated, 0,
+            "the blind attach-time outcome is re-derived at capture end"
+        );
+
+        // A second provider, corroborated when the plan was built: it is not in
+        // the blind attach-time count, so revoking its proof is a new gap.
+        let second = plan::ModuleId(derived.0 + 1);
+        let mut attach_corroborated = merged_module(vec!["scan", "manifest"]);
+        attach_corroborated.id = second;
+        attach_corroborated.corroborated = true;
+        attach_corroborated.corroboration = vec!["agreed"];
+        engine
+            .capture_facts
+            .history
+            .modules
+            .insert(second, attach_corroborated);
+
+        engine
+            .capture_facts
+            .invalidate_discovery_proofs([second], []);
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(
+            engine.discovery.uncorroborated, 1,
+            "the revoked proof is a gap the document must report"
+        );
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(
+            engine.discovery.uncorroborated, 1,
+            "a tombstone gap is not absorbed by another module's re-derivation"
+        );
+
+        // Revoking the derived module's own proof restores exactly its blind
+        // attach-time contribution — it must not be counted twice.
+        engine
+            .capture_facts
+            .invalidate_discovery_proofs([derived], []);
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(
+            engine.discovery.uncorroborated, 2,
+            "both providers are uncorroborated now, and neither is double-counted"
+        );
     }
 
     /// The guard the re-derivation turns on: a provider the scan never reached

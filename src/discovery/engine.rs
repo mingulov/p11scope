@@ -3831,6 +3831,18 @@ fn unmatched_exec_requests_refresh(views: &[ProcessView], pid: u32) -> bool {
     !views.iter().any(|view| view.pid() == pid)
 }
 
+/// Whether two mappings are the same file-backed object at a different load
+/// base — what an `exec` does to the loader. Everything an identity is made of
+/// is unchanged; only the address moved, so this is never a substitute for the
+/// exact match, only a reason not to call the mismatch a discovery loss.
+fn same_object_remapped(expected: &MapEntry, observed: &MapEntry) -> bool {
+    expected != observed
+        && ObjectKey::of(expected) == ObjectKey::of(observed)
+        && expected.file_offset == observed.file_offset
+        && expected.permissions == observed.permissions
+        && expected.raw_path == observed.raw_path
+}
+
 fn inventory_retirement_cause(
     original_current: bool,
     membership_authoritative: bool,
@@ -4942,16 +4954,36 @@ impl Engine {
                 RecordRejection::LoaderMissingMapping,
             ));
         };
-        if context.spec.view != self.views[position].id()
+        let view_id = self.views[position].id();
+        if context.spec.view != view_id
             || context
                 .spec
                 .mapping
                 .as_ref()
                 .is_some_and(|expected| expected != mapping)
         {
-            self.reject_loader_record(
-                "a loader hit failed generation, mapping, identity, or hook-IP validation",
-            );
+            // An `exec` this capture has already seen — it is queued right
+            // now as this exact view's `ExecRefresh` — re-maps the loader at a
+            // new load base, and every hit until the refresh runs resolves
+            // into the moved mapping. The hit is still rejected: it cannot be
+            // resolved against the armed context. It is not a loss: the queued
+            // refresh rescans that view whole and re-arms it, so nothing goes
+            // unobserved. Timing proof does go, so that stays invalidated.
+            let remapped_by_queued_exec = context.spec.view == view_id
+                && pending_views.get(&view_id) == Some(&RetirementCause::ExecRefresh)
+                && context
+                    .spec
+                    .mapping
+                    .as_ref()
+                    .is_some_and(|expected| same_object_remapped(expected, mapping));
+            if remapped_by_queued_exec {
+                self.loader_registry.reject_hit();
+                self.invalidate_causal_timing();
+            } else {
+                self.reject_loader_record(
+                    "a loader hit failed generation, mapping, identity, or hook-IP validation",
+                );
+            }
             return Ok(DiscoveryRecordOutcome::Rejected(
                 RecordRejection::LoaderMismatchedMapping,
             ));
@@ -5982,6 +6014,7 @@ impl Engine {
             .dispatch_started = true;
         let mut changed = false;
         for queued in records.drain(..) {
+            let origin = (queued.record.pid_tgid >> 32) as u32;
             match self.dispatch_discovery_record(queued, session, additions_allowed, pending_views)
             {
                 Ok(outcome) => {
@@ -5992,10 +6025,14 @@ impl Engine {
                 }
                 Err(_) => {
                     closure.fail();
-                    self.mark_live_loss(
-                        "live discovery record",
-                        "a structurally valid private terminal record failed exact live resolution",
-                    );
+                    if self.record_generation_ended(origin) {
+                        self.invalidate_causal_timing();
+                    } else {
+                        self.mark_live_loss(
+                            "live discovery record",
+                            "a structurally valid private terminal record failed exact live resolution",
+                        );
+                    }
                 }
             }
         }
@@ -6260,6 +6297,19 @@ impl Engine {
         }
     }
 
+    /// Whether the generation a record came from has *ended*. A record is
+    /// resolved against the address space that produced it, so one whose
+    /// process exited first cannot be resolved at all — the ordinary end of a
+    /// process, not a discovery loss. Same authority `queue_retirement` uses,
+    /// asked about a record instead of a retirement; loss stays loss whenever
+    /// exit cannot be proven.
+    fn record_generation_ended(&self, pid: u32) -> bool {
+        self.views
+            .iter()
+            .filter(|view| view.pid() == pid)
+            .any(|view| view.original_exited() == Ok(true))
+    }
+
     /// Whether this view's retained original pin *proves* its process exited.
     /// A poll failure or a dropped view is not exit evidence and stays false,
     /// so an unprovable loss is never downgraded.
@@ -6463,6 +6513,7 @@ impl Engine {
         }
         loop {
             for queued in std::mem::take(records) {
+                let origin = (queued.record.pid_tgid >> 32) as u32;
                 match self.dispatch_discovery_record(
                     queued,
                     session,
@@ -6477,10 +6528,14 @@ impl Engine {
                     }
                     Err(_) => {
                         closure.fail();
-                        self.mark_live_loss(
-                            "live discovery record",
-                            "a structurally valid private record failed exact live resolution",
-                        );
+                        if self.record_generation_ended(origin) {
+                            self.invalidate_causal_timing();
+                        } else {
+                            self.mark_live_loss(
+                                "live discovery record",
+                                "a structurally valid private record failed exact live resolution",
+                            );
+                        }
                     }
                 }
             }
@@ -6555,7 +6610,16 @@ impl Engine {
                 if !complete {
                     continue;
                 }
-                self.pending_retirements.insert(view);
+                // The conservative replay this queues drops every pin the view
+                // owns. That is right for a generation that is gone, and wrong
+                // for an `ExecRefresh`, which keeps its view and rescans the
+                // same live generation: dropping its pins re-pins the same
+                // provider under a fresh ID, so a second full slot set is
+                // allocated for targets that already have one and the replay's
+                // `additions_allowed = false` stops the replacement attaching.
+                if cause != RetirementCause::ExecRefresh {
+                    self.pending_retirements.insert(view);
+                }
                 self.retirement_intents.remove(&view);
                 self.ready_expected_removals.remove(&view);
                 if cause == RetirementCause::ExpectedRemoval {
@@ -6701,11 +6765,18 @@ impl Engine {
                 .filter(|view| !view.still_the_same())
                 .map(ProcessView::id)
                 .collect();
+            // `still_the_same()` is false for a generation that was lost and
+            // for one that merely ended. An already-recorded `ExpectedRemoval`
+            // intent settles it, but the `LEADER_EXIT` record that records one
+            // is still in the ring while the retained pin is already readable —
+            // so ask the pin too, the same stronger authority `queue_retirement`
+            // uses. Loss stays loss whenever exit cannot be proven.
             let expected: Vec<_> = stale
                 .iter()
                 .copied()
                 .filter(|view| {
                     self.retirement_intents.get(view) == Some(&RetirementCause::ExpectedRemoval)
+                        || self.original_exited(*view)
                 })
                 .collect();
             for view in expected {
@@ -9010,6 +9081,216 @@ mod tests {
                 .all(|skip| render::capture_skipped_out(skip).reason != "discovery unavailable"),
             "{skips:?}"
         );
+    }
+
+    /// One retained live view for this process, one *attached* loader context
+    /// frozen on `mapping`, and an `ExecRefresh` already queued for that view:
+    /// the state every capture whose target execs passes through between the
+    /// exec record and the refresh it queues.
+    fn engine_with_exec_refreshed_loader(
+        mapping: MapEntry,
+    ) -> (Engine, LoaderContextId, ProcessViewId) {
+        use p11scope_manifest::elf::SymbolFact;
+
+        let pid = std::process::id();
+        let view = ProcessView::open(ProcessViewId(0), pid).expect("a live process view");
+        let view_id = view.id();
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Pid(pid);
+        engine.views.push(view);
+        engine.next_view_id = 1;
+        let prepared = engine
+            .loader_registry
+            .preflight(LoaderContextSpec {
+                view: view_id,
+                loader: PinnedObjectId(9),
+                hook: SymbolFact {
+                    virtual_address: mapping.file_offset + 0x10,
+                    file_offset: mapping.file_offset + 0x10,
+                },
+                mapping: Some(mapping),
+                state: None,
+            })
+            .expect("a preflighted loader context");
+        let context = engine
+            .loader_registry
+            .prepare(prepared)
+            .expect("a prepared loader context");
+        engine
+            .loader_registry
+            .mark_attached(context)
+            .expect("an attached loader context");
+        engine
+            .retirement_intents
+            .insert(view_id, RetirementCause::ExecRefresh);
+        (engine, context, view_id)
+    }
+
+    /// Task 9.2b defect D. An `exec` re-maps the loader at a new load base, so
+    /// every loader hit between that exec and the refresh it queues resolves
+    /// into a mapping the armed context cannot match. Rejecting the record is
+    /// right; calling it a *loss* is not — the queued `ExecRefresh` rescans
+    /// that view whole, so nothing goes unobserved, and the public
+    /// `discovery unavailable` skip made every capture whose target execs
+    /// permanently PARTIAL on an otherwise healthy capture.
+    #[test]
+    fn a_loader_hit_remapped_by_a_queued_exec_refresh_is_not_a_discovery_loss() {
+        let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        let observed = maps
+            .iter()
+            .find(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
+            .expect("this process maps its own executable text")
+            .clone();
+        // The same object at the load base it had before the exec: identity,
+        // file offset and protection unchanged, only the address moved.
+        let mut armed = observed.clone();
+        armed.start -= 0x1000_0000;
+        armed.end -= 0x1000_0000;
+
+        let (mut engine, context, _) = engine_with_exec_refreshed_loader(armed);
+        let mut record = loader_record_for(context, std::process::id());
+        record.table_ptr = observed.start + 0x10;
+        let mut session = ScriptedSession::with_records([], 1);
+        apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .expect("an ordinary batch carrying one remapped loader hit");
+
+        let skips = engine.counters.object_skips.clone();
+        assert!(
+            skips
+                .iter()
+                .all(|skip| skip.subject != "live loader discovery"),
+            "an exec this capture already queued a refresh for explains the moved \
+             mapping; the hit is rejected, not lost: {skips:?}"
+        );
+    }
+
+    /// Task 9.2b defect D, second half. A discovery record can only be resolved
+    /// against the address space it came from, and a `--cgroup` capture's
+    /// forked children make their calls and exit while their records are still
+    /// queued. Every one of those then fails resolution with "process
+    /// generation changed before target access" and publishes one public
+    /// `discovery unavailable` — for the ordinary end of a process whose calls
+    /// the attached probes already counted exactly.
+    #[test]
+    fn a_record_from_a_proven_exited_generation_is_not_a_discovery_loss() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let (mut engine, context) = Engine::retiring_loader_context(pid);
+        // A cgroup capture continues when one member exits; the record its
+        // exited member already queued is what this is about.
+        engine.scope = Scope::Cgroup {
+            path: PathBuf::from("/sys/fs/cgroup/test.scope"),
+            id: 0,
+        };
+        engine.retirement_intents.clear();
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        // A loader record whose context is fine but whose address space is
+        // gone: resolution reads `/proc/<pid>/maps` behind the retained pin.
+        let mut session = ScriptedSession::with_records([], 1);
+        apply_ordinary_batch(
+            &mut engine,
+            &mut session,
+            vec![loader_record_for(context, pid)],
+        )
+        .expect("an ordinary batch carrying one unresolvable record");
+
+        let skips = engine.counters.object_skips.clone();
+        assert!(
+            skips
+                .iter()
+                .all(|skip| skip.subject != "live discovery record"),
+            "a generation the retained pin proves ended is not a lost one: {skips:?}"
+        );
+    }
+
+    /// Task 9.2b defect E, first half. An `ExecRefresh` *keeps* its view: the
+    /// refresh rescans that same live generation. Queuing it for the
+    /// conservative retirement replay drops the view's pins, so the same
+    /// provider is re-pinned under a fresh `PinnedObjectId`, a second full slot
+    /// set is allocated for targets that already have one, and `additions
+    /// allowed` is cleared so the replacement never attaches — 136 slots for a
+    /// 68-entry table, and probes that count nothing.
+    #[test]
+    fn an_exec_refresh_never_queues_its_live_view_for_conservative_retirement() {
+        let (mut engine, module, object, _) = engine_with_overlay(7);
+        let pid = std::process::id();
+        engine.scope = Scope::Pid(pid);
+        engine
+            .views
+            .push(ProcessView::open(module.view, pid).unwrap());
+        engine.next_view_id = module.view.0 + 1;
+        engine
+            .retirement_intents
+            .insert(module.view, RetirementCause::ExecRefresh);
+        assert_eq!(engine.plan.slots.len(), 1);
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        let mut session = ScriptedSession::with_records([], 0);
+
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+            .expect("an ordinary retirement batch");
+
+        assert!(
+            engine
+                .views
+                .iter()
+                .any(|retained| retained.id() == module.view),
+            "an exec refresh keeps its process view"
+        );
+        assert!(
+            engine.pinned.summary(object).is_some(),
+            "a retained view keeps its pins; re-pinning the same object under a \
+             fresh ID allocates a second slot set for targets that already have one"
+        );
+        assert_eq!(engine.plan.modules.len(), 1);
+    }
+
+    /// Task 9.2b defect E, second half, in the *capture* path this time.
+    /// `fix1` taught `queue_retirement` that the retained original pin, not
+    /// `still_the_same()`, decides whether a generation was lost or merely
+    /// ended. `refresh_inventory` asks a weaker question — whether an
+    /// `ExpectedRemoval` intent was already *recorded* — so a `run` child that
+    /// exits before its `LEADER_EXIT` record is drained fails the whole
+    /// capture with "the named process generation changed during capture".
+    #[test]
+    fn a_capture_refresh_ends_on_a_proven_exit_instead_of_failing() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let view = ProcessView::open(ProcessViewId(0), pid).unwrap();
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Pid(pid);
+        engine.views.push(view);
+        engine.next_view_id = 1;
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let mut session = ScriptedSession::with_records([], 0);
+        let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+        let outcome = engine.refresh_inventory(
+            &mut session,
+            &mut true,
+            &mut Vec::new(),
+            &mut PendingViewRetirements::new(),
+            &mut *collect,
+            &mut PauseClosure::new(true),
+        );
+
+        assert!(
+            outcome.is_ok(),
+            "a proven exit ends the capture, it does not discard it: {:?}",
+            outcome.err()
+        );
+        assert!(engine.expected_target_exit());
     }
 
     /// Plan Task 8 Step 1 checkbox 8, deferred to Step 2 because it needs the

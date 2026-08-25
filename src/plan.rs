@@ -343,6 +343,27 @@ impl AttachPlan {
         }
     }
 
+    /// Renames this snapshot's providers, aggregate cells included. Slot
+    /// ownership and the aggregate-cell owners name the same modules, so they
+    /// are renamed together: leaving the cells on the pre-rename IDs makes the
+    /// next [`Self::extend_exact_with_stable_module_ids`] read one provider
+    /// under two IDs as two rivals and latch a false `module_ambiguous` on
+    /// every one of its cells.
+    pub(crate) fn rebind_module_ids(
+        &mut self,
+        slots: Vec<Slot>,
+        remap: &BTreeMap<ModuleId, ModuleId>,
+    ) {
+        for owner in &mut self.aggregate_owners {
+            if let AggregateOwner::Sole(id) = owner
+                && let Some(stable) = remap.get(id)
+            {
+                *owner = AggregateOwner::Sole(*stable);
+            }
+        }
+        self.slots = slots;
+    }
+
     /// Retains only the aggregate-cell provenance a fully reconciled candidate
     /// proved about already-active exact targets. Candidate identities and
     /// topology remain local until their transaction commits.

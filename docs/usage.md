@@ -266,7 +266,7 @@ Phase 4 plan, not independently measured here.
 
 What actually happens today, measured on a real host
 (`docs/notes/phase5-unsupported.md`; two real bugs — a swallowed OS error,
-and 136 identical unexplained lines — were found while reproducing these
+and the historical 136 identical unexplained lines — were found while reproducing these
 and fixed, not just described):
 
 **No `CAP_BPF`/`CAP_SYS_ADMIN` at all** — fails at BPF map creation, exit
@@ -278,15 +278,15 @@ hint: this usually means the environment cannot load or attach BPF programs at a
 ```
 
 **`CAP_BPF`+`CAP_PERFMON` but no `CAP_SYS_ADMIN`, restrictive
-`perf_event_paranoid`** — map creation succeeds, every individual
-`perf_event_open` for the 136 uprobe/uretprobe slots is refused. Each
-per-slot line now carries the real OS error, followed by one synthesized
-summary line instead of 136 unexplained repeats:
+`perf_event_paranoid`** — map creation succeeds. The current 2026-08-25
+measurement recorded 68 attach-failure records/per-slot lines, each with the
+real `perf_event_open` refusal, covering 136 probes. One synthesized summary
+line follows:
 
 ```
-attach failed (slot 0): p11_entry at /usr/lib/softhsm/libsofthsm2.so+0x265b0: `perf_event_open` failed: Permission denied (os error 13)
+attach failed (slot 0): p11_return at /usr/lib/softhsm/libsofthsm2.so+0x265e0: `perf_event_open` failed: Permission denied (os error 13)
 ...
-p11scope: 136/136 attach attempts failed, every one the same way — this almost always means the environment cannot attach BPF uprobes at all: missing CAP_BPF/CAP_SYS_ADMIN (or root), a kernel lockdown mode, or a restrictive kernel.perf_event_paranoid sysctl. First underlying error: p11_entry at /usr/lib/softhsm/libsofthsm2.so+0x265b0: `perf_event_open` failed: Permission denied (os error 13)
+p11scope: 68/68 attach attempts failed, every one the same way — this almost always means the environment cannot attach BPF uprobes at all: missing CAP_BPF/CAP_SYS_ADMIN (or root), a kernel lockdown mode, or a restrictive kernel.perf_event_paranoid sysctl. First underlying error: p11_return at /usr/lib/softhsm/libsofthsm2.so+0x265e0: `perf_event_open` failed: Permission denied (os error 13)
 ```
 
 The tool keeps running with `attached_probes: 0`,

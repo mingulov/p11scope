@@ -35,22 +35,33 @@ if type(attached_probes) is not int:
 failures = evidence.get("attach_failures")
 if not isinstance(failures, list):
     raise SystemExit(f"{row}: attach_failures is not a list")
+skipped = evidence.get("skipped")
+has_sanitized_discovery_skips = isinstance(skipped, list) and bool(skipped) and all(
+    isinstance(skip, dict)
+    and set(skip) == {"name", "reason"}
+    and skip["name"] == "discovery subject"
+    and skip["reason"] == "discovery unavailable"
+    for skip in skipped
+)
 if row == "sysadmin":
     if attached_probes != 136:
         raise SystemExit(f"{row}: expected 136 attached probes, got {attached_probes!r}")
     if failures != []:
         raise SystemExit(f"{row}: expected zero attach failures, got {failures!r}")
-    if evidence.get("skipped") != [{"name": "discovery subject", "reason": "discovery unavailable"}]:
-        raise SystemExit(f"{row}: expected exact discovery-unavailable skip evidence")
+    if not has_sanitized_discovery_skips or len(skipped) != 2:
+        raise SystemExit(f"{row}: expected exactly two sanitized discovery-unavailable skips")
 elif row == "bpf-perfmon":
     if attached_probes != 0:
         raise SystemExit(f"{row}: expected zero attached probes, got {attached_probes!r}")
-    if len(failures) != 136:
-        raise SystemExit(f"{row}: expected 136 attach failures, got {len(failures)}")
-    if not all(type(failure) is str and "`perf_event_open` failed" in failure for failure in failures):
+    if len(failures) != 68:
+        raise SystemExit(f"{row}: expected 68 attach failures, got {len(failures)}")
+    if not all(
+        type(failure) is str and "`perf_event_open` failed: Permission denied" in failure
+        for failure in failures
+    ):
         raise SystemExit(f"{row}: expected perf_event_open refusal for every attach failure")
-    if evidence.get("skipped") != []:
-        raise SystemExit(f"{row}: expected no skipped evidence")
+    if not has_sanitized_discovery_skips or len(skipped) != 3:
+        raise SystemExit(f"{row}: expected exactly three sanitized discovery-unavailable skips")
 else:
     raise SystemExit(f"unknown capability row {row!r}")
 print(f"{row}: expected capability-tier shape")
@@ -70,9 +81,10 @@ perf_event_open_refusal = (
 document = {"evidence": {
     "attached_probes": 136 if row == "sysadmin" else 0,
     "completeness": "PARTIAL",
-    "attach_failures": [] if row == "sysadmin" else [perf_event_open_refusal] * 136,
-    "skipped": [{"name": "discovery subject", "reason": "discovery unavailable"}]
-    if row == "sysadmin" else [],
+    "attach_failures": [] if row == "sysadmin" else [perf_event_open_refusal] * 68,
+    "skipped": [{"name": "discovery subject", "reason": "discovery unavailable"}] * (
+        2 if row == "sysadmin" else 3
+    ),
 }}
 evidence = document["evidence"]
 if mutation == "wrong-attached":
@@ -83,18 +95,32 @@ elif mutation == "complete":
     evidence["completeness"] = "COMPLETE"
 elif mutation == "wrong-skip-name":
     evidence["skipped"] = [{"name": "another subject", "reason": "discovery unavailable"}]
+elif mutation == "too-few-skips":
+    evidence["skipped"] = evidence["skipped"][:-1]
+elif mutation == "too-many-skips":
+    evidence["skipped"].append({"name": "discovery subject", "reason": "discovery unavailable"})
+elif mutation == "missing-sysadmin-skip":
+    evidence["skipped"] = []
+elif mutation == "nonlist-sysadmin-skip":
+    evidence["skipped"] = "discovery unavailable"
 elif mutation == "malformed-skip-reason":
     evidence["skipped"] = [{"name": "discovery subject", "reason": ["discovery unavailable"]}]
+elif mutation == "extra-skip-field":
+    evidence["skipped"] = [{"name": "discovery subject", "reason": "discovery unavailable", "extra": True}]
 elif mutation == "nonempty-sysadmin-failures":
     evidence["attach_failures"] = ["slot 0: permission denied"]
+elif mutation == "nonobject-evidence":
+    document["evidence"] = []
+elif mutation == "nonlist-attach-failures":
+    evidence["attach_failures"] = "none"
 elif mutation == "short-bpf-failures":
     evidence["attach_failures"] = evidence["attach_failures"][:-1]
 elif mutation == "arbitrary-bpf-failure":
-    evidence["attach_failures"] = ["slot 0: arbitrary failure"] * 136
+    evidence["attach_failures"] = ["slot 0: arbitrary failure"] * 68
 elif mutation == "nonstring-bpf-failure":
     evidence["attach_failures"][0] = None
 elif mutation == "unexpected-bpf-skip":
-    evidence["skipped"] = [{"name": "discovery subject", "reason": "discovery unavailable"}]
+    evidence["skipped"] = [{"name": "another subject", "reason": "discovery unavailable"}]
 elif mutation != "baseline":
     raise SystemExit(f"unknown self-test mutation {mutation!r}")
 with open(path, "w", encoding="utf-8") as output:
@@ -136,13 +162,22 @@ self_test() {
     reject_mutation sysadmin wrong-attached
     reject_mutation sysadmin complete
     reject_mutation sysadmin wrong-skip-name
+    reject_mutation sysadmin too-few-skips
+    reject_mutation sysadmin too-many-skips
+    reject_mutation sysadmin missing-sysadmin-skip
+    reject_mutation sysadmin nonlist-sysadmin-skip
     reject_mutation sysadmin malformed-skip-reason
+    reject_mutation sysadmin extra-skip-field
     reject_mutation sysadmin nonempty-sysadmin-failures
+    reject_mutation sysadmin nonobject-evidence
+    reject_mutation sysadmin nonlist-attach-failures
     reject bpf-perfmon 0 "$work/missing.json" missing-document
     reject bpf-perfmon 1 "$bpf_perfmon" nonzero-status
     reject_mutation bpf-perfmon wrong-attached
     reject_mutation bpf-perfmon boolean-attached
     reject_mutation bpf-perfmon complete
+    reject_mutation bpf-perfmon too-few-skips
+    reject_mutation bpf-perfmon too-many-skips
     reject_mutation bpf-perfmon short-bpf-failures
     reject_mutation bpf-perfmon arbitrary-bpf-failure
     reject_mutation bpf-perfmon nonstring-bpf-failure

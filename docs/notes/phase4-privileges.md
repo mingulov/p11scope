@@ -73,9 +73,9 @@ process doesn't even need the module mapped at attach time.
 | Privilege | Result | Actual error text |
 | --- | --- | --- |
 | unprivileged | Historical FAIL | `p11scope: starting attach session: loading BPF object: map error: failed to create map \`CONFIG\`: failed to create map \`CONFIG\`: Operation not permitted (os error 1)` |
-| `CAP_BPF` + `CAP_PERFMON` (no `CAP_SYS_ADMIN`) | Historical FAIL | map creation succeeds; every attach fails: `` attach failed (slot N): p11_entry at /usr/lib/softhsm/libsofthsm2.so+0x...: \`perf_event_open\` failed `` (×136, `attached_probes: 0`, `completeness: PARTIAL`) |
+| `CAP_BPF` + `CAP_PERFMON` (no `CAP_SYS_ADMIN`) | Historical (pre-live) FAIL | map creation succeeds; every attach fails: `` attach failed (slot N): p11_entry at /usr/lib/softhsm/libsofthsm2.so+0x...: \`perf_event_open\` failed `` (×136, `attached_probes: 0`, `completeness: PARTIAL`) |
 | `CAP_SYS_ADMIN` alone | **UNRUN** | Historical pre-live result: 136 probes / `COMPLETE`. Current tracefs-unreadable tier contract: 136 static probes, lifecycle tracking degraded, `PARTIAL`; `scripts/verify-capability-tier.sh` is not yet measured on this host. |
-| full root | Historical PASS | Enhanced lifecycle tier was established in Tasks 2-5; not remeasured after live discovery. |
+| full root | Historical (pre-live Tasks 2-5) PASS | This historical result is not evidence for the post-live `exec`/`exit` lifecycle path. The post-fix6 root enhanced-profile check is separately **UNRUN**. |
 
 **Historical host minimum: `CAP_SYS_ADMIN` alone** — no need for
 `CAP_BPF`/`CAP_PERFMON`/`CAP_SYS_PTRACE` individually, and no need for
@@ -93,12 +93,15 @@ without re-checking `sysctl kernel.perf_event_paranoid` on another box.
 Aya's classic `sched_process_exec` and `sched_process_exit` attach path reads
 their IDs from tracefs. The enhanced tier therefore requires readable
 `events/sched/*/id` files. When tracefs DAC denies those reads, an external
-PID or cgroup observation session retains its other attachable probes and
-publishes `PARTIAL` through the existing discovery-unavailable evidence;
-owned `run` refuses before releasing its barrier. The interim non-root host
-preparation is a tracefs remount granting the observer's dedicated group, for
-example `gid=<observer-group>,mode=0750`. The capability rows above remain
-UNRUN until `scripts/verify-capability-tier.sh` records the two capsh outcomes.
+PID observation session may retain its other attachable probes and publish
+`PARTIAL` through the existing discovery-unavailable evidence. A cgroup
+observation path may degrade only when it does not require the mandatory
+`sched_process_fork`; an event-producing cgroup scope still requires readable
+fork tracefs and can fail closed under the controller ruling. Owned `run`
+refuses before releasing its barrier. The interim non-root host preparation is
+a tracefs remount granting the observer's dedicated group, for example
+`gid=<observer-group>,mode=0750`. The capability rows above remain UNRUN until
+`scripts/verify-capability-tier.sh` records the two capsh outcomes.
 
 ### Docker / kind (`--cgroup`, cross-uid target: container/pod root ≠ invoking user)
 

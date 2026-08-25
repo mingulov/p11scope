@@ -1,13 +1,10 @@
 # Phase 4 Task 8 — fork scoping and measured privileges
 
-> Historical measurement note: these results predate the 2026-08-13
-> same-inode hardening. Current authorization requires file ownership or
-> `CAP_LEASE` in addition to the BPF/procfs capabilities measured here.
-> `scripts/matrix/verify-fork-scope.sh` encodes the `CAP_SYS_ADMIN`+`CAP_LEASE`
-> lane and was corrected on 2026-08-14 to stop asserting a terminal
-> `COMPLETE`, but it has **not** been rerun. The minimum capability set is
-> therefore still inherited from the measurements below rather than freshly
-> derived; every 2026-08-14 live lane ran as root.
+> Historical measurement note: these results predate later live-discovery
+> changes. The current `scripts/matrix/verify-fork-scope.sh` removes the
+> earlier `CAP_LEASE` read-lease requirement, but its capability lane has not
+> been rerun. The rows below are therefore historical, not a current
+> authorization claim; every 2026-08-14 live lane ran as root.
 
 ## Part 1: fork scoping
 
@@ -75,14 +72,14 @@ process doesn't even need the module mapped at attach time.
 
 | Privilege | Result | Actual error text |
 | --- | --- | --- |
-| unprivileged | FAIL | `p11scope: starting attach session: loading BPF object: map error: failed to create map \`CONFIG\`: failed to create map \`CONFIG\`: Operation not permitted (os error 1)` |
-| `CAP_BPF` + `CAP_PERFMON` (no `CAP_SYS_ADMIN`) | FAIL | map creation succeeds; every attach fails: `` attach failed (slot N): p11_entry at /usr/lib/softhsm/libsofthsm2.so+0x...: \`perf_event_open\` failed `` (×136, `attached_probes: 0`, `completeness: PARTIAL`) |
-| `CAP_SYS_ADMIN` alone | **PASS** | `attached_probes: 136`, `completeness: COMPLETE` |
-| full root | PASS | (already established in Tasks 2-5) |
+| unprivileged | Historical FAIL | `p11scope: starting attach session: loading BPF object: map error: failed to create map \`CONFIG\`: failed to create map \`CONFIG\`: Operation not permitted (os error 1)` |
+| `CAP_BPF` + `CAP_PERFMON` (no `CAP_SYS_ADMIN`) | Historical FAIL | map creation succeeds; every attach fails: `` attach failed (slot N): p11_entry at /usr/lib/softhsm/libsofthsm2.so+0x...: \`perf_event_open\` failed `` (×136, `attached_probes: 0`, `completeness: PARTIAL`) |
+| `CAP_SYS_ADMIN` alone | **UNRUN** | Historical pre-live result: 136 probes / `COMPLETE`. Current tracefs-unreadable tier contract: 136 static probes, lifecycle tracking degraded, `PARTIAL`; `scripts/verify-capability-tier.sh` is not yet measured on this host. |
+| full root | Historical PASS | Enhanced lifecycle tier was established in Tasks 2-5; not remeasured after live discovery. |
 
-**Measured minimum on host: `CAP_SYS_ADMIN` alone** — no need for
+**Historical host minimum: `CAP_SYS_ADMIN` alone** — no need for
 `CAP_BPF`/`CAP_PERFMON`/`CAP_SYS_PTRACE` individually, and no need for
-full root. `CAP_BPF`+`CAP_PERFMON` failing here is itself a finding: on
+full root in the pre-live measurement. `CAP_BPF`+`CAP_PERFMON` failing here is itself a finding: on
 upstream kernels those two are documented as sufficient for BPF+uprobe
 work without `CAP_SYS_ADMIN`. Not on this kernel — Ubuntu's
 `kernel.perf_event_paranoid = 4` is a hardening level beyond the upstream
@@ -90,6 +87,18 @@ work without `CAP_SYS_ADMIN`. Not on this kernel — Ubuntu's
 `perf_event_open()`, overriding the `CAP_PERFMON` bypass path. This is a
 real, measured, host-specific fact, not something to generalize from
 without re-checking `sysctl kernel.perf_event_paranoid` on another box.
+
+### Tracefs lifecycle tier (UNRUN on this host)
+
+Aya's classic `sched_process_exec` and `sched_process_exit` attach path reads
+their IDs from tracefs. The enhanced tier therefore requires readable
+`events/sched/*/id` files. When tracefs DAC denies those reads, an external
+PID or cgroup observation session retains its other attachable probes and
+publishes `PARTIAL` through the existing discovery-unavailable evidence;
+owned `run` refuses before releasing its barrier. The interim non-root host
+preparation is a tracefs remount granting the observer's dedicated group, for
+example `gid=<observer-group>,mode=0750`. The capability rows above remain
+UNRUN until `scripts/verify-capability-tier.sh` records the two capsh outcomes.
 
 ### Docker / kind (`--cgroup`, cross-uid target: container/pod root ≠ invoking user)
 
@@ -103,13 +112,13 @@ Measured against a live `verify-docker.sh`-shaped container:
 
 | Privilege | Result | Actual error text |
 | --- | --- | --- |
-| unprivileged | FAIL | `ls: cannot read symbolic link '/proc/<pid>/root': Permission denied` (confirmed directly with `ls`, independent of p11scope) |
-| `CAP_SYS_PTRACE` alone (no `CAP_SYS_ADMIN`) | FAIL, but past the file check | `ls` with `CAP_SYS_PTRACE` alone **succeeds** reading `/proc/<pid>/root/...`; `p11scope profile` still fails at the BPF stage: `p11scope: starting attach session: loading BPF object: map error: failed to create map \`SLOT_KIND\`: failed to create map \`SLOT_KIND\`: Operation not permitted (os error 1)` |
-| `CAP_SYS_ADMIN` alone (no `CAP_SYS_PTRACE`) | FAIL | `p11scope: /proc/<pid>/root/usr/lib/softhsm/libsofthsm2.so: cannot identify the file now (read failed: Permission denied (os error 13))` / `p11scope: manifest does not match the current files; refusing to attach` |
-| `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` | **PASS** | `attached_probes: 136`, `completeness: COMPLETE` |
-| full root (`sudo`) | PASS | (established in Tasks 2-5) |
+| unprivileged | Historical FAIL | `ls: cannot read symbolic link '/proc/<pid>/root': Permission denied` (confirmed directly with `ls`, independent of p11scope) |
+| `CAP_SYS_PTRACE` alone (no `CAP_SYS_ADMIN`) | Historical FAIL, but past the file check | `ls` with `CAP_SYS_PTRACE` alone **succeeds** reading `/proc/<pid>/root/...`; `p11scope profile` still fails at the BPF stage: `p11scope: starting attach session: loading BPF object: map error: failed to create map \`SLOT_KIND\`: failed to create map \`SLOT_KIND\`: Operation not permitted (os error 1)` |
+| `CAP_SYS_ADMIN` alone (no `CAP_SYS_PTRACE`) | Historical FAIL | `p11scope: /proc/<pid>/root/usr/lib/softhsm/libsofthsm2.so: cannot identify the file now (read failed: Permission denied (os error 13))` / `p11scope: manifest does not match the current files; refusing to attach` |
+| `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` | **Historical PASS** | `attached_probes: 136`, `completeness: COMPLETE` |
+| full root (`sudo`) | Historical PASS | (established in Tasks 2-5) |
 
-**Measured minimum for docker: `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN`** — two
+**Historical minimum for docker: `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN`** — two
 capabilities, **not** full root. `CAP_SYS_PTRACE` is what's needed to
 traverse `/proc/<pid>/root` of a different-uid process at all (procfs
 gates this via `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`, independent
@@ -117,7 +126,7 @@ of the target file's own DAC permissions — confirmed directly: the same
 `ls` with `CAP_DAC_READ_SEARCH` instead of `CAP_SYS_PTRACE` still gets
 `Permission denied`, ruling out the more obvious-sounding "it's just a
 file permission" explanation). `CAP_SYS_ADMIN` is the same BPF/uprobe
-requirement as the host row.
+requirement as the host row. Current live-discovery capability output is UNRUN.
 
 Re-measured identically against a live kind pod
 (`verify-kind-pod.sh`-shaped, kind v0.29.0 / Kubernetes v1.33.1): same

@@ -4385,6 +4385,12 @@ impl Engine {
         }
     }
 
+    fn record_lifecycle_tracking_unavailable(&mut self, fact: Option<&str>) {
+        if let Some(fact) = fact {
+            self.mark_partial("live lifecycle tracking", fact);
+        }
+    }
+
     /// A retained generation changed under an operation that needed it. Loss —
     /// unless the retained original pin *proves* the process simply ended, the
     /// same authority `queue_retirement` and the live-record rule already use:
@@ -7884,6 +7890,7 @@ impl Engine {
                     return self.finish_start_capture_attempt(snapshot, Err(error));
                 }
             };
+        self.record_lifecycle_tracking_unavailable(session.lifecycle_tracking_unavailable());
         let result = (|| {
             let mut additions_allowed = true;
             let mut records = Vec::new();
@@ -8258,6 +8265,24 @@ mod tests {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::MetadataExt as _;
     use std::path::PathBuf;
+
+    #[test]
+    fn lifecycle_tier_gap_uses_existing_public_discovery_evidence() {
+        let mut engine = Engine::empty();
+        engine.record_lifecycle_tracking_unavailable(Some(
+            "live lifecycle tracking unavailable: tracefs not found",
+        ));
+        record_object_skips(&mut engine.plan, &engine.counters.object_skips);
+
+        assert_eq!(engine.plan.skipped.len(), 1);
+        assert_eq!(
+            render::capture_skipped_out(&engine.plan.skipped[0]),
+            render::SkippedOut {
+                name: "discovery subject".into(),
+                reason: "discovery unavailable".into(),
+            }
+        );
+    }
 
     fn dynamic_export_work(module: PinnedTimingKey, already_attached: bool) -> DynamicExportWork {
         DynamicExportWork {

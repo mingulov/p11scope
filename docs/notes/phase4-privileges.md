@@ -1,10 +1,10 @@
 # Phase 4 Task 8 — fork scoping and measured privileges
 
-> Historical measurement note: these results predate later live-discovery
-> changes. The current `scripts/matrix/verify-fork-scope.sh` removes the
-> earlier `CAP_LEASE` read-lease requirement, but its capability lane has not
-> been rerun. The rows below are therefore historical, not a current
-> authorization claim; every 2026-08-14 live lane ran as root.
+> Historical measurement note: the pre-2026-08-25 results below predate later
+> live-discovery changes. The 2026-08-25 host rows are current post-fix6,
+> host-specific measurements, not a portable authorization claim. The current
+> `scripts/matrix/verify-fork-scope.sh` removes the earlier `CAP_LEASE`
+> read-lease requirement; its broader capability matrix remains pending rerun.
 
 ## Part 1: fork scoping
 
@@ -73,22 +73,16 @@ process doesn't even need the module mapped at attach time.
 | Privilege | Result | Actual error text |
 | --- | --- | --- |
 | unprivileged | Historical FAIL | `p11scope: starting attach session: loading BPF object: map error: failed to create map \`CONFIG\`: failed to create map \`CONFIG\`: Operation not permitted (os error 1)` |
-| `CAP_BPF` + `CAP_PERFMON` (no `CAP_SYS_ADMIN`) | Historical (pre-live) FAIL | map creation succeeds; every attach fails: `` attach failed (slot N): p11_entry at /usr/lib/softhsm/libsofthsm2.so+0x...: \`perf_event_open\` failed `` (×136, `attached_probes: 0`, `completeness: PARTIAL`) |
-| `CAP_SYS_ADMIN` alone | **UNRUN** | Historical pre-live result: 136 probes / `COMPLETE`. Current tracefs-unreadable tier contract: 136 static probes, lifecycle tracking degraded, `PARTIAL`; `scripts/verify-capability-tier.sh` is not yet measured on this host. |
-| full root | Historical (pre-live Tasks 2-5) PASS | This historical result is not evidence for the post-live `exec`/`exit` lifecycle path. The post-fix6 root enhanced-profile check is separately **UNRUN**. |
+| `CAP_BPF` + `CAP_PERFMON` (no `CAP_SYS_ADMIN`) | Historical (pre-live) FAIL | Map creation succeeded; the pre-live output described every attach failing at `perf_event_open` (136 probes, `attached_probes: 0`, `completeness: PARTIAL`). This is historical wording, not the post-fix6 count. |
+| `CAP_BPF` + `CAP_PERFMON` (no `CAP_SYS_ADMIN`) | **Measured post-fix6** | On this host, 2026-08-25 at `2494fa9`: `exit_status: 0`, `attached_probes: 0/136`, 68 per-slot `attach_failures`, every one containing `` \`perf_event_open\` failed: Permission denied ``; `completeness: PARTIAL`; three sanitized public discovery pairs were recorded. |
+| `CAP_SYS_ADMIN` alone | **Measured post-fix6** | On this host, 2026-08-25 at `2494fa9`: `attached_probes: 136`, lifecycle tracking degraded, `completeness: PARTIAL`; `attach_failures: []`; two identical sanitized `discovery subject` / `discovery unavailable` skips were recorded for lifecycle and the ptrace-limited scan. |
+| full root | Historical (pre-live Tasks 2-5) PASS; **Measured post-fix6** | The pre-live result is not evidence for the post-live `exec`/`exit` lifecycle path. On this host, the existing root-backed `scripts/verify-attach-e2e.sh` run on 2026-08-25 passed both the manifest-free scan and manifest-correlated normal-profile lanes with 136/136 attached probes, zero attach failures, and zero skips; `PARTIAL` remained only for the expected semantics-unverified/count-only slots. This does not prove the owned `run` path. |
 
-**Historical host minimum: `CAP_SYS_ADMIN` alone** — no need for
-`CAP_BPF`/`CAP_PERFMON`/`CAP_SYS_PTRACE` individually, and no need for
-full root in the pre-live measurement. `CAP_BPF`+`CAP_PERFMON` failing here is itself a finding: on
-upstream kernels those two are documented as sufficient for BPF+uprobe
-work without `CAP_SYS_ADMIN`. Not on this kernel — Ubuntu's
-`kernel.perf_event_paranoid = 4` is a hardening level beyond the upstream
-0-3 range that requires `CAP_SYS_ADMIN` specifically for
-`perf_event_open()`, overriding the `CAP_PERFMON` bypass path. This is a
-real, measured, host-specific fact, not something to generalize from
-without re-checking `sysctl kernel.perf_event_paranoid` on another box.
+The pre-live `CAP_SYS_ADMIN` result is historical only. The post-fix6 rows
+above are host-specific measurements, not a general capability minimum; they
+must be re-measured on another host or kernel.
 
-### Tracefs lifecycle tier (UNRUN on this host)
+### Tracefs lifecycle tier
 
 Aya's classic `sched_process_exec` and `sched_process_exit` attach path reads
 their IDs from tracefs. The enhanced tier therefore requires readable
@@ -100,8 +94,13 @@ observation path may degrade only when it does not require the mandatory
 fork tracefs and can fail closed under the controller ruling. Owned `run`
 refuses before releasing its barrier. The interim non-root host preparation is
 a tracefs remount granting the observer's dedicated group, for example
-`gid=<observer-group>,mode=0750`. The capability rows above remain UNRUN until
-`scripts/verify-capability-tier.sh` records the two capsh outcomes.
+`gid=<observer-group>,mode=0750`. The current restricted-observer rows above
+were measured; root enhanced normal-profile evidence is measured by that e2e.
+The healthy owned `run` was also measured on this host with `exit_status: 0`,
+`pause=sigstop`, 136/136 attached probes, zero attach failures, and no tracefs
+refusal; `PARTIAL` remained because initial-set loader timing/capture was
+unproven. These bounded host results do not establish a portable capability
+minimum.
 
 ### Docker / kind (`--cgroup`, cross-uid target: container/pod root ≠ invoking user)
 

@@ -195,10 +195,11 @@ known-limitations section: `docs/notes/phase4-matrix.md`.
    fails on this kernel's `perf_event_paranoid=4`); Docker/kind need
    `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` (crossing into a different-uid
    container/pod's `/proc/<pid>/root`). Neither environment needs full
-   root. These Phase 4 measurements predate the same-inode hardening:
-   a capability-only observer now additionally needs `CAP_LEASE` for
-   provider files it does not own. The updated privileged matrix has not yet
-   been rerun.
+   root. Post-fix6 host evidence (2026-08-25) records `CAP_SYS_ADMIN`
+   attaching 136 probes with `PARTIAL` evidence, while
+   `CAP_BPF`+`CAP_PERFMON` records 68 per-slot `perf_event_open` failures,
+   `attached_probes: 0/136`, and `PARTIAL`. These host-specific rows do not
+   remeasure Docker/kind; that broader capability matrix remains pending.
 
 ## Phase 5 — Overhead benchmark + docs + v0.1 release
 
@@ -322,10 +323,9 @@ partial). Slice-by-slice evidence including every deferred Minor is under
 - `scripts/matrix/verify-fork-scope.sh` and `scripts/matrix/verify-oracle.sh`
   both asserted a terminal `COMPLETE` that the drain change made impossible.
   They were corrected to the shared `terminal_capture_is_clean` predicate on
-  2026-08-14 and have not been rerun. Because fork-scope carries the
-  capability matrix, the minimum capability set remains inherited rather than
-  freshly measured: `CAP_LEASE` is required by construction, but the minimum
-  was not re-derived. Every lane that was rerun ran as root.
+  2026-08-14 and have not been rerun. The post-fix6 host capability rows are
+  separately measured, but the broader fork-scope capability matrix remains
+  pending. Every lane that was rerun ran as root.
 - The container lanes predate the provider-copy byte cap, and
   `scripts/attach-pod.sh` has never run against a live cluster — it is
   unprivileged-tested for argument refusal only.
@@ -387,8 +387,8 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
   kernel 7.0.0-28-generic; consistent with the documented ~3.3µs). CI e2e: PASS — first
   push, run
   [31935749796](https://github.com/mingulov/pkcs11-scope/actions/runs/31935749796)
-  (2026-08-16, `checks-and-e2e` success). Follow-ups noted for 1b: re-measure the `--cgroup` minimum
-  (`verify-fork-scope.sh` still over-grants CAP_LEASE), one privileged `--cgroup` smoke after
+  (2026-08-16, `checks-and-e2e` success). Follow-ups noted for 1b: rerun the post-fix6 `--cgroup`
+  capability matrix, one privileged `--cgroup` smoke after
   the `_cgroup_file` removal, prune the now-unused root `p11scope-discover` dev-dependency.**
 - **Slice 1b — discovery engine and commands.** Split in two independently shippable plans
   when 1a landed (2026-08-16), because the memory scan needs no BPF change while the live

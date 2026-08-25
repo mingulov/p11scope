@@ -767,20 +767,55 @@ fn extend_occurrences<T: Clone + PartialEq>(retained: &mut Vec<T>, incoming: Vec
     }
 }
 
+/// The union of two source sets in the one order the schema allows: exactly
+/// `["scan"]`, `["manifest"]`, or `["scan", "manifest"]`
+/// (docs/schema/observed-profile-v2.md, "in that canonical order"). This is the
+/// order `PinnedObjects::sources` already emits; a union that appends in
+/// arrival order does not, and a manifest-first module the scan only reaches
+/// later renders the illegal `["manifest", "scan"]`.
+fn canonical_sources(retained: &[&'static str], incoming: &[&'static str]) -> Vec<&'static str> {
+    ["scan", "manifest"]
+        .into_iter()
+        .filter(|source| retained.contains(source) || incoming.contains(source))
+        .collect()
+}
+
+/// Merges one snapshot's `objects[]` into the retained set. `objects[]` is
+/// "every object this module's planned slots attach into" — one entry per
+/// object — and each snapshot already holds one entry per object. A later
+/// snapshot of the *same* object with a grown source set is that object
+/// described better, not a second object, so it coalesces rather than
+/// accumulating. Entries that differ in anything but `sources` are left
+/// distinct: this merge unions ownership, it never discards an identity fact.
+fn merge_object_summaries(
+    retained: &mut Vec<render::ObjectSummary>,
+    incoming: Vec<render::ObjectSummary>,
+) {
+    let identity = |object: &render::ObjectSummary| render::ObjectSummary {
+        sources: Vec::new(),
+        ..object.clone()
+    };
+    for object in incoming {
+        match retained
+            .iter_mut()
+            .find(|known| identity(known) == identity(&object))
+        {
+            Some(known) => known.sources = canonical_sources(&known.sources, &object.sources),
+            None => retained.push(object),
+        }
+    }
+}
+
 fn merge_discovered_module(
     retained: &mut render::DiscoveredModule,
     incoming: render::DiscoveredModule,
 ) {
-    extend_occurrences(&mut retained.objects, incoming.objects);
+    merge_object_summaries(&mut retained.objects, incoming.objects);
     extend_occurrences(&mut retained.tables, incoming.tables);
     extend_occurrences(&mut retained.skipped, incoming.skipped);
     retained.interfaces = retained.interfaces.max(incoming.interfaces);
     retained.corroborated |= incoming.corroborated;
-    for source in incoming.sources {
-        if !retained.sources.contains(&source) {
-            retained.sources.push(source);
-        }
-    }
+    retained.sources = canonical_sources(&retained.sources, &incoming.sources);
     for outcome in incoming.corroboration {
         if !retained.corroboration.contains(&outcome) {
             retained.corroboration.push(outcome);
@@ -14409,5 +14444,71 @@ mod tests {
                 && lost.iter().any(|s| s.reason.contains("never discovered")),
             "{lost:?}"
         );
+    }
+
+    fn merged_object(sources: Vec<&'static str>) -> render::ObjectSummary {
+        render::ObjectSummary {
+            dev: (0, 30),
+            ino: 12_043_768,
+            sha256: Some("5f48fcc1".into()),
+            path: "/tmp/freeze-provider.so".into(),
+            build_id: Some("23a2c057".into()),
+            identity_source: "mountinfo",
+            note: None,
+            sources,
+        }
+    }
+
+    fn merged_module(sources: Vec<&'static str>) -> render::DiscoveredModule {
+        render::DiscoveredModule {
+            id: plan::ModuleId(0),
+            dev: (0, 30),
+            ino: 12_043_768,
+            sha256: Some("5f48fcc1".into()),
+            path: "/tmp/freeze-provider.so".into(),
+            build_id: Some("23a2c057".into()),
+            objects: vec![merged_object(sources.clone())],
+            sources,
+            corroborated: false,
+            corroboration: vec!["uncorroborated"],
+            tables: Vec::new(),
+            interfaces: 0,
+            skipped: Vec::new(),
+        }
+    }
+
+    /// A manifest-first module that the scan only reaches later is the one
+    /// arrival order an append-union renders as `["manifest", "scan"]`, which
+    /// is outside the schema's three legal arrays
+    /// (docs/schema/observed-profile-v2.md: "in that canonical order").
+    #[test]
+    fn a_later_scan_merges_into_a_manifest_module_in_canonical_source_order() {
+        let mut retained = merged_module(vec!["manifest"]);
+        merge_discovered_module(&mut retained, merged_module(vec!["scan", "manifest"]));
+        assert_eq!(retained.sources, vec!["scan", "manifest"]);
+    }
+
+    /// `objects[]` is "every object this module's planned slots attach into" —
+    /// one entry per object. A source set that grows between snapshots is the
+    /// same physical object described better, not a second one.
+    #[test]
+    fn one_physical_object_keeps_one_objects_entry_across_a_source_change() {
+        let mut retained = merged_module(vec!["manifest"]);
+        merge_discovered_module(&mut retained, merged_module(vec!["scan", "manifest"]));
+        assert_eq!(
+            retained.objects,
+            vec![merged_object(vec!["scan", "manifest"])]
+        );
+    }
+
+    /// Two genuinely different objects still both appear.
+    #[test]
+    fn distinct_objects_are_never_coalesced_by_the_source_union() {
+        let mut retained = merged_module(vec!["scan"]);
+        let mut incoming = merged_module(vec!["manifest"]);
+        incoming.objects[0].ino = 999;
+        merge_discovered_module(&mut retained, incoming);
+        assert_eq!(retained.objects.len(), 2);
+        assert_eq!(retained.sources, vec!["scan", "manifest"]);
     }
 }

@@ -5003,7 +5003,9 @@ impl Engine {
             // into the moved mapping. The hit is still rejected: it cannot be
             // resolved against the armed context. It is not a loss: the queued
             // refresh rescans that view whole and re-arms it, so nothing goes
-            // unobserved. Timing proof does go, so that stays invalidated.
+            // unobserved — so it is counted by nothing either, neither as a
+            // published skip nor as a `discovery_truncated` context failure.
+            // Timing proof does go, so that stays invalidated.
             let remapped_by_queued_exec = context.spec.view == view_id
                 && pending_views.get(&view_id) == Some(&RetirementCause::ExecRefresh)
                 && context
@@ -5012,7 +5014,6 @@ impl Engine {
                     .as_ref()
                     .is_some_and(|expected| same_object_remapped(expected, mapping));
             if remapped_by_queued_exec {
-                self.loader_registry.reject_hit();
                 self.invalidate_causal_timing();
             } else {
                 self.reject_loader_record(
@@ -9196,6 +9197,15 @@ mod tests {
                 .all(|skip| skip.subject != "live loader discovery"),
             "an exec this capture already queued a refresh for explains the moved \
              mapping; the hit is rejected, not lost: {skips:?}"
+        );
+        // ...and "not a loss" has to mean the loss-class counter too. It is the
+        // one contributor that publishes no skip, so a nonzero value here is a
+        // gap no reader can attribute to anything.
+        let [_, _, _, truncated] = engine.capture_facts().discovery_losses();
+        assert_eq!(
+            truncated, 0,
+            "the queued refresh rescans the view whole, so this rejection is \
+             counted by nothing"
         );
     }
 

@@ -5254,6 +5254,7 @@ impl Engine {
         session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
+        deferred_mismatches: &mut Vec<ProcessViewId>,
     ) -> Result<DiscoveryRecordOutcome> {
         let QueuedDiscoveryRecord {
             record,
@@ -5325,24 +5326,18 @@ impl Engine {
                 .as_ref()
                 .is_some_and(|expected| expected != mapping)
         {
-            // An `exec` this capture has already seen — it is queued right
-            // now as this exact view's `ExecRefresh` — re-maps the loader at a
-            // new load base, and every hit until the refresh runs resolves
-            // into the moved mapping. The hit is still rejected: it cannot be
-            // resolved against the armed context. It is not a loss: the queued
-            // refresh rescans that view whole and re-arms it, so nothing goes
-            // unobserved — so it is counted by nothing either, neither as a
-            // published skip nor as a `discovery_truncated` context failure.
-            // Timing proof does go, so that stays invalidated.
-            let remapped_by_queued_exec = context.spec.view == view_id
-                && pending_views.get(&view_id) == Some(&RetirementCause::ExecRefresh)
+            // A same-object remap can only be explained by an actual matching
+            // EXEC in this dispatched record vector. The hit stays rejected,
+            // but its loss decision waits until that vector is complete.
+            let same_object_remapped = context.spec.view == view_id
                 && context
                     .spec
                     .mapping
                     .as_ref()
                     .is_some_and(|expected| same_object_remapped(expected, mapping));
-            if remapped_by_queued_exec {
+            if same_object_remapped {
                 self.invalidate_causal_timing();
+                deferred_mismatches.push(view_id);
             } else {
                 self.reject_loader_record(
                     "a loader hit failed generation, mapping, identity, or hook-IP validation",
@@ -6399,10 +6394,18 @@ impl Engine {
             .expect("journal checked above")
             .dispatch_started = true;
         let mut changed = false;
+        let mut exec_refresh_views = BTreeSet::new();
+        let mut deferred_mismatches = Vec::new();
         for queued in records.drain(..) {
             let origin = (queued.record.pid_tgid >> 32) as u32;
-            match self.dispatch_discovery_record(queued, session, additions_allowed, pending_views)
-            {
+            match self.dispatch_discovery_record(
+                queued,
+                session,
+                additions_allowed,
+                pending_views,
+                &mut exec_refresh_views,
+                &mut deferred_mismatches,
+            ) {
                 Ok(outcome) => {
                     changed |= outcome.changed();
                     if !outcome.required_complete() {
@@ -6422,6 +6425,7 @@ impl Engine {
                 }
             }
         }
+        self.settle_deferred_loader_mismatches(deferred_mismatches, &exec_refresh_views);
         if self.loader_registry.remove(owner).is_err() {
             *additions_allowed = false;
             self.mark_partial(
@@ -6807,16 +6811,34 @@ impl Engine {
         &mut self,
         record: &DiscoveryRecord,
         pending_views: &mut PendingViewRetirements,
-    ) {
+    ) -> Option<ProcessViewId> {
         let pid = (record.pid_tgid >> 32) as u32;
         if let Some((view, cause)) =
             lifecycle_retirement(&self.views, pid, record.hook_ts_ns, record.kind)
         {
             self.queue_retirement(view, cause, pending_views);
+            (cause == RetirementCause::ExecRefresh).then_some(view)
         } else if record.kind == DISCOVERY_KIND_EXEC
             && unmatched_exec_requests_refresh(&self.views, pid)
         {
             self.refresh_requested.insert(pid);
+            None
+        } else {
+            None
+        }
+    }
+
+    fn settle_deferred_loader_mismatches(
+        &mut self,
+        deferred_mismatches: Vec<ProcessViewId>,
+        exec_refresh_views: &BTreeSet<ProcessViewId>,
+    ) {
+        for view in deferred_mismatches {
+            if !exec_refresh_views.contains(&view) {
+                self.reject_loader_record(
+                    "a loader hit failed generation, mapping, identity, or hook-IP validation",
+                );
+            }
         }
     }
 
@@ -6846,6 +6868,8 @@ impl Engine {
         session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
+        exec_refresh_views: &mut BTreeSet<ProcessViewId>,
+        deferred_mismatches: &mut Vec<ProcessViewId>,
     ) -> Result<DiscoveryRecordOutcome> {
         let record = queued.record;
         match record.kind {
@@ -6854,11 +6878,17 @@ impl Engine {
             | DISCOVERY_KIND_INTERFACE_RETURN => {
                 self.process_export_record(&record, session, additions_allowed, pending_views)
             }
-            DISCOVERY_KIND_LOADER => {
-                self.process_loader_record(queued, session, additions_allowed, pending_views)
-            }
+            DISCOVERY_KIND_LOADER => self.process_loader_record(
+                queued,
+                session,
+                additions_allowed,
+                pending_views,
+                deferred_mismatches,
+            ),
             DISCOVERY_KIND_EXEC | DISCOVERY_KIND_LEADER_EXIT => {
-                self.dispatch_lifecycle_record(&record, pending_views);
+                if let Some(view) = self.dispatch_lifecycle_record(&record, pending_views) {
+                    exec_refresh_views.insert(view);
+                }
                 Ok(DiscoveryRecordOutcome::applied(false, true))
             }
             _ => {
@@ -6892,6 +6922,8 @@ impl Engine {
                 .or_insert(cause);
         }
         loop {
+            let mut exec_refresh_views = BTreeSet::new();
+            let mut deferred_mismatches = Vec::new();
             for queued in std::mem::take(records) {
                 let origin = (queued.record.pid_tgid >> 32) as u32;
                 match self.dispatch_discovery_record(
@@ -6899,6 +6931,8 @@ impl Engine {
                     session,
                     additions_allowed,
                     pending_views,
+                    &mut exec_refresh_views,
+                    &mut deferred_mismatches,
                 ) {
                     Ok(outcome) => {
                         changed |= outcome.changed();
@@ -6919,6 +6953,7 @@ impl Engine {
                     }
                 }
             }
+            self.settle_deferred_loader_mismatches(deferred_mismatches, &exec_refresh_views);
             self.promote_stale_execs(pending_views);
             if pending_views.is_empty() {
                 if (self.pending_rejected_keys.is_empty() && self.pending_retirements.is_empty())
@@ -9753,15 +9788,10 @@ mod tests {
         (engine, context, view_id)
     }
 
-    /// Task 9.2b defect D. An `exec` re-maps the loader at a new load base, so
-    /// every loader hit between that exec and the refresh it queues resolves
-    /// into a mapping the armed context cannot match. Rejecting the record is
-    /// right; calling it a *loss* is not — the queued `ExecRefresh` rescans
-    /// that view whole, so nothing goes unobserved, and the public
-    /// `discovery unavailable` skip made every capture whose target execs
-    /// permanently PARTIAL on an otherwise healthy capture.
+    /// A pending retirement intent is not evidence that this dispatched batch
+    /// contains the matching exec record.
     #[test]
-    fn a_loader_hit_remapped_by_a_queued_exec_refresh_is_not_a_discovery_loss() {
+    fn a_loader_hit_remapped_by_a_preexisting_exec_refresh_is_a_discovery_loss() {
         let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
         let observed = maps
             .iter()
@@ -9785,18 +9815,63 @@ mod tests {
         assert!(
             skips
                 .iter()
-                .all(|skip| skip.subject != "live loader discovery"),
-            "an exec this capture already queued a refresh for explains the moved \
-             mapping; the hit is rejected, not lost: {skips:?}"
+                .any(|skip| skip.subject == "live loader discovery"),
+            "an intent without an actual same-batch exec cannot explain the moved \
+             mapping: {skips:?}"
         );
         // ...and "not a loss" has to mean the loss-class counter too. It is the
         // one contributor that publishes no skip, so a nonzero value here is a
         // gap no reader can attribute to anything.
         let [_, _, _, truncated] = engine.capture_facts().discovery_losses();
         assert_eq!(
+            truncated, 1,
+            "without an actual same-batch exec, the rejected hit remains one loss"
+        );
+    }
+
+    /// A loader hit may precede its matching EXEC record in one dispatched
+    /// batch. The hit remains rejected and fails pause completeness, but the
+    /// exact same-batch lifecycle match explains its moved mapping.
+    #[test]
+    fn a_loader_hit_remapped_by_a_same_batch_exec_is_not_a_discovery_loss() {
+        let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        let observed = maps
+            .iter()
+            .find(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
+            .expect("this process maps its own executable text")
+            .clone();
+        let mut armed = observed.clone();
+        armed.start -= 0x1000_0000;
+        armed.end -= 0x1000_0000;
+
+        let (mut engine, context, _) = engine_with_exec_refreshed_loader(armed);
+        engine.retirement_intents.clear();
+        engine.refresh_requested.clear();
+        let mut loader = loader_record_for(context, std::process::id());
+        loader.table_ptr = observed.start + 0x10;
+        let mut exec: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exec.kind = DISCOVERY_KIND_EXEC;
+        exec.pid_tgid = u64::from(std::process::id()) << 32;
+        exec.hook_ts_ns = engine.views[0].admitted_ns();
+        let mut session = ScriptedSession::with_records([], 1);
+        let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![loader, exec])
+            .expect("an ordinary batch carrying a remapped hit before its exec");
+
+        assert!(
+            !outcome.required_complete,
+            "the loader hit remains rejected even when its loss is explained"
+        );
+        let skips = engine.counters.object_skips.clone();
+        assert!(
+            skips
+                .iter()
+                .all(|skip| skip.subject != "live loader discovery"),
+            "the exact same-batch exec explains the moved mapping: {skips:?}"
+        );
+        let [_, _, _, truncated] = engine.capture_facts().discovery_losses();
+        assert_eq!(
             truncated, 0,
-            "the queued refresh rescans the view whole, so this rejection is \
-             counted by nothing"
+            "the explained rejection is counted by nothing"
         );
     }
 

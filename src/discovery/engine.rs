@@ -2368,11 +2368,34 @@ fn uncorroborated_count(
 /// a `--cgroup` scans every process in the tree, and one provider ten of them
 /// map is one loss, not ten lines of the same one.
 fn record_object_skips(plan: &mut plan::AttachPlan, skips: &[Skipped]) {
+    // Judged by capture end, so what an earlier batch already recorded is
+    // re-judged too: the plan's skip list is only rebuilt when its sources are.
+    let modules = std::mem::take(&mut plan.modules);
+    plan.skipped
+        .retain(|skip| !empty_scan_this_capture_attached(&modules, skip));
     for skip in skips {
-        if !plan.skipped.contains(skip) {
-            plan.skipped.push(skip.clone());
+        if empty_scan_this_capture_attached(&modules, skip) || plan.skipped.contains(skip) {
+            continue;
         }
+        plan.skipped.push(skip.clone());
     }
+    plan.modules = modules;
+}
+
+/// The scan owes an empty module an answer — "no entry to skip, no attach to
+/// fail, no counter" (`discovery::scan`) — but only while the module is still
+/// empty. A provider that builds its `CK_FUNCTION_LIST` at run time is empty in
+/// file-backed data until it is built, so whether any one scan pass of a live
+/// target sees a table is a race; the module the capture ends up attaching a
+/// full table in has nothing left to show, and the record is contradicted by
+/// the same document. Judged by capture end, like §4.12 corroboration. Every
+/// other scan loss, and a module that really did stay empty, is untouched.
+fn empty_scan_this_capture_attached(modules: &[plan::ModuleSummary], skip: &Skipped) -> bool {
+    skip.reason
+        .contains("no function table was found in its file-backed data")
+        && modules.iter().any(|module| {
+            module.path == skip.subject && module.tables.iter().any(|table| table.entries > 0)
+        })
 }
 
 /// The merge refuses an over-capacity module whole rather than attaching a
@@ -9779,6 +9802,60 @@ mod tests {
             "a generation the retained pin proves ended is not a lost one: {:?}",
             engine.counters.object_skips
         );
+    }
+
+    /// Task 9.2-fix5 item C. The scan owes an empty module an answer, but by
+    /// capture end the same object can have a full table: SoftHSM2 builds its
+    /// `CK_FUNCTION_LIST` at run time, and whether one scan pass of a live
+    /// target sees it is a race. Measured on the healthy lane-16 shape
+    /// (`run --pause auto -- hammer`): one run in eight published a second
+    /// record, `function table unavailable in file-backed data`, beside 68
+    /// table entries, 68 slots and 136/136 probes for that very object — every
+    /// other counter identical to the seven clean runs.
+    #[test]
+    fn an_empty_scan_pass_is_not_a_loss_once_the_capture_attaches_that_table() {
+        let mut plan = plan::build_from_reconciled_modules(&[]);
+        plan.modules = vec![plan::ModuleSummary {
+            id: plan::ModuleId(0),
+            object: PinnedObjectId(42),
+            key: ObjectKey {
+                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                inode: 42,
+            },
+            path: "/opt/p11.so".into(),
+            tables: vec![plan::TableSummary {
+                version: (2, 40),
+                entries: 68,
+                source: "scan",
+            }],
+            interfaces: 0,
+            source: "scan",
+            corroborated: false,
+            skipped: vec![],
+        }];
+        let empty_scan = |path: &str| Skipped {
+            subject: path.into(),
+            reason: "no function table was found in its file-backed data; a table built at \
+                     run time in .bss or on the heap is outside the memory scan's reach"
+                .into(),
+        };
+        let attached = empty_scan("/opt/p11.so");
+        let never_attached = empty_scan("/opt/other.so");
+
+        record_object_skips(&mut plan, &[attached.clone(), never_attached.clone()]);
+        assert_eq!(
+            plan.skipped,
+            vec![never_attached.clone()],
+            "a module this capture attached a table in has no empty scan to show; \
+             one it never attached still does"
+        );
+
+        // …and the plan's skip list is only rebuilt when its sources are, so a
+        // record an earlier batch made while the module was still empty has to
+        // be re-judged, not just kept out.
+        plan.skipped = vec![attached, never_attached.clone()];
+        record_object_skips(&mut plan, &[]);
+        assert_eq!(plan.skipped, vec![never_attached]);
     }
 
     /// A cgroup whose `cgroup.procs` names one process that no longer exists —

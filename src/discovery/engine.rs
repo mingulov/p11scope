@@ -5,6 +5,7 @@ use crate::attach::{
     OwnedPauseGeneration, Scope, Session,
 };
 use crate::cli::CaptureArgs;
+use crate::discovery::attribution;
 use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
     ManifestStaleReason, PinnedObjectId, PinnedObjects, PinnedTimingKey, ReconciledModule,
@@ -2158,6 +2159,7 @@ fn scan_and_pin(
             "p11scope: discovery skipped {} — {}",
             skipped.subject, skipped.reason
         );
+        attribution::note(skipped);
         counters.object_skips.push(skipped.clone());
     }
     let modules = match outcome {
@@ -2184,6 +2186,7 @@ fn discover_plan(
     discovered.hooks = a.hooks.clone();
     discovered.module_hints = a.modules.clone();
     let (pids, unlisted) = scope_pids(scope);
+    attribution::note_all(&unlisted);
     discovered.base_counters.object_skips.extend(unlisted);
     // The pid the operator named is the capture; a cgroup's processes are many,
     // however few happen to be in it right now.
@@ -2191,14 +2194,16 @@ fn discover_plan(
     if pids.len() > MAX_SCAN_PIDS {
         // Published, not just noted: a provider mapped only by a process past the
         // cap is undiscovered, unprobed, and has nothing else to show for it.
-        discovered.base_counters.object_skips.push(Skipped {
+        let skipped = Skipped {
             subject: scope_label(scope),
             reason: format!(
                 "{} processes in scope; discovery scanned the first {MAX_SCAN_PIDS} — a \
                  provider mapped only by one of the rest was never discovered",
                 pids.len()
             ),
-        });
+        };
+        attribution::note(&skipped);
+        discovered.base_counters.object_skips.push(skipped);
     }
     for pid in pids.iter().take(MAX_SCAN_PIDS) {
         let opened = if named {
@@ -2213,10 +2218,12 @@ fn discover_plan(
             Ok(view) => view,
             Err(error) if named => return Err(anyhow!(error)),
             Err(error) => {
-                discovered.base_counters.object_skips.push(Skipped {
+                let skipped = Skipped {
                     subject: "process view".into(),
                     reason: format!("the process generation could not be pinned: {error}"),
-                });
+                };
+                attribution::note(&skipped);
+                discovered.base_counters.object_skips.push(skipped);
                 continue;
             }
         };
@@ -2255,10 +2262,12 @@ fn discover_plan(
                     .base_counters
                     .object_skips
                     .extend(counters.object_skips);
-                discovered.base_counters.object_skips.push(Skipped {
+                let skipped = Skipped {
                     subject: format!("pid {pid}"),
                     reason: format!("the process could not be scanned: {error:#}"),
-                });
+                };
+                attribution::note(&skipped);
+                discovered.base_counters.object_skips.push(skipped);
             }
         }
     }
@@ -3127,6 +3136,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     }
     let (mut pinned, aggregation_skips) =
         PinnedObjects::aggregate_views(discovered.scan_inputs.values().map(|input| &input.pins));
+    attribution::note_all(&aggregation_skips);
     counters.object_skips.extend(aggregation_skips);
     let (collapsed, overlay_skips) = canonicalize_scanned_overlays(&mut pinned);
     if collapsed > 0 {
@@ -3136,6 +3146,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
              uncertainty makes this capture PARTIAL"
         );
     }
+    attribution::note_all(&overlay_skips);
     counters.object_skips.extend(overlay_skips);
     let mut accepted = Vec::new();
     let mut accepted_ordinals = Vec::new();
@@ -3261,9 +3272,9 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
                 );
                 accepted.push(manifest);
                 accepted_ordinals.push(manifest_number);
-                counters
-                    .object_skips
-                    .extend(pinned.absorb(manifest_pins.clone()));
+                let absorbed = pinned.absorb(manifest_pins.clone());
+                attribution::note_all(&absorbed);
+                counters.object_skips.extend(absorbed);
             }
             Corroboration::ScanEmpty => {
                 counters.notes.push(format!(
@@ -3280,9 +3291,9 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
                 );
                 accepted.push(manifest);
                 accepted_ordinals.push(manifest_number);
-                counters
-                    .object_skips
-                    .extend(pinned.absorb(manifest_pins.clone()));
+                let absorbed = pinned.absorb(manifest_pins.clone());
+                attribution::note_all(&absorbed);
+                counters.object_skips.extend(absorbed);
             }
             Corroboration::Conflict => {
                 counters.conflicts += 1;
@@ -3300,17 +3311,17 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
                 );
                 accepted.push(manifest);
                 accepted_ordinals.push(manifest_number);
-                counters
-                    .object_skips
-                    .extend(pinned.absorb(manifest_pins.clone()));
+                let absorbed = pinned.absorb(manifest_pins.clone());
+                attribution::note_all(&absorbed);
+                counters.object_skips.extend(absorbed);
             }
             Corroboration::Uncorroborated => {
                 retarget_to_pins(&mut manifest, &[], &pinned, manifest_pins);
                 accepted.push(manifest);
                 accepted_ordinals.push(manifest_number);
-                counters
-                    .object_skips
-                    .extend(pinned.absorb(manifest_pins.clone()));
+                let absorbed = pinned.absorb(manifest_pins.clone());
+                attribution::note_all(&absorbed);
+                counters.object_skips.extend(absorbed);
             }
             Corroboration::IdentityMismatch => {
                 identity_mismatches += 1;
@@ -3325,6 +3336,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     }
 
     let (modules, differed) = bind_scanned_modules(&scan_modules, &mut pinned);
+    attribution::note_all(&differed);
     counters.object_skips.extend(differed);
     let corroborated =
         bind_pending_corroboration(pending_outcomes, &modules, &pinned, &mut counters)?;
@@ -3406,10 +3418,12 @@ fn remove_stale_views(discovered: &mut Engine, stale: &[ProcessViewId]) -> Resul
     }
     for view in stale {
         discovered.scan_inputs.remove(&view);
-        discovered.base_counters.object_skips.push(Skipped {
+        let skipped = Skipped {
             subject: "process view".into(),
             reason: STALE_VIEW_REASON.into(),
-        });
+        };
+        attribution::note(&skipped);
+        discovered.base_counters.object_skips.push(skipped);
         eprintln!("p11scope: discovery skipped process view — {STALE_VIEW_REASON}");
     }
     rebuild_discovered(discovered)?;
@@ -4301,21 +4315,25 @@ impl Engine {
         Ok(())
     }
 
+    #[track_caller]
     fn mark_partial(&mut self, subject: &str, reason: &str) {
         let skipped = Skipped {
             subject: subject.into(),
             reason: reason.into(),
         };
+        attribution::note(&skipped);
         if !self.counters.object_skips.contains(&skipped) {
             self.counters.object_skips.push(skipped);
         }
     }
 
+    #[track_caller]
     fn mark_live_loss(&mut self, subject: &str, reason: &str) {
         self.invalidate_causal_timing();
         self.mark_partial(subject, reason);
     }
 
+    #[track_caller]
     fn reject_loader_record(&mut self, reason: &str) -> bool {
         self.loader_registry.reject_hit();
         self.mark_live_loss("live loader discovery", reason);
@@ -4538,6 +4556,7 @@ impl Engine {
         if self.pinned.has_overlay_uncertainty() || pinned.has_overlay_uncertainty() {
             self.invalidate_causal_timing();
         }
+        attribution::note_all(&skipped);
         for skip in skipped {
             if !self.counters.object_skips.contains(&skip) {
                 self.counters.object_skips.push(skip);
@@ -4553,6 +4572,7 @@ impl Engine {
         });
         pinned.reset_derived_claims();
         let (modules, binding_skips) = bind_scanned_modules(&raw_modules, &mut pinned);
+        attribution::note_all(&binding_skips);
         for skip in binding_skips {
             if !self.counters.object_skips.contains(&skip) {
                 self.counters.object_skips.push(skip);

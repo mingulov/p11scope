@@ -2623,6 +2623,31 @@ fn bind_pending_corroboration(
 
 const STALE_VIEW_REASON: &str = "accepted process generation changed during attach preparation; its discovery claims were removed";
 
+/// The one published record for scope members discovery could not read.
+/// Deduplication is per exact `(subject, reason)` pair, so the pid, the view
+/// and the error text are diagnostics and must stay out of both: carrying them
+/// there gave a `--cgroup` capture one public record per short-lived
+/// subprocess, a count that tracks the workload's fork rate and no loss.
+const UNREADABLE_MEMBER_SUBJECT: &str = "process view";
+const UNREADABLE_MEMBER_REASON: &str = "a process in scope could not be retained or scanned before it changed; a provider \
+     only that generation mapped was never discovered";
+
+/// One member of the scope discovery could not read. `None` when the
+/// generation is *provably* gone — the ordinary end of a process, on the same
+/// authority `queue_retirement` and the live-record rule already use, and
+/// nothing a capture that keeps running can still observe. Loss stays loss,
+/// and loud, whenever the end cannot be proven.
+fn unreadable_member_skip(pid: u32, gone: bool, detail: &str) -> Option<Skipped> {
+    if gone {
+        return None;
+    }
+    eprintln!("p11scope: discovery skipped pid {pid}: {detail}");
+    Some(Skipped {
+        subject: UNREADABLE_MEMBER_SUBJECT.into(),
+        reason: UNREADABLE_MEMBER_REASON.into(),
+    })
+}
+
 fn manifest_object_key(manifest: &Manifest, object: u32) -> Option<(ObjectKey, &str)> {
     let object = manifest.objects.iter().find(|record| record.id == object)?;
     let provenance = &manifest.provenance_objects[plan::provenance_of(manifest, object)?];
@@ -4327,10 +4352,57 @@ impl Engine {
         }
     }
 
+    /// A retained generation changed under an operation that needed it. Loss —
+    /// unless the retained original pin *proves* the process simply ended, the
+    /// same authority `queue_retirement` and the live-record rule already use:
+    /// a `--cgroup` capture of a workload that forks per unit of work loses a
+    /// generation mid-arm every time one of its subprocesses finishes, and that
+    /// is the ordinary end of a process. Timing proof goes either way.
+    #[track_caller]
+    fn mark_generation_change(&mut self, view: ProcessViewId, subject: &str, reason: &str) {
+        if self.original_exited(view) {
+            self.invalidate_causal_timing();
+            return;
+        }
+        self.mark_live_loss(subject, reason);
+    }
+
     #[track_caller]
     fn mark_live_loss(&mut self, subject: &str, reason: &str) {
         self.invalidate_causal_timing();
         self.mark_partial(subject, reason);
+    }
+
+    /// Whether an `exec` explains why this armed context can no longer resolve
+    /// a hit. Any of three proofs, all of them "the image this context was
+    /// armed on is gone and a rescan of the same live generation is already
+    /// owed": the refresh is queued for this exact view; an exec record for
+    /// this pid has already asked for one; or the mapping the context was
+    /// armed on is absent from the current image, which only `exec` does — and
+    /// `sched_process_exec` is attached unconditionally, so the refresh is on
+    /// its way even when its record sits behind this hit in the same ring
+    /// batch. The hit is still rejected — it cannot be resolved against a
+    /// context that no longer describes anything — but the refresh rescans
+    /// that view whole and re-arms it, so nothing goes unobserved. Another
+    /// view's context, or a live image that still holds the armed mapping, is
+    /// loss, unchanged.
+    fn exec_replaced_the_armed_image(
+        &self,
+        context: &LoaderContextSpec,
+        view: ProcessViewId,
+        pid: u32,
+        maps: &[MapEntry],
+        pending_views: &PendingViewRetirements,
+    ) -> bool {
+        if context.view != view {
+            return false;
+        }
+        pending_views.get(&view) == Some(&RetirementCause::ExecRefresh)
+            || self.refresh_requested.contains(&pid)
+            || context
+                .mapping
+                .as_ref()
+                .is_some_and(|armed| !maps.iter().any(|mapping| mapping == armed))
     }
 
     #[track_caller]
@@ -5179,16 +5251,28 @@ impl Engine {
         };
         let loader = context.spec.loader;
         let maps = Self::read_maps(&self.views[position])?;
+        let view_id = self.views[position].id();
         let Some(mapping) = maps
             .iter()
             .find(|mapping| (mapping.start..mapping.end).contains(&record.table_ptr))
         else {
-            self.reject_loader_record("a loader hook address no longer resolved to a mapping");
+            // The same exec transition the identity check below already
+            // excuses, one step earlier: replacing the whole image usually
+            // leaves the hit's address resolving to *nothing*, not to a moved
+            // mapping. The queued `ExecRefresh` rescans this view whole and
+            // re-arms it, so the rejection costs the capture no observation —
+            // only its causal timing proof — so, exactly as in the identity
+            // branch below, it is counted by nothing either.
+            if self.exec_replaced_the_armed_image(&context.spec, view_id, pid, &maps, pending_views)
+            {
+                self.invalidate_causal_timing();
+            } else {
+                self.reject_loader_record("a loader hook address no longer resolved to a mapping");
+            }
             return Ok(DiscoveryRecordOutcome::Rejected(
                 RecordRejection::LoaderMissingMapping,
             ));
         };
-        let view_id = self.views[position].id();
         if context.spec.view != view_id
             || context
                 .spec
@@ -5205,13 +5289,17 @@ impl Engine {
             // unobserved — so it is counted by nothing either, neither as a
             // published skip nor as a `discovery_truncated` context failure.
             // Timing proof does go, so that stays invalidated.
-            let remapped_by_queued_exec = context.spec.view == view_id
-                && pending_views.get(&view_id) == Some(&RetirementCause::ExecRefresh)
-                && context
-                    .spec
-                    .mapping
-                    .as_ref()
-                    .is_some_and(|expected| same_object_remapped(expected, mapping));
+            let remapped_by_queued_exec = self.exec_replaced_the_armed_image(
+                &context.spec,
+                view_id,
+                pid,
+                &maps,
+                pending_views,
+            ) && context
+                .spec
+                .mapping
+                .as_ref()
+                .is_some_and(|expected| same_object_remapped(expected, mapping));
             if remapped_by_queued_exec {
                 self.invalidate_causal_timing();
             } else {
@@ -5731,7 +5819,8 @@ impl Engine {
             }
         };
         if generation_lost {
-            self.mark_live_loss(
+            self.mark_generation_change(
+                view_id,
                 "live loader arming",
                 "loader generation, mapping, or pinned identity changed during attach",
             );
@@ -6037,7 +6126,8 @@ impl Engine {
             LoaderArmOutcome::Invariant(error) => Err(error),
             LoaderArmOutcome::GenerationLost { changed, failure } => {
                 self.queue_stale_views(&[view_id].into_iter().collect(), pending_views);
-                self.mark_live_loss(
+                self.mark_generation_change(
+                    view_id,
                     "live loader arming",
                     "the process generation changed before the loader-arm postcheck",
                 );
@@ -6897,11 +6987,13 @@ impl Engine {
                     scans.push((*view_id, modules, pins));
                 }
                 Err(error) => {
-                    failed_pids.insert(self.views[position].pid());
-                    skipped.push(Skipped {
-                        subject: "process view".into(),
-                        reason: format!("{failure}: {error:#}"),
-                    });
+                    let view = &self.views[position];
+                    failed_pids.insert(view.pid());
+                    skipped.extend(unreadable_member_skip(
+                        view.pid(),
+                        view.original_exited() == Ok(true),
+                        &format!("{failure}: {error:#}"),
+                    ));
                 }
             }
         }
@@ -7133,10 +7225,11 @@ impl Engine {
                 Ok(view) => view,
                 Err(error) => {
                     failed_refresh_pids.insert(pid);
-                    skipped.push(Skipped {
-                        subject: format!("pid {pid}"),
-                        reason: format!("the process generation could not be retained: {error}"),
-                    });
+                    skipped.extend(unreadable_member_skip(
+                        pid,
+                        process::generation_gone(pid),
+                        &format!("the process generation could not be retained: {error}"),
+                    ));
                     continue;
                 }
             };
@@ -7148,10 +7241,11 @@ impl Engine {
                 }
                 Err(error) => {
                     failed_refresh_pids.insert(pid);
-                    skipped.push(Skipped {
-                        subject: format!("pid {pid}"),
-                        reason: format!("the process generation could not be scanned: {error:#}"),
-                    });
+                    skipped.extend(unreadable_member_skip(
+                        pid,
+                        view.original_exited() == Ok(true),
+                        &format!("the process generation could not be scanned: {error:#}"),
+                    ));
                 }
             }
         }
@@ -9648,6 +9742,223 @@ mod tests {
             truncated, 0,
             "the queued refresh rescans the view whole, so this rejection is \
              counted by nothing"
+        );
+    }
+
+    /// Task 9.2-fix5 item A. A retained generation that changes under an
+    /// operation needing it is loss — unless the retained original pin proves
+    /// the process simply ended. Arming a loader context for one of
+    /// pkcs11-check's per-file subprocesses loses the generation every time
+    /// one finishes, and that is the ordinary end of a process, on the same
+    /// authority `queue_retirement` already uses.
+    #[test]
+    fn a_generation_change_a_pin_proves_was_an_exit_is_not_a_loss() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mut engine = Engine::empty();
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(0), child.id()).unwrap());
+        engine.next_view_id = 1;
+
+        engine.mark_generation_change(ProcessViewId(0), "live loader arming", "scripted");
+        assert_eq!(
+            engine.counters.object_skips.len(),
+            1,
+            "a live generation that changed under an arm is a real loss"
+        );
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        engine.counters.object_skips.clear();
+        engine.mark_generation_change(ProcessViewId(0), "live loader arming", "scripted");
+        assert!(
+            engine.counters.object_skips.is_empty(),
+            "a generation the retained pin proves ended is not a lost one: {:?}",
+            engine.counters.object_skips
+        );
+    }
+
+    /// A cgroup whose `cgroup.procs` names one process that no longer exists —
+    /// what every inventory tick of a workload that forks per unit of work
+    /// sees. `scope_pids` only reads the file, so a plain directory holding one
+    /// is the whole scope.
+    fn engine_over_cgroup_naming(pids: &[u32]) -> (Engine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("a scope directory");
+        let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+        std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Cgroup {
+            path: dir.path().to_path_buf(),
+            id: 0,
+        };
+        (engine, dir)
+    }
+
+    fn refresh_inventory_once(engine: &mut Engine) {
+        let mut session = ScriptedSession::with_records([], 0);
+        let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+        engine
+            .refresh_inventory(
+                &mut session,
+                &mut true,
+                &mut Vec::new(),
+                &mut PendingViewRetirements::new(),
+                &mut *collect,
+                &mut PauseClosure::new(true),
+            )
+            .expect("an inventory refresh over a cgroup scope");
+    }
+
+    /// Task 9.2-fix5 item A. A `--cgroup` capture re-enumerates its members
+    /// every tick, and a workload that forks one short-lived subprocess per
+    /// unit of work leaves some of them gone before discovery can open or scan
+    /// them. That is the ordinary end of a process, on the same authority
+    /// `queue_retirement` and the fix4 record rule already use — not a
+    /// discovery loss. Measured on the pkcs11-check `--isolation file` shape:
+    /// five public `discovery unavailable` records, one per vanished pid.
+    #[test]
+    fn a_scope_member_that_ended_before_discovery_reached_it_is_not_a_loss() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
+        refresh_inventory_once(&mut engine);
+
+        let skips = engine.counters.object_skips.clone();
+        assert!(
+            skips.is_empty(),
+            "a generation that is provably gone is not a discovery loss: {skips:?}"
+        );
+    }
+
+    /// …and when its fate is *not* proven the loss stays loud — but as one
+    /// record for the whole capture, not one per pid. The pid, the view and the
+    /// error belong in the diagnostic; carrying them in the deduplicated
+    /// `(subject, reason)` pair defeated `record_object_skips`'s own stated
+    /// deduplication and made the published count track the workload's fork
+    /// rate. Lane 11 published eleven of these on a capture an independent
+    /// oracle proved complete.
+    #[test]
+    fn unreadable_scope_members_stay_loud_as_one_deduplicated_record() {
+        let published: Vec<_> = [7u32, 9, 4242]
+            .into_iter()
+            .filter_map(|pid| unreadable_member_skip(pid, false, "scripted, unproven"))
+            .collect();
+        assert_eq!(published.len(), 3, "an unproven fate is never silent");
+
+        let mut engine = Engine::empty();
+        for skip in &published {
+            engine.mark_partial(&skip.subject, &skip.reason);
+        }
+        assert_eq!(
+            engine.counters.object_skips.len(),
+            1,
+            "three unreadable members are one loss, not three: {:?}",
+            engine.counters.object_skips
+        );
+        assert_eq!(
+            render::capture_skipped_out(&engine.counters.object_skips[0]).reason,
+            "discovery unavailable"
+        );
+        assert!(
+            unreadable_member_skip(11, true, "scripted, proven gone").is_none(),
+            "a generation that is provably gone is the ordinary end of a process"
+        );
+    }
+
+    /// Task 9.2-fix5 item B, first half. The same `exec` transition, one step
+    /// earlier: when the whole image is replaced the moved hook address often
+    /// resolves to *no* mapping at all rather than to a moved one, so the
+    /// record is rejected here instead of at the identity check — and this
+    /// branch never learned what the identity branch already knows. Measured
+    /// on `run --pause never -- env LD_PRELOAD=<provider> harness`: a second
+    /// public `discovery unavailable` on a capture with 136/136 probes, 68
+    /// slots and every counter clean, attributed to this exact site.
+    #[test]
+    fn a_loader_hit_unmapped_by_a_queued_exec_refresh_is_not_a_discovery_loss() {
+        let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        let armed = maps
+            .iter()
+            .find(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
+            .expect("this process maps its own executable text")
+            .clone();
+        // Below `mmap_min_addr`: never mapped, so the hook address resolves to
+        // nothing at all rather than to a moved mapping.
+        let unmapped = 0x1000;
+        assert!(
+            !maps
+                .iter()
+                .any(|mapping| (mapping.start..mapping.end).contains(&unmapped)),
+            "the null page is not mapped"
+        );
+
+        let (mut engine, context, _) = engine_with_exec_refreshed_loader(armed);
+        let mut record = loader_record_for(context, std::process::id());
+        record.table_ptr = unmapped;
+        let mut session = ScriptedSession::with_records([], 1);
+        apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .expect("an ordinary batch carrying one unmapped loader hit");
+
+        let skips = engine.counters.object_skips.clone();
+        assert!(
+            skips
+                .iter()
+                .all(|skip| skip.subject != "live loader discovery"),
+            "an exec this capture already queued a refresh for explains the vanished \
+             mapping; the hit is rejected, not lost: {skips:?}"
+        );
+        let [_, _, _, truncated] = engine.capture_facts().discovery_losses();
+        assert_eq!(
+            truncated, 0,
+            "the queued refresh rescans the view whole, so this rejection is \
+             counted by nothing"
+        );
+    }
+
+    /// …and the exec record does not have to have been *seen* yet. Measured on
+    /// `run --pause auto -- env LD_PRELOAD=<provider> harness`: two loader hits
+    /// sit ahead of the exec record in the same ring batch, so neither
+    /// `pending_views` nor `refresh_requested` knows about the exec when they
+    /// are resolved. The armed mapping being gone from a live image is proof
+    /// enough on its own — only `exec` replaces an address space wholesale,
+    /// and `sched_process_exec` is attached unconditionally.
+    #[test]
+    fn a_loader_hit_whose_armed_image_is_gone_is_not_a_discovery_loss() {
+        let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        let observed = maps
+            .iter()
+            .find(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
+            .expect("this process maps its own executable text")
+            .clone();
+        let mut armed = observed.clone();
+        armed.start -= 0x1000_0000;
+        armed.end -= 0x1000_0000;
+
+        let (mut engine, context, _) = engine_with_exec_refreshed_loader(armed);
+        // Neither channel knows about the exec yet: the record is still behind
+        // this hit in the ring.
+        engine.retirement_intents.clear();
+        engine.refresh_requested.clear();
+        let mut record = loader_record_for(context, std::process::id());
+        record.table_ptr = 0x1000;
+        let mut session = ScriptedSession::with_records([], 1);
+        apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .expect("an ordinary batch carrying one hit from a replaced image");
+
+        let skips = engine.counters.object_skips.clone();
+        assert!(
+            skips
+                .iter()
+                .all(|skip| skip.subject != "live loader discovery"),
+            "the armed mapping is gone from a live image, which only exec does: {skips:?}"
         );
     }
 

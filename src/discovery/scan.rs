@@ -735,6 +735,21 @@ fn hint_gate(
     ))
 }
 
+/// Why `/proc/<pid>/mem` could not be opened, and whether that is a published
+/// discovery loss. `ESRCH` is proof the process ended — the ordinary end of a
+/// process, already recorded by `scan_unavailable`, and nothing a capture that
+/// keeps running can still read. It would otherwise publish one undeduplicable
+/// record per finished subprocess, the pid in both the subject and the message,
+/// on every `--cgroup` capture of a workload that forks per unit of work. Every
+/// refusal — ptrace, Yama, anything unreadable — is a real loss and stays loud.
+fn mem_unavailable(error: &std::io::Error) -> (&'static str, bool) {
+    match error.raw_os_error() {
+        Some(libc::EACCES | libc::EPERM) => ("ptrace", true),
+        Some(libc::ESRCH) => ("gone", false),
+        _ => ("unreadable", true),
+    }
+}
+
 pub fn scan_pid(
     request: &ScanRequest<'_>,
     budget: &mut CaptureWorkBudget,
@@ -771,15 +786,14 @@ pub fn scan_process_view(
     // a ptrace refusal — a pid that died mid-scan gets its own label.
     let mem = view.run_while_same(|| File::open(format!("/proc/{pid}/mem")))?;
     let unavailable = mem.as_ref().err().map(|error| {
-        skipped.push(Skipped {
-            subject: format!("/proc/{pid}/mem"),
-            reason: error.to_string(),
-        });
-        match error.raw_os_error() {
-            Some(libc::EACCES | libc::EPERM) => "ptrace",
-            Some(libc::ESRCH) => "gone",
-            _ => "unreadable",
+        let (class, publishes) = mem_unavailable(error);
+        if publishes {
+            skipped.push(Skipped {
+                subject: format!("/proc/{pid}/mem"),
+                reason: error.to_string(),
+            });
         }
+        class
     });
     let mem = mem.ok();
 
@@ -1016,6 +1030,35 @@ pub fn scan_process_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task 9.2-fix5 item A. A process that has already exited cannot have its
+    /// memory read and cannot read any more of anyone else's: `scan_unavailable`
+    /// records it, and a published skip would carry the pid in both its subject
+    /// and its message, so a `--cgroup` capture of pkcs11-check's
+    /// `--isolation file` shape published one undeduplicable public loss per
+    /// finished subprocess. A refusal is a different thing entirely and stays
+    /// loud.
+    #[test]
+    fn only_a_refusal_to_read_target_memory_is_a_published_loss() {
+        use std::io::Error;
+
+        assert_eq!(
+            mem_unavailable(&Error::from_raw_os_error(libc::ESRCH)),
+            ("gone", false)
+        );
+        assert_eq!(
+            mem_unavailable(&Error::from_raw_os_error(libc::EACCES)),
+            ("ptrace", true)
+        );
+        assert_eq!(
+            mem_unavailable(&Error::from_raw_os_error(libc::EPERM)),
+            ("ptrace", true)
+        );
+        assert_eq!(
+            mem_unavailable(&Error::from_raw_os_error(libc::EIO)),
+            ("unreadable", true)
+        );
+    }
 
     #[test]
     fn only_walkable_version_words_become_candidates() {

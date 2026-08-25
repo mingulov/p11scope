@@ -443,7 +443,6 @@ impl OwnedChild {
         !self.reaped && self.pin.still_the_same()
     }
 
-    #[allow(dead_code)] // asserted by this module's own lifecycle tests
     pub(crate) fn is_reaped(&self) -> bool {
         self.reaped
     }

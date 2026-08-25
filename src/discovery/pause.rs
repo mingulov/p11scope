@@ -1520,9 +1520,10 @@ impl PauseIo for SessionPauseIo<'_> {
     }
 
     fn same_generation(&mut self, pid: u32, generation: u64) -> Result<bool, String> {
-        Ok(self.child.pid() == pid
-            && self.child.generation().get() == generation
-            && self.child.pin().still_the_same())
+        if self.child.pid() != pid || self.child.generation().get() != generation {
+            return Ok(false);
+        }
+        owned_generation_retained(self.child)
     }
 
     fn ring_loss(&mut self) -> Result<u64, String> {
@@ -1539,6 +1540,21 @@ impl PauseIo for SessionPauseIo<'_> {
     fn take_stop_candidate_seen(&mut self) -> bool {
         std::mem::take(&mut self.stop_candidate_seen)
     }
+}
+
+/// Whether the coordinator's own generation is still exactly the one behind
+/// this pid. The retained original pin proves it while the child lives; once
+/// the child ends, the *unreaped* fork child still holds the pid, so nothing
+/// else can be producing records under it and what the ring still holds is
+/// this generation's. The owned child's ordinary end is therefore not a lost
+/// generation — the same authority `mark_generation_change` already uses.
+/// Reaping is what releases the pid to reuse, and a pin that cannot answer
+/// stays an error, so neither is ever read as "still mine".
+fn owned_generation_retained(child: &OwnedChild) -> Result<bool, String> {
+    if child.pin().still_the_same() {
+        return Ok(true);
+    }
+    Ok(!child.is_reaped() && child.pin().original_exited()?)
 }
 
 fn collect_timed_retirement(
@@ -2089,6 +2105,36 @@ mod tests {
         assert_eq!(
             coordinator.expected_tasks,
             [(child.pid(), b'S')].into_iter().collect()
+        );
+    }
+
+    /// The owned child ends; its last records are already in the ring. Nothing
+    /// else can be producing under that pid — the unreaped fork child still
+    /// holds it — so the records are still this generation's and the ordinary
+    /// end is not a lost generation. Reaping is what releases the pid, and only
+    /// then must nothing be attributed to it.
+    #[test]
+    fn the_owned_generation_survives_its_child_ordinary_exit_until_it_is_reaped() {
+        let mut child = OwnedChild::spawn("/bin/true".into(), Vec::new()).unwrap();
+        child.release().unwrap();
+        assert!(
+            child
+                .pin()
+                .wait_ready(Some(Duration::from_secs(5)))
+                .unwrap(),
+            "the owned child must reach its ordinary end"
+        );
+        assert!(!child.still_running());
+
+        assert!(
+            owned_generation_retained(&child).unwrap(),
+            "an unreaped exit still holds the pid: the ring's records are still this generation's"
+        );
+
+        child.wait_for(Some(Duration::ZERO), false).unwrap();
+        assert!(
+            !owned_generation_retained(&child).unwrap(),
+            "a reaped pid can be reused, so nothing may still be attributed to it"
         );
     }
 

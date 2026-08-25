@@ -187,6 +187,13 @@ struct CaptureHistory {
     refusals: BTreeMap<plan::ModuleId, Skipped>,
     fallbacks: BTreeMap<(u32, u32), render::ManifestObjectFallback>,
     corroboration_tombstones: BTreeSet<plan::ModuleId>,
+    /// §4.12 outcomes re-derived after attach. Corroboration is a
+    /// capture-lifetime fact: once the scan reached this object, a view
+    /// retiring later does not unsay it, so the outcome is retained here
+    /// rather than recomputed from whatever the current pin set happens to
+    /// show. A fresher reading replaces it; only a corroboration tombstone
+    /// revokes it.
+    recorroborated: BTreeMap<plan::ModuleId, Corroboration>,
     fallback_tombstones: BTreeSet<(u32, u32)>,
     conflicts: u64,
     uncorroborated: u64,
@@ -341,6 +348,10 @@ impl CaptureFacts {
             if history.corroboration_tombstones.insert(module) && was_corroborated {
                 history.uncorroborated = history.uncorroborated.saturating_add(1);
             }
+            // The tombstone revokes a re-derived outcome outright: the bump
+            // above already accounts for it, so it must not also be subtracted
+            // as a standing corroboration.
+            history.recorroborated.remove(&module);
             if let Some(snapshot) = history.modules.get_mut(&module) {
                 snapshot.corroborated = false;
                 snapshot.corroboration = vec!["uncorroborated"];
@@ -476,23 +487,72 @@ impl CaptureFacts {
         }
         let mut history = self.visible_history().clone();
         let current = discovery_evidence(plan, pinned, counters);
-        for mut module in current.modules {
-            let tombstoned = history.corroboration_tombstones.contains(&module.id);
-            if tombstoned {
-                module.corroborated = false;
-                module.corroboration = vec!["uncorroborated"];
+
+        // §4.12 by capture end. Each fresh reading replaces the retained one;
+        // a publication with nothing to read keeps what the capture already
+        // derived, because a retiring view does not unsay that the scan
+        // reached this object. A tombstoned module is skipped outright: a
+        // proof a later exact identity collision invalidated is never
+        // restored.
+        for (object, outcome) in recorroborate_at_capture_end(pinned, modules, manifests, counters)
+        {
+            let Ok(id) = self.module_id_for_object(pinned, object) else {
+                continue;
+            };
+            if history.corroboration_tombstones.contains(&id) {
+                continue;
             }
-            history
-                .modules
-                .entry(module.id)
-                .and_modify(|known| {
-                    merge_discovered_module(known, module.clone());
-                    if tombstoned {
-                        known.corroborated = false;
-                        known.corroboration = vec!["uncorroborated"];
-                    }
+            // Only a tombstone revokes a standing corroboration. A later
+            // publication whose pin set no longer holds the scan's decoded
+            // tables — a subprocess exited, its view retired — is less
+            // informed, not newer evidence that nothing corroborated this.
+            let standing = history.recorroborated.get(&id).copied();
+            if standing.is_some_and(corroboration_corroborates)
+                && !corroboration_corroborates(outcome)
+            {
+                continue;
+            }
+            history.recorroborated.insert(id, outcome);
+        }
+        let derived_conflicts = history
+            .recorroborated
+            .values()
+            .filter(|outcome| **outcome == Corroboration::Conflict)
+            .count() as u64;
+        let derived_corroborated = history
+            .recorroborated
+            .values()
+            .filter(|outcome| corroboration_corroborates(**outcome))
+            .count() as u64;
+
+        for mut module in current.modules {
+            // A tombstone and a re-derived capture-end outcome are both the
+            // final word on this module, not another opinion to union in — so
+            // both are applied *after* the merge, and the tombstone wins.
+            let settled = if history.corroboration_tombstones.contains(&module.id) {
+                Some((false, vec!["uncorroborated"]))
+            } else {
+                history.recorroborated.get(&module.id).map(|outcome| {
+                    (
+                        corroboration_corroborates(*outcome),
+                        vec![corroboration_label(*outcome)],
+                    )
                 })
-                .or_insert(module);
+            };
+            if let Some((corroborated, corroboration)) = settled.clone() {
+                module.corroborated = corroborated;
+                module.corroboration = corroboration;
+            }
+            let id = module.id;
+            if let Some(known) = history.modules.get_mut(&id) {
+                merge_discovered_module(known, module);
+                if let Some((corroborated, corroboration)) = settled {
+                    known.corroborated = corroborated;
+                    known.corroboration = corroboration;
+                }
+            } else {
+                history.modules.insert(id, module);
+            }
         }
 
         for module in modules {
@@ -685,8 +745,18 @@ impl CaptureFacts {
                 history.fallbacks.entry(key).or_insert(fallback);
             }
         }
-        history.conflicts = history.conflicts.max(current.conflicts);
-        history.uncorroborated = history.uncorroborated.max(current.uncorroborated);
+        // A conflict stays sticky: two sources really did disagree, and a later
+        // retirement does not unsay it. `uncorroborated` is the opposite kind
+        // of fact — "nothing corroborated this **by capture end**" — so a
+        // corroboration derived later must clear the blind attach-time one
+        // rather than being latched under it.
+        history.conflicts = history
+            .conflicts
+            .max(current.conflicts.saturating_add(derived_conflicts));
+        history.uncorroborated = history
+            .uncorroborated
+            .max(current.uncorroborated)
+            .saturating_sub(derived_corroborated);
         history.scan_unavailable = history.scan_unavailable.take().or(current.scan_unavailable);
         history.scan_ms = history.scan_ms.max(current.scan_ms);
         history.vendor_interfaces = history.vendor_interfaces.max(plan.vendor_interfaces);
@@ -1850,6 +1920,94 @@ fn retarget_to_pins(
         provenance.device_minor = key.device.minor;
         provenance.inode = key.inode;
     }
+}
+
+/// Re-derives the §4.12 outcome for every manifest the attach-time
+/// reconciliation had to judge blind.
+///
+/// Corroboration is judged **by capture end**: the design says the observer
+/// "corroborates automatically whenever the object is mapped in scope (scan or
+/// a live export record)" (spec §4.12), and the schema says `uncorroborated`
+/// means "not mapped in scope, or no scan"
+/// (`docs/schema/observed-profile-v2.md`). But `rebuild_discovered` — the only
+/// caller of `corroborate` — runs once, at attach. A target held on a barrier
+/// maps its provider afterwards: the reconciliation sees nothing, records
+/// `uncorroborated`, and the live path only ever retains or invalidates that
+/// record. By the end the same opened object carries both a scan alias and a
+/// manifest alias, and the recorded outcome is stale.
+///
+/// Only a recorded `uncorroborated` is revisited. Every other outcome was
+/// derived with the scan already in hand, and an `identity_mismatch` or
+/// `object_fallback` is a decision, not a gap waiting to be filled.
+///
+/// ponytail: one re-derived outcome per opened object, not per `--manifest` —
+/// the recorded outcome does not carry which manifest produced it, and every
+/// manifest naming one object shares that object's scan side. Split it per
+/// manifest if two manifests ever describe one object with different offsets.
+fn recorroborate_at_capture_end(
+    pinned: &PinnedObjects,
+    modules: &[ReconciledModule],
+    manifests: &[Manifest],
+    counters: &DiscoveryCounters,
+) -> BTreeMap<PinnedObjectId, Corroboration> {
+    let mut derived = BTreeMap::new();
+    // A scan that could not read memory found no tables to compare against;
+    // that is not evidence against any manifest, at attach or at the end.
+    if counters.scan_unavailable.is_some() {
+        return derived;
+    }
+    for object in counters
+        .corroboration
+        .iter()
+        .filter(|(_, label)| *label == "uncorroborated")
+        .flat_map(|(objects, _)| objects)
+    {
+        // Both a scan alias and a manifest alias resolve to this one opened
+        // object: it is mapped in scope, and the scan pinned it.
+        if pinned.sources(*object) != ["scan", "manifest"] {
+            continue;
+        }
+        let scanned: Vec<&ScannedModule> = modules
+            .iter()
+            .filter(|module| module.object == *object)
+            .map(|module| &module.scanned)
+            .collect();
+        let Some(scan_targets) = scanned_targets_without(&scanned, pinned, &BTreeSet::new()) else {
+            // An entry with no comparable pinned identity: there is no exact
+            // set to compare, so the recorded outcome stands.
+            continue;
+        };
+        let Some(own_targets) = manifests
+            .iter()
+            .filter(|manifest| manifest_module_object(manifest, pinned) == Some(*object))
+            .map(|manifest| manifest_targets(manifest, pinned))
+            .collect::<Option<Vec<_>>>()
+            .filter(|sets| !sets.is_empty())
+            .map(|sets| sets.into_iter().flatten().collect())
+        else {
+            continue;
+        };
+        let scan_empty = scanned
+            .iter()
+            .flat_map(|module| &module.tables)
+            .all(|table| table.entries.is_empty());
+        derived.insert(
+            *object,
+            corroborate(
+                false,
+                // Scan and manifest resolved to one opened object, so the
+                // identity comparison already succeeded.
+                Some(true),
+                pinned.exactly_same_targets(&scan_targets, pinned, &own_targets),
+                scan_empty,
+            ),
+        );
+    }
+    derived
+}
+
+fn corroboration_corroborates(outcome: Corroboration) -> bool {
+    matches!(outcome, Corroboration::Agreed | Corroboration::Conflict)
 }
 
 fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
@@ -8402,6 +8560,127 @@ mod tests {
         assert_eq!(
             engine.plan.entries_seen, 2,
             "a distinct claim stays a distinct entry"
+        );
+    }
+
+    /// The attach-time reconciliation is the only thing that ever derives a
+    /// §4.12 outcome, and on a target held on a barrier it runs before the
+    /// provider is mapped: it sees no scan, records `uncorroborated`, and the
+    /// live path never revisits it. Rewinds the recorded counters to exactly
+    /// that blind state and leaves the scan facts the capture ended up with.
+    fn blinded_attach_time_corroboration(engine: &mut Engine) {
+        engine.counters.conflicts = 0;
+        engine.counters.uncorroborated = 1;
+        engine.counters.corroboration = vec![(
+            engine.plan.modules.iter().map(|m| m.object).collect(),
+            "uncorroborated",
+        )];
+        for module in &mut engine.plan.modules {
+            module.corroborated = false;
+        }
+    }
+
+    /// §4.12 is judged by capture end, not by what the attach-time scan
+    /// happened to see (design §4.12: corroboration happens "whenever the
+    /// object is mapped in scope — scan **or a live export record**"; schema:
+    /// `uncorroborated` means "not mapped in scope, or no scan"). A provider
+    /// the target only maps after the observer attached is corroborated by the
+    /// end, and the blind attach-time outcome is stale.
+    #[test]
+    fn a_manifest_the_scan_only_reaches_later_is_corroborated_by_capture_end() {
+        // Differing targets: the manifest records 0x40, the scan decodes 0x80.
+        let (view, modules, pins, input) = same_object_scan_and_manifest(0x80);
+        let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+        blinded_attach_time_corroboration(&mut engine);
+
+        engine.publish_current_capture_facts().unwrap();
+
+        assert_eq!(
+            engine.discovery.conflicts, 1,
+            "both sources decoded targets in one object and they differ"
+        );
+        assert_eq!(
+            engine.discovery.uncorroborated, 0,
+            "nothing is uncorroborated: the scan reached this object by capture end"
+        );
+        let module = &engine.discovery.modules[0];
+        assert!(module.corroborated, "{module:?}");
+        assert_eq!(module.corroboration, vec!["conflict"], "{module:?}");
+    }
+
+    /// Same seam, agreeing sources: the re-derivation must report the outcome
+    /// it actually derives, not "corroborated somehow".
+    #[test]
+    fn a_late_scan_that_agrees_is_recorded_as_agreed_not_as_a_conflict() {
+        let (view, modules, pins, input) = same_object_scan_and_manifest(0x40);
+        let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+        blinded_attach_time_corroboration(&mut engine);
+
+        engine.publish_current_capture_facts().unwrap();
+
+        assert_eq!(engine.discovery.conflicts, 0);
+        assert_eq!(engine.discovery.uncorroborated, 0);
+        let module = &engine.discovery.modules[0];
+        assert!(module.corroborated, "{module:?}");
+        assert_eq!(module.corroboration, vec!["agreed"], "{module:?}");
+    }
+
+    /// Corroboration is a capture-*lifetime* fact, so it survives the ordinary
+    /// churn of a `--cgroup` capture: `pkcs11-check --isolation file` retires a
+    /// view per exiting subprocess, and a publication whose pin set no longer
+    /// holds the scan's decoded tables is less informed, not newer evidence
+    /// that nothing corroborated the manifest. Observed live before this was
+    /// held: `corroboration: ["agreed", "uncorroborated"]` beside
+    /// `corroborated: true` and `discovery_uncorroborated: 1`.
+    #[test]
+    fn a_derived_corroboration_survives_a_later_less_informed_publication() {
+        let (view, modules, pins, input) = same_object_scan_and_manifest(0x80);
+        let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+        blinded_attach_time_corroboration(&mut engine);
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(engine.discovery.modules[0].corroboration, vec!["conflict"]);
+
+        // The scan's view is gone; the manifest still describes the object.
+        engine.modules.clear();
+        engine.publish_current_capture_facts().unwrap();
+
+        let module = &engine.discovery.modules[0];
+        assert_eq!(module.corroboration, vec!["conflict"], "{module:?}");
+        assert!(module.corroborated, "{module:?}");
+        assert_eq!(engine.discovery.conflicts, 1);
+        assert_eq!(engine.discovery.uncorroborated, 0);
+    }
+
+    /// The guard the re-derivation turns on: a provider the scan never reached
+    /// — the only source that ever described it is the manifest — is still
+    /// uncorroborated at capture end, and must stay that way.
+    #[test]
+    fn a_provider_the_scan_never_reached_stays_uncorroborated() {
+        let (_, modules, pins, input) = same_object_scan_and_manifest(0x80);
+        let object = pins.pinned().next().unwrap();
+        let manifest_only = pin_as_manifest_object(object.path);
+        let owned = manifest_only.pinned().next().unwrap().id;
+        assert_eq!(
+            manifest_only.sources(owned),
+            ["manifest"],
+            "the fixture must have no scan alias"
+        );
+
+        let counters = DiscoveryCounters {
+            uncorroborated: 1,
+            corroboration: vec![([owned].into_iter().collect(), "uncorroborated")],
+            ..DiscoveryCounters::default()
+        };
+        let reconciled = bind_scanned_modules(&modules, &mut pins.clone()).0;
+        assert!(
+            recorroborate_at_capture_end(
+                &manifest_only,
+                &reconciled,
+                std::slice::from_ref(&input.manifest),
+                &counters,
+            )
+            .is_empty(),
+            "nothing is mapped in scope to corroborate against"
         );
     }
 

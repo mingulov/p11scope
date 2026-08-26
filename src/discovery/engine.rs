@@ -4272,6 +4272,16 @@ fn loader_arm_outcome(
     }
 }
 
+#[cfg(feature = "skip-attribution")]
+fn loader_arm_ordinary_error(
+    result: &std::result::Result<bool, LoaderArmFailure>,
+) -> Option<String> {
+    match result {
+        Err(LoaderArmFailure::Ordinary(error)) => Some(format!("{error:#}")),
+        _ => None,
+    }
+}
+
 fn arm_refreshed_views_with(
     positions: &[usize],
     mut arm: impl FnMut(usize) -> Result<bool>,
@@ -6419,6 +6429,10 @@ impl Engine {
         let named = matches!(self.scope, Scope::Pid(_));
         let view_id = self.views[position].id();
         let result = self.arm_loader_for_view(position, session, additions_allowed, pending_views);
+        #[cfg(feature = "skip-attribution")]
+        let diagnostic_pid = self.views[position].pid();
+        #[cfg(feature = "skip-attribution")]
+        let ordinary_error = loader_arm_ordinary_error(&result);
         let generation_valid = self
             .views
             .get(position)
@@ -6427,6 +6441,13 @@ impl Engine {
         match loader_arm_outcome(generation_valid, result) {
             LoaderArmOutcome::Changed(changed) => Ok(changed),
             LoaderArmOutcome::OrdinaryFailure => {
+                #[cfg(feature = "skip-attribution")]
+                if let Some(error) = ordinary_error {
+                    eprintln!(
+                        "p11scope: skip-attribution: loader-arm ordinary error: \
+                         view={view_id:?} pid={diagnostic_pid} error={error:?}"
+                    );
+                }
                 self.invalidate_causal_timing();
                 self.mark_partial(
                     "live loader arming",
@@ -13352,6 +13373,18 @@ mod tests {
 
         assert_eq!(attempted, [4, 7]);
         assert!(changed, "refresh must report a loader-arm plan mutation");
+    }
+
+    #[cfg(feature = "skip-attribution")]
+    #[test]
+    fn loader_arm_ordinary_error_preserves_the_anyhow_chain() {
+        let error = anyhow!("inner loader error").context("outer loader stage");
+        let result = Err(LoaderArmFailure::ordinary(error));
+
+        assert_eq!(
+            loader_arm_ordinary_error(&result).as_deref(),
+            Some("outer loader stage: inner loader error")
+        );
     }
 
     #[test]

@@ -28,6 +28,7 @@ jobs:
       - run: scripts/verify-attach-e2e.sh --self-test
       - run: scripts/verify-induced-gaps.sh --self-test
       - run: scripts/verify-discover-containers.sh --self-test
+      - run: scripts/verify-capability-tier.sh --self-test
       - run: scripts/verify-live-discovery-preflight.sh --self-test
       - run: python3 scripts/check-live-discovery-evidence.py --self-test
       - run: scripts/verify-inspect-doctor.sh

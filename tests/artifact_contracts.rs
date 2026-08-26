@@ -2054,6 +2054,7 @@ fn every_script_parses_with_sh_n() {
         "scripts/verify-canaries.sh",
         "scripts/verify-induced-gaps.sh",
         "scripts/verify-discover-containers.sh",
+        "scripts/verify-capability-tier.sh",
         "scripts/matrix/verify-docker.sh",
         "scripts/matrix/verify-fork-scope.sh",
         "scripts/matrix/verify-oracle.sh",
@@ -4371,6 +4372,7 @@ fn every_gate_script_self_tests_its_own_validator() {
         "scripts/verify-induced-gaps.sh",
         "scripts/verify-discover-containers.sh",
         "scripts/verify-live-discovery-preflight.sh",
+        "scripts/verify-capability-tier.sh",
     ] {
         assert!(
             read(script).contains("--self-test"),
@@ -4385,6 +4387,12 @@ fn every_gate_script_self_tests_its_own_validator() {
             "{script} --self-test is not wired into CI"
         );
     }
+    assert!(
+        gates.contains(
+            "echo \"=== scripts/verify-capability-tier.sh ===\"\nscripts/verify-capability-tier.sh"
+        ),
+        "the live capability-tier validator is not wired at the root gate boundary"
+    );
     assert!(
         ci.contains("python3 scripts/check-live-discovery-evidence.py --self-test"),
         "the frozen evidence validator self-test is not wired into CI"

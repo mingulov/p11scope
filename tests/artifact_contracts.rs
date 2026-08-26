@@ -3164,6 +3164,19 @@ fn lane13_pre_runtime_inputs_are_owned_and_release_bytes_stay_local() {
     // Break caught: accepting a collision, drifting base, remote release bytes,
     // ambiguous apply facts, or a post-apply mutation would hide unsafe input.
     let gate = read("scripts/matrix/verify-knative.sh");
+    let canonical_kourier_url = "https://github.com/knative-extensions/net-kourier/releases/download/${KNATIVE_VERSION}/kourier.yaml";
+    assert_eq!(
+        gate.matches(canonical_kourier_url).count(),
+        2,
+        "Kourier canonical owner must be used by both the allowlist and live call"
+    );
+    let obsolete_kourier_url =
+        "https://github.com/knative/net-kourier/releases/download/${KNATIVE_VERSION}/kourier.yaml";
+    assert_eq!(
+        gate.matches(obsolete_kourier_url).count(),
+        0,
+        "obsolete Kourier owner must not remain in production"
+    );
     let d1 = between(
         &gate,
         "lane13_prepare_diagnostics() {",
@@ -3225,7 +3238,7 @@ fn lane13_pre_runtime_inputs_are_owned_and_release_bytes_stay_local() {
     )
     .replace(
         "printf '%s' 'https://release-assets.githubusercontent.com/asset?secret=x'",
-        "printf '%s\\n0' 'https://release-assets.githubusercontent.com/asset?secret=x'",
+        "printf '%s\\n1' 'https://release-assets.githubusercontent.com/asset?secret=x'",
     )
     .replace(
         "curl() { if [ \"$1\" = --version ]; then printf 'curl 8.4.0\\n'; return; fi; printf '%s\\n' \"$*\" >> $LANE13_TEST/curl.calls;",
@@ -3298,6 +3311,47 @@ fn lane13_pre_runtime_inputs_are_owned_and_release_bytes_stay_local() {
     .replace(
         "'create cluster') : > $LANE13_TEST/cluster.created;;",
         "'create cluster') : > $LANE13_TEST/cluster.created; chmod 600 $KUBECONFIG;;",
+    )
+    .replace(
+        "rm -f $LANE13_TEST/curl.calls $LANE13_TEST/kubectl.calls\nmkdir $WORK",
+        "rm -f $LANE13_TEST/curl.calls $LANE13_TEST/kubectl.calls\nmkdir $WORK\nobsolete_url=https://github.com/knative/net-kourier/releases/download/knative-v1.23.0/kourier.yaml\ncp $FACTS $LANE13_TEST/obsolete-facts.before\nset +e\nlane13_fetch_release \"$obsolete_url\" kourier.yaml\nobsolete_status=$?\nset -e\n[ \"$obsolete_status\" -ne 0 ]\n[ ! -e $WORK/releases/kourier.yaml ] && [ ! -L $WORK/releases/kourier.yaml ]\n[ ! -e $WORK/releases/.lane13-applied ]\ncmp -s $LANE13_TEST/obsolete-facts.before $FACTS\n[ ! -e $LANE13_TEST/curl.calls ]\n[ ! -e $LANE13_TEST/apply.paths ]",
+    )
+    .replace(
+        "lane13_fetch_release https://github.com/knative/net-kourier/releases/download/knative-v1.23.0/kourier.yaml kourier.yaml",
+        "lane13_fetch_release https://github.com/knative-extensions/net-kourier/releases/download/knative-v1.23.0/kourier.yaml kourier.yaml",
+    )
+    .replace(
+        "assert_curl_download kourier.yaml https://github.com/knative/net-kourier/releases/download/knative-v1.23.0/kourier.yaml",
+        "assert_curl_download kourier.yaml https://github.com/knative-extensions/net-kourier/releases/download/knative-v1.23.0/kourier.yaml",
+    )
+    .replace(
+        "lane13_fetch_release https://github.com/knative-extensions/net-kourier/releases/download/knative-v1.23.0/kourier.yaml kourier.yaml\nfor fact in",
+        "lane13_fetch_release https://github.com/knative-extensions/net-kourier/releases/download/knative-v1.23.0/kourier.yaml kourier.yaml\ngrep -Fqx 'release_redirects=1' $FACTS\nfor fact in",
+    );
+    let obsolete_concrete_url =
+        "https://github.com/knative/net-kourier/releases/download/knative-v1.23.0/kourier.yaml";
+    assert_eq!(
+        body.matches(obsolete_concrete_url).count(),
+        1,
+        "generated fixture must retain exactly one obsolete-owner rejection probe"
+    );
+    assert_eq!(
+        body.matches("lane13_fetch_release \"$obsolete_url\" kourier.yaml")
+            .count(),
+        1,
+        "generated fixture must execute exactly one obsolete-owner probe"
+    );
+    assert_eq!(
+        body.matches(
+            "printf '%s\\n1' 'https://release-assets.githubusercontent.com/asset?secret=x'"
+        )
+        .count(),
+        1,
+        "successful fake release fetch must report one redirect"
+    );
+    assert!(
+        body.contains("grep -Fqx 'release_redirects=1' $FACTS"),
+        "generated fixture must assert one redirect for every successful release"
     );
     fs::write(&script, &body).expect("write lane-13 D1 test script");
     let output = Command::new("sh")

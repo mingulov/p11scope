@@ -783,7 +783,7 @@ lane13_fetch_release() {
     case $lane13_url:$lane13_name in
         "https://github.com/knative/serving/releases/download/${KNATIVE_VERSION}/serving-crds.yaml:serving-crds.yaml"|\
         "https://github.com/knative/serving/releases/download/${KNATIVE_VERSION}/serving-core.yaml:serving-core.yaml"|\
-        "https://github.com/knative/net-kourier/releases/download/${KNATIVE_VERSION}/kourier.yaml:kourier.yaml") ;;
+        "https://github.com/knative-extensions/net-kourier/releases/download/${KNATIVE_VERSION}/kourier.yaml:kourier.yaml") ;;
         *) return 1 ;;
     esac
     mkdir -p "$WORK/releases"
@@ -1598,7 +1598,7 @@ lane13_fetch_release \
     "https://github.com/knative/serving/releases/download/${KNATIVE_VERSION}/serving-core.yaml" \
     serving-core.yaml
 lane13_fetch_release \
-    "https://github.com/knative/net-kourier/releases/download/${KNATIVE_VERSION}/kourier.yaml" \
+    "https://github.com/knative-extensions/net-kourier/releases/download/${KNATIVE_VERSION}/kourier.yaml" \
     kourier.yaml
 timeout --signal=TERM --kill-after=5s 60s kubectl patch \
     configmap/config-network -n knative-serving --type merge \

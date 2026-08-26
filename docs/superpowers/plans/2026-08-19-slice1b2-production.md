@@ -66,20 +66,38 @@ No new crate is planned.
   historical unchecked implementation boxes below; those boxes are retained as
   the original task contract, not current status.
 
-**Topology scope amendment (2026-08-27, Task 4):** The existing Lane 13
-checker and zero-unavailable acceptance oracle are unchanged. Retain the
-evidenced Knative shared-inode capture for the exact preattached provider:
-`136/136` probes and expected cold-pod calls. In the reproduced Knative
-node-wide retained-view topology, full late-provider discovery is
-`UNSUPPORTED/NON-PASS`; its one-overlay/one-unavailable result is a required
-negative control, never a PASS. Remaining applicable Task 4 lanes and r3 may
-proceed only after this additive amendment is independently reviewed and
-committed; Lane 13 PASS is not an unlock condition. The separate gate-closure
-Task 5 capability-validator work is complete through exact commit
-`7a0c1eddac0b0b81340206ac742884ca2f31f691`, and its live capability gate exited
-0 without changing Lane 13. README/usage wording remains reserved
-for Task 10. This amendment changes no design spec, production
-Rust/BPF/privacy/schema/allowlist, or procfs/mmap/eBPF fallback behavior.
+**Topology scope amendment (2026-08-27, Task 4):** The historical Lane 13
+checker/invocation work is complete at checker/lifecycle commit
+`34357b5dda71c670250dd3ab336b29c801120d5b` (tree
+`ae3346e4b8e137f430f010d0937bcf186cfcff39`) and final invocation/contract
+commit `fd3d08ad9bd2f58508eda1ee4a50882c0633d850` (tree
+`0decc4dee974707468b5758107fb055c30d44d7d`); no new Task 4 checker or
+invocation run is planned. Its zero-unavailable PASS oracle applies only to a
+topology proposed for supported acceptance. Retain the evidenced Knative
+shared-inode capture for the exact preattached provider: `136/136` probes and
+expected cold-pod calls. The completed pre-r3 attempt-6 exclusion is bound to
+immutable receipt
+`/home/user/.local/state/p11scope/task4-lane13-a2fd9ee-20260826T2135EEST/facts.log`
+(SHA-256
+`b96cbed6cbc2963dab2c5963b5c52f6378d9bef313479b83a56c259df79b94f3`, exact
+HEAD/tree `a2fd9ee8eddfaff34b3fb6b65267688b5a90aa03` /
+`f90e2dfe8dbd0a211f9e32055a37ff7320080b88`). It binds the lane command/script
+ledger, Kind/Knative releases/images, provider hash/build ID, kernel/storage,
+node/workload identities, and clean start/end; any future negative-control
+classification with different receipt-defined inputs is UNRUN/review and never
+inherits the exclusion by outcome alone. In the reproduced Knative node-wide
+retained-view topology, full late-provider discovery is
+`UNSUPPORTED/NON-PASS`; one overlay plus one unavailable is evaluated only as
+the required negative control, never by the PASS oracle. Attempt 6 is not rerun
+in Task 4; Lane 13 runs once in 9.2d as the frozen-candidate negative control.
+Remaining applicable Task 4 lanes and r3 may proceed only after this additive
+amendment is independently reviewed and committed; Lane 13 PASS is not an
+unlock condition. The Gate Closure Task 5 capability-validator integration is
+complete through exact commit `7a0c1eddac0b0b81340206ac742884ca2f31f691`, and
+its live capability gate exited 0 without changing Lane 13. README/usage
+wording remains reserved for Task 10. This amendment changes no design spec,
+production Rust/BPF/privacy/schema/allowlist, or procfs/mmap/eBPF fallback
+behavior.
 
 ## Global constraints
 

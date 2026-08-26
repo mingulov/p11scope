@@ -994,6 +994,268 @@ grep -Fqx survived "$work/child.log"
 }
 
 #[test]
+fn lane13_port_forward_snapshot_requires_authenticated_identity() {
+    let gate = read("scripts/matrix/verify-knative.sh");
+    let validator = between(
+        &gate,
+        "lane13_validate_port_forward_snapshot() {",
+        "\nlane13_preserve_diagnostics() {",
+    )
+    .trim_end()
+    .strip_suffix('}')
+    .expect("port-forward snapshot validator closing brace");
+    let directory = tempfile::tempdir().expect("temporary snapshot fixture directory");
+    let ordinary = directory.path().join("ordinary.json");
+    fs::write(
+        &ordinary,
+        r#"[{"pid":999991,"starttime":100,"ppid":1,"pgid":999991,"sid":41,"exe_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","argv":["kubectl","port-forward","-n","kourier-system","svc/kourier-internal","31234:80"]}]"#,
+    )
+    .expect("write ordinary snapshot fixture");
+    let snap = directory.path().join("snap.json");
+    fs::write(
+        &snap,
+        r#"[{"pid":999991,"starttime":100,"ppid":1,"pgid":999991,"sid":41,"exe_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","argv":["/snap/kubectl/3833/kubectl","port-forward","-n","kourier-system","svc/kourier-internal","31234:80"]}]"#,
+    )
+    .expect("write Snap snapshot fixture");
+    let wrong_digest = directory.path().join("wrong-digest.json");
+    fs::write(
+        &wrong_digest,
+        r#"[{"pid":999991,"starttime":100,"ppid":1,"pgid":999991,"sid":41,"exe_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","argv":["/snap/kubectl/3833/kubectl","port-forward","-n","kourier-system","svc/kourier-internal","31234:80"]}]"#,
+    )
+    .expect("write wrong-digest fixture");
+    let another_revision = directory.path().join("another-revision.json");
+    fs::write(
+        &another_revision,
+        r#"[{"pid":999991,"starttime":100,"ppid":1,"pgid":999991,"sid":41,"exe_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","argv":["/snap/kubectl/4000/kubectl","port-forward","-n","kourier-system","svc/kourier-internal","31234:80"]}]"#,
+    )
+    .expect("write another-revision fixture");
+    let tmp = directory.path().join("tmp.json");
+    fs::write(
+        &tmp,
+        r#"[{"pid":999991,"starttime":100,"ppid":1,"pgid":999991,"sid":41,"exe_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","argv":["/tmp/kubectl","port-forward","-n","kourier-system","svc/kourier-internal","31234:80"]}]"#,
+    )
+    .expect("write temporary-path fixture");
+    let altered_tail = directory.path().join("altered-tail.json");
+    fs::write(
+        &altered_tail,
+        r#"[{"pid":999991,"starttime":100,"ppid":1,"pgid":999991,"sid":41,"exe_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","argv":["kubectl","port-forward","-n","kourier-system","svc/kourier-internal","31234:81"]}]"#,
+    )
+    .expect("write altered-tail fixture");
+    let extra_member = directory.path().join("extra-member.json");
+    fs::write(
+        &extra_member,
+        r#"[{"pid":999991,"starttime":100,"ppid":1,"pgid":999991,"sid":41,"exe_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","argv":["kubectl","port-forward","-n","kourier-system","svc/kourier-internal","31234:80"]},{"pid":999992,"starttime":101,"ppid":999991,"pgid":999991,"sid":41,"exe_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","argv":["child"]}]"#,
+    )
+    .expect("write extra-member fixture");
+    let changed_pid = directory.path().join("changed-pid.json");
+    fs::write(
+        &changed_pid,
+        r#"[{"pid":999992,"starttime":100,"ppid":1,"pgid":999992,"sid":41,"exe_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","argv":["kubectl","port-forward","-n","kourier-system","svc/kourier-internal","31234:80"]}]"#,
+    )
+    .expect("write changed-PID fixture");
+    let changed_starttime = directory.path().join("changed-starttime.json");
+    fs::write(
+        &changed_starttime,
+        r#"[{"pid":999991,"starttime":101,"ppid":1,"pgid":999991,"sid":41,"exe_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","argv":["kubectl","port-forward","-n","kourier-system","svc/kourier-internal","31234:80"]}]"#,
+    )
+    .expect("write changed-starttime fixture");
+    let changed_sid = directory.path().join("changed-sid.json");
+    fs::write(
+        &changed_sid,
+        r#"[{"pid":999991,"starttime":100,"ppid":1,"pgid":999991,"sid":42,"exe_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","argv":["kubectl","port-forward","-n","kourier-system","svc/kourier-internal","31234:80"]}]"#,
+    )
+    .expect("write changed-SID fixture");
+    let script = directory.path().join("snapshot-contract.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+set -eu
+lane13_validate_port_forward_snapshot() {{{validator}
+}}
+run() {{
+    fixture=$1
+    expected_status=$2
+    expected_argv0=$3
+    expected_digest=$4
+    leader_pid=$5
+    leader_starttime=$6
+    leader_sid=$7
+    set +e
+    lane13_validate_port_forward_snapshot "$fixture" "$leader_pid" "$leader_starttime" "$leader_sid" "$expected_argv0" "$expected_digest" 31234
+    actual_status=$?
+    set -e
+    [ "$actual_status" -eq "$expected_status" ]
+}}
+ordinary_digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+snap_digest=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+run {ordinary} 0 kubectl "$ordinary_digest" 999991 100 41
+run {snap} 0 /snap/kubectl/3833/kubectl "$snap_digest" 999991 100 41
+run {wrong_digest} 1 /snap/kubectl/3833/kubectl "$snap_digest" 999991 100 41
+run {another_revision} 1 /snap/kubectl/3833/kubectl "$snap_digest" 999991 100 41
+run {tmp} 1 kubectl "$ordinary_digest" 999991 100 41
+run {altered_tail} 1 kubectl "$ordinary_digest" 999991 100 41
+run {extra_member} 1 kubectl "$ordinary_digest" 999991 100 41
+run {changed_pid} 1 kubectl "$ordinary_digest" 999991 100 41
+run {changed_starttime} 1 kubectl "$ordinary_digest" 999991 100 41
+run {changed_sid} 1 kubectl "$ordinary_digest" 999991 100 41
+"#,
+            validator = validator,
+            ordinary = ordinary.display(),
+            snap = snap.display(),
+            wrong_digest = wrong_digest.display(),
+            another_revision = another_revision.display(),
+            tmp = tmp.display(),
+            altered_tail = altered_tail.display(),
+            extra_member = extra_member.display(),
+            changed_pid = changed_pid.display(),
+            changed_starttime = changed_starttime.display(),
+            changed_sid = changed_sid.display(),
+        ),
+    )
+    .expect("write snapshot contract script");
+    let output = Command::new("sh")
+        .arg(&script)
+        .output()
+        .expect("exercise port-forward snapshot validator");
+    assert!(
+        output.status.success(),
+        "snapshot validator contract failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn lane13_port_forward_resolver_binds_launch_and_validator() {
+    let gate = read("scripts/matrix/verify-knative.sh");
+    let resolver = between(
+        &gate,
+        "lane13_resolve_port_forward() {",
+        "\nlane13_validate_port_forward_snapshot() {",
+    )
+    .trim_end()
+    .strip_suffix('}')
+    .expect("port-forward resolver closing brace");
+    let launch_binding = between(
+        &gate,
+        "lane13_resolve_port_forward\nset +e\n",
+        "pf_launch_status=$?",
+    );
+    let validator_binding = between(
+        &gate,
+        "lane13_validate_port_forward_snapshot \"$PF_GROUP_SNAPSHOT\"",
+        "\nprocess_matches_starttime",
+    );
+    let directory = tempfile::tempdir().expect("temporary resolver fixture directory");
+    let calls = directory.path().join("calls");
+    fs::create_dir(&calls).expect("create resolver call directory");
+    let script = directory.path().join("resolver-contract.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+set -eu
+WORK={work}
+CALLS={calls}
+SNAP_PATH=/snap/kubectl/3833/kubectl
+RESOLUTION=
+PF_COMMAND=
+PF_EXPECTED_ARGV0=
+PF_EXPECTED_EXE_SHA256=
+lane13_sha256() {{
+    case "$1" in
+        /tmp/ordinary-kubectl) printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
+        "$SNAP_PATH") printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
+        *) return 1 ;;
+    esac
+}}
+command() {{
+    case "$1:$RESOLUTION" in
+        -v:ordinary) printf '%s\n' /tmp/ordinary-kubectl ;;
+        -v:snap|-v:snap-invalid) printf '%s\n' /snap/bin/kubectl ;;
+        *) return 1 ;;
+    esac
+}}
+readlink() {{
+    case "$RESOLUTION" in
+        ordinary) printf '%s\n' /tmp/ordinary-kubectl ;;
+        snap) printf '%s\n' "$SNAP_PATH" ;;
+        snap-invalid) printf '%s\n' /snap/kubectl/not-a-revision/kubectl ;;
+        *) return 1 ;;
+    esac
+}}
+test() {{
+    case "$1:$2" in
+        -f:/tmp/ordinary-kubectl|-f:$SNAP_PATH) return 0 ;;
+        -L:*) return 1 ;;
+        *) return 1 ;;
+    esac
+}}
+lane13_resolve_port_forward() {{{resolver}
+}}
+assert() {{
+    expected=$1
+    actual=$2
+    case "$actual" in
+        "$expected") ;;
+        *) echo "assertion failed: expected=$expected actual=$actual" >&2; exit 1 ;;
+    esac
+}}
+resolve() {{
+    RESOLUTION=$1
+    set +e
+    lane13_resolve_port_forward
+    status=$?
+    set -e
+    assert "$2" "$status"
+}}
+resolve ordinary 0
+assert kubectl "$PF_COMMAND"
+assert kubectl "$PF_EXPECTED_ARGV0"
+assert aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "$PF_EXPECTED_EXE_SHA256"
+resolve snap 0
+assert /snap/bin/kubectl "$PF_COMMAND"
+assert "$SNAP_PATH" "$PF_EXPECTED_ARGV0"
+assert bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb "$PF_EXPECTED_EXE_SHA256"
+snap_argv0=$PF_EXPECTED_ARGV0
+snap_digest=$PF_EXPECTED_EXE_SHA256
+resolve snap-invalid 1
+launch_user_recorded_process_group() {{ printf '%s\n' "$*" > "$CALLS/launch"; }}
+PORT=31234
+{launch_binding}
+assert "$WORK/portforward.pid $WORK/portforward.log /snap/bin/kubectl port-forward -n kourier-system svc/kourier-internal 31234:80" "$(cat "$CALLS/launch")"
+lane13_validate_port_forward_snapshot() {{ printf '%s\n' "$*" > "$CALLS/validator"; }}
+PF_GROUP_SNAPSHOT=$WORK/portforward.group.before.json
+PF_PID=999991
+PF_STARTTIME=100
+PF_SID=41
+PF_EXPECTED_ARGV0=$snap_argv0
+PF_EXPECTED_EXE_SHA256=$snap_digest
+lane13_validate_port_forward_snapshot "$PF_GROUP_SNAPSHOT"{validator_binding}
+assert "$PF_GROUP_SNAPSHOT 999991 100 41 $snap_argv0 $snap_digest 31234" "$(cat "$CALLS/validator")"
+"#,
+            work = directory.path().display(),
+            calls = calls.display(),
+            resolver = resolver,
+            launch_binding = launch_binding,
+            validator_binding = validator_binding,
+        ),
+    )
+    .expect("write resolver contract script");
+    let output = Command::new("sh")
+        .arg(&script)
+        .output()
+        .expect("exercise resolver and binding contract");
+    assert!(
+        output.status.success(),
+        "resolver and binding contract failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn port_forward_never_signals_a_member_absent_from_its_authorization_snapshot() {
     let gate = read("scripts/matrix/verify-knative.sh");
     let terminate = between(&gate, "terminate_port_forward() {", "\ncleanup() {");

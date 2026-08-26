@@ -4798,12 +4798,26 @@ impl Engine {
             .collect();
         let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
         candidate.views.insert(view);
-        let loader = candidate
-            .pinned
-            .id_for_scanned(loader_module, loader_module.key, &loader_module.path)
-            .filter(|candidate_loader| {
-                loader_pins.exactly_matches(local_loader, &candidate.pinned, *candidate_loader)
+        let candidate_loader =
+            candidate
+                .pinned
+                .id_for_scanned(loader_module, loader_module.key, &loader_module.path);
+        let exact = candidate_loader.is_some_and(|candidate_loader| {
+            loader_pins.exactly_matches(local_loader, &candidate.pinned, candidate_loader)
+        });
+        #[cfg(feature = "skip-attribution")]
+        if !exact {
+            attribution::note(&Skipped {
+                subject: loader_module.path.clone(),
+                reason: if candidate_loader.is_some() {
+                    "diagnostic: the loader raw alias survived canonicalization but ordinary identity equality rejected it"
+                } else {
+                    "diagnostic: the loader raw alias did not survive canonicalization"
+                }
+                .into(),
             });
+        }
+        let loader = candidate_loader.filter(|_| exact);
         Ok((candidate, loader))
     }
 
@@ -5651,6 +5665,7 @@ impl Engine {
             executable_module.key,
             &executable_module.path,
         ) else {
+            attribution::note_all(&skipped);
             self.mark_partial(
                 "live loader arming",
                 "the retained executable could not be pinned exactly",

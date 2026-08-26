@@ -13,6 +13,7 @@ name = "p11scope"
 path = "src/lib.rs"
 
 [features]
+default = ["skip-attribution"]
 unsafe-unvalidated-metadata = []
 # Internal-only diagnostic: attribute every published discovery skip to the
 # site that raised it. Stderr only; the capture document is byte-identical

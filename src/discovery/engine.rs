@@ -7,11 +7,18 @@ use crate::attach::{
 use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
 use crate::discovery::hooks::{HookAbi, HookRegistry};
+#[cfg(not(feature = "skip-attribution"))]
+use crate::discovery::identity::open_view_object;
 use crate::discovery::identity::{
     ManifestStaleReason, PinnedObjectId, PinnedObjects, PinnedTimingKey, ReconciledModule,
-    StaleManifestObject, bind_scanned_modules, canonicalize_scanned_overlays, open_view_object,
+    StaleManifestObject, bind_scanned_modules, canonicalize_scanned_overlays,
     pin_manifest_objects_deferred_in_views, pin_scanned_view_objects, retained_object_key,
     target_paths_equal, view_object_key,
+};
+#[cfg(feature = "skip-attribution")]
+use crate::discovery::identity::{
+    OpenViewObjectDiagnostic, diagnostic_fd_facts, diagnostic_mount_device,
+    open_view_object_diagnostic,
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::scan::{
@@ -36,6 +43,10 @@ use p11scope_manifest::maps::{
     Device, MapEntry, MappedPath, ObjectKey, Resolved, parse_maps, resolve,
 };
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "skip-attribution")]
+use std::fmt::Write as _;
+#[cfg(feature = "skip-attribution")]
+use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
@@ -4285,6 +4296,118 @@ fn loader_stage<T>(_stage: &'static str, result: std::result::Result<T, String>)
 }
 
 #[cfg(feature = "skip-attribution")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticDevice {
+    Value(Device),
+    Absent,
+    Unavailable,
+}
+#[cfg(feature = "skip-attribution")]
+type DiagnosticKeySummary = (usize, Vec<ObjectKey>);
+
+#[cfg(feature = "skip-attribution")]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DiagnosticVma(ObjectKey, u64, u64, u64, [u8; 4]);
+
+#[cfg(feature = "skip-attribution")]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct DiagnosticMapProjection {
+    vmas: Vec<DiagnosticVma>,
+    executable_keys: BTreeSet<ObjectKey>,
+}
+
+#[cfg(feature = "skip-attribution")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InterpreterDiagnosticRecord {
+    pid: u32,
+    fd_mnt_id: Option<u64>,
+    fd_inode: Option<u64>,
+    target_before_device: DiagnosticDevice,
+    observer_device: DiagnosticDevice,
+    target_table_equal: Option<bool>,
+    mount_namespaces_distinct: Option<bool>,
+    relevant_executable_maps_equal: Option<bool>,
+    before_executable: DiagnosticKeySummary,
+}
+
+#[cfg(feature = "skip-attribution")]
+fn diagnostic_key_summary(keys: &BTreeSet<ObjectKey>) -> DiagnosticKeySummary {
+    (keys.len(), keys.iter().copied().take(16).collect())
+}
+
+#[cfg(feature = "skip-attribution")]
+fn diagnostic_number(value: Option<u64>) -> String {
+    value.map_or_else(|| "unavailable".into(), |value| value.to_string())
+}
+
+#[cfg(feature = "skip-attribution")]
+fn diagnostic_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    }
+}
+
+#[cfg(feature = "skip-attribution")]
+fn diagnostic_device(value: DiagnosticDevice) -> String {
+    match value {
+        DiagnosticDevice::Value(Device { major, minor }) => format!("{major}:{minor}"),
+        DiagnosticDevice::Absent => "absent".into(),
+        DiagnosticDevice::Unavailable => "unavailable".into(),
+    }
+}
+
+#[cfg(feature = "skip-attribution")]
+fn diagnostic_keys(summary: &DiagnosticKeySummary) -> String {
+    summary
+        .1
+        .iter()
+        .map(|key| format!("{}:{}:{}", key.device.major, key.device.minor, key.inode))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(feature = "skip-attribution")]
+fn diagnostic_projection_equal(
+    inode: Option<u64>,
+    after_available: bool,
+    before: &DiagnosticMapProjection,
+    after: &DiagnosticMapProjection,
+) -> Option<bool> {
+    inode
+        .zip(after_available.then_some(()))
+        .map(|_| before == after)
+}
+
+#[cfg(feature = "skip-attribution")]
+fn format_interpreter_diagnostic(record: &InterpreterDiagnosticRecord) -> String {
+    let mut line = String::from(
+        "p11scope: skip-attribution: interpreter-mount-diagnostic stage=locator.interpreter",
+    );
+    write!(
+        line,
+        " pid={} fd_mnt_id={} fd_inode={} target_before_device={} \
+         observer_device={} target_table_equal={} \
+         mount_namespaces_distinct={} relevant_executable_maps_equal={} \
+         before_executable_total={} before_executable_keys=[{}] \
+         evidence=non_promotable",
+        record.pid,
+        diagnostic_number(record.fd_mnt_id),
+        diagnostic_number(record.fd_inode),
+        diagnostic_device(record.target_before_device),
+        diagnostic_device(record.observer_device),
+        diagnostic_bool(record.target_table_equal),
+        diagnostic_bool(record.mount_namespaces_distinct),
+        diagnostic_bool(record.relevant_executable_maps_equal),
+        record.before_executable.0,
+        diagnostic_keys(&record.before_executable),
+    )
+    .expect("writing a diagnostic record to a String cannot fail");
+    line
+}
+
+#[cfg(feature = "skip-attribution")]
 fn loader_arm_ordinary_error(
     result: &std::result::Result<bool, LoaderArmFailure>,
 ) -> Option<String> {
@@ -4747,6 +4870,100 @@ impl Engine {
         parse_maps(&bytes).map_err(anyhow::Error::msg)
     }
 
+    #[cfg(feature = "skip-attribution")]
+    fn diagnostic_map_projection(maps: &[MapEntry], inode: Option<u64>) -> DiagnosticMapProjection {
+        let mut projection = DiagnosticMapProjection::default();
+        for mapping in maps
+            .iter()
+            .filter(|mapping| Some(mapping.inode) == inode && mapping.permissions[2] == b'x')
+        {
+            let key = ObjectKey::of(mapping);
+            projection.executable_keys.insert(key);
+            projection.vmas.push(DiagnosticVma(
+                key,
+                mapping.start,
+                mapping.end,
+                mapping.file_offset,
+                mapping.permissions,
+            ));
+        }
+        projection.vmas.sort_unstable();
+        projection
+    }
+
+    #[cfg(feature = "skip-attribution")]
+    fn diagnostic_device_from_mountinfo(
+        mountinfo: Option<&str>,
+        mnt_id: Result<u64, ()>,
+    ) -> DiagnosticDevice {
+        let Some(mountinfo) = mountinfo else {
+            return DiagnosticDevice::Unavailable;
+        };
+        let Ok(mnt_id) = mnt_id else {
+            return DiagnosticDevice::Unavailable;
+        };
+        match diagnostic_mount_device(mountinfo, mnt_id) {
+            Ok(Some(device)) => DiagnosticDevice::Value(device),
+            Ok(None) => DiagnosticDevice::Absent,
+            Err(()) => DiagnosticDevice::Unavailable,
+        }
+    }
+
+    #[cfg(feature = "skip-attribution")]
+    fn emit_interpreter_identity_diagnostic(
+        view: &ProcessView,
+        before_maps: &[MapEntry],
+        file: std::fs::File,
+        target_before_mountinfo: String,
+    ) {
+        let (fd_mnt_id, fd_inode_result) = diagnostic_fd_facts(&file);
+        let fd_inode = fd_inode_result.ok();
+        let target_before_device =
+            Self::diagnostic_device_from_mountinfo(Some(&target_before_mountinfo), fd_mnt_id);
+        let observer_mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok();
+        let observer_device =
+            Self::diagnostic_device_from_mountinfo(observer_mountinfo.as_deref(), fd_mnt_id);
+        let after_maps = Self::read_maps(view).ok();
+        let target_after_mountinfo = view
+            .open_then_mountinfo(|| Ok(()))
+            .ok()
+            .map(|(_, mountinfo)| mountinfo);
+        let target_table_equal = target_after_mountinfo
+            .as_deref()
+            .map(|after| after == target_before_mountinfo);
+        let target_namespace = view.mount_namespace();
+        let observer_namespace = std::fs::metadata("/proc/self/ns/mnt")
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()));
+        let mount_namespaces_distinct = observer_namespace
+            .map(|observer| observer != (target_namespace.device, target_namespace.inode));
+        let before = Self::diagnostic_map_projection(before_maps, fd_inode);
+        let after = after_maps
+            .as_deref()
+            .map_or_else(DiagnosticMapProjection::default, |maps| {
+                Self::diagnostic_map_projection(maps, fd_inode)
+            });
+        let relevant_executable_maps_equal =
+            diagnostic_projection_equal(fd_inode, after_maps.is_some(), &before, &after);
+        let before_executable = diagnostic_key_summary(&before.executable_keys);
+        let record = InterpreterDiagnosticRecord {
+            pid: view.pid(),
+            fd_mnt_id: fd_mnt_id.ok(),
+            fd_inode,
+            target_before_device,
+            observer_device,
+            target_table_equal,
+            mount_namespaces_distinct,
+            relevant_executable_maps_equal,
+            before_executable,
+        };
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "{}",
+            format_interpreter_diagnostic(&record)
+        );
+    }
+
     fn loader_locator(view: &ProcessView) -> Result<Option<LoaderLocator>> {
         let pid = view.pid();
         let before_maps = Self::read_maps(view)?;
@@ -4776,6 +4993,26 @@ impl Engine {
                     .strip_prefix("/")
                     .expect("bounded PT_INTERP paths are absolute"),
             );
+            #[cfg(feature = "skip-attribution")]
+            let acquired = loader_stage(
+                "locator.interpreter",
+                open_view_object_diagnostic(view, &path),
+            )?;
+            #[cfg(feature = "skip-attribution")]
+            let (file, key) = match acquired {
+                OpenViewObjectDiagnostic::Opened(file, key) => (file, key),
+                OpenViewObjectDiagnostic::IdentityFailure(file, target_mountinfo, error) => {
+                    Self::emit_interpreter_identity_diagnostic(
+                        view,
+                        &before_maps,
+                        file,
+                        target_mountinfo,
+                    );
+                    return Err(loader_stage::<()>("locator.interpreter", Err(error))
+                        .expect_err("the retained interpreter identity failure is an error"));
+                }
+            };
+            #[cfg(not(feature = "skip-attribution"))]
             let (file, key) = loader_stage("locator.interpreter", open_view_object(view, &path))?;
             let snapshot = FileSnapshot::read(&file).map_err(anyhow::Error::msg)?;
             Some((snapshot, key))
@@ -13420,6 +13657,102 @@ mod tests {
             format!("{error:#}"),
             "loader-stage=locator.before-executable: fd mount 35 is missing from the mount table"
         );
+    }
+
+    #[cfg(feature = "skip-attribution")]
+    #[test]
+    fn interpreter_diagnostic_parser_projection_and_formatter() {
+        let key = |minor, inode| ObjectKey {
+            device: Device { major: 8, minor },
+            inode,
+        };
+        let map = |minor, inode, start, end, offset, permissions| MapEntry {
+            start,
+            end,
+            file_offset: offset,
+            permissions,
+            device: Device { major: 8, minor },
+            inode,
+            raw_path: Some(b"/sentinel/interpreter".to_vec()),
+        };
+        let relevant = map(1, 55, 1, 2, 3, *b"r-xp");
+        let nonexec = map(1, 55, 3, 4, 0, *b"r--p");
+        let unrelated = map(2, 99, 10, 11, 0, *b"r-xp");
+        let before =
+            Engine::diagnostic_map_projection(&[relevant.clone(), nonexec, unrelated], Some(55));
+        assert_eq!(
+            before.vmas,
+            vec![DiagnosticVma(key(1, 55), 1, 2, 3, *b"r-xp")]
+        );
+        let mut changed = relevant.clone();
+        changed.end = 3;
+        assert_ne!(
+            before,
+            Engine::diagnostic_map_projection(&[changed], Some(55))
+        );
+        assert_eq!(
+            diagnostic_projection_equal(None, true, &before, &before),
+            None
+        );
+        assert_eq!(
+            diagnostic_mount_device("7 1 8:0 / / rw - ext4 /dev/root rw", 7),
+            Ok(Some(Device { major: 8, minor: 0 }))
+        );
+        assert_eq!(
+            diagnostic_mount_device("7 1 8:0 / / rw - ext4 /dev/root rw", 8),
+            Ok(None)
+        );
+        assert_eq!(
+            diagnostic_mount_device("7 1 broken / / rw - ext4 bad rw", 7),
+            Err(())
+        );
+        assert_eq!(
+            Engine::diagnostic_device_from_mountinfo(
+                Some("7 1 8:0 / / rw - ext4 /dev/root rw"),
+                Ok(8),
+            ),
+            DiagnosticDevice::Absent
+        );
+        assert_eq!(
+            Engine::diagnostic_device_from_mountinfo(
+                Some("7 1 8:0 / / rw - ext4 /dev/root rw"),
+                Err(()),
+            ),
+            DiagnosticDevice::Unavailable
+        );
+        let keys = (0..18)
+            .map(|minor| key(minor, 900))
+            .collect::<BTreeSet<_>>();
+        let summary = diagnostic_key_summary(&keys);
+        let record = InterpreterDiagnosticRecord {
+            pid: 42,
+            fd_mnt_id: Some(17),
+            fd_inode: Some(55),
+            target_before_device: DiagnosticDevice::Unavailable,
+            observer_device: DiagnosticDevice::Absent,
+            target_table_equal: None,
+            mount_namespaces_distinct: None,
+            relevant_executable_maps_equal: Some(false),
+            before_executable: summary.clone(),
+        };
+        let rendered = format_interpreter_diagnostic(&record);
+        for needle in [
+            "pid=42 fd_mnt_id=17 fd_inode=55",
+            "target_table_equal=unknown",
+            "relevant_executable_maps_equal=false",
+            "before_executable_total=18",
+            "before_executable_keys=[8:0:900,8:1:900",
+            "evidence=non_promotable",
+        ] {
+            assert!(rendered.contains(needle), "missing {needle}");
+        }
+        assert!(!rendered.contains("8:16:900"));
+        assert!(!rendered.contains("fingerprint"));
+        assert!(!rendered.contains("digest"));
+        assert!(!rendered.contains("/sentinel/interpreter"));
+        assert!(!rendered.contains("7 1 broken / / rw - ext4 bad rw"));
+        assert!(!rendered.contains("target_after_device"));
+        assert!(!rendered.contains("after_executable"));
     }
 
     #[test]

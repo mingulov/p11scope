@@ -824,6 +824,67 @@ pub fn open_view_object(
     Ok((file, key))
 }
 
+#[cfg(feature = "skip-attribution")]
+pub(crate) enum OpenViewObjectDiagnostic {
+    Opened(std::fs::File, ObjectKey),
+    IdentityFailure(std::fs::File, String, String),
+}
+
+#[cfg(feature = "skip-attribution")]
+pub(crate) fn open_view_object_diagnostic(
+    view: &ProcessView,
+    path: &Path,
+) -> Result<OpenViewObjectDiagnostic, String> {
+    let (file, target_mountinfo) = view.open_then_mountinfo(|| open_regular(path))?;
+    match identity_of_in_mountinfo(&file, &target_mountinfo) {
+        Ok(mapping) => Ok(OpenViewObjectDiagnostic::Opened(file, object_key(mapping))),
+        Err(error) => Ok(OpenViewObjectDiagnostic::IdentityFailure(
+            file,
+            target_mountinfo,
+            error,
+        )),
+    }
+}
+
+#[cfg(feature = "skip-attribution")]
+pub(crate) fn diagnostic_fd_facts(file: &std::fs::File) -> (Result<u64, ()>, Result<u64, ()>) {
+    let inode = file
+        .metadata()
+        .map(|metadata| metadata.ino())
+        .map_err(|_| ());
+    let mnt_id = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))
+        .ok()
+        .and_then(|fdinfo| {
+            fdinfo.lines().find_map(|line| {
+                line.strip_prefix("mnt_id:\t")
+                    .and_then(|value| value.parse().ok())
+            })
+        })
+        .ok_or(());
+    (mnt_id, inode)
+}
+
+#[cfg(feature = "skip-attribution")]
+pub(crate) fn diagnostic_mount_device(mountinfo: &str, mnt_id: u64) -> Result<Option<Device>, ()> {
+    let mount_id = mnt_id.to_string();
+    for line in mountinfo.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        if fields.next() != Some(mount_id.as_str()) {
+            continue;
+        }
+        let _parent_id = fields.next().ok_or(())?;
+        let device = fields.next().ok_or(())?;
+        let Some((major, minor)) = device.split_once(':') else {
+            return Err(());
+        };
+        return Ok(Some(Device {
+            major: major.parse().map_err(|_| ())?,
+            minor: minor.parse().map_err(|_| ())?,
+        }));
+    }
+    Ok(None)
+}
+
 pub fn view_object_key(view: &ProcessView, path: &Path) -> Result<ObjectKey, String> {
     Ok(open_view_object(view, path)?.1)
 }

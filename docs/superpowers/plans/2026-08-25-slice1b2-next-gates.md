@@ -4,7 +4,7 @@
 
 **Goal:** Land the already-reviewed Slice 1b-2 fix6 documentation/validator delta, close the remaining gate-contract and runtime evidence gaps, and reach a fresh, independently reviewed runtime campaign without overstating UNRUN or artifact-only evidence.
 
-**Architecture:** Keep production Rust/BPF/privacy/schema behavior frozen during the next gate round. First land the exact five-file reviewed delta at the current implementation tip. Then express the already-specified lane-13 contract directly—manifest-only discovery plus exactly one shared-overlay uncertainty and zero unavailable-discovery records—and run fresh current-tip evidence with durable resolved-input identities. Historical A/B attribution remains an optional diagnostic, not a prerequisite for present product acceptance. Wire the capability-tier validator into the existing gate/CI contract, obtain an independent Sol review, and only then create a new frozen-input root for the serial 9.2d campaign. VM campaign work remains a separate privileged/non-production stage.
+**Architecture:** Keep production Rust/BPF/privacy/schema behavior frozen during the next gate round. First land the exact five-file reviewed delta at the current implementation tip. Then express the already-specified lane-13 contract directly—manifest-only discovery plus exactly one shared-overlay uncertainty and zero unavailable-discovery records—and run fresh current-tip evidence with durable resolved-input identities for the remaining applicable Task 4 lanes. Lane 13 instead uses its receipt-bound attempt-6 pre-r3 history and runs exactly once as the frozen-candidate 9.2d negative control; no current-tip Lane 13 evidence is sought. Historical A/B attribution remains an optional diagnostic, not a prerequisite for present product acceptance. Wire the capability-tier validator into the existing gate/CI contract, obtain an independent Sol review, and only then create a new frozen-input root for the serial 9.2d campaign. VM campaign work remains a separate privileged/non-production stage.
 
 **Topology scope amendment (2026-08-27, Task 4):** The historical Lane 13
 checker/invocation work is complete at its exact committed identities:
@@ -28,10 +28,12 @@ reproduced Knative node-wide retained-view topology, full late-provider
 discovery is `UNSUPPORTED/NON-PASS`; its exact one-overlay/one-unavailable
 result is evaluated only as a required negative control, never by the
 zero-unavailable PASS oracle. Attempt 6 is completed pre-r3 history: no further
-Task 4 Lane 13 rerun. Future negative-control classification requires the
-receipt-defined topology inputs (candidate/gate identity may change only where
-r3 explicitly freezes and reviews it); a mismatch stops as UNRUN/review and
-never inherits the exclusion from outcome alone. Lane 13 runs once in 9.2d as
+Task 4 Lane 13 rerun. Future negative-control classification permits
+only candidate and gate identity may differ from attempt 6, and only when each
+exactly equals the independently reviewed pre-run r3 manifest. Every other
+external topology field from the receipt must match attempt 6; any mismatch
+stops as UNRUN/review before outcome classification and never inherits the
+exclusion from outcome alone. Lane 13 runs once in 9.2d as
 the frozen-candidate negative control: any different public shape, additional
 gap, or lifecycle/input/cleanup failure stops the campaign. Remaining applicable
 Task 4 lanes and r3 may proceed only after this additive amendment is
@@ -92,7 +94,7 @@ cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings
 - [x] Capture fresh, read-only identity for Docker, Kind, Knative, and shared-layer inputs and compare it with the 9.2c record.
 - [x] Classify the historical discriminator `UNVERIFIABLE`: the old record lacks material node/runtime/release/tool identities, so no current control can establish an unchanged historical environment.
 - [x] Reject the unfinished generic A/B controller as disproportionate execution authority; retain it only as ignored, superseded design evidence.
-- [x] Select the exact current-tip oracle path for present product acceptance. Historical A/B remains an optional fresh, content-addressed diagnostic only if later causal attribution is required; no current-tip result may be described as proof that `cb089b0` changed `1bd16e0`.
+- [x] Select the exact current-tip oracle path for the remaining applicable lanes. Lane 13 uses its receipt-bound attempt-6 history and the single frozen-candidate 9.2d negative-control run instead. Historical A/B remains an optional fresh, content-addressed diagnostic only if later causal attribution is required; no current-tip result may be described as proof that `cb089b0` changed `1bd16e0`.
 
 ## Task 4: Run the verify-then-amend gate round
 
@@ -119,7 +121,7 @@ cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings
   - lane 07 manifest-only versus scanned classification, if the new evidence reconfirms it;
   - no Lane 13 oracle amendment: its receipt-bound exclusion is a historical
     negative control, not a supported-acceptance PASS result;
-  - stale hard-coded `uncorroborated=1` assumptions in lanes 10, 11, 13, and 14, replacing them with measured relationship assertions;
+  - stale hard-coded `uncorroborated=1` assumptions in lanes 10, 11, and 14, replacing them with measured relationship assertions;
   - the `verify-oracle.sh:291` oracle defect, if reproduced;
   - the healthy owned-run pause classification from partial to `sigstop`, while retaining legitimate profile PARTIAL status;
   - cross-gate consistency errors.

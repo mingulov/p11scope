@@ -83,8 +83,11 @@ immutable receipt
 HEAD/tree `a2fd9ee8eddfaff34b3fb6b65267688b5a90aa03` /
 `f90e2dfe8dbd0a211f9e32055a37ff7320080b88`). It binds the lane command/script
 ledger, Kind/Knative releases/images, provider hash/build ID, kernel/storage,
-node/workload identities, and clean start/end; any future negative-control
-classification with different receipt-defined inputs is UNRUN/review and never
+node/workload identities, and clean start/end. Future negative-control
+classification permits only candidate and gate identity to differ from attempt
+6, and only when each exactly equals the independently reviewed pre-run r3
+manifest. Every other external topology field from the receipt must match
+attempt 6; any mismatch is UNRUN/review before outcome classification and never
 inherits the exclusion by outcome alone. In the reproduced Knative node-wide
 retained-view topology, full late-provider discovery is
 `UNSUPPORTED/NON-PASS`; one overlay plus one unavailable is evaluated only as

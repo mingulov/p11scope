@@ -217,8 +217,12 @@ pre-r3 attempt-6 exclusion is input-bound to
 exact HEAD/tree `a2fd9ee8eddfaff34b3fb6b65267688b5a90aa03` /
 `f90e2dfe8dbd0a211f9e32055a37ff7320080b88`). The receipt binds the lane
 command/script ledger, Kind/Knative releases/images, provider hash/build ID,
-kernel/storage, node/workload identities, and clean start/end inputs; mismatch is UNRUN/review and never
-inherits the exclusion by outcome alone. In the reproduced Knative node-wide
+kernel/storage, node/workload identities, and clean start/end inputs. Future
+negative-control classification permits only candidate and gate identity to
+differ from attempt 6, and only when each exactly equals the independently
+reviewed pre-run r3 manifest. Every other external topology field from the
+receipt must match attempt 6; any mismatch is UNRUN/review before outcome
+classification and never inherits the exclusion by outcome alone. In the reproduced Knative node-wide
 retained-view topology, full late-provider discovery is
 `UNSUPPORTED/NON-PASS`; one overlay plus one unavailable is a required
 negative control evaluated only outside the PASS oracle. Attempt 6 is not rerun

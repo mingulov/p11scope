@@ -7,7 +7,8 @@ cd "$(dirname "$0")/.."
 echo "=== gate validator self-tests ==="
 for gate in scripts/verify-inspect-doctor.sh scripts/verify-attach-e2e.sh \
     scripts/verify-induced-gaps.sh scripts/verify-canaries.sh \
-    scripts/verify-discover-containers.sh scripts/verify-live-discovery-preflight.sh; do
+    scripts/verify-discover-containers.sh scripts/verify-live-discovery-preflight.sh \
+    scripts/verify-capability-tier.sh; do
     "$gate" --self-test
 done
 python3 scripts/check-live-discovery-evidence.py --self-test
@@ -18,4 +19,6 @@ for gate in scripts/verify-inspect-doctor.sh scripts/verify-attach-e2e.sh \
     echo "=== $gate ==="
     "$gate"
 done
+echo "=== scripts/verify-capability-tier.sh ==="
+scripts/verify-capability-tier.sh
 echo "=== gates: ALL OK ==="

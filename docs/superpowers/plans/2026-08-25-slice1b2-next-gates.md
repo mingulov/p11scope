@@ -135,31 +135,38 @@ cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings
   unavailable record is not submitted to the PASS oracle and does not
   authorize a product fix or oracle widening. Only that Lane 13 topology's
   exact one-overlay/zero-unavailable shape may pass as `PARTIAL`.
-- [ ] A successful owned run requires exactly one public
+- [ ] A successful owned run requires exactly one sanitized public
   `{"name":"discovery subject","reason":"discovery unavailable"}` timing-proof
   projection. That projection is authorized only by the exact frozen owned-run
   context, expected row cardinality, and full lane oracle. Zero, a second, or
   an outside-context projection is `NON-PASS`; it is not a generic discovery
   result and cannot be borrowed across lanes.
 - [ ] Lane 02 has exactly six attempts:
-  `(initial-set|dlopen) × (never|auto|always)`. A successful row exits zero with
-  68 table entries/slots, 136/136 entry-and-return probes, the exact
-  deterministic fixture counts, zero event loss/ambiguity/in-flight residue,
-  exactly one authorized timing-proof projection, and no unavailable-loader
-  strategy. `never` is `none/0/0/0`; `auto|always` is `sigstop` with
+  `(initial-set|dlopen) × (never|auto|always)`. Each Cartesian tuple is one
+  distinct invocation and one row; ungated controls are excluded. A successful
+  row exits zero with 68 table entries/slots, 136/136 entry-and-return probes,
+  the exact deterministic fixture counts, positive function counts equal to
+  the tracked `spike/expected.txt` plus exactly one bootstrap
+  `C_GetFunctionList`, matching the current `validate_clean_metrics` count
+  relation, zero event loss/ambiguity/in-flight residue, exactly one
+  authorized sanitized public timing-proof projection, and no unavailable-
+  loader strategy. `never` is `none/0/0/0`; `auto|always` is `sigstop` with
   `pause_attempts = pause_confirmed >= 1` and `pause_partial = 0`. An `always`
   safe refusal is containment-correct, but its row and the Lane 02 lane are
-  `NON-PASS`, produces no capture document, and still requires complete
+  `NON-PASS`, produce no capture document, and still require complete
   cleanup/quiescence evidence.
 - [ ] Lane 16 has exactly two independent shape checks: one `never` and one
   `auto`. Each row must exit zero with 68 table entries, 68 slots, 136/136
-  entry-and-return probes, exactly one authorized timing-proof projection,
-  zero event loss, discovery loss, ambiguity, in-flight work, and residue, and
-  pass its lane-specific frozen oracle. `never` is `none/0/0/0`; `auto` is
-  `sigstop` with `pause_attempts = pause_confirmed >= 1` and
-  `pause_partial = 0`. Lane 02's deterministic fixture counts do not apply.
-  No historical workload total (including `200000`), `G3`, `136175`, call,
-  timing, median, or performance threshold is an acceptance predicate.
+  entry-and-return probes, exactly one authorized sanitized public timing-proof
+  projection, zero event loss and zero discovery-loss counters, zero ambiguity,
+  in-flight work, and residue. These listed predicates are the complete current
+  Task 4 shape oracle; no existing checker mode is claimed. The one authorized
+  sanitized timing-proof projection is not one of those counters. `never` is
+  `none/0/0/0`; `auto` is `sigstop` with
+  `pause_attempts = pause_confirmed >= 1` and `pause_partial = 0`. Lane 02's
+  deterministic fixture counts do not apply. No historical workload total
+  (including `200000`), `G3`, `136175`, call, timing, median, or performance
+  threshold is an acceptance predicate.
 - [x] Preserve the checker/oracle unchanged while retaining the completed
   receipt-bound attempt-6 node-wide retained-view late-provider result as the
   required `UNSUPPORTED/NON-PASS` negative control: one overlay plus one
@@ -237,7 +244,7 @@ bash scripts/verify-live-discovery-preflight.sh --self-test
 - [ ] Require `none/0/0/0` for every successful `never` row. Require `sigstop`
   only on successful pause-enabled (`auto|always`) rows, with
   `pause_attempts = pause_confirmed >= 1` and `pause_partial = 0`. Require
-  exactly one authorized
+  exactly one authorized sanitized public
   `{"name":"discovery subject","reason":"discovery unavailable"}`
   projection for every successful owned run. Stop on a zero, second, or
   outside-context projection, and preserve cleanup/quiescence evidence with no

@@ -4791,6 +4791,11 @@ impl Engine {
     ) -> Result<(LiveCandidate, Option<PinnedObjectId>)> {
         let mut candidate_pins = self.pinned.clone();
         skipped.extend(candidate_pins.absorb(loader_pins.clone()));
+        let had_exact_loader = candidate_pins
+            .id_for_scanned(loader_module, loader_module.key, &loader_module.path)
+            .is_some_and(|candidate_loader| {
+                loader_pins.exactly_matches(local_loader, &candidate_pins, candidate_loader)
+            });
         let raw_modules = self
             .modules
             .iter()
@@ -4804,6 +4809,34 @@ impl Engine {
             .filter(|candidate_loader| {
                 loader_pins.exactly_matches(local_loader, &candidate.pinned, *candidate_loader)
             });
+        let loader = if loader.is_none() && had_exact_loader {
+            let restored_skips = candidate.pinned.absorb(loader_pins.clone());
+            if !restored_skips.is_empty() {
+                bail!("loader identity restoration produced an unexpected skip");
+            }
+            if candidate.pinned.rejects(loader_module.key) {
+                bail!("loader identity restoration rejected its object key");
+            }
+            let restored = candidate
+                .pinned
+                .id_for_scanned(loader_module, loader_module.key, &loader_module.path)
+                .filter(|candidate_loader| {
+                    loader_pins.exactly_matches(local_loader, &candidate.pinned, *candidate_loader)
+                });
+            let Some(restored) = restored else {
+                bail!("loader identity restoration could not resolve an exact pin");
+            };
+            if !candidate_identity_is_complete(
+                &candidate.plan,
+                &candidate.modules,
+                &candidate.pinned,
+            ) {
+                bail!("loader identity restoration left an incomplete candidate");
+            }
+            Some(restored)
+        } else {
+            loader
+        };
         Ok((candidate, loader))
     }
 
@@ -12127,6 +12160,76 @@ mod tests {
                 .iter()
                 .all(|module| module.path != loader_module.path),
             "public discovery has no linker-only module"
+        );
+    }
+
+    #[test]
+    fn exact_loader_pin_survives_cross_overlay_canonicalization() {
+        let (mut engine, _, provider, _) = engine_with_overlay(104);
+        let loader_module = overlay_module(overlay_key(102));
+        let mut loader_pins = overlay_view_pin(&loader_module, 999, OVERLAY_SHA, 1, true);
+        let (_, bind_skips) =
+            bind_scanned_modules(std::slice::from_ref(&loader_module), &mut loader_pins);
+        assert!(bind_skips.is_empty(), "{bind_skips:?}");
+        let local_loader = loader_pins
+            .id_for_scanned(&loader_module, loader_module.key, &loader_module.path)
+            .unwrap();
+
+        let (candidate, loader) = engine
+            .loader_candidate(
+                loader_module.view,
+                &loader_module,
+                &loader_pins,
+                local_loader,
+                Vec::new(),
+            )
+            .unwrap();
+        let loader = loader.expect("the exact local loader pin survives reconciliation");
+
+        assert_ne!(loader, provider);
+        assert!(loader_pins.exactly_matches(local_loader, &candidate.pinned, loader));
+        assert_eq!(
+            candidate
+                .pinned
+                .id_for_scanned(&loader_module, loader_module.key, &loader_module.path),
+            Some(loader)
+        );
+        assert!(
+            candidate
+                .pinned
+                .view_claims(loader_module.view)
+                .is_some_and(|claims| claims.pins.contains(&loader))
+        );
+        assert!(candidate.pinned.has_overlay_uncertainty());
+        assert!(candidate_identity_is_complete(
+            &candidate.plan,
+            &candidate.modules,
+            &candidate.pinned
+        ));
+        assert_eq!(candidate.plan.modules.len(), 1);
+        assert_eq!(candidate.plan.modules[0].object, provider);
+        assert!(
+            candidate
+                .plan
+                .slots
+                .iter()
+                .all(|slot| slot.object != loader)
+        );
+        let evidence = discovery_evidence(
+            &candidate.plan,
+            &candidate.pinned,
+            &DiscoveryCounters::default(),
+        );
+        assert_eq!(evidence.modules.len(), 1);
+
+        let mut retired = candidate.pinned;
+        let claims = retired.remove_view(loader_module.view).unwrap();
+        assert!(claims.pins.contains(&loader));
+        assert!(retired.summary(loader).is_none());
+        assert_eq!(
+            retired.id_for_scanned(&loader_module, loader_module.key, &loader_module.path),
+            None,
+            "retiring the loader view removes its raw ownership"
         );
     }
 

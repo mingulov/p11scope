@@ -4363,9 +4363,29 @@ set -e
 }
 
 #[test]
+fn unbounded_gate_match_accepts_a_live_only_capability_fixture() {
+    let deceptive = [
+        "for gate in scripts/verify-inspect-doctor.sh; do",
+        "    \"$gate\" --self-test",
+        "done",
+        "echo \"=== scripts/verify-capability-tier.sh ===\"",
+        "scripts/verify-capability-tier.sh",
+    ]
+    .join("\n");
+    assert!(deceptive.contains("scripts/verify-capability-tier.sh"));
+    let self_test_loop = between(&deceptive, "for gate in ", "done");
+    assert!(!self_test_loop.contains("scripts/verify-capability-tier.sh"));
+}
+
+#[test]
 fn every_gate_script_self_tests_its_own_validator() {
     let gates = read("scripts/gates.sh");
     let ci = read(".github/workflows/ci.yml");
+    let self_test_loop = between(
+        &gates,
+        "echo \"=== gate validator self-tests ===\"\nfor gate in ",
+        "done\npython3 scripts/check-live-discovery-evidence.py --self-test",
+    );
     for script in [
         "scripts/verify-inspect-doctor.sh",
         "scripts/verify-attach-e2e.sh",
@@ -4379,7 +4399,7 @@ fn every_gate_script_self_tests_its_own_validator() {
             "{script} has no nonprivileged validator self-test"
         );
         assert!(
-            gates.contains(script),
+            self_test_loop.contains(script),
             "{script} is not wired into scripts/gates.sh"
         );
         assert!(
@@ -4388,10 +4408,49 @@ fn every_gate_script_self_tests_its_own_validator() {
         );
     }
     assert!(
-        gates.contains(
+        self_test_loop.contains("scripts/verify-capability-tier.sh; do")
+            && self_test_loop.contains("\"$gate\" --self-test"),
+        "the capability validator is not in the bounded gates.sh self-test loop"
+    );
+    let live_section = between(
+        &gates,
+        "    \"$gate\"\ndone\n",
+        "echo \"=== gates: ALL OK ===\"",
+    );
+    let live_call = "scripts/verify-capability-tier.sh";
+    assert_eq!(
+        gates.lines().filter(|line| *line == live_call).count(),
+        1,
+        "the capability validator must have exactly one standalone live call"
+    );
+    assert_eq!(
+        live_section
+            .lines()
+            .filter(|line| *line == live_call)
+            .count(),
+        1,
+        "the standalone live capability call must follow the live gate loop"
+    );
+    let ci_self_test_block = between(
+        &ci,
+        "      # Unprivileged validator self-tests:",
+        "      - run: python3 scripts/check-live-discovery-evidence.py --self-test",
+    );
+    let ci_capability_self_test = "      - run: scripts/verify-capability-tier.sh --self-test";
+    assert_eq!(
+        ci.matches(ci_capability_self_test).count(),
+        1,
+        "CI must have exactly one active capability self-test"
+    );
+    assert!(
+        ci_self_test_block.contains(ci_capability_self_test),
+        "CI capability self-test must remain in the unprivileged validator block"
+    );
+    assert!(
+        live_section.contains(
             "echo \"=== scripts/verify-capability-tier.sh ===\"\nscripts/verify-capability-tier.sh"
         ),
-        "the live capability-tier validator is not wired at the root gate boundary"
+        "the live capability-tier validator is not labelled at the root gate boundary"
     );
     assert!(
         ci.contains("python3 scripts/check-live-discovery-evidence.py --self-test"),

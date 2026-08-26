@@ -6,6 +6,23 @@
 
 **Architecture:** Keep production Rust/BPF/privacy/schema behavior frozen during the next gate round. First land the exact five-file reviewed delta at the current implementation tip. Then express the already-specified lane-13 contract directly—manifest-only discovery plus exactly one shared-overlay uncertainty and zero unavailable-discovery records—and run fresh current-tip evidence with durable resolved-input identities. Historical A/B attribution remains an optional diagnostic, not a prerequisite for present product acceptance. Wire the capability-tier validator into the existing gate/CI contract, obtain an independent Sol review, and only then create a new frozen-input root for the serial 9.2d campaign. VM campaign work remains a separate privileged/non-production stage.
 
+**Topology scope amendment (2026-08-27, Task 4):** The existing Lane 13
+checker and its zero-unavailable acceptance oracle are unchanged. Retain the
+evidenced Knative shared-inode capture for the exact preattached provider:
+`136/136` probes and expected cold-pod calls. In the reproduced Knative
+node-wide retained-view topology, full late-provider discovery is
+`UNSUPPORTED/NON-PASS`; its exact one-overlay/one-unavailable result is a
+required negative control and must never be converted to PASS. Lane 13 is
+required in 9.2d: any different public shape, additional gap, or
+lifecycle/input/cleanup failure stops the campaign. Remaining applicable Task
+4 lanes and r3 may proceed only after this additive amendment is independently
+reviewed and committed; Lane 13 PASS is not an unlock condition. Task 5 is
+complete through exact commit `7a0c1eddac0b0b81340206ac742884ca2f31f691`;
+`scripts/verify-capability-tier.sh` exited 0 at that exact tree without
+changing Lane 13. README/usage wording remains reserved for Task 10. This
+amendment changes no design spec, production Rust/BPF/privacy/schema/allowlist,
+or procfs/mmap/eBPF fallback behavior.
+
 **Tech Stack:** Rust 1.88, edition 2024, Linux x86-64-first; Bash gate scripts; Python artifact-contract checks; Docker/Kind/Knative where already authorized; KVM/VM/sudo only at the separately authorized campaign stage.
 
 ## Global Constraints
@@ -78,30 +95,46 @@ cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings
   - the healthy owned-run pause classification from partial to `sigstop`, while retaining legitimate profile PARTIAL status;
   - cross-gate consistency errors.
 - [ ] In lane 13, any unavailable-discovery record is a product failure: preserve its internal attribution and fix the present mount/pinning path rather than widening the oracle. Only the exact one-overlay/zero-unavailable shape may pass as `PARTIAL`.
+- [ ] Preserve that checker/oracle unchanged while recording the reproduced
+  node-wide retained-view late-provider result as the required
+  `UNSUPPORTED/NON-PASS` negative control: one overlay plus one unavailable is
+  not a pass or an oracle amendment. The retained preattached-provider
+  Knative evidence remains `136/136` probes with expected cold-pod calls.
 - [ ] Do not broaden a gate based on a single unexplained row, changed external identity, or blocked privileged lane.
 
 ## Task 5: Integrate the capability-tier validator into the contract
 
-- [ ] Add `scripts/verify-capability-tier.sh --self-test` to the existing unprivileged validator lane in `scripts/gates.sh` and `.github/workflows/ci.yml`.
-- [ ] Add the live capability-tier invocation to the root gate at the established privileged boundary; retain the script’s exact SYS_ADMIN and BPF/PERFMON predicates and negative self-tests.
-- [ ] Add the script to the shell syntax and gate-contract coverage in `tests/artifact_contracts.rs`.
-- [ ] Keep generated capability artifacts out of Git and do not alter the privacy allowlist.
-- [ ] Re-run formatting, locked check, locked tests, locked clippy, all affected self-tests, and `git diff --check`.
+**Status (2026-08-27): COMPLETE through
+`7a0c1eddac0b0b81340206ac742884ca2f31f691`.** The implementation commit
+`a1774d6` wires the validator in the local gate, hosted CI, and artifact
+contracts. The live `scripts/verify-capability-tier.sh` gate exited 0 at the
+exact commit/tree above with the expected measured rows; this does not change
+the Lane 13 `UNSUPPORTED/NON-PASS` disposition or unlock r3.
+
+- [x] Add `scripts/verify-capability-tier.sh --self-test` to the existing unprivileged validator lane in `scripts/gates.sh` and `.github/workflows/ci.yml`.
+- [x] Add the live capability-tier invocation to the root gate at the established privileged boundary; retain the script’s exact SYS_ADMIN and BPF/PERFMON predicates and negative self-tests.
+- [x] Add the script to the shell syntax and gate-contract coverage in `tests/artifact_contracts.rs`.
+- [x] Keep generated capability artifacts out of Git and do not alter the privacy allowlist.
+- [x] Re-run formatting, locked check, locked tests, locked clippy, all affected self-tests, and `git diff --check`.
 
 ## Task 6: Obtain independent review and land the gate-only change
 
 - [ ] Stop the single writer before requesting review.
 - [ ] Ask Sol at xhigh effort to review the fresh evidence, lane13 discriminator, every gate amendment, and the capability integration against the roadmap and stop conditions.
 - [ ] Resolve only evidence-backed review findings; if review identifies a production Rust/BPF/privacy/schema defect, stop and return to the appropriate product plan instead of hiding it in gate logic.
-- [ ] Preserve the additive Task 4 gate-input commit exactly as evidenced. After
-  Task 4 evidence review, implement/review Task 5 capability-validator wiring in
-  one separate additive gate-only commit. Task 4 evidence does not validate the
-  later combined HEAD.
+- [ ] Preserve the additive Task 4 gate-input commit exactly as evidenced, and
+  independently review and commit this topology amendment before remaining
+  applicable Task 4 lanes and r3. Task 5 capability-validator wiring is already
+  complete at the exact base above in its separate gate-only commit; its live
+  result does not validate Lane 13 or unlock r3.
 - [ ] Record exact commit, evidence root, commands, skips, cleanup result, and review outcome in the continuation ledger.
 
 ## Task 7: Create a fresh frozen-input root
 
-- [ ] Only after the gate-only commit and Sol review, create a new root; never reuse r2:
+- [ ] Only after this amendment and the remaining applicable Task 4 gate-input
+  review are independently complete and committed, with the required Sol review,
+  create a new root; Task 5's completed capability commit does not itself unlock
+  r3. Never reuse r2:
 
 ```
 bash scripts/verify-live-discovery-preflight.sh --freeze \
@@ -123,7 +156,7 @@ bash scripts/verify-live-discovery-preflight.sh --self-test
 
 ## Task 8: Run 9.2d, then advance only on clean evidence
 
-- [ ] Run the 9.2d sequence serially: 02, 07, 09, 10, 11, 13, then the lane-16 shape spot check, using the frozen binary/gate commit and a fresh evidence directory.
+- [ ] Run the 9.2d sequence serially: 02, 07, 09, 10, 11, 13, then the lane-16 shape spot check, using the frozen binary/gate commit and a fresh evidence directory. Lane 13 is the required negative control: the reproduced exact late-provider topology must retain one overlay plus one unavailable and be classified `UNSUPPORTED/NON-PASS`; this expected scoped result is recorded and does not stop otherwise applicable lanes. It is not a PASS or unlock condition. Any different public shape, added gap, or lifecycle/input/cleanup failure stops the campaign.
 - [ ] Require one explainable owned-run public skip where specified, healthy `sigstop` pause, no unexplained variance, cleanup/quiescence, and no residue.
 - [ ] Stop on an unexplained row, a second owned skip, candidate changes after freeze, lost quiescence, or cleanup residue. Classify missing infrastructure as UNRUN/blocked.
 - [ ] After an explainable 9.2d result, build the privileged non-production `frozen/preflight-harness` and run the 9.3 campaign: 480 primary plus 40 forced-fallback VM attempts on Jammy 5.15 and Noble 6.8. Missing KVM, sudo, base hashes, or harness is UNRUN/blocked.

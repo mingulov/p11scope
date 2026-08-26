@@ -204,11 +204,26 @@ known-limitations section: `docs/notes/phase4-matrix.md`.
 **Topology scope qualification (2026-08-27, Slice 1b-2):** The historical
 Knative matrix evidence above is retained for the exact preattached provider
 capture: shared-inode attachment, `136/136` probes, and expected cold-pod
-calls. It is narrower than full late-provider discovery. In the reproduced
-Knative node-wide retained-view topology, full late-provider discovery is
-`UNSUPPORTED/NON-PASS`; the exact one-overlay/one-unavailable result is a
-required negative control and is never converted to PASS. The Lane 13 checker
-and zero-unavailable acceptance oracle remain unchanged.
+calls. It is narrower than full late-provider discovery. The historical Lane 13
+checker/invocation is complete at checker/lifecycle commit
+`34357b5dda71c670250dd3ab336b29c801120d5b` (tree
+`ae3346e4b8e137f430f010d0937bcf186cfcff39`) and final invocation/contract
+commit `fd3d08ad9bd2f58508eda1ee4a50882c0633d850` (tree
+`0decc4dee974707468b5758107fb055c30d44d7d`). Its zero-unavailable PASS oracle
+applies only to a topology proposed for supported acceptance. The completed
+pre-r3 attempt-6 exclusion is input-bound to
+`/home/user/.local/state/p11scope/task4-lane13-a2fd9ee-20260826T2135EEST/facts.log`
+(SHA-256 `b96cbed6cbc2963dab2c5963b5c52f6378d9bef313479b83a56c259df79b94f3`,
+exact HEAD/tree `a2fd9ee8eddfaff34b3fb6b65267688b5a90aa03` /
+`f90e2dfe8dbd0a211f9e32055a37ff7320080b88`). The receipt binds the lane
+command/script ledger, Kind/Knative releases/images, provider hash/build ID,
+kernel/storage, node/workload identities, and clean start/end inputs; mismatch is UNRUN/review and never
+inherits the exclusion by outcome alone. In the reproduced Knative node-wide
+retained-view topology, full late-provider discovery is
+`UNSUPPORTED/NON-PASS`; one overlay plus one unavailable is a required
+negative control evaluated only outside the PASS oracle. Attempt 6 is not rerun
+in Task 4; Lane 13 runs once in 9.2d as the frozen-candidate negative control.
+The checker and zero-unavailable acceptance oracle remain unchanged.
 
 ## Phase 5 — Overhead benchmark + docs + v0.1 release
 
@@ -467,17 +482,19 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     unclaimed. See the
     [pause amendment](../specs/2026-08-19-slice1b2-no-busy-wait-pause-amendment.md).**
 
-    **Topology scope ruling (2026-08-27):** Task 4's Lane 13 checker and
-    zero-unavailable oracle are unchanged. The exact reproduced node-wide
+    **Topology scope ruling (2026-08-27):** The exact reproduced node-wide
     retained-view late-provider case is an expected `UNSUPPORTED/NON-PASS`
-    negative control with one overlay plus one unavailable; any different
-    public shape, additional gap, or lifecycle/input/cleanup failure stops the
-    campaign. The retained preattached-provider Knative evidence remains
-    `136/136` with expected cold-pod calls. Remaining applicable Task 4 lanes
-    and r3 may proceed only after this additive amendment is independently
-    reviewed and committed; Lane 13 PASS is not an unlock condition. The
-    separate gate-closure Task 5 capability-validator work is complete through
-    exact commit
+    negative control with one overlay plus one unavailable; it is evaluated
+    only outside the zero-unavailable PASS oracle. The receipt-bound attempt-6
+    history is complete pre-r3 and is not rerun in Task 4; Lane 13 runs once in
+    9.2d as the frozen-candidate negative control. Any receipt-input mismatch,
+    different public shape, additional gap, or lifecycle/input/cleanup failure
+    stops as UNRUN/review or NON-PASS as applicable. The retained
+    preattached-provider Knative evidence remains `136/136` with expected
+    cold-pod calls. Remaining applicable Task 4 lanes and r3 may proceed only
+    after this additive amendment is independently reviewed and committed; Lane
+    13 PASS is not an unlock condition. The Gate Closure Task 5
+    capability-validator integration is complete through exact commit
     `7a0c1eddac0b0b81340206ac742884ca2f31f691`, whose live capability gate
     exited 0 without changing Lane 13. Public README/usage wording remains
     reserved for Task 10; no design-spec, production, privacy/schema, or

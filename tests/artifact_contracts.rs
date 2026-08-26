@@ -3357,10 +3357,25 @@ curl() {{
   case ${{CURL_MODE-redirect}} in
     redirect) printf release > "$out"; printf 'https://release-assets.githubusercontent.com:444/asset\n2\n' ;;
     cap) truncate -s 16777217 "$out"; printf 'https://release-assets.githubusercontent.com/asset\n0\n' ;;
-    unsorted) printf release > "$out"; printf 'https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml\n0\n' ;;
+    unsorted|sorted|duplicate|malformed|empty|nofinal|blank|control|nonascii|failure) printf release > "$out"; printf 'https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml\n0\n' ;;
   esac
 }}
-kubectl() {{ : > {work}/kubectl.called; [ "${{CURL_MODE-}}" = unsorted ] && printf 'service/z\nservice/a\n' && return 0; exit 99; }}
+kubectl() {{
+  : > {work}/kubectl.called
+  case $CURL_MODE in
+    unsorted) printf 'service/z\nservice/a\n' ;;
+    sorted) printf 'service/a\nservice/z\n' ;;
+    duplicate) printf 'service/a\nservice/a\n' ;;
+    malformed) printf 'service/a\nservice/Bad\n' ;;
+    empty) return 0 ;;
+    nofinal) printf 'service/a' ;;
+    blank) printf 'service/a\n\n' ;;
+    control) printf 'service/a\nservice/b\001\n' ;;
+    nonascii) printf 'service/a\nservice/\303\251\n' ;;
+    failure) return 1 ;;
+    *) exit 99 ;;
+  esac
+}}
 timeout() {{ while [ "$#" -gt 0 ]; do case "$1" in --signal=*|--kill-after=*) shift;; --signal|--kill-after) shift 2;; *s) shift; break;; *) break;; esac; done; "$@"; }}
 lane13_require_curl() {{{require_curl}
 lane13_fetch_release() {{{fetch}
@@ -3369,6 +3384,7 @@ for curl_version in 8.4 8.4.0.1 8.x.0; do
     if lane13_require_curl "$curl_version"; then exit 91; fi
 done
 lane13_require_curl 8.4.0
+rm -f {work}/kubectl.called
 set +e
 lane13_fetch_release https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml serving-crds.yaml
 release_status=$?
@@ -3377,6 +3393,7 @@ set -e
 [ ! -e {work}/kubectl.called ]
 rm -f "$WORK/releases/serving-crds.yaml"
 CURL_MODE=cap
+rm -f {work}/kubectl.called
 set +e
 lane13_fetch_release https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml serving-crds.yaml
 release_status=$?
@@ -3385,12 +3402,73 @@ set -e
 [ ! -e {work}/kubectl.called ]
 rm -f "$WORK/releases/serving-crds.yaml"
 CURL_MODE=unsorted
+FACTS=$EVIDENCE/unsorted.facts
+: > "$FACTS"
+rm -f {work}/kubectl.called
+lane13_fetch_release https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml serving-crds.yaml
+[ -e {work}/kubectl.called ]
+unsorted_projection=$(grep '^release_apply_serving-crds.yaml=' "$FACTS")
+[ "$unsorted_projection" = "release_apply_serving-crds.yaml=service/a
+release_apply_serving-crds.yaml=service/z" ]
+[ "$(grep -Ec '^release_pre_sha256=.+$' "$FACTS")" -eq 1 ]
+[ "$(grep -Ec '^release_post_sha256=.+$' "$FACTS")" -eq 1 ]
+[ "$(sed -n 's/^release_pre_sha256=//p' "$FACTS")" = "$(sed -n 's/^release_post_sha256=//p' "$FACTS")" ]
+[ "$(grep -Fxc 'release_apply_success_serving-crds.yaml=1' "$FACTS")" -eq 1 ]
+[ ! -e "$WORK/releases/serving-crds.yaml" ] && [ ! -L "$WORK/releases/serving-crds.yaml" ]
+
+CURL_MODE=sorted
+FACTS=$EVIDENCE/sorted.facts
+: > "$FACTS"
+rm -f {work}/kubectl.called
+lane13_fetch_release https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml serving-crds.yaml
+[ -e {work}/kubectl.called ]
+cmp "$EVIDENCE/unsorted.facts" "$FACTS"
+
+CURL_MODE=duplicate
+FACTS=$EVIDENCE/duplicate.facts
+: > "$FACTS"
+rm -f {work}/kubectl.called
 set +e
 lane13_fetch_release https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml serving-crds.yaml
 release_status=$?
 set -e
 [ "$release_status" -ne 0 ]
 [ -e {work}/kubectl.called ]
+[ -e "$WORK/releases/serving-crds.yaml" ]
+! grep -Fq 'release_apply_serving-crds.yaml=' "$FACTS"
+! grep -Fq 'release_apply_success_serving-crds.yaml=' "$FACTS"
+rm -f "$WORK/releases/serving-crds.yaml"
+
+CURL_MODE=malformed
+FACTS=$EVIDENCE/malformed.facts
+: > "$FACTS"
+rm -f {work}/kubectl.called
+set +e
+lane13_fetch_release https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml serving-crds.yaml
+release_status=$?
+set -e
+[ "$release_status" -ne 0 ]
+[ -e {work}/kubectl.called ]
+[ -e "$WORK/releases/serving-crds.yaml" ]
+! grep -Fq 'release_apply_serving-crds.yaml=' "$FACTS"
+! grep -Fq 'release_apply_success_serving-crds.yaml=' "$FACTS"
+rm -f "$WORK/releases/serving-crds.yaml"
+for invalid_mode in empty nofinal blank control nonascii failure; do
+    CURL_MODE=$invalid_mode
+    FACTS=$EVIDENCE/$invalid_mode.facts
+    : > "$FACTS"
+    rm -f {work}/kubectl.called
+    set +e
+    lane13_fetch_release https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml serving-crds.yaml
+    release_status=$?
+    set -e
+    [ "$release_status" -ne 0 ]
+    [ -e {work}/kubectl.called ]
+    [ -e "$WORK/releases/serving-crds.yaml" ]
+    ! grep -Fq 'release_apply_serving-crds.yaml=' "$FACTS"
+    ! grep -Fq 'release_apply_success_serving-crds.yaml=' "$FACTS"
+    rm -f "$WORK/releases/serving-crds.yaml"
+done
 "#,
             work = directory.path().display(),
             preflight = preflight,
@@ -4018,7 +4096,8 @@ fn lane13_evidence_finalizes_only_after_owned_cleanup() {
         "LANE13_BODY_STARTTIME",
         "LANE13_BODY_SIGNAL",
         "lane13_container_absent",
-        "items != sorted(items)",
+        "len(items) != len(set(items))",
+        "for item in sorted(items):",
         "git diff --cached --quiet",
         "input_ledger_start=",
         "input_ledger_end=",

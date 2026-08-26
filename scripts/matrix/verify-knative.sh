@@ -840,12 +840,12 @@ try:
 except UnicodeDecodeError:
     raise SystemExit("invalid local release apply encoding")
 items = text[:-1].split("\n")
-if not items or items != sorted(items) or any(not item for item in items) or len(items) != len(set(items)) or not all(
+if not items or any(not item for item in items) or len(items) != len(set(items)) or not all(
     re.fullmatch(r"[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9.-]*", item) for item in items
 ):
     raise SystemExit("invalid local release apply projection")
 with open(facts, "a", encoding="utf-8") as output:
-    for item in items:
+    for item in sorted(items):
         output.write(f"release_apply_{logical_name}={item}\n")
 PY
     rm -f -- "$WORK/releases/.lane13-applied"

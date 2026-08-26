@@ -371,20 +371,69 @@ lane13_record_capture_provider() {
     lane13_fact "capture_provider_build_id=$lane13_capture_provider_build"
 }
 
-lane13_record_generated_bpf() {
+lane13_record_generated_bpf() (
     lane13_bpf_list=$WORK/.lane13-bpf-list
     find "$PRODUCT/release/build" -type f \
         -path "$PRODUCT/release/build/p11scope-*/out/p11scope-ebpf" \
-        -print > "$lane13_bpf_list"
+        -print > "$lane13_bpf_list" || { rm -f -- "$lane13_bpf_list"; exit 1; }
     lane13_bpf_count=$(awk 'NF { count += 1 } END { print count + 0 }' "$lane13_bpf_list")
-    [ "$lane13_bpf_count" -eq 1 ] || { rm -f -- "$lane13_bpf_list"; return 1; }
+    [ "$lane13_bpf_count" -eq 1 ] || { rm -f -- "$lane13_bpf_list"; exit 1; }
     lane13_bpf_path=$(cat "$lane13_bpf_list")
     rm -f -- "$lane13_bpf_list"
-    lane13_record_file_fact generated_bpf "$lane13_bpf_path" || return 1
-    lane13_bpf_build_id=$(readelf -n "$lane13_bpf_path" 2>/dev/null | awk '/Build ID:/ { print $3; exit }') || return 1
-    [ -n "$lane13_bpf_build_id" ] || return 1
+    [ -f "$lane13_bpf_path" ] && [ ! -L "$lane13_bpf_path" ] || exit 1
+    exec 9< "$lane13_bpf_path" || exit 1
+    lane13_bpf_fd=/proc/self/fd/9
+    lane13_bpf_stat_before=$(LC_ALL=C stat -Lc '%d:%i:%s:%z' "$lane13_bpf_fd") || exit 1
+    lane13_bpf_size=$(LC_ALL=C stat -Lc %s "$lane13_bpf_fd") || exit 1
+    lane13_bpf_digest=$(LC_ALL=C lane13_sha256 "$lane13_bpf_fd") || exit 1
+    lane13_bpf_header=$(LC_ALL=C readelf -h "$lane13_bpf_fd" 2>/dev/null) || exit 1
+    lane13_bpf_class=$(printf '%s\n' "$lane13_bpf_header" | awk -F: '
+        $1 ~ /^[[:space:]]*Class[[:space:]]*$/ { count += 1; value = $2 }
+        END { if (count != 1) exit 1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value }
+    ') || exit 1
+    lane13_bpf_data=$(printf '%s\n' "$lane13_bpf_header" | awk -F: '
+        $1 ~ /^[[:space:]]*Data[[:space:]]*$/ { count += 1; value = $2 }
+        END { if (count != 1) exit 1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value }
+    ') || exit 1
+    lane13_bpf_type=$(printf '%s\n' "$lane13_bpf_header" | awk -F: '
+        $1 ~ /^[[:space:]]*Type[[:space:]]*$/ { count += 1; value = $2 }
+        END { if (count != 1) exit 1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value }
+    ') || exit 1
+    lane13_bpf_machine=$(printf '%s\n' "$lane13_bpf_header" | awk -F: '
+        $1 ~ /^[[:space:]]*Machine[[:space:]]*$/ { count += 1; value = $2 }
+        END { if (count != 1) exit 1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value }
+    ') || exit 1
+    [ "$lane13_bpf_class" = ELF64 ] || exit 1
+    [ "$lane13_bpf_data" = "2's complement, little endian" ] || exit 1
+    [ "$lane13_bpf_type" = "REL (Relocatable file)" ] || exit 1
+    [ "$lane13_bpf_machine" = "Linux BPF" ] || exit 1
+    if lane13_bpf_notes=$(LC_ALL=C readelf -n "$lane13_bpf_fd" 2>/dev/null); then
+        lane13_bpf_build_id_count=$(printf '%s\n' "$lane13_bpf_notes" | awk '/Build ID:/ { count += 1 } END { print count + 0 }')
+        case $lane13_bpf_build_id_count in
+            0) lane13_bpf_build_id=absent ;;
+            1)
+                lane13_bpf_build_id=$(printf '%s\n' "$lane13_bpf_notes" | awk '/Build ID:/ { if (NF != 3) exit 1; print $3 }') || exit 1
+                printf '%s\n' "$lane13_bpf_build_id" | LC_ALL=C grep -Eq '^[0-9a-f]+$' || exit 1
+                ;;
+            *) exit 1 ;;
+        esac
+    else
+        exit 1
+    fi
+    lane13_bpf_stat_after=$(LC_ALL=C stat -Lc '%d:%i:%s:%z' "$lane13_bpf_fd") || exit 1
+    [ "$lane13_bpf_stat_before" = "$lane13_bpf_stat_after" ] || exit 1
+    [ -f "$lane13_bpf_path" ] && [ ! -L "$lane13_bpf_path" ] || exit 1
+    lane13_bpf_path_stat=$(LC_ALL=C stat -Lc '%d:%i:%s:%z' "$lane13_bpf_path") || exit 1
+    [ "$lane13_bpf_stat_after" = "$lane13_bpf_path_stat" ] || exit 1
+    lane13_fact "generated_bpf_path=$lane13_bpf_path"
+    lane13_fact "generated_bpf_size=$lane13_bpf_size"
+    lane13_fact "generated_bpf_sha256=$lane13_bpf_digest"
     lane13_fact "generated_bpf_build_id=$lane13_bpf_build_id"
-}
+    lane13_fact generated_bpf_elf_class=ELF64
+    lane13_fact generated_bpf_elf_data=LSB
+    lane13_fact generated_bpf_elf_type=ET_REL
+    lane13_fact generated_bpf_elf_machine=EM_BPF
+)
 
 lane13_record_pod_identity() {
     lane13_pod_namespace=$1

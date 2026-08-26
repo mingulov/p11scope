@@ -51,6 +51,9 @@ PF_PGID=
 PF_SID=
 PF_GROUP_SNAPSHOT=
 PF_GROUP_SNAPSHOT_AFTER=
+PF_COMMAND=
+PF_EXPECTED_ARGV0=
+PF_EXPECTED_EXE_SHA256=
 PF_SESSION_EMPTY=1
 LANE13_BODY_PID=
 LANE13_BODY_STARTTIME=
@@ -868,6 +871,83 @@ with open(sys.argv[1], "rb") as source:
     for block in iter(lambda: source.read(131072), b""):
         digest.update(block)
 print(digest.hexdigest())
+PY
+}
+
+lane13_resolve_port_forward() {
+    lane13_kubectl_command=$(command -v kubectl) || return 1
+    case $lane13_kubectl_command in
+        /*) ;;
+        *) echo "kubectl resolution is not an absolute path" >&2; return 1 ;;
+    esac
+    if [ "$lane13_kubectl_command" = /snap/bin/kubectl ]; then
+        lane13_kubectl_path=$(readlink -f -- /snap/kubectl/current/kubectl) || return 1
+        case $lane13_kubectl_path in
+            /snap/kubectl/*/kubectl)
+                lane13_kubectl_revision=${lane13_kubectl_path#/snap/kubectl/}
+                lane13_kubectl_revision=${lane13_kubectl_revision%/kubectl}
+                case $lane13_kubectl_revision in
+                    ''|*[!0-9]*)
+                        echo "Snap kubectl path has an invalid revision" >&2
+                        return 1
+                        ;;
+                esac
+                ;;
+            *)
+                echo "Snap kubectl path is not an approved revision" >&2
+                return 1
+                ;;
+        esac
+        PF_COMMAND=/snap/bin/kubectl
+        PF_EXPECTED_ARGV0=$lane13_kubectl_path
+    else
+        lane13_kubectl_path=$(readlink -f -- "$lane13_kubectl_command") || return 1
+        PF_COMMAND=kubectl
+        PF_EXPECTED_ARGV0=kubectl
+    fi
+    test -f "$lane13_kubectl_path" && ! test -L "$lane13_kubectl_path" || {
+        echo "kubectl identity is not a regular file" >&2
+        return 1
+    }
+    PF_EXPECTED_EXE_SHA256=$(lane13_sha256 "$lane13_kubectl_path") || return 1
+    case $PF_EXPECTED_EXE_SHA256 in
+        ''|*[!0-9a-f]*)
+            echo "kubectl identity hash is malformed" >&2
+            return 1
+            ;;
+    esac
+    [ "${#PF_EXPECTED_EXE_SHA256}" -eq 64 ] || {
+        echo "kubectl identity hash is malformed" >&2
+        return 1
+    }
+}
+
+lane13_validate_port_forward_snapshot() {
+    python3 - "$@" <<'PY'
+import json
+import re
+import sys
+
+snapshot, pid, starttime, sid, expected_argv0, expected_digest, port = sys.argv[1:]
+try:
+    leader = (int(pid), int(starttime), int(sid))
+except ValueError:
+    raise SystemExit("invalid port-forward leader identity")
+if not expected_argv0 or not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+    raise SystemExit("invalid expected port-forward identity")
+members = json.load(open(snapshot, encoding="utf-8"))
+if not isinstance(members, list) or len(members) != 1:
+    raise SystemExit("port-forward process session has unexpected descendants")
+member = members[0]
+if set(member) != {"pid", "starttime", "ppid", "pgid", "sid", "exe_sha256", "argv"}:
+    raise SystemExit("invalid port-forward session snapshot")
+if (member["pid"], member["starttime"], member["sid"]) != leader:
+    raise SystemExit("port-forward process session identity changed")
+if member["exe_sha256"] != expected_digest:
+    raise SystemExit("port-forward executable identity changed")
+expected = [expected_argv0, "port-forward", "-n", "kourier-system", "svc/kourier-internal", f"{port}:80"]
+if member["argv"] != expected:
+    raise SystemExit("port-forward process session does not match its recorded command")
 PY
 }
 
@@ -1755,9 +1835,10 @@ PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); p
 PF_PENDING_STATUS=
 trap 'PF_PENDING_STATUS=${PF_PENDING_STATUS:-130}' INT
 trap 'PF_PENDING_STATUS=${PF_PENDING_STATUS:-143}' TERM
+lane13_resolve_port_forward
 set +e
 launch_user_recorded_process_group "$WORK/portforward.pid" "$WORK/portforward.log" \
-    kubectl port-forward -n kourier-system svc/kourier-internal "$PORT:80"
+    "$PF_COMMAND" port-forward -n kourier-system svc/kourier-internal "$PORT:80"
 pf_launch_status=$?
 set -e
 PF_LAUNCH_PID=$USER_PROCESS_LAUNCH_PID
@@ -1782,19 +1863,8 @@ done
 snapshot_user_process_session "$PF_SID" > "$WORK/portforward.group.before.json"
 PF_GROUP_SNAPSHOT="$WORK/portforward.group.before.json"
 PF_GROUP_SNAPSHOT_AFTER="$WORK/portforward.group.after.json"
-python3 - "$PF_GROUP_SNAPSHOT" "$PF_PID" "$PF_STARTTIME" "$PF_SID" "$PORT" <<'PY'
-import json
-import sys
-
-members = json.load(open(sys.argv[1], encoding="utf-8"))
-expected = ["kubectl", "port-forward", "-n", "kourier-system", "svc/kourier-internal", f"{sys.argv[5]}:80"]
-leader = (int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]))
-if len(members) != 1:
-    raise SystemExit("port-forward process session has unexpected descendants")
-member = members[0]
-if (member["pid"], member["starttime"], member["sid"]) != leader or member["argv"] != expected:
-    raise SystemExit("port-forward process session does not match its recorded command")
-PY
+lane13_validate_port_forward_snapshot "$PF_GROUP_SNAPSHOT" "$PF_PID" "$PF_STARTTIME" \
+    "$PF_SID" "$PF_EXPECTED_ARGV0" "$PF_EXPECTED_EXE_SHA256" "$PORT"
 process_matches_starttime "$PF_PID" "$PF_STARTTIME" \
     || { echo "port-forward identity changed before request" >&2; exit 1; }
 curl -fsS -H "Host: $HOST" "http://127.0.0.1:$PORT/" --max-time 60

@@ -9,7 +9,7 @@ use crate::discovery::attribution;
 use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
     ManifestStaleReason, PinnedObjectId, PinnedObjects, PinnedTimingKey, ReconciledModule,
-    StaleManifestObject, bind_scanned_modules, canonicalize_scanned_overlays,
+    StaleManifestObject, bind_scanned_modules, canonicalize_scanned_overlays, open_view_object,
     pin_manifest_objects_deferred_in_views, pin_scanned_view_objects, retained_object_key,
     target_paths_equal, view_object_key,
 };
@@ -36,6 +36,8 @@ use p11scope_manifest::maps::{
     Device, MapEntry, MappedPath, ObjectKey, Resolved, parse_maps, resolve,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 
 pub struct Engine {
@@ -3729,6 +3731,7 @@ fn usable_path(maps: &[MapEntry], mapping: &MapEntry) -> Option<PathBuf> {
     }
 }
 
+#[cfg(test)]
 fn exact_executable_mapping(
     maps: &[MapEntry],
     identity: ObjectKey,
@@ -3736,6 +3739,209 @@ fn exact_executable_mapping(
     maps.iter()
         .filter(|mapping| mapping.permissions[2] == b'x' && ObjectKey::of(mapping) == identity)
         .find_map(|mapping| usable_path(maps, mapping).map(|path| (mapping, path)))
+}
+
+const ELF_HEADER_BYTES: usize = 64;
+const ELF_PROGRAM_HEADER_BYTES: usize = 56;
+const MAX_PROGRAM_HEADER_TABLE_BYTES: usize = 64 * 1024;
+const MAX_INTERPRETER_BYTES: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileSnapshot {
+    device: u64,
+    inode: u64,
+    size: u64,
+    ctime: i64,
+    ctime_ns: i64,
+}
+
+impl FileSnapshot {
+    fn read(file: &std::fs::File) -> std::result::Result<Self, String> {
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("cannot stat retained executable: {error}"))?;
+        if !metadata.file_type().is_file() {
+            return Err("retained executable is not a regular file".into());
+        }
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            ctime: metadata.ctime(),
+            ctime_ns: metadata.ctime_nsec(),
+        })
+    }
+}
+
+fn read_exact_at(
+    file: &std::fs::File,
+    bytes: &mut [u8],
+    offset: u64,
+) -> std::result::Result<(), String> {
+    let mut done = 0usize;
+    while done < bytes.len() {
+        let at = offset
+            .checked_add(done as u64)
+            .ok_or_else(|| "bounded ELF read offset overflowed".to_string())?;
+        let read = file
+            .read_at(&mut bytes[done..], at)
+            .map_err(|error| format!("bounded ELF pread failed: {error}"))?;
+        if read == 0 {
+            return Err("bounded ELF pread ended before the requested bytes".into());
+        }
+        done += read;
+    }
+    Ok(())
+}
+
+fn little_u16(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes(bytes.try_into().expect("a two-byte ELF field"))
+}
+
+fn little_u32(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(bytes.try_into().expect("a four-byte ELF field"))
+}
+
+fn little_u64(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes(bytes.try_into().expect("an eight-byte ELF field"))
+}
+
+fn read_bounded_interpreter(
+    file: &std::fs::File,
+    size: u64,
+) -> std::result::Result<Option<PathBuf>, String> {
+    let mut header = [0u8; ELF_HEADER_BYTES];
+    read_exact_at(file, &mut header, 0)?;
+    if &header[..4] != b"\x7fELF"
+        || header[4] != 2
+        || header[5] != 1
+        || header[6] != 1
+        || !matches!(little_u16(&header[16..18]), 2 | 3)
+        || little_u16(&header[18..20]) != 62
+        || little_u32(&header[20..24]) != 1
+        || little_u16(&header[52..54]) as usize != ELF_HEADER_BYTES
+        || little_u16(&header[54..56]) as usize != ELF_PROGRAM_HEADER_BYTES
+    {
+        return Err("retained executable is not a supported x86-64 ELF".into());
+    }
+    let table_offset = little_u64(&header[32..40]);
+    let count = little_u16(&header[56..58]);
+    if count == 0 || count == 0xffff {
+        return Err("retained executable has no bounded ordinary program-header table".into());
+    }
+    let table_len = usize::from(count)
+        .checked_mul(ELF_PROGRAM_HEADER_BYTES)
+        .filter(|length| *length <= MAX_PROGRAM_HEADER_TABLE_BYTES)
+        .ok_or_else(|| "retained executable program-header table is too large".to_string())?;
+    table_offset
+        .checked_add(table_len as u64)
+        .filter(|end| *end <= size)
+        .ok_or_else(|| "retained executable program-header table is out of bounds".to_string())?;
+    let mut table = vec![0u8; table_len];
+    read_exact_at(file, &mut table, table_offset)?;
+
+    let mut interpreter = None;
+    for program in table.chunks_exact(ELF_PROGRAM_HEADER_BYTES) {
+        if little_u32(&program[..4]) != 3 {
+            continue;
+        }
+        if interpreter.is_some() {
+            return Err("retained executable has more than one PT_INTERP".into());
+        }
+        let offset = little_u64(&program[8..16]);
+        let length: usize = little_u64(&program[32..40])
+            .try_into()
+            .map_err(|_| "PT_INTERP length does not fit usize".to_string())?;
+        if !(2..=MAX_INTERPRETER_BYTES).contains(&length) {
+            return Err("PT_INTERP length is outside the bounded range".into());
+        }
+        offset
+            .checked_add(length as u64)
+            .filter(|end| *end <= size)
+            .ok_or_else(|| "PT_INTERP range is out of bounds".to_string())?;
+        let mut bytes = vec![0u8; length];
+        read_exact_at(file, &mut bytes, offset)?;
+        let Some(path) = bytes.strip_suffix(&[0]) else {
+            return Err("PT_INTERP is not terminated by one trailing NUL".into());
+        };
+        if path.is_empty() || path.contains(&0) || path[0] != b'/' {
+            return Err("PT_INTERP is not one nonempty absolute path".into());
+        }
+        interpreter = Some(PathBuf::from(std::ffi::OsStr::from_bytes(path)));
+    }
+    Ok(interpreter)
+}
+
+fn executable_map_snapshot(
+    maps: &[MapEntry],
+    identity: ObjectKey,
+) -> std::result::Result<Vec<(MapEntry, PathBuf)>, String> {
+    let mappings: Vec<_> = maps
+        .iter()
+        .filter(|mapping| mapping.permissions[2] == b'x' && ObjectKey::of(mapping) == identity)
+        .filter_map(|mapping| usable_path(maps, mapping).map(|path| (mapping.clone(), path)))
+        .collect();
+    if mappings.is_empty() {
+        return Err("retained executable has no usable executable mapping".into());
+    }
+    Ok(mappings)
+}
+
+fn loader_map_snapshot(
+    maps: &[MapEntry],
+    identity: ObjectKey,
+) -> std::result::Result<(PathBuf, Vec<MapEntry>), String> {
+    let mut by_path: BTreeMap<PathBuf, Vec<MapEntry>> = BTreeMap::new();
+    for mapping in maps
+        .iter()
+        .filter(|mapping| mapping.permissions[2] == b'x' && ObjectKey::of(mapping) == identity)
+    {
+        if let Some(path) = usable_path(maps, mapping) {
+            by_path.entry(path).or_default().push(mapping.clone());
+        }
+    }
+    let mut by_path = by_path.into_iter();
+    let Some(loader) = by_path.next() else {
+        return Err("PT_INTERP has no usable executable loader mapping".into());
+    };
+    if by_path.next().is_some() {
+        return Err("PT_INTERP mapping identity has more than one usable path".into());
+    }
+    Ok(loader)
+}
+
+fn unique_mapping_for_offset(
+    mappings: &[MapEntry],
+    offset: u64,
+) -> std::result::Result<MapEntry, String> {
+    let mut matches = mappings.iter().filter(|mapping| {
+        let len = mapping.end.saturating_sub(mapping.start);
+        (mapping.file_offset..mapping.file_offset.saturating_add(len)).contains(&offset)
+    });
+    let Some(mapping) = matches.next() else {
+        return Err("offset does not resolve inside an exact executable mapping".into());
+    };
+    if matches.next().is_some() {
+        return Err("offset resolves inside more than one exact executable mapping".into());
+    }
+    Ok(mapping.clone())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoaderAuthority {
+    executable_file: FileSnapshot,
+    executable_key: ObjectKey,
+    executable_maps: Vec<(MapEntry, PathBuf)>,
+    interpreter: PathBuf,
+    interpreter_file: FileSnapshot,
+    loader_key: ObjectKey,
+    loader_path: PathBuf,
+    loader_maps: Vec<MapEntry>,
+}
+
+struct LoaderLocator {
+    authority: LoaderAuthority,
+    maps: Vec<MapEntry>,
 }
 
 fn candidate_identity_is_complete(
@@ -4517,6 +4723,78 @@ impl Engine {
             .run_while_same(|| std::fs::read(format!("/proc/{pid}/maps")))
             .map_err(anyhow::Error::msg)??;
         parse_maps(&bytes).map_err(anyhow::Error::msg)
+    }
+
+    fn loader_locator(view: &ProcessView) -> Result<Option<LoaderLocator>> {
+        let pid = view.pid();
+        let before_maps = Self::read_maps(view)?;
+        let executable_path = PathBuf::from(format!("/proc/{pid}/exe"));
+        let before_executable =
+            view_object_key(view, &executable_path).map_err(anyhow::Error::msg)?;
+        let executable = view
+            .run_while_same(|| std::fs::File::open(&executable_path))
+            .map_err(anyhow::Error::msg)??;
+        let before_file = FileSnapshot::read(&executable).map_err(anyhow::Error::msg)?;
+        let interpreter =
+            read_bounded_interpreter(&executable, before_file.size).map_err(anyhow::Error::msg)?;
+        let after_file = FileSnapshot::read(&executable).map_err(anyhow::Error::msg)?;
+        if before_file != after_file {
+            bail!("retained executable changed during bounded PT_INTERP discovery");
+        }
+        let retained_executable =
+            retained_object_key(view, &executable).map_err(anyhow::Error::msg)?;
+
+        let interpreter_file = if let Some(interpreter) = &interpreter {
+            let path = PathBuf::from(format!("/proc/{pid}/root")).join(
+                interpreter
+                    .strip_prefix("/")
+                    .expect("bounded PT_INTERP paths are absolute"),
+            );
+            let (file, key) = open_view_object(view, &path).map_err(anyhow::Error::msg)?;
+            let snapshot = FileSnapshot::read(&file).map_err(anyhow::Error::msg)?;
+            Some((snapshot, key))
+        } else {
+            None
+        };
+
+        let after_maps = Self::read_maps(view)?;
+        let after_executable =
+            view_object_key(view, &executable_path).map_err(anyhow::Error::msg)?;
+        if before_executable != retained_executable || retained_executable != after_executable {
+            bail!("retained executable identity changed during PT_INTERP discovery");
+        }
+        let before_executable_maps = executable_map_snapshot(&before_maps, retained_executable)
+            .map_err(anyhow::Error::msg)?;
+        let after_executable_maps = executable_map_snapshot(&after_maps, retained_executable)
+            .map_err(anyhow::Error::msg)?;
+        if before_executable_maps != after_executable_maps {
+            bail!("retained executable mappings changed during PT_INTERP discovery");
+        }
+        let Some(interpreter) = interpreter else {
+            return Ok(None);
+        };
+        let (interpreter_file, loader_key) =
+            interpreter_file.expect("a PT_INTERP snapshot has its retained file identity");
+        let (before_loader_path, before_loader_maps) =
+            loader_map_snapshot(&before_maps, loader_key).map_err(anyhow::Error::msg)?;
+        let (loader_path, loader_maps) =
+            loader_map_snapshot(&after_maps, loader_key).map_err(anyhow::Error::msg)?;
+        if before_loader_path != loader_path || before_loader_maps != loader_maps {
+            bail!("retained loader mappings changed during PT_INTERP discovery");
+        }
+        Ok(Some(LoaderLocator {
+            authority: LoaderAuthority {
+                executable_file: before_file,
+                executable_key: retained_executable,
+                executable_maps: after_executable_maps,
+                interpreter,
+                interpreter_file,
+                loader_key,
+                loader_path,
+                loader_maps,
+            },
+            maps: after_maps,
+        }))
     }
 
     fn collect_discovery_records(
@@ -5655,84 +5933,23 @@ impl Engine {
         if !self.loader_registry.ids_for_view(view_id).is_empty() {
             return Ok(false);
         }
-        let maps = Self::read_maps(&self.views[position])?;
         let pid = self.views[position].pid();
-        let executable_identity = view_object_key(
+        let Some(locator) = Self::loader_locator(&self.views[position])? else {
+            return Ok(false);
+        };
+        let loader_path = locator.authority.loader_path.clone();
+        let loader_module = mapped_object(
             &self.views[position],
-            Path::new(&format!("/proc/{pid}/exe")),
-        )
-        .map_err(anyhow::Error::msg)?;
-        let Some((executable_mapping, executable_path)) =
-            exact_executable_mapping(&maps, executable_identity)
-        else {
-            self.mark_partial(
-                "live loader arming",
-                "the retained executable had no fresh matching file-backed executable mapping",
-            );
-            return Ok(false);
-        };
-        let executable_module =
-            mapped_object(&self.views[position], executable_mapping, &executable_path);
-        let (executable_pins, mut skipped) = pin_scanned_view_objects(
-            &self.views[position],
-            std::slice::from_ref(&executable_module),
-            &mut self.budget,
-        )
-        .map_err(anyhow::Error::msg)?;
-        let Some(executable_id) = executable_pins.id_for_scanned(
-            &executable_module,
-            executable_module.key,
-            &executable_module.path,
-        ) else {
-            self.mark_partial(
-                "live loader arming",
-                "the retained executable could not be pinned exactly",
-            );
-            return Ok(false);
-        };
-        let executable_snapshot = ElfSnapshot::read(
-            executable_pins
-                .file_for(executable_id)
-                .expect("the just-pinned executable has its retained file"),
-        )
-        .map_err(anyhow::Error::msg)?;
-        let Some(interpreter) = executable_snapshot.interpreter() else {
-            return Ok(false);
-        };
-        let interpreter = PathBuf::from(
-            std::str::from_utf8(interpreter)
-                .map_err(|_| anyhow!("retained executable PT_INTERP is not UTF-8"))?,
+            &locator.authority.loader_maps[0],
+            &loader_path,
         );
-        if !interpreter.is_absolute() {
-            self.mark_partial(
-                "live loader arming",
-                "the retained executable PT_INTERP was not an absolute path",
-            );
-            return Ok(false);
-        }
-        let loader_identity = view_object_key(
-            &self.views[position],
-            Path::new(&format!("/proc/{}/root{}", pid, interpreter.display())),
-        )
-        .map_err(anyhow::Error::msg)?;
-        let Some((first_loader_mapping, loader_path)) =
-            exact_executable_mapping(&maps, loader_identity)
-        else {
-            self.mark_partial(
-                "live loader arming",
-                "PT_INTERP had no fresh matching file-backed executable loader mapping",
-            );
-            return Ok(false);
-        };
-        let loader_module =
-            mapped_object(&self.views[position], first_loader_mapping, &loader_path);
         let (loader_pins, loader_skips) = pin_scanned_view_objects(
             &self.views[position],
             std::slice::from_ref(&loader_module),
             &mut self.budget,
         )
         .map_err(anyhow::Error::msg)?;
-        skipped.extend(loader_skips);
+        let skipped = loader_skips;
         let Some(local_loader_id) =
             loader_pins.id_for_scanned(&loader_module, loader_module.key, &loader_module.path)
         else {
@@ -5748,6 +5965,19 @@ impl Engine {
                 .expect("the just-pinned loader has its retained file"),
         )
         .map_err(anyhow::Error::msg)?;
+        let pinned_loader_file = FileSnapshot::read(
+            loader_pins
+                .file_for(local_loader_id)
+                .expect("the just-pinned loader has its retained file"),
+        )
+        .map_err(anyhow::Error::msg)?;
+        if pinned_loader_file != locator.authority.interpreter_file {
+            self.mark_partial(
+                "live loader arming",
+                "the mapped loader did not match the retained PT_INTERP target",
+            );
+            return Ok(false);
+        }
         let Some(hook) = loader_snapshot
             .defined_symbol("_dl_debug_state")
             .map_err(anyhow::Error::msg)?
@@ -5759,21 +5989,14 @@ impl Engine {
             );
             return Ok(false);
         };
-        let Some(loader_mapping) = maps.iter().find(|mapping| {
-            if ObjectKey::of(mapping) != loader_identity || mapping.permissions[2] != b'x' {
-                return false;
-            }
-            let len = mapping.end.saturating_sub(mapping.start);
-            (mapping.file_offset..mapping.file_offset.saturating_add(len))
-                .contains(&hook.file_offset)
-        }) else {
-            self.mark_partial(
-                "live loader arming",
-                "_dl_debug_state did not resolve inside the exact executable loader mapping",
-            );
-            return Ok(false);
-        };
-        let loader_mapping = loader_mapping.clone();
+        let loader_mapping =
+            match unique_mapping_for_offset(&locator.authority.loader_maps, hook.file_offset) {
+                Ok(mapping) => mapping,
+                Err(reason) => {
+                    self.mark_partial("live loader arming", &reason);
+                    return Ok(false);
+                }
+            };
         let state = loader_snapshot
             .defined_symbol("_r_debug")
             .map_err(anyhow::Error::msg)?;
@@ -5828,8 +6051,12 @@ impl Engine {
             || {
                 self.views[position].still_the_same()
                     && self.pinned.check_unchanged().unwrap_or(false)
-                    && Self::read_maps(&self.views[position])
-                        .is_ok_and(|maps| maps.contains(&loader_mapping))
+                    && Self::loader_locator(&self.views[position]).is_ok_and(|current| {
+                        current.is_some_and(|current| {
+                            current.authority == locator.authority
+                                && current.maps.contains(&loader_mapping)
+                        })
+                    })
             },
             || {
                 session.attach_dynamic_loader(
@@ -8310,7 +8537,6 @@ mod tests {
     use std::cell::Cell;
     use std::io::Write as _;
     use std::os::fd::AsRawFd as _;
-    use std::os::unix::fs::MetadataExt as _;
     use std::path::PathBuf;
 
     #[test]
@@ -9752,10 +9978,10 @@ mod tests {
     /// Task 9.2 defect A. An ordinary dynamically linked target binds its live
     /// loader context through the real arming path, so no capture publishes a
     /// `discovery unavailable` skip for a loader that is plainly there. The
-    /// executable and its PT_INTERP are located by matching `/proc/<pid>/maps`
-    /// identities, and `stat`'s `st_dev` is not that representation: on a btrfs
-    /// rootfs it is the subvolume's anonymous device, so every comparison
-    /// failed and every capture on such a host reported a false unavailable.
+    /// loader is located by reading only the retained executable's bounded
+    /// PT_INTERP metadata and matching `/proc/<pid>/maps`; `stat`'s `st_dev` is not
+    /// that representation: on a btrfs rootfs it is the subvolume's anonymous device,
+    /// so every comparison failed and every capture on such a host reported unavailable.
     #[test]
     fn an_ordinary_dynamic_target_binds_its_live_loader_context() {
         let mut child = std::process::Command::new("sleep")
@@ -9791,6 +10017,59 @@ mod tests {
                 .iter()
                 .all(|skip| render::capture_skipped_out(skip).reason != "discovery unavailable"),
             "an available loader never publishes a refused discovery skip: {skips:?}"
+        );
+    }
+
+    #[test]
+    fn two_gib_dynamic_executable_arms_without_hashing_the_executable() {
+        let mut source = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let source_path = std::fs::read_link(format!("/proc/{}/exe", source.id())).unwrap();
+        source.kill().unwrap();
+        source.wait().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("large-sleep");
+        std::fs::copy(source_path, &executable).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&executable)
+            .unwrap()
+            .set_len(2 * 1024 * 1024 * 1024 + 11 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&executable).unwrap().len(),
+            2 * 1024 * 1024 * 1024 + 11 * 1024 * 1024
+        );
+        let mut child = std::process::Command::new(&executable)
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let view = ProcessView::open(ProcessViewId(0), child.id()).unwrap();
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Pid(child.id());
+        engine.views.push(view);
+
+        let mut session = ScriptedSession::default();
+        let armed = engine.arm_loader_or_partial(
+            0,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        armed.expect("a large dynamic executable locates its separately bounded loader");
+
+        let skips = engine.counters.object_skips.clone();
+        let aggregate = engine.loader_discovery();
+        assert_eq!(aggregate.strategies.debug_state_every_hit, 1, "{skips:?}");
+        assert_eq!(aggregate.strategies.unavailable, 0, "{skips:?}");
+        assert!(
+            skips.iter().all(|skip| !skip.reason.contains("too_large")),
+            "the executable itself is never hashed: {skips:?}"
         );
     }
 
@@ -12078,6 +12357,118 @@ mod tests {
         assert_eq!(mapping.start, 0x3000, "inode alone is not full identity");
         assert_eq!(path, mapped, "pin through the mapping's usable alias");
         assert_ne!(path, interpreter, "PT_INTERP spelling is not map authority");
+    }
+
+    fn bounded_elf(interpreters: &[&[u8]]) -> Vec<u8> {
+        let count = interpreters.len().max(1);
+        let table_len = count * ELF_PROGRAM_HEADER_BYTES;
+        let mut bytes = vec![0u8; ELF_HEADER_BYTES + table_len];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&3u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[32..40].copy_from_slice(&(ELF_HEADER_BYTES as u64).to_le_bytes());
+        bytes[52..54].copy_from_slice(&(ELF_HEADER_BYTES as u16).to_le_bytes());
+        bytes[54..56].copy_from_slice(&(ELF_PROGRAM_HEADER_BYTES as u16).to_le_bytes());
+        bytes[56..58].copy_from_slice(&(count as u16).to_le_bytes());
+        if interpreters.is_empty() {
+            bytes[ELF_HEADER_BYTES..ELF_HEADER_BYTES + 4].copy_from_slice(&1u32.to_le_bytes());
+            return bytes;
+        }
+        for (index, interpreter) in interpreters.iter().enumerate() {
+            let program = ELF_HEADER_BYTES + index * ELF_PROGRAM_HEADER_BYTES;
+            let offset = bytes.len() as u64;
+            bytes[program..program + 4].copy_from_slice(&3u32.to_le_bytes());
+            bytes[program + 8..program + 16].copy_from_slice(&offset.to_le_bytes());
+            bytes[program + 32..program + 40]
+                .copy_from_slice(&(interpreter.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(interpreter);
+        }
+        bytes
+    }
+
+    fn bounded_interpreter(bytes: &[u8]) -> std::result::Result<Option<PathBuf>, String> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("executable");
+        std::fs::write(&path, bytes).unwrap();
+        let file = std::fs::File::open(path).unwrap();
+        read_bounded_interpreter(&file, bytes.len() as u64)
+    }
+
+    #[test]
+    fn bounded_pt_interp_reader_rejects_malformed_or_unbounded_elf() {
+        assert_eq!(
+            bounded_interpreter(&bounded_elf(&[b"/lib/ld.so\0"])),
+            Ok(Some(PathBuf::from("/lib/ld.so")))
+        );
+        assert_eq!(bounded_interpreter(&bounded_elf(&[])), Ok(None));
+        for interpreter in [
+            &b"relative\0"[..],
+            &b"/lib/ld.so"[..],
+            &b"/lib/ld\0.so\0"[..],
+            &b"\0"[..],
+        ] {
+            assert!(bounded_interpreter(&bounded_elf(&[interpreter])).is_err());
+        }
+        assert!(bounded_interpreter(&bounded_elf(&[b"/a\0", b"/b\0"])).is_err());
+        let oversized = vec![b'a'; MAX_INTERPRETER_BYTES + 1];
+        assert!(bounded_interpreter(&bounded_elf(&[&oversized])).is_err());
+
+        let mut malformed = bounded_elf(&[b"/lib/ld.so\0"]);
+        for index in [4usize, 5, 18, 52, 54] {
+            let saved = malformed[index];
+            malformed[index] = 0;
+            assert!(
+                bounded_interpreter(&malformed).is_err(),
+                "accepted byte {index}"
+            );
+            malformed[index] = saved;
+        }
+        malformed[56..58].copy_from_slice(&0xffffu16.to_le_bytes());
+        assert!(bounded_interpreter(&malformed).is_err());
+
+        let mut out_of_bounds = bounded_elf(&[b"/lib/ld.so\0"]);
+        out_of_bounds[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(bounded_interpreter(&out_of_bounds).is_err());
+        let mut overflowing_interp = bounded_elf(&[b"/lib/ld.so\0"]);
+        overflowing_interp[ELF_HEADER_BYTES + 8..ELF_HEADER_BYTES + 16]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(bounded_interpreter(&overflowing_interp).is_err());
+    }
+
+    #[test]
+    fn loader_mapping_selection_is_path_qualified_and_offset_exact() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 20,
+        };
+        let mapping = |start, offset, path: &[u8]| MapEntry {
+            start,
+            end: start + 0x1000,
+            file_offset: offset,
+            permissions: *b"r-xp",
+            device: key.device,
+            inode: key.inode,
+            raw_path: Some(path.to_vec()),
+        };
+        let maps = vec![
+            mapping(0x700000, 0, b"/lib/ld.so"),
+            mapping(0x702000, 0x2000, b"/lib/ld.so"),
+        ];
+        let (path, executable) = loader_map_snapshot(&maps, key).unwrap();
+        assert_eq!(path, PathBuf::from("/lib/ld.so"));
+        assert_eq!(
+            unique_mapping_for_offset(&executable, 0x2100).unwrap(),
+            maps[1]
+        );
+
+        let mut collision = maps.clone();
+        collision.push(mapping(0x800000, 0, b"/other/ld.so"));
+        assert!(loader_map_snapshot(&collision, key).is_err());
+        assert!(unique_mapping_for_offset(&executable, 0x5000).is_err());
     }
 
     #[test]

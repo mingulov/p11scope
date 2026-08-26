@@ -102,28 +102,38 @@ wording remains reserved for Task 10. This amendment changes no design spec,
 production Rust/BPF/privacy/schema/allowlist, or procfs/mmap/eBPF fallback
 behavior.
 
-**Owned-run timing-proof projection binding (2026-08-27, Task 4):** Across
-owned-run Step 2 and Step 3, every successful owned run requires exactly one
-public `{"name":"discovery subject","reason":"discovery unavailable"}`
+**Owned-run timing-proof projection binding (2026-08-27):** Across the Task 9
+Step 2 and Step 3 owned-run campaigns, every successful owned run requires
+exactly one sanitized public
+`{"name":"discovery subject","reason":"discovery unavailable"}`
 timing-proof projection, authorized only by the exact frozen owned-run context,
 expected row cardinality, and full lane oracle. Zero, a second, or an
 outside-context projection is `NON-PASS`. This global one-record rule is
 distinct from the Task 4/9.2d lane cardinalities below; later campaigns retain
-this rule but do not inherit the six/two counts.
+this global rule but do not inherit the six/two counts.
 
 **Task 4/9.2d owned-run cardinalities (2026-08-27):** For this gate round only,
 Lane 02 has exactly six attempts, `(initial-set|dlopen) × (never|auto|always)`;
+each Cartesian tuple is one distinct invocation and one row, and ungated
+controls are excluded. Positive function counts equal the tracked
+`spike/expected.txt` plus exactly one bootstrap `C_GetFunctionList`, matching
+the current `validate_clean_metrics` count relation. A successful paused row
+uses `sigstop` with `pause_attempts = pause_confirmed >= 1` and
+`pause_partial = 0`.
 Lane 16 has exactly two independent shape checks, one `never` and one `auto`.
 Each Lane 16 row must independently exit zero with 68 table entries, 68 slots,
-136/136 probes, exactly one authorized timing-proof projection, zero event or
-discovery loss, ambiguity, in-flight work, residue, and its lane-specific
-frozen oracle; `never` is `none/0/0/0`, while `auto` is `sigstop` with
+136/136 probes, exactly one authorized sanitized public timing-proof projection,
+zero event loss and zero discovery-loss counters, zero ambiguity, in-flight
+work, and residue. These listed predicates are the complete current Task 4
+shape oracle; no existing checker mode is claimed. The one authorized
+sanitized timing-proof projection is not one of those counters. `never` is
+`none/0/0/0`, while `auto` is `sigstop` with
 `pause_attempts = pause_confirmed >= 1` and `pause_partial = 0`. Lane 02's
 deterministic fixture counts do not apply. No historical workload total
 (including `200000`), `G3`, `136175`, call, timing, median, or performance
 threshold is an acceptance predicate. An `always` safe refusal is
-containment-correct, but its row and lane are `NON-PASS`, produces no capture
-document, and still requires complete cleanup/quiescence evidence.
+containment-correct, but its row and lane produce no capture document and are
+`NON-PASS`; complete cleanup/quiescence evidence is still required.
 
 ## Global constraints
 

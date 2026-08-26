@@ -4378,6 +4378,56 @@ fn unbounded_gate_match_accepts_a_live_only_capability_fixture() {
 }
 
 #[test]
+fn previous_gate_contract_accepts_live_loop_and_ci_substring_mutations() {
+    let duplicate_live = [
+        "for gate in scripts/verify-inspect-doctor.sh scripts/verify-capability-tier.sh; do",
+        "    \"$gate\"",
+        "done",
+        "echo \"=== scripts/verify-capability-tier.sh ===\"",
+        "scripts/verify-capability-tier.sh",
+        "echo \"=== gates: ALL OK ===\"",
+    ]
+    .join("\n");
+    let old_live_section = between(
+        &duplicate_live,
+        "    \"$gate\"\ndone\n",
+        "echo \"=== gates: ALL OK ===\"",
+    );
+    assert_eq!(
+        duplicate_live
+            .lines()
+            .filter(|line| *line == "scripts/verify-capability-tier.sh")
+            .count(),
+        1
+    );
+    assert_eq!(
+        old_live_section
+            .lines()
+            .filter(|line| *line == "scripts/verify-capability-tier.sh")
+            .count(),
+        1
+    );
+    let live_loop = between(&duplicate_live, "for gate in ", "done");
+    assert!(live_loop.contains("scripts/verify-capability-tier.sh"));
+
+    let deceptive_ci = [
+        "      # - run: scripts/verify-capability-tier.sh --self-test",
+        "      - run: scripts/verify-capability-tier.sh --self-test-extra",
+    ]
+    .join("\n");
+    let marker = "      - run: scripts/verify-capability-tier.sh --self-test";
+    assert!(deceptive_ci.contains(marker));
+    assert_eq!(
+        deceptive_ci
+            .lines()
+            .map(str::trim)
+            .filter(|line| *line == "- run: scripts/verify-capability-tier.sh --self-test")
+            .count(),
+        0
+    );
+}
+
+#[test]
 fn every_gate_script_self_tests_its_own_validator() {
     let gates = read("scripts/gates.sh");
     let ci = read(".github/workflows/ci.yml");
@@ -4385,6 +4435,16 @@ fn every_gate_script_self_tests_its_own_validator() {
         &gates,
         "echo \"=== gate validator self-tests ===\"\nfor gate in ",
         "done\npython3 scripts/check-live-discovery-evidence.py --self-test",
+    );
+    let live_gate_loop = between(
+        &gates,
+        "# if the CLI cannot even read a target, nothing below is worth waiting for.\nfor gate in ",
+        "done\n",
+    );
+    let ci_self_test_block = between(
+        &ci,
+        "      # Unprivileged validator self-tests:",
+        "      - run: python3 scripts/check-live-discovery-evidence.py --self-test",
     );
     for script in [
         "scripts/verify-inspect-doctor.sh",
@@ -4402,15 +4462,23 @@ fn every_gate_script_self_tests_its_own_validator() {
             self_test_loop.contains(script),
             "{script} is not wired into scripts/gates.sh"
         );
+        let expected_ci_line = format!("- run: {script} --self-test");
         assert!(
-            ci.contains(&format!("{script} --self-test")),
-            "{script} --self-test is not wired into CI"
+            ci_self_test_block
+                .lines()
+                .map(str::trim)
+                .any(|line| line == expected_ci_line),
+            "{script} --self-test is not wired into CI's unprivileged block"
         );
     }
     assert!(
         self_test_loop.contains("scripts/verify-capability-tier.sh; do")
             && self_test_loop.contains("\"$gate\" --self-test"),
         "the capability validator is not in the bounded gates.sh self-test loop"
+    );
+    assert!(
+        !live_gate_loop.contains("scripts/verify-capability-tier.sh"),
+        "the capability validator must not be added to the existing live gate loop"
     );
     let live_section = between(
         &gates,
@@ -4431,14 +4499,13 @@ fn every_gate_script_self_tests_its_own_validator() {
         1,
         "the standalone live capability call must follow the live gate loop"
     );
-    let ci_self_test_block = between(
-        &ci,
-        "      # Unprivileged validator self-tests:",
-        "      - run: python3 scripts/check-live-discovery-evidence.py --self-test",
-    );
-    let ci_capability_self_test = "      - run: scripts/verify-capability-tier.sh --self-test";
+    let ci_capability_self_test = "- run: scripts/verify-capability-tier.sh --self-test";
     assert_eq!(
-        ci.matches(ci_capability_self_test).count(),
+        ci_self_test_block
+            .lines()
+            .map(str::trim)
+            .filter(|line| *line == ci_capability_self_test)
+            .count(),
         1,
         "CI must have exactly one active capability self-test"
     );

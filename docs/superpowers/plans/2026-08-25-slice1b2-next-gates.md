@@ -4,7 +4,7 @@
 
 **Goal:** Land the already-reviewed Slice 1b-2 fix6 documentation/validator delta, close the remaining gate-contract and runtime evidence gaps, and reach a fresh, independently reviewed runtime campaign without overstating UNRUN or artifact-only evidence.
 
-**Architecture:** Keep production Rust/BPF/privacy/schema behavior frozen during the next gate round. First land the exact five-file reviewed delta at the current implementation tip. Then express the already-specified lane-13 contract directly—manifest-only discovery plus exactly one shared-overlay uncertainty and zero unavailable-discovery records—and run fresh current-tip evidence with durable resolved-input identities for the remaining applicable Task 4 lanes. Lane 13 instead uses its receipt-bound attempt-6 pre-r3 history and runs exactly once as the frozen-candidate 9.2d negative control; no current-tip Lane 13 evidence is sought. Historical A/B attribution remains an optional diagnostic, not a prerequisite for present product acceptance. Wire the capability-tier validator into the existing gate/CI contract, obtain an independent Sol review, and only then create a new frozen-input root for the serial 9.2d campaign. VM campaign work remains a separate privileged/non-production stage.
+**Architecture:** Keep production Rust/BPF/privacy/schema behavior frozen during the next gate round. First land the exact five-file reviewed delta at the current implementation tip. Then express the already-specified Lane 13 contract directly—manifest-only discovery plus exactly one shared-overlay uncertainty and zero unavailable-discovery records—and run fresh current-tip evidence with durable resolved-input identities for the remaining applicable Task 4 lanes. The zero-unavailable PASS rule is Lane 13-only and applies only to a topology proposed for supported acceptance. Lane 13 instead uses its receipt-bound attempt-6 pre-r3 history and runs exactly once as the frozen-candidate 9.2d negative control; no current-tip Lane 13 evidence is sought. Historical A/B attribution remains an optional diagnostic, not a prerequisite for present product acceptance. Wire the capability-tier validator into the existing gate/CI contract, obtain an independent Sol review, and only then create a new frozen-input root for the serial 9.2d campaign. VM campaign work remains a separate privileged/non-production stage.
 
 **Topology scope amendment (2026-08-27, Task 4):** The historical Lane 13
 checker/invocation work is complete at its exact committed identities:
@@ -12,8 +12,9 @@ checker/lifecycle commit `34357b5dda71c670250dd3ab336b29c801120d5b`
 (tree `ae3346e4b8e137f430f010d0937bcf186cfcff39`) and final invocation/contract
 commit `fd3d08ad9bd2f58508eda1ee4a50882c0633d850` (tree
 `0decc4dee974707468b5758107fb055c30d44d7d`). The checker and invocation are
-not re-run or amended here, and their zero-unavailable PASS oracle is unchanged:
-that PASS applies only to a topology proposed for supported acceptance. Retain
+not re-run or amended here, and Lane 13's zero-unavailable PASS oracle is
+unchanged: that Lane 13-only PASS applies only to a topology proposed for
+supported acceptance. Retain
 the evidenced Knative shared-inode capture for the exact preattached provider:
 `136/136` probes and expected cold-pod calls. The dated attempt-6 exclusion is
 bound to immutable input receipt
@@ -133,6 +134,25 @@ cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings
   not submitted to the PASS oracle and does not authorize a product fix or
   oracle widening. Only the supported-acceptance topology's exact
   one-overlay/zero-unavailable shape may pass as `PARTIAL`.
+- [ ] A successful owned run requires exactly one public
+  `{name: "discovery subject", reason: "discovery unavailable"}` timing-proof
+  projection. That projection is authorized only by the exact frozen owned-run
+  context, expected row cardinality, and full lane oracle. Zero, a second, or
+  an outside-context projection is `NON-PASS`; it is not a generic discovery
+  result and cannot be borrowed across lanes.
+- [ ] Lane 02 has exactly six attempts:
+  `initial_set|dlopen × never|auto|always`. A successful row exits zero with
+  68 table entries/slots, 136/136 entry-and-return probes, the exact
+  deterministic fixture counts, zero event loss/ambiguity/in-flight residue,
+  exactly one authorized timing-proof projection, and no unavailable-loader
+  strategy. `never` is `none/0/0/0`; `auto|always` is `sigstop` with
+  `pause_confirmed >= 1` and `pause_partial = 0`. An `always` safe refusal is
+  containment-correct, but its row and the Lane 02 lane are `NON-PASS` and it
+  produces no successful artifact.
+- [ ] Lane 16 has exactly two shape checks: one `never` and one `auto`, with
+  the same exact successful row shape and the corresponding `none` or
+  confirmed `sigstop` pause shape. No `200000`, `G3`, `136175`, median, or
+  performance threshold is an acceptance predicate.
 - [x] Preserve the checker/oracle unchanged while retaining the completed
   receipt-bound attempt-6 node-wide retained-view late-provider result as the
   required `UNSUPPORTED/NON-PASS` negative control: one overlay plus one
@@ -195,7 +215,18 @@ bash scripts/verify-live-discovery-preflight.sh --self-test
 
 ## Task 8: Run 9.2d, then advance only on clean evidence
 
-- [ ] Run the 9.2d sequence serially once: 02, 07, 09, 10, 11, 13, 14, then the lane-16 shape spot check, using the frozen binary/gate commit and a fresh evidence directory. Lane 13 is the required frozen-candidate negative control: the receipt-defined reproduced exact late-provider topology must retain one overlay plus one unavailable and be classified `UNSUPPORTED/NON-PASS`; this expected scoped result is recorded and does not stop otherwise applicable lanes. It is not evaluated by the zero-unavailable PASS oracle, and is not a PASS or unlock condition. Any receipt-input mismatch, different public shape, added gap, or lifecycle/input/cleanup failure stops the campaign as UNRUN/review or NON-PASS as applicable.
+- [ ] Run the 9.2d sequence serially once, with exactly one gate run for each
+  of 02, 07, 09, 10, 11, and 14, exactly six Lane 02 rows, exactly one
+  frozen-candidate Lane 13 negative-control run, and exactly two Lane 16 shape
+  checks (one `never`, one `auto`): 02, 07, 09, 10, 11, 13, 14, 16. Lane 13
+  is the required frozen-candidate negative control: the receipt-defined
+  reproduced exact late-provider topology must retain one overlay plus one
+  unavailable and be classified `UNSUPPORTED/NON-PASS`; this expected scoped
+  result is recorded and does not stop otherwise applicable lanes. It is not
+  evaluated by the Lane 13 zero-unavailable PASS oracle, and is not a PASS or
+  unlock condition. Any receipt-input mismatch, different public shape, added
+  gap, or lifecycle/input/cleanup failure stops the campaign as UNRUN/review or
+  NON-PASS as applicable.
 - [ ] Require one explainable owned-run public skip where specified, healthy `sigstop` pause, no unexplained variance, cleanup/quiescence, and no residue.
 - [ ] Stop on an unexplained row, a second owned skip, candidate changes after freeze, lost quiescence, or cleanup residue. Classify missing infrastructure as UNRUN/blocked.
 - [ ] After an explainable 9.2d result, build the privileged non-production `frozen/preflight-harness` and run the 9.3 campaign: 480 primary plus 40 forced-fallback VM attempts on Jammy 5.15 and Noble 6.8. Missing KVM, sudo, base hashes, or harness is UNRUN/blocked.

@@ -72,8 +72,8 @@ checker/invocation work is complete at checker/lifecycle commit
 `ae3346e4b8e137f430f010d0937bcf186cfcff39`) and final invocation/contract
 commit `fd3d08ad9bd2f58508eda1ee4a50882c0633d850` (tree
 `0decc4dee974707468b5758107fb055c30d44d7d`); no new Task 4 checker or
-invocation run is planned. Its zero-unavailable PASS oracle applies only to a
-topology proposed for supported acceptance. Retain the evidenced Knative
+invocation run is planned. Its zero-unavailable PASS oracle is Lane 13-only and
+applies only to a topology proposed for supported acceptance. Retain the evidenced Knative
 shared-inode capture for the exact preattached provider: `136/136` probes and
 expected cold-pod calls. The completed pre-r3 attempt-6 exclusion is bound to
 immutable receipt
@@ -101,6 +101,18 @@ its live capability gate exited 0 without changing Lane 13. README/usage
 wording remains reserved for Task 10. This amendment changes no design spec,
 production Rust/BPF/privacy/schema/allowlist, or procfs/mmap/eBPF fallback
 behavior.
+
+**Owned-run oracle binding (2026-08-27, Task 4):** A successful owned run
+requires exactly one public
+`{name: "discovery subject", reason: "discovery unavailable"}` timing-proof
+projection, authorized only by the exact frozen owned-run context, expected row
+cardinality, and full lane oracle. Zero, a second, or an outside-context
+projection is `NON-PASS`. Lane 02 has exactly six attempts,
+`initial_set|dlopen × never|auto|always`; Lane 16 has exactly two shape checks,
+one `never` and one `auto`. No `200000`, `G3`, `136175`, median, or performance
+threshold is an acceptance predicate. An `always` safe refusal is
+containment-correct, but its row and lane are `NON-PASS` and it produces no
+successful artifact.
 
 ## Global constraints
 

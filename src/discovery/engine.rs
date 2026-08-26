@@ -4273,6 +4273,18 @@ fn loader_arm_outcome(
 }
 
 #[cfg(feature = "skip-attribution")]
+fn loader_stage<T>(stage: &'static str, result: std::result::Result<T, String>) -> Result<T> {
+    result
+        .map_err(anyhow::Error::msg)
+        .with_context(|| format!("loader-stage={stage}"))
+}
+
+#[cfg(not(feature = "skip-attribution"))]
+fn loader_stage<T>(_stage: &'static str, result: std::result::Result<T, String>) -> Result<T> {
+    result.map_err(anyhow::Error::msg)
+}
+
+#[cfg(feature = "skip-attribution")]
 fn loader_arm_ordinary_error(
     result: &std::result::Result<bool, LoaderArmFailure>,
 ) -> Option<String> {
@@ -4739,8 +4751,10 @@ impl Engine {
         let pid = view.pid();
         let before_maps = Self::read_maps(view)?;
         let executable_path = PathBuf::from(format!("/proc/{pid}/exe"));
-        let before_executable =
-            view_object_key(view, &executable_path).map_err(anyhow::Error::msg)?;
+        let before_executable = loader_stage(
+            "locator.before-executable",
+            view_object_key(view, &executable_path),
+        )?;
         let executable = view
             .run_while_same(|| std::fs::File::open(&executable_path))
             .map_err(anyhow::Error::msg)??;
@@ -4751,8 +4765,10 @@ impl Engine {
         if before_file != after_file {
             bail!("retained executable changed during bounded PT_INTERP discovery");
         }
-        let retained_executable =
-            retained_object_key(view, &executable).map_err(anyhow::Error::msg)?;
+        let retained_executable = loader_stage(
+            "locator.retained-executable",
+            retained_object_key(view, &executable),
+        )?;
 
         let interpreter_file = if let Some(interpreter) = &interpreter {
             let path = PathBuf::from(format!("/proc/{pid}/root")).join(
@@ -4760,7 +4776,7 @@ impl Engine {
                     .strip_prefix("/")
                     .expect("bounded PT_INTERP paths are absolute"),
             );
-            let (file, key) = open_view_object(view, &path).map_err(anyhow::Error::msg)?;
+            let (file, key) = loader_stage("locator.interpreter", open_view_object(view, &path))?;
             let snapshot = FileSnapshot::read(&file).map_err(anyhow::Error::msg)?;
             Some((snapshot, key))
         } else {
@@ -4768,8 +4784,10 @@ impl Engine {
         };
 
         let after_maps = Self::read_maps(view)?;
-        let after_executable =
-            view_object_key(view, &executable_path).map_err(anyhow::Error::msg)?;
+        let after_executable = loader_stage(
+            "locator.after-executable",
+            view_object_key(view, &executable_path),
+        )?;
         if before_executable != retained_executable || retained_executable != after_executable {
             bail!("retained executable identity changed during PT_INTERP discovery");
         }
@@ -5953,12 +5971,14 @@ impl Engine {
             &locator.authority.loader_maps[0],
             &loader_path,
         );
-        let (loader_pins, loader_skips) = pin_scanned_view_objects(
-            &self.views[position],
-            std::slice::from_ref(&loader_module),
-            &mut self.budget,
-        )
-        .map_err(anyhow::Error::msg)?;
+        let (loader_pins, loader_skips) = loader_stage(
+            "arm.loader-pin",
+            pin_scanned_view_objects(
+                &self.views[position],
+                std::slice::from_ref(&loader_module),
+                &mut self.budget,
+            ),
+        )?;
         let skipped = loader_skips;
         let Some(local_loader_id) =
             loader_pins.id_for_scanned(&loader_module, loader_module.key, &loader_module.path)
@@ -13384,6 +13404,21 @@ mod tests {
         assert_eq!(
             loader_arm_ordinary_error(&result).as_deref(),
             Some("outer loader stage: inner loader error")
+        );
+    }
+
+    #[cfg(feature = "skip-attribution")]
+    #[test]
+    fn loader_stage_adds_one_label_and_preserves_the_error() {
+        let error = loader_stage::<()>(
+            "locator.before-executable",
+            Err("fd mount 35 is missing from the mount table".into()),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            format!("{error:#}"),
+            "loader-stage=locator.before-executable: fd mount 35 is missing from the mount table"
         );
     }
 

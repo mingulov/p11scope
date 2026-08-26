@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn read(path: &str) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| panic!("reading {path}: {error}"))
@@ -734,11 +737,15 @@ set -eu
 sleep 30 & pinned_pid=$!
 trap 'kill -KILL "$pinned_pid" 2>/dev/null || true; wait "$pinned_pid" 2>/dev/null || true' EXIT
 pinned_start=$(process_starttime "$pinned_pid")
+pinned_sid=$(process_session_id "$pinned_pid")
 if signal_verified_process TERM "$pinned_pid" "$((pinned_start + 1))" 2>/dev/null; then
     exit 1
 fi
+if signal_verified_process TERM "$pinned_pid" "$pinned_start" "$((pinned_sid + 1))" 2>/dev/null; then
+    exit 1
+fi
 kill -0 "$pinned_pid"
-signal_verified_process STOP "$pinned_pid" "$pinned_start"
+signal_verified_process STOP "$pinned_pid" "$pinned_start" "$pinned_sid"
 attempt=0
 while [ "$attempt" -lt 100 ]; do
     state=$(awk '$1 == "State:" { print $2; exit }' "/proc/$pinned_pid/status")
@@ -747,8 +754,8 @@ while [ "$attempt" -lt 100 ]; do
     sleep 0.01
 done
 [ "$state" = T ]
-signal_verified_process CONT "$pinned_pid" "$pinned_start"
-signal_verified_process TERM "$pinned_pid" "$pinned_start"
+signal_verified_process CONT "$pinned_pid" "$pinned_start" "$pinned_sid"
+signal_verified_process TERM "$pinned_pid" "$pinned_start" "$pinned_sid"
 if wait "$pinned_pid"; then exit 1; else status=$?; fi
 [ "$status" -eq 143 ]
 pinned_pid=
@@ -760,6 +767,932 @@ trap - EXIT
     assert!(
         output.status.success(),
         "pidfd helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn body_signal_reaches_the_pinned_leader_before_session_inventory() {
+    let gate = read("scripts/matrix/verify-knative.sh");
+    let signal = between(
+        &gate,
+        "lane13_signal_body_group() {",
+        "\n\nlane13_outer_terminal_failure() {",
+    );
+    let directory = tempfile::tempdir().expect("temporary body-signal directory");
+    let script = directory.path().join("body-signal.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+set -eu
+LANE13_BODY_PID=41
+LANE13_BODY_STARTTIME=42
+LANE13_BODY_SID=41
+process_matches_session() {{ return 0; }}
+process_matches_starttime() {{ return 0; }}
+signal_verified_process() {{ printf '%s %s %s %s\n' "$1" "$2" "$3" "$4" >> {signals}; }}
+snapshot_user_process_session() {{ return 1; }}
+lane13_signal_body_group() {{{signal}
+set +e
+lane13_signal_body_group TERM
+status=$?
+set -e
+[ "$status" -ne 0 ]
+grep -Fqx 'TERM 41 42 41' {signals}
+"#,
+            signal = signal,
+            signals = directory.path().join("signals").display(),
+        ),
+    )
+    .expect("write body-signal regression");
+    let output = Command::new("sh")
+        .arg(&script)
+        .output()
+        .expect("exercise body signal before inventory");
+    assert!(
+        output.status.success(),
+        "body leader was not signalled first: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn body_signal_never_authorizes_a_reused_sid_without_its_recorded_leader() {
+    let gate = read("scripts/matrix/verify-knative.sh");
+    let signal = between(
+        &gate,
+        "lane13_signal_body_group() {",
+        "\n\nlane13_outer_terminal_failure() {",
+    );
+    let directory = tempfile::tempdir().expect("temporary reused-SID directory");
+    let script = directory.path().join("reused-sid.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+set -eu
+LANE13_BODY_PID=41
+LANE13_BODY_STARTTIME=42
+LANE13_BODY_SID=41
+process_matches_session() {{ return 1; }}
+process_matches_starttime() {{ return 1; }}
+signal_verified_process() {{ printf '%s %s %s %s\n' "$1" "$2" "$3" "${{4-}}" >> {signals}; }}
+snapshot_user_process_session() {{ printf '%s\n' '[{{"pid":999993,"starttime":100,"ppid":1,"pgid":999993,"sid":41,"exe_sha256":"foreign","argv":["foreign"]}}]'; }}
+lane13_signal_body_group() {{{signal}
+set +e
+lane13_signal_body_group TERM
+status=$?
+set -e
+[ "$status" -ne 0 ]
+[ ! -e {signals} ]
+"#,
+            signal = signal,
+            signals = directory.path().join("signals").display(),
+        ),
+    )
+    .expect("write reused-SID regression");
+    let output = Command::new("sh")
+        .arg(&script)
+        .output()
+        .expect("exercise body SID authorization");
+    assert!(
+        output.status.success(),
+        "body signal authorized a reused SID: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn user_process_session_lifecycle_is_identity_pinned() {
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            r#"
+set -eu
+. scripts/lib.sh
+work=$(mktemp -d)
+leader=
+trap 'if [ -n "$leader" ]; then kill -KILL "$leader" 2>/dev/null || true; wait "$leader" 2>/dev/null || true; fi; rm -rf "$work"' EXIT
+launch_user_recorded_process_group "$work/portforward.pid" "$work/portforward.log" \
+    sh -c 'trap "" TERM; sleep 30 & wait'
+leader=$USER_PROCESS_PID
+[ "$USER_PROCESS_LAUNCH_PID" = "$leader" ]
+[ "$USER_PROCESS_PGID" = "$leader" ]
+[ "$USER_PROCESS_SID" = "$leader" ]
+env | grep -Fqx "USER_PROCESS_SID=$leader"
+python3 - "$work/portforward.pid" "$leader" "$USER_PROCESS_STARTTIME" <<'PY'
+import json
+import sys
+
+record = json.load(open(sys.argv[1], encoding="utf-8"))
+assert record["pid"] == int(sys.argv[2])
+assert record["starttime"] == int(sys.argv[3])
+assert set(record) == {"pid", "starttime", "pgid", "sid", "argv"}
+assert record["pid"] == record["pgid"] == record["sid"]
+assert record["argv"] == ["sh", "-c", 'trap "" TERM; sleep 30 & wait']
+PY
+snapshot_user_process_session "$USER_PROCESS_SID" > "$work/ready.json"
+python3 - "$work/ready.json" "$leader" <<'PY'
+import json
+import sys
+
+members = json.load(open(sys.argv[1], encoding="utf-8"))
+assert len(members) == 2
+assert {member["pgid"] for member in members} == {int(sys.argv[2])}
+assert {member["sid"] for member in members} == {int(sys.argv[2])}
+assert any(member["pid"] == int(sys.argv[2]) for member in members)
+assert all(member["exe_sha256"] and isinstance(member["argv"], list) for member in members)
+PY
+if signal_verified_process TERM "$leader" "$((USER_PROCESS_STARTTIME + 1))" 2>/dev/null; then
+    exit 1
+fi
+kill -0 "$leader"
+signal_verified_process TERM "$leader" "$USER_PROCESS_STARTTIME"
+sleep 0.05
+kill -0 "$leader"
+signal_verified_process KILL "$leader" "$USER_PROCESS_STARTTIME"
+if wait "$USER_PROCESS_LAUNCH_PID"; then exit 1; else status=$?; fi
+[ "$status" -eq 137 ]
+leader=
+snapshot_user_process_session "$USER_PROCESS_SID" > "$work/after-leader.json"
+python3 - "$work/after-leader.json" <<'PY' | while read -r pid starttime; do
+import json
+import sys
+
+for member in json.load(open(sys.argv[1], encoding="utf-8")):
+    print(member["pid"], member["starttime"])
+PY
+    signal_verified_process KILL "$pid" "$starttime"
+done
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+    [ "$(snapshot_user_process_session "$USER_PROCESS_SID")" = "[]" ] && break
+    attempt=$((attempt + 1))
+    sleep 0.01
+done
+[ "$(snapshot_user_process_session "$USER_PROCESS_SID")" = "[]" ]
+trap - EXIT
+rm -rf "$work"
+"#,
+        ])
+        .output()
+        .expect("exercise user process-group lifecycle helpers");
+    assert!(
+        output.status.success(),
+        "user process-group lifecycle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn failed_user_process_group_validation_never_reauthorizes_a_pid() {
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            r#"
+set -eu
+real_python=$(command -v python3)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+python3() {
+    if [ "$1" = - ]; then
+        case ${3-} in
+            ''|*[!0-9]*) command "$real_python" "$@"; return ;;
+        esac
+        "$real_python" - "$2" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+record = json.load(open(path, encoding="utf-8"))
+record["starttime"] += 1
+open(path, "w", encoding="utf-8").write(json.dumps(record) + "\n")
+PY
+    fi
+    command "$real_python" "$@"
+}
+. scripts/lib.sh
+if launch_user_recorded_process_group "$work/identity.json" "$work/child.log" \
+    sh -c '(sleep 0.2; : > "$1") & trap "printf killed; exit 9" TERM; while [ ! -e "$1" ]; do :; done; printf survived' \
+    sh "$work/done"; then
+    exit 1
+fi
+sleep 0.3
+grep -Fqx survived "$work/child.log"
+"#,
+        ])
+        .output()
+        .expect("exercise failed process-group validation");
+    assert!(
+        output.status.success(),
+        "failed process-group validation signalled a new identity: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn port_forward_never_signals_a_member_absent_from_its_authorization_snapshot() {
+    let gate = read("scripts/matrix/verify-knative.sh");
+    let terminate = between(&gate, "terminate_port_forward() {", "\ncleanup() {");
+    let terminate = terminate
+        .trim_end()
+        .strip_suffix('}')
+        .expect("terminate function closing brace");
+    let directory = tempfile::tempdir().expect("temporary lifecycle test directory");
+    let script = directory.path().join("lifecycle.sh");
+    fs::write(
+        &script,
+        format!(
+r#"#!/bin/sh
+set -eu
+. scripts/lib.sh
+WORK={work}
+PF_LAUNCH_PID=
+sleep 0.01 & PF_LAUNCH_PID=$!
+PF_PID=999991
+PF_STARTTIME=10
+PF_PGID=20
+PF_SID=30
+PF_GROUP_SNAPSHOT=
+match_live=1
+snapshot_count=0
+process_matches_starttime() {{ [ "$match_live" -eq 1 ]; }}
+signal_verified_process() {{
+    printf '%s %s %s\n' "$1" "$2" "$3" >> "$WORK/signals"
+    [ "$1" != TERM ] || match_live=0
+}}
+snapshot_user_process_session() {{
+    snapshot_count=$((snapshot_count + 1))
+    if [ "$snapshot_count" -eq 1 ] && [ "$match_live" -eq 1 ]; then
+        printf '%s\n' '[{{"pid":999991,"starttime":10,"ppid":1,"pgid":20,"sid":30,"exe_sha256":"leader","argv":["kubectl"]}}]'
+    else
+        printf '%s\n' '[{{"pid":999992,"starttime":11,"ppid":1,"pgid":20,"sid":31,"exe_sha256":"late","argv":["foreign"]}}]'
+    fi
+}}
+terminate_port_forward() {{
+{terminate}
+}}
+set +e
+terminate_port_forward
+status=$?
+set -e
+[ "$status" -ne 0 ]
+grep -Fqx 'TERM 999991 10' "$WORK/signals"
+! grep -Fq '999992' "$WORK/signals"
+"#,
+            work = directory.path().display(),
+            terminate = terminate,
+        ),
+    )
+    .expect("write lifecycle test script");
+    let output = Command::new("sh")
+        .arg(&script)
+        .output()
+        .expect("exercise port-forward authorization lifecycle");
+    assert!(
+        output.status.success(),
+        "late process-group member was signalled: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn port_forward_uses_live_leader_snapshot_after_leader_exit_without_reauthorizing_sid() {
+    let gate = read("scripts/matrix/verify-knative.sh");
+    let terminate = between(&gate, "terminate_port_forward() {", "\ncleanup() {")
+        .trim_end()
+        .strip_suffix('}')
+        .expect("terminate function closing brace");
+    let directory = tempfile::tempdir().expect("temporary vanished-leader directory");
+    fs::write(
+        directory.path().join("authorized.json"),
+        r#"[{"pid":999991,"starttime":10,"ppid":1,"pgid":30,"sid":30,"exe_sha256":"leader","argv":["kubectl"]},{"pid":999992,"starttime":11,"ppid":999991,"pgid":30,"sid":30,"exe_sha256":"child","argv":["child"]}]"#,
+    )
+    .expect("write immutable authorization snapshot");
+    let script = directory.path().join("vanished-leader.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+set -eu
+WORK={work}
+PF_LAUNCH_PID=999991
+PF_PID=999991
+PF_STARTTIME=10
+PF_PGID=30
+PF_SID=30
+PF_GROUP_SNAPSHOT=$WORK/authorized.json
+PF_GROUP_SNAPSHOT_AFTER=
+process_matches_starttime() {{ return 1; }}
+process_matches_session() {{ [ "$1" = 999992 ]; }}
+signal_verified_process() {{ printf '%s %s %s %s\n' "$1" "$2" "$3" "${{4-}}" >> "$WORK/signals"; }}
+snapshot_user_process_session() {{
+    [ -e "$WORK/signals" ] || {{ printf '%s\n' '[{{"pid":999993,"starttime":12,"ppid":1,"pgid":30,"sid":30,"exe_sha256":"foreign","argv":["foreign"]}}]'; return; }}
+    printf '[]'
+}}
+wait() {{ return 0; }}
+sleep() {{ :; }}
+terminate_port_forward() {{{terminate}
+}}
+set +e
+terminate_port_forward
+status=$?
+set -e
+[ "$status" -ne 0 ]
+grep -Fqx 'TERM 999992 11 30' "$WORK/signals"
+! grep -Fq '999993' "$WORK/signals"
+"#,
+            work = directory.path().display(),
+            terminate = terminate,
+        ),
+    )
+    .expect("write vanished-leader regression");
+    let output = Command::new("sh")
+        .arg(&script)
+        .output()
+        .expect("exercise immutable port-forward authorization");
+    assert!(
+        output.status.success(),
+        "port-forward reauthorized a reused SID: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn port_forward_leader_exit_race_does_not_abort_under_nounset() {
+    let gate = read("scripts/matrix/verify-knative.sh");
+    let terminate = between(&gate, "terminate_port_forward() {", "\ncleanup() {")
+        .trim_end()
+        .strip_suffix('}')
+        .expect("terminate function closing brace");
+    let directory = tempfile::tempdir().expect("temporary leader-race directory");
+    fs::write(
+        directory.path().join("authorized.json"),
+        r#"[{"pid":999991,"starttime":10,"ppid":1,"pgid":30,"sid":30,"exe_sha256":"leader","argv":["kubectl"]}]"#,
+    )
+    .expect("write leader authorization snapshot");
+    let script = directory.path().join("leader-race.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+set -eu
+WORK={work}
+PF_LAUNCH_PID=999991
+PF_PID=999991
+PF_STARTTIME=10
+PF_PGID=30
+PF_SID=30
+PF_GROUP_SNAPSHOT=$WORK/authorized.json
+PF_GROUP_SNAPSHOT_AFTER=
+matches=0
+process_matches_starttime() {{ matches=$((matches + 1)); [ "$matches" -le 2 ]; }}
+process_matches_session() {{ return 0; }}
+signal_verified_process() {{ printf '%s\n' "$1" >> "$WORK/signals"; }}
+snapshot_user_process_session() {{ printf '[]'; }}
+wait() {{ return 0; }}
+sleep() {{ :; }}
+terminate_port_forward() {{{terminate}
+}}
+terminate_port_forward
+: > "$WORK/after"
+[ -e "$WORK/after" ]
+grep -Fqx TERM "$WORK/signals"
+! grep -Fqx KILL "$WORK/signals"
+"#,
+            work = directory.path().display(),
+            terminate = terminate,
+        ),
+    )
+    .expect("write leader-race regression");
+    let output = Command::new("sh")
+        .arg(&script)
+        .output()
+        .expect("exercise leader exit race");
+    assert!(
+        output.status.success(),
+        "leader exit triggered nounset abort: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn port_forward_term_during_launch_reaps_the_trap_visible_generation() {
+    let gate = read("scripts/matrix/verify-knative.sh");
+    let terminate = between(&gate, "terminate_port_forward() {", "\ncleanup() {")
+        .trim_end()
+        .strip_suffix('}')
+        .expect("terminate function closing brace");
+    let cleanup = between(&gate, "cleanup() {", "\n. scripts/cleanup-traps.sh")
+        .trim_end()
+        .strip_suffix('}')
+        .expect("cleanup function closing brace");
+    let directory = tempfile::tempdir().expect("temporary launch-interrupt directory");
+    let gate_script = directory.path().join("gate.sh");
+    let check_script = directory.path().join("check.sh");
+    let bin = directory.path().join("bin");
+    fs::create_dir(&bin).expect("create Python wrapper directory");
+    let python_wrapper = bin.join("python3");
+    fs::write(
+        &python_wrapper,
+        r#"#!/bin/sh
+if [ "$1" = - ] && [ "$#" -gt 5 ]; then
+    case ${3-} in
+        ''|*[!0-9]*) ;;
+        *)
+            [ -e "$PF_TEST_WORK/validation" ] || : > "$PF_TEST_WORK/validation"
+            while [ ! -e "$PF_TEST_WORK/release" ]; do :; done
+            ;;
+    esac
+fi
+exec "$PF_TEST_REAL_PYTHON" "$@"
+"#,
+    )
+    .expect("write Python validation wrapper");
+    fs::set_permissions(&python_wrapper, fs::Permissions::from_mode(0o755))
+        .expect("make Python validation wrapper executable");
+    fs::write(
+        &gate_script,
+        format!(
+            r#"#!/bin/sh
+set -eu
+. scripts/lib.sh
+WORK={work}
+KUBECONFIG="$WORK/kubeconfig"
+SPID=
+SUPERVISOR_PID=
+SUPERVISOR_STARTTIME=
+ROOT_LAUNCH_PID=
+ROOT_PROCESS_PID=
+ROOT_PROCESS_STARTTIME=
+PF_LAUNCH_PID=
+PF_PID=
+PF_STARTTIME=
+PF_PGID=
+PF_SID=
+PF_GROUP_SNAPSHOT=
+CLUSTER_CREATED=
+IMAGE_CREATED=
+PATH="$WORK/bin:$PATH"
+export PATH
+PF_TEST_WORK="$WORK"
+PF_TEST_REAL_PYTHON="{python}"
+export PF_TEST_WORK PF_TEST_REAL_PYTHON
+terminate_port_forward() {{
+{terminate}
+}}
+cleanup() {{
+{cleanup}
+}}
+. scripts/cleanup-traps.sh
+( while [ ! -e "$WORK/validation" ]; do :; done; : > "$WORK/term-sent"; kill -TERM "$$"; : > "$WORK/release" ) &
+PF_PENDING_STATUS=
+trap 'PF_PENDING_STATUS=${{PF_PENDING_STATUS:-130}}' INT
+trap 'PF_PENDING_STATUS=${{PF_PENDING_STATUS:-143}}' TERM
+set +e
+launch_user_recorded_process_group "$WORK/identity.json" "$WORK/portforward.log" \
+    sh -c 'trap "exit 0" TERM; while :; do :; done'
+launch_status=$?
+set -e
+PF_LAUNCH_PID=$USER_PROCESS_LAUNCH_PID
+PF_PID=$USER_PROCESS_PID
+PF_STARTTIME=$USER_PROCESS_STARTTIME
+PF_PGID=$USER_PROCESS_PGID
+PF_SID=$USER_PROCESS_SID
+PF_GROUP_SNAPSHOT=
+. scripts/cleanup-traps.sh
+[ -z "$PF_PENDING_STATUS" ] || exit "$PF_PENDING_STATUS"
+exit "$launch_status"
+"#,
+            work = directory.path().display(),
+            terminate = terminate,
+            cleanup = cleanup,
+            python = Command::new("sh")
+                .args(["-c", "command -v python3"])
+                .output()
+                .expect("locate system Python")
+                .stdout
+                .strip_suffix(b"\n")
+                .expect("system Python newline")
+                .iter()
+                .map(|&byte| char::from(byte))
+                .collect::<String>(),
+        ),
+    )
+    .expect("write launch-interrupt gate");
+    fs::write(
+        &check_script,
+        format!(
+            r#"#!/bin/sh
+set -eu
+. scripts/lib.sh
+WORK={work}
+sh "$WORK/gate.sh" & gate=$!
+attempt=0
+while [ ! -e "$WORK/term-sent" ] && [ "$attempt" -lt 1000 ]; do
+    attempt=$((attempt + 1))
+    sleep 0.01
+done
+[ -e "$WORK/term-sent" ]
+if wait "$gate"; then exit 1; else status=$?; fi
+[ "$status" -eq 143 ]
+set -- $(python3 - "$WORK/identity.json" <<'PY'
+import json
+import sys
+record = json.load(open(sys.argv[1], encoding="utf-8"))
+assert set(record) == {{"pid", "starttime", "pgid", "sid", "argv"}}
+assert record["pid"] == record["pgid"] == record["sid"]
+print(record["pid"], record["starttime"], record["sid"])
+PY
+)
+! process_matches_starttime "$1" "$2"
+[ "$(snapshot_user_process_group "$3")" = "[]" ]
+"#,
+            work = directory.path().display(),
+        ),
+    )
+    .expect("write launch-interrupt check");
+    let output = Command::new("timeout")
+        .args(["10s", "sh"])
+        .arg(&check_script)
+        .output()
+        .expect("exercise launch-interrupt cleanup");
+    assert!(
+        output.status.success(),
+        "launch-interrupt cleanup failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn mutated_process_group_record_never_signals_the_live_decoy_or_unvalidated_owner() {
+    let directory = tempfile::tempdir().expect("temporary record-mutation directory");
+    let bin = directory.path().join("bin");
+    fs::create_dir(&bin).expect("create Python wrapper directory");
+    let python_wrapper = bin.join("python3");
+    fs::write(
+        &python_wrapper,
+        r#"#!/bin/sh
+if [ "$1" = - ] && [ "$#" -gt 5 ]; then
+    case ${3-} in
+        ''|*[!0-9]*) ;;
+        *) [ -e "$PF_TEST_WORK/mutated" ||
+    "$PF_TEST_REAL_PYTHON" - "$2" "$PF_TEST_WORK" <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+
+def stat(pid):
+    raw = open(f"/proc/{pid}/stat", "rb").read()
+    _, separator, tail = raw.rpartition(b") ")
+    if not separator:
+        raise ValueError("malformed proc stat")
+    fields = tail.split()
+    return int(fields[19]), int(fields[2])
+
+
+record_path, work = sys.argv[1:]
+original = json.load(open(record_path, encoding="utf-8"))
+json.dump(original, open(os.path.join(work, "original.json"), "w", encoding="utf-8"))
+decoy = subprocess.Popen(
+    [
+        "sh",
+        "-c",
+        'trap "printf decoy > \\\"$1\\\"; exit 0" TERM; while :; do :; done',
+        "sh",
+        os.path.join(work, "decoy-signalled"),
+    ],
+    start_new_session=True,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+starttime, pgid = stat(decoy.pid)
+replacement = {"pid": decoy.pid, "starttime": starttime, "pgid": pgid, "argv": ["decoy"]}
+json.dump(replacement, open(os.path.join(work, "decoy.json"), "w", encoding="utf-8"))
+json.dump(replacement, open(record_path, "w", encoding="utf-8"))
+open(os.path.join(work, "mutated"), "w", encoding="utf-8").close()
+PY
+        ;;
+    esac
+fi
+exec "$PF_TEST_REAL_PYTHON" "$@"
+"#,
+    )
+    .expect("write Python mutation wrapper");
+    fs::set_permissions(&python_wrapper, fs::Permissions::from_mode(0o755))
+        .expect("make Python mutation wrapper executable");
+    let script = directory.path().join("lifecycle.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+set -eu
+. scripts/lib.sh
+WORK={work}
+PATH="$WORK/bin:$PATH"
+PF_TEST_WORK="$WORK"
+PF_TEST_REAL_PYTHON="{python}"
+export PATH PF_TEST_WORK PF_TEST_REAL_PYTHON
+real_pid=
+real_starttime=
+decoy_pid=
+decoy_starttime=
+cleanup() {{
+    [ -z "$real_pid" ] || signal_verified_process KILL "$real_pid" "$real_starttime" 2>/dev/null || true
+    [ -z "$decoy_pid" ] || signal_verified_process KILL "$decoy_pid" "$decoy_starttime" 2>/dev/null || true
+    [ -z "${{USER_PROCESS_LAUNCH_PID-}}" ] || wait "$USER_PROCESS_LAUNCH_PID" 2>/dev/null || true
+}}
+trap cleanup EXIT
+if launch_user_recorded_process_group "$WORK/identity.json" "$WORK/portforward.log" \
+    sh -c 'trap "printf real > \"$1\"; exit 0" TERM; while :; do :; done' sh "$WORK/real-signalled"; then
+    exit 1
+fi
+[ -e "$WORK/mutated" ]
+set -- $(python3 - "$WORK/original.json" "$WORK/decoy.json" <<'PY'
+import json
+import sys
+for path in sys.argv[1:]:
+    record = json.load(open(path, encoding="utf-8"))
+    print(record["pid"], record["starttime"], record["pgid"])
+PY
+)
+real_pid=$1
+real_starttime=$2
+real_pgid=$3
+decoy_pid=$4
+decoy_starttime=$5
+decoy_pgid=$6
+process_matches_starttime "$real_pid" "$real_starttime"
+process_matches_starttime "$decoy_pid" "$decoy_starttime"
+[ ! -e "$WORK/real-signalled" ]
+[ ! -e "$WORK/decoy-signalled" ]
+signal_verified_process KILL "$real_pid" "$real_starttime"
+wait "$USER_PROCESS_LAUNCH_PID" 2>/dev/null || true
+signal_verified_process KILL "$decoy_pid" "$decoy_starttime"
+owners_live() {{
+    process_matches_starttime "$real_pid" "$real_starttime" || process_matches_starttime "$decoy_pid" "$decoy_starttime"
+}}
+attempt=0
+while owners_live && [ "$attempt" -lt 100 ]; do
+    attempt=$((attempt + 1))
+    sleep 0.01
+done
+! process_matches_starttime "$real_pid" "$real_starttime"
+! process_matches_starttime "$decoy_pid" "$decoy_starttime"
+[ "$(snapshot_user_process_group "$real_pgid")" = "[]" ]
+[ "$(snapshot_user_process_group "$decoy_pgid")" = "[]" ]
+real_pid=
+decoy_pid=
+trap - EXIT
+"#,
+            work = directory.path().display(),
+            python = run_ok("sh", &["-c", "command -v python3"]).trim(),
+        ),
+    )
+    .expect("write record-mutation lifecycle");
+    let output = Command::new("timeout")
+        .args(["10s", "sh"])
+        .arg(&script)
+        .output()
+        .expect("exercise record-mutation failure path");
+    assert!(
+        output.status.success(),
+        "record mutation signalled an unvalidated process: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn partial_owner_signal_failures_are_bounded_and_do_not_skip_cleanup() {
+    let gate = read("scripts/matrix/verify-knative.sh");
+    let terminate = between(&gate, "terminate_port_forward() {", "\ncleanup() {")
+        .trim_end()
+        .strip_suffix('}')
+        .expect("terminate function closing brace");
+    let directory = tempfile::tempdir().expect("temporary partial-owner directory");
+    let script = directory.path().join("lifecycle.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+set -u
+. scripts/lib.sh
+WORK={work}
+PF_LAUNCH_PID=999991
+PF_PID=999991
+PF_STARTTIME=10
+PF_PGID=
+PF_SID=30
+PF_GROUP_SNAPSHOT=
+process_matches_starttime() {{ return 0; }}
+signal_verified_process() {{ printf '%s %s %s\n' "$1" "$2" "$3" >> "$WORK/signals"; return 1; }}
+snapshot_user_process_session() {{ printf '%s\n' '[{{"pid":999991,"starttime":10,"ppid":1,"pgid":30,"sid":30,"exe_sha256":"x","argv":["x"]}}]'; }}
+sleep() {{ :; }}
+wait() {{ : > "$WORK/waited"; return 0; }}
+terminate_port_forward() {{
+{terminate}
+}}
+after_cleanup() {{ : > "$WORK/after"; }}
+CLEANUP_STATUS=0
+cleanup_step terminate_port_forward
+cleanup_step after_cleanup
+[ "$CLEANUP_STATUS" -ne 0 ]
+grep -Fqx 'TERM 999991 10' "$WORK/signals"
+grep -Fqx 'KILL 999991 10' "$WORK/signals"
+[ ! -e "$WORK/waited" ]
+[ -e "$WORK/after" ]
+"#,
+            work = directory.path().display(),
+            terminate = terminate,
+        ),
+    )
+    .expect("write partial-owner lifecycle");
+    let output = Command::new("timeout")
+        .args(["5s", "sh"])
+        .arg(&script)
+        .output()
+        .expect("exercise partial-owner signal failures");
+    assert!(
+        output.status.success(),
+        "partial-owner signal failure skipped cleanup: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn port_forward_reaps_an_authorized_child_after_its_leader_exits() {
+    let gate = read("scripts/matrix/verify-knative.sh");
+    let terminate = between(&gate, "terminate_port_forward() {", "\ncleanup() {")
+        .trim_end()
+        .strip_suffix('}')
+        .expect("terminate function closing brace");
+    let directory = tempfile::tempdir().expect("temporary leader-exit directory");
+    let script = directory.path().join("lifecycle.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+set -eu
+. scripts/lib.sh
+WORK={work}
+launch_user_recorded_process_group "$WORK/portforward.pid" "$WORK/portforward.log" \
+    sh -c 'trap "" HUP; sleep 30 & : > "$1/ready"; while [ ! -e "$1/release" ]; do :; done' sh "$WORK"
+PF_LAUNCH_PID=$USER_PROCESS_LAUNCH_PID
+PF_PID=$USER_PROCESS_PID
+PF_STARTTIME=$USER_PROCESS_STARTTIME
+PF_PGID=$USER_PROCESS_PGID
+PF_SID=$USER_PROCESS_SID
+sid=$PF_SID
+[ -e "$WORK/ready" ] || {{
+    attempt=0
+    while [ ! -e "$WORK/ready" ] && [ "$attempt" -lt 1000 ]; do
+        attempt=$((attempt + 1))
+        sleep 0.01
+    done
+}}
+[ -e "$WORK/ready" ]
+snapshot_user_process_session "$PF_SID" > "$WORK/authorized.json"
+PF_GROUP_SNAPSHOT="$WORK/authorized.json"
+python3 - "$PF_GROUP_SNAPSHOT" "$PF_PID" <<'PY'
+import json
+import sys
+
+members = json.load(open(sys.argv[1], encoding="utf-8"))
+assert len(members) == 2
+assert any(member["pid"] == int(sys.argv[2]) for member in members)
+PY
+: > "$WORK/release"
+wait "$PF_LAUNCH_PID"
+! process_matches_starttime "$PF_PID" "$PF_STARTTIME"
+[ "$(snapshot_user_process_session "$PF_SID")" != "[]" ]
+terminate_port_forward() {{
+{terminate}
+}}
+set +e
+terminate_port_forward
+status=$?
+set -e
+[ "$status" -ne 0 ]
+[ "$(snapshot_user_process_session "$sid")" = "[]" ]
+[ -z "$PF_PID" ]
+[ -z "$PF_SID" ]
+[ -z "$USER_PROCESS_LAUNCH_PID" ]
+[ -z "$USER_PROCESS_PID" ]
+[ -z "$USER_PROCESS_STARTTIME" ]
+[ -z "$USER_PROCESS_PGID" ]
+[ -z "$USER_PROCESS_INITIAL_STARTTIME" ]
+[ -z "$USER_PROCESS_PIDFILE" ]
+"#,
+            work = directory.path().display(),
+            terminate = terminate,
+        ),
+    )
+    .expect("write leader-exit lifecycle");
+    let output = Command::new("timeout")
+        .args(["10s", "sh"])
+        .arg(&script)
+        .output()
+        .expect("exercise leader-exit cleanup");
+    assert!(
+        output.status.success(),
+        "leader-exit cleanup failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn port_forward_term_ignoring_leader_is_nonpass_without_skipping_cleanup() {
+    let gate = read("scripts/matrix/verify-knative.sh");
+    let terminate = between(&gate, "terminate_port_forward() {", "\ncleanup() {")
+        .trim_end()
+        .strip_suffix('}')
+        .expect("terminate function closing brace");
+    let cleanup = between(&gate, "cleanup() {", "\n. scripts/cleanup-traps.sh")
+        .trim_end()
+        .strip_suffix('}')
+        .expect("cleanup function closing brace");
+    let directory = tempfile::tempdir().expect("temporary forced-kill directory");
+    let script = directory.path().join("lifecycle.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+set -u
+WORK={work}
+(
+    set -eu
+    . scripts/lib.sh
+    WORK={work}
+    KUBECONFIG="$WORK/kubeconfig"
+    SPID=1
+    SUPERVISOR_PID=123
+    SUPERVISOR_STARTTIME=456
+    ROOT_LAUNCH_PID=
+    ROOT_PROCESS_PID=
+    ROOT_PROCESS_STARTTIME=
+    CLUSTER_CREATED=
+    IMAGE_CREATED=
+    launch_user_recorded_process_group "$WORK/identity.json" "$WORK/portforward.log" \
+        sh -c 'trap "" TERM; while :; do :; done'
+    PF_LAUNCH_PID=$USER_PROCESS_LAUNCH_PID
+    PF_PID=$USER_PROCESS_PID
+    PF_STARTTIME=$USER_PROCESS_STARTTIME
+    PF_PGID=$USER_PROCESS_PGID
+    PF_SID=$USER_PROCESS_SID
+    snapshot_user_process_session "$PF_SID" > "$WORK/authorized.json"
+    PF_GROUP_SNAPSHOT="$WORK/authorized.json"
+    signal_verified_root_process() {{ : > "$WORK/root-cleanup"; }}
+    terminate_port_forward() {{
+{terminate}
+}}
+    cleanup() {{
+{cleanup}
+}}
+    cleanup
+) > "$WORK/cleanup.log" 2>&1
+status=$?
+[ "$status" -ne 0 ]
+grep -Fqx 'port-forward required or received SIGKILL' "$WORK/cleanup.log"
+[ -e "$WORK/root-cleanup" ]
+. scripts/lib.sh
+set -- $(python3 - "$WORK/identity.json" <<'PY'
+import json
+import sys
+record = json.load(open(sys.argv[1], encoding="utf-8"))
+print(record["pid"], record["starttime"], record["pgid"])
+PY
+)
+! process_matches_starttime "$1" "$2"
+    [ "$(snapshot_user_process_session "$3")" = "[]" ]
+"#,
+            work = directory.path().display(),
+            terminate = terminate,
+            cleanup = cleanup,
+        ),
+    )
+    .expect("write forced-kill lifecycle");
+    let output = Command::new("timeout")
+        .args(["20s", "sh"])
+        .arg(&script)
+        .output()
+        .expect("exercise forced-kill cleanup");
+    assert!(
+        output.status.success(),
+        "forced-kill cleanup failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -781,6 +1714,11 @@ fn capture_evidence_checker_self_test() {
         "bootstrap function exact count required: OK",
         "clean metrics multiplier is exact: OK",
         "clean metrics discovery source is exact in all three lanes: OK",
+        "lane13 manifest-only shared overlay is exact: OK",
+        "lane13 rejects widened skips, discovery, modes, and concrete gaps: OK",
+        "lane13 rejects nested skips, provenance, malformed scalars, and aliases: OK",
+        "lane13 rejects nested overlays and malformed build IDs: OK",
+        "lane13 rejects a multiplier argument: OK",
         // The scan contributes three per-source table records, while exact
         // target occurrences remain deduplicated across scan and manifest.
         "canary matrix 988/104/208 with 16 mixed surfaces: OK",
@@ -801,6 +1739,43 @@ fn capture_evidence_checker_self_test() {
     ] {
         assert!(stdout.contains(marker), "checker self-test misses {marker}");
     }
+}
+
+#[test]
+fn knative_lane_uses_the_exact_manifest_only_shared_overlay_oracle() {
+    let gate = read("scripts/matrix/verify-knative.sh");
+    let invocation = [
+        "python3 scripts/check-capture-evidence.py lane13-knative-metrics \\",
+        "    \"$WORK/observed.json\" spike/expected.txt",
+    ]
+    .join("\n");
+    assert!(
+        gate.contains(&invocation),
+        "lane 13 must use its exact manifest-only shared-overlay oracle"
+    );
+    assert!(
+        !gate.contains("clean-metrics-manifest-only"),
+        "lane 13 must not silently discard the required shared-overlay uncertainty"
+    );
+
+    let checker = read("scripts/check-capture-evidence.py");
+    let lane13_dispatch = between(
+        &checker,
+        "if argv[0] == \"lane13-knative-metrics\"",
+        "elif argv[0] == \"shared-layer-metrics\"",
+    );
+    assert!(
+        checker.contains("validate_lane13_knative_metrics(lane13, {\"C_Initialize\": 1})"),
+        "checker self-test must exercise the lane-13 oracle"
+    );
+    assert!(
+        lane13_dispatch.contains("len(argv) == 3"),
+        "lane 13 dispatch must accept exactly output and expected arguments"
+    );
+    assert!(
+        !lane13_dispatch.contains("multiplier"),
+        "lane 13 must not accept a multiplier"
+    );
 }
 
 #[test]
@@ -2134,6 +3109,703 @@ fn live_discovery_fixtures_have_two_byte_identities_and_three_surfaces() {
 }
 
 #[test]
+fn lane13_cleanup_never_removes_unowned_collision_paths() {
+    // Break caught: an early collision used to flow into the EXIT trap, which
+    // unlinked the caller's kubeconfig although this run never created it.
+    let gate = read("scripts/matrix/verify-knative.sh");
+    let cleanup = between(&gate, "cleanup() {", "\n. scripts/cleanup-traps.sh");
+    let directory = tempfile::tempdir().expect("temporary lane-13 collision directory");
+    let script = directory.path().join("cleanup.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+set -u
+. scripts/lib.sh
+WORK={work}/work
+KUBECONFIG=$WORK/kubeconfig
+mkdir "$WORK"
+: > "$KUBECONFIG"
+PF_PID= PF_STARTTIME= PF_PGID= PF_SID= PF_GROUP_SNAPSHOT= PF_SESSION_EMPTY=1
+LANE13_BODY_PID= LANE13_BODY_STARTTIME= LANE13_BODY_PGID= LANE13_BODY_SID=
+LANE13_BODY_SIGNAL= LANE13_BODY_SIGNAL_STATUS=0
+SPID= SUPERVISOR_PID= SUPERVISOR_STARTTIME=
+ROOT_LAUNCH_PID= ROOT_PROCESS_PID= ROOT_PROCESS_STARTTIME=
+CLUSTER_CREATED= IMAGE_CREATED= KUBECONFIG_CREATED=
+IMAGE_ID= CLUSTER_NODE= CLUSTER_NODE_ID=
+cleanup() {{{cleanup}
+false
+cleanup
+"#,
+            work = directory.path().display(),
+            cleanup = cleanup,
+        ),
+    )
+    .expect("write collision-cleanup script");
+    let output = Command::new("sh")
+        .arg(&script)
+        .output()
+        .expect("exercise collision cleanup");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "cleanup output: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        directory.path().join("work/kubeconfig").exists(),
+        "cleanup removed a pre-existing kubeconfig: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn lane13_pre_runtime_inputs_are_owned_and_release_bytes_stay_local() {
+    // Break caught: accepting a collision, drifting base, remote release bytes,
+    // ambiguous apply facts, or a post-apply mutation would hide unsafe input.
+    let gate = read("scripts/matrix/verify-knative.sh");
+    let d1 = between(
+        &gate,
+        "lane13_prepare_diagnostics() {",
+        "\nterminate_port_forward() {",
+    );
+    let directory = tempfile::tempdir().expect("temporary lane-13 D1 directory");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("make lane-13 evidence parent private");
+    let script = directory.path().join("d1.sh");
+    let body = format!(
+        "set -eu\nWORK={0}/work\nKUBECONFIG=$WORK/kubeconfig\nIMAGE=kind.local/test:unique\nCLUSTER=test-unique\nEVIDENCE={0}/evidence\nFACTS=$EVIDENCE/facts.log\nLANE13_TEST={0}\nmkdir -m 700 $EVIDENCE; : > $FACTS; chmod 600 $FACTS\nIMAGE_CREATED= CLUSTER_CREATED=\ndocker() {{ printf '%s\\n' \"$*\" >> $LANE13_TEST/docker.calls; case \"$1 $2\" in 'image inspect') [ \"$3\" = \"$IMAGE\" ] && [ -e $LANE13_TEST/image.created ] || [ \"$3\" = ubuntu:24.04 ] || return 1; if [ \"$3\" = ubuntu:24.04 ]; then printf '[{{\"Id\":\"base\",\"RepoDigests\":[\"ubuntu@sha256:base\"],\"RootFS\":{{\"Layers\":[\"a\",\"b\"]}}}}]\\n'; else printf '[{{\"Id\":\"work\",\"RepoDigests\":[\"work@sha256:work\"],\"RootFS\":{{\"Layers\":[\"a\",\"b\",\"c\"]}}}}]\\n'; fi;; pull) : > $LANE13_TEST/base.pulled;; build) printf '%s\\n' \"$*\" | grep -Fq -- --pull=false; : > $LANE13_TEST/image.created;; *) return 9;; esac; }}\nkind() {{ printf '%s\\n' \"$*\" >> $LANE13_TEST/kind.calls; case $1 in get) :;; create) : > $LANE13_TEST/cluster.created;; *) return 9;; esac; }}\ncurl() {{ if [ \"$1\" = --version ]; then printf 'curl 8.4.0\\n'; return; fi; printf '%s\\n' \"$*\" >> $LANE13_TEST/curl.calls; out= url=; while [ \"$#\" -gt 0 ]; do case $1 in --output) out=$2; shift 2;; --write-out) shift 2;; *) url=$1; shift;; esac; done; case $url in https://github.com/*) :;; *) return 9;; esac; printf release > $out; printf '%s' 'https://release-assets.githubusercontent.com/asset?secret=x'; }}\nkubectl() {{ printf '%s\\n' \"$*\" >> $LANE13_TEST/kubectl.calls; [ \"$1\" = apply ] && [ \"$2\" = -f ] && [ -f \"$3\" ] && [ \"$4\" = -o ] && [ \"$5\" = name ]; case $3 in *://*) return 9;; esac; printf 'service/example\\n'; }}\n{1}\nmkdir $WORK\nlane13_preflight\nlane13_record_base_and_build\n[ \"$IMAGE_CREATED\" = 1 ]\nlane13_create_cluster\n[ \"$CLUSTER_CREATED\" = 1 ]\nlane13_fetch_release https://github.com/knative/serving/releases/download/v1.23.0/serving-crds.yaml serving-crds.yaml\n[ ! -e $WORK/releases/serving-crds.yaml ]\ngrep -Fqx service/example $FACTS\ngrep -Fq 'release_effective=https://release-assets.githubusercontent.com/asset' $FACTS\ngrep -Fq input_sha256= $FACTS\ngrep -Fq docker_version= $FACTS\n[ \"$(wc -l < $LANE13_TEST/curl.calls)\" -eq 2 ]\n[ \"$(wc -l < $LANE13_TEST/kubectl.calls)\" -eq 1 ]\ngrep -Fq -- --pull=false $LANE13_TEST/docker.calls\nrm -f $LANE13_TEST/docker.calls $LANE13_TEST/kind.calls\n: > $WORK/collision\nif lane13_preflight; then exit 97; fi\n[ ! -e $LANE13_TEST/docker.calls ]\n[ ! -e $LANE13_TEST/kind.calls ]\n",
+        directory.path().display(),
+        format_args!(
+            "git() {{ case \"$1 ${{2-}}\" in 'diff --quiet'|'diff --cached'|'ls-files --others') return 0;; *) command git \"$@\";; esac; }}\ncargo() {{ printf 'cargo test\\n'; }}\nrustc() {{ printf 'rustc test\\n'; }}\nlane13_fact() {{ printf '%s\\n' \"$1\" >> \"$FACTS\"; }}\nlane13_prepare_diagnostics() {{{d1}"
+        ),
+    )
+    .replace(
+        "\nmkdir $WORK\nlane13_preflight\n",
+        "\nlane13_prepare_diagnostics\nlane13_preflight\nmkdir $WORK\n",
+    )
+    .replace(
+        "IMAGE_CREATED= CLUSTER_CREATED=\n",
+        "IMAGE_CREATED= CLUSTER_CREATED=\ntimeout() { while [ \"$#\" -gt 0 ]; do case $1 in --signal=*|--kill-after=*) shift;; --signal|--kill-after) shift 2;; *s) shift; break;; *) break;; esac; done; \"$@\"; }\n",
+    )
+    .replace(
+        "CLUSTER=test-unique\n",
+        "CLUSTER=test-unique\nKNATIVE_VERSION=knative-v1.23.0\n",
+    )
+    .replace("case \"$1 $2\"", "case \"$1 ${2-}\"")
+    .replace("fi;; pull)", "fi;; pull*)")
+    .replace("pulled;; build)", "pulled;; build*)")
+    .replace(
+        "--pull=false; : > $LANE13_TEST/image.created;;",
+        "--pull=false; : > $LANE13_TEST/image.created; printf work;;",
+    )
+    .replace(
+        "case \"$1 ${2-}\" in 'image inspect')",
+        "case \"$1 ${2-}\" in 'container inspect') printf node-id;; 'image inspect')",
+    )
+    .replace(
+        "case $1 in get) :;; create)",
+        "case \"$1 ${2-}\" in 'get clusters') :;; 'get nodes') printf node\\n;; 'create cluster')",
+    )
+    .replace(
+        "case \"$1 ${2-}\" in 'container inspect') printf node-id;; 'image inspect')",
+        "case \"$1 ${2-}\" in 'version --format') printf docker-test;; 'info --format') printf overlay;; 'container inspect') printf node-id;; 'image inspect')",
+    )
+    .replace(
+        "case \"$1 ${2-}\" in 'version --format') printf docker-test;;",
+        "case \"$1 ${2-}\" in 'version --format') printf docker-test;; 'image ls') [ \"$3\" = --no-trunc ] && [ \"$4\" = --format ] && [ \"$5\" = '{{.Repository}}\\t{{.Tag}}\\t{{.ID}}' ] && [ \"$6\" = \"$IMAGE\" ] || return 1;;",
+    )
+    .replace(
+        "case \"$1 ${2-}\" in 'get clusters') :;; 'get nodes') printf node\\n;; 'create cluster')",
+        "case \"$1 ${2-}\" in 'version ') printf kind-test;; 'get clusters') :;; 'get nodes') printf node\\n;; 'create cluster')",
+    )
+    .replace(
+        "\nFACTS=$EVIDENCE/facts.log\n",
+        "\nP11SCOPE_LANE_EVIDENCE_DIR=$EVIDENCE; export P11SCOPE_LANE_EVIDENCE_DIR\nFACTS=$EVIDENCE/facts.log\n",
+    )
+    .replace(
+        "printf '%s' 'https://release-assets.githubusercontent.com/asset?secret=x'",
+        "printf '%s\\n0' 'https://release-assets.githubusercontent.com/asset?secret=x'",
+    )
+    .replace(
+        "curl() { if [ \"$1\" = --version ]; then printf 'curl 8.4.0\\n'; return; fi; printf '%s\\n' \"$*\" >> $LANE13_TEST/curl.calls;",
+        "curl() { printf '%s\\n' \"$*\" >> $LANE13_TEST/curl.calls; if [ \"$1\" = --version ]; then printf 'curl 8.4.0\\n'; return; fi;",
+    )
+    .replace(
+        ": > $LANE13_TEST/cluster.created;;",
+        ": > $LANE13_TEST/cluster.created; : > $KUBECONFIG;;",
+    )
+    .replace(
+        "kubectl() { printf '%s\\n' \"$*\" >> $LANE13_TEST/kubectl.calls; [ \"$1\" = apply ] && [ \"$2\" = -f ] && [ -f \"$3\" ] && [ \"$4\" = -o ] && [ \"$5\" = name ]",
+        "kubectl() { if [ \"$1\" = version ]; then [ \"$#\" -eq 3 ] && [ \"$2\" = --client ] && [ \"$3\" = --output=yaml ] || return 9; printf '%s\\n' \"$*\" >> $LANE13_TEST/kubectl.calls; printf 'gitVersion: v1.33.0\\n'; return 0; fi; [ \"$1\" = apply ] && [ \"$#\" -eq 5 ] && [ \"$2\" = -f ] && [ -f \"$3\" ] && [ \"$4\" = -o ] && [ \"$5\" = name ] || return 9; case $3 in *://*) return 9;; esac; printf '%s\\n' \"$*\" >> $LANE13_TEST/kubectl.calls; printf '%s\\n' \"$3\" >> $LANE13_TEST/apply.paths; case $3 in *serving-crds.yaml) printf 'service/crds\\n';; *serving-core.yaml) printf 'configmap/core\\nservice/core\\n';; *kourier.yaml) printf 'deployment/kourier\\n';; *) return 9;; esac; if [ \"${MUTATE-}\" = 1 ]; then : > $LANE13_TEST/mutated; printf mutated >> \"$3\"; fi",
+    )
+    .replace(
+        "case $3 in *://*) return 9;; esac; printf 'service/example\\n'; }",
+        "}",
+    )
+    .replace("LANE13_TEST={0}\\n", "LANE13_TEST={0}\\nP11SCOPE_LANE_EVIDENCE_DIR=$EVIDENCE; export P11SCOPE_LANE_EVIDENCE_DIR\\n")
+    .replace("mkdir -m 700 $EVIDENCE; : > $FACTS; chmod 600 $FACTS\n", "")
+    .replace("\ngrep -Fq input_sha256= $FACTS", "")
+    .replace("\ngrep -Fq docker_version= $FACTS", "")
+    .replace(
+        "[ \"$(wc -l < $LANE13_TEST/curl.calls)\" -eq 2 ]",
+        "[ \"$(wc -l < $LANE13_TEST/curl.calls)\" -eq 1 ]",
+    )
+    .replace(
+        "[ \"$(wc -l < $LANE13_TEST/kubectl.calls)\" -eq 1 ]",
+        "[ \"$(wc -l < $LANE13_TEST/kubectl.calls)\" -eq 2 ]",
+    )
+    .replace(
+        "releases/download/v1.23.0/serving-crds.yaml serving-crds.yaml",
+        "releases/download/knative-v1.23.0/serving-crds.yaml serving-crds.yaml",
+    )
+    .replace(
+        "grep -Fqx service/example $FACTS",
+        "MUTATE=1\nset +e\nlane13_fetch_release https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml serving-crds.yaml\nmutation_status=$?\nset -e\n[ \"$mutation_status\" -ne 0 ]\n[ -e $WORK/releases/serving-crds.yaml ]\nrm -f $WORK/releases/serving-crds.yaml\nMUTATE=\nrm -f $LANE13_TEST/curl.calls $LANE13_TEST/kubectl.calls $LANE13_TEST/apply.paths\nlane13_fetch_release https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml serving-crds.yaml\nlane13_fetch_release https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-core.yaml serving-core.yaml\nlane13_fetch_release https://github.com/knative/net-kourier/releases/download/knative-v1.23.0/kourier.yaml kourier.yaml\nfor fact in \\\n    release_apply_serving-crds.yaml=service/crds \\\n    release_apply_serving-core.yaml=configmap/core \\\n    release_apply_serving-core.yaml=service/core \\\n    release_apply_kourier.yaml=deployment/kourier; do grep -Fqx \"$fact\" $FACTS; done\n! grep -Fqx service/crds $FACTS\n! grep -Fqx configmap/core $FACTS\n! grep -Fqx service/core $FACTS\n! grep -Fqx deployment/kourier $FACTS\nfor name in serving-crds.yaml serving-core.yaml kourier.yaml; do [ ! -e $WORK/releases/$name ] && [ ! -L $WORK/releases/$name ]; done\n[ \"$(wc -l < $LANE13_TEST/curl.calls)\" -eq 3 ]\n[ \"$(wc -l < $LANE13_TEST/kubectl.calls)\" -eq 3 ]\n[ \"$(wc -l < $LANE13_TEST/apply.paths)\" -eq 3 ]\n! grep -Fq '://' $LANE13_TEST/apply.paths",
+    )
+    .replace(
+        "grep -Fq 'release_effective=https://release-assets.githubusercontent.com/asset' $FACTS\n[ \"$(wc -l < $LANE13_TEST/curl.calls)\" -eq 1 ]\n[ \"$(wc -l < $LANE13_TEST/kubectl.calls)\" -eq 2 ]\n",
+        "",
+    )
+    .replace(
+        "lane13_preflight\nmkdir $WORK",
+        "lane13_preflight\n[ \"$(wc -l < $LANE13_TEST/curl.calls)\" -eq 1 ]\n[ \"$(wc -l < $LANE13_TEST/kubectl.calls)\" -eq 1 ]\nrm -f $LANE13_TEST/curl.calls $LANE13_TEST/kubectl.calls\nmkdir $WORK",
+    )
+    .replace(
+        "lane13_fetch_release https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml serving-crds.yaml\n[ ! -e $WORK/releases/serving-crds.yaml ]\nMUTATE=1",
+        "MUTATE=1",
+    )
+    .replace(
+        "[ \"$mutation_status\" -ne 0 ]\n[ -e $WORK/releases/serving-crds.yaml ]",
+        "[ \"$mutation_status\" -ne 0 ]\n[ -e $LANE13_TEST/mutated ]\n[ \"$(wc -l < $LANE13_TEST/curl.calls)\" -eq 1 ]\n[ \"$(wc -l < $LANE13_TEST/kubectl.calls)\" -eq 1 ]\n[ -e $WORK/releases/serving-crds.yaml ]",
+    )
+    .replace(
+        "rm -f $WORK/releases/serving-crds.yaml\nMUTATE=\nrm -f $LANE13_TEST/curl.calls",
+        "rm -f $WORK/releases/serving-crds.yaml\nMUTATE=\nrm -f $LANE13_TEST/mutated $LANE13_TEST/curl.calls",
+    )
+    .replace(
+        "[ \"$(wc -l < $LANE13_TEST/curl.calls)\" -eq 3 ]\n[ \"$(wc -l < $LANE13_TEST/kubectl.calls)\" -eq 3 ]",
+        "[ \"$(wc -l < $LANE13_TEST/curl.calls)\" -eq 3 ]\n! grep -Fqx -- --version $LANE13_TEST/curl.calls\ncurl_args='--fail --silent --show-error --retry 0 --connect-timeout 30 --max-time 180 --max-filesize 16777216 --proto =https --proto-redir =https --location --max-redirs 1'\nassert_curl_download() { expected=\"$curl_args --output $WORK/releases/$1 --write-out %{url_effective}\\\\n%{num_redirects} $2\"; grep -Fqx -- \"$expected\" $LANE13_TEST/curl.calls; }\nassert_curl_download serving-crds.yaml https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml\nassert_curl_download serving-core.yaml https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-core.yaml\nassert_curl_download kourier.yaml https://github.com/knative/net-kourier/releases/download/knative-v1.23.0/kourier.yaml\n[ \"$(wc -l < $LANE13_TEST/kubectl.calls)\" -eq 3 ]",
+    )
+    .replace(
+        " || [ \"$3\" = ubuntu:24.04 ] || return 1; if [ \"$3\" = ubuntu:24.04 ]; then ",
+        " || [ \"$3\" = ubuntu:24.04 ] || [ \"$3\" = node-id ] || return 1; if [ \"$3\" = ubuntu:24.04 ]; then ",
+    )
+    .replace(
+        "]; else printf '[{\"Id\":\"work\",\"RepoDigests\":[\"work@sha256:work\"],\"RootFS\":{\"Layers\":[\"a\",\"b\",\"c\"]}}]\\n'; fi;; pull)",
+        "]; elif [ \"$3\" = node-id ]; then printf '[{\"Id\":\"node-id\",\"RepoDigests\":[\"kindest/node@sha256:node\"],\"RootFS\":{\"Layers\":[\"node-layer\"]}}]\\n'; else printf '[{\"Id\":\"work\",\"RepoDigests\":[\"work@sha256:work\"],\"RootFS\":{\"Layers\":[\"a\",\"b\",\"c\"]}}]\\n'; fi;; pull)",
+    )
+    .replace(
+        "'create cluster') : > $LANE13_TEST/cluster.created;;",
+        "'create cluster') : > $LANE13_TEST/cluster.created; chmod 600 $KUBECONFIG;;",
+    );
+    fs::write(&script, &body).expect("write lane-13 D1 test script");
+    let output = Command::new("sh")
+        .arg(&script)
+        .output()
+        .expect("exercise lane-13 D1 controls");
+    assert!(
+        output.status.success(),
+        "lane-13 D1 controls failed: stdout={} stderr={} script={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        body
+    );
+}
+
+#[test]
+fn lane13_preflight_and_release_reject_tool_error_redirect_and_cap_before_apply() {
+    let gate = read("scripts/matrix/verify-knative.sh");
+    let preflight = between(&gate, "lane13_preflight() {", "\nlane13_image_facts() {");
+    let require_curl = between(
+        &gate,
+        "lane13_require_curl() {",
+        "\nlane13_record_inputs() {",
+    );
+    let fetch = between(&gate, "lane13_fetch_release() {", "\nlane13_sha256() {");
+    let sha256 = between(&gate, "lane13_sha256() {", "\nterminate_port_forward() {");
+    let directory = tempfile::tempdir().expect("temporary lane-13 negative fixture");
+    let script = directory.path().join("negative.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+set -eu
+WORK={work}/work
+KUBECONFIG=$WORK/kubeconfig
+IMAGE=kind.local/test:unique
+CLUSTER=test-unique
+KNATIVE_VERSION=knative-v1.23.0
+EVIDENCE={work}/evidence
+FACTS=$EVIDENCE/facts.log
+mkdir -p "$EVIDENCE"
+: > "$FACTS"
+docker() {{ case "$1 ${{2-}}" in 'image inspect') return 1;; 'image ls') return 9;; *) return 9;; esac; }}
+kind() {{ case "$1 ${{2-}}" in 'get clusters') return 0;; *) return 9;; esac; }}
+lane13_fact() {{ printf '%s\n' "$1" >> "$FACTS"; }}
+lane13_preflight() {{{preflight}
+set +e
+lane13_preflight
+preflight_status=$?
+set -e
+[ "$preflight_status" -ne 0 ]
+[ ! -e "$WORK/kubeconfig" ]
+mkdir -p "$WORK/releases"
+curl() {{
+  if [ "$1" = --version ]; then printf 'curl 8.4.0\n'; return; fi
+  out=; while [ "$#" -gt 0 ]; do case "$1" in --output) out=$2; shift 2;; --write-out) shift 2;; *) shift;; esac; done
+  case ${{CURL_MODE-redirect}} in
+    redirect) printf release > "$out"; printf 'https://release-assets.githubusercontent.com:444/asset\n2\n' ;;
+    cap) truncate -s 16777217 "$out"; printf 'https://release-assets.githubusercontent.com/asset\n0\n' ;;
+    unsorted) printf release > "$out"; printf 'https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml\n0\n' ;;
+  esac
+}}
+kubectl() {{ : > {work}/kubectl.called; [ "${{CURL_MODE-}}" = unsorted ] && printf 'service/z\nservice/a\n' && return 0; exit 99; }}
+timeout() {{ while [ "$#" -gt 0 ]; do case "$1" in --signal=*|--kill-after=*) shift;; --signal|--kill-after) shift 2;; *s) shift; break;; *) break;; esac; done; "$@"; }}
+lane13_require_curl() {{{require_curl}
+lane13_fetch_release() {{{fetch}
+lane13_sha256() {{{sha256}
+for curl_version in 8.4 8.4.0.1 8.x.0; do
+    if lane13_require_curl "$curl_version"; then exit 91; fi
+done
+lane13_require_curl 8.4.0
+set +e
+lane13_fetch_release https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml serving-crds.yaml
+release_status=$?
+set -e
+[ "$release_status" -ne 0 ]
+[ ! -e {work}/kubectl.called ]
+rm -f "$WORK/releases/serving-crds.yaml"
+CURL_MODE=cap
+set +e
+lane13_fetch_release https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml serving-crds.yaml
+release_status=$?
+set -e
+[ "$release_status" -ne 0 ]
+[ ! -e {work}/kubectl.called ]
+rm -f "$WORK/releases/serving-crds.yaml"
+CURL_MODE=unsorted
+set +e
+lane13_fetch_release https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml serving-crds.yaml
+release_status=$?
+set -e
+[ "$release_status" -ne 0 ]
+[ -e {work}/kubectl.called ]
+"#,
+            work = directory.path().display(),
+            preflight = preflight,
+            require_curl = require_curl,
+            fetch = fetch,
+            sha256 = sha256,
+        ),
+    )
+    .expect("write lane-13 negative script");
+    let output = Command::new("sh")
+        .arg(&script)
+        .output()
+        .expect("exercise lane-13 negative controls");
+    assert!(
+        output.status.success(),
+        "lane-13 negative controls failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn lane13_evidence_finalizes_only_after_owned_cleanup_synthetic_regression() {
+    let gate = read("scripts/matrix/verify-knative.sh");
+    for marker in [
+        "lane13_outer() {",
+        "lane13_record_facts() {",
+        "lane13_preserve_diagnostics() {",
+        "input_ledger_start=",
+        "input_ledger_end=",
+        "status",
+    ] {
+        assert!(gate.contains(marker), "lane-13 D2 marker missing: {marker}");
+    }
+    assert!(
+        !gate.contains("knative scale-from-zero: ALL OK"),
+        "lane-13 must use its decimal status as the only terminal authority"
+    );
+
+    let directory = tempfile::tempdir().expect("temporary lane-13 D2 directory");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("make lane-13 D2 parent private");
+    let script = directory.path().join("d2.sh");
+    let outer = between(&gate, "lane13_outer() {", "\nterminate_port_forward() {");
+    let preserve = between(
+        &gate,
+        "lane13_preserve_diagnostics() {",
+        "\nterminate_port_forward() {",
+    );
+    let inputs = between(
+        &gate,
+        "lane13_record_inputs() {",
+        "\nlane13_record_facts() {",
+    );
+    let facts = between(
+        &gate,
+        "lane13_record_facts() {",
+        "\nlane13_record_file_fact() {",
+    );
+    let compare_inputs = between(
+        &gate,
+        "lane13_compare_input_ledgers() {",
+        "\nlane13_record_file_fact() {",
+    );
+    let validate = between(
+        &gate,
+        "lane13_validate_retained_root() {",
+        "\nlane13_outer() {",
+    );
+    let sha256 = between(
+        &gate,
+        "lane13_sha256() {",
+        "\nlane13_preserve_diagnostics() {",
+    );
+    let canonical = between(
+        &gate,
+        "lane13_canonical_script() {",
+        "\nlane13_authorize_body() {",
+    );
+    let authorize_body = between(
+        &gate,
+        "lane13_authorize_body() {",
+        "\nlane13_signal_body_group() {",
+    );
+    let remove_work = between(
+        &gate,
+        "lane13_remove_owned_work() {",
+        "\nlane13_remove_owned_kubeconfig() {",
+    );
+    let remove_kubeconfig = between(
+        &gate,
+        "lane13_remove_owned_kubeconfig() {",
+        "\nlane13_record_absence_fact() {",
+    );
+    let absence = between(
+        &gate,
+        "lane13_record_absence_fact() {",
+        "\nlane13_validate_retained_root() {",
+    );
+    let cleanup = between(&gate, "cleanup() {", "\n. scripts/cleanup-traps.sh");
+    let body = format!(
+        r#"#!/bin/sh
+set -eu
+. scripts/lib.sh
+EVIDENCE=
+EVIDENCE_OWNED=0
+LANE13_OUTER_EXIT_ARMED=0
+LANE13_OUTER_PENDING_STATUS=
+FACTS=
+TOKEN=test-token
+P11SCOPE_LANE_EVIDENCE_DIR={root}/evidence
+MARKERS={root}/markers
+WORK={root}/work
+PRODUCT=$WORK/product
+KUBECONFIG=$WORK/kubeconfig
+WORK_CREATED=
+KUBECONFIG_CREATED=
+IMAGE_CREATED=
+CLUSTER_CREATED=
+IMAGE_CLEANUP_ARMED=
+CLUSTER_CLEANUP_ARMED=
+IMAGE_ID=
+CLUSTER_NODE=
+CLUSTER_NODE_ID=
+PF_PID= PF_STARTTIME= PF_PGID= PF_SID= PF_GROUP_SNAPSHOT= PF_SESSION_EMPTY=1
+LANE13_BODY_PID= LANE13_BODY_STARTTIME= LANE13_BODY_PGID= LANE13_BODY_SID=
+LANE13_BODY_SIGNAL= LANE13_BODY_SIGNAL_STATUS=0
+SPID= SUPERVISOR_PID= SUPERVISOR_STARTTIME=
+ROOT_LAUNCH_PID= ROOT_PROCESS_PID= ROOT_PROCESS_STARTTIME=
+CLEANUP_STATUS=0
+BODY_STATUS=0
+lane13_fact() {{ printf '%s\n' "$1" >> "$FACTS"; }}
+lane13_record_inputs() {{{inputs}
+lane13_record_facts() {{{facts}
+lane13_compare_input_ledgers() {{{compare_inputs}
+lane13_sha256() {{{sha256}
+lane13_canonical_script() {{{canonical}
+lane13_authorize_body() {{{authorize_body}
+lane13_remove_owned_work() {{{remove_work}
+lane13_remove_owned_kubeconfig() {{{remove_kubeconfig}
+lane13_record_absence_fact() {{{absence}
+cleanup_step() {{ "$@"; cleanup_step_status=$?; [ "$CLEANUP_STATUS" -ne 0 ] || [ "$cleanup_step_status" -eq 0 ] || CLEANUP_STATUS=$cleanup_step_status; return 0; }}
+terminate_port_forward() {{ :; }}
+snapshot_user_process_session() {{
+    [ "${{LANE13_TEST_SNAPSHOT_FAIL-}}" != 1 ] || return 1
+    printf '[]'
+}}
+launch_user_recorded_process_group() {{
+    lurpg_pidfile=$1; lurpg_log=$2; shift 2
+    "$@" >"$lurpg_log" 2>&1 &
+    USER_PROCESS_LAUNCH_PID=$!
+    USER_PROCESS_PID=$!
+    USER_PROCESS_STARTTIME=$(awk '{{ sub(/^[0-9]+ \\(.*\\) /, ""); split($0, tail, " "); print tail[20]; exit }}' "/proc/$!/stat")
+    USER_PROCESS_PGID=$!
+    USER_PROCESS_SID=$!
+    : > "$lurpg_pidfile"
+}}
+lane13_delete_owned_cluster() {{ : > "$MARKERS/cluster-identity-mismatch"; return 1; }}
+lane13_delete_owned_image() {{ : > "$MARKERS/image-cleaned"; return 0; }}
+reclaim_root_output() {{ :; }}
+mkdir -p -m 700 "$MARKERS"
+lane13_preserve_diagnostics() {{{preserve}
+cleanup() {{{cleanup}
+if [ "${{P11SCOPE_LANE13_BODY-}}" = 1 ]; then
+    EVIDENCE=$P11SCOPE_LANE_EVIDENCE_DIR
+    FACTS=$EVIDENCE/facts.log
+    : > "$FACTS"; chmod 600 "$FACTS"
+    printf '%s\n' body-stdout
+    printf '%s\n' body-stderr >&2
+    BODY_STATUS=0
+    mkdir -m 700 "$WORK"; WORK_CREATED=1; WORK_DEV_INO=$(stat -Lc '%d:%i' "$WORK")
+    lane13_record_facts
+    : > "$WORK/observed.json"
+    : > "$WORK/manifest-host.json"
+    : > "$WORK/profile.log"
+    : > "$WORK/portforward.log"
+    : > "$WORK/portforward.group.before.json"
+    : > "$WORK/portforward.group.after.json"
+    : > "$WORK/foreign-unrelated.tmp"
+    : > "$KUBECONFIG"; KUBECONFIG_CREATED=1; KUBECONFIG_DEV_INO=$(stat -Lc '%d:%i' "$KUBECONFIG")
+    CLUSTER_CREATED=1; IMAGE_CREATED=1; IMAGE_CLEANUP_ARMED=1; CLUSTER_CLEANUP_ARMED=1
+    cleanup
+fi
+lane13_validate_retained_root() {{{validate}
+lane13_outer() {{{outer}
+lane13_outer
+"#,
+        root = directory.path().display(),
+        outer = outer,
+        inputs = inputs,
+        facts = facts,
+        compare_inputs = compare_inputs,
+        sha256 = sha256,
+        canonical = canonical,
+        authorize_body = authorize_body,
+        remove_work = remove_work,
+        remove_kubeconfig = remove_kubeconfig,
+        absence = absence,
+        validate = validate,
+        preserve = preserve,
+        cleanup = cleanup,
+    );
+    fs::write(&script, body).expect("write lane-13 D2 test script");
+    let output = Command::new("sh")
+        .arg(&script)
+        .output()
+        .expect("exercise lane-13 D2 transaction");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "identity mismatch must be nonzero: stdout={} stderr={} evidence={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_dir(directory.path().join("evidence"))
+            .map(|entries| entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>())
+            .map(|entries| format!("{entries:?}"))
+            .unwrap_or_else(|error| error.to_string())
+    );
+    let evidence = directory.path().join("evidence");
+    assert!(
+        evidence.join("stdout.log").is_file(),
+        "outer stdout missing: path={} status={} stdout={} stderr={}",
+        directory.path().display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(evidence.join("stderr.log").is_file());
+    assert!(
+        fs::read_to_string(evidence.join("stdout.log"))
+            .expect("read body stdout")
+            .contains("body-stdout"),
+        "captured stdout missing body output"
+    );
+    assert!(
+        fs::read_to_string(evidence.join("stderr.log"))
+            .expect("read body stderr")
+            .contains("body-stderr")
+    );
+    assert!(evidence.join("facts.log").is_file());
+    let facts = fs::read_to_string(evidence.join("facts.log")).expect("read final facts");
+    assert!(facts.contains("input_ledger_start="));
+    assert!(
+        facts.contains("input_ledger_end="),
+        "missing end ledger: stderr={} facts={}",
+        String::from_utf8_lossy(&output.stderr),
+        facts
+    );
+    assert!(facts.contains("cluster_absent=0"));
+    assert!(facts.contains("workload_tag_absent=1"));
+    assert!(
+        facts.contains("work_absent=0"),
+        "missing retained-work fact: {facts}"
+    );
+    assert!(!facts.contains(".lane13-inputs-"));
+    assert_eq!(
+        fs::read_to_string(evidence.join("status")).expect("read final status"),
+        "1\n"
+    );
+    assert!(directory.path().join("work").is_dir());
+    assert!(
+        directory
+            .path()
+            .join("markers/cluster-identity-mismatch")
+            .exists()
+    );
+    assert!(directory.path().join("markers/image-cleaned").exists());
+    for name in [
+        "observed.json",
+        "manifest-host.json",
+        "profile.log",
+        "portforward.log",
+        "portforward.group.before.json",
+        "portforward.group.after.json",
+    ] {
+        assert!(
+            evidence.join(name).is_file(),
+            "missing retained artifact {name}"
+        );
+    }
+    assert!(!evidence.join("foreign-unrelated.tmp").exists());
+    for entry in fs::read_dir(&evidence).expect("read retained evidence root") {
+        let entry = entry.expect("read retained evidence entry");
+        let metadata = entry.metadata().expect("read retained evidence metadata");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+    assert_eq!(
+        fs::metadata(&evidence)
+            .expect("read retained root metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+
+    fs::remove_dir_all(&evidence).expect("remove first synthetic evidence root");
+    let snapshot_failure = Command::new("sh")
+        .arg(&script)
+        .env("LANE13_TEST_SNAPSHOT_FAIL", "1")
+        .output()
+        .expect("exercise unknown body-group state");
+    assert!(!snapshot_failure.status.success());
+    assert_eq!(
+        fs::read_to_string(evidence.join("status")).expect("read snapshot-failure status"),
+        "1\n"
+    );
+    assert!(
+        evidence.join(".lane13-body.pid").is_file(),
+        "unknown body-group state discarded its durable identity"
+    );
+    assert!(evidence.join(".lane13-body-launch.log").is_file());
+}
+
+#[test]
+fn lane13_failed_queries_remove_their_private_projections() {
+    let gate = read("scripts/matrix/verify-knative.sh");
+    let image_state = between(
+        &gate,
+        "lane13_image_state() {",
+        "\n\nlane13_image_facts() {",
+    );
+    let container_absent = between(
+        &gate,
+        "lane13_container_absent() {",
+        "\n\nlane13_delete_owned_cluster() {",
+    );
+    let directory = tempfile::tempdir().expect("temporary projection directory");
+    let script = directory.path().join("projection.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+set -eu
+EVIDENCE={evidence}
+docker() {{ return 1; }}
+lane13_image_state() {{{image_state}
+lane13_container_absent() {{{container_absent}
+lane13_image_state example.invalid/test:token || :
+[ ! -e "$EVIDENCE/.lane13-image-projection" ]
+lane13_container_absent node identifier || :
+[ ! -e "$EVIDENCE/.lane13-container-projection" ]
+"#,
+            evidence = directory.path().display(),
+            image_state = image_state,
+            container_absent = container_absent,
+        ),
+    )
+    .expect("write projection cleanup regression");
+    let output = Command::new("sh")
+        .arg(&script)
+        .output()
+        .expect("exercise failed projection cleanup");
+    assert!(
+        output.status.success(),
+        "failed query retained scratch state: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn lane13_diagnostics_refuse_a_replaced_work_directory() {
+    let gate = read("scripts/matrix/verify-knative.sh");
+    let preserve = between(
+        &gate,
+        "lane13_preserve_diagnostics() {",
+        "\nterminate_port_forward() {",
+    );
+    let directory = tempfile::tempdir().expect("temporary diagnostic directory");
+    let script = directory.path().join("diagnostics.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+set -eu
+WORK={root}/work
+EVIDENCE={root}/evidence
+BODY_STATUS=1
+mkdir "$WORK" "$EVIDENCE"
+WORK_CREATED=1
+WORK_DEV_INO=$(stat -Lc '%d:%i' "$WORK")
+mv "$WORK" "$WORK-old"
+mkdir "$WORK"
+: > "$WORK/profile.log"
+reclaim_root_output() {{ : > {root}/reclaimed; }}
+lane13_preserve_diagnostics() {{{preserve}
+set +e
+lane13_preserve_diagnostics
+status=$?
+set -e
+[ "$status" -ne 0 ]
+[ ! -e {root}/reclaimed ]
+[ ! -e "$EVIDENCE/profile.log" ]
+"#,
+            root = directory.path().display(),
+            preserve = preserve,
+        ),
+    )
+    .expect("write diagnostic identity regression");
+    let output = Command::new("sh")
+        .arg(&script)
+        .output()
+        .expect("exercise diagnostic work identity");
+    assert!(
+        output.status.success(),
+        "diagnostics consumed a replaced work directory: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn every_gate_script_self_tests_its_own_validator() {
     let gates = read("scripts/gates.sh");
     let ci = read(".github/workflows/ci.yml");
@@ -2166,4 +3838,1055 @@ fn every_gate_script_self_tests_its_own_validator() {
         !ci.contains("--run "),
         "no privileged live-discovery lane may be enabled before the review checkpoint"
     );
+}
+
+#[test]
+fn lane13_evidence_finalizes_only_after_owned_cleanup() {
+    let gate = read("scripts/matrix/verify-knative.sh");
+    assert_eq!(
+        gate.matches("python3 scripts/check-capture-evidence.py lane13-knative-metrics")
+            .count(),
+        1,
+        "the exact lane-13 checker must be invoked once"
+    );
+    for marker in [
+        "P11SCOPE_LANE13_BODY",
+        "P11SCOPE_LANE13_TOKEN",
+        "P11SCOPE_LANE13_TOKEN is private lane state",
+        "LANE13_BODY_STARTTIME",
+        "LANE13_BODY_SIGNAL",
+        "lane13_container_absent",
+        "items != sorted(items)",
+        "git diff --cached --quiet",
+        "input_ledger_start=",
+        "input_ledger_end=",
+        "RepoDigests",
+        "diff_ids",
+        "dev_ino",
+    ] {
+        assert!(
+            gate.contains(marker),
+            "lane-13 Fix Round 1 marker missing: {marker}"
+        );
+    }
+    assert!(!gate.contains("knative scale-from-zero: ALL OK"));
+    assert!(!gate.contains("kill \"$launcher\""));
+    let final_status_write = gate
+        .rfind("printf '%s\\n' \"$lane13_outer_status\" > \"$EVIDENCE/status\"")
+        .expect("outer terminal status write");
+    let final_int_trap = gate
+        .rfind("trap 'lane13_outer_signal 1' INT")
+        .expect("final INT trap installation");
+    let final_term_trap = gate
+        .rfind("trap 'lane13_outer_signal 1' TERM")
+        .expect("final TERM trap installation");
+    let final_signal_check = gate
+        .find("[ \"$LANE13_BODY_SIGNAL_STATUS\" -eq 0 ] || lane13_outer_status=1")
+        .expect("final body signal-status check");
+    assert!(final_int_trap < final_signal_check);
+    assert!(final_term_trap < final_signal_check);
+    assert!(final_signal_check < final_status_write);
+    let terminal_failure = between(
+        &gate,
+        "lane13_outer_terminal_failure() {",
+        "\nlane13_outer_signal() {",
+    );
+    let terminal_trap = terminal_failure
+        .find("trap ':' EXIT")
+        .expect("terminal failure keeps EXIT trap controlled");
+    let terminal_failure_write = terminal_failure
+        .find("printf '%s\\n' \"$lane13_terminal_status\" > \"$EVIDENCE/status\"")
+        .expect("terminal failure status write");
+    assert!(terminal_trap < terminal_failure_write);
+    let retained_root_check = gate
+        .rfind("if ! lane13_validate_retained_root; then lane13_outer_status=1; fi")
+        .expect("retained-root validation");
+    assert!(final_status_write > retained_root_check);
+
+    let directory = tempfile::tempdir().expect("temporary lane-13 D2 directory");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("make lane-13 D2 parent private");
+    let fake_bin = directory.path().join("bin");
+    let state = directory.path().join("state");
+    let provider = directory.path().join("provider");
+    fs::create_dir(&fake_bin).expect("create fake command directory");
+    fs::create_dir(&state).expect("create fake state directory");
+    fs::create_dir(&provider).expect("create fake provider directory");
+    fs::write(provider.join("libsofthsm2.so"), b"fake provider bytes\n")
+        .expect("write fake provider");
+
+    let dispatcher = r###"#!/bin/sh
+name=${D2_COMMAND_NAME:-$(basename "$0")}
+work=$(dirname "${KUBECONFIG:-/tmp/none}")
+echo "$name $*" >> "$D2_STATE/calls"
+cluster="p11scope-knative-$P11SCOPE_LANE13_TOKEN"
+image="kind.local/p11scope-matrix-knative:$P11SCOPE_LANE13_TOKEN"
+case "$name" in
+mkdir)
+    mkdir_target=
+    for argument do
+        case "$argument" in
+            -*) ;;
+            *) mkdir_target=$argument ;;
+        esac
+    done
+    case "$D2_MODE" in
+        mkdir-failure-symlink|mkdir-failure-symlink-signal)
+            /bin/ln -s "$D2_STATE/foreign-symlink-target" "$mkdir_target"
+            if [ "$D2_MODE" = mkdir-failure-symlink-signal ]; then
+                kill -TERM "$PPID"
+            fi
+            exit 1 ;;
+        mkdir-failure-directory|mkdir-failure-directory-signal)
+            /bin/mkdir -m 700 "$mkdir_target"
+            printf '%s\n' foreign-directory-sentinel-a > "$mkdir_target/sentinel-a"
+            printf '%s\n' foreign-directory-sentinel-b > "$mkdir_target/sentinel-b"
+            chmod 640 "$mkdir_target/sentinel-a"
+            chmod 600 "$mkdir_target/sentinel-b"
+            if [ "$D2_MODE" = mkdir-failure-directory-signal ]; then
+                kill -TERM "$PPID"
+            fi
+            exit 1 ;;
+    esac
+    /bin/mkdir "$@"
+    mkdir_status=$?
+    if [ "$D2_MODE" = mkdir-signal ] && [ "$mkdir_status" -eq 0 ] && [ ! -e "$D2_STATE/mkdir-signal" ]; then
+        : > "$D2_STATE/mkdir-signal"
+        kill -TERM "$PPID"
+    fi
+    exit "$mkdir_status" ;;
+git)
+    echo "$*" >> "$D2_STATE/git.calls"
+    if [ "$D2_MODE" = signal-after-root ] && [ "$1" = rev-parse ] && [ "$2" = --show-object-format ] && [ ! -e "$D2_STATE/signal-after-root" ]; then
+        : > "$D2_STATE/signal-after-root"
+        kill -TERM "${P11SCOPE_LANE13_OUTER_PID:?}"
+    fi
+    if [ "$1" = diff ]; then [ ! -e "$D2_STATE/mutate-head" ]; exit $?; fi
+    if [ "$1" = rev-parse ] && [ "$2" = HEAD ]; then
+        if [ -e "$D2_STATE/mutate-head" ]; then printf '%040d\n' 2; else printf '%040d\n' 1; fi; exit 0
+    fi
+    if [ "$1" = rev-parse ] && [ "$2" = 'HEAD^{tree}' ]; then
+        if [ -e "$D2_STATE/mutate-head" ]; then printf '%040d\n' 2; else printf '%040d\n' 1; fi; exit 0
+    fi
+    case " $* " in
+        *" --show-object-format "*) echo sha1; exit 0 ;;
+        *" ls-files "*) exec /usr/bin/git "$@" ;;
+        *" status --porcelain=v1 "*) [ ! -e "$D2_STATE/mutate-head" ] || echo ' M scripts/matrix/verify-knative.sh'; exit 0 ;;
+        *" diff --quiet "*|*" diff --cached --quiet "*) [ ! -e "$D2_STATE/mutate-head" ]; exit $? ;;
+    esac
+    exit 1 ;;
+cargo)
+    if [ "$2" = --version ] || [ "$3" = --version ]; then echo 'cargo 1.88.0 (fake)'; exit 0; fi
+    target=target; previous=
+    for argument do [ "$previous" = --target-dir ] && target=$argument; previous=$argument; done
+    mkdir -p "$target/release/build/p11scope-1/out" "$target/release"
+    echo fake-bpf > "$target/release/build/p11scope-1/out/p11scope-ebpf"
+    cat > "$target/release/p11scope" <<'SCRIPT'
+#!/bin/sh
+if [ "$1" = profile ]; then
+    case " $* " in *" --duration 1 "*) echo 'cannot inspect the file locator now (Permission denied)' >&2; exit 1 ;; esac
+    output=; previous=
+    for argument do [ "$previous" = -o ] && output=$argument; previous=$argument; done
+    if [ -n "$output" ]; then
+        /usr/bin/python3 - "$output" <<'PY'
+import json
+import pathlib
+import runpy
+import sys
+
+check = runpy.run_path("scripts/check-capture-evidence.py")
+evidence = check["evidence_fixture"](
+    check["LEGACY_SURFACES"], sources=("manifest",), discovery_skipped=0
+)
+evidence["skipped"] = [{
+    "name": check["DISCOVERY_SUBJECT"],
+    "reason": check["SHARED_OVERLAY_UNCERTAINTY"],
+}]
+evidence.update(table_entries=68, slots=68, attached_probes=136)
+document = check["document_fixture"](
+    evidence,
+    schema="pkcs11-scope/observed-profile/v2-metrics",
+    mode="metrics",
+    privacy="aggregate-only",
+)
+pairs = [( ["C_GetFunctionList"], 1)]
+for line in pathlib.Path("spike/expected.txt").read_text().splitlines():
+    name, calls = line.split()
+    pairs.append(([name], int(calls)))
+document["functions"] = check["function_items"](pairs)
+pathlib.Path(sys.argv[1]).write_text(json.dumps(document), encoding="utf-8")
+PY
+    fi
+    echo 'capture — privacy=aggregate-only'; exit 0
+fi
+exit 0
+SCRIPT
+    chmod 755 "$target/release/p11scope"
+    cat > "$target/release/p11scope-discover" <<'SCRIPT'
+#!/bin/sh
+module=; output=; previous=
+for argument do [ "$previous" = --module ] && module=$argument; [ "$previous" = -o ] && output=$argument; previous=$argument; done
+printf '{"schema":"p11scope-manifest/4","module_path":"%s","objects":[{"path":"%s"}]}\n' "$module" "$module" > "$output"
+SCRIPT
+    chmod 755 "$target/release/p11scope-discover"
+    [ "$D2_MODE" = sleep-build ] && sleep 30
+    [ "$D2_MODE" = mutate-head ] && : > "$D2_STATE/mutate-head"
+    exit 0 ;;
+rustc) echo 'rustc 1.88.0 (fake)'; exit 0 ;;
+python3)
+    if [ "$1" = scripts/check-capture-evidence.py ]; then
+        printf '%s\n' checker >> "$D2_STATE/checker.calls"
+    fi
+    if [ "$D2_MODE" = terminal-signal ] && [ "$1" = - ] \
+        && [ "${2-}" = "${P11SCOPE_LANE_EVIDENCE_DIR-}" ] \
+        && [ -e "$P11SCOPE_LANE_EVIDENCE_DIR/facts.log" ] \
+        && [ ! -e "$D2_STATE/terminal-signal-ready" ]; then
+        : > "$D2_STATE/terminal-signal-ready"
+        while [ ! -e "$D2_STATE/terminal-signal-go" ]; do sleep 0.01; done
+    fi
+    if [ "$1" = -c ] && printf '%s\n' "$2" | grep -Fq socket.create_connection; then
+        [ -e "$D2_STATE/portforward-ready" ]
+        exit $?
+    fi
+    exec /usr/bin/python3 "$@" ;;
+gcc)
+    if [ "$1" = --version ]; then echo 'gcc (fake) 14.0.0'; exit 0; fi
+    output=; previous=
+    for argument do [ "$previous" = -o ] && output=$argument; previous=$argument; done
+    : > "$output"; chmod 755 "$output"; exit 0 ;;
+curl)
+    if [ "$1" = --version ]; then echo 'curl 8.4.0'; exit 0; fi
+    output=; previous=
+    for argument do [ "$previous" = --output ] && output=$argument; previous=$argument; done
+    [ -n "$output" ] || exit 0
+    echo 'apiVersion: v1' > "$output"; printf '%s\n%s\n' 'https://github.com/knative/serving/releases/download/knative-v1.23.0/fake.yaml' 0; exit 0 ;;
+docker)
+    case " $* " in
+        *" version --format "*) [ "$D2_MODE" = setup-failure ] && exit 1; echo 27.0.0; exit 0 ;;
+        *" info --format "*) echo overlay2; exit 0 ;;
+        *" image ls "*)
+            [ "$D2_MODE" = image-query-failure ] && exit 1
+            [ "$D2_MODE" = cleanup-image-query-failure ] && [ -e "$D2_STATE/image-created" ] && exit 1
+            if [ -e "$D2_STATE/image-created" ] && [ ! -e "$D2_STATE/image-removed" ]; then
+                printf '%s\t%s\tsha256:workload\n' \
+                    kind.local/p11scope-matrix-knative "$P11SCOPE_LANE13_TOKEN"
+            fi
+            exit 0 ;;
+        *" pull "*) exit 0 ;;
+        *" build "*) : > "$D2_STATE/image-created"; echo sha256:workload; exit 0 ;;
+        *" image rm "*) : > "$D2_STATE/image-cleaned"; [ "$D2_MODE" = cleanup-image-failure ] && exit 1; : > "$D2_STATE/image-removed"; exit 0 ;;
+        *" container inspect "*)
+            case " $* " in *" {{.Id}} "*) echo node-id ;; *" {{.Image}} "*) echo sha256:nodeimage ;; *) echo kindest/node:v1.33 ;; esac; exit 0 ;;
+        *" container ls "*)
+            [ "$D2_MODE" = cleanup-node-query-failure ] && [ -e "$D2_STATE/cluster-delete-called" ] && exit 1
+            [ ! -e "$D2_STATE/cluster" ] || printf 'node-id\tfake-node\n'; exit 0 ;;
+        *" image inspect "*)
+            case " $* " in *" --format "*) case " $* " in *"$image"*) echo sha256:workload ;; *) echo sha256:nodeimage ;; esac; exit 0 ;; esac
+            target=; for argument do target=$argument; done
+            [ "$target" = "$image" ] && [ -e "$D2_STATE/image-removed" ] && exit 1
+            if [ "$D2_MODE" = partial-image-creation ] && [ "$target" = "$image" ] \
+                && [ ! -e "$D2_STATE/partial-image-failed" ]; then
+                : > "$D2_STATE/partial-image-failed"; exit 1
+            fi
+            if [ "$D2_MODE" = cluster-replacement ] && [ "$target" = sha256:nodeimage ] \
+                && [ ! -e "$D2_STATE/cluster-replacement-failed" ]; then
+                : > "$D2_STATE/cluster-replacement-failed"; exit 1
+            fi
+            case "$target" in ubuntu:24.04) echo '[{"Id":"sha256:base","RepoDigests":["ubuntu@sha256:base"],"RootFS":{"Layers":["sha256:base"]}}]' ;; sha256:nodeimage) echo '[{"Id":"sha256:nodeimage","RepoDigests":["kindest/node@sha256:node"],"RootFS":{"Layers":["sha256:node-layer-1","sha256:node-layer-2"]}}]' ;; *) echo '[{"Id":"sha256:workload","RepoDigests":["kind.local/p11scope-matrix-knative@sha256:workload"],"RootFS":{"Layers":["sha256:base","sha256:work-layer"]}}]' ;; esac; exit 0 ;;
+    esac
+    exit 1 ;;
+kind)
+    case " $* " in
+        *" version "*) echo kind-v0.25.0; exit 0 ;;
+        *" get clusters "*)
+            [ "$D2_MODE" = cleanup-cluster-query-failure ] && [ -e "$D2_STATE/cluster-delete-called" ] && exit 1
+            [ ! -e "$D2_STATE/cluster" ] || echo "$cluster"; exit 0 ;;
+        *" get nodes "*)
+            if [ "$D2_MODE" = partial-cluster-creation ] \
+                && [ ! -e "$D2_STATE/partial-cluster-failed" ]; then
+                : > "$D2_STATE/partial-cluster-failed"; exit 1
+            fi
+            if [ "$D2_MODE" = cluster-replacement ]; then
+                if [ -e "$D2_STATE/cluster-node-observed" ]; then echo decoy-node; else : > "$D2_STATE/cluster-node-observed"; echo fake-node; fi
+                exit 0
+            fi
+            echo fake-node; exit 0 ;;
+        *" create cluster "*) mkdir -p "$(dirname "$KUBECONFIG")"; : > "$KUBECONFIG"; chmod 600 "$KUBECONFIG"; : > "$D2_STATE/cluster"; exit 0 ;;
+        *" load docker-image "*) exit 0 ;;
+        *" delete cluster "*) : > "$D2_STATE/cluster-delete-called"; [ "$D2_MODE" = cleanup-cluster-failure ] || rm -f "$D2_STATE/cluster"; [ "$D2_MODE" = cleanup-cluster-failure ] && exit 1 || exit 0 ;;
+    esac
+    exit 1 ;;
+kubectl)
+    case " $* " in
+        *" version --client "*) echo gitVersion: v1.33.0; exit 0 ;;
+        *" get deployment "*) exit 1 ;;
+        *" get pods -n knative-serving "*) echo knative-pod; exit 0 ;;
+        *" get pods -n kourier-system "*) echo kourier-pod; exit 0 ;;
+        *" get pods "*" --sort-by=.metadata.creationTimestamp "*) echo fake-cold-pod; exit 0 ;;
+        *" get pods "*" -l "*) exit 0 ;;
+        *" get ksvc "*) echo fake.example; exit 0 ;;
+        *" exec "*" readlink -f "*) echo /usr/lib/softhsm/libsofthsm2.so; exit 0 ;;
+        *" exec "*" tar "*) exec /usr/bin/tar -chC "$D2_PROVIDER" . ;;
+        *" apply "*)
+            file=; previous=
+            for argument do [ "$previous" = -f ] && file=$argument; previous=$argument; done
+            case "$file" in
+                *serving-crds.yaml|*serving-core.yaml|*kourier.yaml) echo configmaps/fake; exit 0 ;;
+                *ksvc.yaml) for name in observed.json manifest-host.json profile.log portforward.log portforward.group.before.json portforward.group.after.json; do : > "$work/$name"; done; : > "$work/foreign-unrelated.tmp"; case "$D2_MODE" in body-success|terminal-signal|cleanup-image-query-failure|cleanup-cluster-query-failure|cleanup-node-query-failure) exit 0 ;; esac; exit 1 ;;
+                *) exit 0 ;;
+            esac ;;
+    esac
+    if [ "$1" = get ] && [ "$2" = pod ]; then
+        pod=$3; namespace=default; pod_query=$*; shift 3
+        while [ "$#" -gt 0 ]; do [ "$1" = -n ] && namespace=$2 && shift; shift; done
+        case " $pod_query " in
+            *creationTimestamp*) echo 2026-08-26T23:59:59Z; exit 0 ;;
+            *containerID*) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; exit 0 ;;
+        esac
+        printf '{"metadata":{"namespace":"%s","name":"%s","uid":"uid-%s"},"spec":{"containers":[{"name":"anchor","image":"kind.local/fake:tag"}]},"status":{"containerStatuses":[{"name":"anchor","containerID":"containerd://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","imageID":"sha256:runtime","ready":true,"restartCount":0}]}}\n' "$namespace" "$pod" "$pod"; exit 0
+    fi
+    case " $* " in
+        *" config use-context "*|*" wait "*|*" patch "*|*" set env "*) exit 0 ;;
+        *" port-forward "*) case "$D2_MODE" in body-success|terminal-signal|cleanup-image-query-failure|cleanup-cluster-query-failure|cleanup-node-query-failure) exec "$D2_PORT_FORWARD_HELPER" "$@" ;; *) sleep 30; exit 143 ;; esac ;;
+    esac
+    exit 0 ;;
+sudo)
+    [ "$1" = -n ] && shift
+    if [ "$1" = timeout ]; then
+        shift
+        while [ "$#" -gt 0 ]; do case "$1" in --signal=*|--kill-after=*) shift ;; --signal|--kill-after) shift 2 ;; *s) shift; break ;; *) break ;; esac; done
+        case "$1" in find) echo /sys/fs/cgroup/kubepods.slice/fake.scope; exit 0 ;; awk) echo 4242; exit 0 ;; stat) echo 0:123; exit 0 ;; esac
+    fi
+    case "$1" in
+        stat) case " $* " in *" %s "*) /usr/bin/stat -Lc %s "$D2_PROVIDER/libsofthsm2.so" ;; *) echo 0:123 ;; esac; exit 0 ;;
+        sha256sum) /usr/bin/sha256sum "$D2_PROVIDER/libsofthsm2.so"; exit 0 ;;
+        readelf) echo '    Build ID: deadbeef'; exit 0 ;;
+    esac
+    exec "$@" ;;
+timeout)
+    while [ "$#" -gt 0 ]; do case "$1" in --signal=*|--kill-after=*) shift ;; --signal|--kill-after) shift 2 ;; *s) shift; break ;; *) break ;; esac; done
+    exec "$@" ;;
+readelf) echo '    Build ID: deadbeef'; exit 0 ;;
+cp) case "$D2_MODE:$*" in copy-failure:*observed.json*) exit 1 ;; esac; exec /bin/cp "$@" ;;
+tar) exec /usr/bin/tar "$@" ;;
+sha256sum) exec /usr/bin/sha256sum "$@" ;;
+*) exec "/usr/bin/$name" "$@" ;;
+esac
+"###;
+    let port_forward_source = directory.path().join("port-forward-helper.c");
+    let port_forward_helper = fake_bin.join("kubectl");
+    fs::write(
+        &port_forward_source,
+        r#"#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+extern char **environ;
+static void on_signal(int signal_number) {
+    (void)signal_number;
+    _exit(0);
+}
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "port-forward") == 0) {
+        signal(SIGINT, on_signal);
+        signal(SIGTERM, on_signal);
+        char ready[4096];
+        snprintf(ready, sizeof(ready), "%s/portforward-ready", getenv("D2_STATE"));
+        close(creat(ready, 0600));
+        for (;;) pause();
+    }
+    char *dispatch = getenv("D2_DISPATCH_PATH");
+    if (dispatch == 0) {
+        return 127;
+    }
+    setenv("D2_COMMAND_NAME", "kubectl", 1);
+    execve(dispatch, argv, environ);
+    return 127;
+}
+"#,
+    )
+    .expect("write fake port-forward helper");
+    let dispatch_path = fake_bin.join("dispatch");
+    let helper_status = Command::new("/usr/bin/cc")
+        .args(["-O0", "-o"])
+        .arg(fake_bin.join("kubectl"))
+        .arg(&port_forward_source)
+        .status()
+        .expect("compile fake port-forward helper");
+    assert!(
+        helper_status.success(),
+        "fake port-forward helper did not compile"
+    );
+    fs::write(fake_bin.join("dispatch"), dispatcher).expect("write fake dispatcher");
+    fs::set_permissions(fake_bin.join("dispatch"), fs::Permissions::from_mode(0o755))
+        .expect("make fake dispatcher executable");
+    for command in [
+        "git",
+        "cargo",
+        "rustc",
+        "gcc",
+        "curl",
+        "docker",
+        "kind",
+        "sudo",
+        "timeout",
+        "readelf",
+        "cp",
+        "tar",
+        "sha256sum",
+        "python3",
+        "mkdir",
+    ] {
+        std::os::unix::fs::symlink("dispatch", fake_bin.join(command)).unwrap();
+    }
+
+    let run = |mode: &str, evidence: &std::path::Path| {
+        for marker in [
+            "cluster",
+            "cluster-delete-called",
+            "image-created",
+            "image-cleaned",
+            "image-removed",
+            "partial-image-failed",
+            "partial-cluster-failed",
+            "cluster-node-observed",
+            "cluster-replacement-failed",
+            "mutate-head",
+            "signal-after-root",
+            "mkdir-signal",
+            "portforward-ready",
+        ] {
+            let _ = fs::remove_file(state.join(marker));
+        }
+        let _ = fs::remove_file(state.join("checker.calls"));
+        Command::new("sh")
+            .args(["scripts/matrix/verify-knative.sh"])
+            .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
+            .env("D2_STATE", &state)
+            .env("D2_PROVIDER", &provider)
+            .env("D2_MODE", mode)
+            .env("D2_DISPATCH_PATH", &dispatch_path)
+            .env("D2_PORT_FORWARD_HELPER", &port_forward_helper)
+            .env("P11SCOPE_LANE_EVIDENCE_DIR", evidence)
+            .output()
+            .expect("run real lane-13 script")
+    };
+
+    let injected = directory.path().join("injected");
+    let injection = Command::new("sh")
+        .args(["scripts/matrix/verify-knative.sh", "--lane13-private-body"])
+        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
+        .env("D2_STATE", &state)
+        .env("D2_PROVIDER", &provider)
+        .env("P11SCOPE_LANE_EVIDENCE_DIR", &injected)
+        .env("P11SCOPE_LANE13_BODY", "1")
+        .env("P11SCOPE_LANE13_TOKEN", "forged")
+        .output()
+        .expect("run direct private injection");
+    assert_eq!(
+        injection.status.code(),
+        Some(2),
+        "direct private entry was accepted: stdout={} stderr={}",
+        String::from_utf8_lossy(&injection.stdout),
+        String::from_utf8_lossy(&injection.stderr)
+    );
+    assert!(
+        !injected.exists(),
+        "direct private injection created evidence"
+    );
+    let public_token_evidence = directory.path().join("public-token");
+    let public_token = Command::new("sh")
+        .args(["scripts/matrix/verify-knative.sh"])
+        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
+        .env("D2_STATE", &state)
+        .env("D2_PROVIDER", &provider)
+        .env("P11SCOPE_LANE_EVIDENCE_DIR", &public_token_evidence)
+        .env("P11SCOPE_LANE13_TOKEN", "caller-controlled")
+        .output()
+        .expect("run public token injection");
+    assert_eq!(public_token.status.code(), Some(2));
+    assert!(!public_token_evidence.exists());
+
+    let mkdir_signal_evidence = directory.path().join("mkdir-signal-evidence");
+    let mkdir_signal = run("mkdir-signal", &mkdir_signal_evidence);
+    assert!(
+        !mkdir_signal.status.success(),
+        "signal during root creation unexpectedly passed: stdout={} stderr={}",
+        String::from_utf8_lossy(&mkdir_signal.stdout),
+        String::from_utf8_lossy(&mkdir_signal.stderr)
+    );
+    let mkdir_signal_calls = fs::read_to_string(state.join("calls")).unwrap_or_default();
+    assert!(
+        !mkdir_signal_calls
+            .lines()
+            .any(|line| line.starts_with("cargo ")),
+        "root-creation signal launched the body: {mkdir_signal_calls}"
+    );
+    assert!(
+        !state.join("checker.calls").exists(),
+        "root-creation signal launched the checker"
+    );
+    assert!(
+        !mkdir_signal_calls.contains("target/matrix-knative/"),
+        "root-creation signal created token WORK: {mkdir_signal_calls}"
+    );
+    if mkdir_signal_evidence.exists() {
+        assert!(mkdir_signal_evidence.is_dir());
+        assert_eq!(
+            fs::metadata(&mkdir_signal_evidence)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let status_path = mkdir_signal_evidence.join("status");
+        assert_eq!(
+            fs::metadata(&status_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let status = fs::read_to_string(status_path).expect("retained root has terminal status");
+        let status_line = status
+            .strip_suffix('\n')
+            .expect("terminal status has one newline");
+        assert!(!status_line.contains('\n'));
+        assert!(!status_line.is_empty() && status_line.chars().all(|c| c.is_ascii_digit()));
+        assert_ne!(status_line.parse::<u32>().unwrap(), 0);
+    }
+
+    let foreign_symlink_target = state.join("foreign-symlink-target");
+    fs::create_dir(&foreign_symlink_target).expect("create foreign symlink target");
+    fs::write(
+        foreign_symlink_target.join("sentinel"),
+        b"foreign symlink target\n",
+    )
+    .expect("write foreign symlink sentinel");
+    fs::set_permissions(
+        foreign_symlink_target.join("sentinel"),
+        fs::Permissions::from_mode(0o640),
+    )
+    .expect("make foreign symlink sentinel private");
+    fs::set_permissions(&foreign_symlink_target, fs::Permissions::from_mode(0o700))
+        .expect("make foreign symlink target private");
+    let foreign_symlink_target_mode = fs::metadata(&foreign_symlink_target)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    let foreign_symlink_bytes = fs::read(foreign_symlink_target.join("sentinel")).unwrap();
+    let foreign_symlink_mode = fs::metadata(foreign_symlink_target.join("sentinel"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    let mkdir_symlink_evidence = directory.path().join("mkdir-failure-symlink-evidence");
+    let mkdir_symlink = run("mkdir-failure-symlink-signal", &mkdir_symlink_evidence);
+    assert!(!mkdir_symlink.status.success());
+    assert!(
+        fs::symlink_metadata(&mkdir_symlink_evidence)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read_link(&mkdir_symlink_evidence).unwrap(),
+        foreign_symlink_target
+    );
+    assert_eq!(
+        fs::read(foreign_symlink_target.join("sentinel")).unwrap(),
+        foreign_symlink_bytes
+    );
+    assert_eq!(
+        fs::metadata(foreign_symlink_target.join("sentinel"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        foreign_symlink_mode
+    );
+    assert_eq!(
+        fs::metadata(&foreign_symlink_target)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        foreign_symlink_target_mode
+    );
+    assert!(!foreign_symlink_target.join("status").exists());
+    assert!(!foreign_symlink_target.join("stdout.log").exists());
+    assert!(!foreign_symlink_target.join("stderr.log").exists());
+    assert!(!foreign_symlink_target.join("facts.log").exists());
+    assert!(!state.join("checker.calls").exists());
+    let symlink_calls = fs::read_to_string(state.join("calls")).unwrap_or_default();
+    assert!(!symlink_calls.contains("cargo "));
+    assert!(!symlink_calls.contains("target/matrix-knative/"));
+    let symlink_entries = fs::read_dir(&foreign_symlink_target)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        symlink_entries,
+        ["sentinel"]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect()
+    );
+
+    let mkdir_directory_evidence = directory.path().join("mkdir-failure-directory-evidence");
+    let mkdir_directory = run("mkdir-failure-directory", &mkdir_directory_evidence);
+    assert!(!mkdir_directory.status.success());
+    assert_eq!(
+        fs::metadata(&mkdir_directory_evidence)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    for (name, contents, mode) in [
+        (
+            "sentinel-a",
+            b"foreign-directory-sentinel-a\n".as_slice(),
+            0o640,
+        ),
+        (
+            "sentinel-b",
+            b"foreign-directory-sentinel-b\n".as_slice(),
+            0o600,
+        ),
+    ] {
+        let path = mkdir_directory_evidence.join(name);
+        assert_eq!(fs::read(&path).unwrap(), contents);
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            mode
+        );
+    }
+    assert!(!mkdir_directory_evidence.join("status").exists());
+    assert!(!mkdir_directory_evidence.join("stdout.log").exists());
+    assert!(!mkdir_directory_evidence.join("stderr.log").exists());
+    assert!(!mkdir_directory_evidence.join("facts.log").exists());
+    assert!(!state.join("checker.calls").exists());
+    let directory_calls = fs::read_to_string(state.join("calls")).unwrap_or_default();
+    assert!(!directory_calls.contains("cargo "));
+    assert!(!directory_calls.contains("target/matrix-knative/"));
+    let directory_entries = fs::read_dir(&mkdir_directory_evidence)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        directory_entries,
+        ["sentinel-a", "sentinel-b"]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect()
+    );
+
+    let success_evidence = directory.path().join("success-evidence");
+    let success = run("body-success", &success_evidence);
+    assert!(
+        success.status.success(),
+        "full body-success dispatch failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&success.stdout),
+        format_args!(
+            "{} evidence-status={} facts-summary={} evidence-stderr={} calls={}",
+            String::from_utf8_lossy(&success.stderr),
+            fs::read_to_string(success_evidence.join("status")).unwrap_or_default(),
+            fs::read_to_string(success_evidence.join("facts.log"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.contains("status") || line.contains("absent"))
+                .collect::<Vec<_>>()
+                .join("|"),
+            fs::read_to_string(success_evidence.join("stderr.log")).unwrap_or_default(),
+            fs::read_to_string(state.join("calls")).unwrap_or_default()
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(success_evidence.join("status")).unwrap(),
+        "0\n"
+    );
+    let success_facts = fs::read_to_string(success_evidence.join("facts.log")).unwrap();
+    let success_work = success_facts
+        .lines()
+        .find_map(|line| line.strip_prefix("work="))
+        .expect("success recorded work path");
+    assert!(!std::path::Path::new(success_work).exists());
+    assert!(success_facts.contains("cluster_absent=1"));
+    assert!(success_facts.contains("workload_tag_absent=1"));
+    assert!(success_facts.contains("kubeconfig_absent=1"));
+    assert!(success_facts.contains("work_absent=1"));
+    let success_entries = fs::read_dir(&success_evidence)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::HashSet<_>>();
+    let allowed_entries = [
+        "stdout.log",
+        "stderr.log",
+        "facts.log",
+        "status",
+        "observed.json",
+        "manifest-host.json",
+        "profile.log",
+        "portforward.log",
+        "portforward.group.before.json",
+        "portforward.group.after.json",
+    ]
+    .into_iter()
+    .map(std::ffi::OsString::from)
+    .collect::<std::collections::HashSet<_>>();
+    assert_eq!(success_entries, allowed_entries);
+    assert_eq!(
+        fs::read_to_string(state.join("checker.calls"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "exact checker must run once"
+    );
+
+    let early_signal_evidence = directory.path().join("early-signal-evidence");
+    let early_signal = run("signal-after-root", &early_signal_evidence);
+    assert!(
+        !early_signal.status.success(),
+        "post-root signal unexpectedly passed: stdout={} stderr={}",
+        String::from_utf8_lossy(&early_signal.stdout),
+        String::from_utf8_lossy(&early_signal.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(early_signal_evidence.join("status")).unwrap(),
+        "1\n"
+    );
+    let early_facts_path = early_signal_evidence.join("facts.log");
+    let early_deadline = Instant::now() + Duration::from_secs(5);
+    let mut early_signal_work = None;
+    while Instant::now() < early_deadline {
+        if let Ok(facts) = fs::read_to_string(&early_facts_path) {
+            if let Some(work) = facts.lines().find_map(|line| line.strip_prefix("work=")) {
+                if !std::path::Path::new(work).exists() {
+                    early_signal_work = Some(work.to_owned());
+                    break;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        early_signal_work.is_some(),
+        "post-root signal did not record and remove WORK"
+    );
+
+    let terminal_signal_evidence = directory.path().join("terminal-signal-evidence");
+    for marker in ["terminal-signal-ready", "terminal-signal-go"] {
+        let _ = fs::remove_file(state.join(marker));
+    }
+    let mut terminal_signal = Command::new("sh")
+        .args(["scripts/matrix/verify-knative.sh"])
+        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
+        .env("D2_STATE", &state)
+        .env("D2_PROVIDER", &provider)
+        .env("D2_MODE", "terminal-signal")
+        .env("D2_DISPATCH_PATH", &dispatch_path)
+        .env("D2_PORT_FORWARD_HELPER", &port_forward_helper)
+        .env("P11SCOPE_LANE_EVIDENCE_DIR", &terminal_signal_evidence)
+        .spawn()
+        .expect("start terminal-finalization signal scenario");
+    let terminal_deadline = Instant::now() + Duration::from_secs(5);
+    while !state.join("terminal-signal-ready").exists()
+        && Instant::now() < terminal_deadline
+        && terminal_signal.try_wait().unwrap().is_none()
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        state.join("terminal-signal-ready").exists(),
+        "terminal signal boundary was not reached"
+    );
+    let terminal_pid = terminal_signal.id().to_string();
+    let _ = Command::new("kill").args(["-TERM", &terminal_pid]).status();
+    fs::write(state.join("terminal-signal-go"), b"go\n").unwrap();
+    let terminal_status = terminal_signal
+        .wait()
+        .expect("wait terminal signal scenario");
+    assert!(!terminal_status.success());
+    assert_eq!(
+        fs::read_to_string(terminal_signal_evidence.join("status")).unwrap(),
+        "1\n"
+    );
+    assert!(
+        terminal_signal_evidence.join("facts.log").is_file(),
+        "terminal evidence entries: {:?}",
+        fs::read_dir(&terminal_signal_evidence).map(|entries| entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect::<Vec<_>>())
+    );
+    let terminal_facts = fs::read_to_string(terminal_signal_evidence.join("facts.log")).unwrap();
+    if let Some(terminal_work) = terminal_facts
+        .lines()
+        .find_map(|line| line.strip_prefix("work="))
+    {
+        assert!(!std::path::Path::new(terminal_work).exists());
+    }
+
+    for (mode, absence_fact) in [
+        ("cleanup-image-query-failure", "workload_tag_absent=0"),
+        ("cleanup-cluster-query-failure", "cluster_absent=0"),
+        ("cleanup-node-query-failure", "cluster_absent=0"),
+    ] {
+        let evidence = directory.path().join(mode);
+        let output = run(mode, &evidence);
+        assert!(
+            !output.status.success(),
+            "{mode} unexpectedly passed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read_to_string(evidence.join("status")).unwrap(), "1\n");
+        let facts = fs::read_to_string(evidence.join("facts.log")).unwrap();
+        assert!(
+            facts.contains(absence_fact),
+            "missing {absence_fact}: {facts}"
+        );
+        assert!(!facts.contains(&absence_fact.replace("=0", "=1")));
+    }
+
+    for (mode, cleanup_marker, absence_fact) in [
+        (
+            "partial-image-creation",
+            "image-cleaned",
+            "workload_tag_absent=1",
+        ),
+        (
+            "partial-cluster-creation",
+            "cluster-delete-called",
+            "cluster_absent=1",
+        ),
+    ] {
+        let evidence = directory.path().join(mode);
+        let output = run(mode, &evidence);
+        assert!(!output.status.success(), "{mode} unexpectedly passed");
+        assert!(
+            state.join(cleanup_marker).is_file(),
+            "{mode} skipped cleanup: stdout={} stderr={} calls={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            fs::read_to_string(state.join("calls")).unwrap_or_default()
+        );
+        let facts = fs::read_to_string(evidence.join("facts.log")).unwrap();
+        assert!(
+            facts.contains(absence_fact),
+            "missing {absence_fact}: {facts}"
+        );
+        let work = facts
+            .lines()
+            .find_map(|line| line.strip_prefix("work="))
+            .expect("partial creation recorded work path");
+        assert!(!std::path::Path::new(work).exists());
+    }
+
+    let replacement_evidence = directory.path().join("cluster-replacement");
+    let replacement = run("cluster-replacement", &replacement_evidence);
+    assert!(!replacement.status.success());
+    assert!(!state.join("cluster-delete-called").exists());
+    let replacement_facts = fs::read_to_string(replacement_evidence.join("facts.log")).unwrap();
+    assert!(replacement_facts.contains("cluster_absent=0"));
+    assert!(replacement_facts.contains("work_absent=0"));
+    let replacement_work = replacement_facts
+        .lines()
+        .find_map(|line| line.strip_prefix("work="))
+        .expect("replacement recorded work path");
+    assert!(std::path::Path::new(replacement_work).is_dir());
+
+    let failure_evidence = directory.path().join("failure-evidence");
+    let failure = run("cleanup-cluster-failure", &failure_evidence);
+    assert!(
+        !failure.status.success(),
+        "body/cleanup failure unexpectedly passed"
+    );
+    assert!(failure_evidence.join("stdout.log").is_file());
+    assert!(failure_evidence.join("stderr.log").is_file());
+    assert!(
+        fs::read_to_string(failure_evidence.join("stdout.log"))
+            .unwrap()
+            .contains("build product"),
+        "failure stdout={} stderr={} outer stdout={} outer stderr={} git={}",
+        fs::read_to_string(failure_evidence.join("stdout.log")).unwrap(),
+        fs::read_to_string(failure_evidence.join("stderr.log")).unwrap(),
+        String::from_utf8_lossy(&failure.stdout),
+        String::from_utf8_lossy(&failure.stderr),
+        fs::read_to_string(state.join("git.calls")).unwrap_or_default()
+    );
+    let facts = fs::read_to_string(failure_evidence.join("facts.log")).expect("read final facts");
+    let work = facts
+        .lines()
+        .find_map(|line| line.strip_prefix("work="))
+        .expect("recorded work path");
+    assert!(std::path::Path::new(work).is_dir());
+    for marker in [
+        "input_ledger_start=",
+        "input_ledger_end=",
+        "image_cluster_node_repo_digests=",
+        "image_cluster_node_diff_ids=",
+        "copied_provider_size=",
+        "manifest_selected_provider_sha256=",
+        "capture_provider_build_id=deadbeef",
+        "cluster_absent=0",
+        "workload_tag_absent=1",
+        "kubeconfig_absent=1",
+        "work_absent=0",
+        "cleanup_status=",
+    ] {
+        assert!(
+            facts.contains(marker),
+            "missing lane-13 fact {marker}: stdout={} stderr={} facts={} calls={}",
+            String::from_utf8_lossy(&failure.stdout),
+            String::from_utf8_lossy(&failure.stderr),
+            facts,
+            fs::read_to_string(state.join("calls")).unwrap_or_default()
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(failure_evidence.join("status")).unwrap(),
+        "1\n"
+    );
+    assert!(state.join("cluster-delete-called").exists());
+    assert!(
+        state.join("cluster").exists(),
+        "foreign cluster refusal was not preserved"
+    );
+    assert!(
+        state.join("image-cleaned").exists(),
+        "cleanup did not continue after cluster refusal"
+    );
+    for name in [
+        "observed.json",
+        "manifest-host.json",
+        "profile.log",
+        "portforward.log",
+        "portforward.group.before.json",
+        "portforward.group.after.json",
+    ] {
+        assert!(
+            failure_evidence.join(name).is_file(),
+            "missing retained artifact {name}"
+        );
+    }
+    assert!(!failure_evidence.join("foreign-unrelated.tmp").exists());
+    assert_eq!(
+        fs::metadata(&failure_evidence)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    for entry in fs::read_dir(&failure_evidence).unwrap() {
+        assert_eq!(
+            entry.unwrap().metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    let copy_evidence = directory.path().join("copy-evidence");
+    let copy = run("copy-failure", &copy_evidence);
+    assert!(!copy.status.success());
+    assert_eq!(
+        fs::read_to_string(copy_evidence.join("status")).unwrap(),
+        "1\n"
+    );
+    assert!(
+        state.join("image-cleaned").exists(),
+        "cleanup stopped after copy failure"
+    );
+
+    let setup_evidence = directory.path().join("setup-evidence");
+    let setup = run("setup-failure", &setup_evidence);
+    assert!(!setup.status.success());
+    assert_eq!(
+        fs::read_to_string(setup_evidence.join("status")).unwrap(),
+        "1\n"
+    );
+
+    let image_query_evidence = directory.path().join("image-query-evidence");
+    let image_query = run("image-query-failure", &image_query_evidence);
+    assert!(!image_query.status.success());
+    assert_eq!(
+        fs::read_to_string(image_query_evidence.join("status")).unwrap(),
+        "1\n"
+    );
+
+    let mutate_evidence = directory.path().join("mutate-evidence");
+    let mutate = run("mutate-head", &mutate_evidence);
+    assert!(!mutate.status.success());
+    let mutate_facts = fs::read_to_string(mutate_evidence.join("facts.log")).unwrap();
+    for marker in [
+        "git_head_start=",
+        "git_head_end=",
+        "git_tree_start=",
+        "git_tree_end=",
+        "git_status_end=",
+        "input_ledger_start=",
+        "input_ledger_end=",
+    ] {
+        assert!(
+            mutate_facts.contains(marker),
+            "missing mutation fact {marker}"
+        );
+    }
+
+    let signal_evidence = directory.path().join("signal-evidence");
+    let mut child = Command::new("sh")
+        .args(["scripts/matrix/verify-knative.sh"])
+        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
+        .env("D2_STATE", &state)
+        .env("D2_PROVIDER", &provider)
+        .env("D2_MODE", "sleep-build")
+        .env("P11SCOPE_LANE_EVIDENCE_DIR", &signal_evidence)
+        .spawn()
+        .expect("start signal scenario");
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < ready_deadline {
+        if fs::read_to_string(signal_evidence.join("facts.log"))
+            .is_ok_and(|facts| facts.lines().any(|line| line.starts_with("work=")))
+        {
+            break;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "signal body exited before WORK"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        fs::read_to_string(signal_evidence.join("facts.log"))
+            .is_ok_and(|facts| facts.lines().any(|line| line.starts_with("work="))),
+        "signal body did not reach WORK"
+    );
+    let pid = child.id().to_string();
+    let _ = Command::new("kill").args(["-TERM", &pid]).status();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    if child.try_wait().unwrap().is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("outer-only signal orphaned the mutating body");
+    }
+    assert!(
+        signal_evidence.join("status").is_file(),
+        "signal path did not finalize status"
+    );
+    let signal_facts = fs::read_to_string(signal_evidence.join("facts.log")).unwrap();
+    let signal_work = signal_facts
+        .lines()
+        .find_map(|line| line.strip_prefix("work="))
+        .expect("signal recorded work path");
+    assert!(!std::path::Path::new(signal_work).exists());
 }

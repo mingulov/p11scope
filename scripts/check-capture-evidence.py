@@ -5,6 +5,7 @@ import copy
 import json
 import re
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -214,6 +215,15 @@ def digest_ok(carrier):
     return isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
 
 
+def build_id_ok(value):
+    return value is None or (
+        isinstance(value, str)
+        and len(value) > 0
+        and len(value) % 2 == 0
+        and re.fullmatch(r"[0-9a-f]+", value) is not None
+    )
+
+
 def u64(value, *, positive=False):
     return (
         isinstance(value, int)
@@ -232,6 +242,15 @@ def exact_identity(carrier):
     )
     require(u64(carrier["ino"], positive=True), f"invalid object inode: {carrier}")
     require(digest_ok(carrier), f"invalid object digest: {carrier}")
+    require(
+        "build_id" not in carrier or build_id_ok(carrier["build_id"]),
+        f"invalid object build ID: {carrier}",
+    )
+
+
+def exact_full_identity(carrier):
+    require("build_id" in carrier, f"full identity omits build ID: {carrier}")
+    exact_identity(carrier)
 
 
 def exact_sources(carrier):
@@ -320,6 +339,7 @@ def exact_counters(evidence, allowances=None):
     require(not unknown, f"unknown evidence allowances: {sorted(unknown)}")
     for name in COUNTERS:
         wanted = allowances.get(name, 0)
+        require(u64(evidence[name]), f"{name}: invalid counter {evidence[name]!r}")
         require(evidence[name] == wanted, f"{name}: want {wanted}, got {evidence[name]}")
 
 
@@ -335,16 +355,24 @@ def exact_manifest_object_fallbacks(evidence):
     scan_identities = set()
     for module in evidence["discovery"]:
         require(
-            {"sources", "objects", "corroborated", "corroboration"} <= set(module),
+            {"sources", "objects", "corroborated", "corroboration", "skipped"} <= set(module),
             f"incomplete discovery module: {module}",
         )
         exact_sources(module)
-        exact_identity(module)
+        exact_full_identity(module)
+        nested_skips = module["skipped"]
+        require(isinstance(nested_skips, list), f"module skips are not an array: {module}")
+        for skip in nested_skips:
+            bounded_skip(skip)
+            require(
+                skip in evidence["skipped"],
+                f"module skip is absent from top-level evidence: {skip}",
+            )
         if "scan" in module["sources"]:
             scan_identities.add((tuple(module["dev"]), module["ino"], module["sha256"]))
         for carrier in module["objects"]:
             exact_sources(carrier)
-            exact_identity(carrier)
+            exact_full_identity(carrier)
             if "scan" in carrier["sources"]:
                 scan_identities.add(
                     (tuple(carrier["dev"]), carrier["ino"], carrier["sha256"])
@@ -446,6 +474,8 @@ def exact_shape(evidence, table_entries, slots, probes, surfaces, vendor, interf
         ("vendor_interfaces", vendor),
         ("interface_list", interface_list),
     ):
+        if isinstance(wanted, int):
+            require(u64(evidence[name]), f"{name}: invalid count {evidence[name]!r}")
         require(evidence[name] == wanted, f"{name}: want {wanted!r}, got {evidence[name]!r}")
     require(surface_signature(evidence) == surfaces, f"unexpected surfaces: {evidence['surfaces']}")
 
@@ -464,16 +494,29 @@ def entry_skips(evidence):
     return [item for item in evidence["skipped"] if item["name"].startswith("C_")]
 
 
+def bounded_skip(item):
+    require(
+        isinstance(item, dict) and set(item) == {"name", "reason"},
+        f"invalid capture skip: {item!r}",
+    )
+    require(
+        isinstance(item["name"], str) and isinstance(item["reason"], str),
+        f"invalid capture skip: {item!r}",
+    )
+    entry = item["name"].startswith("C_")
+    require(
+        entry or item["name"] == DISCOVERY_SUBJECT,
+        f"unbounded capture skip subject: {item}",
+    )
+    allowed = ENTRY_REASONS if entry else DISCOVERY_REASONS
+    require(item["reason"] in allowed, f"unbounded capture skip reason: {item}")
+    return entry
+
+
 def discovery_skips(evidence):
     """Object/process/scope losses after capture-output subject bounding."""
     for item in evidence["skipped"]:
-        entry = item["name"].startswith("C_")
-        require(
-            entry or item["name"] == DISCOVERY_SUBJECT,
-            f"unbounded capture skip subject: {item}",
-        )
-        allowed = ENTRY_REASONS if entry else DISCOVERY_REASONS
-        require(item["reason"] in allowed, f"unbounded capture skip reason: {item}")
+        bounded_skip(item)
     return [item for item in evidence["skipped"] if item["name"] == DISCOVERY_SUBJECT]
 
 
@@ -688,6 +731,10 @@ def exact_common(evidence, *, aliases, skipped, in_flight, discovery_skipped=0):
         len(discovery_skips(evidence)) == discovery_skipped,
         f"discovery skips: want {discovery_skipped}, got {discovery_skips(evidence)}",
     )
+    require(
+        u64(evidence["in_flight_at_end"]),
+        f"invalid in_flight_at_end: {evidence['in_flight_at_end']!r}",
+    )
     require(evidence["in_flight_at_end"] == in_flight, evidence["in_flight_at_end"])
     require(evidence["templates_truncated"] is False, "templates were truncated")
     require(evidence["provider_changed"] is False, "a pinned provider object changed during capture")
@@ -698,10 +745,10 @@ def exact_common(evidence, *, aliases, skipped, in_flight, discovery_skipped=0):
     require(evidence["discovery"], "evidence.discovery is empty: nothing was discovered")
     exact_manifest_object_fallbacks(evidence)
     for module in evidence["discovery"]:
-        exact_identity(module)
+        exact_full_identity(module)
         exact_sources(module)
         for object_ in module["objects"]:
-            exact_identity(object_)
+            exact_full_identity(object_)
             exact_sources(object_)
     require(evidence["modules_skipped"] == [], f"modules refused: {evidence['modules_skipped']}")
     require(evidence["scan_unavailable"] is None, evidence["scan_unavailable"])
@@ -765,7 +812,7 @@ def exact_capture_modules(document):
         # `sha256` is null for an object nothing pinned — never in a lane that
         # attached probes, and the guard keeps that a stated rejection rather
         # than a TypeError traceback.
-        exact_identity(module)
+        exact_full_identity(module)
     require(
         modules == [
             {key: module[key] for key in ("path", "dev", "ino", "sha256", "build_id")}
@@ -1016,15 +1063,34 @@ def validate_clean_metrics(
             surface_sources == wanted_surface_sources,
             f"unexpected corroborated surface sources: {evidence['surfaces']}",
         )
+    elif discovery == "manifest-only":
+        require(
+            [object_["sources"] for object_ in evidence["discovery"][0]["objects"]]
+            == [wanted_sources],
+            f"unexpected manifest-only object sources: {evidence['discovery']}",
+        )
+        require(
+            Counter(surface["source"] for surface in evidence["surfaces"])
+            == Counter({"legacy_function_list": 1}),
+            f"unexpected manifest-only surface sources: {evidence['surfaces']}",
+        )
     exact_capture_modules(document)
 
     actual = Counter()
     for item in document["functions"]:
         calls = item["calls"]
-        require(isinstance(calls, int) and calls >= 0, f"invalid call count: {item}")
-        require(item["names"], f"function without names: {item}")
+        require(u64(calls), f"invalid call count: {item}")
+        names = item["names"]
+        require(
+            isinstance(names, list)
+            and names
+            and all(isinstance(name, str) for name in names)
+            and len(names) == len(set(names)),
+            f"invalid function names: {item}",
+        )
+        require(item["aliased"] is False, f"clean metrics cannot contain aliases: {item}")
         if calls:
-            actual.update({name: calls for name in item["names"]})
+            actual.update({name: calls for name in names})
     wanted = {name: calls * multiplier for name, calls in expected.items()}
     require("C_GetFunctionList" not in wanted, "expected-count file must omit bootstrap")
     wanted["C_GetFunctionList"] = multiplier
@@ -1043,6 +1109,27 @@ def validate_shared_layer_metrics(document, expected, multiplier=1):
         document["evidence"]["skipped"]
         == [{"name": DISCOVERY_SUBJECT, "reason": SHARED_OVERLAY_UNCERTAINTY}],
         f"unexpected shared-overlay uncertainty: {document['evidence']['skipped']}",
+    )
+def validate_lane13_knative_metrics(document, expected):
+    """Lane 13: manifest-only clean metrics plus one shared-overlay uncertainty."""
+    require(
+        "discovery_uncorroborated" in document["evidence"],
+        "lane 13 must state discovery_uncorroborated",
+    )
+    validate_clean_metrics(
+        document,
+        expected,
+        discovery="manifest-only",
+        discovery_skipped=1,
+    )
+    require(
+        document["evidence"]["skipped"]
+        == [{"name": DISCOVERY_SUBJECT, "reason": SHARED_OVERLAY_UNCERTAINTY}],
+        f"unexpected shared-overlay uncertainty: {document['evidence']['skipped']}",
+    )
+    require(
+        [module["skipped"] for module in document["evidence"]["discovery"]] == [[]],
+        f"lane 13 cannot contain module entry skips: {document['evidence']['discovery']}",
     )
 
 
@@ -1298,7 +1385,12 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
         "skipped": [dict(DISCOVERY_SKIP) for _ in range(discovery_skipped)],
         "in_flight_at_end": 0,
         "surfaces": [
-            {"walk": walk, "functions": functions, "acquisition": "ok"}
+            {
+                "walk": walk,
+                "functions": functions,
+                "acquisition": "ok",
+                "source": "legacy_function_list",
+            }
             for (walk, functions), count in surfaces.items()
             for _ in range(count)
         ],
@@ -1367,6 +1459,11 @@ def self_test():
         }
     ]
     validate_shared_layer_metrics(shared, {"C_Initialize": 1})
+    shared_nested_overlay = copy.deepcopy(shared)
+    shared_nested_overlay["evidence"]["discovery"][0]["skipped"] = [
+        copy.deepcopy(shared_nested_overlay["evidence"]["skipped"][0])
+    ]
+    validate_shared_layer_metrics(shared_nested_overlay, {"C_Initialize": 1})
     for mutate in (
         lambda d: d["evidence"].update(skipped=[]),
         lambda d: d["evidence"]["skipped"].append(
@@ -1410,6 +1507,65 @@ def self_test():
     manifest_only["functions"] = function_items(
         [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
     )
+    lane13 = copy.deepcopy(manifest_only)
+    lane13["evidence"]["skipped"] = [
+        {
+            "name": DISCOVERY_SUBJECT,
+            "reason": SHARED_OVERLAY_UNCERTAINTY,
+        }
+    ]
+    validate_lane13_knative_metrics(lane13, {"C_Initialize": 1})
+    for mutate in (
+        lambda d: d["evidence"].update(skipped=[]),
+        lambda d: d["evidence"]["skipped"].append(
+            copy.deepcopy(d["evidence"]["skipped"][0])
+        ),
+        lambda d: d["evidence"]["skipped"][0].update(name="renamed discovery subject"),
+        lambda d: d["evidence"]["skipped"][0].update(reason=TABLE_UNAVAILABLE),
+        lambda d: d["evidence"]["skipped"][0].update(reason=DISCOVERY_UNAVAILABLE),
+        lambda d: d["evidence"]["skipped"].append(
+            {"name": DISCOVERY_SUBJECT, "reason": DISCOVERY_UNAVAILABLE}
+        ),
+        lambda d: d["evidence"]["discovery"][0].update(
+            skipped=[{"name": "C_Initialize", "reason": ENTRY_UNAVAILABLE}]
+        ),
+        lambda d: d["evidence"]["discovery"][0].update(
+            skipped=[{"name": "/private/provider/path", "reason": "raw internal error chain"}]
+        ),
+        lambda d: d["evidence"]["discovery"][0].update(
+            skipped=[copy.deepcopy(d["evidence"]["skipped"][0])]
+        ),
+        lambda d: d["evidence"]["discovery"][0]["objects"][0].update(sources=["scan"]),
+        lambda d: d["evidence"]["surfaces"][0].update(
+            source="scan-derived arbitrary label"
+        ),
+        lambda d: d["evidence"].update(event_loss=1),
+        lambda d: d["evidence"].update(event_loss=False),
+        lambda d: d["evidence"].update(scan_unavailable="ptrace"),
+        lambda d: d["evidence"].update(discovery_uncorroborated=0),
+        lambda d: d["evidence"].update(discovery_uncorroborated=2),
+        lambda d: d["evidence"].update(discovery_uncorroborated=True),
+        lambda d: d["evidence"].pop("discovery_uncorroborated"),
+        lambda d: d["evidence"].update(slots=67),
+        lambda d: d["evidence"].update(vendor_interfaces=False),
+        lambda d: d["evidence"].update(in_flight_at_end=False),
+        lambda d: d["functions"][1].update(calls=2),
+        lambda d: d["functions"][1].update(calls=True),
+        lambda d: d["functions"][1].update(
+            names=["C_Initialize", "C_Initialize"], aliased=True
+        ),
+        lambda d: d["evidence"]["discovery"][0].update(build_id=7),
+        lambda d: d["capture"]["modules"][0].update(build_id=7),
+        lambda d: d["evidence"]["discovery"][0]["objects"][0].update(build_id="a"),
+        lambda d: d["evidence"]["discovery"][0]["objects"][0].pop("build_id"),
+        lambda d: d["capture"]["modules"][0].update(build_id="AABB"),
+        lambda d: d.update(schema="pkcs11-scope/observed-profile/v2"),
+        lambda d: d["capture"].update(mode="profile"),
+        lambda d: d["capture"].update(privacy_mode="allowlisted"),
+    ):
+        bad = copy.deepcopy(lane13)
+        mutate(bad)
+        rejected(lambda bad=bad: validate_lane13_knative_metrics(bad, {"C_Initialize": 1}))
     corroborated_evidence = evidence_fixture(
         LEGACY_SURFACES + LEGACY_SURFACES, sources=("scan", "manifest")
     )
@@ -1425,6 +1581,28 @@ def self_test():
     corroborated["functions"] = function_items(
         [(["C_GetFunctionList"], 1), (["C_Initialize"], 1)]
     )
+    for wrong_discovery in (clean, corroborated):
+        bad = copy.deepcopy(wrong_discovery)
+        bad["evidence"]["skipped"] = [
+            {"name": DISCOVERY_SUBJECT, "reason": SHARED_OVERLAY_UNCERTAINTY}
+        ]
+        rejected(lambda bad=bad: validate_lane13_knative_metrics(bad, {"C_Initialize": 1}))
+    print("lane13 manifest-only shared overlay is exact: OK")
+    print("lane13 rejects widened skips, discovery, modes, and concrete gaps: OK")
+    print("lane13 rejects nested skips, provenance, malformed scalars, and aliases: OK")
+    print("lane13 rejects nested overlays and malformed build IDs: OK")
+    with tempfile.TemporaryDirectory() as directory:
+        output = Path(directory) / "observed.json"
+        expected = Path(directory) / "expected.txt"
+        output.write_text(json.dumps(lane13), encoding="utf-8")
+        expected.write_text("C_Initialize 1\n", encoding="utf-8")
+        main(["lane13-knative-metrics", str(output), str(expected)])
+        rejected(
+            lambda: main(
+                ["lane13-knative-metrics", str(output), str(expected), "2"]
+            )
+        )
+    print("lane13 rejects a multiplier argument: OK")
     documents = {
         "scan": clean,
         "corroborated": corroborated,
@@ -2201,7 +2379,12 @@ def main(argv):
         self_test()
         return
     require(len(argv) >= 1, "usage: check-capture-evidence.py MODE ...")
-    if argv[0] == "shared-layer-metrics" and len(argv) in (3, 4):
+    if argv[0] == "lane13-knative-metrics" and len(argv) == 3:
+        validate_lane13_knative_metrics(
+            load_json(argv[1]),
+            expected_counts(argv[2]),
+        )
+    elif argv[0] == "shared-layer-metrics" and len(argv) in (3, 4):
         multiplier = int(argv[3]) if len(argv) == 4 else 1
         validate_shared_layer_metrics(
             load_json(argv[1]),
@@ -2227,6 +2410,7 @@ def main(argv):
             "usage: check-capture-evidence.py "
             "clean-metrics[-corroborated|-manifest-only] OUTPUT EXPECTED [MULTIPLIER] | "
             "shared-layer-metrics OUTPUT EXPECTED [MULTIPLIER] | "
+            "lane13-knative-metrics OUTPUT EXPECTED | "
             "canary LANE OUTPUT | induced G[1-5] OUTPUT | --self-test"
         )
 

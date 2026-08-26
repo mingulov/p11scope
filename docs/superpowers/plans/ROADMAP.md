@@ -201,6 +201,15 @@ known-limitations section: `docs/notes/phase4-matrix.md`.
    `attached_probes: 0/136`, and `PARTIAL`. These host-specific rows do not
    remeasure Docker/kind; that broader capability matrix remains pending.
 
+**Topology scope qualification (2026-08-27, Slice 1b-2):** The historical
+Knative matrix evidence above is retained for the exact preattached provider
+capture: shared-inode attachment, `136/136` probes, and expected cold-pod
+calls. It is narrower than full late-provider discovery. In the reproduced
+Knative node-wide retained-view topology, full late-provider discovery is
+`UNSUPPORTED/NON-PASS`; the exact one-overlay/one-unavailable result is a
+required negative control and is never converted to PASS. The Lane 13 checker
+and zero-unavailable acceptance oracle remain unchanged.
+
 ## Phase 5 — Overhead benchmark + docs + v0.1 release
 
 - Benchmark unobserved vs `metrics` vs `trace` on SoftHSM2 (worst case:
@@ -457,6 +466,22 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     required CI, release, and security clearance remain incomplete or
     unclaimed. See the
     [pause amendment](../specs/2026-08-19-slice1b2-no-busy-wait-pause-amendment.md).**
+
+    **Topology scope ruling (2026-08-27):** Task 4's Lane 13 checker and
+    zero-unavailable oracle are unchanged. The exact reproduced node-wide
+    retained-view late-provider case is an expected `UNSUPPORTED/NON-PASS`
+    negative control with one overlay plus one unavailable; any different
+    public shape, additional gap, or lifecycle/input/cleanup failure stops the
+    campaign. The retained preattached-provider Knative evidence remains
+    `136/136` with expected cold-pod calls. Remaining applicable Task 4 lanes
+    and r3 may proceed only after this additive amendment is independently
+    reviewed and committed; Lane 13 PASS is not an unlock condition. The
+    separate gate-closure Task 5 capability-validator work is complete through
+    exact commit
+    `7a0c1eddac0b0b81340206ac742884ca2f31f691`, whose live capability gate
+    exited 0 without changing Lane 13. Public README/usage wording remains
+    reserved for Task 10; no design-spec, production, privacy/schema, or
+    procfs/mmap/eBPF fallback change is made here.**
 - **Slice 2 — capture quality**: ring/epoll, budgets, safe-policy params, per-module profile
   sections, filters, snapshots.
 - **Slice 3 — structure**: module split, evidence plumbing, docs consolidation, multi-kernel CI.

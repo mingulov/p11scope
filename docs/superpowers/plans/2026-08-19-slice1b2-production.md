@@ -66,6 +66,21 @@ No new crate is planned.
   historical unchecked implementation boxes below; those boxes are retained as
   the original task contract, not current status.
 
+**Topology scope amendment (2026-08-27, Task 4):** The existing Lane 13
+checker and zero-unavailable acceptance oracle are unchanged. Retain the
+evidenced Knative shared-inode capture for the exact preattached provider:
+`136/136` probes and expected cold-pod calls. In the reproduced Knative
+node-wide retained-view topology, full late-provider discovery is
+`UNSUPPORTED/NON-PASS`; its one-overlay/one-unavailable result is a required
+negative control, never a PASS. Remaining applicable Task 4 lanes and r3 may
+proceed only after this additive amendment is independently reviewed and
+committed; Lane 13 PASS is not an unlock condition. The separate gate-closure
+Task 5 capability-validator work is complete through exact commit
+`7a0c1eddac0b0b81340206ac742884ca2f31f691`, and its live capability gate exited
+0 without changing Lane 13. README/usage wording remains reserved
+for Task 10. This amendment changes no design spec, production
+Rust/BPF/privacy/schema/allowlist, or procfs/mmap/eBPF fallback behavior.
+
 ## Global constraints
 
 1. Preserve `docs/privacy/allowlist-v1.md` until the explicit evidence task;
@@ -1587,6 +1602,11 @@ python3 scripts/check-live-discovery-evidence.py \
   satisfy this regression.
 - [ ] Shared-layer, fork/cgroup, oracle, Knative, induced-gap, privacy canary,
   release-build, and overhead lanes retain existing oracles and cleanup.
+- [ ] Knative's retained preattached-provider evidence remains the measured
+  `136/136`/expected-cold-pod capture. The exact reproduced node-wide
+  retained-view late-provider topology is an expected `UNSUPPORTED/NON-PASS`
+  negative control with one overlay plus one unavailable; do not translate that
+  result into a PASS or widen the checker oracle.
 - [ ] Benchmark `run --pause never` separately from explicit `auto`; report the
   explicit-pause 1 ms userspace polling cost rather than folding it into normal
   capture overhead or adding epoll speculatively.
@@ -1646,6 +1666,11 @@ python3 scripts/check-live-discovery-evidence.py \
   negative classification from raw bounded evidence.
 - [ ] A failed or unavailable optional provider is not hidden; a required
   SoftHSM/proxy/fixture/kernel/product lane is campaign non-PASS.
+- [ ] Record the exact Knative late-provider negative-control disposition. The
+  reproduced one-overlay/one-unavailable shape is the expected
+  `UNSUPPORTED/NON-PASS` result and does not stop otherwise applicable lanes;
+  any different public shape, additional gap, or lifecycle/input/cleanup
+  failure stops the campaign.
 - [ ] Confirm the historical Task 8 160/160 attach-first artifact remains
   diagnostic/non-promotable with zero attempts in this campaign.
 - [ ] Run a security diff review of the whole Slice 1b-2 range, focusing BPF
@@ -1722,7 +1747,9 @@ git diff --check
 - [ ] Only after Task 9 runtime gates and its candidate CI pass, update
   README/usage with factual
   capability boundaries: no manifest is required for bounded live discovery;
-  late `dlopen` is observed through supported hooks; all empty-catalog captures
+  late `dlopen` is observed through supported hooks in supported measured
+  topologies; full late-provider discovery in the reproduced Knative node-wide
+  retained-view topology remains explicitly unsupported; all empty-catalog captures
   remain `PARTIAL`; external PID/cgroup windows are unpaused; owned `run` pause
   is explicit; only the owned child generation is followed; arbitrary
   descendants/nonstandard providers are not guaranteed; and observer SIGKILL

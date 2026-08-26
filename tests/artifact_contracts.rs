@@ -3413,6 +3413,168 @@ set -e
 }
 
 #[test]
+fn lane13_generated_bpf_requires_real_elf_and_rejects_text() {
+    let gate = read("scripts/matrix/verify-knative.sh");
+    let generated = between(
+        &gate,
+        "lane13_record_generated_bpf()",
+        "\nlane13_record_pod_identity() {",
+    );
+    let directory = tempfile::tempdir().expect("temporary generated-BPF directory");
+    let bpf = directory
+        .path()
+        .join("product/release/build/p11scope-1/out/p11scope-ebpf");
+    fs::create_dir_all(bpf.parent().unwrap()).expect("create generated-BPF directory");
+    fs::write(&bpf, p11scope::EBPF_OBJECT).expect("write real embedded eBPF object");
+    let source = directory.path().join("ebpf-source");
+    fs::write(&source, p11scope::EBPF_OBJECT).expect("write eBPF source copy");
+    let facts = directory.path().join("facts.log");
+    let script = directory.path().join("generated-bpf.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+set -eu
+WORK={root}
+PRODUCT=$WORK/product
+FACTS=$WORK/facts.log
+BPF=$PRODUCT/release/build/p11scope-1/out/p11scope-ebpf
+SOURCE={source}
+failure=0
+lane13_fact() {{ printf '%s\n' "$1" >> "$FACTS"; }}
+lane13_sha256() {{ /usr/bin/sha256sum "$1" | awk '{{ print $1 }}'; }}
+lane13_record_generated_bpf(){generated}
+if lane13_record_generated_bpf; then real_status=0; else real_status=$?; fi
+printf 'real_status=%s\n' "$real_status"
+[ "$real_status" -eq 0 ] || failure=1
+[ "$real_status" -ne 0 ] || [ "$(wc -l < "$FACTS")" -eq 8 ] || failure=1
+[ "$real_status" -ne 0 ] || grep -Fqx "generated_bpf_path=$BPF" "$FACTS" || failure=1
+[ "$real_status" -ne 0 ] || grep -Fqx "generated_bpf_size=$(stat -Lc %s "$BPF")" "$FACTS" || failure=1
+[ "$real_status" -ne 0 ] || grep -Fqx "generated_bpf_sha256=$(/usr/bin/sha256sum "$BPF" | awk '{{ print $1 }}')" "$FACTS" || failure=1
+[ "$real_status" -ne 0 ] || grep -Fqx generated_bpf_build_id=absent "$FACTS" || failure=1
+[ "$real_status" -ne 0 ] || grep -Fqx generated_bpf_elf_class=ELF64 "$FACTS" || failure=1
+[ "$real_status" -ne 0 ] || grep -Fqx generated_bpf_elf_data=LSB "$FACTS" || failure=1
+[ "$real_status" -ne 0 ] || grep -Fqx generated_bpf_elf_type=ET_REL "$FACTS" || failure=1
+[ "$real_status" -ne 0 ] || grep -Fqx generated_bpf_elf_machine=EM_BPF "$FACTS" || failure=1
+: > "$FACTS"
+printf 'arbitrary text\n' > "$BPF"
+if lane13_record_generated_bpf; then text_status=0; else text_status=$?; fi
+printf 'text_status=%s\n' "$text_status"
+[ "$text_status" -ne 0 ] || failure=1
+[ ! -s "$FACTS" ] || failure=1
+/bin/cp "$SOURCE" "$BPF"
+readelf() {{ [ "$1" = -n ] && return 42; /usr/bin/readelf "$@"; }}
+: > "$FACTS"
+if lane13_record_generated_bpf; then readelf_status=0; else readelf_status=$?; fi
+printf 'readelf_status=%s\n' "$readelf_status"
+[ "$readelf_status" -ne 0 ] || failure=1
+[ ! -s "$FACTS" ] || failure=1
+exit "$failure"
+"#,
+            root = directory.path().display(),
+            source = source.display(),
+            generated = generated,
+        ),
+    )
+    .expect("write generated-BPF contract script");
+    let output = Command::new("sh")
+        .arg(&script)
+        .output()
+        .expect("exercise generated-BPF contract");
+    assert!(
+        output.status.success(),
+        "generated-BPF contract failed: stdout={} stderr={} facts={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&facts).unwrap_or_else(|error| error.to_string())
+    );
+}
+
+#[test]
+fn lane13_generated_bpf_rejects_path_swap_at_final_identity() {
+    let gate = read("scripts/matrix/verify-knative.sh");
+    let generated = between(
+        &gate,
+        "lane13_record_generated_bpf()",
+        "\nlane13_record_pod_identity() {",
+    );
+    let directory = tempfile::tempdir().expect("temporary generated-BPF ABA directory");
+    let bpf = directory
+        .path()
+        .join("product/release/build/p11scope-1/out/p11scope-ebpf");
+    fs::create_dir_all(bpf.parent().unwrap()).expect("create generated-BPF ABA directory");
+    fs::write(&bpf, p11scope::EBPF_OBJECT).expect("write original embedded eBPF object");
+    let replacement = directory.path().join("replacement-ebpf");
+    fs::write(&replacement, p11scope::EBPF_OBJECT).expect("write replacement eBPF object");
+    let facts = directory.path().join("facts.log");
+    let script = directory.path().join("generated-bpf-aba.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+set -eu
+WORK={root}
+PRODUCT=$WORK/product
+FACTS=$WORK/facts.log
+BPF={bpf}
+REPLACEMENT={replacement}
+failure=0
+STAT_CALLS=$WORK/stat-fd-calls
+printf '0\n' > "$STAT_CALLS"
+lane13_fact() {{ printf '%s\n' "$1" >> "$FACTS"; }}
+lane13_sha256() {{ /usr/bin/sha256sum "$1" | awk '{{ print $1 }}'; }}
+readelf() {{ [ "$1" = -n ] && printf '    Build ID: deadbeef\n' || /usr/bin/readelf "$@"; }}
+stat() {{
+    lane13_stat_target=
+    for lane13_stat_arg do lane13_stat_target=$lane13_stat_arg; done
+    if [ "$lane13_stat_target" = /proc/self/fd/9 ]; then
+        lane13_stat_fd_calls=$(cat "$STAT_CALLS")
+        lane13_stat_fd_calls=$((lane13_stat_fd_calls + 1))
+        printf '%s\n' "$lane13_stat_fd_calls" > "$STAT_CALLS"
+        if [ "$lane13_stat_fd_calls" -eq 3 ]; then
+            /bin/mv -- "$BPF" "$BPF.aba-original"
+            /bin/mv -- "$REPLACEMENT" "$BPF"
+        fi
+    fi
+    exec /usr/bin/stat "$@"
+}}
+lane13_record_generated_bpf(){generated}
+if lane13_record_generated_bpf; then
+    aba_status=0
+else
+    aba_status=$?
+fi
+printf 'aba_status=%s\n' "$aba_status"
+lane13_stat_fd_calls=$(cat "$STAT_CALLS")
+printf 'pinned_fd_stat_calls=%s\n' "$lane13_stat_fd_calls"
+[ "$aba_status" -ne 0 ] || failure=1
+[ ! -s "$FACTS" ] || failure=1
+[ "$lane13_stat_fd_calls" -eq 3 ] || failure=1
+[ -f "$BPF.aba-original" ] || failure=1
+[ -f "$BPF.aba-original" ] && /bin/mv -- "$BPF.aba-original" "$BPF"
+exit "$failure"
+"#,
+            root = directory.path().display(),
+            bpf = bpf.display(),
+            replacement = replacement.display(),
+            generated = generated,
+        ),
+    )
+    .expect("write generated-BPF ABA contract script");
+    let output = Command::new("sh")
+        .arg(&script)
+        .output()
+        .expect("exercise generated-BPF ABA contract");
+    assert!(
+        output.status.success(),
+        "generated-BPF ABA contract failed: stdout={} stderr={} facts={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&facts).unwrap_or_else(|error| error.to_string())
+    );
+}
+
+#[test]
 fn lane13_evidence_finalizes_only_after_owned_cleanup_synthetic_regression() {
     let gate = read("scripts/matrix/verify-knative.sh");
     for marker in [
@@ -3914,6 +4076,8 @@ fn lane13_evidence_finalizes_only_after_owned_cleanup() {
     fs::create_dir(&provider).expect("create fake provider directory");
     fs::write(provider.join("libsofthsm2.so"), b"fake provider bytes\n")
         .expect("write fake provider");
+    let ebpf_object = directory.path().join("p11scope-ebpf");
+    fs::write(&ebpf_object, p11scope::EBPF_OBJECT).expect("write real embedded eBPF object");
 
     let dispatcher = r###"#!/bin/sh
 name=${D2_COMMAND_NAME:-$(basename "$0")}
@@ -3980,7 +4144,7 @@ cargo)
     target=target; previous=
     for argument do [ "$previous" = --target-dir ] && target=$argument; previous=$argument; done
     mkdir -p "$target/release/build/p11scope-1/out" "$target/release"
-    echo fake-bpf > "$target/release/build/p11scope-1/out/p11scope-ebpf"
+    /bin/cp "$D2_EBPF_OBJECT" "$target/release/build/p11scope-1/out/p11scope-ebpf"
     cat > "$target/release/p11scope" <<'SCRIPT'
 #!/bin/sh
 if [ "$1" = profile ]; then
@@ -4166,7 +4330,11 @@ sudo)
 timeout)
     while [ "$#" -gt 0 ]; do case "$1" in --signal=*|--kill-after=*) shift ;; --signal|--kill-after) shift 2 ;; *s) shift; break ;; *) break ;; esac; done
     exec "$@" ;;
-readelf) echo '    Build ID: deadbeef'; exit 0 ;;
+readelf)
+    case "$*" in
+        *p11scope-ebpf|*/proc/*/fd/*) exec /usr/bin/readelf "$@" ;;
+        *) echo '    Build ID: deadbeef'; exit 0 ;;
+    esac ;;
 cp) case "$D2_MODE:$*" in copy-failure:*observed.json*) exit 1 ;; esac; exec /bin/cp "$@" ;;
 tar) exec /usr/bin/tar "$@" ;;
 sha256sum) exec /usr/bin/sha256sum "$@" ;;
@@ -4266,6 +4434,7 @@ int main(int argc, char **argv) {
             .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
             .env("D2_STATE", &state)
             .env("D2_PROVIDER", &provider)
+            .env("D2_EBPF_OBJECT", &ebpf_object)
             .env("D2_MODE", mode)
             .env("D2_DISPATCH_PATH", &dispatch_path)
             .env("D2_PORT_FORWARD_HELPER", &port_forward_helper)
@@ -4513,6 +4682,41 @@ int main(int argc, char **argv) {
         .lines()
         .find_map(|line| line.strip_prefix("work="))
         .expect("success recorded work path");
+    let expected_generated_sha = run_ok("/usr/bin/sha256sum", &[ebpf_object.to_str().unwrap()])
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let expected_generated_facts = [
+        format!(
+            "generated_bpf_path={success_work}/product/release/build/p11scope-1/out/p11scope-ebpf"
+        ),
+        format!("generated_bpf_size={}", p11scope::EBPF_OBJECT.len()),
+        format!("generated_bpf_sha256={expected_generated_sha}"),
+        "generated_bpf_build_id=absent".to_owned(),
+        "generated_bpf_elf_class=ELF64".to_owned(),
+        "generated_bpf_elf_data=LSB".to_owned(),
+        "generated_bpf_elf_type=ET_REL".to_owned(),
+        "generated_bpf_elf_machine=EM_BPF".to_owned(),
+    ];
+    assert_eq!(
+        success_facts
+            .lines()
+            .filter(|line| line.starts_with("generated_bpf_"))
+            .count(),
+        expected_generated_facts.len(),
+        "generated-BPF receipt must contain exactly eight facts"
+    );
+    for expected in expected_generated_facts {
+        assert_eq!(
+            success_facts
+                .lines()
+                .filter(|line| *line == expected)
+                .count(),
+            1,
+            "generated-BPF receipt fact missing or duplicated: {expected}"
+        );
+    }
     assert!(!std::path::Path::new(success_work).exists());
     assert!(success_facts.contains("cluster_absent=1"));
     assert!(success_facts.contains("workload_tag_absent=1"));

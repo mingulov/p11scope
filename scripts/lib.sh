@@ -51,6 +51,34 @@ capped_container_tar() {
     }
 }
 
+recording_launcher_active() {
+    rla_pid=$1
+    kill -0 "$rla_pid" 2>/dev/null || return 1
+    ! awk '{ sub(/^[0-9]+ \(.*\) /, ""); exit(substr($0, 1, 1) == "Z" ? 0 : 1) }' \
+        "/proc/$rla_pid/stat" 2>/dev/null
+}
+
+terminate_recording_launcher() {
+    trl_pid=$1
+    case $trl_pid in ''|*[!0-9]*) return 1 ;; esac
+    kill "$trl_pid" 2>/dev/null || true
+    trl_attempt=0
+    while recording_launcher_active "$trl_pid" && [ "$trl_attempt" -lt 100 ]; do
+        trl_attempt=$((trl_attempt + 1))
+        sleep 0.05
+    done
+    if recording_launcher_active "$trl_pid"; then
+        kill -KILL "$trl_pid" 2>/dev/null || return 1
+        trl_attempt=0
+        while recording_launcher_active "$trl_pid" && [ "$trl_attempt" -lt 100 ]; do
+            trl_attempt=$((trl_attempt + 1))
+            sleep 0.05
+        done
+    fi
+    recording_launcher_active "$trl_pid" && return 1
+    wait "$trl_pid" 2>/dev/null || true
+}
+
 launch_root_recorded_process() {
     lrrp_pidfile=$1
     lrrp_log=$2
@@ -58,17 +86,19 @@ launch_root_recorded_process() {
     sudo -n sh -c '
         umask 077
         starttime=$(awk '\''{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[20]; exit }'\'' "/proc/$$/stat") || exit 1
-        printf "%s %s\n" "$$" "$starttime" > "$1"
+        set -C
+        printf "%s %s\n" "$$" "$starttime" > "$1" || exit 1
         shift
         exec "$@"
     ' sh "$lrrp_pidfile" "$@" > "$lrrp_log" 2>&1 &
     ROOT_LAUNCH_PID=$!
     lrrp_record=$(wait_root_process_record "$lrrp_pidfile" "$ROOT_LAUNCH_PID") || {
         lrrp_status=$?
-        kill "$ROOT_LAUNCH_PID" 2>/dev/null || true
-        wait "$ROOT_LAUNCH_PID" 2>/dev/null || true
-        ROOT_LAUNCH_PID=
-        return "$lrrp_status"
+        if terminate_recording_launcher "$ROOT_LAUNCH_PID"; then
+            ROOT_LAUNCH_PID=
+            return "$lrrp_status"
+        fi
+        return 1
     }
     set -- $lrrp_record
     [ "$#" -eq 2 ] || return 1
@@ -81,7 +111,7 @@ wait_root_process_record() {
     wrpr_launcher=$2
     wrpr_attempt=0
     while ! sudo -n test -s "$wrpr_pidfile" && [ "$wrpr_attempt" -lt 160 ]; do
-        kill -0 "$wrpr_launcher" 2>/dev/null || {
+        recording_launcher_active "$wrpr_launcher" || {
             echo "root process exited before recording its identity" >&2
             return 1
         }

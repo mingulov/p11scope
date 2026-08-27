@@ -2055,6 +2055,7 @@ fn every_script_parses_with_sh_n() {
         "scripts/verify-induced-gaps.sh",
         "scripts/verify-discover-containers.sh",
         "scripts/verify-capability-tier.sh",
+        "scripts/verify-task4-lane02.sh",
         "scripts/matrix/verify-docker.sh",
         "scripts/matrix/verify-fork-scope.sh",
         "scripts/matrix/verify-oracle.sh",
@@ -2069,6 +2070,23 @@ fn every_script_parses_with_sh_n() {
             .unwrap_or_else(|error| panic!("sh -n {path}: {error}"));
         assert!(status.success(), "sh -n failed for {path}");
     }
+}
+
+#[test]
+fn lane02_checker_and_driver_self_tests_execute() {
+    let checker = run_ok(
+        "python3",
+        &["scripts/check-capture-evidence.py", "--self-test"],
+    );
+    assert!(
+        checker.contains("lane02 owned-run metrics self-test: OK"),
+        "checker self-test misses Lane02 marker: {checker}"
+    );
+    let driver = run_ok("sh", &["scripts/verify-task4-lane02.sh", "--self-test"]);
+    assert!(
+        driver.contains("verify-task4-lane02 self-test: OK"),
+        "driver self-test misses marker: {driver}"
+    );
 }
 
 #[test]

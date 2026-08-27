@@ -544,6 +544,20 @@ def unpublished_identity_keys(mapping, published=()):
     )
 
 
+def nested_unpublished_identity_keys(value, path="discovery"):
+    found = []
+    if isinstance(value, dict):
+        for name, nested in value.items():
+            nested_path = f"{path}.{name}"
+            if name.startswith(IDENTITY_PREFIXES) or name.endswith(IDENTITY_SUFFIXES):
+                found.append(nested_path)
+            found.extend(nested_unpublished_identity_keys(nested, nested_path))
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            found.extend(nested_unpublished_identity_keys(nested, f"{path}[{index}]"))
+    return found
+
+
 def exact_loader_discovery(evidence):
     """`evidence.loader_discovery` is closed, finite, and count-only.
 
@@ -720,7 +734,9 @@ def exact_active_to_empty(document):
             )
 
 
-def exact_common(evidence, *, aliases, skipped, in_flight, discovery_skipped=0):
+def exact_common(
+    evidence, *, aliases, skipped, in_flight, discovery_skipped=0, run=False
+):
     require(evidence["attach_failures"] == [], evidence["attach_failures"])
     require(evidence["aliased"] == aliases, f"unexpected aliases: {evidence['aliased']}")
     require(
@@ -741,7 +757,9 @@ def exact_common(evidence, *, aliases, skipped, in_flight, discovery_skipped=0):
     # Discovery is the claim the whole document rests on: a lane that attached
     # probes must name what it attached them into, and how it was authorized.
     require(evidence["authority"] == "hash-pinned", f"unexpected authority: {evidence['authority']}")
-    exact_live_discovery_evidence(evidence)
+    exact_live_discovery_evidence(evidence, run=run)
+    intruders = nested_unpublished_identity_keys(evidence["discovery"])
+    require(not intruders, f"unpublished nested discovery identity: {intruders}")
     require(evidence["discovery"], "evidence.discovery is empty: nothing was discovered")
     exact_manifest_object_fallbacks(evidence)
     for module in evidence["discovery"]:
@@ -1023,7 +1041,13 @@ CLEAN_DISCOVERY = {
 
 
 def validate_clean_metrics(
-    document, expected, multiplier=1, *, discovery="scan", discovery_skipped=0
+    document,
+    expected,
+    multiplier=1,
+    *,
+    discovery="scan",
+    discovery_skipped=0,
+    run=False,
 ):
     """SoftHSM2 counted exactly, with discovery stated rather than assumed."""
     require(discovery in CLEAN_DISCOVERY, f"unknown clean-metrics discovery: {discovery}")
@@ -1045,6 +1069,7 @@ def validate_clean_metrics(
         skipped=[],
         in_flight=0,
         discovery_skipped=discovery_skipped,
+        run=run,
     )
     exact_counters(evidence, allowances)
     sources = [module["sources"] for module in evidence["discovery"]]
@@ -1095,6 +1120,54 @@ def validate_clean_metrics(
     require("C_GetFunctionList" not in wanted, "expected-count file must omit bootstrap")
     wanted["C_GetFunctionList"] = multiplier
     require(dict(actual) == wanted, f"positive function counts: want {wanted}, got {dict(actual)}")
+
+
+def validate_lane02_owned_run_metrics(document, expected, pause):
+    """Lane 02: one owned child, one bounded discovery-unavailable projection."""
+    require(pause in ("never", "auto", "always"), f"unknown Lane02 pause: {pause!r}")
+    validate_clean_metrics(
+        document,
+        expected,
+        discovery="scan",
+        discovery_skipped=1,
+        run=True,
+    )
+    evidence = document["evidence"]
+    require(
+        evidence["skipped"]
+        == [{"name": DISCOVERY_SUBJECT, "reason": DISCOVERY_UNAVAILABLE}],
+        f"unexpected Lane02 skips: {evidence['skipped']}",
+    )
+    require(evidence["child_still_running"] is False, evidence["child_still_running"])
+    loader = evidence["loader_discovery"]
+    require(loader["state_read_failures"] == 0, loader["state_read_failures"])
+    require(
+        loader["strategies"]
+        == {"debug_state_every_hit": 2, "dlopen_return": 0, "unavailable": 0},
+        f"unexpected Lane02 loader strategies: {loader['strategies']}",
+    )
+    timing = {
+        "qualified_pre_constructor": 0,
+        "known_pre_relocation": 0,
+        "unproven": 1,
+        "none": 0,
+    }
+    require(loader["dlopen_timing"] == timing, loader["dlopen_timing"])
+    require(loader["initial_set_timing"] == timing, loader["initial_set_timing"])
+    require(
+        loader["initial_set_capture"] == {"eligible": 0, "none": 1},
+        loader["initial_set_capture"],
+    )
+    attempts, confirmed, partial = (evidence[name] for name in PAUSE_COUNTERS)
+    if pause == "never":
+        require(
+            (evidence["pause"], attempts, confirmed, partial) == ("none", 0, 0, 0),
+            f"Lane02 never pause tuple: {(evidence['pause'], attempts, confirmed, partial)}",
+        )
+    else:
+        require(evidence["pause"] == "sigstop", evidence["pause"])
+        require(attempts == confirmed and confirmed >= 1, (attempts, confirmed))
+        require(partial == 0, partial)
 
 
 def validate_shared_layer_metrics(document, expected, multiplier=1):
@@ -1490,6 +1563,70 @@ def self_test():
     validate_clean_metrics(doubled, {"C_Initialize": 1}, 2)
     rejected(lambda: validate_clean_metrics(clean, {"C_Initialize": 1}, 2))
     print("clean metrics multiplier is exact: OK")
+
+    # Lane 02 owns one child and publishes one sanitized timing-proof skip.
+    for pause in ("never", "auto", "always"):
+        owned = copy.deepcopy(clean)
+        owned["evidence"]["skipped"] = [
+            {"name": DISCOVERY_SUBJECT, "reason": DISCOVERY_UNAVAILABLE}
+        ]
+        owned["evidence"]["child_still_running"] = False
+        owned["evidence"]["loader_discovery"] = loader_discovery_fixture(
+            strategies__debug_state_every_hit=2,
+            dlopen_timing__unproven=1,
+            initial_set_timing__unproven=1,
+            initial_set_capture__none=1,
+        )
+        if pause != "never":
+            owned["evidence"].update(
+                pause="sigstop", pause_attempts=1, pause_confirmed=1, pause_partial=0
+            )
+        validate_lane02_owned_run_metrics(owned, {"C_Initialize": 1}, pause)
+        for mutate in (
+            lambda d: d["evidence"].pop("child_still_running"),
+            lambda d: d["evidence"].update(child_still_running="no"),
+            lambda d: d["evidence"].update(child_still_running=True),
+            lambda d: d["evidence"].update(skipped=[]),
+            lambda d: d["evidence"]["skipped"].append(
+                {"name": DISCOVERY_SUBJECT, "reason": DISCOVERY_UNAVAILABLE}
+            ),
+            lambda d: d["evidence"]["skipped"][0].update(reason=TABLE_UNAVAILABLE),
+            lambda d: d["evidence"]["loader_discovery"].update(state_read_failures=1),
+            lambda d: d["evidence"]["discovery"][0].update(loader_pid=7),
+            lambda d: d["functions"].__setitem__(0, function_items(
+                [(["C_GetFunctionList"], 2)]
+            )[0]),
+        ):
+            bad = copy.deepcopy(owned)
+            mutate(bad)
+            rejected(
+                lambda bad=bad, pause=pause: validate_lane02_owned_run_metrics(
+                    bad, {"C_Initialize": 1}, pause
+                )
+            )
+        bad = copy.deepcopy(owned)
+        if pause == "never":
+            bad["evidence"].update(pause="sigstop", pause_attempts=1, pause_confirmed=1)
+        else:
+            bad["evidence"].update(pause="none", pause_attempts=0, pause_confirmed=0)
+        rejected(
+            lambda bad=bad, pause=pause: validate_lane02_owned_run_metrics(
+                bad, {"C_Initialize": 1}, pause
+            )
+        )
+        rejected(
+            lambda owned=owned, pause=pause: validate_lane02_owned_run_metrics(
+                owned, {"C_Initialize": 2}, pause
+            )
+        )
+        zero_loader = copy.deepcopy(owned)
+        zero_loader["evidence"]["loader_discovery"] = loader_discovery_fixture()
+        rejected(
+            lambda zero_loader=zero_loader, pause=pause: validate_lane02_owned_run_metrics(
+                zero_loader, {"C_Initialize": 1}, pause
+            )
+        )
+    print("lane02 owned-run metrics self-test: OK")
 
     # A lane whose target maps the provider only after attach: the manifest is
     # the sole source and is reported uncorroborated. The scanned expectation
@@ -2384,6 +2521,12 @@ def main(argv):
             load_json(argv[1]),
             expected_counts(argv[2]),
         )
+    elif argv[0] == "lane02-owned-run-metrics" and len(argv) == 4:
+        validate_lane02_owned_run_metrics(
+            load_json(argv[1]),
+            expected_counts(argv[2]),
+            argv[3],
+        )
     elif argv[0] == "shared-layer-metrics" and len(argv) in (3, 4):
         multiplier = int(argv[3]) if len(argv) == 4 else 1
         validate_shared_layer_metrics(
@@ -2411,6 +2554,7 @@ def main(argv):
             "clean-metrics[-corroborated|-manifest-only] OUTPUT EXPECTED [MULTIPLIER] | "
             "shared-layer-metrics OUTPUT EXPECTED [MULTIPLIER] | "
             "lane13-knative-metrics OUTPUT EXPECTED | "
+            "lane02-owned-run-metrics OUTPUT EXPECTED POLICY | "
             "canary LANE OUTPUT | induced G[1-5] OUTPUT | --self-test"
         )
 

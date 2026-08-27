@@ -163,6 +163,16 @@ observer_alive() {
     fi
 }
 
+count_byte_token() {
+    python3 - "$1" "$2" <<'PY'
+import sys
+if len(sys.argv) != 3 or not sys.argv[2]:
+    raise SystemExit("count_byte_token: expected path and non-empty token")
+with open(sys.argv[1], "rb") as stream:
+    print(stream.read().count(sys.argv[2].encode()))
+PY
+}
+
 # The child can emit the marker after iteration N drained discovery but before
 # N rendered. Two subsequent frames prove iteration N+1 drained after mapping.
 wait_mapped_and_drained() {
@@ -171,13 +181,13 @@ wait_mapped_and_drained() {
     wmd_attempt=0
     wmd_limit=${WAIT_ATTEMPTS:-240}
     wmd_delay=${WAIT_DELAY:-0.05}
-    while ! grep -Fqx 'HARNESS_PROVIDER_MAPPED' "$wmd_log" 2>/dev/null; do
+    while [ "$(count_byte_token "$wmd_log" HARNESS_PROVIDER_MAPPED)" -lt 1 ]; do
         observer_alive || return 1
         [ "$wmd_attempt" -lt "$wmd_limit" ] || return 1
         wmd_attempt=$((wmd_attempt + 1))
         sleep "$wmd_delay"
     done
-    [ "$(grep -Fxc HARNESS_PROVIDER_MAPPED "$wmd_log")" -eq 1 ] || return 1
+    [ "$(count_byte_token "$wmd_log" HARNESS_PROVIDER_MAPPED)" -eq 1 ] || return 1
     if [ "$wmd_load_kind" = initial-set ]; then
         wmd_expected=HARNESS_PROVIDER_INITIAL_SET
         wmd_rejected=HARNESS_PROVIDER_LATE_LOAD
@@ -185,8 +195,8 @@ wait_mapped_and_drained() {
         wmd_expected=HARNESS_PROVIDER_LATE_LOAD
         wmd_rejected=HARNESS_PROVIDER_INITIAL_SET
     fi
-    [ "$(grep -Fxc "$wmd_expected" "$wmd_log")" -eq 1 ] || return 1
-    [ "$(grep -Fxc "$wmd_rejected" "$wmd_log")" -eq 0 ] || return 1
+    [ "$(count_byte_token "$wmd_log" "$wmd_expected")" -eq 1 ] || return 1
+    [ "$(count_byte_token "$wmd_log" "$wmd_rejected")" -eq 0 ] || return 1
     wmd_offset=$(wc -c < "$wmd_log") || return 1
     wmd_attempt=0
     while :; do
@@ -274,6 +284,24 @@ C
     ok_line=$(grep -n -F 'harness OK' "$self_root/harness.log" | cut -d: -f1)
     [ "$marker_line" -lt "$ok_line" ]
 
+    WAIT_ATTEMPTS=60 WAIT_DELAY=0.01
+    if count_byte_token "$self_root/missing.log" HARNESS_PROVIDER_MAPPED 2>/dev/null; then
+        echo "missing marker log was treated as empty" >&2
+        exit 1
+    fi
+    if count_byte_token "$self_root/harness.log" "" 2>/dev/null; then
+        echo "empty marker token was accepted" >&2
+        exit 1
+    fi
+    printf '%s\n' 'p11scope — provider diagnostic HARNESS_PROVIDER_LATE_LOAD ... HARNESS_PROVIDER_MAPPED' \
+        > "$self_root/interleaved.log"
+    (sleep 0.25; \
+        printf '%s\n' 'p11scope — privacy=aggregate-only'; sleep 0.03; \
+        printf '%s\n' 'p11scope — privacy=aggregate-only'; sleep 0.5) \
+        >> "$self_root/interleaved.log" &
+    WAIT_PID=$!
+    wait_mapped_and_drained "$self_root/interleaved.log" dlopen
+    wait "$WAIT_PID"
     WAIT_ATTEMPTS=20 WAIT_DELAY=0.01
     : > "$self_root/one.log"
     (printf '%s\n' HARNESS_PROVIDER_LATE_LOAD HARNESS_PROVIDER_MAPPED; sleep 0.03; \
@@ -286,7 +314,7 @@ C
     fi
     wait "$WAIT_PID"
     : > "$self_root/two.log"
-    (printf '%s\n' HARNESS_PROVIDER_LATE_LOAD HARNESS_PROVIDER_MAPPED; sleep 0.03; \
+    (printf '%s\n' HARNESS_PROVIDER_LATE_LOAD HARNESS_PROVIDER_MAPPED; sleep 0.15; \
         printf '%s\n' 'p11scope — privacy=aggregate-only'; sleep 0.03; \
         printf '%s\n' 'p11scope — privacy=aggregate-only'; sleep 0.3) \
         >> "$self_root/two.log" &
@@ -294,7 +322,7 @@ C
     wait_mapped_and_drained "$self_root/two.log" dlopen
     wait "$WAIT_PID"
     : > "$self_root/initial.log"
-    (printf '%s\n' HARNESS_PROVIDER_INITIAL_SET HARNESS_PROVIDER_MAPPED; sleep 0.03; \
+    (printf '%s\n' HARNESS_PROVIDER_INITIAL_SET HARNESS_PROVIDER_MAPPED; sleep 0.15; \
         printf '%s\n' 'p11scope — privacy=aggregate-only'; sleep 0.03; \
         printf '%s\n' 'p11scope — privacy=aggregate-only'; sleep 0.3) \
         >> "$self_root/initial.log" &

@@ -683,8 +683,9 @@ and repeat until all agree.
 - [ ] **Step 3: Freeze the exact cumulative gate-only range**
 
 ```sh
-git diff --name-only bf4cbcf..HEAD
+git diff --name-only bf4cbcf..HEAD -- scripts tests/artifact_contracts.rs
 # Require exactly the ten files in File structure and ownership.
+# The separately committed plan amendment is authority, not implementation.
 # Do not recommit already committed files; Task 3A owns the final four-file
 # correction commit shown above.
 ```

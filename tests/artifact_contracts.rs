@@ -2305,27 +2305,49 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
             .expect("make Task 4 command tripwire executable");
     }
+    let lane14_guard = tempfile::tempdir().expect("create Lane 14 first-mutator tripwire");
+    let lane14_rm = lane14_guard.path().join("rm");
+    fs::write(
+        &lane14_rm,
+        b"#!/bin/sh\nprintf '%s\\n' \"${0##*/}\" >> \"$P11SCOPE_TASK4_TRIPWIRE_LOG\"\nexit 97\n",
+    )
+    .expect("write Lane 14 rm tripwire");
+    fs::set_permissions(&lane14_rm, fs::Permissions::from_mode(0o700))
+        .expect("make Lane 14 rm tripwire executable");
 
     // A comment or unreachable branch containing `--self-test` must not turn
-    // off the guard: this fixture reaches cargo and is caught by the same
-    // unconditional tripwire used for every real driver below.
+    // off the guard. The first mutator is caught, its sentinel survives, and
+    // set -e proves the later Cargo/product runtime commands are unreachable.
     let bypass = tempfile::tempdir().expect("create unreachable-dispatch fixture");
     let bypass_script = bypass.path().join("comment-only-self-test.sh");
     let bypass_log = bypass.path().join("tripwire.log");
+    let protected = bypass.path().join("protected");
+    let sentinel = protected.join("sentinel");
+    fs::create_dir(&protected).expect("create protected fixture directory");
+    fs::write(&sentinel, b"must survive byte-identical\n").expect("write protected sentinel");
     fs::write(
         &bypass_script,
-        b"#!/bin/sh\n# --self-test\n[ \"${1-}\" = --unreachable ] && exit 0\ncargo build\n",
+        b"#!/bin/sh\nset -eu\n# --self-test\n[ \"${1-}\" = --unreachable ] && exit 0\nrm -rf \"$P11SCOPE_TASK4_PROTECTED\"\ncargo build\np11scope run\n",
     )
     .expect("write unreachable-dispatch fixture");
     let bypass_output = Command::new("/bin/sh")
         .arg(&bypass_script)
         .arg("--self-test")
-        .env("PATH", format!("{}:/usr/bin:/bin", guard.path().display()))
+        .env(
+            "PATH",
+            format!(
+                "{}:{}:/usr/bin:/bin",
+                lane14_guard.path().display(),
+                guard.path().display()
+            ),
+        )
         .env("P11SCOPE_TASK4_TRIPWIRE_LOG", &bypass_log)
+        .env("P11SCOPE_TASK4_PROTECTED", &protected)
         .output()
         .expect("run unreachable-dispatch fixture");
     assert_eq!(bypass_output.status.code(), Some(97));
-    assert_eq!(read(bypass_log.to_str().unwrap()), "cargo\n");
+    assert_eq!(read(bypass_log.to_str().unwrap()), "rm\n");
+    assert_eq!(fs::read(&sentinel).unwrap(), b"must survive byte-identical\n");
 
     for (lane, script, marker, lane_cases) in drivers {
         let fixture = tempfile::tempdir().expect("create retained Task 4 self-test fixture");
@@ -2333,8 +2355,17 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         let tripwire_log = fixture.path().join("tripwire.log");
         let mut command = Command::new("/bin/sh");
         command.args([script, "--self-test"]);
+        let path = if lane == "lane14" {
+            format!(
+                "{}:{}:/usr/bin:/bin",
+                lane14_guard.path().display(),
+                guard.path().display()
+            )
+        } else {
+            format!("{}:/usr/bin:/bin", guard.path().display())
+        };
         command
-            .env("PATH", format!("{}:/usr/bin:/bin", guard.path().display()))
+            .env("PATH", path)
             .env("P11SCOPE_TASK4_TRIPWIRE_LOG", &tripwire_log)
             .env("P11SCOPE_TASK4_SELF_TEST_REPORT", &report)
             .env("CARGO", guard.path().join("cargo"))

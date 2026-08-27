@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -2115,96 +2115,283 @@ fn lane02_checker_and_driver_self_tests_execute() {
 
 #[test]
 fn task4_receipt_drivers_execute_behavioral_self_tests() {
+    const COMMON_CASES: &[&str] = &[
+        "complete-success-status-0-last-once",
+        "input-mutation-rejected-nonzero-status-last-once",
+        "cleanup-query-failure-rejected-nonzero-status-last-once",
+        "existing-root-rejected-status-77-no-touch-before-body",
+        "nonprivate-parent-rejected-status-77-no-touch-before-body",
+        "symlink-root-rejected-status-77-no-touch-before-body",
+        "foreign-root-rejected-status-77-no-touch-before-body",
+        "canonical-caller-owned-0700-parent-and-absent-root-required",
+        "campaign-is-canonical-root-dirname-not-env-override",
+        "missing-ephemeral-identity-rejected-nonzero-status-last-once",
+        "root-artifacts-work-device-inode-mutation-rejected",
+        "exact-root-tree-and-0700-directory-modes-accepted",
+        "unexpected-top-level-entry-rejected",
+        "0600-evidence-config-and-retained-executables-validated",
+        "0700-private-executable-only-while-run-validated",
+        "status-0-written-once-last",
+        "missing-status-rejected",
+        "early-status-rejected",
+        "duplicate-status-rejected",
+        "changed-head-rejected",
+        "changed-input-ledger-rejected",
+        "foreign-terminal-artifact-rejected",
+        "missing-capture-evidence-rejected",
+        "missing-checker-evidence-rejected",
+        "root-preflight-blocks-body-cargo-runtime",
+        "lock-contention-status-77-blocks-body-cargo-runtime",
+        "released-exact-lock-success-status-0",
+        "0600-lock-identity-held-through-status-validated",
+        "retained-fixture-tree-validated",
+        "retained-status-sequence-validated",
+        "retained-source-input-ledgers-validated",
+    ];
+    const LANE07_CASES: &[&str] = &[
+        "freeze-CONFIG-PID_FILTER-CGROUP_FILTER-DESCRIPTORS-ASYNC_FUNCTIONS-MECH_SHAPE-ATTR_BOOL_BITS-TEMPLATE_TAIL-exact-accepted",
+        "freeze-missing-rejected",
+        "freeze-duplicate-rejected",
+        "freeze-inventory-mutation-rejected",
+        "g1-160-93-186-exact-accepted",
+        "g1-missing-rejected",
+        "g1-duplicate-rejected",
+        "g1-cardinality-mutation-rejected",
+        "g2-68-2-4-exact-accepted",
+        "g2-missing-rejected",
+        "g2-duplicate-rejected",
+        "g2-cardinality-mutation-rejected",
+        "g3-68-68-136-C_GenerateRandom-200000-exact-accepted",
+        "g3-missing-rejected",
+        "g3-duplicate-rejected",
+        "g3-cardinality-mutation-rejected",
+        "g3-call-mutation-rejected",
+        "g4-988-104-208-inflight-9-start-failures-8-exact-accepted",
+        "g4-missing-rejected",
+        "g4-duplicate-rejected",
+        "g4-cardinality-mutation-rejected",
+        "g4-counter-mutation-rejected",
+        "g5-988-104-208-calls-11-rv-failures-9-unregistered-6-async-orphans-1-exact-accepted",
+        "g5-missing-rejected",
+        "g5-duplicate-rejected",
+        "g5-cardinality-mutation-rejected",
+        "g5-counter-mutation-rejected",
+    ];
+    const LANE09_CASES: &[&str] = &[
+        "broad-and-a-only-b-only-68-68-136-exact-accepted",
+        "broad-cardinality-mutation-rejected",
+        "leaf-cardinality-mutation-rejected",
+        "broad-2-C_GetFunctionList-2-uncertainty-1-leaves-1-C_GetFunctionList-1-uncertainty-0-exact-accepted",
+        "multiplier-function-uncertainty-mutation-rejected",
+        "image-container-identity-mutation-rejected",
+    ];
+    const LANE10_CASES: &[&str] = &[
+        "fork-68-68-136-C_CloseSession-4-C_Digest-20-C_DigestInit-20-C_Finalize-5-C_GetInfo-1-C_GetSlotList-4-C_Initialize-5-C_OpenSession-4-and-four-capability-rows-exact-accepted",
+        "fork-cardinality-mutation-rejected",
+        "fork-function-count-mutation-rejected",
+        "C_GetFunctionList-bootstrap-relation-exact-accepted",
+        "capability-row-cardinality-mutation-rejected",
+        "scan-uncorroborated-1-relationship-exact-accepted",
+        "scan-uncorroborated-relationship-mutation-rejected",
+    ];
+    const LANE11_CASES: &[&str] = &[
+        "subset-oracle-and-both-state-files-absent-start-end-exact-accepted",
+        "initial-isolation-state-rejected",
+        "terminal-isolation-state-rejected",
+        "equal-sibling-head-tree-clean-ledgers-exact-accepted",
+        "sibling-head-tree-clean-ledger-mutation-rejected",
+        "equal-venv-package-ledgers-exact-accepted",
+        "venv-package-ledger-mutation-rejected",
+        "nonoracle-total-change-accepted",
+    ];
+    const LANE14_CASES: &[&str] = &[
+        "single-terminal-owner-and-bound-child-facts-exact-accepted",
+        "nested-lane14-facts-interface-without-second-status-exact-accepted",
+        "second-terminal-owner-rejected",
+        "missing-nested-facts-rejected",
+        "replaced-nested-facts-rejected",
+        "p11scope-p11scope-discover-p11scope-discover-glibc-p11scope-discover-musl-exact-accepted",
+        "executable-inventory-mutation-rejected",
+        "softhsm-record-count-68-exact-accepted",
+        "softhsm-record-count-mutation-rejected",
+        "fixture-68-92-104-exact-accepted",
+        "fixture-cardinality-mutation-rejected",
+        "static-smoke-68-68-136-exact-accepted",
+        "static-smoke-cardinality-mutation-rejected",
+    ];
+    const LANE16_CASES: &[&str] = &[
+        "never-68-68-136-one-timing-zero-loss-ambiguity-inflight-child-false-none-0-0-0-exact-accepted",
+        "auto-68-68-136-one-timing-zero-loss-ambiguity-inflight-child-false-sigstop-confirmed-positive-partial-0-exact-accepted",
+        "never-structural-row-mutation-rejected",
+        "auto-structural-row-mutation-rejected",
+        "never-call-timing-performance-change-accepted",
+        "auto-call-timing-performance-change-accepted",
+        "bare-observer-rejected",
+        "path-observer-rejected",
+        "outside-ROOT-work-target-release-observer-rejected",
+        "cargo-not-Rust-1.88-rejected",
+        "cargo-without-locked-workspace-release-rejected",
+        "private-CARGO_TARGET_DIR-ROOT-work-target-exact-accepted",
+        "missing-observer-identity-ledger-rejected",
+        "missing-cargo-identity-ledger-rejected",
+    ];
+
     let drivers = [
         (
             "lane02",
             "scripts/verify-task4-lane02.sh",
             "verify-task4-lane02 self-test: OK",
+            None,
         ),
         (
             "lane07",
             "scripts/verify-induced-gaps.sh",
             "verify-induced-gaps Task 4 receipt self-test: OK",
+            Some(LANE07_CASES),
         ),
         (
             "lane09",
             "scripts/matrix/verify-shared-layer.sh",
             "verify-shared-layer Task 4 receipt self-test: OK",
+            Some(LANE09_CASES),
         ),
         (
             "lane10",
             "scripts/matrix/verify-fork-scope.sh",
             "verify-fork-scope Task 4 receipt self-test: OK",
+            Some(LANE10_CASES),
         ),
         (
             "lane11",
             "scripts/matrix/verify-oracle.sh",
             "verify-oracle Task 4 receipt self-test: OK",
+            Some(LANE11_CASES),
         ),
         (
             "lane14",
             "scripts/build-release.sh",
             "build-release Task 4 receipt self-test: OK",
+            Some(LANE14_CASES),
         ),
         (
             "lane16",
             "scripts/verify-task4-lane16.sh",
             "verify-task4-lane16 Task 4 receipt self-test: OK",
+            Some(LANE16_CASES),
         ),
     ];
     let mut failures = Vec::new();
 
-    for (lane, script, marker) in drivers {
-        let dispatch_available = fs::read_to_string(script)
-            .map(|source| source.contains("--self-test"))
-            .unwrap_or(false);
-        let guard = (!dispatch_available).then(|| {
-            let guard = tempfile::tempdir().expect("create PATH guard for an unimplemented self-test");
-            for command in [
-                "capsh",
-                "cargo",
-                "docker",
-                "file",
-                "gcc",
-                "jq",
-                "mkdir",
-                "python3",
-                "rm",
-                "setpriv",
-                "softhsm2-util",
-                "sudo",
-                "systemd-run",
-                "timeout",
-            ] {
-                let path = guard.path().join(command);
-                fs::write(&path, b"#!/bin/sh\necho 'missing --self-test dispatch' >&2\nexit 127\n")
-                    .expect("write PATH guard command");
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-                    .expect("make PATH guard command executable");
-            }
-            guard
-        });
+    let guard = tempfile::tempdir().expect("create unconditional Task 4 command tripwires");
+    for command in [
+        "bpftool",
+        "cargo",
+        "docker",
+        "file",
+        "p11scope",
+        "p11scope-discover",
+        "rustup",
+        "setpriv",
+        "sudo",
+        "systemctl",
+        "systemd-run",
+    ] {
+        let path = guard.path().join(command);
+        fs::write(
+            &path,
+            b"#!/bin/sh\nprintf '%s\\n' \"${0##*/}\" >> \"$P11SCOPE_TASK4_TRIPWIRE_LOG\"\nexit 97\n",
+        )
+        .expect("write Task 4 command tripwire");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("make Task 4 command tripwire executable");
+    }
+
+    // A comment or unreachable branch containing `--self-test` must not turn
+    // off the guard: this fixture reaches cargo and is caught by the same
+    // unconditional tripwire used for every real driver below.
+    let bypass = tempfile::tempdir().expect("create unreachable-dispatch fixture");
+    let bypass_script = bypass.path().join("comment-only-self-test.sh");
+    let bypass_log = bypass.path().join("tripwire.log");
+    fs::write(
+        &bypass_script,
+        b"#!/bin/sh\n# --self-test\n[ \"${1-}\" = --unreachable ] && exit 0\ncargo build\n",
+    )
+    .expect("write unreachable-dispatch fixture");
+    let bypass_output = Command::new("/bin/sh")
+        .arg(&bypass_script)
+        .arg("--self-test")
+        .env("PATH", format!("{}:/usr/bin:/bin", guard.path().display()))
+        .env("P11SCOPE_TASK4_TRIPWIRE_LOG", &bypass_log)
+        .output()
+        .expect("run unreachable-dispatch fixture");
+    assert_eq!(bypass_output.status.code(), Some(97));
+    assert_eq!(read(bypass_log.to_str().unwrap()), "cargo\n");
+
+    for (lane, script, marker, lane_cases) in drivers {
+        let fixture = tempfile::tempdir().expect("create retained Task 4 self-test fixture");
+        let report = fixture.path().join("report.tsv");
+        let tripwire_log = fixture.path().join("tripwire.log");
         let mut command = Command::new("/bin/sh");
         command.args([script, "--self-test"]);
-        if let Some(guard) = &guard {
-            // Before Task 3 adds the dispatch, stop legacy drivers at their
-            // first harmless filesystem operation rather than entering a real
-            // build/runtime body. Keep normal tools available for setup.
-            command.env(
-                "PATH",
-                format!("{}:/usr/bin:/bin", guard.path().display()),
-            );
-        }
+        command
+            .env("PATH", format!("{}:/usr/bin:/bin", guard.path().display()))
+            .env("P11SCOPE_TASK4_TRIPWIRE_LOG", &tripwire_log)
+            .env("P11SCOPE_TASK4_SELF_TEST_REPORT", &report)
+            .env("CARGO", guard.path().join("cargo"))
+            .env("DOCKER", guard.path().join("docker"))
+            .env("RUSTUP", guard.path().join("rustup"))
+            .env("SUDO", guard.path().join("sudo"));
         let output = command
             .output()
             .unwrap_or_else(|error| panic!("run {lane} self-test: {error}"));
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let tripped = fs::read_to_string(&tripwire_log).unwrap_or_default();
+        if !tripped.is_empty() {
+            failures.push(format!(
+                "{lane} ({script}) crossed the self-test boundary: {tripped:?}"
+            ));
+        }
         if !output.status.success() || !(stdout.contains(marker) || stderr.contains(marker)) {
             failures.push(format!(
                 "{lane} ({script}): status={:?}, marker={marker:?}, stdout={stdout:?}, stderr={stderr:?}",
                 output.status.code()
             ));
+        }
+        if let Some(lane_cases) = lane_cases {
+            match fs::symlink_metadata(&report) {
+                Ok(metadata) => {
+                    if !metadata.file_type().is_file()
+                        || metadata.nlink() != 1
+                        || metadata.permissions().mode() & 0o777 != 0o600
+                    {
+                        failures.push(format!(
+                            "{lane} retained report must be one mode-0600 regular file"
+                        ));
+                    }
+                    let contents = fs::read_to_string(&report).unwrap_or_default();
+                    let mut observed = BTreeMap::new();
+                    for line in contents.lines() {
+                        *observed.entry(line).or_insert(0usize) += 1;
+                    }
+                    for case in COMMON_CASES.iter().chain(lane_cases.iter()) {
+                        let row = format!("{case}\tOK");
+                        if observed.remove(row.as_str()) != Some(1) {
+                            failures.push(format!(
+                                "{lane} report must retain exactly one {row:?} result"
+                            ));
+                        }
+                    }
+                    if !observed.is_empty() {
+                        failures.push(format!(
+                            "{lane} report contains duplicate or uncontracted rows: {observed:?}"
+                        ));
+                    }
+                }
+                Err(error) => failures.push(format!(
+                    "{lane} did not retain its fixture/status/ledger report: {error}"
+                )),
+            }
         }
     }
 

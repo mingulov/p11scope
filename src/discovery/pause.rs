@@ -16,7 +16,7 @@ use std::time::Duration;
 
 pub(crate) use crate::events::DiscoveryItem;
 
-const CYCLE_NS: u64 = 100_000_000;
+const CYCLE_NS: u64 = 500_000_000;
 const SAMPLE_NS: u64 = 1_000_000;
 const MAX_FAILURE_ITEMS: usize = 128;
 const MSG_ARM_FAILED: &str = "owned child generation changed before pause arm";
@@ -2558,6 +2558,34 @@ mod tests {
     };
     use std::collections::{BTreeMap, VecDeque};
 
+    #[test]
+    fn fixed_cycle_deadline_is_500ms_and_bounds_are_inclusive() {
+        assert_eq!(cycle_deadline(10), Ok(500_000_010));
+        assert_eq!(
+            cycle_deadline(u64::MAX),
+            Err("pause deadline overflow".into())
+        );
+
+        let deadline = 500_000_010;
+        let received = TimedItem {
+            before_ns: deadline,
+            after_ns: deadline,
+            item: DiscoveryItem::Record(record(10, 0, false)),
+            terminal_batch: None,
+        };
+        assert!(validate_received(&received, 10, deadline).is_ok());
+        let late = TimedItem {
+            before_ns: deadline + 1,
+            after_ns: deadline + 1,
+            item: DiscoveryItem::Record(record(10, 0, false)),
+            terminal_batch: None,
+        };
+        assert_eq!(
+            validate_received(&late, 10, deadline),
+            Err(MSG_PAUSE_CAUSAL_DEADLINE.into())
+        );
+    }
+
     struct FakeIo {
         now: VecDeque<Result<u64, String>>,
         fallback_now: u64,
@@ -3086,7 +3114,7 @@ mod tests {
     fn successor_requested_after_resume_deadline_is_protectively_resumed() {
         let mut io = successful_io(vec![record(10, 0, false)]);
         io.resume_authorization = Some(Some(PAUSE_REQUESTED));
-        io.post_resume_now = VecDeque::from([Ok(100_000_011)]);
+        io.post_resume_now = VecDeque::from([Ok(CYCLE_NS + 11)]);
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
         coordinator.arm_for_test();
 
@@ -3186,7 +3214,7 @@ mod tests {
                 0,
                 Some(Some(PAUSE_REQUESTED)),
                 false,
-                100_000_011,
+                CYCLE_NS + 11,
                 false,
                 false,
             ),
@@ -3195,7 +3223,7 @@ mod tests {
                 1,
                 Some(None),
                 true,
-                100_000_011,
+                CYCLE_NS + 11,
                 true,
                 false,
             ),
@@ -3204,7 +3232,7 @@ mod tests {
                 1,
                 Some(None),
                 false,
-                100_000_010,
+                CYCLE_NS + 10,
                 false,
                 true,
             ),
@@ -3239,7 +3267,7 @@ mod tests {
             let mut io = successful_io(vec![record(10, 0, false)]);
             io.resume_authorization = Some(None);
             io.states = VecDeque::from([Ok(stopped()), Ok(stopped()), Ok(stopped()), Ok(tasks)]);
-            io.post_resume_now = VecDeque::from([Ok(100_000_009)]);
+            io.post_resume_now = VecDeque::from([Ok(CYCLE_NS + 9)]);
             let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
             coordinator.cycles = 1;
             coordinator.arm_for_test();
@@ -3255,7 +3283,7 @@ mod tests {
         let mut io = successful_io(vec![record(10, 0, false)]);
         io.post_resume_all_stopped = true;
         io.resume_authorization = Some(None);
-        io.post_resume_now = VecDeque::from([Ok(100_000_010)]);
+        io.post_resume_now = VecDeque::from([Ok(CYCLE_NS + 10)]);
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
         coordinator.cycles = 1;
         coordinator.arm_for_test();
@@ -3371,7 +3399,7 @@ mod tests {
     }
 
     /// Servicing a record this coordinator never owned opens no attempt, so it
-    /// must not leave a 100 ms failure bound behind either: a cleanup drain one
+    /// must not leave a fixed-cycle failure bound behind either: a cleanup drain one
     /// capture later is bounded from its own clock, not from that record.
     #[test]
     fn an_unowned_record_does_not_bound_a_later_cleanup_drain() {
@@ -4110,7 +4138,7 @@ mod tests {
     #[test]
     fn deadline_checks_wrap_future_and_after_dequeue_fail_without_reset() {
         let mut late = successful_io(vec![record(10, 0, false)]);
-        late.now = VecDeque::from([Ok(10), Ok(100_000_011)]);
+        late.now = VecDeque::from([Ok(10), Ok(CYCLE_NS + 11)]);
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
         coordinator.arm_for_test();
         coordinator.service(&mut late).unwrap();
@@ -4449,7 +4477,7 @@ mod tests {
     fn rejected_helper_is_classified_before_all_timestamp_failures() {
         let cases = [
             (u64::MAX, VecDeque::new()),
-            (10, VecDeque::from([Ok(100_000_011), Ok(100_000_012)])),
+            (10, VecDeque::from([Ok(CYCLE_NS + 11), Ok(CYCLE_NS + 12)])),
             (100, VecDeque::from([Ok(50), Ok(60)])),
             (10, VecDeque::from([Ok(20), Ok(19)])),
         ];

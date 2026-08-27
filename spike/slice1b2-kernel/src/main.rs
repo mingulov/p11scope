@@ -290,8 +290,9 @@ pub struct GateBTimingFacts {
     pub cleanup_map_remove_failed: bool,
 }
 
-const STOP_WAIT_CEILING_US: u64 = 100_000;
+const STOP_WAIT_CEILING_US: u64 = 500_000;
 const STOP_WAIT_CEILING_NS: u64 = STOP_WAIT_CEILING_US * 1_000;
+const MAX_SAMPLES: usize = (STOP_WAIT_CEILING_US / 1_000 + 1) as usize;
 const CHILD_REAP_TIMEOUT_MS: i32 = 5_000;
 
 fn cycle_deadline_ns(hook_ts_ns: u64) -> Result<u64, &'static str> {
@@ -327,7 +328,7 @@ fn causal_cycle_pass(facts: &SignalTimingFacts) -> bool {
 }
 
 fn confirmation_samples_well_formed(facts: &SignalTimingFacts) -> bool {
-    if facts.samples.len() > 101
+    if facts.samples.len() > MAX_SAMPLES
         || facts
             .samples
             .iter()
@@ -2754,7 +2755,7 @@ fn coalesced_winner_deadline(
 }
 
 /// The successor must be observed promptly after owner 1's successful resume,
-/// but its own winner timestamp begins a fresh 100 ms cycle.  The liveness
+/// but its own winner timestamp begins a fresh fixed cycle.  The liveness
 /// bound therefore does not become a second-cycle safety deadline.
 fn wait_successor_record(
     ring: &mut aya::maps::RingBuf<aya::maps::MapData>,
@@ -3749,10 +3750,10 @@ fn complete_accepted_cycle(
         return Ok(None);
     }
     let deadline_ns = facts.cycle_deadline_ns;
-    let mut samples: Vec<StopSnapshot> = Vec::with_capacity(101);
+    let mut samples: Vec<StopSnapshot> = Vec::with_capacity(MAX_SAMPLES);
     loop {
         cancellation_failure(cancellation)?;
-        if monotonic_ns()? > deadline_ns || samples.len() >= 101 {
+        if monotonic_ns()? > deadline_ns || samples.len() >= MAX_SAMPLES {
             break;
         }
         let mut sample = stop_snapshot(guard.pid(), expected)?;
@@ -4777,7 +4778,7 @@ mod tests {
     fn valid_signal() -> SignalTimingFacts {
         SignalTimingFacts {
             hook_ts_ns: 1_000_000,
-            cycle_deadline_ns: 101_000_000,
+            cycle_deadline_ns: 1_000_000 + STOP_WAIT_CEILING_NS,
             record_before_dequeue_ns: vec![1_001_000, 1_002_000],
             record_after_decode_ns: vec![1_001_100, 1_002_100],
             record_hook_ts_ns: vec![1_000_000, 1_000_100],
@@ -5073,11 +5074,39 @@ mod tests {
             Some((1, 2))
         );
         assert_eq!(confirm(&[s(1000, true), s(1500, true)]), None);
-        assert_eq!(confirm(&[s(99_000, true), s(100_500, true)]), None);
+        assert_eq!(
+            confirm(&[
+                s(STOP_WAIT_CEILING_US - 1_000, true),
+                s(STOP_WAIT_CEILING_US + 500, true),
+            ]),
+            None
+        );
         assert_eq!(
             confirm(&[s(1000, true), s(2000, false), s(3000, true), s(4100, true)]),
             Some((2, 3))
         );
+    }
+
+    #[test]
+    fn confirmation_after_sample_101_before_fixed_ceiling_is_valid() {
+        let sample = |elapsed_us, stopped| StopSnapshot {
+            elapsed_us,
+            count: 2,
+            exact_expected_task_set: true,
+            all_tasks_stopped: stopped,
+            state_counts: if stopped {
+                [0, 0, 0, 2, 0, 0, 0, 0, 0]
+            } else {
+                [2, 0, 0, 0, 0, 0, 0, 0, 0]
+            },
+        };
+        let mut facts = valid_signal();
+        facts.samples = (0..=102)
+            .map(|index| sample(index * 1_000, index >= 101))
+            .collect();
+        facts.confirmation_sample_indexes = confirm(&facts.samples);
+        assert_eq!(facts.confirmation_sample_indexes, Some((101, 102)));
+        assert!(confirmation_samples_well_formed(&facts));
     }
 
     #[test]
@@ -5955,7 +5984,7 @@ mod tests {
                 if timing_failure {
                     (
                         common::SIGNAL_COOKIE_B as u8,
-                        200_000_000,
+                        STOP_WAIT_CEILING_NS + 1_000,
                         common::SIGNAL_COOKIE_A as u8,
                         1_000,
                         "record deadline",
@@ -6079,7 +6108,7 @@ mod tests {
         assert_rejected_ledger(&owner, successor);
         record_rejected_direct_fallback_deadline(&mut owner, winner, &mut teardown_deadline)
             .unwrap();
-        assert_eq!(teardown_deadline, Some(100_000_002));
+        assert_eq!(teardown_deadline, Some(STOP_WAIT_CEILING_NS + 2));
         assert_eq!(
             cycle_deadline_ns(winner.record.hook_ts_ns),
             Err("deadline overflow")
@@ -6088,7 +6117,7 @@ mod tests {
             &mut map,
             &mut owner,
             &mut guard,
-            100_000_002,
+            STOP_WAIT_CEILING_NS + 2,
             "deadline overflow",
         );
     }
@@ -6107,11 +6136,11 @@ mod tests {
             ) = if timing_failure {
                 (
                     common::SIGNAL_COOKIE_B as u8,
-                    200_000_000,
+                    STOP_WAIT_CEILING_NS + 1_000,
                     common::SIGNAL_COOKIE_A as u8,
                     1_000,
                     "record deadline",
-                    100_001_000,
+                    STOP_WAIT_CEILING_NS + 1_000,
                 )
             } else {
                 (
@@ -6120,7 +6149,7 @@ mod tests {
                     common::SIGNAL_COOKIE_B as u8,
                     3_000,
                     "signal record identity",
-                    100_003_000,
+                    STOP_WAIT_CEILING_NS + 3_000,
                 )
             };
             let coalescer = ReceivedSignalRecord {
@@ -7522,6 +7551,66 @@ mod tests {
             .success()
     }
 
+    #[test]
+    fn gate_b_accepts_max_confirmation_and_keeps_evidence_caps() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/run.sh");
+        let temp = TestDir::new("gate-b-max-samples");
+        let path = temp.path().join("max-samples");
+        fake_canonical_gate_b_export(&path, 2, 20, "none");
+
+        let sample = |elapsed_us, stopped| StopSnapshot {
+            elapsed_us,
+            count: 2,
+            exact_expected_task_set: true,
+            all_tasks_stopped: stopped,
+            state_counts: if stopped {
+                [0, 0, 0, 2, 0, 0, 0, 0, 0]
+            } else {
+                [2, 0, 0, 0, 0, 0, 0, 0, 0]
+            },
+        };
+        let mut facts = valid_gate_b_outcome_a();
+        facts.cycles[0].samples = (0..=500)
+            .map(|index| sample(index * 1_000, index >= 499))
+            .collect();
+        facts.cycles[0].confirmation_sample_indexes = confirm(&facts.cycles[0].samples);
+        assert_eq!(
+            facts.cycles[0].confirmation_sample_indexes,
+            Some((499, 500))
+        );
+        let value = signal_timing_json(&test_gate_metadata(), 1, &facts, true, None);
+        assert_eq!(
+            value["cycles"][0]["samples"].as_array().unwrap().len(),
+            501
+        );
+        let timing = path.join("signal-timing.jsonl");
+        let existing = std::fs::read_to_string(&timing).unwrap();
+        let rest = existing.split_once('\n').unwrap().1;
+        facts.cycles[0].samples.push(sample(501_000, true));
+        assert!(!confirmation_samples_well_formed(&facts.cycles[0]));
+        let oversized = signal_timing_json(&test_gate_metadata(), 1, &facts, true, None);
+        std::fs::write(&timing, oversized.to_string() + "\n" + rest).unwrap();
+        assert!(!shell_validate_gate_b_export(script, &path, 0));
+        std::fs::write(&timing, value.to_string() + "\n" + rest).unwrap();
+        assert!(shell_validate_gate_b_export(script, &path, 0));
+
+        let verifier_log = path.join("verifier.log");
+        std::fs::write(&verifier_log, vec![b'x'; 8 * 1024 * 1024]).unwrap();
+        assert!(shell_validate_gate_b_export(script, &path, 0));
+        std::fs::write(&verifier_log, vec![b'x'; 8 * 1024 * 1024 + 1]).unwrap();
+        assert!(!shell_validate_gate_b_export(script, &path, 0));
+
+        std::fs::write(&verifier_log, vec![b'x'; 8 * 1024 * 1024]).unwrap();
+        let verifier_results = path.join("verifier-results.jsonl");
+        let mut verifier_bytes = std::fs::read(&verifier_results).unwrap();
+        verifier_bytes.resize(4 * 1024 * 1024, b' ');
+        std::fs::write(verifier_results, verifier_bytes).unwrap();
+        let mut timing_bytes = std::fs::read(&timing).unwrap();
+        timing_bytes.resize(4 * 1024 * 1024, b' ');
+        std::fs::write(timing, timing_bytes).unwrap();
+        assert!(!shell_validate_gate_b_export(script, &path, 0));
+    }
+
     fn shell_validate_gate_b_semantics(script: &str, path: &Path, expected_rc: u8) -> bool {
         Command::new("bash")
             .arg("-c")
@@ -7903,11 +7992,11 @@ mod tests {
                 40 => cycle["markers_after_resume"] = 1.into(),
                 41 => cycle["winner_case_id"] = 2.into(),
                 42 => cycle["confirmation_sample_indexes"] = serde_json::Value::Null,
-                43 => cycle["cycle_deadline_ns"] = 101_000_001.into(),
-                44 => cycle["record_before_dequeue_ns"][0] = 101_000_001.into(),
-                45 => cycle["record_after_decode_ns"][0] = 101_000_001.into(),
-                46 => cycle["record_hook_ts_ns"][0] = 101_000_001.into(),
-                47 => cycle["record_hook_ts_ns"][0] = 1_001_101.into(),
+                43 => cycle["cycle_deadline_ns"] = (cycle["hook_ts_ns"].as_u64().unwrap() + STOP_WAIT_CEILING_NS + 1).into(),
+                44 => cycle["record_before_dequeue_ns"][0] = (cycle["cycle_deadline_ns"].as_u64().unwrap() + 1).into(),
+                45 => cycle["record_after_decode_ns"][0] = (cycle["cycle_deadline_ns"].as_u64().unwrap() + 1).into(),
+                46 => cycle["record_hook_ts_ns"][0] = (cycle["cycle_deadline_ns"].as_u64().unwrap() + 1).into(),
+                47 => cycle["record_hook_ts_ns"][0] = (cycle["record_after_decode_ns"][0].as_u64().unwrap() + 1).into(),
                 48 => cycle["coalesced_send_signal_rcs"] = serde_json::json!([0]),
                 49 => record["outcome"] = "B".into(),
                 50 => record["cleanup"]["resume_attempts"] = 1.into(),

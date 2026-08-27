@@ -306,6 +306,9 @@ import json, math, os, sys
 directory, expected_rc = sys.argv[1:]
 if expected_rc not in {"0", "1"}:
     raise SystemExit(64)
+STOP_WAIT_CEILING_US = 500_000
+STOP_WAIT_CEILING_NS = STOP_WAIT_CEILING_US * 1_000
+MAX_SAMPLES = STOP_WAIT_CEILING_US // 1_000 + 1
 programs = ["signal_return", "late_hit"]
 runtime_reasons = set("""
 PY
@@ -363,7 +366,7 @@ def sample_well_formed(sample):
     return sum(counts) == sample["task_count"]
 def samples_well_formed(item):
     samples = item.get("samples")
-    if not isinstance(samples, list) or len(samples) > 101:
+    if not isinstance(samples, list) or len(samples) > MAX_SAMPLES:
         return False
     if any(not sample_well_formed(sample) for sample in samples):
         return False
@@ -386,7 +389,7 @@ def samples_well_formed(item):
                 return False
         if samples[second]["elapsed_us"] - samples[first]["elapsed_us"] < 1000:
             return False
-        if samples[second]["elapsed_us"] > 100000:
+        if samples[second]["elapsed_us"] > STOP_WAIT_CEILING_US:
             return False
     return True
 def cycle_well_formed(cycle):
@@ -436,7 +439,7 @@ def causal(cycle):
     return (
         count <= 2
         and cycle["hook_ts_ns"] != 0
-        and cycle["cycle_deadline_ns"] == cycle["hook_ts_ns"] + 100000000
+        and cycle["cycle_deadline_ns"] == cycle["hook_ts_ns"] + STOP_WAIT_CEILING_NS
         and all(len(cycle[name]) == count for name in ["record_before_dequeue_ns", "record_after_decode_ns", "record_hook_ts_ns"])
         and all(0 < value <= cycle["cycle_deadline_ns"] for name in ["record_before_dequeue_ns", "record_after_decode_ns", "record_hook_ts_ns"] for value in cycle[name])
         and all(before <= after and hook <= after for before, after, hook in zip(cycle["record_before_dequeue_ns"], cycle["record_after_decode_ns"], cycle["record_hook_ts_ns"]))
@@ -516,7 +519,7 @@ def well_formed(item):
     if any(not cycle_well_formed(cycle) for cycle in item["cycles"]):
         return False
     return (
-        item.get("stop_wait_ceiling_us") == 100000
+        item.get("stop_wait_ceiling_us") == STOP_WAIT_CEILING_US
         and isinstance(item.get("signal_link_detached"), bool)
         and isinstance(item.get("late_link_detached"), bool)
         and uint(item.get("final_start_entries"))

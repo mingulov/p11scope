@@ -172,10 +172,65 @@ deadline-anchor changes, Engine checkpoint work, and gate amendment from this
 evidence. The diagnostic B worktree and branch were removed after review; its
 unmerged commit remains recoverable by the recorded hash only.
 
-The smallest approved next diagnostic reuses the existing private
+The subsequent diagnostic reused the existing private
 `before_ns`, `after_ns`, and deadline observations to classify two finite
 facts separately: budget remaining at Engine entry and Engine elapsed-time
-band. It changes no deadline, Engine API, cleanup, attachment behavior, public
-JSON, checker, or privacy contract. A predeclared matched 100 ms campaign must
-then distinguish pre-Engine budget consumption from long synchronous Engine
-work before any product fix is selected.
+band. It changed no deadline, Engine API, cleanup, attachment behavior, public
+JSON, checker, or privacy contract. The predeclared matched 100 ms campaigns
+then tested whether the classifier distinguished pre-Engine budget consumption
+from long synchronous Engine work; the closure below records their result.
+
+## Pause-phase campaign closure
+
+The diagnostic above was implemented at unmerged commit
+`9c40c5065bd5405eaea0dc6ef32c6ea395426e66`, tree
+`aba30fb1d38113ffee0b15d7c42a985c2b332de6`. Its commit changes exactly the
+Lane 02 driver, pause classifier, and artifact contracts. Its parent contained
+an independently required Lane 13 work-parent repair; that repair alone landed
+on the product branch as `da5005e`.
+
+The four finalized roots are `rep1-d100` through `rep4-d100` below
+`/home/user/.local/state/p11scope/lane02-pause-phase-20260827/`.
+
+| Root | Terminal | Target `05-dlopen-auto` | Retained target diagnostic |
+| --- | --- | --- | --- |
+| rep1 | non-pass | PASS | none |
+| rep2 | PASS | PASS | none |
+| rep3 | non-pass | FAIL | `later_pause_boundary` |
+| rep4 | non-pass | PASS | none |
+
+### Confirmed
+
+- Every root is fresh, caller-owned mode 0700, and contains six invocation
+  receipts in the frozen order.
+- All 24 row cleanup pairs record zero exact evidence processes and complete
+  cleanup; every root also has a final zero exact-process receipt.
+- Commit/tree, module, observer binary, driver, checker, both harnesses, oracle,
+  interpreter, libc, and build-tool identities match across all roots.
+- Raw configuration hashes differ because their absolute roots differ. The
+  byte-normalized semantic hash is identical:
+  `32f08cfe20f627e54117fdc1b6eb927ea637e3bef6119d983ff4fe0e5f0b5e48`.
+
+### Contradicted
+
+The frozen rule is contradicted by three target PASS results, one target FAIL,
+and the FAIL's non-selecting fallback token. No four-of-four phase category
+exists. Configuration divergence, missing cleanup receipts, and process
+residue are confirmed non-causes.
+
+### Missing
+
+No retained receipt hashes the exact diagnostic diff. The cumulative ancestry
+from `d30fa44` also includes this report and the separate Lane 13 script repair,
+so it does not satisfy the planned cumulative changed-path set even though the
+exact diagnostic commit itself is the reviewed three-file change. Roots are
+mutable and unsealed, as predeclared. Raw timing is intentionally absent.
+
+### Decision
+
+The campaign is **mixed/unresolved**. It selects no timeout, deadline-anchor,
+Engine, collector, or other product change, and it authorizes no replacement
+or repeat run. The earlier proposed phase diagnostic is now closed rather than
+an approved next action. Any further investigation requires a new reviewed
+plan and fresh roots. Sol, Terra, and Luna independently agreed on this
+conservative decision.

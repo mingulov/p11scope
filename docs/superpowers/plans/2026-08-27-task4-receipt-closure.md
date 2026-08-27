@@ -89,7 +89,7 @@ contradict the exact-six cardinality.
 
 ### Normal drivers
 
-The six normal entry points are literal:
+The six normal drivers and their seven literal invocations are:
 
 ```sh
 sh scripts/verify-induced-gaps.sh ABSENT_ABSOLUTE_ROOT
@@ -132,6 +132,27 @@ returns 77 without touching the path. A prerequisite failure after root
 creation may retain preflight facts plus final status 77, but may not create a
 product capture or owned runtime resource.
 
+Each owning Linux shell enables noclobber and creates absent `facts.log` itself
+with `umask 077; set -C; exec 7>"$ROOT/facts.log"`, which supplies exclusive
+`O_CREAT|O_EXCL` semantics without a child-to-parent FD handoff. It immediately
+disables noclobber only where existing body behavior requires it, validates the
+FD via `/proc/$$/fd/7` against pathname `lstat`, and requires a caller-owned
+0600 regular file with `nlink=1`. Existing files and symlinks therefore fail;
+the self-test syscall/identity cases freeze this Linux shell behavior. FD 7 is
+write-only and remains held through terminal publication; hashing reopens its
+procfs magic link read-only and compares the new FD identity with retained FD 7
+and pathname identity before use. Every facts append and final `terminal_status_intent`
+uses FD 7. Lane 14 additionally holds nested `artifacts/discover.facts` as FD 8.
+Lock FD 9 is reserved for the common lock.
+Every ordinary external tool, Cargo/runtime command, wrapper payload, and fake
+command is invoked with `7>&- 8>&- 9>&- 10>&- 11>&- 12>&- 13>&- 14>&-`. The only exceptions
+are the initial `flock` operation using FD 9, the narrowly named inline facts
+writer using FD 7, the Lane 14 creator/handoff steps using FD 12/8, self-test
+owner/publisher control using FD 10/11, the self-test supervisor using FD 13/14,
+and the final terminal publisher using FD 7/8/9. The terminal publisher performs revalidation with Python stdlib and
+spawns no child; any defensive subprocess API must set `close_fds=True`. Fixture
+commands inspect `/proc/self/fd` and fail if a reserved descriptor leaks.
+
 Set `CAMPAIGN=$(dirname -- "$ROOT")` only after the root parent has been
 canonicalized and validated; it is that caller-owned mode-0700 parent, not an
 environment override. Every normal driver opens the same
@@ -157,13 +178,43 @@ sh scripts/verify-discover-containers.sh \
 
 The child accepts only that option or `--self-test`. It requires an absent
 regular-file path directly beneath the already-validated Lane 14 `artifacts/`
-directory, creates it mode 0600, records facts but no terminal status, and
-returns nonzero on any cleanup or identity uncertainty. `build-release.sh`
-immediately opens the child facts with `O_NOFOLLOW` after the synchronous child
-returns, compares `fstat` dev/inode/owner/mode with the identity recorded inside
-the facts file, hashes through that descriptor, and retains the descriptor
-through finalization. It includes that hash in Lane 14 finalization; any missing,
-replaced, malformed, or multiply linked facts object is nonzero.
+directory. The stopped-writer amendment below supersedes the earlier direct
+pathname-create/open wording: the child publishes a bounded journal and
+payload, then the parent obtains the final facts object through the reviewed
+creator/descriptor handoff. The child records facts but no terminal status and
+returns nonzero on any cleanup or identity uncertainty. Any missing, replaced,
+malformed, multiply linked, or identity-inconsistent object is nonzero.
+`--lane14-facts` names and binds the intended final destination but the child
+does not open it. The exact protocol paths are:
+
+```text
+$ROOT/work/discover.resource-journal
+$ROOT/work/discover.payload
+$ROOT/work/discover.ready.pending
+$ROOT/work/discover.ready
+$ROOT/work/discover.ack.pending
+$ROOT/work/discover.ack
+$ROOT/artifacts/discover.facts
+```
+
+The journal and payload are child outputs; the creator/parent own ready and
+acknowledgement; the terminal publisher imports the first two and
+identity-cleans all six private protocol files before committing status.
+
+| Path | Creator | Mode and exact content | Cleanup owner / failure |
+|---|---|---|---|
+| `work/discover.resource-journal` | nested child, before first resource | first open is 0600 `O_CREAT|O_EXCL|O_NOFOLLOW|O_WRONLY`; later appends are `O_WRONLY|O_APPEND|O_NOFOLLOW` only after identity comparison; one header, then exactly one requested, resolved-or-uncertain, cleanup, and absence record per declared indexed resource, followed by one terminal record | terminal publisher removes by retained identity after import; malformed/missing/uncertain is non-pass |
+| `work/discover.payload` | nested child finalizer | 0600 `O_CREAT|O_EXCL|O_NOFOLLOW|O_WRONLY` regular, exactly one canonical payload containing child PID/starttime/session, journal identity/digest/count, declared resource count, fact-key counts, cleanup summary, terminal result | terminal publisher removes by retained identity; missing/replaced/duplicate is non-pass |
+| `work/discover.ready.pending` | facts creator | 0600 `O_CREAT|O_EXCL|O_NOFOLLOW|O_WRONLY`, exactly one ready record before atomic no-replace publication | creator removes only its still-matching pending object on failure; otherwise it must be absent before status |
+| `work/discover.ready` | facts creator by no-replace rename | 0600 regular, exactly one version/nonce/parent PID+starttime/creator PID+starttime/creator-FD-12/facts-identity record | terminal publisher identity-cleans after validated handoff; five-second timeout, parent mismatch, or creator death is non-pass |
+| `work/discover.ack.pending` | parent | 0600 `O_CREAT|O_EXCL|O_NOFOLLOW|O_WRONLY`, exactly one acknowledgement record before atomic no-replace publication | parent removes only its still-matching pending object on failure; otherwise it must be absent before status |
+| `work/discover.ack` | parent by no-replace rename | 0600 regular, exactly one matching version/nonce/generations/creator-FD-12/parent-FD-8/facts-identity record | terminal publisher identity-cleans after creator reap; five-second timeout, mismatch, or parent death makes creator exit and is non-pass |
+| `artifacts/discover.facts` | pinned creator, imported by terminal publisher through FD 8 | 0600 regular, `nlink=1`, one canonical bounded Lane 14 fact stream with exact allowed-key cardinalities | retained; replacement/mutation/import/fsync uncertainty is non-pass and prevents status |
+
+All protocol objects are caller-owned, bounded by the facts limits below, and
+must be absent initially including as dangling symlinks. A failure is status 77
+only if it is proven before `CONSUMED`; afterward it is non-pass or, if terminal
+publication cannot safely run, an absent authoritative status.
 
 ### Lane 14 private-work and terminal-authority amendment
 
@@ -254,6 +305,297 @@ path and SHA-256 are recorded; the existing OpenSSL feasibility report is such
 an exception. The separately committed receipt plan is not untracked during
 implementation/runtime.
 
+### Stopped-writer lifecycle repair amendment (authoritative)
+
+The stopped-writer review at implementation HEAD
+`1330630d1af58d5f61c21c258d23babc8acc1135` rejected Task 4 advancement. The
+current self-tests are green but model state in toy Python rather than execute
+the real shell finalizers. The current scripts can publish zero before later
+filesystem failures, install terminal authority after mutations, expose
+rootless body bypasses, use pathname-only facts, under-record consumed inputs,
+and leave cleanup ownership split across processes. This amendment supersedes
+every conflicting lifecycle, facts-publication, and status-publication sentence
+above. Runtime remains prohibited until the repaired implementation passes the
+new real-fixture tests and stopped-writer review.
+
+Each normal driver executes its receipt body in the owning shell. Lanes 07, 09,
+10, and 11 remove `P11SCOPE_TASK4_BODY`; no normal driver has a public body
+re-entry path. After parent authority validation but before the first root
+creation/claim mutation, the owner initializes state and installs one
+partial-state-tolerant `EXIT` finalizer plus separate `INT`, `HUP`, and `TERM`
+handlers. The owner tracks at least `ROOT_OWNED`, `ROOT_CLAIMING`, `LOCKED`,
+`CONSUMED`, `FINALIZER_RUNNING`, an explicit `REGISTRATION_ACTIVE`, and every
+registered resource. A
+status of 77 is permitted only while `CONSUMED=0` and before any owned runtime
+resource is created. Outside a registration checkpoint, a catchable signal
+enters the one finalizer immediately. During a checkpoint it latches until that
+same requested/resolved registration is durably completed or recorded as
+uncertain, then enters the finalizer; it never waits for a later unrelated
+registration.
+
+Before creating an owned process, cgroup, unit, container, image, BPF object,
+token, or other runtime resource, append and `fsync` its unique requested
+identity. After creation but before activation or cleanup eligibility, append
+and `fsync` its resolved immutable identity. Cleanup addresses only that
+resolved identity, records the result, and query-proves final absence. A raw PID
+or mutable name is never cleanup authority. PID cleanup binds PID plus
+starttime; Docker binds IDs/digests; systemd/cgroup cleanup binds the exact unit,
+invocation, and cgroup identity. Identity uncertainty preserves diagnostics and
+forces non-pass. The finalizer never suppresses cleanup failure and never
+repairs mode drift with `chmod` or a generic `find`; it rejects drift.
+
+Resources that normally start immediately use existing native staging instead
+of an unregistrable launch. Docker uses `create`, records/fsyncs the container
+ID, then `start`. A systemd or ordinary child starts a minimal private wrapper
+blocked on a fixed private FIFO; the parent records/fsyncs PID/starttime,
+session, unit/invocation, and cgroup identities before releasing the wrapper.
+The wrapper command and FIFO are themselves fixed, identity-recorded inputs.
+The observer process owns its internal BPF link lifecycle; the receipt registers
+the stopped observer generation before release, later inventories only resolved
+owned BPF IDs, and never attempts pathname/name cleanup of an unregistered BPF
+object. SoftHSM configuration/token requests are journaled before initialization
+and resolved private directory/file identities are recorded before use.
+Docker image builds record/fsync a unique requested tag and label before build,
+then resolve/fsync the immutable image ID/digest before use. An interrupted build
+must reconcile exactly one matching immutable ID; zero or multiple matches are
+recorded as uncertain, forbid destructive image cleanup, and force non-pass.
+
+All receipt paths use the already absolute `$ROOT`, `$ROOT/work`, and
+`$ROOT/artifacts` values. No `$PWD/$WORK`, glob-selected `*observed*`, first-file
+selection, or stdout-as-capture substitution is allowed. Every retained artifact
+has one fixed name, expected type, identity, cardinality, and consumer. Rename
+all pre-finalization `ALL OK` output to `body oracle OK`.
+
+The finalizer completes cleanup, absence proofs, source/input/root/tree/facts
+revalidation, exact artifact inventory, and retained-data synchronization before
+status publication. It then `exec`s one bounded inline Python terminal
+publisher. That publisher:
+
+1. blocks or controls catchable signals for the commit window;
+2. revalidates the root/work/artifacts/lock identities and every retained facts
+   descriptor and digest;
+3. appends `terminal_status_intent` through retained main facts FD 7, `fsync`s
+   it, and freshly revalidates descriptor/path identity and digest (and Lane 14
+   nested facts FD 8/path/digest);
+4. creates `work/status.pending` with `O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600,
+   writes one decimal line, and `fsync`s it and the work/root directory FDs;
+5. revalidates immediately before commit;
+6. calls the Linux x86-64 libc `renameat2` symbol through Python stdlib
+   `ctypes.CDLL(None, use_errno=True)` with `RENAME_NOREPLACE=1`, making that
+   rename from the work dirfd to the root dirfd the final filesystem operation;
+   and
+7. immediately calls `os._exit(published_value)`.
+
+There is no `os.rename`, syscall-number, or replacing-rename fallback. Missing
+`renameat2`, `ENOSYS`, a collision, or any other failure before the rename
+leaves no authoritative status and exits nonzero. The final facts record is
+`terminal_status_intent`; no fact claims that publication succeeded. Main facts
+FD 7, Lane 14 nested facts FD 8, and lock FD 9 remain open through
+a successful rename and close only implicitly in `os._exit`. Availability or
+descriptor-handoff failure is 77 only before consumption and otherwise
+non-pass.
+
+#### Bounded common facts grammar
+
+Facts are versioned, canonical, length-bounded records with fixed keys and exact
+per-key cardinalities. They contain no free-form environment dump, secrets, or
+arbitrary container filesystem content. Every normal receipt records:
+
+- schema/version; literal selected argv; clean-environment proof; UTC start/end;
+  UID/GID; kernel; source HEAD/tree; explicit tracked and untracked status at
+  start/end; and the reviewed non-input exception ledger;
+- start/end ledgers for each consumed file with
+  `dev:ino:uid:gid:mode:nlink:size:sha256`, plus ELF build ID where applicable;
+- root, artifacts, work, lock, lock-holder PID/starttime, and terminal publisher
+  identities;
+- resolved path, identity/hash, and version for each consumed tool; explicit
+  build inputs/config/toolchain; only consumed environment variables and proof
+  that forbidden build variables were absent;
+- body/signal result; each requested and resolved resource identity; cleanup
+  result; final absence; exact named artifact inventory; and
+  `terminal_status_intent`.
+
+The literal grammar is one ASCII line per record:
+
+```text
+facts-v1<TAB>SEQUENCE<TAB>KEY<TAB>VALUE<LF>
+```
+
+`SEQUENCE` is an unsigned canonical decimal increasing from zero without gaps.
+`KEY` matches `[a-z0-9][a-z0-9_.-]{0,63}`. `VALUE` is UTF-8 projected to ASCII:
+bytes outside `0x20..0x7e`, plus `%` and tab, are uppercase `%HH` encoded. A line
+is at most 4096 bytes, a facts object at most 8 MiB and 4096 records. Literal
+non-indexed keys occur exactly once. Repeated tools, inputs, resources, and
+artifacts use zero-padded indexed keys (`resource.000.requested`,
+`resource.000.resolved`, and so on), with one declared count key and no missing
+or duplicate index. Each lane's self-test freezes its complete allowed-key and
+cardinality table; unknown keys or free-form text are invalid.
+
+<!-- FACT_SCHEMA_V1_BEGIN -->
+The complete non-indexed common key set is
+`schema.sha256`, `receipt.argv`, `receipt.cwd`, `receipt.clean_env`, `time.start_utc`, `time.end_utc`,
+`host.uid`, `host.gid`, `host.kernel`, `source.head.start`, `source.head.end`,
+`source.tree.start`, `source.tree.end`, `source.tracked.start`,
+`source.tracked.end`, `source.untracked.start`, `source.untracked.end`,
+`source.exception_count`, `root.identity.start`, `root.identity.end`,
+`artifacts.identity.start`, `artifacts.identity.end`, `work.identity.start`,
+`work.identity.end`, `lock.identity`, `lock.holder_pid`,
+`lock.holder_starttime`, `tool.count`, `input.count`, `build_env.count`,
+`resource.count`, `artifact.count`, `body.result`, `signal.result`, and
+`terminal_status_intent`. The only indexed key families are
+`source.exception.NNN`, `tool.NNN`, `input.NNN.start`, `input.NNN.end`,
+`build_env.NNN`, `resource.NNN.requested`, `resource.NNN.resolved`,
+`resource.NNN.cleanup`, `resource.NNN.absence`, `artifact.NNN.creation`,
+`artifact.NNN.final`, and the lane groups in the table below. Each count equals
+the number of complete zero-based indexed groups; every listed field has
+cardinality one and no other key is accepted.
+
+| Lane | Lane-group count keys and required indexed groups |
+|---|---|
+| 07 | `lane07.case_count=6`; `lane07.case.NNN.{name,capture,manifest,checker,exit,observer,bpf,map_before,map_after,oracle}` for NNN 000..005; `lane07.map_count=8`; `lane07.map.NNN.{name,before,after}` for NNN 000..007 |
+| 09 | `lane09.capture_count=3`; `lane09.capture.NNN.{name,capture,checker,cgroup,product,harness,expected,provider_view,oracle}` for NNN 000..002; `lane09.base_count=1`; `lane09.base.000.{requested,resolved}`; `lane09.image_count=1`; `lane09.image.000.{requested,resolved,cleanup,absence}`; `lane09.container_count=2`; `lane09.container.NNN.{requested,resolved,pid,cleanup,absence}` for NNN 000..001 |
+| 10 | `lane10.fork_count=1`; `lane10.fork.000.{capture,oracle,fifo,unit,cgroup,process}`; `lane10.capability_count=4`; `lane10.capability.NNN.{caps,argv,exit,document,log,scan_relation}` for NNN 000..003 |
+| 11 | `lane11.report_count=2`; `lane11.report.NNN.{name,creation,final,snapshot}` for NNN 000..001 (`report.jsonl`, `results.json` in that order); `lane11.private_count=3`; `lane11.private.000.{name,creation,snapshot,removal,absence}` is state, 001 policy, 002 derived cache; `lane11.oracle_count=1`; `lane11.oracle.000.{capture,subset,unit,cgroup,process}` |
+| 14 | `lane14.canary_count=10`; `lane14.canary.NNN.{name,artifacts,oracle}` for the seven fixed matrix lanes then three fixed start/fault lanes in source order; `lane14.image_count=3`; `lane14.image.NNN.{requested,resolved,packages,cleanup,absence}` for bookworm, Ubuntu, Alpine; `lane14.container_count=3`; `lane14.container.NNN.{requested,resolved,pid,cleanup,absence}` for glibc-build, glibc-run, musl-build; `lane14.smoke_count=6`; `lane14.smoke.NNN.{name,input,output,oracle}` for glibc-container, musl-container, host-glibc, packaged-helper, attach-e2e, static-attach; `lane14.dist_count=4`; `lane14.dist.NNN.{name,creation,final,build_id,linkage}` in the plan's fixed distribution order; `lane14.protocol_count=1`; `lane14.protocol.000.{journal,payload,ready,ack,creator,facts,cleanup}` |
+| 16 | `lane16.row_count=1`; `lane16.row.000.{hammer,checker,provider,cargo,config,softhsm,observer,bpf,capture,aggregate,pause,loss,ambiguity,in_flight,child,cleanup,absence}` |
+
+Brace notation expands to literal keys in the shown suffix order; it is not part
+of the wire format. These are the only lane key families and every displayed
+count is numeric and fixed before `CONSUMED`. Values combine their named
+subfields in one canonical, length-bounded record with a lane-local fixed field
+order. `schema.sha256` occurs exactly once and its value is the authoritative
+digest below. A mismatch is non-pass.
+<!-- FACT_SCHEMA_V1_END -->
+
+The authoritative schema digest is the SHA-256 of the UTF-8 bytes strictly
+between the two marker lines above, including final newlines:
+`e212fd00c0e3063c206688524c2a395bd44c7bb2f3fecd22abe0df712b817250`. Task 3B RED tests and every driver embed and
+report that literal digest; changing any key, order, or count requires a
+separately reviewed plan amendment and new digest.
+
+#### Self-test-only real-finalizer fixture protocol
+
+The public interface remains exactly `--self-test`; it accepts no case selector,
+fault environment, or extra argument. That branch creates one private mode-0700
+temporary parent, a fixed fake-command directory, and one subprocess per
+declared case by forking a shell subshell that calls the same receipt-owner/body/
+finalizer functions as normal mode. Lexical shell variables select the fake
+body and fault point only inside that subshell. Normal receipt mode forcibly
+sets those variables to `none`, resets `PATH` to the validated normal command
+set, and rejects extra arguments, so caller environment cannot activate a test
+seam.
+
+The fake-command boundary replaces only the named Cargo/runtime/tool commands;
+root validation, trap installation, receipt mutation, resource journal,
+cleanup/query logic, facts parser, inline terminal publisher, and status commit
+are the production code. The self-test supervisor creates two mode-0600 FIFOs
+inside its private temporary directory: `control.in` and `events.out`. It opens
+both ends read/write before forking, retaining control/events as supervisor FDs
+13/14. The case subshell duplicates 13 to child control-input FD 10 and 14 to
+child event-output FD 11, then closes 13/14 before calling the receipt owner;
+creator protocol FD 12 remains distinct. Normal receipt mode closes 10 through
+14 before validation and ignores all inherited test variables. Fake external
+commands receive `10>&- 11>&- 12>&- 13>&- 14>&-`; only the receipt owner and its
+execed terminal publisher retain child FDs 10/11, while only the supervisor
+retains FDs 13/14.
+
+Each FIFO frame is one bounded ASCII line:
+
+```text
+selftest-v1<TAB>NONCE<TAB>CASE<TAB>SEQUENCE<TAB>event|command<TAB>NAME<LF>
+```
+
+The child writes increasing `event` frames to FD 11; the supervisor alone writes
+increasing `command` frames to FD 10. Nonce/case/direction/sequence mismatch,
+unexpected EOF, malformed/duplicate frame, or timeout fails that case and kills
+then reaps only the pinned child generation. `continue` and the fixed fault
+commands `facts-write`, `facts-fsync`, `dir-fsync`, `mode-drift`, `inventory`,
+`pending-write`, `pending-fsync`, `rename-collision`, and
+`rename-unavailable` are the only commands. Events expose exact barriers before
+and after requested/resolved registration and before terminal rename. The
+supervisor pins each child PID/starttime, waits for the exact event, sends the
+requested `INT`/`HUP`/`TERM` directly to that generation or writes its command,
+and bounds every frame wait at five monotonic seconds. The child closes 10/11
+immediately after the final terminal fault point; the supervisor closes 13/14
+after exact child reap and removes only identity-matching FIFOs.
+Every case reports only canonical `selftest-v1<TAB>case<TAB>expected<TAB>actual`
+rows followed by `selftest-v1<TAB>complete`; the Rust contract rejects missing,
+duplicate, or unexpected rows. No Cargo, Docker, systemd, sudo, eBPF, provider,
+or release command may escape the fake boundary.
+
+Generated artifacts record creation and final identities. Source, configuration,
+provider, observer, BPF, harness, checker, and capture identities are revalidated
+at the end, not merely named. Per-lane facts additionally include:
+
+- Lane 07: default/ring/state/freeze observer and BPF builds; provider and
+  fixtures; exact eight-map inventories; named freeze and G1-G5
+  captures/manifests/checkers/exits; unit/cgroup/PID identities and absence.
+- Lane 09: Docker client/server/storage; requested/resolved base ID/digest and
+  rootfs; built image ID/digest; both container IDs/image IDs/PID generations;
+  provider identities in both views; broad/A/B cgroups; product, harness,
+  expected file, checker; three named captures/logs; final absence.
+- Lane 10: provider, product, discover, two harnesses, manifest, expected file;
+  ptrace/perf/tracefs/DAC; unit/cgroup/process/FIFO; fork capture; four exact
+  capability rows; scan/uncorroborated relation; final absence.
+- Lane 11: sibling HEAD/tree and explicitly empty tracked/untracked status at
+  start/end; sibling root/project/venv/bin/Python/package identities; default
+  state/policy absence including dangling symlinks; private state/policy/cache;
+  product/BPF/provider/manifest; unit/cgroup/PIDs; raw reports, capture, subset;
+  retained state snapshots and identity-clean removal/absence.
+- Lane 14: nested scripts/checkers/source; toolchains/config; image
+  IDs/digests/package projections; container/process identities; journal,
+  payload, creator handoff; canary/e2e/static evidence; official observer/BPF;
+  four-file distribution; static-smoke PIDs; final absence.
+- Lane 16: hammer/checker/provider/Cargo source/config; SoftHSM config/token;
+  observer/BPF/hammer start/end; clean argv/env; named capture/checker;
+  aggregate `evidence.module_ambiguous == 0`; pause/loss/ambiguity/in-flight
+  fields; final identities and child absence.
+
+#### Lane 14 journal, payload, and retained descriptor
+
+The nested discover child is pinned by PID/starttime/session and never receives
+the final facts FD. Before its first owned resource it creates a bounded,
+versioned resource journal. After its exclusive first creation, each journal
+append is a one-shot inline Python `O_WRONLY|O_APPEND|O_NOFOLLOW` operation that
+requires the original journal identity, compares pre/post `lstat` versus
+`fstat`, validates the canonical record, and `fsync`s. The child records requested identity before
+creation and resolved container/image/PID/starttime/unit/cgroup identity before
+activation or cleanup eligibility. Its finalizer identity-cleans and
+query-proves absence, hashes the journal, and exclusively publishes one bounded
+payload containing creator/file identities, journal digest, exact fact
+cardinalities, cleanup results, and terminal child result. The parent pins and
+waits the child and retains journal/payload on uncertainty.
+
+Only after the complete Lane 14 body and ordinary cleanup/absence, the parent
+starts a short-lived pinned creator. Through the validated artifacts directory
+FD, the creator opens absent `discover.facts` with
+`O_CREAT|O_EXCL|O_NOFOLLOW|O_RDWR`, mode 0600, validates
+regular/owner/nlink/identity, assigns creator protocol FD 12, closes inherited
+lock and unrelated descriptors, and atomically publishes a nonce-bound ready
+record using `renameat2(RENAME_NOREPLACE)`. The ready record contains protocol
+version, nonce, parent and creator PID/starttime, FD number, and facts identity.
+It waits boundedly for a matching atomic acknowledgement while polling parent
+PID/starttime.
+
+The parent uses `$!` plus pinned creator starttime, validates the ready record,
+opens `/proc/$creator_pid/fd/12` into parent FD 8, and compares FD 8
+`fstat`, pathname `lstat`, and ready identity before and after creator-generation
+checks. It atomically publishes the matching acknowledgement, waits/reaps the
+exact creator, and immediately `exec`s the terminal publisher. No intervening
+or unrelated external command inherits FD 8; the execed terminal publisher is
+the sole intended inheritor. Numeric PID reuse is not authority.
+
+Inside that terminal publisher, validate journal, payload, ready,
+acknowledgement, schemas, nonces, cardinalities, sizes, identities, and digests;
+import their canonical representation through FD 8 and `fsync` it; then remove
+only identity-matching private protocol files. Revalidate final source/input,
+root/work/artifacts, facts FD/path/hash, exact inventory, and cleanup absence;
+record `terminal_status_intent`; synchronize retained data; and perform the
+terminal status protocol above. Main facts FD 7, nested facts FD 8, and lock FD
+9 remain open through the final rename. Creator/IPC cleanup is
+PID/starttime-bound. Parent death or `SIGKILL` may leave diagnostics, but never
+a valid status receipt.
+
 ## Lane contract matrix
 
 ### Lane 07 — induced gaps
@@ -336,17 +678,28 @@ cgroup/unit, and FIFO absent.
 `/home/user/src/m/pkcs11-check-ws/pkcs11-check`, its executable `.venv`, cgroup
 v2/systemd, SoftHSM2, Python 3, Rust 1.88, provider, and `sudo -n`. Both sibling
 `.pkcs11-check-isolation-state.json` and
-`.pkcs11-check-isolation-state-policy.json` must be absent initially; otherwise
-finalize 77 and never delete them.
+`.pkcs11-check-isolation-policy.json` must be absent initially, including as
+dangling symlinks; otherwise finalize 77 and never delete them.
 
 **Artifacts/oracle:** use
 `cargo +1.88 build --locked --release --workspace`. Retain equal start/end
-sibling HEAD/tree/tracked-clean ledgers, lock/project/venv file identities,
-installed-package projection, state-file absence, provider/product/BPF
-identities, raw oracle reports, manifest/capture/log, and derived subset
-summary. Remove only isolation files proven to have been created by this
-invocation, after regular-file/dev/inode/owner validation; require both absent
-at finalization. Any sibling, venv, package, or state-ledger mutation invalidates
+sibling HEAD/tree plus explicitly empty tracked and untracked status ledgers,
+lock/project/venv file identities, installed-package projection, default
+state/policy absence, provider/product/BPF identities, raw oracle reports,
+manifest/capture/log, and derived subset summary. Invoke the sibling CLI with
+its native `--state-file` and `--policy-file` options using exactly:
+
+```text
+$ROOT/work/isolation-state.json
+$ROOT/work/isolation-policy.json
+```
+
+Its exact derived report-record cache is
+`$ROOT/work/.isolation-state.json.report-records`. Retain validated snapshots,
+then remove only those three private objects proven to have been created by this
+invocation, after regular-file/directory/dev/inode/owner validation; require all
+private and both sibling defaults absent at finalization. Any sibling, venv,
+package, state, policy, cache, tracked, or untracked ledger mutation invalidates
 the lane. Preserve the current subset and terminal-capture oracles; current
 aggregate totals are not frozen acceptance counts.
 
@@ -654,14 +1007,119 @@ git add scripts/build-release.sh scripts/verify-canaries.sh \
 git commit -m "fix: confine Lane 14 release work"
 ```
 
+### Task 3B: Repair real lifecycle, provenance, and Lane 14 handoff
+
+This task follows the unanimous stopped-writer rejection at exact HEAD
+`1330630d1af58d5f61c21c258d23babc8acc1135`. The already committed ten-file
+implementation inventory is unchanged; this task repairs those same files in
+place. Commit this plan amendment alone before changing implementation.
+
+**Files:** Modify only the existing ten-file implementation inventory under
+File structure and ownership. Writers are sequential and own disjoint files;
+review begins only after each writer stops.
+
+| Order | Sole writer ownership | Acceptance before next row |
+|---|---|---|
+| 1 | `tests/artifact_contracts.rs` | intended real-finalizer RED, writer stopped, Sol/Terra/Luna review |
+| 2 | `scripts/verify-task4-lane16.sh` | syntax, self-test, focused GREEN, writer stopped, three reviews |
+| 3 | `scripts/verify-induced-gaps.sh` | same focused gate and three reviews |
+| 4 | `scripts/matrix/verify-shared-layer.sh` | same focused gate and three reviews |
+| 5 | `scripts/matrix/verify-fork-scope.sh` | same focused gate and three reviews |
+| 6 | `scripts/matrix/verify-oracle.sh` | same focused gate plus exact sibling-state tests and three reviews |
+| 7 | `scripts/verify-canaries.sh` | private-path self-test, stopped writer, three reviews |
+| 8 | `scripts/verify-attach-e2e.sh` | private-path self-test, stopped writer, three reviews |
+| 9 | `scripts/verify-discover-containers.sh` | child journal/payload fixtures, stopped writer, three reviews |
+| 10 | `scripts/build-release.sh` | parent creator/FD-8/terminal fixtures, stopped writer, three reviews |
+
+No later writer edits an earlier row's file. If review requires such a change,
+return ownership to that row, stop all other writers, repair, rerun its gate,
+and repeat all three reviews before resuming.
+
+- [ ] **Step 1: Replace toy models with RED real-finalizer fixtures**
+
+In `tests/artifact_contracts.rs`, execute each actual script `--self-test` path
+against fake external commands and private temporary roots. The self-test must
+exercise the production root owner and finalizer, with only runtime bodies
+substituted at the named command boundary. First require RED for:
+
+- success followed by facts `fsync`, directory `fsync`, mode, inventory, or
+  status-stage failure: no zero receipt and no early/duplicate status;
+- `INT`, `HUP`, and `TERM` before and after durable requested/resolved resource
+  registration; cleanup failure; absence-query failure; and identity mismatch;
+- invalid/existing/symlink/non-private roots and held campaign lock reaching no
+  Cargo/runtime/body mutator;
+- input, HEAD/tree, tracked, untracked, provider, observer, BPF, harness,
+  checker, capture, or artifact mutation before terminal publication;
+- absence of every public body bypass, `$PWD/$WORK`, glob/first-observed
+  selection, stdout capture substitution, `find` mode repair, and pre-finalizer
+  root mutation; fake commands and descendants also prove FD 7 through 14
+  are closed outside the named protocol exceptions;
+- terminal `renameat2(RENAME_NOREPLACE)` collision/unavailability and proof that
+  its successful rename is the last filesystem mutation before exit;
+- exact bounded fact keys/cardinalities and named artifacts for every lane;
+- Lane 11 unchanged dirty sibling, untracked sibling input, dangling default
+  state/policy symlink, incorrect default filename, missing native state/policy
+  arguments, wrong derived cache, and foreign private object; and
+- Lane 14 journal append/`fsync`, requested-before-create,
+  resolved-before-activation, child cleanup uncertainty, malformed/replaced
+  journal or payload, creator PID/starttime reuse, nonce/ready/ack/FD identity
+  mismatch, parent death before ack, FD 8 leakage, and final facts replacement.
+
+For Lane 16, reject a missing aggregate
+`evidence.module_ambiguous == 0`, changed observer/hammer/config/provider/capture
+identity, and an owned child surviving finalization. Keep one focused Cargo test
+command at a time and prove the failure is the intended contract, not fixture
+setup or a real privileged command.
+
+- [ ] **Step 2: Implement Lane 16 as the reference owner**
+
+Repair `scripts/verify-task4-lane16.sh` first: immediate finalizer, state
+latches, durable resource registration, bounded facts, complete aggregate
+predicate, final input revalidation, identity-bound cleanup/absence, exact
+artifact inventory, and execed terminal publisher. Run its shell syntax,
+self-test, and focused artifact contract. Stop its writer and obtain Sol xhigh,
+Terra, and Luna review before copying the proven local pattern.
+
+- [ ] **Step 3: Repair Lanes 07, 09, 10, and 11 sequentially**
+
+Use one writer per script, in that order. Remove public body re-entry, execute
+the body in the owner shell, install terminal authority before mutation, use
+absolute receipt paths, register resources durably, bind cleanup to immutable
+identity, retain exact named artifacts, emit the lane-specific bounded facts,
+and use the reviewed terminal publisher. Preserve every existing lane oracle.
+For Lane 11 additionally use the corrected sibling defaults and exact private
+state/policy/cache contract above. After each stopped writer, run syntax,
+self-test, focused artifact tests, and independent three-model review; repair
+before advancing.
+
+- [ ] **Step 4: Repair Lane 14 and nested facts last**
+
+Keep the existing fixed private work relationships in `build-release.sh`,
+`verify-canaries.sh`, and `verify-attach-e2e.sh`. Implement the child
+journal/payload and parent creator/FD-8 protocol exactly as amended above in
+`verify-discover-containers.sh` and `build-release.sh`. Perform all remaining
+import, protocol-file cleanup, final revalidation, synchronization, and status
+publication inside the execed terminal publisher. No intervening or unrelated
+command inherits FD 8; the terminal publisher is its sole intended inheritor.
+Run only rootless fixtures until stopped-writer Sol xhigh, Terra, and Luna
+agree.
+
+- [ ] **Step 5: Canonical verification and cumulative review**
+
+Run every script syntax/self-test, the focused artifact contract, then the full
+canonical Rust sequence serially. Freeze and review exactly the cumulative ten
+implementation files from `bf4cbcf..HEAD` plus this separately committed plan
+authority. Runtime remains `UNRUN` until Task 4 below passes unanimously.
+
 ### Task 4: Verify and independently review the implementation
 
-**Files:** The cumulative exact ten-file implementation range only. At current
-HEAD, eight files are already committed; Task 3A supplies the remaining
-four-file correction with two files overlapping that cumulative range.
+**Files:** The cumulative exact ten-file implementation range only. The range
+through exact HEAD `1330630d1af58d5f61c21c258d23babc8acc1135` is rejected and
+must not advance to runtime. Task 3B supplies the stopped-writer lifecycle,
+provenance, Lane 11, Lane 14, and Lane 16 corrections within the same inventory.
 
-**Produces:** One reviewed cumulative gate-only range ending in the Task 3A
-four-file correction commit.
+**Produces:** One reviewed cumulative gate-only range ending in the final Task
+3B correction commit.
 
 - [ ] **Step 1: Run canonical verification serially**
 
@@ -686,8 +1144,7 @@ and repeat until all agree.
 git diff --name-only bf4cbcf..HEAD -- scripts tests/artifact_contracts.rs
 # Require exactly the ten files in File structure and ownership.
 # The separately committed plan amendment is authority, not implementation.
-# Do not recommit already committed files; Task 3A owns the final four-file
-# correction commit shown above.
+# Do not add another implementation file or shared receipt framework.
 ```
 
 ### Task 5: Prove Lane 02 compatibility and run remaining Task 4 lanes

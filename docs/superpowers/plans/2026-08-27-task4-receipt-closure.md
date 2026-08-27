@@ -41,6 +41,60 @@ cardinalities, and `docs/superpowers/plans/ROADMAP.md` topology ruling.
   requested important-decision policy, focused Terra and Luna reviews must also
   agree before the plan and implementation gates advance.
 
+### Descriptor inheritance reconciliation (authoritative)
+
+The unanimous architecture reconciliation fixes the shell-visible descriptor
+mapping and supersedes any conflicting numeric label in this plan. The mapping
+is control `FD 3`, events `FD 4`, observer `FD 5`, creator `FD 6`, main facts
+`FD 7`, nested facts `FD 8`, and common lock `FD 9`; the reserved range is
+`FD 3-9`. This changes no schema bytes, schema digest, privacy policy, or
+capture vocabulary.
+
+| Process or mode | Descriptor inheritance and allocation |
+|---|---|
+| Observed supervisor | `FD 3` control FIFO, `FD 4` events FIFO, and `FD 5` observer stream. The observed anchor passes only `FD 5`; the supervisor closes inherited `FD 3/4/6-9` before opening the two FIFOs as `FD 3/4`. |
+| Case owner/publisher | Inherits only the case `FD 3/4` control/events pair and, for a receipt case as applicable, owns main facts/nested facts/lock as `FD 7/8/9`. The execed publisher keeps `FD 3/4` only through `publisher-entered` and its acknowledged final command, then closes both before terminal publication and retains only the applicable `FD 7/8/9`. It never inherits `FD 5/6`. |
+| Lane 14 creator | Closes inherited `FD 3-9`, opens and identity-validates the artifacts directory transiently, creates facts through that directory, moves the facts descriptor to fresh local `FD 6`, and closes every transient before ready publication. Its observable ready/wait state is exactly standard FDs plus FD 6. The receipt parent imports FD 6 into FD 8 only after the ready record and identity checks. |
+| Receipt parent/publisher | Owns main facts `FD 7`, Lane 14 nested facts `FD 8` when applicable, and common lock `FD 9`; those descriptors remain through terminal publication. |
+| Hardened launcher/child | Gets a fresh local `FD 3` only after its external boundary closes inherited `FD 3-9`, writes and validates the PID handoff, then closes FD 3 before exec; the target payload receives no reserved descriptor. |
+| Other external/fake command | Closes every reserved descriptor `FD 3-9` before execution; no descriptor outside the named owner/supervisor/creator exceptions is accepted. |
+
+Standalone and normal modes close inherited `FD 3-9` before their own
+allocations. Every Task 3B driver acceptance runs through the real observed
+session, which validates supervisor `FD 3/4/5` identities, each case's protocol
+`FD 3/4` and absence of `FD 5/6` before receipt allocation, the publisher's
+two descriptor phases, and the Lane 14 creator `FD 6` to parent `FD 8`
+handoff. A synthetic protocol emitter is RED-only and never acceptance. A
+Bash/proc bridge for the observer protocol is rejected;
+`/proc/$creator_pid/fd/6` is permitted only for the reviewed Lane 14 creator
+handoff above.
+
+Lane 13 is outside this descriptor amendment and the current ten-file Task 3B
+implementation range. Its checker/lifecycle authority remains commit
+`34357b5dda71c670250dd3ab336b29c801120d5b` (tree
+`ae3346e4b8e137f430f010d0937bcf186cfcff39`) and its final
+invocation/contract authority remains commit
+`fd3d08ad9bd2f58508eda1ee4a50882c0633d850` (tree
+`0decc4dee974707468b5758107fb055c30d44d7d`). The attempt-6 receipt is
+`/home/user/.local/state/p11scope/task4-lane13-a2fd9ee-20260826T2135EEST/facts.log`
+with SHA-256
+`b96cbed6cbc2963dab2c5963b5c52f6378d9bef313479b83a56c259df79b94f3`,
+exact HEAD `a2fd9ee8eddfaff34b3fb6b65267688b5a90aa03`, and tree
+`f90e2dfe8dbd0a211f9e32055a37ff7320080b88`. Its evidenced preattached-provider
+capture remains 136/136 probes with expected cold-pod calls. Its bound
+command/script ledger, Kind/Knative releases/images, provider hash/build ID,
+kernel/storage, node/workload topology, and clean start/end inputs remain
+immutable. The checker and invocation are not rerun or amended here. Future 9.2d negative-control
+classification permits only candidate and gate identity to differ, each equal
+to the independently reviewed pre-run r3 manifest; any other mismatch is
+UNRUN/review before outcome classification. Attempt 6 is not rerun. The one
+9.2d frozen-candidate control retains exactly one overlay plus one unavailable
+and is `UNSUPPORTED/NON-PASS` outside the unchanged zero-unavailable Lane-13
+PASS oracle; Lane 13 PASS is not an unlock condition. This plan neither changes
+nor requires a common Task-4 lock in `scripts/matrix/verify-knative.sh`. Any
+later FD migration requires new roadmap, ledger, review, and freeze authority
+after that unchanged negative control.
+
 ---
 
 ## Frozen baseline and Lane 02 disposition
@@ -145,12 +199,12 @@ and pathname identity before use. Every facts append and final `terminal_status_
 uses FD 7. Lane 14 additionally holds nested `artifacts/discover.facts` as FD 8.
 Lock FD 9 is reserved for the common lock.
 Every ordinary external tool, Cargo/runtime command, wrapper payload, and fake
-command is invoked with `7>&- 8>&- 9>&- 10>&- 11>&- 12>&- 13>&- 14>&- 15>&-`. The only exceptions
+command is invoked with `3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-`. The only exceptions
 are the initial `flock` operation using FD 9, the narrowly named inline facts
-writer using FD 7, the Lane 14 creator/handoff steps using FD 12/8, self-test
-owner/publisher control using FD 10/11, the self-test supervisor using FD 13/14,
-the transient Python group anchor while it passes FD 15, and the self-test
-witness link shared by the Rust peer and supervisor FD 15,
+writer using FD 7, the Lane 14 creator/handoff steps using FD 6/8, self-test
+owner/publisher control using FD 3/4, the self-test supervisor using FD 3/4,
+the transient Python group anchor while it passes FD 5, the self-test
+witness link shared by the Rust peer and supervisor FD 5,
 and the final terminal publisher using FD 7/8/9. The terminal publisher performs revalidation with Python stdlib and
 spawns no child; any defensive subprocess API must set `close_fds=True`. Fixture
 commands inspect `/proc/self/fd` and fail if a reserved descriptor leaks.
@@ -208,9 +262,9 @@ identity-cleans all six private protocol files before committing status.
 | `work/discover.resource-journal` | nested child, before first resource | first open is 0600 `O_CREAT|O_EXCL|O_NOFOLLOW|O_WRONLY`; later appends are `O_WRONLY|O_APPEND|O_NOFOLLOW` only after identity comparison; one header, then exactly one requested, resolved-or-uncertain, cleanup, and absence record per declared indexed resource, followed by one terminal record | terminal publisher removes by retained identity after import; malformed/missing/uncertain is non-pass |
 | `work/discover.payload` | nested child finalizer | 0600 `O_CREAT|O_EXCL|O_NOFOLLOW|O_WRONLY` regular, exactly one canonical payload containing child PID/starttime/session, journal identity/digest/count, declared resource count, fact-key counts, cleanup summary, terminal result | terminal publisher removes by retained identity; missing/replaced/duplicate is non-pass |
 | `work/discover.ready.pending` | facts creator | 0600 `O_CREAT|O_EXCL|O_NOFOLLOW|O_WRONLY`, exactly one ready record before atomic no-replace publication | creator removes only its still-matching pending object on failure; otherwise it must be absent before status |
-| `work/discover.ready` | facts creator by no-replace rename | 0600 regular, exactly one version/nonce/parent PID+starttime/creator PID+starttime/creator-FD-12/facts-identity record | terminal publisher identity-cleans after validated handoff; five-second timeout, parent mismatch, or creator death is non-pass |
+| `work/discover.ready` | facts creator by no-replace rename | 0600 regular, exactly one version/nonce/parent PID+starttime/creator PID+starttime/creator-FD-6/facts-identity record | terminal publisher identity-cleans after validated handoff; five-second timeout, parent mismatch, or creator death is non-pass |
 | `work/discover.ack.pending` | parent | 0600 `O_CREAT|O_EXCL|O_NOFOLLOW|O_WRONLY`, exactly one acknowledgement record before atomic no-replace publication | parent removes only its still-matching pending object on failure; otherwise it must be absent before status |
-| `work/discover.ack` | parent by no-replace rename | 0600 regular, exactly one matching version/nonce/generations/creator-FD-12/parent-FD-8/facts-identity record | terminal publisher identity-cleans after creator reap; five-second timeout, mismatch, or parent death makes creator exit and is non-pass |
+| `work/discover.ack` | parent by no-replace rename | 0600 regular, exactly one matching version/nonce/generations/creator-FD-6/parent-FD-8/facts-identity record | terminal publisher identity-cleans after creator reap; five-second timeout, mismatch, or parent death makes creator exit and is non-pass |
 | `artifacts/discover.facts` | pinned creator, imported by terminal publisher through FD 8 | 0600 regular, `nlink=1`, one canonical bounded Lane 14 fact stream with exact allowed-key cardinalities | retained; replacement/mutation/import/fsync uncertainty is non-pass and prevents status |
 
 All protocol objects are caller-owned, bounded by the facts limits below, and
@@ -481,9 +535,9 @@ The public interface remains exactly `--self-test`; it accepts no case selector,
 fault environment, or extra argument. Standalone self-test creates one private
 mode-0700 temporary parent and requires neither
 `P11SCOPE_TASK4_SELF_TEST_WORK`, `P11SCOPE_TASK4_SELF_TEST_ANCHOR_PGID`, nor FD
-15. The Rust-observed form instead requires all three: an existing, empty,
+5. The Rust-observed form instead requires all three: an existing, empty,
 caller-owned mode-0700 absolute `P11SCOPE_TASK4_SELF_TEST_WORK` parent, inherited
-FD 15, and the anchor PGID below. Any incomplete combination is an exit-2
+FD 5, and the anchor PGID below. Any incomplete combination is an exit-2
 rejection before mutation. These inputs are accepted only by the exact
 one-argument `--self-test` branch, and normal mode rejects all three. The branch creates a fixed
 fake-command directory and one subprocess per declared case by forking a shell
@@ -502,15 +556,17 @@ at `$P11SCOPE_TASK4_SELF_TEST_WORK/control.in` and
 relative names under its standalone parent. The FIFOs are supervisor-created,
 caller-UID-owned mode-0600 objects. It opens
 both ends read/write before forking, retaining control/events as supervisor FDs
-13/14. The supervisor itself rejects symlink/non-FIFO/wrong-owner/wrong-mode/
+3/4. The supervisor itself rejects symlink/non-FIFO/wrong-owner/wrong-mode/
 wrong-link-count paths and requires pathname `lstat` to match FD `fstat` after
-creation, before every child, and before identity cleanup. The case subshell duplicates 13 to child control-input FD 10 and 14 to
-child event-output FD 11, then closes 13/14 before calling the receipt owner;
-creator protocol FD 12 remains distinct. Normal receipt mode closes 10 through
-15 before validation and ignores all inherited test variables. Fake external
-commands receive `10>&- 11>&- 12>&- 13>&- 14>&- 15>&-`; only the receipt owner and its
-execed terminal publisher retain child FDs 10/11, while only the supervisor
-retains FDs 13/14 and the supervisor side of FD 15. Case children close FD 15.
+creation, before every child, and before identity cleanup. The case subshell
+inherits child control-input FD 3 and event-output FD 4 directly, then closes
+FD 5 before calling the receipt owner; driver-private FD 6 remains distinct.
+Normal receipt mode closes inherited FDs 3 through 9 before validation and
+ignores all inherited test variables. Fake external commands receive
+`3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-`; only the receipt owner and its execed
+terminal publisher retain child FDs 3/4 plus the applicable receipt FDs 7/8/9,
+while only the supervisor retains FDs 3/4 and its side of FD 5. Case children
+close FD 5.
 
 Each FIFO frame is one bounded ASCII line:
 
@@ -518,8 +574,8 @@ Each FIFO frame is one bounded ASCII line:
 selftest-v1<TAB>NONCE<TAB>CASE<TAB>SEQUENCE<TAB>event|command<TAB>NAME<LF>
 ```
 
-The child writes increasing `event` frames to FD 11; the supervisor alone writes
-increasing `command` frames to FD 10. The two FIFOs are campaign-wide: they are
+The child writes increasing `event` frames to FD 4; the supervisor alone writes
+increasing `command` frames to FD 3. The two FIFOs are campaign-wide: they are
 created once before the first case, reused by every exactly reaped case, then
 closed and identity-removed before the supervisor's final completion event.
 Nonce/case/direction/sequence mismatch,
@@ -530,14 +586,30 @@ commands `facts-write`, `facts-fsync`, `dir-fsync`, `mode-drift`, `inventory`,
 `rename-unavailable` are the only commands. Events expose exact barriers before
 and after requested/resolved registration and before terminal rename. The
 supervisor pins each child PID/starttime and waits for the exact event. In the
-Rust-observed form it forwards each named lifecycle barrier to FD 15, waits for
+Rust-observed form it forwards each named lifecycle barrier to FD 5, waits for
 Rust's acknowledgement, and only then sends the requested `INT`/`HUP`/`TERM`
 directly to that generation or writes its `continue`/fault command,
-and bounds every internal frame wait at five monotonic seconds. The child closes
-10/11 immediately after the final terminal fault point. The supervisor emits
+and bounds every internal frame wait at five monotonic seconds. Non-publisher
+children close FDs 3/4 immediately after their final protocol point. For the
+execed terminal publisher, `publisher-entered` is sent on FD 4 and its final
+command is read on FD 3. It records that command without applying the fault,
+closes both descriptors, and sends `SIGSTOP` to itself before the first
+terminal-publication mutation. The supervisor waits for the exact pinned
+generation to enter the stopped state, proves FDs 3/4 absent, and compares the
+complete bounded root/work/artifacts inventory plus every retained object's
+identity, size, digest, canonical content, and case-specific expected status
+state with its
+`publisher-entered` snapshot. It then emits the supervisor-generated
+`publisher-isolated` frame to Rust. Rust independently proves the stopped
+generation, FD absence, retained FD 7/8/9 identities as applicable, and the
+same exact pre/post inventory/content equality. Only after Rust
+acknowledges that frame does the supervisor send `SIGCONT`; the publisher may
+then apply the recorded fault command and enter terminal publication. Missing
+stop, identity drift, mutation, timeout, or failed continuation is non-pass and
+causes pinned-generation cleanup. The supervisor emits
 `case-reaped` only after exact child reap, retains that case root until Rust
 acknowledges the frame, then identity-removes it. After the final case it closes
-13/14 and removes only identity-matching FIFOs before `complete`.
+3/4 and removes only identity-matching FIFOs before `complete`.
 Every case reports only canonical `selftest-v1<TAB>case<TAB>expected<TAB>actual`
 rows followed by `selftest-v1<TAB>complete`; the Rust contract rejects missing,
 duplicate, or unexpected rows. No Cargo, Docker, systemd, sudo, eBPF, provider,
@@ -545,15 +617,16 @@ or release command may escape the fake boundary.
 
 The Rust artifact contract is the independent live observer, not the tested
 reporter. It creates a `UnixStream::pair`; both originals are close-on-exec.
+Rust records the child endpoint's socket identity before dropping its copy.
 In `pre_exec` for the group anchor described below, Rust uses only
 async-signal-safe `dup2`/`close`/`fcntl`: if the child endpoint is not already
-15 it duplicates it to 15 and closes the original; if it is already 15 it only
+5 it duplicates it to 5 and closes the original; if it is already 5 it only
 clears `FD_CLOEXEC`; every other surplus stream copy is closed. Rust retains the
 non-inheritable unnumbered peer and drops its child-end copy immediately after
-spawn. The anchor hands FD 15 to the shell using the exact `Popen` sequence
-below. FD 15 is optional for standalone self-test but mandatory for this
+spawn. The anchor hands FD 5 to the shell using the exact `Popen` sequence
+below. FD 5 is optional for standalone self-test but mandatory for this
 acceptance gate. Its presence requires the dedicated work parent above. Case
-children and every external/fake command close FD 15; only the Rust peer and
+children and every external/fake command close FD 5; only the Rust peer and
 shell supervisor retain their endpoints.
 
 Rust generates a 64-lowercase-hex nonce from 32 bytes read from `/dev/urandom`
@@ -566,7 +639,7 @@ each bounded at five monotonic seconds. Directions and grammar are exact:
 ```text
 Rust -> supervisor: audit-v1<TAB>NONCE<TAB>challenge<LF>
 supervisor -> Rust: audit-v1<TAB>NONCE<TAB>SEQUENCE<TAB>supervisor-ready<TAB>SUPERVISOR_PID<TAB>SUPERVISOR_STARTTIME<TAB>PARENT_DEV:INO<TAB>CONTROL_DEV:INO<TAB>EVENTS_DEV:INO<LF>
-supervisor -> Rust: audit-v1<TAB>NONCE<TAB>SEQUENCE<TAB>case-started|owner-entered|finalizer-entered|publisher-entered|case-reaped<TAB>ORDINAL<TAB>CASE<TAB>CHILD_PID<TAB>CHILD_STARTTIME<TAB>ROOT_DEV:INO_OR_NONE<TAB>RECEIPT_STATUS<TAB>CHILD_WAIT_STATUS<TAB>PUBLISHER_EXE_DEV:INO_OR_DASH<LF>
+supervisor -> Rust: audit-v1<TAB>NONCE<TAB>SEQUENCE<TAB>case-started|owner-entered|finalizer-entered|publisher-entered|publisher-isolated|case-reaped<TAB>ORDINAL<TAB>CASE<TAB>CHILD_PID<TAB>CHILD_STARTTIME<TAB>ROOT_DEV:INO_OR_NONE<TAB>RECEIPT_STATUS<TAB>CHILD_WAIT_STATUS<TAB>PUBLISHER_EXE_DEV:INO_OR_DASH<LF>
 supervisor -> Rust: audit-v1<TAB>NONCE<TAB>SEQUENCE<TAB>complete<TAB>CASE_COUNT<LF>
 Rust -> supervisor: audit-v1<TAB>NONCE<TAB>SEQUENCE<TAB>ack<LF>
 ```
@@ -579,19 +652,24 @@ exact ordered lifecycle sequence for every case: `case-started` and
 `case-reaped` are mandatory, while owner/finalizer/publisher events occur only
 when that case is expected to reach them. The total supervisor-frame count is
 exactly two plus the sum of those frozen per-case sequence lengths.
-It may never exceed `5 * CASE_COUNT + 2`; EOF or another frame after the exact
+It may never exceed `6 * CASE_COUNT + 2`; EOF or another frame after the exact
 `complete` is failure. Missing/malformed ack or any five-second ack timeout makes
 the supervisor kill and reap its pinned case child, identity-clean only owned
 fixtures, and exit nonzero; the Rust anchor remains available for group cleanup.
-`RECEIPT_STATUS` is `none` before reap; at `case-reaped` it is `none`, `invalid`,
-or canonical decimal 0..255 exactly as the authoritative classes below require.
+`RECEIPT_STATUS` is the literal non-semantic placeholder `none` before reap;
+Rust derives every live status assertion from its filesystem snapshot, so this
+placeholder does not assert absence and also applies to the planned I97 live
+frames. At `case-reaped` the field is semantic and is `none`, `invalid`, or
+canonical decimal 0..255 exactly as the authoritative classes below require.
 `CHILD_WAIT_STATUS` is `none` before reap and canonical decimal 0..255 at
 `case-reaped`; signal waits use POSIX shell values 128 plus the signal number.
-The publisher executable field is `-` except at `publisher-entered`; the root
+The publisher executable field is `-` except at `publisher-entered` and
+`publisher-isolated`, where both frames name the same pinned terminal
+interpreter identity; the root
 field is `none` until an owned root exists.
 
-`none` means `lstat(root/status)` is `ENOENT`. `invalid` means the path is not
-an authoritative terminal receipt, with an exact case oracle: `early-status`
+At `case-reaped`, `none` means `lstat(root/status)` is `ENOENT`. `invalid` means
+the path is not an authoritative terminal receipt, with an exact case oracle: `early-status`
 retains the original caller-UID-owned mode-0600 `nlink=1` regular `0\n` inode
 whose creation precedes `publisher-entered`; `duplicate-status` retains one
 such regular inode containing exactly `0\n0\n`; and `foreign-terminal-artifact`
@@ -601,7 +679,8 @@ accepted as a decimal receipt.
 
 The following ordered classes are plan-authoritative and exhaustive; matching
 stops at the first class. `full` means `case-started`, `owner-entered`,
-`finalizer-entered`, `publisher-entered`, `case-reaped`; `refusal` means only
+`finalizer-entered`, `publisher-entered`, `publisher-isolated`, `case-reaped`;
+`refusal` means only
 `case-started`, `case-reaped`. A refusal has no owned root or receipt status.
 A full case has no root at `case-started` and the same exact owned root at every
 later live event.
@@ -627,22 +706,36 @@ parent identity, and distinct supervisor-created caller-UID-owned mode-0600
 `control.in`/`events.out`
 FIFOs. It uses `symlink_metadata` on those exact paths, rejects symlinks and
 non-FIFOs, requires `nlink=1`, and matches each reported `dev:ino` both to that
-path and to `/proc/SUPERVISOR_PID/fd/13` or `/proc/SUPERVISOR_PID/fd/14`.
+path and to `/proc/SUPERVISOR_PID/fd/3` or `/proc/SUPERVISOR_PID/fd/4`. It also
+matches `/proc/SUPERVISOR_PID/fd/5` to the Rust-recorded child socket identity
+and requires that same FD 5 identity through every frame including `complete`.
 For each case, Rust derives the supervisor-owned sandbox `cases/NNN` and the
 candidate receipt root `cases/NNN/root` from the zero-based ordinal. The
 child's mandatory `case-started` and every expected `owner-entered`,
 `finalizer-entered`, and execed terminal publisher `publisher-entered` are
-blocking FD-11 barriers: child event,
-supervisor validation and FD-15 forward, Rust live validation and ack, then the
-supervisor's FD-10 `continue`/fault command. Rust revalidates the pinned child
-generation and `/proc/PID/fd/10` plus `/proc/PID/fd/11` against the campaign
+blocking FD-4 barriers: child event,
+supervisor validation and FD-5 forward, Rust live validation and ack, then the
+supervisor's FD-3 `continue`/fault command. Rust revalidates the pinned child
+generation and `/proc/PID/fd/3` plus `/proc/PID/fd/4` against the campaign
 FIFO identities at every live barrier. At `case-started`, Rust checks the
 case's frozen precondition and proves that no unplanned owned mutation occurred.
 When the frame names a root identity, Rust also revalidates it. Owner and
 finalizer require mode 0700 and no status. Publisher additionally requires
 `/proc/PID/exe` to
 differ from the pinned shell identity and match the pre-resolved terminal
-Python interpreter identity reported in its frame. At `case-reaped`, the
+Python interpreter identity reported in its frame. Rust requires publisher FDs
+3/4 present at `publisher-entered`. The supervisor-generated
+`publisher-isolated` barrier follows the close-and-stop sequence above; both
+observers require FDs 3/4 absent, applicable FDs 7/8/9 unchanged, the exact
+publisher generation stopped, the case-specific expected status state
+unchanged, and no inventory, facts,
+nested-facts, journal, payload, ready/ack protocol, or other retained-content
+mutation between the bounded `publisher-entered` and `publisher-isolated`
+snapshots before the acknowledged `SIGCONT`. Normal full cases require status
+absent at both snapshots. I97 cases instead require their exact planned invalid
+status inode/type/mode/link/content or foreign identity captured at
+`publisher-entered` and byte- and identity-unchanged at `publisher-isolated`;
+the live-frame `RECEIPT_STATUS` remains `none` until reap. At `case-reaped`, the
 supervisor has reaped the child; Rust proves that generation absent and checks
 the expected terminal status, tree, facts, and ownership before ack permits
 root deletion. `complete` follows all case-root deletions and FIFO cleanup; Rust
@@ -743,9 +836,9 @@ The Rust harness launches a fixed inline Python group anchor as the direct child
 with `std::os::unix::process::CommandExt::process_group(0)`; Rust verifies the
 resulting anchor PID equals PGID before the challenge. The anchor starts the
 observed `/bin/sh SCRIPT --self-test` supervisor in the same group with
-`subprocess.Popen(..., close_fds=True, pass_fds=(15,))`. FD 15 is already
+`subprocess.Popen(..., close_fds=True, pass_fds=(5,))`. FD 5 is already
 inheritable from Rust's handoff; immediately after successful `Popen` the anchor
-closes its FD-15 copy, and on `Popen` failure it closes FD 15 and exits 125. It
+closes its FD-5 copy, and on `Popen` failure it closes FD 5 and exits 125. It
 sets `P11SCOPE_TASK4_SELF_TEST_ANCHOR_PGID` to its canonical decimal PID only in
 that observed shell environment; the exact self-test branch validates it
 against `getpgrp`, normal/standalone mode rejects it, and fake commands inherit
@@ -786,8 +879,13 @@ kills/reaps through the anchor. The
 validated `complete` frame is appended and fsynced before Rust sends its final
 ack. The summary report retains its existing 8-MiB cap. A dynamic marker-complete,
 digest-correct, exhaustive reporter launched inside the same tripwire-only
-environment but without a valid FD-15 exchange must fail at
+environment but without a valid FD-5 exchange must fail at
 `supervisor-ready`, with no receipt mutation, fake command, or process residue.
+Separately, a synthetic reporter that inherits valid FD 5, creates and opens
+FDs 3/4, and emits canonical-looking frames but lacks the named production
+owner/finalizer/root state must be rejected before Rust acknowledges the first
+state-dependent frame. Passing the transport fixture alone is never driver
+acceptance.
 Extra-argument probes use that same environment and require nonzero, zero
 frames, zero tripwire entries, zero mutation, and no process residue. This
 observer raises regression confidence against dead-code/toy reporters; it is
@@ -838,23 +936,30 @@ cardinalities, cleanup results, and terminal child result. The parent pins and
 waits the child and retains journal/payload on uncertainty.
 
 Only after the complete Lane 14 body and ordinary cleanup/absence, the parent
-starts a short-lived pinned creator. Through the validated artifacts directory
-FD, the creator opens absent `discover.facts` with
-`O_CREAT|O_EXCL|O_NOFOLLOW|O_RDWR`, mode 0600, validates
-regular/owner/nlink/identity, assigns creator protocol FD 12, closes inherited
-lock and unrelated descriptors, and atomically publishes a nonce-bound ready
+starts a short-lived pinned creator. The creator first closes inherited FDs 3
+through 9. It transiently opens the artifacts directory with no-follow
+directory semantics and requires its expected identity; through that FD it
+opens absent `discover.facts` with `O_CREAT|O_EXCL|O_NOFOLLOW|O_RDWR`, mode
+0600, validates regular/owner/nlink/identity, moves the facts descriptor to FD
+6, and closes the directory and every other transient before it atomically
+publishes a nonce-bound ready
 record using `renameat2(RENAME_NOREPLACE)`. The ready record contains protocol
 version, nonce, parent and creator PID/starttime, FD number, and facts identity.
 It waits boundedly for a matching atomic acknowledgement while polling parent
 PID/starttime.
 
 The parent uses `$!` plus pinned creator starttime, validates the ready record,
-opens `/proc/$creator_pid/fd/12` into parent FD 8, and compares FD 8
+opens `/proc/$creator_pid/fd/6` into parent FD 8, and compares FD 8
 `fstat`, pathname `lstat`, and ready identity before and after creator-generation
 checks. It atomically publishes the matching acknowledgement, waits/reaps the
 exact creator, and immediately `exec`s the terminal publisher. No intervening
 or unrelated external command inherits FD 8; the execed terminal publisher is
 the sole intended inheritor. Numeric PID reuse is not authority.
+
+The observed Lane 14 mutation table snapshots `/proc/$creator_pid/fd` and
+requires exactly standard FDs plus FD 6, proves every other reserved descriptor
+absent, matches creator FD 6 to parent FD 8 before and after generation checks,
+and rejects any extra descriptor or importer other than that parent.
 
 Inside that terminal publisher, validate journal, payload, ready,
 acknowledgement, schemas, nonces, cardinalities, sizes, identities, and digests;
@@ -1188,7 +1293,11 @@ add mutations proving all of the following:
   available when absent, and no `$PWD/$WORK` composition remains; and
 - canary, attach, discover, diagnostic-BPF, distribution, and official-build
   paths cannot escape `$ROOT/work` or use receipt-mode `target/canaries` and
-  `target/e2e` paths.
+  `target/e2e` paths; and
+- a rootless hardened-child fixture enters with FDs 3 through 9 absent, opens
+  its own PID-handoff FD 3, validates that descriptor's local file identity,
+  closes it before exec, and proves that no control FIFO or other receipt
+  descriptor reaches the target payload.
 
 ### Task 3: Implement lane-local receipts minimally
 
@@ -1323,7 +1432,7 @@ substituted at the named command boundary. First require RED for:
   checker, capture, or artifact mutation before terminal publication;
 - absence of every public body bypass, `$PWD/$WORK`, glob/first-observed
   selection, stdout capture substitution, `find` mode repair, and pre-finalizer
-  root mutation; fake commands and descendants also prove FD 7 through 15
+  root mutation; fake commands and descendants also prove FD 3 through 9
   are closed outside the named protocol exceptions;
 - terminal `renameat2(RENAME_NOREPLACE)` collision/unavailability and proof that
   its successful rename is the last filesystem mutation before exit;
@@ -1334,7 +1443,15 @@ substituted at the named command boundary. First require RED for:
 - Lane 14 journal append/`fsync`, requested-before-create,
   resolved-before-activation, child cleanup uncertainty, malformed/replaced
   journal or payload, creator PID/starttime reuse, nonce/ready/ack/FD identity
-  mismatch, parent death before ack, FD 8 leakage, and final facts replacement.
+  mismatch, parent death before ack, exact creator descriptor inventory, FD 8
+  leakage, and final facts replacement;
+- every real Task 3B driver through the observed session, rejecting direct
+  marker-only success; and a valid-FD-5 synthetic reporter that opens FDs 3/4
+  and emits canonical-looking frames without production owner/finalizer/root
+  state, rejected before the first state-dependent acknowledgement; and
+- an early facts/protocol mutation after `publisher-entered` but before
+  close-and-stop, rejected at `publisher-isolated` with no acknowledgement or
+  terminal receipt.
 
 For Lane 16, reject a missing aggregate
 `evidence.module_ambiguous == 0`, changed observer/hammer/config/provider/capture

@@ -794,6 +794,27 @@ impl PauseCoordinator {
         if let Err(error) = io.resume() {
             return self.fail_cycle(io, error, true);
         }
+        for sample in 0..10 {
+            if let Err(error) = io.wait_one_ms() {
+                eprintln!("P11SCOPE_PAUSE_EXPERIMENT sample={sample} wait_error={error}");
+                break;
+            }
+            let states = io.task_states(self.pid);
+            let authorization = io.authorization();
+            match states {
+                Ok(states) => {
+                    let stopped = states.values().filter(|state| **state == b'T').count();
+                    eprintln!(
+                        "P11SCOPE_PAUSE_EXPERIMENT sample={sample} tasks={} stopped={} authorization={authorization:?}",
+                        states.len(),
+                        stopped,
+                    );
+                }
+                Err(error) => eprintln!(
+                    "P11SCOPE_PAUSE_EXPERIMENT sample={sample} state_error={error} authorization={authorization:?}"
+                ),
+            }
+        }
         self.epoch.resume_succeeded = true;
         self.counters.confirmed = self.counters.confirmed.saturating_add(1);
         self.attempt_open = false;

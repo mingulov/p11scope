@@ -163,6 +163,10 @@ observer_alive() {
     fi
 }
 
+count_byte_token() {
+    grep -Fao "$2" "$1" 2>/dev/null | wc -l
+}
+
 # The child can emit the marker after iteration N drained discovery but before
 # N rendered. Two subsequent frames prove iteration N+1 drained after mapping.
 wait_mapped_and_drained() {
@@ -171,13 +175,13 @@ wait_mapped_and_drained() {
     wmd_attempt=0
     wmd_limit=${WAIT_ATTEMPTS:-240}
     wmd_delay=${WAIT_DELAY:-0.05}
-    while ! grep -Fqx 'HARNESS_PROVIDER_MAPPED' "$wmd_log" 2>/dev/null; do
+    while [ "$(count_byte_token "$wmd_log" HARNESS_PROVIDER_MAPPED)" -lt 1 ]; do
         observer_alive || return 1
         [ "$wmd_attempt" -lt "$wmd_limit" ] || return 1
         wmd_attempt=$((wmd_attempt + 1))
         sleep "$wmd_delay"
     done
-    [ "$(grep -Fxc HARNESS_PROVIDER_MAPPED "$wmd_log")" -eq 1 ] || return 1
+    [ "$(count_byte_token "$wmd_log" HARNESS_PROVIDER_MAPPED)" -eq 1 ] || return 1
     if [ "$wmd_load_kind" = initial-set ]; then
         wmd_expected=HARNESS_PROVIDER_INITIAL_SET
         wmd_rejected=HARNESS_PROVIDER_LATE_LOAD
@@ -185,8 +189,8 @@ wait_mapped_and_drained() {
         wmd_expected=HARNESS_PROVIDER_LATE_LOAD
         wmd_rejected=HARNESS_PROVIDER_INITIAL_SET
     fi
-    [ "$(grep -Fxc "$wmd_expected" "$wmd_log")" -eq 1 ] || return 1
-    [ "$(grep -Fxc "$wmd_rejected" "$wmd_log")" -eq 0 ] || return 1
+    [ "$(count_byte_token "$wmd_log" "$wmd_expected")" -eq 1 ] || return 1
+    [ "$(count_byte_token "$wmd_log" "$wmd_rejected")" -eq 0 ] || return 1
     wmd_offset=$(wc -c < "$wmd_log") || return 1
     wmd_attempt=0
     while :; do

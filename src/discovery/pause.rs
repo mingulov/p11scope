@@ -137,6 +137,18 @@ pub(crate) trait PauseIo {
         pause_owned: bool,
         terminal_batch: &mut Option<TerminalBatch>,
     ) -> Result<PauseBatchOutcome, String>;
+    fn account_unvalidated_records(&mut self, count: u64);
+    fn reconcile_terminal_authority(
+        &mut self,
+        terminal_batch: &mut Option<TerminalBatch>,
+    ) -> Result<(), String>;
+    fn cleanup_terminal_batch_without_replay(
+        &mut self,
+        terminal_batch: &mut Option<TerminalBatch>,
+    ) -> Result<(), String>;
+    fn terminal_authority_pending(&self) -> bool {
+        false
+    }
     fn revalidate_after_release(
         &mut self,
         pause_owned: bool,
@@ -190,6 +202,18 @@ struct PauseEpoch {
     protective_resume_attempted: bool,
 }
 
+#[derive(Clone, Copy)]
+enum RemovalDisposition {
+    Normal,
+    Rejected,
+}
+
+#[derive(Clone, Copy)]
+enum AuthorizationSource {
+    Observation,
+    Removal,
+}
+
 pub(crate) struct PauseCoordinator {
     policy: PausePolicy,
     pid: u32,
@@ -211,10 +235,34 @@ pub(crate) struct PauseCoordinator {
     failure_deadline: Option<u64>,
     failure_items: usize,
     pending_records: Vec<DiscoveryRecord>,
+    unvalidated_records: u64,
     terminal_batch: Option<TerminalBatch>,
     cycles: u8,
     cleaning: bool,
     cleaned: bool,
+}
+
+enum TimedDequeueError {
+    Deadline(String),
+    Failure(String),
+}
+
+impl TimedDequeueError {
+    fn lifecycle(&self) -> bool {
+        matches!(self, Self::Failure(_))
+    }
+
+    fn message(self) -> String {
+        match self {
+            Self::Deadline(message) | Self::Failure(message) => message,
+        }
+    }
+}
+
+fn clamp_deadline(slot: &mut Option<u64>, candidate: u64) -> u64 {
+    let deadline = slot.map_or(candidate, |existing| existing.min(candidate));
+    *slot = Some(deadline);
+    deadline
 }
 
 impl PauseCoordinator {
@@ -276,6 +324,7 @@ impl PauseCoordinator {
             failure_deadline: None,
             failure_items: 0,
             pending_records: Vec::new(),
+            unvalidated_records: 0,
             terminal_batch: None,
             cycles: 0,
             cleaning: false,
@@ -348,10 +397,10 @@ impl PauseCoordinator {
         io: &mut impl PauseIo,
     ) -> Result<(), PauseError> {
         loop {
-            let pause_owned = self.armed || self.attempt_open || self.may_be_stopped;
+            let pause_owned = self.active_epoch();
             match io.revalidate_after_release(pause_owned) {
                 Ok(PauseRevalidationOutcome::Deferred(received)) if pause_owned => {
-                    self.service_received(io, received)?;
+                    self.service_deferred(io, received)?;
                 }
                 Ok(PauseRevalidationOutcome::Deferred(_)) => {
                     return Err(Self::policy_error(
@@ -411,8 +460,6 @@ impl PauseCoordinator {
         lifecycle: bool,
     ) -> Result<ArmResult, PauseError> {
         self.begin_attempt();
-        self.may_be_stopped = true;
-        self.epoch.authorization_consumed = true;
         self.fail_cycle(io, message, lifecycle)
             .map(|()| ArmResult::Disabled)
     }
@@ -423,7 +470,7 @@ impl PauseCoordinator {
         }
         let received = match self.timed_dequeue(io, None) {
             Ok(received) => received,
-            Err(error) => return self.fail_cycle(io, error, true),
+            Err(error) => return self.fail_cycle(io, error.message(), true),
         };
         let Some(received) = received else {
             let ring_loss = match io.ring_loss() {
@@ -434,9 +481,93 @@ impl PauseCoordinator {
                 self.begin_attempt();
                 return self.fail_cycle(io, "discovery record reservation loss", false);
             }
+            if self.armed {
+                let authorization = match io.authorization() {
+                    Ok(authorization) => authorization,
+                    Err(error) => return self.fail_cycle(io, error, true),
+                };
+                match authorization {
+                    Some(PAUSE_ARMED) => return Ok(()),
+                    Some(PAUSE_REQUESTED) => {
+                        let now = match io.now_ns() {
+                            Ok(now) => now,
+                            Err(error) => return self.fail_cycle(io, error, true),
+                        };
+                        let deadline = now.checked_add(CYCLE_NS).unwrap_or(u64::MAX);
+                        return self.service_requested(io, deadline);
+                    }
+                    Some(_) | None => {
+                        return self.fail_cycle(
+                            io,
+                            "armed pause authorization was absent or unknown",
+                            true,
+                        );
+                    }
+                }
+            }
             return Ok(());
         };
         self.service_received(io, received)
+    }
+
+    fn service_requested(
+        &mut self,
+        io: &mut impl PauseIo,
+        fixed_deadline: u64,
+    ) -> Result<(), PauseError> {
+        self.begin_attempt();
+        self.may_be_stopped = true;
+        self.epoch.authorization_consumed = true;
+        let deadline = clamp_deadline(&mut self.failure_deadline, fixed_deadline);
+        if !self.pending_records.is_empty() {
+            if let Err(error) = self.apply_unowned(io, Some(deadline)) {
+                return self.fail_cycle(io, error.to_string(), error.lifecycle());
+            }
+        }
+        loop {
+            match io.cancelled() {
+                Ok(false) => {}
+                Ok(true) => return self.fail_cycle(io, "pause coordination cancelled", true),
+                Err(error) => return self.fail_cycle(io, error, true),
+            }
+            if let Err(error) = self.check_ring_loss(io) {
+                return self.fail_cycle(io, error, false);
+            }
+            match self.timed_dequeue(io, Some(deadline)) {
+                Ok(Some(received))
+                    if matches!(
+                        &received.item,
+                        DiscoveryItem::Record(record)
+                            if exact_pid(record) == self.pid && self.predates_arm(record)
+                    ) =>
+                {
+                    let DiscoveryItem::Record(_) = received.item else {
+                        unreachable!("stale-record guard matched a non-record")
+                    };
+                    if let Err(error) = self.apply_unowned(io, Some(deadline)) {
+                        return self.fail_cycle(io, error.to_string(), error.lifecycle());
+                    }
+                    continue;
+                }
+                Ok(Some(received)) => return self.service_received(io, received),
+                Ok(None) => {
+                    let now = match io.now_ns() {
+                        Ok(now) => now,
+                        Err(error) => return self.fail_cycle(io, error, true),
+                    };
+                    if now >= deadline {
+                        return self.fail_cycle(io, "pause request had no discovery record", false);
+                    }
+                    if let Err(error) = io.wait_one_ms() {
+                        return self.fail_cycle(io, error, true);
+                    }
+                }
+                Err(error) => {
+                    let lifecycle = error.lifecycle();
+                    return self.fail_cycle(io, error.message(), lifecycle);
+                }
+            }
+        }
     }
 
     fn service_received(
@@ -456,8 +587,8 @@ impl PauseCoordinator {
             self.terminal_batch = Some(batch);
         }
         self.take_stop_candidate_seen(io);
-        self.failure_deadline
-            .get_or_insert_with(|| received.after_ns.checked_add(CYCLE_NS).unwrap_or(u64::MAX));
+        let failure_candidate = received.after_ns.checked_add(CYCLE_NS).unwrap_or(u64::MAX);
+        clamp_deadline(&mut self.failure_deadline, failure_candidate);
         match io.cancelled() {
             Ok(false) => {}
             Ok(true) => return self.fail_cycle(io, "pause coordination cancelled", true),
@@ -467,7 +598,6 @@ impl PauseCoordinator {
             self.begin_attempt();
             return self.fail_cycle(io, "malformed discovery record in pause epoch", false);
         };
-        self.pending_records.push(first);
         if exact_pid(&first) != self.pid {
             return self.fail_cycle(io, "unaccounted discovery record in pause epoch", false);
         }
@@ -487,18 +617,56 @@ impl PauseCoordinator {
                     Err(error) => return self.fail_cycle(io, error, true),
                 }
             }
-            return self.apply_unowned(io);
+            return self.apply_unowned(io, None);
         }
         if self.predates_arm(&first) {
-            // Not this epoch's record at all. `may_be_stopped` is left exactly
-            // as it was: whether a stop is outstanding is the authorization
-            // map's answer, and the failure and cleanup routes still read it.
-            return self.apply_unowned(io);
+            let authorization = match io.authorization() {
+                Ok(authorization) => authorization,
+                Err(error) => return self.fail_cycle(io, error, true),
+            };
+            let deadline = self.failure_deadline.unwrap_or(u64::MAX);
+            match authorization {
+                Some(PAUSE_REQUESTED) => return self.service_requested(io, deadline),
+                Some(PAUSE_ARMED) => {
+                    if let Err(error) = self.apply_unowned(io, Some(deadline)) {
+                        return self.fail_cycle(io, error.to_string(), error.lifecycle());
+                    }
+                    match io.authorization() {
+                        Ok(Some(PAUSE_ARMED)) => {
+                            self.failure_deadline = None;
+                            return Ok(());
+                        }
+                        Ok(Some(PAUSE_REQUESTED)) => return self.service_requested(io, deadline),
+                        Ok(_) => {
+                            return self.fail_cycle(
+                                io,
+                                "stale record authorization was absent or unknown",
+                                true,
+                            );
+                        }
+                        Err(error) => return self.fail_cycle(io, error, true),
+                    }
+                }
+                Some(_) | None => {
+                    return self.fail_cycle(
+                        io,
+                        "stale record authorization was absent or unknown",
+                        true,
+                    );
+                }
+            }
         }
         let state = match io.authorization() {
             Ok(state) => state,
             Err(error) => return self.fail_cycle(io, error, true),
         };
+        if self.epoch.authorization_consumed && state != Some(PAUSE_REQUESTED) {
+            return self.fail_cycle(
+                io,
+                "pause request authorization did not remain REQUESTED",
+                true,
+            );
+        }
         if state != Some(PAUSE_REQUESTED) {
             // An exact ARMED readback refutes the candidate. The kernel is the
             // only writer of REQUESTED and never clears it, and this arm is
@@ -520,7 +688,7 @@ impl PauseCoordinator {
             }
             self.epoch.zero_candidate = false;
             self.may_be_stopped = false;
-            return self.apply_unowned(io);
+            return self.apply_unowned(io, None);
         }
         self.may_be_stopped = true;
         self.begin_attempt();
@@ -541,11 +709,12 @@ impl PauseCoordinator {
             if first.status_flags & DISCOVERY_STATUS_COALESCED_NO_HELPER == 0 {
                 return self.fail_cycle(io, "unknown coalesced record status", false);
             }
-            let provisional = match cycle_deadline(first.hook_ts_ns) {
+            let provisional_candidate = match cycle_deadline(first.hook_ts_ns) {
                 Ok(deadline) => deadline,
                 Err(error) => return self.fail_cycle(io, error, false),
             };
-            self.active_deadline = Some(provisional);
+            let provisional = clamp_deadline(&mut self.failure_deadline, provisional_candidate);
+            let provisional = clamp_deadline(&mut self.active_deadline, provisional);
             if let Err(error) = validate_received(&received, first.hook_ts_ns, provisional) {
                 return self.fail_cycle(io, error, false);
             }
@@ -560,7 +729,10 @@ impl PauseCoordinator {
                 }
                 let next = match self.timed_dequeue(io, Some(provisional)) {
                     Ok(next) => next,
-                    Err(error) => return self.fail_cycle(io, error, false),
+                    Err(error) => {
+                        let lifecycle = error.lifecycle();
+                        return self.fail_cycle(io, error.message(), lifecycle);
+                    }
                 };
                 let Some(next) = next else {
                     let now = match io.now_ns() {
@@ -594,10 +766,8 @@ impl PauseCoordinator {
                         return self.fail_cycle(io, error, false);
                     }
                     records.push(record);
-                    self.pending_records.push(record);
                     continue;
                 }
-                self.pending_records.push(record);
                 break (next, record);
             }
         } else {
@@ -608,12 +778,12 @@ impl PauseCoordinator {
             self.epoch.rejected = true;
             self.epoch.zero_candidate = false;
             self.may_be_stopped = false;
-            self.pending_records.clear();
-            let deadline = cycle_deadline(winner_record.hook_ts_ns)
+            let candidate = cycle_deadline(winner_record.hook_ts_ns)
                 .unwrap_or_else(|_| self.failure_deadline.unwrap_or(u64::MAX));
-            self.active_deadline = Some(deadline);
+            let deadline = clamp_deadline(&mut self.failure_deadline, candidate);
+            let deadline = clamp_deadline(&mut self.active_deadline, deadline);
             records.push(winner_record);
-            return self.reject_cycle(io, deadline, records);
+            return self.reject_cycle(io, deadline);
         }
         if winner_record.status_flags & DISCOVERY_STATUS_COALESCED_NO_HELPER != 0 {
             return self.fail_cycle(io, "winner carried coalesced status", false);
@@ -623,11 +793,12 @@ impl PauseCoordinator {
             // later timestamp/deadline check makes confirmation impossible.
             self.epoch.accepted = true;
         }
-        let deadline = match cycle_deadline(winner_record.hook_ts_ns) {
+        let candidate = match cycle_deadline(winner_record.hook_ts_ns) {
             Ok(deadline) => deadline,
             Err(error) => return self.fail_cycle(io, error, false),
         };
-        self.active_deadline = Some(deadline);
+        let deadline = clamp_deadline(&mut self.failure_deadline, candidate);
+        let deadline = clamp_deadline(&mut self.active_deadline, deadline);
         if let Err(error) = validate_received(&winner_received, winner_record.hook_ts_ns, deadline)
         {
             return self.fail_cycle(io, error, false);
@@ -675,7 +846,10 @@ impl PauseCoordinator {
         loop {
             let received = match self.timed_dequeue(io, Some(deadline)) {
                 Ok(received) => received,
-                Err(error) => return self.fail_cycle(io, error, false),
+                Err(error) => {
+                    let lifecycle = error.lifecycle();
+                    return self.fail_cycle(io, error.message(), lifecycle);
+                }
             };
             let Some(received) = received else { break };
             let DiscoveryItem::Record(record) = received.item else {
@@ -691,7 +865,6 @@ impl PauseCoordinator {
                 return self.fail_cycle(io, error, false);
             }
             records.push(record);
-            self.pending_records.push(record);
         }
         if let Err(error) = self.check_ring_loss(io) {
             return self.fail_cycle(io, error, false);
@@ -703,10 +876,9 @@ impl PauseCoordinator {
         if marker_seen {
             return self.fail_cycle(io, "protected marker preceded attachment", false);
         }
-        let record_count = records.len();
-        self.pending_records.clear();
+        let record_count = self.pending_records.len();
         let outcome = match io.apply_batch(
-            records,
+            std::mem::take(&mut self.pending_records),
             Some(deadline),
             true,
             true,
@@ -737,14 +909,18 @@ impl PauseCoordinator {
         match self.timed_dequeue(io, Some(deadline)) {
             Ok(None) => {}
             Ok(Some(_)) => return self.fail_cycle(io, "queue was not empty before resume", false),
-            Err(error) => return self.fail_cycle(io, error, false),
+            Err(error) => {
+                let lifecycle = error.lifecycle();
+                return self.fail_cycle(io, error.message(), lifecycle);
+            }
         }
 
         let install_successor = record_count == 1 && self.cycles == 0 && self.rearming_enabled;
         let mut successor_baseline = None;
         if install_successor {
-            if let Err(error) = io.remove_authorization() {
-                return self.fail_cycle(io, error, true);
+            if let Err(error) = self.remove_and_account(io) {
+                let lifecycle = error.lifecycle();
+                return self.fail_cycle(io, error.to_string(), lifecycle);
             }
             let armed_at = io.now_ns().ok();
             if let Err(error) = io.arm() {
@@ -780,10 +956,14 @@ impl PauseCoordinator {
                 Ok(Some(_)) => {
                     return self.fail_cycle(io, "successor was consumed before prior resume", true);
                 }
-                Err(error) => return self.fail_cycle(io, error, false),
+                Err(error) => {
+                    let lifecycle = error.lifecycle();
+                    return self.fail_cycle(io, error.message(), lifecycle);
+                }
             }
-        } else if let Err(error) = io.remove_authorization() {
-            return self.fail_cycle(io, error, true);
+        } else if let Err(error) = self.remove_and_account(io) {
+            let lifecycle = error.lifecycle();
+            return self.fail_cycle(io, error.to_string(), lifecycle);
         }
 
         match io.cancelled() {
@@ -798,10 +978,19 @@ impl PauseCoordinator {
         if let Err(error) = io.resume() {
             return self.fail_cycle(io, error, true);
         }
+        self.epoch.resume_succeeded = true;
+        if install_successor {
+            self.epoch = PauseEpoch {
+                successor_installed: true,
+                successor_unresolved: true,
+                resume_attempted: true,
+                resume_succeeded: true,
+                ..PauseEpoch::default()
+            };
+        }
         if let Err(error) = self.observe_resumed(io, deadline, install_successor) {
             return self.fail_cycle(io, error, true);
         }
-        self.epoch.resume_succeeded = true;
         self.counters.confirmed = self.counters.confirmed.saturating_add(1);
         self.attempt_open = false;
         self.active_deadline = None;
@@ -815,16 +1004,22 @@ impl PauseCoordinator {
         } else {
             self.ring_loss_baseline = successor_baseline
                 .expect("an installed successor froze its stopped ring-loss baseline");
-            self.epoch = PauseEpoch {
-                successor_installed: true,
-                successor_unresolved: true,
-                resume_attempted: true,
-                resume_succeeded: true,
-                ..PauseEpoch::default()
-            };
         }
         debug_assert!(self.counters.valid());
         Ok(())
+    }
+
+    /// Nested revalidation transfers a generation-validated item directly;
+    /// unlike `timed_dequeue`, it has not crossed the coordinator sink yet.
+    fn service_deferred(
+        &mut self,
+        io: &mut impl PauseIo,
+        received: TimedItem,
+    ) -> Result<(), PauseError> {
+        if let DiscoveryItem::Record(record) = received.item {
+            self.pending_records.push(record);
+        }
+        self.service_received(io, received)
     }
 
     /// A record the live arm cannot have produced. The producer reads its
@@ -841,23 +1036,40 @@ impl PauseCoordinator {
                 .is_some_and(|armed_at| record.hook_ts_ns < armed_at)
     }
 
-    /// A record this coordinator's authorization did not produce. No attempt is
-    /// open, so the failure bound `service_received` installed from that record
-    /// goes with it: a later failure or cleanup drain must be bounded from its
-    /// own clock, not from a record the coordinator never owned.
-    fn apply_unowned(&mut self, io: &mut impl PauseIo) -> Result<(), PauseError> {
-        if !self.attempt_open {
+    /// Applies records this coordinator did not own. A bounded deadline is used
+    /// while servicing a proven handoff; ordinary/unarmed application is
+    /// unbounded and cannot attribute the record to this pause owner.
+    fn apply_unowned(
+        &mut self,
+        io: &mut impl PauseIo,
+        deadline: Option<u64>,
+    ) -> Result<(), PauseError> {
+        if deadline.is_none() && !self.attempt_open {
             self.failure_deadline = None;
         }
         io.apply_batch(
             std::mem::take(&mut self.pending_records),
-            None,
+            deadline,
             true,
             false,
             &mut self.terminal_batch,
         )
         .map(|_| ())
         .map_err(|error| Self::policy_error(self.policy, error, false))
+    }
+
+    fn remove_and_account(&mut self, io: &mut impl PauseIo) -> Result<(), PauseError> {
+        let disposition = if self.epoch.rejected {
+            RemovalDisposition::Rejected
+        } else {
+            RemovalDisposition::Normal
+        };
+        let removed = io
+            .remove_authorization()
+            .map_err(|error| Self::policy_error(self.policy, error, true))?;
+        self.classify_authorization(removed, disposition, AuthorizationSource::Removal)
+            .map_err(|error| Self::policy_error(self.policy, error, true))?;
+        Ok(())
     }
 
     fn check_ring_loss(&mut self, io: &mut impl PauseIo) -> Result<(), String> {
@@ -869,14 +1081,8 @@ impl PauseCoordinator {
         }
     }
 
-    fn reject_cycle(
-        &mut self,
-        io: &mut impl PauseIo,
-        deadline: u64,
-        mut records: Vec<DiscoveryRecord>,
-    ) -> Result<(), PauseError> {
+    fn reject_cycle(&mut self, io: &mut impl PauseIo, deadline: u64) -> Result<(), PauseError> {
         if self.policy == PausePolicy::Always {
-            self.pending_records.append(&mut records);
             return self.terminal_cleanup_with_cause(
                 io,
                 vec!["pause helper rejected SIGSTOP".into()],
@@ -886,8 +1092,8 @@ impl PauseCoordinator {
         }
         let mut retained_error = None;
         let mut lifecycle_errors = Vec::new();
-        if let Err(error) = io.remove_authorization() {
-            lifecycle_errors.push(error);
+        if let Err(error) = self.remove_and_account(io) {
+            lifecycle_errors.push(error.to_string());
         }
         self.armed = false;
         while self.failure_items < MAX_FAILURE_ITEMS {
@@ -895,13 +1101,13 @@ impl PauseCoordinator {
                 Ok(None) => match io.now_ns() {
                     Ok(now) if now < deadline => {
                         if let Err(error) = io.wait_one_ms() {
-                            retained_error.get_or_insert(error);
+                            lifecycle_errors.push(error);
                             break;
                         }
                     }
                     Ok(_) => break,
                     Err(error) => {
-                        retained_error.get_or_insert(error);
+                        lifecycle_errors.push(error);
                         break;
                     }
                 },
@@ -913,7 +1119,6 @@ impl PauseCoordinator {
                     && record.status_flags & DISCOVERY_STATUS_COALESCED_NO_HELPER != 0 =>
                 {
                     self.failure_items += 1;
-                    records.push(record);
                 }
                 Ok(Some(_)) => {
                     self.failure_items += 1;
@@ -921,13 +1126,19 @@ impl PauseCoordinator {
                         .get_or_insert_with(|| "rejected epoch contained an invalid record".into());
                 }
                 Err(error) => {
-                    retained_error.get_or_insert(error);
+                    let lifecycle = error.lifecycle();
+                    let message = error.message();
+                    if lifecycle {
+                        lifecycle_errors.push(message);
+                    } else {
+                        retained_error.get_or_insert(message);
+                    }
                     break;
                 }
             }
         }
         if let Err(error) = io.apply_batch(
-            records,
+            std::mem::take(&mut self.pending_records),
             Some(deadline),
             true,
             true,
@@ -947,7 +1158,6 @@ impl PauseCoordinator {
         self.failure_deadline = None;
         self.failure_items = 0;
         if !lifecycle_errors.is_empty() {
-            self.pending_records.clear();
             return self.terminal_cleanup_with_errors(io, lifecycle_errors);
         }
         self.epoch = PauseEpoch::default();
@@ -1023,30 +1233,48 @@ impl PauseCoordinator {
         &mut self,
         io: &mut impl PauseIo,
         deadline: Option<u64>,
-    ) -> Result<Option<TimedItem>, String> {
-        let before_ns = io.now_ns()?;
+    ) -> Result<Option<TimedItem>, TimedDequeueError> {
+        let before_ns = io.now_ns().map_err(TimedDequeueError::Failure)?;
         if deadline.is_some_and(|deadline| before_ns > deadline) {
-            return Err("deadline crossed before discovery dequeue".into());
+            return Err(TimedDequeueError::Deadline(
+                "deadline crossed before discovery dequeue".into(),
+            ));
         }
-        let item = io.dequeue()?;
-        if let Some(DiscoveryItem::Record(record)) = item.as_ref()
+        let item = io.dequeue().map_err(TimedDequeueError::Failure)?;
+        if self.active_epoch()
+            && let Some(DiscoveryItem::Record(record)) = &item
             && exact_pid(record) == self.pid
             && record.send_signal_rc == 0
             && !self.predates_arm(record)
         {
-            // A zero helper result is a stop candidate, not proof. This mark
-            // deliberately precedes the post-dequeue clock and every map read.
             self.may_be_stopped = true;
             self.epoch.zero_candidate = true;
         }
-        let after_ns = io.now_ns()?;
+        if let Some(DiscoveryItem::Record(record)) = &item {
+            match io.same_generation(self.pid, self.generation) {
+                Ok(true) => self.pending_records.push(*record),
+                Ok(false) => {
+                    self.unvalidated_records = self.unvalidated_records.saturating_add(1);
+                    return Err(TimedDequeueError::Failure(
+                        "owned child generation changed after discovery decode".into(),
+                    ));
+                }
+                Err(error) => {
+                    self.unvalidated_records = self.unvalidated_records.saturating_add(1);
+                    return Err(TimedDequeueError::Failure(error));
+                }
+            }
+        }
+        let after_ns = io.now_ns().map_err(TimedDequeueError::Failure)?;
         if deadline.is_some_and(|deadline| after_ns > deadline) {
-            return Err("deadline crossed after discovery dequeue".into());
+            return Err(TimedDequeueError::Deadline(
+                "deadline crossed after discovery dequeue".into(),
+            ));
         }
-        if item.is_some() && !io.same_generation(self.pid, self.generation)? {
-            return Err("owned child generation changed after discovery decode".into());
-        }
-        Ok(item.map(|item| TimedItem {
+        let Some(item) = item else {
+            return Ok(None);
+        };
+        Ok(Some(TimedItem {
             before_ns,
             after_ns,
             item,
@@ -1062,7 +1290,7 @@ impl PauseCoordinator {
     ) -> Result<(), PauseError> {
         let message = message.into();
         self.rearming_enabled = false;
-        if lifecycle || self.policy == PausePolicy::Always {
+        if lifecycle || self.policy == PausePolicy::Always || self.unvalidated_records != 0 {
             return self.terminal_cleanup_with_cause(
                 io,
                 vec![message],
@@ -1075,11 +1303,10 @@ impl PauseCoordinator {
         while self.failure_items < MAX_FAILURE_ITEMS {
             match self.timed_dequeue(io, Some(deadline)) {
                 Ok(Some(TimedItem {
-                    item: DiscoveryItem::Record(record),
+                    item: DiscoveryItem::Record(_),
                     ..
                 })) => {
                     self.failure_items += 1;
-                    self.pending_records.push(record);
                 }
                 Ok(Some(TimedItem {
                     item: DiscoveryItem::Malformed,
@@ -1090,7 +1317,12 @@ impl PauseCoordinator {
                 }
                 Ok(None) => break,
                 Err(error) => {
-                    errors.push(error);
+                    let lifecycle = error.lifecycle();
+                    let message = error.message();
+                    errors.push(message);
+                    if lifecycle {
+                        return self.terminal_cleanup_with_errors(io, errors);
+                    }
                     break;
                 }
             }
@@ -1099,40 +1331,31 @@ impl PauseCoordinator {
             std::mem::take(&mut self.pending_records),
             Some(deadline),
             true,
-            self.armed || self.attempt_open || self.may_be_stopped,
+            self.active_epoch(),
             &mut self.terminal_batch,
         ) {
             errors.push(error);
         }
         self.take_stop_candidate_seen(io);
         match io.authorization() {
-            Ok(Some(PAUSE_REQUESTED)) => {
-                self.may_be_stopped = true;
-                self.epoch.authorization_consumed = true;
-                self.begin_attempt();
-            }
-            Ok(Some(PAUSE_ARMED)) | Ok(None) => {
-                if !self.epoch.zero_candidate && !self.epoch.accepted {
-                    self.epoch.successor_unresolved = false;
-                    self.may_be_stopped = false;
-                    self.epoch.authorization_consumed = false;
+            Ok(state) => {
+                if let Err(error) = self.classify_authorization(
+                    state,
+                    RemovalDisposition::Normal,
+                    AuthorizationSource::Observation,
+                ) {
+                    errors.push(error);
+                    return self.terminal_cleanup_with_errors(io, errors);
                 }
-            }
-            Ok(Some(_)) => {
-                errors.push("unknown pause authorization state".into());
-                self.may_be_stopped = true;
-                self.epoch.authorization_consumed = true;
-                return self.terminal_cleanup_with_errors(io, errors);
             }
             Err(error) => {
                 errors.push(error);
-                self.may_be_stopped = true;
-                self.epoch.authorization_consumed = true;
+                self.may_be_stopped |= self.has_proven_resume_debt();
                 return self.terminal_cleanup_with_errors(io, errors);
             }
         }
-        if let Err(error) = io.remove_authorization() {
-            errors.push(error);
+        if let Err(error) = self.remove_and_account(io) {
+            errors.push(error.to_string());
             return self.terminal_cleanup_with_errors(io, errors);
         }
         self.armed = false;
@@ -1215,10 +1438,17 @@ impl PauseCoordinator {
         }
         let initiating_errors = errors.len();
         self.cleaning = true;
+        if let Err(error) = io.reconcile_terminal_authority(&mut self.terminal_batch) {
+            errors.push(error);
+        }
+        if self.terminal_batch.is_none() && io.terminal_authority_pending() {
+            if let Err(error) = io.cleanup_terminal_batch_without_replay(&mut self.terminal_batch) {
+                errors.push(error);
+            }
+        }
         if let Err(error) = io.detach_pause_links() {
             errors.push(error);
         }
-        let mut records = std::mem::take(&mut self.pending_records);
         let deadline = self.failure_bound(io, &mut errors);
         while self.failure_items < MAX_FAILURE_ITEMS {
             match self.timed_dequeue(io, Some(deadline)) {
@@ -1230,60 +1460,71 @@ impl PauseCoordinator {
                     errors.push("malformed discovery record during cleanup".into());
                 }
                 Ok(Some(TimedItem {
-                    item: DiscoveryItem::Record(record),
+                    item: DiscoveryItem::Record(_),
                     ..
                 })) => {
                     self.failure_items += 1;
-                    records.push(record);
                 }
                 Ok(None) => break,
                 Err(error) => {
-                    errors.push(error);
+                    errors.push(error.message());
                     break;
                 }
             }
         }
+        let unvalidated = std::mem::take(&mut self.unvalidated_records);
         if let Err(error) = io.apply_batch(
-            records,
+            std::mem::take(&mut self.pending_records),
             Some(deadline),
             false,
-            self.armed || self.attempt_open || self.may_be_stopped,
+            self.active_epoch(),
             &mut self.terminal_batch,
         ) {
             errors.push(error);
         }
+        if self.terminal_batch.is_some() {
+            if let Err(error) = io.apply_batch(
+                Vec::new(),
+                Some(deadline),
+                false,
+                self.active_epoch(),
+                &mut self.terminal_batch,
+            ) {
+                errors.push(error);
+            }
+            if self.terminal_batch.is_some()
+                && let Err(error) =
+                    io.cleanup_terminal_batch_without_replay(&mut self.terminal_batch)
+            {
+                errors.push(error);
+            }
+        }
+        if unvalidated != 0 {
+            io.account_unvalidated_records(unvalidated);
+        }
         self.take_stop_candidate_seen(io);
         match io.authorization() {
-            Ok(Some(PAUSE_REQUESTED)) => {
-                if self.epoch.rejected {
-                    self.may_be_stopped = false;
-                    self.epoch.authorization_consumed = false;
+            Ok(state) => {
+                let disposition = if self.epoch.rejected {
+                    RemovalDisposition::Rejected
                 } else {
-                    self.may_be_stopped = true;
-                    self.epoch.authorization_consumed = true;
-                    self.epoch.successor_unresolved |= self.epoch.successor_installed;
+                    RemovalDisposition::Normal
+                };
+                if let Err(error) = self.classify_authorization(
+                    state,
+                    disposition,
+                    AuthorizationSource::Observation,
+                ) {
+                    errors.push(error);
                 }
-            }
-            Ok(Some(PAUSE_ARMED)) | Ok(None) => {
-                if !self.epoch.zero_candidate && !self.epoch.accepted {
-                    self.epoch.successor_unresolved = false;
-                    self.may_be_stopped = false;
-                    self.epoch.authorization_consumed = false;
-                }
-            }
-            Ok(Some(_)) => {
-                errors.push("unknown pause authorization state".into());
-                self.may_be_stopped = true;
-                self.epoch.authorization_consumed = true;
             }
             Err(error) => {
                 errors.push(error);
-                self.may_be_stopped = true;
-                self.epoch.authorization_consumed = true;
+                self.may_be_stopped |= self.has_proven_resume_debt();
             }
         }
-        if let Err(error) = io.remove_authorization() {
-            errors.push(error);
+        if let Err(error) = self.remove_and_account(io) {
+            errors.push(error.to_string());
         }
         self.armed = false;
         if self.epoch.accepted && self.may_be_stopped && !self.epoch.resume_attempted {
@@ -1291,8 +1532,8 @@ impl PauseCoordinator {
             if let Err(error) = io.resume() {
                 errors.push(error);
             } else {
-                self.may_be_stopped = false;
                 self.epoch.resume_succeeded = true;
+                self.settle_cleanup_resume_debt();
             }
         } else if !self.epoch.accepted
             && !self.epoch.rejected
@@ -1308,15 +1549,26 @@ impl PauseCoordinator {
             if let Err(error) = io.resume() {
                 errors.push(error);
             } else {
-                self.may_be_stopped = false;
+                self.settle_cleanup_resume_debt();
             }
         }
-        self.cleaned = true;
+        if self.terminal_batch.is_none()
+            && io.terminal_authority_pending()
+            && let Err(error) = io.cleanup_terminal_batch_without_replay(&mut self.terminal_batch)
+        {
+            errors.push(error);
+        }
+        if self.terminal_batch.is_some() || io.terminal_authority_pending() {
+            errors.push("terminal discovery authority remained unresolved after cleanup".into());
+            self.cleaning = false;
+            return Err(PauseError::many(errors, required, true));
+        }
+        let cleanup_failed = errors.len() > initiating_errors;
+        self.cleaned = !cleanup_failed;
         self.cleaning = false;
         if errors.is_empty() {
             Ok(())
         } else {
-            let cleanup_failed = errors.len() > initiating_errors;
             Err(PauseError::many(
                 errors,
                 required,
@@ -1325,9 +1577,23 @@ impl PauseCoordinator {
         }
     }
 
+    fn settle_cleanup_resume_debt(&mut self) {
+        self.may_be_stopped = false;
+        self.epoch.authorization_consumed = false;
+        self.epoch.zero_candidate = false;
+        self.epoch.accepted = false;
+        self.epoch.successor_unresolved = false;
+    }
+
     fn failure_bound(&mut self, io: &mut impl PauseIo, errors: &mut Vec<String>) -> u64 {
-        if let Some(deadline) = self.active_deadline.or(self.failure_deadline) {
-            self.failure_deadline = Some(deadline);
+        let existing = match (self.active_deadline, self.failure_deadline) {
+            (Some(active), Some(failure)) => Some(active.min(failure)),
+            (Some(active), None) | (None, Some(active)) => Some(active),
+            (None, None) => None,
+        };
+        if let Some(deadline) = existing {
+            let deadline = clamp_deadline(&mut self.failure_deadline, deadline);
+            clamp_deadline(&mut self.active_deadline, deadline);
             return deadline;
         }
         let now = match io.now_ns() {
@@ -1338,8 +1604,7 @@ impl PauseCoordinator {
             }
         };
         let deadline = now.checked_add(CYCLE_NS).unwrap_or(u64::MAX);
-        self.failure_deadline = Some(deadline);
-        deadline
+        clamp_deadline(&mut self.failure_deadline, deadline)
     }
 
     pub(crate) fn counters(&self) -> PauseCounters {
@@ -1369,10 +1634,86 @@ impl PauseCoordinator {
         }
     }
 
+    fn active_epoch(&self) -> bool {
+        self.policy != PausePolicy::Never && (self.armed || self.has_proven_resume_debt())
+    }
+
+    fn classify_authorization(
+        &mut self,
+        state: Option<u64>,
+        disposition: RemovalDisposition,
+        source: AuthorizationSource,
+    ) -> Result<(), String> {
+        let successor = self.epoch.successor_installed && self.epoch.successor_unresolved;
+        match state {
+            Some(PAUSE_REQUESTED) if matches!(disposition, RemovalDisposition::Rejected) => {
+                self.epoch.authorization_consumed = false;
+                self.may_be_stopped = successor;
+            }
+            Some(PAUSE_REQUESTED) => {
+                self.may_be_stopped = true;
+                self.epoch.authorization_consumed = true;
+                self.epoch.successor_unresolved |= self.epoch.successor_installed;
+                self.begin_attempt();
+            }
+            Some(PAUSE_ARMED) => {
+                if self.epoch.zero_candidate
+                    && !self.epoch.authorization_consumed
+                    && !self.epoch.accepted
+                {
+                    self.epoch.zero_candidate = false;
+                }
+                let prior_authorization_debt = self.has_proven_authorization_debt();
+                if prior_authorization_debt && !successor {
+                    return Err("ARMED authorization followed consumed pause debt".into());
+                }
+                if matches!(source, AuthorizationSource::Removal) && successor {
+                    self.epoch.successor_unresolved = false;
+                }
+                self.may_be_stopped = if matches!(source, AuthorizationSource::Removal) {
+                    prior_authorization_debt
+                } else {
+                    self.has_proven_resume_debt()
+                };
+                if !self.may_be_stopped {
+                    self.epoch.successor_unresolved = false;
+                    self.epoch.authorization_consumed = false;
+                }
+            }
+            None if self.has_proven_resume_debt() => {
+                self.may_be_stopped = true;
+                return Err("pause authorization disappeared after consumed pause debt".into());
+            }
+            None if self.policy != PausePolicy::Never && self.armed => {
+                return Err("active pause authorization was absent".into());
+            }
+            None => {
+                self.epoch.successor_unresolved = false;
+                self.may_be_stopped = false;
+                self.epoch.authorization_consumed = false;
+            }
+            Some(_) => return Err("unknown pause authorization state".into()),
+        }
+        Ok(())
+    }
+
+    fn has_proven_resume_debt(&self) -> bool {
+        self.has_proven_authorization_debt()
+            || (self.epoch.successor_installed
+                && self.epoch.successor_unresolved
+                && self.epoch.resume_succeeded)
+    }
+
+    fn has_proven_authorization_debt(&self) -> bool {
+        self.epoch.authorization_consumed || self.epoch.accepted || self.epoch.zero_candidate
+    }
+
     fn take_stop_candidate_seen(&mut self, io: &mut impl PauseIo) {
         let seen = io.take_stop_candidate_seen();
-        self.epoch.zero_candidate |= seen;
-        self.may_be_stopped |= seen;
+        if self.active_epoch() {
+            self.epoch.zero_candidate |= seen;
+            self.may_be_stopped |= seen;
+        }
     }
 
     fn policy_error(
@@ -1474,6 +1815,7 @@ impl PauseIo for SessionPauseIo<'_> {
         pause_owned: bool,
         terminal_batch: &mut Option<TerminalBatch>,
     ) -> Result<PauseBatchOutcome, String> {
+        self.reconcile_terminal_authority(terminal_batch)?;
         let child = self.child;
         let stop_candidate_seen = &mut self.stop_candidate_seen;
         let mut collect = |session: &mut dyn EngineSession| {
@@ -1491,7 +1833,7 @@ impl PauseIo for SessionPauseIo<'_> {
             ));
         }
         let records = terminal_dispatch.then(Vec::new).unwrap_or(records);
-        let outcome = match self.engine.apply_discovery_batch_with(
+        let result = match self.engine.apply_discovery_batch_with(
             self.session,
             records,
             std::mem::take(&mut self.malformed),
@@ -1499,31 +1841,71 @@ impl PauseIo for SessionPauseIo<'_> {
             terminal_dispatch,
             &mut collect,
         ) {
-            Ok(outcome) => outcome,
+            Ok(outcome) => {
+                self.plan_changed |= outcome.changed;
+                Ok(PauseBatchOutcome {
+                    required_complete: outcome.required_complete,
+                })
+            }
             Err(error) => {
                 let error = match error.downcast::<DeferredDiscoveryItem>() {
                     Ok(mut deferred) => {
                         *terminal_batch = deferred.terminal_batch.take();
-                        return Err(format!("discovery batch application failed: {deferred:#}"));
+                        anyhow::Error::new(deferred)
                     }
                     Err(error) => error,
                 };
-                if terminal_dispatch {
-                    *terminal_batch = Some(
-                        self.engine
-                            .take_terminal_batch_for_deferred()
-                            .map_err(|error| {
-                                format!("terminal discovery batch restore failed: {error:#}")
-                            })?,
-                    );
-                }
-                return Err(format!("discovery batch application failed: {error:#}"));
+                Err(format!("discovery batch application failed: {error:#}"))
             }
         };
-        self.plan_changed |= outcome.changed;
-        Ok(PauseBatchOutcome {
-            required_complete: outcome.required_complete,
-        })
+        if let Err(error) = self.reconcile_terminal_authority(terminal_batch) {
+            return Err(match result {
+                Ok(_) => format!("terminal discovery authority reconciliation failed: {error:#}"),
+                Err(apply) => format!(
+                    "{apply}; terminal discovery authority reconciliation failed: {error:#}"
+                ),
+            });
+        }
+        result
+    }
+
+    fn account_unvalidated_records(&mut self, count: u64) {
+        self.engine.account_unvalidated_discovery(count);
+    }
+
+    fn reconcile_terminal_authority(
+        &mut self,
+        terminal_batch: &mut Option<TerminalBatch>,
+    ) -> Result<(), String> {
+        self.engine
+            .reconcile_terminal_authority(terminal_batch)
+            .map_err(|error| {
+                format!("terminal discovery authority reconciliation failed: {error:#}")
+            })
+    }
+
+    fn cleanup_terminal_batch_without_replay(
+        &mut self,
+        terminal_batch: &mut Option<TerminalBatch>,
+    ) -> Result<(), String> {
+        if terminal_batch.is_some() {
+            self.engine
+                .cleanup_terminal_batch_without_replay(terminal_batch)
+                .map_err(|error| {
+                    format!("terminal discovery cleanup without replay failed: {error:#}")
+                })?;
+        } else {
+            self.engine
+                .cleanup_started_terminal_journal()
+                .map_err(|error| {
+                    format!("terminal discovery cleanup-only retry failed: {error:#}")
+                })?;
+        }
+        Ok(())
+    }
+
+    fn terminal_authority_pending(&self) -> bool {
+        self.engine.terminal_authority_pending()
     }
 
     fn revalidate_after_release(
@@ -1631,7 +2013,7 @@ fn collect_timed_retirement(
         pause_owned,
         || attach::monotonic_ns().ok_or_else(|| anyhow::anyhow!("monotonic clock read failed")),
         || session.discovery_dequeue(),
-        || owned_generation_retained(child).unwrap_or(false),
+        || owned_generation_retained(child).map_err(anyhow::Error::msg),
     )
 }
 
@@ -1642,21 +2024,29 @@ fn collect_timed_retirement_with(
     pause_owned: bool,
     mut now_ns: impl FnMut() -> Result<u64, anyhow::Error>,
     mut dequeue: impl FnMut() -> Result<Option<DiscoveryItem>, anyhow::Error>,
-    mut same_generation: impl FnMut() -> bool,
+    mut same_generation: impl FnMut() -> Result<bool, anyhow::Error>,
 ) -> Result<(Vec<DiscoveryRecord>, u64), anyhow::Error> {
     let mut records = Vec::new();
     let mut malformed = 0u64;
+    let mut unvalidated_records = 0u64;
     loop {
         let before_ns = match now_ns() {
             Ok(now) => now,
             Err(error) => {
-                return Err(IncompleteTerminalDrain::new(records, malformed, error).into());
+                return Err(IncompleteTerminalDrain::new(
+                    records,
+                    malformed,
+                    unvalidated_records,
+                    error,
+                )
+                .into());
             }
         };
         if deadline.is_some_and(|deadline| before_ns > deadline) {
             return Err(IncompleteTerminalDrain::new(
                 records,
                 malformed,
+                unvalidated_records,
                 anyhow::anyhow!("deadline crossed before nested discovery dequeue"),
             )
             .into());
@@ -1664,7 +2054,13 @@ fn collect_timed_retirement_with(
         let item = match dequeue() {
             Ok(item) => item,
             Err(error) => {
-                return Err(IncompleteTerminalDrain::new(records, malformed, error).into());
+                return Err(IncompleteTerminalDrain::new(
+                    records,
+                    malformed,
+                    unvalidated_records,
+                    error,
+                )
+                .into());
             }
         };
         if let Some(DiscoveryItem::Record(record)) = item.as_ref()
@@ -1674,6 +2070,43 @@ fn collect_timed_retirement_with(
         {
             *stop_candidate_seen = true;
         }
+        if let Some(current) = item.as_ref() {
+            match same_generation() {
+                Ok(true) => {}
+                Ok(false) => {
+                    match current {
+                        DiscoveryItem::Record(_) => {
+                            unvalidated_records = unvalidated_records.saturating_add(1)
+                        }
+                        DiscoveryItem::Malformed => malformed = malformed.saturating_add(1),
+                    }
+                    return Err(IncompleteTerminalDrain::new(
+                        records,
+                        malformed,
+                        unvalidated_records,
+                        anyhow::anyhow!(
+                            "owned child generation changed after nested discovery decode"
+                        ),
+                    )
+                    .into());
+                }
+                Err(error) => {
+                    match current {
+                        DiscoveryItem::Record(_) => {
+                            unvalidated_records = unvalidated_records.saturating_add(1)
+                        }
+                        DiscoveryItem::Malformed => malformed = malformed.saturating_add(1),
+                    }
+                    return Err(IncompleteTerminalDrain::new(
+                        records,
+                        malformed,
+                        unvalidated_records,
+                        error,
+                    )
+                    .into());
+                }
+            }
+        }
         let after_ns = match now_ns() {
             Ok(now) => now,
             Err(error) => {
@@ -1682,7 +2115,13 @@ fn collect_timed_retirement_with(
                     Some(DiscoveryItem::Malformed) => malformed = malformed.saturating_add(1),
                     None => {}
                 }
-                return Err(IncompleteTerminalDrain::new(records, malformed, error).into());
+                return Err(IncompleteTerminalDrain::new(
+                    records,
+                    malformed,
+                    unvalidated_records,
+                    error,
+                )
+                .into());
             }
         };
         if deadline.is_some_and(|deadline| after_ns > deadline) {
@@ -1694,31 +2133,28 @@ fn collect_timed_retirement_with(
             return Err(IncompleteTerminalDrain::new(
                 records,
                 malformed,
+                unvalidated_records,
                 anyhow::anyhow!("deadline crossed after nested discovery dequeue"),
             )
             .into());
         }
         let Some(item) = item else { break };
-        if !same_generation() {
-            match item {
-                DiscoveryItem::Record(record) => records.push(record),
-                DiscoveryItem::Malformed => malformed = malformed.saturating_add(1),
-            }
-            return Err(IncompleteTerminalDrain::new(
-                records,
-                malformed,
-                anyhow::anyhow!("owned child generation changed after nested discovery decode"),
-            )
-            .into());
-        }
         if pause_owned && deadline.is_none() {
-            return Err(DeferredDiscoveryItem {
-                before_ns,
-                after_ns,
-                item,
-                terminal_batch: None,
+            match item {
+                DiscoveryItem::Record(_) => {
+                    return Err(DeferredDiscoveryItem {
+                        before_ns,
+                        after_ns,
+                        item,
+                        terminal_batch: None,
+                    }
+                    .into());
+                }
+                DiscoveryItem::Malformed => {
+                    malformed = malformed.saturating_add(1);
+                    return Ok((records, malformed));
+                }
             }
-            .into());
         }
         match item {
             DiscoveryItem::Malformed => {
@@ -1740,6 +2176,7 @@ fn collect_timed_retirement_with(
                         return Err(IncompleteTerminalDrain::new(
                             records,
                             malformed,
+                            unvalidated_records,
                             anyhow::Error::msg(error),
                         )
                         .into());
@@ -1751,6 +2188,7 @@ fn collect_timed_retirement_with(
                         return Err(IncompleteTerminalDrain::new(
                             records,
                             malformed,
+                            unvalidated_records,
                             anyhow::anyhow!("duplicate or unaccounted nested pause record"),
                         )
                         .into());
@@ -1845,14 +2283,18 @@ mod tests {
         states: VecDeque<Result<BTreeMap<u32, u8>, String>>,
         queue: VecDeque<Result<Option<DiscoveryItem>, String>>,
         authorization: Option<u64>,
+        authorization_results: VecDeque<Result<Option<u64>, String>>,
         marker: bool,
         events: Vec<&'static str>,
         applied: Vec<DiscoveryRecord>,
+        apply_deadlines: Vec<Option<u64>>,
         fail_detach: bool,
         fail_remove: bool,
         fail_read: bool,
         fail_resume: bool,
         fail_apply: bool,
+        fail_terminal_apply: bool,
+        unvalidated_records: u64,
         required_complete: bool,
         fail_wait: bool,
         cancelled: bool,
@@ -1874,6 +2316,9 @@ mod tests {
         revalidation_pause_owned: Vec<bool>,
         apply_pause_owned: Vec<bool>,
         terminal_batches: Vec<TerminalBatch>,
+        reconcile_results: VecDeque<Result<(), String>>,
+        terminal_cleanup_results: VecDeque<Result<(), String>>,
+        terminal_authority_pending: bool,
     }
 
     impl Default for FakeIo {
@@ -1884,14 +2329,18 @@ mod tests {
                 states: VecDeque::new(),
                 queue: VecDeque::new(),
                 authorization: None,
+                authorization_results: VecDeque::new(),
                 marker: false,
                 events: Vec::new(),
                 applied: Vec::new(),
+                apply_deadlines: Vec::new(),
                 fail_detach: false,
                 fail_remove: false,
                 fail_read: false,
                 fail_resume: false,
                 fail_apply: false,
+                fail_terminal_apply: false,
+                unvalidated_records: 0,
                 required_complete: true,
                 fail_wait: false,
                 cancelled: false,
@@ -1913,6 +2362,9 @@ mod tests {
                 revalidation_pause_owned: Vec::new(),
                 apply_pause_owned: Vec::new(),
                 terminal_batches: Vec::new(),
+                reconcile_results: VecDeque::new(),
+                terminal_cleanup_results: VecDeque::new(),
+                terminal_authority_pending: false,
             }
         }
     }
@@ -1976,7 +2428,9 @@ mod tests {
 
         fn authorization(&mut self) -> Result<Option<u64>, String> {
             self.events.push("read");
-            if self.fail_read {
+            if let Some(result) = self.authorization_results.pop_front() {
+                result
+            } else if self.fail_read {
                 Err("read".into())
             } else {
                 Ok(self.authorization)
@@ -1994,7 +2448,7 @@ mod tests {
         fn apply_batch(
             &mut self,
             records: Vec<DiscoveryRecord>,
-            _deadline: Option<u64>,
+            deadline: Option<u64>,
             additions_allowed: bool,
             pause_owned: bool,
             terminal_batch: &mut Option<TerminalBatch>,
@@ -2007,6 +2461,10 @@ mod tests {
             if self.fail_apply && additions_allowed {
                 return Err("apply".into());
             }
+            if self.fail_terminal_apply && !additions_allowed {
+                return Err("terminal apply".into());
+            }
+            self.apply_deadlines.push(deadline);
             self.apply_pause_owned.push(pause_owned);
             if let Some(batch) = terminal_batch.take() {
                 self.terminal_batches.push(batch);
@@ -2015,6 +2473,35 @@ mod tests {
             Ok(PauseBatchOutcome {
                 required_complete: self.required_complete,
             })
+        }
+
+        fn account_unvalidated_records(&mut self, count: u64) {
+            self.events.push("unvalidated");
+            self.unvalidated_records = self.unvalidated_records.saturating_add(count);
+        }
+
+        fn reconcile_terminal_authority(
+            &mut self,
+            _: &mut Option<TerminalBatch>,
+        ) -> Result<(), String> {
+            self.reconcile_results.pop_front().unwrap_or(Ok(()))
+        }
+
+        fn cleanup_terminal_batch_without_replay(
+            &mut self,
+            terminal_batch: &mut Option<TerminalBatch>,
+        ) -> Result<(), String> {
+            self.events.push("discard");
+            let result = self.terminal_cleanup_results.pop_front().unwrap_or(Ok(()));
+            if result.is_ok() {
+                self.terminal_authority_pending = false;
+            }
+            terminal_batch.take();
+            result
+        }
+
+        fn terminal_authority_pending(&self) -> bool {
+            self.terminal_authority_pending
         }
 
         fn revalidate_after_release(
@@ -2173,7 +2660,7 @@ mod tests {
             true,
             || clocks.pop_front().expect("one before and one after clock"),
             || Ok(item.take()),
-            || same_generation,
+            || Ok(same_generation),
         );
         (result, stop_candidate_seen)
     }
@@ -2301,6 +2788,24 @@ mod tests {
         assert_eq!(
             io.events.iter().filter(|event| **event == "resume").count(),
             1
+        );
+    }
+
+    #[test]
+    fn successor_requested_after_resume_deadline_is_protectively_resumed() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.resume_authorization = Some(Some(PAUSE_REQUESTED));
+        io.post_resume_now = VecDeque::from([Ok(100_000_011)]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(error.lifecycle());
+        assert_eq!(coordinator.counters().confirmed, 0);
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            2
         );
     }
 
@@ -2516,8 +3021,8 @@ mod tests {
     /// fired between epochs produced one, with the same zero helper result an
     /// accepted stop has. None of them won this arm: the producer reads its
     /// causal timestamp *after* the exchange that would have stopped the child.
-    /// Consuming the oldest as the epoch's winner mistakes the real winner,
-    /// still queued behind it, for a duplicate.
+    /// Consuming the oldest as the epoch's winner must not discard the real
+    /// winner still queued behind it.
     #[test]
     fn a_record_older_than_the_arm_is_never_its_epoch_winner() {
         let mut io = successful_io(vec![record(1, 0, false), record(6, 0, false)]);
@@ -2525,30 +3030,26 @@ mod tests {
         io.now = VecDeque::from([Ok(5)]);
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
         assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        coordinator.cycles = 1;
         // The record behind it is the one that won, so the map already reads
         // REQUESTED when the leftover is dequeued.
         io.authorization = Some(PAUSE_REQUESTED);
 
         coordinator.service(&mut io).unwrap();
 
-        assert_eq!(
-            coordinator.counters(),
-            PauseCounters::default(),
-            "a leftover opens no attempt and loses no authority"
-        );
-        assert!(coordinator.is_armed());
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert!(!coordinator.is_armed());
         assert!(coordinator.rearming_enabled());
         assert_eq!(
             io.applied.len(),
-            1,
-            "it is applied as the ordinary record it is"
+            2,
+            "the stale and winner records are each applied once"
         );
-        assert!(!io.events.contains(&"resume"));
         assert_eq!(
-            io.authorization,
-            Some(PAUSE_REQUESTED),
-            "the winner still owns the arm"
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
         );
+        assert_eq!(io.authorization, None);
         coordinator.cleanup(&mut io).unwrap();
 
         assert_eq!(
@@ -2609,9 +3110,17 @@ mod tests {
         // it: unexplained, so the candidate stands.
         io.authorization = None;
 
-        coordinator.service(&mut io).unwrap();
+        let error = coordinator.service(&mut io).unwrap_err();
 
-        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(error.lifecycle());
+        assert_eq!(
+            coordinator.counters(),
+            PauseCounters {
+                attempts: 1,
+                confirmed: 0,
+                partial: 0,
+            }
+        );
         assert!(!coordinator.rearming_enabled());
         assert_eq!(
             io.events.iter().filter(|event| **event == "resume").count(),
@@ -2693,7 +3202,7 @@ mod tests {
     }
 
     #[test]
-    fn unconsumed_armed_successor_cleanup_does_not_invent_a_protective_resume() {
+    fn unconsumed_armed_successor_cleanup_preserves_successor_debt() {
         let mut io = successful_io(vec![record(10, 0, false)]);
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
         coordinator.arm_for_test();
@@ -2705,7 +3214,7 @@ mod tests {
         assert_eq!(
             io.events.iter().filter(|event| **event == "resume").count(),
             1,
-            "ARMED proves the successor did not request a stop"
+            "a bare successor-only debt is cleared when its ARMED state is removed"
         );
         assert_eq!(io.authorization, None);
     }
@@ -2726,6 +3235,7 @@ mod tests {
             1
         );
         assert_eq!(io.authorization, None);
+        assert_eq!(io.applied.len(), 2, "both dequeued records apply once");
     }
 
     #[test]
@@ -2783,6 +3293,10 @@ mod tests {
                 record(10, 0, false),
                 record(20, COALESCED_NO_HELPER_RC, false),
             ],
+            vec![
+                record(5, COALESCED_NO_HELPER_RC, true),
+                record(20, COALESCED_NO_HELPER_RC, true),
+            ],
         ] {
             let mut io = successful_io(records);
             let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
@@ -2791,6 +3305,7 @@ mod tests {
             coordinator.service(&mut io).unwrap();
 
             assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+            assert_eq!(io.applied.len(), 2, "each dequeued record applies once");
             assert_eq!(
                 io.events.iter().filter(|event| **event == "resume").count(),
                 1
@@ -2811,6 +3326,26 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn first_pre_resume_check_applies_its_unexpected_record_once() {
+        let first = record(10, 0, false);
+        let unexpected = record(20, 0, false);
+        let mut io = successful_io(Vec::new());
+        io.queue = VecDeque::from([
+            Ok(Some(DiscoveryItem::Record(first))),
+            Ok(None),
+            Ok(Some(DiscoveryItem::Record(unexpected))),
+        ]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(io.applied.len(), 2);
+        assert_eq!(io.applied[0].hook_ts_ns, 10);
+        assert_eq!(io.applied[1].hook_ts_ns, 20);
     }
 
     #[test]
@@ -2880,9 +3415,393 @@ mod tests {
     }
 
     #[test]
-    fn post_insert_map_read_failure_removes_and_protectively_resumes() {
+    fn empty_outer_tick_then_bounded_winner_confirms() {
         let mut io = FakeIo {
+            authorization: Some(PAUSE_REQUESTED),
+            queue: VecDeque::from([
+                Ok(None),
+                Ok(Some(DiscoveryItem::Record(record(4, 0, false)))),
+                Ok(None),
+                Ok(None),
+            ]),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+    }
+
+    #[test]
+    fn requested_empty_tick_is_bounded_auto_partial_with_one_protective_resume() {
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_REQUESTED),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(!coordinator.rearming_enabled());
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn requested_empty_tick_is_required_always_cleanup() {
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_REQUESTED),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(error.required());
+        assert_eq!(coordinator.counters().partial, 0);
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn armed_empty_tick_has_no_attempt_or_resume() {
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_ARMED),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::default());
+        assert!(!io.events.contains(&"resume"));
+    }
+
+    #[test]
+    fn armed_empty_tick_then_requested_tick_never_leaves_request_unresolved() {
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_ARMED),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+        io.authorization = Some(PAUSE_REQUESTED);
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn requested_empty_tick_authorization_error_is_lifecycle_fatal() {
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_REQUESTED),
             fail_read: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(error.lifecycle());
+        assert_eq!(coordinator.counters().partial, 0);
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn armed_absent_or_unknown_authorization_is_lifecycle_without_resume() {
+        for authorization in [None, Some(999)] {
+            let mut io = FakeIo {
+                authorization,
+                ..FakeIo::default()
+            };
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.arm_for_test();
+
+            let error = coordinator.service(&mut io).unwrap_err();
+
+            assert!(error.lifecycle(), "authorization {authorization:?}");
+            assert_eq!(
+                coordinator.counters().partial,
+                0,
+                "authorization {authorization:?}"
+            );
+            assert_eq!(
+                io.events.iter().filter(|event| **event == "resume").count(),
+                0,
+                "authorization {authorization:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn requested_empty_tick_cancellation_is_lifecycle_fatal_and_resumes_once() {
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_REQUESTED),
+            cancelled: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(error.lifecycle());
+        assert_eq!(coordinator.counters().partial, 0);
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn requested_empty_tick_ring_loss_is_a_bounded_partial_with_one_resume() {
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_REQUESTED),
+            ring_losses: VecDeque::from([Ok(0), Ok(1)]),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn first_authorization_read_error_removes_without_resume() {
+        let mut io = FakeIo {
+            authorization_results: VecDeque::from([Err("first read".into()), Ok(None)]),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(error.lifecycle());
+        assert!(io.events.contains(&"remove"));
+        assert!(!io.events.contains(&"resume"));
+    }
+
+    #[test]
+    fn requested_debt_survives_later_auth_error_with_one_resume() {
+        let mut io = FakeIo {
+            authorization_results: VecDeque::from([
+                Ok(Some(PAUSE_REQUESTED)),
+                Err("later read".into()),
+                Ok(None),
+            ]),
+            ring_losses: VecDeque::from([Ok(0), Ok(1)]),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(error.lifecycle());
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unknown_or_absent_auth_without_debt_never_resumes_even_after_ring_loss() {
+        for authorization in [Ok(Some(999)), Err("read".into())] {
+            let mut io = FakeIo {
+                authorization_results: VecDeque::from([
+                    authorization.clone(),
+                    authorization.clone(),
+                ]),
+                ring_losses: VecDeque::from([Ok(1)]),
+                ..FakeIo::default()
+            };
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.arm_for_test();
+
+            let error = coordinator.service(&mut io).unwrap_err();
+
+            assert!(error.lifecycle(), "authorization {authorization:?}");
+            assert!(
+                !io.events.contains(&"resume"),
+                "authorization {authorization:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_or_absent_auth_after_requested_debt_resumes_once() {
+        for authorization in [Ok(Some(999)), Ok(None), Err("read".into())] {
+            let mut io = FakeIo {
+                authorization_results: VecDeque::from([
+                    Ok(Some(PAUSE_REQUESTED)),
+                    authorization.clone(),
+                    Ok(None),
+                ]),
+                ring_losses: VecDeque::from([Ok(0), Ok(1)]),
+                ..FakeIo::default()
+            };
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.arm_for_test();
+
+            let error = coordinator.service(&mut io).unwrap_err();
+            assert!(error.lifecycle(), "authorization {authorization:?}");
+            assert_eq!(
+                io.events.iter().filter(|event| **event == "resume").count(),
+                1,
+                "authorization {authorization:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_record_is_applied_then_winner_uses_the_same_request_deadline() {
+        let stale = record(4, 0, false);
+        let winner = record(6, 0, false);
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_REQUESTED),
+            queue: VecDeque::from([
+                Ok(None),
+                Ok(Some(DiscoveryItem::Record(stale))),
+                Ok(Some(DiscoveryItem::Record(winner))),
+                Ok(None),
+                Ok(None),
+            ]),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.armed_at_ns = Some(5);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(io.applied.len(), 2);
+        assert_eq!(io.applied[0].hook_ts_ns, 4);
+        assert_eq!(io.applied[1].hook_ts_ns, 6);
+        assert_eq!(io.apply_pause_owned, [false, true]);
+        assert_eq!(io.apply_deadlines, [Some(CYCLE_NS + 3), Some(CYCLE_NS + 3)]);
+    }
+
+    #[test]
+    fn armed_stale_record_rereads_requested_after_bounded_apply() {
+        let stale = record(1, 0, false);
+        let winner = record(4, 0, false);
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_REQUESTED),
+            authorization_results: VecDeque::from([
+                Ok(Some(PAUSE_ARMED)),
+                Ok(Some(PAUSE_REQUESTED)),
+                Ok(Some(PAUSE_REQUESTED)),
+            ]),
+            queue: VecDeque::from([
+                Ok(Some(DiscoveryItem::Record(stale))),
+                Ok(Some(DiscoveryItem::Record(winner))),
+                Ok(None),
+                Ok(None),
+            ]),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.armed_at_ns = Some(3);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(io.apply_pause_owned, [false, true]);
+        assert_eq!(io.apply_deadlines, [Some(CYCLE_NS + 2), Some(CYCLE_NS + 2)]);
+    }
+
+    #[test]
+    fn stale_records_until_exact_deadline_resume_once_without_extension() {
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_REQUESTED),
+            queue: VecDeque::from([
+                Ok(None),
+                Ok(Some(DiscoveryItem::Record(record(9, 0, false)))),
+                Ok(None),
+            ]),
+            now: VecDeque::from([
+                Ok(0),
+                Ok(0),
+                Ok(0),
+                Ok(CYCLE_NS - 1),
+                Ok(CYCLE_NS - 1),
+                Ok(CYCLE_NS),
+                Ok(CYCLE_NS),
+            ]),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.armed_at_ns = Some(10);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn stale_record_application_failure_resumes_once() {
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_REQUESTED),
+            queue: VecDeque::from([
+                Ok(None),
+                Ok(Some(DiscoveryItem::Record(record(9, 0, false)))),
+            ]),
+            fail_apply: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.armed_at_ns = Some(10);
+
+        coordinator.service(&mut io).unwrap();
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn post_insert_map_read_failure_removes_without_resume_without_request() {
+        let mut io = FakeIo {
+            authorization_results: VecDeque::from([
+                Err("post-insert read".into()),
+                Ok(Some(PAUSE_ARMED)),
+            ]),
             ..FakeIo::default()
         };
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
@@ -2893,7 +3812,7 @@ mod tests {
         assert_eq!(io.authorization, None);
         assert_eq!(
             io.events.iter().filter(|event| **event == "resume").count(),
-            1
+            0
         );
     }
 
@@ -2922,6 +3841,283 @@ mod tests {
     }
 
     #[test]
+    fn timed_dequeue_distinguishes_deadline_from_clock_queue_and_generation_failures() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+
+        let mut deadline = FakeIo {
+            now: VecDeque::from([Ok(CYCLE_NS + 1)]),
+            ..FakeIo::default()
+        };
+        assert!(matches!(
+            coordinator.timed_dequeue(&mut deadline, Some(CYCLE_NS)),
+            Err(TimedDequeueError::Deadline(_))
+        ));
+
+        let mut clock = FakeIo {
+            now: VecDeque::from([Err("clock".into())]),
+            ..FakeIo::default()
+        };
+        assert!(matches!(
+            coordinator.timed_dequeue(&mut clock, Some(CYCLE_NS)),
+            Err(TimedDequeueError::Failure(_))
+        ));
+
+        let mut queue = FakeIo {
+            now: VecDeque::from([Ok(0)]),
+            queue: VecDeque::from([Err("queue".into())]),
+            ..FakeIo::default()
+        };
+        assert!(matches!(
+            coordinator.timed_dequeue(&mut queue, Some(CYCLE_NS)),
+            Err(TimedDequeueError::Failure(_))
+        ));
+
+        let mut generation = FakeIo {
+            now: VecDeque::from([Ok(0), Ok(0)]),
+            queue: VecDeque::from([Ok(Some(DiscoveryItem::Record(record(0, 0, false))))]),
+            same_generation_results: VecDeque::from([Ok(false)]),
+            ..FakeIo::default()
+        };
+        assert!(matches!(
+            coordinator.timed_dequeue(&mut generation, Some(CYCLE_NS)),
+            Err(TimedDequeueError::Failure(_))
+        ));
+    }
+
+    #[test]
+    fn timed_dequeue_sinks_validated_records_and_counts_changed_generation_once() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        let mut clock = FakeIo {
+            now: VecDeque::from([Ok(1), Err("post-clock".into())]),
+            queue: VecDeque::from([Ok(Some(DiscoveryItem::Record(record(1, 0, false))))]),
+            ..FakeIo::default()
+        };
+        let error = match coordinator.timed_dequeue(&mut clock, Some(CYCLE_NS)) {
+            Err(error) => error,
+            Ok(_) => panic!("post-clock failure must retain the removed record"),
+        };
+        assert!(error.lifecycle());
+        assert!(matches!(error, TimedDequeueError::Failure(_)));
+        assert_eq!(coordinator.pending_records.len(), 1);
+        assert_eq!(coordinator.unvalidated_records, 0);
+
+        let mut changed = FakeIo {
+            now: VecDeque::from([Ok(1), Ok(2)]),
+            queue: VecDeque::from([Ok(Some(DiscoveryItem::Record(record(2, 0, false))))]),
+            same_generation_results: VecDeque::from([Ok(false)]),
+            ..FakeIo::default()
+        };
+        let error = match coordinator.timed_dequeue(&mut changed, Some(CYCLE_NS)) {
+            Err(error) => error,
+            Ok(_) => panic!("generation change must reject the removed record"),
+        };
+        assert!(matches!(error, TimedDequeueError::Failure(_)));
+        assert_eq!(coordinator.pending_records.len(), 1);
+        assert_eq!(coordinator.unvalidated_records, 1);
+    }
+
+    #[test]
+    fn direct_generation_loss_precedes_a_coincident_deadline() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        let mut io = FakeIo {
+            now: VecDeque::from([Ok(1), Ok(CYCLE_NS + 1)]),
+            queue: VecDeque::from([Ok(Some(DiscoveryItem::Record(record(1, 0, false))))]),
+            same_generation_results: VecDeque::from([Ok(false)]),
+            ..FakeIo::default()
+        };
+
+        let error = match coordinator.timed_dequeue(&mut io, Some(CYCLE_NS)) {
+            Err(error) => error,
+            Ok(_) => panic!("generation loss must fail the direct dequeue"),
+        };
+
+        assert!(matches!(&error, TimedDequeueError::Failure(_)));
+        assert!(error.message().contains("generation changed"));
+        assert!(coordinator.pending_records.is_empty());
+        assert_eq!(coordinator.unvalidated_records, 1);
+    }
+
+    #[test]
+    fn unvalidated_record_is_counted_only_by_terminal_cleanup() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        let mut io = FakeIo {
+            now: VecDeque::from([Ok(1), Ok(2)]),
+            queue: VecDeque::from([Ok(Some(DiscoveryItem::Record(record(2, 0, false))))]),
+            same_generation_results: VecDeque::from([Err("generation".into())]),
+            ..FakeIo::default()
+        };
+        let error = match coordinator.timed_dequeue(&mut io, Some(CYCLE_NS)) {
+            Err(error) => error,
+            Ok(_) => panic!("generation read failure must reject the removed record"),
+        };
+        assert!(matches!(error, TimedDequeueError::Failure(_)));
+
+        coordinator.terminal_cleanup(&mut io).unwrap();
+
+        assert!(io.applied.is_empty());
+        assert_eq!(io.apply_pause_owned, [false]);
+        assert_eq!(io.unvalidated_records, 1);
+        assert_eq!(coordinator.counters().confirmed, 0);
+    }
+
+    #[test]
+    fn terminal_cleanup_applies_validated_and_accounts_unvalidated() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.pending_records.push(record(1, 0, false));
+        coordinator.unvalidated_records = 3;
+        let mut io = FakeIo::default();
+
+        coordinator.terminal_cleanup(&mut io).unwrap();
+
+        assert_eq!(
+            io.events,
+            [
+                "detach",
+                "dequeue",
+                "account",
+                "unvalidated",
+                "read",
+                "remove"
+            ]
+        );
+        assert_eq!(io.applied.len(), 1);
+        assert_eq!(io.unvalidated_records, 3);
+    }
+
+    #[test]
+    fn terminal_cleanup_reclaims_validated_record_retained_by_drain_failure() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.failure_deadline = Some(CYCLE_NS);
+        let mut io = FakeIo {
+            now: VecDeque::from([Ok(1), Err("post-clock".into())]),
+            queue: VecDeque::from([Ok(Some(DiscoveryItem::Record(record(1, 1, false))))]),
+            ..FakeIo::default()
+        };
+
+        let error = coordinator.terminal_cleanup(&mut io).unwrap_err();
+
+        assert!(error.to_string().contains("post-clock"));
+        assert_eq!(io.applied.len(), 1);
+        assert_eq!(io.applied[0].hook_ts_ns, 1);
+        assert_eq!(io.unvalidated_records, 0);
+    }
+
+    #[test]
+    fn round7_cleanup_only_failures_do_not_skip_child_safe_cleanup_or_resume_twice() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.epoch.authorization_consumed = true;
+        coordinator.may_be_stopped = true;
+        coordinator.pending_records.push(record(1, 0, false));
+        coordinator.unvalidated_records = 2;
+        let mut io = FakeIo {
+            queue: VecDeque::from([Ok(Some(DiscoveryItem::Malformed)), Ok(None), Ok(None)]),
+            terminal_cleanup_results: VecDeque::from([
+                Err("registry remove one".into()),
+                Err("registry remove two".into()),
+                Ok(()),
+            ]),
+            terminal_authority_pending: true,
+            ..FakeIo::default()
+        };
+
+        let first = coordinator.cleanup(&mut io).unwrap_err();
+
+        assert!(first.lifecycle());
+        assert_eq!(io.applied.len(), 1);
+        assert_eq!(io.unvalidated_records, 2);
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "detach").count(),
+            1
+        );
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+        assert_eq!(
+            io.events
+                .iter()
+                .filter(|event| **event == "discard")
+                .count(),
+            2
+        );
+        assert!(io.terminal_authority_pending);
+        assert!(!coordinator.cleaned);
+
+        coordinator.cleanup(&mut io).unwrap();
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "detach").count(),
+            2
+        );
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+        assert_eq!(
+            io.events
+                .iter()
+                .filter(|event| **event == "discard")
+                .count(),
+            3
+        );
+        assert!(!io.terminal_authority_pending);
+        assert!(coordinator.cleaned);
+    }
+
+    #[test]
+    fn round7_reconciliation_error_still_removes_authorization_and_resumes() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.epoch.authorization_consumed = true;
+        coordinator.may_be_stopped = true;
+        let mut io = FakeIo {
+            reconcile_results: VecDeque::from([Err("authority invariant".into())]),
+            ..FakeIo::default()
+        };
+
+        let error = coordinator.cleanup(&mut io).unwrap_err();
+
+        assert!(error.lifecycle());
+        assert!(error.to_string().contains("authority invariant"));
+        assert!(io.events.contains(&"detach"));
+        assert!(io.events.contains(&"account"));
+        assert!(io.events.contains(&"remove"));
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+        assert!(!coordinator.cleaned);
+    }
+
+    #[test]
+    fn post_dequeue_generation_failure_latches_one_protective_resume() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        let mut io = FakeIo {
+            now: VecDeque::from([Ok(1), Ok(2)]),
+            queue: VecDeque::from([Ok(Some(DiscoveryItem::Record(record(1, 0, false))))]),
+            same_generation_results: VecDeque::from([Err("generation".into())]),
+            authorization: None,
+            ..FakeIo::default()
+        };
+
+        let error = match coordinator.timed_dequeue(&mut io, Some(CYCLE_NS)) {
+            Err(error) => error,
+            Ok(_) => panic!("generation failure must fail after dequeue"),
+        };
+        assert!(coordinator.epoch.zero_candidate);
+        assert!(coordinator.may_be_stopped);
+        coordinator
+            .fail_cycle(&mut io, error.message(), true)
+            .unwrap_err();
+
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    #[test]
     fn rejected_helper_is_one_partial_attempt_without_sigcont_or_rearm() {
         let mut io = successful_io(vec![record(10, -libc::EPERM as i64, false)]);
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
@@ -2931,6 +4127,31 @@ mod tests {
         assert!(!io.events.contains(&"resume"));
         assert!(!coordinator.is_armed());
         assert!(!coordinator.rearming_enabled());
+        assert!(!coordinator.may_be_stopped);
+        assert!(!coordinator.epoch.authorization_consumed);
+    }
+
+    #[test]
+    fn rejected_lifecycle_failure_applies_every_validated_record_once_without_resume() {
+        let rejected = record(10, -libc::EPERM as i64, false);
+        let invalid = record(20, 0, false);
+        let mut io = successful_io(Vec::new());
+        io.queue = VecDeque::from([
+            Ok(Some(DiscoveryItem::Record(rejected))),
+            Ok(Some(DiscoveryItem::Record(invalid))),
+            Ok(None),
+        ]);
+        io.same_generation_results = VecDeque::from([Ok(true), Ok(true), Ok(false)]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(error.lifecycle());
+        assert_eq!(io.applied.len(), 2);
+        assert_eq!(io.applied[0].hook_ts_ns, 10);
+        assert_eq!(io.applied[1].hook_ts_ns, 20);
+        assert!(!io.events.contains(&"resume"));
     }
 
     #[test]
@@ -3004,7 +4225,7 @@ mod tests {
     #[test]
     fn post_release_revalidation_remains_owned_by_the_pause_ledger() {
         let mut io = FakeIo {
-            authorization: Some(PAUSE_ARMED),
+            authorization: None,
             revalidation_required_complete: false,
             revalidation_consumes_winner: true,
             ..FakeIo::default()
@@ -3012,10 +4233,18 @@ mod tests {
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
         coordinator.arm_for_test();
 
-        coordinator.revalidate_after_release(&mut io).unwrap();
+        let error = coordinator.revalidate_after_release(&mut io).unwrap_err();
 
         assert_eq!(io.events.first(), Some(&"revalidate"));
-        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(error.lifecycle());
+        assert_eq!(
+            coordinator.counters(),
+            PauseCounters {
+                attempts: 1,
+                confirmed: 0,
+                partial: 0,
+            }
+        );
         assert_eq!(io.authorization, None);
         assert_eq!(
             io.events.iter().filter(|event| **event == "resume").count(),
@@ -3025,7 +4254,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_owner_debt_does_not_resume_an_unconsumed_successor() {
+    fn completed_owner_debt_preserves_an_unconsumed_successor_debt() {
         let mut io = FakeIo {
             authorization: Some(PAUSE_ARMED),
             revalidation_required_complete: false,
@@ -3041,7 +4270,7 @@ mod tests {
         assert_eq!(
             io.events.iter().filter(|event| **event == "resume").count(),
             1,
-            "owner 1 debt must not invent a resume for the ARMED successor"
+            "a bare successor-only debt is cleared when its ARMED state is removed"
         );
         assert_eq!(
             coordinator.counters(),
@@ -3051,7 +4280,6 @@ mod tests {
                 partial: 1,
             }
         );
-        assert!(coordinator.counters().valid());
         assert_eq!(io.authorization, None);
         assert!(!coordinator.is_armed());
         assert!(!coordinator.rearming_enabled());
@@ -3070,7 +4298,7 @@ mod tests {
         };
         assert!(stop_candidate_seen);
         let mut io = FakeIo {
-            authorization: Some(PAUSE_ARMED),
+            authorization: None,
             revalidation_error: Some(error),
             retirement_stop_candidate_seen: stop_candidate_seen,
             ..FakeIo::default()
@@ -3078,10 +4306,17 @@ mod tests {
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
         coordinator.arm_for_test();
 
-        coordinator.revalidate_after_release(&mut io).unwrap();
+        let error = coordinator.revalidate_after_release(&mut io).unwrap_err();
 
-        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
-        assert!(coordinator.counters().valid());
+        assert!(error.lifecycle());
+        assert_eq!(
+            coordinator.counters(),
+            PauseCounters {
+                attempts: 1,
+                confirmed: 0,
+                partial: 0,
+            }
+        );
         assert_eq!(io.authorization, None);
         assert_eq!(
             io.events.iter().filter(|event| **event == "resume").count(),
@@ -3109,10 +4344,17 @@ mod tests {
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
         coordinator.arm_for_test();
 
-        coordinator.revalidate_after_release(&mut io).unwrap();
+        let error = coordinator.revalidate_after_release(&mut io).unwrap_err();
 
-        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
-        assert!(coordinator.counters().valid());
+        assert!(error.lifecycle());
+        assert_eq!(
+            coordinator.counters(),
+            PauseCounters {
+                attempts: 1,
+                confirmed: 0,
+                partial: 0,
+            }
+        );
         assert_eq!(io.authorization, None);
         assert_eq!(
             io.events.iter().filter(|event| **event == "resume").count(),
@@ -3220,7 +4462,7 @@ mod tests {
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Never, 41, 9, stopped());
 
         coordinator
-            .service_received(
+            .service_deferred(
                 &mut io,
                 TimedItem {
                     before_ns: 1,
@@ -3252,7 +4494,7 @@ mod tests {
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Never, 41, 9, stopped());
 
         let error = coordinator
-            .service_received(
+            .service_deferred(
                 &mut io,
                 TimedItem {
                     before_ns: 1,
@@ -3322,14 +4564,15 @@ mod tests {
             queued(owner, child.pid()),
             Err(anyhow::anyhow!("scripted ring read failed")),
         ]);
+        let mut terminal_batch = None;
 
         with_session_io(&mut engine, &mut session, &child, |io| {
-            io.apply_batch(Vec::new(), None, true, false, &mut None)
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
                 .expect("a failed terminal drain is loss, never a batch error")
         });
 
-        let batch = engine
-            .terminal_batch_for_test()
+        let batch = terminal_batch
+            .as_ref()
             .expect("the exact prefix stays with its authority");
         assert_eq!(
             batch.record_count(),
@@ -3348,7 +4591,7 @@ mod tests {
 
         session.dequeues.push_back(queued(unrelated, child.pid()));
         with_session_io(&mut engine, &mut session, &child, |io| {
-            io.apply_batch(Vec::new(), None, true, false, &mut None)
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
                 .expect("the continued drain completes")
         });
 
@@ -3357,8 +4600,192 @@ mod tests {
             2,
             "the continuation dispatched the whole batch exactly once"
         );
+        assert!(terminal_batch.is_none());
         assert!(engine.terminal_batch_for_test().is_none());
         assert_eq!(engine.terminal_journal_for_test(), None);
+        assert_eq!(engine.loader_context_state_for_test(owner), None);
+    }
+
+    #[test]
+    fn round7_adopted_incomplete_batch_collects_to_empty_before_dispatch() {
+        let child = OwnedChild::spawn("/bin/true".into(), Vec::new()).unwrap();
+        let (mut engine, owner) = Engine::retiring_loader_context(child.pid());
+        let unrelated = LoaderContextId::from_case_id(9);
+        let mut session = ScriptedSession::with_records([], 16);
+        let carried = carried_empty_terminal_batch(&mut engine, &mut session, &child);
+        let mut terminal_batch = Some(carried);
+        session
+            .dequeues
+            .extend([queued(unrelated, child.pid()), Ok(None)]);
+
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(
+                vec![loader_record_for(owner, child.pid())],
+                None,
+                true,
+                false,
+                &mut terminal_batch,
+            )
+            .unwrap()
+        });
+
+        assert_eq!(engine.dispatched_loader_records(), 2);
+        assert!(session.dequeues.is_empty());
+        assert!(terminal_batch.is_none());
+        assert_eq!(engine.terminal_journal_for_test(), None);
+    }
+
+    #[test]
+    fn round7_active_revalidation_counts_nested_malformed_once_without_raw_record() {
+        let child = OwnedChild::spawn("/bin/true".into(), Vec::new()).unwrap();
+        let (mut engine, _) = Engine::retiring_loader_context(child.pid());
+        let mut session = ScriptedSession::with_records([], 16);
+        session
+            .dequeues
+            .extend([Ok(Some(DiscoveryItem::Malformed)), Ok(None)]);
+        let mut coordinator = PauseCoordinator::for_test(
+            PausePolicy::Auto,
+            child.pid(),
+            child.generation().get(),
+            stopped(),
+        );
+        coordinator.arm_for_test();
+
+        let error = with_session_io(&mut engine, &mut session, &child, |io| {
+            coordinator.revalidate_after_release(io).unwrap_err()
+        });
+
+        assert!(error.lifecycle());
+        assert_eq!(engine.malformed_discovery_for_test(), 1);
+        assert_eq!(engine.dispatched_loader_records(), 0);
+        assert!(coordinator.pending_records.is_empty());
+    }
+
+    #[test]
+    fn round7_started_journal_failure_runs_full_cleanup_and_later_flushes_generic_once() {
+        let child = OwnedChild::spawn("/bin/true".into(), Vec::new()).unwrap();
+        let (mut engine, owner) = Engine::retiring_loader_context(child.pid());
+        engine.start_cleanup_only_terminal_journal_for_test(owner);
+        let mut session = ScriptedSession::with_records([], 16);
+        session
+            .dequeues
+            .extend([Ok(Some(DiscoveryItem::Malformed)), Ok(None)]);
+        session.fail_counter_reads([true]);
+        let mut coordinator = PauseCoordinator::for_test(
+            PausePolicy::Auto,
+            child.pid(),
+            child.generation().get(),
+            stopped(),
+        );
+        coordinator.arm_for_test();
+        coordinator.epoch.authorization_consumed = true;
+        coordinator.may_be_stopped = true;
+        coordinator
+            .pending_records
+            .push(loader_record_for(owner, child.pid()));
+        coordinator.unvalidated_records = 2;
+
+        let first = with_session_io(&mut engine, &mut session, &child, |io| {
+            coordinator.cleanup(io).unwrap_err()
+        });
+
+        assert!(first.lifecycle());
+        assert_eq!(
+            engine.terminal_journal_for_test(),
+            Some((owner, true, true))
+        );
+        assert_eq!(engine.pending_discovery_records_for_test(), 1);
+        assert_eq!(engine.malformed_discovery_for_test(), 1);
+        assert_eq!(engine.unvalidated_discovery_for_test(), 2);
+        assert_eq!(engine.capture_facts().discovery_truncated, 3);
+        assert_eq!(engine.dispatched_loader_records(), 0);
+        assert!(!coordinator.cleaned);
+
+        engine.tombstone_loader_context_for_test(owner);
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            coordinator.cleanup(io).unwrap()
+        });
+        assert_eq!(engine.pending_discovery_records_for_test(), 0);
+        assert_eq!(engine.dispatched_loader_records(), 1);
+        assert_eq!(engine.malformed_discovery_for_test(), 1);
+        assert_eq!(engine.unvalidated_discovery_for_test(), 2);
+        assert_eq!(engine.terminal_journal_for_test(), None);
+        assert!(coordinator.cleaned);
+
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            coordinator.cleanup(io).unwrap()
+        });
+        assert_eq!(engine.dispatched_loader_records(), 1);
+    }
+
+    #[test]
+    fn round7_rejected_cleanup_keeps_the_coordinator_terminal_batch() {
+        let child = OwnedChild::spawn("/bin/true".into(), Vec::new()).unwrap();
+        let (mut engine, owner) = Engine::retiring_loader_context(child.pid());
+        let mut session = ScriptedSession::with_records([], 16);
+        session.detach_exports = vec![terminal_export()];
+        let mut carried = carried_empty_terminal_batch(&mut engine, &mut session, &child);
+        carried.extend([loader_record_for(owner, child.pid())]);
+        let mut coordinator = PauseCoordinator::for_test(
+            PausePolicy::Never,
+            child.pid(),
+            child.generation().get(),
+            stopped(),
+        );
+        coordinator.terminal_batch = Some(carried);
+        engine.start_cleanup_only_terminal_journal_for_test(owner);
+        let truncated = engine.capture_facts().discovery_truncated;
+
+        let error = with_session_io(&mut engine, &mut session, &child, |io| {
+            coordinator.cleanup(io).unwrap_err()
+        });
+
+        assert!(error.lifecycle());
+        assert!(error.to_string().contains("dispatched terminal authority"));
+        let carried = coordinator
+            .terminal_batch
+            .as_ref()
+            .expect("rejected cleanup keeps coordinator ownership");
+        assert_eq!(carried.authority.owner, owner);
+        assert_eq!(carried.authority.exports, [terminal_export()]);
+        assert_eq!(carried.record_count(), 1);
+        assert_eq!(carried.tagged_owners(), [Some(owner)]);
+        assert!(!carried.complete());
+        assert_eq!(engine.dispatched_loader_records(), 0);
+        assert_eq!(engine.capture_facts().discovery_truncated, truncated);
+        assert_eq!(
+            engine.terminal_journal_for_test(),
+            Some((owner, true, true))
+        );
+    }
+
+    #[test]
+    fn real_adapter_nested_generation_loss_counts_without_retaining_raw_bytes() {
+        let mut child = OwnedChild::spawn("/bin/true".into(), Vec::new()).unwrap();
+        let (mut engine, owner) = Engine::retiring_loader_context(child.pid());
+        let mut session = ScriptedSession::with_records([], 16);
+        session
+            .dequeues
+            .push_back(Err(anyhow::anyhow!("start drain")));
+        let mut terminal_batch = None;
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .unwrap()
+        });
+        assert_eq!(terminal_batch.as_ref().unwrap().record_count(), 0);
+
+        child.terminate_and_reap().unwrap();
+        session.dequeues.push_back(queued(owner, child.pid()));
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .unwrap()
+        });
+
+        assert_eq!(engine.capture_facts().discovery_truncated, 1);
+        assert!(terminal_batch.is_none());
+        assert!(engine.terminal_batch_for_test().is_none());
+        assert_eq!(engine.terminal_journal_for_test(), None);
+        assert_eq!(engine.dispatched_loader_records(), 0);
         assert_eq!(engine.loader_context_state_for_test(owner), None);
     }
 
@@ -3376,12 +4803,13 @@ mod tests {
             queued(unrelated, child.pid()),
             Err(anyhow::anyhow!("scripted ring read failed")),
         ]);
+        let mut terminal_batch = None;
         with_session_io(&mut engine, &mut session, &child, |io| {
-            io.apply_batch(Vec::new(), None, true, false, &mut None)
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
                 .expect("a failed terminal drain is loss, never a batch error")
         });
-        let carried = engine
-            .take_terminal_batch_for_deferred()
+        let carried = terminal_batch
+            .take()
             .expect("a deferral hands the exact batch to the coordinator");
         let mut coordinator = PauseCoordinator::for_test(
             PausePolicy::Never,
@@ -3393,7 +4821,7 @@ mod tests {
         session.fail_counter_reads([true]);
         let error = with_session_io(&mut engine, &mut session, &child, |io| {
             coordinator
-                .service_received(
+                .service_deferred(
                     io,
                     TimedItem {
                         before_ns: 1,
@@ -3422,7 +4850,10 @@ mod tests {
             [None, Some(owner)],
             "only the owned record carries terminal authority"
         );
-        assert!(retained.complete());
+        assert!(
+            !retained.complete(),
+            "appending the coordinator record cannot prove the collector empty"
+        );
         assert_eq!(engine.dispatched_loader_records(), 0);
         assert_eq!(
             engine.loader_context_state_for_test(owner),
@@ -3431,7 +4862,7 @@ mod tests {
 
         with_session_io(&mut engine, &mut session, &child, |io| {
             coordinator
-                .service_received(
+                .service_deferred(
                     io,
                     TimedItem {
                         before_ns: 3,
@@ -3452,6 +4883,177 @@ mod tests {
         assert!(engine.terminal_batch_for_test().is_none());
         assert_eq!(engine.terminal_journal_for_test(), None);
         assert_eq!(engine.loader_context_state_for_test(owner), None);
+    }
+
+    fn carried_empty_terminal_batch(
+        engine: &mut Engine,
+        session: &mut ScriptedSession,
+        child: &OwnedChild,
+    ) -> TerminalBatch {
+        session
+            .dequeues
+            .push_back(Err(anyhow::anyhow!("start drain")));
+        let mut terminal_batch = None;
+        with_session_io(engine, session, child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .unwrap()
+        });
+        terminal_batch.take().unwrap()
+    }
+
+    #[test]
+    fn real_terminal_cleanup_retries_the_same_batch_once_and_dispatches_once() {
+        let child = OwnedChild::spawn("/bin/true".into(), Vec::new()).unwrap();
+        let (mut engine, owner) = Engine::retiring_loader_context(child.pid());
+        let mut session = ScriptedSession::with_records([], 16);
+        let carried = carried_empty_terminal_batch(&mut engine, &mut session, &child);
+        let mut coordinator = PauseCoordinator::for_test(
+            PausePolicy::Never,
+            child.pid(),
+            child.generation().get(),
+            stopped(),
+        );
+        coordinator.terminal_batch = Some(carried);
+        coordinator
+            .pending_records
+            .push(loader_record_for(owner, child.pid()));
+        session.fail_counter_reads([true]);
+        let reads = session.counter_reads();
+
+        let error = with_session_io(&mut engine, &mut session, &child, |io| {
+            coordinator.cleanup(io).unwrap_err()
+        });
+
+        assert!(error.to_string().contains("application failed"), "{error}");
+        assert_eq!(
+            session.counter_reads() - reads,
+            3,
+            "one failed application plus the retry's generic and terminal gates"
+        );
+        assert_eq!(engine.dispatched_loader_records(), 1);
+        assert!(coordinator.terminal_batch.is_none());
+        assert!(engine.terminal_batch_for_test().is_none());
+        assert_eq!(engine.terminal_journal_for_test(), None);
+        assert_eq!(engine.loader_context_state_for_test(owner), None);
+    }
+
+    #[test]
+    fn real_terminal_cleanup_two_failures_clear_without_a_third_or_dispatch() {
+        let child = OwnedChild::spawn("/bin/true".into(), Vec::new()).unwrap();
+        let (mut engine, owner) = Engine::retiring_loader_context(child.pid());
+        let mut session = ScriptedSession::with_records([], 16);
+        let carried = carried_empty_terminal_batch(&mut engine, &mut session, &child);
+        let mut coordinator = PauseCoordinator::for_test(
+            PausePolicy::Never,
+            child.pid(),
+            child.generation().get(),
+            stopped(),
+        );
+        coordinator.terminal_batch = Some(carried);
+        coordinator
+            .pending_records
+            .push(loader_record_for(owner, child.pid()));
+        session.fail_counter_reads([true, true, false]);
+        let reads = session.counter_reads();
+
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            coordinator.cleanup(io).unwrap_err()
+        });
+
+        assert_eq!(session.counter_reads() - reads, 2, "no third application");
+        assert_eq!(engine.dispatched_loader_records(), 0);
+        assert!(coordinator.terminal_batch.is_none());
+        assert!(engine.terminal_batch_for_test().is_none());
+        assert_eq!(engine.terminal_journal_for_test(), None);
+        assert_eq!(engine.loader_context_state_for_test(owner), None);
+    }
+
+    #[test]
+    fn round6_initial_ordinary_cleanup_continues_new_terminal_authority_once() {
+        let child = OwnedChild::spawn("/bin/true".into(), Vec::new()).unwrap();
+        let (mut engine, owner) = Engine::retiring_loader_context(child.pid());
+        let mut session = ScriptedSession::with_records([], 16);
+        session
+            .dequeues
+            .extend([Ok(None), Err(anyhow::anyhow!("initial terminal drain"))]);
+        let mut coordinator = PauseCoordinator::for_test(
+            PausePolicy::Never,
+            child.pid(),
+            child.generation().get(),
+            stopped(),
+        );
+        coordinator
+            .pending_records
+            .push(loader_record_for(owner, child.pid()));
+        let reads = session.counter_reads();
+
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            coordinator.cleanup(io).unwrap()
+        });
+
+        assert_eq!(session.counter_reads() - reads, 3);
+        assert!(coordinator.terminal_batch.is_none());
+        assert!(engine.terminal_batch_for_test().is_none());
+        assert_eq!(engine.terminal_journal_for_test(), None);
+        assert_eq!(engine.loader_context_state_for_test(owner), None);
+    }
+
+    #[test]
+    fn round6_never_cleanup_does_not_turn_an_ordinary_zero_into_pause_debt() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Never, 41, 9, stopped());
+        let mut io = FakeIo {
+            now: VecDeque::from([Ok(0), Ok(1), Ok(2), Ok(3)]),
+            queue: VecDeque::from([
+                Ok(Some(DiscoveryItem::Record(record(1, 0, false)))),
+                Ok(None),
+            ]),
+            ..FakeIo::default()
+        };
+
+        coordinator.cleanup(&mut io).unwrap();
+
+        assert_eq!(io.apply_pause_owned, [false]);
+        assert!(!coordinator.may_be_stopped);
+        assert!(!coordinator.epoch.zero_candidate);
+        assert!(!io.events.contains(&"resume"));
+    }
+
+    #[test]
+    fn round6_active_arm_with_absent_authorization_is_lifecycle_loss_without_resume() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        let mut io = FakeIo {
+            now: VecDeque::from([Ok(0), Ok(1)]),
+            queue: VecDeque::from([Ok(None)]),
+            authorization: None,
+            ..FakeIo::default()
+        };
+
+        let error = coordinator.cleanup(&mut io).unwrap_err();
+
+        assert!(error.lifecycle());
+        assert!(!io.events.contains(&"resume"));
+    }
+
+    #[test]
+    fn round6_nested_malformed_is_counted_once_without_a_raw_record() {
+        let child = OwnedChild::spawn("/bin/true".into(), Vec::new()).unwrap();
+        let (mut engine, _) = Engine::retiring_loader_context(child.pid());
+        let mut session = ScriptedSession::with_records([], 16);
+        let mut terminal_batch = None;
+        session
+            .dequeues
+            .extend([Ok(Some(DiscoveryItem::Malformed)), Ok(None)]);
+
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .unwrap()
+        });
+
+        assert_eq!(engine.malformed_discovery_for_test(), 1);
+        assert_eq!(engine.dispatched_loader_records(), 0);
+        assert!(terminal_batch.is_none());
+        assert!(engine.terminal_batch_for_test().is_none());
     }
 
     /// The real `revalidate_after_release` collector runs deadline-less and
@@ -3490,6 +5092,15 @@ mod tests {
         assert_eq!(engine.dispatched_loader_records(), 0);
         assert_eq!(coordinator.counters(), PauseCounters::default());
         assert!(!coordinator.is_armed());
+
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            coordinator.cleanup(io).unwrap()
+        });
+        assert_eq!(engine.dispatched_loader_records(), 1);
+        assert!(coordinator.terminal_batch.is_none());
+        assert!(engine.terminal_batch_for_test().is_none());
+        assert_eq!(engine.terminal_journal_for_test(), None);
+        assert_eq!(engine.loader_context_state_for_test(owner), None);
     }
 
     #[test]
@@ -3571,7 +5182,7 @@ mod tests {
             false,
             || clocks.pop_front().expect("two clocks per dequeue"),
             || items.pop_front().expect("one item then empty"),
-            || true,
+            || Ok(true),
         )
         .unwrap();
 
@@ -3593,7 +5204,7 @@ mod tests {
             true,
             || clocks.pop_front().expect("clock for queued record"),
             || items.pop_front().expect("queued record"),
-            || true,
+            || Ok(true),
         ) {
             Err(error) => error,
             Ok(_) => panic!("post-dequeue clock failure must retain the collected prefix"),
@@ -3628,7 +5239,7 @@ mod tests {
                     true,
                     || clocks.pop_front().expect("clock for queued record"),
                     || items.pop_front().expect("queued record"),
-                    || same_generation,
+                    || Ok(same_generation),
                 ) {
                     Err(error) => error,
                     Ok(_) => panic!("a post-dequeue terminal failure must retain the prefix"),
@@ -3640,13 +5251,14 @@ mod tests {
             };
 
         let generation = retained_by(None, DiscoveryItem::Record(record(1, 0, false)), 1, false);
-        assert_eq!(generation.records.len(), 1);
-        assert_eq!(generation.records[0].hook_ts_ns, 1);
+        assert!(generation.records.is_empty());
         assert_eq!(generation.malformed, 0);
+        assert_eq!(generation.unvalidated_records, 1);
 
         let malformed_generation = retained_by(None, DiscoveryItem::Malformed, 0, false);
         assert!(malformed_generation.records.is_empty());
         assert_eq!(malformed_generation.malformed, 1);
+        assert_eq!(malformed_generation.unvalidated_records, 0);
 
         let timing = retained_by(
             Some(100),
@@ -3656,6 +5268,7 @@ mod tests {
         );
         assert_eq!(timing.records.len(), 1);
         assert_eq!(timing.records[0].hook_ts_ns, 50);
+        assert_eq!(timing.unvalidated_records, 0);
 
         let unaccounted = retained_by(
             Some(100),
@@ -3665,10 +5278,35 @@ mod tests {
         );
         assert_eq!(unaccounted.records.len(), 1);
         assert_eq!(unaccounted.records[0].hook_ts_ns, 1);
+        assert_eq!(unaccounted.unvalidated_records, 0);
         assert!(
             unaccounted.to_string().contains("duplicate or unaccounted"),
             "{unaccounted:#}"
         );
+    }
+
+    #[test]
+    fn nested_generation_loss_precedes_a_coincident_deadline() {
+        let mut clocks = VecDeque::from([Ok(1), Ok(101)]);
+        let mut item = Some(DiscoveryItem::Record(record(1, 0, false)));
+        let mut stop_candidate_seen = false;
+
+        let error = match collect_timed_retirement_with(
+            41,
+            Some(100),
+            &mut stop_candidate_seen,
+            true,
+            || clocks.pop_front().expect("before and after clocks"),
+            || Ok(item.take()),
+            || Ok(false),
+        ) {
+            Err(error) => error.downcast::<IncompleteTerminalDrain>().unwrap(),
+            Ok(_) => panic!("generation loss must fail the nested drain"),
+        };
+
+        assert!(error.to_string().contains("generation changed"));
+        assert!(error.records.is_empty());
+        assert_eq!(error.unvalidated_records, 1);
     }
 
     #[test]
@@ -3796,7 +5434,6 @@ mod tests {
             let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
             coordinator.begin_attempt();
             coordinator.may_be_stopped = true;
-            coordinator.epoch.authorization_consumed = true;
 
             coordinator.cleanup(&mut io).unwrap();
 
@@ -3811,7 +5448,12 @@ mod tests {
             io.authorization = authorization;
             let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
             coordinator.arm_for_test();
-            coordinator.service(&mut io).unwrap();
+            let result = coordinator.service(&mut io);
+            if authorization.is_none() {
+                assert!(result.unwrap_err().lifecycle());
+            } else {
+                result.unwrap();
+            }
             coordinator.cleanup(&mut io).unwrap();
             assert_eq!(
                 io.events.iter().filter(|event| **event == "resume").count(),
@@ -3874,10 +5516,16 @@ mod tests {
             ],
             "cleanup must retain failures without short-circuiting before resume"
         );
-        assert!(
-            coordinator.cleanup(&mut io).is_ok(),
-            "cleanup must be idempotent"
+        assert!(!coordinator.cleaned);
+        io.fail_detach = false;
+        io.fail_remove = false;
+        coordinator.cleanup(&mut io).unwrap();
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1,
+            "the full retry must not resume twice"
         );
+        assert!(coordinator.cleaned);
     }
 
     #[test]

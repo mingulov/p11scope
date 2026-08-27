@@ -336,16 +336,17 @@ fn assert_owned_run_pause_internal_contract(
     {
         return Err("Task 7 machinery must remain internal and owned-child-only".into());
     }
+    let timed_dequeue = contract_section(pause, "fn timed_dequeue(", "fn fail_cycle(")?;
     require_before(
-        pause,
-        "let before_ns = io.now_ns()?;",
-        "let item = io.dequeue()?;",
+        timed_dequeue,
+        "let before_ns = io.now_ns().map_err(TimedDequeueError::Failure)?;",
+        "let item = io.dequeue().map_err(TimedDequeueError::Failure)?;",
         "clock before each discovery dequeue",
     )?;
     require_before(
-        pause,
-        "let item = io.dequeue()?;",
-        "let after_ns = io.now_ns()?;",
+        timed_dequeue,
+        "let item = io.dequeue().map_err(TimedDequeueError::Failure)?;",
+        "let after_ns = io.now_ns().map_err(TimedDequeueError::Failure)?;",
         "clock after each discovery dequeue",
     )
 }

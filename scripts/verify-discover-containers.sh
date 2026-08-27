@@ -140,16 +140,50 @@ PY
 
 [ "${1-}" != "--self-test" ] || { [ "$#" -eq 1 ] || exit 2; self_test; }
 
+[ "$#" -eq 2 ] && [ "$1" = --lane14-facts ] || {
+    echo "usage: $0 --self-test | --lane14-facts ABSENT_ARTIFACTS_FILE" >&2
+    exit 2
+}
+LANE14_FACTS=$2
+LANE14_ARTIFACTS=${LANE14_FACTS%/*}
+[ "${LANE14_FACTS##*/}" = discover.facts ] || exit 1
+[ "${LANE14_ARTIFACTS##*/}" = artifacts ] || exit 1
+[ -d "$LANE14_ARTIFACTS" ] && [ ! -L "$LANE14_ARTIFACTS" ] || exit 1
+[ "$(stat -Lc %u:%a "$LANE14_ARTIFACTS")" = "$(id -u):700" ] || exit 1
+[ ! -e "$LANE14_FACTS" ] && [ ! -L "$LANE14_FACTS" ] || exit 1
+umask 077
+: > "$LANE14_FACTS"
+chmod 600 "$LANE14_FACTS"
+LANE14_FACTS_ID=$(stat -Lc %d:%i "$LANE14_FACTS")
+printf 'facts_identity\t%s\nstarted_utc\t%s\n' "$LANE14_FACTS_ID" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LANE14_FACTS"
+DISCOVER_WORK=${P11SCOPE_TASK4_WORK:-target}/discover
+mkdir -m 700 -p "$DISCOVER_WORK"
+
 TOKEN=$$
 GLIBC_BUILD="p11scope-discover-glibc-build-$TOKEN"
 GLIBC_RUN="p11scope-discover-glibc-run-$TOKEN"
 MUSL_BUILD="p11scope-discover-musl-build-$TOKEN"
+GLIBC_BUILD_ID=
+GLIBC_RUN_ID=
+MUSL_BUILD_ID=
 cleanup() {
     status=$?
     trap - EXIT INT TERM
-    timeout --signal=TERM --kill-after=5s 30s \
-        docker rm -f "$GLIBC_BUILD" "$GLIBC_RUN" "$MUSL_BUILD" \
-        >/dev/null 2>&1 || true
+    for owned_id in "$GLIBC_BUILD_ID" "$GLIBC_RUN_ID" "$MUSL_BUILD_ID"; do
+        [ -z "$owned_id" ] || timeout --signal=TERM --kill-after=5s 30s \
+            docker rm -f "$owned_id" >/dev/null 2>&1 || status=1
+    done
+    if [ "$(stat -Lc %d:%i "$LANE14_FACTS" 2>/dev/null)" != "$LANE14_FACTS_ID" ]; then
+        status=1
+    else
+        for owned_id in "$GLIBC_BUILD_ID" "$GLIBC_RUN_ID" "$MUSL_BUILD_ID"; do
+            [ -z "$owned_id" ] || if docker inspect "$owned_id" >/dev/null 2>&1; then status=1; fi
+        done
+        printf 'cleanup_query\tcontainers-absent\nended_utc\t%s\nchild_exit\t%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$status" >> "$LANE14_FACTS" || status=1
+        sync -f "$LANE14_FACTS" 2>/dev/null || status=1
+    fi
     exit "$status"
 }
 . scripts/cleanup-traps.sh
@@ -161,20 +195,23 @@ timeout --signal=TERM --kill-after=5s 300s docker pull -q rust:1.88.0-alpine
 # Vendored so container builds need no network (sandbox git quirks).
 # The vendor config is rewritten with absolute /src paths because it is
 # copied into $CARGO_HOME inside the containers.
-mkdir -p target/vendor
+mkdir -p "$DISCOVER_WORK/vendor"
 timeout --signal=TERM --kill-after=5s 600s \
-    cargo +1.88 vendor --locked target/vendor/src > target/vendor/config.toml
-sed 's|directory = "|directory = "/src/|' target/vendor/config.toml > target/vendor/config.container.toml
+    cargo +1.88 vendor --locked "$DISCOVER_WORK/vendor/src" > "$DISCOVER_WORK/vendor/config.toml"
+sed 's|directory = ".*"|directory = "/receipt/vendor/src"|' \
+    "$DISCOVER_WORK/vendor/config.toml" > "$DISCOVER_WORK/vendor/config.container.toml"
 
 echo "=== glibc: build in rust:1.88.0-bookworm, run in ubuntu:24.04 ==="
-timeout --signal=TERM --kill-after=5s 600s docker run --name "$GLIBC_BUILD" --rm \
-    -v "$PWD:/src" -w /src rust:1.88.0-bookworm sh -ec '
+timeout --signal=TERM --kill-after=5s 600s docker run --name "$GLIBC_BUILD" \
+    -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src rust:1.88.0-bookworm sh -ec '
   export CARGO_HOME=/tmp/cargo
-  mkdir -p /tmp/cargo && cp target/vendor/config.container.toml /tmp/cargo/config.toml
-  cargo build --locked --release -p p11scope-discover --offline --target-dir /src/target/glibc-build'
-timeout --signal=TERM --kill-after=5s 300s docker run --name "$GLIBC_RUN" --rm \
+  mkdir -p /tmp/cargo && cp /receipt/vendor/config.container.toml /tmp/cargo/config.toml
+  cargo build --locked --release -p p11scope-discover --offline --target-dir /receipt/glibc-build'
+GLIBC_BUILD_ID=$(docker inspect -f '{{.Id}}' "$GLIBC_BUILD")
+printf 'container_glibc_build\t%s\n' "$GLIBC_BUILD_ID" >> "$LANE14_FACTS"
+timeout --signal=TERM --kill-after=5s 300s docker run --name "$GLIBC_RUN" \
     -v "$PWD:/src:ro" \
-    -v "$PWD/target/glibc-build/release/p11scope-discover:/usr/local/bin/p11scope-discover:ro" \
+    -v "$DISCOVER_WORK/glibc-build/release/p11scope-discover:/usr/local/bin/p11scope-discover:ro" \
     ubuntu:24.04 sh -ec '
   apt-get update -q >/dev/null && apt-get install -qy gcc jq softhsm2 util-linux >/dev/null
   run_discover() {
@@ -189,21 +226,23 @@ timeout --signal=TERM --kill-after=5s 300s docker run --name "$GLIBC_RUN" --rm \
   run_discover --module /tmp/matrix.so -o /tmp/matrix.json
   jq -e -f /src/scripts/fixtures/discover-manifest.jq /tmp/matrix.json >/dev/null
   echo "ubuntu glibc: SoftHSM 68 + fixture 68/92/104 + alternate/null names OK"'
+GLIBC_RUN_ID=$(docker inspect -f '{{.Id}}' "$GLIBC_RUN")
+printf 'container_glibc_run\t%s\n' "$GLIBC_RUN_ID" >> "$LANE14_FACTS"
 
 echo "=== musl-dynamic: build + run in rust:1.88.0-alpine ==="
-timeout --signal=TERM --kill-after=5s 600s docker run --name "$MUSL_BUILD" --rm \
-    -v "$PWD:/src" -w /src rust:1.88.0-alpine sh -ec '
+timeout --signal=TERM --kill-after=5s 600s docker run --name "$MUSL_BUILD" \
+    -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src rust:1.88.0-alpine sh -ec '
   apk add -q musl-dev gcc softhsm file jq util-linux
   export CARGO_HOME=/tmp/cargo
-  mkdir -p /tmp/cargo && cp target/vendor/config.container.toml /tmp/cargo/config.toml
+  mkdir -p /tmp/cargo && cp /receipt/vendor/config.container.toml /tmp/cargo/config.toml
   export RUSTFLAGS="-C target-feature=-crt-static"
-  cargo build --locked --release -p p11scope-discover --offline --target-dir /src/target/musl-build
-  file /src/target/musl-build/release/p11scope-discover | grep -q "dynamically linked" \
+  cargo build --locked --release -p p11scope-discover --offline --target-dir /receipt/musl-build
+  file /receipt/musl-build/release/p11scope-discover | grep -q "dynamically linked" \
       || { echo "helper is NOT dynamic"; exit 1; }
-  ldd /src/target/musl-build/release/p11scope-discover
+  ldd /receipt/musl-build/release/p11scope-discover
   run_discover() {
     setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs \
-      /src/target/musl-build/release/p11scope-discover "$@"
+      /receipt/musl-build/release/p11scope-discover "$@"
   }
   run_discover --module /usr/lib/softhsm/libsofthsm2.so -o /tmp/m.json
   n=$(grep -c "\"name\": \"C_" /tmp/m.json)
@@ -213,5 +252,8 @@ timeout --signal=TERM --kill-after=5s 600s docker run --name "$MUSL_BUILD" --rm 
   run_discover --module /tmp/matrix.so -o /tmp/matrix.json
   jq -e -f /src/scripts/fixtures/discover-manifest.jq /tmp/matrix.json >/dev/null
   echo "alpine musl-dynamic: SoftHSM 68 + fixture 68/92/104 + alternate/null names OK"'
+MUSL_BUILD_ID=$(docker inspect -f '{{.Id}}' "$MUSL_BUILD")
+printf 'container_musl_build\t%s\n' "$MUSL_BUILD_ID" >> "$LANE14_FACTS"
 
 echo "=== container verification: ALL OK ==="
+printf 'oracle\tsofthsm-68-and-fixture-68-92-104\n' >> "$LANE14_FACTS"

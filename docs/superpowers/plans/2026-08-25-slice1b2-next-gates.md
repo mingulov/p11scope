@@ -99,6 +99,12 @@ cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings
 
 ## Task 4: Run the verify-then-amend gate round
 
+The independently reviewed
+[fixed 500 ms owned-pause amendment](../specs/2026-08-27-slice1b2-500ms-pause-amendment.md)
+passed its isolated two-kernel and host candidate-selection gates at
+`1098d7de655b0a727c60762cc1af46989d7ef46b`. Task 4 still starts with a new
+Lane 02 root; none of that candidate-selection evidence is reused here.
+
 - [x] Historical runtime sequencing, checker, and invocation work is complete
   at the exact committed identities recorded in the topology amendment above.
   Its immutable evidence recorded equal start/end commit, tree, cleanliness,

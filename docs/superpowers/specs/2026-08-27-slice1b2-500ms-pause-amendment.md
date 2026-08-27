@@ -2,8 +2,9 @@
 
 **Date:** 2026-08-27
 
-**Status:** Proposed; no source or runtime authority until independent Sol,
-Terra, and Luna review agrees and this amendment is committed.
+**Status:** Accepted for the reviewed candidate at
+`1098d7de655b0a727c60762cc1af46989d7ef46b`; this does not complete production
+Task 4, r3/9.2d, 9.3, or release gates.
 
 **Exact base:** `17c538ff6a73bf2aecd3ee539bee54732a964229`
 
@@ -131,6 +132,25 @@ amendment; their separate 100 ms constants and retained evidence are not
 changed. Kernel unit tests may continue to read that artifact's lifecycle shell
 as an unchanged contract fixture. Current product two-kernel authority comes
 only from the later 9.3 candidate campaign.
+
+## Disposition
+
+The fresh candidate-selection gates passed without retry:
+
+- Gate A passed on Jammy 5.15 and Noble 6.8;
+- Gate B passed 120/120 children across three cold boots per kernel, with 57
+  outcome A and 63 outcome B classifications over 183 accepted cycles;
+- every accepted cycle retained the exact 500,000,000 ns winner-relative
+  deadline; the largest observed resume-from-hook tail was 4.703646 ms;
+- the fresh host Lane 02 matrix passed 6/6 with 68 slots, 136/136 probes, exact
+  fixture counts plus one `C_GetFunctionList`, confirmed pause-enabled rows,
+  and terminal cleanup; and
+- independent Sol xhigh, Terra xhigh, and Luna review recomputed the raw
+  identities, cardinality, lifecycle, oracle, hashes, and privacy-negative
+  result and unanimously returned `PASS`.
+
+This accepts the fixed 500 ms candidate for the remaining fresh Task 4 round.
+It does not reuse the candidate-selection Lane 02 root as production evidence.
 
 ## Rejected alternatives
 

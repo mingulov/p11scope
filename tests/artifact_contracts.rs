@@ -616,7 +616,7 @@ fn embedded_symbols() -> String {
 #[test]
 fn official_build_is_safe_only() {
     let release = read("scripts/build-release.sh");
-    assert!(release.contains("OFFICIAL_TARGET=target/release-official"));
+    assert!(release.contains("OFFICIAL_TARGET=\"$WORK/release-official\""));
     let official = between(
         &release,
         "=== p11scope: isolated safe-only official static build ===",
@@ -636,6 +636,102 @@ fn official_build_is_safe_only() {
     ] {
         assert!(official.contains(marker), "official build misses {marker}");
     }
+}
+
+#[test]
+fn task4_receipt_lane14_release_work_is_private_and_single_owner() {
+    let release = read("scripts/build-release.sh");
+    let canaries = read("scripts/verify-canaries.sh");
+    let attach = read("scripts/verify-attach-e2e.sh");
+
+    for public_override in [
+        "P11SCOPE_TASK4_BODY",
+        "P11SCOPE_TASK4_DIST",
+        "P11SCOPE_TASK4_OFFICIAL_TARGET",
+    ] {
+        assert!(
+            !release.contains(public_override),
+            "release exposes public re-entry/path override {public_override}"
+        );
+    }
+    for relationship in [
+        "WORK=$TASK4_ROOT/work",
+        "DIST=\"$WORK/dist\"",
+        "OFFICIAL_TARGET=\"$WORK/release-official\"",
+        "CANARY_WORK=\"$WORK/canaries\"",
+        "ATTACH_WORK=$WORK",
+        "DISCOVER_BASE=$WORK",
+        "DISCOVER_WORK=\"$DISCOVER_BASE/discover\"",
+    ] {
+        assert!(
+            release.contains(relationship),
+            "release misses private path relationship {relationship}"
+        );
+    }
+    for invocation in [
+        "P11SCOPE_TASK4_WORK=\"$CANARY_WORK\" sh scripts/verify-canaries.sh",
+        "P11SCOPE_TASK4_WORK=\"$ATTACH_WORK\" sh scripts/verify-attach-e2e.sh",
+        "P11SCOPE_TASK4_WORK=\"$DISCOVER_BASE\" \\\n    sh scripts/verify-discover-containers.sh",
+        "\"$CANARY_WORK\"/feature-build/release/build/p11scope-*/out/p11scope-ebpf",
+    ] {
+        assert!(
+            release.contains(invocation),
+            "release misses private nested invocation {invocation}"
+        );
+    }
+    assert_eq!(release.matches("trap task4_finalize EXIT").count(), 1);
+    assert_eq!(release.matches("release_body_cleanup").count(), 2);
+    assert!(!release.contains(". scripts/cleanup-traps.sh"));
+    assert!(!release.contains("$PWD/$WORK"));
+
+    for (script, source, default) in [
+        ("verify-canaries", canaries, "target/canaries"),
+        ("verify-attach-e2e", attach, "target/e2e"),
+    ] {
+        assert!(
+            source.contains(&format!("WORK=${{P11SCOPE_TASK4_WORK-{default}}}")),
+            "{script} lost its standalone default"
+        );
+        assert!(
+            source.contains("case $WORK in /*) ;; *)"),
+            "{script} accepts a relative supplied work path"
+        );
+        assert!(
+            !source.contains("$PWD/$WORK"),
+            "{script} composes an absolute work path with cwd"
+        );
+    }
+
+    let fixture = tempfile::tempdir().expect("create Lane 14 poisoned-environment fixture");
+    let bin = fixture.path().join("bin");
+    let protected = fixture.path().join("protected");
+    let sentinel = protected.join("sentinel");
+    let tripwire = fixture.path().join("tripwire.log");
+    fs::create_dir(&bin).unwrap();
+    fs::create_dir(&protected).unwrap();
+    fs::write(&sentinel, b"must survive\n").unwrap();
+    fs::write(
+        bin.join("rm"),
+        b"#!/bin/sh\nprintf '%s\\n' rm >> \"$P11SCOPE_TASK4_TRIPWIRE_LOG\"\nexit 97\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("rm"), fs::Permissions::from_mode(0o700)).unwrap();
+    let output = Command::new("/bin/sh")
+        .arg("scripts/build-release.sh")
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("P11SCOPE_TASK4_BODY", "1")
+        .env("P11SCOPE_TASK4_WORK", protected.join("work"))
+        .env("P11SCOPE_TASK4_DIST", &protected)
+        .env("P11SCOPE_TASK4_OFFICIAL_TARGET", &protected)
+        .env("P11SCOPE_TASK4_TRIPWIRE_LOG", &tripwire)
+        .output()
+        .expect("run Lane 14 with poisoned public re-entry environment");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        !tripwire.exists(),
+        "poisoned rootless invocation reached rm"
+    );
+    assert_eq!(fs::read(&sentinel).unwrap(), b"must survive\n");
 }
 
 #[test]
@@ -2218,6 +2314,11 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         "fixture-cardinality-mutation-rejected",
         "static-smoke-68-68-136-exact-accepted",
         "static-smoke-cardinality-mutation-rejected",
+        "fixed-private-work-descendants-exact-accepted",
+        "caller-path-overrides-rejected-before-mutation",
+        "same-shell-single-finalizer-exact-accepted",
+        "cleanup-failure-upgrades-one-status-written-last",
+        "absolute-nested-work-and-legacy-defaults-exact-accepted",
     ];
     const LANE16_CASES: &[&str] = &[
         "never-68-68-136-one-timing-zero-loss-ambiguity-inflight-child-false-none-0-0-0-exact-accepted",

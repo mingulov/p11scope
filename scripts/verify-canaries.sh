@@ -5,7 +5,12 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-WORK=target/canaries
+WORK=${P11SCOPE_TASK4_WORK-target/canaries}
+if [ "${P11SCOPE_TASK4_WORK+set}" = set ]; then
+    case $WORK in /*) ;; *) echo "P11SCOPE_TASK4_WORK must be absolute" >&2; exit 2 ;; esac
+else
+    WORK=$(pwd -P)/$WORK
+fi
 
 assert_lanes() {
     case ${1-} in
@@ -1681,8 +1686,8 @@ run_lane() {
         "$WORK/$lane.observer.log" "$WORK/$lane.workload.log" \
         "$WORK/$lane".*.raw \
         "$WORK"/mapdump_*_"$lane".json "$WORK/mapdump_manifest_$lane.json"
-    "$WORK/canary_workload" "$PWD/$WORK/matrix-provider.so" matrix \
-        "$PWD/$WORK/$lane.ready" "$PWD/$WORK/$lane.go" \
+    "$WORK/canary_workload" "$WORK/matrix-provider.so" matrix \
+        "$WORK/$lane.ready" "$WORK/$lane.go" \
         > "$WORK/$lane.workload.log" 2>&1 &
     WPID=$!
     WORKLOAD_STARTTIME=$(process_starttime "$WPID") || {
@@ -1747,9 +1752,9 @@ run_lane() {
 
 echo "=== discover deterministic matrix providers ==="
 "$WORK/default-build/release/p11scope-discover" \
-    --module "$PWD/$WORK/matrix-provider.so" -o "$WORK/matrix-manifest.json"
+    --module "$WORK/matrix-provider.so" -o "$WORK/matrix-manifest.json"
 "$WORK/default-build/release/p11scope-discover" \
-    --module "$PWD/$WORK/privacy-provider.so" -o "$WORK/privacy-manifest.json"
+    --module "$WORK/privacy-provider.so" -o "$WORK/privacy-manifest.json"
 rm -f "$WORK"/mapdump_*.json "$WORK"/mapdump_manifest_*.json
 
 while read -r lane build kind; do
@@ -1781,7 +1786,7 @@ run_start_lane() {
         "$WORK/$start_lane.workload.log" "$WORK"/mapdump_*_"$start_lane".json \
         "$WORK/mapdump_manifest_$start_lane.json"
     ( while [ ! -f "$WORK/$start_lane.go" ]; do sleep 0.05; done
-      exec "$WORK/canary_workload" "$PWD/$WORK/privacy-provider.so" "$start_mode" ) \
+      exec "$WORK/canary_workload" "$WORK/privacy-provider.so" "$start_mode" ) \
         > "$WORK/$start_lane.workload.log" 2>&1 &
     WPID=$!
     WORKLOAD_STARTTIME=$(process_starttime "$WPID") || {

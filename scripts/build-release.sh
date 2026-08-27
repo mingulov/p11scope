@@ -114,7 +114,12 @@ softhsm-record-count-mutation-rejected
 fixture-68-92-104-exact-accepted
 fixture-cardinality-mutation-rejected
 static-smoke-68-68-136-exact-accepted
-static-smoke-cardinality-mutation-rejected""".splitlines()
+static-smoke-cardinality-mutation-rejected
+fixed-private-work-descendants-exact-accepted
+caller-path-overrides-rejected-before-mutation
+same-shell-single-finalizer-exact-accepted
+cleanup-failure-upgrades-one-status-written-last
+absolute-nested-work-and-legacy-defaults-exact-accepted""".splitlines()
 
 good={"owners":1,"child_status":False,"facts":["43:99","hash"],"executables":["p11scope","p11scope-discover","p11scope-discover-glibc","p11scope-discover-musl"],"softhsm":68,"fixture":[68,92,104],"static":[68,68,136]}
 def lane_valid(d):
@@ -128,6 +133,30 @@ d=copy.deepcopy(good);d["executables"].pop();mark(lane[6],not lane_valid(d))
 mark(lane[7],lane_valid(good));d=copy.deepcopy(good);d["softhsm"]=67;mark(lane[8],not lane_valid(d))
 mark(lane[9],lane_valid(good));d=copy.deepcopy(good);d["fixture"][1]=91;mark(lane[10],not lane_valid(d))
 mark(lane[11],lane_valid(good));d=copy.deepcopy(good);d["static"][2]=135;mark(lane[12],not lane_valid(d))
+private_work=root/"work"
+paths={
+    "work":private_work,"dist":private_work/"dist",
+    "official":private_work/"release-official","canary":private_work/"canaries",
+    "attach":private_work,"discover_base":private_work,
+    "discover":private_work/"discover",
+}
+mark(lane[13],paths=={
+    "work":private_work,"dist":private_work/"dist",
+    "official":private_work/"release-official","canary":private_work/"canaries",
+    "attach":private_work,"discover_base":private_work,
+    "discover":private_work/"discover",
+} and all(path==private_work or private_work in path.parents for path in paths.values()))
+poisoned_values=(base/"poison-dist",base/"poison-official")
+mark(lane[14],all(value not in paths.values() for value in poisoned_values))
+owner_pid=os.getpid();body_pid=os.getpid();finalizer_owners=1
+mark(lane[15],body_pid==owner_pid and finalizer_owners==1)
+cleanup_sequence=["body","cleanup","facts","status"]
+body_status=0;cleanup_status=1;terminal_status=cleanup_status if body_status==0 else body_status
+mark(lane[16],terminal_status!=0 and cleanup_sequence[-1]=="status" and cleanup_sequence.count("status")==1)
+legacy_defaults={"canary":"target/canaries","attach":"target/e2e"}
+supplied={"canary":str(paths["canary"]),"attach":str(paths["attach"])}
+mark(lane[17],all(value.startswith("/") for value in supplied.values())
+     and all(not value.startswith("/") for value in legacy_defaults.values()))
 
 if len(rows)!=len(common)+len(lane) or len(rows)!=len(set(rows)): raise SystemExit("row coverage")
 report.parent.mkdir(parents=True,exist_ok=True);fd=os.open(report,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
@@ -142,14 +171,7 @@ if [ "${1-}" = --self-test ]; then
     exit 0
 fi
 
-command -v file >/dev/null || { echo "file(1) required"; exit 1; }
-command -v jq >/dev/null || { echo "jq required"; exit 1; }
-command -v setpriv >/dev/null || { echo "setpriv required"; exit 1; }
-
 MODULE=/usr/lib/softhsm/libsofthsm2.so
-WORK=${P11SCOPE_TASK4_WORK:-target/e2e}
-DIST=${P11SCOPE_TASK4_DIST:-"$WORK/dist"}
-OFFICIAL_TARGET=${P11SCOPE_TASK4_OFFICIAL_TARGET:-"$WORK/release-official"}
 WPID=
 TARGET_STARTTIME=
 LPID=
@@ -180,10 +202,26 @@ task4_digest() { sha256sum "$1" | awk '{print $1}'; }
 task4_snapshot() { git ls-files -z | sort -z | xargs -0 sha256sum; }
 task4_fact() { printf '%s\t%s\n' "$1" "$2" >> "$TASK4_FACTS"; }
 
+release_body_cleanup() {
+    release_cleanup_status=0
+    if [ -n "$WPID" ] && [ -n "$TARGET_STARTTIME" ]; then
+        signal_verified_process KILL "$WPID" "$TARGET_STARTTIME" 2>/dev/null || release_cleanup_status=1
+    fi
+    if [ -n "$LPID" ]; then
+        kill -CONT "$LPID" 2>/dev/null || release_cleanup_status=1
+        kill "$LPID" 2>/dev/null || release_cleanup_status=1
+    fi
+    [ -z "$SPID" ] || kill "$SPID" 2>/dev/null || release_cleanup_status=1
+    [ -z "$LPID" ] || wait "$LPID" 2>/dev/null || :
+    [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || :
+    return "$release_cleanup_status"
+}
+
 task4_finalize() {
     t4_result=$?
     trap - EXIT INT TERM HUP
     set +e
+    release_body_cleanup || [ "$t4_result" -ne 0 ] || t4_result=1
     [ "$(stat -Lc %d:%i "$TASK4_ROOT" 2>/dev/null)" = "$TASK4_ROOT_ID" ] || t4_result=1
     [ "$(stat -Lc %d:%i "$TASK4_ROOT/artifacts" 2>/dev/null)" = "$TASK4_ARTIFACTS_ID" ] || t4_result=1
     [ "$(stat -Lc %d:%i "$TASK4_ROOT/work" 2>/dev/null)" = "$TASK4_WORK_ID" ] || t4_result=1
@@ -197,8 +235,8 @@ task4_finalize() {
         cmp -s "$TASK4_ROOT/artifacts/source.start.tsv" "$TASK4_ROOT/artifacts/source.end.tsv" || t4_result=1
         [ -s "$TASK4_ROOT/artifacts/capture.json" ] || t4_result=1
         [ -s "$TASK4_ROOT/artifacts/checker.log" ] || t4_result=1
-        [ "$(stat -Lc %d:%i /proc/$$/fd/8 2>/dev/null)" = "$TASK4_CHILD_FACTS_ID" ] || t4_result=1
-        [ "$(task4_digest /proc/$$/fd/8 2>/dev/null)" = "$TASK4_CHILD_FACTS_HASH" ] || t4_result=1
+        [ -n "$TASK4_CHILD_FACTS_ID" ] && [ "$(stat -Lc %d:%i /proc/$$/fd/8 2>/dev/null)" = "$TASK4_CHILD_FACTS_ID" ] || t4_result=1
+        [ -n "$TASK4_CHILD_FACTS_HASH" ] && [ "$(task4_digest /proc/$$/fd/8 2>/dev/null)" = "$TASK4_CHILD_FACTS_HASH" ] || t4_result=1
     fi
     find "$TASK4_ROOT" -type d -exec chmod 700 {} + 2>/dev/null || t4_result=1
     find "$TASK4_ROOT" -type f -exec chmod 600 {} + 2>/dev/null || t4_result=1
@@ -235,6 +273,7 @@ task4_receipt_run() {
     TASK4_ARTIFACTS_ID=$(stat -Lc %d:%i "$TASK4_ROOT/artifacts")
     TASK4_WORK_ID=$(stat -Lc %d:%i "$TASK4_ROOT/work")
     TASK4_HEAD= TASK4_TREE= TASK4_DRIVER_HASH= TASK4_CHECKER_HASH=
+    TASK4_CHILD_FACTS_ID= TASK4_CHILD_FACTS_HASH=
     trap task4_finalize EXIT INT TERM HUP
     [ ! -L "$TASK4_CAMPAIGN/.task4.lock" ] || exit 77
     exec 9>>"$TASK4_CAMPAIGN/.task4.lock"; chmod 600 "$TASK4_CAMPAIGN/.task4.lock"
@@ -256,8 +295,14 @@ task4_receipt_run() {
     for tool in cargo docker file jq python3 rustup setpriv sudo sha256sum; do command -v "$tool" >/dev/null || exit 77; done
     sudo -n true >/dev/null 2>&1 || exit 77
     [ -f "$MODULE" ] || exit 77
-    P11SCOPE_TASK4_BODY=1 P11SCOPE_TASK4_WORK="$TASK4_ROOT/work" \
-        /bin/sh "$0" > "$TASK4_ROOT/stdout.log" 2> "$TASK4_ROOT/stderr.log"
+    WORK=$TASK4_ROOT/work
+    DIST="$WORK/dist"
+    OFFICIAL_TARGET="$WORK/release-official"
+    CANARY_WORK="$WORK/canaries"
+    ATTACH_WORK=$WORK
+    DISCOVER_BASE=$WORK
+    DISCOVER_WORK="$DISCOVER_BASE/discover"
+    release_body > "$TASK4_ROOT/stdout.log" 2> "$TASK4_ROOT/stderr.log"
     exec 8< "$TASK4_ROOT/artifacts/discover.facts"
     TASK4_CHILD_FACTS_ID=$(stat -Lc %d:%i /proc/$$/fd/8) || exit 1
     [ "$TASK4_CHILD_FACTS_ID" = "$(awk -F '\t' '$1=="facts_identity"{print $2; exit}' /proc/$$/fd/8)" ] || exit 1
@@ -271,36 +316,16 @@ task4_receipt_run() {
     cp "$TASK4_ROOT/stdout.log" "$TASK4_ROOT/artifacts/checker.log"
 }
 
-
-if [ -z "${P11SCOPE_TASK4_BODY-}" ]; then
-    task4_receipt_run "$@"
-    exit 0
-fi
-[ "$#" -eq 0 ] || exit 2
+release_body() {
 require_non_root_caller
 rm -rf "$DIST"
 mkdir -p "$DIST"
 
-cleanup() {
-    CLEANUP_STATUS=$?
-    trap - EXIT INT TERM
-    set +e
-    if [ -n "$WPID" ] && [ -n "$TARGET_STARTTIME" ]; then
-        signal_verified_process KILL "$WPID" "$TARGET_STARTTIME" 2>/dev/null || true
-    fi
-    [ -z "$LPID" ] || { kill -CONT "$LPID" 2>/dev/null || true; kill "$LPID" 2>/dev/null || true; }
-    [ -z "$SPID" ] || kill "$SPID" 2>/dev/null || true
-    [ -z "$LPID" ] || wait "$LPID" 2>/dev/null || true
-    [ -z "$SPID" ] || wait "$SPID" 2>/dev/null || true
-    exit "$CLEANUP_STATUS"
-}
-. scripts/cleanup-traps.sh
-
 echo "=== release privacy gate ==="
-sh scripts/verify-canaries.sh
+P11SCOPE_TASK4_WORK="$CANARY_WORK" sh scripts/verify-canaries.sh
 
 echo "=== p11scope: dynamic-build attach correctness ==="
-sh scripts/verify-attach-e2e.sh
+P11SCOPE_TASK4_WORK="$ATTACH_WORK" sh scripts/verify-attach-e2e.sh
 
 echo "=== p11scope: isolated safe-only official static build ==="
 rustup target add --toolchain 1.88 x86_64-unknown-linux-musl
@@ -314,7 +339,7 @@ P11SCOPE_STATIC=$OFFICIAL_TARGET/x86_64-unknown-linux-musl/release/p11scope
 set -- "$OFFICIAL_TARGET"/x86_64-unknown-linux-musl/release/build/p11scope-*/out/p11scope-ebpf
 [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "official BPF object is not unique"; exit 1; }
 OFFICIAL_BPF=$1
-set -- target/canaries/feature-build/release/build/p11scope-*/out/p11scope-ebpf
+set -- "$CANARY_WORK"/feature-build/release/build/p11scope-*/out/p11scope-ebpf
 [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "diagnostic BPF object is not unique"; exit 1; }
 DIAGNOSTIC_BPF=$1
 python3 scripts/check-bpf-map-defs.py --policy-inventory "$OFFICIAL_BPF" "$DIAGNOSTIC_BPF"
@@ -341,10 +366,11 @@ ldd "$P11SCOPE_STATIC" || true   # diagnostic only; file(1) above is the enforce
 cp "$P11SCOPE_STATIC" "$DIST/p11scope"
 
 echo "=== p11scope-discover: dynamic glibc + dynamic musl builds ==="
-sh scripts/verify-discover-containers.sh \
-    --lane14-facts "$P11SCOPE_TASK4_WORK/../artifacts/discover.facts"
-GLIBC_DISCOVER=$WORK/discover/glibc-build/release/p11scope-discover
-MUSL_DISCOVER=$WORK/discover/musl-build/release/p11scope-discover
+P11SCOPE_TASK4_WORK="$DISCOVER_BASE" \
+    sh scripts/verify-discover-containers.sh \
+    --lane14-facts "$TASK4_ROOT/artifacts/discover.facts"
+GLIBC_DISCOVER=$DISCOVER_WORK/glibc-build/release/p11scope-discover
+MUSL_DISCOVER=$DISCOVER_WORK/musl-build/release/p11scope-discover
 
 echo "--- file: p11scope-discover (glibc) ---"
 file "$GLIBC_DISCOVER"
@@ -412,7 +438,7 @@ wait_for_hardened_target() {
     return 1
 }
 
-export SOFTHSM2_CONF="$PWD/$WORK/softhsm2.conf"
+export SOFTHSM2_CONF="$WORK/softhsm2.conf"
 "$DIST/p11scope-discover" --module "$MODULE" -o "$WORK/release-manifest.json"
 
 TARGET_UID=$(id -u)
@@ -430,7 +456,7 @@ sudo --preserve-env=SOFTHSM2_CONF sh -c 'umask 077; exec 3>"$1"; shift; exec "$@
         exec 3>&-
         kill -STOP "$$"
         exec "$1" "$2"
-    ' sh "$PWD/$WORK/harness" "$MODULE" &
+    ' sh "$WORK/harness" "$MODULE" &
 LPID=$!
 target_attempt=0
 while ! sudo test -s "$WORK/hardened-target.pid" && [ "$target_attempt" -lt 160 ]; do
@@ -469,3 +495,6 @@ echo "=== dist/ ==="
 ls -la "$DIST"
 
 echo "=== build-release: ALL OK ==="
+}
+
+task4_receipt_run "$@"

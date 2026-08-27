@@ -149,6 +149,10 @@ pub(crate) trait PauseIo {
         Ok(true)
     }
 
+    fn original_exited(&mut self) -> Result<bool, String> {
+        Ok(false)
+    }
+
     fn ring_loss(&mut self) -> Result<u64, String> {
         Ok(0)
     }
@@ -794,6 +798,9 @@ impl PauseCoordinator {
         if let Err(error) = io.resume() {
             return self.fail_cycle(io, error, true);
         }
+        if let Err(error) = self.observe_resumed(io, deadline, install_successor) {
+            return self.fail_cycle(io, error, true);
+        }
         self.epoch.resume_succeeded = true;
         self.counters.confirmed = self.counters.confirmed.saturating_add(1);
         self.attempt_open = false;
@@ -961,6 +968,55 @@ impl PauseCoordinator {
             return Err("task set changed or was not entirely stopped".into());
         }
         Ok(now)
+    }
+
+    fn observe_resumed(
+        &self,
+        io: &mut impl PauseIo,
+        deadline: u64,
+        install_successor: bool,
+    ) -> Result<(), String> {
+        loop {
+            if !io.same_generation(self.pid, self.generation)? {
+                return Err("owned child generation changed after resume".into());
+            }
+            let authorization = io.authorization()?;
+            if install_successor && authorization == Some(PAUSE_REQUESTED) {
+                if io.now_ns()? > deadline {
+                    return Err("pause resume observation deadline crossed".into());
+                }
+                return Ok(());
+            }
+            let resting = if install_successor {
+                Some(PAUSE_ARMED)
+            } else {
+                None
+            };
+            if authorization != resting {
+                return Err("pause authorization did not reach the expected resting state".into());
+            }
+            if io.original_exited()? {
+                if io.now_ns()? > deadline {
+                    return Err("pause resume observation deadline crossed".into());
+                }
+                return Ok(());
+            }
+            let states = io.task_states(self.pid)?;
+            let now = io.now_ns()?;
+            if now > deadline {
+                return Err("pause resume observation deadline crossed".into());
+            }
+            if states.keys().ne(self.expected_tasks.keys()) {
+                return Ok(());
+            }
+            if states.values().any(|state| *state != b'T') {
+                return Ok(());
+            }
+            if now == deadline {
+                return Err("pause resume observation deadline crossed".into());
+            }
+            io.wait_one_ms()?;
+        }
     }
 
     fn timed_dequeue(
@@ -1526,6 +1582,10 @@ impl PauseIo for SessionPauseIo<'_> {
         owned_generation_retained(self.child)
     }
 
+    fn original_exited(&mut self) -> Result<bool, String> {
+        self.child.pin().original_exited()
+    }
+
     fn ring_loss(&mut self) -> Result<u64, String> {
         self.session
             .counter_snapshot()
@@ -1797,6 +1857,12 @@ mod tests {
         fail_wait: bool,
         cancelled: bool,
         same_generation: bool,
+        same_generation_results: VecDeque<Result<bool, String>>,
+        original_exited: bool,
+        resume_authorization: Option<Option<u64>>,
+        resumed: bool,
+        post_resume_all_stopped: bool,
+        post_resume_now: VecDeque<Result<u64, String>>,
         ring_losses: VecDeque<Result<u64, String>>,
         fallback_ring_loss: u64,
         revalidation_required_complete: bool,
@@ -1830,6 +1896,12 @@ mod tests {
                 fail_wait: false,
                 cancelled: false,
                 same_generation: true,
+                same_generation_results: VecDeque::new(),
+                original_exited: false,
+                resume_authorization: None,
+                resumed: false,
+                post_resume_all_stopped: false,
+                post_resume_now: VecDeque::new(),
                 ring_losses: VecDeque::new(),
                 fallback_ring_loss: 0,
                 revalidation_required_complete: true,
@@ -1847,6 +1919,14 @@ mod tests {
 
     impl PauseIo for FakeIo {
         fn now_ns(&mut self) -> Result<u64, String> {
+            if self.resumed
+                && let Some(now) = self.post_resume_now.pop_front()
+            {
+                if let Ok(now) = now {
+                    self.fallback_now = now;
+                }
+                return now;
+            }
             match self.now.pop_front() {
                 Some(Ok(now)) => {
                     self.fallback_now = now;
@@ -1870,12 +1950,22 @@ mod tests {
         }
 
         fn task_states(&mut self, _: u32) -> Result<BTreeMap<u32, u8>, String> {
-            self.states.pop_front().unwrap_or_else(|| Ok(stopped()))
+            self.states.pop_front().unwrap_or_else(|| {
+                if self.resumed && !self.post_resume_all_stopped {
+                    Ok([(41, b'R'), (42, b'T')].into_iter().collect())
+                } else {
+                    Ok(stopped())
+                }
+            })
         }
 
         fn dequeue(&mut self) -> Result<Option<DiscoveryItem>, String> {
             self.events.push("dequeue");
-            self.queue.pop_front().unwrap_or(Ok(None))
+            let item = self.queue.pop_front().unwrap_or(Ok(None));
+            if matches!(item, Ok(Some(DiscoveryItem::Record(_)))) {
+                self.resumed = false;
+            }
+            item
         }
 
         fn arm(&mut self) -> Result<(), String> {
@@ -1970,6 +2060,10 @@ mod tests {
             if self.fail_resume {
                 Err("resume".into())
             } else {
+                self.resumed = true;
+                if let Some(authorization) = self.resume_authorization {
+                    self.authorization = authorization;
+                }
                 Ok(())
             }
         }
@@ -1984,7 +2078,13 @@ mod tests {
         }
 
         fn same_generation(&mut self, _: u32, _: u64) -> Result<bool, String> {
-            Ok(self.same_generation)
+            self.same_generation_results
+                .pop_front()
+                .unwrap_or(Ok(self.same_generation))
+        }
+
+        fn original_exited(&mut self) -> Result<bool, String> {
+            Ok(self.original_exited)
         }
 
         fn ring_loss(&mut self) -> Result<u64, String> {
@@ -2160,6 +2260,221 @@ mod tests {
         no_epoch.service(&mut ordinary).unwrap();
         assert_eq!(no_epoch.counters(), PauseCounters::default());
         assert!(!ordinary.events.contains(&"resume"));
+    }
+
+    #[test]
+    fn final_resume_all_stopped_to_deadline_is_lifecycle_fatal_not_partial() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.post_resume_all_stopped = true;
+        io.resume_authorization = Some(None);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.cycles = 1;
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(error.lifecycle());
+        assert_eq!(
+            coordinator.counters(),
+            PauseCounters {
+                attempts: 1,
+                confirmed: 0,
+                partial: 0,
+            }
+        );
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn successor_requested_after_resume_confirms_even_while_tasks_remain_stopped() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.resume_authorization = Some(Some(PAUSE_REQUESTED));
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn final_resume_with_a_running_task_and_no_authorization_confirms() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.resume_authorization = Some(None);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.cycles = 1;
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+    }
+
+    #[test]
+    fn final_resume_authorization_mismatch_is_lifecycle_fatal() {
+        for authorization in [Some(PAUSE_REQUESTED), Some(999)] {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            io.resume_authorization = Some(authorization);
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.cycles = 1;
+            coordinator.arm_for_test();
+
+            let error = coordinator.service(&mut io).unwrap_err();
+
+            assert!(error.lifecycle(), "authorization {authorization:?}");
+            assert_eq!(
+                coordinator.counters(),
+                PauseCounters {
+                    attempts: 1,
+                    confirmed: 0,
+                    partial: 0,
+                }
+            );
+            assert_eq!(
+                io.events.iter().filter(|event| **event == "resume").count(),
+                1,
+                "authorization {authorization:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn original_generation_exit_confirms_after_resume() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.post_resume_all_stopped = true;
+        io.resume_authorization = Some(None);
+        io.original_exited = true;
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.cycles = 1;
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+    }
+
+    #[test]
+    fn generation_mismatch_after_resume_is_lifecycle_fatal() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.resume_authorization = Some(None);
+        io.same_generation_results = VecDeque::from([Ok(true), Ok(false)]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.cycles = 1;
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(error.lifecycle());
+        assert_eq!(
+            coordinator.counters(),
+            PauseCounters {
+                attempts: 1,
+                confirmed: 0,
+                partial: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn resume_observation_witnesses_are_bounded_by_the_existing_deadline() {
+        for (name, cycles, authorization, exited, now, all_stopped, confirms) in [
+            (
+                "requested-after-deadline",
+                0,
+                Some(Some(PAUSE_REQUESTED)),
+                false,
+                100_000_011,
+                false,
+                false,
+            ),
+            (
+                "exit-after-deadline",
+                1,
+                Some(None),
+                true,
+                100_000_011,
+                true,
+                false,
+            ),
+            (
+                "running-at-deadline",
+                1,
+                Some(None),
+                false,
+                100_000_010,
+                false,
+                true,
+            ),
+        ] {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            io.resume_authorization = authorization;
+            io.original_exited = exited;
+            io.post_resume_all_stopped = all_stopped;
+            io.post_resume_now = VecDeque::from([Ok(now)]);
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.cycles = cycles;
+            coordinator.arm_for_test();
+
+            let result = coordinator.service(&mut io);
+
+            assert_eq!(result.is_ok(), confirms, "{name}: {result:?}");
+            assert_eq!(
+                coordinator.counters().confirmed,
+                u64::from(confirms),
+                "{name}"
+            );
+            assert_eq!(coordinator.counters().partial, 0, "{name}");
+        }
+    }
+
+    #[test]
+    fn changed_task_set_after_resume_is_a_valid_execution_witness() {
+        for tasks in [
+            [(41, b'R'), (42, b'T'), (43, b'R')].into_iter().collect(),
+            [(41, b'R')].into_iter().collect(),
+        ] {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            io.resume_authorization = Some(None);
+            io.states = VecDeque::from([Ok(stopped()), Ok(stopped()), Ok(stopped()), Ok(tasks)]);
+            io.post_resume_now = VecDeque::from([Ok(100_000_009)]);
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.cycles = 1;
+            coordinator.arm_for_test();
+
+            coordinator.service(&mut io).unwrap();
+
+            assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        }
+    }
+
+    #[test]
+    fn all_stopped_at_the_resume_deadline_fails_without_waiting_past_it() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.post_resume_all_stopped = true;
+        io.resume_authorization = Some(None);
+        io.post_resume_now = VecDeque::from([Ok(100_000_010)]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.cycles = 1;
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(error.lifecycle());
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "wait").count(),
+            2
+        );
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
     }
 
     /// A leader-exit record is produced *after* the arm and still carries the

@@ -187,6 +187,9 @@ struct CaptureHistory {
     tables: BTreeMap<TableOccurrence, plan::TableSummary>,
     skips: BTreeMap<DecodedOccurrence, Skipped>,
     losses: BTreeMap<(String, String), Skipped>,
+    /// Scan gaps contradicted by a later same-path nonempty table; exact keys
+    /// keep persistent counters from resurrecting them after that table retires.
+    scan_gap_tombstones: BTreeSet<(String, String)>,
     refusals: BTreeMap<plan::ModuleId, Skipped>,
     fallbacks: BTreeMap<(u32, u32), render::ManifestObjectFallback>,
     corroboration_tombstones: BTreeSet<plan::ModuleId>,
@@ -742,11 +745,23 @@ impl CaptureFacts {
             }
         }
 
+        let retired_scan_gaps: Vec<_> = history
+            .losses
+            .iter()
+            .filter(|(_, skipped)| scan_gap_this_capture_attached(&plan.modules, skipped))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in retired_scan_gaps {
+            history.losses.remove(&key);
+            history.scan_gap_tombstones.insert(key);
+        }
         for skipped in &counters.object_skips {
-            history
-                .losses
-                .entry((skipped.subject.clone(), skipped.reason.clone()))
-                .or_insert_with(|| skipped.clone());
+            let key = (skipped.subject.clone(), skipped.reason.clone());
+            if scan_gap_this_capture_attached(&plan.modules, skipped) {
+                history.scan_gap_tombstones.insert(key);
+            } else if !history.scan_gap_tombstones.contains(&key) {
+                history.losses.entry(key).or_insert_with(|| skipped.clone());
+            }
         }
         for (object, refused) in plan.refused_modules() {
             let id = self.module_id_for_object(pinned, object)?;
@@ -2382,9 +2397,9 @@ fn record_object_skips(plan: &mut plan::AttachPlan, skips: &[Skipped]) {
     // re-judged too: the plan's skip list is only rebuilt when its sources are.
     let modules = std::mem::take(&mut plan.modules);
     plan.skipped
-        .retain(|skip| !empty_scan_this_capture_attached(&modules, skip));
+        .retain(|skip| !scan_gap_this_capture_attached(&modules, skip));
     for skip in skips {
-        if empty_scan_this_capture_attached(&modules, skip) || plan.skipped.contains(skip) {
+        if scan_gap_this_capture_attached(&modules, skip) || plan.skipped.contains(skip) {
             continue;
         }
         plan.skipped.push(skip.clone());
@@ -2392,17 +2407,16 @@ fn record_object_skips(plan: &mut plan::AttachPlan, skips: &[Skipped]) {
     plan.modules = modules;
 }
 
-/// The scan owes an empty module an answer — "no entry to skip, no attach to
-/// fail, no counter" (`discovery::scan`) — but only while the module is still
-/// empty. A provider that builds its `CK_FUNCTION_LIST` at run time is empty in
-/// file-backed data until it is built, so whether any one scan pass of a live
-/// target sees a table is a race; the module the capture ends up attaching a
-/// full table in has nothing left to show, and the record is contradicted by
-/// the same document. Judged by capture end, like §4.12 corroboration. Every
-/// other scan loss, and a module that really did stay empty, is untouched.
-fn empty_scan_this_capture_attached(modules: &[plan::ModuleSummary], skip: &Skipped) -> bool {
-    skip.reason
-        .contains("no function table was found in its file-backed data")
+/// A scan gap is contradicted only when the capture ends up attaching a full
+/// table for the same path. This covers a module that was not mapped and one
+/// that was mapped but empty in file-backed data; both can race a later load.
+/// Judged by capture end, like §4.12 corroboration. Every other scan loss, and
+/// a module that really did stay empty, is untouched.
+fn scan_gap_this_capture_attached(modules: &[plan::ModuleSummary], skip: &Skipped) -> bool {
+    (skip.reason == "not mapped in the target"
+        || skip
+            .reason
+            .contains("no function table was found in its file-backed data"))
         && modules.iter().any(|module| {
             module.path == skip.subject && module.tables.iter().any(|table| table.entries > 0)
         })
@@ -9009,6 +9023,87 @@ mod tests {
 
         engine.publish_current_capture_facts().unwrap();
         assert_eq!(engine.discovery.modules[0].tables.len(), 2);
+    }
+
+    #[test]
+    fn later_same_path_table_retires_pre_attachment_scan_losses() {
+        let (mut engine, _, _, _) = engine_with_overlay(43);
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        let attached_plan = engine.plan.clone();
+        let attached_pinned = engine.pinned.clone();
+        let attached_modules = engine.modules.clone();
+        let path = attached_modules[0].scanned.path.clone();
+        let not_mapped = Skipped {
+            subject: path.clone(),
+            reason: "not mapped in the target".into(),
+        };
+        let empty_scan = Skipped {
+            subject: path,
+            reason: "no function table was found in its file-backed data".into(),
+        };
+        let same_path_other = Skipped {
+            subject: attached_modules[0].scanned.path.clone(),
+            reason: "provider identity changed".into(),
+        };
+        let initial_set_timing = Skipped {
+            subject: "owned initial-set discovery".into(),
+            reason: "the empty timing catalog leaves initial-set capture unproven".into(),
+        };
+        let unmatched = Skipped {
+            subject: "/opt/other-p11.so".into(),
+            reason: "not mapped in the target".into(),
+        };
+        engine.counters.object_skips = vec![
+            not_mapped.clone(),
+            empty_scan.clone(),
+            same_path_other.clone(),
+            initial_set_timing.clone(),
+            unmatched.clone(),
+        ];
+        engine.plan = plan::build_from_reconciled_modules(&[]);
+        engine.pinned = PinnedObjects::empty();
+        engine.modules.clear();
+        engine.publish_current_capture_facts().unwrap();
+
+        engine.plan = attached_plan;
+        engine.pinned = attached_pinned;
+        engine.modules = attached_modules;
+        engine.publish_current_capture_facts().unwrap();
+
+        assert_eq!(
+            engine.plan.skipped,
+            vec![
+                unmatched.clone(),
+                same_path_other.clone(),
+                initial_set_timing.clone()
+            ],
+            "only non-scan-gap losses remain"
+        );
+        assert!(!engine.plan.skipped.contains(&not_mapped));
+        assert!(!engine.plan.skipped.contains(&empty_scan));
+
+        engine.plan = plan::build_from_reconciled_modules(&[]);
+        engine.pinned = PinnedObjects::empty();
+        engine.modules.clear();
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(
+            engine.plan.skipped,
+            vec![unmatched, same_path_other, initial_set_timing],
+            "a later empty publication does not resurrect retired scan gaps"
+        );
+        let rendered = engine
+            .plan
+            .skipped
+            .iter()
+            .map(render::capture_skipped_out)
+            .collect::<Vec<_>>();
+        assert_eq!(rendered.len(), 3);
+        assert!(rendered.iter().all(|skip| {
+            skip.name == "discovery subject" && skip.reason == "discovery unavailable"
+        }));
     }
 
     #[test]

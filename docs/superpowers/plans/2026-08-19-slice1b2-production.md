@@ -327,7 +327,9 @@ deadline, and one-winner/one-resume oracle cannot satisfy the new assertions.
 - [ ] Make cleanup idempotent and non-short-circuiting: resume obligations,
   link detach, owner removal, kill/reap, evidence close, VM cleanup, and final
   status are each attempted and each result retained.
-- [ ] Use one absolute 100 ms winner-relative deadline per accepted cycle; the
+- [ ] Use one absolute 500 ms winner-relative deadline per accepted cycle, as
+  accepted by the
+  [fixed 500 ms amendment](../specs/2026-08-27-slice1b2-500ms-pause-amendment.md); the
   second record never resets it.
 - [ ] Keep the fixture genuinely concurrent. A serialized/barrier-only control
   may diagnose scheduling but cannot satisfy the campaign oracle.
@@ -1050,14 +1052,14 @@ separate; do not create a framework or async runtime.
   attach set. Reservation loss before CAS consumes no authorization but becomes
   one finite attempt under explicit pause.
 - [ ] Two exact-set/all-`T` snapshots at least 1 ms apart, both no later than the
-  absolute 100 ms deadline, are mandatory. A changed task set, non-T state,
+  absolute 500 ms deadline, are mandatory. A changed task set, non-T state,
   `/proc` error, future timestamp, arithmetic overflow, or deadline crossing is
   finite failure.
 - [ ] Poll task state no more frequently than once per millisecond and never
   reset the winner-relative deadline after queue delivery or a second record.
 - [ ] While an authorization is `ARMED` or an owner is active, service the
   discovery queue on a monotonic 1 ms cadence so the ordinary capture refresh
-  interval cannot consume the 100 ms causal budget. This explicit-pause-only
+  interval cannot consume the 500 ms causal budget. This explicit-pause-only
   polling is the intentional Slice 1b-2 ceiling; add epoll only if later
   measurement shows it is needed.
 - [ ] `DiscoveryDrain` exposes one crate-private dequeue result exactly as

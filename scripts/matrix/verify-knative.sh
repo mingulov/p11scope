@@ -1647,6 +1647,7 @@ IMAGE_CLEANUP_ARMED=1
 CLUSTER_CLEANUP_ARMED=1
 
 echo "=== build product and unique Knative workload image ==="
+mkdir -p "${WORK%/*}"
 mkdir "$WORK"
 WORK_CREATED=1
 WORK_DEV_INO=$(stat -Lc '%d:%i' "$WORK")

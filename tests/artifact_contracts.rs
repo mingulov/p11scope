@@ -4575,6 +4575,13 @@ fn every_gate_script_self_tests_its_own_validator() {
 #[test]
 fn lane13_evidence_finalizes_only_after_owned_cleanup() {
     let gate = read("scripts/matrix/verify-knative.sh");
+    require_before(
+        &gate,
+        "mkdir -p \"${WORK%/*}\"",
+        "mkdir \"$WORK\"",
+        "lane-13 creates only the fixed parent before exclusively creating its token work root",
+    )
+    .unwrap();
     assert_eq!(
         gate.matches("python3 scripts/check-capture-evidence.py lane13-knative-metrics")
             .count(),

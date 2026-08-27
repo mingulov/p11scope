@@ -76,7 +76,8 @@ rows = {
 }
 required_dirs = {"bin", "rows", "tokens"} | {f"rows/{row}" for row in rows}
 required_files = {
-    "facts.log", "cargo-configs.tsv", "softhsm2.conf", "bin/p11scope", "bin/harness"
+    "facts.log", "cargo-configs.tsv", "softhsm2.conf", "bin/p11scope",
+    "bin/harness", "bin/harness-initial"
 }
 required_files |= {f"rows/{row}/observer.log" for row in rows}
 required_files |= {f"rows/{row}/checker.log" for row in rows}
@@ -284,17 +285,22 @@ U C_GetFunctionList(void **out) {
 }
 C
     gcc -std=c11 -O2 -Wall -Wextra -fPIC -shared -Wl,-z,defs \
+        -Wl,-soname,provider.so \
         -o "$self_root/provider.so" "$self_root/provider.c"
     gcc -O0 -o "$self_root/harness" spike/harness.c -ldl
+    gcc -O0 -Wl,--no-as-needed -Wl,-rpath,"$self_root" \
+        -o "$self_root/harness-initial" spike/harness.c "$self_root/provider.so" -ldl
+    INITIAL_DYNAMIC=$(readelf -d "$self_root/harness-initial") || exit 77
+    [ "$(printf '%s\n' "$INITIAL_DYNAMIC" \
+        | grep -Fc 'Shared library: [provider.so]')" -eq 1 ] || exit 77
     : > "$self_root/go"
     timeout 5 "$self_root/harness" "$self_root/provider.so" "$self_root/go" \
         > "$self_root/harness.log" 2>&1
     [ "$(grep -Fxc HARNESS_PROVIDER_MAPPED "$self_root/harness.log")" -eq 1 ]
     [ "$(grep -Fxc HARNESS_PROVIDER_LATE_LOAD "$self_root/harness.log")" -eq 1 ]
-    timeout 5 /usr/bin/env "LD_PRELOAD=$self_root/provider.so" \
-        "$self_root/harness" "$self_root/provider.so" "$self_root/go" \
-        > "$self_root/preloaded.log" 2>&1
-    [ "$(grep -Fxc HARNESS_PROVIDER_INITIAL_SET "$self_root/preloaded.log")" -eq 1 ]
+    timeout 5 "$self_root/harness-initial" "$self_root/provider.so" "$self_root/go" \
+        > "$self_root/initial.log" 2>&1
+    [ "$(grep -Fxc HARNESS_PROVIDER_INITIAL_SET "$self_root/initial.log")" -eq 1 ]
     marker_line=$(grep -n -F HARNESS_PROVIDER_MAPPED "$self_root/harness.log" | cut -d: -f1)
     ok_line=$(grep -n -F 'harness OK' "$self_root/harness.log" | cut -d: -f1)
     [ "$marker_line" -lt "$ok_line" ]
@@ -404,6 +410,7 @@ C
     : > "$ROOT/softhsm2.conf"
     : > "$ROOT/bin/p11scope"
     : > "$ROOT/bin/harness"
+    : > "$ROOT/bin/harness-initial"
     lane02_rows | while read -r row_id _; do
         install -d -m 700 "$ROOT/rows/$row_id"
         : > "$ROOT/rows/$row_id/observer.log"
@@ -474,6 +481,7 @@ CONF=$ROOT/softhsm2.conf
 CARGO_CONFIG_FACTS=$ROOT/cargo-configs.tsv
 P11SCOPE=$ROOT/bin/p11scope
 HARNESS=$ROOT/bin/harness
+HARNESS_INITIAL=$ROOT/bin/harness-initial
 RUN_FAILED=0
 INVOCATIONS=0
 FINALIZED=0
@@ -492,9 +500,9 @@ durable() {
 }
 
 harness_absent() {
-    sudo -n python3 - "$HARNESS" <<'PY'
+    sudo -n python3 - "$HARNESS" "$HARNESS_INITIAL" <<'PY'
 import os, sys
-wanted = os.fsencode(sys.argv[1])
+wanted = {os.fsencode(path) for path in sys.argv[1:]}
 for name in os.listdir('/proc'):
     if not name.isdigit():
         continue
@@ -503,15 +511,15 @@ for name in os.listdir('/proc'):
         exe = os.path.realpath(f'/proc/{name}/exe')
     except OSError:
         continue
-    if argv and argv[0] == wanted and os.fsencode(exe) == wanted:
+    if argv and argv[0] in wanted and os.fsencode(exe) == argv[0]:
         raise SystemExit(f"owned harness still running as pid {name}")
 PY
 }
 
 terminate_owned_harness() {
-    sudo -n python3 - "$HARNESS" <<'PY'
+    sudo -n python3 - "$HARNESS" "$HARNESS_INITIAL" <<'PY'
 import os, select, signal, sys
-wanted = os.fsencode(sys.argv[1])
+wanted = {os.fsencode(path) for path in sys.argv[1:]}
 
 def owned():
     result = []
@@ -524,7 +532,7 @@ def owned():
             exe = os.path.realpath(f'/proc/{name}/exe')
         except OSError:
             continue
-        if argv and argv[0] == wanted and os.fsencode(exe) == wanted:
+        if argv and argv[0] in wanted and os.fsencode(exe) == argv[0]:
             result.append((int(name), fd))
     return result
 
@@ -741,8 +749,20 @@ install -d -m 700 "$ROOT/build"
 cargo +1.88 build --locked --release --workspace --target-dir "$ROOT/build" || exit 1
 install -m 700 "$ROOT/build/release/p11scope" "$P11SCOPE"
 gcc -O0 -o "$HARNESS" spike/harness.c -ldl || exit 1
+MODULE_DIR=${MODULE%/*}
+gcc -O0 -Wl,--no-as-needed -Wl,-rpath,"$MODULE_DIR" \
+    -o "$HARNESS_INITIAL" spike/harness.c "$MODULE" -ldl || exit 1
+INITIAL_DYNAMIC=$(readelf -d "$HARNESS_INITIAL") || exit 77
+[ "$(printf '%s\n' "$INITIAL_DYNAMIC" \
+    | grep -Fc 'Shared library: [libsofthsm2.so]')" -eq 1 ] || exit 77
+HARNESS_INITIAL_LDD=$(ldd "$HARNESS_INITIAL") || exit 77
+INITIAL_MODULE_RESOLVED=$(printf '%s\n' "$HARNESS_INITIAL_LDD" \
+    | awk '$1=="libsofthsm2.so"{print $3; exit}') || exit 77
+[ -n "$INITIAL_MODULE_RESOLVED" ] || exit 77
+[ "$(realpath -e "$INITIAL_MODULE_RESOLVED")" = "$MODULE_REALPATH" ] || exit 77
 P11SCOPE_HASH=$(digest "$P11SCOPE")
 HARNESS_HASH=$(digest "$HARNESS")
+HARNESS_INITIAL_HASH=$(digest "$HARNESS_INITIAL")
 P11SCOPE_PROGRAM_HEADERS=$(readelf -l "$P11SCOPE") || exit 77
 INTERPRETER=$(printf '%s\n' "$P11SCOPE_PROGRAM_HEADERS" \
     | awk -F': ' '/Requesting program interpreter/{gsub(/[][]/, "", $2); print $2; exit}') || exit 77
@@ -757,6 +777,7 @@ LIBC_REALPATH=$(realpath -e "$LIBC") || exit 77
 LIBC_HASH=$(digest "$LIBC_REALPATH")
 fact p11scope_sha256 "$P11SCOPE_HASH"
 fact harness_sha256 "$HARNESS_HASH"
+fact harness_initial_sha256 "$HARNESS_INITIAL_HASH"
 fact interpreter_realpath "$INTERPRETER_REALPATH"
 fact interpreter_sha256 "$INTERPRETER_HASH"
 fact libc_realpath "$LIBC_REALPATH"
@@ -800,7 +821,7 @@ run_row() {
         "$P11SCOPE" run --module "$MODULE" --mode metrics --duration 30 \
         --kill-on-timeout --pause "$policy" -o "$output" --
     if [ "$load_kind" = initial-set ]; then
-        set -- "$@" /usr/bin/env "LD_PRELOAD=$MODULE" "$HARNESS" "$MODULE" "$go"
+        set -- "$@" "$HARNESS_INITIAL" "$MODULE" "$go"
     else
         set -- "$@" "$HARNESS" "$MODULE" "$go"
     fi
@@ -921,6 +942,7 @@ TRACKED_STATUS=$(git status --porcelain=v1 --untracked-files=no) || exit 1
 [ "$(digest "$MODULE")" = "$MODULE_HASH" ] || exit 1
 [ "$(digest "$P11SCOPE")" = "$P11SCOPE_HASH" ] || exit 1
 [ "$(digest "$HARNESS")" = "$HARNESS_HASH" ] || exit 1
+[ "$(digest "$HARNESS_INITIAL")" = "$HARNESS_INITIAL_HASH" ] || exit 1
 [ "$(digest "$CONF")" = "$CONFIG_HASH" ] || exit 1
 CARGO_CONFIG_NOW=$(cargo_config_snapshot) || exit 1
 CARGO_CONFIG_THEN=$(cat "$CARGO_CONFIG_FACTS") || exit 1

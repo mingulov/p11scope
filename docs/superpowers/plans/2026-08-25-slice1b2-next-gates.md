@@ -4,7 +4,16 @@
 
 **Goal:** Land the already-reviewed Slice 1b-2 fix6 documentation/validator delta, close the remaining gate-contract and runtime evidence gaps, and reach a fresh, independently reviewed runtime campaign without overstating UNRUN or artifact-only evidence.
 
-**Architecture:** Keep production Rust/BPF/privacy/schema behavior frozen during the next gate round. First land the exact five-file reviewed delta at the current implementation tip. Then express the already-specified Lane 13 contract directly—manifest-only discovery plus exactly one shared-overlay uncertainty and zero unavailable-discovery records—and run fresh current-tip evidence with durable resolved-input identities for the remaining applicable Task 4 lanes. The zero-unavailable PASS rule is Lane 13-only and applies only to a topology proposed for supported acceptance. Lane 13 instead uses its receipt-bound attempt-6 pre-r3 history and runs exactly once as the frozen-candidate 9.2d negative control; no current-tip Lane 13 evidence is sought. Historical A/B attribution remains an optional diagnostic, not a prerequisite for present product acceptance. Wire the capability-tier validator into the existing gate/CI contract, obtain an independent Sol review, and only then create a new frozen-input root for the serial 9.2d campaign. VM campaign work remains a separate privileged/non-production stage.
+**Architecture:** Production Rust/BPF/privacy/schema behavior remains frozen.
+The exact five-file delta and Lane 13 work described by Tasks 1–3 below are
+completed prerequisites, not current execution authority. Current Task 4
+authority is the exact four-document sealed-envelope amendment: the accepted
+decision report, receipt-closure plan, this qualification, and ROADMAP ruling.
+Lane 13 is not rerun in Task 4; its receipt-bound attempt-6 history is used only
+for the single frozen-candidate 9.2d negative control. Remaining Task 4 lanes
+record durable resolved-input identities under that amendment. Historical A/B
+attribution remains optional. The capability-tier integration is already
+complete; fresh r3 and the serial 9.2d/VM stages remain downstream.
 
 **Topology scope amendment (2026-08-27, Task 4):** The historical Lane 13
 checker/invocation work is complete at its exact committed identities:
@@ -99,11 +108,21 @@ cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings
 
 ## Task 4: Run the verify-then-amend gate round
 
+**Receipt qualification (2026-08-28):** Remaining Task 4 evidence is accepted
+only through the independently reviewed sealed-envelope contract in
+`2026-08-27-task4-receipt-closure.md`, as amended by the accepted architecture
+decision. The already frozen Lane 02 evidence is compatibility-checked and is
+not rerun in Task 4. Lane 13 history remains unamended and is not rerun here.
+The remaining order is 07, 09, 10, 11, 14, 16-never, 16-auto. This
+qualification changes no product Rust/BPF, public schema, privacy allowlist,
+lane oracle, r3, 9.2d, 9.3, 9.4, CI, or Task 10 order.
+
 The independently reviewed
 [fixed 500 ms owned-pause amendment](../specs/2026-08-27-slice1b2-500ms-pause-amendment.md)
 passed its isolated two-kernel and host candidate-selection gates at
-`1098d7de655b0a727c60762cc1af46989d7ef46b`. Task 4 still starts with a new
-Lane 02 root; none of that candidate-selection evidence is reused here.
+`1098d7de655b0a727c60762cc1af46989d7ef46b`. Task 4 starts by rehashing and
+compatibility-checking the already frozen Lane 02 root; it does not rerun Lane
+02. The remaining Task 4 executions start at Lane 07.
 
 - [x] Historical runtime sequencing, checker, and invocation work is complete
   at the exact committed identities recorded in the topology amendment above.
@@ -120,9 +139,10 @@ Lane 02 root; none of that candidate-selection evidence is reused here.
   Rust/BPF/privacy/schema/allowlist behavior.
 - [ ] For each external lane, durably record the bytes and resolved identities actually consumed: release files, base/workload/node/component image IDs and available digests, provider SHA-256/build ID, exact gate/helper/HEAD identities, tool versions, kernel, Docker daemon/storage driver, timestamps, and cleanup/quiescence. A result without this record is invalid, not PASS. This is current-environment-qualified evidence, not a frozen campaign or causal A/B claim.
 - [ ] Use a fresh evidence root and the exact authorized lane commands. Run
-  the remaining applicable Task 4 lanes serially in this order: lane 02, lane
-  07, lane 09, lane 10, lane 11, lane 14, then the lane-16 shape spot check;
-  Lane 13 has completed its pre-r3 negative history and is not rerun here.
+  the remaining applicable Task 4 lanes serially in this order: lane 07, lane
+  09, lane 10, lane 11, lane 14, then Lane 16 `never` and `auto`; Lane 02 is
+  compatibility-checked only, and Lane 13 has completed its pre-r3 negative
+  history and is not rerun here.
 - [ ] Preserve cleanup and quiescence evidence for every lane. Record public skips exactly once where the lane contract requires them.
 - [ ] Amend only fresh, reproduced mismatches:
   - lane 07 manifest-only versus scanned classification, if the new evidence reconfirms it;
@@ -147,7 +167,8 @@ Lane 02 root; none of that candidate-selection evidence is reused here.
   context, expected row cardinality, and full lane oracle. Zero, a second, or
   an outside-context projection is `NON-PASS`; it is not a generic discovery
   result and cannot be borrowed across lanes.
-- [ ] Lane 02 has exactly six attempts:
+- [ ] Compatibility-check the frozen Lane 02 evidence as exactly six attempts;
+  do not execute them again in Task 4:
   `(initial-set|dlopen) × (never|auto|always)`. Each Cartesian tuple is one
   distinct invocation and one row; ungated controls are excluded. A successful
   row exits zero with 68 table entries/slots, 136/136 entry-and-return probes,
@@ -234,6 +255,11 @@ bash scripts/verify-live-discovery-preflight.sh --self-test
 - [ ] Confirm the frozen campaign begins at zero attempts, and record source commit plus hashes for modified Step 2 scripts that are not fully frozen by the execution manifest.
 
 ## Task 8: Run 9.2d, then advance only on clean evidence
+
+This later frozen-candidate campaign is distinct from Task 4. It retains the
+existing 9.2d Lane 02 gate position and therefore runs fresh Lane 02 rows only
+after r3 is frozen; the Task 4 compatibility-only ruling does not remove or
+pre-execute that downstream gate.
 
 - [ ] Run the 9.2d sequence serially once, with exactly one gate run for each
   of 02, 07, 09, 10, 11, and 14, exactly six Lane 02 rows, exactly one

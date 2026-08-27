@@ -9,12 +9,13 @@ source-bound, terminal evidence without changing their product oracles, then
 run exactly once and serially: 07, 09, 10, 11, 14, Lane 16 `never`, Lane 16
 `auto`.
 
-**Architecture:** Keep evidence ownership inside each lane because only the
-lane can bind ephemeral container, process, cgroup, and build identities before
-cleanup destroys them. Reuse existing shell and Python oracles; add no generic
-controller, receipt library, public schema, or product behavior. Every modified
-normal driver consumes one absent private evidence root and owns one terminal
-status; the Lane 14 nested discover script owns facts only.
+**Architecture:** Use one gate-only sealed receipt envelope implemented by one
+private Python-stdlib helper. Existing lane checkers remain the domain oracles;
+the envelope validates only declaration equality, custody, provenance, resource
+lifecycle, replay isolation, privacy scanning, sealing, and terminal
+publication. Six committed lane contracts define the required inventory.
+Product Rust/BPF, public schemas, privacy policy, lane oracles, and runtime order
+do not change.
 
 **Tech Stack:** POSIX shell, existing Python 3/JQ oracles, Rust 1.88 edition
 2024 artifact contracts, Linux x86-64, `flock`, Docker/systemd/eBPF only in the
@@ -30,8 +31,10 @@ cardinalities, and `docs/superpowers/plans/ROADMAP.md` topology ruling.
 - Preserve `docs/privacy/allowlist-v1.md`; do not broaden capture or public
   evidence vocabulary.
 - Preserve Rust 1.88, edition 2024, and Linux x86-64-first support.
-- Modify no product Rust/BPF, Cargo manifest/lock/config/toolchain, schema,
-  checker, common shell library, cleanup helper, README, or public usage file.
+- Modify no product Rust/BPF, Cargo manifest/lock/config/toolchain, public
+  schema, privacy policy, common shell library, README, or public usage file.
+  A narrowly pinned replay-only checker adapter is permitted only under the
+  authoritative sealed-envelope amendment below.
 - Run at most one Cargo-heavy command at a time.
 - Runtime lanes stay `UNRUN` until this plan is reviewed, committed,
   implemented, verified, independently reviewed, and committed.
@@ -41,7 +44,496 @@ cardinalities, and `docs/superpowers/plans/ROADMAP.md` topology ruling.
   requested important-decision policy, focused Terra and Luna reviews must also
   agree before the plan and implementation gates advance.
 
-### Descriptor inheritance reconciliation (authoritative)
+## Accepted sealed-envelope amendment (2026-08-28; authoritative)
+
+The accepted
+[Task 4 Receipt Architecture Decision](../reports/2026-08-28-task4-receipt-architecture-decision.md)
+is incorporated here as normative implementation authority. If this section or
+the retained lane matrix conflicts with superseded receipt text, the decision
+and this section control.
+
+### Scope and files
+
+Create one private Python-stdlib helper, `scripts/task4-receipt.py`, and six
+committed contracts beneath `scripts/task4-contracts/`: `lane07.json`,
+`lane09.json`, `lane10.json`, `lane11.json`, `lane14.json`, and `lane16.json`.
+The six normal drivers keep lane-specific collection, immutable-identity
+cleanup, and their existing domain checkers, but replace their local receipt
+wrappers with the common envelope. `scripts/verify-discover-containers.sh` may
+retain only Lane 14 resource/artifact production and registration. No receipt
+helper or Rust test interprets PKCS #11 counts, lane facts, or PASS semantics.
+
+### Canonical bounds and schemas
+
+All JSON is UTF-8 with no surrogate code point, no float, and integer values
+only where the schema permits them. Parsing uses `json.loads` with a
+duplicate-rejecting `object_pairs_hook`, rejecting `parse_constant`, and a
+`parse_float` that rejects every float token. Generation uses
+`json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+allow_nan=False)`, followed by UTF-8 encoding and one LF. JSONL uses the same
+encoding, one LF-terminated object per record, and gap-free `seq` values
+starting at zero.
+
+- `contract.json` is at most 1 MiB.
+- `receipt.json`, `resources.jsonl`, and `artifacts.jsonl` are each at most
+  8 MiB and, where applicable, 4096 records.
+- Each JSONL record is at most 16 KiB; each string is at most 4096 UTF-8 bytes.
+- Labels match `[a-z][a-z0-9_.-]{0,63}`.
+- Retained paths match `[A-Za-z0-9._/-]{1,4096}`, are relative, contain no
+  empty, `.` or `..` component, and artifact paths begin with `artifacts/`.
+- SHA-256 values are exactly 64 lowercase hexadecimal characters.
+- Every artifact declaration has `1 <= max_bytes <= 4294967296`; no undeclared
+  retained file is permitted. `stdout.log`, `stderr.log`, and `checker.log` are
+  each at most 64 MiB; `verdict` and `status` are at most four bytes; and
+  `seal.sha256` is at most 16 MiB.
+
+A lane contract has exactly these top-level keys:
+
+```text
+artifacts, checkers, driver, environment, inputs, lane,
+privacy_surfaces, replay_adapter, resources, schema
+```
+
+`schema` is `p11scope-task4-contract-v1`; `lane` is one of
+`07|09|10|11|14|16`; `driver` references an input whose kind is `driver`.
+Arrays contain 0..4096 entries unless a tighter bound is stated and have
+exactly these fields:
+
+```text
+InputDecl: execution, kind, label, locator, origin, retained_path
+EnvironmentDecl: evidence, name, value
+CheckerDecl: argv, executable, label, role
+ArgToken: kind, value
+ReplayAdapterDecl: argv, checker, executable, label
+ResourceDecl: class, identity_scheme, label
+ArtifactDecl: checker_roles, label, max_bytes, path, privacy, producer
+PrivacySurfaceDecl: exclusions, scanner, target, target_kind
+```
+
+The declaration vocabulary is closed:
+
+- input `kind` is
+  `driver|source|checker|adapter|interpreter|dependency|tool|configuration`;
+  `origin` is `tracked|external-pinned|external-copied`; a tracked locator is a
+  repository-relative path and an external locator is absolute. A replay-
+  required checker, adapter, interpreter, script, or dependency always has a
+  caller-owned `nlink=1` retained copy at `inputs/LABEL`, even when tracked;
+  `retained_path` is that path. Other tracked or external-pinned collection
+  inputs use JSON null; other external-copied inputs use an `inputs/` path;
+- input `execution` is `none|direct|interpreter-argument`. A replay-required
+  direct binary is retained mode 0700 and may be a checker `executable`; an
+  interpreter-fed script is retained mode 0600, must appear as an input argv
+  token, and cannot be the executable. Every other retained input is mode 0600.
+  Contract validation rejects all other execution/mode combinations;
+- environment `name` matches `[A-Z][A-Z0-9_]{0,63}` and `evidence` is
+  `absent|literal|sha256|root-relative`; `value` is respectively JSON null, the
+  exact authorized string, a lowercase SHA-256, or a retained relative path;
+  the contract lists every consumed variable;
+- checker `role` is `domain|privacy`; `executable` references a checker,
+  adapter, or interpreter input; `argv` contains 1..512 tokens;
+- argument `kind` is `literal|artifact|input|common`; a literal is bounded
+  UTF-8 without NUL, artifact/input values reference labels, and common value
+  is exactly `checker.log|stdout.log|stderr.log`;
+- resource `class` is
+  `process|process-group|container|image|cgroup|bpf-link|bpf-map|mount|network|file|directory|token-store`;
+  `identity_scheme` is
+  `pid-starttime|sid-leader-starttime|container-id|image-id|cgroup-id|bpf-id|mount-id|netns-id|dev-ino`;
+- artifact `checker_roles` is the sorted unique list of checker labels that
+  must consume the artifact; `producer` references the driver input or a
+  resource label; `privacy` is `none|scan|structural-trace|quarantine-only`;
+- a privacy surface has target kind `artifact|common`; an artifact target
+  references one label, while a common target is one of the three common logs.
+  It references one privacy-role checker. `exclusions` is
+  `none|trace-pid-tid-positions`. The latter is legal only for trace artifacts
+  and means the structural scanner excludes exactly the two
+  PID/TID positions permitted by `allowlist-v1.md`, not whole lines or files.
+
+Identity schemes are fixed by class: process=`pid-starttime`,
+process-group=`sid-leader-starttime`, container=`container-id`, image=`image-id`,
+cgroup=`cgroup-id`, BPF link/map=`bpf-id`, mount=`mount-id`,
+network=`netns-id`, file/directory/token-store=`dev-ino`, and
+no other pairing is valid.
+
+`replay_adapter` contains zero or one declaration and its `checker` references
+one checker label. Every reference resolves inside the same contract. Labels
+and paths are unique; arrays are sorted by label or bytewise path. Runtime
+output cannot add, remove, or redefine a declaration. The contract fixes all
+required cardinalities.
+
+For each checker, expand argv deterministically: literal bytes are unchanged;
+an artifact becomes the root-relative declared path, an input becomes its
+descriptor-pinned or retained path, and a common token becomes that root-
+relative common path. The set
+of artifact labels appearing as `artifact` tokens, counting each exactly once,
+must equal the set of contract artifacts naming that checker in
+`checker_roles`. The adapter, when present, is included in this expansion but
+cannot change the equality. Checker output or runtime file-open observations
+may corroborate consumption but cannot define or shrink this required set.
+The privacy-surface set exactly equals artifacts whose privacy value is
+`scan|structural-trace`, union exactly one target for each of the three common
+logs. Each artifact scanner must also appear in that artifact's
+`checker_roles` and argv equality, and each common-log scanner argv names that
+common token exactly once.
+Exactly one privacy checker targets `checker.log`; it is the terminal log
+auditor described below.
+Every non-file live surface, including live `START` map state, is first retained
+as a declared bounded artifact; there is no live-state-only privacy target.
+`quarantine-only` can occur only in a
+nonzero failed receipt and can never contribute to status zero or promotion.
+
+Each resource-journal record is exactly one of:
+
+```text
+requested: class, label, locator, nonce, seq, state
+resolved: class, identity, label, nonce, resolution, seq, state
+cleanup: class, identity, label, nonce, result, seq, state
+absent: class, identity, label, nonce, query, result, seq, state
+```
+
+`nonce` is 128 random bits encoded as 32 lowercase hexadecimal characters.
+`identity` contains exactly `scheme,value`; `resolution` is
+`created|reconciled`; cleanup `result` is `removed|already-absent|failed`; and
+absent `result` is a JSON boolean.
+
+`state` is the literal record name. `locator` has exactly `kind,value`, with
+class-fixed kinds: process/process-group=`argv-sha256`, container/image/network
+=`name`, cgroup/mount/file/directory/token-store=`path`, and BPF link/map=`label`.
+Names/labels use the label grammar; paths use the retained-path grammar; hashes
+use the SHA-256 grammar. Identity `value` is a closed object by scheme:
+
+```text
+pid-starttime: pid,starttime
+sid-leader-starttime: leader_pid,leader_starttime,sid
+container-id|image-id|cgroup-id|bpf-id|mount-id|netns-id: id
+dev-ino: dev,ino
+```
+
+PIDs, starttimes, device numbers, and inode numbers are canonical positive
+integers; `sid` is a canonical positive integer; `id` is 1..4096 bytes matching `[A-Za-z0-9:._/-]+`. `query` has
+exactly `method,target`; method is fixed by scheme as
+`pidfd|session-snapshot|runtime-id|cgroupfs-id|bpf-id|mountinfo-id|netns-id|lstat-dev-ino`,
+and target exactly repeats the resolved identity value. No free-form identity,
+locator, or query field is accepted. The only successful transition is:
+
+```text
+pid-starttime -> pidfd
+sid-leader-starttime -> session-snapshot
+container-id|image-id -> runtime-id
+cgroup-id -> cgroupfs-id
+bpf-id -> bpf-id
+mount-id -> mountinfo-id
+netns-id -> netns-id
+dev-ino -> lstat-dev-ino
+```
+
+```text
+declared -> requested -> resolved(created|reconciled) -> cleanup -> absent(true)
+```
+
+`requested` is durable before creation and `resolved` before activation or
+handoff. A create-before-resolve crash may append `resolved(reconciled)` only
+when the nonce selects exactly one owned candidate. Otherwise the journal is an
+incomplete non-pass prefix and no mutable name authorizes deletion. Crash
+recovery is lane-owned; the helper validates records and never infers deletion.
+Status zero requires every declared resource to reach `absent(true)` exactly
+once with no duplicate, skipped, reordered, identity-changing, or later row.
+
+Each artifact-journal record has exactly:
+
+```text
+acquired, checker_roles, label, path, portable, producer, seq
+```
+
+`acquired` contains exactly `dev,gid,ino,mode,nlink,size,uid`; `portable`
+contains exactly `sha256,size`. Each artifact is a caller-owned mode-0600
+regular file with `nlink=1`, beneath the retained root, inside its declared
+bound. The declared and recorded artifact sets must be exactly equal.
+
+`receipt.json` has exactly these top-level keys:
+
+```text
+checks, contract, environment, git, inputs, invocation, lane, lock, schema,
+times
+```
+
+`schema` is `p11scope-task4-receipt-v1`; `lane` equals the contract.
+`contract` contains exactly `path,sha256`. `invocation` contains exactly
+`argv,cwd,gid,uid`. `git` contains exactly
+`clean_end,clean_start,head,tracked_sha256,tree`, with both cleanliness values
+true. `times` contains exactly `end_utc,start_utc` in canonical UTC RFC 3339.
+`environment` is a name-sorted exact-set array of records
+`evidence,name,value`; value is JSON null for absent, the authorized literal or
+lowercase SHA-256, or the retained relative path for root-relative. A
+root-relative value is opened beneath root FD 8 and identity-revalidated like
+an input. `inputs` is a label-sorted exact-set array of records
+`end,label,locator,retained,start`; start/end each contain exactly
+`dev,ino,mode,nlink,sha256,size`. `retained` is JSON null or exactly
+`path,sha256,size` and is mandatory when `retained_path` is non-null. Every
+contract input appears once, no other input appears, tracked input hashes equal
+their recorded HEAD blobs, and retained identity is independently revalidated.
+`lock` contains exactly `dev,ino,path` for the retained campaign-lock identity;
+it is common execution authority, not a lane resource and is not removed by a
+receipt.
+
+`checks` follows replay order—domain labels, privacy labels other than the
+terminal log auditor, then that auditor—and has exactly one record per contract checker with fields
+`argv,executable,label,log_end,log_sha256,log_start,result`. `argv` is the exact
+expanded replay argv; executable is the retained input label; result is a
+canonical 0..255 integer; log offsets are canonical byte offsets into
+`checker.log`; and `log_sha256` covers that checker's canonical framed record.
+Adapter identity and expanded argv are included in the associated checker
+record. Missing, duplicate, reordered, or additional checker records are
+invalid.
+
+### Driver/helper ownership protocol
+
+The lane driver is the sole parent and resource owner. Before any root mutation
+it validates the public invocation and clean environment, installs its
+EXIT/HUP/INT/TERM finalization trap, and acquires nonblocking FD 9 on
+`CAMPAIGN/.task4.lock`. `CAMPAIGN` is the caller-owned mode-0700 canonical
+parent of all lane roots; the lock is an `O_NOFOLLOW|O_CREAT` mode-0600 regular
+file whose dev/inode is retained. Contention or invalid lock exits 77 before a
+root, body, Cargo, container, network, or runtime command. FD 9 remains held
+through terminal exit.
+
+The driver retains campaign-parent dirfd 5, artifact-journal FD 6,
+resource-journal FD 7, root dirfd 8, and lock FD 9. It invokes only these helper
+operations:
+
+```text
+task4-receipt.py init CONTRACT --parent-fd 5 --name ROOT_NAME --lock-fd 9
+task4-receipt.py artifact --root-fd 8 --journal-fd 6 --label LABEL
+task4-receipt.py journal --fd 7 --state requested|resolved|cleanup|absent ...
+task4-receipt.py validate-contract CONTRACT
+task4-receipt.py finalize --parent-fd 5 --name ROOT_NAME --root-fd 8 \
+  --artifacts-fd 6 --resources-fd 7 --lock-fd 9 \
+  --start-sha256 START_SHA256 --intent CODE
+task4-receipt.py verify-copy ROOT_COPY
+task4-receipt.py --self-test
+```
+
+The driver opens the canonical caller-owned mode-0700 campaign parent as FD 5
+with no-follow component checks. `init` descriptor-validates the committed
+contract, FD 5, and FD 9. `ROOT_NAME` is one 1..255-byte ASCII component
+matching `[A-Za-z0-9][A-Za-z0-9._-]*`; NUL, slash, `.`, and `..` are rejected
+before mutation by both init and finalize. Init creates it relative to FD 5
+race-free mode 0700, then creates caller-owned mode-0700 `inputs/` and
+`artifacts/` directories with `nlink>=2`, records and revalidates their
+dev/inode/mode/owner, copies the canonical contract and replay-required inputs;
+creates
+caller-owned mode-0600 `nlink=1` stdout/stderr, both empty journals, and
+`receipt.json.pending` containing the canonical start ledger; fsyncs files and
+directories; and returns
+`ROOT_DEV:ROOT_INO<TAB>START_SHA256<LF>`. The driver opens the root relative to
+FD 5 with `openat(O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)` as FD 8, requires
+parent-relative `lstat` to equal FD 8 `fstat`, and retains the returned start
+digest outside the root. Finalize identity-checks
+that pending object, requires its original bytes to match `START_SHA256`, then replaces its bytes
+with the complete receipt after replay, fsyncs it, and renames it no-replace to
+`receipt.json`; failure or leftover pending state prevents status. Any
+partial-init failure either identity-removes its empty root or leaves
+missing status/non-pass; it never continues by pathname.
+
+FDs 5-9 are close-on-exec during lane work and are closed in every external
+child except the named FD 7 resource-journal inheritance. Immediately before
+the final helper `exec`, the driver clears close-on-exec only for FDs 5-9; the
+helper revalidates all five before use.
+
+The driver opens `stdout.log`/`stderr.log` as retained FDs 3/4 and
+`artifacts.jsonl`/`resources.jsonl` as retained append FDs 6/7, all relative to
+FD 8 with `O_NOFOLLOW` and exact identity checks. It serializes every journal
+operation. Nested resource creators inherit only FD 7 and call `journal`; all
+other children close FDs 5-9 and body stdout/stderr is captured only through
+FDs 3/4. A requested append returns only after fsync and before creation;
+resolved returns only after fsync and before activation or handoff.
+
+After producing a declared artifact and before any checker consumes it, the
+driver calls `artifact`. That operation opens the contract-declared path
+relative to FD 8, rejects links/special files/identity drift, streams its
+bounded SHA-256, rechecks the same FD identity, appends and fsyncs the typed
+acquisition row through FD 6, and returns. Finalization repeats the same checks
+and requires acquisition and final identities/hashes plus exact declared-set
+equality. Runtime scanning without an acquisition record cannot authorize an
+artifact.
+
+The same-shell driver body performs lane work. Its trap reaps owned children,
+executes lane-specific cleanup using only immutable identities already held by
+the driver, appends cleanup/absence rows when identity is known, and treats any
+uncertainty as non-pass. The helper never starts, signals, or deletes a lane
+resource. After cleanup, the driver closes body-only descriptors and `exec`s
+`task4-receipt.py finalize` with FDs 5-9, `START_SHA256`, and `CODE`; FDs 3/4
+are fsynced and closed first. Finalize revalidates FD 8 against `ROOT_NAME`
+through FD 5 and retains FD 5 and FD 9 through final publication and process
+exit. No public environment
+or CLI body-reentry mode exists. Signals retain shell exit codes HUP=129,
+INT=130, TERM=143 after
+cleanup. Unexpected consumed-run failure uses 97. A proven pre-consumption
+refusal exits 77 with no root or status. Success is 0. For every completed
+owned root, `verdict == status == process exit`; status 77 is never published.
+`CODE` is exactly `0|97|129|130|143`; validator, replay, privacy, provenance,
+resource, seal, or publication failure may upgrade 0 to 97 but can never
+downgrade a nonzero intent.
+
+The campaign lock is caller-owned, mode 0600, regular, and `nlink=1`. Before
+root claim and immediately before publication, pathname `lstat` relative to FD
+5 must equal FD 9 `fstat` in dev/inode/uid/gid/mode/nlink. Replacement, unlink,
+or mismatch is non-pass and cannot publish zero.
+
+`journal` accepts the exact typed fields of the selected transition, not a
+free-form JSON record. A completed non-pass journal may end at requested alone,
+at resolved, or after cleanup/absent failure. Once immutable identity is known,
+cleanup and absence rows are mandatory whenever the owner remains capable of
+finalization. `cleanup(failed)` is followed by `absent(true|false)`;
+`absent(false)` is always non-pass. Only
+`cleanup(removed|already-absent),absent(true)` can contribute to status zero.
+Catastrophic owner death yields missing status and never a pass.
+
+### Authority, provenance, replay, and terminal protocol
+
+`contract.json` is the canonical copy of the descriptor-pinned committed lane
+contract. The envelope binds its repository path and SHA-256 before body
+execution. It records exact invocation identity and start/end ledgers for every
+consumed source, input, checker, adapter, interpreter, dependency, tool, and
+configuration. The tracked index/worktree is clean at start and end; every
+consumed tracked file matches its HEAD blob through a no-follow descriptor.
+Repository-untracked executables and Cargo/container build inputs are rejected.
+Mutable external inputs are descriptor-pinned or copied before use.
+
+The contract, not checker output, defines required inventory. Checker zero is
+necessary but insufficient. Lane 16's reviewed fixed validator is the sole
+non-standalone domain oracle. A collection-coupled checker may use the
+contract's single replay-only adapter only to map retained labels into its
+existing checker invocation. The adapter collects nothing, adds no predicate,
+accepts no missing input, and is pinned and reviewed like a checker; this is the
+only exception to the checker-freeze rule.
+
+After descendants are reaped and every resource is absent, replay runs in the
+original private root over read-only, contract-registered retained inputs and
+writes only to `checker.log.pending`, an `O_EXCL|O_NOFOLLOW` mode-0600 bounded
+file. Domain checkers execute in label order, followed by privacy checkers in
+label order except the `checker.log` auditor. The helper captures each checker's raw
+stdout/stderr and appends one canonical JSONL record with exactly
+`label,result,stderr_b64,stdout_b64`; decoded combined bytes and the whole log
+remain within 64 MiB. This framed log is fsynced and renamed no-replace to the
+mandatory `checker.log` even when a checker exits nonzero. If the mandatory log cannot be created or published, no
+authoritative status is published. Original repository paths and services are
+unavailable; network, privilege, Cargo, Docker, systemd,
+collection commands, globs, mutable imports, and undeclared paths are
+tripwired. A copied sealed envelope must independently revalidate and replay
+from a different absolute path.
+
+After that publication, the terminal log auditor reads canonical
+`checker.log`; its own
+stdout/stderr must be empty and is never appended to the file it audits. Its
+exit and zero-length log range are recorded in `checks`, with `log_sha256` equal
+to SHA-256 of empty bytes. The result is sealed through `receipt.json`; it never
+modifies the audited log.
+
+`verify-copy` opens the copied sealed root read-only, creates one bounded
+caller-owned mode-0700 scratch directory beside—not inside—the copy, runs all
+replay checkers with outputs captured there, and compares canonical check
+results and framed log bytes with sealed `receipt.json` and `checker.log`. It
+identity-removes scratch afterward and never mutates the copied root. Scratch
+creation, overflow, cleanup, or comparison uncertainty is failure.
+
+After the last checker, finalize revalidates every retained input and artifact
+again before writing receipt check records, verdict, or seal. `stdout.log` and
+`stderr.log` are created only by `init`, captured through FDs 3/4, fsynced and
+identity-revalidated by finalize, and never repaired or synthesized. Their
+absence, replacement, overflow, or write/fsync uncertainty prevents status.
+
+`seal.sha256` contains one
+`SHA256<TAB>SIZE<TAB>RELATIVE_PATH<LF>` row per regular retained file in stable
+bytewise path order, excluding only `seal.sha256` and `status`. Mandatory common
+sealed entries are `contract.json`, `receipt.json`, both JSONL journals, every
+retained `inputs/` copy, every contract artifact, `checker.log`, `stdout.log`,
+`stderr.log`, and `verdict`.
+Logs and verdict are not extra domain artifacts. No other retained file exists.
+
+Terminal order is: reap; identity-bound cleanup and absence; provenance and
+inventory revalidation; checker replay and privacy validation; write/fsync the
+exact ASCII bytes `CODE<LF>` to `verdict`, seal, and root; create
+`ROOT/status.pending`, write the same exact
+sealed verdict, fsync it and the root; publish `status` with
+`renameat2(RENAME_NOREPLACE)` as the final namespace mutation; fsync the root;
+exit without mutation. Every consumer revalidates the seal and exact terminal
+delta. Any collision, unavailable no-replace rename, fsync failure, mismatch,
+missing status, or later mutation is non-pass.
+
+The Python-stdlib-only rule permits one minimal `ctypes` binding to libc
+`renameat2`; missing symbols, `ENOSYS`, or any fallback without no-replace
+semantics is non-pass. No third-party package or external rename utility is
+allowed. The binding loads libc with `use_errno=True`, declares integer dirfd
+and flags plus byte-pointer pathname ABI types, uses retained root dirfd for
+both directories, and passes exactly `RENAME_NOREPLACE`.
+
+### Implementation and test sequence
+
+1. After independent Sol, Terra, and Luna acceptance, make one docs-only
+   authority change containing exactly the accepted decision report, this
+   closure plan, the next-gates qualification, and ROADMAP amendment. Exclude
+   the rejected schema draft and unrelated OpenSSL report.
+2. Write and independently review all six canonical contracts, including every
+   literal artifact path, bound, checker role, privacy surface, resource class,
+   replay argv, and cardinality. Lane 14 must enumerate every allowlist-required
+   profile, log, map, live `START`, trace, attach, discover, distribution,
+   protocol, and canary surface. Every trace artifact names a pinned structural
+   scanner and only `trace-pid-tid-positions` exclusions. No helper
+   implementation starts before this gate passes.
+3. Replace the current `Task4ObservedSession`, custom SHA-256, `facts-v1`
+   interpreter, FD-5 protocol, and lane-fact Rust assertions with a core test
+   `task4_receipt_envelope_contracts_core` plus six lane rows
+   `task4_receipt_envelope_contracts_lane07|09|10|11|14|16`. Core invokes the helper self-test and
+   validates all contracts. Each lane row invokes its real driver self-test;
+   Rust parses no lane facts. The first focused RED command is:
+
+   ```sh
+   cargo +1.88 test --locked --test artifact_contracts \
+     task4_receipt_envelope_contracts_core -- --nocapture
+   ```
+
+   It fails only because reviewed helper behavior is absent, never from fixture
+   setup or a real external command. All six lane rows are written now and each
+   remains independently RED on its missing driver integration.
+4. Implement the helper. Its real-process self-test covers at least: manifest
+   A+B versus a zero checker using only A; unique and ambiguous
+   create-before-resolve death; replay after original inputs/services disappear;
+   copied-root replay; mutation of every authority class; unsafe roots;
+   descriptor leaks; signal boundaries; cleanup/absence failure; early,
+   duplicate, or replaced status; rename collision/unavailability; and
+   post-publication mutation.
+5. Migrate Lane 07 first and independently review exact registration/replay;
+   migrate 09, 10, 11, 14, and 16 serially, replacing rather than layering
+   local receipts. Preserve every checker and retained lane-matrix predicate.
+6. Run helper/contract/driver self-tests, shell syntax checks, the focused Rust
+   contract, then all four canonical Rust checks. Stop the writer and obtain
+   independent lifecycle, provenance, privacy, and oracle review before runtime.
+7. Compatibility-check frozen Lane 02 without rerunning it. Do not amend or
+   rerun Lane 13 history. Run remaining lanes once in order: 07, 09, 10, 11,
+   14, 16-never, 16-auto; stop at the first UNRUN/NON-PASS. Preserve downstream
+   order: fresh r3; 9.2d with the existing Lane 02 and single Lane 13
+   frozen-candidate negative-control positions; 9.3; 9.4 review; exact-tip CI;
+   Task 10.
+
+Writer ownership is sequential: (1) six contracts only; (2)
+`tests/artifact_contracts.rs`; (3) `scripts/task4-receipt.py`; (4) Lane 07
+driver; (5) Lane 09 driver; (6) Lane 10 driver; (7) Lane 11 driver; (8) all
+Lane 14 scripts as one stopped-writer group; (9) Lane 16 driver. A reviewer
+starts only after its writer stops. The focused command above is RED before the
+helper and GREEN afterward. After each driver migration, run only its named lane
+row and require GREEN; the aggregate `task4_receipt_envelope_contracts` filter
+becomes GREEN only after Lane 16. Every self-test is rootless and trips any
+Cargo, Docker, sudo, systemd, BPF attach, network, or real lane-body command.
+Canonical Cargo checks remain serial.
+
+The frozen Lane 02 section and Lane 07/09/10/11/14/16 contract matrix below
+remain domain authority. The Lane 13 topology ruling remains unchanged.
+
+### Rejected live-observer descriptor design (historical, non-authoritative)
+
+This descriptor-observer design is retained only as threat-case history. It is
+superseded by the sealed-envelope amendment and must not be implemented. The
+Lane 13 disposition beginning below remains authoritative and unchanged.
 
 The unanimous architecture reconciliation fixes the shell-visible descriptor
 mapping and supersedes any conflicting numeric label in this plan. The mapping
@@ -139,7 +631,12 @@ invalidates compatibility and requires new reviewed authority. It does **not** a
 automatic Lane 02 rerun: another run would create twelve Task 4 attempts and
 contradict the exact-six cardinality.
 
-## Exact receipt interface
+## Rejected lane-local receipt design (historical, non-authoritative)
+
+Everything from this heading up to, but not including, the retained lane-matrix
+heading is historical design evidence and is not implementation authority. In particular, the
+`facts-v1`, live observer/FD-5 protocol, duplicated local wrappers, and nested
+facts protocol are rejected.
 
 ### Normal drivers
 
@@ -361,7 +858,7 @@ path and SHA-256 are recorded; the existing OpenSSL feasibility report is such
 an exception. The separately committed receipt plan is not untracked during
 implementation/runtime.
 
-### Stopped-writer lifecycle repair amendment (authoritative)
+### Rejected stopped-writer lifecycle repair (historical, non-authoritative)
 
 The stopped-writer review at implementation HEAD
 `1330630d1af58d5f61c21c258d23babc8acc1135` rejected Task 4 advancement. The
@@ -433,7 +930,8 @@ publisher. That publisher:
 3. appends `terminal_status_intent` through retained main facts FD 7, `fsync`s
    it, and freshly revalidates descriptor/path identity and digest (and Lane 14
    nested facts FD 8/path/digest);
-4. creates `work/status.pending` with `O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600,
+4. historical draft used `ROOT/status.pending` with
+   `O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600,
    writes one decimal line, and `fsync`s it and the work/root directory FDs;
 5. revalidates immediately before commit;
 6. calls the Linux x86-64 libc `renameat2` symbol through Python stdlib
@@ -972,7 +1470,7 @@ terminal status protocol above. Main facts FD 7, nested facts FD 8, and lock FD
 PID/starttime-bound. Parent death or `SIGKILL` may leave diagnostics, but never
 a valid status receipt.
 
-## Lane contract matrix
+## Lane contract matrix (retained domain authority)
 
 ### Lane 07 — induced gaps
 
@@ -982,7 +1480,8 @@ a valid status receipt.
 nightly/eBPF LLVM toolchain, `bpftool`, `systemd-run`, `sudo -n`, provider, and
 the existing dump-helper self-test. If the current second-DISCOVERY-ringbuf
 `dump-owned-bpf-maps.py`/`bpftool` path cannot inspect the owned maps (including
-the known rc 244 class), finalize 77 before the six production cases.
+the known rc 244 class), exit 77 before `init`, root creation, consumption, or
+the six production cases.
 
 **Artifacts/oracle:** retain fixture/provider/BPF identities, before/after map
 inventories and dumps, cgroup and PID/starttime identities, and every capture,
@@ -1007,7 +1506,9 @@ processes, cgroup/unit, and owned BPF objects.
 **Prerequisites before consumption:** Docker client/daemon/storage, `gcc`,
 SoftHSM2, Python 3, Rust 1.88, `sudo -n`, resolved base image, and writable
 private evidence work. This receipt plan supersedes the earlier Lane 09 UNRUN
-status only after its implementation commit passes review.
+status only after its implementation commit passes review. Any missing or
+invalid prerequisite exits 77 before `init`, root creation, Docker, or other
+consumption.
 
 **Artifacts/oracle:** put all disposable work under `$ROOT/work`; retain Docker
 client/server/storage facts, requested and resolved base, built image ID/digest,
@@ -1027,7 +1528,7 @@ and cgroups absent.
 **Prerequisites before consumption:** cgroup v2, systemd, `capsh`, tracefs/DAC
 context, `gcc`, SoftHSM2, Python 3, Rust 1.88, provider, and `sudo -n`. If the
 intended capability row cannot be formed because tracefs or DAC infrastructure
-is unavailable, finalize 77 before its capture rather than fabricating a
+is unavailable, exit 77 before `init`, root creation, or capture rather than fabricating a
 relationship.
 
 **Artifacts/oracle:** retain product/discover/provider/harness/manifest/expected
@@ -1055,7 +1556,8 @@ cgroup/unit, and FIFO absent.
 v2/systemd, SoftHSM2, Python 3, Rust 1.88, provider, and `sudo -n`. Both sibling
 `.pkcs11-check-isolation-state.json` and
 `.pkcs11-check-isolation-policy.json` must be absent initially, including as
-dangling symlinks; otherwise finalize 77 and never delete them.
+dangling symlinks; otherwise exit 77 before `init` or root creation and never
+delete them.
 
 **Artifacts/oracle:** use
 `cargo +1.88 build --locked --release --workspace`. Retain equal start/end
@@ -1088,7 +1590,8 @@ aggregate totals are not frozen acceptance counts.
 Rust 1.88 stable and required nightly/eBPF toolchain, musl target and linker,
 `gcc`, Docker client/daemon, `sudo -n`, SoftHSM2, resolved build images, and the
 dump-helper/bpftool path used by nested gates. If the known second-DISCOVERY
-ringbuf inspection cannot run, finalize 77 before consuming release evidence.
+ringbuf inspection cannot run, exit 77 before `init`, root creation, or
+consuming release evidence.
 This plan supersedes the earlier Lane 14 UNRUN status only after implementation
 review.
 
@@ -1115,8 +1618,8 @@ Prove containers, images owned by ID, target processes, and observer absent.
 **Prerequisites before consumption:** `gcc`, `sudo -n`, SoftHSM2, Python 3,
 Rust 1.88, provider, `scripts/fixtures/hammer.c`, and
 `scripts/check-capture-evidence.py`. Missing current-head binary inputs,
-checker, compiler/toolchain, provider, or `sudo -n` finalizes 77 before build or
-capture. Reject inherited build-affecting Cargo/Rust/compiler environment using
+checker, compiler/toolchain, provider, or `sudo -n` exits 77 before `init`, root
+creation, build, or capture. Reject inherited build-affecting Cargo/Rust/compiler environment using
 the same fixed list as Lane 02.
 
 **Build/config:** create `$ROOT/work/tokens` mode 0700 and
@@ -1174,7 +1677,13 @@ counts do not apply. `200000` defines the workload but is not an acceptance
 count; `G3`, `136175`, function-call totals, timing, latency, median, and
 performance values are non-authoritative.
 
-## File structure and ownership
+## Historical rejected task appendix — do not execute
+
+Every checkbox, command, file list, task, and commit instruction below through
+the superseded Task 4 section is preserved only as review history. None is
+executable authority.
+
+### Superseded file structure and ownership
 
 Commit this plan alone first so its commit is the implementation authority.
 The later implementation commit modifies exactly:
@@ -1190,13 +1699,13 @@ The later implementation commit modifies exactly:
 - `scripts/verify-task4-lane16.sh` — Lane 16 workload/structural validator;
 - `tests/artifact_contracts.rs` — table-driven lifecycle and lane mutations.
 
-Do not add a shared receipt helper: the six scripts have different ephemeral
-ownership and a generic API would increase the trust surface without removing
-their lane-specific identity checks.
+Historical rule, now superseded: this design prohibited a shared receipt
+helper. The authoritative amendment instead permits exactly one private
+stdlib-Python envelope while leaving lane-specific resource ownership local.
 
 ---
 
-### Task 1: Commit the reviewed plan authority
+### Superseded Task 1: prior plan-commit sequence
 
 **Files:**
 - Create: `docs/superpowers/plans/2026-08-27-task4-receipt-closure.md`
@@ -1224,7 +1733,7 @@ git commit -m "docs: plan remaining Task 4 receipts"
 
 Do not add the unrelated OpenSSL report.
 
-### Task 2: Add RED artifact and behavioral contracts
+### Superseded Task 2: live-observer RED contracts
 
 **Files:**
 - Modify: `tests/artifact_contracts.rs`
@@ -1299,7 +1808,7 @@ add mutations proving all of the following:
   closes it before exec, and proves that no control FIFO or other receipt
   descriptor reaches the target payload.
 
-### Task 3: Implement lane-local receipts minimally
+### Superseded Task 3: duplicated lane-local receipts
 
 **Files:**
 - Modify/Create: exactly the nine scripts listed under file ownership.
@@ -1351,7 +1860,7 @@ cargo +1.88 test --locked --test artifact_contracts task4_receipt -- --nocapture
 No Docker, sudo, systemd, eBPF attachment, or production evidence is consumed
 by these self-tests.
 
-### Task 3A: Correct Lane 14 private-work containment
+### Superseded Task 3A: prior Lane 14 containment sequence
 
 This task follows the fresh canonical-suite finding at exact HEAD `47a4632`.
 Commit this plan-only authority amendment before changing code.
@@ -1387,7 +1896,7 @@ git add scripts/build-release.sh scripts/verify-canaries.sh \
 git commit -m "fix: confine Lane 14 release work"
 ```
 
-### Task 3B: Repair real lifecycle, provenance, and Lane 14 handoff
+### Superseded Task 3B: live-observer lifecycle sequence
 
 This task follows the unanimous stopped-writer rejection at exact HEAD
 `1330630d1af58d5f61c21c258d23babc8acc1135`. The already committed ten-file
@@ -1499,7 +2008,7 @@ canonical Rust sequence serially. Freeze and review exactly the cumulative ten
 implementation files from `bf4cbcf..HEAD` plus this separately committed plan
 authority. Runtime remains `UNRUN` until Task 4 below passes unanimously.
 
-### Task 4: Verify and independently review the implementation
+### Superseded Task 4: prior implementation review
 
 **Files:** The cumulative exact ten-file implementation range only. The range
 through exact HEAD `1330630d1af58d5f61c21c258d23babc8acc1135` is rejected and
@@ -1532,7 +2041,7 @@ and repeat until all agree.
 git diff --name-only bf4cbcf..HEAD -- scripts tests/artifact_contracts.rs
 # Require exactly the ten files in File structure and ownership.
 # The separately committed plan amendment is authority, not implementation.
-# Do not add another implementation file or shared receipt framework.
+# Historical rejected rule: no shared helper. Do not execute this old task.
 ```
 
 ### Task 5: Prove Lane 02 compatibility and run remaining Task 4 lanes
@@ -1551,8 +2060,9 @@ and stop on overlap/mismatch. Do not rerun Lane 02 automatically.
 - [ ] **Step 2: Run lanes once in exact order**
 
 Use one new absent root for 07, 09, 10, 11, and 14, then one new absent root for
-each Lane 16 mode. Hold the common campaign lock and stop immediately on status
-77, nonzero status, missing status, body/oracle failure, input drift, cleanup
+each Lane 16 mode. Hold the common campaign lock and stop immediately on an
+exit 77 before root creation, nonzero status, missing status, body/oracle
+failure, input drift, cleanup
 uncertainty, or privacy failure. Do not run any later lane after a stop.
 
 - [ ] **Step 3: Independent evidence review and freeze**

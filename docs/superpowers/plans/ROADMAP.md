@@ -491,9 +491,10 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     passed fresh Gate A on Jammy 5.15 and Noble 6.8, Gate B 120/120 across
     three cold boots per kernel, and the isolated host Lane 02 matrix 6/6.
     Independent Sol, Terra, and Luna evidence review unanimously passed. This
-    selects the candidate only: the remaining Task 4 sequence restarts with a
-    fresh Lane 02 root, and r3/9.2d, 9.3, CI, Task 10, and release remain
-    pending.**
+    selects the candidate only: Task 4 rehashes and compatibility-checks the
+    already frozen Lane 02 result, then executes remaining lanes beginning at
+    Lane 07. The distinct post-r3 9.2d campaign retains its existing Lane 02
+    gate position. r3/9.2d, 9.3, CI, Task 10, and release remain pending.**
 
     **Topology scope ruling (2026-08-27):** The exact reproduced node-wide
     retained-view late-provider case is an expected `UNSUPPORTED/NON-PASS`
@@ -512,6 +513,19 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     exited 0 without changing Lane 13. Public README/usage wording remains
     reserved for Task 10; no design-spec, production, privacy/schema, or
     procfs/mmap/eBPF fallback change is made here.**
+
+    **Task 4 receipt architecture ruling (2026-08-28):** Remaining-lane gate
+    receipts use one private Python-stdlib sealed-envelope helper and six
+    committed lane contracts. Existing checkers remain the domain oracles; the
+    envelope validates only declaration equality, custody, provenance, resource
+    lifecycle, replay isolation, privacy scanning, sealing, and terminal
+    publication. The rejected live Rust observer, FD-5 protocol, global
+    `facts-v1` interpreter, and duplicated lane-local receipt wrappers are not
+    implementation authority. Frozen Lane 02 evidence is compatibility-checked
+    rather than rerun in Task 4; Lane 13 history is neither amended nor rerun
+    and remains the single frozen-candidate 9.2d negative control. Product
+    Rust/BPF, public v2 schemas, `allowlist-v1`, lane oracles, runtime order, r3,
+    9.2d, 9.3, 9.4, exact-tip CI, and Task 10 remain unchanged.**
 - **Slice 2 — capture quality**: ring/epoll, budgets, safe-policy params, per-module profile
   sections, filters, snapshots.
 - **Slice 3 — structure**: module split, evidence plumbing, docs consolidation, multi-kernel CI.

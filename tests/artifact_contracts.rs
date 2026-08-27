@@ -2114,6 +2114,108 @@ fn lane02_checker_and_driver_self_tests_execute() {
 }
 
 #[test]
+fn task4_receipt_drivers_execute_behavioral_self_tests() {
+    let drivers = [
+        (
+            "lane02",
+            "scripts/verify-task4-lane02.sh",
+            "verify-task4-lane02 self-test: OK",
+        ),
+        (
+            "lane07",
+            "scripts/verify-induced-gaps.sh",
+            "verify-induced-gaps Task 4 receipt self-test: OK",
+        ),
+        (
+            "lane09",
+            "scripts/matrix/verify-shared-layer.sh",
+            "verify-shared-layer Task 4 receipt self-test: OK",
+        ),
+        (
+            "lane10",
+            "scripts/matrix/verify-fork-scope.sh",
+            "verify-fork-scope Task 4 receipt self-test: OK",
+        ),
+        (
+            "lane11",
+            "scripts/matrix/verify-oracle.sh",
+            "verify-oracle Task 4 receipt self-test: OK",
+        ),
+        (
+            "lane14",
+            "scripts/build-release.sh",
+            "build-release Task 4 receipt self-test: OK",
+        ),
+        (
+            "lane16",
+            "scripts/verify-task4-lane16.sh",
+            "verify-task4-lane16 Task 4 receipt self-test: OK",
+        ),
+    ];
+    let mut failures = Vec::new();
+
+    for (lane, script, marker) in drivers {
+        let dispatch_available = fs::read_to_string(script)
+            .map(|source| source.contains("--self-test"))
+            .unwrap_or(false);
+        let guard = (!dispatch_available).then(|| {
+            let guard = tempfile::tempdir().expect("create PATH guard for an unimplemented self-test");
+            for command in [
+                "capsh",
+                "cargo",
+                "docker",
+                "file",
+                "gcc",
+                "jq",
+                "mkdir",
+                "python3",
+                "rm",
+                "setpriv",
+                "softhsm2-util",
+                "sudo",
+                "systemd-run",
+                "timeout",
+            ] {
+                let path = guard.path().join(command);
+                fs::write(&path, b"#!/bin/sh\necho 'missing --self-test dispatch' >&2\nexit 127\n")
+                    .expect("write PATH guard command");
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                    .expect("make PATH guard command executable");
+            }
+            guard
+        });
+        let mut command = Command::new("/bin/sh");
+        command.args([script, "--self-test"]);
+        if let Some(guard) = &guard {
+            // Before Task 3 adds the dispatch, stop legacy drivers at their
+            // first harmless filesystem operation rather than entering a real
+            // build/runtime body. Keep normal tools available for setup.
+            command.env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", guard.path().display()),
+            );
+        }
+        let output = command
+            .output()
+            .unwrap_or_else(|error| panic!("run {lane} self-test: {error}"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() || !(stdout.contains(marker) || stderr.contains(marker)) {
+            failures.push(format!(
+                "{lane} ({script}): status={:?}, marker={marker:?}, stdout={stdout:?}, stderr={stderr:?}",
+                output.status.code()
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Task 4 receipt self-test contract failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
 fn linux_permission_denial_classifier_accepts_eacces_and_eperm_only() {
     let status = Command::new("sh")
         .args([

@@ -77,12 +77,41 @@ pub struct Engine {
     expected_target_exit: bool,
     /// The deduplicated bound-context set behind `loader_discovery`'s
     /// strategy/timing/capture counts (design §9.2). Keyed by the exact
-    /// internal `{process generation, optional bound tuple}` — the loader
-    /// context id stands for the bound tuple and is absent when binding
-    /// failed — so one context contributes exactly once no matter how many
-    /// records it produces. All identity stays out: only the classification
-    /// is kept, and it is all that can be rendered.
-    loader_contexts: BTreeMap<(ProcessViewId, Option<u16>), LoaderContextClass>,
+    /// internal `{process generation, bound identity state, load kind}` — so
+    /// one context contributes exactly once no matter how many records it
+    /// produces, while initial-set and ordinary contexts stay partitioned.
+    /// All identity stays out: only the classification is kept, and it is all
+    /// that can be rendered.
+    loader_contexts: BTreeMap<(ProcessViewId, LoaderAggregateKey, bool), LoaderContextClass>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoaderAggregateKey {
+    Unbound,
+    Bound(PinnedTimingKey),
+    BoundUnkeyed(LoaderContextId),
+}
+
+impl Ord for LoaderAggregateKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+
+        match (self, other) {
+            (Self::Unbound, Self::Unbound) => Ordering::Equal,
+            (Self::Unbound, _) => Ordering::Less,
+            (_, Self::Unbound) => Ordering::Greater,
+            (Self::Bound(left), Self::Bound(right)) => left.cmp(right),
+            (Self::Bound(_), Self::BoundUnkeyed(_)) => Ordering::Less,
+            (Self::BoundUnkeyed(_), Self::Bound(_)) => Ordering::Greater,
+            (Self::BoundUnkeyed(left), Self::BoundUnkeyed(right)) => left.get().cmp(&right.get()),
+        }
+    }
+}
+
+impl PartialOrd for LoaderAggregateKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// One exact live-loader context, classified. `bound` is the §9.2 strategy
@@ -4497,23 +4526,35 @@ impl Engine {
     }
 
     /// Classifies the exact live-loader context this view owns after an arming
-    /// attempt. Re-arming the same context updates its entry rather than
-    /// adding a second — that is what makes the published counts per-context
-    /// and not per-record — and a context never changes load kind once
-    /// recorded, so a later ordinary refresh cannot relabel the pre-exec
-    /// initial-set context as an ordinary `dlopen` one.
+    /// attempt. Re-arming the same context in one load kind updates its entry
+    /// rather than adding a second — that is what makes the published counts
+    /// per-context and not per-record — while the load kind stays partitioned.
     fn record_loader_arm(&mut self, view: ProcessViewId, initial_set: bool) {
         let bound = self
             .loader_registry
             .ids_for_view(view)
             .into_iter()
             .find(|id| !self.loader_registry.is_tombstoned(*id));
-        let class = LoaderContextClass {
-            bound: bound.is_some(),
-            initial_set,
+        let (bound_key, bound) = match bound {
+            None => (LoaderAggregateKey::Unbound, false),
+            Some(id) => match self
+                .loader_registry
+                .context(id)
+                .and_then(|context| self.pinned.owned_timing_key(context.spec.loader))
+            {
+                Some(key) => (LoaderAggregateKey::Bound(key), true),
+                None => {
+                    self.mark_live_loss(
+                        "live loader discovery",
+                        "loader context has no stable aggregation identity",
+                    );
+                    (LoaderAggregateKey::BoundUnkeyed(id), true)
+                }
+            },
         };
+        let class = LoaderContextClass { bound, initial_set };
         self.loader_contexts
-            .entry((view, bound.map(LoaderContextId::get)))
+            .entry((view, bound_key, initial_set))
             .and_modify(|known| known.bound = class.bound)
             .or_insert(class);
     }
@@ -11117,6 +11158,130 @@ mod tests {
             None,
             "an unmeasured gap is never zero"
         );
+    }
+
+    #[test]
+    fn loader_counts_deduplicate_replaced_context_by_stable_bound_tuple() {
+        use p11scope_manifest::elf::SymbolFact;
+
+        let view = ProcessViewId(5);
+        let module = overlay_module(overlay_key(105));
+        let pins = overlay_pins(&[(module.key, OVERLAY_SHA, 1)]);
+        let loader = pins
+            .id_for_scanned(&module, module.key, &module.path)
+            .unwrap();
+        let mut engine = Engine::empty();
+        engine.pinned = pins;
+        let spec = LoaderContextSpec {
+            view,
+            loader,
+            mapping: Some(MapEntry {
+                start: 0x4000,
+                end: 0x5000,
+                file_offset: 0x2000,
+                permissions: *b"r-xp",
+                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                inode: 7,
+                raw_path: Some(b"/lib/ld.so".to_vec()),
+            }),
+            hook: SymbolFact {
+                virtual_address: 0x2100,
+                file_offset: 0x2100,
+            },
+            state: None,
+        };
+
+        let first = engine.loader_registry.preflight(spec.clone()).unwrap();
+        let first = engine.loader_registry.prepare(first).unwrap();
+        engine.loader_registry.mark_attached(first).unwrap();
+        engine.record_loader_arm(view, false);
+        engine.loader_registry.tombstone(first).unwrap();
+        engine.loader_registry.remove(first).unwrap();
+
+        let replacement = engine.loader_registry.preflight(spec.clone()).unwrap();
+        let replacement = engine.loader_registry.prepare(replacement).unwrap();
+        engine.loader_registry.mark_attached(replacement).unwrap();
+        engine.record_loader_arm(view, false);
+
+        let aggregate = engine.loader_discovery();
+        assert_eq!(aggregate.strategies.debug_state_every_hit, 1);
+        assert_eq!(aggregate.dlopen_timing.unproven, 1);
+        assert_eq!(
+            aggregate.initial_set_timing,
+            render::LoaderTiming::default()
+        );
+        assert_eq!(
+            aggregate.initial_set_capture,
+            render::InitialSetCapture::default()
+        );
+
+        engine.loader_registry.tombstone(replacement).unwrap();
+        engine.loader_registry.remove(replacement).unwrap();
+        let initial_set = engine.loader_registry.preflight(spec).unwrap();
+        let initial_set = engine.loader_registry.prepare(initial_set).unwrap();
+        engine.loader_registry.mark_attached(initial_set).unwrap();
+        engine.record_loader_arm(view, true);
+
+        let aggregate = engine.loader_discovery();
+        assert_eq!(aggregate.strategies.debug_state_every_hit, 2);
+        assert_eq!(aggregate.dlopen_timing.unproven, 1);
+        assert_eq!(aggregate.initial_set_timing.unproven, 1);
+        assert_eq!(aggregate.initial_set_capture.none, 1);
+    }
+
+    #[test]
+    fn loader_counts_distinguish_unbound_and_unkeyed_contexts() {
+        use p11scope_manifest::elf::SymbolFact;
+
+        let view = ProcessViewId(6);
+        let mut engine = Engine::empty();
+        engine.record_loader_arm(view, false);
+        let spec = LoaderContextSpec {
+            view,
+            loader: PinnedObjectId(9),
+            mapping: Some(MapEntry {
+                start: 0x4000,
+                end: 0x5000,
+                file_offset: 0x2000,
+                permissions: *b"r-xp",
+                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                inode: 7,
+                raw_path: Some(b"/lib/ld.so".to_vec()),
+            }),
+            hook: SymbolFact {
+                virtual_address: 0x2100,
+                file_offset: 0x2100,
+            },
+            state: None,
+        };
+        let first = engine.loader_registry.preflight(spec.clone()).unwrap();
+        let first = engine.loader_registry.prepare(first).unwrap();
+        engine.loader_registry.mark_attached(first).unwrap();
+        engine.record_loader_arm(view, false);
+        engine.record_loader_arm(view, false);
+
+        let aggregate = engine.loader_discovery();
+        assert_eq!(aggregate.strategies.unavailable, 1);
+        assert_eq!(aggregate.strategies.debug_state_every_hit, 1);
+        assert_eq!(aggregate.dlopen_timing.unproven, 1);
+        assert_eq!(engine.counters.object_skips.len(), 1);
+        assert_eq!(
+            render::capture_skipped_out(&engine.counters.object_skips[0]).reason,
+            "discovery unavailable"
+        );
+
+        engine.loader_registry.tombstone(first).unwrap();
+        engine.loader_registry.remove(first).unwrap();
+        let replacement = engine.loader_registry.preflight(spec).unwrap();
+        let replacement = engine.loader_registry.prepare(replacement).unwrap();
+        engine.loader_registry.mark_attached(replacement).unwrap();
+        engine.record_loader_arm(view, false);
+
+        let aggregate = engine.loader_discovery();
+        assert_eq!(aggregate.strategies.unavailable, 1);
+        assert_eq!(aggregate.strategies.debug_state_every_hit, 2);
+        assert_eq!(aggregate.dlopen_timing.unproven, 2);
+        assert_eq!(engine.counters.object_skips.len(), 1);
     }
 
     /// Plan Task 8 Step 2: a named target's expected exit is what ends the

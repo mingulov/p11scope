@@ -19,6 +19,125 @@ pub(crate) use crate::events::DiscoveryItem;
 const CYCLE_NS: u64 = 100_000_000;
 const SAMPLE_NS: u64 = 1_000_000;
 const MAX_FAILURE_ITEMS: usize = 128;
+const MSG_ARM_FAILED: &str = "owned child generation changed before pause arm";
+const MSG_POST_RELEASE_REVALIDATION_INCOMPLETE: &str =
+    "post-release loader revalidation did not close required discovery";
+const MSG_PAUSE_HELPER_REJECTED: &str = "pause helper rejected SIGSTOP";
+const MSG_NESTED_DEADLINE_BEFORE: &str = "deadline crossed before nested discovery dequeue";
+const MSG_NESTED_DEADLINE_AFTER: &str = "deadline crossed after nested discovery dequeue";
+const MSG_DEADLINE_BEFORE_DEQUEUE: &str = "deadline crossed before discovery dequeue";
+const MSG_DEADLINE_AFTER_DEQUEUE: &str = "deadline crossed after discovery dequeue";
+const MSG_PAUSE_CONFIRMATION_DEADLINE: &str = "pause confirmation deadline crossed";
+const MSG_PAUSE_RESUME_DEADLINE: &str = "pause resume observation deadline crossed";
+const MSG_PAUSE_CAUSAL_DEADLINE: &str = "pause causal deadline crossed";
+const MSG_COALESCED_RECORD_DEADLINE: &str = "coalesced record crossed winner deadline";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PauseDiagnostic {
+    ArmFailedBeforeEpoch,
+    PostReleaseRevalidationIncomplete,
+    PauseHelperRejected,
+    DeadlineBeforeEngineApply,
+    DeadlineDuringEngineApply,
+    EngineIncompleteWithinDeadline,
+    NestedCollectorDeadline,
+    LaterPauseBoundary,
+    OtherAutoNonconfirmed,
+}
+
+impl PauseDiagnostic {
+    fn token(self) -> &'static str {
+        match self {
+            Self::ArmFailedBeforeEpoch => "arm_failed_before_epoch",
+            Self::PostReleaseRevalidationIncomplete => "post_release_revalidation_incomplete",
+            Self::PauseHelperRejected => "pause_helper_rejected",
+            Self::DeadlineBeforeEngineApply => "deadline_before_engine_apply",
+            Self::DeadlineDuringEngineApply => "deadline_during_engine_apply",
+            Self::EngineIncompleteWithinDeadline => "engine_incomplete_within_deadline",
+            Self::NestedCollectorDeadline => "nested_collector_deadline",
+            Self::LaterPauseBoundary => "later_pause_boundary",
+            Self::OtherAutoNonconfirmed => "other_auto_nonconfirmed",
+        }
+    }
+}
+
+fn render_pause_diagnostic(diagnostic: PauseDiagnostic) -> String {
+    format!(
+        "p11scope: pause: partial [pause_diag={}]",
+        diagnostic.token()
+    )
+}
+
+fn diagnostic_for_message(message: &str) -> Option<PauseDiagnostic> {
+    match message {
+        MSG_ARM_FAILED => Some(PauseDiagnostic::ArmFailedBeforeEpoch),
+        MSG_POST_RELEASE_REVALIDATION_INCOMPLETE => {
+            Some(PauseDiagnostic::PostReleaseRevalidationIncomplete)
+        }
+        MSG_PAUSE_HELPER_REJECTED => Some(PauseDiagnostic::PauseHelperRejected),
+        MSG_NESTED_DEADLINE_BEFORE | MSG_NESTED_DEADLINE_AFTER => {
+            Some(PauseDiagnostic::NestedCollectorDeadline)
+        }
+        _ if message == MSG_DEADLINE_BEFORE_DEQUEUE
+            || message == MSG_DEADLINE_AFTER_DEQUEUE
+            || message == MSG_PAUSE_CONFIRMATION_DEADLINE
+            || message == MSG_PAUSE_RESUME_DEADLINE
+            || message == MSG_PAUSE_CAUSAL_DEADLINE
+            || message == MSG_COALESCED_RECORD_DEADLINE =>
+        {
+            Some(PauseDiagnostic::LaterPauseBoundary)
+        }
+        _ => None,
+    }
+}
+
+fn classify_apply_diagnostic(
+    before_ns: Option<u64>,
+    after_ns: Option<u64>,
+    deadline: Option<u64>,
+    required_complete: bool,
+    nested_deadline: bool,
+) -> Option<PauseDiagnostic> {
+    if nested_deadline {
+        return Some(PauseDiagnostic::NestedCollectorDeadline);
+    }
+    let deadline = deadline?;
+    if before_ns.is_some_and(|before| before > deadline) {
+        return Some(PauseDiagnostic::DeadlineBeforeEngineApply);
+    }
+    if before_ns.is_some_and(|before| before <= deadline)
+        && after_ns.is_some_and(|after| after > deadline)
+    {
+        return Some(PauseDiagnostic::DeadlineDuringEngineApply);
+    }
+    if !required_complete && after_ns.is_some_and(|after| after <= deadline) {
+        return Some(PauseDiagnostic::EngineIncompleteWithinDeadline);
+    }
+    None
+}
+
+#[derive(Debug)]
+pub(crate) struct PauseBatchError {
+    message: String,
+    diagnostic: Option<PauseDiagnostic>,
+}
+
+impl PauseBatchError {
+    fn new(message: impl Into<String>, diagnostic: Option<PauseDiagnostic>) -> Self {
+        Self {
+            message: message.into(),
+            diagnostic,
+        }
+    }
+}
+
+impl std::fmt::Display for PauseBatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(formatter)
+    }
+}
+
+impl std::error::Error for PauseBatchError {}
 
 /// One source of truth for the policy: the coordinator uses the exact type the
 /// CLI parses, so a spelling can never mean one thing at the command line and
@@ -136,7 +255,7 @@ pub(crate) trait PauseIo {
         additions_allowed: bool,
         pause_owned: bool,
         terminal_batch: &mut Option<TerminalBatch>,
-    ) -> Result<PauseBatchOutcome, String>;
+    ) -> Result<PauseBatchOutcome, PauseBatchError>;
     fn account_unvalidated_records(&mut self, count: u64);
     fn reconcile_terminal_authority(
         &mut self,
@@ -181,6 +300,7 @@ pub(crate) trait PauseIo {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PauseBatchOutcome {
     pub(crate) required_complete: bool,
+    diagnostic: Option<PauseDiagnostic>,
 }
 
 #[allow(clippy::large_enum_variant)] // The frozen 896-byte item stays allocation-free in transfer.
@@ -237,6 +357,8 @@ pub(crate) struct PauseCoordinator {
     pending_records: Vec<DiscoveryRecord>,
     unvalidated_records: u64,
     terminal_batch: Option<TerminalBatch>,
+    pending_diagnostic: Option<PauseDiagnostic>,
+    diagnostic_annotated: bool,
     cycles: u8,
     cleaning: bool,
     cleaned: bool,
@@ -326,6 +448,8 @@ impl PauseCoordinator {
             pending_records: Vec::new(),
             unvalidated_records: 0,
             terminal_batch: None,
+            pending_diagnostic: None,
+            diagnostic_annotated: false,
             cycles: 0,
             cleaning: false,
             cleaned: false,
@@ -364,7 +488,7 @@ impl PauseCoordinator {
             }
         };
         if !same_generation {
-            return self.arm_failed(io, "owned child generation changed before pause arm");
+            return self.arm_failed(io, MSG_ARM_FAILED);
         }
         self.ring_loss_baseline = match io.ring_loss() {
             Ok(loss) => loss,
@@ -416,11 +540,8 @@ impl PauseCoordinator {
                 }
                 Ok(PauseRevalidationOutcome::Complete(_)) => {
                     self.begin_attempt();
-                    return self.fail_cycle(
-                        io,
-                        "post-release loader revalidation did not close required discovery",
-                        false,
-                    );
+                    self.set_diagnostic(PauseDiagnostic::PostReleaseRevalidationIncomplete);
+                    return self.fail_cycle(io, MSG_POST_RELEASE_REVALIDATION_INCOMPLETE, false);
                 }
                 Err(error) if !pause_owned => {
                     return Err(Self::policy_error(self.policy, error, true));
@@ -439,11 +560,14 @@ impl PauseCoordinator {
         message: impl Into<String>,
     ) -> Result<ArmResult, PauseError> {
         let message = message.into();
-        self.counters.attempts = self.counters.attempts.saturating_add(1);
+        self.begin_attempt();
+        self.set_diagnostic(PauseDiagnostic::ArmFailedBeforeEpoch);
         self.rearming_enabled = false;
         match self.policy {
             PausePolicy::Auto => {
                 self.counters.partial = self.counters.partial.saturating_add(1);
+                let _ = self.emit_partial_diagnostic();
+                self.attempt_open = false;
                 Ok(ArmResult::Disabled)
             }
             PausePolicy::Always => self
@@ -460,6 +584,7 @@ impl PauseCoordinator {
         lifecycle: bool,
     ) -> Result<ArmResult, PauseError> {
         self.begin_attempt();
+        self.set_diagnostic(PauseDiagnostic::ArmFailedBeforeEpoch);
         self.fail_cycle(io, message, lifecycle)
             .map(|()| ArmResult::Disabled)
     }
@@ -804,7 +929,7 @@ impl PauseCoordinator {
             return self.fail_cycle(io, error, false);
         }
         if records.iter().any(|record| record.hook_ts_ns > deadline) {
-            return self.fail_cycle(io, "coalesced record crossed winner deadline", false);
+            return self.fail_cycle(io, MSG_COALESCED_RECORD_DEADLINE, false);
         }
         records.push(winner_record);
 
@@ -886,10 +1011,16 @@ impl PauseCoordinator {
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
+                if let Some(diagnostic) = error.diagnostic {
+                    self.set_diagnostic(diagnostic);
+                }
                 self.take_stop_candidate_seen(io);
-                return self.fail_cycle(io, error, false);
+                return self.fail_cycle(io, error.to_string(), false);
             }
         };
+        if let Some(diagnostic) = outcome.diagnostic {
+            self.set_diagnostic(diagnostic);
+        }
         if !outcome.required_complete {
             return self.fail_cycle(io, "one or more frozen required attachments failed", false);
         }
@@ -1047,15 +1178,26 @@ impl PauseCoordinator {
         if deadline.is_none() && !self.attempt_open {
             self.failure_deadline = None;
         }
-        io.apply_batch(
+        match io.apply_batch(
             std::mem::take(&mut self.pending_records),
             deadline,
             true,
             false,
             &mut self.terminal_batch,
-        )
-        .map(|_| ())
-        .map_err(|error| Self::policy_error(self.policy, error, false))
+        ) {
+            Ok(outcome) => {
+                if let Some(diagnostic) = outcome.diagnostic {
+                    self.set_diagnostic(diagnostic);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(diagnostic) = error.diagnostic {
+                    self.set_diagnostic(diagnostic);
+                }
+                Err(Self::policy_error(self.policy, error.to_string(), false))
+            }
+        }
     }
 
     fn remove_and_account(&mut self, io: &mut impl PauseIo) -> Result<(), PauseError> {
@@ -1082,10 +1224,11 @@ impl PauseCoordinator {
     }
 
     fn reject_cycle(&mut self, io: &mut impl PauseIo, deadline: u64) -> Result<(), PauseError> {
+        self.set_diagnostic(PauseDiagnostic::PauseHelperRejected);
         if self.policy == PausePolicy::Always {
             return self.terminal_cleanup_with_cause(
                 io,
-                vec!["pause helper rejected SIGSTOP".into()],
+                vec![MSG_PAUSE_HELPER_REJECTED.into()],
                 true,
                 false,
             );
@@ -1144,7 +1287,10 @@ impl PauseCoordinator {
             true,
             &mut self.terminal_batch,
         ) {
-            retained_error.get_or_insert(error);
+            if let Some(diagnostic) = error.diagnostic {
+                self.set_diagnostic(diagnostic);
+            }
+            retained_error.get_or_insert(error.to_string());
         }
         match io.same_generation(self.pid, self.generation) {
             Ok(true) => {}
@@ -1161,16 +1307,14 @@ impl PauseCoordinator {
             return self.terminal_cleanup_with_errors(io, lifecycle_errors);
         }
         self.epoch = PauseEpoch::default();
-        self.finish_nonconfirmed(
-            retained_error.unwrap_or_else(|| "pause helper rejected SIGSTOP".into()),
-        )
+        self.finish_nonconfirmed(retained_error.unwrap_or_else(|| MSG_PAUSE_HELPER_REJECTED.into()))
     }
 
     fn sample_stopped(&self, io: &mut impl PauseIo, deadline: u64) -> Result<u64, String> {
         let states = io.task_states(self.pid)?;
         let now = io.now_ns()?;
         if now > deadline {
-            return Err("pause confirmation deadline crossed".into());
+            return Err(MSG_PAUSE_CONFIRMATION_DEADLINE.into());
         }
         if states.keys().ne(self.expected_tasks.keys())
             || states.values().any(|state| *state != b'T')
@@ -1193,7 +1337,7 @@ impl PauseCoordinator {
             let authorization = io.authorization()?;
             if install_successor && authorization == Some(PAUSE_REQUESTED) {
                 if io.now_ns()? > deadline {
-                    return Err("pause resume observation deadline crossed".into());
+                    return Err(MSG_PAUSE_RESUME_DEADLINE.into());
                 }
                 return Ok(());
             }
@@ -1207,14 +1351,14 @@ impl PauseCoordinator {
             }
             if io.original_exited()? {
                 if io.now_ns()? > deadline {
-                    return Err("pause resume observation deadline crossed".into());
+                    return Err(MSG_PAUSE_RESUME_DEADLINE.into());
                 }
                 return Ok(());
             }
             let states = io.task_states(self.pid)?;
             let now = io.now_ns()?;
             if now > deadline {
-                return Err("pause resume observation deadline crossed".into());
+                return Err(MSG_PAUSE_RESUME_DEADLINE.into());
             }
             if states.keys().ne(self.expected_tasks.keys()) {
                 return Ok(());
@@ -1223,7 +1367,7 @@ impl PauseCoordinator {
                 return Ok(());
             }
             if now == deadline {
-                return Err("pause resume observation deadline crossed".into());
+                return Err(MSG_PAUSE_RESUME_DEADLINE.into());
             }
             io.wait_one_ms()?;
         }
@@ -1237,7 +1381,7 @@ impl PauseCoordinator {
         let before_ns = io.now_ns().map_err(TimedDequeueError::Failure)?;
         if deadline.is_some_and(|deadline| before_ns > deadline) {
             return Err(TimedDequeueError::Deadline(
-                "deadline crossed before discovery dequeue".into(),
+                MSG_DEADLINE_BEFORE_DEQUEUE.into(),
             ));
         }
         let item = io.dequeue().map_err(TimedDequeueError::Failure)?;
@@ -1268,7 +1412,7 @@ impl PauseCoordinator {
         let after_ns = io.now_ns().map_err(TimedDequeueError::Failure)?;
         if deadline.is_some_and(|deadline| after_ns > deadline) {
             return Err(TimedDequeueError::Deadline(
-                "deadline crossed after discovery dequeue".into(),
+                MSG_DEADLINE_AFTER_DEQUEUE.into(),
             ));
         }
         let Some(item) = item else {
@@ -1289,6 +1433,10 @@ impl PauseCoordinator {
         lifecycle: bool,
     ) -> Result<(), PauseError> {
         let message = message.into();
+        self.set_message_diagnostic(&message);
+        if !lifecycle {
+            self.set_diagnostic(PauseDiagnostic::OtherAutoNonconfirmed);
+        }
         self.rearming_enabled = false;
         if lifecycle || self.policy == PausePolicy::Always || self.unvalidated_records != 0 {
             return self.terminal_cleanup_with_cause(
@@ -1319,6 +1467,7 @@ impl PauseCoordinator {
                 Err(error) => {
                     let lifecycle = error.lifecycle();
                     let message = error.message();
+                    self.set_message_diagnostic(&message);
                     errors.push(message);
                     if lifecycle {
                         return self.terminal_cleanup_with_errors(io, errors);
@@ -1334,7 +1483,10 @@ impl PauseCoordinator {
             self.active_epoch(),
             &mut self.terminal_batch,
         ) {
-            errors.push(error);
+            if let Some(diagnostic) = error.diagnostic {
+                self.set_diagnostic(diagnostic);
+            }
+            errors.push(error.to_string());
         }
         self.take_stop_candidate_seen(io);
         match io.authorization() {
@@ -1396,12 +1548,23 @@ impl PauseCoordinator {
     fn finish_nonconfirmed(&mut self, message: String) -> Result<(), PauseError> {
         match self.policy {
             PausePolicy::Auto => {
+                self.set_diagnostic(PauseDiagnostic::OtherAutoNonconfirmed);
                 self.counters.partial = self.counters.partial.saturating_add(1);
                 self.attempt_open = false;
+                let _ = self.emit_partial_diagnostic();
                 debug_assert!(self.counters.valid());
                 Ok(())
             }
-            PausePolicy::Always => Err(PauseError::one(message, true, false)),
+            PausePolicy::Always => {
+                let diagnostic = self
+                    .pending_diagnostic
+                    .unwrap_or(PauseDiagnostic::OtherAutoNonconfirmed);
+                Err(PauseError::one(
+                    Self::annotate_primary(message, diagnostic),
+                    true,
+                    false,
+                ))
+            }
             PausePolicy::Never => Ok(()),
         }
     }
@@ -1467,30 +1630,54 @@ impl PauseCoordinator {
                 }
                 Ok(None) => break,
                 Err(error) => {
-                    errors.push(error.message());
+                    let message = error.message();
+                    self.set_message_diagnostic(&message);
+                    errors.push(message);
                     break;
                 }
             }
         }
         let unvalidated = std::mem::take(&mut self.unvalidated_records);
-        if let Err(error) = io.apply_batch(
+        match io.apply_batch(
             std::mem::take(&mut self.pending_records),
             Some(deadline),
             false,
             self.active_epoch(),
             &mut self.terminal_batch,
         ) {
-            errors.push(error);
+            Ok(outcome) => {
+                if let Some(diagnostic) = outcome.diagnostic {
+                    self.set_diagnostic(diagnostic);
+                }
+            }
+            Err(error) => {
+                if let Some(diagnostic) = error.diagnostic {
+                    self.set_diagnostic(diagnostic);
+                }
+                errors.push(error.to_string());
+                self.annotate_required_primary(&mut errors, required);
+            }
         }
         if self.terminal_batch.is_some() {
-            if let Err(error) = io.apply_batch(
+            match io.apply_batch(
                 Vec::new(),
                 Some(deadline),
                 false,
                 self.active_epoch(),
                 &mut self.terminal_batch,
             ) {
-                errors.push(error);
+                Ok(outcome) => {
+                    if let Some(diagnostic) = outcome.diagnostic {
+                        self.set_diagnostic(diagnostic);
+                    }
+                }
+                Err(error) => {
+                    if let Some(diagnostic) = error.diagnostic {
+                        self.set_diagnostic(diagnostic);
+                    }
+                    errors.push(error.to_string());
+                    self.annotate_required_primary(&mut errors, required);
+                }
             }
             if self.terminal_batch.is_some()
                 && let Err(error) =
@@ -1560,6 +1747,7 @@ impl PauseCoordinator {
         }
         if self.terminal_batch.is_some() || io.terminal_authority_pending() {
             errors.push("terminal discovery authority remained unresolved after cleanup".into());
+            self.annotate_required_primary(&mut errors, required);
             self.cleaning = false;
             return Err(PauseError::many(errors, required, true));
         }
@@ -1569,6 +1757,7 @@ impl PauseCoordinator {
         if errors.is_empty() {
             Ok(())
         } else {
+            self.annotate_required_primary(&mut errors, required);
             Err(PauseError::many(
                 errors,
                 required,
@@ -1629,8 +1818,48 @@ impl PauseCoordinator {
 
     fn begin_attempt(&mut self) {
         if !self.attempt_open {
+            self.pending_diagnostic = None;
+            self.diagnostic_annotated = false;
             self.counters.attempts = self.counters.attempts.saturating_add(1);
             self.attempt_open = true;
+        }
+    }
+
+    fn set_diagnostic(&mut self, diagnostic: PauseDiagnostic) {
+        self.pending_diagnostic.get_or_insert(diagnostic);
+    }
+
+    fn set_message_diagnostic(&mut self, message: &str) {
+        if let Some(diagnostic) = diagnostic_for_message(message) {
+            self.set_diagnostic(diagnostic);
+        }
+    }
+
+    fn emit_partial_diagnostic(&mut self) -> String {
+        let diagnostic = self
+            .pending_diagnostic
+            .take()
+            .unwrap_or(PauseDiagnostic::OtherAutoNonconfirmed);
+        let line = render_pause_diagnostic(diagnostic);
+        eprintln!("{line}");
+        line
+    }
+
+    fn annotate_primary(message: String, diagnostic: PauseDiagnostic) -> String {
+        let message = message.replace("pause_diag=", "pause_diag_escaped=");
+        format!("{message} [pause_diag={}]", diagnostic.token())
+    }
+
+    fn annotate_required_primary(&mut self, errors: &mut [String], required: bool) {
+        if required
+            && let Some(primary) = errors.first_mut()
+            && !self.diagnostic_annotated
+        {
+            let diagnostic = self
+                .pending_diagnostic
+                .unwrap_or(PauseDiagnostic::OtherAutoNonconfirmed);
+            *primary = Self::annotate_primary(std::mem::take(primary), diagnostic);
+            self.diagnostic_annotated = true;
         }
     }
 
@@ -1814,12 +2043,21 @@ impl PauseIo for SessionPauseIo<'_> {
         additions_allowed: bool,
         pause_owned: bool,
         terminal_batch: &mut Option<TerminalBatch>,
-    ) -> Result<PauseBatchOutcome, String> {
-        self.reconcile_terminal_authority(terminal_batch)?;
+    ) -> Result<PauseBatchOutcome, PauseBatchError> {
+        self.reconcile_terminal_authority(terminal_batch)
+            .map_err(|error| PauseBatchError::new(error, None))?;
         let child = self.child;
         let stop_candidate_seen = &mut self.stop_candidate_seen;
+        let nested_deadline = std::cell::Cell::new(false);
         let mut collect = |session: &mut dyn EngineSession| {
-            collect_timed_retirement(session, child, deadline, stop_candidate_seen, pause_owned)
+            collect_timed_retirement(
+                session,
+                child,
+                deadline,
+                stop_candidate_seen,
+                pause_owned,
+                &nested_deadline,
+            )
         };
         let terminal_dispatch = terminal_batch.is_some();
         if let Some(batch) = terminal_batch.take()
@@ -1828,11 +2066,13 @@ impl PauseIo for SessionPauseIo<'_> {
                 .install_terminal_batch(batch.clone(), records.clone())
         {
             *terminal_batch = Some(batch);
-            return Err(format!(
-                "terminal discovery batch restore failed: {error:#}"
+            return Err(PauseBatchError::new(
+                format!("terminal discovery batch restore failed: {error:#}"),
+                None,
             ));
         }
         let records = terminal_dispatch.then(Vec::new).unwrap_or(records);
+        let before_ns = attach::monotonic_ns();
         let result = match self.engine.apply_discovery_batch_with(
             self.session,
             records,
@@ -1843,9 +2083,7 @@ impl PauseIo for SessionPauseIo<'_> {
         ) {
             Ok(outcome) => {
                 self.plan_changed |= outcome.changed;
-                Ok(PauseBatchOutcome {
-                    required_complete: outcome.required_complete,
-                })
+                Ok(outcome.required_complete)
             }
             Err(error) => {
                 let error = match error.downcast::<DeferredDiscoveryItem>() {
@@ -1858,11 +2096,34 @@ impl PauseIo for SessionPauseIo<'_> {
                 Err(format!("discovery batch application failed: {error:#}"))
             }
         };
+        let after_ns = attach::monotonic_ns();
+        let diagnostic = classify_apply_diagnostic(
+            before_ns,
+            after_ns,
+            deadline,
+            result.as_ref().copied().unwrap_or(true),
+            nested_deadline.get(),
+        );
+        let result = result.map_err(|message| PauseBatchError::new(message, diagnostic));
+        let result = result.map(|required_complete| PauseBatchOutcome {
+            required_complete,
+            diagnostic,
+        });
         if let Err(error) = self.reconcile_terminal_authority(terminal_batch) {
+            let diagnostic = result
+                .as_ref()
+                .map_or_else(|error| error.diagnostic, |outcome| outcome.diagnostic);
             return Err(match result {
-                Ok(_) => format!("terminal discovery authority reconciliation failed: {error:#}"),
-                Err(apply) => format!(
-                    "{apply}; terminal discovery authority reconciliation failed: {error:#}"
+                Ok(_) => PauseBatchError::new(
+                    format!("terminal discovery authority reconciliation failed: {error:#}"),
+                    diagnostic,
+                ),
+                Err(apply) => PauseBatchError::new(
+                    format!(
+                        "{}; terminal discovery authority reconciliation failed: {error:#}",
+                        apply.message
+                    ),
+                    diagnostic.or(apply.diagnostic),
                 ),
             });
         }
@@ -1914,8 +2175,16 @@ impl PauseIo for SessionPauseIo<'_> {
     ) -> Result<PauseRevalidationOutcome, String> {
         let child = self.child;
         let stop_candidate_seen = &mut self.stop_candidate_seen;
+        let nested_deadline = std::cell::Cell::new(false);
         let mut collect = |session: &mut dyn EngineSession| {
-            collect_timed_retirement(session, child, None, stop_candidate_seen, pause_owned)
+            collect_timed_retirement(
+                session,
+                child,
+                None,
+                stop_candidate_seen,
+                pause_owned,
+                &nested_deadline,
+            )
         };
         let outcome =
             match self
@@ -1940,6 +2209,7 @@ impl PauseIo for SessionPauseIo<'_> {
         self.plan_changed |= outcome.changed;
         Ok(PauseRevalidationOutcome::Complete(PauseBatchOutcome {
             required_complete: outcome.required_complete,
+            diagnostic: None,
         }))
     }
 
@@ -2005,23 +2275,28 @@ fn collect_timed_retirement(
     deadline: Option<u64>,
     stop_candidate_seen: &mut bool,
     pause_owned: bool,
+    nested_deadline: &std::cell::Cell<bool>,
 ) -> Result<(Vec<DiscoveryRecord>, u64), anyhow::Error> {
     collect_timed_retirement_with(
         child.pid(),
         deadline,
         stop_candidate_seen,
         pause_owned,
+        Some(nested_deadline),
         || attach::monotonic_ns().ok_or_else(|| anyhow::anyhow!("monotonic clock read failed")),
         || session.discovery_dequeue(),
         || owned_generation_retained(child).map_err(anyhow::Error::msg),
     )
 }
 
+// The explicit callbacks keep deadline, dequeue, and process-generation failure paths testable.
+#[allow(clippy::too_many_arguments)]
 fn collect_timed_retirement_with(
     child_pid: u32,
     deadline: Option<u64>,
     stop_candidate_seen: &mut bool,
     pause_owned: bool,
+    nested_deadline: Option<&std::cell::Cell<bool>>,
     mut now_ns: impl FnMut() -> Result<u64, anyhow::Error>,
     mut dequeue: impl FnMut() -> Result<Option<DiscoveryItem>, anyhow::Error>,
     mut same_generation: impl FnMut() -> Result<bool, anyhow::Error>,
@@ -2043,11 +2318,14 @@ fn collect_timed_retirement_with(
             }
         };
         if deadline.is_some_and(|deadline| before_ns > deadline) {
+            if let Some(nested_deadline) = nested_deadline {
+                nested_deadline.set(true);
+            }
             return Err(IncompleteTerminalDrain::new(
                 records,
                 malformed,
                 unvalidated_records,
-                anyhow::anyhow!("deadline crossed before nested discovery dequeue"),
+                anyhow::anyhow!(MSG_NESTED_DEADLINE_BEFORE),
             )
             .into());
         }
@@ -2125,6 +2403,9 @@ fn collect_timed_retirement_with(
             }
         };
         if deadline.is_some_and(|deadline| after_ns > deadline) {
+            if let Some(nested_deadline) = nested_deadline {
+                nested_deadline.set(true);
+            }
             match item {
                 Some(DiscoveryItem::Record(record)) => records.push(record),
                 Some(DiscoveryItem::Malformed) => malformed = malformed.saturating_add(1),
@@ -2134,7 +2415,7 @@ fn collect_timed_retirement_with(
                 records,
                 malformed,
                 unvalidated_records,
-                anyhow::anyhow!("deadline crossed after nested discovery dequeue"),
+                anyhow::anyhow!(MSG_NESTED_DEADLINE_AFTER),
             )
             .into());
         }
@@ -2254,7 +2535,7 @@ fn validate_received(received: &TimedItem, record_ns: u64, deadline: u64) -> Res
         return Err("monotonic dequeue clocks were reversed".into());
     }
     if received.before_ns > deadline || received.after_ns > deadline || record_ns > deadline {
-        return Err("pause causal deadline crossed".into());
+        return Err(MSG_PAUSE_CAUSAL_DEADLINE.into());
     }
     if record_ns > received.after_ns {
         return Err("pause record timestamp is in the future".into());
@@ -2293,6 +2574,8 @@ mod tests {
         fail_read: bool,
         fail_resume: bool,
         fail_apply: bool,
+        apply_outcome_diagnostic: Option<PauseDiagnostic>,
+        apply_error_diagnostic: Option<PauseDiagnostic>,
         fail_terminal_apply: bool,
         unvalidated_records: u64,
         required_complete: bool,
@@ -2339,6 +2622,8 @@ mod tests {
                 fail_read: false,
                 fail_resume: false,
                 fail_apply: false,
+                apply_outcome_diagnostic: None,
+                apply_error_diagnostic: None,
                 fail_terminal_apply: false,
                 unvalidated_records: 0,
                 required_complete: true,
@@ -2452,17 +2737,20 @@ mod tests {
             additions_allowed: bool,
             pause_owned: bool,
             terminal_batch: &mut Option<TerminalBatch>,
-        ) -> Result<PauseBatchOutcome, String> {
+        ) -> Result<PauseBatchOutcome, PauseBatchError> {
             self.events.push(if additions_allowed {
                 "apply"
             } else {
                 "account"
             });
             if self.fail_apply && additions_allowed {
-                return Err("apply".into());
+                return Err(PauseBatchError::new("apply", self.apply_error_diagnostic));
             }
             if self.fail_terminal_apply && !additions_allowed {
-                return Err("terminal apply".into());
+                return Err(PauseBatchError::new(
+                    "terminal apply",
+                    self.apply_error_diagnostic,
+                ));
             }
             self.apply_deadlines.push(deadline);
             self.apply_pause_owned.push(pause_owned);
@@ -2472,6 +2760,7 @@ mod tests {
             self.applied.extend(records);
             Ok(PauseBatchOutcome {
                 required_complete: self.required_complete,
+                diagnostic: self.apply_outcome_diagnostic,
             })
         }
 
@@ -2535,6 +2824,7 @@ mod tests {
             }
             Ok(PauseRevalidationOutcome::Complete(PauseBatchOutcome {
                 required_complete: self.revalidation_required_complete,
+                diagnostic: None,
             }))
         }
 
@@ -2658,6 +2948,7 @@ mod tests {
             None,
             &mut stop_candidate_seen,
             true,
+            None,
             || clocks.pop_front().expect("one before and one after clock"),
             || Ok(item.take()),
             || Ok(same_generation),
@@ -5180,6 +5471,7 @@ mod tests {
             None,
             &mut stop_candidate_seen,
             false,
+            None,
             || clocks.pop_front().expect("two clocks per dequeue"),
             || items.pop_front().expect("one item then empty"),
             || Ok(true),
@@ -5202,6 +5494,7 @@ mod tests {
             Some(100),
             &mut stop_candidate_seen,
             true,
+            None,
             || clocks.pop_front().expect("clock for queued record"),
             || items.pop_front().expect("queued record"),
             || Ok(true),
@@ -5222,6 +5515,28 @@ mod tests {
         assert_eq!(retained.malformed, 0);
     }
 
+    #[test]
+    fn nested_deadline_is_marked_at_its_source_not_from_rendered_text() {
+        for clocks in [VecDeque::from([Ok(101)]), VecDeque::from([Ok(1), Ok(101)])] {
+            let mut clocks = clocks;
+            let mut item = Some(DiscoveryItem::Record(record(1, 0, false)));
+            let mut stop_candidate_seen = false;
+            let nested_deadline = std::cell::Cell::new(false);
+            let result = collect_timed_retirement_with(
+                41,
+                Some(100),
+                &mut stop_candidate_seen,
+                true,
+                Some(&nested_deadline),
+                || clocks.pop_front().expect("bounded deadline clocks"),
+                || Ok(item.take()),
+                || Ok(true),
+            );
+            assert!(result.is_err());
+            assert!(nested_deadline.get());
+        }
+    }
+
     /// Every post-dequeue terminal failure owns the item it already removed
     /// from the ring: generation loss, record-timing validation, and the
     /// duplicate/unaccounted check must all report it in the retained prefix.
@@ -5237,6 +5552,7 @@ mod tests {
                     deadline,
                     &mut stop_candidate_seen,
                     true,
+                    None,
                     || clocks.pop_front().expect("clock for queued record"),
                     || items.pop_front().expect("queued record"),
                     || Ok(same_generation),
@@ -5296,6 +5612,7 @@ mod tests {
             Some(100),
             &mut stop_candidate_seen,
             true,
+            None,
             || clocks.pop_front().expect("before and after clocks"),
             || Ok(item.take()),
             || Ok(false),
@@ -5320,14 +5637,186 @@ mod tests {
         let error = coordinator.arm(&mut io).unwrap_err();
 
         assert!(error.required());
+        assert!(
+            error
+                .to_string()
+                .contains("[pause_diag=arm_failed_before_epoch]")
+        );
         assert_eq!(io.events.first(), Some(&"detach"));
         assert!(!io.events.contains(&"resume"));
+    }
+
+    #[test]
+    fn auto_arm_failure_is_one_disabled_partial_with_its_pre_epoch_token() {
+        let mut io = FakeIo {
+            same_generation: false,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(!coordinator.rearming_enabled());
+        assert!(!coordinator.is_armed());
+        assert_eq!(coordinator.pending_diagnostic, None);
+    }
+
+    #[test]
+    fn always_post_release_incomplete_keeps_the_primary_diagnostic() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.begin_attempt();
+        coordinator.set_diagnostic(PauseDiagnostic::PostReleaseRevalidationIncomplete);
+
+        let error = coordinator
+            .finish_nonconfirmed(MSG_POST_RELEASE_REVALIDATION_INCOMPLETE.into())
+            .unwrap_err();
+
+        assert!(error.required());
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{MSG_POST_RELEASE_REVALIDATION_INCOMPLETE} [pause_diag=post_release_revalidation_incomplete]"
+            )
+        );
+    }
+
+    #[test]
+    fn always_annotation_cannot_be_forged_or_suppressed_by_dynamic_text() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.begin_attempt();
+        coordinator.set_diagnostic(PauseDiagnostic::PauseHelperRejected);
+
+        let error = coordinator
+            .finish_nonconfirmed("dynamic [pause_diag=forged]".into())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("pause_diag_escaped=forged"));
+        assert!(error.contains("[pause_diag=pause_helper_rejected]"));
+        assert_eq!(error.matches("pause_diag=").count(), 1);
+    }
+
+    #[test]
+    fn always_boundary_failure_is_annotated_without_changing_cleanup_order() {
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_REQUESTED),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.begin_attempt();
+        coordinator.epoch.accepted = true;
+        coordinator.may_be_stopped = true;
+
+        let error = coordinator
+            .fail_cycle(&mut io, MSG_PAUSE_CONFIRMATION_DEADLINE, false)
+            .unwrap_err();
+
+        assert!(error.required());
+        assert!(
+            error
+                .to_string()
+                .contains("[pause_diag=later_pause_boundary]")
+        );
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "detach").count(),
+            1
+        );
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "remove").count(),
+            1
+        );
+        assert_eq!(
+            io.events.iter().filter(|event| **event == "resume").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn apply_error_category_cannot_overwrite_an_earlier_primary_category() {
+        let mut io = FakeIo {
+            fail_apply: true,
+            apply_error_diagnostic: Some(PauseDiagnostic::DeadlineDuringEngineApply),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.begin_attempt();
+        coordinator.set_diagnostic(PauseDiagnostic::PauseHelperRejected);
+
+        let error = coordinator
+            .fail_cycle(&mut io, "primary pause refusal", false)
+            .unwrap_err();
+
+        assert!(error.required());
+        assert!(
+            error
+                .to_string()
+                .contains("[pause_diag=pause_helper_rejected]")
+        );
+        assert_eq!(error.to_string().matches("pause_diag=").count(), 1);
+    }
+
+    #[test]
+    fn failure_cleanup_apply_category_cannot_overwrite_primary_fallback() {
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_REQUESTED),
+            fail_terminal_apply: true,
+            apply_error_diagnostic: Some(PauseDiagnostic::DeadlineBeforeEngineApply),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.epoch.accepted = true;
+        coordinator.may_be_stopped = true;
+
+        let error = coordinator
+            .fail_cycle(&mut io, "primary pause refusal", false)
+            .unwrap_err();
+
+        assert!(error.required());
+        assert!(
+            error
+                .to_string()
+                .contains("[pause_diag=other_auto_nonconfirmed]")
+        );
+        assert_eq!(error.to_string().matches("pause_diag=").count(), 1);
+        let detach = io.events.iter().position(|event| *event == "detach");
+        let apply = io.events.iter().position(|event| *event == "account");
+        let remove = io.events.iter().position(|event| *event == "remove");
+        let resume = io.events.iter().position(|event| *event == "resume");
+        assert!(
+            detach.unwrap() < apply.unwrap()
+                && apply.unwrap() < remove.unwrap()
+                && remove.unwrap() < resume.unwrap()
+        );
+    }
+
+    #[test]
+    fn successful_failure_cleanup_apply_adopts_its_typed_category() {
+        let mut io = FakeIo {
+            apply_outcome_diagnostic: Some(PauseDiagnostic::DeadlineDuringEngineApply),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+
+        let error = coordinator
+            .terminal_cleanup_with_cause(&mut io, vec!["lifecycle".into()], false, true)
+            .unwrap_err();
+
+        assert!(error.lifecycle());
+        assert_eq!(
+            coordinator.pending_diagnostic,
+            Some(PauseDiagnostic::DeadlineDuringEngineApply)
+        );
+        assert!(io.events.contains(&"account"));
     }
 
     #[test]
     fn terminal_preserves_required_failure_and_cleanup_errors() {
         let mut io = successful_io(vec![record(10, 0, false)]);
         io.fail_apply = true;
+        io.apply_error_diagnostic = Some(PauseDiagnostic::DeadlineDuringEngineApply);
         io.fail_detach = true;
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
         coordinator.arm_for_test();
@@ -5336,6 +5825,11 @@ mod tests {
 
         assert!(error.required());
         assert!(error.lifecycle());
+        assert!(
+            error
+                .to_string()
+                .contains("[pause_diag=deadline_during_engine_apply]")
+        );
         assert!(error.to_string().contains("apply"));
         assert!(error.to_string().contains("detach"));
         assert!(io.events.contains(&"account"));
@@ -5355,6 +5849,11 @@ mod tests {
         assert!(error.required());
         assert!(error.lifecycle());
         assert!(error.to_string().contains("rejected SIGSTOP"));
+        assert!(
+            error
+                .to_string()
+                .contains("[pause_diag=pause_helper_rejected]")
+        );
         assert!(error.to_string().contains("detach"));
         assert!(io.events.contains(&"account"));
         assert!(io.events.contains(&"remove"));
@@ -5550,5 +6049,146 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn pause_diagnostics_render_one_bounded_line_each() {
+        let cases = [
+            (
+                PauseDiagnostic::ArmFailedBeforeEpoch,
+                "arm_failed_before_epoch",
+            ),
+            (
+                PauseDiagnostic::PostReleaseRevalidationIncomplete,
+                "post_release_revalidation_incomplete",
+            ),
+            (
+                PauseDiagnostic::PauseHelperRejected,
+                "pause_helper_rejected",
+            ),
+            (
+                PauseDiagnostic::DeadlineBeforeEngineApply,
+                "deadline_before_engine_apply",
+            ),
+            (
+                PauseDiagnostic::DeadlineDuringEngineApply,
+                "deadline_during_engine_apply",
+            ),
+            (
+                PauseDiagnostic::EngineIncompleteWithinDeadline,
+                "engine_incomplete_within_deadline",
+            ),
+            (
+                PauseDiagnostic::NestedCollectorDeadline,
+                "nested_collector_deadline",
+            ),
+            (PauseDiagnostic::LaterPauseBoundary, "later_pause_boundary"),
+            (
+                PauseDiagnostic::OtherAutoNonconfirmed,
+                "other_auto_nonconfirmed",
+            ),
+        ];
+        for (diagnostic, token) in cases {
+            let line = render_pause_diagnostic(diagnostic);
+            assert_eq!(
+                line,
+                format!("p11scope: pause: partial [pause_diag={token}]"),
+                "every diagnostic has one exact bounded rendering"
+            );
+            assert_eq!(line.matches("pause_diag=").count(), 1);
+        }
+    }
+
+    #[test]
+    fn pause_diagnostic_message_mapping_is_exact_and_unknown_is_fallback() {
+        assert_eq!(
+            diagnostic_for_message(MSG_ARM_FAILED),
+            Some(PauseDiagnostic::ArmFailedBeforeEpoch)
+        );
+        assert_eq!(
+            diagnostic_for_message(MSG_POST_RELEASE_REVALIDATION_INCOMPLETE),
+            Some(PauseDiagnostic::PostReleaseRevalidationIncomplete)
+        );
+        assert_eq!(
+            diagnostic_for_message(MSG_PAUSE_HELPER_REJECTED),
+            Some(PauseDiagnostic::PauseHelperRejected)
+        );
+        assert_eq!(
+            diagnostic_for_message(MSG_NESTED_DEADLINE_BEFORE),
+            Some(PauseDiagnostic::NestedCollectorDeadline)
+        );
+        assert_eq!(
+            diagnostic_for_message(MSG_NESTED_DEADLINE_AFTER),
+            Some(PauseDiagnostic::NestedCollectorDeadline)
+        );
+        assert_eq!(
+            diagnostic_for_message("not a recognized pause message"),
+            None
+        );
+        for message in [
+            MSG_DEADLINE_BEFORE_DEQUEUE,
+            MSG_DEADLINE_AFTER_DEQUEUE,
+            MSG_PAUSE_CONFIRMATION_DEADLINE,
+            MSG_PAUSE_RESUME_DEADLINE,
+            MSG_PAUSE_CAUSAL_DEADLINE,
+            MSG_COALESCED_RECORD_DEADLINE,
+        ] {
+            assert_eq!(
+                diagnostic_for_message(message),
+                Some(PauseDiagnostic::LaterPauseBoundary)
+            );
+        }
+    }
+
+    #[test]
+    fn apply_diagnostic_precedence_requires_strict_deadline_crossing() {
+        assert_eq!(
+            classify_apply_diagnostic(Some(101), Some(102), Some(100), true, false),
+            Some(PauseDiagnostic::DeadlineBeforeEngineApply)
+        );
+        assert_eq!(
+            classify_apply_diagnostic(Some(100), Some(101), Some(100), true, false),
+            Some(PauseDiagnostic::DeadlineDuringEngineApply)
+        );
+        assert_eq!(
+            classify_apply_diagnostic(Some(100), Some(100), Some(100), false, false),
+            Some(PauseDiagnostic::EngineIncompleteWithinDeadline)
+        );
+        assert_eq!(
+            classify_apply_diagnostic(Some(100), Some(101), Some(100), true, true,),
+            Some(PauseDiagnostic::NestedCollectorDeadline)
+        );
+        assert_eq!(
+            classify_apply_diagnostic(None, None, Some(100), false, false),
+            None
+        );
+        assert_eq!(
+            classify_apply_diagnostic(Some(100), Some(101), None, false, false),
+            None
+        );
+        assert_eq!(
+            classify_apply_diagnostic(Some(100), Some(100), Some(100), true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn coordinator_diagnostic_is_first_cause_and_clears_on_emission() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.begin_attempt();
+        coordinator.set_diagnostic(PauseDiagnostic::LaterPauseBoundary);
+        coordinator.set_diagnostic(PauseDiagnostic::PauseHelperRejected);
+        assert_eq!(
+            coordinator.pending_diagnostic,
+            Some(PauseDiagnostic::LaterPauseBoundary)
+        );
+        assert_eq!(
+            coordinator.emit_partial_diagnostic(),
+            "p11scope: pause: partial [pause_diag=later_pause_boundary]"
+        );
+        assert_eq!(coordinator.pending_diagnostic, None);
+        coordinator.attempt_open = false;
+        coordinator.begin_attempt();
+        assert_eq!(coordinator.pending_diagnostic, None);
     }
 }

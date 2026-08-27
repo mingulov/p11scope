@@ -181,13 +181,6 @@ wait_mapped_and_drained() {
     wmd_attempt=0
     wmd_limit=${WAIT_ATTEMPTS:-240}
     wmd_delay=${WAIT_DELAY:-0.05}
-    while [ "$(count_byte_token "$wmd_log" HARNESS_PROVIDER_MAPPED)" -lt 1 ]; do
-        observer_alive || return 1
-        [ "$wmd_attempt" -lt "$wmd_limit" ] || return 1
-        wmd_attempt=$((wmd_attempt + 1))
-        sleep "$wmd_delay"
-    done
-    [ "$(count_byte_token "$wmd_log" HARNESS_PROVIDER_MAPPED)" -eq 1 ] || return 1
     if [ "$wmd_load_kind" = initial-set ]; then
         wmd_expected=HARNESS_PROVIDER_INITIAL_SET
         wmd_rejected=HARNESS_PROVIDER_LATE_LOAD
@@ -195,21 +188,43 @@ wait_mapped_and_drained() {
         wmd_expected=HARNESS_PROVIDER_LATE_LOAD
         wmd_rejected=HARNESS_PROVIDER_INITIAL_SET
     fi
-    [ "$(count_byte_token "$wmd_log" "$wmd_expected")" -eq 1 ] || return 1
-    [ "$(count_byte_token "$wmd_log" "$wmd_rejected")" -eq 0 ] || return 1
-    wmd_offset=$(wc -c < "$wmd_log") || return 1
-    wmd_attempt=0
     while :; do
-        wmd_frames=$(python3 - "$wmd_log" "$wmd_offset" <<'PY'
+        wmd_state=$(python3 - "$wmd_log" "$wmd_expected" "$wmd_rejected" <<'PY'
 import sys
+path, expected, rejected = sys.argv[1:]
+marker = b"HARNESS_PROVIDER_MAPPED"
+expected = expected.encode()
+rejected = rejected.encode()
 with open(sys.argv[1], "rb") as stream:
-    stream.seek(int(sys.argv[2]))
-    lines = stream.read().splitlines(keepends=True)
-print(sum(line.endswith(b"\n") and b"p11scope" in line
-          and b"privacy=aggregate-only" in line for line in lines))
+    snapshot = stream.read()
+marker_count = snapshot.count(marker)
+expected_count = snapshot.count(expected)
+rejected_count = snapshot.count(rejected)
+if marker_count > 1 or expected_count > 1 or rejected_count:
+    print("invalid 0")
+elif marker_count == 1 and expected_count == 1:
+    offset = snapshot.index(marker) + len(marker)
+    lines = snapshot[offset:].splitlines(keepends=True)
+    frames = sum(line.endswith(b"\n") and b"p11scope" in line
+                 and b"privacy=aggregate-only" in line for line in lines)
+    print(("ready" if frames >= 2 else "pending"), frames)
+else:
+    print("pending 0")
 PY
         ) || return 1
-        [ "$wmd_frames" -lt 2 ] || return 0
+        wmd_status=${wmd_state%% *}
+        wmd_frames=${wmd_state#* }
+        case "$wmd_status" in
+            ready)
+                [ "$wmd_frames" -ge 2 ] || return 1
+                return 0
+                ;;
+            pending)
+                [ "$wmd_frames" -ge 0 ] || return 1
+                ;;
+            invalid) return 1 ;;
+            *) return 1 ;;
+        esac
         observer_alive || return 1
         [ "$wmd_attempt" -lt "$wmd_limit" ] || return 1
         wmd_attempt=$((wmd_attempt + 1))
@@ -293,6 +308,12 @@ C
         echo "empty marker token was accepted" >&2
         exit 1
     fi
+    printf '%s\n' HARNESS_PROVIDER_LATE_LOAD HARNESS_PROVIDER_MAPPED \
+        'p11scope — privacy=aggregate-only' \
+        'p11scope — privacy=aggregate-only' \
+        > "$self_root/presnapshot.log"
+    WAIT_PID=$$
+    wait_mapped_and_drained "$self_root/presnapshot.log" dlopen
     printf '%s\n' 'p11scope — provider diagnostic HARNESS_PROVIDER_LATE_LOAD ... HARNESS_PROVIDER_MAPPED' \
         > "$self_root/interleaved.log"
     (sleep 0.25; \
@@ -301,6 +322,21 @@ C
         >> "$self_root/interleaved.log" &
     WAIT_PID=$!
     wait_mapped_and_drained "$self_root/interleaved.log" dlopen
+    wait "$WAIT_PID"
+    printf '%s\n' HARNESS_PROVIDER_LATE_LOAD HARNESS_PROVIDER_MAPPED \
+        'p11scope — privacy=aggregate-only' \
+        > "$self_root/topology-race.log"
+    (
+        sleep 0.5
+        printf '%s\n' HARNESS_PROVIDER_INITIAL_SET \
+            'p11scope — privacy=aggregate-only' >> "$self_root/topology-race.log"
+        sleep 0.3
+    ) &
+    WAIT_PID=$!
+    if wait_mapped_and_drained "$self_root/topology-race.log" dlopen; then
+        echo "rejected topology was accepted after a second frame" >&2
+        exit 1
+    fi
     wait "$WAIT_PID"
     WAIT_ATTEMPTS=20 WAIT_DELAY=0.01
     : > "$self_root/one.log"

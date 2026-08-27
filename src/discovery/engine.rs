@@ -1108,14 +1108,21 @@ impl EngineSession for Session {
 pub(crate) struct IncompleteTerminalDrain {
     pub(crate) records: Vec<DiscoveryRecord>,
     pub(crate) malformed: u64,
+    pub(crate) unvalidated_records: u64,
     cause: String,
 }
 
 impl IncompleteTerminalDrain {
-    pub(crate) fn new(records: Vec<DiscoveryRecord>, malformed: u64, cause: anyhow::Error) -> Self {
+    pub(crate) fn new(
+        records: Vec<DiscoveryRecord>,
+        malformed: u64,
+        unvalidated_records: u64,
+        cause: anyhow::Error,
+    ) -> Self {
         Self {
             records,
             malformed,
+            unvalidated_records,
             cause: cause.to_string(),
         }
     }
@@ -1127,6 +1134,7 @@ impl std::fmt::Debug for IncompleteTerminalDrain {
             .debug_struct("IncompleteTerminalDrain")
             .field("records", &self.records.len())
             .field("malformed", &self.malformed)
+            .field("unvalidated_records", &self.unvalidated_records)
             .field("cause", &self.cause)
             .finish()
     }
@@ -4575,6 +4583,14 @@ impl Engine {
         }
     }
 
+    pub(crate) fn account_unvalidated_discovery(&mut self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.discovery_truncated = self.discovery_truncated.saturating_add(count);
+        self.invalidate_causal_timing();
+    }
+
     fn allocate_view_id(&mut self) -> Result<ProcessViewId> {
         if self.next_view_id as usize >= MAX_SCAN_PIDS {
             bail!("capture process-view capacity {MAX_SCAN_PIDS} is exhausted");
@@ -4827,7 +4843,7 @@ impl Engine {
                 // the producer, so it travels with the failure as the retained
                 // prefix, exactly as the timed terminal collector does.
                 Err(error) => {
-                    return Err(IncompleteTerminalDrain::new(records, malformed, error).into());
+                    return Err(IncompleteTerminalDrain::new(records, malformed, 0, error).into());
                 }
             }
         }
@@ -6370,6 +6386,7 @@ impl Engine {
             errors.push("dynamic loader detach failed".into());
         }
         let mut complete = true;
+        let mut unvalidated_records = 0;
         let drained = begin_owned_prearm_retirement_with(
             &mut self.loader_registry,
             context,
@@ -6381,11 +6398,13 @@ impl Engine {
                 Err(error) => {
                     let incomplete = error.downcast::<IncompleteTerminalDrain>()?;
                     complete = false;
+                    unvalidated_records = incomplete.unvalidated_records;
                     Ok((incomplete.records, incomplete.malformed))
                 }
                 drained => drained,
             },
         );
+        self.account_unvalidated_discovery(unvalidated_records);
         if !complete {
             errors.push(
                 "post-detach discovery drain was incomplete; its exact prefix is retained".into(),
@@ -6557,6 +6576,7 @@ impl Engine {
             }
             Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
                 Ok(incomplete) => {
+                    self.account_unvalidated_discovery(incomplete.unvalidated_records);
                     self.retain_terminal_batch(
                         incomplete.records.clone(),
                         false,
@@ -6617,7 +6637,6 @@ impl Engine {
             bail!("terminal loader drain batch cannot be restored");
         }
         batch.extend(records);
-        batch.complete = true;
         self.terminal_batch = Some(batch);
         Ok(())
     }
@@ -6626,6 +6645,85 @@ impl Engine {
         self.terminal_batch
             .take()
             .ok_or_else(|| anyhow!("terminal loader drain batch is missing"))
+    }
+
+    pub(crate) fn reconcile_terminal_authority(
+        &mut self,
+        returned: &mut Option<TerminalBatch>,
+    ) -> Result<()> {
+        let Some(journal) = self.terminal_journal else {
+            if self.terminal_batch.is_some() || returned.is_some() {
+                bail!("terminal loader drain authority has no journal");
+            }
+            return Ok(());
+        };
+        if journal.dispatch_started {
+            if self.terminal_batch.is_some() || returned.is_some() {
+                bail!("dispatched terminal authority still has a replayable batch");
+            }
+            return Ok(());
+        }
+        match (self.terminal_batch.take(), returned.as_ref()) {
+            (Some(batch), None) => *returned = Some(batch),
+            (None, Some(batch)) if batch.authority.owner == journal.owner => {}
+            (Some(batch), Some(_)) => {
+                self.terminal_batch = Some(batch);
+                bail!("terminal loader drain authority has two batch owners");
+            }
+            (None, Some(_)) => bail!("returned terminal batch does not match its journal"),
+            (None, None) => bail!("undispatched terminal authority has no batch owner"),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn terminal_authority_pending(&self) -> bool {
+        self.terminal_journal.is_some()
+    }
+
+    pub(crate) fn cleanup_started_terminal_journal(&mut self) -> Result<()> {
+        let journal = self
+            .terminal_journal
+            .ok_or_else(|| anyhow!("terminal loader drain journal is missing"))?;
+        if !journal.dispatch_started || self.terminal_batch.is_some() {
+            bail!("terminal loader drain journal is not cleanup-only");
+        }
+        self.loader_registry
+            .remove(journal.owner)
+            .map_err(anyhow::Error::msg)?;
+        self.terminal_journal = None;
+        Ok(())
+    }
+
+    pub(crate) fn cleanup_terminal_batch_without_replay(
+        &mut self,
+        returned: &mut Option<TerminalBatch>,
+    ) -> Result<()> {
+        let batch = returned
+            .as_ref()
+            .ok_or_else(|| anyhow!("returned terminal batch is missing"))?;
+        let journal = self
+            .terminal_journal
+            .ok_or_else(|| anyhow!("terminal loader drain journal is missing"))?;
+        if journal.dispatch_started || journal.owner != batch.authority.owner {
+            bail!("returned terminal batch does not match the undispatched journal");
+        }
+        if self.terminal_batch.as_ref().is_some() {
+            bail!("engine still owns an undispatched terminal batch");
+        }
+        self.terminal_journal
+            .as_mut()
+            .expect("journal checked above")
+            .dispatch_started = true;
+        returned.take();
+        self.mark_live_loss(
+            TERMINAL_DRAIN_SUBJECT,
+            "the bounded terminal cleanup retry failed; its undispatched batch was discarded without replay",
+        );
+        self.loader_registry
+            .remove(journal.owner)
+            .map_err(anyhow::Error::msg)?;
+        self.terminal_journal = None;
+        Ok(())
     }
 
     fn dispatch_terminal_batch(
@@ -6834,6 +6932,7 @@ impl Engine {
                     }
                     Ok(Err(error)) => {
                         if let Ok(incomplete) = error.downcast::<IncompleteTerminalDrain>() {
+                            self.account_unvalidated_discovery(incomplete.unvalidated_records);
                             self.retain_terminal_batch(
                                 incomplete.records,
                                 false,
@@ -8247,7 +8346,7 @@ impl Engine {
 #[cfg(test)]
 pub(crate) mod session_fixture {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
     #[derive(Default)]
@@ -8256,6 +8355,7 @@ pub(crate) mod session_fixture {
         pub(crate) counters: CounterSnapshot,
         /// One entry per upcoming `counter_snapshot` call; `true` fails it.
         counter_script: RefCell<VecDeque<bool>>,
+        counter_reads: Cell<u64>,
         pub(crate) detach_exports: Vec<DynamicExportIdentity>,
         pub(crate) detach_failed: bool,
         pub(crate) lifecycle_tracking_unavailable: Option<&'static str>,
@@ -8308,6 +8408,10 @@ pub(crate) mod session_fixture {
             *self.counter_script.borrow_mut() = script.into_iter().collect();
         }
 
+        pub(crate) fn counter_reads(&self) -> u64 {
+            self.counter_reads.get()
+        }
+
         /// A session whose next `attach_targets` kills and reaps `pid`, i.e.
         /// loses the retained generation exactly between a link mutation's
         /// generation precheck and its postcheck.
@@ -8339,6 +8443,8 @@ pub(crate) mod session_fixture {
         }
 
         fn counter_snapshot(&self) -> Result<CounterSnapshot> {
+            self.counter_reads
+                .set(self.counter_reads.get().saturating_add(1));
             if self
                 .counter_script
                 .borrow_mut()
@@ -8502,6 +8608,33 @@ impl Engine {
         self.terminal_batch.as_ref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn malformed_discovery_for_test(&self) -> u64 {
+        self.malformed_discovery
+    }
+
+    pub(crate) fn unvalidated_discovery_for_test(&self) -> u64 {
+        self.discovery_truncated
+    }
+
+    pub(crate) fn start_cleanup_only_terminal_journal_for_test(&mut self, owner: LoaderContextId) {
+        self.retirement_intents.clear();
+        self.terminal_batch = None;
+        self.terminal_journal = Some(TerminalJournal {
+            owner,
+            dispatch_started: true,
+            retry_used: true,
+        });
+    }
+
+    pub(crate) fn tombstone_loader_context_for_test(&mut self, owner: LoaderContextId) {
+        self.loader_registry.tombstone(owner).unwrap();
+    }
+
+    pub(crate) fn pending_discovery_records_for_test(&self) -> usize {
+        self.pending_discovery_records.len()
+    }
+
     /// `(owner, dispatch_started, retry_used)` of the private lifecycle journal.
     pub(crate) fn terminal_journal_for_test(&self) -> Option<(LoaderContextId, bool, bool)> {
         self.terminal_journal
@@ -8575,6 +8708,77 @@ mod tests {
             !engine.plan.skipped.is_empty(),
             "the final engine plan supplies the existing public PARTIAL projection"
         );
+    }
+
+    #[test]
+    fn unvalidated_discovery_accounting_changes_only_bounded_loss_evidence() {
+        let (mut engine, owner) = Engine::retiring_loader_context(std::process::id());
+        let view = ProcessViewId(0);
+        let timing = timing_key(0);
+        engine.timings.observe(&timing, 1_000_000);
+        engine.timings.complete(&timing, 2_000_000);
+        engine.discovery_truncated = 1;
+        engine.refresh_requested.insert(std::process::id());
+        engine.pending_retirements.insert(view);
+        engine.ready_expected_removals.insert(view);
+        engine.expected_target_exit_pending = Some(view);
+        engine.loader_records_accepted = 7;
+        engine.counter_snapshot.loader_hits = 11;
+        engine.terminal_journal = Some(TerminalJournal {
+            owner,
+            dispatch_started: true,
+            retry_used: false,
+        });
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_LOADER;
+        engine
+            .pending_discovery_records
+            .push(QueuedDiscoveryRecord {
+                record,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            });
+        let confirmation = PauseClosure::new(true);
+
+        let before_plan = engine.plan.clone();
+        let before_discovery = engine.discovery.clone();
+        let before_views: Vec<_> = engine.views.iter().map(ProcessView::id).collect();
+        let before_refresh = engine.refresh_requested.clone();
+        let before_retirements = engine.pending_retirements.clone();
+        let before_ready = engine.ready_expected_removals.clone();
+        let before_facts = engine.capture_facts();
+        let before_journal = engine.terminal_journal_for_test();
+
+        engine.account_unvalidated_discovery(0);
+        assert_eq!(engine.timings.gap_ns(&timing), Some(1_000_000));
+        engine.account_unvalidated_discovery(u64::MAX);
+        engine.account_unvalidated_discovery(1);
+
+        assert_eq!(engine.discovery_truncated, u64::MAX);
+        assert_eq!(engine.capture_facts().discovery_truncated, u64::MAX);
+        assert_eq!(engine.capture_facts().attach_gap_ms(), None);
+        assert_eq!(engine.plan, before_plan);
+        assert_eq!(engine.discovery, before_discovery);
+        assert_eq!(
+            engine.views.iter().map(ProcessView::id).collect::<Vec<_>>(),
+            before_views
+        );
+        assert_eq!(engine.refresh_requested, before_refresh);
+        assert_eq!(engine.loader_records_accepted, 7);
+        assert_eq!(engine.counter_snapshot.loader_hits, 11);
+        assert_eq!(engine.loader_context_state_for_test(owner), Some("live"));
+        assert_eq!(engine.pending_retirements, before_retirements);
+        assert_eq!(engine.ready_expected_removals, before_ready);
+        assert_eq!(engine.expected_target_exit_pending, Some(view));
+        assert_eq!(engine.terminal_journal_for_test(), before_journal);
+        assert!(engine.terminal_batch_for_test().is_none());
+        assert_eq!(engine.pending_discovery_records.len(), 1);
+        assert!(confirmation.required_complete());
+        assert_eq!(
+            engine.capture_facts().table_entries,
+            before_facts.table_entries
+        );
+        assert_eq!(engine.capture_facts().slots, before_facts.slots);
     }
 
     fn dynamic_export_work(module: PinnedTimingKey, already_attached: bool) -> DynamicExportWork {
@@ -8691,7 +8895,7 @@ mod tests {
     fn generic_drain_failure_states_no_retention_claim() {
         let record: DiscoveryRecord = unsafe { std::mem::zeroed() };
         let retained =
-            IncompleteTerminalDrain::new(vec![record], 0, anyhow!("scripted ring read failed"));
+            IncompleteTerminalDrain::new(vec![record], 0, 0, anyhow!("scripted ring read failed"));
 
         let error = Engine::generic_drain_error(retained.into());
 
@@ -11977,6 +12181,189 @@ mod tests {
             Some(owner)
         );
         assert!(engine.loader_registry.is_tombstoned(owner));
+    }
+
+    #[test]
+    fn rejected_terminal_cleanup_leaves_both_batch_owners_unchanged() {
+        let pid = std::process::id();
+        for case in [
+            "missing journal",
+            "mismatched journal owner",
+            "dispatch started",
+            "competing engine batch",
+        ] {
+            let (mut engine, owner) = Engine::retiring_loader_context(pid);
+            let other = LoaderContextId::from_case_id(9);
+            let export = terminal_export();
+            let mut first = loader_record_for(owner, pid);
+            first.hook_ts_ns = 11;
+            let mut second = loader_record_for(other, pid);
+            second.hook_ts_ns = 22;
+            let mut returned = TerminalBatch::empty(TerminalAuthority {
+                owner,
+                exports: vec![export],
+            });
+            returned.extend([first, second]);
+            returned.complete = true;
+            let mut returned = Some(returned);
+
+            match case {
+                "missing journal" => {}
+                "mismatched journal owner" => {
+                    engine.terminal_journal = Some(TerminalJournal {
+                        owner: other,
+                        dispatch_started: false,
+                        retry_used: true,
+                    });
+                }
+                "dispatch started" => {
+                    engine.terminal_journal = Some(TerminalJournal {
+                        owner,
+                        dispatch_started: true,
+                        retry_used: true,
+                    });
+                }
+                "competing engine batch" => {
+                    engine.terminal_journal = Some(TerminalJournal {
+                        owner,
+                        dispatch_started: false,
+                        retry_used: true,
+                    });
+                    engine.terminal_batch = Some(TerminalBatch::empty(TerminalAuthority {
+                        owner: other,
+                        exports: Vec::new(),
+                    }));
+                }
+                _ => unreachable!(),
+            }
+
+            let batch_state = |batch: Option<&TerminalBatch>| {
+                batch.map(|batch| {
+                    (
+                        batch.authority.owner,
+                        batch.authority.exports.clone(),
+                        batch.record_count(),
+                        batch.complete(),
+                        batch.tagged_owners(),
+                    )
+                })
+            };
+            let journal = engine.terminal_journal_for_test();
+            let engine_batch = batch_state(engine.terminal_batch.as_ref());
+            let registry = engine.loader_context_state_for_test(owner);
+            let skips = engine.counters.object_skips.clone();
+            let plan = engine.plan.clone();
+            let truncated = engine.capture_facts().discovery_truncated;
+            let dispatched = engine.dispatched_loader_records();
+
+            let error = engine
+                .cleanup_terminal_batch_without_replay(&mut returned)
+                .unwrap_err();
+
+            assert!(!error.to_string().is_empty(), "{case}");
+            let returned = returned.as_ref().expect("coordinator keeps its batch");
+            assert_eq!(returned.authority.owner, owner, "{case}");
+            assert_eq!(returned.authority.exports, [export], "{case}");
+            assert_eq!(returned.record_count(), 2, "{case}");
+            assert!(returned.complete(), "{case}");
+            assert_eq!(returned.tagged_owners(), [Some(owner), None], "{case}");
+            assert_eq!(returned.records[0].record.hook_ts_ns, 11, "{case}");
+            assert_eq!(
+                returned.records[0].record.pid_tgid,
+                u64::from(pid) << 32,
+                "{case}"
+            );
+            assert_eq!(returned.records[1].record.hook_ts_ns, 22, "{case}");
+            assert_eq!(
+                returned.records[1].record.pid_tgid,
+                u64::from(pid) << 32,
+                "{case}"
+            );
+            assert_eq!(engine.terminal_journal_for_test(), journal, "{case}");
+            assert_eq!(
+                batch_state(engine.terminal_batch.as_ref()),
+                engine_batch,
+                "{case}"
+            );
+            assert_eq!(
+                engine.loader_context_state_for_test(owner),
+                registry,
+                "{case}"
+            );
+            assert_eq!(engine.counters.object_skips, skips, "{case}");
+            assert_eq!(engine.plan, plan, "{case}");
+            assert_eq!(
+                engine.capture_facts().discovery_truncated,
+                truncated,
+                "{case}"
+            );
+            assert_eq!(engine.dispatched_loader_records(), dispatched, "{case}");
+        }
+    }
+
+    #[test]
+    fn terminal_cleanup_consumes_once_then_retries_only_registry_removal() {
+        let pid = std::process::id();
+        let (mut engine, owner) = Engine::retiring_loader_context(pid);
+        let other = LoaderContextId::from_case_id(9);
+        let export = terminal_export();
+        let mut returned = TerminalBatch::empty(TerminalAuthority {
+            owner,
+            exports: vec![export],
+        });
+        returned.extend([loader_record_for(owner, pid), loader_record_for(other, pid)]);
+        returned.complete = true;
+        let mut returned = Some(returned);
+        engine.terminal_journal = Some(TerminalJournal {
+            owner,
+            dispatch_started: false,
+            retry_used: true,
+        });
+        let plan = engine.plan.clone();
+        let truncated = engine.capture_facts().discovery_truncated;
+        let malformed = engine.malformed_discovery_for_test();
+        let pending = engine.pending_discovery_records_for_test();
+
+        let error = engine
+            .cleanup_terminal_batch_without_replay(&mut returned)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("not tombstoned"), "{error:#}");
+        assert!(returned.is_none(), "the coordinator batch was consumed");
+        assert!(engine.terminal_batch_for_test().is_none());
+        assert_eq!(
+            engine.terminal_journal_for_test(),
+            Some((owner, true, true))
+        );
+        assert_eq!(engine.loader_context_state_for_test(owner), Some("live"));
+        assert_eq!(engine.dispatched_loader_records(), 0);
+        assert_eq!(engine.counters.object_skips.len(), 1);
+        assert_eq!(
+            engine.counters.object_skips[0].subject,
+            TERMINAL_DRAIN_SUBJECT
+        );
+        assert_eq!(
+            engine.counters.object_skips[0].reason,
+            "the bounded terminal cleanup retry failed; its undispatched batch was discarded without replay"
+        );
+        assert_eq!(engine.plan, plan);
+        assert_eq!(engine.capture_facts().discovery_truncated, truncated);
+        assert_eq!(engine.malformed_discovery_for_test(), malformed);
+        assert_eq!(engine.pending_discovery_records_for_test(), pending);
+
+        engine.tombstone_loader_context_for_test(owner);
+        let skips = engine.counters.object_skips.clone();
+        engine.cleanup_started_terminal_journal().unwrap();
+
+        assert_eq!(engine.terminal_journal_for_test(), None);
+        assert!(engine.terminal_batch_for_test().is_none());
+        assert_eq!(engine.loader_context_state_for_test(owner), None);
+        assert_eq!(engine.dispatched_loader_records(), 0);
+        assert_eq!(engine.counters.object_skips, skips);
+        assert_eq!(engine.plan, plan);
+        assert_eq!(engine.capture_facts().discovery_truncated, truncated);
+        assert_eq!(engine.malformed_discovery_for_test(), malformed);
+        assert_eq!(engine.pending_discovery_records_for_test(), pending);
     }
 
     #[test]

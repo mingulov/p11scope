@@ -2,8 +2,11 @@
 
 **Date:** 2026-08-27
 
-**Status:** Proposed; execute only after the paired amendment and this plan pass
-independent Sol, Terra, and Luna review and are committed together.
+**Status:** Tasks 1-7 passed at
+`1098d7de655b0a727c60762cc1af46989d7ef46b`: Gate A 2/2, Gate B 120/120,
+host Lane 02 6/6, and unanimous Sol/Terra/Luna evidence review. The remaining
+production Task 4 sequence must still begin with a fresh Lane 02 root;
+r3/9.2d and later gates remain locked.
 
 **Starting base:** `17c538ff6a73bf2aecd3ee539bee54732a964229`
 

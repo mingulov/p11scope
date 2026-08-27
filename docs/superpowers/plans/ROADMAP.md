@@ -486,6 +486,15 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     unclaimed. See the
     [pause amendment](../specs/2026-08-19-slice1b2-no-busy-wait-pause-amendment.md).**
 
+    **Fixed-ceiling disposition (2026-08-27):** The reviewed
+    [500 ms amendment](../specs/2026-08-27-slice1b2-500ms-pause-amendment.md)
+    passed fresh Gate A on Jammy 5.15 and Noble 6.8, Gate B 120/120 across
+    three cold boots per kernel, and the isolated host Lane 02 matrix 6/6.
+    Independent Sol, Terra, and Luna evidence review unanimously passed. This
+    selects the candidate only: the remaining Task 4 sequence restarts with a
+    fresh Lane 02 root, and r3/9.2d, 9.3, CI, Task 10, and release remain
+    pending.**
+
     **Topology scope ruling (2026-08-27):** The exact reproduced node-wide
     retained-view late-provider case is an expected `UNSUPPORTED/NON-PASS`
     negative control with one overlay plus one unavailable; it is evaluated

@@ -2347,7 +2347,10 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         .expect("run unreachable-dispatch fixture");
     assert_eq!(bypass_output.status.code(), Some(97));
     assert_eq!(read(bypass_log.to_str().unwrap()), "rm\n");
-    assert_eq!(fs::read(&sentinel).unwrap(), b"must survive byte-identical\n");
+    assert_eq!(
+        fs::read(&sentinel).unwrap(),
+        b"must survive byte-identical\n"
+    );
 
     for (lane, script, marker, lane_cases) in drivers {
         let fixture = tempfile::tempdir().expect("create retained Task 4 self-test fixture");

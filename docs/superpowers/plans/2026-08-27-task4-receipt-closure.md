@@ -145,10 +145,12 @@ and pathname identity before use. Every facts append and final `terminal_status_
 uses FD 7. Lane 14 additionally holds nested `artifacts/discover.facts` as FD 8.
 Lock FD 9 is reserved for the common lock.
 Every ordinary external tool, Cargo/runtime command, wrapper payload, and fake
-command is invoked with `7>&- 8>&- 9>&- 10>&- 11>&- 12>&- 13>&- 14>&-`. The only exceptions
+command is invoked with `7>&- 8>&- 9>&- 10>&- 11>&- 12>&- 13>&- 14>&- 15>&-`. The only exceptions
 are the initial `flock` operation using FD 9, the narrowly named inline facts
 writer using FD 7, the Lane 14 creator/handoff steps using FD 12/8, self-test
 owner/publisher control using FD 10/11, the self-test supervisor using FD 13/14,
+the transient Python group anchor while it passes FD 15, and the self-test
+witness link shared by the Rust peer and supervisor FD 15,
 and the final terminal publisher using FD 7/8/9. The terminal publisher performs revalidation with Python stdlib and
 spawns no child; any defensive subprocess API must set `close_fds=True`. Fixture
 commands inspect `/proc/self/fd` and fail if a reserved descriptor leaks.
@@ -476,10 +478,16 @@ separately reviewed plan amendment and new digest.
 #### Self-test-only real-finalizer fixture protocol
 
 The public interface remains exactly `--self-test`; it accepts no case selector,
-fault environment, or extra argument. That branch creates one private mode-0700
-temporary parent, a fixed fake-command directory, and one subprocess per
-declared case by forking a shell subshell that calls the same receipt-owner/body/
-finalizer functions as normal mode. Lexical shell variables select the fake
+fault environment, or extra argument. Standalone self-test creates one private
+mode-0700 temporary parent and requires neither
+`P11SCOPE_TASK4_SELF_TEST_WORK`, `P11SCOPE_TASK4_SELF_TEST_ANCHOR_PGID`, nor FD
+15. The Rust-observed form instead requires all three: an existing, empty,
+caller-owned mode-0700 absolute `P11SCOPE_TASK4_SELF_TEST_WORK` parent, inherited
+FD 15, and the anchor PGID below. Any incomplete combination is an exit-2
+rejection before mutation. These inputs are accepted only by the exact
+one-argument `--self-test` branch, and normal mode rejects all three. The branch creates a fixed
+fake-command directory and one subprocess per declared case by forking a shell
+subshell that calls the same receipt-owner/body/finalizer functions as normal mode. Lexical shell variables select the fake
 body and fault point only inside that subshell. Normal receipt mode forcibly
 sets those variables to `none`, resets `PATH` to the validated normal command
 set, and rejects extra arguments, so caller environment cannot activate a test
@@ -489,15 +497,20 @@ The fake-command boundary replaces only the named Cargo/runtime/tool commands;
 root validation, trap installation, receipt mutation, resource journal,
 cleanup/query logic, facts parser, inline terminal publisher, and status commit
 are the production code. The self-test supervisor creates two mode-0600 FIFOs
-inside its private temporary directory: `control.in` and `events.out`. It opens
+at `$P11SCOPE_TASK4_SELF_TEST_WORK/control.in` and
+`$P11SCOPE_TASK4_SELF_TEST_WORK/events.out` in observed mode, or at the same
+relative names under its standalone parent. The FIFOs are supervisor-created,
+caller-UID-owned mode-0600 objects. It opens
 both ends read/write before forking, retaining control/events as supervisor FDs
-13/14. The case subshell duplicates 13 to child control-input FD 10 and 14 to
+13/14. The supervisor itself rejects symlink/non-FIFO/wrong-owner/wrong-mode/
+wrong-link-count paths and requires pathname `lstat` to match FD `fstat` after
+creation, before every child, and before identity cleanup. The case subshell duplicates 13 to child control-input FD 10 and 14 to
 child event-output FD 11, then closes 13/14 before calling the receipt owner;
 creator protocol FD 12 remains distinct. Normal receipt mode closes 10 through
-14 before validation and ignores all inherited test variables. Fake external
-commands receive `10>&- 11>&- 12>&- 13>&- 14>&-`; only the receipt owner and its
+15 before validation and ignores all inherited test variables. Fake external
+commands receive `10>&- 11>&- 12>&- 13>&- 14>&- 15>&-`; only the receipt owner and its
 execed terminal publisher retain child FDs 10/11, while only the supervisor
-retains FDs 13/14.
+retains FDs 13/14 and the supervisor side of FD 15. Case children close FD 15.
 
 Each FIFO frame is one bounded ASCII line:
 
@@ -506,22 +519,280 @@ selftest-v1<TAB>NONCE<TAB>CASE<TAB>SEQUENCE<TAB>event|command<TAB>NAME<LF>
 ```
 
 The child writes increasing `event` frames to FD 11; the supervisor alone writes
-increasing `command` frames to FD 10. Nonce/case/direction/sequence mismatch,
+increasing `command` frames to FD 10. The two FIFOs are campaign-wide: they are
+created once before the first case, reused by every exactly reaped case, then
+closed and identity-removed before the supervisor's final completion event.
+Nonce/case/direction/sequence mismatch,
 unexpected EOF, malformed/duplicate frame, or timeout fails that case and kills
 then reaps only the pinned child generation. `continue` and the fixed fault
 commands `facts-write`, `facts-fsync`, `dir-fsync`, `mode-drift`, `inventory`,
 `pending-write`, `pending-fsync`, `rename-collision`, and
 `rename-unavailable` are the only commands. Events expose exact barriers before
 and after requested/resolved registration and before terminal rename. The
-supervisor pins each child PID/starttime, waits for the exact event, sends the
-requested `INT`/`HUP`/`TERM` directly to that generation or writes its command,
-and bounds every frame wait at five monotonic seconds. The child closes 10/11
-immediately after the final terminal fault point; the supervisor closes 13/14
-after exact child reap and removes only identity-matching FIFOs.
+supervisor pins each child PID/starttime and waits for the exact event. In the
+Rust-observed form it forwards each named lifecycle barrier to FD 15, waits for
+Rust's acknowledgement, and only then sends the requested `INT`/`HUP`/`TERM`
+directly to that generation or writes its `continue`/fault command,
+and bounds every internal frame wait at five monotonic seconds. The child closes
+10/11 immediately after the final terminal fault point. The supervisor emits
+`case-reaped` only after exact child reap, retains that case root until Rust
+acknowledges the frame, then identity-removes it. After the final case it closes
+13/14 and removes only identity-matching FIFOs before `complete`.
 Every case reports only canonical `selftest-v1<TAB>case<TAB>expected<TAB>actual`
 rows followed by `selftest-v1<TAB>complete`; the Rust contract rejects missing,
 duplicate, or unexpected rows. No Cargo, Docker, systemd, sudo, eBPF, provider,
 or release command may escape the fake boundary.
+
+The Rust artifact contract is the independent live observer, not the tested
+reporter. It creates a `UnixStream::pair`; both originals are close-on-exec.
+In `pre_exec` for the group anchor described below, Rust uses only
+async-signal-safe `dup2`/`close`/`fcntl`: if the child endpoint is not already
+15 it duplicates it to 15 and closes the original; if it is already 15 it only
+clears `FD_CLOEXEC`; every other surplus stream copy is closed. Rust retains the
+non-inheritable unnumbered peer and drops its child-end copy immediately after
+spawn. The anchor hands FD 15 to the shell using the exact `Popen` sequence
+below. FD 15 is optional for standalone self-test but mandatory for this
+acceptance gate. Its presence requires the dedicated work parent above. Case
+children and every external/fake command close FD 15; only the Rust peer and
+shell supervisor retain their endpoints.
+
+Rust generates a 64-lowercase-hex nonce from 32 bytes read from `/dev/urandom`
+and starts the exchange. The stream is incrementally line-framed: no message
+boundary is inferred from a read. Every line is printable ASCII plus tabs, ends
+in one LF, and is at most 1024 bytes including LF; partial EOF, oversize, extra,
+or malformed lines fail. Rust-to-supervisor and supervisor-to-Rust waits are
+each bounded at five monotonic seconds. Directions and grammar are exact:
+
+```text
+Rust -> supervisor: audit-v1<TAB>NONCE<TAB>challenge<LF>
+supervisor -> Rust: audit-v1<TAB>NONCE<TAB>SEQUENCE<TAB>supervisor-ready<TAB>SUPERVISOR_PID<TAB>SUPERVISOR_STARTTIME<TAB>PARENT_DEV:INO<TAB>CONTROL_DEV:INO<TAB>EVENTS_DEV:INO<LF>
+supervisor -> Rust: audit-v1<TAB>NONCE<TAB>SEQUENCE<TAB>case-started|owner-entered|finalizer-entered|publisher-entered|case-reaped<TAB>ORDINAL<TAB>CASE<TAB>CHILD_PID<TAB>CHILD_STARTTIME<TAB>ROOT_DEV:INO_OR_NONE<TAB>RECEIPT_STATUS<TAB>CHILD_WAIT_STATUS<TAB>PUBLISHER_EXE_DEV:INO_OR_DASH<LF>
+supervisor -> Rust: audit-v1<TAB>NONCE<TAB>SEQUENCE<TAB>complete<TAB>CASE_COUNT<LF>
+Rust -> supervisor: audit-v1<TAB>NONCE<TAB>SEQUENCE<TAB>ack<LF>
+```
+
+All numeric fields are canonical unsigned decimal; every `dev:ino` is two such
+decimals separated by one colon. The case alphabet is exactly the canonical
+table. Sequence begins at zero, increases only for supervisor frames, and the
+ack repeats rather than consumes that sequence. The Rust case table freezes the
+exact ordered lifecycle sequence for every case: `case-started` and
+`case-reaped` are mandatory, while owner/finalizer/publisher events occur only
+when that case is expected to reach them. The total supervisor-frame count is
+exactly two plus the sum of those frozen per-case sequence lengths.
+It may never exceed `5 * CASE_COUNT + 2`; EOF or another frame after the exact
+`complete` is failure. Missing/malformed ack or any five-second ack timeout makes
+the supervisor kill and reap its pinned case child, identity-clean only owned
+fixtures, and exit nonzero; the Rust anchor remains available for group cleanup.
+`RECEIPT_STATUS` is `none` before reap; at `case-reaped` it is `none`, `invalid`,
+or canonical decimal 0..255 exactly as the authoritative classes below require.
+`CHILD_WAIT_STATUS` is `none` before reap and canonical decimal 0..255 at
+`case-reaped`; signal waits use POSIX shell values 128 plus the signal number.
+The publisher executable field is `-` except at `publisher-entered`; the root
+field is `none` until an owned root exists.
+
+`none` means `lstat(root/status)` is `ENOENT`. `invalid` means the path is not
+an authoritative terminal receipt, with an exact case oracle: `early-status`
+retains the original caller-UID-owned mode-0600 `nlink=1` regular `0\n` inode
+whose creation precedes `publisher-entered`; `duplicate-status` retains one
+such regular inode containing exactly `0\n0\n`; and `foreign-terminal-artifact`
+retains the substituted inode and its recorded foreign identity. Rust validates
+those identities, contents, modes, link counts, and ordering itself; none is
+accepted as a decimal receipt.
+
+The following ordered classes are plan-authoritative and exhaustive; matching
+stops at the first class. `full` means `case-started`, `owner-entered`,
+`finalizer-entered`, `publisher-entered`, `case-reaped`; `refusal` means only
+`case-started`, `case-reaped`. A refusal has no owned root or receipt status.
+A full case has no root at `case-started` and the same exact owned root at every
+later live event.
+
+| Class | Exact membership rule | Sequence | Receipt at reap | Child wait |
+|---|---|---|---|---|
+| P77 | `existing-root-rejected-status-77-no-touch-before-body`, `nonprivate-parent-rejected-status-77-no-touch-before-body`, `symlink-root-rejected-status-77-no-touch-before-body`, `foreign-root-rejected-status-77-no-touch-before-body`, `root-preflight-blocks-body-cargo-runtime`, `lock-contention-status-77-blocks-body-cargo-runtime`, `rootless-invalid-root-and-poisoned-environment-reach-no-mutator`, `public-body-reentry-rejected`, `explicit-pwd-work-composition-rejected-before-mutation`, `stdout-capture-substitution-rejected`, `glob-first-observed-selection-rejected`, `find-mode-repair-rejected`, every Lane-11 case ending `-rejected-before-mutation`, `caller-path-overrides-rejected-before-mutation`, `bare-observer-rejected`, `path-observer-rejected`, `outside-ROOT-work-target-release-observer-rejected`, `cargo-not-Rust-1.88-rejected`, `cargo-without-locked-workspace-release-rejected` | refusal | `none` | 77 |
+| N97 | `missing-status-rejected`, `success-pending-write-failure-rejected-nonzero-status-last-once`, `success-pending-fsync-failure-rejected-nonzero-status-last-once`, `terminal-renameat2-noreplace-collision-rejected`, `terminal-renameat2-unavailable-rejected` | full | `none` | 97 |
+| I97 | `early-status-rejected`, `duplicate-status-rejected`, `foreign-terminal-artifact-rejected` | full | `invalid` | 97 |
+| SIGINT | every common case beginning `signal-INT-` | full | 130 | 130 |
+| SIGHUP | every common case beginning `signal-HUP-` | full | 129 | 129 |
+| SIGTERM | every common case beginning `signal-TERM-` | full | 143 | 143 |
+| R97 | every remaining canonical name that ends in `-rejected`, contains `-rejected-`, or contains `-mutation-rejected`, and the exact cases `cleanup-failure-upgrades-terminal-status-and-is-written-last`, `cleanup-failure-upgrades-one-status-written-last`, `absence-query-failure-upgrades-terminal-status-and-is-written-last`, and `identity-mismatch-upgrades-terminal-status-and-is-written-last` | full | 97 | 97 |
+| S0 | every remaining canonical case | full | 0 | 0 |
+
+The Rust table expands these syntactic first-match rules and asserts that every
+canonical case matches exactly one class. Thus, for example,
+`initial-isolation-state-rejected` is R97/full, while the retained evidence
+value `start-failures-8-exact-accepted` is S0/full.
+
+At `supervisor-ready`, Rust proves the pinned supervisor PID/starttime, supplied
+parent identity, and distinct supervisor-created caller-UID-owned mode-0600
+`control.in`/`events.out`
+FIFOs. It uses `symlink_metadata` on those exact paths, rejects symlinks and
+non-FIFOs, requires `nlink=1`, and matches each reported `dev:ino` both to that
+path and to `/proc/SUPERVISOR_PID/fd/13` or `/proc/SUPERVISOR_PID/fd/14`.
+For each case, Rust derives the supervisor-owned sandbox `cases/NNN` and the
+candidate receipt root `cases/NNN/root` from the zero-based ordinal. The
+child's mandatory `case-started` and every expected `owner-entered`,
+`finalizer-entered`, and execed terminal publisher `publisher-entered` are
+blocking FD-11 barriers: child event,
+supervisor validation and FD-15 forward, Rust live validation and ack, then the
+supervisor's FD-10 `continue`/fault command. Rust revalidates the pinned child
+generation and `/proc/PID/fd/10` plus `/proc/PID/fd/11` against the campaign
+FIFO identities at every live barrier. At `case-started`, Rust checks the
+case's frozen precondition and proves that no unplanned owned mutation occurred.
+When the frame names a root identity, Rust also revalidates it. Owner and
+finalizer require mode 0700 and no status. Publisher additionally requires
+`/proc/PID/exe` to
+differ from the pinned shell identity and match the pre-resolved terminal
+Python interpreter identity reported in its frame. At `case-reaped`, the
+supervisor has reaped the child; Rust proves that generation absent and checks
+the expected terminal status, tree, facts, and ownership before ack permits
+root deletion. `complete` follows all case-root deletions and FIFO cleanup; Rust
+checks both FIFO paths absent and every case reaped before acknowledging it.
+
+The observed work inventory is exact. `$P11SCOPE_TASK4_SELF_TEST_WORK/cases`
+is one supervisor-created mode-0700 directory. Before each `case-started`, the
+work parent contains only `control.in`, `events.out`, and `cases`; `cases`
+contains only the current supervisor-created `NNN` sandbox. That sandbox is
+mode 0700 except in `nonprivate-parent-rejected-status-77-no-touch-before-body`,
+where it is mode 0755. Its allowed entries are only the case's frozen P77 input:
+`root` as the required directory/symlink/unauthorized object, or
+`.task4.lock` for contention; otherwise it is empty and `root` is absent.
+`foreign-root` is a caller-UID-owned object created by the Rust harness whose
+identity is deliberately absent from the current run's requested/authorized
+registry; it never means unavailable foreign Unix ownership. Rust creates or
+authorizes each named negative fixture before the child proceeds, records its
+identity/content, and checks that no other entry appears.
+
+For P77 cases with a Rust-created `root` or `.task4.lock` entry, Rust validates
+that entry byte- and identity-unchanged, removes only that entry, and only then
+acknowledges `case-reaped`; the tested supervisor never removes or repairs it.
+For the non-private-parent case, Rust validates that the sandbox remains mode
+0755 and leaves sandbox removal to the supervisor. Fixtureless P77 cases require
+an empty sandbox. For every other class, the supervisor removes only the `root` it created after Rust's
+`case-reaped` ack. The supervisor then removes its now-empty `NNN` sandbox.
+Rust proves the preceding sandbox absent before acknowledging the next
+`case-started`, or before `complete` for the last case. Before `complete`, the supervisor removes `cases` and
+the two FIFOs, leaving the supplied parent empty and at its original identity.
+
+The three Lane-14 helpers use a separate exact four-frame sequence after the
+same challenge; no FIFO or case frame is used:
+
+```text
+audit-v1<TAB>NONCE<TAB>0<TAB>helper-work-ready<TAB>HELPER<TAB>PID<TAB>STARTTIME<TAB>HELPER_ROOT_DEV:INO<LF>
+audit-v1<TAB>NONCE<TAB>1<TAB>helper-body-complete<TAB>HELPER<TAB>PID<TAB>STARTTIME<TAB>OUTPUT_DEV:INO<TAB>SECOND_OUTPUT_DEV:INO_OR_DASH<LF>
+audit-v1<TAB>NONCE<TAB>2<TAB>helper-cleanup-complete<TAB>HELPER<TAB>PID<TAB>STARTTIME<LF>
+audit-v1<TAB>NONCE<TAB>3<TAB>complete<TAB>1<LF>
+```
+
+Every helper frame blocks for the same exact ack. Rust supplies a distinct
+empty mode-0700 absolute `P11SCOPE_TASK4_SELF_TEST_WORK` parent and pins its
+identity separately; `HELPER_ROOT_DEV:INO` identifies only the helper-created
+`helper` child. The helper creates only that mode-0700 child, reports it at
+`helper-work-ready`, and Rust validates its containment and the helper
+generation. Before each mutation and frame, the helper itself revalidates the
+supplied parent and helper-child path/type/owner/mode/link count against their
+pinned identities; mismatch is nonzero without cleanup by stale pathname.
+Canary creates exactly `helper/canaries.result`, containing
+`selftest-v1<TAB>NONCE<TAB>canaries<TAB>result<TAB>OK<LF>`; attach creates
+exactly `helper/attach-e2e.result`, containing
+`selftest-v1<TAB>NONCE<TAB>attach-e2e<TAB>result<TAB>OK<LF>`. Each is a
+caller-UID-owned mode-0600 regular file with `nlink=1` and is the sole helper
+child entry.
+
+Discover instead executes one fake-resource requested/resolved/cleanup/absence
+lifecycle through the production journal/payload routines. Its sole entries are
+mode-0600, caller-UID-owned, `nlink=1` regular files
+`helper/discover.facts.journal` and `helper/discover.facts.payload`. The journal
+has exactly these bounded records, where PID/starttime are the pinned fake child
+that receives the fixture's normal cleanup request, exits 0, is reaped, and is
+proved absent before `helper-body-complete`:
+
+```text
+journal-v1<TAB>0<TAB>resource.000.requested<TAB>fake-container:test<LF>
+journal-v1<TAB>1<TAB>resource.000.resolved<TAB>pid=PID,starttime=STARTTIME<LF>
+journal-v1<TAB>2<TAB>resource.000.cleanup<TAB>0<LF>
+journal-v1<TAB>3<TAB>resource.000.absence<TAB>true<LF>
+```
+
+The payload has exactly these records; `DEV:INO`, `SHA256`, PID/starttime, and
+the wait value are independently recomputed by Rust:
+
+```text
+payload-v1<TAB>0<TAB>journal.identity<TAB>DEV:INO<LF>
+payload-v1<TAB>1<TAB>journal.sha256<TAB>SHA256<LF>
+payload-v1<TAB>2<TAB>resource.count<TAB>1<LF>
+payload-v1<TAB>3<TAB>resource.000.pid<TAB>PID<LF>
+payload-v1<TAB>4<TAB>resource.000.starttime<TAB>STARTTIME<LF>
+payload-v1<TAB>5<TAB>resource.000.cleanup<TAB>0<LF>
+payload-v1<TAB>6<TAB>resource.000.absence<TAB>true<LF>
+payload-v1<TAB>7<TAB>child.wait<TAB>0<LF>
+```
+
+The first output identity is the single canary/attach result or discover
+journal; only discover uses the second identity for its payload.
+At `helper-body-complete`, Rust validates the exact object inventory and, for
+discover, both contents and that no helper-owned child remains in the anchored
+process group. The helper then
+identity-removes only its result objects and `helper` child and emits
+`helper-cleanup-complete`; Rust requires them absent and the supplied parent
+empty at its original identity. The helper never removes that supplied parent.
+After `complete`, Rust reaps the helper and requires the whole process group
+absent. Any identity, inventory, content, cleanup, ack, or group-absence failure
+is nonzero and leaves no success report.
+
+The Rust harness launches a fixed inline Python group anchor as the direct child
+with `std::os::unix::process::CommandExt::process_group(0)`; Rust verifies the
+resulting anchor PID equals PGID before the challenge. The anchor starts the
+observed `/bin/sh SCRIPT --self-test` supervisor in the same group with
+`subprocess.Popen(..., close_fds=True, pass_fds=(15,))`. FD 15 is already
+inheritable from Rust's handoff; immediately after successful `Popen` the anchor
+closes its FD-15 copy, and on `Popen` failure it closes FD 15 and exits 125. It
+sets `P11SCOPE_TASK4_SELF_TEST_ANCHOR_PGID` to its canonical decimal PID only in
+that observed shell environment; the exact self-test branch validates it
+against `getpgrp`, normal/standalone mode rejects it, and fake commands inherit
+it unchanged for their own `getpgrp()` check. It
+waits for the shell and preserves its wait status: Python return codes 0..255
+remain unchanged, while `-SIGNAL` becomes `128 + SIGNAL`; after the residue
+checks below the anchor uses `os._exit` with that canonical value. After the shell exits, the
+anchor takes two `/proc` snapshots 10 ms apart for members of its PGID,
+excluding itself. It exits with the shell status only after both are empty. If
+either is nonempty, it reports one bounded diagnostic and blocks without
+spawning further children until Rust kills the group. Rust pins
+the anchor PID/starttime/PGID before issuing the challenge and separately pins
+the supervisor from `supervisor-ready`. On protocol failure, timeout, output
+excess, or residue, Rust revalidates the live anchor, sends `SIGKILL` to the
+negative PGID, reaps the anchor, and requires the group absent. Normal completion
+requires anchor reap, the preserved shell status, and group absence. The anchor
+is test harness, not product code, and is never used by normal or standalone
+self-test. Self-test source and every fake command are forbidden to call
+`setsid`, `setpgid`, `unshare`, or otherwise leave the anchor's process group;
+after rejecting an inherited anchor variable, standalone self-test records its
+current PGID in a private expected-PGID value inherited by fakes. Observed mode
+instead validates the anchor-supplied value. Fake commands assert
+`getpgrp() == EXPECTED_PGID` before any simulated action.
+
+Stdout and stderr go to separate exclusive mode-0600 temporary files; Rust
+polls each at no more than 1 MiB, kills on excess, then reads them after reap,
+so pipe-held descendants cannot block collection. Rust's mode-0700 temporary
+`HARNESS` contains only `work`, `fake-bin`, `report.tsv`, `audit.trace`,
+`stdout`, `stderr`, and `tripwire.log`; every retained object's type, mode,
+owner, link count, and bound is validated. Rust alone creates
+`$HARNESS/audit.trace` with create-new/no-follow semantics,
+caller ownership, mode 0600, and `nlink=1`; it appends only frames that passed
+the live checks, caps the file at 1 MiB, and fsyncs it after `complete`.
+Challenge and ack messages are never retained; every validated supervisor frame
+is retained byte-for-byte. On protocol failure Rust fsyncs and closes the valid
+prefix without adding `complete`, preserves it as a non-success diagnostic, and
+kills/reaps through the anchor. The
+validated `complete` frame is appended and fsynced before Rust sends its final
+ack. The summary report retains its existing 8-MiB cap. A dynamic marker-complete,
+digest-correct, exhaustive reporter launched inside the same tripwire-only
+environment but without a valid FD-15 exchange must fail at
+`supervisor-ready`, with no receipt mutation, fake command, or process residue.
+Extra-argument probes use that same environment and require nonzero, zero
+frames, zero tripwire entries, zero mutation, and no process residue. This
+observer raises regression confidence against dead-code/toy reporters; it is
+not claimed as proof against a deliberately malicious replacement that
+reproduces the entire OS-visible protocol.
 
 Generated artifacts record creation and final identities. Source, configuration,
 provider, observer, BPF, harness, checker, and capture identities are revalidated
@@ -1052,7 +1323,7 @@ substituted at the named command boundary. First require RED for:
   checker, capture, or artifact mutation before terminal publication;
 - absence of every public body bypass, `$PWD/$WORK`, glob/first-observed
   selection, stdout capture substitution, `find` mode repair, and pre-finalizer
-  root mutation; fake commands and descendants also prove FD 7 through 14
+  root mutation; fake commands and descendants also prove FD 7 through 15
   are closed outside the named protocol exceptions;
 - terminal `renameat2(RENAME_NOREPLACE)` collision/unavailability and proof that
   its successful rename is the last filesystem mutation before exit;

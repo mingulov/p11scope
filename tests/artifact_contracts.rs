@@ -4851,7 +4851,7 @@ kubectl)
         pod=$3; namespace=default; pod_query=$*; shift 3
         while [ "$#" -gt 0 ]; do [ "$1" = -n ] && namespace=$2 && shift; shift; done
         case " $pod_query " in
-            *creationTimestamp*) echo 2026-08-26T23:59:59Z; exit 0 ;;
+            *creationTimestamp*) /usr/bin/date -u -d '+1 minute' '+%Y-%m-%dT%H:%M:%SZ'; exit 0 ;;
             *containerID*) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; exit 0 ;;
         esac
         printf '{"metadata":{"namespace":"%s","name":"%s","uid":"uid-%s"},"spec":{"containers":[{"name":"anchor","image":"kind.local/fake:tag"}]},"status":{"containerStatuses":[{"name":"anchor","containerID":"containerd://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","imageID":"sha256:runtime","ready":true,"restartCount":0}]}}\n' "$namespace" "$pod" "$pod"; exit 0

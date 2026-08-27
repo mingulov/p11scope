@@ -1441,6 +1441,19 @@ struct DynamicExportWork {
 }
 
 #[derive(Clone)]
+struct CountOnlySeedWork {
+    object: PinnedObjectId,
+    object_path: String,
+    file_offset: u64,
+}
+
+struct CollectedExportWork {
+    dynamic: Vec<DynamicExportWork>,
+    count_only_seeds: Vec<CountOnlySeedWork>,
+    required_seed_complete: bool,
+}
+
+#[derive(Clone)]
 struct QueuedDiscoveryRecord {
     record: DiscoveryRecord,
     terminal_owner: Option<LoaderContextId>,
@@ -5802,7 +5815,7 @@ impl Engine {
         candidate.views.insert(self.views[position].id());
         let observed = candidate_timing_keys(&candidate, &export_modules);
         self.observe_causal_timing(&observed, record.hook_ts_ns);
-        let dynamic_work = self.collect_dynamic_export_work(
+        let collected = self.collect_dynamic_export_work(
             context_id,
             &export_modules,
             &candidate,
@@ -5810,15 +5823,57 @@ impl Engine {
             terminal_owner.is_some(),
             &terminal_exports,
         );
+        let mut required_seed_complete = collected.required_seed_complete;
+        for seed in &collected.count_only_seeds {
+            let mut owners = candidate
+                .plan
+                .modules
+                .iter()
+                .filter(|module| module.object == seed.object);
+            let Some(module) = owners.next() else {
+                required_seed_complete = false;
+                self.mark_partial(
+                    "live export hook",
+                    "a C_GetFunctionList seed had no unique candidate module owner",
+                );
+                continue;
+            };
+            if owners.next().is_some() {
+                required_seed_complete = false;
+                self.mark_partial(
+                    "live export hook",
+                    "a C_GetFunctionList seed had no unique candidate module owner",
+                );
+                continue;
+            }
+            match candidate.plan.add_provisional_get_function_list(
+                plan::ProvisionalGetFunctionList {
+                    module: module.id,
+                    object: seed.object,
+                    object_path: seed.object_path.clone(),
+                    file_offset: seed.file_offset,
+                },
+            ) {
+                Ok(Some(slot)) => candidate.delta.new.push(slot),
+                Ok(None) => {}
+                Err(_) => {
+                    required_seed_complete = false;
+                    self.mark_partial(
+                        "live export hook",
+                        "a C_GetFunctionList seed could not be added to the candidate plan",
+                    );
+                }
+            }
+        }
         let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
         self.record_apply_timing(&outcome);
         self.queue_apply_outcome(&outcome, pending_views);
         let changed = outcome.changed;
-        let mut required_complete = outcome.required_complete();
+        let mut required_complete = required_seed_complete && outcome.required_complete();
         if terminal_owner.is_none() && outcome.accepted() {
             let (retire, dynamic_complete) = self.attach_export_work(
                 self.views[position].id(),
-                &dynamic_work,
+                &collected.dynamic,
                 session,
                 additions_allowed,
             );
@@ -5830,7 +5885,7 @@ impl Engine {
                 self.queue_stale_views(&[view].into_iter().collect(), pending_views);
             }
         } else {
-            lose_unperformed_dynamic_work(&mut self.timings, &dynamic_work);
+            lose_unperformed_dynamic_work(&mut self.timings, &collected.dynamic);
         }
         Ok(DiscoveryRecordOutcome::applied(changed, required_complete))
     }
@@ -5843,13 +5898,29 @@ impl Engine {
         session: &dyn EngineSession,
         terminal: bool,
         terminal_exports: &[DynamicExportIdentity],
-    ) -> Vec<DynamicExportWork> {
-        let mut work = Vec::new();
+    ) -> CollectedExportWork {
+        let mut collected = CollectedExportWork {
+            dynamic: Vec::new(),
+            count_only_seeds: Vec::new(),
+            required_seed_complete: true,
+        };
+        let mut seed_keys = BTreeSet::new();
         for module in modules {
+            let requires_seed = module
+                .exports
+                .iter()
+                .any(|name| name == "C_GetFunctionList");
             let Some(object) = candidate
                 .pinned
                 .id_for_scanned(module, module.key, &module.path)
             else {
+                if requires_seed {
+                    collected.required_seed_complete = false;
+                    self.mark_partial(
+                        "live export hook",
+                        "a C_GetFunctionList seed lacked an exact pinned module object",
+                    );
+                }
                 continue;
             };
             let timing_key = candidate.pinned.owned_timing_key(object);
@@ -5857,6 +5928,30 @@ impl Engine {
                 .pinned
                 .file_for(object)
                 .and_then(|file| ElfSnapshot::read(file).ok());
+            if requires_seed {
+                let seed = snapshot.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .defined_symbol("C_GetFunctionList")
+                        .ok()
+                        .flatten()
+                        .filter(|fact| snapshot.is_executable_offset(fact.file_offset))
+                });
+                if let Some(seed) = seed {
+                    if seed_keys.insert((object, seed.file_offset)) {
+                        collected.count_only_seeds.push(CountOnlySeedWork {
+                            object,
+                            object_path: module.path.clone(),
+                            file_offset: seed.file_offset,
+                        });
+                    }
+                } else {
+                    collected.required_seed_complete = false;
+                    self.mark_partial(
+                        "live export hook",
+                        "an export hook was absent or outside an executable ELF segment",
+                    );
+                }
+            }
             for name in &module.exports {
                 let Some(abi) = self.hooks.abi(name) else {
                     continue;
@@ -5881,7 +5976,7 @@ impl Engine {
                     );
                     continue;
                 };
-                work.push(DynamicExportWork {
+                collected.dynamic.push(DynamicExportWork {
                     context,
                     module: timing_key.clone(),
                     object,
@@ -5901,7 +5996,7 @@ impl Engine {
                 });
             }
         }
-        work
+        collected
     }
 
     fn attach_export_work(
@@ -8405,8 +8500,12 @@ pub(crate) mod session_fixture {
         pub(crate) detached_slots: Vec<usize>,
         /// One entry per upcoming `detach_slots` call; `true` fails it.
         detach_slot_script: VecDeque<bool>,
+        /// Static target slot indices that the next attach reports as failed.
+        fail_target_slots: BTreeSet<u32>,
         /// Slot counts of every `attach_targets` call, in order.
         pub(crate) attached_slots: Vec<usize>,
+        /// Dynamic exports requested by the Engine, in order.
+        pub(crate) dynamic_attach_calls: Vec<DynamicExportIdentity>,
         /// Killed and reaped from inside `attach_targets`, i.e. exactly between
         /// a generation precheck and its postcheck.
         kill_on_attach: Option<u32>,
@@ -8476,6 +8575,10 @@ pub(crate) mod session_fixture {
         pub(crate) fn fail_slot_detaches(&mut self, script: impl IntoIterator<Item = bool>) {
             self.detach_slot_script = script.into_iter().collect();
         }
+
+        pub(crate) fn fail_target_slots(&mut self, slots: impl IntoIterator<Item = u32>) {
+            self.fail_target_slots = slots.into_iter().collect();
+        }
     }
 
     impl EngineSession for ScriptedSession {
@@ -8521,7 +8624,14 @@ pub(crate) mod session_fixture {
             if let Some(pid) = self.kill_on_attach.take() {
                 kill_and_reap(pid);
             }
-            Ok((Vec::new(), Vec::new()))
+            Ok((
+                slots
+                    .iter()
+                    .filter(|slot| self.fail_target_slots.contains(&slot.index))
+                    .map(|slot| slot.index)
+                    .collect(),
+                Vec::new(),
+            ))
         }
 
         fn replace_targets(
@@ -8544,22 +8654,33 @@ pub(crate) mod session_fixture {
         fn has_dynamic_export(
             &self,
             _: LoaderContextId,
-            _: (PinnedObjectId, u64),
-            _: u64,
-            _: HookAbi,
+            target: (PinnedObjectId, u64),
+            cookie: u64,
+            abi: HookAbi,
         ) -> bool {
-            false
+            self.dynamic_attach_calls.iter().any(|export| {
+                export.object == target.0
+                    && export.file_offset == target.1
+                    && export.cookie == cookie
+                    && export.abi == abi
+            })
         }
 
         fn attach_dynamic_export(
             &mut self,
             _: LoaderContextId,
             _: u32,
-            _: (PinnedObjectId, u64),
-            _: u64,
-            _: HookAbi,
+            target: (PinnedObjectId, u64),
+            cookie: u64,
+            abi: HookAbi,
             _: &PinnedObjects,
         ) -> Result<(bool, Option<u64>)> {
+            self.dynamic_attach_calls.push(DynamicExportIdentity {
+                object: target.0,
+                file_offset: target.1,
+                cookie,
+                abi,
+            });
             Ok((false, None))
         }
 
@@ -10324,13 +10445,27 @@ mod tests {
     /// so every comparison failed and every capture on such a host reported unavailable.
     #[test]
     fn an_ordinary_dynamic_target_binds_its_live_loader_context() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let view = ProcessView::open(ProcessViewId(0), child.id()).unwrap();
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let mut child = ChildGuard(
+            std::process::Command::new("sh")
+                .args(["-c", "printf R; kill -STOP $$"])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut ready = [0_u8; 1];
+        std::io::Read::read_exact(child.0.stdout.as_mut().unwrap(), &mut ready).unwrap();
+        assert_eq!(ready, *b"R");
+        let view = ProcessView::open(ProcessViewId(0), child.0.id()).unwrap();
         let mut engine = Engine::empty();
-        engine.scope = Scope::Pid(child.id());
+        engine.scope = Scope::Pid(child.0.id());
         engine.views.push(view);
 
         let mut session = ScriptedSession::default();
@@ -10340,8 +10475,8 @@ mod tests {
             &mut true,
             &mut PendingViewRetirements::new(),
         );
-        child.kill().unwrap();
-        child.wait().unwrap();
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
         armed.expect("arming an ordinary dynamic target is not a failure");
 
         let skips = engine.counters.object_skips.clone();
@@ -11640,6 +11775,443 @@ mod tests {
             address: 0x7000,
         }];
         module
+    }
+
+    struct LoadedSeedProvider {
+        child: std::process::Child,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Drop for LoadedSeedProvider {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn loaded_seed_provider() -> (
+        LoadedSeedProvider,
+        ProcessView,
+        ScannedModule,
+        PinnedObjects,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("seed-provider.so");
+        let source = dir.path().join("seed-provider.c");
+        let runner_source = dir.path().join("seed-runner.c");
+        let runner = dir.path().join("seed-runner");
+        std::fs::write(
+            &source,
+            r#"
+#include <stddef.h>
+__attribute__((visibility("default"), noinline))
+int C_GetFunctionList(void **out) {
+    if (out != NULL) *out = NULL;
+    return 0;
+}
+"#,
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&library)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(
+            &runner_source,
+            r#"
+#include <dlfcn.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    void *handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    if (handle == NULL) return 3;
+    sleep(30);
+    dlclose(handle);
+    return 0;
+}
+"#,
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-o"])
+                .arg(&runner)
+                .arg(&runner_source)
+                .arg("-ldl")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let child = std::process::Command::new(&runner)
+            .arg(&library)
+            .spawn()
+            .unwrap();
+        let fixture = LoadedSeedProvider { child, _dir: dir };
+        let view = ProcessView::open(ProcessViewId(0), fixture.child.id()).unwrap();
+        let mut mapped = None;
+        for _ in 0..200 {
+            let maps =
+                parse_maps(&std::fs::read(format!("/proc/{}/maps", fixture.child.id())).unwrap())
+                    .unwrap();
+            mapped = maps
+                .iter()
+                .find_map(|mapping| match resolve(&maps, mapping.start) {
+                    Resolved::File {
+                        path: MappedPath::Usable(path),
+                        ..
+                    } if path == library => Some((mapping.clone(), path)),
+                    _ => None,
+                });
+            if mapped.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (mapping, mapped_path) = mapped.expect("the loaded seed provider is mapped");
+        let mut module = mapped_object(&view, &mapping, &mapped_path);
+        module.exports = vec!["C_GetFunctionList".into()];
+        let pins = pin_test_module(&view, &module);
+        (fixture, view, module, pins)
+    }
+
+    fn armed_seed_route(
+        loader_hits: u64,
+    ) -> (
+        LoadedSeedProvider,
+        Engine,
+        LoaderContextId,
+        DiscoveryRecord,
+        ScriptedSession,
+    ) {
+        let (fixture, view, _module, _pins) = loaded_seed_provider();
+        let pid = view.pid();
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Pid(pid);
+        engine.next_view_id = 1;
+        engine.views.push(view);
+        let mut session = ScriptedSession::default();
+        session.counters.loader_hits = loader_hits;
+        engine
+            .arm_loader_or_partial(
+                0,
+                &mut session,
+                &mut true,
+                &mut PendingViewRetirements::new(),
+            )
+            .unwrap();
+        let context = engine.loader_registry.ids_for_view(ProcessViewId(0))[0];
+        let spec = engine
+            .loader_registry
+            .context(context)
+            .unwrap()
+            .spec
+            .clone();
+        let mapping = spec.mapping.as_ref().unwrap();
+        let mut record = loader_record_for(context, pid);
+        record.table_ptr = mapping.start + (spec.hook.file_offset - mapping.file_offset);
+        record.hook_ts_ns = engine.views[0].admitted_ns();
+        (fixture, engine, context, record, session)
+    }
+
+    #[test]
+    fn loader_batch_route_adds_one_count_only_seed_without_table_surface() {
+        let (_dir, mut engine, _context, record, mut session) = armed_seed_route(2);
+        let first = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+
+        assert!(first.required_complete);
+        assert_eq!(
+            session
+                .attached_slots
+                .iter()
+                .filter(|count| **count > 0)
+                .count(),
+            1
+        );
+        assert_eq!(engine.plan.entries_seen, 0);
+        assert!(engine.plan.surfaces.is_empty());
+        assert_eq!(
+            engine
+                .plan
+                .slots
+                .iter()
+                .filter(|slot| engine.plan.is_active(slot.index))
+                .count(),
+            1
+        );
+        assert_eq!(
+            engine.plan.slots[0].names,
+            ["C_GetFunctionList"],
+            "the seed owns descriptor zero"
+        );
+
+        let second = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+        assert!(second.required_complete);
+        assert_eq!(
+            session
+                .attached_slots
+                .iter()
+                .filter(|count| **count > 0)
+                .count(),
+            1,
+            "an exact repeated loader record does not reattach the seed"
+        );
+        assert_eq!(
+            session.dynamic_attach_calls.len(),
+            1,
+            "an exact repeated loader record does not reattach the export"
+        );
+        assert_eq!(
+            engine
+                .plan
+                .slots
+                .iter()
+                .filter(|slot| engine.plan.is_active(slot.index))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn terminal_loader_batch_route_seeds_without_dynamic_attach() {
+        let (_fixture, mut engine, context, record, mut session) = armed_seed_route(1);
+        engine
+            .begin_terminal_drain(context, Vec::new(), || Ok::<(), anyhow::Error>(()))
+            .unwrap()
+            .unwrap();
+        engine.retain_terminal_batch([record], true, 0).unwrap();
+        let mut collect = Engine::collect_discovery_records;
+        let terminal = engine
+            .apply_discovery_batch_with(&mut session, Vec::new(), 0, true, true, &mut collect)
+            .unwrap();
+
+        assert!(terminal.required_complete);
+        assert!(engine.loader_registry.context(context).is_none());
+        assert!(session.dynamic_attach_calls.is_empty());
+        assert_eq!(
+            session
+                .attached_slots
+                .iter()
+                .filter(|count| **count > 0)
+                .count(),
+            1,
+            "the terminal replay does not attach a duplicate static seed"
+        );
+        assert_eq!(
+            engine
+                .plan
+                .slots
+                .iter()
+                .filter(|slot| engine.plan.is_active(slot.index))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn loader_batch_route_seed_target_failure_deactivates_slot() {
+        let (_fixture, mut engine, _context, record, mut session) = armed_seed_route(1);
+        session.fail_target_slots([0]);
+
+        let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+
+        assert!(!outcome.required_complete);
+        assert!(!engine.plan.is_active(0));
+        assert_eq!(engine.plan.slots[0].descriptor_index, 0);
+        assert_eq!(engine.plan.slots[0].names, ["C_GetFunctionList"]);
+        assert_eq!(engine.plan.entries_seen, 0);
+        assert!(engine.plan.surfaces.is_empty());
+        assert_eq!(
+            session
+                .attached_slots
+                .iter()
+                .filter(|count| **count > 0)
+                .count(),
+            1
+        );
+        assert!(session.detached_slots.contains(&1));
+    }
+
+    #[test]
+    fn exact_pinned_executable_export_collects_one_count_only_seed() {
+        let (_fixture, view, module, pins) = loaded_seed_provider();
+        let mut engine = Engine::empty();
+        let candidate = engine
+            .live_candidate(pins, vec![module.clone()], Vec::new())
+            .unwrap();
+        let object = candidate
+            .pinned
+            .id_for_scanned(&module, module.key, &module.path)
+            .unwrap();
+        let collected = engine.collect_dynamic_export_work(
+            LoaderContextId::from_case_id(0),
+            std::slice::from_ref(&module),
+            &candidate,
+            &ScriptedSession::default(),
+            false,
+            &[],
+        );
+
+        assert!(collected.required_seed_complete);
+        assert_eq!(collected.count_only_seeds.len(), 1);
+        assert_eq!(collected.count_only_seeds[0].object, object);
+        assert_eq!(collected.count_only_seeds[0].object_path, module.path);
+        assert_eq!(collected.dynamic.len(), 1);
+        assert_eq!(collected.dynamic[0].object, object);
+        assert!(
+            candidate
+                .plan
+                .modules
+                .iter()
+                .any(|summary| summary.object == object)
+        );
+        assert_eq!(view.id(), module.view);
+    }
+
+    #[test]
+    fn absent_pinned_export_marks_seed_incomplete_without_allocating_a_slot() {
+        let (mut modules, pins) = pinned_self();
+        let mut module = modules.pop().unwrap();
+        module.exports = vec!["C_GetFunctionList".into()];
+        let mut engine = Engine::empty();
+        let candidate = engine
+            .live_candidate(pins, vec![module.clone()], Vec::new())
+            .unwrap();
+        let collected = engine.collect_dynamic_export_work(
+            LoaderContextId::from_case_id(0),
+            std::slice::from_ref(&module),
+            &candidate,
+            &ScriptedSession::default(),
+            false,
+            &[],
+        );
+
+        assert!(!collected.required_seed_complete);
+        assert!(collected.count_only_seeds.is_empty());
+        assert!(collected.dynamic.is_empty());
+        assert!(engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live export hook"
+                && !skip.reason.contains(&module.path)
+                && !skip.reason.contains("offset")
+        }));
+    }
+
+    #[test]
+    fn static_seed_attach_failure_detaches_and_deactivates_seed_slot() {
+        let (_fixture, view, module, pins) = loaded_seed_provider();
+        let mut engine = Engine::empty();
+        engine.views.push(view);
+        let mut candidate = engine
+            .live_candidate(pins, vec![module.clone()], Vec::new())
+            .unwrap();
+        let object = candidate
+            .pinned
+            .id_for_scanned(&module, module.key, &module.path)
+            .unwrap();
+        let collected = engine.collect_dynamic_export_work(
+            LoaderContextId::from_case_id(0),
+            std::slice::from_ref(&module),
+            &candidate,
+            &ScriptedSession::default(),
+            false,
+            &[],
+        );
+        let seed = &collected.count_only_seeds[0];
+        let owner = candidate
+            .plan
+            .modules
+            .iter()
+            .find(|summary| summary.object == object)
+            .unwrap()
+            .id;
+        let slot = candidate
+            .plan
+            .add_provisional_get_function_list(plan::ProvisionalGetFunctionList {
+                module: owner,
+                object: seed.object,
+                object_path: seed.object_path.clone(),
+                file_offset: seed.file_offset,
+            })
+            .unwrap()
+            .unwrap();
+        candidate.delta.new.push(slot.clone());
+
+        let mut session = ScriptedSession::default();
+        session.fail_target_slots([slot.index]);
+        let mut additions_allowed = true;
+        let outcome = engine
+            .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+            .unwrap();
+
+        assert!(!outcome.required_complete());
+        assert_eq!(session.attached_slots, [1]);
+        assert_eq!(session.detached_slots, [0, 1]);
+        assert!(!engine.plan.is_active(slot.index));
+        assert_eq!(engine.plan.slots[slot.index as usize].descriptor_index, 0);
+        assert_eq!(
+            engine.plan.slots[slot.index as usize].names,
+            ["C_GetFunctionList"]
+        );
+        assert_eq!(engine.plan.entries_seen, 0);
+        assert!(engine.plan.surfaces.is_empty());
+    }
+
+    #[test]
+    fn static_seed_preflight_refusal_keeps_accepted_plan_and_links_unchanged() {
+        let (_fixture, view, module, pins) = loaded_seed_provider();
+        let mut engine = Engine::empty();
+        engine.views.push(view);
+        let mut candidate = engine
+            .live_candidate(pins, vec![module.clone()], Vec::new())
+            .unwrap();
+        let object = candidate
+            .pinned
+            .id_for_scanned(&module, module.key, &module.path)
+            .unwrap();
+        let owner = candidate
+            .plan
+            .modules
+            .iter()
+            .find(|summary| summary.object == object)
+            .unwrap()
+            .id;
+        let seed = CountOnlySeedWork {
+            object,
+            object_path: module.path.clone(),
+            file_offset: ElfSnapshot::read(candidate.pinned.file_for(object).unwrap())
+                .unwrap()
+                .defined_symbol("C_GetFunctionList")
+                .unwrap()
+                .unwrap()
+                .file_offset,
+        };
+        let slot = candidate
+            .plan
+            .add_provisional_get_function_list(plan::ProvisionalGetFunctionList {
+                module: owner,
+                object: seed.object,
+                object_path: seed.object_path,
+                file_offset: seed.file_offset,
+            })
+            .unwrap()
+            .unwrap();
+        candidate.delta.new.push(slot);
+        let accepted_plan = engine.plan.clone();
+        let mut session = ScriptedSession::refusing_preflight();
+        let mut additions_allowed = true;
+        let outcome = engine
+            .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+            .unwrap();
+
+        assert!(outcome.refused());
+        assert!(!outcome.required_complete());
+        assert_eq!(engine.plan, accepted_plan);
+        assert!(session.attached_slots.is_empty());
+        assert!(session.detached_slots.is_empty());
     }
 
     /// Two provider modules over two distinct executable objects the live

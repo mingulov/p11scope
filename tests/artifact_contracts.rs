@@ -2074,6 +2074,29 @@ fn every_script_parses_with_sh_n() {
 }
 
 #[test]
+fn lane02_initial_set_uses_a_direct_needed_harness() {
+    let driver = read("scripts/verify-task4-lane02.sh");
+    assert!(driver.contains("HARNESS_INITIAL=$ROOT/bin/harness-initial"));
+    assert!(driver.contains("-Wl,--no-as-needed"));
+    assert!(driver.contains("set -- \"$@\" \"$HARNESS_INITIAL\" \"$MODULE\" \"$go\""));
+    assert!(!driver.contains("set -- \"$@\" /usr/bin/env \"LD_PRELOAD=$MODULE\""));
+}
+
+#[test]
+fn lane02_cleanup_covers_both_harness_executables() {
+    let driver = read("scripts/verify-task4-lane02.sh");
+    assert_eq!(
+        driver
+            .matches("python3 - \"$HARNESS\" \"$HARNESS_INITIAL\"")
+            .count(),
+        2,
+        "absence and termination must inspect both exact harness paths"
+    );
+    assert!(driver.contains("argv[0] in wanted"));
+    assert!(driver.contains("os.fsencode(exe) == argv[0]"));
+}
+
+#[test]
 fn lane02_checker_and_driver_self_tests_execute() {
     let checker = run_ok(
         "python3",

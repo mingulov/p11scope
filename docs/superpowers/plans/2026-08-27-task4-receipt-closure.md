@@ -165,6 +165,46 @@ the facts file, hashes through that descriptor, and retains the descriptor
 through finalization. It includes that hash in Lane 14 finalization; any missing,
 replaced, malformed, or multiply linked facts object is nonzero.
 
+### Lane 14 private-work and terminal-authority amendment
+
+`build-release.sh` accepts only `ABSENT_ABSOLUTE_ROOT` or `--self-test`.
+Receipt-mode body execution is an internal same-shell function reachable only
+after validated-root creation, the common lock, source binding, and terminal
+authority are established. There is no public environment/body re-entry flag,
+body subshell, or body-local `EXIT` trap. The sole receipt finalizer first runs
+release-body cleanup; cleanup uncertainty upgrades terminal status and cannot
+replace or bypass finalization.
+
+Every mutable Lane 14 path is a fixed descendant of the validated root:
+
+```text
+WORK=$ROOT/work
+DIST=$WORK/dist
+OFFICIAL_TARGET=$WORK/release-official
+CANARY_WORK=$WORK/canaries
+ATTACH_WORK=$WORK
+DISCOVER_BASE=$WORK
+DISCOVER_WORK=$DISCOVER_BASE/discover
+```
+
+`DIST` and `OFFICIAL_TARGET` are derived values, never environment overrides.
+The parent invokes `verify-canaries.sh` with `P11SCOPE_TASK4_WORK` fixed to
+`$CANARY_WORK`, invokes `verify-attach-e2e.sh` with it fixed to `$ATTACH_WORK`,
+and invokes the discover child with `P11SCOPE_TASK4_WORK` fixed to
+`$DISCOVER_BASE`; that child's established interface derives the exact
+`$DISCOVER_WORK`. The canary diagnostic
+BPF is consumed only from `$CANARY_WORK/feature-build/...`. The two nested
+scripts preserve their historical standalone defaults when the variable is
+absent, require an explicitly supplied work path to be absolute, and never
+compose an absolute work path as `$PWD/$WORK`. No receipt-mode mutation or
+lookup may use `target/canaries`, `target/e2e`, or another caller-selected
+path.
+
+Receipt-mode body cleanup is one non-trapping `release_body_cleanup` function
+called exactly once by the terminal finalizer. The receipt branch does not
+source `cleanup-traps.sh`, install another body `EXIT` trap, or call `exit` from
+body cleanup. A cleanup failure upgrades the one terminal status written last.
+
 ## Receipt lifecycle and provenance contract
 
 After root creation, each normal driver installs one finalizer covering every
@@ -415,6 +455,8 @@ The later implementation commit modifies exactly:
 - `scripts/matrix/verify-fork-scope.sh` — Lane 10 receipt only;
 - `scripts/matrix/verify-oracle.sh` — Lane 11 isolation/receipt and pinned Cargo;
 - `scripts/build-release.sh` — sole Lane 14 receipt/finalizer;
+- `scripts/verify-canaries.sh` — Lane 14-private canary work propagation;
+- `scripts/verify-attach-e2e.sh` — Lane 14-private attach work propagation;
 - `scripts/verify-discover-containers.sh` — Lane 14-private nested facts;
 - `scripts/verify-task4-lane16.sh` — Lane 16 workload/structural validator;
 - `tests/artifact_contracts.rs` — table-driven lifecycle and lane mutations.
@@ -500,10 +542,34 @@ call/timing/performance values. Reject a Lane 16 bare/PATH observer,
 unpinned/unlocked Cargo invocation, observer outside
 `$ROOT/work/target/release`, or missing observer/Cargo identity ledger.
 
+- [ ] **Step 4: Encode the Lane 14 containment amendment**
+
+Replace the historical `OFFICIAL_TARGET=target/release-official` assertion
+with the relational safe-only contract
+`OFFICIAL_TARGET="$WORK/release-official"`, while retaining the isolated
+`CARGO_TARGET_DIR`, `--no-default-features`, and unsafe-flag rejection checks.
+The real `build-release.sh --self-test` boundary and source contracts must
+add mutations proving all of the following:
+
+- no `P11SCOPE_TASK4_BODY` dispatch or public body re-entry exists;
+- a rootless, invalid-root, or poisoned-environment invocation reaches no
+  mutator;
+- caller `P11SCOPE_TASK4_DIST` and
+  `P11SCOPE_TASK4_OFFICIAL_TARGET` values cannot redirect output;
+- there is one receipt `EXIT`/finalizer owner and body cleanup failure produces
+  one nonzero status written last;
+- the exact `WORK`, `CANARY_WORK`, `ATTACH_WORK`, `DISCOVER_BASE`,
+  `DISCOVER_WORK`, `DIST`, and `OFFICIAL_TARGET` relationships above hold;
+- supplied nested work paths must be absolute, their legacy defaults remain
+  available when absent, and no `$PWD/$WORK` composition remains; and
+- canary, attach, discover, diagnostic-BPF, distribution, and official-build
+  paths cannot escape `$ROOT/work` or use receipt-mode `target/canaries` and
+  `target/e2e` paths.
+
 ### Task 3: Implement lane-local receipts minimally
 
 **Files:**
-- Modify/Create: exactly the seven scripts listed under file ownership.
+- Modify/Create: exactly the nine scripts listed under file ownership.
 
 **Consumes:** Task 2 tests and existing lane oracles.
 
@@ -521,7 +587,8 @@ sequence inside each owner; do not create a helper file or new dependency.
 Move work beneath the private root, wrap existing body execution, replace
 mutable-name cleanup with recorded immutable identity cleanup, and retain
 current assertions. For Lane 10 do not change `uncorroborated=1`. For Lane 11
-pin Cargo and enforce state ownership. For Lane 14 pass only the private facts
+pin Cargo and enforce state ownership. For Lane 14 use the internal same-shell
+body and fixed private-work path map above, and pass only the private facts
 path. Add the exact Lane 16 validator above.
 
 - [ ] **Step 3: Run focused GREEN checks**
@@ -532,6 +599,8 @@ sh -n scripts/matrix/verify-shared-layer.sh
 sh -n scripts/matrix/verify-fork-scope.sh
 sh -n scripts/matrix/verify-oracle.sh
 sh -n scripts/build-release.sh
+sh -n scripts/verify-canaries.sh
+sh -n scripts/verify-attach-e2e.sh
 sh -n scripts/verify-discover-containers.sh
 sh -n scripts/verify-task4-lane16.sh
 sh scripts/verify-induced-gaps.sh --self-test
@@ -539,6 +608,8 @@ sh scripts/matrix/verify-shared-layer.sh --self-test
 sh scripts/matrix/verify-fork-scope.sh --self-test
 sh scripts/matrix/verify-oracle.sh --self-test
 sh scripts/build-release.sh --self-test
+sh scripts/verify-canaries.sh --self-test
+sh scripts/verify-attach-e2e.sh --self-test
 sh scripts/verify-discover-containers.sh --self-test
 sh scripts/verify-task4-lane16.sh --self-test
 cargo +1.88 test --locked --test artifact_contracts task4_receipt -- --nocapture
@@ -547,11 +618,50 @@ cargo +1.88 test --locked --test artifact_contracts task4_receipt -- --nocapture
 No Docker, sudo, systemd, eBPF attachment, or production evidence is consumed
 by these self-tests.
 
+### Task 3A: Correct Lane 14 private-work containment
+
+This task follows the fresh canonical-suite finding at exact HEAD `47a4632`.
+Commit this plan-only authority amendment before changing code.
+
+**Files:**
+- Modify exactly `scripts/build-release.sh`, `scripts/verify-canaries.sh`,
+  `scripts/verify-attach-e2e.sh`, and `tests/artifact_contracts.rs`.
+
+- [ ] **Step 1: Capture focused RED**
+
+Add the Task 2 Step 4 contracts without weakening the existing receipt cases.
+Run the focused artifact contract and require failure on the current public
+re-entry/path escapes or obsolete official-target literal, never on a fixture
+error or real runtime command.
+
+- [ ] **Step 2: Implement the same-shell correction**
+
+Remove public body re-entry and caller-selected distribution/official paths.
+Call the release body only from the validated receipt owner, derive the fixed
+path map above, propagate exact nested paths, make absolute work safe, and give
+body cleanup to the one finalizer. Preserve every existing release oracle and
+the nested discover facts authority.
+
+- [ ] **Step 3: Focused GREEN and four-file commit**
+
+Run shell syntax/self-tests for the three scripts, the focused artifact
+contract, then the full canonical sequence serially. After stopped-writer
+review, commit exactly the four corrective files:
+
+```sh
+git add scripts/build-release.sh scripts/verify-canaries.sh \
+  scripts/verify-attach-e2e.sh tests/artifact_contracts.rs
+git commit -m "fix: confine Lane 14 release work"
+```
+
 ### Task 4: Verify and independently review the implementation
 
-**Files:** The exact eight-file implementation diff only.
+**Files:** The cumulative exact ten-file implementation range only. At current
+HEAD, eight files are already committed; Task 3A supplies the remaining
+four-file correction with two files overlapping that cumulative range.
 
-**Produces:** One reviewed gate-only commit.
+**Produces:** One reviewed cumulative gate-only range ending in the Task 3A
+four-file correction commit.
 
 - [ ] **Step 1: Run canonical verification serially**
 
@@ -570,16 +680,13 @@ oracle preservation. Terra reviews command/root/lock/runtime sequencing. Luna
 checks file inventory, literal cardinalities, and no out-of-scope change. Fix
 and repeat until all agree.
 
-- [ ] **Step 3: Commit the exact gate-only delta**
+- [ ] **Step 3: Freeze the exact cumulative gate-only range**
 
 ```sh
-git add scripts/verify-induced-gaps.sh \
-  scripts/matrix/verify-shared-layer.sh \
-  scripts/matrix/verify-fork-scope.sh \
-  scripts/matrix/verify-oracle.sh scripts/build-release.sh \
-  scripts/verify-discover-containers.sh \
-  scripts/verify-task4-lane16.sh tests/artifact_contracts.rs
-git commit -m "test: bind remaining Task 4 lane receipts"
+git diff --name-only bf4cbcf..HEAD
+# Require exactly the ten files in File structure and ownership.
+# Do not recommit already committed files; Task 3A owns the final four-file
+# correction commit shown above.
 ```
 
 ### Task 5: Prove Lane 02 compatibility and run remaining Task 4 lanes

@@ -50,6 +50,132 @@ dependencies. Directory, glob, selected-source, version-only, and inherited
 contract bound, stop for schema review; do not replace it with an archive or
 directory shorthand.
 
+The private literal ledger is canonical LF-terminated UTF-8 TSV named
+`input-v1`. It is not a Task 4 envelope or public-evidence schema. It contains
+1..4096 rows and at most 4 MiB. Every row has exactly nine fields:
+
+```text
+input-v1<TAB>SEQ<TAB>CLASS<TAB>ACCESS<TAB>RESULT<TAB>MODE<TAB>SIZE<TAB>SHA256<TAB>LOCATOR<LF>
+```
+
+The file contains no blank row, CR, NUL, BOM, or trailing bytes, and ends in
+exactly one LF. `SEQ` is `0|[1-9][0-9]*`, equals the row's zero-based position,
+and is at most 4095. There is exactly one row per `LOCATOR`. Rows are in strict
+ascending order of the complete locator's raw UTF-8 bytes; repeated observations
+of one locator are combined before sorting. A lone regular-file metadata
+observation produces `probe`; `read` or `execute` subsumes `probe`, and observing
+both read and execute produces `read-execute`. A lone directory metadata
+observation produces `probe`; `enumerate` subsumes it. Conflicting classes,
+results, identities, or contents reject as mutation.
+
+`LOCATOR` is 1..4096 UTF-8 bytes and has exactly one of these disjoint forms:
+
+```text
+repo:/
+repo:/COMPONENT(/COMPONENT)*
+vendor:/
+vendor:/COMPONENT(/COMPONENT)*
+external:/
+external:/COMPONENT(/COMPONENT)*
+```
+
+`repo:/` is anchored at the exact `build_head` checkout, `vendor:/` at the
+reviewed candidate vendor root, and `external:/` at filesystem root. A path at
+or beneath the vendor anchor must use `vendor:`; a path beneath either private
+anchor cannot use `external:`. A component is 1..255 raw UTF-8 bytes, is neither
+`.` nor `..`, contains no `/`, NUL, Unicode `Cc`, `Cf`, or `Cs` code point, and
+is not Unicode-normalized or case-folded: its original UTF-8 bytes are
+authoritative. Repeated separators and a trailing separator except in the three
+root locators reject. Relative syscall paths are resolved from the traced
+process's exact cwd or dirfd. Resolution is lexical and descriptor-relative,
+not `realpath`; inability to resolve the exact cwd, dirfd, or path rejects.
+
+`CLASS`, `ACCESS`, `RESULT`, and the value fields obey this exhaustive matrix:
+
+| `CLASS` | Locator namespace | `ACCESS` | `RESULT` | `MODE`, `SIZE`, `SHA256` |
+|---|---|---|---|---|
+| `repo` | `repo:` | `probe|read|execute|read-execute` | `present` | Present regular-file values |
+| `vendor` | `vendor:` | `probe|read|execute|read-execute` | `present` | Present regular-file values |
+| `stable-sysroot|nightly-sysroot|tool|dynamic` | `external:` | `probe|read|execute|read-execute` | `present` | Present regular-file values |
+| `host-config|lane09-base|lane09-package` | `external:` | `probe|read` | `present` | Present regular-file values |
+| `directory` | any namespace | `probe|enumerate` | `present` | Directory-listing values |
+| `symlink` | any namespace | `probe` | `present` | Symlink-target values |
+| `absent` | any namespace | `probe` | `ENOENT|ENOTDIR` | `-`, `-`, `-` |
+
+No other combination is valid. `repo` and `vendor` are selected by locator
+namespace. External regular files below the two exact, disjoint pinned sysroot
+roots use the corresponding sysroot class; the exact reviewed Lane 09 base
+archive and package-byte sets use `lane09-base` and `lane09-package`;
+predeclared configuration files use `host-config`; loader/interpreter/shared-
+library inputs outside those sets use `dynamic`; every remaining external
+regular build input uses `tool`. Overlapping external classifications reject.
+A `lane09-base` row always names exact local regular archive bytes; its resolved
+OCI digest/ID remains in the already-required opaque build authority and is not
+encoded as a fake path.
+
+For a present regular file, `MODE` is exactly four lowercase octal digits for
+`st_mode & 07777`, `SIZE` is canonical unsigned decimal in `0..4294967296`,
+and `SHA256` is exactly 64 lowercase hexadecimal characters over the complete
+file bytes. Collection and verification use a held `O_NOFOLLOW` regular-file
+descriptor, stream the hash, and require unchanged device, inode, uid, gid,
+mode, link count, size, mtime, and ctime across the read. Hard links are
+permitted but distinct locators remain distinct rows.
+
+A directory row never grants authority to read or execute a descendant and
+never replaces a literal row for a consumed descendant. Its hash preimage is
+the complete immediate directory listing, excluding `.` and `..`. Each entry
+is encoded as one type byte (`F` regular, `D` directory, or `L` symlink),
+followed by the entry-name byte length as unsigned big-endian 16-bit, followed
+by the raw name bytes. Entries are sorted strictly by raw name bytes and
+concatenated without a header or terminator. Names are 1..255 bytes; duplicate
+names, any other file type, more than 4096 entries, or a listing exceeding
+4 MiB reject. `MODE` is the held directory's four-octal-digit mode, `SIZE` is
+the canonical decimal preimage length, and `SHA256` hashes that exact preimage.
+Two descriptor-relative listings and the directory's before/after device,
+inode, uid, gid, mode, link count, size, mtime, and ctime must agree; otherwise
+collection or verification rejects as mutation. Raw listing names are never
+retained.
+
+Every symlink component encountered while resolving a consumed or probed path
+has its own row. `MODE` is the symlink's four-octal-digit `lstat` mode, `SIZE`
+is the canonical decimal length in `1..4096` of the exact raw `readlinkat`
+target bytes, and `SHA256` hashes those bytes. The target bytes are read twice;
+the symlink's before/after device, inode, uid, gid, mode, link count, size,
+mtime, and ctime must agree. Relative targets resolve from the symlink's parent;
+absolute targets resolve from filesystem root; `.` and `..` are normalized only
+while deriving the canonical target locator. Namespace selection after
+resolution is vendor, then repo, then external according to the two anchors
+above. Every resolved target locator must have its own `symlink`, `directory`,
+present-regular, or `absent` row. Every link in a chain is recorded; cycles,
+more than 40 links, an unencodable resolved locator, or a special-file target
+reject. Raw target bytes are never retained.
+
+An absent row names the canonical requested locator after resolving every
+existing prefix. `ENOENT` requires a `directory` row for the nearest existing
+parent and rows for every traversed symlink; `ENOTDIR` requires a present row
+for the first blocking non-directory component and rows for every traversed
+symlink. Production must reproduce the exact errno. `EACCES`, `ELOOP`, unknown
+results, unresolved dirfds/cwds, and all other failures stop discovery for
+schema review rather than being ignored or generalized.
+
+The discovery trace must classify every successful regular-file read, mapping,
+or execution, every product-affecting metadata probe, every directory
+enumeration, and every `ENOENT` or `ENOTDIR` probe across all traced processes.
+A path first created inside the owned clean build root is an internal output,
+not an `input-v1` row; preexistence, read before owned creation, or use of an
+unowned generated path rejects. Production must observe no additional literal
+input or probe and must reproduce every ledger row. Directory hashes grant no
+directory read authority; the sandbox authorizes only the literal resolved
+objects required by the reviewed rows.
+
+Encoding uses the closed spellings above, canonical decimal/octal forms, and no
+escaping. Parsing followed by canonical encoding must reproduce the exact input
+bytes. Any syntax, matrix, ordering, namespace, bound, filesystem, relation, or
+round-trip failure rejects. The candidate trace and ledger remain mode-0600
+private inputs; only their ordered digest and already-approved opaque identities
+enter tracked authority. No locator, raw directory listing, or raw symlink
+target enters tracked or public evidence.
+
 The production output is a private staging directory, not a Task 4 envelope.
 It is produced before the receipt helper exists and introduces no build-subject
 schema. It contains only the reviewed input ledger and these literal subjects:

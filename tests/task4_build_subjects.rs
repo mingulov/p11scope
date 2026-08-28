@@ -2602,3 +2602,941 @@ print("bs2a-confirmed-gaps-red-ok")
         diagnostics.join("\n")
     );
 }
+
+#[test]
+fn discover_input_v1_candidate_only_rejects_reset_gaps() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = repo.join("scripts/task4-build-subject.py");
+    let driver = r##"
+import importlib.util
+import ctypes
+import json
+import os
+import shutil
+import signal
+import stat
+import struct
+import sys
+import tempfile
+import time
+import types
+
+spec = importlib.util.spec_from_file_location("task4_build_subject", sys.argv[1])
+if spec is None or spec.loader is None:
+    raise SystemExit("could not import task4 build-subject script")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+diagnostics = {f"R{index}": [] for index in range(14)}
+diagnostics.update(
+    {
+        "R6/write-only-mmap": [],
+        "R6/zero-length-mmap": [],
+        "R6/munmap-length": [],
+        **{
+            f"R13/{field}/{kind}": []
+            for field in ("seq", "klass", "access", "result", "mode", "size", "sha256", "locator")
+            for kind in ("list", "dict")
+        },
+        "R13/non-record": [],
+    }
+)
+
+
+def failure(label, reason):
+    diagnostics.setdefault(label, []).append(reason)
+
+
+def tree(root, *, include_times=True):
+    entries = []
+
+    def visit(path):
+        value = os.lstat(path)
+        mode = stat.S_IMODE(value.st_mode)
+        if stat.S_ISDIR(value.st_mode):
+            kind, content = "directory", None
+        elif stat.S_ISREG(value.st_mode):
+            kind, content = "regular", open(path, "rb").read()
+        elif stat.S_ISLNK(value.st_mode):
+            kind, content = "symlink", os.fsencode(os.readlink(path))
+        else:
+            kind, content = "other", None
+        entry = [
+            os.fsencode(os.path.relpath(path, root)),
+            kind,
+            mode,
+            value.st_dev,
+            value.st_ino,
+            value.st_uid,
+            value.st_gid,
+            value.st_nlink,
+            value.st_size,
+            content,
+        ]
+        if include_times:
+            entry.extend((value.st_mtime_ns, value.st_ctime_ns))
+        entries.append(tuple(entry))
+        if kind == "directory":
+            for child in sorted(os.scandir(path), key=lambda entry: os.fsencode(entry.name)):
+                visit(child.path)
+
+    visit(root)
+    return tuple(entries)
+
+
+def fixture(root, *, many=False):
+    os.chmod(root, 0o700)
+    repo = os.path.join(root, "repo")
+    vendor = os.path.join(repo, "vendor")
+    vendor_pkg = os.path.join(vendor, "pkg")
+    build = os.path.join(root, "build")
+    stable = os.path.join(root, "stable")
+    nightly = os.path.join(root, "nightly")
+    outside = os.path.join(root, "outside.bin")
+    enum = os.path.join(repo, "enum")
+    empty_dir = os.path.join(repo, "empty")
+    for path in (repo, vendor, vendor_pkg, build, stable, nightly, enum, empty_dir):
+        os.mkdir(path)
+        os.chmod(path, 0o700 if path == build else 0o755)
+    if many:
+        for index in range(4097):
+            with open(os.path.join(enum, f"e{index:04d}"), "wb"):
+                pass
+    else:
+        with open(os.path.join(enum, "a"), "wb") as handle:
+            handle.write(b"a")
+        os.chmod(os.path.join(enum, "a"), 0o644)
+
+    def write(path, data=b"abc", mode=0o644):
+        with open(path, "wb") as handle:
+            handle.write(data)
+        os.chmod(path, mode)
+
+    write(os.path.join(repo, "input"))
+    write(os.path.join(vendor_pkg, "tool"))
+    write(os.path.join(stable, "stable.bin"))
+    write(os.path.join(nightly, "nightly.bin"))
+    write(outside)
+    return {
+        "root": root,
+        "repo": repo,
+        "vendor": vendor,
+        "vendor_file": os.path.join(vendor_pkg, "tool"),
+        "build": build,
+        "stable": stable,
+        "nightly": nightly,
+        "outside": outside,
+        "enum": enum,
+        "empty": empty_dir,
+        "input": os.path.join(repo, "input"),
+    }
+
+
+def values(paths, **overrides):
+    result = dict(
+        root_pid=100,
+        initial_cwd=paths["repo"],
+        repo_root=paths["repo"],
+        vendor_relative="vendor",
+        build_root=paths["build"],
+        stable_sysroot_root=paths["stable"],
+        nightly_sysroot_root=paths["nightly"],
+    )
+    result.update(overrides)
+    return result
+
+
+def discover(paths, trace, **overrides):
+    return module.discover_input_v1(trace, **values(paths, **overrides))
+
+
+def exit_trace(pid=100):
+    return f"{pid} +++ exited with 0 +++\n".encode("ascii")
+
+
+def expect_exception(label, expected, operation):
+    try:
+        operation()
+    except BaseException as exc:
+        if type(exc) is not expected:
+            failure(label, f"expected {expected.__name__}, got {type(exc).__name__}")
+    else:
+        failure(label, f"accepted invalid input, expected {expected.__name__}")
+
+
+def expect_success(label, operation):
+    try:
+        return operation()
+    except BaseException as exc:
+        failure(label, f"expected success, got {type(exc).__name__}")
+        return None
+
+
+IN_ACCESS = 0x00000001
+IN_OPEN = 0x00000020
+IN_NONBLOCK = 0x00000800
+IN_DONT_FOLLOW = 0x02000000
+IN_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+libc = ctypes.CDLL(None, use_errno=True)
+libc.inotify_init1.argtypes = [ctypes.c_int]
+libc.inotify_init1.restype = ctypes.c_int
+libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+libc.inotify_add_watch.restype = ctypes.c_int
+libc.inotify_rm_watch.argtypes = [ctypes.c_int, ctypes.c_int]
+libc.inotify_rm_watch.restype = ctypes.c_int
+
+
+def native_watches(paths, *, nofollow=()):
+    requested = tuple(dict.fromkeys(paths))
+    fd = libc.inotify_init1(IN_NONBLOCK | IN_CLOEXEC)
+    if fd < 0:
+        return None, {}
+    watches = {}
+    for path in requested:
+        flags = IN_ACCESS | IN_OPEN | (IN_DONT_FOLLOW if path in nofollow else 0)
+        watch = libc.inotify_add_watch(fd, os.fsencode(path), flags)
+        if watch < 0 or watch in watches:
+            os.close(fd)
+            return None, {}
+        watches[watch] = path
+    if len(watches) != len(requested):
+        os.close(fd)
+        return None, {}
+    return fd, watches
+
+
+def native_events(fd, watches):
+    events = []
+    if fd is None:
+        return events
+    while True:
+        try:
+            data = os.read(fd, 65536)
+        except BlockingIOError:
+            return events
+        if not data:
+            return events
+        offset = 0
+        while offset + 16 <= len(data):
+            watch, mask, _cookie, length = struct.unpack_from("iIII", data, offset)
+            offset += 16 + length
+            if watch in watches:
+                events.append((watches[watch], mask))
+
+
+def wait_child(pid, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            waited, status = os.waitpid(pid, os.WNOHANG | os.WUNTRACED)
+        except ChildProcessError:
+            return None, True
+        if waited == pid:
+            return status, os.WIFEXITED(status) or os.WIFSIGNALED(status)
+        if time.monotonic() >= deadline:
+            return None, False
+        time.sleep(0.01)
+
+
+# R0: compile both wrappers before forking, then install the audit hook in an
+# isolated child immediately before the exact public calls. The hook and its
+# evidence die with that child, and the parent receives only public outcomes.
+with tempfile.TemporaryDirectory(prefix="x-") as root:
+    paths = fixture(root)
+    target = os.path.join(paths["repo"], "target")
+    with open(target, "wb") as handle:
+        handle.write(b"abc")
+    os.chmod(target, 0o644)
+    alias = os.path.join(paths["repo"], "alias")
+    os.symlink("target", alias)
+    trace = (
+        f'100 openat(AT_FDCWD, "{alias}", O_RDONLY|O_CLOEXEC) = 3\n'
+        "100 close(3) = 0\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    expected = (
+        "input-v1\t0\tsymlink\tprobe\tpresent\t0777\t6\t"
+        "34a04005bcaf206eec990bd9637d9fdb6725e0a0c0d4aebf003f17f4c956eb5c\t"
+        "repo:/alias\n"
+        "input-v1\t1\trepo\tread\tpresent\t0644\t3\t"
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\t"
+        "repo:/target\n"
+    ).encode("ascii")
+    watched_paths = {
+        os.path.realpath(sys.argv[1]),
+        os.path.realpath(os.path.join(os.getcwd(), "tests", "task4_build_subjects.rs")),
+    }
+    read_fd, write_fd = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(read_fd)
+        try:
+            token = os.urandom(12).hex()
+            first_name = "u" + token[:10]
+            second_name = "v" + token[10:]
+            deep_one = "w" + os.urandom(6).hex()
+            deep_two = "z" + os.urandom(6).hex()
+            first_source = (
+                f"def {first_name}(call, payload, options):\n"
+                "    return call(payload, **options)\n"
+            )
+            second_source = (
+                f"def {second_name}(call, payload, options):\n"
+                f"    def {deep_one}(value):\n"
+                f"        def {deep_two}(nested):\n"
+                "            return call(nested, **options)\n"
+                f"        return {deep_two}(value)\n"
+                f"    return {deep_one}(payload)\n"
+            )
+            first_namespace = {}
+            second_namespace = {}
+            exec(compile(first_source, "<x>", "exec"), {"__builtins__": __builtins__}, first_namespace)
+            exec(compile(second_source, "<x>", "exec"), {"__builtins__": __builtins__}, second_namespace)
+            sensitive = []
+            watched_reads = []
+
+            def audit_observer(event, args):
+                lowered = event.lower()
+                if event in {"sys._getframe", "sys.settrace", "sys.setprofile"} or any(
+                    token in lowered for token in ("frame", "trace", "profile", "code")
+                ):
+                    sensitive.append(event)
+                if any(isinstance(arg, (types.FrameType, types.CodeType)) for arg in args):
+                    sensitive.append("sensitive-object")
+                if event == "open":
+                    for arg in args[:1]:
+                        try:
+                            path = os.path.realpath(os.fsdecode(arg))
+                        except (TypeError, ValueError):
+                            continue
+                        if path in watched_paths:
+                            watched_reads.append(path)
+
+            sys.addaudithook(audit_observer)
+            outcomes = []
+            for namespace, name in ((first_namespace, first_name), (second_namespace, second_name)):
+                try:
+                    outcomes.append(("ok", namespace[name](module.discover_input_v1, trace, values(paths)).decode("ascii")))
+                except BaseException as exc:
+                    outcomes.append(("error", type(exc).__name__, str(exc)))
+            payload = {"outcomes": outcomes, "sensitive": sensitive, "watched": watched_reads}
+            os.write(write_fd, json.dumps(payload).encode("utf-8"))
+        finally:
+            os.close(write_fd)
+            os._exit(0)
+    os.close(write_fd)
+    child_status, child_reaped = wait_child(child)
+    if child_status is None and not child_reaped:
+        failure("R0", "isolated wrapper child wait timed out")
+    if not child_reaped:
+        try:
+            os.kill(child, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        cleanup_status, child_reaped = wait_child(child)
+        if cleanup_status is not None:
+            child_status = cleanup_status
+    raw = os.read(read_fd, 65536) if child_reaped else b""
+    os.close(read_fd)
+    payload = json.loads(raw.decode("utf-8")) if raw else {}
+    outcomes = payload.get("outcomes", [])
+    if child_status is None or not os.WIFEXITED(child_status) or os.WEXITSTATUS(child_status) != 0:
+        failure("R0", "isolated wrapper child did not exit normally")
+    if payload.get("sensitive"):
+        failure("R0", "introspection audit event observed")
+    if payload.get("watched"):
+        failure("R0", "test or candidate source path read after import")
+    if len(outcomes) < 2 or outcomes[0] != ["ok", expected.decode("ascii")]:
+        failure("R0", "first wrapper missed literal ledger")
+    if len(outcomes) < 2 or outcomes[1] != ["ok", expected.decode("ascii")]:
+        failure("R0", "second wrapper missed literal ledger")
+    if len(outcomes) == 2 and outcomes[0] != outcomes[1]:
+        failure("R0", "wrapper outcomes differ")
+
+
+# R1: a real directory with 4097 ordinary entries must be rejected before the
+# result can be materialized as an unbounded directory record.
+with tempfile.TemporaryDirectory(prefix="x-") as root:
+    paths = fixture(root, many=True)
+    before = tree(root)
+    trace = (
+        f'100 openat(AT_FDCWD, "{paths["enum"]}", O_RDONLY|O_CLOEXEC|O_DIRECTORY) = 3\n'
+        "100 getdents64(3, 0x7f, 32768) = 24\n"
+        "100 getdents64(3, 0x7f, 32768) = 0\n"
+        "100 close(3) = 0\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    expect_exception("R1", module.FormatError, lambda: discover(paths, trace))
+    if tree(root) != before:
+        failure("R1", "fixture changed")
+
+
+# R2: prebuild both same-shaped trees, then stop the isolated child before its
+# audited input open. The parent verifies a retained original b FD through
+# /proc, swaps only the prebuilt directories, resumes, and uses inotify for
+# original/replacement provenance. No parent audit hook survives this case.
+with tempfile.TemporaryDirectory(prefix="x-") as root:
+    paths = fixture(root)
+    nested = os.path.join(paths["repo"], "a", "b")
+    replacement = nested + "." + os.urandom(8).hex()
+    held_nested = nested + "." + os.urandom(8).hex()
+    os.mkdir(os.path.join(paths["repo"], "a"))
+    os.mkdir(nested)
+    os.mkdir(replacement)
+    os.chmod(os.path.join(paths["repo"], "a"), 0o755)
+    os.chmod(nested, 0o755)
+    os.chmod(replacement, 0o755)
+    target = os.path.join(nested, "input")
+    replacement_target = os.path.join(replacement, "input")
+    with open(target, "wb") as handle:
+        handle.write(b"abc")
+    with open(replacement_target, "wb") as handle:
+        handle.write(b"xyz")
+    os.chmod(target, 0o644)
+    os.chmod(replacement_target, 0o644)
+    before = tree(root, include_times=False)
+    original_paths = {nested, target}
+    replacement_paths = {replacement, replacement_target}
+    watch_fd, all_watches = native_watches(tuple(original_paths | replacement_paths))
+    watches = {
+        watch: path for watch, path in all_watches.items() if path in original_paths
+    }
+    replacement_watches = {
+        watch: ("replacement", path)
+        for watch, path in all_watches.items()
+        if path in replacement_paths
+    }
+    if watch_fd is None:
+        failure("R2", "native inotify unavailable")
+    trace = (
+        f'100 openat(AT_FDCWD, "{target}", O_RDONLY|O_CLOEXEC) = 3\n'
+        "100 read(3, \"abc\", 3) = 3\n"
+        "100 close(3) = 0\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    read_fd, write_fd = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(read_fd)
+        b_acquisitions = [0]
+        stopped = [False]
+
+        def audit_relation(event, args):
+            if event != "open" or not args:
+                return
+            path = os.fsdecode(args[0])
+            if path == "b":
+                b_acquisitions[0] += 1
+            elif not stopped[0] and b_acquisitions[0] and path == "input":
+                stopped[0] = True
+                os.kill(os.getpid(), signal.SIGSTOP)
+
+        sys.addaudithook(audit_relation)
+        try:
+            try:
+                result = ("ok", discover(paths, trace).decode("ascii"))
+            except BaseException as exc:
+                result = ("error", type(exc).__name__, str(exc))
+            result += (b_acquisitions[0],)
+            os.write(write_fd, json.dumps(result).encode("utf-8"))
+        finally:
+            os.close(write_fd)
+            os._exit(0)
+    os.close(write_fd)
+    child_status = None
+    swapped = False
+    original_renamed = False
+    child_reaped = False
+    original_identity = os.stat(nested, follow_symlinks=False)
+    try:
+        child_status, child_reaped = wait_child(child)
+        if child_status is None:
+            failure("R2", "isolated child wait timed out")
+        if child_status is None or not os.WIFSTOPPED(child_status):
+            failure("R2", "isolated child did not stop before input open")
+        else:
+            held = 0
+            try:
+                for entry in os.listdir(f"/proc/{child}/fd"):
+                    try:
+                        value = os.stat(f"/proc/{child}/fd/{entry}")
+                    except OSError:
+                        continue
+                    if (value.st_dev, value.st_ino) == (original_identity.st_dev, original_identity.st_ino):
+                        held += 1
+            except OSError:
+                held = -1
+            if held < 1:
+                failure("R2", "no held original b FD was observed")
+            os.rename(nested, held_nested)
+            original_renamed = True
+            os.rename(replacement, nested)
+            swapped = True
+            if not child_reaped:
+                os.kill(child, signal.SIGCONT)
+                child_status, child_reaped = wait_child(child)
+                if child_status is None:
+                    failure("R2", "resumed child wait timed out")
+    finally:
+        if not child_reaped:
+            try:
+                os.kill(child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            cleanup_status, child_reaped = wait_child(child)
+            if cleanup_status is not None:
+                child_status = cleanup_status
+        events = native_events(watch_fd, watches | replacement_watches)
+        if watch_fd is not None:
+            os.close(watch_fd)
+        if swapped:
+            os.rename(nested, replacement)
+            os.rename(held_nested, nested)
+        elif original_renamed:
+            os.rename(held_nested, nested)
+    raw = os.read(read_fd, 65536) if child_reaped else b""
+    os.close(read_fd)
+    result = json.loads(raw.decode("utf-8")) if raw else None
+    if child_status is None or not os.WIFEXITED(child_status) or os.WEXITSTATUS(child_status) != 0:
+        failure("R2", "isolated child did not exit normally")
+    if not isinstance(result, list) or len(result) < 3 or result[-1] != 1:
+        failure("R2", "original b path acquisition count was not one")
+    if not (isinstance(result, list) and len(result) >= 2 and result[0] == "error" and result[1] == "MutationError"):
+        failure("R2", "expected MutationError after replacement")
+    original_target_activity = sum(
+        path == target and bool(mask & (IN_OPEN | IN_ACCESS))
+        for path, mask in events
+    )
+    replacement_activity = sum(
+        isinstance(path, tuple)
+        and path[0] == "replacement"
+        and bool(mask & (IN_OPEN | IN_ACCESS))
+        for path, mask in events
+    )
+    if not original_target_activity:
+        failure("R2", "original input open/access provenance was not observed")
+    if replacement_activity:
+        failure("R2", "replacement tree was opened or read")
+    if tree(root, include_times=False) != before:
+        failure("R2", "fixture changed")
+
+
+# R3: prebuild a replacement repo, then stop the isolated child at the vendor
+# open after initial-cwd observation and exactly one repo acquisition. The
+# parent verifies a retained original repo FD through /proc, performs two
+# renames, resumes, and requires original-vendor/no-replacement inotify use.
+with tempfile.TemporaryDirectory(prefix="x-") as root:
+    paths = fixture(root)
+    replacement_repo = paths["repo"] + "." + os.urandom(8).hex()
+    held_repo = paths["repo"] + "." + os.urandom(8).hex()
+    shutil.copytree(paths["repo"], replacement_repo, symlinks=True)
+    replacement_vendor_file = os.path.join(replacement_repo, "vendor", "pkg", "tool")
+    with open(replacement_vendor_file, "wb") as handle:
+        handle.write(b"xyz")
+    os.chmod(replacement_vendor_file, 0o644)
+    before = tree(root, include_times=False)
+    original_vendor_paths = {
+        paths["vendor"],
+        os.path.join(paths["vendor"], "pkg"),
+        paths["vendor_file"],
+    }
+    replacement_vendor_paths = {
+        os.path.join(replacement_repo, "vendor"),
+        os.path.join(replacement_repo, "vendor", "pkg"),
+        replacement_vendor_file,
+    }
+    watch_fd, all_watches = native_watches(tuple(original_vendor_paths | replacement_vendor_paths))
+    watches = {
+        watch: path for watch, path in all_watches.items() if path in original_vendor_paths
+    }
+    replacement_watches = {
+        watch: ("replacement", path)
+        for watch, path in all_watches.items()
+        if path in replacement_vendor_paths
+    }
+    if watch_fd is None:
+        failure("R3", "native inotify unavailable")
+    trace = (
+        f'100 openat(AT_FDCWD, "{paths["vendor_file"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+        "100 read(3, \"abc\", 3) = 3\n"
+        "100 close(3) = 0\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    read_fd, write_fd = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(read_fd)
+        cwd_seen = [False]
+        repo_acquisitions = [0]
+        stopped = [False]
+
+        def audit_relation(event, args):
+            if event != "open" or not args or stopped[0]:
+                return
+            path = os.fsdecode(args[0])
+            if not cwd_seen[0] and path == os.path.basename(paths["root"]):
+                cwd_seen[0] = True
+            elif cwd_seen[0] and path == "repo":
+                repo_acquisitions[0] += 1
+            elif cwd_seen[0] and repo_acquisitions[0] == 1 and path == "vendor":
+                stopped[0] = True
+                os.kill(os.getpid(), signal.SIGSTOP)
+
+        sys.addaudithook(audit_relation)
+        try:
+            try:
+                result = ("ok", discover(paths, trace, initial_cwd=paths["root"]).decode("ascii"))
+            except BaseException as exc:
+                result = ("error", type(exc).__name__, str(exc))
+            os.write(write_fd, json.dumps(result).encode("utf-8"))
+        finally:
+            os.close(write_fd)
+            os._exit(0)
+    os.close(write_fd)
+    child_status = None
+    swapped = False
+    original_renamed = False
+    child_reaped = False
+    original_identity = os.stat(paths["repo"], follow_symlinks=False)
+    try:
+        child_status, child_reaped = wait_child(child)
+        if child_status is None:
+            failure("R3", "isolated child wait timed out")
+        if child_status is None or not os.WIFSTOPPED(child_status):
+            failure("R3", "isolated child did not stop before vendor acquisition")
+        else:
+            held = 0
+            try:
+                for entry in os.listdir(f"/proc/{child}/fd"):
+                    try:
+                        value = os.stat(f"/proc/{child}/fd/{entry}")
+                    except OSError:
+                        continue
+                    if (value.st_dev, value.st_ino) == (original_identity.st_dev, original_identity.st_ino):
+                        held += 1
+            except OSError:
+                held = -1
+            if held < 1:
+                failure("R3", "no held original repo FD was observed")
+            os.rename(paths["repo"], held_repo)
+            original_renamed = True
+            os.rename(replacement_repo, paths["repo"])
+            swapped = True
+            if not child_reaped:
+                os.kill(child, signal.SIGCONT)
+                child_status, child_reaped = wait_child(child)
+                if child_status is None:
+                    failure("R3", "resumed child wait timed out")
+    finally:
+        if not child_reaped:
+            try:
+                os.kill(child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            cleanup_status, child_reaped = wait_child(child)
+            if cleanup_status is not None:
+                child_status = cleanup_status
+        events = native_events(watch_fd, watches | replacement_watches)
+        if watch_fd is not None:
+            os.close(watch_fd)
+        if swapped:
+            os.rename(paths["repo"], replacement_repo)
+            os.rename(held_repo, paths["repo"])
+        elif original_renamed:
+            os.rename(held_repo, paths["repo"])
+    raw = os.read(read_fd, 65536) if child_reaped else b""
+    os.close(read_fd)
+    result = json.loads(raw.decode("utf-8")) if raw else None
+    if child_status is None or not os.WIFEXITED(child_status) or os.WEXITSTATUS(child_status) != 0:
+        failure("R3", "isolated child did not exit normally")
+    if not (isinstance(result, list) and len(result) >= 2 and result[0] == "error" and result[1] == "MutationError"):
+        failure("R3", "expected MutationError after repo replacement")
+    original_vendor_opened = sum(
+        path in original_vendor_paths and bool(mask & (IN_OPEN | IN_ACCESS))
+        for path, mask in events
+    )
+    replacement_vendor_opened = sum(
+        isinstance(path, tuple)
+        and path[0] == "replacement"
+        and bool(mask & (IN_OPEN | IN_ACCESS))
+        for path, mask in events
+    )
+    if not original_vendor_opened:
+        failure("R3", "original vendor open was not observed")
+    if replacement_vendor_opened:
+        failure("R3", "replacement vendor object was opened or read")
+    if tree(root, include_times=False) != before:
+        failure("R3", "fixture changed")
+
+
+# R4: deterministic public success control for one regular target acquisition.
+# Native inotify proves exactly one target IN_OPEN while the resolved regular
+# target is read. The full same-FD S0/H0/S1/rewind/H1/S2 mutation invariant is
+# review-only here, as required by the architecture decision; this control
+# does not claim to dynamically prove a race-free between-pass mutation.
+with tempfile.TemporaryDirectory(prefix="x-") as root:
+    paths = fixture(root)
+    target = paths["outside"]
+    before = tree(root)
+    watch_fd, watches = native_watches((target,))
+    if watch_fd is None:
+        failure("R4", "native inotify unavailable")
+    trace = (
+        f'100 openat(AT_FDCWD, "{target}", O_RDONLY|O_CLOEXEC) = 3\n'
+        "100 read(3, \"abc\", 3) = 3\n"
+        "100 close(3) = 0\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    expected = (
+        "input-v1\t0\ttool\tread\tpresent\t0644\t3\t"
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\t"
+        f"external:{target}\n"
+    ).encode("ascii")
+    value = expect_success("R4", lambda: discover(paths, trace))
+    events = native_events(watch_fd, watches)
+    if watch_fd is not None:
+        os.close(watch_fd)
+    if value != expected:
+        failure("R4", "literal ledger mismatch")
+    open_count = sum(path == target and bool(mask & IN_OPEN) for path, mask in events)
+    if open_count != 1:
+        failure("R4", f"target was opened {open_count} times")
+    if tree(root) != before:
+        failure("R4", "fixture changed")
+
+
+# R5: ordinary external openat/read is a tool input, with no mmap or exec.
+with tempfile.TemporaryDirectory(prefix="x-") as root:
+    paths = fixture(root)
+    trace = (
+        f'100 openat(AT_FDCWD, "{paths["outside"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+        "100 read(3, \"abc\", 3) = 3\n"
+        "100 close(3) = 0\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    expected = (
+        "input-v1\t0\ttool\tread\tpresent\t0644\t3\t"
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\t"
+        f"external:{paths['outside']}\n"
+    ).encode("ascii")
+    value = expect_success("R5", lambda: discover(paths, trace))
+    if value is not None and value != expected:
+        failure("R5", "literal ledger mismatch")
+
+
+# R6: mmap and munmap boundaries are exact public trace errors.
+with tempfile.TemporaryDirectory(prefix="x-") as root:
+    paths = fixture(root)
+    cases = {
+        "write-only-mmap": (
+            f'100 openat(AT_FDCWD, "{paths["build"]}/generated.o", O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0600) = 3\n'
+            "100 write(3, \"abc\", 3) = 3\n"
+            "100 close(3) = 0\n"
+            f'100 openat(AT_FDCWD, "{paths["build"]}/generated.o", O_WRONLY|O_CLOEXEC) = 4\n'
+            "100 mmap(NULL, 3, PROT_READ, MAP_PRIVATE, 4, 0) = 0\n"
+            "100 munmap(0, 3) = 0\n"
+            "100 close(4) = 0\n"
+            f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 5\n'
+            "100 read(5, \"abc\", 3) = 3\n"
+            "100 close(5) = 0\n"
+            "100 +++ exited with 0 +++\n"
+        ),
+        "zero-length-mmap": (
+            f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+            "100 mmap(NULL, 0, PROT_READ, MAP_PRIVATE, 3, 0) = 0\n"
+            "100 close(3) = 0\n"
+            f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 4\n'
+            "100 read(4, \"abc\", 3) = 3\n"
+            "100 close(4) = 0\n"
+            "100 +++ exited with 0 +++\n"
+        ),
+        "munmap-length": (
+            f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+            "100 mmap(NULL, 3, PROT_READ, MAP_PRIVATE, 3, 0) = 0\n"
+            "100 munmap(0, 2) = 0\n"
+            "100 close(3) = 0\n"
+            f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 4\n'
+            "100 read(4, \"abc\", 3) = 3\n"
+            "100 close(4) = 0\n"
+            "100 +++ exited with 0 +++\n"
+        ),
+    }
+    for name, raw in cases.items():
+        expect_exception(f"R6/{name}", module.FormatError, lambda raw=raw: discover(paths, raw.encode("ascii")))
+
+
+# R7: dup aliases share a directory description, including its EOF state.
+with tempfile.TemporaryDirectory(prefix="x-") as root:
+    paths = fixture(root)
+    trace = (
+        f'100 openat(AT_FDCWD, "{paths["enum"]}", O_RDONLY|O_CLOEXEC|O_DIRECTORY) = 3\n'
+        "100 dup(3) = 9\n"
+        "100 getdents64(3, 0x7f, 32768) = 24\n"
+        "100 getdents64(3, 0x7f, 32768) = 0\n"
+        "100 getdents64(9, 0x7f, 32768) = 24\n"
+        "100 close(3) = 0\n"
+        "100 close(9) = 0\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    expect_exception("R7", module.FormatError, lambda: discover(paths, trace))
+
+
+# R8: clone aliases share directory EOF, while a positive-through-one/EOF-
+# through-the-other control trace is a successful single directory row.
+with tempfile.TemporaryDirectory(prefix="x-") as root:
+    paths = fixture(root)
+    reject = (
+        f'100 openat(AT_FDCWD, "{paths["enum"]}", O_RDONLY|O_CLOEXEC|O_DIRECTORY) = 3\n'
+        "100 clone(child_stack=NULL, flags=SIGCHLD, child_tidptr=NULL) = 101\n"
+        "100 getdents64(3, 0x7f, 32768) = 24\n"
+        "100 getdents64(3, 0x7f, 32768) = 0\n"
+        "101 getdents64(3, 0x7f, 32768) = 24\n"
+        "100 close(3) = 0\n"
+        "101 close(3) = 0\n"
+        "101 +++ exited with 0 +++\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    expect_exception("R8", module.FormatError, lambda: discover(paths, reject))
+    control = (
+        f'100 openat(AT_FDCWD, "{paths["enum"]}", O_RDONLY|O_CLOEXEC|O_DIRECTORY) = 3\n'
+        "100 clone(child_stack=NULL, flags=SIGCHLD, child_tidptr=NULL) = 101\n"
+        "100 getdents64(3, 0x7f, 32768) = 24\n"
+        "101 getdents64(3, 0x7f, 32768) = 0\n"
+        "100 close(3) = 0\n"
+        "101 close(3) = 0\n"
+        "101 +++ exited with 0 +++\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    expected = (
+        "input-v1\t0\tdirectory\tenumerate\tpresent\t0755\t4\t"
+        "ee972d3b461ce8c55a76223e6b121e4c39ff9f3de93b2c1ca5842c95bf205bc9\t"
+        "repo:/enum\n"
+    ).encode("ascii")
+    value = expect_success("R8", lambda: discover(paths, control))
+    if value is not None and value != expected:
+        failure("R8", "control ledger mismatch")
+
+
+# R9: cloning an address space copies a live mapping, but each process retires
+# its own inherited copy independently.
+with tempfile.TemporaryDirectory(prefix="x-") as root:
+    paths = fixture(root)
+    trace = (
+        f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+        "100 mmap(NULL, 3, PROT_READ, MAP_PRIVATE, 3, 0) = 0\n"
+        "100 clone(child_stack=NULL, flags=SIGCHLD, child_tidptr=NULL) = 101\n"
+        "101 munmap(0, 3) = 0\n"
+        "101 close(3) = 0\n"
+        "101 +++ exited with 0 +++\n"
+        "100 munmap(0, 3) = 0\n"
+        "100 close(3) = 0\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    expected = (
+        "input-v1\t0\trepo\tread\tpresent\t0644\t3\t"
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\t"
+        "repo:/input\n"
+    ).encode("ascii")
+    value = expect_success("R9", lambda: discover(paths, trace))
+    if value is not None and value != expected:
+        failure("R9", "literal ledger mismatch")
+
+
+# R10: immediate EOF is valid for an empty directory; a result larger than the
+# requested getdents buffer is not.
+with tempfile.TemporaryDirectory(prefix="x-") as root:
+    paths = fixture(root)
+    empty_trace = (
+        f'100 openat(AT_FDCWD, "{paths["empty"]}", O_RDONLY|O_CLOEXEC|O_DIRECTORY) = 3\n'
+        "100 getdents64(3, 0x7f, 32768) = 0\n"
+        "100 close(3) = 0\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    expected = (
+        "input-v1\t0\tdirectory\tenumerate\tpresent\t0755\t0\t"
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\t"
+        "repo:/empty\n"
+    ).encode("ascii")
+    value = expect_success("R10", lambda: discover(paths, empty_trace))
+    if value is not None and value != expected:
+        failure("R10", "empty-directory ledger mismatch")
+    oversized = empty_trace.replace(b") = 0\n", b") = 32769\n", 1)
+    expect_exception("R10", module.FormatError, lambda: discover(paths, oversized))
+
+
+# R11: an exclusive output whose immediate parent is absent is not a claimed
+# successful build output, and the real build directory remains empty.
+with tempfile.TemporaryDirectory(prefix="x-") as root:
+    paths = fixture(root)
+    before = tree(paths["build"])
+    trace = (
+        f'100 openat(AT_FDCWD, "{paths["build"]}/missing/generated.o", O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0600) = 3\n'
+        "100 write(3, \"o\", 1) = 1\n"
+        "100 close(3) = 0\n"
+        f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 4\n'
+        "100 read(4, \"abc\", 3) = 3\n"
+        "100 close(4) = 0\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    expect_exception("R11", module.MutationError, lambda: discover(paths, trace))
+    if tree(paths["build"]) != before:
+        failure("R11", "build directory changed")
+
+
+# R12: an already-green no-follow symlink control rejects a supplied root
+# symlink before replay; this does not claim general identity-alias coverage.
+with tempfile.TemporaryDirectory(prefix="x-") as root:
+    paths = fixture(root)
+    os.unlink(os.path.join(paths["nightly"], "nightly.bin"))
+    os.rmdir(paths["nightly"])
+    os.symlink(paths["stable"], paths["nightly"])
+    before = tree(root)
+    expect_exception("R12", module.MutationError, lambda: discover(paths, exit_trace()))
+    if tree(root) != before:
+        failure("R12", "symlink-alias fixture changed")
+
+
+# R13: public encoder validation rejects every malformed field shape and a
+# non-record element with FormatError, never leaking a Python TypeError.
+digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+fields = ["seq", "klass", "access", "result", "mode", "size", "sha256", "locator"]
+valid = [0, "tool", "read", "present", 0o644, 3, digest, "external:/x"]
+for index, name in enumerate(fields):
+    for replacement in (["x"], {"x": 1}):
+        record = list(valid)
+        record[index] = replacement
+        label = f"R13/{name}/{type(replacement).__name__}"
+        expect_exception(
+            label,
+            module.FormatError,
+            lambda record=record: module.encode_ledger([module.InputRecord(*record)]),
+        )
+expect_exception("R13/non-record", module.FormatError, lambda: module.encode_ledger([[]]))
+
+if any(diagnostics.values()):
+    for label in sorted(diagnostics):
+        print(f"{label}: {'PASS' if not diagnostics[label] else 'FAIL'}")
+    for label in sorted(diagnostics):
+        for reason in diagnostics[label]:
+            print(f"{label}: {reason}")
+    raise SystemExit(1)
+print("bs2a-reset-red-ok")
+"##;
+    let output = Command::new("/usr/bin/python3")
+        .args(["-c", driver, script.to_str().expect("script path is UTF-8")])
+        .current_dir(repo)
+        .env_clear()
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("PYTHONHASHSEED", "1")
+        .output()
+        .expect("run BS2a reset RED regression driver");
+    assert!(
+        output.status.success()
+            && output.stderr.is_empty()
+            && output.stdout == b"bs2a-reset-red-ok\n",
+        "BS2a reset RED diagnostics:\n{}\nstderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

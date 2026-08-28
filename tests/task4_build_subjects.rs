@@ -1540,3 +1540,1065 @@ print("bs2a-c2-ok")
         "two-pass mutation driver did not complete"
     );
 }
+
+#[test]
+fn discover_input_v1_candidate_only_rejects_confirmed_green_gaps() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = repo.join("scripts/task4-build-subject.py");
+    let driver = r##"
+import importlib.util
+import os
+import shutil
+import stat
+import sys
+import tempfile
+
+spec = importlib.util.spec_from_file_location("task4_build_subject", sys.argv[1])
+if spec is None or spec.loader is None:
+    raise SystemExit("could not import task4 build-subject script")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+failures = []
+
+
+def state(root):
+    root = os.fspath(root)
+    entries = []
+
+    def visit(path):
+        value = os.lstat(path)
+        mode = stat.S_IMODE(value.st_mode)
+        if stat.S_ISDIR(value.st_mode):
+            kind, content = "directory", None
+        elif stat.S_ISREG(value.st_mode):
+            kind, content = "regular", open(path, "rb").read()
+        elif stat.S_ISLNK(value.st_mode):
+            kind, content = "symlink", os.fsencode(os.readlink(path))
+        else:
+            kind, content = "other", None
+        relative = os.fsencode(os.path.relpath(path, root))
+        entries.append((relative, kind, mode, value.st_dev, value.st_ino, content))
+        if kind == "directory":
+            for child in sorted(os.scandir(path), key=lambda entry: os.fsencode(entry.name)):
+                visit(child.path)
+
+    visit(root)
+    return tuple(entries)
+
+
+def fixture(root, *, many=False):
+    os.chmod(root, 0o700)
+    repo = os.path.join(root, "repo")
+    vendor = os.path.join(repo, "vendor")
+    build = os.path.join(root, "build")
+    stable = os.path.join(root, "stable")
+    nightly = os.path.join(root, "nightly")
+    tool = os.path.join(root, "tool")
+    for path in (repo, vendor, build, stable, nightly):
+        os.mkdir(path)
+        os.chmod(path, 0o700 if path == build else 0o755)
+    with open(os.path.join(repo, "blocker"), "wb") as handle:
+        handle.write(b"blocker")
+    os.chmod(os.path.join(repo, "blocker"), 0o600)
+    with open(os.path.join(repo, "input.txt"), "wb") as handle:
+        handle.write(b"input\n")
+    os.chmod(os.path.join(repo, "input.txt"), 0o644)
+    with open(os.path.join(repo, "exec"), "wb") as handle:
+        handle.write(b"#!/bin/sh\n")
+    os.chmod(os.path.join(repo, "exec"), 0o755)
+    with open(os.path.join(repo, "target"), "wb") as handle:
+        handle.write(b"data")
+    os.chmod(os.path.join(repo, "target"), 0o644)
+    os.symlink("target", os.path.join(repo, "link"))
+    with open(os.path.join(stable, "stable.bin"), "wb") as handle:
+        handle.write(b"stable\n")
+    os.chmod(os.path.join(stable, "stable.bin"), 0o644)
+    with open(os.path.join(nightly, "nightly.bin"), "wb") as handle:
+        handle.write(b"nightly\n")
+    os.chmod(os.path.join(nightly, "nightly.bin"), 0o644)
+    with open(tool, "wb") as handle:
+        handle.write(b"stable\n")
+    os.chmod(tool, 0o755)
+    if many:
+        enum = os.path.join(repo, "enum")
+        os.mkdir(enum)
+        os.chmod(enum, 0o755)
+        for index in range(4097):
+            with open(os.path.join(enum, f"e{index:04d}"), "wb"):
+                pass
+    return {
+        "root": root,
+        "repo": repo,
+        "vendor": vendor,
+        "build": build,
+        "stable": stable,
+        "nightly": nightly,
+        "tool": tool,
+        "input": os.path.join(repo, "input.txt"),
+        "exec": os.path.join(repo, "exec"),
+        "target": os.path.join(repo, "target"),
+        "link": os.path.join(repo, "link"),
+    }
+
+
+def discover(paths, trace, **overrides):
+    values = dict(
+        root_pid=100,
+        initial_cwd=paths["repo"],
+        repo_root=paths["repo"],
+        vendor_relative="vendor",
+        build_root=paths["build"],
+        stable_sysroot_root=paths["stable"],
+        nightly_sysroot_root=paths["nightly"],
+    )
+    values.update(overrides)
+    return module.discover_input_v1(trace, **values)
+
+
+def exit_trace(pid=100):
+    return f"{pid} +++ exited with 0 +++\n".encode("ascii")
+
+
+def valid_read_exit_trace(paths):
+    return (
+        f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+        "100 read(3, \"input\\n\", 6) = 6\n"
+        "100 close(3) = 0\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+
+
+def expect_exception(name, expected, operation):
+    try:
+        operation()
+    except BaseException as exc:
+        if type(exc) is not expected:
+            failures.append(
+                f"{name}: expected {expected.__name__}, got {type(exc).__name__}: {exc}"
+            )
+    else:
+        failures.append(f"{name}: accepted invalid input")
+
+
+def expect_success(name, operation):
+    try:
+        value = operation()
+    except BaseException as exc:
+        failures.append(f"{name}: expected success, got {type(exc).__name__}: {exc}")
+        return None
+    return value
+
+
+def replace_directory(path):
+    backup = path + ".held"
+    os.rename(path, backup)
+    shutil.copytree(backup, path, symlinks=True)
+    return backup
+
+
+def restore_directory(path, backup):
+    shutil.rmtree(path)
+    os.rename(backup, path)
+
+
+def path_is_beneath(path, root):
+    if isinstance(path, int):
+        return False
+    try:
+        candidate = os.path.abspath(os.fsdecode(path))
+        return os.path.commonpath((candidate, root)) == root
+    except (TypeError, ValueError):
+        return False
+
+
+def anchor_replacement_case(anchor):
+    name = f"held-{anchor}-replacement"
+    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-{name}-") as root:
+        paths = fixture(root)
+        before = state(root)
+        target = paths[anchor]
+        target_id = (os.lstat(target).st_dev, os.lstat(target).st_ino)
+        real_open = os.open
+        real_close = os.close
+        real_fstat = os.fstat
+        real_scandir = os.scandir
+        replacement = [False]
+        violations = []
+        opened = []
+        replacement_fds = set()
+        replacement_opened = set()
+        replacement_closed = set()
+        replacement_ids = set()
+        backup = [None]
+
+        def violation(reason):
+            violations.append(reason)
+            raise AssertionError(reason)
+
+        def record_violation(reason):
+            violations.append(reason)
+
+        def tree_ids(path):
+            value = os.lstat(path)
+            ids = {(value.st_dev, value.st_ino)}
+            if stat.S_ISDIR(value.st_mode):
+                for entry in real_scandir(path):
+                    ids.update(tree_ids(entry.path))
+            return ids
+
+        def swap():
+            if replacement[0]:
+                return
+            replacement[0] = True
+            backup[0] = replace_directory(target)
+            replacement_ids.update(tree_ids(target))
+
+        def open_hook(path, flags, mode=0o777, *, dir_fd=None):
+            is_target = dir_fd is None and path_is_beneath(path, target)
+            if is_target and replacement[0]:
+                violation("replacement directory/object was opened by pathname")
+            if dir_fd is None:
+                fd = real_open(path, flags, mode)
+            else:
+                fd = real_open(path, flags, mode, dir_fd=dir_fd)
+            opened.append(fd)
+            if replacement_ids:
+                value = real_fstat(fd)
+                if (value.st_dev, value.st_ino) in replacement_ids:
+                    replacement_fds.add(fd)
+                    replacement_opened.add(fd)
+                    record_violation("replacement tree object was opened")
+            if dir_fd is None and not replacement[0] and os.path.abspath(os.fsdecode(path)) == target:
+                swap()
+            return fd
+
+        def fstat_hook(fd):
+            value = real_fstat(fd)
+            if not replacement[0] and (value.st_dev, value.st_ino) == target_id:
+                swap()
+            return value
+
+        def close_hook(fd):
+            if fd in opened:
+                opened.remove(fd)
+            if fd in replacement_fds:
+                replacement_fds.remove(fd)
+                replacement_closed.add(fd)
+            return real_close(fd)
+
+        def scandir_hook(path):
+            if not isinstance(path, int) and path_is_beneath(path, target):
+                violation("anchor was enumerated by pathname")
+            if isinstance(path, int) and replacement_ids:
+                value = real_fstat(path)
+                if (value.st_dev, value.st_ino) in replacement_ids:
+                    record_violation("replacement tree object was enumerated")
+            return real_scandir(path)
+
+        module.os.open = open_hook
+        module.os.close = close_hook
+        module.os.fstat = fstat_hook
+        module.os.scandir = scandir_hook
+        try:
+            try:
+                requested = paths["input"] if anchor == "repo" else paths["stable"] + "/stable.bin"
+                payload = "input\\n" if anchor == "repo" else "stable\\n"
+                size = 6 if anchor == "repo" else 7
+                trace = (
+                    f'100 openat(AT_FDCWD, "{requested}", O_RDONLY|O_CLOEXEC) = 3\n'
+                    f'100 read(3, "{payload}", {size}) = {size}\n'
+                    "100 close(3) = 0\n"
+                    "100 +++ exited with 0 +++\n"
+                ).encode("ascii")
+                discover(paths, trace)
+            except BaseException as exc:
+                if type(exc) is not module.MutationError:
+                    failures.append(
+                        f"{name}: expected MutationError, got {type(exc).__name__}: {exc}"
+                    )
+            else:
+                failures.append(f"{name}: replacement was accepted")
+        finally:
+            module.os.open = real_open
+            module.os.close = real_close
+            module.os.fstat = real_fstat
+            module.os.scandir = real_scandir
+            if backup[0] is not None:
+                restore_directory(target, backup[0])
+            for fd in tuple(opened):
+                try:
+                    real_close(fd)
+                except OSError:
+                    pass
+                if fd in opened:
+                    opened.remove(fd)
+                if fd in replacement_fds:
+                    replacement_fds.remove(fd)
+                    replacement_closed.add(fd)
+            if opened:
+                failures.append(f"{name}: replacement descriptors leaked: {tuple(opened)!r}")
+        if not replacement[0]:
+            failures.append(f"{name}: replacement seam was never reached")
+        if violations:
+            failures.append(f"{name}: hook violations {violations!r}")
+        if replacement_fds or replacement_opened != replacement_closed:
+            failures.append(
+                f"{name}: replacement descriptor close mismatch: "
+                f"opened={replacement_opened!r}, closed={replacement_closed!r}, "
+                f"live={replacement_fds!r}"
+            )
+        if state(root) != before:
+            failures.append(f"{name}: fixture identity/content was not restored")
+
+
+def symlink_replacement_case():
+    name = "held-symlink-replacement"
+    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-{name}-") as root:
+        paths = fixture(root)
+        before = state(root)
+        repo_id = (os.lstat(paths["repo"]).st_dev, os.lstat(paths["repo"]).st_ino)
+        real_readlink = os.readlink
+        real_fstat = os.fstat
+        real_open = os.open
+        real_close = os.close
+        returned = []
+        violations = []
+        replacement = [False]
+        replacement_id = [None]
+        opened = []
+        replacement_opened = set()
+        replacement_closed = set()
+        backup = [None]
+
+        def violation(reason):
+            violations.append(reason)
+            raise AssertionError(reason)
+
+        def record_violation(reason):
+            violations.append(reason)
+
+        def readlink_hook(path, *, dir_fd=None):
+            if os.fsdecode(path) != "link" or not isinstance(dir_fd, int):
+                violation("symlink target was not read descriptor-relatively")
+            if replacement[0]:
+                check_replacement_link(path, dir_fd)
+            value = real_fstat(dir_fd)
+            if (value.st_dev, value.st_ino) != repo_id:
+                violation("symlink target used the wrong held directory")
+            actual = real_readlink(path, dir_fd=dir_fd)
+            if len(returned) >= 2:
+                violation("symlink target was read more than twice")
+            returned.append(actual)
+            if len(returned) == 1:
+                backup[0] = paths["link"] + ".held"
+                os.rename(paths["link"], backup[0])
+                os.symlink("target", paths["link"])
+                value = os.lstat(paths["link"])
+                replacement_id[0] = (value.st_dev, value.st_ino)
+                replacement[0] = True
+            return actual
+
+        def check_replacement_link(path, dir_fd):
+            if not replacement[0] or dir_fd is None or os.fsdecode(path) != "link":
+                return
+            probe_fd = real_open(path, os.O_PATH | os.O_NOFOLLOW, dir_fd=dir_fd)
+            replacement_opened.add(probe_fd)
+            try:
+                value = real_fstat(probe_fd)
+                if (value.st_dev, value.st_ino) == replacement_id[0]:
+                    record_violation("replacement symlink was accessed descriptor-relatively")
+            finally:
+                real_close(probe_fd)
+                replacement_closed.add(probe_fd)
+
+        def open_hook(path, flags, mode=0o777, *, dir_fd=None):
+            if replacement[0] and dir_fd is None and path_is_beneath(path, paths["link"]):
+                violation("replacement symlink was opened by pathname")
+            check_replacement_link(path, dir_fd)
+            if dir_fd is None:
+                fd = real_open(path, flags, mode)
+            else:
+                fd = real_open(path, flags, mode, dir_fd=dir_fd)
+            opened.append(fd)
+            return fd
+
+        def close_hook(fd):
+            if fd in opened:
+                opened.remove(fd)
+            return real_close(fd)
+
+        module.os.readlink = readlink_hook
+        module.os.open = open_hook
+        module.os.close = close_hook
+        try:
+            trace = (
+                f'100 openat(AT_FDCWD, "{paths["link"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+                "100 close(3) = 0\n"
+                "100 +++ exited with 0 +++\n"
+            ).encode("ascii")
+            try:
+                discover(paths, trace)
+            except BaseException as exc:
+                if type(exc) is not module.MutationError:
+                    failures.append(
+                        f"{name}: expected MutationError, got {type(exc).__name__}: {exc}"
+                    )
+            else:
+                failures.append(f"{name}: replacement was accepted")
+        finally:
+            module.os.readlink = real_readlink
+            module.os.open = real_open
+            module.os.close = real_close
+            leaked = tuple(opened)
+            if backup[0] is not None:
+                os.unlink(paths["link"])
+                os.rename(backup[0], paths["link"])
+            for fd in opened:
+                try:
+                    real_close(fd)
+                except OSError:
+                    pass
+            if leaked:
+                failures.append(f"{name}: replacement descriptors leaked: {leaked!r}")
+        if not replacement[0] or len(returned) != 2:
+            failures.append(f"{name}: target observations were {returned!r}")
+        elif returned[0] != returned[1] or returned[0] != "target":
+            failures.append(f"{name}: raw target observations changed: {returned!r}")
+        if violations:
+            failures.append(f"{name}: hook violations {violations!r}")
+        if replacement_opened != replacement_closed:
+            failures.append(
+                f"{name}: replacement descriptor close mismatch: "
+                f"opened={replacement_opened!r}, closed={replacement_closed!r}"
+            )
+        if state(root) != before:
+            failures.append(f"{name}: fixture identity/content was not restored")
+
+
+def regular_replacement_case():
+    name = "held-regular-replacement"
+    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-{name}-") as root:
+        paths = fixture(root)
+        before = state(root)
+        target = paths["input"]
+        target_id = (os.lstat(target).st_dev, os.lstat(target).st_ino)
+        repo_id = (os.lstat(paths["repo"]).st_dev, os.lstat(paths["repo"]).st_ino)
+        real_lstat = os.lstat
+        real_stat = os.stat
+        real_fstat = os.fstat
+        real_open = os.open
+        real_close = os.close
+        real_read = os.read
+        replacement = [False]
+        replacement_fds = set()
+        replacement_opened = set()
+        replacement_closed = set()
+        opened = []
+        replacement_reads = []
+        violations = []
+        backup = [None]
+
+        def violation(reason):
+            violations.append(reason)
+            raise AssertionError(reason)
+
+        def swap():
+            if replacement[0]:
+                return
+            replacement[0] = True
+            backup[0] = target + ".held"
+            os.rename(target, backup[0])
+            with open(target, "wb") as handle:
+                handle.write(b"input\n")
+            os.chmod(target, 0o644)
+
+        def maybe_swap(value):
+            if not replacement[0] and (value.st_dev, value.st_ino) == target_id:
+                swap()
+
+        def lstat_hook(path, *, dir_fd=None):
+            value = real_lstat(path, dir_fd=dir_fd) if dir_fd is not None else real_lstat(path)
+            if dir_fd is None and not isinstance(path, int) and os.path.abspath(os.fsdecode(path)) == target:
+                maybe_swap(value)
+            return value
+
+        def stat_hook(path, *, dir_fd=None, follow_symlinks=True):
+            if dir_fd is None:
+                value = real_stat(path, follow_symlinks=follow_symlinks)
+            else:
+                value = real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+            if dir_fd is None and not isinstance(path, int) and os.path.abspath(os.fsdecode(path)) == target:
+                maybe_swap(value)
+            return value
+
+        def fstat_hook(fd):
+            value = real_fstat(fd)
+            maybe_swap(value)
+            return value
+
+        def open_hook(path, flags, mode=0o777, *, dir_fd=None):
+            if dir_fd is None:
+                fd = real_open(path, flags, mode)
+            else:
+                fd = real_open(path, flags, mode, dir_fd=dir_fd)
+            opened.append(fd)
+            if replacement[0]:
+                is_replacement = dir_fd is None and not isinstance(path, int) and os.path.abspath(os.fsdecode(path)) == target
+                if dir_fd is not None and not isinstance(path, int) and os.fsdecode(path) == "input.txt":
+                    try:
+                        parent = real_fstat(dir_fd)
+                    except OSError:
+                        parent = None
+                    is_replacement = parent is not None and (parent.st_dev, parent.st_ino) == repo_id
+                if is_replacement:
+                    replacement_fds.add(fd)
+                    replacement_opened.add(fd)
+            return fd
+
+        def close_hook(fd):
+            if fd in opened:
+                opened.remove(fd)
+            if fd in replacement_fds:
+                replacement_fds.remove(fd)
+                replacement_closed.add(fd)
+            return real_close(fd)
+
+        def read_hook(fd, size):
+            if fd in replacement_fds:
+                replacement_reads.append(fd)
+                violations.append("replacement regular bytes were consumed")
+            return real_read(fd, size)
+
+        module.os.lstat = lstat_hook
+        module.os.stat = stat_hook
+        module.os.fstat = fstat_hook
+        module.os.open = open_hook
+        module.os.close = close_hook
+        module.os.read = read_hook
+        try:
+            trace = (
+                f'100 newfstatat(AT_FDCWD, "{target}", 0x7f, 0) = 0\n'
+                f'100 openat(AT_FDCWD, "{target}", O_RDONLY|O_CLOEXEC) = 3\n'
+                "100 read(3, \"input\\n\", 6) = 6\n"
+                "100 close(3) = 0\n"
+                "100 +++ exited with 0 +++\n"
+            ).encode("ascii")
+            try:
+                discover(paths, trace)
+            except BaseException as exc:
+                if type(exc) is not module.MutationError:
+                    failures.append(
+                        f"{name}: expected MutationError, got {type(exc).__name__}: {exc}"
+                    )
+            else:
+                failures.append(f"{name}: replacement was accepted")
+        finally:
+            module.os.lstat = real_lstat
+            module.os.stat = real_stat
+            module.os.fstat = real_fstat
+            module.os.open = real_open
+            module.os.close = real_close
+            module.os.read = real_read
+            leaked = tuple(opened)
+            if backup[0] is not None:
+                os.unlink(target)
+                os.rename(backup[0], target)
+            for fd in opened:
+                try:
+                    real_close(fd)
+                except OSError:
+                    pass
+            if leaked:
+                failures.append(f"{name}: replacement descriptors leaked: {leaked!r}")
+            if replacement_fds or replacement_opened != replacement_closed:
+                failures.append(
+                    f"{name}: replacement descriptor close mismatch: "
+                    f"opened={replacement_opened!r}, closed={replacement_closed!r}, "
+                    f"live={replacement_fds!r}"
+                )
+        if not replacement[0]:
+            failures.append(f"{name}: replacement seam was never reached")
+        if replacement_reads or violations:
+            failures.append(f"{name}: hook violations {violations!r}")
+        if state(root) != before:
+            failures.append(f"{name}: fixture identity/content was not restored")
+
+
+anchor_replacement_case("repo")
+anchor_replacement_case("stable")
+symlink_replacement_case()
+regular_replacement_case()
+
+
+for name, link_count in (("self-cycle", 1), ("long-chain", 41)):
+    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-{name}-") as root:
+        paths = fixture(root)
+        if name == "self-cycle":
+            os.symlink("cycle", os.path.join(paths["repo"], "cycle"))
+            requested = os.path.join(paths["repo"], "cycle")
+        else:
+            for index in range(link_count):
+                target = f"chain{index + 1}" if index + 1 < link_count else "input.txt"
+                os.symlink(target, os.path.join(paths["repo"], f"chain{index}"))
+            requested = os.path.join(paths["repo"], "chain0")
+        before = state(root)
+        trace = (
+            f'100 openat(AT_FDCWD, "{requested}", O_RDONLY|O_CLOEXEC) = 3\n'
+            "100 close(3) = 0\n"
+            "100 +++ exited with 0 +++\n"
+        ).encode("ascii")
+        real_open = os.open
+        real_close = os.close
+        opened = []
+
+        def open_tracking(path, flags, mode=0o777, *, dir_fd=None):
+            if dir_fd is None:
+                fd = real_open(path, flags, mode)
+            else:
+                fd = real_open(path, flags, mode, dir_fd=dir_fd)
+            opened.append(fd)
+            return fd
+
+        def close_tracking(fd):
+            if fd in opened:
+                opened.remove(fd)
+            return real_close(fd)
+
+        module.os.open = open_tracking
+        module.os.close = close_tracking
+        try:
+            expect_exception(name, module.FormatError, lambda: discover(paths, trace))
+        finally:
+            module.os.open = real_open
+            module.os.close = real_close
+            for fd in opened:
+                try:
+                    real_close(fd)
+                except OSError:
+                    pass
+        if state(root) != before:
+            failures.append(f"{name}: fixture changed")
+
+
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-access-") as root:
+    paths = fixture(root)
+    nested = os.path.join(paths["stable"], "nested")
+    os.mkdir(nested)
+    os.chmod(nested, 0o755)
+    access_before = state(root)
+    read_trace = (
+        f'100 newfstatat(AT_FDCWD, "{paths["input"]}", 0x7f, 0) = 0\n'
+        f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+        "100 read(3, \"input\\n\", 6) = 6\n"
+        "100 close(3) = 0\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    execute_trace = (
+        f'100 newfstatat(AT_FDCWD, "{paths["exec"]}", 0x7f, 0) = 0\n'
+        f'100 execve("{paths["exec"]}", ["exec"], ["LC_ALL=C"]) = 0\n'
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    stable_trace = (
+        f'100 execve("{paths["stable"]}/stable.bin", ["stable.bin"], ["LC_ALL=C"]) = 0\n'
+        f'100 execve("{paths["nightly"]}/nightly.bin", ["nightly.bin"], ["LC_ALL=C"]) = 0\n'
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    read_expected = (
+        "input-v1\t0\trepo\tread\tpresent\t0644\t6\t"
+        "7d3f9b6284c6f36e77b425cac882e8fbbcc97a4727ec20790853076d0f463453\t"
+        "repo:/input.txt\n"
+    ).encode("ascii")
+    execute_expected = (
+        "input-v1\t0\trepo\texecute\tpresent\t0755\t10\t"
+        "a8076d3d28d21e02012b20eaf7dbf75409a6277134439025f282e368e3305abf\t"
+        "repo:/exec\n"
+    ).encode("ascii")
+    stable_rows = [
+        (
+            f"input-v1\t0\tnightly-sysroot\texecute\tpresent\t0644\t8\t"
+            f"58bea07cb6d97f9cfcd5c8f98b1feca0fb81cce5b0bf29a8e70ed2641956e9a6\t"
+            f"external:{paths['nightly']}/nightly.bin\n"
+        ).encode("ascii"),
+        (
+            f"input-v1\t1\tstable-sysroot\texecute\tpresent\t0644\t7\t"
+            f"2b92ea252be0fbc26f70317cdaa7b6411ea634b50d55338cd8c495e4dbf25d1d\t"
+            f"external:{paths['stable']}/stable.bin\n"
+        ).encode("ascii"),
+    ]
+    stable_expected = b"".join(sorted(stable_rows, key=lambda row: row.split(b"\t")[-1]))
+    for name, trace, expected in (
+        ("probe-plus-read", read_trace, read_expected),
+        ("probe-plus-execute", execute_trace, execute_expected),
+        ("stable-nightly-execute", stable_trace, stable_expected),
+    ):
+        value = expect_success(name, lambda trace=trace: discover(paths, trace))
+        if value is not None and value != expected:
+            failures.append(f"{name}: literal ledger mismatch: {value!r}")
+
+    for name, stable_root, nightly_root in (
+        ("sysroot-equal", paths["stable"], paths["stable"]),
+        ("sysroot-nested", paths["stable"], nested),
+        ("sysroot-reverse-nested", nested, paths["stable"]),
+    ):
+        overlap_trace = (
+            f'100 openat(AT_FDCWD, "{paths["stable"]}/stable.bin", O_RDONLY|O_CLOEXEC) = 3\n'
+            "100 read(3, \"stable\\n\", 7) = 7\n"
+            "100 close(3) = 0\n"
+            "100 +++ exited with 0 +++\n"
+        ).encode("ascii")
+        expect_exception(
+            name,
+            module.MutationError,
+            lambda stable_root=stable_root, nightly_root=nightly_root: discover(
+                paths,
+                overlap_trace,
+                stable_sysroot_root=stable_root,
+                nightly_sysroot_root=nightly_root,
+            ),
+        )
+    if state(root) != access_before:
+        failures.append("access fixture changed")
+
+
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-state-") as root:
+    paths = fixture(root)
+    trace_before = state(root)
+    valid = (
+        f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+        f'100 openat(AT_FDCWD, "{paths["exec"]}", O_RDONLY|O_CLOEXEC) = 4\n'
+        "100 close(4) = 0\n"
+        "100 close(3) = 0\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    expect_exception("trace-vt-separator", module.FormatError, lambda: discover(paths, valid.replace(b"\n", b"\v", 1)))
+    expect_exception("trace-ff-separator", module.FormatError, lambda: discover(paths, valid.replace(b"\n", b"\f", 1)))
+    control = (
+        f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+        "100 read(3, \"input\\n\", 6) = 6\n"
+        "100 close(3) = 0\n"
+    ).encode("ascii") + (
+        b'100 openat(AT_FDCWD, "'
+        + os.fsencode(paths["build"])
+        + b'/owned\x01.o", O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0600) = 4\n'
+        + b"100 close(4) = 0\n100 +++ exited with 0 +++\n"
+    )
+    expect_exception("trace-unescaped-control", module.FormatError, lambda: discover(paths, control))
+    overwrite = (
+        f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+        f'100 openat(AT_FDCWD, "{paths["exec"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+        "100 close(3) = 0\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    expect_exception("live-fd-overwrite", module.FormatError, lambda: discover(paths, overwrite))
+    clone_zero = (
+        f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+        "100 read(3, \"input\\n\", 6) = 6\n"
+        "100 close(3) = 0\n"
+        "100 clone(child_stack=NULL, flags=SIGCHLD, child_tidptr=NULL) = 0\n"
+        "0 +++ exited with 0 +++\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    expect_exception(
+        "clone-pid-zero",
+        module.FormatError,
+        lambda: discover(paths, clone_zero),
+    )
+    duplicate_output = (
+        f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+        "100 read(3, \"input\\n\", 6) = 6\n"
+        "100 close(3) = 0\n"
+        f'100 openat(AT_FDCWD, "{paths["build"]}/generated.o", O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0600) = 3\n'
+        "100 close(3) = 0\n"
+        f'100 openat(AT_FDCWD, "{paths["build"]}/generated.o", O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0600) = 4\n'
+        "100 close(4) = 0\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    expect_exception("duplicate-exclusive-output", module.FormatError, lambda: discover(paths, duplicate_output))
+    duplicate_mapping = (
+        f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+        "100 mmap(NULL, 6, PROT_READ, MAP_PRIVATE, 3, 0) = 4096\n"
+        "100 mmap(NULL, 6, PROT_READ, MAP_PRIVATE, 3, 0) = 4096\n"
+        "100 munmap(4096, 6) = 0\n"
+        "100 close(3) = 0\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    expect_exception("duplicate-live-mapping", module.FormatError, lambda: discover(paths, duplicate_mapping))
+    exec_reuse = (
+        f'100 openat(AT_FDCWD, "{paths["exec"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+        "100 mmap(NULL, 10, PROT_READ, MAP_PRIVATE, 3, 0) = 4096\n"
+        f'100 execve("{paths["tool"]}", ["tool"], ["LC_ALL=C"]) = 0\n'
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    exec_expected = (
+        f"input-v1\t0\ttool\texecute\tpresent\t0755\t7\t"
+        "2b92ea252be0fbc26f70317cdaa7b6411ea634b50d55338cd8c495e4dbf25d1d\t"
+        f"external:{paths['tool']}\n"
+        "input-v1\t1\trepo\tread\tpresent\t0755\t10\t"
+        "a8076d3d28d21e02012b20eaf7dbf75409a6277134439025f282e368e3305abf\t"
+        "repo:/exec\n"
+    ).encode("ascii")
+    value = expect_success("mapping-retired-on-exec", lambda: discover(paths, exec_reuse))
+    if value is not None and value != exec_expected:
+        failures.append(f"mapping-retired-on-exec: literal ledger mismatch: {value!r}")
+    exit_reuse = (
+        f'100 clone(child_stack=NULL, flags=SIGCHLD, child_tidptr=NULL) = 101\n'
+        "101 getpid() = 101\n"
+        f'101 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+        "101 mmap(NULL, 6, PROT_READ, MAP_PRIVATE, 3, 0) = 8192\n"
+        "101 close(3) = 0\n"
+        "101 +++ exited with 0 +++\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    value = expect_success("mapping-retired-on-exit", lambda: discover(paths, exit_reuse))
+    exit_expected = (
+        "input-v1\t0\trepo\tread\tpresent\t0644\t6\t"
+        "7d3f9b6284c6f36e77b425cac882e8fbbcc97a4727ec20790853076d0f463453\t"
+        "repo:/input.txt\n"
+    ).encode("ascii")
+    if value is not None and value != exit_expected:
+        failures.append(f"mapping-retired-on-exit: literal ledger mismatch: {value!r}")
+    read_only_create = (
+        f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+        "100 read(3, \"input\\n\", 6) = 6\n"
+        "100 close(3) = 0\n"
+        f'100 openat(AT_FDCWD, "{paths["build"]}/readonly.o", O_RDONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0600) = 3\n'
+        "100 write(3, \"x\", 1) = 1\n"
+        "100 close(3) = 0\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    expect_exception("readonly-create-write", module.FormatError, lambda: discover(paths, read_only_create))
+    write_only_read = (
+        f'100 openat(AT_FDCWD, "{paths["input"]}", O_WRONLY|O_CLOEXEC) = 3\n'
+        "100 read(3, \"input\\n\", 6) = 6\n"
+        "100 close(3) = 0\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    expect_exception("write-only-read", module.FormatError, lambda: discover(paths, write_only_read))
+    if state(root) != trace_before:
+        failures.append("trace-state: fixture snapshot comparison failed")
+
+
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-relations-") as root:
+    paths = fixture(root, many=True)
+    before_absent = state(root)
+    absent_trace = (
+        f'100 newfstatat(AT_FDCWD, "{paths["repo"]}/blocker/child/grand", 0x7f, 0) = -1 ENOTDIR (Not a directory)\n'
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    absent_expected = (
+        "input-v1\t0\trepo\tprobe\tpresent\t0600\t7\t"
+        "1a48940a9383be191a715f95a09c7c253b725555cf61f72272482836e8710eef\t"
+        "repo:/blocker\n"
+        "input-v1\t1\tabsent\tprobe\tENOTDIR\t-\t-\t-\trepo:/blocker/child/grand\n"
+    ).encode("ascii")
+    value = expect_success("complete-enotdir-locator", lambda: discover(paths, absent_trace))
+    if value is not None and value != absent_expected:
+        failures.append(f"complete-enotdir-locator: literal ledger mismatch: {value!r}")
+    if state(root) != before_absent:
+        failures.append("complete-enotdir-locator: fixture changed")
+    before_cardinality = state(root)
+    many_trace = (
+        f'100 openat(AT_FDCWD, "{paths["repo"]}/enum", O_RDONLY|O_CLOEXEC|O_DIRECTORY) = 3\n'
+        "100 getdents64(3, 0x7f, 32768) = 32768\n"
+        "100 getdents64(3, 0x7f, 32768) = 0\n"
+        "100 close(3) = 0\n"
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    enum = os.path.join(paths["repo"], "enum")
+    enum_id = (os.lstat(enum).st_dev, os.lstat(enum).st_ino)
+    real_listdir = os.listdir
+    real_scandir = os.scandir
+    real_fstat = os.fstat
+    cardinality_inputs = []
+
+    class BoundedEntries(list):
+        def __iter__(self):
+            for index, entry in enumerate(super().__iter__()):
+                if index >= 4097:
+                    raise AssertionError("directory enumeration exceeded 4097 entries")
+                yield entry
+
+    class BoundedScandir:
+        def __init__(self, iterator):
+            self.iterator = iterator
+            self.count = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self.close()
+            return False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.count >= 4097:
+                raise AssertionError("directory enumeration exceeded 4097 entries")
+            entry = next(self.iterator)
+            self.count += 1
+            return entry
+
+        def close(self):
+            self.iterator.close()
+
+    def listdir_cardinality(target):
+        if isinstance(target, int):
+            value = real_fstat(target)
+            if (value.st_dev, value.st_ino) == enum_id:
+                entries = real_listdir(target)
+                cardinality_inputs.append(len(entries))
+                return BoundedEntries(entries)
+        return real_listdir(target)
+
+    def scandir_cardinality(target):
+        if isinstance(target, int):
+            value = real_fstat(target)
+            if (value.st_dev, value.st_ino) == enum_id:
+                bounded = BoundedScandir(real_scandir(target))
+                cardinality_inputs.append(bounded)
+                return bounded
+        return real_scandir(target)
+
+    module.os.listdir = listdir_cardinality
+    module.os.scandir = scandir_cardinality
+    try:
+        expect_exception("directory-cardinality-4097", module.FormatError, lambda: discover(paths, many_trace))
+    finally:
+        module.os.listdir = real_listdir
+        module.os.scandir = real_scandir
+    if not cardinality_inputs:
+        failures.append("directory-cardinality-4097: seam was not reached")
+    elif any(
+        (value if isinstance(value, int) else value.count) != 4097
+        for value in cardinality_inputs
+    ):
+        failures.append(f"directory-cardinality-4097: seam observed {cardinality_inputs!r}")
+    if state(root) != before_cardinality:
+        failures.append("directory-cardinality-4097: fixture changed")
+    controlled = os.path.join(root, "controlled")
+    os.mkdir(controlled)
+    os.chmod(controlled, 0o755)
+    with open(os.path.join(controlled, "entry"), "wb") as handle:
+        handle.write(b"x")
+    os.chmod(os.path.join(controlled, "entry"), 0o644)
+    before_root = state(root)
+    real_scandir = os.scandir
+    real_listdir = os.listdir
+    real_close = os.close
+    real_fstat = os.fstat
+    root_stat = os.lstat("/")
+    root_id = (root_stat.st_dev, root_stat.st_ino)
+    controlled_fd = os.open(controlled, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    violations = []
+
+    def root_path(value):
+        return not isinstance(value, int) and os.fsdecode(value) == "/"
+
+    def scandir_root(target):
+        if root_path(target):
+            violations.append("root directory was scanned by pathname")
+            return real_scandir(controlled_fd)
+        if isinstance(target, int):
+            value = real_fstat(target)
+            if (value.st_dev, value.st_ino) == root_id:
+                return real_scandir(controlled_fd)
+        return real_scandir(target)
+
+    def listdir_root(target):
+        if root_path(target):
+            violations.append("root directory was listed by pathname")
+            return real_listdir(controlled_fd)
+        if isinstance(target, int):
+            value = real_fstat(target)
+            if (value.st_dev, value.st_ino) == root_id:
+                return real_listdir(controlled_fd)
+        return real_listdir(target)
+
+    module.os.scandir = scandir_root
+    module.os.listdir = listdir_root
+    try:
+        root_trace = b'100 newfstatat(AT_FDCWD, "/", 0x7f, 0) = 0\n100 +++ exited with 0 +++\n'
+        root_mode = stat.S_IMODE(root_stat.st_mode)
+        root_expected = (
+            f"input-v1\t0\tdirectory\tprobe\tpresent\t{root_mode:04o}\t8\t"
+            "1228cb53fde462d88e7bd04d6076c13df410e3f2c0358d0f5d133b9f6ed84c47\t"
+            "external:/\n"
+        ).encode("ascii")
+        value = expect_success("external-root-probe", lambda: discover(paths, root_trace, initial_cwd="/"))
+        if value is not None and value != root_expected:
+            failures.append(f"external-root-probe: literal ledger mismatch: {value!r}")
+    finally:
+        module.os.scandir = real_scandir
+        module.os.listdir = real_listdir
+        os.close(controlled_fd)
+    if violations:
+        failures.append(f"external-root-probe: hook violations {violations!r}")
+    if state(root) != before_root:
+        failures.append("relation fixture changed")
+
+    before_root_spelling = state(root)
+    for name, override in (
+        ("noncanonical-repo-root", {"repo_root": "//" + paths["repo"].lstrip("/")}),
+        ("trailing-build-root", {"build_root": paths["build"] + "/"}),
+        ("noncanonical-stable-root", {"stable_sysroot_root": "//" + paths["stable"].lstrip("/")}),
+        ("trailing-nightly-root", {"nightly_sysroot_root": paths["nightly"] + "/"}),
+    ):
+        expect_exception(
+            name,
+            module.FormatError,
+            lambda override=override: discover(paths, valid_read_exit_trace(paths), **override),
+        )
+    if state(root) != before_root_spelling:
+        failures.append("root-spelling fixtures changed")
+
+
+if failures:
+    raise SystemExit("\n".join(failures))
+print("bs2a-confirmed-gaps-red-ok")
+"##;
+    let mut outputs = Vec::new();
+    for seed in ["1", "2"] {
+        outputs.push(
+            Command::new("/usr/bin/python3")
+                .args(["-c", driver, script.to_str().expect("script path is UTF-8")])
+                .current_dir(repo)
+                .env_clear()
+                .env("PYTHONDONTWRITEBYTECODE", "1")
+                .env("PYTHONHASHSEED", seed)
+                .output()
+                .expect("run BS2a confirmed-gap regression driver"),
+        );
+    }
+    let diagnostics = outputs
+        .iter()
+        .enumerate()
+        .map(|(index, output)| {
+            format!(
+                "seed={} status={:?} stdout={:?} stderr={:?}",
+                index + 1,
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+        .collect::<Vec<_>>();
+    let same_diagnostics = outputs.windows(2).all(|pair| {
+        pair[0].status.code() == pair[1].status.code()
+            && pair[0].stdout == pair[1].stdout
+            && pair[0].stderr == pair[1].stderr
+    });
+    assert!(
+        same_diagnostics
+            && outputs.iter().all(|output| {
+                output.status.success()
+                    && output.stderr.is_empty()
+                    && output.stdout == b"bs2a-confirmed-gaps-red-ok\n"
+            }),
+        "BS2a confirmed-gap regression matrix diagnostics:\n{}",
+        diagnostics.join("\n")
+    );
+}

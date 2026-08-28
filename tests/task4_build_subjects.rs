@@ -4016,7 +4016,7 @@ for syscall in ("open", "openat", "openat2"):
 # walk; a valid external read still has a literal one-row ledger.
 with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-structural-ancestor-sibling-churn-") as root:
     paths = fixture(root)
-    expected = ledger([regular_row(paths["dynamic"], "dynamic", "read", "external")])
+    expected = ledger([regular_row(paths["dynamic"], "tool", "read", "external")])
     markers = [
         os.path.join(root, "structural-churn-during-custody"),
         os.path.join(root, "structural-churn-after-custody"),
@@ -4116,7 +4116,7 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-unobserved-anchor-sibl
 # directory timestamp changes used as an emptiness proxy.
 with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-build-root-ephemeral-churn-") as root:
     paths = fixture(root)
-    expected = ledger([regular_row(paths["dynamic"], "dynamic", "read", "external")])
+    expected = ledger([regular_row(paths["dynamic"], "tool", "read", "external")])
     marker = os.path.join(paths["build"], "ephemeral-entry")
     seam = [False]
     real_listdir = os.listdir

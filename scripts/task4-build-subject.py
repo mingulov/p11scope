@@ -58,6 +58,50 @@ class _SemanticTraceState:
         }
         self._tasks[child_tid] = child
 
+    def exec_event(self, *, tid, mappings):
+        if type(tid) is not int or tid <= 0:
+            raise FormatError("invalid task")
+        task = self._task(tid)
+        if task["tgid"] != tid or any(
+            other_tid != tid and other["tgid"] == tid for other_tid, other in self._tasks.items()
+        ):
+            raise FormatError("invalid exec task")
+        fds = task["fds"]
+        if type(fds) is not dict:
+            raise FormatError("invalid FD table")
+        for fd, value in fds.items():
+            if type(fd) is not int or fd < 0 or type(value) is not tuple or len(value) != 2 or type(value[1]) is not bool:
+                raise FormatError("invalid FD table")
+        if type(mappings) is not dict:
+            raise FormatError("invalid mapping table")
+        ranges = []
+        for start, value in mappings.items():
+            if type(start) is not int or type(value) is not tuple or len(value) != 5:
+                raise FormatError("invalid mapping")
+            length, _node, offset, _prot, shared = value
+            if (
+                type(length) is not int
+                or type(offset) is not int
+                or type(shared) is not bool
+                or start < 0
+                or offset < 0
+                or length <= 0
+                or start >= 2**64
+                or start + length > 2**64
+            ):
+                raise FormatError("invalid mapping")
+            end = start + length
+            if any(start < existing_end and existing_start < end for existing_start, existing_end in ranges):
+                raise FormatError("overlapping mapping")
+            ranges.append((start, end))
+        retained_fds = {fd: value for fd, value in fds.items() if not value[1]}
+        self._tasks[tid] = {
+            "tgid": task["tgid"],
+            "fds": retained_fds,
+            "fs": task["fs"],
+            "maps": dict(mappings),
+        }
+
     def dup2(self, *, tid, source_fd, target_fd):
         task = self._task(tid)
         try:

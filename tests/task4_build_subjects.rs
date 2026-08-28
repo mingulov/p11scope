@@ -5935,3 +5935,550 @@ print("bs2b-semantic-state-topology-ok")
         "BS2b semantic state topology driver did not complete"
     );
 }
+
+#[test]
+fn semantic_trace_v1_private_exec_event_contracts() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = repo.join("scripts/task4-build-subject.py");
+    let driver = r#"
+import copy
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("task4_build_subject", sys.argv[1])
+if spec is None or spec.loader is None:
+    raise SystemExit("could not import task4 build-subject script")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+
+class DictSubclass(dict):
+    pass
+
+
+class TupleSubclass(tuple):
+    pass
+
+
+def success_state():
+    retained_description = object()
+    closing_description = object()
+    old_node = object()
+    old_protection = object()
+    state = module._SemanticTraceState(
+        root_tid=100,
+        cwd="exec-cwd",
+        root="exec-root",
+        umask=0o027,
+        fds={3: (retained_description, False), 4: (closing_description, True)},
+    )
+    state.map_file(
+        tid=100,
+        start=0x1000,
+        length=0x1000,
+        node=old_node,
+        offset=0x40,
+        prot=old_protection,
+        shared=False,
+    )
+    state.spawn(
+        parent_tid=100,
+        child_tid=101,
+        share_files=True,
+        share_fs=True,
+        share_vm=True,
+        thread_group=False,
+    )
+    state.spawn(
+        parent_tid=100,
+        child_tid=102,
+        share_files=False,
+        share_fs=False,
+        share_vm=False,
+        thread_group=False,
+    )
+    return state, {
+        "retained_description": retained_description,
+        "closing_description": closing_description,
+        "old_node": old_node,
+        "old_protection": old_protection,
+    }
+
+
+state, tokens = success_state()
+replacement_node = object()
+replacement_protection = object()
+replacement = {
+    0x2000: (0x1000, replacement_node, 0x200, replacement_protection, True),
+    0x3000: (0x800, object(), 0, object(), False),
+}
+expected_replacement = dict(replacement)
+if state.exec_event(tid=100, mappings=replacement) is not None:
+    raise SystemExit("successful exec_event did not return None")
+root = state.snapshot(tid=100)
+peer = state.snapshot(tid=101)
+copied_fs_peer = state.snapshot(tid=102)
+if root["tgid"] != 100:
+    raise SystemExit("exec changed the execing task TGID")
+if root["fds"] != {3: (tokens["retained_description"], False)}:
+    raise SystemExit("exec did not retain exactly the non-CLOEXEC FD")
+if root["fds"][3][0] is not tokens["retained_description"]:
+    raise SystemExit("exec did not preserve retained description identity")
+if peer["fds"] != {
+    3: (tokens["retained_description"], False),
+    4: (tokens["closing_description"], True),
+}:
+    raise SystemExit("FD-sharing peer did not retain the old FD table")
+if peer["fds"][3][0] is not tokens["retained_description"] or peer["fds"][4][0] is not tokens["closing_description"]:
+    raise SystemExit("FD-sharing peer changed description identity")
+if peer["maps"] != {
+    0x1000: (0x1000, tokens["old_node"], 0x40, tokens["old_protection"], False),
+}:
+    raise SystemExit("VM-sharing peer did not retain the old mapping table")
+if peer["maps"][0x1000][1] is not tokens["old_node"] or peer["maps"][0x1000][3] is not tokens["old_protection"]:
+    raise SystemExit("VM-sharing peer changed old mapping token identity")
+if root["maps"] != expected_replacement or 0x1000 in root["maps"]:
+    raise SystemExit("exec did not replace the mapping table exactly")
+if root["maps"][0x2000][1] is not replacement_node or root["maps"][0x2000][3] is not replacement_protection:
+    raise SystemExit("exec did not preserve replacement token identity")
+if root["cwd"] != "exec-cwd" or root["root"] != "exec-root" or root["umask"] != 0o027:
+    raise SystemExit("exec did not preserve the FS context values")
+if copied_fs_peer["cwd"] != "exec-cwd" or copied_fs_peer["root"] != "exec-root" or copied_fs_peer["umask"] != 0o027:
+    raise SystemExit("copied-FS peer did not retain its initial FS values")
+
+replacement[0x2000] = (1, object(), 0, object(), False)
+replacement[0x4000] = (1, object(), 0, object(), False)
+if state.snapshot(tid=100)["maps"] != expected_replacement:
+    raise SystemExit("caller mutation changed the defensive replacement map copy")
+
+state.dup2(tid=100, source_fd=3, target_fd=8)
+if state.snapshot(tid=100)["fds"] != {
+    3: (tokens["retained_description"], False),
+    8: (tokens["retained_description"], False),
+}:
+    raise SystemExit("execing FD mutation was not retained")
+if state.snapshot(tid=101)["fds"] != {
+    3: (tokens["retained_description"], False),
+    4: (tokens["closing_description"], True),
+}:
+    raise SystemExit("execing FD mutation crossed into the old shared table")
+state.close(tid=101, fd=4)
+if state.snapshot(tid=101)["fds"] != {3: (tokens["retained_description"], False)}:
+    raise SystemExit("peer FD mutation was not retained")
+if state.snapshot(tid=100)["fds"] != {
+    3: (tokens["retained_description"], False),
+    8: (tokens["retained_description"], False),
+}:
+    raise SystemExit("peer FD mutation crossed into the execing table")
+
+state.map_file(
+    tid=100,
+    start=0x4000,
+    length=0x1000,
+    node=object(),
+    offset=0,
+    prot=object(),
+    shared=False,
+)
+if 0x4000 not in state.snapshot(tid=100)["maps"] or 0x4000 in state.snapshot(tid=101)["maps"]:
+    raise SystemExit("execing mapping mutation crossed into the old VM table")
+state.map_file(
+    tid=101,
+    start=0x5000,
+    length=0x1000,
+    node=object(),
+    offset=0,
+    prot=object(),
+    shared=True,
+)
+if 0x5000 not in state.snapshot(tid=101)["maps"] or 0x5000 in state.snapshot(tid=100)["maps"]:
+    raise SystemExit("peer mapping mutation crossed into the execing VM table")
+if 0x4000 in state.snapshot(tid=102)["maps"] or 0x5000 in state.snapshot(tid=102)["maps"]:
+    raise SystemExit("mapping mutation leaked into a copied VM table")
+
+state.set_cwd(tid=100, node="exec-cwd-after")
+state.set_umask(tid=100, value=0o077)
+if state.snapshot(tid=101)["cwd"] != "exec-cwd-after" or state.snapshot(tid=101)["umask"] != 0o077:
+    raise SystemExit("execing FS mutation did not cross the shared FS context")
+if state.snapshot(tid=102)["cwd"] != "exec-cwd" or state.snapshot(tid=102)["umask"] != 0o027:
+    raise SystemExit("execing FS mutation leaked into copied FS context")
+state.set_cwd(tid=101, node="peer-cwd-after")
+state.set_umask(tid=101, value=0o037)
+if state.snapshot(tid=100)["cwd"] != "peer-cwd-after" or state.snapshot(tid=100)["umask"] != 0o037:
+    raise SystemExit("peer FS mutation did not cross the shared FS context")
+if state.snapshot(tid=102)["cwd"] != "exec-cwd" or state.snapshot(tid=102)["umask"] != 0o027:
+    raise SystemExit("peer FS mutation leaked into copied FS context")
+if state.snapshot(tid=100)["root"] != "exec-root" or state.snapshot(tid=101)["root"] != "exec-root":
+    raise SystemExit("exec changed the root FS node")
+
+
+def exec_with_replacement():
+    fresh, tokens = success_state()
+    if fresh.exec_event(
+        tid=100,
+        mappings={0x2000: (1, object(), 0, object(), False)},
+    ) is not None:
+        raise SystemExit("fresh successful exec_event did not return None")
+    return fresh, tokens
+
+
+fresh, fresh_tokens = exec_with_replacement()
+fresh.close(tid=100, fd=3)
+if fresh.snapshot(tid=100)["fds"] != {}:
+    raise SystemExit("closing the retained FD did not affect the execing table")
+if fresh.snapshot(tid=101)["fds"] != {
+    3: (fresh_tokens["retained_description"], False),
+    4: (fresh_tokens["closing_description"], True),
+}:
+    raise SystemExit("execing close crossed into the old shared FD table")
+fresh, fresh_tokens = exec_with_replacement()
+fresh.close(tid=101, fd=4)
+if fresh.snapshot(tid=101)["fds"] != {3: (fresh_tokens["retained_description"], False)}:
+    raise SystemExit("closing the peer CLOEXEC FD did not affect its old table")
+if fresh.snapshot(tid=100)["fds"] != {3: (fresh_tokens["retained_description"], False)}:
+    raise SystemExit("peer close crossed into the execing FD table")
+
+
+def accepted_mappings(label, mappings):
+    fresh, _ = success_state()
+    if fresh.exec_event(tid=100, mappings=mappings) is not None:
+        raise SystemExit(f"{label}: successful exec_event did not return None")
+    if fresh.snapshot(tid=100)["maps"] != mappings:
+        raise SystemExit(f"{label}: accepted mapping payload was not installed exactly")
+
+
+accepted_mappings("empty map", {})
+adjacent_node = object()
+adjacent_protection = object()
+accepted_mappings(
+    "adjacent ranges",
+    {
+        0x2000: (1, adjacent_node, 0, adjacent_protection, False),
+        0x2001: (1, object(), 0, object(), True),
+    },
+)
+accepted_mappings(
+    "u64 final byte",
+    {2**64 - 4: (4, object(), 0, object(), False)},
+)
+
+
+def fresh_rejection(root_tid=100):
+    state = module._SemanticTraceState(
+        root_tid=root_tid,
+        cwd="reject-cwd",
+        root="reject-root",
+        umask=0o022,
+        fds={3: ("retained", False), 4: ("closing", True)},
+    )
+    state.map_file(
+        tid=root_tid,
+        start=0x1000,
+        length=0x1000,
+        node="old-node",
+        offset=0x10,
+        prot="old-protection",
+        shared=False,
+    )
+    state.spawn(
+        parent_tid=root_tid,
+        child_tid=101,
+        share_files=True,
+        share_fs=True,
+        share_vm=True,
+        thread_group=False,
+    )
+    state.spawn(
+        parent_tid=root_tid,
+        child_tid=102,
+        share_files=False,
+        share_fs=False,
+        share_vm=False,
+        thread_group=False,
+    )
+    return state
+
+
+def literal_snapshot(tgid):
+    return {
+        "tgid": tgid,
+        "fds": {3: ("retained", False), 4: ("closing", True)},
+        "cwd": "reject-cwd",
+        "root": "reject-root",
+        "umask": 0o022,
+        "maps": {0x1000: (0x1000, "old-node", 0x10, "old-protection", False)},
+    }
+
+
+def expected_initial(root_tid, tids):
+    expected = {
+        root_tid: literal_snapshot(root_tid),
+        101: literal_snapshot(101),
+        102: literal_snapshot(102),
+    }
+    if 103 in tids:
+        expected[103] = literal_snapshot(root_tid)
+    return {tid: expected[tid] for tid in tids}
+
+
+def fd_fingerprint(table):
+    if isinstance(table, dict):
+        return (
+            type(table),
+            tuple((type(key), key, type(value), value) for key, value in table.items()),
+        )
+    return (type(table), repr(table))
+
+
+def prove_aliases(label, state, root_tid, valid_fd):
+    copied_before = copy.deepcopy(state.snapshot(tid=102))
+    state.set_cwd(tid=root_tid, node=f"{label}-cwd")
+    state.set_umask(tid=root_tid, value=0o071)
+    state.map_file(
+        tid=root_tid,
+        start=0x2000,
+        length=1,
+        node=f"{label}-node",
+        offset=0,
+        prot=f"{label}-protection",
+        shared=False,
+    )
+    shared_after = state.snapshot(tid=101)
+    copied_after = state.snapshot(tid=102)
+    if shared_after["cwd"] != f"{label}-cwd" or shared_after["umask"] != 0o071:
+        raise SystemExit(f"{label}: shared FS alias was lost after rejection")
+    if shared_after["maps"].get(0x2000) != (1, f"{label}-node", 0, f"{label}-protection", False):
+        raise SystemExit(f"{label}: shared VM alias was lost after rejection")
+    if copied_after["cwd"] != copied_before["cwd"] or copied_after["umask"] != copied_before["umask"]:
+        raise SystemExit(f"{label}: copied FS peer observed a rejected-call probe")
+    if 0x2000 in copied_after["maps"]:
+        raise SystemExit(f"{label}: copied VM peer observed a rejected-call probe")
+    if valid_fd:
+        state.dup2(tid=root_tid, source_fd=3, target_fd=8)
+        if state.snapshot(tid=101)["fds"].get(8) != ("retained", False):
+            raise SystemExit(f"{label}: shared FD alias was lost after rejection")
+        if 8 in state.snapshot(tid=102)["fds"]:
+            raise SystemExit(f"{label}: copied FD peer observed a rejected-call probe")
+
+
+def expect_format(
+    label,
+    operation,
+    *,
+    root_tid=100,
+    tids=(100, 101, 102),
+    inject_fd=None,
+    add_sibling=False,
+):
+    state = fresh_rejection(root_tid=root_tid)
+    if add_sibling:
+        state.spawn(
+            parent_tid=root_tid,
+            child_tid=103,
+            share_files=False,
+            share_fs=False,
+            share_vm=False,
+            thread_group=True,
+        )
+    before = {
+        tid: copy.deepcopy(state.snapshot(tid=tid))
+        for tid in tids
+    }
+    if before != expected_initial(root_tid, tids):
+        raise SystemExit(f"{label}: rejection fixture did not start from its literal state")
+    if inject_fd is not None:
+        inject_fd(state)
+        corrupt_before = fd_fingerprint(state._task(root_tid)["fds"])
+        try:
+            injected_target = state.snapshot(tid=root_tid)
+        except BaseException:
+            injected_target_non_fd = None
+        else:
+            injected_target.pop("fds")
+            injected_target_non_fd = copy.deepcopy(injected_target)
+    try:
+        operation(state)
+    except BaseException as exc:
+        if type(exc) is not module.FormatError:
+            raise SystemExit(
+                f"{label}: expected FormatError, got {type(exc).__name__}: {exc}"
+            ) from exc
+        if inject_fd is not None:
+            if fd_fingerprint(state._task(root_tid)["fds"]) != corrupt_before:
+                raise SystemExit(f"{label}: corrupt FD table changed after rejection")
+            if injected_target_non_fd is not None:
+                target_after = state.snapshot(tid=root_tid)
+                target_after.pop("fds")
+                if copy.deepcopy(target_after) != injected_target_non_fd:
+                    raise SystemExit(f"{label}: non-FD target state changed after rejection")
+            normal_tids = tuple(tid for tid in tids if tid != root_tid)
+        else:
+            normal_tids = tids
+        for tid in normal_tids:
+            after = copy.deepcopy(state.snapshot(tid=tid))
+            if after != before[tid]:
+                raise SystemExit(f"{label}: rejected operation mutated TID {tid}")
+        prove_aliases(label, state, root_tid, inject_fd is None)
+    else:
+        raise SystemExit(f"{label}: accepted invalid operation")
+
+
+expect_format("unknown TID", lambda state: state.exec_event(tid=999, mappings={}))
+expect_format("float TID", lambda state: state.exec_event(tid=100.0, mappings={}))
+expect_format(
+    "boolean TID does not alias root 1",
+    lambda state: state.exec_event(tid=True, mappings={}),
+    root_tid=1,
+    tids=(1, 101, 102),
+)
+expect_format(
+    "nonleader exec",
+    lambda state: state.exec_event(tid=103, mappings={}),
+    tids=(100, 101, 102, 103),
+    add_sibling=True,
+)
+expect_format(
+    "leader with retained sibling",
+    lambda state: state.exec_event(tid=100, mappings={}),
+    tids=(100, 101, 102, 103),
+    add_sibling=True,
+)
+
+
+def inject_table(table):
+    def inject(state):
+        state._task(100)["fds"] = table
+    return inject
+
+
+def inject_fd_value(key, value):
+    def inject(state):
+        table = dict(state._task(100)["fds"])
+        table[key] = value
+        state._task(100)["fds"] = table
+    return inject
+
+
+expect_format(
+    "FD table list",
+    lambda state: state.exec_event(tid=100, mappings={}),
+    inject_fd=inject_table([]),
+)
+expect_format(
+    "FD table dict subclass",
+    lambda state: state.exec_event(tid=100, mappings={}),
+    inject_fd=inject_table(DictSubclass({3: ("retained", False), 4: ("closing", True)})),
+)
+for label, key in (
+    ("negative FD key", -1),
+    ("boolean FD key", True),
+    ("non-integer FD key", "fd"),
+    ("float FD key", 5.0),
+):
+    expect_format(
+        label,
+        lambda state: state.exec_event(tid=100, mappings={}),
+        inject_fd=inject_fd_value(key, ("bad", False)),
+    )
+for label, value in (
+    ("FD value list", ["bad", False]),
+    ("FD value tuple subclass", TupleSubclass(("bad", False))),
+    ("FD value one-item tuple", ("bad",)),
+    ("FD value three-item tuple", ("bad", False, "extra")),
+    ("FD CLOEXEC integer", ("bad", 1)),
+    ("FD CLOEXEC None", ("bad", None)),
+):
+    expect_format(
+        label,
+        lambda state: state.exec_event(tid=100, mappings={}),
+        inject_fd=inject_fd_value(5, value),
+    )
+
+
+opaque_node = object()
+opaque_protection = object()
+
+
+def mapping(length=1, offset=0, shared=False):
+    return (length, opaque_node, offset, opaque_protection, shared)
+
+
+expect_format(
+    "mappings dict subclass",
+    lambda state: state.exec_event(tid=100, mappings=DictSubclass({})),
+)
+for label, payload in (
+    ("mappings list", []),
+    ("mapping value list", {0x2000: [1, opaque_node, 0, opaque_protection, False]}),
+    ("mapping value tuple subclass", {0x2000: TupleSubclass(mapping())}),
+    ("mapping value four-item tuple", {0x2000: (1, opaque_node, 0, opaque_protection)}),
+    ("mapping value six-item tuple", {0x2000: (1, opaque_node, 0, opaque_protection, False, "extra")}),
+):
+    expect_format(label, lambda state, payload=payload: state.exec_event(tid=100, mappings=payload))
+for label, start in (
+    ("boolean mapping start", True),
+    ("non-integer mapping start", "start"),
+    ("float mapping start", 1.0),
+    ("negative mapping start", -1),
+):
+    expect_format(label, lambda state, start=start: state.exec_event(tid=100, mappings={start: mapping()}))
+for label, length in (
+    ("boolean mapping length", True),
+    ("non-integer mapping length", "length"),
+    ("float mapping length", 1.0),
+    ("zero mapping length", 0),
+    ("negative mapping length", -1),
+):
+    expect_format(label, lambda state, length=length: state.exec_event(tid=100, mappings={0x2000: mapping(length=length)}))
+for label, offset in (
+    ("boolean mapping offset", True),
+    ("non-integer mapping offset", "offset"),
+    ("float mapping offset", 1.0),
+    ("negative mapping offset", -1),
+):
+    expect_format(label, lambda state, offset=offset: state.exec_event(tid=100, mappings={0x2000: mapping(offset=offset)}))
+for label, shared in (
+    ("integer shared flag", 1),
+    ("None shared flag", None),
+):
+    expect_format(label, lambda state, shared=shared: state.exec_event(tid=100, mappings={0x2000: mapping(shared=shared)}))
+expect_format(
+    "mapping start at u64 limit",
+    lambda state: state.exec_event(tid=100, mappings={2**64: mapping()}),
+)
+expect_format(
+    "mapping range overflows u64",
+    lambda state: state.exec_event(tid=100, mappings={2**64 - 1: mapping(length=2)}),
+)
+expect_format(
+    "overlapping mapping ranges",
+    lambda state: state.exec_event(
+        tid=100,
+        mappings={0x2000: mapping(length=0x10), 0x200F: mapping()},
+    ),
+)
+
+print("bs2b-semantic-exec-event-ok")
+"#;
+    let output = Command::new("/usr/bin/python3")
+        .args(["-c", driver, script.to_str().expect("script path is UTF-8")])
+        .current_dir(repo)
+        .env_clear()
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("run BS2b semantic exec-event contract");
+    assert!(
+        output.status.success(),
+        "BS2b semantic exec-event contract failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "BS2b semantic exec-event driver wrote to stderr"
+    );
+    assert_eq!(
+        output.stdout, b"bs2b-semantic-exec-event-ok\n",
+        "BS2b semantic exec-event driver did not complete"
+    );
+}

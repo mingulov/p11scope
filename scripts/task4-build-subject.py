@@ -48,12 +48,105 @@ class _SemanticTraceState:
             }
         }
         self._pending = {}
+        self._fd_table_mutators = []
+
+    @staticmethod
+    def _validate_fd_table_mutator_operation(operation):
+        if type(operation) is not tuple or len(operation) != 3:
+            raise FormatError("invalid pending syscall")
+        name, category, arguments = operation
+        if type(name) is not str or name not in {"dup", "dup2"}:
+            raise FormatError("invalid pending syscall")
+        if type(category) is not str or category != "fd":
+            raise FormatError("invalid pending syscall")
+        if type(arguments) is not tuple or len(arguments) != 6:
+            raise FormatError("invalid pending syscall")
+        if any(type(value) is not int or not 0 <= value < 2**64 for value in arguments):
+            raise FormatError("invalid pending syscall")
+        endpoint_count = 2 if name == "dup2" else 1
+        if any(
+            type(value) is not int or not 0 <= value <= 2**31 - 1
+            for value in arguments[:endpoint_count]
+        ):
+            raise FormatError("invalid pending syscall")
+        return name, arguments
+
+    def _validate_fd_table_mutators(self):
+        owners = self._fd_table_mutators
+        if type(owners) is not list or type(self._pending) is not dict:
+            raise FormatError("invalid FD-table mutators")
+        tables = []
+        tids = set()
+        for owner in owners:
+            if type(owner) is not tuple or len(owner) != 3:
+                raise FormatError("invalid FD-table mutator")
+            table, owner_tid, pending = owner
+            if type(table) is not dict or type(owner_tid) is not int or owner_tid <= 0:
+                raise FormatError("invalid FD-table mutator")
+            if any(table is previous for previous in tables) or owner_tid in tids:
+                raise FormatError("duplicate FD-table mutator")
+            task = self._task(owner_tid)
+            if type(task) is not dict or task.get("fds") is not table:
+                raise FormatError("stale FD-table mutator")
+            self._fd_table(owner_tid)
+            try:
+                current_pending = self._pending[owner_tid]
+            except (KeyError, TypeError) as exc:
+                raise FormatError("missing pending syscall") from exc
+            if current_pending is not pending:
+                raise FormatError("stale pending syscall")
+            self._validate_fd_table_mutator_operation(pending)
+            tables.append(table)
+            tids.add(owner_tid)
+        return owners
+
+    def _owner_for_fd_table_mutator(self, tid):
+        fds = self._fd_table(tid)
+        if type(self._pending) is not dict:
+            raise FormatError("invalid pending syscall table")
+        try:
+            pending = self._pending[tid]
+        except (KeyError, TypeError) as exc:
+            raise FormatError("no pending syscall") from exc
+        owners = self._validate_fd_table_mutators()
+        owner_index = None
+        for index, owner in enumerate(owners):
+            if owner[0] is fds and owner[1] == tid and owner[2] is pending:
+                if owner_index is not None:
+                    raise FormatError("ambiguous FD-table mutator")
+                owner_index = index
+        if owner_index is None:
+            raise FormatError("FD-table mutator not admitted")
+        return fds, pending, owner_index
+
+    def try_admit_fd_table_mutator(self, *, tid):
+        if type(tid) is not int or tid <= 0:
+            raise FormatError("invalid task")
+        fds = self._fd_table(tid)
+        if type(self._pending) is not dict:
+            raise FormatError("invalid pending syscall table")
+        try:
+            pending = self._pending[tid]
+        except (KeyError, TypeError) as exc:
+            raise FormatError("no pending syscall") from exc
+        self._validate_fd_table_mutator_operation(pending)
+        owners = self._validate_fd_table_mutators()
+        for owner in owners:
+            if owner[0] is fds:
+                return owner[1] == tid and owner[2] is pending
+        owners.append((fds, tid, pending))
+        return True
 
     def _fd_table(self, tid):
         if type(tid) is not int or tid <= 0:
             raise FormatError("invalid task")
         task = self._task(tid)
-        fds = task["fds"]
+        if type(task) is not dict:
+            raise FormatError("invalid task")
+        try:
+            fds = task["fds"]
+        except (KeyError, TypeError) as exc:
+            raise FormatError("invalid FD table") from exc
         if type(fds) is not dict:
             raise FormatError("invalid FD table")
         for fd, value in fds.items():
@@ -168,25 +261,11 @@ class _SemanticTraceState:
         del self._pending[tid]
 
     def finish_dup2_syscall(self, *, tid, result, errno):
-        fds = self._fd_table(tid)
-        try:
-            pending = self._pending[tid]
-        except (KeyError, TypeError) as exc:
-            raise FormatError("no pending syscall") from exc
-        if type(pending) is not tuple or len(pending) != 3:
-            raise FormatError("invalid pending syscall")
-        name, category, arguments = pending
-        if type(name) is not str or name != "dup2":
-            raise FormatError("invalid pending syscall")
-        if type(category) is not str or category != "fd":
-            raise FormatError("invalid pending syscall")
-        if type(arguments) is not tuple or len(arguments) != 6:
-            raise FormatError("invalid pending syscall")
-        if any(type(value) is not int or not 0 <= value < 2**64 for value in arguments):
+        fds, pending, owner_index = self._owner_for_fd_table_mutator(tid)
+        name, arguments = self._validate_fd_table_mutator_operation(pending)
+        if name != "dup2":
             raise FormatError("invalid pending syscall")
         oldfd, newfd = arguments[:2]
-        if any(type(fd) is not int or not 0 <= fd <= 2**31 - 1 for fd in (oldfd, newfd)):
-            raise FormatError("invalid dup2 FD")
 
         success = type(result) is int and result == newfd and errno is None
         failure = type(result) is int and result == -1 and type(errno) is int and errno in {
@@ -207,28 +286,15 @@ class _SemanticTraceState:
         if success:
             self.dup2(tid=tid, source_fd=oldfd, target_fd=newfd)
         del self._pending[tid]
+        del self._fd_table_mutators[owner_index]
         return receipt
 
     def finish_dup_syscall(self, *, tid, result, errno):
-        fds = self._fd_table(tid)
-        try:
-            pending = self._pending[tid]
-        except (KeyError, TypeError) as exc:
-            raise FormatError("no pending syscall") from exc
-        if type(pending) is not tuple or len(pending) != 3:
-            raise FormatError("invalid pending syscall")
-        name, category, arguments = pending
-        if type(name) is not str or name != "dup":
-            raise FormatError("invalid pending syscall")
-        if type(category) is not str or category != "fd":
-            raise FormatError("invalid pending syscall")
-        if type(arguments) is not tuple or len(arguments) != 6:
-            raise FormatError("invalid pending syscall")
-        if any(type(value) is not int or not 0 <= value < 2**64 for value in arguments):
+        fds, pending, owner_index = self._owner_for_fd_table_mutator(tid)
+        name, arguments = self._validate_fd_table_mutator_operation(pending)
+        if name != "dup":
             raise FormatError("invalid pending syscall")
         oldfd = arguments[0]
-        if oldfd > 2**31 - 1:
-            raise FormatError("invalid dup FD")
 
         success = type(result) is int and 0 <= result <= 2**31 - 1 and errno is None
         failure = type(result) is int and result == -1 and type(errno) is int and errno in {9, 24}
@@ -255,6 +321,7 @@ class _SemanticTraceState:
         if success:
             self.dup2(tid=tid, source_fd=oldfd, target_fd=result)
         del self._pending[tid]
+        del self._fd_table_mutators[owner_index]
         return receipt
 
     def _task(self, tid):

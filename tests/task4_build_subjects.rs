@@ -8012,3 +8012,638 @@ print("bs2b-semantic-open-description-ok")
         "BS2b semantic open-description driver did not complete"
     );
 }
+
+#[test]
+fn semantic_trace_v1_private_dup2_outcome_contracts() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = repo.join("scripts/task4-build-subject.py");
+    let driver = r#"
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("task4_build_subject", sys.argv[1])
+if spec is None or spec.loader is None:
+    raise SystemExit("could not import task4 build-subject script")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+
+class IntSubclass(int):
+    pass
+
+
+class StringSubclass(str):
+    pass
+
+
+class TupleSubclass(tuple):
+    pass
+
+
+INT_MAX = 2**31 - 1
+MAX_U64 = 2**64 - 1
+TAIL = (17, 2**63, 2**64 - 2, MAX_U64)
+BASE_ARGS = (5, 6, *TAIL)
+
+
+def dup_operation(oldfd=5, newfd=6, tail=TAIL):
+    return ("dup2", "fd", (oldfd, newfd, *tail))
+
+
+def seed_state(root_tid=100, include_target=True):
+    state = module._SemanticTraceState(
+        root_tid=root_tid,
+        cwd=object(),
+        root=object(),
+        umask=0o022,
+        fds={3: (object(), False), 4: (object(), True)},
+    )
+    state.install_open_fd(
+        tid=root_tid,
+        fd=5,
+        node=object(),
+        kind="regular",
+        access="read_write",
+        cloexec=True,
+    )
+    state.apply_io_offset(tid=root_tid, fd=5, direction="write", count=7, position=None)
+    if include_target:
+        state.install_open_fd(
+            tid=root_tid,
+            fd=6,
+            node=object(),
+            kind="regular",
+            access="read_write",
+            cloexec=True,
+        )
+    state.map_file(
+        tid=root_tid,
+        start=0x1000,
+        length=0x1000,
+        node=object(),
+        offset=0,
+        prot=object(),
+        shared=False,
+    )
+    state.spawn(
+        parent_tid=root_tid,
+        child_tid=101,
+        share_files=True,
+        share_fs=True,
+        share_vm=True,
+        thread_group=False,
+    )
+    state.spawn(
+        parent_tid=root_tid,
+        child_tid=102,
+        share_files=False,
+        share_fs=False,
+        share_vm=False,
+        thread_group=False,
+    )
+    return state
+
+
+def arm_pending(state, root_tid=100, operation=None, peer=True):
+    if operation is None:
+        operation = dup_operation()
+    state.begin_syscall(tid=root_tid, operation=operation)
+    refs = {root_tid: operation}
+    if peer:
+        peer_operation = ("C_Peer", "pure", (0, 0, 0, 0, 0, 0))
+        state.begin_syscall(tid=101, operation=peer_operation)
+        refs[101] = peer_operation
+    return refs
+
+
+def arm_malformed_pending(state, pending, root_tid=100, peer=True):
+    refs = {}
+    if peer:
+        peer_operation = ("C_Peer", "pure", (0, 0, 0, 0, 0, 0))
+        state.begin_syscall(tid=101, operation=peer_operation)
+        refs[101] = peer_operation
+    state._pending[root_tid] = pending
+    refs[root_tid] = pending
+    return refs
+
+
+def same_value(left, right):
+    if left is right:
+        return True
+    if type(left) is not type(right):
+        return False
+    if type(left) is tuple or type(left) is list:
+        return len(left) == len(right) and all(
+            same_value(a, b) for a, b in zip(left, right)
+        )
+    if type(left) is dict:
+        return (
+            list(left) == list(right)
+            and all(same_value(left[key], right[key]) for key in left)
+        )
+    try:
+        return bool(left == right)
+    except BaseException:
+        return False
+
+
+def description_fields(description):
+    try:
+        return (
+            "typed",
+            description.kind,
+            description.access,
+            description.offset,
+            description.identity,
+        )
+    except AttributeError:
+        return ("opaque", description)
+
+
+def observation(state, tids=(100, 101, 102)):
+    result = {}
+    for tid in tids:
+        task = state._task(tid)
+        fds = task["fds"]
+        fd_rows = []
+        if type(fds) is dict:
+            for fd, entry in fds.items():
+                if type(entry) is tuple and len(entry) == 2:
+                    fd_rows.append(
+                        (
+                            fd,
+                            entry,
+                            entry[0],
+                            entry[1],
+                            description_fields(entry[0]),
+                        )
+                    )
+                else:
+                    fd_rows.append((fd, entry, entry, None, None))
+        fs = task["fs"]
+        maps = task["maps"]
+        result[tid] = (
+            task,
+            task["tgid"],
+            fds,
+            tuple(fd_rows),
+            fs,
+            (fs.get("cwd"), fs.get("root"), fs.get("umask")),
+            maps,
+            tuple(maps.items()) if type(maps) is dict else maps,
+        )
+    return result
+
+
+def same_observation(before, after):
+    if set(before) != set(after):
+        return False
+    for tid in before:
+        left, right = before[tid], after[tid]
+        if left[0] is not right[0] or left[1] != right[1]:
+            return False
+        if left[2] is not right[2] or left[4] is not right[4] or left[6] is not right[6]:
+            return False
+        if not same_value(left[5], right[5]):
+            return False
+        if type(left[2]) is dict:
+            if len(left[3]) != len(right[3]):
+                return False
+            for old, new in zip(left[3], right[3]):
+                if old[0] != new[0] or old[1] is not new[1]:
+                    return False
+                if old[2] is not new[2] or old[3] is not new[3]:
+                    return False
+                if not same_value(old[4], new[4]):
+                    return False
+        if type(left[6]) is dict:
+            if len(left[7]) != len(right[7]):
+                return False
+            for (old_key, old_value), (new_key, new_value) in zip(left[7], right[7]):
+                if old_key != new_key or old_value is not new_value:
+                    return False
+    return True
+
+
+def pending_refs(state):
+    return {tid: operation for tid, operation in state._pending.items()}
+
+
+def assert_pending(label, state, refs):
+    if set(state._pending) != set(refs):
+        raise SystemExit(f"{label}: pending TID set changed")
+    for tid, operation in refs.items():
+        if state._pending[tid] is not operation:
+            raise SystemExit(f"{label}: pending tuple identity changed")
+
+
+def assert_receipt(label, receipt, pending, result, errno):
+    if type(receipt) is not tuple or len(receipt) != 3:
+        raise SystemExit(f"{label}: semantic result was not a three-item tuple")
+    if receipt[0] is not pending or type(receipt[1]) is not int or receipt[1] != result:
+        raise SystemExit(f"{label}: semantic result did not retain pending/result")
+    if errno is None:
+        if receipt[2] is not None:
+            raise SystemExit(f"{label}: success errno was not None")
+    elif type(receipt[2]) is not int or receipt[2] != errno:
+        raise SystemExit(f"{label}: semantic result did not retain errno")
+
+
+def assert_fd(label, state, tid, fd, description, cloexec):
+    entry = state._task(tid)["fds"][fd]
+    if type(entry) is not tuple or len(entry) != 2 or type(entry[1]) is not bool:
+        raise SystemExit(f"{label}: malformed FD entry")
+    if entry[0] is not description or entry[1] is not cloexec:
+        raise SystemExit(f"{label}: FD description/CLOEXEC changed")
+
+
+def expect_rejected(label, state, invoke, refs=None, root_tid=100):
+    tids = (root_tid, 101, 102)
+    before = observation(state, tids)
+    if refs is None:
+        refs = pending_refs(state)
+    try:
+        invoke()
+    except BaseException as exc:
+        if type(exc) is not module.FormatError:
+            raise SystemExit(
+                f"{label}: expected FormatError, got {type(exc).__name__}: {exc}"
+            ) from exc
+    else:
+        raise SystemExit(f"{label}: invalid completion was accepted")
+    if not same_observation(before, observation(state, tids)):
+        raise SystemExit(f"{label}: rejection changed semantic state")
+    assert_pending(label, state, refs)
+
+
+def expect_rejected_pending(label, pending, result=6, errno=None):
+    state = seed_state()
+    refs = arm_malformed_pending(state, pending)
+    expect_rejected(
+        label,
+        state,
+        lambda: state.finish_dup2_syscall(tid=100, result=result, errno=errno),
+        refs,
+    )
+
+
+def expect_rejected_valid(label, result=6, errno=None, operation=None):
+    state = seed_state()
+    refs = arm_pending(state, operation=operation)
+    expect_rejected(
+        label,
+        state,
+        lambda: state.finish_dup2_syscall(tid=100, result=result, errno=errno),
+        refs,
+    )
+
+
+def expect_rejected_tid(label, tid, result, errno, root_tid=100):
+    state = seed_state(root_tid)
+    refs = arm_pending(state, root_tid=root_tid)
+    expect_rejected(
+        label,
+        state,
+        lambda: state.finish_dup2_syscall(tid=tid, result=result, errno=errno),
+        refs,
+        root_tid,
+    )
+
+
+# The first valid S5 call is deliberately before any other S5 invocation.
+# The current candidate fails here solely because finish_dup2_syscall is absent.
+state = seed_state()
+refs = arm_pending(state)
+pending = refs[100]
+peer_pending = refs[101]
+source = state._task(100)["fds"][5][0]
+old_target = state._task(100)["fds"][6][0]
+receipt = state.finish_dup2_syscall(tid=100, result=6, errno=None)
+assert_receipt("distinct-target success", receipt, pending, 6, None)
+if state._task(100)["fds"] is not state._task(101)["fds"]:
+    raise SystemExit("shared FD-table fixture was not shared")
+if state._task(100)["fds"] is state._task(102)["fds"]:
+    raise SystemExit("copied FD-table fixture was shared")
+assert_fd("distinct-target root", state, 100, 5, source, True)
+assert_fd("distinct-target root", state, 100, 6, source, False)
+assert_fd("distinct-target shared peer", state, 101, 6, source, False)
+assert_fd("distinct-target copied peer", state, 102, 6, old_target, True)
+if source.offset != 7 or old_target.offset != 0:
+    raise SystemExit("distinct-target success changed description offsets")
+assert_pending("distinct-target success", state, {101: peer_pending})
+
+
+# A vacant target is created only in the shared table; the copied table stays
+# untouched.
+state = seed_state(include_target=False)
+refs = arm_pending(state)
+pending = refs[100]
+source = state._task(100)["fds"][5][0]
+root_table = state._task(100)["fds"]
+shared_table = state._task(101)["fds"]
+copied_table = state._task(102)["fds"]
+copied_before = observation(state, (102,))
+if root_table is not shared_table or root_table is copied_table:
+    raise SystemExit("vacant-target fixture has the wrong FD-table topology")
+if 6 in state._task(100)["fds"] or 6 in state._task(102)["fds"]:
+    raise SystemExit("vacant-target fixture was not vacant")
+receipt = state.finish_dup2_syscall(tid=100, result=6, errno=None)
+assert_receipt("vacant-target success", receipt, pending, 6, None)
+if (
+    state._task(100)["fds"] is not root_table
+    or state._task(101)["fds"] is not shared_table
+    or state._task(102)["fds"] is not copied_table
+    or state._task(100)["fds"] is not state._task(101)["fds"]
+):
+    raise SystemExit("vacant-target success changed FD-table topology")
+assert_fd("vacant-target root source", state, 100, 5, source, True)
+assert_fd("vacant-target shared source", state, 101, 5, source, True)
+assert_fd("vacant-target copied source", state, 102, 5, source, True)
+assert_fd("vacant-target root", state, 100, 6, source, False)
+assert_fd("vacant-target shared peer", state, 101, 6, source, False)
+if 6 in state._task(102)["fds"]:
+    raise SystemExit("vacant-target success changed copied FD table")
+if not same_observation(copied_before, observation(state, (102,))):
+    raise SystemExit("vacant-target success changed copied FD observation")
+assert_pending("vacant-target success", state, {101: refs[101]})
+
+
+# Equal descriptors are a no-op, including their CLOEXEC state.
+state = seed_state()
+refs = arm_pending(state, operation=dup_operation(5, 5))
+pending = refs[100]
+source = state._task(100)["fds"][5][0]
+before = observation(state)
+receipt = state.finish_dup2_syscall(tid=100, result=5, errno=None)
+assert_receipt("same-FD success", receipt, pending, 5, None)
+if not same_observation(before, observation(state)):
+    raise SystemExit("same-FD success changed FD state")
+assert_fd("same-FD root", state, 100, 5, source, True)
+assert_fd("same-FD shared peer", state, 101, 5, source, True)
+assert_fd("same-FD copied peer", state, 102, 5, source, True)
+assert_pending("same-FD success", state, {101: refs[101]})
+
+
+# All Linux dup2 terminal failures return their own semantic tuple and make no
+# FD mutation. EBADF deliberately has no source, so failure must bypass lookup.
+for errno in (4, 9, 16, 24):
+    state = seed_state()
+    oldfd = 99 if errno == 9 else 5
+    refs = arm_pending(state, operation=dup_operation(oldfd, 6))
+    pending = refs[100]
+    before = observation(state)
+    receipt = state.finish_dup2_syscall(tid=100, result=-1, errno=errno)
+    assert_receipt(f"failure errno {errno}", receipt, pending, -1, errno)
+    if not same_observation(before, observation(state)):
+        raise SystemExit(f"failure errno {errno} changed FD state")
+    assert_pending(f"failure errno {errno}", state, {101: refs[101]})
+
+
+# S3 restart keeps the exact operation object until its normalized terminal
+# result arrives.
+state = seed_state()
+refs = arm_pending(state)
+pending = refs[100]
+before = observation(state)
+if state.finish_syscall(tid=100, outcome="restart") is not None:
+    raise SystemExit("restart returned a non-None value")
+if not same_observation(before, observation(state)):
+    raise SystemExit("restart changed semantic state")
+assert_pending("restart", state, refs)
+receipt = state.finish_dup2_syscall(tid=100, result=6, errno=None)
+assert_receipt("normalized completion after restart", receipt, pending, 6, None)
+assert_pending("normalized completion after restart", state, {101: refs[101]})
+
+
+# Wrong operation/name/category/tuple forms reject before touching state.
+for label, bad_pending in (
+    ("wrong operation name", ("dup", "fd", BASE_ARGS)),
+    ("wrong operation category", ("dup2", "path", BASE_ARGS)),
+    ("operation list", ["dup2", "fd", BASE_ARGS]),
+    ("operation tuple subclass", TupleSubclass(("dup2", "fd", BASE_ARGS))),
+    ("operation two-item tuple", ("dup2", "fd")),
+    ("operation four-item tuple", ("dup2", "fd", BASE_ARGS, "extra")),
+    ("arguments list", ("dup2", "fd", list(BASE_ARGS))),
+    ("arguments tuple subclass", ("dup2", "fd", TupleSubclass(BASE_ARGS))),
+    ("five arguments", ("dup2", "fd", BASE_ARGS[:5])),
+    ("seven arguments", ("dup2", "fd", BASE_ARGS + (7,))),
+):
+    expect_rejected_pending(label, bad_pending)
+
+
+# Old/new FDs are the only interpreted argument positions. Both endpoints
+# accept 0 and INT_MAX in an admitted failure, while every exact-type/range
+# violation rejects atomically.
+for oldfd, newfd in ((0, INT_MAX), (INT_MAX, 0)):
+    state = seed_state()
+    refs = arm_pending(state, operation=dup_operation(oldfd, newfd))
+    pending = refs[100]
+    before = observation(state)
+    receipt = state.finish_dup2_syscall(tid=100, result=-1, errno=9)
+    assert_receipt("admitted FD endpoint", receipt, pending, -1, 9)
+    if not same_observation(before, observation(state)):
+        raise SystemExit("admitted FD endpoint changed FD state")
+    assert_pending("admitted FD endpoint", state, {101: refs[101]})
+
+for position, name in ((0, "oldfd"), (1, "newfd")):
+    for label, bad in (
+        ("negative", -1),
+        ("above INT_MAX", INT_MAX + 1),
+        ("bool", True),
+        ("integer subclass", IntSubclass(5)),
+        ("float", 5.0),
+        ("None", None),
+    ):
+        args = list(BASE_ARGS)
+        args[position] = bad
+        expect_rejected_pending(
+            f"{name} {label}",
+            ("dup2", "fd", tuple(args)),
+        )
+
+
+# Raw argument positions two through five are uninterpreted u64 values.
+for tail in ((0, 0, 0, 0), (1, 2, 3, 4), (MAX_U64, MAX_U64, MAX_U64, MAX_U64)):
+    state = seed_state()
+    pending = dup_operation(5, 6, tail)
+    refs = arm_pending(state, operation=pending)
+    receipt = state.finish_dup2_syscall(tid=100, result=6, errno=None)
+    assert_receipt("uninterpreted raw arguments", receipt, pending, 6, None)
+    assert_pending("uninterpreted raw arguments", state, {101: refs[101]})
+
+
+for position in range(2, 6):
+    for label, bad in (
+        ("bool", True),
+        ("integer subclass", IntSubclass(1)),
+        ("negative", -1),
+        ("u64 overflow", 2**64),
+    ):
+        args = list(BASE_ARGS)
+        args[position] = bad
+        expect_rejected_pending(
+            f"raw argument slot {position} {label}",
+            ("dup2", "fd", tuple(args)),
+        )
+
+
+# Exact result/errno typing is part of the normalized semantic boundary.
+for label, result, errno in (
+    ("bool success result", True, None),
+    ("bool failure result", False, 4),
+    ("integer-subclass success result", IntSubclass(6), None),
+    ("integer-subclass failure result", IntSubclass(-1), 4),
+    ("float result", 6.0, None),
+    ("string result", "6", None),
+    ("bool errno", -1, True),
+    ("integer-subclass errno", -1, IntSubclass(4)),
+    ("float errno", -1, 4.0),
+    ("string errno", -1, "4"),
+):
+    expect_rejected_valid(label, result, errno)
+
+
+for label, result, errno in (
+    ("success result with errno", 6, 4),
+    ("failure result without errno", -1, None),
+    ("wrong result with errno", 5, 4),
+    ("other negative result", -2, 4),
+):
+    expect_rejected_valid(label, result, errno)
+
+
+for errno in (0, 5, 25, 2**31):
+    expect_rejected_valid(
+        f"unknown errno {errno}",
+        result=-1,
+        errno=errno,
+    )
+
+
+for raw_restart in (-512, -513, -514, -516):
+    expect_rejected_valid(
+        f"raw restart pseudo-result {raw_restart}",
+        result=raw_restart,
+        errno=4,
+    )
+
+
+# Success source validation is required only for success; an absent source is
+# therefore rejected without changing the target or any peer state.
+expect_rejected_valid(
+    "unknown success source",
+    result=6,
+    errno=None,
+    operation=dup_operation(99, 6),
+)
+
+
+# Both terminal paths reject malformed FD tables before any effect.
+for label, table, result, errno in (
+    ("malformed table success list", [], 6, None),
+    ("malformed table success key", {True: (object(), False)}, 6, None),
+    ("malformed table success entry", {5: [object(), False]}, 6, None),
+    ("malformed table failure list", [], -1, 4),
+    ("malformed table failure key", {True: (object(), False)}, -1, 4),
+    ("malformed table failure entry", {5: [object(), False]}, -1, 4),
+):
+    state = seed_state()
+    refs = arm_pending(state)
+    state._task(100)["fds"] = table
+    expect_rejected(
+        label,
+        state,
+        lambda result=result, errno=errno: state.finish_dup2_syscall(
+            tid=100, result=result, errno=errno
+        ),
+        refs,
+    )
+
+
+# Every invalid TID form is checked against both terminal paths, including an
+# integer subclass that compares equal to the real root key.
+invalid_tids = (
+    ("unknown", 999),
+    ("bool", True),
+    ("false bool", False),
+    ("string", "100"),
+    ("string subclass", StringSubclass("100")),
+    ("None", None),
+    ("zero", 0),
+    ("negative", -1),
+    ("float", 100.0),
+    ("integer subclass", IntSubclass(100)),
+)
+for label, tid in invalid_tids:
+    expect_rejected_tid(f"invalid success TID {label}", tid, 6, None)
+    expect_rejected_tid(f"invalid failure TID {label}", tid, -1, 4)
+expect_rejected_tid("alias success TID", IntSubclass(1), 6, None, root_tid=1)
+expect_rejected_tid("alias failure TID", IntSubclass(1), -1, 4, root_tid=1)
+
+
+# Orphan completion and duplicate completion are both atomic.
+state = seed_state()
+refs = arm_pending(state, peer=False)
+pending = refs.pop(100)
+del state._pending[100]
+expect_rejected(
+    "orphan completion",
+    state,
+    lambda: state.finish_dup2_syscall(tid=100, result=6, errno=None),
+    {},
+)
+
+state = seed_state()
+refs = arm_pending(state)
+first = state.finish_dup2_syscall(tid=100, result=-1, errno=4)
+assert_receipt("duplicate setup", first, refs[100], -1, 4)
+before = observation(state)
+expect_rejected(
+    "duplicate completion",
+    state,
+    lambda: state.finish_dup2_syscall(tid=100, result=-1, errno=4),
+    {101: refs[101]},
+)
+if not same_observation(before, observation(state)):
+    raise SystemExit("duplicate completion changed state")
+
+
+# Existing S4 topology accepts legacy opaque descriptions too.
+state = seed_state()
+legacy = state._task(100)["fds"][3][0]
+target = state._task(100)["fds"][6][0]
+pending = dup_operation(3, 6)
+refs = arm_pending(state, operation=pending)
+receipt = state.finish_dup2_syscall(tid=100, result=6, errno=None)
+assert_receipt("legacy opaque success", receipt, pending, 6, None)
+assert_fd("legacy opaque root source", state, 100, 3, legacy, False)
+assert_fd("legacy opaque root target", state, 100, 6, legacy, False)
+assert_fd("legacy opaque shared target", state, 101, 6, legacy, False)
+assert_fd("legacy opaque copied target", state, 102, 6, target, True)
+assert_pending("legacy opaque success", state, {101: refs[101]})
+
+print("bs2b-semantic-dup2-outcome-ok")
+"#;
+    let output = Command::new("/usr/bin/python3")
+        .args(["-c", driver, script.to_str().expect("script path is UTF-8")])
+        .current_dir(repo)
+        .env_clear()
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("run BS2b semantic dup2-outcome contract");
+    assert!(
+        output.status.success(),
+        "BS2b semantic dup2-outcome contract failed:\nstdout={:?}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "BS2b semantic dup2-outcome driver wrote to stderr"
+    );
+    assert_eq!(
+        output.stdout, b"bs2b-semantic-dup2-outcome-ok\n",
+        "BS2b semantic dup2-outcome driver did not complete"
+    );
+}

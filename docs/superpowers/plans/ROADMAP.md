@@ -515,8 +515,16 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     procfs/mmap/eBPF fallback change is made here.**
 
     **Task 4 receipt architecture ruling (2026-08-28):** Remaining-lane gate
-    receipts use one private Python-stdlib sealed-envelope helper and six
-    committed lane contracts. Existing checkers remain the domain oracles; the
+    receipts use one private Python-stdlib sealed-envelope helper, one shared
+    privacy scanner, six lane-owned checkers, and seven committed contracts
+    (`07`, `09`, `10`, `11`, `14`, `16-never`, `16-auto`). Seven reviewed
+    non-executable blueprints precede checker implementation; all checker and
+    helper interfaces resolve before promotion, and the runtime helper rejects
+    blueprint schema with exit 77 before root creation. The exact
+    194-row Lane 14 canary/privacy crosswalk contains 191 scan targets, two
+    input-only manifests, and one must-detect positive control; it does not
+    replace Lane 14 distribution/attach/protocol/release/smoke artifact rows.
+    Existing checkers remain the domain oracles; the
     envelope validates only declaration equality, custody, provenance, resource
     lifecycle, replay isolation, privacy scanning, sealing, and terminal
     publication. The rejected live Rust observer, FD-5 protocol, global

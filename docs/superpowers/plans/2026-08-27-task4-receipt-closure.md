@@ -13,7 +13,8 @@ run exactly once and serially: 07, 09, 10, 11, 14, Lane 16 `never`, Lane 16
 private Python-stdlib helper. Existing lane checkers remain the domain oracles;
 the envelope validates only declaration equality, custody, provenance, resource
 lifecycle, replay isolation, privacy scanning, sealing, and terminal
-publication. Six committed lane contracts define the required inventory.
+publication. Seven committed contracts for six lanes define the required
+inventory.
 Product Rust/BPF, public schemas, privacy policy, lane oracles, and runtime order
 do not change.
 
@@ -54,14 +55,23 @@ and this section control.
 
 ### Scope and files
 
-Create one private Python-stdlib helper, `scripts/task4-receipt.py`, and six
-committed contracts beneath `scripts/task4-contracts/`: `lane07.json`,
-`lane09.json`, `lane10.json`, `lane11.json`, `lane14.json`, and `lane16.json`.
-The six normal drivers keep lane-specific collection, immutable-identity
-cleanup, and their existing domain checkers, but replace their local receipt
-wrappers with the common envelope. `scripts/verify-discover-containers.sh` may
-retain only Lane 14 resource/artifact production and registration. No receipt
-helper or Rust test interprets PKCS #11 counts, lane facts, or PASS semantics.
+Create one private Python-stdlib helper, `scripts/task4-receipt.py`, one shared
+privacy scanner, six lane-owned checker scripts, and seven committed contracts
+beneath `scripts/task4-contracts/`: `lane07.json`, `lane09.json`, `lane10.json`,
+`lane11.json`, `lane14.json`, `lane16-never.json`, and `lane16-auto.json`.
+The six normal drivers keep lane-specific collection and immutable-identity
+cleanup, but replace inline predicates only after mutation-equivalent lane
+checkers exist and replace local receipt wrappers with the common envelope.
+`scripts/verify-discover-containers.sh` may retain only Lane 14 resource/artifact
+production and registration. No receipt helper or Rust test interprets PKCS #11
+counts, lane facts, or PASS semantics.
+
+The checker files are exactly `scripts/check-privacy-surfaces.py` and
+`scripts/check-task4-lane07.py`, `scripts/check-task4-lane09.py`,
+`scripts/check-task4-lane10.py`, `scripts/check-task4-lane11.py`,
+`scripts/check-task4-lane14.py`, and `scripts/check-task4-lane16.py`. Existing
+`check-capture-evidence.py`, `check-bpf-map-defs.py`, and
+`scripts/fixtures/discover-manifest.jq` retain their current semantic scope.
 
 ### Canonical bounds and schemas
 
@@ -87,15 +97,60 @@ starting at zero.
   each at most 64 MiB; `verdict` and `status` are at most four bytes; and
   `seal.sha256` is at most 16 MiB.
 
-A lane contract has exactly these top-level keys:
+Before checker implementation, seven non-executable inventory blueprints live
+only beneath `docs/superpowers/contracts/task4/`. A blueprint has the exact
+runtime-contract keys below plus `unresolved_interfaces`; `schema` is
+`p11scope-task4-contract-blueprint-v1`. The helper rejects this schema with exit
+77 before root creation.
+
+`unresolved_interfaces` has 0..3 records per blueprint, sorted by label, each
+with exactly:
 
 ```text
-artifacts, checkers, driver, environment, inputs, lane,
-privacy_surfaces, replay_adapter, resources, schema
+bindings, executable, kind, label, locator, self_test
+```
+
+`kind` is `lane-checker|privacy-scanner|envelope-helper`. `label` names exactly
+one declared tracked input of kind `checker|helper`; `locator` equals that
+input's repository-relative locator; `executable` names the interpreter/direct
+input used by `self_test`; and `self_test` is 1..512 `literal|input` `ArgToken`
+values. Self-test use is exactly `executable==label` with zero matching input
+tokens, or a different executable with exactly one matching input token.
+
+`bindings` has 1..4096 records for checker/scanner kinds and is empty for the
+helper. Each record has exactly `argv,checker,executable,role`, is sorted by
+checker, and exactly repeats one `CheckerDecl`. Every reference is exactly one
+of: executable equals the interface label with zero matching input tokens, or
+executable differs and argv contains exactly one matching input token. Mixed or
+repeated references are schema errors. The binding set equals every declaration
+with either form and has no duplicate checker. A CheckerDecl may appear once in
+multiple interface records when it names each distinct interface exactly once.
+Thus one shared scanner/interpreter binds every explicit scanner-mode invocation
+without wrappers, and the Lane 14 domain checker can bind its own script plus
+the scanner. No interface record shares a label or locator. The union is the
+only forward-reference set. Existing paths do not discharge absent CLIs or
+failing tests.
+
+Discharge resolves exact bytes at the promotion commit, validates the bound
+input and all checker bindings, expands binding/self-test argv under the normal
+token rules, and requires the self-test to exit zero without privilege, containers,
+network, Cargo, or a lane body. Promotion removes the array, changes only
+`schema` to `p11scope-task4-contract-v1`, and preserves every other canonical
+value byte-for-byte. The envelope helper has no checker binding and must resolve
+before any runtime manifest promotes.
+
+A runtime lane contract has exactly these top-level keys:
+
+```text
+artifacts, checkers, driver, environment, inputs, lane, privacy_surfaces,
+replay_adapter, requested_mode, resources, schema
 ```
 
 `schema` is `p11scope-task4-contract-v1`; `lane` is one of
 `07|09|10|11|14|16`; `driver` references an input whose kind is `driver`.
+`requested_mode` is required: it is JSON null for lanes 07/09/10/11/14 and is
+exactly `never|auto` for Lane 16. The two Lane 16 contracts have the same lane
+but distinct requested modes.
 Arrays contain 0..4096 entries unless a tighter bound is stated and have
 exactly these fields:
 
@@ -113,7 +168,7 @@ PrivacySurfaceDecl: exclusions, scanner, target, target_kind
 The declaration vocabulary is closed:
 
 - input `kind` is
-  `driver|source|checker|adapter|interpreter|dependency|tool|configuration`;
+  `driver|source|checker|helper|adapter|interpreter|dependency|tool|configuration`;
   `origin` is `tracked|external-pinned|external-copied`; a tracked locator is a
   repository-relative path and an external locator is absolute. A replay-
   required checker, adapter, interpreter, script, or dependency always has a
@@ -180,6 +235,48 @@ Every non-file live surface, including live `START` map state, is first retained
 as a declared bounded artifact; there is no live-state-only privacy target.
 `quarantine-only` can occur only in a
 nonzero failed receipt and can never contribute to status zero or promotion.
+
+The shared scanner is `scripts/check-privacy-surfaces.py`, with exact CLI:
+
+```text
+check-privacy-surfaces.py --self-test
+check-privacy-surfaces.py json PATH...
+check-privacy-surfaces.py trace --exclude trace-pid-tid-positions PATH...
+check-privacy-surfaces.py map-json PATH...
+check-privacy-surfaces.py bytes PATH...
+check-privacy-surfaces.py workload-log PATH...
+check-privacy-surfaces.py checker-log PATH
+```
+
+Inputs are explicit files, never directories or globs. Normal modes return 0
+clean, 1 only for a forbidden value in well-formed input, 2 usage, and 3 for
+malformed input, I/O failure, or bound violation, with empty stdout and bounded stderr;
+`checker-log` accepts exactly one file and is silent. Every mode has a planted
+positive self-test. `map-json` scans source bytes plus bytes reconstructed from
+duplicate-free JSON of depth at most 6. Its root is either a bpftool entry array
+whose every entry has exactly `{key,value}` or `{key,values}`, or the exact
+positive-control object `{"value":[BYTE...]}`. `key` and scalar `value` are
+nonempty arrays of lowercase `0x[0-9a-f]{2}` strings. `values` is a nonempty
+list of exact `cpu,value` objects; CPU is unique, strictly increasing, and in
+0..1048575, and each value array is nonempty. Unknown/missing members or other
+shapes fail; an empty root array is valid for an empty map. Arrays decode in
+document order. Float, invalid source UTF-8, duplicate key, depth/bound overflow
+fail; reconstructed bytes have no UTF-8 constraint. The retained control uses ordinary
+`map-json`, must return 1, and is not a privacy surface.
+
+Lane 14's canary/privacy subset is the exact 194-row
+[crosswalk](../reports/2026-08-28-lane14-canary-surface-crosswalk.md): 191 scan
+targets, two input-only discovery manifests, and one must-detect positive
+control. It is not the entire Lane 14 artifact set; distribution, attach,
+protocol, release, and smoke artifacts are separate literal blueprint rows.
+The control artifact has privacy `none` and names the Lane 14 domain checker in
+`checker_roles`. That checker argv includes both its own script input and the
+shared scanner input, invokes `map-json` on the retained control, requires exact
+scanner result 1 with bounded diagnostics, and returns its ordinary zero only
+after that must-detect result. Result 0, 2, 3, signal, timeout, missing
+consumption, or any other result is non-pass. Mutation tests include both a
+well-formed sentinel-free control (scanner 0) and malformed control (scanner 3);
+no global expected-result field is added.
 
 Each resource-journal record is exactly one of:
 
@@ -252,11 +349,15 @@ bound. The declared and recorded artifact sets must be exactly equal.
 `receipt.json` has exactly these top-level keys:
 
 ```text
-checks, contract, environment, git, inputs, invocation, lane, lock, schema,
-times
+checks, contract, environment, git, inputs, invocation, lane, lock,
+requested_mode, schema, times
 ```
 
-`schema` is `p11scope-task4-receipt-v1`; `lane` equals the contract.
+`schema` is `p11scope-task4-receipt-v1`; `lane` equals the contract and
+`requested_mode` exactly equals the contract value. For Lane 16, the driver's
+sole mode token and the lane checker's sole mode literal equal that value; for
+other lanes no mode token is permitted. Contract/receipt/driver/checker mismatch
+is non-pass.
 `contract` contains exactly `path,sha256`. `invocation` contains exactly
 `argv,cwd,gid,uid`. `git` contains exactly
 `clean_end,clean_start,head,tracked_sha256,tree`, with both cleanliness values
@@ -470,61 +571,83 @@ both directories, and passes exactly `RENAME_NOREPLACE`.
 ### Implementation and test sequence
 
 1. After independent Sol, Terra, and Luna acceptance, make one docs-only
-   authority change containing exactly the accepted decision report, this
-   closure plan, the next-gates qualification, and ROADMAP amendment. Exclude
-   the rejected schema draft and unrelated OpenSSL report.
-2. Write and independently review all six canonical contracts, including every
-   literal artifact path, bound, checker role, privacy surface, resource class,
-   replay argv, and cardinality. Lane 14 must enumerate every allowlist-required
+   authority change containing exactly the accepted decision report, Lane 14
+   crosswalk, this closure plan, the next-gates qualification, and ROADMAP
+   amendment. Exclude the rejected schema draft and unrelated OpenSSL report.
+2. Write and independently review seven inventory-complete blueprints and the
+   Lane 14 crosswalk, including every literal artifact path, evidenced bound,
+   checker role, privacy surface, resource class/identity, replay argv, input,
+   environment value, and cardinality. Only exact `unresolved_interfaces`
+   records may refer forward. Lane 14 must separately enumerate every required
    profile, log, map, live `START`, trace, attach, discover, distribution,
-   protocol, and canary surface. Every trace artifact names a pinned structural
-   scanner and only `trace-pid-tid-positions` exclusions. No helper
-   implementation starts before this gate passes.
-3. Replace the current `Task4ObservedSession`, custom SHA-256, `facts-v1`
-   interpreter, FD-5 protocol, and lane-fact Rust assertions with a core test
-   `task4_receipt_envelope_contracts_core` plus six lane rows
-   `task4_receipt_envelope_contracts_lane07|09|10|11|14|16`. Core invokes the helper self-test and
-   validates all contracts. Each lane row invokes its real driver self-test;
-   Rust parses no lane facts. The first focused RED command is:
+   protocol, release, smoke, and canary surface. No helper implementation starts
+   before this gate passes.
+3. The sole `tests/artifact_contracts.rs` owner adds rootless blueprint rejection
+   and seven absent-interface RED rows, one per future manifest. The exact first
+   focused command is:
 
    ```sh
    cargo +1.88 test --locked --test artifact_contracts \
-     task4_receipt_envelope_contracts_core -- --nocapture
+     task4_contract_ -- --nocapture
    ```
 
-   It fails only because reviewed helper behavior is absent, never from fixture
-   setup or a real external command. All six lane rows are written now and each
-   remains independently RED on its missing driver integration.
-4. Implement the helper. Its real-process self-test covers at least: manifest
+   It fails only on the seven named absent checker/scanner interfaces; static
+   rows validate the blueprint key set and forward-reference bindings without
+   calling a helper. Stop the writer and review before any checker
+   implementation. The later helper core RED/GREEN proves blueprint schema
+   exits 77 before root creation.
+4. Sequential sole writers implement, self-test, stop, and receive independent
+   review for `check-privacy-surfaces.py`, then the Lane 07, 09, 10, 11, 14,
+   and 16 checker files. Before removing an inline predicate, a mutation test
+   names its sole replacement checker. Each writer runs its exact script with
+   `--self-test`, followed by exactly one Rust row from
+   `task4_contract_privacy`, `task4_contract_lane07`,
+   `task4_contract_lane09`, `task4_contract_lane10`,
+   `task4_contract_lane11`, `task4_contract_lane14`, and
+   `task4_contract_lane16`, using the same fixed Cargo prefix as step 3. The
+   aggregate `task4_contract_` filter becomes GREEN only after Lane 16 review.
+5. The sole Rust-test owner adds `task4_receipt_envelope_contracts_core` RED and
+   stops for review. The sole helper owner then implements the helper. Its real-
+   process self-test proves blueprint schema exits 77 before root creation and
+   covers at least: manifest
    A+B versus a zero checker using only A; unique and ambiguous
    create-before-resolve death; replay after original inputs/services disappear;
    copied-root replay; mutation of every authority class; unsafe roots;
    descriptor leaks; signal boundaries; cleanup/absence failure; early,
    duplicate, or replaced status; rename collision/unavailability; and
    post-publication mutation.
-5. Migrate Lane 07 first and independently review exact registration/replay;
-   migrate 09, 10, 11, 14, and 16 serially, replacing rather than layering
-   local receipts. Preserve every checker and retained lane-matrix predicate.
-6. Run helper/contract/driver self-tests, shell syntax checks, the focused Rust
+6. Re-review all blueprints against exact checker and helper bytes, require zero
+   unresolved records, and promote seven runtime contracts while changing only
+   the schema and removing `unresolved_interfaces`.
+7. Migrate Lane 07 first and independently review exact registration/replay;
+   migrate 09, 10, 11, all Lane 14 scripts as one group, and Lane 16 serially,
+   replacing rather than layering local receipts. Each cycle is lane RED,
+   minimal implementation, focused GREEN, writer stop, and independent review.
+   Ownership returns to the primary before touching any stopped writer's file.
+   Preserve every checker and retained lane-matrix predicate.
+8. Run helper/contract/driver self-tests, shell syntax checks, the focused Rust
    contract, then all four canonical Rust checks. Stop the writer and obtain
    independent lifecycle, provenance, privacy, and oracle review before runtime.
-7. Compatibility-check frozen Lane 02 without rerunning it. Do not amend or
+9. Compatibility-check frozen Lane 02 without rerunning it. Do not amend or
    rerun Lane 13 history. Run remaining lanes once in order: 07, 09, 10, 11,
    14, 16-never, 16-auto; stop at the first UNRUN/NON-PASS. Preserve downstream
    order: fresh r3; 9.2d with the existing Lane 02 and single Lane 13
    frozen-candidate negative-control positions; 9.3; 9.4 review; exact-tip CI;
    Task 10.
 
-Writer ownership is sequential: (1) six contracts only; (2)
-`tests/artifact_contracts.rs`; (3) `scripts/task4-receipt.py`; (4) Lane 07
-driver; (5) Lane 09 driver; (6) Lane 10 driver; (7) Lane 11 driver; (8) all
-Lane 14 scripts as one stopped-writer group; (9) Lane 16 driver. A reviewer
-starts only after its writer stops. The focused command above is RED before the
-helper and GREEN afterward. After each driver migration, run only its named lane
-row and require GREEN; the aggregate `task4_receipt_envelope_contracts` filter
-becomes GREEN only after Lane 16. Every self-test is rootless and trips any
-Cargo, Docker, sudo, systemd, BPF attach, network, or real lane-body command.
-Canonical Cargo checks remain serial.
+Writer ownership is sequential: (1) seven blueprints plus Lane 14 crosswalk;
+(2) `tests/artifact_contracts.rs` interface RED; (3) privacy scanner; (4-9) one
+lane checker each for 07, 09, 10, 11, 14, and 16; (10)
+`tests/artifact_contracts.rs` core RED; (11) `scripts/task4-receipt.py`; (12)
+blueprint promotion; (13-18) Lane 07, 09, 10, 11, all Lane 14 scripts as one
+group, then Lane 16.
+A reviewer starts only after its writer stops. Ownership returns to the primary
+at every stop, and later edits require a new explicit owner. After each driver
+migration, run only its named lane row and require GREEN; the aggregate
+`task4_receipt_envelope_contracts` filter becomes GREEN only after both Lane 16
+modes. Every self-test is rootless and trips any Cargo, Docker, sudo, systemd,
+BPF attach, network, or real lane-body command. Canonical Cargo checks remain
+serial.
 
 The frozen Lane 02 section and Lane 07/09/10/11/14/16 contract matrix below
 remain domain authority. The Lane 13 topology ruling remains unchanged.

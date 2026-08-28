@@ -14,6 +14,17 @@ class MutationError(RuntimeError):
     pass
 
 
+_MAX_OFFSET = 2**63 - 1
+
+
+@_dataclasses.dataclass(slots=True, eq=False)
+class _OpenDescription:
+    kind: str
+    access: str
+    offset: int | None
+    identity: object
+
+
 @_dataclasses.dataclass(frozen=True, slots=True)
 class InputRecord:
     seq: int
@@ -37,6 +48,79 @@ class _SemanticTraceState:
             }
         }
         self._pending = {}
+
+    def _fd_table(self, tid):
+        if type(tid) is not int or tid <= 0:
+            raise FormatError("invalid task")
+        task = self._task(tid)
+        fds = task["fds"]
+        if type(fds) is not dict:
+            raise FormatError("invalid FD table")
+        for fd, value in fds.items():
+            if (
+                type(fd) is not int
+                or fd < 0
+                or type(value) is not tuple
+                or len(value) != 2
+                or type(value[1]) is not bool
+            ):
+                raise FormatError("invalid FD table")
+        return fds
+
+    def _typed_description(self, description):
+        if type(description) is not _OpenDescription:
+            raise FormatError("unknown description")
+        try:
+            description.kind, description.access, description.offset, description.identity
+        except AttributeError as exc:
+            raise FormatError("invalid description") from exc
+        if type(description.kind) is not str or type(description.access) is not str:
+            raise FormatError("invalid description")
+        if description.kind == "regular":
+            if description.access not in {"read", "write", "read_write"}:
+                raise FormatError("invalid description")
+            if type(description.offset) is not int or not 0 <= description.offset <= _MAX_OFFSET:
+                raise FormatError("invalid description")
+            if description.identity is None:
+                raise FormatError("invalid description")
+        elif description.kind == "directory":
+            if description.access != "read" or description.offset is not None or description.identity is None:
+                raise FormatError("invalid description")
+        elif description.kind in {"pipe", "socketpair"}:
+            identity = description.identity
+            if (
+                description.offset is not None
+                or type(identity) is not tuple
+                or len(identity) != 2
+                or type(identity[0]) is not object
+                or type(identity[1]) is not int
+                or identity[1] not in (0, 1)
+            ):
+                raise FormatError("invalid description")
+            expected_access = "read_write" if description.kind == "socketpair" else ("read" if identity[1] == 0 else "write")
+            if description.access != expected_access:
+                raise FormatError("invalid description")
+        else:
+            raise FormatError("invalid description")
+        return description
+
+    def _validate_pair_peer(self, fds, description):
+        token, endpoint = description.identity
+        peer = None
+        for value in fds.values():
+            candidate = value[0]
+            if candidate is description:
+                continue
+            if type(candidate) is not _OpenDescription:
+                continue
+            candidate = self._typed_description(candidate)
+            if candidate.kind != description.kind or candidate.identity[0] is not token:
+                continue
+            if candidate.identity[1] == endpoint:
+                raise FormatError("invalid pair peer")
+            if peer is not None and peer is not candidate:
+                raise FormatError("ambiguous pair peer")
+            peer = candidate
 
     def begin_syscall(self, *, tid, operation):
         if type(tid) is not int or tid <= 0:
@@ -112,12 +196,7 @@ class _SemanticTraceState:
             other_tid != tid and other["tgid"] == tid for other_tid, other in self._tasks.items()
         ):
             raise FormatError("invalid exec task")
-        fds = task["fds"]
-        if type(fds) is not dict:
-            raise FormatError("invalid FD table")
-        for fd, value in fds.items():
-            if type(fd) is not int or fd < 0 or type(value) is not tuple or len(value) != 2 or type(value[1]) is not bool:
-                raise FormatError("invalid FD table")
+        fds = self._fd_table(tid)
         if type(mappings) is not dict:
             raise FormatError("invalid mapping table")
         ranges = []
@@ -149,20 +228,104 @@ class _SemanticTraceState:
         }
 
     def dup2(self, *, tid, source_fd, target_fd):
-        task = self._task(tid)
+        fds = self._fd_table(tid)
+        if (
+            type(source_fd) is not int
+            or source_fd < 0
+            or type(target_fd) is not int
+            or target_fd < 0
+        ):
+            raise FormatError("invalid FD")
         try:
-            source = task["fds"][source_fd]
+            source = fds[source_fd]
         except (KeyError, TypeError) as exc:
             raise FormatError("unknown source FD") from exc
         if source_fd != target_fd:
-            task["fds"][target_fd] = (source[0], False)
+            fds[target_fd] = (source[0], False)
 
     def close(self, *, tid, fd):
-        task = self._task(tid)
+        fds = self._fd_table(tid)
+        if type(fd) is not int or fd < 0:
+            raise FormatError("invalid FD")
         try:
-            del task["fds"][fd]
+            del fds[fd]
         except (KeyError, TypeError) as exc:
             raise FormatError("unknown FD") from exc
+
+    def install_open_fd(self, *, tid, fd, node, kind, access, cloexec):
+        fds = self._fd_table(tid)
+        if type(fd) is not int or fd < 0 or fd in fds:
+            raise FormatError("invalid target FD")
+        if type(kind) is not str or type(access) is not str or type(cloexec) is not bool:
+            raise FormatError("invalid open description")
+        if node is None:
+            raise FormatError("invalid open node")
+        if kind == "regular":
+            if access not in {"read", "write", "read_write"}:
+                raise FormatError("invalid open description")
+            description = _OpenDescription(kind, access, 0, node)
+        elif kind == "directory":
+            if access != "read":
+                raise FormatError("invalid open description")
+            description = _OpenDescription(kind, access, None, node)
+        else:
+            raise FormatError("invalid open description")
+        fds[fd] = (description, cloexec)
+
+    def install_local_pair(self, *, tid, first_fd, second_fd, kind, cloexec):
+        fds = self._fd_table(tid)
+        if (
+            type(first_fd) is not int
+            or first_fd < 0
+            or type(second_fd) is not int
+            or second_fd < 0
+            or first_fd == second_fd
+            or first_fd in fds
+            or second_fd in fds
+        ):
+            raise FormatError("invalid pair FD")
+        if type(kind) is not str or kind not in {"pipe", "socketpair"} or type(cloexec) is not bool:
+            raise FormatError("invalid local pair")
+        token = object()
+        access = "read_write" if kind == "socketpair" else None
+        first_access = access or "read"
+        second_access = access or "write"
+        fds.update(
+            {
+                first_fd: (_OpenDescription(kind, first_access, None, (token, 0)), cloexec),
+                second_fd: (_OpenDescription(kind, second_access, None, (token, 1)), cloexec),
+            }
+        )
+
+    def apply_io_offset(self, *, tid, fd, direction, count, position):
+        fds = self._fd_table(tid)
+        if type(fd) is not int or fd < 0:
+            raise FormatError("invalid FD")
+        if type(direction) is not str or direction not in {"read", "write"}:
+            raise FormatError("invalid I/O direction")
+        if type(count) is not int or not 0 <= count <= _MAX_OFFSET:
+            raise FormatError("invalid I/O count")
+        if position is not None and (type(position) is not int or not 0 <= position <= _MAX_OFFSET):
+            raise FormatError("invalid I/O position")
+        try:
+            description = self._typed_description(fds[fd][0])
+        except KeyError as exc:
+            raise FormatError("unknown FD") from exc
+        if description.kind == "directory":
+            raise FormatError("directory I/O unsupported")
+        if description.access != "read_write" and direction != description.access:
+            raise FormatError("I/O access mismatch")
+        if description.kind in {"pipe", "socketpair"}:
+            if position is not None:
+                raise FormatError("positional pair I/O")
+            self._validate_pair_peer(fds, description)
+            return
+        if position is None:
+            if count > _MAX_OFFSET - description.offset:
+                raise FormatError("I/O offset overflow")
+            description.offset += count
+        elif count > _MAX_OFFSET - position:
+            raise FormatError("I/O position overflow")
 
     def set_cwd(self, *, tid, node):
         self._task(tid)["fs"]["cwd"] = node

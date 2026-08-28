@@ -97,7 +97,14 @@ starting at zero.
   each at most 64 MiB; `verdict` and `status` are at most four bytes; and
   `seal.sha256` is at most 16 MiB.
 
-Before checker implementation, seven non-executable inventory blueprints live
+`ArtifactDecl.max_bytes` is a reviewed design-selected fail-closed ceiling
+justified from the artifact's structural or operational worst case. It is
+enforced by the later producer before registration and by helper acquisition
+and finalization. It is not historical output evidence and cannot simply copy
+the 4-GiB schema maximum. Exceeding it is non-pass; observed output never
+silently raises authority.
+
+Before checker implementation, seven non-executable design blueprints live
 only beneath `docs/superpowers/contracts/task4/`. A blueprint has the exact
 runtime-contract keys below plus `unresolved_interfaces`; `schema` is
 `p11scope-task4-contract-blueprint-v1`. The helper rejects this schema with exit
@@ -131,6 +138,17 @@ the scanner. No interface record shares a label or locator. The union is the
 only forward-reference set. Existing paths do not discharge absent CLIs or
 failing tests.
 
+Blueprint `bindings`, `executable`, and `self_test` are normative interface
+signatures, not existence or success evidence. The blueprint-authoring gate performs no locator existence
+or execution check. Input labels are exactly `interpreter.python3`,
+`checker.lane07|lane09|lane10|lane11|lane14|lane16`, `checker.privacy`, and
+`helper.receipt`. Every Python self-test uses executable
+`interpreter.python3`, then the checker/helper input token and literal
+`--self-test`; normal checker bindings begin with the script input followed by
+their declared literal/artifact/common tokens. The initial artifact-contract
+interface rows intentionally remain RED on the seven absent checker/scanner
+locators; helper absence belongs to the later envelope-core RED.
+
 Discharge resolves exact bytes at the promotion commit, validates the bound
 input and all checker bindings, expands binding/self-test argv under the normal
 token rules, and requires the self-test to exit zero without privilege, containers,
@@ -138,6 +156,16 @@ network, Cargo, or a lane body. Promotion removes the array, changes only
 `schema` to `p11scope-task4-contract-v1`, and preserves every other canonical
 value byte-for-byte. The envelope helper has no checker binding and must resolve
 before any runtime manifest promotes.
+
+Design completion fixes literal artifact paths, planned input roles, resource
+labels/classes/identity schemes, checker roles, privacy surfaces, bounds, and
+cardinalities as future acceptance requirements. It does not claim current
+drivers already emit them. Exact input bytes and runtime identities—hashes,
+dev/inode, process generations, BPF/container/image IDs—are later interface or
+receipt evidence. Current `$WORK`, glob, first-match, basename, stdout
+substitution, and directory-order behavior is migration evidence only. If an
+implementation needs an undeclared dependency or resource, it stops for a
+blueprint amendment and independent review before consuming it.
 
 A runtime lane contract has exactly these top-level keys:
 
@@ -574,10 +602,11 @@ both directories, and passes exactly `RENAME_NOREPLACE`.
    authority change containing exactly the accepted decision report, Lane 14
    crosswalk, this closure plan, the next-gates qualification, and ROADMAP
    amendment. Exclude the rejected schema draft and unrelated OpenSSL report.
-2. Write and independently review seven inventory-complete blueprints and the
-   Lane 14 crosswalk, including every literal artifact path, evidenced bound,
-   checker role, privacy surface, resource class/identity, replay argv, input,
-   environment value, and cardinality. Only exact `unresolved_interfaces`
+2. Select, write, and independently review seven design-complete blueprints and
+   the Lane 14 crosswalk, including every literal artifact path, justified
+   design bound with its future producer/helper enforcement point, checker role,
+   privacy surface, resource class/identity scheme, normative replay argv,
+   planned input/environment declaration, and cardinality. Only exact `unresolved_interfaces`
    records may refer forward. Lane 14 must separately enumerate every required
    profile, log, map, live `START`, trace, attach, discover, distribution,
    protocol, release, smoke, and canary surface. No helper implementation starts
@@ -617,14 +646,17 @@ both directories, and passes exactly `RENAME_NOREPLACE`.
    duplicate, or replaced status; rename collision/unavailability; and
    post-publication mutation.
 6. Re-review all blueprints against exact checker and helper bytes, require zero
-   unresolved records, and promote seven runtime contracts while changing only
-   the schema and removing `unresolved_interfaces`.
+   unresolved records, and promote seven interface-complete runtime contracts
+   while changing only the schema and removing `unresolved_interfaces`.
+   Promotion is not lane acceptance.
 7. Migrate Lane 07 first and independently review exact registration/replay;
    migrate 09, 10, 11, all Lane 14 scripts as one group, and Lane 16 serially,
    replacing rather than layering local receipts. Each cycle is lane RED,
    minimal implementation, focused GREEN, writer stop, and independent review.
    Ownership returns to the primary before touching any stopped writer's file.
-   Preserve every checker and retained lane-matrix predicate.
+   Preserve every checker and retained lane-matrix predicate. A lane becomes
+   executable only after its migrated driver passes exact registration, replay,
+   cleanup, privacy, and terminal-publication checks.
 8. Run helper/contract/driver self-tests, shell syntax checks, the focused Rust
    contract, then all four canonical Rust checks. Stop the writer and obtain
    independent lifecycle, provenance, privacy, and oracle review before runtime.
@@ -1697,7 +1729,21 @@ $ROOT/work/isolation-policy.json
 
 Its exact derived report-record cache is
 `$ROOT/work/.isolation-state.json.report-records`. Retain validated snapshots,
-then remove only those three private objects proven to have been created by this
+using exact regular-file paths `artifacts/oracle/isolation-state.json` and
+`artifacts/oracle/isolation-policy.json`; the sibling default policy name
+remains exactly `.pkcs11-check-isolation-policy.json`. Declare the live cache
+directory as a `directory/dev-ino` resource, not an artifact. Retain every raw
+shard byte as the lossless serialization
+`artifacts/oracle/report-records.jsonl`: reject symlinks, special files, and
+unexpected entries; require each accepted entry to be a private regular file;
+canonicalize its cache-relative path without `.` or `..`; open it relative to
+the validated cache directory; and concatenate the complete set in bytewise
+full cache-relative-path order. Retain
+`artifacts/oracle/report-records-inventory.json` containing each canonical
+cache-relative path, dev/inode/mode/nlink, SHA-256, size, and contiguous,
+non-overlapping start/end offsets. This pair preserves every accepted shard and
+its exact boundary; it is not a selected or derived substitute. Then remove
+only those three private objects proven to have been created by this
 invocation, after regular-file/directory/dev/inode/owner validation; require all
 private and both sibling defaults absent at finalization. Any sibling, venv,
 package, state, policy, cache, tracked, or untracked ledger mutation invalidates

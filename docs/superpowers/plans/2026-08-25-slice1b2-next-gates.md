@@ -111,8 +111,13 @@ cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings
 **Receipt qualification (2026-08-28):** Remaining Task 4 evidence is accepted
 only through the independently reviewed sealed-envelope contract in
 `2026-08-27-task4-receipt-closure.md`, as amended by the accepted architecture
-decision. The already frozen Lane 02 evidence is compatibility-checked and is
-not rerun in Task 4. Lane 13 history remains unamended and is not rerun here.
+decision and the independently accepted contract-closure decision.
+Inventory blueprints are
+non-executable; seven runtime contracts exist only after every checker and
+helper interface resolves and the reviewed promotion changes only schema/removes the
+forward-reference array. The already frozen Lane 02 evidence is compatibility-
+checked and is not rerun in Task 4. Lane 13 history remains unamended and is not
+rerun here.
 The remaining order is 07, 09, 10, 11, 14, 16-never, 16-auto. This
 qualification changes no product Rust/BPF, public schema, privacy allowlist,
 lane oracle, r3, 9.2d, 9.3, 9.4, CI, or Task 10 order.

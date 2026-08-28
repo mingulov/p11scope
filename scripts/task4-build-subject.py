@@ -25,6 +25,88 @@ class InputRecord:
     sha256: str | None
     locator: str
 
+
+class _SemanticTraceState:
+    def __init__(self, *, root_tid, cwd, root, umask, fds):
+        self._tasks = {
+            root_tid: {
+                "tgid": root_tid,
+                "fds": dict(fds),
+                "fs": {"cwd": cwd, "root": root, "umask": umask},
+                "maps": {},
+            }
+        }
+
+    def _task(self, tid):
+        try:
+            return self._tasks[tid]
+        except (KeyError, TypeError) as exc:
+            raise FormatError("unknown task") from exc
+
+    def spawn(self, *, parent_tid, child_tid, share_files, share_fs, share_vm, thread_group):
+        parent = self._task(parent_tid)
+        try:
+            if child_tid in self._tasks:
+                raise FormatError("duplicate task")
+        except TypeError as exc:
+            raise FormatError("invalid child task") from exc
+        child = {
+            "tgid": parent["tgid"] if thread_group else child_tid,
+            "fds": parent["fds"] if share_files else dict(parent["fds"]),
+            "fs": parent["fs"] if share_fs else dict(parent["fs"]),
+            "maps": parent["maps"] if share_vm else dict(parent["maps"]),
+        }
+        self._tasks[child_tid] = child
+
+    def dup2(self, *, tid, source_fd, target_fd):
+        task = self._task(tid)
+        try:
+            source = task["fds"][source_fd]
+        except (KeyError, TypeError) as exc:
+            raise FormatError("unknown source FD") from exc
+        if source_fd != target_fd:
+            task["fds"][target_fd] = (source[0], False)
+
+    def close(self, *, tid, fd):
+        task = self._task(tid)
+        try:
+            del task["fds"][fd]
+        except (KeyError, TypeError) as exc:
+            raise FormatError("unknown FD") from exc
+
+    def set_cwd(self, *, tid, node):
+        self._task(tid)["fs"]["cwd"] = node
+
+    def set_umask(self, *, tid, value):
+        task = self._task(tid)
+        if type(value) is not int or not 0 <= value <= 0o777:
+            raise FormatError("invalid umask")
+        task["fs"]["umask"] = value
+
+    def map_file(self, *, tid, start, length, node, offset, prot, shared):
+        task = self._task(tid)
+        if length <= 0 or start < 0 or offset < 0:
+            raise FormatError("invalid mapping range")
+        end = start + length
+        for existing_start, existing in task["maps"].items():
+            existing_end = existing_start + existing[0]
+            if start < existing_end and existing_start < end:
+                raise FormatError("overlapping mapping")
+        task["maps"][start] = (length, node, offset, prot, shared)
+
+    def snapshot(self, *, tid):
+        task = self._task(tid)
+        fs = task["fs"]
+        return {
+            "tgid": task["tgid"],
+            "fds": dict(task["fds"]),
+            "cwd": fs["cwd"],
+            "root": fs["root"],
+            "umask": fs["umask"],
+            "maps": dict(task["maps"]),
+        }
+
+
 _REGULAR = {
     "repo",
     "vendor",

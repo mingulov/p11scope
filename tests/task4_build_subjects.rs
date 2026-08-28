@@ -5991,7 +5991,7 @@ def success_state():
         thread_group=False,
     )
     state.spawn(
-        parent_tid=100,
+        parent_tid=root_tid,
         child_tid=102,
         share_files=False,
         share_fs=False,
@@ -6480,5 +6480,478 @@ print("bs2b-semantic-exec-event-ok")
     assert_eq!(
         output.stdout, b"bs2b-semantic-exec-event-ok\n",
         "BS2b semantic exec-event driver did not complete"
+    );
+}
+
+#[test]
+fn semantic_trace_v1_private_syscall_lifecycle_contracts() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = repo.join("scripts/task4-build-subject.py");
+    let driver = r#"
+import copy
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("task4_build_subject", sys.argv[1])
+if spec is None or spec.loader is None:
+    raise SystemExit("could not import task4 build-subject script")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+
+class IntSubclass(int):
+    pass
+
+
+class StringSubclass(str):
+    pass
+
+
+class TupleSubclass(tuple):
+    pass
+
+
+PRODUCT_CATEGORIES = (
+    "path",
+    "fd",
+    "mapping",
+    "data",
+    "lifecycle",
+    "cwd_root",
+    "exec",
+    "mutation",
+)
+ALL_CATEGORIES = ("pure",) + PRODUCT_CATEGORIES
+BASE_ARGS = (1, 2, 3, 4, 5, 6)
+MAX_U64 = 2**64 - 1
+
+
+def operation(category, name="C_Test", args=BASE_ARGS):
+    return (name, category, args)
+
+
+def new_state(root_tid=100):
+    state = module._SemanticTraceState(
+        root_tid=root_tid,
+        cwd="initial-cwd",
+        root="initial-root",
+        umask=0o022,
+        fds={
+            3: ("shared-description", False),
+            4: ("closing-description", True),
+        },
+    )
+    state.map_file(
+        tid=root_tid,
+        start=0x1000,
+        length=0x1000,
+        node="initial-node",
+        offset=0,
+        prot="r",
+        shared=False,
+    )
+    state.spawn(
+        parent_tid=root_tid,
+        child_tid=101,
+        share_files=True,
+        share_fs=True,
+        share_vm=True,
+        thread_group=False,
+    )
+    state.spawn(
+        parent_tid=root_tid,
+        child_tid=102,
+        share_files=False,
+        share_fs=False,
+        share_vm=False,
+        thread_group=False,
+    )
+    snapshots = {tid: state.snapshot(tid=tid) for tid in (root_tid, 101, 102)}
+    if snapshots[root_tid]["tgid"] != root_tid or snapshots[101]["tgid"] != 101:
+        raise SystemExit("peer must have a different TGID")
+    if snapshots[102]["tgid"] != 102:
+        raise SystemExit("copied peer must have its own TGID")
+    if snapshots[root_tid] != snapshots[101] | {"tgid": root_tid}:
+        raise SystemExit("shared peer fixture changed the root topology")
+    return state
+
+
+def begin_pair(state, root_category="pure", peer_category="pure", root_tid=100):
+    root_operation = operation(root_category, "C_Root")
+    peer_operation = operation(peer_category, "C_Peer")
+    if state.begin_syscall(tid=root_tid, operation=root_operation) is not None:
+        raise SystemExit("begin_syscall returned a non-None result")
+    if state.begin_syscall(tid=101, operation=peer_operation) is not None:
+        raise SystemExit("independent begin_syscall returned a non-None result")
+    if state._pending[root_tid] is not root_operation:
+        raise SystemExit("root pending tuple identity was not retained")
+    if state._pending[101] is not peer_operation:
+        raise SystemExit("peer pending tuple identity was not retained")
+    return root_operation, peer_operation
+
+
+def pending_refs(state):
+    return {tid: state._pending[tid] for tid in state._pending}
+
+
+def assert_pending(label, state, refs):
+    if set(state._pending) != set(refs):
+        raise SystemExit(f"{label}: pending TID set changed")
+    for tid, expected in refs.items():
+        if state._pending[tid] is not expected:
+            raise SystemExit(f"{label}: pending tuple identity changed for TID {tid}")
+
+
+def topology(state, root_tid=100):
+    return {tid: copy.deepcopy(state.snapshot(tid=tid)) for tid in (root_tid, 101, 102)}
+
+
+def prove_shared_aliases(label, state, root_tid=100):
+    copied_before = copy.deepcopy(state.snapshot(tid=102))
+    state.dup2(tid=root_tid, source_fd=3, target_fd=8)
+    if state.snapshot(tid=101)["fds"].get(8) != ("shared-description", False):
+        raise SystemExit(f"{label}: FD alias was not shared after rejection")
+    if 8 in state.snapshot(tid=102)["fds"]:
+        raise SystemExit(f"{label}: copied FD table changed after rejection")
+    state.set_cwd(tid=root_tid, node=f"{label}-cwd")
+    if state.snapshot(tid=101)["cwd"] != f"{label}-cwd":
+        raise SystemExit(f"{label}: FS alias was not shared after rejection")
+    if state.snapshot(tid=102)["cwd"] != copied_before["cwd"]:
+        raise SystemExit(f"{label}: copied FS context changed after rejection")
+    state.map_file(
+        tid=root_tid,
+        start=0x2000,
+        length=1,
+        node=f"{label}-node",
+        offset=0,
+        prot=f"{label}-protection",
+        shared=False,
+    )
+    if 0x2000 not in state.snapshot(tid=101)["maps"]:
+        raise SystemExit(f"{label}: VM alias was not shared after rejection")
+    if 0x2000 in state.snapshot(tid=102)["maps"]:
+        raise SystemExit(f"{label}: copied VM table changed after rejection")
+
+
+def expect_rejected_state(label, state, invoke, refs=None, root_tid=100):
+    if refs is None:
+        refs = pending_refs(state)
+    before = topology(state, root_tid)
+    try:
+        invoke()
+    except BaseException as exc:
+        if type(exc) is not module.FormatError:
+            raise SystemExit(
+                f"{label}: expected FormatError, got {type(exc).__name__}: {exc}"
+            ) from exc
+    else:
+        raise SystemExit(f"{label}: accepted invalid lifecycle call")
+    if topology(state, root_tid) != before:
+        raise SystemExit(f"{label}: rejected lifecycle call changed topology")
+    assert_pending(label, state, refs)
+    prove_shared_aliases(label, state, root_tid)
+
+
+def expect_rejected(
+    label,
+    invoke,
+    root_category="pure",
+    peer_category="pure",
+    root_tid=100,
+):
+    state = new_state(root_tid)
+    begin_pair(state, root_category, peer_category, root_tid)
+    expect_rejected_state(label, state, lambda: invoke(state), root_tid=root_tid)
+
+
+def expect_rejected_begin_tid(label, tid, root_tid=100):
+    state = new_state(root_tid)
+    peer_operation = operation("pure", "C_Peer")
+    if state.begin_syscall(tid=101, operation=peer_operation) is not None:
+        raise SystemExit(f"{label}: peer begin returned a non-None result")
+    expect_rejected_state(
+        label,
+        state,
+        lambda: state.begin_syscall(tid=tid, operation=operation("pure")),
+        {101: peer_operation},
+        root_tid,
+    )
+
+
+def expect_rejected_finish_tid(label, tid, root_tid=100):
+    state = new_state(root_tid)
+    root_operation, peer_operation = begin_pair(state, root_tid=root_tid)
+    expect_rejected_state(
+        label,
+        state,
+        lambda: state.finish_syscall(tid=tid, outcome="success"),
+        {root_tid: root_operation, 101: peer_operation},
+        root_tid,
+    )
+
+
+for label, tid in (
+    ("unknown TID", 999),
+    ("boolean false TID", False),
+    ("string TID", "100"),
+    ("StringSubclass TID", StringSubclass("100")),
+    ("None TID", None),
+    ("zero TID", 0),
+    ("negative TID", -1),
+):
+    expect_rejected(
+        label,
+        lambda state, tid=tid: state.begin_syscall(
+            tid=tid,
+            operation=operation("pure"),
+        ),
+    )
+
+expect_rejected_begin_tid("boolean true TID", True, root_tid=1)
+expect_rejected_begin_tid("float TID", 100.0)
+expect_rejected_begin_tid("IntSubclass TID", IntSubclass(100))
+
+for label, tid in (
+    ("orphan unknown finish TID", 999),
+    ("orphan boolean false finish TID", False),
+    ("orphan string finish TID", "100"),
+    ("orphan StringSubclass finish TID", StringSubclass("100")),
+    ("orphan None finish TID", None),
+    ("orphan zero finish TID", 0),
+    ("orphan negative finish TID", -1),
+):
+    expect_rejected_finish_tid(label, tid)
+expect_rejected_finish_tid("orphan boolean true finish TID", True, root_tid=1)
+expect_rejected_finish_tid("orphan float finish TID", 100.0)
+expect_rejected_finish_tid("orphan IntSubclass finish TID", IntSubclass(100))
+
+
+for label, bad_operation in (
+    ("operation list", []),
+    ("operation None", None),
+    ("operation tuple subclass", TupleSubclass(operation("pure"))),
+    ("operation two-item tuple", ("C_Test", "pure")),
+    ("operation four-item tuple", ("C_Test", "pure", BASE_ARGS, "extra")),
+):
+    expect_rejected(
+        label,
+        lambda state, bad_operation=bad_operation: state.begin_syscall(
+            tid=102,
+            operation=bad_operation,
+        ),
+    )
+
+
+for label, bad_name in (
+    ("empty name", ""),
+    ("None name", None),
+    ("bytes name", b"C_Test"),
+    ("StringSubclass name", StringSubclass("C_Test")),
+):
+    expect_rejected(
+        label,
+        lambda state, bad_name=bad_name: state.begin_syscall(
+            tid=102,
+            operation=operation("pure", name=bad_name),
+        ),
+    )
+
+
+for label, bad_category in (
+    ("unknown category", "unknown"),
+    ("None category", None),
+    ("bytes category", b"pure"),
+    ("StringSubclass category", StringSubclass("pure")),
+):
+    expect_rejected(
+        label,
+        lambda state, bad_category=bad_category: state.begin_syscall(
+            tid=102,
+            operation=operation(bad_category),
+        ),
+    )
+
+
+for label, bad_arguments in (
+    ("arguments list", []),
+    ("arguments None", None),
+    ("arguments tuple subclass", TupleSubclass(BASE_ARGS)),
+    ("five arguments", BASE_ARGS[:5]),
+    ("seven arguments", BASE_ARGS + (7,)),
+):
+    expect_rejected(
+        label,
+        lambda state, bad_arguments=bad_arguments: state.begin_syscall(
+            tid=102,
+            operation=operation("pure", args=bad_arguments),
+        ),
+    )
+
+
+for label, bad_value in (
+    ("boolean argument", True),
+    ("float argument", 1.0),
+    ("IntSubclass argument", IntSubclass(1)),
+    ("string argument", "1"),
+    ("None argument", None),
+    ("negative argument", -1),
+    ("u64 overflow argument", 2**64),
+):
+    for position in range(6):
+        args = list(BASE_ARGS)
+        args[position] = bad_value
+        expect_rejected(
+            f"{label} at position {position}",
+            lambda state, args=tuple(args): state.begin_syscall(
+                tid=102,
+                operation=operation("pure", args=args),
+            ),
+        )
+
+
+for boundary in (0, MAX_U64):
+    for position in range(6):
+        args = list(BASE_ARGS)
+        args[position] = boundary
+        state = new_state()
+        candidate = operation("pure", args=tuple(args))
+        if state.begin_syscall(tid=100, operation=candidate) is not None:
+            raise SystemExit("valid boundary begin returned a non-None result")
+        if state._pending[100] is not candidate:
+            raise SystemExit("valid boundary tuple identity was not retained")
+        if state.finish_syscall(tid=100, outcome="success") is not None:
+            raise SystemExit("valid boundary finish returned a non-None result")
+        if 100 in state._pending:
+            raise SystemExit("valid boundary pure finish did not clear pending")
+
+
+state = new_state()
+root_operation, peer_operation = begin_pair(state)
+expect_rejected_state(
+    "duplicate begin",
+    state,
+    lambda: state.begin_syscall(
+        tid=100,
+        operation=operation("pure", name="C_Replacement"),
+    ),
+    {100: root_operation, 101: peer_operation},
+)
+
+
+for category in ALL_CATEGORIES:
+    state = new_state()
+    root_operation, peer_operation = begin_pair(state, category, category)
+    before = topology(state)
+    if state.finish_syscall(tid=100, outcome="restart") is not None:
+        raise SystemExit(f"{category}: restart returned a non-None result")
+    if topology(state) != before:
+        raise SystemExit(f"{category}: restart changed topology")
+    assert_pending(
+        f"{category}: restart",
+        state,
+        {100: root_operation, 101: peer_operation},
+    )
+    prove_shared_aliases(f"{category}: restart", state)
+    assert_pending(
+        f"{category}: restart after alias probe",
+        state,
+        {100: root_operation, 101: peer_operation},
+    )
+    if state.finish_syscall(tid=101, outcome="restart") is not None:
+        raise SystemExit(f"{category}: peer restart returned a non-None result")
+    assert_pending(f"{category}: peer restart", state, {100: root_operation, 101: peer_operation})
+
+
+for outcome in ("success", "failure"):
+    state = new_state()
+    root_operation, peer_operation = begin_pair(state, "pure", "pure")
+    before = topology(state)
+    if state.finish_syscall(tid=100, outcome=outcome) is not None:
+        raise SystemExit(f"pure {outcome}: finish returned a non-None result")
+    if 100 in state._pending or state._pending.get(101) is not peer_operation:
+        raise SystemExit(f"pure {outcome}: cleared the wrong pending tuple")
+    if topology(state) != before:
+        raise SystemExit(f"pure {outcome}: changed topology")
+    prove_shared_aliases(f"pure {outcome}", state)
+    assert_pending(
+        f"pure {outcome}: after alias probe",
+        state,
+        {101: peer_operation},
+    )
+    if state.finish_syscall(tid=101, outcome=outcome) is not None:
+        raise SystemExit(f"peer pure {outcome}: finish returned a non-None result")
+    if state._pending:
+        raise SystemExit(f"pure {outcome}: did not clear the matching tuple")
+
+
+for category in PRODUCT_CATEGORIES:
+    for outcome in ("success", "failure"):
+        state = new_state()
+        root_operation, peer_operation = begin_pair(state, category, category)
+        expect_rejected_state(
+            f"{category} {outcome}",
+            state,
+            lambda outcome=outcome: state.finish_syscall(tid=100, outcome=outcome),
+            {100: root_operation, 101: peer_operation},
+        )
+
+
+for label, outcome in (
+    ("unknown outcome", "unknown"),
+    ("None outcome", None),
+    ("StringSubclass outcome", StringSubclass("success")),
+):
+    expect_rejected(
+        label,
+        lambda state, outcome=outcome: state.finish_syscall(
+            tid=100,
+            outcome=outcome,
+        ),
+    )
+
+
+state = new_state()
+root_operation, peer_operation = begin_pair(state)
+expect_rejected_state(
+    "orphan finish",
+    state,
+    lambda: state.finish_syscall(tid=102, outcome="success"),
+    {100: root_operation, 101: peer_operation},
+)
+
+state = new_state()
+root_operation, peer_operation = begin_pair(state)
+if state.finish_syscall(tid=100, outcome="success") is not None:
+    raise SystemExit("initial finish before duplicate check returned a result")
+expect_rejected_state(
+    "duplicate finish",
+    state,
+    lambda: state.finish_syscall(tid=100, outcome="success"),
+    {101: peer_operation},
+)
+
+print("bs2b-semantic-syscall-lifecycle-ok")
+"#;
+    let output = Command::new("/usr/bin/python3")
+        .args(["-c", driver, script.to_str().expect("script path is UTF-8")])
+        .current_dir(repo)
+        .env_clear()
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("run BS2b semantic syscall lifecycle contract");
+    assert!(
+        output.status.success(),
+        "BS2b semantic syscall lifecycle contract failed:\nstdout={:?}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "BS2b semantic syscall lifecycle driver wrote to stderr"
+    );
+    assert_eq!(
+        output.stdout, b"bs2b-semantic-syscall-lifecycle-ok\n",
+        "BS2b semantic syscall lifecycle driver did not complete"
     );
 }

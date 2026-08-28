@@ -3485,3 +3485,544 @@ print("bs2a-reset-red-ok")
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn discover_input_v1_candidate_only_rejects_final_review_gaps() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = repo.join("scripts/task4-build-subject.py");
+    let driver = r##"
+import hashlib
+import importlib.util
+import os
+import stat
+import sys
+import tempfile
+
+spec = importlib.util.spec_from_file_location("task4_build_subject", sys.argv[1])
+if spec is None or spec.loader is None:
+    raise SystemExit("could not import task4 build-subject script")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+labels = [
+    "alias-map-direct-read",
+    "alias-read-direct-exec",
+    "odirectory-regular",
+    "getdents-nonreadable-directory",
+    "mmap-directory",
+    "trace-separator-fs",
+    "trace-separator-gs",
+    "trace-separator-rs",
+    "trace-separator-us",
+    "read-malformed-escape",
+    "read-raw-control",
+    "read-empty-payload",
+    "read-valid-escape-control",
+    "write-malformed-escape",
+    "write-raw-control",
+    "write-empty-payload",
+    "write-valid-escape-control",
+    "surrogate-encoder",
+    "surrogate-root",
+    "surrogate-vendor",
+    "open-create-mode",
+    "openat-create-mode",
+    "openat2-create-mode",
+    "open-create-missing-mode",
+    "openat-create-missing-mode",
+    "openat2-create-missing-mode",
+    "open-no-create-mode",
+    "openat-no-create-mode",
+    "openat2-no-create-mode",
+    "external-post-s2-full-identity",
+]
+failures = {label: [] for label in labels}
+deferred = {"external-post-s2-full-identity": "formal-review-only: no deterministic public seam without ptrace"}
+
+
+def failure(label, reason):
+    failures[label].append(reason)
+
+
+def tree(root):
+    entries = []
+
+    def visit(path):
+        value = os.lstat(path)
+        mode = stat.S_IMODE(value.st_mode)
+        if stat.S_ISDIR(value.st_mode):
+            kind, content = "directory", None
+        elif stat.S_ISREG(value.st_mode):
+            kind, content = "regular", open(path, "rb").read()
+        elif stat.S_ISLNK(value.st_mode):
+            kind, content = "symlink", os.fsencode(os.readlink(path))
+        else:
+            kind, content = "other", None
+        entries.append((
+            os.fsencode(os.path.relpath(path, root)),
+            kind,
+            mode,
+            value.st_dev,
+            value.st_ino,
+            value.st_uid,
+            value.st_gid,
+            value.st_nlink,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+            content,
+        ))
+        if kind == "directory":
+            for child in sorted(os.scandir(path), key=lambda entry: os.fsencode(entry.name)):
+                visit(child.path)
+
+    visit(root)
+    return tuple(entries)
+
+
+def fixture(root):
+    os.chmod(root, 0o700)
+    repo = os.path.join(root, "repo")
+    vendor = os.path.join(repo, "vendor")
+    build = os.path.join(root, "build")
+    stable = os.path.join(root, "stable")
+    nightly = os.path.join(root, "nightly")
+    for path in (repo, vendor, build, stable, nightly):
+        os.mkdir(path)
+        os.chmod(path, 0o700 if path == build else 0o755)
+    directory = os.path.join(repo, "directory")
+    os.mkdir(directory)
+    os.chmod(directory, 0o755)
+
+    def write(path, data, mode=0o644):
+        with open(path, "wb") as handle:
+            handle.write(data)
+        os.chmod(path, mode)
+
+    write(os.path.join(repo, "input"), b"data")
+    write(os.path.join(directory, "entry"), b"entry")
+    dynamic = os.path.join(root, "dynamic")
+    tool = os.path.join(root, "tool")
+    write(dynamic, b"data")
+    write(tool, b"data", 0o755)
+    write(os.path.join(stable, "stable"), b"data")
+    write(os.path.join(nightly, "nightly"), b"data")
+    return {
+        "root": root,
+        "repo": repo,
+        "vendor": vendor,
+        "build": build,
+        "stable": stable,
+        "nightly": nightly,
+        "directory": directory,
+        "input": os.path.join(repo, "input"),
+        "dynamic": dynamic,
+        "tool": tool,
+    }
+
+
+def values(paths, **overrides):
+    result = dict(
+        root_pid=100,
+        initial_cwd=paths["repo"],
+        repo_root=paths["repo"],
+        vendor_relative="vendor",
+        build_root=paths["build"],
+        stable_sysroot_root=paths["stable"],
+        nightly_sysroot_root=paths["nightly"],
+    )
+    result.update(overrides)
+    return result
+
+
+def discover(paths, trace, **overrides):
+    return module.discover_input_v1(trace, **values(paths, **overrides))
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def locator(path, namespace):
+    if namespace == "external":
+        return f"external:{path}"
+    return f"{namespace}:/{os.path.basename(path)}"
+
+
+def regular_row(path, klass, access, namespace):
+    value = os.stat(path, follow_symlinks=False)
+    data = open(path, "rb").read()
+    return (klass, access, "present", f"{stat.S_IMODE(value.st_mode):04o}", str(len(data)), digest(data), locator(path, namespace))
+
+
+def symlink_row(path, namespace):
+    value = os.lstat(path)
+    data = os.fsencode(os.readlink(path))
+    return ("symlink", "probe", "present", f"{stat.S_IMODE(value.st_mode):04o}", str(len(data)), digest(data), locator(path, namespace))
+
+
+def ledger(rows):
+    rows = sorted(rows, key=lambda row: row[-1].encode("utf-8"))
+    return b"".join(
+        ("\t".join(("input-v1", str(index), *row)) + "\n").encode("utf-8")
+        for index, row in enumerate(rows)
+    )
+
+
+def exit_trace(pid=100):
+    return f"{pid} +++ exited with 0 +++\n".encode("ascii")
+
+
+def read_trace(paths, payload, count, result=None):
+    if result is None:
+        result = count
+    return (
+        f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 3\n'.encode("ascii")
+        + b'100 read(3, "' + payload + f'", {count}) = {result}\n'.encode("ascii")
+        + b"100 close(3) = 0\n100 +++ exited with 0 +++\n"
+    )
+
+
+def write_trace(paths, payload, count, result=None):
+    if result is None:
+        result = count
+    return (
+        f'100 openat(AT_FDCWD, "{paths["build"]}/generated", O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0600) = 3\n'.encode("ascii")
+        + b'100 write(3, "' + payload + f'", {count}) = {result}\n'.encode("ascii")
+        + b"100 close(3) = 0\n"
+        + f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 4\n'.encode("ascii")
+        + b'100 read(4, "data", 4) = 4\n100 close(4) = 0\n100 +++ exited with 0 +++\n'
+    )
+
+
+def run_trace(label, build_trace, *, expected=None, expected_error=None, **overrides):
+    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-final-{label}-") as root:
+        paths = fixture(root)
+        before = tree(root)
+        try:
+            actual = discover(paths, build_trace(paths), **overrides)
+        except BaseException as exc:
+            if expected_error is None:
+                failure(label, f"expected success, got {type(exc).__name__}: {exc}")
+            elif type(exc) is not expected_error:
+                failure(label, f"expected {expected_error.__name__}, got {type(exc).__name__}: {exc}")
+        else:
+            if expected_error is not None:
+                failure(label, f"accepted invalid input, expected {expected_error.__name__}")
+            elif actual != expected:
+                failure(label, f"ledger mismatch: {actual!r}")
+        if tree(root) != before:
+            failure(label, "fixture changed")
+
+
+def run_operation(label, operation, *, expected_error):
+    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-final-{label}-") as root:
+        paths = fixture(root)
+        before = tree(root)
+        try:
+            operation(paths)
+        except BaseException as exc:
+            if type(exc) is not expected_error:
+                failure(label, f"expected {expected_error.__name__}, got {type(exc).__name__}: {exc}")
+        else:
+            failure(label, f"accepted invalid input, expected {expected_error.__name__}")
+        if tree(root) != before:
+            failure(label, "fixture changed")
+
+
+# Resolved aliases combine access by the resolved target, while retaining one
+# symlink probe row per alias.
+def map_alias_trace(paths):
+    alias = os.path.join(paths["repo"], "map-link")
+    return (
+        f'100 openat(AT_FDCWD, "{alias}", O_RDONLY|O_CLOEXEC) = 3\n'
+        "100 mmap(NULL, 4, PROT_READ, MAP_PRIVATE, 3, 0) = 0\n"
+        "100 munmap(0, 4) = 0\n"
+        "100 close(3) = 0\n"
+        f'100 openat(AT_FDCWD, "{paths["dynamic"]}", O_RDONLY|O_CLOEXEC) = 4\n'
+        '100 read(4, "data", 4) = 4\n'
+        "100 close(4) = 0\n100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+
+
+def map_alias_expected(paths):
+    alias = os.path.join(paths["repo"], "map-link")
+    return ledger([
+        regular_row(paths["dynamic"], "dynamic", "read", "external"),
+        symlink_row(alias, "repo"),
+    ])
+
+
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-alias-map-") as root:
+    paths = fixture(root)
+    alias = os.path.join(paths["repo"], "map-link")
+    os.symlink(paths["dynamic"], alias)
+    before = tree(root)
+    try:
+        actual = discover(paths, map_alias_trace(paths))
+    except BaseException as exc:
+        failure("alias-map-direct-read", f"expected success, got {type(exc).__name__}: {exc}")
+    else:
+        expected = map_alias_expected(paths)
+        if actual != expected:
+            failure("alias-map-direct-read", f"ledger mismatch: {actual!r}")
+        try:
+            records = module.parse_ledger(actual)
+        except BaseException as exc:
+            failure("alias-map-direct-read", f"public ledger parse failed: {type(exc).__name__}: {exc}")
+        else:
+            if len(records) != 2 or sum(record.klass == "symlink" for record in records) != 1:
+                failure("alias-map-direct-read", "resolved alias emitted duplicate or missing rows")
+    if tree(root) != before:
+        failure("alias-map-direct-read", "fixture changed")
+
+
+def exec_alias_trace(paths):
+    alias = os.path.join(paths["repo"], "exec-link")
+    return (
+        f'100 openat(AT_FDCWD, "{alias}", O_RDONLY|O_CLOEXEC) = 3\n'
+        '100 read(3, "data", 4) = 4\n'
+        "100 close(3) = 0\n"
+        f'100 execve("{paths["tool"]}", ["tool"], []) = 0\n'
+        "100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+
+
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-alias-exec-") as root:
+    paths = fixture(root)
+    alias = os.path.join(paths["repo"], "exec-link")
+    os.symlink(paths["tool"], alias)
+    before = tree(root)
+    try:
+        actual = discover(paths, exec_alias_trace(paths))
+    except BaseException as exc:
+        failure("alias-read-direct-exec", f"expected success, got {type(exc).__name__}: {exc}")
+    else:
+        expected = ledger([
+            regular_row(paths["tool"], "tool", "read-execute", "external"),
+            symlink_row(alias, "repo"),
+        ])
+        if actual != expected:
+            failure("alias-read-direct-exec", f"ledger mismatch: {actual!r}")
+        try:
+            records = module.parse_ledger(actual)
+        except BaseException as exc:
+            failure("alias-read-direct-exec", f"public ledger parse failed: {type(exc).__name__}: {exc}")
+        else:
+            if len(records) != 2 or sum(record.klass == "symlink" for record in records) != 1:
+                failure("alias-read-direct-exec", "resolved alias emitted duplicate or missing rows")
+    if tree(root) != before:
+        failure("alias-read-direct-exec", "fixture changed")
+
+
+# Classification and descriptor state errors are public errors, not successful
+# ledger rows.
+run_trace(
+    "odirectory-regular",
+    lambda p: (
+        f'100 openat(AT_FDCWD, "{p["input"]}", O_RDONLY|O_DIRECTORY|O_CLOEXEC) = 3\n'
+        "100 close(3) = 0\n"
+        f'100 openat(AT_FDCWD, "{p["input"]}", O_RDONLY|O_CLOEXEC) = 4\n'
+        '100 read(4, "data", 4) = 4\n'
+        "100 close(4) = 0\n100 +++ exited with 0 +++\n"
+    ).encode("ascii"),
+    expected_error=module.MutationError,
+)
+run_trace(
+    "getdents-nonreadable-directory",
+    lambda p: (
+        f'100 openat(AT_FDCWD, "{p["directory"]}", O_WRONLY|O_DIRECTORY|O_CLOEXEC) = 3\n'
+        "100 getdents64(3, 0x7f, 32768) = 0\n100 close(3) = 0\n"
+        f'100 openat(AT_FDCWD, "{p["input"]}", O_RDONLY|O_CLOEXEC) = 4\n'
+        '100 read(4, "data", 4) = 4\n'
+        "100 close(4) = 0\n100 +++ exited with 0 +++\n"
+    ).encode("ascii"),
+    expected_error=module.FormatError,
+)
+run_trace(
+    "mmap-directory",
+    lambda p: (
+        f'100 openat(AT_FDCWD, "{p["directory"]}", O_RDONLY|O_DIRECTORY|O_CLOEXEC) = 3\n'
+        "100 mmap(NULL, 1, PROT_READ, MAP_PRIVATE, 3, 0) = 0\n"
+        "100 munmap(0, 1) = 0\n100 close(3) = 0\n"
+        f'100 openat(AT_FDCWD, "{p["input"]}", O_RDONLY|O_CLOEXEC) = 4\n'
+        '100 read(4, "data", 4) = 4\n'
+        "100 close(4) = 0\n100 +++ exited with 0 +++\n"
+    ).encode("ascii"),
+    expected_error=module.FormatError,
+)
+
+
+base_read_trace = lambda p: read_trace(p, b"data", 4)
+for name, separator in (("fs", 0x1C), ("gs", 0x1D), ("rs", 0x1E), ("us", 0x1F)):
+    run_trace(
+        f"trace-separator-{name}",
+        lambda p, separator=separator: base_read_trace(p).replace(b"\n", bytes((separator,)), 1),
+        expected_error=module.FormatError,
+    )
+
+
+run_trace("read-malformed-escape", lambda p: read_trace(p, b"bad\\q", 4), expected_error=module.FormatError)
+run_trace("read-raw-control", lambda p: read_trace(p, b"bad\x01", 4), expected_error=module.FormatError)
+
+
+def read_expected_for(paths):
+    return ledger([regular_row(paths["input"], "repo", "read", "repo")])
+
+
+def run_read_success(label, payload, count):
+    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-final-{label}-") as root:
+        paths = fixture(root)
+        before = tree(root)
+        try:
+            actual = discover(paths, read_trace(paths, payload, count))
+        except BaseException as exc:
+            failure(label, f"expected success, got {type(exc).__name__}: {exc}")
+        else:
+            expected = read_expected_for(paths)
+            if actual != expected:
+                failure(label, f"ledger mismatch: {actual!r}")
+        if tree(root) != before:
+            failure(label, "fixture changed")
+
+
+run_read_success("read-empty-payload", b"", 0)
+run_read_success("read-valid-escape-control", b"\\x01\\x1f", 2)
+run_trace("write-malformed-escape", lambda p: write_trace(p, b"\\q", 1), expected_error=module.FormatError)
+run_trace("write-raw-control", lambda p: write_trace(p, b"bad\x01", 4), expected_error=module.FormatError)
+
+
+def write_expected_for(paths):
+    return ledger([regular_row(paths["input"], "repo", "read", "repo")])
+
+
+for label, payload, count in (
+    ("write-empty-payload", b"", 0),
+    ("write-valid-escape-control", b"\\x01\\x1f", 2),
+):
+    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-final-{label}-") as root:
+        paths = fixture(root)
+        before = tree(root)
+        try:
+            actual = discover(paths, write_trace(paths, payload, count))
+        except BaseException as exc:
+            failure(label, f"expected success, got {type(exc).__name__}: {exc}")
+        else:
+            expected = write_expected_for(paths)
+            if actual != expected:
+                failure(label, f"ledger mismatch: {actual!r}")
+        if tree(root) != before:
+            failure(label, "fixture changed")
+
+
+def surrogate_encoder(paths):
+    module.encode_ledger([
+        module.InputRecord(0, "repo", "read", "present", 0o644, 4, digest(b"data"), "repo:/\ud800")
+    ])
+
+
+run_operation("surrogate-encoder", surrogate_encoder, expected_error=module.FormatError)
+run_operation(
+    "surrogate-root",
+    lambda p: discover(p, exit_trace(), repo_root=os.path.join(p["root"], "\ud800")),
+    expected_error=module.FormatError,
+)
+run_operation("surrogate-vendor", lambda p: discover(p, exit_trace(), vendor_relative="\ud800"), expected_error=module.FormatError)
+
+
+def input_tail(paths, fd=4):
+    return (
+        f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = {fd}\n'
+        f'100 read({fd}, "data", 4) = 4\n'
+        f"100 close({fd}) = 0\n100 +++ exited with 0 +++\n"
+    )
+
+
+def mode_trace(paths, syscall, *, create, mode_present):
+    flags = "O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC" if create else "O_RDONLY|O_CLOEXEC"
+    if create:
+        path = os.path.join(paths["build"], "mode-output")
+    else:
+        path = paths["input"]
+    mode = ", 0600" if mode_present and syscall != "openat2" else ""
+    if syscall == "open":
+        call = f'100 open("{path}", {flags}{mode}) = 3\n'
+    elif syscall == "openat":
+        call = f'100 openat(AT_FDCWD, "{path}", {flags}{mode}) = 3\n'
+    else:
+        struct_mode = ", mode=0600" if mode_present else ""
+        call = f'100 openat2(AT_FDCWD, "{path}", {{ flags={flags}{struct_mode}, resolve=0 }}, 24) = 3\n'
+    if create:
+        return (call + "100 close(3) = 0\n" + input_tail(paths)).encode("ascii")
+    return (call + '100 read(3, "data", 4) = 4\n100 close(3) = 0\n100 +++ exited with 0 +++\n').encode("ascii")
+
+
+def mode_expected(paths):
+    return ledger([regular_row(paths["input"], "repo", "read", "repo")])
+
+
+def run_mode_success(label, syscall):
+    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-final-{label}-") as root:
+        paths = fixture(root)
+        before = tree(root)
+        try:
+            actual = discover(paths, mode_trace(paths, syscall, create=True, mode_present=True))
+        except BaseException as exc:
+            failure(label, f"expected success, got {type(exc).__name__}: {exc}")
+        else:
+            if actual != mode_expected(paths):
+                failure(label, f"ledger mismatch: {actual!r}")
+        if tree(root) != before:
+            failure(label, "fixture changed")
+
+
+for syscall in ("open", "openat", "openat2"):
+    run_mode_success(f"{syscall}-create-mode", syscall)
+
+for syscall in ("open", "openat", "openat2"):
+    run_trace(
+        f"{syscall}-create-missing-mode",
+        lambda p, syscall=syscall: mode_trace(p, syscall, create=True, mode_present=False),
+        expected_error=module.FormatError,
+    )
+    run_trace(
+        f"{syscall}-no-create-mode",
+        lambda p, syscall=syscall: mode_trace(p, syscall, create=False, mode_present=True),
+        expected_error=module.FormatError,
+    )
+
+
+if deferred:
+    # No racy post-S2 oracle is installed: a public discovery call has no
+    # deterministic pause between its second hash and final edge check.
+    pass
+
+if any(failures[label] for label in labels if label not in deferred):
+    for label in labels:
+        if label in deferred:
+            print(f"{label}: FORMAL_REVIEW_ONLY ({deferred[label]})")
+        else:
+            print(f"{label}: {'PASS' if not failures[label] else 'FAIL'}")
+    for label in labels:
+        for reason in failures[label]:
+            print(f"{label}: {reason}")
+    raise SystemExit(1)
+print("bs2a-final-gap-red-ok")
+"##;
+    let output = Command::new("/usr/bin/python3")
+        .args(["-c", driver, script.to_str().expect("script path is UTF-8")])
+        .current_dir(repo)
+        .env_clear()
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("run BS2a final review-gap regression driver");
+    assert!(
+        output.status.success()
+            && output.stderr.is_empty()
+            && output.stdout == b"bs2a-final-gap-red-ok\n",
+        "BS2a final review-gap RED diagnostics:\n{}\nstderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

@@ -5991,7 +5991,7 @@ def success_state():
         thread_group=False,
     )
     state.spawn(
-        parent_tid=root_tid,
+        parent_tid=100,
         child_tid=102,
         share_files=False,
         share_fs=False,

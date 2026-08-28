@@ -620,10 +620,19 @@ source/build bound.
    remains referenced authority and is not recommitted. Exclude the rejected
    schema draft and unrelated OpenSSL report.
 2. Specify, RED-test, implement, and independently review the rootless
-   build-subject discovery, production-freeze, consumer-copy, pre-use-check,
-   Lane 09 image-load, and final-tip compatibility protocols from the correction
-   decision. The non-production discovery run may propose a literal transitive
-   ledger but cannot produce accepted subjects.
+   build-subject boundary in two ordered slices. BS2a is candidate-only
+   `discover_input_v1`: it may consume a caller trace and propose a literal
+   transitive ledger, but has no production `expected` mode and cannot produce
+   accepted subjects. BS2b is the sole production `run_reconciled_build`
+   boundary: one call owns expected-ledger preflight, the complete fixed
+   four-profile and Lane 09 image build set, exact-object Landlock rules, fresh
+   rootless user/mount/PID/network isolation with private `/proc`, inherited
+   network/FD-theft/process-injection denial and no external daemon, trace
+   launch and process lifecycle, reconciliation, postflight, and no-replace
+   publication beneath a held fsync-capable private-parent descriptor with an
+   exact allowed namespace delta.
+   Then implement the consumer-copy, pre-use-check, Lane 09 image-load, and
+   final-tip compatibility protocols from the correction decision.
 3. Independently review that literal producer ledger, then run exactly one fresh
    production build-subject freeze. Persist its staging-root, literal-ledger,
    and subject identities in one opaque tracked authority report. This is not a

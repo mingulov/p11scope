@@ -138,6 +138,15 @@ source-bound build/distribution contract. Independent Sol/Terra/Luna review
 accepted this correction; it makes no current build, blueprint, lane, or
 release claim.
 
+BS2a is strictly candidate discovery: caller-supplied trace bytes can propose
+`input-v1` but cannot authorize production, and `produce` remains exit 77.
+BS2b is the first and only production boundary: one runner call owns the whole
+fixed four-profile and Lane 09 image build set, exact-object preflight,
+filesystem restriction, fresh rootless PID/mount/network isolation with private
+`/proc`, inherited network/FD-theft/process-injection denial with no external
+daemon, trace/process lifecycle, reconciliation, postflight, and no-replace
+publication beneath a held fsync-capable private-parent descriptor.
+
 The independently reviewed
 [fixed 500 ms owned-pause amendment](../specs/2026-08-27-slice1b2-500ms-pause-amendment.md)
 passed its isolated two-kernel and host candidate-selection gates at

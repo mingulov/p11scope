@@ -553,7 +553,14 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     Cargo. Lane 14 remains the source-bound build/distribution contract. The
     schema and custody helper remain unchanged. Independent Sol/Terra/Luna
     review accepted `2026-08-28-task4-build-subject-decision.md`; all build and
-    runtime claims remain UNRUN.**
+    runtime claims remain UNRUN. BS2a is candidate-only discovery and cannot
+    authorize a subject; `produce` remains exit 77. One BS2b runner call is the
+    sole production boundary and owns the complete four-profile and Lane 09
+    image build set, exact-object preflight, filesystem restriction, fresh
+    rootless PID/mount/network isolation with private `/proc`, inherited
+    network/FD-theft/process-injection denial with no external daemon,
+    trace/process lifecycle, reconciliation, postflight, and no-replace
+    publication beneath a held fsync-capable private-parent descriptor.**
 - **Slice 2 — capture quality**: ring/epoll, budgets, safe-policy params, per-module profile
   sections, filters, snapshots.
 - **Slice 3 — structure**: module split, evidence plumbing, docs consolidation, multi-kernel CI.

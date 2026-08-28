@@ -167,6 +167,48 @@ class _SemanticTraceState:
             raise FormatError("product syscall cannot finish")
         del self._pending[tid]
 
+    def finish_dup2_syscall(self, *, tid, result, errno):
+        fds = self._fd_table(tid)
+        try:
+            pending = self._pending[tid]
+        except (KeyError, TypeError) as exc:
+            raise FormatError("no pending syscall") from exc
+        if type(pending) is not tuple or len(pending) != 3:
+            raise FormatError("invalid pending syscall")
+        name, category, arguments = pending
+        if type(name) is not str or name != "dup2":
+            raise FormatError("invalid pending syscall")
+        if type(category) is not str or category != "fd":
+            raise FormatError("invalid pending syscall")
+        if type(arguments) is not tuple or len(arguments) != 6:
+            raise FormatError("invalid pending syscall")
+        if any(type(value) is not int or not 0 <= value < 2**64 for value in arguments):
+            raise FormatError("invalid pending syscall")
+        oldfd, newfd = arguments[:2]
+        if any(type(fd) is not int or not 0 <= fd <= 2**31 - 1 for fd in (oldfd, newfd)):
+            raise FormatError("invalid dup2 FD")
+
+        success = type(result) is int and result == newfd and errno is None
+        failure = type(result) is int and result == -1 and type(errno) is int and errno in {
+            4,
+            9,
+            16,
+            24,
+        }
+        if not success and not failure:
+            raise FormatError("invalid dup2 outcome")
+        if success:
+            try:
+                fds[oldfd]
+            except (KeyError, TypeError) as exc:
+                raise FormatError("unknown source FD") from exc
+
+        receipt = (pending, result, errno)
+        if success:
+            self.dup2(tid=tid, source_fd=oldfd, target_fd=newfd)
+        del self._pending[tid]
+        return receipt
+
     def _task(self, tid):
         try:
             return self._tasks[tid]

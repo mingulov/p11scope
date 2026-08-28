@@ -5810,6 +5810,10 @@ if state.snapshot(tid=101) != shared_state:
 state.dup2(tid=102, source_fd=4, target_fd=4)
 if state.snapshot(tid=102)["fds"][4] != ("tool-description", True):
     raise SystemExit("dup2(fd, fd) did not preserve CLOEXEC")
+state.dup2(tid=102, source_fd=4, target_fd=11)
+if state.snapshot(tid=102)["fds"][11] != ("tool-description", False):
+    raise SystemExit("dup2 did not clear CLOEXEC on a distinct target")
+state.close(tid=102, fd=11)
 state.dup2(tid=102, source_fd=3, target_fd=4)
 if state.snapshot(tid=102)["fds"][4] != ("source-description", False):
     raise SystemExit("dup2 did not atomically replace an existing target")

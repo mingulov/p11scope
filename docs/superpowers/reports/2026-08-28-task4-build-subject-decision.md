@@ -124,11 +124,12 @@ The file contains no blank row, CR, NUL, BOM, or trailing bytes, and ends in
 exactly one LF. `SEQ` is `0|[1-9][0-9]*`, equals the row's zero-based position,
 and is at most 4095. There is exactly one row per `LOCATOR`. Rows are in strict
 ascending order of the complete locator's raw UTF-8 bytes; repeated observations
-of one locator are combined before sorting. A lone regular-file metadata
-observation produces `probe`; `read` or `execute` subsumes `probe`, and observing
-both read and execute produces `read-execute`. A lone directory metadata
-observation produces `probe`; `enumerate` subsumes it. Conflicting classes,
-results, identities, or contents reject as mutation.
+of one locator are combined before sorting. A lone regular-file metadata or
+open-only observation produces `probe`; an actual `read` or `mmap` upgrades it
+to `read`, an actual `exec` upgrades it to `execute`, and observing both actual
+accesses produces `read-execute`. A lone directory metadata observation
+produces `probe`; `enumerate` subsumes it. Conflicting classes, results,
+identities, or contents reject as mutation.
 
 `LOCATOR` is 1..4096 UTF-8 bytes and has exactly one of these disjoint forms:
 
@@ -150,23 +151,35 @@ anchor cannot use `external:`. A component is 1..255 raw UTF-8 bytes, is neither
 `.` nor `..`, contains no `/`, NUL, Unicode `Cc`, `Cf`, or `Cs` code point, and
 is not Unicode-normalized or case-folded: its original UTF-8 bytes are
 authoritative. Repeated separators and a trailing separator except in the three
-root locators reject. Relative syscall paths are resolved from the traced
-process's exact cwd or dirfd. Resolution is lexical and descriptor-relative,
-not `realpath`; inability to resolve the exact cwd, dirfd, or path rejects.
+root locators reject. Path-bearing syscall paths are resolved immediately from
+the traced process's held exact cwd or held dirfd (absolute paths start at the
+held filesystem root). Resolution is a raw kernel-order descriptor-relative
+walk, not `realpath`: `.` is consumed as reached; `..` is applied only when
+reached, and a symlink's raw target components are prepended to the pending
+walk. Relative targets resume at the held symlink parent and
+absolute targets at the held filesystem root. Inability to resolve the exact
+cwd, dirfd, or path rejects.
 
 ### Custody identity roles
 
 Custody-only relations are weaker than evidence rows. The filesystem root `/`,
-the traced process's exact `cwd`, every intermediate ancestor, and each
-supplied `repo`, `build`, `stable`, `nightly`, or `vendor` anchor are acquired
-once. Their one-attempt acquisition and final parent/name plus held-FD binding
-use only the structural identity `(st_dev,st_ino,S_IFMT(st_mode))`. A mismatch
-is an immediate mutation failure: acquisition is never retried, reopened, or
-accepted from a replacement. Unrelated unobserved child creation or removal
-beneath a held ancestor is not evidence and does not invalidate that binding.
+the traced process's exact `cwd`, every dirfd used as a path start, every
+observation or absence start, every intermediate ancestor, each supplied
+`repo`, `build`, `stable`, `nightly`, or `vendor` anchor, and every parent of a
+created output are acquired once as held nodes. Their one-attempt acquisition
+and final parent/name plus held-FD binding use only the structural identity
+`(st_dev,st_ino,S_IFMT(st_mode))`. A mismatch is an immediate mutation
+failure: acquisition is never retried, reopened, or accepted from a
+replacement. Unrelated unobserved child creation or removal beneath a held
+ancestor is not evidence and does not invalidate that binding. A logical
+final-leaf output under the initially empty held build root has no physical
+node and emits no input.
+
+Retained relations are cached only by the held parent relation plus raw name;
+no textual path or locator cache may reopen or restart a relation from `/`.
 
 Full nine-field identity `(st_dev,st_ino,uid,gid,st_mode,st_nlink,st_size,
-st_mtime,st_ctime)` begins at the first role-specific observation and
+st_mtime,st_ctime)` is captured by the first evidence role at event time and
 continues through final validation only for retained regular inputs, ENOTDIR
 blockers, observed symlinks, and emitted directory rows, including the ENOENT
 parent row. An anchor is held to the full nine fields only when it is itself
@@ -175,7 +188,8 @@ evidenced by one of those rows; otherwise it remains structural-only.
 The owned build root has a direct descriptor-relative exact-emptiness check at
 both initial setup and final validation, reusing the held-FD `os.listdir`
 operation. Its emptiness is never inferred from timestamps or another
-directory metadata proxy.
+directory metadata proxy. Created-output parents remain held nodes; a logical
+final leaf has no physical node and is never emitted as input.
 
 `CLASS`, `ACCESS`, `RESULT`, and the value fields obey this exhaustive matrix:
 
@@ -208,6 +222,10 @@ descriptor, stream the hash, and require unchanged device, inode, uid, gid,
 mode, link count, size, mtime, and ctime across the read. Hard links are
 permitted but distinct locators remain distinct rows.
 
+The external post-S2 scheduling case remains `FORMAL_REVIEW_ONLY`: independent
+line review must prove the retained-FD metadata/hash sequence and final
+parent/name binding, but no racy oracle is promoted to executable acceptance.
+
 A directory row never grants authority to read or execute a descendant and
 never replaces a literal row for a consumed descendant. Its hash preimage is
 the complete immediate directory listing, excluding `.` and `..`. Each entry
@@ -228,35 +246,48 @@ has its own row. `MODE` is the symlink's four-octal-digit `lstat` mode, `SIZE`
 is the canonical decimal length in `1..4096` of the exact raw `readlinkat`
 target bytes, and `SHA256` hashes those bytes. The target bytes are read twice;
 the symlink's before/after device, inode, uid, gid, mode, link count, size,
-mtime, and ctime must agree. Relative targets resolve from the symlink's parent;
-absolute targets resolve from filesystem root; `.` and `..` are normalized only
-while deriving the canonical target locator. Namespace selection after
-resolution is vendor, then repo, then external according to the two anchors
-above. Every resolved target locator must have its own `symlink`, `directory`,
-present-regular, or `absent` row. Every link in a chain is recorded; cycles,
-more than 40 links, an unencodable resolved locator, or a special-file target
-reject. Raw target bytes are never retained.
+mtime, and ctime must agree. Relative targets resolve from the held symlink's
+parent; absolute targets resolve from the held filesystem root. Raw target
+components are prepended to the pending walk, with `.` and `..` consumed only
+when reached. Namespace selection after resolution is vendor, then repo, then
+external according to the two anchors above. Every resolved target locator must
+have its own `symlink`, `directory`, present-regular, or `absent` row. Every
+link in a chain is recorded; 40 total follows are allowed and the 41st
+rejects, with no repeated-locator rejection. An unencodable resolved locator or
+a special-file target rejects. Raw target bytes are never retained.
 
 An absent row names the canonical requested locator after resolving every
-existing prefix. `ENOENT` requires a `directory` row for the nearest existing
-parent and rows for every traversed symlink; `ENOTDIR` requires a present row
-for the first blocking non-directory component and rows for every traversed
-symlink. After evidence and retained-edge validation, every absent row is
-re-resolved immediately before encoding; production must reproduce the exact
-errno, canonical resolved locator, and held boundary identity. Any mismatch is
-non-pass and is never repaired by retrying acquisition. `EACCES`, `ELOOP`, unknown results, unresolved
-dirfds/cwds, and all other failures stop discovery for schema review rather
-than being ignored or generalized.
+existing prefix. Its retained internal evidence includes the held start node,
+raw syscall path, errno, canonical resolved locator, and full missing/blocking
+boundary identity; these do not add fields to the public nine-field row.
+`ENOENT` requires a `directory` row for the nearest existing parent and rows
+for every traversed symlink; `ENOTDIR` requires a present row for the first
+blocking non-directory component and rows for every traversed symlink. An
+unresolved suffix has a floor at the missing or blocking component: raw
+`name` and `..` steps are permitted only above that floor; crossing it or
+collapsing to the blocker rejects. Raw absence replay is the last filesystem
+observation; production must reproduce the exact errno, canonical resolved
+locator, and held boundary identity with a live boundary validation. Any
+mismatch is non-pass and is never repaired by retrying acquisition. `EACCES`,
+`ELOOP`, unknown results, unresolved dirfds/cwds, and all other failures stop
+discovery for schema review rather than being ignored or generalized.
+
+Finalization order is fixed: collect/hash/list -> final build list -> full
+bindings -> raw absence replay/boundary -> pure encode -> finally close all
+held descriptors. Pure encoding performs no filesystem access.
 
 The discovery trace must classify every successful regular-file read, mapping,
 or execution, every product-affecting metadata probe, every directory
 enumeration, and every `ENOENT` or `ENOTDIR` probe across all traced processes.
-A path first created inside the owned clean build root is an internal output,
-not an `input-v1` row; preexistence, read before owned creation, or use of an
-unowned generated path rejects. Production must observe no additional literal
-input or probe and must reproduce every ledger row. Directory hashes grant no
-directory read authority; the sandbox authorizes only the literal resolved
-objects required by the reviewed rows.
+Every path-bearing event is resolved immediately from its held cwd/dirfd by the
+raw kernel-order walk above. A path first created inside the owned clean build
+root is an internal output, not an `input-v1` row; its logical final leaf has
+no physical node and emits no input, while its created parent is held.
+Preexistence, read before owned creation, or use of an unowned generated path
+rejects. Production must observe no additional literal input or probe and must
+reproduce every ledger row. Directory hashes grant no directory read authority;
+the sandbox authorizes only the literal resolved objects required by the
+reviewed rows.
 
 Before production launch, every reviewed present, symlink, directory, and
 absent relation is independently reproduced. Present regular inputs remain

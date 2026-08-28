@@ -258,6 +258,12 @@ blueprint amendment/review before consuming it.
 
 ## Revised gate order
 
+The first candidate produced under the order below was rejected for incomplete
+Cargo/Docker transitive input closure. The accepted
+[`2026-08-28-task4-build-subject-decision.md`](2026-08-28-task4-build-subject-decision.md)
+supersedes steps 2 onward; no blueprint or executable-contract gate is complete
+until its build-subject prerequisites pass.
+
 1. Amend and independently review the governing plan.
 2. Select, write, and review seven design-complete, non-executable blueprint-
    schema files plus the Lane 14 crosswalk. Review every literal set, normative

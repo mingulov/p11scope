@@ -598,11 +598,38 @@ both directories, and passes exactly `RENAME_NOREPLACE`.
 
 ### Implementation and test sequence
 
+The accepted
+[`2026-08-28-task4-build-subject-decision.md`](../reports/2026-08-28-task4-build-subject-decision.md)
+corrects the first-blueprint input-closure failure. Until its independent
+acceptance, the seven uncommitted blueprints are rejected and the sequence below
+is paused before blueprint acceptance.
+
+That correction supersedes every later Lane 07/09/10/11/16
+requirement to run Cargo, build a product/image, accept a Cargo target directory,
+or prove Cargo/source identity inside the runtime lane. Those later paragraphs
+remain current-driver migration evidence only. Their normative replacement is
+the copied-subject, registered pre-use checker, final replay, and final-tip
+compatibility contract in the correction decision. Lane-local C fixture builds
+and all non-build lane oracles remain authoritative; Lane 14 remains fully
+source/build bound.
+
 1. After independent Sol, Terra, and Luna acceptance, make one docs-only
-   authority change containing exactly the accepted decision report, Lane 14
-   crosswalk, this closure plan, the next-gates qualification, and ROADMAP
-   amendment. Exclude the rejected schema draft and unrelated OpenSSL report.
-2. Select, write, and independently review seven design-complete blueprints and
+   authority change containing exactly the accepted build-subject decision,
+   this amended contract-closure decision, this closure plan, the next-gates
+   qualification, and ROADMAP amendment. The already committed Lane 14 crosswalk
+   remains referenced authority and is not recommitted. Exclude the rejected
+   schema draft and unrelated OpenSSL report.
+2. Specify, RED-test, implement, and independently review the rootless
+   build-subject discovery, production-freeze, consumer-copy, pre-use-check,
+   Lane 09 image-load, and final-tip compatibility protocols from the correction
+   decision. The non-production discovery run may propose a literal transitive
+   ledger but cannot produce accepted subjects.
+3. Independently review that literal producer ledger, then run exactly one fresh
+   production build-subject freeze. Persist its staging-root, literal-ledger,
+   and subject identities in one opaque tracked authority report. This is not a
+   Task 4 envelope and does not use `task4-receipt.py`. No historical subject
+   may be reused.
+4. Select, write, and independently review seven design-complete blueprints and
    the Lane 14 crosswalk, including every literal artifact path, justified
    design bound with its future producer/helper enforcement point, checker role,
    privacy surface, resource class/identity scheme, normative replay argv,
@@ -611,7 +638,7 @@ both directories, and passes exactly `RENAME_NOREPLACE`.
    profile, log, map, live `START`, trace, attach, discover, distribution,
    protocol, release, smoke, and canary surface. No helper implementation starts
    before this gate passes.
-3. The sole `tests/artifact_contracts.rs` owner adds rootless blueprint rejection
+5. The sole `tests/artifact_contracts.rs` owner adds rootless blueprint rejection
    and seven absent-interface RED rows, one per future manifest. The exact first
    focused command is:
 
@@ -625,7 +652,7 @@ both directories, and passes exactly `RENAME_NOREPLACE`.
    calling a helper. Stop the writer and review before any checker
    implementation. The later helper core RED/GREEN proves blueprint schema
    exits 77 before root creation.
-4. Sequential sole writers implement, self-test, stop, and receive independent
+6. Sequential sole writers implement, self-test, stop, and receive independent
    review for `check-privacy-surfaces.py`, then the Lane 07, 09, 10, 11, 14,
    and 16 checker files. Before removing an inline predicate, a mutation test
    names its sole replacement checker. Each writer runs its exact script with
@@ -633,9 +660,9 @@ both directories, and passes exactly `RENAME_NOREPLACE`.
    `task4_contract_privacy`, `task4_contract_lane07`,
    `task4_contract_lane09`, `task4_contract_lane10`,
    `task4_contract_lane11`, `task4_contract_lane14`, and
-   `task4_contract_lane16`, using the same fixed Cargo prefix as step 3. The
+   `task4_contract_lane16`, using the same fixed Cargo prefix as step 5. The
    aggregate `task4_contract_` filter becomes GREEN only after Lane 16 review.
-5. The sole Rust-test owner adds `task4_receipt_envelope_contracts_core` RED and
+7. The sole Rust-test owner adds `task4_receipt_envelope_contracts_core` RED and
    stops for review. The sole helper owner then implements the helper. Its real-
    process self-test proves blueprint schema exits 77 before root creation and
    covers at least: manifest
@@ -645,11 +672,11 @@ both directories, and passes exactly `RENAME_NOREPLACE`.
    descriptor leaks; signal boundaries; cleanup/absence failure; early,
    duplicate, or replaced status; rename collision/unavailability; and
    post-publication mutation.
-6. Re-review all blueprints against exact checker and helper bytes, require zero
+8. Re-review all blueprints against exact checker and helper bytes, require zero
    unresolved records, and promote seven interface-complete runtime contracts
    while changing only the schema and removing `unresolved_interfaces`.
    Promotion is not lane acceptance.
-7. Migrate Lane 07 first and independently review exact registration/replay;
+9. Migrate Lane 07 first and independently review exact registration/replay;
    migrate 09, 10, 11, all Lane 14 scripts as one group, and Lane 16 serially,
    replacing rather than layering local receipts. Each cycle is lane RED,
    minimal implementation, focused GREEN, writer stop, and independent review.
@@ -657,21 +684,25 @@ both directories, and passes exactly `RENAME_NOREPLACE`.
    Preserve every checker and retained lane-matrix predicate. A lane becomes
    executable only after its migrated driver passes exact registration, replay,
    cleanup, privacy, and terminal-publication checks.
-8. Run helper/contract/driver self-tests, shell syntax checks, the focused Rust
+10. Run helper/contract/driver self-tests, shell syntax checks, the focused Rust
    contract, then all four canonical Rust checks. Stop the writer and obtain
    independent lifecycle, provenance, privacy, and oracle review before runtime.
-9. Compatibility-check frozen Lane 02 without rerunning it. Do not amend or
-   rerun Lane 13 history. Run remaining lanes once in order: 07, 09, 10, 11,
+11. Compatibility-check frozen Lane 02 without rerunning it. Do not amend or
+   rerun Lane 13 history. Rerun the rootless final-tip product-affecting
+   compatibility verifier immediately before Lane 07; any mismatch returns to
+   build-subject discovery and production. Then run remaining lanes once in
+   order: 07, 09, 10, 11,
    14, 16-never, 16-auto; stop at the first UNRUN/NON-PASS. Preserve downstream
    order: fresh r3; 9.2d with the existing Lane 02 and single Lane 13
    frozen-candidate negative-control positions; 9.3; 9.4 review; exact-tip CI;
    Task 10.
 
-Writer ownership is sequential: (1) seven blueprints plus Lane 14 crosswalk;
-(2) `tests/artifact_contracts.rs` interface RED; (3) privacy scanner; (4-9) one
-lane checker each for 07, 09, 10, 11, 14, and 16; (10)
-`tests/artifact_contracts.rs` core RED; (11) `scripts/task4-receipt.py`; (12)
-blueprint promotion; (13-18) Lane 07, 09, 10, 11, all Lane 14 scripts as one
+Writer ownership is sequential: (1) build-subject contracts/tests; (2)
+build-subject implementation; (3) seven blueprints plus Lane 14 crosswalk;
+(4) `tests/artifact_contracts.rs` interface RED; (5) privacy scanner; (6-11) one
+lane checker each for 07, 09, 10, 11, 14, and 16; (12)
+`tests/artifact_contracts.rs` core RED; (13) `scripts/task4-receipt.py`; (14)
+blueprint promotion; (15-20) Lane 07, 09, 10, 11, all Lane 14 scripts as one
 group, then Lane 16.
 A reviewer starts only after its writer stops. Ownership returns to the primary
 at every stop, and later edits require a new explicit owner. After each driver

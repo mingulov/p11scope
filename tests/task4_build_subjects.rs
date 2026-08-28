@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -44,6 +44,42 @@ const CASES: &[&str] = &[
     "subject-path-reopen",
     "subject-same-fd-check-use",
 ];
+
+fn snapshot_tree(root: &Path) -> BTreeSet<(PathBuf, &'static str)> {
+    fn visit(root: &Path, current: &Path, entries: &mut BTreeSet<(PathBuf, &'static str)>) {
+        for entry in fs::read_dir(current)
+            .expect("read fixture directory")
+            .map(|entry| entry.expect("read fixture entry"))
+        {
+            let path = entry.path();
+            let file_type = fs::symlink_metadata(&path)
+                .expect("read fixture entry metadata")
+                .file_type();
+            let kind = if file_type.is_dir() {
+                "directory"
+            } else if file_type.is_file() {
+                "regular"
+            } else if file_type.is_symlink() {
+                "symlink"
+            } else {
+                "other"
+            };
+            entries.insert((
+                path.strip_prefix(root)
+                    .expect("fixture entry is below root")
+                    .to_path_buf(),
+                kind,
+            ));
+            if file_type.is_dir() {
+                visit(root, &path, entries);
+            }
+        }
+    }
+
+    let mut entries = BTreeSet::new();
+    visit(root, root, &mut entries);
+    entries
+}
 
 #[test]
 fn task4_build_subject_self_test_is_rootless_and_complete() {
@@ -125,15 +161,9 @@ fn task4_build_subject_self_test_is_rootless_and_complete() {
             .expect("chmod tripwire");
     }
 
-    let snapshot = |path: &Path| -> BTreeSet<std::ffi::OsString> {
-        fs::read_dir(path)
-            .expect("read fixture directory")
-            .map(|entry| entry.expect("read fixture entry").file_name())
-            .collect()
-    };
-    let repo_before = snapshot(repo);
-    let fake_bin_before = snapshot(&fake_bin);
-    let root_before = snapshot(&root);
+    let repo_before = snapshot_tree(repo);
+    let fake_bin_before = snapshot_tree(&fake_bin);
+    let root_before = snapshot_tree(&root);
 
     let mut command = Command::new("/usr/bin/python3");
     command
@@ -189,13 +219,31 @@ fn task4_build_subject_self_test_is_rootless_and_complete() {
     assert_eq!(report_text, expected_report);
 
     assert!(!tripwire_log.exists(), "a self-test tripwire command ran");
-    assert_eq!(snapshot(&fake_bin), fake_bin_before, "tripwire was modified");
-    assert!(snapshot(&work).is_empty(), "self-test wrote runtime work output");
+    assert_eq!(
+        snapshot_tree(&fake_bin),
+        fake_bin_before,
+        "tripwire was modified"
+    );
+    assert!(
+        snapshot_tree(&work).is_empty(),
+        "self-test wrote runtime work output"
+    );
     assert!(!staging.exists(), "self-test created staging output");
     assert!(!runtime.exists(), "self-test created runtime output");
 
     let mut expected_root = root_before;
-    expected_root.insert(report.file_name().expect("report filename").to_owned());
-    assert_eq!(snapshot(&root), expected_root, "fixture gained unexpected output");
-    assert_eq!(snapshot(repo), repo_before, "self-test changed repository output");
+    expected_root.insert((
+        PathBuf::from(report.file_name().expect("report filename")),
+        "regular",
+    ));
+    assert_eq!(
+        snapshot_tree(&root),
+        expected_root,
+        "fixture gained unexpected output"
+    );
+    assert_eq!(
+        snapshot_tree(repo),
+        repo_before,
+        "self-test changed repository output"
+    );
 }

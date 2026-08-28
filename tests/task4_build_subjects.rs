@@ -3509,6 +3509,7 @@ labels = [
     "alias-map-direct-read",
     "alias-read-direct-exec",
     "odirectory-regular",
+    "odirectory-rdwr",
     "getdents-nonreadable-directory",
     "mmap-directory",
     "trace-separator-fs",
@@ -3535,6 +3536,13 @@ labels = [
     "open-no-create-mode",
     "openat-no-create-mode",
     "openat2-no-create-mode",
+    "structural-ancestor-sibling-churn",
+    "unobserved-anchor-sibling-churn",
+    "build-root-ephemeral-churn",
+    "build-root-final-nonempty",
+    "absent-final-boundary",
+    "absent-final-boundary-replaced",
+    "relation-open-replacement",
     "external-post-s2-full-identity",
 ]
 failures = {label: [] for label in labels}
@@ -3841,6 +3849,16 @@ run_trace(
     expected_error=module.FormatError,
 )
 run_trace(
+    "odirectory-rdwr",
+    lambda p: (
+        f'100 openat(AT_FDCWD, "{p["directory"]}", O_RDWR|O_DIRECTORY|O_CLOEXEC) = 3\n'
+        "100 getdents64(3, 0x7f, 32768) = 0\n100 close(3) = 0\n"
+        f'100 openat(AT_FDCWD, "{p["input"]}", O_RDONLY|O_CLOEXEC) = 4\n'
+        '100 read(4, "data", 4) = 4\n100 close(4) = 0\n100 +++ exited with 0 +++\n'
+    ).encode("ascii"),
+    expected_error=module.FormatError,
+)
+run_trace(
     "mmap-directory",
     lambda p: (
         f'100 openat(AT_FDCWD, "{p["directory"]}", O_RDONLY|O_DIRECTORY|O_CLOEXEC) = 3\n'
@@ -3991,6 +4009,328 @@ for syscall in ("open", "openat", "openat2"):
         lambda p, syscall=syscall: mode_trace(p, syscall, create=False, mode_present=True),
         expected_error=module.FormatError,
     )
+
+
+# Sibling churn changes structural-directory metadata without replacing its
+# edge. Exercise it once between lstat and open, and once before the final edge
+# walk; a valid external read still has a literal one-row ledger.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-structural-ancestor-sibling-churn-") as root:
+    paths = fixture(root)
+    expected = ledger([regular_row(paths["dynamic"], "dynamic", "read", "external")])
+    markers = [
+        os.path.join(root, "structural-churn-during-custody"),
+        os.path.join(root, "structural-churn-after-custody"),
+    ]
+    seams = {"acquire": False, "post_custody": False}
+    active = [True]
+
+    def churn(path):
+        os.mkdir(path)
+        os.rmdir(path)
+
+    def audit_structural(event, args):
+        if not active[0] or event != "open" or not args:
+            return
+        try:
+            path = os.fsdecode(args[0])
+        except (TypeError, ValueError):
+            return
+        if not seams["acquire"] and path == os.path.basename(root):
+            seams["acquire"] = True
+            churn(markers[0])
+        elif seams["acquire"] and not seams["post_custody"] and path == "dynamic":
+            seams["post_custody"] = True
+            churn(markers[1])
+
+    sys.addaudithook(audit_structural)
+    try:
+        try:
+            actual = discover(paths, (
+                f'100 openat(AT_FDCWD, "{paths["dynamic"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+                '100 read(3, "data", 4) = 4\n'
+                "100 close(3) = 0\n100 +++ exited with 0 +++\n"
+            ).encode("ascii"))
+        except BaseException as exc:
+            failure("structural-ancestor-sibling-churn", f"expected success, got {type(exc).__name__}: {exc}")
+        else:
+            if actual != expected:
+                failure("structural-ancestor-sibling-churn", f"ledger mismatch: {actual!r}")
+    finally:
+        active[0] = False
+        for marker in markers:
+            if os.path.isdir(marker):
+                os.rmdir(marker)
+    if not seams["acquire"]:
+        failure("structural-ancestor-sibling-churn", "acquisition churn seam was not reached")
+    if not seams["post_custody"]:
+        failure("structural-ancestor-sibling-churn", "post-custody churn seam was not reached")
+    if any(os.path.exists(marker) for marker in markers):
+        failure("structural-ancestor-sibling-churn", "churn marker was not cleaned up")
+
+
+# An unobserved repo sibling must not become an input row. The audit hook fires
+# while the observed input is being acquired, after all named anchors are held.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-unobserved-anchor-sibling-churn-") as root:
+    paths = fixture(root)
+    expected = ledger([regular_row(paths["input"], "repo", "read", "repo")])
+    marker = os.path.join(paths["repo"], "unobserved-sibling")
+    seam = [False]
+    active = [True]
+
+    def audit_unobserved(event, args):
+        if not active[0]:
+            return
+        try:
+            path = os.fsdecode(args[0]) if args else None
+        except (TypeError, ValueError):
+            return
+        if event == "open" and not seam[0] and path == "input":
+            seam[0] = True
+            os.mkdir(marker)
+            os.rmdir(marker)
+
+    sys.addaudithook(audit_unobserved)
+    try:
+        try:
+            actual = discover(paths, (
+                f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+                '100 read(3, "data", 4) = 4\n'
+                "100 close(3) = 0\n100 +++ exited with 0 +++\n"
+            ).encode("ascii"))
+        except BaseException as exc:
+            failure("unobserved-anchor-sibling-churn", f"expected success, got {type(exc).__name__}: {exc}")
+        else:
+            if actual != expected:
+                failure("unobserved-anchor-sibling-churn", f"ledger mismatch: {actual!r}")
+    finally:
+        active[0] = False
+        if os.path.isdir(marker):
+            os.rmdir(marker)
+    if not seam[0]:
+        failure("unobserved-anchor-sibling-churn", "unobserved sibling seam was not reached")
+    if os.path.exists(marker):
+        failure("unobserved-anchor-sibling-churn", "unobserved sibling marker was not cleaned up")
+
+
+# A create/remove cycle leaves the build root empty and must not be rejected by
+# directory timestamp changes used as an emptiness proxy.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-build-root-ephemeral-churn-") as root:
+    paths = fixture(root)
+    expected = ledger([regular_row(paths["dynamic"], "dynamic", "read", "external")])
+    marker = os.path.join(paths["build"], "ephemeral-entry")
+    seam = [False]
+    real_listdir = os.listdir
+    build_identity = os.stat(paths["build"], follow_symlinks=False)
+
+    def listdir_ephemeral(target):
+        result = real_listdir(target)
+        if not seam[0] and isinstance(target, int):
+            value = os.fstat(target)
+            if (value.st_dev, value.st_ino) == (build_identity.st_dev, build_identity.st_ino):
+                if result:
+                    raise AssertionError("build root was not initially empty")
+                seam[0] = True
+                os.mkdir(marker)
+                os.rmdir(marker)
+        return result
+
+    module.os.listdir = listdir_ephemeral
+    try:
+        try:
+            actual = discover(paths, (
+                f'100 openat(AT_FDCWD, "{paths["dynamic"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+                '100 read(3, "data", 4) = 4\n'
+                "100 close(3) = 0\n100 +++ exited with 0 +++\n"
+            ).encode("ascii"))
+        except BaseException as exc:
+            failure("build-root-ephemeral-churn", f"expected success, got {type(exc).__name__}: {exc}")
+        else:
+            if actual != expected:
+                failure("build-root-ephemeral-churn", f"ledger mismatch: {actual!r}")
+    finally:
+        module.os.listdir = real_listdir
+        if os.path.isdir(marker):
+            os.rmdir(marker)
+    if not seam[0]:
+        failure("build-root-ephemeral-churn", "ephemeral build-root seam was not reached")
+    if module.os.listdir is not real_listdir:
+        failure("build-root-ephemeral-churn", "listdir seam was not restored")
+    if os.path.exists(marker):
+        failure("build-root-ephemeral-churn", "ephemeral build-root marker was not cleaned up")
+
+
+# The build root is checked empty once, then an unrelated late entry must be
+# rejected by a direct final emptiness check and cleaned up by this test.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-build-root-final-nonempty-") as root:
+    paths = fixture(root)
+    marker = os.path.join(paths["build"], "late-entry")
+    seam = [False]
+    real_listdir = os.listdir
+    build_identity = os.stat(paths["build"], follow_symlinks=False)
+
+    def listdir_build(target):
+        result = real_listdir(target)
+        if not seam[0] and isinstance(target, int):
+            value = os.fstat(target)
+            if (value.st_dev, value.st_ino) == (build_identity.st_dev, build_identity.st_ino):
+                if result:
+                    raise AssertionError("build root was not initially empty")
+                seam[0] = True
+                os.mkdir(marker)
+        return result
+
+    module.os.listdir = listdir_build
+    try:
+        try:
+            discover(paths, (
+                f'100 openat(AT_FDCWD, "{paths["dynamic"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+                '100 read(3, "data", 4) = 4\n'
+                "100 close(3) = 0\n100 +++ exited with 0 +++\n"
+            ).encode("ascii"))
+        except BaseException as exc:
+            if type(exc) is not module.MutationError:
+                failure("build-root-final-nonempty", f"expected MutationError, got {type(exc).__name__}: {exc}")
+        else:
+            failure("build-root-final-nonempty", "accepted late build-root entry")
+    finally:
+        module.os.listdir = real_listdir
+        if os.path.isdir(marker):
+            os.rmdir(marker)
+    if not seam[0]:
+        failure("build-root-final-nonempty", "late build-root seam was not reached")
+    if module.os.listdir is not real_listdir:
+        failure("build-root-final-nonempty", "listdir seam was not restored")
+    if os.path.exists(marker):
+        failure("build-root-final-nonempty", "late build-root marker was not cleaned up")
+
+
+# After the parent evidence and final edge/fstat comparison both succeed,
+# create either the exact missing leaf or only its missing prefix. The latter
+# preserves ENOENT and the canonical locator, so boundary identity must also
+# be reproduced by the final absent replay.
+def absent_final_case(label, requested_tail, first_missing):
+    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-final-{label}-") as root:
+        paths = fixture(root)
+        marker = os.path.join(paths["repo"], first_missing)
+        state = {
+            "absent": False,
+            "repo_fstats": 0,
+            "final_edge": False,
+            "repo_final_observed": False,
+            "created": False,
+        }
+        real_stat = os.stat
+        real_fstat = os.fstat
+        repo_identity = real_stat(paths["repo"], follow_symlinks=False)
+
+        def stat_absent(target, *, dir_fd=None, follow_symlinks=True):
+            if state["repo_final_observed"] and not state["created"]:
+                state["created"] = True
+                os.mkdir(marker)
+            try:
+                value = real_stat(target, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+            except FileNotFoundError:
+                if not state["absent"] and os.fsdecode(target) == first_missing:
+                    state["absent"] = True
+                raise
+            if (
+                state["absent"]
+                and state["repo_fstats"] >= 3
+                and os.fsdecode(target) == "repo"
+                and isinstance(dir_fd, int)
+            ):
+                state["final_edge"] = True
+            return value
+
+        def fstat_absent(fd):
+            value = real_fstat(fd)
+            if (value.st_dev, value.st_ino) == (repo_identity.st_dev, repo_identity.st_ino) and state["absent"]:
+                state["repo_fstats"] += 1
+                if state["final_edge"]:
+                    state["repo_final_observed"] = True
+            return value
+
+        module.os.stat = stat_absent
+        module.os.fstat = fstat_absent
+        try:
+            try:
+                discover(paths, (
+                    f'100 newfstatat(AT_FDCWD, "{paths["repo"]}/{requested_tail}", 0x7f, 0) = -1 ENOENT (No such file or directory)\n'
+                    f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+                    '100 read(3, "data", 4) = 4\n'
+                    "100 close(3) = 0\n100 +++ exited with 0 +++\n"
+                ).encode("ascii"))
+            except BaseException as exc:
+                if type(exc) is not module.MutationError:
+                    failure(label, f"expected MutationError, got {type(exc).__name__}: {exc}")
+            else:
+                failure(label, "accepted changed final absent boundary")
+        finally:
+            module.os.stat = real_stat
+            module.os.fstat = real_fstat
+            if os.path.isdir(marker):
+                os.rmdir(marker)
+        if not state["absent"]:
+            failure(label, "initial absent seam was not reached")
+        if (
+            state["repo_fstats"] < 4
+            or not state["final_edge"]
+            or not state["repo_final_observed"]
+            or not state["created"]
+        ):
+            failure(label, f"final boundary seam was incomplete: {state!r}")
+        if module.os.stat is not real_stat or module.os.fstat is not real_fstat:
+            failure(label, "stat/fstat seams were not restored")
+        if os.path.exists(marker):
+            failure(label, "absent-final marker was not cleaned up")
+
+
+absent_final_case("absent-final-boundary", "absent-final-leaf", "absent-final-leaf")
+absent_final_case(
+    "absent-final-boundary-replaced",
+    "absent-final-prefix/leaf",
+    "absent-final-prefix",
+)
+
+
+# A relation that changes between the initial lstat and the one authorized
+# open must be rejected; a stable replacement must not become a retry target.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-relation-open-") as root:
+    paths = fixture(root)
+    original = paths["dynamic"]
+    held = original + ".original"
+    replacement = original + ".replacement"
+    with open(replacement, "wb") as handle:
+        handle.write(b"replacement")
+    os.chmod(replacement, 0o644)
+    armed = [True]
+
+    def replace_before_open(event, args):
+        if event != "open" or not armed[0] or args[0] not in ("dynamic", b"dynamic"):
+            return
+        armed[0] = False
+        os.rename(original, held)
+        os.rename(replacement, original)
+
+    sys.addaudithook(replace_before_open)
+    try:
+        trace = (
+            f'100 openat(AT_FDCWD, "{paths["dynamic"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+            '100 read(3, "data", 4) = 4\n100 close(3) = 0\n100 +++ exited with 0 +++\n'
+        ).encode("ascii")
+        discover(paths, trace)
+    except BaseException as exc:
+        if type(exc) is not module.MutationError:
+            failure("relation-open-replacement", f"expected MutationError, got {type(exc).__name__}: {exc}")
+    else:
+        failure("relation-open-replacement", "accepted stable replacement after open-time mismatch")
+    finally:
+        if os.path.exists(held):
+            if os.path.exists(original):
+                os.rename(original, replacement)
+            os.rename(held, original)
+    if armed[0]:
+        failure("relation-open-replacement", "open-time replacement seam was not reached")
 
 
 if deferred:

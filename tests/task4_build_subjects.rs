@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -32,6 +33,30 @@ const INPUT_LEDGER_LARGE_SIZE: &str = concat!(
     "input-v1\t0\ttool\tread\tpresent\t0644\t2159017984\t",
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "\texternal:/opt/rust/bin/rustc\n",
+);
+
+const INPUT_LEDGER_MAX_SIZE: &str = concat!(
+    "input-v1\t0\ttool\tread\tpresent\t0644\t4294967296\t",
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "\texternal:/opt/rust/bin/rustc-max\n",
+);
+
+const INPUT_LEDGER_OVERSIZE: &str = concat!(
+    "input-v1\t0\ttool\tread\tpresent\t0644\t4294967297\t",
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "\texternal:/opt/rust/bin/rustc-oversize\n",
+);
+
+const INPUT_LEDGER_SPECIAL_CLASSES: &str = concat!(
+    "input-v1\t0\thost-config\tread\tpresent\t0644\t17\t",
+    "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+    "\texternal:/config\n",
+    "input-v1\t1\tlane09-base\tread\tpresent\t0644\t23\t",
+    "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+    "\texternal:/lane09-base\n",
+    "input-v1\t2\tlane09-package\tread\tpresent\t0644\t29\t",
+    "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7",
+    "\texternal:/lane09-package\n",
 );
 
 const INPUT_LEDGER_INVALID: &[(&str, &str)] = &[
@@ -113,6 +138,59 @@ fn snapshot_tree(root: &Path) -> BTreeSet<(PathBuf, &'static str)> {
     entries
 }
 
+fn snapshot_exact_tree(root: &Path) -> BTreeSet<(PathBuf, &'static str, u32, u64, u64, Vec<u8>)> {
+    fn visit(
+        root: &Path,
+        current: &Path,
+        entries: &mut BTreeSet<(PathBuf, &'static str, u32, u64, u64, Vec<u8>)>,
+    ) {
+        let metadata = fs::symlink_metadata(current).expect("read isolated project metadata");
+        let file_type = metadata.file_type();
+        let kind = if file_type.is_dir() {
+            "directory"
+        } else if file_type.is_file() {
+            "regular"
+        } else if file_type.is_symlink() {
+            "symlink"
+        } else {
+            "other"
+        };
+        let content = if file_type.is_file() {
+            fs::read(current).expect("read isolated project file")
+        } else if file_type.is_symlink() {
+            fs::read_link(current)
+                .expect("read isolated project symlink")
+                .into_os_string()
+                .into_vec()
+        } else {
+            Vec::new()
+        };
+        entries.insert((
+            current
+                .strip_prefix(root)
+                .expect("isolated project entry is below root")
+                .to_path_buf(),
+            kind,
+            metadata.permissions().mode() & 0o7777,
+            metadata.dev(),
+            metadata.ino(),
+            content,
+        ));
+        if file_type.is_dir() {
+            for entry in fs::read_dir(current)
+                .expect("read isolated project directory")
+                .map(|entry| entry.expect("read isolated project entry"))
+            {
+                visit(root, &entry.path(), entries);
+            }
+        }
+    }
+
+    let mut entries = BTreeSet::new();
+    visit(root, root, &mut entries);
+    entries
+}
+
 #[test]
 fn input_v1_ledger_round_trip_and_encoder_rejects_invalid_vectors() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -147,6 +225,62 @@ large = os.environ["TASK4_LARGE_SIZE"].encode("ascii")
 large_records = module.parse_ledger(large)
 if module.encode_ledger(large_records) != large:
     raise SystemExit("input-v1 parse/encode changed the large-size bytes")
+maximum = os.environ["TASK4_MAX_SIZE"].encode("ascii")
+maximum_records = module.parse_ledger(maximum)
+if module.encode_ledger(maximum_records) != maximum:
+    raise SystemExit("input-v1 parse/encode changed the maximum-size bytes")
+special_classes = os.environ["TASK4_SPECIAL_CLASSES"].encode("ascii")
+special_records = module.parse_ledger(special_classes)
+if module.encode_ledger(special_records) != special_classes:
+    raise SystemExit("input-v1 parse/encode changed the special-class bytes")
+oversize = os.environ["TASK4_OVERSIZE"].encode("ascii")
+try:
+    module.parse_ledger(oversize)
+except module.FormatError:
+    pass
+else:
+    raise SystemExit("input-v1 parser accepted size 4294967297")
+
+digest = hashlib.sha256(b"abc").hexdigest()
+boundary_locator = "external:/" + "/".join(["a" * 255] * 15 + ["b" * 246])
+if len(boundary_locator.encode("ascii")) != 4096:
+    raise SystemExit("4096-byte locator fixture has the wrong length")
+boundary_record = module.InputRecord(
+    0, "tool", "read", "present", 0o644, 0, digest, boundary_locator
+)
+boundary_bytes = module.encode_ledger([boundary_record])
+if module.parse_ledger(boundary_bytes) != [boundary_record]:
+    raise SystemExit("4096-byte locator did not round-trip")
+locator_4097 = "external:/" + "/".join(["a" * 255] * 15 + ["b" * 247])
+if len(locator_4097.encode("ascii")) != 4097:
+    raise SystemExit("4097-byte locator fixture has the wrong length")
+locator_256 = "external:/" + "c" * 256
+for name, raw in {
+    "4097-byte locator": (
+        f"input-v1\t0\ttool\tread\tpresent\t0644\t0\t{digest}\t{locator_4097}\n"
+    ).encode("ascii"),
+    "256-byte component": (
+        f"input-v1\t0\ttool\tread\tpresent\t0644\t0\t{digest}\t{locator_256}\n"
+    ).encode("ascii"),
+}.items():
+    try:
+        module.parse_ledger(raw)
+    except module.FormatError:
+        continue
+    raise SystemExit(f"{name}: input-v1 parser accepted an invalid locator")
+for name, locator in {
+    "size 4294967297": "external:/oversize",
+    "4097-byte locator": locator_4097,
+    "256-byte component": locator_256,
+}.items():
+    size = 4294967297 if name == "size 4294967297" else 0
+    try:
+        module.encode_ledger(
+            [module.InputRecord(0, "tool", "read", "present", 0o644, size, digest, locator)]
+        )
+    except module.FormatError:
+        continue
+    raise SystemExit(f"{name}: input-v1 encoder accepted an invalid record")
 for item in os.environ["TASK4_INVALID"].split("\x1e"):
     name, raw = item.split("\x1f", 1)
     try:
@@ -189,7 +323,6 @@ for name, raw in generated_invalid.items():
         continue
     raise SystemExit(f"{name}: input-v1 parser accepted an invalid vector")
 
-digest = hashlib.sha256(b"abc").hexdigest()
 encoder_negatives = {
     "boolean-sequence": [
         module.InputRecord(False, "repo", "read", "present", 0o644, 3, digest, "repo:/bool-seq")
@@ -258,6 +391,9 @@ print("input-v1-ok")
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("TASK4_GOLDEN", INPUT_LEDGER_GOLDEN)
         .env("TASK4_LARGE_SIZE", INPUT_LEDGER_LARGE_SIZE)
+        .env("TASK4_MAX_SIZE", INPUT_LEDGER_MAX_SIZE)
+        .env("TASK4_OVERSIZE", INPUT_LEDGER_OVERSIZE)
+        .env("TASK4_SPECIAL_CLASSES", INPUT_LEDGER_SPECIAL_CLASSES)
         .env("TASK4_INVALID", invalid)
         .output()
         .expect("import task4 build-subject script through /usr/bin/python3");
@@ -278,8 +414,62 @@ print("input-v1-ok")
 
 #[test]
 fn input_v1_discovery_api_is_candidate_only() {
+    struct Cleanup(PathBuf);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     let script = repo.join("scripts/task4-build-subject.py");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_nanos();
+    let project = std::env::temp_dir().join(format!(
+        "p11scope-task4-produce-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&project).expect("create isolated project");
+    let _cleanup = Cleanup(project.clone());
+    let scripts = project.join("scripts");
+    fs::create_dir(&scripts).expect("create isolated project scripts directory");
+    let isolated_script = scripts.join("task4-build-subject.py");
+    fs::copy(&script, &isolated_script).expect("copy task4 build-subject script");
+    let script_mode = fs::symlink_metadata(&script)
+        .expect("read task4 build-subject script metadata")
+        .permissions()
+        .mode();
+    fs::set_permissions(&isolated_script, fs::Permissions::from_mode(script_mode))
+        .expect("copy task4 build-subject script mode");
+    let project_before = snapshot_exact_tree(&project);
+    let produce = Command::new("/usr/bin/python3")
+        .args(["scripts/task4-build-subject.py", "produce"])
+        .current_dir(&project)
+        .env_clear()
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("run deferred task4 build-subject producer");
+    assert_eq!(
+        produce.status.code(),
+        Some(77),
+        "produce must remain deferred"
+    );
+    assert!(
+        produce.stdout.is_empty(),
+        "deferred producer wrote to stdout"
+    );
+    assert!(
+        produce.stderr.len() <= 4096,
+        "deferred producer diagnostics exceeded 4096 bytes"
+    );
+    assert_eq!(
+        snapshot_exact_tree(&project),
+        project_before,
+        "deferred producer changed the isolated project tree"
+    );
     let driver = r#"
 import importlib.util
 import inspect
@@ -320,6 +510,9 @@ if any(
     raise SystemExit("discover_input_v1 accepts variadic arguments")
 if any(parameter.default is not inspect.Parameter.empty for parameter in parameters):
     raise SystemExit("discover_input_v1 arguments are not all required")
+for name in ("reconcile_input_v1", "run_reconciled_build"):
+    if callable(getattr(module, name, None)):
+        raise SystemExit(f"{name} is callable on the candidate-only module")
 
 kwargs = dict(
     root_pid=1,

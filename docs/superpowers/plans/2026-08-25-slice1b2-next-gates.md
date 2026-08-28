@@ -126,6 +126,18 @@ The remaining order is 07, 09, 10, 11, 14, 16-never, 16-auto. This
 qualification changes no product Rust/BPF, public schema, privacy allowlist,
 lane oracle, r3, 9.2d, 9.3, 9.4, CI, or Task 10 order.
 
+**Build-subject correction (2026-08-28, accepted):** the first blueprint
+candidate is rejected for incomplete Cargo/Docker input closure. Before the
+seven-blueprint gate, the proposed
+[`2026-08-28-task4-build-subject-decision.md`](../reports/2026-08-28-task4-build-subject-decision.md)
+requires one rootless discovery/review/production build-subject freeze, tracked
+subject authority, final-tip product-affecting compatibility, private consumer
+copies, exact pre-use and replay validation, and a sealed Lane 09 image. Runtime
+lanes 07/09/10/11/16 then consume subjects without Cargo; Lane 14 remains the
+source-bound build/distribution contract. Independent Sol/Terra/Luna review
+accepted this correction; it makes no current build, blueprint, lane, or
+release claim.
+
 The independently reviewed
 [fixed 500 ms owned-pause amendment](../specs/2026-08-27-slice1b2-500ms-pause-amendment.md)
 passed its isolated two-kernel and host candidate-selection gates at

@@ -517,8 +517,9 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     **Task 4 receipt architecture ruling (2026-08-28):** Remaining-lane gate
     receipts use one private Python-stdlib sealed-envelope helper, one shared
     privacy scanner, six lane-owned checkers, and seven committed contracts
-    (`07`, `09`, `10`, `11`, `14`, `16-never`, `16-auto`). The next gate
-    requires seven independently reviewed, design-complete, non-executable
+    (`07`, `09`, `10`, `11`, `14`, `16-never`, `16-auto`). After accepted
+    input/build-subject closure, the blueprint gate requires seven independently
+    reviewed, design-complete, non-executable
     blueprints that select future literal sets,
     normative checker ABIs, resources, privacy mappings, cardinalities, and
     fail-closed caps before implementation; they make no current-output claim.
@@ -540,6 +541,19 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     and remains the single frozen-candidate 9.2d negative control. Product
     Rust/BPF, public v2 schemas, `allowlist-v1`, lane oracles, runtime order, r3,
     9.2d, 9.3, 9.4, exact-tip CI, and Task 10 remain unchanged.**
+
+    **Task 4 build-subject correction (2026-08-28, accepted):** The first
+    seven-blueprint candidate is rejected because selected source rows do not
+    close Cargo or Docker inputs. Before blueprint acceptance, add one reviewed
+    rootless build-subject discovery/production freeze with exhaustive
+    transitive input authority, a fresh sealed Lane 09 image, and final-tip
+    product-affecting compatibility. Lanes 07/09/10/11/16 consume private
+    copied subjects, validate exact registered subject-checker argv before any
+    privilege/container/BPF/resource and again at final replay, and do not run
+    Cargo. Lane 14 remains the source-bound build/distribution contract. The
+    schema and custody helper remain unchanged. Independent Sol/Terra/Luna
+    review accepted `2026-08-28-task4-build-subject-decision.md`; all build and
+    runtime claims remain UNRUN.**
 - **Slice 2 — capture quality**: ring/epoll, budgets, safe-policy params, per-module profile
   sections, filters, snapshots.
 - **Slice 3 — structure**: module split, evidence plumbing, docs consolidation, multi-kernel CI.

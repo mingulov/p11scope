@@ -9454,14 +9454,15 @@ class TupleSubclass(tuple):
 
 INT_MAX = 2**31 - 1
 MAX_U64 = 2**64 - 1
-TAIL = (17, 2**63, MAX_U64 - 1, MAX_U64)
+DUP_TAIL = (17, 2**63, MAX_U64 - 1, MAX_U64, 1)
+DUP2_TAIL = (17, 2**63, MAX_U64 - 1, MAX_U64)
 
 
-def dup2_operation(oldfd=5, newfd=6, tail=TAIL):
+def dup2_operation(oldfd=5, newfd=6, tail=DUP2_TAIL):
     return ("dup2", "fd", (oldfd, newfd, *tail))
 
 
-def dup_operation(oldfd=5, tail=TAIL):
+def dup_operation(oldfd=5, tail=DUP_TAIL):
     return ("dup", "fd", (oldfd, *tail))
 
 
@@ -10016,28 +10017,28 @@ exercise_bad_owner("missing pending identity", missing_pending)
 # Stored owner operations are independently closed-grammar checked before
 # either terminal handler can inspect its result.
 for label, bad_pending in (
-    ("stored operation list", ["dup", "fd", (5, *TAIL)]),
+    ("stored operation list", ["dup", "fd", (5, *DUP_TAIL)]),
     ("stored operation two items", ("dup", "fd")),
-    ("stored operation name", ("close", "fd", (5, *TAIL))),
-    ("stored operation category", ("dup", "path", (5, *TAIL))),
-    ("stored operation arguments list", ("dup", "fd", list((5, *TAIL)))),
-    ("stored operation five args", ("dup", "fd", (5, *TAIL)[:5])),
-    ("stored operation raw bool", ("dup", "fd", (5, True, *TAIL[1:]))),
-    ("stored operation oldfd bool", ("dup", "fd", (True, *TAIL))),
+    ("stored operation name", ("close", "fd", (5, *DUP_TAIL))),
+    ("stored operation category", ("dup", "path", (5, *DUP_TAIL))),
+    ("stored operation arguments list", ("dup", "fd", list((5, *DUP_TAIL)))),
+    ("stored operation five args", ("dup", "fd", (5, *DUP_TAIL)[:5])),
+    ("stored operation raw bool", ("dup", "fd", (5, True, *DUP_TAIL[1:]))),
+    ("stored operation oldfd bool", ("dup", "fd", (True, *DUP_TAIL))),
 ):
     exercise_bad_unrelated_operation(label, bad_pending)
 
 
 for label, bad_pending in (
-    ("stored dup2 operation list", ["dup2", "fd", (5, 6, *TAIL)]),
+    ("stored dup2 operation list", ["dup2", "fd", (5, 6, *DUP2_TAIL)]),
     ("stored dup2 operation two items", ("dup2", "fd")),
-    ("stored dup2 operation name", ("close", "fd", (5, 6, *TAIL))),
-    ("stored dup2 operation category", ("dup2", "path", (5, 6, *TAIL))),
-    ("stored dup2 operation arguments list", ("dup2", "fd", list((5, 6, *TAIL)))),
-    ("stored dup2 operation five args", ("dup2", "fd", (5, 6, *TAIL)[:5])),
-    ("stored dup2 operation raw bool", ("dup2", "fd", (5, 6, True, *TAIL[1:]))),
-    ("stored dup2 operation oldfd bool", ("dup2", "fd", (True, 6, *TAIL))),
-    ("stored dup2 operation newfd bool", ("dup2", "fd", (5, True, *TAIL))),
+    ("stored dup2 operation name", ("close", "fd", (5, 6, *DUP2_TAIL))),
+    ("stored dup2 operation category", ("dup2", "path", (5, 6, *DUP2_TAIL))),
+    ("stored dup2 operation arguments list", ("dup2", "fd", list((5, 6, *DUP2_TAIL)))),
+    ("stored dup2 operation five args", ("dup2", "fd", (5, 6, *DUP2_TAIL)[:5])),
+    ("stored dup2 operation raw bool", ("dup2", "fd", (5, 6, True, *DUP2_TAIL[1:]))),
+    ("stored dup2 operation oldfd bool", ("dup2", "fd", (True, 6, *DUP2_TAIL))),
+    ("stored dup2 operation newfd bool", ("dup2", "fd", (5, True, *DUP2_TAIL))),
 ):
     exercise_bad_unrelated_operation(label, bad_pending)
 
@@ -10045,18 +10046,18 @@ for label, bad_pending in (
 # Admission checks the pending object itself, even with no owners yet.  Only
 # exact dup/dup2, fd, six-u64 tuples with canonical endpoint FDs are accepted.
 for label, bad_pending in (
-    ("pending outer list", ["dup", "fd", (5, *TAIL)]),
-    ("pending outer tuple subclass", TupleSubclass(("dup", "fd", (5, *TAIL)))),
+    ("pending outer list", ["dup", "fd", (5, *DUP_TAIL)]),
+    ("pending outer tuple subclass", TupleSubclass(("dup", "fd", (5, *DUP_TAIL)))),
     ("pending two items", ("dup", "fd")),
-    ("pending four items", ("dup", "fd", (5, *TAIL), "extra")),
-    ("pending wrong name", ("close", "fd", (5, *TAIL))),
-    ("pending name subclass", (StringSubclass("dup"), "fd", (5, *TAIL))),
-    ("pending wrong category", ("dup", "path", (5, *TAIL))),
-    ("pending category subclass", ("dup", StringSubclass("fd"), (5, *TAIL))),
-    ("pending arguments list", ("dup", "fd", list((5, *TAIL)))),
-    ("pending arguments tuple subclass", ("dup", "fd", TupleSubclass((5, *TAIL)))),
-    ("pending five args", ("dup", "fd", (5, *TAIL)[:5])),
-    ("pending seven args", ("dup", "fd", (5, *TAIL) + (7,))),
+    ("pending four items", ("dup", "fd", (5, *DUP_TAIL), "extra")),
+    ("pending wrong name", ("close", "fd", (5, *DUP_TAIL))),
+    ("pending name subclass", (StringSubclass("dup"), "fd", (5, *DUP_TAIL))),
+    ("pending wrong category", ("dup", "path", (5, *DUP_TAIL))),
+    ("pending category subclass", ("dup", StringSubclass("fd"), (5, *DUP_TAIL))),
+    ("pending arguments list", ("dup", "fd", list((5, *DUP_TAIL)))),
+    ("pending arguments tuple subclass", ("dup", "fd", TupleSubclass((5, *DUP_TAIL)))),
+    ("pending five args", ("dup", "fd", (5, *DUP_TAIL)[:5])),
+    ("pending seven args", ("dup", "fd", (5, *DUP_TAIL) + (7,))),
 ):
     state = seed_state()
     state._pending[100] = bad_pending
@@ -10071,7 +10072,7 @@ for position, label in ((0, "dup oldfd"), (1, "dup2 newfd")):
         ("float", 5.0),
         ("None", None),
     ):
-        args = list((5, 6, *TAIL)) if position == 1 else list((5, *TAIL))
+        args = list((5, 6, *DUP2_TAIL)) if position == 1 else list((5, *DUP_TAIL))
         args[position] = bad
         pending = ("dup2", "fd", tuple(args)) if position == 1 else ("dup", "fd", tuple(args))
         state = seed_state()
@@ -10086,7 +10087,7 @@ for suffix, bad in (
     ("float", 5.0),
     ("None", None),
 ):
-    args = list((5, 6, *TAIL))
+    args = list((5, 6, *DUP2_TAIL))
     args[0] = bad
     pending = ("dup2", "fd", tuple(args))
     state = seed_state()
@@ -10100,7 +10101,7 @@ for position in range(2, 6):
         ("negative", -1),
         ("overflow", 2**64),
     ):
-        args = list((5, 6, *TAIL))
+        args = list((5, 6, *DUP2_TAIL))
         args[position] = bad
         pending = ("dup2", "fd", tuple(args))
         state = seed_state()
@@ -10114,7 +10115,7 @@ for position in range(1, 6):
         ("negative", -1),
         ("overflow", 2**64),
     ):
-        args = list((5, *TAIL))
+        args = list((5, *DUP_TAIL))
         args[position] = bad
         pending = ("dup", "fd", tuple(args))
         state = seed_state()

@@ -209,6 +209,54 @@ class _SemanticTraceState:
         del self._pending[tid]
         return receipt
 
+    def finish_dup_syscall(self, *, tid, result, errno):
+        fds = self._fd_table(tid)
+        try:
+            pending = self._pending[tid]
+        except (KeyError, TypeError) as exc:
+            raise FormatError("no pending syscall") from exc
+        if type(pending) is not tuple or len(pending) != 3:
+            raise FormatError("invalid pending syscall")
+        name, category, arguments = pending
+        if type(name) is not str or name != "dup":
+            raise FormatError("invalid pending syscall")
+        if type(category) is not str or category != "fd":
+            raise FormatError("invalid pending syscall")
+        if type(arguments) is not tuple or len(arguments) != 6:
+            raise FormatError("invalid pending syscall")
+        if any(type(value) is not int or not 0 <= value < 2**64 for value in arguments):
+            raise FormatError("invalid pending syscall")
+        oldfd = arguments[0]
+        if oldfd > 2**31 - 1:
+            raise FormatError("invalid dup FD")
+
+        success = type(result) is int and 0 <= result <= 2**31 - 1 and errno is None
+        failure = type(result) is int and result == -1 and type(errno) is int and errno in {9, 24}
+        if not success and not failure:
+            raise FormatError("invalid dup outcome")
+
+        source_present = oldfd in fds
+        if success:
+            if not source_present:
+                raise FormatError("unknown source FD")
+            if result in fds:
+                raise FormatError("occupied result FD")
+            lowest = 0
+            while lowest in fds:
+                lowest += 1
+            if result != lowest:
+                raise FormatError("non-lowest result FD")
+        elif errno == 9 and source_present:
+            raise FormatError("present source FD")
+        elif errno == 24 and not source_present:
+            raise FormatError("unknown source FD")
+
+        receipt = (pending, result, errno)
+        if success:
+            self.dup2(tid=tid, source_fd=oldfd, target_fd=result)
+        del self._pending[tid]
+        return receipt
+
     def _task(self, tid):
         try:
             return self._tasks[tid]

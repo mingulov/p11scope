@@ -154,6 +154,29 @@ root locators reject. Relative syscall paths are resolved from the traced
 process's exact cwd or dirfd. Resolution is lexical and descriptor-relative,
 not `realpath`; inability to resolve the exact cwd, dirfd, or path rejects.
 
+### Custody identity roles
+
+Custody-only relations are weaker than evidence rows. The filesystem root `/`,
+the traced process's exact `cwd`, every intermediate ancestor, and each
+supplied `repo`, `build`, `stable`, `nightly`, or `vendor` anchor are acquired
+once. Their one-attempt acquisition and final parent/name plus held-FD binding
+use only the structural identity `(st_dev,st_ino,S_IFMT(st_mode))`. A mismatch
+is an immediate mutation failure: acquisition is never retried, reopened, or
+accepted from a replacement. Unrelated unobserved child creation or removal
+beneath a held ancestor is not evidence and does not invalidate that binding.
+
+Full nine-field identity `(st_dev,st_ino,uid,gid,st_mode,st_nlink,st_size,
+st_mtime,st_ctime)` begins at the first role-specific observation and
+continues through final validation only for retained regular inputs, ENOTDIR
+blockers, observed symlinks, and emitted directory rows, including the ENOENT
+parent row. An anchor is held to the full nine fields only when it is itself
+evidenced by one of those rows; otherwise it remains structural-only.
+
+The owned build root has a direct descriptor-relative exact-emptiness check at
+both initial setup and final validation, reusing the held-FD `os.listdir`
+operation. Its emptiness is never inferred from timestamps or another
+directory metadata proxy.
+
 `CLASS`, `ACCESS`, `RESULT`, and the value fields obey this exhaustive matrix:
 
 | `CLASS` | Locator namespace | `ACCESS` | `RESULT` | `MODE`, `SIZE`, `SHA256` |
@@ -218,9 +241,12 @@ An absent row names the canonical requested locator after resolving every
 existing prefix. `ENOENT` requires a `directory` row for the nearest existing
 parent and rows for every traversed symlink; `ENOTDIR` requires a present row
 for the first blocking non-directory component and rows for every traversed
-symlink. Production must reproduce the exact errno. `EACCES`, `ELOOP`, unknown
-results, unresolved dirfds/cwds, and all other failures stop discovery for
-schema review rather than being ignored or generalized.
+symlink. After evidence and retained-edge validation, every absent row is
+re-resolved immediately before encoding; production must reproduce the exact
+errno, canonical resolved locator, and held boundary identity. Any mismatch is
+non-pass and is never repaired by retrying acquisition. `EACCES`, `ELOOP`, unknown results, unresolved
+dirfds/cwds, and all other failures stop discovery for schema review rather
+than being ignored or generalized.
 
 The discovery trace must classify every successful regular-file read, mapping,
 or execution, every product-affecting metadata probe, every directory

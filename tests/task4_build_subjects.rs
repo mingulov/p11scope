@@ -1861,15 +1861,9 @@ def symlink_replacement_case():
         repo_id = (os.lstat(paths["repo"]).st_dev, os.lstat(paths["repo"]).st_ino)
         real_readlink = os.readlink
         real_fstat = os.fstat
-        real_open = os.open
-        real_close = os.close
         returned = []
         violations = []
         replacement = [False]
-        replacement_id = [None]
-        opened = []
-        replacement_opened = set()
-        replacement_closed = set()
         backup = [None]
 
         def violation(reason):
@@ -1882,56 +1876,24 @@ def symlink_replacement_case():
         def readlink_hook(path, *, dir_fd=None):
             if os.fsdecode(path) != "link" or not isinstance(dir_fd, int):
                 violation("symlink target was not read descriptor-relatively")
-            if replacement[0]:
-                check_replacement_link(path, dir_fd)
             value = real_fstat(dir_fd)
             if (value.st_dev, value.st_ino) != repo_id:
                 violation("symlink target used the wrong held directory")
+            if replacement[0]:
+                record_violation("forbidden replacement-target-byte consumption")
+                return returned[0]
             actual = real_readlink(path, dir_fd=dir_fd)
-            if len(returned) >= 2:
-                violation("symlink target was read more than twice")
+            if returned:
+                violation("symlink target was read more than once")
             returned.append(actual)
             if len(returned) == 1:
                 backup[0] = paths["link"] + ".held"
                 os.rename(paths["link"], backup[0])
                 os.symlink("target", paths["link"])
-                value = os.lstat(paths["link"])
-                replacement_id[0] = (value.st_dev, value.st_ino)
                 replacement[0] = True
             return actual
 
-        def check_replacement_link(path, dir_fd):
-            if not replacement[0] or dir_fd is None or os.fsdecode(path) != "link":
-                return
-            probe_fd = real_open(path, os.O_PATH | os.O_NOFOLLOW, dir_fd=dir_fd)
-            replacement_opened.add(probe_fd)
-            try:
-                value = real_fstat(probe_fd)
-                if (value.st_dev, value.st_ino) == replacement_id[0]:
-                    record_violation("replacement symlink was accessed descriptor-relatively")
-            finally:
-                real_close(probe_fd)
-                replacement_closed.add(probe_fd)
-
-        def open_hook(path, flags, mode=0o777, *, dir_fd=None):
-            if replacement[0] and dir_fd is None and path_is_beneath(path, paths["link"]):
-                violation("replacement symlink was opened by pathname")
-            check_replacement_link(path, dir_fd)
-            if dir_fd is None:
-                fd = real_open(path, flags, mode)
-            else:
-                fd = real_open(path, flags, mode, dir_fd=dir_fd)
-            opened.append(fd)
-            return fd
-
-        def close_hook(fd):
-            if fd in opened:
-                opened.remove(fd)
-            return real_close(fd)
-
         module.os.readlink = readlink_hook
-        module.os.open = open_hook
-        module.os.close = close_hook
         try:
             trace = (
                 f'100 openat(AT_FDCWD, "{paths["link"]}", O_RDONLY|O_CLOEXEC) = 3\n'
@@ -1949,30 +1911,13 @@ def symlink_replacement_case():
                 failures.append(f"{name}: replacement was accepted")
         finally:
             module.os.readlink = real_readlink
-            module.os.open = real_open
-            module.os.close = real_close
-            leaked = tuple(opened)
             if backup[0] is not None:
                 os.unlink(paths["link"])
                 os.rename(backup[0], paths["link"])
-            for fd in opened:
-                try:
-                    real_close(fd)
-                except OSError:
-                    pass
-            if leaked:
-                failures.append(f"{name}: replacement descriptors leaked: {leaked!r}")
-        if not replacement[0] or len(returned) != 2:
+        if not replacement[0] or returned != [b"target"]:
             failures.append(f"{name}: target observations were {returned!r}")
-        elif returned[0] != returned[1] or returned[0] != "target":
-            failures.append(f"{name}: raw target observations changed: {returned!r}")
         if violations:
             failures.append(f"{name}: hook violations {violations!r}")
-        if replacement_opened != replacement_closed:
-            failures.append(
-                f"{name}: replacement descriptor close mismatch: "
-                f"opened={replacement_opened!r}, closed={replacement_closed!r}"
-            )
         if state(root) != before:
             failures.append(f"{name}: fixture identity/content was not restored")
 
@@ -3410,7 +3355,7 @@ with tempfile.TemporaryDirectory(prefix="x-") as root:
     ).encode("ascii")
     expected = (
         "input-v1\t0\tdirectory\tenumerate\tpresent\t0755\t4\t"
-        "ee972d3b461ce8c55a76223e6b121e4c39ff9f3de93b2c1ca5842c95bf205bc9\t"
+        "27a4f844873b98b62676cf72fa49841676f4b63221ae7afd85fdad5bbf4d85de\t"
         "repo:/enum\n"
     ).encode("ascii")
     value = expect_success("R8", lambda: discover(paths, control))

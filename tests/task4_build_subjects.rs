@@ -5603,3 +5603,331 @@ print("bs2a-final-gap-red-ok")
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn semantic_trace_v1_private_state_topology_contracts() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = repo.join("scripts/task4-build-subject.py");
+    let driver = r#"
+import importlib.util
+import copy
+import sys
+
+spec = importlib.util.spec_from_file_location("task4_build_subject", sys.argv[1])
+if spec is None or spec.loader is None:
+    raise SystemExit("could not import task4 build-subject script")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+
+def expect_format(label, operation, absent_tids=()):
+    before = {
+        tid: copy.deepcopy(state.snapshot(tid=tid))
+        for tid in (100, 101, 102, 103, 104, 105)
+    }
+    try:
+        operation()
+    except BaseException as exc:
+        if type(exc) is not module.FormatError:
+            raise SystemExit(
+                f"{label}: expected FormatError, got {type(exc).__name__}: {exc}"
+            ) from exc
+        after = {
+            tid: copy.deepcopy(state.snapshot(tid=tid))
+            for tid in (100, 101, 102, 103, 104, 105)
+        }
+        if after != before:
+            raise SystemExit(f"{label}: rejected operation mutated semantic state")
+        for tid in absent_tids:
+            try:
+                state.snapshot(tid=tid)
+            except BaseException as snapshot_exc:
+                if type(snapshot_exc) is not module.FormatError:
+                    raise SystemExit(
+                        f"{label}: absent TID {tid} returned "
+                        f"{type(snapshot_exc).__name__}: {snapshot_exc}"
+                    ) from snapshot_exc
+            else:
+                raise SystemExit(f"{label}: rejected operation created TID {tid}")
+    else:
+        raise SystemExit(f"{label}: accepted invalid operation")
+
+
+state = module._SemanticTraceState(
+    root_tid=100,
+    cwd="repo-node",
+    root="root-node",
+    umask=0o022,
+    fds={
+        3: ("source-description", False),
+        4: ("tool-description", True),
+    },
+)
+state.map_file(
+    tid=100,
+    start=0x1000,
+    length=0x1000,
+    node="source-node",
+    offset=0,
+    prot="r",
+    shared=False,
+)
+state.spawn(
+    parent_tid=100,
+    child_tid=101,
+    share_files=True,
+    share_fs=True,
+    share_vm=True,
+    thread_group=True,
+)
+state.spawn(
+    parent_tid=100,
+    child_tid=102,
+    share_files=False,
+    share_fs=False,
+    share_vm=False,
+    thread_group=False,
+)
+state.spawn(
+    parent_tid=100,
+    child_tid=103,
+    share_files=True,
+    share_fs=False,
+    share_vm=False,
+    thread_group=False,
+)
+state.spawn(
+    parent_tid=100,
+    child_tid=104,
+    share_files=False,
+    share_fs=True,
+    share_vm=False,
+    thread_group=False,
+)
+state.spawn(
+    parent_tid=100,
+    child_tid=105,
+    share_files=False,
+    share_fs=False,
+    share_vm=True,
+    thread_group=False,
+)
+
+initial_root = {
+    "tgid": 100,
+    "fds": {
+        3: ("source-description", False),
+        4: ("tool-description", True),
+    },
+    "cwd": "repo-node",
+    "root": "root-node",
+    "umask": 0o022,
+    "maps": {
+        0x1000: (0x1000, "source-node", 0, "r", False),
+    },
+}
+initial_thread = dict(initial_root, tgid=100)
+initial_fork = dict(initial_root, tgid=102)
+if state.snapshot(tid=100) != initial_root:
+    raise SystemExit("root snapshot did not preserve the seeded state")
+if state.snapshot(tid=101) != initial_thread:
+    raise SystemExit("thread-like child did not initially share the seeded state")
+if state.snapshot(tid=102) != initial_fork:
+    raise SystemExit("fork-like child did not initially copy the seeded state")
+
+state.dup2(tid=101, source_fd=3, target_fd=8)
+state.set_cwd(tid=101, node="thread-node")
+state.set_umask(tid=101, value=0o077)
+state.map_file(
+    tid=101,
+    start=0x3000,
+    length=0x1000,
+    node="thread-node",
+    offset=0x1000,
+    prot="rw",
+    shared=True,
+)
+state.close(tid=101, fd=4)
+state.dup2(tid=103, source_fd=3, target_fd=10)
+if state.snapshot(tid=100)["fds"] != {
+    3: ("source-description", False),
+    8: ("source-description", False),
+    10: ("source-description", False),
+} or state.snapshot(tid=103)["fds"] != state.snapshot(tid=100)["fds"]:
+    raise SystemExit("share_files did not expose the FD mutation only through the shared table")
+if state.snapshot(tid=104)["fds"] != {
+    3: ("source-description", False),
+    4: ("tool-description", True),
+} or state.snapshot(tid=105)["fds"] != state.snapshot(tid=104)["fds"]:
+    raise SystemExit("share_files mutation leaked into copied FD tables")
+
+state.set_cwd(tid=104, node="fs-node")
+if state.snapshot(tid=100)["cwd"] != "fs-node" or state.snapshot(tid=101)["cwd"] != "fs-node":
+    raise SystemExit("share_fs did not expose the cwd mutation through the shared context")
+if state.snapshot(tid=104)["umask"] != 0o077:
+    raise SystemExit("share_fs child did not observe the shared umask")
+if state.snapshot(tid=103)["cwd"] != "repo-node" or state.snapshot(tid=105)["cwd"] != "repo-node":
+    raise SystemExit("share_fs mutation leaked into copied FS contexts")
+if state.snapshot(tid=103)["umask"] != 0o022 or state.snapshot(tid=105)["umask"] != 0o022:
+    raise SystemExit("share_fs child mutation changed copied umasks")
+
+state.map_file(
+    tid=105,
+    start=0x5000,
+    length=0x1000,
+    node="vm-node",
+    offset=0,
+    prot="r",
+    shared=False,
+)
+if 0x5000 not in state.snapshot(tid=100)["maps"] or 0x5000 not in state.snapshot(tid=101)["maps"]:
+    raise SystemExit("share_vm did not expose the mapping mutation through the shared table")
+if 0x5000 in state.snapshot(tid=103)["maps"] or 0x5000 in state.snapshot(tid=104)["maps"]:
+    raise SystemExit("share_vm mutation leaked into copied mapping tables")
+
+shared_state = {
+    "tgid": 100,
+    "fds": {
+        3: ("source-description", False),
+        8: ("source-description", False),
+        10: ("source-description", False),
+    },
+    "cwd": "fs-node",
+    "root": "root-node",
+    "umask": 0o077,
+    "maps": {
+        0x1000: (0x1000, "source-node", 0, "r", False),
+        0x3000: (0x1000, "thread-node", 0x1000, "rw", True),
+        0x5000: (0x1000, "vm-node", 0, "r", False),
+    },
+}
+if state.snapshot(tid=100) != shared_state:
+    raise SystemExit("shared child mutations were not visible in the root")
+if state.snapshot(tid=101) != shared_state:
+    raise SystemExit("shared child snapshot diverged from the root")
+
+state.dup2(tid=102, source_fd=4, target_fd=4)
+if state.snapshot(tid=102)["fds"][4] != ("tool-description", True):
+    raise SystemExit("dup2(fd, fd) did not preserve CLOEXEC")
+state.dup2(tid=102, source_fd=3, target_fd=4)
+if state.snapshot(tid=102)["fds"][4] != ("source-description", False):
+    raise SystemExit("dup2 did not atomically replace an existing target")
+state.dup2(tid=102, source_fd=3, target_fd=9)
+state.close(tid=102, fd=4)
+state.set_cwd(tid=102, node="fork-node")
+state.set_umask(tid=102, value=0o027)
+state.map_file(
+    tid=102,
+    start=0x2000,
+    length=0x1000,
+    node="adjacent-node",
+    offset=0,
+    prot="r",
+    shared=False,
+)
+state.map_file(
+    tid=102,
+    start=0x7000,
+    length=0x1000,
+    node="fork-node",
+    offset=0,
+    prot="r",
+    shared=False,
+)
+
+fork_state = {
+    "tgid": 102,
+    "fds": {
+        3: ("source-description", False),
+        9: ("source-description", False),
+    },
+    "cwd": "fork-node",
+    "root": "root-node",
+    "umask": 0o027,
+    "maps": {
+        0x1000: (0x1000, "source-node", 0, "r", False),
+        0x2000: (0x1000, "adjacent-node", 0, "r", False),
+        0x7000: (0x1000, "fork-node", 0, "r", False),
+    },
+}
+if state.snapshot(tid=102) != fork_state:
+    raise SystemExit("fork-like child mutations changed the expected copied state")
+if state.snapshot(tid=100) != shared_state:
+    raise SystemExit("fork-like child mutations leaked into the root")
+
+expect_format(
+    "unknown parent",
+    lambda: state.spawn(
+        parent_tid=999,
+        child_tid=106,
+        share_files=False,
+        share_fs=False,
+        share_vm=False,
+        thread_group=False,
+    ),
+    absent_tids=(106,),
+)
+expect_format("unknown task", lambda: state.snapshot(tid=999), absent_tids=(999,))
+expect_format(
+    "duplicate child TID",
+    lambda: state.spawn(
+        parent_tid=100,
+        child_tid=101,
+        share_files=False,
+        share_fs=False,
+        share_vm=False,
+        thread_group=False,
+    ),
+)
+expect_format("unknown dup2 source FD", lambda: state.dup2(tid=102, source_fd=99, target_fd=10))
+expect_format("closed dup2 source FD", lambda: state.dup2(tid=102, source_fd=4, target_fd=10))
+expect_format("umask bool", lambda: state.set_umask(tid=100, value=True))
+expect_format("umask float", lambda: state.set_umask(tid=100, value=1.0))
+expect_format("umask below range", lambda: state.set_umask(tid=100, value=-1))
+expect_format("umask above range", lambda: state.set_umask(tid=100, value=0o1000))
+for label, start, length, offset in (
+    ("zero mapping length", 0x8000, 0, 0),
+    ("negative mapping length", 0x8000, -1, 0),
+    ("negative mapping start", -1, 1, 0),
+    ("negative mapping offset", 0x8000, 1, -1),
+    ("overlap starts inside", 0x1800, 1, 0),
+    ("overlap starts before and ends inside", 0x0800, 0x1000, 0),
+    ("overlap encloses", 0x0800, 0x2800, 0),
+):
+    expect_format(
+        label,
+        lambda start=start, length=length, offset=offset: state.map_file(
+            tid=100,
+            start=start,
+            length=length,
+            node="bad-node",
+            offset=offset,
+            prot="r",
+            shared=False,
+        ),
+    )
+
+print("bs2b-semantic-state-topology-ok")
+"#;
+    let output = Command::new("/usr/bin/python3")
+        .args(["-c", driver, script.to_str().expect("script path is UTF-8")])
+        .current_dir(repo)
+        .env_clear()
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("run BS2b semantic state topology contract");
+    assert!(
+        output.status.success(),
+        "BS2b semantic state topology contract failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "BS2b semantic state topology driver wrote to stderr"
+    );
+    assert_eq!(
+        output.stdout, b"bs2b-semantic-state-topology-ok\n",
+        "BS2b semantic state topology driver did not complete"
+    );
+}

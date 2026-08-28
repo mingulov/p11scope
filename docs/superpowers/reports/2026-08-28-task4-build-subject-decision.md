@@ -42,6 +42,68 @@ The freeze has two runs:
    build at `build_head` consumes exactly the ledger under a clean environment.
    Any missing, changed, untracked, or additional input is non-pass.
 
+The current BS2a boundary implements only non-production candidate discovery.
+`discover_input_v1` may consume a caller-supplied private trace, but its output
+cannot authorize a build subject and has no production `expected` mode.
+`produce` remains unavailable with exit 77.
+
+Production authority begins only at the later integrated
+`run_reconciled_build` boundary. That runner accepts no caller recipe, argv,
+trace, PID, environment, classifier, or output name. It owns exact-object
+preflight, the complete fixed build set, filesystem and network restriction,
+trace launch/acquisition,
+PID/start-time/nonce binding, complete descendant reap, reconciliation,
+postflight revalidation, and private staging publication as one fail-closed
+transaction.
+
+The private interfaces are closed as follows:
+
+```python
+def discover_input_v1(
+    trace: bytes,
+    *,
+    root_pid: int,
+    initial_cwd: path,
+    repo_root: path,
+    vendor_relative: str,
+    build_root: path,
+    stable_sysroot_root: path,
+    nightly_sysroot_root: path,
+) -> bytes
+
+def run_reconciled_build(
+    *,
+    expected_ledger_fd: int,
+    repo_root: path,
+    vendor_relative: str,
+    stable_sysroot_root: path,
+    nightly_sysroot_root: path,
+    private_parent_fd: int,
+) -> ProductionFreeze
+```
+
+`expected_ledger_fd` must name a held, caller-owned, mode-0600, `nlink=1`,
+stable regular file. Its external rows declare reviewed classes only; the
+runner independently derives every other field. One call runs the closed
+default, small-ring, small-state, and unsafe/freeze Cargo recipes and the sealed
+Lane 09 image producer, then returns the complete staging set or nothing.
+Commands, environment, target names, output names, trace location, and process
+identity are internal constants, never caller inputs.
+
+`private_parent_fd` must be a held, fsync-capable
+`O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW` descriptor for a caller-owned
+mode-0700 directory. Its device, inode, uid, gid, and mode remain stable. The
+runner records the initial descriptor-relative listing, creates nonce-named
+build, trace, and pending-staging children, and holds every created directory.
+The final-staging name must remain absent until pending staging is published
+with `renameat2(RENAME_NOREPLACE)`. Produced files, created directories, and the
+parent are fsynced. Final validation permits exactly the new held final-staging
+entry and its entailed parent link-count/time changes; every initial entry is
+unchanged and every other created identity is absent. The runner removes only
+identities it created. A collision, replacement, link, unexpected namespace
+delta, ownership/mode mismatch, fsync failure, or cleanup uncertainty is
+non-pass.
+
 Cargo is locked and offline. The ledger includes workspace files, manifests,
 lock/config/toolchain files, exact crate-source files, stable/nightly sysroots,
 rust-src/rust-lld, compiler/linker/LLVM tools, and their runtime dynamic
@@ -79,9 +141,11 @@ external:/
 external:/COMPONENT(/COMPONENT)*
 ```
 
-`repo:/` is anchored at the exact `build_head` checkout, `vendor:/` at the
-reviewed candidate vendor root, and `external:/` at filesystem root. A path at
-or beneath the vendor anchor must use `vendor:`; a path beneath either private
+`repo:/` is anchored at the exact `build_head` checkout, and `external:/` at
+filesystem root. The vendor anchor is a reviewed canonical relative path opened
+descriptor-relatively beneath the held repo anchor. An equal, outside,
+symlink-escaped, or independently opened vendor root rejects. A path at or
+beneath the vendor anchor must use `vendor:`; a path beneath either private
 anchor cannot use `external:`. A component is 1..255 raw UTF-8 bytes, is neither
 `.` nor `..`, contains no `/`, NUL, Unicode `Cc`, `Cf`, or `Cs` code point, and
 is not Unicode-normalized or case-folded: its original UTF-8 bytes are
@@ -168,6 +232,42 @@ input or probe and must reproduce every ledger row. Directory hashes grant no
 directory read authority; the sandbox authorizes only the literal resolved
 objects required by the reviewed rows.
 
+Before production launch, every reviewed present, symlink, directory, and
+absent relation is independently reproduced. Present regular inputs remain
+held with `nlink>=1`; distinct hard-link locators remain distinct rows. Landlock
+grants read or execute rights to exact held regular-file objects and `READ_DIR`
+only to reviewed directory rows. No repo, vendor, sysroot, tool parent, or
+filesystem root receives recursive read authority. The initially empty owned
+build root is the only broader filesystem rule.
+
+The production runner acquires the complete private trace itself and binds it
+to its child by PID, kernel start time, nonce handshake, parentage, and reap
+status. Caller-supplied trace bytes or process identities never satisfy
+production. Every held object and locator relation is revalidated after all
+descendants exit. Any mutation, missing or extra operation, incomplete trace,
+restriction failure, network capability, or surviving child is non-pass.
+
+Before launch the runner closes every inherited descriptor except its own
+private pipes and held authority descriptors. The complete producer tree enters
+fresh rootless user, mount, PID, and network namespaces with a private `/proc`;
+the network namespace has no configured interface. The trusted trace supervisor
+and every build/image helper are owned descendants in that boundary. Builds use
+`PTRACE_TRACEME`/parent tracing and are not attachable by peers. Build children
+cannot name a host process and an inherited seccomp filter rejects `socket`,
+`connect`, `sendto`, `sendmmsg`, `io_uring_setup`, `pidfd_getfd`, `ptrace`,
+`process_vm_readv`, and `process_vm_writev`; local `socketpair` IPC may remain.
+The trace supervisor has the same network/FD-theft filter but retains only the
+minimum descendant-`ptrace` operations needed to collect the owned trace. A
+trusted launcher requests `PTRACE_TRACEME` before stacking the tracee's inherited
+deny-`ptrace` filter, and the supervisor confirms the initial stop before exec.
+A Landlock network ruleset grants no TCP bind/connect right. The outer
+orchestrator executes no ledger-controlled byte and has the same network and
+FD-theft denials before supervising the isolated tree. An external OCI daemon,
+daemon socket, host `/proc`, surviving helper, or process outside these controls
+cannot satisfy production. If the host or fixed producer cannot establish and
+retain every boundary, BS2b exits 77 before publication; postflight trace
+comparison is not a network control.
+
 Encoding uses the closed spellings above, canonical decimal/octal forms, and no
 escaping. Parsing followed by canonical encoding must reproduce the exact input
 bytes. Any syntax, matrix, ordering, namespace, bound, filesystem, relation, or
@@ -192,9 +292,10 @@ affecting ledger digest, exact build argv/environment/toolchain identities, and
 each subject's label, SHA-256, size, mode, and profile for independent review.
 
 The Lane 09 archive has its own exact producer closure. Its base image is bound
-by resolved digest/ID. The build is network-free and consumes either exact
-local package bytes or an independently reviewed rootless OCI-builder subject.
-Live `apt`, `apk`, mutable tags, and an undeclared Docker context are forbidden.
+by resolved digest/ID. The build is network-free and consumes exact local
+package bytes through an independently reviewed daemonless rootless OCI-builder
+subject running as an owned filtered descendant. Live `apt`, `apk`, mutable
+tags, external daemons/sockets, and an undeclared Docker context are forbidden.
 
 ## Tracked authority and final-tip compatibility
 

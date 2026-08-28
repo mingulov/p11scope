@@ -7387,6 +7387,20 @@ assert_pending("successful representative local-pair I/O", pair_state, pair_refs
 for endpoint in (pipe_read, pipe_write, socket_left, socket_right):
     if endpoint.offset is not None:
         raise SystemExit("local-pair I/O changed an endpoint offset")
+
+single_endpoint = seed_state()
+single_refs = arm_pending(single_endpoint)
+single_endpoint.install_local_pair(
+    tid=100, first_fd=10, second_fd=11, kind="pipe", cloexec=False
+)
+remaining = single_endpoint.snapshot(tid=100)["fds"][10][0]
+single_endpoint.close(tid=100, fd=11)
+single_endpoint.apply_io_offset(
+    tid=100, fd=10, direction="read", count=1, position=None
+)
+assert_pending("successful single local-pair endpoint I/O", single_endpoint, single_refs)
+if remaining.offset is not None:
+    raise SystemExit("single local-pair endpoint I/O changed its offset")
 for label, fd, direction in (
     ("pipe read direction", 11, "read"),
     ("pipe write direction", 10, "write"),

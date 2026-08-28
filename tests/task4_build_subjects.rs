@@ -651,3 +651,269 @@ print("input-v1-discover-ok")
         "discovery changed the real repository"
     );
 }
+
+#[test]
+fn discover_input_v1_candidate_only_rejects_relation_and_trace_mutation() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = repo.join("scripts/task4-build-subject.py");
+    let driver = r#"
+import importlib.util
+import os
+import stat
+import sys
+import tempfile
+
+spec = importlib.util.spec_from_file_location("task4_build_subject", sys.argv[1])
+if spec is None or spec.loader is None:
+    raise SystemExit("could not import task4 build-subject script")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+
+def metadata(path):
+    value = os.lstat(path)
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_uid,
+        value.st_gid,
+        stat.S_IMODE(value.st_mode),
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def snapshot(root):
+    root = os.fspath(root)
+    entries = []
+
+    def record(path):
+        value = os.lstat(path)
+        if stat.S_ISREG(value.st_mode):
+            content = open(path, "rb").read()
+        elif stat.S_ISLNK(value.st_mode):
+            content = os.readlink(path)
+        else:
+            content = None
+        return metadata(path), content
+
+    def visit(current):
+        children = sorted(os.scandir(current), key=lambda entry: os.fsencode(entry.name))
+        for entry in children:
+            path = entry.path
+            entries.append((os.fsencode(os.path.relpath(path, root)), record(path)))
+            if stat.S_ISDIR(os.lstat(path).st_mode):
+                visit(path)
+
+    anchor = record(root)
+    if stat.S_ISDIR(os.lstat(root).st_mode):
+        visit(root)
+    return anchor, tuple(entries)
+
+
+def fixture(root):
+    os.chmod(root, 0o700)
+    repo = os.path.join(root, "repo")
+    vendor = os.path.join(repo, "vendor")
+    build = os.path.join(root, "build")
+    stable = os.path.join(root, "stable")
+    nightly = os.path.join(root, "nightly")
+    outside = os.path.join(root, "outside")
+    outside_vendor = os.path.join(outside, "vendor")
+    for path in (repo, vendor, stable, nightly, outside, outside_vendor):
+        os.mkdir(path)
+        os.chmod(path, 0o755)
+    os.mkdir(build)
+    os.chmod(build, 0o700)
+    blocker = os.path.join(repo, "blocker")
+    source = os.path.join(repo, "input.txt")
+    with open(blocker, "wb") as handle:
+        handle.write(b"blocker")
+    os.chmod(blocker, 0o600)
+    with open(source, "wb") as handle:
+        handle.write(b"input\n")
+    os.chmod(source, 0o644)
+    return {
+        "root": root,
+        "repo": repo,
+        "vendor": vendor,
+        "build": build,
+        "stable": stable,
+        "nightly": nightly,
+        "outside_vendor": outside_vendor,
+        "source": source,
+    }
+
+
+def trace_for(paths):
+    repo = paths["repo"]
+    source = paths["source"]
+    build = paths["build"]
+    return (
+        f'100 clone(child_stack=NULL, flags=SIGCHLD, child_tidptr=NULL) = 101\n'
+        f'101 getpid() = 101\n'
+        f'101 +++ exited with 0 +++\n'
+        f'100 openat(AT_FDCWD, "{source}", O_RDONLY|O_CLOEXEC) = 3\n'
+        f'100 mmap(NULL, 6, PROT_READ, MAP_PRIVATE, 3, 0) = 0\n'
+        f'100 munmap(0, 6) = 0\n'
+        f'100 read(3, "input\\n", 6) = 6\n'
+        f'100 close(3) = 0\n'
+        f'100 newfstatat(AT_FDCWD, "{repo}/blocker/child", 0x7f, 0) = -1 ENOTDIR (Not a directory)\n'
+        f'100 openat(AT_FDCWD, "{build}/generated.o", O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0600) = 4\n'
+        f'100 write(4, "o", 1) = 1\n'
+        f'100 close(4) = 0\n'
+        f'100 openat(AT_FDCWD, "{build}/generated.o", O_RDONLY|O_CLOEXEC) = 4\n'
+        f'100 read(4, "o", 1) = 1\n'
+        f'100 close(4) = 0\n'
+        f'100 +++ exited with 0 +++\n'
+    ).encode("ascii")
+
+
+def discover(module, paths, trace, *, vendor_relative="vendor", root_pid=100):
+    return module.discover_input_v1(
+        trace,
+        root_pid=root_pid,
+        initial_cwd=paths["repo"],
+        repo_root=paths["repo"],
+        vendor_relative=vendor_relative,
+        build_root=paths["build"],
+        stable_sysroot_root=paths["stable"],
+        nightly_sysroot_root=paths["nightly"],
+    )
+
+
+def anchors(paths):
+    return {
+        name: snapshot(paths[name])
+        for name in ("root", "repo", "vendor", "build", "stable", "nightly")
+    }
+
+
+def assert_unchanged(paths, before):
+    after = anchors(paths)
+    if after != before:
+        raise SystemExit("discovery changed repo/build/sysroot or anchor identity/content")
+    if snapshot(paths["build"])[1]:
+        raise SystemExit("build root is not empty after rejected discovery")
+
+
+def baseline():
+    with tempfile.TemporaryDirectory(prefix="task4-bs2a-c1-") as root:
+        paths = fixture(root)
+        before = anchors(paths)
+        result = discover(module, paths, trace_for(paths))
+        expected = (
+            "input-v1\t0\trepo\tprobe\tpresent\t0600\t7\t"
+            "1a48940a9383be191a715f95a09c7c253b725555cf61f72272482836e8710eef\t"
+            "repo:/blocker\n"
+            "input-v1\t1\tabsent\tprobe\tENOTDIR\t-\t-\t-\t"
+            "repo:/blocker/child\n"
+            "input-v1\t2\trepo\tread\tpresent\t0644\t6\t"
+            "7d3f9b6284c6f36e77b425cac882e8fbbcc97a4727ec20790853076d0f463453\t"
+            "repo:/input.txt\n"
+        ).encode("ascii")
+        if result != expected:
+            raise SystemExit("baseline candidate differs from the literal expected ledger")
+        assert_unchanged(paths, before)
+
+
+def rejected(
+    name,
+    *,
+    mutate_trace=None,
+    vendor_relative="vendor",
+    root_pid=100,
+    escape_vendor=False,
+    absolute_vendor=False,
+):
+    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-c1-{name}-") as root:
+        paths = fixture(root)
+        if escape_vendor:
+            os.rmdir(paths["vendor"])
+            os.symlink(paths["outside_vendor"], paths["vendor"])
+        if absolute_vendor:
+            vendor_relative = os.path.abspath(paths["vendor"])
+        trace = trace_for(paths)
+        if mutate_trace is not None:
+            trace = mutate_trace(trace)
+        before = anchors(paths)
+        try:
+            discover(
+                module,
+                paths,
+                trace,
+                vendor_relative=vendor_relative,
+                root_pid=root_pid,
+            )
+        except (module.FormatError, module.MutationError):
+            pass
+        except BaseException as exc:
+            raise SystemExit(f"{name}: unexpected exception {type(exc).__name__}: {exc}") from exc
+        else:
+            raise SystemExit(f"{name}: mutation was accepted")
+        assert_unchanged(paths, before)
+
+
+def output_read_before_create(raw):
+    lines = raw.splitlines(keepends=True)
+    create = next(index for index, line in enumerate(lines) if b"O_WRONLY|O_CREAT|O_EXCL" in line)
+    read = next(index for index, line in enumerate(lines) if b'generated.o", O_RDONLY' in line)
+    create_block = lines[create : create + 3]
+    read_block = lines[read : read + 3]
+    remaining = lines[:create] + lines[create + 3 : read] + lines[read + 3 :]
+    return b"".join(remaining[:create] + read_block + create_block + remaining[create:])
+
+
+baseline()
+rejected("vendor-dot", vendor_relative=".")
+rejected("vendor-absolute", absolute_vendor=True)
+rejected("vendor-parent", vendor_relative="../outside")
+rejected("vendor-dotdot", vendor_relative="vendor/../vendor")
+rejected("vendor-trailing", vendor_relative="vendor/")
+rejected("vendor-symlink-escape", escape_vendor=True)
+rejected(
+    "errno-mismatch",
+    mutate_trace=lambda raw: raw.replace(
+        b"= -1 ENOTDIR (Not a directory)",
+        b"= -1 ENOENT (No such file or directory)",
+    ),
+)
+rejected("output-read-before-create", mutate_trace=output_read_before_create)
+rejected(
+    "clone-missing",
+    mutate_trace=lambda raw: raw.replace(
+        b"100 clone(child_stack=NULL, flags=SIGCHLD, child_tidptr=NULL) = 101\n", b""
+    ),
+)
+rejected(
+    "child-exit-missing",
+    mutate_trace=lambda raw: raw.replace(b"101 +++ exited with 0 +++\n", b""),
+)
+rejected("wrong-root-pid", root_pid=101)
+rejected(
+    "mmap-unaccounted-fd",
+    mutate_trace=lambda raw: raw.replace(b"MAP_PRIVATE, 3, 0", b"MAP_PRIVATE, 99, 0"),
+)
+print("bs2a-c1-ok")
+"#;
+    let output = Command::new("/usr/bin/python3")
+        .args(["-c", driver, script.to_str().expect("script path is UTF-8")])
+        .current_dir(repo)
+        .env_clear()
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("import task4 build-subject script through /usr/bin/python3");
+    assert!(
+        output.status.success(),
+        "candidate mutation contract failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty(), "mutation driver wrote to stderr");
+    assert_eq!(
+        output.stdout, b"bs2a-c1-ok\n",
+        "mutation driver did not complete"
+    );
+}

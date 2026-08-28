@@ -917,3 +917,433 @@ print("bs2a-c1-ok")
         "mutation driver did not complete"
     );
 }
+
+#[test]
+fn discover_input_v1_candidate_only_detects_two_pass_collection_mutation() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = repo.join("scripts/task4-build-subject.py");
+    let driver = r#"
+import importlib.util
+import os
+import stat
+import sys
+import tempfile
+
+spec = importlib.util.spec_from_file_location("task4_build_subject", sys.argv[1])
+if spec is None or spec.loader is None:
+    raise SystemExit("could not import task4 build-subject script")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+
+def identity(path):
+    value = os.lstat(path)
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_uid,
+        value.st_gid,
+        stat.S_IMODE(value.st_mode),
+        value.st_nlink,
+        value.st_size,
+    )
+
+
+def snapshot(root):
+    root = os.fspath(root)
+    entries = []
+
+    def visit(current):
+        children = sorted(os.scandir(current), key=lambda entry: os.fsencode(entry.name))
+        for entry in children:
+            path = entry.path
+            value = os.lstat(path)
+            if stat.S_ISREG(value.st_mode):
+                content = open(path, "rb").read()
+            elif stat.S_ISLNK(value.st_mode):
+                content = os.readlink(path)
+            else:
+                content = None
+            entries.append(
+                (
+                    os.fsencode(os.path.relpath(path, root)),
+                    identity(path),
+                    content,
+                )
+            )
+            if stat.S_ISDIR(value.st_mode):
+                visit(path)
+
+    anchor = identity(root)
+    visit(root)
+    return anchor, tuple(entries)
+
+
+def fixture(root):
+    os.chmod(root, 0o700)
+    repo = os.path.join(root, "repo")
+    vendor = os.path.join(repo, "vendor")
+    build = os.path.join(root, "build")
+    stable = os.path.join(root, "stable")
+    nightly = os.path.join(root, "nightly")
+    enum = os.path.join(repo, "enum")
+    target = os.path.join(repo, "target")
+    link = os.path.join(repo, "link")
+    for path in (repo, vendor, stable, nightly):
+        os.mkdir(path)
+        os.chmod(path, 0o755)
+    os.mkdir(build)
+    os.chmod(build, 0o700)
+    os.mkdir(enum)
+    os.chmod(enum, 0o755)
+    with open(os.path.join(enum, "a"), "wb") as handle:
+        handle.write(b"a")
+    os.chmod(os.path.join(enum, "a"), 0o644)
+    with open(os.path.join(enum, "b"), "wb") as handle:
+        handle.write(b"b")
+    os.chmod(os.path.join(enum, "b"), 0o644)
+    with open(target, "wb") as handle:
+        handle.write(b"data")
+    os.chmod(target, 0o644)
+    os.symlink("target", link)
+    if stat.S_IMODE(os.lstat(root).st_mode) != 0o700:
+        raise SystemExit("temporary parent is not private")
+    return {
+        "root": root,
+        "repo": repo,
+        "vendor": vendor,
+        "build": build,
+        "stable": stable,
+        "nightly": nightly,
+        "enum": enum,
+        "target": target,
+        "link": link,
+    }
+
+
+def anchors(paths):
+    return {
+        name: snapshot(paths[name])
+        for name in ("root", "repo", "build", "stable", "nightly")
+    }
+
+
+def assert_unchanged(paths, before):
+    if anchors(paths) != before:
+        raise SystemExit("discovery did not restore root/repo/build/sysroot fixtures")
+    if snapshot(paths["build"])[1]:
+        raise SystemExit("build root is not empty after rejected discovery")
+
+
+def discover(paths, trace):
+    return module.discover_input_v1(
+        trace,
+        root_pid=100,
+        initial_cwd=paths["repo"],
+        repo_root=paths["repo"],
+        vendor_relative="vendor",
+        build_root=paths["build"],
+        stable_sysroot_root=paths["stable"],
+        nightly_sysroot_root=paths["nightly"],
+    )
+
+
+def trace_for(paths):
+    return (
+        f'100 openat(AT_FDCWD, "{paths["repo"]}/enum", O_RDONLY|O_CLOEXEC|O_DIRECTORY) = 3\n'
+        f'100 getdents64(3, 0x7f, 32768) = 24\n'
+        f'100 getdents64(3, 0x7f, 32768) = 0\n'
+        f'100 close(3) = 0\n'
+        f'100 openat(AT_FDCWD, "{paths["repo"]}/link", O_RDONLY|O_CLOEXEC) = 4\n'
+        f'100 close(4) = 0\n'
+        f'100 +++ exited with 0 +++\n'
+    ).encode("ascii")
+
+
+expected = (
+    "input-v1\t0\tdirectory\tenumerate\tpresent\t0755\t8\t"
+    "15746dfb2feb256226f09dd7194d1e4906cf72bc293b6e8b651d3bcca496fa37\t"
+    "repo:/enum\n"
+    "input-v1\t1\tsymlink\tprobe\tpresent\t0777\t6\t"
+    "34a04005bcaf206eec990bd9637d9fdb6725e0a0c0d4aebf003f17f4c956eb5c\t"
+    "repo:/link\n"
+    "input-v1\t2\trepo\tread\tpresent\t0644\t4\t"
+    "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7\t"
+    "repo:/target\n"
+).encode("ascii")
+
+
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-c2-baseline-") as root:
+    paths = fixture(root)
+    before = anchors(paths)
+    if discover(paths, trace_for(paths)) != expected:
+        raise SystemExit("baseline candidate differs from the literal expected ledger")
+    assert_unchanged(paths, before)
+
+
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-c2-collection-") as root:
+    paths = fixture(root)
+    before = anchors(paths)
+    real_scandir = os.scandir
+    real_listdir = os.listdir
+    real_fstat = os.fstat
+    real_close = os.close
+    enum_identity = identity(paths["enum"])[0:2]
+    frozen_stat = [None]
+    passes = []
+    target_active = [False]
+    violations = []
+    outstanding_proxies = []
+
+    def violation(reason):
+        violations.append(reason)
+        raise AssertionError(reason)
+
+    def enum_path(target):
+        if isinstance(target, int):
+            return False
+        try:
+            candidate = os.path.realpath(os.path.abspath(os.fsdecode(target)))
+        except (TypeError, ValueError):
+            return False
+        return candidate == paths["enum"]
+
+    def begin_target(target):
+        if enum_path(target):
+            violation("enum collection must use a held directory fd")
+        if not isinstance(target, int):
+            return None
+        try:
+            value = real_fstat(target)
+        except OSError:
+            return None
+        if (value.st_dev, value.st_ino) != enum_identity:
+            return None
+        if target_active[0] or len(passes) >= 2:
+            violation("enum collection must have exactly two target passes")
+        target_active[0] = True
+        if frozen_stat[0] is None:
+            frozen_stat[0] = value
+        return len(passes)
+
+    def complete_target(names):
+        actual = set(names)
+        expected_names = {b"a"} if not passes else {b"a", b"b"}
+        if actual != expected_names:
+            violation(
+                f"enum target pass differs from expected {expected_names!r}: {actual!r}"
+            )
+        passes.append(actual)
+        target_active[0] = False
+
+    class ScandirProxy:
+        def __init__(self, iterator, scan_fd, pass_index):
+            self.iterator = iterator
+            self.scan_fd = scan_fd
+            self.pass_index = pass_index
+            self.names = []
+            self.exhausted = False
+            self.closed = False
+
+        def close(self):
+            if not self.closed:
+                self.closed = True
+                try:
+                    self.iterator.close()
+                finally:
+                    real_close(self.scan_fd)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            try:
+                while True:
+                    entry = next(self.iterator)
+                    name = os.fsencode(entry.name)
+                    if self.pass_index == 0 and name == b"b":
+                        continue
+                    self.names.append(name)
+                    return entry
+            except StopIteration:
+                if not self.exhausted:
+                    self.exhausted = True
+                    self.close()
+                    complete_target(self.names)
+                raise
+            except BaseException:
+                self.close()
+                raise
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+            return False
+
+    def scandir(target):
+        index = begin_target(target)
+        if index is None:
+            return real_scandir(target)
+        scan_fd = os.open(
+            ".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=target
+        )
+        try:
+            proxy = ScandirProxy(real_scandir(scan_fd), scan_fd, index)
+            outstanding_proxies.append(proxy)
+            return proxy
+        except BaseException:
+            real_close(scan_fd)
+            raise
+
+    def listdir(target):
+        index = begin_target(target)
+        if index is None:
+            return real_listdir(target)
+        scan_fd = os.open(
+            ".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=target
+        )
+        try:
+            names = real_listdir(scan_fd)
+            normalized = [os.fsencode(name) for name in names]
+            if index == 0:
+                names = [name for name in names if os.fsencode(name) != b"b"]
+                normalized = [name for name in normalized if name != b"b"]
+            complete_target(normalized)
+            return names
+        finally:
+            real_close(scan_fd)
+
+    def fstat(target):
+        value = real_fstat(target)
+        if (value.st_dev, value.st_ino) == enum_identity:
+            if frozen_stat[0] is None:
+                frozen_stat[0] = value
+            return frozen_stat[0]
+        return value
+
+    module.os.scandir = scandir
+    module.os.listdir = listdir
+    module.os.fstat = fstat
+    mutation = [False]
+    accepted = [False]
+    unexpected = [None]
+    try:
+        try:
+            discover(paths, trace_for(paths))
+        except module.MutationError:
+            mutation[0] = True
+        except BaseException as exc:
+            unexpected[0] = f"{type(exc).__name__}: {exc}"
+        else:
+            accepted[0] = True
+    finally:
+        module.os.scandir = real_scandir
+        module.os.listdir = real_listdir
+        module.os.fstat = real_fstat
+        for proxy in outstanding_proxies:
+            proxy.close()
+    if violations:
+        raise SystemExit(f"collection seam violation: {violations!r}")
+    if unexpected[0] is not None:
+        raise SystemExit(f"collection mutation: unexpected {unexpected[0]}")
+    if accepted[0]:
+        raise SystemExit("collection mutation was accepted")
+    if not mutation[0]:
+        raise SystemExit("collection mutation did not raise MutationError")
+    if module.os is not os:
+        raise SystemExit("module.os identity changed during collection seam")
+    if (
+        module.os.scandir is not real_scandir
+        or module.os.listdir is not real_listdir
+        or module.os.fstat is not real_fstat
+    ):
+        raise SystemExit("collection seam did not restore os function identities")
+    if passes != [{b"a"}, {b"a", b"b"}] or target_active[0]:
+        raise SystemExit(f"collection passes were not exactly A then A+B: {passes!r}")
+    assert_unchanged(paths, before)
+
+
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-c2-symlink-") as root:
+    paths = fixture(root)
+    before = anchors(paths)
+    real_readlink = os.readlink
+    real_fstat = os.fstat
+    repo_identity = identity(paths["repo"])[0:2]
+    returned = []
+    symlink_violations = []
+
+    def symlink_violation(reason):
+        symlink_violations.append(reason)
+        raise AssertionError(reason)
+
+    def readlink(target, *, dir_fd=None):
+        if os.fsdecode(target) != "link" or not isinstance(dir_fd, int):
+            symlink_violation("link probe must use a descriptor-relative component")
+        value = real_fstat(dir_fd)
+        if (value.st_dev, value.st_ino) != repo_identity:
+            symlink_violation("link probe dir_fd is not the held repo directory")
+        actual = real_readlink(target, dir_fd=dir_fd)
+        if len(returned) >= 2:
+            symlink_violation("link target was read more than twice")
+        value = actual if not returned else b"other" if isinstance(actual, bytes) else "other"
+        returned.append(value)
+        return value
+
+    module.os.readlink = readlink
+    mutation = [False]
+    accepted = [False]
+    unexpected = [None]
+    try:
+        try:
+            discover(paths, trace_for(paths))
+        except module.MutationError:
+            mutation[0] = True
+        except BaseException as exc:
+            unexpected[0] = f"{type(exc).__name__}: {exc}"
+        else:
+            accepted[0] = True
+    finally:
+        module.os.readlink = real_readlink
+    if symlink_violations:
+        raise SystemExit(f"symlink seam violation: {symlink_violations!r}")
+    if module.os is not os or module.os.readlink is not real_readlink:
+        raise SystemExit("symlink seam did not restore os/readlink identity")
+    if unexpected[0] is not None:
+        raise SystemExit(f"symlink mutation: unexpected {unexpected[0]}")
+    if accepted[0]:
+        raise SystemExit("symlink mutation was accepted")
+    if not mutation[0]:
+        raise SystemExit("symlink mutation did not raise MutationError")
+    if len(returned) != 2:
+        raise SystemExit(f"symlink probe did not read the raw target twice: {returned!r}")
+    expected_returns = ("target", "other") if isinstance(returned[0], str) else (b"target", b"other")
+    if tuple(returned) != expected_returns:
+        raise SystemExit(f"symlink probe returned unexpected values: {returned!r}")
+    assert_unchanged(paths, before)
+
+print("bs2a-c2-ok")
+"#;
+    let output = Command::new("/usr/bin/python3")
+        .args(["-c", driver, script.to_str().expect("script path is UTF-8")])
+        .current_dir(repo)
+        .env_clear()
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("import task4 build-subject script through /usr/bin/python3");
+    assert!(
+        output.status.success(),
+        "candidate two-pass mutation contract failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "two-pass mutation driver wrote to stderr"
+    );
+    assert_eq!(
+        output.stdout, b"bs2a-c2-ok\n",
+        "two-pass mutation driver did not complete"
+    );
+}

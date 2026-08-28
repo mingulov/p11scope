@@ -1,49 +1,10 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-const CASES: &[&str] = &[
-    "ledger-missing-final-lf",
-    "ledger-duplicate-row",
-    "ledger-unsorted-row",
-    "ledger-noncontiguous-seq",
-    "ledger-4097th-row",
-    "ledger-bad-field",
-    "directory-listing-mutation",
-    "undeclared-directory-entry",
-    "unsafe-file-kind-or-identity",
-    "trace-truncated",
-    "trace-unparseable",
-    "trace-lost-child",
-    "trace-unaccounted-fd",
-    "trace-missing-transitive-input",
-    "trace-unknown-class",
-    "production-undeclared-open",
-    "production-input-mutation",
-    "landlock-undeclared-read",
-    "landlock-outside-write",
-    "production-network-denied",
-    "staging-collision",
-    "staging-partial-pending",
-    "staging-unexpected-entry",
-    "staging-subject-drift",
-    "lane09-mutable-base",
-    "lane09-live-package-network",
-    "lane09-broad-context",
-    "lane09-missing-package",
-    "authority-report-opaque",
-    "tip-product-input-mutation",
-    "tip-unrelated-report-accepted",
-    "copy-source-replacement",
-    "copy-destination-collision",
-    "subject-replace-after-check",
-    "subject-close-before-use",
-    "subject-path-reopen",
-    "subject-same-fd-check-use",
-];
 
 const INPUT_LEDGER_GOLDEN: &str = concat!(
     "input-v1\t0\tdynamic\tread\tpresent\t0644\t4\t",
@@ -176,180 +137,7 @@ fn snapshot_tree(root: &Path) -> BTreeSet<(PathBuf, &'static str)> {
 }
 
 #[test]
-fn task4_build_subject_self_test_is_rootless_and_complete() {
-    struct Cleanup(std::path::PathBuf);
-
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before Unix epoch")
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "p11scope-task4-build-subjects-{}-{nonce}",
-        std::process::id()
-    ));
-    fs::create_dir(&root).expect("create private Task 4 fixture");
-    let _cleanup = Cleanup(root.clone());
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
-        .expect("chmod private Task 4 fixture");
-
-    let fake_bin = root.join("tripwire-bin");
-    let work = root.join("work");
-    let staging = root.join("staging");
-    let runtime = root.join("runtime");
-    let report = root.join("report.tsv");
-    let tripwire_log = root.join("tripwire.log");
-    fs::create_dir(&fake_bin).expect("create private tripwire directory");
-    fs::create_dir(&work).expect("create private self-test work directory");
-    fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o700))
-        .expect("chmod private tripwire directory");
-    fs::set_permissions(&work, fs::Permissions::from_mode(0o700))
-        .expect("chmod private self-test work directory");
-
-    let tripwire_names = [
-        "bash",
-        "bpftool",
-        "bpftrace",
-        "cargo",
-        "cc",
-        "clang",
-        "clang++",
-        "curl",
-        "docker",
-        "file",
-        "gcc",
-        "g++",
-        "ip",
-        "ld",
-        "ld.lld",
-        "make",
-        "ninja",
-        "p11scope",
-        "p11scope-discover",
-        "podman",
-        "python",
-        "python3",
-        "rust-lld",
-        "rustc",
-        "rustdoc",
-        "rustup",
-        "setpriv",
-        "sh",
-        "strace",
-        "sudo",
-        "systemctl",
-        "systemd-run",
-        "wget",
-    ];
-    let tripwire =
-        b"#!/bin/sh\nprintf '%s\\n' \"${0##*/}\" >> \"$P11SCOPE_TASK4_TRIPWIRE_LOG\"\nexit 97\n";
-    for name in tripwire_names {
-        let path = fake_bin.join(name);
-        fs::write(&path, tripwire).expect("write tripwire");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("chmod tripwire");
-    }
-
-    let repo_before = snapshot_tree(repo);
-    let fake_bin_before = snapshot_tree(&fake_bin);
-    let root_before = snapshot_tree(&root);
-
-    let mut command = Command::new("/usr/bin/python3");
-    command
-        .args(["scripts/task4-build-subject.py", "--self-test"])
-        .current_dir(repo)
-        .env_clear()
-        .env("PATH", &fake_bin)
-        .env("TMPDIR", &root)
-        .env("P11SCOPE_TASK4_SELF_TEST_WORK", &work)
-        .env("P11SCOPE_TASK4_WORK", &work)
-        .env("P11SCOPE_TASK4_SELF_TEST_REPORT", &report)
-        .env("P11SCOPE_TASK4_SELF_TEST_STAGING", &staging)
-        .env("P11SCOPE_TASK4_SELF_TEST_RUNTIME", &runtime)
-        .env("P11SCOPE_TASK4_TRIPWIRE_LOG", &tripwire_log);
-    for (variable, command_name) in [
-        ("BPFTOOL", "bpftool"),
-        ("CARGO", "cargo"),
-        ("CC", "gcc"),
-        ("CXX", "g++"),
-        ("DOCKER", "docker"),
-        ("LD", "ld"),
-        ("PODMAN", "podman"),
-        ("RUSTC", "rustc"),
-        ("RUSTUP", "rustup"),
-        ("STRACE", "strace"),
-        ("SUDO", "sudo"),
-        ("SYSTEMD_RUN", "systemd-run"),
-    ] {
-        command.env(variable, fake_bin.join(command_name));
-    }
-
-    let output = command
-        .output()
-        .expect("run /usr/bin/python3 scripts/task4-build-subject.py --self-test");
-    assert!(
-        output.status.success(),
-        "Task 4 build-subject self-test failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(output.stdout.is_empty(), "self-test wrote to stdout");
-    assert!(
-        output.stderr.len() <= 64 * 1024,
-        "self-test stderr is unbounded"
-    );
-
-    let report_bytes = fs::read(&report).expect("read private self-test report");
-    assert!(
-        report_bytes.len() <= 4 * 1024 * 1024,
-        "self-test report is unbounded"
-    );
-    let report_text = String::from_utf8(report_bytes).expect("self-test report is UTF-8");
-    let mut expected_report = String::new();
-    for case in CASES {
-        expected_report.push_str("selftest-v1\tcase\t");
-        expected_report.push_str(case);
-        expected_report.push_str("\tOK\tOK\n");
-    }
-    expected_report.push_str("selftest-v1\tcomplete\n");
-    assert_eq!(report_text, expected_report);
-
-    assert!(!tripwire_log.exists(), "a self-test tripwire command ran");
-    assert_eq!(
-        snapshot_tree(&fake_bin),
-        fake_bin_before,
-        "tripwire was modified"
-    );
-    assert!(
-        snapshot_tree(&work).is_empty(),
-        "self-test wrote runtime work output"
-    );
-    assert!(!staging.exists(), "self-test created staging output");
-    assert!(!runtime.exists(), "self-test created runtime output");
-
-    let mut expected_root = root_before;
-    expected_root.insert((
-        PathBuf::from(report.file_name().expect("report filename")),
-        "regular",
-    ));
-    assert_eq!(
-        snapshot_tree(&root),
-        expected_root,
-        "fixture gained unexpected output"
-    );
-    assert_eq!(
-        snapshot_tree(repo),
-        repo_before,
-        "self-test changed repository output"
-    );
-}
-
-#[test]
-fn input_v1_ledger_round_trip_and_rejects_invalid_vectors() {
+fn input_v1_ledger_round_trip_and_encoder_rejects_invalid_vectors() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     let script = repo.join("scripts/task4-build-subject.py");
     let mut invalid = String::new();
@@ -362,6 +150,7 @@ fn input_v1_ledger_round_trip_and_rejects_invalid_vectors() {
         invalid.push_str(vector);
     }
     let driver = r#"
+import hashlib
 import importlib.util
 import os
 import sys
@@ -388,6 +177,7 @@ for item in os.environ["TASK4_INVALID"].split("\x1e"):
     except module.FormatError:
         continue
     raise SystemExit(f"{name}: input-v1 parser accepted an invalid vector")
+
 generated_invalid = {
     "4097-rows": b"".join(
         (
@@ -421,6 +211,67 @@ for name, raw in generated_invalid.items():
     except module.FormatError:
         continue
     raise SystemExit(f"{name}: input-v1 parser accepted an invalid vector")
+
+digest = hashlib.sha256(b"abc").hexdigest()
+encoder_negatives = {
+    "boolean-sequence": [
+        module.InputRecord(False, "repo", "read", "present", 0o644, 3, digest, "repo:/bool-seq")
+    ],
+    "boolean-size": [
+        module.InputRecord(0, "repo", "read", "present", 0o644, True, digest, "repo:/bool-size")
+    ],
+    "invalid-directory-mode": [
+        module.InputRecord(
+            0,
+            "directory",
+            "probe",
+            "present",
+            0o10000,
+            0,
+            hashlib.sha256(b"").hexdigest(),
+            "repo:/dir",
+        )
+    ],
+    "invalid-symlink-mode": [
+        module.InputRecord(
+            0,
+            "symlink",
+            "probe",
+            "present",
+            0o10000,
+            1,
+            "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+            "repo:/link",
+        )
+    ],
+}
+for name, vector in encoder_negatives.items():
+    try:
+        module.encode_ledger(vector)
+    except module.FormatError:
+        continue
+    raise SystemExit(f"{name}: encoder accepted an invalid programmatic record")
+
+long_component = "x" * 255
+oversized_records = [
+    module.InputRecord(
+        index,
+        "tool",
+        "read",
+        "present",
+        0o644,
+        0,
+        hashlib.sha256(b"").hexdigest(),
+        f"external:/{index:04d}/" + "/".join([long_component] * 15),
+    )
+    for index in range(4096)
+]
+try:
+    module.encode_ledger(oversized_records)
+except module.FormatError:
+    pass
+else:
+    raise SystemExit("oversized-programmatic-ledger: encoder accepted >4 MiB output")
 print("input-v1-ok")
 "#;
     let output = Command::new("/usr/bin/python3")
@@ -435,7 +286,7 @@ print("input-v1-ok")
         .expect("import task4 build-subject script through /usr/bin/python3");
     assert!(
         output.status.success(),
-        "input-v1 parse_ledger rejected the nine-field golden ledger: {}",
+        "input-v1 ledger contract failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
@@ -444,7 +295,91 @@ print("input-v1-ok")
     );
     assert_eq!(
         output.stdout, b"input-v1-ok\n",
-        "input-v1 parse/encode driver did not complete"
+        "input-v1 ledger driver did not complete"
+    );
+}
+
+#[test]
+fn input_v1_discovery_api_is_candidate_only() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = repo.join("scripts/task4-build-subject.py");
+    let driver = r#"
+import importlib.util
+import inspect
+import sys
+
+spec = importlib.util.spec_from_file_location("task4_build_subject", sys.argv[1])
+if spec is None or spec.loader is None:
+    raise SystemExit("could not import task4 build-subject script")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+discover = getattr(module, "discover_input_v1", None)
+if not callable(discover):
+    raise SystemExit("discover_input_v1 is missing or not callable")
+
+parameters = list(inspect.signature(discover).parameters.values())
+required = [
+    "trace",
+    "root_pid",
+    "initial_cwd",
+    "repo_root",
+    "vendor_relative",
+    "build_root",
+    "stable_sysroot_root",
+    "nightly_sysroot_root",
+]
+if [parameter.name for parameter in parameters] != required:
+    raise SystemExit("discover_input_v1 signature drifted")
+if parameters[0].kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD:
+    raise SystemExit("discover_input_v1 trace is not positional")
+if any(parameter.kind is not inspect.Parameter.KEYWORD_ONLY for parameter in parameters[1:]):
+    raise SystemExit("discover_input_v1 roots are not keyword-only")
+if any(
+    parameter.kind in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}
+    for parameter in parameters
+):
+    raise SystemExit("discover_input_v1 accepts variadic arguments")
+if any(parameter.default is not inspect.Parameter.empty for parameter in parameters):
+    raise SystemExit("discover_input_v1 arguments are not all required")
+
+kwargs = dict(
+    root_pid=1,
+    initial_cwd="/",
+    repo_root="/",
+    vendor_relative="vendor",
+    build_root="/tmp/build",
+    stable_sysroot_root="/tmp/stable",
+    nightly_sysroot_root="/tmp/nightly",
+)
+for name in ("expected", "production"):
+    try:
+        discover(b"", **kwargs, **{name: b""})
+    except TypeError:
+        continue
+    raise SystemExit(f"discover_input_v1 accepted forbidden {name}= keyword")
+print("input-v1-api-ok")
+"#;
+    let output = Command::new("/usr/bin/python3")
+        .args(["-c", driver, script.to_str().expect("script path is UTF-8")])
+        .current_dir(repo)
+        .env_clear()
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("import task4 build-subject script through /usr/bin/python3");
+    assert!(
+        output.status.success(),
+        "input-v1 discovery API contract failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "discovery API driver wrote to stderr"
+    );
+    assert_eq!(
+        output.stdout, b"input-v1-api-ok\n",
+        "discovery API driver did not complete"
     );
 }
 

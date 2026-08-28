@@ -138,12 +138,10 @@ fn snapshot_tree(root: &Path) -> BTreeSet<(PathBuf, &'static str)> {
     entries
 }
 
-fn snapshot_exact_tree(root: &Path) -> BTreeSet<(PathBuf, &'static str, u32, u64, u64, Vec<u8>)> {
-    fn visit(
-        root: &Path,
-        current: &Path,
-        entries: &mut BTreeSet<(PathBuf, &'static str, u32, u64, u64, Vec<u8>)>,
-    ) {
+type ExactTreeEntry = (PathBuf, &'static str, u32, u64, u64, Vec<u8>);
+
+fn snapshot_exact_tree(root: &Path) -> BTreeSet<ExactTreeEntry> {
+    fn visit(root: &Path, current: &Path, entries: &mut BTreeSet<ExactTreeEntry>) {
         let metadata = fs::symlink_metadata(current).expect("read isolated project metadata");
         let file_type = metadata.file_type();
         let kind = if file_type.is_dir() {
@@ -777,15 +775,15 @@ rows = [
     ("repo", "probe", "present", "0600", "1", "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881", "repo:/blocker"),
     ("absent", "probe", "ENOTDIR", "-", "-", "-", "repo:/blocker/child"),
     ("directory", "enumerate", "present", "0700", "4", "27a4f844873b98b62676cf72fa49841676f4b63221ae7afd85fdad5bbf4d85de", "repo:/enum"),
-    ("repo", "read", "present", "0600", "1", "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881", "repo:/hard-a"),
-    ("repo", "read", "present", "0600", "1", "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881", "repo:/hard-b"),
+    ("repo", "probe", "present", "0600", "1", "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881", "repo:/hard-a"),
+    ("repo", "probe", "present", "0600", "1", "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881", "repo:/hard-b"),
     ("symlink", "probe", "present", "0777", "5", "4437e55da8273b6a2a433c93548a08cdab55f3e2cba9e08cc080dfdd67d04959", "repo:/link1"),
     ("symlink", "probe", "present", "0777", "19", "21eec616add1a571e58aba55d5f1b9504205384b72a6b40976a4749a3e840b80", "repo:/link2"),
     ("directory", "probe", "present", "0700", "0", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "repo:/probe"),
     ("absent", "probe", "ENOENT", "-", "-", "-", "repo:/probe/missing"),
     ("directory", "probe", "present", "0755", "11", "69342b35fbb91e72cda5d95b052b88fad5f0b111afd2dbb718f45e5778641aa3", "repo:/sub"),
-    ("repo", "read", "present", "0644", "1", "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb", "repo:/sub/café.rs"),
-    ("vendor", "read", "present", "0700", "4", "0eb9e3089dc8479fdc76d897a20c1555c51505d9f13cc97a868af3ef5988dc87", "vendor:/pkg/tool.bin"),
+    ("repo", "probe", "present", "0644", "1", "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb", "repo:/sub/café.rs"),
+    ("vendor", "probe", "present", "0700", "4", "0eb9e3089dc8479fdc76d897a20c1555c51505d9f13cc97a868af3ef5988dc87", "vendor:/pkg/tool.bin"),
 ]
 rows.sort(key=lambda row: row[-1].encode("utf-8"))
 ledger = b"".join(
@@ -1261,7 +1259,7 @@ expected = (
     "input-v1\t1\tsymlink\tprobe\tpresent\t0777\t6\t"
     "34a04005bcaf206eec990bd9637d9fdb6725e0a0c0d4aebf003f17f4c956eb5c\t"
     "repo:/link\n"
-    "input-v1\t2\trepo\tread\tpresent\t0644\t4\t"
+    "input-v1\t2\trepo\tprobe\tpresent\t0644\t4\t"
     "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7\t"
     "repo:/target\n"
 ).encode("ascii")
@@ -2804,7 +2802,7 @@ with tempfile.TemporaryDirectory(prefix="x-") as root:
         "input-v1\t0\tsymlink\tprobe\tpresent\t0777\t6\t"
         "34a04005bcaf206eec990bd9637d9fdb6725e0a0c0d4aebf003f17f4c956eb5c\t"
         "repo:/alias\n"
-        "input-v1\t1\trepo\tread\tpresent\t0644\t3\t"
+        "input-v1\t1\trepo\tprobe\tpresent\t0644\t3\t"
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\t"
         "repo:/target\n"
     ).encode("ascii")
@@ -3537,9 +3535,35 @@ labels = [
     "openat-no-create-mode",
     "openat2-no-create-mode",
     "structural-ancestor-sibling-churn",
+    "vendor-anchor-pre-evidence-churn",
     "unobserved-anchor-sibling-churn",
     "build-root-ephemeral-churn",
+    "build-provisional-enoent-ephemeral-churn",
     "build-root-final-nonempty",
+    "cached-enotdir-blocker-replacement",
+    "cached-enoent-parent-replacement",
+    "absent-symlink-two-reads",
+    "absent-symlink-final-metadata",
+    "build-enoent-before-create",
+    "build-enoent-after-create",
+    "present-regular-final-metadata",
+    "created-output-probe",
+    "build-success-probe-unowned",
+    "hardlinked-symlink-chain",
+    "symlink-dotdot-decoy",
+    "dirfd-fchdir-held-target",
+    "open-only-probe-read-control",
+    "same-locator-symlink-repetition",
+    "symlink-depth-40-success",
+    "absent-enoent-dotdot-floor",
+    "absent-enoent-dotdot-above-floor",
+    "absent-enotdir-dotdot-floor",
+    "absent-enotdir-dotdot-above-floor",
+    "event-time-evidence-baseline",
+    "ledger-symlink-size-zero",
+    "ledger-symlink-size-4097",
+    "ledger-directory-size-4194305",
+    "root-enoent-parent-full-identity",
     "absent-final-boundary",
     "absent-final-boundary-replaced",
     "relation-open-replacement",
@@ -4068,6 +4092,56 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-structural-ancestor-si
         failure("structural-ancestor-sibling-churn", "churn marker was not cleaned up")
 
 
+# The vendor anchor is structural-only until its exact directory probe. A
+# create/remove cycle after anchor custody but before trace evidence must not
+# make that valid empty-directory probe fail.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-vendor-anchor-pre-evidence-churn-") as root:
+    paths = fixture(root)
+    expected = ledger([("directory", "probe", "present", "0755", "0", digest(b""), "vendor:/")])
+    marker = os.path.join(paths["vendor"], "pre-evidence-churn")
+    seam = [False]
+    real_listdir = os.listdir
+    build_identity = os.stat(paths["build"], follow_symlinks=False)
+    before = tuple((*entry[:9], entry[11]) for entry in tree(root))
+
+    def listdir_vendor_anchor(target):
+        result = real_listdir(target)
+        if not seam[0] and isinstance(target, int):
+            value = os.fstat(target)
+            if (value.st_dev, value.st_ino) == (build_identity.st_dev, build_identity.st_ino):
+                if result:
+                    raise AssertionError("build root was not initially empty")
+                os.mkdir(marker)
+                os.rmdir(marker)
+                seam[0] = True
+        return result
+
+    module.os.listdir = listdir_vendor_anchor
+    try:
+        try:
+            actual = discover(paths, (
+                f'100 openat(AT_FDCWD, "{paths["vendor"]}", O_RDONLY|O_DIRECTORY|O_CLOEXEC) = 3\n'
+                "100 close(3) = 0\n100 +++ exited with 0 +++\n"
+            ).encode("ascii"))
+        except BaseException as exc:
+            failure("vendor-anchor-pre-evidence-churn", f"expected success, got {type(exc).__name__}: {exc}")
+        else:
+            if actual != expected:
+                failure("vendor-anchor-pre-evidence-churn", f"ledger mismatch: {actual!r}")
+    finally:
+        module.os.listdir = real_listdir
+        if os.path.isdir(marker):
+            os.rmdir(marker)
+    if not seam[0]:
+        failure("vendor-anchor-pre-evidence-churn", "vendor pre-evidence churn seam was not reached")
+    if module.os.listdir is not real_listdir:
+        failure("vendor-anchor-pre-evidence-churn", "vendor churn seam was not restored")
+    if os.path.exists(marker):
+        failure("vendor-anchor-pre-evidence-churn", "vendor churn marker was not cleaned up")
+    if tuple((*entry[:9], entry[11]) for entry in tree(root)) != before:
+        failure("vendor-anchor-pre-evidence-churn", "fixture content or mode changed")
+
+
 # An unobserved repo sibling must not become an input row. The audit hook fires
 # while the observed input is being acquired, after all named anchors are held.
 with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-unobserved-anchor-sibling-churn-") as root:
@@ -4157,6 +4231,83 @@ with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-build-root-ephemeral-c
         failure("build-root-ephemeral-churn", "listdir seam was not restored")
     if os.path.exists(marker):
         failure("build-root-ephemeral-churn", "ephemeral build-root marker was not cleaned up")
+
+
+# A provisional build-root ENOENT is suppressed by the later exact output
+# create. Churn immediately before the semantic final listdir must not reject
+# the otherwise empty build root.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-build-provisional-enoent-ephemeral-churn-") as root:
+    paths = fixture(root)
+    expected = ledger([regular_row(paths["input"], "repo", "read", "repo")])
+    marker = os.path.join(paths["build"], "provisional-ephemeral-entry")
+    seam = [False]
+    absent_seen = [False]
+    real_stat = os.stat
+    real_listdir = os.listdir
+    build_identity = real_stat(paths["build"], follow_symlinks=False)
+    before = tuple((*entry[:9], entry[11]) for entry in tree(root))
+
+    def is_build_output(target, dir_fd):
+        if not isinstance(dir_fd, int) or os.fsdecode(target) != "generated.o":
+            return False
+        value = os.fstat(dir_fd)
+        return (value.st_dev, value.st_ino) == (build_identity.st_dev, build_identity.st_ino)
+
+    def stat_provisional(target, *, dir_fd=None, follow_symlinks=True):
+        try:
+            return real_stat(target, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        except FileNotFoundError:
+            if is_build_output(target, dir_fd):
+                absent_seen[0] = True
+            raise
+
+    def listdir_provisional(target):
+        result = real_listdir(target)
+        if not seam[0] and absent_seen[0] and isinstance(target, int):
+            value = os.fstat(target)
+            if (value.st_dev, value.st_ino) == (build_identity.st_dev, build_identity.st_ino):
+                if result:
+                    raise AssertionError("build root was not initially empty")
+                os.mkdir(marker)
+                os.rmdir(marker)
+                seam[0] = True
+        return result
+
+    module.os.stat = stat_provisional
+    module.os.listdir = listdir_provisional
+    try:
+        try:
+            missing = f'{paths["build"]}/generated.o'
+            trace = (
+                f'100 newfstatat(AT_FDCWD, "{missing}", 0x7f, 0) = -1 ENOENT (No such file or directory)\n'
+                f'100 openat(AT_FDCWD, "{missing}", O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0600) = 3\n'
+                '100 write(3, "object", 6) = 6\n'
+                '100 close(3) = 0\n'
+                f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 4\n'
+                '100 read(4, "data", 4) = 4\n'
+                '100 close(4) = 0\n100 +++ exited with 0 +++\n'
+            ).encode("ascii")
+            actual = discover(paths, trace)
+        except BaseException as exc:
+            failure("build-provisional-enoent-ephemeral-churn", f"expected success, got {type(exc).__name__}: {exc}")
+        else:
+            if actual != expected:
+                failure("build-provisional-enoent-ephemeral-churn", f"ledger mismatch: {actual!r}")
+    finally:
+        module.os.stat = real_stat
+        module.os.listdir = real_listdir
+        if os.path.isdir(marker):
+            os.rmdir(marker)
+    if not absent_seen[0]:
+        failure("build-provisional-enoent-ephemeral-churn", "provisional build ENOENT seam was not reached")
+    if not seam[0]:
+        failure("build-provisional-enoent-ephemeral-churn", "final build-root listdir seam was not reached")
+    if module.os.stat is not real_stat or module.os.listdir is not real_listdir:
+        failure("build-provisional-enoent-ephemeral-churn", "provisional churn seams were not restored")
+    if os.path.exists(marker):
+        failure("build-provisional-enoent-ephemeral-churn", "provisional churn marker was not cleaned up")
+    if tuple((*entry[:9], entry[11]) for entry in tree(root)) != before:
+        failure("build-provisional-enoent-ephemeral-churn", "fixture content or mode changed")
 
 
 # The build root is checked empty once, then an unrelated late entry must be
@@ -4291,6 +4442,1092 @@ absent_final_case(
     "absent-final-prefix/leaf",
     "absent-final-prefix",
 )
+
+
+# Mutation caught: replacing the cached ENOTDIR blocker after the production
+# final-edge loop must invalidate the final absent replay.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-cached-enotdir-") as root:
+    paths = fixture(root)
+    blocker = os.path.join(paths["repo"], "blocker")
+    backup = blocker + ".held"
+    with open(blocker, "wb") as handle:
+        handle.write(b"blocker")
+    os.chmod(blocker, 0o644)
+    original = os.lstat(blocker)
+    repo_identity = os.stat(paths["repo"], follow_symlinks=False)
+    real_stat = os.stat
+    real_fstat = os.fstat
+    real_read = os.read
+    stat_calls = [0]
+    fstat_calls = [0]
+    collection_read = [False]
+    pending_final_edge = [False]
+    final_edge_observed = [False]
+    replaced = [False]
+
+    def stat_cached_enotdir(target, *, dir_fd=None, follow_symlinks=True):
+        result = real_stat(target, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        if isinstance(dir_fd, int) and os.fsdecode(target) == "blocker" and (
+            real_fstat(dir_fd).st_dev,
+            real_fstat(dir_fd).st_ino,
+        ) == (repo_identity.st_dev, repo_identity.st_ino):
+            stat_calls[0] += 1
+            if collection_read[0]:
+                pending_final_edge[0] = True
+        return result
+
+    def fstat_cached_enotdir(target):
+        result = real_fstat(target)
+        if (result.st_dev, result.st_ino) == (original.st_dev, original.st_ino):
+            fstat_calls[0] += 1
+            if pending_final_edge[0] and collection_read[0] and not replaced[0]:
+                final_edge_observed[0] = True
+                os.rename(blocker, backup)
+                with open(blocker, "wb") as handle:
+                    handle.write(b"replacement")
+                os.chmod(blocker, 0o644)
+                replaced[0] = True
+            pending_final_edge[0] = False
+        return result
+
+    def read_cached_enotdir(fd, size):
+        result = real_read(fd, size)
+        try:
+            value = real_fstat(fd)
+        except OSError:
+            return result
+        if (value.st_dev, value.st_ino) == (original.st_dev, original.st_ino):
+            collection_read[0] = True
+        return result
+
+    module.os.stat = stat_cached_enotdir
+    module.os.fstat = fstat_cached_enotdir
+    module.os.read = read_cached_enotdir
+    try:
+        trace = (
+            f'100 newfstatat(AT_FDCWD, "{paths["repo"]}/blocker/child", 0x7f, 0) = -1 ENOTDIR (Not a directory)\n'
+            f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+            '100 read(3, "data", 4) = 4\n'
+            "100 close(3) = 0\n100 +++ exited with 0 +++\n"
+        ).encode("ascii")
+        try:
+            discover(paths, trace)
+        except BaseException as exc:
+            if type(exc) is not module.MutationError:
+                failure("cached-enotdir-blocker-replacement", f"expected MutationError, got {type(exc).__name__}: {exc}")
+        else:
+            failure("cached-enotdir-blocker-replacement", "accepted replaced cached ENOTDIR blocker")
+    finally:
+        module.os.stat = real_stat
+        module.os.fstat = real_fstat
+        module.os.read = real_read
+        if os.path.exists(backup):
+            if os.path.exists(blocker):
+                os.unlink(blocker)
+            os.rename(backup, blocker)
+    if stat_calls[0] == 0 or fstat_calls[0] == 0 or not final_edge_observed[0]:
+        failure("cached-enotdir-blocker-replacement", f"blocker final edge observations were stat={stat_calls[0]}, fstat={fstat_calls[0]}, final={final_edge_observed[0]}")
+    if not replaced[0]:
+        failure("cached-enotdir-blocker-replacement", "cached ENOTDIR replacement seam was not reached")
+    if module.os.stat is not real_stat or module.os.fstat is not real_fstat or module.os.read is not real_read:
+        failure("cached-enotdir-blocker-replacement", "stat/fstat seams were not restored")
+    if not os.path.exists(blocker) or os.lstat(blocker).st_ino != original.st_ino:
+        failure("cached-enotdir-blocker-replacement", "original blocker was not restored")
+    with open(blocker, "rb") as handle:
+        if handle.read() != b"blocker":
+            failure("cached-enotdir-blocker-replacement", "restored blocker content changed")
+    if os.path.exists(backup):
+        failure("cached-enotdir-blocker-replacement", "cached ENOTDIR backup was not cleaned up")
+
+
+# Mutation caught: replacing the cached nearest existing ENOENT parent after
+# its final edge stat/fstat observation must invalidate absent replay.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-cached-enoent-") as root:
+    paths = fixture(root)
+    parent = os.path.join(paths["repo"], "missing-parent")
+    backup = parent + ".held"
+    os.mkdir(parent)
+    os.chmod(parent, 0o755)
+    original = os.lstat(parent)
+    repo_identity = os.stat(paths["repo"], follow_symlinks=False)
+    real_stat = os.stat
+    real_fstat = os.fstat
+    real_open = os.open
+    stat_calls = [0]
+    fstat_calls = [0]
+    collection_scan = [False]
+    pending_final_edge = [False]
+    final_edge_observed = [False]
+    replaced = [False]
+
+    def stat_cached_enoent(target, *, dir_fd=None, follow_symlinks=True):
+        result = real_stat(target, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        if isinstance(dir_fd, int) and os.fsdecode(target) == "missing-parent" and (
+            real_fstat(dir_fd).st_dev,
+            real_fstat(dir_fd).st_ino,
+        ) == (repo_identity.st_dev, repo_identity.st_ino):
+            stat_calls[0] += 1
+            if collection_scan[0]:
+                pending_final_edge[0] = True
+        return result
+
+    def fstat_cached_enoent(target):
+        result = real_fstat(target)
+        if (result.st_dev, result.st_ino) == (original.st_dev, original.st_ino):
+            fstat_calls[0] += 1
+            if pending_final_edge[0] and collection_scan[0] and not replaced[0]:
+                final_edge_observed[0] = True
+                os.rename(parent, backup)
+                os.mkdir(parent)
+                os.chmod(parent, 0o755)
+                replaced[0] = True
+            pending_final_edge[0] = False
+        return result
+
+    def open_cached_enoent(path, flags, mode=0o777, *, dir_fd=None):
+        fd = real_open(path, flags, mode, dir_fd=dir_fd) if dir_fd is not None else real_open(path, flags, mode)
+        if os.fsdecode(path) == "." and isinstance(dir_fd, int):
+            value = real_fstat(dir_fd)
+            if (value.st_dev, value.st_ino) == (original.st_dev, original.st_ino):
+                collection_scan[0] = True
+        return fd
+
+    module.os.stat = stat_cached_enoent
+    module.os.fstat = fstat_cached_enoent
+    module.os.open = open_cached_enoent
+    try:
+        trace = (
+            f'100 newfstatat(AT_FDCWD, "{paths["repo"]}/missing-parent/missing-leaf", 0x7f, 0) = -1 ENOENT (No such file or directory)\n'
+            f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+            '100 read(3, "data", 4) = 4\n'
+            "100 close(3) = 0\n100 +++ exited with 0 +++\n"
+        ).encode("ascii")
+        try:
+            discover(paths, trace)
+        except BaseException as exc:
+            if type(exc) is not module.MutationError:
+                failure("cached-enoent-parent-replacement", f"expected MutationError, got {type(exc).__name__}: {exc}")
+        else:
+            failure("cached-enoent-parent-replacement", "accepted replaced cached ENOENT parent")
+    finally:
+        module.os.stat = real_stat
+        module.os.fstat = real_fstat
+        module.os.open = real_open
+        if os.path.exists(backup):
+            if os.path.exists(parent):
+                os.rmdir(parent)
+            os.rename(backup, parent)
+    if stat_calls[0] == 0 or fstat_calls[0] == 0 or not final_edge_observed[0]:
+        failure("cached-enoent-parent-replacement", f"parent final edge observations were stat={stat_calls[0]}, fstat={fstat_calls[0]}, final={final_edge_observed[0]}")
+    if not replaced[0]:
+        failure("cached-enoent-parent-replacement", "cached ENOENT replacement seam was not reached")
+    if module.os.stat is not real_stat or module.os.fstat is not real_fstat or module.os.open is not real_open:
+        failure("cached-enoent-parent-replacement", "stat/fstat seams were not restored")
+    if not os.path.exists(parent) or os.lstat(parent).st_ino != original.st_ino:
+        failure("cached-enoent-parent-replacement", "original ENOENT parent was not restored")
+    if os.path.exists(backup):
+        failure("cached-enoent-parent-replacement", "cached ENOENT backup was not cleaned up")
+
+
+# Mutation caught: replaying an absent path through one symlink must reuse its
+# first target observation, producing exactly two total target reads.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-absent-symlink-") as root:
+    paths = fixture(root)
+    link = os.path.join(paths["repo"], "absent-link")
+    os.symlink("missing-target", link)
+    before = tree(root)
+    real_readlink = os.readlink
+    reads = []
+
+    def readlink_absent(target, *, dir_fd=None):
+        reads.append((target, dir_fd))
+        return real_readlink(target, dir_fd=dir_fd)
+
+    module.os.readlink = readlink_absent
+    actual = None
+    try:
+        trace = (
+            f'100 newfstatat(AT_FDCWD, "{paths["repo"]}/absent-link/missing-leaf", 0x7f, 0) = -1 ENOENT (No such file or directory)\n'
+            "100 +++ exited with 0 +++\n"
+        ).encode("ascii")
+        try:
+            actual = discover(paths, trace)
+        except BaseException as exc:
+            failure("absent-symlink-two-reads", f"expected success, got {type(exc).__name__}: {exc}")
+    finally:
+        module.os.readlink = real_readlink
+    if len(reads) != 2:
+        failure("absent-symlink-two-reads", f"symlink target was read {len(reads)} times, expected 2")
+    if any(os.fsdecode(target) != "absent-link" or not isinstance(dir_fd, int) for target, dir_fd in reads):
+        failure("absent-symlink-two-reads", f"symlink reads were not descriptor-relative: {reads!r}")
+    if actual is not None:
+        try:
+            records = module.parse_ledger(actual)
+        except BaseException as exc:
+            failure("absent-symlink-two-reads", f"public ledger parse failed: {type(exc).__name__}: {exc}")
+        else:
+            keys = {(record.klass, record.locator) for record in records}
+            expected = {
+                ("directory", "repo:/"),
+                ("symlink", "repo:/absent-link"),
+                ("absent", "repo:/missing-target/missing-leaf"),
+            }
+            if keys != expected:
+                failure("absent-symlink-two-reads", f"absent symlink ledger keys were {keys!r}")
+    if module.os.readlink is not real_readlink:
+        failure("absent-symlink-two-reads", "readlink seam was not restored")
+    if tree(root) != before:
+        failure("absent-symlink-two-reads", "absent symlink fixture was not cleaned up")
+
+
+# Mutation caught: a symlink metadata-only change at final listdir must fail
+# before final replay reads the cached target again.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-absent-symlink-metadata-") as root:
+    paths = fixture(root)
+    link = os.path.join(paths["repo"], "absent-link")
+    os.symlink("missing-target", link)
+    original = os.lstat(link)
+    real_readlink = os.readlink
+    real_listdir = os.listdir
+    real_fstat = os.fstat
+    build_identity = os.stat(paths["build"], follow_symlinks=False)
+    reads = []
+    listdir_calls = [0]
+    mutated = [False]
+    reads_at_mutation = [None]
+
+    def readlink_metadata(target, *, dir_fd=None):
+        reads.append((target, dir_fd))
+        return real_readlink(target, dir_fd=dir_fd)
+
+    def listdir_metadata(target):
+        result = real_listdir(target)
+        if isinstance(target, int):
+            value = real_fstat(target)
+            if (value.st_dev, value.st_ino) == (build_identity.st_dev, build_identity.st_ino):
+                listdir_calls[0] += 1
+                if listdir_calls[0] == 2:
+                    reads_at_mutation[0] = len(reads)
+                    current = os.lstat(link)
+                    os.utime(
+                        link,
+                        ns=(current.st_atime_ns, current.st_mtime_ns + 1),
+                        follow_symlinks=False,
+                    )
+                    mutated[0] = True
+        return result
+
+    module.os.readlink = readlink_metadata
+    module.os.listdir = listdir_metadata
+    try:
+        trace = (
+            f'100 newfstatat(AT_FDCWD, "{paths["repo"]}/absent-link/missing-leaf", 0x7f, 0) = -1 ENOENT (No such file or directory)\n'
+            "100 +++ exited with 0 +++\n"
+        ).encode("ascii")
+        try:
+            discover(paths, trace)
+        except BaseException as exc:
+            if type(exc) is not module.MutationError:
+                failure("absent-symlink-final-metadata", f"expected MutationError, got {type(exc).__name__}: {exc}")
+        else:
+            failure("absent-symlink-final-metadata", "accepted symlink metadata change")
+    finally:
+        module.os.readlink = real_readlink
+        module.os.listdir = real_listdir
+        try:
+            os.utime(
+                link,
+                ns=(original.st_atime_ns, original.st_mtime_ns),
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            failure("absent-symlink-final-metadata", f"could not restore symlink metadata: {exc}")
+    if listdir_calls[0] != 2:
+        failure("absent-symlink-final-metadata", f"held build-root listdir calls were {listdir_calls[0]}, expected 2")
+    if not mutated[0]:
+        failure("absent-symlink-final-metadata", "symlink metadata seam was not reached")
+    if reads_at_mutation[0] != 2:
+        failure("absent-symlink-final-metadata", f"initial symlink reads before final listdir were {reads_at_mutation[0]}, expected 2")
+    if len(reads) != 2:
+        failure("absent-symlink-final-metadata", f"symlink target was read {len(reads)} times, expected no reads after metadata mutation")
+    if module.os.readlink is not real_readlink or module.os.listdir is not real_listdir:
+        failure("absent-symlink-final-metadata", "symlink metadata seams were not restored")
+    if not os.path.islink(link) or os.readlink(link) != "missing-target":
+        failure("absent-symlink-final-metadata", "symlink target was not cleaned up")
+
+
+# Mutation caught: an ENOENT observation of exact build/generated is ignored
+# only when the later exclusive create proves it was a logical output.
+def build_enoent_case(label, *, after_create):
+    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-final-{label}-") as root:
+        paths = fixture(root)
+        before = tree(root)
+        missing = f'{paths["build"]}/generated'
+        absent = f'100 newfstatat(AT_FDCWD, "{missing}", 0x7f, 0) = -1 ENOENT (No such file or directory)\n'
+        create = f'100 openat(AT_FDCWD, "{missing}", O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0600) = 3\n100 close(3) = 0\n'
+        input_trace = (
+            f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 4\n'
+            '100 read(4, "data", 4) = 4\n'
+            "100 close(4) = 0\n100 +++ exited with 0 +++\n"
+        )
+        trace = (create + absent if after_create else absent + create) + input_trace
+        try:
+            actual = discover(paths, trace.encode("ascii"))
+        except BaseException as exc:
+            if after_create:
+                if type(exc) is not module.FormatError:
+                    failure(label, f"expected FormatError, got {type(exc).__name__}: {exc}")
+            else:
+                failure(label, f"expected repo-only success, got {type(exc).__name__}: {exc}")
+        else:
+            if after_create:
+                failure(label, "accepted ENOENT after logical creation")
+            else:
+                expected = ledger([regular_row(paths["input"], "repo", "read", "repo")])
+                if actual != expected:
+                    failure(label, f"build ENOENT before create emitted more than repo input: {actual!r}")
+                try:
+                    records = module.parse_ledger(actual)
+                except BaseException as exc:
+                    failure(label, f"public ledger parse failed: {type(exc).__name__}: {exc}")
+                else:
+                    if len(records) != 1 or records[0].locator != "repo:/input":
+                        failure(label, f"build ENOENT before create records were {records!r}")
+        if tree(root) != before:
+            failure(label, "build ENOENT fixture was not cleaned up")
+
+
+build_enoent_case("build-enoent-before-create", after_create=False)
+build_enoent_case("build-enoent-after-create", after_create=True)
+
+
+# Mutation caught: present-regular metadata changed at the second held
+# build-root listdir must be rejected by final binding validation.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-present-regular-metadata-") as root:
+    paths = fixture(root)
+    target = paths["dynamic"]
+    original = os.stat(target, follow_symlinks=False)
+    with open(target, "rb") as handle:
+        original_data = handle.read()
+    real_listdir = os.listdir
+    real_fstat = os.fstat
+    build_identity = os.stat(paths["build"], follow_symlinks=False)
+    listdir_calls = [0]
+    mutated = [False]
+
+    def listdir_present_metadata(target_fd):
+        result = real_listdir(target_fd)
+        if isinstance(target_fd, int):
+            value = real_fstat(target_fd)
+            if (value.st_dev, value.st_ino) == (build_identity.st_dev, build_identity.st_ino):
+                listdir_calls[0] += 1
+                if listdir_calls[0] == 2:
+                    os.chmod(target, 0o600)
+                    mutated[0] = True
+        return result
+
+    module.os.listdir = listdir_present_metadata
+    try:
+        trace = (
+            f'100 openat(AT_FDCWD, "{target}", O_RDONLY|O_CLOEXEC) = 3\n'
+            '100 read(3, "data", 4) = 4\n'
+            "100 close(3) = 0\n100 +++ exited with 0 +++\n"
+        ).encode("ascii")
+        try:
+            discover(paths, trace)
+        except BaseException as exc:
+            if type(exc) is not module.MutationError:
+                failure("present-regular-final-metadata", f"expected MutationError, got {type(exc).__name__}: {exc}")
+        else:
+            failure("present-regular-final-metadata", "accepted present-regular metadata change")
+    finally:
+        module.os.listdir = real_listdir
+        os.chmod(target, original.st_mode & 0o7777)
+        os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns), follow_symlinks=False)
+    if listdir_calls[0] != 2:
+        failure("present-regular-final-metadata", f"held build-root listdir calls were {listdir_calls[0]}, expected 2")
+    if not mutated[0]:
+        failure("present-regular-final-metadata", "present-regular metadata seam was not reached")
+    if module.os.listdir is not real_listdir:
+        failure("present-regular-final-metadata", "listdir seam was not restored")
+    restored = os.stat(target, follow_symlinks=False)
+    if (
+        (restored.st_dev, restored.st_ino, restored.st_mode & 0o7777, restored.st_size, restored.st_mtime_ns)
+        != (original.st_dev, original.st_ino, original.st_mode & 0o7777, original.st_size, original.st_mtime_ns)
+    ):
+        failure("present-regular-final-metadata", "present-regular metadata was not restored")
+    with open(target, "rb") as handle:
+        if handle.read() != original_data:
+            failure("present-regular-final-metadata", "present-regular content was not restored")
+
+
+# Mutation caught: a successful probe of a physically present but unowned
+# build-root input must be rejected before it can become a ledger row.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-build-success-probe-") as root:
+    paths = fixture(root)
+    target = os.path.join(paths["build"], "unowned")
+    build_identity = os.stat(paths["build"], follow_symlinks=False)
+    real_listdir = os.listdir
+    real_fstat = os.fstat
+    listdir_calls = [0]
+    created = [False]
+
+    def listdir_unowned_probe(target_fd):
+        if isinstance(target_fd, int):
+            value = real_fstat(target_fd)
+            if (value.st_dev, value.st_ino) == (build_identity.st_dev, build_identity.st_ino):
+                listdir_calls[0] += 1
+                if listdir_calls[0] == 2 and os.path.exists(target):
+                    os.unlink(target)
+        result = real_listdir(target_fd)
+        if listdir_calls[0] == 1:
+            with open(target, "wb") as handle:
+                handle.write(b"data")
+            os.chmod(target, 0o600)
+            created[0] = True
+        return result
+
+    module.os.listdir = listdir_unowned_probe
+    try:
+        trace = (
+            f'100 newfstatat(AT_FDCWD, "{target}", 0x7f, 0) = 0\n'
+            f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 3\n'
+            '100 read(3, "data", 4) = 4\n'
+            "100 close(3) = 0\n100 +++ exited with 0 +++\n"
+        ).encode("ascii")
+        try:
+            discover(paths, trace)
+        except BaseException as exc:
+            if type(exc) is not module.FormatError:
+                failure("build-success-probe-unowned", f"expected FormatError, got {type(exc).__name__}: {exc}")
+        else:
+            failure("build-success-probe-unowned", "accepted successful unowned build probe")
+    finally:
+        module.os.listdir = real_listdir
+        if os.path.exists(target):
+            os.unlink(target)
+    if listdir_calls[0] != 1:
+        failure("build-success-probe-unowned", f"held build-root listdir calls were {listdir_calls[0]}, expected trace-time rejection after first call")
+    if not created[0]:
+        failure("build-success-probe-unowned", "unowned build probe fixture was not activated")
+    if module.os.listdir is not real_listdir:
+        failure("build-success-probe-unowned", "listdir seam was not restored")
+    if os.path.exists(target):
+        failure("build-success-probe-unowned", "unowned build probe file was not cleaned up")
+
+
+# Mutation caught: a successful probe of a logically created build output is
+# evidence of the output event, not an emitted absent or build-root row.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-created-output-probe-") as root:
+    paths = fixture(root)
+    before = tree(root)
+    target = os.path.join(paths["build"], "generated")
+    trace = (
+        f'100 openat(AT_FDCWD, "{target}", O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0600) = 3\n'
+        "100 close(3) = 0\n"
+        f'100 newfstatat(AT_FDCWD, "{target}", 0x7f, 0) = 0\n'
+        f'100 openat(AT_FDCWD, "{paths["input"]}", O_RDONLY|O_CLOEXEC) = 4\n'
+        '100 read(4, "data", 4) = 4\n'
+        "100 close(4) = 0\n100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    try:
+        actual = discover(paths, trace)
+    except BaseException as exc:
+        failure("created-output-probe", f"created output probe was not omitted: {type(exc).__name__}: {exc}")
+    else:
+        expected = ledger([regular_row(paths["input"], "repo", "read", "repo")])
+        if actual != expected:
+            failure("created-output-probe", f"created output probe emitted non-repo rows: {actual!r}")
+        try:
+            records = module.parse_ledger(actual)
+        except BaseException as exc:
+            failure("created-output-probe", f"public ledger parse failed: {type(exc).__name__}: {exc}")
+        else:
+            if len(records) != 1 or records[0].locator != "repo:/input":
+                failure("created-output-probe", f"created output probe records were {records!r}")
+    if tree(root) != before:
+        failure("created-output-probe", "created output probe fixture was not cleaned up")
+
+
+# Mutation caught: distinct hardlinked symlink locators in one resolution
+# chain must not be mistaken for an inode cycle.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-hardlinked-symlink-") as root:
+    paths = fixture(root)
+    directory_a = os.path.join(paths["repo"], "a")
+    directory_b = os.path.join(directory_a, "b")
+    target = os.path.join(paths["repo"], "link")
+    link_a = os.path.join(directory_a, "link")
+    link_b = os.path.join(directory_b, "link")
+    os.mkdir(directory_a)
+    os.mkdir(directory_b)
+    os.chmod(directory_a, 0o755)
+    os.chmod(directory_b, 0o755)
+    with open(target, "wb") as handle:
+        handle.write(b"target")
+    os.chmod(target, 0o644)
+    os.symlink("../link", link_a)
+    os.link(link_a, link_b, follow_symlinks=False)
+    before = tree(root)
+    original_a = os.lstat(link_a)
+    original_b = os.lstat(link_b)
+    if original_a.st_ino != original_b.st_ino:
+        failure("hardlinked-symlink-chain", "hardlinked symlink setup did not share an inode")
+    real_readlink = os.readlink
+    real_fstat = os.fstat
+    parent_labels = {
+        (os.stat(directory_a, follow_symlinks=False).st_dev, os.stat(directory_a, follow_symlinks=False).st_ino): "repo/a",
+        (os.stat(directory_b, follow_symlinks=False).st_dev, os.stat(directory_b, follow_symlinks=False).st_ino): "repo/a/b",
+    }
+    reads = []
+    violations = []
+
+    def readlink_chain(target_name, *, dir_fd=None):
+        if not isinstance(dir_fd, int) or os.fsdecode(target_name) != "link":
+            violations.append("symlink read was not descriptor-relative to link")
+        else:
+            parent = real_fstat(dir_fd)
+            label = parent_labels.get((parent.st_dev, parent.st_ino))
+            if label is None:
+                violations.append("symlink read used an unexpected parent")
+            else:
+                reads.append(label)
+        return real_readlink(target_name, dir_fd=dir_fd)
+
+    module.os.readlink = readlink_chain
+    actual = None
+    try:
+        trace = (
+            f'100 newfstatat(AT_FDCWD, "{link_b}", 0x7f, 0) = 0\n'
+            "100 +++ exited with 0 +++\n"
+        ).encode("ascii")
+        try:
+            actual = discover(paths, trace)
+        except BaseException as exc:
+            failure("hardlinked-symlink-chain", f"hardlinked symlink chain was not accepted: {type(exc).__name__}: {exc}")
+    finally:
+        module.os.readlink = real_readlink
+    if violations:
+        failure("hardlinked-symlink-chain", f"symlink chain seam violations: {violations!r}")
+    if reads.count("repo/a") != 2 or reads.count("repo/a/b") != 2 or len(reads) != 4:
+        failure("hardlinked-symlink-chain", f"symlink reads were {reads!r}, expected two per locator")
+    if actual is not None:
+        try:
+            records = module.parse_ledger(actual)
+        except BaseException as exc:
+            failure("hardlinked-symlink-chain", f"public ledger parse failed: {type(exc).__name__}: {exc}")
+        else:
+            keys = {(record.klass, record.locator) for record in records}
+            expected = {
+                ("symlink", "repo:/a/link"),
+                ("symlink", "repo:/a/b/link"),
+                ("repo", "repo:/link"),
+            }
+            if keys != expected:
+                failure("hardlinked-symlink-chain", f"hardlinked symlink ledger keys were {keys!r}")
+    if module.os.readlink is not real_readlink:
+        failure("hardlinked-symlink-chain", "readlink seam was not restored")
+    if tree(root) != before:
+        failure("hardlinked-symlink-chain", "hardlinked symlink fixture was not cleaned up")
+
+
+# Mutation caught: repeated traversal of one symlink locator is not an inode
+# cycle; the target may be read again while the symlink row stays singular.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-same-locator-") as root:
+    paths = fixture(root)
+    link = os.path.join(paths["repo"], "again")
+    os.symlink(".", link)
+    before = tree(root)
+    real_readlink = os.readlink
+    reads = []
+
+    def readlink_same_locator(target, *, dir_fd=None):
+        if os.fsdecode(target) != "again" or not isinstance(dir_fd, int):
+            failure("same-locator-symlink-repetition", f"symlink read was not repo-relative: {target!r}, {dir_fd!r}")
+        reads.append((target, dir_fd))
+        return real_readlink(target, dir_fd=dir_fd)
+
+    module.os.readlink = readlink_same_locator
+    actual = None
+    try:
+        trace = (
+            f'100 openat(AT_FDCWD, "{paths["repo"]}/again/again/input", O_RDONLY|O_CLOEXEC) = 3\n'
+            '100 read(3, "data", 4) = 4\n'
+            "100 close(3) = 0\n100 +++ exited with 0 +++\n"
+        ).encode("ascii")
+        try:
+            actual = discover(paths, trace)
+        except BaseException as exc:
+            failure("same-locator-symlink-repetition", f"expected success, got {type(exc).__name__}: {exc}")
+    finally:
+        module.os.readlink = real_readlink
+    if len(reads) != 2:
+        failure("same-locator-symlink-repetition", f"same symlink target was read {len(reads)} times, expected 2")
+    if actual is not None:
+        expected = ledger([
+            symlink_row(link, "repo"),
+            regular_row(paths["input"], "repo", "read", "repo"),
+        ])
+        if actual != expected:
+            failure("same-locator-symlink-repetition", f"same-locator ledger mismatch: {actual!r}")
+        try:
+            records = module.parse_ledger(actual)
+        except BaseException as exc:
+            failure("same-locator-symlink-repetition", f"public ledger parse failed: {type(exc).__name__}: {exc}")
+        else:
+            if sum(record.klass == "symlink" for record in records) != 1:
+                failure("same-locator-symlink-repetition", "same locator emitted more than one symlink row")
+    if module.os.readlink is not real_readlink:
+        failure("same-locator-symlink-repetition", "same-locator readlink seam was not restored")
+    if tree(root) != before:
+        failure("same-locator-symlink-repetition", "same-locator fixture changed")
+
+
+# Mutation caught: the depth boundary permits exactly forty distinct symlink
+# links, while the existing forty-one-link case remains a rejection.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-depth-40-") as root:
+    paths = fixture(root)
+    names = [f"chain{index}" for index in range(40)]
+    for index, name in enumerate(names):
+        target = names[index + 1] if index + 1 < len(names) else "input"
+        os.symlink(target, os.path.join(paths["repo"], name))
+    before = tree(root)
+    real_readlink = os.readlink
+    reads = []
+
+    def readlink_depth_40(target, *, dir_fd=None):
+        if os.fsdecode(target) not in names or not isinstance(dir_fd, int):
+            failure("symlink-depth-40-success", f"depth read was not repo-relative: {target!r}, {dir_fd!r}")
+        reads.append(os.fsdecode(target))
+        return real_readlink(target, dir_fd=dir_fd)
+
+    module.os.readlink = readlink_depth_40
+    actual = None
+    try:
+        requested = os.path.join(paths["repo"], names[0])
+        trace = (
+            f'100 openat(AT_FDCWD, "{requested}", O_RDONLY|O_CLOEXEC) = 3\n'
+            '100 read(3, "data", 4) = 4\n'
+            "100 close(3) = 0\n100 +++ exited with 0 +++\n"
+        ).encode("ascii")
+        try:
+            actual = discover(paths, trace)
+        except BaseException as exc:
+            failure("symlink-depth-40-success", f"expected forty-link success, got {type(exc).__name__}: {exc}")
+    finally:
+        module.os.readlink = real_readlink
+    if len(reads) != 80:
+        failure("symlink-depth-40-success", f"forty-link target reads were {len(reads)}, expected 80 total link-follow reads")
+    if actual is not None:
+        try:
+            records = module.parse_ledger(actual)
+        except BaseException as exc:
+            failure("symlink-depth-40-success", f"public ledger parse failed: {type(exc).__name__}: {exc}")
+        else:
+            symlink_records = [record for record in records if record.klass == "symlink"]
+            expected_locators = {f"repo:/{name}" for name in names}
+            if {record.locator for record in symlink_records} != expected_locators:
+                failure("symlink-depth-40-success", "forty-link success did not emit exactly the chain rows")
+            if not any(record.locator == "repo:/input" and record.access == "read" for record in records):
+                failure("symlink-depth-40-success", "forty-link success omitted the resolved input read")
+    if module.os.readlink is not real_readlink:
+        failure("symlink-depth-40-success", "forty-link readlink seam was not restored")
+    if tree(root) != before:
+        failure("symlink-depth-40-success", "forty-link fixture changed")
+
+
+# Mutation caught: an ENOENT suffix must remain below its missing floor;
+# missing/.. must not be normalized into the existing repo anchor.
+def absent_dotdot_case(label, requested_tail, errno, setup, expected_rows=None, expect_error=None):
+    with tempfile.TemporaryDirectory(prefix=f"task4-bs2a-final-{label}-") as root:
+        paths = fixture(root)
+        setup(paths)
+        before = tree(root)
+        trace = (
+            f'100 newfstatat(AT_FDCWD, "{paths["repo"]}/{requested_tail}", 0x7f, 0) = -1 {errno} ({"No such file or directory" if errno == "ENOENT" else "Not a directory"})\n'
+            "100 +++ exited with 0 +++\n"
+        ).encode("ascii")
+        try:
+            actual = discover(paths, trace)
+        except BaseException as exc:
+            if expect_error is None:
+                failure(label, f"expected success, got {type(exc).__name__}: {exc}")
+            elif type(exc) is not expect_error:
+                failure(label, f"expected {expect_error.__name__}, got {type(exc).__name__}: {exc}")
+        else:
+            if expect_error is not None:
+                failure(label, f"accepted invalid suffix, expected {expect_error.__name__}")
+            else:
+                ordered = sorted(expected_rows, key=lambda row: row[-1].encode("utf-8"))
+                expected = b"".join(
+                    (
+                        "\t".join((
+                            "input-v1",
+                            str(index),
+                            row[0],
+                            row[1],
+                            errno if row[0] == "absent" else row[2],
+                            row[3] if row[3] is not None else "-",
+                            row[4] if row[4] is not None else "-",
+                            row[5] if row[5] is not None else "-",
+                            row[6],
+                        )) + "\n"
+                    ).encode("utf-8")
+                    for index, row in enumerate(ordered)
+                )
+                if actual != expected:
+                    failure(label, f"absent suffix ledger mismatch: {actual!r}")
+        if tree(root) != before:
+            failure(label, "absent suffix fixture changed")
+
+
+absent_dotdot_case(
+    "absent-enoent-dotdot-floor",
+    "missing/a/../b",
+    "ENOENT",
+    lambda paths: None,
+    expected_rows=[
+        ("directory", "probe", "present", "0755", "29", digest(b"D\x00\tdirectoryF\x00\x05inputD\x00\x06vendor"), "repo:/"),
+        ("absent", "probe", None, None, None, None, "repo:/missing/b"),
+    ],
+)
+absent_dotdot_case(
+    "absent-enoent-dotdot-above-floor",
+    "missing/..",
+    "ENOENT",
+    lambda paths: None,
+    expect_error=module.FormatError,
+)
+
+
+def setup_blocker(paths):
+    blocker = os.path.join(paths["repo"], "blocker")
+    with open(blocker, "wb") as handle:
+        handle.write(b"blocker")
+    os.chmod(blocker, 0o644)
+
+
+absent_dotdot_case(
+    "absent-enotdir-dotdot-floor",
+    "blocker/a/../b",
+    "ENOTDIR",
+    setup_blocker,
+    expected_rows=[
+        ("repo", "probe", "present", "0644", "7", digest(b"blocker"), "repo:/blocker"),
+        ("absent", "probe", None, None, None, None, "repo:/blocker/b"),
+    ],
+)
+absent_dotdot_case(
+    "absent-enotdir-dotdot-above-floor",
+    "blocker/child/..",
+    "ENOTDIR",
+    setup_blocker,
+    expect_error=module.FormatError,
+)
+
+
+# Mutation caught: mutating a resolved regular object's full identity after
+# its first held-fd observation must be rejected, not baseline-captured later.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-event-time-baseline-") as root:
+    paths = fixture(root)
+    target = paths["dynamic"]
+    original = os.stat(target, follow_symlinks=False)
+    target_identity = (original.st_dev, original.st_ino)
+    real_open = os.open
+    real_fstat = os.fstat
+    target_fd = [None]
+    resolved = [False]
+    mutated = [False]
+
+    def open_event(path, flags, mode=0o777, *, dir_fd=None):
+        fd = real_open(path, flags, mode, dir_fd=dir_fd) if dir_fd is not None else real_open(path, flags, mode)
+        value = real_fstat(fd)
+        if (value.st_dev, value.st_ino) == target_identity:
+            target_fd[0] = fd
+        return fd
+
+    def fstat_event(fd):
+        value = real_fstat(fd)
+        if fd == target_fd[0] and not resolved[0]:
+            resolved[0] = True
+            os.chmod(target, 0o600)
+            mutated[0] = True
+        return value
+
+    module.os.open = open_event
+    module.os.fstat = fstat_event
+    try:
+        trace = (
+            f'100 openat(AT_FDCWD, "{target}", O_RDONLY|O_CLOEXEC) = 3\n'
+            '100 read(3, "data", 4) = 4\n'
+            "100 close(3) = 0\n100 +++ exited with 0 +++\n"
+        ).encode("ascii")
+        try:
+            discover(paths, trace)
+        except BaseException as exc:
+            if type(exc) is not module.MutationError:
+                failure("event-time-evidence-baseline", f"expected MutationError, got {type(exc).__name__}: {exc}")
+        else:
+            failure("event-time-evidence-baseline", "accepted post-resolution identity mutation")
+    finally:
+        module.os.open = real_open
+        module.os.fstat = real_fstat
+        os.chmod(target, original.st_mode & 0o7777)
+        os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns), follow_symlinks=False)
+    if not resolved[0] or not mutated[0]:
+        failure("event-time-evidence-baseline", "event-time identity seam was not activated")
+    if module.os.open is not real_open or module.os.fstat is not real_fstat:
+        failure("event-time-evidence-baseline", "event-time seams were not restored")
+    restored = os.stat(target, follow_symlinks=False)
+    if (
+        restored.st_dev,
+        restored.st_ino,
+        restored.st_mode & 0o7777,
+        restored.st_size,
+        restored.st_mtime_ns,
+    ) != (
+        original.st_dev,
+        original.st_ino,
+        original.st_mode & 0o7777,
+        original.st_size,
+        original.st_mtime_ns,
+    ):
+        failure("event-time-evidence-baseline", "event-time identity metadata was not restored")
+
+
+# Mutation caught: public ledger validation must reject class-specific size
+# bounds even when every other field is a literal valid record.
+def ledger_size_case(label, klass, size, mode, locator_value, digest_value):
+    record = module.InputRecord(0, klass, "probe", "present", mode, size, digest_value, locator_value)
+    try:
+        module.encode_ledger([record])
+    except module.FormatError:
+        pass
+    else:
+        failure(label, "encoder accepted invalid class-specific size")
+    literal = (
+        f"input-v1\\t0\\t{klass}\\tprobe\\tpresent\\t{mode:04o}\\t{size}\\t{digest_value}\\t{locator_value}\\n"
+    ).encode("ascii")
+    try:
+        module.parse_ledger(literal)
+    except module.FormatError:
+        pass
+    else:
+        failure(label, "parser accepted invalid class-specific size")
+
+
+ledger_size_case("ledger-symlink-size-zero", "symlink", 0, 0o777, "repo:/size-link", digest(b"target"))
+ledger_size_case("ledger-symlink-size-4097", "symlink", 4097, 0o777, "repo:/size-link-4097", digest(b"target"))
+ledger_size_case("ledger-directory-size-4194305", "directory", 4194305, 0o755, "repo:/size-directory", digest(b""))
+
+
+# Mutation caught: a final root full-identity-only change must invalidate an
+# emitted external:/ ENOENT-parent directory evidence row.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-root-identity-") as root:
+    paths = fixture(root)
+    before = tree(root)
+    real_fstat = os.fstat
+    root_stat = os.stat("/", follow_symlinks=False)
+    root_identity = (root_stat.st_dev, root_stat.st_ino)
+    fake_root = os.stat_result(
+        (
+            root_stat.st_mode,
+            root_stat.st_ino,
+            root_stat.st_dev,
+            root_stat.st_nlink,
+            root_stat.st_uid,
+            root_stat.st_gid,
+            root_stat.st_size,
+            root_stat.st_atime,
+            root_stat.st_mtime + 1.0,
+            root_stat.st_ctime,
+        )
+    )
+    root_fstat_calls = [0]
+    mutated = [False]
+    mocked = [0]
+
+    def fstat_root_identity(target):
+        value = real_fstat(target)
+        if (value.st_dev, value.st_ino) == root_identity:
+            root_fstat_calls[0] += 1
+            if root_fstat_calls[0] == 6:
+                mutated[0] = True
+                mocked[0] += 1
+                return fake_root
+        return value
+
+    module.os.fstat = fstat_root_identity
+    actual = None
+    try:
+        trace = b'100 newfstatat(AT_FDCWD, "/missing", 0x7f, 0) = -1 ENOENT (No such file or directory)\n100 +++ exited with 0 +++\n'
+        try:
+            actual = discover(paths, trace)
+        except BaseException as exc:
+            if type(exc) is not module.MutationError:
+                failure("root-enoent-parent-full-identity", f"expected MutationError, got {type(exc).__name__}: {exc}")
+        else:
+            failure("root-enoent-parent-full-identity", "accepted root evidence full-identity change")
+            try:
+                records = module.parse_ledger(actual)
+            except BaseException as exc:
+                failure("root-enoent-parent-full-identity", f"public ledger parse failed: {type(exc).__name__}: {exc}")
+            else:
+                keys = {(record.klass, record.locator) for record in records}
+                expected = {("directory", "external:/"), ("absent", "external:/missing")}
+                if keys != expected:
+                    failure("root-enoent-parent-full-identity", f"root ENOENT ledger keys were {keys!r}")
+    finally:
+        module.os.fstat = real_fstat
+    if root_fstat_calls[0] != 6 or not mutated[0] or mocked[0] != 1:
+        failure("root-enoent-parent-full-identity", f"required root fstat call6 was not activated: calls={root_fstat_calls[0]}, mock_calls={mocked[0]}")
+    if module.os.fstat is not real_fstat:
+        failure("root-enoent-parent-full-identity", "root identity seams were not restored")
+    if tree(root) != before:
+        failure("root-enoent-parent-full-identity", "root identity fixture was not cleaned up")
+
+
+# Mutation caught: a symlink must resolve before a later dotdot component;
+# lexically collapsing hop/.. would consume the repo decoy instead.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-symlink-dotdot-") as root:
+    paths = fixture(root)
+    outside = os.path.join(root, "outside")
+    outside_dir = os.path.join(outside, "dir")
+    os.mkdir(outside)
+    os.mkdir(outside_dir)
+    secret = os.path.join(outside, "secret")
+    with open(secret, "wb") as handle:
+        handle.write(b"actual")
+    os.chmod(secret, 0o644)
+    decoy = os.path.join(paths["repo"], "secret")
+    with open(decoy, "wb") as handle:
+        handle.write(b"decoy")
+    os.chmod(decoy, 0o644)
+    hop = os.path.join(paths["repo"], "hop")
+    os.symlink("../outside/dir", hop)
+    before = tree(root)
+    trace = (
+        f'100 openat(AT_FDCWD, "{paths["repo"]}/hop/../secret", O_RDONLY|O_CLOEXEC) = 3\n'
+        '100 read(3, "actual", 6) = 6\n'
+        "100 close(3) = 0\n100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    try:
+        actual = discover(paths, trace)
+    except BaseException as exc:
+        failure("symlink-dotdot-decoy", f"expected success, got {type(exc).__name__}: {exc}")
+    else:
+        expected = ledger([
+            symlink_row(hop, "repo"),
+            regular_row(secret, "tool", "read", "external"),
+        ])
+        if actual != expected:
+            failure("symlink-dotdot-decoy", f"symlink-before-dotdot ledger mismatch: {actual!r}")
+        try:
+            records = module.parse_ledger(actual)
+        except BaseException as exc:
+            failure("symlink-dotdot-decoy", f"public ledger parse failed: {type(exc).__name__}: {exc}")
+        else:
+            if "repo:/secret" in {record.locator for record in records}:
+                failure("symlink-dotdot-decoy", "resolved repo decoy instead of external secret")
+    if tree(root) != before:
+        failure("symlink-dotdot-decoy", "symlink-before-dotdot fixture changed")
+
+
+# Mutation caught: a directory symlink held as a dirfd must anchor both
+# relative openat and post-fchdir AT_FDCWD paths at its resolved target.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-dirfd-fchdir-") as root:
+    paths = fixture(root)
+    left = os.path.join(paths["repo"], "left")
+    right = os.path.join(paths["repo"], "right")
+    right_inner = os.path.join(right, "inner")
+    os.mkdir(left)
+    os.mkdir(right)
+    os.mkdir(right_inner)
+    for directory in (left, right, right_inner):
+        os.chmod(directory, 0o755)
+    left_decoy = os.path.join(left, "sibling")
+    right_sibling = os.path.join(right, "sibling")
+    for path, data in ((left_decoy, b"left"), (right_sibling, b"right")):
+        with open(path, "wb") as handle:
+            handle.write(data)
+        os.chmod(path, 0o644)
+    directory_link = os.path.join(left, "dir")
+    os.symlink("../right/inner", directory_link)
+    before = tree(root)
+    trace = (
+        f'100 openat(AT_FDCWD, "{directory_link}", O_RDONLY|O_DIRECTORY|O_CLOEXEC) = 3\n'
+        '100 openat(3, "../sibling", O_RDONLY|O_CLOEXEC) = 4\n'
+        '100 read(4, "right", 5) = 5\n'
+        "100 close(4) = 0\n"
+        '100 fchdir(3) = 0\n'
+        '100 openat(AT_FDCWD, "../sibling", O_RDONLY|O_CLOEXEC) = 5\n'
+        '100 read(5, "right", 5) = 5\n'
+        "100 close(5) = 0\n100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    try:
+        actual = discover(paths, trace)
+    except BaseException as exc:
+        failure("dirfd-fchdir-held-target", f"expected success, got {type(exc).__name__}: {exc}")
+    else:
+        expected = ledger([
+            ("directory", "probe", "present", "0755", "0", digest(b""), "repo:/right/inner"),
+            ("repo", "read", "present", "0644", "5", digest(b"right"), "repo:/right/sibling"),
+            (*symlink_row(directory_link, "repo")[:-1], "repo:/left/dir"),
+        ])
+        if actual != expected:
+            failure("dirfd-fchdir-held-target", f"dirfd/fchdir ledger mismatch: {actual!r}")
+        try:
+            records = module.parse_ledger(actual)
+        except BaseException as exc:
+            failure("dirfd-fchdir-held-target", f"public ledger parse failed: {type(exc).__name__}: {exc}")
+        else:
+            by_locator = {record.locator: record for record in records}
+            if by_locator.get("repo:/right/sibling") is None or by_locator["repo:/right/sibling"].sha256 != digest(b"right"):
+                failure("dirfd-fchdir-held-target", "resolved right sibling was not combined")
+            if "repo:/left/sibling" in by_locator:
+                failure("dirfd-fchdir-held-target", "resolved left decoy through stale dirfd path")
+    if tree(root) != before:
+        failure("dirfd-fchdir-held-target", "dirfd/fchdir fixture changed")
+
+
+# Mutation caught: an open/close-only descriptor is a probe, while a positive
+# read is read access; open-time readability must not invent a read event.
+with tempfile.TemporaryDirectory(prefix="task4-bs2a-final-open-only-probe-") as root:
+    paths = fixture(root)
+    probe = os.path.join(paths["repo"], "probe")
+    readable = os.path.join(paths["repo"], "read")
+    for path, data in ((probe, b"probe"), (readable, b"read")):
+        with open(path, "wb") as handle:
+            handle.write(data)
+        os.chmod(path, 0o644)
+    before = tree(root)
+    trace = (
+        f'100 openat(AT_FDCWD, "{probe}", O_RDONLY|O_CLOEXEC) = 3\n'
+        "100 close(3) = 0\n"
+        f'100 openat(AT_FDCWD, "{readable}", O_RDONLY|O_CLOEXEC) = 4\n'
+        '100 read(4, "read", 4) = 4\n'
+        "100 close(4) = 0\n100 +++ exited with 0 +++\n"
+    ).encode("ascii")
+    try:
+        actual = discover(paths, trace)
+    except BaseException as exc:
+        failure("open-only-probe-read-control", f"expected success, got {type(exc).__name__}: {exc}")
+    else:
+        expected = ledger([
+            regular_row(probe, "repo", "probe", "repo"),
+            regular_row(readable, "repo", "read", "repo"),
+        ])
+        if actual != expected:
+            failure("open-only-probe-read-control", f"probe/read access ledger mismatch: {actual!r}")
+        try:
+            records = module.parse_ledger(actual)
+        except BaseException as exc:
+            failure("open-only-probe-read-control", f"public ledger parse failed: {type(exc).__name__}: {exc}")
+        else:
+            access = {record.locator: record.access for record in records}
+            if access.get("repo:/probe") != "probe" or access.get("repo:/read") != "read":
+                failure("open-only-probe-read-control", f"probe/read access was {access!r}")
+    if tree(root) != before:
+        failure("open-only-probe-read-control", "probe/read fixture changed")
 
 
 # A relation that changes between the initial lstat and the one authorized

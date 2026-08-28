@@ -1,0 +1,1069 @@
+#!/usr/bin/python3
+import dataclasses as _dataclasses
+import hashlib as _hashlib
+import os
+import re as _re
+import stat as _stat
+import unicodedata as _unicodedata
+
+class FormatError(ValueError):
+    pass
+
+
+class MutationError(RuntimeError):
+    pass
+
+
+@_dataclasses.dataclass(frozen=True, slots=True)
+class InputRecord:
+    seq: int
+    klass: str
+    access: str
+    result: str
+    mode: int | None
+    size: int | None
+    sha256: str | None
+    locator: str
+
+_REGULAR = {
+    "repo",
+    "vendor",
+    "stable-sysroot",
+    "nightly-sysroot",
+    "tool",
+    "dynamic",
+}
+_SPECIAL = {"host-config", "lane09-base", "lane09-package"}
+_DIGEST = _re.compile(r"[0-9a-f]{64}\Z")
+_DECIMAL = _re.compile(r"0|[1-9][0-9]*\Z")
+_SEQ = _DECIMAL
+_MODE = _re.compile(r"[0-7]{4}\Z")
+_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _validate_locator(locator):
+    try:
+        raw = locator.encode("utf-8")
+    except UnicodeError as exc:
+        raise FormatError("locator is not UTF-8") from exc
+    if not 1 <= len(raw) <= 4096:
+        raise FormatError("invalid locator length")
+    prefix = next((value for value in ("repo:/", "vendor:/", "external:/") if locator.startswith(value)), None)
+    if prefix is None:
+        raise FormatError("invalid locator namespace")
+    tail = locator[len(prefix) :]
+    if not tail:
+        return prefix[:-1]
+    for component in tail.split("/"):
+        encoded = component.encode("utf-8")
+        if not 1 <= len(encoded) <= 255 or component in (".", ".."):
+            raise FormatError("invalid locator component")
+        if any(_unicodedata.category(ch) in {"Cc", "Cf", "Cs"} for ch in component):
+            raise FormatError("invalid locator code point")
+    return prefix[:-1]
+
+
+def _validate_records(records):
+    if type(records) is not list or not 1 <= len(records) <= 4096:
+        raise FormatError("records must be a bounded list")
+    for record in records:
+        if type(record) is not InputRecord:
+            raise FormatError("non-InputRecord element")
+        values = (record.klass, record.access, record.result, record.locator)
+        if type(record.seq) is not int or any(type(value) is not str for value in values):
+            raise FormatError("invalid scalar type")
+        if record.mode is not None and type(record.mode) is not int:
+            raise FormatError("invalid mode type")
+        if record.size is not None and type(record.size) is not int:
+            raise FormatError("invalid size type")
+        if record.sha256 is not None and type(record.sha256) is not str:
+            raise FormatError("invalid digest type")
+
+    previous = None
+    for index, record in enumerate(records):
+        if record.seq != index or record.seq > 4095:
+            raise FormatError("invalid sequence")
+        namespace = _validate_locator(record.locator)
+        locator_bytes = record.locator.encode("utf-8")
+        if previous is not None and locator_bytes <= previous:
+            raise FormatError("locators are not strictly ordered")
+        previous = locator_bytes
+        if record.klass == "repo" and namespace != "repo:":
+            raise FormatError("repo namespace mismatch")
+        if record.klass == "vendor" and namespace != "vendor:":
+            raise FormatError("vendor namespace mismatch")
+        if record.klass in (_REGULAR | _SPECIAL) - {"repo", "vendor"} and namespace != "external:":
+            raise FormatError("external namespace mismatch")
+        if record.klass in _REGULAR:
+            valid = record.access in {"probe", "read", "execute", "read-execute"}
+        elif record.klass in _SPECIAL:
+            valid = record.access in {"probe", "read"}
+        elif record.klass == "directory":
+            valid = record.access in {"probe", "enumerate"}
+        elif record.klass == "symlink":
+            valid = record.access == "probe"
+        elif record.klass == "absent":
+            valid = record.access == "probe" and record.result in {"ENOENT", "ENOTDIR"}
+        else:
+            valid = False
+        if not valid:
+            raise FormatError("invalid class/access matrix")
+        present = record.klass != "absent"
+        if present:
+            if record.result != "present":
+                raise FormatError("invalid present result")
+            if record.mode is None or not 0 <= record.mode <= 0o7777:
+                raise FormatError("invalid mode")
+            if record.size is None or not 0 <= record.size <= 4294967296:
+                raise FormatError("invalid size")
+            if record.klass == "symlink" and not 1 <= record.size <= 4096:
+                raise FormatError("invalid symlink size")
+            if record.klass == "directory" and record.size > _MAX_BYTES:
+                raise FormatError("invalid directory size")
+            if record.sha256 is None or _DIGEST.fullmatch(record.sha256) is None:
+                raise FormatError("invalid digest")
+        elif any(value is not None for value in (record.mode, record.size, record.sha256)):
+            raise FormatError("absent record has values")
+
+
+def parse_ledger(data: bytes) -> list[InputRecord]:
+    if type(data) is not bytes or not 1 <= len(data) <= _MAX_BYTES:
+        raise FormatError("invalid input-v1 container")
+    if data.startswith(b"\xef\xbb\xbf") or b"\r" in data or b"\0" in data or not data.endswith(b"\n"):
+        raise FormatError("invalid input-v1 framing")
+    rows = data[:-1].split(b"\n")
+    if not 1 <= len(rows) <= 4096 or any(not row for row in rows):
+        raise FormatError("invalid input-v1 rows")
+    records = []
+    try:
+        for row in rows:
+            fields = row.decode("utf-8").split("\t")
+            if len(fields) != 9 or fields[0] != "input-v1":
+                raise FormatError("invalid input-v1 row")
+            _, seq, klass, access, result, mode, size, digest, locator = fields
+            if _SEQ.fullmatch(seq) is None:
+                raise FormatError("invalid sequence spelling")
+            if mode == "-":
+                parsed_mode = None
+            elif _MODE.fullmatch(mode) is not None:
+                parsed_mode = int(mode, 8)
+            else:
+                raise FormatError("invalid mode spelling")
+            if size == "-":
+                parsed_size = None
+            elif _DECIMAL.fullmatch(size) is not None:
+                parsed_size = int(size)
+            else:
+                raise FormatError("invalid size spelling")
+            parsed_digest = None if digest == "-" else digest
+            records.append(InputRecord(int(seq), klass, access, result, parsed_mode, parsed_size, parsed_digest, locator))
+    except (UnicodeError, ValueError) as exc:
+        raise FormatError("invalid input-v1 encoding") from exc
+    _validate_records(records)
+    if encode_ledger(records) != data:
+        raise FormatError("non-canonical input-v1")
+    return records
+
+
+def encode_ledger(records: list[InputRecord]) -> bytes:
+    _validate_records(records)
+    chunks = []
+    for record in records:
+        values = (
+            "input-v1",
+            str(record.seq),
+            record.klass,
+            record.access,
+            record.result,
+            "-" if record.mode is None else f"{record.mode:04o}",
+            "-" if record.size is None else str(record.size),
+            "-" if record.sha256 is None else record.sha256,
+            record.locator,
+        )
+        chunks.append(("\t".join(values) + "\n").encode("utf-8"))
+    data = b"".join(chunks)
+    if len(data) > _MAX_BYTES:
+        raise FormatError("input-v1 exceeds 4 MiB")
+    return data
+
+
+def _component(value):
+    if not 1 <= len(value) <= 255 or value in (b".", b"..") or b"/" in value or b"\0" in value:
+        raise FormatError("invalid path component")
+    try:
+        text = value.decode("utf-8")
+    except UnicodeError as exc:
+        raise FormatError("path is not UTF-8") from exc
+    if any(_unicodedata.category(ch) in {"Cc", "Cf", "Cs"} for ch in text):
+        raise FormatError("invalid path code point")
+    return value
+
+
+def _path(value, name):
+    try:
+        value = os.fspath(value)
+    except TypeError as exc:
+        raise FormatError(f"invalid {name}") from exc
+    if type(value) is not str or not value.startswith("/") or value != os.path.normpath(value) or "//" in value:
+        raise FormatError(f"non-canonical {name}")
+    try:
+        raw = value.encode("utf-8")
+    except UnicodeError as exc:
+        raise FormatError(f"invalid {name}") from exc
+    parts = tuple(_component(part) for part in raw.split(b"/") if part)
+    return parts
+
+
+def _relative(value):
+    if type(value) is not str or not value or value.startswith("/") or value.endswith("/") or value != os.path.normpath(value):
+        raise FormatError("invalid vendor_relative")
+    try:
+        raw = value.encode("utf-8")
+    except UnicodeError as exc:
+        raise FormatError("invalid vendor_relative") from exc
+    return tuple(_component(part) for part in raw.split(b"/"))
+
+
+def _identity(value):
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_uid,
+        value.st_gid,
+        value.st_mode,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _structural(value):
+    return (value.st_dev, value.st_ino, _stat.S_IFMT(value.st_mode))
+
+
+def _quoted(value):
+    if len(value) < 2 or value[0] != '"' or value[-1] != '"':
+        raise FormatError("invalid quoted path")
+    raw = value[1:-1]
+    output = bytearray()
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if char != "\\":
+            code = ord(char)
+            if code < 0x20 or code > 0x7e:
+                raise FormatError("invalid quoted path byte")
+            output.append(code)
+            index += 1
+            continue
+        if raw.startswith("\\x", index) and index + 4 <= len(raw):
+            try:
+                output.append(int(raw[index + 2 : index + 4], 16))
+            except ValueError as exc:
+                raise FormatError("invalid hex escape") from exc
+            index += 4
+        elif index + 1 < len(raw) and raw[index + 1] in {'"', "\\"}:
+            output.append(ord(raw[index + 1]))
+            index += 2
+        else:
+            raise FormatError("invalid path escape")
+    if not output or b"\0" in output:
+        raise FormatError("invalid empty path")
+    return bytes(output)
+
+
+def _payload(value):
+    raw = value[1:-1]
+    index = 0
+    while index < len(raw):
+        code = ord(raw[index])
+        if raw[index] != "\\":
+            if code < 0x20 or code > 0x7e:
+                raise FormatError("invalid payload byte")
+            index += 1
+        elif raw.startswith("\\x", index) and index + 4 <= len(raw):
+            try:
+                int(raw[index + 2 : index + 4], 16)
+            except ValueError as exc:
+                raise FormatError("invalid payload hex escape") from exc
+            index += 4
+        elif index + 1 < len(raw) and raw[index + 1] in {'"', "\\", "a", "b", "f", "n", "r", "t", "v"}:
+            index += 2
+        else:
+            raise FormatError("invalid payload escape")
+
+
+def _beneath(parts, root):
+    return len(parts) >= len(root) and parts[: len(root)] == root
+
+
+def _locator(parts, repo, vendor):
+    if _beneath(parts, vendor):
+        prefix, tail = "vendor:/", parts[len(vendor) :]
+    elif _beneath(parts, repo):
+        prefix, tail = "repo:/", parts[len(repo) :]
+    else:
+        prefix, tail = "external:/", parts
+    text = prefix + "/".join(part.decode("utf-8") for part in tail)
+    _validate_locator(text)
+    return text
+
+
+def discover_input_v1(
+    trace: bytes,
+    *,
+    root_pid: int,
+    initial_cwd,
+    repo_root,
+    vendor_relative: str,
+    build_root,
+    stable_sysroot_root,
+    nightly_sysroot_root,
+) -> bytes:
+    if type(trace) is not bytes or type(root_pid) is not int or root_pid <= 0:
+        raise FormatError("invalid discovery scalar")
+    cwd_parts = _path(initial_cwd, "initial_cwd")
+    repo_parts = _path(repo_root, "repo_root")
+    build_parts = _path(build_root, "build_root")
+    stable_parts = _path(stable_sysroot_root, "stable_sysroot_root")
+    nightly_parts = _path(nightly_sysroot_root, "nightly_sysroot_root")
+    vendor_tail = _relative(vendor_relative)
+    vendor_parts = repo_parts + vendor_tail
+    supplied = (repo_parts, build_parts, stable_parts, nightly_parts)
+    for index, left in enumerate(supplied):
+        for right in supplied[index + 1 :]:
+            if _beneath(left, right) or _beneath(right, left):
+                raise MutationError("anchor paths overlap")
+    if not trace.endswith(b"\n") or any(byte < 0x20 and byte != 0x0A for byte in trace):
+        raise FormatError("invalid trace framing")
+    try:
+        text = trace.decode("ascii")
+    except UnicodeError as exc:
+        raise FormatError("trace is not ASCII") from exc
+    lines = text[:-1].split("\n")
+    if not lines or any(not line for line in lines):
+        raise FormatError("empty trace")
+
+    held = []
+    edges = []
+    cache = {}
+    observations = {}
+    absent = []
+    created = {}
+
+    def close_all():
+        for fd in reversed(held):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def validate_binding(node):
+        evidence = node.get("evidence")
+        if node["parent"] is None:
+            held_value = os.fstat(node["fd"])
+            if evidence is None:
+                if _structural(held_value) != node["structural"]:
+                    raise MutationError("retained root changed")
+            elif _identity(held_value) != evidence:
+                raise MutationError("retained root changed")
+            return
+        try:
+            edge_value = os.stat(node["name"], dir_fd=node["parent"]["fd"], follow_symlinks=False)
+        except OSError as exc:
+            raise MutationError("retained edge disappeared") from exc
+        held_value = os.fstat(node["fd"])
+        if evidence is None:
+            expected = node["structural"]
+            if _structural(edge_value) != expected or _structural(held_value) != expected:
+                raise MutationError("retained edge changed")
+        elif _identity(edge_value) != evidence or _identity(held_value) != evidence:
+            raise MutationError("retained edge changed")
+
+    def open_edge(parent, name, expected=None):
+        key = (parent["fd"], name)
+        if key in cache:
+            node = cache[key]
+            validate_binding(node)
+            if expected is not None and node["kind"] != expected:
+                raise MutationError("relation kind changed")
+            return node
+        try:
+            before = os.stat(name, dir_fd=parent["fd"], follow_symlinks=False)
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            raise MutationError("claimed relation is absent") from exc
+        mode = before.st_mode
+        if _stat.S_ISDIR(mode):
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+            kind = "directory"
+        elif _stat.S_ISREG(mode):
+            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+            kind = "regular"
+        elif _stat.S_ISLNK(mode):
+            flags = os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW
+            kind = "symlink"
+        else:
+            raise FormatError("special file in relation")
+        try:
+            fd = os.open(name, flags, dir_fd=parent["fd"])
+        except OSError as exc:
+            raise MutationError("relation open failed") from exc
+        held.append(fd)
+        after = os.fstat(fd)
+        if _structural(before) != _structural(after):
+            raise MutationError("relation changed while opening")
+        node = {
+            "parts": parent["parts"] + (name,),
+            "fd": fd,
+            "stat": _identity(after),
+            "pending_acquired": _identity(before),
+            "structural": _structural(after),
+            "kind": kind,
+            "parent": parent,
+            "name": name,
+            "evidence": None,
+        }
+        cache[key] = node
+        edges.append(node)
+        if expected is not None and kind != expected:
+            raise MutationError("relation kind mismatch")
+        return node
+
+    def anchor(parts):
+        node = root_node
+        for name in parts:
+            node = open_edge(node, name, "directory")
+            node.pop("pending_acquired", None)
+        return node
+
+    def capture_evidence(node):
+        if node.get("logical"):
+            return
+        if node["evidence"] is not None:
+            validate_binding(node)
+            return
+        if node["parent"] is None:
+            value = _identity(os.fstat(node["fd"]))
+        else:
+            edge_value = _identity(os.stat(node["name"], dir_fd=node["parent"]["fd"], follow_symlinks=False))
+            held_value = _identity(os.fstat(node["fd"]))
+            pending = node.pop("pending_acquired", None)
+            if edge_value != held_value or (pending is not None and edge_value != pending):
+                raise MutationError("relation changed while evidencing")
+            value = held_value
+        node["evidence"] = value
+
+    def observe(node, access, expected=None):
+        if node.get("logical"):
+            return
+        if expected is not None and node["kind"] != expected:
+            raise MutationError("trace kind differs from resolved object")
+        capture_evidence(node)
+        observations.setdefault(node["parts"], [node, set()])[1].add(access)
+
+    def canonical_absence(base, floor, suffix, outcome):
+        parts = list(base)
+        for token in suffix:
+            if not token or token == b".":
+                continue
+            if token == b"..":
+                if len(parts) <= len(floor):
+                    raise FormatError("absence suffix crosses floor")
+                parts.pop()
+                continue
+            parts.append(_component(token))
+        if outcome == "ENOTDIR" and tuple(parts) == floor:
+            raise FormatError("absence ends at blocker floor")
+        return tuple(parts)
+
+    def read_symlink(node):
+        if "target" in node:
+            return node["target"]
+        first = os.readlink(node["name"], dir_fd=node["parent"]["fd"])
+        edge1 = _identity(os.stat(node["name"], dir_fd=node["parent"]["fd"], follow_symlinks=False))
+        held1 = _identity(os.fstat(node["fd"]))
+        if edge1 != node["evidence"] or held1 != node["evidence"]:
+            raise MutationError("symlink changed after first read")
+        second = os.readlink(node["name"], dir_fd=node["parent"]["fd"])
+        edge2 = _identity(os.stat(node["name"], dir_fd=node["parent"]["fd"], follow_symlinks=False))
+        held2 = _identity(os.fstat(node["fd"]))
+        first = os.fsencode(first)
+        second = os.fsencode(second)
+        if edge2 != node["evidence"] or held2 != node["evidence"] or first != second:
+            raise MutationError("symlink changed during observation")
+        if not 1 <= len(first) <= 4096:
+            raise FormatError("invalid symlink target length")
+        node["target"] = first
+        return first
+
+    def resolve(start, requested, replay=None):
+        if requested.startswith(b"/"):
+            node = root_node
+            tokens = requested.split(b"/")
+        else:
+            node = start
+            tokens = requested.split(b"/")
+        index = 0
+        links = []
+        follows = 0
+        while index < len(tokens):
+            name = tokens[index]
+            index += 1
+            if not name or name == b".":
+                continue
+            if name == b"..":
+                node = node["parent"] if node["parent"] is not None else root_node
+                continue
+            if node["kind"] != "directory":
+                if replay is not None and node is replay["boundary"]:
+                    validate_binding(node)
+                    return replay["errno"], node, replay["resolved"], links, replay.get("missing_name")
+                suffix = (name,) + tuple(tokens[index:])
+                resolved = canonical_absence(node["parts"], node["parts"], suffix, "ENOTDIR")
+                capture_evidence(node)
+                return "ENOTDIR", node, resolved, links, None
+            key = (node["fd"], name)
+            child = created.get(key)
+            if child is None:
+                if key in cache:
+                    child = cache[key]
+                    if replay is None:
+                        validate_binding(child)
+                elif replay is not None:
+                    if replay["errno"] == "ENOENT" and node is replay["boundary"] and name == replay["missing_name"]:
+                        validate_binding(node)
+                        try:
+                            os.stat(name, dir_fd=node["fd"], follow_symlinks=False)
+                        except FileNotFoundError:
+                            pass
+                        except OSError as exc:
+                            raise MutationError("absence relation changed") from exc
+                        else:
+                            raise MutationError("absence relation appeared")
+                        return replay["errno"], node, replay["resolved"], links, replay.get("missing_name")
+                    raise MutationError("absence replay acquired relation")
+                else:
+                    try:
+                        os.stat(name, dir_fd=node["fd"], follow_symlinks=False)
+                    except FileNotFoundError:
+                        suffix = tuple(tokens[index:])
+                        floor = node["parts"] + (name,)
+                        resolved = canonical_absence(floor, floor, suffix, "ENOENT")
+                        if not _beneath(resolved, build_parts):
+                            capture_evidence(node)
+                        return "ENOENT", node, resolved, links, name
+                    except NotADirectoryError as exc:
+                        raise MutationError("directory relation changed") from exc
+                    child = open_edge(node, name)
+            if child["kind"] == "symlink":
+                if replay is not None and not any(child is link for link in replay["links"]):
+                    raise MutationError("absence replay symlink chain changed")
+                follows += 1
+                if follows > 40:
+                    raise FormatError("symlink depth exceeded")
+                capture_evidence(child)
+                target = read_symlink(child)
+                links.append(child)
+                tokens = tuple(target.split(b"/")) + tuple(tokens[index:])
+                node = root_node if target.startswith(b"/") else child["parent"]
+                index = 0
+                continue
+            if index < len(tokens) and child["kind"] != "directory":
+                if replay is not None and child is replay["boundary"]:
+                    validate_binding(child)
+                    return replay["errno"], child, replay["resolved"], links, replay.get("missing_name")
+                suffix = tuple(tokens[index:])
+                resolved = canonical_absence(child["parts"], child["parts"], suffix, "ENOTDIR")
+                capture_evidence(child)
+                return "ENOTDIR", child, resolved, links, None
+            if index < len(tokens):
+                child.pop("pending_acquired", None)
+            node = child
+        if replay is not None and replay["errno"] != "present":
+            raise MutationError("absence replay result changed")
+        if node.get("logical"):
+            return "present", node, node["parts"], links, None
+        capture_evidence(node)
+        return "present", node, node["parts"], links, None
+
+    try:
+        root_fd = os.open(b"/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        held.append(root_fd)
+        root_stat = os.fstat(root_fd)
+        root_node = {
+            "parts": (),
+            "fd": root_fd,
+            "stat": _identity(root_stat),
+            "structural": _structural(root_stat),
+            "kind": "directory",
+            "parent": None,
+            "name": None,
+            "evidence": None,
+        }
+        cwd_node = anchor(cwd_parts)
+        repo_node = anchor(repo_parts)
+        build_node = anchor(build_parts)
+        stable_node = anchor(stable_parts)
+        nightly_node = anchor(nightly_parts)
+        vendor_node = repo_node
+        for name in vendor_tail:
+            vendor_node = open_edge(vendor_node, name, "directory")
+            vendor_node.pop("pending_acquired", None)
+        named_anchors = (("repo", repo_node), ("build", build_node), ("stable", stable_node), ("nightly", nightly_node), ("vendor", vendor_node))
+        lineages = {}
+        for name, node in named_anchors:
+            lineage = []
+            while node is not None:
+                lineage.append(node["stat"][:2])
+                node = node["parent"]
+            lineages[name] = lineage
+        for index, (left_name, left) in enumerate(named_anchors):
+            for right_name, right in named_anchors[index + 1 :]:
+                overlap = left["stat"][:2] in lineages[right_name] or right["stat"][:2] in lineages[left_name]
+                vendor_beneath_repo = left_name == "repo" and right_name == "vendor" and left["stat"][:2] != right["stat"][:2] and left["stat"][:2] in lineages["vendor"][1:] and right["stat"][:2] not in lineages["repo"]
+                if overlap and not vendor_beneath_repo:
+                    raise MutationError("anchor identities or lineages overlap")
+        os.lseek(build_node["fd"], 0, os.SEEK_SET)
+        if os.listdir(build_node["fd"]):
+            raise MutationError("build root is not empty")
+
+        descriptions = []
+        processes = {root_pid: {"cwd": cwd_node, "fds": {}, "maps": {}, "alive": True}}
+
+        def process(pid_text):
+            pid = int(pid_text)
+            value = processes.get(pid)
+            if value is None or not value["alive"]:
+                raise FormatError("unknown trace pid")
+            return pid, value
+
+        def base_for(proc, token, raw):
+            if raw.startswith(b"/"):
+                return root_node
+            if token == "AT_FDCWD":
+                return proc["cwd"]
+            fd = int(token)
+            ref = proc["fds"].get(fd)
+            if ref is None:
+                raise FormatError("unknown dirfd")
+            desc = descriptions[ref[0]]
+            if desc["kind"] != "directory":
+                raise FormatError("non-directory dirfd")
+            return desc["node"]
+
+        def opened(proc, token, quoted, flags_text, mode_text, result_text):
+            raw = _quoted(quoted)
+            base = base_for(proc, token, raw)
+            flags = flags_text.split("|")
+            allowed = {"O_RDONLY", "O_WRONLY", "O_RDWR", "O_CLOEXEC", "O_DIRECTORY", "O_CREAT", "O_EXCL"}
+            if not flags or len(flags) != len(set(flags)) or any(flag not in allowed for flag in flags):
+                raise FormatError("invalid open flags")
+            access = [flag for flag in flags if flag in {"O_RDONLY", "O_WRONLY", "O_RDWR"}]
+            if len(access) != 1:
+                raise FormatError("invalid open access")
+            fd = int(result_text)
+            if fd in proc["fds"]:
+                raise FormatError("live fd overwritten")
+            create = "O_CREAT" in flags or "O_EXCL" in flags
+            if create != ("O_CREAT" in flags and "O_EXCL" in flags):
+                raise FormatError("invalid exclusive output")
+            if (mode_text is not None) != create or (create and mode_text != "0600"):
+                raise FormatError("open mode presence mismatch")
+            outcome, node, parts, links, missing_name = resolve(base, raw)
+            logical = False
+            if create:
+                if outcome == "present" and node.get("logical"):
+                    raise FormatError("duplicate exclusive output")
+                if outcome != "ENOENT" or node["kind"] != "directory" or not parts:
+                    raise MutationError("exclusive output already exists")
+                leaf = parts[-1]
+                if tuple(parts[:-1]) != node["parts"] or not _beneath(node["parts"], build_parts):
+                    raise MutationError("output parent is absent")
+                key = (node["fd"], leaf)
+                if key in created:
+                    raise FormatError("duplicate exclusive output")
+                created[key] = {
+                    "parts": tuple(parts),
+                    "kind": "regular",
+                    "logical": True,
+                    "parent": node,
+                    "name": leaf,
+                }
+                node = created[key]
+                logical = True
+            elif outcome != "present":
+                raise MutationError("opened path is absent")
+            elif _beneath(parts, build_parts) and not node.get("logical"):
+                raise FormatError("unowned build input")
+            directory = "O_DIRECTORY" in flags
+            if directory and node["kind"] != "directory":
+                raise MutationError("invalid directory open target")
+            if directory and (create or access[0] != "O_RDONLY"):
+                raise FormatError("invalid directory open access")
+            if not directory and node["kind"] != "regular":
+                raise MutationError("opened path is not regular")
+            desc = {
+                "parts": parts,
+                "node": node,
+                "kind": node["kind"],
+                "readable": access[0] in {"O_RDONLY", "O_RDWR"},
+                "writable": access[0] in {"O_WRONLY", "O_RDWR"},
+                "owned": logical or node.get("logical", False),
+                "seen": False,
+                "eof": False,
+            }
+            descriptions.append(desc)
+            proc["fds"][fd] = (len(descriptions) - 1, "O_CLOEXEC" in flags)
+            if directory:
+                if not desc["owned"]:
+                    observe(node, "probe", "directory")
+            elif not desc["owned"]:
+                observe(node, "probe", "regular")
+
+        quote = r'"(?:[^"\\]|\\.)*"'
+        for line in lines:
+            match = _re.fullmatch(r"([0-9]+) openat\((AT_FDCWD|[0-9]+), (" + quote + r"), ([A-Z0-9_|]+)(?:, ([0-7]+))?\) = ([0-9]+)", line)
+            if match:
+                _, proc = process(match[1])
+                opened(proc, match[2], match[3], match[4], match[5], match[6])
+                continue
+            match = _re.fullmatch(r"([0-9]+) open\((" + quote + r"), ([A-Z0-9_|]+)(?:, ([0-7]+))?\) = ([0-9]+)", line)
+            if match:
+                _, proc = process(match[1])
+                opened(proc, "AT_FDCWD", match[2], match[3], match[4], match[5])
+                continue
+            match = _re.fullmatch(r"([0-9]+) openat2\((AT_FDCWD|[0-9]+), (" + quote + r"), \{ flags=([A-Z0-9_|]+)(?:, mode=([0-7]+))?, resolve=0 \}, 24\) = ([0-9]+)", line)
+            if match:
+                _, proc = process(match[1])
+                opened(proc, match[2], match[3], match[4], match[5], match[6])
+                continue
+            match = _re.fullmatch(r"([0-9]+) dup\(([0-9]+)\) = ([0-9]+)", line)
+            if match:
+                _, proc = process(match[1]); source, target = int(match[2]), int(match[3])
+                if source not in proc["fds"] or target in proc["fds"]:
+                    raise FormatError("invalid dup")
+                proc["fds"][target] = (proc["fds"][source][0], False)
+                continue
+            match = _re.fullmatch(r"([0-9]+) clone\(child_stack=NULL, flags=SIGCHLD, child_tidptr=NULL\) = ([0-9]+)", line)
+            if match:
+                _, proc = process(match[1]); child = int(match[2])
+                if child <= 0 or child in processes:
+                    raise FormatError("invalid clone child")
+                processes[child] = {"cwd": proc["cwd"], "fds": dict(proc["fds"]), "maps": dict(proc["maps"]), "alive": True}
+                continue
+            match = _re.fullmatch(r"([0-9]+) getpid\(\) = ([0-9]+)", line)
+            if match:
+                pid, _ = process(match[1])
+                if pid != int(match[2]):
+                    raise FormatError("getpid mismatch")
+                continue
+            match = _re.fullmatch(r"([0-9]+) close\(([0-9]+)\) = 0", line)
+            if match:
+                _, proc = process(match[1]); fd = int(match[2])
+                if proc["fds"].pop(fd, None) is None:
+                    raise FormatError("close of unknown fd")
+                continue
+            match = _re.fullmatch(r"([0-9]+) (read|write)\(([0-9]+), " + quote + r", ([0-9]+)\) = ([0-9]+)", line)
+            if match:
+                _payload(match[0][match[0].find('"') : match[0].rfind('"') + 1])
+                _, proc = process(match[1]); operation, fd, count, result = match[2], int(match[3]), int(match[4]), int(match[5])
+                ref = proc["fds"].get(fd)
+                if ref is None or result > count:
+                    raise FormatError("invalid IO")
+                desc = descriptions[ref[0]]
+                if operation == "read":
+                    if not desc["readable"] or desc["kind"] == "directory":
+                        raise FormatError("read on unreadable fd")
+                    if not desc["owned"]:
+                        observe(desc["node"], "read", "regular")
+                elif not desc["writable"] or not desc["owned"]:
+                    raise FormatError("write on unwritable input")
+                continue
+            match = _re.fullmatch(r"([0-9]+) mmap\(NULL, ([0-9]+), PROT_READ, MAP_PRIVATE, ([0-9]+), 0\) = ([0-9]+)", line)
+            if match:
+                _, proc = process(match[1]); length, fd, address = int(match[2]), int(match[3]), int(match[4])
+                ref = proc["fds"].get(fd)
+                if length <= 0 or ref is None or address in proc["maps"] or not descriptions[ref[0]]["readable"] or descriptions[ref[0]]["kind"] == "directory":
+                    raise FormatError("invalid mmap")
+                proc["maps"][address] = (length, ref[0])
+                if not descriptions[ref[0]]["owned"]:
+                    observe(descriptions[ref[0]]["node"], "mapped", "regular")
+                continue
+            match = _re.fullmatch(r"([0-9]+) munmap\(([0-9]+), ([0-9]+)\) = 0", line)
+            if match:
+                _, proc = process(match[1]); address, length = int(match[2]), int(match[3])
+                if proc["maps"].get(address, (None,))[0] != length:
+                    raise FormatError("invalid munmap")
+                del proc["maps"][address]
+                continue
+            match = _re.fullmatch(r"([0-9]+) getdents64\(([0-9]+), 0x[0-9a-f]+, ([0-9]+)\) = ([0-9]+)", line)
+            if match:
+                _, proc = process(match[1]); fd, requested, result = int(match[2]), int(match[3]), int(match[4])
+                ref = proc["fds"].get(fd)
+                if ref is None or descriptions[ref[0]]["kind"] != "directory" or not descriptions[ref[0]]["readable"] or result > requested:
+                    raise FormatError("invalid getdents64")
+                desc = descriptions[ref[0]]
+                if desc["eof"] and result:
+                    raise FormatError("directory advanced after EOF")
+                desc["seen"] = True
+                if result == 0:
+                    desc["eof"] = True
+                if not desc["owned"]:
+                    observe(desc["node"], "enumerate", "directory")
+                continue
+            match = _re.fullmatch(r"([0-9]+) fchdir\(([0-9]+)\) = 0", line)
+            if match:
+                _, proc = process(match[1]); ref = proc["fds"].get(int(match[2]))
+                if ref is None or descriptions[ref[0]]["kind"] != "directory":
+                    raise FormatError("invalid fchdir")
+                proc["cwd"] = descriptions[ref[0]]["node"]
+                continue
+            match = _re.fullmatch(r"([0-9]+) newfstatat\((AT_FDCWD|[0-9]+), (" + quote + r"), 0x[0-9a-f]+, 0\) = (0|-1 (ENOENT|ENOTDIR) \([^\n]+\))", line)
+            if match:
+                _, proc = process(match[1]); raw = _quoted(match[3]); base = base_for(proc, match[2], raw)
+                outcome, node, parts, links, missing_name = resolve(base, raw)
+                if match[4] == "0":
+                    if outcome != "present":
+                        raise MutationError("successful stat path is absent")
+                    if _beneath(parts, build_parts):
+                        if node.get("logical"):
+                            continue
+                        raise FormatError("unowned build probe")
+                    observe(node, "probe")
+                else:
+                    if outcome == "present":
+                        if node.get("logical"):
+                            raise FormatError("absent build output after creation")
+                        raise MutationError("trace errno no longer matches")
+                    if outcome != match[5]:
+                        raise MutationError("trace errno no longer matches")
+                    if _beneath(parts, build_parts):
+                        if outcome == "ENOTDIR" and node.get("logical"):
+                            continue
+                        if outcome == "ENOENT":
+                            absent.append({
+                                "provisional": True,
+                                "start": base,
+                                "raw": raw,
+                                "errno": outcome,
+                                "boundary": node,
+                                "resolved": parts,
+                                "links": links,
+                                "missing_name": missing_name,
+                            })
+                            continue
+                        raise FormatError("unowned build absence")
+                    absent.append({
+                        "provisional": False,
+                        "start": base,
+                        "raw": raw,
+                        "errno": outcome,
+                        "boundary": node,
+                        "resolved": parts,
+                        "links": links,
+                        "missing_name": missing_name,
+                    })
+                continue
+            match = _re.fullmatch(r"([0-9]+) execve\((" + quote + r"), \[[^\n]*\], \[[^\n]*\]\) = 0", line)
+            if match:
+                _, proc = process(match[1]); raw = _quoted(match[2]); outcome, node, parts, links, _ = resolve(proc["cwd"], raw)
+                if outcome != "present":
+                    raise MutationError("executed path is absent")
+                if _beneath(parts, build_parts) and not node.get("logical"):
+                    raise FormatError("unowned executed output")
+                if not node.get("logical"):
+                    observe(node, "execute", "regular")
+                proc["maps"].clear()
+                proc["fds"] = {fd: ref for fd, ref in proc["fds"].items() if not ref[1]}
+                continue
+            match = _re.fullmatch(r"([0-9]+) \+\+\+ exited with [0-9]+ \+\+\+", line)
+            if match:
+                _, proc = process(match[1]); proc["fds"].clear(); proc["maps"].clear(); proc["alive"] = False
+                continue
+            raise FormatError("unknown trace line")
+        if any(proc["alive"] for proc in processes.values()):
+            raise FormatError("trace ended with live process")
+
+        collected = {}
+        access_by_locator = {}
+
+        def directory_record(node, access):
+            def scan():
+                scan_fd = os.open(b".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=node["fd"])
+                try:
+                    entries = []
+                    with os.scandir(scan_fd) as iterator:
+                        for entry in iterator:
+                            if len(entries) == 4096:
+                                raise FormatError("directory has more than 4096 entries")
+                            name = _component(os.fsencode(entry.name))
+                            value = entry.stat(follow_symlinks=False)
+                            if _stat.S_ISREG(value.st_mode):
+                                kind = b"F"
+                            elif _stat.S_ISDIR(value.st_mode):
+                                kind = b"D"
+                            elif _stat.S_ISLNK(value.st_mode):
+                                kind = b"L"
+                            else:
+                                raise FormatError("special directory entry")
+                            entries.append((name, kind))
+                    entries.sort()
+                    data = b"".join(kind + len(name).to_bytes(2, "big") + name for name, kind in entries)
+                    if len(data) > _MAX_BYTES:
+                        raise FormatError("directory listing exceeds 4 MiB")
+                    return data
+                finally:
+                    os.close(scan_fd)
+            s0 = _identity(os.fstat(node["fd"])); first = scan(); s1 = _identity(os.fstat(node["fd"])); second = scan(); s2 = _identity(os.fstat(node["fd"]))
+            if s0 != s1 or s1 != s2 or first != second:
+                raise MutationError("directory changed during collection")
+            if node["evidence"] is not None and node["evidence"] != s0:
+                raise MutationError("directory evidence changed")
+            node["evidence"] = s0
+            return access, s0[4] & 0o7777, len(first), _hashlib.sha256(first).hexdigest()
+
+        def regular_record(node, access):
+            def digest():
+                value = _hashlib.sha256()
+                while True:
+                    chunk = os.read(node["fd"], 1024 * 1024)
+                    if not chunk:
+                        return value.hexdigest()
+                    value.update(chunk)
+            s0 = _identity(os.fstat(node["fd"])); h0 = digest(); s1 = _identity(os.fstat(node["fd"])); os.lseek(node["fd"], 0, os.SEEK_SET); h1 = digest(); s2 = _identity(os.fstat(node["fd"]))
+            if s0 != s1 or s1 != s2 or h0 != h1 or not _stat.S_ISREG(s0[4]):
+                raise MutationError("regular file changed during collection")
+            if node["evidence"] is not None and node["evidence"] != s0:
+                raise MutationError("regular file evidence changed")
+            node["evidence"] = s0
+            return access, s0[4] & 0o7777, s0[6], h0
+
+        resolved_observations = {}
+        for node, accesses in observations.values():
+            locator = _locator(node["parts"], repo_parts, vendor_parts)
+            current = resolved_observations.get(locator)
+            if current is None:
+                resolved_observations[locator] = [node, set(accesses)]
+            else:
+                if current[0]["stat"] != node["stat"] or current[0]["parts"] != node["parts"]:
+                    raise MutationError("resolved locator identity conflict")
+                current[1].update(accesses)
+
+        for locator, (node, accesses) in resolved_observations.items():
+            if "enumerate" in accesses:
+                access = "enumerate"
+            elif "read" in accesses or "mapped" in accesses:
+                access = "read-execute" if "execute" in accesses else "read"
+            elif "execute" in accesses:
+                access = "execute"
+            else:
+                access = "probe"
+            access_by_locator[locator] = accesses
+            if node["kind"] == "directory":
+                if access not in {"probe", "enumerate"}:
+                    raise FormatError("invalid directory access")
+                row = ("directory",) + directory_record(node, access)
+            elif node["kind"] == "regular":
+                row = (None,) + regular_record(node, access)
+            else:
+                raise FormatError("resolved path is not consumable")
+            collected[locator] = row
+
+        absent_proofs = []
+        for proof in absent:
+            if proof["provisional"]:
+                output = created.get((proof["boundary"]["fd"], proof["resolved"][-1])) if proof["resolved"] else None
+                if output is None or output["parts"] != tuple(proof["resolved"]):
+                    raise FormatError("unowned build absence")
+                continue
+            outcome = proof["errno"]
+            node = proof["boundary"]
+            resolved = proof["resolved"]
+            locator = _locator(resolved, repo_parts, vendor_parts)
+            proof["locator"] = locator
+            proof["boundary_evidence"] = node["evidence"]
+            absent_proofs.append(proof)
+            if outcome == "ENOENT":
+                parent_locator = _locator(node["parts"], repo_parts, vendor_parts)
+                if parent_locator not in collected:
+                    collected[parent_locator] = ("directory",) + directory_record(node, "probe")
+            else:
+                blocker = node
+                blocker_locator = _locator(blocker["parts"], repo_parts, vendor_parts)
+                if blocker_locator not in collected:
+                    collected[blocker_locator] = (None,) + regular_record(blocker, "probe")
+            collected[locator] = ("absent", "probe", None, None, None, outcome)
+
+        for node in edges:
+            if node["kind"] != "symlink" or "target" not in node:
+                continue
+            locator = _locator(node["parts"], repo_parts, vendor_parts)
+            raw = node["target"]
+            collected[locator] = ("symlink", "probe", node["evidence"][4] & 0o7777, len(raw), _hashlib.sha256(raw).hexdigest())
+
+        if len(collected) > 4096:
+            raise FormatError("discovery produced too many records")
+
+        # Every retained parent/name relation, including each anchor edge, must
+        # still name the held child before any ledger bytes are returned.
+        os.lseek(build_node["fd"], 0, os.SEEK_SET)
+        if os.listdir(build_node["fd"]):
+            raise MutationError("build root is not empty")
+
+        validate_binding(root_node)
+        for node in edges:
+            validate_binding(node)
+
+        for proof in absent_proofs:
+            outcome, node, resolved, links, _ = resolve(proof["start"], proof["raw"], replay=proof)
+            if (
+                outcome != proof["errno"]
+                or resolved != proof["resolved"]
+                or _locator(resolved, repo_parts, vendor_parts) != proof["locator"]
+                or node is not proof["boundary"]
+                or node["evidence"] != proof["boundary_evidence"]
+                or len(links) != len(proof["links"])
+                or any(left is not right for left, right in zip(links, proof["links"]))
+            ):
+                raise MutationError("absent relation changed")
+
+        rows = []
+        for index, locator in enumerate(sorted(collected, key=lambda value: value.encode("utf-8"))):
+            row = collected[locator]
+            if row[0] == "absent":
+                rows.append(InputRecord(index, "absent", "probe", row[5], None, None, None, locator))
+                continue
+            kind, access, mode, size, digest = row
+            if kind is None:
+                if locator.startswith("vendor:"):
+                    kind = "vendor"
+                elif locator.startswith("repo:"):
+                    kind = "repo"
+                else:
+                    resolved = tuple(_component(part) for part in locator[len("external:/") :].encode("utf-8").split(b"/") if part)
+                    original_accesses = access_by_locator.get(locator, set())
+                    if _beneath(resolved, stable_parts):
+                        kind = "stable-sysroot"
+                    elif _beneath(resolved, nightly_parts):
+                        kind = "nightly-sysroot"
+                    elif "execute" in original_accesses:
+                        kind = "tool"
+                    elif "mapped" in original_accesses:
+                        kind = "dynamic"
+                    else:
+                        kind = "tool"
+            rows.append(InputRecord(index, kind, access, "present", mode, size, digest, locator))
+        return encode_ledger(rows)
+    except FormatError:
+        raise
+    except MutationError:
+        raise
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise MutationError("filesystem relation could not be reproduced") from exc
+    finally:
+        close_all()
+
+
+if __name__ == "__main__":
+    raise SystemExit(77)

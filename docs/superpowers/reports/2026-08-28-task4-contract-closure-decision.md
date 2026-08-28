@@ -1,25 +1,30 @@
 # Task 4 Contract Closure Decision
 
-**Status:** accepted after independent Sol, Terra, and Luna review; this amends
-commit `5fdc7cb` planning authority without claiming executable contracts.
+**Status:** accepted through commit `61ee78a`; the design-complete clarification
+after the blocked C1 attempt was independently accepted by Sol, Terra, and Luna
+on 2026-08-28. No executable contract is claimed.
 
 ## Problem
 
-The committed plan requires six executable contracts before their fixed
-artifacts and replay/privacy checker interfaces exist. Current lane drivers use
+The committed base plan required runtime manifests before their fixed artifacts
+and replay/privacy checker interfaces existed. Current lane drivers use
 inline live-only predicates, first-match capture selection, and fleeting Lane
-14 surfaces. A complete JSON file today would invent authority.
+14 surfaces. A design blueprint may select future requirements today; an
+interface-complete or lane-executable claim may not.
 
 Contract closure has three distinct gates:
 
-1. **inventory-complete:** reviewed fixed inputs, resources, checker roles,
-   privacy surfaces, paths, bounds, and cardinalities;
+1. **design-complete:** reviewed closed design authority for every input role,
+   resource generation, checker role, privacy surface, literal path, numeric
+   acceptance ceiling, and cardinality;
 2. **interface-complete:** every referenced checker/scanner CLI exists and its
    mutation self-tests pass;
-3. **executable:** every referenced byte exists at a committed identity and the
-   envelope validates and replays it.
+3. **lane-executable:** the migrated driver emits and registers the exact set,
+   and the envelope validates cleanup, privacy, replay, and publication.
 
-Only inventory completion can precede checker implementation.
+Design completion precedes checker implementation. It constrains later code; it
+is not an observation that current `$WORK`, glob, first-match, basename, or
+directory-order behavior already produces the set.
 
 ## Decision
 
@@ -61,6 +66,17 @@ exactly once. This permits one retained scanner/interpreter to serve all explici
 wrapper, and lets the Lane 14 domain checker explicitly consume both its own
 script and the scanner. No interface label or locator may appear in two
 interface records. The union is the only forward-reference allowlist.
+
+Blueprint `bindings`, `executable`, and `self_test` are normative interface
+signatures, not existence or success claims. The blueprint-authoring gate performs no locator existence
+or execution check. Use exact input labels `interpreter.python3`,
+`checker.lane07|lane09|lane10|lane11|lane14|lane16`, `checker.privacy`, and
+`helper.receipt`; every Python self-test uses executable
+`interpreter.python3`, then the checker/helper input token and literal
+`--self-test`. Normal checker bindings likewise begin with the script input
+token followed by their exact literal/artifact/common tokens. The initial
+artifact-contract interface rows intentionally remain RED until each
+checker/scanner locator exists; helper absence belongs to the later core RED.
 
 Discharge resolves the tracked locator at the candidate promotion commit,
 verifies its declared input metadata and exact bytes, expands every binding and
@@ -136,9 +152,9 @@ it is not a privacy surface and introduces no scanner mode.
 The helper remains custody-only: `scripts/task4-receipt.py` interprets none of
 these lane predicates.
 
-## Contract count
+## Future runtime-manifest count
 
-Use seven executable manifests for six lanes:
+Promote seven interface-complete manifests for six lanes:
 
 ```text
 scripts/task4-contracts/lane07.json
@@ -167,7 +183,18 @@ narrow gate-only schema amendment, not filename authority.
 - Lane 10: `artifacts/fork/`, `artifacts/capabilities/rows.json`, and four
   literal document/log pairs; zero-byte documents remain declared artifacts.
 - Lane 11: `artifacts/oracle/` report/results/subset, observed capture, sibling
-  ledgers, and state/policy/cache snapshots.
+  ledgers, and state/policy/cache snapshots. The sibling default is exactly
+  `.pkcs11-check-isolation-policy.json`; retained private policy is
+  `artifacts/oracle/isolation-policy.json`; retained private state is
+  `artifacts/oracle/isolation-state.json`. The live
+  `.isolation-state.json.report-records` directory is a `directory/dev-ino`
+  resource, not an artifact. Every entry below that cache root must be a
+  non-symlink regular file with the required private mode, owner, and link
+  count; reject every unexpected or non-regular entry. Retain every shard's raw
+  bytes in bytewise full cache-relative-path order as the lossless serialization
+  `artifacts/oracle/report-records.jsonl`. Record each canonical cache-relative
+  path, identity, SHA-256, size, and non-gapped, non-overlapping byte offsets in
+  `artifacts/oracle/report-records-inventory.json`.
 - Lane 14: use the separately reviewed literal canary/privacy subset crosswalk
   [`2026-08-28-lane14-canary-surface-crosswalk.md`](2026-08-28-lane14-canary-surface-crosswalk.md).
   Its 194 rows do not replace the separately literal distribution, attach,
@@ -192,10 +219,17 @@ or a derived summary in place of raw evidence.
 ## Blueprint completeness
 
 Each blueprint contains complete closed arrays for inputs, environment,
-resources, artifacts, checker roles, privacy surfaces, and exact bounds; only
+resources, artifacts, checker roles, privacy surfaces, and exact design bounds; only
 the declared interface records may be unresolved. No placeholder string, schema
-maximum used as an unevidenced artifact bound, or inferred resource count is
+maximum used as an unjustified artifact bound, or inferred resource count is
 accepted.
+
+`ArtifactDecl.max_bytes` is a design-selected fail-closed ceiling justified in
+blueprint review from the artifact's structural or operational worst case. The
+later producer enforces it before registration and the helper enforces it again
+during acquisition/finalization. It is not a claim that an artifact currently
+exists and cannot be copied from the 4-GiB schema maximum. Exceeding it is
+non-pass; observed output never silently raises it.
 
 Resource arrays name every owner-visible generation: observer/workload/helper
 processes and process groups, units/cgroups, token stores, BPF links and every
@@ -205,18 +239,30 @@ smoke processes. Each label fixes class and identity scheme. Lane 14 crosswalk
 map rows reference the corresponding exact BPF-map label.
 
 Input closure names every consumed tracked byte and resolved external tool,
-interpreter, configuration, provider, dynamic dependency, Docker image digest,
+interpreter, configuration, provider, dynamic dependency, requested Docker
+image reference through an exact literal environment or tracked configuration
+input plus its image-resource logical role,
 `jq` program, LLVM/file utility, and magic database as applicable. Replay tools
 are retained inputs; collection-only external inputs remain descriptor-pinned.
 Promotion review proves the exact transitive set rather than trusting `PATH` or
 a version string.
 
+A blueprint fixes planned inputs, including each requested image reference in a
+literal environment/configuration declaration plus its image resource role, and
+resource label/class/identity schemes.
+Exact input bytes and runtime resource identities (hashes, dev/inode, process
+generation, BPF/container/image IDs and resolved image digests) are
+receipt/interface evidence. If later
+implementation needs an undeclared dependency, it stops and returns to
+blueprint amendment/review before consuming it.
+
 ## Revised gate order
 
 1. Amend and independently review the governing plan.
-2. Write and review seven inventory-complete, non-executable blueprint-schema
-   files plus the Lane 14 crosswalk. Only their exact interface records may be
-   unresolved.
+2. Select, write, and review seven design-complete, non-executable blueprint-
+   schema files plus the Lane 14 crosswalk. Review every literal set, normative
+   checker ABI, resource generation, privacy mapping, cardinality, and bound
+   justification; only the exact interface records may be unresolved.
 3. The sole `tests/artifact_contracts.rs` writer adds rootless RED rows and
    blueprint-schema rejection tests. Focused command:
    `cargo +1.88 test --locked --test artifact_contracts task4_contract_ -- --nocapture`.
@@ -232,13 +278,14 @@ a version string.
    implements the helper, runs focused GREEN including blueprint exit 77,
    stops, and receives review.
 6. Re-review blueprints against exact checker and helper bytes, require zero
-   unresolved records, and promote the seven runtime manifests with no other
-   value change.
+   unresolved records, and promote seven interface-complete runtime manifests
+   with no other value change. Promotion is not lane acceptance.
 7. Migrate drivers serially under separate sole ownership: Lane 07, 09, 10,
    11, all Lane 14 scripts as one group, and Lane 16 (`never` then `auto`). Each
    cycle is lane RED, minimal implementation, focused GREEN, writer stop, and
    independent review. Ownership returns to the primary before any stopped
-   writer's file is touched again.
+   writer's file is touched again. A lane becomes executable only after this
+   migrated-driver exact registration/replay gate passes.
 8. Preserve frozen Lane 02 compatibility, untouched Lane 13 history, and the
    downstream fresh-r3, 9.2d, 9.3, 9.4, exact-tip CI, and Task 10 order.
 

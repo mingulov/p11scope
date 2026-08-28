@@ -517,10 +517,16 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     **Task 4 receipt architecture ruling (2026-08-28):** Remaining-lane gate
     receipts use one private Python-stdlib sealed-envelope helper, one shared
     privacy scanner, six lane-owned checkers, and seven committed contracts
-    (`07`, `09`, `10`, `11`, `14`, `16-never`, `16-auto`). Seven reviewed
-    non-executable blueprints precede checker implementation; all checker and
+    (`07`, `09`, `10`, `11`, `14`, `16-never`, `16-auto`). The next gate
+    requires seven independently reviewed, design-complete, non-executable
+    blueprints that select future literal sets,
+    normative checker ABIs, resources, privacy mappings, cardinalities, and
+    fail-closed caps before implementation; they make no current-output claim.
+    All checker and
     helper interfaces resolve before promotion, and the runtime helper rejects
-    blueprint schema with exit 77 before root creation. The exact
+    blueprint schema with exit 77 before root creation. Promotion yields
+    interface-complete manifests, not lane acceptance; executability begins only
+    after migrated-driver exact registration/replay passes. The exact
     194-row Lane 14 canary/privacy crosswalk contains 191 scan targets, two
     input-only manifests, and one must-detect positive control; it does not
     replace Lane 14 distribution/attach/protocol/release/smoke artifact rows.

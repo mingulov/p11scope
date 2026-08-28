@@ -111,11 +111,15 @@ cargo +1.88 clippy --locked --workspace --all-targets -- -D warnings
 **Receipt qualification (2026-08-28):** Remaining Task 4 evidence is accepted
 only through the independently reviewed sealed-envelope contract in
 `2026-08-27-task4-receipt-closure.md`, as amended by the accepted architecture
-decision and the independently accepted contract-closure decision.
-Inventory blueprints are
-non-executable; seven runtime contracts exist only after every checker and
+decision and the contract-closure decision accepted through `61ee78a`; its
+design-complete clarification was independently accepted by Sol, Terra, and
+Luna on 2026-08-28.
+Design-complete blueprints are non-executable normative requirements, not
+claims about current outputs; seven interface-complete runtime contracts exist
+only after every checker and
 helper interface resolves and the reviewed promotion changes only schema/removes the
-forward-reference array. The already frozen Lane 02 evidence is compatibility-
+forward-reference array. Lane executability additionally requires migrated-
+driver exact registration/replay. The already frozen Lane 02 evidence is compatibility-
 checked and is not rerun in Task 4. Lane 13 history remains unamended and is not
 rerun here.
 The remaining order is 07, 09, 10, 11, 14, 16-never, 16-auto. This

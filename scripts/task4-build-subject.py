@@ -36,6 +36,52 @@ class _SemanticTraceState:
                 "maps": {},
             }
         }
+        self._pending = {}
+
+    def begin_syscall(self, *, tid, operation):
+        if type(tid) is not int or tid <= 0:
+            raise FormatError("invalid task")
+        self._task(tid)
+        if type(operation) is not tuple or len(operation) != 3:
+            raise FormatError("invalid operation")
+        name, category, arguments = operation
+        if type(name) is not str or not name:
+            raise FormatError("invalid operation name")
+        if type(category) is not str or category not in {
+            "pure",
+            "path",
+            "fd",
+            "mapping",
+            "data",
+            "lifecycle",
+            "cwd_root",
+            "exec",
+            "mutation",
+        }:
+            raise FormatError("invalid operation category")
+        if type(arguments) is not tuple or len(arguments) != 6:
+            raise FormatError("invalid operation arguments")
+        if any(type(value) is not int or not 0 <= value < 2**64 for value in arguments):
+            raise FormatError("invalid operation argument")
+        if tid in self._pending:
+            raise FormatError("pending syscall exists")
+        self._pending[tid] = operation
+
+    def finish_syscall(self, *, tid, outcome):
+        if type(tid) is not int or tid <= 0:
+            raise FormatError("invalid task")
+        self._task(tid)
+        try:
+            operation = self._pending[tid]
+        except KeyError as exc:
+            raise FormatError("no pending syscall") from exc
+        if type(outcome) is not str or outcome not in {"success", "failure", "restart"}:
+            raise FormatError("invalid syscall outcome")
+        if outcome == "restart":
+            return
+        if operation[1] != "pure":
+            raise FormatError("product syscall cannot finish")
+        del self._pending[tid]
 
     def _task(self, tid):
         try:

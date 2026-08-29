@@ -561,6 +561,16 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     network/FD-theft/process-injection denial with no external daemon,
     trace/process lifecycle, reconciliation, postflight, and no-replace
     publication beneath a held fsync-capable private-parent descriptor.**
+
+    **Stage3 authority amendment (2026-08-30, accepted):** The
+    [accepted decision's Stage3 amendment](../reports/2026-08-28-task4-build-subject-decision.md#stage3-authority-amendment-2026-08-30-accepted)
+    governs BS2b capacity, exact constants, raw-symlink custody, and order.
+    The phase order is `3A0` -> `3A1` -> `3A2` -> `3A3`, each limited to RED,
+    GREEN, and review after docs acceptance; Stage3 code remains gated until
+    independent review/commit. No build, child/build-root, Landlock
+    implementation/probe, producer, runtime, publication, or release is
+    authorized by this amendment. The privacy allowlist and schema row limits
+    remain unchanged.**
 - **Slice 2 — capture quality**: ring/epoll, budgets, safe-policy params, per-module profile
   sections, filters, snapshots.
 - **Slice 3 — structure**: module split, evidence plumbing, docs consolidation, multi-kernel CI.

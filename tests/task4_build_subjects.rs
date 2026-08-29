@@ -12700,3 +12700,1209 @@ raise SystemExit(0)
     );
     fs::remove_dir(&temp_root).expect("remove BS2b-S9 temporary directory");
 }
+
+#[test]
+fn bs2b_s9_native_ptrace_lifecycle_contracts() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let collector = repo.join("scripts/fixtures/task4-fcntl-trace.c");
+    assert!(
+        collector.is_file(),
+        "RED2 missing scripts/fixtures/task4-fcntl-trace.c"
+    );
+    const HEADER: u16 = 0x01;
+    const ROOT: u16 = 0x10;
+    const CREATE_ENTRY: u16 = 0x11;
+    const CREATE_EVENT: u16 = 0x12;
+    const CREATE_EXIT: u16 = 0x13;
+    const CHILD_JOIN: u16 = 0x14;
+    const VFORK_DONE: u16 = 0x15;
+    const EXEC_EVENT: u16 = 0x16;
+    const EXIT_EVENT: u16 = 0x17;
+    const FINAL_WIF: u16 = 0x18;
+    const SIGNAL_DELIVERY: u16 = 0x19;
+    const SYSCALL_CANCEL: u16 = 0x1a;
+    const FCNTL_ENTRY: u16 = 0x20;
+    const FCNTL_EXIT: u16 = 0x21;
+
+    let experiment = repo.join("scripts/task4-fcntl-experiment.py");
+    assert!(experiment.is_file(), "RED2 missing Python parser");
+    let test_file = repo.join("tests/task4_build_subjects.rs");
+    let input_paths = [&test_file, &experiment, &collector];
+    let snapshot_input = |path: &Path| {
+        let metadata = fs::metadata(path).expect("snapshot RED2 input metadata");
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.mode(),
+            metadata.nlink(),
+            metadata.size(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+            fs::read(path).expect("snapshot RED2 input bytes"),
+        )
+    };
+    let input_before = input_paths
+        .iter()
+        .map(|path| snapshot_input(path))
+        .collect::<Vec<_>>();
+    let assert_inputs_unchanged = || {
+        for (path, before) in input_paths.iter().zip(input_before.iter()) {
+            assert_eq!(&snapshot_input(path), before, "RED2 owned input changed");
+        }
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after epoch")
+        .as_nanos();
+    let temp_root = std::env::temp_dir().join(format!(
+        "pkcs11-scope-bs2b-s9-red2-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&temp_root).expect("create RED2 temporary directory");
+    struct TempGuard(PathBuf);
+    impl Drop for TempGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _temp_guard = TempGuard(temp_root.clone());
+    fs::set_permissions(&temp_root, fs::Permissions::from_mode(0o700))
+        .expect("set RED2 temporary directory mode");
+    let binary = temp_root.join("task4-fcntl-trace");
+    let compile = Command::new("/usr/bin/cc")
+        .args([
+            "-std=c11",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-o",
+            binary.to_str().expect("binary path is UTF-8"),
+            collector.to_str().expect("collector path is UTF-8"),
+            "-lseccomp",
+            "-pthread",
+        ])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("TZ", "UTC")
+        .output()
+        .expect("compile RED2 collector");
+    assert_inputs_unchanged();
+    assert!(
+        compile.status.success(),
+        "RED2 collector compile failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    assert!(compile.stdout.is_empty(), "RED2 compiler wrote to stdout");
+    assert!(compile.stderr.is_empty(), "RED2 compiler wrote to stderr");
+
+    let evidence = temp_root.join("evidence");
+    fs::create_dir(&evidence).expect("create RED2 evidence directory");
+    let driver = r#"
+import ctypes
+import errno
+import fcntl
+import hashlib
+import importlib.util
+import os
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+binary, experiment, evidence = sys.argv[1:]
+
+spec = importlib.util.spec_from_file_location("task4_s9_experiment", experiment)
+if spec is None or spec.loader is None:
+    raise SystemExit("RED2 could not import Python parser")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+if any(callable(getattr(module, name, None)) for name in ("run", "produce", "capture", "check")):
+    raise SystemExit("RED2 production callable became reachable")
+if not callable(getattr(module, "_parse_raw", None)):
+    raise SystemExit("RED2 missing _parse_raw bridge")
+
+libc = ctypes.CDLL(None, use_errno=True)
+PR_SET_CHILD_SUBREAPER = 36
+if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+    raise SystemExit("RED2 collector containment unavailable")
+driver_pid = os.getpid()
+driver_tid = str(driver_pid)
+proc_fd = os.open("/proc", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+task_fd = os.open(f"self/task/{driver_tid}", os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=proc_fd)
+children_fd = os.open("children", os.O_RDONLY | os.O_CLOEXEC, dir_fd=task_fd)
+try:
+    if os.pread(children_fd, 65536, 0) not in (b"", b"\n"):
+        raise SystemExit("RED2 collector containment unavailable")
+except OSError:
+    raise SystemExit("RED2 collector containment unavailable")
+if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+    raise SystemExit("RED2 collector containment unavailable")
+try:
+    own_pidfd = os.pidfd_open(driver_pid)
+    signal.pidfd_send_signal(own_pidfd, 0)
+    os.close(own_pidfd)
+except OSError:
+    raise SystemExit("RED2 collector containment unavailable")
+
+CASES = (
+    "sim-event-first", "sim-stop-first", "sim-tid-reuse", "sim-restart",
+    "review-policy-bpf", "kernel-bootstrap", "kernel-fork", "kernel-clone",
+    "kernel-vfork", "kernel-nonleader-exec", "kernel-signal-ignored",
+    "kernel-signal-caught", "kernel-restart-reject", "kernel-group-stop-reject",
+    "kernel-cleanup-signal", "kernel-cleanup-failure",
+)
+KERNEL_CASES = set(CASES[5:])
+UNRUN = {
+    "bs2b-s9-native-unrun:linux-x86-64-required",
+    "bs2b-s9-native-unrun:ptrace-seize-unsupported",
+    "bs2b-s9-native-unrun:ptrace-seize-denied",
+}
+EXPECTED_ROWS = {
+    "kernel-bootstrap": {},
+    "kernel-fork": {("getfd", "none", "none", "none"): 2},
+    "kernel-clone": {("getfd", "none", "none", "none"): 2},
+    "kernel-vfork": {("getfd", "none", "none", "none"): 2},
+    "kernel-nonleader-exec": {("getfd", "none", "none", "none"): 1},
+    "kernel-signal-ignored": {("getfd", "none", "none", "none"): 1},
+    "kernel-signal-caught": {("getfd", "none", "none", "none"): 2},
+}
+SIMULATION_NEGATIVE = {"sim-restart", "kernel-restart-reject", "kernel-group-stop-reject",
+                       "kernel-cleanup-signal", "kernel-cleanup-failure"}
+def fail(label, message):
+    raise SystemExit(f"{label}: {message}")
+
+def read_children():
+    try:
+        raw = os.pread(children_fd, 65536, 0)
+    except OSError:
+        fail("containment", "could not read exact children file")
+    if not raw:
+        return []
+    values = raw.split()
+    if len(values) > 4097 or any(not item.isdigit() or item.startswith(b"0") for item in values):
+        fail("containment", "noncanonical children file")
+    pids = [int(item) for item in values]
+    if any(pid <= 0 or pid > 2**31 - 1 for pid in pids) or len(set(pids)) != len(pids):
+        fail("containment", "invalid children identity")
+    return pids
+
+def proc_stat(pid, retain=False):
+    pid_fd = os.open(str(pid), os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=proc_fd)
+    keep_fd = False
+    try:
+        first_stat = os.fstat(pid_fd)
+        first_identity = (first_stat.st_dev, first_stat.st_ino)
+        stat_fd = os.open("stat", os.O_RDONLY | os.O_CLOEXEC, dir_fd=pid_fd)
+        try:
+            raw = os.pread(stat_fd, 65536, 0)
+        finally:
+            os.close(stat_fd)
+        close = raw.rfind(b")")
+        if close < 0:
+            fail("containment", "malformed proc stat")
+        try:
+            actual_pid = int(raw.split(b" ", 1)[0])
+        except (ValueError, IndexError):
+            fail("containment", "malformed proc pid")
+        if actual_pid != pid:
+            fail("containment", "proc pid changed")
+        fields = raw[close + 2:].split()
+        if len(fields) < 22:
+            fail("containment", "short proc stat")
+        state = fields[0]
+        if state not in (b"R", b"S", b"D", b"Z", b"T", b"t", b"W", b"X", b"x", b"K", b"P"):
+            fail("containment", "invalid proc state")
+        result = (actual_pid, int(fields[1]), int(fields[2]), int(fields[3]), int(fields[19]))
+        if result[1] <= 0 or result[2] <= 0 or result[3] <= 0 or result[4] <= 0:
+            fail("containment", "invalid proc identity fields")
+        second_stat = os.fstat(pid_fd)
+        second_identity = (second_stat.st_dev, second_stat.st_ino)
+        if first_identity != second_identity:
+            fail("containment", "proc directory identity changed")
+        keep_fd = retain
+        return result + (first_identity, pid_fd)
+    finally:
+        if not keep_fd:
+            os.close(pid_fd)
+
+def contain(deadline, expected_session=None, expected_pgrp=None):
+    seen = set()
+    while time.monotonic() < deadline:
+        pids = read_children()
+        if not pids:
+            try:
+                os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                return
+            continue
+        for pid in pids:
+            if pid in seen or len(seen) >= 4097:
+                fail("containment", "adopted PID cap exceeded")
+            seen.add(pid)
+            try:
+                pfd = os.pidfd_open(pid)
+            except OSError as exc:
+                if exc.errno == errno.ESRCH:
+                    seen.remove(pid)
+                    try:
+                        os.waitpid(pid, os.WNOHANG)
+                    except ChildProcessError:
+                        pass
+                    continue
+                fail("containment", "pidfd_open failed")
+            try:
+                actual_pid, ppid, pgrp, session, _start, proc_identity, proc_dir_fd = proc_stat(pid, retain=True)
+                try:
+                    if actual_pid != pid or ppid != driver_pid or (expected_session is not None and session != expected_session) or (expected_pgrp is not None and pgrp != expected_pgrp):
+                        fail("containment", "held proc identity mismatch")
+                    signal.pidfd_send_signal(pfd, signal.SIGKILL)
+                    while time.monotonic() < deadline:
+                        waited, _ = os.waitpid(pid, os.WNOHANG)
+                        if waited == pid:
+                            break
+                        time.sleep(0.001)
+                    else:
+                        fail("containment", "child reap deadline expired")
+                    held_stat = os.fstat(proc_dir_fd)
+                    if (held_stat.st_dev, held_stat.st_ino) != proc_identity:
+                        fail("containment", "held proc identity changed")
+                finally:
+                    os.close(proc_dir_fd)
+            finally:
+                os.close(pfd)
+    fail("containment", "five-second adopted-child deadline expired")
+
+def prove_clean(deadline):
+    while time.monotonic() < deadline:
+        if read_children():
+            fail("containment", "child remained after successful outcome")
+        try:
+            waited, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if waited:
+            fail("containment", "unlisted child was reaped")
+        time.sleep(0.001)
+    fail("containment", "clean-closure deadline expired")
+
+def identity(fd):
+    item = os.fstat(fd)
+    return (item.st_dev, item.st_ino, item.st_uid, item.st_gid,
+            stat.S_IMODE(item.st_mode), item.st_nlink, item.st_size)
+
+def watchdog(data, case, collector_pid):
+    if len(data) != 24 or data[:8] != b"P11S9WD\0" or data[8:10] != b"\1\0":
+        fail(case, "invalid watchdog record")
+    kind = struct.unpack_from("<H", data, 10)[0]
+    flags = struct.unpack_from("<I", data, 12)[0]
+    pgid = struct.unpack_from("<Q", data, 16)[0]
+    if kind not in (0, 1) or flags != 0 or pgid > 2**31 - 1:
+        fail(case, "noncanonical watchdog record")
+    if kind == 0 and pgid != 0:
+        fail(case, "no-root watchdog carried PGID")
+    if kind == 1 and (pgid <= 0 or pgid > 2**31 - 1):
+        fail(case, "owned-root watchdog identity mismatch")
+    if case not in KERNEL_CASES and kind != 0:
+        fail(case, "simulation reported a root")
+    if case in KERNEL_CASES and kind != 1:
+        fail(case, "kernel case omitted root")
+    if kind == 0:
+        return kind, pgid, None, None, None
+    root_dir_fd = None
+    try:
+        root_pidfd = os.pidfd_open(pgid)
+        signal.pidfd_send_signal(root_pidfd, 0)
+    except OSError:
+        fail(case, "reported root pidfd unavailable")
+    try:
+        actual_pid, ppid, pgrp, session, start, root_identity, root_dir_fd = proc_stat(pgid, retain=True)
+        if actual_pid != pgid or ppid != collector_pid or pgrp != pgid or session != collector_pid:
+            fail(case, "reported root process identity mismatch")
+        return kind, pgid, root_pidfd, root_dir_fd, root_identity
+    except BaseException:
+        os.close(root_pidfd)
+        if root_dir_fd is not None:
+            os.close(root_dir_fd)
+        raise
+
+def invoke(case, output_fd, watchdog_fd, watchdog_read_fd, args=None, timeout=15):
+    argv = [binary, "self-test", case, str(output_fd), str(watchdog_fd)] if args is None else [binary] + args
+    stream_fds = []
+    stream_paths = []
+    stdin_fd = None
+    child = None
+    pidfd = None
+    root_pidfd = None
+    root_dir_fd = None
+    root_identity = None
+    reported_pgid = None
+    watchdog_bytes = bytearray()
+    watchdog_eof = False
+    timed_out = False
+    try:
+        stdin_fd = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+        stdin_metadata = os.fstat(stdin_fd)
+        null_metadata = os.stat("/dev/null")
+        if (not stat.S_ISCHR(stdin_metadata.st_mode)
+                or (stdin_metadata.st_dev, stdin_metadata.st_ino) != (null_metadata.st_dev, null_metadata.st_ino)):
+            fail(case, "stdin is not /dev/null")
+        for prefix in ("s9-stdout-", "s9-stderr-"):
+            fd, path = tempfile.mkstemp(prefix=prefix, dir=os.environ.get("TMPDIR"))
+            metadata = os.fstat(fd)
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+                    or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_nlink != 1):
+                fail(case, "standard stream custody is not a private regular file")
+            stream_fds.append(fd)
+            stream_paths.append(path)
+        flags = fcntl.fcntl(watchdog_read_fd, fcntl.F_GETFL)
+        fcntl.fcntl(watchdog_read_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        child = subprocess.Popen(argv, close_fds=True, pass_fds=(output_fd, watchdog_fd),
+                                 stdin=stdin_fd, stdout=stream_fds[0], stderr=stream_fds[1],
+                                 start_new_session=True)
+        os.close(watchdog_fd)
+        watchdog_fd = None
+        os.close(stdin_fd)
+        stdin_fd = None
+        for fd in stream_fds:
+            os.close(fd)
+        stream_fds = []
+        pidfd = os.pidfd_open(child.pid)
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                chunk = os.read(watchdog_read_fd, 4096)
+                if chunk:
+                    watchdog_bytes.extend(chunk)
+                    if len(watchdog_bytes) > 24:
+                        fail(case, "watchdog record exceeded 24 bytes")
+                    if len(watchdog_bytes) == 24:
+                        kind, reported_pgid, root_pidfd, root_dir_fd, root_identity = watchdog(bytes(watchdog_bytes), case, child.pid)
+                else:
+                    watchdog_eof = True
+            except BlockingIOError:
+                pass
+            rc = child.poll()
+            if rc is not None and watchdog_eof:
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                reap_deadline = time.monotonic() + 5
+                while child.poll() is None and time.monotonic() < reap_deadline:
+                    time.sleep(0.001)
+                if child.poll() is None:
+                    fail(case, "collector kill/reap deadline expired")
+                contain(time.monotonic() + 5, child.pid, reported_pgid)
+                watchdog_drain_deadline = time.monotonic() + 5
+                while not watchdog_eof:
+                    if time.monotonic() >= watchdog_drain_deadline:
+                        fail(case, "watchdog EOF drain deadline expired")
+                    try:
+                        chunk = os.read(watchdog_read_fd, 4096)
+                    except BlockingIOError:
+                        time.sleep(0.001)
+                        continue
+                    if chunk:
+                        watchdog_bytes.extend(chunk)
+                        if len(watchdog_bytes) > 24:
+                            fail(case, "watchdog record exceeded 24 bytes")
+                    else:
+                        watchdog_eof = True
+                break
+            time.sleep(0.001)
+        rc = child.returncode
+        streams = []
+        for path in stream_paths:
+            fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                stream_size = os.fstat(fd).st_size
+                if stream_size > 1 << 20:
+                    fail(case, "standard stream exceeded 1 MiB")
+                stream = os.pread(fd, stream_size, 0)
+                if len(stream) != stream_size:
+                    fail(case, "standard stream read was short")
+                streams.append(stream)
+            finally:
+                os.close(fd)
+        if args is None and len(watchdog_bytes) != 24:
+            fail(case, "watchdog record missing")
+        if root_dir_fd is not None:
+            held_root = os.fstat(root_dir_fd)
+            if (held_root.st_dev, held_root.st_ino) != root_identity:
+                fail(case, "held root proc identity changed")
+        return rc, bytes(watchdog_bytes), streams[0], streams[1], timed_out, child.pid, reported_pgid
+    finally:
+        if watchdog_fd is not None:
+            os.close(watchdog_fd)
+        if pidfd is not None:
+            os.close(pidfd)
+        if root_pidfd is not None:
+            os.close(root_pidfd)
+        if root_dir_fd is not None:
+            os.close(root_dir_fd)
+        if child is not None and child.poll() is None:
+            try:
+                orphan_pidfd = os.pidfd_open(child.pid)
+                try:
+                    signal.pidfd_send_signal(orphan_pidfd, signal.SIGKILL)
+                finally:
+                    os.close(orphan_pidfd)
+                reap_deadline = time.monotonic() + 5
+                while child.poll() is None and time.monotonic() < reap_deadline:
+                    time.sleep(0.001)
+                if child.poll() is not None:
+                    contain(time.monotonic() + 5, child.pid, reported_pgid)
+            except BaseException:
+                raise
+        if stdin_fd is not None:
+            os.close(stdin_fd)
+        for fd in stream_fds:
+            os.close(fd)
+        for path in stream_paths:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+def valid_case(case):
+    out_fd = wd_read = wd_write = None
+    out_path = None
+    session_id = None
+    reported_pgid = None
+    try:
+        out_fd, out_path = tempfile.mkstemp(prefix="s9-out-", dir=os.environ.get("TMPDIR"))
+        output_metadata = os.fstat(out_fd)
+        if (not stat.S_ISREG(output_metadata.st_mode) or output_metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(output_metadata.st_mode) != 0o600 or output_metadata.st_nlink != 1):
+            fail(case, "output custody is not a private regular file")
+        start_flags = fcntl.fcntl(out_fd, fcntl.F_GETFL)
+        if start_flags & os.O_ACCMODE != os.O_RDWR or start_flags & os.O_APPEND:
+            fail(case, "output flags are not O_RDWR without O_APPEND")
+        os.lseek(out_fd, 37, os.SEEK_SET)
+        start_identity = identity(out_fd)
+        start_offset = os.lseek(out_fd, 0, os.SEEK_CUR)
+        wd_read, wd_write = os.pipe2(os.O_CLOEXEC)
+        rc, watchdog_bytes, stdout, stderr, timed_out, session_id, reported_pgid = invoke(case, out_fd, wd_write, wd_read)
+        if timed_out:
+            fail(case, "collector timed out")
+        if rc == 0:
+            if stdout != f"bs2b-s9-native-self-test-ok:{case}\n".encode() or stderr:
+                fail(case, "success stream contract mismatch")
+        elif rc == 77 and case in KERNEL_CASES:
+            if stdout or stderr not in tuple((token + "\n").encode() for token in UNRUN):
+                fail(case, "UNRUN stream contract mismatch")
+            with open(os.path.join(evidence, case + ".unrun"), "wb") as stream:
+                stream.write(stderr)
+        else:
+            fail(case, f"unexpected exit {rc}")
+        if os.fstat(out_fd).st_size > 128 * 1024 * 1024:
+            fail(case, "raw output exceeded 128 MiB")
+        if case == "review-policy-bpf":
+            raw = os.pread(out_fd, 1 << 20, 0)
+            if not raw or len(raw) % 8 or len(raw) // 8 > 4096:
+                fail(case, "BPF export is empty, unaligned, or over bound")
+            digest = hashlib.sha256(raw).hexdigest()
+            with open(os.path.join(evidence, case + ".bpf"), "wb") as stream:
+                stream.write(raw)
+            with open(os.path.join(evidence, case + ".bpf.meta"), "w", encoding="ascii") as stream:
+                stream.write(f"length={len(raw)}\ncount={len(raw) // 8}\nsha256={digest}\n")
+        elif rc == 0 and case not in SIMULATION_NEGATIVE:
+            calls = []
+            original = module._parse_raw
+            def parse_once(fd):
+                calls.append(fd)
+                return original(fd)
+            module._parse_raw = parse_once
+            try:
+                rows = module._parse_raw(out_fd)
+            finally:
+                module._parse_raw = original
+            if len(calls) != 1 or rows != EXPECTED_ROWS.get(case, {}):
+                fail(case, "Python _parse_raw bridge mismatch")
+            raw = os.pread(out_fd, 128 * 1024 * 1024, 0)
+            with open(os.path.join(evidence, case + ".raw"), "wb") as stream:
+                stream.write(raw)
+        elif os.fstat(out_fd).st_size != 0:
+            fail(case, "rejection or UNRUN wrote raw output")
+        if identity(out_fd)[:6] != start_identity[:6] or fcntl.fcntl(out_fd, fcntl.F_GETFL) != start_flags:
+            fail(case, "output identity or flags changed")
+        if os.lseek(out_fd, 0, os.SEEK_CUR) != start_offset:
+            fail(case, "caller offset changed")
+        try:
+            prove_clean(time.monotonic() + 5)
+        except BaseException:
+            contain(time.monotonic() + 5, session_id, reported_pgid)
+            raise
+    except BaseException:
+        try:
+            prove_clean(time.monotonic() + 5)
+        except BaseException:
+            contain(time.monotonic() + 5, session_id, reported_pgid)
+        raise
+    finally:
+        for fd in (wd_read, wd_write, out_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        if out_path is not None:
+            try:
+                os.unlink(out_path)
+            except FileNotFoundError:
+                pass
+
+def refusal(label, output_mode="rw", watchdog_mode="write", args=None):
+    out_fd = wd_read = wd_write = passed_watchdog = None
+    out_path = watchdog_path = None
+    session_id = None
+    reported_pgid = None
+    try:
+        base_fd, out_path = tempfile.mkstemp(prefix="s9-refuse-", dir=os.environ.get("TMPDIR"))
+        os.close(base_fd)
+        output_flags = {"rw": os.O_RDWR, "ro": os.O_RDONLY, "wo": os.O_WRONLY, "append": os.O_RDWR | os.O_APPEND}[output_mode]
+        out_fd = os.open(out_path, output_flags | os.O_CLOEXEC)
+        output_metadata = os.fstat(out_fd)
+        if (not stat.S_ISREG(output_metadata.st_mode) or output_metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(output_metadata.st_mode) != 0o600 or output_metadata.st_nlink != 1):
+            fail(label, "refusal output custody is not a private regular file")
+        before = identity(out_fd)
+        before_flags = fcntl.fcntl(out_fd, fcntl.F_GETFL)
+        os.lseek(out_fd, 19, os.SEEK_SET)
+        before_offset = os.lseek(out_fd, 0, os.SEEK_CUR)
+        if output_mode == "rw":
+            if before_flags & os.O_ACCMODE != os.O_RDWR or before_flags & os.O_APPEND:
+                fail(label, "refusal output flags are not O_RDWR without O_APPEND")
+        elif output_mode == "ro":
+            if before_flags & os.O_ACCMODE != os.O_RDONLY:
+                fail(label, "refusal output is not read-only")
+        elif output_mode == "wo":
+            if before_flags & os.O_ACCMODE != os.O_WRONLY:
+                fail(label, "refusal output is not write-only")
+        elif not before_flags & os.O_APPEND:
+            fail(label, "refusal output is not append-only")
+        wd_read, wd_write = os.pipe2(os.O_CLOEXEC)
+        passed_watchdog = wd_write
+        if watchdog_mode == "read":
+            passed_watchdog = os.dup(wd_read)
+        elif watchdog_mode == "regular":
+            watchdog_base, watchdog_path = tempfile.mkstemp(prefix="s9-watchdog-", dir=os.environ.get("TMPDIR"))
+            os.close(watchdog_base)
+            passed_watchdog = os.open(watchdog_path, os.O_RDONLY | os.O_CLOEXEC)
+        elif watchdog_mode == "alias":
+            passed_watchdog = os.dup(out_fd)
+        if watchdog_mode == "regular":
+            watchdog_identity = identity(passed_watchdog)
+            if watchdog_identity[:2] == before[:2]:
+                fail(label, "nonpipe watchdog reused output identity")
+        actual_args = args if args is not None else ["self-test", "sim-event-first", str(out_fd), str(out_fd if watchdog_mode == "alias" else passed_watchdog)]
+        if watchdog_mode != "write":
+            os.close(wd_write)
+            wd_write = -1
+        rc, watchdog_bytes, stdout, stderr, timed_out, session_id, reported_pgid = invoke("refusal", out_fd, passed_watchdog, wd_read, args=actual_args)
+        if timed_out or rc != 77 or stdout or stderr or watchdog_bytes or os.fstat(out_fd).st_size:
+            fail(label, "refusal mutated output, watchdog, or streams")
+        if (identity(out_fd) != before
+                or fcntl.fcntl(out_fd, fcntl.F_GETFL) != before_flags
+                or os.lseek(out_fd, 0, os.SEEK_CUR) != before_offset):
+            fail(label, "refusal changed output identity")
+        try:
+            prove_clean(time.monotonic() + 5)
+        except BaseException:
+            contain(time.monotonic() + 5, session_id, reported_pgid)
+            raise
+    except BaseException:
+        try:
+            prove_clean(time.monotonic() + 5)
+        except BaseException:
+            contain(time.monotonic() + 5, session_id, reported_pgid)
+        raise
+    finally:
+        for fd in (wd_read, wd_write, out_fd, passed_watchdog):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        if out_path is not None:
+            try:
+                os.unlink(out_path)
+            except FileNotFoundError:
+                pass
+        if watchdog_path is not None:
+            try:
+                os.unlink(watchdog_path)
+            except FileNotFoundError:
+                pass
+
+for args in ([], ["--help"], ["produce"], ["capture"], ["check"], ["unknown"],
+             ["self-test", "sim-event-first", "3", "4"],
+             ["self-test", "sim-event-first", "-1", "4"],
+             ["self-test", "sim-event-first", "03", "4"],
+             ["self-test", "sim-event-first", "3", "+4"],
+             ["self-test", "sim-event-first", "", "4"],
+             ["self-test", "sim-event-first", "3", "2147483648"],
+             ["self-test", "sim-event-first", "3", "4", "extra"],
+             ["self-test", "unknown", "3", "4"],
+             ["internal-workload", "unknown"],
+             ["internal-workload", "kernel-fork", "extra"]):
+    refusal("refusal-" + "-".join(args or ["empty"]), args=args)
+refusal("refusal-read-only-output", output_mode="ro")
+refusal("refusal-write-only-output", output_mode="wo")
+refusal("refusal-append-output", output_mode="append")
+refusal("refusal-nonpipe-watchdog", watchdog_mode="regular")
+refusal("refusal-read-end-watchdog", watchdog_mode="read")
+refusal("refusal-aliased-watchdog", watchdog_mode="alias")
+for case in CASES:
+    valid_case(case)
+print("bs2b-s9-native-ptrace-lifecycle-ok")
+"#;
+    let output = Command::new("/usr/bin/python3")
+        .args([
+            "-c",
+            driver,
+            binary.to_str().expect("binary path is UTF-8"),
+            experiment.to_str().expect("experiment path is UTF-8"),
+            evidence.to_str().expect("evidence path is UTF-8"),
+        ])
+        .current_dir(repo)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("TZ", "UTC")
+        .env("TMPDIR", &temp_root)
+        .output()
+        .expect("run RED2 native lifecycle oracle");
+    assert_inputs_unchanged();
+    assert!(
+        output.status.success(),
+        "RED2 native lifecycle oracle failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"bs2b-s9-native-ptrace-lifecycle-ok\n");
+    assert!(output.stderr.is_empty(), "RED2 oracle wrote to stderr");
+
+    let simulation_evidence = ["sim-event-first", "sim-stop-first", "sim-tid-reuse"];
+    for case in simulation_evidence {
+        assert!(evidence.join(format!("{case}.raw")).is_file());
+    }
+    assert!(evidence.join("review-policy-bpf.bpf").is_file());
+    assert!(evidence.join("review-policy-bpf.bpf.meta").is_file());
+    for case in [
+        "kernel-bootstrap",
+        "kernel-fork",
+        "kernel-clone",
+        "kernel-vfork",
+        "kernel-nonleader-exec",
+        "kernel-signal-ignored",
+        "kernel-signal-caught",
+    ] {
+        let raw = evidence.join(format!("{case}.raw"));
+        let unrun = evidence.join(format!("{case}.unrun"));
+        assert_ne!(
+            raw.is_file(),
+            unrun.is_file(),
+            "RED2 case evidence is ambiguous"
+        );
+    }
+
+    let bpf_path = evidence.join("review-policy-bpf.bpf");
+    let bpf_meta_path = evidence.join("review-policy-bpf.bpf.meta");
+    assert!(bpf_path.is_file(), "RED2 BPF bytes evidence missing");
+    assert!(
+        bpf_meta_path.is_file(),
+        "RED2 BPF metadata evidence missing"
+    );
+    let bpf_bytes = fs::read(&bpf_path).expect("read RED2 BPF bytes evidence");
+    assert!(!bpf_bytes.is_empty(), "RED2 BPF evidence is empty");
+    assert_eq!(
+        bpf_bytes.len() % 8,
+        0,
+        "RED2 BPF instruction alignment changed"
+    );
+    assert!(
+        bpf_bytes.len() / 8 <= 4096,
+        "RED2 BPF instruction bound changed"
+    );
+    let digest = Command::new("/usr/bin/sha256sum")
+        .arg(&bpf_path)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("TZ", "UTC")
+        .output()
+        .expect("hash RED2 BPF evidence");
+    assert!(digest.status.success(), "RED2 BPF digest failed");
+    let digest = String::from_utf8_lossy(&digest.stdout);
+    let digest = digest.split_whitespace().next().expect("BPF digest");
+    let metadata = fs::read_to_string(&bpf_meta_path).expect("read RED2 BPF metadata");
+    assert_eq!(
+        metadata,
+        format!(
+            "length={}\ncount={}\nsha256={digest}\n",
+            bpf_bytes.len(),
+            bpf_bytes.len() / 8
+        ),
+        "RED2 BPF byte metadata changed"
+    );
+    fs::remove_file(&bpf_path).expect("remove RED2 BPF bytes evidence");
+    fs::remove_file(&bpf_meta_path).expect("remove RED2 BPF metadata");
+
+    for entry in fs::read_dir(&evidence).expect("read RED2 evidence directory") {
+        let path = entry.expect("read RED2 evidence entry").path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("RED2 evidence filename is UTF-8");
+        let bytes = fs::read(&path).expect("read RED2 raw evidence");
+        if name.ends_with(".unrun") {
+            assert!(name.starts_with("kernel-"), "simulation was marked UNRUN");
+            assert!(
+                matches!(
+                    bytes.as_slice(),
+                    b"bs2b-s9-native-unrun:linux-x86-64-required\n"
+                        | b"bs2b-s9-native-unrun:ptrace-seize-unsupported\n"
+                        | b"bs2b-s9-native-unrun:ptrace-seize-denied\n"
+                ),
+                "RED2 UNRUN reason is not exact"
+            );
+            fs::remove_file(path).expect("remove RED2 UNRUN evidence");
+            continue;
+        }
+        assert!(name.ends_with(".raw"), "unknown RED2 evidence artifact");
+        let case = name.strip_suffix(".raw").expect("RED2 raw case name");
+        assert!(!bytes.is_empty(), "RED2 raw evidence is empty");
+        assert_eq!(bytes.len() % 128, 0, "RED2 raw ABI alignment changed");
+        let allowed_kinds = [
+            HEADER,
+            ROOT,
+            CREATE_ENTRY,
+            CREATE_EVENT,
+            CREATE_EXIT,
+            CHILD_JOIN,
+            VFORK_DONE,
+            EXEC_EVENT,
+            EXIT_EVENT,
+            FINAL_WIF,
+            SIGNAL_DELIVERY,
+            SYSCALL_CANCEL,
+            FCNTL_ENTRY,
+            FCNTL_EXIT,
+        ];
+        let mut counts = std::collections::BTreeMap::<u16, usize>::new();
+        let mut exit_statuses = std::collections::BTreeMap::<u64, u32>::new();
+        let mut wif_statuses = std::collections::BTreeMap::<u64, u32>::new();
+        let mut exec_superseded = BTreeSet::new();
+        for (index, record) in bytes.chunks_exact(128).enumerate() {
+            assert_eq!(&record[..8], b"P11S9R1\0", "RED2 journal magic changed");
+            assert_eq!(
+                &record[8..10],
+                &1u16.to_le_bytes(),
+                "RED2 journal version changed"
+            );
+            assert_eq!(&record[12..16], &[0, 0, 0, 0], "RED2 journal flags changed");
+            let sequence = u64::from_le_bytes(record[16..24].try_into().unwrap());
+            assert_eq!(sequence, index as u64, "RED2 physical sequence changed");
+            let kind = u16::from_le_bytes(record[10..12].try_into().unwrap());
+            assert!(allowed_kinds.contains(&kind), "RED2 journal kind changed");
+            *counts.entry(kind).or_default() += 1;
+            let payload_end = match kind {
+                HEADER | ROOT => 32,
+                CREATE_ENTRY | CREATE_EVENT => 42,
+                CREATE_EXIT => 44,
+                CHILD_JOIN => 58,
+                VFORK_DONE => 48,
+                EXEC_EVENT => 50,
+                EXIT_EVENT | FINAL_WIF | SIGNAL_DELIVERY => 36,
+                SYSCALL_CANCEL => 40,
+                FCNTL_ENTRY => 88,
+                FCNTL_EXIT => 48,
+                _ => unreachable!(),
+            };
+            assert!(
+                record[payload_end..].iter().all(|byte| *byte == 0),
+                "RED2 kind-specific padding changed"
+            );
+            if kind != HEADER && kind != ROOT {
+                let ordinal = u64::from_le_bytes(record[24..32].try_into().unwrap());
+                assert!(
+                    (1..=4096).contains(&ordinal),
+                    "RED2 private ordinal bound changed"
+                );
+            }
+            match kind {
+                CREATE_ENTRY => assert!(
+                    (1..=4).contains(&u16::from_le_bytes(record[40..42].try_into().unwrap())),
+                    "RED2 creation syscall kind changed"
+                ),
+                CREATE_EVENT => assert!(
+                    (1..=3).contains(&u16::from_le_bytes(record[40..42].try_into().unwrap())),
+                    "RED2 creation event kind changed"
+                ),
+                CREATE_EXIT => {
+                    let outcome = u16::from_le_bytes(record[40..42].try_into().unwrap());
+                    let errno = u16::from_le_bytes(record[42..44].try_into().unwrap());
+                    assert!(
+                        (outcome == 1 && errno == 0)
+                            || (outcome == 0 && (1..=4095).contains(&errno)),
+                        "RED2 creation outcome changed"
+                    );
+                }
+                CHILD_JOIN => assert!(
+                    (1..=3).contains(&u16::from_le_bytes(record[56..58].try_into().unwrap())),
+                    "RED2 child event kind changed"
+                ),
+                VFORK_DONE => assert_ne!(
+                    u64::from_le_bytes(record[40..48].try_into().unwrap()),
+                    0,
+                    "RED2 VFORK_DONE child changed"
+                ),
+                EXEC_EVENT => {
+                    let class = u16::from_le_bytes(record[48..50].try_into().unwrap());
+                    assert!((1..=2).contains(&class), "RED2 exec class changed");
+                    if class == 2 {
+                        exec_superseded
+                            .insert(u64::from_le_bytes(record[32..40].try_into().unwrap()));
+                    }
+                }
+                SIGNAL_DELIVERY => assert!(
+                    (1..=64).contains(&u32::from_le_bytes(record[32..36].try_into().unwrap())),
+                    "RED2 signal field changed"
+                ),
+                SYSCALL_CANCEL => assert_ne!(
+                    u64::from_le_bytes(record[32..40].try_into().unwrap()),
+                    72,
+                    "RED2 fcntl cancellation changed"
+                ),
+                EXIT_EVENT | FINAL_WIF => {
+                    let status = u32::from_le_bytes(record[32..36].try_into().unwrap());
+                    let signal = status & 0x7f;
+                    let normal = status & 0xff == 0;
+                    let signaled = (1..=64).contains(&signal) && (status & !0xff) == 0;
+                    assert!(
+                        status <= 0xffff && (normal || signaled),
+                        "RED2 terminal wait status changed"
+                    );
+                }
+                _ => {}
+            }
+            if kind == EXIT_EVENT {
+                assert!(
+                    exit_statuses
+                        .insert(
+                            u64::from_le_bytes(record[24..32].try_into().unwrap()),
+                            u32::from_le_bytes(record[32..36].try_into().unwrap()),
+                        )
+                        .is_none(),
+                    "RED2 duplicate EXIT_EVENT changed"
+                );
+            }
+            if kind == FINAL_WIF {
+                let generation = u64::from_le_bytes(record[24..32].try_into().unwrap());
+                let status = u32::from_le_bytes(record[32..36].try_into().unwrap());
+                assert!(
+                    wif_statuses.insert(generation, status).is_none(),
+                    "RED2 duplicate WIF changed"
+                );
+            }
+        }
+        assert_eq!(
+            u16::from_le_bytes(bytes[10..12].try_into().unwrap()),
+            HEADER,
+            "RED2 journal envelope is not first"
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            128,
+            "RED2 journal record size changed"
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+            0x0102_0304,
+            "RED2 journal endian discriminator changed"
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[128 + 10..128 + 12].try_into().unwrap()),
+            ROOT,
+            "RED2 root record is not second"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[128 + 24..128 + 32].try_into().unwrap()),
+            1,
+            "RED2 root generation changed"
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[256 + 10..256 + 12].try_into().unwrap()),
+            EXEC_EVENT,
+            "RED2 bootstrap exec record is not third"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[256 + 24..256 + 32].try_into().unwrap()),
+            1,
+            "RED2 bootstrap execing generation changed"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[256 + 32..256 + 40].try_into().unwrap()),
+            0,
+            "RED2 bootstrap displaced generation changed"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[256 + 40..256 + 48].try_into().unwrap()),
+            1,
+            "RED2 bootstrap thread group changed"
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[256 + 48..256 + 50].try_into().unwrap()),
+            1,
+            "RED2 bootstrap exec class changed"
+        );
+        assert!(counts.contains_key(&ROOT), "RED2 bootstrap record missing");
+        let required = match case {
+            "sim-event-first" | "sim-stop-first" | "sim-tid-reuse" => &[
+                HEADER,
+                ROOT,
+                EXEC_EVENT,
+                CREATE_ENTRY,
+                CREATE_EVENT,
+                CREATE_EXIT,
+                CHILD_JOIN,
+                EXIT_EVENT,
+                FINAL_WIF,
+            ][..],
+            "kernel-bootstrap" => &[HEADER, ROOT, EXEC_EVENT, EXIT_EVENT, FINAL_WIF][..],
+            "kernel-fork" | "kernel-clone" => &[
+                HEADER,
+                ROOT,
+                CREATE_ENTRY,
+                CREATE_EVENT,
+                CREATE_EXIT,
+                CHILD_JOIN,
+                EXEC_EVENT,
+                EXIT_EVENT,
+                FINAL_WIF,
+                FCNTL_ENTRY,
+                FCNTL_EXIT,
+            ][..],
+            "kernel-vfork" => &[
+                HEADER,
+                ROOT,
+                CREATE_ENTRY,
+                CREATE_EVENT,
+                CREATE_EXIT,
+                CHILD_JOIN,
+                VFORK_DONE,
+                EXEC_EVENT,
+                EXIT_EVENT,
+                FINAL_WIF,
+                FCNTL_ENTRY,
+                FCNTL_EXIT,
+            ][..],
+            "kernel-nonleader-exec" => &[
+                HEADER,
+                ROOT,
+                EXEC_EVENT,
+                EXIT_EVENT,
+                FINAL_WIF,
+                FCNTL_ENTRY,
+                FCNTL_EXIT,
+            ][..],
+            "kernel-signal-ignored" | "kernel-signal-caught" => &[
+                HEADER,
+                ROOT,
+                EXEC_EVENT,
+                EXIT_EVENT,
+                FINAL_WIF,
+                SIGNAL_DELIVERY,
+                FCNTL_ENTRY,
+                FCNTL_EXIT,
+            ][..],
+            _ => &[][..],
+        };
+        for kind in required {
+            assert!(
+                counts.contains_key(kind),
+                "RED2 required lifecycle kind missing"
+            );
+        }
+        for (generation, status) in &wif_statuses {
+            assert_eq!(
+                exit_statuses.get(generation),
+                Some(status),
+                "RED2 EXIT/WIF status changed"
+            );
+        }
+        for (generation, status) in &exit_statuses {
+            if exec_superseded.contains(generation) {
+                assert!(
+                    !wif_statuses.contains_key(generation),
+                    "RED2 superseded generation received WIF"
+                );
+            } else {
+                assert_eq!(
+                    wif_statuses.get(generation),
+                    Some(status),
+                    "RED2 live generation lost WIF"
+                );
+            }
+        }
+        assert_eq!(
+            counts.get(&EXIT_EVENT).copied().unwrap_or_default(),
+            counts.get(&FINAL_WIF).copied().unwrap_or_default() + exec_superseded.len(),
+            "RED2 terminal generation equation changed"
+        );
+        assert_eq!(
+            exec_superseded.len(),
+            if case == "kernel-nonleader-exec" {
+                1
+            } else {
+                0
+            },
+            "RED2 exec-superseded exception changed"
+        );
+        let count = |kind: u16| counts.get(&kind).copied().unwrap_or_default();
+        let expected_kind_counts: &[(u16, usize)] = match case {
+            "kernel-bootstrap" => &[(EXEC_EVENT, 1)],
+            "kernel-fork" | "kernel-clone" => &[
+                (CREATE_EVENT, 1),
+                (CREATE_EXIT, 1),
+                (CHILD_JOIN, 1),
+                (EXEC_EVENT, 1),
+                (EXIT_EVENT, 2),
+                (FINAL_WIF, 2),
+                (FCNTL_ENTRY, 2),
+                (FCNTL_EXIT, 2),
+            ],
+            "kernel-vfork" => &[
+                (CREATE_EVENT, 1),
+                (CREATE_EXIT, 1),
+                (CHILD_JOIN, 1),
+                (VFORK_DONE, 1),
+                (EXEC_EVENT, 2),
+                (EXIT_EVENT, 2),
+                (FINAL_WIF, 2),
+                (FCNTL_ENTRY, 2),
+                (FCNTL_EXIT, 2),
+            ],
+            "kernel-nonleader-exec" => &[
+                (EXEC_EVENT, 2),
+                (EXIT_EVENT, 2),
+                (FINAL_WIF, 1),
+                (FCNTL_ENTRY, 1),
+                (FCNTL_EXIT, 1),
+            ],
+            "kernel-signal-ignored" => &[
+                (EXEC_EVENT, 1),
+                (SIGNAL_DELIVERY, 1),
+                (EXIT_EVENT, 1),
+                (FINAL_WIF, 1),
+                (FCNTL_ENTRY, 1),
+                (FCNTL_EXIT, 1),
+            ],
+            "kernel-signal-caught" => &[
+                (EXEC_EVENT, 1),
+                (SIGNAL_DELIVERY, 1),
+                (EXIT_EVENT, 1),
+                (FINAL_WIF, 1),
+                (FCNTL_ENTRY, 2),
+                (FCNTL_EXIT, 2),
+            ],
+            _ => &[],
+        };
+        for (kind, expected) in expected_kind_counts {
+            assert_eq!(count(*kind), *expected, "RED2 per-case kind count changed");
+        }
+        if matches!(
+            case,
+            "sim-event-first" | "sim-stop-first" | "kernel-fork" | "kernel-clone" | "kernel-vfork"
+        ) {
+            assert_eq!(
+                count(CREATE_EXIT),
+                count(CREATE_EVENT),
+                "RED2 creation event/result equation changed"
+            );
+            assert_eq!(
+                count(CHILD_JOIN),
+                count(CREATE_EVENT),
+                "RED2 join equation changed"
+            );
+        }
+        if case == "kernel-vfork" {
+            assert_eq!(count(VFORK_DONE), 1, "RED2 VFORK_DONE count changed");
+        }
+        if case == "kernel-nonleader-exec" {
+            assert_eq!(count(EXEC_EVENT), 2, "RED2 exec-event count changed");
+            assert_eq!(
+                count(EXIT_EVENT),
+                count(FINAL_WIF) + exec_superseded.len(),
+                "RED2 sole exec supersede changed"
+            );
+        } else {
+            assert_eq!(
+                count(EXIT_EVENT),
+                count(FINAL_WIF),
+                "RED2 EXIT/WIF equation changed"
+            );
+        }
+        if matches!(case, "kernel-signal-ignored" | "kernel-signal-caught") {
+            assert_eq!(
+                count(SIGNAL_DELIVERY),
+                1,
+                "RED2 signal-delivery count changed"
+            );
+        }
+        if matches!(case, "kernel-fork" | "kernel-clone" | "kernel-vfork") {
+            assert_eq!(
+                count(FCNTL_ENTRY),
+                count(FCNTL_EXIT),
+                "RED2 fcntl entry/exit equation changed"
+            );
+        }
+        if matches!(case, "sim-event-first" | "sim-stop-first") {
+            let clone_entries = bytes
+                .chunks_exact(128)
+                .filter(|record| {
+                    u16::from_le_bytes(record[10..12].try_into().unwrap()) == CREATE_ENTRY
+                        && u16::from_le_bytes(record[40..42].try_into().unwrap()) == 4
+                })
+                .count();
+            let clone_events = bytes
+                .chunks_exact(128)
+                .filter(|record| {
+                    u16::from_le_bytes(record[10..12].try_into().unwrap()) == CREATE_EVENT
+                        && u16::from_le_bytes(record[40..42].try_into().unwrap()) == 3
+                })
+                .count();
+            let clone_joins = bytes
+                .chunks_exact(128)
+                .filter(|record| {
+                    u16::from_le_bytes(record[10..12].try_into().unwrap()) == CHILD_JOIN
+                        && u64::from_le_bytes(record[24..32].try_into().unwrap()) != 1
+                })
+                .count();
+            assert_eq!(clone_entries, 1, "RED2 clone3 entry count changed");
+            assert_eq!(clone_events, 1, "RED2 clone3 event count changed");
+            assert_eq!(clone_joins, 2, "RED2 clone3 join count changed");
+        }
+        fs::remove_file(path).expect("remove RED2 raw evidence");
+    }
+    fs::remove_dir(&evidence).expect("remove RED2 evidence directory");
+    fs::remove_file(&binary).expect("remove RED2 temporary binary");
+    fs::remove_dir(&temp_root).expect("remove RED2 temporary directory");
+    assert_inputs_unchanged();
+}

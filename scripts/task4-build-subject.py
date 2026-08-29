@@ -1751,6 +1751,249 @@ def run_reconciled_build(
         )
     ):
         raise MutationError("private parent fsync failed") from fsync_error
+
+    if fsync_error is not None:
+        raise SystemExit(77)
+
+    stage2_failure = None
+    stage2_capability = False
+    owned_fds = []
+    private_ledger_fd = None
+    private_parent_owned_fd = None
+    duplicate_command = getattr(fcntl, "F_DUPFD_CLOEXEC", None)
+    capability_errors = {
+        errno.EINVAL,
+        errno.ENOSYS,
+        errno.EOPNOTSUPP,
+        errno.ENOTSUP,
+    }
+
+    try:
+        if type(duplicate_command) is not int or duplicate_command < 0:
+            stage2_capability = True
+        else:
+            try:
+                candidate = fcntl.fcntl(expected_ledger_fd, duplicate_command, 0)
+            except OSError as exc:
+                if exc.errno in capability_errors:
+                    stage2_capability = True
+                else:
+                    stage2_failure = MutationError("ledger duplication failed")
+            except Exception as exc:
+                stage2_failure = MutationError("ledger duplication failed")
+            else:
+                if (
+                    type(candidate) is not int
+                    or candidate < 0
+                    or candidate in {expected_ledger_fd, private_parent_fd}
+                ):
+                    stage2_failure = MutationError("ledger duplication returned an invalid descriptor")
+                else:
+                    private_ledger_fd = candidate
+                    owned_fds.append(candidate)
+
+        if private_ledger_fd is not None:
+            try:
+                private_parent_candidate = os.open(
+                    ".",
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=private_parent_fd,
+                )
+            except OSError as exc:
+                if exc.errno in capability_errors:
+                    stage2_capability = True
+                else:
+                    stage2_failure = MutationError("private parent open failed")
+            except Exception as exc:
+                stage2_failure = MutationError("private parent open failed")
+            else:
+                if (
+                    type(private_parent_candidate) is not int
+                    or private_parent_candidate < 0
+                    or private_parent_candidate in {expected_ledger_fd, private_parent_fd, private_ledger_fd}
+                    or private_parent_candidate in owned_fds
+                ):
+                    stage2_failure = MutationError("private parent open returned an invalid descriptor")
+                else:
+                    private_parent_owned_fd = private_parent_candidate
+                    owned_fds.append(private_parent_candidate)
+
+        private_ledger_usable = private_ledger_fd is not None
+        if private_ledger_fd is not None:
+            private_ledger_flags_ok = True
+            try:
+                private_ledger_flags = fcntl.fcntl(private_ledger_fd, fcntl.F_GETFL)
+                if (
+                    type(private_ledger_flags) is not int
+                    or private_ledger_flags != ledger_flags
+                    or opath and private_ledger_flags & opath
+                    or private_ledger_flags & os.O_ACCMODE not in {os.O_RDONLY, os.O_RDWR}
+                ):
+                    raise MutationError("private ledger flags changed")
+            except Exception as exc:
+                private_ledger_flags_ok = False
+                private_ledger_usable = False
+                if stage2_failure is None:
+                    stage2_failure = exc if isinstance(exc, MutationError) else MutationError("private ledger F_GETFL failed")
+
+            if private_ledger_flags_ok:
+                private_ledger_fd_flags_ok = True
+                try:
+                    private_ledger_fd_flags = fcntl.fcntl(private_ledger_fd, fcntl.F_GETFD)
+                    if type(private_ledger_fd_flags) is not int or private_ledger_fd_flags != fcntl.FD_CLOEXEC:
+                        raise MutationError("private ledger descriptor flags changed")
+                except Exception as exc:
+                    private_ledger_fd_flags_ok = False
+                    private_ledger_usable = False
+                    if stage2_failure is None:
+                        stage2_failure = exc if isinstance(exc, MutationError) else MutationError("private ledger F_GETFD failed")
+
+                if private_ledger_fd_flags_ok:
+                    private_ledger_pre = None
+                    try:
+                        private_ledger_pre = _identity(os.fstat(private_ledger_fd))
+                        if private_ledger_pre != ledger_identity:
+                            raise MutationError("private ledger identity changed before read")
+                    except Exception as exc:
+                        private_ledger_pre = None
+                        private_ledger_usable = False
+                        if stage2_failure is None:
+                            stage2_failure = exc if isinstance(exc, MutationError) else MutationError("private ledger fstat failed")
+
+                    if private_ledger_pre is not None:
+                        try:
+                            private_ledger_bytes = read_all(private_ledger_fd, ledger_value.st_size, MutationError)
+                            if private_ledger_bytes != first:
+                                raise MutationError("private ledger bytes changed")
+                        except Exception as exc:
+                            private_ledger_usable = False
+                            if stage2_failure is None:
+                                stage2_failure = exc if isinstance(exc, MutationError) else MutationError("private ledger read failed")
+
+                        try:
+                            private_ledger_post = _identity(os.fstat(private_ledger_fd))
+                            if private_ledger_post != ledger_identity:
+                                raise MutationError("private ledger identity changed after read")
+                        except Exception as exc:
+                            private_ledger_usable = False
+                            if stage2_failure is None:
+                                stage2_failure = exc if isinstance(exc, MutationError) else MutationError("private ledger fstat failed")
+
+        if private_parent_owned_fd is not None:
+            private_parent_flags = None
+            try:
+                private_parent_flags = fcntl.fcntl(private_parent_owned_fd, fcntl.F_GETFL)
+                if (
+                    type(private_parent_flags) is not int
+                    or opath and private_parent_flags & opath
+                    or private_parent_flags & os.O_ACCMODE != os.O_RDONLY
+                ):
+                    raise MutationError("private parent flags changed")
+            except Exception as exc:
+                if stage2_failure is None:
+                    stage2_failure = exc if isinstance(exc, MutationError) else MutationError("private parent F_GETFL failed")
+
+            private_parent_fd_flags = None
+            try:
+                private_parent_fd_flags = fcntl.fcntl(private_parent_owned_fd, fcntl.F_GETFD)
+                if type(private_parent_fd_flags) is not int or private_parent_fd_flags != fcntl.FD_CLOEXEC:
+                    raise MutationError("private parent descriptor flags changed")
+            except Exception as exc:
+                if stage2_failure is None:
+                    stage2_failure = exc if isinstance(exc, MutationError) else MutationError("private parent F_GETFD failed")
+
+            try:
+                private_parent_value = os.fstat(private_parent_owned_fd)
+                if not _stat.S_ISDIR(private_parent_value.st_mode) or _identity(private_parent_value) != parent_identity:
+                    raise MutationError("private parent identity changed")
+            except Exception as exc:
+                if stage2_failure is None:
+                    stage2_failure = exc if isinstance(exc, MutationError) else MutationError("private parent fstat failed")
+
+        if private_ledger_usable:
+            borrowed_ledger_flags = None
+            try:
+                borrowed_ledger_flags = fcntl.fcntl(expected_ledger_fd, fcntl.F_GETFL)
+                if type(borrowed_ledger_flags) is not int or borrowed_ledger_flags != ledger_flags:
+                    raise MutationError("borrowed ledger flags changed")
+            except Exception as exc:
+                if stage2_failure is None:
+                    stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed ledger F_GETFL failed")
+            try:
+                if _identity(os.fstat(expected_ledger_fd)) != ledger_identity:
+                    raise MutationError("borrowed ledger identity changed")
+            except Exception as exc:
+                if stage2_failure is None:
+                    stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed ledger fstat failed")
+        else:
+            borrowed_ledger_flags_ok = True
+            borrowed_ledger_pre = None
+            try:
+                borrowed_ledger_flags = fcntl.fcntl(expected_ledger_fd, fcntl.F_GETFL)
+                if type(borrowed_ledger_flags) is not int or borrowed_ledger_flags != ledger_flags:
+                    raise MutationError("borrowed ledger flags changed")
+            except Exception as exc:
+                borrowed_ledger_flags_ok = False
+                if stage2_failure is None:
+                    stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed ledger F_GETFL failed")
+            try:
+                borrowed_ledger_pre = _identity(os.fstat(expected_ledger_fd))
+                if borrowed_ledger_pre != ledger_identity:
+                    raise MutationError("borrowed ledger identity changed before read")
+            except Exception as exc:
+                borrowed_ledger_pre = None
+                if stage2_failure is None:
+                    stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed ledger fstat failed")
+            if borrowed_ledger_flags_ok and borrowed_ledger_pre is not None:
+                try:
+                    if read_all(expected_ledger_fd, ledger_value.st_size, MutationError) != first:
+                        raise MutationError("borrowed ledger bytes changed")
+                except Exception as exc:
+                    if stage2_failure is None:
+                        stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed ledger read failed")
+                try:
+                    if _identity(os.fstat(expected_ledger_fd)) != ledger_identity:
+                        raise MutationError("borrowed ledger identity changed after read")
+                except Exception as exc:
+                    if stage2_failure is None:
+                        stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed ledger fstat failed")
+
+        borrowed_parent_flags = None
+        try:
+            borrowed_parent_flags = fcntl.fcntl(private_parent_fd, fcntl.F_GETFL)
+            if type(borrowed_parent_flags) is not int or borrowed_parent_flags != parent_flags:
+                raise MutationError("borrowed parent flags changed")
+        except Exception as exc:
+            if stage2_failure is None:
+                stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed parent F_GETFL failed")
+        try:
+            borrowed_parent_fd_flags = fcntl.fcntl(private_parent_fd, fcntl.F_GETFD)
+            if type(borrowed_parent_fd_flags) is not int or borrowed_parent_fd_flags != parent_fd_flags:
+                raise MutationError("borrowed parent descriptor flags changed")
+        except Exception as exc:
+            if stage2_failure is None:
+                stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed parent F_GETFD failed")
+        try:
+            if _identity(os.fstat(private_parent_fd)) != parent_identity:
+                raise MutationError("borrowed parent identity changed")
+        except Exception as exc:
+            if stage2_failure is None:
+                stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed parent fstat failed")
+
+    finally:
+        close_failure = None
+        for owned_fd in reversed(owned_fds):
+            try:
+                os.close(owned_fd)
+            except BaseException as exc:
+                if close_failure is None:
+                    close_failure = exc
+        if close_failure is not None:
+            raise MutationError("owned descriptor close failed") from close_failure
+    if stage2_failure is not None:
+        raise stage2_failure
+    if stage2_capability:
+        raise SystemExit(77)
     raise SystemExit(77)
 
 

@@ -713,7 +713,9 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         except OSError:
             return None
 
-    def run_case(label, expected, overrides=None, patches=(), borrowed=(), postcheck=None):
+    MISSING = object()
+
+    def run_case(label, expected, overrides=None, patches=(), borrowed=(), postcheck=None, custody=None):
         call_kwargs = dict(valid)
         if overrides:
             call_kwargs.update(overrides)
@@ -736,8 +738,14 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         calls_before = discover_calls["count"]
         try:
             for owner, name, replacement in patches:
-                originals.append((owner, name, getattr(owner, name)))
-                setattr(owner, name, replacement)
+                existed = hasattr(owner, name)
+                original = getattr(owner, name) if existed else MISSING
+                originals.append((owner, name, existed, original))
+                if replacement is MISSING:
+                    if existed:
+                        delattr(owner, name)
+                else:
+                    setattr(owner, name, replacement)
             module.discover_input_v1 = discover_bomb
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 try:
@@ -746,8 +754,11 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     caught = exc
         finally:
             module.discover_input_v1 = real_discover
-            for owner, name, original in reversed(originals):
-                setattr(owner, name, original)
+            for owner, name, existed, original in reversed(originals):
+                if existed:
+                    setattr(owner, name, original)
+                elif hasattr(owner, name):
+                    delattr(owner, name)
         if discover_calls["count"] != calls_before:
             raise SystemExit(f"{label}: discover_input_v1 was called")
         if stdout.getvalue() or stderr.getvalue():
@@ -758,6 +769,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         elif type(caught) is not expected:
             name = type(caught).__name__ if caught is not None else "return"
             raise SystemExit(f"{label}: expected {expected.__name__}, got {name}")
+        if custody is not None:
+            custody()
         if postcheck is not None:
             postcheck()
         if tuple(tree_state(root) for root in roots) != before_roots:
@@ -781,6 +794,952 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 raise SystemExit(f"{label}: runner changed borrowed fd {fd} offset")
 
     base_borrowed = [(ledger_fd, ledger_offset), (parent_fd, parent_offset)]
+
+    stage2_positive = {
+        "started": False,
+        "dup_calls": 0,
+        "open_calls": 0,
+        "private_ledger": None,
+        "private_parent": None,
+        "private_cookie": None,
+        "owned": [],
+        "pread_calls": [],
+        "pread_bytes": [],
+        "pread_cursor": 0,
+        "events": [],
+        "fstat_counts": {},
+        "private_fstat_values": [],
+        "observed_flags": {},
+        "private_parent_fstat": None,
+        "close_calls": [],
+        "fcntl_counts": {},
+    }
+    real_fcntl = fcntl.fcntl
+    real_open = os.open
+    real_pread = os.pread
+    real_read = os.read
+    real_lseek = os.lseek
+    real_fstat = os.fstat
+    real_close = os.close
+    duplicate_commands = {
+        value
+        for name in dir(fcntl)
+        if name.startswith("F_DUPFD")
+        for value in [getattr(fcntl, name)]
+        if type(value) is int
+    }
+    duplicate_command = getattr(fcntl, "F_DUPFD_CLOEXEC", None)
+    expected_open_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+    def stage2_positive_fcntl(fd, command, *arguments):
+        if type(command) is not int:
+            raise SystemExit("stage2 used a non-exact fcntl command")
+        if command in duplicate_commands and command != duplicate_command:
+            raise SystemExit("stage2 used an unfixed descriptor duplication command")
+        if command not in {fcntl.F_GETFL, fcntl.F_GETFD, duplicate_command}:
+            raise SystemExit("stage2 used an unapproved fcntl command")
+        if command == duplicate_command:
+            stage2_positive["dup_calls"] += 1
+            if (
+                stage2_positive["dup_calls"] != 1
+                or fd != ledger_fd
+                or arguments != (0,)
+            ):
+                raise SystemExit("stage2 ledger duplication arguments drifted")
+            value = real_fcntl(fd, command, *arguments)
+            if type(value) is not int or value < 0:
+                raise SystemExit("stage2 ledger duplicate returned an unusable fd")
+            stage2_positive["private_ledger"] = value
+            stage2_positive["owned"].append(value)
+            stage2_positive["started"] = True
+            stage2_positive["events"].append("dup-L")
+            return value
+        if stage2_positive["started"]:
+            tracked_fds = {ledger_fd, parent_fd, stage2_positive["private_ledger"]}
+            if stage2_positive["private_parent"] is not None:
+                tracked_fds.add(stage2_positive["private_parent"])
+            if fd not in tracked_fds:
+                raise SystemExit("stage2 observed an untracked descriptor")
+            if command not in {fcntl.F_GETFL, fcntl.F_GETFD}:
+                raise SystemExit("stage2 used an unapproved fcntl command")
+        value = real_fcntl(fd, command, *arguments)
+        if stage2_positive["started"]:
+            if command not in {fcntl.F_GETFL, fcntl.F_GETFD}:
+                raise SystemExit("stage2 used an unapproved fcntl command")
+            key = (fd, command)
+            if key in stage2_positive["fcntl_counts"]:
+                raise SystemExit("stage2 repeated a tracked fcntl observation")
+            stage2_positive["fcntl_counts"][key] = 1
+            if fd == stage2_positive["private_ledger"]:
+                if command not in {fcntl.F_GETFL, fcntl.F_GETFD}:
+                    raise SystemExit("stage2 used an untracked private-ledger observation")
+            elif fd == stage2_positive["private_parent"]:
+                if command not in {fcntl.F_GETFL, fcntl.F_GETFD}:
+                    raise SystemExit("stage2 used an untracked private-parent observation")
+            elif fd == ledger_fd:
+                if command != fcntl.F_GETFL:
+                    raise SystemExit("stage2 used an untracked borrowed-ledger observation")
+            elif fd == parent_fd:
+                if command not in {fcntl.F_GETFL, fcntl.F_GETFD}:
+                    raise SystemExit("stage2 used an untracked borrowed-parent observation")
+            else:
+                raise SystemExit("stage2 observed an untracked descriptor")
+            if fd in {stage2_positive["private_ledger"], stage2_positive["private_parent"]} and command in {fcntl.F_GETFL, fcntl.F_GETFD}:
+                stage2_positive["observed_flags"][(fd, command)] = value
+            if fd == stage2_positive["private_ledger"]:
+                if command == fcntl.F_GETFL:
+                    stage2_positive["events"].append("L-getfl")
+                elif command == fcntl.F_GETFD:
+                    stage2_positive["events"].append("L-getfd")
+            elif fd == stage2_positive["private_parent"]:
+                if command == fcntl.F_GETFL:
+                    stage2_positive["events"].append("P-getfl")
+                elif command == fcntl.F_GETFD:
+                    stage2_positive["events"].append("P-getfd")
+            elif fd == ledger_fd:
+                if command == fcntl.F_GETFL:
+                    stage2_positive["events"].append("borrowed-L-getfl")
+            elif fd == parent_fd:
+                if command == fcntl.F_GETFL:
+                    stage2_positive["events"].append("borrowed-P-getfl")
+                elif command == fcntl.F_GETFD:
+                    stage2_positive["events"].append("borrowed-P-getfd")
+        return value
+
+    def stage2_positive_open(path, flags, mode=0o777, *, dir_fd=None):
+        stage2_positive["open_calls"] += 1
+        if (
+            stage2_positive["open_calls"] != 1
+            or path != "."
+            or flags != expected_open_flags
+            or dir_fd != parent_fd
+        ):
+            raise SystemExit("stage2 parent open arguments drifted")
+        value = real_open(path, flags, mode, dir_fd=dir_fd)
+        if type(value) is not int or value < 0:
+            raise SystemExit("stage2 parent open returned an unusable fd")
+        stage2_positive["private_parent"] = value
+        stage2_positive["owned"].append(value)
+        stage2_positive["private_cookie"] = real_lseek(value, parent_offset + 1, os.SEEK_SET)
+        stage2_positive["events"].append("open-P")
+        return value
+
+    def stage2_positive_pread(fd, size, offset):
+        owned = set(stage2_positive["owned"])
+        if stage2_positive["started"] and (
+            fd in {ledger_fd, parent_fd} or fd in owned and fd != stage2_positive["private_ledger"]
+        ):
+            raise SystemExit("stage2 used pread on a borrowed or non-ledger descriptor")
+        if not stage2_positive["started"] or fd != stage2_positive["private_ledger"]:
+            return real_pread(fd, size, offset)
+        if size > 3:
+            size = 3
+        if offset != stage2_positive["pread_cursor"]:
+            raise SystemExit("stage2 private ledger pread was not contiguous")
+        if stage2_positive["pread_cursor"] >= len(os.environ["TASK4_GOLDEN"].encode("ascii")):
+            raise SystemExit("stage2 extended a terminal private-ledger pread")
+        stage2_positive["events"].append("L-pread")
+        value = real_pread(fd, size, offset)
+        if type(value) is not bytes or not value:
+            raise SystemExit("stage2 private ledger pread returned an invalid chunk")
+        stage2_positive["pread_calls"].append((offset, len(value)))
+        stage2_positive["pread_bytes"].append(value)
+        stage2_positive["pread_cursor"] += len(value)
+        return value
+
+    def stage2_positive_read(fd, size):
+        if fd in set(stage2_positive["owned"]) | {ledger_fd, parent_fd}:
+            raise SystemExit("stage2 used read on a guarded descriptor")
+        return real_read(fd, size)
+
+    def stage2_positive_lseek(fd, offset, whence):
+        if fd in set(stage2_positive["owned"]) | {ledger_fd, parent_fd}:
+            raise SystemExit("stage2 used lseek on a guarded descriptor")
+        return real_lseek(fd, offset, whence)
+
+    def stage2_positive_fstat(fd):
+        value = real_fstat(fd)
+        if stage2_positive["started"]:
+            count = stage2_positive["fstat_counts"].get(fd, 0) + 1
+            stage2_positive["fstat_counts"][fd] = count
+            if fd == stage2_positive["private_ledger"]:
+                stage2_positive["private_fstat_values"].append(value)
+                stage2_positive["events"].append("L-fstat-pre" if count == 1 else "L-fstat-post")
+            elif fd == stage2_positive["private_parent"]:
+                stage2_positive["private_parent_fstat"] = value
+                stage2_positive["events"].append("P-fstat")
+            elif fd == ledger_fd:
+                stage2_positive["events"].append("borrowed-L-fstat")
+            elif fd == parent_fd:
+                stage2_positive["events"].append("borrowed-P-fstat")
+        return value
+
+    def stage2_positive_close(fd):
+        if fd not in set(stage2_positive["owned"]):
+            raise SystemExit("stage2 closed a borrowed or invalid descriptor")
+        expected = list(reversed(stage2_positive["owned"]))
+        close_index = len(stage2_positive["close_calls"])
+        if close_index >= len(expected) or fd != expected[close_index]:
+            raise SystemExit("stage2 closed owned descriptors out of order or twice")
+        stage2_positive["close_calls"].append(fd)
+        if fd == stage2_positive["private_parent"]:
+            stage2_positive["events"].append("close-P")
+        elif fd == stage2_positive["private_ledger"]:
+            stage2_positive["events"].append("close-L")
+        return real_close(fd)
+
+    def check_stage2_positive():
+        if stage2_positive["dup_calls"] != 1:
+            raise SystemExit("stage2 ledger duplicate was not acquired exactly once")
+        if stage2_positive["open_calls"] != 1:
+            raise SystemExit("stage2 parent was not opened exactly once")
+        if stage2_positive["private_cookie"] in {None, 0, parent_offset}:
+            raise SystemExit("stage2 private parent cookie was not independent")
+        expected_events = [
+            "dup-L", "open-P", "L-getfl", "L-getfd", "L-fstat-pre",
+            "L-pread-complete", "L-fstat-post", "P-getfl", "P-getfd", "P-fstat",
+            "borrowed-L-getfl", "borrowed-L-fstat", "borrowed-P-getfl",
+            "borrowed-P-getfd", "borrowed-P-fstat", "close-P", "close-L",
+            "SystemExit(77)",
+        ]
+        normalized_events = []
+        index = 0
+        while index < len(stage2_positive["events"]):
+            event = stage2_positive["events"][index]
+            if event == "L-pread":
+                while index < len(stage2_positive["events"]) and stage2_positive["events"][index] == "L-pread":
+                    index += 1
+                normalized_events.append("L-pread-complete")
+            else:
+                normalized_events.append(event)
+                index += 1
+        if normalized_events + ["SystemExit(77)"] != expected_events:
+            raise SystemExit(
+                f"stage2 positive trace drifted: {stage2_positive['events']!r}"
+            )
+        ledger_size = len(os.environ["TASK4_GOLDEN"].encode("ascii"))
+        if stage2_positive["pread_cursor"] != ledger_size or len(stage2_positive["pread_calls"]) < 2:
+            raise SystemExit("stage2 private ledger pread was not one multi-chunk complete pass")
+        if len(stage2_positive["private_fstat_values"]) != 2:
+            raise SystemExit("stage2 private ledger identity bracket was not complete")
+        private_ledger = stage2_positive["private_ledger"]
+        private_parent = stage2_positive["private_parent"]
+        if (
+            type(stage2_positive["observed_flags"].get((private_ledger, fcntl.F_GETFL))) is not int
+            or stage2_positive["observed_flags"].get((private_ledger, fcntl.F_GETFL)) != fcntl.fcntl(ledger_fd, fcntl.F_GETFL)
+            or stage2_positive["observed_flags"].get((private_ledger, fcntl.F_GETFD)) != fcntl.FD_CLOEXEC
+            or type(stage2_positive["observed_flags"].get((private_ledger, fcntl.F_GETFD))) is not int
+            or type(stage2_positive["observed_flags"].get((private_parent, fcntl.F_GETFL))) is not int
+            or stage2_positive["observed_flags"].get((private_parent, fcntl.F_GETFL)) & getattr(os, "O_PATH", 0)
+            or stage2_positive["observed_flags"].get((private_parent, fcntl.F_GETFL)) & os.O_ACCMODE != os.O_RDONLY
+            or stage2_positive["observed_flags"].get((private_parent, fcntl.F_GETFD)) != fcntl.FD_CLOEXEC
+            or type(stage2_positive["observed_flags"].get((private_parent, fcntl.F_GETFD))) is not int
+            or stage2_positive["private_parent_fstat"] is None
+            or not stat.S_ISDIR(stage2_positive["private_parent_fstat"].st_mode)
+            or identity(stage2_positive["private_parent_fstat"]) != identity(os.fstat(parent_fd))
+        ):
+            raise SystemExit("stage2 private descriptor metadata was not exact")
+        if (
+            identity(stage2_positive["private_fstat_values"][0]) != identity(stage2_positive["private_fstat_values"][1])
+            or b"".join(stage2_positive["pread_bytes"]) != os.environ["TASK4_GOLDEN"].encode("ascii")
+        ):
+            raise SystemExit("stage2 private ledger identity or bytes drifted")
+        cursor = 0
+        for offset, length in stage2_positive["pread_calls"]:
+            if offset != cursor or length <= 0:
+                raise SystemExit("stage2 private ledger pread offsets were not contiguous")
+            cursor += length
+        if cursor != ledger_size:
+            raise SystemExit("stage2 private ledger pread did not cover the ledger")
+        if stage2_positive["close_calls"] != [
+            stage2_positive["private_parent"], stage2_positive["private_ledger"]
+        ]:
+            raise SystemExit("stage2 owned descriptors were not closed in reverse order")
+        for fd in stage2_positive["owned"]:
+            try:
+                real_fstat(fd)
+            except OSError as exc:
+                if exc.errno != errno.EBADF:
+                    raise SystemExit("stage2 closed descriptor did not report EBADF") from exc
+            else:
+                raise SystemExit("stage2 owned descriptor leaked")
+
+    run_case(
+        "stage2-positive-private-custody",
+        SystemExit,
+        patches=(
+            (fcntl, "fcntl", stage2_positive_fcntl),
+            (module.os, "open", stage2_positive_open),
+            (module.os, "pread", stage2_positive_pread),
+            (module.os, "read", stage2_positive_read),
+            (module.os, "lseek", stage2_positive_lseek),
+            (module.os, "fstat", stage2_positive_fstat),
+            (module.os, "close", stage2_positive_close),
+            (module.os, "dup", lambda *args: (_ for _ in ()).throw(SystemExit("stage2 called os.dup"))),
+            (module.os, "dup2", lambda *args: (_ for _ in ()).throw(SystemExit("stage2 called os.dup2"))),
+        ),
+        borrowed=base_borrowed,
+        postcheck=check_stage2_positive,
+    )
+
+    def stage2_expected(position=None, variant=None, ledger_event="dup-L", parent_event="open-P", terminal="MutationError"):
+        token = f"{position}-{variant}" if position is not None else None
+        private_ledger = ledger_event == "dup-L"
+        private_parent = parent_event == "open-P"
+        result = [ledger_event]
+        if parent_event is not None:
+            result.append(parent_event)
+        if position in {"L-getfl", "L-getfd", "L-fstat-pre", "L-pread", "L-fstat-post"}:
+            prefixes = {
+                "L-getfl": [],
+                "L-getfd": ["L-getfl"],
+                "L-fstat-pre": ["L-getfl", "L-getfd"],
+                "L-pread": ["L-getfl", "L-getfd", "L-fstat-pre"],
+                "L-fstat-post": ["L-getfl", "L-getfd", "L-fstat-pre", "L-pread-complete"],
+            }
+            result.extend(prefixes[position])
+            result.append(token)
+            if position == "L-pread":
+                result.append("L-fstat-post")
+            elif position != "L-fstat-post":
+                result.extend([])
+            if private_parent:
+                result.extend(["P-getfl", "P-getfd", "P-fstat"])
+            result.extend(["borrowed-L-getfl", "borrowed-L-fstat-pre", "borrowed-L-pread-complete", "borrowed-L-fstat-post"])
+            result.extend(["borrowed-P-getfl", "borrowed-P-getfd", "borrowed-P-fstat"])
+            result.extend(["close-P", "close-L"] if private_parent else ["close-L"])
+            result.append(terminal)
+            return result
+        if position in {"P-getfl", "P-getfd", "P-fstat"}:
+            result.extend(["L-getfl", "L-getfd", "L-fstat-pre", "L-pread-complete", "L-fstat-post"])
+            for operation in ("P-getfl", "P-getfd", "P-fstat"):
+                result.append(token if operation == position else operation)
+            result.extend(["borrowed-L-getfl", "borrowed-L-fstat"])
+            result.extend(["borrowed-P-getfl", "borrowed-P-getfd", "borrowed-P-fstat"])
+            result.extend(["close-P", "close-L"] if private_parent else ["close-L"])
+            result.append(terminal)
+            return result
+        if position in {"borrowed-L-getfl", "borrowed-L-fstat-pre", "borrowed-L-pread", "borrowed-L-fstat-post"}:
+            result = [ledger_event]
+            if position == "borrowed-L-getfl":
+                result.extend([token, "borrowed-L-fstat-pre"])
+            elif position == "borrowed-L-fstat-pre":
+                result.extend(["borrowed-L-getfl", token])
+            elif position == "borrowed-L-pread":
+                result.extend(["borrowed-L-getfl", "borrowed-L-fstat-pre", token, "borrowed-L-fstat-post"])
+            else:
+                result.extend(["borrowed-L-getfl", "borrowed-L-fstat-pre", "borrowed-L-pread-complete", token])
+            result.extend(["borrowed-P-getfl", "borrowed-P-getfd", "borrowed-P-fstat", terminal])
+            return result
+        if position in {"borrowed-P-getfl", "borrowed-P-getfd", "borrowed-P-fstat"}:
+            result.extend(
+                ["L-getfl", "L-getfd", "L-fstat-pre", "L-pread-complete", "L-fstat-post"]
+                if private_ledger
+                else ["borrowed-L-getfl", "borrowed-L-fstat-pre", "borrowed-L-pread-complete", "borrowed-L-fstat-post"]
+            )
+            if private_ledger:
+                result.append("borrowed-L-getfl")
+                result.append("borrowed-L-fstat")
+            for operation in ("borrowed-P-getfl", "borrowed-P-getfd", "borrowed-P-fstat"):
+                result.append(token if operation == position else operation)
+            result.extend(["close-P", "close-L"] if private_parent else (["close-L"] if private_ledger else []))
+            result.append(terminal)
+            return result
+        if private_ledger:
+            result.extend(["L-getfl", "L-getfd", "L-fstat-pre", "L-pread-complete", "L-fstat-post"])
+            if private_parent:
+                result.extend(["P-getfl", "P-getfd", "P-fstat"])
+            result.extend(["borrowed-L-getfl", "borrowed-L-fstat"])
+        elif parent_event is not None and parent_event != "open-P":
+            result.extend([])
+        if not private_ledger:
+            result.extend(["borrowed-L-getfl", "borrowed-L-fstat-pre", "borrowed-L-pread-complete", "borrowed-L-fstat-post"])
+        result.extend(["borrowed-P-getfl", "borrowed-P-getfd", "borrowed-P-fstat"])
+        if private_parent:
+            result.extend(["close-P", "close-L"])
+        elif private_ledger:
+            result.append("close-L")
+        result.append(terminal)
+        return result
+
+    def run_stage2_case(
+        label,
+        expected,
+        *,
+        ledger_mode="real",
+        parent_mode="real",
+        command_mode=None,
+        failure=None,
+        close_error=None,
+        ledger_errno=errno.EINVAL,
+        parent_errno=errno.EINVAL,
+    ):
+        state = {
+            "ledger_calls": 0,
+            "open_calls": 0,
+            "private_ledger": None,
+            "private_parent": None,
+            "owned": [],
+            "close_calls": [],
+            "events": [],
+            "fcntl_counts": {},
+            "fstat_counts": {},
+            "pread_counts": {},
+            "pread_cursors": {},
+            "pread_states": {},
+            "borrowed_l_fallback_phase": False,
+            "borrowed_l_getfl_exact": False,
+            "borrowed_l_fstat_pre_exact": False,
+            "stub_returns": [],
+        }
+        if command_mode is not None:
+            state["events"].append("command-absent" if command_mode == "absent" else "command-invalid")
+        if isinstance(failure, dict):
+            failure_position, failure_variant = None, None
+        else:
+            failure_position, failure_variant = failure or (None, None)
+
+        def mode_parts(mode, default_errno):
+            if isinstance(mode, tuple):
+                return mode[0], mode[1]
+            return mode, default_errno
+
+        ledger_kind, ledger_error = mode_parts(ledger_mode, ledger_errno)
+        parent_kind, parent_error = mode_parts(parent_mode, parent_errno)
+        private_duplicate_command = duplicate_command
+
+        def unowned_stub(fd):
+            for _, value in state["stub_returns"]:
+                if fd == value and value not in {ledger_fd, parent_fd} and value not in state["owned"]:
+                    return True
+            return False
+
+        def failure_variant_for(operation):
+            if isinstance(failure, dict):
+                return failure.get(operation)
+            return failure_variant if failure_position == operation else None
+
+        def private_ledger_usable():
+            if state["private_ledger"] is None:
+                return False
+            if failure_position is not None and failure_position.startswith("L-"):
+                return False
+            return not any(operation.startswith("L-") for operation in failure or {}) if isinstance(failure, dict) else True
+
+        def acquisition_error(kind, error_number, prefix):
+            if kind == "allowed":
+                state["events"].append(f"{prefix}-allowed-error")
+                raise OSError(error_number, "stage2 capability refusal")
+            if kind == "eio":
+                state["events"].append(f"{prefix}-EIO-error")
+                raise OSError(errno.EIO, "stage2 mutation failure")
+            if kind == "runtime":
+                state["events"].append(f"{prefix}-RuntimeError")
+                raise RuntimeError("stage2 mutation failure")
+
+        def wrapped_fcntl(fd, command, *arguments):
+            if type(command) is not int:
+                raise SystemExit("stage2 used a non-exact fcntl command")
+            if command in duplicate_commands and command != private_duplicate_command:
+                raise SystemExit("stage2 used an unfixed descriptor duplication command")
+            if command not in {fcntl.F_GETFL, fcntl.F_GETFD, private_duplicate_command}:
+                raise SystemExit("stage2 used an unapproved fcntl command")
+            if unowned_stub(fd):
+                raise SystemExit("stage2 used an invalid stub descriptor")
+            if command == private_duplicate_command:
+                state["ledger_calls"] += 1
+                if state["ledger_calls"] != 1 or fd != ledger_fd or arguments != (0,):
+                    raise SystemExit("stage2 ledger duplication arguments drifted")
+                acquisition_error(ledger_kind, ledger_error, "dup-L")
+                if ledger_kind == "true":
+                    value = True
+                elif ledger_kind == "subclass":
+                    value = IntSubclass(10**6)
+                elif ledger_kind == "negative":
+                    value = -1
+                elif ledger_kind == "collision-L":
+                    value = ledger_fd
+                elif ledger_kind == "collision-P":
+                    value = parent_fd
+                else:
+                    value = real_fcntl(fd, command, *arguments)
+                    state["private_ledger"] = value
+                    state["owned"].append(value)
+                if ledger_kind in {"true", "subclass", "negative", "collision-L", "collision-P"}:
+                    state["stub_returns"].append(("ledger", value))
+                    state["events"].append(
+                        {
+                            "true": "dup-L-return-True",
+                            "subclass": "dup-L-return-IntSubclass",
+                            "negative": "dup-L-return-negative",
+                            "collision-L": "dup-L-return-collision-borrowed-L",
+                            "collision-P": "dup-L-return-collision-borrowed-P",
+                        }[ledger_kind]
+                    )
+                else:
+                    state["events"].append("dup-L")
+                return value
+            tracked_fds = {ledger_fd, parent_fd}
+            if state["private_ledger"] is not None:
+                tracked_fds.add(state["private_ledger"])
+            if state["private_parent"] is not None:
+                tracked_fds.add(state["private_parent"])
+            if fd not in tracked_fds:
+                raise SystemExit("stage2 observed an untracked descriptor")
+            key = (fd, command)
+            next_count = state["fcntl_counts"].get(key, 0) + 1
+            if fd in {state["private_ledger"], state["private_parent"]} and next_count != 1:
+                raise SystemExit("stage2 repeated a private-descriptor fcntl observation")
+            if fd == ledger_fd and (command != fcntl.F_GETFL or next_count > 2):
+                raise SystemExit("stage2 used an untracked borrowed-ledger fcntl observation")
+            if fd == parent_fd and next_count > 3:
+                raise SystemExit("stage2 used an untracked borrowed-parent fcntl observation")
+            value = real_fcntl(fd, command, *arguments)
+            state["fcntl_counts"][key] = state["fcntl_counts"].get(key, 0) + 1
+            count = state["fcntl_counts"][key]
+            operation = None
+            if fd == state["private_ledger"]:
+                if count != 1:
+                    raise SystemExit("stage2 repeated a private-ledger fcntl observation")
+                operation = {fcntl.F_GETFL: "L-getfl", fcntl.F_GETFD: "L-getfd"}.get(command)
+            elif fd == state["private_parent"]:
+                if count != 1:
+                    raise SystemExit("stage2 repeated a private-parent fcntl observation")
+                operation = {fcntl.F_GETFL: "P-getfl", fcntl.F_GETFD: "P-getfd"}.get(command)
+            elif fd == ledger_fd:
+                if command == fcntl.F_GETFL and count == 2:
+                    operation = "borrowed-L-getfl"
+                elif count > 1 or command != fcntl.F_GETFL:
+                    raise SystemExit("stage2 used an untracked borrowed-ledger fcntl observation")
+            elif fd == parent_fd:
+                if command == fcntl.F_GETFL and count == 3:
+                    operation = "borrowed-P-getfl"
+                elif command == fcntl.F_GETFD and count == 3:
+                    operation = "borrowed-P-getfd"
+                elif count > 2 or command not in {fcntl.F_GETFL, fcntl.F_GETFD}:
+                    raise SystemExit("stage2 used an untracked borrowed-parent fcntl observation")
+            if operation is None:
+                return value
+            operation_variant = failure_variant_for(operation)
+            if operation_variant is not None:
+                if operation_variant == "exception":
+                    state["events"].append(f"{operation}-exception")
+                    raise OSError(errno.EIO, "stage2 injected fcntl failure")
+                if operation_variant == "status-mismatch":
+                    state["events"].append(f"{operation}-status-mismatch")
+                    return (value & ~os.O_ACCMODE) | os.O_WRONLY if operation.startswith("P-") or operation.startswith("borrowed-P-") else value | os.O_NONBLOCK
+                if operation_variant == "bool-FD_CLOEXEC":
+                    state["events"].append(f"{operation}-bool-FD_CLOEXEC")
+                    return True
+                if operation_variant == "IntSubclass-FD_CLOEXEC":
+                    state["events"].append(f"{operation}-IntSubclass-FD_CLOEXEC")
+                    return IntSubclass(fcntl.FD_CLOEXEC)
+                if operation_variant == "fd-flags-mismatch":
+                    state["events"].append(f"{operation}-fd-flags-mismatch")
+                    return 0
+                if operation_variant == "bool-FL_RDONLY":
+                    state["events"].append(f"{operation}-bool-FL_RDONLY")
+                    return False
+                if operation_variant == "IntSubclass-FL_RDONLY":
+                    state["events"].append(f"{operation}-IntSubclass-FL_RDONLY")
+                    return IntSubclass(value)
+                if operation_variant == "O_PATH":
+                    state["events"].append(f"{operation}-O_PATH")
+                    return getattr(os, "O_PATH", 0) | os.O_RDONLY
+            if operation == "borrowed-L-getfl":
+                state["borrowed_l_getfl_exact"] = operation_variant is None
+            state["events"].append(operation)
+            return value
+
+        def wrapped_open(path, flags, mode=0o777, *, dir_fd=None):
+            state["open_calls"] += 1
+            if state["open_calls"] != 1 or path != "." or flags != expected_open_flags or dir_fd != parent_fd:
+                raise SystemExit("stage2 parent open arguments drifted")
+            acquisition_error(parent_kind, parent_error, "open-P")
+            if parent_kind == "true":
+                value = True
+            elif parent_kind == "subclass":
+                value = IntSubclass(10**6 + 1)
+            elif parent_kind == "negative":
+                value = -1
+            elif parent_kind == "collision-L":
+                value = state["private_ledger"]
+            elif parent_kind == "collision-borrowed-L":
+                value = ledger_fd
+            elif parent_kind == "collision-borrowed-P":
+                value = parent_fd
+            else:
+                value = real_open(path, flags, mode, dir_fd=dir_fd)
+                state["private_parent"] = value
+                state["owned"].append(value)
+                real_lseek(value, parent_offset + 1, os.SEEK_SET)
+            if parent_kind != "real":
+                state["stub_returns"].append(("parent", value))
+                state["events"].append(
+                    {
+                        "true": "open-P-return-True",
+                        "subclass": "open-P-return-IntSubclass",
+                        "negative": "open-P-return-negative",
+                        "collision-L": "open-P-return-collision-owned-L",
+                        "collision-borrowed-L": "open-P-return-collision-borrowed-L",
+                        "collision-borrowed-P": "open-P-return-collision-borrowed-P",
+                    }.get(parent_kind, f"open-P-{parent_kind}-error")
+                )
+            else:
+                state["events"].append("open-P")
+            return value
+
+        def wrapped_fstat(fd):
+            if unowned_stub(fd):
+                raise SystemExit("stage2 used an invalid stub descriptor")
+            count = state["fstat_counts"].get(fd, 0) + 1
+            state["fstat_counts"][fd] = count
+            operation = None
+            if fd == state["private_ledger"]:
+                operation = "L-fstat-pre" if count == 1 else "L-fstat-post"
+            elif fd == state["private_parent"]:
+                operation = "P-fstat"
+            elif fd == ledger_fd and count >= 4:
+                if private_ledger_usable() and count == 4:
+                    operation = "borrowed-L-fstat"
+                elif not private_ledger_usable() and count == 4:
+                    operation = "borrowed-L-fstat-pre"
+                elif not private_ledger_usable() and count == 5:
+                    operation = "borrowed-L-fstat-post"
+                else:
+                    raise SystemExit("stage2 used an untracked borrowed-ledger fstat observation")
+            elif fd == parent_fd and count >= 3:
+                operation = "borrowed-P-fstat"
+            value = real_fstat(fd)
+            if operation is None:
+                return value
+            if operation == "borrowed-L-fstat-post":
+                state["borrowed_l_fallback_phase"] = False
+            operation_variant = failure_variant_for(operation)
+            if operation_variant is not None:
+                if operation_variant == "exception":
+                    state["events"].append(f"{operation}-exception")
+                    raise OSError(errno.EIO, "stage2 injected fstat failure")
+                if operation_variant == "kind-mismatch":
+                    state["events"].append(f"{operation}-kind-mismatch")
+                    return StatProxy(value, st_mode=stat.S_IFREG | 0o600)
+                if operation_variant == "identity-proxy-mismatch":
+                    state["events"].append(f"{operation}-identity-proxy-mismatch")
+                    return StatProxy(value, st_ino=value.st_ino + 1)
+            if operation == "borrowed-L-fstat-pre":
+                state["borrowed_l_fstat_pre_exact"] = (
+                    state["borrowed_l_getfl_exact"] and operation_variant is None
+                )
+                state["borrowed_l_fallback_phase"] = state["borrowed_l_fstat_pre_exact"]
+            state["events"].append(operation)
+            return value
+
+        def wrapped_pread(fd, size, offset):
+            if fd == state["private_ledger"]:
+                operation = "L-pread"
+            elif fd == ledger_fd and not private_ledger_usable() and state["borrowed_l_fallback_phase"]:
+                operation = "borrowed-L-pread"
+            elif fd == ledger_fd and state["fstat_counts"].get(fd, 0) < 3:
+                return real_pread(fd, size, offset)
+            elif fd == ledger_fd:
+                raise SystemExit("stage2 used an unauthorized borrowed-ledger pread")
+            else:
+                if unowned_stub(fd) or fd in {parent_fd, state["private_parent"]} or fd in set(state["owned"]):
+                    raise SystemExit("stage2 used pread on a guarded descriptor")
+                return real_pread(fd, size, offset)
+            state["pread_counts"][fd] = state["pread_counts"].get(fd, 0) + 1
+            size = min(size, 3)
+            cursor = state["pread_cursors"].get(fd, 0)
+            if state["pread_states"].get(fd) in {"failed", "complete"}:
+                raise SystemExit("stage2 retried or extended a terminal ledger pread")
+            if offset != cursor or cursor >= len(os.environ["TASK4_GOLDEN"].encode("ascii")):
+                raise SystemExit("stage2 used an extra or non-contiguous ledger pread")
+            state["events"].append(operation)
+            operation_variant = failure_variant_for(operation)
+            if operation_variant is not None:
+                if operation_variant == "exception":
+                    state["pread_states"][fd] = "failed"
+                    raise OSError(errno.EIO, "stage2 injected pread failure")
+                if operation_variant == "zero-first":
+                    state["pread_states"][fd] = "failed"
+                    return b""
+                if operation_variant == "invalid-chunk":
+                    state["pread_states"][fd] = "failed"
+                    return bytearray(b"invalid")
+                if operation_variant == "short-after-positive" and state["pread_counts"][fd] > 1:
+                    state["pread_states"][fd] = "failed"
+                    return b""
+            value = real_pread(fd, size, offset)
+            if type(value) is bytes and value:
+                state["pread_cursors"][fd] = cursor + len(value)
+                if state["pread_cursors"][fd] == len(os.environ["TASK4_GOLDEN"].encode("ascii")):
+                    state["pread_states"][fd] = "complete"
+            if operation_variant == "complete-bytes-mismatch":
+                if value:
+                    value = bytes([value[0] ^ 1]) + value[1:]
+            return value
+
+        def wrapped_read(fd, size):
+            if unowned_stub(fd) or fd in {ledger_fd, parent_fd} or fd in set(state["owned"]):
+                raise SystemExit("stage2 used read on a guarded descriptor")
+            return real_read(fd, size)
+
+        def wrapped_lseek(fd, offset, whence):
+            if unowned_stub(fd) or fd in {ledger_fd, parent_fd} or fd in set(state["owned"]):
+                raise SystemExit("stage2 used lseek on a guarded descriptor")
+            return real_lseek(fd, offset, whence)
+
+        def wrapped_close(fd):
+            if unowned_stub(fd) or fd in {ledger_fd, parent_fd}:
+                raise SystemExit("stage2 closed a borrowed or invalid descriptor")
+            if fd not in state["owned"]:
+                raise SystemExit("stage2 closed an unowned descriptor")
+            expected = list(reversed(state["owned"]))
+            close_index = len(state["close_calls"])
+            if close_index >= len(expected) or fd != expected[close_index] or fd in state["close_calls"]:
+                raise SystemExit("stage2 closed owned descriptors out of order or twice")
+            state["close_calls"].append(fd)
+            state["events"].append("close-P" if fd == state["private_parent"] else "close-L")
+            value = real_close(fd)
+            if close_error == ("parent" if fd == state["private_parent"] else "ledger"):
+                raise OSError(errno.EIO, "stage2 injected close failure")
+            return value
+
+        def observed_trace():
+            events = list(state["events"])
+            index = 0
+            normalized = []
+            while index < len(events):
+                event = events[index]
+                if event in {"L-pread", "borrowed-L-pread"}:
+                    index += 1
+                    while index < len(events) and events[index] == event:
+                        index += 1
+                    operation_variant = failure_variant_for(event)
+                    if operation_variant is not None:
+                        normalized.append(f"{event}-{operation_variant}")
+                    else:
+                        normalized.append(f"{event}-complete")
+                else:
+                    normalized.append(event)
+                    index += 1
+            normalized.append(expected[-1])
+            return normalized
+
+        def check_trace():
+            if observed_trace() != expected:
+                raise SystemExit(f"{label}: exact Stage2 event vector drifted: {observed_trace()!r}")
+
+        def check_custody():
+            if len(state["owned"]) != len(set(state["owned"])):
+                raise SystemExit(f"{label}: duplicate owned fd")
+            expected_close = list(reversed(state["owned"]))
+            if state["close_calls"] != expected_close:
+                raise SystemExit(f"{label}: close order drifted")
+            if state["ledger_calls"] > 1 or state["open_calls"] > 1:
+                raise SystemExit(f"{label}: acquisition was retried")
+            for _, value in state["stub_returns"]:
+                if value not in state["owned"] and value in state["close_calls"]:
+                    raise SystemExit(f"{label}: invalid stub descriptor was closed")
+            for role, value in state["stub_returns"]:
+                if role == "ledger" and state["private_ledger"] is not None:
+                    raise SystemExit(f"{label}: ledger stub return was acquired")
+                if role == "parent" and value != state["private_ledger"] and value in state["owned"]:
+                    raise SystemExit(f"{label}: parent stub return was acquired")
+            for fd in state["owned"]:
+                try:
+                    real_fstat(fd)
+                except OSError as exc:
+                    if exc.errno != errno.EBADF:
+                        raise SystemExit(f"{label}: owned fd did not close to EBADF") from exc
+                else:
+                    raise SystemExit(f"{label}: owned fd leaked")
+
+        patches = [
+            (fcntl, "fcntl", wrapped_fcntl),
+            (module.os, "open", wrapped_open),
+            (module.os, "fstat", wrapped_fstat),
+            (module.os, "pread", wrapped_pread),
+            (module.os, "read", wrapped_read),
+            (module.os, "lseek", wrapped_lseek),
+            (module.os, "close", wrapped_close),
+            (module.os, "dup", lambda *args: (_ for _ in ()).throw(SystemExit("stage2 called os.dup"))),
+            (module.os, "dup2", lambda *args: (_ for _ in ()).throw(SystemExit("stage2 called os.dup2"))),
+        ]
+        if command_mode is not None:
+            patches.append(
+                (
+                    fcntl,
+                    "F_DUPFD_CLOEXEC",
+                    MISSING if command_mode == "absent" else True if command_mode == "true" else IntSubclass(duplicate_command) if command_mode == "subclass" else -1,
+                )
+            )
+        run_case(
+            label,
+            SystemExit if expected[-1] == "SystemExit(77)" else module.MutationError,
+            patches=tuple(patches),
+            borrowed=base_borrowed,
+            postcheck=check_trace,
+            custody=check_custody,
+        )
+
+    validation_variants = (
+        ("L-getfl", ("exception", "status-mismatch")),
+        ("L-getfd", ("exception", "bool-FD_CLOEXEC", "IntSubclass-FD_CLOEXEC", "fd-flags-mismatch")),
+        ("L-fstat-pre", ("exception", "identity-proxy-mismatch")),
+        ("L-pread", ("exception", "zero-first", "invalid-chunk", "short-after-positive", "complete-bytes-mismatch")),
+        ("L-fstat-post", ("exception", "identity-proxy-mismatch")),
+        ("P-getfl", ("exception", "status-mismatch", "bool-FL_RDONLY", "IntSubclass-FL_RDONLY", "O_PATH")),
+        ("P-getfd", ("exception", "bool-FD_CLOEXEC", "IntSubclass-FD_CLOEXEC", "fd-flags-mismatch")),
+        ("P-fstat", ("exception", "kind-mismatch", "identity-proxy-mismatch")),
+        ("borrowed-L-getfl", ("exception", "status-mismatch")),
+        ("borrowed-L-fstat-pre", ("exception", "identity-proxy-mismatch")),
+        ("borrowed-L-pread", ("exception", "zero-first", "invalid-chunk", "short-after-positive", "complete-bytes-mismatch")),
+        ("borrowed-L-fstat-post", ("exception", "identity-proxy-mismatch")),
+        ("borrowed-P-getfl", ("exception", "status-mismatch")),
+        ("borrowed-P-getfd", ("exception", "bool-FD_CLOEXEC", "IntSubclass-FD_CLOEXEC", "fd-flags-mismatch")),
+        ("borrowed-P-fstat", ("exception", "kind-mismatch", "identity-proxy-mismatch")),
+    )
+    for position, variants in validation_variants:
+        for variant in variants:
+            if position.startswith("borrowed-L-"):
+                ledger_event = "dup-L-allowed-error"
+                parent_event = None
+            else:
+                ledger_event = "dup-L"
+                parent_event = "open-P"
+            expected = stage2_expected(
+                position,
+                variant,
+                ledger_event=ledger_event,
+                parent_event=parent_event,
+            )
+            run_stage2_case(
+                f"stage2-attempt-all-{position}-{variant}",
+                expected,
+                ledger_mode=("allowed", errno.EINVAL) if position.startswith("borrowed-L-") else "real",
+                failure=(position, variant),
+            )
+
+    for command_mode, first in (("absent", "command-absent"), ("true", "command-invalid"), ("subclass", "command-invalid"), ("negative", "command-invalid")):
+        expected = stage2_expected(ledger_event=first, parent_event=None, terminal="SystemExit(77)")
+        run_stage2_case(f"stage2-{first}-{command_mode}", expected, command_mode=command_mode)
+        for position, variant in (("borrowed-L-pread", "complete-bytes-mismatch"), ("borrowed-L-fstat-pre", "identity-proxy-mismatch")):
+            mutation_expected = stage2_expected(
+                position,
+                variant,
+                ledger_event=first,
+                parent_event=None,
+            )
+            run_stage2_case(
+                f"stage2-{first}-fallback-{variant}",
+                mutation_expected,
+                command_mode=command_mode,
+                failure=(position, variant),
+            )
+
+    for index, error_number in enumerate(dict.fromkeys((errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP))):
+        expected = stage2_expected(ledger_event="dup-L-allowed-error", parent_event=None, terminal="SystemExit(77)")
+        run_stage2_case(
+            f"stage2-ledger-capability-refusal-{index}",
+            expected,
+            ledger_mode=("allowed", error_number),
+        )
+    for kind in ("eio", "runtime"):
+        expected = stage2_expected(ledger_event=f"dup-L-{kind.upper()}-error" if kind == "eio" else "dup-L-RuntimeError", parent_event=None)
+        run_stage2_case(f"stage2-ledger-{kind}-error", expected, ledger_mode=kind)
+
+    for mode, event in (
+        ("true", "dup-L-return-True"),
+        ("subclass", "dup-L-return-IntSubclass"),
+        ("negative", "dup-L-return-negative"),
+        ("collision-L", "dup-L-return-collision-borrowed-L"),
+        ("collision-P", "dup-L-return-collision-borrowed-P"),
+    ):
+        expected = stage2_expected(ledger_event=event, parent_event=None)
+        run_stage2_case(f"stage2-ledger-{mode}", expected, ledger_mode=mode)
+
+    parent_modes = tuple(
+        [
+            (("allowed", error_number), "open-P-allowed-error", "SystemExit(77)")
+            for error_number in dict.fromkeys((errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP))
+        ]
+        + [
+        ("eio", "open-P-EIO-error", "MutationError"),
+        ("runtime", "open-P-RuntimeError", "MutationError"),
+        ("true", "open-P-return-True", "MutationError"),
+        ("subclass", "open-P-return-IntSubclass", "MutationError"),
+        ("negative", "open-P-return-negative", "MutationError"),
+        ("collision-L", "open-P-return-collision-owned-L", "MutationError"),
+        ("collision-borrowed-L", "open-P-return-collision-borrowed-L", "MutationError"),
+        ("collision-borrowed-P", "open-P-return-collision-borrowed-P", "MutationError"),
+        ]
+    )
+    for mode, event, terminal in parent_modes:
+        expected = stage2_expected(ledger_event="dup-L", parent_event=event, terminal=terminal)
+        run_stage2_case(f"stage2-parent-{event}", expected, parent_mode=mode)
+
+    parent_refusal_failure = stage2_expected(
+        "L-pread",
+        "exception",
+        ledger_event="dup-L",
+        parent_event="open-P-allowed-error",
+    )
+    run_stage2_case(
+        "stage2-parent-refusal-private-ledger-fallback",
+        parent_refusal_failure,
+        parent_mode=("allowed", errno.EINVAL),
+        failure=("L-pread", "exception"),
+    )
+    parent_refusal_mutation = stage2_expected(
+        "borrowed-P-getfl",
+        "exception",
+        ledger_event="dup-L",
+        parent_event="open-P-allowed-error",
+    )
+    run_stage2_case(
+        "stage2-parent-refusal-mutation-partner",
+        parent_refusal_mutation,
+        parent_mode=("allowed", errno.EINVAL),
+        failure=("borrowed-P-getfl", "exception"),
+    )
+    parent_refusal_close = stage2_expected(
+        ledger_event="dup-L",
+        parent_event="open-P-allowed-error",
+    )
+    run_stage2_case(
+        "stage2-parent-refusal-ledger-close-error",
+        parent_refusal_close,
+        parent_mode=("allowed", errno.EINVAL),
+        close_error="ledger",
+    )
+    combined_attempt_all = [
+        "dup-L", "open-P", "L-getfl", "L-getfd", "L-fstat-pre",
+        "L-pread-complete", "L-fstat-post", "P-getfl-exception", "P-getfd", "P-fstat",
+        "borrowed-L-getfl", "borrowed-L-fstat", "borrowed-P-getfl-exception",
+        "borrowed-P-getfd", "borrowed-P-fstat", "close-P", "close-L", "MutationError",
+    ]
+    run_stage2_case(
+        "stage2-combined-private-and-borrowed-parent-getfl-failures",
+        combined_attempt_all,
+        failure={"P-getfl": "exception", "borrowed-P-getfl": "exception"},
+    )
+    for position, variant in (("borrowed-L-pread", "complete-bytes-mismatch"), ("borrowed-L-fstat-pre", "identity-proxy-mismatch")):
+        expected = stage2_expected(position, variant, ledger_event="dup-L-allowed-error", parent_event=None)
+        run_stage2_case(
+            f"stage2-capability-mutation-{position}",
+            expected,
+            ledger_mode=("allowed", errno.EINVAL),
+            failure=(position, variant),
+        )
+
+    for close_target in ("parent", "ledger"):
+        expected = stage2_expected(ledger_event="dup-L", parent_event="open-P")
+        run_stage2_case(
+            f"stage2-close-{close_target}-real-close-then-raise",
+            expected,
+            close_error=close_target,
+        )
 
     read_write_ledger = os.open(
         ledger_path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW

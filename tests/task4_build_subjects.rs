@@ -806,6 +806,51 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
     )
     os.close(read_write_ledger)
 
+    first_pass_eof_state = {"events": [], "getfl_calls": 0, "pread_calls": 0}
+    original_fcntl = fcntl.fcntl
+    original_pread = os.pread
+    original_fstat = os.fstat
+
+    def first_pass_eof_fcntl(fd, command, *arguments):
+        value = original_fcntl(fd, command, *arguments)
+        if fd == ledger_fd and command == fcntl.F_GETFL:
+            first_pass_eof_state["events"].append("ledger-getfl")
+            first_pass_eof_state["getfl_calls"] += 1
+        return value
+
+    def first_pass_eof_pread(fd, size, offset):
+        if fd == ledger_fd:
+            first_pass_eof_state["events"].append("ledger-pread-first")
+            first_pass_eof_state["pread_calls"] += 1
+            return b""
+        return original_pread(fd, size, offset)
+
+    def first_pass_eof_fstat(fd):
+        value = original_fstat(fd)
+        if fd == ledger_fd:
+            first_pass_eof_state["events"].append("ledger-fstat")
+        return value
+
+    def check_first_pass_eof():
+        if first_pass_eof_state["getfl_calls"] != 1:
+            raise SystemExit("first-pass ledger F_GETFL shim was not reached exactly once")
+        if first_pass_eof_state["pread_calls"] != 1:
+            raise SystemExit("first-pass premature EOF shim was not reached exactly once")
+        if first_pass_eof_state["events"] != ["ledger-getfl", "ledger-fstat", "ledger-pread-first"]:
+            raise SystemExit("premature EOF was not injected during the first ledger pass")
+
+    run_case(
+        "first-pass-premature-eof",
+        module.MutationError,
+        patches=(
+            (fcntl, "fcntl", first_pass_eof_fcntl),
+            (module.os, "fstat", first_pass_eof_fstat),
+            (module.os, "pread", first_pass_eof_pread),
+        ),
+        borrowed=base_borrowed,
+        postcheck=check_first_pass_eof,
+    )
+
     partial_state = {
         "calls": 0,
         "events": [],
@@ -1329,6 +1374,86 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             module.MutationError,
             mutation,
         )
+
+    recovery_state = {
+        "failed": False,
+        "fsync_calls": 0,
+        "fsync_targets": [],
+        "getfl_failed": False,
+        "events": [],
+        "ledger_reads": [],
+    }
+    original_fstat = os.fstat
+    original_pread = os.pread
+    original_fcntl = fcntl.fcntl
+
+    def recovery_fsync(fd):
+        recovery_state["fsync_targets"].append(fd)
+        recovery_state["fsync_calls"] += 1
+        if fd == parent_fd:
+            recovery_state["failed"] = True
+            raise OSError(errno.EINVAL, "fixture capability refusal")
+        raise OSError(errno.EIO, "unexpected fsync target")
+
+    def recovery_fcntl(fd, command, *arguments):
+        value = original_fcntl(fd, command, *arguments)
+        if recovery_state["failed"] and fd == parent_fd and command == fcntl.F_GETFL:
+            recovery_state["events"].append("parent-getfl")
+            if not recovery_state["getfl_failed"]:
+                recovery_state["getfl_failed"] = True
+                raise OSError(errno.EIO, "fixture earliest recheck failure")
+        elif recovery_state["failed"] and fd == parent_fd and command == fcntl.F_GETFD:
+            recovery_state["events"].append("parent-getfd")
+        return value
+
+    def recovery_fstat(fd):
+        value = original_fstat(fd)
+        if recovery_state["failed"] and fd == parent_fd:
+            recovery_state["events"].append("parent-fstat")
+        elif recovery_state["failed"] and fd == ledger_fd:
+            recovery_state["events"].append("ledger-fstat")
+        return value
+
+    def recovery_pread(fd, size, offset):
+        value = original_pread(fd, size, offset)
+        if recovery_state["failed"] and fd == ledger_fd:
+            recovery_state["events"].append("ledger-pread")
+            recovery_state["ledger_reads"].append((offset, len(value)))
+        return value
+
+    def check_recovery_after_earliest_failure():
+        if recovery_state["fsync_targets"] != [parent_fd]:
+            raise SystemExit("recovery fsync targeted an unexpected descriptor")
+        if recovery_state["fsync_calls"] != 1:
+            raise SystemExit("recovery fsync shim was not reached exactly once")
+        if not recovery_state["getfl_failed"]:
+            raise SystemExit("earliest parent F_GETFL failure shim was not reached")
+        reads = recovery_state["ledger_reads"]
+        expected_events = ["parent-getfl", "parent-getfd", "parent-fstat"]
+        expected_events.extend("ledger-pread" for _ in reads)
+        expected_events.append("ledger-fstat")
+        if recovery_state["events"] != expected_events:
+            raise SystemExit("remaining rechecks were not attempted in fixed order")
+        cursor = 0
+        for offset, length in reads:
+            if offset != cursor or length <= 0:
+                raise SystemExit("recovery ledger reread was not contiguous")
+            cursor += length
+        if cursor != len(ledger_bytes):
+            raise SystemExit("recovery ledger reread was incomplete")
+
+    run_case(
+        "capability-fsync-earliest-parent-recheck-failure",
+        module.MutationError,
+        patches=(
+            (module.os, "fsync", recovery_fsync),
+            (module.os, "fstat", recovery_fstat),
+            (module.os, "pread", recovery_pread),
+            (fcntl, "fcntl", recovery_fcntl),
+        ),
+        borrowed=base_borrowed,
+        postcheck=check_recovery_after_earliest_failure,
+    )
 
     run_case("valid-refusal-only-runner", SystemExit, borrowed=base_borrowed)
     os.close(ledger_fd)

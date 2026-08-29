@@ -11457,6 +11457,7 @@ fn bs2b_s9_fcntl_experiment_normalization_privacy_contracts() {
     let mut duplicate_raw = raw_golden.clone();
     put_raw_u64(&mut duplicate_raw, 31, 40, 0);
     put_raw_u64(&mut duplicate_raw, 31, 48, 0);
+    put_raw_u64(&mut duplicate_raw, 31, 56, 0);
     let duplicate_json = concat!(
         "{\"authority\":\"non-production-experiment-only\",\"rows\":[",
         "{\"argument\":\"zero\",\"command\":\"dupfd\",\"count\":2,",
@@ -11530,6 +11531,66 @@ fn bs2b_s9_fcntl_experiment_normalization_privacy_contracts() {
     put_raw_u16(&mut bytes, 4, 40, 3);
     add_rejection("creation-event-kind", bytes);
     let mut bytes = raw_golden.clone();
+    put_raw_u16(&mut bytes, 9, 40, 1);
+    put_raw_u16(&mut bytes, 11, 56, 1);
+    add_rejection("creation2-fork-event-same-group", bytes);
+    let mut clone3_vfork = Vec::new();
+    let mut push_clone3_vfork = |mut bytes: [u8; 128]| {
+        put_u64(&mut bytes, 16, (clone3_vfork.len() / 128) as u64);
+        clone3_vfork.extend_from_slice(&bytes);
+    };
+    let mut bytes = record(0, 1);
+    put_u32(&mut bytes, 24, 128);
+    put_u32(&mut bytes, 28, 0x0102_0304);
+    push_clone3_vfork(bytes);
+    let mut bytes = record(1, 0x10);
+    put_u64(&mut bytes, 24, 1);
+    push_clone3_vfork(bytes);
+    let mut bytes = record(2, 0x16);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 40, 1);
+    put_u16(&mut bytes, 48, 1);
+    push_clone3_vfork(bytes);
+    let mut bytes = record(3, 0x11);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 1);
+    put_u16(&mut bytes, 40, 4);
+    push_clone3_vfork(bytes);
+    let mut bytes = record(4, 0x12);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 1);
+    put_u16(&mut bytes, 40, 2);
+    push_clone3_vfork(bytes);
+    let mut bytes = record(5, 0x14);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 1);
+    put_u64(&mut bytes, 40, 2);
+    put_u64(&mut bytes, 48, 2);
+    put_u16(&mut bytes, 56, 2);
+    push_clone3_vfork(bytes);
+    let mut bytes = record(6, 0x13);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 1);
+    put_u16(&mut bytes, 40, 1);
+    push_clone3_vfork(bytes);
+    let mut bytes = record(7, 0x17);
+    put_u64(&mut bytes, 24, 1);
+    put_u32(&mut bytes, 32, 0);
+    push_clone3_vfork(bytes);
+    let mut bytes = record(8, 0x18);
+    put_u64(&mut bytes, 24, 1);
+    put_u32(&mut bytes, 32, 0);
+    push_clone3_vfork(bytes);
+    let mut bytes = record(9, 0x17);
+    put_u64(&mut bytes, 24, 2);
+    put_u32(&mut bytes, 32, 0);
+    push_clone3_vfork(bytes);
+    let mut bytes = record(10, 0x18);
+    put_u64(&mut bytes, 24, 2);
+    put_u32(&mut bytes, 32, 0);
+    push_clone3_vfork(bytes);
+    add_rejection("creation2-clone3-vfork-without-done", clone3_vfork);
+    let mut bytes = raw_golden.clone();
     put_raw_u16(&mut bytes, 6, 40, 2);
     add_rejection("creation-outcome", bytes);
     let mut bytes = raw_golden.clone();
@@ -11554,6 +11615,10 @@ fn bs2b_s9_fcntl_experiment_normalization_privacy_contracts() {
     put_raw_u32(&mut bytes, 35, 32, 0x7f);
     put_raw_u32(&mut bytes, 36, 32, 0x7f);
     add_rejection("terminal-stopped-status", bytes);
+    let mut bytes = raw_golden.clone();
+    put_raw_u32(&mut bytes, 35, 32, 0x0109);
+    put_raw_u32(&mut bytes, 36, 32, 0x0109);
+    add_rejection("terminal-noncanonical-signal-status", bytes);
     let mut bytes = raw_golden.clone();
     put_raw_u32(&mut bytes, 36, 32, 0);
     add_rejection("terminal-wif-mismatch", bytes);
@@ -11596,6 +11661,121 @@ fn bs2b_s9_fcntl_experiment_normalization_privacy_contracts() {
     put_u32(&mut extra, 32, 0);
     bytes.extend_from_slice(&extra);
     add_rejection("equation-superseded-wif", bytes);
+
+    let mut join_after_exit = Vec::new();
+    let mut append_join_after_exit = |mut bytes: [u8; 128]| {
+        put_u64(&mut bytes, 16, (join_after_exit.len() / 128) as u64);
+        join_after_exit.extend_from_slice(&bytes);
+    };
+    let mut bytes = record(0, 1);
+    put_u32(&mut bytes, 24, 128);
+    put_u32(&mut bytes, 28, 0x0102_0304);
+    append_join_after_exit(bytes);
+    let mut bytes = record(1, 0x10);
+    put_u64(&mut bytes, 24, 1);
+    append_join_after_exit(bytes);
+    let mut bytes = record(2, 0x16);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 40, 1);
+    put_u16(&mut bytes, 48, 1);
+    append_join_after_exit(bytes);
+    let mut bytes = record(3, 0x11);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 1);
+    put_u16(&mut bytes, 40, 1);
+    append_join_after_exit(bytes);
+    let mut bytes = record(4, 0x12);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 1);
+    put_u16(&mut bytes, 40, 1);
+    append_join_after_exit(bytes);
+    let mut bytes = record(5, 0x13);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 1);
+    put_u16(&mut bytes, 40, 1);
+    append_join_after_exit(bytes);
+    let mut bytes = record(6, 0x17);
+    put_u64(&mut bytes, 24, 1);
+    put_u32(&mut bytes, 32, 0);
+    append_join_after_exit(bytes);
+    let mut bytes = record(7, 0x14);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 1);
+    put_u64(&mut bytes, 40, 2);
+    put_u64(&mut bytes, 48, 2);
+    put_u16(&mut bytes, 56, 1);
+    append_join_after_exit(bytes);
+    let mut bytes = record(8, 0x18);
+    put_u64(&mut bytes, 24, 1);
+    put_u32(&mut bytes, 32, 0);
+    append_join_after_exit(bytes);
+    let mut bytes = record(9, 0x17);
+    put_u64(&mut bytes, 24, 2);
+    put_u32(&mut bytes, 32, 0);
+    append_join_after_exit(bytes);
+    let mut bytes = record(10, 0x18);
+    put_u64(&mut bytes, 24, 2);
+    put_u32(&mut bytes, 32, 0);
+    append_join_after_exit(bytes);
+    add_rejection("creation-join-after-parent-exit", join_after_exit);
+
+    let mut terminal_vfork = Vec::new();
+    let mut push_terminal_vfork = |mut bytes: [u8; 128]| {
+        put_u64(&mut bytes, 16, (terminal_vfork.len() / 128) as u64);
+        terminal_vfork.extend_from_slice(&bytes);
+    };
+    let mut bytes = record(0, 1);
+    put_u32(&mut bytes, 24, 128);
+    put_u32(&mut bytes, 28, 0x0102_0304);
+    push_terminal_vfork(bytes);
+    let mut bytes = record(1, 0x10);
+    put_u64(&mut bytes, 24, 1);
+    push_terminal_vfork(bytes);
+    let mut bytes = record(2, 0x16);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 40, 1);
+    put_u16(&mut bytes, 48, 1);
+    push_terminal_vfork(bytes);
+    let mut bytes = record(3, 0x11);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 1);
+    put_u16(&mut bytes, 40, 2);
+    push_terminal_vfork(bytes);
+    let mut bytes = record(4, 0x12);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 1);
+    put_u16(&mut bytes, 40, 2);
+    push_terminal_vfork(bytes);
+    let mut bytes = record(5, 0x14);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 1);
+    put_u64(&mut bytes, 40, 2);
+    put_u64(&mut bytes, 48, 2);
+    put_u16(&mut bytes, 56, 2);
+    push_terminal_vfork(bytes);
+    let mut bytes = record(6, 0x17);
+    put_u64(&mut bytes, 24, 2);
+    push_terminal_vfork(bytes);
+    let mut bytes = record(7, 0x15);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 1);
+    put_u64(&mut bytes, 40, 2);
+    push_terminal_vfork(bytes);
+    let mut bytes = record(8, 0x13);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 1);
+    put_u16(&mut bytes, 40, 1);
+    push_terminal_vfork(bytes);
+    let mut bytes = record(9, 0x17);
+    put_u64(&mut bytes, 24, 1);
+    push_terminal_vfork(bytes);
+    let mut bytes = record(10, 0x18);
+    put_u64(&mut bytes, 24, 1);
+    push_terminal_vfork(bytes);
+    let mut bytes = record(11, 0x18);
+    put_u64(&mut bytes, 24, 2);
+    push_terminal_vfork(bytes);
+    add_rejection("vfork-done-after-child-terminal", terminal_vfork);
 
     let mut sparse_generation = Vec::new();
     for bytes in records.iter().take(3) {
@@ -12139,6 +12319,31 @@ elif held_case == "changed-during-read":
     if os.fstat(1).st_size != 0:
         fail("held-changed-during-read", "changed input left output bytes")
     raise SystemExit(64)
+elif held_case == "output-race":
+    real_sha256 = hashlib.sha256
+    calls = [0]
+    def racing_sha256(*args, **kwargs):
+        digest = real_sha256(*args, **kwargs)
+        if calls[0] == 0:
+            calls[0] = 1
+            os.pwrite(1, b"x", 0)
+        return digest
+    hashlib.sha256 = racing_sha256
+    try:
+        try:
+            module._check_raw(0, 1)
+        except module.ContractError as exc:
+            if type(exc) is not module.ContractError or exc.code != "invalid" or str(exc) != "invalid":
+                fail("held-output-race", f"wrong error {type(exc).__name__}: {exc}")
+        else:
+            fail("held-output-race", "output race was accepted")
+    finally:
+        hashlib.sha256 = real_sha256
+    if calls[0] != 1:
+        fail("held-output-race", "digest shim did not run")
+    if os.pread(1, 1 << 20, 0) != b"x":
+        fail("held-output-race", "output race did not preserve the marker")
+    raise SystemExit(64)
 elif held_case == "offset":
     os.lseek(0, 19, os.SEEK_SET)
     os.lseek(1, 7, os.SEEK_SET)
@@ -12358,6 +12563,17 @@ raise SystemExit(0)
     );
     fs::remove_file(raw_path).expect("remove changed raw fixture");
     fs::remove_file(output_path).expect("remove changed output fixture");
+
+    let (raw_path, raw_file) = create_regular("output-race-raw", &raw_golden);
+    let (output_path, output_file) = create_regular("output-race-output", &[]);
+    run_held("output-race", 64, raw_file, output_file);
+    assert_regular(&output_path);
+    assert_eq!(
+        fs::read(&output_path).expect("read output-race output"),
+        b"x"
+    );
+    fs::remove_file(raw_path).expect("remove output-race raw fixture");
+    fs::remove_file(output_path).expect("remove output-race output fixture");
 
     let (raw_path, raw_file) = create_regular("mode-raw", &raw_golden);
     fs::set_permissions(&raw_path, fs::Permissions::from_mode(0o644))

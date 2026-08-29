@@ -354,6 +354,71 @@ package bytes through an independently reviewed daemonless rootless OCI-builder
 subject running as an owned filtered descendant. Live `apt`, `apk`, mutable
 tags, external daemons/sockets, and an undeclared Docker context are forbidden.
 
+## Stage3 authority amendment (2026-08-30; accepted)
+
+This amendment is the controlling BS2b capacity, ordering, and raw-symlink
+authority for staged Stage3 work. It changes no product contract, privacy
+allowlist, schema, or schema row limit.
+
+### CAPACITY
+
+BS2b acquires every graph/scan FD exactly once and retains it. It does not batch
+acquisition, drop and reopen descriptors, retry acquisition, raise
+`RLIMIT_NOFILE`, sweep FDs, precount, or use a prefix estimate. Before graph
+acquisition it records exactly one finite, nonnegative, exact-integer
+`RLIMIT_NOFILE` tuple `(soft, hard)`, with `soft <= hard`.
+
+An exact `EMFILE` from a specified graph/scan open triggers exactly one
+immediate reread of that tuple. Only an unchanged tuple may stop dependent
+acquisition. The runner then performs safe final private-plus-borrowed custody
+and bindings for held nodes, skips the canonical absence caused by the
+incomplete graph, and reverse-closes exactly once. Silent exit 77 is permitted
+only after the exact checks and cleanup. `ENFILE`, an invalid or colliding
+descriptor, drift, any other post-baseline failure, or cleanup uncertainty is
+`MutationError`.
+
+A syntax-valid ledger may be capacity-refused; capacity refusal does not imply
+batching or a product row cap. Native capability constants are exact:
+`O_RDONLY == 0`; `O_CLOEXEC`, `O_NOFOLLOW`, and `O_DIRECTORY` are exact
+positive values whose required open-flag bits do not collide; `FD_CLOEXEC` is
+exactly positive; `O_PATH` must be exactly positive when the ledger contains a
+symlink row and is not required otherwise; and `F_GETFD` is exactly
+nonnegative. Missing native support is a stable refusal before graph
+acquisition. Present zero, wrong-type, or colliding security flags are
+`MutationError`. After graph acquisition begins, only an exact unchanged-tuple
+`EMFILE` may be a stable refusal.
+
+### ORDER
+
+BS2b's order is exact: preflight the exact held graph; establish private-parent
+transaction custody and an initially-empty held nonce build root; construct the
+complete literal Landlock ruleset from the inputs and build root; then establish
+the producer/isolation boundary and apply enforcement before exec. Preflight
+alone does not authorize a child. Ruleset construction is not enforcement;
+`no_new_privs` plus `restrict_self` in the intended child is enforcement.
+
+### RAW SYMLINK
+
+Raw symlink target bytes are ephemeral. They are not decoded, normalized,
+logged, cached, or published. A symlink is held with
+`O_PATH|O_CLOEXEC|O_NOFOLLOW`; descriptor-relative `readlink` reads it exactly
+twice, bracketed by stable full identity. Target closure is resolved
+immediately after the second read before the bytes are discarded; the held
+symlink descriptor remains owned through final binding and cleanup. An empty
+target rejects. Repeated slashes collapse; absolute targets start at the held
+root, relative targets at the held link parent, `.` is a no-op, and `..` clamps
+held parents at the root. A trailing slash requires a directory. Target
+components are processed before the remaining original components. Every
+encountered link and final relation has a ledger row. Forty follows pass and
+the forty-first rejects. No text reopen or repeated-locator shortcut is
+permitted.
+
+This amendment authorizes only staged `3A0`-`3A3` RED/GREEN/review after these
+docs are accepted. It does not authorize a build, child/build-root creation,
+Landlock implementation or probe, producer, runtime, publication, or release.
+Stage3 code remains gated until independent review and commit. The privacy
+allowlist and schema row limits remain unchanged.
+
 ## Tracked authority and final-tip compatibility
 
 After the production run, a tracked reviewed authority report is the opaque

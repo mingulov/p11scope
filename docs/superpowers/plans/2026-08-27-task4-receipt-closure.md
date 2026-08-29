@@ -633,6 +633,25 @@ source/build bound.
    exact allowed namespace delta.
    Then implement the consumer-copy, pre-use-check, Lane 09 image-load, and
    final-tip compatibility protocols from the correction decision.
+   **Stage3 authority amendment (2026-08-30; accepted):** The full normative
+   authority is in the [accepted build-subject decision](../reports/2026-08-28-task4-build-subject-decision.md#stage3-authority-amendment-2026-08-30-accepted).
+   BS2b acquires and retains every graph/scan FD exactly once, records one
+   exact `(soft, hard)` `RLIMIT_NOFILE` tuple before graph acquisition, and
+   permits only the exact unchanged-tuple `EMFILE` reread/refusal path;
+   `ENFILE`, descriptor collision/invalidity, drift, other post-baseline
+   failure, and cleanup uncertainty are `MutationError`. Its order is exact
+   held-graph preflight, private-parent custody with an initially-empty held
+   nonce build root, complete literal Landlock construction, then producer /
+   isolation enforcement before exec; preflight alone does not authorize a
+   child. Raw symlink bytes remain ephemeral, use held
+   `O_PATH|O_CLOEXEC|O_NOFOLLOW`, exactly two descriptor-relative reads with
+   stable full identity, and the closed 40/41-follow and ledger-row rules.
+   This amendment authorizes only staged `3A0`-`3A3` RED/GREEN/review after
+   docs acceptance; it does not authorize build, child/build-root, Landlock
+   implementation/probe, producer, runtime, publication, or release. Stage3
+   code remains gated until independent review/commit; privacy and schema row
+   limits are unchanged.**
+
 3. Independently review that literal producer ledger, then run exactly one fresh
    production build-subject freeze. Persist its staging-root, literal-ledger,
    and subject identities in one opaque tracked authority report. This is not a

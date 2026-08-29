@@ -1,10 +1,13 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::{Seek, SeekFrom};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const INPUT_LEDGER_GOLDEN: &str = concat!(
@@ -11173,4 +11176,1254 @@ print("bs2b-semantic-close-outcome-ok")
         output.stdout, b"bs2b-semantic-close-outcome-ok\n",
         "BS2b semantic close outcome driver did not complete"
     );
+}
+
+#[test]
+fn bs2b_s9_fcntl_experiment_normalization_privacy_contracts() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = repo.join("scripts/task4-fcntl-experiment.py");
+    assert!(
+        script.is_file(),
+        "RED1 missing scripts/task4-fcntl-experiment.py"
+    );
+
+    fn record(seq: u64, kind: u16) -> [u8; 128] {
+        let mut bytes = [0u8; 128];
+        bytes[..8].copy_from_slice(b"P11S9R1\0");
+        bytes[8..10].copy_from_slice(&1u16.to_le_bytes());
+        bytes[10..12].copy_from_slice(&kind.to_le_bytes());
+        bytes[12..16].copy_from_slice(&0u32.to_le_bytes());
+        bytes[16..24].copy_from_slice(&seq.to_le_bytes());
+        bytes
+    }
+
+    fn put_u16(bytes: &mut [u8; 128], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(bytes: &mut [u8; 128], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64(bytes: &mut [u8; 128], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_raw_u16(bytes: &mut [u8], record_index: usize, offset: usize, value: u16) {
+        let start = record_index * 128 + offset;
+        bytes[start..start + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_raw_u32(bytes: &mut [u8], record_index: usize, offset: usize, value: u32) {
+        let start = record_index * 128 + offset;
+        bytes[start..start + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_raw_u64(bytes: &mut [u8], record_index: usize, offset: usize, value: u64) {
+        let start = record_index * 128 + offset;
+        bytes[start..start + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn hex(data: &[u8]) -> String {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut result = String::with_capacity(data.len() * 2);
+        for byte in data {
+            result.push(char::from(DIGITS[(byte >> 4) as usize]));
+            result.push(char::from(DIGITS[(byte & 0x0f) as usize]));
+        }
+        result
+    }
+
+    let mut records = Vec::<[u8; 128]>::new();
+    let mut bytes = record(0, 1);
+    put_u32(&mut bytes, 24, 128);
+    put_u32(&mut bytes, 28, 0x0102_0304);
+    records.push(bytes);
+    let mut bytes = record(1, 0x10);
+    put_u64(&mut bytes, 24, 1);
+    records.push(bytes);
+    let mut bytes = record(2, 0x16);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 0);
+    put_u64(&mut bytes, 40, 1);
+    put_u16(&mut bytes, 48, 1);
+    records.push(bytes);
+
+    let mut bytes = record(3, 0x11);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 1);
+    put_u16(&mut bytes, 40, 1);
+    records.push(bytes);
+    let mut bytes = record(4, 0x12);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 1);
+    put_u16(&mut bytes, 40, 1);
+    records.push(bytes);
+    let mut bytes = record(5, 0x14);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 1);
+    put_u64(&mut bytes, 40, 2);
+    put_u64(&mut bytes, 48, 2);
+    put_u16(&mut bytes, 56, 1);
+    records.push(bytes);
+    let mut bytes = record(6, 0x13);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 1);
+    put_u16(&mut bytes, 40, 1);
+    put_u16(&mut bytes, 42, 0);
+    records.push(bytes);
+    let mut bytes = record(7, 0x16);
+    put_u64(&mut bytes, 24, 2);
+    put_u64(&mut bytes, 32, 0);
+    put_u64(&mut bytes, 40, 2);
+    put_u16(&mut bytes, 48, 1);
+    records.push(bytes);
+
+    let mut bytes = record(8, 0x11);
+    put_u64(&mut bytes, 24, 2);
+    put_u64(&mut bytes, 32, 1);
+    put_u16(&mut bytes, 40, 3);
+    records.push(bytes);
+    let mut bytes = record(9, 0x12);
+    put_u64(&mut bytes, 24, 2);
+    put_u64(&mut bytes, 32, 1);
+    put_u16(&mut bytes, 40, 3);
+    records.push(bytes);
+    let mut bytes = record(10, 0x13);
+    put_u64(&mut bytes, 24, 2);
+    put_u64(&mut bytes, 32, 1);
+    put_u16(&mut bytes, 40, 1);
+    put_u16(&mut bytes, 42, 0);
+    records.push(bytes);
+    let mut bytes = record(11, 0x14);
+    put_u64(&mut bytes, 24, 2);
+    put_u64(&mut bytes, 32, 1);
+    put_u64(&mut bytes, 40, 3);
+    put_u64(&mut bytes, 48, 1);
+    put_u16(&mut bytes, 56, 3);
+    records.push(bytes);
+
+    let mut bytes = record(12, 0x11);
+    put_u64(&mut bytes, 24, 3);
+    put_u64(&mut bytes, 32, 2);
+    put_u16(&mut bytes, 40, 2);
+    records.push(bytes);
+    let mut bytes = record(13, 0x12);
+    put_u64(&mut bytes, 24, 3);
+    put_u64(&mut bytes, 32, 2);
+    put_u16(&mut bytes, 40, 2);
+    records.push(bytes);
+    let mut bytes = record(14, 0x14);
+    put_u64(&mut bytes, 24, 3);
+    put_u64(&mut bytes, 32, 2);
+    put_u64(&mut bytes, 40, 4);
+    put_u64(&mut bytes, 48, 3);
+    put_u16(&mut bytes, 56, 2);
+    records.push(bytes);
+    let mut bytes = record(15, 0x15);
+    put_u64(&mut bytes, 24, 3);
+    put_u64(&mut bytes, 32, 2);
+    put_u64(&mut bytes, 40, 4);
+    records.push(bytes);
+    let mut bytes = record(16, 0x13);
+    put_u64(&mut bytes, 24, 3);
+    put_u64(&mut bytes, 32, 2);
+    put_u16(&mut bytes, 40, 1);
+    put_u16(&mut bytes, 42, 0);
+    records.push(bytes);
+
+    let mut bytes = record(17, 0x17);
+    put_u64(&mut bytes, 24, 1);
+    put_u32(&mut bytes, 32, 0);
+    records.push(bytes);
+    let mut bytes = record(18, 0x16);
+    put_u64(&mut bytes, 24, 3);
+    put_u64(&mut bytes, 32, 1);
+    put_u64(&mut bytes, 40, 1);
+    put_u16(&mut bytes, 48, 2);
+    records.push(bytes);
+    let mut bytes = record(19, 0x16);
+    put_u64(&mut bytes, 24, 4);
+    put_u64(&mut bytes, 32, 0);
+    put_u64(&mut bytes, 40, 3);
+    put_u16(&mut bytes, 48, 1);
+    records.push(bytes);
+
+    let mut bytes = record(20, 0x11);
+    put_u64(&mut bytes, 24, 4);
+    put_u64(&mut bytes, 32, 2);
+    put_u16(&mut bytes, 40, 4);
+    records.push(bytes);
+    let mut bytes = record(21, 0x1a);
+    put_u64(&mut bytes, 24, 2);
+    put_u64(&mut bytes, 32, 435);
+    records.push(bytes);
+    let mut bytes = record(22, 0x11);
+    put_u64(&mut bytes, 24, 5);
+    put_u64(&mut bytes, 32, 4);
+    put_u16(&mut bytes, 40, 1);
+    records.push(bytes);
+    let mut bytes = record(23, 0x13);
+    put_u64(&mut bytes, 24, 5);
+    put_u64(&mut bytes, 32, 4);
+    put_u16(&mut bytes, 40, 0);
+    put_u16(&mut bytes, 42, 1);
+    records.push(bytes);
+    let mut bytes = record(24, 0x19);
+    put_u64(&mut bytes, 24, 2);
+    put_u32(&mut bytes, 32, 15);
+    records.push(bytes);
+
+    let fcntl_args = |command: u64, argument: u64| {
+        [
+            5,
+            command,
+            argument,
+            0x1111_2222_3333_4444,
+            0x5555_6666_7777_8888,
+            u64::MAX,
+        ]
+    };
+    for (seq, invocation, generation, command, argument) in [
+        (25, 1, 2, 0, 0),
+        (27, 2, 3, 1, 0),
+        (29, 3, 4, 2, 1),
+        (31, 4, 4, 3, 0x200),
+    ] {
+        let mut bytes = record(seq, 0x20);
+        put_u64(&mut bytes, 24, invocation);
+        put_u64(&mut bytes, 32, generation);
+        for (index, argument) in fcntl_args(command, argument).into_iter().enumerate() {
+            put_u64(&mut bytes, 40 + index * 8, argument);
+        }
+        records.push(bytes);
+        let mut bytes = record(seq + 1, 0x21);
+        put_u64(&mut bytes, 24, invocation);
+        put_u64(&mut bytes, 32, generation);
+        put_u64(&mut bytes, 40, if invocation == 2 { 1 } else { 0 });
+        records.push(bytes);
+    }
+
+    let mut bytes = record(33, 0x17);
+    put_u64(&mut bytes, 24, 2);
+    put_u32(&mut bytes, 32, 7 << 8);
+    records.push(bytes);
+    let mut bytes = record(34, 0x18);
+    put_u64(&mut bytes, 24, 2);
+    put_u32(&mut bytes, 32, 7 << 8);
+    records.push(bytes);
+    let mut bytes = record(35, 0x17);
+    put_u64(&mut bytes, 24, 3);
+    put_u32(&mut bytes, 32, 0x80 | 9);
+    records.push(bytes);
+    let mut bytes = record(36, 0x18);
+    put_u64(&mut bytes, 24, 3);
+    put_u32(&mut bytes, 32, 0x80 | 9);
+    records.push(bytes);
+    let mut bytes = record(37, 0x17);
+    put_u64(&mut bytes, 24, 4);
+    put_u32(&mut bytes, 32, 0);
+    records.push(bytes);
+    let mut bytes = record(38, 0x18);
+    put_u64(&mut bytes, 24, 4);
+    put_u32(&mut bytes, 32, 0);
+    records.push(bytes);
+
+    assert_eq!(records.len(), 39);
+    let mut raw_golden = Vec::with_capacity(records.len() * 128);
+    for bytes in &records {
+        raw_golden.extend_from_slice(bytes);
+    }
+
+    let expected_json = concat!(
+        "{\"authority\":\"non-production-experiment-only\",\"rows\":[",
+        "{\"argument\":\"zero\",\"command\":\"dupfd\",\"count\":1,",
+        "\"errno\":\"none\",\"result\":\"equal-floor\"},",
+        "{\"argument\":\"none\",\"command\":\"getfd\",\"count\":1,",
+        "\"errno\":\"none\",\"result\":\"cloexec\"},",
+        "{\"argument\":\"file-status-flags\",\"command\":\"getfl\",\"count\":1,",
+        "\"errno\":\"none\",\"result\":\"success\"},",
+        "{\"argument\":\"cloexec\",\"command\":\"setfd\",\"count\":1,",
+        "\"errno\":\"none\",\"result\":\"success-zero\"}],",
+        "\"schema\":\"bs2b-s9-fcntl-experiment-aggregate-v1\",",
+        "\"trace_v1_input\":false}\n"
+    );
+    let empty_json = concat!(
+        "{\"authority\":\"non-production-experiment-only\",\"rows\":[],",
+        "\"schema\":\"bs2b-s9-fcntl-experiment-aggregate-v1\",",
+        "\"trace_v1_input\":false}\n"
+    );
+
+    let mut duplicate_raw = raw_golden.clone();
+    put_raw_u64(&mut duplicate_raw, 31, 40, 0);
+    put_raw_u64(&mut duplicate_raw, 31, 48, 0);
+    let duplicate_json = concat!(
+        "{\"authority\":\"non-production-experiment-only\",\"rows\":[",
+        "{\"argument\":\"zero\",\"command\":\"dupfd\",\"count\":2,",
+        "\"errno\":\"none\",\"result\":\"equal-floor\"},",
+        "{\"argument\":\"none\",\"command\":\"getfd\",\"count\":1,",
+        "\"errno\":\"none\",\"result\":\"cloexec\"},",
+        "{\"argument\":\"cloexec\",\"command\":\"setfd\",\"count\":1,",
+        "\"errno\":\"none\",\"result\":\"success-zero\"}],",
+        "\"schema\":\"bs2b-s9-fcntl-experiment-aggregate-v1\",",
+        "\"trace_v1_input\":false}\n"
+    );
+
+    let mut raw_rejections = Vec::<(String, Vec<u8>)>::new();
+    let mut add_rejection = |name: &str, bytes: Vec<u8>| {
+        raw_rejections.push((name.to_owned(), bytes));
+    };
+    add_rejection("envelope-empty", Vec::new());
+    add_rejection(
+        "envelope-nonaligned",
+        raw_golden[..raw_golden.len() - 1].to_vec(),
+    );
+    let mut bytes = raw_golden.clone();
+    put_raw_u32(&mut bytes, 3, 12, 1);
+    add_rejection("reserved-flags", bytes);
+    let mut bytes = raw_golden.clone();
+    bytes[3 * 128 + 127] = 1;
+    add_rejection("reserved-padding", bytes);
+    let mut bytes = raw_golden.clone();
+    put_raw_u32(&mut bytes, 0, 24, 129);
+    add_rejection("envelope-header-size", bytes);
+    let mut bytes = raw_golden.clone();
+    put_raw_u32(&mut bytes, 0, 28, 0x0403_0201);
+    add_rejection("envelope-endian", bytes);
+    let mut bytes = raw_golden.clone();
+    bytes[0] = b'Q';
+    add_rejection("envelope-magic", bytes);
+    let mut bytes = raw_golden.clone();
+    put_raw_u16(&mut bytes, 0, 8, 2);
+    add_rejection("envelope-version", bytes);
+    let mut bytes = raw_golden.clone();
+    put_raw_u64(&mut bytes, 3, 16, 2);
+    add_rejection("sequence-duplicate", bytes);
+    let mut bytes = raw_golden.clone();
+    put_raw_u64(&mut bytes, 4, 16, 99);
+    add_rejection("sequence-gap", bytes);
+    for (name, value) in [
+        ("ordinal-generation-zero", 0),
+        ("ordinal-generation-cap", 4097),
+    ] {
+        let mut bytes = raw_golden.clone();
+        put_raw_u64(&mut bytes, 25, 32, value);
+        add_rejection(name, bytes);
+    }
+    for (name, value) in [
+        ("ordinal-invocation-zero", 0),
+        ("ordinal-invocation-cap", 65_537),
+    ] {
+        let mut bytes = raw_golden.clone();
+        put_raw_u64(&mut bytes, 25, 24, value);
+        add_rejection(name, bytes);
+    }
+    for (name, value) in [("ordinal-creation-zero", 0), ("ordinal-creation-cap", 4097)] {
+        let mut bytes = raw_golden.clone();
+        put_raw_u64(&mut bytes, 3, 24, value);
+        add_rejection(name, bytes);
+    }
+    let mut bytes = raw_golden.clone();
+    put_raw_u64(&mut bytes, 4, 24, 99);
+    add_rejection("creation-event-ordinal", bytes);
+    let mut bytes = raw_golden.clone();
+    put_raw_u16(&mut bytes, 4, 40, 3);
+    add_rejection("creation-event-kind", bytes);
+    let mut bytes = raw_golden.clone();
+    put_raw_u16(&mut bytes, 6, 40, 2);
+    add_rejection("creation-outcome", bytes);
+    let mut bytes = raw_golden.clone();
+    put_raw_u16(&mut bytes, 6, 42, 1);
+    add_rejection("creation-success-errno", bytes);
+    let mut bytes = raw_golden.clone();
+    put_raw_u64(&mut bytes, 5, 40, 4);
+    add_rejection("creation-join-gap", bytes);
+    let mut bytes = raw_golden.clone();
+    put_raw_u64(&mut bytes, 15, 40, 3);
+    add_rejection("vfork-done-child", bytes);
+    let mut bytes = raw_golden.clone();
+    put_raw_u16(&mut bytes, 18, 48, 3);
+    add_rejection("exec-class", bytes);
+    let mut bytes = raw_golden.clone();
+    put_raw_u64(&mut bytes, 18, 32, 0);
+    add_rejection("exec-displaced", bytes);
+    let mut bytes = raw_golden.clone();
+    put_raw_u64(&mut bytes, 18, 40, 2);
+    add_rejection("exec-thread-group", bytes);
+    let mut bytes = raw_golden.clone();
+    put_raw_u32(&mut bytes, 35, 32, 0x7f);
+    put_raw_u32(&mut bytes, 36, 32, 0x7f);
+    add_rejection("terminal-stopped-status", bytes);
+    let mut bytes = raw_golden.clone();
+    put_raw_u32(&mut bytes, 36, 32, 0);
+    add_rejection("terminal-wif-mismatch", bytes);
+    add_rejection(
+        "terminal-missing-wif",
+        raw_golden[..raw_golden.len() - 128].to_vec(),
+    );
+    let mut bytes = raw_golden.clone();
+    let mut extra = record(39, 0x18);
+    put_u64(&mut extra, 24, 4);
+    put_u32(&mut extra, 32, 0);
+    bytes.extend_from_slice(&extra);
+    add_rejection("equation-duplicate-wif", bytes);
+    let mut bytes = raw_golden.clone();
+    put_raw_u16(&mut bytes, 4, 10, 0x19);
+    for byte in &mut bytes[4 * 128 + 24..5 * 128] {
+        *byte = 0;
+    }
+    put_raw_u64(&mut bytes, 4, 24, 1);
+    put_raw_u32(&mut bytes, 4, 32, 1);
+    add_rejection("equation-missing-event", bytes);
+    let mut bytes = raw_golden.clone();
+    put_raw_u64(&mut bytes, 28, 24, 3);
+    add_rejection("equation-fcntl-ordinal", bytes);
+    let mut bytes = raw_golden.clone();
+    put_raw_u64(&mut bytes, 21, 32, 57);
+    add_rejection("equation-cancel-mapping", bytes);
+    let mut bytes = raw_golden.clone();
+    let mut extra = record(39, 0x19);
+    put_u64(&mut extra, 24, 4);
+    put_u32(&mut extra, 32, 9);
+    bytes.extend_from_slice(&extra);
+    add_rejection("equation-post-terminal-reference", bytes);
+    let mut bytes = raw_golden.clone();
+    bytes.extend_from_slice(&record(39, 0x22));
+    add_rejection("envelope-unknown-kind", bytes);
+    let mut bytes = raw_golden.clone();
+    let mut extra = record(39, 0x18);
+    put_u64(&mut extra, 24, 1);
+    put_u32(&mut extra, 32, 0);
+    bytes.extend_from_slice(&extra);
+    add_rejection("equation-superseded-wif", bytes);
+
+    let mut sparse_generation = Vec::new();
+    for bytes in records.iter().take(3) {
+        sparse_generation.extend_from_slice(bytes);
+    }
+    let mut bytes = record(3, 0x20);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 4097);
+    for (index, argument) in fcntl_args(0, 0).into_iter().enumerate() {
+        put_u64(&mut bytes, 40 + index * 8, argument);
+    }
+    sparse_generation.extend_from_slice(&bytes);
+    add_rejection("sparse-generation-bound", sparse_generation);
+    let mut sparse_invocation = Vec::new();
+    for bytes in records.iter().take(3) {
+        sparse_invocation.extend_from_slice(bytes);
+    }
+    let mut bytes = record(3, 0x20);
+    put_u64(&mut bytes, 24, 65_537);
+    put_u64(&mut bytes, 32, 1);
+    for (index, argument) in fcntl_args(0, 0).into_iter().enumerate() {
+        put_u64(&mut bytes, 40 + index * 8, argument);
+    }
+    sparse_invocation.extend_from_slice(&bytes);
+    add_rejection("sparse-invocation-bound", sparse_invocation);
+
+    let serialize_cases = |cases: &[(String, Vec<u8>)]| {
+        cases
+            .iter()
+            .map(|(name, bytes)| format!("{name}\x1f{}", hex(bytes)))
+            .collect::<Vec<_>>()
+            .join("\x1e")
+    };
+    let mut normalizations = Vec::<String>::new();
+    let mut add_norm = |name: &str, command: u64, argument: u64, result: u64, expected: &str| {
+        normalizations.push(format!(
+            "{name}\x1f{command}\x1f{argument}\x1f{result}\x1f{expected}"
+        ));
+    };
+    for (argument, result, expected) in [
+        (0, 0, "zero,equal-floor,none"),
+        (1, 1, "stdio,equal-floor,none"),
+        (2, 3, "stdio,above-floor,none"),
+        (3, 3, "low-3-31,equal-floor,none"),
+        (31, 32, "low-3-31,above-floor,none"),
+        (32, 32, "medium-32-1023,equal-floor,none"),
+        (1023, 1024, "medium-32-1023,above-floor,none"),
+        (1024, 1024, "high-1024-int-max,equal-floor,none"),
+        (
+            2_147_483_647,
+            2_147_483_647,
+            "high-1024-int-max,equal-floor,none",
+        ),
+    ] {
+        add_norm(
+            &format!("dupfd-{argument}-{result}"),
+            0,
+            argument,
+            result,
+            &format!("dupfd,{expected}"),
+        );
+    }
+    add_norm(
+        "dupfd-cloexec-above",
+        1030,
+        32,
+        33,
+        "dupfd-cloexec,medium-32-1023,above-floor,none",
+    );
+    add_norm(
+        "dupfd-argument-over-int-max",
+        0,
+        2_147_483_648,
+        2_147_483_648,
+        "invalid",
+    );
+    add_norm("dupfd-result-over-int-max", 0, 0, 2_147_483_648, "invalid");
+    add_norm("dupfd-result-below-floor", 0, 32, 31, "invalid");
+    add_norm(
+        "dupfd-negative-failure",
+        0,
+        0,
+        u64::MAX - 1,
+        "dupfd,zero,failure,other",
+    );
+    for (command, name) in [(0, "dupfd"), (1030, "dupfd-cloexec")] {
+        add_norm(
+            &format!("{name}-bad-fd"),
+            command,
+            0,
+            u64::MAX - 8,
+            &format!("{name},zero,failure,bad-fd"),
+        );
+        add_norm(
+            &format!("{name}-invalid"),
+            command,
+            0,
+            u64::MAX - 21,
+            &format!("{name},zero,failure,invalid"),
+        );
+    }
+    add_norm("getfd-none", 1, 0, 0, "getfd,none,none,none");
+    add_norm("getfd-cloexec", 1, 0, 1, "getfd,none,cloexec,none");
+    add_norm("getfd-mask-other", 1, 0, 2, "getfd,none,fd-mask-other,none");
+    add_norm(
+        "getfd-failure",
+        1,
+        0,
+        u64::MAX - 8,
+        "getfd,none,failure,bad-fd",
+    );
+    add_norm("setfd-none", 2, 0, 0, "setfd,none,success-zero,none");
+    add_norm("setfd-cloexec", 2, 1, 0, "setfd,cloexec,success-zero,none");
+    add_norm(
+        "setfd-mask-other",
+        2,
+        2,
+        0,
+        "setfd,fd-mask-other,success-zero,none",
+    );
+    add_norm("setfd-nonzero-result", 2, 0, 1, "invalid");
+    for (command, name) in [(3, "getfl"), (4, "setfl")] {
+        add_norm(
+            &format!("{name}-flags"),
+            command,
+            0x800,
+            0,
+            &format!("{name},file-status-flags,success,none"),
+        );
+        add_norm(
+            &format!("{name}-failure"),
+            command,
+            0x800,
+            u64::MAX - 21,
+            &format!("{name},file-status-flags,failure,invalid"),
+        );
+    }
+    for command in [5, 6, 7, 36, 37, 38, 1029] {
+        add_norm(
+            &format!("lock-{command}"),
+            command,
+            0x1234,
+            0,
+            "lock,pointer,success,none",
+        );
+    }
+    for command in [8, 10, 11, 15, 16, 17] {
+        add_norm(
+            &format!("owner-{command}"),
+            command,
+            0x1234,
+            0,
+            "owner-signal,owner-signal,success,none",
+        );
+    }
+    add_norm(
+        "owner-getown-signed",
+        9,
+        0x1234,
+        u64::MAX,
+        "owner-signal,owner-signal,signed-ambiguous,none",
+    );
+    for (command, name) in [(1024, "lease"), (1025, "lease")] {
+        add_norm(
+            &format!("lease-{command}"),
+            command,
+            0x1234,
+            0,
+            &format!("{name},lease,success,none"),
+        );
+    }
+    for (command, name) in [
+        (1026, "notify"),
+        (1031, "pipe"),
+        (1032, "pipe"),
+        (1033, "seal"),
+        (1034, "seal"),
+    ] {
+        add_norm(
+            &format!("{name}-{command}"),
+            command,
+            0x1234,
+            0,
+            &format!("{name},{name},success,none"),
+        );
+    }
+    for command in 1035..=1038 {
+        add_norm(
+            &format!("hint-{command}"),
+            command,
+            0x1234,
+            0,
+            "hint,hint,success,none",
+        );
+    }
+    add_norm(
+        "unknown-success",
+        12,
+        0x1234,
+        0,
+        "unknown,unknown,success,none",
+    );
+    add_norm(
+        "unknown-failure",
+        u64::MAX,
+        0x1234,
+        u64::MAX - 1,
+        "unknown,unknown,failure,other",
+    );
+    for (result, errno) in [
+        (u64::MAX - 8, "bad-fd"),
+        (u64::MAX - 21, "invalid"),
+        (u64::MAX - 23, "process-fd-limit"),
+        (u64::MAX - 22, "system-fd-limit"),
+        (u64::MAX - 3, "interrupted"),
+        (u64::MAX - 12, "contended"),
+        (u64::MAX - 10, "contended"),
+        (u64::MAX - 34, "deadlock"),
+        (u64::MAX - 36, "no-locks"),
+        (u64::MAX - 13, "bad-pointer"),
+        (u64::MAX - 1, "other"),
+        (u64::MAX, "denied"),
+        (u64::MAX - 37, "unsupported"),
+        (u64::MAX - 94, "unsupported"),
+    ] {
+        add_norm(
+            &format!("errno-{errno}-{result}"),
+            12,
+            0x1234,
+            result,
+            &format!("unknown,unknown,failure,{errno}"),
+        );
+    }
+    for result in [
+        u64::MAX - 511,
+        u64::MAX - 512,
+        u64::MAX - 513,
+        u64::MAX - 515,
+    ] {
+        add_norm(&format!("restart-{result}"), 12, 0, result, "invalid");
+    }
+    add_norm("getown-restart", 9, 0, u64::MAX - 511, "invalid");
+    add_norm(
+        "getown-signed-bad-fd",
+        9,
+        0,
+        u64::MAX - 8,
+        "owner-signal,owner-signal,signed-ambiguous,none",
+    );
+    add_norm(
+        "generic-minimum-failure",
+        12,
+        0,
+        u64::MAX - 4094,
+        "unknown,unknown,failure,other",
+    );
+    add_norm("generic-below-minimum", 12, 0, u64::MAX - 4095, "invalid");
+    let normalization_cases = normalizations.join("\x1e");
+
+    let mut aggregate_mutations = vec![
+        (
+            "duplicate-key",
+            expected_json.replace(
+                "{\"authority\":",
+                "{\"authority\":\"non-production-experiment-only\",\"authority\":",
+            ),
+        ),
+        (
+            "forbidden-key",
+            expected_json.replace("\"rows\":", "\"path\":\"/forbidden\",\"rows\":"),
+        ),
+        (
+            "forbidden-token",
+            expected_json.replace("\"file-status-flags\"", "\"forbidden\""),
+        ),
+        (
+            "order",
+            format!(
+                "{{\"rows\":{},\"authority\":\"non-production-experiment-only\",\"schema\":\"bs2b-s9-fcntl-experiment-aggregate-v1\",\"trace_v1_input\":false}}\n",
+                &expected_json[expected_json.find("\"rows\":").unwrap() + "\"rows\":".len()
+                    ..expected_json.find(",\"schema\":").unwrap()]
+            ),
+        ),
+        (
+            "whitespace",
+            expected_json.replace(",\"rows\":", ", \"rows\":"),
+        ),
+        (
+            "missing-final-lf",
+            expected_json.trim_end_matches('\n').to_owned(),
+        ),
+        ("extra-final-lf", format!("{expected_json}\n")),
+        (
+            "count-type",
+            expected_json.replacen("\"count\":1", "\"count\":true", 1),
+        ),
+    ];
+    let duplicate_row_json = expected_json.replacen(
+        "{\"argument\":\"none\"",
+        "{\"argument\":\"zero\",\"command\":\"dupfd\",\"count\":1,\"errno\":\"none\",\"result\":\"equal-floor\"},{\"argument\":\"none\"",
+        1,
+    );
+    aggregate_mutations.push(("duplicate-row", duplicate_row_json));
+    let aggregate_cases = aggregate_mutations
+        .iter()
+        .map(|(name, json)| format!("{name}\x1f{json}"))
+        .collect::<Vec<_>>()
+        .join("\x1e");
+
+    let driver = r#"
+import contextlib
+import hashlib
+import importlib.util
+import io
+import json
+import os
+import sys
+import tempfile
+
+spec = importlib.util.spec_from_file_location("task4_s9_fcntl_experiment", sys.argv[1])
+if spec is None or spec.loader is None:
+    raise SystemExit("could not import task4 fcntl experiment")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+if any(callable(getattr(module, name, None)) for name in ("run", "produce", "capture")):
+    raise SystemExit("experiment exposed a production callable")
+
+def fail(label, message):
+    raise SystemExit(f"{label}: {message}")
+
+def expect_invalid(label, invoke):
+    try:
+        invoke()
+    except module.ContractError as exc:
+        if type(exc) is not module.ContractError or exc.code != "invalid" or str(exc) != "invalid":
+            fail(label, f"wrong ContractError {type(exc).__name__}: {exc}")
+    else:
+        fail(label, "accepted invalid input")
+
+def with_raw(raw, invoke):
+    fd, path = tempfile.mkstemp(prefix="task4-s9-", dir=os.environ.get("TMPDIR"))
+    try:
+        os.fchmod(fd, 0o600)
+        os.ftruncate(fd, len(raw))
+        if raw and os.pwrite(fd, raw, 0) != len(raw):
+            fail("raw fixture", "short fixture write")
+        os.lseek(fd, 7, os.SEEK_SET)
+        return invoke(fd)
+    finally:
+        os.close(fd)
+        os.unlink(path)
+
+expected_bytes = os.environ["TASK4_EXPECTED_JSON"].encode("ascii")
+expected = json.loads(expected_bytes)
+expected_rows = {
+    (row["command"], row["argument"], row["result"], row["errno"]): row["count"]
+    for row in expected["rows"]
+}
+if module._encode_aggregate({}) != os.environ["TASK4_EMPTY_JSON"].encode("ascii"):
+    fail("empty aggregate", "canonical empty bytes differ")
+module._privacy_scan_aggregate(os.environ["TASK4_EMPTY_JSON"].encode("ascii"))
+golden = bytes.fromhex(os.environ["TASK4_RAW_GOLDEN"])
+
+def parse_golden(fd):
+    before = os.lseek(fd, 0, os.SEEK_CUR)
+    rows = module._parse_raw(fd)
+    if rows != expected_rows:
+        fail("all-kinds golden", f"rows differ: {rows!r}")
+    if os.lseek(fd, 0, os.SEEK_CUR) != before:
+        fail("all-kinds golden", "raw offset changed")
+
+with_raw(golden, parse_golden)
+if module._encode_aggregate(expected_rows) != expected_bytes:
+    fail("all-kinds golden", "canonical bytes differ")
+module._privacy_scan_aggregate(expected_bytes)
+
+duplicate_raw = bytes.fromhex(os.environ["TASK4_DUPLICATE_RAW"])
+duplicate_expected = json.loads(os.environ["TASK4_DUPLICATE_JSON"])
+duplicate_rows = {
+    (row["command"], row["argument"], row["result"], row["errno"]): row["count"]
+    for row in duplicate_expected["rows"]
+}
+def parse_duplicate(fd):
+    if module._parse_raw(fd) != duplicate_rows:
+        fail("duplicate raw", "rows did not merge")
+with_raw(duplicate_raw, parse_duplicate)
+
+for item in filter(None, os.environ["TASK4_RAW_CASES"].split("\x1e")):
+    label, encoded = item.split("\x1f", 1)
+    expect_invalid(label, lambda encoded=encoded: with_raw(bytes.fromhex(encoded), module._parse_raw))
+
+fd, path = tempfile.mkstemp(prefix="task4-s9-cap-", dir=os.environ.get("TMPDIR"))
+try:
+    os.fchmod(fd, 0o600)
+    os.ftruncate(fd, 128 * 1024 * 1024 + 128)
+    real_pread = os.pread
+    def pread_bomb(*args):
+        fail("raw cap", "pread happened before cap rejection")
+    os.pread = pread_bomb
+    expect_invalid("raw-cap-plus-one", lambda: module._parse_raw(fd))
+    os.pread = real_pread
+finally:
+    os.close(fd)
+    os.unlink(path)
+
+for item in os.environ["TASK4_NORMALIZATION_CASES"].split("\x1e"):
+    label, command, argument, result, wanted = item.split("\x1f")
+    values = (int(command), int(argument), int(result))
+    if wanted == "invalid":
+        expect_invalid(label, lambda values=values: module._normalize(*values))
+    else:
+        try:
+            actual = module._normalize(*values)
+        except BaseException as exc:
+            fail(label, f"unexpected exception {type(exc).__name__}: {exc}")
+        if actual != tuple(wanted.split(",")):
+            fail(label, f"expected {wanted!r}, got {actual!r}")
+
+class IntSubclass(int):
+    pass
+
+for label, values in (
+    ("normalize-bool-command", (True, 0, 0)),
+    ("normalize-int-subclass", (IntSubclass(0), 0, 0)),
+    ("normalize-bool-argument", (0, True, 0)),
+    ("normalize-int-subclass-argument", (0, IntSubclass(0), 0)),
+    ("normalize-float-argument", (0, 0.0, 0)),
+    ("normalize-negative-argument", (0, -1, 0)),
+    ("normalize-overflow-argument", (0, 2**64, 0)),
+    ("normalize-float", (0.0, 0, 0)),
+    ("normalize-negative-command", (-1, 0, 0)),
+    ("normalize-overflow-command", (2**64, 0, 0)),
+    ("normalize-bool-result", (0, 0, True)),
+    ("normalize-int-subclass-result", (0, 0, IntSubclass(0))),
+    ("normalize-float-result", (0, 0, 0.0)),
+    ("normalize-negative-result", (0, 0, -1)),
+    ("normalize-overflow-result", (0, 0, 2**64)),
+):
+    expect_invalid(label, lambda values=values: module._normalize(*values))
+
+for item in os.environ["TASK4_AGGREGATE_CASES"].split("\x1e"):
+    label, encoded = item.split("\x1f", 1)
+    expect_invalid(label, lambda encoded=encoded: module._privacy_scan_aggregate(encoded.encode("ascii")))
+expect_invalid(
+    "aggregate-count-sum",
+    lambda: module._encode_aggregate({
+        ("dupfd", "zero", "equal-floor", "none"): 65536,
+        ("getfd", "none", "none", "none"): 1,
+    }),
+)
+expect_invalid(
+    "aggregate-count-zero",
+    lambda: module._encode_aggregate({("dupfd", "zero", "equal-floor", "none"): 0}),
+)
+expect_invalid("aggregate-cap", lambda: module._privacy_scan_aggregate(b"x" * (1 << 20) + b"x"))
+
+def invoke_main(argv):
+    out = io.StringIO()
+    err = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = module.main(argv)
+    return code, out.getvalue(), err.getvalue()
+
+code, out, err = invoke_main(["self-test"])
+if code != 0 or out != "bs2b-s9-fcntl-experiment-self-test-ok\n" or err:
+    fail("self-test", f"unexpected result {code!r}, {out!r}, {err!r}")
+for argv in ([], ["produce"], ["capture"], ["check"], ["--help"], ["unknown"]):
+    code, out, err = invoke_main(argv)
+    if code != 77 or out or err:
+        fail("refusal-" + "-".join(argv or ["empty"]), f"unexpected result {code!r}, {out!r}, {err!r}")
+
+held_case = os.environ.get("TASK4_HELD_CASE")
+if held_case is None:
+    print("bs2b-s9-fcntl-experiment-normalization-privacy-ok")
+    raise SystemExit(0)
+
+def held_invalid(label):
+    before = os.pread(1, 1 << 20, 0)
+    try:
+        module._check_raw(0, 1)
+    except module.ContractError as exc:
+        if type(exc) is not module.ContractError or exc.code != "invalid" or str(exc) != "invalid":
+            fail(label, f"wrong error {type(exc).__name__}: {exc}")
+    else:
+        fail(label, "accepted invalid held-FD input")
+    after = os.pread(1, 1 << 20, 0)
+    if after != before:
+        fail(label, "pre-write rejection changed output")
+    if os.fstat(1).st_size != 0 and held_case not in ("alias", "link"):
+        fail(label, "pre-write rejection left output bytes")
+
+if held_case in ("alias", "kind", "mode", "link", "uid", "pre-invalid"):
+    if held_case == "uid":
+        real_fstat = os.fstat
+        called = [False]
+        def wrong_uid(fd):
+            if fd == 0 and not called[0]:
+                called[0] = True
+                stat_result = real_fstat(fd)
+                values = list(stat_result)
+                values[4] = os.geteuid() + 1
+                return os.stat_result(values)
+            return real_fstat(fd)
+        os.fstat = wrong_uid
+        try:
+            held_invalid("held-wrong-uid")
+        finally:
+            os.fstat = real_fstat
+        if not called[0]:
+            fail("held-wrong-uid", "metadata shim was not used")
+    else:
+        held_invalid("held-" + held_case)
+    raise SystemExit(64)
+elif held_case == "changed-during-read":
+    raw_before = os.pread(0, 1 << 20, 0)
+    real_pread = os.pread
+    calls = [0]
+    def changing_pread(fd, size, offset):
+        data = real_pread(fd, size, offset)
+        if fd == 0 and calls[0] == 0:
+            calls[0] = 1
+            os.fchmod(fd, 0o644)
+        return data
+    os.pread = changing_pread
+    try:
+        try:
+            module._check_raw(0, 1)
+        except module.ContractError as exc:
+            if type(exc) is not module.ContractError or exc.code != "invalid" or str(exc) != "invalid":
+                fail("held-changed-during-read", f"wrong error {type(exc).__name__}: {exc}")
+        else:
+            fail("held-changed-during-read", "metadata mutation was accepted")
+    finally:
+        os.pread = real_pread
+    if calls[0] != 1:
+        fail("held-changed-during-read", "raw-read shim did not run")
+    if os.pread(0, 1 << 20, 0) != raw_before:
+        fail("held-changed-during-read", "raw bytes changed")
+    if os.fstat(1).st_size != 0:
+        fail("held-changed-during-read", "changed input left output bytes")
+    raise SystemExit(64)
+elif held_case == "offset":
+    os.lseek(0, 19, os.SEEK_SET)
+    os.lseek(1, 7, os.SEEK_SET)
+    digest = module._check_raw(0, 1)
+    if digest != hashlib.sha256(expected_bytes).hexdigest():
+        fail("held-offset", "digest mismatch")
+    if os.lseek(0, 0, os.SEEK_CUR) != 19 or os.lseek(1, 0, os.SEEK_CUR) != 7:
+        fail("held-offset", "caller offsets changed")
+elif held_case == "taint":
+    real_pwrite = os.pwrite
+    calls = []
+    def short_pwrite(fd, data, offset):
+        prefix = data[:max(1, len(data) // 2)]
+        written = real_pwrite(fd, prefix, offset)
+        calls.append((fd, len(data), written))
+        return written
+    os.pwrite = short_pwrite
+    try:
+        try:
+            module._check_raw(0, 1)
+        except module.ContractError as exc:
+            if type(exc) is not module.ContractError or exc.code != "tainted-output" or str(exc) != "tainted-output":
+                fail("held-taint", f"wrong error {type(exc).__name__}: {exc}")
+        else:
+            fail("held-taint", "short write was accepted")
+    finally:
+        os.pwrite = real_pwrite
+    if len(calls) != 1 or calls[0][0] != 1 or calls[0][2] <= 0 or calls[0][2] >= calls[0][1]:
+        fail("held-taint", f"unexpected pwrite calls {calls!r}")
+    if os.fstat(1).st_size == 0:
+        fail("held-taint", "tainted output was empty")
+    raise SystemExit(65)
+elif held_case == "success":
+    digest = module._check_raw(0, 1)
+    if digest != hashlib.sha256(expected_bytes).hexdigest():
+        fail("held-success", "digest mismatch")
+    if os.pread(1, 1 << 20, 0) != expected_bytes:
+        fail("held-success", "readback bytes differ")
+else:
+    fail("held", "unknown held case")
+raise SystemExit(0)
+"#;
+
+    for chunk in raw_rejections.chunks(6) {
+        let output = Command::new("/usr/bin/python3")
+            .args(["-c", driver, script.to_str().expect("script path is UTF-8")])
+            .current_dir(repo)
+            .env_clear()
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("TASK4_RAW_GOLDEN", hex(&raw_golden))
+            .env("TASK4_EMPTY_JSON", empty_json)
+            .env("TASK4_EXPECTED_JSON", expected_json)
+            .env("TASK4_DUPLICATE_RAW", hex(&duplicate_raw))
+            .env("TASK4_DUPLICATE_JSON", duplicate_json)
+            .env("TASK4_RAW_CASES", serialize_cases(chunk))
+            .env("TASK4_NORMALIZATION_CASES", &normalization_cases)
+            .env("TASK4_AGGREGATE_CASES", &aggregate_cases)
+            .output()
+            .expect("run BS2b-S9 normalization/privacy contract");
+        assert!(
+            output.status.success(),
+            "BS2b-S9 normalization/privacy contract failed:\nstdout={:?}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "BS2b-S9 base driver wrote to stderr"
+        );
+        assert_eq!(
+            output.stdout,
+            b"bs2b-s9-fcntl-experiment-normalization-privacy-ok\n"
+        );
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after epoch")
+        .as_nanos();
+    let temp_root = std::env::temp_dir().join(format!(
+        "pkcs11-scope-bs2b-s9-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&temp_root).expect("create BS2b-S9 temporary directory");
+    fs::set_permissions(&temp_root, fs::Permissions::from_mode(0o700))
+        .expect("set BS2b-S9 temporary directory mode");
+    let create_regular = |name: &str, contents: &[u8]| {
+        let path = temp_root.join(name);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create BS2b-S9 regular fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("set BS2b-S9 regular fixture mode");
+        std::io::Write::write_all(&mut file, contents).expect("write BS2b-S9 regular fixture");
+        file.sync_all().expect("sync BS2b-S9 regular fixture");
+        file.seek(SeekFrom::Start(0))
+            .expect("rewind BS2b-S9 regular fixture");
+        (path, file)
+    };
+    let run_held = |case: &str, expected_status: i32, raw: std::fs::File, output: std::fs::File| {
+        let child = Command::new("/usr/bin/python3")
+            .args(["-c", driver, script.to_str().expect("script path is UTF-8")])
+            .current_dir(repo)
+            .env_clear()
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("TASK4_RAW_GOLDEN", hex(&raw_golden))
+            .env("TASK4_EMPTY_JSON", empty_json)
+            .env("TASK4_EXPECTED_JSON", expected_json)
+            .env("TASK4_DUPLICATE_RAW", hex(&duplicate_raw))
+            .env("TASK4_DUPLICATE_JSON", duplicate_json)
+            .env("TASK4_RAW_CASES", "")
+            .env("TASK4_NORMALIZATION_CASES", &normalization_cases)
+            .env("TASK4_AGGREGATE_CASES", &aggregate_cases)
+            .env("TASK4_HELD_CASE", case)
+            .stdin(Stdio::from(raw))
+            .stdout(Stdio::from(output))
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn BS2b-S9 held-FD contract");
+        let result = child
+            .wait_with_output()
+            .expect("wait for BS2b-S9 held-FD contract");
+        assert_eq!(
+            result.status.code(),
+            Some(expected_status),
+            "BS2b-S9 held-FD {case} returned unexpected status: stderr={:?}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            result.stderr.is_empty(),
+            "BS2b-S9 held-FD {case} wrote to stderr"
+        );
+    };
+    let assert_regular = |path: &Path| {
+        let metadata = fs::symlink_metadata(path).expect("read BS2b-S9 output metadata");
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+    };
+
+    let (raw_path, raw_file) = create_regular("success-raw", &raw_golden);
+    let (output_path, output_file) = create_regular("success-output", &[]);
+    run_held("success", 0, raw_file, output_file);
+    assert_regular(&output_path);
+    assert_eq!(
+        fs::read(&output_path).expect("read successful aggregate"),
+        expected_json.as_bytes()
+    );
+    fs::remove_file(raw_path).expect("remove successful raw fixture");
+    fs::remove_file(output_path).expect("remove successful output fixture");
+
+    let (raw_path, raw_file) = create_regular("offset-raw", &raw_golden);
+    let (output_path, output_file) = create_regular("offset-output", &[]);
+    let mut raw_probe = raw_file.try_clone().expect("clone offset raw probe");
+    let mut output_probe = output_file.try_clone().expect("clone offset output probe");
+    run_held("offset", 0, raw_file, output_file);
+    assert_eq!(
+        raw_probe
+            .seek(SeekFrom::Current(0))
+            .expect("seek offset raw probe"),
+        19
+    );
+    assert_eq!(
+        output_probe
+            .seek(SeekFrom::Current(0))
+            .expect("seek offset output probe"),
+        7
+    );
+    assert_regular(&output_path);
+    assert_eq!(
+        fs::read(&output_path).expect("read offset aggregate"),
+        expected_json.as_bytes()
+    );
+    fs::remove_file(raw_path).expect("remove offset raw fixture");
+    fs::remove_file(output_path).expect("remove offset output fixture");
+
+    let (raw_path, raw_file) = create_regular("taint-raw", &raw_golden);
+    let (output_path, output_file) = create_regular("taint-output", &[]);
+    run_held("taint", 65, raw_file, output_file);
+    assert_regular(&output_path);
+    assert!(
+        fs::metadata(&output_path)
+            .expect("stat tainted output")
+            .len()
+            > 0
+    );
+    fs::remove_file(raw_path).expect("remove taint raw fixture");
+    fs::remove_file(output_path).expect("remove taint output fixture");
+
+    let (raw_path, raw_file) = create_regular("invalid-raw", &raw_golden[..raw_golden.len() - 128]);
+    let (output_path, output_file) = create_regular("invalid-output", &[]);
+    run_held("pre-invalid", 64, raw_file, output_file);
+    assert_regular(&output_path);
+    assert!(
+        fs::read(&output_path)
+            .expect("read invalid output")
+            .is_empty()
+    );
+    fs::remove_file(raw_path).expect("remove invalid raw fixture");
+    fs::remove_file(output_path).expect("remove invalid output fixture");
+
+    let (raw_path, raw_file) = create_regular("changed-raw", &raw_golden);
+    let (output_path, output_file) = create_regular("changed-output", &[]);
+    run_held("changed-during-read", 64, raw_file, output_file);
+    assert_eq!(
+        fs::read(&raw_path).expect("read changed raw fixture"),
+        raw_golden
+    );
+    assert_regular(&output_path);
+    assert!(
+        fs::read(&output_path)
+            .expect("read changed output")
+            .is_empty()
+    );
+    fs::remove_file(raw_path).expect("remove changed raw fixture");
+    fs::remove_file(output_path).expect("remove changed output fixture");
+
+    let (raw_path, raw_file) = create_regular("mode-raw", &raw_golden);
+    fs::set_permissions(&raw_path, fs::Permissions::from_mode(0o644))
+        .expect("set wrong BS2b-S9 raw mode");
+    let (output_path, output_file) = create_regular("mode-output", &[]);
+    run_held("mode", 64, raw_file, output_file);
+    assert_regular(&output_path);
+    assert!(fs::read(&output_path).expect("read mode output").is_empty());
+    fs::remove_file(raw_path).expect("remove mode raw fixture");
+    fs::remove_file(output_path).expect("remove mode output fixture");
+
+    let (raw_path, raw_file) = create_regular("link-raw", &raw_golden);
+    let link_path = temp_root.join("link-alias");
+    fs::hard_link(&raw_path, &link_path).expect("create BS2b-S9 hard link");
+    let (output_path, output_file) = create_regular("link-output", &[]);
+    run_held("link", 64, raw_file, output_file);
+    assert_eq!(
+        fs::read(&raw_path).expect("read linked raw fixture"),
+        raw_golden
+    );
+    fs::remove_file(raw_path).expect("remove link raw fixture");
+    fs::remove_file(link_path).expect("remove link raw hard link");
+    assert_regular(&output_path);
+    assert!(fs::read(&output_path).expect("read link output").is_empty());
+    fs::remove_file(output_path).expect("remove link output fixture");
+
+    let (raw_path, raw_file) = create_regular("alias-raw", &raw_golden);
+    let alias_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&raw_path)
+        .expect("open BS2b-S9 alias raw fixture");
+    run_held("alias", 64, raw_file, alias_file);
+    assert_eq!(
+        fs::read(&raw_path).expect("read alias raw fixture"),
+        raw_golden
+    );
+    fs::remove_file(raw_path).expect("remove alias raw fixture");
+
+    let kind_path = temp_root.join("kind-raw");
+    fs::create_dir(&kind_path).expect("create BS2b-S9 directory raw fixture");
+    fs::set_permissions(&kind_path, fs::Permissions::from_mode(0o700))
+        .expect("set BS2b-S9 directory raw mode");
+    let raw_file = std::fs::File::open(&kind_path).expect("open BS2b-S9 directory raw fixture");
+    fs::set_permissions(&kind_path, fs::Permissions::from_mode(0o600))
+        .expect("set accessible BS2b-S9 directory mode");
+    let (output_path, output_file) = create_regular("kind-output", &[]);
+    run_held("kind", 64, raw_file, output_file);
+    assert_regular(&output_path);
+    assert!(fs::read(&output_path).expect("read kind output").is_empty());
+    fs::remove_dir(&kind_path).expect("remove kind raw fixture");
+    fs::remove_file(output_path).expect("remove kind output fixture");
+
+    let (raw_path, raw_file) = create_regular("uid-raw", &raw_golden);
+    let (output_path, output_file) = create_regular("uid-output", &[]);
+    run_held("uid", 64, raw_file, output_file);
+    assert_regular(&output_path);
+    assert!(fs::read(&output_path).expect("read uid output").is_empty());
+    fs::remove_file(raw_path).expect("remove uid raw fixture");
+    fs::remove_file(output_path).expect("remove uid output fixture");
+
+    assert!(
+        fs::read_dir(&temp_root)
+            .expect("read BS2b-S9 temporary directory")
+            .next()
+            .is_none()
+    );
+    fs::remove_dir(&temp_root).expect("remove BS2b-S9 temporary directory");
 }

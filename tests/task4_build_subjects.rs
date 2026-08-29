@@ -14294,6 +14294,24 @@ print("bs2b-s9-native-ptrace-lifecycle-ok")
                 "RED2 simulated clone lifecycle order changed"
             );
         }
+        if case == "sim-stop-first" {
+            let find = |kind, ordinal| {
+                bytes.chunks_exact(128).position(|record| {
+                    u16::from_le_bytes(record[10..12].try_into().unwrap()) == kind
+                        && u64::from_le_bytes(record[24..32].try_into().unwrap()) == ordinal
+                })
+            };
+            for ordinal in [1, 2] {
+                let entry = find(CREATE_ENTRY, ordinal).expect("RED2 creation entry missing");
+                let event = find(CREATE_EVENT, ordinal).expect("RED2 creation event missing");
+                let join = find(CHILD_JOIN, ordinal).expect("RED2 creation join missing");
+                let exit = find(CREATE_EXIT, ordinal).expect("RED2 creation result missing");
+                assert!(
+                    entry < event && event < join && join < exit,
+                    "RED2 simulated stop-first creation lifecycle order changed"
+                );
+            }
+        }
         fs::remove_file(path).expect("remove RED2 raw evidence");
     }
     fs::remove_dir(&evidence).expect("remove RED2 evidence directory");

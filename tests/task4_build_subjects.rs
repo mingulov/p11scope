@@ -1327,6 +1327,9 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 if operation_variant == "exception":
                     state["events"].append(f"{operation}-exception")
                     raise OSError(errno.EIO, "stage2 injected fcntl failure")
+                if operation_variant == "KeyboardInterrupt":
+                    state["events"].append(f"{operation}-KeyboardInterrupt")
+                    raise KeyboardInterrupt()
                 if operation_variant == "status-mismatch":
                     state["events"].append(f"{operation}-status-mismatch")
                     return (value & ~os.O_ACCMODE) | os.O_WRONLY if operation.startswith("P-") or operation.startswith("borrowed-P-") else value | os.O_NONBLOCK
@@ -1578,12 +1581,55 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             )
         run_case(
             label,
-            SystemExit if expected[-1] == "SystemExit(77)" else module.MutationError,
+            KeyboardInterrupt
+            if expected[-1] == "KeyboardInterrupt"
+            else SystemExit
+            if expected[-1] == "SystemExit(77)"
+            else module.MutationError,
             patches=tuple(patches),
             borrowed=base_borrowed,
             postcheck=check_trace,
             custody=check_custody,
         )
+
+    for variant in ("exception", "status-mismatch"):
+        run_stage2_case(
+            f"stage2-usable-private-borrowed-L-getfl-{variant}",
+            [
+                "dup-L",
+                "open-P",
+                "L-getfl",
+                "L-getfd",
+                "L-fstat-pre",
+                "L-pread-complete",
+                "L-fstat-post",
+                "P-getfl",
+                "P-getfd",
+                "P-fstat",
+                f"borrowed-L-getfl-{variant}",
+                "borrowed-L-fstat",
+                "borrowed-P-getfl",
+                "borrowed-P-getfd",
+                "borrowed-P-fstat",
+                "close-P",
+                "close-L",
+                "MutationError",
+            ],
+            failure=("borrowed-L-getfl", variant),
+        )
+
+    run_stage2_case(
+        "stage2-private-ledger-getfl-keyboardinterrupt",
+        [
+            "dup-L",
+            "open-P",
+            "L-getfl-KeyboardInterrupt",
+            "close-P",
+            "close-L",
+            "KeyboardInterrupt",
+        ],
+        failure=("L-getfl", "KeyboardInterrupt"),
+    )
 
     validation_variants = (
         ("L-getfl", ("exception", "status-mismatch")),

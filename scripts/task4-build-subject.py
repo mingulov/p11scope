@@ -55,7 +55,7 @@ class _SemanticTraceState:
         if type(operation) is not tuple or len(operation) != 3:
             raise FormatError("invalid pending syscall")
         name, category, arguments = operation
-        if type(name) is not str or name not in {"dup", "dup2"}:
+        if type(name) is not str or name not in {"close", "dup", "dup2"}:
             raise FormatError("invalid pending syscall")
         if type(category) is not str or category != "fd":
             raise FormatError("invalid pending syscall")

@@ -10490,6 +10490,16 @@ def assert_owner(label, state, table, tid, pending):
 def freeze(value):
     value_type = type(value)
     type_tag = (value_type.__module__, value_type.__qualname__)
+    if value_type is module._OpenDescription:
+        return (
+            "open-description",
+            type_tag,
+            id(value),
+            freeze(value.kind),
+            freeze(value.access),
+            freeze(value.offset),
+            freeze(value.identity),
+        )
     if value_type in (type(None), bool, int, float, str, bytes):
         return ("scalar", type_tag, value)
     if value_type is tuple:
@@ -10705,7 +10715,442 @@ for label, bad_pending in (
     exercise_stored_malformed_close(label, bad_pending)
 
 
-print("bs2b-semantic-close-admission-ok")
+def assert_receipt(label, receipt, pending, result, errno):
+    if type(receipt) is not tuple or len(receipt) != 3:
+        raise SystemExit(f"{label}: malformed semantic receipt")
+    if receipt[0] is not pending or type(receipt[1]) is not int or receipt[1] != result:
+        raise SystemExit(f"{label}: receipt lost pending/result identity")
+    if receipt[2] is not errno:
+        raise SystemExit(f"{label}: receipt errno mismatch")
+
+
+def fd_table_snapshot(table):
+    return (
+        table,
+        tuple(table),
+        tuple(
+            (fd, entry, entry[0], entry[1], freeze(entry[0]))
+            for fd, entry in table.items()
+        ),
+    )
+
+
+def assert_fd_delta(label, before, after, removed_fd=None):
+    before_table, before_keys, before_rows = before
+    after_table, after_keys, after_rows = after
+    if after_table is not before_table:
+        raise SystemExit(f"{label}: FD table container identity changed")
+    expected_keys = (
+        tuple(fd for fd in before_keys if fd != removed_fd)
+        if removed_fd is not None
+        else before_keys
+    )
+    if after_keys != expected_keys:
+        raise SystemExit(f"{label}: FD table keys changed beyond the target")
+    expected_rows = (
+        tuple(row for row in before_rows if row[0] != removed_fd)
+        if removed_fd is not None
+        else before_rows
+    )
+    if len(after_rows) != len(expected_rows):
+        raise SystemExit(f"{label}: FD table entry count changed beyond the target")
+    for expected, actual in zip(expected_rows, after_rows):
+        if (
+            expected[0] != actual[0]
+            or expected[1] is not actual[1]
+            or expected[2] is not actual[2]
+            or expected[3] is not actual[3]
+            or expected[4] != actual[4]
+        ):
+            raise SystemExit(f"{label}: non-target FD entry/description changed")
+    if removed_fd is not None and (
+        removed_fd not in before_keys or removed_fd in after_keys
+    ):
+        raise SystemExit(f"{label}: target FD deletion was not exact")
+
+
+# S8b RED discriminator: this is the first close-terminal call.  The exact
+# admission above is real; the current baseline must fail only because the
+# terminal method has not been added.  Keep this call before every S8b helper.
+state = seed_state()
+pending = arm(state, close_operation(5))
+table = state._task(100)["fds"]
+if state.try_admit_fd_table_mutator(tid=100) is not True:
+    raise SystemExit("first close-terminal admission did not return True")
+assert_owner("first close-terminal admission", state, table, 100, pending)
+before_fds = fd_table_snapshot(table)
+receipt = state.finish_close_syscall(tid=100, result=0, errno=None)
+assert_receipt("first close-terminal success", receipt, pending, 0, None)
+assert_fd_delta("first close-terminal success", before_fds, fd_table_snapshot(table), 5)
+if 5 in table or 100 in state._pending or state._fd_table_mutators:
+    raise SystemExit("first close-terminal success did not delete the present FD")
+
+
+def admit_close(operation=None, tid=100):
+    state = seed_state()
+    operation = close_operation() if operation is None else operation
+    pending = arm(state, operation, tid=tid)
+    table = state._task(tid)["fds"]
+    if state.try_admit_fd_table_mutator(tid=tid) is not True:
+        raise SystemExit("close-terminal admission failed")
+    assert_owner("close-terminal admission", state, table, tid, pending)
+    return state, pending, table
+
+
+def finish_valid_close(label, state, pending, table, fd, result, errno, delete_fd=True):
+    before_fds = fd_table_snapshot(table)
+    receipt = state.finish_close_syscall(tid=100, result=result, errno=errno)
+    assert_receipt(label, receipt, pending, result, errno)
+    assert_fd_delta(
+        label,
+        before_fds,
+        fd_table_snapshot(table),
+        fd if delete_fd else None,
+    )
+    if 100 in state._pending or state._fd_table_mutators:
+        raise SystemExit(f"{label}: pending/owner cleanup was incomplete")
+    return receipt
+
+
+# A successful close and every known post-close failure consume a present FD;
+# EBADF is the sole accepted absent-FD result and leaves the table unchanged.
+for errno in (None, 4, 5, 28, 122):
+    result = 0 if errno is None else -1
+    state, pending, table = admit_close()
+    finish_valid_close(
+        f"present close result={result} errno={errno}",
+        state,
+        pending,
+        table,
+        5,
+        result,
+        errno,
+    )
+
+state = seed_state()
+table = state._task(100)["fds"]
+state.close(tid=100, fd=5)
+if 5 in table:
+    raise SystemExit("EBADF setup did not remove the target FD")
+pending = arm(state, close_operation())
+if state.try_admit_fd_table_mutator(tid=100) is not True:
+    raise SystemExit("absent close EBADF admission failed")
+finish_valid_close("absent close EBADF", state, pending, table, 5, -1, 9, False)
+
+
+def expect_invalid_close(label, result, errno, fd=5, present=True):
+    state = seed_state()
+    table = state._task(100)["fds"]
+    if not present and fd in table:
+        state.close(tid=100, fd=fd)
+    pending = arm(state, close_operation(fd))
+    if state.try_admit_fd_table_mutator(tid=100) is not True:
+        raise SystemExit(f"{label}: setup admission failed")
+    expect_format(
+        label,
+        state,
+        lambda: state.finish_close_syscall(tid=100, result=result, errno=errno),
+    )
+
+
+# Presence/errno inverses are rejected, including all post-close errors on an
+# absent FD.  The same cases also cover an unknown FD rather than inventing a
+# second terminal grammar.
+expect_invalid_close("present EBADF inverse", -1, 9)
+expect_invalid_close("absent success inverse", 0, None, present=False)
+expect_invalid_close("unknown FD success", 0, None, fd=99, present=False)
+for errno in (4, 5, 28, 122):
+    expect_invalid_close(f"absent post-close errno {errno}", -1, errno, present=False)
+
+
+# Exact result/errno types and values are closed.  Bool, subclasses, floats,
+# unknown results, and restart-shaped pairs all retain the complete snapshot.
+for label, result, errno in (
+    ("result bool", True, None),
+    ("result false", False, None),
+    ("result int subclass", IntSubclass(0), None),
+    ("result float", 0.0, None),
+    ("result None", None, None),
+    ("result string", "0", None),
+    ("success errno bool", 0, False),
+    ("success errno int", 0, 0),
+    ("success errno int subclass", 0, IntSubclass(9)),
+    ("success errno float", 0, 0.0),
+    ("success errno string", 0, "0"),
+    ("failure result zero", 0, 9),
+    ("failure result int subclass", IntSubclass(-1), 4),
+    ("failure result float", -1.0, 4),
+    ("failure result None", None, 4),
+    ("failure errno None", -1, None),
+    ("failure errno bool", -1, True),
+    ("failure errno int subclass", -1, IntSubclass(4)),
+    ("failure errno float", -1, 4.0),
+    ("failure errno string", -1, "4"),
+    ("failure unknown errno", -1, 1),
+    ("failure wrong errno", -1, 6),
+    ("unknown positive result", 1, None),
+    ("unknown negative result", -2, None),
+    ("restart EINTR pair", -512, 4),
+    ("restart no-errno pair", -512, None),
+    ("restart alternate pair", -513, 4),
+):
+    expect_invalid_close(label, result, errno)
+
+
+# A pending close without an owner is not terminally admissible and is left
+# byte-for-byte and identity-for-identity unchanged.
+state = seed_state()
+pending = arm(state, close_operation())
+expect_format(
+    "close terminal without owner",
+    state,
+    lambda: state.finish_close_syscall(tid=100, result=0, errno=None),
+)
+if state._pending[100] is not pending or state._fd_table_mutators:
+    raise SystemExit("close terminal without owner changed pending/owner state")
+
+
+# Shared-table aliases observe deletion; an equal-content copied table does
+# not.  Unrelated pending objects remain the same objects after cleanup.
+state = seed_state()
+root_table = state._task(100)["fds"]
+shared_table = state._task(101)["fds"]
+copied_table = state._task(102)["fds"]
+copied_entry = copied_table[5]
+root_pending = arm(state, close_operation(), tid=100)
+shared_pending = arm(state, close_operation(), tid=101)
+copied_pending = arm(state, close_operation(), tid=102)
+if shared_table is not root_table or copied_table is root_table or copied_table != root_table:
+    raise SystemExit("close table topology setup was wrong")
+if state.try_admit_fd_table_mutator(tid=100) is not True:
+    raise SystemExit("shared/copy close admission failed")
+finish_valid_close("shared/copy close", state, root_pending, root_table, 5, 0, None)
+if 5 in shared_table:
+    raise SystemExit("shared FD table did not observe close deletion")
+if copied_table.get(5) is not copied_entry:
+    raise SystemExit("copied FD table changed during shared close")
+if state._pending.get(101) is not shared_pending or state._pending.get(102) is not copied_pending:
+    raise SystemExit("shared/copy unrelated pending identity changed")
+
+
+# Closing one alias preserves the other alias's exact description and entry.
+state = seed_state()
+table = state._task(100)["fds"]
+state.dup2(tid=100, source_fd=5, target_fd=7)
+source_description = table[5][0]
+alias_entry = table[7]
+alias_description = alias_entry[0]
+if alias_description is not source_description or alias_entry[1] is not False:
+    raise SystemExit("close alias setup lost exact description")
+pending = arm(state, close_operation(5))
+if state.try_admit_fd_table_mutator(tid=100) is not True:
+    raise SystemExit("close alias admission failed")
+finish_valid_close("close one alias", state, pending, table, 5, 0, None)
+if table.get(7) is not alias_entry or table[7][0] is not alias_description:
+    raise SystemExit("close one alias changed the surviving description")
+if table[7][1] is not False:
+    raise SystemExit("close one alias changed surviving CLOEXEC")
+
+
+# The last FD for a mapped node can close without replacing the mapping or
+# its exact node identity.
+state = seed_state()
+table = state._task(100)["fds"]
+description = table[5][0]
+node = description.identity
+maps = state._task(100)["maps"]
+state.map_file(
+    tid=100,
+    start=0x3000,
+    length=0x1000,
+    node=node,
+    offset=0,
+    prot=object(),
+    shared=False,
+)
+mapping = maps[0x3000]
+copied_table = state._task(102)["fds"]
+if copied_table is table or copied_table[5][0] is not description:
+    raise SystemExit("mapped node copied-table setup lost the description")
+state.close(tid=102, fd=5)
+if 5 in copied_table:
+    raise SystemExit("mapped node copied-table setup retained the closed FD")
+if any(entry[0] is description for fd, entry in table.items() if fd != 5):
+    raise SystemExit("mapped node had another live FD before last close")
+pending = arm(state, close_operation(5))
+if state.try_admit_fd_table_mutator(tid=100) is not True:
+    raise SystemExit("mapped last-FD admission failed")
+finish_valid_close("close last mapped FD", state, pending, table, 5, 0, None)
+if maps is not state._task(100)["maps"] or maps.get(0x3000) is not mapping:
+    raise SystemExit("close last mapped FD replaced the mapping")
+if maps[0x3000][1] is not node:
+    raise SystemExit("close last mapped FD changed mapping node identity")
+seen_tables = []
+for task in state._tasks.values():
+    candidate = task["fds"]
+    if any(candidate is existing for existing in seen_tables):
+        continue
+    seen_tables.append(candidate)
+    if any(entry[0] is description for entry in candidate.values()):
+        raise SystemExit("close last mapped FD left a reference in another table")
+
+
+# Restart preserves the exact pending/owner pair; same-object re-admission is
+# idempotent before the later terminal close.
+state = seed_state()
+pending = arm(state, close_operation())
+table = state._task(100)["fds"]
+if state.try_admit_fd_table_mutator(tid=100) is not True:
+    raise SystemExit("close restart setup admission failed")
+owners = state._fd_table_mutators
+owner = owners[0]
+if state.finish_syscall(tid=100, outcome="restart") is not None:
+    raise SystemExit("close restart returned a non-None result")
+if state._pending.get(100) is not pending or owners[0] is not owner:
+    raise SystemExit("close restart changed pending/owner identity")
+if state.try_admit_fd_table_mutator(tid=100) is not True:
+    raise SystemExit("close restart same-object admission was not idempotent")
+if state._fd_table_mutators is not owners or owners[0] is not owner:
+    raise SystemExit("close restart re-admission replaced owner identity")
+finish_valid_close("close after restart", state, pending, table, 5, 0, None)
+
+
+def exercise_close_bad_unrelated(label, configure):
+    state = seed_state()
+    pending = arm(state, close_operation())
+    table = state._task(100)["fds"]
+    if state.try_admit_fd_table_mutator(tid=100) is not True:
+        raise SystemExit(f"{label}: selected admission failed")
+    configure(state)
+    expect_format(
+        label,
+        state,
+        lambda: state.finish_close_syscall(tid=100, result=0, errno=None),
+    )
+    if state._pending[100] is not pending or 5 not in table:
+        raise SystemExit(f"{label}: selected close changed state")
+
+
+exercise_close_bad_unrelated(
+    "close malformed unrelated owner",
+    lambda state: state._fd_table_mutators.append(("bad owner",)),
+)
+
+
+def malformed_unrelated_table(state):
+    state._task(102)["fds"] = []
+    bad_pending = close_operation()
+    state._pending[102] = bad_pending
+    state._fd_table_mutators.append((state._task(102)["fds"], 102, bad_pending))
+
+
+exercise_close_bad_unrelated("close malformed unrelated table", malformed_unrelated_table)
+
+
+def malformed_unrelated_operation(state):
+    bad_pending = ["close", "fd", (5, *CLOSE_TAIL)]
+    state._pending[102] = bad_pending
+    state._fd_table_mutators.append((state._task(102)["fds"], 102, bad_pending))
+
+
+exercise_close_bad_unrelated("close malformed unrelated operation", malformed_unrelated_operation)
+
+
+# Select a later owner index.  The synchronous close hook checks the captured
+# owner/pending at effect entry, commits deletion, then corrupts that slot;
+# cleanup must use the captured index and perform no post-effect validation.
+state = seed_state()
+copied_pending = arm(state, close_operation(), tid=102)
+root_pending = arm(state, close_operation(), tid=100)
+state.spawn(
+    parent_tid=100,
+    child_tid=103,
+    share_files=False,
+    share_fs=False,
+    share_vm=False,
+    thread_group=False,
+)
+third_pending = arm(state, close_operation(), tid=103)
+if state.try_admit_fd_table_mutator(tid=102) is not True:
+    raise SystemExit("later-index close copied admission failed")
+if state.try_admit_fd_table_mutator(tid=100) is not True:
+    raise SystemExit("later-index close root admission failed")
+if state.try_admit_fd_table_mutator(tid=103) is not True:
+    raise SystemExit("later-index close third admission failed")
+owners = state._fd_table_mutators
+pending_entries = state._pending
+if len(owners) != 3 or len(pending_entries) != 3:
+    raise SystemExit("later-index close did not create three valid owners")
+unrelated = owners[0]
+selected_owner = owners[1]
+trailing_owner = owners[2]
+if selected_owner is not owners[1] or selected_owner is owners[-1]:
+    raise SystemExit("later-index close selected a final owner")
+root_table = state._task(100)["fds"]
+effect_entry_checked = []
+original_close = state.close
+
+
+def discriminate_close(**kwargs):
+    if kwargs != {"tid": 100, "fd": 5}:
+        raise SystemExit("later-index close hook received wrong effect arguments")
+    selected = state._fd_table_mutators[1]
+    if (
+        selected is not selected_owner
+        or type(selected) is not tuple
+        or len(selected) != 3
+        or selected[0] is not root_table
+        or selected[1] != 100
+        or selected[2] is not root_pending
+        or state._pending.get(100) is not root_pending
+        or state._fd_table_mutators is not owners
+        or state._pending is not pending_entries
+        or state._fd_table_mutators[0] is not unrelated
+        or state._fd_table_mutators[2] is not trailing_owner
+        or state._pending.get(102) is not copied_pending
+        or state._pending.get(103) is not third_pending
+    ):
+        raise SystemExit("later-index close owner/pending changed before effect")
+    effect_entry_checked.append(True)
+    original_close(**kwargs)
+    if 5 in root_table:
+        raise SystemExit("later-index close effect did not delete FD")
+    state._fd_table_mutators[1] = ("post-effect malformed owner",)
+
+
+state.close = discriminate_close
+before_fds = fd_table_snapshot(root_table)
+receipt = state.finish_close_syscall(tid=100, result=0, errno=None)
+assert_receipt("later-index close", receipt, root_pending, 0, None)
+assert_fd_delta("later-index close", before_fds, fd_table_snapshot(root_table), 5)
+if effect_entry_checked != [True]:
+    raise SystemExit("later-index close hook did not run synchronously")
+if 100 in state._pending:
+    raise SystemExit("later-index close left selected pending entry")
+if (
+    state._fd_table_mutators is not owners
+    or state._pending is not pending_entries
+    or len(state._fd_table_mutators) != 2
+    or state._fd_table_mutators[0] is not unrelated
+    or state._fd_table_mutators[1] is not trailing_owner
+    or type(state._fd_table_mutators[0]) is not tuple
+    or len(state._fd_table_mutators[0]) != 3
+    or state._fd_table_mutators[0][0] is not state._task(102)["fds"]
+    or state._fd_table_mutators[0][1] != 102
+    or state._fd_table_mutators[0][2] is not copied_pending
+    or state._pending.get(102) is not copied_pending
+    or state._pending.get(103) is not third_pending
+    or set(state._pending) != {102, 103}
+):
+    raise SystemExit("later-index close cleanup lost unrelated owner identity")
+if 5 in root_table:
+    raise SystemExit("later-index close retained the closed FD")
+
+
+# No runner or production BS2b callable is introduced by this private slice.
+if callable(getattr(module, "run", None)) or callable(getattr(module, "produce", None)):
+    raise SystemExit("production BS2b callable became reachable")
+print("bs2b-semantic-close-outcome-ok")
 "#;
     let output = Command::new("/usr/bin/python3")
         .args(["-c", driver, script.to_str().expect("script path is UTF-8")])
@@ -10713,19 +11158,19 @@ print("bs2b-semantic-close-admission-ok")
         .env_clear()
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
-        .expect("run BS2b semantic close admission contract");
+        .expect("run BS2b semantic close outcome contract");
     assert!(
         output.status.success(),
-        "BS2b semantic close admission contract failed:\nstdout={:?}\nstderr={}",
+        "BS2b semantic close outcome contract failed:\nstdout={:?}\nstderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
         output.stderr.is_empty(),
-        "BS2b semantic close admission driver wrote to stderr"
+        "BS2b semantic close outcome driver wrote to stderr"
     );
     assert_eq!(
-        output.stdout, b"bs2b-semantic-close-admission-ok\n",
-        "BS2b semantic close admission driver did not complete"
+        output.stdout, b"bs2b-semantic-close-outcome-ok\n",
+        "BS2b semantic close outcome driver did not complete"
     );
 }

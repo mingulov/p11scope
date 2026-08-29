@@ -10019,7 +10019,7 @@ exercise_bad_owner("missing pending identity", missing_pending)
 for label, bad_pending in (
     ("stored operation list", ["dup", "fd", (5, *DUP_TAIL)]),
     ("stored operation two items", ("dup", "fd")),
-    ("stored operation name", ("close", "fd", (5, *DUP_TAIL))),
+    ("stored operation name", ("fcntl", "fd", (5, *DUP_TAIL))),
     ("stored operation category", ("dup", "path", (5, *DUP_TAIL))),
     ("stored operation arguments list", ("dup", "fd", list((5, *DUP_TAIL)))),
     ("stored operation five args", ("dup", "fd", (5, *DUP_TAIL)[:5])),
@@ -10032,7 +10032,7 @@ for label, bad_pending in (
 for label, bad_pending in (
     ("stored dup2 operation list", ["dup2", "fd", (5, 6, *DUP2_TAIL)]),
     ("stored dup2 operation two items", ("dup2", "fd")),
-    ("stored dup2 operation name", ("close", "fd", (5, 6, *DUP2_TAIL))),
+    ("stored dup2 operation name", ("fcntl", "fd", (5, 6, *DUP2_TAIL))),
     ("stored dup2 operation category", ("dup2", "path", (5, 6, *DUP2_TAIL))),
     ("stored dup2 operation arguments list", ("dup2", "fd", list((5, 6, *DUP2_TAIL)))),
     ("stored dup2 operation five args", ("dup2", "fd", (5, 6, *DUP2_TAIL)[:5])),
@@ -10050,7 +10050,7 @@ for label, bad_pending in (
     ("pending outer tuple subclass", TupleSubclass(("dup", "fd", (5, *DUP_TAIL)))),
     ("pending two items", ("dup", "fd")),
     ("pending four items", ("dup", "fd", (5, *DUP_TAIL), "extra")),
-    ("pending wrong name", ("close", "fd", (5, *DUP_TAIL))),
+    ("pending wrong name", ("fcntl", "fd", (5, *DUP_TAIL))),
     ("pending name subclass", (StringSubclass("dup"), "fd", (5, *DUP_TAIL))),
     ("pending wrong category", ("dup", "path", (5, *DUP_TAIL))),
     ("pending category subclass", ("dup", StringSubclass("fd"), (5, *DUP_TAIL))),
@@ -10358,5 +10358,374 @@ print("bs2b-semantic-fd-table-admission-ok")
     assert_eq!(
         output.stdout, b"bs2b-semantic-fd-table-admission-ok\n",
         "BS2b FD-table admission driver did not complete"
+    );
+}
+
+#[test]
+fn semantic_trace_v1_private_close_outcome_contracts() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = repo.join("scripts/task4-build-subject.py");
+    let driver = r#"
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("task4_build_subject", sys.argv[1])
+if spec is None or spec.loader is None:
+    raise SystemExit("could not import task4 build-subject script")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+
+class IntSubclass(int):
+    pass
+
+
+class StringSubclass(str):
+    pass
+
+
+class ListSubclass(list):
+    pass
+
+
+class TupleSubclass(tuple):
+    pass
+
+
+INT_MAX = 2**31 - 1
+MAX_U64 = 2**64 - 1
+CLOSE_TAIL = (17, 2**63, MAX_U64 - 1, MAX_U64, 1)
+DUP_TAIL = (17, 2**63, MAX_U64 - 1, MAX_U64, 1)
+DUP2_TAIL = (17, 2**63, MAX_U64 - 1, MAX_U64)
+
+
+def close_operation(fd=5, tail=CLOSE_TAIL):
+    return ("close", "fd", (fd, *tail))
+
+
+def dup_operation(oldfd=5, tail=DUP_TAIL):
+    return ("dup", "fd", (oldfd, *tail))
+
+
+def dup2_operation(oldfd=5, newfd=6, tail=DUP2_TAIL):
+    return ("dup2", "fd", (oldfd, newfd, *tail))
+
+
+def seed_state(root_tid=100):
+    state = module._SemanticTraceState(
+        root_tid=root_tid,
+        cwd=object(),
+        root=object(),
+        umask=0o022,
+        fds={
+            0: (object(), True),
+            2: (object(), False),
+            4: (object(), True),
+        },
+    )
+    state.install_open_fd(
+        tid=root_tid,
+        fd=5,
+        node=object(),
+        kind="regular",
+        access="read_write",
+        cloexec=True,
+    )
+    state.install_open_fd(
+        tid=root_tid,
+        fd=6,
+        node=object(),
+        kind="regular",
+        access="read_write",
+        cloexec=True,
+    )
+    state.apply_io_offset(tid=root_tid, fd=5, direction="write", count=7, position=None)
+    state.map_file(
+        tid=root_tid,
+        start=0x1000,
+        length=0x1000,
+        node=object(),
+        offset=0,
+        prot=object(),
+        shared=False,
+    )
+    state.spawn(
+        parent_tid=root_tid,
+        child_tid=101,
+        share_files=True,
+        share_fs=True,
+        share_vm=True,
+        thread_group=False,
+    )
+    state.spawn(
+        parent_tid=root_tid,
+        child_tid=102,
+        share_files=False,
+        share_fs=False,
+        share_vm=False,
+        thread_group=False,
+    )
+    return state
+
+
+def arm(state, operation, tid=100):
+    state.begin_syscall(tid=tid, operation=operation)
+    return operation
+
+
+def assert_owner(label, state, table, tid, pending):
+    owners = state._fd_table_mutators
+    if type(owners) is not list or len(owners) != 1:
+        raise SystemExit(f"{label}: owner collection is not one built-in entry")
+    owner = owners[0]
+    if type(owner) is not tuple or len(owner) != 3:
+        raise SystemExit(f"{label}: owner entry is not a built-in triple")
+    if owner[0] is not table or type(owner[1]) is not int or owner[1] != tid:
+        raise SystemExit(f"{label}: owner table/TID identity is wrong")
+    if owner[2] is not pending:
+        raise SystemExit(f"{label}: owner pending identity is wrong")
+
+
+def freeze(value):
+    value_type = type(value)
+    type_tag = (value_type.__module__, value_type.__qualname__)
+    if value_type in (type(None), bool, int, float, str, bytes):
+        return ("scalar", type_tag, value)
+    if value_type is tuple:
+        return ("tuple", type_tag, id(value), tuple(freeze(item) for item in value))
+    if value_type is list:
+        return ("list", type_tag, id(value), tuple(freeze(item) for item in value))
+    if value_type is dict:
+        return (
+            "dict",
+            type_tag,
+            id(value),
+            tuple((freeze(key), freeze(item)) for key, item in value.items()),
+        )
+    return ("object", type_tag, id(value))
+
+
+def snapshot(state):
+    return (
+        state._tasks,
+        freeze(state._tasks),
+        state._pending,
+        freeze(state._pending),
+        state._fd_table_mutators,
+        freeze(state._fd_table_mutators),
+    )
+
+
+def assert_unchanged(label, before, after):
+    for position in (0, 2, 4):
+        if before[position] is not after[position]:
+            raise SystemExit(f"{label}: state container identity changed")
+    for position in (1, 3, 5):
+        if before[position] != after[position]:
+            raise SystemExit(f"{label}: state values or identities changed")
+
+
+def expect_format(label, state, invoke):
+    before = snapshot(state)
+    try:
+        invoke()
+    except BaseException as exc:
+        if type(exc) is not module.FormatError:
+            raise SystemExit(
+                f"{label}: expected FormatError, got {type(exc).__name__}: {exc}"
+            ) from exc
+    else:
+        raise SystemExit(f"{label}: malformed operation was accepted")
+    assert_unchanged(label, before, snapshot(state))
+
+
+# RED discriminator: this is the first real admission call, and the exact
+# close grammar currently fails only because the shared S7 validator excludes
+# the close name.  Do not bypass admission or manufacture an owner tuple.
+state = seed_state()
+pending = arm(state, ("close", "fd", (5, *CLOSE_TAIL)))
+table = state._task(100)["fds"]
+if state.try_admit_fd_table_mutator(tid=100) is not True:
+    raise SystemExit("first exact close admission did not return True")
+assert_owner("first exact close admission", state, table, 100, pending)
+
+
+# Exact FD boundaries and raw-u64 tails are accepted after the validator is
+# extended; raw values have no S8a semantics beyond their exact type/range.
+for label, operation in (
+    ("fd zero/raw zero", close_operation(0, (0, 0, 0, 0, 0))),
+    ("fd INT_MAX/raw max", close_operation(INT_MAX, (MAX_U64,) * 5)),
+):
+    state = seed_state()
+    pending = arm(state, operation)
+    table = state._task(100)["fds"]
+    if state.try_admit_fd_table_mutator(tid=100) is not True:
+        raise SystemExit(f"{label}: exact close admission failed")
+    assert_owner(label, state, table, 100, pending)
+
+
+# Outer/name/category/shape errors remain rejected, including arbitrary
+# fcntl/fd operations after close becomes a valid name.
+for label, bad_pending in (
+    ("outer list", ["close", "fd", (5, *CLOSE_TAIL)]),
+    ("outer tuple subclass", TupleSubclass(("close", "fd", (5, *CLOSE_TAIL)))),
+    ("two items", ("close", "fd")),
+    ("four items", ("close", "fd", (5, *CLOSE_TAIL), "extra")),
+    ("wrong name fcntl", ("fcntl", "fd", (5, *CLOSE_TAIL))),
+    ("name subclass", (StringSubclass("close"), "fd", (5, *CLOSE_TAIL))),
+    ("wrong category", ("close", "path", (5, *CLOSE_TAIL))),
+    ("category subclass", ("close", StringSubclass("fd"), (5, *CLOSE_TAIL))),
+    ("arguments list", ("close", "fd", list((5, *CLOSE_TAIL)))),
+    ("arguments tuple subclass", ("close", "fd", TupleSubclass((5, *CLOSE_TAIL)))),
+    ("five args", ("close", "fd", (5, *CLOSE_TAIL)[:5])),
+    ("seven args", ("close", "fd", (5, *CLOSE_TAIL) + (7,))),
+):
+    state = seed_state()
+    state._pending[100] = bad_pending
+    expect_format(label, state, lambda: state.try_admit_fd_table_mutator(tid=100))
+
+
+for suffix, bad in (
+    ("bool", True),
+    ("integer subclass", IntSubclass(5)),
+    ("negative", -1),
+    ("overflow", INT_MAX + 1),
+    ("float", 5.0),
+    ("None", None),
+):
+    args = list((5, *CLOSE_TAIL))
+    args[0] = bad
+    state = seed_state()
+    state._pending[100] = ("close", "fd", tuple(args))
+    expect_format(f"close fd {suffix}", state, lambda: state.try_admit_fd_table_mutator(tid=100))
+
+
+for position in range(1, 6):
+    for suffix, bad in (
+        ("bool", True),
+        ("integer subclass", IntSubclass(1)),
+        ("negative", -1),
+        ("overflow", 2**64),
+        ("float", 1.0),
+        ("None", None),
+    ):
+        args = list((5, *CLOSE_TAIL))
+        args[position] = bad
+        state = seed_state()
+        state._pending[100] = ("close", "fd", tuple(args))
+        expect_format(
+            f"close raw slot {position} {suffix}",
+            state,
+            lambda: state.try_admit_fd_table_mutator(tid=100),
+        )
+
+
+# The exact owner triple is idempotent for the same table/pending/TID.  A
+# shared-table contender is denied without mutation, while an equal-content
+# copied table is an independent owner.
+state = seed_state()
+root_pending = arm(state, close_operation())
+peer_pending = arm(state, close_operation(), tid=101)
+copied_table = state._task(102)["fds"]
+root_table = state._task(100)["fds"]
+if root_table is copied_table or root_table != copied_table:
+    raise SystemExit("copied FD table was not equal-content and distinct")
+if state.try_admit_fd_table_mutator(tid=100) is not True:
+    raise SystemExit("close owner setup admission failed")
+assert_owner("close owner setup", state, root_table, 100, root_pending)
+owners = state._fd_table_mutators
+owner = owners[0]
+before = snapshot(state)
+if state.try_admit_fd_table_mutator(tid=100) is not True:
+    raise SystemExit("same close owner retry was not idempotent")
+assert_unchanged("same close owner retry", before, snapshot(state))
+if state._fd_table_mutators is not owners or owners[0] is not owner:
+    raise SystemExit("same close owner retry replaced owner identity")
+before = snapshot(state)
+if state.try_admit_fd_table_mutator(tid=101) is not False:
+    raise SystemExit("shared-table close contender was not denied")
+assert_unchanged("shared-table close contention", before, snapshot(state))
+copied_pending = arm(state, close_operation(), tid=102)
+if state.try_admit_fd_table_mutator(tid=102) is not True:
+    raise SystemExit("copied-table close admission failed")
+if len(state._fd_table_mutators) != 2:
+    raise SystemExit("copied-table close admission changed owner count")
+copied_owner = state._fd_table_mutators[1]
+if (
+    type(copied_owner) is not tuple
+    or len(copied_owner) != 3
+    or copied_owner[0] is not copied_table
+    or copied_owner[1] != 102
+    or copied_owner[2] is not copied_pending
+):
+    raise SystemExit("copied-table close admission lost owner identities")
+if state._pending[101] is not peer_pending:
+    raise SystemExit("shared-table contender changed pending identity")
+
+
+def exercise_stored_malformed_close(label, bad_pending):
+    # Both existing S7 terminal handlers must fail at global-owner validation,
+    # before they can inspect or mutate an otherwise-admissible selected op.
+    for handler_name in ("dup2", "dup"):
+        state = seed_state()
+        selected = dup2_operation() if handler_name == "dup2" else dup_operation()
+        selected_pending = arm(state, selected)
+        if state.try_admit_fd_table_mutator(tid=100) is not True:
+            raise SystemExit(f"{label} {handler_name}: selected setup was not admissible")
+        bad_table = state._task(102)["fds"]
+        state._pending[102] = bad_pending
+        state._fd_table_mutators.append((bad_table, 102, bad_pending))
+        expect_format(
+            f"{label} {handler_name} admission",
+            state,
+            lambda: state.try_admit_fd_table_mutator(tid=100),
+        )
+        if handler_name == "dup2":
+            invoke = lambda: state.finish_dup2_syscall(tid=100, result=6, errno=None)
+        else:
+            invoke = lambda: state.finish_dup_syscall(tid=100, result=1, errno=None)
+        expect_format(f"{label} {handler_name} terminal", state, invoke)
+        if state._pending[100] is not selected_pending:
+            raise SystemExit(f"{label} {handler_name}: selected pending identity changed")
+
+
+for label, bad_pending in (
+    ("stored close outer list", ["close", "fd", (5, *CLOSE_TAIL)]),
+    ("stored close outer tuple subclass", TupleSubclass(("close", "fd", (5, *CLOSE_TAIL)))),
+    ("stored close wrong name", ("fcntl", "fd", (5, *CLOSE_TAIL))),
+    ("stored close wrong category", ("close", "path", (5, *CLOSE_TAIL))),
+    ("stored close arguments list", ("close", "fd", list((5, *CLOSE_TAIL)))),
+    ("stored close short shape", ("close", "fd", (5, *CLOSE_TAIL)[:5])),
+    ("stored close fd bool", ("close", "fd", (True, *CLOSE_TAIL))),
+    ("stored close fd overflow", ("close", "fd", (INT_MAX + 1, *CLOSE_TAIL))),
+    ("stored close raw bool", ("close", "fd", (5, True, *CLOSE_TAIL[1:]))),
+    ("stored close raw overflow", ("close", "fd", (5, 2**64, *CLOSE_TAIL[1:]))),
+):
+    exercise_stored_malformed_close(label, bad_pending)
+
+
+print("bs2b-semantic-close-admission-ok")
+"#;
+    let output = Command::new("/usr/bin/python3")
+        .args(["-c", driver, script.to_str().expect("script path is UTF-8")])
+        .current_dir(repo)
+        .env_clear()
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("run BS2b semantic close admission contract");
+    assert!(
+        output.status.success(),
+        "BS2b semantic close admission contract failed:\nstdout={:?}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "BS2b semantic close admission driver wrote to stderr"
+    );
+    assert_eq!(
+        output.stdout, b"bs2b-semantic-close-admission-ok\n",
+        "BS2b semantic close admission driver did not complete"
     );
 }

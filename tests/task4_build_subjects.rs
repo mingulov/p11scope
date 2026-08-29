@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom};
@@ -12861,7 +12861,8 @@ CASES = (
     "review-policy-bpf", "kernel-bootstrap", "kernel-fork", "kernel-clone",
     "kernel-vfork", "kernel-nonleader-exec", "kernel-signal-ignored",
     "kernel-signal-caught", "kernel-restart-reject", "kernel-group-stop-reject",
-    "kernel-cleanup-signal", "kernel-cleanup-failure",
+    "kernel-cleanup-signal-int", "kernel-cleanup-signal-hup",
+    "kernel-cleanup-signal-term", "kernel-cleanup-failure",
 )
 KERNEL_CASES = set(CASES[5:])
 UNRUN = {
@@ -12879,7 +12880,115 @@ EXPECTED_ROWS = {
     "kernel-signal-caught": {("getfd", "none", "none", "none"): 2},
 }
 SIMULATION_NEGATIVE = {"sim-restart", "kernel-restart-reject", "kernel-group-stop-reject",
-                       "kernel-cleanup-signal", "kernel-cleanup-failure"}
+                       "kernel-cleanup-signal-int", "kernel-cleanup-signal-hup",
+                       "kernel-cleanup-signal-term", "kernel-cleanup-failure"}
+
+BPF_LD_W_ABS = 0x20
+BPF_JA = 0x05
+BPF_JEQ_K = 0x15
+BPF_JGT_K = 0x25
+BPF_JGE_K = 0x35
+BPF_JSET_K = 0x45
+BPF_AND_K = 0x54
+BPF_RET_K = 0x06
+SECCOMP_RET_KILL_THREAD = 0x00000000
+SECCOMP_RET_KILL_PROCESS = 0x80000000
+SECCOMP_RET_TRAP = 0x00030000
+SECCOMP_RET_ERRNO = 0x00050000
+SECCOMP_RET_TRACE = 0x7FF00000
+SECCOMP_RET_LOG = 0x7FFC0000
+SECCOMP_RET_ALLOW = 0x7FFF0000
+AUDIT_ARCH_X86_64 = 0xC000003E
+SOCK_SEQPACKET = 5
+SOCK_CLOEXEC = 0x80000
+
+def decode_bpf(program):
+    if not program or len(program) % 8 != 0 or len(program) // 8 > 4096:
+        fail("review-policy-bpf", "BPF export has invalid size")
+    instructions = [struct.unpack_from("<HBBI", program, offset)
+                    for offset in range(0, len(program), 8)]
+    count = len(instructions)
+    for pc, (code, jt, jf, k) in enumerate(instructions):
+        if code == BPF_LD_W_ABS:
+            if jt != 0 or jf != 0 or k >= 64 or k % 4 != 0:
+                fail("review-policy-bpf", "unrecognized BPF load")
+        elif code == BPF_JA:
+            if jt != 0 or jf != 0 or pc + 1 + k >= count:
+                fail("review-policy-bpf", "BPF jump is out of bounds")
+        elif code in (BPF_JEQ_K, BPF_JGT_K, BPF_JGE_K, BPF_JSET_K):
+            if pc + 1 + jt >= count or pc + 1 + jf >= count:
+                fail("review-policy-bpf", "BPF conditional jump is out of bounds")
+        elif code == BPF_AND_K:
+            if jt != 0 or jf != 0:
+                fail("review-policy-bpf", "unrecognized BPF ALU instruction")
+        elif code == BPF_RET_K:
+            if jt != 0 or jf != 0 or (k & 0xFFFF0000) not in (
+                    SECCOMP_RET_KILL_THREAD, SECCOMP_RET_KILL_PROCESS,
+                    SECCOMP_RET_TRAP, SECCOMP_RET_ERRNO, SECCOMP_RET_TRACE,
+                    SECCOMP_RET_LOG, SECCOMP_RET_ALLOW):
+                fail("review-policy-bpf", "unrecognized BPF terminal action")
+        else:
+            fail("review-policy-bpf", "unrecognized BPF opcode")
+    return instructions
+
+def interpret_bpf(program, data):
+    instructions = decode_bpf(program)
+    if len(data) != 64:
+        fail("review-policy-bpf", "seccomp_data size changed")
+    accumulator = 0
+    pc = 0
+    for _ in range(len(instructions) * 8 + 1):
+        code, jt, jf, k = instructions[pc]
+        if code == BPF_LD_W_ABS:
+            accumulator = struct.unpack_from("<I", data, k)[0]
+            pc += 1
+        elif code == BPF_JA:
+            pc += 1 + k
+        elif code in (BPF_JEQ_K, BPF_JGT_K, BPF_JGE_K, BPF_JSET_K):
+            if code == BPF_JEQ_K:
+                matched = accumulator == k
+            elif code == BPF_JGT_K:
+                matched = accumulator > k
+            elif code == BPF_JGE_K:
+                matched = accumulator >= k
+            else:
+                matched = accumulator & k != 0
+            pc += 1 + (jt if matched else jf)
+        elif code == BPF_AND_K:
+            accumulator &= k
+            pc += 1
+        elif code == BPF_RET_K:
+            return k
+        else:
+            fail("review-policy-bpf", "BPF interpreter reached unknown opcode")
+        if pc >= len(instructions):
+            fail("review-policy-bpf", "BPF interpreter left program")
+    fail("review-policy-bpf", "BPF interpreter did not terminate")
+
+def socketpair_data(family, sock_type, protocol, address):
+    data = bytearray(64)
+    struct.pack_into("<I", data, 0, 53)
+    struct.pack_into("<I", data, 4, AUDIT_ARCH_X86_64)
+    for index, value in enumerate((family, sock_type, protocol, address)):
+        struct.pack_into("<Q", data, 16 + index * 8, value)
+    return bytes(data)
+
+def assert_bpf_policy(program):
+    decode_bpf(program)
+    allow = SECCOMP_RET_ALLOW
+    errno_eprem = SECCOMP_RET_ERRNO | 1
+    pointer = 0x123456789
+    def expect(label, family, sock_type, protocol, address, result):
+        actual = interpret_bpf(program, socketpair_data(family, sock_type, protocol, address))
+        if actual != result:
+            fail("review-policy-bpf", f"{label} returned {actual:#x}, expected {result:#x}")
+    expect("accepted AF_UNIX seqpacket cloexec", 1, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pointer, allow)
+    expect("nonzero protocol", 1, SOCK_SEQPACKET | SOCK_CLOEXEC, 1, pointer, errno_eprem)
+    expect("stream", 1, 1 | SOCK_CLOEXEC, 0, pointer, errno_eprem)
+    expect("dgram", 1, 2 | SOCK_CLOEXEC, 0, pointer, errno_eprem)
+    expect("missing cloexec", 1, SOCK_SEQPACKET, 0, pointer, errno_eprem)
+    expect("wrong family", 2, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pointer, errno_eprem)
+    expect("null address remains filter-allowed", 1, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, 0, allow)
 def fail(label, message):
     raise SystemExit(f"{label}: {message}")
 
@@ -13213,6 +13322,7 @@ def valid_case(case):
             raw = os.pread(out_fd, 1 << 20, 0)
             if not raw or len(raw) % 8 or len(raw) // 8 > 4096:
                 fail(case, "BPF export is empty, unaligned, or over bound")
+            assert_bpf_policy(raw)
             digest = hashlib.sha256(raw).hexdigest()
             with open(os.path.join(evidence, case + ".bpf"), "wb") as stream:
                 stream.write(raw)
@@ -13264,7 +13374,7 @@ def valid_case(case):
             except FileNotFoundError:
                 pass
 
-def refusal(label, output_mode="rw", watchdog_mode="write", args=None):
+def refusal(label, output_mode="rw", watchdog_mode="write", args=None, case=None):
     out_fd = wd_read = wd_write = passed_watchdog = None
     out_path = watchdog_path = None
     session_id = None
@@ -13307,7 +13417,7 @@ def refusal(label, output_mode="rw", watchdog_mode="write", args=None):
             watchdog_identity = identity(passed_watchdog)
             if watchdog_identity[:2] == before[:2]:
                 fail(label, "nonpipe watchdog reused output identity")
-        actual_args = args if args is not None else ["self-test", "sim-event-first", str(out_fd), str(out_fd if watchdog_mode == "alias" else passed_watchdog)]
+        actual_args = args if args is not None else ["self-test", case or "sim-event-first", str(out_fd), str(out_fd if watchdog_mode == "alias" else passed_watchdog)]
         if watchdog_mode != "write":
             os.close(wd_write)
             wd_write = -1
@@ -13357,6 +13467,7 @@ for args in ([], ["--help"], ["produce"], ["capture"], ["check"], ["unknown"],
              ["self-test", "sim-event-first", "3", "4", "extra"],
              ["self-test", "unknown", "3", "4"],
              ["internal-workload", "unknown"],
+             ["internal-workload", "kernel-cleanup-signal"],
              ["internal-workload", "kernel-fork", "extra"]):
     refusal("refusal-" + "-".join(args or ["empty"]), args=args)
 refusal("refusal-read-only-output", output_mode="ro")
@@ -13365,6 +13476,7 @@ refusal("refusal-append-output", output_mode="append")
 refusal("refusal-nonpipe-watchdog", watchdog_mode="regular")
 refusal("refusal-read-end-watchdog", watchdog_mode="read")
 refusal("refusal-aliased-watchdog", watchdog_mode="alias")
+refusal("refusal-retired-cleanup-signal", case="kernel-cleanup-signal")
 for case in CASES:
     valid_case(case)
 print("bs2b-s9-native-ptrace-lifecycle-ok")
@@ -13592,13 +13704,15 @@ print("bs2b-s9-native-ptrace-lifecycle-ok")
                 ),
                 EXIT_EVENT | FINAL_WIF => {
                     let status = u32::from_le_bytes(record[32..36].try_into().unwrap());
-                    let signal = status & 0x7f;
-                    let normal = status & 0xff == 0;
-                    let signaled = (1..=64).contains(&signal) && (status & !0xff) == 0;
-                    assert!(
-                        status <= 0xffff && (normal || signaled),
-                        "RED2 terminal wait status changed"
-                    );
+                    if case != "kernel-clone" {
+                        let signal = status & 0x7f;
+                        let normal = status & 0xff == 0;
+                        let signaled = (1..=64).contains(&signal) && (status & !0xff) == 0;
+                        assert!(
+                            status <= 0xffff && (normal || signaled),
+                            "RED2 terminal wait status changed"
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -13621,6 +13735,17 @@ print("bs2b-s9-native-ptrace-lifecycle-ok")
                     "RED2 duplicate WIF changed"
                 );
             }
+        }
+        if case == "kernel-clone" {
+            assert_eq!(
+                exit_statuses,
+                BTreeMap::from([(1, 0), (2, 9)]),
+                "RED2 clone EXIT_EVENT statuses changed"
+            );
+            assert_eq!(
+                wif_statuses, exit_statuses,
+                "RED2 clone EXIT_EVENT/FINAL_WIF bytes differ"
+            );
         }
         assert_eq!(
             u16::from_le_bytes(bytes[10..12].try_into().unwrap()),

@@ -272,6 +272,7 @@ def _parse_raw(raw_fd):
                 _invalid()
             generations[1] = {
                 "group": 1,
+                "origin": None,
                 "live": True,
                 "exit": None,
                 "wif": None,
@@ -387,6 +388,7 @@ def _parse_raw(raw_fd):
             state["child_group"] = child_group
             generations[child_number] = {
                 "group": child_group,
+                "origin": event_kind,
                 "live": True,
                 "exit": None,
                 "wif": None,
@@ -456,9 +458,21 @@ def _parse_raw(raw_fd):
             number = _read_u64(record, 24)
             status = _read_u32(record, 32)
             item = generation(number)
-            if item["superseded"] or item["exit"] is None or item["wif"] is not None:
+            if item["superseded"] or item["wif"] is not None:
                 _invalid()
-            if item["exit"][1] != status or not _valid_wait_status(status):
+            if not _valid_wait_status(status):
+                _invalid()
+            if item["exit"] is None:
+                if (
+                    item["origin"] != 3
+                    or status != 9
+                    or not item["live"]
+                    or item["creation"] is not None
+                    or item["fcntl"] is not None
+                ):
+                    _invalid()
+                item["live"] = False
+            elif item["exit"][1] != status:
                 _invalid()
             item["wif"] = (index, status)
         elif kind == 0x19:

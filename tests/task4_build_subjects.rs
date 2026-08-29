@@ -13808,9 +13808,26 @@ print("bs2b-s9-native-ptrace-lifecycle-ok")
                             .insert(u64::from_le_bytes(record[32..40].try_into().unwrap()));
                     }
                 }
-                SIGNAL_DELIVERY => assert!(
-                    (1..=64).contains(&u32::from_le_bytes(record[32..36].try_into().unwrap())),
-                    "RED2 signal field changed"
+                SIGNAL_DELIVERY => {
+                    let signal = u32::from_le_bytes(record[32..36].try_into().unwrap());
+                    assert!(
+                        (1..=64).contains(&signal)
+                            && match case {
+                                "kernel-signal-ignored" => signal == 10,
+                                "kernel-signal-caught" => signal == 12,
+                                _ => true,
+                            },
+                        "RED2 signal field changed"
+                    );
+                }
+                FCNTL_ENTRY => assert_eq!(
+                    [
+                        u64::from_le_bytes(record[40..48].try_into().unwrap()),
+                        u64::from_le_bytes(record[48..56].try_into().unwrap()),
+                        u64::from_le_bytes(record[56..64].try_into().unwrap()),
+                    ],
+                    [2, 1, 0],
+                    "RED2 fcntl source/command/argument changed"
                 ),
                 SYSCALL_CANCEL => assert_ne!(
                     u64::from_le_bytes(record[32..40].try_into().unwrap()),

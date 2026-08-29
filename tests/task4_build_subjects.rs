@@ -1506,6 +1506,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             state["close_calls"].append(fd)
             state["events"].append("close-P" if fd == state["private_parent"] else "close-L")
             value = real_close(fd)
+            if close_error == "parent-keyboardinterrupt" and fd == state["private_parent"]:
+                raise KeyboardInterrupt()
             if close_error == ("parent" if fd == state["private_parent"] else "ledger"):
                 raise OSError(errno.EIO, "stage2 injected close failure")
             return value
@@ -1788,6 +1790,11 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             expected,
             close_error=close_target,
         )
+    run_stage2_case(
+        "stage2-close-parent-keyboardinterrupt",
+        stage2_expected(ledger_event="dup-L", parent_event="open-P"),
+        close_error="parent-keyboardinterrupt",
+    )
 
     read_write_ledger = os.open(
         ledger_path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW

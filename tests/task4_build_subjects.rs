@@ -12679,14 +12679,12 @@ raise SystemExit(0)
     let mut output_probe = output_file.try_clone().expect("clone offset output probe");
     run_held("offset", 0, Stdio::from(raw_file), output_file);
     assert_eq!(
-        raw_probe
-            .seek(SeekFrom::Current(0))
-            .expect("seek offset raw probe"),
+        raw_probe.stream_position().expect("seek offset raw probe"),
         19
     );
     assert_eq!(
         output_probe
-            .seek(SeekFrom::Current(0))
+            .stream_position()
             .expect("seek offset output probe"),
         7
     );

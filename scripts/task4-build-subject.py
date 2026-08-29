@@ -260,6 +260,38 @@ class _SemanticTraceState:
             raise FormatError("product syscall cannot finish")
         del self._pending[tid]
 
+    def finish_close_syscall(self, *, tid, result, errno):
+        fds, pending, owner_index = self._owner_for_fd_table_mutator(tid)
+        name, arguments = self._validate_fd_table_mutator_operation(pending)
+        if name != "close":
+            raise FormatError("invalid pending syscall")
+        fd = arguments[0]
+
+        success = type(result) is int and result == 0 and errno is None
+        failure = type(result) is int and result == -1 and type(errno) is int and errno in {
+            4,
+            5,
+            9,
+            28,
+            122,
+        }
+        if not success and not failure:
+            raise FormatError("invalid close outcome")
+
+        present = fd in fds
+        if success or (failure and errno in {4, 5, 28, 122}):
+            if not present:
+                raise FormatError("unknown FD")
+        elif present:
+            raise FormatError("present FD")
+
+        receipt = (pending, result, errno)
+        if success or (failure and errno != 9):
+            self.close(tid=tid, fd=fd)
+        del self._pending[tid]
+        del self._fd_table_mutators[owner_index]
+        return receipt
+
     def finish_dup2_syscall(self, *, tid, result, errno):
         fds, pending, owner_index = self._owner_for_fd_table_mutator(tid)
         name, arguments = self._validate_fd_table_mutator_operation(pending)

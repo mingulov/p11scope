@@ -1138,6 +1138,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 else ["borrowed-L-getfl", "borrowed-L-fstat-pre", "borrowed-L-pread-complete", "borrowed-L-fstat-post"]
             )
             if private_ledger:
+                if private_parent:
+                    result.extend(["P-getfl", "P-getfd", "P-fstat"])
                 result.append("borrowed-L-getfl")
                 result.append("borrowed-L-fstat")
             for operation in ("borrowed-P-getfl", "borrowed-P-getfd", "borrowed-P-fstat"):

@@ -446,34 +446,42 @@ fn input_v1_discovery_api_is_candidate_only() {
     fs::set_permissions(&isolated_script, fs::Permissions::from_mode(script_mode))
         .expect("copy task4 build-subject script mode");
     let project_before = snapshot_exact_tree(&project);
-    let produce = Command::new("/usr/bin/python3")
-        .args(["scripts/task4-build-subject.py", "produce"])
-        .current_dir(&project)
-        .env_clear()
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .output()
-        .expect("run deferred task4 build-subject producer");
-    assert_eq!(
-        produce.status.code(),
-        Some(77),
-        "produce must remain deferred"
-    );
-    assert!(
-        produce.stdout.is_empty(),
-        "deferred producer wrote to stdout"
-    );
-    assert!(
-        produce.stderr.len() <= 4096,
-        "deferred producer diagnostics exceeded 4096 bytes"
-    );
-    assert_eq!(
-        snapshot_exact_tree(&project),
-        project_before,
-        "deferred producer changed the isolated project tree"
-    );
+    for argv in [None, Some("produce"), Some("arbitrary")] {
+        let mut command = Command::new("/usr/bin/python3");
+        command
+            .current_dir(&project)
+            .env_clear()
+            .env("PYTHONDONTWRITEBYTECODE", "1");
+        match argv {
+            None => {
+                command.args(["scripts/task4-build-subject.py"]);
+            }
+            Some(value) => {
+                command.args(["scripts/task4-build-subject.py", value]);
+            }
+        }
+        let output = command
+            .output()
+            .expect("run deferred task4 build-subject argv");
+        assert_eq!(output.status.code(), Some(77), "argv must remain deferred");
+        assert!(output.stdout.is_empty(), "deferred argv wrote to stdout");
+        assert!(output.stderr.is_empty(), "deferred argv wrote to stderr");
+        assert_eq!(
+            snapshot_exact_tree(&project),
+            project_before,
+            "deferred argv changed the isolated project tree"
+        );
+    }
     let driver = r#"
+import contextlib
+import errno
+import fcntl
 import importlib.util
 import inspect
+import io
+import os
+import stat
+import tempfile
 import sys
 
 spec = importlib.util.spec_from_file_location("task4_build_subject", sys.argv[1])
@@ -511,9 +519,12 @@ if any(
     raise SystemExit("discover_input_v1 accepts variadic arguments")
 if any(parameter.default is not inspect.Parameter.empty for parameter in parameters):
     raise SystemExit("discover_input_v1 arguments are not all required")
-for name in ("reconcile_input_v1", "run_reconciled_build"):
-    if callable(getattr(module, name, None)):
-        raise SystemExit(f"{name} is callable on the candidate-only module")
+if callable(getattr(module, "reconcile_input_v1", None)):
+    raise SystemExit("reconcile_input_v1 is callable on the candidate-only module")
+
+runner = getattr(module, "run_reconciled_build", None)
+if not callable(runner):
+    raise SystemExit("run_reconciled_build is missing or not callable")
 
 kwargs = dict(
     root_pid=1,
@@ -530,6 +541,799 @@ for name in ("expected", "production"):
     except TypeError:
         continue
     raise SystemExit(f"discover_input_v1 accepted forbidden {name}= keyword")
+
+runner_parameters = list(inspect.signature(runner).parameters.values())
+runner_names = [parameter.name for parameter in runner_parameters]
+if runner_names != [
+    "expected_ledger_fd",
+    "repo_root",
+    "vendor_relative",
+    "stable_sysroot_root",
+    "nightly_sysroot_root",
+    "private_parent_fd",
+]:
+    raise SystemExit("run_reconciled_build signature drifted")
+if any(parameter.kind is not inspect.Parameter.KEYWORD_ONLY for parameter in runner_parameters):
+    raise SystemExit("run_reconciled_build parameters are not keyword-only")
+if any(
+    parameter.kind in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}
+    for parameter in runner_parameters
+):
+    raise SystemExit("run_reconciled_build accepts variadic arguments")
+if any(parameter.default is not inspect.Parameter.empty for parameter in runner_parameters):
+    raise SystemExit("run_reconciled_build arguments are not all required")
+by_name = {parameter.name: parameter for parameter in runner_parameters}
+for name in ("expected_ledger_fd", "private_parent_fd"):
+    if by_name[name].annotation is not int:
+        raise SystemExit(f"run_reconciled_build {name} annotation drifted")
+if by_name["vendor_relative"].annotation is not str:
+    raise SystemExit("run_reconciled_build vendor_relative annotation drifted")
+for name in ("repo_root", "stable_sysroot_root", "nightly_sysroot_root"):
+    if by_name[name].annotation is not inspect.Parameter.empty:
+        raise SystemExit(f"run_reconciled_build {name} must be unannotated")
+if inspect.signature(runner).return_annotation != "ProductionFreeze":
+    raise SystemExit("run_reconciled_build return annotation drifted")
+for name in ("run", "capture", "produce", "reconcile_input_v1"):
+    if callable(getattr(module, name, None)):
+        raise SystemExit(f"{name} is callable on the refusal-only module")
+
+class IntSubclass(int):
+    pass
+
+
+def identity(value):
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_uid,
+        value.st_gid,
+        value.st_mode,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def tree_state(root):
+    entries = []
+
+    def visit(path, relative):
+        value = os.lstat(path)
+        mode = value.st_mode
+        if stat.S_ISREG(mode):
+            with open(path, "rb") as stream:
+                content = stream.read()
+        elif stat.S_ISLNK(mode):
+            content = os.readlink(path).encode("utf-8", "surrogateescape")
+        else:
+            content = b""
+        entries.append((relative, stat.S_IFMT(mode), mode & 0o7777, identity(value), content))
+        if stat.S_ISDIR(mode):
+            names = sorted(os.listdir(path), key=os.fsencode)
+            for name in names:
+                child = os.path.join(path, name)
+                child_relative = name if not relative else os.path.join(relative, name)
+                visit(child, child_relative)
+
+    visit(root, "")
+    return tuple(entries)
+
+
+def ledger_state(fd):
+    value = os.fstat(fd)
+    content = os.pread(fd, value.st_size, 0)
+    if len(content) != value.st_size:
+        raise SystemExit("fixture ledger read was short")
+    return identity(value), content
+
+
+def readable_ledger_state(fd):
+    try:
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    except (OSError, TypeError, ValueError):
+        return None
+    if flags & getattr(os, "O_PATH", 0) or flags & os.O_ACCMODE == os.O_WRONLY:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+    except OSError:
+        return None
+    return ledger_state(fd)
+
+
+class StatProxy:
+    def __init__(self, original, **changes):
+        self._original = original
+        self._changes = changes
+
+    def __getattr__(self, name):
+        if name in self._changes:
+            return self._changes[name]
+        return getattr(self._original, name)
+
+
+def make_file(root, name, content, mode=0o600):
+    path = os.path.join(root, name)
+    with open(path, "wb") as stream:
+        stream.write(content)
+    os.chmod(path, mode)
+    return path
+
+
+with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
+    repo_root = os.path.join(fixture, "repo")
+    stable_root = os.path.join(fixture, "stable")
+    nightly_root = os.path.join(fixture, "nightly")
+    parent_root = os.path.join(fixture, "parent")
+    for path in (repo_root, stable_root, nightly_root):
+        os.mkdir(path, 0o755)
+    os.mkdir(parent_root, 0o700)
+    make_file(parent_root, "marker", b"parent-marker", 0o600)
+    ledger_path = make_file(fixture, "ledger", os.environ["TASK4_GOLDEN"].encode("ascii"))
+    ledger_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    ledger_fd = os.open(ledger_path, ledger_flags)
+    parent_fd = os.open(parent_root, parent_flags)
+    ledger_offset = os.lseek(ledger_fd, 11, os.SEEK_SET)
+    parent_offset = os.lseek(parent_fd, 7, os.SEEK_CUR)
+    if ledger_offset == 0 or parent_offset == 0 or ledger_offset == parent_offset:
+        raise SystemExit("positive fixture offsets are not distinct nonzero values")
+    if fcntl.fcntl(ledger_fd, fcntl.F_GETFL) & getattr(os, "O_PATH", 0):
+        raise SystemExit("readable ledger fixture unexpectedly has O_PATH")
+    if fcntl.fcntl(ledger_fd, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY:
+        raise SystemExit("readable ledger fixture is not read-only")
+    if fcntl.fcntl(parent_fd, fcntl.F_GETFL) & getattr(os, "O_PATH", 0):
+        raise SystemExit("readable parent fixture unexpectedly has O_PATH")
+    if fcntl.fcntl(parent_fd, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY:
+        raise SystemExit("readable parent fixture is not read-only")
+    if not fcntl.fcntl(parent_fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC:
+        raise SystemExit("readable parent fixture is not CLOEXEC")
+
+    valid = dict(
+        expected_ledger_fd=ledger_fd,
+        repo_root=repo_root,
+        vendor_relative="vendor",
+        stable_sysroot_root=stable_root,
+        nightly_sysroot_root=nightly_root,
+        private_parent_fd=parent_fd,
+    )
+    roots = (repo_root, stable_root, nightly_root, parent_root)
+    discover_calls = {"count": 0}
+    real_discover = module.discover_input_v1
+
+    def discover_bomb(*arguments, **arguments_by_name):
+        discover_calls["count"] += 1
+        raise SystemExit("discover_input_v1 must not be called by run_reconciled_build")
+
+    def borrowed_offset(fd):
+        try:
+            return os.lseek(fd, 0, os.SEEK_CUR)
+        except OSError:
+            return None
+
+    def run_case(label, expected, overrides=None, patches=(), borrowed=(), postcheck=None):
+        call_kwargs = dict(valid)
+        if overrides:
+            call_kwargs.update(overrides)
+        ledger_argument = call_kwargs["expected_ledger_fd"]
+        before_ledger = readable_ledger_state(ledger_argument)
+        before_roots = tuple(tree_state(root) for root in roots)
+        before_fds = []
+        for fd, offset in borrowed:
+            try:
+                value = os.fstat(fd)
+                flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                descriptor_flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+            except OSError as exc:
+                raise SystemExit(f"{label}: fixture borrowed fd is not open") from exc
+            before_fds.append((fd, offset, identity(value), flags, descriptor_flags))
+        originals = []
+        caught = None
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        calls_before = discover_calls["count"]
+        try:
+            for owner, name, replacement in patches:
+                originals.append((owner, name, getattr(owner, name)))
+                setattr(owner, name, replacement)
+            module.discover_input_v1 = discover_bomb
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                try:
+                    runner(**call_kwargs)
+                except BaseException as exc:
+                    caught = exc
+        finally:
+            module.discover_input_v1 = real_discover
+            for owner, name, original in reversed(originals):
+                setattr(owner, name, original)
+        if discover_calls["count"] != calls_before:
+            raise SystemExit(f"{label}: discover_input_v1 was called")
+        if stdout.getvalue() or stderr.getvalue():
+            raise SystemExit(f"{label}: runner wrote output")
+        if expected is SystemExit:
+            if type(caught) is not SystemExit or caught.code != 77:
+                raise SystemExit(f"{label}: expected silent SystemExit(77), got {caught!r}")
+        elif type(caught) is not expected:
+            name = type(caught).__name__ if caught is not None else "return"
+            raise SystemExit(f"{label}: expected {expected.__name__}, got {name}")
+        if postcheck is not None:
+            postcheck()
+        if tuple(tree_state(root) for root in roots) != before_roots:
+            raise SystemExit(f"{label}: runner changed a fixture tree")
+        if before_ledger is not None and readable_ledger_state(ledger_argument) != before_ledger:
+            raise SystemExit(f"{label}: runner changed the borrowed ledger")
+        for fd, offset, expected_identity, expected_flags, expected_descriptor_flags in before_fds:
+            try:
+                value = os.fstat(fd)
+                flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                descriptor_flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+            except OSError as exc:
+                raise SystemExit(f"{label}: runner closed borrowed fd {fd}") from exc
+            if (
+                identity(value) != expected_identity
+                or flags != expected_flags
+                or descriptor_flags != expected_descriptor_flags
+            ):
+                raise SystemExit(f"{label}: runner changed borrowed fd {fd} metadata")
+            if offset is not None and borrowed_offset(fd) != offset:
+                raise SystemExit(f"{label}: runner changed borrowed fd {fd} offset")
+
+    base_borrowed = [(ledger_fd, ledger_offset), (parent_fd, parent_offset)]
+
+    read_write_ledger = os.open(
+        ledger_path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+    )
+    read_write_offset = os.lseek(read_write_ledger, 23, os.SEEK_SET)
+    if read_write_offset == 0 or read_write_offset in {ledger_offset, parent_offset}:
+        raise SystemExit("read-write ledger fixture offset is not distinct and nonzero")
+    read_write_flags = fcntl.fcntl(read_write_ledger, fcntl.F_GETFL)
+    read_write_value = os.fstat(read_write_ledger)
+    if (
+        read_write_flags & getattr(os, "O_PATH", 0)
+        or read_write_flags & os.O_ACCMODE != os.O_RDWR
+        or fcntl.fcntl(read_write_ledger, fcntl.F_GETFD) & fcntl.FD_CLOEXEC == 0
+        or read_write_value.st_mode & 0o7777 != 0o600
+        or read_write_value.st_nlink != 1
+    ):
+        raise SystemExit("read-write ledger fixture was not a valid 0600 regular FD")
+    run_case(
+        "ledger-read-write",
+        SystemExit,
+        {"expected_ledger_fd": read_write_ledger},
+        borrowed=[(read_write_ledger, read_write_offset), (parent_fd, parent_offset)],
+    )
+    os.close(read_write_ledger)
+
+    partial_state = {
+        "calls": 0,
+        "events": [],
+        "offsets": [],
+        "lengths": [],
+        "passes": [],
+        "pass": 0,
+        "pass1_fstat": 0,
+        "pass2_fstat": 0,
+    }
+    original_pread = os.pread
+    original_fstat = os.fstat
+
+    def partial_pread(fd, size, offset):
+        if fd != ledger_fd:
+            return original_pread(fd, size, offset)
+        partial_state["calls"] += 1
+        if offset == 0 and partial_state["pass"] == 0:
+            partial_state["pass"] = 1
+        elif (
+            offset == 0
+            and partial_state["pass"] == 1
+            and partial_state["pass1_fstat"] == 1
+        ):
+            partial_state["pass"] = 2
+        if partial_state["pass"] not in {1, 2}:
+            partial_state["passes"].append(0)
+            partial_state["events"].append("ledger-pread-invalid-pass")
+        else:
+            partial_state["passes"].append(partial_state["pass"])
+            partial_state["events"].append(f"ledger-pread-pass{partial_state['pass']}")
+        partial_state["offsets"].append(offset)
+        chunk = original_pread(fd, min(size, 3), offset)
+        partial_state["lengths"].append(len(chunk))
+        return chunk
+
+    def partial_fstat(fd):
+        value = original_fstat(fd)
+        if fd == ledger_fd:
+            if partial_state["pass"] == 0:
+                partial_state["events"].append("ledger-fstat-initial")
+            elif partial_state["pass"] == 1 and partial_state["pass1_fstat"] == 0:
+                partial_state["pass1_fstat"] = 1
+                partial_state["events"].append("ledger-fstat-pass1")
+            elif partial_state["pass"] == 2 and partial_state["pass2_fstat"] == 0:
+                partial_state["pass2_fstat"] = 1
+                partial_state["events"].append("ledger-fstat-pass2")
+            else:
+                partial_state["events"].append("ledger-fstat-extra")
+        return value
+
+    def check_partial_pread():
+        offsets = partial_state["offsets"]
+        lengths = partial_state["lengths"]
+        passes = partial_state["passes"]
+        ledger_size = len(os.environ["TASK4_GOLDEN"].encode("ascii"))
+        if partial_state["calls"] < 4 or not lengths or any(length <= 0 for length in lengths):
+            raise SystemExit("positive partial pread did not cover both complete passes")
+        if len(offsets) != len(lengths) or len(offsets) != len(passes):
+            raise SystemExit("positive partial pread accounting drifted")
+        if passes.count(1) < 2 or passes.count(2) < 2 or passes.count(0):
+            raise SystemExit("positive partial pread did not produce two multi-chunk passes")
+        expected_events = ["ledger-fstat-initial"]
+        expected_events.extend("ledger-pread-pass1" for _ in range(passes.count(1)))
+        expected_events.append("ledger-fstat-pass1")
+        expected_events.extend("ledger-pread-pass2" for _ in range(passes.count(2)))
+        expected_events.append("ledger-fstat-pass2")
+        if partial_state["events"] != expected_events:
+            raise SystemExit("positive partial pread/fstat event order drifted")
+        if partial_state["pass1_fstat"] != 1 or partial_state["pass2_fstat"] != 1:
+            raise SystemExit("positive partial pread terminal fstats were not unique")
+        for pass_number in (1, 2):
+            pass_offsets = [offset for offset, pass_value in zip(offsets, passes) if pass_value == pass_number]
+            pass_lengths = [length for length, pass_value in zip(lengths, passes) if pass_value == pass_number]
+            if not pass_offsets or pass_offsets[0] != 0:
+                raise SystemExit("positive partial pread pass did not start at zero")
+            cursor = 0
+            for offset, length in zip(pass_offsets, pass_lengths):
+                if offset != cursor or length <= 0:
+                    raise SystemExit("positive partial pread offsets were not contiguous")
+                cursor += length
+            if cursor != ledger_size:
+                raise SystemExit("positive partial pread pass was incomplete")
+
+    run_case(
+        "positive-partial-pread-both-passes",
+        SystemExit,
+        patches=((module.os, "pread", partial_pread), (module.os, "fstat", partial_fstat)),
+        borrowed=base_borrowed,
+        postcheck=check_partial_pread,
+    )
+
+    def run_alt_fd(label, key, fd, offset=None, borrowed_extra=()):
+        borrowed = list(base_borrowed)
+        if key == "expected_ledger_fd":
+            borrowed[0] = (fd, borrowed_offset(fd) if offset is None else offset)
+        else:
+            borrowed[1] = (fd, borrowed_offset(fd) if offset is None else offset)
+        borrowed.extend(borrowed_extra)
+        try:
+            run_case(label, module.FormatError, {key: fd}, borrowed=borrowed)
+        finally:
+            os.close(fd)
+
+    for role in ("expected_ledger_fd", "private_parent_fd"):
+        for value, label in ((True, "bool-true"), (False, "bool-false"), (None, "none"), ("fd", "string")):
+            run_case(f"{role}-{label}", module.FormatError, {role: value}, borrowed=base_borrowed)
+        run_case(
+            f"{role}-int-subclass",
+            module.FormatError,
+            {role: IntSubclass(ledger_fd if role == "expected_ledger_fd" else parent_fd)},
+            borrowed=base_borrowed,
+        )
+        run_case(f"{role}-negative", module.FormatError, {role: -1}, borrowed=base_borrowed)
+        invalid_fd = 10**6
+        run_case(f"{role}-invalid", module.FormatError, {role: invalid_fd}, borrowed=base_borrowed)
+        closed_fd = os.open(ledger_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        os.close(closed_fd)
+        run_case(f"{role}-closed", module.FormatError, {role: closed_fd}, borrowed=base_borrowed)
+
+    writable_ledger = os.open(ledger_path, os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    run_alt_fd("ledger-writable", "expected_ledger_fd", writable_ledger, 0)
+
+    opath = getattr(os, "O_PATH", 0)
+    if not opath:
+        raise SystemExit("Linux O_PATH is required by the focused fixture")
+    opath_ledger = os.open(ledger_path, opath | os.O_CLOEXEC | os.O_NOFOLLOW)
+    opath_ledger_flags = fcntl.fcntl(opath_ledger, fcntl.F_GETFL)
+    if not opath_ledger_flags & opath or opath_ledger_flags & os.O_ACCMODE != os.O_RDONLY:
+        raise SystemExit("O_PATH regular ledger fixture did not expose the misleading read-only bits")
+    run_alt_fd("ledger-o-path", "expected_ledger_fd", opath_ledger)
+
+    wrong_kind_ledger = os.open(parent_root, parent_flags)
+    run_alt_fd("ledger-wrong-kind", "expected_ledger_fd", wrong_kind_ledger)
+
+    wrong_mode_path = make_file(fixture, "ledger-wrong-mode", os.environ["TASK4_GOLDEN"].encode("ascii"), 0o644)
+    wrong_mode_ledger = os.open(wrong_mode_path, ledger_flags)
+    run_alt_fd("ledger-wrong-mode", "expected_ledger_fd", wrong_mode_ledger)
+
+    nlink_path = make_file(fixture, "ledger-nlink", os.environ["TASK4_GOLDEN"].encode("ascii"))
+    nlink_alias = nlink_path + "-alias"
+    os.link(nlink_path, nlink_alias)
+    nlink_ledger = os.open(nlink_path, ledger_flags)
+    if os.fstat(nlink_ledger).st_nlink != 2:
+        raise SystemExit("nlink fixture did not create a real hard link")
+    run_alt_fd("ledger-nlink", "expected_ledger_fd", nlink_ledger)
+
+    empty_path = make_file(fixture, "ledger-empty", b"")
+    run_alt_fd("ledger-empty", "expected_ledger_fd", os.open(empty_path, ledger_flags))
+    sparse_path = os.path.join(fixture, "ledger-sparse")
+    sparse_fd = os.open(sparse_path, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    os.ftruncate(sparse_fd, 4 * 1024 * 1024 + 1)
+    os.close(sparse_fd)
+    run_alt_fd("ledger-sparse-oversize", "expected_ledger_fd", os.open(sparse_path, ledger_flags))
+    malformed_path = make_file(fixture, "ledger-malformed", b"not input-v1\n")
+    run_alt_fd("ledger-malformed", "expected_ledger_fd", os.open(malformed_path, ledger_flags))
+
+    opath_parent = os.open(parent_root, opath | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    opath_parent_flags = fcntl.fcntl(opath_parent, fcntl.F_GETFL)
+    if not opath_parent_flags & opath or opath_parent_flags & os.O_ACCMODE != os.O_RDONLY:
+        raise SystemExit("O_PATH directory fixture did not expose the misleading read-only bits")
+    run_alt_fd("parent-o-path", "private_parent_fd", opath_parent)
+
+    parent_file_path = make_file(fixture, "parent-wrong-kind", b"not a directory")
+    parent_file = os.open(parent_file_path, ledger_flags)
+    run_alt_fd("parent-wrong-kind", "private_parent_fd", parent_file)
+
+    os.chmod(parent_root, 0o755)
+    wrong_mode_parent = os.open(parent_root, parent_flags)
+    run_alt_fd("parent-wrong-mode", "private_parent_fd", wrong_mode_parent)
+    os.chmod(parent_root, 0o700)
+
+    no_cloexec_parent = os.dup(parent_fd)
+    fcntl.fcntl(no_cloexec_parent, fcntl.F_SETFD, fcntl.fcntl(no_cloexec_parent, fcntl.F_GETFD) & ~fcntl.FD_CLOEXEC)
+    run_alt_fd("parent-no-cloexec", "private_parent_fd", no_cloexec_parent)
+
+    for name, value in (
+        ("repo_root", repo_root + "/"),
+        ("stable_sysroot_root", stable_root + "/."),
+        ("nightly_sysroot_root", nightly_root + "//child/.."),
+        ("vendor_relative", "/vendor"),
+    ):
+        for role in ("expected_ledger_fd", "private_parent_fd"):
+            run_case(f"noncanonical-{name}-{role}", module.FormatError, {name: value}, borrowed=base_borrowed)
+
+    run_case(
+        "root-overlap",
+        module.MutationError,
+        {"stable_sysroot_root": repo_root},
+        borrowed=base_borrowed,
+    )
+
+    foreign_ledger_state = {"calls": 0}
+    original_fstat = os.fstat
+
+    def foreign_ledger_fstat(fd):
+        value = original_fstat(fd)
+        if fd == ledger_fd:
+            foreign_ledger_state["calls"] += 1
+            return StatProxy(value, st_uid=value.st_uid + 1)
+        return value
+
+    run_case(
+        "ledger-foreign-uid",
+        module.FormatError,
+        patches=((module.os, "fstat", foreign_ledger_fstat),),
+        borrowed=base_borrowed,
+        postcheck=lambda: foreign_ledger_state["calls"] >= 1
+        or (_ for _ in ()).throw(SystemExit("ledger foreign uid shim was not reached")),
+    )
+
+    foreign_parent_state = {"calls": 0}
+    original_fstat = os.fstat
+
+    def foreign_parent_fstat(fd):
+        value = original_fstat(fd)
+        if fd == parent_fd:
+            foreign_parent_state["calls"] += 1
+            return StatProxy(value, st_uid=value.st_uid + 1)
+        return value
+
+    run_case(
+        "parent-foreign-uid",
+        module.FormatError,
+        patches=((module.os, "fstat", foreign_parent_fstat),),
+        borrowed=base_borrowed,
+        postcheck=lambda: foreign_parent_state["calls"] >= 1
+        or (_ for _ in ()).throw(SystemExit("parent foreign uid shim was not reached")),
+    )
+
+    writable_parent_state = {"calls": 0}
+    original_fcntl = fcntl.fcntl
+
+    def writable_parent_fcntl(fd, command, *arguments):
+        value = original_fcntl(fd, command, *arguments)
+        if fd == parent_fd and command == fcntl.F_GETFL:
+            writable_parent_state["calls"] += 1
+            return (value & ~os.O_ACCMODE) | os.O_RDWR
+        return value
+
+    run_case(
+        "parent-writable-status",
+        module.FormatError,
+        patches=((fcntl, "fcntl", writable_parent_fcntl),),
+        borrowed=base_borrowed,
+        postcheck=lambda: writable_parent_state["calls"] >= 1
+        or (_ for _ in ()).throw(SystemExit("parent writable-status shim was not reached")),
+    )
+
+    short_state = {"calls": 0, "zero_seen": False, "injected": False}
+    original_pread = os.pread
+
+    def short_pread(fd, size, offset):
+        short_state["calls"] += 1
+        if fd == ledger_fd and offset == 0:
+            if short_state["zero_seen"]:
+                short_state["injected"] = True
+                return b""
+            short_state["zero_seen"] = True
+        return original_pread(fd, size, offset)
+
+    run_case(
+        "post-baseline-short-pread",
+        module.MutationError,
+        patches=((module.os, "pread", short_pread),),
+        borrowed=base_borrowed,
+        postcheck=lambda: (
+            short_state["calls"] >= 2 and short_state["injected"]
+        ) or (_ for _ in ()).throw(SystemExit("short pread shim was not reached")),
+    )
+
+    mutated_bytes = os.environ["TASK4_GOLDEN"].encode("ascii").replace(b"libstd-abc.so", b"libstd-abX.so", 1)
+    byte_state = {"fsync": 0, "injected": False}
+    original_fsync = os.fsync
+    original_pread = os.pread
+
+    def byte_fsync(fd):
+        if fd == parent_fd:
+            byte_state["fsync"] += 1
+        return original_fsync(fd)
+
+    def byte_pread(fd, size, offset):
+        if fd == ledger_fd and byte_state["fsync"]:
+            byte_state["injected"] = True
+            return mutated_bytes[offset : offset + size]
+        return original_pread(fd, size, offset)
+
+    run_case(
+        "ledger-byte-mutation-during-fsync",
+        module.MutationError,
+        patches=((module.os, "fsync", byte_fsync), (module.os, "pread", byte_pread)),
+        borrowed=base_borrowed,
+        postcheck=lambda: (
+            byte_state["fsync"] == 1 and byte_state["injected"]
+        ) or (_ for _ in ()).throw(SystemExit("ledger byte mutation shim was not reached")),
+    )
+
+    identity_state = {"fsync": 0, "injected": False}
+    original_fsync = os.fsync
+    original_fstat = os.fstat
+
+    def identity_fsync(fd):
+        if fd == parent_fd:
+            identity_state["fsync"] += 1
+        return original_fsync(fd)
+
+    def ledger_identity_fstat(fd):
+        value = original_fstat(fd)
+        if fd == ledger_fd and identity_state["fsync"]:
+            identity_state["injected"] = True
+            return StatProxy(value, st_ino=value.st_ino + 1)
+        return value
+
+    run_case(
+        "ledger-identity-mutation-during-fsync",
+        module.MutationError,
+        patches=((module.os, "fsync", identity_fsync), (module.os, "fstat", ledger_identity_fstat)),
+        borrowed=base_borrowed,
+        postcheck=lambda: (
+            identity_state["fsync"] == 1 and identity_state["injected"]
+        ) or (_ for _ in ()).throw(SystemExit("ledger identity mutation shim was not reached")),
+    )
+
+    parent_identity_state = {"fsync": 0, "injected": False}
+    original_fsync = os.fsync
+    original_fstat = os.fstat
+
+    def parent_identity_fsync(fd):
+        if fd == parent_fd:
+            parent_identity_state["fsync"] += 1
+        return original_fsync(fd)
+
+    def parent_identity_fstat(fd):
+        value = original_fstat(fd)
+        if fd == parent_fd and parent_identity_state["fsync"]:
+            parent_identity_state["injected"] = True
+            return StatProxy(value, st_ino=value.st_ino + 1)
+        return value
+
+    run_case(
+        "parent-identity-mutation-during-fsync",
+        module.MutationError,
+        patches=((module.os, "fsync", parent_identity_fsync), (module.os, "fstat", parent_identity_fstat)),
+        borrowed=base_borrowed,
+        postcheck=lambda: (
+            parent_identity_state["fsync"] == 1 and parent_identity_state["injected"]
+        ) or (_ for _ in ()).throw(SystemExit("parent identity mutation shim was not reached")),
+    )
+
+    flag_state = {"fsync": 0, "getfl": 0, "injected_fl": False}
+    original_fsync = os.fsync
+    original_fcntl = fcntl.fcntl
+
+    def flag_fsync(fd):
+        if fd == parent_fd:
+            flag_state["fsync"] += 1
+        return original_fsync(fd)
+
+    def parent_getfl_mutation(fd, command, *arguments):
+        value = original_fcntl(fd, command, *arguments)
+        if fd == parent_fd and command == fcntl.F_GETFL:
+            flag_state["getfl"] += 1
+            if flag_state["fsync"]:
+                flag_state["injected_fl"] = True
+                return value | os.O_NONBLOCK
+        return value
+
+    run_case(
+        "parent-getfl-mutation-during-fsync",
+        module.MutationError,
+        patches=((module.os, "fsync", flag_fsync), (fcntl, "fcntl", parent_getfl_mutation)),
+        borrowed=base_borrowed,
+        postcheck=lambda: (
+            flag_state["fsync"] == 1 and flag_state["getfl"] >= 2 and flag_state["injected_fl"]
+        ) or (_ for _ in ()).throw(SystemExit("parent F_GETFL mutation shim was not reached")),
+    )
+
+    fd_state = {"fsync": 0, "getfd": 0, "injected": False}
+    original_fsync = os.fsync
+    original_fcntl = fcntl.fcntl
+
+    def fd_fsync(fd):
+        if fd == parent_fd:
+            fd_state["fsync"] += 1
+        return original_fsync(fd)
+
+    def parent_getfd_mutation(fd, command, *arguments):
+        value = original_fcntl(fd, command, *arguments)
+        if fd == parent_fd and command == fcntl.F_GETFD:
+            fd_state["getfd"] += 1
+            if fd_state["fsync"]:
+                fd_state["injected"] = True
+                return value & ~fcntl.FD_CLOEXEC
+        return value
+
+    run_case(
+        "parent-getfd-mutation-during-fsync",
+        module.MutationError,
+        patches=((module.os, "fsync", fd_fsync), (fcntl, "fcntl", parent_getfd_mutation)),
+        borrowed=base_borrowed,
+        postcheck=lambda: (
+            fd_state["fsync"] == 1 and fd_state["getfd"] >= 2 and fd_state["injected"]
+        ) or (_ for _ in ()).throw(SystemExit("parent F_GETFD mutation shim was not reached")),
+    )
+
+    ledger_bytes = os.environ["TASK4_GOLDEN"].encode("ascii")
+    mutated_ledger_bytes = ledger_bytes.replace(b"libstd-abc.so", b"libstd-abX.so", 1)
+
+    def fsync_error_case(label, error_number, expected, mutation=None, partial=False):
+        state = {"failed": False, "fsync": 0, "events": [], "ledger_reads": []}
+        original_fsync = os.fsync
+        original_fstat = os.fstat
+        original_pread = os.pread
+        original_fcntl = fcntl.fcntl
+
+        def wrapped_fsync(fd):
+            if fd == parent_fd:
+                state["fsync"] += 1
+                state["failed"] = True
+                raise OSError(error_number, "fixture fsync failure")
+            return original_fsync(fd)
+
+        def wrapped_fstat(fd):
+            value = original_fstat(fd)
+            if state["failed"] and fd == parent_fd:
+                state["events"].append("parent-fstat")
+                if mutation == "parent-identity":
+                    state["parent-identity"] = True
+                    return StatProxy(value, st_ino=value.st_ino + 1)
+            elif state["failed"] and fd == ledger_fd:
+                state["events"].append("ledger-fstat")
+                if mutation == "ledger-identity":
+                    state["ledger-identity"] = True
+                    return StatProxy(value, st_ino=value.st_ino + 1)
+            return value
+
+        def wrapped_pread(fd, size, offset):
+            read_size = min(size, 3) if partial else size
+            value = original_pread(fd, read_size, offset)
+            if state["failed"] and fd == ledger_fd:
+                state["events"].append("ledger-pread")
+                if mutation == "ledger-bytes":
+                    value = mutated_ledger_bytes[offset : offset + read_size]
+                    state["ledger-bytes"] = True
+                state["ledger_reads"].append((offset, len(value)))
+            return value
+
+        def wrapped_fcntl(fd, command, *arguments):
+            value = original_fcntl(fd, command, *arguments)
+            if state["failed"] and fd == parent_fd and command == fcntl.F_GETFL:
+                state["events"].append("parent-getfl")
+                if mutation == "parent-getfl":
+                    state["parent-getfl"] = True
+                    return value | os.O_NONBLOCK
+            if state["failed"] and fd == parent_fd and command == fcntl.F_GETFD:
+                state["events"].append("parent-getfd")
+                if mutation == "parent-getfd":
+                    state["parent-getfd"] = True
+                    return value & ~fcntl.FD_CLOEXEC
+            return value
+
+        def check_rechecks():
+            if state["fsync"] != 1:
+                raise SystemExit(f"{label}: fsync shim was not reached exactly once")
+            events = state["events"]
+            required_parent = ["parent-getfl", "parent-getfd", "parent-fstat"]
+            first_ledger_read = events.index("ledger-pread") if "ledger-pread" in events else -1
+            if first_ledger_read < 0:
+                raise SystemExit(f"{label}: second ledger pread was not reached")
+            if events[:3] != required_parent:
+                raise SystemExit(f"{label}: mandatory parent rechecks were not exact and ordered")
+            reads = state["ledger_reads"]
+            if partial and len(reads) < 2:
+                raise SystemExit(f"{label}: partial capability reread was not multi-chunk")
+            cursor = 0
+            for offset, length in reads:
+                if offset != cursor or length <= 0:
+                    raise SystemExit(f"{label}: second ledger pread was not contiguous")
+                cursor += length
+            if cursor != len(ledger_bytes):
+                raise SystemExit(f"{label}: second ledger pread was incomplete")
+            expected_events = required_parent + ["ledger-pread"] * len(reads) + ["ledger-fstat"]
+            if events != expected_events:
+                raise SystemExit(f"{label}: mandatory recheck event sequence drifted")
+            if mutation is not None and not state.get(mutation):
+                raise SystemExit(f"{label}: requested mutation shim was not reached")
+
+        patches = (
+            (module.os, "fsync", wrapped_fsync),
+            (module.os, "fstat", wrapped_fstat),
+            (module.os, "pread", wrapped_pread),
+            (fcntl, "fcntl", wrapped_fcntl),
+        )
+        run_case(
+            label,
+            expected,
+            patches=patches,
+            borrowed=base_borrowed,
+            postcheck=check_rechecks,
+        )
+
+    capability_names = tuple(dict.fromkeys(("EINVAL", "ENOSYS", "EOPNOTSUPP", "ENOTSUP")))
+    for capability_index, capability_name in enumerate(capability_names):
+        fsync_error_case(
+            f"stable-fsync-capability-refusal-{capability_name}",
+            getattr(errno, capability_name),
+            SystemExit,
+            partial=capability_index == 0,
+        )
+    fsync_error_case("stable-fsync-non-capability-refusal", errno.EIO, module.MutationError)
+    for mutation in (
+        "parent-getfl",
+        "parent-getfd",
+        "parent-identity",
+        "ledger-bytes",
+        "ledger-identity",
+    ):
+        fsync_error_case(
+            f"mutation-{mutation}-wins-over-capability-refusal",
+            errno.EINVAL,
+            module.MutationError,
+            mutation,
+        )
+
+    run_case("valid-refusal-only-runner", SystemExit, borrowed=base_borrowed)
+    os.close(ledger_fd)
+    os.close(parent_fd)
+
 print("input-v1-api-ok")
 "#;
     let output = Command::new("/usr/bin/python3")
@@ -537,6 +1341,7 @@ print("input-v1-api-ok")
         .current_dir(repo)
         .env_clear()
         .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("TASK4_GOLDEN", INPUT_LEDGER_GOLDEN)
         .output()
         .expect("import task4 build-subject script through /usr/bin/python3");
     assert!(

@@ -1,5 +1,7 @@
 #!/usr/bin/python3
 import dataclasses as _dataclasses
+import errno
+import fcntl
 import hashlib as _hashlib
 import os
 import re as _re
@@ -1587,6 +1589,169 @@ def discover_input_v1(
         raise MutationError("filesystem relation could not be reproduced") from exc
     finally:
         close_all()
+
+
+def run_reconciled_build(
+    *,
+    expected_ledger_fd: int,
+    repo_root,
+    vendor_relative: str,
+    stable_sysroot_root,
+    nightly_sysroot_root,
+    private_parent_fd: int,
+) -> "ProductionFreeze":
+    if (
+        type(expected_ledger_fd) is not int
+        or expected_ledger_fd < 0
+        or type(private_parent_fd) is not int
+        or private_parent_fd < 0
+    ):
+        raise FormatError("invalid borrowed descriptor")
+
+    repo_parts = _path(repo_root, "repo_root")
+    stable_parts = _path(stable_sysroot_root, "stable_sysroot_root")
+    nightly_parts = _path(nightly_sysroot_root, "nightly_sysroot_root")
+    _relative(vendor_relative)
+    supplied = (repo_parts, stable_parts, nightly_parts)
+    for index, left in enumerate(supplied):
+        for right in supplied[index + 1 :]:
+            if _beneath(left, right) or _beneath(right, left):
+                raise MutationError("anchor paths overlap")
+
+    try:
+        ledger_flags = fcntl.fcntl(expected_ledger_fd, fcntl.F_GETFL)
+        ledger_value = os.fstat(expected_ledger_fd)
+    except (OSError, TypeError, ValueError) as exc:
+        raise FormatError("borrowed descriptor admission failed") from exc
+
+    opath = getattr(os, "O_PATH", 0)
+    if (
+        type(ledger_flags) is not int
+        or opath and ledger_flags & opath
+        or ledger_flags & os.O_ACCMODE not in {os.O_RDONLY, os.O_RDWR}
+        or not _stat.S_ISREG(ledger_value.st_mode)
+        or ledger_value.st_uid != os.geteuid()
+        or ledger_value.st_mode & 0o7777 != 0o600
+        or ledger_value.st_nlink != 1
+        or not 1 <= ledger_value.st_size <= _MAX_BYTES
+    ):
+        raise FormatError("invalid expected ledger descriptor")
+    ledger_identity = _identity(ledger_value)
+
+    def read_all(fd, size, failure):
+        chunks = []
+        offset = 0
+        while offset < size:
+            try:
+                chunk = os.pread(fd, min(1024 * 1024, size - offset), offset)
+            except Exception as exc:
+                raise failure("ledger read failed") from exc
+            if type(chunk) is not bytes or not chunk or len(chunk) > size - offset:
+                raise failure("ledger read was short")
+            chunks.append(chunk)
+            offset += len(chunk)
+        return b"".join(chunks)
+
+    first = read_all(expected_ledger_fd, ledger_value.st_size, MutationError)
+    try:
+        first_value = os.fstat(expected_ledger_fd)
+    except Exception as exc:
+        raise MutationError("expected ledger changed after admission") from exc
+    try:
+        first_identity = _identity(first_value)
+    except Exception as exc:
+        raise MutationError("expected ledger changed after admission") from exc
+    if first_identity != ledger_identity:
+        raise MutationError("expected ledger changed after admission")
+    parse_ledger(first)
+
+    try:
+        parent_flags = fcntl.fcntl(private_parent_fd, fcntl.F_GETFL)
+        parent_fd_flags = fcntl.fcntl(private_parent_fd, fcntl.F_GETFD)
+        parent_value = os.fstat(private_parent_fd)
+    except (OSError, TypeError, ValueError) as exc:
+        raise FormatError("borrowed descriptor admission failed") from exc
+    if (
+        type(parent_flags) is not int
+        or type(parent_fd_flags) is not int
+        or opath and parent_flags & opath
+        or parent_flags & os.O_ACCMODE != os.O_RDONLY
+        or not parent_fd_flags & fcntl.FD_CLOEXEC
+        or not _stat.S_ISDIR(parent_value.st_mode)
+        or parent_value.st_uid != os.geteuid()
+        or parent_value.st_mode & 0o7777 != 0o700
+    ):
+        raise FormatError("invalid private parent descriptor")
+    parent_identity = _identity(parent_value)
+
+    fsync_error = None
+    try:
+        os.fsync(private_parent_fd)
+    except Exception as exc:
+        fsync_error = exc
+
+    first_failure = None
+    current_parent_flags = None
+    current_parent_fd_flags = None
+    current_parent_identity = None
+    try:
+        current_parent_flags = fcntl.fcntl(private_parent_fd, fcntl.F_GETFL)
+        if type(current_parent_flags) is not int:
+            raise TypeError("invalid parent F_GETFL result")
+    except Exception:
+        current_parent_flags = None
+        first_failure = MutationError("private parent F_GETFL failed")
+    try:
+        current_parent_fd_flags = fcntl.fcntl(private_parent_fd, fcntl.F_GETFD)
+        if type(current_parent_fd_flags) is not int:
+            raise TypeError("invalid parent F_GETFD result")
+    except Exception:
+        current_parent_fd_flags = None
+        if first_failure is None:
+            first_failure = MutationError("private parent F_GETFD failed")
+    try:
+        current_parent_identity = _identity(os.fstat(private_parent_fd))
+    except Exception:
+        current_parent_identity = None
+        if first_failure is None:
+            first_failure = MutationError("private parent fstat failed")
+
+    second = None
+    try:
+        second = read_all(expected_ledger_fd, ledger_value.st_size, MutationError)
+    except Exception:
+        if first_failure is None:
+            first_failure = MutationError("second ledger read failed")
+    second_identity = None
+    try:
+        second_identity = _identity(os.fstat(expected_ledger_fd))
+    except Exception:
+        if first_failure is None:
+            first_failure = MutationError("second ledger fstat failed")
+    if first_failure is not None:
+        raise first_failure
+    parent_changed = (
+        current_parent_flags != parent_flags
+        or current_parent_fd_flags != parent_fd_flags
+        or current_parent_identity != parent_identity
+    )
+    if parent_changed or second_identity != ledger_identity or second != first:
+        raise MutationError("expected ledger changed after fsync")
+    if (
+        fsync_error is not None
+        and (
+            not isinstance(fsync_error, OSError)
+            or fsync_error.errno
+            not in {
+                errno.EINVAL,
+                errno.ENOSYS,
+                errno.EOPNOTSUPP,
+                errno.ENOTSUP,
+            }
+        )
+    ):
+        raise MutationError("private parent fsync failed") from fsync_error
+    raise SystemExit(77)
 
 
 if __name__ == "__main__":

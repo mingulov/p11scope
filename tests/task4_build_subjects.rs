@@ -1795,6 +1795,19 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         stage2_expected(ledger_event="dup-L", parent_event="open-P"),
         close_error="parent-keyboardinterrupt",
     )
+    run_stage2_case(
+        "stage2-combined-private-keyboardinterrupt-parent-close-error",
+        [
+            "dup-L",
+            "open-P",
+            "L-getfl-KeyboardInterrupt",
+            "close-P",
+            "close-L",
+            "MutationError",
+        ],
+        failure=("L-getfl", "KeyboardInterrupt"),
+        close_error="parent",
+    )
 
     read_write_ledger = os.open(
         ledger_path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW

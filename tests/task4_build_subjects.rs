@@ -13892,7 +13892,7 @@ print("bs2b-s9-native-ptrace-lifecycle-ok")
                 .chunks_exact(128)
                 .filter(|record| {
                     u16::from_le_bytes(record[10..12].try_into().unwrap()) == CHILD_JOIN
-                        && u64::from_le_bytes(record[24..32].try_into().unwrap()) != 1
+                        && u64::from_le_bytes(record[40..48].try_into().unwrap()) != 1
                 })
                 .count();
             assert_eq!(clone_entries, 1, "RED2 clone3 entry count changed");

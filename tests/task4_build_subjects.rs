@@ -11519,11 +11519,9 @@ fn bs2b_s9_fcntl_experiment_normalization_privacy_contracts() {
         put_raw_u64(&mut bytes, 25, 24, value);
         add_rejection(name, bytes);
     }
-    for (name, value) in [("ordinal-creation-zero", 0), ("ordinal-creation-cap", 4097)] {
-        let mut bytes = raw_golden.clone();
-        put_raw_u64(&mut bytes, 3, 24, value);
-        add_rejection(name, bytes);
-    }
+    let mut bytes = raw_golden.clone();
+    put_raw_u64(&mut bytes, 3, 24, 0);
+    add_rejection("ordinal-creation-zero", bytes);
     let mut bytes = raw_golden.clone();
     put_raw_u64(&mut bytes, 4, 24, 99);
     add_rejection("creation-event-ordinal", bytes);
@@ -11809,6 +11807,46 @@ fn bs2b_s9_fcntl_experiment_normalization_privacy_contracts() {
             .collect::<Vec<_>>()
             .join("\x1e")
     };
+    let mut creation_scale_raw = Vec::with_capacity(8199 * 128);
+    let mut append_creation_scale = |mut bytes: [u8; 128]| {
+        put_u64(&mut bytes, 16, (creation_scale_raw.len() / 128) as u64);
+        creation_scale_raw.extend_from_slice(&bytes);
+    };
+    let mut bytes = record(0, 1);
+    put_u32(&mut bytes, 24, 128);
+    put_u32(&mut bytes, 28, 0x0102_0304);
+    append_creation_scale(bytes);
+    let mut bytes = record(1, 0x10);
+    put_u64(&mut bytes, 24, 1);
+    append_creation_scale(bytes);
+    let mut bytes = record(2, 0x16);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 40, 1);
+    put_u16(&mut bytes, 48, 1);
+    append_creation_scale(bytes);
+    for creation in 1..=4097 {
+        let mut bytes = record(0, 0x11);
+        put_u64(&mut bytes, 24, creation);
+        put_u64(&mut bytes, 32, 1);
+        put_u16(&mut bytes, 40, 1);
+        append_creation_scale(bytes);
+        let mut bytes = record(0, 0x13);
+        put_u64(&mut bytes, 24, creation);
+        put_u64(&mut bytes, 32, 1);
+        put_u16(&mut bytes, 40, 0);
+        put_u16(&mut bytes, 42, 1);
+        append_creation_scale(bytes);
+    }
+    let mut bytes = record(0, 0x17);
+    put_u64(&mut bytes, 24, 1);
+    put_u32(&mut bytes, 32, 0);
+    append_creation_scale(bytes);
+    let mut bytes = record(0, 0x18);
+    put_u64(&mut bytes, 24, 1);
+    put_u32(&mut bytes, 32, 0);
+    append_creation_scale(bytes);
+    assert_eq!(creation_scale_raw.len(), 8199 * 128);
+
     let mut normalizations = Vec::<String>::new();
     let mut add_norm = |name: &str, command: u64, argument: u64, result: u64, expected: &str| {
         normalizations.push(format!(
@@ -12291,6 +12329,12 @@ if held_case in ("alias", "kind", "mode", "link", "uid", "pre-invalid"):
     else:
         held_invalid("held-" + held_case)
     raise SystemExit(64)
+elif held_case == "creation-scale":
+    if module._parse_raw(0) != {}:
+        fail("held-creation-scale", "failed creations produced aggregate rows")
+    if os.fstat(1).st_size != 0:
+        fail("held-creation-scale", "positive parse changed output")
+    raise SystemExit(0)
 elif held_case == "changed-during-read":
     raw_before = os.pread(0, 1 << 20, 0)
     real_pread = os.pread
@@ -12446,7 +12490,7 @@ raise SystemExit(0)
             .expect("rewind BS2b-S9 regular fixture");
         (path, file)
     };
-    let run_held = |case: &str, expected_status: i32, raw: std::fs::File, output: std::fs::File| {
+    let run_held = |case: &str, expected_status: i32, raw: Stdio, output: std::fs::File| {
         let child = Command::new("/usr/bin/python3")
             .args(["-c", driver, script.to_str().expect("script path is UTF-8")])
             .current_dir(repo)
@@ -12461,7 +12505,7 @@ raise SystemExit(0)
             .env("TASK4_NORMALIZATION_CASES", &normalization_cases)
             .env("TASK4_AGGREGATE_CASES", &aggregate_cases)
             .env("TASK4_HELD_CASE", case)
-            .stdin(Stdio::from(raw))
+            .stdin(raw)
             .stdout(Stdio::from(output))
             .stderr(Stdio::piped())
             .spawn()
@@ -12489,7 +12533,7 @@ raise SystemExit(0)
 
     let (raw_path, raw_file) = create_regular("success-raw", &raw_golden);
     let (output_path, output_file) = create_regular("success-output", &[]);
-    run_held("success", 0, raw_file, output_file);
+    run_held("success", 0, Stdio::from(raw_file), output_file);
     assert_regular(&output_path);
     assert_eq!(
         fs::read(&output_path).expect("read successful aggregate"),
@@ -12498,11 +12542,27 @@ raise SystemExit(0)
     fs::remove_file(raw_path).expect("remove successful raw fixture");
     fs::remove_file(output_path).expect("remove successful output fixture");
 
+    let (raw_path, raw_file) = create_regular("creation-scale-raw", &creation_scale_raw);
+    let (output_path, output_file) = create_regular("creation-scale-output", &[]);
+    run_held("creation-scale", 0, Stdio::from(raw_file), output_file);
+    assert_eq!(
+        fs::read(&raw_path).expect("read creation-scale raw fixture"),
+        creation_scale_raw
+    );
+    assert_regular(&output_path);
+    assert!(
+        fs::read(&output_path)
+            .expect("read creation-scale output")
+            .is_empty()
+    );
+    fs::remove_file(raw_path).expect("remove creation-scale raw fixture");
+    fs::remove_file(output_path).expect("remove creation-scale output fixture");
+
     let (raw_path, raw_file) = create_regular("offset-raw", &raw_golden);
     let (output_path, output_file) = create_regular("offset-output", &[]);
     let mut raw_probe = raw_file.try_clone().expect("clone offset raw probe");
     let mut output_probe = output_file.try_clone().expect("clone offset output probe");
-    run_held("offset", 0, raw_file, output_file);
+    run_held("offset", 0, Stdio::from(raw_file), output_file);
     assert_eq!(
         raw_probe
             .seek(SeekFrom::Current(0))
@@ -12525,7 +12585,7 @@ raise SystemExit(0)
 
     let (raw_path, raw_file) = create_regular("taint-raw", &raw_golden);
     let (output_path, output_file) = create_regular("taint-output", &[]);
-    run_held("taint", 65, raw_file, output_file);
+    run_held("taint", 65, Stdio::from(raw_file), output_file);
     assert_regular(&output_path);
     assert!(
         fs::metadata(&output_path)
@@ -12538,7 +12598,7 @@ raise SystemExit(0)
 
     let (raw_path, raw_file) = create_regular("invalid-raw", &raw_golden[..raw_golden.len() - 128]);
     let (output_path, output_file) = create_regular("invalid-output", &[]);
-    run_held("pre-invalid", 64, raw_file, output_file);
+    run_held("pre-invalid", 64, Stdio::from(raw_file), output_file);
     assert_regular(&output_path);
     assert!(
         fs::read(&output_path)
@@ -12550,7 +12610,12 @@ raise SystemExit(0)
 
     let (raw_path, raw_file) = create_regular("changed-raw", &raw_golden);
     let (output_path, output_file) = create_regular("changed-output", &[]);
-    run_held("changed-during-read", 64, raw_file, output_file);
+    run_held(
+        "changed-during-read",
+        64,
+        Stdio::from(raw_file),
+        output_file,
+    );
     assert_eq!(
         fs::read(&raw_path).expect("read changed raw fixture"),
         raw_golden
@@ -12566,7 +12631,7 @@ raise SystemExit(0)
 
     let (raw_path, raw_file) = create_regular("output-race-raw", &raw_golden);
     let (output_path, output_file) = create_regular("output-race-output", &[]);
-    run_held("output-race", 64, raw_file, output_file);
+    run_held("output-race", 64, Stdio::from(raw_file), output_file);
     assert_regular(&output_path);
     assert_eq!(
         fs::read(&output_path).expect("read output-race output"),
@@ -12579,7 +12644,7 @@ raise SystemExit(0)
     fs::set_permissions(&raw_path, fs::Permissions::from_mode(0o644))
         .expect("set wrong BS2b-S9 raw mode");
     let (output_path, output_file) = create_regular("mode-output", &[]);
-    run_held("mode", 64, raw_file, output_file);
+    run_held("mode", 64, Stdio::from(raw_file), output_file);
     assert_regular(&output_path);
     assert!(fs::read(&output_path).expect("read mode output").is_empty());
     fs::remove_file(raw_path).expect("remove mode raw fixture");
@@ -12589,7 +12654,7 @@ raise SystemExit(0)
     let link_path = temp_root.join("link-alias");
     fs::hard_link(&raw_path, &link_path).expect("create BS2b-S9 hard link");
     let (output_path, output_file) = create_regular("link-output", &[]);
-    run_held("link", 64, raw_file, output_file);
+    run_held("link", 64, Stdio::from(raw_file), output_file);
     assert_eq!(
         fs::read(&raw_path).expect("read linked raw fixture"),
         raw_golden
@@ -12606,30 +12671,22 @@ raise SystemExit(0)
         .write(true)
         .open(&raw_path)
         .expect("open BS2b-S9 alias raw fixture");
-    run_held("alias", 64, raw_file, alias_file);
+    run_held("alias", 64, Stdio::from(raw_file), alias_file);
     assert_eq!(
         fs::read(&raw_path).expect("read alias raw fixture"),
         raw_golden
     );
     fs::remove_file(raw_path).expect("remove alias raw fixture");
 
-    let kind_path = temp_root.join("kind-raw");
-    fs::create_dir(&kind_path).expect("create BS2b-S9 directory raw fixture");
-    fs::set_permissions(&kind_path, fs::Permissions::from_mode(0o700))
-        .expect("set BS2b-S9 directory raw mode");
-    let raw_file = std::fs::File::open(&kind_path).expect("open BS2b-S9 directory raw fixture");
-    fs::set_permissions(&kind_path, fs::Permissions::from_mode(0o600))
-        .expect("set accessible BS2b-S9 directory mode");
     let (output_path, output_file) = create_regular("kind-output", &[]);
-    run_held("kind", 64, raw_file, output_file);
+    run_held("kind", 64, Stdio::piped(), output_file);
     assert_regular(&output_path);
     assert!(fs::read(&output_path).expect("read kind output").is_empty());
-    fs::remove_dir(&kind_path).expect("remove kind raw fixture");
     fs::remove_file(output_path).expect("remove kind output fixture");
 
     let (raw_path, raw_file) = create_regular("uid-raw", &raw_golden);
     let (output_path, output_file) = create_regular("uid-output", &[]);
-    run_held("uid", 64, raw_file, output_file);
+    run_held("uid", 64, Stdio::from(raw_file), output_file);
     assert_regular(&output_path);
     assert!(fs::read(&output_path).expect("read uid output").is_empty());
     fs::remove_file(raw_path).expect("remove uid raw fixture");

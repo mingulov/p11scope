@@ -1821,6 +1821,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         "pass": 0,
         "pass1_fstat": 0,
         "pass2_fstat": 0,
+        "custody_fstat": 0,
     }
     original_pread = os.pread
     original_fstat = os.fstat
@@ -1859,6 +1860,9 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             elif partial_state["pass"] == 2 and partial_state["pass2_fstat"] == 0:
                 partial_state["pass2_fstat"] = 1
                 partial_state["events"].append("ledger-fstat-pass2")
+            elif partial_state["pass"] == 2 and partial_state["custody_fstat"] == 0:
+                partial_state["custody_fstat"] = 1
+                partial_state["events"].append("ledger-fstat-custody")
             else:
                 partial_state["events"].append("ledger-fstat-extra")
         return value
@@ -1879,9 +1883,14 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         expected_events.append("ledger-fstat-pass1")
         expected_events.extend("ledger-pread-pass2" for _ in range(passes.count(2)))
         expected_events.append("ledger-fstat-pass2")
+        expected_events.append("ledger-fstat-custody")
         if partial_state["events"] != expected_events:
             raise SystemExit("positive partial pread/fstat event order drifted")
-        if partial_state["pass1_fstat"] != 1 or partial_state["pass2_fstat"] != 1:
+        if (
+            partial_state["pass1_fstat"] != 1
+            or partial_state["pass2_fstat"] != 1
+            or partial_state["custody_fstat"] != 1
+        ):
             raise SystemExit("positive partial pread terminal fstats were not unique")
         for pass_number in (1, 2):
             pass_offsets = [offset for offset, pass_value in zip(offsets, passes) if pass_value == pass_number]

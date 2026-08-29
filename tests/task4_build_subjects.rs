@@ -11435,6 +11435,97 @@ fn bs2b_s9_fcntl_experiment_normalization_privacy_contracts() {
         raw_golden.extend_from_slice(bytes);
     }
 
+    let clone_exitless_raw = |syscall_kind: u16,
+                              event_kind: u16,
+                              child_group: u64,
+                              child_status: u32,
+                              active_fcntl: bool| {
+        let mut raw = Vec::with_capacity(if active_fcntl { 11 } else { 10 } * 128);
+        let mut push = |mut bytes: [u8; 128]| {
+            put_u64(&mut bytes, 16, (raw.len() / 128) as u64);
+            raw.extend_from_slice(&bytes);
+        };
+
+        let mut bytes = record(0, 1);
+        put_u32(&mut bytes, 24, 128);
+        put_u32(&mut bytes, 28, 0x0102_0304);
+        push(bytes);
+        let mut bytes = record(1, 0x10);
+        put_u64(&mut bytes, 24, 1);
+        push(bytes);
+        let mut bytes = record(2, 0x16);
+        put_u64(&mut bytes, 24, 1);
+        put_u64(&mut bytes, 40, 1);
+        put_u16(&mut bytes, 48, 1);
+        push(bytes);
+        let mut bytes = record(3, 0x11);
+        put_u64(&mut bytes, 24, 1);
+        put_u64(&mut bytes, 32, 1);
+        put_u16(&mut bytes, 40, syscall_kind);
+        push(bytes);
+        let mut bytes = record(4, 0x12);
+        put_u64(&mut bytes, 24, 1);
+        put_u64(&mut bytes, 32, 1);
+        put_u16(&mut bytes, 40, event_kind);
+        push(bytes);
+        let mut bytes = record(5, 0x14);
+        put_u64(&mut bytes, 24, 1);
+        put_u64(&mut bytes, 32, 1);
+        put_u64(&mut bytes, 40, 2);
+        put_u64(&mut bytes, 48, child_group);
+        put_u16(&mut bytes, 56, event_kind);
+        push(bytes);
+        if event_kind == 2 {
+            let mut bytes = record(6, 0x15);
+            put_u64(&mut bytes, 24, 1);
+            put_u64(&mut bytes, 32, 1);
+            put_u64(&mut bytes, 40, 2);
+            push(bytes);
+        }
+        let mut bytes = record(6, 0x13);
+        put_u64(&mut bytes, 24, 1);
+        put_u64(&mut bytes, 32, 1);
+        put_u16(&mut bytes, 40, 1);
+        push(bytes);
+        let mut bytes = record(7, 0x17);
+        put_u64(&mut bytes, 24, 1);
+        put_u32(&mut bytes, 32, 0);
+        push(bytes);
+        let mut bytes = record(8, 0x18);
+        put_u64(&mut bytes, 24, 1);
+        put_u32(&mut bytes, 32, 0);
+        push(bytes);
+        if active_fcntl {
+            let mut bytes = record(9, 0x20);
+            put_u64(&mut bytes, 24, 1);
+            put_u64(&mut bytes, 32, 2);
+            push(bytes);
+        }
+        let mut bytes = record(if active_fcntl { 10 } else { 9 }, 0x18);
+        put_u64(&mut bytes, 24, 2);
+        put_u32(&mut bytes, 32, child_status);
+        push(bytes);
+        raw
+    };
+    let clone_exitless_positive = clone_exitless_raw(3, 3, 1, 9, false);
+    let clone_exitless_negative_cases = [
+        ("clone-exitless-fork", clone_exitless_raw(1, 1, 2, 9, false)),
+        (
+            "clone-exitless-vfork",
+            clone_exitless_raw(2, 2, 2, 9, false),
+        ),
+        ("clone-exitless-non9", clone_exitless_raw(3, 3, 1, 0, false)),
+        (
+            "clone-exitless-active-fcntl",
+            clone_exitless_raw(3, 3, 1, 9, true),
+        ),
+    ];
+    let clone_exitless_negative_cases = clone_exitless_negative_cases
+        .iter()
+        .map(|(name, bytes)| format!("{name}\x1f{}", hex(bytes)))
+        .collect::<Vec<_>>()
+        .join("\x1e");
+
     let expected_json = concat!(
         "{\"authority\":\"non-production-experiment-only\",\"rows\":[",
         "{\"argument\":\"zero\",\"command\":\"dupfd\",\"count\":1,",
@@ -12203,6 +12294,20 @@ def parse_duplicate(fd):
         fail("duplicate raw", "rows did not merge")
 with_raw(duplicate_raw, parse_duplicate)
 
+clone_exitless = bytes.fromhex(os.environ["TASK4_CLONE_EXITLESS_RAW"])
+def parse_clone_exitless(fd):
+    try:
+        rows = module._parse_raw(fd)
+    except module.ContractError as exc:
+        fail("clone-exitless-positive", f"parser rejected positive journal: {exc}")
+    if rows != {}:
+        fail("clone-exitless-positive", f"expected empty rows, got {rows!r}")
+with_raw(clone_exitless, parse_clone_exitless)
+
+for item in filter(None, os.environ["TASK4_CLONE_EXITLESS_NEGATIVE_CASES"].split("\x1e")):
+    label, encoded = item.split("\x1f", 1)
+    expect_invalid(label, lambda encoded=encoded: with_raw(bytes.fromhex(encoded), module._parse_raw))
+
 for item in filter(None, os.environ["TASK4_RAW_CASES"].split("\x1e")):
     label, encoded = item.split("\x1f", 1)
     expect_invalid(label, lambda encoded=encoded: with_raw(bytes.fromhex(encoded), module._parse_raw))
@@ -12442,6 +12547,11 @@ raise SystemExit(0)
             .env("TASK4_EXPECTED_JSON", expected_json)
             .env("TASK4_DUPLICATE_RAW", hex(&duplicate_raw))
             .env("TASK4_DUPLICATE_JSON", duplicate_json)
+            .env("TASK4_CLONE_EXITLESS_RAW", hex(&clone_exitless_positive))
+            .env(
+                "TASK4_CLONE_EXITLESS_NEGATIVE_CASES",
+                &clone_exitless_negative_cases,
+            )
             .env("TASK4_RAW_CASES", serialize_cases(chunk))
             .env("TASK4_NORMALIZATION_CASES", &normalization_cases)
             .env("TASK4_AGGREGATE_CASES", &aggregate_cases)
@@ -12501,6 +12611,11 @@ raise SystemExit(0)
             .env("TASK4_EXPECTED_JSON", expected_json)
             .env("TASK4_DUPLICATE_RAW", hex(&duplicate_raw))
             .env("TASK4_DUPLICATE_JSON", duplicate_json)
+            .env("TASK4_CLONE_EXITLESS_RAW", hex(&clone_exitless_positive))
+            .env(
+                "TASK4_CLONE_EXITLESS_NEGATIVE_CASES",
+                &clone_exitless_negative_cases,
+            )
             .env("TASK4_RAW_CASES", "")
             .env("TASK4_NORMALIZATION_CASES", &normalization_cases)
             .env("TASK4_AGGREGATE_CASES", &aggregate_cases)
@@ -13738,13 +13853,30 @@ print("bs2b-s9-native-ptrace-lifecycle-ok")
         }
         if case == "kernel-clone" {
             assert_eq!(
-                exit_statuses,
-                BTreeMap::from([(1, 0), (2, 9)]),
-                "RED2 clone EXIT_EVENT statuses changed"
+                exit_statuses.get(&1),
+                Some(&0),
+                "RED2 clone root EXIT_EVENT status changed"
             );
             assert_eq!(
-                wif_statuses, exit_statuses,
-                "RED2 clone EXIT_EVENT/FINAL_WIF bytes differ"
+                wif_statuses,
+                BTreeMap::from([(1, 0), (2, 9)]),
+                "RED2 clone FINAL_WIF statuses changed"
+            );
+            assert!(
+                exit_statuses == BTreeMap::from([(1, 0)])
+                    || exit_statuses == BTreeMap::from([(1, 0), (2, 9)]),
+                "RED2 clone EXIT_EVENT statuses changed"
+            );
+        }
+        if case == "sim-event-first" {
+            assert_eq!(
+                wif_statuses.get(&4),
+                Some(&9),
+                "RED2 simulated clone FINAL_WIF status changed"
+            );
+            assert!(
+                !exit_statuses.contains_key(&4),
+                "RED2 simulated clone EXIT_EVENT was synthesized"
             );
         }
         assert_eq!(
@@ -13865,32 +13997,50 @@ print("bs2b-s9-native-ptrace-lifecycle-ok")
                 "RED2 required lifecycle kind missing"
             );
         }
-        for (generation, status) in &wif_statuses {
-            assert_eq!(
-                exit_statuses.get(generation),
-                Some(status),
-                "RED2 EXIT/WIF status changed"
-            );
-        }
-        for (generation, status) in &exit_statuses {
-            if exec_superseded.contains(generation) {
-                assert!(
-                    !wif_statuses.contains_key(generation),
-                    "RED2 superseded generation received WIF"
-                );
-            } else {
+        if case != "kernel-clone" {
+            for (generation, status) in &wif_statuses {
+                if case == "sim-event-first" && *generation == 4 {
+                    continue;
+                }
                 assert_eq!(
-                    wif_statuses.get(generation),
+                    exit_statuses.get(generation),
                     Some(status),
-                    "RED2 live generation lost WIF"
+                    "RED2 EXIT/WIF status changed"
                 );
             }
+            for (generation, status) in &exit_statuses {
+                if exec_superseded.contains(generation) {
+                    assert!(
+                        !wif_statuses.contains_key(generation),
+                        "RED2 superseded generation received WIF"
+                    );
+                } else {
+                    assert_eq!(
+                        wif_statuses.get(generation),
+                        Some(status),
+                        "RED2 live generation lost WIF"
+                    );
+                }
+            }
         }
-        assert_eq!(
-            counts.get(&EXIT_EVENT).copied().unwrap_or_default(),
-            counts.get(&FINAL_WIF).copied().unwrap_or_default() + exec_superseded.len(),
-            "RED2 terminal generation equation changed"
-        );
+        if case == "sim-event-first" {
+            assert_eq!(
+                counts.get(&EXIT_EVENT).copied().unwrap_or_default() + 1,
+                counts.get(&FINAL_WIF).copied().unwrap_or_default() + exec_superseded.len(),
+                "RED2 simulated direct-WIF terminal equation changed"
+            );
+        } else if case == "kernel-clone" {
+            assert!(
+                (1..=2).contains(&counts.get(&EXIT_EVENT).copied().unwrap_or_default()),
+                "RED2 clone EXIT_EVENT count changed"
+            );
+        } else {
+            assert_eq!(
+                counts.get(&EXIT_EVENT).copied().unwrap_or_default(),
+                counts.get(&FINAL_WIF).copied().unwrap_or_default() + exec_superseded.len(),
+                "RED2 terminal generation equation changed"
+            );
+        }
         assert_eq!(
             exec_superseded.len(),
             if case == "kernel-nonleader-exec" {
@@ -13902,13 +14052,31 @@ print("bs2b-s9-native-ptrace-lifecycle-ok")
         );
         let count = |kind: u16| counts.get(&kind).copied().unwrap_or_default();
         let expected_kind_counts: &[(u16, usize)] = match case {
+            "sim-event-first" => &[
+                (EXEC_EVENT, 1),
+                (CREATE_ENTRY, 3),
+                (CREATE_EVENT, 3),
+                (CREATE_EXIT, 3),
+                (CHILD_JOIN, 3),
+                (EXIT_EVENT, 3),
+                (FINAL_WIF, 4),
+            ],
             "kernel-bootstrap" => &[(EXEC_EVENT, 1)],
-            "kernel-fork" | "kernel-clone" => &[
+            "kernel-fork" => &[
                 (CREATE_EVENT, 1),
                 (CREATE_EXIT, 1),
                 (CHILD_JOIN, 1),
                 (EXEC_EVENT, 1),
                 (EXIT_EVENT, 2),
+                (FINAL_WIF, 2),
+                (FCNTL_ENTRY, 2),
+                (FCNTL_EXIT, 2),
+            ],
+            "kernel-clone" => &[
+                (CREATE_EVENT, 1),
+                (CREATE_EXIT, 1),
+                (CHILD_JOIN, 1),
+                (EXEC_EVENT, 1),
                 (FINAL_WIF, 2),
                 (FCNTL_ENTRY, 2),
                 (FCNTL_EXIT, 2),
@@ -13977,7 +14145,7 @@ print("bs2b-s9-native-ptrace-lifecycle-ok")
                 count(FINAL_WIF) + exec_superseded.len(),
                 "RED2 sole exec supersede changed"
             );
-        } else {
+        } else if case != "sim-event-first" && case != "kernel-clone" {
             assert_eq!(
                 count(EXIT_EVENT),
                 count(FINAL_WIF),
@@ -14020,9 +14188,111 @@ print("bs2b-s9-native-ptrace-lifecycle-ok")
                         && u64::from_le_bytes(record[40..48].try_into().unwrap()) != 1
                 })
                 .count();
-            assert_eq!(clone_entries, 1, "RED2 clone3 entry count changed");
-            assert_eq!(clone_events, 1, "RED2 clone3 event count changed");
-            assert_eq!(clone_joins, 2, "RED2 clone3 join count changed");
+            assert_eq!(
+                clone_entries,
+                if case == "sim-event-first" { 2 } else { 1 },
+                "RED2 clone3 entry count changed"
+            );
+            assert_eq!(
+                clone_events,
+                if case == "sim-event-first" { 2 } else { 1 },
+                "RED2 clone3 event count changed"
+            );
+            assert_eq!(
+                clone_joins,
+                if case == "sim-event-first" { 3 } else { 2 },
+                "RED2 clone3 join count changed"
+            );
+        }
+        if case == "sim-event-first" {
+            let read_u16 = |record: &[u8], offset| {
+                u16::from_le_bytes(record[offset..offset + 2].try_into().unwrap())
+            };
+            let read_u64 = |record: &[u8], offset| {
+                u64::from_le_bytes(record[offset..offset + 8].try_into().unwrap())
+            };
+            let find = |kind, ordinal| {
+                bytes.chunks_exact(128).enumerate().find(|(_, record)| {
+                    read_u16(record, 10) == kind && read_u64(record, 24) == ordinal
+                })
+            };
+            let (clone_entry, entry) =
+                find(CREATE_ENTRY, 3).expect("RED2 simulated clone entry missing");
+            assert_eq!(
+                read_u64(entry, 32),
+                1,
+                "RED2 simulated clone entry parent changed"
+            );
+            assert_eq!(
+                read_u16(entry, 40),
+                4,
+                "RED2 simulated clone syscall changed"
+            );
+            let (clone_event, event) =
+                find(CREATE_EVENT, 3).expect("RED2 simulated clone event missing");
+            assert_eq!(
+                read_u64(event, 32),
+                1,
+                "RED2 simulated clone event parent changed"
+            );
+            assert_eq!(
+                read_u16(event, 40),
+                3,
+                "RED2 simulated clone event kind changed"
+            );
+            let (clone_exit, exit) =
+                find(CREATE_EXIT, 3).expect("RED2 simulated clone result missing");
+            assert_eq!(
+                read_u64(exit, 32),
+                1,
+                "RED2 simulated clone result parent changed"
+            );
+            assert_eq!(
+                &exit[40..44],
+                &[1, 0, 0, 0],
+                "RED2 simulated clone result changed"
+            );
+            let (clone_join, join) =
+                find(CHILD_JOIN, 3).expect("RED2 simulated clone join missing");
+            assert_eq!(
+                read_u64(join, 32),
+                1,
+                "RED2 simulated clone join parent changed"
+            );
+            assert_eq!(
+                read_u64(join, 40),
+                4,
+                "RED2 simulated clone child generation changed"
+            );
+            assert_eq!(
+                read_u64(join, 48),
+                1,
+                "RED2 simulated clone thread group changed"
+            );
+            assert_eq!(
+                read_u16(join, 56),
+                3,
+                "RED2 simulated clone join kind changed"
+            );
+            let (clone_wif, wif) =
+                find(FINAL_WIF, 4).expect("RED2 simulated clone FINAL_WIF missing");
+            assert_eq!(
+                read_u64(wif, 24),
+                4,
+                "RED2 simulated clone generation changed"
+            );
+            assert_eq!(
+                u32::from_le_bytes(wif[32..36].try_into().unwrap()),
+                9,
+                "RED2 simulated clone FINAL_WIF status changed"
+            );
+            assert!(
+                clone_entry < clone_event
+                    && clone_event < clone_exit
+                    && clone_exit < clone_join
+                    && clone_join < clone_wif,
+                "RED2 simulated clone lifecycle order changed"
+            );
         }
         fs::remove_file(path).expect("remove RED2 raw evidence");
     }

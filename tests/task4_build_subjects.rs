@@ -855,7 +855,14 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         return (site == role or site == f"edge-{edge_index}") and case[2] == variant
 
     def stage3_a1_injection(case, family, index):
-        if family == "gb" and stage3_a1_options(case).get("safe_failure") == "GB" and index == 0:
+        if (
+            family == "gb"
+            and index < len(stage3_a1_expected_bindings)
+            and stage3_a1_options(case).get("ki_token")
+            == stage3_a1_expected_bindings[index]
+        ):
+            return "KeyboardInterrupt"
+        if family == "gb" and stage3_a1_options(case).get("safe_failure") in {"GB", "GB-KI"} and index == 0:
             return "error"
         if case is not None and case[0] == f"stage3a1-{family}-mutation" and case[1] == index:
             return case[2]
@@ -871,6 +878,42 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         if case is not None and case[0] == "stage3a1-lineage-mutation" and index in case[1:3]:
             return ("lineage", case[3])
         return None
+
+    def stage3_a1_fp_fault(case, token):
+        options = stage3_a1_options(case)
+        if options.get("fp_error") == token:
+            return "error"
+        if options.get("fp_mismatch") == token:
+            return "mismatch"
+        return None
+
+    def stage3_a1_expected_fp_events(state):
+        options = stage3_a1_options(state["stage3_case"])
+        stop = (
+            options.get("fp_error")
+            or options.get("fp_mismatch")
+            or options.get("ki_token")
+        )
+        parent = stage3_a1_final_private[-3:]
+        if stop in stage3_a1_final_private[:3]:
+            index = stage3_a1_final_private.index(stop)
+            return stage3_a1_final_private[: index + 1] + parent
+        if stop in {"private-L-pread", "private-L-pread-attempt"}:
+            return (
+                *stage3_a1_final_private[:3],
+                "private-L-pread-attempt",
+                stage3_a1_final_private[4],
+                *parent,
+            )
+        return stage3_a1_final_private
+
+    def stage3_a1_maybe_interrupt(state, token):
+        if stage3_a1_options(state["stage3_case"]).get("ki_token") != token:
+            return
+        if state["a1_ki_attempted"] is not None:
+            raise SystemExit("stage3a1 KeyboardInterrupt injection retried")
+        state["a1_ki_attempted"] = token
+        raise KeyboardInterrupt()
 
     def stage3_a1_proxy_identity(value, structural):
         return StatProxy(
@@ -956,9 +999,10 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         if state is None or state["a1_phase"] != "fp":
             return False
         index = len(state["a1_final_private_events"])
-        if index >= len(stage3_a1_final_private):
+        expected = stage3_a1_expected_fp_events(state)
+        if index >= len(expected):
             return False
-        token = stage3_a1_final_private[index]
+        token = expected[index]
         if token.startswith("private-L-"):
             fd = state["private_ledger_fd"]
         else:
@@ -970,7 +1014,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             return namespace == "fcntl" and name == "fcntl" and arguments[1:] == (command,) and not arguments_by_name
         if "fstat" in token:
             return namespace == "os" and name == "fstat" and len(arguments) == 1 and not arguments_by_name
-        return (
+        return token in {"private-L-pread-complete", "private-L-pread-attempt"} and (
             namespace == "os"
             and name == "pread"
             and len(arguments) == 3
@@ -1370,13 +1414,17 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         injection = stage3_a1_injection(
                             state["stage3_case"], "gb", attempt_index
                         )
-                        if injection == "error":
+                        if injection in {"error", "KeyboardInterrupt"}:
                             state["a1_body_outcome"] = "governed"
                             state["gb_failed"] = True
-                            if stage3_a1_options(state["stage3_case"]).get("safe_failure") == "GB":
-                                state["a1_safe_failure_attempted"] = "GB"
+                            safe_failure = stage3_a1_options(state["stage3_case"]).get("safe_failure")
+                            if safe_failure in {"GB", "GB-KI"}:
+                                state["a1_safe_failure_attempted"] = safe_failure
                             if state["graph_binding_events"] == state["active_graph_bindings"]:
                                 state["a1_phase"] = "cleanup"
+                            if injection == "KeyboardInterrupt" or safe_failure == "GB-KI":
+                                stage3_a1_maybe_interrupt(state, binding_token)
+                                raise KeyboardInterrupt()
                             raise OSError(errno.EIO, "stage3a1 graph binding stat failed")
                         result = self.target(*arguments, **arguments_by_name)
                         if injection == "mismatch":
@@ -1435,23 +1483,28 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 command = arguments[1] if len(arguments) >= 2 else None
                 observed_getfl, observed_getfd = stage3_custody_commands(state)
                 if a1_private_call:
-                    private_token = stage3_a1_final_private[len(state["a1_final_private_events"])]
+                    private_token = stage3_a1_expected_fp_events(state)[len(state["a1_final_private_events"])]
                     state["a1_final_private_events"].append(private_token)
-                    if tuple(state["a1_final_private_events"]) == stage3_a1_final_private:
+                    if tuple(state["a1_final_private_events"]) == stage3_a1_expected_fp_events(state):
                         state["a1_suffix"].append("final-private")
                         state["a1_phase"] = "fb"
                     if (
-                        stage3_a1_options(state["stage3_case"]).get("safe_failure") == "FP"
+                        stage3_a1_options(state["stage3_case"]).get("safe_failure") in {"FP", "FP-KI"}
                         and private_token == "private-P-fstat"
                     ):
-                        state["a1_safe_failure_attempted"] = "FP"
+                        safe_failure = stage3_a1_options(state["stage3_case"]).get("safe_failure")
+                        state["a1_safe_failure_attempted"] = safe_failure
+                        if safe_failure == "FP-KI":
+                            raise KeyboardInterrupt()
                         raise OSError(errno.EIO, "stage3a1 final private custody failed")
+                    stage3_a1_maybe_interrupt(state, private_token)
                 if (
                     stage3_case_reaches_g1(state["stage3_case"])
                     and call_label in stage3_a1_final_borrowed
                 ):
                     state["a1_final_borrowed_events"].append(call_label)
                     state["events"].append(call_label)
+                    stage3_a1_maybe_interrupt(state, call_label)
                 if (
                     not stage3_case_reaches_g1(state["stage3_case"])
                     and
@@ -1479,7 +1532,30 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         forwarded[1] = fcntl.F_GETFL
                     elif command == observed_getfd:
                         forwarded[1] = fcntl.F_GETFD
+                if a1_private_call:
+                    fault = stage3_a1_fp_fault(state["stage3_case"], private_token)
+                    if fault == "error":
+                        raise OSError(errno.EIO, "stage3a1 final private custody failed")
                 result = self.target(*forwarded, **arguments_by_name)
+                if a1_private_call:
+                    if fault == "mismatch":
+                        result = result + 1 if type(result) is int else True
+                    if private_token == "private-P-getfl":
+                        semantic = stage3_a1_options(state["stage3_case"]).get("private_p_getfl")
+                        if semantic == "benign-bit":
+                            extra = 1
+                            forbidden = result | os.O_ACCMODE | getattr(os, "O_PATH", 0)
+                            while forbidden & extra:
+                                extra <<= 1
+                            result |= extra
+                        elif semantic == "True":
+                            result = True
+                        elif semantic == "IntSubclass":
+                            result = IntSubclass(os.O_RDONLY)
+                        elif semantic == "non-readonly":
+                            result = (result & ~os.O_ACCMODE) | os.O_WRONLY
+                        elif semantic == "opath":
+                            result |= getattr(os, "O_PATH", 0)
                 duplicate_command = getattr(fcntl, "F_DUPFD_CLOEXEC", None)
                 if (
                     state["a2_complete"] == 0
@@ -1493,17 +1569,21 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             if self.namespace == "os" and self.name == "fstat" and state is not None:
                 fd = arguments[0] if len(arguments) == 1 and not arguments_by_name else None
                 if a1_private_call:
-                    private_token = stage3_a1_final_private[len(state["a1_final_private_events"])]
+                    private_token = stage3_a1_expected_fp_events(state)[len(state["a1_final_private_events"])]
                     state["a1_final_private_events"].append(private_token)
-                    if tuple(state["a1_final_private_events"]) == stage3_a1_final_private:
+                    if tuple(state["a1_final_private_events"]) == stage3_a1_expected_fp_events(state):
                         state["a1_suffix"].append("final-private")
                         state["a1_phase"] = "fb"
                     if (
-                        stage3_a1_options(state["stage3_case"]).get("safe_failure") == "FP"
+                        stage3_a1_options(state["stage3_case"]).get("safe_failure") in {"FP", "FP-KI"}
                         and private_token == "private-P-fstat"
                     ):
-                        state["a1_safe_failure_attempted"] = "FP"
+                        safe_failure = stage3_a1_options(state["stage3_case"]).get("safe_failure")
+                        state["a1_safe_failure_attempted"] = safe_failure
+                        if safe_failure == "FP-KI":
+                            raise KeyboardInterrupt()
                         raise OSError(errno.EIO, "stage3a1 final private custody failed")
+                    stage3_a1_maybe_interrupt(state, private_token)
                 if state["a2_complete"] == 1 and stage3_case_reaches_g1(state["stage3_case"]):
                     token = stage3_a1_expected_token(state)
                     binding_token = stage3_a1_expected_binding_token(state)
@@ -1516,13 +1596,17 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         injection = stage3_a1_injection(
                             state["stage3_case"], "gb", attempt_index
                         )
-                        if injection == "error":
+                        if injection in {"error", "KeyboardInterrupt"}:
                             state["a1_body_outcome"] = "governed"
                             state["gb_failed"] = True
-                            if stage3_a1_options(state["stage3_case"]).get("safe_failure") == "GB":
-                                state["a1_safe_failure_attempted"] = "GB"
+                            safe_failure = stage3_a1_options(state["stage3_case"]).get("safe_failure")
+                            if safe_failure in {"GB", "GB-KI"}:
+                                state["a1_safe_failure_attempted"] = safe_failure
                             if state["graph_binding_events"] == state["active_graph_bindings"]:
                                 state["a1_phase"] = "cleanup"
+                            if injection == "KeyboardInterrupt" or safe_failure == "GB-KI":
+                                stage3_a1_maybe_interrupt(state, binding_token)
+                                raise KeyboardInterrupt()
                             raise OSError(errno.EIO, "stage3a1 graph binding fstat failed")
                         result = self.target(*arguments, **arguments_by_name)
                         if injection == "mismatch":
@@ -1617,12 +1701,19 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         if stage3_a1_expected_binding_token(state) is None:
                             state["a1_suffix"].append("final-graph-bindings")
                             state["a1_phase"] = "cleanup"
+                    stage3_a1_maybe_interrupt(state, call_label)
                 if not stage3_case_reaches_g1(state["stage3_case"]) and state["final_custody"] == 1:
                     if fd == state["borrowed_ledger_fd"] and "borrowed-L-fstat" not in state["events"]:
                         state["events"].append("borrowed-L-fstat")
                     elif fd == state["borrowed_parent_fd"] and "borrowed-P-fstat" not in state["events"]:
                         state["events"].append("borrowed-P-fstat")
+                if a1_private_call:
+                    fault = stage3_a1_fp_fault(state["stage3_case"], private_token)
+                    if fault == "error":
+                        raise OSError(errno.EIO, "stage3a1 final private custody failed")
                 result = self.target(*arguments, **arguments_by_name)
+                if a1_private_call and fault == "mismatch":
+                    result = StatProxy(result, st_ino=result.st_ino + 1)
                 if (
                     state["a2_complete"] == 0
                     and fd == state["private_parent_fd"]
@@ -1632,6 +1723,17 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     stage3_a2_complete()
                 return result
             if self.namespace == "os" and self.name == "pread" and state is not None:
+                if a1_private_call:
+                    private_token = stage3_a1_expected_fp_events(state)[len(state["a1_final_private_events"])]
+                    fault = stage3_a1_fp_fault(state["stage3_case"], "private-L-pread")
+                    if fault is not None:
+                        state["a1_final_private_events"].append(private_token)
+                        state["a1_fp_pread_attempted"] = True
+                        raise OSError(errno.EIO, "stage3a1 final private ledger pread failed")
+                    if private_token == "private-L-pread-attempt":
+                        state["a1_final_private_events"].append(private_token)
+                        state["a1_fp_pread_attempted"] = True
+                        stage3_a1_maybe_interrupt(state, "private-L-pread")
                 result = self.target(*arguments, **arguments_by_name)
                 if a1_private_call:
                     cursor = state["a1_private_pread_cursor"]
@@ -2029,35 +2131,47 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 case[2].endswith("drift") and reread == baseline
             ):
                 raise SystemExit("stage3a1 RLIMIT reread drifted")
-        if case[0] == "stage3a1-gb-mutation":
-            outcome = "success"
-        elif stage3_a1_failure(case) or case[0] in {
-            "stage3a1-g1-mutation",
-            "stage3a1-lineage-mutation",
-        }:
-            outcome = (
-                "KeyboardInterrupt"
-                if stage3_a1_failure(case) and case[2] == "KeyboardInterrupt"
-                else "MutationError"
-            )
-        else:
-            outcome = "success"
-        expected_private = stage3_a1_final_private if outcome == "MutationError" else ()
+        graph_arbitrary = (
+            stage3_a1_failure(case) and case[2] == "KeyboardInterrupt"
+        )
+        expects_fp = (
+            stage3_a1_failure(case) and not graph_arbitrary
+            or case[0] in {"stage3a1-g1-mutation", "stage3a1-lineage-mutation"}
+        )
+        expected_private = stage3_a1_expected_fp_events(state) if expects_fp else ()
         if tuple(state["a1_final_private_events"]) != expected_private:
             raise SystemExit("stage3a1 final private custody drifted")
-        if outcome == "MutationError" and (
-            state["a1_private_pread_cursor"] != len(state["a1_private_expected_bytes"])
-            or b"".join(chunk for _offset, chunk in state["a1_private_pread_chunks"])
-            != state["a1_private_expected_bytes"]
+        if "private-L-pread-attempt" in expected_private:
+            if (
+                not state["a1_fp_pread_attempted"]
+                or state["a1_private_pread_cursor"] != 0
+                or state["a1_private_pread_chunks"]
+                or "private-L-fstat-post" not in expected_private
+            ):
+                raise SystemExit("stage3a1 final private pread fault bracket drifted")
+        elif "private-L-pread-complete" in expected_private:
+            if (
+                state["a1_fp_pread_attempted"]
+                or state["a1_private_pread_cursor"] != len(state["a1_private_expected_bytes"])
+                or b"".join(chunk for _offset, chunk in state["a1_private_pread_chunks"])
+                != state["a1_private_expected_bytes"]
+            ):
+                raise SystemExit("stage3a1 final private pread coverage drifted")
+        elif (
+            state["a1_fp_pread_attempted"]
+            or state["a1_private_pread_cursor"] != 0
+            or state["a1_private_pread_chunks"]
         ):
-            raise SystemExit("stage3a1 final private pread coverage drifted")
+            raise SystemExit("stage3a1 skipped private pread was attempted")
         expected_safe_failure = stage3_a1_options(case).get("safe_failure")
         if state["a1_safe_failure_attempted"] != expected_safe_failure:
             raise SystemExit("stage3a1 safe-successor failure injection drifted")
+        if state["a1_ki_attempted"] != stage3_a1_options(case).get("ki_token"):
+            raise SystemExit("stage3a1 KeyboardInterrupt injection drifted")
         expected_binding_events = state.get("active_graph_bindings", [])
-        if outcome != "KeyboardInterrupt" and state["graph_binding_events"] != expected_binding_events:
+        if not graph_arbitrary and state["graph_binding_events"] != expected_binding_events:
             raise SystemExit("stage3a1 final graph binding drifted")
-        expected_borrowed = () if outcome == "KeyboardInterrupt" else stage3_a1_final_borrowed
+        expected_borrowed = () if graph_arbitrary else stage3_a1_final_borrowed
         if tuple(state["a1_final_borrowed_events"]) != expected_borrowed:
             raise SystemExit("stage3a1 final borrowed custody drifted")
         expected_post_calls = ["resource-getrlimit"]
@@ -2081,9 +2195,9 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         if len(state["graph_binding_successes"]) != expected_binding_successes:
             raise SystemExit("stage3a1 successful graph binding ledger drifted")
         expected_suffix = []
-        if outcome == "MutationError":
+        if expects_fp:
             expected_suffix.append("final-private")
-        if outcome != "KeyboardInterrupt":
+        if not graph_arbitrary:
             expected_suffix.append("final-borrowed")
             if not state["gb_failed"]:
                 expected_suffix.append("final-graph-bindings")
@@ -2197,6 +2311,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     "a1_private_expected_bytes": os.environ["TASK4_GOLDEN"].encode("ascii"),
                     "a1_private_pread_cursor": 0,
                     "a1_private_pread_chunks": [],
+                    "a1_fp_pread_attempted": False,
+                    "a1_ki_attempted": None,
                     "a1_rejected_returns": [],
                     "a1_close_failure_attempted": None,
                     "a1_emfile": False,
@@ -4821,7 +4937,6 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     ("emfile-fp-failure", "vendor", "EMFILE-rlimit-same", {"safe_failure": "FP"}, module.MutationError),
                     ("emfile-fb-failure", "vendor", "EMFILE-rlimit-same", {"safe_failure": "FB"}, module.MutationError),
                     ("emfile-gb-failure", "vendor", "EMFILE-rlimit-same", {"safe_failure": "GB"}, module.MutationError),
-                    ("mutation-fb-failure", "vendor", "ENFILE", {"safe_failure": "FB-KI"}, module.MutationError),
                     ("keyboardinterrupt-close-failure", "vendor", "KeyboardInterrupt", {"close_failure": "parent"}, module.MutationError),
                     ("mutation-close-failure", "vendor", "ENFILE", {"close_failure": "parent"}, module.MutationError),
                     ("refusal-close-failure", "vendor", "EMFILE-rlimit-same", {"close_failure": "parent"}, module.MutationError),
@@ -4833,6 +4948,88 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         full_a2=True,
                         stage3_case=("stage3a1-failure", site, variant, options),
                     )
+                for label, option in (
+                    ("fp-early-L-getfl-error", {"fp_error": "private-L-getfl"}),
+                    ("fp-early-L-getfl-mismatch", {"fp_mismatch": "private-L-getfl"}),
+                    ("fp-early-L-getfd-error", {"fp_error": "private-L-getfd"}),
+                    ("fp-early-L-getfd-mismatch", {"fp_mismatch": "private-L-getfd"}),
+                    ("fp-early-L-fstat-error", {"fp_error": "private-L-fstat-pre"}),
+                    ("fp-early-L-fstat-mismatch", {"fp_mismatch": "private-L-fstat-pre"}),
+                    ("fp-pread-error", {"fp_error": "private-L-pread"}),
+                ):
+                    run_case(
+                        f"stage3a1-{label}",
+                        module.MutationError,
+                        borrowed=base_borrowed,
+                        full_a2=True,
+                        stage3_case=(
+                            "stage3a1-failure",
+                            "vendor",
+                            "ENFILE",
+                            option,
+                        ),
+                    )
+                for label, semantic, expected in (
+                    ("private-P-getfl-benign-bit", "benign-bit", SystemExit),
+                    ("private-P-getfl-True", "True", module.MutationError),
+                    ("private-P-getfl-IntSubclass", "IntSubclass", module.MutationError),
+                    ("private-P-getfl-opath", "opath", module.MutationError),
+                    ("private-P-getfl-non-readonly", "non-readonly", module.MutationError),
+                ):
+                    run_case(
+                        f"stage3a1-{label}",
+                        expected,
+                        borrowed=base_borrowed,
+                        full_a2=True,
+                        stage3_case=(
+                            "stage3a1-failure",
+                            "vendor",
+                            "EMFILE-rlimit-same",
+                            {"private_p_getfl": semantic},
+                        ),
+                    )
+                for family, tokens in (
+                    (
+                        "fp",
+                        (
+                            "private-L-getfl",
+                            "private-L-getfd",
+                            "private-L-fstat-pre",
+                            "private-L-pread",
+                            "private-L-fstat-post",
+                            "private-P-getfl",
+                            "private-P-getfd",
+                            "private-P-fstat",
+                        ),
+                    ),
+                    ("fb", stage3_a1_final_borrowed),
+                    (
+                        "gb",
+                        (
+                            stage3_a1_expected_bindings[0],
+                            next(
+                                token
+                                for token in stage3_a1_expected_bindings
+                                if token.startswith("bind-parent-name-stat:")
+                            ),
+                        ),
+                    ),
+                ):
+                    for token in tokens:
+                        run_case(
+                            f"stage3a1-{family}-ki-{token}",
+                            module.MutationError,
+                            borrowed=base_borrowed,
+                            full_a2=True,
+                            stage3_case=(
+                                "stage3a1-failure",
+                                "vendor",
+                                "EMFILE-rlimit-same"
+                                if family == "gb" and token == stage3_a1_expected_bindings[0]
+                                else "ENFILE",
+                                {"ki_token": token},
+                            ),
+                        )
                 run_case(
                     "stage3a1-success-close-failure",
                     module.MutationError,

@@ -1618,7 +1618,7 @@ def run_reconciled_build(
     repo_parts = _path(repo_root, "repo_root")
     stable_parts = _path(stable_sysroot_root, "stable_sysroot_root")
     nightly_parts = _path(nightly_sysroot_root, "nightly_sysroot_root")
-    _relative(vendor_relative)
+    vendor_tail = _relative(vendor_relative)
     supplied = (repo_parts, stable_parts, nightly_parts)
     for index, left in enumerate(supplied):
         for right in supplied[index + 1 :]:
@@ -1768,6 +1768,11 @@ def run_reconciled_build(
     owned_fds = []
     private_ledger_fd = None
     private_parent_owned_fd = None
+    graph_nodes = []
+    graph_cache = {}
+    graph_body_outcome = None
+    owned_os_close = borrowed_os_close
+    stage3_ready = False
     duplicate_command = getattr(fcntl, "F_DUPFD_CLOEXEC", None)
     capability_errors = {
         errno.EINVAL,
@@ -2030,6 +2035,293 @@ def run_reconciled_build(
                             else:
                                 borrowed_f_getfd = stage3_f_getfd
                                 borrowed_f_getfl = stage3_f_getfl
+                                owned_os_close = stage3_os_close
+                                stage3_ready = True
+
+        if stage3_ready:
+            class _Stage3CapacityRefusal(Exception):
+                pass
+
+            directory_flags = (
+                stage3_o_rdonly
+                | stage3_o_directory
+                | stage3_o_cloexec
+                | stage3_o_nofollow
+            )
+            private_parent_structural = _structural(parent_value)
+
+            def open_owned_directory(name, parent, before, parts):
+                try:
+                    if parent is None:
+                        candidate = stage3_os_open(name, directory_flags)
+                    else:
+                        candidate = stage3_os_open(
+                            name,
+                            directory_flags,
+                            dir_fd=parent["fd"],
+                        )
+                except OSError as exc:
+                    if exc.errno != errno.EMFILE:
+                        raise MutationError("stage3 directory open failed") from exc
+                    try:
+                        current_limit = stage3_getrlimit(stage3_rlimit_nofile)
+                    except Exception as limit_exc:
+                        raise MutationError("stage3 RLIMIT_NOFILE reread failed") from limit_exc
+                    if (
+                        type(current_limit) is not tuple
+                        or len(current_limit) != 2
+                        or any(type(value) is not int or value < 0 for value in current_limit)
+                        or current_limit[0] > current_limit[1]
+                        or current_limit != stage3_rlimit
+                    ):
+                        raise MutationError("stage3 RLIMIT_NOFILE changed")
+                    raise _Stage3CapacityRefusal() from exc
+                except Exception as exc:
+                    raise MutationError("stage3 directory open failed") from exc
+
+                if (
+                    type(candidate) is not int
+                    or candidate < 0
+                    or candidate in {expected_ledger_fd, private_parent_fd}
+                    or candidate in owned_fds
+                ):
+                    raise MutationError("stage3 directory open returned an invalid descriptor")
+                owned_fds.append(candidate)
+                try:
+                    held_value = stage3_os_fstat(candidate)
+                except Exception as exc:
+                    raise MutationError("stage3 held directory fstat failed") from exc
+                held = _structural(held_value)
+                if not _stat.S_ISDIR(held_value.st_mode) or before is not None and held != before:
+                    raise MutationError("stage3 directory relation changed")
+                if held == private_parent_structural:
+                    raise MutationError("stage3 directory aliases private parent")
+                node = {
+                    "parts": parts,
+                    "fd": candidate,
+                    "parent": parent,
+                    "name": None if parent is None else name,
+                    "structural": held,
+                }
+                graph_nodes.append(node)
+                if parent is not None:
+                    graph_cache[(parent["fd"], name)] = node
+                return node
+
+            def open_edge(parent, name):
+                cached = graph_cache.get((parent["fd"], name))
+                if cached is not None:
+                    try:
+                        held_value = stage3_os_fstat(cached["fd"])
+                    except Exception as exc:
+                        raise MutationError("stage3 cached directory fstat failed") from exc
+                    if (
+                        not _stat.S_ISDIR(held_value.st_mode)
+                        or _structural(held_value) != cached["structural"]
+                    ):
+                        raise MutationError("stage3 cached directory changed")
+                    try:
+                        bound_value = stage3_os_stat(
+                            name,
+                            dir_fd=parent["fd"],
+                            follow_symlinks=False,
+                        )
+                    except Exception as exc:
+                        raise MutationError("stage3 cached directory binding failed") from exc
+                    if (
+                        not _stat.S_ISDIR(bound_value.st_mode)
+                        or _structural(bound_value) != cached["structural"]
+                    ):
+                        raise MutationError("stage3 cached directory binding changed")
+                    return cached
+                try:
+                    before_value = stage3_os_stat(
+                        name,
+                        dir_fd=parent["fd"],
+                        follow_symlinks=False,
+                    )
+                except Exception as exc:
+                    raise MutationError("stage3 directory stat failed") from exc
+                if not _stat.S_ISDIR(before_value.st_mode):
+                    raise MutationError("stage3 path component is not a directory")
+                return open_owned_directory(
+                    name,
+                    parent,
+                    _structural(before_value),
+                    parent["parts"] + (name,),
+                )
+
+            def walk_anchor(parts, start):
+                node = start
+                for name in parts:
+                    node = open_edge(node, name)
+                return node
+
+            def lineage(node):
+                result = []
+                while node is not None:
+                    result.append(node)
+                    node = node["parent"]
+                result.reverse()
+                return result
+
+            def divergent_suffixes(left, right):
+                shared = 0
+                while (
+                    shared < len(left)
+                    and shared < len(right)
+                    and left[shared] is right[shared]
+                ):
+                    shared += 1
+                left_suffix = [node["structural"] for node in left[shared:]]
+                right_suffix = [node["structural"] for node in right[shared:]]
+                if (
+                    len(left_suffix) != len(set(left_suffix))
+                    or len(right_suffix) != len(set(right_suffix))
+                    or set(left_suffix) & set(right_suffix)
+                ):
+                    raise MutationError("stage3 anchor lineages converge")
+                return left_suffix, right_suffix
+
+            try:
+                root_node = open_owned_directory(b"/", None, None, ())
+                repo_node = walk_anchor(repo_parts, root_node)
+                vendor_node = walk_anchor(vendor_tail, repo_node)
+                repo_lineage = lineage(repo_node)
+                vendor_lineage = lineage(vendor_node)
+                if (
+                    len(vendor_lineage) <= len(repo_lineage)
+                    or any(
+                        vendor is not repo
+                        for vendor, repo in zip(vendor_lineage, repo_lineage)
+                    )
+                ):
+                    raise MutationError("stage3 vendor lineage escaped repo")
+                vendor_suffix = [
+                    node["structural"] for node in vendor_lineage[len(repo_lineage) :]
+                ]
+                repo_structural = {node["structural"] for node in repo_lineage}
+                if (
+                    len(vendor_suffix) != len(set(vendor_suffix))
+                    or set(vendor_suffix) & repo_structural
+                ):
+                    raise MutationError("stage3 vendor lineage aliases another anchor")
+
+                stable_node = walk_anchor(stable_parts, root_node)
+                stable_lineage = lineage(stable_node)
+                _, stable_suffix = divergent_suffixes(repo_lineage, stable_lineage)
+                if set(vendor_suffix) & set(stable_suffix):
+                    raise MutationError("stage3 vendor lineage aliases another anchor")
+
+                nightly_node = walk_anchor(nightly_parts, root_node)
+                nightly_lineage = lineage(nightly_node)
+                _, nightly_suffix = divergent_suffixes(repo_lineage, nightly_lineage)
+                divergent_suffixes(stable_lineage, nightly_lineage)
+                if set(vendor_suffix) & set(nightly_suffix):
+                    raise MutationError("stage3 vendor lineage aliases another anchor")
+            except _Stage3CapacityRefusal:
+                graph_body_outcome = "capacity"
+                stage2_capability = True
+            except MutationError as exc:
+                graph_body_outcome = "mutation"
+                if stage2_failure is None:
+                    stage2_failure = exc
+            else:
+                graph_body_outcome = "success"
+
+        if graph_body_outcome in {"mutation", "capacity"}:
+            private_failure = None
+
+            def record_private_failure(exc, message):
+                nonlocal private_failure
+                if private_failure is None:
+                    private_failure = (
+                        exc if isinstance(exc, MutationError) else MutationError(message)
+                    )
+
+            ledger_guard_ok = True
+            try:
+                value = stage3_fcntl(private_ledger_fd, stage3_f_getfl)
+                if type(value) is not int or value != ledger_flags:
+                    raise MutationError("private ledger flags changed")
+            except BaseException as exc:
+                ledger_guard_ok = False
+                record_private_failure(exc, "final private ledger F_GETFL failed")
+            if ledger_guard_ok:
+                try:
+                    value = stage3_fcntl(private_ledger_fd, stage3_f_getfd)
+                    if type(value) is not int or value != stage3_fd_cloexec:
+                        raise MutationError("private ledger descriptor flags changed")
+                except BaseException as exc:
+                    ledger_guard_ok = False
+                    record_private_failure(exc, "final private ledger F_GETFD failed")
+            if ledger_guard_ok:
+                try:
+                    value = stage3_os_fstat(private_ledger_fd)
+                    if _identity(value) != ledger_identity:
+                        raise MutationError("private ledger identity changed before final read")
+                except BaseException as exc:
+                    ledger_guard_ok = False
+                    record_private_failure(exc, "final private ledger fstat failed")
+            if ledger_guard_ok:
+                chunks = []
+                offset = 0
+                while offset < ledger_value.st_size:
+                    try:
+                        chunk = stage3_os_pread(
+                            private_ledger_fd,
+                            min(1024 * 1024, ledger_value.st_size - offset),
+                            offset,
+                        )
+                        if (
+                            type(chunk) is not bytes
+                            or not chunk
+                            or len(chunk) > ledger_value.st_size - offset
+                        ):
+                            raise MutationError("final private ledger read was short")
+                    except BaseException as exc:
+                        record_private_failure(exc, "final private ledger read failed")
+                        break
+                    chunks.append(chunk)
+                    offset += len(chunk)
+                if offset == ledger_value.st_size and b"".join(chunks) != first:
+                    record_private_failure(
+                        MutationError("private ledger bytes changed"),
+                        "final private ledger read failed",
+                    )
+                try:
+                    value = stage3_os_fstat(private_ledger_fd)
+                    if _identity(value) != ledger_identity:
+                        raise MutationError("private ledger identity changed after final read")
+                except BaseException as exc:
+                    record_private_failure(exc, "final private ledger fstat failed")
+            try:
+                value = stage3_fcntl(private_parent_owned_fd, stage3_f_getfl)
+                if (
+                    type(value) is not int
+                    or opath and value & opath
+                    or value & stage3_o_accmode != stage3_o_rdonly
+                ):
+                    raise MutationError("private parent flags changed")
+            except BaseException as exc:
+                record_private_failure(exc, "final private parent F_GETFL failed")
+            try:
+                value = stage3_fcntl(private_parent_owned_fd, stage3_f_getfd)
+                if type(value) is not int or value != stage3_fd_cloexec:
+                    raise MutationError("private parent descriptor flags changed")
+            except BaseException as exc:
+                record_private_failure(exc, "final private parent F_GETFD failed")
+            try:
+                value = stage3_os_fstat(private_parent_owned_fd)
+                if (
+                    not _stat.S_ISDIR(value.st_mode)
+                    or _identity(value) != parent_identity
+                ):
+                    raise MutationError("private parent identity changed")
+            except BaseException as exc:
+                record_private_failure(exc, "final private parent fstat failed")
+            if stage2_failure is None and private_failure is not None:
+                stage2_failure = private_failure
 
         if private_ledger_usable:
             borrowed_ledger_flags = None
@@ -2037,13 +2329,17 @@ def run_reconciled_build(
                 borrowed_ledger_flags = borrowed_fcntl(expected_ledger_fd, borrowed_f_getfl)
                 if type(borrowed_ledger_flags) is not int or borrowed_ledger_flags != ledger_flags:
                     raise MutationError("borrowed ledger flags changed")
-            except Exception as exc:
+            except BaseException as exc:
+                if not isinstance(exc, Exception) and graph_body_outcome not in {"mutation", "capacity"}:
+                    raise
                 if stage2_failure is None:
                     stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed ledger F_GETFL failed")
             try:
                 if _identity(borrowed_os_fstat(expected_ledger_fd)) != ledger_identity:
                     raise MutationError("borrowed ledger identity changed")
-            except Exception as exc:
+            except BaseException as exc:
+                if not isinstance(exc, Exception) and graph_body_outcome not in {"mutation", "capacity"}:
+                    raise
                 if stage2_failure is None:
                     stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed ledger fstat failed")
         else:
@@ -2053,7 +2349,9 @@ def run_reconciled_build(
                 borrowed_ledger_flags = borrowed_fcntl(expected_ledger_fd, borrowed_f_getfl)
                 if type(borrowed_ledger_flags) is not int or borrowed_ledger_flags != ledger_flags:
                     raise MutationError("borrowed ledger flags changed")
-            except Exception as exc:
+            except BaseException as exc:
+                if not isinstance(exc, Exception) and graph_body_outcome not in {"mutation", "capacity"}:
+                    raise
                 borrowed_ledger_flags_ok = False
                 if stage2_failure is None:
                     stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed ledger F_GETFL failed")
@@ -2061,7 +2359,9 @@ def run_reconciled_build(
                 borrowed_ledger_pre = _identity(borrowed_os_fstat(expected_ledger_fd))
                 if borrowed_ledger_pre != ledger_identity:
                     raise MutationError("borrowed ledger identity changed before read")
-            except Exception as exc:
+            except BaseException as exc:
+                if not isinstance(exc, Exception) and graph_body_outcome not in {"mutation", "capacity"}:
+                    raise
                 borrowed_ledger_pre = None
                 if stage2_failure is None:
                     stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed ledger fstat failed")
@@ -2069,13 +2369,17 @@ def run_reconciled_build(
                 try:
                     if read_all(expected_ledger_fd, ledger_value.st_size, MutationError) != first:
                         raise MutationError("borrowed ledger bytes changed")
-                except Exception as exc:
+                except BaseException as exc:
+                    if not isinstance(exc, Exception) and graph_body_outcome not in {"mutation", "capacity"}:
+                        raise
                     if stage2_failure is None:
                         stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed ledger read failed")
                 try:
                     if _identity(borrowed_os_fstat(expected_ledger_fd)) != ledger_identity:
                         raise MutationError("borrowed ledger identity changed after read")
-                except Exception as exc:
+                except BaseException as exc:
+                    if not isinstance(exc, Exception) and graph_body_outcome not in {"mutation", "capacity"}:
+                        raise
                     if stage2_failure is None:
                         stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed ledger fstat failed")
 
@@ -2084,28 +2388,80 @@ def run_reconciled_build(
             borrowed_parent_flags = borrowed_fcntl(private_parent_fd, borrowed_f_getfl)
             if type(borrowed_parent_flags) is not int or borrowed_parent_flags != parent_flags:
                 raise MutationError("borrowed parent flags changed")
-        except Exception as exc:
+        except BaseException as exc:
+            if not isinstance(exc, Exception) and graph_body_outcome not in {"mutation", "capacity"}:
+                raise
             if stage2_failure is None:
                 stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed parent F_GETFL failed")
         try:
             borrowed_parent_fd_flags = borrowed_fcntl(private_parent_fd, borrowed_f_getfd)
             if type(borrowed_parent_fd_flags) is not int or borrowed_parent_fd_flags != parent_fd_flags:
                 raise MutationError("borrowed parent descriptor flags changed")
-        except Exception as exc:
+        except BaseException as exc:
+            if not isinstance(exc, Exception) and graph_body_outcome not in {"mutation", "capacity"}:
+                raise
             if stage2_failure is None:
                 stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed parent F_GETFD failed")
         try:
             if _identity(borrowed_os_fstat(private_parent_fd)) != parent_identity:
                 raise MutationError("borrowed parent identity changed")
-        except Exception as exc:
+        except BaseException as exc:
+            if not isinstance(exc, Exception) and graph_body_outcome not in {"mutation", "capacity"}:
+                raise
             if stage2_failure is None:
                 stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed parent fstat failed")
+
+        if graph_body_outcome is not None:
+            for node in graph_nodes:
+                try:
+                    value = stage3_os_fstat(node["fd"])
+                    if (
+                        not _stat.S_ISDIR(value.st_mode)
+                        or _structural(value) != node["structural"]
+                    ):
+                        raise MutationError("stage3 held directory binding changed")
+                except BaseException as exc:
+                    if (
+                        not isinstance(exc, Exception)
+                        and graph_body_outcome not in {"mutation", "capacity"}
+                    ):
+                        raise
+                    if stage2_failure is None:
+                        stage2_failure = (
+                            exc
+                            if isinstance(exc, MutationError)
+                            else MutationError("stage3 held directory binding failed")
+                        )
+                if node["parent"] is not None:
+                    try:
+                        value = stage3_os_stat(
+                            node["name"],
+                            dir_fd=node["parent"]["fd"],
+                            follow_symlinks=False,
+                        )
+                        if (
+                            not _stat.S_ISDIR(value.st_mode)
+                            or _structural(value) != node["structural"]
+                        ):
+                            raise MutationError("stage3 directory edge binding changed")
+                    except BaseException as exc:
+                        if (
+                            not isinstance(exc, Exception)
+                            and graph_body_outcome not in {"mutation", "capacity"}
+                        ):
+                            raise
+                        if stage2_failure is None:
+                            stage2_failure = (
+                                exc
+                                if isinstance(exc, MutationError)
+                                else MutationError("stage3 directory edge binding failed")
+                            )
 
     finally:
         close_failure = None
         for owned_fd in reversed(owned_fds):
             try:
-                borrowed_os_close(owned_fd)
+                owned_os_close(owned_fd)
             except BaseException as exc:
                 if close_failure is None:
                     close_failure = exc

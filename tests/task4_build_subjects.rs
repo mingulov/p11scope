@@ -587,6 +587,10 @@ class StrSubclass(str):
     pass
 
 
+class BytesSubclass(bytes):
+    pass
+
+
 def identity(value):
     return (
         value.st_dev,
@@ -847,12 +851,21 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
     def stage3_case_is_a2(case):
         return case is not None and case[0].startswith("stage3a2-")
 
+    def stage3_case_is_a3(case):
+        return case is not None and case[0].startswith("stage3a3-")
+
     def stage3_case_is_c0(case):
-        return case is not None and not stage3_case_is_a1(case) and not stage3_case_is_a2(case)
+        return (
+            case is not None
+            and not stage3_case_is_a1(case)
+            and not stage3_case_is_a2(case)
+            and not stage3_case_is_a3(case)
+        )
 
     def stage3_case_reaches_a2(case):
         return (
             stage3_case_is_a2(case)
+            or stage3_case_is_a3(case)
             or stage3_case_is_continuation(case)
             or case is not None and case[0] == "stage3a1-gb-mutation"
         )
@@ -861,6 +874,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         return (
             stage3_case_is_a1(case)
             or stage3_case_is_a2(case)
+            or stage3_case_is_a3(case)
             or stage3_case_is_continuation(case)
         )
 
@@ -873,7 +887,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
     def stage3_case_has_symlink(case):
         if case is None:
             return True
-        if stage3_case_is_a1(case) or stage3_case_is_a2(case):
+        if stage3_case_is_a1(case) or stage3_case_is_a2(case) or stage3_case_is_a3(case):
             return not stage3_a1_options(case).get("no_symlink", False)
         return case[5]
 
@@ -1093,7 +1107,13 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             return
         outcome = state["a2_expected_outcome"]
         state["a1_body_outcome"] = outcome
-        state["a1_phase"] = {"success": "fb", "governed": "fp", "arbitrary": "cleanup"}[outcome]
+        state["a1_phase"] = (
+            "fp"
+            if outcome == "success"
+            and stage3_case_is_a3(state["stage3_case"])
+            and not state["a3_body_operations"]
+            else {"success": "fb", "governed": "fp", "arbitrary": "cleanup"}[outcome]
+        )
 
     def stage3_a2_promote_binding(state, label):
         result = state["a2_current_fd"]
@@ -1396,6 +1416,274 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         stage3_a2_complete_operation(state)
         return result
 
+    def stage3_a3_fault(case):
+        if case is None or case[0] != "stage3a3-mutation":
+            return None, None
+        return case[1], case[2]
+
+    def stage3_a3_spec(case):
+        if not stage3_case_is_a3(case):
+            return (), ()
+        options = stage3_a2_options(case)
+        return stage3_a3_specs[options["spec"]]
+
+    def stage3_a3_role(state, value):
+        if isinstance(value, tuple) and value[0] == "@a3":
+            return state["a3_fds"][value[1]]
+        if value == "@read1":
+            return state["a3_readlinks"][-1][1]
+        if value == "@read2":
+            return state["a3_readlinks"][-1][1]
+        return stage3_a2_role(state, value)
+
+    def stage3_a3_expected_descriptor(state):
+        expected = (
+            state["a3_body_operations"]
+            if state["a1_phase"] in {"fb", "a3"}
+            else state["a3_absence_operations"]
+            if state["a1_phase"] == "absence"
+            else ()
+        )
+        index = (
+            len(state["a3_body_events"])
+            if state["a1_phase"] == "a3"
+            else len(state["a3_absence_events"])
+        )
+        return expected[index] if index < len(expected) else None
+
+    def stage3_a3_call_token(namespace, name, arguments, arguments_by_name):
+        state = stage3_c0_state
+        if (
+            state is None
+            or not stage3_case_is_a3(state["stage3_case"])
+            or len(state["a2_operations"]) != len(state["a2_expected_operations"])
+        ):
+            return None
+        descriptor = stage3_a3_expected_descriptor(state)
+        if descriptor is None:
+            return None
+        token, expected_namespace, expected_name, positional, keywords = descriptor
+        if namespace != expected_namespace or name != expected_name:
+            return None
+        expected_arguments = tuple(stage3_a3_role(state, value) for value in positional)
+        expected_keywords = {key: stage3_a3_role(state, value) for key, value in keywords}
+        return token if arguments == expected_arguments and arguments_by_name == expected_keywords else None
+
+    def stage3_a3_governed(state, token):
+        if state["a3_first_body_failure"] is None:
+            state["a3_first_body_failure"] = token
+        state["a1_body_outcome"] = "governed"
+        state["a1_phase"] = "fp"
+
+    def stage3_a3_after_gb(state):
+        if (
+            stage3_case_is_a3(state["stage3_case"])
+            and (state["a3_started"] or not state["a3_body_operations"])
+            and not state["gb_failed"]
+        ):
+            if state["a3_absence_operations"]:
+                state["a1_phase"] = "post-gb"
+            else:
+                state["a3_markers"].append("canonical-absence-empty")
+                state["a3_forbid_later_filesystem"] = True
+                state["a1_phase"] = "cleanup"
+        else:
+            state["a1_phase"] = "cleanup"
+
+    def stage3_a3_execute(callable_value, token, arguments, arguments_by_name):
+        state = stage3_c0_state
+        case = state["stage3_case"]
+        options = stage3_a2_options(case)
+        if state["a1_phase"] == "fb":
+            state["a1_phase"] = "a3"
+        fault_token, variant = stage3_a3_fault(case)
+        injected = token == fault_token
+        events = (
+            state["a3_body_events"]
+            if state["a1_phase"] == "a3"
+            else state["a3_absence_events"]
+        )
+        events.append(token)
+        state["a3_started"] = True
+
+        if token.startswith("readlink"):
+            state["a3_readlink_attempts"].append(token)
+        if token.startswith("target-fsencode"):
+            state["a3_fsencode_attempts"].append(token)
+
+        if token.startswith("symlink-open:"):
+            occurrence = int(token.rsplit(":", 1)[1])
+            active = {
+                state["borrowed_ledger_fd"],
+                state["borrowed_parent_fd"],
+                state["private_ledger_fd"],
+                state["private_parent_fd"],
+                *state["graph_owned"],
+            }
+            state["a3_open_active"].append((token, tuple(sorted(active))))
+            if injected:
+                collisions = {
+                    "collision-borrowed-L": state["borrowed_ledger_fd"],
+                    "collision-borrowed-P": state["borrowed_parent_fd"],
+                    "collision-private-L": state["private_ledger_fd"],
+                    "collision-private-P": state["private_parent_fd"],
+                    "collision-graph": state["graph_owned"][0],
+                }
+                if occurrence > 1:
+                    collisions["collision-earlier-A3"] = state["a3_fds"][occurrence - 1]
+                if variant == "return-True":
+                    stage3_a3_governed(state, token)
+                    return True
+                if variant == "return-IntSubclass":
+                    stage3_a3_governed(state, token)
+                    return IntSubclass(0)
+                if variant == "return-negative":
+                    stage3_a3_governed(state, token)
+                    return -1
+                if variant in collisions:
+                    stage3_a3_governed(state, token)
+                    return collisions[variant]
+                if variant in {"EIO", "ENFILE", "EMFILE-rlimit-same", "EMFILE-rlimit-drift"}:
+                    if variant.startswith("EMFILE"):
+                        state["a1_emfile"] = True
+                        state["a1_emfile_pending"] = True
+                    stage3_a3_governed(state, token)
+                    raise OSError(
+                        errno.EMFILE if variant.startswith("EMFILE") else errno.ENFILE if variant == "ENFILE" else errno.EIO,
+                        "stage3a3 injected symlink open failure",
+                    )
+            result = callable_value(*arguments, **arguments_by_name)
+            if type(result) is not int or result < 0 or result in active:
+                stage3_a3_governed(state, token)
+                return result
+            state["a3_fds"][occurrence] = result
+            state["graph_owned"].append(result)
+            state["a3_owned_occurrences"].append(occurrence)
+            return result
+
+        if injected and variant in {"error", "KeyboardInterrupt"}:
+            if state["a1_phase"] == "absence":
+                state["a1_phase"] = "cleanup"
+                state["a3_forbid_later_filesystem"] = True
+                if variant == "KeyboardInterrupt":
+                    state["a3_original_interrupt"] = token
+                    raise KeyboardInterrupt()
+                raise OSError(errno.EIO, "stage3a3 injected absence boundary failure")
+            state["a1_phase"] = "cleanup" if variant == "KeyboardInterrupt" else "fp"
+            if variant == "error":
+                stage3_a3_governed(state, token)
+                raise OSError(errno.EIO, "stage3a3 injected operation failure")
+            state["a3_original_interrupt"] = token
+            raise KeyboardInterrupt()
+
+        if token.startswith("readlink"):
+            ordinal = 1 if token.startswith("readlink1:") else 2
+            occurrence = int(token.rsplit(":", 1)[1])
+            native = callable_value(*arguments, **arguments_by_name)
+            state["a3_native_readlinks"].append((token, native))
+            expected_native = options.get("raw_targets", {}).get(
+                occurrence, options.get("raw_target", native)
+            )
+            if native != expected_native or type(native) is not type(expected_native):
+                raise SystemExit("stage3a3 native readlink fixture drifted")
+            result = native
+            if injected:
+                result = {
+                    "bytes-subclass": BytesSubclass(native),
+                    "str-subclass": StrSubclass(native),
+                    "other-type": 1,
+                    "empty": b"",
+                    "4097-bytes": b"x" * 4097,
+                    "mismatch": b"different",
+                }.get(variant, native)
+                if variant in {
+                    "bytes-subclass", "str-subclass", "other-type", "empty",
+                    "4097-bytes", "mismatch",
+                }:
+                    stage3_a3_governed(state, token)
+            state["a3_readlinks"].append((token, result))
+            return result
+
+        if token.startswith("target-fsencode"):
+            if injected and variant == "error":
+                stage3_a3_governed(state, token)
+                raise OSError(errno.EIO, "stage3a3 fsencode failure")
+            result = callable_value(*arguments, **arguments_by_name)
+            if injected and variant == "nonbytes":
+                result = "not-bytes"
+                stage3_a3_governed(state, token)
+            state["a3_fsencode_calls"].append((arguments[0], result))
+            return result
+
+        if token.startswith("absent-") and state["a3_absence_suffix_snapshot"] is None:
+            state["a3_absence_suffix_snapshot"] = (
+                tuple(state["a1_final_private_events"]),
+                tuple(state["a1_final_borrowed_events"]),
+                tuple(state["graph_binding_events"]),
+            )
+        if token.startswith("absent-terminal:"):
+            if injected and variant == "success":
+                state["a1_phase"] = "cleanup"
+                state["a3_forbid_later_filesystem"] = True
+                return os.stat_result((stat.S_IFREG | 0o600, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+            if injected and variant == "KeyboardInterrupt":
+                state["a1_phase"] = "cleanup"
+                state["a3_forbid_later_filesystem"] = True
+                state["a3_original_interrupt"] = token
+                raise KeyboardInterrupt()
+            try:
+                callable_value(*arguments, **arguments_by_name)
+            except OSError as exc:
+                observed = errno.EIO if injected and variant == "wrong-errno" else exc.errno
+                state["a3_absence_errnos"].append((token, observed))
+                if injected and variant == "wrong-errno":
+                    state["a1_phase"] = "cleanup"
+                    state["a3_forbid_later_filesystem"] = True
+                    raise OSError(errno.EIO, "stage3a3 wrong absence errno")
+                if len(events) == len(state["a3_absence_operations"]):
+                    state["a3_absence_complete"] = True
+                    state["a3_forbid_later_filesystem"] = True
+                    state["a1_phase"] = "cleanup"
+                raise
+            raise SystemExit("stage3a3 canonical absence unexpectedly existed")
+
+        result = callable_value(*arguments, **arguments_by_name)
+        if injected and variant == "mismatch":
+            original = identity(result)
+            if state["a1_phase"] == "a3":
+                stage3_a3_governed(state, token)
+            elif state["a1_phase"] == "absence":
+                state["a1_phase"] = "cleanup"
+                state["a3_forbid_later_filesystem"] = True
+            result = StatProxy(result, st_ino=result.st_ino + 1)
+            state["a3_injections"].append((token, original, identity(result)))
+        if token.startswith(("symlink-held-fstat", "symlink-parent-stat")):
+            state["a3_symlink_identities"].append((token, identity(result)))
+        if token.startswith(("target-held-fstat", "target-parent-stat")):
+            state["a3_target_identities"].append((token, identity(result)))
+        if token.startswith("absent-") and not token.startswith("absent-terminal:"):
+            state["a3_boundary_identities"].append((token, identity(result)))
+        if injected and variant == "semantic":
+            state["a3_semantic_observed"] = options["semantic_failure"]
+        if token.startswith("symlink-parent-stat0:"):
+            occurrence = int(token.rsplit(":", 1)[1])
+            if not injected:
+                if options.get("expected_route") == "follow41" and occurrence == 41:
+                    state["a3_first_body_failure"] = token
+                    state["a3_forbid_later_filesystem"] = True
+                    state["a1_body_outcome"] = "governed"
+                    state["a1_phase"] = "cleanup"
+                else:
+                    key = f"@a3:link:{occurrence}".encode("ascii")
+                    state["graph_fds"][key] = state["a3_fds"][occurrence]
+                    state["graph_edges"].append(("edge", "a3", arguments[0], os.fsencode(repo3), key, ""))
+                    state["expected_graph_bindings"].extend(
+                        (f"bind-held-fstat:{key.decode('ascii')}", f"bind-parent-name-stat:{key.decode('ascii')}")
+                    )
+        if state["a1_phase"] == "a3" and len(events) == len(state["a3_body_operations"]):
+            state["a1_phase"] = "a3-complete"
+        return result
+
     def stage3_a1_private_call_matches(namespace, name, arguments, arguments_by_name):
         state = stage3_c0_state
         if state is None or state["a1_phase"] != "fp":
@@ -1556,7 +1844,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 return "resource-getrlimit-reread"
             return None
         if (
-            stage3_case_is_a2(state["stage3_case"])
+            stage3_case_reaches_a2(state["stage3_case"])
             and state["a1_phase"] == "a2"
             and namespace == "os"
             and name == "fsencode"
@@ -1645,6 +1933,13 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 raise SystemExit("stage3a1 EMFILE RLIMIT reread was not immediate")
             if (
                 state is not None
+                and state.get("a3_forbid_later_filesystem")
+                and self.namespace == "os"
+                and self.name != "close"
+            ):
+                raise SystemExit("stage3a3 filesystem call followed terminal absence failure")
+            if (
+                state is not None
                 and state["a2_complete"] == 1
                 and stage3_case_reaches_g1(state["stage3_case"])
                 and state["a1_phase"] == "c0"
@@ -1664,6 +1959,27 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             ):
                 state["events"].append("capacity-policy-selected")
                 state["a1_phase"] = "g1"
+            if state is not None and state.get("a1_phase") == "a3-complete":
+                state["a1_phase"] = "fp"
+                if not stage3_a1_private_call_matches(
+                    self.namespace, self.name, arguments, arguments_by_name
+                ):
+                    state["a1_phase"] = "a3-complete"
+                    if self.namespace == "os" and self.name == "close":
+                        state["a1_phase"] = "cleanup"
+                elif state.get("a3_semantic_observed") is not None:
+                    state["a3_semantic_rejection"] = state["a3_semantic_observed"]
+                    state["a3_first_body_failure"] = stage3_a3_fault(
+                        state["stage3_case"]
+                    )[0]
+            if state is not None and state.get("a1_phase") == "post-gb":
+                state["a1_phase"] = "absence"
+                if stage3_a3_call_token(
+                    self.namespace, self.name, arguments, arguments_by_name
+                ) is None:
+                    state["a1_phase"] = "post-gb"
+                    if self.namespace == "os" and self.name == "close":
+                        state["a1_phase"] = "cleanup"
             a1_graph_call = stage3_a1_graph_call_matches(
                 self.namespace, self.name, arguments, arguments_by_name
             )
@@ -1673,13 +1989,16 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             a2_call_token = stage3_a2_call_token(
                 self.namespace, self.name, arguments, arguments_by_name
             )
-            call_label = a2_call_token or stage3_authorized_call(
+            a3_call_token = stage3_a3_call_token(
+                self.namespace, self.name, arguments, arguments_by_name
+            )
+            call_label = a3_call_token or a2_call_token or stage3_authorized_call(
                 self.namespace, self.name, arguments, arguments_by_name
             )
             if state is not None and state["a2_complete"] == 1:
                 if call_label is None and not a1_graph_call and not a1_private_call:
                     state["unauthorized_calls"].append((self.namespace, self.name))
-                elif call_label is not None:
+                elif call_label is not None and a3_call_token is None:
                     state["post_a2_calls"].append(call_label)
             if call_label == "stage3a2-fsencode":
                 result = self.target(*arguments, **arguments_by_name)
@@ -1689,6 +2008,13 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 return stage3_a2_execute(
                     stage3_native_target(self.target),
                     a2_call_token,
+                    arguments,
+                    arguments_by_name,
+                )
+            if a3_call_token is not None:
+                return stage3_a3_execute(
+                    stage3_native_target(self.target),
+                    a3_call_token,
                     arguments,
                     arguments_by_name,
                 )
@@ -1856,11 +2182,13 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         if injection in {"error", "KeyboardInterrupt"}:
                             state["a1_body_outcome"] = "governed"
                             state["gb_failed"] = True
+                            if stage3_case_is_a3(state["stage3_case"]):
+                                state["a3_later_gb_failure"] = binding_token
                             safe_failure = stage3_a1_options(state["stage3_case"]).get("safe_failure")
                             if safe_failure in {"GB", "GB-KI"}:
                                 state["a1_safe_failure_attempted"] = safe_failure
                             if state["graph_binding_events"] == state["active_graph_bindings"]:
-                                state["a1_phase"] = "cleanup"
+                                stage3_a3_after_gb(state)
                             if injection == "KeyboardInterrupt" or safe_failure == "GB-KI":
                                 stage3_a1_maybe_interrupt(state, binding_token)
                                 raise KeyboardInterrupt()
@@ -1869,6 +2197,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         if injection == "mismatch":
                             state["a1_body_outcome"] = "governed"
                             state["gb_failed"] = True
+                            if stage3_case_is_a3(state["stage3_case"]):
+                                state["a3_later_gb_failure"] = binding_token
                             result = StatProxy(result, st_ino=result.st_ino + 1)
                         elif (
                             stage3_a1_options(state["stage3_case"]).get("full_binding")
@@ -1882,7 +2212,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         if state["graph_binding_events"] == state["active_graph_bindings"]:
                             if not state["gb_failed"]:
                                 state["a1_suffix"].append("final-graph-bindings")
-                            state["a1_phase"] = "cleanup"
+                            stage3_a3_after_gb(state)
                         return result
                     if token is None or not (
                         token.startswith("edge-pre-stat:")
@@ -2045,11 +2375,13 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         if injection in {"error", "KeyboardInterrupt"}:
                             state["a1_body_outcome"] = "governed"
                             state["gb_failed"] = True
+                            if stage3_case_is_a3(state["stage3_case"]):
+                                state["a3_later_gb_failure"] = binding_token
                             safe_failure = stage3_a1_options(state["stage3_case"]).get("safe_failure")
                             if safe_failure in {"GB", "GB-KI"}:
                                 state["a1_safe_failure_attempted"] = safe_failure
                             if state["graph_binding_events"] == state["active_graph_bindings"]:
-                                state["a1_phase"] = "cleanup"
+                                stage3_a3_after_gb(state)
                             if injection == "KeyboardInterrupt" or safe_failure == "GB-KI":
                                 stage3_a1_maybe_interrupt(state, binding_token)
                                 raise KeyboardInterrupt()
@@ -2058,6 +2390,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         if injection == "mismatch":
                             state["a1_body_outcome"] = "governed"
                             state["gb_failed"] = True
+                            if stage3_case_is_a3(state["stage3_case"]):
+                                state["a3_later_gb_failure"] = binding_token
                             result = StatProxy(result, st_ino=result.st_ino + 1)
                         elif (
                             stage3_a1_options(state["stage3_case"]).get("full_binding")
@@ -2076,7 +2410,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         if state["graph_binding_events"] == state["active_graph_bindings"]:
                             if not state["gb_failed"]:
                                 state["a1_suffix"].append("final-graph-bindings")
-                            state["a1_phase"] = "cleanup"
+                            stage3_a3_after_gb(state)
                         return result
                     if token is not None and (
                         token.startswith("held-fstat:")
@@ -2162,7 +2496,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                             raise OSError(errno.EIO, "stage3a1 final borrowed custody failed")
                         if stage3_a1_expected_binding_token(state) is None:
                             state["a1_suffix"].append("final-graph-bindings")
-                            state["a1_phase"] = "cleanup"
+                            stage3_a3_after_gb(state)
                     stage3_a1_maybe_interrupt(state, call_label)
                 if not stage3_case_reaches_g1(state["stage3_case"]) and state["final_custody"] == 1:
                     if fd == state["borrowed_ledger_fd"] and "borrowed-L-fstat" not in state["events"]:
@@ -2249,6 +2583,14 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 )
                 result = target(*arguments, **arguments_by_name)
                 if (
+                    stage3_case_is_a3(state["stage3_case"])
+                    and stage3_a2_options(state["stage3_case"]).get("a3_close_failure")
+                    and fd in state["a3_fds"].values()
+                    and state["a3_close_failure"] is None
+                ):
+                    state["a3_close_failure"] = fd
+                    raise state["a3_close_sentinel"]
+                if (
                     stage3_a1_options(state["stage3_case"]).get("close_failure") == "parent"
                     and fd == state["private_parent_fd"]
                 ):
@@ -2274,7 +2616,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 )
                 if (
                     state is not None
-                    and (stage3_case_is_a1(case) or stage3_case_is_a2(case))
+                    and stage3_case_reaches_g1(case)
                     and state["a1_emfile"]
                     and len(case) >= 3
                     and case[2] == "EMFILE-rlimit-drift"
@@ -2884,6 +3226,516 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         if state["a2_close_uncertain"] and expected_terminal != "MutationError":
             raise SystemExit("stage3a2 scan close uncertainty lost precedence")
 
+    def check_stage3_a2_prefix():
+        state = stage3_c0_state
+        if (
+            state["graph_events"] != state["expected_graph_events"]
+            or tuple(state["a2_operations"])
+            != tuple(descriptor[0] for descriptor in state["a2_expected_operations"])
+            or state["a2_expected_outcome"] != "success"
+        ):
+            raise SystemExit("stage3a3 A2 prefix drifted")
+        expected_fsencode = [
+            (descriptor[3][0], os.fsencode(descriptor[3][0]))
+            for descriptor in state["a2_expected_operations"]
+            if descriptor[0].startswith("fsencode")
+        ]
+        if state["a2_fsencode_calls"] != expected_fsencode:
+            raise SystemExit("stage3a3 A2 fsencode prefix drifted")
+        for row in stage3_a2_expected_rows:
+            label, locator, klass, access, result, mode, size, digest = row[:8]
+            observed = state["a2_supplied_rows"].get(locator)
+            value = state["a2_row_stats"].get(label)
+            if (
+                observed != (locator, klass, access, result, mode, size, digest)
+                or value is None
+                or stat.S_IMODE(value.st_mode) != mode
+            ):
+                raise SystemExit("stage3a3 A2 literal row prefix drifted")
+
+    def check_stage3_a3(expected_terminal):
+        state = stage3_c0_state
+        case = state["stage3_case"]
+        options = stage3_a2_options(case)
+        body_tokens = tuple(descriptor[0] for descriptor in state["a3_body_operations"])
+        absence_tokens = tuple(descriptor[0] for descriptor in state["a3_absence_operations"])
+        fault_token, fault_variant = stage3_a3_fault(case)
+        if not state["a3_started"]:
+            if (
+                case[0] == "stage3a3-case"
+                and case[1] == "relative-primary"
+                and tuple(state["a1_final_private_events"]) == ()
+                and tuple(state["a1_final_borrowed_events"]) == stage3_a1_final_borrowed
+                and state["a1_phase"] == "cleanup"
+            ):
+                raise SystemExit(
+                    "stage3a3 canonical absence was not the final filesystem observation"
+                )
+            raise SystemExit("stage3a3 executable case performed no A3 operation")
+        expected_body = body_tokens
+        if fault_token in body_tokens:
+            expected_body = body_tokens[: body_tokens.index(fault_token) + 1]
+        if options.get("expected_route", "success") == "follow41":
+            refused = next(
+                token
+                for token in body_tokens
+                if token == "symlink-parent-stat0:41"
+            )
+            expected_body = body_tokens[: body_tokens.index(refused) + 1]
+        if tuple(state["a3_body_events"]) != expected_body:
+            raise SystemExit("stage3a3 body operation order drifted")
+        route = options.get("expected_route", "success")
+        expected_absence = absence_tokens
+        if fault_token in absence_tokens:
+            expected_absence = absence_tokens[: absence_tokens.index(fault_token) + 1]
+        if route == "success" and tuple(state["a3_absence_events"]) != expected_absence:
+            raise SystemExit("stage3a3 canonical absence was not the final filesystem observation")
+        if route.startswith("absence-") and tuple(state["a3_absence_events"]) != expected_absence:
+            raise SystemExit("stage3a3 terminal absence mutation order drifted")
+        if route not in {"success", "absence-failure", "absence-arbitrary"} and state["a3_absence_events"]:
+            raise SystemExit("stage3a3 rejected body reached canonical absence")
+        if absence_tokens:
+            if any(
+                not (
+                    absence_tokens[index].startswith("absent-boundary-parent:")
+                    and absence_tokens[index + 1].startswith("absent-boundary-held:")
+                    and absence_tokens[index + 2].startswith("absent-terminal:")
+                )
+                for index in range(0, len(absence_tokens), 3)
+            ):
+                raise SystemExit("stage3a3 canonical absence order drifted")
+            if route == "success" and (
+                not state["a3_absence_complete"]
+                or not state["a3_absence_events"][-1].startswith("absent-terminal:")
+                or tuple(value for _token, value in state["a3_absence_errnos"])
+                != (errno.ENOENT, errno.ENOTDIR, errno.ENOENT)
+            ):
+                raise SystemExit("stage3a3 canonical absence was not the final filesystem observation")
+        elif route == "success" and state["a3_markers"] != ["canonical-absence-empty"]:
+            raise SystemExit("stage3a3 empty canonical-absence ledger was not explicit")
+        expected_boundary_tokens = tuple(
+            token
+            for token in expected_absence
+            if token.startswith(("absent-boundary-parent:", "absent-boundary-held:"))
+            and not (token == fault_token and fault_variant in {"error", "KeyboardInterrupt"})
+        )
+        expected_boundary_values = []
+        injection_after = {
+            token: after for token, _before, after in state["a3_injections"]
+        }
+        for token in expected_boundary_tokens:
+            row_label = "repo-abs-blocker" if "/blocker/child" in token else "repo-abs"
+            value = identity(state["a2_row_stats"][row_label])
+            expected_boundary_values.append(injection_after.get(token, value))
+        if (
+            tuple(token for token, _value in state["a3_boundary_identities"])
+            != expected_boundary_tokens
+            or tuple(value for _token, value in state["a3_boundary_identities"])
+            != tuple(expected_boundary_values)
+        ):
+            raise SystemExit("stage3a3 canonical absence boundary identities drifted")
+        expected_absence_errnos = []
+        for token in expected_absence:
+            if not token.startswith("absent-terminal:"):
+                continue
+            if token == fault_token and fault_variant in {"success", "KeyboardInterrupt"}:
+                continue
+            expected_absence_errnos.append(
+                errno.EIO
+                if token == fault_token and fault_variant == "wrong-errno"
+                else errno.ENOTDIR
+                if token.endswith(":ENOTDIR")
+                else errno.ENOENT
+            )
+        if tuple(state["a3_absence_errnos"]) != tuple(
+            (token, value)
+            for token, value in zip(
+                (token for token in expected_absence if token.startswith("absent-terminal:")),
+                expected_absence_errnos,
+            )
+        ):
+            raise SystemExit("stage3a3 canonical absence errno identity drifted")
+        if state["unauthorized_calls"] or state["unauthorized_attributes"]:
+            raise SystemExit("stage3a3 performed an unauthorized later observation")
+        if (
+            route in {"success", "follow41", "absence-failure", "absence-arbitrary"}
+            and not state["a3_forbid_later_filesystem"]
+        ):
+            raise SystemExit("stage3a3 terminal filesystem sentinel was not armed")
+
+        open_tokens = [token for token in expected_body if token.startswith("symlink-open:")]
+        if fault_token in open_tokens:
+            open_tokens = open_tokens[: open_tokens.index(fault_token)]
+        admitted = [int(token.rsplit(":", 1)[1]) for token in open_tokens]
+        if (
+            state["a3_owned_occurrences"] != admitted
+            or len(state["a3_fds"]) != len(admitted)
+            or len(set(state["a3_fds"].values())) != len(admitted)
+            or any(state["a3_fds"][occurrence] not in state["graph_owned"] for occurrence in admitted)
+        ):
+            raise SystemExit("stage3a3 occurrence ownership drifted")
+        for token, active in state["a3_open_active"]:
+            occurrence = int(token.rsplit(":", 1)[1])
+            if occurrence in state["a3_fds"] and state["a3_fds"][occurrence] in active:
+                raise SystemExit("stage3a3 open did not validate the complete active owner set")
+            earlier = {
+                fd
+                for prior, fd in state["a3_fds"].items()
+                if prior < occurrence
+            }
+            fixed = {
+                state["borrowed_ledger_fd"],
+                state["borrowed_parent_fd"],
+                state["private_ledger_fd"],
+                state["private_parent_fd"],
+                *(set(state["graph_owned"]) - set(state["a3_fds"].values())),
+            }
+            if set(active) != fixed | earlier:
+                raise SystemExit("stage3a3 active owner collision set was incomplete")
+        if (
+            fault_token is not None
+            and fault_token.startswith("symlink-parent-stat0:")
+            and fault_variant in {"error", "mismatch"}
+        ):
+            occurrence = int(fault_token.rsplit(":", 1)[1])
+            key = f"@a3:link:{occurrence}".encode("ascii")
+            if occurrence not in state["a3_owned_occurrences"] or key in state["graph_fds"]:
+                raise SystemExit("stage3a3 failed parent bracket promoted an occurrence")
+
+        read_attempts = tuple(
+            token for token in expected_body if token.startswith("readlink")
+        )
+        nonreturning = fault_variant in {"error", "KeyboardInterrupt"}
+        returned_reads = tuple(
+            token for token in read_attempts if not (nonreturning and token == fault_token)
+        )
+        if (
+            tuple(state["a3_readlink_attempts"]) != read_attempts
+            or tuple(token for token, _value in state["a3_native_readlinks"])
+            != returned_reads
+            or tuple(token for token, _value in state["a3_readlinks"])
+            != returned_reads
+        ):
+            raise SystemExit("stage3a3 readlink attempt/return prefix drifted")
+        native_by_token = dict(state["a3_native_readlinks"])
+        returned_by_token = dict(state["a3_readlinks"])
+        for token in returned_reads:
+            occurrence = int(token.rsplit(":", 1)[1])
+            expected_raw = options.get("raw_targets", {}).get(
+                occurrence, options.get("raw_target", b"./enum/../target")
+            )
+            native = native_by_token[token]
+            if type(native) is not type(expected_raw) or native != expected_raw:
+                raise SystemExit("stage3a3 native readlink result drifted")
+            if token != fault_token and returned_by_token[token] != native:
+                raise SystemExit("stage3a3 positive readlink result was transformed")
+        fsencode_attempts = tuple(
+            token for token in expected_body if token.startswith("target-fsencode")
+        )
+        returned_fsencodes = tuple(
+            token
+            for token in fsencode_attempts
+            if not (fault_variant == "error" and token == fault_token)
+        )
+        if (
+            tuple(state["a3_fsencode_attempts"]) != fsencode_attempts
+            or len(state["a3_fsencode_calls"]) != len(returned_fsencodes)
+        ):
+            raise SystemExit("stage3a3 fsencode attempt/return prefix drifted")
+        if any(type(value) is bytes for value in native_by_token.values()) and fsencode_attempts:
+            raise SystemExit("stage3a3 bytes target reached fsencode")
+        if any(type(value) is str for value in native_by_token.values()) and len(fsencode_attempts) != len(returned_reads):
+            raise SystemExit("stage3a3 str target fsencode was not immediate and singular")
+        raw_values = tuple(value for _token, value in state["a3_readlinks"])
+        for occurrence in admitted[:40]:
+            reads = [
+                (token, value)
+                for token, value in state["a3_readlinks"]
+                if token.endswith(f":{occurrence}")
+            ]
+            if not reads:
+                continue
+            if fault_token is not None and any(token == fault_token for token, _value in reads):
+                observed = reads[-1][1]
+                valid_fault = (
+                    fault_variant == "bytes-subclass" and type(observed) is BytesSubclass
+                    or fault_variant == "str-subclass" and type(observed) is StrSubclass
+                    or fault_variant == "other-type" and type(observed) is int
+                    or fault_variant == "empty" and observed == b""
+                    or fault_variant == "4097-bytes" and type(observed) is bytes and len(observed) == 4097
+                    or fault_variant == "mismatch" and observed == b"different"
+                )
+                if not valid_fault:
+                    raise SystemExit("stage3a3 readlink mutation was not operational")
+                if fault_variant in {"empty", "4097-bytes", "mismatch"} and (
+                    not fault_token.startswith("readlink2:")
+                    or len(reads) != 2
+                    or len([token for token in returned_reads if token.endswith(f":{occurrence}")]) != 2
+                ):
+                    raise SystemExit("stage3a3 second-read mutation lacked two observations")
+                continue
+            expected_raw = options.get("raw_targets", {}).get(
+                occurrence, options.get("raw_target", b"./enum/../target")
+            )
+            locator = reads[0][0].split(":", 1)[1].rsplit(":", 1)[0].encode("ascii")
+            row = state["a2_supplied_rows"].get(locator)
+            encoded = os.fsencode(expected_raw)
+            if (
+                len(reads) != 2
+                or type(reads[0][1]) is not type(expected_raw)
+                or reads[0][1] != expected_raw
+                or reads[1][1] != expected_raw
+                or row is None
+                or row[1:4] != ("symlink", "probe", "present")
+                or row[4] != 0o777
+                or row[5] != len(encoded)
+                or row[6] != hashlib.sha256(encoded).hexdigest()
+            ):
+                raise SystemExit("stage3a3 exact raw target S3/T3 evidence drifted")
+        identity_by_occurrence = {}
+        for token, value in state["a3_symlink_identities"]:
+            identity_by_occurrence.setdefault(int(token.rsplit(":", 1)[1]), []).append(value)
+        expected_identity_tokens = [
+            token
+            for token in expected_body
+            if token.startswith(("symlink-held-fstat", "symlink-parent-stat"))
+            and not (token == fault_token and fault_variant in {"error", "KeyboardInterrupt"})
+        ]
+        if tuple(token for token, _value in state["a3_symlink_identities"]) != tuple(expected_identity_tokens):
+            raise SystemExit("stage3a3 symlink identity observation order drifted")
+        for occurrence in admitted:
+            values = identity_by_occurrence.get(occurrence, ())
+            expected_count = sum(token.endswith(f":{occurrence}") for token in expected_identity_tokens)
+            mismatch_here = fault_token is not None and fault_token.endswith(f":{occurrence}") and fault_variant == "mismatch"
+            held_stat0_failed = (
+                fault_token == f"symlink-held-fstat0:{occurrence}"
+                and fault_variant in {"error", "KeyboardInterrupt"}
+            )
+            mode_invalid = bool(values) and not stat.S_ISLNK(values[0][4])
+            if (
+                len(values) != expected_count
+                or not values and not held_stat0_failed
+                or mode_invalid
+                or not held_stat0_failed
+                and not mismatch_here
+                and len(set(values)) != 1
+            ):
+                raise SystemExit("stage3a3 symlink identity bracket drifted")
+            if held_stat0_failed and f"@a3:link:{occurrence}".encode("ascii") in state["graph_fds"]:
+                raise SystemExit("stage3a3 failed held stat0 promoted an occurrence")
+        for token, value in state["a3_symlink_identities"]:
+            occurrence = int(token.rsplit(":", 1)[1])
+            locator = next(
+                open_token.split(":", 1)[1].rsplit(":", 1)[0].encode("ascii")
+                for open_token in body_tokens
+                if open_token.startswith("symlink-open:")
+                and open_token.endswith(f":{occurrence}")
+            )
+            row = state["a2_supplied_rows"].get(locator)
+            if (
+                not stat.S_ISLNK(value[4])
+                or row is None
+                or row[4] != 0o777
+                or stat.S_IMODE(value[4]) != row[4]
+            ):
+                raise SystemExit("stage3a3 symlink mode evidence drifted")
+        if fault_variant == "mismatch" and fault_token.startswith(("symlink-", "target-", "absent-")) and not any(
+            token == fault_token and before != after
+            for token, before, after in state["a3_injections"]
+        ):
+            raise SystemExit("stage3a3 identity mutation was not operational")
+        if 41 in admitted and any(token.endswith(":41") for token in read_attempts):
+            raise SystemExit("stage3a3 refused occurrence 41 reached readlink")
+
+        target_tokens = [
+            token
+            for token in expected_body
+            if token.startswith(("target-parent-stat", "target-held-fstat"))
+            and not (token == fault_token and fault_variant in {"error", "KeyboardInterrupt"})
+        ]
+        if case[0] == "stage3a3-case":
+            expected_target_counts = {
+                "relative-primary": 4,
+                "absolute-external-str": 2 * (len(external_literal_relations) + 1),
+                "repeated-slash-vendor": 4,
+                "root-clamped-dotdot": 2 * (len(root_literal_relations) + 1),
+                "trailing-directory": 2,
+                "trailing-nondirectory": 2,
+                "empty-target": 0,
+                "chain40": 41,
+                "chain41-refused": 40,
+                "no-symlink-ledger": 0,
+                "canonical-absence-empty": 4,
+                "a3-close-real-then-raise": 4,
+            }
+            described_targets = sum(
+                token.startswith(("target-parent-stat", "target-held-fstat"))
+                for token in body_tokens
+            )
+            if described_targets != expected_target_counts[case[1]]:
+                raise SystemExit("stage3a3 successful target components were incomplete")
+        target_values = [value for _token, value in state["a3_target_identities"]]
+        if tuple(token for token, _value in state["a3_target_identities"]) != tuple(target_tokens):
+            raise SystemExit("stage3a3 target edge/held identity drifted")
+        paired_target_values = target_values
+        if case[0] == "stage3a3-case" and case[1] in {"chain40", "chain41-refused"}:
+            final_pair = 2 if case[1] == "chain40" else 0
+            intermediate = target_values[:-final_pair] if final_pair else target_values
+            intermediate_tokens = target_tokens[:-final_pair] if final_pair else target_tokens
+            if any(not stat.S_ISLNK(value[4]) for value in intermediate):
+                raise SystemExit("stage3a3 chain target relation was not a symlink")
+            for token, value in zip(intermediate_tokens, intermediate):
+                occurrence = int(token.split(":", 2)[1])
+                next_identities = identity_by_occurrence.get(occurrence + 1, ())
+                if not next_identities or value != next_identities[0]:
+                    raise SystemExit("stage3a3 chain target did not bind the next held stat0")
+            paired_target_values = target_values[-final_pair:] if final_pair else []
+        if options.get("semantic_failure") == "intermediate-unreviewed-symlink":
+            if (
+                len(target_values) != 1
+                or not stat.S_ISLNK(target_values[0][4])
+                or b"repo:/unreviewed-link" in state["a2_supplied_rows"]
+            ):
+                raise SystemExit("stage3a3 unreviewed intermediate was not a real symlink")
+            paired_target_values = []
+        if fault_variant != "mismatch" and (
+            len(paired_target_values) % 2
+            or any(
+                paired_target_values[index] != paired_target_values[index + 1]
+                for index in range(0, len(paired_target_values), 2)
+            )
+        ):
+            raise SystemExit("stage3a3 target edge/held identity drifted")
+        target_row = options.get(
+            "target_row",
+            (
+                b"repo:/target", "repo", "read", "present", 0o600, 2,
+                "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5",
+            ),
+        )
+        if target_values and target_row is not None:
+            locator, klass, access, result, mode, size, digest = target_row
+            locator = options.get("target_locator", locator)
+            klass = options.get("target_namespace", klass)
+            size = options.get("target_row_size", size)
+            digest = options.get("target_row_digest", digest)
+            if (
+                state["a2_supplied_rows"].get(locator)
+                != (locator, klass, access, result, mode, size, digest)
+                or stat.S_IMODE(target_values[-1][4]) != mode
+                or klass != "directory" and target_values[-1][6] != size
+            ):
+                raise SystemExit("stage3a3 literal reviewed target row drifted")
+        if options.get("semantic_failure") is not None and (
+            state["a3_semantic_observed"] != options["semantic_failure"]
+            or state["a3_semantic_rejection"] != options["semantic_failure"]
+            or fault_token != state["a3_first_body_failure"]
+        ):
+            raise SystemExit("stage3a3 semantic mutation was not rejected by production")
+        if options.get("semantic_failure") in {
+            "missing-reviewed-final-row", "final-locator-mismatch", "final-namespace-mismatch"
+        }:
+            row_label = options.get("semantic_row")
+            if not target_values:
+                raise SystemExit("stage3a3 semantic target relation was not observed")
+            if row_label is None:
+                if b"repo:/unreviewed-target" in state["a2_supplied_rows"]:
+                    raise SystemExit("stage3a3 missing-final unexpectedly had a reviewed row")
+            else:
+                row = stage3_a2_row_by_label[row_label]
+                if (
+                    target_values[-1] != identity(state["a2_row_stats"][row_label])
+                    or state["a2_supplied_rows"].get(row[1]) is None
+                    or row[1] in {
+                        b"repo:/locator-alias", b"repo:/namespace-alias"
+                    }
+                    or options["semantic_failure"] == "final-namespace-mismatch"
+                    and row[2] != "vendor"
+                ):
+                    raise SystemExit("stage3a3 independently consumed mapping mutation drifted")
+        if case[1] in {"chain40", "chain41-refused"}:
+            if b"repo:/link" in state["a2_supplied_rows"]:
+                raise SystemExit("stage3a3 chain improperly retained the base link row")
+            chain_count = 40 if case[1] == "chain40" else 41
+            expected_locators = {
+                f"repo:/chain{index:02d}".encode("ascii")
+                for index in range(chain_count)
+            }
+            observed_locators = {
+                token.split(":", 1)[1].rsplit(":", 1)[0].encode("ascii")
+                for token in read_attempts
+                if token.startswith("readlink1:")
+            }
+            if observed_locators != expected_locators - ({b"repo:/chain40"} if chain_count == 41 else set()):
+                raise SystemExit("stage3a3 chain entry/intermediate locators drifted")
+
+        expected_bindings = tuple(
+            token
+            for token in state["expected_graph_bindings"]
+            if token.split(":", 1)[1].encode("ascii") in state["graph_fds"]
+        )
+        if route not in {"arbitrary", "absence-arbitrary", "follow41"} and (
+            tuple(state["a1_final_private_events"]) != stage3_a1_final_private
+            or tuple(state["a1_final_borrowed_events"]) != stage3_a1_final_borrowed
+            or tuple(state["graph_binding_events"]) != expected_bindings
+        ):
+            raise SystemExit("stage3a3 FP/FB/GB suffix drifted")
+        if route in {"arbitrary", "absence-arbitrary", "follow41"} and (
+            state["a1_final_private_events"]
+            or state["a1_final_borrowed_events"]
+            or state["graph_binding_events"]
+        ):
+            raise SystemExit("stage3a3 cleanup-only route entered the safe suffix")
+        if state["a3_absence_events"] and state["a3_absence_suffix_snapshot"] != (
+            stage3_a1_final_private,
+            stage3_a1_final_borrowed,
+            expected_bindings,
+        ):
+            raise SystemExit("stage3a3 absence preceded FP/FB/GB")
+        expected_closes = list(reversed(state["graph_owned"])) + [
+            state["private_parent_fd"], state["private_ledger_fd"]
+        ]
+        if state["graph_close_calls"] != expected_closes:
+            raise SystemExit("stage3a3 reverse occurrence cleanup drifted")
+        if options.get("a3_close_failure") and state["a3_close_failure"] is None:
+            raise SystemExit("stage3a3 retained FD close uncertainty was not injected")
+        if options.get("a3_close_failure") and state["caught_exception"].__cause__ is not state["a3_close_sentinel"]:
+            raise SystemExit("stage3a3 retained FD close sentinel cause drifted")
+        if route == "follow41" and (
+            state["a3_first_body_failure"] != "symlink-parent-stat0:41"
+            or b"@a3:link:41" in state["graph_fds"]
+            or not state["a3_forbid_later_filesystem"]
+        ):
+            raise SystemExit("stage3a3 occurrence 41 refusal identity drifted")
+        if route in {"governed", "capacity"} and state["a3_first_body_failure"] != fault_token:
+            raise SystemExit("stage3a3 first governed failure identity drifted")
+        expected_rlimit_count = 2 if fault_variant is not None and fault_variant.startswith("EMFILE") else 1
+        if (
+            len(state["getrlimit"]) != expected_rlimit_count
+            or state["getrlimit"][0][1] != state["rlimit_baseline"]
+            or state["a1_emfile_pending"]
+        ):
+            raise SystemExit("stage3a3 EMFILE RLIMIT receipt drifted")
+        if fault_variant == "EMFILE-rlimit-same" and state["getrlimit"][1][1] != state["rlimit_baseline"]:
+            raise SystemExit("stage3a3 unchanged RLIMIT reread drifted")
+        if fault_variant == "EMFILE-rlimit-drift" and state["getrlimit"][1][1] == state["rlimit_baseline"]:
+            raise SystemExit("stage3a3 drifted RLIMIT reread drifted")
+        if route == "arbitrary" and state["a3_original_interrupt"] != fault_token:
+            raise SystemExit("stage3a3 original interrupt identity drifted")
+        expected_safe_failure = options.get("safe_failure")
+        if expected_safe_failure is not None and state["a1_safe_failure_attempted"] != expected_safe_failure:
+            raise SystemExit("stage3a3 safe suffix failure identity drifted")
+        if expected_safe_failure == "GB" and state["a3_later_gb_failure"] != expected_bindings[0]:
+            raise SystemExit("stage3a3 later GB failure identity drifted")
+        if expected_terminal != (
+            "SystemExit(77)" if route in {"success", "capacity"} and not options.get("a3_close_failure") else
+            "KeyboardInterrupt" if route in {"arbitrary", "absence-arbitrary"} and not options.get("a3_close_failure") else
+            "MutationError"
+        ):
+            raise SystemExit("stage3a3 terminal route drifted")
+        if state["a1_phase"] != "cleanup":
+            raise SystemExit("stage3a3 lifecycle did not reach cleanup")
+
     def run_case(
         label,
         expected,
@@ -3027,6 +3879,35 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     "a2_cross_scan": False,
                     "a2_first_body_failure": None,
                     "a2_original_interrupt": None,
+                    "a3_body_operations": stage3_a3_spec(stage3_case)[0],
+                    "a3_absence_operations": stage3_a3_spec(stage3_case)[1],
+                    "a3_body_events": [],
+                    "a3_absence_events": [],
+                    "a3_started": False,
+                    "a3_fds": {},
+                    "a3_owned_occurrences": [],
+                    "a3_open_active": [],
+                    "a3_readlinks": [],
+                    "a3_native_readlinks": [],
+                    "a3_readlink_attempts": [],
+                    "a3_fsencode_calls": [],
+                    "a3_fsencode_attempts": [],
+                    "a3_absence_errnos": [],
+                    "a3_absence_complete": False,
+                    "a3_absence_suffix_snapshot": None,
+                    "a3_symlink_identities": [],
+                    "a3_target_identities": [],
+                    "a3_boundary_identities": [],
+                    "a3_markers": [],
+                    "a3_first_body_failure": None,
+                    "a3_original_interrupt": None,
+                    "a3_close_failure": None,
+                    "a3_close_sentinel": OSError(errno.EIO, "stage3a3 retained FD real-close-then-raise"),
+                    "a3_forbid_later_filesystem": False,
+                    "a3_injections": [],
+                    "a3_semantic_observed": None,
+                    "a3_semantic_rejection": None,
+                    "a3_later_gb_failure": None,
                     "a1_emfile": False,
                     "a1_emfile_pending": False,
                     "private_parent_structural": None,
@@ -3095,7 +3976,11 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         if full_a2:
             expected_terminal = "SystemExit(77)" if expected is SystemExit else expected.__name__
             if stage3_case_reaches_a2(stage3_case):
-                check_stage3_a2(expected_terminal)
+                if stage3_case_is_a3(stage3_case):
+                    check_stage3_a2_prefix()
+                    check_stage3_a3(expected_terminal)
+                else:
+                    check_stage3_a2(expected_terminal)
                 if stage3_case_is_continuation(stage3_case):
                     check_stage3_c0_case(stage3_case, expected_terminal)
             elif stage3_case_is_a1(stage3_case):
@@ -5487,6 +6372,341 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             or not stage3_a2_expected_operations
         ):
             raise SystemExit("stage3a2 literal positive oracle drifted")
+        symlink_flags = os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW
+        repo_raw = os.fsencode(repo3)
+        link_parent = ("@held", repo_raw)
+
+        def stage3_a3_occurrence(occurrence, name, locator, *, text_target=False):
+            read_name = os.fsdecode(name) if text_target else name
+            result = [
+                (f"symlink-open:{locator}:{occurrence}", "os", "open", (name, symlink_flags), (("dir_fd", link_parent),)),
+                (f"symlink-held-fstat0:{occurrence}", "os", "fstat", (("@a3", occurrence),), ()),
+                (f"symlink-parent-stat0:{occurrence}", "os", "stat", (name,), (("dir_fd", link_parent), ("follow_symlinks", False))),
+                (f"readlink1:{locator}:{occurrence}", "os", "readlink", (read_name,), (("dir_fd", link_parent),)),
+            ]
+            if text_target:
+                result.append((f"target-fsencode1:{occurrence}", "os", "fsencode", ("@read1",), ()))
+            result.extend(
+                (
+                    (f"symlink-held-fstat1:{occurrence}", "os", "fstat", (("@a3", occurrence),), ()),
+                    (f"symlink-parent-stat1:{occurrence}", "os", "stat", (name,), (("dir_fd", link_parent), ("follow_symlinks", False))),
+                    (f"readlink2:{locator}:{occurrence}", "os", "readlink", (read_name,), (("dir_fd", link_parent),)),
+                )
+            )
+            if text_target:
+                result.append((f"target-fsencode2:{occurrence}", "os", "fsencode", ("@read2",), ()))
+            result.extend(
+                (
+                    (f"symlink-held-fstat2:{occurrence}", "os", "fstat", (("@a3", occurrence),), ()),
+                    (f"symlink-parent-stat2:{occurrence}", "os", "stat", (name,), (("dir_fd", link_parent), ("follow_symlinks", False))),
+                )
+            )
+            return tuple(result)
+
+        def stage3_a3_target_relation(index, label, parent_role, name, held_role):
+            return (
+                (f"target-parent-stat:{index}:{label}", "os", "stat", (name,), (("dir_fd", parent_role), ("follow_symlinks", False))),
+                (f"target-held-fstat:{index}:{label}", "os", "fstat", (held_role,), ()),
+            )
+
+        def stage3_a3_target_components(relations):
+            return tuple(
+                descriptor
+                for index, (label, parent_role, name, held_role) in enumerate(relations)
+                for descriptor in stage3_a3_target_relation(
+                    index, label, parent_role, name, held_role
+                )
+            )
+
+        stage3_a3_absence_operations = (
+            ("absent-boundary-parent:repo:/abs/a-missing", "os", "stat", (b"abs",), (("dir_fd", ("@held", repo_raw)), ("follow_symlinks", False))),
+            ("absent-boundary-held:repo:/abs/a-missing", "os", "fstat", (("@evidence", "repo-abs"),), ()),
+            ("absent-terminal:repo:/abs/a-missing:ENOENT", "os", "stat", (b"a-missing",), (("dir_fd", ("@evidence", "repo-abs")), ("follow_symlinks", False))),
+            ("absent-boundary-parent:repo:/abs/blocker/child", "os", "stat", (b"blocker",), (("dir_fd", ("@evidence", "repo-abs")), ("follow_symlinks", False))),
+            ("absent-boundary-held:repo:/abs/blocker/child", "os", "fstat", (("@evidence", "repo-abs-blocker"),), ()),
+            ("absent-terminal:repo:/abs/blocker/child:ENOTDIR", "os", "stat", (b"child",), (("dir_fd", ("@evidence", "repo-abs-blocker")), ("follow_symlinks", False))),
+            ("absent-boundary-parent:repo:/abs/c-missing", "os", "stat", (b"abs",), (("dir_fd", ("@held", repo_raw)), ("follow_symlinks", False))),
+            ("absent-boundary-held:repo:/abs/c-missing", "os", "fstat", (("@evidence", "repo-abs"),), ()),
+            ("absent-terminal:repo:/abs/c-missing:ENOENT", "os", "stat", (b"c-missing",), (("dir_fd", ("@evidence", "repo-abs")), ("follow_symlinks", False))),
+        )
+
+        repo_target = stage3_a3_target_components(
+            (("repo-target", ("@held", repo_raw), b"target", ("@evidence", "repo-target")),)
+        )
+        relative_target = stage3_a3_target_components(
+            (
+                ("repo-enum", ("@held", repo_raw), b"enum", ("@evidence", "repo-enum")),
+                ("repo-target", ("@held", repo_raw), b"target", ("@evidence", "repo-target")),
+            )
+        )
+        repo_enum = stage3_a3_target_components(
+            (("repo-enum", ("@held", repo_raw), b"enum", ("@evidence", "repo-enum")),)
+        )
+        vendor_target = stage3_a3_target_components(
+            (
+                ("vendor-dir", ("@held", repo_raw), b"vendor", ("@held", os.fsencode(vendor3))),
+                ("vendor", ("@held", os.fsencode(vendor3)), b"v.bin", ("@evidence", "vendor")),
+            )
+        )
+        stage3_root_literal_names = tuple(
+            name for name in stage3_root_bytes.split(b"/") if name
+        )
+        stage3_root_literal_prefixes = tuple(
+            b"/" + b"/".join(stage3_root_literal_names[:index])
+            for index in range(1, len(stage3_root_literal_names) + 1)
+        )
+        external_literal_names = stage3_root_literal_names + (b"external",)
+        external_literal_prefixes = stage3_root_literal_prefixes + (os.fsencode(external3),)
+        external_literal_relations = tuple(
+            (
+                "external-parent" if index == len(external_literal_names) - 1 else f"absolute-prefix-{index}",
+                ("@held", b"/") if index == 0 else (
+                    ("@held", stage3_root_literal_prefixes[index - 1])
+                    if index <= len(stage3_root_literal_prefixes)
+                    else ("@evidence", "external-parent")
+                ),
+                name,
+                ("@evidence", "external-parent")
+                if index == len(external_literal_names) - 1
+                else ("@held", external_literal_prefixes[index]),
+            )
+            for index, name in enumerate(external_literal_names)
+        )
+        root_literal_relations = tuple(
+            (
+                "repo-dir" if index == len(stage3_root_literal_names) - 1 else f"root-prefix-{index}",
+                ("@held", b"/") if index == 0 else ("@held", stage3_root_literal_prefixes[index - 1]),
+                name,
+                ("@held", repo_raw)
+                if index == len(stage3_root_literal_names) - 1
+                else ("@held", stage3_root_literal_prefixes[index]),
+            )
+            for index, name in enumerate(stage3_root_literal_names)
+        )
+        external_target = stage3_a3_target_components(external_literal_relations) + stage3_a3_target_components(
+            (("external-tool", ("@evidence", "external-parent"), b"tool", ("@evidence", "external-tool")),)
+        )
+        root_clamped_target = stage3_a3_target_components(root_literal_relations) + repo_target
+        primary = stage3_a3_occurrence(1, b"link", "repo:/link")
+        primary_text = stage3_a3_occurrence(1, b"link", "repo:/link", text_target=True)
+        stage3_a3_live_cases = [
+            ("relative-primary", primary + relative_target, stage3_a3_absence_operations, SystemExit, {"raw_target": b"./enum/../target", "target_row": (b"repo:/target", "repo", "read", "present", 0o600, 2, "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5")}, "base"),
+            ("absolute-external-str", primary_text + external_target, stage3_a3_absence_operations, SystemExit, {"raw_target": os.fsdecode(os.fsencode(external3) + b"/tool"), "target_row": (b"external:/" + stage3_root_bytes[1:] + b"/external/tool", "tool", "execute", "present", 0o700, 13, "022036a28655c76d3ac5e1584872c898d161687b7578de171ac3447b7447bf68")}, "external-str"),
+            ("repeated-slash-vendor", primary + vendor_target, stage3_a3_absence_operations, SystemExit, {"raw_target": b".//vendor///v.bin", "target_row": (b"vendor:/v.bin", "vendor", "read", "present", 0o600, 2, "ade9afa39b059ce9954a97780d15c35c204ed2a8ee75199512731550556e6f5f")}, "repeated"),
+            ("root-clamped-dotdot", primary + root_clamped_target, stage3_a3_absence_operations, SystemExit, {"raw_target": b"../" * 64 + repo_raw.lstrip(b"/") + b"/target", "target_row": (b"repo:/target", "repo", "read", "present", 0o600, 2, "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5")}, "root-clamped"),
+            ("trailing-directory", primary + repo_enum, stage3_a3_absence_operations, SystemExit, {"raw_target": b"./enum/", "target_row": (b"repo:/enum", "directory", "enumerate", "present", 0o700, 21, "2c337acb2a4a9f0836a1b0401109e0464648087c760683e6956dfa0949153305")}, "trailing-directory"),
+            ("trailing-nondirectory", primary + repo_target, (), module.MutationError, {"raw_target": b"./target/", "expected_route": "governed", "target_row": (b"repo:/target", "repo", "read", "present", 0o600, 2, "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5")}, "trailing-nondirectory"),
+            ("empty-target", primary, (), module.MutationError, {"raw_target": b"", "expected_route": "governed", "target_row": None}, "empty"),
+        ]
+
+        chain40_parts = []
+        chain41_parts = []
+        for occurrence in range(1, 41):
+            current_name = f"chain{occurrence - 1:02d}".encode("ascii")
+            common = stage3_a3_occurrence(
+                occurrence, current_name, f"repo:/chain{occurrence - 1:02d}"
+            )
+            chain40_parts.extend(common)
+            chain41_parts.extend(common)
+            if occurrence == 40:
+                chain40_parts.extend(repo_target)
+                chain41_parts.append(
+                    stage3_a3_target_relation(
+                        occurrence, "repo-chain40", link_parent, b"chain40", None
+                    )[0]
+                )
+            else:
+                next_name = f"chain{occurrence:02d}".encode("ascii")
+                relation = stage3_a3_target_relation(
+                    occurrence, f"repo-chain{occurrence:02d}", link_parent, next_name, None
+                )[0]
+                chain40_parts.append(relation)
+                chain41_parts.append(relation)
+        chain40 = tuple(chain40_parts)
+        chain41 = tuple(chain41_parts) + stage3_a3_occurrence(41, b"chain40", "repo:/chain40")[:3]
+        stage3_a3_live_cases.extend(
+            (
+                ("chain40", chain40, stage3_a3_absence_operations, SystemExit, {"raw_target": b"chain01", "target_row": (b"repo:/target", "repo", "read", "present", 0o600, 2, "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5")}, "chain40"),
+                ("chain41-refused", chain41, (), module.MutationError, {"raw_target": b"chain01", "expected_route": "follow41", "target_row": None}, "chain41"),
+                ("no-symlink-ledger", (), stage3_a3_absence_operations, SystemExit, {"no_symlink": True, "target_row": None}, "no-symlink"),
+                ("canonical-absence-empty", primary + relative_target, (), SystemExit, {"raw_target": b"./enum/../target", "target_row": (b"repo:/target", "repo", "read", "present", 0o600, 2, "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5")}, "no-absence"),
+                ("a3-close-real-then-raise", primary + relative_target, stage3_a3_absence_operations, module.MutationError, {"raw_target": b"./enum/../target", "a3_close_failure": True, "target_row": (b"repo:/target", "repo", "read", "present", 0o600, 2, "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5")}, "base"),
+            )
+        )
+        if len(stage3_a3_live_cases) != 12 or len({case[0] for case in stage3_a3_live_cases}) != 12:
+            raise SystemExit("stage3a3 executable live case table drifted")
+        stage3_a3_specs = {
+            label: (body, absence)
+            for label, body, absence, _expected, _options, _ledger in stage3_a3_live_cases
+        }
+
+        stage3_a3_mutations = []
+
+        def stage3_a3_mutation(label, token, variant, *, options=None, expected=module.MutationError, route="governed", spec="relative-primary", ledger="base"):
+            values = dict(options or ())
+            values.update({"spec": spec, "expected_route": route})
+            stage3_a3_mutations.append((label, token, variant, values, expected, route, ledger))
+
+        first_open = primary[0][0]
+        for variant in (
+            "return-True", "return-IntSubclass", "return-negative",
+            "collision-borrowed-L", "collision-borrowed-P",
+            "collision-private-L", "collision-private-P", "collision-graph",
+            "EIO", "ENFILE", "EMFILE-rlimit-same", "EMFILE-rlimit-drift",
+        ):
+            stage3_a3_mutation(
+                f"open-{variant}", first_open, variant,
+                expected=SystemExit if variant == "EMFILE-rlimit-same" else module.MutationError,
+                options={"raw_target": b"./enum/../target"},
+                route="capacity" if variant == "EMFILE-rlimit-same" else "governed",
+            )
+        repeated_link_relation = stage3_a3_target_relation(
+            1, "repo-link-again", link_parent, b"link", None
+        )[0:1]
+        two_links = primary + repeated_link_relation + stage3_a3_occurrence(
+            2, b"link", "repo:/link"
+        )
+        stage3_a3_specs["two-link-collision"] = (two_links, ())
+        stage3_a3_mutation(
+            "open-collision-earlier-A3", next(
+                descriptor[0]
+                for descriptor in two_links
+                if descriptor[0].startswith("symlink-open:")
+                and descriptor[0].endswith(":2")
+            ), "collision-earlier-A3",
+            options={"raw_target": b"link"}, spec="two-link-collision",
+        )
+        for bracket in range(3):
+            for role in ("held", "parent"):
+                token = f"symlink-{role}-{'fstat' if role == 'held' else 'stat'}{bracket}:1"
+                for variant in ("mismatch", "error"):
+                    stage3_a3_mutation(
+                        f"identity-{role}-{bracket}-{variant}", token, variant,
+                        options={"raw_target": b"./enum/../target"},
+                    )
+        for role, token in (
+            ("held", "symlink-held-fstat1:1"),
+            ("parent", "symlink-parent-stat1:1"),
+        ):
+            stage3_a3_mutation(
+                f"identity-{role}-KeyboardInterrupt", token, "KeyboardInterrupt",
+                options={"raw_target": b"./enum/../target"}, expected=KeyboardInterrupt, route="arbitrary",
+            )
+        for ordinal in (1, 2):
+            token = next(descriptor[0] for descriptor in primary if descriptor[0].startswith(f"readlink{ordinal}:"))
+            for variant in ("error", "KeyboardInterrupt"):
+                stage3_a3_mutation(
+                    f"read{ordinal}-{variant}", token, variant,
+                    options={"raw_target": b"./enum/../target"},
+                    expected=KeyboardInterrupt if variant == "KeyboardInterrupt" else module.MutationError,
+                    route="arbitrary" if variant == "KeyboardInterrupt" else "governed",
+                )
+            for variant in (
+                ("bytes-subclass", "str-subclass", "other-type")
+                if ordinal == 1
+                else ("bytes-subclass", "str-subclass", "other-type", "mismatch")
+            ):
+                spec = "relative-primary"
+                raw_target = b"./enum/../target"
+                if variant == "str-subclass":
+                    spec = f"read{ordinal}-str-subclass"
+                    raw_target = os.fsdecode(os.fsencode(external3) + b"/tool")
+                    stage3_a3_specs[spec] = (primary_text + external_target, ())
+                stage3_a3_mutation(
+                    f"read{ordinal}-{variant}", token, variant,
+                    options={"raw_target": raw_target}, spec=spec,
+                )
+        for variant in ("empty", "4097-bytes"):
+            stage3_a3_mutation(
+                f"read2-{variant}", next(descriptor[0] for descriptor in primary if descriptor[0].startswith("readlink2:")), variant,
+                options={"raw_target": b"./enum/../target"},
+            )
+        for ordinal in (1, 2):
+            token = next(descriptor[0] for descriptor in primary_text if descriptor[0].startswith(f"target-fsencode{ordinal}:"))
+            for variant in ("error", "nonbytes"):
+                stage3_a3_specs[f"text-{ordinal}-{variant}"] = (primary_text + external_target, ())
+                stage3_a3_mutation(
+                    f"fsencode{ordinal}-{variant}", token, variant,
+                    options={"raw_target": os.fsdecode(os.fsencode(external3) + b"/tool")},
+                    spec=f"text-{ordinal}-{variant}",
+                )
+        for label in ("symlink-size-mismatch", "symlink-digest-mismatch"):
+            stage3_a3_specs[label] = (primary, ())
+            stage3_a3_mutation(
+                label, primary[-1][0], "semantic",
+                options={"raw_target": b"./enum/../target", "semantic_failure": label},
+                spec=label, ledger=label,
+            )
+        missing_target = stage3_a3_target_relation(
+            0, "repo-unreviewed-target", link_parent, b"unreviewed-target", None
+        )[0:1]
+        stage3_a3_specs["missing-reviewed-final-row"] = (primary + missing_target, ())
+        stage3_a3_mutation(
+            "missing-reviewed-final-row", missing_target[0][0], "semantic",
+            options={"raw_target": b"./unreviewed-target", "semantic_failure": "missing-reviewed-final-row", "semantic_row": None, "target_row": None},
+            spec="missing-reviewed-final-row",
+        )
+        for label, alias, row_label in (
+            ("final-locator-mismatch", b"locator-alias", "repo-target"),
+            ("final-namespace-mismatch", b"namespace-alias", "vendor"),
+        ):
+            relation = stage3_a3_target_relation(
+                0, f"repo-{alias.decode('ascii')}", link_parent, alias, None
+            )[0:1]
+            stage3_a3_specs[label] = (primary + relation, ())
+            stage3_a3_mutation(
+                label, relation[0][0], "semantic",
+                options={"raw_target": b"./" + alias, "semantic_failure": label, "semantic_row": row_label, "target_row": None},
+                spec=label,
+            )
+        unreviewed_target = (
+            ("target-parent-stat:0:repo-unreviewed-link", "os", "stat", (b"unreviewed-link",), (("dir_fd", link_parent), ("follow_symlinks", False))),
+        )
+        stage3_a3_specs["intermediate-unreviewed-symlink"] = (primary + unreviewed_target, ())
+        stage3_a3_mutation(
+            "intermediate-unreviewed-symlink", unreviewed_target[0][0], "semantic",
+            options={"raw_target": b"./unreviewed-link", "semantic_failure": "intermediate-unreviewed-symlink"},
+            spec="intermediate-unreviewed-symlink",
+        )
+        for label, token in (
+            ("target-edge-drift", "target-parent-stat:1:repo-target"),
+            ("target-held-drift", "target-held-fstat:1:repo-target"),
+        ):
+            stage3_a3_mutation(label, token, "mismatch", options={"raw_target": b"./enum/../target"})
+        absence_targets = (
+            ("enoent", stage3_a3_absence_operations[0][0], stage3_a3_absence_operations[1][0], stage3_a3_absence_operations[2][0]),
+            ("enotdir", stage3_a3_absence_operations[3][0], stage3_a3_absence_operations[4][0], stage3_a3_absence_operations[5][0]),
+        )
+        for label, parent_token, held_token, terminal_token in absence_targets:
+            for role, token in (("parent", parent_token), ("held", held_token)):
+                stage3_a3_mutation(f"absence-{label}-{role}-mismatch", token, "mismatch", options={"raw_target": b"./enum/../target"}, route="absence-failure")
+            for variant in ("wrong-errno", "success"):
+                stage3_a3_mutation(f"absence-{label}-{variant}", terminal_token, variant, options={"raw_target": b"./enum/../target"}, route="absence-failure")
+        stage3_a3_mutation(
+            "absence-first-row-stops-later", stage3_a3_absence_operations[0][0], "error",
+            options={"raw_target": b"./enum/../target", "forbid_later_filesystem": True},
+            route="absence-failure",
+        )
+        stage3_a3_mutation(
+            "absence-terminal-KeyboardInterrupt", stage3_a3_absence_operations[2][0], "KeyboardInterrupt",
+            options={"raw_target": b"./enum/../target"}, expected=KeyboardInterrupt, route="absence-arbitrary",
+        )
+        for label, options, expected, route in (
+            ("governed-runs-suffix", {"safe_failure": "FP"}, module.MutationError, "governed"),
+            ("arbitrary-direct-cleanup", {}, KeyboardInterrupt, "arbitrary"),
+            ("later-GB-does-not-replace", {"safe_failure": "GB"}, module.MutationError, "governed"),
+            ("close-overrides-governed", {"a3_close_failure": True}, module.MutationError, "governed"),
+            ("close-overrides-KeyboardInterrupt", {"a3_close_failure": True}, module.MutationError, "arbitrary"),
+        ):
+            token = next(descriptor[0] for descriptor in primary if descriptor[0].startswith("readlink1:"))
+            variant = (
+                "KeyboardInterrupt"
+                if "KeyboardInterrupt" in label or label == "arbitrary-direct-cleanup"
+                else "error"
+            )
+            stage3_a3_mutation(label, token, variant, options={"raw_target": b"./enum/../target", **options}, expected=expected, route=route)
+        if len(stage3_a3_mutations) != len({row[0] for row in stage3_a3_mutations}):
+            raise SystemExit("stage3a3 executable finite mutation table drifted")
         stage3_a2_cases = []
 
         def stage3_a2_case(token, variant, expected=module.MutationError, options=None):
@@ -5960,6 +7180,50 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         stage3_ledger_bytes = stage3_ledger(stage3_root_bytes, True)
         if stage3_ledger_bytes.count(b"\n") != 12 or stage3_no_symlink_ledger.count(b"\n") != 11:
             raise SystemExit("stage3 literal ledger row cardinality drifted")
+        for index in range(41):
+            target = b"target" if index == 40 else f"chain{index + 1:02d}".encode("ascii")
+            os.symlink(target, os.path.join(repo3, f"chain{index:02d}"))
+        os.symlink(b"target", os.path.join(repo3, "unreviewed-link"))
+        os.link(os.path.join(repo3, "target"), os.path.join(repo3, "unreviewed-target"))
+        os.link(os.path.join(repo3, "target"), os.path.join(repo3, "locator-alias"))
+        os.link(os.path.join(vendor3, "v.bin"), os.path.join(repo3, "namespace-alias"))
+
+        def stage3_a3_ledger(raw_target, *, include_link=True, include_absence=True, chain_count=0, mutation=None):
+            rows = [line.split(b"\t")[2:] for line in stage3_ledger_bytes.splitlines()]
+            rows = [row for row in rows if include_link or row[-1] != b"repo:/link"]
+            rows = [row for row in rows if include_absence or row[0] != b"absent"]
+            if include_link:
+                encoded = os.fsencode(raw_target)
+                for row in rows:
+                    if row[-1] == b"repo:/link":
+                        row[4] = str(len(encoded)).encode("ascii")
+                        row[5] = hashlib.sha256(encoded).hexdigest().encode("ascii")
+                        break
+            for index in range(chain_count):
+                target = (
+                    b"target"
+                    if index == chain_count - 1
+                    else f"chain{index + 1:02d}".encode("ascii")
+                )
+                rows.append(
+                    [
+                        b"symlink", b"probe", b"present", b"0777",
+                        str(len(target)).encode("ascii"),
+                        hashlib.sha256(target).hexdigest().encode("ascii"),
+                        f"repo:/chain{index:02d}".encode("ascii"),
+                    ]
+                )
+            if mutation == "symlink-size-mismatch":
+                next(row for row in rows if row[-1] == b"repo:/link")[4] = str(
+                    len(os.fsencode(raw_target)) + 1
+                ).encode("ascii")
+            elif mutation == "symlink-digest-mismatch":
+                next(row for row in rows if row[-1] == b"repo:/link")[5] = b"0" * 64
+            rows.sort(key=lambda row: row[-1])
+            return b"".join(
+                b"\t".join((b"input-v1", str(index).encode("ascii"), *row)) + b"\n"
+                for index, row in enumerate(rows)
+            )
         stage3_ledger_path = os.path.join(fixture, "stage3-ledger")
         stage3_file(stage3_ledger_path, stage3_ledger_bytes, 0o600)
         stage3_no_symlink_path = os.path.join(fixture, "stage3-ledger-no-symlink")
@@ -6399,6 +7663,78 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         borrowed=base_borrowed,
                         full_a2=True,
                         stage3_case=case,
+                    )
+                def run_stage3_a3(label, expected, options, ledger_kind, stage3_case):
+                    raw_target = options.get("raw_target", b"./enum/../target")
+                    include_link = ledger_kind not in {"no-symlink", "chain40", "chain41"}
+                    include_absence = ledger_kind != "no-absence"
+                    chain_count = 40 if ledger_kind == "chain40" else 41 if ledger_kind == "chain41" else 0
+                    if chain_count:
+                        options["raw_targets"] = {
+                            occurrence: (
+                                b"target"
+                                if occurrence == chain_count
+                                else f"chain{occurrence:02d}".encode("ascii")
+                            )
+                            for occurrence in range(1, chain_count + 1)
+                        }
+                    if os.path.lexists(stage3_link_path):
+                        os.unlink(stage3_link_path)
+                    if include_link:
+                        os.symlink(raw_target, stage3_link_path)
+                    chain39 = os.path.join(repo3, "chain39")
+                    os.unlink(chain39)
+                    os.symlink(b"target" if chain_count == 40 else b"chain40", chain39)
+                    ledger = stage3_a3_ledger(
+                        raw_target,
+                        include_link=include_link,
+                        include_absence=include_absence,
+                        chain_count=chain_count,
+                        mutation=ledger_kind if ledger_kind in {
+                            "symlink-size-mismatch", "symlink-digest-mismatch",
+                        } else None,
+                    )
+                    case_path = os.path.join(fixture, f"stage3a3-ledger-{label}")
+                    stage3_file(case_path, ledger, 0o600)
+                    case_fd = os.open(case_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+                    case_offset = os.lseek(case_fd, 11, os.SEEK_SET)
+                    original_golden = os.environ["TASK4_GOLDEN"]
+                    os.environ["TASK4_GOLDEN"] = ledger.decode("ascii")
+                    try:
+                        run_case(
+                            f"stage3a3-{label}",
+                            expected,
+                            overrides={"expected_ledger_fd": case_fd},
+                            borrowed=[(case_fd, case_offset), (parent_fd, parent_offset)],
+                            full_a2=True,
+                            stage3_case=stage3_case,
+                        )
+                    finally:
+                        os.environ["TASK4_GOLDEN"] = original_golden
+                        os.close(case_fd)
+                        if os.path.lexists(stage3_link_path):
+                            os.unlink(stage3_link_path)
+                        os.symlink(b"./enum/../target", stage3_link_path)
+                        os.unlink(chain39)
+                        os.symlink(b"chain40", chain39)
+
+                for label, _body, _absence, expected, case_options, ledger_kind in stage3_a3_live_cases:
+                    options = dict(case_options)
+                    options["spec"] = label
+                    run_stage3_a3(
+                        label,
+                        expected,
+                        options,
+                        ledger_kind,
+                        ("stage3a3-case", label, options),
+                    )
+                for label, token, variant, options, expected, _route, ledger_kind in stage3_a3_mutations:
+                    run_stage3_a3(
+                        label,
+                        expected,
+                        options,
+                        ledger_kind,
+                        ("stage3a3-mutation", token, variant, options),
                     )
             finally:
                 stage3_ready = False

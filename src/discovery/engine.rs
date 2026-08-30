@@ -10505,15 +10505,8 @@ mod tests {
             }
         }
 
-        let mut source = ChildGuard(
-            std::process::Command::new("sh")
-                .args(["-c", "read _"])
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-                .unwrap(),
-        );
-        let source_path = std::fs::read_link(format!("/proc/{}/exe", source.0.id())).unwrap();
-        let source_file = std::fs::File::open(&source_path).unwrap();
+        let source_path = std::path::Path::new("/bin/sh");
+        let source_file = std::fs::File::open(source_path).unwrap();
         let source_size = source_file.metadata().unwrap().len();
         assert!(
             read_bounded_interpreter(&source_file, source_size)
@@ -10521,8 +10514,6 @@ mod tests {
                 .is_some(),
             "the copied source must be a dynamic executable with one PT_INTERP"
         );
-        source.0.kill().unwrap();
-        source.0.wait().unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let executable = dir.path().join("large-sh");
@@ -10556,6 +10547,13 @@ mod tests {
         );
         assert!(libc::WIFSTOPPED(status));
         assert_eq!(libc::WSTOPSIG(status), libc::SIGSTOP);
+        let process_executable = std::fs::metadata(format!("/proc/{}/exe", child.0.id())).unwrap();
+        let fixture_executable = std::fs::metadata(&executable).unwrap();
+        assert_eq!(
+            (process_executable.dev(), process_executable.ino()),
+            (fixture_executable.dev(), fixture_executable.ino()),
+            "the stopped child must execute the enlarged fixture"
+        );
         let view = ProcessView::open(ProcessViewId(0), child.0.id()).unwrap();
         let mut engine = Engine::empty();
         engine.scope = Scope::Pid(child.0.id());

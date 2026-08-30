@@ -868,7 +868,7 @@ impl Owned {
         end: CaptureEnd,
         signals: &SignalState,
     ) -> Result<()> {
-        let Some(mut child) = self.child.take() else {
+        let Some(child) = self.child.take() else {
             return Ok(());
         };
         let cleanup = {
@@ -877,44 +877,62 @@ impl Owned {
             let mut io = SessionPauseIo::new(engine, session, &child, &marker, &cancelled);
             self.coordinator.cleanup(&mut io)
         };
-        let end = if end == CaptureEnd::DurationExpired && signals.interrupted() {
-            CaptureEnd::Signal
-        } else {
-            end
-        };
-        // An interrupt ends this run's own work rather than orphaning it; an
-        // expired `--duration` is not a reason to end someone's process, so
-        // the child is handed back unless `--kill-on-timeout` asked otherwise.
-        // An expired `--duration` is the only end that may hand back a live
-        // child, and only after coordinator cleanup succeeds.
-        let can_hand_off =
-            cleanup.is_ok() && end.allows_handoff(self.kill_on_timeout) && signals.claim_handoff();
-        let settled: Result<ChildOutcome> = if can_hand_off {
-            stage_handoff(child, &mut self.pending_handoff)
-        } else if (end == CaptureEnd::Signal || signals.interrupted()) && child.still_running() {
-            settle_after_signal(&mut child, signals)
-        } else {
-            child
-                .terminate_and_reap()
-                .map(ChildOutcome::Exited)
-                .map_err(|error| anyhow!("run: reaping the owned child: {error}"))
-        };
-        let settled = match settled {
-            Ok(ChildOutcome::Exited(code)) => {
-                self.exit_code = Some(code);
-                self.still_running = false;
-                Ok(())
-            }
-            Ok(ChildOutcome::TimedOutRunning) => {
-                self.exit_code = None;
-                self.still_running = true;
-                Ok(())
-            }
-            Err(error) => Err(anyhow!("run: reaping the owned child: {error}")),
-        };
+        let settled = settle_owned_child(
+            child,
+            end,
+            cleanup.is_ok(),
+            self.kill_on_timeout,
+            signals,
+            &mut self.pending_handoff,
+            &mut self.exit_code,
+            &mut self.still_running,
+        );
         // Both outcomes are retained: a cleanup failure must not be lost
         // behind a reap failure, or the other way round (design §10.3).
         combine_finish_errors(cleanup.map_err(pause_failure), settled)
+    }
+}
+
+fn settle_owned_child(
+    mut child: OwnedChild,
+    end: CaptureEnd,
+    cleanup_ok: bool,
+    kill_on_timeout: bool,
+    signals: &SignalState,
+    pending: &mut Option<OwnedChild>,
+    exit_code: &mut Option<i32>,
+    still_running: &mut bool,
+) -> Result<()> {
+    let end = if end == CaptureEnd::DurationExpired && signals.interrupted() {
+        CaptureEnd::Signal
+    } else {
+        end
+    };
+    // An expired `--duration` is the only end that may hand back a live
+    // child, and only after coordinator cleanup succeeds.
+    let can_hand_off = cleanup_ok && end.allows_handoff(kill_on_timeout) && signals.claim_handoff();
+    let settled: Result<ChildOutcome> = if can_hand_off {
+        stage_handoff(child, pending)
+    } else if (end == CaptureEnd::Signal || signals.interrupted()) && child.still_running() {
+        settle_after_signal(&mut child, signals)
+    } else {
+        child
+            .terminate_and_reap()
+            .map(ChildOutcome::Exited)
+            .map_err(|error| anyhow!("run: reaping the owned child: {error}"))
+    };
+    match settled {
+        Ok(ChildOutcome::Exited(code)) => {
+            *exit_code = Some(code);
+            *still_running = false;
+            Ok(())
+        }
+        Ok(ChildOutcome::TimedOutRunning) => {
+            *exit_code = None;
+            *still_running = true;
+            Ok(())
+        }
+        Err(error) => Err(anyhow!("run: reaping the owned child: {error}")),
     }
 }
 
@@ -2206,6 +2224,107 @@ mod tests {
         commit_handoff(&mut pending).unwrap();
         assert!(pending.is_none());
         unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    }
+
+    #[test]
+    fn owned_disposition_records_every_capture_end_state() {
+        let cases = [
+            (
+                "/bin/true",
+                CaptureEnd::TargetExit,
+                true,
+                false,
+                None,
+                Some(0),
+            ),
+            (
+                "/bin/sleep",
+                CaptureEnd::Signal,
+                true,
+                false,
+                Some(libc::SIGTERM),
+                Some(128 + libc::SIGTERM),
+            ),
+            (
+                "/bin/sleep",
+                CaptureEnd::Error,
+                true,
+                false,
+                None,
+                Some(128 + libc::SIGTERM),
+            ),
+            (
+                "/bin/sleep",
+                CaptureEnd::DurationExpired,
+                true,
+                false,
+                None,
+                None,
+            ),
+            (
+                "/bin/sleep",
+                CaptureEnd::DurationExpired,
+                false,
+                false,
+                None,
+                Some(128 + libc::SIGTERM),
+            ),
+            (
+                "/bin/sleep",
+                CaptureEnd::DurationExpired,
+                true,
+                true,
+                None,
+                Some(128 + libc::SIGTERM),
+            ),
+        ];
+
+        for (program, end, cleanup_ok, kill_on_timeout, signal, expected_exit) in cases {
+            let mut args = Vec::new();
+            if program == "/bin/sleep" {
+                args.push("10".to_string());
+            }
+            let mut child = spawn(
+                program,
+                &args.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
+            let pid = child.pid();
+            child.release().unwrap();
+            if end == CaptureEnd::TargetExit {
+                wait_until(
+                    || !child.still_running(),
+                    "target fixture never reached its exit state",
+                );
+            }
+            let signals = SignalState::new();
+            if let Some(signal) = signal {
+                signals.observe(signal);
+            }
+            let mut pending = None;
+            let mut exit_code = None;
+            let mut still_running = false;
+            settle_owned_child(
+                child,
+                end,
+                cleanup_ok,
+                kill_on_timeout,
+                &signals,
+                &mut pending,
+                &mut exit_code,
+                &mut still_running,
+            )
+            .unwrap();
+            assert_eq!(exit_code, expected_exit, "{program} {end:?}");
+            assert_eq!(still_running, expected_exit.is_none(), "{program} {end:?}");
+            assert_eq!(
+                pending.is_some(),
+                end == CaptureEnd::DurationExpired && cleanup_ok && !kill_on_timeout
+            );
+            if let Some(pending) = pending {
+                assert!(pending.still_running());
+                assert_eq!(pending.pid(), pid);
+            }
+        }
     }
 
     #[test]

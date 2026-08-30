@@ -1446,7 +1446,10 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     ):
                         state["a1_safe_failure_attempted"] = "FP"
                         raise OSError(errno.EIO, "stage3a1 final private custody failed")
-                if call_label in stage3_a1_final_borrowed:
+                if (
+                    stage3_case_reaches_g1(state["stage3_case"])
+                    and call_label in stage3_a1_final_borrowed
+                ):
                     state["a1_final_borrowed_events"].append(call_label)
                     state["events"].append(call_label)
                 if (
@@ -1596,7 +1599,10 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         return result
                     if token is not None and token == "anchor-lineages-exact":
                         raise SystemExit("stage3a1 graph acquisition order drifted")
-                if call_label in stage3_a1_final_borrowed:
+                if (
+                    stage3_case_reaches_g1(state["stage3_case"])
+                    and call_label in stage3_a1_final_borrowed
+                ):
                     state["a1_final_borrowed_events"].append(call_label)
                     state["events"].append(call_label)
                     if call_label == "borrowed-P-fstat":

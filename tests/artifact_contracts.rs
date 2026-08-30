@@ -2441,6 +2441,85 @@ fn live_discovery_bpf_classification_is_exact_and_output_only() {
         .expect("bounded interface loop");
     assert!(output_null < loop_start);
 
+    let assert_range_proof = |listed: &str| {
+        let proof = between(
+            listed,
+            "let active_count = count.min(16);",
+            "let mut interface_index = 0usize;",
+        );
+        let zero_guard = proof
+            .find("if active_count == 0")
+            .expect("active count zero guard");
+        let subtraction = proof
+            .find("(active_count - 1) * 24")
+            .expect("count-sensitive range proof");
+        assert!(zero_guard < subtraction);
+        assert_eq!(
+            proof.matches("checked_add").count(),
+            1,
+            "range proof must contain exactly one checked_add"
+        );
+        assert_eq!(
+            proof
+                .matches("bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES)")
+                .count(),
+            1,
+            "range proof must own exactly one bounded-read counter increment"
+        );
+        let compact_proof: String = proof
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        assert!(compact_proof.contains("state.arg0.checked_add((active_count-1)*24)"));
+        let overflow = &proof[proof.find("checked_add").expect("overflow proof")..];
+        assert_eq!(
+            overflow
+                .matches("bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES)")
+                .count(),
+            1,
+            "range overflow must own one bounded-read counter increment"
+        );
+        assert_eq!(
+            overflow.matches("return 0;").count(),
+            1,
+            "range overflow must return immediately"
+        );
+
+        let loop_start = listed
+            .find("while interface_index < 16")
+            .expect("count-sensitive interface loop");
+        assert!(listed.find("let active_count = count.min(16);").unwrap() < loop_start);
+        let loop_body = &listed[loop_start..];
+        assert!(
+            loop_body.contains("if interface_index as u64 >= active_count {\n            break;"),
+            "interface loop must terminate against active_count"
+        );
+        assert!(
+            loop_body.contains("state.arg0 + interface_index as u64 * 24"),
+            "interface loop must use the proven ordinary address expression"
+        );
+        assert!(
+            !loop_body.contains("checked_add"),
+            "interface loop must not repeat checked range arithmetic"
+        );
+        assert!(
+            !proof.contains("15 * 24"),
+            "range proof must depend on active_count"
+        );
+    };
+    assert_range_proof(listed);
+
+    let constant_range_proof = source.replacen("(active_count - 1) * 24", "15 * 24", 1);
+    let mutated_listed = between(
+        &constant_range_proof,
+        "pub fn interface_list_return(ctx: RetProbeContext) -> u32 {",
+        "#[uprobe]\npub fn interface_entry",
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_range_proof(mutated_listed)).is_err(),
+        "constant 15 * 24 range proof mutation must be rejected"
+    );
+
     for path in ["src/render.rs", "src/trace.rs", "src/output.rs"] {
         assert!(
             !read(path).contains("send_signal_rc"),

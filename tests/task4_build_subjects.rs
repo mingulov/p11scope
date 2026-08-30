@@ -583,6 +583,10 @@ class IntSubclass(int):
     pass
 
 
+class StrSubclass(str):
+    pass
+
+
 def identity(value):
     return (
         value.st_dev,
@@ -847,7 +851,11 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         return case is not None and not stage3_case_is_a1(case) and not stage3_case_is_a2(case)
 
     def stage3_case_reaches_a2(case):
-        return stage3_case_is_a2(case) or stage3_case_is_continuation(case)
+        return (
+            stage3_case_is_a2(case)
+            or stage3_case_is_continuation(case)
+            or case is not None and case[0] == "stage3a1-gb-mutation"
+        )
 
     def stage3_case_reaches_g1(case):
         return (
@@ -1035,6 +1043,11 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         expected = state["a2_expected_operations"]
         return expected[index] if index < len(expected) else None
 
+    def stage3_a2_regular_size(state, label):
+        return stage3_a2_options(state["stage3_case"]).get(
+            "regular_size", stage3_a2_row_by_label[label][6]
+        )
+
     def stage3_a2_role(state, value):
         if isinstance(value, tuple) and value[0] == "@held":
             return state["graph_fds"][value[1]]
@@ -1057,7 +1070,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             return None
         if token.startswith("regular-pread:"):
             label = token.split(":", 1)[1]
-            expected_size = stage3_a2_row_by_label[label][6]
+            expected_size = stage3_a2_regular_size(state, label)
             remaining = expected_size - state["a2_regular_cursor"]
             if (
                 len(arguments) != 3
@@ -1082,6 +1095,33 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         state["a1_body_outcome"] = outcome
         state["a1_phase"] = {"success": "fb", "governed": "fp", "arbitrary": "cleanup"}[outcome]
 
+    def stage3_a2_promote_binding(state, label):
+        result = state["a2_current_fd"]
+        state["a2_fds"][label] = result
+        if label != "external-parent":
+            state["a2_row_lineage"][label] = stage3_a2_row_by_label[label][8]
+        key = b"@a2:" + label.encode("ascii")
+        if label == "external-parent":
+            name = b"external"
+            parent_key = stage3_root_bytes
+        else:
+            row = stage3_a2_row_by_label[label]
+            name = row[9]
+            parent_role = row[8]
+            parent_key = (
+                b"@a2:" + parent_role[1].encode("ascii")
+                if parent_role[0] == "@evidence"
+                else parent_role[1]
+            )
+        state["graph_fds"][key] = result
+        state["graph_edges"].append(("edge", "a2", name, parent_key, key, ""))
+        state["expected_graph_bindings"].extend(
+            (
+                f"bind-held-fstat:{key.decode('ascii')}",
+                f"bind-parent-name-stat:{key.decode('ascii')}",
+            )
+        )
+
     def stage3_a2_execute(callable_value, token, arguments, arguments_by_name):
         state = stage3_c0_state
         case = state["stage3_case"]
@@ -1094,16 +1134,16 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             state["a2_open_snapshots"].append((token, tuple(state["graph_owned"])))
         if injected and operation.endswith("open"):
             if variant == "return-True":
-                state["a2_rejected_returns"].append(True)
+                state["a2_rejected_returns"].append((True, False))
                 stage3_a2_complete_operation(state)
                 return True
             if variant == "return-IntSubclass":
                 value = IntSubclass(0)
-                state["a2_rejected_returns"].append(value)
+                state["a2_rejected_returns"].append((value, False))
                 stage3_a2_complete_operation(state)
                 return value
             if variant == "return-negative":
-                state["a2_rejected_returns"].append(-1)
+                state["a2_rejected_returns"].append((-1, False))
                 stage3_a2_complete_operation(state)
                 return -1
             collisions = {
@@ -1113,13 +1153,15 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 "collision-private-P": state["private_parent_fd"],
             }
             if variant in collisions:
-                state["a2_rejected_returns"].append(collisions[variant])
+                state["a2_rejected_returns"].append(
+                    (collisions[variant], variant.startswith("collision-private-"))
+                )
                 stage3_a2_complete_operation(state)
                 return collisions[variant]
             if variant.startswith("collision-owned-G"):
                 snapshot = state["a2_open_snapshots"][-1][1]
                 value = snapshot[int(variant.removeprefix("collision-owned-G"))]
-                state["a2_rejected_returns"].append(value)
+                state["a2_rejected_returns"].append((value, True))
                 stage3_a2_complete_operation(state)
                 return value
             if variant == "reuse-closed-scan1":
@@ -1147,6 +1189,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         if injected and (variant == "error" or variant.startswith("KeyboardInterrupt")):
             if operation == "regular-pread":
                 state["a2_operations"].append(token)
+            if variant.startswith("KeyboardInterrupt"):
+                state["a2_original_interrupt"] = token
             stage3_a2_complete_operation(state)
             if variant.startswith("KeyboardInterrupt"):
                 raise KeyboardInterrupt()
@@ -1165,11 +1209,19 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 state["graph_owned"].remove(fd)
             state["a2_active_scan"] = None
             result = callable_value(*arguments, **arguments_by_name)
-            state["a2_scan_closes"].append(fd)
+            state["a2_scan_closes"].append(token)
             close_override = stage3_a2_options(case).get("scan_close_failure") == token
-            if injected and variant == "real-close-then-raise" or close_override:
+            if injected and variant in {
+                "real-close-then-raise",
+                "real-close-then-KeyboardInterrupt",
+                "real-close-then-KeyboardInterrupt-outer-close",
+            } or close_override:
                 state["a2_close_uncertain"] = True
+                if state["a2_first_close_failure"] is None:
+                    state["a2_first_close_failure"] = token
                 stage3_a2_complete_operation(state)
+                if "KeyboardInterrupt" in variant:
+                    raise state["a2_scan_close_sentinel"]
                 raise OSError(errno.EIO, "stage3a2 scan close uncertainty")
             try:
                 real_fstat(fd)
@@ -1213,6 +1265,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 result = b""
             elif variant == "oversized-chunk":
                 result += b"x"
+            elif variant == "chunk-over-request-under-remaining":
+                result = b"x" * (arguments[1] + 1)
             elif variant == "premature-eof":
                 attempts = state["a2_pread_attempts"].get(token, 0)
                 state["a2_pread_attempts"][token] = attempts + 1
@@ -1238,6 +1292,12 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 result = ["a", "a"]
             elif variant == "entry-4097":
                 result = [f"e{index}" for index in range(4097)]
+            elif variant == "bytes-entry":
+                result = [b"blocker"]
+                state["a2_invalid_list_result"] = result
+            elif variant == "str-subclass-entry":
+                result = [StrSubclass("blocker")]
+                state["a2_invalid_list_result"] = result
             elif variant == "cross-scan-drift":
                 state["a2_cross_scan"] = True
         elif operation.startswith("list"):
@@ -1252,7 +1312,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     else ["raw-\udcff-name", "a", "z"]
                 )
             state["a2_list_results"].append((token, tuple(result)))
-        if operation.startswith("list") and variant == "cross-scan-drift":
+        if injected and operation.startswith("list") and variant == "cross-scan-drift":
             label = token.split(":", 1)[1]
             expected_names = [entry[0] for entry in directory_entries[label]]
             if sorted(result, key=os.fsencode) != sorted(expected_names, key=os.fsencode):
@@ -1282,37 +1342,13 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 if operation == "regular-open":
                     state["a2_regular_cursor"] = 0
                     state["a2_regular_chunks"] = []
-                state["a2_fds"][label] = result
-                if label != "external-parent":
-                    state["a2_row_lineage"][label] = stage3_a2_row_by_label[label][8]
-                key = b"@a2:" + label.encode("ascii")
-                if label == "external-parent":
-                    name = b"external"
-                    parent_key = stage3_root_bytes
-                else:
-                    row = stage3_a2_row_by_label[label]
-                    name = row[9]
-                    parent_role = row[8]
-                    parent_key = (
-                        b"@a2:" + parent_role[1].encode("ascii")
-                        if parent_role[0] == "@evidence"
-                        else parent_role[1]
-                    )
-                state["graph_fds"][key] = result
-                state["graph_edges"].append(("edge", "a2", name, parent_key, key, ""))
-                state["expected_graph_bindings"].extend(
-                    (
-                        f"bind-held-fstat:{key.decode('ascii')}",
-                        f"bind-parent-name-stat:{key.decode('ascii')}",
-                    )
-                )
             if result not in state["graph_owned"]:
                 state["graph_owned"].append(result)
         if operation == "regular-pread":
             if type(result) is bytes:
                 state["a2_regular_chunks"].append((arguments[2], arguments[1], result))
                 state["a2_regular_cursor"] += len(result)
-            expected_size = stage3_a2_row_by_label[token.split(":", 1)[1]][6]
+            expected_size = stage3_a2_regular_size(state, token.split(":", 1)[1])
             invalid = (
                 type(result) is not bytes
                 or not result
@@ -1338,6 +1374,23 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 file_type = stat.S_IFDIR
                 result = StatProxy(result, st_mode=stat.S_IFDIR | 0o700)
             state["a2_entry_types"].append((raw_name, file_type))
+        regular_size = stage3_a2_options(case).get("regular_size")
+        if regular_size is not None and operation in {
+            "regular-fstat-pre",
+            "regular-fstat-post",
+        }:
+            result = StatProxy(result, st_size=regular_size)
+            if operation == "regular-fstat-pre":
+                state["a2_row_stats"][token.split(":", 1)[1]] = result
+        if stage3_a2_options(case).get("post_fstat_failure") == token:
+            if state["a2_first_body_failure"] is None:
+                state["a2_first_body_failure"] = token
+            stage3_a2_complete_operation(state)
+            if stage3_a2_options(case).get("post_fstat_interrupt"):
+                raise state["a2_post_fstat_sentinel"]
+            raise OSError(errno.EIO, "stage3a2 mandatory post-fstat sentinel")
+        if operation in {"parent-fstat", "regular-fstat-pre", "directory-fstat0"} and not injected:
+            stage3_a2_promote_binding(state, token.split(":", 1)[1])
         if operation in {"regular-fstat-pre", "directory-fstat0"}:
             state["a2_row_stats"][token.split(":", 1)[1]] = result
         stage3_a2_complete_operation(state)
@@ -1634,7 +1687,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 return result
             if a2_call_token is not None:
                 return stage3_a2_execute(
-                    self.target,
+                    stage3_native_target(self.target),
                     a2_call_token,
                     arguments,
                     arguments_by_name,
@@ -2200,6 +2253,13 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     and fd == state["private_parent_fd"]
                 ):
                     state["a1_close_failure_attempted"] = "parent"
+                    if stage3_a2_options(state["stage3_case"]).get(
+                        "parent_close_sentinel"
+                    ):
+                        state["a2_parent_close_raised"] = state[
+                            "a2_parent_close_sentinel"
+                        ]
+                        raise state["a2_parent_close_sentinel"]
                     raise OSError(errno.EIO, "stage3a1 parent real-close-then-raise")
                 return result
             if self.namespace == "resource" and self.name == "getrlimit" and state is not None:
@@ -2652,8 +2712,13 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             file_type == stat.S_IFIFO for _raw_name, file_type in state["a2_entry_types"]
         ):
             raise SystemExit("stage3a2 unsupported directory entry type was not recorded")
-        if any(value in state["graph_close_calls"] for value in state["a2_rejected_returns"]):
-            raise SystemExit("stage3a2 rejected descriptor was used by cleanup")
+        for value, preowned in state["a2_rejected_returns"]:
+            close_count = sum(
+                type(closed) is type(value) and closed == value
+                for closed in state["graph_close_calls"]
+            )
+            if close_count != (1 if preowned else 0):
+                raise SystemExit("stage3a2 rejected descriptor cleanup lifetime drifted")
         expected_outcome = state["a2_expected_outcome"]
         expected_private = stage3_a1_final_private if expected_outcome == "governed" else ()
         expected_borrowed = () if expected_outcome == "arbitrary" else stage3_a1_final_borrowed
@@ -2665,6 +2730,43 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         expected_safe_failure = stage3_a1_options(case).get("safe_failure")
         if state["a1_safe_failure_attempted"] != expected_safe_failure:
             raise SystemExit("stage3a2 safe-successor failure injection drifted")
+        expected_close_failure = stage3_a2_options(case).get("close_failure")
+        if state["a1_close_failure_attempted"] != expected_close_failure:
+            raise SystemExit("stage3a2 outer close failure injection drifted")
+        if variant in {
+            "real-close-then-raise",
+            "real-close-then-KeyboardInterrupt",
+            "real-close-then-KeyboardInterrupt-outer-close",
+        } and state["a2_first_close_failure"] != fault_token:
+            raise SystemExit("stage3a2 first scan close failure identity drifted")
+        if variant == "KeyboardInterrupt-post-fstat-error" and (
+            state["a2_original_interrupt"] != fault_token
+            or state["a2_first_body_failure"]
+            != stage3_a2_options(case).get("post_fstat_failure")
+            or expected_outcome != "arbitrary"
+            or expected_terminal != "KeyboardInterrupt"
+        ):
+            raise SystemExit("stage3a2 original body interrupt precedence drifted")
+        if variant == "wrong-digest-post-fstat-sentinel" and (
+            state["a2_first_body_failure"] != fault_token
+            or state["caught_exception"] is not state["a2_post_fstat_sentinel"]
+            or expected_terminal != "KeyboardInterrupt"
+        ):
+            raise SystemExit("stage3a2 post-fstat sentinel was not first")
+        if variant == "chunk-over-request-under-remaining":
+            chunks = state["a2_regular_chunks"]
+            expected_size = stage3_a2_options(case).get("regular_size")
+            if (
+                len(chunks) != 1
+                or len(chunks[0][2]) != chunks[0][1] + 1
+                or len(chunks[0][2]) > expected_size
+            ):
+                raise SystemExit("stage3a2 per-chunk cap mutation drifted")
+        if variant in {"bytes-entry", "str-subclass-entry"}:
+            entries = state["a2_invalid_list_result"]
+            expected_type = bytes if variant == "bytes-entry" else StrSubclass
+            if len(entries) != 1 or type(entries[0]) is not expected_type:
+                raise SystemExit("stage3a2 exact list entry type mutation drifted")
         if expected_safe_failure in {"GB", "GB-KI"} and not state["gb_failed"]:
             raise SystemExit("stage3a2 GB safe-successor failure was not observed")
         if variant == "identity-drift-GB" and (
@@ -2704,6 +2806,15 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     raise SystemExit("stage3a2 retained owner did not report EBADF") from exc
             else:
                 raise SystemExit("stage3a2 retained owner leaked")
+        if variant in {
+            "real-close-then-KeyboardInterrupt",
+            "real-close-then-KeyboardInterrupt-outer-close",
+        } and state["caught_exception"].__cause__ is not state["a2_scan_close_sentinel"]:
+            raise SystemExit("stage3a2 scan close cause identity drifted")
+        if variant == "real-close-then-KeyboardInterrupt-outer-close" and (
+            state["a2_parent_close_raised"] is not state["a2_parent_close_sentinel"]
+        ):
+            raise SystemExit("stage3a2 parent close sentinel identity drifted")
         expected_suffix = []
         if expected_outcome == "governed":
             expected_suffix.append("final-private")
@@ -2892,6 +3003,12 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     "a2_scan_closes": [],
                     "a2_rejected_returns": [],
                     "a2_close_uncertain": False,
+                    "a2_first_close_failure": None,
+                    "a2_scan_close_sentinel": KeyboardInterrupt(),
+                    "a2_parent_close_sentinel": OSError(errno.EIO),
+                    "a2_parent_close_raised": None,
+                    "a2_post_fstat_sentinel": KeyboardInterrupt(),
+                    "caught_exception": None,
                     "a2_open_snapshots": [],
                     "a2_regular_cursor": 0,
                     "a2_regular_chunks": [],
@@ -2899,6 +3016,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     "a2_chunks_by_label": {},
                     "a2_pread_attempts": {},
                     "a2_list_results": [],
+                    "a2_invalid_list_result": [],
                     "a2_scan_raw": [],
                     "a2_entry_types": [],
                     "a2_scan_start": 0,
@@ -2908,6 +3026,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     "a2_supplied_rows": stage3_a2_supplied_rows(os.environ["TASK4_GOLDEN"]),
                     "a2_cross_scan": False,
                     "a2_first_body_failure": None,
+                    "a2_original_interrupt": None,
                     "a1_emfile": False,
                     "a1_emfile_pending": False,
                     "private_parent_structural": None,
@@ -2967,6 +3086,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             name = type(caught).__name__ if caught is not None else "return"
             raise SystemExit(f"{label}: expected {expected.__name__}, got {name}")
         if full_a2:
+            stage3_c0_state["caught_exception"] = caught
             stage3_c0_state["events"].append(
                 "SystemExit(77)" if expected is SystemExit else expected.__name__
             )
@@ -5489,6 +5609,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 "entry-4097",
             ):
                 stage3_a2_case(token, variant)
+        for variant in ("bytes-entry", "str-subclass-entry"):
+            stage3_a2_case("list1:repo-abs", variant)
         for scan in (1, 2):
             stage3_a2_case(f"list{scan}:repo-enum", "duplicate")
         stage3_a2_case("list2:repo-enum", "cross-scan-drift")
@@ -5504,6 +5626,37 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         stage3_a2_case("entry-stat1:repo-abs:626c6f636b6572", "special-type")
         for token in ("scan1-close:repo-abs", "scan2-close:repo-abs"):
             stage3_a2_case(token, "real-close-then-raise")
+        stage3_a2_case(
+            "scan1-close:repo-abs",
+            "real-close-then-KeyboardInterrupt",
+        )
+        stage3_a2_case(
+            "scan1-close:repo-abs",
+            "real-close-then-KeyboardInterrupt-outer-close",
+            module.MutationError,
+            {"close_failure": "parent", "parent_close_sentinel": True},
+        )
+        stage3_a2_case(
+            "regular-pread:external-tool",
+            "KeyboardInterrupt-post-fstat-error",
+            KeyboardInterrupt,
+            {"post_fstat_failure": "regular-fstat-post:external-tool"},
+        )
+        stage3_a2_case(
+            "regular-pread:external-tool",
+            "chunk-over-request-under-remaining",
+            module.MutationError,
+            {"regular_size": 1_048_577},
+        )
+        stage3_a2_case(
+            "regular-fstat-post:external-tool",
+            "wrong-digest-post-fstat-sentinel",
+            KeyboardInterrupt,
+            {
+                "post_fstat_failure": "regular-fstat-post:external-tool",
+                "post_fstat_interrupt": True,
+            },
+        )
         stage3_a2_case(
             "list1:repo-abs",
             "KeyboardInterrupt-close-override",
@@ -5581,6 +5734,18 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 stage3_a2_case_expectations[
                     ("stage3a2-fault", mapping_token, variant)
                 ] = (stage3_a2_expected_operations[: mapping_index + 1], "governed")
+        post_fstat_index = next(
+            index
+            for index, descriptor in enumerate(stage3_a2_expected_operations)
+            if descriptor[0] == "regular-fstat-post:external-tool"
+        )
+        stage3_a2_case_expectations[
+            (
+                "stage3a2-fault",
+                "regular-fstat-post:external-tool",
+                "wrong-digest-post-fstat-sentinel",
+            )
+        ] = (stage3_a2_expected_operations[: post_fstat_index + 1], "arbitrary")
         directory_open_index = next(
             index
             for index, descriptor in enumerate(stage3_a2_expected_operations)
@@ -5675,7 +5840,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 "governed",
             )
         if (
-            len(stage3_a2_cases) != 360
+            len(stage3_a2_cases) != 367
             or len(stage3_a2_cases)
             != len({label for label, _expected, _case in stage3_a2_cases})
             or not all(case[1] in descriptor_by_token for _label, _expected, case in stage3_a2_cases)
@@ -6165,10 +6330,30 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         "entry-stat1:repo-abs:626c6f636b6572",
                         "special-type",
                     ),
+                    (
+                        "per-chunk-cap",
+                        b"\ttool\texecute\tpresent\t0700\t13\t022036a28655c76d3ac5e1584872c898d161687b7578de171ac3447b7447bf68\t",
+                        b"\ttool\texecute\tpresent\t0700\t1048577\t154b8ed3c2383ce429058768595935faf7851b5c38db2b1732594be1d88bc05a\t",
+                        "regular-pread:external-tool",
+                        "chunk-over-request-under-remaining",
+                        {"regular_size": 1_048_577},
+                    ),
+                    (
+                        "wrong-digest-post-fstat",
+                        b"\ttool\texecute\tpresent\t0700\t13\t022036a28655c76d3ac5e1584872c898d161687b7578de171ac3447b7447bf68\t",
+                        b"\ttool\texecute\tpresent\t0700\t13\t122036a28655c76d3ac5e1584872c898d161687b7578de171ac3447b7447bf68\t",
+                        "regular-fstat-post:external-tool",
+                        "wrong-digest-post-fstat-sentinel",
+                        {
+                            "post_fstat_failure": "regular-fstat-post:external-tool",
+                            "post_fstat_interrupt": True,
+                        },
+                    ),
                 )
-                if len(stage3_a2_ledger_mutations) != 6:
+                if len(stage3_a2_ledger_mutations) != 8:
                     raise SystemExit("stage3a2 operational ledger mutation count drifted")
-                for label, old, new, token, variant in stage3_a2_ledger_mutations:
+                for mutation in stage3_a2_ledger_mutations:
+                    label, old, new, token, variant, *case_options = mutation
                     if stage3_ledger_bytes.count(old) != 1:
                         raise SystemExit("stage3a2 ledger mutation anchor drifted")
                     mutated = stage3_ledger_bytes.replace(old, new, 1)
@@ -6182,22 +6367,31 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     original_golden = os.environ["TASK4_GOLDEN"]
                     os.environ["TASK4_GOLDEN"] = mutated.decode("ascii")
                     try:
+                        stage3_case = ("stage3a2-fault", token, variant)
+                        if case_options:
+                            stage3_case += (case_options[0],)
                         run_case(
                             f"stage3a2-ledger-{label}",
-                            module.MutationError,
+                            KeyboardInterrupt
+                            if variant == "wrong-digest-post-fstat-sentinel"
+                            else module.MutationError,
                             overrides={"expected_ledger_fd": mutation_fd},
                             borrowed=[
                                 (mutation_fd, mutation_offset),
                                 (parent_fd, parent_offset),
                             ],
                             full_a2=True,
-                            stage3_case=("stage3a2-fault", token, variant),
+                            stage3_case=stage3_case,
                         )
                     finally:
                         os.environ["TASK4_GOLDEN"] = original_golden
                         os.close(mutation_fd)
                 for label, expected, case in stage3_a2_cases:
-                    if case[2] == "special-type":
+                    if case[2] in {
+                        "special-type",
+                        "chunk-over-request-under-remaining",
+                        "wrong-digest-post-fstat-sentinel",
+                    }:
                         continue
                     run_case(
                         f"stage3a2-{label}",

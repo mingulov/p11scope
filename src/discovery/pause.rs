@@ -5093,7 +5093,15 @@ mod tests {
         });
         assert_eq!(terminal_batch.as_ref().unwrap().record_count(), 0);
 
-        child.terminate_and_reap().unwrap();
+        child.release().unwrap();
+        assert!(
+            child
+                .pin()
+                .wait_ready(Some(Duration::from_secs(5)))
+                .unwrap(),
+            "the owned child must reach its ordinary end"
+        );
+        child.wait_for(Some(Duration::ZERO), false).unwrap();
         session.dequeues.push_back(queued(owner, child.pid()));
         with_session_io(&mut engine, &mut session, &child, |io| {
             io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)

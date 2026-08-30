@@ -3377,6 +3377,13 @@ fn live_discovery_gates_freeze_the_exact_command_inputs_and_fixture_flags() {
 fn live_discovery_fixtures_have_two_byte_identities_and_three_surfaces() {
     let provider = read("tests/fixtures/live-discovery-provider.c");
     let driver = read("tests/fixtures/live-discovery-driver.c");
+    let first_include = provider
+        .find("#include")
+        .expect("provider includes system headers");
+    assert!(
+        provider[..first_include].contains("#define _GNU_SOURCE"),
+        "provider must define _GNU_SOURCE before its first include"
+    );
     assert!(
         provider.contains("#if P11SCOPE_EXPORT_TABLES")
             && provider.contains("#define TABLE_FN static"),

@@ -1937,6 +1937,7 @@ def run_reconciled_build(
                 stage3_os_open = os.open
                 stage3_os_stat = os.stat
                 stage3_os_listdir = os.listdir
+                stage3_os_fsencode = os.fsencode
                 stage3_os_fstat = os.fstat
                 stage3_os_pread = os.pread
                 stage3_os_close = os.close
@@ -1989,6 +1990,7 @@ def run_reconciled_build(
                         stage3_os_open,
                         stage3_os_stat,
                         stage3_os_listdir,
+                        stage3_os_fsencode,
                         stage3_os_fstat,
                         stage3_os_pread,
                         stage3_os_close,

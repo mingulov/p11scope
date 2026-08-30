@@ -5,6 +5,7 @@ import fcntl
 import hashlib as _hashlib
 import os
 import re as _re
+import resource
 import stat as _stat
 import unicodedata as _unicodedata
 
@@ -1608,6 +1609,12 @@ def run_reconciled_build(
     ):
         raise FormatError("invalid borrowed descriptor")
 
+    borrowed_fcntl = fcntl.fcntl
+    borrowed_f_getfd = fcntl.F_GETFD
+    borrowed_f_getfl = fcntl.F_GETFL
+    borrowed_os_close = os.close
+    borrowed_os_fstat = os.fstat
+
     repo_parts = _path(repo_root, "repo_root")
     stable_parts = _path(stable_sysroot_root, "stable_sysroot_root")
     nightly_parts = _path(nightly_sysroot_root, "nightly_sysroot_root")
@@ -1663,7 +1670,8 @@ def run_reconciled_build(
         raise MutationError("expected ledger changed after admission") from exc
     if first_identity != ledger_identity:
         raise MutationError("expected ledger changed after admission")
-    parse_ledger(first)
+    records = parse_ledger(first)
+    has_symlink_row = any(record.klass == "symlink" for record in records)
 
     try:
         parent_flags = fcntl.fcntl(private_parent_fd, fcntl.F_GETFL)
@@ -1910,17 +1918,130 @@ def run_reconciled_build(
                 if stage2_failure is None:
                     stage2_failure = exc if isinstance(exc, MutationError) else MutationError("private parent fstat failed")
 
+        if stage2_failure is None and not stage2_capability:
+            try:
+                stage3_o_rdonly = os.O_RDONLY
+                stage3_o_cloexec = os.O_CLOEXEC
+                stage3_o_nofollow = os.O_NOFOLLOW
+                stage3_o_directory = os.O_DIRECTORY
+                stage3_o_accmode = os.O_ACCMODE
+                stage3_fd_cloexec = fcntl.FD_CLOEXEC
+                stage3_f_getfd = fcntl.F_GETFD
+                stage3_f_getfl = fcntl.F_GETFL
+                stage3_rlimit_nofile = resource.RLIMIT_NOFILE
+                stage3_os_open = os.open
+                stage3_os_stat = os.stat
+                stage3_os_listdir = os.listdir
+                stage3_os_fstat = os.fstat
+                stage3_os_pread = os.pread
+                stage3_os_close = os.close
+                stage3_fcntl = fcntl.fcntl
+                stage3_getrlimit = resource.getrlimit
+                stage3_supports_dir_fd = os.supports_dir_fd
+                stage3_supports_follow_symlinks = os.supports_follow_symlinks
+                stage3_supports_fd = os.supports_fd
+                if has_symlink_row:
+                    stage3_o_path = os.O_PATH
+                    stage3_os_readlink = os.readlink
+            except AttributeError:
+                stage2_capability = True
+            except Exception:
+                stage2_failure = MutationError("stage3 capability inventory failed")
+            else:
+                stage3_open_flags = [
+                    stage3_o_cloexec,
+                    stage3_o_nofollow,
+                    stage3_o_directory,
+                ]
+                if has_symlink_row:
+                    stage3_open_flags.append(stage3_o_path)
+                stage3_constants_valid = (
+                    type(stage3_o_rdonly) is int
+                    and stage3_o_rdonly == 0
+                    and all(type(value) is int and value > 0 for value in stage3_open_flags)
+                    and all(
+                        left & right == 0
+                        for index, left in enumerate(stage3_open_flags)
+                        for right in stage3_open_flags[index + 1 :]
+                    )
+                    and type(stage3_o_accmode) is int
+                    and stage3_o_accmode > 0
+                    and all(value & stage3_o_accmode == 0 for value in stage3_open_flags)
+                    and stage3_o_rdonly & stage3_o_accmode == 0
+                    and type(stage3_fd_cloexec) is int
+                    and stage3_fd_cloexec > 0
+                    and type(stage3_f_getfd) is int
+                    and stage3_f_getfd >= 0
+                    and type(stage3_f_getfl) is int
+                    and stage3_f_getfl >= 0
+                    and stage3_f_getfd != stage3_f_getfl
+                    and type(stage3_rlimit_nofile) is int
+                    and stage3_rlimit_nofile >= 0
+                )
+                stage3_callables_valid = all(
+                    callable(value)
+                    for value in (
+                        stage3_os_open,
+                        stage3_os_stat,
+                        stage3_os_listdir,
+                        stage3_os_fstat,
+                        stage3_os_pread,
+                        stage3_os_close,
+                        stage3_fcntl,
+                        stage3_getrlimit,
+                    )
+                    + ((stage3_os_readlink,) if has_symlink_row else ())
+                )
+                try:
+                    stage3_support_results = (
+                        stage3_os_open in stage3_supports_dir_fd,
+                        stage3_os_stat in stage3_supports_dir_fd,
+                        stage3_os_stat in stage3_supports_follow_symlinks,
+                        stage3_os_listdir in stage3_supports_fd,
+                    )
+                    if has_symlink_row:
+                        stage3_support_results += (
+                            stage3_os_readlink in stage3_supports_dir_fd,
+                        )
+                except Exception:
+                    stage2_failure = MutationError("stage3 capability membership failed")
+                else:
+                    if not stage3_constants_valid or not stage3_callables_valid:
+                        stage2_failure = MutationError("invalid stage3 capability")
+                    elif not all(stage3_support_results):
+                        stage2_capability = True
+                    else:
+                        try:
+                            stage3_rlimit = stage3_getrlimit(stage3_rlimit_nofile)
+                        except Exception:
+                            stage2_failure = MutationError("stage3 RLIMIT_NOFILE read failed")
+                        else:
+                            if (
+                                type(stage3_rlimit) is not tuple
+                                or len(stage3_rlimit) != 2
+                                or any(
+                                    type(value) is not int
+                                    or value < 0
+                                    for value in stage3_rlimit
+                                )
+                                or stage3_rlimit[0] > stage3_rlimit[1]
+                            ):
+                                stage2_failure = MutationError("invalid RLIMIT_NOFILE result")
+                            else:
+                                borrowed_f_getfd = stage3_f_getfd
+                                borrowed_f_getfl = stage3_f_getfl
+
         if private_ledger_usable:
             borrowed_ledger_flags = None
             try:
-                borrowed_ledger_flags = fcntl.fcntl(expected_ledger_fd, fcntl.F_GETFL)
+                borrowed_ledger_flags = borrowed_fcntl(expected_ledger_fd, borrowed_f_getfl)
                 if type(borrowed_ledger_flags) is not int or borrowed_ledger_flags != ledger_flags:
                     raise MutationError("borrowed ledger flags changed")
             except Exception as exc:
                 if stage2_failure is None:
                     stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed ledger F_GETFL failed")
             try:
-                if _identity(os.fstat(expected_ledger_fd)) != ledger_identity:
+                if _identity(borrowed_os_fstat(expected_ledger_fd)) != ledger_identity:
                     raise MutationError("borrowed ledger identity changed")
             except Exception as exc:
                 if stage2_failure is None:
@@ -1929,7 +2050,7 @@ def run_reconciled_build(
             borrowed_ledger_flags_ok = True
             borrowed_ledger_pre = None
             try:
-                borrowed_ledger_flags = fcntl.fcntl(expected_ledger_fd, fcntl.F_GETFL)
+                borrowed_ledger_flags = borrowed_fcntl(expected_ledger_fd, borrowed_f_getfl)
                 if type(borrowed_ledger_flags) is not int or borrowed_ledger_flags != ledger_flags:
                     raise MutationError("borrowed ledger flags changed")
             except Exception as exc:
@@ -1937,7 +2058,7 @@ def run_reconciled_build(
                 if stage2_failure is None:
                     stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed ledger F_GETFL failed")
             try:
-                borrowed_ledger_pre = _identity(os.fstat(expected_ledger_fd))
+                borrowed_ledger_pre = _identity(borrowed_os_fstat(expected_ledger_fd))
                 if borrowed_ledger_pre != ledger_identity:
                     raise MutationError("borrowed ledger identity changed before read")
             except Exception as exc:
@@ -1952,7 +2073,7 @@ def run_reconciled_build(
                     if stage2_failure is None:
                         stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed ledger read failed")
                 try:
-                    if _identity(os.fstat(expected_ledger_fd)) != ledger_identity:
+                    if _identity(borrowed_os_fstat(expected_ledger_fd)) != ledger_identity:
                         raise MutationError("borrowed ledger identity changed after read")
                 except Exception as exc:
                     if stage2_failure is None:
@@ -1960,21 +2081,21 @@ def run_reconciled_build(
 
         borrowed_parent_flags = None
         try:
-            borrowed_parent_flags = fcntl.fcntl(private_parent_fd, fcntl.F_GETFL)
+            borrowed_parent_flags = borrowed_fcntl(private_parent_fd, borrowed_f_getfl)
             if type(borrowed_parent_flags) is not int or borrowed_parent_flags != parent_flags:
                 raise MutationError("borrowed parent flags changed")
         except Exception as exc:
             if stage2_failure is None:
                 stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed parent F_GETFL failed")
         try:
-            borrowed_parent_fd_flags = fcntl.fcntl(private_parent_fd, fcntl.F_GETFD)
+            borrowed_parent_fd_flags = borrowed_fcntl(private_parent_fd, borrowed_f_getfd)
             if type(borrowed_parent_fd_flags) is not int or borrowed_parent_fd_flags != parent_fd_flags:
                 raise MutationError("borrowed parent descriptor flags changed")
         except Exception as exc:
             if stage2_failure is None:
                 stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed parent F_GETFD failed")
         try:
-            if _identity(os.fstat(private_parent_fd)) != parent_identity:
+            if _identity(borrowed_os_fstat(private_parent_fd)) != parent_identity:
                 raise MutationError("borrowed parent identity changed")
         except Exception as exc:
             if stage2_failure is None:
@@ -1984,7 +2105,7 @@ def run_reconciled_build(
         close_failure = None
         for owned_fd in reversed(owned_fds):
             try:
-                os.close(owned_fd)
+                borrowed_os_close(owned_fd)
             except BaseException as exc:
                 if close_failure is None:
                     close_failure = exc

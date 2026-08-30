@@ -742,6 +742,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             ("os", "fstat"),
             ("os", "pread"),
             ("os", "close"),
+            ("os", "fsencode"),
             ("os", "readlink"),
             ("fcntl", "fcntl"),
             ("resource", "getrlimit"),
@@ -1239,6 +1240,16 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 and not arguments_by_name
             ):
                 raise SystemExit("stage3a1 EMFILE RLIMIT reread was not immediate")
+            if (
+                state is not None
+                and state["a2_complete"] == 1
+                and stage3_case_reaches_g1(state["stage3_case"])
+                and state["a1_phase"] == "c0"
+                and self.namespace == "os"
+                and self.name == "open"
+                and not stage3_a1_c0_complete(state)
+            ):
+                raise SystemExit("stage3a1 C0 inventory drifted")
             if (
                 state is not None
                 and state["a2_complete"] == 1
@@ -2052,6 +2063,16 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         case = None if state is None else state["stage3_case"]
         if state is None:
             raise SystemExit("stage3a1 filesystem root anchor was not acquired exactly once")
+        if (
+            set(state["constants"]) != state["required_constants"]
+            or set(state["callables"]) != state["required_callables"]
+            or set(state["supports"]) != state["required_supports"]
+            or any(count != 1 for count in state["constants"].values())
+            or any(count != 1 for count in state["callables"].values())
+            or any(count != 1 for count in state["supports"].values())
+            or not state["inventory_valid"]
+        ):
+            raise SystemExit("stage3a1 C0 inventory drifted")
         expected_events = state["expected_graph_events"]
         if stage3_a1_failure(case):
             site = case[1]
@@ -2066,16 +2087,6 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             raise SystemExit("stage3a1 filesystem root anchor was not acquired exactly once")
         if state["graph_events"] != expected_events:
             raise SystemExit("stage3a1 graph acquisition order drifted")
-        if (
-            set(state["constants"]) != state["required_constants"]
-            or set(state["callables"]) != state["required_callables"]
-            or set(state["supports"]) != state["required_supports"]
-            or any(count != 1 for count in state["constants"].values())
-            or any(count != 1 for count in state["callables"].values())
-            or any(count != 1 for count in state["supports"].values())
-            or not state["inventory_valid"]
-        ):
-            raise SystemExit("stage3a1 C0 inventory drifted")
         expected_observed_items = (
             state["required_constants"]
             | state["required_callables"]
@@ -4526,7 +4537,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         stage3_c0_cases.append(
             (f"invalid-rlimit-result-{label}", "rlimit-result", None, result, module.MutationError, True)
         )
-    if len(stage3_c0_cases) != 96:
+    if len(stage3_c0_cases) != 98:
         raise SystemExit(f"stage3a0 capability table cardinality drifted: {len(stage3_c0_cases)}")
 
     with tempfile.TemporaryDirectory(prefix="p11scope-stage3-") as stage3_root:

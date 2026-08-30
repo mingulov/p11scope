@@ -2873,13 +2873,13 @@ fn both_capture_loops_keep_the_one_frozen_per_tick_ordering() {
         (
             "profile",
             profile,
-            "    // The owned child is resumed",
+            "    finish_capture_loop(",
             "state.sync_plan(engine.plan());",
         ),
         (
             "trace",
             trace,
-            "    if let Some(owned) = owned.as_deref_mut() {",
+            "    finish_capture_loop(",
             "tracer.sync_plan(engine.plan());",
         ),
     ] {
@@ -2957,7 +2957,7 @@ fn both_capture_loops_keep_the_one_frozen_per_tick_ordering() {
     for source in [profile, trace] {
         require_before(
             source,
-            "owned.finish(engine, session, interrupted)?;",
+            "finish_capture_loop(",
             "let detach = session.detach_producers();",
             "owned-child settlement before terminal evidence",
         )

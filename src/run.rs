@@ -893,6 +893,7 @@ impl Owned {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn settle_owned_child(
     mut child: OwnedChild,
     end: CaptureEnd,

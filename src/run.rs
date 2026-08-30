@@ -432,6 +432,14 @@ impl OwnedChild {
         if self.pin.wait_ready(Some(grace))? {
             return self.wait_blocking();
         }
+        self.kill_and_reap_tail()
+    }
+
+    fn kill_and_reap_tail(&mut self) -> io::Result<i32> {
+        if self.pin.wait_ready(Some(Duration::ZERO))? {
+            return self.wait_blocking();
+        }
+        self.ensure_active_generation()?;
         signal_group(self.pid, libc::SIGKILL)?;
         if !self.pin.wait_ready(Some(Duration::from_secs(5)))? {
             return Err(io::Error::new(
@@ -452,7 +460,7 @@ impl OwnedChild {
 
     /// Task 8 uses this only after pause authorization, links, and stop debt
     /// are closed. Drop then intentionally leaves the running process alone.
-    pub(crate) fn hand_off_running(mut self) -> io::Result<u32> {
+    pub(crate) fn hand_off_running(&mut self) -> io::Result<u32> {
         if !self.released || !self.still_running() {
             return Err(io::Error::other(
                 "only a released, still-running owned child can be handed off",
@@ -951,34 +959,76 @@ fn stage_handoff(mut child: OwnedChild, pending: &mut Option<OwnedChild>) -> Res
 }
 
 fn commit_handoff(pending: &mut Option<OwnedChild>) -> Result<()> {
-    let Some(child) = pending.take() else {
+    let Some(child) = pending.as_mut() else {
         return Ok(());
     };
     child
         .hand_off_running()
         .map(|_| ())
-        .map_err(|error| anyhow!("run: handing back the owned child: {error}"))
+        .map_err(|error| anyhow!("run: handing back the owned child: {error}"))?;
+    pending.take();
+    Ok(())
 }
 
 fn settle_after_signal(child: &mut OwnedChild, signals: &SignalState) -> Result<ChildOutcome> {
+    settle_after_signal_with_grace(child, signals, TERM_GRACE)
+}
+
+fn settle_after_signal_with_grace(
+    child: &mut OwnedChild,
+    signals: &SignalState,
+    grace: Duration,
+) -> Result<ChildOutcome> {
     let signal = signals
         .first_signal()
         .ok_or_else(|| anyhow!("run: signal settlement lost the first signal identity"))?;
     child
         .forward_signal(signal)
         .map_err(|error| anyhow!("run: forwarding signal {signal}: {error}"))?;
-    let deadline = Instant::now() + TERM_GRACE;
+    let mut deadline = Instant::now() + grace;
     let mut second_sigint_forwarded = false;
+    let mut fallback_term_forwarded = false;
     loop {
         if signal == libc::SIGINT && !second_sigint_forwarded && signals.sigint_deliveries() >= 2 {
-            child
-                .forward_signal(libc::SIGINT)
-                .map_err(|error| anyhow!("run: forwarding second SIGINT: {error}"))?;
-            second_sigint_forwarded = true;
+            match child.forward_signal(libc::SIGINT) {
+                Ok(ForwardAction::Escalated) => {
+                    return child
+                        .kill_and_reap_tail()
+                        .map(ChildOutcome::Exited)
+                        .map_err(|error| anyhow!("run: settling after signal: {error}"));
+                }
+                Ok(ForwardAction::Forwarded) => second_sigint_forwarded = true,
+                Err(error) => {
+                    if let ChildOutcome::Exited(code) = child
+                        .wait_for(Some(Duration::ZERO), false)
+                        .map_err(|reap| anyhow!("run: waiting after signal: {reap}"))?
+                    {
+                        return Ok(ChildOutcome::Exited(code));
+                    }
+                    return Err(anyhow!("run: forwarding second SIGINT: {error}"));
+                }
+            }
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            break;
+            if fallback_term_forwarded {
+                break;
+            }
+            if let Err(error) = child.forward_signal(libc::SIGTERM) {
+                // A child can exit between the grace wait and fallback TERM.
+                // Reap it at this phase boundary instead of reporting a
+                // forwarding failure for a natural exit.
+                if let ChildOutcome::Exited(code) = child
+                    .wait_for(Some(Duration::ZERO), false)
+                    .map_err(|reap| anyhow!("run: waiting after signal: {reap}"))?
+                {
+                    return Ok(ChildOutcome::Exited(code));
+                }
+                return Err(anyhow!("run: forwarding fallback SIGTERM: {error}"));
+            }
+            fallback_term_forwarded = true;
+            deadline = Instant::now() + grace;
+            continue;
         }
         match child
             .wait_for(Some(remaining.min(Duration::from_millis(10))), false)
@@ -989,9 +1039,26 @@ fn settle_after_signal(child: &mut OwnedChild, signals: &SignalState) -> Result<
         }
     }
     child
-        .terminate_and_reap()
+        .kill_and_reap_tail()
         .map(ChildOutcome::Exited)
         .map_err(|error| anyhow!("run: settling after signal: {error}"))
+}
+
+fn abort_pending_handoff(pending: &mut Option<OwnedChild>) -> Result<()> {
+    let Some(mut child) = pending.take() else {
+        return Ok(());
+    };
+    child
+        .terminate_and_reap()
+        .map(|_| ())
+        .map_err(|error| anyhow!("run: aborting pending handoff: {error}"))
+}
+
+fn combine_handoff_failure(primary: anyhow::Error, abort: Result<()>) -> anyhow::Error {
+    match abort {
+        Ok(()) => primary,
+        Err(abort) => primary.context(format!("aborting pending handoff also failed: {abort:#}")),
+    }
 }
 
 fn combine_finish_errors(cleanup: Result<()>, settled: Result<()>) -> Result<()> {
@@ -1206,8 +1273,16 @@ fn run_owned_inner(args: &RunArgs) -> Result<OwnedRunOutcome> {
         out,
         &stop,
         Some(&mut owned),
-    )?;
-    commit_handoff(&mut owned.pending_handoff)?;
+    )
+    .map_err(|error| {
+        combine_handoff_failure(error, abort_pending_handoff(&mut owned.pending_handoff))
+    })?;
+    if let Err(error) = commit_handoff(&mut owned.pending_handoff) {
+        return Err(combine_handoff_failure(
+            error,
+            abort_pending_handoff(&mut owned.pending_handoff),
+        ));
+    }
     Ok(OwnedRunOutcome {
         child_exit_code: owned.exit_code,
         child_still_running: owned.still_running,
@@ -2228,6 +2303,48 @@ mod tests {
     }
 
     #[test]
+    fn terminal_failure_aborts_staged_handoff_and_reaps_child() {
+        let mut child = spawn("/bin/sleep", &["10"]);
+        let pid = child.pid();
+        child.release().unwrap();
+        let mut pending = None;
+        assert_eq!(
+            stage_handoff(child, &mut pending).unwrap(),
+            ChildOutcome::TimedOutRunning
+        );
+
+        let error = combine_handoff_failure(
+            anyhow!("terminal failed"),
+            abort_pending_handoff(&mut pending),
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("terminal failed"), "{rendered}");
+        assert!(pending.is_none(), "pending handoff was not aborted");
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        assert_eq!(waited, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+
+        let synthetic = combine_handoff_failure(
+            anyhow!("commit failed"),
+            Err(anyhow!("aborting pending handoff failed")),
+        );
+        let synthetic_rendered = format!("{synthetic:#}");
+        assert!(
+            synthetic_rendered.contains("commit failed"),
+            "{synthetic_rendered}"
+        );
+        assert!(
+            synthetic_rendered.contains("aborting pending handoff failed"),
+            "{synthetic_rendered}"
+        );
+    }
+
+    #[test]
     fn owned_disposition_records_every_capture_end_state() {
         let cases = [
             (
@@ -2511,6 +2628,51 @@ mod tests {
     }
 
     #[test]
+    fn signal_settlement_observes_second_sigint_during_fallback_term_grace() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let term = directory.path().join("term");
+        let mut child = spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                &format!(
+                    "trap '' INT; trap ': > {}' TERM; : > {}; while :; do :; done",
+                    term.display(),
+                    ready.display(),
+                ),
+            ],
+        );
+        child.release().unwrap();
+        wait_until(|| ready.exists(), "the SIGINT fixture never became ready");
+
+        let signals = Arc::new(SignalState::new());
+        signals.observe(libc::SIGINT);
+        let observed = Arc::clone(&signals);
+        let sender = std::thread::spawn(move || {
+            wait_until(
+                || term.exists(),
+                "settlement never forwarded fallback SIGTERM",
+            );
+            assert_eq!(
+                observed.sigint_deliveries(),
+                1,
+                "the second SIGINT was recorded before fallback SIGTERM",
+            );
+            observed.observe(libc::SIGINT);
+        });
+        assert_eq!(
+            settle_after_signal_with_grace(&mut child, &signals, Duration::from_millis(100))
+                .unwrap(),
+            ChildOutcome::Exited(128 + libc::SIGKILL)
+        );
+        sender.join().unwrap();
+        assert_eq!(signals.sigint_deliveries(), 2);
+        assert_eq!(child.interrupt_count, 2);
+        assert!(child.is_reaped());
+    }
+
+    #[test]
     fn signal_settlement_forwards_the_retained_sigterm_identity() {
         let mut child = spawn("/bin/sleep", &["10"]);
         child.release().unwrap();
@@ -2572,7 +2734,7 @@ mod tests {
             child.pid()
         };
         let invalid_handoff_pid = {
-            let child = spawn("/bin/sleep", &["10"]);
+            let mut child = spawn("/bin/sleep", &["10"]);
             let pid = child.pid();
             assert!(child.hand_off_running().is_err());
             pid

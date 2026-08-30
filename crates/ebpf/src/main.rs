@@ -690,18 +690,27 @@ pub fn interface_list_return(ctx: RetProbeContext) -> u32 {
         return 0;
     };
     let announced_count = count.min(u32::MAX as u64) as u32;
+    let active_count = count.min(16);
+    if active_count == 0 {
+        return 0;
+    }
     if state.arg0 == 0 {
+        return 0;
+    }
+    if state
+        .arg0
+        .checked_add((active_count - 1) * 24)
+        .is_none()
+    {
+        bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
         return 0;
     }
     let mut interface_index = 0usize;
     while interface_index < 16 {
-        if interface_index as u64 >= count {
+        if interface_index as u64 >= active_count {
             break;
         }
-        let Some(address) = state.arg0.checked_add(interface_index as u64 * 24) else {
-            bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
-            break;
-        };
+        let address = state.arg0 + interface_index as u64 * 24;
         classify_direct_interface(
             DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN as u64
                 | ((interface_index as u64) << 8)

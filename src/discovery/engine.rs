@@ -10505,13 +10505,24 @@ mod tests {
             }
         }
 
-        let mut source = std::process::Command::new("sh")
-            .args(["-c", "sleep 30"])
-            .spawn()
-            .unwrap();
-        let source_path = std::fs::read_link(format!("/proc/{}/exe", source.id())).unwrap();
-        source.kill().unwrap();
-        source.wait().unwrap();
+        let mut source = ChildGuard(
+            std::process::Command::new("sh")
+                .args(["-c", "read _"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let source_path = std::fs::read_link(format!("/proc/{}/exe", source.0.id())).unwrap();
+        let source_file = std::fs::File::open(&source_path).unwrap();
+        let source_size = source_file.metadata().unwrap().len();
+        assert!(
+            read_bounded_interpreter(&source_file, source_size)
+                .unwrap()
+                .is_some(),
+            "the copied source must be a dynamic executable with one PT_INTERP"
+        );
+        source.0.kill().unwrap();
+        source.0.wait().unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let executable = dir.path().join("large-sh");
@@ -10536,6 +10547,15 @@ mod tests {
         let mut ready = [0_u8; 1];
         std::io::Read::read_exact(child.0.stdout.as_mut().unwrap(), &mut ready).unwrap();
         assert_eq!(ready, *b"R");
+        let pid = child.0.id() as libc::pid_t;
+        let mut status = 0;
+        // SAFETY: this process is the parent of the exact unreaped child.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+            pid
+        );
+        assert!(libc::WIFSTOPPED(status));
+        assert_eq!(libc::WSTOPSIG(status), libc::SIGSTOP);
         let view = ProcessView::open(ProcessViewId(0), child.0.id()).unwrap();
         let mut engine = Engine::empty();
         engine.scope = Scope::Pid(child.0.id());

@@ -4988,6 +4988,30 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                             {"private_p_getfl": semantic},
                         ),
                     )
+                no_symlink_fd = os.open(
+                    stage3_no_symlink_path,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                )
+                no_symlink_offset = os.lseek(no_symlink_fd, 11, os.SEEK_SET)
+                try:
+                    run_case(
+                        "stage3a1-private-P-getfl-opath-no-symlink",
+                        module.MutationError,
+                        overrides={"expected_ledger_fd": no_symlink_fd},
+                        borrowed=[
+                            (no_symlink_fd, no_symlink_offset),
+                            (parent_fd, parent_offset),
+                        ],
+                        full_a2=True,
+                        stage3_case=(
+                            "stage3a1-failure",
+                            "vendor",
+                            "EMFILE-rlimit-same",
+                            {"private_p_getfl": "opath"},
+                        ),
+                    )
+                finally:
+                    os.close(no_symlink_fd)
                 for family, tokens in (
                     (
                         "fp",

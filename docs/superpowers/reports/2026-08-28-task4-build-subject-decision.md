@@ -356,6 +356,9 @@ tags, external daemons/sockets, and an undeclared Docker context are forbidden.
 
 ## Stage3 authority amendment (2026-08-30; accepted)
 
+**Status:** the accepted baseline and independently reviewed RAW SYMLINK 40/41
+clarification below are governing.
+
 This amendment is the controlling BS2b capacity, ordering, and raw-symlink
 authority for staged Stage3 work. It changes no product contract, privacy
 allowlist, schema, or schema row limit.
@@ -400,18 +403,22 @@ alone does not authorize a child. Ruleset construction is not enforcement;
 ### RAW SYMLINK
 
 Raw symlink target bytes are ephemeral. They are not decoded, normalized,
-logged, cached, or published. A symlink is held with
-`O_PATH|O_CLOEXEC|O_NOFOLLOW`; descriptor-relative `readlink` reads it exactly
-twice, bracketed by stable full identity. Target closure is resolved
-immediately after the second read before the bytes are discarded; the held
-symlink descriptor remains owned through final binding and cleanup. An empty
-target rejects. Repeated slashes collapse; absolute targets start at the held
-root, relative targets at the held link parent, `.` is a no-op, and `..` clamps
-held parents at the root. A trailing slash requires a directory. Target
-components are processed before the remaining original components. Every
-encountered link and final relation has a ledger row. Forty follows pass and
-the forty-first rejects. No text reopen or repeated-locator shortcut is
-permitted.
+logged, cached, or published. Each symlink occurrence admitted to follow (the
+first through fortieth) is held with `O_PATH|O_CLOEXEC|O_NOFOLLOW` and performs
+exactly two descriptor-relative `readlink` calls bracketed by stable full
+identity. A repeated locator is a fresh occurrence and never reuses target
+evidence. Target closure is resolved immediately after the second read before
+the bytes are discarded; the held symlink descriptor remains owned through
+final binding and cleanup. The refused forty-first occurrence is opened and
+fully validated by the initial held-FD then parent/name no-follow identity
+bracket, then raises `MutationError` before its first `readlink`, target
+closure, or any later filesystem observation; ordinary governed cleanup still
+runs. An empty target rejects. Repeated slashes collapse; absolute targets
+start at the held root, relative targets at the held link parent, `.` is a
+no-op, and `..` clamps held parents at the root. A trailing slash requires a
+directory. Target components are processed before the remaining original
+components. Every encountered link and final relation has a ledger row. No
+text reopen or repeated-locator shortcut is permitted.
 
 This amendment authorizes only staged `3A0`-`3A3` RED/GREEN/review after these
 docs are accepted. It does not authorize a build, child/build-root creation,

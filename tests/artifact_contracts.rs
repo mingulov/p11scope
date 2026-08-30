@@ -2852,6 +2852,19 @@ fn gate_scripts_pin_the_toolchain() {
     }
 }
 
+#[test]
+fn production_bpf_toolchain_is_frozen() {
+    let toolchain = read("crates/ebpf/rust-toolchain.toml");
+    let build = read("build.rs");
+    let ci = read(".github/workflows/ci.yml");
+
+    assert!(toolchain.contains("channel = \"nightly-2026-05-20\""));
+    assert!(build.contains("\"+nightly-2026-05-20\""));
+    assert!(!build.contains("\"+nightly\""));
+    assert!(ci.contains("toolchain install nightly-2026-05-20 "));
+    assert!(!ci.contains("toolchain install nightly "));
+}
+
 /// Task 8 Step 2's ordering sentence, frozen where the loops live: "Each tick
 /// drains discovery, lets `Engine` extend `AttachPlan` and apply attachment
 /// deltas, synchronizes immediate semantic/trace invalidations while

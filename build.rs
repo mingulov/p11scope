@@ -59,7 +59,7 @@ fn main() {
     let target_dir = out_dir.join("ebpf-target");
     let mut cmd = Command::new("cargo");
     cmd.args([
-        "+nightly",
+        "+nightly-2026-05-20",
         "build",
         "--locked",
         "--release",
@@ -90,12 +90,12 @@ fn main() {
     }
     let status = cmd
         // Cargo sets these for build-script subprocesses to point at the
-        // *outer* (stable) toolchain; left alone they'd override `+nightly`
+        // *outer* (stable) toolchain; left alone they'd override `+nightly-2026-05-20`
         // on the inner cargo invocation. Same workaround as `aya-build`.
         .env_remove("RUSTC")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .status()
-        .expect("failed to spawn `cargo +nightly build` for crates/ebpf");
+        .expect("failed to spawn `cargo +nightly-2026-05-20 build` for crates/ebpf");
     assert!(status.success(), "building crates/ebpf failed: {status}");
 
     let built = target_dir.join(target).join("release/p11scope-ebpf");

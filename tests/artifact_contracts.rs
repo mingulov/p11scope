@@ -2414,13 +2414,17 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
 #[test]
 fn live_discovery_bpf_classification_is_exact_and_output_only() {
     let source = read("crates/ebpf/src/main.rs");
-    let export = between(&source, "fn emit_export(", "fn export_symbol_id");
+    let classifier = between(
+        &source,
+        "fn classify_direct_interface(",
+        "#[inline(never)]\nfn emit_export(",
+    );
     assert!(
-        export.contains("let mut bytes = [0u8; 9];"),
+        classifier.contains("let mut bytes = [0u8; 9];"),
         "the ninth byte must distinguish an exact standard name from a longer prefix"
     );
     assert!(
-        export.contains("read == 8 && bytes[..8] == *b\"PKCS 11\\0\""),
+        classifier.contains("read == 8 && bytes[..8] == *b\"PKCS 11\\0\""),
         "interface classification must require the exact eight-byte string"
     );
 
@@ -2443,6 +2447,53 @@ fn live_discovery_bpf_classification_is_exact_and_output_only() {
             "private helper result escaped into {path}"
         );
     }
+}
+
+#[test]
+fn live_discovery_direct_classification_precedes_record_reservation() {
+    let source = read("crates/ebpf/src/main.rs");
+    let assert_contract = |source: &str| {
+        let classifier = between(
+            source,
+            "#[inline(never)]\nfn classify_direct_interface(",
+            "#[inline(never)]\nfn emit_export(",
+        );
+        assert!(
+            !classifier.contains("reserve_discovery("),
+            "direct interface classification must finish before reservation"
+        );
+        let classify_read = classifier
+            .find("bpf_probe_read_user")
+            .expect("direct classifier must resolve interface fields");
+        let classify_emit = classifier
+            .find("emit_export(")
+            .expect("direct classifier must converge on the record emitter");
+        assert!(classify_read < classify_emit);
+
+        let listed = between(
+            source,
+            "pub fn interface_list_return(ctx: RetProbeContext) -> u32 {",
+            "#[uprobe]\npub fn interface_entry",
+        );
+        listed
+            .find("classify_direct_interface(")
+            .expect("interface list return must call the direct classifier");
+        assert!(
+            !listed.contains("emit_export("),
+            "interface list return must not dispatch through runtime-polymorphic emit_export"
+        );
+    };
+    assert_contract(&source);
+
+    let without_classifier_inline = source.replacen(
+        "#[inline(never)]\nfn classify_direct_interface(",
+        "fn classify_direct_interface(",
+        1,
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_contract(&without_classifier_inline)).is_err(),
+        "classifier inline attribute mutation must be rejected"
+    );
 }
 
 #[test]

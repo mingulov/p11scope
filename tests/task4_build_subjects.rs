@@ -848,6 +848,13 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
     def stage3_a1_options(case):
         return case[-1] if case and isinstance(case[-1], dict) else {}
 
+    def stage3_case_has_symlink(case):
+        if case is None:
+            return True
+        if stage3_case_is_a1(case):
+            return not stage3_a1_options(case).get("no_symlink", False)
+        return case[5]
+
     def stage3_a1_failure_matches(case, edge_index, role, variant):
         if not stage3_a1_failure(case) or len(case) < 3:
             return False
@@ -2323,17 +2330,17 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     "rlimit_baseline": None,
                     "required_constants": (
                         stage3_constants
-                        if stage3_case is None or stage3_case_is_a1(stage3_case) or stage3_case[5]
+                        if stage3_case_has_symlink(stage3_case)
                         else stage3_constants - {("os", "O_PATH")}
                     ),
                     "required_callables": (
                         stage3_callables
-                        if stage3_case is None or stage3_case_is_a1(stage3_case) or stage3_case[5]
+                        if stage3_case_has_symlink(stage3_case)
                         else stage3_callables - {("os", "readlink")}
                     ),
                     "required_supports": (
                         stage3_supports
-                        if stage3_case is None or stage3_case_is_a1(stage3_case) or stage3_case[5]
+                        if stage3_case_has_symlink(stage3_case)
                         else stage3_supports - {("supports_dir_fd", "readlink")}
                     ),
                 }
@@ -4993,6 +5000,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
                 )
                 no_symlink_offset = os.lseek(no_symlink_fd, 11, os.SEEK_SET)
+                symlink_golden = os.environ["TASK4_GOLDEN"]
+                os.environ["TASK4_GOLDEN"] = stage3_no_symlink_ledger.decode("ascii")
                 try:
                     run_case(
                         "stage3a1-private-P-getfl-opath-no-symlink",
@@ -5007,10 +5016,11 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                             "stage3a1-failure",
                             "vendor",
                             "EMFILE-rlimit-same",
-                            {"private_p_getfl": "opath"},
+                            {"private_p_getfl": "opath", "no_symlink": True},
                         ),
                     )
                 finally:
+                    os.environ["TASK4_GOLDEN"] = symlink_golden
                     os.close(no_symlink_fd)
                 for family, tokens in (
                     (

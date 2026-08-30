@@ -758,6 +758,12 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
     )
     stage3_support_wrapper_targets = []
 
+    def stage3_native_target(target):
+        for wrapper, native in stage3_support_wrapper_targets:
+            if target is wrapper:
+                return native
+        return target
+
     def stage3_maybe_inventory():
         state = stage3_c0_state
         required_constants = stage3_constants if state is None else state["required_constants"]
@@ -830,6 +836,254 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             or case[0].startswith("continue-")
         )
 
+    def stage3_case_is_a1(case):
+        return case is not None and case[0].startswith("stage3a1-")
+
+    def stage3_case_reaches_g1(case):
+        return stage3_case_is_a1(case) or stage3_case_is_continuation(case)
+
+    def stage3_a1_failure(case):
+        return case is not None and case[0] == "stage3a1-failure"
+
+    def stage3_a1_options(case):
+        return case[-1] if case and isinstance(case[-1], dict) else {}
+
+    def stage3_a1_failure_matches(case, edge_index, role, variant):
+        if not stage3_a1_failure(case) or len(case) < 3:
+            return False
+        site = case[1]
+        return (site == role or site == f"edge-{edge_index}") and case[2] == variant
+
+    def stage3_a1_injection(case, family, index):
+        if family == "gb" and stage3_a1_options(case).get("safe_failure") == "GB" and index == 0:
+            return "error"
+        if case is not None and case[0] == f"stage3a1-{family}-mutation" and case[1] == index:
+            return case[2]
+        if (
+            family == "g1"
+            and case is not None
+            and case[0] == "stage3a1-g1-mutation"
+            and case[2] == "private-alias"
+            and len(case) > 4
+            and case[4] == index
+        ):
+            return "private-alias-pre"
+        if case is not None and case[0] == "stage3a1-lineage-mutation" and index in case[1:3]:
+            return ("lineage", case[3])
+        return None
+
+    def stage3_a1_proxy_identity(value, structural):
+        return StatProxy(
+            value,
+            **dict(
+                zip(
+                    (
+                        "st_dev", "st_ino", "st_uid", "st_gid", "st_mode",
+                        "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns",
+                    ),
+                    structural,
+                )
+            ),
+        )
+
+    def stage3_a1_expected_token(state):
+        if state["a1_phase"] != "g1":
+            return None
+        events = state["expected_graph_events"]
+        index = len(state["graph_events"])
+        return events[index] if index < len(events) else None
+
+    def stage3_a1_finish_body(state, outcome):
+        if state["a1_phase"] != "g1":
+            return
+        state["a1_body_outcome"] = outcome
+        state["a1_phase"] = "cleanup" if outcome == "arbitrary" else "fp"
+
+    def stage3_a1_c0_complete(state):
+        return (
+            state["events"]
+            == ["a2-complete", "capability-inventory", "rlimit-baseline"]
+            and set(state["constants"]) == state["required_constants"]
+            and set(state["callables"]) == state["required_callables"]
+            and set(state["supports"]) == state["required_supports"]
+            and all(count == 1 for count in state["constants"].values())
+            and all(count == 1 for count in state["callables"].values())
+            and all(count == 1 for count in state["supports"].values())
+            and len(state["getrlimit"]) == 1
+        )
+
+    def stage3_a1_edge_for_prefix(state, prefix):
+        for edge in state["graph_edges"]:
+            if edge[4] == prefix:
+                return edge
+        return None
+
+    def stage3_a1_fd_for_prefix(state, prefix):
+        return state["graph_fds"].get(prefix)
+
+    def stage3_a1_expected_binding_token(state):
+        if state["a1_phase"] != "gb":
+            return None
+        expected = [
+            token
+            for token in state["expected_graph_bindings"]
+            if token.split(":", 1)[1].encode("ascii") in state["graph_fds"]
+        ]
+        state["active_graph_bindings"] = expected
+        index = len(state["graph_binding_events"])
+        return expected[index] if index < len(expected) else None
+
+    stage3_a1_final_private = (
+        "private-L-getfl",
+        "private-L-getfd",
+        "private-L-fstat-pre",
+        "private-L-pread-complete",
+        "private-L-fstat-post",
+        "private-P-getfl",
+        "private-P-getfd",
+        "private-P-fstat",
+    )
+    stage3_a1_final_borrowed = (
+        "borrowed-L-getfl",
+        "borrowed-L-fstat",
+        "borrowed-P-getfl",
+        "borrowed-P-getfd",
+        "borrowed-P-fstat",
+    )
+
+    def stage3_a1_private_call_matches(namespace, name, arguments, arguments_by_name):
+        state = stage3_c0_state
+        if state is None or state["a1_phase"] != "fp":
+            return False
+        index = len(state["a1_final_private_events"])
+        if index >= len(stage3_a1_final_private):
+            return False
+        token = stage3_a1_final_private[index]
+        if token.startswith("private-L-"):
+            fd = state["private_ledger_fd"]
+        else:
+            fd = state["private_parent_fd"]
+        if not arguments or arguments[0] != fd:
+            return False
+        if token.endswith("getfl") or token.endswith("getfd"):
+            command = stage3_custody_commands(state)[0 if token.endswith("getfl") else 1]
+            return namespace == "fcntl" and name == "fcntl" and arguments[1:] == (command,) and not arguments_by_name
+        if "fstat" in token:
+            return namespace == "os" and name == "fstat" and len(arguments) == 1 and not arguments_by_name
+        return (
+            namespace == "os"
+            and name == "pread"
+            and len(arguments) == 3
+            and type(arguments[1]) is int
+            and arguments[1] > 0
+            and arguments[2] == state["a1_private_pread_cursor"]
+            and state["a1_private_pread_cursor"] < len(state["a1_private_expected_bytes"])
+            and not arguments_by_name
+        )
+
+    def stage3_a1_graph_call_matches(namespace, name, arguments, arguments_by_name):
+        state = stage3_c0_state
+        case = None if state is None else state["stage3_case"]
+        if (
+            state is None
+            or state["a2_complete"] != 1
+            or not stage3_case_reaches_g1(case)
+        ):
+            return False
+        if (
+            state["a1_phase"] == "cleanup"
+            and namespace == "os"
+            and name == "close"
+            and len(arguments) == 1
+            and not arguments_by_name
+        ):
+            close_index = len(state["graph_close_calls"])
+            expected = list(reversed(state["graph_owned"]))
+            expected += [state["private_parent_fd"], state["private_ledger_fd"]]
+            return close_index < len(expected) and arguments[0] == expected[close_index]
+        token = stage3_a1_expected_token(state)
+        if token is None:
+            token = stage3_a1_expected_binding_token(state)
+            if token is None or state["a1_body_outcome"] == "arbitrary":
+                return False
+            operation, raw_prefix = token.split(":", 1)
+            prefix = raw_prefix.encode("ascii")
+            edge = stage3_a1_edge_for_prefix(state, prefix)
+            if edge is None:
+                return False
+            if operation == "bind-held-fstat":
+                return (
+                    namespace == "os"
+                    and name == "fstat"
+                    and arguments == (stage3_a1_fd_for_prefix(state, prefix),)
+                    and not arguments_by_name
+                )
+            return (
+                operation == "bind-parent-name-stat"
+                and namespace == "os"
+                and name == "stat"
+                and arguments == (edge[2],)
+                and arguments_by_name
+                == {
+                    "dir_fd": stage3_a1_fd_for_prefix(state, edge[3]),
+                    "follow_symlinks": False,
+                }
+            )
+        if token == "anchor-lineages-exact":
+            return False
+        if token == "open-root" or token.startswith("open-prefix:"):
+            if namespace != "os" or name != "open" or len(arguments) != 2:
+                return False
+            edge = (
+                state["graph_edges"][0]
+                if token == "open-root"
+                else stage3_a1_edge_for_prefix(
+                    state, token.split(":", 1)[1].encode("ascii")
+                )
+            )
+            if edge is None or edge[0] == "cache":
+                return False
+            expected_parent = (
+                None if edge[3] is None else state["graph_fds"].get(edge[3])
+            )
+            expected_flags = (
+                state["constant_values"][("os", "O_RDONLY")]
+                | state["constant_values"][("os", "O_DIRECTORY")]
+                | state["constant_values"][("os", "O_CLOEXEC")]
+                | state["constant_values"][("os", "O_NOFOLLOW")]
+            )
+            return (
+                type(arguments[0]) is bytes
+                and arguments[0] == edge[2]
+                and arguments[1] == expected_flags
+                and arguments_by_name
+                == ({} if expected_parent is None else {"dir_fd": expected_parent})
+            )
+        if token.startswith("edge-pre-stat:") or token.startswith("cache-binding-stat:"):
+            if namespace != "os" or name != "stat" or len(arguments) != 1:
+                return False
+            prefix = token.split(":", 1)[1].encode("ascii")
+            edge = stage3_a1_edge_for_prefix(state, prefix)
+            if edge is None:
+                return False
+            return (
+                arguments[0] == edge[2]
+                and arguments_by_name.get("dir_fd") == state["graph_fds"].get(edge[3])
+                and arguments_by_name.get("follow_symlinks") is False
+                and set(arguments_by_name) == {"dir_fd", "follow_symlinks"}
+            )
+        if token.startswith("held-fstat:") or token.startswith("cache-held-fstat:"):
+            if namespace != "os" or name != "fstat" or len(arguments) != 1 or arguments_by_name:
+                return False
+            prefix = token.split(":", 1)[1].encode("ascii")
+            expected_fd = state.get("graph_pending_fd")
+            if expected_fd is not None:
+                expected_fd = expected_fd[1]
+            else:
+                expected_fd = stage3_a1_fd_for_prefix(state, prefix)
+            return arguments[0] == expected_fd
+        return False
+
     def stage3_custody_commands(state):
         if "rlimit-baseline" not in state["events"]:
             return fcntl.F_GETFL, fcntl.F_GETFD
@@ -845,6 +1099,52 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         if namespace == "resource" and name == "getrlimit":
             if state["events"] == ["a2-complete", "capability-inventory"]:
                 return "resource-getrlimit"
+            if (
+                stage3_case_reaches_g1(state["stage3_case"])
+                and state["a1_emfile"]
+                and len(state["getrlimit"]) == 1
+                and arguments
+                == (state["constant_values"][("resource", "RLIMIT_NOFILE")],)
+                and not arguments_by_name
+            ):
+                return "resource-getrlimit-reread"
+            return None
+        if stage3_case_reaches_g1(state["stage3_case"]):
+            if state["a1_phase"] == "fb":
+                index = len(state["a1_final_borrowed_events"])
+                token = (
+                    stage3_a1_final_borrowed[index]
+                    if index < len(stage3_a1_final_borrowed)
+                    else None
+                )
+                getfl, getfd = stage3_custody_commands(state)
+                expected = {
+                    "borrowed-L-getfl": ("fcntl", "fcntl", state["borrowed_ledger_fd"], getfl),
+                    "borrowed-L-fstat": ("os", "fstat", state["borrowed_ledger_fd"], None),
+                    "borrowed-P-getfl": ("fcntl", "fcntl", state["borrowed_parent_fd"], getfl),
+                    "borrowed-P-getfd": ("fcntl", "fcntl", state["borrowed_parent_fd"], getfd),
+                    "borrowed-P-fstat": ("os", "fstat", state["borrowed_parent_fd"], None),
+                }.get(token)
+                if expected is not None:
+                    expected_namespace, expected_name, expected_fd, expected_command = expected
+                    if (
+                        namespace == expected_namespace
+                        and name == expected_name
+                        and arguments[0] == expected_fd
+                        and not arguments_by_name
+                        and (
+                            expected_command is None
+                            and len(arguments) == 1
+                            or expected_command is not None
+                            and arguments[1:] == (expected_command,)
+                        )
+                    ):
+                        return token
+            if state["a1_phase"] == "cleanup" and namespace == "os" and name == "close":
+                if arguments == (state["private_parent_fd"],) and not arguments_by_name:
+                    return "close-P"
+                if arguments == (state["private_ledger_fd"],) and not arguments_by_name:
+                    return "close-L"
             return None
         if namespace == "fcntl" and name == "fcntl" and len(arguments) >= 2:
             fd, command = arguments[:2]
@@ -880,18 +1180,45 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
 
         def __call__(self, *arguments, **arguments_by_name):
             state = stage3_c0_state
+            if state is not None and state.get("a1_emfile_pending") and not (
+                self.namespace == "resource"
+                and self.name == "getrlimit"
+                and arguments
+                == (state["constant_values"][("resource", "RLIMIT_NOFILE")],)
+                and not arguments_by_name
+            ):
+                raise SystemExit("stage3a1 EMFILE RLIMIT reread was not immediate")
+            if (
+                state is not None
+                and state["a2_complete"] == 1
+                and stage3_case_reaches_g1(state["stage3_case"])
+                and state["a1_phase"] == "c0"
+                and self.namespace == "os"
+                and self.name == "open"
+                and stage3_a1_c0_complete(state)
+            ):
+                state["events"].append("capacity-policy-selected")
+                state["a1_phase"] = "g1"
+            a1_graph_call = stage3_a1_graph_call_matches(
+                self.namespace, self.name, arguments, arguments_by_name
+            )
+            a1_private_call = stage3_a1_private_call_matches(
+                self.namespace, self.name, arguments, arguments_by_name
+            )
             call_label = stage3_authorized_call(
                 self.namespace, self.name, arguments, arguments_by_name
             )
             if state is not None and state["a2_complete"] == 1:
-                if call_label is None:
+                if call_label is None and not a1_graph_call and not a1_private_call:
                     state["unauthorized_calls"].append((self.namespace, self.name))
-                else:
+                elif call_label is not None:
                     state["post_a2_calls"].append(call_label)
             if (
                 state is not None
                 and state["events"]
                 == ["a2-complete", "capability-inventory", "rlimit-baseline"]
+                and not a1_graph_call
+                and not a1_private_call
                 and not (
                     self.namespace == "fcntl"
                     and self.name == "fcntl"
@@ -904,15 +1231,227 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             if self.namespace == "os" and self.name == "open" and state is not None:
                 if state["a2_complete"] == 1:
                     state["graph_opens"] += 1
-                result = self.target(*arguments, **arguments_by_name)
+                if state["a2_complete"] == 1 and stage3_case_reaches_g1(state["stage3_case"]):
+                    token = stage3_a1_expected_token(state)
+                    if token == "open-root":
+                        edge = state["graph_edges"][0]
+                    elif token is not None and token.startswith("open-prefix:"):
+                        expected_prefix = token.split(":", 1)[1].encode("ascii")
+                        edge = stage3_a1_edge_for_prefix(state, expected_prefix)
+                    else:
+                        raise SystemExit("stage3a1 graph acquisition order drifted")
+                    if edge is None or edge[0] != "edge" and edge[0] != "root":
+                        raise SystemExit("stage3a1 graph acquisition order drifted")
+                    edge_index = state["graph_edges"].index(edge)
+                    _kind, role, expected_path, expected_parent, expected_prefix, _event = edge
+                    actual_path = arguments[0] if arguments else None
+                    actual_flags = arguments[1] if len(arguments) > 1 else None
+                    actual_parent = arguments_by_name.get("dir_fd")
+                    expected_flags = (
+                        state["constant_values"][("os", "O_RDONLY")]
+                        | state["constant_values"][("os", "O_DIRECTORY")]
+                        | state["constant_values"][("os", "O_CLOEXEC")]
+                        | state["constant_values"][("os", "O_NOFOLLOW")]
+                    )
+                    expected_parent_fd = (
+                        None if expected_parent is None else state["graph_fds"].get(expected_parent)
+                    )
+                    if (
+                        type(actual_path) is not bytes
+                        or actual_path != expected_path
+                        or actual_flags != expected_flags
+                        or actual_parent != expected_parent_fd
+                    ):
+                        raise SystemExit("stage3a1 graph acquisition order drifted")
+                    attempt_index = len(state["graph_events"])
+                    if attempt_index in state["g1_attempt_indices"]:
+                        raise SystemExit("stage3a1 graph acquisition retried")
+                    state["g1_attempt_indices"].append(attempt_index)
+                    state["graph_events"].append(token)
+                    case = state["stage3_case"]
+                    for variant in (
+                        "return-True",
+                        "return-IntSubclass",
+                        "return-negative",
+                        "collision-borrowed-L",
+                        "collision-borrowed-P",
+                        "collision-private-L",
+                        "collision-private-P",
+                        "ENFILE",
+                        "EMFILE-rlimit-same",
+                        "EMFILE-rlimit-drift",
+                        "KeyboardInterrupt",
+                    ):
+                        if stage3_a1_failure_matches(case, edge_index, role, variant):
+                            break
+                    else:
+                        variant = None
+                    if (
+                        variant is None
+                        and stage3_a1_failure(case)
+                        and len(case) >= 3
+                        and (case[1] == role or case[1] == f"edge-{edge_index}")
+                        and case[2].startswith("collision-owned-G")
+                    ):
+                        variant = case[2]
+                    if variant is not None:
+                        stage3_a1_finish_body(state, (
+                            "arbitrary" if variant == "KeyboardInterrupt" else "governed"
+                        ))
+                        if variant == "return-True":
+                            state["a1_rejected_returns"].append((True, False))
+                            return True
+                        if variant == "return-IntSubclass":
+                            candidate = IntSubclass(0)
+                            state["a1_rejected_returns"].append((candidate, False))
+                            return candidate
+                        if variant == "return-negative":
+                            state["a1_rejected_returns"].append((-1, False))
+                            return -1
+                        if variant == "collision-borrowed-L":
+                            candidate = state["borrowed_ledger_fd"]
+                            state["a1_rejected_returns"].append((candidate, False))
+                            return candidate
+                        if variant == "collision-borrowed-P":
+                            candidate = state["borrowed_parent_fd"]
+                            state["a1_rejected_returns"].append((candidate, False))
+                            return candidate
+                        if variant == "collision-private-L":
+                            candidate = state["private_ledger_fd"]
+                            state["a1_rejected_returns"].append((candidate, True))
+                            return candidate
+                        if variant == "collision-private-P":
+                            candidate = state["private_parent_fd"]
+                            state["a1_rejected_returns"].append((candidate, True))
+                            return candidate
+                        if variant.startswith("collision-owned-G"):
+                            try:
+                                graph_index = int(variant.removeprefix("collision-owned-G"))
+                                candidate = state["graph_owned"][graph_index]
+                            except (ValueError, IndexError):
+                                raise SystemExit("stage3a1 graph collision index drifted")
+                            state["a1_rejected_returns"].append((candidate, True))
+                            return candidate
+                        if variant == "KeyboardInterrupt":
+                            raise KeyboardInterrupt()
+                        if variant == "ENFILE":
+                            raise OSError(errno.ENFILE, "fixture system file table exhausted")
+                        if variant.startswith("EMFILE"):
+                            state["a1_emfile"] = True
+                            state["a1_emfile_pending"] = True
+                            raise OSError(errno.EMFILE, "fixture process file table exhausted")
+                target = stage3_native_target(self.target) if a1_graph_call else self.target
+                result = target(*arguments, **arguments_by_name)
+                if state["a2_complete"] == 1 and stage3_case_reaches_g1(state["stage3_case"]):
+                    if type(result) is not int or result < 0:
+                        raise SystemExit("stage3a1 graph acquisition order drifted")
+                    if result in {
+                        state["borrowed_ledger_fd"],
+                        state["borrowed_parent_fd"],
+                        state["private_ledger_fd"],
+                        state["private_parent_fd"],
+                    } or result in state["graph_owned"]:
+                        raise SystemExit("stage3a1 graph acquisition order drifted")
+                    state["graph_owned"].append(result)
+                    state["graph_pending_fd"] = (expected_prefix, result)
                 if state["a2_complete"] == 0 and state["private_parent_fd"] is None:
                     state["private_parent_fd"] = result
                 return result
+            if self.namespace == "os" and self.name == "stat" and state is not None:
+                if state["a2_complete"] == 1 and stage3_case_reaches_g1(state["stage3_case"]):
+                    token = stage3_a1_expected_token(state)
+                    binding_token = stage3_a1_expected_binding_token(state)
+                    if token is None and binding_token is not None and a1_graph_call:
+                        attempt_index = len(state["graph_binding_events"])
+                        if attempt_index in state["gb_attempt_indices"]:
+                            raise SystemExit("stage3a1 graph binding retried")
+                        state["gb_attempt_indices"].append(attempt_index)
+                        state["graph_binding_events"].append(binding_token)
+                        injection = stage3_a1_injection(
+                            state["stage3_case"], "gb", attempt_index
+                        )
+                        if injection == "error":
+                            state["a1_body_outcome"] = "governed"
+                            state["gb_failed"] = True
+                            if stage3_a1_options(state["stage3_case"]).get("safe_failure") == "GB":
+                                state["a1_safe_failure_attempted"] = "GB"
+                            if state["graph_binding_events"] == state["active_graph_bindings"]:
+                                state["a1_phase"] = "cleanup"
+                            raise OSError(errno.EIO, "stage3a1 graph binding stat failed")
+                        result = self.target(*arguments, **arguments_by_name)
+                        if injection == "mismatch":
+                            state["a1_body_outcome"] = "governed"
+                            state["gb_failed"] = True
+                            result = StatProxy(result, st_ino=result.st_ino + 1)
+                        else:
+                            state["graph_binding_successes"].append(binding_token)
+                        if state["graph_binding_events"] == state["active_graph_bindings"]:
+                            if not state["gb_failed"]:
+                                state["a1_suffix"].append("final-graph-bindings")
+                            state["a1_phase"] = "cleanup"
+                        return result
+                    if token is None or not (
+                        token.startswith("edge-pre-stat:")
+                        or token.startswith("cache-binding-stat:")
+                    ):
+                        raise SystemExit("stage3a1 graph acquisition order drifted")
+                    attempt_index = len(state["graph_events"])
+                    if attempt_index in state["g1_attempt_indices"]:
+                        raise SystemExit("stage3a1 graph acquisition retried")
+                    state["g1_attempt_indices"].append(attempt_index)
+                    state["graph_events"].append(token)
+                    prefix = token.split(":", 1)[1].encode("ascii")
+                    edge = stage3_a1_edge_for_prefix(state, prefix)
+                    if edge is None:
+                        raise SystemExit("stage3a1 graph acquisition order drifted")
+                    case = state["stage3_case"]
+                    injection = stage3_a1_injection(case, "g1", attempt_index)
+                    if injection == "error":
+                        stage3_a1_finish_body(state, "governed")
+                        raise OSError(errno.EIO, "stage3a1 graph stat failed")
+                    result = self.target(*arguments, **arguments_by_name)
+                    if injection == "mismatch":
+                        if token.startswith("cache-binding-stat:"):
+                            stage3_a1_finish_body(state, "governed")
+                        else:
+                            state["a1_body_outcome"] = "governed"
+                        result = StatProxy(result, st_ino=result.st_ino + 1)
+                    elif isinstance(injection, tuple) and injection[0] == "lineage":
+                        result = stage3_a1_proxy_identity(
+                            result, state["graph_initial_structural"][injection[1]]
+                        )
+                    elif injection == "private-alias-pre":
+                        result = stage3_a1_proxy_identity(
+                            result, state["private_parent_structural"]
+                        )
+                    if token.startswith("cache-binding-stat:") and (
+                        len(state["graph_events"]) == len(state["expected_graph_events"]) - 1
+                    ):
+                        state["graph_events"].append("anchor-lineages-exact")
+                    return result
+                return self.target(*arguments, **arguments_by_name)
             if self.namespace == "fcntl" and self.name == "fcntl" and state is not None:
                 fd = arguments[0] if len(arguments) >= 1 else None
                 command = arguments[1] if len(arguments) >= 2 else None
                 observed_getfl, observed_getfd = stage3_custody_commands(state)
+                if a1_private_call:
+                    private_token = stage3_a1_final_private[len(state["a1_final_private_events"])]
+                    state["a1_final_private_events"].append(private_token)
+                    if tuple(state["a1_final_private_events"]) == stage3_a1_final_private:
+                        state["a1_suffix"].append("final-private")
+                        state["a1_phase"] = "fb"
+                    if (
+                        stage3_a1_options(state["stage3_case"]).get("safe_failure") == "FP"
+                        and private_token == "private-P-fstat"
+                    ):
+                        state["a1_safe_failure_attempted"] = "FP"
+                        raise OSError(errno.EIO, "stage3a1 final private custody failed")
+                if call_label in stage3_a1_final_borrowed:
+                    state["a1_final_borrowed_events"].append(call_label)
+                    state["events"].append(call_label)
                 if (
+                    not stage3_case_reaches_g1(state["stage3_case"])
+                    and
                     state["a2_complete"] == 1
                     and fd == state["borrowed_ledger_fd"]
                     and command == observed_getfl
@@ -950,7 +1489,129 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 return result
             if self.namespace == "os" and self.name == "fstat" and state is not None:
                 fd = arguments[0] if len(arguments) == 1 and not arguments_by_name else None
-                if state["final_custody"] == 1:
+                if a1_private_call:
+                    private_token = stage3_a1_final_private[len(state["a1_final_private_events"])]
+                    state["a1_final_private_events"].append(private_token)
+                    if tuple(state["a1_final_private_events"]) == stage3_a1_final_private:
+                        state["a1_suffix"].append("final-private")
+                        state["a1_phase"] = "fb"
+                    if (
+                        stage3_a1_options(state["stage3_case"]).get("safe_failure") == "FP"
+                        and private_token == "private-P-fstat"
+                    ):
+                        state["a1_safe_failure_attempted"] = "FP"
+                        raise OSError(errno.EIO, "stage3a1 final private custody failed")
+                if state["a2_complete"] == 1 and stage3_case_reaches_g1(state["stage3_case"]):
+                    token = stage3_a1_expected_token(state)
+                    binding_token = stage3_a1_expected_binding_token(state)
+                    if token is None and binding_token is not None and a1_graph_call:
+                        attempt_index = len(state["graph_binding_events"])
+                        if attempt_index in state["gb_attempt_indices"]:
+                            raise SystemExit("stage3a1 graph binding retried")
+                        state["gb_attempt_indices"].append(attempt_index)
+                        state["graph_binding_events"].append(binding_token)
+                        injection = stage3_a1_injection(
+                            state["stage3_case"], "gb", attempt_index
+                        )
+                        if injection == "error":
+                            state["a1_body_outcome"] = "governed"
+                            state["gb_failed"] = True
+                            if stage3_a1_options(state["stage3_case"]).get("safe_failure") == "GB":
+                                state["a1_safe_failure_attempted"] = "GB"
+                            if state["graph_binding_events"] == state["active_graph_bindings"]:
+                                state["a1_phase"] = "cleanup"
+                            raise OSError(errno.EIO, "stage3a1 graph binding fstat failed")
+                        result = self.target(*arguments, **arguments_by_name)
+                        if injection == "mismatch":
+                            state["a1_body_outcome"] = "governed"
+                            state["gb_failed"] = True
+                            result = StatProxy(result, st_ino=result.st_ino + 1)
+                        else:
+                            state["graph_binding_successes"].append(binding_token)
+                        if state["graph_binding_events"] == state["active_graph_bindings"]:
+                            if not state["gb_failed"]:
+                                state["a1_suffix"].append("final-graph-bindings")
+                            state["a1_phase"] = "cleanup"
+                        return result
+                    if token is not None and (
+                        token.startswith("held-fstat:")
+                        or token.startswith("cache-held-fstat:")
+                    ):
+                        attempt_index = len(state["graph_events"])
+                        if attempt_index in state["g1_attempt_indices"]:
+                            raise SystemExit("stage3a1 graph acquisition retried")
+                        state["g1_attempt_indices"].append(attempt_index)
+                        state["graph_events"].append(token)
+                        prefix = token.split(":", 1)[1].encode("ascii")
+                        expected_fd = (
+                            state["graph_pending_fd"][1]
+                            if token.startswith("held-fstat:")
+                            else stage3_a1_fd_for_prefix(state, prefix)
+                        )
+                        if fd != expected_fd:
+                            raise SystemExit("stage3a1 graph acquisition order drifted")
+                        case = state["stage3_case"]
+                        injection = stage3_a1_injection(case, "g1", attempt_index)
+                        if injection == "error":
+                            stage3_a1_finish_body(state, "governed")
+                            raise OSError(errno.EIO, "stage3a1 held fstat failed")
+                        result = self.target(*arguments, **arguments_by_name)
+                        if injection == "mismatch":
+                            stage3_a1_finish_body(state, "governed")
+                            result = StatProxy(result, st_ino=result.st_ino + 1)
+                        elif injection == "root-mismatch":
+                            stage3_a1_finish_body(state, "governed")
+                            result = StatProxy(result, st_mode=stat.S_IFREG | 0o600)
+                        elif injection == "private-alias":
+                            stage3_a1_finish_body(state, "governed")
+                            result = stage3_a1_proxy_identity(
+                                result, state["private_parent_structural"]
+                            )
+                        elif isinstance(injection, tuple) and injection[0] == "lineage":
+                            result = stage3_a1_proxy_identity(
+                                result, state["graph_initial_structural"][injection[1]]
+                            )
+                        if token.startswith("held-fstat:"):
+                            rejects_here = injection in {"mismatch", "root-mismatch", "private-alias"}
+                            if (
+                                case is not None
+                                and case[0] == "stage3a1-g1-mutation"
+                                and len(case) > 3
+                                and case[3] == attempt_index
+                            ):
+                                rejects_here = True
+                                stage3_a1_finish_body(state, "governed")
+                            if not rejects_here:
+                                state["graph_fds"][prefix] = fd
+                                state["graph_initial_structural"][prefix] = identity(result)
+                                state["graph_pending_fd"] = None
+                                state["graph_events"].append(
+                                    f"private-parent-disjoint:{prefix.decode('ascii')}"
+                                )
+                                if isinstance(injection, tuple):
+                                    stage3_a1_finish_body(state, "governed")
+                                elif len(state["graph_events"]) == len(state["expected_graph_events"]) - 1:
+                                    state["graph_events"].append("anchor-lineages-exact")
+                                    state["a1_phase"] = "fb"
+                        return result
+                    if token is not None and token == "anchor-lineages-exact":
+                        raise SystemExit("stage3a1 graph acquisition order drifted")
+                if call_label in stage3_a1_final_borrowed:
+                    state["a1_final_borrowed_events"].append(call_label)
+                    state["events"].append(call_label)
+                    if call_label == "borrowed-P-fstat":
+                        state["a1_suffix"].append("final-borrowed")
+                        state["a1_phase"] = "gb"
+                        safe_failure = stage3_a1_options(state["stage3_case"]).get("safe_failure")
+                        if safe_failure in {"FB", "FB-KI"}:
+                            state["a1_safe_failure_attempted"] = safe_failure
+                            if safe_failure == "FB-KI":
+                                raise KeyboardInterrupt()
+                            raise OSError(errno.EIO, "stage3a1 final borrowed custody failed")
+                        if stage3_a1_expected_binding_token(state) is None:
+                            state["a1_suffix"].append("final-graph-bindings")
+                            state["a1_phase"] = "cleanup"
+                if not stage3_case_reaches_g1(state["stage3_case"]) and state["final_custody"] == 1:
                     if fd == state["borrowed_ledger_fd"] and "borrowed-L-fstat" not in state["events"]:
                         state["events"].append("borrowed-L-fstat")
                     elif fd == state["borrowed_parent_fd"] and "borrowed-P-fstat" not in state["events"]:
@@ -961,27 +1622,90 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     and fd == state["private_parent_fd"]
                     and state["private_parent_fd"] is not None
                 ):
+                    state["private_parent_structural"] = identity(result)
                     stage3_a2_complete()
+                return result
+            if self.namespace == "os" and self.name == "pread" and state is not None:
+                result = self.target(*arguments, **arguments_by_name)
+                if a1_private_call:
+                    cursor = state["a1_private_pread_cursor"]
+                    expected = state["a1_private_expected_bytes"]
+                    if (
+                        type(result) is not bytes
+                        or not result
+                        or cursor + len(result) > len(expected)
+                        or result != expected[cursor : cursor + len(result)]
+                    ):
+                        raise SystemExit("stage3a1 final private pread was not exact")
+                    state["a1_private_pread_chunks"].append((cursor, result))
+                    state["a1_private_pread_cursor"] += len(result)
+                    if state["a1_private_pread_cursor"] == len(expected):
+                        state["a1_final_private_events"].append(
+                            stage3_a1_final_private[len(state["a1_final_private_events"])]
+                        )
                 return result
             if self.namespace == "os" and self.name == "close" and state is not None:
                 fd = arguments[0] if len(arguments) == 1 and not arguments_by_name else None
-                if state["final_custody"] == 1:
+                if stage3_case_reaches_g1(state["stage3_case"]):
+                    close_index = len(state["graph_close_calls"])
+                    expected = list(reversed(state["graph_owned"]))
+                    expected += [state["private_parent_fd"], state["private_ledger_fd"]]
+                    if close_index >= len(expected) or fd != expected[close_index]:
+                        raise SystemExit("stage3a1 reverse close order drifted")
+                    if fd in state["graph_owned"]:
+                        graph_index = state["graph_owned"].index(fd)
+                        state["a1_custody_events"].append(f"close-G{graph_index}")
+                    elif fd == state["private_parent_fd"]:
+                        state["a1_custody_events"].append("close-P")
+                    elif fd == state["private_ledger_fd"]:
+                        state["a1_custody_events"].append("close-L")
+                    state["graph_close_calls"].append(fd)
+                    if close_index == len(expected) - 1:
+                        state["a1_suffix"].append("reverse-close-graph-P-L")
+                if stage3_case_reaches_g1(state["stage3_case"]):
                     if fd == state["private_parent_fd"]:
                         state["events"].append("close-P")
                     elif fd == state["private_ledger_fd"]:
                         state["events"].append("close-L")
-                return self.target(*arguments, **arguments_by_name)
+                elif state["final_custody"] == 1:
+                    if fd == state["private_parent_fd"]:
+                        state["events"].append("close-P")
+                    elif fd == state["private_ledger_fd"]:
+                        state["events"].append("close-L")
+                target = (
+                    stage3_native_target(self.target)
+                    if fd in state.get("graph_owned", ())
+                    else self.target
+                )
+                result = target(*arguments, **arguments_by_name)
+                if (
+                    stage3_a1_options(state["stage3_case"]).get("close_failure") == "parent"
+                    and fd == state["private_parent_fd"]
+                ):
+                    state["a1_close_failure_attempted"] = "parent"
+                    raise OSError(errno.EIO, "stage3a1 parent real-close-then-raise")
+                return result
             if self.namespace == "resource" and self.name == "getrlimit" and state is not None:
                 limit = arguments[0] if len(arguments) == 1 and not arguments_by_name else None
                 case = state["stage3_case"]
-                if case is not None and case[1] == "rlimit-result":
+                if case is not None and not stage3_case_is_a1(case) and case[1] == "rlimit-result":
                     state["case_attempts"] += 1
                 result = (
                     case[3]
-                    if case is not None and case[1] == "rlimit-result"
+                    if case is not None and not stage3_case_is_a1(case) and case[1] == "rlimit-result"
                     else (1024, 1048576)
                 )
+                if (
+                    state is not None
+                    and stage3_case_is_a1(case)
+                    and state["a1_emfile"]
+                    and len(case) >= 3
+                    and case[2] == "EMFILE-rlimit-drift"
+                ):
+                    result = (1023, 1048576)
                 state["getrlimit"].append((limit, result))
+                if state.get("a1_emfile_pending"):
+                    state["a1_emfile_pending"] = False
                 if (
                     state["events"] == ["a2-complete", "capability-inventory"]
                     and limit
@@ -994,6 +1718,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     and result[0] <= result[1]
                 ):
                     state["events"].append("rlimit-baseline")
+                    state["rlimit_baseline"] = result
                 return result
             return self.target(*arguments, **arguments_by_name)
 
@@ -1017,6 +1742,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 state["observed_items"][item] = state["observed_items"].get(item, 0) + 1
             if (
                 case is not None
+                and not stage3_case_is_a1(case)
                 and case[1] == "missing-support"
                 and case[2] == item
                 and state["case_attempts"] == 0
@@ -1039,8 +1765,23 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             case = None if state is None or state["a2_complete"] == 0 else state["stage3_case"]
             if state is not None and state["a2_complete"] == 1:
                 state["observed_items"][item] = state["observed_items"].get(item, 0) + 1
+                allowed_items = (
+                    state["required_constants"]
+                    | state["required_callables"]
+                    | {
+                        ("os", "supports_dir_fd"),
+                        ("os", "supports_follow_symlinks"),
+                        ("os", "supports_fd"),
+                    }
+                )
+                if item not in allowed_items:
+                    state["unauthorized_attributes"].append(item)
+                    raise SystemExit(
+                        f"stage3 unauthorized native attribute: {self.namespace}.{name}"
+                    )
             if (
                 case is not None
+                and not stage3_case_is_a1(case)
                 and case[1] == "missing"
                 and case[2] == item
                 and state["case_attempts"] == 0
@@ -1051,6 +1792,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             value = getattr(self.target, name)
             if (
                 case is not None
+                and not stage3_case_is_a1(case)
                 and case[1] == "replace"
                 and case[2] == item
                 and state["case_attempts"] == 0
@@ -1085,6 +1827,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         if state is not None:
             state["a2_complete"] += 1
             state["events"].append("a2-complete")
+            state["a1_phase"] = "c0"
 
     def check_stage3_c0(expected_terminal):
         state = stage3_c0_state
@@ -1137,7 +1880,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
     def check_stage3_c0_case(case, expected_terminal):
         continuation = stage3_case_is_continuation(case)
         if continuation:
-            check_stage3_c0(expected_terminal)
+            check_stage3_a1(expected_terminal)
             state = stage3_c0_state
             if case[0] == "missing-O_PATH-no-symlink-continue":
                 if (
@@ -1188,6 +1931,161 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             or "capacity-policy-selected" in state["events"]
         ):
             raise SystemExit(f"stage3a0 mutation vector drifted: {case[0]}")
+
+    def check_stage3_a1(expected_terminal):
+        state = stage3_c0_state
+        case = None if state is None else state["stage3_case"]
+        if state is None:
+            raise SystemExit("stage3a1 filesystem root anchor was not acquired exactly once")
+        expected_events = state["expected_graph_events"]
+        if stage3_a1_failure(case):
+            site = case[1]
+            edge = next(edge for edge in state["graph_edges"] if edge[1] == site)
+            failed_token = edge[5]
+            expected_events = expected_events[: expected_events.index(failed_token) + 1]
+        elif case[0] == "stage3a1-g1-mutation":
+            expected_events = expected_events[: case[3] + 1]
+        elif case[0] == "stage3a1-lineage-mutation":
+            expected_events = expected_events[: case[4] + 1]
+        elif state["graph_events"][:1] != ["open-root"]:
+            raise SystemExit("stage3a1 filesystem root anchor was not acquired exactly once")
+        if state["graph_events"] != expected_events:
+            raise SystemExit("stage3a1 graph acquisition order drifted")
+        if (
+            set(state["constants"]) != state["required_constants"]
+            or set(state["callables"]) != state["required_callables"]
+            or set(state["supports"]) != state["required_supports"]
+            or any(count != 1 for count in state["constants"].values())
+            or any(count != 1 for count in state["callables"].values())
+            or any(count != 1 for count in state["supports"].values())
+            or not state["inventory_valid"]
+        ):
+            raise SystemExit("stage3a1 C0 inventory drifted")
+        expected_observed_items = (
+            state["required_constants"]
+            | state["required_callables"]
+            | state["required_supports"]
+            | {
+                ("os", "supports_dir_fd"),
+                ("os", "supports_follow_symlinks"),
+                ("os", "supports_fd"),
+            }
+        )
+        if (
+            set(state["observed_items"]) != expected_observed_items
+            or any(count != 1 for count in state["observed_items"].values())
+        ):
+            raise SystemExit("stage3a1 native attribute observation drifted")
+        if state["unauthorized_calls"] or state["unauthorized_attributes"]:
+            raise SystemExit("stage3a1 unauthorized native call")
+        expected_closes = list(reversed(state["graph_owned"])) + [
+            state["private_parent_fd"],
+            state["private_ledger_fd"],
+        ]
+        if (
+            state["graph_close_calls"] != expected_closes
+            or any(
+                not preowned and candidate in state["graph_close_calls"]
+                for candidate, preowned in state["a1_rejected_returns"]
+            )
+        ):
+            raise SystemExit("stage3a1 reverse close order drifted")
+        expected_custody_events = [
+            f"close-G{index}" for index in reversed(range(len(state["graph_owned"])))
+        ] + ["close-P", "close-L"]
+        if state["a1_custody_events"] != expected_custody_events:
+            raise SystemExit("stage3a1 close custody ledger drifted")
+        for fd in expected_closes:
+            try:
+                real_fstat(fd)
+            except OSError as exc:
+                if exc.errno != errno.EBADF:
+                    raise SystemExit("stage3a1 closed owner did not report EBADF") from exc
+            else:
+                raise SystemExit("stage3a1 owned descriptor leaked")
+        if state["a1_close_failure_attempted"] != stage3_a1_options(case).get("close_failure"):
+            raise SystemExit("stage3a1 close override injection drifted")
+        emfile = stage3_a1_failure(case) and case[2].startswith("EMFILE")
+        if (
+            len(state["getrlimit"]) != (2 if emfile else 1)
+            or state["a1_emfile_pending"]
+            or state["getrlimit"][0]
+            != (
+                state["constant_values"][("resource", "RLIMIT_NOFILE")],
+                state["rlimit_baseline"],
+            )
+        ):
+            raise SystemExit("stage3a1 RLIMIT reread drifted")
+        if emfile:
+            baseline = state["getrlimit"][0][1]
+            reread = state["getrlimit"][1][1]
+            if (case[2].endswith("same") and reread != baseline) or (
+                case[2].endswith("drift") and reread == baseline
+            ):
+                raise SystemExit("stage3a1 RLIMIT reread drifted")
+        if case[0] == "stage3a1-gb-mutation":
+            outcome = "success"
+        elif stage3_a1_failure(case) or case[0] in {
+            "stage3a1-g1-mutation",
+            "stage3a1-lineage-mutation",
+        }:
+            outcome = (
+                "KeyboardInterrupt"
+                if stage3_a1_failure(case) and case[2] == "KeyboardInterrupt"
+                else "MutationError"
+            )
+        else:
+            outcome = "success"
+        expected_private = stage3_a1_final_private if outcome == "MutationError" else ()
+        if tuple(state["a1_final_private_events"]) != expected_private:
+            raise SystemExit("stage3a1 final private custody drifted")
+        if outcome == "MutationError" and (
+            state["a1_private_pread_cursor"] != len(state["a1_private_expected_bytes"])
+            or b"".join(chunk for _offset, chunk in state["a1_private_pread_chunks"])
+            != state["a1_private_expected_bytes"]
+        ):
+            raise SystemExit("stage3a1 final private pread coverage drifted")
+        expected_safe_failure = stage3_a1_options(case).get("safe_failure")
+        if state["a1_safe_failure_attempted"] != expected_safe_failure:
+            raise SystemExit("stage3a1 safe-successor failure injection drifted")
+        expected_binding_events = state.get("active_graph_bindings", [])
+        if outcome != "KeyboardInterrupt" and state["graph_binding_events"] != expected_binding_events:
+            raise SystemExit("stage3a1 final graph binding drifted")
+        expected_borrowed = () if outcome == "KeyboardInterrupt" else stage3_a1_final_borrowed
+        if tuple(state["a1_final_borrowed_events"]) != expected_borrowed:
+            raise SystemExit("stage3a1 final borrowed custody drifted")
+        expected_post_calls = ["resource-getrlimit"]
+        if emfile:
+            expected_post_calls.append("resource-getrlimit-reread")
+        expected_post_calls.extend(expected_borrowed)
+        expected_post_calls.extend(("close-P", "close-L"))
+        expected_post_events = [
+            "a2-complete",
+            "capability-inventory",
+            "rlimit-baseline",
+            "capacity-policy-selected",
+            *expected_borrowed,
+            "close-P",
+            "close-L",
+            expected_terminal,
+        ]
+        if state["post_a2_calls"] != expected_post_calls or state["events"] != expected_post_events:
+            raise SystemExit("stage3a1 post-A2 call order drifted")
+        expected_binding_successes = len(expected_binding_events) - (1 if state["gb_failed"] else 0)
+        if len(state["graph_binding_successes"]) != expected_binding_successes:
+            raise SystemExit("stage3a1 successful graph binding ledger drifted")
+        expected_suffix = []
+        if outcome == "MutationError":
+            expected_suffix.append("final-private")
+        if outcome != "KeyboardInterrupt":
+            expected_suffix.append("final-borrowed")
+            if not state["gb_failed"]:
+                expected_suffix.append("final-graph-bindings")
+        expected_suffix.append("reverse-close-graph-P-L")
+        if tuple(state["a1_suffix"]) != tuple(expected_suffix):
+            raise SystemExit("stage3a1 custody suffix drifted")
+        if state["a1_phase"] != "cleanup":
+            raise SystemExit("stage3a1 lifecycle phase did not reach cleanup")
 
     def run_case(
         label,
@@ -1261,6 +2159,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     "intervening": 0,
                     "post_a2_calls": [],
                     "unauthorized_calls": [],
+                    "unauthorized_attributes": [],
                     "observed_items": {},
                     "case_attempts": 0,
                     "borrowed_ledger_fd": call_kwargs["expected_ledger_fd"],
@@ -1270,19 +2169,49 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     "final_custody": 0,
                     "a2_complete": 0,
                     "stage3_case": stage3_case,
+                    "graph_events": [],
+                    "g1_attempt_indices": [],
+                    "expected_graph_events": stage3_a1_expected_g1,
+                    "graph_edges": stage3_a1_expected_edges,
+                    "graph_fds": {},
+                    "graph_owned": [],
+                    "graph_pending_fd": None,
+                    "graph_initial_structural": {},
+                    "graph_binding_events": [],
+                    "gb_attempt_indices": [],
+                    "expected_graph_bindings": stage3_a1_expected_bindings,
+                    "graph_close_calls": [],
+                    "a1_custody_events": [],
+                    "a1_suffix": [],
+                    "a1_phase": "pre-a2",
+                    "a1_body_outcome": None,
+                    "a1_final_private_events": [],
+                    "a1_final_borrowed_events": [],
+                    "a1_safe_failure_attempted": None,
+                    "a1_private_expected_bytes": os.environ["TASK4_GOLDEN"].encode("ascii"),
+                    "a1_private_pread_cursor": 0,
+                    "a1_private_pread_chunks": [],
+                    "a1_rejected_returns": [],
+                    "a1_close_failure_attempted": None,
+                    "a1_emfile": False,
+                    "a1_emfile_pending": False,
+                    "private_parent_structural": None,
+                    "graph_binding_successes": [],
+                    "gb_failed": False,
+                    "rlimit_baseline": None,
                     "required_constants": (
                         stage3_constants
-                        if stage3_case is None or stage3_case[5]
+                        if stage3_case is None or stage3_case_is_a1(stage3_case) or stage3_case[5]
                         else stage3_constants - {("os", "O_PATH")}
                     ),
                     "required_callables": (
                         stage3_callables
-                        if stage3_case is None or stage3_case[5]
+                        if stage3_case is None or stage3_case_is_a1(stage3_case) or stage3_case[5]
                         else stage3_callables - {("os", "readlink")}
                     ),
                     "required_supports": (
                         stage3_supports
-                        if stage3_case is None or stage3_case[5]
+                        if stage3_case is None or stage3_case_is_a1(stage3_case) or stage3_case[5]
                         else stage3_supports - {("supports_dir_fd", "readlink")}
                     ),
                 }
@@ -1330,7 +2259,9 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             custody()
         if full_a2:
             expected_terminal = "SystemExit(77)" if expected is SystemExit else expected.__name__
-            if stage3_case is None:
+            if stage3_case_is_a1(stage3_case):
+                check_stage3_a1(expected_terminal)
+            elif stage3_case is None:
                 check_stage3_c0(expected_terminal)
             else:
                 check_stage3_c0_case(stage3_case, expected_terminal)
@@ -1569,6 +2500,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             stage2_positive["events"].append("close-L")
         return real_close(fd)
 
+    stage3_support_wrapper_targets.append((stage2_positive_close, real_close))
+
     def check_stage2_positive():
         if stage2_positive["dup_calls"] != 1:
             raise SystemExit("stage2 ledger duplicate was not acquired exactly once")
@@ -1662,6 +2595,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         borrowed=base_borrowed,
         postcheck=check_stage2_positive,
         full_a2=True,
+        stage3_case=("stage3a1-positive",),
     )
 
     def stage2_expected(position=None, variant=None, ledger_event="dup-L", parent_event="open-P", terminal="MutationError"):
@@ -2095,6 +3029,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             if close_error == ("parent" if fd == state["private_parent"] else "ledger"):
                 raise OSError(errno.EIO, "stage2 injected close failure")
             return value
+
+        stage3_support_wrapper_targets.append((wrapped_close, real_close))
 
         def observed_trace():
             events = list(state["events"])
@@ -3223,6 +4159,89 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             stat.S_IFLNK: "symlink",
         }.get(file_type, "other")
 
+    def stage3_raw_prefixes(raw_path):
+        if type(raw_path) is not bytes or not raw_path.startswith(b"/"):
+            raise SystemExit("stage3 raw anchor is not absolute bytes")
+        components = [component for component in raw_path.split(b"/") if component]
+        return [
+            b"/" + b"/".join(components[:index])
+            for index in range(1, len(components) + 1)
+        ]
+
+    def stage3_a1_graph_events(root_raw, repo_raw, vendor_raw, stable_raw, nightly_raw):
+        return [
+            event
+            for edge in stage3_a1_graph_edges(
+                root_raw, repo_raw, vendor_raw, stable_raw, nightly_raw
+            )
+            for event in (
+                ["open-root", "held-fstat:/", "private-parent-disjoint:/"]
+                if edge[0] == "root"
+                else [
+                    f"edge-pre-stat:{edge[4].decode('ascii')}",
+                    f"open-prefix:{edge[4].decode('ascii')}",
+                    f"held-fstat:{edge[4].decode('ascii')}",
+                    f"private-parent-disjoint:{edge[4].decode('ascii')}",
+                ]
+                if edge[0] == "edge"
+                else [
+                    f"cache-held-fstat:{edge[4].decode('ascii')}",
+                    *([] if edge[4] == b"/" else [f"cache-binding-stat:{edge[4].decode('ascii')}"]),
+                ]
+            )
+        ] + ["anchor-lineages-exact"]
+
+    def stage3_a1_graph_edges(root_raw, repo_raw, vendor_raw, stable_raw, nightly_raw):
+        held = {b"/"}
+        edges = [("root", "root", b"/", None, b"/", "open-root")]
+        for raw_path, anchor in ((repo_raw, "repo"),):
+            previous = b"/"
+            for prefix in stage3_raw_prefixes(raw_path):
+                if prefix not in held:
+                    edge_role = (
+                        "ordinary-F"
+                        if prefix == root_raw
+                        else anchor
+                        if prefix == raw_path
+                        else None
+                    )
+                    edges.append(("edge", edge_role, prefix.rsplit(b"/", 1)[-1], previous, prefix, f"open-prefix:{prefix.decode('ascii')}"))
+                    held.add(prefix)
+                previous = prefix
+        if vendor_raw in held or not vendor_raw.startswith(repo_raw + b"/"):
+            raise SystemExit("stage3 vendor lineage is not a strict repo suffix")
+        edges.append(("edge", "vendor", b"vendor", repo_raw, vendor_raw, f"open-prefix:{vendor_raw.decode('ascii')}"))
+        held.add(vendor_raw)
+        for raw_path, anchor in ((stable_raw, "stable"), (nightly_raw, "nightly")):
+            previous = b"/"
+            for prefix in stage3_raw_prefixes(raw_path):
+                if prefix not in held:
+                    edge_role = anchor if prefix == raw_path else None
+                    edges.append(("edge", edge_role, prefix.rsplit(b"/", 1)[-1], previous, prefix, f"open-prefix:{prefix.decode('ascii')}"))
+                    held.add(prefix)
+                elif prefix != b"/":
+                    cache_role = "cache-F" if prefix == root_raw else "cache-shared"
+                    edges.append(("cache", cache_role, prefix.rsplit(b"/", 1)[-1], previous, prefix, ""))
+                previous = prefix
+        return edges
+
+    stage3_a1_expected_g1 = None
+    stage3_a1_expected_edges = None
+    stage3_a1_expected_bindings = None
+    stage3_a1_failure_sites = ("root", "ordinary-F", "repo", "vendor", "stable", "nightly")
+    stage3_a1_base_failure_variants = (
+        "return-True",
+        "return-IntSubclass",
+        "return-negative",
+        "collision-borrowed-L",
+        "collision-borrowed-P",
+        "collision-private-L",
+        "collision-private-P",
+        "ENFILE",
+        "EMFILE-rlimit-same",
+        "EMFILE-rlimit-drift",
+        "KeyboardInterrupt",
+    )
     stage3_c0_cases = []
     for item in sorted(stage3_constants | stage3_callables):
         stage3_c0_cases.append(
@@ -3484,6 +4503,125 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             raise SystemExit("stage3 literal abs preimage mismatch")
 
         stage3_root_bytes = os.fsencode(stage3_root)
+        stage3_a1_expected_g1 = stage3_a1_graph_events(
+            stage3_root_bytes,
+            os.fsencode(repo3),
+            os.fsencode(vendor3),
+            os.fsencode(stable3),
+            os.fsencode(nightly3),
+        )
+        stage3_a1_expected_edges = stage3_a1_graph_edges(
+            stage3_root_bytes,
+            os.fsencode(repo3),
+            os.fsencode(vendor3),
+            os.fsencode(stable3),
+            os.fsencode(nightly3),
+        )
+        stage3_a1_expected_bindings = [
+            token
+            for edge in stage3_a1_expected_edges
+            if edge[0] != "cache"
+            for token in (
+                [f"bind-held-fstat:{edge[4].decode('ascii')}"]
+                if edge[0] == "root"
+                else [
+                    f"bind-held-fstat:{edge[4].decode('ascii')}",
+                    f"bind-parent-name-stat:{edge[4].decode('ascii')}",
+                ]
+            )
+        ]
+        stage3_a1_site_edges = {
+            edge[1]: sum(
+                earlier[0] != "cache"
+                for earlier in stage3_a1_expected_edges[:index]
+            )
+            for index, edge in enumerate(stage3_a1_expected_edges)
+            if edge[1] in stage3_a1_failure_sites
+        }
+        if tuple(stage3_a1_site_edges) != stage3_a1_failure_sites:
+            raise SystemExit("stage3a1 acquisition sites drifted")
+        stage3_a1_failure_matrix = tuple(
+            (site, variant)
+            for site in stage3_a1_failure_sites
+            for variant in stage3_a1_base_failure_variants
+            + tuple(
+                f"collision-owned-G{index}"
+                for index in range(stage3_a1_site_edges[site])
+            )
+        )
+        if len(stage3_a1_failure_matrix) != len(set(stage3_a1_failure_matrix)):
+            raise SystemExit("stage3a1 acquisition failure matrix drifted")
+        stage3_a1_cache_f_edges = [
+            edge
+            for edge in stage3_a1_expected_edges
+            if edge[0] == "cache" and edge[1] == "cache-F"
+        ]
+        if len(stage3_a1_cache_f_edges) != 2:
+            raise SystemExit("stage3a1 fixture root cache reuse drifted")
+        held_prefixes = set(stage3_raw_prefixes(os.fsencode(repo3)))
+        held_prefixes.add(b"/")
+        held_prefixes.add(os.fsencode(vendor3))
+        expected_cache_prefixes = []
+        for anchor_path in (os.fsencode(stable3), os.fsencode(nightly3)):
+            for prefix in stage3_raw_prefixes(anchor_path):
+                if prefix in held_prefixes:
+                    expected_cache_prefixes.append(prefix)
+                else:
+                    held_prefixes.add(prefix)
+        actual_cache_prefixes = [
+            edge[4] for edge in stage3_a1_expected_edges if edge[0] == "cache"
+        ]
+        if actual_cache_prefixes != expected_cache_prefixes:
+            raise SystemExit("stage3a1 shared-prefix cache order drifted")
+        stage3_a1_g1_mutations = []
+        for event_index, token in enumerate(stage3_a1_expected_g1[:-1]):
+            if token.startswith("edge-pre-stat:"):
+                prefix = token.split(":", 1)[1]
+                held_index = stage3_a1_expected_g1.index(f"held-fstat:{prefix}")
+                stage3_a1_g1_mutations.extend(
+                    ((event_index, "error", event_index, None), (event_index, "mismatch", held_index, None))
+                )
+            elif token.startswith("held-fstat:"):
+                stage3_a1_g1_mutations.append((event_index, "error", event_index, None))
+                stage3_a1_g1_mutations.append(
+                    (
+                        event_index,
+                        "root-mismatch" if token == "held-fstat:/" else "mismatch",
+                        event_index,
+                        None,
+                    )
+                )
+                raw_prefix = token.split(":", 1)[1]
+                pre_index = (
+                    None
+                    if raw_prefix == "/"
+                    else stage3_a1_expected_g1.index(f"edge-pre-stat:{raw_prefix}")
+                )
+                stage3_a1_g1_mutations.append(
+                    (event_index, "private-alias", event_index, pre_index)
+                )
+            elif token.startswith("cache-held-fstat:") or token.startswith("cache-binding-stat:"):
+                stage3_a1_g1_mutations.extend(
+                    ((event_index, "error", event_index, None), (event_index, "mismatch", event_index, None))
+                )
+        stage3_a1_lineage_mutations = []
+        for site, source in (
+            ("vendor", os.fsencode(repo3)),
+            ("stable", os.fsencode(vendor3)),
+            ("nightly", os.fsencode(stable3)),
+        ):
+            edge = next(edge for edge in stage3_a1_expected_edges if edge[1] == site)
+            raw_prefix = edge[4].decode("ascii")
+            pre_index = stage3_a1_expected_g1.index(f"edge-pre-stat:{raw_prefix}")
+            held_index = stage3_a1_expected_g1.index(f"held-fstat:{raw_prefix}")
+            stage3_a1_lineage_mutations.append(
+                (pre_index, held_index, source, held_index + 1)
+            )
+        stage3_a1_gb_mutations = tuple(
+            (index, variant)
+            for index in range(len(stage3_a1_expected_bindings))
+            for variant in ("error", "mismatch")
+        )
         stage3_link_path = os.path.join(repo3, "link")
         os.unlink(stage3_link_path)
         no_symlink_objects = expected_objects - {(b"repo/link", "symlink", 0o777)}
@@ -3579,6 +4717,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     else:
                         case_borrowed = base_borrowed if standard_borrowed else stored_borrowed
                     try:
+                        if stage3_case is None:
+                            stage3_case = ("stage3a1-positive",)
                         run_case(
                             label,
                             expected,
@@ -3620,6 +4760,80 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     finally:
                         if case_ledger_fd is not None:
                             os.close(case_ledger_fd)
+                for site, variant in stage3_a1_failure_matrix:
+                    expected = (
+                        SystemExit
+                        if variant == "EMFILE-rlimit-same"
+                        else KeyboardInterrupt
+                        if variant == "KeyboardInterrupt"
+                        else module.MutationError
+                    )
+                    run_case(
+                        f"stage3a1-{site}-{variant}",
+                        expected,
+                        borrowed=base_borrowed,
+                        full_a2=True,
+                        stage3_case=("stage3a1-failure", site, variant),
+                    )
+                for event_index, variant, stop_index, companion_index in stage3_a1_g1_mutations:
+                    run_case(
+                        f"stage3a1-g1-{event_index}-{variant}",
+                        module.MutationError,
+                        borrowed=base_borrowed,
+                        full_a2=True,
+                        stage3_case=(
+                            "stage3a1-g1-mutation",
+                            event_index,
+                            variant,
+                            stop_index,
+                            companion_index,
+                        ),
+                    )
+                for pre_index, held_index, source, stop_index in stage3_a1_lineage_mutations:
+                    run_case(
+                        f"stage3a1-lineage-{pre_index}-{held_index}",
+                        module.MutationError,
+                        borrowed=base_borrowed,
+                        full_a2=True,
+                        stage3_case=(
+                            "stage3a1-lineage-mutation",
+                            pre_index,
+                            held_index,
+                            source,
+                            stop_index,
+                        ),
+                    )
+                for binding_index, variant in stage3_a1_gb_mutations:
+                    run_case(
+                        f"stage3a1-gb-{binding_index}-{variant}",
+                        module.MutationError,
+                        borrowed=base_borrowed,
+                        full_a2=True,
+                        stage3_case=("stage3a1-gb-mutation", binding_index, variant),
+                    )
+                for label, site, variant, options, expected in (
+                    ("emfile-fp-failure", "vendor", "EMFILE-rlimit-same", {"safe_failure": "FP"}, module.MutationError),
+                    ("emfile-fb-failure", "vendor", "EMFILE-rlimit-same", {"safe_failure": "FB"}, module.MutationError),
+                    ("emfile-gb-failure", "vendor", "EMFILE-rlimit-same", {"safe_failure": "GB"}, module.MutationError),
+                    ("mutation-fb-failure", "vendor", "ENFILE", {"safe_failure": "FB-KI"}, module.MutationError),
+                    ("keyboardinterrupt-close-failure", "vendor", "KeyboardInterrupt", {"close_failure": "parent"}, module.MutationError),
+                    ("mutation-close-failure", "vendor", "ENFILE", {"close_failure": "parent"}, module.MutationError),
+                    ("refusal-close-failure", "vendor", "EMFILE-rlimit-same", {"close_failure": "parent"}, module.MutationError),
+                ):
+                    run_case(
+                        f"stage3a1-{label}",
+                        expected,
+                        borrowed=base_borrowed,
+                        full_a2=True,
+                        stage3_case=("stage3a1-failure", site, variant, options),
+                    )
+                run_case(
+                    "stage3a1-success-close-failure",
+                    module.MutationError,
+                    borrowed=base_borrowed,
+                    full_a2=True,
+                    stage3_case=("stage3a1-positive", {"close_failure": "parent"}),
+                )
             finally:
                 stage3_ready = False
                 (

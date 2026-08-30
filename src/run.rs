@@ -450,6 +450,16 @@ impl OwnedChild {
         self.wait_blocking()
     }
 
+    fn reap_after_escalation(&mut self) -> io::Result<i32> {
+        match self.wait_for(Some(Duration::from_secs(5)), false)? {
+            ChildOutcome::Exited(code) => Ok(code),
+            ChildOutcome::TimedOutRunning => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "child reap timeout",
+            )),
+        }
+    }
+
     pub(crate) fn still_running(&self) -> bool {
         !self.reaped && self.pin.still_the_same()
     }
@@ -993,7 +1003,7 @@ fn settle_after_signal_with_grace(
             match child.forward_signal(libc::SIGINT) {
                 Ok(ForwardAction::Escalated) => {
                     return child
-                        .kill_and_reap_tail()
+                        .reap_after_escalation()
                         .map(ChildOutcome::Exited)
                         .map_err(|error| anyhow!("run: settling after signal: {error}"));
                 }
@@ -2588,6 +2598,37 @@ mod tests {
                 .unwrap(),
             128 + libc::SIGKILL
         );
+    }
+
+    #[test]
+    fn reap_only_after_escalated_signal_reaps_pidfd_ready_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let mut child = spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                &format!("trap '' INT; : > {}; while :; do :; done", ready.display()),
+            ],
+        );
+        child.release().unwrap();
+        wait_until(|| ready.exists(), "the SIGINT fixture never became ready");
+
+        assert_eq!(
+            child.forward_signal(libc::SIGINT).unwrap(),
+            ForwardAction::Forwarded
+        );
+        assert_eq!(
+            child.forward_signal(libc::SIGINT).unwrap(),
+            ForwardAction::Escalated
+        );
+        wait_until(
+            || child.pin.wait_ready(Some(Duration::ZERO)).unwrap(),
+            "the escalated child pidfd never became ready",
+        );
+
+        assert_eq!(child.reap_after_escalation().unwrap(), 128 + libc::SIGKILL);
+        assert!(child.is_reaped());
     }
 
     #[test]

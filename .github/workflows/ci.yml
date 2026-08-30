@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.88 --profile minimal --component rustfmt,clippy
-      - run: rustup toolchain install nightly --profile minimal --component rust-src
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       # bpf-linker 0.10.4 (default feature rust-llvm-22) proxies to the LLVM bundled with the
       # toolchain that runs it (nightly); no system LLVM is needed at build time.
       - run: cargo +1.88 install bpf-linker --version 0.10.4 --locked

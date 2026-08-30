@@ -830,6 +830,14 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             or case[0].startswith("continue-")
         )
 
+    def stage3_custody_commands(state):
+        if "rlimit-baseline" not in state["events"]:
+            return fcntl.F_GETFL, fcntl.F_GETFD
+        return (
+            state["constant_values"][("fcntl", "F_GETFL")],
+            state["constant_values"][("fcntl", "F_GETFD")],
+        )
+
     def stage3_authorized_call(namespace, name, arguments, arguments_by_name):
         state = stage3_c0_state
         if state is None or state["a2_complete"] == 0:
@@ -840,8 +848,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             return None
         if namespace == "fcntl" and name == "fcntl" and len(arguments) >= 2:
             fd, command = arguments[:2]
-            getfl = state["constant_values"].get(("fcntl", "F_GETFL"), fcntl.F_GETFL)
-            getfd = state["constant_values"].get(("fcntl", "F_GETFD"), fcntl.F_GETFD)
+            getfl, getfd = stage3_custody_commands(state)
             if fd == state["borrowed_ledger_fd"] and command == getfl and state["final_custody"] == 0:
                 return "borrowed-L-getfl"
             if fd == state["borrowed_parent_fd"] and state["final_custody"] == 1:
@@ -890,8 +897,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     and self.name == "fcntl"
                     and len(arguments) >= 2
                     and arguments[0] == state["borrowed_ledger_fd"]
-                    and arguments[1]
-                    == state["constant_values"].get(("fcntl", "F_GETFL"), fcntl.F_GETFL)
+                    and arguments[1] == stage3_custody_commands(state)[0]
                 )
             ):
                 state["intervening"] += 1
@@ -905,8 +911,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             if self.namespace == "fcntl" and self.name == "fcntl" and state is not None:
                 fd = arguments[0] if len(arguments) >= 1 else None
                 command = arguments[1] if len(arguments) >= 2 else None
-                observed_getfl = state["constant_values"].get(("fcntl", "F_GETFL"), fcntl.F_GETFL)
-                observed_getfd = state["constant_values"].get(("fcntl", "F_GETFD"), fcntl.F_GETFD)
+                observed_getfl, observed_getfd = stage3_custody_commands(state)
                 if (
                     state["a2_complete"] == 1
                     and fd == state["borrowed_ledger_fd"]

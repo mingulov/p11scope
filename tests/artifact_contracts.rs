@@ -5672,3 +5672,59 @@ int main(int argc, char **argv) {
         .expect("signal recorded work path");
     assert!(!std::path::Path::new(signal_work).exists());
 }
+
+#[test]
+fn escalated_signal_wiring_is_reap_only_and_bounded() {
+    let run = read("src/run.rs");
+    let escalated = between(
+        &run,
+        "Ok(ForwardAction::Escalated) => {",
+        "Ok(ForwardAction::Forwarded)",
+    );
+    assert_eq!(
+        escalated.matches(".reap_after_escalation()").count(),
+        1,
+        "the escalated branch must settle its child with reap_after_escalation",
+    );
+    assert_eq!(
+        escalated
+            .matches("child\n                        .reap_after_escalation()")
+            .count(),
+        1,
+        "the escalated branch must have one reap-only child settlement call",
+    );
+    for forbidden in [
+        "kill_and_reap_tail",
+        "forward_signal",
+        "ensure_active_generation",
+        "signal_group",
+    ] {
+        assert!(
+            !escalated.contains(forbidden),
+            "escalated branch contains forbidden action {forbidden:?}",
+        );
+    }
+
+    let reap = between(
+        &run,
+        "fn reap_after_escalation(&mut self) -> io::Result<i32> {",
+        "\n    pub(crate) fn still_running",
+    );
+    assert_eq!(
+        reap.matches("self.wait_for(Some(Duration::from_secs(5)), false)?")
+            .count(),
+        1,
+        "reap_after_escalation must use one bounded existing wait_for",
+    );
+    for forbidden in [
+        "kill_and_reap_tail",
+        "forward_signal",
+        "ensure_active_generation",
+        "signal_group",
+    ] {
+        assert!(
+            !reap.contains(forbidden),
+            "reap_after_escalation contains forbidden action {forbidden:?}",
+        );
+    }
+}

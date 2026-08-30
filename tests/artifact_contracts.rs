@@ -5676,6 +5676,14 @@ int main(int argc, char **argv) {
 #[test]
 fn escalated_signal_wiring_is_reap_only_and_bounded() {
     let run = read("src/run.rs");
+    let forbidden_actions = [
+        "kill_and_reap_tail",
+        "forward_signal",
+        "ensure_active_generation",
+        "signal_group",
+        "terminate_and_reap",
+        "terminate_with_grace",
+    ];
     let escalated = between(
         &run,
         "Ok(ForwardAction::Escalated) => {",
@@ -5686,19 +5694,7 @@ fn escalated_signal_wiring_is_reap_only_and_bounded() {
         1,
         "the escalated branch must settle its child with reap_after_escalation",
     );
-    assert_eq!(
-        escalated
-            .matches("child\n                        .reap_after_escalation()")
-            .count(),
-        1,
-        "the escalated branch must have one reap-only child settlement call",
-    );
-    for forbidden in [
-        "kill_and_reap_tail",
-        "forward_signal",
-        "ensure_active_generation",
-        "signal_group",
-    ] {
+    for forbidden in forbidden_actions {
         assert!(
             !escalated.contains(forbidden),
             "escalated branch contains forbidden action {forbidden:?}",
@@ -5716,12 +5712,7 @@ fn escalated_signal_wiring_is_reap_only_and_bounded() {
         1,
         "reap_after_escalation must use one bounded existing wait_for",
     );
-    for forbidden in [
-        "kill_and_reap_tail",
-        "forward_signal",
-        "ensure_active_generation",
-        "signal_group",
-    ] {
+    for forbidden in forbidden_actions {
         assert!(
             !reap.contains(forbidden),
             "reap_after_escalation contains forbidden action {forbidden:?}",

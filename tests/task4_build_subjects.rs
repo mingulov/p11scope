@@ -756,6 +756,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             ("supports_dir_fd", "readlink"),
         }
     )
+    stage3_support_wrapper_targets = []
 
     def stage3_maybe_inventory():
         state = stage3_c0_state
@@ -998,6 +999,10 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
 
         def __contains__(self, candidate):
             target = candidate.target if isinstance(candidate, Stage3Callable) else candidate
+            for wrapper, native in stage3_support_wrapper_targets:
+                if target is wrapper:
+                    target = native
+                    break
             result = target in self.target
             function_name = candidate.name if isinstance(candidate, Stage3Callable) else getattr(candidate, "__name__", None)
             item = (self.name, function_name)
@@ -1493,6 +1498,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         stage2_positive["events"].append("open-P")
         return value
 
+    stage3_support_wrapper_targets.append((stage2_positive_open, real_open))
+
     def stage2_positive_pread(fd, size, offset):
         owned = set(stage2_positive["owned"])
         if stage2_positive["started"] and (
@@ -1963,6 +1970,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             else:
                 state["events"].append("open-P")
             return value
+
+        stage3_support_wrapper_targets.append((wrapped_open, real_open))
 
         def wrapped_fstat(fd):
             if unowned_stub(fd):

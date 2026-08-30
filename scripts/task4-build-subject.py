@@ -1766,11 +1766,13 @@ def run_reconciled_build(
     stage2_failure = None
     stage2_capability = False
     owned_fds = []
+    first_close_failure = None
     private_ledger_fd = None
     private_parent_owned_fd = None
     graph_nodes = []
     graph_cache = {}
     graph_body_outcome = None
+    graph_body_exception = None
     owned_os_close = borrowed_os_close
     stage3_ready = False
     duplicate_command = getattr(fcntl, "F_DUPFD_CLOEXEC", None)
@@ -2104,6 +2106,7 @@ def run_reconciled_build(
                     "parent": parent,
                     "name": None if parent is None else name,
                     "structural": held,
+                    "kind": "directory",
                 }
                 graph_nodes.append(node)
                 if parent is not None:
@@ -2224,12 +2227,367 @@ def run_reconciled_build(
             except _Stage3CapacityRefusal:
                 graph_body_outcome = "capacity"
                 stage2_capability = True
-            except MutationError as exc:
+            except Exception as exc:
                 graph_body_outcome = "mutation"
                 if stage2_failure is None:
-                    stage2_failure = exc
+                    stage2_failure = (
+                        exc
+                        if isinstance(exc, MutationError)
+                        else MutationError("stage3 graph acquisition failed")
+                    )
+            except BaseException as exc:
+                graph_body_outcome = "arbitrary"
+                graph_body_exception = exc
             else:
-                graph_body_outcome = "success"
+                try:
+                    # Stage 3A2 retains only the present regular/directory
+                    # evidence rows.  Symlink and absence closure belongs to
+                    # the later substage.
+                    evidence_rows = [
+                        record
+                        for record in records
+                        if record.result == "present"
+                        and record.klass != "symlink"
+                        and record.klass != "absent"
+                    ]
+                    if not evidence_rows:
+                        raise MutationError("stage3 evidence rows are absent")
+
+                    def locator_parts(record):
+                        raw = record.locator.encode("utf-8")
+                        if raw.startswith(b"repo:/"):
+                            base = repo_node["parts"]
+                            tail = raw[len(b"repo:/") :]
+                        elif raw.startswith(b"vendor:/"):
+                            base = vendor_node["parts"]
+                            tail = raw[len(b"vendor:/") :]
+                        elif raw.startswith(b"external:/"):
+                            base = ()
+                            tail = raw[len(b"external:/") :]
+                        else:
+                            raise MutationError("stage3 evidence locator namespace changed")
+                        suffix = tuple(part for part in tail.split(b"/") if part)
+                        return base + suffix if base else suffix
+
+                    def class_for_path(record, parts, kind):
+                        if kind == "directory":
+                            return "directory"
+                        if _beneath(parts, vendor_node["parts"]):
+                            return "vendor"
+                        if _beneath(parts, repo_node["parts"]):
+                            return "repo"
+                        if _beneath(parts, stable_node["parts"]):
+                            return "stable-sysroot"
+                        if _beneath(parts, nightly_node["parts"]):
+                            return "nightly-sysroot"
+                        return record.klass
+
+                    def validate_class(record, parts, kind):
+                        expected = class_for_path(record, parts, kind)
+                        if record.klass != expected:
+                            raise MutationError("stage3 evidence class changed")
+                        if kind == "directory":
+                            if record.access not in {"probe", "enumerate"}:
+                                raise MutationError("stage3 directory access changed")
+                        elif record.access not in {"probe", "read", "execute", "read-execute"}:
+                            raise MutationError("stage3 regular access changed")
+
+                    def open_evidence(name, parent, flags, parts, kind):
+                        try:
+                            candidate = stage3_os_open(
+                                name,
+                                flags,
+                                dir_fd=parent["fd"],
+                            )
+                        except OSError as exc:
+                            if exc.errno != errno.EMFILE:
+                                raise MutationError("stage3 evidence open failed") from exc
+                            try:
+                                current_limit = stage3_getrlimit(stage3_rlimit_nofile)
+                            except Exception as limit_exc:
+                                raise MutationError("stage3 RLIMIT_NOFILE reread failed") from limit_exc
+                            if (
+                                type(current_limit) is not tuple
+                                or len(current_limit) != 2
+                                or any(type(value) is not int or value < 0 for value in current_limit)
+                                or current_limit[0] > current_limit[1]
+                                or current_limit != stage3_rlimit
+                            ):
+                                raise MutationError("stage3 RLIMIT_NOFILE changed")
+                            raise _Stage3CapacityRefusal() from exc
+                        except Exception as exc:
+                            raise MutationError("stage3 evidence open failed") from exc
+                        if (
+                            type(candidate) is not int
+                            or candidate < 0
+                            or candidate in {expected_ledger_fd, private_parent_fd}
+                            or candidate in owned_fds
+                        ):
+                            raise MutationError("stage3 evidence open returned an invalid descriptor")
+                        owned_fds.append(candidate)
+                        return {
+                            "parts": parts,
+                            "fd": candidate,
+                            "parent": parent,
+                            "name": name,
+                            "structural": None,
+                            "kind": kind,
+                            "identity": None,
+                        }
+
+                    def promote(node, value, kind):
+                        if node["identity"] is not None or node["structural"] is not None:
+                            raise MutationError("stage3 evidence node promoted twice")
+                        if kind == "regular":
+                            valid_kind = _stat.S_ISREG(value.st_mode)
+                        elif kind == "directory":
+                            valid_kind = _stat.S_ISDIR(value.st_mode)
+                        else:
+                            raise MutationError("stage3 evidence node kind changed")
+                        structural = _structural(value)
+                        if not valid_kind or structural == private_parent_structural:
+                            raise MutationError("stage3 evidence node is not disjoint")
+                        node["identity"] = _identity(value)
+                        node["structural"] = structural
+                        graph_nodes.append(node)
+                        graph_cache[(node["parent"]["fd"], node["name"])] = node
+
+                    def parent_for(parts):
+                        parent_parts = parts[:-1]
+                        for node in graph_nodes:
+                            if node["parts"] == parent_parts:
+                                return node
+                        if parent_parts == root_node["parts"]:
+                            return root_node
+                        # The fixture's only non-anchor present parent is
+                        # F/external.  Acquire it with its independent stat,
+                        # open, and fstat bracket.
+                        for held_parent in graph_nodes:
+                            if (
+                                len(parent_parts) == len(held_parent["parts"]) + 1
+                                and parent_parts[:-1] == held_parent["parts"]
+                            ):
+                                name = parent_parts[-1]
+                                try:
+                                    before_value = stage3_os_stat(
+                                        name,
+                                        dir_fd=held_parent["fd"],
+                                        follow_symlinks=False,
+                                    )
+                                except Exception as exc:
+                                    raise MutationError("stage3 evidence parent stat failed") from exc
+                                if not _stat.S_ISDIR(before_value.st_mode):
+                                    raise MutationError("stage3 evidence parent is not a directory")
+                                return open_owned_directory(
+                                    name,
+                                    held_parent,
+                                    _structural(before_value),
+                                    parent_parts,
+                                )
+                        raise MutationError("stage3 evidence parent is not held")
+
+                    def note_failure(current, exc):
+                        if current is None:
+                            return exc
+                        return current
+
+                    def regular_evidence(record, parts, parent, name):
+                        node = open_evidence(
+                            name,
+                            parent,
+                            stage3_o_rdonly | stage3_o_cloexec | stage3_o_nofollow,
+                            parts,
+                            "regular",
+                        )
+                        failure = None
+                        pre_value = None
+                        try:
+                            pre_value = stage3_os_fstat(node["fd"])
+                            if (
+                                not _stat.S_ISREG(pre_value.st_mode)
+                                or pre_value.st_nlink < 1
+                                or _stat.S_IMODE(pre_value.st_mode) != record.mode
+                                or pre_value.st_size != record.size
+                                or pre_value.st_size > 4_294_967_296
+                            ):
+                                raise MutationError("stage3 regular evidence preimage changed")
+                            promote(node, pre_value, "regular")
+                        except BaseException as exc:
+                            raise exc
+
+                        digest = _hashlib.sha256()
+                        offset = 0
+                        try:
+                            while offset < record.size:
+                                request = min(1024 * 1024, record.size - offset)
+                                chunk = stage3_os_pread(
+                                    node["fd"],
+                                    request,
+                                    offset,
+                                )
+                                if (
+                                    type(chunk) is not bytes
+                                    or not chunk
+                                    or len(chunk) > request
+                                ):
+                                    raise MutationError("stage3 regular evidence read was short")
+                                digest.update(chunk)
+                                offset += len(chunk)
+                        except BaseException as exc:
+                            failure = note_failure(failure, exc)
+
+                        try:
+                            post_value = stage3_os_fstat(node["fd"])
+                            if _identity(post_value) != node["identity"]:
+                                raise MutationError("stage3 regular evidence identity changed")
+                        except BaseException as exc:
+                            failure = note_failure(failure, exc)
+                        if offset != record.size or digest.hexdigest() != record.sha256:
+                            failure = note_failure(
+                                failure,
+                                MutationError("stage3 regular evidence values changed"),
+                            )
+                        if failure is not None:
+                            raise failure
+                        validate_class(record, parts, "regular")
+                        return node
+
+                    def directory_evidence(record, parts, parent, name):
+                        node = open_evidence(
+                            name,
+                            parent,
+                            directory_flags,
+                            parts,
+                            "directory",
+                        )
+                        first_value = stage3_os_fstat(node["fd"])
+                        if (
+                            not _stat.S_ISDIR(first_value.st_mode)
+                            or _stat.S_IMODE(first_value.st_mode) != record.mode
+                        ):
+                            raise MutationError("stage3 directory evidence preimage changed")
+                        promote(node, first_value, "directory")
+
+                        def scan_directory(scan_number):
+                            nonlocal first_close_failure
+                            scan_fd = open_evidence(
+                                b".",
+                                node,
+                                directory_flags,
+                                parts,
+                                "scan",
+                            )
+                            entries = None
+                            failure = None
+                            arbitrary_failure = False
+                            scan_close_failed = False
+                            preimage = None
+                            try:
+                                entries = stage3_os_listdir(scan_fd["fd"])
+                                if type(entries) is not list:
+                                    raise MutationError("stage3 directory listing is not a list")
+                                if len(entries) > 4096:
+                                    raise MutationError("stage3 directory has too many entries")
+                                encoded = []
+                                seen = set()
+                                for entry in entries:
+                                    if type(entry) is not str:
+                                        raise MutationError("stage3 directory entry name changed")
+                                    raw_name = stage3_os_fsencode(entry)
+                                    if (
+                                        type(raw_name) is not bytes
+                                        or not 1 <= len(raw_name) <= 255
+                                        or raw_name in {b".", b".."}
+                                        or b"\0" in raw_name
+                                        or b"/" in raw_name
+                                        or raw_name in seen
+                                    ):
+                                        raise MutationError("stage3 directory entry name changed")
+                                    seen.add(raw_name)
+                                    value = stage3_os_stat(
+                                        raw_name,
+                                        dir_fd=scan_fd["fd"],
+                                        follow_symlinks=False,
+                                    )
+                                    file_type = _stat.S_IFMT(value.st_mode)
+                                    kind = {
+                                        _stat.S_IFREG: b"F",
+                                        _stat.S_IFDIR: b"D",
+                                        _stat.S_IFLNK: b"L",
+                                    }.get(file_type)
+                                    if kind is None:
+                                        raise MutationError("stage3 special directory entry")
+                                    encoded.append(
+                                        (raw_name, kind + len(raw_name).to_bytes(2, "big") + raw_name)
+                                    )
+                                encoded.sort(key=lambda item: item[0])
+                                preimage = b"".join(value for _name, value in encoded)
+                                if len(preimage) > _MAX_BYTES:
+                                    raise MutationError("stage3 directory listing exceeds 4 MiB")
+                            except BaseException as exc:
+                                failure = note_failure(failure, exc)
+                                arbitrary_failure = not isinstance(exc, Exception)
+                            finally:
+                                owned_fds.remove(scan_fd["fd"])
+                                try:
+                                    stage3_os_close(scan_fd["fd"])
+                                except BaseException as exc:
+                                    scan_close_failed = True
+                                    if first_close_failure is None:
+                                        first_close_failure = exc
+                                    if failure is None:
+                                        failure = exc
+                            if arbitrary_failure:
+                                if scan_close_failed:
+                                    raise MutationError("stage3 scan close failed") from first_close_failure
+                                raise failure
+                            try:
+                                value = stage3_os_fstat(node["fd"])
+                                if _identity(value) != node["identity"]:
+                                    raise MutationError("stage3 directory identity changed")
+                            except BaseException as exc:
+                                failure = note_failure(failure, exc)
+                            if scan_close_failed:
+                                raise MutationError("stage3 scan close failed") from first_close_failure
+                            if failure is not None:
+                                raise failure
+                            return preimage
+
+                        first = scan_directory(1)
+                        second = scan_directory(2)
+                        if first != second or len(first) != record.size or _hashlib.sha256(first).hexdigest() != record.sha256:
+                            raise MutationError("stage3 directory evidence values changed")
+                        validate_class(record, parts, "directory")
+                        return node
+
+                    row_nodes = {}
+                    for record in evidence_rows:
+                        parts = locator_parts(record)
+                        if not parts:
+                            raise MutationError("stage3 evidence locator is empty")
+                        parent = parent_for(parts)
+                        name = parts[-1]
+                        if record.klass == "directory":
+                            node = directory_evidence(record, parts, parent, name)
+                        else:
+                            node = regular_evidence(record, parts, parent, name)
+                        row_nodes[record.locator] = node
+                except _Stage3CapacityRefusal:
+                    graph_body_outcome = "capacity"
+                    stage2_capability = True
+                except Exception as exc:
+                    graph_body_outcome = "mutation"
+                    if stage2_failure is None:
+                        stage2_failure = (
+                            exc
+                            if isinstance(exc, MutationError)
+                            else MutationError("stage3 evidence collection failed")
+                        )
+                except BaseException as exc:
+                    graph_body_outcome = "arbitrary"
+                    graph_body_exception = exc
+                else:
+                    graph_body_outcome = "success"
 
         if graph_body_outcome in {"mutation", "capacity"}:
             private_failure = None
@@ -2325,7 +2683,7 @@ def run_reconciled_build(
             if stage2_failure is None and private_failure is not None:
                 stage2_failure = private_failure
 
-        if private_ledger_usable:
+        if graph_body_outcome != "arbitrary" and private_ledger_usable:
             borrowed_ledger_flags = None
             try:
                 borrowed_ledger_flags = borrowed_fcntl(expected_ledger_fd, borrowed_f_getfl)
@@ -2344,7 +2702,7 @@ def run_reconciled_build(
                     raise
                 if stage2_failure is None:
                     stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed ledger fstat failed")
-        else:
+        elif graph_body_outcome != "arbitrary":
             borrowed_ledger_flags_ok = True
             borrowed_ledger_pre = None
             try:
@@ -2386,41 +2744,47 @@ def run_reconciled_build(
                         stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed ledger fstat failed")
 
         borrowed_parent_flags = None
-        try:
-            borrowed_parent_flags = borrowed_fcntl(private_parent_fd, borrowed_f_getfl)
-            if type(borrowed_parent_flags) is not int or borrowed_parent_flags != parent_flags:
-                raise MutationError("borrowed parent flags changed")
-        except BaseException as exc:
-            if not isinstance(exc, Exception) and graph_body_outcome not in {"mutation", "capacity"}:
-                raise
-            if stage2_failure is None:
-                stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed parent F_GETFL failed")
-        try:
-            borrowed_parent_fd_flags = borrowed_fcntl(private_parent_fd, borrowed_f_getfd)
-            if type(borrowed_parent_fd_flags) is not int or borrowed_parent_fd_flags != parent_fd_flags:
-                raise MutationError("borrowed parent descriptor flags changed")
-        except BaseException as exc:
-            if not isinstance(exc, Exception) and graph_body_outcome not in {"mutation", "capacity"}:
-                raise
-            if stage2_failure is None:
-                stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed parent F_GETFD failed")
-        try:
-            if _identity(borrowed_os_fstat(private_parent_fd)) != parent_identity:
-                raise MutationError("borrowed parent identity changed")
-        except BaseException as exc:
-            if not isinstance(exc, Exception) and graph_body_outcome not in {"mutation", "capacity"}:
-                raise
-            if stage2_failure is None:
-                stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed parent fstat failed")
+        if graph_body_outcome != "arbitrary":
+            try:
+                borrowed_parent_flags = borrowed_fcntl(private_parent_fd, borrowed_f_getfl)
+                if type(borrowed_parent_flags) is not int or borrowed_parent_flags != parent_flags:
+                    raise MutationError("borrowed parent flags changed")
+            except BaseException as exc:
+                if not isinstance(exc, Exception) and graph_body_outcome not in {"mutation", "capacity"}:
+                    raise
+                if stage2_failure is None:
+                    stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed parent F_GETFL failed")
+            try:
+                borrowed_parent_fd_flags = borrowed_fcntl(private_parent_fd, borrowed_f_getfd)
+                if type(borrowed_parent_fd_flags) is not int or borrowed_parent_fd_flags != parent_fd_flags:
+                    raise MutationError("borrowed parent descriptor flags changed")
+            except BaseException as exc:
+                if not isinstance(exc, Exception) and graph_body_outcome not in {"mutation", "capacity"}:
+                    raise
+                if stage2_failure is None:
+                    stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed parent F_GETFD failed")
+            try:
+                if _identity(borrowed_os_fstat(private_parent_fd)) != parent_identity:
+                    raise MutationError("borrowed parent identity changed")
+            except BaseException as exc:
+                if not isinstance(exc, Exception) and graph_body_outcome not in {"mutation", "capacity"}:
+                    raise
+                if stage2_failure is None:
+                    stage2_failure = exc if isinstance(exc, MutationError) else MutationError("borrowed parent fstat failed")
 
-        if graph_body_outcome is not None:
+        if graph_body_outcome in {"success", "mutation", "capacity"}:
             for node in graph_nodes:
+                expected_identity = node.get("identity")
                 try:
                     value = stage3_os_fstat(node["fd"])
-                    if (
-                        not _stat.S_ISDIR(value.st_mode)
-                        or _structural(value) != node["structural"]
-                    ):
+                    if expected_identity is None:
+                        valid = (
+                            _stat.S_ISDIR(value.st_mode)
+                            and _structural(value) == node["structural"]
+                        )
+                    else:
+                        valid = _identity(value) == expected_identity
+                    if not valid:
                         raise MutationError("stage3 held directory binding changed")
                 except BaseException as exc:
                     if (
@@ -2441,10 +2805,14 @@ def run_reconciled_build(
                             dir_fd=node["parent"]["fd"],
                             follow_symlinks=False,
                         )
-                        if (
-                            not _stat.S_ISDIR(value.st_mode)
-                            or _structural(value) != node["structural"]
-                        ):
+                        if expected_identity is None:
+                            valid = (
+                                _stat.S_ISDIR(value.st_mode)
+                                and _structural(value) == node["structural"]
+                            )
+                        else:
+                            valid = _identity(value) == expected_identity
+                        if not valid:
                             raise MutationError("stage3 directory edge binding changed")
                     except BaseException as exc:
                         if (
@@ -2460,17 +2828,18 @@ def run_reconciled_build(
                             )
 
     finally:
-        close_failure = None
         for owned_fd in reversed(owned_fds):
             try:
                 owned_os_close(owned_fd)
             except BaseException as exc:
-                if close_failure is None:
-                    close_failure = exc
-        if close_failure is not None:
-            raise MutationError("owned descriptor close failed") from close_failure
+                if first_close_failure is None:
+                    first_close_failure = exc
+        if first_close_failure is not None:
+            raise MutationError("owned descriptor close failed") from first_close_failure
     if stage2_failure is not None:
         raise stage2_failure
+    if graph_body_exception is not None:
+        raise graph_body_exception
     if stage2_capability:
         raise SystemExit(77)
     raise SystemExit(77)

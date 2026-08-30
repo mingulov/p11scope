@@ -472,14 +472,16 @@ fn input_v1_discovery_api_is_candidate_only() {
             "deferred argv changed the isolated project tree"
         );
     }
-    let driver = r#"
+    let driver = r##"
 import contextlib
 import errno
 import fcntl
+import hashlib
 import importlib.util
 import inspect
 import io
 import os
+import resource
 import stat
 import tempfile
 import sys
@@ -715,7 +717,495 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
 
     MISSING = object()
 
-    def run_case(label, expected, overrides=None, patches=(), borrowed=(), postcheck=None, custody=None):
+    deferred_full_a2 = []
+    stage3_ready = False
+    stage3_c0_state = None
+    stage3_constants = frozenset(
+        {
+            ("os", "O_RDONLY"),
+            ("os", "O_CLOEXEC"),
+            ("os", "O_NOFOLLOW"),
+            ("os", "O_DIRECTORY"),
+            ("os", "O_PATH"),
+            ("os", "O_ACCMODE"),
+            ("fcntl", "FD_CLOEXEC"),
+            ("fcntl", "F_GETFD"),
+            ("fcntl", "F_GETFL"),
+            ("resource", "RLIMIT_NOFILE"),
+        }
+    )
+    stage3_callables = frozenset(
+        {
+            ("os", "open"),
+            ("os", "stat"),
+            ("os", "listdir"),
+            ("os", "fstat"),
+            ("os", "pread"),
+            ("os", "close"),
+            ("os", "readlink"),
+            ("fcntl", "fcntl"),
+            ("resource", "getrlimit"),
+        }
+    )
+    stage3_supports = frozenset(
+        {
+            ("supports_dir_fd", "open"),
+            ("supports_dir_fd", "stat"),
+            ("supports_follow_symlinks", "stat"),
+            ("supports_fd", "listdir"),
+            ("supports_dir_fd", "readlink"),
+        }
+    )
+
+    def stage3_maybe_inventory():
+        state = stage3_c0_state
+        required_constants = stage3_constants if state is None else state["required_constants"]
+        required_callables = stage3_callables if state is None else state["required_callables"]
+        required_supports = stage3_supports if state is None else state["required_supports"]
+        values = {} if state is None else state["constant_values"]
+        open_flag_names = ["O_CLOEXEC", "O_NOFOLLOW", "O_DIRECTORY"]
+        if ("os", "O_PATH") in required_constants:
+            open_flag_names.append("O_PATH")
+        open_flags = [
+            values.get(("os", name))
+            for name in open_flag_names
+        ]
+        constants_valid = (
+            state is not None
+            and not state["inventory_closed"]
+            and all(type(value) is int for value in values.values())
+            and values.get(("os", "O_RDONLY")) == 0
+            and type(values.get(("os", "O_ACCMODE"))) is int
+            and values.get(("os", "O_ACCMODE"), 0) > 0
+            and all(type(value) is int and value > 0 for value in open_flags)
+            and all(
+                left & right == 0
+                for index, left in enumerate(open_flags)
+                for right in open_flags[index + 1 :]
+            )
+            and all(value & values[("os", "O_ACCMODE")] == 0 for value in open_flags)
+            and type(values.get(("fcntl", "FD_CLOEXEC"))) is int
+            and values.get(("fcntl", "FD_CLOEXEC"), 0) > 0
+            and type(values.get(("fcntl", "F_GETFD"))) is int
+            and values.get(("fcntl", "F_GETFD"), -1) >= 0
+            and type(values.get(("fcntl", "F_GETFL"))) is int
+            and values.get(("fcntl", "F_GETFL"), -1) >= 0
+            and values.get(("fcntl", "F_GETFD")) != values.get(("fcntl", "F_GETFL"))
+            and type(values.get(("resource", "RLIMIT_NOFILE"))) is int
+            and values.get(("resource", "RLIMIT_NOFILE"), -1) >= 0
+        )
+        if (
+            state is not None
+            and state["events"] == ["a2-complete"]
+            and set(state["constants"]) == required_constants
+            and set(state["callables"]) == required_callables
+            and set(state["supports"]) == required_supports
+            and all(count == 1 for count in state["constants"].values())
+            and all(count == 1 for count in state["callables"].values())
+            and all(count == 1 for count in state["supports"].values())
+            and state["inventory_valid"]
+            and constants_valid
+        ):
+            state["events"].append("capability-inventory")
+
+    def stage3_record(domain, item, value):
+        state = stage3_c0_state
+        if state is None or state["events"] != ["a2-complete"]:
+            return
+        counts = state[domain]
+        counts[item] = counts.get(item, 0) + 1
+        if domain == "constants":
+            state["constant_values"][item] = value
+            state["inventory_valid"] &= type(value) is int
+        elif domain == "callables":
+            state["inventory_valid"] &= callable(value)
+        else:
+            state["inventory_valid"] &= value is True
+        stage3_maybe_inventory()
+
+    def stage3_case_is_continuation(case):
+        return case is not None and (
+            case[0] == "missing-O_PATH-no-symlink-continue"
+            or case[0].startswith("continue-")
+        )
+
+    def stage3_authorized_call(namespace, name, arguments, arguments_by_name):
+        state = stage3_c0_state
+        if state is None or state["a2_complete"] == 0:
+            return None
+        if namespace == "resource" and name == "getrlimit":
+            if state["events"] == ["a2-complete", "capability-inventory"]:
+                return "resource-getrlimit"
+            return None
+        if namespace == "fcntl" and name == "fcntl" and len(arguments) >= 2:
+            fd, command = arguments[:2]
+            getfl = state["constant_values"].get(("fcntl", "F_GETFL"), fcntl.F_GETFL)
+            getfd = state["constant_values"].get(("fcntl", "F_GETFD"), fcntl.F_GETFD)
+            if fd == state["borrowed_ledger_fd"] and command == getfl and state["final_custody"] == 0:
+                return "borrowed-L-getfl"
+            if fd == state["borrowed_parent_fd"] and state["final_custody"] == 1:
+                if command == getfl:
+                    return "borrowed-P-getfl"
+                if command == getfd:
+                    return "borrowed-P-getfd"
+            return None
+        if namespace == "os" and name == "fstat" and len(arguments) == 1 and not arguments_by_name:
+            if state["final_custody"] == 1:
+                if arguments[0] == state["borrowed_ledger_fd"]:
+                    return "borrowed-L-fstat"
+                if arguments[0] == state["borrowed_parent_fd"]:
+                    return "borrowed-P-fstat"
+            return None
+        if namespace == "os" and name == "close" and len(arguments) == 1 and not arguments_by_name:
+            if state["final_custody"] == 1:
+                if arguments[0] == state["private_parent_fd"]:
+                    return "close-P"
+                if arguments[0] == state["private_ledger_fd"]:
+                    return "close-L"
+        return None
+
+    class Stage3Callable:
+        def __init__(self, namespace, name, target):
+            self.namespace = namespace
+            self.name = name
+            self.target = target
+
+        def __call__(self, *arguments, **arguments_by_name):
+            state = stage3_c0_state
+            call_label = stage3_authorized_call(
+                self.namespace, self.name, arguments, arguments_by_name
+            )
+            if state is not None and state["a2_complete"] == 1:
+                if call_label is None:
+                    state["unauthorized_calls"].append((self.namespace, self.name))
+                else:
+                    state["post_a2_calls"].append(call_label)
+            if (
+                state is not None
+                and state["events"]
+                == ["a2-complete", "capability-inventory", "rlimit-baseline"]
+                and not (
+                    self.namespace == "fcntl"
+                    and self.name == "fcntl"
+                    and len(arguments) >= 2
+                    and arguments[0] == state["borrowed_ledger_fd"]
+                    and arguments[1]
+                    == state["constant_values"].get(("fcntl", "F_GETFL"), fcntl.F_GETFL)
+                )
+            ):
+                state["intervening"] += 1
+            if self.namespace == "os" and self.name == "open" and state is not None:
+                if state["a2_complete"] == 1:
+                    state["graph_opens"] += 1
+                result = self.target(*arguments, **arguments_by_name)
+                if state["a2_complete"] == 0 and state["private_parent_fd"] is None:
+                    state["private_parent_fd"] = result
+                return result
+            if self.namespace == "fcntl" and self.name == "fcntl" and state is not None:
+                fd = arguments[0] if len(arguments) >= 1 else None
+                command = arguments[1] if len(arguments) >= 2 else None
+                observed_getfl = state["constant_values"].get(("fcntl", "F_GETFL"), fcntl.F_GETFL)
+                observed_getfd = state["constant_values"].get(("fcntl", "F_GETFD"), fcntl.F_GETFD)
+                if (
+                    state["a2_complete"] == 1
+                    and fd == state["borrowed_ledger_fd"]
+                    and command == observed_getfl
+                    and state["final_custody"] == 0
+                ):
+                    if state["events"] == [
+                        "a2-complete",
+                        "capability-inventory",
+                        "rlimit-baseline",
+                    ]:
+                        state["events"].append("capacity-policy-selected")
+                    state["events"].append("borrowed-L-getfl")
+                    state["final_custody"] = 1
+                elif state["final_custody"] == 1 and fd == state["borrowed_parent_fd"]:
+                    if command == observed_getfl and "borrowed-P-getfl" not in state["events"]:
+                        state["events"].append("borrowed-P-getfl")
+                    elif command == observed_getfd and "borrowed-P-getfd" not in state["events"]:
+                        state["events"].append("borrowed-P-getfd")
+                forwarded = list(arguments)
+                if state["a2_complete"] == 1 and len(forwarded) >= 2:
+                    if command == observed_getfl:
+                        forwarded[1] = fcntl.F_GETFL
+                    elif command == observed_getfd:
+                        forwarded[1] = fcntl.F_GETFD
+                result = self.target(*forwarded, **arguments_by_name)
+                duplicate_command = getattr(fcntl, "F_DUPFD_CLOEXEC", None)
+                if (
+                    state["a2_complete"] == 0
+                    and fd == state["borrowed_ledger_fd"]
+                    and command == duplicate_command
+                    and type(result) is int
+                    and result >= 0
+                ):
+                    state["private_ledger_fd"] = result
+                return result
+            if self.namespace == "os" and self.name == "fstat" and state is not None:
+                fd = arguments[0] if len(arguments) == 1 and not arguments_by_name else None
+                if state["final_custody"] == 1:
+                    if fd == state["borrowed_ledger_fd"] and "borrowed-L-fstat" not in state["events"]:
+                        state["events"].append("borrowed-L-fstat")
+                    elif fd == state["borrowed_parent_fd"] and "borrowed-P-fstat" not in state["events"]:
+                        state["events"].append("borrowed-P-fstat")
+                result = self.target(*arguments, **arguments_by_name)
+                if (
+                    state["a2_complete"] == 0
+                    and fd == state["private_parent_fd"]
+                    and state["private_parent_fd"] is not None
+                ):
+                    stage3_a2_complete()
+                return result
+            if self.namespace == "os" and self.name == "close" and state is not None:
+                fd = arguments[0] if len(arguments) == 1 and not arguments_by_name else None
+                if state["final_custody"] == 1:
+                    if fd == state["private_parent_fd"]:
+                        state["events"].append("close-P")
+                    elif fd == state["private_ledger_fd"]:
+                        state["events"].append("close-L")
+                return self.target(*arguments, **arguments_by_name)
+            if self.namespace == "resource" and self.name == "getrlimit" and state is not None:
+                limit = arguments[0] if len(arguments) == 1 and not arguments_by_name else None
+                case = state["stage3_case"]
+                if case is not None and case[1] == "rlimit-result":
+                    state["case_attempts"] += 1
+                result = (
+                    case[3]
+                    if case is not None and case[1] == "rlimit-result"
+                    else (1024, 1048576)
+                )
+                state["getrlimit"].append((limit, result))
+                if (
+                    state["events"] == ["a2-complete", "capability-inventory"]
+                    and limit
+                    == state["constant_values"].get(
+                        ("resource", "RLIMIT_NOFILE"), resource.RLIMIT_NOFILE
+                    )
+                    and type(result) is tuple
+                    and len(result) == 2
+                    and all(type(item) is int and item >= 0 for item in result)
+                    and result[0] <= result[1]
+                ):
+                    state["events"].append("rlimit-baseline")
+                return result
+            return self.target(*arguments, **arguments_by_name)
+
+    class Stage3SupportProxy:
+        def __init__(self, name, target):
+            self.name = name
+            self.target = target
+
+        def __contains__(self, candidate):
+            target = candidate.target if isinstance(candidate, Stage3Callable) else candidate
+            result = target in self.target
+            function_name = candidate.name if isinstance(candidate, Stage3Callable) else getattr(candidate, "__name__", None)
+            item = (self.name, function_name)
+            state = stage3_c0_state
+            case = None if state is None or state["a2_complete"] == 0 else state["stage3_case"]
+            if state is not None and state["a2_complete"] == 1:
+                state["observed_items"][item] = state["observed_items"].get(item, 0) + 1
+            if (
+                case is not None
+                and case[1] == "missing-support"
+                and case[2] == item
+                and state["case_attempts"] == 0
+            ):
+                state["case_attempts"] += 1
+                state["inventory_closed"] = not stage3_case_is_continuation(case)
+                return False
+            if result and item in stage3_supports:
+                stage3_record("supports", item, result)
+            return result
+
+    class Stage3NativeProxy:
+        def __init__(self, namespace, target):
+            self.namespace = namespace
+            self.target = target
+
+        def __getattr__(self, name):
+            item = (self.namespace, name)
+            state = stage3_c0_state
+            case = None if state is None or state["a2_complete"] == 0 else state["stage3_case"]
+            if state is not None and state["a2_complete"] == 1:
+                state["observed_items"][item] = state["observed_items"].get(item, 0) + 1
+            if (
+                case is not None
+                and case[1] == "missing"
+                and case[2] == item
+                and state["case_attempts"] == 0
+            ):
+                state["case_attempts"] += 1
+                state["inventory_closed"] = not stage3_case_is_continuation(case)
+                raise AttributeError(name)
+            value = getattr(self.target, name)
+            if (
+                case is not None
+                and case[1] == "replace"
+                and case[2] == item
+                and state["case_attempts"] == 0
+            ):
+                state["case_attempts"] += 1
+                state["inventory_closed"] = not stage3_case_is_continuation(case)
+                value = case[3]
+            if item in stage3_constants:
+                stage3_record("constants", item, value)
+            if item in stage3_callables:
+                stage3_record("callables", item, value)
+            if callable(value) and (self.namespace == "os" and name in {
+                "open",
+                "stat",
+                "listdir",
+                "fstat",
+                "pread",
+                "close",
+                "readlink",
+            } or self.namespace == "fcntl" and name == "fcntl" or self.namespace == "resource" and name == "getrlimit"):
+                return Stage3Callable(self.namespace, name, value)
+            if self.namespace == "os" and name in {
+                "supports_dir_fd",
+                "supports_follow_symlinks",
+                "supports_fd",
+            }:
+                return Stage3SupportProxy(name, value)
+            return value
+
+    def stage3_a2_complete():
+        state = stage3_c0_state
+        if state is not None:
+            state["a2_complete"] += 1
+            state["events"].append("a2-complete")
+
+    def check_stage3_c0(expected_terminal):
+        state = stage3_c0_state
+        b_events = [
+            "borrowed-L-getfl",
+            "borrowed-L-fstat",
+            "borrowed-P-getfl",
+            "borrowed-P-getfd",
+            "borrowed-P-fstat",
+            "close-P",
+            "close-L",
+        ]
+        b_calls = [
+            "borrowed-L-getfl",
+            "borrowed-L-fstat",
+            "borrowed-P-getfl",
+            "borrowed-P-getfd",
+            "borrowed-P-fstat",
+            "close-P",
+            "close-L",
+        ]
+        if (
+            state is None
+            or state["a2_complete"] != 1
+            or set(state["constants"]) != state["required_constants"]
+            or set(state["callables"]) != state["required_callables"]
+            or set(state["supports"]) != state["required_supports"]
+            or any(count != 1 for count in state["constants"].values())
+            or any(count != 1 for count in state["callables"].values())
+            or any(count != 1 for count in state["supports"].values())
+            or not state["inventory_valid"]
+            or len(state["getrlimit"]) != 1
+            or state["events"]
+            != [
+                "a2-complete",
+                "capability-inventory",
+                "rlimit-baseline",
+                "capacity-policy-selected",
+            ]
+            + b_events
+            + [expected_terminal]
+            or state["post_a2_calls"] != ["resource-getrlimit"] + b_calls
+            or state["unauthorized_calls"]
+            or state["final_custody"] != 1
+            or state["graph_opens"] != 0
+            or state["intervening"] != 0
+        ):
+            raise SystemExit("stage3a0 fd capacity policy was not evaluated exactly once")
+
+    def check_stage3_c0_case(case, expected_terminal):
+        continuation = stage3_case_is_continuation(case)
+        if continuation:
+            check_stage3_c0(expected_terminal)
+            state = stage3_c0_state
+            if case[0] == "missing-O_PATH-no-symlink-continue":
+                if (
+                    state["case_attempts"] != 0
+                    or state["observed_items"].get(("os", "O_PATH"), 0) != 0
+                    or state["observed_items"].get(("os", "readlink"), 0) != 0
+                    or state["observed_items"].get(("supports_dir_fd", "readlink"), 0) != 0
+                ):
+                    raise SystemExit("stage3a0 no-symlink capability continuation drifted")
+            elif (
+                state["case_attempts"] != 1
+                or state["observed_items"].get(case[2], 0) != 1
+            ):
+                raise SystemExit(f"stage3a0 continuation shim count drifted: {case[0]}")
+            return
+        state = stage3_c0_state
+        b_events = [
+            "borrowed-L-getfl",
+            "borrowed-L-fstat",
+            "borrowed-P-getfl",
+            "borrowed-P-getfd",
+            "borrowed-P-fstat",
+            "close-P",
+            "close-L",
+        ]
+        expected_prefix = (
+            ["a2-complete", "capability-inventory"]
+            if case[1] == "rlimit-result"
+            else ["a2-complete"]
+        )
+        expected_calls = (
+            ["resource-getrlimit"] if case[1] == "rlimit-result" else []
+        ) + b_events
+        if (
+            state is None
+            or state["a2_complete"] != 1
+            or state["events"] != expected_prefix + b_events + [expected_terminal]
+            or state["post_a2_calls"] != expected_calls
+            or state["unauthorized_calls"]
+            or len(state["getrlimit"]) != (1 if case[1] == "rlimit-result" else 0)
+            or state["case_attempts"] != 1
+            or (
+                case[1] in {"missing", "missing-support", "replace"}
+                and state["observed_items"].get(case[2], 0) != 1
+            )
+            or state["final_custody"] != 1
+            or state["graph_opens"] != 0
+            or "capacity-policy-selected" in state["events"]
+        ):
+            raise SystemExit(f"stage3a0 mutation vector drifted: {case[0]}")
+
+    def run_case(
+        label,
+        expected,
+        overrides=None,
+        patches=(),
+        borrowed=(),
+        postcheck=None,
+        custody=None,
+        full_a2=False,
+        stage3_case=None,
+    ):
+        global stage3_c0_state
+        if full_a2 and not stage3_ready:
+            deferred_full_a2.append(
+                (
+                    label,
+                    expected,
+                    overrides,
+                    patches,
+                    borrowed,
+                    borrowed == base_borrowed,
+                    postcheck,
+                    custody,
+                    stage3_case,
+                )
+            )
+            return
         call_kwargs = dict(valid)
         if overrides:
             call_kwargs.update(overrides)
@@ -732,6 +1222,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 raise SystemExit(f"{label}: fixture borrowed fd is not open") from exc
             before_fds.append((fd, offset, identity(value), flags, descriptor_flags))
         originals = []
+        module_originals = []
         caught = None
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -746,6 +1237,53 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         delattr(owner, name)
                 else:
                     setattr(owner, name, replacement)
+            if full_a2:
+                stage3_c0_state = {
+                    "constants": {},
+                    "constant_values": {},
+                    "callables": {},
+                    "supports": {},
+                    "inventory_valid": True,
+                    "inventory_closed": False,
+                    "getrlimit": [],
+                    "events": [],
+                    "graph_opens": 0,
+                    "intervening": 0,
+                    "post_a2_calls": [],
+                    "unauthorized_calls": [],
+                    "observed_items": {},
+                    "case_attempts": 0,
+                    "borrowed_ledger_fd": call_kwargs["expected_ledger_fd"],
+                    "borrowed_parent_fd": call_kwargs["private_parent_fd"],
+                    "private_ledger_fd": None,
+                    "private_parent_fd": None,
+                    "final_custody": 0,
+                    "a2_complete": 0,
+                    "stage3_case": stage3_case,
+                    "required_constants": (
+                        stage3_constants
+                        if stage3_case is None or stage3_case[5]
+                        else stage3_constants - {("os", "O_PATH")}
+                    ),
+                    "required_callables": (
+                        stage3_callables
+                        if stage3_case is None or stage3_case[5]
+                        else stage3_callables - {("os", "readlink")}
+                    ),
+                    "required_supports": (
+                        stage3_supports
+                        if stage3_case is None or stage3_case[5]
+                        else stage3_supports - {("supports_dir_fd", "readlink")}
+                    ),
+                }
+                for name, replacement in (
+                    ("os", Stage3NativeProxy("os", module.os)),
+                    ("fcntl", Stage3NativeProxy("fcntl", module.fcntl)),
+                    ("resource", Stage3NativeProxy("resource", resource)),
+                ):
+                    existed = hasattr(module, name)
+                    module_originals.append((name, existed, getattr(module, name, None)))
+                    setattr(module, name, replacement)
             module.discover_input_v1 = discover_bomb
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 try:
@@ -754,6 +1292,11 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     caught = exc
         finally:
             module.discover_input_v1 = real_discover
+            for name, existed, original in reversed(module_originals):
+                if existed:
+                    setattr(module, name, original)
+                else:
+                    delattr(module, name)
             for owner, name, existed, original in reversed(originals):
                 if existed:
                     setattr(owner, name, original)
@@ -769,8 +1312,18 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         elif type(caught) is not expected:
             name = type(caught).__name__ if caught is not None else "return"
             raise SystemExit(f"{label}: expected {expected.__name__}, got {name}")
+        if full_a2:
+            stage3_c0_state["events"].append(
+                "SystemExit(77)" if expected is SystemExit else expected.__name__
+            )
         if custody is not None:
             custody()
+        if full_a2:
+            expected_terminal = "SystemExit(77)" if expected is SystemExit else expected.__name__
+            if stage3_case is None:
+                check_stage3_c0(expected_terminal)
+            else:
+                check_stage3_c0_case(stage3_case, expected_terminal)
         if postcheck is not None:
             postcheck()
         if tuple(tree_state(root) for root in roots) != before_roots:
@@ -792,8 +1345,24 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 raise SystemExit(f"{label}: runner changed borrowed fd {fd} metadata")
             if offset is not None and borrowed_offset(fd) != offset:
                 raise SystemExit(f"{label}: runner changed borrowed fd {fd} offset")
+        stage3_c0_state = None
 
     base_borrowed = [(ledger_fd, ledger_offset), (parent_fd, parent_offset)]
+    synthetic_context = (
+        ledger_fd,
+        ledger_path,
+        ledger_offset,
+        parent_fd,
+        parent_offset,
+        repo_root,
+        stable_root,
+        nightly_root,
+        parent_root,
+        valid,
+        roots,
+        base_borrowed,
+        os.environ["TASK4_GOLDEN"],
+    )
 
     stage2_positive = {
         "started": False,
@@ -1080,6 +1649,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         ),
         borrowed=base_borrowed,
         postcheck=check_stage2_positive,
+        full_a2=True,
     )
 
     def stage2_expected(position=None, variant=None, ledger_event="dup-L", parent_event="open-P", terminal="MutationError"):
@@ -1592,6 +2162,16 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             borrowed=base_borrowed,
             postcheck=check_trace,
             custody=check_custody,
+            full_a2=(
+                label.startswith("stage2-usable-private-borrowed-L-getfl-")
+                or label.startswith("stage2-attempt-all-borrowed-P-")
+                or label
+                in {
+                    "stage2-close-parent-real-close-then-raise",
+                    "stage2-close-ledger-real-close-then-raise",
+                    "stage2-close-parent-keyboardinterrupt",
+                }
+            ),
         )
 
     for variant in ("exception", "status-mismatch"):
@@ -1830,6 +2410,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         SystemExit,
         {"expected_ledger_fd": read_write_ledger},
         borrowed=[(read_write_ledger, read_write_offset), (parent_fd, parent_offset)],
+        full_a2=True,
     )
     os.close(read_write_ledger)
 
@@ -1977,6 +2558,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         patches=((module.os, "pread", partial_pread), (module.os, "fstat", partial_fstat)),
         borrowed=base_borrowed,
         postcheck=check_partial_pread,
+        full_a2=True,
     )
 
     def run_alt_fd(label, key, fd, offset=None, borrowed_extra=()):
@@ -2491,14 +3073,572 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         postcheck=check_recovery_after_earliest_failure,
     )
 
-    run_case("valid-refusal-only-runner", SystemExit, borrowed=base_borrowed)
+    run_case(
+        "valid-refusal-only-runner",
+        SystemExit,
+        borrowed=base_borrowed,
+        full_a2=True,
+    )
+
+    # Stage3A0 RED owns one independent literal fixture for every full-A2 route.
+
+    def stage3_ledger(fixture_bytes, include_link):
+        if not fixture_bytes.startswith(b"/") or any(byte >= 0x80 for byte in fixture_bytes):
+            raise SystemExit("stage3 fixture path is not absolute ASCII")
+        fixture_abs = fixture_bytes[1:]
+        rows = [
+            (
+                "tool",
+                "execute",
+                "present",
+                "0700",
+                "13",
+                "022036a28655c76d3ac5e1584872c898d161687b7578de171ac3447b7447bf68",
+                b"external:/" + fixture_abs + b"/external/tool",
+            ),
+            (
+                "nightly-sysroot",
+                "read",
+                "present",
+                "0600",
+                "2",
+                "28312e346b76a3f91e8283519baab5f103d79547dedff5fb7ccc0dc3c5119bbe",
+                b"external:/" + fixture_abs + b"/nightly/n.bin",
+            ),
+            (
+                "stable-sysroot",
+                "read",
+                "present",
+                "0600",
+                "2",
+                "7aa397df66304bab4fe275afe0507a01844e7fda848b4e194a9402d010721839",
+                b"external:/" + fixture_abs + b"/stable/s.bin",
+            ),
+            (
+                "directory",
+                "probe",
+                "present",
+                "0700",
+                "10",
+                "dff711efda3385276e20031e3c33c758adb07840d3181fb20b23d4d00af6543f",
+                b"repo:/abs",
+            ),
+            ("absent", "probe", "ENOENT", "-", "-", "-", b"repo:/abs/a-missing"),
+            (
+                "repo",
+                "probe",
+                "present",
+                "0600",
+                "1",
+                "df7e70e5021544f4834bbee64a9e3789febc4be81470df629cad6ddb03320a5c",
+                b"repo:/abs/blocker",
+            ),
+            ("absent", "probe", "ENOTDIR", "-", "-", "-", b"repo:/abs/blocker/child"),
+            ("absent", "probe", "ENOENT", "-", "-", "-", b"repo:/abs/c-missing"),
+            (
+                "directory",
+                "enumerate",
+                "present",
+                "0700",
+                "21",
+                "2c337acb2a4a9f0836a1b0401109e0464648087c760683e6956dfa0949153305",
+                b"repo:/enum",
+            ),
+            (
+                "symlink",
+                "probe",
+                "present",
+                "0777",
+                "16",
+                "35f44f63e1bc62f86de434856c9acf9de517304b0af8b3fc978cd5d6ae0cf2cc",
+                b"repo:/link",
+            ),
+            (
+                "repo",
+                "read",
+                "present",
+                "0600",
+                "2",
+                "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5",
+                b"repo:/target",
+            ),
+            (
+                "vendor",
+                "read",
+                "present",
+                "0600",
+                "2",
+                "ade9afa39b059ce9954a97780d15c35c204ed2a8ee75199512731550556e6f5f",
+                b"vendor:/v.bin",
+            ),
+        ]
+        if not include_link:
+            rows = [row for row in rows if row[-1] != b"repo:/link"]
+        rows.sort(key=lambda row: row[-1])
+        return b"".join(
+            b"\t".join(
+                (
+                    b"input-v1",
+                    str(index).encode("ascii"),
+                    klass.encode("ascii"),
+                    access.encode("ascii"),
+                    result.encode("ascii"),
+                    mode.encode("ascii"),
+                    size.encode("ascii"),
+                    digest.encode("ascii"),
+                    locator,
+                )
+            )
+            + b"\n"
+            for index, (klass, access, result, mode, size, digest, locator) in enumerate(rows)
+        )
+
+    def stage3_mkdir(path, mode):
+        os.mkdir(path)
+        os.chmod(path, mode)
+
+    def stage3_file(path, content, mode):
+        with open(path, "wb") as stream:
+            stream.write(content)
+        os.chmod(path, mode)
+
+    def stage3_kind(file_type):
+        return {
+            stat.S_IFDIR: "directory",
+            stat.S_IFREG: "regular",
+            stat.S_IFLNK: "symlink",
+        }.get(file_type, "other")
+
+    stage3_c0_cases = []
+    for item in sorted(stage3_constants | stage3_callables):
+        stage3_c0_cases.append(
+            (f"missing-{item[0]}-{item[1]}", "missing", item, None, SystemExit, True)
+        )
+    for item in sorted(stage3_supports):
+        stage3_c0_cases.append(
+            (f"missing-{item[0]}-{item[1]}", "missing-support", item, None, SystemExit, True)
+        )
+    stage3_c0_cases.append(
+        (
+            "missing-O_PATH-no-symlink-continue",
+            "missing",
+            ("os", "O_PATH"),
+            None,
+            SystemExit,
+            False,
+        )
+    )
+    for item in sorted(stage3_callables):
+        stage3_c0_cases.append(
+            (f"noncallable-{item[0]}-{item[1]}", "replace", item, 1, module.MutationError, True)
+        )
+    native_constants = {
+        ("os", name): getattr(os, name)
+        for name in ("O_RDONLY", "O_CLOEXEC", "O_NOFOLLOW", "O_DIRECTORY", "O_PATH", "O_ACCMODE")
+    }
+    native_constants.update(
+        {
+            ("fcntl", name): getattr(fcntl, name)
+            for name in ("FD_CLOEXEC", "F_GETFD", "F_GETFL")
+        }
+    )
+    native_constants[("resource", "RLIMIT_NOFILE")] = resource.RLIMIT_NOFILE
+
+    def stage3_invalid_constants(item, variants):
+        for label, value in variants:
+            stage3_c0_cases.append(
+                (f"invalid-{item[0]}-{item[1]}-{label}", "replace", item, value, module.MutationError, True)
+            )
+
+    stage3_invalid_constants(
+        ("os", "O_RDONLY"),
+        (("nonzero", 1), ("bool", True), ("subclass", IntSubclass(0)), ("negative", -1)),
+    )
+    for name in ("O_CLOEXEC", "O_NOFOLLOW", "O_DIRECTORY", "O_PATH"):
+        item = ("os", name)
+        stage3_invalid_constants(
+            item,
+            (
+                ("zero", 0),
+                ("bool", True),
+                ("subclass", IntSubclass(native_constants[item])),
+                ("negative", -1),
+            ),
+        )
+    for item in (("os", "O_ACCMODE"), ("fcntl", "FD_CLOEXEC")):
+        stage3_invalid_constants(
+            item,
+            (
+                ("zero", 0),
+                ("bool", True),
+                ("subclass", IntSubclass(native_constants[item])),
+                ("negative", -1),
+            ),
+        )
+    for item in (("fcntl", "F_GETFD"), ("fcntl", "F_GETFL")):
+        stage3_invalid_constants(
+            item,
+            (
+                ("bool", True),
+                ("subclass", IntSubclass(native_constants[item])),
+                ("negative", -1),
+            ),
+        )
+    for name in ("F_GETFD", "F_GETFL"):
+        stage3_c0_cases.append(
+            (
+                f"continue-fcntl-{name}-zero",
+                "replace",
+                ("fcntl", name),
+                0,
+                SystemExit,
+                True,
+            )
+        )
+    stage3_c0_cases.append(
+        (
+            "invalid-fcntl-F_GETFL-equals-F_GETFD",
+            "replace",
+            ("fcntl", "F_GETFL"),
+            native_constants[("fcntl", "F_GETFD")],
+            module.MutationError,
+            True,
+        )
+    )
+    security_items = [("os", name) for name in ("O_CLOEXEC", "O_NOFOLLOW", "O_DIRECTORY", "O_PATH")]
+    for index, left in enumerate(security_items):
+        for right in security_items[index + 1 :]:
+            stage3_c0_cases.append(
+                (
+                    f"collision-{left[1]}-{right[1]}",
+                    "replace",
+                    right,
+                    native_constants[left],
+                    module.MutationError,
+                    True,
+                )
+            )
+    for item in security_items:
+        stage3_c0_cases.append(
+            (
+                f"collision-O_ACCMODE-{item[1]}",
+                "replace",
+                ("os", "O_ACCMODE"),
+                native_constants[("os", "O_ACCMODE")] | native_constants[item],
+                module.MutationError,
+                True,
+            )
+        )
+    rlimit_item = ("resource", "RLIMIT_NOFILE")
+    stage3_invalid_constants(
+        rlimit_item,
+        (
+            ("bool", True),
+            ("subclass", IntSubclass(resource.RLIMIT_NOFILE)),
+            ("negative", -1),
+        ),
+    )
+    stage3_c0_cases.append(
+        (
+            "continue-resource-RLIMIT_NOFILE-zero",
+            "replace",
+            rlimit_item,
+            0,
+            SystemExit,
+            True,
+        )
+    )
+    for label, result in (
+        ("wrong-type", None),
+        ("wrong-length", (1024,)),
+        ("soft-bool", (True, 1048576)),
+        ("hard-bool", (1024, True)),
+        ("soft-subclass", (IntSubclass(1024), 1048576)),
+        ("hard-subclass", (1024, IntSubclass(1048576))),
+        ("soft-negative", (-1, 1048576)),
+        ("hard-negative", (1024, -1)),
+        ("soft-infinite", (resource.RLIM_INFINITY, 1048576)),
+        ("hard-infinite", (1024, resource.RLIM_INFINITY)),
+        ("reversed", (1048576, 1024)),
+    ):
+        stage3_c0_cases.append(
+            (f"invalid-rlimit-result-{label}", "rlimit-result", None, result, module.MutationError, True)
+        )
+    if len(stage3_c0_cases) != 96:
+        raise SystemExit(f"stage3a0 capability table cardinality drifted: {len(stage3_c0_cases)}")
+
+    with tempfile.TemporaryDirectory(prefix="p11scope-stage3-") as stage3_root:
+        os.chmod(stage3_root, 0o700)
+        repo3 = os.path.join(stage3_root, "repo")
+        stable3 = os.path.join(stage3_root, "stable")
+        nightly3 = os.path.join(stage3_root, "nightly")
+        external3 = os.path.join(stage3_root, "external")
+        parent3 = os.path.join(stage3_root, "parent")
+        stage3_mkdir(repo3, 0o755)
+        stage3_mkdir(stable3, 0o755)
+        stage3_mkdir(nightly3, 0o755)
+        stage3_mkdir(external3, 0o755)
+        stage3_mkdir(parent3, 0o700)
+
+        vendor3 = os.path.join(repo3, "vendor")
+        abs3 = os.path.join(repo3, "abs")
+        enum3 = os.path.join(repo3, "enum")
+        stage3_mkdir(vendor3, 0o755)
+        stage3_mkdir(abs3, 0o700)
+        stage3_mkdir(enum3, 0o700)
+        stage3_file(os.path.join(vendor3, "v.bin"), b"V\n", 0o600)
+        stage3_file(os.path.join(abs3, "blocker"), b"B", 0o600)
+        stage3_file(os.path.join(enum3, "a"), b"A", 0o600)
+        stage3_mkdir(os.path.join(enum3, "z"), 0o700)
+        raw_enum_name = os.fsencode(enum3) + b"/raw-\xff-name"
+        os.symlink(b"unused", raw_enum_name)
+        stage3_file(os.path.join(repo3, "target"), b"T\n", 0o600)
+        os.symlink(b"./enum/../target", os.path.join(repo3, "link"))
+        stage3_file(os.path.join(stable3, "s.bin"), b"S\n", 0o600)
+        stage3_file(os.path.join(nightly3, "n.bin"), b"N\n", 0o600)
+        stage3_file(os.path.join(external3, "tool"), b"#!/bin/false\n", 0o700)
+
+        expected_objects = {
+            (b"", "directory", 0o700),
+            (b"repo", "directory", 0o755),
+            (b"repo/vendor", "directory", 0o755),
+            (b"repo/vendor/v.bin", "regular", 0o600),
+            (b"repo/abs", "directory", 0o700),
+            (b"repo/abs/blocker", "regular", 0o600),
+            (b"repo/enum", "directory", 0o700),
+            (b"repo/enum/a", "regular", 0o600),
+            (b"repo/enum/raw-\xff-name", "symlink", 0o777),
+            (b"repo/enum/z", "directory", 0o700),
+            (b"repo/link", "symlink", 0o777),
+            (b"repo/target", "regular", 0o600),
+            (b"stable", "directory", 0o755),
+            (b"stable/s.bin", "regular", 0o600),
+            (b"nightly", "directory", 0o755),
+            (b"nightly/n.bin", "regular", 0o600),
+            (b"external", "directory", 0o755),
+            (b"external/tool", "regular", 0o700),
+            (b"parent", "directory", 0o700),
+        }
+        observed_objects = {
+            (os.fsencode(relative), stage3_kind(file_type), mode)
+            for relative, file_type, mode, _identity_value, _content in tree_state(stage3_root)
+        }
+        if len(observed_objects) != 19 or observed_objects != expected_objects:
+            raise SystemExit("stage3 literal fixture does not contain exactly 19 objects")
+
+        stage3_payloads = {
+            b"repo/vendor/v.bin": (b"V\n", "ade9afa39b059ce9954a97780d15c35c204ed2a8ee75199512731550556e6f5f"),
+            b"repo/abs/blocker": (b"B", "df7e70e5021544f4834bbee64a9e3789febc4be81470df629cad6ddb03320a5c"),
+            b"repo/enum/a": (b"A", "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"),
+            b"repo/target": (b"T\n", "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5"),
+            b"stable/s.bin": (b"S\n", "7aa397df66304bab4fe275afe0507a01844e7fda848b4e194a9402d010721839"),
+            b"nightly/n.bin": (b"N\n", "28312e346b76a3f91e8283519baab5f103d79547dedff5fb7ccc0dc3c5119bbe"),
+            b"external/tool": (b"#!/bin/false\n", "022036a28655c76d3ac5e1584872c898d161687b7578de171ac3447b7447bf68"),
+        }
+        for relative, (content, digest) in stage3_payloads.items():
+            path = os.fsencode(stage3_root) + b"/" + relative
+            if open(path, "rb").read() != content or hashlib.sha256(content).hexdigest() != digest:
+                raise SystemExit(f"stage3 literal payload mismatch: {relative!r}")
+        for relative, target, digest in (
+            (
+                b"repo/link",
+                b"./enum/../target",
+                "35f44f63e1bc62f86de434856c9acf9de517304b0af8b3fc978cd5d6ae0cf2cc",
+            ),
+            (
+                b"repo/enum/raw-\xff-name",
+                b"unused",
+                "febe1d741b49e5a9c31526728d8c5134a803adfc4c04c4f052673722ed85597e",
+            ),
+        ):
+            path = os.fsencode(stage3_root) + b"/" + relative
+            if os.readlink(path) != target or hashlib.sha256(target).hexdigest() != digest:
+                raise SystemExit(f"stage3 literal symlink mismatch: {relative!r}")
+        enum_preimage = b"F\x00\x01aL\x00\nraw-\xff-nameD\x00\x01z"
+        if (
+            len(enum_preimage) != 21
+            or hashlib.sha256(enum_preimage).hexdigest()
+            != "2c337acb2a4a9f0836a1b0401109e0464648087c760683e6956dfa0949153305"
+        ):
+            raise SystemExit("stage3 literal enum preimage mismatch")
+        abs_preimage = b"F\x00\x07blocker"
+        if (
+            len(abs_preimage) != 10
+            or hashlib.sha256(abs_preimage).hexdigest()
+            != "dff711efda3385276e20031e3c33c758adb07840d3181fb20b23d4d00af6543f"
+        ):
+            raise SystemExit("stage3 literal abs preimage mismatch")
+
+        stage3_root_bytes = os.fsencode(stage3_root)
+        stage3_link_path = os.path.join(repo3, "link")
+        os.unlink(stage3_link_path)
+        no_symlink_objects = expected_objects - {(b"repo/link", "symlink", 0o777)}
+        observed_no_symlink_objects = {
+            (os.fsencode(relative), stage3_kind(file_type), mode)
+            for relative, file_type, mode, _identity_value, _content in tree_state(stage3_root)
+        }
+        if len(observed_no_symlink_objects) != 18 or observed_no_symlink_objects != no_symlink_objects:
+            raise SystemExit("stage3 no-symlink fixture does not remove exactly repo/link")
+        stage3_no_symlink_ledger = stage3_ledger(stage3_root_bytes, False)
+        os.symlink(b"./enum/../target", stage3_link_path)
+        stage3_ledger_bytes = stage3_ledger(stage3_root_bytes, True)
+        if stage3_ledger_bytes.count(b"\n") != 12 or stage3_no_symlink_ledger.count(b"\n") != 11:
+            raise SystemExit("stage3 literal ledger row cardinality drifted")
+        stage3_ledger_path = os.path.join(fixture, "stage3-ledger")
+        stage3_file(stage3_ledger_path, stage3_ledger_bytes, 0o600)
+        stage3_no_symlink_path = os.path.join(fixture, "stage3-ledger-no-symlink")
+        stage3_file(stage3_no_symlink_path, stage3_no_symlink_ledger, 0o600)
+        stage3_ledger_fd = os.open(
+            stage3_ledger_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+        stage3_parent_fd = os.open(
+            parent3, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+        try:
+            stage3_ledger_offset = os.lseek(stage3_ledger_fd, 11, os.SEEK_SET)
+            stage3_parent_offset = os.lseek(stage3_parent_fd, 7, os.SEEK_CUR)
+            (
+                ledger_fd,
+                ledger_path,
+                ledger_offset,
+                parent_fd,
+                parent_offset,
+                repo_root,
+                stable_root,
+                nightly_root,
+                parent_root,
+                valid,
+                roots,
+                base_borrowed,
+                _synthetic_golden,
+            ) = (
+                stage3_ledger_fd,
+                stage3_ledger_path,
+                stage3_ledger_offset,
+                stage3_parent_fd,
+                stage3_parent_offset,
+                repo3,
+                stable3,
+                nightly3,
+                parent3,
+                {
+                    "expected_ledger_fd": stage3_ledger_fd,
+                    "repo_root": repo3,
+                    "vendor_relative": "vendor",
+                    "stable_sysroot_root": stable3,
+                    "nightly_sysroot_root": nightly3,
+                    "private_parent_fd": stage3_parent_fd,
+                },
+                (stage3_root,),
+                [
+                    (stage3_ledger_fd, stage3_ledger_offset),
+                    (stage3_parent_fd, stage3_parent_offset),
+                ],
+                synthetic_context[-1],
+            )
+            os.environ["TASK4_GOLDEN"] = stage3_ledger_bytes.decode("ascii")
+            stage3_ready = True
+            try:
+                for (
+                    label,
+                    expected,
+                    overrides,
+                    patches,
+                    stored_borrowed,
+                    standard_borrowed,
+                    postcheck,
+                    custody,
+                    stage3_case,
+                ) in deferred_full_a2:
+                    close_after = None
+                    if label == "ledger-read-write":
+                        close_after = os.open(
+                            stage3_ledger_path,
+                            os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        )
+                        read_write_offset = os.lseek(close_after, 23, os.SEEK_SET)
+                        overrides = {"expected_ledger_fd": close_after}
+                        case_borrowed = [
+                            (close_after, read_write_offset),
+                            (parent_fd, parent_offset),
+                        ]
+                    else:
+                        case_borrowed = base_borrowed if standard_borrowed else stored_borrowed
+                    try:
+                        run_case(
+                            label,
+                            expected,
+                            overrides,
+                            patches,
+                            case_borrowed,
+                            postcheck,
+                            custody,
+                            full_a2=True,
+                            stage3_case=stage3_case,
+                        )
+                    finally:
+                        if close_after is not None:
+                            os.close(close_after)
+                for case in stage3_c0_cases:
+                    case_ledger_fd = None
+                    case_overrides = None
+                    case_borrowed = base_borrowed
+                    if not case[5]:
+                        case_ledger_fd = os.open(
+                            stage3_no_symlink_path,
+                            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        )
+                        case_offset = os.lseek(case_ledger_fd, 11, os.SEEK_SET)
+                        case_overrides = {"expected_ledger_fd": case_ledger_fd}
+                        case_borrowed = [
+                            (case_ledger_fd, case_offset),
+                            (parent_fd, parent_offset),
+                        ]
+                    try:
+                        run_case(
+                            f"stage3a0-{case[0]}",
+                            case[4],
+                            case_overrides,
+                            borrowed=case_borrowed,
+                            full_a2=True,
+                            stage3_case=case,
+                        )
+                    finally:
+                        if case_ledger_fd is not None:
+                            os.close(case_ledger_fd)
+            finally:
+                stage3_ready = False
+                (
+                    ledger_fd,
+                    ledger_path,
+                    ledger_offset,
+                    parent_fd,
+                    parent_offset,
+                    repo_root,
+                    stable_root,
+                    nightly_root,
+                    parent_root,
+                    valid,
+                    roots,
+                    base_borrowed,
+                    synthetic_golden,
+                ) = synthetic_context
+                os.environ["TASK4_GOLDEN"] = synthetic_golden
+        finally:
+            os.close(stage3_parent_fd)
+            os.close(stage3_ledger_fd)
     os.close(ledger_fd)
     os.close(parent_fd)
 
 print("input-v1-api-ok")
-"#;
+"##;
+    let driver_path = project.join("stage3a0-driver.py");
+    fs::write(&driver_path, driver).expect("write Stage3A0 driver");
     let output = Command::new("/usr/bin/python3")
-        .args(["-c", driver, script.to_str().expect("script path is UTF-8")])
+        .args([
+            driver_path.to_str().expect("driver path is UTF-8"),
+            script.to_str().expect("script path is UTF-8"),
+        ])
         .current_dir(repo)
         .env_clear()
         .env("PYTHONDONTWRITEBYTECODE", "1")

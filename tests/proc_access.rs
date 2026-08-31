@@ -4,7 +4,7 @@
 //! skipping a precondition it cannot control — `eprintln!` output is only for
 //! `--nocapture` observability, no test result depends on it being read.
 
-use std::io::Read as _;
+use std::os::unix::fs::FileExt as _;
 use std::process::{Child, Command};
 
 fn ptrace_scope() -> i32 {
@@ -62,10 +62,16 @@ fn mem_access_for_a_same_uid_non_descendant_follows_the_documented_ptrace_rules(
         maps.is_ok(),
         "/proc/{pid}/maps must be readable (PTRACE_MODE_READ): {maps:?}"
     );
+    let maps = p11scope_manifest::maps::parse_maps(maps.unwrap().as_bytes()).unwrap();
+    let readable_address = maps
+        .iter()
+        .find(|entry| entry.permissions[0] == b'r')
+        .expect("target has a readable mapping")
+        .start;
 
-    let mem = std::fs::File::open(format!("/proc/{pid}/mem")).and_then(|mut f| {
+    let mem = std::fs::File::open(format!("/proc/{pid}/mem")).and_then(|f| {
         let mut b = [0u8; 1];
-        f.read_exact(&mut b)
+        f.read_exact_at(&mut b, readable_address)
     });
     let is_root = unsafe { libc::geteuid() } == 0;
     let scope = ptrace_scope();

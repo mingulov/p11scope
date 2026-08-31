@@ -5818,7 +5818,7 @@ impl Engine {
         let collected = self.collect_dynamic_export_work(
             context_id,
             &export_modules,
-            &candidate,
+            &candidate.pinned,
             session,
             terminal_owner.is_some(),
             &terminal_exports,
@@ -5894,7 +5894,7 @@ impl Engine {
         &mut self,
         context: LoaderContextId,
         modules: &[ScannedModule],
-        candidate: &LiveCandidate,
+        pinned: &PinnedObjects,
         session: &dyn EngineSession,
         terminal: bool,
         terminal_exports: &[DynamicExportIdentity],
@@ -5910,10 +5910,7 @@ impl Engine {
                 .exports
                 .iter()
                 .any(|name| name == "C_GetFunctionList");
-            let Some(object) = candidate
-                .pinned
-                .id_for_scanned(module, module.key, &module.path)
-            else {
+            let Some(object) = pinned.id_for_scanned(module, module.key, &module.path) else {
                 if requires_seed {
                     collected.required_seed_complete = false;
                     self.mark_partial(
@@ -5923,9 +5920,8 @@ impl Engine {
                 }
                 continue;
             };
-            let timing_key = candidate.pinned.owned_timing_key(object);
-            let snapshot = candidate
-                .pinned
+            let timing_key = pinned.owned_timing_key(object);
+            let snapshot = pinned
                 .file_for(object)
                 .and_then(|file| ElfSnapshot::read(file).ok());
             if requires_seed {
@@ -6086,6 +6082,48 @@ impl Engine {
             }
         }
         (retire, complete)
+    }
+
+    fn attach_refreshed_exports(
+        &mut self,
+        view: ProcessViewId,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+    ) -> (bool, bool) {
+        let modules: Vec<_> = self
+            .modules
+            .iter()
+            .filter(|module| module.scanned.view == view && !module.scanned.exports.is_empty())
+            .map(|module| module.scanned.clone())
+            .collect();
+        if modules.is_empty() {
+            return (false, true);
+        }
+        let contexts: Vec<_> = self
+            .loader_registry
+            .ids_for_view(view)
+            .into_iter()
+            .filter(|context| {
+                !self.loader_registry.is_tombstoned(*context)
+                    && self
+                        .loader_registry
+                        .context(*context)
+                        .is_some_and(|context| context.was_attached)
+            })
+            .collect();
+        let [context] = contexts.as_slice() else {
+            self.mark_partial(
+                "live export hook",
+                "a refreshed provider had no unique attached loader context",
+            );
+            return (false, false);
+        };
+        let pinned = self.pinned.clone();
+        let collected =
+            self.collect_dynamic_export_work(*context, &modules, &pinned, session, false, &[]);
+        let (retire, complete) =
+            self.attach_export_work(view, &collected.dynamic, session, additions_allowed);
+        (retire, complete && collected.required_seed_complete)
     }
 
     fn arm_loader_for_view(
@@ -8142,6 +8180,16 @@ impl Engine {
         let fatal = match arm_result {
             Ok(arm_changed) => {
                 changed |= arm_changed;
+                for view in refreshed_ok.union(&new_view_ids).copied() {
+                    let (retire, complete) =
+                        self.attach_refreshed_exports(view, session, additions_allowed);
+                    if retire {
+                        self.queue_stale_views(&[view].into_iter().collect(), pending_views);
+                    }
+                    if !complete {
+                        closure.fail();
+                    }
+                }
                 None
             }
             Err(error) => Some(error),
@@ -11841,6 +11889,20 @@ int C_GetFunctionList(void **out) {
     if (out != NULL) *out = NULL;
     return 0;
 }
+__attribute__((visibility("default"), noinline))
+int C_GetInterfaceList(void *out, unsigned long *count) {
+    if (out != NULL) *(void **)out = NULL;
+    if (count != NULL) *count = 0;
+    return 0;
+}
+__attribute__((visibility("default"), noinline))
+int C_GetInterface(const char *name, void *version, void **out, unsigned long flags) {
+    (void)name;
+    (void)version;
+    (void)flags;
+    if (out != NULL) *out = NULL;
+    return 0;
+}
 "#,
         )
         .unwrap();
@@ -11951,6 +12013,48 @@ int main(int argc, char **argv) {
     }
 
     #[test]
+    fn exec_refresh_attaches_provider_exports_before_readiness() {
+        let (fixture, view, _module, _pins) = loaded_seed_provider();
+        let pid = view.pid();
+        let view_id = view.id();
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Pid(pid);
+        engine.next_view_id = 1;
+        engine.module_hints = vec![fixture._dir.path().join("seed-provider.so")];
+        engine.views.push(view);
+        let mut session = ScriptedSession::default();
+        engine
+            .arm_loader_or_partial(
+                0,
+                &mut session,
+                &mut true,
+                &mut PendingViewRetirements::new(),
+            )
+            .unwrap();
+        let retired = engine.loader_registry.ids_for_view(view_id)[0];
+        let mut exec: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exec.kind = DISCOVERY_KIND_EXEC;
+        exec.pid_tgid = u64::from(pid) << 32;
+        exec.hook_ts_ns = engine.views[0].admitted_ns();
+
+        let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![exec]).unwrap();
+
+        assert!(outcome.required_complete);
+        let contexts = engine.loader_registry.ids_for_view(view_id);
+        assert_eq!(contexts.len(), 1);
+        assert_ne!(contexts[0], retired);
+        assert_eq!(
+            session
+                .dynamic_attach_calls
+                .iter()
+                .map(|export| export.cookie)
+                .collect::<BTreeSet<_>>(),
+            [1, 2, 3].into_iter().collect(),
+            "readiness requires all configured exports from the refreshed provider"
+        );
+    }
+
+    #[test]
     fn loader_batch_route_adds_one_count_only_seed_without_table_surface() {
         let (_dir, mut engine, _context, record, mut session) = armed_seed_route(2);
         let first = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
@@ -11994,8 +12098,8 @@ int main(int argc, char **argv) {
         );
         assert_eq!(
             session.dynamic_attach_calls.len(),
-            1,
-            "an exact repeated loader record does not reattach the export"
+            3,
+            "an exact repeated loader record does not reattach the exports"
         );
         assert_eq!(
             engine
@@ -12082,7 +12186,7 @@ int main(int argc, char **argv) {
         let collected = engine.collect_dynamic_export_work(
             LoaderContextId::from_case_id(0),
             std::slice::from_ref(&module),
-            &candidate,
+            &candidate.pinned,
             &ScriptedSession::default(),
             false,
             &[],
@@ -12116,7 +12220,7 @@ int main(int argc, char **argv) {
         let collected = engine.collect_dynamic_export_work(
             LoaderContextId::from_case_id(0),
             std::slice::from_ref(&module),
-            &candidate,
+            &candidate.pinned,
             &ScriptedSession::default(),
             false,
             &[],
@@ -12147,7 +12251,7 @@ int main(int argc, char **argv) {
         let collected = engine.collect_dynamic_export_work(
             LoaderContextId::from_case_id(0),
             std::slice::from_ref(&module),
-            &candidate,
+            &candidate.pinned,
             &ScriptedSession::default(),
             false,
             &[],

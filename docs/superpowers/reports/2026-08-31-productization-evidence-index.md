@@ -9,7 +9,13 @@ are identified by hashes below.
 
 ## Integrated on `main`
 
-- Current integration checkpoint: `b71b4f2c75e4324462e0d28002dbfafa40d98e83`.
+- Runtime-qualified documentation checkpoint:
+  `3e10be9875db7ea13bf9352cf85d482db6efbf0d`.
+- Portable history merge:
+  `4b626c38c39d9b50644bdd4429cf0bfcf007dc6b`. Its tree is exactly
+  `f03ef58509b83486d99e64b743e883a1a3931d86`, unchanged from `3e10be9`.
+  The merge makes every unique worktree tip listed below reachable from
+  `main` without promoting its experimental or rejected file tree.
 - Shipping baseline: `91e21496ae4e7d151c050a9dee2e8547d2d6cb75`,
   merged by `21bfd008d79ebd1ae1292d3820855ef45889a0d8`.
 - Committed MVP lifecycle fixes through
@@ -41,13 +47,15 @@ Fresh integration checks:
 - Independent prerequisite-merge review: ACCEPT, no findings.
 - Full four-command workspace gate on the combined tree: PASS (630 library,
   63 artifact-contract, and all integration tests; Clippy denies warnings).
-- Exact-tip CI, packaging, publication, push, tag, and release: UNRUN at this
-  checkpoint.
+- Exact-tip CI, complete packaging, publication, push, tag, and release:
+  UNRUN at this checkpoint.
 
-## Preserved worktree snapshots
+## Portable historical snapshots
 
 These commits preserve exact source state but are not automatically accepted
-for product integration.
+for product integration. They are parents/ancestors of the portable history
+merge `4b626c38`; they no longer depend on local-only branch names for
+transfer.
 
 | Worktree / branch | Preserved commit | Disposition |
 | --- | --- | --- |
@@ -170,16 +178,47 @@ evidence; the accepted successor campaign above supersedes their MVP gate.
 | detached `/tmp/p11scope-s3a1-redfix-wt-fjQfyT` | `0afa628633f108730281d07169c420492e4970e8` | Dirty 10-line patch is already represented by `95c52305c9e48f3f02ff34ea5f27baffcd9987c0`; no unique result. |
 | `.claude/worktrees/slice1b2-product` | no independent Git identity | Generated target directory only; no source result to integrate. |
 
-No worktree or branch was deleted during consolidation. Generated `target/`
-trees are not evidence and remain cleanup candidates only after all referenced
-artifacts are independently retained.
+The source histories above are now reachable from `main`. Worktree checkout
+directories and redundant branch names are cleanup-only metadata; deleting
+them after portable evidence verification cannot delete the merged commits.
+Generated `target/` trees are not evidence.
+
+## Static security closeout
+
+Codex Security Standard scan `ccd45755-a021-4492-a066-e3df02b0944e` reviewed
+exact revision `3e10be9875db7ea13bf9352cf85d482db6efbf0d` offline. Coverage is
+risk-ranked and `partial`, not a whole-repository clearance. It reported nine
+validated findings: one high, six medium, and two low.
+
+- HIGH: an elevated `p11scope run` execs the observed child without dropping
+  observer uid/gid/groups/capabilities or sanitizing inherited authority.
+- MEDIUM: discovery-helper inherited descriptors, mutable cgroup pathname
+  reuse, adversarial scan complexity/pause extension, unbounded trace output,
+  output-directory ancestry, and untracked/PATH-dependent release inputs.
+- LOW: terminal control characters in mapped-module headings and ambiguous
+  Lane 14 receipt binding.
+- The default privacy allowlist and policy-map freezing surface produced no
+  finding.
+
+Durable private copy (mode 0700/0600):
+`/home/user/.local/state/p11scope/security-scan-3e10be9/`.
+
+- `scan-manifest.json`: `efe277bfb3f2a3f0c439c2239e5c2f0725bb0dfbbbd65d3b8010b8078b07d16b`
+- `findings.json`: `014e94863827184010218f07cc1a28cd47c310eab7090875df7fa75fb173b8a9`
+- `coverage.json`: `a62b85e8845d7242d2fa20542a4d769a5ede0e7af3b4e7f0a83b536f6aab9d72`
+- `report.md`: `4bfbcf926e5434de8b3aa9e21360c2458f5728f49fa76c61c9e03fec92b1f284`
+- `exports/results.sarif`: `7f8ee74bf750a5ceac39a0ac79311a0799b2a004026f28a847d660dbf996f226`
 
 ## Remaining critical path
 
-1. Commit the runtime-status documentation on the integrated `main` tree.
-2. Run exact-tip CI.
-3. Complete packaging, final security review, and release closeout.
+1. Fix the owned-child privilege boundary, then the smallest release-relevant
+   identity/boundedness/build-receipt findings.
+2. Rerun the four exact-tip local gates and exact-tip CI.
+3. Complete the release build/receipt and release closeout.
+4. After MVP closeout, run the approved Fedora QEMU smoke with SELinux
+   `Enforcing`; do not duplicate the historical high-volume campaign unless a
+   portability failure requires it.
 
-Deep Security Scan, full security/privacy clearance, container/deployment
-lanes, exact-tip CI, packaging, publication, push, tag, and release remain
+Full security clearance, exact-final-candidate container/deployment reruns,
+exact-tip CI, complete packaging, publication, push, tag, and release remain
 UNRUN unless a separate accepted record says otherwise.

@@ -398,12 +398,18 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
 **Consolidation checkpoint (2026-08-31):** The shipping baseline, Slice 1b-2
 Task 4 prerequisites, the exact accepted Stage 3A3 GREEN6 pair, and the
 dual-kernel-qualified MVP lifecycle fixes through `ae8494d` are integrated on
-`main` by `b71b4f2`. The combined tree passes all four locked workspace gates.
+`main`. The combined tree passed all four locked workspace gates at the
+runtime-qualified checkpoint.
 The frozen MVP candidate passed the six-row semantic/privacy/cleanup campaign
 on Jammy 5.15 and Noble 6.8. The tree remains unreleased; exact-tip CI,
-packaging, final security review, and release gates are still pending. See the tracked
+complete packaging, security remediation, and release gates are still
+pending. The exact `3e10be9` static security closeout is complete: one high,
+six medium, and two low findings, with the owned-child root-authority finding
+release-blocking. The historical 9.2d/9.3/9.4 volume campaign is retained as
+post-MVP hardening rather than a prerequisite for declaring the local MVP
+runtime-qualified; it remains UNRUN and is not claimed. See the tracked
 [productization evidence index](../reports/2026-08-31-productization-evidence-index.md)
-for exact commits, hashes, preserved worktrees, runtime evidence, and claim
+for exact commits, hashes, portable history, runtime evidence, and claim
 boundaries.
 
 - **Slice 1a — trust simplification** ([plan](2026-08-15-productization-slice1a-trust-simplification.md)):

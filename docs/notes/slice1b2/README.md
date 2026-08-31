@@ -7,6 +7,17 @@ SHA-256 manifest, and this file carries only digests, pointers, and finite
 facts. Nothing under that root is release output; private spike bundles are
 separately permissioned (corrective design §9.4).
 
+## Current disposition (2026-08-31)
+
+This file retains the historical campaigns below. Their promotion blockers do
+not describe the current MVP candidate: the accepted successor through
+`ae8494d` passed the six-row semantic/privacy/cleanup campaign on Jammy 5.15
+and Noble 6.8 and is integrated on `main`. Stage 3A3 GREEN6 is also integrated.
+The remaining 9.2d/9.3/9.4 volume work is post-MVP hardening and remains
+UNRUN; public release is instead blocked by exact-tip security remediation,
+CI, and complete packaging. The authoritative current record is
+`docs/superpowers/reports/2026-08-31-productization-evidence-index.md`.
+
 ## Amended-candidate campaign attempt (2026-08-20)
 
 The reviewed no-busy-wait candidate

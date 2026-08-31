@@ -388,7 +388,6 @@ struct ExportArgs {
     symbol_id: u32,
     announced_count: u32,
     address: u64,
-    diagnostic_flags: u8,
 }
 
 #[inline(never)]
@@ -467,8 +466,6 @@ fn emit_export(
     let interface_index = (record_meta >> 8) as u8;
     let name_class = (record_meta >> 16) as u8;
     let mut read_failed = (record_meta >> 24) & 1 != 0;
-    let out_near_entry_stack = (record_meta >> 25) & 1 != 0;
-    let header_read_before_reserve = (record_meta >> 26) & 1 != 0;
     let symbol_id = (record_meta >> 32) as u32;
     let read_table =
         name_class == DISCOVERY_NAME_NA || name_class == DISCOVERY_NAME_EXACT_STANDARD;
@@ -519,8 +516,6 @@ fn emit_export(
         }
     }
     if read_failed {
-        version_major = u8::from(out_near_entry_stack);
-        version_minor = u8::from(header_read_before_reserve);
         bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
     }
     let usable = discovery_usable_prefix(read_failed, completed);
@@ -565,8 +560,6 @@ fn emit_export(
 fn classify_export(args: &ExportArgs, scope: &ScopeAuth) {
     let record_meta = args.kind as u64
         | ((args.interface_index as u64) << 8)
-        | ((u64::from(args.diagnostic_flags) & 1) << 25)
-        | (((u64::from(args.diagnostic_flags) >> 1) & 1) << 26)
         | ((args.symbol_id as u64) << 32);
     if args.source == EXPORT_SOURCE_FUNCTION_LIST {
         let mut read_failed = false;
@@ -675,8 +668,7 @@ pub fn function_list_entry(ctx: ProbeContext) -> u32 {
         &ctx,
         StartState {
             arg0: ctx.arg::<u64>(0).unwrap_or(0),
-            // SAFETY: the uprobe context is the kernel-provided x86-64 pt_regs.
-            arg1: unsafe { (*ctx.regs).rsp },
+            arg1: 0,
         },
     );
     0
@@ -693,14 +685,6 @@ pub fn function_list_return(ctx: RetProbeContext) -> u32 {
     };
     let rv: u64 = ctx.ret();
     if rv == 0 {
-        let table_before_reserve =
-            unsafe { helpers::bpf_probe_read_user(state.arg0 as *const u64) }.ok();
-        let header_read_before_reserve = match table_before_reserve {
-            Some(table) if table != 0 => {
-                unsafe { helpers::bpf_probe_read_user(table as *const [u8; 2]) }.is_ok()
-            }
-            _ => false,
-        };
         classify_export(
             &ExportArgs {
                 kind: DISCOVERY_KIND_FUNCTION_LIST_RETURN,
@@ -709,8 +693,6 @@ pub fn function_list_return(ctx: RetProbeContext) -> u32 {
                 symbol_id: key.attach_cookie as u32,
                 announced_count: 0,
                 address: state.arg0,
-                diagnostic_flags: u8::from(state.arg0.abs_diff(state.arg1) <= 4096)
-                    | (u8::from(header_read_before_reserve) << 1),
             },
             &scope,
         );
@@ -895,7 +877,6 @@ pub fn interface_return(ctx: RetProbeContext) -> u32 {
                 symbol_id: key.attach_cookie as u32,
                 announced_count: 0,
                 address: state.arg0,
-                diagnostic_flags: 0,
             },
             &scope,
         );

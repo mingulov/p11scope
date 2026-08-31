@@ -28,7 +28,7 @@ use p11scope_ebpf_common::{
     DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
     DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER, DISCOVERY_NAME_EXACT_STANDARD,
     DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER, DISCOVERY_STATUS_LOADER_CONTEXT_INVALID,
-    DISCOVERY_STATUS_READ_FAILURE, DiscoveryRecord, valid_discovery_record,
+    DiscoveryRecord, valid_discovery_record,
 };
 use p11scope_manifest::elf::ElfSnapshot;
 use p11scope_manifest::manifest::{Acquisition, Manifest, Resolution, SCHEMA, WalkOutcome};
@@ -5619,82 +5619,6 @@ impl Engine {
         let lowered = {
             let view = &self.views[position];
             let maps = Self::read_maps(view)?;
-            if record.status_flags & DISCOVERY_STATUS_READ_FAILURE != 0 {
-                let hook_name = self.hooks.by_id(record.symbol_id).map(|(name, _)| name);
-                let (
-                    mapped,
-                    readable,
-                    writable,
-                    executable,
-                    provider_mapping,
-                    hook_address,
-                    first_slot_address,
-                ) = match resolve(&maps, record.table_ptr) {
-                    Resolved::File {
-                        raw_path,
-                        file_offset,
-                        device,
-                        inode,
-                        permissions,
-                        ..
-                    } => (
-                        true,
-                        permissions[0] == b'r',
-                        permissions[1] == b'w',
-                        permissions[2] == b'x',
-                        raw_path.ends_with(b"/provider-exported.so"),
-                        hook_name.is_some_and(|hook_name| {
-                            self.plan.slots.iter().any(|slot| {
-                                slot.file_offset == file_offset
-                                    && slot.names.iter().any(|name| name == hook_name)
-                                    && self.pinned.summary(slot.object).is_some_and(|summary| {
-                                        summary.key == ObjectKey { device, inode }
-                                    })
-                            })
-                        }),
-                        self.plan
-                            .modules
-                            .iter()
-                            .find(|module| module.key == ObjectKey { device, inode })
-                            .and_then(|module| self.pinned.file_for(module.object))
-                            .and_then(|file| ElfSnapshot::read(file).ok())
-                            .and_then(|snapshot| {
-                                snapshot.defined_symbol("C_Initialize").ok().flatten()
-                            })
-                            .is_some_and(|symbol| symbol.file_offset == file_offset),
-                    ),
-                    Resolved::Anonymous => (true, false, false, false, false, false, false),
-                    Resolved::Unmapped => (false, false, false, false, false, false, false),
-                };
-                let mut header = [0u8; 2];
-                let userspace_readable = view
-                    .run_while_same(|| {
-                        std::fs::File::open(format!("/proc/{pid}/mem"))
-                            .and_then(|mem| mem.read_at(&mut header, record.table_ptr))
-                    })
-                    .ok()
-                    .and_then(Result::ok)
-                    == Some(header.len());
-                let supported_header = userspace_readable
-                    && spans_for(u64::from(header[0]) | (u64::from(header[1]) << 8)).is_some();
-                eprintln!(
-                    "p11scope diagnostic: export bounded read failed: table_pointer={} out_near_entry_stack={} header_read_before_reserve={} mapped={} readable={} writable={} executable={} provider_mapping={} hook_address={} first_slot_address={} userspace_readable={} supported_header={} attempted={} completed={}",
-                    record.table_ptr != 0,
-                    record.version_major == 1,
-                    record.version_minor == 1,
-                    mapped,
-                    readable,
-                    writable,
-                    executable,
-                    provider_mapping,
-                    hook_address,
-                    first_slot_address,
-                    userspace_readable,
-                    supported_header,
-                    record.pointers_attempted,
-                    record.completed_prefix,
-                );
-            }
             lower_export_record(view, &maps, &self.hooks, record, &mut self.budget)
         };
         let Some(lowered) = lowered.map_err(|error| anyhow!(error))? else {

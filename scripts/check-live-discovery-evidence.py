@@ -1821,7 +1821,11 @@ def self_test():
             ),
             (
                 "glibc 31986 disposition",
-                _patch(manifest, ["loader", "interpreter", "rtld_audit_31986_fixed"], True),
+                _patch(
+                    manifest,
+                    ["loader", "interpreter", "rtld_audit_31986_fixed"],
+                    not manifest["loader"]["interpreter"]["rtld_audit_31986_fixed"],
+                ),
             ),
             (
                 "companion libc identity",

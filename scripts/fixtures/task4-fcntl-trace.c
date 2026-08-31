@@ -1403,6 +1403,7 @@ static int transition(struct collector *collector, const struct observation *obs
             collector->group_stop_state = 1;
             actions->resume = 1;
             actions->deliver_signal = SIGSTOP;
+            actions->signal_before_resume = 1;
             actions->signal_tid = -collector->root;
             return 0;
         }
@@ -3253,6 +3254,16 @@ static int stopping_signal_checks(void)
                 .signal_info = SIGNAL_INFO_EINVAL}, -2) != 0)
             return -1;
     }
+    negative_init(&collector, data, "sim-negative");
+    memset(&actions, 0, sizeof(actions));
+    if (negative_seed(&collector) != 0 ||
+        transition(&collector, &(struct observation){
+            .kind = OBS_SIGNAL_DELIVERY, .generation = 1, .status = SIGSTOP,
+            .signal_phase = SIGNAL_PHASE_GROUP_ARM}, &actions) != 0 ||
+        collector.group_stop_state != 1 || !actions.resume ||
+        actions.deliver_signal != SIGSTOP || !actions.signal_before_resume ||
+        actions.resume_signal != 0 || actions.signal_tid != -collector.root)
+        return -1;
     negative_init(&collector, data, "sim-negative");
     collector.group_stop_state = 2;
     if (negative_seed(&collector) != 0)

@@ -35,19 +35,25 @@ def oracle(document, doctor):
     scanned = document["scan"]["status"] == "scanned"
     assert scanned == ("memory scan available" in verdict), (document["scan"], verdict)
     if scanned:
-        # The scan decoded the provider's own table, at the version SoftHSM2
-        # publishes; a scan that "succeeded" and found nothing would be a gap.
-        tables = [
-            table
+        provider = next(
+            module
             for module in document["modules"]
             if module["path"].endswith("libsofthsm2.so")
-            for table in module["tables"]
-        ]
-        assert tables, document["modules"]
-        assert all(table["entries"] > 0 for table in tables), tables
-        return "inspect: OK", paths, [
-            (table["version"], table["walk"], table["entries"]) for table in tables
-        ]
+        )
+        tableless = {
+            "subject": provider["path"],
+            "reason": "no function table was found in its file-backed data; a table built at run time in .bss or on the heap is outside the memory scan's reach",
+        }
+        tableless_skips = [skip for skip in document.get("skipped", []) if skip == tableless]
+        if provider["tables"]:
+            assert not tableless_skips, document.get("skipped", [])
+            assert all(table["entries"] > 0 for table in provider["tables"]), provider["tables"]
+            return "inspect: OK", paths, [
+                (table["version"], table["walk"], table["entries"])
+                for table in provider["tables"]
+            ]
+        assert tableless_skips == [tableless], document.get("skipped", [])
+        return "inspect: OK (runtime-built table)", paths, tableless["reason"]
     assert document["scan"]["reason"], document["scan"]
     return "inspect: OK (scan refused, maps-only)", paths, document["scan"]["reason"]
 
@@ -81,6 +87,22 @@ SCANNED = {
         }
     ],
 }
+SCANNED_TABLELESS = {
+    "schema": "pkcs11-scope/inspect/v1",
+    "scan": {"status": "scanned", "reason": None},
+    "modules": [
+        {
+            "path": "/usr/lib64/pkcs11/libsofthsm2.so",
+            "tables": [],
+        }
+    ],
+    "skipped": [
+        {
+            "subject": "/usr/lib64/pkcs11/libsofthsm2.so",
+            "reason": "no function table was found in its file-backed data; a table built at run time in .bss or on the heap is outside the memory scan's reach",
+        }
+    ],
+}
 REFUSED = {
     "schema": "pkcs11-scope/inspect/v1",
     "scan": {"status": "refused", "reason": "ptrace_scope"},
@@ -96,6 +118,7 @@ HOST_DOCTOR = (
 
 if sys.argv[1] == "--self-test":
     oracle(SCANNED, SCANNED_DOCTOR)
+    oracle(SCANNED_TABLELESS, SCANNED_DOCTOR)
     oracle(REFUSED, REFUSED_DOCTOR)
     host_oracle(HOST_DOCTOR)
     mutations = [
@@ -118,6 +141,18 @@ if sys.argv[1] == "--self-test":
             "decoded entries",
             SCANNED,
             mutate(SCANNED, ["modules", 0, "tables"], [{"version": "2.40", "walk": "full", "entries": 0}]),
+            SCANNED_DOCTOR,
+        ),
+        (
+            "tableless reason",
+            SCANNED_TABLELESS,
+            mutate(SCANNED_TABLELESS, ["skipped", 0, "reason"], "other"),
+            SCANNED_DOCTOR,
+        ),
+        (
+            "tableless subject",
+            SCANNED_TABLELESS,
+            mutate(SCANNED_TABLELESS, ["skipped", 0, "subject"], "/usr/lib64/other.so"),
             SCANNED_DOCTOR,
         ),
         ("refusal reason", REFUSED, mutate(REFUSED, ["scan", "reason"], ""), REFUSED_DOCTOR),

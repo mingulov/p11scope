@@ -111,6 +111,14 @@ fn first_executable_offset(path: &Path) -> u64 {
         .0
 }
 
+fn first_non_executable_offset(path: &Path) -> u64 {
+    let file = p11scope_manifest::identity::open_object(path).unwrap();
+    let inspected = p11scope_manifest::identity::inspect_file(&file).unwrap();
+    (0..file.metadata().unwrap().len())
+        .find(|offset| !inspected.contains_executable_offset(*offset))
+        .expect("fixture has a non-executable file byte")
+}
+
 #[test]
 fn manifest_input_is_regular_utf8_and_bounded() {
     let d = tmpdir("manifest_pinning_input");
@@ -692,6 +700,7 @@ fn symlink_is_pinned_and_non_executable_offsets_are_refused() {
     );
 
     let mut offset_manifest = manifest_for(&so);
+    let non_executable_offset = first_non_executable_offset(&so);
     offset_manifest.surfaces[0] = SurfaceRecord {
         source: SurfaceSource::LegacyFunctionList,
         acquisition: Acquisition::Ok,
@@ -704,7 +713,7 @@ fn symlink_is_pinned_and_non_executable_offsets_are_refused() {
                 resolution: Resolution::Resolved {
                     object: 0,
                     file_offset: if field.name == "C_Initialize" {
-                        0
+                        non_executable_offset
                     } else {
                         first_executable_offset(&so)
                     },

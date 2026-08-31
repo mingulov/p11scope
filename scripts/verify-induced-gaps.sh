@@ -105,7 +105,7 @@ static void fd_array(const char *name, int target, const struct bpf_map_info *in
         object_fd = open(cgroup_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (object_fd < 0) die("open cgroup");
     } else {
-        if (lookup(target, &key, &object_id)) die("lookup TEMPLATE_TAIL program id");
+        if (lookup(target, &key, &object_id)) die("lookup TAIL_CALLS program id");
         object_fd = fd_by_id(BPF_PROG_GET_FD_BY_ID, object_id);
     }
     int control = map_create(info);
@@ -133,7 +133,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "%s=%u exact map identity mismatch: id=%u name=%s\n",
                     argv[i], id, info.id, info.name); return 1;
         }
-        if (!strcmp(argv[i], "CGROUP_FILTER") || !strcmp(argv[i], "TEMPLATE_TAIL"))
+        if (!strcmp(argv[i], "CGROUP_FILTER") || !strcmp(argv[i], "TAIL_CALLS"))
             fd_array(argv[i], target, &info, argv[2]);
         else ordinary(argv[i], target, &info, workload_pid);
         printf("%s id=%u: unfrozen matched control succeeded; frozen mutation EPERM\n", argv[i], id);
@@ -293,7 +293,7 @@ policy_map_ids() {
     $pmi_python - "$@" <<'PY'
 import json, os, sys
 expected = {"CONFIG", "PID_FILTER", "CGROUP_FILTER", "DESCRIPTORS",
-            "ASYNC_FUNCTIONS", "MECH_SHAPE", "ATTR_BOOL_BITS", "TEMPLATE_TAIL"}
+            "ASYNC_FUNCTIONS", "MECH_SHAPE", "ATTR_BOOL_BITS", "TAIL_CALLS"}
 
 
 def oracle(items, output_path):

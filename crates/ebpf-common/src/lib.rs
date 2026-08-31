@@ -230,6 +230,8 @@ pub const COALESCED_NO_HELPER_RC: i64 = i64::MIN;
 
 pub const DISCOVERY_POINTERS: usize = 104;
 pub const DISCOVERY_INTERFACES: u8 = 16;
+pub const TAIL_CALLS_INTERFACE_WORKER_SLOT: u32 = 0;
+pub const TAIL_CALLS_TEMPLATE_SECOND_SLOT: u32 = 1;
 #[cfg(not(feature = "small-discovery-ring"))]
 pub const DISCOVERY_BYTES: u32 = 65_536;
 #[cfg(feature = "small-discovery-ring")]
@@ -276,6 +278,54 @@ pub const fn discovery_pause_coalesced(previous: u64, won: bool) -> bool {
 
 pub const fn discovery_state_take_failed(state_present: bool, removed: bool) -> bool {
     !state_present || !removed
+}
+
+/// Pack the bounded interface-list count and index into the private state.
+/// Values above the ABI's u32 count saturate; the upper 24 bits stay zero.
+pub const fn interface_continuation_pack(announced_count: u64, index: u8) -> u64 {
+    let saturated_count = if announced_count > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        announced_count as u32
+    };
+    ((saturated_count as u64) << 8) | index as u64
+}
+
+/// Decode a continuation only when its reserved bits and finite bounds hold.
+pub const fn interface_continuation_unpack(value: u64) -> Option<(u32, u8)> {
+    if value >> 40 != 0 {
+        return None;
+    }
+    let announced_count = (value >> 8) as u32;
+    let index = value as u8;
+    let active_count = if announced_count < DISCOVERY_INTERFACES as u32 {
+        announced_count
+    } else {
+        DISCOVERY_INTERFACES as u32
+    };
+    if index >= DISCOVERY_INTERFACES || index as u32 >= active_count {
+        None
+    } else {
+        Some((announced_count, index))
+    }
+}
+
+/// Advance a valid continuation, or finish after its last bounded interface.
+pub const fn interface_continuation_next(value: u64) -> Option<u64> {
+    let Some((announced_count, index)) = interface_continuation_unpack(value) else {
+        return None;
+    };
+    let next = index + 1;
+    let active_count = if announced_count < DISCOVERY_INTERFACES as u32 {
+        announced_count
+    } else {
+        DISCOVERY_INTERFACES as u32
+    };
+    if next as u32 >= active_count {
+        None
+    } else {
+        Some(interface_continuation_pack(announced_count as u64, next))
+    }
 }
 
 #[repr(C)]
@@ -776,7 +826,7 @@ pub struct CallStart {
     pub attr_bools_seen1: u32,
     pub capture: u32,
     pub target_function: u32,
-    pub _pad: u32,
+    pub _pad: u64,
 }
 
 /// One completed call. Emitted at return only: a call with no return is
@@ -924,6 +974,11 @@ mod tests {
         assert_eq!(core::mem::size_of::<Event>(), 288);
         assert_eq!(core::mem::align_of::<CallStart>(), 8);
         assert_eq!(core::mem::align_of::<Event>(), 8);
+        let call_start = CallStart::default();
+        assert_eq!(
+            core::mem::offset_of!(CallStart, _pad) + core::mem::size_of_val(&call_start._pad),
+            core::mem::size_of::<CallStart>()
+        );
     }
 
     #[test]
@@ -1056,6 +1111,70 @@ mod tests {
         assert!(!discovery_state_take_failed(true, true));
         assert!(discovery_state_take_failed(false, true));
         assert!(discovery_state_take_failed(true, false));
+    }
+
+    #[test]
+    fn interface_continuation_packs_decodes_and_progresses() {
+        assert_eq!(TAIL_CALLS_INTERFACE_WORKER_SLOT, 0);
+        assert_eq!(TAIL_CALLS_TEMPLATE_SECOND_SLOT, 1);
+        assert_eq!(interface_continuation_pack(1, 0), 1u64 << 8);
+        assert_eq!(interface_continuation_pack(16, 15), (16u64 << 8) | 15);
+        assert_eq!(interface_continuation_pack(17, 0), 17u64 << 8);
+        assert_eq!(
+            interface_continuation_pack(u64::from(u32::MAX), 0),
+            u64::from(u32::MAX) << 8
+        );
+        assert_eq!(
+            interface_continuation_pack(u64::MAX, 15),
+            (u64::from(u32::MAX) << 8) | 15
+        );
+
+        assert_eq!(
+            interface_continuation_unpack(interface_continuation_pack(1, 0)),
+            Some((1, 0))
+        );
+        assert_eq!(
+            interface_continuation_unpack(interface_continuation_pack(16, 15)),
+            Some((16, 15))
+        );
+        assert_eq!(
+            interface_continuation_unpack(interface_continuation_pack(17, 15)),
+            Some((17, 15))
+        );
+        assert_eq!(
+            interface_continuation_unpack(interface_continuation_pack(u64::MAX, 15)),
+            Some((u32::MAX, 15))
+        );
+        assert_eq!(
+            interface_continuation_unpack(interface_continuation_pack(1, 15)),
+            None
+        );
+        assert_eq!(
+            interface_continuation_unpack(interface_continuation_pack(16, 16)),
+            None
+        );
+        assert_eq!(
+            interface_continuation_unpack(interface_continuation_pack(0, 0)),
+            None
+        );
+        assert_eq!(interface_continuation_unpack(1u64 << 40), None);
+
+        assert_eq!(
+            interface_continuation_next(interface_continuation_pack(1, 0)),
+            None
+        );
+        assert_eq!(
+            interface_continuation_next(interface_continuation_pack(16, 14)),
+            Some(interface_continuation_pack(16, 15))
+        );
+        assert_eq!(
+            interface_continuation_next(interface_continuation_pack(16, 15)),
+            None
+        );
+        assert_eq!(
+            interface_continuation_next(interface_continuation_pack(17, 15)),
+            None
+        );
     }
 
     /// Mutation caught: reordering a counter silently assigns one kernel loss

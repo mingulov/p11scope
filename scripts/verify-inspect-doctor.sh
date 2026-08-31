@@ -35,25 +35,28 @@ def oracle(document, doctor):
     scanned = document["scan"]["status"] == "scanned"
     assert scanned == ("memory scan available" in verdict), (document["scan"], verdict)
     if scanned:
-        provider = next(
+        details = []
+        for provider in [
             module
             for module in document["modules"]
             if module["path"].endswith("libsofthsm2.so")
-        )
-        tableless = {
-            "subject": provider["path"],
-            "reason": "no function table was found in its file-backed data; a table built at run time in .bss or on the heap is outside the memory scan's reach",
-        }
-        tableless_skips = [skip for skip in document.get("skipped", []) if skip == tableless]
-        if provider["tables"]:
-            assert not tableless_skips, document.get("skipped", [])
-            assert all(table["entries"] > 0 for table in provider["tables"]), provider["tables"]
-            return "inspect: OK", paths, [
-                (table["version"], table["walk"], table["entries"])
-                for table in provider["tables"]
-            ]
-        assert tableless_skips == [tableless], document.get("skipped", [])
-        return "inspect: OK (runtime-built table)", paths, tableless["reason"]
+        ]:
+            tableless = {
+                "subject": provider["path"],
+                "reason": "no function table was found in its file-backed data; a table built at run time in .bss or on the heap is outside the memory scan's reach",
+            }
+            tableless_skips = [skip for skip in document.get("skipped", []) if skip == tableless]
+            if provider["tables"]:
+                assert not tableless_skips, document.get("skipped", [])
+                assert all(table["entries"] > 0 for table in provider["tables"]), provider["tables"]
+                details.extend(
+                    (table["version"], table["walk"], table["entries"])
+                    for table in provider["tables"]
+                )
+            else:
+                assert tableless_skips == [tableless], document.get("skipped", [])
+                details.append(tableless["reason"])
+        return "inspect: OK", paths, details
     assert document["scan"]["reason"], document["scan"]
     return "inspect: OK (scan refused, maps-only)", paths, document["scan"]["reason"]
 
@@ -153,6 +156,18 @@ if sys.argv[1] == "--self-test":
             "tableless subject",
             SCANNED_TABLELESS,
             mutate(SCANNED_TABLELESS, ["skipped", 0, "subject"], "/usr/lib64/other.so"),
+            SCANNED_DOCTOR,
+        ),
+        (
+            "tableless missing",
+            SCANNED_TABLELESS,
+            mutate(SCANNED_TABLELESS, ["skipped"], []),
+            SCANNED_DOCTOR,
+        ),
+        (
+            "tableless duplicated",
+            SCANNED_TABLELESS,
+            mutate(SCANNED_TABLELESS, ["skipped"], SCANNED_TABLELESS["skipped"] * 2),
             SCANNED_DOCTOR,
         ),
         ("refusal reason", REFUSED, mutate(REFUSED, ["scan", "reason"], ""), REFUSED_DOCTOR),

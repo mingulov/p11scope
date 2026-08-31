@@ -3832,6 +3832,25 @@ fn live_discovery_fixtures_have_two_byte_identities_and_three_surfaces() {
 }
 
 #[test]
+fn live_discovery_post_gate_reads_after_done_marker() {
+    let driver = read("tests/fixtures/live-discovery-driver.c");
+    let done = driver
+        .find("emit(\"P11SCOPE_FIXTURE driver done\\n\");")
+        .expect("driver must emit its existing done marker");
+    let post_gate = driver
+        .find("const char *post_gate = getenv(\"P11SCOPE_FIXTURE_POST_GATE\");")
+        .expect("driver must expose the optional post-call gate");
+    let post_read = post_gate
+        + driver[post_gate..]
+            .find("read(STDIN_FILENO, &byte, 1)")
+            .expect("post-call gate must read exactly one byte");
+    assert!(
+        done < post_read,
+        "post-call gate must read only after the successful-call done marker"
+    );
+}
+
+#[test]
 fn lane13_cleanup_never_removes_unowned_collision_paths() {
     // Break caught: an early collision used to flow into the EXIT trap, which
     // unlinked the caller's kubeconfig although this run never created it.

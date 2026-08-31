@@ -25,6 +25,9 @@
  * Environment:
  *   P11SCOPE_FIXTURE_GATE=1     read one byte from stdin before doing anything,
  *                               so an external-PID lane can attach first
+ *   P11SCOPE_FIXTURE_POST_GATE=1
+ *                               emit the done marker after successful calls,
+ *                               then read one byte before exiting
  *   P11SCOPE_FIXTURE_REPEAT=N   call every surface N times (loss lanes)
  *   P11SCOPE_FIXTURE_INTERFACES=N
  *                               use exactly N interface records for N in
@@ -237,5 +240,12 @@ int main(int argc, char **argv) {
         return status;
     }
     emit("P11SCOPE_FIXTURE driver done\n");
+    const char *post_gate = getenv("P11SCOPE_FIXTURE_POST_GATE");
+    if (post_gate != NULL && post_gate[0] == '1') {
+        unsigned char byte = 0;
+        if (read(STDIN_FILENO, &byte, 1) != 1) {
+            return EXIT_GATE;
+        }
+    }
     return 0;
 }

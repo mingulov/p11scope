@@ -25,7 +25,13 @@
  * Environment:
  *   P11SCOPE_FIXTURE_GATE=1     read one byte from stdin before doing anything,
  *                               so an external-PID lane can attach first
+ *   P11SCOPE_FIXTURE_POST_GATE=1
+ *                               emit the done marker after successful calls,
+ *                               then read one byte before exiting
  *   P11SCOPE_FIXTURE_REPEAT=N   call every surface N times (loss lanes)
+ *   P11SCOPE_FIXTURE_INTERFACES=N
+ *                               use exactly N interface records for N in
+ *                               {0, 1, 16, 17}; absent/invalid values use 1.
  */
 
 #include <dlfcn.h>
@@ -43,10 +49,14 @@ typedef struct {
     void *pFunctionList;
     CK_FLAGS flags;
 } CK_INTERFACE;
+typedef CK_INTERFACE *CK_INTERFACE_PTR;
+typedef CK_INTERFACE_PTR *CK_INTERFACE_PTR_PTR;
+
+#define P11SCOPE_FIXTURE_MAX_INTERFACES 17
 
 typedef CK_RV (*get_function_list_fn)(void **);
 typedef CK_RV (*get_interface_list_fn)(CK_INTERFACE *, CK_ULONG *);
-typedef CK_RV (*get_interface_fn)(void *, void *, void **, CK_FLAGS);
+typedef CK_RV (*get_interface_fn)(void *, void *, CK_INTERFACE_PTR_PTR, CK_FLAGS);
 
 #define EXIT_USAGE 2
 #define EXIT_GATE 3
@@ -70,6 +80,25 @@ static long repeat_count(void) {
     return parsed > 0 ? parsed : 1;
 }
 
+static CK_ULONG fixture_interface_count(void) {
+    const char *value = getenv("P11SCOPE_FIXTURE_INTERFACES");
+    if (value != NULL) {
+        if (strcmp(value, "0") == 0) {
+            return 0;
+        }
+        if (strcmp(value, "1") == 0) {
+            return 1;
+        }
+        if (strcmp(value, "16") == 0) {
+            return 16;
+        }
+        if (strcmp(value, "17") == 0) {
+            return 17;
+        }
+    }
+    return 1;
+}
+
 struct provider_surfaces {
     get_function_list_fn get_function_list;
     get_interface_list_fn get_interface_list;
@@ -78,19 +107,25 @@ struct provider_surfaces {
 
 /* Calls all three standard return ABIs, in a fixed order, `repeat` times. */
 static int drive(struct provider_surfaces surfaces, long repeat) {
+    CK_ULONG expected = fixture_interface_count();
     for (long index = 0; index < repeat; index++) {
         void *table = NULL;
         if (surfaces.get_function_list(&table) != 0 || table == NULL) {
             return EXIT_SURFACE;
         }
-        CK_INTERFACE interface;
-        CK_ULONG count = 1;
-        if (surfaces.get_interface_list(&interface, &count) != 0 || count != 1) {
+        CK_INTERFACE interfaces[P11SCOPE_FIXTURE_MAX_INTERFACES];
+        CK_ULONG count = P11SCOPE_FIXTURE_MAX_INTERFACES;
+        if (surfaces.get_interface_list(interfaces, &count) != 0 || count != expected) {
             return EXIT_SURFACE;
         }
-        table = NULL;
-        if (surfaces.get_interface(NULL, NULL, &table, 0) != 0 || table == NULL) {
-            return EXIT_SURFACE;
+        if (expected != 0) {
+            CK_INTERFACE_PTR interface = NULL;
+            if (surfaces.get_interface(NULL, NULL, &interface, 0) != 0 ||
+                interface == NULL || interface->pInterfaceName == NULL ||
+                strcmp(interface->pInterfaceName, "PKCS 11") != 0 ||
+                interface->pFunctionList == NULL || interface->flags != 0) {
+                return EXIT_SURFACE;
+            }
         }
     }
     return 0;
@@ -99,7 +134,8 @@ static int drive(struct provider_surfaces surfaces, long repeat) {
 #if defined(P11SCOPE_DRIVER_NEEDED)
 extern CK_RV C_GetFunctionList(void **out);
 extern CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count);
-extern CK_RV C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags);
+extern CK_RV C_GetInterface(void *name, void *version, CK_INTERFACE_PTR_PTR out,
+                            CK_FLAGS flags);
 #endif
 
 static int drive_dlopened(const char *path, long repeat) {
@@ -204,5 +240,12 @@ int main(int argc, char **argv) {
         return status;
     }
     emit("P11SCOPE_FIXTURE driver done\n");
+    const char *post_gate = getenv("P11SCOPE_FIXTURE_POST_GATE");
+    if (post_gate != NULL && post_gate[0] == '1') {
+        unsigned char byte = 0;
+        if (read(STDIN_FILENO, &byte, 1) != 1) {
+            return EXIT_GATE;
+        }
+    }
     return 0;
 }

@@ -186,6 +186,14 @@ enum SurfaceOccurrence {
         functions: usize,
         occurrence: usize,
     },
+    Interface {
+        module: plan::ModuleId,
+        index: usize,
+        name_class: &'static str,
+        version: (u8, u8),
+        walk: String,
+        functions: usize,
+    },
     Manifest {
         module: plan::ModuleId,
         manifest: u32,
@@ -632,6 +640,32 @@ impl CaptureFacts {
                         acquisition: "ok".into(),
                         functions,
                     });
+                for interface in module
+                    .scanned
+                    .interfaces
+                    .iter()
+                    .filter(|interface| interface.table == Some(table_index))
+                {
+                    history
+                        .surfaces
+                        .entry(SurfaceOccurrence::Interface {
+                            module: owner,
+                            index: interface.index,
+                            name_class: interface.name_class,
+                            version: table.version,
+                            walk: table.walk.to_string(),
+                            functions,
+                        })
+                        .or_insert_with(|| plan::SurfaceSummary {
+                            source: format!(
+                                "interface[{}] {}",
+                                interface.index, interface.name_class
+                            ),
+                            walk: table.walk.to_string(),
+                            acquisition: "ok".into(),
+                            functions,
+                        });
+                }
                 let table_fact = (table.version, table.entries.len());
                 let table_occurrence = tables.entry(table_fact).or_insert(0usize);
                 history
@@ -3778,7 +3812,16 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
         interface.table = interface
             .table
             .and_then(|index| table_indices.get(index).copied());
-        if !existing.interfaces.contains(&interface) {
+        if let Some(known) = existing.interfaces.iter_mut().find(|known| {
+            known.index == interface.index
+                && known.name_class == interface.name_class
+                && known.flags == interface.flags
+                && known.table == interface.table
+        }) {
+            if known.name_lossy.is_none() {
+                known.name_lossy = interface.name_lossy;
+            }
+        } else {
             existing.interfaces.push(interface);
         }
     }
@@ -5818,7 +5861,7 @@ impl Engine {
         let collected = self.collect_dynamic_export_work(
             context_id,
             &export_modules,
-            &candidate,
+            &candidate.pinned,
             session,
             terminal_owner.is_some(),
             &terminal_exports,
@@ -5894,7 +5937,7 @@ impl Engine {
         &mut self,
         context: LoaderContextId,
         modules: &[ScannedModule],
-        candidate: &LiveCandidate,
+        pinned: &PinnedObjects,
         session: &dyn EngineSession,
         terminal: bool,
         terminal_exports: &[DynamicExportIdentity],
@@ -5910,10 +5953,7 @@ impl Engine {
                 .exports
                 .iter()
                 .any(|name| name == "C_GetFunctionList");
-            let Some(object) = candidate
-                .pinned
-                .id_for_scanned(module, module.key, &module.path)
-            else {
+            let Some(object) = pinned.id_for_scanned(module, module.key, &module.path) else {
                 if requires_seed {
                     collected.required_seed_complete = false;
                     self.mark_partial(
@@ -5923,9 +5963,8 @@ impl Engine {
                 }
                 continue;
             };
-            let timing_key = candidate.pinned.owned_timing_key(object);
-            let snapshot = candidate
-                .pinned
+            let timing_key = pinned.owned_timing_key(object);
+            let snapshot = pinned
                 .file_for(object)
                 .and_then(|file| ElfSnapshot::read(file).ok());
             if requires_seed {
@@ -6086,6 +6125,48 @@ impl Engine {
             }
         }
         (retire, complete)
+    }
+
+    fn attach_refreshed_exports(
+        &mut self,
+        view: ProcessViewId,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+    ) -> (bool, bool) {
+        let modules: Vec<_> = self
+            .modules
+            .iter()
+            .filter(|module| module.scanned.view == view && !module.scanned.exports.is_empty())
+            .map(|module| module.scanned.clone())
+            .collect();
+        if modules.is_empty() {
+            return (false, true);
+        }
+        let contexts: Vec<_> = self
+            .loader_registry
+            .ids_for_view(view)
+            .into_iter()
+            .filter(|context| {
+                !self.loader_registry.is_tombstoned(*context)
+                    && self
+                        .loader_registry
+                        .context(*context)
+                        .is_some_and(|context| context.was_attached)
+            })
+            .collect();
+        let [context] = contexts.as_slice() else {
+            self.mark_partial(
+                "live export hook",
+                "a refreshed provider had no unique attached loader context",
+            );
+            return (false, false);
+        };
+        let pinned = self.pinned.clone();
+        let collected =
+            self.collect_dynamic_export_work(*context, &modules, &pinned, session, false, &[]);
+        let (retire, complete) =
+            self.attach_export_work(view, &collected.dynamic, session, additions_allowed);
+        (retire, complete && collected.required_seed_complete)
     }
 
     fn arm_loader_for_view(
@@ -8142,6 +8223,16 @@ impl Engine {
         let fatal = match arm_result {
             Ok(arm_changed) => {
                 changed |= arm_changed;
+                for view in refreshed_ok.union(&new_view_ids).copied() {
+                    let (retire, complete) =
+                        self.attach_refreshed_exports(view, session, additions_allowed);
+                    if retire {
+                        self.queue_stale_views(&[view].into_iter().collect(), pending_views);
+                    }
+                    if !complete {
+                        closure.fail();
+                    }
+                }
                 None
             }
             Err(error) => Some(error),
@@ -9363,6 +9454,34 @@ mod tests {
         assert_eq!(engine.plan.entries_seen, 2);
         assert_eq!(engine.plan.surfaces.len(), 2);
         assert_eq!(engine.discovery.modules.len(), 2);
+    }
+
+    #[test]
+    fn accepted_capture_facts_publish_scanned_interface_surfaces() {
+        let (mut engine, _, _, _) = engine_with_overlay(45);
+        engine.modules[0].scanned.interfaces.push(ScannedInterface {
+            index: 0,
+            name_class: "exact_standard",
+            name_lossy: None,
+            flags: 0,
+            table: Some(0),
+        });
+        engine.plan = plan::build_from_reconciled_modules(&engine.modules);
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+
+        engine.publish_current_capture_facts().unwrap();
+
+        assert_eq!(engine.plan.surfaces.len(), 2);
+        assert_eq!(
+            engine.plan.surfaces[1].source,
+            "interface[0] exact_standard"
+        );
+
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(engine.plan.surfaces.len(), 2, "surface is not duplicated");
     }
 
     #[test]
@@ -11841,6 +11960,20 @@ int C_GetFunctionList(void **out) {
     if (out != NULL) *out = NULL;
     return 0;
 }
+__attribute__((visibility("default"), noinline))
+int C_GetInterfaceList(void *out, unsigned long *count) {
+    if (out != NULL) *(void **)out = NULL;
+    if (count != NULL) *count = 0;
+    return 0;
+}
+__attribute__((visibility("default"), noinline))
+int C_GetInterface(const char *name, void *version, void **out, unsigned long flags) {
+    (void)name;
+    (void)version;
+    (void)flags;
+    if (out != NULL) *out = NULL;
+    return 0;
+}
 "#,
         )
         .unwrap();
@@ -11951,6 +12084,48 @@ int main(int argc, char **argv) {
     }
 
     #[test]
+    fn exec_refresh_attaches_provider_exports_before_readiness() {
+        let (fixture, view, _module, _pins) = loaded_seed_provider();
+        let pid = view.pid();
+        let view_id = view.id();
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Pid(pid);
+        engine.next_view_id = 1;
+        engine.module_hints = vec![fixture._dir.path().join("seed-provider.so")];
+        engine.views.push(view);
+        let mut session = ScriptedSession::default();
+        engine
+            .arm_loader_or_partial(
+                0,
+                &mut session,
+                &mut true,
+                &mut PendingViewRetirements::new(),
+            )
+            .unwrap();
+        let retired = engine.loader_registry.ids_for_view(view_id)[0];
+        let mut exec: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exec.kind = DISCOVERY_KIND_EXEC;
+        exec.pid_tgid = u64::from(pid) << 32;
+        exec.hook_ts_ns = engine.views[0].admitted_ns();
+
+        let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![exec]).unwrap();
+
+        assert!(outcome.required_complete);
+        let contexts = engine.loader_registry.ids_for_view(view_id);
+        assert_eq!(contexts.len(), 1);
+        assert_ne!(contexts[0], retired);
+        assert_eq!(
+            session
+                .dynamic_attach_calls
+                .iter()
+                .map(|export| export.cookie)
+                .collect::<BTreeSet<_>>(),
+            [1, 2, 3].into_iter().collect(),
+            "readiness requires all configured exports from the refreshed provider"
+        );
+    }
+
+    #[test]
     fn loader_batch_route_adds_one_count_only_seed_without_table_surface() {
         let (_dir, mut engine, _context, record, mut session) = armed_seed_route(2);
         let first = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
@@ -11994,8 +12169,8 @@ int main(int argc, char **argv) {
         );
         assert_eq!(
             session.dynamic_attach_calls.len(),
-            1,
-            "an exact repeated loader record does not reattach the export"
+            3,
+            "an exact repeated loader record does not reattach the exports"
         );
         assert_eq!(
             engine
@@ -12082,7 +12257,7 @@ int main(int argc, char **argv) {
         let collected = engine.collect_dynamic_export_work(
             LoaderContextId::from_case_id(0),
             std::slice::from_ref(&module),
-            &candidate,
+            &candidate.pinned,
             &ScriptedSession::default(),
             false,
             &[],
@@ -12116,7 +12291,7 @@ int main(int argc, char **argv) {
         let collected = engine.collect_dynamic_export_work(
             LoaderContextId::from_case_id(0),
             std::slice::from_ref(&module),
-            &candidate,
+            &candidate.pinned,
             &ScriptedSession::default(),
             false,
             &[],
@@ -12147,7 +12322,7 @@ int main(int argc, char **argv) {
         let collected = engine.collect_dynamic_export_work(
             LoaderContextId::from_case_id(0),
             std::slice::from_ref(&module),
-            &candidate,
+            &candidate.pinned,
             &ScriptedSession::default(),
             false,
             &[],
@@ -14657,6 +14832,47 @@ int main(int argc, char **argv) {
                 "a successful or early-return arm must enter cleanup and retain its change bit"
             );
         }
+    }
+
+    #[test]
+    fn merge_scanned_interfaces_retains_the_richer_name() {
+        let module = |name_lossy| ScannedModule {
+            view: ProcessViewId(0),
+            mount_namespace: crate::process::MountNamespaceId {
+                device: 1,
+                inode: 2,
+            },
+            key: ObjectKey {
+                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                inode: 42,
+            },
+            path: "/opt/p.so".into(),
+            exports: vec![],
+            tables: vec![ScannedTable {
+                version: (3, 0),
+                walk: "full",
+                entries: vec![],
+                null_entries: vec![],
+                unpinned: vec![],
+                address: 0x1000,
+            }],
+            interfaces: vec![ScannedInterface {
+                index: 0,
+                name_class: "exact_standard",
+                name_lossy,
+                flags: 7,
+                table: Some(0),
+            }],
+        };
+
+        let mut merged = vec![module(Some("PKCS 11".into()))];
+        merge_scanned_module(&mut merged, module(None));
+
+        assert_eq!(merged[0].interfaces.len(), 1);
+        assert_eq!(
+            merged[0].interfaces[0].name_lossy.as_deref(),
+            Some("PKCS 11")
+        );
     }
 
     #[test]

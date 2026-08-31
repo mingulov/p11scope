@@ -19,7 +19,8 @@ use p11scope_ebpf_common::{
     DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
     FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED, FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
     FUNCTION_NAME_MAX_BYTES, FunctionNameKey, MAX_DESCRIPTORS, PAUSE_ARMED, PauseKey,
-    SlotSemantics, attach_cookie,
+    SlotSemantics, TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_TEMPLATE_SECOND_SLOT,
+    attach_cookie,
 };
 use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -80,7 +81,7 @@ const fn map_metadata(
     }
 }
 
-const BASE_POLICY_MAPS: [(&str, ExactMapMetadata); 6] = [
+const BASE_POLICY_MAPS: [(&str, ExactMapMetadata); 7] = [
     (
         "CONFIG",
         map_metadata(MapType::Array, 4, 8, 1, BPF_F_RDONLY_PROG),
@@ -111,19 +112,17 @@ const BASE_POLICY_MAPS: [(&str, ExactMapMetadata); 6] = [
             BPF_F_RDONLY_PROG,
         ),
     ),
-];
-const FEATURE_POLICY_MAPS: [(&str, ExactMapMetadata); 2] = [
     (
-        "ATTR_BOOL_BITS",
-        map_metadata(MapType::Hash, 4, 4, 16, BPF_F_RDONLY_PROG),
-    ),
-    (
-        "TEMPLATE_TAIL",
-        map_metadata(MapType::ProgramArray, 4, 4, 1, 0),
+        "TAIL_CALLS",
+        map_metadata(MapType::ProgramArray, 4, 4, 2, 0),
     ),
 ];
-const TAIL_POLICY_MAP: &str = "TEMPLATE_TAIL";
-const DEFAULT_PROGRAMS: [&str; 12] = [
+const FEATURE_POLICY_MAPS: [(&str, ExactMapMetadata); 1] = [(
+    "ATTR_BOOL_BITS",
+    map_metadata(MapType::Hash, 4, 4, 16, BPF_F_RDONLY_PROG),
+)];
+const TAIL_POLICY_MAP: &str = "TAIL_CALLS";
+const DEFAULT_PROGRAMS: [&str; 13] = [
     "p11_entry",
     "p11_return",
     "sched_process_fork",
@@ -132,6 +131,7 @@ const DEFAULT_PROGRAMS: [&str; 12] = [
     "function_list_return",
     "interface_list_entry",
     "interface_list_return",
+    "interface_list_worker",
     "interface_entry",
     "interface_return",
     "sched_process_exec",
@@ -875,15 +875,12 @@ fn publish_attribute_catalog(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
 
 fn freeze_published_maps(ebpf: &Ebpf) -> Result<()> {
     for (name, _) in BASE_POLICY_MAPS {
-        if name == "DESCRIPTORS" {
+        if matches!(name, "DESCRIPTORS" | TAIL_POLICY_MAP) {
             continue;
         }
         freeze_map(name, ebpf.map(name).with_context(|| format!("{name} map"))?)?;
     }
     for (name, _) in FEATURE_POLICY_MAPS {
-        if name == TAIL_POLICY_MAP {
-            continue;
-        }
         if let Some(map) = ebpf.map(name) {
             freeze_map(name, map)?;
         }
@@ -953,52 +950,46 @@ fn validate_program_inventory(ebpf: &Ebpf, unsafe_enabled: bool) -> Result<()> {
     Ok(())
 }
 
-fn publish_and_freeze_template_tail(
-    ebpf: &mut Ebpf,
-    object_has_unsafe: bool,
-    enabled: bool,
-) -> Result<()> {
-    if ebpf.map(TAIL_POLICY_MAP).is_none() {
-        if object_has_unsafe {
-            bail!("{TAIL_POLICY_MAP} is missing from the diagnostic eBPF object");
-        }
-        return Ok(());
-    }
-    if !object_has_unsafe {
-        bail!("{TAIL_POLICY_MAP} must be absent from the default eBPF object");
-    }
-    if enabled {
-        let (tail_fd, expected_id) = {
-            let tail: &UProbe = ebpf
-                .program("p11_entry_template_second")
-                .context("program p11_entry_template_second missing from object")?
-                .try_into()?;
-            (tail.fd()?.try_clone()?, tail.info()?.id())
-        };
+fn publish_and_freeze_tail_calls(ebpf: &mut Ebpf, enabled: bool) -> Result<()> {
+    let (worker_fd, worker_id) = {
+        let worker: &UProbe = ebpf
+            .program("interface_list_worker")
+            .context("program interface_list_worker missing from object")?
+            .try_into()?;
+        (worker.fd()?.try_clone()?, worker.info()?.id())
+    };
+    let second = if enabled {
+        let second: &UProbe = ebpf
+            .program("p11_entry_template_second")
+            .context("program p11_entry_template_second missing from object")?
+            .try_into()?;
+        Some((second.fd()?.try_clone()?, second.info()?.id()))
+    } else {
+        None
+    };
+    {
         let mut tails: ProgramArray<_> =
-            ProgramArray::try_from(ebpf.map_mut(TAIL_POLICY_MAP).context("TEMPLATE_TAIL map")?)?;
-        tails.set(0, &tail_fd, 0)?;
-        let actual_id = program_array_id(
-            TAIL_POLICY_MAP,
-            ebpf.map(TAIL_POLICY_MAP).context("TEMPLATE_TAIL map")?,
-            0,
-        )?;
-        if actual_id != Some(expected_id) {
-            bail!(
-                "TEMPLATE_TAIL exact readback id {actual_id:?} differs from loaded program {expected_id}"
-            );
+            ProgramArray::try_from(ebpf.map_mut(TAIL_POLICY_MAP).context("TAIL_CALLS map")?)?;
+        tails.set(TAIL_CALLS_INTERFACE_WORKER_SLOT, &worker_fd, 0)?;
+        if let Some((second_fd, _)) = second.as_ref() {
+            tails.set(TAIL_CALLS_TEMPLATE_SECOND_SLOT, second_fd, 0)?;
         }
-    } else if let Some(id) = program_array_id(
-        TAIL_POLICY_MAP,
-        ebpf.map(TAIL_POLICY_MAP).context("TEMPLATE_TAIL map")?,
-        0,
-    )? {
-        bail!("TEMPLATE_TAIL unexpectedly contains program id {id} for the selected policy");
     }
-    freeze_map(
-        TAIL_POLICY_MAP,
-        ebpf.map(TAIL_POLICY_MAP).context("TEMPLATE_TAIL map")?,
-    )
+    let map = ebpf.map(TAIL_POLICY_MAP).context("TAIL_CALLS map")?;
+    let actual_worker = program_array_id(TAIL_POLICY_MAP, map, TAIL_CALLS_INTERFACE_WORKER_SLOT)?;
+    if actual_worker != Some(worker_id) {
+        bail!(
+            "TAIL_CALLS worker exact readback id {actual_worker:?} differs from loaded program {worker_id}"
+        );
+    }
+    let actual_second = program_array_id(TAIL_POLICY_MAP, map, TAIL_CALLS_TEMPLATE_SECOND_SLOT)?;
+    let expected_second = second.as_ref().map(|(_, id)| *id);
+    if actual_second != expected_second {
+        bail!(
+            "TAIL_CALLS template-second exact readback id {actual_second:?} differs from expected {expected_second:?}"
+        );
+    }
+    freeze_map(TAIL_POLICY_MAP, map)
 }
 
 /// A kernel/environment that cannot load or attach BPF programs at all
@@ -1117,8 +1108,8 @@ impl Session {
             ebpf.map("DESCRIPTORS").context("DESCRIPTORS map")?,
         )
         .context("freezing DESCRIPTORS")?;
-        publish_and_freeze_template_tail(&mut ebpf, object_has_unsafe, unsafe_enabled)
-            .context("publishing and freezing TEMPLATE_TAIL")?;
+        publish_and_freeze_tail_calls(&mut ebpf, unsafe_enabled)
+            .context("publishing and freezing TAIL_CALLS")?;
 
         let mut links = Vec::new();
         if matches!(scope, Scope::Cgroup { .. }) && policy.uses_events() {
@@ -2350,13 +2341,14 @@ mod tests {
                 "DESCRIPTORS",
                 "ASYNC_FUNCTIONS",
                 "MECH_SHAPE",
+                "TAIL_CALLS",
             ]
         );
         assert_eq!(
             FEATURE_POLICY_MAPS.map(|(name, _)| name),
-            ["ATTR_BOOL_BITS", "TEMPLATE_TAIL"]
+            ["ATTR_BOOL_BITS"]
         );
-        assert_eq!(TAIL_POLICY_MAP, "TEMPLATE_TAIL");
+        assert_eq!(TAIL_POLICY_MAP, "TAIL_CALLS");
     }
 
     #[test]
@@ -2369,12 +2361,12 @@ mod tests {
     #[test]
     fn program_array_readback_distinguishes_empty_from_failure() {
         assert_eq!(
-            program_array_lookup_result("TEMPLATE_TAIL", 0, 37, Ok(())).unwrap(),
+            program_array_lookup_result("TAIL_CALLS", 0, 37, Ok(())).unwrap(),
             Some(37)
         );
         assert_eq!(
             program_array_lookup_result(
-                "TEMPLATE_TAIL",
+                "TAIL_CALLS",
                 0,
                 0,
                 Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
@@ -2384,14 +2376,14 @@ mod tests {
         );
 
         let error = program_array_lookup_result(
-            "TEMPLATE_TAIL",
+            "TAIL_CALLS",
             0,
             0,
             Err(std::io::Error::from_raw_os_error(libc::EPERM)),
         )
         .unwrap_err();
         let rendered = format!("{error:#}");
-        assert!(rendered.contains("reading back TEMPLATE_TAIL[0]"));
+        assert!(rendered.contains("reading back TAIL_CALLS[0]"));
         assert!(rendered.contains("Operation not permitted"));
     }
 

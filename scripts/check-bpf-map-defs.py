@@ -113,11 +113,11 @@ SAFE_MAPS = {
         "DESCRIPTORS": (2, 4, 18, 105, 128),
         "START": (1, 16, 272, 16_384),
         "STATS": (6, 4, 296, 512),
+        "TAIL_CALLS": (3, 4, 4, 2),
     }.items()
 }
 UNSAFE_MAPS = SAFE_MAPS | {
     "ATTR_BOOL_BITS": map_def(1, 4, 4, 16, 128),
-    "TEMPLATE_TAIL": map_def(3, 4, 4, 1),
 }
 SAFE_PROGRAMS = {
     "p11_entry",
@@ -128,6 +128,7 @@ SAFE_PROGRAMS = {
     "function_list_return",
     "interface_list_entry",
     "interface_list_return",
+    "interface_list_worker",
     "interface_entry",
     "interface_return",
     "sched_process_exec",
@@ -164,10 +165,10 @@ def self_test():
     assert SAFE_MAPS["COUNTERS"] == map_def(6, 4, 8, 5)
     assert SAFE_MAPS["PAUSE_PIDS"] == map_def(1, 16, 8, 1)
     assert SAFE_MAPS["PID_FILTER"] == map_def(1, 4, 8, 1_024, 128)
-    assert len(SAFE_MAPS) == 15
+    assert len(SAFE_MAPS) == 16
     assert len(UNSAFE_MAPS) == 17
-    assert len(SAFE_PROGRAMS) == 12
-    assert len(UNSAFE_PROGRAMS) == 16
+    assert len(SAFE_PROGRAMS) == 13
+    assert len(UNSAFE_PROGRAMS) == 17
     good = (SAFE_MAPS, SAFE_PROGRAMS, {"p11_entry"})
     diagnostic = (
         UNSAFE_MAPS,

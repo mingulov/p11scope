@@ -6169,6 +6169,26 @@ impl Engine {
         (retire, complete && collected.required_seed_complete)
     }
 
+    fn attach_initial_exports(
+        &mut self,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+        closure: &mut PauseClosure,
+    ) {
+        let views: Vec<_> = self.views.iter().map(ProcessView::id).collect();
+        for view in views {
+            let (retire, complete) =
+                self.attach_refreshed_exports(view, session, additions_allowed);
+            if retire {
+                self.queue_stale_views(&[view].into_iter().collect(), pending_views);
+            }
+            if !complete {
+                closure.fail();
+            }
+        }
+    }
+
     fn arm_loader_for_view(
         &mut self,
         position: usize,
@@ -8546,6 +8566,14 @@ impl Engine {
                     }
                 }
             }
+            if fatal.is_none() {
+                self.attach_initial_exports(
+                    &mut session,
+                    &mut additions_allowed,
+                    &mut pending_views,
+                    &mut closure,
+                );
+            }
             let cleanup = self.process_discovery_records(
                 &mut session,
                 &mut records,
@@ -8600,6 +8628,9 @@ pub(crate) mod session_fixture {
         /// Killed and reaped from inside `attach_targets`, i.e. exactly between
         /// a generation precheck and its postcheck.
         kill_on_attach: Option<u32>,
+        /// Killed and reaped after one dynamic link mutation, before its
+        /// generation postcheck.
+        kill_on_dynamic_attach: Option<u32>,
         /// Refuses every `preflight_targets`, i.e. a pure preflight refusal.
         refuse_preflight: bool,
     }
@@ -8669,6 +8700,10 @@ pub(crate) mod session_fixture {
 
         pub(crate) fn fail_target_slots(&mut self, slots: impl IntoIterator<Item = u32>) {
             self.fail_target_slots = slots.into_iter().collect();
+        }
+
+        pub(crate) fn lose_generation_at_dynamic_attach(&mut self, pid: u32) {
+            self.kill_on_dynamic_attach = Some(pid);
         }
     }
 
@@ -8760,7 +8795,7 @@ pub(crate) mod session_fixture {
         fn attach_dynamic_export(
             &mut self,
             _: LoaderContextId,
-            _: u32,
+            pid: u32,
             target: (PinnedObjectId, u64),
             cookie: u64,
             abi: HookAbi,
@@ -8772,6 +8807,9 @@ pub(crate) mod session_fixture {
                 cookie,
                 abi,
             });
+            if self.kill_on_dynamic_attach.take().is_some() {
+                kill_and_reap(pid);
+            }
             Ok((false, None))
         }
 
@@ -9180,6 +9218,28 @@ mod tests {
         assert!(route.contains("arm_owned_loader_before_release("));
         assert!(!route.contains("child.release()"));
         assert!(source.contains("child.revalidate_after_exec()"));
+    }
+
+    #[test]
+    fn initial_provider_exports_are_attached_before_session_readiness() {
+        let source = include_str!("engine.rs");
+        let route = source
+            .split_once("    fn start_session_with(")
+            .unwrap()
+            .1
+            .split_once("\n    }\n}")
+            .unwrap()
+            .0;
+        let external_loader = route.find("self.arm_loader_or_partial(").unwrap();
+        let exports = route.find("self.attach_initial_exports(").unwrap();
+        let drain = route
+            .find("let cleanup = self.process_discovery_records(")
+            .unwrap();
+        let ready = route.rfind("Ok(session)").unwrap();
+
+        assert!(external_loader < exports);
+        assert!(exports < drain);
+        assert!(drain < ready);
     }
 
     fn prepared_loader_registry() -> (LoaderRegistry, LoaderContextId) {
@@ -12044,6 +12104,39 @@ int main(int argc, char **argv) {
         (fixture, view, module, pins)
     }
 
+    fn initial_export_route() -> (LoadedSeedProvider, Engine, ScriptedSession) {
+        let (fixture, view, mut module, pins) = loaded_seed_provider();
+        let pid = view.pid();
+        module.exports = vec![
+            "C_GetFunctionList".into(),
+            "C_GetInterfaceList".into(),
+            "C_GetInterface".into(),
+        ];
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Pid(pid);
+        engine.next_view_id = 1;
+        engine.views.push(view);
+        let candidate = engine
+            .live_candidate(pins, vec![module], Vec::new())
+            .unwrap();
+        let mut session = ScriptedSession::default();
+        let mut additions_allowed = true;
+        let outcome = engine
+            .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+            .unwrap();
+        assert!(outcome.accepted());
+        engine
+            .arm_loader_or_partial(
+                0,
+                &mut session,
+                &mut additions_allowed,
+                &mut PendingViewRetirements::new(),
+            )
+            .unwrap();
+        assert!(additions_allowed);
+        (fixture, engine, session)
+    }
+
     fn armed_seed_route(
         loader_hits: u64,
     ) -> (
@@ -12123,6 +12216,59 @@ int main(int argc, char **argv) {
             [1, 2, 3].into_iter().collect(),
             "readiness requires all configured exports from the refreshed provider"
         );
+    }
+
+    #[test]
+    fn initial_export_route_attaches_once_before_readiness() {
+        let (_fixture, mut engine, mut session) = initial_export_route();
+        let mut additions_allowed = true;
+        let mut pending = PendingViewRetirements::new();
+        let mut closure = PauseClosure::new(true);
+
+        engine.attach_initial_exports(
+            &mut session,
+            &mut additions_allowed,
+            &mut pending,
+            &mut closure,
+        );
+        assert_eq!(
+            session
+                .dynamic_attach_calls
+                .iter()
+                .map(|export| export.cookie)
+                .collect::<BTreeSet<_>>(),
+            [1, 2, 3].into_iter().collect()
+        );
+        assert!(additions_allowed && pending.is_empty() && closure.required_complete());
+
+        engine.attach_initial_exports(
+            &mut session,
+            &mut additions_allowed,
+            &mut pending,
+            &mut closure,
+        );
+        assert_eq!(session.dynamic_attach_calls.len(), 3);
+    }
+
+    #[test]
+    fn initial_export_generation_loss_queues_retirement_before_readiness() {
+        let (_fixture, mut engine, mut session) = initial_export_route();
+        let view = engine.views[0].id();
+        session.lose_generation_at_dynamic_attach(engine.views[0].pid());
+        let mut additions_allowed = true;
+        let mut pending = PendingViewRetirements::new();
+        let mut closure = PauseClosure::new(true);
+
+        engine.attach_initial_exports(
+            &mut session,
+            &mut additions_allowed,
+            &mut pending,
+            &mut closure,
+        );
+
+        assert!(!additions_allowed);
+        assert!(pending.contains_key(&view));
+        assert!(!closure.required_complete());
     }
 
     #[test]

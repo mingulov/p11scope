@@ -875,6 +875,40 @@ fn container_provider_streams_are_byte_capped() {
 }
 
 #[test]
+fn capture_readiness_is_rechecked_after_observer_exit() {
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            r#"
+set -eu
+. scripts/lib.sh
+log=$(mktemp)
+trap 'rm -f "$log"' EXIT
+grep_calls=0
+grep() {
+    grep_calls=$((grep_calls + 1))
+    if [ "$grep_calls" -eq 1 ]; then
+        printf '%s\n' 'capture — privacy=aggregate-only' > "$log"
+        return 1
+    fi
+    command grep "$@"
+}
+kill() { return 1; }
+SPID=42
+wait_for_capture_ready "$log" aggregate-only metrics
+[ "$grep_calls" -eq 2 ]
+"#,
+        ])
+        .output()
+        .expect("exercise capture readiness exit race");
+    assert!(
+        output.status.success(),
+        "final readiness recheck failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn container_manifest_rewrite_refuses_escapes_and_rewrites_paths() {
     // Discovery runs on a host copy of the container's provider directory, so
     // every attach path must be rewritten into the container's mount view --
@@ -5619,9 +5653,7 @@ document["functions"] = check["function_items"](pairs)
 pathlib.Path(sys.argv[1]).write_text(json.dumps(document), encoding="utf-8")
 PY
     fi
-    echo 'capture — privacy=aggregate-only'
-    while [ ! -e "$D2_STATE/portforward-ready" ]; do /usr/bin/sleep 0.01; done
-    exit 0
+    echo 'capture — privacy=aggregate-only'; exit 0
 fi
 exit 0
 SCRIPT

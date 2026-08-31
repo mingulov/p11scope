@@ -8,12 +8,12 @@
 #![allow(internal_features)]
 
 use aya_ebpf::bindings::BPF_F_RDONLY_PROG;
-use aya_ebpf::macros::{map, tracepoint, uprobe, uretprobe};
+use aya_ebpf::macros::{map, raw_tracepoint, tracepoint, uprobe, uretprobe};
 use aya_ebpf::maps::ring_buf::RingBufEntry;
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use aya_ebpf::maps::ProgramArray;
 use aya_ebpf::maps::{Array, CgroupArray, HashMap, PerCpuArray, PerCpuHashMap, RingBuf};
-use aya_ebpf::programs::{ProbeContext, RetProbeContext, TracePointContext};
+use aya_ebpf::programs::{ProbeContext, RawTracePointContext, RetProbeContext, TracePointContext};
 use aya_ebpf::{helpers, EbpfContext as _};
 use core::mem::MaybeUninit;
 use p11scope_ebpf_common::{
@@ -802,16 +802,16 @@ fn emit_lifecycle(kind: u8, scope: ScopeAuth, pause_eligible: bool) {
     finish_discovery_record(entry, scope, pause_eligible, pid_tgid, 0);
 }
 
-#[tracepoint(category = "sched", name = "sched_process_exec")]
-pub fn sched_process_exec(_ctx: TracePointContext) -> u32 {
+#[raw_tracepoint(tracepoint = "sched_process_exec")]
+pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {
     if let Some(scope) = scope_auth() {
         emit_lifecycle(DISCOVERY_KIND_EXEC, scope, true);
     }
     0
 }
 
-#[tracepoint(category = "sched", name = "sched_process_exit")]
-pub fn sched_process_exit(_ctx: TracePointContext) -> u32 {
+#[raw_tracepoint(tracepoint = "sched_process_exit")]
+pub fn sched_process_exit(_ctx: RawTracePointContext) -> u32 {
     let pid_tgid = helpers::bpf_get_current_pid_tgid();
     if pid_tgid as u32 != (pid_tgid >> 32) as u32 {
         return 0;

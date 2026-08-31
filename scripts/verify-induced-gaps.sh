@@ -733,7 +733,7 @@ cleanup() {
 echo "=== build isolated default + induced-gap variants ==="
 rm -rf "$WORK/default-build" "$WORK/ring-build" "$WORK/state-build" "$WORK/freeze-build"
 cargo +1.88 build --locked --release --workspace --target-dir "$WORK/default-build"
-DISCOVER=./"$WORK"/default-build/release/p11scope-discover
+DISCOVER="$WORK/default-build/release/p11scope-discover"
 
 echo "=== build small-ring p11scope (Gap 3 only; default build untouched) ==="
 # RING_BYTES override mechanism: crates/ebpf-common's `small-ring` Cargo

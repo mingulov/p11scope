@@ -402,10 +402,12 @@ dual-kernel-qualified MVP lifecycle fixes through `ae8494d` are integrated on
 runtime-qualified checkpoint.
 The frozen MVP candidate passed the six-row semantic/privacy/cleanup campaign
 on Jammy 5.15 and Noble 6.8. The tree remains unreleased; exact-tip CI,
-complete packaging, security remediation, and release gates are still
-pending. The exact `3e10be9` static security closeout is complete: one high,
-six medium, and two low findings, with the owned-child root-authority finding
-release-blocking. The historical 9.2d/9.3/9.4 volume campaign is retained as
+complete packaging, remaining security remediation, and release gates are
+still pending. The exact `3e10be9` static security closeout found one high,
+six medium, and two low findings. The owned-child root-authority finding is
+remediated and independently accepted in the current revision; privileged VM
+confirmation and the lower-severity release work remain pending. The
+historical 9.2d/9.3/9.4 volume campaign is retained as
 post-MVP hardening rather than a prerequisite for declaring the local MVP
 runtime-qualified; it remains UNRUN and is not claimed. See the tracked
 [productization evidence index](../reports/2026-08-31-productization-evidence-index.md)

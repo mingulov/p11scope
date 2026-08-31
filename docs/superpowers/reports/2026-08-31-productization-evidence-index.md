@@ -213,6 +213,12 @@ validated findings: one high, six medium, and two low.
 
 - HIGH: an elevated `p11scope run` execs the observed child without dropping
   observer uid/gid/groups/capabilities or sanitizing inherited authority.
+  **Resolved in the current revision:** the child target must name one existing
+  non-root account, credentials/capabilities are dropped and verified before
+  barrier release, the environment and descriptors are confined, and the
+  already-opened ELF is executed with `execveat`. Independent review accepted
+  closure of the high finding; privileged runtime confirmation remains part of
+  the exact-tip VM campaign.
 - MEDIUM: discovery-helper inherited descriptors, mutable cgroup pathname
   reuse, adversarial scan complexity/pause extension, unbounded trace output,
   output-directory ancestry, and untracked/PATH-dependent release inputs.
@@ -232,8 +238,8 @@ Durable private copy (mode 0700/0600):
 
 ## Remaining critical path
 
-1. Fix the owned-child privilege boundary, then the smallest release-relevant
-   identity/boundedness/build-receipt findings.
+1. Fix the smallest release-relevant identity/boundedness/build-receipt
+   findings.
 2. Rerun the four exact-tip local gates and exact-tip CI.
 3. Complete the release build/receipt and release closeout.
 4. After MVP closeout, run the approved Fedora QEMU smoke with SELinux

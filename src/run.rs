@@ -26,7 +26,7 @@ use std::io;
 use std::io::{Seek as _, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -98,7 +98,7 @@ impl FileIdentity {
 }
 
 impl PreparedExecutable {
-    /// Resolves normal `execvp` PATH spelling, then accepts only a direct
+    /// Resolves normal PATH spelling in the parent, then accepts only a direct
     /// x86-64 ELF with one absolute PT_INTERP. Shebang and non-ELF forms
     /// deliberately return `None` and use ordinary live discovery.
     pub(crate) fn resolve(program: &OsStr) -> io::Result<Option<Self>> {
@@ -175,6 +175,266 @@ fn resolve_program(program: &OsStr) -> io::Result<PathBuf> {
     Err(io::Error::from(io::ErrorKind::NotFound))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChildIdentity {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    clear_groups: bool,
+}
+
+impl ChildIdentity {
+    fn for_invoker() -> io::Result<Self> {
+        let mut uids = [0; 3];
+        let mut gids = [0; 3];
+        // SAFETY: each call receives three valid output pointers.
+        if unsafe { libc::getresuid(&mut uids[0], &mut uids[1], &mut uids[2]) } != 0
+            || unsafe { libc::getresgid(&mut gids[0], &mut gids[1], &mut gids[2]) } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let identity = Self::from_ids(
+            uids,
+            gids,
+            std::env::var_os("SUDO_UID").as_deref(),
+            std::env::var_os("SUDO_GID").as_deref(),
+        )?;
+        if identity.clear_groups {
+            validate_account_pair(identity.uid, identity.gid)?;
+        }
+        Ok(identity)
+    }
+
+    fn from_ids(
+        uids: [libc::uid_t; 3],
+        gids: [libc::gid_t; 3],
+        sudo_uid: Option<&OsStr>,
+        sudo_gid: Option<&OsStr>,
+    ) -> io::Result<Self> {
+        if uids != [uids[1]; 3] || gids != [gids[1]; 3] {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "refusing owned child with set-id observer credentials",
+            ));
+        }
+        if uids[1] != 0 {
+            if gids[1] == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "refusing owned child with root group credentials",
+                ));
+            }
+            return Ok(Self {
+                uid: uids[1],
+                gid: gids[1],
+                clear_groups: false,
+            });
+        }
+        let parse = |name: &str, value: Option<&OsStr>| -> io::Result<u32> {
+            let value = value
+                .filter(|value| {
+                    !value.as_bytes().is_empty() && value.as_bytes().iter().all(u8::is_ascii_digit)
+                })
+                .and_then(|value| value.to_str())
+                .and_then(|value| value.parse().ok())
+                .filter(|value| *value != 0 && *value != u32::MAX)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("root observer requires a valid non-root {name}"),
+                    )
+                })?;
+            Ok(value)
+        };
+        Ok(Self {
+            uid: parse("SUDO_UID", sudo_uid)?,
+            gid: parse("SUDO_GID", sudo_gid)?,
+            clear_groups: true,
+        })
+    }
+}
+
+fn validate_account_pair(uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
+    let mut account = unsafe { std::mem::zeroed::<libc::passwd>() };
+    let mut result = std::ptr::null_mut();
+    let mut buffer = vec![0; 16 * 1024];
+    // SAFETY: account, buffer, and result are valid writable storage for getpwuid_r.
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut account,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status));
+    }
+    if result.is_null() || account.pw_gid != gid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "SUDO_UID/SUDO_GID do not name one existing account",
+        ));
+    }
+    Ok(())
+}
+
+fn child_environment(
+    identity: ChildIdentity,
+    variables: impl IntoIterator<Item = (OsString, OsString)>,
+) -> io::Result<Vec<CString>> {
+    let variables: Vec<_> = variables.into_iter().collect();
+    let selected: Vec<(OsString, OsString)> = if identity.clear_groups {
+        let mut selected = vec![
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (OsString::from("LANG"), OsString::from("C")),
+            (OsString::from("LC_ALL"), OsString::from("C")),
+        ];
+        for allowed in ["TERM", "TZ", "SOFTHSM2_CONF"] {
+            if let Some((name, value)) = variables.iter().find(|(name, _)| name == allowed) {
+                selected.push((name.clone(), value.clone()));
+            }
+        }
+        selected
+    } else {
+        variables
+    };
+    selected
+        .into_iter()
+        .map(|(name, value)| {
+            let mut entry = name.into_vec();
+            entry.push(b'=');
+            entry.extend(value.into_vec());
+            CString::new(entry).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "environment contains NUL")
+            })
+        })
+        .collect()
+}
+
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+unsafe fn last_errno() -> i32 {
+    // SAFETY: errno storage is thread-local and readable in this post-fork thread.
+    unsafe { *libc::__errno_location() }
+}
+
+unsafe fn harden_owned_child(identity: ChildIdentity) -> std::result::Result<(), i32> {
+    if unsafe { libc::syscall(libc::SYS_prctl, libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0
+        || unsafe {
+            libc::syscall(
+                libc::SYS_prctl,
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_CLEAR_ALL,
+                0,
+                0,
+                0,
+            )
+        } != 0
+    {
+        return Err(unsafe { last_errno() });
+    }
+    if identity.clear_groups
+        && unsafe { libc::syscall(libc::SYS_setgroups, 0, std::ptr::null::<libc::gid_t>()) } != 0
+    {
+        return Err(unsafe { last_errno() });
+    }
+    if unsafe {
+        libc::syscall(
+            libc::SYS_setresgid,
+            identity.gid,
+            identity.gid,
+            identity.gid,
+        )
+    } != 0
+        || unsafe {
+            libc::syscall(
+                libc::SYS_setresuid,
+                identity.uid,
+                identity.uid,
+                identity.uid,
+            )
+        } != 0
+    {
+        return Err(unsafe { last_errno() });
+    }
+    let mut header = CapHeader {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    let data = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    if unsafe { libc::syscall(libc::SYS_capset, &mut header, data.as_ptr()) } != 0
+        || unsafe {
+            libc::syscall(
+                libc::SYS_prctl,
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_CLEAR_ALL,
+                0,
+                0,
+                0,
+            )
+        } != 0
+    {
+        return Err(unsafe { last_errno() });
+    }
+    let mut uids = [0; 3];
+    let mut gids = [0; 3];
+    let mut actual_caps = [CapData {
+        effective: u32::MAX,
+        permitted: u32::MAX,
+        inheritable: u32::MAX,
+    }; 2];
+    if unsafe {
+        libc::syscall(
+            libc::SYS_getresuid,
+            uids.as_mut_ptr(),
+            uids.as_mut_ptr().add(1),
+            uids.as_mut_ptr().add(2),
+        )
+    } != 0
+        || unsafe {
+            libc::syscall(
+                libc::SYS_getresgid,
+                gids.as_mut_ptr(),
+                gids.as_mut_ptr().add(1),
+                gids.as_mut_ptr().add(2),
+            )
+        } != 0
+        || unsafe { libc::syscall(libc::SYS_capget, &mut header, actual_caps.as_mut_ptr()) } != 0
+    {
+        return Err(unsafe { last_errno() });
+    }
+    if uids != [identity.uid; 3]
+        || gids != [identity.gid; 3]
+        || (identity.clear_groups
+            && unsafe { libc::syscall(libc::SYS_getgroups, 0, std::ptr::null::<libc::gid_t>()) }
+                != 0)
+        || actual_caps
+            .iter()
+            .any(|caps| caps.effective != 0 || caps.permitted != 0 || caps.inheritable != 0)
+        || unsafe { libc::syscall(libc::SYS_prctl, libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 1
+    {
+        return Err(libc::EPERM);
+    }
+    Ok(())
+}
+
 /// Owns exactly one fork generation until it is reaped or deliberately handed
 /// back still running. The child enters a private session before blocking on
 /// the CLOEXEC pre-exec barrier.
@@ -193,7 +453,25 @@ pub(crate) struct OwnedChild {
 
 impl OwnedChild {
     pub(crate) fn spawn(program: OsString, args: Vec<OsString>) -> io::Result<Self> {
-        let prepared = PreparedExecutable::resolve(&program).ok().flatten();
+        let identity = ChildIdentity::for_invoker()?;
+        let resolved = resolve_program(&program)?;
+        let launch_file = File::open(&resolved)?;
+        let metadata = launch_file.metadata()?;
+        if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "owned command must be a regular executable file",
+            ));
+        }
+        if ElfSnapshot::read(&launch_file).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "owned command must be an ELF executable; invoke scripts through an interpreter",
+            ));
+        }
+        let prepared = PreparedExecutable::resolve(resolved.as_os_str())
+            .ok()
+            .flatten();
         let program = CString::new(program.as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "program contains NUL"))?;
         let args: Vec<CString> = std::iter::once(program.clone())
@@ -212,6 +490,12 @@ impl OwnedChild {
             .map(|arg| arg.as_ptr())
             .chain(std::iter::once(std::ptr::null()))
             .collect();
+        let environment = child_environment(identity, std::env::vars_os())?;
+        let envp: Vec<*const libc::c_char> = environment
+            .iter()
+            .map(|entry| entry.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
         let (release_reader, release_writer) = pipe_pair()?;
         let (exec_reader, exec_writer) = pipe_pair()?;
         // Allocate before fork so exhaustion cannot create an unguarded child.
@@ -228,7 +512,19 @@ impl OwnedChild {
                 libc::close(release_writer.as_raw_fd());
                 libc::close(exec_reader.as_raw_fd());
                 if libc::setsid() < 0 {
-                    child_exec_failure(exec_writer.as_raw_fd(), io::Error::last_os_error());
+                    child_exec_failure_errno(exec_writer.as_raw_fd(), last_errno());
+                }
+                if libc::syscall(
+                    libc::SYS_close_range,
+                    3u32,
+                    u32::MAX,
+                    libc::CLOSE_RANGE_CLOEXEC,
+                ) != 0
+                {
+                    child_exec_failure_errno(exec_writer.as_raw_fd(), last_errno());
+                }
+                if let Err(errno) = harden_owned_child(identity) {
+                    child_exec_failure_errno(exec_writer.as_raw_fd(), errno);
                 }
                 let mut byte = 0u8;
                 loop {
@@ -240,13 +536,20 @@ impl OwnedChild {
                     if read == 0 {
                         libc::_exit(127);
                     }
-                    let error = io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::EINTR) {
-                        child_exec_failure(exec_writer.as_raw_fd(), error);
+                    let errno = last_errno();
+                    if errno != libc::EINTR {
+                        child_exec_failure_errno(exec_writer.as_raw_fd(), errno);
                     }
                 }
-                libc::execvp(program.as_ptr(), argv.as_ptr());
-                child_exec_failure(exec_writer.as_raw_fd(), io::Error::last_os_error());
+                libc::syscall(
+                    libc::SYS_execveat,
+                    launch_file.as_raw_fd(),
+                    c"".as_ptr(),
+                    argv.as_ptr(),
+                    envp.as_ptr(),
+                    libc::AT_EMPTY_PATH,
+                );
+                child_exec_failure_errno(exec_writer.as_raw_fd(), last_errno());
             }
         }
 
@@ -553,8 +856,8 @@ fn pipe_pair() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
-unsafe fn child_exec_failure(fd: i32, error: io::Error) -> ! {
-    let errno = error.raw_os_error().unwrap_or(libc::EIO).to_ne_bytes();
+unsafe fn child_exec_failure_errno(fd: i32, errno: i32) -> ! {
+    let errno = errno.to_ne_bytes();
     // SAFETY: this child-only error path writes one fixed stack buffer then exits.
     unsafe {
         let mut written = 0;
@@ -2261,13 +2564,202 @@ mod tests {
     }
 
     #[test]
+    fn owned_child_execs_with_no_new_privileges() {
+        let directory = tempfile::tempdir().unwrap();
+        let status = directory.path().join("status");
+        let mut child = spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                &format!("cat /proc/self/status > {}", status.display()),
+            ],
+        );
+
+        child.release().unwrap();
+        assert_eq!(
+            child.wait_for(None, false).unwrap(),
+            ChildOutcome::Exited(0)
+        );
+        let status = std::fs::read_to_string(status).unwrap();
+        assert!(status.lines().any(|line| line == "NoNewPrivs:\t1"));
+        for capability in ["CapInh", "CapPrm", "CapEff", "CapAmb"] {
+            assert!(
+                status
+                    .lines()
+                    .any(|line| line == format!("{capability}:\t0000000000000000")),
+                "owned child retained {capability}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_child_identity_is_the_invoking_user_and_never_implicit_root() {
+        let nonroot = ChildIdentity::from_ids(
+            [1000; 3],
+            [1001; 3],
+            Some(OsStr::new("not-an-id")),
+            Some(OsStr::new("also-not-an-id")),
+        )
+        .unwrap();
+        assert_eq!(
+            nonroot,
+            ChildIdentity {
+                uid: 1000,
+                gid: 1001,
+                clear_groups: false,
+            }
+        );
+
+        let sudo = ChildIdentity::from_ids(
+            [0; 3],
+            [0; 3],
+            Some(OsStr::new("1000")),
+            Some(OsStr::new("1001")),
+        )
+        .unwrap();
+        assert_eq!(
+            sudo,
+            ChildIdentity {
+                uid: 1000,
+                gid: 1001,
+                clear_groups: true,
+            }
+        );
+
+        assert!(ChildIdentity::from_ids([0; 3], [0; 3], None, None).is_err());
+        assert!(
+            ChildIdentity::from_ids(
+                [0; 3],
+                [0; 3],
+                Some(OsStr::new("+1000")),
+                Some(OsStr::new("1000")),
+            )
+            .is_err()
+        );
+        assert!(
+            ChildIdentity::from_ids(
+                [0; 3],
+                [0; 3],
+                Some(OsStr::new("0")),
+                Some(OsStr::new("1000")),
+            )
+            .is_err()
+        );
+        assert!(
+            ChildIdentity::from_ids(
+                [1000; 3],
+                [0; 3],
+                Some(OsStr::new("1000")),
+                Some(OsStr::new("1000")),
+            )
+            .is_err()
+        );
+        assert!(
+            ChildIdentity::from_ids(
+                [1000, 0, 0],
+                [1000; 3],
+                Some(OsStr::new("1000")),
+                Some(OsStr::new("1000")),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn privileged_child_environment_is_an_allowlist() {
+        let identity = ChildIdentity {
+            uid: 1000,
+            gid: 1000,
+            clear_groups: true,
+        };
+        let environment = child_environment(
+            identity,
+            [
+                (OsString::from("PATH"), OsString::from("/root/bin")),
+                (OsString::from("SSH_AUTH_SOCK"), OsString::from("/secret")),
+                (OsString::from("API_TOKEN"), OsString::from("secret")),
+                (OsString::from("TERM"), OsString::from("xterm")),
+                (
+                    OsString::from("SOFTHSM2_CONF"),
+                    OsString::from("/tmp/softhsm2.conf"),
+                ),
+            ],
+        )
+        .unwrap();
+        let environment: Vec<_> = environment
+            .iter()
+            .map(|entry| entry.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            environment,
+            [
+                "PATH=/usr/bin:/bin",
+                "LANG=C",
+                "LC_ALL=C",
+                "TERM=xterm",
+                "SOFTHSM2_CONF=/tmp/softhsm2.conf",
+            ]
+        );
+    }
+
+    #[test]
+    fn owned_child_executes_the_opened_inode_after_path_retarget() {
+        let directory = tempfile::tempdir().unwrap();
+        let command = directory.path().join("command");
+        let replacement = directory.path().join("replacement");
+        std::fs::copy("/bin/true", &command).unwrap();
+        std::fs::copy("/bin/false", &replacement).unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut child = OwnedChild::spawn(command.clone().into_os_string(), Vec::new()).unwrap();
+        std::fs::rename(replacement, command).unwrap();
+        child.release().unwrap();
+        assert_eq!(
+            child.wait_for(None, false).unwrap(),
+            ChildOutcome::Exited(0)
+        );
+    }
+
+    #[test]
+    fn owned_child_does_not_inherit_unrelated_descriptors() {
+        let mut fds = [-1; 2];
+        // SAFETY: fds points to two writable integers; pipe initializes both.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: successful pipe returned two distinct owned descriptors.
+        let inherited = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let _writer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("leaked");
+        let mut child = spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                &format!(
+                    "if [ -e /proc/self/fd/{} ]; then printf leaked > {}; fi",
+                    inherited.as_raw_fd(),
+                    marker.display()
+                ),
+            ],
+        );
+
+        child.release().unwrap();
+        assert_eq!(
+            child.wait_for(None, false).unwrap(),
+            ChildOutcome::Exited(0)
+        );
+        assert!(!marker.exists(), "owned child inherited an unrelated fd");
+    }
+
+    #[test]
     fn exec_errno_exit_status_and_signal_status_are_exact() {
-        let mut missing = spawn("/definitely/missing/p11scope-task7", &[]);
-        let failure = missing.release().unwrap_err();
-        assert_eq!(failure.errno, libc::ENOENT);
-        assert_eq!(failure.exit_code, 127);
-        assert!(!missing.is_reaped());
-        drop(missing);
+        assert_eq!(
+            OwnedChild::spawn("/definitely/missing/p11scope-task7".into(), Vec::new())
+                .err()
+                .expect("missing executable must be refused before fork")
+                .raw_os_error(),
+            Some(libc::ENOENT)
+        );
 
         let mut normal = spawn("/bin/sh", &["-c", "exit 23"]);
         normal.release().unwrap();
@@ -2286,12 +2778,18 @@ mod tests {
 
     #[test]
     fn release_error_defers_settlement_for_owned_cleanup() {
-        let mut missing = spawn("/definitely/missing/p11scope-owned-release", &[]);
-        let failure = missing.release().unwrap_err();
-        assert_eq!(failure.errno, libc::ENOENT);
+        let directory = tempfile::tempdir().unwrap();
+        let command = directory.path().join("command");
+        std::fs::copy("/bin/true", &command).unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut child = OwnedChild::spawn(command.clone().into_os_string(), Vec::new()).unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let failure = child.release().unwrap_err();
+        assert_eq!(failure.errno, libc::EACCES);
         assert_eq!(failure.exit_code, 127);
         assert!(
-            !missing.is_reaped(),
+            !child.is_reaped(),
             "run-owned release errors must wait for coordinator cleanup before settlement"
         );
     }

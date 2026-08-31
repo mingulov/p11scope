@@ -10,9 +10,11 @@ implementation limits are code contracts, not measurements.
 > capture, schema v2, and owned-child live discovery are implemented. The
 > frozen candidate passed all six semantic/privacy/cleanup rows on Ubuntu
 > 22.04 kernel 5.15 and Ubuntu 24.04 kernel 6.8. The static security closeout
-> is complete and found release-blocking privilege, identity, boundedness,
-> output, and build-receipt gaps. Exact-tip CI, complete packaging,
-> remediation, publication, and release remain pending.
+> found release-blocking privilege, identity, boundedness, output, and
+> build-receipt gaps. The highest-severity owned-child privilege boundary is
+> remediated; exact-tip privileged confirmation, lower-severity remediation,
+> CI, complete packaging, publication, and release remain pending; these local
+> results make no release or security-clearance claim.
 > See the
 > [safe metadata design](superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md)
 > and the
@@ -122,12 +124,19 @@ sudo p11scope run --module /opt/vendor/lib/pkcs11.so \
   -o observed-profile.json --pause auto -- /opt/application/bin/workload
 ```
 
-> **Current `run` safety boundary:** an observer started with `sudo` currently
-> execs the owned child with the observer's root authority. Until the tracked
-> privilege-drop fix lands, use `profile`/`trace` against an already-running
-> workload, or use `run` only for a command explicitly intended and trusted to
-> run as root. The six-row campaign proves capture semantics and cleanup; it
-> does not make this authority transfer safe.
+> **`run` safety boundary:** `sudo p11scope run` requires valid non-root
+> `SUDO_UID` and `SUDO_GID` values naming one existing non-root account and
+> drops the child to that identity before releasing its private barrier. Root
+> without that explicit target and set-id invocations are refused. These
+> environment values select the target account but do not authenticate that
+> the launcher was `sudo`. The child has no capabilities, cannot gain
+> privilege across exec, receives only `PATH`, C locale, optional `TERM`/`TZ`,
+> and `SOFTHSM2_CONF`, and does not inherit unrelated file descriptors. The
+> command is an opened ELF executable; invoke scripts explicitly as
+> `/bin/sh /path/to/script`, and use `/usr/bin/env NAME=value command` after
+> `--` for other application variables. The sudo path currently clears
+> supplementary groups; use `profile`/`trace` against an already-running
+> workload when the application needs an HSM/device group.
 
 ### Discovery timing and optional offline discovery
 

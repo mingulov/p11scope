@@ -215,11 +215,20 @@ conflict modules; an accepted manifest may authorize only its exact pinned
 object, offset, and canonical function name. The owned-child `run` path and
 capture-history corrections passed the local 5.15/6.8 semantic campaign.
 The project remains unreleased while exact-tip CI, packaging, and final
-security remediation/release review are pending. **Current safety warning:**
-when the observer itself runs as root, `p11scope run -- ...` currently execs
-the child with that same authority. Until the tracked privilege-boundary fix
-lands, use `profile`/`trace` against an already-running workload, or run only a
-command that is explicitly intended and trusted to execute as root.
+security remediation/release review are pending. `p11scope run` never
+implicitly releases a root child: a non-root observer keeps its UID/GID while
+losing capabilities, and a sudo-root observer requires valid non-root
+`SUDO_UID`/`SUDO_GID` values naming one existing non-root account and drops to
+them before the release barrier. Root without that explicit target and set-id
+invocations are refused; those environment values select the target account
+but do not authenticate that the launcher was `sudo`. The child also receives
+`no_new_privs`, no capabilities, a small environment allowlist, and no
+unrelated inherited file descriptors. Its executable is opened before fork
+and executed by descriptor; scripts must be invoked through an explicit ELF
+interpreter such as `/bin/sh script`.
+For now, the sudo path clears supplementary groups, so workloads needing an
+HSM/device group should use an already-running target until explicit run-as
+group selection is implemented.
 
 Fresh final-candidate unprivileged self-tests, local packaging subsets, and
 the Jammy/Noble owned-run campaign are recorded in the productization evidence

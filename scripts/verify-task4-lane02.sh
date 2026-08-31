@@ -818,6 +818,7 @@ run_row() {
     fact "$row_id.pause" "$policy"
 
     set -- /usr/bin/env -i "PATH=$PATH_FIXED" "SOFTHSM2_CONF=$CONF" \
+        "SUDO_UID=$(id -u)" "SUDO_GID=$(id -g)" \
         "$P11SCOPE" run --module "$MODULE" --mode metrics --duration 30 \
         --kill-on-timeout --pause "$policy" -o "$output" --
     if [ "$load_kind" = initial-set ]; then

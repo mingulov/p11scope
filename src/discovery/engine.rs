@@ -186,6 +186,14 @@ enum SurfaceOccurrence {
         functions: usize,
         occurrence: usize,
     },
+    Interface {
+        module: plan::ModuleId,
+        index: usize,
+        name_class: &'static str,
+        version: (u8, u8),
+        walk: String,
+        functions: usize,
+    },
     Manifest {
         module: plan::ModuleId,
         manifest: u32,
@@ -632,6 +640,32 @@ impl CaptureFacts {
                         acquisition: "ok".into(),
                         functions,
                     });
+                for interface in module
+                    .scanned
+                    .interfaces
+                    .iter()
+                    .filter(|interface| interface.table == Some(table_index))
+                {
+                    history
+                        .surfaces
+                        .entry(SurfaceOccurrence::Interface {
+                            module: owner,
+                            index: interface.index,
+                            name_class: interface.name_class,
+                            version: table.version,
+                            walk: table.walk.to_string(),
+                            functions,
+                        })
+                        .or_insert_with(|| plan::SurfaceSummary {
+                            source: format!(
+                                "interface[{}] {}",
+                                interface.index, interface.name_class
+                            ),
+                            walk: table.walk.to_string(),
+                            acquisition: "ok".into(),
+                            functions,
+                        });
+                }
                 let table_fact = (table.version, table.entries.len());
                 let table_occurrence = tables.entry(table_fact).or_insert(0usize);
                 history
@@ -9411,6 +9445,34 @@ mod tests {
         assert_eq!(engine.plan.entries_seen, 2);
         assert_eq!(engine.plan.surfaces.len(), 2);
         assert_eq!(engine.discovery.modules.len(), 2);
+    }
+
+    #[test]
+    fn accepted_capture_facts_publish_scanned_interface_surfaces() {
+        let (mut engine, _, _, _) = engine_with_overlay(45);
+        engine.modules[0].scanned.interfaces.push(ScannedInterface {
+            index: 0,
+            name_class: "exact_standard",
+            name_lossy: None,
+            flags: 0,
+            table: Some(0),
+        });
+        engine.plan = plan::build_from_reconciled_modules(&engine.modules);
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+
+        engine.publish_current_capture_facts().unwrap();
+
+        assert_eq!(engine.plan.surfaces.len(), 2);
+        assert_eq!(
+            engine.plan.surfaces[1].source,
+            "interface[0] exact_standard"
+        );
+
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(engine.plan.surfaces.len(), 2, "surface is not duplicated");
     }
 
     #[test]

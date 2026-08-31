@@ -5619,7 +5619,9 @@ document["functions"] = check["function_items"](pairs)
 pathlib.Path(sys.argv[1]).write_text(json.dumps(document), encoding="utf-8")
 PY
     fi
-    echo 'capture — privacy=aggregate-only'; exit 0
+    echo 'capture — privacy=aggregate-only'
+    while [ ! -e "$D2_STATE/portforward-ready" ]; do /usr/bin/sleep 0.01; done
+    exit 0
 fi
 exit 0
 SCRIPT

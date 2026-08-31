@@ -1226,6 +1226,23 @@ fn descriptors_are_published_read_back_and_frozen_before_probe_attachment() {
 }
 
 #[test]
+fn lifecycle_exec_exit_are_raw_while_fork_stays_formatted() {
+    let ebpf = read("crates/ebpf/src/main.rs");
+    let attach = read("src/attach.rs");
+
+    for program in ["sched_process_exec", "sched_process_exit"] {
+        assert!(
+            ebpf.contains(&format!("#[raw_tracepoint(tracepoint = \"{program}\")]")),
+            "{program} must use the raw tracepoint declaration"
+        );
+    }
+    assert!(ebpf.contains("#[tracepoint(category = \"sched\", name = \"sched_process_fork\")]"));
+    assert!(attach.contains("RawTracePointLinkId"));
+    assert!(attach.contains("RegisteredLink::RawTracePoint"));
+    assert!(attach.contains("let raw: &mut RawTracePoint"));
+}
+
+#[test]
 fn policy_specific_ebpf() {
     const KEY_SIZE: usize = 1;
     let definitions = embedded_map_definitions();

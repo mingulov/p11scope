@@ -10,9 +10,10 @@ use crate::run::OwnedChild;
 use anyhow::{Context as _, Result, anyhow, bail};
 use aya::Ebpf;
 use aya::maps::{Array, HashMap, Map, MapError, MapType, PerCpuArray, ProgramArray};
+use aya::programs::raw_trace_point::RawTracePointLinkId;
 use aya::programs::trace_point::TracePointLinkId;
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeLinkId, UProbeScope};
-use aya::programs::{ProgramError, TracePoint, TracePointError, UProbe};
+use aya::programs::{ProgramError, RawTracePoint, TracePoint, TracePointError, UProbe};
 use p11scope_ebpf_common::{
     ARG_NONE, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
     DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
@@ -469,6 +470,7 @@ fn attach_lifecycle_with<S, T>(
 enum ProducerProgram {
     UProbe(&'static str),
     TracePoint(&'static str),
+    RawTracePoint(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -490,6 +492,10 @@ enum RegisteredLink {
     TracePoint {
         program: &'static str,
         id: TracePointLinkId,
+    },
+    RawTracePoint {
+        program: &'static str,
+        id: RawTracePointLinkId,
     },
     DynamicUProbe {
         program: &'static str,
@@ -537,20 +543,23 @@ impl RegisteredLink {
                 ProducerProgram::UProbe(program)
             }
             Self::TracePoint { program, .. } => ProducerProgram::TracePoint(program),
+            Self::RawTracePoint { program, .. } => ProducerProgram::RawTracePoint(program),
         }
     }
 
     fn slot(&self) -> Option<u32> {
         match self {
             Self::UProbe { slot, .. } => Some(*slot),
-            Self::TracePoint { .. } | Self::DynamicUProbe { .. } => None,
+            Self::TracePoint { .. } | Self::RawTracePoint { .. } | Self::DynamicUProbe { .. } => {
+                None
+            }
         }
     }
 
     fn context(&self) -> Option<LoaderContextId> {
         match self {
             Self::DynamicUProbe { context, .. } => Some(*context),
-            Self::UProbe { .. } | Self::TracePoint { .. } => None,
+            Self::UProbe { .. } | Self::TracePoint { .. } | Self::RawTracePoint { .. } => None,
         }
     }
 }
@@ -632,6 +641,7 @@ fn detach_selected_with<T>(
         ProducerProgram::UProbe("p11_entry_template_types") => 2,
         ProducerProgram::UProbe("p11_entry_template_pair") => 3,
         ProducerProgram::TracePoint("sched_process_fork") => 4,
+        ProducerProgram::RawTracePoint(_) => 4,
         ProducerProgram::UProbe("p11_return") => 5,
         _ => 6,
     });
@@ -1092,8 +1102,15 @@ impl Session {
 
         let programs = expected_programs(object_has_unsafe);
         for prog_name in programs {
-            if prog_name.starts_with("sched_process_") {
+            if prog_name == "sched_process_fork" {
                 let prog: &mut TracePoint = ebpf
+                    .program_mut(prog_name)
+                    .with_context(|| format!("program {prog_name} missing from object"))?
+                    .try_into()?;
+                prog.load()
+                    .with_context(|| format!("loading {prog_name}"))?;
+            } else if prog_name.starts_with("sched_process_") {
+                let prog: &mut RawTracePoint = ebpf
                     .program_mut(prog_name)
                     .with_context(|| format!("program {prog_name} missing from object"))?
                     .try_into()?;
@@ -1138,25 +1155,25 @@ impl Session {
             &mut ebpf,
             pause_key.is_some(),
             |ebpf, program| {
-                let tracepoint: &mut TracePoint = ebpf
+                let raw: &mut RawTracePoint = ebpf
                     .program_mut(program)
                     .with_context(|| format!("program {program} missing from object"))?
                     .try_into()?;
-                tracepoint.attach("sched", program).map_err(Into::into)
+                raw.attach(program).map_err(Into::into)
             },
             |ebpf, program, id| {
-                let tracepoint: &mut TracePoint = ebpf
+                let raw: &mut RawTracePoint = ebpf
                     .program_mut(program)
                     .with_context(|| format!("program {program} missing during rollback"))?
                     .try_into()?;
-                tracepoint.detach(id).map_err(Into::into)
+                raw.detach(id).map_err(Into::into)
             },
         )? {
             LifecycleAttachOutcome::Attached(lifecycle_links) => {
                 links.extend(
                     lifecycle_links
                         .into_iter()
-                        .map(|(program, id)| RegisteredLink::TracePoint { program, id }),
+                        .map(|(program, id)| RegisteredLink::RawTracePoint { program, id }),
                 );
                 None
             }
@@ -1416,7 +1433,9 @@ impl Session {
                     abi,
                 }),
             ),
-            RegisteredLink::UProbe { .. } | RegisteredLink::TracePoint { .. } => (context, None),
+            RegisteredLink::UProbe { .. }
+            | RegisteredLink::TracePoint { .. }
+            | RegisteredLink::RawTracePoint { .. } => (context, None),
         });
         let failures = self.detach_failures.len();
         let _ = self.detach_links(|link| link.context() == Some(context));
@@ -1630,6 +1649,15 @@ impl Session {
                     .try_into()?;
                 tracepoint
                     .detach(id)
+                    .with_context(|| format!("detaching {program}"))
+            })(),
+            RegisteredLink::RawTracePoint { program, id } => (|| {
+                let raw: &mut RawTracePoint = self
+                    .ebpf
+                    .program_mut(program)
+                    .with_context(|| format!("program {program} missing during detach"))?
+                    .try_into()?;
+                raw.detach(id)
                     .with_context(|| format!("detaching {program}"))
             })(),
             RegisteredLink::DynamicUProbe { program, id, .. } => (|| {

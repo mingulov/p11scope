@@ -639,6 +639,8 @@ def ledger_state(fd):
 
 
 def readable_ledger_state(fd):
+    if type(fd) is not int or fd < 0:
+        return None
     try:
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
     except (OSError, TypeError, ValueError):
@@ -9918,7 +9920,8 @@ print("input-v1-api-ok")
     );
     assert!(
         output.stderr.is_empty(),
-        "discovery API driver wrote to stderr"
+        "discovery API driver wrote to stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
         output.stdout, b"input-v1-api-ok\n",

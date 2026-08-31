@@ -197,11 +197,7 @@ static P11ScopeTable provider_table = {
 };
 
 static char provider_interface_name[] = "PKCS 11";
-static CK_INTERFACE provider_interface = {
-    .pInterfaceName = provider_interface_name,
-    .pFunctionList = &provider_table,
-    .flags = 0,
-};
+static CK_INTERFACE provider_interface;
 
 /* A table whose last byte sits one byte before an unmapped page, so the
  * production bounded read must report truncation rather than a short copy. */
@@ -279,6 +275,9 @@ C_GetInterface(void *name, void *version, CK_INTERFACE_PTR_PTR out, CK_FLAGS fla
     if (out == NULL) {
         return CKR_ARGUMENTS_BAD;
     }
+    provider_interface.pInterfaceName = provider_interface_name;
+    provider_interface.pFunctionList = published_table();
+    provider_interface.flags = 0;
     *out = &provider_interface;
     return CKR_OK;
 }

@@ -1195,7 +1195,7 @@ static int transition(struct collector *collector, const struct observation *obs
         if (task == NULL || task->superseded || task->wif || task->terminal_wait_pending)
             return -1;
         task->terminal_wait_pending = 1;
-        task->terminal_deadline = monotonic_ns() + 1000000000ULL;
+        task->terminal_deadline = monotonic_ns() + 5000000000ULL;
         if (collector->deadline != 0 && task->terminal_deadline > collector->deadline)
             task->terminal_deadline = collector->deadline;
         return 0;

@@ -597,3 +597,17 @@ boundaries.
 
 **Gate for each slice:** the four cargo checks, the unprivileged suite, and the CI e2e job
 green; root gates run locally only with owner approval and are otherwise recorded UNRUN.
+
+## 2026-09-01 MVP portability checkpoint
+
+`main` is the sole working tree and authoritative product branch. Accepted
+Stage 3A3 GREEN6 history is reachable from it. Product commit `1d3837b` closes
+initial mapped-provider export attachment before readiness and passed the
+local Rust 1.88 workspace gates plus an independent review.
+
+The same product commit passed Fedora Cloud 44 on kernel 6.19 with SELinux
+`Enforcing`: exact workspace gates, release build, Fedora SoftHSM core capture,
+the three-export initial-set fixture, inspect/doctor, all seven privacy-canary
+lanes, zero AVCs, and cleanup. This is post-MVP portability evidence, not a
+release declaration. Remaining work is release hardening, hosted CI,
+container/deployment refresh, the complete receipt, and publication authority.

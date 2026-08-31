@@ -395,6 +395,15 @@ discovery, security-findings layer, GUI.
 Input: `docs/notes/2026-08-15-architecture-and-gap-analysis.md` (review + decisions A1–A7)
 and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust-design.md`.
 
+**Consolidation checkpoint (2026-08-31):** The shipping baseline, committed
+MVP lifecycle fixes, Slice 1b-2 Task 4 prerequisites, and the exact accepted
+Stage 3A3 GREEN6 pair are integrated on `main`. The tree remains unreleased;
+full workspace gates, the blocked Jammy semantic row, the remaining two-kernel
+campaign, exact-tip CI, and release gates are still pending. See the tracked
+[productization evidence index](../reports/2026-08-31-productization-evidence-index.md)
+for exact commits, hashes, preserved worktrees, runtime evidence, and claim
+boundaries.
+
 - **Slice 1a — trust simplification** ([plan](2026-08-15-productization-slice1a-trust-simplification.md)):
   the lease/provenance/hardened-oracle lane of `2026-08-13-manifest-provenance.md` is
   **scheduled for removal** (status flips to "removed" in the plan's deletion task; kept in

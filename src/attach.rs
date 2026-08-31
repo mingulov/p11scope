@@ -12,7 +12,7 @@ use aya::Ebpf;
 use aya::maps::{Array, HashMap, Map, MapError, MapType, PerCpuArray, ProgramArray};
 use aya::programs::trace_point::TracePointLinkId;
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeLinkId, UProbeScope};
-use aya::programs::{TracePoint, UProbe};
+use aya::programs::{ProgramError, TracePoint, TracePointError, UProbe};
 use p11scope_ebpf_common::{
     ARG_NONE, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
     DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::mem::size_of_val;
 use std::num::NonZeroU64;
 use std::os::fd::{AsFd as _, AsRawFd as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const BPF_F_RDONLY_PROG: u32 = 1 << 7;
 
@@ -377,7 +377,92 @@ pub struct Session {
     uprobe_scope: UProbeScope,
     #[allow(dead_code)] // Task 8 drives the Task 7 pause coordinator.
     pause_key: Option<PauseKey>,
+    lifecycle_tracking_unavailable: Option<String>,
     links: Vec<RegisteredLink>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LifecycleAttachOutcome<T> {
+    Attached(Vec<(&'static str, T)>),
+    Degraded(String),
+}
+
+fn expected_tracefs_id_path(program: &str, path: &Path) -> bool {
+    ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"]
+        .into_iter()
+        .any(|root| {
+            path == Path::new(root)
+                .join("events")
+                .join("sched")
+                .join(program)
+                .join("id")
+        })
+}
+
+fn tracefs_lifecycle_failure(error: &anyhow::Error, program: &str) -> Option<String> {
+    match error.downcast_ref::<ProgramError>()? {
+        ProgramError::IOError(error)
+            if error.kind() == std::io::ErrorKind::Other
+                && error.to_string() == "tracefs not found" =>
+        {
+            Some("tracefs not found".into())
+        }
+        ProgramError::TracePointError(TracePointError::FileError { filename, io_error })
+            if expected_tracefs_id_path(program, filename)
+                && matches!(
+                    io_error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+                ) =>
+        {
+            Some(format!(
+                "tracefs id file {}: {io_error}",
+                filename.display()
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Attaches the two all-session lifecycle programs as one tier. A future raw
+/// tracepoint implementation can replace this mechanism without changing its
+/// callers or its all-or-nothing lifecycle contract.
+fn attach_lifecycle_with<S, T>(
+    state: &mut S,
+    owned_run: bool,
+    mut attach: impl FnMut(&mut S, &'static str) -> Result<T>,
+    mut detach: impl FnMut(&mut S, &'static str, T) -> Result<()>,
+) -> Result<LifecycleAttachOutcome<T>> {
+    let mut links = Vec::new();
+    for program in ["sched_process_exec", "sched_process_exit"] {
+        match attach(state, program) {
+            Ok(link) => links.push((program, link)),
+            Err(error) => {
+                let tracefs = tracefs_lifecycle_failure(&error, program);
+                let attach_failure = format!("{error:#}");
+                for (attached_program, link) in links.into_iter().rev() {
+                    if let Err(rollback) =
+                        detach(state, attached_program, link).with_context(|| {
+                            format!("rolling back {attached_program} after {program} failed")
+                        })
+                    {
+                        bail!("attaching {program}: {attach_failure}; {rollback:#}");
+                    }
+                }
+                let error = error.context(format!("attaching {program}"));
+                if let Some(cause) = tracefs {
+                    let fact = format!("live lifecycle tracking unavailable: {cause}");
+                    if owned_run {
+                        return Err(error.context(format!(
+                            "owned run requires tracefs lifecycle tracking; run as root or remount tracefs with gid=<observer-group> and mode=0750: {fact}"
+                        )));
+                    }
+                    return Ok(LifecycleAttachOutcome::Degraded(fact));
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(LifecycleAttachOutcome::Attached(links))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -930,6 +1015,10 @@ lockdown mode, a kernel below the supported floor (>= 5.15), missing BTF \
 (/sys/kernel/btf/vmlinux), or a restrictive kernel.perf_event_paranoid sysctl. See \
 docs/notes/phase5-unsupported.md for what each looks like when observed.";
 
+fn unsupported_environment_context(error: anyhow::Error) -> anyhow::Error {
+    error.context(UNSUPPORTED_ENV_HINT)
+}
+
 impl Session {
     pub(crate) fn start(
         plan: &AttachPlan,
@@ -944,11 +1033,11 @@ impl Session {
                 "a pinned provider object changed before attach; refusing to observe changed bytes"
             );
         }
-        let mut session = Self::start_inner(scope, policy, pause_key)
-            .map_err(|e| anyhow!("{e:#}\n{UNSUPPORTED_ENV_HINT}"))?;
+        let mut session =
+            Self::start_inner(scope, policy, pause_key).map_err(unsupported_environment_context)?;
         session
             .attach_plan(plan, objects)
-            .map_err(|e| anyhow!("{e:#}\n{UNSUPPORTED_ENV_HINT}"))?;
+            .map_err(unsupported_environment_context)?;
         // The error path drops `session`, which detaches every probe.
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!(
@@ -1045,16 +1134,34 @@ impl Session {
                 id,
             });
         }
-        for program in ["sched_process_exec", "sched_process_exit"] {
-            let tracepoint: &mut TracePoint = ebpf
-                .program_mut(program)
-                .with_context(|| format!("program {program} missing from object"))?
-                .try_into()?;
-            let id = tracepoint
-                .attach("sched", program)
-                .with_context(|| format!("attaching {program}"))?;
-            links.push(RegisteredLink::TracePoint { program, id });
-        }
+        let lifecycle_tracking_unavailable = match attach_lifecycle_with(
+            &mut ebpf,
+            pause_key.is_some(),
+            |ebpf, program| {
+                let tracepoint: &mut TracePoint = ebpf
+                    .program_mut(program)
+                    .with_context(|| format!("program {program} missing from object"))?
+                    .try_into()?;
+                tracepoint.attach("sched", program).map_err(Into::into)
+            },
+            |ebpf, program, id| {
+                let tracepoint: &mut TracePoint = ebpf
+                    .program_mut(program)
+                    .with_context(|| format!("program {program} missing during rollback"))?
+                    .try_into()?;
+                tracepoint.detach(id).map_err(Into::into)
+            },
+        )? {
+            LifecycleAttachOutcome::Attached(lifecycle_links) => {
+                links.extend(
+                    lifecycle_links
+                        .into_iter()
+                        .map(|(program, id)| RegisteredLink::TracePoint { program, id }),
+                );
+                None
+            }
+            LifecycleAttachOutcome::Degraded(fact) => Some(fact),
+        };
 
         Ok(Self {
             ebpf,
@@ -1064,6 +1171,7 @@ impl Session {
             policy,
             uprobe_scope,
             pause_key,
+            lifecycle_tracking_unavailable,
             links,
         })
     }
@@ -1624,6 +1732,10 @@ impl Session {
         &self.detach_failures
     }
 
+    pub(crate) fn lifecycle_tracking_unavailable(&self) -> Option<&str> {
+        self.lifecycle_tracking_unavailable.as_deref()
+    }
+
     /// Lifetime successful static endpoints (2 per fully-attached slot).
     pub fn attached_probes(&self) -> usize {
         self.successful_static.len()
@@ -1713,6 +1825,7 @@ mod policy_output {
 mod tests {
     use super::*;
     use p11scope_ebpf_common::{ARG_NONE, SlotSemantics};
+    use std::io;
 
     fn test_slot(index: u32) -> crate::plan::Slot {
         crate::plan::Slot {
@@ -1780,6 +1893,164 @@ mod tests {
         ] {
             assert_eq!(static_endpoint(program, 7), None, "{program}");
         }
+    }
+
+    #[test]
+    fn optional_lifecycle_tier_degrades_for_typed_tracefs_discovery_loss() {
+        let mut state = ();
+        let outcome = attach_lifecycle_with::<_, ()>(
+            &mut state,
+            false,
+            |_, program| {
+                assert_eq!(program, "sched_process_exec");
+                Err(
+                    aya::programs::ProgramError::IOError(io::Error::other("tracefs not found"))
+                        .into(),
+                )
+            },
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            LifecycleAttachOutcome::Degraded(
+                "live lifecycle tracking unavailable: tracefs not found".into()
+            )
+        );
+    }
+
+    #[test]
+    fn optional_lifecycle_tier_rolls_back_the_first_link_when_second_is_unavailable() {
+        let mut detached = Vec::new();
+        let outcome = attach_lifecycle_with(
+            &mut detached,
+            false,
+            |_, program| match program {
+                "sched_process_exec" => Ok(program),
+                "sched_process_exit" => Err(aya::programs::ProgramError::IOError(
+                    io::Error::other("tracefs not found"),
+                )
+                .into()),
+                _ => unreachable!(),
+            },
+            |detached, _, link| {
+                detached.push(link);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, LifecycleAttachOutcome::Degraded(_)));
+        assert_eq!(detached, ["sched_process_exec"]);
+    }
+
+    #[test]
+    fn lifecycle_tier_rollback_failure_stays_fatal_and_retains_both_causes() {
+        let mut state = ();
+        let error = attach_lifecycle_with(
+            &mut state,
+            false,
+            |_, program| match program {
+                "sched_process_exec" => Ok(()),
+                "sched_process_exit" => {
+                    Err(ProgramError::IOError(io::Error::other("tracefs not found")).into())
+                }
+                _ => unreachable!(),
+            },
+            |_, _, _| anyhow::bail!("injected rollback failure"),
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains("tracefs not found"));
+        assert!(rendered.contains("injected rollback failure"));
+    }
+
+    #[test]
+    fn lifecycle_tier_classifies_only_expected_tracefs_id_file_access() {
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::NotFound] {
+            let error =
+                anyhow::Error::from(ProgramError::TracePointError(TracePointError::FileError {
+                    filename: PathBuf::from(
+                        "/sys/kernel/tracing/events/sched/sched_process_exec/id",
+                    ),
+                    io_error: io::Error::from(kind),
+                }));
+            assert!(tracefs_lifecycle_failure(&error, "sched_process_exec").is_some());
+        }
+
+        let unexpected =
+            anyhow::Error::from(ProgramError::TracePointError(TracePointError::FileError {
+                filename: PathBuf::from("/tmp/not-tracefs/id"),
+                io_error: io::Error::from(io::ErrorKind::PermissionDenied),
+            }));
+        assert!(tracefs_lifecycle_failure(&unexpected, "sched_process_exec").is_none());
+
+        let malformed_id =
+            anyhow::Error::from(ProgramError::TracePointError(TracePointError::FileError {
+                filename: PathBuf::from(
+                    "/sys/kernel/tracing/events/sched/sched_process_exec/id.bak",
+                ),
+                io_error: io::Error::from(io::ErrorKind::PermissionDenied),
+            }));
+        assert!(tracefs_lifecycle_failure(&malformed_id, "sched_process_exec").is_none());
+    }
+
+    #[test]
+    fn unsupported_environment_context_preserves_program_error() {
+        let error = unsupported_environment_context(
+            ProgramError::IOError(io::Error::other("tracefs not found")).into(),
+        );
+
+        assert!(format!("{error:#}").contains(UNSUPPORTED_ENV_HINT));
+        assert!(error.downcast_ref::<ProgramError>().is_some());
+    }
+
+    #[test]
+    fn owned_run_refuses_tracefs_lifecycle_loss_with_actionable_remediation() {
+        let mut state = ();
+        let error = attach_lifecycle_with::<_, ()>(
+            &mut state,
+            true,
+            |_, _| {
+                Err(
+                    aya::programs::ProgramError::IOError(io::Error::other("tracefs not found"))
+                        .into(),
+                )
+            },
+            |_, _, _| Ok(()),
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains("owned run"));
+        assert!(rendered.contains("tracefs"));
+        assert!(rendered.contains("root"));
+        assert!(rendered.contains("gid="));
+        assert!(rendered.contains("0750"));
+        assert!(rendered.contains("tracefs not found"));
+        assert!(error.downcast_ref::<ProgramError>().is_some());
+    }
+
+    #[test]
+    fn non_tracefs_lifecycle_error_stays_fail_closed() {
+        let mut state = ();
+        let error = attach_lifecycle_with::<_, ()>(
+            &mut state,
+            false,
+            |_, _| {
+                Err(ProgramError::SyscallError(aya::sys::SyscallError {
+                    call: "perf_event_open_trace_point",
+                    io_error: io::Error::from_raw_os_error(libc::EPERM),
+                })
+                .into())
+            },
+            |_, _, _| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("Operation not permitted"));
     }
 
     #[test]

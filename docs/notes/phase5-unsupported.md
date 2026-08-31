@@ -86,28 +86,24 @@ attach failed (slot 0): p11_entry at /usr/lib/softhsm/libsofthsm2.so+0x265b0: `p
 redrawing a live `Evidence: 0/136 probes attached ... → PARTIAL` frame
 every second, exiting 0 at `--duration`.
 
-**After the fix** (real output, this host): the per-slot lines now carry
-the real OS error, and a summary line follows the 136th one:
+**Historical output after the original message fix**: the per-slot lines
+carried the real OS error, and a summary line followed the 136th one:
 ```
 attach failed (slot 0): p11_entry at /usr/lib/softhsm/libsofthsm2.so+0x265b0: `perf_event_open` failed: Permission denied (os error 13)
 ...
 attach failed (slot 67): p11_return at /usr/lib/softhsm/libsofthsm2.so+0x27b30: `perf_event_open` failed: Permission denied (os error 13)
 p11scope: 0/136 attach attempts failed, every one the same way — this almost always means the environment cannot attach BPF uprobes at all: missing CAP_BPF/CAP_SYS_ADMIN (or root), a kernel lockdown mode, or a restrictive kernel.perf_event_paranoid sysctl. First underlying error: p11_entry at /usr/lib/softhsm/libsofthsm2.so+0x265b0: `perf_event_open` failed: Permission denied (os error 13)
 ```
-Then the same live `Evidence: 0/136 probes attached ... → PARTIAL` frame
-as before (the JSON evidence contract is unchanged — `PARTIAL` was
-already correct and never read as healthy; only the stderr text
-changed). Exit code: 0 (unchanged — a partial capture with real,
-reported evidence is not a crash, and `scripts/matrix/verify-fork-scope.sh`
-depends on this run succeeding and writing its `-o` JSON to assert
-`attached_probes == 0` numerically).
+The current post-fix6 measurement (2026-08-25) instead records 68
+attach-failure records/per-slot lines, `attached_probes: 0/136`, and
+`evidence.completeness: PARTIAL`; it exits 0 with reported partial evidence.
 
-### 3. `CAP_SYS_ADMIN` alone — succeeds (control case, confirms no regression)
+### 3. `CAP_SYS_ADMIN` alone — historical control case
 
+Historical pre-terminal-drain control output:
 ```
 Evidence: 136/136 probes attached · 68 slots · 0 aliased · 0 skipped · 0 in-flight → COMPLETE
 ```
-Re-run after the fix to confirm the success path is untouched.
 
 ### 4. Missing BTF — not inducible here
 
@@ -175,4 +171,4 @@ on.
 None of the induced cases produce a panic, a raw verifier dump, or a
 silent zero-count capture that reads as healthy — the two genuinely
 unclear messages found while reproducing these (the swallowed OS error,
-and 136 repeated lines with no named cause) were real bugs, now fixed.
+and the historical 136 repeated lines with no named cause) were real bugs, now fixed.

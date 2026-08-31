@@ -44,6 +44,30 @@ Do not derive function totals by summing mechanism totals: one initialized
 operation can cover several later function calls, and a capture can start in
 the middle of an operation.
 
+## Capture-lifetime facts, not a live view
+
+`capture.modules[]`, `evidence.discovery[]`, `evidence.table_entries`,
+`evidence.slots`, `evidence.attached_probes`, and the per-row aggregate
+ownership in `functions[]` are **accepted facts about the whole capture
+window**. They say what this capture discovered, planned, attached, and
+attributed at some point between `capture.start` and `capture.end`.
+
+They are **not** a statement that any of it is still live when the document is
+written. A target can exit, a mapping can be unmapped, a pinned object can be
+released, and a process view can be retired; none of that removes what was
+already accepted, and none of it is re-derived from the topology that is active
+at render time. A capture whose target exited normally therefore still names
+its providers, still reports the entries it decoded and the slots it allocated,
+still reports the endpoints it attached, and still attributes its counts to the
+modules that owned them — and the ordinary exit is not itself a discovery loss,
+a reconciliation, or a reason to drop history. The same rule governs the live
+and terminal on-screen headings: they name the providers this capture accepted,
+never the ones currently mapped, so "no modules discovered" can only mean a
+capture that never accepted one.
+
+A consumer that needs to know what is live now must observe now; this document
+answers what was observed, not what remains.
+
 ## Semantic-join authority
 
 `scan` is bounded heuristic discovery, not semantic acquisition. A
@@ -180,6 +204,90 @@ Kernel/event loss:
 | `template_tail_failures` | Internal second-template handoff failed; the first template may remain available, but the key-pair request is incomplete. |
 | `malformed_records` | Event records rejected for ABI size mismatch. |
 
+### Live discovery, pause, and the owned run
+
+These fields are part of v2 — the identifier does not change, because v2 is
+unpublished and no consumer has received a document without them. Every one of
+them is present in `profile`, `metrics`, and the terminal `trace` `EVIDENCE`
+object, with the single stated exception of `child_still_running`.
+
+| Field | Type | Owner and meaning |
+| --- | --- | --- |
+| `attach_gap_ms` | integer or `null` | The maximum of the defined per-module earliest-causal-event-to-last-required-attach gaps. `null` — never an invented `0` — when no module has a defined gap. A `0` therefore means measured and zero. |
+| `pause` | `none` \| `sigstop` \| `partial` | Derived only from the three counters below, never labelled independently: `none` when `pause_attempts` is 0, `sigstop` when every attempt closed confirmed, `partial` when any attempt did not. A pause lifecycle error prevents a successful result rather than creating a fourth value. |
+| `pause_attempts` | integer | Pause owners the coordinator opened, counted once each, plus any arming that failed before one could open. |
+| `pause_confirmed` | integer | Owners that closed with the stop observed and the child resumed. |
+| `pause_partial` | integer | Owners that closed without that confirmation. Forces `PARTIAL`. `pause_confirmed + pause_partial == pause_attempts` in every document. |
+| `child_still_running` | boolean | **`run` only**: true only when capture ended while the owned child was still alive. Absent — not `null`, not `false` — from every `--pid`/`--cgroup` document, because a capture that owned no child cannot answer the question. |
+| `discovery_ring_loss` | integer | BPF counter: `DISCOVERY` ring reservations that failed, across loader, exec, and export records. Never derived from received-record counts. |
+| `discovery_state_failures` | integer | BPF counter: export entry-state no-overwrite/cleanup failures. |
+| `discovery_read_failures` | integer | BPF counter: export table/interface bounded user-memory read failures **only**. Loader-state reads are deliberately excluded and are counted once, in `loader_discovery.state_read_failures`. |
+| `discovery_truncated` | integer | One discovery-engine accumulator: source-declared record truncations, userspace decode failures, and every refused, invalid, or stale loader context, each fed exactly once. One exemption, and only one: a loader-hit rejection **fully explained by that view's already-queued exec refresh** — the same object at a new load base, and the refresh that rescans the view whole is already queued for that exact view — is counted by nothing, because nothing went unobserved. It publishes no skip either; only the causal timing proof is invalidated. Every other rejected context, including one whose process ended before its record could be resolved, is still counted. It is composed by summing four internal monotone accumulators rather than kept as a single stored field; the sum is exact and no source feeds it twice, and none of the four is published separately. |
+| `loader_discovery` | object | The always-present finite live-loader aggregate. All-zero when nothing live ran; never absent, because an absent key would be a claim that nothing was measured. |
+
+Every integer above is an unsigned 64-bit count, and no counter is a second
+copy of another: each has exactly one owner — a BPF counter, the pause
+coordinator's own aggregate, the causal-timing table, or the deduplicated
+loader-context set — and a consumer must not add them together or derive one
+from another.
+
+#### `evidence.loader_discovery`
+
+Six keys, always all present, every leaf an unsigned 64-bit count. Key order
+carries no meaning (a real document's object keys arrive sorted).
+
+| Field | Meaning |
+| --- | --- |
+| `strategies.debug_state_every_hit` | Exact bound contexts served by the `_dl_debug_state` hook on every hit. The only strategy that leaves no completeness gap. |
+| `strategies.dlopen_return` | **Structurally zero in this build.** The key is always published, but this slice attaches `_dl_debug_state` only and has no `dlopen_return` product path at all, so nothing can increment it. Read a zero here as "this strategy does not exist yet", not as "it was available and unused". |
+| `strategies.unavailable` | Contexts with no usable loader binding. Forces `PARTIAL`. |
+| `dlopen_timing.*` | One classification for each exact bound context whose load kind is an ordinary `dlopen`: `qualified_pre_constructor` (the only value with no gap), `known_pre_relocation`, `unproven`, `none`. |
+| `initial_set_timing.*` | The same four classifications for the owned run's pre-exec initial-set context. |
+| `initial_set_capture.eligible` / `.none` | Whether an owned `run` could capture its child's initial provider set before the child's first constructor ran. `none` forces `PARTIAL`. |
+| `hits` | Scoped BPF debug-state hit counter, incremented before ring reservation and never derived from received-record counts. A hit is not a loss: this counter alone never changes the verdict. |
+| `state_read_failures` | The separate BPF counter for `_r_debug.r_state` reads. There is no second public copy of it, in this object or beside it. |
+
+With the empty compiled-in timing catalog this build ships, only `unproven` and
+`none` are reachable in either timing group, and `initial_set_capture.eligible`
+is unreachable. Both reachable values are gaps, so any capture that recorded an
+exact bound loader context at all is `PARTIAL`.
+
+The three classification groups are one partition of the same exact bound
+context set, not three independent tallies:
+
+- `strategies` totals the same number of contexts as `dlopen_timing` and
+  `initial_set_timing` together;
+- `initial_set_capture` totals the same number as `initial_set_timing`;
+- there is at most one initial-set context in any document — a `run` owns one
+  child, and a `--pid`/`--cgroup` capture arms none.
+
+Repeated arming of one context updates its classification instead of adding a
+second, so these are per-context counts and never per-record counts. Nothing in
+this object identifies a context: no loader path, digest or build ID, address,
+pointer, cookie, context id, delta, proof id, absent-state sentinel, signal
+record, interface name, marker, or process identity is published beside the
+counts (`docs/privacy/allowlist-v1.md`).
+
+#### What live discovery does not publish
+
+The completeness verdict consumes one more live-discovery fact that is
+deliberately **not** a field: whether any module's first required attach key
+was learned from a live loader or export event that no confirmed pause owner
+protected. The design forbids publishing it, and this document does not.
+
+It is worth stating plainly how the unpublished input is obtained, because it
+is an inference and not a measurement: the implementation treats a capture as
+having had an unprotected live window when `loader_discovery.hits > 0` and
+`pause` is not `sigstop` — "a live window happened at all, and no confirmed
+pause owner protected it". That is a capture-level approximation of a
+per-module condition, and it is inexact in both directions: over-inclusive,
+because a hit that established no module's first required key still forces
+`PARTIAL`; and under-inclusive, because the export-event lane can establish a
+first required key without incrementing `hits`. It can only ever downgrade a
+verdict, never raise one, and its runtime proof is still outstanding. A
+consumer must not reconstruct it from `hits` and `pause`: it is not a published
+field, and the inference behind it is expected to be replaced by a measured one.
+
 Process and semantic uncertainty:
 
 | Field | Meaning |
@@ -221,6 +329,27 @@ fields permitted in a complete document are the explicitly informational
 a structurally corroborated known prefix, but that surface deliberately keeps
 the verdict `PARTIAL`.
 
+Live discovery adds its own gates, and `COMPLETE` additionally requires all of
+them:
+
+- `discovery_ring_loss`, `discovery_state_failures`, `discovery_read_failures`,
+  and `discovery_truncated` are all zero;
+- `pause_partial` is zero (a partially confirmed pause owner is a gap; an
+  unattempted pause, `pause: none`, is not);
+- in `loader_discovery`: `strategies.dlopen_return` and `strategies.unavailable`
+  are zero, every timing classification other than `qualified_pre_constructor`
+  is zero in **both** timing groups, `initial_set_capture.none` is zero, and
+  `state_read_failures` is zero. `hits` and
+  `initial_set_capture.eligible` are not gaps;
+- no `functions[]` row is `module_unresolved`;
+- the unpublished unprotected-live-window input above is zero.
+
+Each of those is sticky for the rest of the capture, because the counter behind
+it is never decreased anywhere in the pipeline: a later clean tick cannot
+subtract a loss that already happened, so a verdict that has gone `PARTIAL`
+stays `PARTIAL`. (`hits` and `attach_gap_ms` never gate the verdict: a measured
+gap is a measurement, not a loss.)
+
 **A written profile is always `PARTIAL`.** Detaching a perf link stops new
 probe invocations but does not wait for BPF callbacks already executing on
 another CPU, so no terminal snapshot can prove it drained everything. The
@@ -242,8 +371,9 @@ One item per attach slot:
 | --- | --- |
 | `names` | Every standard function name resolving to the target. |
 | `aliased` | Whether more than one name shares the target. |
-| `module` | `{dev, ino, sha256}` of the module these counts belong to, matching one `capture.modules[]` entry (its `sha256` may be `null` on the same terms); `null` when two modules publish this target. |
+| `module` | `{dev, ino, sha256}` of the module these counts belong to, matching one `capture.modules[]` entry (its `sha256` may be `null` on the same terms); `null` when the owner is not knowable — see the exclusive relation below. |
 | `module_ambiguous` | True exactly when `module` is `null` because two modules claim the slot. The counts are real; the owner is not knowable and is never guessed. |
+| `module_unresolved` | True exactly when `module` is `null` because this allocated aggregate cell has **no accepted sole owner at all**. Forces `PARTIAL`. |
 | `calls` | Returns observed by the aggregate map. |
 | `errors` | Nonzero returns excluding `CKR_PENDING`. |
 | `pending_returns` | Returns equal to `CKR_PENDING`; also present in `rv_counts`. |
@@ -252,6 +382,30 @@ One item per attach slot:
 | `rv_counts` | Full-width `CK_RV` formatted as a 16-digit hex key to count. |
 
 Aliased slots are never split into guessed per-name counts.
+
+### The owner relation is exact and exclusive
+
+`module`, `module_ambiguous`, and `module_unresolved` are one relation with
+exactly three legal shapes, and a consumer may switch on them directly:
+
+| `module` | `module_ambiguous` | `module_unresolved` | Meaning |
+| --- | --- | --- | --- |
+| object | `false` | `false` | One accepted sole owner. |
+| `null` | `true` | `false` | Two modules publish this target: counted, never attributed. |
+| `null` | `false` | `true` | An allocated aggregate cell with no accepted sole owner. |
+
+`null, false, false` is not a legal row: an unattributed count always states
+which of the two reasons applies. Both flags true is likewise illegal —
+**an unresolved owner is not two-module ambiguity and is never relabelled as
+it**. Ambiguity means two candidates and no way to choose; unresolved means no
+accepted candidate at all, which is why they gate different things:
+`evidence.module_ambiguous` counts the ambiguous slots, while an unresolved
+owner has no public counter and appears only as this per-row boolean.
+
+`module_unresolved` is one finite boolean and carries nothing else. There is no
+reason string, no process identity, no path, no cookie, and no internal owner
+key beside it — the fact that the cell is unowned is the whole published
+statement, and it forces `PARTIAL` so the count is never read as attributed.
 
 ## `mechanisms[]`
 
@@ -344,12 +498,24 @@ Added:
 - `evidence.skipped` additionally carries object-level losses (a provider
   discovery could not read at all), which v1.4 only printed to stderr.
 
-Deferred to Slice 1b-2 (same v2, nothing is published yet): `attach_gap_ms`,
-`pause`, `child_still_running` and the live-discovery loss counters
-(`discovery_ring_loss`, `discovery_state_failures`, `discovery_truncated`,
-`discovery_read_failures`). They are **absent rather than null**: this slice has
-no live discovery to report on, and an always-null field is a claim that
-something was measured.
+Added by Slice 1b-2, in the same v2 and under the same identifier — v2 is
+unpublished, so no consumer ever received a document without them, and a second
+identifier would only invent a migration nobody has to make:
+
+- `evidence.attach_gap_ms`, `evidence.pause`, `evidence.pause_attempts`,
+  `evidence.pause_confirmed`, `evidence.pause_partial`, the four live-discovery
+  loss counters (`discovery_ring_loss`, `discovery_state_failures`,
+  `discovery_read_failures`, `discovery_truncated`), and the always-present
+  `evidence.loader_discovery` aggregate — see "Live discovery, pause, and the
+  owned run" above for the exact types, owners, and gates;
+- `evidence.child_still_running`, present only in a document `run` produced;
+- `functions[].module_unresolved`, completing the exact owner relation.
+
+`child_still_running` is the one field that is **absent rather than null** when
+it does not apply: a capture that owned no child cannot answer the question, and
+an always-present field would be a claim that it was measured. Every other field
+above is always present, all-zero (or `null`, for the deliberately nullable
+`attach_gap_ms`) when nothing live ran.
 
 ## v0-metrics → v1.1-metrics migration
 

@@ -47,6 +47,9 @@ one entry program per slot, and only template-bearing calls use
 | Function identity | All modes | Attach cookie indexes a slot from a current memory scan or explicit operator manifest attestation. Hash pinning binds the selected offsets to the opened bytes; a manifest that the scan cannot corroborate forces `PARTIAL`. No function-name pointer is needed for ordinary calls. | Standard name or an explicit alias group. Scan-only, aliased, and ambiguous slots remain count-only. |
 | PID/TID | All modes | `bpf_get_current_pid_tgid`; no user-memory read. | Privileged internal correlation state in every mode; only bounded `trace` output serializes raw PID/TID. Profile and metrics do not publish it. |
 | Cgroup id | All modes | `bpf_get_current_cgroup_id`; no user-memory read. | Numeric id and best-effort host cgroup label. |
+| Live loader/export discovery aggregate | All modes | Scoped BPF counters (`DISCOVERY` ring reservations that failed, export entry-state failures, export bounded user-read failures, `_r_debug.r_state` read failures, debug-state hits), the observer's own deduplicated set of exact bound loader contexts, and its causal-timing table for the gap. Loader state is read only through bounded `bpf_probe_read_user`; no PKCS#11 call argument and no provider-memory pointer is involved, and repeated arming of one context updates it rather than adding a record. | `evidence.loader_discovery`'s six always-present keys (four count groups and two counters), `evidence.discovery_ring_loss`, `evidence.discovery_state_failures`, `evidence.discovery_read_failures`, `evidence.discovery_truncated`, and the nullable `evidence.attach_gap_ms`. Counts and one measured millisecond gap only: never a loader or libc path, digest or build ID, address, pointer, attach cookie, context id, delta, proof id, absent-state sentinel, interface name, marker, or observer-owned map value. |
+| Pause authorization aggregate | All modes | `run` observes and confirms the stop of the child it forked itself, over its own bounded 1 ms loop; no user memory is read and no process the observer does not own can be paused. | `evidence.pause` (`none`/`sigstop`/`partial`, derived only from the counters), `evidence.pause_attempts`, `evidence.pause_confirmed`, `evidence.pause_partial`, and the run-only boolean `evidence.child_still_running`. Never a PID, TID, task set, process generation, signal record, or owner key. |
+| Aggregate slot ownership | All modes | The attach plan's existing module attribution for the slot; no provider-memory read and no call argument. | `functions[].module_unresolved`: one finite boolean stating that an allocated aggregate cell has no accepted sole owner, exclusive with `module_ambiguous`. Never a reason string, process identity, path, cookie, or internal owner key beside it. |
 | Discovery skip record | All modes | Scan, pinning, process, and scope losses share one untyped internal record after aggregation. Exact standard function names survive; every other name becomes `discovery subject`. Reasons come only from the five finite categories documented by the v2 schema; unknown/internal reasons become `discovery unavailable`. | `evidence.skipped[]`; never an arbitrary mapped path, numeric PID label, `/proc/<pid>` path, cgroup path, unknown name, or raw error chain. The categorical reason, number of distinct losses, and resulting `PARTIAL` verdict remain intact. |
 | Session handle | `allowlisted` and unsafe diagnostic | One descriptor-selected argument word read by `arg_u64`. | Internal state key only; `trace` emits a capture-local `sess#N`, never the handle. |
 | Slot id and session flags | `allowlisted` and unsafe diagnostic | One descriptor-selected argument word each. | Aggregate lifecycle/async-session evidence only. |
@@ -126,6 +129,11 @@ metadata pointer into unrelated readable memory.
   byte-exact catalog membership; no hash-only authorization path remains.
 - `CallStart` may temporarily hold protocol pointers required at return; the
   emitted `Event` and public render types have no raw-pointer output field.
+- Loader and pause state is reduced to finite counts before any render type is
+  constructed: the one immutable view the renderer receives carries no pin,
+  process view, open file, timing key, loader context, or child identity by
+  construction, so a loader/pause identity has no path into a document even
+  through a field that was added later.
 - Every kernel read/update failure has evidence that forces `PARTIAL` where it
   can affect attribution.
 - Count-only reduces provider-memory reads and adds no allowlisted field.
@@ -148,6 +156,21 @@ in any artifact fails the gate. The same run verifies both known GCM layouts,
 malformed-length refusal, and RSA-PSS scalar decoding. The hostile-alias lanes
 deliberately place sentinels behind decoded pointers; the ordinary lanes
 independently cover the supported ABI shapes.
+
+The same lanes scan every one of those surfaces for the loader and pause
+identities the observer holds privately — attach cookie, context id, delta,
+absent-state sentinel, process generation, child PID/TID, `_r_debug` and hook
+addresses, marker, loader path, digest and build ID, and interface-name bytes.
+Each surface is scanned the way a leak into it would look: a capture document
+structurally, because its allowlisted `rv_counts` and mechanism values
+legitimately spell narrow private constants and a byte scan would fire on them;
+a trace with only its two allowlisted call-event `pid`/`tid` positions removed
+by line shape, so a real PID cannot trigger the scan and an identity anywhere
+else on the same line still does; and a map dump as the bytes it encodes rather
+than as its `0x..` token text. `scripts/check-capture-evidence.py` carries the
+structural half — exact key sets, unsigned ranges, the pause enum, the
+aggregate cardinalities, run-only field presence, and the closed loader/pause
+key namespace at evidence, function-row, and module-reference level.
 
 Changes to `SlotSemantics`, `CallStart`, `Event`, `arg_u64`, `decode_params`,
 `walk_template`, `capture_async_target`, or public render fields require an

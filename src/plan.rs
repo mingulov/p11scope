@@ -50,7 +50,7 @@ impl AggregateOwner {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Slot {
     pub index: u32,
     /// Fixed descriptor selected by the static attach cookie. Zero is
@@ -198,6 +198,8 @@ pub struct AttachPlan {
     // exact reappearance gets a fresh monotonic slot rather than reviving a
     // historical cookie.
     slot_by_key: BTreeMap<AttachKey, usize>,
+    // Exact bootstrap targets which have not yet acquired table authority.
+    provisional_get_function_list: BTreeMap<AttachKey, PinnedObjectId>,
     // Slot indices never leave this set during one capture. Their historical
     // aggregate-map cells remain readable but may not receive new links.
     retired_slots: BTreeSet<usize>,
@@ -221,6 +223,14 @@ impl AttachKey {
             file_offset: slot.file_offset,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ProvisionalGetFunctionList {
+    pub(crate) module: ModuleId,
+    pub(crate) object: PinnedObjectId,
+    pub(crate) object_path: String,
+    pub(crate) file_offset: u64,
 }
 
 /// The finite link work induced by one complete rebuilt-plan snapshot.
@@ -260,6 +270,7 @@ impl AttachPlan {
                 .filter(|owner| matches!(owner, AggregateOwner::Ambiguous))
                 .count(),
             slot_by_key,
+            provisional_get_function_list: BTreeMap::new(),
             retired_slots: BTreeSet::new(),
             aggregate_owners,
         }
@@ -285,13 +296,102 @@ impl AttachPlan {
         manifests: &[Manifest],
         pinned_id: impl FnMut(ObjectKey, &str) -> Option<PinnedObjectId>,
     ) -> AttachPlan {
-        build_from_sources_with(
+        let mut rebuilt = build_from_sources_with(
             scanned,
             manifests,
             pinned_id,
             self.slots.len(),
             &self.slot_by_key,
-        )
+        );
+        for (key, object) in &self.provisional_get_function_list {
+            if key.object != *object || rebuilt.slot_by_key.contains_key(key) {
+                continue;
+            }
+            let Some(module_id) = rebuilt
+                .modules
+                .iter()
+                .find(|module| module.object == *object)
+                .map(|module| module.id)
+            else {
+                continue;
+            };
+            let Some(position) = self.slot_by_key.get(key).copied() else {
+                continue;
+            };
+            let Some(slot) = self.slots.get(position) else {
+                continue;
+            };
+            if rebuilt.slots.len() < MAX_SLOTS as usize {
+                rebuilt
+                    .add_provisional_get_function_list(ProvisionalGetFunctionList {
+                        module: module_id,
+                        object: *object,
+                        object_path: slot.object_path.clone(),
+                        file_offset: key.file_offset,
+                    })
+                    .expect("rebuilt provisional provider must remain valid");
+            }
+        }
+        rebuilt
+    }
+
+    pub(crate) fn add_provisional_get_function_list(
+        &mut self,
+        provisional: ProvisionalGetFunctionList,
+    ) -> Result<Option<Slot>, String> {
+        self.validate_slot_index()?;
+        let Some(module) = self
+            .modules
+            .iter()
+            .find(|module| module.id == provisional.module)
+        else {
+            return Err(format!(
+                "provisional C_GetFunctionList names missing module {}",
+                provisional.module.0
+            ));
+        };
+        if module.object != provisional.object {
+            return Err(format!(
+                "provisional C_GetFunctionList module {} names object {:?}, got {:?}",
+                provisional.module.0, module.object, provisional.object
+            ));
+        }
+        let key = AttachKey {
+            object: provisional.object,
+            file_offset: provisional.file_offset,
+        };
+        if let Some(position) = self.slot_by_key.get(&key).copied()
+            && self.is_active(position as u32)
+        {
+            return Ok(None);
+        }
+        if self.slots.len() >= MAX_SLOTS as usize {
+            return Err(format!(
+                "attach plan has {} allocated slots but only {MAX_SLOTS} are available",
+                self.slots.len()
+            ));
+        }
+        let slot = Slot {
+            index: self.slots.len() as u32,
+            descriptor_index: 0,
+            object: provisional.object,
+            object_path: provisional.object_path,
+            file_offset: provisional.file_offset,
+            names: vec!["C_GetFunctionList".into()],
+            aliased: false,
+            semantics: SlotSemantics::COUNT_ONLY,
+            semantic_authorized: false,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![provisional.module],
+        };
+        self.slot_by_key.insert(key, slot.index as usize);
+        self.provisional_get_function_list
+            .insert(key, provisional.object);
+        self.slots.push(slot.clone());
+        self.aggregate_owners
+            .push(AggregateOwner::Sole(provisional.module));
+        Ok(Some(slot))
     }
 
     /// True while this slot still accepts probes. Retired slots remain in
@@ -343,6 +443,27 @@ impl AttachPlan {
         }
     }
 
+    /// Renames this snapshot's providers, aggregate cells included. Slot
+    /// ownership and the aggregate-cell owners name the same modules, so they
+    /// are renamed together: leaving the cells on the pre-rename IDs makes the
+    /// next [`Self::extend_exact_with_stable_module_ids`] read one provider
+    /// under two IDs as two rivals and latch a false `module_ambiguous` on
+    /// every one of its cells.
+    pub(crate) fn rebind_module_ids(
+        &mut self,
+        slots: Vec<Slot>,
+        remap: &BTreeMap<ModuleId, ModuleId>,
+    ) {
+        for owner in &mut self.aggregate_owners {
+            if let AggregateOwner::Sole(id) = owner
+                && let Some(stable) = remap.get(id)
+            {
+                *owner = AggregateOwner::Sole(*stable);
+            }
+        }
+        self.slots = slots;
+    }
+
     /// Retains only the aggregate-cell provenance a fully reconciled candidate
     /// proved about already-active exact targets. Candidate identities and
     /// topology remain local until their transaction commits.
@@ -392,6 +513,8 @@ impl AttachPlan {
     }
 
     fn extend_exact_prepared(&mut self, rebuilt: AttachPlan) -> Result<AttachDelta, String> {
+        self.validate_slot_index()?;
+        rebuilt.validate_slot_index()?;
         self.validate_extension_capacity(&rebuilt)?;
 
         let mut slots = self.slots.clone();
@@ -488,6 +611,7 @@ impl AttachPlan {
         self.vendor_interfaces = rebuilt.vendor_interfaces;
         self.interface_list = rebuilt.interface_list;
         self.slot_by_key = slot_by_key;
+        self.provisional_get_function_list = rebuilt.provisional_get_function_list;
         self.retired_slots = retired_slots;
         self.aggregate_owners = aggregate_owners;
         self.module_ambiguous = self
@@ -538,17 +662,56 @@ impl AttachPlan {
         Ok(())
     }
 
+    /// The one infallible cleanup for a candidate that lost a process
+    /// generation after its links were already mutated. Every endpoint whose
+    /// exact pinned identity left with that generation stops accepting probes,
+    /// and its module and capacity refusal go with it. Allocated slot IDs are
+    /// never given back. A cell this candidate allocated itself — index at or
+    /// past `accepted_slots` — was never accepted by anybody, so it may not
+    /// keep a sole provider owner; an already-accepted owner and latched
+    /// ambiguity both stay. Returns the endpoints the caller must detach.
+    pub(crate) fn retire_unpinned_targets(
+        &mut self,
+        pinned: &PinnedObjects,
+        accepted_slots: usize,
+    ) -> Vec<Slot> {
+        self.modules
+            .retain(|module| pinned.summary(module.object).is_some());
+        self.refused_module_objects
+            .retain(|(object, _)| pinned.summary(*object).is_some());
+        let retired: Vec<Slot> = self
+            .slots
+            .iter()
+            .filter(|slot| self.is_active(slot.index) && pinned.summary(slot.object).is_none())
+            .cloned()
+            .collect();
+        for slot in &retired {
+            self.deactivate(slot.index);
+            let position = slot.index as usize;
+            if position >= accepted_slots
+                && matches!(self.aggregate_owners[position], AggregateOwner::Sole(_))
+            {
+                self.aggregate_owners[position] = AggregateOwner::Unowned;
+            }
+        }
+        retired
+    }
+
     /// A failed replacement must not revive the old descriptor or reuse its
     /// cookie. It remains a visible, inactive aggregate slot with finite
     /// attachment evidence owned by the caller.
     pub(crate) fn deactivate(&mut self, slot: u32) {
+        let position = slot as usize;
+        if position >= self.slots.len() {
+            return;
+        }
+        let key = AttachKey::of(&self.slots[position]);
+        self.provisional_get_function_list.remove(&key);
         if !self.is_active(slot) {
             return;
         }
-        let position = slot as usize;
         self.retired_slots.insert(position);
-        self.slot_by_key
-            .remove(&AttachKey::of(&self.slots[position]));
+        self.slot_by_key.remove(&key);
         self.module_ambiguous = self
             .aggregate_owners
             .iter()
@@ -627,6 +790,47 @@ impl AttachPlan {
             }
             if AttachKey::of(&self.slots[*position]) != *key {
                 return Err("exact attach index key does not match its slot".into());
+            }
+        }
+        for (key, object) in &self.provisional_get_function_list {
+            let Some(position) = self.slot_by_key.get(key).copied() else {
+                return Err("provisional exact key is missing from attach index".into());
+            };
+            if self.retired_slots.contains(&position) || !self.is_active(position as u32) {
+                return Err("provisional exact key points to a retired slot".into());
+            }
+            let slot = &self.slots[position];
+            if AttachKey::of(slot) != *key {
+                return Err("provisional exact key does not match its slot".into());
+            }
+            if slot.descriptor_index != 0
+                || slot.semantics != SlotSemantics::COUNT_ONLY
+                || slot.names != ["C_GetFunctionList"]
+                || slot.semantic_authorized
+                || slot.aliased
+                || slot.fork_safe
+                || slot.module_ids.len() != 1
+            {
+                return Err("provisional exact key names a non-provisional slot".into());
+            }
+            let module_id = slot.module_ids[0];
+            let aggregate_ambiguous = match self.aggregate_owners.get(position) {
+                Some(AggregateOwner::Sole(owner)) if *owner == module_id => false,
+                Some(AggregateOwner::Ambiguous) => true,
+                _ => return Err("provisional exact key has no valid aggregate owner".into()),
+            };
+            if slot.semantic_ambiguous && !aggregate_ambiguous {
+                return Err("provisional sole-owner slot is semantically ambiguous".into());
+            }
+            let mut modules = self.modules.iter().filter(|module| module.id == module_id);
+            let Some(module) = modules.next() else {
+                return Err("provisional exact key names a missing module".into());
+            };
+            if modules.next().is_some() {
+                return Err("provisional exact key names multiple modules".into());
+            }
+            if module.object != *object || slot.object != *object {
+                return Err("provisional exact key provider object does not match".into());
             }
         }
         Ok(())
@@ -1907,6 +2111,266 @@ mod tests {
         plan
     }
 
+    fn provisional_plan(object: PinnedObjectId) -> AttachPlan {
+        exact_plan(vec![], vec![exact_module(0, object)])
+    }
+
+    #[test]
+    fn provisional_get_function_list_seed_is_count_only_without_table_evidence() {
+        let object = PinnedObjectId(7);
+        let mut plan = provisional_plan(object);
+
+        let inserted = plan
+            .add_provisional_get_function_list(ProvisionalGetFunctionList {
+                module: ModuleId(0),
+                object,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x10,
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(inserted.index, 0);
+        assert_eq!(inserted.descriptor_index, 0);
+        assert_eq!(inserted.names, ["C_GetFunctionList"]);
+        assert!(!inserted.semantic_authorized);
+        assert!(!inserted.semantic_ambiguous);
+        assert!(!inserted.aliased);
+        assert!(!inserted.fork_safe);
+        assert_eq!(inserted.module_ids, [ModuleId(0)]);
+        assert!(plan.modules[0].tables.is_empty());
+        assert!(plan.surfaces.is_empty());
+        assert_eq!(plan.entries_seen, 0);
+        assert_eq!(plan.provisional_get_function_list.len(), 1);
+    }
+
+    #[test]
+    fn tableless_rebuild_carries_provisional_without_attach_delta() {
+        let object = PinnedObjectId(42);
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: u64::from(object.0),
+        };
+        let mut plan = provisional_plan(object);
+        let seeded = plan
+            .add_provisional_get_function_list(ProvisionalGetFunctionList {
+                module: ModuleId(0),
+                object,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x10,
+            })
+            .unwrap()
+            .unwrap();
+        let mut tableless = scanned_with(key, "/opt/p11.so", []);
+        tableless.scanned.tables.clear();
+        tableless.entry_objects.clear();
+
+        let rebuilt = plan.rebuild_from_sources(&[tableless], &[], &PinnedObjects::empty());
+        assert_eq!(rebuilt.entries_seen, 0);
+        assert_eq!(rebuilt.slots, [seeded]);
+        assert_eq!(rebuilt.provisional_get_function_list.len(), 1);
+
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(delta.new.is_empty());
+        assert!(delta.replace.is_empty());
+        assert!(delta.retire.is_empty());
+        assert_eq!(plan.provisional_get_function_list.len(), 1);
+    }
+
+    #[test]
+    fn real_table_reuses_provisional_slot_and_removes_marker() {
+        let object = PinnedObjectId(42);
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: u64::from(object.0),
+        };
+        let mut plan = provisional_plan(object);
+        let seeded = plan
+            .add_provisional_get_function_list(ProvisionalGetFunctionList {
+                module: ModuleId(0),
+                object,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x10,
+            })
+            .unwrap()
+            .unwrap();
+        let mut table = scanned_with(key, "/opt/p11.so", [0x10]);
+        table.scanned.tables[0].entries[0].name = "C_GetFunctionList";
+
+        let rebuilt = plan.rebuild_from_sources(&[table], &[], &PinnedObjects::empty());
+        assert_eq!(rebuilt.entries_seen, 1);
+        assert!(rebuilt.provisional_get_function_list.is_empty());
+        assert_eq!(rebuilt.slots.len(), 1);
+        assert_eq!(rebuilt.slots[0].index, seeded.index);
+
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(delta.new.is_empty());
+        assert!(delta.replace.is_empty());
+        assert!(delta.retire.is_empty());
+        assert!(plan.provisional_get_function_list.is_empty());
+        assert_eq!(plan.entries_seen, 1);
+        assert_eq!(plan.slots[0].names, ["C_GetFunctionList"]);
+    }
+
+    #[test]
+    fn provider_retirement_prunes_provisional_marker_with_slot() {
+        let object = PinnedObjectId(7);
+        let mut plan = provisional_plan(object);
+        let seeded = plan
+            .add_provisional_get_function_list(ProvisionalGetFunctionList {
+                module: ModuleId(0),
+                object,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x10,
+            })
+            .unwrap()
+            .unwrap();
+
+        let retired = plan.retire_unpinned_targets(&PinnedObjects::empty(), 0);
+        assert_eq!(retired, [seeded.clone()]);
+        assert!(!plan.is_active(seeded.index));
+        assert!(plan.provisional_get_function_list.is_empty());
+    }
+
+    #[test]
+    fn latched_ambiguity_keeps_a_provisional_target_through_tableless_rebuild() {
+        let object = PinnedObjectId(42);
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: u64::from(object.0),
+        };
+        let mut plan = provisional_plan(object);
+        let seeded = plan
+            .add_provisional_get_function_list(ProvisionalGetFunctionList {
+                module: ModuleId(0),
+                object,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x10,
+            })
+            .unwrap()
+            .unwrap();
+        let mut ambiguous = plan.clone();
+        ambiguous.aggregate_owners[0] = AggregateOwner::Ambiguous;
+
+        assert!(plan.latch_ambiguity_from(&ambiguous));
+        assert!(plan.validate_slot_index().is_ok());
+        assert_eq!(plan.module_of_slot(seeded.index), None);
+        assert!(plan.slot_is_module_ambiguous(seeded.index));
+        assert_eq!(plan.provisional_get_function_list.len(), 1);
+
+        let mut tableless = scanned_with(key, "/opt/p11.so", []);
+        tableless.scanned.tables.clear();
+        tableless.entry_objects.clear();
+        let rebuilt = plan.rebuild_from_sources(&[tableless], &[], &PinnedObjects::empty());
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(delta.new.is_empty());
+        assert!(delta.replace.is_empty());
+        assert!(delta.retire.is_empty());
+        assert_eq!(plan.provisional_get_function_list.len(), 1);
+        assert!(plan.slot_is_module_ambiguous(seeded.index));
+
+        let mut table = scanned_with(key, "/opt/p11.so", [0x10]);
+        table.scanned.tables[0].entries[0].name = "C_GetFunctionList";
+        let rebuilt = plan.rebuild_from_sources(&[table], &[], &PinnedObjects::empty());
+        let delta = plan.extend_exact(rebuilt).unwrap();
+        assert!(delta.new.is_empty());
+        assert!(delta.replace.is_empty());
+        assert!(delta.retire.is_empty());
+        assert!(plan.provisional_get_function_list.is_empty());
+        assert_eq!(plan.slots[seeded.index as usize].descriptor_index, 0);
+        assert!(plan.slot_is_module_ambiguous(seeded.index));
+    }
+
+    #[test]
+    fn provisional_get_function_list_refuses_capacity() {
+        let object = PinnedObjectId(7);
+        let slots = (0..MAX_SLOTS)
+            .map(|index| exact_slot(index, object, u64::from(index) * 8, 0, vec![ModuleId(0)]))
+            .collect();
+        let mut plan = exact_plan(slots, vec![exact_module(0, object)]);
+
+        let error = plan
+            .add_provisional_get_function_list(ProvisionalGetFunctionList {
+                module: ModuleId(0),
+                object,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x10000,
+            })
+            .unwrap_err();
+
+        assert!(error.contains("512"), "{error}");
+        assert!(plan.provisional_get_function_list.is_empty());
+        assert_eq!(plan.slots.len(), MAX_SLOTS as usize);
+    }
+
+    #[test]
+    fn provisional_index_validation_rejects_stale_retired_and_mismatched_entries() {
+        let object = PinnedObjectId(7);
+        let key = AttachKey {
+            object,
+            file_offset: 0x10,
+        };
+
+        let mut stale = provisional_plan(object);
+        stale.provisional_get_function_list.insert(key, object);
+        assert!(stale.validate_slot_index().is_err());
+
+        let mut retired = provisional_plan(object);
+        let seeded = retired
+            .add_provisional_get_function_list(ProvisionalGetFunctionList {
+                module: ModuleId(0),
+                object,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x10,
+            })
+            .unwrap()
+            .unwrap();
+        retired.deactivate(seeded.index);
+        retired.provisional_get_function_list.insert(key, object);
+        assert!(retired.validate_slot_index().is_err());
+
+        let mut mismatched = provisional_plan(object);
+        mismatched
+            .add_provisional_get_function_list(ProvisionalGetFunctionList {
+                module: ModuleId(0),
+                object,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x10,
+            })
+            .unwrap();
+        mismatched
+            .provisional_get_function_list
+            .insert(key, PinnedObjectId(8));
+        assert!(mismatched.validate_slot_index().is_err());
+
+        let mut unowned = provisional_plan(object);
+        unowned
+            .add_provisional_get_function_list(ProvisionalGetFunctionList {
+                module: ModuleId(0),
+                object,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x10,
+            })
+            .unwrap();
+        unowned.aggregate_owners[0] = AggregateOwner::Unowned;
+        assert!(unowned.validate_slot_index().is_err());
+
+        let mut wrong_owner = exact_plan(
+            vec![],
+            vec![exact_module(0, object), exact_module(1, PinnedObjectId(8))],
+        );
+        wrong_owner
+            .add_provisional_get_function_list(ProvisionalGetFunctionList {
+                module: ModuleId(0),
+                object,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x10,
+            })
+            .unwrap();
+        wrong_owner.aggregate_owners[0] = AggregateOwner::Sole(ModuleId(1));
+        assert!(wrong_owner.validate_slot_index().is_err());
+    }
+
     fn discovered_for_capacity(
         object: PinnedObjectId,
         path: &'static str,
@@ -1974,6 +2438,32 @@ mod tests {
         assert_eq!(plan.active_module_of_slot(0), None);
         assert_eq!(plan.module_of_slot(0), Some(ModuleId(0)));
         assert_eq!(plan.slots[0], frozen);
+    }
+
+    #[test]
+    fn retiring_an_unpinned_target_keeps_latched_ambiguity_on_a_new_cell() {
+        let object = PinnedObjectId(1);
+        let descriptor = crate::kinds::function_id("C_Sign").unwrap() + 1;
+        let mut plan = exact_plan(
+            vec![
+                exact_slot(0, object, 0x10, descriptor, vec![ModuleId(0)]),
+                exact_slot(1, object, 0x20, descriptor, vec![ModuleId(0), ModuleId(1)]),
+            ],
+            vec![exact_module(0, object)],
+        );
+        assert_eq!(plan.module_ambiguous, 1);
+
+        // Nothing is pinned any more and no cell was accepted before this
+        // candidate, so slot 0 loses its sole owner and slot 1 stays ambiguous.
+        let retired = plan.retire_unpinned_targets(&PinnedObjects::empty(), 0);
+
+        assert_eq!(retired.len(), 2);
+        assert_eq!(plan.slots.len(), 2, "allocated cells are never given back");
+        assert_eq!(plan.module_of_slot(0), None);
+        assert_eq!(plan.module_of_slot(1), None);
+        assert!(plan.slot_is_module_ambiguous(1), "ambiguity stays sticky");
+        assert_eq!(plan.module_ambiguous, 1);
+        assert!(plan.modules.is_empty());
     }
 
     #[test]

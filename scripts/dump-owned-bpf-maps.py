@@ -39,6 +39,20 @@ def run_json(args, require_list=False):
     )
 
 
+def map_oracle(item):
+    """Which oracle reads this map: `bpftool map dump`, or an mmap consumer.
+
+    A ringbuf has no key/value iteration, so `bpftool map dump` refuses it
+    (exit 244, empty stderr) whatever it is called. Dispatch on the map type,
+    never on the name: Slice 1b-2 owns two ringbufs, EVENTS and DISCOVERY.
+    """
+    if item.get("type") == "ringbuf":
+        return "mmap"
+    if item["name"] == "EVENTS":
+        raise RuntimeError(f"EVENTS is not a ringbuf: {item}")
+    return "dump"
+
+
 def one(value):
     if isinstance(value, list):
         if len(value) != 1:
@@ -70,6 +84,27 @@ def self_test():
     else:
         raise AssertionError("non-list ordinary map dump was accepted")
     print("ordinary dump list validation: OK")
+    # `bpftool map dump` cannot read a ringbuf — it exits 244 with empty stderr —
+    # so every ringbuf this observer owns must route to the mmap oracle. The
+    # mutation lane is the real Slice 1b-2 inventory: two ringbufs, only one of
+    # them named EVENTS. Dispatching on the name dumps DISCOVERY and dies.
+    inventory = [
+        {"name": "EVENTS", "type": "ringbuf"},
+        {"name": "DISCOVERY", "type": "ringbuf"},
+        {"name": "START", "type": "hash"},
+        {"name": "COUNTERS", "type": "percpu_array"},
+    ]
+    assert [map_oracle(item) for item in inventory] == ["mmap", "mmap", "dump", "dump"], [
+        map_oracle(item) for item in inventory
+    ]
+    print("every owned ringbuf routes to the mmap oracle: OK")
+    try:
+        map_oracle({"name": "EVENTS", "type": "hash"})
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("EVENTS built as a non-ringbuf was accepted")
+    print("EVENTS ringbuf build guard: OK")
     print("dump-owned-bpf-maps self-test: OK")
 
 
@@ -138,39 +173,24 @@ def main():
     manifest = []
     for item in maps:
         name = item["name"]
-        if name == "EVENTS":
-            if item.get("type") != "ringbuf":
-                raise RuntimeError(f"EVENTS is not a ringbuf: {item}")
-            manifest.append(
-                {
-                    "id": item["id"],
-                    "name": name,
-                    "type": item.get("type"),
-                    "key_size": item.get("bytes_key"),
-                    "value_size": item.get("bytes_value"),
-                    "max_entries": item.get("max_entries"),
-                    "oracle": "mmap",
-                }
+        record = {
+            "id": item["id"],
+            "name": name,
+            "type": item.get("type"),
+            "key_size": item.get("bytes_key"),
+            "value_size": item.get("bytes_value"),
+            "max_entries": item.get("max_entries"),
+            "oracle": map_oracle(item),
+        }
+        if record["oracle"] == "dump":
+            output = out_dir / f"mapdump_{name}{suffix}.json"
+            dumped = run_json(
+                ["bpftool", "-j", "map", "dump", "id", str(item["id"])],
+                require_list=True,
             )
-            continue
-        output = out_dir / f"mapdump_{name}{suffix}.json"
-        dumped = run_json(
-            ["bpftool", "-j", "map", "dump", "id", str(item["id"])],
-            require_list=True,
-        )
-        output.write_text(json.dumps(dumped, separators=(",", ":")) + "\n")
-        manifest.append(
-            {
-                "id": item["id"],
-                "name": name,
-                "type": item.get("type"),
-                "key_size": item.get("bytes_key"),
-                "value_size": item.get("bytes_value"),
-                "max_entries": item.get("max_entries"),
-                "oracle": "dump",
-                "file": str(output),
-            }
-        )
+            output.write_text(json.dumps(dumped, separators=(",", ":")) + "\n")
+            record["file"] = str(output)
+        manifest.append(record)
 
     manifest_path = out_dir / f"mapdump_manifest{suffix}.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")

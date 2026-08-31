@@ -51,6 +51,34 @@ capped_container_tar() {
     }
 }
 
+recording_launcher_active() {
+    rla_pid=$1
+    kill -0 "$rla_pid" 2>/dev/null || return 1
+    ! awk '{ sub(/^[0-9]+ \(.*\) /, ""); exit(substr($0, 1, 1) == "Z" ? 0 : 1) }' \
+        "/proc/$rla_pid/stat" 2>/dev/null
+}
+
+terminate_recording_launcher() {
+    trl_pid=$1
+    case $trl_pid in ''|*[!0-9]*) return 1 ;; esac
+    kill "$trl_pid" 2>/dev/null || true
+    trl_attempt=0
+    while recording_launcher_active "$trl_pid" && [ "$trl_attempt" -lt 100 ]; do
+        trl_attempt=$((trl_attempt + 1))
+        sleep 0.05
+    done
+    if recording_launcher_active "$trl_pid"; then
+        kill -KILL "$trl_pid" 2>/dev/null || return 1
+        trl_attempt=0
+        while recording_launcher_active "$trl_pid" && [ "$trl_attempt" -lt 100 ]; do
+            trl_attempt=$((trl_attempt + 1))
+            sleep 0.05
+        done
+    fi
+    recording_launcher_active "$trl_pid" && return 1
+    wait "$trl_pid" 2>/dev/null || true
+}
+
 launch_root_recorded_process() {
     lrrp_pidfile=$1
     lrrp_log=$2
@@ -58,17 +86,19 @@ launch_root_recorded_process() {
     sudo -n sh -c '
         umask 077
         starttime=$(awk '\''{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[20]; exit }'\'' "/proc/$$/stat") || exit 1
-        printf "%s %s\n" "$$" "$starttime" > "$1"
+        set -C
+        printf "%s %s\n" "$$" "$starttime" > "$1" || exit 1
         shift
         exec "$@"
     ' sh "$lrrp_pidfile" "$@" > "$lrrp_log" 2>&1 &
     ROOT_LAUNCH_PID=$!
     lrrp_record=$(wait_root_process_record "$lrrp_pidfile" "$ROOT_LAUNCH_PID") || {
         lrrp_status=$?
-        kill "$ROOT_LAUNCH_PID" 2>/dev/null || true
-        wait "$ROOT_LAUNCH_PID" 2>/dev/null || true
-        ROOT_LAUNCH_PID=
-        return "$lrrp_status"
+        if terminate_recording_launcher "$ROOT_LAUNCH_PID"; then
+            ROOT_LAUNCH_PID=
+            return "$lrrp_status"
+        fi
+        return 1
     }
     set -- $lrrp_record
     [ "$#" -eq 2 ] || return 1
@@ -81,7 +111,7 @@ wait_root_process_record() {
     wrpr_launcher=$2
     wrpr_attempt=0
     while ! sudo -n test -s "$wrpr_pidfile" && [ "$wrpr_attempt" -lt 160 ]; do
-        kill -0 "$wrpr_launcher" 2>/dev/null || {
+        recording_launcher_active "$wrpr_launcher" || {
             echo "root process exited before recording its identity" >&2
             return 1
         }
@@ -123,6 +153,23 @@ process_matches_starttime() {
     [ "$pms_current" = "$pms_expected" ]
 }
 
+process_session_id() {
+    psid_pid=$1
+    case $psid_pid in ''|*[!0-9]*) return 1 ;; esac
+    psid_value=$(awk '{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[4]; exit }' \
+        "/proc/$psid_pid/stat" 2>/dev/null) || return 1
+    case $psid_value in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$psid_value"
+}
+
+process_matches_session() {
+    pms_pid=$1
+    pms_starttime=$2
+    pms_sid=$3
+    process_matches_starttime "$pms_pid" "$pms_starttime" \
+        && [ "$(process_session_id "$pms_pid")" = "$pms_sid" ]
+}
+
 root_process_matches_starttime() {
     rpms_pid=$1
     rpms_expected=$2
@@ -150,15 +197,18 @@ signals = {
     "STOP": signal.SIGSTOP,
     "TERM": signal.SIGTERM,
 }
-if len(sys.argv) != 4 or sys.argv[1] not in signals:
-    raise SystemExit("usage: SIGNAL PID STARTTIME")
+if len(sys.argv) not in (4, 5) or sys.argv[1] not in signals:
+    raise SystemExit("usage: SIGNAL PID STARTTIME [SID]")
 
 pid, expected = int(sys.argv[2]), int(sys.argv[3])
+expected_sid = int(sys.argv[4]) if len(sys.argv) == 5 else None
 fd = os.pidfd_open(pid)
 raw = open(f"/proc/{pid}/stat", "rb").read()
 tail = raw.rsplit(b") ", 1)[1].split()
 if len(tail) < 20 or int(tail[19]) != expected:
     raise SystemExit(f"refusing changed process identity {pid}")
+if expected_sid is not None and int(tail[3]) != expected_sid:
+    raise SystemExit(f"refusing changed process session {pid}")
 signal.pidfd_send_signal(fd, signals[sys.argv[1]], None, 0)
 PY
 }
@@ -169,6 +219,232 @@ signal_verified_process() {
 
 signal_verified_root_process() {
     signal_pinned_process root "$@"
+}
+
+# Start a user-owned command as its own session/process group and retain the
+# identity that makes a later pidfd signal safe across PID reuse.
+launch_user_recorded_process_group() {
+    lurpg_pidfile=$1
+    lurpg_log=$2
+    shift 2
+    [ "$#" -gt 0 ] || return 1
+    [ ! -e "$lurpg_pidfile" ] || {
+        echo "user process-group identity file already exists" >&2
+        return 1
+    }
+    umask 077
+    USER_PROCESS_SID=
+    export USER_PROCESS_SID
+    python3 - "$lurpg_pidfile" "$@" > "$lurpg_log" 2>&1 <<'PY' &
+import json
+import os
+import sys
+
+
+def stat(pid):
+    raw = open(f"/proc/{pid}/stat", "rb").read()
+    _, separator, tail = raw.rpartition(b") ")
+    if not separator:
+        raise ValueError("malformed proc stat")
+    fields = tail.split()
+    if len(fields) < 20:
+        raise ValueError("short proc stat")
+    return int(fields[19]), int(fields[2]), int(fields[3])
+
+
+pidfile, command = sys.argv[1], sys.argv[2:]
+if not command:
+    raise SystemExit("missing command")
+os.umask(0o077)
+os.setsid()
+pid = os.getpid()
+starttime, pgid, sid = stat(pid)
+if pid != pgid or pid != sid:
+    raise SystemExit("new session leader does not lead its session and process group")
+record = json.dumps(
+    {"pid": pid, "starttime": starttime, "pgid": pgid, "sid": sid, "argv": command},
+    separators=(",", ":"),
+).encode() + b"\n"
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+fd = os.open(pidfile, flags, 0o600)
+try:
+    os.write(fd, record)
+    os.fsync(fd)
+finally:
+    os.close(fd)
+directory = os.open(os.path.dirname(os.path.abspath(pidfile)) or ".", os.O_RDONLY)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+os.execvp(command[0], command)
+PY
+    USER_PROCESS_LAUNCH_PID=$!
+    # This direct child identity is trap-visible before the durable group
+    # record appears. It is never refreshed after launch failure.
+    USER_PROCESS_PID=$USER_PROCESS_LAUNCH_PID
+    USER_PROCESS_STARTTIME=$(process_starttime "$USER_PROCESS_LAUNCH_PID" 2>/dev/null || true)
+    USER_PROCESS_INITIAL_STARTTIME=$USER_PROCESS_STARTTIME
+    USER_PROCESS_PGID=
+    USER_PROCESS_PIDFILE=$lurpg_pidfile
+    lurpg_attempt=0
+    while [ ! -s "$lurpg_pidfile" ] && [ "$lurpg_attempt" -lt 160 ]; do
+        kill -0 "$USER_PROCESS_LAUNCH_PID" 2>/dev/null || {
+            echo "user process group exited before recording its identity" >&2
+            USER_PROCESS_LAUNCH_PID=
+            return 1
+        }
+        lurpg_attempt=$((lurpg_attempt + 1))
+        sleep 0.05
+    done
+    [ -s "$lurpg_pidfile" ] || {
+        echo "user process group identity was not recorded" >&2
+        return 1
+    }
+    lurpg_record=$(python3 - "$lurpg_pidfile" "$USER_PROCESS_LAUNCH_PID" \
+        "$USER_PROCESS_INITIAL_STARTTIME" "$@" <<'PY'
+import json
+import sys
+
+
+record = json.load(open(sys.argv[1], encoding="utf-8"))
+launcher = int(sys.argv[2])
+initial_starttime = int(sys.argv[3])
+expected_argv = sys.argv[4:]
+if set(record) != {"pid", "starttime", "pgid", "sid", "argv"}:
+    raise SystemExit("malformed user process-group identity")
+if not all(isinstance(record[name], int) and record[name] > 0 for name in ("pid", "starttime", "pgid", "sid")):
+    raise SystemExit("malformed user process-group identity")
+if not isinstance(record["argv"], list) or not all(isinstance(item, str) for item in record["argv"]):
+    raise SystemExit("malformed user process-group argv")
+if record["pid"] != launcher or record["starttime"] != initial_starttime:
+    raise SystemExit("user process-group identity does not match launch")
+if record["pid"] != record["pgid"] or record["pid"] != record["sid"] or record["argv"] != expected_argv:
+    raise SystemExit("user process-group identity does not match launch")
+print(record["pid"], record["starttime"], record["pgid"], record["sid"])
+PY
+) || {
+        lurpg_status=$?
+        return "$lurpg_status"
+    }
+    set -- $lurpg_record
+    [ "$#" -eq 4 ] || return 1
+    USER_PROCESS_PID=$1
+    USER_PROCESS_STARTTIME=$2
+    USER_PROCESS_PGID=$3
+    USER_PROCESS_SID=$4
+    export USER_PROCESS_SID
+
+    python3 - "$USER_PROCESS_PID" "$USER_PROCESS_STARTTIME" "$USER_PROCESS_PGID" "$USER_PROCESS_SID" <<'PY'
+import sys
+
+
+def stat(pid):
+    raw = open(f"/proc/{pid}/stat", "rb").read()
+    _, separator, tail = raw.rpartition(b") ")
+    if not separator:
+        raise ValueError("malformed proc stat")
+    fields = tail.split()
+    if len(fields) < 20:
+        raise ValueError("short proc stat")
+    return int(fields[19]), int(fields[2]), int(fields[3])
+
+
+pid, starttime, pgid, sid = map(int, sys.argv[1:5])
+actual_starttime, actual_pgid, actual_sid = stat(pid)
+if actual_starttime != starttime or actual_pgid != pgid or actual_sid != sid or pid != pgid or pid != sid:
+    raise SystemExit("user process-session identity changed before use")
+PY
+    lurpg_status=$?
+    [ "$lurpg_status" -eq 0 ] || {
+        return "$lurpg_status"
+    }
+}
+
+# Emit a closed, sorted JSON projection of one current user-owned process
+# session. A process that races or cannot be identified invalidates the snapshot.
+snapshot_user_process_session() {
+    sups_sid=$1
+    case $sups_sid in ''|*[!0-9]*) return 1 ;; esac
+    python3 - "$sups_sid" <<'PY'
+import glob
+import hashlib
+import json
+import os
+import sys
+
+
+def stat(pid):
+    raw = open(f"/proc/{pid}/stat", "rb").read()
+    _, separator, tail = raw.rpartition(b") ")
+    if not separator:
+        raise ValueError("malformed proc stat")
+    fields = tail.split()
+    if len(fields) < 20:
+        raise ValueError("short proc stat")
+    return int(fields[19]), int(fields[1]), int(fields[2]), int(fields[3])
+
+
+sids = int(sys.argv[1])
+if sids <= 0:
+    raise SystemExit("invalid process session")
+members = []
+for path in glob.glob("/proc/[0-9]*"):
+    pid = int(path.rsplit("/", 1)[1])
+    try:
+        starttime, ppid, actual_pgid, actual_sid = stat(pid)
+    except FileNotFoundError:
+        # No membership can be established for a process that vanished before
+        # its first stat read. Once the target group is identified below, any
+        # later disappearance is a hard error.
+        continue
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"cannot inspect process {pid}: {error}")
+    if actual_sid != sids:
+        continue
+    try:
+        def projection():
+            digest = hashlib.sha256()
+            with open(f"/proc/{pid}/exe", "rb") as source:
+                for block in iter(lambda: source.read(131072), b""):
+                    digest.update(block)
+            raw_argv = open(f"/proc/{pid}/cmdline", "rb").read()
+            if not raw_argv or not raw_argv.endswith(b"\0"):
+                raise ValueError("malformed argv")
+            argv = [item.decode("utf-8", "strict") for item in raw_argv[:-1].split(b"\0")]
+            if not argv or not argv[0]:
+                raise ValueError("empty argv")
+            return digest.hexdigest(), argv
+
+        digest, argv = projection()
+        middle = stat(pid)
+        final_digest, final_argv = projection()
+        final = stat(pid)
+    except (FileNotFoundError, OSError, UnicodeError, ValueError) as error:
+        raise SystemExit(f"cannot close process-group member {pid}: {error}")
+    if middle != (starttime, ppid, actual_pgid, actual_sid) or final != middle:
+        raise SystemExit(f"process-session member {pid} changed during snapshot")
+    if (final_digest, final_argv) != (digest, argv):
+        raise SystemExit(f"process-group member {pid} execed during snapshot")
+    members.append(
+        {
+            "pid": pid,
+            "starttime": starttime,
+            "ppid": ppid,
+            "pgid": actual_pgid,
+            "sid": actual_sid,
+            "exe_sha256": digest,
+            "argv": argv,
+        }
+    )
+print(json.dumps(sorted(members, key=lambda member: member["pid"]), separators=(",", ":")))
+PY
+}
+
+snapshot_user_process_group() {
+    snapshot_user_process_session "$@"
 }
 
 # This slice scans once, at attach time: a provider mapped later is not

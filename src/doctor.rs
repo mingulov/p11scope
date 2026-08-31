@@ -65,6 +65,10 @@ pub fn probe(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check> {
         capabilities_check(),
     ];
     checks.extend(bpf_checks());
+    let capture_lane = !checks
+        .iter()
+        .any(|c| is_capture_row(&c.name) && matches!(c.status, Status::Fail(_)));
+    checks.extend(live_discovery_checks(pid, capture_lane));
     checks.push(match pid {
         Some(pid) => proc_maps_check(pid),
         None => not_applicable("/proc/<pid>/maps", "no --pid"),
@@ -286,6 +290,110 @@ fn attach_self_probe(ebpf: &mut Ebpf) -> Result<(), String> {
     Ok(())
 }
 
+/// What the live-discovery lanes need from the target's dynamic loader, read
+/// with nothing but ordinary opens: whether the PT_INTERP loader could be
+/// bound at all, whether it defines an executable `_dl_debug_state`, and
+/// whether it defines `_r_debug` for the bounded live state read.
+///
+/// Every failure collapses to the negative classification. Nothing about
+/// *which* loader this is may reach the row (design §9.3, §10.1), so this
+/// deliberately returns three booleans and never an error string.
+fn loader_facts(pid: Option<u32>) -> (bool, bool, bool) {
+    let unbound = (false, false, false);
+    // With no `--pid` the honest subject is this host as the observer sees it:
+    // its own PT_INTERP is the build a capture on this host would bind.
+    let executable = match pid {
+        Some(pid) => format!("/proc/{pid}/exe"),
+        None => "/proc/self/exe".to_string(),
+    };
+    let Ok(file) = std::fs::File::open(&executable) else {
+        return unbound;
+    };
+    let Ok(snapshot) = p11scope_manifest::elf::ElfSnapshot::read(&file) else {
+        return unbound;
+    };
+    let Some(interpreter) = snapshot.interpreter() else {
+        return unbound;
+    };
+    let interpreter = PathBuf::from(std::ffi::OsString::from(
+        String::from_utf8_lossy(interpreter).into_owned(),
+    ));
+    let Ok(loader) = std::fs::File::open(&interpreter) else {
+        return unbound;
+    };
+    let Ok(loader) = p11scope_manifest::elf::ElfSnapshot::read(&loader) else {
+        return unbound;
+    };
+    let hook = loader
+        .defined_symbol("_dl_debug_state")
+        .ok()
+        .flatten()
+        .is_some_and(|hook| loader.is_executable_offset(hook.file_offset));
+    let state = loader.defined_symbol("_r_debug").ok().flatten().is_some();
+    (true, hook, state)
+}
+
+/// The eight finite live-discovery classifications of design §10.1. Each
+/// detail is exactly one word from its frozen vocabulary, never the identity
+/// or the proof behind it.
+fn live_discovery_checks(pid: Option<u32>, capture_lane: bool) -> Vec<Check> {
+    let (bound, hook, state) = loader_facts(pid);
+    let finite = |ok: bool, yes: &str, no: &str| {
+        if ok {
+            Status::Ok(yes.to_string())
+        } else {
+            // A degraded live lane is a warning: it makes complete timing
+            // unavailable without making every capture lane fatal (§10.1).
+            Status::Warn(no.to_string())
+        }
+    };
+    // The compiled-in timing catalog is exactly empty (D3 amendment §3), so a
+    // bound debug-state context is `unproven` and everything else is `none`.
+    // No context can reach `qualified_pre_constructor`/`known_pre_relocation`.
+    let timing = || Status::Warn(if hook { "unproven" } else { "none" }.to_string());
+    vec![
+        Check {
+            name: "target loader build".into(),
+            status: finite(bound, "bound", "unbound"),
+        },
+        Check {
+            name: "debug-state hook".into(),
+            status: finite(hook, "available", "unavailable"),
+        },
+        Check {
+            name: "loader timing (initial_set)".into(),
+            status: timing(),
+        },
+        Check {
+            name: "loader timing (dlopen)".into(),
+            status: timing(),
+        },
+        Check {
+            name: "loader-state live read".into(),
+            status: finite(state, "available", "unavailable"),
+        },
+        Check {
+            // Bounded `bpf_probe_read_user` in the current task: it needs the
+            // same program load the capture lane needs, and nothing more.
+            name: "live export reads".into(),
+            status: finite(capture_lane, "available", "unavailable"),
+        },
+        Check {
+            // Never eligible while the catalog is empty: attach-first closure
+            // cannot prove the observed event was the first relevant one.
+            name: "run initial-set capture".into(),
+            status: Status::Warn("none".into()),
+        },
+        Check {
+            name: "pause".into(),
+            status: Status::Ok(format!(
+                "never default; explicit auto|always {} arm here",
+                if capture_lane { "can" } else { "cannot" }
+            )),
+        },
+    ]
+}
+
 fn own_libc_path() -> Result<PathBuf, String> {
     let bytes = std::fs::read("/proc/self/maps").map_err(|e| format!("/proc/self/maps: {e}"))?;
     let entries = p11scope_manifest::maps::parse_maps(&bytes)?;
@@ -384,6 +492,14 @@ fn is_cgroup_row(name: &str) -> bool {
     name == "cgroup path"
 }
 
+/// The one live-discovery lane that gates the exit code: a `run` that asked
+/// for initial-set capture and cannot have it is a requested lane that is
+/// unavailable (§10.1). The timing rows warn instead — a degraded timing value
+/// must not make every capture lane fatal.
+fn is_run_capture_row(name: &str) -> bool {
+    name == "run initial-set capture"
+}
+
 fn scan_pid_suffix(name: &str) -> String {
     name.strip_prefix("/proc/")
         .and_then(|rest| rest.strip_suffix("/mem"))
@@ -452,7 +568,10 @@ pub fn render(checks: &[Check]) -> String {
 /// in a requested lane" reduces to "any `Fail` among these fixed row names".
 pub fn verdict(checks: &[Check]) -> i32 {
     let gated = checks.iter().any(|c| {
-        (is_capture_row(&c.name) || is_scan_row(&c.name) || is_cgroup_row(&c.name))
+        (is_capture_row(&c.name)
+            || is_scan_row(&c.name)
+            || is_cgroup_row(&c.name)
+            || is_run_capture_row(&c.name))
             && matches!(c.status, Status::Fail(_))
     });
     if gated { 1 } else { 0 }
@@ -540,7 +659,8 @@ mod tests {
     #[test]
     fn probe_marks_unrequested_lanes_not_applicable_and_never_fails_them() {
         let checks = probe(None, None);
-        assert_eq!(checks.len(), 11, "{checks:?}");
+        // 11 host/target rows plus the eight §10.1 live-discovery rows.
+        assert_eq!(checks.len(), 19, "{checks:?}");
         let by_name = |name: &str| checks.iter().find(|c| c.name == name).unwrap();
         assert_eq!(
             by_name("/proc/<pid>/maps").status,
@@ -563,5 +683,127 @@ mod tests {
                 "{name} was not requested and must not Fail"
             );
         }
+    }
+
+    // ---- Slice 1b-2 doctor contract (design §10.1) ------------------------
+
+    /// Every live-discovery row doctor may print, and the finite vocabulary its
+    /// detail is drawn from. A row that classified itself any other way is
+    /// publishing something the operator cannot act on.
+    const FROZEN_ROWS: [(&str, &[&str]); 7] = [
+        ("target loader build", &["bound", "unbound"]),
+        ("debug-state hook", &["available", "unavailable"]),
+        (
+            "loader timing (initial_set)",
+            &[
+                "qualified_pre_constructor",
+                "known_pre_relocation",
+                "unproven",
+                "none",
+            ],
+        ),
+        (
+            "loader timing (dlopen)",
+            &[
+                "qualified_pre_constructor",
+                "known_pre_relocation",
+                "unproven",
+                "none",
+            ],
+        ),
+        ("loader-state live read", &["available", "unavailable"]),
+        ("live export reads", &["available", "unavailable"]),
+        ("run initial-set capture", &["eligible", "none"]),
+    ];
+
+    #[test]
+    fn doctor_classifies_every_live_discovery_row_finitely() {
+        let checks = probe(None, None);
+        for (name, allowed) in FROZEN_ROWS {
+            let check = checks
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("{name} row is missing: {checks:?}"));
+            let detail = status_detail(&check.status);
+            assert!(
+                allowed.contains(&detail),
+                "{name} classified itself as {detail:?}, outside {allowed:?}"
+            );
+        }
+        // Pause: the default is stated, and an explicit policy's armability is
+        // what an operator actually needs before asking for one.
+        let pause = checks
+            .iter()
+            .find(|c| c.name == "pause")
+            .expect("pause row is missing");
+        let detail = status_detail(&pause.status);
+        assert!(detail.starts_with("never default"), "{detail:?}");
+        assert!(
+            detail.contains("auto") && detail.contains("always"),
+            "the pause row must say whether an explicit policy can arm: {detail:?}"
+        );
+        // The memory scan lane keeps its existing row and its existing rules.
+        assert!(checks.iter().any(|c| c.name == "/proc/<pid>/mem"));
+    }
+
+    #[test]
+    fn ordinary_doctor_output_never_prints_the_identity_behind_a_row() {
+        let out = render(&probe(None, None));
+        for forbidden in [
+            "ld-linux", "ld-musl", "libc.so", "build_id", "sha256", "proof", "_r_debug", "0x",
+        ] {
+            assert!(
+                !out.contains(forbidden),
+                "doctor printed {forbidden:?} behind a row:\n{out}"
+            );
+        }
+    }
+
+    /// A degraded timing value is a warning: it makes complete timing
+    /// unavailable without making every capture lane fatal. A requested lane
+    /// that is genuinely unavailable stays nonzero.
+    #[test]
+    fn a_degraded_timing_row_warns_while_a_requested_lane_still_refuses() {
+        let degraded = vec![
+            Check {
+                name: "uprobe attach (own libc)".into(),
+                status: Status::Ok("attached and detached".into()),
+            },
+            Check {
+                name: "loader timing (dlopen)".into(),
+                status: Status::Warn("unproven".into()),
+            },
+        ];
+        assert_eq!(verdict(&degraded), 0);
+
+        let mut refused = degraded.clone();
+        refused.push(Check {
+            name: "run initial-set capture".into(),
+            status: Status::Fail("none".into()),
+        });
+        assert_eq!(
+            verdict(&refused),
+            1,
+            "a requested lane that cannot run is nonzero"
+        );
+    }
+
+    /// `probe` loads and attaches BPF; nothing of it may outlive the call.
+    #[test]
+    fn no_bpf_program_link_or_map_survives_a_doctor_probe() {
+        let bpf_descriptors = || {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|entry| std::fs::read_link(entry.unwrap().path()).ok())
+                .filter(|target| target.to_string_lossy().contains("bpf"))
+                .count()
+        };
+        let before = bpf_descriptors();
+        let _ = probe(None, None);
+        assert_eq!(
+            bpf_descriptors(),
+            before,
+            "doctor left a BPF program, link, or map loaded"
+        );
     }
 }

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use p11scope_manifest::identity::{
     IdentityKind, MappingFileKey, ObjectIdentity, inspect_file, inspect_file_with_reader,
-    mapping_file_key, mapping_file_key_in_mountinfo, open_object,
+    mapping_file_key, mapping_file_key_in_mountinfo, open_object, open_regular,
 };
 use p11scope_manifest::manifest::{Manifest, Resolution};
 use p11scope_manifest::maps::{Device, ObjectKey};
@@ -807,6 +807,32 @@ fn identity_of_in_mountinfo(
 ) -> Result<MappingFileKey, String> {
     mapping_file_key_in_mountinfo(file, mountinfo)
         .map_err(|error| format!("mapping identity unavailable: {error}"))
+}
+
+/// The `/proc/<pid>/maps`-comparable identity of one object reached through a
+/// retained process view. Live loader arming finds the executable and its
+/// PT_INTERP by matching this against `ObjectKey::of(mapping)`, so it has to be
+/// the representation maps itself renders: `st_dev` is the btrfs subvolume's
+/// anonymous device and never equals the mount device in maps, which leaves the
+/// loader unbindable on such a rootfs.
+pub fn open_view_object(
+    view: &ProcessView,
+    path: &Path,
+) -> Result<(std::fs::File, ObjectKey), String> {
+    let (file, mountinfo) = view.open_then_mountinfo(|| open_regular(path))?;
+    let key = object_key(identity_of_in_mountinfo(&file, &mountinfo)?);
+    Ok((file, key))
+}
+
+pub fn view_object_key(view: &ProcessView, path: &Path) -> Result<ObjectKey, String> {
+    Ok(open_view_object(view, path)?.1)
+}
+
+/// The same identity for a descriptor already retained across a pre-exec
+/// barrier, which must not be reopened by path.
+pub fn retained_object_key(view: &ProcessView, file: &std::fs::File) -> Result<ObjectKey, String> {
+    let ((), mountinfo) = view.open_then_mountinfo(|| Ok(()))?;
+    Ok(object_key(identity_of_in_mountinfo(file, &mountinfo)?))
 }
 
 fn object_key(mapping: MappingFileKey) -> ObjectKey {
@@ -1616,6 +1642,21 @@ mod tests {
         Acquisition, FunctionRecord, ObjectRecord, ProvenanceObject, SurfaceRecord, SurfaceSource,
         Version, WalkOutcome,
     };
+
+    #[test]
+    fn retained_view_object_open_rejects_a_fifo_without_data_open() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("interpreter");
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+
+        let error = open_view_object(&view, &fifo).expect_err("a FIFO is not a loader object");
+        assert!(error.contains("not a regular file"), "{error}");
+    }
 
     /// The same objects, opened on a real filesystem rather than through an overlay.
     fn image_pins(entries: &[(ObjectKey, &str, i64)]) -> PinnedObjects {

@@ -9,6 +9,139 @@ use crate::plan::{ModuleId, TableSummary};
 use serde::Serialize;
 use std::time::Duration;
 
+/// Which live-discovery strategy each exact bound context used (design §9.2).
+/// Only `debug_state_every_hit` leaves no completeness gap.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct LoaderStrategies {
+    pub debug_state_every_hit: u64,
+    pub dlopen_return: u64,
+    pub unavailable: u64,
+}
+
+/// One load kind's timing classification, per exact bound context (design
+/// §9.2). With the empty compiled-in catalog (D3 amendment §3) only `unproven`
+/// and `none` are ever reachable, and both force `PARTIAL`.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct LoaderTiming {
+    pub qualified_pre_constructor: u64,
+    pub known_pre_relocation: u64,
+    pub unproven: u64,
+    pub none: u64,
+}
+
+impl LoaderTiming {
+    /// Every classification except `qualified_pre_constructor` is a gap.
+    fn gaps(&self) -> u64 {
+        self.known_pre_relocation
+            .saturating_add(self.unproven)
+            .saturating_add(self.none)
+    }
+}
+
+/// Whether an owned `run` could capture the child's initial provider set
+/// before its first constructor ran (design §9.2).
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct InitialSetCapture {
+    pub eligible: u64,
+    pub none: u64,
+}
+
+/// The whole public live-loader surface: finite aggregate counts, never a
+/// loader list, proof id, address, cookie, or process identity (design §9.2).
+/// Always present in a Slice 1b-2 document, all-zero when nothing live ran.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct LoaderDiscovery {
+    pub strategies: LoaderStrategies,
+    pub dlopen_timing: LoaderTiming,
+    pub initial_set_timing: LoaderTiming,
+    pub initial_set_capture: InitialSetCapture,
+    /// Scoped BPF debug-state hit counter, incremented before ring
+    /// reservation. Never derived from received-record counts.
+    pub hits: u64,
+    /// The separate BPF counter for `_r_debug.r_state` reads. There is no
+    /// second public copy of it.
+    pub state_read_failures: u64,
+}
+
+impl LoaderDiscovery {
+    /// True when nothing live discovery did leaves a completeness gap:
+    /// only `debug_state_every_hit`, `qualified_pre_constructor`, and
+    /// `initial_set_capture.eligible` are neutral (design §9.2).
+    fn complete(&self) -> bool {
+        self.strategies.dlopen_return == 0
+            && self.strategies.unavailable == 0
+            && self.dlopen_timing.gaps() == 0
+            && self.initial_set_timing.gaps() == 0
+            && self.initial_set_capture.none == 0
+            && self.state_read_failures == 0
+    }
+}
+
+/// The capture-lifetime, render-ready facts the binary may see: everything the
+/// headings, the final frame, and the JSON document are built from. Sanitized
+/// by construction — no pins, process views, open files, timing keys, or
+/// loader/pause identities cross this boundary (plan Task 8 Step 2).
+#[derive(Debug, Clone, Default)]
+pub struct CaptureFacts {
+    pub(crate) discovery: DiscoveryEvidence,
+    pub(crate) table_entries: usize,
+    pub(crate) slots: usize,
+    pub(crate) attach_gap_ms: Option<u64>,
+    pub(crate) loader_discovery: LoaderDiscovery,
+    pub(crate) discovery_ring_loss: u64,
+    pub(crate) discovery_state_failures: u64,
+    pub(crate) discovery_read_failures: u64,
+    pub(crate) discovery_truncated: u64,
+}
+
+impl CaptureFacts {
+    /// Everything discovery accepted over the whole capture, already sanitized.
+    pub fn discovery(&self) -> &DiscoveryEvidence {
+        &self.discovery
+    }
+
+    /// Function records decoded across every walked surface this capture saw.
+    pub fn table_entries(&self) -> usize {
+        self.table_entries
+    }
+
+    /// Attach slots allocated over the whole capture.
+    pub fn slots(&self) -> usize {
+        self.slots
+    }
+
+    pub fn attach_gap_ms(&self) -> Option<u64> {
+        self.attach_gap_ms
+    }
+
+    pub fn loader_discovery(&self) -> LoaderDiscovery {
+        self.loader_discovery
+    }
+
+    /// The four §9.1 discovery loss counters, in schema order.
+    pub fn discovery_losses(&self) -> [u64; 4] {
+        [
+            self.discovery_ring_loss,
+            self.discovery_state_failures,
+            self.discovery_read_failures,
+            self.discovery_truncated,
+        ]
+    }
+
+    /// The one live-heading policy: every ordinary heading names the providers
+    /// this capture accepted over its lifetime, never the currently active
+    /// topology. A target that exited keeps its provider in the heading, so
+    /// "no modules discovered" can never print beside retained historical
+    /// calls; only a capture that never accepted a provider says it.
+    pub fn heading(&self) -> String {
+        match self.discovery.modules.as_slice() {
+            [] => "no modules discovered".to_string(),
+            [only] => only.path.clone(),
+            [first, rest @ ..] => format!("{} (+{} more)", first.path, rest.len()),
+        }
+    }
+}
+
 /// What discovery learned, carried into evidence (spec §4.8). Flattened into
 /// `evidence`, so a consumer reads `evidence.authority`, `evidence.discovery[]`
 /// and the counters as siblings of every other evidence field.
@@ -233,6 +366,46 @@ pub struct Evidence {
     /// A pinned provider object changed (ino, size or ctime) after attach;
     /// probes may no longer describe the mapped bytes.
     pub provider_changed: bool,
+    /// Maximum of the defined per-module earliest-causal-event-to-last-
+    /// required-attach gaps (design §5.5). `null` — never an invented zero —
+    /// when no module has a defined gap.
+    pub attach_gap_ms: Option<u64>,
+    /// Exactly `none`, `sigstop`, or `partial`, derived only from the three
+    /// counters below by the design §5.6 lattice.
+    pub pause: &'static str,
+    pub pause_attempts: u64,
+    pub pause_confirmed: u64,
+    pub pause_partial: u64,
+    /// Present only for `run`: true only when capture ended while the owned
+    /// child was still alive. Absent from every `--pid`/`--cgroup` document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_still_running: Option<bool>,
+    /// Failed `DISCOVERY` ring reservations across loader, exec, and export
+    /// records — from the BPF counter, never derived from received records.
+    pub discovery_ring_loss: u64,
+    /// Export entry-state no-overwrite/cleanup failures (BPF counter).
+    pub discovery_state_failures: u64,
+    /// Export table/interface bounded user-read failures only (BPF counter);
+    /// loader-state reads are excluded and live in `loader_discovery`.
+    pub discovery_read_failures: u64,
+    /// One discovery-engine accumulator: source-declared record truncations,
+    /// userspace decode failures, and every refused/invalid/stale loader
+    /// context, each fed exactly once.
+    pub discovery_truncated: u64,
+    /// The always-present finite live-loader aggregate (design §9.2).
+    pub loader_discovery: LoaderDiscovery,
+    /// Modules whose first required attach key was learned from a live loader
+    /// or export event outside a confirmed pause owner (design §5.7). Design
+    /// §5.7 explicitly forbids a public field for this, so it follows the
+    /// existing `semantic_unverified_slots` precedent and only gates the
+    /// verdict.
+    #[serde(skip)]
+    pub unprotected_live_windows: usize,
+    /// Allocated aggregate cells with no accepted sole owner. Published per
+    /// row as `functions[].module_unresolved`; the count itself stays internal
+    /// and only gates the verdict.
+    #[serde(skip)]
+    pub module_unresolved_slots: usize,
     /// Everything discovery learned, flattened into this object.
     #[serde(flatten)]
     pub discovery: DiscoveryEvidence,
@@ -358,6 +531,17 @@ impl Evidence {
             && self.shape_decode_total_failures == 0
             && !self.provider_changed
             && interface_list_complete
+            // Live discovery (design §5.7, §9.1, §9.2). Each of these is
+            // sticky because the counter behind it is never reset in the
+            // pipeline: a later clean tick cannot subtract a loss.
+            && self.unprotected_live_windows == 0
+            && self.module_unresolved_slots == 0
+            && self.discovery_ring_loss == 0
+            && self.discovery_state_failures == 0
+            && self.discovery_read_failures == 0
+            && self.discovery_truncated == 0
+            && self.pause_partial == 0
+            && self.loader_discovery.complete()
         {
             "COMPLETE"
         } else {
@@ -648,6 +832,11 @@ struct FunctionOut {
     module: Option<ModuleRef>,
     /// True exactly when `module` is null because two modules claim the slot.
     module_ambiguous: bool,
+    /// True exactly when `module` is null because this allocated aggregate
+    /// cell has no accepted sole owner at all — an unowned endpoint, never
+    /// relabelled as two-module ambiguity. The three fields are an exact
+    /// exclusive relation: nonnull/false/false, null/true/false, null/false/true.
+    module_unresolved: bool,
     calls: u64,
     errors: u64,
     pending_returns: u64,
@@ -704,6 +893,7 @@ fn functions_out(reports: &[SlotReport], modules: &[DiscoveredModule]) -> Vec<Fu
             // Kept next to `module` on purpose: a reader that only checks for a
             // null module must not have to know why it is null.
             module_ambiguous: r.module_ambiguous,
+            module_unresolved: r.module_unresolved,
             calls: r.calls,
             errors: r.errors,
             pending_returns: r
@@ -1129,6 +1319,7 @@ mod tests {
             semantic_authorized: true,
             module: None,
             module_ambiguous: false,
+            module_unresolved: false,
             calls,
             errors: 0,
             in_flight,
@@ -1190,6 +1381,19 @@ mod tests {
             shape_decode_failures: 0,
             shape_decode_total_failures: 0,
             templates_truncated: false,
+            attach_gap_ms: None,
+            pause: "none",
+            pause_attempts: 0,
+            pause_confirmed: 0,
+            pause_partial: 0,
+            child_still_running: None,
+            discovery_ring_loss: 0,
+            discovery_state_failures: 0,
+            discovery_read_failures: 0,
+            discovery_truncated: 0,
+            loader_discovery: LoaderDiscovery::default(),
+            unprotected_live_windows: 0,
+            module_unresolved_slots: 0,
             provider_changed: false,
             discovery: DiscoveryEvidence {
                 modules: vec![discovered_fixture()],
@@ -2735,5 +2939,441 @@ mod tests {
             serde_json::json!([]),
             "allowlisted capture must not attribute a rejected init as a mechanism request"
         );
+    }
+
+    // ---- Slice 1b-2 public evidence contract (design §5.5–§5.7, §9) -------
+    //
+    // These freeze the exact published vocabulary. Every key below is named by
+    // the approved design; nothing here may be widened, renamed, or derived a
+    // second time from another counter.
+
+    /// The fields §9.1 adds to profile, metrics, and the final trace evidence
+    /// object. `child_still_running` is deliberately not here: it is the one
+    /// run-only field and must be absent from an ordinary capture.
+    const LIVE_EVIDENCE_FIELDS: [&str; 10] = [
+        "attach_gap_ms",
+        "pause",
+        "pause_attempts",
+        "pause_confirmed",
+        "pause_partial",
+        "discovery_ring_loss",
+        "discovery_state_failures",
+        "discovery_read_failures",
+        "discovery_truncated",
+        "loader_discovery",
+    ];
+
+    fn trace_evidence_object(ev: &Evidence) -> serde_json::Value {
+        let line = crate::trace::evidence_line(ev, CapturePolicy::Allowlisted);
+        serde_json::from_str(line.strip_prefix("EVIDENCE ").expect("EVIDENCE prefix"))
+            .expect("the final trace evidence record is one JSON object")
+    }
+
+    #[test]
+    fn every_capture_document_publishes_the_live_discovery_evidence_fields() {
+        let mut ev = evidence();
+        ev.verdict();
+        let profile = profile_json(
+            &reports_fixture(),
+            &ev,
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        let metrics = json(&reports_fixture(), &ev, &capture_fixture());
+        for document in [
+            &profile["evidence"],
+            &metrics["evidence"],
+            &trace_evidence_object(&ev),
+        ] {
+            for field in LIVE_EVIDENCE_FIELDS {
+                assert!(document.get(field).is_some(), "{field} is missing");
+            }
+            // Nothing this observer did not start can be a running child.
+            assert!(
+                document.get("child_still_running").is_none(),
+                "child_still_running is a run-only field"
+            );
+            // A gap that was never measured is null, never an invented zero.
+            assert!(document["attach_gap_ms"].is_null());
+            assert_eq!(document["pause"], "none");
+            for counter in ["pause_attempts", "pause_confirmed", "pause_partial"] {
+                assert_eq!(document[counter], 0, "{counter}");
+            }
+        }
+        // The run-only field appears exactly when the observer owned the child.
+        ev.child_still_running = Some(true);
+        let owned = json(&reports_fixture(), &ev, &capture_fixture());
+        assert_eq!(owned["evidence"]["child_still_running"], true);
+    }
+
+    #[test]
+    fn every_loader_discovery_key_is_always_present_and_an_unsigned_count() {
+        let mut ev = evidence();
+        ev.verdict();
+        let document = json(&reports_fixture(), &ev, &capture_fixture());
+        let aggregate = &document["evidence"]["loader_discovery"];
+        for (group, keys) in [
+            (
+                "strategies",
+                vec!["debug_state_every_hit", "dlopen_return", "unavailable"],
+            ),
+            (
+                "dlopen_timing",
+                vec![
+                    "qualified_pre_constructor",
+                    "known_pre_relocation",
+                    "unproven",
+                    "none",
+                ],
+            ),
+            (
+                "initial_set_timing",
+                vec![
+                    "qualified_pre_constructor",
+                    "known_pre_relocation",
+                    "unproven",
+                    "none",
+                ],
+            ),
+            ("initial_set_capture", vec!["eligible", "none"]),
+        ] {
+            let object = aggregate[group]
+                .as_object()
+                .unwrap_or_else(|| panic!("{group} is missing"));
+            // The plan freezes the key *set*; `serde_json` is built without
+            // `preserve_order`, so its object is a `BTreeMap` and JSON key
+            // order is alphabetical rather than declaration order. Compare
+            // sorted: no key may go missing and no key may be added.
+            let present: Vec<&str> = object.keys().map(String::as_str).collect();
+            let mut wanted = keys.clone();
+            wanted.sort_unstable();
+            assert_eq!(present, wanted, "{group} key set drifted");
+            for key in keys {
+                assert!(object[key].is_u64(), "{group}.{key} is not a u64 count");
+            }
+        }
+        for key in ["hits", "state_read_failures"] {
+            assert!(aggregate[key].is_u64(), "{key} is not a u64 count");
+        }
+        assert_eq!(
+            aggregate.as_object().unwrap().len(),
+            6,
+            "loader_discovery grew a key: {aggregate}"
+        );
+        // No second public copy of an internal counter, no proof/identity, no
+        // per-loader list: the aggregate is the whole public surface.
+        let text = serde_json::to_string(&document).unwrap();
+        for forbidden in [
+            "loader_state_read_failures",
+            "proof_id",
+            "loader_identity",
+            "r_debug",
+            "hook_vaddr",
+            "context_id",
+            "delta",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "{forbidden} reached public output"
+            );
+        }
+    }
+
+    /// `module`, `module_ambiguous`, and `module_unresolved` are exclusive:
+    /// nonnull/false/false, null/true/false, or null/false/true. An unowned
+    /// cell is never relabelled as two-module ambiguity.
+    #[test]
+    fn module_ownership_is_an_exact_exclusive_relation() {
+        let owned = {
+            let mut r = report("C_Sign", 1, 0, false);
+            r.module = Some(crate::plan::ModuleId(0));
+            r
+        };
+        let ambiguous = {
+            let mut r = report("C_Sign", 2, 0, false);
+            r.module = None;
+            r.module_ambiguous = true;
+            r
+        };
+        let unresolved = {
+            let mut r = report("C_Sign", 3, 0, false);
+            r.module = None;
+            r.module_unresolved = true;
+            r
+        };
+        let mut ev = evidence();
+        ev.verdict();
+        assert_eq!(ev.completeness, "COMPLETE", "baseline must start clean");
+
+        let out = profile_json(
+            &[owned, ambiguous, unresolved],
+            &ev,
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        let rows = out["functions"].as_array().unwrap();
+        assert!(!rows[0]["module"].is_null());
+        assert_eq!(rows[0]["module_ambiguous"], false);
+        assert_eq!(rows[0]["module_unresolved"], false);
+        assert!(rows[1]["module"].is_null());
+        assert_eq!(rows[1]["module_ambiguous"], true);
+        assert_eq!(rows[1]["module_unresolved"], false);
+        assert!(rows[2]["module"].is_null());
+        assert_eq!(
+            rows[2]["module_ambiguous"], false,
+            "an unowned cell is not two-module ambiguity"
+        );
+        assert_eq!(rows[2]["module_unresolved"], true);
+        // The counts are real either way; only the owner is unknown.
+        assert_eq!(rows[2]["calls"], 3);
+    }
+
+    #[test]
+    fn an_unresolved_owner_forces_partial() {
+        let mut ev = evidence();
+        ev.module_unresolved_slots = 1;
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(
+            ev.discovery.module_ambiguous, 0,
+            "an unresolved owner must not be counted as ambiguity"
+        );
+    }
+
+    /// With the compiled-in timing catalog empty (D3), debug-state discovery
+    /// still runs but proves nothing about timing.
+    #[test]
+    fn an_empty_timing_catalog_stays_unproven_eligible_zero_and_partial() {
+        let mut ev = evidence();
+        ev.loader_discovery.strategies.debug_state_every_hit = 1;
+        ev.loader_discovery.dlopen_timing.unproven = 1;
+        ev.loader_discovery.initial_set_timing.unproven = 1;
+        ev.loader_discovery.initial_set_capture.none = 1;
+        // A fully protected observed window does not create a timing proof.
+        ev.unprotected_live_windows = 0;
+        ev.pause = "sigstop";
+        ev.pause_attempts = 1;
+        ev.pause_confirmed = 1;
+        ev.verdict();
+
+        assert_eq!(
+            ev.loader_discovery.dlopen_timing.qualified_pre_constructor,
+            0
+        );
+        assert_eq!(ev.loader_discovery.dlopen_timing.known_pre_relocation, 0);
+        assert_eq!(
+            ev.loader_discovery
+                .initial_set_timing
+                .qualified_pre_constructor,
+            0
+        );
+        assert_eq!(
+            ev.loader_discovery.initial_set_timing.known_pre_relocation,
+            0
+        );
+        assert_eq!(ev.loader_discovery.initial_set_capture.eligible, 0);
+        assert_eq!(ev.completeness, "PARTIAL");
+    }
+
+    /// A protected window removes exactly one gap — its own. It is not a
+    /// licence to call the rest of the capture complete.
+    #[test]
+    fn a_protected_window_removes_only_its_corresponding_live_gap() {
+        let proven = |ev: &mut Evidence| {
+            ev.loader_discovery.strategies.debug_state_every_hit = 1;
+            ev.loader_discovery.dlopen_timing.qualified_pre_constructor = 1;
+            ev.loader_discovery
+                .initial_set_timing
+                .qualified_pre_constructor = 1;
+            ev.loader_discovery.initial_set_capture.eligible = 1;
+        };
+
+        let mut unprotected = evidence();
+        proven(&mut unprotected);
+        unprotected.unprotected_live_windows = 1;
+        unprotected.verdict();
+        assert_eq!(unprotected.completeness, "PARTIAL");
+
+        let mut protected = evidence();
+        proven(&mut protected);
+        protected.unprotected_live_windows = 0;
+        protected.pause = "sigstop";
+        protected.pause_attempts = 1;
+        protected.pause_confirmed = 1;
+        protected.verdict();
+        assert_eq!(protected.completeness, "COMPLETE");
+
+        let mut protected_but_lossy = protected.clone();
+        protected_but_lossy.event_loss = 1;
+        protected_but_lossy.verdict();
+        assert_eq!(
+            protected_but_lossy.completeness, "PARTIAL",
+            "a protected window cannot erase another evidence gap"
+        );
+    }
+
+    /// One named live-discovery loss, applied to an otherwise clean fixture.
+    type NamedLoss = fn(&mut Evidence);
+
+    #[test]
+    fn partial_is_sticky_for_every_named_live_discovery_loss() {
+        let losses: Vec<(&str, NamedLoss)> = vec![
+            ("scan-only semantic authority", |ev| {
+                ev.semantic_unverified_slots = 1
+            }),
+            ("unprotected live window", |ev| {
+                ev.unprotected_live_windows = 1
+            }),
+            ("discovery ring loss", |ev| ev.discovery_ring_loss = 1),
+            ("discovery state failure", |ev| {
+                ev.discovery_state_failures = 1
+            }),
+            ("discovery read failure", |ev| {
+                ev.discovery_read_failures = 1
+            }),
+            ("discovery truncation", |ev| ev.discovery_truncated = 1),
+            ("loader fallback", |ev| {
+                ev.loader_discovery.strategies.dlopen_return = 1
+            }),
+            ("loader unavailable", |ev| {
+                ev.loader_discovery.strategies.unavailable = 1
+            }),
+            ("unproven timing", |ev| {
+                ev.loader_discovery.dlopen_timing.unproven = 1
+            }),
+            ("no timing", |ev| ev.loader_discovery.dlopen_timing.none = 1),
+            ("initial-set capture none", |ev| {
+                ev.loader_discovery.initial_set_capture.none = 1
+            }),
+            ("loader state read failure", |ev| {
+                ev.loader_discovery.state_read_failures = 1
+            }),
+            ("pause partial", |ev| {
+                ev.pause = "partial";
+                ev.pause_attempts = 1;
+                ev.pause_partial = 1;
+            }),
+            ("attach failure", |ev| {
+                ev.attach_failures.push("C_Sign: EPERM".into())
+            }),
+            ("identity ambiguity", |ev| ev.discovery.module_ambiguous = 1),
+            ("unresolved owner", |ev| ev.module_unresolved_slots = 1),
+            ("changed provider", |ev| ev.provider_changed = true),
+            ("zero modules", |ev| ev.discovery.modules.clear()),
+        ];
+        for (name, apply) in losses {
+            let mut ev = evidence();
+            apply(&mut ev);
+            ev.verdict();
+            assert_eq!(ev.completeness, "PARTIAL", "{name} did not force PARTIAL");
+            // Sticky: a later clean pass cannot promote it back.
+            ev.verdict();
+            assert_eq!(ev.completeness, "PARTIAL", "{name} was un-stuck");
+        }
+    }
+
+    /// The capture ended the ordinary way: the process is gone, its links and
+    /// views are released, and everything the capture *did* observe is still
+    /// reported. An exited target is not a discovery loss.
+    #[test]
+    fn an_active_to_empty_lifecycle_keeps_its_history_in_every_renderer() {
+        let mut ev = evidence();
+        ev.child_still_running = Some(false);
+        ev.verdict();
+        let reports = reports_fixture();
+
+        let profile = profile_json(&reports, &ev, &state_fixture(), &capture_fixture());
+        let metrics = json(&reports, &ev, &capture_fixture());
+        let trace = trace_evidence_object(&ev);
+        for document in [&profile["evidence"], &metrics["evidence"], &trace] {
+            // History: the modules, the exact table entries, the surfaces and
+            // skips, the allocated slots and the successful endpoints.
+            assert_eq!(document["discovery"][0]["path"], "/opt/p11.so");
+            assert_eq!(document["discovery"][0]["tables"][0]["entries"], 68);
+            assert_eq!(document["surfaces"][0]["walk"], "full");
+            assert_eq!(document["table_entries"], 68);
+            assert_eq!(document["slots"], 68);
+            assert_eq!(document["attached_probes"], 136);
+            // No exit-generated discovery loss and no false reconciliation.
+            for counter in [
+                "discovery_ring_loss",
+                "discovery_state_failures",
+                "discovery_read_failures",
+                "discovery_truncated",
+                "state_reconciliations",
+            ] {
+                assert_eq!(document[counter], 0, "{counter} after an ordinary exit");
+            }
+        }
+        // Aggregate calls and the exact function-module reference survive too.
+        for document in [&profile, &metrics] {
+            assert_eq!(document["functions"][0]["calls"], 1);
+            assert_eq!(document["functions"][0]["module"]["ino"], 11);
+            assert_eq!(document["capture"]["modules"][0]["path"], "/opt/p11.so");
+        }
+    }
+
+    /// A slot discovered after the capture started renders exactly like one
+    /// from the initial plan, in both metrics and trace evidence — and an
+    /// in-flight call at the end still costs completeness.
+    #[test]
+    fn metrics_and_trace_render_a_slot_that_appeared_mid_capture() {
+        let mut late = report("C_Encrypt", 5, 1, false);
+        late.module = Some(crate::plan::ModuleId(0));
+        let mut ev = evidence();
+        ev.in_flight_at_end = 1;
+        ev.verdict();
+
+        let metrics = json(&[late.clone()], &ev, &capture_fixture());
+        assert_eq!(metrics["functions"][0]["names"][0], "C_Encrypt");
+        assert_eq!(metrics["functions"][0]["calls"], 5);
+        assert_eq!(metrics["functions"][0]["module"]["ino"], 11);
+        assert_eq!(metrics["evidence"]["completeness"], "PARTIAL");
+        assert_eq!(trace_evidence_object(&ev)["in_flight_at_end"], 1);
+    }
+
+    /// The one live-heading policy (plan Task 8 Step 2): every ordinary
+    /// heading is built from capture-lifetime provider facts, so a target that
+    /// exited — active topology empty — cannot print "no modules discovered"
+    /// beside the calls it is still reporting. Only a capture that never
+    /// accepted a provider says that.
+    #[test]
+    fn the_live_heading_names_capture_facts_never_the_active_topology() {
+        let facts = CaptureFacts {
+            discovery: DiscoveryEvidence {
+                modules: vec![discovered_fixture()],
+                ..DiscoveryEvidence::default()
+            },
+            ..CaptureFacts::default()
+        };
+        assert_eq!(facts.heading(), "/opt/p11.so");
+
+        let mut ev = evidence();
+        ev.child_still_running = Some(false);
+        ev.verdict();
+        let frame = live(
+            &reports_fixture(),
+            &ev,
+            Duration::from_secs(1),
+            &facts.heading(),
+            "profile",
+            CapturePolicy::Allowlisted,
+        );
+        assert!(frame.contains("/opt/p11.so"), "{frame}");
+        assert!(!frame.contains("no modules discovered"), "{frame}");
+        // Two providers are named as two, never as "the" module.
+        let mut second = discovered_fixture();
+        second.id = ModuleId(1);
+        second.path = "/opt/other.so".into();
+        let both = CaptureFacts {
+            discovery: DiscoveryEvidence {
+                modules: vec![discovered_fixture(), second],
+                ..DiscoveryEvidence::default()
+            },
+            ..CaptureFacts::default()
+        };
+        assert_eq!(both.heading(), "/opt/p11.so (+1 more)");
+        // And the honest empty case still says so.
+        assert_eq!(CaptureFacts::default().heading(), "no modules discovered");
     }
 }

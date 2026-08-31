@@ -66,6 +66,75 @@ No new crate is planned.
   historical unchecked implementation boxes below; those boxes are retained as
   the original task contract, not current status.
 
+**Topology scope amendment (2026-08-27, Task 4):** The historical Lane 13
+checker/invocation work is complete at checker/lifecycle commit
+`34357b5dda71c670250dd3ab336b29c801120d5b` (tree
+`ae3346e4b8e137f430f010d0937bcf186cfcff39`) and final invocation/contract
+commit `fd3d08ad9bd2f58508eda1ee4a50882c0633d850` (tree
+`0decc4dee974707468b5758107fb055c30d44d7d`); no new Task 4 checker or
+invocation run is planned. Its zero-unavailable PASS oracle is Lane 13-only and
+applies only to a topology proposed for supported acceptance. Retain the evidenced Knative
+shared-inode capture for the exact preattached provider: `136/136` probes and
+expected cold-pod calls. The completed pre-r3 attempt-6 exclusion is bound to
+immutable receipt
+`/home/user/.local/state/p11scope/task4-lane13-a2fd9ee-20260826T2135EEST/facts.log`
+(SHA-256
+`b96cbed6cbc2963dab2c5963b5c52f6378d9bef313479b83a56c259df79b94f3`, exact
+HEAD/tree `a2fd9ee8eddfaff34b3fb6b65267688b5a90aa03` /
+`f90e2dfe8dbd0a211f9e32055a37ff7320080b88`). It binds the lane command/script
+ledger, Kind/Knative releases/images, provider hash/build ID, kernel/storage,
+node/workload identities, and clean start/end. Future negative-control
+classification permits only candidate and gate identity to differ from attempt
+6, and only when each exactly equals the independently reviewed pre-run r3
+manifest. Every other external topology field from the receipt must match
+attempt 6; any mismatch is UNRUN/review before outcome classification and never
+inherits the exclusion by outcome alone. In the reproduced Knative node-wide
+retained-view topology, full late-provider discovery is
+`UNSUPPORTED/NON-PASS`; one overlay plus one unavailable is evaluated only as
+the required negative control, never by the PASS oracle. Attempt 6 is not rerun
+in Task 4; Lane 13 runs once in 9.2d as the frozen-candidate negative control.
+Remaining applicable Task 4 lanes and r3 may proceed only after this additive
+amendment is independently reviewed and committed; Lane 13 PASS is not an
+unlock condition. The Gate Closure Task 5 capability-validator integration is
+complete through exact commit `7a0c1eddac0b0b81340206ac742884ca2f31f691`, and
+its live capability gate exited 0 without changing Lane 13. README/usage
+wording remains reserved for Task 10. This amendment changes no design spec,
+production Rust/BPF/privacy/schema/allowlist, or procfs/mmap/eBPF fallback
+behavior.
+
+**Owned-run timing-proof projection binding (2026-08-27):** Across the Task 9
+Step 2 and Step 3 owned-run campaigns, every successful owned run requires
+exactly one sanitized public
+`{"name":"discovery subject","reason":"discovery unavailable"}`
+timing-proof projection, authorized only by the exact frozen owned-run context,
+expected row cardinality, and full lane oracle. Zero, a second, or an
+outside-context projection is `NON-PASS`. This global one-record rule is
+distinct from the Task 4/9.2d lane cardinalities below; later campaigns retain
+this global rule but do not inherit the six/two counts.
+
+**Task 4/9.2d owned-run cardinalities (2026-08-27):** For this gate round only,
+Lane 02 has exactly six attempts, `(initial-set|dlopen) × (never|auto|always)`;
+each Cartesian tuple is one distinct invocation and one row, and ungated
+controls are excluded. Positive function counts equal the tracked
+`spike/expected.txt` plus exactly one bootstrap `C_GetFunctionList`, matching
+the current `validate_clean_metrics` count relation. A successful paused row
+uses `sigstop` with `pause_attempts = pause_confirmed >= 1` and
+`pause_partial = 0`.
+Lane 16 has exactly two independent shape checks, one `never` and one `auto`.
+Each Lane 16 row must independently exit zero with 68 table entries, 68 slots,
+136/136 probes, exactly one authorized sanitized public timing-proof projection,
+zero event loss and zero discovery-loss counters, zero ambiguity, in-flight
+work, and residue. These listed predicates are the complete current Task 4
+shape oracle; no existing checker mode is claimed. The one authorized
+sanitized timing-proof projection is not one of those counters. `never` is
+`none/0/0/0`, while `auto` is `sigstop` with
+`pause_attempts = pause_confirmed >= 1` and `pause_partial = 0`. Lane 02's
+deterministic fixture counts do not apply. No historical workload total
+(including `200000`), `G3`, `136175`, call, timing, median, or performance
+threshold is an acceptance predicate. An `always` safe refusal is
+containment-correct, but its row and lane produce no capture document and are
+`NON-PASS`; complete cleanup/quiescence evidence is still required.
+
 ## Global constraints
 
 1. Preserve `docs/privacy/allowlist-v1.md` until the explicit evidence task;
@@ -258,7 +327,9 @@ deadline, and one-winner/one-resume oracle cannot satisfy the new assertions.
 - [ ] Make cleanup idempotent and non-short-circuiting: resume obligations,
   link detach, owner removal, kill/reap, evidence close, VM cleanup, and final
   status are each attempted and each result retained.
-- [ ] Use one absolute 100 ms winner-relative deadline per accepted cycle; the
+- [ ] Use one absolute 500 ms winner-relative deadline per accepted cycle, as
+  accepted by the
+  [fixed 500 ms amendment](../specs/2026-08-27-slice1b2-500ms-pause-amendment.md); the
   second record never resets it.
 - [ ] Keep the fixture genuinely concurrent. A serialized/barrier-only control
   may diagnose scheduling but cannot satisfy the campaign oracle.
@@ -981,14 +1052,14 @@ separate; do not create a framework or async runtime.
   attach set. Reservation loss before CAS consumes no authorization but becomes
   one finite attempt under explicit pause.
 - [ ] Two exact-set/all-`T` snapshots at least 1 ms apart, both no later than the
-  absolute 100 ms deadline, are mandatory. A changed task set, non-T state,
+  absolute 500 ms deadline, are mandatory. A changed task set, non-T state,
   `/proc` error, future timestamp, arithmetic overflow, or deadline crossing is
   finite failure.
 - [ ] Poll task state no more frequently than once per millisecond and never
   reset the winner-relative deadline after queue delivery or a second record.
 - [ ] While an authorization is `ARMED` or an owner is active, service the
   discovery queue on a monotonic 1 ms cadence so the ordinary capture refresh
-  interval cannot consume the 100 ms causal budget. This explicit-pause-only
+  interval cannot consume the 500 ms causal budget. This explicit-pause-only
   polling is the intentional Slice 1b-2 ceiling; add epoll only if later
   measurement shows it is needed.
 - [ ] `DiscoveryDrain` exposes one crate-private dequeue result exactly as
@@ -1587,6 +1658,11 @@ python3 scripts/check-live-discovery-evidence.py \
   satisfy this regression.
 - [ ] Shared-layer, fork/cgroup, oracle, Knative, induced-gap, privacy canary,
   release-build, and overhead lanes retain existing oracles and cleanup.
+- [ ] Knative's retained preattached-provider evidence remains the measured
+  `136/136`/expected-cold-pod capture. The exact reproduced node-wide
+  retained-view late-provider topology is an expected `UNSUPPORTED/NON-PASS`
+  negative control with one overlay plus one unavailable; do not translate that
+  result into a PASS or widen the checker oracle.
 - [ ] Benchmark `run --pause never` separately from explicit `auto`; report the
   explicit-pause 1 ms userspace polling cost rather than folding it into normal
   capture overhead or adding epoll speculatively.
@@ -1646,6 +1722,11 @@ python3 scripts/check-live-discovery-evidence.py \
   negative classification from raw bounded evidence.
 - [ ] A failed or unavailable optional provider is not hidden; a required
   SoftHSM/proxy/fixture/kernel/product lane is campaign non-PASS.
+- [ ] Record the exact Knative late-provider negative-control disposition. The
+  reproduced one-overlay/one-unavailable shape is the expected
+  `UNSUPPORTED/NON-PASS` result and does not stop otherwise applicable lanes;
+  any different public shape, additional gap, or lifecycle/input/cleanup
+  failure stops the campaign.
 - [ ] Confirm the historical Task 8 160/160 attach-first artifact remains
   diagnostic/non-promotable with zero attempts in this campaign.
 - [ ] Run a security diff review of the whole Slice 1b-2 range, focusing BPF
@@ -1722,7 +1803,9 @@ git diff --check
 - [ ] Only after Task 9 runtime gates and its candidate CI pass, update
   README/usage with factual
   capability boundaries: no manifest is required for bounded live discovery;
-  late `dlopen` is observed through supported hooks; all empty-catalog captures
+  late `dlopen` is observed through supported hooks in supported measured
+  topologies; full late-provider discovery in the reproduced Knative node-wide
+  retained-view topology remains explicitly unsupported; all empty-catalog captures
   remain `PARTIAL`; external PID/cgroup windows are unpaused; owned `run` pause
   is explicit; only the owned child generation is followed; arbitrary
   descendants/nonstandard providers are not guaranteed; and observer SIGKILL

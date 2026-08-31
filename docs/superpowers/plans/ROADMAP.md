@@ -195,10 +195,39 @@ known-limitations section: `docs/notes/phase4-matrix.md`.
    fails on this kernel's `perf_event_paranoid=4`); Docker/kind need
    `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` (crossing into a different-uid
    container/pod's `/proc/<pid>/root`). Neither environment needs full
-   root. These Phase 4 measurements predate the same-inode hardening:
-   a capability-only observer now additionally needs `CAP_LEASE` for
-   provider files it does not own. The updated privileged matrix has not yet
-   been rerun.
+   root. Post-fix6 host evidence (2026-08-25) records `CAP_SYS_ADMIN`
+   attaching 136 probes with `PARTIAL` evidence, while
+   `CAP_BPF`+`CAP_PERFMON` records 68 per-slot `perf_event_open` failures,
+   `attached_probes: 0/136`, and `PARTIAL`. These host-specific rows do not
+   remeasure Docker/kind; that broader capability matrix remains pending.
+
+**Topology scope qualification (2026-08-27, Slice 1b-2):** The historical
+Knative matrix evidence above is retained for the exact preattached provider
+capture: shared-inode attachment, `136/136` probes, and expected cold-pod
+calls. It is narrower than full late-provider discovery. The historical Lane 13
+checker/invocation is complete at checker/lifecycle commit
+`34357b5dda71c670250dd3ab336b29c801120d5b` (tree
+`ae3346e4b8e137f430f010d0937bcf186cfcff39`) and final invocation/contract
+commit `fd3d08ad9bd2f58508eda1ee4a50882c0633d850` (tree
+`0decc4dee974707468b5758107fb055c30d44d7d`). Its zero-unavailable PASS oracle
+applies only to a topology proposed for supported acceptance. The completed
+pre-r3 attempt-6 exclusion is input-bound to
+`/home/user/.local/state/p11scope/task4-lane13-a2fd9ee-20260826T2135EEST/facts.log`
+(SHA-256 `b96cbed6cbc2963dab2c5963b5c52f6378d9bef313479b83a56c259df79b94f3`,
+exact HEAD/tree `a2fd9ee8eddfaff34b3fb6b65267688b5a90aa03` /
+`f90e2dfe8dbd0a211f9e32055a37ff7320080b88`). The receipt binds the lane
+command/script ledger, Kind/Knative releases/images, provider hash/build ID,
+kernel/storage, node/workload identities, and clean start/end inputs. Future
+negative-control classification permits only candidate and gate identity to
+differ from attempt 6, and only when each exactly equals the independently
+reviewed pre-run r3 manifest. Every other external topology field from the
+receipt must match attempt 6; any mismatch is UNRUN/review before outcome
+classification and never inherits the exclusion by outcome alone. In the reproduced Knative node-wide
+retained-view topology, full late-provider discovery is
+`UNSUPPORTED/NON-PASS`; one overlay plus one unavailable is a required
+negative control evaluated only outside the PASS oracle. Attempt 6 is not rerun
+in Task 4; Lane 13 runs once in 9.2d as the frozen-candidate negative control.
+The checker and zero-unavailable acceptance oracle remain unchanged.
 
 ## Phase 5 — Overhead benchmark + docs + v0.1 release
 
@@ -322,10 +351,9 @@ partial). Slice-by-slice evidence including every deferred Minor is under
 - `scripts/matrix/verify-fork-scope.sh` and `scripts/matrix/verify-oracle.sh`
   both asserted a terminal `COMPLETE` that the drain change made impossible.
   They were corrected to the shared `terminal_capture_is_clean` predicate on
-  2026-08-14 and have not been rerun. Because fork-scope carries the
-  capability matrix, the minimum capability set remains inherited rather than
-  freshly measured: `CAP_LEASE` is required by construction, but the minimum
-  was not re-derived. Every lane that was rerun ran as root.
+  2026-08-14 and have not been rerun. The post-fix6 host capability rows are
+  separately measured, but the broader fork-scope capability matrix remains
+  pending. Every lane that was rerun ran as root.
 - The container lanes predate the provider-copy byte cap, and
   `scripts/attach-pod.sh` has never run against a live cluster — it is
   unprivileged-tested for argument refusal only.
@@ -357,9 +385,10 @@ partial). Slice-by-slice evidence including every deferred Minor is under
 
 ## Explicitly deferred (post-v1, in design spec's "out" list)
 
-AArch64 → first item after v1. Then, unordered and only on demonstrated need:
-live-discovery fallback mode, syscall/network correlation, DaemonSet/operator
-packaging, system-wide module discovery, security-findings layer, GUI.
+AArch64 → first item after v1. Raw tracepoint lifecycle migration is post-v1.
+Then, unordered and only on demonstrated need: live-discovery fallback mode,
+syscall/network correlation, DaemonSet/operator packaging, system-wide module
+discovery, security-findings layer, GUI.
 
 ## Productization (2026-08-15 →)
 
@@ -386,8 +415,8 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
   kernel 7.0.0-28-generic; consistent with the documented ~3.3µs). CI e2e: PASS — first
   push, run
   [31935749796](https://github.com/mingulov/pkcs11-scope/actions/runs/31935749796)
-  (2026-08-16, `checks-and-e2e` success). Follow-ups noted for 1b: re-measure the `--cgroup` minimum
-  (`verify-fork-scope.sh` still over-grants CAP_LEASE), one privileged `--cgroup` smoke after
+  (2026-08-16, `checks-and-e2e` success). Follow-ups noted for 1b: rerun the post-fix6 `--cgroup`
+  capability matrix, one privileged `--cgroup` smoke after
   the `_cgroup_file` removal, prune the now-unused root `p11scope-discover` dev-dependency.**
 - **Slice 1b — discovery engine and commands.** Split in two independently shippable plans
   when 1a landed (2026-08-16), because the memory scan needs no BPF change while the live
@@ -456,6 +485,33 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     required CI, release, and security clearance remain incomplete or
     unclaimed. See the
     [pause amendment](../specs/2026-08-19-slice1b2-no-busy-wait-pause-amendment.md).**
+
+    **Fixed-ceiling disposition (2026-08-27):** The reviewed
+    [500 ms amendment](../specs/2026-08-27-slice1b2-500ms-pause-amendment.md)
+    passed fresh Gate A on Jammy 5.15 and Noble 6.8, Gate B 120/120 across
+    three cold boots per kernel, and the isolated host Lane 02 matrix 6/6.
+    Independent Sol, Terra, and Luna evidence review unanimously passed. This
+    selects the candidate only: the remaining Task 4 sequence restarts with a
+    fresh Lane 02 root, and r3/9.2d, 9.3, CI, Task 10, and release remain
+    pending.**
+
+    **Topology scope ruling (2026-08-27):** The exact reproduced node-wide
+    retained-view late-provider case is an expected `UNSUPPORTED/NON-PASS`
+    negative control with one overlay plus one unavailable; it is evaluated
+    only outside the zero-unavailable PASS oracle. The receipt-bound attempt-6
+    history is complete pre-r3 and is not rerun in Task 4; Lane 13 runs once in
+    9.2d as the frozen-candidate negative control. Any receipt-input mismatch,
+    different public shape, additional gap, or lifecycle/input/cleanup failure
+    stops as UNRUN/review or NON-PASS as applicable. The retained
+    preattached-provider Knative evidence remains `136/136` with expected
+    cold-pod calls. Remaining applicable Task 4 lanes and r3 may proceed only
+    after this additive amendment is independently reviewed and committed; Lane
+    13 PASS is not an unlock condition. The Gate Closure Task 5
+    capability-validator integration is complete through exact commit
+    `7a0c1eddac0b0b81340206ac742884ca2f31f691`, whose live capability gate
+    exited 0 without changing Lane 13. Public README/usage wording remains
+    reserved for Task 10; no design-spec, production, privacy/schema, or
+    procfs/mmap/eBPF fallback change is made here.**
 - **Slice 2 — capture quality**: ring/epoll, budgets, safe-policy params, per-module profile
   sections, filters, snapshots.
 - **Slice 3 — structure**: module split, evidence plumbing, docs consolidation, multi-kernel CI.

@@ -26,6 +26,9 @@
  *   P11SCOPE_FIXTURE_GATE=1     read one byte from stdin before doing anything,
  *                               so an external-PID lane can attach first
  *   P11SCOPE_FIXTURE_REPEAT=N   call every surface N times (loss lanes)
+ *   P11SCOPE_FIXTURE_INTERFACES=N
+ *                               use exactly N interface records for N in
+ *                               {0, 1, 16, 17}; absent/invalid values use 1.
  */
 
 #include <dlfcn.h>
@@ -43,6 +46,8 @@ typedef struct {
     void *pFunctionList;
     CK_FLAGS flags;
 } CK_INTERFACE;
+
+#define P11SCOPE_FIXTURE_MAX_INTERFACES 17
 
 typedef CK_RV (*get_function_list_fn)(void **);
 typedef CK_RV (*get_interface_list_fn)(CK_INTERFACE *, CK_ULONG *);
@@ -70,6 +75,25 @@ static long repeat_count(void) {
     return parsed > 0 ? parsed : 1;
 }
 
+static CK_ULONG fixture_interface_count(void) {
+    const char *value = getenv("P11SCOPE_FIXTURE_INTERFACES");
+    if (value != NULL) {
+        if (strcmp(value, "0") == 0) {
+            return 0;
+        }
+        if (strcmp(value, "1") == 0) {
+            return 1;
+        }
+        if (strcmp(value, "16") == 0) {
+            return 16;
+        }
+        if (strcmp(value, "17") == 0) {
+            return 17;
+        }
+    }
+    return 1;
+}
+
 struct provider_surfaces {
     get_function_list_fn get_function_list;
     get_interface_list_fn get_interface_list;
@@ -78,19 +102,22 @@ struct provider_surfaces {
 
 /* Calls all three standard return ABIs, in a fixed order, `repeat` times. */
 static int drive(struct provider_surfaces surfaces, long repeat) {
+    CK_ULONG expected = fixture_interface_count();
     for (long index = 0; index < repeat; index++) {
         void *table = NULL;
         if (surfaces.get_function_list(&table) != 0 || table == NULL) {
             return EXIT_SURFACE;
         }
-        CK_INTERFACE interface;
-        CK_ULONG count = 1;
-        if (surfaces.get_interface_list(&interface, &count) != 0 || count != 1) {
+        CK_INTERFACE interfaces[P11SCOPE_FIXTURE_MAX_INTERFACES];
+        CK_ULONG count = P11SCOPE_FIXTURE_MAX_INTERFACES;
+        if (surfaces.get_interface_list(interfaces, &count) != 0 || count != expected) {
             return EXIT_SURFACE;
         }
-        table = NULL;
-        if (surfaces.get_interface(NULL, NULL, &table, 0) != 0 || table == NULL) {
-            return EXIT_SURFACE;
+        if (expected != 0) {
+            table = NULL;
+            if (surfaces.get_interface(NULL, NULL, &table, 0) != 0 || table == NULL) {
+                return EXIT_SURFACE;
+            }
         }
     }
     return 0;

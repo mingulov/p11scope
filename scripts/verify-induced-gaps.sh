@@ -16,6 +16,7 @@ cd "$(dirname "$0")/.."
 
 MODULE=${P11SCOPE_PKCS11_MODULE:-/usr/lib/softhsm/libsofthsm2.so}
 WORK=${P11SCOPE_TASK4_WORK:-target/induced-gaps}
+case $WORK in /*) WORK_ABS=$WORK ;; *) WORK_ABS=$PWD/$WORK ;; esac
 FIX=scripts/fixtures
 . scripts/lib.sh
 
@@ -851,7 +852,7 @@ gcc -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 \
 gcc -std=c11 -O0 -Wall -Wextra -o "$WORK/freeze-workload" \
     scripts/fixtures/canary_workload.c -ldl -pthread
 "$WORK/freeze-build/release/p11scope-discover" \
-    --module "$PWD/$WORK/freeze-provider.so" -o "$WORK/freeze-manifest.json"
+    --module "$WORK_ABS/freeze-provider.so" -o "$WORK/freeze-manifest.json"
 
 rm -f "$WORK/freeze-ready" "$WORK/freeze-go" "$WORK/freeze-observed.json" \
     "$WORK/freeze-profile.log" "$WORK/freeze-workload.log" \
@@ -865,10 +866,10 @@ CGROUP_PATH="/sys/fs/cgroup/system.slice/${WORKLOAD_UNIT}.scope"
     --uid="$(id -u)" --gid="$(id -g)" -- sh -c \
     "umask 077; \
      starttime=\$(awk '{ sub(/^[0-9]+ \\(.*\\) /, \"\"); split(\$0, tail, \" \"); print tail[20]; exit }' /proc/\$\$/stat) || exit 1; \
-     printf '%s %s\\n' \"\$\$\" \"\$starttime\" > '$PWD/$WORK/freeze-workload.pid'; \
-     read -r _ < '$PWD/$WORK/freeze-barrier'; \
-     exec '$PWD/$WORK/freeze-workload' '$PWD/$WORK/freeze-provider.so' matrix \
-         '$PWD/$WORK/freeze-ready' '$PWD/$WORK/freeze-go'" ) \
+     printf '%s %s\\n' \"\$\$\" \"\$starttime\" > '$WORK_ABS/freeze-workload.pid'; \
+     read -r _ < '$WORK_ABS/freeze-barrier'; \
+     exec '$WORK_ABS/freeze-workload' '$WORK_ABS/freeze-provider.so' matrix \
+         '$WORK_ABS/freeze-ready' '$WORK_ABS/freeze-go'" ) \
     > "$WORK/freeze-workload.log" 2>&1 &
 WORKLOAD_LAUNCHER_PID=$!
 workload_record=$(wait_root_process_record \
@@ -916,7 +917,7 @@ export SOFTHSM2_CONF="$WORK/softhsm2.conf"
 rm -rf "$WORK/tokens"
 mkdir -p "$WORK/tokens"
 cat > "$SOFTHSM2_CONF" <<EOF
-directories.tokendir = $PWD/$WORK/tokens
+directories.tokendir = $WORK_ABS/tokens
 objectstore.backend = file
 log.level = ERROR
 slots.removable = false
@@ -936,15 +937,15 @@ gcc -shared -fPIC -Wl,-soname,helper.so -o "$WORK/g1/helper.so" \
     crates/discover/tests/fixture/helper.c
 gcc -shared -fPIC -o "$WORK/g1/provider.so" \
     crates/discover/tests/fixture/provider.c "$WORK/g1/helper.so" \
-    -Wl,-rpath,"$PWD/$WORK/g1"
+    -Wl,-rpath,"$WORK_ABS/g1"
 gcc -O0 -o "$WORK/g1_workload" "$FIX/alias_workload.c"
 
-"$DISCOVER" --module "$PWD/$WORK/g1/provider.so" -o "$WORK/g1_manifest.json"
+"$DISCOVER" --module "$WORK_ABS/g1/provider.so" -o "$WORK/g1_manifest.json"
 
 rm -f "$WORK/g1_go" "$WORK/g1_observed.json" "$WORK/g1_profile.log"
 ( while [ ! -f "$WORK/g1_go" ]; do sleep 0.05; done
   export P11SCOPE_HOLD=1
-  exec "$WORK/g1_workload" "$PWD/$WORK/g1/provider.so" 25 17 ) &
+  exec "$WORK/g1_workload" "$WORK_ABS/g1/provider.so" 25 17 ) &
 WPID=$!
 pin_workload
 sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" profile \
@@ -969,11 +970,11 @@ echo "=== gap 2/5: in-flight at end ==="
 gcc -shared -fPIC -o "$WORK/g2_provider.so" "$FIX/blocking_provider.c"
 gcc -O0 -o "$WORK/g2_workload" "$FIX/blocking_workload.c" -ldl
 
-"$DISCOVER" --module "$PWD/$WORK/g2_provider.so" -o "$WORK/g2_manifest.json"
+"$DISCOVER" --module "$WORK_ABS/g2_provider.so" -o "$WORK/g2_manifest.json"
 
 rm -f "$WORK/g2_go" "$WORK/g2_observed.json" "$WORK/g2_profile.log"
 ( while [ ! -f "$WORK/g2_go" ]; do sleep 0.05; done
-  exec "$WORK/g2_workload" "$PWD/$WORK/g2_provider.so" ) &
+  exec "$WORK/g2_workload" "$WORK_ABS/g2_provider.so" ) &
 WPID=$!
 pin_workload
 sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" profile \
@@ -1031,11 +1032,11 @@ gcc -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 -DPRIVACY_BLOCKS=1 \
     -o "$WORK/g4_provider.so" crates/discover/tests/fixture/version_matrix.c
 gcc -O0 -Wall -Wextra -pthread -o "$WORK/privacy_stack_workload" \
     "$FIX/privacy-stack-workload.c" -ldl
-"$DISCOVER" --module "$PWD/$WORK/g4_provider.so" -o "$WORK/g4_manifest.json"
+"$DISCOVER" --module "$WORK_ABS/g4_provider.so" -o "$WORK/g4_manifest.json"
 
 rm -f "$WORK/g4_go" "$WORK/g4_observed.json" "$WORK/g4_profile.log"
 ( while [ ! -f "$WORK/g4_go" ]; do sleep 0.05; done
-  exec "$WORK/privacy_stack_workload" "$PWD/$WORK/g4_provider.so" ) \
+  exec "$WORK/privacy_stack_workload" "$WORK_ABS/g4_provider.so" ) \
     > "$WORK/g4_workload.log" 2>&1 &
 WPID=$!
 pin_workload
@@ -1060,12 +1061,12 @@ echo "=== gap 5/5: RV update loss (one-entry map, distinct completed slots) ==="
 ##############################################################################
 gcc -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 \
     -o "$WORK/g5_provider.so" crates/discover/tests/fixture/version_matrix.c
-"$DISCOVER" --module "$PWD/$WORK/g5_provider.so" -o "$WORK/g5_manifest.json"
+"$DISCOVER" --module "$WORK_ABS/g5_provider.so" -o "$WORK/g5_manifest.json"
 
 rm -f "$WORK/g5_go" "$WORK/g5_observed.json" "$WORK/g5_profile.log"
 ( while [ ! -f "$WORK/g5_go" ]; do sleep 0.05; done
   export P11SCOPE_HOLD=1
-  exec "$WORK/privacy_stack_workload" "$PWD/$WORK/g5_provider.so" sequential ) \
+  exec "$WORK/privacy_stack_workload" "$WORK_ABS/g5_provider.so" sequential ) \
     > "$WORK/g5_workload.log" 2>&1 &
 WPID=$!
 pin_workload

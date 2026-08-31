@@ -2879,6 +2879,7 @@ static int internal_workload(const char *case_name)
         for (;;) {
             volatile unsigned long spin = 0;
             ++spin;
+            (void)spin;
         }
     }
     if (strcmp(case_name, "kernel-signal-ignored") == 0) {

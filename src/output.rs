@@ -277,10 +277,7 @@ struct OpenHow {
 fn open_output_directory(path: &Path) -> Result<std::fs::File, String> {
     let display = path.display().to_string();
     let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-        format!(
-            "opening output directory {} failed: path contains a NUL byte",
-            display
-        )
+        format!("opening output directory {display} failed: path contains a NUL byte")
     })?;
     let how = OpenHow {
         flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,

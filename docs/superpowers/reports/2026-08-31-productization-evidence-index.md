@@ -183,6 +183,27 @@ directories and redundant branch names are cleanup-only metadata; deleting
 them after portable evidence verification cannot delete the merged commits.
 Generated `target/` trees are not evidence.
 
+## Portable transfer package
+
+The complete `main` history through `90a03acbbbaff6de39fe56d3eb4de8b8add27e43`
+and the finite accepted evidence set are packaged at:
+
+`/home/user/.local/state/p11scope/pkcs11-scope-portable-90a03ac.tar.zst`
+
+- archive SHA-256:
+  `e4d6cf6294d7717c5b89cd38bec3a608e1fc8d8696a3f86f074a6bbcb4c2d6cf`
+- complete `main` Git bundle SHA-256:
+  `a08004436f85f1e14517c9a68ec756d319e2b6e4bbdfa5e98d5678895685785d`
+- internal manifest SHA-256:
+  `b9f8f6171d0820b9a8e98def82ba804000bf174a6cf5ff1c04e6fdc69ea0ea71`
+- unpacked/archive sizes: 32 MiB / 14 MiB.
+
+`git bundle verify` reports a complete history with `refs/heads/main` at
+`90a03ac`. The package contains the Jammy/Noble accepted runtime roots,
+Stage 3A3 GREEN6 reports, exact security scan artifacts, and the release
+binaries/receipts without rebuildable Cargo intermediates. Its adjacent
+`.sha256` file is the authoritative archive checksum.
+
 ## Static security closeout
 
 Codex Security Standard scan `ccd45755-a021-4492-a066-e3df02b0944e` reviewed

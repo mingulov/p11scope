@@ -1298,6 +1298,18 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
             acquisition: "ok".into(),
             functions: published,
         });
+        surfaces.extend(
+            scanned
+                .interfaces
+                .iter()
+                .filter(|interface| interface.table == Some(index))
+                .map(|interface| SurfaceSummary {
+                    source: format!("interface[{}] {}", interface.index, interface.name_class),
+                    walk: table.walk.to_string(),
+                    acquisition: "ok".into(),
+                    functions: published,
+                }),
+        );
         targets.extend(table.entries.iter().zip(&module.entry_objects[index]).map(
             |(entry, object)| Target {
                 name: entry.name,
@@ -1608,6 +1620,28 @@ mod tests {
                 interfaces: vec![],
             },
         }
+    }
+
+    #[test]
+    fn scanned_interfaces_are_published_as_classified_surfaces() {
+        use crate::discovery::scan::ScannedInterface;
+
+        let mut scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
+        scanned.scanned.interfaces.push(ScannedInterface {
+            index: 0,
+            name_class: "exact_standard",
+            name_lossy: None,
+            flags: 0,
+            table: Some(0),
+        });
+
+        let plan = build_from_test_sources(&[scanned], &[]);
+        assert_eq!(plan.modules[0].interfaces, 1);
+        assert_eq!(plan.surfaces.len(), 2);
+        assert_eq!(plan.surfaces[1].source, "interface[0] exact_standard");
+        assert_eq!(plan.surfaces[1].walk, "full");
+        assert_eq!(plan.surfaces[1].acquisition, "ok");
+        assert_eq!(plan.surfaces[1].functions, 1);
     }
 
     #[test]

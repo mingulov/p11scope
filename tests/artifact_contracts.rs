@@ -3766,6 +3766,11 @@ fn live_discovery_fixtures_have_two_byte_identities_and_three_surfaces() {
         provider.contains("return provider_application_phase ? \"app\" : \"ctor\";"),
         "constructor and application markers must be distinguished by phase, not timing"
     );
+    assert!(
+        provider.contains("static CK_INTERFACE provider_interface;")
+            && provider.contains("provider_interface.pFunctionList = published_table();"),
+        "C_GetInterface storage must not look like a discovered interface before the call"
+    );
     // One driver source, both load kinds, and the frozen lane modes.
     assert!(
         driver.contains("#if defined(P11SCOPE_DRIVER_NEEDED)"),

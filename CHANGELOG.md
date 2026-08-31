@@ -1,12 +1,14 @@
 # Changelog
 
-## Unreleased — productization slice 1b-1
+## Unreleased — productization slice 1b MVP
 
 Corrective Tasks 1–5 and the owner-selected semantic-authority implementation
-are complete. Final whole-range correctness/security reviews and the
-exact-candidate local matrix passed on 2026-08-19. CI remains pending, so this
-slice is still unreleased. Slice 1b-2 live discovery is wired internally, but
-public `run`, capture-history correction, and runtime gates remain incomplete.
+are complete. Public `run`, owned-child live discovery, and capture-history
+correction are integrated. The frozen candidate passed all six
+semantic/privacy/cleanup rows on Ubuntu 22.04 kernel 5.15 and Ubuntu 24.04
+kernel 6.8, and the combined `main` tree passes all four locked workspace
+gates. Exact-tip CI, packaging, final security review, and release remain
+pending.
 
 - **Discovery**: `profile` and `trace` scan the target's mapped memory once at
   attach, so neither a manifest nor the offline helper is required. Repeatable
@@ -31,10 +33,10 @@ public `run`, capture-history correction, and runtime gates remain incomplete.
   Top-level skip records retain exact standard function names but bound all
   other names and reasons to finite categories, so cgroup scans do not publish
   bystander paths, numeric PID labels, `/proc/<pid>` paths, or raw error chains.
-- **Promotion limit**: accepted Slice 1b-1 evidence covers the initial memory
-  scan. This branch wires later loader/export discovery internally, but late
-  provider coverage remains unsupported until Tasks 6E–10 pass. Use a suitable
-  pre-existing manifest when available and hash-matchable.
+- **Owned command**: `p11scope run -- ...` starts capture before releasing the
+  child and tracks later provider loads with the loader/export path. Existing
+  external processes still use the initial memory scan or a suitable
+  pre-existing, hash-matched manifest.
 - **Corrective work bounds**: one 512 MiB attempted-I/O budget covers all
   memory scans and scan-sourced hashes in a capture (64 MiB per operation),
   with ceilings of 512 accepted tables, 53,248 decoded entries, 512 interfaces,

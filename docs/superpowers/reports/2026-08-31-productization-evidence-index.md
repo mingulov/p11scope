@@ -9,12 +9,15 @@ are identified by hashes below.
 
 ## Integrated on `main`
 
-- Current integration checkpoint: `5c741c79a662e132c8039747fe3a9b44466beb1d`.
+- Current integration checkpoint: `b71b4f2c75e4324462e0d28002dbfafa40d98e83`.
 - Shipping baseline: `91e21496ae4e7d151c050a9dee2e8547d2d6cb75`,
   merged by `21bfd008d79ebd1ae1292d3820855ef45889a0d8`.
 - Committed MVP lifecycle fixes through
   `af5282abc018277a757ed277728def1f275c5144`, merged by
   `0874c06e1539350cb42c136a3abfe7ea9af576a5`.
+- Dual-kernel-qualified lifecycle fixes through
+  `ae8494de65aea78384b86b2f7d05cf6fc30000f8`, merged by
+  `b71b4f2c75e4324462e0d28002dbfafa40d98e83`.
 - Slice 1b-2 Task 4 prerequisites through
   `eebb0fcdea1d4da50536230ed07ac7325c29f4d0`, merged by
   `b0e47d8ff1e264bff6974e6b0d8cacce0c1c63e3`.
@@ -34,10 +37,12 @@ Fresh integration checks:
 - Task 4 build-subject negative control: silent exit 77, PASS.
 - Python syntax and modified shell syntax: PASS.
 - `cargo +1.88 test --locked --test task4_build_subjects`: 18/18 PASS.
-- `cargo +1.88 test --locked --test artifact_contracts`: 60/60 PASS.
+- `cargo +1.88 test --locked --test artifact_contracts`: 63/63 PASS.
 - Independent prerequisite-merge review: ACCEPT, no findings.
-- Full four-command workspace gate, exact-tip CI, packaging, publication,
-  push, tag, and release: UNRUN at this checkpoint.
+- Full four-command workspace gate on the combined tree: PASS (630 library,
+  63 artifact-contract, and all integration tests; Clippy denies warnings).
+- Exact-tip CI, packaging, publication, push, tag, and release: UNRUN at this
+  checkpoint.
 
 ## Preserved worktree snapshots
 
@@ -46,7 +51,7 @@ for product integration.
 
 | Worktree / branch | Preserved commit | Disposition |
 | --- | --- | --- |
-| `productization/mvp-lifecycle-fix` | `fd727a86c4e4a367b0a836949c13b5956f056980` | Clean post-diagnostic candidate. Cleanup review accepted, but fresh Jammy Attempt 15 row 02 remains semantic NON-PASS; do not merge until fixed. Raw WIP remains recoverable at `dff4085778ad96e4d7741b282977b6052e47afb0`. |
+| `productization/mvp-lifecycle-fix` | `ae8494de65aea78384b86b2f7d05cf6fc30000f8` | Accepted six-row dual-kernel candidate; fully integrated by `b71b4f2`. Historical diagnostic WIP remains reachable in the branch history. |
 | `productization/slice1b2-finish` | `5a7c9a7cfd24c8b938866d12e78089935000a9d3` | Exact GREEN6 pair plus separately unaccepted artifact-contract/contracts/report WIP. GREEN6 and prerequisites are integrated; the remaining snapshot is preserved only. |
 | `research/raw-tracepoint-lifecycle` | `5e027743c01072b47ac5bb0bf7ebdfe4767c8428` | `DONE_WITH_CONCERNS`; verifier, masked-tracefs, capability-parity, and cross-kernel runtime remain UNRUN. Post-v1 unless promoted separately. |
 
@@ -58,7 +63,46 @@ the final report and independent review are
 
 ## Kernel runtime evidence
 
-Frozen candidate identities used by the 2026-08-31 campaign:
+Accepted frozen candidate identities used by the final 2026-08-31 campaign:
+
+- Candidate/tree: `ae8494de65aea78384b86b2f7d05cf6fc30000f8` /
+  `c273bb500fb4820a3a5bd478436db6c260960321`.
+- BPF object:
+  `1daaca3a77d3babbeb61d49d91a535f7f7ef941448f835c3bd1dc1fee64a6ce1`.
+- runner:
+  `60b2d47a752ce57de446eb4a78700f45ad0419cbb72a22d1f06fc56d010fa4b0`.
+- privacy allowlist:
+  `0cb4983d239c8c182d9c0ba632cde87ff9031ff22c7c9cab9edf4af43474797f`.
+
+Jammy 22.04 / kernel 5.15.0-187:
+
+- Separate five-program Gate A: PASS 5/5.
+- Six product rows: 6/6 command, semantic, privacy, and cleanup PASS.
+- Evidence archive:
+  `a34461f4fea672f7a125706df5250c7bad5f84e09fb34f803408c08435f284f9`.
+- Sealed manifest copy:
+  `/home/user/.local/state/p11scope/mvp-semantic-jammy-attempt28-two-phase-six-row/`.
+
+Noble 24.04 / kernel 6.8.0-137:
+
+- Six product rows: 6/6 command, semantic, privacy, and cleanup PASS using
+  the identical runner/BPF/allowlist bytes.
+- Evidence archive:
+  `837a560140f3f5161c6781f745059034028981b15fac793eaed109ec1abdc8fa`.
+- Sealed manifest copy:
+  `/home/user/.local/state/p11scope/mvp-semantic-noble-attempt29-two-phase-six-row/`.
+- A separate Noble diagnostic Gate A was not repeated; all six product rows
+  loaded and exercised the identical object. Independent review accepted this
+  with the Jammy Gate A as sufficient for the MVP two-kernel gate.
+
+Both roots pass their complete `EVIDENCE.sha256` manifests. Source, candidate,
+base images, and initialized overlays remained unchanged; collection and
+teardown passed, ports and QEMU processes cleared, and disposable children
+were deleted. Independent dual-kernel evidence review: ACCEPT, no required
+action before main. Noble's stale preparation label and `a27` hostname are
+cosmetic deferred harness fixes, not provenance defects.
+
+The earlier diagnostic campaign used these superseded identities:
 
 - BPF object:
   `2638906cda708c30eb69a7c6c055853bb927bcd15d6000784131ac52f53b5c93`.
@@ -109,7 +153,8 @@ Jammy 5.15:
 
 Evidence paths are local under
 `.claude/worktrees/mvp-lifecycle-fix/.superpowers/sdd/2026-08-31-mvp-semantic-campaign/`.
-These results are diagnostic or partial runtime evidence, not release proof.
+The earlier results in this subsection are diagnostic or partial runtime
+evidence; the accepted successor campaign above supersedes their MVP gate.
 
 ## Other worktrees
 
@@ -131,14 +176,9 @@ artifacts are independently retained.
 
 ## Remaining critical path
 
-1. Identify and fix the interface-list lifecycle defect isolated by clean
-   Attempt 15. Diagnostic removal and its independent review are complete.
-2. Rerun the frozen Jammy row 02. Do not spend time on rows 03-06 until it
-   passes.
-3. Merge the reviewed lifecycle fix to `main`.
-4. Run the four locked workspace commands on the exact `main` tip.
-5. Run the serial Jammy 5.15 and Noble 6.8 semantic campaign, independently
-   review its evidence, then run exact-tip CI and release closeout.
+1. Commit the runtime-status documentation on the integrated `main` tree.
+2. Run exact-tip CI.
+3. Complete packaging, final security review, and release closeout.
 
 Deep Security Scan, full security/privacy clearance, container/deployment
 lanes, exact-tip CI, packaging, publication, push, tag, and release remain

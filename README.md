@@ -10,12 +10,13 @@ table (including stripped providers with no `C_*` symbols), attaches probes by
 file offset, and produces a versioned `observed-profile.json` for migration
 assessment and incident diagnostics.
 
-> **Status: unreleased; Slice 1b-1 local evidence is complete.** Its memory-scan discovery,
-> `inspect`, `doctor`, multi-module capture, schema v2, corrective Tasks 1–5,
-> and the owner-selected semantic-authority implementation are complete. Final
-> whole-range correctness/security reviews and the exact-candidate local matrix
-> passed on 2026-08-19. CI remains pending.
-> Slice 1b-2 live discovery is wired internally, but public `run` is absent and the live path remains unsupported and unreleased pending Tasks 6E–10.
+> **Status: unreleased; the local MVP candidate is runtime-qualified.**
+> Memory-scan discovery, `inspect`, `doctor`, public `run`, multi-module
+> capture, schema v2, and owned-child live discovery are implemented. The
+> frozen candidate passed all six semantic/privacy/cleanup rows on Ubuntu
+> 22.04 kernel 5.15 and Ubuntu 24.04 kernel 6.8, and its merged `main` tree
+> passes the four locked workspace gates. Exact-tip CI, packaging, release,
+> and final security closeout remain pending.
 
 Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40
 table, and standard 3.0, 3.1, and 3.2 interfaces (all 104 slots published in
@@ -192,8 +193,9 @@ overlay instances, so every such collapse is published as uncertainty and forces
 `PARTIAL`; a distinct byte-identical instance could otherwise be under-counted.
 
 Initial discovery scans provider tables already mapped in the target and
-executes no provider code. Internal loader/export hooks can react to later
-loads, but that path remains unsupported pending Tasks 6E–10. The
+executes no provider code. For a command the observer owns, `p11scope run`
+starts capture before releasing the child and loader/export hooks react to
+later loads. The
 optional unprivileged helper (`p11scope-discover`) can prepare a manifest
 offline while the same provider identity is available; a manifest cannot be
 conjured after a missed capture to make that window complete.
@@ -207,11 +209,10 @@ rename).
 Memory scanning is heuristic discovery. Live and terminal evidence are PARTIAL
 while scan-only semantic claims remain. P11Lab joins reject scan-only and
 conflict modules; an accepted manifest may authorize only its exact pinned
-object, offset, and canonical function name. Slice 1b-2 live discovery is wired
-internally, but public `run`, capture-history correction, runtime gates, and CI
-remain incomplete. Final whole-range correctness/security reviews and the
-exact-candidate local matrix passed on 2026-08-19; Slice 1b-1 remains
-unreleased while CI remains pending.
+object, offset, and canonical function name. The owned-child `run` path and
+capture-history corrections passed the local 5.15/6.8 semantic campaign.
+The project remains unreleased while exact-tip CI, packaging, and final
+security/release review are pending.
 
 Fresh final-candidate unprivileged, privileged, container, Kubernetes, and
 release results are recorded in the Task 4 handoff. No remote CI result is

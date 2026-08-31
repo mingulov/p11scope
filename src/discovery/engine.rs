@@ -10497,16 +10497,26 @@ mod tests {
 
     #[test]
     fn two_gib_dynamic_executable_arms_without_hashing_the_executable() {
-        let mut source = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let source_path = std::fs::read_link(format!("/proc/{}/exe", source.id())).unwrap();
-        source.kill().unwrap();
-        source.wait().unwrap();
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let source_path = std::path::Path::new("/bin/sh");
+        let source_file = std::fs::File::open(source_path).unwrap();
+        let source_size = source_file.metadata().unwrap().len();
+        assert!(
+            read_bounded_interpreter(&source_file, source_size)
+                .unwrap()
+                .is_some(),
+            "the copied source must be a dynamic executable with one PT_INTERP"
+        );
 
         let dir = tempfile::tempdir().unwrap();
-        let executable = dir.path().join("large-sleep");
+        let executable = dir.path().join("large-sh");
         std::fs::copy(source_path, &executable).unwrap();
         std::fs::OpenOptions::new()
             .write(true)
@@ -10518,13 +10528,35 @@ mod tests {
             std::fs::metadata(&executable).unwrap().len(),
             2 * 1024 * 1024 * 1024 + 11 * 1024 * 1024
         );
-        let mut child = std::process::Command::new(&executable)
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let view = ProcessView::open(ProcessViewId(0), child.id()).unwrap();
+        let mut child = ChildGuard(
+            std::process::Command::new(&executable)
+                .args(["-c", "printf R; kill -STOP $$"])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut ready = [0_u8; 1];
+        std::io::Read::read_exact(child.0.stdout.as_mut().unwrap(), &mut ready).unwrap();
+        assert_eq!(ready, *b"R");
+        let pid = child.0.id() as libc::pid_t;
+        let mut status = 0;
+        // SAFETY: this process is the parent of the exact unreaped child.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+            pid
+        );
+        assert!(libc::WIFSTOPPED(status));
+        assert_eq!(libc::WSTOPSIG(status), libc::SIGSTOP);
+        let process_executable = std::fs::metadata(format!("/proc/{}/exe", child.0.id())).unwrap();
+        let fixture_executable = std::fs::metadata(&executable).unwrap();
+        assert_eq!(
+            (process_executable.dev(), process_executable.ino()),
+            (fixture_executable.dev(), fixture_executable.ino()),
+            "the stopped child must execute the enlarged fixture"
+        );
+        let view = ProcessView::open(ProcessViewId(0), child.0.id()).unwrap();
         let mut engine = Engine::empty();
-        engine.scope = Scope::Pid(child.id());
+        engine.scope = Scope::Pid(child.0.id());
         engine.views.push(view);
 
         let mut session = ScriptedSession::default();
@@ -10534,8 +10566,8 @@ mod tests {
             &mut true,
             &mut PendingViewRetirements::new(),
         );
-        child.kill().unwrap();
-        child.wait().unwrap();
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
         armed.expect("a large dynamic executable locates its separately bounded loader");
 
         let skips = engine.counters.object_skips.clone();

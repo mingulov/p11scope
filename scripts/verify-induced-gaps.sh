@@ -862,7 +862,10 @@ rm -f "$WORK/freeze-ready" "$WORK/freeze-go" "$WORK/freeze-observed.json" \
 mkfifo "$WORK/freeze-barrier"
 WORKLOAD_UNIT="p11scope-freeze-$$"
 CGROUP_PATH="/sys/fs/cgroup/system.slice/${WORKLOAD_UNIT}.scope"
-( sudo systemd-run --scope --unit="$WORKLOAD_UNIT" \
+SYSTEMD_RUN_NO_EXPAND=
+systemd-run --help 2>&1 | grep -q -- '--expand-environment=' \
+    && SYSTEMD_RUN_NO_EXPAND=--expand-environment=no
+( sudo systemd-run $SYSTEMD_RUN_NO_EXPAND --scope --unit="$WORKLOAD_UNIT" \
     --uid="$(id -u)" --gid="$(id -g)" -- sh -c \
     "umask 077; \
      starttime=\$(awk '{ sub(/^[0-9]+ \\(.*\\) /, \"\"); split(\$0, tail, \" \"); print tail[20]; exit }' /proc/\$\$/stat) || exit 1; \

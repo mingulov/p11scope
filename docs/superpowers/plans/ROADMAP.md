@@ -491,9 +491,10 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     passed fresh Gate A on Jammy 5.15 and Noble 6.8, Gate B 120/120 across
     three cold boots per kernel, and the isolated host Lane 02 matrix 6/6.
     Independent Sol, Terra, and Luna evidence review unanimously passed. This
-    selects the candidate only: the remaining Task 4 sequence restarts with a
-    fresh Lane 02 root, and r3/9.2d, 9.3, CI, Task 10, and release remain
-    pending.**
+    selects the candidate only: Task 4 rehashes and compatibility-checks the
+    already frozen Lane 02 result, then executes remaining lanes beginning at
+    Lane 07. The distinct post-r3 9.2d campaign retains its existing Lane 02
+    gate position. r3/9.2d, 9.3, CI, Task 10, and release remain pending.**
 
     **Topology scope ruling (2026-08-27):** The exact reproduced node-wide
     retained-view late-provider case is an expected `UNSUPPORTED/NON-PASS`
@@ -512,6 +513,64 @@ and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust
     exited 0 without changing Lane 13. Public README/usage wording remains
     reserved for Task 10; no design-spec, production, privacy/schema, or
     procfs/mmap/eBPF fallback change is made here.**
+
+    **Task 4 receipt architecture ruling (2026-08-28):** Remaining-lane gate
+    receipts use one private Python-stdlib sealed-envelope helper, one shared
+    privacy scanner, six lane-owned checkers, and seven committed contracts
+    (`07`, `09`, `10`, `11`, `14`, `16-never`, `16-auto`). After accepted
+    input/build-subject closure, the blueprint gate requires seven independently
+    reviewed, design-complete, non-executable
+    blueprints that select future literal sets,
+    normative checker ABIs, resources, privacy mappings, cardinalities, and
+    fail-closed caps before implementation; they make no current-output claim.
+    All checker and
+    helper interfaces resolve before promotion, and the runtime helper rejects
+    blueprint schema with exit 77 before root creation. Promotion yields
+    interface-complete manifests, not lane acceptance; executability begins only
+    after migrated-driver exact registration/replay passes. The exact
+    194-row Lane 14 canary/privacy crosswalk contains 191 scan targets, two
+    input-only manifests, and one must-detect positive control; it does not
+    replace Lane 14 distribution/attach/protocol/release/smoke artifact rows.
+    Existing checkers remain the domain oracles; the
+    envelope validates only declaration equality, custody, provenance, resource
+    lifecycle, replay isolation, privacy scanning, sealing, and terminal
+    publication. The rejected live Rust observer, FD-5 protocol, global
+    `facts-v1` interpreter, and duplicated lane-local receipt wrappers are not
+    implementation authority. Frozen Lane 02 evidence is compatibility-checked
+    rather than rerun in Task 4; Lane 13 history is neither amended nor rerun
+    and remains the single frozen-candidate 9.2d negative control. Product
+    Rust/BPF, public v2 schemas, `allowlist-v1`, lane oracles, runtime order, r3,
+    9.2d, 9.3, 9.4, exact-tip CI, and Task 10 remain unchanged.**
+
+    **Task 4 build-subject correction (2026-08-28, accepted):** The first
+    seven-blueprint candidate is rejected because selected source rows do not
+    close Cargo or Docker inputs. Before blueprint acceptance, add one reviewed
+    rootless build-subject discovery/production freeze with exhaustive
+    transitive input authority, a fresh sealed Lane 09 image, and final-tip
+    product-affecting compatibility. Lanes 07/09/10/11/16 consume private
+    copied subjects, validate exact registered subject-checker argv before any
+    privilege/container/BPF/resource and again at final replay, and do not run
+    Cargo. Lane 14 remains the source-bound build/distribution contract. The
+    schema and custody helper remain unchanged. Independent Sol/Terra/Luna
+    review accepted `2026-08-28-task4-build-subject-decision.md`; all build and
+    runtime claims remain UNRUN. BS2a is candidate-only discovery and cannot
+    authorize a subject; `produce` remains exit 77. One BS2b runner call is the
+    sole production boundary and owns the complete four-profile and Lane 09
+    image build set, exact-object preflight, filesystem restriction, fresh
+    rootless PID/mount/network isolation with private `/proc`, inherited
+    network/FD-theft/process-injection denial with no external daemon,
+    trace/process lifecycle, reconciliation, postflight, and no-replace
+    publication beneath a held fsync-capable private-parent descriptor.**
+
+    **Stage3 authority amendment (2026-08-30, accepted):** The
+    [accepted decision's Stage3 amendment](../reports/2026-08-28-task4-build-subject-decision.md#stage3-authority-amendment-2026-08-30-accepted)
+    governs BS2b capacity, exact constants, raw-symlink custody, and order.
+    The phase order is `3A0` -> `3A1` -> `3A2` -> `3A3`, each limited to RED,
+    GREEN, and review after docs acceptance; Stage3 code remains gated until
+    independent review/commit. No build, child/build-root, Landlock
+    implementation/probe, producer, runtime, publication, or release is
+    authorized by this amendment. The privacy allowlist and schema row limits
+    remain unchanged.**
 - **Slice 2 — capture quality**: ring/epoll, budgets, safe-policy params, per-module profile
   sections, filters, snapshots.
 - **Slice 3 — structure**: module split, evidence plumbing, docs consolidation, multi-kernel CI.

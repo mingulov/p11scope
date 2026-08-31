@@ -192,7 +192,7 @@ command -v gcc >/dev/null || { echo "gcc required" >&2; exit 1; }
 command -v capsh >/dev/null || { echo "capsh required" >&2; exit 1; }
 sudo -n true 2>/dev/null || { echo "passwordless sudo required" >&2; exit 1; }
 
-MODULE=/usr/lib/softhsm/libsofthsm2.so
+MODULE=${P11SCOPE_PKCS11_MODULE:-/usr/lib/softhsm/libsofthsm2.so}
 [ -f "$MODULE" ] || { echo "SoftHSM2 not installed at $MODULE" >&2; exit 1; }
 WORK=target/capability-tier
 BIN="$PWD/target/release/p11scope"

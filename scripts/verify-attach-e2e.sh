@@ -106,7 +106,7 @@ if [ "${1-}" = "--self-test" ]; then
     exit 0
 fi
 
-MODULE=/usr/lib/softhsm/libsofthsm2.so
+MODULE=${P11SCOPE_PKCS11_MODULE:-/usr/lib/softhsm/libsofthsm2.so}
 WORK=${P11SCOPE_TASK4_WORK-target/e2e}
 if [ "${P11SCOPE_TASK4_WORK+set}" = set ]; then
     case $WORK in /*) ;; *) echo "P11SCOPE_TASK4_WORK must be absolute" >&2; exit 2 ;; esac

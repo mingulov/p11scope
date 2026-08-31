@@ -3489,11 +3489,8 @@ fn operator_docs_preserve_semantic_authority_limits() {
             "docs/usage.md",
             "P11Lab joins reject scan-only and conflict modules",
         ),
-        (
-            "CHANGELOG.md",
-            "Slice 1b-2 live discovery is wired internally",
-        ),
-        ("docs/superpowers/plans/ROADMAP.md", "CI remains pending"),
+        ("CHANGELOG.md", "Public `run`, owned-child live discovery"),
+        ("docs/superpowers/plans/ROADMAP.md", "exact-tip CI"),
     ] {
         assert!(
             read(path)
@@ -3511,11 +3508,12 @@ fn operator_docs_preserve_semantic_authority_limits() {
         "CHANGELOG.md",
         "docs/superpowers/plans/ROADMAP.md",
     ] {
-        let document = read(path).split_whitespace().collect::<Vec<_>>().join(" ");
-        for statement in [
-            "Final whole-range correctness/security reviews and the exact-candidate local matrix passed on 2026-08-19",
-            "CI remains pending",
-        ] {
+        let document = read(path)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        for statement in ["exact-tip ci", "pending"] {
             assert!(
                 document.contains(statement),
                 "{path} is missing: {statement}"
@@ -3535,12 +3533,13 @@ fn operator_docs_preserve_semantic_authority_limits() {
     }
     for path in ["README.md", "docs/usage.md"] {
         let document = read(path).split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(
-            document.contains(
-                "Slice 1b-2 live discovery is wired internally, but public `run` is absent and the live path remains unsupported and unreleased pending Tasks 6E–10"
-            ),
-            "{path}"
-        );
+        for statement in [
+            "local MVP candidate is runtime-qualified",
+            "22.04 kernel 5.15",
+            "24.04 kernel 6.8",
+        ] {
+            assert!(document.contains(statement), "{path}: {statement}");
+        }
     }
 }
 

@@ -5,12 +5,12 @@ how to run it, and what its output actually proves. Measured examples below
 name the script that produced them so they can be reproduced; fixed
 implementation limits are code contracts, not measurements.
 
-> **Status: unreleased; Slice 1b-1 local evidence is complete.** Memory-scan discovery,
-> `inspect`, `doctor`, multi-module capture, schema v2, corrective Tasks 1–5,
-> and the owner-selected semantic-authority implementation are complete. Final
-> whole-range correctness/security reviews and the exact-candidate local matrix
-> passed on 2026-08-19. CI remains pending.
-> Slice 1b-2 live discovery is wired internally, but public `run` is absent and the live path remains unsupported and unreleased pending Tasks 6E–10.
+> **Status: unreleased; the local MVP candidate is runtime-qualified.**
+> Memory-scan discovery, `inspect`, `doctor`, public `run`, multi-module
+> capture, schema v2, and owned-child live discovery are implemented. The
+> frozen candidate passed all six semantic/privacy/cleanup rows on Ubuntu
+> 22.04 kernel 5.15 and Ubuntu 24.04 kernel 6.8. Exact-tip CI, packaging,
+> release, and final security closeout remain pending.
 > See the
 > [safe metadata design](superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md)
 > and the
@@ -114,21 +114,27 @@ sudo p11scope profile --pid 12345 --duration 60 -o observed-profile.json
 
 # 3. Or stream one line per call.
 sudo p11scope trace --cgroup /sys/fs/cgroup/... --duration 15
+
+# 4. Or start capture before releasing a command that loads the provider.
+sudo p11scope run --module /opt/vendor/lib/pkcs11.so \
+  -o observed-profile.json --pause auto -- /opt/application/bin/workload
 ```
 
 ### Discovery timing and optional offline discovery
 
-The memory scan builds the initial attach plan. Acquiring a provider `dlopen`ed
-after capture starts is implemented internally but is **not a supported
-capability in this tree**: its runtime and CI evidence are still outstanding, so
-plan a capture as though a provider loaded later may be missed. If a suitable
-manifest was prepared while the same provider identity was available, pass it
+The memory scan builds the initial attach plan. For an owned command,
+`p11scope run` starts capture before releasing the child and can acquire a
+provider loaded later. This path passed the local six-row campaign on kernels
+5.15 and 6.8; CI and release qualification remain pending. For an already
+running external process, a provider loaded before attachment can still be
+missed. If a suitable manifest was prepared while the same provider identity
+was available, pass it
 with `--manifest`; it is explicit operator attestation of exact accepted
 function-name/offset claims, hash-matched against the pinned file, and
 corroborated when the provider is already mapped. Scan-only discovery is
 semantics-unverified and count-only, but aggregate counts/RVs/latency remain
 available. A helper run after the fact cannot repair a missed capture window,
-and `--manifest` remains the supported answer until that evidence lands.
+and `--manifest` remains the explicit-attestation path for that case.
 
 `p11scope-discover --module <provider.so> -o manifest.json` is that optional
 offline path. It executes provider code in its own unprivileged process; the
@@ -423,12 +429,10 @@ evidence are PARTIAL while scan-only semantic claims remain. P11Lab joins reject
 scan-only and conflict modules. An accepted manifest authorizes only the exact
 pinned object, offset, and canonical function name it attests; stale fallback,
 hash agreement, path identity, and raw `{dev,ino}` never transfer that
-attestation. Slice 1b-2 live discovery is wired internally, but public `run`,
-capture-history correction, and the required runtime gates remain incomplete.
-
-Slice 1b-1 implementation is complete. Final whole-range correctness/security
-reviews and the exact-candidate local matrix passed on 2026-08-19. CI remains
-pending, so no release or security-clearance claim applies yet.
+attestation. The owned-child `run` path and capture-history corrections passed
+the local 5.15/6.8 semantic campaign. Exact-tip CI, packaging, and final
+security/release review remain pending, so no release or security-clearance
+claim applies yet.
 
 **`PARTIAL`** is forced by any single gap in that list — an attach
 failure, ring-buffer loss, a template the in-kernel walk couldn't finish

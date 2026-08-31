@@ -395,11 +395,13 @@ discovery, security-findings layer, GUI.
 Input: `docs/notes/2026-08-15-architecture-and-gap-analysis.md` (review + decisions A1–A7)
 and `docs/superpowers/specs/2026-08-15-productization-slice1-discovery-and-trust-design.md`.
 
-**Consolidation checkpoint (2026-08-31):** The shipping baseline, committed
-MVP lifecycle fixes, Slice 1b-2 Task 4 prerequisites, and the exact accepted
-Stage 3A3 GREEN6 pair are integrated on `main`. The tree remains unreleased;
-full workspace gates, the blocked Jammy semantic row, the remaining two-kernel
-campaign, exact-tip CI, and release gates are still pending. See the tracked
+**Consolidation checkpoint (2026-08-31):** The shipping baseline, Slice 1b-2
+Task 4 prerequisites, the exact accepted Stage 3A3 GREEN6 pair, and the
+dual-kernel-qualified MVP lifecycle fixes through `ae8494d` are integrated on
+`main` by `b71b4f2`. The combined tree passes all four locked workspace gates.
+The frozen MVP candidate passed the six-row semantic/privacy/cleanup campaign
+on Jammy 5.15 and Noble 6.8. The tree remains unreleased; exact-tip CI,
+packaging, final security review, and release gates are still pending. See the tracked
 [productization evidence index](../reports/2026-08-31-productization-evidence-index.md)
 for exact commits, hashes, preserved worktrees, runtime evidence, and claim
 boundaries.

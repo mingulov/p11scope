@@ -162,7 +162,7 @@ if [ "${1-}" = "--self-test" ]; then
     exit 0
 fi
 
-MODULE=/usr/lib/softhsm/libsofthsm2.so
+MODULE=${P11SCOPE_PKCS11_MODULE:-/usr/lib/softhsm/libsofthsm2.so}
 WORK=target/inspect
 PTRACER_PID=
 PLAIN_PID=

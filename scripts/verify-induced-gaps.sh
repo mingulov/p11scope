@@ -14,7 +14,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-MODULE=/usr/lib/softhsm/libsofthsm2.so
+MODULE=${P11SCOPE_PKCS11_MODULE:-/usr/lib/softhsm/libsofthsm2.so}
 WORK=${P11SCOPE_TASK4_WORK:-target/induced-gaps}
 FIX=scripts/fixtures
 . scripts/lib.sh

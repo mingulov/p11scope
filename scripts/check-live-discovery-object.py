@@ -143,21 +143,29 @@ def production_source_contract(source):
     if worker_region.count("classify_direct_interface(") != 1:
         fail("interface-list worker must call the direct classifier exactly once")
     for marker in [
-        "interface_continuation_pack(count, 0)",
+        "interface_continuation_pack(count, 0, symbol_id)",
         "active_count == 0",
         "state.arg0 == 0",
         "checked_add((active_count - 1) * 24)",
-        "DISCOVERY_STATE\n        .insert(&key, &continuation, aya_ebpf::bindings::BPF_EXIST as u64)",
+        "take_export_state(&ctx, scope.is_some())",
+        "StateKey {",
+        "attach_cookie: 0",
+        "aya_ebpf::bindings::BPF_NOEXIST as u64",
         "TAIL_CALLS.tail_call(&ctx, TAIL_CALLS_INTERFACE_WORKER_SLOT)",
         "fail_export_state(&key)",
     ]:
         if marker not in return_region:
             fail(f"interface-list return contract missing {marker!r}")
+    if "export_state_key(&ctx)" in worker_region:
+        fail("interface-list worker must not use the attach-cookie helper")
     for marker in [
-        "export_state_key(&ctx)",
+        "StateKey {",
+        "pid_tgid: helpers::bpf_get_current_pid_tgid()",
+        "attach_cookie: 0",
         "interface_continuation_unpack(state.arg1)",
         "DISCOVERY_STATE.get(&key)",
         "DISCOVERY_INTERFACES",
+        "(u64::from(symbol_id) << 32)",
         "interface_continuation_next(state.arg1)",
         "DISCOVERY_STATE\n        .insert(&key, &continuation, aya_ebpf::bindings::BPF_EXIST as u64)",
         "TAIL_CALLS.tail_call(&ctx, TAIL_CALLS_INTERFACE_WORKER_SLOT)",
@@ -668,20 +676,20 @@ def interface_tail_contract(disassembly):
         return False
     if not re.search(r"\bif r\d+ > r\d+ goto", return_block):
         return False
-    if not re.search(r"\br\d+ = 0x2\b", return_block):
+    if not re.search(r"\br4 = 0x1\b", return_block):
         return False
     if not re.search(r"\bcall 0x2\b", return_block):
         return False
-    if not re.search(r"\br\d+ = 0x2\b", worker_block):
+    if not re.search(r"\br4 = 0x2\b", worker_block):
         return False
     if not re.search(r"\bcall 0x2\b", worker_block):
         return False
-    if not re.search(r"\bcall 0xae\b", worker_block):
+    if re.search(r"\bcall 0xae\b", worker_block):
         return False
     if not (
-        re.search(r"\bif r\d+ > 0xffffffffff goto", worker_block)
+        re.search(r"\bif r\d+ > 0xffffff goto", worker_block)
         or (
-            re.search(r"\br\d+ = 0xffffffffff\b", worker_block)
+            re.search(r"\br\d+ = 0xffffff\b", worker_block)
             and re.search(r"\bif r\d+ > r\d+ goto", worker_block)
         )
     ):
@@ -724,12 +732,16 @@ def cookie_object_contract(disassembly):
     )
     for name in export_programs:
         block = "\n".join(blocks.get(name, []))
+        if name == "interface_list_worker":
+            if re.search(r"\bcall 0xae\b", block):
+                return False
+            continue
         if (
             len(re.findall(r"\bcall 0xae\b", block)) != 2
             or "= -0x100000000 ll" not in block
             or "= -0xffffffff ll" not in block
             or (
-                name != "interface_list_worker"
+                name != "interface_list_return"
                 and re.search(r"(?:s)?>>= 0x20\b", block)
             )
         ):
@@ -1124,11 +1136,8 @@ def _cookie_disassembly():
         "interface_return",
     )
     worker = """0000000000001000 <interface_list_worker>:
-       0:\tcall 0xae
-       1:\tr1 = -0x100000000 ll
-       3:\tr1 = -0xffffffff ll
-       5:\tcall 0xae
-       6:\texit"""
+       0:\tcall 0x1
+       1:\texit"""
     return "\n".join([loader] + [export.format(name=name) for name in names] + [worker])
 
 
@@ -1149,7 +1158,7 @@ def _tail_disassembly():
        2:\tif r2 == 0x0 goto +0x7
        3:\tif r2 > r3 goto +0x6
 		0000000000000020:  R_BPF_64_64\tDISCOVERY_STATE
-       4:\tr4 = 0x2
+       4:\tr4 = 0x1
        5:\tcall 0x2
        6:\tr2 = 0x0
 		0000000000000038:  R_BPF_64_64\tTAIL_CALLS
@@ -1165,12 +1174,12 @@ def _tail_disassembly():
       14:\t*(u64 *)(r0 + 0x0) = r1
       15:\texit
 0000000000000060 <interface_list_worker>:
-      12:\tcall 0xae
+      12:\tcall 0x1
       13:\tcall 0x1
 		0000000000000070:  R_BPF_64_64\tDISCOVERY_STATE
 		0000000000000080:  R_BPF_64_64\tDISCOVERY_STATE
       14:\tif r0 == 0x0 goto +0xd
-      15:\tif r8 > 0xffffffffff goto +0xc
+      15:\tif r8 > 0xffffff goto +0xc
       16:\tr1 = 0x10
       17:\tif r1 > 0xf goto +0xa
       18:\tif r1 >= r2 goto +0x9
@@ -1489,11 +1498,11 @@ def self_test():
     for label, mutation in [
         ("return tail slot", tail.replace("r2 = 0x0", "r2 = 0x1", 1)),
         ("worker tail slot", tail.replace("      23:\tr2 = 0x0", "      23:\tr2 = 0x1", 1)),
-        ("return BPF_EXIST", tail.replace("       4:\tr4 = 0x2", "       4:\tr4 = 0x1", 1)),
+        ("return BPF_NOEXIST", tail.replace("       4:\tr4 = 0x1", "       4:\tr4 = 0x2", 1)),
         ("worker BPF_EXIST", tail.replace("      21:\tr4 = 0x2", "      21:\tr4 = 0x1", 1)),
         ("return fallthrough cleanup", tail.replace("       8:\tcall 0x3\n", "", 1)),
         ("worker fallthrough cleanup", tail.replace("      25:\tcall 0x3\n", "", 1)),
-        ("worker cookie", tail.replace("      12:\tcall 0xae\n", "", 1)),
+        ("worker cookie", tail.replace("      12:\tcall 0x1\n", "      12:\tcall 0xae\n", 1)),
         ("worker index cap", tail.replace("if r1 > 0xf", "if r1 > 0x10", 1)),
         ("worker active-count gate", tail.replace("if r1 >= r2", "if r1 > r2", 1)),
         ("worker classifier", tail.replace("      19:\tcall 0x1c", "      19:\tcall 0x1b", 1)),

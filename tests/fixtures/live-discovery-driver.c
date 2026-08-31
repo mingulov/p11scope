@@ -46,12 +46,14 @@ typedef struct {
     void *pFunctionList;
     CK_FLAGS flags;
 } CK_INTERFACE;
+typedef CK_INTERFACE *CK_INTERFACE_PTR;
+typedef CK_INTERFACE_PTR *CK_INTERFACE_PTR_PTR;
 
 #define P11SCOPE_FIXTURE_MAX_INTERFACES 17
 
 typedef CK_RV (*get_function_list_fn)(void **);
 typedef CK_RV (*get_interface_list_fn)(CK_INTERFACE *, CK_ULONG *);
-typedef CK_RV (*get_interface_fn)(void *, void *, void **, CK_FLAGS);
+typedef CK_RV (*get_interface_fn)(void *, void *, CK_INTERFACE_PTR_PTR, CK_FLAGS);
 
 #define EXIT_USAGE 2
 #define EXIT_GATE 3
@@ -114,8 +116,11 @@ static int drive(struct provider_surfaces surfaces, long repeat) {
             return EXIT_SURFACE;
         }
         if (expected != 0) {
-            table = NULL;
-            if (surfaces.get_interface(NULL, NULL, &table, 0) != 0 || table == NULL) {
+            CK_INTERFACE_PTR interface = NULL;
+            if (surfaces.get_interface(NULL, NULL, &interface, 0) != 0 ||
+                interface == NULL || interface->pInterfaceName == NULL ||
+                strcmp(interface->pInterfaceName, "PKCS 11") != 0 ||
+                interface->pFunctionList == NULL || interface->flags != 0) {
                 return EXIT_SURFACE;
             }
         }
@@ -126,7 +131,8 @@ static int drive(struct provider_surfaces surfaces, long repeat) {
 #if defined(P11SCOPE_DRIVER_NEEDED)
 extern CK_RV C_GetFunctionList(void **out);
 extern CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count);
-extern CK_RV C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags);
+extern CK_RV C_GetInterface(void *name, void *version, CK_INTERFACE_PTR_PTR out,
+                            CK_FLAGS flags);
 #endif
 
 static int drive_dlopened(const char *path, long repeat) {

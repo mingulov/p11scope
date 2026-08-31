@@ -280,23 +280,32 @@ pub const fn discovery_state_take_failed(state_present: bool, removed: bool) -> 
     !state_present || !removed
 }
 
-/// Pack the bounded interface-list count and index into the private state.
-/// Values above the ABI's u32 count saturate; the upper 24 bits stay zero.
-pub const fn interface_continuation_pack(announced_count: u64, index: u8) -> u64 {
+/// Pack the export identity, bounded interface-list count, and index.
+/// Values above the ABI's u32 count saturate. Zero and oversized symbol IDs
+/// fail closed because only 24 bits remain after the count and index.
+pub const fn interface_continuation_pack(
+    announced_count: u64,
+    index: u8,
+    symbol_id: u32,
+) -> Option<u64> {
+    if symbol_id == 0 || symbol_id > 0x00ff_ffff {
+        return None;
+    }
     let saturated_count = if announced_count > u32::MAX as u64 {
         u32::MAX
     } else {
         announced_count as u32
     };
-    ((saturated_count as u64) << 8) | index as u64
+    Some(((symbol_id as u64) << 40) | ((saturated_count as u64) << 8) | index as u64)
 }
 
-/// Decode a continuation only when its reserved bits and finite bounds hold.
-pub const fn interface_continuation_unpack(value: u64) -> Option<(u32, u8)> {
-    if value >> 40 != 0 {
+/// Decode a continuation only when its identity and finite bounds hold.
+pub const fn interface_continuation_unpack(value: u64) -> Option<(u32, u8, u32)> {
+    let symbol_id = (value >> 40) as u32;
+    if symbol_id == 0 {
         return None;
     }
-    let announced_count = (value >> 8) as u32;
+    let announced_count = ((value >> 8) & u32::MAX as u64) as u32;
     let index = value as u8;
     let active_count = if announced_count < DISCOVERY_INTERFACES as u32 {
         announced_count
@@ -306,13 +315,13 @@ pub const fn interface_continuation_unpack(value: u64) -> Option<(u32, u8)> {
     if index >= DISCOVERY_INTERFACES || index as u32 >= active_count {
         None
     } else {
-        Some((announced_count, index))
+        Some((announced_count, index, symbol_id))
     }
 }
 
 /// Advance a valid continuation, or finish after its last bounded interface.
 pub const fn interface_continuation_next(value: u64) -> Option<u64> {
-    let Some((announced_count, index)) = interface_continuation_unpack(value) else {
+    let Some((announced_count, index, symbol_id)) = interface_continuation_unpack(value) else {
         return None;
     };
     let next = index + 1;
@@ -324,7 +333,7 @@ pub const fn interface_continuation_next(value: u64) -> Option<u64> {
     if next as u32 >= active_count {
         None
     } else {
-        Some(interface_continuation_pack(announced_count as u64, next))
+        interface_continuation_pack(announced_count as u64, next, symbol_id)
     }
 }
 
@@ -1117,62 +1126,76 @@ mod tests {
     fn interface_continuation_packs_decodes_and_progresses() {
         assert_eq!(TAIL_CALLS_INTERFACE_WORKER_SLOT, 0);
         assert_eq!(TAIL_CALLS_TEMPLATE_SECOND_SLOT, 1);
-        assert_eq!(interface_continuation_pack(1, 0), 1u64 << 8);
-        assert_eq!(interface_continuation_pack(16, 15), (16u64 << 8) | 15);
-        assert_eq!(interface_continuation_pack(17, 0), 17u64 << 8);
+        let symbol_id = 0x00ab_cdef;
         assert_eq!(
-            interface_continuation_pack(u64::from(u32::MAX), 0),
-            u64::from(u32::MAX) << 8
+            interface_continuation_pack(1, 0, symbol_id),
+            Some((u64::from(symbol_id) << 40) | (1u64 << 8))
         );
         assert_eq!(
-            interface_continuation_pack(u64::MAX, 15),
-            (u64::from(u32::MAX) << 8) | 15
+            interface_continuation_pack(16, 15, symbol_id),
+            Some((u64::from(symbol_id) << 40) | (16u64 << 8) | 15)
         );
+        assert_eq!(
+            interface_continuation_pack(17, 0, symbol_id),
+            Some((u64::from(symbol_id) << 40) | (17u64 << 8))
+        );
+        assert_eq!(
+            interface_continuation_pack(u64::from(u32::MAX), 0, symbol_id),
+            Some((u64::from(symbol_id) << 40) | (u64::from(u32::MAX) << 8))
+        );
+        assert_eq!(
+            interface_continuation_pack(u64::MAX, 15, symbol_id),
+            Some((u64::from(symbol_id) << 40) | (u64::from(u32::MAX) << 8) | 15)
+        );
+        assert_eq!(interface_continuation_pack(1, 0, 0), None);
+        assert_eq!(interface_continuation_pack(1, 0, 0x0100_0000), None);
 
         assert_eq!(
-            interface_continuation_unpack(interface_continuation_pack(1, 0)),
-            Some((1, 0))
+            interface_continuation_unpack(interface_continuation_pack(1, 0, symbol_id).unwrap()),
+            Some((1, 0, symbol_id))
         );
         assert_eq!(
-            interface_continuation_unpack(interface_continuation_pack(16, 15)),
-            Some((16, 15))
+            interface_continuation_unpack(interface_continuation_pack(16, 15, symbol_id).unwrap()),
+            Some((16, 15, symbol_id))
         );
         assert_eq!(
-            interface_continuation_unpack(interface_continuation_pack(17, 15)),
-            Some((17, 15))
+            interface_continuation_unpack(interface_continuation_pack(17, 15, symbol_id).unwrap()),
+            Some((17, 15, symbol_id))
         );
         assert_eq!(
-            interface_continuation_unpack(interface_continuation_pack(u64::MAX, 15)),
-            Some((u32::MAX, 15))
+            interface_continuation_unpack(
+                interface_continuation_pack(u64::MAX, 15, symbol_id).unwrap()
+            ),
+            Some((u32::MAX, 15, symbol_id))
         );
         assert_eq!(
-            interface_continuation_unpack(interface_continuation_pack(1, 15)),
+            interface_continuation_unpack(interface_continuation_pack(1, 15, symbol_id).unwrap()),
             None
         );
         assert_eq!(
-            interface_continuation_unpack(interface_continuation_pack(16, 16)),
+            interface_continuation_unpack(interface_continuation_pack(16, 16, symbol_id).unwrap()),
             None
         );
         assert_eq!(
-            interface_continuation_unpack(interface_continuation_pack(0, 0)),
+            interface_continuation_unpack(interface_continuation_pack(0, 0, symbol_id).unwrap()),
             None
         );
         assert_eq!(interface_continuation_unpack(1u64 << 40), None);
 
         assert_eq!(
-            interface_continuation_next(interface_continuation_pack(1, 0)),
+            interface_continuation_next(interface_continuation_pack(1, 0, symbol_id).unwrap()),
             None
         );
         assert_eq!(
-            interface_continuation_next(interface_continuation_pack(16, 14)),
-            Some(interface_continuation_pack(16, 15))
+            interface_continuation_next(interface_continuation_pack(16, 14, symbol_id).unwrap()),
+            Some(interface_continuation_pack(16, 15, symbol_id).unwrap())
         );
         assert_eq!(
-            interface_continuation_next(interface_continuation_pack(16, 15)),
+            interface_continuation_next(interface_continuation_pack(16, 15, symbol_id).unwrap()),
             None
         );
         assert_eq!(
-            interface_continuation_next(interface_continuation_pack(17, 15)),
+            interface_continuation_next(interface_continuation_pack(17, 15, symbol_id).unwrap()),
             None
         );
     }

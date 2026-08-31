@@ -1,7 +1,14 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::process::Command;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -549,6 +556,3435 @@ fn run_ok(program: &str, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).expect("command stdout is UTF-8")
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Task4AnchorIdentity {
+    pid: u32,
+    starttime: u64,
+    pgid: u32,
+}
+
+#[derive(Debug)]
+struct Task4AuditFrame {
+    raw: String,
+    sequence: u64,
+    fields: Vec<String>,
+}
+
+const TASK4_FACT_SCHEMA_V1_DIGEST: &str =
+    "e212fd00c0e3063c206688524c2a395bd44c7bb2f3fecd22abe0df712b817250";
+const TASK4_TRIPWIRE_COMMANDS: &[&str] = &[
+    "bpftool",
+    "cargo",
+    "docker",
+    "file",
+    "p11scope",
+    "p11scope-discover",
+    "rustup",
+    "setpriv",
+    "sudo",
+    "systemctl",
+    "systemd-run",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Task4CaseEvent {
+    Started,
+    OwnerEntered,
+    FinalizerEntered,
+    PublisherEntered,
+    PublisherIsolated,
+    Reaped,
+}
+
+impl Task4CaseEvent {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "case-started" => Ok(Self::Started),
+            "owner-entered" => Ok(Self::OwnerEntered),
+            "finalizer-entered" => Ok(Self::FinalizerEntered),
+            "publisher-entered" => Ok(Self::PublisherEntered),
+            "publisher-isolated" => Ok(Self::PublisherIsolated),
+            "case-reaped" => Ok(Self::Reaped),
+            _ => Err(format!("unknown Task 4 case event: {value:?}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Task4OutcomeClass {
+    P77,
+    N97,
+    I97,
+    SigInt,
+    SigHup,
+    SigTerm,
+    R97,
+    S0,
+}
+
+impl Task4OutcomeClass {
+    fn sequence(self) -> &'static [Task4CaseEvent] {
+        const REFUSAL: &[Task4CaseEvent] = &[Task4CaseEvent::Started, Task4CaseEvent::Reaped];
+        const FULL: &[Task4CaseEvent] = &[
+            Task4CaseEvent::Started,
+            Task4CaseEvent::OwnerEntered,
+            Task4CaseEvent::FinalizerEntered,
+            Task4CaseEvent::PublisherEntered,
+            Task4CaseEvent::PublisherIsolated,
+            Task4CaseEvent::Reaped,
+        ];
+        match self {
+            Self::P77 => REFUSAL,
+            _ => FULL,
+        }
+    }
+
+    fn terminal(self) -> (Task4ReceiptStatus, u8) {
+        match self {
+            Self::P77 => (Task4ReceiptStatus::None, 77),
+            Self::N97 => (Task4ReceiptStatus::None, 97),
+            Self::I97 => (Task4ReceiptStatus::Invalid, 97),
+            Self::SigInt => (Task4ReceiptStatus::Code(130), 130),
+            Self::SigHup => (Task4ReceiptStatus::Code(129), 129),
+            Self::SigTerm => (Task4ReceiptStatus::Code(143), 143),
+            Self::R97 => (Task4ReceiptStatus::Code(97), 97),
+            Self::S0 => (Task4ReceiptStatus::Code(0), 0),
+        }
+    }
+}
+
+fn task4_outcome_class(case: &str) -> Task4OutcomeClass {
+    if matches!(
+        case,
+        "existing-root-rejected-status-77-no-touch-before-body"
+            | "nonprivate-parent-rejected-status-77-no-touch-before-body"
+            | "symlink-root-rejected-status-77-no-touch-before-body"
+            | "foreign-root-rejected-status-77-no-touch-before-body"
+            | "root-preflight-blocks-body-cargo-runtime"
+            | "lock-contention-status-77-blocks-body-cargo-runtime"
+            | "rootless-invalid-root-and-poisoned-environment-reach-no-mutator"
+            | "public-body-reentry-rejected"
+            | "explicit-pwd-work-composition-rejected-before-mutation"
+            | "stdout-capture-substitution-rejected"
+            | "glob-first-observed-selection-rejected"
+            | "find-mode-repair-rejected"
+            | "caller-path-overrides-rejected-before-mutation"
+            | "bare-observer-rejected"
+            | "path-observer-rejected"
+            | "outside-ROOT-work-target-release-observer-rejected"
+            | "cargo-not-Rust-1.88-rejected"
+            | "cargo-without-locked-workspace-release-rejected"
+    ) || case.ends_with("-rejected-before-mutation")
+    {
+        Task4OutcomeClass::P77
+    } else if matches!(
+        case,
+        "missing-status-rejected"
+            | "success-pending-write-failure-rejected-nonzero-status-last-once"
+            | "success-pending-fsync-failure-rejected-nonzero-status-last-once"
+            | "terminal-renameat2-noreplace-collision-rejected"
+            | "terminal-renameat2-unavailable-rejected"
+    ) {
+        Task4OutcomeClass::N97
+    } else if matches!(
+        case,
+        "early-status-rejected"
+            | "duplicate-status-rejected"
+            | "foreign-terminal-artifact-rejected"
+    ) {
+        Task4OutcomeClass::I97
+    } else if case.starts_with("signal-INT-") {
+        Task4OutcomeClass::SigInt
+    } else if case.starts_with("signal-HUP-") {
+        Task4OutcomeClass::SigHup
+    } else if case.starts_with("signal-TERM-") {
+        Task4OutcomeClass::SigTerm
+    } else if case.ends_with("-rejected")
+        || case.contains("-rejected-")
+        || case.contains("-mutation-rejected")
+        || matches!(
+            case,
+            "cleanup-failure-upgrades-terminal-status-and-is-written-last"
+                | "cleanup-failure-upgrades-one-status-written-last"
+                | "absence-query-failure-upgrades-terminal-status-and-is-written-last"
+                | "identity-mismatch-upgrades-terminal-status-and-is-written-last"
+        )
+    {
+        Task4OutcomeClass::R97
+    } else {
+        Task4OutcomeClass::S0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Task4IdentityField {
+    None,
+    Identity((u64, u64)),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Task4ReceiptStatus {
+    None,
+    Invalid,
+    Code(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Task4WaitStatus {
+    None,
+    Code(u8),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Task4CaseFrame {
+    sequence: u64,
+    event: Task4CaseEvent,
+    ordinal: usize,
+    case: String,
+    child_pid: u32,
+    child_starttime: u64,
+    root: Task4IdentityField,
+    receipt: Task4ReceiptStatus,
+    wait: Task4WaitStatus,
+    publisher_exe: Task4IdentityField,
+}
+
+#[derive(Debug)]
+struct Task4ObservedResult {
+    _fixture: tempfile::TempDir,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    trace: String,
+    identity: Task4AnchorIdentity,
+    socket_identity: (u64, u64),
+    report: Vec<u8>,
+    tripwire: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Task4FileIdentity {
+    dev: u64,
+    ino: u64,
+    uid: u32,
+    mode: u32,
+    nlink: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Task4SnapshotKind {
+    Directory,
+    Regular,
+    Symlink,
+    Fifo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Task4SnapshotEntry {
+    kind: Task4SnapshotKind,
+    dev: u64,
+    ino: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    nlink: u64,
+    size: u64,
+    content: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Task4PublisherSnapshot {
+    tree: BTreeMap<String, Task4SnapshotEntry>,
+    descriptors: BTreeMap<i32, (u64, u64)>,
+    executable: (u64, u64),
+}
+
+#[derive(Debug)]
+struct Task4P77Fixture {
+    path: Option<PathBuf>,
+    snapshot: BTreeMap<String, Task4SnapshotEntry>,
+    lock: Option<File>,
+}
+
+struct Task4CaseState {
+    child: Task4ProcessIdentity,
+    root: Option<(u64, u64)>,
+    publisher: Option<Task4PublisherSnapshot>,
+    fixture: Option<Task4P77Fixture>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Task4ProcessIdentity {
+    pid: u32,
+    starttime: u64,
+    ppid: u32,
+    pgid: u32,
+    state: char,
+}
+
+struct Task4ObservedSession {
+    fixture: Option<tempfile::TempDir>,
+    peer: UnixStream,
+    anchor: Option<Child>,
+    identity: Task4AnchorIdentity,
+    socket_identity: (u64, u64),
+    supervisor: Option<Task4ProcessIdentity>,
+    fifo_identities: Option<((u64, u64), (u64, u64))>,
+    nonce: String,
+    pending: Option<Task4AuditFrame>,
+    next_sequence: u64,
+    complete_acked: bool,
+    stdout_path: std::path::PathBuf,
+    stderr_path: std::path::PathBuf,
+    trace_path: std::path::PathBuf,
+    report_path: std::path::PathBuf,
+    tripwire_path: std::path::PathBuf,
+    work_path: std::path::PathBuf,
+    work_identity: Task4FileIdentity,
+    shell_identity: (u64, u64),
+    python_identity: (u64, u64),
+    fake_bin_path: PathBuf,
+    fake_bin_snapshot: BTreeMap<String, Task4SnapshotEntry>,
+    stdout: File,
+    stderr: File,
+    trace: File,
+    stdout_identity: Task4FileIdentity,
+    stderr_identity: Task4FileIdentity,
+    trace_identity: Task4FileIdentity,
+    report_identity: Option<Task4FileIdentity>,
+    tripwire_identity: Option<Task4FileIdentity>,
+    trace_len: u64,
+}
+
+const TASK4_OBSERVED_ANCHOR: &str = r#"
+import os
+import subprocess
+import sys
+import time
+
+script = sys.argv[1]
+args = sys.argv[2:]
+
+def group_members():
+    members = []
+    pgid = os.getpgrp()
+    for name in os.listdir("/proc"):
+        if not name.isdigit() or int(name) == os.getpid():
+            continue
+        try:
+            stat = open("/proc/" + name + "/stat").read()
+            fields = stat[stat.rfind(")") + 2:].split()
+            if int(fields[2]) == pgid:
+                members.append(int(name))
+        except (OSError, ValueError, IndexError):
+            pass
+    return sorted(members)
+
+try:
+    os.umask(0o077)
+    env = os.environ.copy()
+    env["P11SCOPE_TASK4_SELF_TEST_ANCHOR_PGID"] = str(os.getpid())
+    child = subprocess.Popen(["/bin/sh", script] + args,
+                             close_fds=True, pass_fds=(5,), env=env)
+    os.close(5)
+    status = child.wait()
+    first = group_members()
+    time.sleep(0.01)
+    second = group_members()
+    if first or second:
+        sys.stderr.write("anchor process-group residue\\n")
+        sys.stderr.flush()
+        while True:
+            time.sleep(3600)
+    if status < 0:
+        status = 128 + (-status)
+    os._exit(status & 255)
+except BaseException as error:
+    try:
+        os.close(5)
+    except OSError:
+        pass
+    sys.stderr.write("anchor failure: %s\\n" % error)
+    os._exit(125)
+"#;
+
+fn task4_nonce() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    File::open("/dev/urandom")
+        .map_err(|error| format!("open nonce source: {error}"))?
+        .read_exact(&mut bytes)
+        .map_err(|error| format!("read nonce source: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn task4_proc_starttime(pid: u32) -> Option<u64> {
+    task4_proc_identity(pid).map(|identity| identity.starttime)
+}
+
+fn task4_proc_identity(pid: u32) -> Option<Task4ProcessIdentity> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat
+        .get(stat.rfind(')')? + 2..)?
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    Some(Task4ProcessIdentity {
+        pid,
+        state: fields.first()?.chars().next()?,
+        ppid: fields.get(1)?.parse().ok()?,
+        pgid: fields.get(2)?.parse().ok()?,
+        starttime: fields.get(19)?.parse().ok()?,
+    })
+}
+
+fn task4_canonical_u64(value: &str, field: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| format!("{field} is not unsigned decimal: {value:?}"))?;
+    if parsed.to_string() != value {
+        return Err(format!(
+            "{field} is not canonical unsigned decimal: {value:?}"
+        ));
+    }
+    Ok(parsed)
+}
+
+fn task4_canonical_u32(value: &str, field: &str) -> Result<u32, String> {
+    u32::try_from(task4_canonical_u64(value, field)?)
+        .map_err(|_| format!("{field} exceeds u32: {value:?}"))
+}
+
+fn task4_dev_ino(value: &str, field: &str) -> Result<(u64, u64), String> {
+    let (dev, ino) = value
+        .split_once(':')
+        .ok_or_else(|| format!("{field} is not DEV:INO: {value:?}"))?;
+    if ino.contains(':') {
+        return Err(format!("{field} is not one DEV:INO pair: {value:?}"));
+    }
+    Ok((
+        task4_canonical_u64(dev, field)?,
+        task4_canonical_u64(ino, field)?,
+    ))
+}
+
+fn task4_code(value: &str, field: &str) -> Result<u8, String> {
+    u8::try_from(task4_canonical_u64(value, field)?)
+        .map_err(|_| format!("{field} exceeds 255: {value:?}"))
+}
+
+fn task4_parse_case_frame(frame: &Task4AuditFrame) -> Result<Task4CaseFrame, String> {
+    if frame.fields.len() != 12 {
+        return Err(format!(
+            "case frame has {} fields instead of 12: {:?}",
+            frame.fields.len(),
+            frame.raw
+        ));
+    }
+    let root = if frame.fields[8] == "none" {
+        Task4IdentityField::None
+    } else {
+        Task4IdentityField::Identity(task4_dev_ino(&frame.fields[8], "root identity")?)
+    };
+    let receipt = match frame.fields[9].as_str() {
+        "none" => Task4ReceiptStatus::None,
+        "invalid" => Task4ReceiptStatus::Invalid,
+        value => Task4ReceiptStatus::Code(task4_code(value, "receipt status")?),
+    };
+    let wait = match frame.fields[10].as_str() {
+        "none" => Task4WaitStatus::None,
+        value => Task4WaitStatus::Code(task4_code(value, "child wait status")?),
+    };
+    let publisher_exe = if frame.fields[11] == "-" {
+        Task4IdentityField::None
+    } else {
+        Task4IdentityField::Identity(task4_dev_ino(
+            &frame.fields[11],
+            "publisher executable identity",
+        )?)
+    };
+    Ok(Task4CaseFrame {
+        sequence: frame.sequence,
+        event: Task4CaseEvent::parse(&frame.fields[3])?,
+        ordinal: usize::try_from(task4_canonical_u64(&frame.fields[4], "case ordinal")?)
+            .map_err(|_| "case ordinal exceeds usize".to_owned())?,
+        case: frame.fields[5].clone(),
+        child_pid: task4_canonical_u32(&frame.fields[6], "case child PID")?,
+        child_starttime: task4_canonical_u64(&frame.fields[7], "case child starttime")?,
+        root,
+        receipt,
+        wait,
+        publisher_exe,
+    })
+}
+
+fn task4_validate_report(bytes: &[u8], cases: &[&str], schema_digest: &str) -> Result<(), String> {
+    if !bytes.ends_with(b"\n") {
+        return Err("Task 4 report is not LF-terminated".to_owned());
+    }
+    let contents = std::str::from_utf8(bytes)
+        .map_err(|error| format!("Task 4 report is not UTF-8: {error}"))?;
+    let mut observed = Vec::new();
+    let mut complete = 0usize;
+    for line in contents.lines() {
+        if line.len() > 4096
+            || !line
+                .bytes()
+                .all(|byte| byte == b'\t' || (0x20..=0x7e).contains(&byte))
+        {
+            return Err(format!(
+                "Task 4 report contains non-canonical row: {line:?}"
+            ));
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        match fields.as_slice() {
+            ["selftest-v1", "complete"] => complete += 1,
+            ["selftest-v1", "case", case, expected, actual]
+                if !case.is_empty()
+                    && expected == actual
+                    && *expected
+                        == if case.starts_with("facts-schema-v1-schema.sha256-") {
+                            schema_digest
+                        } else {
+                            "OK"
+                        } =>
+            {
+                observed.push(*case);
+            }
+            _ => return Err(format!("Task 4 report contains malformed row: {line:?}")),
+        }
+    }
+    if complete != 1 || contents.lines().last() != Some("selftest-v1\tcomplete") {
+        return Err("Task 4 report must end with one complete row".to_owned());
+    }
+    if observed != cases {
+        return Err(format!(
+            "Task 4 report case order differs: expected={cases:?}, actual={observed:?}"
+        ));
+    }
+    if contents.matches("schema.sha256").count() != 1
+        || contents.matches(schema_digest).count() != 2
+    {
+        return Err("Task 4 report schema digest cardinality differs".to_owned());
+    }
+    Ok(())
+}
+
+fn task4_validate_driver_source(script: &str) -> Result<(), String> {
+    let source = read(script);
+    for banned in [
+        "P11SCOPE_TASK4_BODY",
+        "$PWD/$WORK",
+        "stdout-as-capture",
+        "stdout_capture",
+    ] {
+        if source.contains(banned) {
+            return Err(format!("{script} retains forbidden bypass {banned:?}"));
+        }
+    }
+    Ok(())
+}
+
+fn task4_sha256(bytes: &[u8]) -> String {
+    const INITIAL: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    const ROUND: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let bit_len = (bytes.len() as u64).wrapping_mul(8);
+    let mut padded = bytes.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+    let mut hash = INITIAL;
+    for block in padded.chunks_exact(64) {
+        let mut words = [0u32; 64];
+        for (index, word) in words[..16].iter_mut().enumerate() {
+            *word = u32::from_be_bytes(block[index * 4..index * 4 + 4].try_into().unwrap());
+        }
+        for index in 16..64 {
+            let s0 = words[index - 15].rotate_right(7)
+                ^ words[index - 15].rotate_right(18)
+                ^ (words[index - 15] >> 3);
+            let s1 = words[index - 2].rotate_right(17)
+                ^ words[index - 2].rotate_right(19)
+                ^ (words[index - 2] >> 10);
+            words[index] = words[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(words[index - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = hash;
+        for index in 0..64 {
+            let sum1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choice = (e & f) ^ (!e & g);
+            let temporary1 = h
+                .wrapping_add(sum1)
+                .wrapping_add(choice)
+                .wrapping_add(ROUND[index])
+                .wrapping_add(words[index]);
+            let sum0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let temporary2 = sum0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temporary1);
+            d = c;
+            c = b;
+            b = a;
+            a = temporary1.wrapping_add(temporary2);
+        }
+        for (slot, value) in hash.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *slot = slot.wrapping_add(value);
+        }
+    }
+    hash.iter().map(|word| format!("{word:08x}")).collect()
+}
+
+fn task4_validate_success_facts(root: &Path, lane: &str, terminal: bool) -> Result<(), String> {
+    let path = root.join("facts.log");
+    let bytes = Task4ObservedSession::read_optional_file(&path, "main facts", 8 * 1024 * 1024)?;
+    if bytes.is_empty() || !bytes.ends_with(b"\n") {
+        return Err("successful case omitted an LF-terminated main facts stream".to_owned());
+    }
+    let text =
+        std::str::from_utf8(&bytes).map_err(|error| format!("main facts is not UTF-8: {error}"))?;
+    let mut facts = BTreeMap::new();
+    let mut observed_order = Vec::new();
+    for (sequence, line) in text.lines().enumerate() {
+        if sequence == 4096 || line.len() > 4096 {
+            return Err("main facts exceeded its record or line bound".to_owned());
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 4
+            || fields[0] != "facts-v1"
+            || task4_canonical_u64(fields[1], "facts sequence")? != sequence as u64
+            || fields[2].is_empty()
+            || fields[2].len() > 64
+            || !fields[2].bytes().enumerate().all(|(index, byte)| {
+                if index == 0 {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit()
+                } else {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'_' | b'.' | b'-')
+                }
+            })
+            || !fields[3].bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+        {
+            return Err(format!("non-canonical facts row: {line:?}"));
+        }
+        let value = fields[3].as_bytes();
+        let mut offset = 0usize;
+        while offset < value.len() {
+            if value[offset] == b'%' {
+                if offset + 2 >= value.len()
+                    || !value[offset + 1].is_ascii_digit()
+                        && !(b'A'..=b'F').contains(&value[offset + 1])
+                    || !value[offset + 2].is_ascii_digit()
+                        && !(b'A'..=b'F').contains(&value[offset + 2])
+                {
+                    return Err(format!(
+                        "facts value has malformed percent encoding: {line:?}"
+                    ));
+                }
+                offset += 3;
+            } else {
+                offset += 1;
+            }
+        }
+        if facts
+            .insert(fields[2].to_owned(), fields[3].to_owned())
+            .is_some()
+        {
+            return Err(format!("duplicate facts key {:?}", fields[2]));
+        }
+        observed_order.push(fields[2].to_owned());
+    }
+
+    let mut expected_order = [
+        "schema.sha256",
+        "receipt.argv",
+        "receipt.cwd",
+        "receipt.clean_env",
+        "time.start_utc",
+        "time.end_utc",
+        "host.uid",
+        "host.gid",
+        "host.kernel",
+        "source.head.start",
+        "source.head.end",
+        "source.tree.start",
+        "source.tree.end",
+        "source.tracked.start",
+        "source.tracked.end",
+        "source.untracked.start",
+        "source.untracked.end",
+        "source.exception_count",
+        "root.identity.start",
+        "root.identity.end",
+        "artifacts.identity.start",
+        "artifacts.identity.end",
+        "work.identity.start",
+        "work.identity.end",
+        "lock.identity",
+        "lock.holder_pid",
+        "lock.holder_starttime",
+        "tool.count",
+        "input.count",
+        "build_env.count",
+        "resource.count",
+        "artifact.count",
+        "body.result",
+        "signal.result",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    let mut expected = expected_order.iter().cloned().collect::<BTreeSet<_>>();
+    if terminal {
+        expected.insert("terminal_status_intent".to_owned());
+    }
+
+    let count = |key: &str| -> Result<usize, String> {
+        let value = facts
+            .get(key)
+            .ok_or_else(|| format!("facts omitted count key {key}"))?;
+        usize::try_from(task4_canonical_u64(value, key)?)
+            .map_err(|_| format!("facts count {key} exceeds usize"))
+    };
+    for (count_key, prefix, suffixes) in [
+        ("source.exception_count", "source.exception", vec![""]),
+        ("tool.count", "tool", vec![""]),
+        ("input.count", "input", vec!["start", "end"]),
+        ("build_env.count", "build_env", vec![""]),
+        (
+            "resource.count",
+            "resource",
+            vec!["requested", "resolved", "cleanup", "absence"],
+        ),
+        ("artifact.count", "artifact", vec!["creation", "final"]),
+    ] {
+        let cardinality = count(count_key)?;
+        if cardinality > 4096 {
+            return Err(format!("{count_key} exceeds 4096"));
+        }
+        for index in 0..cardinality {
+            for suffix in &suffixes {
+                expected.insert(if suffix.is_empty() {
+                    let key = format!("{prefix}.{index:03}");
+                    expected_order.push(key.clone());
+                    key
+                } else {
+                    let key = format!("{prefix}.{index:03}.{suffix}");
+                    expected_order.push(key.clone());
+                    key
+                });
+            }
+        }
+    }
+
+    let (lane_counts, lane_groups): (&[(&str, usize)], &[(&str, usize, &[&str])]) = match lane {
+        "lane07" => (
+            &[("lane07.case_count", 6), ("lane07.map_count", 8)],
+            &[
+                (
+                    "lane07.case",
+                    6,
+                    &[
+                        "name",
+                        "capture",
+                        "manifest",
+                        "checker",
+                        "exit",
+                        "observer",
+                        "bpf",
+                        "map_before",
+                        "map_after",
+                        "oracle",
+                    ],
+                ),
+                ("lane07.map", 8, &["name", "before", "after"]),
+            ],
+        ),
+        "lane09" => (
+            &[
+                ("lane09.capture_count", 3),
+                ("lane09.base_count", 1),
+                ("lane09.image_count", 1),
+                ("lane09.container_count", 2),
+            ],
+            &[
+                (
+                    "lane09.capture",
+                    3,
+                    &[
+                        "name",
+                        "capture",
+                        "checker",
+                        "cgroup",
+                        "product",
+                        "harness",
+                        "expected",
+                        "provider_view",
+                        "oracle",
+                    ],
+                ),
+                ("lane09.base", 1, &["requested", "resolved"]),
+                (
+                    "lane09.image",
+                    1,
+                    &["requested", "resolved", "cleanup", "absence"],
+                ),
+                (
+                    "lane09.container",
+                    2,
+                    &["requested", "resolved", "pid", "cleanup", "absence"],
+                ),
+            ],
+        ),
+        "lane10" => (
+            &[("lane10.fork_count", 1), ("lane10.capability_count", 4)],
+            &[
+                (
+                    "lane10.fork",
+                    1,
+                    &["capture", "oracle", "fifo", "unit", "cgroup", "process"],
+                ),
+                (
+                    "lane10.capability",
+                    4,
+                    &["caps", "argv", "exit", "document", "log", "scan_relation"],
+                ),
+            ],
+        ),
+        "lane11" => (
+            &[
+                ("lane11.report_count", 2),
+                ("lane11.private_count", 3),
+                ("lane11.oracle_count", 1),
+            ],
+            &[
+                (
+                    "lane11.report",
+                    2,
+                    &["name", "creation", "final", "snapshot"],
+                ),
+                (
+                    "lane11.private",
+                    3,
+                    &["name", "creation", "snapshot", "removal", "absence"],
+                ),
+                (
+                    "lane11.oracle",
+                    1,
+                    &["capture", "subset", "unit", "cgroup", "process"],
+                ),
+            ],
+        ),
+        "lane14" => (
+            &[
+                ("lane14.canary_count", 10),
+                ("lane14.image_count", 3),
+                ("lane14.container_count", 3),
+                ("lane14.smoke_count", 6),
+                ("lane14.dist_count", 4),
+                ("lane14.protocol_count", 1),
+            ],
+            &[
+                ("lane14.canary", 10, &["name", "artifacts", "oracle"]),
+                (
+                    "lane14.image",
+                    3,
+                    &["requested", "resolved", "packages", "cleanup", "absence"],
+                ),
+                (
+                    "lane14.container",
+                    3,
+                    &["requested", "resolved", "pid", "cleanup", "absence"],
+                ),
+                ("lane14.smoke", 6, &["name", "input", "output", "oracle"]),
+                (
+                    "lane14.dist",
+                    4,
+                    &["name", "creation", "final", "build_id", "linkage"],
+                ),
+                (
+                    "lane14.protocol",
+                    1,
+                    &[
+                        "journal", "payload", "ready", "ack", "creator", "facts", "cleanup",
+                    ],
+                ),
+            ],
+        ),
+        "lane16" => (
+            &[("lane16.row_count", 1)],
+            &[(
+                "lane16.row",
+                1,
+                &[
+                    "hammer",
+                    "checker",
+                    "provider",
+                    "cargo",
+                    "config",
+                    "softhsm",
+                    "observer",
+                    "bpf",
+                    "capture",
+                    "aggregate",
+                    "pause",
+                    "loss",
+                    "ambiguity",
+                    "in_flight",
+                    "child",
+                    "cleanup",
+                    "absence",
+                ],
+            )],
+        ),
+        _ => return Err(format!("unknown facts lane {lane:?}")),
+    };
+    for (key, value) in lane_counts {
+        let key = (*key).to_owned();
+        expected.insert(key.clone());
+        if count(&key)? != *value {
+            return Err(format!("{key} differs from fixed count {value}"));
+        }
+        expected_order.push(key);
+    }
+    for (prefix, cardinality, suffixes) in lane_groups {
+        for index in 0..*cardinality {
+            for suffix in *suffixes {
+                let key = format!("{prefix}.{index:03}.{suffix}");
+                expected.insert(key.clone());
+                expected_order.push(key);
+            }
+        }
+    }
+    if terminal {
+        expected_order.push("terminal_status_intent".to_owned());
+    }
+    if facts.get("schema.sha256").map(String::as_str) != Some(TASK4_FACT_SCHEMA_V1_DIGEST) {
+        return Err("facts schema digest differs".to_owned());
+    }
+    let actual = facts.keys().cloned().collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(format!(
+            "facts key set differs: missing={:?}, extra={:?}",
+            expected.difference(&actual).collect::<Vec<_>>(),
+            actual.difference(&expected).collect::<Vec<_>>()
+        ));
+    }
+    if observed_order != expected_order {
+        return Err("facts key order differs from facts-schema-v1".to_owned());
+    }
+
+    let value = |key: &str| -> Result<&str, String> {
+        facts
+            .get(key)
+            .map(String::as_str)
+            .ok_or_else(|| format!("facts omitted {key}"))
+    };
+    if value("receipt.clean_env")? != "true" {
+        return Err("receipt.clean_env is not true".to_owned());
+    }
+    if task4_canonical_u32(value("host.uid")?, "host.uid")? != unsafe { libc::geteuid() }
+        || task4_canonical_u32(value("host.gid")?, "host.gid")? != unsafe { libc::getegid() }
+    {
+        return Err("facts host identity differs from the observer".to_owned());
+    }
+    for (start, end) in [
+        ("source.head.start", "source.head.end"),
+        ("source.tree.start", "source.tree.end"),
+        ("source.tracked.start", "source.tracked.end"),
+        ("source.untracked.start", "source.untracked.end"),
+        ("root.identity.start", "root.identity.end"),
+        ("artifacts.identity.start", "artifacts.identity.end"),
+        ("work.identity.start", "work.identity.end"),
+    ] {
+        if value(start)?.is_empty() || value(start)? != value(end)? {
+            return Err(format!("facts {start}/{end} differ"));
+        }
+    }
+    for index in 0..count("input.count")? {
+        let start = format!("input.{index:03}.start");
+        let end = format!("input.{index:03}.end");
+        if value(&start)?.is_empty() || value(&start)? != value(&end)? {
+            return Err(format!("facts {start}/{end} differ"));
+        }
+    }
+    let artifacts = root.join("artifacts");
+    let work = root.join("work");
+    let lock = root
+        .parent()
+        .ok_or_else(|| "successful receipt root has no campaign parent".to_owned())?
+        .join(".task4.lock");
+    for (key, object) in [
+        ("root.identity.start", root),
+        ("artifacts.identity.start", artifacts.as_path()),
+        ("work.identity.start", work.as_path()),
+        ("lock.identity", lock.as_path()),
+    ] {
+        let metadata = fs::symlink_metadata(object)
+            .map_err(|error| format!("stat facts object {}: {error}", object.display()))?;
+        if task4_dev_ino(value(key)?, key)? != (metadata.dev(), metadata.ino()) {
+            return Err(format!(
+                "facts {key} does not identify {}",
+                object.display()
+            ));
+        }
+    }
+    task4_canonical_u32(value("lock.holder_pid")?, "lock.holder_pid")?;
+    task4_canonical_u64(value("lock.holder_starttime")?, "lock.holder_starttime")?;
+    if terminal && value("terminal_status_intent")? != "0" {
+        return Err("successful terminal_status_intent is not 0".to_owned());
+    }
+
+    let mut inventory = fs::read_dir(root)
+        .map_err(|error| format!("list successful receipt root: {error}"))?
+        .map(|entry| {
+            entry
+                .map_err(|error| format!("read successful receipt root entry: {error}"))
+                .and_then(|entry| {
+                    entry
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| "successful receipt root has a non-UTF-8 entry".to_owned())
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    inventory.sort();
+    let expected_inventory = if terminal {
+        vec![
+            "artifacts",
+            "facts.log",
+            "status",
+            "stderr.log",
+            "stdout.log",
+            "work",
+        ]
+    } else {
+        vec!["artifacts", "facts.log", "stderr.log", "stdout.log", "work"]
+    };
+    if inventory != expected_inventory {
+        return Err(format!(
+            "successful receipt inventory differs: {inventory:?}"
+        ));
+    }
+    if fs::read_dir(root.join("work"))
+        .map_err(|error| format!("list successful receipt work: {error}"))?
+        .next()
+        .is_some()
+    {
+        return Err("successful receipt retained private work".to_owned());
+    }
+    if terminal
+        && Task4ObservedSession::read_optional_file(&root.join("status"), "status", 4096)? != b"0\n"
+    {
+        return Err("successful terminal status is not exactly 0".to_owned());
+    }
+    Ok(())
+}
+
+fn task4_group_absent(pgid: u32) -> bool {
+    let result = unsafe { libc::kill(-(pgid as libc::pid_t), 0) };
+    result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+fn task4_group_pids(pgid: u32) -> Result<Vec<u32>, String> {
+    let mut pids = Vec::new();
+    for entry in fs::read_dir("/proc").map_err(|error| format!("list /proc: {error}"))? {
+        let entry = entry.map_err(|error| format!("read /proc entry: {error}"))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        if task4_proc_identity(pid).is_some_and(|identity| identity.pgid == pgid) {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    Ok(pids)
+}
+
+fn task4_send_frame(stream: &mut UnixStream, frame: &str) -> Result<(), String> {
+    let mut encoded = frame.as_bytes().to_vec();
+    encoded.push(b'\n');
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| format!("set audit write timeout: {error}"))?;
+    stream
+        .write_all(&encoded)
+        .map_err(|error| format!("write audit frame: {error}"))
+}
+
+fn task4_read_one_frame(
+    stream: &mut UnixStream,
+    stdout: &File,
+    stderr: &File,
+) -> Result<String, String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .map_err(|error| format!("set audit read timeout: {error}"))?;
+    let mut frame = Vec::new();
+    loop {
+        for (file, label) in [(stdout, "stdout"), (stderr, "stderr")] {
+            let metadata = file
+                .metadata()
+                .map_err(|error| format!("stat retained {label} capture: {error}"))?;
+            if metadata.len() > 1024 * 1024 {
+                return Err(format!("{label} capture exceeded 1 MiB"));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err("audit frame exceeded five-second timeout".to_owned());
+        }
+        let mut byte = [0u8; 1];
+        match stream.read(&mut byte) {
+            Ok(0) => return Err("audit peer closed before one LF-terminated frame".to_owned()),
+            Ok(1) if byte[0] == b'\n' => {
+                if frame.len() + 1 > 1024 {
+                    return Err("audit frame exceeded 1024 bytes".to_owned());
+                }
+                if !frame
+                    .iter()
+                    .all(|byte| *byte == b'\t' || (0x20..=0x7e).contains(byte))
+                {
+                    return Err("audit frame contains non-canonical bytes".to_owned());
+                }
+                return String::from_utf8(frame)
+                    .map_err(|error| format!("audit frame is not UTF-8: {error}"));
+            }
+            Ok(1) => {
+                if frame.len() + 2 > 1024 {
+                    return Err("audit frame exceeded 1024 bytes".to_owned());
+                }
+                frame.push(byte[0]);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(format!("read audit frame: {error}")),
+            Ok(_) => unreachable!(),
+        }
+    }
+}
+
+fn task4_file_identity(file: &File) -> Result<Task4FileIdentity, String> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("stat retained capture: {error}"))?;
+    Ok(Task4FileIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        uid: metadata.uid(),
+        mode: metadata.permissions().mode() & 0o777,
+        nlink: metadata.nlink(),
+    })
+}
+
+fn task4_capture_file(path: &Path) -> Result<(File, Task4FileIdentity), String> {
+    let file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("create capture {}: {error}", path.display()))?;
+    let identity = task4_file_identity(&file)?;
+    if identity.mode != 0o600 || identity.nlink != 1 {
+        return Err(format!("capture {} has unsafe metadata", path.display()));
+    }
+    Ok((file, identity))
+}
+
+fn task4_fd_identity(pid: u32, fd: i32) -> Result<Option<(u64, u64)>, String> {
+    match fs::metadata(format!("/proc/{pid}/fd/{fd}")) {
+        Ok(metadata) => Ok(Some((metadata.dev(), metadata.ino()))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("stat process {pid} FD {fd}: {error}")),
+    }
+}
+
+fn task4_snapshot_tree(root: &Path) -> Result<BTreeMap<String, Task4SnapshotEntry>, String> {
+    const MAX_ENTRIES: usize = 4096;
+    const MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+    let root_before = fs::symlink_metadata(root)
+        .map_err(|error| format!("stat snapshot root {}: {error}", root.display()))?;
+    if !root_before.file_type().is_dir() {
+        return Err(format!(
+            "snapshot root {} is not a directory",
+            root.display()
+        ));
+    }
+    let root_identity = (root_before.dev(), root_before.ino());
+    let mut pending = vec![(PathBuf::new(), root.to_path_buf())];
+    let mut snapshot = BTreeMap::new();
+    let mut total_bytes = 0u64;
+    while let Some((relative, path)) = pending.pop() {
+        if snapshot.len() == MAX_ENTRIES {
+            return Err("publisher snapshot exceeded 4096 entries".to_owned());
+        }
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("lstat publisher snapshot {}: {error}", path.display()))?;
+        let (kind, content) = if metadata.file_type().is_dir() {
+            let mut children = fs::read_dir(&path)
+                .map_err(|error| format!("list publisher snapshot {}: {error}", path.display()))?
+                .map(|entry| {
+                    entry
+                        .map_err(|error| format!("read publisher snapshot entry: {error}"))
+                        .and_then(|entry| {
+                            entry.file_name().into_string().map_err(|_| {
+                                "publisher snapshot contains non-UTF-8 name".to_owned()
+                            })
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            children.sort_by(|left, right| right.cmp(left));
+            for child in children {
+                pending.push((relative.join(&child), path.join(child)));
+            }
+            (Task4SnapshotKind::Directory, Vec::new())
+        } else if metadata.file_type().is_file() {
+            if metadata.len() > MAX_BYTES.saturating_sub(total_bytes) {
+                return Err("publisher snapshot exceeded 8 MiB".to_owned());
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)
+                .map_err(|error| format!("open publisher snapshot {}: {error}", path.display()))?;
+            let retained = file
+                .metadata()
+                .map_err(|error| format!("fstat publisher snapshot: {error}"))?;
+            if (retained.dev(), retained.ino()) != (metadata.dev(), metadata.ino()) {
+                return Err("publisher snapshot identity changed while opening".to_owned());
+            }
+            let mut bytes = Vec::new();
+            file.take(MAX_BYTES - total_bytes + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| format!("read publisher snapshot: {error}"))?;
+            total_bytes += bytes.len() as u64;
+            if total_bytes > MAX_BYTES {
+                return Err("publisher snapshot exceeded 8 MiB".to_owned());
+            }
+            (Task4SnapshotKind::Regular, bytes)
+        } else if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&path)
+                .map_err(|error| format!("read publisher symlink {}: {error}", path.display()))?;
+            let bytes = target.as_os_str().as_bytes().to_vec();
+            total_bytes += bytes.len() as u64;
+            if total_bytes > MAX_BYTES {
+                return Err("publisher snapshot exceeded 8 MiB".to_owned());
+            }
+            (Task4SnapshotKind::Symlink, bytes)
+        } else if metadata.file_type().is_fifo() {
+            (Task4SnapshotKind::Fifo, Vec::new())
+        } else {
+            return Err(format!(
+                "publisher snapshot contains unsupported object {}",
+                path.display()
+            ));
+        };
+        let key = if relative.as_os_str().is_empty() {
+            ".".to_owned()
+        } else {
+            relative
+                .to_str()
+                .ok_or("publisher snapshot path is not UTF-8")?
+                .to_owned()
+        };
+        if snapshot
+            .insert(
+                key,
+                Task4SnapshotEntry {
+                    kind,
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                    uid: metadata.uid(),
+                    gid: metadata.gid(),
+                    mode: metadata.permissions().mode() & 0o777,
+                    nlink: metadata.nlink(),
+                    size: metadata.len(),
+                    content,
+                },
+            )
+            .is_some()
+        {
+            return Err("publisher snapshot contains duplicate relative path".to_owned());
+        }
+    }
+    let root_after = fs::symlink_metadata(root)
+        .map_err(|error| format!("revalidate snapshot root {}: {error}", root.display()))?;
+    if (root_after.dev(), root_after.ino()) != root_identity {
+        return Err("publisher snapshot root changed during traversal".to_owned());
+    }
+    Ok(snapshot)
+}
+
+fn task4_validate_terminal_delta(
+    isolated: &Task4PublisherSnapshot,
+    final_root: &BTreeMap<String, Task4SnapshotEntry>,
+    class: Task4OutcomeClass,
+) -> Result<(), String> {
+    let intent = match class {
+        Task4OutcomeClass::N97 | Task4OutcomeClass::I97 | Task4OutcomeClass::R97 => 97,
+        Task4OutcomeClass::SigInt => 130,
+        Task4OutcomeClass::SigHup => 129,
+        Task4OutcomeClass::SigTerm => 143,
+        Task4OutcomeClass::S0 => 0,
+        Task4OutcomeClass::P77 => {
+            return Err("P77 has no terminal publisher delta".to_owned());
+        }
+    };
+    let mut expected = BTreeMap::new();
+    for (path, entry) in &isolated.tree {
+        if path == "root" {
+            expected.insert(String::new(), entry.clone());
+        } else if let Some(path) = path.strip_prefix("root/") {
+            expected.insert(path.to_owned(), entry.clone());
+        }
+    }
+    if !expected.contains_key("") {
+        return Err("publisher snapshot omitted the receipt root".to_owned());
+    }
+
+    let before = expected
+        .get("facts.log")
+        .ok_or_else(|| "publisher snapshot omitted facts.log".to_owned())?
+        .clone();
+    if before.kind != Task4SnapshotKind::Regular || !before.content.ends_with(b"\n") {
+        return Err("publisher facts are not an LF-terminated regular file".to_owned());
+    }
+    let sequence = before.content.iter().filter(|byte| **byte == b'\n').count();
+    let mut expected_content = before.content.clone();
+    expected_content.extend_from_slice(
+        format!("facts-v1\t{sequence}\tterminal_status_intent\t{intent}\n").as_bytes(),
+    );
+    let mut expected_facts = before;
+    expected_facts.size = expected_content.len() as u64;
+    expected_facts.content = expected_content;
+    expected.insert("facts.log".to_owned(), expected_facts);
+
+    let mut observed = final_root.clone();
+    match class {
+        Task4OutcomeClass::I97 => {}
+        Task4OutcomeClass::N97 => {
+            if observed.contains_key("status") || expected.contains_key("status") {
+                return Err("N97 unexpectedly retained terminal status".to_owned());
+            }
+        }
+        _ => {
+            if expected.contains_key("status") {
+                return Err("publisher snapshot contained an early terminal status".to_owned());
+            }
+            let status = observed
+                .remove("status")
+                .ok_or_else(|| format!("terminal status {intent} is absent"))?;
+            if status.kind != Task4SnapshotKind::Regular
+                || status.uid != unsafe { libc::geteuid() }
+                || status.mode != 0o600
+                || status.nlink != 1
+                || status.content != format!("{intent}\n").as_bytes()
+                || status.size != status.content.len() as u64
+            {
+                return Err(format!("terminal status {intent} metadata/content differs"));
+            }
+        }
+    }
+    if observed != expected {
+        return Err("receipt tree changed outside the exact terminal delta".to_owned());
+    }
+    Ok(())
+}
+
+impl Task4ObservedSession {
+    fn spawn(script: &Path, args: &[&str]) -> Result<Self, String> {
+        Self::spawn_with_env(script, args, &[])
+    }
+
+    fn spawn_with_env(
+        script: &Path,
+        args: &[&str],
+        environment: &[(String, String)],
+    ) -> Result<Self, String> {
+        let fixture =
+            tempfile::tempdir().map_err(|error| format!("create observer fixture: {error}"))?;
+        fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("chmod observer fixture: {error}"))?;
+        let work = fixture.path().join("work");
+        fs::create_dir(&work).map_err(|error| format!("create observer work: {error}"))?;
+        fs::set_permissions(&work, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("chmod observer work: {error}"))?;
+        let fake_bin = fixture.path().join("fake-bin");
+        fs::create_dir(&fake_bin).map_err(|error| format!("create fake-bin: {error}"))?;
+        fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("chmod fake-bin: {error}"))?;
+        for name in TASK4_TRIPWIRE_COMMANDS {
+            let path = fake_bin.join(name);
+            fs::write(
+                &path,
+                b"#!/bin/sh\nprintf '%s\\n' \"${0##*/}\" >> \"$P11SCOPE_TASK4_TRIPWIRE_LOG\"\nexit 97\n",
+            )
+            .map_err(|error| format!("write {name} tripwire: {error}"))?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .map_err(|error| format!("chmod {name} tripwire: {error}"))?;
+        }
+        let fake_bin_snapshot = task4_snapshot_tree(&fake_bin)?;
+        let work_metadata =
+            fs::symlink_metadata(&work).map_err(|error| format!("stat observer work: {error}"))?;
+        if !work_metadata.file_type().is_dir()
+            || work_metadata.uid() != unsafe { libc::geteuid() }
+            || work_metadata.permissions().mode() & 0o777 != 0o700
+        {
+            return Err("observer work is not a private caller-owned directory".to_owned());
+        }
+        let work_identity = Task4FileIdentity {
+            dev: work_metadata.dev(),
+            ino: work_metadata.ino(),
+            uid: work_metadata.uid(),
+            mode: work_metadata.permissions().mode() & 0o777,
+            nlink: work_metadata.nlink(),
+        };
+        let stdout_path = fixture.path().join("stdout");
+        let stderr_path = fixture.path().join("stderr");
+        let trace_path = fixture.path().join("audit.trace");
+        let report_path = fixture.path().join("report.tsv");
+        let tripwire_path = fixture.path().join("tripwire.log");
+        let (stdout, stdout_identity) = task4_capture_file(&stdout_path)?;
+        let (stderr, stderr_identity) = task4_capture_file(&stderr_path)?;
+        let (trace, trace_identity) = task4_capture_file(&trace_path)?;
+        let stdout_child = stdout
+            .try_clone()
+            .map_err(|error| format!("clone stdout capture: {error}"))?;
+        let stderr_child = stderr
+            .try_clone()
+            .map_err(|error| format!("clone stderr capture: {error}"))?;
+        let (mut peer, child_end) =
+            UnixStream::pair().map_err(|error| format!("audit pair: {error}"))?;
+        let child_fd = child_end.as_raw_fd();
+        let peer_fd = peer.as_raw_fd();
+        let socket_metadata = fs::metadata(format!("/proc/self/fd/{child_fd}"))
+            .map_err(|error| format!("stat audit child endpoint: {error}"))?;
+        let socket_identity = (socket_metadata.dev(), socket_metadata.ino());
+        let shell_metadata = fs::metadata("/bin/sh")
+            .map_err(|error| format!("stat fixed self-test shell: {error}"))?;
+        let shell_identity = (shell_metadata.dev(), shell_metadata.ino());
+        let python_metadata = fs::metadata("/usr/bin/python3")
+            .map_err(|error| format!("stat fixed terminal Python: {error}"))?;
+        let python_identity = (python_metadata.dev(), python_metadata.ino());
+        let mut command = Command::new("/usr/bin/python3");
+        command
+            .args([
+                "-c",
+                TASK4_OBSERVED_ANCHOR,
+                script.to_str().ok_or("non-UTF-8 script path")?,
+            ])
+            .args(args)
+            .env_clear()
+            .stdout(Stdio::from(stdout_child))
+            .stderr(Stdio::from(stderr_child));
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        command
+            .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
+            .env("CARGO", fake_bin.join("cargo"))
+            .env("DOCKER", fake_bin.join("docker"))
+            .env("RUSTUP", fake_bin.join("rustup"))
+            .env("SUDO", fake_bin.join("sudo"))
+            .env("P11SCOPE_TASK4_SELF_TEST_WORK", &work)
+            .env("P11SCOPE_TASK4_WORK", &work)
+            .env("P11SCOPE_TASK4_SELF_TEST_REPORT", &report_path)
+            .env("P11SCOPE_TASK4_TRIPWIRE_LOG", &tripwire_path);
+        unsafe {
+            command.process_group(0);
+            command.pre_exec(move || {
+                if child_fd != 5 && libc::dup2(child_fd, 5) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                let flags = libc::fcntl(5, libc::F_GETFD);
+                if flags == -1 || libc::fcntl(5, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                for fd in [3, 4, 6, 7, 8, 9] {
+                    libc::close(fd);
+                }
+                if child_fd != 5 {
+                    libc::close(child_fd);
+                }
+                if peer_fd != 5 && peer_fd != child_fd {
+                    libc::close(peer_fd);
+                }
+                Ok(())
+            });
+        }
+        let nonce = task4_nonce()?;
+        let mut anchor = command
+            .spawn()
+            .map_err(|error| format!("spawn observed anchor: {error}"))?;
+        drop(child_end);
+        let pid = anchor.id();
+        let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+        let starttime = task4_proc_starttime(pid);
+        if pgid != pid as libc::pid_t || starttime.is_none() {
+            let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            let _ = anchor.wait();
+            return Err(format!(
+                "observed anchor identity invalid: pid={pid}, pgid={pgid}, starttime={starttime:?}"
+            ));
+        }
+        let identity = Task4AnchorIdentity {
+            pid,
+            starttime: starttime.unwrap(),
+            pgid: pgid as u32,
+        };
+        if let Err(error) = task4_send_frame(&mut peer, &format!("audit-v1\t{nonce}\tchallenge")) {
+            let _ = unsafe { libc::kill(-(identity.pgid as libc::pid_t), libc::SIGKILL) };
+            let _ = anchor.wait();
+            return Err(error);
+        }
+        Ok(Self {
+            fixture: Some(fixture),
+            peer,
+            anchor: Some(anchor),
+            identity,
+            socket_identity,
+            supervisor: None,
+            fifo_identities: None,
+            nonce,
+            pending: None,
+            next_sequence: 0,
+            complete_acked: false,
+            stdout_path,
+            stderr_path,
+            trace_path,
+            report_path,
+            tripwire_path,
+            work_path: work,
+            work_identity,
+            shell_identity,
+            python_identity,
+            fake_bin_path: fake_bin,
+            fake_bin_snapshot,
+            stdout,
+            stderr,
+            trace,
+            stdout_identity,
+            stderr_identity,
+            trace_identity,
+            report_identity: None,
+            tripwire_identity: None,
+            trace_len: 0,
+        })
+    }
+
+    fn check_capture_bounds(&self) -> Result<(), String> {
+        let harness = self
+            .fixture
+            .as_ref()
+            .ok_or("Task 4 harness directory already consumed")?
+            .path();
+        let harness_metadata = fs::symlink_metadata(harness)
+            .map_err(|error| format!("stat Task 4 harness: {error}"))?;
+        if !harness_metadata.file_type().is_dir()
+            || harness_metadata.uid() != unsafe { libc::geteuid() }
+            || harness_metadata.permissions().mode() & 0o777 != 0o700
+        {
+            return Err("Task 4 harness is not a private caller-owned directory".to_owned());
+        }
+        let mut actual = fs::read_dir(harness)
+            .map_err(|error| format!("list Task 4 harness: {error}"))?
+            .map(|entry| {
+                entry
+                    .map_err(|error| format!("read Task 4 harness entry: {error}"))
+                    .and_then(|entry| {
+                        entry
+                            .file_name()
+                            .into_string()
+                            .map_err(|_| "Task 4 harness contains non-UTF-8 name".to_owned())
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        actual.sort();
+        let mut expected = vec!["audit.trace", "fake-bin", "stderr", "stdout", "work"];
+        if self.report_path.exists() {
+            expected.push("report.tsv");
+        }
+        if self.tripwire_path.exists() {
+            expected.push("tripwire.log");
+        }
+        expected.sort();
+        if actual != expected {
+            return Err(format!("unexpected Task 4 harness inventory: {actual:?}"));
+        }
+        if task4_snapshot_tree(&self.fake_bin_path)? != self.fake_bin_snapshot {
+            return Err("Task 4 fake-bin identity or content changed".to_owned());
+        }
+        for (file, path, identity) in [
+            (&self.stdout, &self.stdout_path, self.stdout_identity),
+            (&self.stderr, &self.stderr_path, self.stderr_identity),
+            (&self.trace, &self.trace_path, self.trace_identity),
+        ] {
+            let retained = file
+                .metadata()
+                .map_err(|error| format!("stat retained capture {}: {error}", path.display()))?;
+            let pathname = fs::symlink_metadata(path)
+                .map_err(|error| format!("stat capture path {}: {error}", path.display()))?;
+            if !pathname.file_type().is_file()
+                || retained.dev() != identity.dev
+                || retained.ino() != identity.ino
+                || retained.uid() != identity.uid
+                || retained.permissions().mode() & 0o777 != identity.mode
+                || retained.nlink() != identity.nlink
+                || pathname.dev() != identity.dev
+                || pathname.ino() != identity.ino
+                || pathname.uid() != identity.uid
+                || pathname.permissions().mode() & 0o777 != identity.mode
+                || pathname.nlink() != identity.nlink
+                || retained.len() > 1024 * 1024
+            {
+                return Err(format!(
+                    "capture {} violated its identity or bound",
+                    path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn read_capture(file: &File, label: &str) -> Result<Vec<u8>, String> {
+        let mut reader = file
+            .try_clone()
+            .map_err(|error| format!("clone {label} capture: {error}"))?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| format!("seek {label} capture: {error}"))?;
+        let mut bytes = Vec::new();
+        reader
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("read {label} capture: {error}"))?;
+        if bytes.len() > 1024 * 1024 {
+            return Err(format!("{label} capture exceeded 1 MiB"));
+        }
+        Ok(bytes)
+    }
+
+    fn read_optional_file(path: &Path, label: &str, limit: u64) -> Result<Vec<u8>, String> {
+        let pathname = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(format!("stat {label} {}: {error}", path.display())),
+        };
+        if !pathname.file_type().is_file()
+            || pathname.uid() != unsafe { libc::geteuid() }
+            || pathname.permissions().mode() & 0o777 != 0o600
+            || pathname.nlink() != 1
+            || pathname.len() > limit
+        {
+            return Err(format!("{label} {} has unsafe metadata", path.display()));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| format!("open {label} {}: {error}", path.display()))?;
+        let retained = file
+            .metadata()
+            .map_err(|error| format!("stat open {label}: {error}"))?;
+        if retained.dev() != pathname.dev() || retained.ino() != pathname.ino() {
+            return Err(format!("{label} identity changed while opening"));
+        }
+        let mut bytes = Vec::new();
+        file.take(limit + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("read {label}: {error}"))?;
+        if bytes.len() as u64 > limit {
+            return Err(format!("{label} exceeded {limit} bytes"));
+        }
+        Ok(bytes)
+    }
+
+    fn observe_optional_file(
+        path: &Path,
+        label: &str,
+        limit: u64,
+        expected: Option<Task4FileIdentity>,
+    ) -> Result<Option<Task4FileIdentity>, String> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && expected.is_none() => {
+                return Ok(None);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(format!("retained {label} disappeared"));
+            }
+            Err(error) => return Err(format!("stat {label}: {error}")),
+        };
+        let identity = Task4FileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            uid: metadata.uid(),
+            mode: metadata.permissions().mode() & 0o777,
+            nlink: metadata.nlink(),
+        };
+        if !metadata.file_type().is_file()
+            || identity.uid != unsafe { libc::geteuid() }
+            || identity.mode != 0o600
+            || identity.nlink != 1
+            || metadata.len() > limit
+            || expected.is_some_and(|value| value != identity)
+        {
+            return Err(format!("{label} identity, metadata, or bound changed"));
+        }
+        Ok(Some(identity))
+    }
+
+    fn check_optional_files(&mut self) -> Result<(), String> {
+        self.report_identity = Self::observe_optional_file(
+            &self.report_path,
+            "self-test report",
+            8 * 1024 * 1024,
+            self.report_identity,
+        )?;
+        self.tripwire_identity = Self::observe_optional_file(
+            &self.tripwire_path,
+            "tripwire",
+            1024 * 1024,
+            self.tripwire_identity,
+        )?;
+        Ok(())
+    }
+
+    fn tripwire_contents(&self) -> Result<Vec<u8>, String> {
+        Self::read_optional_file(&self.tripwire_path, "tripwire", 1024 * 1024)
+    }
+
+    fn recv_frame(&mut self) -> Result<&Task4AuditFrame, String> {
+        if self.pending.is_some() {
+            return Err("previous audit frame has not been acknowledged".to_owned());
+        }
+        self.check_capture_bounds()?;
+        self.check_optional_files()?;
+        if !self.tripwire_contents()?.is_empty() {
+            return Err("Task 4 command tripwire fired before audit validation".to_owned());
+        }
+        let raw =
+            task4_read_one_frame(&mut self.peer, &self.stdout, &self.stderr).map_err(|error| {
+                let stdout = Self::read_capture(&self.stdout, "stdout").unwrap_or_default();
+                let stderr = Self::read_capture(&self.stderr, "stderr").unwrap_or_default();
+                format!(
+                    "{error}; stdout={:?}; stderr={:?}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                )
+            })?;
+        if !self.tripwire_contents()?.is_empty() {
+            return Err("Task 4 command tripwire fired during audit validation".to_owned());
+        }
+        self.check_optional_files()?;
+        let fields = raw.split('\t').map(str::to_owned).collect::<Vec<_>>();
+        if fields.len() < 4 || fields[0] != "audit-v1" || fields[1] != self.nonce {
+            return Err(format!("malformed or foreign audit frame: {raw:?}"));
+        }
+        let sequence = fields[2]
+            .parse::<u64>()
+            .map_err(|_| format!("non-canonical audit sequence: {:?}", fields[2]))?;
+        if sequence.to_string() != fields[2] || sequence != self.next_sequence {
+            return Err(format!(
+                "unexpected audit sequence: expected={}, actual={:?}",
+                self.next_sequence, fields[2]
+            ));
+        }
+        self.pending = Some(Task4AuditFrame {
+            raw,
+            sequence,
+            fields,
+        });
+        Ok(self.pending.as_ref().unwrap())
+    }
+
+    fn validate_supervisor_ready(&mut self) -> Result<Task4ProcessIdentity, String> {
+        let frame = self.recv_frame()?;
+        if frame.fields.len() != 9 || frame.fields[3] != "supervisor-ready" {
+            return Err(format!(
+                "expected exact supervisor-ready frame: {:?}",
+                frame.raw
+            ));
+        }
+        let fields = frame.fields.clone();
+        let sequence = frame.sequence;
+        let pid = task4_canonical_u32(&fields[4], "supervisor PID")?;
+        let starttime = task4_canonical_u64(&fields[5], "supervisor starttime")?;
+        let parent = task4_dev_ino(&fields[6], "work parent identity")?;
+        let control = task4_dev_ino(&fields[7], "control FIFO identity")?;
+        let events = task4_dev_ino(&fields[8], "events FIFO identity")?;
+        if pid == 0 || control == events {
+            return Err("supervisor PID must be nonzero and FIFO identities distinct".to_owned());
+        }
+        let process = task4_proc_identity(pid)
+            .ok_or_else(|| format!("supervisor {pid} is not live at supervisor-ready"))?;
+        if process.starttime != starttime
+            || process.ppid != self.identity.pid
+            || process.pgid != self.identity.pgid
+        {
+            return Err(format!(
+                "supervisor generation/parent/group mismatch: actual={process:?}, reported_starttime={starttime}, expected_parent={}, expected_group={}",
+                self.identity.pid, self.identity.pgid
+            ));
+        }
+        if parent != (self.work_identity.dev, self.work_identity.ino) {
+            return Err(format!(
+                "supervisor reported foreign work parent {parent:?}"
+            ));
+        }
+        let current_work = fs::symlink_metadata(&self.work_path)
+            .map_err(|error| format!("revalidate observer work: {error}"))?;
+        if !current_work.file_type().is_dir()
+            || current_work.dev() != self.work_identity.dev
+            || current_work.ino() != self.work_identity.ino
+            || current_work.uid() != self.work_identity.uid
+            || current_work.permissions().mode() & 0o777 != self.work_identity.mode
+            || current_work.nlink() != self.work_identity.nlink
+        {
+            return Err(
+                "observer work identity or exact cases-directory link count changed".to_owned(),
+            );
+        }
+        let mut work_entries = fs::read_dir(&self.work_path)
+            .map_err(|error| format!("list observer work: {error}"))?
+            .map(|entry| {
+                entry
+                    .map_err(|error| format!("read observer work entry: {error}"))
+                    .and_then(|entry| {
+                        entry
+                            .file_name()
+                            .into_string()
+                            .map_err(|_| "observer work contains a non-UTF-8 name".to_owned())
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        work_entries.sort();
+        if work_entries != ["cases", "control.in", "events.out"] {
+            return Err(format!(
+                "unexpected observer work inventory: {work_entries:?}"
+            ));
+        }
+        let cases = fs::symlink_metadata(self.work_path.join("cases"))
+            .map_err(|error| format!("stat cases directory: {error}"))?;
+        if !cases.file_type().is_dir()
+            || cases.uid() != unsafe { libc::geteuid() }
+            || cases.permissions().mode() & 0o777 != 0o700
+            || fs::read_dir(self.work_path.join("cases"))
+                .map_err(|error| format!("list cases directory: {error}"))?
+                .next()
+                .is_some()
+        {
+            return Err("cases is not an empty private caller-owned directory".to_owned());
+        }
+        for (name, fd, reported) in [("control.in", 3, control), ("events.out", 4, events)] {
+            let path = self.work_path.join(name);
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|error| format!("stat {name}: {error}"))?;
+            if !metadata.file_type().is_fifo()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.permissions().mode() & 0o777 != 0o600
+                || metadata.nlink() != 1
+                || (metadata.dev(), metadata.ino()) != reported
+            {
+                return Err(format!("{name} is not the reported private FIFO"));
+            }
+            let descriptor = fs::metadata(format!("/proc/{pid}/fd/{fd}"))
+                .map_err(|error| format!("stat supervisor FD {fd}: {error}"))?;
+            if (descriptor.dev(), descriptor.ino()) != reported {
+                return Err(format!("supervisor FD {fd} does not name {name}"));
+            }
+        }
+        let socket = fs::metadata(format!("/proc/{pid}/fd/5"))
+            .map_err(|error| format!("stat supervisor FD 5: {error}"))?;
+        if (socket.dev(), socket.ino()) != self.socket_identity {
+            return Err("supervisor FD 5 does not name the pinned audit socket".to_owned());
+        }
+        for fd in 6..=9 {
+            match fs::metadata(format!("/proc/{pid}/fd/{fd}")) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                _ => return Err(format!("supervisor unexpectedly retains FD {fd}")),
+            }
+        }
+        self.validate_group_members(&[self.identity.pid, process.pid])?;
+        self.supervisor = Some(process);
+        self.fifo_identities = Some((control, events));
+        self.ack_validated(sequence, false)?;
+        Ok(process)
+    }
+
+    fn validate_case_started(
+        &mut self,
+        ordinal: usize,
+        case: &str,
+        class: Task4OutcomeClass,
+    ) -> Result<(Task4CaseFrame, Option<Task4P77Fixture>), String> {
+        let supervisor = self
+            .supervisor
+            .ok_or_else(|| "case frame arrived before supervisor-ready".to_owned())?;
+        let (control, events) = self
+            .fifo_identities
+            .ok_or_else(|| "case frame arrived without pinned FIFOs".to_owned())?;
+        let current_supervisor = task4_proc_identity(supervisor.pid)
+            .ok_or_else(|| "pinned supervisor exited before case-started".to_owned())?;
+        if current_supervisor.pid != supervisor.pid
+            || current_supervisor.starttime != supervisor.starttime
+            || current_supervisor.ppid != supervisor.ppid
+            || current_supervisor.pgid != supervisor.pgid
+        {
+            return Err("pinned supervisor generation changed before case-started".to_owned());
+        }
+        let socket = fs::metadata(format!("/proc/{}/fd/5", supervisor.pid))
+            .map_err(|error| format!("revalidate supervisor FD 5: {error}"))?;
+        if (socket.dev(), socket.ino()) != self.socket_identity {
+            return Err("supervisor lost the pinned FD-5 audit socket".to_owned());
+        }
+
+        let observed = task4_parse_case_frame(self.recv_frame()?)?;
+        if observed.event != Task4CaseEvent::Started {
+            return Err(format!("expected case-started, got {:?}", observed.event));
+        }
+        if observed.ordinal != ordinal || observed.case != case {
+            return Err(format!(
+                "unexpected case-started identity: ordinal={}, case={:?}",
+                observed.ordinal, observed.case
+            ));
+        }
+        if observed.root != Task4IdentityField::None
+            || observed.receipt != Task4ReceiptStatus::None
+            || observed.wait != Task4WaitStatus::None
+            || observed.publisher_exe != Task4IdentityField::None
+        {
+            return Err(
+                "case-started carries live root, receipt, wait, or publisher authority".to_owned(),
+            );
+        }
+        let child = task4_proc_identity(observed.child_pid)
+            .ok_or_else(|| format!("case child {} is not live", observed.child_pid))?;
+        if child.starttime != observed.child_starttime
+            || child.ppid != supervisor.pid
+            || child.pgid != self.identity.pgid
+        {
+            return Err(format!(
+                "case child generation/parent/group mismatch: {child:?}"
+            ));
+        }
+        for (fd, expected) in [(3, control), (4, events)] {
+            let descriptor = fs::metadata(format!("/proc/{}/fd/{fd}", observed.child_pid))
+                .map_err(|error| format!("stat case child FD {fd}: {error}"))?;
+            if (descriptor.dev(), descriptor.ino()) != expected {
+                return Err(format!("case child FD {fd} does not name the pinned FIFO"));
+            }
+        }
+        for fd in 5..=9 {
+            match fs::metadata(format!("/proc/{}/fd/{fd}", observed.child_pid)) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                _ => return Err(format!("case child unexpectedly retains FD {fd}")),
+            }
+        }
+        let sandbox = self.work_path.join("cases").join(format!("{ordinal:03}"));
+        let fixture = if class == Task4OutcomeClass::P77 {
+            Some(self.prepare_p77_fixture(ordinal, case)?)
+        } else {
+            None
+        };
+        let mut case_entries = fs::read_dir(self.work_path.join("cases"))
+            .map_err(|error| format!("list cases directory: {error}"))?
+            .map(|entry| {
+                entry
+                    .map_err(|error| format!("read cases entry: {error}"))
+                    .and_then(|entry| {
+                        entry
+                            .file_name()
+                            .into_string()
+                            .map_err(|_| "cases contains a non-UTF-8 name".to_owned())
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        case_entries.sort();
+        if case_entries != [format!("{ordinal:03}")] {
+            return Err(format!("unexpected cases inventory: {case_entries:?}"));
+        }
+        let sandbox_metadata = fs::symlink_metadata(&sandbox)
+            .map_err(|error| format!("stat case sandbox {}: {error}", sandbox.display()))?;
+        let expected_mode = if case == "nonprivate-parent-rejected-status-77-no-touch-before-body" {
+            0o755
+        } else {
+            0o700
+        };
+        let mut sandbox_entries = fs::read_dir(&sandbox)
+            .map_err(|error| format!("list case sandbox: {error}"))?
+            .map(|entry| {
+                entry
+                    .map_err(|error| format!("read case sandbox entry: {error}"))
+                    .and_then(|entry| {
+                        entry
+                            .file_name()
+                            .into_string()
+                            .map_err(|_| "case sandbox contains a non-UTF-8 name".to_owned())
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        sandbox_entries.sort();
+        let expected_entries = fixture
+            .as_ref()
+            .and_then(|fixture| fixture.path.as_ref())
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .map(|name| vec![name.to_owned()])
+            .unwrap_or_default();
+        if !sandbox_metadata.file_type().is_dir()
+            || sandbox_metadata.uid() != unsafe { libc::geteuid() }
+            || sandbox_metadata.permissions().mode() & 0o777 != expected_mode
+            || sandbox_entries != expected_entries
+        {
+            return Err("case-started sandbox does not match its frozen precondition".to_owned());
+        }
+        Ok((observed, fixture))
+    }
+
+    fn prepare_p77_fixture(&self, ordinal: usize, case: &str) -> Result<Task4P77Fixture, String> {
+        let sandbox = self.work_path.join("cases").join(format!("{ordinal:03}"));
+        let mut path = None;
+        let mut lock = None;
+        match case {
+            "existing-root-rejected-status-77-no-touch-before-body"
+            | "foreign-root-rejected-status-77-no-touch-before-body" => {
+                let root = sandbox.join("root");
+                fs::create_dir(&root)
+                    .map_err(|error| format!("create P77 root fixture: {error}"))?;
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                    .map_err(|error| format!("chmod P77 root fixture: {error}"))?;
+                path = Some(root);
+            }
+            "symlink-root-rejected-status-77-no-touch-before-body" => {
+                let root = sandbox.join("root");
+                std::os::unix::fs::symlink("missing-root-target", &root)
+                    .map_err(|error| format!("create P77 root symlink: {error}"))?;
+                path = Some(root);
+            }
+            "lock-contention-status-77-blocks-body-cargo-runtime" => {
+                let lock_path = sandbox.join(".task4.lock");
+                let file = OpenOptions::new()
+                    .create_new(true)
+                    .read(true)
+                    .write(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&lock_path)
+                    .map_err(|error| format!("create P77 lock fixture: {error}"))?;
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
+                    return Err(format!("lock P77 fixture: {}", io::Error::last_os_error()));
+                }
+                path = Some(lock_path);
+                lock = Some(file);
+            }
+            _ => {}
+        }
+        Ok(Task4P77Fixture {
+            path,
+            snapshot: task4_snapshot_tree(&sandbox)?,
+            lock,
+        })
+    }
+
+    fn cleanup_p77_fixture(
+        &self,
+        ordinal: usize,
+        mut fixture: Task4P77Fixture,
+    ) -> Result<(), String> {
+        let sandbox = self.work_path.join("cases").join(format!("{ordinal:03}"));
+        if task4_snapshot_tree(&sandbox)? != fixture.snapshot {
+            return Err("P77 fixture or sandbox changed before case reap".to_owned());
+        }
+        drop(fixture.lock.take());
+        if let Some(path) = fixture.path {
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("revalidate P77 fixture: {error}"))?;
+            if metadata.file_type().is_dir() {
+                fs::remove_dir(&path)
+                    .map_err(|error| format!("remove P77 directory fixture: {error}"))?;
+            } else {
+                fs::remove_file(&path)
+                    .map_err(|error| format!("remove P77 file fixture: {error}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_live_case_process(
+        &self,
+        frame: &Task4CaseFrame,
+        expected: Task4ProcessIdentity,
+        require_fifos: bool,
+    ) -> Result<Task4ProcessIdentity, String> {
+        if frame.child_pid != expected.pid || frame.child_starttime != expected.starttime {
+            return Err("case frame changed the pinned child generation".to_owned());
+        }
+        let current = task4_proc_identity(expected.pid)
+            .ok_or_else(|| "pinned case child exited before a live barrier".to_owned())?;
+        if current.pid != expected.pid
+            || current.starttime != expected.starttime
+            || current.ppid != expected.ppid
+            || current.pgid != expected.pgid
+        {
+            return Err("pinned case child generation/parent/group changed".to_owned());
+        }
+        if require_fifos {
+            let (control, events) = self.fifo_identities.ok_or("missing pinned FIFOs")?;
+            for (fd, identity) in [(3, control), (4, events)] {
+                if task4_fd_identity(current.pid, fd)? != Some(identity) {
+                    return Err(format!("live case child FD {fd} changed"));
+                }
+            }
+        }
+        if task4_fd_identity(current.pid, 5)?.is_some() {
+            return Err("case child inherited forbidden observer FD 5".to_owned());
+        }
+        if task4_fd_identity(current.pid, 6)?.is_some() {
+            return Err("case child retained forbidden FD 6 outside creator handoff".to_owned());
+        }
+        self.validate_group_members(&[
+            self.identity.pid,
+            self.supervisor.ok_or("supervisor is not pinned")?.pid,
+            current.pid,
+        ])?;
+        Ok(current)
+    }
+
+    fn validate_group_members(&self, expected: &[u32]) -> Result<(), String> {
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        let actual = task4_group_pids(self.identity.pgid)?;
+        if actual != expected {
+            return Err(format!(
+                "observed process group differs: expected={expected:?}, actual={actual:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_observer_generations(&self) -> Result<Task4ProcessIdentity, String> {
+        if !self.anchor_is_live_and_same() {
+            return Err("observer anchor generation changed".to_owned());
+        }
+        let expected = self.supervisor.ok_or("supervisor is not pinned")?;
+        let current = task4_proc_identity(expected.pid)
+            .ok_or_else(|| "pinned supervisor exited during protocol".to_owned())?;
+        if current.pid != expected.pid
+            || current.starttime != expected.starttime
+            || current.ppid != expected.ppid
+            || current.pgid != expected.pgid
+        {
+            return Err("pinned supervisor generation changed during protocol".to_owned());
+        }
+        if task4_fd_identity(expected.pid, 5)? != Some(self.socket_identity) {
+            return Err("pinned supervisor lost FD 5 during protocol".to_owned());
+        }
+        self.validate_work_parent()?;
+        Ok(current)
+    }
+
+    fn validate_work_parent(&self) -> Result<(), String> {
+        let metadata = fs::symlink_metadata(&self.work_path)
+            .map_err(|error| format!("revalidate Task 4 work parent: {error}"))?;
+        if !metadata.file_type().is_dir()
+            || metadata.dev() != self.work_identity.dev
+            || metadata.ino() != self.work_identity.ino
+            || metadata.uid() != self.work_identity.uid
+            || metadata.permissions().mode() & 0o777 != self.work_identity.mode
+            || metadata.nlink() != self.work_identity.nlink
+        {
+            return Err("Task 4 work parent identity or metadata changed".to_owned());
+        }
+        Ok(())
+    }
+
+    fn recv_expected_case(
+        &mut self,
+        ordinal: usize,
+        case: &str,
+        event: Task4CaseEvent,
+    ) -> Result<Task4CaseFrame, String> {
+        self.validate_observer_generations()?;
+        let frame = task4_parse_case_frame(self.recv_frame()?)?;
+        if frame.ordinal != ordinal || frame.case != case || frame.event != event {
+            return Err(format!(
+                "unexpected case transition: expected=({ordinal},{case:?},{event:?}), actual=({},{:?},{:?})",
+                frame.ordinal, frame.case, frame.event
+            ));
+        }
+        self.validate_observer_generations()?;
+        Ok(frame)
+    }
+
+    fn validate_root(
+        &self,
+        ordinal: usize,
+        reported: Task4IdentityField,
+        expected: Option<(u64, u64)>,
+    ) -> Result<(u64, u64), String> {
+        let Task4IdentityField::Identity(reported) = reported else {
+            return Err("live full case omitted its root identity".to_owned());
+        };
+        if expected.is_some_and(|identity| identity != reported) {
+            return Err("live full case changed its root identity".to_owned());
+        }
+        let root = self
+            .work_path
+            .join("cases")
+            .join(format!("{ordinal:03}"))
+            .join("root");
+        let metadata = fs::symlink_metadata(&root)
+            .map_err(|error| format!("stat live receipt root: {error}"))?;
+        if !metadata.file_type().is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o777 != 0o700
+            || (metadata.dev(), metadata.ino()) != reported
+        {
+            return Err("live receipt root is not the reported private directory".to_owned());
+        }
+        Ok(reported)
+    }
+
+    fn validate_status(
+        &self,
+        ordinal: usize,
+        case: &str,
+        expected: Task4ReceiptStatus,
+    ) -> Result<(), String> {
+        let path = self
+            .work_path
+            .join("cases")
+            .join(format!("{ordinal:03}"))
+            .join("root/status");
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return if expected == Task4ReceiptStatus::None {
+                    Ok(())
+                } else {
+                    Err(format!("expected {expected:?} receipt is absent"))
+                };
+            }
+            Err(error) => return Err(format!("lstat terminal receipt: {error}")),
+        };
+        if expected == Task4ReceiptStatus::None {
+            return Err("receipt exists when ENOENT is required".to_owned());
+        }
+        if !metadata.file_type().is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o777 != 0o600
+            || metadata.nlink() != 1
+        {
+            return Err("receipt is not one caller-owned mode-0600 regular file".to_owned());
+        }
+        let bytes = Self::read_optional_file(&path, "terminal receipt", 4096)?;
+        match expected {
+            Task4ReceiptStatus::None => unreachable!(),
+            Task4ReceiptStatus::Code(code) if bytes == format!("{code}\n").as_bytes() => Ok(()),
+            Task4ReceiptStatus::Invalid if case == "early-status-rejected" && bytes == b"0\n" => {
+                Ok(())
+            }
+            Task4ReceiptStatus::Invalid
+                if case == "duplicate-status-rejected" && bytes == b"0\n0\n" =>
+            {
+                Ok(())
+            }
+            Task4ReceiptStatus::Invalid if case == "foreign-terminal-artifact-rejected" => Ok(()),
+            _ => Err(format!(
+                "terminal receipt content differs from {expected:?}: {bytes:?}"
+            )),
+        }
+    }
+
+    fn publisher_snapshot(
+        &self,
+        ordinal: usize,
+        child_pid: u32,
+        lane14: bool,
+    ) -> Result<Task4PublisherSnapshot, String> {
+        let executable = fs::metadata(format!("/proc/{child_pid}/exe"))
+            .map_err(|error| format!("stat terminal publisher executable: {error}"))?;
+        let executable = (executable.dev(), executable.ino());
+        let sandbox = self.work_path.join("cases").join(format!("{ordinal:03}"));
+        let root = sandbox.join("root");
+        let mut expected_descriptors = vec![
+            (7, root.join("facts.log")),
+            (9, sandbox.join(".task4.lock")),
+        ];
+        if lane14 {
+            expected_descriptors.insert(1, (8, root.join("artifacts/discover.facts")));
+        }
+        let mut descriptors = BTreeMap::new();
+        for (fd, path) in expected_descriptors {
+            let identity = task4_fd_identity(child_pid, fd)?
+                .ok_or_else(|| format!("terminal publisher omitted required FD {fd}"))?;
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                format!(
+                    "stat terminal publisher FD {fd} object {}: {error}",
+                    path.display()
+                )
+            })?;
+            if !metadata.file_type().is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.permissions().mode() & 0o777 != 0o600
+                || metadata.nlink() != 1
+                || identity != (metadata.dev(), metadata.ino())
+            {
+                return Err(format!(
+                    "terminal publisher FD {fd} is not bound to {}",
+                    path.display()
+                ));
+            }
+            descriptors.insert(fd, identity);
+        }
+        if !lane14 && task4_fd_identity(child_pid, 8)?.is_some() {
+            return Err("non-Lane-14 publisher unexpectedly retained FD 8".to_owned());
+        }
+        Ok(Task4PublisherSnapshot {
+            tree: task4_snapshot_tree(&sandbox)?,
+            descriptors,
+            executable,
+        })
+    }
+
+    fn validate_driver_protocol(&mut self, lane: &str, cases: &[&str]) -> Result<(), String> {
+        self.validate_supervisor_ready()?;
+        let expected_frames = 2usize
+            + cases
+                .iter()
+                .map(|case| task4_outcome_class(case).sequence().len())
+                .sum::<usize>();
+        if expected_frames > 6 * cases.len() + 2 {
+            return Err("driver frame bound exceeds 6 * CASE_COUNT + 2".to_owned());
+        }
+
+        for (ordinal, case) in cases.iter().copied().enumerate() {
+            let class = task4_outcome_class(case);
+            let (started, fixture) = self.validate_case_started(ordinal, case, class)?;
+            let child = task4_proc_identity(started.child_pid)
+                .ok_or_else(|| "case child vanished after case-started validation".to_owned())?;
+            let mut state = Task4CaseState {
+                child,
+                root: None,
+                publisher: None,
+                fixture,
+            };
+            self.ack_validated(started.sequence, false)?;
+
+            if class == Task4OutcomeClass::P77 {
+                let reaped = self.recv_expected_case(ordinal, case, Task4CaseEvent::Reaped)?;
+                if reaped.child_pid != state.child.pid
+                    || reaped.child_starttime != state.child.starttime
+                    || reaped.root != Task4IdentityField::None
+                    || reaped.receipt != Task4ReceiptStatus::None
+                    || reaped.wait != Task4WaitStatus::Code(77)
+                    || reaped.publisher_exe != Task4IdentityField::None
+                    || task4_proc_identity(state.child.pid)
+                        .is_some_and(|current| current.starttime == state.child.starttime)
+                {
+                    return Err("P77 case-reaped state is not exact".to_owned());
+                }
+                self.cleanup_p77_fixture(ordinal, state.fixture.take().unwrap())?;
+                self.validate_group_members(&[self.identity.pid, self.supervisor.unwrap().pid])?;
+                self.ack_validated(reaped.sequence, false)?;
+                continue;
+            }
+
+            let owner = self.recv_expected_case(ordinal, case, Task4CaseEvent::OwnerEntered)?;
+            self.validate_live_case_process(&owner, state.child, true)?;
+            if owner.receipt != Task4ReceiptStatus::None
+                || owner.wait != Task4WaitStatus::None
+                || owner.publisher_exe != Task4IdentityField::None
+            {
+                return Err("owner-entered carries terminal authority".to_owned());
+            }
+            state.root = Some(self.validate_root(ordinal, owner.root, None)?);
+            self.validate_status(ordinal, case, Task4ReceiptStatus::None)?;
+            self.ack_validated(owner.sequence, false)?;
+
+            let finalizer =
+                self.recv_expected_case(ordinal, case, Task4CaseEvent::FinalizerEntered)?;
+            self.validate_live_case_process(&finalizer, state.child, true)?;
+            self.validate_root(ordinal, finalizer.root, state.root)?;
+            if finalizer.receipt != Task4ReceiptStatus::None
+                || finalizer.wait != Task4WaitStatus::None
+                || finalizer.publisher_exe != Task4IdentityField::None
+            {
+                return Err("finalizer-entered carries terminal authority".to_owned());
+            }
+            self.validate_status(ordinal, case, Task4ReceiptStatus::None)?;
+            task4_snapshot_tree(
+                &self
+                    .work_path
+                    .join("cases")
+                    .join(format!("{ordinal:03}"))
+                    .join("root"),
+            )?;
+            if class == Task4OutcomeClass::S0 {
+                task4_validate_success_facts(
+                    &self
+                        .work_path
+                        .join("cases")
+                        .join(format!("{ordinal:03}"))
+                        .join("root"),
+                    lane,
+                    false,
+                )?;
+            }
+            self.ack_validated(finalizer.sequence, false)?;
+
+            let entered =
+                self.recv_expected_case(ordinal, case, Task4CaseEvent::PublisherEntered)?;
+            self.validate_live_case_process(&entered, state.child, true)?;
+            self.validate_root(ordinal, entered.root, state.root)?;
+            if entered.receipt != Task4ReceiptStatus::None
+                || entered.wait != Task4WaitStatus::None
+                || entered.publisher_exe != Task4IdentityField::Identity(self.python_identity)
+            {
+                return Err("publisher-entered fields are not exact".to_owned());
+            }
+            let entered_snapshot =
+                self.publisher_snapshot(ordinal, state.child.pid, lane == "lane14")?;
+            if entered_snapshot.executable != self.python_identity
+                || entered_snapshot.executable == self.shell_identity
+            {
+                return Err(
+                    "publisher-entered executable is not the pinned terminal Python".to_owned(),
+                );
+            }
+            self.validate_status(
+                ordinal,
+                case,
+                if class == Task4OutcomeClass::I97 {
+                    Task4ReceiptStatus::Invalid
+                } else {
+                    Task4ReceiptStatus::None
+                },
+            )?;
+            if class == Task4OutcomeClass::S0 {
+                task4_validate_success_facts(
+                    &self
+                        .work_path
+                        .join("cases")
+                        .join(format!("{ordinal:03}"))
+                        .join("root"),
+                    lane,
+                    false,
+                )?;
+            }
+            state.publisher = Some(entered_snapshot);
+            self.ack_validated(entered.sequence, false)?;
+
+            let isolated =
+                self.recv_expected_case(ordinal, case, Task4CaseEvent::PublisherIsolated)?;
+            let isolated_process =
+                self.validate_live_case_process(&isolated, state.child, false)?;
+            self.validate_root(ordinal, isolated.root, state.root)?;
+            if !matches!(isolated_process.state, 'T' | 't')
+                || isolated.receipt != Task4ReceiptStatus::None
+                || isolated.wait != Task4WaitStatus::None
+                || isolated.publisher_exe != Task4IdentityField::Identity(self.python_identity)
+                || task4_fd_identity(state.child.pid, 3)?.is_some()
+                || task4_fd_identity(state.child.pid, 4)?.is_some()
+            {
+                return Err("publisher-isolated process/FD/field state is not exact".to_owned());
+            }
+            let isolated_snapshot =
+                self.publisher_snapshot(ordinal, state.child.pid, lane == "lane14")?;
+            if state.publisher.as_ref() != Some(&isolated_snapshot) {
+                return Err("publisher-isolated snapshot differs from publisher-entered".to_owned());
+            }
+            self.validate_status(
+                ordinal,
+                case,
+                if class == Task4OutcomeClass::I97 {
+                    Task4ReceiptStatus::Invalid
+                } else {
+                    Task4ReceiptStatus::None
+                },
+            )?;
+            if class == Task4OutcomeClass::S0 {
+                task4_validate_success_facts(
+                    &self
+                        .work_path
+                        .join("cases")
+                        .join(format!("{ordinal:03}"))
+                        .join("root"),
+                    lane,
+                    false,
+                )?;
+            }
+            self.ack_validated(isolated.sequence, false)?;
+
+            let reaped = self.recv_expected_case(ordinal, case, Task4CaseEvent::Reaped)?;
+            let (receipt, wait) = class.terminal();
+            if reaped.child_pid != state.child.pid
+                || reaped.child_starttime != state.child.starttime
+                || reaped.root != Task4IdentityField::Identity(state.root.unwrap())
+                || reaped.receipt != receipt
+                || reaped.wait != Task4WaitStatus::Code(wait)
+                || reaped.publisher_exe != Task4IdentityField::None
+                || task4_proc_identity(state.child.pid)
+                    .is_some_and(|current| current.starttime == state.child.starttime)
+            {
+                return Err("full case-reaped state is not exact".to_owned());
+            }
+            self.validate_status(ordinal, case, receipt)?;
+            let final_tree = task4_snapshot_tree(
+                &self
+                    .work_path
+                    .join("cases")
+                    .join(format!("{ordinal:03}"))
+                    .join("root"),
+            )?;
+            task4_validate_terminal_delta(
+                state
+                    .publisher
+                    .as_ref()
+                    .ok_or_else(|| "full case omitted publisher snapshot".to_owned())?,
+                &final_tree,
+                class,
+            )?;
+            if class == Task4OutcomeClass::S0 {
+                task4_validate_success_facts(
+                    &self
+                        .work_path
+                        .join("cases")
+                        .join(format!("{ordinal:03}"))
+                        .join("root"),
+                    lane,
+                    true,
+                )?;
+            }
+            self.validate_group_members(&[self.identity.pid, self.supervisor.unwrap().pid])?;
+            self.ack_validated(reaped.sequence, false)?;
+        }
+
+        self.validate_observer_generations()?;
+        self.validate_group_members(&[self.identity.pid, self.supervisor.unwrap().pid])?;
+        let complete = self.recv_frame()?;
+        if complete.fields.len() != 5
+            || complete.fields[3] != "complete"
+            || usize::try_from(task4_canonical_u64(
+                &complete.fields[4],
+                "complete case count",
+            )?)
+            .map_err(|_| "complete case count exceeds usize".to_owned())?
+                != cases.len()
+            || complete.sequence + 1 != expected_frames as u64
+        {
+            return Err(format!(
+                "driver complete frame is not exact: {:?}",
+                complete.raw
+            ));
+        }
+        let complete_sequence = complete.sequence;
+        self.validate_observer_generations()?;
+        for path in [
+            self.work_path.join("control.in"),
+            self.work_path.join("events.out"),
+            self.work_path.join("cases"),
+        ] {
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                _ => {
+                    return Err(format!(
+                        "protocol object remains at complete: {}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        if fs::read_dir(&self.work_path)
+            .map_err(|error| format!("list work at complete: {error}"))?
+            .next()
+            .is_some()
+        {
+            return Err("observer work is not empty at complete".to_owned());
+        }
+        self.validate_work_parent()?;
+        self.ack_validated(complete_sequence, true)?;
+        self.expect_protocol_eof()?;
+        Ok(())
+    }
+
+    fn expect_protocol_eof(&mut self) -> Result<(), String> {
+        self.peer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|error| format!("set protocol EOF timeout: {error}"))?;
+        let mut byte = [0u8; 1];
+        match self.peer.read(&mut byte) {
+            Ok(0) => Ok(()),
+            Ok(_) => Err("extra protocol data followed complete".to_owned()),
+            Err(error) => Err(format!("protocol EOF was not observed: {error}")),
+        }
+    }
+
+    fn validate_helper_process(
+        &self,
+        pid: u32,
+        starttime: u64,
+    ) -> Result<Task4ProcessIdentity, String> {
+        let process =
+            task4_proc_identity(pid).ok_or_else(|| format!("helper process {pid} is not live"))?;
+        if process.starttime != starttime
+            || process.ppid != self.identity.pid
+            || process.pgid != self.identity.pgid
+            || task4_fd_identity(pid, 5)? != Some(self.socket_identity)
+        {
+            return Err("helper generation/parent/group/FD5 identity differs".to_owned());
+        }
+        for fd in [3, 4, 6, 7, 8, 9] {
+            if task4_fd_identity(pid, fd)?.is_some() {
+                return Err(format!("helper unexpectedly retains reserved FD {fd}"));
+            }
+        }
+        self.validate_work_parent()?;
+        self.validate_group_members(&[self.identity.pid, pid])?;
+        Ok(process)
+    }
+
+    fn validate_helper_protocol(&mut self, helper: &str) -> Result<(), String> {
+        let ready = self.recv_frame()?;
+        if ready.fields.len() != 8
+            || ready.fields[3] != "helper-work-ready"
+            || ready.fields[4] != helper
+        {
+            return Err(format!("helper-work-ready is not exact: {:?}", ready.raw));
+        }
+        let ready_fields = ready.fields.clone();
+        let ready_sequence = ready.sequence;
+        let pid = task4_canonical_u32(&ready_fields[5], "helper PID")?;
+        let starttime = task4_canonical_u64(&ready_fields[6], "helper starttime")?;
+        let root_identity = task4_dev_ino(&ready_fields[7], "helper root identity")?;
+        self.validate_helper_process(pid, starttime)?;
+        let helper_root = self.work_path.join("helper");
+        let root = fs::symlink_metadata(&helper_root)
+            .map_err(|error| format!("stat helper root: {error}"))?;
+        if !root.file_type().is_dir()
+            || root.uid() != unsafe { libc::geteuid() }
+            || root.permissions().mode() & 0o777 != 0o700
+            || (root.dev(), root.ino()) != root_identity
+            || fs::read_dir(&helper_root)
+                .map_err(|error| format!("list helper root: {error}"))?
+                .next()
+                .is_some()
+        {
+            return Err("helper root is not the exact empty private child".to_owned());
+        }
+        let mut work_entries = fs::read_dir(&self.work_path)
+            .map_err(|error| format!("list helper work: {error}"))?
+            .map(|entry| {
+                entry
+                    .map_err(|error| format!("read helper work entry: {error}"))
+                    .and_then(|entry| {
+                        entry
+                            .file_name()
+                            .into_string()
+                            .map_err(|_| "helper work contains non-UTF-8 name".to_owned())
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        work_entries.sort();
+        if work_entries != ["helper"] {
+            return Err(format!(
+                "unexpected helper work inventory: {work_entries:?}"
+            ));
+        }
+        self.ack_validated(ready_sequence, false)?;
+
+        let body = self.recv_frame()?;
+        if body.fields.len() != 9
+            || body.fields[3] != "helper-body-complete"
+            || body.fields[4] != helper
+        {
+            return Err(format!("helper-body-complete is not exact: {:?}", body.raw));
+        }
+        let body_fields = body.fields.clone();
+        let body_sequence = body.sequence;
+        if task4_canonical_u32(&body_fields[5], "helper PID")? != pid
+            || task4_canonical_u64(&body_fields[6], "helper starttime")? != starttime
+        {
+            return Err("helper-body-complete changed helper generation".to_owned());
+        }
+        self.validate_helper_process(pid, starttime)?;
+        let first = task4_dev_ino(&body_fields[7], "helper output identity")?;
+        let second = if body_fields[8] == "-" {
+            None
+        } else {
+            Some(task4_dev_ino(
+                &body_fields[8],
+                "second helper output identity",
+            )?)
+        };
+        let expected_names: &[&str] = match helper {
+            "canaries" => &["canaries.result"],
+            "attach-e2e" => &["attach-e2e.result"],
+            "discover" => &["discover.facts.journal", "discover.facts.payload"],
+            _ => return Err(format!("unknown Task 4 helper {helper:?}")),
+        };
+        let mut names = fs::read_dir(&helper_root)
+            .map_err(|error| format!("list completed helper root: {error}"))?
+            .map(|entry| {
+                entry
+                    .map_err(|error| format!("read helper result entry: {error}"))
+                    .and_then(|entry| {
+                        entry
+                            .file_name()
+                            .into_string()
+                            .map_err(|_| "helper result has non-UTF-8 name".to_owned())
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        names.sort();
+        if names != expected_names {
+            return Err(format!("helper result inventory differs: {names:?}"));
+        }
+        let mut contents = Vec::new();
+        for (index, name) in expected_names.iter().enumerate() {
+            let path = helper_root.join(name);
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("stat helper output {name}: {error}"))?;
+            let reported = if index == 0 { Some(first) } else { second };
+            if !metadata.file_type().is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.permissions().mode() & 0o777 != 0o600
+                || metadata.nlink() != 1
+                || reported != Some((metadata.dev(), metadata.ino()))
+            {
+                return Err(format!("helper output {name} identity/metadata differs"));
+            }
+            contents.push(Self::read_optional_file(&path, name, 1024 * 1024)?);
+        }
+        match helper {
+            "canaries"
+                if contents[0]
+                    == format!("selftest-v1\t{}\tcanaries\tresult\tOK\n", self.nonce)
+                        .as_bytes() => {}
+            "attach-e2e"
+                if contents[0]
+                    == format!("selftest-v1\t{}\tattach-e2e\tresult\tOK\n", self.nonce)
+                        .as_bytes() => {}
+            "discover" => self.validate_discover_helper(first, &contents[0], &contents[1])?,
+            _ => return Err(format!("helper {helper} result content differs")),
+        }
+        self.ack_validated(body_sequence, false)?;
+
+        let cleanup = self.recv_frame()?;
+        let helper_absent = matches!(
+            fs::symlink_metadata(&helper_root),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        );
+        if cleanup.fields.len() != 7
+            || cleanup.fields[3] != "helper-cleanup-complete"
+            || cleanup.fields[4] != helper
+            || task4_canonical_u32(&cleanup.fields[5], "helper PID")? != pid
+            || task4_canonical_u64(&cleanup.fields[6], "helper starttime")? != starttime
+            || !helper_absent
+        {
+            return Err(format!(
+                "helper-cleanup-complete is not exact: {:?}",
+                cleanup.raw
+            ));
+        }
+        let cleanup_sequence = cleanup.sequence;
+        self.validate_helper_process(pid, starttime)?;
+        if fs::read_dir(&self.work_path)
+            .map_err(|error| format!("list helper work after cleanup: {error}"))?
+            .next()
+            .is_some()
+        {
+            return Err("helper work is not empty after cleanup".to_owned());
+        }
+        self.validate_work_parent()?;
+        self.ack_validated(cleanup_sequence, false)?;
+
+        let complete = self.recv_frame()?;
+        if complete.fields.len() != 5
+            || complete.fields[3] != "complete"
+            || complete.fields[4] != "1"
+            || complete.sequence != 3
+        {
+            return Err(format!("helper complete is not exact: {:?}", complete.raw));
+        }
+        let complete_sequence = complete.sequence;
+        self.validate_helper_process(pid, starttime)?;
+        self.ack_validated(complete_sequence, true)?;
+        self.expect_protocol_eof()?;
+        Ok(())
+    }
+
+    fn validate_discover_helper(
+        &self,
+        journal_identity: (u64, u64),
+        journal: &[u8],
+        payload: &[u8],
+    ) -> Result<(), String> {
+        let journal_digest = task4_sha256(journal);
+        let journal = std::str::from_utf8(journal)
+            .map_err(|error| format!("discover journal is not UTF-8: {error}"))?;
+        let rows = journal.lines().collect::<Vec<_>>();
+        if rows.len() != 4
+            || rows[0] != "journal-v1\t0\tresource.000.requested\tfake-container:test"
+            || rows[2] != "journal-v1\t2\tresource.000.cleanup\t0"
+            || rows[3] != "journal-v1\t3\tresource.000.absence\ttrue"
+        {
+            return Err("discover journal grammar differs".to_owned());
+        }
+        let resolved = rows[1]
+            .strip_prefix("journal-v1\t1\tresource.000.resolved\tpid=")
+            .and_then(|value| value.split_once(",starttime="))
+            .ok_or("discover resolved journal row differs")?;
+        let child_pid = task4_canonical_u32(resolved.0, "discover child PID")?;
+        let child_starttime = task4_canonical_u64(resolved.1, "discover child starttime")?;
+        if task4_proc_identity(child_pid)
+            .is_some_and(|current| current.starttime == child_starttime)
+        {
+            return Err("discover helper child remains live".to_owned());
+        }
+        let payload = std::str::from_utf8(payload)
+            .map_err(|error| format!("discover payload is not UTF-8: {error}"))?;
+        let payload_rows = payload.lines().collect::<Vec<_>>();
+        let expected_tail = [
+            "payload-v1\t2\tresource.count\t1".to_owned(),
+            format!("payload-v1\t3\tresource.000.pid\t{child_pid}"),
+            format!("payload-v1\t4\tresource.000.starttime\t{child_starttime}"),
+            "payload-v1\t5\tresource.000.cleanup\t0".to_owned(),
+            "payload-v1\t6\tresource.000.absence\ttrue".to_owned(),
+            "payload-v1\t7\tchild.wait\t0".to_owned(),
+        ];
+        if payload_rows.len() != 8
+            || payload_rows[0]
+                != format!(
+                    "payload-v1\t0\tjournal.identity\t{}:{}",
+                    journal_identity.0, journal_identity.1
+                )
+            || !payload_rows[1].starts_with("payload-v1\t1\tjournal.sha256\t")
+            || payload_rows[2..] != expected_tail
+        {
+            return Err("discover payload grammar or child relation differs".to_owned());
+        }
+        let digest = payload_rows[1]
+            .strip_prefix("payload-v1\t1\tjournal.sha256\t")
+            .unwrap();
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || digest != journal_digest
+        {
+            return Err("discover journal digest is not its exact lowercase SHA-256".to_owned());
+        }
+        Ok(())
+    }
+
+    fn ack_validated(&mut self, sequence: u64, complete: bool) -> Result<(), String> {
+        let pending = self
+            .pending
+            .take()
+            .ok_or_else(|| "no pending audit frame".to_owned())?;
+        if pending.sequence != sequence || sequence != self.next_sequence {
+            self.pending = Some(pending);
+            return Err("audit acknowledgement does not match pending sequence".to_owned());
+        }
+        if complete != (pending.fields.get(3).map(String::as_str) == Some("complete")) {
+            self.pending = Some(pending);
+            return Err("audit complete acknowledgement does not match frame".to_owned());
+        }
+        let bytes = pending.raw.as_bytes();
+        let new_len = self.trace_len + bytes.len() as u64 + 1;
+        if new_len > 1024 * 1024 {
+            self.pending = Some(pending);
+            return Err("audit trace exceeded 1 MiB".to_owned());
+        }
+        self.trace
+            .write_all(bytes)
+            .and_then(|()| self.trace.write_all(b"\n"))
+            .map_err(|error| format!("append audit trace: {error}"))?;
+        self.trace_len = new_len;
+        if complete {
+            self.trace
+                .sync_all()
+                .map_err(|error| format!("fsync completed audit trace: {error}"))?;
+            self.complete_acked = true;
+        }
+        task4_send_frame(
+            &mut self.peer,
+            &format!("audit-v1\t{}\t{sequence}\tack", self.nonce),
+        )?;
+        self.next_sequence += 1;
+        Ok(())
+    }
+
+    fn anchor_is_live_and_same(&self) -> bool {
+        task4_proc_starttime(self.identity.pid) == Some(self.identity.starttime)
+            && unsafe { libc::getpgid(self.identity.pid as libc::pid_t) }
+                == self.identity.pgid as libc::pid_t
+    }
+
+    fn abort(&mut self) -> Result<(), String> {
+        self.trace
+            .sync_all()
+            .map_err(|error| format!("fsync rejected audit prefix: {error}"))?;
+        let Some(mut anchor) = self.anchor.take() else {
+            return Ok(());
+        };
+        if let Some(_) = anchor
+            .try_wait()
+            .map_err(|error| format!("poll observed anchor before abort: {error}"))?
+        {
+            return if task4_group_absent(self.identity.pgid) {
+                Ok(())
+            } else {
+                Err("anchor exited before cleanup while its group remained".to_owned())
+            };
+        }
+        if !self.anchor_is_live_and_same() {
+            return Err("refusing to signal changed observed anchor generation".to_owned());
+        }
+        let killed = unsafe { libc::kill(-(self.identity.pgid as libc::pid_t), libc::SIGKILL) };
+        if killed == -1 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+            return Err(format!(
+                "kill observed anchor group: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            self.check_capture_bounds()?;
+            match anchor
+                .try_wait()
+                .map_err(|error| format!("reap observed anchor: {error}"))?
+            {
+                Some(_) => break,
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                None => return Err("observed anchor reap exceeded five seconds".to_owned()),
+            }
+        }
+        while !task4_group_absent(self.identity.pgid) {
+            self.check_capture_bounds()?;
+            if Instant::now() >= deadline {
+                return Err("observed process group survived SIGKILL".to_owned());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    fn finish_rejected(mut self) -> Result<(), String> {
+        if self.pending.is_some() || self.complete_acked {
+            return Err("rejected probe retained an acknowledged protocol state".to_owned());
+        }
+        let mut anchor = self
+            .anchor
+            .take()
+            .ok_or("rejected probe anchor already consumed")?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            self.check_capture_bounds()?;
+            match anchor
+                .try_wait()
+                .map_err(|error| format!("poll rejected probe anchor: {error}"))?
+            {
+                Some(status) => break status,
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                None => {
+                    self.anchor = Some(anchor);
+                    self.abort()?;
+                    return Err("rejected probe exit exceeded five seconds".to_owned());
+                }
+            }
+        };
+        if status.success() {
+            return Err("rejected probe exited successfully".to_owned());
+        }
+        if !task4_group_absent(self.identity.pgid) {
+            return Err("rejected probe left process-group residue".to_owned());
+        }
+        self.check_optional_files()?;
+        if !self.tripwire_contents()?.is_empty()
+            || !Self::read_optional_file(&self.report_path, "self-test report", 8 * 1024 * 1024)?
+                .is_empty()
+            || fs::read_dir(&self.work_path)
+                .map_err(|error| format!("list rejected probe work: {error}"))?
+                .next()
+                .is_some()
+        {
+            return Err("rejected probe mutated work, report, or command tripwire".to_owned());
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Task4ObservedResult, String> {
+        if !self.complete_acked || self.pending.is_some() {
+            return Err("cannot finish before the validated complete acknowledgement".to_owned());
+        }
+        let mut anchor = self
+            .anchor
+            .take()
+            .ok_or("observed anchor already consumed")?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            self.check_capture_bounds()?;
+            match anchor
+                .try_wait()
+                .map_err(|error| format!("poll observed anchor: {error}"))?
+            {
+                Some(status) => break status,
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                None => {
+                    self.anchor = Some(anchor);
+                    self.abort()?;
+                    return Err("observed anchor finish exceeded five seconds".to_owned());
+                }
+            }
+        };
+        if !task4_group_absent(self.identity.pgid) {
+            return Err("observed anchor exited but its process group remained".to_owned());
+        }
+        if !status.success() {
+            return Err(format!("observed anchor exited with {status}"));
+        }
+        self.validate_work_parent()?;
+        if fs::read_dir(&self.work_path)
+            .map_err(|error| format!("list observer work after anchor exit: {error}"))?
+            .next()
+            .is_some()
+        {
+            return Err("observer work changed after complete acknowledgement".to_owned());
+        }
+        self.check_capture_bounds()?;
+        self.check_optional_files()?;
+        let stdout = Self::read_capture(&self.stdout, "stdout")?;
+        let stderr = Self::read_capture(&self.stderr, "stderr")?;
+        let trace = String::from_utf8(Self::read_capture(&self.trace, "audit trace")?)
+            .map_err(|error| format!("audit trace is not UTF-8: {error}"))?;
+        let report =
+            Self::read_optional_file(&self.report_path, "self-test report", 8 * 1024 * 1024)?;
+        let tripwire = self.tripwire_contents()?;
+        Ok(Task4ObservedResult {
+            _fixture: self.fixture.take().unwrap(),
+            stdout,
+            stderr,
+            trace,
+            identity: self.identity,
+            socket_identity: self.socket_identity,
+            report,
+            tripwire,
+        })
+    }
+}
+
+impl Drop for Task4ObservedSession {
+    fn drop(&mut self) {
+        let _ = self.abort();
+    }
+}
+
+#[test]
+fn task4_sha256_matches_standard_vectors() {
+    assert_eq!(
+        task4_sha256(b""),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(
+        task4_sha256(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+}
+
+#[test]
+fn task4_report_requires_final_lf() {
+    let report = format!(
+        "selftest-v1\tcase\tfacts-schema-v1-schema.sha256-exact-accepted\t{0}\t{0}\nselftest-v1\tcomplete",
+        TASK4_FACT_SCHEMA_V1_DIGEST
+    );
+    let error = task4_validate_report(
+        report.as_bytes(),
+        &["facts-schema-v1-schema.sha256-exact-accepted"],
+        TASK4_FACT_SCHEMA_V1_DIGEST,
+    )
+    .expect_err("an unterminated final report row must be rejected");
+    assert!(error.contains("LF-terminated"));
+}
+
+#[test]
+fn task4_terminal_delta_is_exact_for_every_full_class() {
+    let entry = |kind, ino, mode, content: &[u8]| Task4SnapshotEntry {
+        kind,
+        dev: 1,
+        ino,
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
+        mode,
+        nlink: 1,
+        size: content.len() as u64,
+        content: content.to_vec(),
+    };
+    let before_facts = b"facts-v1\t0\tschema.sha256\tx\n";
+    for (class, code) in [
+        (Task4OutcomeClass::N97, 97),
+        (Task4OutcomeClass::I97, 97),
+        (Task4OutcomeClass::R97, 97),
+        (Task4OutcomeClass::SigInt, 130),
+        (Task4OutcomeClass::SigHup, 129),
+        (Task4OutcomeClass::SigTerm, 143),
+        (Task4OutcomeClass::S0, 0),
+    ] {
+        let mut isolated_tree = BTreeMap::from([
+            (
+                "".to_owned(),
+                entry(Task4SnapshotKind::Directory, 10, 0o700, b""),
+            ),
+            (
+                ".task4.lock".to_owned(),
+                entry(Task4SnapshotKind::Regular, 11, 0o600, b""),
+            ),
+            (
+                "root".to_owned(),
+                entry(Task4SnapshotKind::Directory, 12, 0o700, b""),
+            ),
+            (
+                "root/facts.log".to_owned(),
+                entry(Task4SnapshotKind::Regular, 13, 0o600, before_facts),
+            ),
+            (
+                "root/artifacts".to_owned(),
+                entry(Task4SnapshotKind::Directory, 14, 0o700, b""),
+            ),
+            (
+                "root/work".to_owned(),
+                entry(Task4SnapshotKind::Directory, 15, 0o700, b""),
+            ),
+        ]);
+        if class == Task4OutcomeClass::I97 {
+            isolated_tree.insert(
+                "root/status".to_owned(),
+                entry(Task4SnapshotKind::Regular, 16, 0o600, b"0\n0\n"),
+            );
+        }
+        let isolated = Task4PublisherSnapshot {
+            tree: isolated_tree,
+            descriptors: BTreeMap::new(),
+            executable: (2, 2),
+        };
+        let mut final_tree = BTreeMap::from([
+            (
+                "".to_owned(),
+                entry(Task4SnapshotKind::Directory, 12, 0o700, b""),
+            ),
+            (
+                "artifacts".to_owned(),
+                entry(Task4SnapshotKind::Directory, 14, 0o700, b""),
+            ),
+            (
+                "work".to_owned(),
+                entry(Task4SnapshotKind::Directory, 15, 0o700, b""),
+            ),
+        ]);
+        let final_facts = format!(
+            "{}facts-v1\t1\tterminal_status_intent\t{code}\n",
+            std::str::from_utf8(before_facts).unwrap()
+        );
+        final_tree.insert(
+            "facts.log".to_owned(),
+            entry(
+                Task4SnapshotKind::Regular,
+                13,
+                0o600,
+                final_facts.as_bytes(),
+            ),
+        );
+        if class == Task4OutcomeClass::I97 {
+            final_tree.insert(
+                "status".to_owned(),
+                entry(Task4SnapshotKind::Regular, 16, 0o600, b"0\n0\n"),
+            );
+        } else if class != Task4OutcomeClass::N97 {
+            final_tree.insert(
+                "status".to_owned(),
+                entry(
+                    Task4SnapshotKind::Regular,
+                    20 + code as u64,
+                    0o600,
+                    format!("{code}\n").as_bytes(),
+                ),
+            );
+        }
+        task4_validate_terminal_delta(&isolated, &final_tree, class)
+            .expect("exact terminal delta must pass");
+
+        let mut mutated = final_tree.clone();
+        mutated.insert(
+            "artifacts/foreign".to_owned(),
+            entry(Task4SnapshotKind::Regular, 999, 0o600, b"foreign"),
+        );
+        task4_validate_terminal_delta(&isolated, &mutated, class)
+            .expect_err("post-isolation artifact mutation must fail");
+    }
+}
+
+#[test]
+fn task4_observer_rejects_complete_report_without_protocol() {
+    let fixture = tempfile::tempdir().expect("create no-frame fixture");
+    let script = fixture.path().join("no-frame.sh");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' \
+'selftest-v1	case	complete-success-status-0-last-once	OK	OK' \
+'selftest-v1	case	facts-schema-v1-schema.sha256-exact-accepted	{0}	{0}' \
+'selftest-v1	complete' > "$P11SCOPE_TASK4_SELF_TEST_REPORT"
+chmod 600 "$P11SCOPE_TASK4_SELF_TEST_REPORT"
+printf '%s\n' 'marker-complete digest-correct exhaustive reporter'
+"#,
+            TASK4_FACT_SCHEMA_V1_DIGEST
+        ),
+    )
+    .expect("write no-frame script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("chmod no-frame script");
+    let mut session = Task4ObservedSession::spawn(&script, &["--self-test"])
+        .expect("spawn no-frame observed session");
+    let error = session
+        .recv_frame()
+        .expect_err("a no-frame child must fail the observed FD5 gate");
+    let report =
+        Task4ObservedSession::read_optional_file(&session.report_path, "self-test report", 8192)
+            .expect("read marker-only report");
+    task4_validate_report(
+        &report,
+        &[
+            "complete-success-status-0-last-once",
+            "facts-schema-v1-schema.sha256-exact-accepted",
+        ],
+        TASK4_FACT_SCHEMA_V1_DIGEST,
+    )
+    .expect("marker-only report is deliberately complete");
+    assert!(session.tripwire_contents().unwrap().is_empty());
+    session.abort().expect("clean no-frame observed session");
+    assert!(
+        error.contains("closed before one LF-terminated frame")
+            || error.contains("Connection reset by peer"),
+        "unexpected bounded no-frame result: {error}"
+    );
+}
+
+#[test]
+fn task4_observer_rejects_state_frame_without_production_child() {
+    let fixture = tempfile::tempdir().expect("create observed protocol fixture");
+    let script = fixture.path().join("observed.sh");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+set -eu
+work=$P11SCOPE_TASK4_SELF_TEST_WORK
+tab=$(printf '\t')
+IFS=$tab read -r version nonce kind <&5
+[ "$version" = audit-v1 ] && [ "$kind" = challenge ]
+mkfifo "$work/control.in" "$work/events.out" 5>&-
+mkdir "$work/cases" 5>&-
+chmod 600 "$work/control.in" "$work/events.out" 5>&-
+chmod 700 "$work/cases" 5>&-
+exec 3<>"$work/control.in"
+exec 4<>"$work/events.out"
+start=$(python3 -c 'import sys; s=open("/proc/%s/stat"%sys.argv[1]).read(); print(s[s.rfind(")")+2:].split()[19])' "$$" 3>&- 4>&- 5>&-)
+parent=$(stat -Lc '%d:%i' "$work" 3>&- 4>&- 5>&-)
+control=$(stat -Lc '%d:%i' "$work/control.in" 3>&- 4>&- 5>&-)
+events=$(stat -Lc '%d:%i' "$work/events.out" 3>&- 4>&- 5>&-)
+printf 'audit-v1\t%s\t0\tsupervisor-ready\t%s\t%s\t%s\t%s\t%s\n' "$nonce" "$$" "$start" "$parent" "$control" "$events" >&5
+IFS=$tab read -r a b c d <&5
+[ "$a" = audit-v1 ] && [ "$b" = "$nonce" ] && [ "$c" = 0 ] && [ "$d" = ack ]
+printf 'audit-v1\t%s\t1\tcase-started\t0\tcomplete-success-status-0-last-once\t%s\t%s\tnone\tnone\tnone\t-\n' "$nonce" "$$" "$start" >&5
+IFS=$tab read -r a b c d <&5
+[ "$a" = audit-v1 ] && [ "$b" = "$nonce" ] && [ "$c" = 1 ] && [ "$d" = ack ]
+"#,
+    )
+    .expect("write observed protocol script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
+        .expect("chmod observed protocol script");
+
+    let mut session =
+        Task4ObservedSession::spawn(&script, &["--self-test"]).expect("spawn observed session");
+    let supervisor = session
+        .validate_supervisor_ready()
+        .expect("validate and ack supervisor-ready");
+    assert_ne!(supervisor.pid, session.identity.pid);
+    let error = session
+        .validate_case_started(
+            0,
+            "complete-success-status-0-last-once",
+            Task4OutcomeClass::S0,
+        )
+        .expect_err("synthetic supervisor must not impersonate a production case child");
+    assert!(
+        error.contains("generation/parent/group mismatch"),
+        "unexpected state-dependent rejection: {error}"
+    );
+    assert!(session.tripwire_contents().unwrap().is_empty());
+    session.abort().expect("clean rejected synthetic reporter");
+}
+
+#[test]
+fn task4_observer_rejects_publisher_mutation_before_isolation() {
+    let fixture = tempfile::tempdir().expect("create publisher-isolation fixture");
+    let script = fixture.path().join("publisher-mutation.sh");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+set -eu
+work=$P11SCOPE_TASK4_SELF_TEST_WORK
+tab=$(printf '\t')
+IFS=$tab read -r version nonce kind <&5
+[ "$version" = audit-v1 ] && [ "$kind" = challenge ]
+mkfifo "$work/control.in" "$work/events.out" 5>&-
+mkdir "$work/cases" 5>&-
+chmod 600 "$work/control.in" "$work/events.out" 5>&-
+chmod 700 "$work/cases" 5>&-
+exec 3<>"$work/control.in"
+exec 4<>"$work/events.out"
+start=$(python3 -c 'import sys; s=open("/proc/%s/stat"%sys.argv[1]).read(); print(s[s.rfind(")")+2:].split()[19])' "$$" 3>&- 4>&- 5>&-)
+parent=$(stat -Lc '%d:%i' "$work" 3>&- 4>&- 5>&-)
+control=$(stat -Lc '%d:%i' "$work/control.in" 3>&- 4>&- 5>&-)
+events=$(stat -Lc '%d:%i' "$work/events.out" 3>&- 4>&- 5>&-)
+publisher_exe=$(stat -Lc '%d:%i' /usr/bin/python3 3>&- 4>&- 5>&-)
+printf 'audit-v1\t%s\t0\tsupervisor-ready\t%s\t%s\t%s\t%s\t%s\n' "$nonce" "$$" "$start" "$parent" "$control" "$events" >&5
+IFS=$tab read -r a b c d <&5
+[ "$a" = audit-v1 ] && [ "$b" = "$nonce" ] && [ "$c" = 0 ] && [ "$d" = ack ]
+mkdir "$work/cases/000"
+chmod 700 "$work/cases/000"
+/bin/sh -c '
+set -eu
+nonce=$1
+work=$2
+publisher_exe=$3
+case_name=input-mutation-rejected-nonzero-status-last-once
+pid=$$
+start=$(python3 -c '"'"'import sys; s=open("/proc/%s/stat"%sys.argv[1]).read(); print(s[s.rfind(")")+2:].split()[19])'"'"' "$pid" 3>&- 4>&- 5>&-)
+tab=$(printf "\t")
+send() {
+    printf "audit-v1\t%s\t%s\t%s\t0\t%s\t%s\t%s\t%s\tnone\tnone\t-\n" \
+        "$nonce" "$1" "$2" "$case_name" "$pid" "$start" "$3" >&4
+    IFS=$tab read -r a b c d <&3
+    [ "$a" = audit-v1 ] && [ "$b" = "$nonce" ] && [ "$c" = "$1" ] && [ "$d" = ack ]
+}
+send 1 case-started none
+mkdir "$work/cases/000/root"
+chmod 700 "$work/cases/000/root"
+root=$(stat -Lc "%d:%i" "$work/cases/000/root" 3>&- 4>&- 5>&-)
+send 2 owner-entered "$root"
+send 3 finalizer-entered "$root"
+exec 7>"$work/cases/000/root/facts.log"
+exec 9>"$work/cases/000/.task4.lock"
+exec /usr/bin/python3 -c '"'"'
+import os
+import signal
+import sys
+nonce, case_name, pid, start, root, publisher_exe = sys.argv[1:]
+line = "audit-v1\t%s\t4\tpublisher-entered\t0\t%s\t%s\t%s\t%s\tnone\tnone\t%s\n" % (
+    nonce, case_name, pid, start, root, publisher_exe)
+os.write(4, line.encode())
+ack = bytearray()
+while not ack.endswith(b"\n"):
+    chunk = os.read(3, 1)
+    if not chunk:
+        raise SystemExit(97)
+    ack += chunk
+if ack.decode() != "audit-v1\t%s\t4\tack\n" % nonce:
+    raise SystemExit(97)
+os.write(7, b"mutated-before-isolation\n")
+os.fsync(7)
+os.close(3)
+os.close(4)
+os.kill(int(pid), signal.SIGSTOP)
+'"'"' "$nonce" "$case_name" "$pid" "$start" "$root" "$publisher_exe" 5>&-
+' sh "$nonce" "$work" "$publisher_exe" 5>&- &
+child=$!
+for sequence in 1 2 3 4; do
+    IFS= read -r event <&4
+    printf '%s\n' "$event" >&5
+    IFS= read -r ack <&5
+    printf '%s\n' "$ack" >&3
+done
+while :; do
+    state=
+    while read -r key value rest; do
+        [ "$key" = State: ] && state=$value
+    done < "/proc/$child/status"
+    [ "$state" = T ] || [ "$state" = t ] || continue
+    break
+done
+child_start=$(python3 -c 'import sys; s=open("/proc/%s/stat"%sys.argv[1]).read(); print(s[s.rfind(")")+2:].split()[19])' "$child" 3>&- 4>&- 5>&-)
+root=$(stat -Lc '%d:%i' "$work/cases/000/root" 3>&- 4>&- 5>&-)
+printf 'audit-v1\t%s\t5\tpublisher-isolated\t0\tinput-mutation-rejected-nonzero-status-last-once\t%s\t%s\t%s\tnone\tnone\t%s\n' \
+    "$nonce" "$child" "$child_start" "$root" "$publisher_exe" >&5
+IFS= read -r unexpected_ack <&5
+exit 97
+"#,
+    )
+    .expect("write publisher-isolation fixture");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
+        .expect("chmod publisher-isolation fixture");
+
+    let mut session = Task4ObservedSession::spawn(&script, &["--self-test"])
+        .expect("spawn publisher-isolation fixture");
+    let error = session
+        .validate_driver_protocol(
+            "lane07",
+            &["input-mutation-rejected-nonzero-status-last-once"],
+        )
+        .expect_err("publisher mutation must be rejected before isolated ack");
+    assert!(
+        error.contains("publisher-isolated snapshot differs"),
+        "unexpected publisher-isolation rejection: {error}; trace={:?}",
+        String::from_utf8_lossy(
+            &Task4ObservedSession::read_capture(&session.trace, "audit trace").unwrap()
+        )
+    );
+    assert!(session.tripwire_contents().unwrap().is_empty());
+    assert!(
+        Task4ObservedSession::read_optional_file(
+            &session.work_path.join("cases/000/root/status"),
+            "unexpected terminal receipt",
+            4096,
+        )
+        .unwrap()
+        .is_empty()
+    );
+    session
+        .abort()
+        .expect("clean publisher-isolation negative fixture");
 }
 
 fn embedded_map_definitions() -> BTreeMap<String, [u32; 7]> {
@@ -2233,6 +5669,16 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         "duplicate-status-rejected",
         "changed-head-rejected",
         "changed-input-ledger-rejected",
+        "head-tree-final-revalidation-mutation-rejected",
+        "tracked-input-final-revalidation-mutation-rejected",
+        "untracked-input-final-revalidation-mutation-rejected",
+        "provider-identity-final-revalidation-mutation-rejected",
+        "observer-identity-final-revalidation-mutation-rejected",
+        "bpf-identity-final-revalidation-mutation-rejected",
+        "harness-identity-final-revalidation-mutation-rejected",
+        "checker-identity-final-revalidation-mutation-rejected",
+        "capture-identity-final-revalidation-mutation-rejected",
+        "artifact-identity-final-revalidation-mutation-rejected",
         "foreign-terminal-artifact-rejected",
         "missing-capture-evidence-rejected",
         "missing-checker-evidence-rejected",
@@ -2243,6 +5689,42 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         "retained-fixture-tree-validated",
         "retained-status-sequence-validated",
         "retained-source-input-ledgers-validated",
+        "success-facts-fsync-failure-rejected-nonzero-status-last-once",
+        "success-dir-fsync-failure-rejected-nonzero-status-last-once",
+        "success-mode-drift-rejected-nonzero-status-last-once",
+        "success-inventory-failure-rejected-nonzero-status-last-once",
+        "success-pending-write-failure-rejected-nonzero-status-last-once",
+        "success-pending-fsync-failure-rejected-nonzero-status-last-once",
+        "signal-INT-before-requested-registration-rejected-nonzero-status-last-once",
+        "signal-INT-after-requested-registration-rejected-nonzero-status-last-once",
+        "signal-INT-before-resolved-registration-rejected-nonzero-status-last-once",
+        "signal-INT-after-resolved-registration-rejected-nonzero-status-last-once",
+        "signal-HUP-before-requested-registration-rejected-nonzero-status-last-once",
+        "signal-HUP-after-requested-registration-rejected-nonzero-status-last-once",
+        "signal-HUP-before-resolved-registration-rejected-nonzero-status-last-once",
+        "signal-HUP-after-resolved-registration-rejected-nonzero-status-last-once",
+        "signal-TERM-before-requested-registration-rejected-nonzero-status-last-once",
+        "signal-TERM-after-requested-registration-rejected-nonzero-status-last-once",
+        "signal-TERM-before-resolved-registration-rejected-nonzero-status-last-once",
+        "signal-TERM-after-resolved-registration-rejected-nonzero-status-last-once",
+        "cleanup-failure-upgrades-terminal-status-and-is-written-last",
+        "absence-query-failure-upgrades-terminal-status-and-is-written-last",
+        "identity-mismatch-upgrades-terminal-status-and-is-written-last",
+        "reserved-fd-3-through-9-closed-to-fake-commands",
+        "facts-schema-v1-schema.sha256-exact-accepted",
+        "facts-schema-v1-unknown-key-rejected",
+        "facts-schema-v1-duplicate-key-rejected",
+        "facts-schema-v1-cardinality-mutation-rejected",
+        "facts-schema-v1-digest-mutation-rejected",
+        "terminal-renameat2-noreplace-collision-rejected",
+        "terminal-renameat2-unavailable-rejected",
+        "terminal-renameat2-success-last-filesystem-operation",
+        "rootless-invalid-root-and-poisoned-environment-reach-no-mutator",
+        "public-body-reentry-rejected",
+        "explicit-pwd-work-composition-rejected-before-mutation",
+        "stdout-capture-substitution-rejected",
+        "glob-first-observed-selection-rejected",
+        "find-mode-repair-rejected",
     ];
     const LANE07_CASES: &[&str] = &[
         "freeze-CONFIG-PID_FILTER-CGROUP_FILTER-DESCRIPTORS-ASYNC_FUNCTIONS-MECH_SHAPE-ATTR_BOOL_BITS-TEMPLATE_TAIL-exact-accepted",
@@ -2299,6 +5781,15 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         "equal-venv-package-ledgers-exact-accepted",
         "venv-package-ledger-mutation-rejected",
         "nonoracle-total-change-accepted",
+        "default-state-dangling-symlink-rejected-before-mutation",
+        "default-policy-dangling-symlink-rejected-before-mutation",
+        "wrong-default-filename-rejected-before-mutation",
+        "native-state-file-option-exact-private-path-accepted",
+        "native-policy-file-option-exact-private-path-accepted",
+        "derived-report-record-cache-exact-private-path-accepted",
+        "foreign-private-state-policy-cache-rejected",
+        "dirty-sibling-rejected-before-mutation",
+        "untracked-sibling-input-rejected-before-mutation",
     ];
     const LANE14_CASES: &[&str] = &[
         "single-terminal-owner-and-bound-child-facts-exact-accepted",
@@ -2319,6 +5810,22 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         "same-shell-single-finalizer-exact-accepted",
         "cleanup-failure-upgrades-one-status-written-last",
         "absolute-nested-work-and-legacy-defaults-exact-accepted",
+        "nested-journal-append-and-fsync-exact-accepted",
+        "nested-requested-before-create-resolved-before-activation-exact-accepted",
+        "nested-malformed-journal-rejected",
+        "nested-replaced-journal-rejected",
+        "nested-malformed-payload-rejected",
+        "nested-replaced-payload-rejected",
+        "creator-pid-starttime-reuse-rejected",
+        "nonce-ready-ack-mismatch-rejected",
+        "parent-death-before-ack-rejected",
+        "fd8-leak-to-unrelated-command-rejected",
+        "protocol-files-identity-cleaned-after-import",
+        "child-cleanup-uncertainty-rejected",
+        "creator-fd-inventory-standard-plus-6-exact-accepted",
+        "creator-fd6-imported-as-parent-fd8-exact-accepted",
+        "final-facts-replacement-rejected",
+        "publisher-entered-to-isolated-facts-mutation-rejected",
     ];
     const LANE16_CASES: &[&str] = &[
         "never-68-68-136-one-timing-zero-loss-ambiguity-inflight-child-false-none-0-0-0-exact-accepted",
@@ -2335,6 +5842,9 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         "private-CARGO_TARGET_DIR-ROOT-work-target-exact-accepted",
         "missing-observer-identity-ledger-rejected",
         "missing-cargo-identity-ledger-rejected",
+        "aggregate-evidence.module_ambiguous-zero-exact-accepted",
+        "child-absent-after-finalization-exact-accepted",
+        "final-identities-revalidated-before-status-exact-accepted",
     ];
 
     let drivers = [
@@ -2382,150 +5892,207 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         ),
     ];
     let mut failures = Vec::new();
+    for (lane, script, _marker, lane_cases) in drivers {
+        if lane == "lane02" {
+            continue;
+        }
 
-    let guard = tempfile::tempdir().expect("create unconditional Task 4 command tripwires");
-    for command in [
-        "bpftool",
-        "cargo",
-        "docker",
-        "file",
-        "p11scope",
-        "p11scope-discover",
-        "rustup",
-        "setpriv",
-        "sudo",
-        "systemctl",
-        "systemd-run",
-    ] {
-        let path = guard.path().join(command);
-        fs::write(
-            &path,
-            b"#!/bin/sh\nprintf '%s\\n' \"${0##*/}\" >> \"$P11SCOPE_TASK4_TRIPWIRE_LOG\"\nexit 97\n",
-        )
-        .expect("write Task 4 command tripwire");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-            .expect("make Task 4 command tripwire executable");
-    }
-    let lane14_guard = tempfile::tempdir().expect("create Lane 14 first-mutator tripwire");
-    let lane14_rm = lane14_guard.path().join("rm");
-    fs::write(
-        &lane14_rm,
-        b"#!/bin/sh\nprintf '%s\\n' \"${0##*/}\" >> \"$P11SCOPE_TASK4_TRIPWIRE_LOG\"\nexit 97\n",
-    )
-    .expect("write Lane 14 rm tripwire");
-    fs::set_permissions(&lane14_rm, fs::Permissions::from_mode(0o700))
-        .expect("make Lane 14 rm tripwire executable");
-
-    // A comment or unreachable branch containing `--self-test` must not turn
-    // off the guard. The first mutator is caught, its sentinel survives, and
-    // set -e proves the later Cargo/product runtime commands are unreachable.
-    let bypass = tempfile::tempdir().expect("create unreachable-dispatch fixture");
-    let bypass_script = bypass.path().join("comment-only-self-test.sh");
-    let bypass_log = bypass.path().join("tripwire.log");
-    let protected = bypass.path().join("protected");
-    let sentinel = protected.join("sentinel");
-    fs::create_dir(&protected).expect("create protected fixture directory");
-    fs::write(&sentinel, b"must survive byte-identical\n").expect("write protected sentinel");
-    fs::write(
-        &bypass_script,
-        b"#!/bin/sh\nset -eu\n# --self-test\n[ \"${1-}\" = --unreachable ] && exit 0\nrm -rf \"$P11SCOPE_TASK4_PROTECTED\"\ncargo build\np11scope run\n",
-    )
-    .expect("write unreachable-dispatch fixture");
-    let bypass_output = Command::new("/bin/sh")
-        .arg(&bypass_script)
-        .arg("--self-test")
-        .env(
-            "PATH",
-            format!(
-                "{}:{}:/usr/bin:/bin",
-                lane14_guard.path().display(),
-                guard.path().display()
-            ),
-        )
-        .env("P11SCOPE_TASK4_TRIPWIRE_LOG", &bypass_log)
-        .env("P11SCOPE_TASK4_PROTECTED", &protected)
-        .output()
-        .expect("run unreachable-dispatch fixture");
-    assert_eq!(bypass_output.status.code(), Some(97));
-    assert_eq!(read(bypass_log.to_str().unwrap()), "rm\n");
-    assert_eq!(
-        fs::read(&sentinel).unwrap(),
-        b"must survive byte-identical\n"
-    );
-
-    for (lane, script, marker, lane_cases) in drivers {
-        let fixture = tempfile::tempdir().expect("create retained Task 4 self-test fixture");
-        let report = fixture.path().join("report.tsv");
-        let tripwire_log = fixture.path().join("tripwire.log");
-        let mut command = Command::new("/bin/sh");
-        command.args([script, "--self-test"]);
-        let path = if lane == "lane14" {
-            format!(
-                "{}:{}:/usr/bin:/bin",
-                lane14_guard.path().display(),
-                guard.path().display()
-            )
-        } else {
-            format!("{}:/usr/bin:/bin", guard.path().display())
+        let expected_cases = COMMON_CASES
+            .iter()
+            .chain(lane_cases.unwrap_or_default())
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expected_cases
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len(),
+            expected_cases.len(),
+            "{lane} case alphabet contains duplicates"
+        );
+        let expected_frames = 2usize
+            + expected_cases
+                .iter()
+                .map(|case| task4_outcome_class(case).sequence().len())
+                .sum::<usize>();
+        let frozen_frames = match lane {
+            "lane07" => 578,
+            "lane09" => 452,
+            "lane10" => 458,
+            "lane11" => 498,
+            "lane14" => 616,
+            "lane16" => 498,
+            _ => unreachable!(),
         };
-        command
-            .env("PATH", path)
-            .env("P11SCOPE_TASK4_TRIPWIRE_LOG", &tripwire_log)
-            .env("P11SCOPE_TASK4_SELF_TEST_REPORT", &report)
-            .env("CARGO", guard.path().join("cargo"))
-            .env("DOCKER", guard.path().join("docker"))
-            .env("RUSTUP", guard.path().join("rustup"))
-            .env("SUDO", guard.path().join("sudo"));
-        let output = command
-            .output()
-            .unwrap_or_else(|error| panic!("run {lane} self-test: {error}"));
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let tripped = fs::read_to_string(&tripwire_log).unwrap_or_default();
-        if !tripped.is_empty() {
-            failures.push(format!(
-                "{lane} ({script}) crossed the self-test boundary: {tripped:?}"
-            ));
-        }
-        if !output.status.success() || !(stdout.contains(marker) || stderr.contains(marker)) {
-            failures.push(format!(
-                "{lane} ({script}): status={:?}, marker={marker:?}, stdout={stdout:?}, stderr={stderr:?}",
-                output.status.code()
-            ));
-        }
-        if let Some(lane_cases) = lane_cases {
-            match fs::symlink_metadata(&report) {
-                Ok(metadata) => {
-                    if !metadata.file_type().is_file()
-                        || metadata.nlink() != 1
-                        || metadata.permissions().mode() & 0o777 != 0o600
+        assert_eq!(expected_frames, frozen_frames, "{lane} frame count drifted");
+        assert!(expected_frames <= 6 * expected_cases.len() + 2);
+
+        let environment: [(String, String); 0] = [];
+
+        let mut session = match Task4ObservedSession::spawn_with_env(
+            Path::new(script),
+            &["--self-test"],
+            &environment,
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                failures.push(format!("{lane} ({script}) observer setup failed: {error}"));
+                continue;
+            }
+        };
+        let expected_case_count = expected_cases.len();
+        match session.validate_driver_protocol(lane, &expected_cases) {
+            Ok(()) => match session.finish() {
+                Ok(result) => {
+                    if let Err(error) = task4_validate_driver_source(script) {
+                        failures.push(error);
+                    }
+                    if let Err(error) = task4_validate_report(
+                        &result.report,
+                        &expected_cases,
+                        TASK4_FACT_SCHEMA_V1_DIGEST,
+                    ) {
+                        failures.push(format!("{lane} retained report is invalid: {error}"));
+                    }
+                    if !result.tripwire.is_empty()
+                        || !result.stdout.is_empty()
+                        || !result.stderr.is_empty()
+                        || result.trace.lines().count() != expected_frames
+                        || result.identity.pid != result.identity.pgid
+                        || result.socket_identity.1 == 0
                     {
                         failures.push(format!(
-                            "{lane} retained report must be one mode-0600 regular file"
-                        ));
-                    }
-                    let contents = fs::read_to_string(&report).unwrap_or_default();
-                    let mut observed = BTreeMap::new();
-                    for line in contents.lines() {
-                        *observed.entry(line).or_insert(0usize) += 1;
-                    }
-                    for case in COMMON_CASES.iter().chain(lane_cases.iter()) {
-                        let row = format!("{case}\tOK");
-                        if observed.remove(row.as_str()) != Some(1) {
-                            failures.push(format!(
-                                "{lane} report must retain exactly one {row:?} result"
-                            ));
-                        }
-                    }
-                    if !observed.is_empty() {
-                        failures.push(format!(
-                            "{lane} report contains duplicate or uncontracted rows: {observed:?}"
+                            "{lane} validated lifecycle retained invalid report/output/trace"
                         ));
                     }
                 }
                 Err(error) => failures.push(format!(
-                    "{lane} did not retain its fixture/status/ledger report: {error}"
+                    "{lane} ({script}) failed after its validated lifecycle: {error}"
                 )),
+            },
+            Err(error) => {
+                failures.push(format!(
+                    "{lane} ({script}) is missing its observed {expected_case_count}-case production lifecycle with schema {TASK4_FACT_SCHEMA_V1_DIGEST}: {error}"
+                ));
+                match session.tripwire_contents() {
+                    Ok(contents) if contents.is_empty() => {}
+                    Ok(contents) => failures.push(format!(
+                        "{lane} ({script}) crossed the self-test boundary: {:?}",
+                        String::from_utf8_lossy(&contents)
+                    )),
+                    Err(error) => {
+                        failures.push(format!("{lane} tripwire validation failed: {error}"))
+                    }
+                }
+                if let Err(error) = session.abort() {
+                    failures.push(format!("{lane} observed cleanup failed: {error}"));
+                }
+            }
+        }
+
+        let mut extra = match Task4ObservedSession::spawn_with_env(
+            Path::new(script),
+            &["--self-test", "unexpected"],
+            &environment,
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                failures.push(format!("{lane} extra-argument setup failed: {error}"));
+                continue;
+            }
+        };
+        match extra.recv_frame() {
+            Ok(frame) => {
+                failures.push(format!(
+                    "{lane} extra-argument probe emitted forbidden frame {:?}",
+                    frame.fields.get(3)
+                ));
+                if let Err(error) = extra.abort() {
+                    failures.push(format!("{lane} extra-argument cleanup failed: {error}"));
+                }
+            }
+            Err(_) => {
+                if let Err(error) = extra.finish_rejected() {
+                    failures.push(format!(
+                        "{lane} did not reject extra arguments without mutation: {error}"
+                    ));
+                }
+            }
+        }
+    }
+
+    for (helper, script) in [
+        ("canaries", "scripts/verify-canaries.sh"),
+        ("attach-e2e", "scripts/verify-attach-e2e.sh"),
+        ("discover", "scripts/verify-discover-containers.sh"),
+    ] {
+        let environment: [(String, String); 0] = [];
+        let mut session = match Task4ObservedSession::spawn_with_env(
+            Path::new(script),
+            &["--self-test"],
+            &environment,
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                failures.push(format!("{helper} helper observer setup failed: {error}"));
+                continue;
+            }
+        };
+        match session.validate_helper_protocol(helper) {
+            Ok(()) => match session.finish() {
+                Ok(result)
+                    if result.trace.lines().count() == 4
+                        && result.tripwire.is_empty()
+                        && result.stdout.is_empty()
+                        && result.stderr.is_empty() => {}
+                Ok(_) => failures.push(format!("{helper} helper retained invalid output/trace")),
+                Err(error) => failures.push(format!("{helper} helper finish failed: {error}")),
+            },
+            Err(error) => {
+                failures.push(format!(
+                    "{helper} ({script}) is missing its observed four-frame lifecycle: {error}"
+                ));
+                match session.tripwire_contents() {
+                    Ok(contents) if contents.is_empty() => {}
+                    Ok(contents) => failures.push(format!(
+                        "{helper} helper crossed the command boundary: {:?}",
+                        String::from_utf8_lossy(&contents)
+                    )),
+                    Err(error) => failures.push(format!("{helper} tripwire check failed: {error}")),
+                }
+                if let Err(error) = session.abort() {
+                    failures.push(format!("{helper} helper cleanup failed: {error}"));
+                }
+            }
+        }
+        let mut extra = match Task4ObservedSession::spawn_with_env(
+            Path::new(script),
+            &["--self-test", "unexpected"],
+            &environment,
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                failures.push(format!("{helper} extra-argument setup failed: {error}"));
+                continue;
+            }
+        };
+        match extra.recv_frame() {
+            Ok(frame) => {
+                failures.push(format!(
+                    "{helper} extra-argument probe emitted forbidden frame {:?}",
+                    frame.fields.get(3)
+                ));
+                if let Err(error) = extra.abort() {
+                    failures.push(format!("{helper} extra-argument cleanup failed: {error}"));
+                }
+            }
+            Err(_) => {
+                if let Err(error) = extra.finish_rejected() {
+                    failures.push(format!(
+                        "{helper} did not reject extra arguments without mutation: {error}"
+                    ));
+                }
             }
         }
     }

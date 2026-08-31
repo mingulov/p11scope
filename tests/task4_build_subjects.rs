@@ -1036,6 +1036,39 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         "borrowed-P-getfd",
         "borrowed-P-fstat",
     )
+
+    def record_final_borrowed_attempt(state, token):
+        index = len(state["a1_final_borrowed_events"])
+        expected = (
+            stage3_a1_final_borrowed[index]
+            if index < len(stage3_a1_final_borrowed)
+            else None
+        )
+        if token != expected:
+            raise SystemExit("stage3a1 final borrowed custody order drifted")
+        state["a1_final_borrowed_events"].append(token)
+        state["events"].append(token)
+        try:
+            if token == "borrowed-P-fstat":
+                state["a1_suffix"].append("final-borrowed")
+                state["a1_phase"] = "gb"
+                safe_failure = stage3_a1_options(state["stage3_case"]).get("safe_failure")
+                if safe_failure in {"FB", "FB-KI"}:
+                    state["a1_safe_failure_attempted"] = safe_failure
+                    if safe_failure == "FB-KI":
+                        raise KeyboardInterrupt()
+                    raise OSError(errno.EIO, "stage3a1 final borrowed custody failed")
+                if stage3_a1_expected_binding_token(state) is None:
+                    state["a1_suffix"].append("final-graph-bindings")
+                    stage3_a3_after_gb(state)
+            stage3_a1_maybe_interrupt(state, token)
+        except Exception:
+            raise
+        except BaseException:
+            if state["a1_body_outcome"] != "governed":
+                state["a1_phase"] = "cleanup"
+            raise
+
     def stage3_a2_options(case):
         return case[-1] if case and isinstance(case[-1], dict) else {}
 
@@ -1045,6 +1078,12 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         return case[1], case[2]
 
     def stage3_a2_expectation(case):
+        if (
+            case is not None
+            and case[0] == "stage3a3-case"
+            and case[1] == "held-root-canonical-absence"
+        ):
+            return stage3_a2_held_root_expected_operations, "success"
         return stage3_a2_case_expectations.get(
             None if case is None or case[0] != "stage3a2-fault" else case[:3],
             (stage3_a2_expected_operations, "success"),
@@ -1110,13 +1149,19 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         state["a1_phase"] = (
             "fp"
             if outcome == "success"
-            and stage3_case_is_a3(state["stage3_case"])
+            and stage3_case_composes_a3(state["stage3_case"])
             and not state["a3_body_operations"]
             else {"success": "fb", "governed": "fp", "arbitrary": "cleanup"}[outcome]
         )
 
     def stage3_a2_promote_binding(state, label):
         result = state["a2_current_fd"]
+        if label == "external-root":
+            if result != state["graph_fds"].get(b"/"):
+                raise SystemExit("stage3a3 held root evidence reused the wrong descriptor")
+            state["a2_fds"][label] = result
+            state["a2_row_lineage"][label] = stage3_a2_held_root_rows[0][8]
+            return
         state["a2_fds"][label] = result
         if label != "external-parent":
             state["a2_row_lineage"][label] = stage3_a2_row_by_label[label][8]
@@ -1331,6 +1376,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     if operation == "list1"
                     else ["raw-\udcff-name", "a", "z"]
                 )
+            elif label == "external-root":
+                result = [entry[0] for entry in directory_entries[label]]
             state["a2_list_results"].append((token, tuple(result)))
         if injected and operation.startswith("list") and variant == "cross-scan-drift":
             label = token.split(":", 1)[1]
@@ -1402,6 +1449,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             result = StatProxy(result, st_size=regular_size)
             if operation == "regular-fstat-pre":
                 state["a2_row_stats"][token.split(":", 1)[1]] = result
+        if token == "directory-fstat0:external-root":
+            state["a2_current_fd"] = state["graph_fds"].get(b"/")
         if stage3_a2_options(case).get("post_fstat_failure") == token:
             if state["a2_first_body_failure"] is None:
                 state["a2_first_body_failure"] = token
@@ -1421,11 +1470,35 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             return None, None
         return case[1], case[2]
 
+    def stage3_a3_composition(case):
+        if stage3_case_is_a3(case):
+            return stage3_a2_options(case)["spec"]
+        if stage3_case_is_continuation(case):
+            return "no-symlink-ledger" if not stage3_case_has_symlink(case) else "relative-primary"
+        if case is not None and (
+            case[0] == "stage3a1-gb-mutation"
+            or case[0] == "stage3a2-positive"
+            or case[:3] == ("stage3a2-fault", "scan2-open:repo-abs", "reuse-closed-scan1")
+        ):
+            return "relative-primary"
+        return None
+
+    def stage3_case_composes_a3(case):
+        return stage3_a3_composition(case) is not None
+
+    def stage3_case_must_compose_a3(case):
+        return case is not None and (
+            stage3_case_is_continuation(case)
+            or case[0] in {"stage3a1-gb-mutation", "stage3a2-positive"}
+            or case[:3]
+            == ("stage3a2-fault", "scan2-open:repo-abs", "reuse-closed-scan1")
+        )
+
     def stage3_a3_spec(case):
-        if not stage3_case_is_a3(case):
+        composition = stage3_a3_composition(case)
+        if composition is None:
             return (), ()
-        options = stage3_a2_options(case)
-        return stage3_a3_specs[options["spec"]]
+        return stage3_a3_specs[composition]
 
     def stage3_a3_role(state, value):
         if isinstance(value, tuple) and value[0] == "@a3":
@@ -1455,7 +1528,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         state = stage3_c0_state
         if (
             state is None
-            or not stage3_case_is_a3(state["stage3_case"])
+            or not stage3_case_composes_a3(state["stage3_case"])
             or len(state["a2_operations"]) != len(state["a2_expected_operations"])
         ):
             return None
@@ -1477,9 +1550,10 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
 
     def stage3_a3_after_gb(state):
         if (
-            stage3_case_is_a3(state["stage3_case"])
+            stage3_case_composes_a3(state["stage3_case"])
             and (state["a3_started"] or not state["a3_body_operations"])
             and not state["gb_failed"]
+            and state["a1_body_outcome"] != "governed"
         ):
             if state["a3_absence_operations"]:
                 state["a1_phase"] = "post-gb"
@@ -1489,6 +1563,449 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 state["a1_phase"] = "cleanup"
         else:
             state["a1_phase"] = "cleanup"
+
+    def disjoint_root_missing_probe_allowed(
+        state, namespace, name, arguments, arguments_by_name
+    ):
+        case = state["stage3_case"]
+        next_descriptor = stage3_a3_expected_descriptor(state)
+        return (
+            state["a1_phase"] == "a3"
+            and case is not None
+            and case[0] == "stage3a3-case"
+            and case[1] == "disjoint-symlink-roots"
+            and tuple(state["a3_body_events"]) == state["disjoint_first_root_tokens"]
+            and next_descriptor is not None
+            and next_descriptor[0] == "symlink-open:repo:/link-b:2"
+            and state["a1_body_outcome"] == "success"
+            and state["a3_first_body_failure"] is None
+            and not state["a1_emfile"]
+            and not state["gb_failed"]
+            and not state["disjoint_root_missing"]
+            and namespace == "fcntl"
+            and name == "fcntl"
+            and arguments
+            == (
+                state["private_ledger_fd"],
+                state["constant_values"][("fcntl", "F_GETFL")],
+            )
+            and not arguments_by_name
+        )
+
+    def reviewed_target_absence_fp_probe_allowed(
+        state, namespace, name, arguments, arguments_by_name
+    ):
+        case = state["stage3_case"]
+        return (
+            state["a1_phase"] == "post-gb"
+            and case is not None
+            and case[0] == "stage3a3-case"
+            and case[1] == "reviewed-symlink-target-absence"
+            and tuple(state["a3_body_events"]) == reviewed_target_absence_tokens
+            and tuple(state["a3_target_absence_errnos"])
+            == ((reviewed_target_absence_tokens[-1], errno.ENOENT),)
+            and not state["a3_absence_events"]
+            and state["a3_first_body_failure"] is None
+            and state["a1_body_outcome"] == "success"
+            and not state["a1_emfile"]
+            and not state["a1_emfile_pending"]
+            and not state["gb_failed"]
+            and state["a3_original_interrupt"] is None
+            and not state["reviewed_target_absence_fp_bridge"]
+            and namespace == "fcntl"
+            and name == "fcntl"
+            and arguments
+            == (
+                state["private_ledger_fd"],
+                state["constant_values"][("fcntl", "F_GETFL")],
+            )
+            and not arguments_by_name
+        )
+
+    def multi_component_absence_fp_probe_allowed(
+        state, namespace, name, arguments, arguments_by_name
+    ):
+        case = state["stage3_case"]
+        return (
+            state["a1_phase"] == "post-gb"
+            and case is not None
+            and case[0] == "stage3a3-case"
+            and case[1] == "multi-component-canonical-absence"
+            and tuple(state["a3_body_events"]) == multi_component_absence_tokens
+            and tuple(state["a3_target_absence_errnos"])
+            == ((multi_component_absence_tokens[-1], errno.ENOENT),)
+            and not state["a3_absence_events"]
+            and not state["a3_absence_errnos"]
+            and state["a3_first_body_failure"] is None
+            and state["a1_body_outcome"] == "success"
+            and not state["a1_emfile"]
+            and not state["a1_emfile_pending"]
+            and not state["gb_failed"]
+            and state["a3_original_interrupt"] is None
+            and state["a1_safe_failure_attempted"] is None
+            and state["a1_close_failure_attempted"] is None
+            and state["a3_close_failure"] is None
+            and not state["graph_close_calls"]
+            and not state["multi_component_absence_fp_bridge"]
+            and namespace == "fcntl"
+            and name == "fcntl"
+            and arguments
+            == (
+                state["private_ledger_fd"],
+                state["constant_values"][("fcntl", "F_GETFL")],
+            )
+            and not arguments_by_name
+        )
+
+    def multi_component_enotdir_fp_probe_allowed(
+        state, namespace, name, arguments, arguments_by_name
+    ):
+        case = state["stage3_case"]
+        return (
+            state["a1_phase"] == "post-gb"
+            and case is not None
+            and case[0] == "stage3a3-case"
+            and case[1] == "multi-component-canonical-enotdir"
+            and tuple(state["a3_body_events"]) == multi_component_enotdir_tokens
+            and tuple(state["a3_target_absence_errnos"])
+            == ((multi_component_enotdir_tokens[-1], errno.ENOTDIR),)
+            and not state["a3_absence_events"]
+            and not state["a3_absence_errnos"]
+            and state["a3_first_body_failure"] is None
+            and state["a1_body_outcome"] == "success"
+            and not state["a1_emfile"]
+            and not state["a1_emfile_pending"]
+            and not state["gb_failed"]
+            and state["a3_original_interrupt"] is None
+            and state["a1_safe_failure_attempted"] is None
+            and state["a1_close_failure_attempted"] is None
+            and state["a3_close_failure"] is None
+            and not state["graph_close_calls"]
+            and not state["multi_component_enotdir_fp_bridge"]
+            and namespace == "fcntl"
+            and name == "fcntl"
+            and arguments
+            == (
+                state["private_ledger_fd"],
+                state["constant_values"][("fcntl", "F_GETFL")],
+            )
+            and not arguments_by_name
+        )
+
+    def held_root_missing_probe_allowed(
+        state, namespace, name, arguments, arguments_by_name
+    ):
+        case = state["stage3_case"]
+        return (
+            state["a1_phase"] == "a3"
+            and case is not None
+            and case[0] == "stage3a3-case"
+            and case[1] == "held-root-canonical-absence"
+            and tuple(state["a3_body_events"]) == held_root_body_prefix_tokens
+            and not state["a3_target_absence_errnos"]
+            and not state["a3_absence_events"]
+            and not state["a3_absence_errnos"]
+            and state["a3_first_body_failure"] is None
+            and state["a1_body_outcome"] is None
+            and not state["a1_emfile"]
+            and not state["a1_emfile_pending"]
+            and not state["gb_failed"]
+            and state["a3_original_interrupt"] is None
+            and not state["held_root_missing"]
+            and not state["held_root_first_fp_bridge"]
+            and namespace == "os"
+            and name == "stat"
+            and arguments == (b"root-missing",)
+            and arguments_by_name
+            == {
+                "dir_fd": state["graph_fds"][b"/"],
+                "follow_symlinks": False,
+            }
+        )
+
+    def held_root_first_fp_bridge_allowed(
+        state, namespace, name, arguments, arguments_by_name
+    ):
+        case = state["stage3_case"]
+        return (
+            state["a1_phase"] == "a2"
+            and case is not None
+            and case[0] == "stage3a3-case"
+            and case[1] == "held-root-canonical-absence"
+            and state["graph_events"] == state["expected_graph_events"]
+            and state["held_root_open_redirects"] == ["open-root"]
+            and not state["a2_operations"]
+            and not state["a3_body_events"]
+            and not state["a3_absence_events"]
+            and not state["a3_target_absence_errnos"]
+            and not state["a3_absence_errnos"]
+            and not state["a1_final_private_events"]
+            and not state["a1_final_borrowed_events"]
+            and not state["graph_binding_events"]
+            and not state["graph_close_calls"]
+            and state["a1_body_outcome"] is None
+            and state["a2_first_body_failure"] is None
+            and state["a3_first_body_failure"] is None
+            and state["a1_safe_failure_attempted"] is None
+            and state["a1_close_failure_attempted"] is None
+            and state["a3_close_failure"] is None
+            and not state["a1_suffix"]
+            and not state["a1_emfile"]
+            and not state["a1_emfile_pending"]
+            and not state["gb_failed"]
+            and state["a3_original_interrupt"] is None
+            and not state["held_root_missing"]
+            and not state["held_root_first_fp_bridge"]
+            and namespace == "fcntl"
+            and name == "fcntl"
+            and arguments
+            == (
+                state["private_ledger_fd"],
+                state["constant_values"][("fcntl", "F_GETFL")],
+            )
+            and not arguments_by_name
+        )
+
+    def reviewed_target_absence_cleanup_probe_allowed(
+        state, namespace, name, arguments, arguments_by_name
+    ):
+        case = state["stage3_case"]
+        expected_bindings = tuple(
+            token
+            for token in state["expected_graph_bindings"]
+            if token.split(":", 1)[1].encode("ascii") in state["graph_fds"]
+        )
+        expected_closes = list(reversed(state["graph_owned"])) + [
+            state["private_parent_fd"], state["private_ledger_fd"]
+        ]
+        return (
+            state["a1_phase"] == "post-gb"
+            and case is not None
+            and case[0] == "stage3a3-case"
+            and case[1] == "reviewed-symlink-target-absence"
+            and tuple(state["a3_body_events"]) == reviewed_target_absence_tokens
+            and tuple(state["a3_target_absence_errnos"])
+            == ((reviewed_target_absence_tokens[-1], errno.ENOENT),)
+            and not state["a3_absence_events"]
+            and tuple(state["a1_final_private_events"]) == stage3_a1_final_private
+            and tuple(state["a1_final_borrowed_events"]) == stage3_a1_final_borrowed
+            and tuple(state["graph_binding_events"]) == expected_bindings
+            and not state["gb_failed"]
+            and state["a1_body_outcome"] == "success"
+            and not state["target_absence_missing"]
+            and not state["graph_close_calls"]
+            and expected_closes
+            and namespace == "os"
+            and name == "close"
+            and arguments == (expected_closes[0],)
+            and not arguments_by_name
+        )
+
+    def multi_component_absence_cleanup_probe_allowed(
+        state, namespace, name, arguments, arguments_by_name
+    ):
+        case = state["stage3_case"]
+        expected_bindings = tuple(
+            token
+            for token in state["expected_graph_bindings"]
+            if token.split(":", 1)[1].encode("ascii") in state["graph_fds"]
+        )
+        expected_closes = list(reversed(state["graph_owned"])) + [
+            state["private_parent_fd"], state["private_ledger_fd"]
+        ]
+        return (
+            state["a1_phase"] == "post-gb"
+            and case is not None
+            and case[0] == "stage3a3-case"
+            and case[1] == "multi-component-canonical-absence"
+            and tuple(state["a3_body_events"]) == multi_component_absence_tokens[:-1]
+            and not state["a3_target_absence_errnos"]
+            and not state["a3_absence_events"]
+            and not state["a3_absence_errnos"]
+            and tuple(state["a1_final_private_events"]) == stage3_a1_final_private
+            and tuple(state["a1_final_borrowed_events"]) == stage3_a1_final_borrowed
+            and tuple(state["graph_binding_events"]) == expected_bindings
+            and state["a3_first_body_failure"] is None
+            and state["a1_body_outcome"] == "success"
+            and not state["a1_emfile"]
+            and not state["a1_emfile_pending"]
+            and not state["gb_failed"]
+            and state["a3_original_interrupt"] is None
+            and state["a1_safe_failure_attempted"] is None
+            and state["a1_close_failure_attempted"] is None
+            and state["a3_close_failure"] is None
+            and not state["multi_component_absence_missing"]
+            and not state["multi_component_absence_fp_bridge"]
+            and not state["graph_close_calls"]
+            and expected_closes
+            and namespace == "os"
+            and name == "close"
+            and arguments == (expected_closes[0],)
+            and not arguments_by_name
+        )
+
+    def multi_component_enotdir_missing_probe_allowed(
+        state, namespace, name, arguments, arguments_by_name
+    ):
+        case = state["stage3_case"]
+        return (
+            state["a1_phase"] == "a3"
+            and case is not None
+            and case[0] == "stage3a3-case"
+            and case[1] == "multi-component-canonical-enotdir"
+            and tuple(state["a3_body_events"]) == multi_component_enotdir_tokens[:-1]
+            and not state["a3_target_absence_errnos"]
+            and not state["a3_absence_events"]
+            and not state["a3_absence_errnos"]
+            and state["a3_first_body_failure"] is None
+            and state["a1_body_outcome"] == "success"
+            and not state["a1_emfile"]
+            and not state["a1_emfile_pending"]
+            and not state["gb_failed"]
+            and state["a3_original_interrupt"] is None
+            and state["a1_safe_failure_attempted"] is None
+            and state["a1_close_failure_attempted"] is None
+            and state["a3_close_failure"] is None
+            and not state["multi_component_enotdir_missing"]
+            and not state["multi_component_enotdir_fp_bridge"]
+            and not state["a1_final_private_events"]
+            and not state["a1_final_borrowed_events"]
+            and not state["graph_binding_events"]
+            and not state["a1_suffix"]
+            and not state["graph_close_calls"]
+            and namespace == "fcntl"
+            and name == "fcntl"
+            and arguments
+            == (
+                state["private_ledger_fd"],
+                state["constant_values"][("fcntl", "F_GETFL")],
+            )
+            and not arguments_by_name
+        )
+
+    def check_reviewed_target_absence_probe_controls():
+        terminal = reviewed_target_absence_tokens[-1]
+        accepted = {
+            "a1_phase": "post-gb",
+            "stage3_case": (
+                "stage3a3-case", "reviewed-symlink-target-absence", {}
+            ),
+            "a3_body_events": list(reviewed_target_absence_tokens),
+            "a3_target_absence_errnos": [(terminal, errno.ENOENT)],
+            "a3_absence_events": [],
+            "a3_first_body_failure": None,
+            "a1_body_outcome": "success",
+            "a1_emfile": False,
+            "a1_emfile_pending": False,
+            "gb_failed": False,
+            "a3_original_interrupt": None,
+            "reviewed_target_absence_fp_bridge": False,
+            "private_ledger_fd": 42,
+            "constant_values": {("fcntl", "F_GETFL"): fcntl.F_GETFL},
+        }
+        accepted_call = ("fcntl", "fcntl", (42, fcntl.F_GETFL), {})
+        if not reviewed_target_absence_fp_probe_allowed(accepted, *accepted_call):
+            raise SystemExit("stage3a3 reviewed absence positive probe was rejected")
+        controls = [
+            ("partial body", {"a3_body_events": list(reviewed_target_absence_tokens[:-1])}),
+            ("changed body", {"a3_body_events": ["changed", *reviewed_target_absence_tokens[1:]]}),
+            ("extra body", {"a3_body_events": [*reviewed_target_absence_tokens, "extra"]}),
+            ("reordered body", {"a3_body_events": [reviewed_target_absence_tokens[1], reviewed_target_absence_tokens[0], *reviewed_target_absence_tokens[2:]]}),
+            ("wrong case", {"stage3_case": ("stage3a3-case", "relative-primary", {})}),
+            ("wrong phase", {"a1_phase": "fp"}),
+            ("absent errno observation", {"a3_target_absence_errnos": []}),
+            ("wrong errno observation", {"a3_target_absence_errnos": [(terminal, errno.ENOTDIR)]}),
+            ("duplicate errno observation", {"a3_target_absence_errnos": [(terminal, errno.ENOENT), (terminal, errno.ENOENT)]}),
+            ("successful errno observation", {"a3_target_absence_errnos": [(terminal, None)]}),
+            ("body failure", {"a3_first_body_failure": "body-failure"}),
+            ("capacity outcome", {"a1_body_outcome": "capacity", "a1_emfile": True}),
+            ("arbitrary outcome", {"a1_body_outcome": "arbitrary"}),
+            ("EMFILE", {"a1_emfile": True}),
+            ("GB failure", {"gb_failed": True}),
+            ("used bridge", {"reviewed_target_absence_fp_bridge": True}),
+            ("wrong namespace", {"namespace": "os"}),
+            ("wrong name", {"name": "open"}),
+            ("wrong fd", {"arguments": (43, fcntl.F_GETFL)}),
+            ("later FP token", {"arguments": (42, fcntl.F_GETFD)}),
+            ("wrong arity", {"arguments": (42, fcntl.F_GETFL, 0)}),
+            ("keywords", {"arguments_by_name": {"dir_fd": 42}}),
+            ("close", {"namespace": "os", "name": "close", "arguments": (42,)}),
+            ("graph stat", {"namespace": "os", "name": "stat", "arguments": (b"tmp",), "arguments_by_name": {"dir_fd": 42, "follow_symlinks": False}}),
+        ]
+        for label, overrides in controls:
+            trial = dict(accepted)
+            namespace, name, arguments, arguments_by_name = accepted_call
+            namespace = overrides.get("namespace", namespace)
+            name = overrides.get("name", name)
+            arguments = overrides.get("arguments", arguments)
+            arguments_by_name = overrides.get("arguments_by_name", arguments_by_name)
+            trial.update(
+                {
+                    key: value
+                    for key, value in overrides.items()
+                    if key not in {"namespace", "name", "arguments", "arguments_by_name"}
+                }
+            )
+            if reviewed_target_absence_fp_probe_allowed(
+                trial, namespace, name, arguments, arguments_by_name
+            ):
+                raise SystemExit(
+                    f"stage3a3 reviewed absence negative control accepted: {label}"
+                )
+
+        cleanup_accepted = {
+            **accepted,
+            "a1_final_private_events": list(stage3_a1_final_private),
+            "a1_final_borrowed_events": list(stage3_a1_final_borrowed),
+            "graph_binding_events": [],
+            "expected_graph_bindings": [],
+            "graph_fds": {},
+            "graph_owned": [43],
+            "private_parent_fd": 41,
+            "graph_close_calls": [],
+            "target_absence_missing": False,
+        }
+        cleanup_call = ("os", "close", (43,), {})
+        if not reviewed_target_absence_cleanup_probe_allowed(
+            cleanup_accepted, *cleanup_call
+        ):
+            raise SystemExit("stage3a3 reviewed absence cleanup positive probe was rejected")
+        cleanup_controls = [
+            ("incomplete FP", {"a1_final_private_events": []}),
+            ("incomplete FB", {"a1_final_borrowed_events": []}),
+            ("incomplete GB", {"graph_binding_events": ["unexpected"]}),
+            ("final absence", {"a3_absence_events": ["absent-terminal"]}),
+            ("wrong phase", {"a1_phase": "cleanup"}),
+            ("used flag", {"target_absence_missing": True}),
+            ("wrong first reverse-close FD", {"graph_owned": [44]}),
+            ("body failure", {"a1_body_outcome": "governed"}),
+            ("capacity outcome", {"a1_body_outcome": "capacity", "a1_emfile": True}),
+            ("GB failure", {"gb_failed": True}),
+            ("wrong namespace", {"namespace": "fcntl"}),
+            ("wrong name", {"name": "fstat"}),
+            ("wrong arity", {"arguments": (43, 0)}),
+            ("keywords", {"arguments_by_name": {"dir_fd": 43}}),
+        ]
+        for label, overrides in cleanup_controls:
+            trial = dict(cleanup_accepted)
+            namespace, name, arguments, arguments_by_name = cleanup_call
+            namespace = overrides.get("namespace", namespace)
+            name = overrides.get("name", name)
+            arguments = overrides.get("arguments", arguments)
+            arguments_by_name = overrides.get("arguments_by_name", arguments_by_name)
+            trial.update(
+                {
+                    key: value
+                    for key, value in overrides.items()
+                    if key not in {"namespace", "name", "arguments", "arguments_by_name"}
+                }
+            )
+            if reviewed_target_absence_cleanup_probe_allowed(
+                trial, namespace, name, arguments, arguments_by_name
+            ):
+                raise SystemExit(
+                    f"stage3a3 reviewed absence cleanup negative control accepted: {label}"
+                )
 
     def stage3_a3_execute(callable_value, token, arguments, arguments_by_name):
         state = stage3_c0_state
@@ -1505,9 +2022,36 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         )
         events.append(token)
         state["a3_started"] = True
+        if token.startswith("absent-") and state["a3_absence_suffix_snapshot"] is None:
+            state["a3_absence_suffix_snapshot"] = (
+                tuple(state["a1_final_private_events"]),
+                tuple(state["a1_final_borrowed_events"]),
+                tuple(state["graph_binding_events"]),
+            )
 
         if token.startswith("readlink"):
             state["a3_readlink_attempts"].append(token)
+            if token.startswith("readlink1:"):
+                occurrence = int(token.rsplit(":", 1)[1])
+                key = f"@a3:link:{occurrence}".encode("ascii")
+                parent_fd = arguments_by_name.get("dir_fd")
+                parent_keys = [
+                    candidate
+                    for candidate, fd in state["graph_fds"].items()
+                    if fd == parent_fd
+                ]
+                if len(parent_keys) != 1 or key in state["graph_fds"]:
+                    raise SystemExit("stage3a3 duplicate or unknown parent promotion")
+                state["graph_fds"][key] = state["a3_fds"][occurrence]
+                state["graph_edges"].append(
+                    ("edge", "a3", os.fsencode(arguments[0]), parent_keys[0], key, "")
+                )
+                state["expected_graph_bindings"].extend(
+                    (
+                        f"bind-held-fstat:{key.decode('ascii')}",
+                        f"bind-parent-name-stat:{key.decode('ascii')}",
+                    )
+                )
         if token.startswith("target-fsencode"):
             state["a3_fsencode_attempts"].append(token)
 
@@ -1577,29 +2121,31 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             raise KeyboardInterrupt()
 
         if token.startswith("readlink"):
-            ordinal = 1 if token.startswith("readlink1:") else 2
             occurrence = int(token.rsplit(":", 1)[1])
-            native = callable_value(*arguments, **arguments_by_name)
-            state["a3_native_readlinks"].append((token, native))
-            expected_native = options.get("raw_targets", {}).get(
-                occurrence, options.get("raw_target", native)
+            native = options.get("raw_targets", {}).get(
+                occurrence, options.get("raw_target", b"./enum/../target")
             )
-            if native != expected_native or type(native) is not type(expected_native):
-                raise SystemExit("stage3a3 native readlink fixture drifted")
+            state["a3_native_readlinks"].append((token, native))
             result = native
             if injected:
-                result = {
-                    "bytes-subclass": BytesSubclass(native),
-                    "str-subclass": StrSubclass(native),
-                    "other-type": 1,
-                    "empty": b"",
-                    "4097-bytes": b"x" * 4097,
-                    "mismatch": b"different",
-                }.get(variant, native)
+                if variant == "bytes-subclass":
+                    result = BytesSubclass(native)
+                elif variant == "str-subclass":
+                    result = StrSubclass(native)
+                else:
+                    result = {
+                        "other-type": 1,
+                        "empty": b"",
+                        "4097-bytes": b"x" * 4097,
+                        "mismatch": b"different",
+                    }.get(variant, native)
                 if variant in {
                     "bytes-subclass", "str-subclass", "other-type", "empty",
                     "4097-bytes", "mismatch",
-                }:
+                } and not (
+                    token.startswith("readlink2:")
+                    and variant in {"empty", "4097-bytes", "mismatch"}
+                ):
                     stage3_a3_governed(state, token)
             state["a3_readlinks"].append((token, result))
             return result
@@ -1615,12 +2161,26 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             state["a3_fsencode_calls"].append((arguments[0], result))
             return result
 
-        if token.startswith("absent-") and state["a3_absence_suffix_snapshot"] is None:
-            state["a3_absence_suffix_snapshot"] = (
-                tuple(state["a1_final_private_events"]),
-                tuple(state["a1_final_borrowed_events"]),
-                tuple(state["graph_binding_events"]),
-            )
+        if token.startswith("target-absence-terminal:"):
+            try:
+                result = callable_value(*arguments, **arguments_by_name)
+            except OSError as exc:
+                state["a3_target_absence_errnos"].append((token, exc.errno))
+                if exc.errno == errno.ENOENT or (
+                    case[0] == "stage3a3-case"
+                    and case[1] == "multi-component-canonical-enotdir"
+                    and exc.errno == errno.ENOTDIR
+                ):
+                    state["a1_phase"] = (
+                        "a3-complete"
+                        if case[:2]
+                        == ("stage3a3-case", "held-root-canonical-absence")
+                        and exc.errno == errno.ENOENT
+                        else "post-gb"
+                    )
+                raise
+            return result
+
         if token.startswith("absent-terminal:"):
             if injected and variant == "success":
                 state["a1_phase"] = "cleanup"
@@ -1650,36 +2210,73 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         result = callable_value(*arguments, **arguments_by_name)
         if injected and variant == "mismatch":
             original = identity(result)
-            if state["a1_phase"] == "a3":
+            operations = (
+                state["a3_body_operations"]
+                if state["a1_phase"] == "a3"
+                else state["a3_absence_operations"]
+            )
+            next_token = operations[len(events)][0] if len(events) < len(operations) else None
+            defer_target_parent = (
+                token.startswith("target-parent-stat:")
+                and next_token == token.replace("parent-stat", "held-fstat")
+            )
+            defer_absence_parent = (
+                token.startswith("absent-boundary-parent:")
+                and next_token == token.replace("boundary-parent", "boundary-held")
+            )
+            if (
+                state["a1_phase"] == "a3"
+                and not token.startswith("symlink-held-fstat")
+                and not defer_target_parent
+            ):
                 stage3_a3_governed(state, token)
-            elif state["a1_phase"] == "absence":
+            elif state["a1_phase"] == "absence" and not defer_absence_parent:
                 state["a1_phase"] = "cleanup"
                 state["a3_forbid_later_filesystem"] = True
             result = StatProxy(result, st_ino=result.st_ino + 1)
             state["a3_injections"].append((token, original, identity(result)))
         if token.startswith(("symlink-held-fstat", "symlink-parent-stat")):
             state["a3_symlink_identities"].append((token, identity(result)))
+        if (
+            variant == "mismatch"
+            and fault_token is not None
+            and fault_token.startswith("symlink-held-fstat")
+            and token == fault_token.replace("held-fstat", "parent-stat")
+        ):
+            stage3_a3_governed(state, fault_token)
+        if (
+            variant in {"empty", "4097-bytes", "mismatch"}
+            and fault_token is not None
+            and fault_token.startswith("readlink2:")
+            and token == f"symlink-parent-stat2:{fault_token.rsplit(':', 1)[1]}"
+        ):
+            stage3_a3_governed(state, fault_token)
         if token.startswith(("target-held-fstat", "target-parent-stat")):
             state["a3_target_identities"].append((token, identity(result)))
+        if (
+            variant == "mismatch"
+            and fault_token is not None
+            and fault_token.startswith("target-parent-stat:")
+            and token == fault_token.replace("parent-stat", "held-fstat")
+        ):
+            stage3_a3_governed(state, fault_token)
         if token.startswith("absent-") and not token.startswith("absent-terminal:"):
             state["a3_boundary_identities"].append((token, identity(result)))
-        if injected and variant == "semantic":
-            state["a3_semantic_observed"] = options["semantic_failure"]
+        if (
+            variant == "mismatch"
+            and fault_token is not None
+            and fault_token.startswith("absent-boundary-parent:")
+            and token == fault_token.replace("boundary-parent", "boundary-held")
+        ):
+            state["a1_phase"] = "cleanup"
+            state["a3_forbid_later_filesystem"] = True
         if token.startswith("symlink-parent-stat0:"):
             occurrence = int(token.rsplit(":", 1)[1])
-            if not injected:
-                if options.get("expected_route") == "follow41" and occurrence == 41:
-                    state["a3_first_body_failure"] = token
-                    state["a3_forbid_later_filesystem"] = True
-                    state["a1_body_outcome"] = "governed"
-                    state["a1_phase"] = "cleanup"
-                else:
-                    key = f"@a3:link:{occurrence}".encode("ascii")
-                    state["graph_fds"][key] = state["a3_fds"][occurrence]
-                    state["graph_edges"].append(("edge", "a3", arguments[0], os.fsencode(repo3), key, ""))
-                    state["expected_graph_bindings"].extend(
-                        (f"bind-held-fstat:{key.decode('ascii')}", f"bind-parent-name-stat:{key.decode('ascii')}")
-                    )
+            if not injected and options.get("expected_route") == "follow41" and occurrence == 41:
+                state["a3_first_body_failure"] = token
+                state["a3_forbid_later_filesystem"] = True
+                state["a1_body_outcome"] = "governed"
+                state["a1_phase"] = "cleanup"
         if state["a1_phase"] == "a3" and len(events) == len(state["a3_body_operations"]):
             state["a1_phase"] = "a3-complete"
         return result
@@ -1915,6 +2512,588 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     return "close-L"
         return None
 
+    def check_multi_component_absence_fp_probe_controls():
+        terminal = multi_component_absence_tokens[-1]
+        accepted = {
+            "a1_phase": "post-gb",
+            "stage3_case": (
+                "stage3a3-case", "multi-component-canonical-absence", {}
+            ),
+            "a3_body_events": list(multi_component_absence_tokens),
+            "a3_target_absence_errnos": [(terminal, errno.ENOENT)],
+            "a3_absence_events": [],
+            "a3_absence_errnos": [],
+            "a3_first_body_failure": None,
+            "a1_body_outcome": "success",
+            "a1_emfile": False,
+            "a1_emfile_pending": False,
+            "gb_failed": False,
+            "a3_original_interrupt": None,
+            "a1_safe_failure_attempted": None,
+            "a1_close_failure_attempted": None,
+            "a3_close_failure": None,
+            "graph_close_calls": [],
+            "multi_component_absence_fp_bridge": False,
+            "private_ledger_fd": 42,
+            "constant_values": {("fcntl", "F_GETFL"): fcntl.F_GETFL},
+        }
+        accepted_call = ("fcntl", "fcntl", (42, fcntl.F_GETFL), {})
+        if not multi_component_absence_fp_probe_allowed(accepted, *accepted_call):
+            raise SystemExit("stage3a3 multi-component absence FP positive probe was rejected")
+        controls = [
+            ("wrong case", {"stage3_case": ("stage3a3-case", "relative-primary", {})}),
+            ("wrong phase", {"a1_phase": "fp"}),
+            ("partial body", {"a3_body_events": list(multi_component_absence_tokens[:-1])}),
+            ("changed body", {"a3_body_events": ["changed", *multi_component_absence_tokens[1:]]}),
+            ("reordered body", {"a3_body_events": [multi_component_absence_tokens[1], multi_component_absence_tokens[0], *multi_component_absence_tokens[2:]]}),
+            ("extra body", {"a3_body_events": [*multi_component_absence_tokens, "extra"]}),
+            ("missing immediate errno", {"a3_target_absence_errnos": []}),
+            ("wrong immediate errno", {"a3_target_absence_errnos": [(terminal, errno.ENOTDIR)]}),
+            ("duplicate immediate errno", {"a3_target_absence_errnos": [(terminal, errno.ENOENT), (terminal, errno.ENOENT)]}),
+            ("successful immediate errno", {"a3_target_absence_errnos": [(terminal, None)]}),
+            ("final absence event", {"a3_absence_events": ["absent-terminal"]}),
+            ("final absence errno", {"a3_absence_errnos": [("absent-terminal", errno.ENOENT)]}),
+            ("body failure", {"a3_first_body_failure": "body-failure"}),
+            ("governed outcome", {"a1_body_outcome": "governed"}),
+            ("capacity outcome", {"a1_body_outcome": "capacity", "a1_emfile": True}),
+            ("arbitrary outcome", {"a1_body_outcome": "arbitrary"}),
+            ("EMFILE", {"a1_emfile": True}),
+            ("EMFILE pending", {"a1_emfile_pending": True}),
+            ("GB failure", {"gb_failed": True}),
+            ("interrupt", {"a3_original_interrupt": "interrupt"}),
+            ("safe failure", {"a1_safe_failure_attempted": "FP"}),
+            ("A1 close failure", {"a1_close_failure_attempted": "close"}),
+            ("A3 close failure", {"a3_close_failure": "close"}),
+            ("used marker", {"multi_component_absence_fp_bridge": True}),
+            ("graph close", {"graph_close_calls": [43]}),
+            ("wrong namespace", {"namespace": "os"}),
+            ("wrong name", {"name": "fstat"}),
+            ("wrong fd", {"arguments": (43, fcntl.F_GETFL)}),
+            ("wrong command", {"arguments": (42, fcntl.F_GETFD)}),
+            ("wrong arity", {"arguments": (42, fcntl.F_GETFL, 0)}),
+            ("keywords", {"arguments_by_name": {"dir_fd": 42}}),
+            ("close", {"namespace": "os", "name": "close", "arguments": (42,)}),
+            ("graph stat", {"namespace": "os", "name": "stat", "arguments": (b"tmp",), "arguments_by_name": {"dir_fd": 42, "follow_symlinks": False}}),
+        ]
+        for label, overrides in controls:
+            trial = dict(accepted)
+            namespace, name, arguments, arguments_by_name = accepted_call
+            namespace = overrides.get("namespace", namespace)
+            name = overrides.get("name", name)
+            arguments = overrides.get("arguments", arguments)
+            arguments_by_name = overrides.get("arguments_by_name", arguments_by_name)
+            trial.update(
+                {
+                    key: value
+                    for key, value in overrides.items()
+                    if key not in {"namespace", "name", "arguments", "arguments_by_name"}
+                }
+            )
+            if multi_component_absence_fp_probe_allowed(
+                trial, namespace, name, arguments, arguments_by_name
+            ):
+                raise SystemExit(
+                    f"stage3a3 multi-component absence FP negative control accepted: {label}"
+                )
+
+    def check_multi_component_absence_cleanup_probe_controls():
+        accepted = {
+            "a1_phase": "post-gb",
+            "stage3_case": (
+                "stage3a3-case", "multi-component-canonical-absence", {}
+            ),
+            "a3_body_events": list(multi_component_absence_tokens[:-1]),
+            "a3_target_absence_errnos": [],
+            "a3_absence_events": [],
+            "a3_absence_errnos": [],
+            "a1_final_private_events": list(stage3_a1_final_private),
+            "a1_final_borrowed_events": list(stage3_a1_final_borrowed),
+            "graph_binding_events": [],
+            "expected_graph_bindings": [],
+            "graph_fds": {},
+            "graph_owned": [43],
+            "private_parent_fd": 41,
+            "private_ledger_fd": 42,
+            "a3_first_body_failure": None,
+            "a1_body_outcome": "success",
+            "a1_emfile": False,
+            "a1_emfile_pending": False,
+            "gb_failed": False,
+            "a3_original_interrupt": None,
+            "a1_safe_failure_attempted": None,
+            "a1_close_failure_attempted": None,
+            "a3_close_failure": None,
+            "multi_component_absence_missing": False,
+            "multi_component_absence_fp_bridge": False,
+            "graph_close_calls": [],
+        }
+        cleanup_call = ("os", "close", (43,), {})
+        if not multi_component_absence_cleanup_probe_allowed(accepted, *cleanup_call):
+            raise SystemExit("stage3a3 multi-component absence cleanup positive probe was rejected")
+        controls = [
+            ("wrong case", {"stage3_case": ("stage3a3-case", "relative-primary", {})}),
+            ("wrong phase", {"a1_phase": "fp"}),
+            ("partial body", {"a3_body_events": list(multi_component_absence_tokens[:-2])}),
+            ("changed body", {"a3_body_events": ["changed", *multi_component_absence_tokens[1:]]}),
+            ("reordered body", {"a3_body_events": [multi_component_absence_tokens[1], multi_component_absence_tokens[0], *multi_component_absence_tokens[2:]]}),
+            ("extra body", {"a3_body_events": [*multi_component_absence_tokens, "extra"]}),
+            ("fabricated full-suffix event", {"a3_body_events": list(multi_component_absence_tokens)}),
+            ("immediate errno", {"a3_target_absence_errnos": [(multi_component_absence_tokens[-1], errno.ENOENT)]}),
+            ("incomplete FP", {"a1_final_private_events": []}),
+            ("incomplete FB", {"a1_final_borrowed_events": []}),
+            ("incomplete GB", {"graph_binding_events": ["unexpected"]}),
+            ("absence event", {"a3_absence_events": ["absent-terminal"]}),
+            ("absence errno", {"a3_absence_errnos": [("absent-terminal", errno.ENOENT)]}),
+            ("body failure", {"a3_first_body_failure": "body-failure"}),
+            ("governed outcome", {"a1_body_outcome": "governed"}),
+            ("capacity outcome", {"a1_body_outcome": "capacity", "a1_emfile": True}),
+            ("arbitrary outcome", {"a1_body_outcome": "arbitrary"}),
+            ("EMFILE", {"a1_emfile": True}),
+            ("EMFILE pending", {"a1_emfile_pending": True}),
+            ("GB failure", {"gb_failed": True}),
+            ("interrupt", {"a3_original_interrupt": "interrupt"}),
+            ("safe failure", {"a1_safe_failure_attempted": "FP"}),
+            ("A1 close failure", {"a1_close_failure_attempted": "close"}),
+            ("A3 close failure", {"a3_close_failure": "close"}),
+            ("used FP bridge", {"multi_component_absence_fp_bridge": True}),
+            ("marker already set", {"multi_component_absence_missing": True}),
+            ("existing close", {"graph_close_calls": [43]}),
+            ("wrong fd", {"arguments": (44,)}),
+            ("wrong namespace", {"namespace": "fcntl"}),
+            ("wrong name", {"name": "fstat"}),
+            ("wrong arity", {"arguments": (43, 0)}),
+            ("keywords", {"arguments_by_name": {"dir_fd": 43}}),
+        ]
+        for label, overrides in controls:
+            trial = dict(accepted)
+            namespace, name, arguments, arguments_by_name = cleanup_call
+            namespace = overrides.get("namespace", namespace)
+            name = overrides.get("name", name)
+            arguments = overrides.get("arguments", arguments)
+            arguments_by_name = overrides.get("arguments_by_name", arguments_by_name)
+            trial.update(
+                {
+                    key: value
+                    for key, value in overrides.items()
+                    if key not in {"namespace", "name", "arguments", "arguments_by_name"}
+                }
+            )
+            if multi_component_absence_cleanup_probe_allowed(
+                trial, namespace, name, arguments, arguments_by_name
+            ):
+                raise SystemExit(
+                    f"stage3a3 multi-component absence cleanup negative control accepted: {label}"
+                )
+
+        fallback_accepted = {
+            "label": "stage3a3-multi-component-canonical-absence",
+            "full_a2": True,
+            "state": {"multi_component_absence_missing": True},
+            "caught": module.MutationError("original"),
+        }
+        fallback_controls = [
+            ("wrong label", {"label": "stage3a3-reviewed-symlink-target-absence"}),
+            ("incomplete A2", {"full_a2": False}),
+            ("missing state", {"state": None}),
+            ("false marker", {"state": {"multi_component_absence_missing": False}}),
+            ("no exception", {"caught": None}),
+            ("SystemExit", {"caught": SystemExit(77)}),
+            ("another exception", {"caught": OSError(errno.EIO)}),
+        ]
+        class MutationErrorSubclass(module.MutationError):
+            pass
+        fallback_controls.append(("MutationError subclass", {"caught": MutationErrorSubclass("subclass")}))
+        fallback_trials = [("positive", {})] + fallback_controls
+        for label, overrides in fallback_trials:
+            trial = dict(fallback_accepted)
+            trial.update(overrides)
+            state = trial["state"]
+            multi_component_absence_fallback = (
+                trial["label"] == "stage3a3-multi-component-canonical-absence"
+                and trial["full_a2"]
+                and state is not None
+                and state["multi_component_absence_missing"]
+                and type(trial["caught"]) is module.MutationError
+            )
+            if (label == "positive") != multi_component_absence_fallback:
+                raise SystemExit(
+                    f"stage3a3 multi-component absence fallback control drifted: {label}"
+                )
+
+    def check_multi_component_enotdir_probe_controls():
+        terminal = multi_component_enotdir_tokens[-1]
+        accepted = {
+            "a1_phase": "post-gb",
+            "stage3_case": (
+                "stage3a3-case", "multi-component-canonical-enotdir", {}
+            ),
+            "a3_body_events": list(multi_component_enotdir_tokens),
+            "a3_target_absence_errnos": [(terminal, errno.ENOTDIR)],
+            "a3_absence_events": [],
+            "a3_absence_errnos": [],
+            "a3_first_body_failure": None,
+            "a1_body_outcome": "success",
+            "a1_emfile": False,
+            "a1_emfile_pending": False,
+            "gb_failed": False,
+            "a3_original_interrupt": None,
+            "a1_safe_failure_attempted": None,
+            "a1_close_failure_attempted": None,
+            "a3_close_failure": None,
+            "graph_close_calls": [],
+            "multi_component_enotdir_fp_bridge": False,
+            "private_ledger_fd": 42,
+            "constant_values": {("fcntl", "F_GETFL"): fcntl.F_GETFL},
+        }
+        accepted_call = ("fcntl", "fcntl", (42, fcntl.F_GETFL), {})
+        if not multi_component_enotdir_fp_probe_allowed(accepted, *accepted_call):
+            raise SystemExit("stage3a3 multi-component ENOTDIR FP positive probe was rejected")
+        controls = [
+            ("wrong case", {"stage3_case": ("stage3a3-case", "relative-primary", {})}),
+            ("wrong phase", {"a1_phase": "fp"}),
+            ("partial body", {"a3_body_events": list(multi_component_enotdir_tokens[:-1])}),
+            ("changed body", {"a3_body_events": ["changed", *multi_component_enotdir_tokens[1:]]}),
+            ("reordered body", {"a3_body_events": [multi_component_enotdir_tokens[1], multi_component_enotdir_tokens[0], *multi_component_enotdir_tokens[2:]]}),
+            ("extra body", {"a3_body_events": [*multi_component_enotdir_tokens, "extra"]}),
+            ("missing immediate errno", {"a3_target_absence_errnos": []}),
+            ("wrong immediate errno", {"a3_target_absence_errnos": [(terminal, errno.ENOENT)]}),
+            ("duplicate immediate errno", {"a3_target_absence_errnos": [(terminal, errno.ENOTDIR), (terminal, errno.ENOTDIR)]}),
+            ("successful immediate errno", {"a3_target_absence_errnos": [(terminal, None)]}),
+            ("final absence event", {"a3_absence_events": ["absent-terminal"]}),
+            ("final absence errno", {"a3_absence_errnos": [("absent-terminal", errno.ENOTDIR)]}),
+            ("body failure", {"a3_first_body_failure": "body-failure"}),
+            ("governed outcome", {"a1_body_outcome": "governed"}),
+            ("capacity outcome", {"a1_body_outcome": "capacity", "a1_emfile": True}),
+            ("arbitrary outcome", {"a1_body_outcome": "arbitrary"}),
+            ("EMFILE", {"a1_emfile": True}),
+            ("EMFILE pending", {"a1_emfile_pending": True}),
+            ("GB failure", {"gb_failed": True}),
+            ("interrupt", {"a3_original_interrupt": "interrupt"}),
+            ("safe failure", {"a1_safe_failure_attempted": "FP"}),
+            ("A1 close failure", {"a1_close_failure_attempted": "close"}),
+            ("A3 close failure", {"a3_close_failure": "close"}),
+            ("used marker", {"multi_component_enotdir_fp_bridge": True}),
+            ("graph close", {"graph_close_calls": [43]}),
+            ("wrong namespace", {"namespace": "os"}),
+            ("wrong name", {"name": "fstat"}),
+            ("wrong fd", {"arguments": (43, fcntl.F_GETFL)}),
+            ("wrong command", {"arguments": (42, fcntl.F_GETFD)}),
+            ("wrong arity", {"arguments": (42, fcntl.F_GETFL, 0)}),
+            ("keywords", {"arguments_by_name": {"dir_fd": 42}}),
+            ("close", {"namespace": "os", "name": "close", "arguments": (42,)}),
+            ("graph stat", {"namespace": "os", "name": "stat", "arguments": (b"tmp",), "arguments_by_name": {"dir_fd": 42, "follow_symlinks": False}}),
+        ]
+        for label, overrides in controls:
+            trial = dict(accepted)
+            namespace, name, arguments, arguments_by_name = accepted_call
+            namespace = overrides.get("namespace", namespace)
+            name = overrides.get("name", name)
+            arguments = overrides.get("arguments", arguments)
+            arguments_by_name = overrides.get("arguments_by_name", arguments_by_name)
+            trial.update(
+                {
+                    key: value
+                    for key, value in overrides.items()
+                    if key not in {"namespace", "name", "arguments", "arguments_by_name"}
+                }
+            )
+            if multi_component_enotdir_fp_probe_allowed(
+                trial, namespace, name, arguments, arguments_by_name
+            ):
+                raise SystemExit(
+                    f"stage3a3 multi-component ENOTDIR FP negative control accepted: {label}"
+                )
+
+    def check_multi_component_enotdir_missing_probe_controls():
+        accepted = {
+            "a1_phase": "a3",
+            "stage3_case": (
+                "stage3a3-case", "multi-component-canonical-enotdir", {}
+            ),
+            "a3_body_events": list(multi_component_enotdir_tokens[:-1]),
+            "a3_target_absence_errnos": [],
+            "a3_absence_events": [],
+            "a3_absence_errnos": [],
+            "a1_final_private_events": [],
+            "a1_final_borrowed_events": [],
+            "graph_binding_events": [],
+            "expected_graph_bindings": [],
+            "graph_fds": {},
+            "graph_owned": [43],
+            "private_parent_fd": 41,
+            "private_ledger_fd": 42,
+            "constant_values": {("fcntl", "F_GETFL"): fcntl.F_GETFL},
+            "a3_first_body_failure": None,
+            "a1_body_outcome": "success",
+            "a1_emfile": False,
+            "a1_emfile_pending": False,
+            "gb_failed": False,
+            "a3_original_interrupt": None,
+            "a1_safe_failure_attempted": None,
+            "a1_close_failure_attempted": None,
+            "a3_close_failure": None,
+            "multi_component_enotdir_missing": False,
+            "multi_component_enotdir_fp_bridge": False,
+            "a1_suffix": [],
+            "graph_close_calls": [],
+        }
+        first_fp_call = ("fcntl", "fcntl", (42, fcntl.F_GETFL), {})
+        if not multi_component_enotdir_missing_probe_allowed(accepted, *first_fp_call):
+            raise SystemExit("stage3a3 multi-component ENOTDIR first-FP positive probe was rejected")
+        controls = [
+            ("wrong case", {"stage3_case": ("stage3a3-case", "relative-primary", {})}),
+            ("wrong phase", {"a1_phase": "fp"}),
+            ("partial body", {"a3_body_events": list(multi_component_enotdir_tokens[:-2])}),
+            ("changed body", {"a3_body_events": ["changed", *multi_component_enotdir_tokens[1:-1]]}),
+            ("reordered body", {"a3_body_events": [multi_component_enotdir_tokens[1], multi_component_enotdir_tokens[0], *multi_component_enotdir_tokens[2:-1]]}),
+            ("extra body", {"a3_body_events": [*multi_component_enotdir_tokens, "extra"]}),
+            ("fabricated full-suffix event", {"a3_body_events": list(multi_component_enotdir_tokens)}),
+            ("immediate errno", {"a3_target_absence_errnos": [(multi_component_enotdir_tokens[-1], errno.ENOTDIR)]}),
+            ("pre-existing FP", {"a1_final_private_events": list(stage3_a1_final_private)}),
+            ("pre-existing FB", {"a1_final_borrowed_events": list(stage3_a1_final_borrowed)}),
+            ("incomplete GB", {"graph_binding_events": ["unexpected"]}),
+            ("absence event", {"a3_absence_events": ["absent-terminal"]}),
+            ("absence errno", {"a3_absence_errnos": [("absent-terminal", errno.ENOTDIR)]}),
+            ("body failure", {"a3_first_body_failure": "body-failure"}),
+            ("governed outcome", {"a1_body_outcome": "governed"}),
+            ("capacity outcome", {"a1_body_outcome": "capacity", "a1_emfile": True}),
+            ("arbitrary outcome", {"a1_body_outcome": "arbitrary"}),
+            ("EMFILE", {"a1_emfile": True}),
+            ("EMFILE pending", {"a1_emfile_pending": True}),
+            ("GB failure", {"gb_failed": True}),
+            ("interrupt", {"a3_original_interrupt": "interrupt"}),
+            ("safe failure", {"a1_safe_failure_attempted": "FP"}),
+            ("A1 close failure", {"a1_close_failure_attempted": "close"}),
+            ("A3 close failure", {"a3_close_failure": "close"}),
+            ("used FP bridge", {"multi_component_enotdir_fp_bridge": True}),
+            ("marker already set", {"multi_component_enotdir_missing": True}),
+            ("existing close", {"graph_close_calls": [43]}),
+            ("existing suffix", {"a1_suffix": ["final-private"]}),
+            ("wrong fd", {"arguments": (44, fcntl.F_GETFL)}),
+            ("wrong namespace", {"namespace": "os"}),
+            ("wrong name", {"name": "fstat"}),
+            ("wrong arity", {"arguments": (42, fcntl.F_GETFL, 0)}),
+            ("keywords", {"arguments_by_name": {"dir_fd": 42}}),
+            ("close", {"namespace": "os", "name": "close", "arguments": (43,)}),
+        ]
+        for label, overrides in controls:
+            trial = dict(accepted)
+            namespace, name, arguments, arguments_by_name = first_fp_call
+            namespace = overrides.get("namespace", namespace)
+            name = overrides.get("name", name)
+            arguments = overrides.get("arguments", arguments)
+            arguments_by_name = overrides.get("arguments_by_name", arguments_by_name)
+            trial.update(
+                {
+                    key: value
+                    for key, value in overrides.items()
+                    if key not in {"namespace", "name", "arguments", "arguments_by_name"}
+                }
+            )
+            if multi_component_enotdir_missing_probe_allowed(
+                trial, namespace, name, arguments, arguments_by_name
+            ):
+                raise SystemExit(
+                    f"stage3a3 multi-component ENOTDIR first-FP negative control accepted: {label}"
+                )
+
+        fallback_accepted = {
+            "label": "stage3a3-multi-component-canonical-enotdir",
+            "full_a2": True,
+            "state": {"multi_component_enotdir_missing": True},
+            "caught": module.MutationError("original"),
+        }
+        fallback_controls = [
+            ("wrong label", {"label": "stage3a3-multi-component-canonical-absence"}),
+            ("incomplete A2", {"full_a2": False}),
+            ("missing state", {"state": None}),
+            ("false marker", {"state": {"multi_component_enotdir_missing": False}}),
+            ("no exception", {"caught": None}),
+            ("SystemExit", {"caught": SystemExit(77)}),
+            ("another exception", {"caught": OSError(errno.EIO)}),
+        ]
+        class MutationErrorSubclass(module.MutationError):
+            pass
+        fallback_controls.append(("MutationError subclass", {"caught": MutationErrorSubclass("subclass")}))
+        fallback_trials = [("positive", {})] + fallback_controls
+        for label, overrides in fallback_trials:
+            trial = dict(fallback_accepted)
+            trial.update(overrides)
+            state = trial["state"]
+            fallback = (
+                trial["label"] == "stage3a3-multi-component-canonical-enotdir"
+                and trial["full_a2"]
+                and state is not None
+                and state["multi_component_enotdir_missing"]
+                and type(trial["caught"]) is module.MutationError
+            )
+            if (label == "positive") != fallback:
+                raise SystemExit(
+                    f"stage3a3 multi-component ENOTDIR fallback control drifted: {label}"
+                )
+
+    def check_held_root_missing_probe_controls():
+        accepted = {
+            "a1_phase": "a3",
+            "stage3_case": (
+                "stage3a3-case", "held-root-canonical-absence", {}
+            ),
+            "a3_body_events": list(held_root_body_prefix_tokens),
+            "a3_target_absence_errnos": [],
+            "a3_absence_events": [],
+            "a3_absence_errnos": [],
+            "a3_first_body_failure": None,
+            "a1_body_outcome": None,
+            "a1_emfile": False,
+            "a1_emfile_pending": False,
+            "gb_failed": False,
+            "a3_original_interrupt": None,
+            "held_root_missing": False,
+            "held_root_first_fp_bridge": False,
+            "graph_fds": {b"/": 42},
+        }
+        accepted_call = (
+            "os", "stat", (b"root-missing",),
+            {"dir_fd": 42, "follow_symlinks": False},
+        )
+        if not held_root_missing_probe_allowed(accepted, *accepted_call):
+            raise SystemExit("stage3a3 held root missing positive probe was rejected")
+        controls = [
+            ("wrong case", {"stage3_case": ("stage3a3-case", "relative-primary", {})}),
+            ("wrong phase", {"a1_phase": "fp"}),
+            ("partial body", {"a3_body_events": list(held_root_body_prefix_tokens[:-1])}),
+            ("changed body", {"a3_body_events": ["changed", *held_root_body_prefix_tokens[1:]]}),
+            ("extra body", {"a3_body_events": [*held_root_body_prefix_tokens, "extra"]}),
+            ("immediate errno", {"a3_target_absence_errnos": [("immediate", errno.ENOENT)]}),
+            ("final absence", {"a3_absence_events": ["absent-terminal"]}),
+            ("body failure", {"a3_first_body_failure": "body-failure"}),
+            ("clean outcome", {"a1_body_outcome": "success"}),
+            ("EMFILE", {"a1_emfile": True}),
+            ("EMFILE pending", {"a1_emfile_pending": True}),
+            ("GB failure", {"gb_failed": True}),
+            ("interrupt", {"a3_original_interrupt": "interrupt"}),
+            ("used marker", {"held_root_missing": True}),
+            ("used bridge", {"held_root_first_fp_bridge": True}),
+            ("wrong root fd", {"graph_fds": {b"/": 43}}),
+            ("wrong namespace", {"namespace": "fcntl"}),
+            ("wrong name", {"name": "open"}),
+            ("wrong path", {"arguments": (b"root-missing/leaf",)}),
+            ("wrong follow", {"arguments_by_name": {"dir_fd": 42, "follow_symlinks": True}}),
+            ("wrong arity", {"arguments": (b"root-missing", 0)}),
+            ("keywords", {"arguments_by_name": {"dir_fd": 42}}),
+        ]
+        for label, overrides in controls:
+            trial = dict(accepted)
+            namespace, name, arguments, arguments_by_name = accepted_call
+            namespace = overrides.get("namespace", namespace)
+            name = overrides.get("name", name)
+            arguments = overrides.get("arguments", arguments)
+            arguments_by_name = overrides.get("arguments_by_name", arguments_by_name)
+            trial.update(
+                {
+                    key: value
+                    for key, value in overrides.items()
+                    if key not in {"namespace", "name", "arguments", "arguments_by_name"}
+                }
+            )
+            if held_root_missing_probe_allowed(
+                trial, namespace, name, arguments, arguments_by_name
+            ):
+                raise SystemExit(
+                    f"stage3a3 held root missing negative control accepted: {label}"
+                )
+
+    def check_held_root_first_fp_bridge_controls():
+        accepted = {
+            "a1_phase": "a2",
+            "stage3_case": (
+                "stage3a3-case", "held-root-canonical-absence", {}
+            ),
+            "graph_events": list(held_root_expected_g1),
+            "expected_graph_events": list(held_root_expected_g1),
+            "held_root_open_redirects": ["open-root"],
+            "a2_operations": [],
+            "a3_body_events": [],
+            "a3_absence_events": [],
+            "a3_target_absence_errnos": [],
+            "a3_absence_errnos": [],
+            "a1_final_private_events": [],
+            "a1_final_borrowed_events": [],
+            "graph_binding_events": [],
+            "graph_close_calls": [],
+            "a1_body_outcome": None,
+            "a2_first_body_failure": None,
+            "a3_first_body_failure": None,
+            "a1_safe_failure_attempted": None,
+            "a1_close_failure_attempted": None,
+            "a3_close_failure": None,
+            "a1_suffix": [],
+            "a1_emfile": False,
+            "a1_emfile_pending": False,
+            "gb_failed": False,
+            "a3_original_interrupt": None,
+            "held_root_missing": False,
+            "held_root_first_fp_bridge": False,
+            "private_ledger_fd": 42,
+            "constant_values": {("fcntl", "F_GETFL"): fcntl.F_GETFL},
+        }
+        accepted_call = ("fcntl", "fcntl", (42, fcntl.F_GETFL), {})
+        if not held_root_first_fp_bridge_allowed(accepted, *accepted_call):
+            raise SystemExit("stage3a3 held root first-FP positive bridge was rejected")
+        controls = [
+            ("wrong case", {"stage3_case": ("stage3a3-case", "relative-primary", {})}),
+            ("wrong phase", {"a1_phase": "fp"}),
+            ("incomplete G1", {"graph_events": list(held_root_expected_g1[:-1])}),
+            ("missing sentinel", {"held_root_open_redirects": []}),
+            ("duplicate sentinel", {"held_root_open_redirects": ["open-root", "open-root"]}),
+            ("A2 event", {"a2_operations": ["unexpected"]}),
+            ("A3 event", {"a3_body_events": ["unexpected"]}),
+            ("final absence", {"a3_absence_events": ["unexpected"]}),
+            ("FP event", {"a1_final_private_events": ["unexpected"]}),
+            ("FB event", {"a1_final_borrowed_events": ["unexpected"]}),
+            ("GB event", {"graph_binding_events": ["unexpected"]}),
+            ("close event", {"graph_close_calls": [43]}),
+            ("body failure", {"a1_body_outcome": "governed"}),
+            ("A2 failure", {"a2_first_body_failure": "failure"}),
+            ("A3 failure", {"a3_first_body_failure": "failure"}),
+            ("safe failure", {"a1_safe_failure_attempted": "FP"}),
+            ("A1 close failure", {"a1_close_failure_attempted": "close"}),
+            ("A3 close failure", {"a3_close_failure": "close"}),
+            ("existing suffix", {"a1_suffix": ["final-private"]}),
+            ("EMFILE", {"a1_emfile": True}),
+            ("EMFILE pending", {"a1_emfile_pending": True}),
+            ("GB failure", {"gb_failed": True}),
+            ("interrupt", {"a3_original_interrupt": "interrupt"}),
+            ("used marker", {"held_root_first_fp_bridge": True}),
+            ("missing probe", {"held_root_missing": True}),
+            ("wrong fd", {"private_ledger_fd": 43}),
+            ("wrong namespace", {"namespace": "os"}),
+            ("wrong name", {"name": "fstat"}),
+            ("wrong command", {"arguments": (42, fcntl.F_GETFD)}),
+            ("wrong arity", {"arguments": (42, fcntl.F_GETFL, 0)}),
+            ("keywords", {"arguments_by_name": {"dir_fd": 42}}),
+        ]
+        for label, overrides in controls:
+            trial = dict(accepted)
+            namespace, name, arguments, arguments_by_name = accepted_call
+            namespace = overrides.get("namespace", namespace)
+            name = overrides.get("name", name)
+            arguments = overrides.get("arguments", arguments)
+            arguments_by_name = overrides.get("arguments_by_name", arguments_by_name)
+            trial.update(
+                {
+                    key: value
+                    for key, value in overrides.items()
+                    if key not in {"namespace", "name", "arguments", "arguments_by_name"}
+                }
+            )
+            if held_root_first_fp_bridge_allowed(
+                trial, namespace, name, arguments, arguments_by_name
+            ):
+                raise SystemExit(
+                    f"stage3a3 held root first-FP negative control accepted: {label}"
+                )
+
     class Stage3Callable:
         def __init__(self, namespace, name, target):
             self.namespace = namespace
@@ -1959,6 +3138,55 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             ):
                 state["events"].append("capacity-policy-selected")
                 state["a1_phase"] = "g1"
+            if state is not None and disjoint_root_missing_probe_allowed(
+                state, self.namespace, self.name, arguments, arguments_by_name
+            ):
+                state["disjoint_root_missing"] = True
+                state["a1_phase"] = "a3-complete"
+            if state is not None and reviewed_target_absence_fp_probe_allowed(
+                state, self.namespace, self.name, arguments, arguments_by_name
+            ):
+                state["reviewed_target_absence_fp_bridge"] = True
+                state["a1_phase"] = "fp"
+            if state is not None and reviewed_target_absence_cleanup_probe_allowed(
+                state, self.namespace, self.name, arguments, arguments_by_name
+            ):
+                state["target_absence_missing"] = True
+                state["a1_phase"] = "cleanup"
+            if state is not None and multi_component_absence_cleanup_probe_allowed(
+                state, self.namespace, self.name, arguments, arguments_by_name
+            ):
+                state["multi_component_absence_missing"] = True
+                state["a1_phase"] = "cleanup"
+            if state is not None and multi_component_enotdir_missing_probe_allowed(
+                state, self.namespace, self.name, arguments, arguments_by_name
+            ):
+                state["multi_component_enotdir_missing"] = True
+                state["a1_phase"] = "fp"
+            if state is not None and multi_component_absence_fp_probe_allowed(
+                state, self.namespace, self.name, arguments, arguments_by_name
+            ):
+                state["multi_component_absence_fp_bridge"] = True
+                state["a1_phase"] = "fp"
+            if state is not None and multi_component_enotdir_fp_probe_allowed(
+                state, self.namespace, self.name, arguments, arguments_by_name
+            ):
+                state["multi_component_enotdir_fp_bridge"] = True
+                state["a1_phase"] = "fp"
+            if state is not None and held_root_missing_probe_allowed(
+                state, self.namespace, self.name, arguments, arguments_by_name
+            ):
+                state["held_root_missing"] = True
+                try:
+                    return self.target(*arguments, **arguments_by_name)
+                finally:
+                    state["a1_phase"] = "a2"
+            if state is not None and held_root_first_fp_bridge_allowed(
+                state, self.namespace, self.name, arguments, arguments_by_name
+            ):
+                state["held_root_missing"] = True
+                state["held_root_first_fp_bridge"] = True
+                state["a1_phase"] = "fp"
             if state is not None and state.get("a1_phase") == "a3-complete":
                 state["a1_phase"] = "fp"
                 if not stage3_a1_private_call_matches(
@@ -1967,11 +3195,6 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     state["a1_phase"] = "a3-complete"
                     if self.namespace == "os" and self.name == "close":
                         state["a1_phase"] = "cleanup"
-                elif state.get("a3_semantic_observed") is not None:
-                    state["a3_semantic_rejection"] = state["a3_semantic_observed"]
-                    state["a3_first_body_failure"] = stage3_a3_fault(
-                        state["stage3_case"]
-                    )[0]
             if state is not None and state.get("a1_phase") == "post-gb":
                 state["a1_phase"] = "absence"
                 if stage3_a3_call_token(
@@ -1980,6 +3203,26 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     state["a1_phase"] = "post-gb"
                     if self.namespace == "os" and self.name == "close":
                         state["a1_phase"] = "cleanup"
+            if (
+                state is not None
+                and state["stage3_case"] is not None
+                and state["stage3_case"][0] == "stage3a3-case"
+                and state["stage3_case"][1] == "multi-component-canonical-absence"
+                and state["a1_phase"] == "a3"
+                and tuple(state["a3_body_events"]) == multi_component_absence_tokens[:-1]
+                and self.namespace == "os"
+                and self.name == "stat"
+                and arguments == (b"a-missing",)
+                and arguments_by_name
+                == {
+                    "dir_fd": state["a2_fds"]["repo-abs"],
+                    "follow_symlinks": False,
+                }
+            ):
+                try:
+                    return self.target(*arguments, **arguments_by_name)
+                finally:
+                    state["a1_phase"] = "fp"
             a1_graph_call = stage3_a1_graph_call_matches(
                 self.namespace, self.name, arguments, arguments_by_name
             )
@@ -2018,6 +3261,12 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     arguments,
                     arguments_by_name,
                 )
+            if (
+                state is not None
+                and stage3_case_reaches_g1(state["stage3_case"])
+                and call_label in stage3_a1_final_borrowed
+            ):
+                record_final_borrowed_attempt(state, call_label)
             if (
                 state is not None
                 and state["events"]
@@ -2146,7 +3395,21 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                             state["a1_emfile_pending"] = True
                             raise OSError(errno.EMFILE, "fixture process file table exhausted")
                 target = stage3_native_target(self.target) if a1_graph_call else self.target
-                result = target(*arguments, **arguments_by_name)
+                if (
+                    a1_graph_call
+                    and state is not None
+                    and state["stage3_case"] is not None
+                    and state["stage3_case"][0] == "stage3a3-case"
+                    and state["stage3_case"][1] == "held-root-canonical-absence"
+                    and state["a1_phase"] == "g1"
+                    and token == "open-root"
+                    and arguments == (b"/", arguments[1])
+                    and not arguments_by_name
+                ):
+                    state["held_root_open_redirects"].append("open-root")
+                    result = target(stage3_root_bytes, arguments[1])
+                else:
+                    result = target(*arguments, **arguments_by_name)
                 if state["a2_complete"] == 1 and stage3_case_reaches_g1(state["stage3_case"]):
                     if type(result) is not int or result < 0:
                         raise SystemExit("stage3a1 graph acquisition order drifted")
@@ -2275,13 +3538,6 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         raise OSError(errno.EIO, "stage3a1 final private custody failed")
                     stage3_a1_maybe_interrupt(state, private_token)
                 if (
-                    stage3_case_reaches_g1(state["stage3_case"])
-                    and call_label in stage3_a1_final_borrowed
-                ):
-                    state["a1_final_borrowed_events"].append(call_label)
-                    state["events"].append(call_label)
-                    stage3_a1_maybe_interrupt(state, call_label)
-                if (
                     not stage3_case_reaches_g1(state["stage3_case"])
                     and
                     state["a2_complete"] == 1
@@ -2312,7 +3568,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     fault = stage3_a1_fp_fault(state["stage3_case"], private_token)
                     if fault == "error":
                         raise OSError(errno.EIO, "stage3a1 final private custody failed")
-                result = self.target(*forwarded, **arguments_by_name)
+                target = stage3_native_target(self.target) if a1_private_call else self.target
+                result = target(*forwarded, **arguments_by_name)
                 if a1_private_call:
                     if fault == "mismatch":
                         result = result + 1 if type(result) is int else True
@@ -2479,25 +3736,6 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         return result
                     if token is not None and token == "anchor-lineages-exact":
                         raise SystemExit("stage3a1 graph acquisition order drifted")
-                if (
-                    stage3_case_reaches_g1(state["stage3_case"])
-                    and call_label in stage3_a1_final_borrowed
-                ):
-                    state["a1_final_borrowed_events"].append(call_label)
-                    state["events"].append(call_label)
-                    if call_label == "borrowed-P-fstat":
-                        state["a1_suffix"].append("final-borrowed")
-                        state["a1_phase"] = "gb"
-                        safe_failure = stage3_a1_options(state["stage3_case"]).get("safe_failure")
-                        if safe_failure in {"FB", "FB-KI"}:
-                            state["a1_safe_failure_attempted"] = safe_failure
-                            if safe_failure == "FB-KI":
-                                raise KeyboardInterrupt()
-                            raise OSError(errno.EIO, "stage3a1 final borrowed custody failed")
-                        if stage3_a1_expected_binding_token(state) is None:
-                            state["a1_suffix"].append("final-graph-bindings")
-                            stage3_a3_after_gb(state)
-                    stage3_a1_maybe_interrupt(state, call_label)
                 if not stage3_case_reaches_g1(state["stage3_case"]) and state["final_custody"] == 1:
                     if fd == state["borrowed_ledger_fd"] and "borrowed-L-fstat" not in state["events"]:
                         state["events"].append("borrowed-L-fstat")
@@ -2507,7 +3745,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     fault = stage3_a1_fp_fault(state["stage3_case"], private_token)
                     if fault == "error":
                         raise OSError(errno.EIO, "stage3a1 final private custody failed")
-                result = self.target(*arguments, **arguments_by_name)
+                target = stage3_native_target(self.target) if a1_private_call else self.target
+                result = target(*arguments, **arguments_by_name)
                 if a1_private_call and fault == "mismatch":
                     result = StatProxy(result, st_ino=result.st_ino + 1)
                 if (
@@ -2530,7 +3769,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         state["a1_final_private_events"].append(private_token)
                         state["a1_fp_pread_attempted"] = True
                         stage3_a1_maybe_interrupt(state, "private-L-pread")
-                result = self.target(*arguments, **arguments_by_name)
+                target = stage3_native_target(self.target) if a1_private_call else self.target
+                result = target(*arguments, **arguments_by_name)
                 if a1_private_call:
                     cursor = state["a1_private_pread_cursor"]
                     expected = state["a1_private_expected_bytes"]
@@ -3018,6 +4258,124 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         if state["a1_phase"] != "cleanup":
             raise SystemExit("stage3a1 lifecycle phase did not reach cleanup")
 
+    def check_stage3_a2_positive_body():
+        state = stage3_c0_state
+        if state is None or state["a2_expected_outcome"] != "success":
+            raise SystemExit("stage3a2 positive body was used for a non-success route")
+        case = state["stage3_case"]
+        fault_token, variant = stage3_a2_fault(case)
+        expected_fsencode = [
+            (descriptor[3][0], os.fsencode(descriptor[3][0]))
+            for descriptor in state["a2_expected_operations"]
+            if descriptor[0].startswith("fsencode")
+            and not (descriptor[0] == fault_token and variant == "error")
+        ]
+        if state["a2_fsencode_calls"] != expected_fsencode:
+            raise SystemExit("stage3a2 positive fsencode invocation drifted")
+        if len(state["a2_scan_closes"]) != len(set(state["a2_scan_closes"])):
+            raise SystemExit("stage3a2 positive scan descriptor was closed more than once")
+        for value, preowned in state["a2_rejected_returns"]:
+            close_count = sum(
+                type(closed) is type(value) and closed == value
+                for closed in state["graph_close_calls"]
+            )
+            if close_count != (1 if preowned else 0):
+                raise SystemExit("stage3a2 positive rejected descriptor lifetime drifted")
+        expected_closes = list(reversed(state["graph_owned"])) + [
+            state["private_parent_fd"],
+            state["private_ledger_fd"],
+        ]
+        if state["graph_close_calls"] != expected_closes:
+            raise SystemExit("stage3a2 positive reverse owner cleanup drifted")
+        for fd in expected_closes:
+            try:
+                real_fstat(fd)
+            except OSError as exc:
+                if exc.errno != errno.EBADF:
+                    raise SystemExit("stage3a2 positive owner did not report EBADF") from exc
+            else:
+                raise SystemExit("stage3a2 positive owner leaked")
+        expected_post_calls = ["resource-getrlimit"]
+        for descriptor in state["a2_expected_operations"]:
+            token = descriptor[0]
+            repeats = 1
+            if token.startswith("regular-pread:"):
+                label = token.split(":", 1)[1]
+                chunks = state["a2_chunks_by_label"].get(label)
+                if chunks is None and token == fault_token:
+                    chunks = state["a2_regular_chunks"]
+                repeats = max(1, len(chunks or ()))
+            expected_post_calls.extend(token for _ in range(repeats))
+            if token == fault_token and variant is not None and variant.startswith("EMFILE"):
+                expected_post_calls.append("resource-getrlimit-reread")
+        expected_a2_prefix = tuple(expected_post_calls)
+        expected_post_calls.extend(stage3_a1_final_borrowed)
+        expected_post_calls.extend(("close-P", "close-L"))
+        if stage3_case_composes_a3(state["stage3_case"]):
+            if tuple(state["post_a2_calls"][: len(expected_a2_prefix)]) != expected_a2_prefix:
+                raise SystemExit("stage3a2 positive post-A2 call sequence drifted")
+        elif state["post_a2_calls"] != expected_post_calls:
+            raise SystemExit("stage3a2 positive post-A2 call sequence drifted")
+        expected_rows = stage3_a2_expected_rows
+        if (
+            state["stage3_case"] is not None
+            and state["stage3_case"][0] == "stage3a3-case"
+            and state["stage3_case"][1] == "held-root-canonical-absence"
+        ):
+            expected_rows = stage3_a2_held_root_rows
+        for row in expected_rows:
+            label, locator, klass, access, result, mode, size, digest = row[:8]
+            observed_row = state["a2_supplied_rows"].get(locator)
+            observed_lineage = state["a2_row_lineage"].get(label)
+            if observed_row is None or observed_row + (observed_lineage,) != (
+                locator,
+                klass,
+                access,
+                result,
+                mode,
+                size,
+                digest,
+                row[8],
+            ):
+                raise SystemExit("stage3a2 positive literal ledger lineage drifted")
+            value = state["a2_row_stats"].get(label)
+            if value is None or stat.S_IMODE(value.st_mode) != mode:
+                raise SystemExit("stage3a2 positive literal row mode drifted")
+            if row[-1] == "regular":
+                content = state["a2_regular_bytes"].get(label)
+                chunks = state["a2_chunks_by_label"].get(label, ())
+                cursor = 0
+                for offset, request, chunk in chunks:
+                    if (
+                        offset != cursor
+                        or request <= 0
+                        or request > min(1024 * 1024, size - offset)
+                        or not chunk
+                        or cursor + len(chunk) > size
+                    ):
+                        raise SystemExit("stage3a2 positive pread cursor/request drifted")
+                    cursor += len(chunk)
+                if (
+                    content is None
+                    or cursor != size
+                    or len(content) != size
+                    or hashlib.sha256(content).hexdigest() != digest
+                ):
+                    raise SystemExit("stage3a2 positive regular row values drifted")
+            else:
+                preimages = [
+                    data
+                    for observed_label, data in state["a2_preimages"]
+                    if observed_label == label
+                ]
+                if (
+                    len(preimages) != 2
+                    or preimages[0] != preimages[1]
+                    or len(preimages[0]) != size
+                    or hashlib.sha256(preimages[0]).hexdigest() != digest
+                ):
+                    raise SystemExit("stage3a2 positive directory preimages drifted")
+
     def check_stage3_a2(expected_terminal):
         state = stage3_c0_state
         if (
@@ -3185,49 +4543,25 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         if state["post_a2_calls"] != expected_post_calls:
             raise SystemExit("stage3a2 post-A2 call sequence drifted")
         if expected_outcome == "success":
-            for row in stage3_a2_expected_rows:
-                label, locator, klass, access, result, mode, size, digest = row[:8]
-                observed_row = state["a2_supplied_rows"].get(locator)
-                observed_lineage = state["a2_row_lineage"].get(label)
-                if observed_row is None or observed_row + (observed_lineage,) != (
-                        locator,
-                        klass,
-                        access,
-                        result,
-                        mode,
-                        size,
-                        digest,
-                        row[8],
-                    ):
-                    raise SystemExit("stage3a2 literal ledger row mapping drifted")
-                value = state["a2_row_stats"].get(label)
-                if value is None or stat.S_IMODE(value.st_mode) != mode:
-                    raise SystemExit("stage3a2 literal row mode was not observed")
-                if row[-1] == "regular":
-                    content = state["a2_regular_bytes"].get(label)
-                    chunks = state["a2_chunks_by_label"].get(label, ())
-                    cursor = 0
-                    for offset, request, chunk in chunks:
-                        if (
-                            offset != cursor
-                            or request <= 0
-                            or request > min(1024 * 1024, size - offset)
-                            or not chunk
-                            or cursor + len(chunk) > size
-                        ):
-                            raise SystemExit("stage3a2 regular pread cursor/request drifted")
-                        cursor += len(chunk)
-                    if content is None or cursor != size or len(content) != size or hashlib.sha256(content).hexdigest() != digest:
-                        raise SystemExit("stage3a2 literal regular row values drifted")
-                else:
-                    preimages = [data for observed_label, data in state["a2_preimages"] if observed_label == label]
-                    if len(preimages) != 2 or preimages[0] != preimages[1] or len(preimages[0]) != size or hashlib.sha256(preimages[0]).hexdigest() != digest:
-                        raise SystemExit("stage3a2 literal directory row values drifted")
+            check_stage3_a2_positive_body()
         if state["a2_close_uncertain"] and expected_terminal != "MutationError":
             raise SystemExit("stage3a2 scan close uncertainty lost precedence")
 
     def check_stage3_a2_prefix():
         state = stage3_c0_state
+        if (
+            state["stage3_case"] is not None
+            and state["stage3_case"][0] == "stage3a3-case"
+            and state["stage3_case"][1] == "held-root-canonical-absence"
+            and state["held_root_missing"]
+        ):
+            if (
+                state["graph_events"] != state["expected_graph_events"]
+                or state["a2_operations"]
+                or not state["held_root_first_fp_bridge"]
+            ):
+                raise SystemExit("stage3a3 held root RED prefix drifted")
+            return
         if (
             state["graph_events"] != state["expected_graph_events"]
             or tuple(state["a2_operations"])
@@ -3242,16 +4576,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         ]
         if state["a2_fsencode_calls"] != expected_fsencode:
             raise SystemExit("stage3a3 A2 fsencode prefix drifted")
-        for row in stage3_a2_expected_rows:
-            label, locator, klass, access, result, mode, size, digest = row[:8]
-            observed = state["a2_supplied_rows"].get(locator)
-            value = state["a2_row_stats"].get(label)
-            if (
-                observed != (locator, klass, access, result, mode, size, digest)
-                or value is None
-                or stat.S_IMODE(value.st_mode) != mode
-            ):
-                raise SystemExit("stage3a3 A2 literal row prefix drifted")
+        check_stage3_a2_positive_body()
 
     def check_stage3_a3(expected_terminal):
         state = stage3_c0_state
@@ -3260,8 +4585,22 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         body_tokens = tuple(descriptor[0] for descriptor in state["a3_body_operations"])
         absence_tokens = tuple(descriptor[0] for descriptor in state["a3_absence_operations"])
         fault_token, fault_variant = stage3_a3_fault(case)
+        held_root_case = (
+            case[0] == "stage3a3-case"
+            and case[1] == "held-root-canonical-absence"
+        )
+        held_root_fallback = (
+            held_root_case
+            and state["held_root_missing"]
+            and state["held_root_first_fp_bridge"]
+            and expected_terminal == "MutationError"
+        )
+        held_root_early_fallback = held_root_fallback and not state["a3_started"]
+        observed_body_tokens = tuple(state["a3_body_events"])
         if not state["a3_started"]:
-            if (
+            if held_root_early_fallback:
+                expected_body = ()
+            elif (
                 case[0] == "stage3a3-case"
                 and case[1] == "relative-primary"
                 and tuple(state["a1_final_private_events"]) == ()
@@ -3271,10 +4610,27 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 raise SystemExit(
                     "stage3a3 canonical absence was not the final filesystem observation"
                 )
-            raise SystemExit("stage3a3 executable case performed no A3 operation")
-        expected_body = body_tokens
+            else:
+                raise SystemExit("stage3a3 executable case performed no A3 operation")
+        else:
+            expected_body = body_tokens
         if fault_token in body_tokens:
-            expected_body = body_tokens[: body_tokens.index(fault_token) + 1]
+            end = body_tokens.index(fault_token) + 1
+            if fault_variant == "mismatch" and fault_token.startswith("symlink-held-fstat"):
+                end += 1
+            elif (
+                fault_variant in {"empty", "4097-bytes", "mismatch"}
+                and fault_token.startswith("readlink2:")
+            ):
+                end += 2
+            elif (
+                fault_variant == "mismatch"
+                and fault_token.startswith("target-parent-stat:")
+                and end < len(body_tokens)
+                and body_tokens[end] == fault_token.replace("parent-stat", "held-fstat")
+            ):
+                end += 1
+            expected_body = body_tokens[:end]
         if options.get("expected_route", "success") == "follow41":
             refused = next(
                 token
@@ -3282,19 +4638,63 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 if token == "symlink-parent-stat0:41"
             )
             expected_body = body_tokens[: body_tokens.index(refused) + 1]
+        disjoint_first_root_only = False
+        if case[0] == "stage3a3-case" and case[1] == "disjoint-symlink-roots":
+            if observed_body_tokens not in (state["disjoint_first_root_tokens"], body_tokens):
+                raise SystemExit("stage3a3 disjoint symlink body operation order drifted")
+            disjoint_first_root_only = observed_body_tokens == state["disjoint_first_root_tokens"]
+            expected_body = observed_body_tokens
+        if (
+            case[0] == "stage3a3-case"
+            and case[1] == "multi-component-canonical-absence"
+            and expected_terminal == "MutationError"
+            and tuple(state["a3_body_events"]) == multi_component_absence_tokens[:-1]
+            and not state["a3_target_absence_errnos"]
+        ):
+            expected_body = multi_component_absence_tokens[:-1]
+        if (
+            case[0] == "stage3a3-case"
+            and case[1] == "multi-component-canonical-enotdir"
+            and expected_terminal == "MutationError"
+            and tuple(state["a3_body_events"]) == multi_component_enotdir_tokens[:-1]
+            and not state["a3_target_absence_errnos"]
+        ):
+            expected_body = multi_component_enotdir_tokens[:-1]
+        if held_root_fallback and not held_root_early_fallback:
+            expected_body = held_root_body_prefix_tokens
         if tuple(state["a3_body_events"]) != expected_body:
             raise SystemExit("stage3a3 body operation order drifted")
         route = options.get("expected_route", "success")
-        expected_absence = absence_tokens
+        if route == "success" and stage3_case_composes_a3(case) and (
+            state["a1_body_outcome"] == "governed"
+            or expected_terminal == "MutationError"
+            and not state["a3_absence_events"]
+            and not state["a3_markers"]
+        ):
+            route = "governed"
+        expected_absence = (
+            absence_tokens
+            if route in {"success", "absence-failure", "absence-arbitrary"}
+            else ()
+        )
         if fault_token in absence_tokens:
-            expected_absence = absence_tokens[: absence_tokens.index(fault_token) + 1]
+            end = absence_tokens.index(fault_token) + 1
+            if (
+                fault_variant == "mismatch"
+                and fault_token.startswith("absent-boundary-parent:")
+                and end < len(absence_tokens)
+                and absence_tokens[end]
+                == fault_token.replace("boundary-parent", "boundary-held")
+            ):
+                end += 1
+            expected_absence = absence_tokens[:end]
         if route == "success" and tuple(state["a3_absence_events"]) != expected_absence:
             raise SystemExit("stage3a3 canonical absence was not the final filesystem observation")
         if route.startswith("absence-") and tuple(state["a3_absence_events"]) != expected_absence:
             raise SystemExit("stage3a3 terminal absence mutation order drifted")
         if route not in {"success", "absence-failure", "absence-arbitrary"} and state["a3_absence_events"]:
             raise SystemExit("stage3a3 rejected body reached canonical absence")
-        if absence_tokens:
+        if absence_tokens and not held_root_case:
             if any(
                 not (
                     absence_tokens[index].startswith("absent-boundary-parent:")
@@ -3311,7 +4711,18 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 != (errno.ENOENT, errno.ENOTDIR, errno.ENOENT)
             ):
                 raise SystemExit("stage3a3 canonical absence was not the final filesystem observation")
-        elif route == "success" and state["a3_markers"] != ["canonical-absence-empty"]:
+        elif held_root_case and route == "success" and (
+            not state["a3_absence_complete"]
+            or tuple(state["a3_absence_events"]) != held_root_absence_tokens
+            or tuple(value for _token, value in state["a3_absence_errnos"])
+            != (errno.ENOENT,)
+        ):
+            raise SystemExit("stage3a3 held root canonical absence was not replayed")
+        elif (
+            route == "success"
+            and not held_root_case
+            and state["a3_markers"] != ["canonical-absence-empty"]
+        ):
             raise SystemExit("stage3a3 empty canonical-absence ledger was not explicit")
         expected_boundary_tokens = tuple(
             token
@@ -3324,6 +4735,10 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             token: after for token, _before, after in state["a3_injections"]
         }
         for token in expected_boundary_tokens:
+            if held_root_case:
+                value = identity(state["a2_row_stats"]["external-root"])
+                expected_boundary_values.append(injection_after.get(token, value))
+                continue
             row_label = "repo-abs-blocker" if "/blocker/child" in token else "repo-abs"
             value = identity(state["a2_row_stats"][row_label])
             expected_boundary_values.append(injection_after.get(token, value))
@@ -3442,9 +4857,11 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             or len(state["a3_fsencode_calls"]) != len(returned_fsencodes)
         ):
             raise SystemExit("stage3a3 fsencode attempt/return prefix drifted")
-        if any(type(value) is bytes for value in native_by_token.values()) and fsencode_attempts:
+        if any(type(value) is bytes for value in returned_by_token.values()) and fsencode_attempts:
             raise SystemExit("stage3a3 bytes target reached fsencode")
-        if any(type(value) is str for value in native_by_token.values()) and len(fsencode_attempts) != len(returned_reads):
+        if len(fsencode_attempts) != sum(
+            type(value) is str for value in returned_by_token.values()
+        ):
             raise SystemExit("stage3a3 str target fsencode was not immediate and singular")
         raw_values = tuple(value for _token, value in state["a3_readlinks"])
         for occurrence in admitted[:40]:
@@ -3480,16 +4897,24 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             locator = reads[0][0].split(":", 1)[1].rsplit(":", 1)[0].encode("ascii")
             row = state["a2_supplied_rows"].get(locator)
             encoded = os.fsencode(expected_raw)
+            expected_read_count = sum(
+                token.endswith(f":{occurrence}") for token in returned_reads
+            )
+            expected_row_size = options.get("symlink_row_size", len(encoded))
+            expected_row_digest = options.get(
+                "symlink_row_digest", hashlib.sha256(encoded).hexdigest()
+            )
             if (
-                len(reads) != 2
-                or type(reads[0][1]) is not type(expected_raw)
-                or reads[0][1] != expected_raw
-                or reads[1][1] != expected_raw
+                len(reads) != expected_read_count
+                or any(
+                    type(value) is not type(expected_raw) or value != expected_raw
+                    for _token, value in reads
+                )
                 or row is None
                 or row[1:4] != ("symlink", "probe", "present")
                 or row[4] != 0o777
-                or row[5] != len(encoded)
-                or row[6] != hashlib.sha256(encoded).hexdigest()
+                or row[5] != expected_row_size
+                or row[6] != expected_row_digest
             ):
                 raise SystemExit("stage3a3 exact raw target S3/T3 evidence drifted")
         identity_by_occurrence = {}
@@ -3506,7 +4931,12 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         for occurrence in admitted:
             values = identity_by_occurrence.get(occurrence, ())
             expected_count = sum(token.endswith(f":{occurrence}") for token in expected_identity_tokens)
-            mismatch_here = fault_token is not None and fault_token.endswith(f":{occurrence}") and fault_variant == "mismatch"
+            mismatch_here = (
+                fault_token is not None
+                and fault_token.startswith(("symlink-held-fstat", "symlink-parent-stat"))
+                and fault_token.endswith(f":{occurrence}")
+                and fault_variant == "mismatch"
+            )
             held_stat0_failed = (
                 fault_token == f"symlink-held-fstat0:{occurrence}"
                 and fault_variant in {"error", "KeyboardInterrupt"}
@@ -3561,23 +4991,62 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 "root-clamped-dotdot": 2 * (len(root_literal_relations) + 1),
                 "trailing-directory": 2,
                 "trailing-nondirectory": 2,
-                "empty-target": 0,
                 "chain40": 41,
                 "chain41-refused": 40,
+                "nested-trailing-slash-regular": 3,
                 "no-symlink-ledger": 0,
                 "canonical-absence-empty": 4,
                 "a3-close-real-then-raise": 4,
+                "disjoint-symlink-roots": 4,
+                "reviewed-symlink-target-absence": 2,
+                "multi-component-canonical-absence": 2,
+                "multi-component-canonical-enotdir": 4,
+                "held-root-canonical-absence": 1,
+                "symlink-size-mismatch": 0,
+                "symlink-digest-mismatch": 0,
+                "missing-reviewed-final-row": 1,
+                "final-locator-mismatch": 1,
+                "final-namespace-mismatch": 1,
+                "intermediate-unreviewed-symlink": 1,
+                "unreviewed-held-final-directory": 2,
             }
+            target_descriptors = (
+                expected_body
+                if held_root_fallback
+                or case[1] == "disjoint-symlink-roots" and disjoint_first_root_only
+                else body_tokens
+            )
             described_targets = sum(
                 token.startswith(("target-parent-stat", "target-held-fstat"))
-                for token in body_tokens
+                for token in target_descriptors
             )
-            if described_targets != expected_target_counts[case[1]]:
+            expected_target_count = expected_target_counts[case[1]]
+            if held_root_fallback:
+                expected_target_count = 0
+            if case[1] == "disjoint-symlink-roots" and disjoint_first_root_only:
+                expected_target_count = 2
+            if described_targets != expected_target_count:
                 raise SystemExit("stage3a3 successful target components were incomplete")
         target_values = [value for _token, value in state["a3_target_identities"]]
         if tuple(token for token, _value in state["a3_target_identities"]) != tuple(target_tokens):
             raise SystemExit("stage3a3 target edge/held identity drifted")
         paired_target_values = target_values
+        if held_root_case and not held_root_fallback:
+            if (
+                target_tokens
+                != ["target-held-fstat:1:external:/root-missing/leaf"]
+                or target_values
+                != [identity(state["a2_row_stats"]["external-root"])]
+            ):
+                raise SystemExit("stage3a3 held root target identity drifted")
+            paired_target_values = []
+        if (
+            fault_token
+            and fault_token.startswith("symlink-open:")
+            and target_tokens
+            and target_tokens[-1].startswith("target-parent-stat:")
+        ):
+            paired_target_values = paired_target_values[:-1]
         if case[0] == "stage3a3-case" and case[1] in {"chain40", "chain41-refused"}:
             final_pair = 2 if case[1] == "chain40" else 0
             intermediate = target_values[:-final_pair] if final_pair else target_values
@@ -3590,21 +5059,44 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 if not next_identities or value != next_identities[0]:
                     raise SystemExit("stage3a3 chain target did not bind the next held stat0")
             paired_target_values = target_values[-final_pair:] if final_pair else []
-        if options.get("semantic_failure") == "intermediate-unreviewed-symlink":
+        if case[0] == "stage3a3-case" and case[1] == "nested-trailing-slash-regular":
+            intermediate = target_values[:-2]
+            intermediate_tokens = target_tokens[:-2]
+            held_stat0 = identity_by_occurrence.get(2, ())
             if (
-                len(target_values) != 1
-                or not stat.S_ISLNK(target_values[0][4])
-                or b"repo:/unreviewed-link" in state["a2_supplied_rows"]
+                len(intermediate) != 1
+                or len(intermediate_tokens) != 1
+                or not stat.S_ISLNK(intermediate[0][4])
+                or not held_stat0
+                or intermediate[0] != held_stat0[0]
             ):
-                raise SystemExit("stage3a3 unreviewed intermediate was not a real symlink")
-            paired_target_values = []
-        if fault_variant != "mismatch" and (
-            len(paired_target_values) % 2
-            or any(
-                paired_target_values[index] != paired_target_values[index + 1]
-                for index in range(0, len(paired_target_values), 2)
-            )
-        ):
+                raise SystemExit("stage3a3 nested intermediate relation did not bind occurrence 2 held stat0")
+            paired_target_values = target_values[-2:]
+        if len(paired_target_values) % 2 and target_tokens[-1].startswith("target-parent-stat:"):
+            paired_target_values = paired_target_values[:-1]
+        target_pair_drift = len(paired_target_values) % 2 != 0
+        target_injection = next(
+            (
+                (before, after)
+                for token, before, after in state["a3_injections"]
+                if token == fault_token
+            ),
+            None,
+        )
+        for index in range(0, len(paired_target_values) - 1, 2):
+            pair_tokens = target_tokens[index : index + 2]
+            pair_values = paired_target_values[index : index + 2]
+            if fault_variant == "mismatch" and fault_token in pair_tokens:
+                fault_index = pair_tokens.index(fault_token)
+                if (
+                    target_injection is None
+                    or pair_values[fault_index] != target_injection[1]
+                    or pair_values[1 - fault_index] != target_injection[0]
+                ):
+                    target_pair_drift = True
+            elif pair_values[0] != pair_values[1]:
+                target_pair_drift = True
+        if target_pair_drift:
             raise SystemExit("stage3a3 target edge/held identity drifted")
         target_row = options.get(
             "target_row",
@@ -3626,34 +5118,93 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 or klass != "directory" and target_values[-1][6] != size
             ):
                 raise SystemExit("stage3a3 literal reviewed target row drifted")
-        if options.get("semantic_failure") is not None and (
-            state["a3_semantic_observed"] != options["semantic_failure"]
-            or state["a3_semantic_rejection"] != options["semantic_failure"]
-            or fault_token != state["a3_first_body_failure"]
-        ):
-            raise SystemExit("stage3a3 semantic mutation was not rejected by production")
-        if options.get("semantic_failure") in {
-            "missing-reviewed-final-row", "final-locator-mismatch", "final-namespace-mismatch"
-        }:
-            row_label = options.get("semantic_row")
-            if not target_values:
-                raise SystemExit("stage3a3 semantic target relation was not observed")
-            if row_label is None:
-                if b"repo:/unreviewed-target" in state["a2_supplied_rows"]:
-                    raise SystemExit("stage3a3 missing-final unexpectedly had a reviewed row")
-            else:
-                row = stage3_a2_row_by_label[row_label]
+        if case[0] == "stage3a3-case" and case[1] == "reviewed-symlink-target-absence":
+            target_absence_token = reviewed_target_absence_tokens[-1]
+            if (
+                tuple(state["a3_target_absence_errnos"])
+                != ((target_absence_token, errno.ENOENT),)
+                or state["a2_supplied_rows"].get(b"repo:/abs")
+                != (
+                    b"repo:/abs", "directory", "probe", "present", 0o700, 10,
+                    "dff711efda3385276e20031e3c33c758adb07840d3181fb20b23d4d00af6543f",
+                )
+                or state["a3_supplied_absence_rows"].get(b"repo:/abs/a-missing")
+                != (b"repo:/abs/a-missing", "absent", "probe", "ENOENT")
+                or not state["reviewed_target_absence_fp_bridge"]
+            ):
+                raise SystemExit("stage3a3 reviewed target absence evidence drifted")
+            if expected_terminal == "SystemExit(77)" and state["target_absence_missing"]:
+                raise SystemExit("stage3a3 corrected target absence took RED fallback")
+            if expected_terminal == "MutationError" and not state["target_absence_missing"]:
+                raise SystemExit("stage3a3 target absence RED fallback was not observed")
+        if case[0] == "stage3a3-case" and case[1] == "multi-component-canonical-absence":
+            immediate_token = multi_component_absence_tokens[-1]
+            if (
+                state["a2_supplied_rows"].get(b"repo:/abs")
+                != (
+                    b"repo:/abs", "directory", "probe", "present", 0o700, 10,
+                    "dff711efda3385276e20031e3c33c758adb07840d3181fb20b23d4d00af6543f",
+                )
+                or state["a3_supplied_absence_rows"].get(b"repo:/abs/a-missing/leaf")
+                != (b"repo:/abs/a-missing/leaf", "absent", "probe", "ENOENT")
+            ):
+                raise SystemExit("stage3a3 multi-component absence evidence drifted")
+            if expected_terminal == "SystemExit(77)":
+                if tuple(state["a3_target_absence_errnos"]) != ((immediate_token, errno.ENOENT),):
+                    raise SystemExit("stage3a3 multi-component immediate absence evidence drifted")
+                if state["multi_component_absence_missing"]:
+                    raise SystemExit("stage3a3 corrected multi-component absence took RED fallback")
+                if not state["multi_component_absence_fp_bridge"]:
+                    raise SystemExit("stage3a3 multi-component immediate absence FP bridge was not observed")
+            if expected_terminal == "MutationError":
                 if (
-                    target_values[-1] != identity(state["a2_row_stats"][row_label])
-                    or state["a2_supplied_rows"].get(row[1]) is None
-                    or row[1] in {
-                        b"repo:/locator-alias", b"repo:/namespace-alias"
-                    }
-                    or options["semantic_failure"] == "final-namespace-mismatch"
-                    and row[2] != "vendor"
+                    tuple(state["a3_body_events"]) != multi_component_absence_tokens[:-1]
+                    or state["a3_target_absence_errnos"]
+                    or state["a3_absence_events"]
+                    or state["a3_absence_errnos"]
+                    or state["multi_component_absence_fp_bridge"]
                 ):
-                    raise SystemExit("stage3a3 independently consumed mapping mutation drifted")
-        if case[1] in {"chain40", "chain41-refused"}:
+                    raise SystemExit("stage3a3 multi-component immediate absence RED accounting drifted")
+                if not state["multi_component_absence_missing"]:
+                    raise SystemExit("stage3a3 multi-component absence RED fallback was not observed")
+        if case[0] == "stage3a3-case" and case[1] == "multi-component-canonical-enotdir":
+            immediate_token = multi_component_enotdir_tokens[-1]
+            if (
+                state["a2_supplied_rows"].get(b"repo:/abs/blocker")
+                != (
+                    b"repo:/abs/blocker", "repo", "probe", "present", 0o600, 1,
+                    "df7e70e5021544f4834bbee64a9e3789febc4be81470df629cad6ddb03320a5c",
+                )
+                or state["a3_supplied_absence_rows"].get(
+                    b"repo:/abs/blocker/child/leaf"
+                )
+                != (b"repo:/abs/blocker/child/leaf", "absent", "probe", "ENOTDIR")
+            ):
+                raise SystemExit("stage3a3 multi-component ENOTDIR evidence drifted")
+            if expected_terminal == "SystemExit(77)":
+                if tuple(state["a3_target_absence_errnos"]) != (
+                    (immediate_token, errno.ENOTDIR),
+                ):
+                    raise SystemExit("stage3a3 multi-component ENOTDIR immediate evidence drifted")
+                if state["multi_component_enotdir_missing"]:
+                    raise SystemExit("stage3a3 corrected multi-component ENOTDIR took RED fallback")
+                if not state["multi_component_enotdir_fp_bridge"]:
+                    raise SystemExit("stage3a3 multi-component ENOTDIR FP bridge was not observed")
+            if expected_terminal == "MutationError":
+                if (
+                    tuple(state["a3_body_events"]) != multi_component_enotdir_tokens[:-1]
+                    or state["a3_target_absence_errnos"]
+                    or state["a3_absence_events"]
+                    or state["a3_absence_errnos"]
+                    or state["multi_component_enotdir_fp_bridge"]
+                ):
+                    raise SystemExit("stage3a3 multi-component ENOTDIR RED accounting drifted")
+                if not state["multi_component_enotdir_missing"]:
+                    raise SystemExit("stage3a3 multi-component ENOTDIR RED fallback was not observed")
+        if (
+            case[0] == "stage3a3-case"
+            and case[1] in {"chain40", "chain41-refused"}
+        ):
             if b"repo:/link" in state["a2_supplied_rows"]:
                 raise SystemExit("stage3a3 chain improperly retained the base link row")
             chain_count = 40 if case[1] == "chain40" else 41
@@ -3674,13 +5225,71 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             for token in state["expected_graph_bindings"]
             if token.split(":", 1)[1].encode("ascii") in state["graph_fds"]
         )
+        promoted_occurrences = tuple(
+            int(token.rsplit(":", 1)[1])
+            for token in state["a3_readlink_attempts"]
+            if token.startswith("readlink1:")
+        )
+        for occurrence in admitted:
+            key = f"@a3:link:{occurrence}".encode("ascii")
+            if (key in state["graph_fds"]) != (occurrence in promoted_occurrences):
+                raise SystemExit("stage3a3 promotion preceded or followed readlink1")
+        actual_a3_bindings = tuple(
+            token
+            for token in expected_bindings
+            if token.startswith(("bind-held-fstat:@a3:link:", "bind-parent-name-stat:@a3:link:"))
+        )
+        expected_a3_bindings = tuple(
+            token
+            for occurrence in promoted_occurrences
+            for token in (
+                f"bind-held-fstat:@a3:link:{occurrence}",
+                f"bind-parent-name-stat:@a3:link:{occurrence}",
+            )
+        )
+        if actual_a3_bindings != expected_a3_bindings:
+            raise SystemExit("stage3a3 dynamic binding inventory drifted")
+        if case[0] == "stage3a3-case" and case[1] in {"chain40", "chain41-refused"}:
+            if promoted_occurrences != tuple(range(1, 41)):
+                raise SystemExit("stage3a3 chain promotion inventory drifted")
+            if case[1] == "chain40" and len(actual_a3_bindings) != 80:
+                raise SystemExit("stage3a3 chain40 GB binding count drifted")
+            if case[1] == "chain41-refused" and state["graph_binding_events"]:
+                raise SystemExit("stage3a3 follow41 entered graph binding")
+        if case[0] == "stage3a1-gb-mutation":
+            selected = expected_bindings[case[1]]
+            expected_successes = tuple(
+                token for token in expected_bindings if token != selected
+            )
+            if (
+                not state["gb_failed"]
+                or selected in state["graph_binding_successes"]
+                or tuple(state["graph_binding_successes"]) != expected_successes
+            ):
+                raise SystemExit("stage3a1 selected GB mutation complement drifted")
+        if case[0] == "stage3a2-positive":
+            if options.get("close_failure") == "parent" and (
+                state["a1_close_failure_attempted"] != "parent"
+            ):
+                raise SystemExit("stage3a2 parent close failure identity drifted")
+            selected = options.get("full_binding")
+            if selected is not None:
+                expected_successes = tuple(
+                    token for token in expected_bindings if token != selected
+                )
+                if (
+                    not state["gb_failed"]
+                    or selected in state["graph_binding_successes"]
+                    or tuple(state["graph_binding_successes"]) != expected_successes
+                ):
+                    raise SystemExit("stage3a2 full-binding success complement drifted")
         if route not in {"arbitrary", "absence-arbitrary", "follow41"} and (
             tuple(state["a1_final_private_events"]) != stage3_a1_final_private
             or tuple(state["a1_final_borrowed_events"]) != stage3_a1_final_borrowed
             or tuple(state["graph_binding_events"]) != expected_bindings
         ):
             raise SystemExit("stage3a3 FP/FB/GB suffix drifted")
-        if route in {"arbitrary", "absence-arbitrary", "follow41"} and (
+        if route in {"arbitrary", "follow41"} and (
             state["a1_final_private_events"]
             or state["a1_final_borrowed_events"]
             or state["graph_binding_events"]
@@ -3707,7 +5316,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             or not state["a3_forbid_later_filesystem"]
         ):
             raise SystemExit("stage3a3 occurrence 41 refusal identity drifted")
-        if route in {"governed", "capacity"} and state["a3_first_body_failure"] != fault_token:
+        if route in {"governed", "capacity"} and fault_token is not None and state["a3_first_body_failure"] != fault_token:
             raise SystemExit("stage3a3 first governed failure identity drifted")
         expected_rlimit_count = 2 if fault_variant is not None and fault_variant.startswith("EMFILE") else 1
         if (
@@ -3720,21 +5329,36 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             raise SystemExit("stage3a3 unchanged RLIMIT reread drifted")
         if fault_variant == "EMFILE-rlimit-drift" and state["getrlimit"][1][1] == state["rlimit_baseline"]:
             raise SystemExit("stage3a3 drifted RLIMIT reread drifted")
-        if route == "arbitrary" and state["a3_original_interrupt"] != fault_token:
+        if route in {"arbitrary", "absence-arbitrary"} and state["a3_original_interrupt"] != fault_token:
             raise SystemExit("stage3a3 original interrupt identity drifted")
         expected_safe_failure = options.get("safe_failure")
         if expected_safe_failure is not None and state["a1_safe_failure_attempted"] != expected_safe_failure:
             raise SystemExit("stage3a3 safe suffix failure identity drifted")
         if expected_safe_failure == "GB" and state["a3_later_gb_failure"] != expected_bindings[0]:
             raise SystemExit("stage3a3 later GB failure identity drifted")
-        if expected_terminal != (
+        expected_route_terminal = (
             "SystemExit(77)" if route in {"success", "capacity"} and not options.get("a3_close_failure") else
             "KeyboardInterrupt" if route in {"arbitrary", "absence-arbitrary"} and not options.get("a3_close_failure") else
             "MutationError"
-        ):
+        )
+        terminal_after_successful_absence = (
+            stage3_case_composes_a3(case)
+            and route == "success"
+            and expected_terminal == "MutationError"
+            and (
+                state["a3_absence_complete"]
+                or state["a3_markers"] == ["canonical-absence-empty"]
+            )
+        )
+        if expected_terminal != expected_route_terminal and not terminal_after_successful_absence:
             raise SystemExit("stage3a3 terminal route drifted")
         if state["a1_phase"] != "cleanup":
             raise SystemExit("stage3a3 lifecycle did not reach cleanup")
+        if case[0] == "stage3a3-case" and case[1] == "disjoint-symlink-roots":
+            if state["disjoint_root_missing"] != disjoint_first_root_only:
+                raise SystemExit("stage3a3 disjoint root transition flag drifted")
+            if disjoint_first_root_only:
+                raise SystemExit("stage3a3 disjoint symlink root was not replayed")
 
     def run_case(
         label,
@@ -3795,6 +5419,11 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 else:
                     setattr(owner, name, replacement)
             if full_a2:
+                held_root_case = (
+                    stage3_case is not None
+                    and stage3_case[0] == "stage3a3-case"
+                    and stage3_case[1] == "held-root-canonical-absence"
+                )
                 stage3_c0_state = {
                     "constants": {},
                     "constant_values": {},
@@ -3820,15 +5449,25 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     "stage3_case": stage3_case,
                     "graph_events": [],
                     "g1_attempt_indices": [],
-                    "expected_graph_events": stage3_a1_expected_g1,
-                    "graph_edges": list(stage3_a1_expected_edges),
+                    "expected_graph_events": (
+                        held_root_expected_g1 if held_root_case else stage3_a1_expected_g1
+                    ),
+                    "graph_edges": list(
+                        held_root_expected_edges
+                        if held_root_case
+                        else stage3_a1_expected_edges
+                    ),
                     "graph_fds": {},
                     "graph_owned": [],
                     "graph_pending_fd": None,
                     "graph_initial_structural": {},
                     "graph_binding_events": [],
                     "gb_attempt_indices": [],
-                    "expected_graph_bindings": list(stage3_a1_expected_bindings),
+                    "expected_graph_bindings": list(
+                        held_root_expected_bindings
+                        if held_root_case
+                        else stage3_a1_expected_bindings
+                    ),
                     "graph_close_calls": [],
                     "a1_custody_events": [],
                     "a1_suffix": [],
@@ -3861,6 +5500,9 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     "a2_parent_close_raised": None,
                     "a2_post_fstat_sentinel": KeyboardInterrupt(),
                     "caught_exception": None,
+                    "held_root_open_redirects": [],
+                    "held_root_missing": False,
+                    "held_root_first_fp_bridge": False,
                     "a2_open_snapshots": [],
                     "a2_regular_cursor": 0,
                     "a2_regular_chunks": [],
@@ -3876,6 +5518,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     "a2_row_stats": {},
                     "a2_row_lineage": {},
                     "a2_supplied_rows": stage3_a2_supplied_rows(os.environ["TASK4_GOLDEN"]),
+                    "a3_supplied_absence_rows": stage3_a3_supplied_absence_rows(os.environ["TASK4_GOLDEN"]),
                     "a2_cross_scan": False,
                     "a2_first_body_failure": None,
                     "a2_original_interrupt": None,
@@ -3892,6 +5535,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     "a3_readlink_attempts": [],
                     "a3_fsencode_calls": [],
                     "a3_fsencode_attempts": [],
+                    "a3_target_absence_errnos": [],
                     "a3_absence_errnos": [],
                     "a3_absence_complete": False,
                     "a3_absence_suffix_snapshot": None,
@@ -3905,9 +5549,15 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     "a3_close_sentinel": OSError(errno.EIO, "stage3a3 retained FD real-close-then-raise"),
                     "a3_forbid_later_filesystem": False,
                     "a3_injections": [],
-                    "a3_semantic_observed": None,
-                    "a3_semantic_rejection": None,
                     "a3_later_gb_failure": None,
+                    "disjoint_root_missing": False,
+                    "disjoint_first_root_tokens": disjoint_first_root_tokens,
+                    "reviewed_target_absence_fp_bridge": False,
+                    "target_absence_missing": False,
+                    "multi_component_absence_missing": False,
+                    "multi_component_absence_fp_bridge": False,
+                    "multi_component_enotdir_missing": False,
+                    "multi_component_enotdir_fp_bridge": False,
                     "a1_emfile": False,
                     "a1_emfile_pending": False,
                     "private_parent_structural": None,
@@ -3960,29 +5610,68 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             raise SystemExit(f"{label}: discover_input_v1 was called")
         if stdout.getvalue() or stderr.getvalue():
             raise SystemExit(f"{label}: runner wrote output")
-        if expected is SystemExit:
+        target_absence_fallback = (
+            label == "stage3a3-reviewed-symlink-target-absence"
+            and full_a2
+            and stage3_c0_state is not None
+            and stage3_c0_state["target_absence_missing"]
+            and type(caught) is module.MutationError
+        )
+        multi_component_absence_fallback = (
+            label == "stage3a3-multi-component-canonical-absence"
+            and full_a2
+            and stage3_c0_state is not None
+            and stage3_c0_state["multi_component_absence_missing"]
+            and type(caught) is module.MutationError
+        )
+        multi_component_enotdir_fallback = (
+            label == "stage3a3-multi-component-canonical-enotdir"
+            and full_a2
+            and stage3_c0_state is not None
+            and stage3_c0_state["multi_component_enotdir_missing"]
+            and type(caught) is module.MutationError
+        )
+        held_root_fallback = (
+            label == "stage3a3-held-root-canonical-absence"
+            and full_a2
+            and stage3_c0_state is not None
+            and stage3_c0_state["held_root_missing"]
+            and stage3_c0_state["held_root_first_fp_bridge"]
+            and type(caught) is module.MutationError
+            and str(caught) == "stage3 evidence locator is empty"
+        )
+        effective_expected = (
+            module.MutationError
+            if target_absence_fallback
+            or multi_component_absence_fallback
+            or multi_component_enotdir_fallback
+            or held_root_fallback
+            else expected
+        )
+        if effective_expected is SystemExit:
             if type(caught) is not SystemExit or caught.code != 77:
                 raise SystemExit(f"{label}: expected silent SystemExit(77), got {caught!r}")
-        elif type(caught) is not expected:
+        elif type(caught) is not effective_expected:
             name = type(caught).__name__ if caught is not None else "return"
-            raise SystemExit(f"{label}: expected {expected.__name__}, got {name}")
+            raise SystemExit(f"{label}: expected {effective_expected.__name__}, got {name}")
         if full_a2:
             stage3_c0_state["caught_exception"] = caught
             stage3_c0_state["events"].append(
-                "SystemExit(77)" if expected is SystemExit else expected.__name__
+                "SystemExit(77)" if effective_expected is SystemExit else effective_expected.__name__
             )
         if custody is not None:
             custody()
         if full_a2:
-            expected_terminal = "SystemExit(77)" if expected is SystemExit else expected.__name__
-            if stage3_case_reaches_a2(stage3_case):
-                if stage3_case_is_a3(stage3_case):
-                    check_stage3_a2_prefix()
-                    check_stage3_a3(expected_terminal)
-                else:
-                    check_stage3_a2(expected_terminal)
+            expected_terminal = "SystemExit(77)" if effective_expected is SystemExit else effective_expected.__name__
+            if stage3_case_must_compose_a3(stage3_case) and not stage3_case_composes_a3(stage3_case):
+                raise SystemExit("stage3a3 required A2-to-A3 composition was deleted")
+            if stage3_case_composes_a3(stage3_case):
+                check_stage3_a2_prefix()
+                check_stage3_a3(expected_terminal)
                 if stage3_case_is_continuation(stage3_case):
                     check_stage3_c0_case(stage3_case, expected_terminal)
+            elif stage3_case_reaches_a2(stage3_case):
+                check_stage3_a2(expected_terminal)
             elif stage3_case_is_a1(stage3_case):
                 check_stage3_a1(expected_terminal)
             elif stage3_case is None:
@@ -4010,6 +5699,14 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 raise SystemExit(f"{label}: runner changed borrowed fd {fd} metadata")
             if offset is not None and borrowed_offset(fd) != offset:
                 raise SystemExit(f"{label}: runner changed borrowed fd {fd} offset")
+        if target_absence_fallback:
+            raise SystemExit("stage3a3 reviewed symlink target absence was not accepted")
+        if multi_component_absence_fallback:
+            raise SystemExit("stage3a3 multi-component target absence was not proven immediately")
+        if multi_component_enotdir_fallback:
+            raise SystemExit("stage3a3 multi-component target ENOTDIR was not proven immediately")
+        if held_root_fallback:
+            raise SystemExit("stage3a3 held root full evidence was not collected")
         stage3_c0_state = None
 
     base_borrowed = [(ledger_fd, ledger_offset), (parent_fd, parent_offset)]
@@ -4140,6 +5837,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     stage2_positive["events"].append("borrowed-P-getfd")
         return value
 
+    stage3_support_wrapper_targets.append((stage2_positive_fcntl, real_fcntl))
+
     def stage2_positive_open(path, flags, mode=0o777, *, dir_fd=None):
         stage2_positive["open_calls"] += 1
         if (
@@ -4183,6 +5882,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         stage2_positive["pread_cursor"] += len(value)
         return value
 
+    stage3_support_wrapper_targets.append((stage2_positive_pread, real_pread))
+
     def stage2_positive_read(fd, size):
         if fd in set(stage2_positive["owned"]) | {ledger_fd, parent_fd}:
             raise SystemExit("stage2 used read on a guarded descriptor")
@@ -4209,6 +5910,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             elif fd == parent_fd:
                 stage2_positive["events"].append("borrowed-P-fstat")
         return value
+
+    stage3_support_wrapper_targets.append((stage2_positive_fstat, real_fstat))
 
     def stage2_positive_close(fd):
         if fd not in set(stage2_positive["owned"]):
@@ -4318,7 +6021,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         ),
         borrowed=base_borrowed,
         postcheck=check_stage2_positive,
-        full_a2=False,
+        full_a2=True,
     )
 
     def stage2_expected(position=None, variant=None, ledger_event="dup-L", parent_event="open-P", terminal="MutationError"):
@@ -4595,6 +6298,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             state["events"].append(operation)
             return value
 
+        stage3_support_wrapper_targets.append((wrapped_fcntl, real_fcntl))
+
         def wrapped_open(path, flags, mode=0o777, *, dir_fd=None):
             state["open_calls"] += 1
             if state["open_calls"] != 1 or path != "." or flags != expected_open_flags or dir_fd != parent_fd:
@@ -4680,6 +6385,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             state["events"].append(operation)
             return value
 
+        stage3_support_wrapper_targets.append((wrapped_fstat, real_fstat))
+
         def wrapped_pread(fd, size, offset):
             if fd == state["private_ledger"]:
                 operation = "L-pread"
@@ -4724,6 +6431,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 if value:
                     value = bytes([value[0] ^ 1]) + value[1:]
             return value
+
+        stage3_support_wrapper_targets.append((wrapped_pread, real_pread))
 
         def wrapped_read(fd, size):
             if unowned_stub(fd) or fd in {ledger_fd, parent_fd} or fd in set(state["owned"]):
@@ -6258,6 +7967,25 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 ]
             )
         ]
+        held_root_expected_g1 = stage3_a1_graph_events(
+            b"/", b"/repo", b"/repo/vendor", b"/stable", b"/nightly"
+        )
+        held_root_expected_edges = stage3_a1_graph_edges(
+            b"/", b"/repo", b"/repo/vendor", b"/stable", b"/nightly"
+        )
+        held_root_expected_bindings = [
+            token
+            for edge in held_root_expected_edges
+            if edge[0] != "cache"
+            for token in (
+                [f"bind-held-fstat:{edge[4].decode('ascii')}"]
+                if edge[0] == "root"
+                else [
+                    f"bind-held-fstat:{edge[4].decode('ascii')}",
+                    f"bind-parent-name-stat:{edge[4].decode('ascii')}",
+                ]
+            )
+        ]
         stage3_a2_expected_rows = (
             ("external-tool", b"external:/" + stage3_root_bytes[1:] + b"/external/tool", "tool", "execute", "present", 0o700, 13, "022036a28655c76d3ac5e1584872c898d161687b7578de171ac3447b7447bf68", ("@evidence", "external-parent"), b"tool", "regular"),
             ("nightly", b"external:/" + stage3_root_bytes[1:] + b"/nightly/n.bin", "nightly-sysroot", "read", "present", 0o600, 2, "28312e346b76a3f91e8283519baab5f103d79547dedff5fb7ccc0dc3c5119bbe", ("@held", os.fsencode(nightly3)), b"n.bin", "regular"),
@@ -6286,6 +8014,20 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 )
             return supplied
 
+        def stage3_a3_supplied_absence_rows(ledger_text):
+            supplied = {}
+            for line in ledger_text.encode("ascii").splitlines():
+                fields = line.split(b"\t")
+                if len(fields) != 9 or fields[0] != b"input-v1" or fields[2] != b"absent":
+                    continue
+                supplied[fields[8]] = (
+                    fields[8],
+                    fields[2].decode("ascii"),
+                    fields[3].decode("ascii"),
+                    fields[4].decode("ascii"),
+                )
+            return supplied
+
         stage3_a2_row_by_label = {row[0]: row for row in stage3_a2_expected_rows}
         regular_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
         directory_flags = regular_flags | os.O_DIRECTORY
@@ -6305,6 +8047,13 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             ]
 
         directory_entries = {
+            "external-root": (
+                ("external", b"external", stat.S_IFDIR),
+                ("nightly", b"nightly", stat.S_IFDIR),
+                ("parent", b"parent", stat.S_IFDIR),
+                ("repo", b"repo", stat.S_IFDIR),
+                ("stable", b"stable", stat.S_IFDIR),
+            ),
             "repo-abs": (("blocker", b"blocker", stat.S_IFREG),),
             "repo-enum": (
                 ("a", b"a", stat.S_IFREG),
@@ -6349,6 +8098,23 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 )
             return result
 
+        stage3_a2_held_root_rows = (
+            (
+                "external-root", b"external:/", "directory", "probe", "present",
+                0o700, 46,
+                "fdebc2828ff8f3c44dd0abe878bed6766de457d1fc601f1b6a5975420b8968f2",
+                ("@held", b"/"), b"", "directory",
+            ),
+        )
+        stage3_a2_held_root_expected_operations = (
+            (
+                "directory-fstat0:external-root", "os", "fstat",
+                (("@held", b"/"),), (),
+            ),
+        ) + tuple(
+            stage3_a2_directory_descriptors(stage3_a2_held_root_rows[0])[2:]
+        )
+
         for row in stage3_a2_expected_rows:
             stage3_a2_expected_operations.extend(
                 stage3_a2_regular_descriptors(row)
@@ -6377,7 +8143,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         link_parent = ("@held", repo_raw)
 
         def stage3_a3_occurrence(occurrence, name, locator, *, text_target=False):
-            read_name = os.fsdecode(name) if text_target else name
+            read_name = name
             result = [
                 (f"symlink-open:{locator}:{occurrence}", "os", "open", (name, symlink_flags), (("dir_fd", link_parent),)),
                 (f"symlink-held-fstat0:{occurrence}", "os", "fstat", (("@a3", occurrence),), ()),
@@ -6429,6 +8195,20 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             ("absent-boundary-held:repo:/abs/c-missing", "os", "fstat", (("@evidence", "repo-abs"),), ()),
             ("absent-terminal:repo:/abs/c-missing:ENOENT", "os", "stat", (b"c-missing",), (("dir_fd", ("@evidence", "repo-abs")), ("follow_symlinks", False))),
         )
+        multi_component_absence_operations = (
+            ("absent-boundary-parent:repo:/abs/a-missing/leaf", "os", "stat", (b"abs",), (("dir_fd", ("@held", repo_raw)), ("follow_symlinks", False))),
+            ("absent-boundary-held:repo:/abs/a-missing/leaf", "os", "fstat", (("@evidence", "repo-abs"),), ()),
+            ("absent-terminal:repo:/abs/a-missing/leaf:ENOENT", "os", "stat", (b"a-missing/leaf",), (("dir_fd", ("@evidence", "repo-abs")), ("follow_symlinks", False))),
+        ) + stage3_a3_absence_operations[3:]
+        multi_component_enotdir_absence_operations = (
+            stage3_a3_absence_operations[:3]
+            + (
+                ("absent-boundary-parent:repo:/abs/blocker/child/leaf", "os", "stat", (b"blocker",), (("dir_fd", ("@evidence", "repo-abs")), ("follow_symlinks", False))),
+                ("absent-boundary-held:repo:/abs/blocker/child/leaf", "os", "fstat", (("@evidence", "repo-abs-blocker"),), ()),
+                ("absent-terminal:repo:/abs/blocker/child/leaf:ENOTDIR", "os", "stat", (b"child/leaf",), (("dir_fd", ("@evidence", "repo-abs-blocker")), ("follow_symlinks", False))),
+            )
+            + stage3_a3_absence_operations[6:]
+        )
 
         repo_target = stage3_a3_target_components(
             (("repo-target", ("@held", repo_raw), b"target", ("@evidence", "repo-target")),)
@@ -6472,16 +8252,18 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             )
             for index, name in enumerate(external_literal_names)
         )
+        repo_literal_names = tuple(name for name in repo_raw.split(b"/") if name)
+        repo_literal_prefixes = tuple(stage3_raw_prefixes(repo_raw))
         root_literal_relations = tuple(
             (
-                "repo-dir" if index == len(stage3_root_literal_names) - 1 else f"root-prefix-{index}",
-                ("@held", b"/") if index == 0 else ("@held", stage3_root_literal_prefixes[index - 1]),
+                "repo-dir" if index == len(repo_literal_names) - 1 else f"root-prefix-{index}",
+                ("@held", b"/") if index == 0 else ("@held", repo_literal_prefixes[index - 1]),
                 name,
                 ("@held", repo_raw)
-                if index == len(stage3_root_literal_names) - 1
-                else ("@held", stage3_root_literal_prefixes[index]),
+                if index == len(repo_literal_names) - 1
+                else ("@held", repo_literal_prefixes[index]),
             )
-            for index, name in enumerate(stage3_root_literal_names)
+            for index, name in enumerate(repo_literal_names)
         )
         external_target = stage3_a3_target_components(external_literal_relations) + stage3_a3_target_components(
             (("external-tool", ("@evidence", "external-parent"), b"tool", ("@evidence", "external-tool")),)
@@ -6489,6 +8271,130 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         root_clamped_target = stage3_a3_target_components(root_literal_relations) + repo_target
         primary = stage3_a3_occurrence(1, b"link", "repo:/link")
         primary_text = stage3_a3_occurrence(1, b"link", "repo:/link", text_target=True)
+        nested_trailing = (
+            primary
+            + (
+                stage3_a3_target_relation(
+                    1, "repo-unreviewed-link", link_parent, b"unreviewed-link", None
+                )[0],
+            )
+            + stage3_a3_occurrence(2, b"unreviewed-link", "repo:/unreviewed-link")
+            + repo_target
+        )
+        disjoint_first_root = primary + repo_target
+        disjoint_first_root_tokens = tuple(
+            descriptor[0] for descriptor in disjoint_first_root
+        )
+        disjoint_symlink_roots = (
+            disjoint_first_root
+            + stage3_a3_occurrence(2, b"link-b", "repo:/link-b")
+            + repo_target
+        )
+        reviewed_target_absence = (
+            primary
+            + stage3_a3_target_relation(
+                1, "repo-abs", link_parent, b"abs", ("@evidence", "repo-abs")
+            )
+            + (
+                (
+                    "target-absence-terminal:1:repo:/abs/a-missing:ENOENT",
+                    "os",
+                    "stat",
+                    (b"a-missing",),
+                    (
+                        ("dir_fd", ("@evidence", "repo-abs")),
+                        ("follow_symlinks", False),
+                    ),
+                ),
+            )
+        )
+        reviewed_target_absence_tokens = tuple(
+            descriptor[0] for descriptor in reviewed_target_absence
+        )
+        multi_component_absence = (
+            primary
+            + stage3_a3_target_relation(
+                1, "repo-abs", link_parent, b"abs", ("@evidence", "repo-abs")
+            )
+            + (
+                (
+                    "target-absence-terminal:1:repo:/abs/a-missing/leaf:ENOENT",
+                    "os",
+                    "stat",
+                    (b"a-missing/leaf",),
+                    (
+                        ("dir_fd", ("@evidence", "repo-abs")),
+                        ("follow_symlinks", False),
+                    ),
+                ),
+            )
+        )
+        multi_component_absence_tokens = tuple(
+            descriptor[0] for descriptor in multi_component_absence
+        )
+        multi_component_enotdir = (
+            primary
+            + stage3_a3_target_relation(
+                1, "repo-abs", link_parent, b"abs", ("@evidence", "repo-abs")
+            )
+            + stage3_a3_target_relation(
+                2, "repo-abs-blocker", ("@evidence", "repo-abs"), b"blocker", ("@evidence", "repo-abs-blocker")
+            )
+            + (
+                (
+                    "target-absence-terminal:2:repo:/abs/blocker/child/leaf:ENOTDIR",
+                    "os",
+                    "stat",
+                    (b"child/leaf",),
+                    (
+                        ("dir_fd", ("@evidence", "repo-abs-blocker")),
+                        ("follow_symlinks", False),
+                    ),
+                ),
+            )
+        )
+        multi_component_enotdir_tokens = tuple(
+            descriptor[0] for descriptor in multi_component_enotdir
+        )
+        held_root_primary = (
+            ("symlink-open:repo:/link:1", "os", "open", (b"link", symlink_flags), (("dir_fd", ("@held", b"/repo")),)),
+            ("symlink-held-fstat0:1", "os", "fstat", (("@a3", 1),), ()),
+            ("symlink-parent-stat0:1", "os", "stat", (b"link",), (("dir_fd", ("@held", b"/repo")), ("follow_symlinks", False))),
+            ("readlink1:repo:/link:1", "os", "readlink", (b"link",), (("dir_fd", ("@held", b"/repo")),)),
+            ("symlink-held-fstat1:1", "os", "fstat", (("@a3", 1),), ()),
+            ("symlink-parent-stat1:1", "os", "stat", (b"link",), (("dir_fd", ("@held", b"/repo")), ("follow_symlinks", False))),
+            ("readlink2:repo:/link:1", "os", "readlink", (b"link",), (("dir_fd", ("@held", b"/repo")),)),
+            ("symlink-held-fstat2:1", "os", "fstat", (("@a3", 1),), ()),
+            ("symlink-parent-stat2:1", "os", "stat", (b"link",), (("dir_fd", ("@held", b"/repo")), ("follow_symlinks", False))),
+        )
+        held_root_body_prefix_tokens = tuple(
+            descriptor[0] for descriptor in held_root_primary
+        )
+        held_root_target_absence = held_root_primary + (
+            (
+                "target-held-fstat:1:external:/root-missing/leaf", "os", "fstat",
+                (("@held", b"/"),), (),
+            ),
+            (
+                "target-absence-terminal:1:external:/root-missing/leaf:ENOENT", "os", "stat",
+                (b"root-missing/leaf",),
+                (("dir_fd", ("@held", b"/")), ("follow_symlinks", False)),
+            ),
+        )
+        held_root_absence = (
+            (
+                "absent-boundary-held:external:/root-missing/leaf", "os", "fstat",
+                (("@held", b"/"),), (),
+            ),
+            (
+                "absent-terminal:external:/root-missing/leaf:ENOENT", "os", "stat",
+                (b"root-missing/leaf",),
+                (("dir_fd", ("@held", b"/")), ("follow_symlinks", False)),
+            ),
+        )
+        held_root_absence_tokens = tuple(
+            descriptor[0] for descriptor in held_root_absence
+        )
         stage3_a3_live_cases = [
             ("relative-primary", primary + relative_target, stage3_a3_absence_operations, SystemExit, {"raw_target": b"./enum/../target", "target_row": (b"repo:/target", "repo", "read", "present", 0o600, 2, "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5")}, "base"),
             ("absolute-external-str", primary_text + external_target, stage3_a3_absence_operations, SystemExit, {"raw_target": os.fsdecode(os.fsencode(external3) + b"/tool"), "target_row": (b"external:/" + stage3_root_bytes[1:] + b"/external/tool", "tool", "execute", "present", 0o700, 13, "022036a28655c76d3ac5e1584872c898d161687b7578de171ac3447b7447bf68")}, "external-str"),
@@ -6496,7 +8402,6 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             ("root-clamped-dotdot", primary + root_clamped_target, stage3_a3_absence_operations, SystemExit, {"raw_target": b"../" * 64 + repo_raw.lstrip(b"/") + b"/target", "target_row": (b"repo:/target", "repo", "read", "present", 0o600, 2, "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5")}, "root-clamped"),
             ("trailing-directory", primary + repo_enum, stage3_a3_absence_operations, SystemExit, {"raw_target": b"./enum/", "target_row": (b"repo:/enum", "directory", "enumerate", "present", 0o700, 21, "2c337acb2a4a9f0836a1b0401109e0464648087c760683e6956dfa0949153305")}, "trailing-directory"),
             ("trailing-nondirectory", primary + repo_target, (), module.MutationError, {"raw_target": b"./target/", "expected_route": "governed", "target_row": (b"repo:/target", "repo", "read", "present", 0o600, 2, "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5")}, "trailing-nondirectory"),
-            ("empty-target", primary, (), module.MutationError, {"raw_target": b"", "expected_route": "governed", "target_row": None}, "empty"),
         ]
 
         chain40_parts = []
@@ -6527,18 +8432,140 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         stage3_a3_live_cases.extend(
             (
                 ("chain40", chain40, stage3_a3_absence_operations, SystemExit, {"raw_target": b"chain01", "target_row": (b"repo:/target", "repo", "read", "present", 0o600, 2, "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5")}, "chain40"),
-                ("chain41-refused", chain41, (), module.MutationError, {"raw_target": b"chain01", "expected_route": "follow41", "target_row": None}, "chain41"),
-                ("no-symlink-ledger", (), stage3_a3_absence_operations, SystemExit, {"no_symlink": True, "target_row": None}, "no-symlink"),
+            ("chain41-refused", chain41, (), module.MutationError, {"raw_target": b"chain01", "expected_route": "follow41", "target_row": None}, "chain41"),
+            ("nested-trailing-slash-regular", nested_trailing, (), module.MutationError, {"raw_target": b"unreviewed-link/", "expected_route": "governed", "target_row": (b"repo:/target", "repo", "read", "present", 0o600, 2, "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5")}, "nested-trailing-slash-regular"),
+            ("disjoint-symlink-roots", disjoint_symlink_roots, stage3_a3_absence_operations, SystemExit, {"raw_target": b"target", "target_row": (b"repo:/target", "repo", "read", "present", 0o600, 2, "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5")}, "disjoint-symlink-roots"),
+            ("reviewed-symlink-target-absence", reviewed_target_absence, stage3_a3_absence_operations, SystemExit, {"raw_target": b"abs/a-missing", "target_row": (b"repo:/abs", "directory", "probe", "present", 0o700, 10, "dff711efda3385276e20031e3c33c758adb07840d3181fb20b23d4d00af6543f")}, "base"),
+            ("multi-component-canonical-absence", multi_component_absence, multi_component_absence_operations, SystemExit, {"raw_target": b"abs/a-missing/leaf", "target_row": (b"repo:/abs", "directory", "probe", "present", 0o700, 10, "dff711efda3385276e20031e3c33c758adb07840d3181fb20b23d4d00af6543f")}, "multi-component-canonical-absence"),
+            ("multi-component-canonical-enotdir", multi_component_enotdir, multi_component_enotdir_absence_operations, SystemExit, {"raw_target": b"abs/blocker/child/leaf", "target_row": (b"repo:/abs/blocker", "repo", "probe", "present", 0o600, 1, "df7e70e5021544f4834bbee64a9e3789febc4be81470df629cad6ddb03320a5c")}, "multi-component-canonical-enotdir"),
+            ("held-root-canonical-absence", held_root_target_absence, held_root_absence, SystemExit, {"raw_target": b"/root-missing/leaf", "target_row": None}, "held-root-canonical-absence"),
+            ("no-symlink-ledger", (), stage3_a3_absence_operations, SystemExit, {"no_symlink": True, "target_row": None}, "no-symlink"),
                 ("canonical-absence-empty", primary + relative_target, (), SystemExit, {"raw_target": b"./enum/../target", "target_row": (b"repo:/target", "repo", "read", "present", 0o600, 2, "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5")}, "no-absence"),
                 ("a3-close-real-then-raise", primary + relative_target, stage3_a3_absence_operations, module.MutationError, {"raw_target": b"./enum/../target", "a3_close_failure": True, "target_row": (b"repo:/target", "repo", "read", "present", 0o600, 2, "678f81a714fbc72030f82f9980054d5cf90e6f041a367f7da2f35b0f7dafb0e5")}, "base"),
             )
         )
-        if len(stage3_a3_live_cases) != 12 or len({case[0] for case in stage3_a3_live_cases}) != 12:
+
+        missing_target = stage3_a3_target_relation(
+            0, "repo-unreviewed-target", link_parent, b"unreviewed-target", None
+        )[0:1]
+        locator_mismatch_target = stage3_a3_target_relation(
+            0, "repo-locator-alias", link_parent, b"locator-alias", None
+        )[0:1]
+        namespace_mismatch_target = stage3_a3_target_relation(
+            0, "repo-namespace-alias", link_parent, b"namespace-alias", None
+        )[0:1]
+        unreviewed_target = (
+            ("target-parent-stat:0:repo-unreviewed-link", "os", "stat", (b"unreviewed-link",), (("dir_fd", link_parent), ("follow_symlinks", False))),
+        )
+        unreviewed_held_final_target = stage3_a3_target_relation(
+            0, "vendor-dir", link_parent, b"vendor", ("@held", os.fsencode(vendor3))
+        )
+        stage3_a3_live_cases.extend(
+            (
+                ("symlink-size-mismatch", primary, (), module.MutationError, {"raw_target": b"./enum/../target", "expected_route": "governed", "symlink_row_size": len(b"./enum/../target") + 1, "target_row": None}, "symlink-size-mismatch"),
+                ("symlink-digest-mismatch", primary, (), module.MutationError, {"raw_target": b"./enum/../target", "expected_route": "governed", "symlink_row_digest": "0" * 64, "target_row": None}, "symlink-digest-mismatch"),
+                ("missing-reviewed-final-row", primary + missing_target, (), module.MutationError, {"raw_target": b"./unreviewed-target", "expected_route": "governed", "target_row": None}, "base"),
+                ("final-locator-mismatch", primary + locator_mismatch_target, (), module.MutationError, {"raw_target": b"./locator-alias", "expected_route": "governed", "target_row": None}, "base"),
+                ("final-namespace-mismatch", primary + namespace_mismatch_target, (), module.MutationError, {"raw_target": b"./namespace-alias", "expected_route": "governed", "target_row": None}, "base"),
+                ("intermediate-unreviewed-symlink", primary + unreviewed_target, (), module.MutationError, {"raw_target": b"./unreviewed-link", "expected_route": "governed", "target_row": None}, "base"),
+                ("unreviewed-held-final-directory", primary + unreviewed_held_final_target, stage3_a3_absence_operations, module.MutationError, {"raw_target": b"vendor", "target_row": None}, "base"),
+            )
+        )
+        if len(stage3_a3_live_cases) != 24 or len({case[0] for case in stage3_a3_live_cases}) != 24:
             raise SystemExit("stage3a3 executable live case table drifted")
         stage3_a3_specs = {
             label: (body, absence)
             for label, body, absence, _expected, _options, _ledger in stage3_a3_live_cases
         }
+
+        def check_disjoint_root_missing_probe_controls():
+            accepted = {
+                "stage3_case": ("stage3a3-case", "disjoint-symlink-roots", {}),
+                "a1_phase": "a3",
+                "a3_body_operations": disjoint_symlink_roots,
+                "a3_body_events": list(disjoint_first_root_tokens),
+                "disjoint_first_root_tokens": disjoint_first_root_tokens,
+                "a3_absence_operations": (),
+                "a3_absence_events": [],
+                "a1_body_outcome": "success",
+                "a3_first_body_failure": None,
+                "a1_emfile": False,
+                "gb_failed": False,
+                "disjoint_root_missing": False,
+                "private_ledger_fd": 42,
+                "constant_values": {("fcntl", "F_GETFL"): fcntl.F_GETFL},
+            }
+            accepted_call = ("fcntl", "fcntl", (42, fcntl.F_GETFL), {})
+            if not disjoint_root_missing_probe_allowed(accepted, *accepted_call):
+                raise SystemExit("stage3a3 disjoint root positive probe was rejected")
+            controls = [
+                ("partial body", {"a3_body_events": list(disjoint_first_root_tokens[:-1])}),
+                ("changed body", {"a3_body_events": ["changed", *disjoint_first_root_tokens[1:]]}),
+                ("extra body", {"a3_body_events": [*disjoint_first_root_tokens, "extra"]}),
+                ("full body", {"a3_body_events": [descriptor[0] for descriptor in disjoint_symlink_roots]}),
+                ("wrong case", {"stage3_case": ("stage3a3-case", "relative-primary", {})}),
+                ("wrong phase", {"a1_phase": "fp"}),
+                ("governed outcome", {"a1_body_outcome": "governed"}),
+                ("capacity outcome", {"a1_body_outcome": "capacity", "a1_emfile": True}),
+                ("arbitrary outcome", {"a1_body_outcome": "arbitrary"}),
+                ("body failure", {"a3_first_body_failure": "body-failure"}),
+                ("used flag", {"disjoint_root_missing": True}),
+                ("wrong namespace", {"namespace": "os"}),
+                ("wrong name", {"name": "open"}),
+                ("wrong fd", {"arguments": (43, fcntl.F_GETFL)}),
+                ("later FP token", {"arguments": (42, fcntl.F_GETFD)}),
+                ("wrong arguments", {"arguments": (42, fcntl.F_GETFL, 0)}),
+                ("keywords", {"arguments_by_name": {"dir_fd": 42}}),
+                ("close", {"namespace": "os", "name": "close", "arguments": (42,)}),
+                (
+                    "graph stat",
+                    {
+                        "namespace": "os",
+                        "name": "stat",
+                        "arguments": (b"tmp",),
+                        "arguments_by_name": {"dir_fd": 42, "follow_symlinks": False},
+                    },
+                ),
+                (
+                    "future link-b open",
+                    {
+                        "namespace": "os",
+                        "name": "open",
+                        "arguments": (b"link-b", symlink_flags),
+                        "arguments_by_name": {"dir_fd": 42},
+                    },
+                ),
+            ]
+            for label, overrides in controls:
+                trial = dict(accepted)
+                namespace, name, arguments, arguments_by_name = accepted_call
+                namespace = overrides.get("namespace", namespace)
+                name = overrides.get("name", name)
+                arguments = overrides.get("arguments", arguments)
+                arguments_by_name = overrides.get("arguments_by_name", arguments_by_name)
+                trial.update(
+                    {
+                        key: value
+                        for key, value in overrides.items()
+                        if key not in {"namespace", "name", "arguments", "arguments_by_name"}
+                    }
+                )
+                if disjoint_root_missing_probe_allowed(
+                    trial, namespace, name, arguments, arguments_by_name
+                ):
+                    raise SystemExit(
+                        f"stage3a3 disjoint root negative control accepted: {label}"
+                    )
+
+        check_disjoint_root_missing_probe_controls()
+
+        check_reviewed_target_absence_probe_controls()
+        check_multi_component_absence_fp_probe_controls()
+        check_multi_component_absence_cleanup_probe_controls()
+        check_multi_component_enotdir_probe_controls()
+        check_multi_component_enotdir_missing_probe_controls()
+        check_held_root_missing_probe_controls()
+        check_held_root_first_fp_bridge_controls()
 
         stage3_a3_mutations = []
 
@@ -6574,7 +8601,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                 if descriptor[0].startswith("symlink-open:")
                 and descriptor[0].endswith(":2")
             ), "collision-earlier-A3",
-            options={"raw_target": b"link"}, spec="two-link-collision",
+            options={"raw_target": b"link", "target_row": None}, spec="two-link-collision",
         )
         for bracket in range(3):
             for role in ("held", "parent"):
@@ -6630,44 +8657,6 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     options={"raw_target": os.fsdecode(os.fsencode(external3) + b"/tool")},
                     spec=f"text-{ordinal}-{variant}",
                 )
-        for label in ("symlink-size-mismatch", "symlink-digest-mismatch"):
-            stage3_a3_specs[label] = (primary, ())
-            stage3_a3_mutation(
-                label, primary[-1][0], "semantic",
-                options={"raw_target": b"./enum/../target", "semantic_failure": label},
-                spec=label, ledger=label,
-            )
-        missing_target = stage3_a3_target_relation(
-            0, "repo-unreviewed-target", link_parent, b"unreviewed-target", None
-        )[0:1]
-        stage3_a3_specs["missing-reviewed-final-row"] = (primary + missing_target, ())
-        stage3_a3_mutation(
-            "missing-reviewed-final-row", missing_target[0][0], "semantic",
-            options={"raw_target": b"./unreviewed-target", "semantic_failure": "missing-reviewed-final-row", "semantic_row": None, "target_row": None},
-            spec="missing-reviewed-final-row",
-        )
-        for label, alias, row_label in (
-            ("final-locator-mismatch", b"locator-alias", "repo-target"),
-            ("final-namespace-mismatch", b"namespace-alias", "vendor"),
-        ):
-            relation = stage3_a3_target_relation(
-                0, f"repo-{alias.decode('ascii')}", link_parent, alias, None
-            )[0:1]
-            stage3_a3_specs[label] = (primary + relation, ())
-            stage3_a3_mutation(
-                label, relation[0][0], "semantic",
-                options={"raw_target": b"./" + alias, "semantic_failure": label, "semantic_row": row_label, "target_row": None},
-                spec=label,
-            )
-        unreviewed_target = (
-            ("target-parent-stat:0:repo-unreviewed-link", "os", "stat", (b"unreviewed-link",), (("dir_fd", link_parent), ("follow_symlinks", False))),
-        )
-        stage3_a3_specs["intermediate-unreviewed-symlink"] = (primary + unreviewed_target, ())
-        stage3_a3_mutation(
-            "intermediate-unreviewed-symlink", unreviewed_target[0][0], "semantic",
-            options={"raw_target": b"./unreviewed-link", "semantic_failure": "intermediate-unreviewed-symlink"},
-            spec="intermediate-unreviewed-symlink",
-        )
         for label, token in (
             ("target-edge-drift", "target-parent-stat:1:repo-target"),
             ("target-held-drift", "target-held-fstat:1:repo-target"),
@@ -7167,6 +9156,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             for variant in ("error", "mismatch")
         )
         stage3_link_path = os.path.join(repo3, "link")
+        stage3_link_b_path = os.path.join(repo3, "link-b")
+        stage3_target_path = os.path.join(repo3, "target")
         os.unlink(stage3_link_path)
         no_symlink_objects = expected_objects - {(b"repo/link", "symlink", 0o777)}
         observed_no_symlink_objects = {
@@ -7187,8 +9178,29 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
         os.link(os.path.join(repo3, "target"), os.path.join(repo3, "unreviewed-target"))
         os.link(os.path.join(repo3, "target"), os.path.join(repo3, "locator-alias"))
         os.link(os.path.join(vendor3, "v.bin"), os.path.join(repo3, "namespace-alias"))
+        unreviewed_link_path = os.path.join(repo3, "unreviewed-link")
 
         def stage3_a3_ledger(raw_target, *, include_link=True, include_absence=True, chain_count=0, mutation=None):
+            if mutation == "held-root-canonical-absence":
+                if raw_target != b"/root-missing/leaf" or not include_link or not include_absence:
+                    raise SystemExit("stage3a3 held root ledger options drifted")
+                rows = [
+                    [
+                        b"directory", b"probe", b"present", b"0700", b"46",
+                        b"fdebc2828ff8f3c44dd0abe878bed6766de457d1fc601f1b6a5975420b8968f2",
+                        b"external:/",
+                    ],
+                    [b"absent", b"probe", b"ENOENT", b"-", b"-", b"-", b"external:/root-missing/leaf"],
+                    [
+                        b"symlink", b"probe", b"present", b"0777", b"18",
+                        b"7c3c2ce2b11615baf3bef6954dcb3e2644b91e9fee4c7339dcf6c6983c9a7d69",
+                        b"repo:/link",
+                    ],
+                ]
+                return b"".join(
+                    b"\t".join((b"input-v1", str(index).encode("ascii"), *row)) + b"\n"
+                    for index, row in enumerate(rows)
+                )
             rows = [line.split(b"\t")[2:] for line in stage3_ledger_bytes.splitlines()]
             rows = [row for row in rows if include_link or row[-1] != b"repo:/link"]
             rows = [row for row in rows if include_absence or row[0] != b"absent"]
@@ -7198,6 +9210,16 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     if row[-1] == b"repo:/link":
                         row[4] = str(len(encoded)).encode("ascii")
                         row[5] = hashlib.sha256(encoded).hexdigest().encode("ascii")
+                        break
+            if mutation == "multi-component-canonical-absence":
+                for row in rows:
+                    if row[-1] == b"repo:/abs/a-missing":
+                        row[-1] = b"repo:/abs/a-missing/leaf"
+                        break
+            if mutation == "multi-component-canonical-enotdir":
+                for row in rows:
+                    if row[-1] == b"repo:/abs/blocker/child":
+                        row[-1] = b"repo:/abs/blocker/child/leaf"
                         break
             for index in range(chain_count):
                 target = (
@@ -7213,6 +9235,26 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         f"repo:/chain{index:02d}".encode("ascii"),
                     ]
                 )
+            if mutation == "nested-trailing-slash-regular":
+                target = b"target"
+                rows.append(
+                    [
+                        b"symlink", b"probe", b"present", b"0777",
+                        str(len(target)).encode("ascii"),
+                        hashlib.sha256(target).hexdigest().encode("ascii"),
+                        b"repo:/unreviewed-link",
+                    ]
+                )
+            if mutation == "disjoint-symlink-roots":
+                target = b"target"
+                rows.append(
+                    [
+                        b"symlink", b"probe", b"present", b"0777",
+                        str(len(target)).encode("ascii"),
+                        hashlib.sha256(target).hexdigest().encode("ascii"),
+                        b"repo:/link-b",
+                    ]
+                )
             if mutation == "symlink-size-mismatch":
                 next(row for row in rows if row[-1] == b"repo:/link")[4] = str(
                     len(os.fsencode(raw_target)) + 1
@@ -7220,6 +9262,18 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             elif mutation == "symlink-digest-mismatch":
                 next(row for row in rows if row[-1] == b"repo:/link")[5] = b"0" * 64
             rows.sort(key=lambda row: row[-1])
+            if mutation == "nested-trailing-slash-regular":
+                symlink_locators = [
+                    row[-1] for row in rows if row[0] == b"symlink"
+                ]
+                if symlink_locators != [b"repo:/link", b"repo:/unreviewed-link"]:
+                    raise SystemExit("stage3a3 nested symlink ledger order drifted")
+            if mutation == "disjoint-symlink-roots":
+                symlink_locators = [
+                    row[-1] for row in rows if row[0] == b"symlink"
+                ]
+                if symlink_locators != [b"repo:/link", b"repo:/link-b"]:
+                    raise SystemExit("stage3a3 disjoint symlink ledger order drifted")
             return b"".join(
                 b"\t".join((b"input-v1", str(index).encode("ascii"), *row)) + b"\n"
                 for index, row in enumerate(rows)
@@ -7278,7 +9332,138 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
             )
             os.environ["TASK4_GOLDEN"] = stage3_ledger_bytes.decode("ascii")
             stage3_ready = True
+
+            def run_stage3_a3(label, expected, options, ledger_kind, stage3_case):
+                raw_target = options.get("raw_target", b"./enum/../target")
+                include_link = ledger_kind not in {"no-symlink", "chain40", "chain41"}
+                include_absence = ledger_kind != "no-absence"
+                chain_count = 40 if ledger_kind == "chain40" else 41 if ledger_kind == "chain41" else 0
+                if chain_count:
+                    options["raw_targets"] = {
+                        occurrence: (
+                            b"target"
+                            if occurrence == chain_count
+                            else f"chain{occurrence:02d}".encode("ascii")
+                        )
+                        for occurrence in range(1, chain_count + 1)
+                    }
+                if ledger_kind == "nested-trailing-slash-regular":
+                    options["raw_targets"] = {1: raw_target, 2: b"target"}
+                disjoint_link_before = None
+                disjoint_target_before = None
+                if os.path.lexists(stage3_link_path):
+                    os.unlink(stage3_link_path)
+                if include_link:
+                    os.symlink(
+                        b"target" if ledger_kind == "disjoint-symlink-roots" else raw_target,
+                        stage3_link_path,
+                    )
+                if ledger_kind == "disjoint-symlink-roots":
+                    if os.path.lexists(stage3_link_b_path):
+                        raise SystemExit("stage3a3 disjoint temporary link already exists")
+                    os.symlink(b"target", stage3_link_b_path)
+                    disjoint_link_before = (
+                        identity(os.lstat(stage3_link_path)),
+                        os.readlink(stage3_link_path),
+                    )
+                    with open(stage3_target_path, "rb") as stream:
+                        target_bytes = stream.read()
+                    disjoint_target_before = (
+                        identity(os.stat(stage3_target_path)),
+                        target_bytes,
+                    )
+                chain39 = os.path.join(repo3, "chain39")
+                if ledger_kind != "nested-trailing-slash-regular":
+                    os.unlink(chain39)
+                    os.symlink(b"target" if chain_count == 40 else b"chain40", chain39)
+                ledger = stage3_a3_ledger(
+                    raw_target,
+                    include_link=include_link,
+                    include_absence=include_absence,
+                    chain_count=chain_count,
+                    mutation=ledger_kind if ledger_kind in {
+                        "symlink-size-mismatch", "symlink-digest-mismatch",
+                        "nested-trailing-slash-regular", "disjoint-symlink-roots",
+                        "multi-component-canonical-absence", "multi-component-canonical-enotdir",
+                        "held-root-canonical-absence",
+                    } else None,
+                )
+                case_path = os.path.join(fixture, f"stage3a3-ledger-{label}")
+                stage3_file(case_path, ledger, 0o600)
+                case_fd = os.open(case_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+                case_offset = os.lseek(case_fd, 11, os.SEEK_SET)
+                original_golden = os.environ["TASK4_GOLDEN"]
+                os.environ["TASK4_GOLDEN"] = ledger.decode("ascii")
+                unreviewed_link_before = (
+                    identity(os.lstat(unreviewed_link_path)),
+                    os.readlink(unreviewed_link_path),
+                )
+                try:
+                    case_overrides = {"expected_ledger_fd": case_fd}
+                    if ledger_kind == "held-root-canonical-absence":
+                        case_overrides.update(
+                            {
+                                "repo_root": "/repo",
+                                "stable_sysroot_root": "/stable",
+                                "nightly_sysroot_root": "/nightly",
+                            }
+                        )
+                    run_case(
+                        f"stage3a3-{label}",
+                        expected,
+                        overrides=case_overrides,
+                        borrowed=[(case_fd, case_offset), (parent_fd, parent_offset)],
+                        full_a2=True,
+                        stage3_case=stage3_case,
+                    )
+                finally:
+                    os.environ["TASK4_GOLDEN"] = original_golden
+                    os.close(case_fd)
+                    if ledger_kind == "disjoint-symlink-roots":
+                        if not os.path.lexists(stage3_link_b_path):
+                            raise SystemExit("stage3a3 disjoint temporary link was changed")
+                        os.unlink(stage3_link_b_path)
+                        with open(stage3_target_path, "rb") as stream:
+                            target_after = stream.read()
+                        if (
+                            (
+                                identity(os.lstat(stage3_link_path)),
+                                os.readlink(stage3_link_path),
+                            )
+                            != disjoint_link_before
+                            or (
+                                identity(os.stat(stage3_target_path)),
+                                target_after,
+                            )
+                            != disjoint_target_before
+                        ):
+                            raise SystemExit(
+                                "stage3a3 disjoint root cleanup changed original link or target"
+                            )
+                    else:
+                        if os.path.lexists(stage3_link_path):
+                            os.unlink(stage3_link_path)
+                        os.symlink(b"./enum/../target", stage3_link_path)
+                    if ledger_kind != "nested-trailing-slash-regular":
+                        os.unlink(chain39)
+                        os.symlink(b"chain40", chain39)
+                    if ledger_kind == "nested-trailing-slash-regular" and (
+                        identity(os.lstat(unreviewed_link_path)),
+                        os.readlink(unreviewed_link_path),
+                    ) != unreviewed_link_before:
+                        raise SystemExit("stage3a3 nested reused symlink changed")
+
             try:
+                first_label, _body, _absence, first_expected, first_case_options, first_ledger = stage3_a3_live_cases[0]
+                first_options = dict(first_case_options)
+                first_options["spec"] = first_label
+                run_stage3_a3(
+                    first_label,
+                    first_expected,
+                    first_options,
+                    first_ledger,
+                    ("stage3a3-case", first_label, first_options),
+                )
                 for (
                     label,
                     expected,
@@ -7325,6 +9510,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                     case_ledger_fd = None
                     case_overrides = None
                     case_borrowed = base_borrowed
+                    case_golden = None
                     if not case[5]:
                         case_ledger_fd = os.open(
                             stage3_no_symlink_path,
@@ -7336,6 +9522,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                             (case_ledger_fd, case_offset),
                             (parent_fd, parent_offset),
                         ]
+                        case_golden = os.environ["TASK4_GOLDEN"]
+                        os.environ["TASK4_GOLDEN"] = stage3_no_symlink_ledger.decode("ascii")
                     try:
                         run_case(
                             f"stage3a0-{case[0]}",
@@ -7346,6 +9534,8 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                             stage3_case=case,
                         )
                     finally:
+                        if case_golden is not None:
+                            os.environ["TASK4_GOLDEN"] = case_golden
                         if case_ledger_fd is not None:
                             os.close(case_ledger_fd)
                 for site, variant in stage3_a1_failure_matrix:
@@ -7664,61 +9854,7 @@ with tempfile.TemporaryDirectory(prefix="p11scope-stage1-") as fixture:
                         full_a2=True,
                         stage3_case=case,
                     )
-                def run_stage3_a3(label, expected, options, ledger_kind, stage3_case):
-                    raw_target = options.get("raw_target", b"./enum/../target")
-                    include_link = ledger_kind not in {"no-symlink", "chain40", "chain41"}
-                    include_absence = ledger_kind != "no-absence"
-                    chain_count = 40 if ledger_kind == "chain40" else 41 if ledger_kind == "chain41" else 0
-                    if chain_count:
-                        options["raw_targets"] = {
-                            occurrence: (
-                                b"target"
-                                if occurrence == chain_count
-                                else f"chain{occurrence:02d}".encode("ascii")
-                            )
-                            for occurrence in range(1, chain_count + 1)
-                        }
-                    if os.path.lexists(stage3_link_path):
-                        os.unlink(stage3_link_path)
-                    if include_link:
-                        os.symlink(raw_target, stage3_link_path)
-                    chain39 = os.path.join(repo3, "chain39")
-                    os.unlink(chain39)
-                    os.symlink(b"target" if chain_count == 40 else b"chain40", chain39)
-                    ledger = stage3_a3_ledger(
-                        raw_target,
-                        include_link=include_link,
-                        include_absence=include_absence,
-                        chain_count=chain_count,
-                        mutation=ledger_kind if ledger_kind in {
-                            "symlink-size-mismatch", "symlink-digest-mismatch",
-                        } else None,
-                    )
-                    case_path = os.path.join(fixture, f"stage3a3-ledger-{label}")
-                    stage3_file(case_path, ledger, 0o600)
-                    case_fd = os.open(case_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-                    case_offset = os.lseek(case_fd, 11, os.SEEK_SET)
-                    original_golden = os.environ["TASK4_GOLDEN"]
-                    os.environ["TASK4_GOLDEN"] = ledger.decode("ascii")
-                    try:
-                        run_case(
-                            f"stage3a3-{label}",
-                            expected,
-                            overrides={"expected_ledger_fd": case_fd},
-                            borrowed=[(case_fd, case_offset), (parent_fd, parent_offset)],
-                            full_a2=True,
-                            stage3_case=stage3_case,
-                        )
-                    finally:
-                        os.environ["TASK4_GOLDEN"] = original_golden
-                        os.close(case_fd)
-                        if os.path.lexists(stage3_link_path):
-                            os.unlink(stage3_link_path)
-                        os.symlink(b"./enum/../target", stage3_link_path)
-                        os.unlink(chain39)
-                        os.symlink(b"chain40", chain39)
-
-                for label, _body, _absence, expected, case_options, ledger_kind in stage3_a3_live_cases:
+                for label, _body, _absence, expected, case_options, ledger_kind in stage3_a3_live_cases[1:]:
                     options = dict(case_options)
                     options["spec"] = label
                     run_stage3_a3(

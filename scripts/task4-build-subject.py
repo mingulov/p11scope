@@ -1775,6 +1775,9 @@ def run_reconciled_build(
     graph_body_exception = None
     owned_os_close = borrowed_os_close
     stage3_ready = False
+    a3_body_success = False
+    a3_absence_pending = False
+    a3_absence_relations = {}
     duplicate_command = getattr(fcntl, "F_DUPFD_CLOEXEC", None)
     capability_errors = {
         errno.EINVAL,
@@ -2270,6 +2273,16 @@ def run_reconciled_build(
                         return base + suffix if base else suffix
 
                     def class_for_path(record, parts, kind):
+                        if not parts:
+                            if (
+                                record.locator != "external:/"
+                                or record.klass != "directory"
+                                or record.access != "probe"
+                                or record.result != "present"
+                                or kind != "directory"
+                            ):
+                                raise MutationError("stage3 evidence class changed")
+                            return "directory"
                         if kind == "directory":
                             return "directory"
                         if _beneath(parts, vendor_node["parts"]):
@@ -2453,20 +2466,38 @@ def run_reconciled_build(
                         return node
 
                     def directory_evidence(record, parts, parent, name):
-                        node = open_evidence(
-                            name,
-                            parent,
-                            directory_flags,
-                            parts,
-                            "directory",
-                        )
-                        first_value = stage3_os_fstat(node["fd"])
-                        if (
-                            not _stat.S_ISDIR(first_value.st_mode)
-                            or _stat.S_IMODE(first_value.st_mode) != record.mode
-                        ):
-                            raise MutationError("stage3 directory evidence preimage changed")
-                        promote(node, first_value, "directory")
+                        if record.locator == "external:/":
+                            if (
+                                parts
+                                or parent is not None
+                                or name is not None
+                                or root_node.get("identity") is not None
+                            ):
+                                raise MutationError("stage3 evidence root binding changed")
+                            node = root_node
+                            first_value = stage3_os_fstat(node["fd"])
+                            if (
+                                not _stat.S_ISDIR(first_value.st_mode)
+                                or _structural(first_value) != node["structural"]
+                                or _stat.S_IMODE(first_value.st_mode) != record.mode
+                            ):
+                                raise MutationError("stage3 directory evidence preimage changed")
+                            node["identity"] = _identity(first_value)
+                        else:
+                            node = open_evidence(
+                                name,
+                                parent,
+                                directory_flags,
+                                parts,
+                                "directory",
+                            )
+                            first_value = stage3_os_fstat(node["fd"])
+                            if (
+                                not _stat.S_ISDIR(first_value.st_mode)
+                                or _stat.S_IMODE(first_value.st_mode) != record.mode
+                            ):
+                                raise MutationError("stage3 directory evidence preimage changed")
+                            promote(node, first_value, "directory")
 
                         def scan_directory(scan_number):
                             nonlocal first_close_failure
@@ -2564,9 +2595,18 @@ def run_reconciled_build(
                     for record in evidence_rows:
                         parts = locator_parts(record)
                         if not parts:
-                            raise MutationError("stage3 evidence locator is empty")
-                        parent = parent_for(parts)
-                        name = parts[-1]
+                            if (
+                                record.locator != "external:/"
+                                or record.klass != "directory"
+                                or record.access != "probe"
+                                or record.result != "present"
+                            ):
+                                raise MutationError("stage3 evidence locator is empty")
+                            parent = None
+                            name = None
+                        else:
+                            parent = parent_for(parts)
+                            name = parts[-1]
                         if record.klass == "directory":
                             node = directory_evidence(record, parts, parent, name)
                         else:
@@ -2589,11 +2629,507 @@ def run_reconciled_build(
                 else:
                     graph_body_outcome = "success"
 
-        if graph_body_outcome in {"mutation", "capacity"}:
+        if graph_body_outcome == "success":
+            nodes_by_parts = {node["parts"]: node for node in graph_nodes}
+            for record in records:
+                if record.result not in {"ENOENT", "ENOTDIR"}:
+                    continue
+                parts = locator_parts(record)
+                if not parts:
+                    continue
+                boundary = None
+                boundary_parts = None
+                for prefix_length in range(len(parts) - 1, -1, -1):
+                    candidate_parts = parts[:prefix_length]
+                    candidate = nodes_by_parts.get(candidate_parts)
+                    if candidate is None:
+                        continue
+                    identity = candidate.get("identity")
+                    if record.result == "ENOENT":
+                        valid_boundary = (
+                            candidate["kind"] == "directory"
+                            and type(identity) is tuple
+                            and len(identity) == 9
+                            and _stat.S_ISDIR(identity[4])
+                            and (
+                                candidate["parent"] is not None
+                                or (
+                                    prefix_length == 0
+                                    and candidate is root_node
+                                    and row_nodes.get("external:/") is root_node
+                                    and record.locator.startswith("external:/")
+                                )
+                            )
+                        )
+                    else:
+                        valid_boundary = (
+                            candidate["parent"] is not None
+                            and candidate["kind"] == "regular"
+                            and type(identity) is tuple
+                            and len(identity) == 9
+                            and _stat.S_ISREG(identity[4])
+                            and len(parts) - prefix_length > 1
+                        )
+                    if not valid_boundary:
+                        continue
+                    boundary = candidate
+                    boundary_parts = candidate_parts
+                    break
+                if boundary is not None:
+                    a3_absence_relations[record.locator] = (
+                        record,
+                        boundary,
+                        parts[len(boundary_parts) :],
+                    )
+
+        if graph_body_outcome == "success" and not has_symlink_row:
+            a3_body_success = True
+            a3_absence_pending = True
+
+        if graph_body_outcome == "success" and has_symlink_row:
+            class _Stage3FollowLimit(Exception):
+                pass
+
+            record_by_locator = {record.locator: record for record in records}
+            symlink_records = [
+                record for record in records if record.result == "present" and record.klass == "symlink"
+            ]
+            a3_occurrence = 0
+            a3_covered_roots = set()
+            a3_closure_coverage = set()
+
+            def a3_locator(parts):
+                try:
+                    return _locator(parts, repo_parts, repo_parts + vendor_tail)
+                except (FormatError, UnicodeError) as exc:
+                    raise MutationError("stage3 symlink target locator is invalid") from exc
+
+            def a3_open(record, parent, name):
+                try:
+                    candidate = stage3_os_open(
+                        name,
+                        stage3_o_path | stage3_o_cloexec | stage3_o_nofollow,
+                        dir_fd=parent["fd"],
+                    )
+                except OSError as exc:
+                    if exc.errno != errno.EMFILE:
+                        raise MutationError("stage3 symlink open failed") from exc
+                    try:
+                        current_limit = stage3_getrlimit(stage3_rlimit_nofile)
+                    except Exception as limit_exc:
+                        raise MutationError("stage3 RLIMIT_NOFILE reread failed") from limit_exc
+                    if (
+                        type(current_limit) is not tuple
+                        or len(current_limit) != 2
+                        or any(type(value) is not int or value < 0 for value in current_limit)
+                        or current_limit[0] > current_limit[1]
+                        or current_limit != stage3_rlimit
+                    ):
+                        raise MutationError("stage3 RLIMIT_NOFILE changed")
+                    raise _Stage3CapacityRefusal() from exc
+                except Exception as exc:
+                    raise MutationError("stage3 symlink open failed") from exc
+                if (
+                    type(candidate) is not int
+                    or candidate < 0
+                    or candidate in {expected_ledger_fd, private_parent_fd, private_ledger_fd, private_parent_owned_fd}
+                    or candidate in owned_fds
+                ):
+                    raise MutationError("stage3 symlink open returned an invalid descriptor")
+                owned_fds.append(candidate)
+                return candidate
+
+            def a3_identity_check(value, expected, message):
+                if not _stat.S_ISLNK(value.st_mode) or _stat.S_IMODE(value.st_mode) != expected.mode:
+                    raise MutationError(message)
+                return _identity(value)
+
+            def a3_read_value(value):
+                if type(value) is bytes:
+                    return value
+                if type(value) is str:
+                    encoded = stage3_os_fsencode(value)
+                    if type(encoded) is not bytes:
+                        raise MutationError("stage3 symlink target is not bytes")
+                    return encoded
+                raise MutationError("stage3 symlink target has invalid type")
+
+            def a3_follow(parent, name, record, expected_edge=None):
+                nonlocal a3_occurrence
+                a3_occurrence += 1
+                fd = a3_open(record, parent, name)
+                try:
+                    held0 = stage3_os_fstat(fd)
+                except BaseException as exc:
+                    raise exc
+                held_identity = a3_identity_check(
+                    held0,
+                    record,
+                    "stage3 symlink held identity changed",
+                )
+                try:
+                    edge0 = stage3_os_stat(
+                        name,
+                        dir_fd=parent["fd"],
+                        follow_symlinks=False,
+                    )
+                except BaseException as exc:
+                    raise exc
+                edge_identity = a3_identity_check(
+                    edge0,
+                    record,
+                    "stage3 symlink edge identity changed",
+                )
+                if edge_identity != held_identity or (
+                    expected_edge is not None and edge_identity != expected_edge
+                ):
+                    raise MutationError("stage3 symlink identity changed")
+                node = {
+                    "parts": parent["parts"] + (name,),
+                    "fd": fd,
+                    "parent": parent,
+                    "name": name,
+                    "structural": _structural(held0),
+                    "kind": "symlink",
+                    "identity": held_identity,
+                }
+                graph_nodes.append(node)
+                nodes_by_parts[node["parts"]] = node
+                if a3_occurrence > 40:
+                    raise _Stage3FollowLimit()
+
+                read_name = name
+                first = stage3_os_readlink(read_name, dir_fd=parent["fd"])
+                first = a3_read_value(first)
+                try:
+                    held1 = stage3_os_fstat(fd)
+                    edge1 = stage3_os_stat(
+                        name,
+                        dir_fd=parent["fd"],
+                        follow_symlinks=False,
+                    )
+                except BaseException as exc:
+                    raise exc
+                if (
+                    a3_identity_check(held1, record, "stage3 symlink identity changed")
+                    != held_identity
+                    or a3_identity_check(edge1, record, "stage3 symlink identity changed")
+                    != held_identity
+                ):
+                    raise MutationError("stage3 symlink changed after first read")
+
+                second = stage3_os_readlink(read_name, dir_fd=parent["fd"])
+                second = a3_read_value(second)
+                try:
+                    held2 = stage3_os_fstat(fd)
+                    edge2 = stage3_os_stat(
+                        name,
+                        dir_fd=parent["fd"],
+                        follow_symlinks=False,
+                    )
+                except BaseException as exc:
+                    raise exc
+                if (
+                    a3_identity_check(held2, record, "stage3 symlink identity changed")
+                    != held_identity
+                    or a3_identity_check(edge2, record, "stage3 symlink identity changed")
+                    != held_identity
+                ):
+                    raise MutationError("stage3 symlink changed during observation")
+                if first != second or not 1 <= len(first) <= 4096:
+                    raise MutationError("stage3 symlink target changed")
+                if len(first) != record.size or _hashlib.sha256(first).hexdigest() != record.sha256:
+                    raise MutationError("stage3 symlink target values changed")
+                if not first or b"\0" in first:
+                    raise MutationError("stage3 symlink target is empty or invalid")
+                a3_closure_coverage.add(a3_locator(node["parts"]))
+                return first
+
+            def a3_target_class(record, parts, kind):
+                if kind == "directory":
+                    expected = "directory"
+                elif _beneath(parts, repo_parts + vendor_tail):
+                    expected = "vendor"
+                elif _beneath(parts, repo_parts):
+                    expected = "repo"
+                elif _beneath(parts, stable_parts):
+                    expected = "stable-sysroot"
+                elif _beneath(parts, nightly_parts):
+                    expected = "nightly-sysroot"
+                else:
+                    expected = record.klass
+                if record.klass != expected:
+                    raise MutationError("stage3 symlink target class changed")
+
+            def a3_validate_final(node):
+                identity = node.get("identity")
+                if identity is None:
+                    raise MutationError("stage3 symlink target row is not reviewed")
+                locator = a3_locator(node["parts"])
+                reviewed = record_by_locator.get(locator)
+                if reviewed is None or reviewed.result != "present":
+                    raise MutationError("stage3 symlink target row is not reviewed")
+                kind = (
+                    "directory"
+                    if _stat.S_ISDIR(identity[4])
+                    else "regular"
+                    if _stat.S_ISREG(identity[4])
+                    else "other"
+                )
+                if kind != node["kind"] or kind == "other":
+                    raise MutationError("stage3 symlink target type changed")
+                a3_target_class(reviewed, node["parts"], kind)
+                if _stat.S_IMODE(identity[4]) != reviewed.mode or (
+                    kind == "regular" and identity[6] != reviewed.size
+                ):
+                    raise MutationError("stage3 symlink target values changed")
+
+            def a3_resolve(start, target):
+                node = start
+                tokens = tuple(target.split(b"/"))
+                proven_boundary = None
+                while True:
+                    if target.startswith(b"/"):
+                        node = nodes_by_parts.get(())
+                        if node is None:
+                            raise MutationError("stage3 symlink root is not held")
+                        proven_boundary = root_node
+                    index = 0
+                    while index < len(tokens):
+                        token = tokens[index]
+                        index += 1
+                        if not token:
+                            continue
+                        if token == b".":
+                            proven_boundary = None
+                            continue
+                        if token == b"..":
+                            node = node["parent"] if node["parent"] is not None else node
+                            proven_boundary = None
+                            continue
+                        if b"\0" in token or node["kind"] != "directory":
+                            raise MutationError("stage3 symlink target traversal changed")
+                        remaining = tokens[index - 1 :]
+                        if proven_boundary is not None and len(remaining) > 1:
+                            relation_locator = a3_locator(proven_boundary["parts"] + remaining)
+                            reviewed = record_by_locator.get(relation_locator)
+                            relation = next(
+                                (
+                                    candidate
+                                    for candidate in a3_absence_relations.values()
+                                    if candidate[0] is reviewed
+                                    and reviewed.result == "ENOENT"
+                                    and candidate[1] is proven_boundary
+                                    and candidate[2] == remaining
+                                ),
+                                None,
+                            )
+                            if relation is not None:
+                                relation_record, relation_boundary, relation_suffix = relation
+                                if (
+                                    reviewed is relation_record
+                                    and relation_boundary is proven_boundary
+                                    and relation_suffix == remaining
+                                ):
+                                    if relation_boundary is root_node:
+                                        expected_identity = relation_boundary.get("identity")
+                                        held = stage3_os_fstat(relation_boundary["fd"])
+                                        if (
+                                            type(expected_identity) is not tuple
+                                            or len(expected_identity) != 9
+                                            or _identity(held) != expected_identity
+                                        ):
+                                            raise MutationError("stage3 symlink root identity changed")
+                                    try:
+                                        stage3_os_stat(
+                                            b"/".join(relation_suffix),
+                                            dir_fd=relation_boundary["fd"],
+                                            follow_symlinks=False,
+                                        )
+                                    except OSError as exc:
+                                        if exc.errno == errno.ENOENT:
+                                            return None
+                                        raise
+                                    raise MutationError("stage3 symlink target traversal changed")
+                        parts = node["parts"] + (token,)
+                        locator = a3_locator(parts)
+                        try:
+                            edge = stage3_os_stat(
+                                token,
+                                dir_fd=node["fd"],
+                                follow_symlinks=False,
+                            )
+                        except OSError as exc:
+                            reviewed = record_by_locator.get(locator)
+                            identity = node.get("identity")
+                            if (
+                                isinstance(exc, OSError)
+                                and exc.errno == errno.ENOENT
+                                and index == len(tokens)
+                                and reviewed is not None
+                                and reviewed.klass == "absent"
+                                and reviewed.access == "probe"
+                                and reviewed.result == "ENOENT"
+                                and proven_boundary is node
+                                and type(identity) is tuple
+                                and len(identity) == 9
+                                and node["kind"] == "directory"
+                                and _stat.S_ISDIR(identity[4])
+                            ):
+                                return None
+                            raise
+                        except BaseException as exc:
+                            raise exc
+                        reviewed = record_by_locator.get(locator)
+                        target_node = nodes_by_parts.get(parts)
+                        if reviewed is None:
+                            if target_node is None or target_node["kind"] != "directory":
+                                raise MutationError("stage3 symlink target row is not reviewed")
+                            try:
+                                held = stage3_os_fstat(target_node["fd"])
+                            except BaseException as exc:
+                                raise exc
+                            if _identity(edge) != _identity(held) or _structural(held) != target_node["structural"]:
+                                raise MutationError("stage3 symlink target identity changed")
+                            node = target_node
+                            if index < len(tokens) and node["kind"] != "directory":
+                                raise MutationError("stage3 symlink target is not a directory")
+                            continue
+                        if reviewed.result != "present":
+                            raise MutationError("stage3 symlink target row is not reviewed")
+                        if _stat.S_ISLNK(edge.st_mode):
+                            if reviewed.klass != "symlink":
+                                raise MutationError("stage3 symlink target class changed")
+                            expected_edge = _identity(edge)
+                            target_value = a3_follow(
+                                node,
+                                token,
+                                reviewed,
+                                expected_edge=expected_edge,
+                            )
+                            tokens = tuple(target_value.split(b"/")) + tokens[index:]
+                            node = nodes_by_parts.get(parts[:-1])
+                            if node is None:
+                                raise MutationError("stage3 symlink target parent is not held")
+                            target = target_value
+                            proven_boundary = None
+                            break
+                        if reviewed.klass == "symlink":
+                            raise MutationError("stage3 symlink target class changed")
+                        if target_node is None:
+                            raise MutationError("stage3 symlink target is not held")
+                        expected_identity = target_node.get("identity")
+                        try:
+                            held = stage3_os_fstat(target_node["fd"])
+                        except BaseException as exc:
+                            raise exc
+                        if expected_identity is None:
+                            if _identity(edge) != _identity(held) or _structural(held) != target_node["structural"]:
+                                raise MutationError("stage3 symlink target identity changed")
+                        elif _identity(edge) != expected_identity or _identity(held) != expected_identity:
+                            raise MutationError("stage3 symlink target identity changed")
+                        kind = "directory" if _stat.S_ISDIR(held.st_mode) else "regular" if _stat.S_ISREG(held.st_mode) else "other"
+                        if kind == "other":
+                            raise MutationError("stage3 symlink target type changed")
+                        a3_target_class(reviewed, parts, kind)
+                        if _stat.S_IMODE(held.st_mode) != reviewed.mode or (
+                            kind == "regular" and held.st_size != reviewed.size
+                        ):
+                            raise MutationError("stage3 symlink target values changed")
+                        node = target_node
+                        proven_boundary = node
+                        if index < len(tokens) and kind == "regular":
+                            remaining = tokens[index:]
+                            relation_locator = a3_locator(node["parts"] + remaining)
+                            reviewed_absence = record_by_locator.get(relation_locator)
+                            relation = a3_absence_relations.get(relation_locator)
+                            if (
+                                len(remaining) > 1
+                                and reviewed_absence is not None
+                                and reviewed_absence.result == "ENOTDIR"
+                                and reviewed_absence.klass == "absent"
+                                and reviewed_absence.access == "probe"
+                                and relation is not None
+                                and relation[0] is reviewed_absence
+                                and relation[1] is node
+                                and relation[2] == remaining
+                            ):
+                                try:
+                                    stage3_os_stat(
+                                        b"/".join(remaining),
+                                        dir_fd=node["fd"],
+                                        follow_symlinks=False,
+                                    )
+                                except OSError as exc:
+                                    if exc.errno == errno.ENOTDIR:
+                                        return None
+                                    raise
+                                raise MutationError("stage3 symlink target traversal changed")
+                        if index < len(tokens) and node["kind"] != "directory":
+                            raise MutationError("stage3 symlink target is not a directory")
+                    else:
+                        if target.endswith(b"/") and node["kind"] != "directory":
+                            raise MutationError("stage3 symlink target traversal changed")
+                        a3_validate_final(node)
+                        return node
+
+            for outer_record in symlink_records:
+                if outer_record.locator in a3_covered_roots:
+                    continue
+                outer_parts = tuple(
+                    part
+                    for part in outer_record.locator.split(":/", 1)[1].encode("utf-8").split(b"/")
+                    if part
+                )
+                if outer_record.locator.startswith("repo:/"):
+                    outer_parts = repo_parts + outer_parts
+                elif outer_record.locator.startswith("vendor:/"):
+                    outer_parts = repo_parts + vendor_tail + outer_parts
+                elif outer_record.locator.startswith("external:/"):
+                    outer_parts = outer_parts
+                outer_parent = nodes_by_parts.get(outer_parts[:-1])
+                if outer_parent is None:
+                    raise MutationError("stage3 symlink parent is not held")
+                a3_closure_coverage = set()
+                try:
+                    outer_target = a3_follow(outer_parent, outer_parts[-1], outer_record)
+                    a3_resolve(outer_parent, outer_target)
+                except _Stage3CapacityRefusal:
+                    graph_body_outcome = "capacity"
+                    stage2_capability = True
+                    break
+                except _Stage3FollowLimit:
+                    graph_body_outcome = "arbitrary"
+                    graph_body_exception = MutationError("stage3 symlink follow limit exceeded")
+                    break
+                except Exception as exc:
+                    graph_body_outcome = "mutation"
+                    stage2_failure = (
+                        exc
+                        if isinstance(exc, MutationError)
+                        else MutationError("stage3 symlink evidence failed")
+                    )
+                    break
+                except BaseException as exc:
+                    graph_body_outcome = "arbitrary"
+                    graph_body_exception = exc
+                    break
+                else:
+                    a3_covered_roots.update(a3_closure_coverage)
+            if graph_body_outcome == "success":
+                a3_body_success = True
+                a3_absence_pending = True
+
+        if graph_body_outcome in {"mutation", "capacity"} or a3_body_success:
             private_failure = None
 
             def record_private_failure(exc, message):
                 nonlocal private_failure
+                if (
+                    not isinstance(exc, Exception)
+                    and graph_body_outcome not in {"mutation", "capacity"}
+                ):
+                    raise exc
                 if private_failure is None:
                     private_failure = (
                         exc if isinstance(exc, MutationError) else MutationError(message)
@@ -2826,6 +3362,83 @@ def run_reconciled_build(
                                 if isinstance(exc, MutationError)
                                 else MutationError("stage3 directory edge binding failed")
                             )
+
+        if (
+            a3_absence_pending
+            and graph_body_outcome == "success"
+            and stage2_failure is None
+            and private_failure is None
+        ):
+            try:
+                for record in records:
+                    if record.result not in {"ENOENT", "ENOTDIR"}:
+                        continue
+                    parts = locator_parts(record)
+                    if not parts:
+                        raise MutationError("stage3 absent locator is empty")
+                    if record.result == "ENOENT":
+                        relation = a3_absence_relations.get(record.locator)
+                        if relation is None or relation[0] is not record:
+                            raise MutationError("stage3 absent boundary is not held")
+                        _relation_record, boundary, suffix = relation
+                        terminal_name = b"/".join(suffix)
+                    else:
+                        relation = a3_absence_relations.get(record.locator)
+                        if (
+                            relation is not None
+                            and relation[0] is record
+                            and len(relation[2]) > 1
+                        ):
+                            _relation_record, boundary, suffix = relation
+                            terminal_name = b"/".join(suffix)
+                        else:
+                            boundary_parts = parts[:-1]
+                            boundary = nodes_by_parts.get(boundary_parts)
+                            if boundary is None or boundary["parent"] is None:
+                                raise MutationError("stage3 absent boundary is not held")
+                            terminal_name = parts[-1]
+                    if boundary["parent"] is None:
+                        if boundary is not root_node or boundary["name"] is not None:
+                            raise MutationError("stage3 absent root binding changed")
+                        held = stage3_os_fstat(boundary["fd"])
+                        expected_identity = boundary.get("identity")
+                        if (
+                            type(expected_identity) is not tuple
+                            or len(expected_identity) != 9
+                            or _identity(held) != expected_identity
+                        ):
+                            raise MutationError("stage3 absent root changed")
+                    else:
+                        try:
+                            edge = stage3_os_stat(
+                                boundary["name"],
+                                dir_fd=boundary["parent"]["fd"],
+                                follow_symlinks=False,
+                            )
+                            held = stage3_os_fstat(boundary["fd"])
+                        except BaseException as exc:
+                            raise exc
+                        expected_identity = boundary.get("identity")
+                        if expected_identity is None:
+                            expected_identity = _structural(edge)
+                        if _identity(edge) != expected_identity or _identity(held) != expected_identity:
+                            raise MutationError("stage3 absent boundary changed")
+                    try:
+                        stage3_os_stat(
+                            terminal_name,
+                            dir_fd=boundary["fd"],
+                            follow_symlinks=False,
+                        )
+                    except OSError as exc:
+                        expected_errno = errno.ENOENT if record.result == "ENOENT" else errno.ENOTDIR
+                        if exc.errno != expected_errno:
+                            raise MutationError("stage3 canonical absence errno changed") from exc
+                    else:
+                        raise MutationError("stage3 canonical absence appeared")
+            except Exception as exc:
+                stage2_failure = exc if isinstance(exc, MutationError) else MutationError("stage3 canonical absence failed")
+            except BaseException as exc:
+                graph_body_exception = exc
 
     finally:
         for owned_fd in reversed(owned_fds):

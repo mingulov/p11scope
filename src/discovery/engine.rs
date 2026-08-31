@@ -3812,7 +3812,16 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
         interface.table = interface
             .table
             .and_then(|index| table_indices.get(index).copied());
-        if !existing.interfaces.contains(&interface) {
+        if let Some(known) = existing.interfaces.iter_mut().find(|known| {
+            known.index == interface.index
+                && known.name_class == interface.name_class
+                && known.flags == interface.flags
+                && known.table == interface.table
+        }) {
+            if known.name_lossy.is_none() {
+                known.name_lossy = interface.name_lossy;
+            }
+        } else {
             existing.interfaces.push(interface);
         }
     }
@@ -14823,6 +14832,47 @@ int main(int argc, char **argv) {
                 "a successful or early-return arm must enter cleanup and retain its change bit"
             );
         }
+    }
+
+    #[test]
+    fn merge_scanned_interfaces_retains_the_richer_name() {
+        let module = |name_lossy| ScannedModule {
+            view: ProcessViewId(0),
+            mount_namespace: crate::process::MountNamespaceId {
+                device: 1,
+                inode: 2,
+            },
+            key: ObjectKey {
+                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                inode: 42,
+            },
+            path: "/opt/p.so".into(),
+            exports: vec![],
+            tables: vec![ScannedTable {
+                version: (3, 0),
+                walk: "full",
+                entries: vec![],
+                null_entries: vec![],
+                unpinned: vec![],
+                address: 0x1000,
+            }],
+            interfaces: vec![ScannedInterface {
+                index: 0,
+                name_class: "exact_standard",
+                name_lossy,
+                flags: 7,
+                table: Some(0),
+            }],
+        };
+
+        let mut merged = vec![module(Some("PKCS 11".into()))];
+        merge_scanned_module(&mut merged, module(None));
+
+        assert_eq!(merged[0].interfaces.len(), 1);
+        assert_eq!(
+            merged[0].interfaces[0].name_lossy.as_deref(),
+            Some("PKCS 11")
+        );
     }
 
     #[test]

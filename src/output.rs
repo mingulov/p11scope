@@ -195,19 +195,26 @@ impl Drop for AtomicFile {
 
 /// Opens (creating/truncating) a private regular file for an appended line
 /// stream — trace `-o`, which streams lines as they arrive and so cannot be
-/// published atomically like `AtomicFile`. O_NOFOLLOW on the final component
-/// (a planted symlink at the target is refused, not followed), O_NONBLOCK so a
-/// planted FIFO fails instead of blocking, mode 0600. An existing target is
-/// only truncated after it proved to be a regular file owned by the caller;
-/// its mode is then made private too.
+/// published atomically like `AtomicFile`. The parent is retained without
+/// following any path symlink, and O_NOFOLLOW protects the final component
+/// too. O_NONBLOCK makes a planted FIFO fail instead of blocking, mode 0600.
+/// An existing target is only truncated after it proved to be a regular file
+/// owned by the caller; its mode is then made private too.
 pub fn create_private_stream(path: &Path) -> Result<std::fs::File, String> {
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
+    use std::os::unix::fs::PermissionsExt as _;
+    if path.as_os_str().as_bytes().last() == Some(&b'/') {
+        return Err(format!("output {} has no file name", path.display()));
+    }
+    let directory_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = open_output_directory(directory_path)?;
+    let final_name = path
+        .file_name()
+        .ok_or_else(|| format!("output {} has no file name", path.display()))?;
+    let final_name = c_name(final_name, "output file name")?;
+    let file = openat_stream(&directory, &final_name)
         .map_err(|error| format!("opening output {} failed: {error}", path.display()))?;
     let metadata = file
         .metadata()
@@ -260,18 +267,59 @@ fn c_name(name: &OsStr, label: &str) -> Result<CString, String> {
     CString::new(name.as_bytes()).map_err(|_| format!("{label} contains a NUL byte"))
 }
 
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
 fn open_output_directory(path: &Path) -> Result<std::fs::File, String> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY)
-        .open(path)
-        .map_err(|error| {
-            format!(
-                "opening output directory {} failed: {error}",
-                path.display()
-            )
-        })
+    let display = path.display().to_string();
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        format!(
+            "opening output directory {} failed: path contains a NUL byte",
+            display
+        )
+    })?;
+    let how = OpenHow {
+        flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: libc::RESOLVE_NO_SYMLINKS,
+    };
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            &how,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if fd == -1 {
+        return Err(format!(
+            "opening output directory {} failed: {}",
+            display,
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd as _) })
+}
+
+fn openat_stream(directory: &std::fs::File, name: &CString) -> std::io::Result<std::fs::File> {
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
 }
 
 fn openat_profile(directory: &std::fs::File, name: &CString) -> std::io::Result<std::fs::File> {
@@ -360,6 +408,20 @@ mod tests {
     }
 
     #[test]
+    fn private_stream_refuses_a_symlinked_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("target-dir");
+        std::fs::create_dir(&target_dir).unwrap();
+        let target = target_dir.join("trace.log");
+        std::fs::write(&target, b"do not touch").unwrap();
+        let link = dir.path().join("parent");
+        std::os::unix::fs::symlink(&target_dir, &link).unwrap();
+
+        assert!(create_private_stream(&link.join("trace.log")).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not touch");
+    }
+
+    #[test]
     fn private_stream_refuses_a_fifo_without_blocking() {
         let dir = tempfile::tempdir().unwrap();
         let fifo = dir.path().join("trace.log");
@@ -409,6 +471,20 @@ mod tests {
             1,
             "no temp left"
         );
+    }
+
+    #[test]
+    fn atomic_file_refuses_a_symlinked_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("target-dir");
+        std::fs::create_dir(&target_dir).unwrap();
+        let target = target_dir.join("observed.json");
+        std::fs::write(&target, b"do not touch").unwrap();
+        let link = dir.path().join("parent");
+        std::os::unix::fs::symlink(&target_dir, &link).unwrap();
+
+        assert!(AtomicFile::create(&link.join("observed.json")).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not touch");
     }
 
     #[test]

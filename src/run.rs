@@ -30,7 +30,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TERM_GRACE: Duration = Duration::from_secs(5);
@@ -318,7 +318,6 @@ impl OwnedChild {
             let errno = io::Error::last_os_error()
                 .raw_os_error()
                 .unwrap_or(libc::EIO);
-            let _ = self.terminate_and_reap();
             return Err(ExecFailure {
                 errno,
                 exit_code: 127,
@@ -348,7 +347,6 @@ impl OwnedChild {
                 if error.raw_os_error() == Some(libc::EINTR) {
                     continue;
                 }
-                let _ = self.terminate_and_reap();
                 return Err(ExecFailure {
                     errno: error.raw_os_error().unwrap_or(libc::EIO),
                     exit_code: 127,
@@ -368,8 +366,13 @@ impl OwnedChild {
         } else {
             libc::EIO
         };
-        let exit_code = self.wait_blocking().unwrap_or(127);
-        Err(ExecFailure { errno, exit_code })
+        // The child-side exec failure always exits 127. Leave the pidfd
+        // unreaped so an owned run can close coordinator state first; callers
+        // that do not have that coordinator still get safe Drop settlement.
+        Err(ExecFailure {
+            errno,
+            exit_code: 127,
+        })
     }
 
     pub(crate) fn revalidate_after_exec(&self) -> io::Result<bool> {
@@ -429,6 +432,14 @@ impl OwnedChild {
         if self.pin.wait_ready(Some(grace))? {
             return self.wait_blocking();
         }
+        self.kill_and_reap_tail()
+    }
+
+    fn kill_and_reap_tail(&mut self) -> io::Result<i32> {
+        if self.pin.wait_ready(Some(Duration::ZERO))? {
+            return self.wait_blocking();
+        }
+        self.ensure_active_generation()?;
         signal_group(self.pid, libc::SIGKILL)?;
         if !self.pin.wait_ready(Some(Duration::from_secs(5)))? {
             return Err(io::Error::new(
@@ -437,6 +448,16 @@ impl OwnedChild {
             ));
         }
         self.wait_blocking()
+    }
+
+    fn reap_after_escalation(&mut self) -> io::Result<i32> {
+        match self.wait_for(Some(Duration::from_secs(5)), false)? {
+            ChildOutcome::Exited(code) => Ok(code),
+            ChildOutcome::TimedOutRunning => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "child reap timeout",
+            )),
+        }
     }
 
     pub(crate) fn still_running(&self) -> bool {
@@ -449,7 +470,7 @@ impl OwnedChild {
 
     /// Task 8 uses this only after pause authorization, links, and stop debt
     /// are closed. Drop then intentionally leaves the running process alone.
-    pub(crate) fn hand_off_running(mut self) -> io::Result<u32> {
+    pub(crate) fn hand_off_running(&mut self) -> io::Result<u32> {
         if !self.released || !self.still_running() {
             return Err(io::Error::other(
                 "only a released, still-running owned child can be handed off",
@@ -595,42 +616,106 @@ fn wait_status(status: i32) -> i32 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureEnd {
+    DurationExpired,
+    TargetExit,
+    Signal,
+    Error,
+}
+
+impl CaptureEnd {
+    fn allows_handoff(self, kill_on_timeout: bool) -> bool {
+        matches!(self, Self::DurationExpired) && !kill_on_timeout
+    }
+}
+
 /// Both operator stop signals end a capture the same clean way. SIGTERM is
 /// what a supervisor (systemd, a container runtime, `timeout`) sends, and
 /// its default disposition would kill the process mid-write.
 const STOP_SIGNALS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGTERM];
 
-/// Installs handlers that only ever set an `AtomicBool` —
-/// `signal_hook::flag::register` is itself the signal-safe minimum a raw
-/// handler may do (no allocation, no I/O, no locks). Every capture loop
-/// polls this flag cooperatively, the same way it already polls
-/// `--duration` elapsing, so Ctrl-C (or SIGTERM) ends a capture the same
-/// clean way: stop polling, print the final frame, write `-o` if given —
-/// never torn down mid-write.
+/// Installs handlers that only ever update atomic signal state — no allocation,
+/// no I/O, no locks, and no child signaling or cleanup. Every capture loop
+/// polls this state cooperatively, the same way it polls `--duration`
+/// elapsing, so Ctrl-C (or SIGTERM) ends a capture the same clean way: stop
+/// polling, print the final frame, write `-o` if given — never torn down
+/// mid-write.
 ///
-/// Chose `signal-hook` over a hand-rolled `libc::signal` handler: this
-/// is exactly the "self-pipe/flag" pattern signal-hook exists for, its
-/// `flag` module is a few lines of audited, already-idiomatic code doing
-/// precisely this, and it costs one small, already-`libc`-based
-/// dependency (the project already pulls `libc` transitively via `aya`).
-/// Hand-rolling it correctly means getting async-signal-safety right
-/// with no compiler help; reusing it means getting it right by
-/// construction.
-fn install_stop_flag() -> Result<Arc<AtomicBool>> {
-    let flag = Arc::new(AtomicBool::new(false));
+/// `signal_hook::low_level::register` is used instead of a hand-rolled
+/// `libc::signal` handler: the callback is the signal-safe minimum, while the
+/// capture loop retains the first identity and counts repeated Ctrl-C.
+struct SignalState {
+    state: AtomicU64,
+}
+
+impl SignalState {
+    fn new() -> Self {
+        Self {
+            state: AtomicU64::new(0),
+        }
+    }
+
+    fn observe(&self, signal: libc::c_int) {
+        let _ = self
+            .state
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+                let first = state & 0xff;
+                let count = (state >> 8) & 3;
+                let first = if first == 0 { signal as u64 } else { first };
+                let count = if signal == libc::SIGINT {
+                    count.saturating_add(1).min(2)
+                } else {
+                    count
+                };
+                Some((state & HANDOFF_CLAIMED) | first | (count << 8))
+            });
+    }
+
+    fn first_signal(&self) -> Option<libc::c_int> {
+        match self.state.load(Ordering::SeqCst) & 0xff {
+            0 => None,
+            signal => Some(signal as libc::c_int),
+        }
+    }
+
+    fn sigint_deliveries(&self) -> u8 {
+        ((self.state.load(Ordering::SeqCst) >> 8) & 3) as u8
+    }
+
+    fn interrupted(&self) -> bool {
+        self.first_signal().is_some()
+    }
+
+    /// Atomically claims the clean-duration handoff boundary. A signal
+    /// observed before this CAS wins; a signal observed after it is after the
+    /// child has been authorized for handoff.
+    fn claim_handoff(&self) -> bool {
+        self.state
+            .compare_exchange(0, HANDOFF_CLAIMED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+}
+
+const HANDOFF_CLAIMED: u64 = 1 << 10;
+
+fn install_stop_flag() -> Result<Arc<SignalState>> {
+    let state = Arc::new(SignalState::new());
     for signal in STOP_SIGNALS {
-        signal_hook::flag::register(signal, Arc::clone(&flag))
+        let observed = Arc::clone(&state);
+        // SAFETY: the callback performs only atomic operations.
+        unsafe { signal_hook::low_level::register(signal, move || observed.observe(signal)) }
             .with_context(|| format!("installing handler for signal {signal}"))?;
     }
-    Ok(flag)
+    Ok(state)
 }
 
 /// Whether a capture loop should stop this tick: interrupted (Ctrl-C or
 /// SIGTERM) or `--duration` elapsed. A pure function so the stop path is
-/// directly testable without sending a real signal — set the flag,
+/// directly testable without sending a real signal — set the state,
 /// confirm this returns `true` regardless of `elapsed`/`duration`.
-fn should_stop(interrupted: &AtomicBool, elapsed: Duration, duration: Option<Duration>) -> bool {
-    interrupted.load(Ordering::Relaxed) || duration.is_some_and(|d| elapsed >= d)
+fn should_stop(interrupted: &SignalState, elapsed: Duration, duration: Option<Duration>) -> bool {
+    interrupted.interrupted() || duration.is_some_and(|d| elapsed >= d)
 }
 
 /// `profile` and `trace` against an external target: decide the policy,
@@ -733,7 +818,7 @@ fn run_loop(
     policy: CapturePolicy,
     duration: Option<Duration>,
     out: OutputSink,
-    interrupted: &AtomicBool,
+    interrupted: &SignalState,
     owned: Option<&mut Owned>,
 ) -> Result<render::Evidence> {
     report_attach_failures(session);
@@ -776,6 +861,7 @@ pub struct OwnedRunOutcome {
 /// nothing here is reachable from outside the library.
 struct Owned {
     child: Option<OwnedChild>,
+    pending_handoff: Option<OwnedChild>,
     coordinator: PauseCoordinator,
     policy: cli::PausePolicy,
     kill_on_timeout: bool,
@@ -797,49 +883,262 @@ impl Owned {
         &mut self,
         engine: &mut Engine,
         session: &mut Session,
-        interrupted: &AtomicBool,
+        end: CaptureEnd,
+        signals: &SignalState,
     ) -> Result<()> {
-        let Some(mut child) = self.child.take() else {
+        let Some(child) = self.child.take() else {
             return Ok(());
         };
         let cleanup = {
             let marker = marker_never_seen();
-            let cancelled = cancelled_by(interrupted);
+            let cancelled = cancelled_by(signals);
             let mut io = SessionPauseIo::new(engine, session, &child, &marker, &cancelled);
             self.coordinator.cleanup(&mut io)
         };
-        // An interrupt ends this run's own work rather than orphaning it; an
-        // expired `--duration` is not a reason to end someone's process, so
-        // the child is handed back unless `--kill-on-timeout` asked otherwise.
-        let settled = if interrupted.load(Ordering::Relaxed) && child.still_running() {
-            // The child is in its own session, so a terminal Ctrl-C never
-            // reached it: forward the interrupt through the owned route, then
-            // fall back to the one owned cleanup path if it is ignored.
-            let _ = child.forward_signal(libc::SIGINT);
-            child.wait_for(Some(TERM_GRACE), true)
-        } else {
-            child.wait_for(Some(Duration::ZERO), self.kill_on_timeout)
-        };
-        let settled = match settled {
-            Ok(ChildOutcome::Exited(code)) => {
-                self.exit_code = Some(code);
-                self.still_running = false;
-                Ok(())
-            }
-            Ok(ChildOutcome::TimedOutRunning) => {
-                self.exit_code = None;
-                self.still_running = true;
-                child
-                    .hand_off_running()
-                    .map(|_| ())
-                    .map_err(|error| anyhow!("run: handing back the owned child: {error}"))
-            }
-            Err(error) => Err(anyhow!("run: reaping the owned child: {error}")),
-        };
+        let settled = settle_owned_child(
+            child,
+            end,
+            cleanup.is_ok(),
+            self.kill_on_timeout,
+            signals,
+            &mut self.pending_handoff,
+            &mut self.exit_code,
+            &mut self.still_running,
+        );
         // Both outcomes are retained: a cleanup failure must not be lost
         // behind a reap failure, or the other way round (design §10.3).
-        cleanup.map_err(pause_failure).and(settled)
+        combine_finish_errors(cleanup.map_err(pause_failure), settled)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_owned_child(
+    mut child: OwnedChild,
+    end: CaptureEnd,
+    cleanup_ok: bool,
+    kill_on_timeout: bool,
+    signals: &SignalState,
+    pending: &mut Option<OwnedChild>,
+    exit_code: &mut Option<i32>,
+    still_running: &mut bool,
+) -> Result<()> {
+    let end = if end == CaptureEnd::DurationExpired && signals.interrupted() {
+        CaptureEnd::Signal
+    } else {
+        end
+    };
+    // An expired `--duration` is the only end that may hand back a live
+    // child, and only after coordinator cleanup succeeds.
+    let can_hand_off = cleanup_ok && end.allows_handoff(kill_on_timeout) && signals.claim_handoff();
+    let settled: Result<ChildOutcome> = if can_hand_off {
+        stage_handoff(child, pending)
+    } else if (end == CaptureEnd::Signal || signals.interrupted()) && child.still_running() {
+        settle_after_signal(&mut child, signals)
+    } else {
+        child
+            .terminate_and_reap()
+            .map(ChildOutcome::Exited)
+            .map_err(|error| anyhow!("run: reaping the owned child: {error}"))
+    };
+    match settled {
+        Ok(ChildOutcome::Exited(code)) => {
+            *exit_code = Some(code);
+            *still_running = false;
+            Ok(())
+        }
+        Ok(ChildOutcome::TimedOutRunning) => {
+            *exit_code = None;
+            *still_running = true;
+            Ok(())
+        }
+        Err(error) => Err(anyhow!("run: reaping the owned child: {error}")),
+    }
+}
+
+fn stage_handoff(mut child: OwnedChild, pending: &mut Option<OwnedChild>) -> Result<ChildOutcome> {
+    match child
+        .wait_for(Some(Duration::ZERO), false)
+        .map_err(|error| anyhow!("run: waiting for the owned child: {error}"))?
+    {
+        outcome @ ChildOutcome::TimedOutRunning => {
+            *pending = Some(child);
+            Ok(outcome)
+        }
+        outcome => Ok(outcome),
+    }
+}
+
+fn commit_handoff(pending: &mut Option<OwnedChild>) -> Result<()> {
+    let Some(child) = pending.as_mut() else {
+        return Ok(());
+    };
+    child
+        .hand_off_running()
+        .map(|_| ())
+        .map_err(|error| anyhow!("run: handing back the owned child: {error}"))?;
+    pending.take();
+    Ok(())
+}
+
+fn settle_after_signal(child: &mut OwnedChild, signals: &SignalState) -> Result<ChildOutcome> {
+    settle_after_signal_with_grace(child, signals, TERM_GRACE)
+}
+
+fn settle_after_signal_with_grace(
+    child: &mut OwnedChild,
+    signals: &SignalState,
+    grace: Duration,
+) -> Result<ChildOutcome> {
+    let signal = signals
+        .first_signal()
+        .ok_or_else(|| anyhow!("run: signal settlement lost the first signal identity"))?;
+    child
+        .forward_signal(signal)
+        .map_err(|error| anyhow!("run: forwarding signal {signal}: {error}"))?;
+    let mut deadline = Instant::now() + grace;
+    let mut second_sigint_forwarded = false;
+    let mut fallback_term_forwarded = false;
+    loop {
+        if signal == libc::SIGINT && !second_sigint_forwarded && signals.sigint_deliveries() >= 2 {
+            match child.forward_signal(libc::SIGINT) {
+                Ok(ForwardAction::Escalated) => {
+                    return child
+                        .reap_after_escalation()
+                        .map(ChildOutcome::Exited)
+                        .map_err(|error| anyhow!("run: settling after signal: {error}"));
+                }
+                Ok(ForwardAction::Forwarded) => second_sigint_forwarded = true,
+                Err(error) => {
+                    if let ChildOutcome::Exited(code) = child
+                        .wait_for(Some(Duration::ZERO), false)
+                        .map_err(|reap| anyhow!("run: waiting after signal: {reap}"))?
+                    {
+                        return Ok(ChildOutcome::Exited(code));
+                    }
+                    return Err(anyhow!("run: forwarding second SIGINT: {error}"));
+                }
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            if fallback_term_forwarded {
+                break;
+            }
+            if let Err(error) = child.forward_signal(libc::SIGTERM) {
+                // A child can exit between the grace wait and fallback TERM.
+                // Reap it at this phase boundary instead of reporting a
+                // forwarding failure for a natural exit.
+                if let ChildOutcome::Exited(code) = child
+                    .wait_for(Some(Duration::ZERO), false)
+                    .map_err(|reap| anyhow!("run: waiting after signal: {reap}"))?
+                {
+                    return Ok(ChildOutcome::Exited(code));
+                }
+                return Err(anyhow!("run: forwarding fallback SIGTERM: {error}"));
+            }
+            fallback_term_forwarded = true;
+            deadline = Instant::now() + grace;
+            continue;
+        }
+        match child
+            .wait_for(Some(remaining.min(Duration::from_millis(10))), false)
+            .map_err(|error| anyhow!("run: waiting after signal: {error}"))?
+        {
+            ChildOutcome::Exited(code) => return Ok(ChildOutcome::Exited(code)),
+            ChildOutcome::TimedOutRunning => {}
+        }
+    }
+    child
+        .kill_and_reap_tail()
+        .map(ChildOutcome::Exited)
+        .map_err(|error| anyhow!("run: settling after signal: {error}"))
+}
+
+fn abort_pending_handoff(pending: &mut Option<OwnedChild>) -> Result<()> {
+    let Some(mut child) = pending.take() else {
+        return Ok(());
+    };
+    child
+        .terminate_and_reap()
+        .map(|_| ())
+        .map_err(|error| anyhow!("run: aborting pending handoff: {error}"))
+}
+
+fn combine_handoff_failure(primary: anyhow::Error, abort: Result<()>) -> anyhow::Error {
+    match abort {
+        Ok(()) => primary,
+        Err(abort) => primary.context(format!("aborting pending handoff also failed: {abort:#}")),
+    }
+}
+
+fn combine_finish_errors(cleanup: Result<()>, settled: Result<()>) -> Result<()> {
+    match (cleanup, settled) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(cleanup), Err(settled)) => {
+            Err(cleanup.context(format!("owned child settlement also failed: {settled:#}")))
+        }
+    }
+}
+
+fn combine_capture_failure(
+    mut capture: anyhow::Error,
+    finish: Result<()>,
+    detach: Result<()>,
+) -> anyhow::Error {
+    if let Err(error) = finish {
+        capture = capture.context(format!("owned cleanup/settlement also failed: {error:#}"));
+    }
+    if let Err(error) = detach {
+        capture = capture.context(format!(
+            "detaching capture producers also failed: {error:#}"
+        ));
+    }
+    capture
+}
+
+fn combine_detach<T>(terminal: Result<T>, detach: Result<()>) -> Result<T> {
+    match (terminal, detach) {
+        (result, Ok(())) => result,
+        (Ok(_), Err(detach)) => Err(anyhow!("run: detaching capture producers: {detach:#}")),
+        (Err(terminal), Err(detach)) => Err(terminal.context(format!(
+            "detaching capture producers also failed: {detach:#}"
+        ))),
+    }
+}
+
+fn finish_capture_error(
+    error: anyhow::Error,
+    engine: &mut Engine,
+    session: &mut Session,
+    owned: Option<&mut Owned>,
+    signals: &SignalState,
+) -> anyhow::Error {
+    let finish = match owned {
+        Some(owned) => owned.finish(engine, session, CaptureEnd::Error, signals),
+        None => Ok(()),
+    };
+    let detach = session.detach_producers();
+    combine_capture_failure(error, finish, detach)
+}
+
+fn finish_capture_loop(
+    result: Result<CaptureEnd>,
+    engine: &mut Engine,
+    session: &mut Session,
+    mut owned: Option<&mut Owned>,
+    signals: &SignalState,
+) -> Result<CaptureEnd> {
+    let end = match result {
+        Ok(end) => end,
+        Err(error) => return Err(finish_capture_error(error, engine, session, owned, signals)),
+    };
+    if let Some(owned) = owned.take()
+        && let Err(error) = owned.finish(engine, session, end, signals)
+    {
+        return Err(finish_capture_error(error, engine, session, None, signals));
+    }
+    Ok(end)
 }
 
 /// A marker probe is not wired in this slice, so the coordinator is told the
@@ -851,8 +1150,8 @@ fn marker_never_seen() -> impl Fn() -> std::result::Result<bool, String> {
 
 /// The coordinator's cancellation signal is the same stop flag the loops poll,
 /// so an accepted stop is never slept through inside a bounded pause cycle.
-fn cancelled_by(interrupted: &AtomicBool) -> impl Fn() -> std::result::Result<bool, String> + '_ {
-    move || Ok(interrupted.load(Ordering::Relaxed))
+fn cancelled_by(interrupted: &SignalState) -> impl Fn() -> std::result::Result<bool, String> + '_ {
+    move || Ok(interrupted.interrupted())
 }
 
 /// The one narrow public production facade `p11scope run` uses: it owns the
@@ -927,7 +1226,8 @@ fn run_owned_inner(args: &RunArgs) -> Result<OwnedRunOutcome> {
         // the child's first loader event, not from the first tick after it.
         coordinator.arm(&mut io).map_err(pause_failure)?;
         Owned {
-            child: None,
+            child: Some(child),
+            pending_handoff: None,
             coordinator,
             policy: args.pause,
             kill_on_timeout: args.kill_on_timeout,
@@ -937,18 +1237,42 @@ fn run_owned_inner(args: &RunArgs) -> Result<OwnedRunOutcome> {
         }
     };
 
-    child
+    let release = owned
+        .child
+        .as_mut()
+        .expect("owned child is present before release")
         .release()
-        .map_err(|failure| anyhow!("run: exec {failure}"))?;
+        .map_err(|failure| anyhow!("run: exec {failure}"));
+    if let Err(error) = release {
+        return Err(finish_capture_error(
+            error,
+            &mut engine,
+            &mut session,
+            Some(&mut owned),
+            &stop,
+        ));
+    }
     {
         let marker = marker_never_seen();
         let cancelled = cancelled_by(&stop);
-        let mut io = SessionPauseIo::new(&mut engine, &mut session, &child, &marker, &cancelled);
+        let child = owned
+            .child
+            .as_ref()
+            .expect("owned child is present after release");
+        let mut io = SessionPauseIo::new(&mut engine, &mut session, child, &marker, &cancelled);
         if let Err(error) = owned.coordinator.revalidate_after_release(&mut io) {
+            if error.required() || error.lifecycle() {
+                return Err(finish_capture_error(
+                    pause_failure(error),
+                    &mut engine,
+                    &mut session,
+                    Some(&mut owned),
+                    &stop,
+                ));
+            }
             retire_pause_policy(error)?;
         }
     }
-    owned.child = Some(child);
 
     let evidence = run_loop(
         &mut engine,
@@ -959,7 +1283,16 @@ fn run_owned_inner(args: &RunArgs) -> Result<OwnedRunOutcome> {
         out,
         &stop,
         Some(&mut owned),
-    )?;
+    )
+    .map_err(|error| {
+        combine_handoff_failure(error, abort_pending_handoff(&mut owned.pending_handoff))
+    })?;
+    if let Err(error) = commit_handoff(&mut owned.pending_handoff) {
+        return Err(combine_handoff_failure(
+            error,
+            abort_pending_handoff(&mut owned.pending_handoff),
+        ));
+    }
     Ok(OwnedRunOutcome {
         child_exit_code: owned.exit_code,
         child_still_running: owned.still_running,
@@ -1102,7 +1435,7 @@ fn drain_discovery_tick(
     engine: &mut Engine,
     session: &mut Session,
     owned: Option<&mut Owned>,
-    interrupted: &AtomicBool,
+    interrupted: &SignalState,
 ) -> Result<(bool, bool)> {
     let Some(owned) = owned else {
         return Ok((engine.drain_discovery(session)?, false));
@@ -1155,20 +1488,18 @@ fn retire_pause_policy(error: PauseError) -> Result<()> {
     Ok(())
 }
 
-/// Whether this tick may finish the capture. Beyond an interrupt and
-/// `--duration`, a named target's expected exit ends the capture the ordinary
-/// way — final drain, finalization, observer success — with no interrupt and
-/// no expiry needed. A cgroup capture never reaches this condition when one
-/// member exits: it stops only by its normal capture policy.
-fn should_finish(
+/// Classifies the first terminal condition observed on a capture tick. Signal
+/// wins over duration or target exit when both become visible together.
+fn capture_end(
     engine: &Engine,
     owned: Option<&Owned>,
-    interrupted: &AtomicBool,
+    interrupted: &SignalState,
     elapsed: Duration,
     duration: Option<Duration>,
-) -> bool {
-    should_stop(interrupted, elapsed, duration)
-        || engine.expected_target_exit()
+) -> Option<CaptureEnd> {
+    if interrupted.interrupted() {
+        Some(CaptureEnd::Signal)
+    } else if engine.expected_target_exit()
         // An owned child that has already exited ends its run the ordinary
         // way too, without waiting for its exit record: the pidfd is the
         // definitive answer, and the terminal drain below still collects
@@ -1179,6 +1510,13 @@ fn should_finish(
                 .as_ref()
                 .is_some_and(|child| !child.still_running())
         })
+    {
+        Some(CaptureEnd::TargetExit)
+    } else if should_stop(interrupted, elapsed, duration) {
+        Some(CaptureEnd::DurationExpired)
+    } else {
+        None
+    }
 }
 
 /// How long to wait before the next tick. An open pause owner replaces the
@@ -1202,7 +1540,7 @@ fn capture_profile(
     policy: CapturePolicy,
     duration: Option<Duration>,
     output: Option<AtomicFile>,
-    interrupted: &AtomicBool,
+    interrupted: &SignalState,
     mut owned: Option<&mut Owned>,
 ) -> Result<render::Evidence> {
     // Opened by the caller before the attach; published by `commit()` only
@@ -1218,9 +1556,16 @@ fn capture_profile(
     let mut state = semantics::State::with_policy(engine.plan(), policy);
     let mut process_tracker = process::Tracker::new();
     if policy.uses_unsafe_decoders() {
-        load_mech_shapes(&mut state)?;
+        if let Err(error) = load_mech_shapes(&mut state) {
+            return Err(finish_capture_error(
+                error,
+                engine,
+                session,
+                owned.as_deref_mut(),
+                interrupted,
+            ));
+        }
     }
-    let mut malformed_records: u64 = 0;
     let drain_events = |session: &mut Session,
                         state: &mut semantics::State,
                         tracker: &mut process::Tracker|
@@ -1239,11 +1584,13 @@ fn capture_profile(
         });
         Ok(drain.malformed())
     };
-
+    let mut malformed_records: u64 = 0;
     let mut stdout_open = true;
-    let mut last_frame = Instant::now() - PROFILE_CADENCE;
     let wall_start = SystemTime::now();
     let clock = Instant::now();
+    let mut last_frame = Instant::now() - PROFILE_CADENCE;
+    #[rustfmt::skip]
+    let loop_result = (|| -> Result<CaptureEnd> {
     loop {
         let elapsed = clock.elapsed();
         // 1. Drain discovery: `Engine` extends `AttachPlan` and applies the
@@ -1255,8 +1602,8 @@ fn capture_profile(
         if plan_changed {
             state.sync_plan(engine.plan());
         }
-        if should_finish(engine, owned.as_deref(), interrupted, elapsed, duration) {
-            break;
+        if let Some(end) = capture_end(engine, owned.as_deref(), interrupted, elapsed, duration) {
+            break Ok(end);
         }
         // 3. Drain call events.
         if profile {
@@ -1304,19 +1651,23 @@ fn capture_profile(
             )?;
             flush_stdout(stdout, &mut stdout_open)?;
             if !stdout_open && !has_output {
-                break;
+                break Ok(CaptureEnd::Error);
             }
         }
         tick_sleep(paused, PROFILE_CADENCE);
     }
-
-    // The owned child is resumed, settled, and its disposition recorded before
-    // any terminal evidence is built.
-    if let Some(owned) = owned.as_deref_mut() {
-        owned.finish(engine, session, interrupted)?;
-    }
+    })();
+    finish_capture_loop(
+        loop_result,
+        engine,
+        session,
+        owned.as_deref_mut(),
+        interrupted,
+    )?;
 
     let detach = session.detach_producers();
+    #[rustfmt::skip]
+    let terminal = (|| -> Result<render::Evidence> {
     // A detach error is retained until after this terminal drain. Do not put a
     // fallible provider check between those two operations.
     if profile {
@@ -1390,8 +1741,9 @@ fn capture_profile(
         out_file.commit().map_err(anyhow::Error::msg)?;
     }
 
-    detach?;
     Ok(ev)
+    })();
+    combine_detach(terminal, detach)
 }
 
 /// Writes the `-o` report — the same call whether the loop above it
@@ -1419,7 +1771,7 @@ fn capture_trace(
     policy: CapturePolicy,
     duration: Option<Duration>,
     out: Option<std::fs::File>,
-    interrupted: &AtomicBool,
+    interrupted: &SignalState,
     mut owned: Option<&mut Owned>,
 ) -> Result<render::Evidence> {
     // A line stream, not a published artifact: opened by the caller before the
@@ -1431,21 +1783,39 @@ fn capture_trace(
 
     let mut state = semantics::State::with_policy(engine.plan(), policy);
     let mut process_tracker = process::Tracker::new();
-    if policy.uses_unsafe_decoders() {
-        load_mech_shapes(&mut state)?;
+    if policy.uses_unsafe_decoders()
+        && let Err(error) = load_mech_shapes(&mut state)
+    {
+        return Err(finish_capture_error(
+            error,
+            engine,
+            session,
+            owned.as_deref_mut(),
+            interrupted,
+        ));
     }
     let mut tracer = trace::Tracer::new(engine.plan());
 
     let mut stdout_open = true;
     let mut malformed_records: u64 = 0;
     let mut last_reported_loss: u64 = 0;
-    let clock = Instant::now();
-    emit_trace_line(
+    if let Err(error) = emit_trace_line(
         &trace::capture_line(policy),
         stdout,
         &mut stdout_open,
         out_file,
-    )?;
+    ) {
+        return Err(finish_capture_error(
+            error,
+            engine,
+            session,
+            owned.as_deref_mut(),
+            interrupted,
+        ));
+    }
+    let clock = Instant::now();
+    #[rustfmt::skip]
+    let loop_result = (|| -> Result<CaptureEnd> {
     loop {
         let elapsed = clock.elapsed();
         // 1. Drain discovery; the Engine extends the plan and applies deltas.
@@ -1457,8 +1827,8 @@ fn capture_trace(
             state.sync_plan(engine.plan());
             tracer.sync_plan(engine.plan());
         }
-        if should_finish(engine, owned.as_deref(), interrupted, elapsed, duration) {
-            break;
+        if let Some(end) = capture_end(engine, owned.as_deref(), interrupted, elapsed, duration) {
+            break Ok(end);
         }
         // 3. Drain call events.
         malformed_records += drain_trace_events(
@@ -1490,16 +1860,23 @@ fn capture_trace(
             f.flush().context("flushing trace output file")?;
         }
         if !stdout_open && out_file.is_none() {
-            break;
+            break Ok(CaptureEnd::Error);
         }
         tick_sleep(paused, TRACE_CADENCE);
     }
+    })();
 
-    if let Some(owned) = owned.as_deref_mut() {
-        owned.finish(engine, session, interrupted)?;
-    }
+    finish_capture_loop(
+        loop_result,
+        engine,
+        session,
+        owned.as_deref_mut(),
+        interrupted,
+    )?;
 
     let detach = session.detach_producers();
+    #[rustfmt::skip]
+    let terminal = (|| -> Result<render::Evidence> {
     // Drain everything currently visible after detach, then report the closing
     // loss line. Kernel detach does not wait for callbacks already executing
     // on another CPU, so terminal evidence below remains explicitly PARTIAL.
@@ -1559,8 +1936,9 @@ fn capture_trace(
         f.flush().context("flushing trace output file")?;
     }
 
-    detach?;
     Ok(evidence)
+    })();
+    combine_detach(terminal, detach)
 }
 
 /// Prints (and, if given, appends to the `-o` file) every rendered line.
@@ -1888,7 +2266,8 @@ mod tests {
         let failure = missing.release().unwrap_err();
         assert_eq!(failure.errno, libc::ENOENT);
         assert_eq!(failure.exit_code, 127);
-        assert!(missing.is_reaped());
+        assert!(!missing.is_reaped());
+        drop(missing);
 
         let mut normal = spawn("/bin/sh", &["-c", "exit 23"]);
         normal.release().unwrap();
@@ -1903,6 +2282,184 @@ mod tests {
             signalled.wait_for(None, false).unwrap(),
             ChildOutcome::Exited(128 + libc::SIGTERM)
         );
+    }
+
+    #[test]
+    fn release_error_defers_settlement_for_owned_cleanup() {
+        let mut missing = spawn("/definitely/missing/p11scope-owned-release", &[]);
+        let failure = missing.release().unwrap_err();
+        assert_eq!(failure.errno, libc::ENOENT);
+        assert_eq!(failure.exit_code, 127);
+        assert!(
+            !missing.is_reaped(),
+            "run-owned release errors must wait for coordinator cleanup before settlement"
+        );
+    }
+
+    #[test]
+    fn duration_handoff_stays_pending_until_finalization_commits_it() {
+        let mut child = spawn("/bin/sleep", &["10"]);
+        let pid = child.pid();
+        child.release().unwrap();
+        let mut pending = None;
+        let outcome = stage_handoff(child, &mut pending).unwrap();
+        assert_eq!(outcome, ChildOutcome::TimedOutRunning);
+        assert!(pending.is_some());
+        assert!(!pending.as_ref().unwrap().handed_off);
+
+        commit_handoff(&mut pending).unwrap();
+        assert!(pending.is_none());
+        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    }
+
+    #[test]
+    fn terminal_failure_aborts_staged_handoff_and_reaps_child() {
+        let mut child = spawn("/bin/sleep", &["10"]);
+        let pid = child.pid();
+        child.release().unwrap();
+        let mut pending = None;
+        assert_eq!(
+            stage_handoff(child, &mut pending).unwrap(),
+            ChildOutcome::TimedOutRunning
+        );
+
+        let error = combine_handoff_failure(
+            anyhow!("terminal failed"),
+            abort_pending_handoff(&mut pending),
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("terminal failed"), "{rendered}");
+        assert!(pending.is_none(), "pending handoff was not aborted");
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        assert_eq!(waited, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+
+        let synthetic = combine_handoff_failure(
+            anyhow!("commit failed"),
+            Err(anyhow!("aborting pending handoff failed")),
+        );
+        let synthetic_rendered = format!("{synthetic:#}");
+        assert!(
+            synthetic_rendered.contains("commit failed"),
+            "{synthetic_rendered}"
+        );
+        assert!(
+            synthetic_rendered.contains("aborting pending handoff failed"),
+            "{synthetic_rendered}"
+        );
+    }
+
+    #[test]
+    fn owned_disposition_records_every_capture_end_state() {
+        let cases = [
+            (
+                "/bin/true",
+                CaptureEnd::TargetExit,
+                true,
+                false,
+                None,
+                Some(0),
+            ),
+            (
+                "/bin/sleep",
+                CaptureEnd::Signal,
+                true,
+                false,
+                Some(libc::SIGTERM),
+                Some(128 + libc::SIGTERM),
+            ),
+            (
+                "/bin/sleep",
+                CaptureEnd::Error,
+                true,
+                false,
+                None,
+                Some(128 + libc::SIGTERM),
+            ),
+            (
+                "/bin/sleep",
+                CaptureEnd::DurationExpired,
+                true,
+                false,
+                None,
+                None,
+            ),
+            (
+                "/bin/sleep",
+                CaptureEnd::DurationExpired,
+                false,
+                false,
+                None,
+                Some(128 + libc::SIGTERM),
+            ),
+            (
+                "/bin/sleep",
+                CaptureEnd::DurationExpired,
+                true,
+                true,
+                None,
+                Some(128 + libc::SIGTERM),
+            ),
+        ];
+
+        for (program, end, cleanup_ok, kill_on_timeout, signal, expected_exit) in cases {
+            let mut args = Vec::new();
+            if program == "/bin/sleep" {
+                args.push("10".to_string());
+            }
+            let mut child = spawn(
+                program,
+                &args.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
+            let pid = child.pid();
+            child.release().unwrap();
+            if end == CaptureEnd::TargetExit {
+                wait_until(
+                    || !child.still_running(),
+                    "target fixture never reached its exit state",
+                );
+            }
+            let signals = SignalState::new();
+            if let Some(signal) = signal {
+                signals.observe(signal);
+            }
+            let mut pending = None;
+            let mut exit_code = None;
+            let mut still_running = false;
+            settle_owned_child(
+                child,
+                end,
+                cleanup_ok,
+                kill_on_timeout,
+                &signals,
+                &mut pending,
+                &mut exit_code,
+                &mut still_running,
+            )
+            .unwrap();
+            assert_eq!(exit_code, expected_exit, "{program} {end:?}");
+            assert_eq!(still_running, expected_exit.is_none(), "{program} {end:?}");
+            assert_eq!(
+                pending.is_some(),
+                end == CaptureEnd::DurationExpired && cleanup_ok && !kill_on_timeout
+            );
+            if let Some(pending) = pending {
+                assert!(pending.still_running());
+                assert_eq!(pending.pid(), pid);
+            }
+        }
+    }
+
+    #[test]
+    fn signal_observed_before_handoff_rejects_the_handoff_boundary() {
+        let signals = SignalState::new();
+        signals.observe(libc::SIGTERM);
+        assert!(!signals.claim_handoff());
     }
 
     #[test]
@@ -2044,13 +2601,181 @@ mod tests {
     }
 
     #[test]
+    fn reap_only_after_escalated_signal_reaps_pidfd_ready_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let mut child = spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                &format!("trap '' INT; : > {}; while :; do :; done", ready.display()),
+            ],
+        );
+        child.release().unwrap();
+        wait_until(|| ready.exists(), "the SIGINT fixture never became ready");
+
+        assert_eq!(
+            child.forward_signal(libc::SIGINT).unwrap(),
+            ForwardAction::Forwarded
+        );
+        assert_eq!(
+            child.forward_signal(libc::SIGINT).unwrap(),
+            ForwardAction::Escalated
+        );
+        wait_until(
+            || child.pin.wait_ready(Some(Duration::ZERO)).unwrap(),
+            "the escalated child pidfd never became ready",
+        );
+
+        assert_eq!(child.reap_after_escalation().unwrap(), 128 + libc::SIGKILL);
+        assert!(child.is_reaped());
+    }
+
+    #[test]
+    fn signal_settlement_forwards_the_second_sigint_as_escalation() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let first_signal = directory.path().join("first-signal");
+        let mut child = spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                &format!(
+                    "trap ': > {}' INT; : > {}; while :; do sleep 1; done",
+                    first_signal.display(),
+                    ready.display(),
+                ),
+            ],
+        );
+        child.release().unwrap();
+        wait_until(|| ready.exists(), "the SIGINT fixture never became ready");
+
+        let signals = Arc::new(SignalState::new());
+        signals.observe(libc::SIGINT);
+        let observed = Arc::clone(&signals);
+        let sender = std::thread::spawn(move || {
+            wait_until(
+                || first_signal.exists(),
+                "settlement never forwarded the first SIGINT",
+            );
+            observed.observe(libc::SIGINT);
+        });
+        assert_eq!(
+            settle_after_signal(&mut child, &signals).unwrap(),
+            ChildOutcome::Exited(128 + libc::SIGKILL)
+        );
+        sender.join().unwrap();
+        assert_eq!(child.interrupt_count, 2);
+    }
+
+    #[test]
+    fn signal_settlement_observes_second_sigint_during_fallback_term_grace() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let term = directory.path().join("term");
+        let mut child = spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                &format!(
+                    "trap '' INT; trap ': > {}' TERM; : > {}; while :; do :; done",
+                    term.display(),
+                    ready.display(),
+                ),
+            ],
+        );
+        child.release().unwrap();
+        wait_until(|| ready.exists(), "the SIGINT fixture never became ready");
+
+        let signals = Arc::new(SignalState::new());
+        signals.observe(libc::SIGINT);
+        let observed = Arc::clone(&signals);
+        let sender = std::thread::spawn(move || {
+            wait_until(
+                || term.exists(),
+                "settlement never forwarded fallback SIGTERM",
+            );
+            assert_eq!(
+                observed.sigint_deliveries(),
+                1,
+                "the second SIGINT was recorded before fallback SIGTERM",
+            );
+            observed.observe(libc::SIGINT);
+        });
+        assert_eq!(
+            settle_after_signal_with_grace(&mut child, &signals, Duration::from_millis(100))
+                .unwrap(),
+            ChildOutcome::Exited(128 + libc::SIGKILL)
+        );
+        sender.join().unwrap();
+        assert_eq!(signals.sigint_deliveries(), 2);
+        assert_eq!(child.interrupt_count, 2);
+        assert!(child.is_reaped());
+    }
+
+    #[test]
+    fn signal_settlement_forwards_the_retained_sigterm_identity() {
+        let mut child = spawn("/bin/sleep", &["10"]);
+        child.release().unwrap();
+        let signals = SignalState::new();
+        signals.observe(libc::SIGTERM);
+        assert_eq!(
+            settle_after_signal(&mut child, &signals).unwrap(),
+            ChildOutcome::Exited(128 + libc::SIGTERM)
+        );
+    }
+
+    #[test]
+    fn capture_error_keeps_cleanup_and_settlement_context() {
+        let finish = combine_finish_errors(
+            Err(anyhow!("cleanup failed")),
+            Err(anyhow!("settlement failed")),
+        )
+        .unwrap_err();
+        let finish_rendered = format!("{finish:#}");
+        assert!(
+            finish_rendered.contains("cleanup failed"),
+            "{finish_rendered}"
+        );
+        assert!(
+            finish_rendered.contains("settlement failed"),
+            "{finish_rendered}"
+        );
+
+        let error = combine_capture_failure(
+            anyhow!("capture failed"),
+            Err(finish),
+            Err(anyhow!("detach failed")),
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("capture failed"), "{rendered}");
+        assert!(rendered.contains("cleanup failed"), "{rendered}");
+        assert!(rendered.contains("settlement failed"), "{rendered}");
+        assert!(rendered.contains("detach failed"), "{rendered}");
+
+        let terminal = combine_detach::<()>(
+            Err(anyhow!("terminal failed")),
+            Err(anyhow!("detach failed")),
+        );
+        let terminal_rendered = format!("{:#}", terminal.unwrap_err());
+        assert!(
+            terminal_rendered.contains("terminal failed"),
+            "{terminal_rendered}"
+        );
+        assert!(
+            terminal_rendered.contains("detach failed"),
+            "{terminal_rendered}"
+        );
+    }
+
+    #[test]
     fn drop_closes_the_barrier_and_reaps_an_unreleased_child() {
         let unreleased_pid = {
             let child = spawn("/bin/sleep", &["10"]);
             child.pid()
         };
         let invalid_handoff_pid = {
-            let child = spawn("/bin/sleep", &["10"]);
+            let mut child = spawn("/bin/sleep", &["10"]);
             let pid = child.pid();
             assert!(child.hand_off_running().is_err());
             pid
@@ -2222,7 +2947,7 @@ mod tests {
     /// SIGINT drives.
     #[test]
     fn should_stop_on_interrupt_regardless_of_duration() {
-        let interrupted = AtomicBool::new(false);
+        let interrupted = SignalState::new();
         assert!(!should_stop(&interrupted, Duration::from_secs(0), None));
         assert!(!should_stop(
             &interrupted,
@@ -2230,7 +2955,7 @@ mod tests {
             Some(Duration::from_secs(3600))
         ));
 
-        interrupted.store(true, Ordering::Relaxed);
+        interrupted.observe(libc::SIGINT);
         assert!(
             should_stop(&interrupted, Duration::from_secs(0), None),
             "no --duration set at all"
@@ -2247,7 +2972,7 @@ mod tests {
 
     #[test]
     fn should_stop_still_honors_duration_elapsing_without_an_interrupt() {
-        let interrupted = AtomicBool::new(false);
+        let interrupted = SignalState::new();
         assert!(should_stop(
             &interrupted,
             Duration::from_secs(10),
@@ -2268,9 +2993,32 @@ mod tests {
     fn sigterm_sets_the_stop_flag() {
         let stop = install_stop_flag().unwrap();
         assert!(!should_stop(&stop, Duration::ZERO, None));
-        // SAFETY: raise() with a handled signal; the handler only sets an AtomicBool.
+        // SAFETY: raise() with a handled signal; the handler only sets atomics.
         assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
         assert!(should_stop(&stop, Duration::ZERO, None));
+        assert_eq!(stop.first_signal(), Some(libc::SIGTERM));
+        assert_eq!(stop.sigint_deliveries(), 0);
+    }
+
+    #[test]
+    fn capture_end_only_allows_handoff_for_clean_duration_expiry() {
+        assert!(CaptureEnd::DurationExpired.allows_handoff(false));
+        assert!(!CaptureEnd::DurationExpired.allows_handoff(true));
+        assert!(!CaptureEnd::TargetExit.allows_handoff(false));
+        assert!(!CaptureEnd::Signal.allows_handoff(false));
+        assert!(!CaptureEnd::Error.allows_handoff(false));
+    }
+
+    #[test]
+    fn signal_state_retains_first_identity_and_saturates_sigint_deliveries() {
+        let state = SignalState::new();
+        state.observe(libc::SIGTERM);
+        state.observe(libc::SIGINT);
+        state.observe(libc::SIGINT);
+        state.observe(libc::SIGINT);
+
+        assert_eq!(state.first_signal(), Some(libc::SIGTERM));
+        assert_eq!(state.sigint_deliveries(), 2);
     }
 
     #[test]

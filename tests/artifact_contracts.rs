@@ -2414,13 +2414,17 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
 #[test]
 fn live_discovery_bpf_classification_is_exact_and_output_only() {
     let source = read("crates/ebpf/src/main.rs");
-    let export = between(&source, "fn emit_export(", "fn export_symbol_id");
+    let classifier = between(
+        &source,
+        "fn classify_direct_interface(",
+        "#[inline(never)]\nfn emit_export(",
+    );
     assert!(
-        export.contains("let mut bytes = [0u8; 9];"),
+        classifier.contains("let mut bytes = [0u8; 9];"),
         "the ninth byte must distinguish an exact standard name from a longer prefix"
     );
     assert!(
-        export.contains("read == 8 && bytes[..8] == *b\"PKCS 11\\0\""),
+        classifier.contains("read == 8 && bytes[..8] == *b\"PKCS 11\\0\""),
         "interface classification must require the exact eight-byte string"
     );
 
@@ -2437,12 +2441,138 @@ fn live_discovery_bpf_classification_is_exact_and_output_only() {
         .expect("bounded interface loop");
     assert!(output_null < loop_start);
 
+    let assert_range_proof = |listed: &str| {
+        let proof = between(
+            listed,
+            "let active_count = count.min(16);",
+            "let mut interface_index = 0usize;",
+        );
+        let zero_guard = proof
+            .find("if active_count == 0")
+            .expect("active count zero guard");
+        let subtraction = proof
+            .find("(active_count - 1) * 24")
+            .expect("count-sensitive range proof");
+        assert!(zero_guard < subtraction);
+        assert_eq!(
+            proof.matches("checked_add").count(),
+            1,
+            "range proof must contain exactly one checked_add"
+        );
+        assert_eq!(
+            proof
+                .matches("bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES)")
+                .count(),
+            1,
+            "range proof must own exactly one bounded-read counter increment"
+        );
+        let compact_proof: String = proof
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        assert!(compact_proof.contains("state.arg0.checked_add((active_count-1)*24)"));
+        let overflow = &proof[proof.find("checked_add").expect("overflow proof")..];
+        assert_eq!(
+            overflow
+                .matches("bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES)")
+                .count(),
+            1,
+            "range overflow must own one bounded-read counter increment"
+        );
+        assert_eq!(
+            overflow.matches("return 0;").count(),
+            1,
+            "range overflow must return immediately"
+        );
+
+        let loop_start = listed
+            .find("while interface_index < 16")
+            .expect("count-sensitive interface loop");
+        assert!(listed.find("let active_count = count.min(16);").unwrap() < loop_start);
+        let loop_body = &listed[loop_start..];
+        assert!(
+            loop_body.contains("if interface_index as u64 >= active_count {\n            break;"),
+            "interface loop must terminate against active_count"
+        );
+        assert!(
+            loop_body.contains("state.arg0 + interface_index as u64 * 24"),
+            "interface loop must use the proven ordinary address expression"
+        );
+        assert!(
+            !loop_body.contains("checked_add"),
+            "interface loop must not repeat checked range arithmetic"
+        );
+        assert!(
+            !proof.contains("15 * 24"),
+            "range proof must depend on active_count"
+        );
+    };
+    assert_range_proof(listed);
+
+    let constant_range_proof = source.replacen("(active_count - 1) * 24", "15 * 24", 1);
+    let mutated_listed = between(
+        &constant_range_proof,
+        "pub fn interface_list_return(ctx: RetProbeContext) -> u32 {",
+        "#[uprobe]\npub fn interface_entry",
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_range_proof(mutated_listed)).is_err(),
+        "constant 15 * 24 range proof mutation must be rejected"
+    );
+
     for path in ["src/render.rs", "src/trace.rs", "src/output.rs"] {
         assert!(
             !read(path).contains("send_signal_rc"),
             "private helper result escaped into {path}"
         );
     }
+}
+
+#[test]
+fn live_discovery_direct_classification_precedes_record_reservation() {
+    let source = read("crates/ebpf/src/main.rs");
+    let assert_contract = |source: &str| {
+        let classifier = between(
+            source,
+            "#[inline(never)]\nfn classify_direct_interface(",
+            "#[inline(never)]\nfn emit_export(",
+        );
+        assert!(
+            !classifier.contains("reserve_discovery("),
+            "direct interface classification must finish before reservation"
+        );
+        let classify_read = classifier
+            .find("bpf_probe_read_user")
+            .expect("direct classifier must resolve interface fields");
+        let classify_emit = classifier
+            .find("emit_export(")
+            .expect("direct classifier must converge on the record emitter");
+        assert!(classify_read < classify_emit);
+
+        let listed = between(
+            source,
+            "pub fn interface_list_return(ctx: RetProbeContext) -> u32 {",
+            "#[uprobe]\npub fn interface_entry",
+        );
+        listed
+            .find("classify_direct_interface(")
+            .expect("interface list return must call the direct classifier");
+        assert!(
+            !listed.contains("emit_export("),
+            "interface list return must not dispatch through runtime-polymorphic emit_export"
+        );
+    };
+    assert_contract(&source);
+
+    let without_classifier_inline = source.replacen(
+        "#[inline(never)]\nfn classify_direct_interface(",
+        "fn classify_direct_interface(",
+        1,
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_contract(&without_classifier_inline)).is_err(),
+        "classifier inline attribute mutation must be rejected"
+    );
 }
 
 #[test]
@@ -2852,6 +2982,19 @@ fn gate_scripts_pin_the_toolchain() {
     }
 }
 
+#[test]
+fn production_bpf_toolchain_is_frozen() {
+    let toolchain = read("crates/ebpf/rust-toolchain.toml");
+    let build = read("build.rs");
+    let ci = read(".github/workflows/ci.yml");
+
+    assert!(toolchain.contains("channel = \"nightly-2026-05-20\""));
+    assert!(build.contains("\"+nightly-2026-05-20\""));
+    assert!(!build.contains("\"+nightly\""));
+    assert!(ci.contains("toolchain install nightly-2026-05-20 "));
+    assert!(!ci.contains("toolchain install nightly "));
+}
+
 /// Task 8 Step 2's ordering sentence, frozen where the loops live: "Each tick
 /// drains discovery, lets `Engine` extend `AttachPlan` and apply attachment
 /// deltas, synchronizes immediate semantic/trace invalidations while
@@ -2873,13 +3016,13 @@ fn both_capture_loops_keep_the_one_frozen_per_tick_ordering() {
         (
             "profile",
             profile,
-            "    // The owned child is resumed",
+            "    finish_capture_loop(",
             "state.sync_plan(engine.plan());",
         ),
         (
             "trace",
             trace,
-            "    if let Some(owned) = owned.as_deref_mut() {",
+            "    finish_capture_loop(",
             "tracer.sync_plan(engine.plan());",
         ),
     ] {
@@ -2957,7 +3100,7 @@ fn both_capture_loops_keep_the_one_frozen_per_tick_ordering() {
     for source in [profile, trace] {
         require_before(
             source,
-            "owned.finish(engine, session, interrupted)?;",
+            "finish_capture_loop(",
             "let detach = session.detach_producers();",
             "owned-child settlement before terminal evidence",
         )
@@ -3377,6 +3520,13 @@ fn live_discovery_gates_freeze_the_exact_command_inputs_and_fixture_flags() {
 fn live_discovery_fixtures_have_two_byte_identities_and_three_surfaces() {
     let provider = read("tests/fixtures/live-discovery-provider.c");
     let driver = read("tests/fixtures/live-discovery-driver.c");
+    let first_include = provider
+        .find("#include")
+        .expect("provider includes system headers");
+    assert!(
+        provider[..first_include].contains("#define _GNU_SOURCE"),
+        "provider must define _GNU_SOURCE before its first include"
+    );
     assert!(
         provider.contains("#if P11SCOPE_EXPORT_TABLES")
             && provider.contains("#define TABLE_FN static"),
@@ -5671,4 +5821,51 @@ int main(int argc, char **argv) {
         .find_map(|line| line.strip_prefix("work="))
         .expect("signal recorded work path");
     assert!(!std::path::Path::new(signal_work).exists());
+}
+
+#[test]
+fn escalated_signal_wiring_is_reap_only_and_bounded() {
+    let run = read("src/run.rs");
+    let forbidden_actions = [
+        "kill_and_reap_tail",
+        "forward_signal",
+        "ensure_active_generation",
+        "signal_group",
+        "terminate_and_reap",
+        "terminate_with_grace",
+    ];
+    let escalated = between(
+        &run,
+        "Ok(ForwardAction::Escalated) => {",
+        "Ok(ForwardAction::Forwarded)",
+    );
+    assert_eq!(
+        escalated.matches(".reap_after_escalation()").count(),
+        1,
+        "the escalated branch must settle its child with reap_after_escalation",
+    );
+    for forbidden in forbidden_actions {
+        assert!(
+            !escalated.contains(forbidden),
+            "escalated branch contains forbidden action {forbidden:?}",
+        );
+    }
+
+    let reap = between(
+        &run,
+        "fn reap_after_escalation(&mut self) -> io::Result<i32> {",
+        "\n    pub(crate) fn still_running",
+    );
+    assert_eq!(
+        reap.matches("self.wait_for(Some(Duration::from_secs(5)), false)?")
+            .count(),
+        1,
+        "reap_after_escalation must use one bounded existing wait_for",
+    );
+    for forbidden in forbidden_actions {
+        assert!(
+            !reap.contains(forbidden),
+            "reap_after_escalation contains forbidden action {forbidden:?}",
+        );
+    }
 }

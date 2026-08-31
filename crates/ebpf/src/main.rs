@@ -366,7 +366,6 @@ fn finish_discovery_record(
 // TASK5_PAUSE_WRITER_END
 
 const EXPORT_SOURCE_FUNCTION_LIST: u8 = 1;
-const EXPORT_SOURCE_INTERFACE_DIRECT: u8 = 2;
 const EXPORT_SOURCE_INTERFACE_INDIRECT: u8 = 3;
 
 struct ExportArgs {
@@ -379,72 +378,84 @@ struct ExportArgs {
 }
 
 #[inline(never)]
-fn emit_export(args: &ExportArgs, scope: ScopeAuth) {
-    let Some(mut entry) = reserve_discovery() else {
-        return;
-    };
-    let raw = entry.as_mut_ptr();
+fn classify_direct_interface(
+    mut record_meta: u64,
+    announced_count: u32,
+    address: u64,
+    scope: &ScopeAuth,
+) {
     let mut read_failed = false;
     let mut table_ptr = 0u64;
     let mut interface_flags = 0u64;
     let mut name_class = DISCOVERY_NAME_NA;
 
-    if args.source == EXPORT_SOURCE_FUNCTION_LIST {
-        match unsafe { helpers::bpf_probe_read_user(args.address as *const u64) } {
-            Ok(pointer) if pointer != 0 => table_ptr = pointer,
-            _ => read_failed = true,
-        }
+    if address == 0 {
+        name_class = DISCOVERY_NAME_UNREADABLE;
+        read_failed = true;
     } else {
-        let interface_address = if args.source == EXPORT_SOURCE_INTERFACE_INDIRECT {
-            match unsafe { helpers::bpf_probe_read_user(args.address as *const u64) } {
-                Ok(pointer) => pointer,
-                Err(_) => {
-                    read_failed = true;
-                    0
-                }
-            }
-        } else {
-            args.address
-        };
-        if interface_address == 0 {
-            name_class = DISCOVERY_NAME_UNREADABLE;
-            read_failed = true;
-        } else {
-            match unsafe { helpers::bpf_probe_read_user(interface_address as *const [u64; 3]) } {
-                Ok([name, table, flags]) => {
-                    table_ptr = table;
-                    interface_flags = flags;
-                    if name == 0 {
-                        name_class = DISCOVERY_NAME_NULL;
+        match unsafe { helpers::bpf_probe_read_user(address as *const [u64; 3]) } {
+            Ok([name, table, flags]) => {
+                table_ptr = table;
+                interface_flags = flags;
+                if name == 0 {
+                    name_class = DISCOVERY_NAME_NULL;
+                } else {
+                    let mut bytes = [0u8; 9];
+                    let read = unsafe {
+                        helpers::generated::bpf_probe_read_user_str(
+                            bytes.as_mut_ptr().cast(),
+                            bytes.len() as u32,
+                            name as *const core::ffi::c_void,
+                        )
+                    };
+                    if read < 0 {
+                        name_class = DISCOVERY_NAME_UNREADABLE;
+                        read_failed = true;
+                    } else if read == 8 && bytes[..8] == *b"PKCS 11\0" {
+                        name_class = DISCOVERY_NAME_EXACT_STANDARD;
                     } else {
-                        let mut bytes = [0u8; 9];
-                        let read = unsafe {
-                            helpers::generated::bpf_probe_read_user_str(
-                                bytes.as_mut_ptr().cast(),
-                                bytes.len() as u32,
-                                name as *const core::ffi::c_void,
-                            )
-                        };
-                        if read < 0 {
-                            name_class = DISCOVERY_NAME_UNREADABLE;
-                            read_failed = true;
-                        } else if read == 8 && bytes[..8] == *b"PKCS 11\0" {
-                            name_class = DISCOVERY_NAME_EXACT_STANDARD;
-                        } else {
-                            name_class = DISCOVERY_NAME_OTHER;
-                        }
+                        name_class = DISCOVERY_NAME_OTHER;
                     }
                 }
-                Err(_) => {
-                    name_class = DISCOVERY_NAME_UNREADABLE;
-                    read_failed = true;
-                }
+            }
+            Err(_) => {
+                name_class = DISCOVERY_NAME_UNREADABLE;
+                read_failed = true;
             }
         }
     }
 
+    record_meta = (record_meta & !(0xff00_0000u64 | 0x00ff_0000u64))
+        | ((name_class as u64) << 16)
+        | ((read_failed as u64) << 24);
+    emit_export(
+        record_meta,
+        announced_count,
+        table_ptr,
+        interface_flags,
+        scope,
+    );
+}
+
+#[inline(never)]
+fn emit_export(
+    record_meta: u64,
+    announced_count: u32,
+    table_ptr: u64,
+    interface_flags: u64,
+    scope: &ScopeAuth,
+) {
+    let Some(mut entry) = reserve_discovery() else {
+        return;
+    };
+    let raw = entry.as_mut_ptr();
+    let kind = record_meta as u8;
+    let interface_index = (record_meta >> 8) as u8;
+    let name_class = (record_meta >> 16) as u8;
+    let mut read_failed = (record_meta >> 24) & 1 != 0;
+    let symbol_id = (record_meta >> 32) as u32;
     let read_table =
-        args.source == EXPORT_SOURCE_FUNCTION_LIST || name_class == DISCOVERY_NAME_EXACT_STANDARD;
+        name_class == DISCOVERY_NAME_NA || name_class == DISCOVERY_NAME_EXACT_STANDARD;
     let mut version_major = 0u8;
     let mut version_minor = 0u8;
     let mut attempted = 0u8;
@@ -508,10 +519,10 @@ fn emit_export(args: &ExportArgs, scope: ScopeAuth) {
             core::ptr::addr_of_mut!((*raw).interface_flags),
             interface_flags,
         );
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).kind), args.kind);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).kind), kind);
         core::ptr::write_volatile(
             core::ptr::addr_of_mut!((*raw).interface_index),
-            args.interface_index,
+            interface_index,
         );
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).name_class), name_class);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).usable_n), usable);
@@ -522,14 +533,50 @@ fn emit_export(args: &ExportArgs, scope: ScopeAuth) {
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).completed_prefix), completed);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).version_major), version_major);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).version_minor), version_minor);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).symbol_id), args.symbol_id);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).symbol_id), symbol_id);
         core::ptr::write_volatile(
             core::ptr::addr_of_mut!((*raw).announced_count),
-            args.announced_count,
+            announced_count,
         );
     }
     let pid_tgid = helpers::bpf_get_current_pid_tgid();
-    finish_discovery_record(entry, scope, true, pid_tgid, status);
+    finish_discovery_record(entry, *scope, true, pid_tgid, status);
+}
+
+#[inline(always)]
+fn classify_export(args: &ExportArgs, scope: &ScopeAuth) {
+    let record_meta = args.kind as u64
+        | ((args.interface_index as u64) << 8)
+        | ((args.symbol_id as u64) << 32);
+    if args.source == EXPORT_SOURCE_FUNCTION_LIST {
+        let mut read_failed = false;
+        let table_ptr = match unsafe { helpers::bpf_probe_read_user(args.address as *const u64) } {
+            Ok(pointer) if pointer != 0 => pointer,
+            _ => {
+                read_failed = true;
+                0
+            }
+        };
+        emit_export(
+            record_meta | ((read_failed as u64) << 24),
+            args.announced_count,
+            table_ptr,
+            0,
+            scope,
+        );
+    } else {
+        let interface_address = match unsafe { helpers::bpf_probe_read_user(args.address as *const u64) }
+        {
+            Ok(pointer) => pointer,
+            Err(_) => 0,
+        };
+        classify_direct_interface(
+            record_meta,
+            args.announced_count,
+            interface_address,
+            scope,
+        );
+    }
 }
 
 fn export_symbol_id<C: aya_ebpf::EbpfContext>(ctx: &C) -> Option<u32> {
@@ -598,7 +645,7 @@ pub fn function_list_return(ctx: RetProbeContext) -> u32 {
     };
     let rv: u64 = ctx.ret();
     if rv == 0 {
-        emit_export(
+        classify_export(
             &ExportArgs {
                 kind: DISCOVERY_KIND_FUNCTION_LIST_RETURN,
                 source: EXPORT_SOURCE_FUNCTION_LIST,
@@ -607,7 +654,7 @@ pub fn function_list_return(ctx: RetProbeContext) -> u32 {
                 announced_count: 0,
                 address: state.arg0,
             },
-            scope,
+            &scope,
         );
     }
     0
@@ -643,28 +690,34 @@ pub fn interface_list_return(ctx: RetProbeContext) -> u32 {
         return 0;
     };
     let announced_count = count.min(u32::MAX as u64) as u32;
+    let active_count = count.min(16);
+    if active_count == 0 {
+        return 0;
+    }
     if state.arg0 == 0 {
+        return 0;
+    }
+    if state
+        .arg0
+        .checked_add((active_count - 1) * 24)
+        .is_none()
+    {
+        bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
         return 0;
     }
     let mut interface_index = 0usize;
     while interface_index < 16 {
-        if interface_index as u64 >= count {
+        if interface_index as u64 >= active_count {
             break;
         }
-        let Some(address) = state.arg0.checked_add(interface_index as u64 * 24) else {
-            bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
-            break;
-        };
-        emit_export(
-            &ExportArgs {
-                kind: DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN,
-                source: EXPORT_SOURCE_INTERFACE_DIRECT,
-                interface_index: interface_index as u8,
-                symbol_id: key.attach_cookie as u32,
-                announced_count,
-                address,
-            },
-            scope,
+        let address = state.arg0 + interface_index as u64 * 24;
+        classify_direct_interface(
+            DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN as u64
+                | ((interface_index as u64) << 8)
+                | ((key.attach_cookie as u32 as u64) << 32),
+            announced_count,
+            address,
+            &scope,
         );
         interface_index += 1;
     }
@@ -694,7 +747,7 @@ pub fn interface_return(ctx: RetProbeContext) -> u32 {
     };
     let rv: u64 = ctx.ret();
     if rv == 0 {
-        emit_export(
+        classify_export(
             &ExportArgs {
                 kind: DISCOVERY_KIND_INTERFACE_RETURN,
                 source: EXPORT_SOURCE_INTERFACE_INDIRECT,
@@ -703,7 +756,7 @@ pub fn interface_return(ctx: RetProbeContext) -> u32 {
                 announced_count: 0,
                 address: state.arg0,
             },
-            scope,
+            &scope,
         );
     }
     0

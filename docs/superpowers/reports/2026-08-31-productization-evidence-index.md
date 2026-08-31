@@ -9,7 +9,7 @@ are identified by hashes below.
 
 ## Integrated on `main`
 
-- Current integration checkpoint: `b0e47d8ff1e264bff6974e6b0d8cacce0c1c63e3`.
+- Current integration checkpoint: `5c741c79a662e132c8039747fe3a9b44466beb1d`.
 - Shipping baseline: `91e21496ae4e7d151c050a9dee2e8547d2d6cb75`,
   merged by `21bfd008d79ebd1ae1292d3820855ef45889a0d8`.
 - Committed MVP lifecycle fixes through
@@ -46,7 +46,7 @@ for product integration.
 
 | Worktree / branch | Preserved commit | Disposition |
 | --- | --- | --- |
-| `productization/mvp-lifecycle-fix` | `dff4085778ad96e4d7741b282977b6052e47afb0` | Mixed accepted interface-list tail work and diagnostic instrumentation. Surgically remove diagnostics, rerun Jammy row 02, then review before merging. |
+| `productization/mvp-lifecycle-fix` | `fd727a86c4e4a367b0a836949c13b5956f056980` | Clean post-diagnostic candidate. Cleanup review accepted, but fresh Jammy Attempt 15 row 02 remains semantic NON-PASS; do not merge until fixed. Raw WIP remains recoverable at `dff4085778ad96e4d7741b282977b6052e47afb0`. |
 | `productization/slice1b2-finish` | `5a7c9a7cfd24c8b938866d12e78089935000a9d3` | Exact GREEN6 pair plus separately unaccepted artifact-contract/contracts/report WIP. GREEN6 and prerequisites are integrated; the remaining snapshot is preserved only. |
 | `research/raw-tracepoint-lifecycle` | `5e027743c01072b47ac5bb0bf7ebdfe4767c8428` | `DONE_WITH_CONCERNS`; verifier, masked-tracefs, capability-parity, and cross-kernel runtime remain UNRUN. Post-v1 unless promoted separately. |
 
@@ -89,6 +89,23 @@ Jammy 5.15:
 - The VM powered off cleanly, QEMU exited in five seconds, port 2223 cleared,
   and `qemu-img check` returned 0. The disposable child overlay is preserved,
   not deleted.
+- Attempt 15 rebuilt the clean post-diagnostic candidate at
+  `fd727a86c4e4a367b0a836949c13b5956f056980`:
+  - static-musl runner:
+    `a6f30aff09e08d450609604fafae5bf8e1334aacf8a6cc0ec6b22a1c5d5d080f`;
+  - eBPF object:
+    `97b19c5d15bada7df00e6a92d3c2149f2e34e70fecf40665dbd028da359f6983`;
+  - Gate A and the static object checker: PASS;
+  - row 02 command, readiness producer, and exact-baseline cleanup: PASS;
+  - provider scan: 104 entries and 208 attached probes;
+  - semantic oracle: NON-PASS, `interfaces: expected 1, got 0`.
+- Attempt 15 archive:
+  `12e25383ed7a7d9c4e5f652ca34fba52e7e32e373e8373c865f714b1061e7afe`.
+  A verified preservation copy, including the candidate runner/object and
+  manifest, is under
+  `/home/user/.local/state/p11scope/mvp-semantic-jammy-attempt15-clean-row02/`.
+  Its disposable child was deleted after graceful shutdown and successful
+  image/input checks.
 
 Evidence paths are local under
 `.claude/worktrees/mvp-lifecycle-fix/.superpowers/sdd/2026-08-31-mvp-semantic-campaign/`.
@@ -114,12 +131,11 @@ artifacts are independently retained.
 
 ## Remaining critical path
 
-1. Clean only the diagnostic hunks from snapshot
-   `dff4085778ad96e4d7741b282977b6052e47afb0` while preserving
-   accepted interface-list tail, checker, map, fixture, and padding work.
+1. Identify and fix the interface-list lifecycle defect isolated by clean
+   Attempt 15. Diagnostic removal and its independent review are complete.
 2. Rerun the frozen Jammy row 02. Do not spend time on rows 03-06 until it
    passes.
-3. Merge the reviewed clean tail fix to `main`.
+3. Merge the reviewed lifecycle fix to `main`.
 4. Run the four locked workspace commands on the exact `main` tip.
 5. Run the serial Jammy 5.15 and Noble 6.8 semantic campaign, independently
    review its evidence, then run exact-tip CI and release closeout.

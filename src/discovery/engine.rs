@@ -5646,15 +5646,91 @@ impl Engine {
         let observed_module = lowered.clone();
         merge_scanned_module(&mut raw_modules, lowered);
         let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
-        candidate.views.insert(self.views[position].id());
+        let view_id = self.views[position].id();
+        candidate.views.insert(view_id);
         let observed = candidate_timing_keys(&candidate, std::slice::from_ref(&observed_module));
         self.observe_causal_timing(&observed, record.hook_ts_ns);
+        let contexts: Vec<_> = self
+            .loader_registry
+            .ids_for_view(view_id)
+            .into_iter()
+            .filter(|context| {
+                !self.loader_registry.is_tombstoned(*context)
+                    && self
+                        .loader_registry
+                        .context(*context)
+                        .is_some_and(|context| context.was_attached)
+            })
+            .collect();
+        let terminal_owner = self.terminal_journal.is_some_and(|journal| {
+            self.loader_registry
+                .context(journal.owner)
+                .is_some_and(|context| context.spec.view == view_id)
+        });
+        let mut dynamic_complete = terminal_owner || contexts.len() == 1;
+        let collected = (!terminal_owner && contexts.len() == 1)
+            .then(|| contexts[0])
+            .and_then(|context| {
+                let object = candidate.pinned.id_for_scanned(
+                    &observed_module,
+                    observed_module.key,
+                    &observed_module.path,
+                )?;
+                let snapshot = ElfSnapshot::read(candidate.pinned.file_for(object)?).ok()?;
+                let mut module = observed_module.clone();
+                module.exports = self
+                    .hooks
+                    .names()
+                    .into_iter()
+                    .filter(|name| {
+                        snapshot
+                            .defined_symbol(name)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|fact| snapshot.is_executable_offset(fact.file_offset))
+                    })
+                    .map(str::to_owned)
+                    .collect();
+                (!module.exports.is_empty()).then(|| {
+                    self.collect_dynamic_export_work(
+                        context,
+                        std::slice::from_ref(&module),
+                        &candidate,
+                        session,
+                        false,
+                        &[],
+                    )
+                })
+            });
+        if collected.is_none() && !terminal_owner {
+            dynamic_complete = false;
+            self.mark_partial(
+                "live export hook",
+                "an exact export record had no unique attached loader context or pinned ELF exports",
+            );
+        }
         let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
         self.record_apply_timing(&outcome);
         self.queue_apply_outcome(&outcome, pending_views);
+        if outcome.accepted() {
+            if let Some(collected) = &collected {
+                let (retire, complete) = self.attach_export_work(
+                    view_id,
+                    &collected.dynamic,
+                    session,
+                    additions_allowed,
+                );
+                dynamic_complete &= complete;
+                if retire {
+                    self.queue_stale_views(&[view_id].into_iter().collect(), pending_views);
+                }
+            }
+        } else if let Some(collected) = &collected {
+            lose_unperformed_dynamic_work(&mut self.timings, &collected.dynamic);
+        }
         Ok(DiscoveryRecordOutcome::applied(
             outcome.changed,
-            outcome.required_complete(),
+            outcome.required_complete() && dynamic_complete,
         ))
     }
 
@@ -8506,6 +8582,8 @@ pub(crate) mod session_fixture {
         pub(crate) attached_slots: Vec<usize>,
         /// Dynamic exports requested by the Engine, in order.
         pub(crate) dynamic_attach_calls: Vec<DynamicExportIdentity>,
+        /// Owning loader context for each dynamic export request, in order.
+        pub(crate) dynamic_attach_contexts: Vec<LoaderContextId>,
         /// Killed and reaped from inside `attach_targets`, i.e. exactly between
         /// a generation precheck and its postcheck.
         kill_on_attach: Option<u32>,
@@ -8668,13 +8746,14 @@ pub(crate) mod session_fixture {
 
         fn attach_dynamic_export(
             &mut self,
-            _: LoaderContextId,
+            context: LoaderContextId,
             _: u32,
             target: (PinnedObjectId, u64),
             cookie: u64,
             abi: HookAbi,
             _: &PinnedObjects,
         ) -> Result<(bool, Option<u64>)> {
+            self.dynamic_attach_contexts.push(context);
             self.dynamic_attach_calls.push(DynamicExportIdentity {
                 object: target.0,
                 file_offset: target.1,
@@ -11827,13 +11906,7 @@ mod tests {
         ScannedModule,
         PinnedObjects,
     ) {
-        let dir = tempfile::tempdir().unwrap();
-        let library = dir.path().join("seed-provider.so");
-        let source = dir.path().join("seed-provider.c");
-        let runner_source = dir.path().join("seed-runner.c");
-        let runner = dir.path().join("seed-runner");
-        std::fs::write(
-            &source,
+        loaded_provider(
             r#"
 #include <stddef.h>
 __attribute__((visibility("default"), noinline))
@@ -11843,7 +11916,54 @@ int C_GetFunctionList(void **out) {
 }
 "#,
         )
-        .unwrap();
+    }
+
+    fn loaded_sibling_provider() -> (
+        LoadedSeedProvider,
+        ProcessView,
+        ScannedModule,
+        PinnedObjects,
+    ) {
+        loaded_provider(
+            r#"
+#include <stddef.h>
+__attribute__((visibility("default"), noinline))
+int C_GetFunctionList(void **out) {
+    if (out != NULL) *out = NULL;
+    return 0;
+}
+__attribute__((visibility("default"), noinline))
+int C_GetInterfaceList(void *out, unsigned long *count) {
+    if (out != NULL) *(void **)out = NULL;
+    if (count != NULL) *count = 0;
+    return 0;
+}
+__attribute__((visibility("default"), noinline))
+int C_GetInterface(const char *name, void *version, void **out, unsigned long flags) {
+    (void)name;
+    (void)version;
+    (void)flags;
+    if (out != NULL) *out = NULL;
+    return 0;
+}
+"#,
+        )
+    }
+
+    fn loaded_provider(
+        provider_source: &str,
+    ) -> (
+        LoadedSeedProvider,
+        ProcessView,
+        ScannedModule,
+        PinnedObjects,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("seed-provider.so");
+        let source = dir.path().join("seed-provider.c");
+        let runner_source = dir.path().join("seed-runner.c");
+        let runner = dir.path().join("seed-runner");
+        std::fs::write(&source, provider_source).unwrap();
         assert!(
             std::process::Command::new("gcc")
                 .args(["-shared", "-fPIC", "-o"])
@@ -11909,6 +12029,96 @@ int main(int argc, char **argv) {
         module.exports = vec!["C_GetFunctionList".into()];
         let pins = pin_test_module(&view, &module);
         (fixture, view, module, pins)
+    }
+
+    fn armed_sibling_export_route() -> (
+        LoadedSeedProvider,
+        Engine,
+        LoaderContextId,
+        DiscoveryRecord,
+        ScriptedSession,
+    ) {
+        let (fixture, view, module, _pins) = loaded_sibling_provider();
+        let pid = view.pid();
+        let mut engine = Engine::empty();
+        engine.scope = Scope::Pid(pid);
+        engine.next_view_id = 1;
+        engine.views.push(view);
+        let mut session = ScriptedSession::default();
+        engine
+            .arm_loader_or_partial(
+                0,
+                &mut session,
+                &mut true,
+                &mut PendingViewRetirements::new(),
+            )
+            .unwrap();
+        let context = engine.loader_registry.ids_for_view(ProcessViewId(0))[0];
+
+        let maps = parse_maps(&std::fs::read(format!("/proc/{pid}/maps")).unwrap()).unwrap();
+        let table_mapping = maps
+            .iter()
+            .find(|mapping| {
+                ObjectKey::of(mapping) == module.key
+                    && mapping.permissions[0] == b'r'
+                    && mapping.permissions[2] != b'x'
+            })
+            .expect("the sibling provider has a readable data mapping");
+        let code_mapping = maps
+            .iter()
+            .find(|mapping| ObjectKey::of(mapping) == module.key && mapping.permissions[2] == b'x')
+            .expect("the sibling provider has an executable mapping");
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+        record.symbol_id = engine.hooks.id("C_GetFunctionList").unwrap();
+        record.pid_tgid = u64::from(pid) << 32;
+        record.table_ptr = table_mapping.start;
+        record.pointers[0] = code_mapping.start;
+        record.pointers_attempted = 1;
+        record.completed_prefix = 1;
+        record.usable_n = 1;
+        record.version_major = 2;
+        record.version_minor = 40;
+        (fixture, engine, context, record, session)
+    }
+
+    /// Mutation caught: removing sibling collection/attachment leaves only the
+    /// exact C_GetFunctionList export linked during ordinary dispatch.
+    #[test]
+    fn exact_export_dispatch_collects_and_attaches_sibling_exports() {
+        let (_fixture, mut engine, context, record, mut session) = armed_sibling_export_route();
+
+        let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+
+        assert!(outcome.required_complete);
+        assert_eq!(session.dynamic_attach_contexts, [context; 3]);
+        assert_eq!(
+            session
+                .dynamic_attach_calls
+                .iter()
+                .map(|export| export.cookie)
+                .collect::<Vec<_>>(),
+            [1, 2, 3],
+            "exact export dispatch must attach C_GetFunctionList and its configured siblings"
+        );
+    }
+
+    #[test]
+    fn terminal_export_dispatch_does_not_reattach_or_create_a_false_loss() {
+        let (_fixture, mut engine, context, record, mut session) = armed_sibling_export_route();
+        let owned = engine
+            .begin_terminal_drain(context, Vec::new(), || Ok::<_, anyhow::Error>(vec![record]))
+            .unwrap()
+            .unwrap();
+        engine.retain_terminal_batch(owned, true, 0).unwrap();
+        let mut collect = Engine::collect_discovery_records;
+
+        let outcome = engine
+            .apply_discovery_batch_with(&mut session, Vec::new(), 0, true, true, &mut collect)
+            .unwrap();
+
+        assert!(outcome.required_complete);
+        assert!(session.dynamic_attach_calls.is_empty());
     }
 
     fn armed_seed_route(

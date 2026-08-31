@@ -5,10 +5,23 @@
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <link.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+struct mapped_query { const char *path; int found; };
+
+static int find_mapped(struct dl_phdr_info *info, size_t size, void *opaque)
+{
+    (void)size;
+    struct mapped_query *query = opaque;
+    if (info->dlpi_name && strcmp(info->dlpi_name, query->path) == 0)
+        query->found = 1;
+    return query->found;
+}
 
 typedef unsigned long CK_RV, CK_ULONG, CK_SLOT_ID, CK_SESSION_HANDLE;
 typedef struct { CK_ULONG mechanism; void *pParameter; CK_ULONG ulParameterLen; } CK_MECHANISM;
@@ -42,12 +55,24 @@ int main(int argc, char **argv)
         return 2;
     }
 
+    if (argc == 3) {
+        struct mapped_query query = { argv[1], 0 };
+        dl_iterate_phdr(find_mapped, &query);
+        fputs(query.found ? "HARNESS_PROVIDER_INITIAL_SET\n"
+                          : "HARNESS_PROVIDER_LATE_LOAD\n", stderr);
+        fflush(stderr);
+    }
+
     void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
+    if (argc == 3) {
+        fputs("HARNESS_PROVIDER_MAPPED\n", stderr);
+        fflush(stderr);
+    }
 
-    /* With a go-file the provider is mapped *before* the observer attaches, and
-     * not one PKCS#11 call has run yet: the manifest-free lane needs both, since
-     * this slice scans once at attach time. Waiting in the shell instead would
+    /* With a go-file the provider is mapped before the first PKCS#11 call, so
+     * the observer can complete a post-map discovery drain before work begins.
+     * Waiting in the shell instead would
      * leave nothing mapped to scan. Call counts are unchanged either way —
      * C_GetFunctionList below still runs after the wait. */
     if (argc == 3) {

@@ -20,8 +20,10 @@ import os
 from pathlib import Path
 import platform
 import re
+import runpy
 import struct
 import sys
+import tempfile
 
 work = sys.argv[1]
 REGISTERED = 0x250
@@ -49,12 +51,15 @@ POLICY_BOOLEAN_TYPES = (
     0x01, 0x02, 0x103, 0x104, 0x105, 0x106,
     0x107, 0x108, 0x10A, 0x10C, 0x162,
 )
-SAFE_MAPS = {
-    "ASYNC_FUNCTIONS", "CGROUP_FILTER", "CONFIG", "EVENTS", "EVIDENCE",
-    "MECH_SHAPE", "PID_FILTER", "RV_COUNTS", "DESCRIPTORS", "START",
-    "STATS",
-}
-FEATURE_MAPS = SAFE_MAPS | {"ATTR_BOOL_BITS", "TEMPLATE_TAIL"}
+# The owned-map inventory is read from the one checked-in BPF list rather than
+# frozen again here: a second copy went stale across Slice 1b-2 (11 names
+# against the observer's 15) and every map missing from it was a map this
+# matrix never scanned.
+BPF_MAP_DEFS = runpy.run_path(
+    "scripts/check-bpf-map-defs.py", run_name="canary_map_inventory"
+)
+SAFE_MAPS = set(BPF_MAP_DEFS["SAFE_MAPS"])
+FEATURE_MAPS = set(BPF_MAP_DEFS["UNSAFE_MAPS"])
 EXPECTED_SENTINEL_FAMILIES = {
     "PIN", "KEY", "LABEL", "ID", "PLAINTEXT", "IV", "AAD", "BOOLLONG",
     "USERNAME", "CIPHERTEXT", "SIGNATURE", "WRAPPED", "RANDOM", "OUTPUT",
@@ -98,6 +103,134 @@ FUNCTION_NONE = (1 << 32) - 1
 ARG_READ_FAILURE = 1 << 4
 CALL_START_SIZE = 272
 EVENT_SIZE = 288
+DISCOVERY_RECORD_SIZE = 896
+# Every owned ringbuf, with the exact record length its mmap oracle accepts.
+# Keyed by name only because a record layout is per-map; which maps are
+# ringbufs is decided by `type`, from the one checked-in BPF inventory.
+RING_RECORD_SIZES = {"EVENTS": EVENT_SIZE, "DISCOVERY": DISCOVERY_RECORD_SIZE}
+
+
+# Loader and pause identities the observer holds privately. None of them may
+# reach profile/metrics JSON, trace output, an observer or workload log,
+# private temporary output, or an observer-owned map value (design §9.3, §9.4).
+LOADER_PAUSE_IDENTITIES = {
+    "attach_cookie": 0x5C00_11E5_0000_0200,
+    "context_id": 0xFA,
+    "delta": -4096,
+    "absent_state_sentinel": 512,
+    "process_generation": 0x0000_0007_C0FF_EE01,
+    "child_pid": 4242424,
+    "child_tid": 4242425,
+    "r_debug_vaddr": 0x7FFF_F7FF_E180,
+    "hook_ip": 0x7FFF_F7FE_1B00,
+    "marker": 0xDEAD_BEEF_CAFE_F00D,
+    "loader_path": "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+    "loader_sha256": "ab" * 32,
+    "loader_build_id": "aabbccddeeff0011",
+    "interface_name_bytes": "PKCS 11",
+}
+# A narrow value's raw 64-bit word is the same byte run any zero-padded small
+# integer produces — `512` little-endian is indistinguishable from the padding
+# around a `2` in an adjacent map slot — so scanning for it would fire on every
+# clean dump and mask the leaks that matter. Narrow values are therefore
+# searched in the spellings a leak actually takes in text (JSON, trace, logs),
+# while wide distinctive values are searched raw as well; the checker's exact
+# key sets are what close the structural case.
+DISTINCTIVE_FLOOR = 1 << 20
+
+
+def identity_patterns(values):
+    patterns = []
+    for value in values:
+        if isinstance(value, str):
+            patterns.append(value.encode())
+            continue
+        word = value & ((1 << 64) - 1)
+        patterns.append(f"0x{word:x}".encode())
+        patterns.append(f"0x{word:016x}".encode())
+        if abs(value) >= DISTINCTIVE_FLOOR:
+            patterns.append(str(value).encode())
+            patterns.append(struct.pack("<Q", word))
+            patterns.append(struct.pack(">Q", word))
+    return patterns
+
+
+def assert_no_loader_pause_identity(label, data, values=None):
+    values = list(LOADER_PAUSE_IDENTITIES.values()) if values is None else values
+    if isinstance(data, str):
+        data = data.encode()
+    for pattern in identity_patterns(values):
+        assert pattern not in data, f"{label} published loader/pause identity {pattern!r}"
+
+
+# The published loader/pause field names, mirroring
+# `scripts/check-capture-evidence.py`. Anything else in that namespace is an
+# identity the capture document may not carry, wherever it appears.
+PUBLISHED_LOADER_PAUSE_FIELDS = {
+    "attach_gap_ms", "pause", "pause_attempts", "pause_confirmed",
+    "pause_partial", "loader_discovery", "child_still_running",
+}
+IDENTITY_PREFIXES = ("pause", "loader", "child", "attach_gap")
+IDENTITY_SUFFIXES = ("_pid", "_tid", "_tids", "_tasks", "_task_set")
+STRING_IDENTITIES = [value for value in LOADER_PAUSE_IDENTITIES.values()
+                     if isinstance(value, str)]
+# A workload's own stderr legitimately names the interface it went looking for
+# ("no exact PKCS 11 v3.2 table"). The prohibition binds what the *observer*
+# publishes, so the target's own log is scanned for every identity except that
+# one; every observer surface is scanned for all of them.
+WORKLOAD_IDENTITIES = [value for name, value in LOADER_PAUSE_IDENTITIES.items()
+                       if name != "interface_name_bytes"]
+# `HH:MM:SS.ffffff pid P tid T [sess#N] FUNCTION[ MECHANISM] → CKR_x DURATION`
+# (src/trace.rs). The two identity positions are captured so they can be
+# removed structurally rather than by exempting the whole surface.
+TRACE_EVENT = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{6} pid \d+ tid \d+ (?P<rest>.*)$")
+
+
+def assert_json_identity_structure(label, value, path="$"):
+    """Structural field check for a capture document.
+
+    Keys are checked against the closed loader/pause namespace and strings
+    against the loader path/digest/build-id/interface-name spellings. Numbers
+    are deliberately not byte-scanned here: `rv_counts` keys, mechanism ids and
+    latency totals are allowlisted arbitrary values whose spellings collide
+    with a narrow private constant in a clean document, which is the false
+    trigger the plan forbids. The checker's exact key sets and u64 ranges close
+    the numeric case structurally instead.
+    """
+    if isinstance(value, dict):
+        for key, item in value.items():
+            published = (
+                key in PUBLISHED_LOADER_PAUSE_FIELDS
+                or not (key.startswith(IDENTITY_PREFIXES)
+                        or key.endswith(IDENTITY_SUFFIXES))
+            )
+            assert published, f"{label} publishes loader/pause identity {path}.{key}"
+            assert_json_identity_structure(label, item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            assert_json_identity_structure(label, item, f"{path}[{index}]")
+    elif isinstance(value, str):
+        assert_no_loader_pause_identity(f"{label} {path}", value, STRING_IDENTITIES)
+
+
+def trace_scannable(label, text):
+    """A trace with only its allowlisted call-event identity positions removed.
+
+    `pid`/`tid` are published output for an ordinary call event, and only
+    there. Scanning the whole surface would fire on a legitimate field;
+    exempting the whole surface would mask a leak elsewhere in the same file.
+    Every line must match one of the frozen shapes, so an unfrozen line cannot
+    smuggle an identity past either.
+    """
+    kept = []
+    for line in text.splitlines():
+        if not line or line.startswith(("CAPTURE ", "EVIDENCE ", "LOST ")):
+            kept.append(line)
+            continue
+        event = TRACE_EVENT.match(line)
+        assert event, f"{label} rendered an unfrozen trace line: {line!r}"
+        kept.append(event.group("rest"))
+    return "\n".join(kept)
 
 
 def profile_terminal(doc, schema="pkcs11-scope/observed-profile/v2"):
@@ -258,7 +391,10 @@ def assert_scan_only_hostile_output(doc, text, hostile):
     }], doc["capture"]
     assert doc["functions"] == [{
         "names": ["C_OpenSession"], "aliased": False, "module": module,
-        "module_ambiguous": False, "calls": 25, "errors": 3,
+        # The owner relation is exclusive: an owned cell states both reasons
+        # false, so a leaked owner key cannot hide behind a missing field.
+        "module_ambiguous": False, "module_unresolved": False,
+        "calls": 25, "errors": 3,
         "pending_returns": 5, "in_flight": 0,
         "latency_ns": {
             "approximate": True, "p50": 64, "p95": 64, "p99": 64,
@@ -466,7 +602,13 @@ def assert_fault_starts(manifest, workload_pid):
     assert_fault_records(starts, value_total(cells[0].get("values", [])))
 
 
-def parse_ring_records(data, capacity, consumer_pos, producer_pos):
+def ring_raw_path(prefix, name):
+    """Where a ringbuf's mmap-oracled records land for the privacy scan."""
+    return Path(f"{prefix}.{name}.raw")
+
+
+def parse_ring_records(data, capacity, consumer_pos, producer_pos,
+                       record_length=EVENT_SIZE):
     assert capacity >= mmap.PAGESIZE and capacity & (capacity - 1) == 0
     assert capacity % mmap.PAGESIZE == 0 and len(data) == 2 * capacity
     assert producer_pos >= consumer_pos, "ring position wrap cannot be proved"
@@ -479,18 +621,18 @@ def parse_ring_records(data, capacity, consumer_pos, producer_pos):
         assert not header & (1 << 31), "BUSY ring record"
         assert not header & (1 << 30), "discarded ring record"
         length = header & ((1 << 30) - 1)
-        assert length == EVENT_SIZE, f"ring record size {length}, expected {EVENT_SIZE}"
+        assert length == record_length, f"ring record size {length}, expected {record_length}"
         record_size = (8 + length + 7) & ~7
-        assert record_size == 296 and position + record_size <= producer_pos
+        assert position + record_size <= producer_pos
         records.append(bytes(data[offset + 8:offset + 8 + length]))
         position += record_size
     assert position == producer_pos
     return records
 
 
-def ring_records(manifest):
+def ring_records(manifest, name="EVENTS"):
     assert platform.machine() == "x86_64", "raw ring oracle requires Linux x86-64"
-    item = manifest_map(manifest, "EVENTS")
+    item = manifest_map(manifest, name)
     assert item["oracle"] == "mmap" and "file" not in item, item
     assert item["type"] == "ringbuf" and item["key_size"] == item["value_size"] == 0, item
     map_id, capacity = item["id"], item["max_entries"]
@@ -499,13 +641,14 @@ def ring_records(manifest):
     fd = libc.syscall(321, 14, ctypes.byref(attr), ctypes.sizeof(attr))
     if fd < 0:
         error = ctypes.get_errno()
-        raise OSError(error, f"BPF_MAP_GET_FD_BY_ID for EVENTS id {map_id}")
+        raise OSError(error, f"BPF_MAP_GET_FD_BY_ID for {name} id {map_id}")
     page = mmap.PAGESIZE
     consumer = mmap.mmap(fd, page, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ, offset=0)
     producer = mmap.mmap(fd, page + 2 * capacity, flags=mmap.MAP_SHARED,
                          prot=mmap.PROT_READ, offset=page)
     before = (u64(consumer, 0), u64(producer, 0))
-    records = parse_ring_records(producer[page:], capacity, *before)
+    records = parse_ring_records(producer[page:], capacity, *before,
+                                 RING_RECORD_SIZES[name])
     after = (u64(consumer, 0), u64(producer, 0))
     producer.close()
     consumer.close()
@@ -558,24 +701,61 @@ def assert_event_records(raw_records, lane, workload_pid):
                 event["attr_seen"]) == (1, 1, 0, 0), event
 
 
-def assert_raw_events(manifest, lane, workload_pid, output):
-    raw_records = ring_records(manifest)
-    assert_event_records(raw_records, lane, workload_pid)
-    Path(output).write_bytes(b"".join(raw_records))
+def assert_raw_records(manifest, lane, workload_pid, prefix):
+    """Reads every owned ringbuf through the mmap oracle and keeps its bytes.
+
+    `EVENTS` additionally gets its frozen per-call policy oracle; the rest are
+    kept for the matrix scan, which is what makes a ringbuf a scanned privacy
+    surface rather than a map the dump loop silently walked past.
+    """
+    read = set()
+    for item in read_json(manifest):
+        if item["type"] != "ringbuf":
+            continue
+        records = ring_records(manifest, item["name"])
+        if item["name"] == "EVENTS":
+            assert_event_records(records, lane, workload_pid)
+        ring_raw_path(prefix, item["name"]).write_bytes(b"".join(records))
+        read.add(item["name"])
+    assert read == set(RING_RECORD_SIZES), f"{lane}: owned ringbufs {read} were not all read"
+
+
+def owned_map_surfaces(label, manifest, expected, prefix):
+    """Every owned map paired with the file the privacy scan reads it from.
+
+    Dispatch is by map *type*, never by name: a ringbuf has no key/value
+    iteration, so `bpftool map dump` cannot read it at all and it is read
+    through the mmap oracle instead, landing as its raw records; every other
+    map is read as its `bpftool` dump. A map with no surface on disk is a
+    failure, never a skip — an unscanned owned map is exactly the privacy hole
+    this gate exists to close.
+    """
+    names = {item["name"] for item in manifest}
+    assert names == expected, f"{label}: map inventory {names} != {expected}"
+    ids = [item['id'] for item in manifest]
+    assert all(isinstance(map_id, int) and map_id > 0 for map_id in ids), ids
+    assert len(ids) == len(set(ids)), f"{label}: duplicate observer-owned map ids {ids}"
+    surfaces = []
+    for item in manifest:
+        if item["type"] == "ringbuf":
+            assert item["oracle"] == "mmap" and "file" not in item, item
+            assert item["key_size"] == item["value_size"] == 0, item
+            path = ring_raw_path(prefix, item["name"])
+        else:
+            assert item["oracle"] == "dump", item
+            path = Path(item["file"])
+        assert path.is_file(), f"{label}: {item['name']} has no scanned surface {path}"
+        surfaces.append(path)
+    return surfaces
 
 
 def assert_exact_owned_map_inventory(lane, expected):
-    manifest = read_json(f"{work}/mapdump_manifest_{lane}.json")
-    names = {item["name"] for item in manifest}
-    assert names == expected, f"{lane}: map inventory {names} != {expected}"
-    ids = [item['id'] for item in manifest]
-    assert all(isinstance(map_id, int) and map_id > 0 for map_id in ids), ids
-    assert len(ids) == len(set(ids)), f"{lane}: duplicate observer-owned map ids {ids}"
-    for item in manifest:
-        if item["name"] == "EVENTS":
-            assert item["oracle"] == "mmap" and "file" not in item, item
-        else:
-            assert item["oracle"] == "dump" and Path(item["file"]).is_file(), item
+    return owned_map_surfaces(
+        lane,
+        read_json(f"{work}/mapdump_manifest_{lane}.json"),
+        expected,
+        f"{work}/{lane}",
+    )
 
 
 def alias_hits(content, reconstructed=b""):
@@ -603,7 +783,7 @@ def positive_control_content(value=None):
 
 
 if work == "--raw-events":
-    assert_raw_events(sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5])
+    assert_raw_records(sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5])
     raise SystemExit
 if work == "--hostile-starts":
     assert_hostile_starts(sys.argv[2], sys.argv[3], int(sys.argv[4]))
@@ -785,7 +965,8 @@ if work == "--self-test":
         },
         "functions": [{
             "names": ["C_OpenSession"], "aliased": False, "module": scan_module,
-            "module_ambiguous": False, "calls": 25, "errors": 3,
+            "module_ambiguous": False, "module_unresolved": False,
+            "calls": 25, "errors": 3,
             "pending_returns": 5, "in_flight": 0,
             "latency_ns": {
                 "approximate": True, "p50": 64, "p95": 64, "p99": 64,
@@ -825,6 +1006,21 @@ if work == "--self-test":
         scan_trace.replace("CKR_PENDING", "CKR_PENDING " + hostile[0]),
         hostile,
     ))
+    # The owner relation is part of that exact shape: an owned cell may not be
+    # relabelled unowned or ambiguous, and it may not drop the boolean either.
+    for label, mutate in (
+        ("scan-only owned cell relabelled unowned",
+         lambda d: d["functions"][0].update(module=None, module_unresolved=True)),
+        ("scan-only owned cell relabelled ambiguous",
+         lambda d: d["functions"][0].update(module=None, module_ambiguous=True)),
+        ("scan-only owner relation dropped",
+         lambda d: d["functions"][0].pop("module_unresolved")),
+    ):
+        mutated = json.loads(json.dumps(scan_only))
+        mutate(mutated)
+        reject(label, lambda m=mutated: assert_scan_only_hostile_output(
+            m, scan_trace, hostile
+        ))
     print("scan-only hostile output contract: OK")
 
     for family, sentinel in sorted(fixture_sentinels().items()):
@@ -1013,6 +1209,229 @@ if work == "--self-test":
             mutated, "feature-unsafe-profile", 0x555
         ))
     print("unsafe raw template oracle self-test: OK")
+
+    # Loader/pause identity scan. The positive control comes first: every
+    # spelling of every private value is found when it is deliberately placed
+    # in each scanned surface, so the clean result below is a real absence and
+    # not a scanner that matches nothing.
+    surfaces = ("profile json", "trace output", "observer log",
+                "private temp output", "owned map value")
+    for name, value in LOADER_PAUSE_IDENTITIES.items():
+        for pattern in identity_patterns([value]):
+            for surface in surfaces:
+                reject(
+                    f"{surface} {name}",
+                    lambda s=surface, p=pattern: assert_no_loader_pause_identity(
+                        s, b"leading" + p + b"trailing"
+                    ),
+                )
+    clean_document = {
+        "capture": {"modules": [{"path": "/opt/p11.so", "dev": [8, 1], "ino": 42,
+                                 "sha256": "11" * 32, "build_id": "aabb"}]},
+        "evidence": {
+            "attach_gap_ms": 7, "pause": "partial", "pause_attempts": 2,
+            "pause_confirmed": 1, "pause_partial": 1,
+            "discovery_ring_loss": 0, "discovery_state_failures": 0,
+            "discovery_read_failures": 0, "discovery_truncated": 0,
+            "loader_discovery": {
+                # Two exact bound contexts: one ordinary `dlopen`, and the
+                # owned run's one pre-exec initial-set context.
+                "strategies": {"debug_state_every_hit": 2, "dlopen_return": 0,
+                               "unavailable": 0},
+                "dlopen_timing": {"qualified_pre_constructor": 0,
+                                  "known_pre_relocation": 0, "unproven": 1,
+                                  "none": 0},
+                "initial_set_timing": {"qualified_pre_constructor": 0,
+                                       "known_pre_relocation": 0, "unproven": 1,
+                                       "none": 0},
+                "initial_set_capture": {"eligible": 0, "none": 1},
+                "hits": 4, "state_read_failures": 0,
+            },
+        },
+        "functions": [{
+            "names": ["C_Sign"], "aliased": False,
+            "module": {"dev": [8, 1], "ino": 42, "sha256": "11" * 32},
+            "module_ambiguous": False, "module_unresolved": False,
+            "rv_counts": {"0x0000000000000200": 3, "0x00000000000000fa": 1},
+        }],
+    }
+    clean_aggregate = json.dumps(clean_document["evidence"])
+    assert_no_loader_pause_identity("profile evidence", clean_aggregate)
+    assert_no_loader_pause_identity(
+        "trace output",
+        "CAPTURE privacy=allowlisted\nC_Sign 0x0 sess#1 1.2ms\nEVIDENCE "
+        + clean_aggregate,
+    )
+    assert_no_loader_pause_identity(
+        "owned map value", struct.pack("<QQ", 1, 0) + struct.pack("<QQ", 2, 0)
+    )
+    print("loader/pause identity scanner self-test: OK")
+
+    # Structural field checks. A published capture document carries the finite
+    # loader/pause fields and nothing else from that namespace, at any depth —
+    # and a legitimate allowlisted value whose spelling looks like a narrow
+    # private constant (an `rv_counts` key of `0x…0200` or `0x…00fa`) must not
+    # be mistaken for one.
+    assert_json_identity_structure("clean profile json", clean_document)
+    for label, mutate in (
+        # The document as a whole is checked structurally, never byte-scanned:
+        # this clean one carries `rv_counts` keys spelling `0x…0200` and
+        # `0x…00fa`, which are allowlisted full-width return codes and also the
+        # text spelling of two narrow private constants.
+        ("evidence loader path", lambda d: d["evidence"].update(
+            loader="/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2")),
+        ("evidence child pid", lambda d: d["evidence"].update(child_pid=4242424)),
+        ("nested pause identity", lambda d: d["evidence"]["loader_discovery"].update(
+            pause_tasks=[4242424, 4242425])),
+        ("function row owner key", lambda d: d["functions"][0].update(loader_context=3)),
+        ("module ref process identity", lambda d: d["functions"][0]["module"].update(
+            owner_tid=4242425)),
+        ("capture module interface bytes", lambda d: d["capture"]["modules"][0].update(
+            path="PKCS 11")),
+        ("discovered loader digest", lambda d: d["evidence"].update(
+            discovery=[{"path": "/opt/p11.so", "sha256": "ab" * 32}])),
+    ):
+        mutated = json.loads(json.dumps(clean_document))
+        mutate(mutated)
+        reject(label, lambda m=mutated: assert_json_identity_structure("profile json", m))
+
+    # The trace's two allowlisted identity positions are removed by shape, so a
+    # real PID that collides with a private constant cannot fire, while an
+    # identity anywhere else on the same line — or on an unfrozen line — still
+    # does.
+    allowlisted_trace = (
+        "CAPTURE privacy=allowlisted\n"
+        f"00:00:00.000000 pid {LOADER_PAUSE_IDENTITIES['child_pid']} "
+        f"tid {LOADER_PAUSE_IDENTITIES['child_tid']} C_Sign → CKR_OK 100ns\n"
+        "LOST 2 events\nEVIDENCE " + clean_aggregate
+    )
+    assert_no_loader_pause_identity(
+        "trace output", trace_scannable("trace output", allowlisted_trace)
+    )
+    for label, line in (
+        ("trace session identity", "00:00:00.000000 pid 100 tid 1 C_Sign "
+                                   f"sess#{LOADER_PAUSE_IDENTITIES['marker']} → CKR_OK 100ns"),
+        ("unfrozen trace line", "loader /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"),
+    ):
+        reject(label, lambda line=line: assert_no_loader_pause_identity(
+            "trace output",
+            trace_scannable("trace output", f"CAPTURE privacy=allowlisted\n{line}"),
+        ))
+
+    # The workload-log exemption is exactly one value wide: the target's own
+    # stderr may name the interface it looked for, and nothing else.
+    assert_no_loader_pause_identity(
+        "workload log", b"no exact PKCS 11 v3.2 table\n", WORKLOAD_IDENTITIES
+    )
+    reject("observer log interface bytes", lambda: assert_no_loader_pause_identity(
+        "observer log", b"no exact PKCS 11 v3.2 table\n"
+    ))
+    for label, leaked in (
+        ("workload log loader path", LOADER_PAUSE_IDENTITIES["loader_path"]),
+        ("workload log child pid", str(LOADER_PAUSE_IDENTITIES["child_pid"])),
+    ):
+        reject(label, lambda leaked=leaked: assert_no_loader_pause_identity(
+            "workload log", f"leading{leaked}trailing".encode(), WORKLOAD_IDENTITIES
+        ))
+    print("loader/pause structural field checks: OK")
+
+    # ------------------------------------------------------------------
+    # Owned-map inventory and scan surfaces. The inventory comes from the one
+    # checked-in BPF list, the dispatch from each map's `type`, and every owned
+    # map must end up with a file the matrix scan actually reads.
+    # ------------------------------------------------------------------
+    RINGBUF = 27
+    assert set(RING_RECORD_SIZES) == {
+        name for name, definition in BPF_MAP_DEFS["UNSAFE_MAPS"].items()
+        if definition["type"] == RINGBUF
+    }, "a new owned ringbuf needs its exact record length here"
+    assert len(SAFE_MAPS) == 15 and len(FEATURE_MAPS) == 17, (SAFE_MAPS, FEATURE_MAPS)
+    assert {"COUNTERS", "DISCOVERY", "DISCOVERY_STATE", "PAUSE_PIDS"} <= SAFE_MAPS
+    assert FEATURE_MAPS - SAFE_MAPS == {"ATTR_BOOL_BITS", "TEMPLATE_TAIL"}
+
+    with tempfile.TemporaryDirectory() as scan_dir:
+        prefix = f"{scan_dir}/default-safe-profile"
+
+        def owned_manifest():
+            manifest = []
+            for map_id, (name, definition) in enumerate(
+                sorted(BPF_MAP_DEFS["SAFE_MAPS"].items()), start=1
+            ):
+                ring = definition["type"] == RINGBUF
+                item = {
+                    "name": name, "id": map_id, "max_entries": definition["max_entries"],
+                    "key_size": definition["key_size"] if not ring else 0,
+                    "value_size": definition["value_size"] if not ring else 0,
+                    "type": "ringbuf" if ring else "hash",
+                    "oracle": "mmap" if ring else "dump",
+                }
+                if not ring:
+                    item["file"] = f"{scan_dir}/mapdump_{name}_lane.json"
+                manifest.append(item)
+            return manifest
+
+        def write_surfaces(manifest, planted=None):
+            for item in manifest:
+                if item["type"] == "ringbuf":
+                    payload = planted if planted and item["name"] == planted[0] else (b"", b"")
+                    ring_raw_path(prefix, item["name"]).write_bytes(bytes(64) + payload[1])
+                else:
+                    content = (positive_control_content(planted[1])
+                               if planted and item["name"] == planted[0]
+                               else b"[]\n")
+                    Path(item["file"]).write_bytes(content)
+
+        manifest = owned_manifest()
+        write_surfaces(manifest)
+        surfaces = owned_map_surfaces("lane", manifest, SAFE_MAPS, prefix)
+        assert len(surfaces) == 15 and all(path.is_file() for path in surfaces), surfaces
+        assert {path.name for path in surfaces} >= {
+            f"default-safe-profile.{name}.raw" for name in RING_RECORD_SIZES
+        }, surfaces
+        print("owned map inventory routes every map by type: OK")
+
+        for label, mutate in (
+            # The frozen name-keyed dispatch: every ringbuf that is not EVENTS
+            # was required to be a `bpftool map dump`, which cannot read one.
+            ("ringbuf dumped", lambda m: m[[i["name"] for i in m].index("DISCOVERY")].update(
+                oracle="dump", type="hash", file=f"{scan_dir}/mapdump_DISCOVERY_lane.json")),
+            ("non-ringbuf mmapped", lambda m: [
+                i.update(oracle="mmap") or i.pop("file") for i in m
+                if i["name"] == "DISCOVERY_STATE"]),
+            ("stale inventory", lambda m: m.pop([i["name"] for i in m].index("PAUSE_PIDS"))),
+            ("duplicate map ids", lambda m: m[1].update(id=m[0]["id"])),
+            # A surface that is not on disk is an unscanned owned map.
+            ("dump surface missing", lambda m: [
+                i.update(file=f"{scan_dir}/absent.json") for i in m
+                if i["name"] == "COUNTERS"]),
+            ("ring surface missing",
+             lambda m: ring_raw_path(prefix, "DISCOVERY").unlink()),
+        ):
+            mutated = json.loads(json.dumps(manifest))
+            mutate(mutated)
+            reject(label, lambda mutated=mutated:
+                   owned_map_surfaces("lane", mutated, SAFE_MAPS, prefix))
+        print("owned map surface mutations are all rejected: OK")
+
+        # Each Slice 1b-2 map is a scan surface in its own right: a canary
+        # planted in it must be found by the same reader the matrix uses.
+        write_surfaces(manifest)
+        for name in ("COUNTERS", "DISCOVERY", "DISCOVERY_STATE", "PAUSE_PIDS"):
+            planted = json.loads(json.dumps(manifest))
+            write_surfaces(planted, (name, SENTINELS["PIN"]))
+            found = {}
+            for path in owned_map_surfaces("lane", planted, SAFE_MAPS, prefix):
+                content = path.read_bytes()
+                hits = sentinel_hits(
+                    content, reconstruct(content) if path.suffix == ".json" else b""
+                )
+                if hits:
+                    found[path.name] = sorted(hits)
+            assert list(found.values()) == [["PIN"]], (name, found)
+            assert name in next(iter(found)), (name, found)
+            write_surfaces(manifest)
+        print("every Slice 1b-2 map is a scanned canary surface: OK")
+
     print("canary lane assertion self-test: OK")
     raise SystemExit
 
@@ -1039,8 +1458,10 @@ lanes = {
     "feature-unsafe-profile": FEATURE_MAPS, "feature-unsafe-trace": FEATURE_MAPS,
     "aggregate-only-metrics": SAFE_MAPS,
 }
-for lane, expected in lanes.items():
-    assert_exact_owned_map_inventory(lane, expected)
+lane_surfaces = {
+    lane: assert_exact_owned_map_inventory(lane, expected)
+    for lane, expected in lanes.items()
+}
 for lane in ["feature-safe-profile", "feature-safe-trace"]:
     assert read_json(f"{work}/mapdump_ATTR_BOOL_BITS_{lane}.json") == []
     assert read_json(f"{work}/mapdump_TEMPLATE_TAIL_{lane}.json") == []
@@ -1064,14 +1485,45 @@ print(f"positive control OK: scanner found PIN in {control}")
 
 artifacts = []
 for lane in lanes:
-    suffixes = ("output", "observer.log", "workload.log")
-    if lane != "aggregate-only-metrics":
-        suffixes += ("events.raw",)
-    artifacts.extend(Path(work) / f"{lane}.{suffix}" for suffix in suffixes)
+    artifacts.extend(Path(work) / f"{lane}.{suffix}" for suffix in
+                     ("output", "observer.log", "workload.log"))
+    # Every map the observer owns, as its own type says it must be read: the
+    # dump files plus the raw records the mmap oracle pulled out of each
+    # ringbuf. `owned_map_surfaces` already refused to return a missing one.
+    artifacts.extend(lane_surfaces[lane])
 artifacts.extend(Path(work).glob("mapdump_*.json"))
 for lane in ("default-safe-start", "feature-safe-start", "feature-unsafe-fault"):
     artifacts.extend(Path(work) / f"{lane}.{suffix}" for suffix in
                      ("output", "observer.log", "workload.log"))
+artifacts = list(dict.fromkeys(artifacts))
+# Loader and pause identities, over every artifact surface: the capture
+# documents, the trace streams, the observer/workload logs, the raw event
+# dumps, and every map owned by the exact observer map ids (including the
+# published copy of the private temporary START dump). Each surface is scanned
+# the way a leak into it would actually look: a capture document structurally,
+# because its allowlisted `rv_counts`/mechanism values legitimately spell
+# narrow private constants; a trace with its two allowlisted call-event
+# identity positions removed by shape, so a real PID cannot fire the scan and
+# an identity anywhere else on the line still does; a map dump as the bytes it
+# encodes, never as its `0x..` token text, whose two-hex-digit runs would match
+# a narrow spelling in every clean dump.
+for path in artifacts:
+    content = path.read_bytes()
+    if path.suffix == ".output":
+        rendered = content.decode("utf-8", "surrogateescape")
+        if rendered.lstrip().startswith("{"):
+            assert_json_identity_structure(str(path), json.loads(rendered))
+        else:
+            assert_no_loader_pause_identity(
+                str(path), trace_scannable(str(path), rendered)
+            )
+    elif path.suffix == ".json":
+        assert_no_loader_pause_identity(str(path), reconstruct(content))
+    elif path.name.endswith(".workload.log"):
+        assert_no_loader_pause_identity(str(path), content, WORKLOAD_IDENTITIES)
+    else:
+        assert_no_loader_pause_identity(str(path), content)
+
 leaks = {}
 for path in artifacts:
     content = path.read_bytes()
@@ -1086,10 +1538,8 @@ safe_lanes = (set(lanes) - {"feature-unsafe-profile", "feature-unsafe-trace"}) |
 for lane in safe_lanes:
     paths = [Path(work) / f"{lane}.{suffix}" for suffix in
              ("output", "observer.log", "workload.log")]
-    raw = Path(work) / f"{lane}.events.raw"
-    if raw.exists():
-        paths.append(raw)
-    paths.extend(Path(work).glob(f"mapdump_*_{lane}.json"))
+    paths.extend(lane_surfaces[lane] if lane in lane_surfaces
+                 else Path(work).glob(f"mapdump_*_{lane}.json"))
     for path in paths:
         content = path.read_bytes()
         reconstructed = reconstruct(content) if path.suffix == ".json" else b""
@@ -1229,7 +1679,7 @@ run_lane() {
     echo "=== $lane ($build $kind) ==="
     rm -f "$WORK/$lane.ready" "$WORK/$lane.go" "$WORK/$lane.output" \
         "$WORK/$lane.observer.log" "$WORK/$lane.workload.log" \
-        "$WORK/$lane.events.raw" \
+        "$WORK/$lane".*.raw \
         "$WORK"/mapdump_*_"$lane".json "$WORK/mapdump_manifest_$lane.json"
     "$WORK/canary_workload" "$PWD/$WORK/matrix-provider.so" matrix \
         "$PWD/$WORK/$lane.ready" "$PWD/$WORK/$lane.go" \
@@ -1271,9 +1721,9 @@ run_lane() {
     sudo python3 scripts/dump-owned-bpf-maps.py \
         "$OBSERVER_PID" "$WORK" "$lane" 0 16384
     assert_lanes --raw-events "$WORK/mapdump_manifest_$lane.json" "$lane" \
-        "$lane_workload_pid" "$WORK/$lane.events.raw"
+        "$lane_workload_pid" "$WORK/$lane"
     reclaim_root_output "$WORK"/mapdump_*_"$lane".json \
-        "$WORK/$lane.events.raw"
+        "$WORK/$lane".*.raw
     signal_verified_root_process CONT "$OBSERVER_PID" "$OBSERVER_STARTTIME"
     # sudo suspends itself when its command stops; resume it too or `wait`
     # below never returns (and the exited observer stays a zombie under it).
@@ -1293,9 +1743,6 @@ run_lane() {
     fi
     reclaim_root_output "$WORK/$lane.output"
     python3 scripts/check-capture-evidence.py canary "$lane" "$WORK/$lane.output"
-    # A metrics lane emits no per-call events; keep its empty raw dump out
-    # of the artifact set the matrix assertion scans.
-    [ "$kind" != metrics ] || rm -f "$WORK/$lane.events.raw"
 }
 
 echo "=== discover deterministic matrix providers ==="

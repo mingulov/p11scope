@@ -10,6 +10,102 @@
 set -eu
 cd "$(dirname "$0")/.."
 
+# The lane oracle, in one place. `--self-test` runs it over synthetic evidence
+# and requires every claimed field to refuse a mutation, unprivileged.
+assert_lane_evidence() {
+    python3 - "$@" <<'PY'
+import copy
+import json
+import sys
+
+
+def oracle(document, lane):
+    evidence = document["evidence"]
+    discovery = evidence["discovery"]
+    assert evidence["authority"] == "hash-pinned", evidence["authority"]
+    assert document["capture"]["modules"][0]["path"].endswith("libsofthsm2.so"), document["capture"]
+    if lane == "scan":
+        assert [m["sources"] for m in discovery] == [["scan"]], discovery
+        assert [m["corroborated"] for m in discovery] == [False], discovery
+        assert [m["corroboration"] for m in discovery] == [["single_source"]], discovery
+    else:
+        assert [m["sources"] for m in discovery] == [["scan", "manifest"]], discovery
+        assert [m["corroborated"] for m in discovery] == [True], discovery
+        assert [m["corroboration"] for m in discovery] == [["agreed"]], discovery
+        assert evidence["discovery_conflicts"] == 0, evidence["discovery_conflicts"]
+        assert evidence["discovery_uncorroborated"] == 0, evidence["discovery_uncorroborated"]
+
+
+def good(lane):
+    corroborated = lane != "scan"
+    return {
+        "evidence": {
+            "authority": "hash-pinned",
+            "discovery": [
+                {
+                    "sources": ["scan", "manifest"] if corroborated else ["scan"],
+                    "corroborated": corroborated,
+                    "corroboration": ["agreed"] if corroborated else ["single_source"],
+                }
+            ],
+            "discovery_conflicts": 0,
+            "discovery_uncorroborated": 0,
+        },
+        "capture": {"modules": [{"path": "/usr/lib/softhsm/libsofthsm2.so"}]},
+    }
+
+
+def mutate(document, path, value):
+    mutated = copy.deepcopy(document)
+    cursor = mutated
+    for key in path[:-1]:
+        cursor = cursor[key]
+    cursor[path[-1]] = value
+    return mutated
+
+
+if sys.argv[1] == "--self-test":
+    lanes = {
+        "scan": [
+            ("authority", ["evidence", "authority"], "unpinned"),
+            ("scan-only sources", ["evidence", "discovery", 0, "sources"], ["scan", "manifest"]),
+            ("uncorroborated flag", ["evidence", "discovery", 0, "corroborated"], True),
+            ("single-source label", ["evidence", "discovery", 0, "corroboration"], ["agreed"]),
+            ("captured module", ["capture", "modules", 0, "path"], "/tmp/other.so"),
+        ],
+        "manifest": [
+            ("authority", ["evidence", "authority"], "unpinned"),
+            ("corroborated sources", ["evidence", "discovery", 0, "sources"], ["scan"]),
+            ("corroborated flag", ["evidence", "discovery", 0, "corroborated"], False),
+            ("agreement label", ["evidence", "discovery", 0, "corroboration"], ["single_source"]),
+            ("discovery conflicts", ["evidence", "discovery_conflicts"], 1),
+            ("uncorroborated count", ["evidence", "discovery_uncorroborated"], 1),
+        ],
+    }
+    for lane, mutations in lanes.items():
+        oracle(good(lane), lane)
+        for label, path, value in mutations:
+            try:
+                oracle(mutate(good(lane), path, value), lane)
+            except (AssertionError, KeyError, IndexError):
+                continue
+            raise SystemExit(f"mutation accepted: {lane} {label}")
+    print("attach-e2e lane oracle mutations rejected: OK")
+    raise SystemExit(0)
+
+lane, path = sys.argv[1], sys.argv[2]
+oracle(json.load(open(path)), lane)
+print(f"{lane} lane: OK")
+PY
+}
+
+if [ "${1-}" = "--self-test" ]; then
+    [ "$#" -eq 1 ] || { echo "usage: $0 [--self-test]" >&2; exit 2; }
+    assert_lane_evidence --self-test
+    echo "verify-attach-e2e self-test: OK"
+    exit 0
+fi
+
 MODULE=/usr/lib/softhsm/libsofthsm2.so
 WORK=target/e2e
 WPID=
@@ -87,34 +183,13 @@ run_lane() {
 
 echo "=== observe (manifest-free: memory scan only) ==="
 run_lane observed-scan clean-metrics
-python3 - "$WORK/observed-scan.json" <<'PY'
-import json, sys
-doc = json.load(open(sys.argv[1]))
-ev = doc["evidence"]
-assert ev["authority"] == "hash-pinned", ev["authority"]
-assert [m["sources"] for m in ev["discovery"]] == [["scan"]], ev["discovery"]
-assert [m["corroborated"] for m in ev["discovery"]] == [False], ev["discovery"]
-assert [m["corroboration"] for m in ev["discovery"]] == [["single_source"]], ev["discovery"]
-assert doc["capture"]["modules"][0]["path"].endswith("libsofthsm2.so"), doc["capture"]
-print("manifest-free lane: OK")
-PY
+assert_lane_evidence scan "$WORK/observed-scan.json"
 
 echo "=== discover (the helper still produces a manifest, for the corroboration lane) ==="
 "$WORK/build/release/p11scope-discover" --module "$MODULE" -o "$WORK/manifest.json"
 
 echo "=== observe (manifest corroborated against the scan) ==="
 run_lane observed clean-metrics-corroborated --manifest "$WORK/manifest.json"
-python3 - "$WORK/observed.json" <<'PY'
-import json, sys
-doc = json.load(open(sys.argv[1]))
-ev = doc["evidence"]
-assert ev["authority"] == "hash-pinned", ev["authority"]
-assert [m["sources"] for m in ev["discovery"]] == [["scan", "manifest"]], ev["discovery"]
-assert [m["corroborated"] for m in ev["discovery"]] == [True], ev["discovery"]
-assert [m["corroboration"] for m in ev["discovery"]] == [["agreed"]], ev["discovery"]
-assert ev["discovery_conflicts"] == 0, ev["discovery_conflicts"]
-assert ev["discovery_uncorroborated"] == 0, ev["discovery_uncorroborated"]
-print("manifest-corroboration lane: OK")
-PY
+assert_lane_evidence manifest "$WORK/observed.json"
 
 echo "=== e2e: ALL OK ==="

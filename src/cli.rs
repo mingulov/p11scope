@@ -33,6 +33,39 @@ pub struct CaptureArgs {
     pub unsafe_requested: bool,
 }
 
+/// What `run` is allowed to do to its own child to keep loader discovery from
+/// racing an unobserved `dlopen`. `Never` is the omission default: nothing this
+/// observer starts is stopped unless the operator asked for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PausePolicy {
+    #[default]
+    Never,
+    Auto,
+    Always,
+}
+
+/// `p11scope run`: the capture options above, plus the child this observer
+/// starts and owns. There is no scope flag — the scope *is* the command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunArgs {
+    /// `--trace` selects `Kind::Trace`; otherwise this is a profile capture.
+    pub kind: Kind,
+    pub modules: Vec<PathBuf>,
+    pub manifests: Vec<PathBuf>,
+    pub hooks: HookRegistry,
+    /// `--mode metrics` (rejected beside `--trace`).
+    pub metrics: bool,
+    pub duration: Option<Duration>,
+    pub out: Option<PathBuf>,
+    pub unsafe_requested: bool,
+    pub pause: PausePolicy,
+    /// `--kill-on-timeout`: `--duration` expiry ends the child too, instead of
+    /// handing it back still running.
+    pub kill_on_timeout: bool,
+    /// Everything after `--`, verbatim. Never empty.
+    pub command: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectArgs {
     pub pid: u32,
@@ -51,6 +84,7 @@ pub struct DoctorArgs {
 pub enum Command {
     Profile(CaptureArgs),
     Trace(CaptureArgs),
+    Run(RunArgs),
     Inspect(InspectArgs),
     Doctor(DoctorArgs),
 }
@@ -67,13 +101,19 @@ pub const USAGE: &str = "usage:
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
   p11scope trace   [same scope and discovery options] [--duration <…>] [-o <out.file>]
+  p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--duration <…>]
+                   [-o <out>] [--pause never|auto|always] [--kill-on-timeout] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
   p11scope doctor  [--pid <n>] [--cgroup <path>]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
-scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning happens once, at attach time.
+scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
+run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup. --pause
+selects what run may do to its own child while it observes loading: never (default) touches
+nothing, auto only when the child would otherwise load unobserved, always on every load.
+--kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
 every descendant (kernel >= 5.15). Provider identity is pinned by SHA-256 at attach and
@@ -115,8 +155,84 @@ fn unknown_arg(arg: &str) -> CliError {
         "--provenance-module" | "--trusted-workload" => {
             usage_err(format!("{arg}: {REMOVED_FLAG_HINT}"))
         }
+        // Pause policy is only meaningful for a child this observer owns, so it
+        // is refused by name everywhere else rather than silently ignored.
+        "--pause" => usage_err(
+            "--pause is a `p11scope run` option: only a child this observer started can be \
+             paused",
+        ),
         other => usage_err(format!("unknown argument: {other}")),
     }
+}
+
+/// The discovery and capture options every capturing subcommand shares.
+/// `metrics` stays `None` until `--mode` is given so `--trace`/`trace` can
+/// refuse a mode whichever order the two were typed in.
+/// `HookRegistry`'s own `Default` is the builtin set, so a defaulted `Common`
+/// starts with exactly the five documented hook symbols.
+#[derive(Debug, Default)]
+struct Common {
+    modules: Vec<PathBuf>,
+    manifests: Vec<PathBuf>,
+    hooks: HookRegistry,
+    metrics: Option<bool>,
+    duration: Option<Duration>,
+    out: Option<PathBuf>,
+    unsafe_requested: bool,
+}
+
+impl Common {
+    /// One `--mode` rule for every capture surface: raw event streaming has no
+    /// mode, whether it was selected as the `trace` subcommand or `run --trace`.
+    fn metrics_for(&self, kind: Kind, subject: &str) -> Result<bool, CliError> {
+        match (kind, self.metrics) {
+            (Kind::Trace, Some(_)) => Err(usage_err(format!(
+                "{subject} has no --mode; it always streams raw events"
+            ))),
+            _ => Ok(self.metrics.unwrap_or(false)),
+        }
+    }
+}
+
+/// Handles one shared capture option, or reports that `arg` is not one — so
+/// each subcommand keeps exactly its own rules for everything else.
+fn capture_option(
+    common: &mut Common,
+    arg: &str,
+    args: &mut impl Iterator<Item = String>,
+) -> Result<bool, CliError> {
+    match arg {
+        "--module" => common.modules.push(require_value(args, "--module")?.into()),
+        "--manifest" => common
+            .manifests
+            .push(require_value(args, "--manifest")?.into()),
+        "--hook-symbol" => add_hook(&mut common.hooks, args)?,
+        "--mode" => {
+            let v = require_value(args, "--mode")?;
+            common.metrics = Some(match v.as_str() {
+                "profile" => false,
+                "metrics" => true,
+                "trace" => {
+                    return Err(usage_err(
+                        "trace is a subcommand (`p11scope trace …`) or the `run --trace` flag, \
+                         not --mode trace",
+                    ));
+                }
+                other => return Err(usage_err(format!("--mode: invalid value {other:?}"))),
+            });
+        }
+        "--duration" => {
+            let v = require_value(args, "--duration")?;
+            common.duration = Some(
+                parse_duration(&v)
+                    .map_err(|e| usage_err(format!("--duration: invalid value {v:?}: {e}")))?,
+            );
+        }
+        "-o" => common.out = Some(require_value(args, "-o")?.into()),
+        "--unsafe-unvalidated-metadata" => common.unsafe_requested = true,
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 /// The whole command line: the subcommand plus its own arguments. Pure — no I/O,
@@ -125,6 +241,7 @@ pub fn parse(mut argv: impl Iterator<Item = String>) -> Result<Command, CliError
     match argv.next().as_deref() {
         Some("profile") => Ok(Command::Profile(parse_capture(Kind::Profile, argv)?)),
         Some("trace") => Ok(Command::Trace(parse_capture(Kind::Trace, argv)?)),
+        Some("run") => Ok(Command::Run(parse_run(argv)?)),
         Some("inspect") => Ok(Command::Inspect(parse_inspect(argv)?)),
         Some("doctor") => Ok(Command::Doctor(parse_doctor(argv)?)),
         Some("--help" | "-h") => Err(CliError::Help),
@@ -193,51 +310,18 @@ pub fn parse_capture(
     kind: Kind,
     mut args: impl Iterator<Item = String>,
 ) -> Result<CaptureArgs, CliError> {
-    let mut modules = Vec::new();
-    let mut manifests = Vec::new();
-    let mut hooks = HookRegistry::builtin();
+    let mut common = Common::default();
     let mut pid: Option<u32> = None;
     let mut cgroup: Option<PathBuf> = None;
-    let mut metrics = false;
-    let mut duration: Option<Duration> = None;
-    let mut out: Option<PathBuf> = None;
-    let mut unsafe_requested = false;
 
     while let Some(a) = args.next() {
+        if capture_option(&mut common, a.as_str(), &mut args)? {
+            continue;
+        }
         match a.as_str() {
             "--help" | "-h" => return Err(CliError::Help),
-            "--module" => modules.push(require_value(&mut args, "--module")?.into()),
-            "--manifest" => manifests.push(require_value(&mut args, "--manifest")?.into()),
-            "--hook-symbol" => add_hook(&mut hooks, &mut args)?,
             "--pid" => pid = Some(require_pid(&mut args)?),
             "--cgroup" => cgroup = Some(require_value(&mut args, "--cgroup")?.into()),
-            "--mode" => {
-                let v = require_value(&mut args, "--mode")?;
-                if kind == Kind::Trace {
-                    return Err(usage_err(
-                        "trace has no --mode; it always streams raw events",
-                    ));
-                }
-                match v.as_str() {
-                    "profile" => metrics = false,
-                    "metrics" => metrics = true,
-                    "trace" => {
-                        return Err(usage_err(
-                            "trace is a subcommand: `p11scope trace …`, not --mode trace",
-                        ));
-                    }
-                    other => return Err(usage_err(format!("--mode: invalid value {other:?}"))),
-                }
-            }
-            "--duration" => {
-                let v = require_value(&mut args, "--duration")?;
-                duration = Some(
-                    parse_duration(&v)
-                        .map_err(|e| usage_err(format!("--duration: invalid value {v:?}: {e}")))?,
-                );
-            }
-            "-o" => out = Some(require_value(&mut args, "-o")?.into()),
-            "--unsafe-unvalidated-metadata" => unsafe_requested = true,
             other => return Err(unknown_arg(other)),
         }
     }
@@ -249,16 +333,85 @@ pub fn parse_capture(
         (Some(_), Some(_)) => return Err(usage_err("--pid and --cgroup are mutually exclusive")),
     };
 
+    let metrics = common.metrics_for(kind, "trace")?;
     Ok(CaptureArgs {
         kind,
-        modules,
-        manifests,
-        hooks,
+        modules: common.modules,
+        manifests: common.manifests,
+        hooks: common.hooks,
         scope,
         metrics,
-        duration,
-        out,
-        unsafe_requested,
+        duration: common.duration,
+        out: common.out,
+        unsafe_requested: common.unsafe_requested,
+    })
+}
+
+/// `p11scope run`: the shared capture options, this observer's own pause
+/// policy, and the command it starts. The command is everything after `--`,
+/// taken verbatim so an argument meant for the child is never consumed here.
+fn parse_run(mut args: impl Iterator<Item = String>) -> Result<RunArgs, CliError> {
+    let mut common = Common::default();
+    let mut pause = PausePolicy::Never;
+    let mut kill_on_timeout = false;
+    let mut trace = false;
+    let mut command: Vec<String> = Vec::new();
+
+    while let Some(a) = args.next() {
+        if capture_option(&mut common, a.as_str(), &mut args)? {
+            continue;
+        }
+        match a.as_str() {
+            "--help" | "-h" => return Err(CliError::Help),
+            "--trace" => trace = true,
+            "--pause" => {
+                let v = require_value(&mut args, "--pause")?;
+                pause = match v.as_str() {
+                    "never" => PausePolicy::Never,
+                    "auto" => PausePolicy::Auto,
+                    "always" => PausePolicy::Always,
+                    other => {
+                        return Err(usage_err(format!(
+                            "--pause: invalid value {other:?} (expected never|auto|always)"
+                        )));
+                    }
+                };
+            }
+            "--kill-on-timeout" => kill_on_timeout = true,
+            "--pid" | "--cgroup" => {
+                return Err(usage_err(
+                    "run has no --pid or --cgroup: it captures exactly the command it starts",
+                ));
+            }
+            "--" => {
+                command.extend(args.by_ref());
+                break;
+            }
+            other => return Err(unknown_arg(other)),
+        }
+    }
+
+    // No `--`, nothing after it, and an empty program name are the same
+    // refusal: there is no command for this observer to start and own.
+    if command.first().is_none_or(String::is_empty) {
+        return Err(usage_err(
+            "run requires a command: `p11scope run [options] -- CMD [ARGS...]`",
+        ));
+    }
+    let kind = if trace { Kind::Trace } else { Kind::Profile };
+    let metrics = common.metrics_for(kind, "run --trace")?;
+    Ok(RunArgs {
+        kind,
+        modules: common.modules,
+        manifests: common.manifests,
+        hooks: common.hooks,
+        metrics,
+        duration: common.duration,
+        out: common.out,
+        unsafe_requested: common.unsafe_requested,
+        pause,
+        kill_on_timeout,
+        command,
     })
 }
 
@@ -455,6 +608,136 @@ mod tests {
         .unwrap();
         assert!(a.unsafe_requested);
         assert_eq!(a.scope, ScopeArg::Cgroup(PathBuf::from("/sys/fs/cgroup/x")));
+    }
+
+    #[test]
+    fn run_takes_capture_options_a_pause_policy_and_the_trailing_command() {
+        let Command::Run(a) = parse(args(&[
+            "run",
+            "--module",
+            "/opt/a.so",
+            "--manifest",
+            "/tmp/m.json",
+            "--hook-symbol",
+            "V_GetTable:interface",
+            "--mode",
+            "metrics",
+            "--duration",
+            "5m",
+            "-o",
+            "out.json",
+            "--unsafe-unvalidated-metadata",
+            "--pause",
+            "always",
+            "--kill-on-timeout",
+            "--",
+            "/usr/bin/app",
+            "--pid",
+            "7",
+        ]))
+        .unwrap() else {
+            panic!("expected run")
+        };
+        assert_eq!(a.kind, Kind::Profile);
+        assert_eq!(a.modules, vec![PathBuf::from("/opt/a.so")]);
+        assert_eq!(a.manifests, vec![PathBuf::from("/tmp/m.json")]);
+        assert_eq!(a.hooks.abi("V_GetTable"), Some(HookAbi::Interface));
+        assert!(a.metrics);
+        assert_eq!(a.duration, Some(Duration::from_secs(300)));
+        assert_eq!(a.out, Some(PathBuf::from("out.json")));
+        assert!(a.unsafe_requested);
+        assert_eq!(a.pause, PausePolicy::Always);
+        assert!(a.kill_on_timeout);
+        // Everything after `--` is the command verbatim, flags included: the
+        // observer must never consume an argument meant for the child.
+        assert_eq!(a.command, ["/usr/bin/app", "--pid", "7"]);
+    }
+
+    #[test]
+    fn run_trace_selects_the_trace_kind_and_omitted_pause_is_never() {
+        let Command::Run(a) = parse(args(&["run", "--trace", "--", "/bin/true"])).unwrap() else {
+            panic!("expected run")
+        };
+        assert_eq!(a.kind, Kind::Trace);
+        assert_eq!(a.pause, PausePolicy::Never);
+        assert!(!a.kill_on_timeout);
+        assert!(!a.metrics);
+        assert_eq!(a.command, ["/bin/true"]);
+        // `--trace` streams raw events, so it has no `--mode`, whichever order
+        // the two are typed in.
+        for both in [
+            vec!["run", "--trace", "--mode", "metrics", "--", "/bin/true"],
+            vec!["run", "--mode", "metrics", "--trace", "--", "/bin/true"],
+        ] {
+            assert!(
+                matches!(parse(args(&both)), Err(CliError::Usage(m)) if m.contains("has no --mode")),
+                "{both:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_rejects_scope_flags_an_empty_command_and_unknown_pause_values() {
+        for scoped in [
+            vec!["run", "--pid", "1", "--", "/bin/true"],
+            vec!["run", "--cgroup", "/sys/fs/cgroup/x", "--", "/bin/true"],
+        ] {
+            assert!(
+                matches!(parse(args(&scoped)), Err(CliError::Usage(m)) if m.contains("run has no --pid or --cgroup")),
+                "{scoped:?}"
+            );
+        }
+        for empty in [
+            vec!["run"],
+            vec!["run", "--pause", "auto"],
+            vec!["run", "--"],
+            vec!["run", "--", ""],
+        ] {
+            assert!(
+                matches!(parse(args(&empty)), Err(CliError::Usage(m)) if m.contains("-- CMD [ARGS...]")),
+                "{empty:?}"
+            );
+        }
+        assert!(matches!(
+            parse(args(&["run", "--pause", "sometimes", "--", "/bin/true"])),
+            Err(CliError::Usage(m)) if m.contains("never|auto|always")
+        ));
+        assert!(matches!(
+            parse(args(&["run", "--pause"])),
+            Err(CliError::Usage(m)) if m.contains("--pause requires a value")
+        ));
+        assert_eq!(parse(args(&["run", "--help"])).unwrap_err(), CliError::Help);
+    }
+
+    #[test]
+    fn pause_is_a_run_only_option() {
+        for elsewhere in [
+            vec!["profile", "--pid", "1", "--pause", "auto"],
+            vec!["trace", "--pid", "1", "--pause", "never"],
+            vec!["inspect", "--pid", "1", "--pause", "always"],
+            vec!["doctor", "--pause", "auto"],
+        ] {
+            assert!(
+                matches!(parse(args(&elsewhere)), Err(CliError::Usage(m)) if m.contains("`p11scope run`")),
+                "{elsewhere:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_pause_policy_spelling_parses_exactly() {
+        for (spelling, expected) in [
+            ("never", PausePolicy::Never),
+            ("auto", PausePolicy::Auto),
+            ("always", PausePolicy::Always),
+        ] {
+            let Command::Run(a) =
+                parse(args(&["run", "--pause", spelling, "--", "/bin/true"])).unwrap()
+            else {
+                panic!("expected run")
+            };
+            assert_eq!(a.pause, expected, "{spelling}");
+        }
     }
 
     #[test]

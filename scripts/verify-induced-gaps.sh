@@ -18,6 +18,438 @@ MODULE=/usr/lib/softhsm/libsofthsm2.so
 WORK=target/induced-gaps
 FIX=scripts/fixtures
 . scripts/lib.sh
+
+write_freeze_policy_maps_source() {
+    cat > "$1" <<'EOF'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/bpf.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static int bpf(enum bpf_cmd cmd, union bpf_attr *attr) {
+    return (int)syscall(SYS_bpf, cmd, attr, sizeof(*attr));
+}
+static void die(const char *what) { perror(what); exit(1); }
+static int fd_by_id(enum bpf_cmd cmd, uint32_t id) {
+    union bpf_attr attr = {.map_id = id};
+    int fd = bpf(cmd, &attr); if (fd < 0) die("BPF_MAP_GET_FD_BY_ID/BPF_PROG_GET_FD_BY_ID"); return fd;
+}
+static struct bpf_map_info info_for(int fd) {
+    struct bpf_map_info info = {0};
+    union bpf_attr attr = {.info.bpf_fd = (uint32_t)fd, .info.info_len = sizeof(info),
+                           .info.info = (uintptr_t)&info};
+    if (bpf(BPF_OBJ_GET_INFO_BY_FD, &attr)) die("BPF_OBJ_GET_INFO_BY_FD");
+    return info;
+}
+static int map_create(const struct bpf_map_info *info) {
+    union bpf_attr attr = {.map_type = info->type, .key_size = info->key_size,
+        .value_size = info->value_size, .max_entries = info->max_entries,
+        .map_flags = info->map_flags};
+    memcpy(attr.map_name, "freeze_control", sizeof("freeze_control"));
+    int fd = bpf(BPF_MAP_CREATE, &attr); if (fd < 0) die("BPF_MAP_CREATE matched control"); return fd;
+}
+static int lookup(int fd, void *key, void *value) {
+    union bpf_attr attr = {.map_fd = (uint32_t)fd, .key = (uintptr_t)key,
+                           .value = (uintptr_t)value};
+    return bpf(BPF_MAP_LOOKUP_ELEM, &attr);
+}
+static int first_key(int fd, void *key) {
+    union bpf_attr attr = {.map_fd = (uint32_t)fd, .next_key = (uintptr_t)key};
+    return bpf(BPF_MAP_GET_NEXT_KEY, &attr);
+}
+static int update(int fd, void *key, void *value) {
+    union bpf_attr attr = {.map_fd = (uint32_t)fd, .key = (uintptr_t)key,
+                           .value = (uintptr_t)value, .flags = BPF_ANY};
+    return bpf(BPF_MAP_UPDATE_ELEM, &attr);
+}
+static int remove_key(int fd, void *key) {
+    union bpf_attr attr = {.map_fd = (uint32_t)fd, .key = (uintptr_t)key};
+    return bpf(BPF_MAP_DELETE_ELEM, &attr);
+}
+static int matched_result(int control_rc, int target_rc, int target_errno) {
+    return control_rc == 0 && target_rc == -1 && target_errno == EPERM;
+}
+static void require_match(int control_rc, int target_rc, int target_errno, const char *name) {
+    if (!matched_result(control_rc, target_rc, target_errno)) {
+        fprintf(stderr, "%s frozen mutation: expected Operation not permitted (EPERM), rc=%d errno=%d\n",
+                name, target_rc, target_errno); exit(1);
+    }
+}
+static void ordinary(const char *name, int target, const struct bpf_map_info *info,
+                     uint32_t workload_pid) {
+    unsigned char *key = calloc(1, info->key_size), *value = calloc(1, info->value_size);
+    if (!key || !value) die("calloc");
+    if (!strcmp(name, "PID_FILTER")) {
+        memcpy(key, &workload_pid, sizeof(workload_pid)); value[0] = 1;
+    } else {
+        if (first_key(target, key) || lookup(target, key, value)) die("reading policy entry");
+    }
+    int control = map_create(info);
+    int control_rc = update(control, key, value);
+    if (control_rc) die("unfrozen matched control update");
+    errno = 0; int target_rc = update(target, key, value); int target_errno = errno;
+    require_match(control_rc, target_rc, target_errno, name);
+    close(control); free(value); free(key);
+}
+static void fd_array(const char *name, int target, const struct bpf_map_info *info,
+                     const char *cgroup_path) {
+    uint32_t key = 0, object_id = 0;
+    int object_fd;
+    if (!strcmp(name, "CGROUP_FILTER")) {
+        object_fd = open(cgroup_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (object_fd < 0) die("open cgroup");
+    } else {
+        if (lookup(target, &key, &object_id)) die("lookup TEMPLATE_TAIL program id");
+        object_fd = fd_by_id(BPF_PROG_GET_FD_BY_ID, object_id);
+    }
+    int control = map_create(info);
+    if (update(control, &key, &object_fd)) die("populate unfrozen fd-array control");
+    int control_rc = remove_key(control, &key);
+    if (control_rc) die("unfrozen matched control delete");
+    errno = 0; int target_rc = remove_key(target, &key); int target_errno = errno;
+    require_match(control_rc, target_rc, target_errno, name);
+    close(control); close(object_fd);
+}
+int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--self-test")) {
+        if (!matched_result(0, -1, EPERM) || matched_result(-1, -1, EPERM)
+            || matched_result(0, -1, EINVAL) || matched_result(0, 0, 0)) return 1;
+        puts("freeze matched-result self-test: OK"); return 0;
+    }
+    if (argc != 11) { fprintf(stderr, "usage: %s PID CGROUP NAME=ID...\n", argv[0]); return 2; }
+    uint32_t workload_pid = (uint32_t)strtoul(argv[1], NULL, 10);
+    for (int i = 3; i < argc; i++) {
+        char *eq = strchr(argv[i], '='); if (!eq) return 2; *eq = '\0';
+        uint32_t id = (uint32_t)strtoul(eq + 1, NULL, 10);
+        int target = fd_by_id(BPF_MAP_GET_FD_BY_ID, id);
+        struct bpf_map_info info = info_for(target);
+        if (info.id != id || strncmp((char *)info.name, argv[i], BPF_OBJ_NAME_LEN)) {
+            fprintf(stderr, "%s=%u exact map identity mismatch: id=%u name=%s\n",
+                    argv[i], id, info.id, info.name); return 1;
+        }
+        if (!strcmp(argv[i], "CGROUP_FILTER") || !strcmp(argv[i], "TEMPLATE_TAIL"))
+            fd_array(argv[i], target, &info, argv[2]);
+        else ordinary(argv[i], target, &info, workload_pid);
+        printf("%s id=%u: unfrozen matched control succeeded; frozen mutation EPERM\n", argv[i], id);
+        close(target);
+    }
+    return 0;
+}
+EOF
+}
+
+# Gap 1 and gap 2 own inline oracles beyond the shared checker, and the
+# policy-map lane owns two more. Each lives in exactly one place and accepts
+# `--self-test`, which runs the same assertions over synthetic evidence and
+# requires every claimed field to refuse a mutation, unprivileged.
+assert_gap1() {
+    python3 - "$@" <<'PY'
+import copy
+import json
+import sys
+
+WANT = sorted(["C_CancelFunction", "C_WaitForSlotEvent"])
+WANT_CALLS = 25 + 17
+
+
+def oracle(observed):
+    alias_groups = observed["evidence"]["aliased"]
+    matches = [group for group in alias_groups if sorted(group) == WANT]
+    assert matches, f"no alias group == {WANT} in evidence.aliased: {alias_groups}"
+    assert len(matches) == 1, f"expected exactly one matching alias group, got {matches}"
+
+    reports = [f for f in observed["functions"] if sorted(f["names"]) == WANT]
+    assert len(reports) == 1, f"expected exactly one function report for {WANT}, got {reports}"
+    report = reports[0]
+    assert report["aliased"] is True, "aliased slot must be flagged aliased=true"
+    assert report["calls"] == WANT_CALLS, (
+        f"aliased group calls: want {WANT_CALLS}, got {report['calls']}"
+    )
+    return report["calls"]
+
+
+GOOD = {
+    "evidence": {"aliased": [list(WANT)]},
+    "functions": [
+        {"names": list(WANT), "aliased": True, "calls": WANT_CALLS},
+        {"names": ["C_GetInfo"], "aliased": False, "calls": 1},
+    ],
+}
+
+
+def mutate(path, value):
+    document = copy.deepcopy(GOOD)
+    cursor = document
+    for key in path[:-1]:
+        cursor = cursor[key]
+    cursor[path[-1]] = value
+    return document
+
+
+if sys.argv[1] == "--self-test":
+    oracle(GOOD)
+    for label, document in [
+        ("alias group present", mutate(["evidence", "aliased"], [["C_GetInfo"]])),
+        ("one alias group", mutate(["evidence", "aliased"], [list(WANT), list(WANT)])),
+        ("one function report", mutate(["functions"], GOOD["functions"] + [GOOD["functions"][0]])),
+        ("aliased flag", mutate(["functions", 0, "aliased"], False)),
+        ("aliased group calls", mutate(["functions", 0, "calls"], WANT_CALLS - 1)),
+    ]:
+        try:
+            oracle(document)
+        except (AssertionError, KeyError, IndexError):
+            continue
+        raise SystemExit(f"mutation accepted: gap 1 {label}")
+    print("gap 1 alias oracle mutations rejected: OK")
+    raise SystemExit(0)
+
+calls = oracle(json.load(open(sys.argv[1])))
+print(f"gap 1 OK: alias group {WANT} calls={calls} (want {WANT_CALLS})")
+PY
+}
+
+assert_gap2() {
+    python3 - "$@" <<'PY'
+import copy
+import json
+import sys
+
+
+def oracle(observed):
+    in_flight = observed["evidence"]["in_flight_at_end"]
+    reports = [f for f in observed["functions"] if "C_WaitForSlotEvent" in f["names"]]
+    assert len(reports) == 1, (
+        f"expected exactly one function report naming C_WaitForSlotEvent, got {reports}"
+    )
+    report = reports[0]
+    assert report["in_flight"] >= 1, f"slot in_flight: want >= 1, got {report['in_flight']}"
+    assert report["calls"] == 0, f"stranded call must not count as completed: {report['calls']}"
+    assert report["latency_ns"]["p50"] is None, (
+        "stranded call must be excluded from latency percentiles"
+    )
+    assert report["latency_ns"]["p95"] is None
+    assert report["latency_ns"]["p99"] is None
+    return in_flight
+
+
+GOOD = {
+    "evidence": {"in_flight_at_end": 1},
+    "functions": [
+        {
+            "names": ["C_WaitForSlotEvent"],
+            "in_flight": 1,
+            "calls": 0,
+            "latency_ns": {"p50": None, "p95": None, "p99": None},
+        }
+    ],
+}
+
+
+def mutate(path, value):
+    document = copy.deepcopy(GOOD)
+    cursor = document
+    for key in path[:-1]:
+        cursor = cursor[key]
+    cursor[path[-1]] = value
+    return document
+
+
+if sys.argv[1] == "--self-test":
+    oracle(GOOD)
+    for label, document in [
+        ("one stranded report", mutate(["functions"], GOOD["functions"] * 2)),
+        ("named report", mutate(["functions", 0, "names"], ["C_GetInfo"])),
+        ("in-flight count", mutate(["functions", 0, "in_flight"], 0)),
+        ("completed calls", mutate(["functions", 0, "calls"], 1)),
+        ("p50 exclusion", mutate(["functions", 0, "latency_ns"], {"p50": 1, "p95": None, "p99": None})),
+        ("p95 exclusion", mutate(["functions", 0, "latency_ns"], {"p50": None, "p95": 1, "p99": None})),
+        ("p99 exclusion", mutate(["functions", 0, "latency_ns"], {"p50": None, "p95": None, "p99": 1})),
+    ]:
+        try:
+            oracle(document)
+        except (AssertionError, KeyError, IndexError):
+            continue
+        raise SystemExit(f"mutation accepted: gap 2 {label}")
+    print("gap 2 in-flight oracle mutations rejected: OK")
+    raise SystemExit(0)
+
+in_flight = oracle(json.load(open(sys.argv[1])))
+print(f"gap 2 OK: in_flight_at_end={in_flight}, stranded call excluded from percentiles")
+PY
+}
+
+policy_map_ids() {
+    # `--self-test` runs unprivileged; the real lane reads a root-owned dump.
+    case ${1-} in
+        --self-test) pmi_python=python3 ;;
+        *) pmi_python="sudo python3" ;;
+    esac
+    $pmi_python - "$@" <<'PY'
+import json, os, sys
+expected = {"CONFIG", "PID_FILTER", "CGROUP_FILTER", "DESCRIPTORS",
+            "ASYNC_FUNCTIONS", "MECH_SHAPE", "ATTR_BOOL_BITS", "TEMPLATE_TAIL"}
+
+
+def oracle(items, output_path):
+    assert set(items) >= expected, (set(items), expected)
+    with open(output_path, "w", encoding="utf-8") as output:
+        os.chmod(output_path, 0o600)
+        for name in sorted(expected):
+            print(f"{name}={items[name]}", file=output)
+
+
+if sys.argv[1] == "--self-test":
+    work = sys.argv[2]
+    good = {name: index for index, name in enumerate(sorted(expected), start=1)}
+    oracle(good, f"{work}/ids")
+    written = dict(line.split("=") for line in open(f"{work}/ids").read().splitlines())
+    assert sorted(written) == sorted(expected), written
+    assert oct(os.stat(f"{work}/ids").st_mode)[-3:] == "600", "policy-map id file must be 0600"
+    for label, items in [
+        ("missing published policy map", {k: v for k, v in good.items() if k != "DESCRIPTORS"}),
+        ("empty inventory", {}),
+    ]:
+        try:
+            oracle(items, f"{work}/ids")
+        except AssertionError:
+            continue
+        raise SystemExit(f"mutation accepted: {label}")
+    print("policy-map id oracle mutations rejected: OK")
+    raise SystemExit(0)
+
+oracle({item["name"]: item["id"] for item in json.load(open(sys.argv[1]))}, sys.argv[2])
+PY
+}
+
+assert_dynamic_maps_advanced() {
+    # `--self-test` runs unprivileged; the real lane reads root-owned dumps.
+    case ${1-} in
+        --self-test) adma_python=python3 ;;
+        *) adma_python="sudo python3" ;;
+    esac
+    $adma_python - "$1" "$2" <<'PY'
+import json, os, struct, sys
+
+
+def identity(before, after):
+    assert before["EVENTS"]["oracle"] == after["EVENTS"]["oracle"] == "mmap"
+    assert "file" not in before["EVENTS"] and "file" not in after["EVENTS"]
+    assert {name: item["id"] for name, item in before.items()} == {
+        name: item["id"] for name, item in after.items()
+    }, "observer-owned map ids changed during freeze lane"
+
+
+def total(path):
+    doc = json.load(open(path))
+    cells = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            encoded = value.get("value")
+            if isinstance(encoded, list) and all(isinstance(item, str) for item in encoded):
+                raw = bytes(int(item, 16) for item in encoded)
+                assert len(raw) % 8 == 0, (path, len(raw))
+                cells.extend(struct.unpack(f"<{len(raw) // 8}Q", raw))
+            else:
+                for child in value.values(): walk(child)
+        elif isinstance(value, list):
+            for child in value: walk(child)
+
+    walk(doc)
+    return sum(cells)
+
+
+DYNAMIC = ("STATS", "RV_COUNTS", "EVIDENCE")
+
+
+def advanced(before, after):
+    identity(before, after)
+    for name in DYNAMIC:
+        previous, current = total(before[name]["file"]), total(after[name]["file"])
+        assert current > previous, f"dynamic {name} did not advance: {previous} -> {current}"
+        print(f"dynamic {name} exact id={before[name]['id']} advanced: {previous} -> {current}")
+
+
+if sys.argv[1] == "--self-test":
+    work = sys.argv[2]
+
+    def dump(name, cells):
+        path = os.path.join(work, f"{name}.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(
+                [{"value": [f"0x{byte:02x}" for byte in struct.pack("<Q", cell)]} for cell in cells],
+                handle,
+            )
+        return path
+
+    def side(suffix, counts):
+        maps = {"EVENTS": {"id": 1, "oracle": "mmap"}}
+        for index, name in enumerate(DYNAMIC, start=2):
+            maps[name] = {"id": index, "file": dump(f"{name}-{suffix}", [counts])}
+        return maps
+
+    good_before, good_after = side("before", 1), side("after", 2)
+    advanced(good_before, good_after)
+    mutations = [
+        ("EVENTS ring oracle", good_before, {**good_after, "EVENTS": {"id": 1, "oracle": "file"}}),
+        (
+            "EVENTS dumped to a file",
+            good_before,
+            {**good_after, "EVENTS": {"id": 1, "oracle": "mmap", "file": "/dev/null"}},
+        ),
+        (
+            "observer-owned map ids",
+            good_before,
+            {**good_after, "STATS": {**good_after["STATS"], "id": 99}},
+        ),
+        ("STATS advanced", good_before, {**good_after, "STATS": good_before["STATS"]}),
+        ("RV_COUNTS advanced", good_before, {**good_after, "RV_COUNTS": good_before["RV_COUNTS"]}),
+        ("EVIDENCE advanced", good_before, {**good_after, "EVIDENCE": good_before["EVIDENCE"]}),
+    ]
+    for label, before_side, after_side in mutations:
+        try:
+            advanced(before_side, after_side)
+        except (AssertionError, KeyError):
+            continue
+        raise SystemExit(f"mutation accepted: {label}")
+    print(f"dynamic policy-map oracle mutations rejected: OK ({len(mutations)} lanes)")
+    raise SystemExit(0)
+
+before_path, after_path = sys.argv[1:3]
+advanced(
+    {item["name"]: item for item in json.load(open(before_path))},
+    {item["name"]: item for item in json.load(open(after_path))},
+)
+PY
+}
+
+if [ "${1-}" = "--self-test" ]; then
+    [ "$#" -eq 1 ] || { echo "usage: $0 [--self-test]" >&2; exit 2; }
+    # Unprivileged: the delegated validators' own mutation suites, this
+    # script's four inline oracles, and the C freeze harness's matched-result
+    # control. No BPF, no sudo, no workload, no build of the observer.
+    command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
+    python3 scripts/check-bpf-map-defs.py --self-test
+    python3 scripts/check-capture-evidence.py --self-test
+    assert_gap1 --self-test
+    assert_gap2 --self-test
+    SELF_TEST_WORK=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-induced-selftest-XXXXXX")
+    trap 'rm -rf "$SELF_TEST_WORK"' EXIT INT TERM
+    policy_map_ids --self-test "$SELF_TEST_WORK"
+    assert_dynamic_maps_advanced --self-test "$SELF_TEST_WORK"
+    write_freeze_policy_maps_source "$SELF_TEST_WORK/freeze-policy-maps.c"
+    gcc -std=c11 -O2 -Wall -Wextra -Werror -o "$SELF_TEST_WORK/freeze-policy-maps" \
+        "$SELF_TEST_WORK/freeze-policy-maps.c"
+    "$SELF_TEST_WORK/freeze-policy-maps" --self-test
+    echo "verify-induced-gaps self-test: OK"
+    exit 0
+fi
 require_non_root_caller
 mkdir -p "$WORK"
 
@@ -164,187 +596,15 @@ freeze_policy_maps() {
     workload_pid=$1
     cgroup_path=$2
     manifest=$3
-    sudo python3 - "$manifest" "$WORK/freeze-policy-map-ids" <<'PY'
-import json, os, sys
-expected = {"CONFIG", "PID_FILTER", "CGROUP_FILTER", "DESCRIPTORS",
-            "ASYNC_FUNCTIONS", "MECH_SHAPE", "ATTR_BOOL_BITS", "TEMPLATE_TAIL"}
-items = {item["name"]: item['id'] for item in json.load(open(sys.argv[1]))}
-assert set(items) >= expected, (set(items), expected)
-with open(sys.argv[2], "w", encoding="utf-8") as output:
-    os.chmod(sys.argv[2], 0o600)
-    for name in sorted(expected):
-        print(f"{name}={items[name]}", file=output)
-PY
+    policy_map_ids "$manifest" "$WORK/freeze-policy-map-ids"
     set -- $(sudo cat "$WORK/freeze-policy-map-ids")
     sudo "$WORK/freeze-policy-maps" "$workload_pid" "$cgroup_path" \
         "$@"
 }
 
-cat > "$WORK/freeze-policy-maps.c" <<'EOF'
-#define _GNU_SOURCE
-#include <errno.h>
-#include <fcntl.h>
-#include <linux/bpf.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-
-static int bpf(enum bpf_cmd cmd, union bpf_attr *attr) {
-    return (int)syscall(SYS_bpf, cmd, attr, sizeof(*attr));
-}
-static void die(const char *what) { perror(what); exit(1); }
-static int fd_by_id(enum bpf_cmd cmd, uint32_t id) {
-    union bpf_attr attr = {.map_id = id};
-    int fd = bpf(cmd, &attr); if (fd < 0) die("BPF_MAP_GET_FD_BY_ID/BPF_PROG_GET_FD_BY_ID"); return fd;
-}
-static struct bpf_map_info info_for(int fd) {
-    struct bpf_map_info info = {0};
-    union bpf_attr attr = {.info.bpf_fd = (uint32_t)fd, .info.info_len = sizeof(info),
-                           .info.info = (uintptr_t)&info};
-    if (bpf(BPF_OBJ_GET_INFO_BY_FD, &attr)) die("BPF_OBJ_GET_INFO_BY_FD");
-    return info;
-}
-static int map_create(const struct bpf_map_info *info) {
-    union bpf_attr attr = {.map_type = info->type, .key_size = info->key_size,
-        .value_size = info->value_size, .max_entries = info->max_entries,
-        .map_flags = info->map_flags};
-    memcpy(attr.map_name, "freeze_control", sizeof("freeze_control"));
-    int fd = bpf(BPF_MAP_CREATE, &attr); if (fd < 0) die("BPF_MAP_CREATE matched control"); return fd;
-}
-static int lookup(int fd, void *key, void *value) {
-    union bpf_attr attr = {.map_fd = (uint32_t)fd, .key = (uintptr_t)key,
-                           .value = (uintptr_t)value};
-    return bpf(BPF_MAP_LOOKUP_ELEM, &attr);
-}
-static int first_key(int fd, void *key) {
-    union bpf_attr attr = {.map_fd = (uint32_t)fd, .next_key = (uintptr_t)key};
-    return bpf(BPF_MAP_GET_NEXT_KEY, &attr);
-}
-static int update(int fd, void *key, void *value) {
-    union bpf_attr attr = {.map_fd = (uint32_t)fd, .key = (uintptr_t)key,
-                           .value = (uintptr_t)value, .flags = BPF_ANY};
-    return bpf(BPF_MAP_UPDATE_ELEM, &attr);
-}
-static int remove_key(int fd, void *key) {
-    union bpf_attr attr = {.map_fd = (uint32_t)fd, .key = (uintptr_t)key};
-    return bpf(BPF_MAP_DELETE_ELEM, &attr);
-}
-static int matched_result(int control_rc, int target_rc, int target_errno) {
-    return control_rc == 0 && target_rc == -1 && target_errno == EPERM;
-}
-static void require_match(int control_rc, int target_rc, int target_errno, const char *name) {
-    if (!matched_result(control_rc, target_rc, target_errno)) {
-        fprintf(stderr, "%s frozen mutation: expected Operation not permitted (EPERM), rc=%d errno=%d\n",
-                name, target_rc, target_errno); exit(1);
-    }
-}
-static void ordinary(const char *name, int target, const struct bpf_map_info *info,
-                     uint32_t workload_pid) {
-    unsigned char *key = calloc(1, info->key_size), *value = calloc(1, info->value_size);
-    if (!key || !value) die("calloc");
-    if (!strcmp(name, "PID_FILTER")) {
-        memcpy(key, &workload_pid, sizeof(workload_pid)); value[0] = 1;
-    } else {
-        if (first_key(target, key) || lookup(target, key, value)) die("reading policy entry");
-    }
-    int control = map_create(info);
-    int control_rc = update(control, key, value);
-    if (control_rc) die("unfrozen matched control update");
-    errno = 0; int target_rc = update(target, key, value); int target_errno = errno;
-    require_match(control_rc, target_rc, target_errno, name);
-    close(control); free(value); free(key);
-}
-static void fd_array(const char *name, int target, const struct bpf_map_info *info,
-                     const char *cgroup_path) {
-    uint32_t key = 0, object_id = 0;
-    int object_fd;
-    if (!strcmp(name, "CGROUP_FILTER")) {
-        object_fd = open(cgroup_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (object_fd < 0) die("open cgroup");
-    } else {
-        if (lookup(target, &key, &object_id)) die("lookup TEMPLATE_TAIL program id");
-        object_fd = fd_by_id(BPF_PROG_GET_FD_BY_ID, object_id);
-    }
-    int control = map_create(info);
-    if (update(control, &key, &object_fd)) die("populate unfrozen fd-array control");
-    int control_rc = remove_key(control, &key);
-    if (control_rc) die("unfrozen matched control delete");
-    errno = 0; int target_rc = remove_key(target, &key); int target_errno = errno;
-    require_match(control_rc, target_rc, target_errno, name);
-    close(control); close(object_fd);
-}
-int main(int argc, char **argv) {
-    if (argc == 2 && !strcmp(argv[1], "--self-test")) {
-        if (!matched_result(0, -1, EPERM) || matched_result(-1, -1, EPERM)
-            || matched_result(0, -1, EINVAL) || matched_result(0, 0, 0)) return 1;
-        puts("freeze matched-result self-test: OK"); return 0;
-    }
-    if (argc != 11) { fprintf(stderr, "usage: %s PID CGROUP NAME=ID...\n", argv[0]); return 2; }
-    uint32_t workload_pid = (uint32_t)strtoul(argv[1], NULL, 10);
-    for (int i = 3; i < argc; i++) {
-        char *eq = strchr(argv[i], '='); if (!eq) return 2; *eq = '\0';
-        uint32_t id = (uint32_t)strtoul(eq + 1, NULL, 10);
-        int target = fd_by_id(BPF_MAP_GET_FD_BY_ID, id);
-        struct bpf_map_info info = info_for(target);
-        if (info.id != id || strncmp((char *)info.name, argv[i], BPF_OBJ_NAME_LEN)) {
-            fprintf(stderr, "%s=%u exact map identity mismatch: id=%u name=%s\n",
-                    argv[i], id, info.id, info.name); return 1;
-        }
-        if (!strcmp(argv[i], "CGROUP_FILTER") || !strcmp(argv[i], "TEMPLATE_TAIL"))
-            fd_array(argv[i], target, &info, argv[2]);
-        else ordinary(argv[i], target, &info, workload_pid);
-        printf("%s id=%u: unfrozen matched control succeeded; frozen mutation EPERM\n", argv[i], id);
-        close(target);
-    }
-    return 0;
-}
-EOF
+write_freeze_policy_maps_source "$WORK/freeze-policy-maps.c"
 gcc -std=c11 -O2 -Wall -Wextra -Werror -o "$WORK/freeze-policy-maps" \
     "$WORK/freeze-policy-maps.c"
-
-assert_dynamic_maps_advanced() {
-    sudo python3 - "$1" "$2" <<'PY'
-import json, struct, sys
-
-before_path, after_path = sys.argv[1:]
-before = {item["name"]: item for item in json.load(open(before_path))}
-after = {item["name"]: item for item in json.load(open(after_path))}
-assert before["EVENTS"]["oracle"] == after["EVENTS"]["oracle"] == "mmap"
-assert "file" not in before["EVENTS"] and "file" not in after["EVENTS"]
-assert {name: item['id'] for name, item in before.items()} == {
-    name: item['id'] for name, item in after.items()
-}, "observer-owned map ids changed during freeze lane"
-
-
-def total(path):
-    doc = json.load(open(path))
-    cells = []
-
-    def walk(value):
-        if isinstance(value, dict):
-            encoded = value.get("value")
-            if isinstance(encoded, list) and all(isinstance(item, str) for item in encoded):
-                raw = bytes(int(item, 16) for item in encoded)
-                assert len(raw) % 8 == 0, (path, len(raw))
-                cells.extend(struct.unpack(f"<{len(raw) // 8}Q", raw))
-            else:
-                for child in value.values(): walk(child)
-        elif isinstance(value, list):
-            for child in value: walk(child)
-
-    walk(doc)
-    return sum(cells)
-
-
-for name in ("STATS", "RV_COUNTS", "EVIDENCE"):
-    previous, current = total(before[name]["file"]), total(after[name]["file"])
-    assert current > previous, f"dynamic {name} did not advance: {previous} -> {current}"
-    print(f"dynamic {name} exact id={before[name]['id']} advanced: {previous} -> {current}")
-PY
-}
 
 # The ordinary Rust suite owns mechanism-union refusal without loading BPF.
 # cargo test: approval_capacity_refuses_the_whole_oversized_union
@@ -431,11 +691,6 @@ library.reset_on_fork = false
 EOF
 softhsm2-util --init-token --free --label induced-gaps --so-pin 1234 --pin 1234 >/dev/null
 
-CHECK_PY='
-import json, sys
-obs = json.load(open(sys.argv[1]))
-'
-
 ##############################################################################
 echo "=== gap 1/5: aliasing ==="
 ##############################################################################
@@ -472,25 +727,7 @@ reclaim_root_output "$WORK/g1_observed.json"
 tail -n 5 "$WORK/g1_profile.log"
 python3 scripts/check-capture-evidence.py induced G1 "$WORK/g1_observed.json"
 
-python3 - "$WORK/g1_observed.json" <<PY
-$CHECK_PY
-ev = obs["evidence"]
-alias_groups = ev["aliased"]
-want = sorted(["C_CancelFunction", "C_WaitForSlotEvent"])
-matches = [g for g in alias_groups if sorted(g) == want]
-assert matches, f"no alias group == {want} in evidence.aliased: {alias_groups}"
-assert len(matches) == 1, f"expected exactly one matching alias group, got {matches}"
-
-fn = [f for f in obs["functions"] if sorted(f["names"]) == want]
-assert len(fn) == 1, f"expected exactly one function report for {want}, got {fn}"
-fn = fn[0]
-assert fn["aliased"] is True, "aliased slot must be flagged aliased=true"
-got_calls = fn["calls"]
-want_calls = 25 + 17
-assert got_calls == want_calls, f"aliased group calls: want {want_calls}, got {got_calls}"
-
-print(f"gap 1 OK: alias group {want} calls={got_calls} (want {want_calls})")
-PY
+assert_gap1 "$WORK/g1_observed.json"
 
 ##############################################################################
 echo "=== gap 2/5: in-flight at end ==="
@@ -523,22 +760,7 @@ WPID=
 WORKLOAD_STARTTIME=
 python3 scripts/check-capture-evidence.py induced G2 "$WORK/g2_observed.json"
 
-python3 - "$WORK/g2_observed.json" <<PY
-$CHECK_PY
-ev = obs["evidence"]
-in_flight = ev["in_flight_at_end"]
-
-fn = [f for f in obs["functions"] if "C_WaitForSlotEvent" in f["names"]]
-assert len(fn) == 1, f"expected exactly one function report naming C_WaitForSlotEvent, got {fn}"
-fn = fn[0]
-assert fn["in_flight"] >= 1, f"slot in_flight: want >= 1, got {fn['in_flight']}"
-assert fn["calls"] == 0, f"stranded call must not count as completed: calls={fn['calls']}"
-assert fn["latency_ns"]["p50"] is None, "stranded call must be excluded from latency percentiles"
-assert fn["latency_ns"]["p95"] is None
-assert fn["latency_ns"]["p99"] is None
-
-print(f"gap 2 OK: in_flight_at_end={in_flight}, stranded call excluded from percentiles")
-PY
+assert_gap2 "$WORK/g2_observed.json"
 
 ##############################################################################
 echo "=== gap 3/5: event loss (tiny ring buffer, high call rate) ==="

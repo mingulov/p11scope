@@ -504,6 +504,10 @@ wait_for_capture_ready() {
             *) echo "unknown readiness kind: $wcr_kind" >&2; return 1 ;;
         esac
         [ -z "${SPID-}" ] || kill -0 "$SPID" 2>/dev/null || {
+            case $wcr_kind in
+                trace) grep -Fqx "CAPTURE privacy=$wcr_privacy" "$wcr_log" 2>/dev/null && return 0 ;;
+                profile|metrics) grep -Fq " — privacy=$wcr_privacy" "$wcr_log" 2>/dev/null && return 0 ;;
+            esac
             echo "observer exited before capture readiness: $wcr_log" >&2
             return 1
         }

@@ -382,6 +382,7 @@ fact cargo_identity "$(cargo +1.88 --version)|$(rustc +1.88 --version)"
 
 set +e
 /usr/bin/env -i PATH="$PATH_FIXED" SOFTHSM2_CONF="$ROOT/work/softhsm2.conf" \
+    SUDO_UID="${SUDO_UID-}" SUDO_GID="${SUDO_GID-}" \
     "$OBSERVER" run --module "$MODULE" --mode metrics --duration 30 \
     --kill-on-timeout --pause "$MODE" -o "$ROOT/artifacts/observed.json" -- \
     "$ROOT/work/hammer" "$MODULE" 200000 \

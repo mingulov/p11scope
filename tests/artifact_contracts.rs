@@ -52,8 +52,11 @@ fn require_before(source: &str, first: &str, second: &str, contract: &str) -> Re
 }
 
 fn assert_exact_policy_map_metadata_contract(attach: &str) -> Result<(), String> {
-    let declarations =
-        contract_section(attach, "const BASE_POLICY_MAPS:", "const TAIL_POLICY_MAP:")?;
+    let declarations = contract_section(
+        attach,
+        "const BASE_POLICY_MAPS:",
+        "const FEATURE_POLICY_MAPS:",
+    )?;
     let compact: String = declarations
         .chars()
         .filter(|character| !character.is_whitespace())
@@ -66,13 +69,51 @@ fn assert_exact_policy_map_metadata_contract(attach: &str) -> Result<(), String>
         "(\"DESCRIPTORS\",map_metadata(MapType::Array,4,18,MAX_DESCRIPTORS,BPF_F_RDONLY_PROG))",
         "(\"ASYNC_FUNCTIONS\",map_metadata(MapType::Hash,32,4,128,BPF_F_RDONLY_PROG))",
         "(\"MECH_SHAPE\",map_metadata(MapType::Hash,8,4,p11scope_ebpf_common::MAX_MECH_SHAPES,BPF_F_RDONLY_PROG))",
-        "(\"ATTR_BOOL_BITS\",map_metadata(MapType::Hash,4,4,16,BPF_F_RDONLY_PROG))",
-        "(\"TEMPLATE_TAIL\",map_metadata(MapType::ProgramArray,4,4,1,0))",
+        "(\"TAIL_CALLS\",map_metadata(MapType::ProgramArray,4,4,2,0))",
     ] {
         if !compact.contains(expected) {
             return Err(format!("exact policy-map metadata missing {expected}"));
         }
     }
+
+    let features = contract_section(
+        attach,
+        "const FEATURE_POLICY_MAPS:",
+        "const TAIL_POLICY_MAP:",
+    )?;
+    require_contract_marker(
+        attach,
+        "const FEATURE_POLICY_MAPS: [(&str, ExactMapMetadata); 1]",
+        "single feature policy map",
+    )?;
+    let compact_features: String = features
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>()
+        .replace(",)", ")");
+    if compact_features
+        .matches("(\"ATTR_BOOL_BITS\",map_metadata(MapType::Hash,4,4,16,BPF_F_RDONLY_PROG))")
+        .count()
+        != 1
+        || compact_features.contains("TAIL_CALLS")
+    {
+        return Err("FEATURE_POLICY_MAPS must contain only ATTR_BOOL_BITS".into());
+    }
+    require_contract_marker(
+        attach,
+        "const TAIL_POLICY_MAP: &str = \"TAIL_CALLS\";",
+        "TAIL_CALLS policy-map alias",
+    )?;
+    let freeze = contract_section(
+        attach,
+        "fn freeze_published_maps(",
+        "fn validate_runtime_map(",
+    )?;
+    require_contract_marker(
+        freeze,
+        "matches!(name, \"DESCRIPTORS\" | TAIL_POLICY_MAP)",
+        "deferred DESCRIPTORS and TAIL_CALLS freeze",
+    )?;
 
     let validator = contract_section(attach, "fn validate_map_metadata(", "fn freeze_map(")?;
     for marker in [
@@ -181,7 +222,7 @@ fn assert_live_discovery_host_contract(
     )?;
     require_before(
         attach,
-        "publish_and_freeze_template_tail(&mut ebpf, object_has_unsafe, unsafe_enabled)",
+        "publish_and_freeze_tail_calls(&mut ebpf, unsafe_enabled)",
         ".attach(\"sched\", \"sched_process_fork\")",
         "tail publication before first producer attach",
     )?;
@@ -262,11 +303,62 @@ fn assert_live_discovery_host_contract(
             "complete object program load",
         ),
         (
-            "publish_and_freeze_template_tail(&mut ebpf, object_has_unsafe, unsafe_enabled)",
+            "publish_and_freeze_tail_calls(&mut ebpf, unsafe_enabled)",
             "safe-policy handling in the unsafe object",
+        ),
+        (
+            "\"interface_list_worker\"",
+            "interface-list worker program inventory",
         ),
     ] {
         require_contract_marker(attach, marker, contract)?;
+    }
+    let scheduling = contract_section(
+        attach,
+        "fn attach_targets_with(",
+        "fn standard_async_catalog",
+    )?;
+    if scheduling.contains("interface_list_worker") {
+        return Err("interface-list worker must be loaded but never attached".into());
+    }
+    let start_inner =
+        contract_section(attach, "fn start_inner(", "pub(crate) fn counter_snapshot(")?;
+    let dynamic_loader = contract_section(
+        attach,
+        "pub(crate) fn attach_dynamic_loader(",
+        "pub(crate) fn attach_dynamic_export(",
+    )?;
+    let dynamic_export = contract_section(
+        attach,
+        "pub(crate) fn attach_dynamic_export(",
+        "pub(crate) fn has_dynamic_export(",
+    )?;
+    let static_targets = contract_section(
+        attach,
+        "pub(crate) fn attach_targets(",
+        "pub fn replace_targets(",
+    )?;
+    for attach_site in [start_inner, dynamic_loader, dynamic_export, static_targets] {
+        if attach_site.contains("interface_list_worker") && attach_site.contains(".attach") {
+            return Err("interface-list worker must never be attached".into());
+        }
+    }
+    let tail_publication = contract_section(
+        attach,
+        "fn publish_and_freeze_tail_calls(",
+        "/// A kernel/environment",
+    )?;
+    for marker in [
+        ".program(\"interface_list_worker\")",
+        "tails.set(TAIL_CALLS_INTERFACE_WORKER_SLOT",
+        "program_array_id(TAIL_POLICY_MAP, map, TAIL_CALLS_INTERFACE_WORKER_SLOT)",
+        "program_array_id(TAIL_POLICY_MAP, map, TAIL_CALLS_TEMPLATE_SECOND_SLOT)",
+        "tails.set(TAIL_CALLS_TEMPLATE_SECOND_SLOT, second_fd, 0)?;",
+        "if actual_worker != Some(worker_id)",
+        "if actual_second != expected_second",
+        "freeze_map(TAIL_POLICY_MAP, map)",
+    ] {
+        require_contract_marker(tail_publication, marker, "TAIL_CALLS publication")?;
     }
     Ok(())
 }
@@ -2609,8 +2701,8 @@ fn immutable_policy_maps() {
         "the static slot policy must be selected by attach cookie"
     );
     assert_eq!(definitions["CGROUP_FILTER"][FLAGS], 0);
+    assert_eq!(definitions["TAIL_CALLS"][FLAGS], 0);
     assert!(!definitions.contains_key("ATTR_BOOL_BITS"));
-    assert!(!definitions.contains_key("TEMPLATE_TAIL"));
     for name in [
         "STATS",
         "START",
@@ -2720,6 +2812,43 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
         &attach, &events, &engine, &library, &main, &pause, &run,
     )
     .unwrap();
+
+    let assert_rejects_attach_mutation = |source: &str, message: &str| {
+        assert!(
+            assert_live_discovery_host_contract(
+                source, &scope, &events, &hooks, &engine, &main, &run,
+            )
+            .is_err(),
+            "{message}"
+        );
+    };
+    let missing_second_slot_set = attach.replacen(
+        "tails.set(TAIL_CALLS_TEMPLATE_SECOND_SLOT, second_fd, 0)?;",
+        "tails.set(TAIL_CALLS_INTERFACE_WORKER_SLOT, second_fd, 0)?;",
+        1,
+    );
+    assert_rejects_attach_mutation(
+        &missing_second_slot_set,
+        "TAIL_CALLS slot 1 publication must be required",
+    );
+    let missing_worker_readback = attach.replacen(
+        "if actual_worker != Some(worker_id)",
+        "if actual_second != Some(worker_id)",
+        1,
+    );
+    assert_rejects_attach_mutation(
+        &missing_worker_readback,
+        "TAIL_CALLS worker readback must be required",
+    );
+    let worker_attach = attach.replacen(
+        "let programs = expected_programs(object_has_unsafe);",
+        "let programs = expected_programs(object_has_unsafe);\n        let _ = ebpf.program_mut(\"interface_list_worker\").attach(...);",
+        1,
+    );
+    assert_rejects_attach_mutation(
+        &worker_attach,
+        "interface-list worker must not gain an attach site",
+    );
 
     let public_run = library.replacen("pub(crate) mod run;", "pub mod run;", 1);
     assert!(
@@ -2855,94 +2984,60 @@ fn live_discovery_bpf_classification_is_exact_and_output_only() {
     let listed = between(
         &source,
         "pub fn interface_list_return(ctx: RetProbeContext) -> u32 {",
+        "#[uretprobe]\npub fn interface_list_worker",
+    );
+    assert!(!listed.contains("while interface_index < 16"));
+    assert!(!listed.contains("classify_direct_interface("));
+    for marker in [
+        "let active_count = count.min(u64::from(DISCOVERY_INTERFACES));",
+        "if active_count == 0",
+        "if state.arg0 == 0",
+        "checked_add((active_count - 1) * 24)",
+        "interface_continuation_pack(count, 0, symbol_id)",
+        "take_export_state(&ctx, scope.is_some())",
+        "StateKey {",
+        "attach_cookie: 0",
+        "BPF_NOEXIST",
+        "TAIL_CALLS.tail_call(&ctx, TAIL_CALLS_INTERFACE_WORKER_SLOT)",
+        "fail_export_state(&key)",
+    ] {
+        assert!(listed.contains(marker), "return contract misses {marker}");
+    }
+
+    let worker = between(
+        &source,
+        "pub fn interface_list_worker(ctx: RetProbeContext) -> u32 {",
         "#[uprobe]\npub fn interface_entry",
     );
-    let output_null = listed
-        .find("if state.arg0 == 0")
-        .expect("the valid count-query form must not read a null output array");
-    let loop_start = listed
-        .find("while interface_index < 16")
-        .expect("bounded interface loop");
-    assert!(output_null < loop_start);
-
-    let assert_range_proof = |listed: &str| {
-        let proof = between(
-            listed,
-            "let active_count = count.min(16);",
-            "let mut interface_index = 0usize;",
-        );
-        let zero_guard = proof
-            .find("if active_count == 0")
-            .expect("active count zero guard");
-        let subtraction = proof
-            .find("(active_count - 1) * 24")
-            .expect("count-sensitive range proof");
-        assert!(zero_guard < subtraction);
-        assert_eq!(
-            proof.matches("checked_add").count(),
-            1,
-            "range proof must contain exactly one checked_add"
-        );
-        assert_eq!(
-            proof
-                .matches("bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES)")
-                .count(),
-            1,
-            "range proof must own exactly one bounded-read counter increment"
-        );
-        let compact_proof: String = proof
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect();
-        assert!(compact_proof.contains("state.arg0.checked_add((active_count-1)*24)"));
-        let overflow = &proof[proof.find("checked_add").expect("overflow proof")..];
-        assert_eq!(
-            overflow
-                .matches("bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES)")
-                .count(),
-            1,
-            "range overflow must own one bounded-read counter increment"
-        );
-        assert_eq!(
-            overflow.matches("return 0;").count(),
-            1,
-            "range overflow must return immediately"
-        );
-
-        let loop_start = listed
-            .find("while interface_index < 16")
-            .expect("count-sensitive interface loop");
-        assert!(listed.find("let active_count = count.min(16);").unwrap() < loop_start);
-        let loop_body = &listed[loop_start..];
-        assert!(
-            loop_body.contains("if interface_index as u64 >= active_count {\n            break;"),
-            "interface loop must terminate against active_count"
-        );
-        assert!(
-            loop_body.contains("state.arg0 + interface_index as u64 * 24"),
-            "interface loop must use the proven ordinary address expression"
-        );
-        assert!(
-            !loop_body.contains("checked_add"),
-            "interface loop must not repeat checked range arithmetic"
-        );
-        assert!(
-            !proof.contains("15 * 24"),
-            "range proof must depend on active_count"
-        );
-    };
-    assert_range_proof(listed);
-
-    let constant_range_proof = source.replacen("(active_count - 1) * 24", "15 * 24", 1);
-    let mutated_listed = between(
-        &constant_range_proof,
-        "pub fn interface_list_return(ctx: RetProbeContext) -> u32 {",
-        "#[uprobe]\npub fn interface_entry",
+    assert_eq!(
+        worker.matches("classify_direct_interface(").count(),
+        1,
+        "worker must own the sole direct classifier call"
     );
     assert!(
-        std::panic::catch_unwind(|| assert_range_proof(mutated_listed)).is_err(),
-        "constant 15 * 24 range proof mutation must be rejected"
+        !worker.contains("export_state_key(&ctx)"),
+        "worker must use a fixed zero-cookie state key"
     );
+    for marker in [
+        "StateKey {",
+        "pid_tgid: helpers::bpf_get_current_pid_tgid()",
+        "attach_cookie: 0",
+        "interface_continuation_unpack(state.arg1)",
+        "DISCOVERY_STATE.get(&key)",
+        "DISCOVERY_INTERFACES",
+        "(u64::from(symbol_id) << 32)",
+        "if active_count == 0",
+        "u64::from(interface_index).checked_mul(24)",
+        "interface_continuation_next(state.arg1)",
+        "BPF_EXIST",
+        "TAIL_CALLS.tail_call(&ctx, TAIL_CALLS_INTERFACE_WORKER_SLOT)",
+        "fail_export_state(&key)",
+        "finish_export_state(&key)",
+    ] {
+        assert!(worker.contains(marker), "worker contract misses {marker}");
+    }
+
+    assert!(source.contains("while pointer_index < 104"));
 
     for path in ["src/render.rs", "src/trace.rs", "src/output.rs"] {
         assert!(
@@ -2950,6 +3045,64 @@ fn live_discovery_bpf_classification_is_exact_and_output_only() {
             "private helper result escaped into {path}"
         );
     }
+}
+
+#[test]
+fn scope_auth_layout_and_padding_are_explicit_and_initialized() {
+    let source = read("crates/ebpf/src/main.rs");
+    let assert_contract = |source: &str| {
+        let struct_start = source
+            .find("#[derive(Clone, Copy)]\n#[repr(C)]\nstruct ScopeAuth {")
+            .expect("ScopeAuth must use an explicit C layout");
+        let scope = between(&source[struct_start..], "struct ScopeAuth {", "\n}\n");
+        let compact: String = scope
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        assert_eq!(
+            compact, "flags:u64,tgid:u32,_pad:u32,generation_token:u64,",
+            "ScopeAuth field order and widths must match the worker qword copy"
+        );
+        for assertion in [
+            "const _: [(); 24] = [(); core::mem::size_of::<ScopeAuth>()];",
+            "const _: [(); 0] = [(); core::mem::offset_of!(ScopeAuth, flags)];",
+            "const _: [(); 8] = [(); core::mem::offset_of!(ScopeAuth, tgid)];",
+            "const _: [(); 12] = [(); core::mem::offset_of!(ScopeAuth, _pad)];",
+            "const _: [(); 16] = [(); core::mem::offset_of!(ScopeAuth, generation_token)];",
+        ] {
+            assert!(
+                source.contains(assertion),
+                "missing ScopeAuth layout assertion: {assertion}"
+            );
+        }
+        let constructors = between(source, "fn scope_auth()", "fn scope_flags()");
+        assert_eq!(
+            constructors.matches("ScopeAuth {").count(),
+            2,
+            "scope_auth must retain both constructors"
+        );
+        assert_eq!(
+            constructors.matches("_pad: 0").count(),
+            2,
+            "both ScopeAuth constructors must initialize padding"
+        );
+    };
+    assert_contract(&source);
+
+    let missing_repr = source.replacen("#[repr(C)]\nstruct ScopeAuth", "struct ScopeAuth", 1);
+    assert!(
+        std::panic::catch_unwind(|| assert_contract(&missing_repr)).is_err(),
+        "ScopeAuth must reject implicit Rust layout"
+    );
+    let missing_pad = source.replacen(
+        "                _pad: 0,\n                generation_token: token,",
+        "                generation_token: token,",
+        1,
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_contract(&missing_pad)).is_err(),
+        "ScopeAuth must reject an omitted constructor pad initializer"
+    );
 }
 
 #[test]
@@ -3018,6 +3171,8 @@ fn live_discovery_checker_rejects_mutations_and_noncanonical_source() {
     ] {
         assert!(stdout.contains(marker), "checker self-test misses {marker}");
     }
+    let checker = read("scripts/check-live-discovery-object.py");
+    assert!(checker.contains("[\"llvm-objdump\", \"-dr\", \"--print-imm-hex\", str(path)]"));
 
     let directory = tempfile::tempdir().expect("temporary checker directory");
     let manifest = directory.path().join("manifest.json");
@@ -3047,6 +3202,9 @@ fn descriptors_are_published_read_back_and_frozen_before_probe_attachment() {
     let descriptor_freeze = source
         .find("freeze_map(\n            \"DESCRIPTORS\",")
         .expect("Session must freeze descriptors");
+    let tail_publication = source
+        .find("publish_and_freeze_tail_calls(&mut ebpf, unsafe_enabled)")
+        .expect("Session must publish and freeze TAIL_CALLS");
     let fork_attach = source
         .find(".attach(\"sched\", \"sched_process_fork\")")
         .expect("Session must attach the fork probe");
@@ -3055,8 +3213,11 @@ fn descriptors_are_published_read_back_and_frozen_before_probe_attachment() {
         .expect("Session must attach uprobes");
     assert_descriptor_publication_contract(&source).unwrap();
     assert!(publish < descriptor_freeze);
+    assert!(descriptor_freeze < tail_publication);
     assert!(descriptor_freeze < fork_attach);
     assert!(descriptor_freeze < uprobe_attach);
+    assert!(tail_publication < fork_attach);
+    assert!(tail_publication < uprobe_attach);
 }
 
 #[test]
@@ -3066,12 +3227,12 @@ fn policy_specific_ebpf() {
     let symbols = embedded_symbols();
 
     assert_eq!(definitions["ASYNC_FUNCTIONS"][KEY_SIZE], 32);
-    for unsafe_map in ["ATTR_BOOL_BITS", "TEMPLATE_TAIL"] {
-        assert!(
-            !definitions.contains_key(unsafe_map),
-            "default object contains unsafe-only map {unsafe_map}"
-        );
-    }
+    assert_eq!(definitions["TAIL_CALLS"][0], 3);
+    assert_eq!(definitions["TAIL_CALLS"][3], 2);
+    assert!(
+        !definitions.contains_key("ATTR_BOOL_BITS"),
+        "default object contains unsafe-only map ATTR_BOOL_BITS"
+    );
     for unsafe_symbol in [
         "p11_entry_template",
         "p11_entry_template_types",
@@ -3941,9 +4102,32 @@ fn live_discovery_gates_freeze_the_exact_command_inputs_and_fixture_flags() {
 }
 
 #[test]
+fn live_discovery_provider_macro_covers_all_104_table_slots() {
+    let provider = read("tests/fixtures/live-discovery-provider.c");
+    let macro_body = between(
+        &provider,
+        "#define PROVIDER_FUNCTIONS(X) \\",
+        "\n\nstatic P11ScopeTable",
+    );
+    let names = macro_body
+        .split("X(")
+        .skip(1)
+        .map(|entry| entry.split(')').next().expect("macro entry name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names.len(),
+        104,
+        "provider function macro slot count changed"
+    );
+    assert_eq!(names[3], "P11ScopeSlot3");
+    assert_eq!(names[103], "P11ScopeSlot103");
+}
+
+#[test]
 fn live_discovery_fixtures_have_two_byte_identities_and_three_surfaces() {
     let provider = read("tests/fixtures/live-discovery-provider.c");
     let driver = read("tests/fixtures/live-discovery-driver.c");
+    let validator = read("scripts/check-live-discovery-evidence.py");
     let first_include = provider
         .find("#include")
         .expect("provider includes system headers");
@@ -3956,6 +4140,41 @@ fn live_discovery_fixtures_have_two_byte_identities_and_three_surfaces() {
             && provider.contains("#define TABLE_FN static"),
         "one provider source must compile into exported and hidden table identities"
     );
+    assert!(
+        provider.contains("P11SCOPE_FIXTURE_INTERFACES")
+            && provider.contains("P11SCOPE_FIXTURE_MAX_INTERFACES 17")
+            && provider.contains("CK_INTERFACE interfaces[P11SCOPE_FIXTURE_MAX_INTERFACES]"),
+        "provider must bind the exact four-value interface-count knob with a fixed bound"
+    );
+    assert!(
+        driver.contains("P11SCOPE_FIXTURE_INTERFACES")
+            && driver.contains("P11SCOPE_FIXTURE_MAX_INTERFACES 17")
+            && driver.contains("CK_INTERFACE interfaces[P11SCOPE_FIXTURE_MAX_INTERFACES]"),
+        "driver must validate interface counts with a fixed bound"
+    );
+    assert!(
+        validator.contains("    \"P11SCOPE_FIXTURE_INTERFACES\","),
+        "the interface-count knob must be manifest-declared"
+    );
+    for value in ["0", "1", "16", "17"] {
+        let accepted = format!("strcmp(value, \"{value}\") == 0");
+        assert_eq!(
+            provider.matches(&accepted).count(),
+            1,
+            "provider accepted-count vocabulary changed for {value}"
+        );
+        assert_eq!(
+            driver.matches(&accepted).count(),
+            1,
+            "driver accepted-count vocabulary changed for {value}"
+        );
+    }
+    for source in [&provider, &driver] {
+        assert!(
+            !source.contains("strcmp(value, \"2\")"),
+            "unsupported interface count entered the fixture vocabulary"
+        );
+    }
     for surface in ["C_GetFunctionList", "C_GetInterfaceList", "C_GetInterface"] {
         assert!(
             provider.contains(&format!("{surface}(")),
@@ -3971,11 +4190,60 @@ fn live_discovery_fixtures_have_two_byte_identities_and_three_surfaces() {
         provider.contains("return provider_application_phase ? \"app\" : \"ctor\";"),
         "constructor and application markers must be distinguished by phase, not timing"
     );
+    assert!(
+        provider.contains("static CK_INTERFACE provider_interface;")
+            && provider.contains("provider_interface.pFunctionList = published_table();"),
+        "C_GetInterface storage must not look like a discovered interface before the call"
+    );
     // One driver source, both load kinds, and the frozen lane modes.
     assert!(
         driver.contains("#if defined(P11SCOPE_DRIVER_NEEDED)"),
         "one driver source must serve DT_NEEDED and dlopen load kinds"
     );
+
+    let directory = tempfile::tempdir().expect("temporary fixture build directory");
+    let provider_output = directory.path().join("provider-exported.so");
+    let driver_output = directory.path().join("driver-dlopen");
+    let provider_build = Command::new("gcc")
+        .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-fPIC"])
+        .arg("-DP11SCOPE_EXPORT_TABLES=1")
+        .args(["-shared", "-Wl,-z,defs", "-o"])
+        .arg(&provider_output)
+        .arg("tests/fixtures/live-discovery-provider.c")
+        .output()
+        .expect("compile exported live-discovery provider");
+    assert!(
+        provider_build.status.success(),
+        "provider build failed: {}",
+        String::from_utf8_lossy(&provider_build.stderr)
+    );
+    let driver_build = Command::new("gcc")
+        .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-fPIC"])
+        .args(["-o"])
+        .arg(&driver_output)
+        .arg("tests/fixtures/live-discovery-driver.c")
+        .args(["-ldl", "-pthread"])
+        .output()
+        .expect("compile live-discovery dlopen driver");
+    assert!(
+        driver_build.status.success(),
+        "driver build failed: {}",
+        String::from_utf8_lossy(&driver_build.stderr)
+    );
+    let provider_path = provider_output.to_str().expect("provider path is UTF-8");
+    for requested in ["0", "1", "16", "17"] {
+        let output = Command::new(&driver_output)
+            .args(["dlopen", provider_path])
+            .env("P11SCOPE_FIXTURE_INTERFACES", requested)
+            .output()
+            .expect("execute interface-count fixture row");
+        assert!(
+            output.status.success(),
+            "interface count {requested} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     for mode in [
         "needed",
         "dlopen",
@@ -3985,6 +4253,25 @@ fn live_discovery_fixtures_have_two_byte_identities_and_three_surfaces() {
     ] {
         assert!(driver.contains(mode), "driver lane mode missing: {mode}");
     }
+}
+
+#[test]
+fn live_discovery_post_gate_reads_after_done_marker() {
+    let driver = read("tests/fixtures/live-discovery-driver.c");
+    let done = driver
+        .find("emit(\"P11SCOPE_FIXTURE driver done\\n\");")
+        .expect("driver must emit its existing done marker");
+    let post_gate = driver
+        .find("const char *post_gate = getenv(\"P11SCOPE_FIXTURE_POST_GATE\");")
+        .expect("driver must expose the optional post-call gate");
+    let post_read = post_gate
+        + driver[post_gate..]
+            .find("read(STDIN_FILENO, &byte, 1)")
+            .expect("post-call gate must read exactly one byte");
+    assert!(
+        done < post_read,
+        "post-call gate must read only after the successful-call done marker"
+    );
 }
 
 #[test]

@@ -464,6 +464,7 @@ def u32(raw, offset):
 
 def decode_start(raw):
     assert len(raw) == CALL_START_SIZE
+    assert u64(raw, 264) == 0, "CallStart padding must be zero"
     return {
         "raw": raw, "session": u64(raw, 8), "slot_id": u64(raw, 16),
         "mechanism": u64(raw, 24), "mechanism_ptr": u64(raw, 32),
@@ -1066,6 +1067,9 @@ if work == "--self-test":
               decode_start(start_bytes(0x303, capture=ARG_READ_FAILURE)),
               decode_start(start_bytes(0x304, capture=ARG_READ_FAILURE))]
     assert_hostile_records(starts, pointers)
+    nonzero_pad = bytearray(start_bytes(0x301))
+    struct.pack_into("<I", nonzero_pad, 268, 1)
+    reject("CallStart padding", lambda: decode_start(bytes(nonzero_pad)))
     for session in (0x301, 0x302, 0x303, 0x304):
         mutated = [dict(record) for record in starts]
         record = next(record for record in mutated if record["session"] == session)
@@ -1350,9 +1354,9 @@ if work == "--self-test":
         name for name, definition in BPF_MAP_DEFS["UNSAFE_MAPS"].items()
         if definition["type"] == RINGBUF
     }, "a new owned ringbuf needs its exact record length here"
-    assert len(SAFE_MAPS) == 15 and len(FEATURE_MAPS) == 17, (SAFE_MAPS, FEATURE_MAPS)
+    assert len(SAFE_MAPS) == 16 and len(FEATURE_MAPS) == 17, (SAFE_MAPS, FEATURE_MAPS)
     assert {"COUNTERS", "DISCOVERY", "DISCOVERY_STATE", "PAUSE_PIDS"} <= SAFE_MAPS
-    assert FEATURE_MAPS - SAFE_MAPS == {"ATTR_BOOL_BITS", "TEMPLATE_TAIL"}
+    assert FEATURE_MAPS - SAFE_MAPS == {"ATTR_BOOL_BITS"}
 
     with tempfile.TemporaryDirectory() as scan_dir:
         prefix = f"{scan_dir}/default-safe-profile"
@@ -1389,7 +1393,7 @@ if work == "--self-test":
         manifest = owned_manifest()
         write_surfaces(manifest)
         surfaces = owned_map_surfaces("lane", manifest, SAFE_MAPS, prefix)
-        assert len(surfaces) == 15 and all(path.is_file() for path in surfaces), surfaces
+        assert len(surfaces) == 16 and all(path.is_file() for path in surfaces), surfaces
         assert {path.name for path in surfaces} >= {
             f"default-safe-profile.{name}.raw" for name in RING_RECORD_SIZES
         }, surfaces
@@ -1467,12 +1471,15 @@ lane_surfaces = {
     lane: assert_exact_owned_map_inventory(lane, expected)
     for lane, expected in lanes.items()
 }
+for lane in ["default-safe-profile", "default-safe-trace",
+             "feature-safe-profile", "feature-safe-trace",
+             "aggregate-only-metrics"]:
+    assert len(read_json(f"{work}/mapdump_TAIL_CALLS_{lane}.json")) == 1
 for lane in ["feature-safe-profile", "feature-safe-trace"]:
     assert read_json(f"{work}/mapdump_ATTR_BOOL_BITS_{lane}.json") == []
-    assert read_json(f"{work}/mapdump_TEMPLATE_TAIL_{lane}.json") == []
 for lane in ["feature-unsafe-profile", "feature-unsafe-trace"]:
     assert len(read_json(f"{work}/mapdump_ATTR_BOOL_BITS_{lane}.json")) == 11
-    assert len(read_json(f"{work}/mapdump_TEMPLATE_TAIL_{lane}.json")) == 1
+    assert len(read_json(f"{work}/mapdump_TAIL_CALLS_{lane}.json")) == 2
 
 for lane in ["feature-unsafe-profile", "feature-unsafe-trace"]:
     log = Path(f"{work}/{lane}.observer.log").read_text(encoding="utf-8")

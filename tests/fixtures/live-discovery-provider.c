@@ -27,6 +27,9 @@
  *   P11SCOPE_FIXTURE_QUIET=1     suppress markers (loss lanes call surfaces in
  *                                a tight loop and must not be rate-limited by
  *                                stderr).
+ *   P11SCOPE_FIXTURE_INTERFACES=N
+ *                                use exactly N interface records for N in
+ *                                {0, 1, 16, 17}; absent/invalid values use 1.
  */
 
 #define _GNU_SOURCE
@@ -52,12 +55,16 @@ typedef struct {
     void *pFunctionList;
     CK_FLAGS flags;
 } CK_INTERFACE;
+typedef CK_INTERFACE *CK_INTERFACE_PTR;
+typedef CK_INTERFACE_PTR *CK_INTERFACE_PTR_PTR;
 
 typedef struct {
     CK_VERSION version;
     CK_BYTE reserved[6];
     void *functions[104];
 } P11ScopeTable;
+
+#define P11SCOPE_FIXTURE_MAX_INTERFACES 17
 
 #define CKR_OK 0UL
 #define CKR_ARGUMENTS_BAD 7UL
@@ -86,6 +93,25 @@ static int provider_quiet(void) {
         cached = (value != NULL && value[0] == '1') ? 1 : 0;
     }
     return cached;
+}
+
+static CK_ULONG fixture_interface_count(void) {
+    const char *value = getenv("P11SCOPE_FIXTURE_INTERFACES");
+    if (value != NULL) {
+        if (strcmp(value, "0") == 0) {
+            return 0;
+        }
+        if (strcmp(value, "1") == 0) {
+            return 1;
+        }
+        if (strcmp(value, "16") == 0) {
+            return 16;
+        }
+        if (strcmp(value, "17") == 0) {
+            return 17;
+        }
+    }
+    return 1;
 }
 
 /* write(2) is warn_unused_result under glibc; -Werror needs the result read. */
@@ -118,7 +144,7 @@ static const char *phase_name(void) {
 }
 
 #define PROVIDER_FUNCTIONS(X) \
-    X(C_Initialize) X(C_Finalize) X(C_GetInfo) X(C_GetSlotList) \
+    X(C_Initialize) X(C_Finalize) X(C_GetInfo) X(P11ScopeSlot3) X(C_GetSlotList) \
     X(C_GetSlotInfo) X(C_GetTokenInfo) X(C_GetMechanismList) \
     X(C_GetMechanismInfo) X(C_InitToken) X(C_InitPIN) X(C_SetPIN) \
     X(C_OpenSession) X(C_CloseSession) X(C_CloseAllSessions) \
@@ -171,6 +197,7 @@ static P11ScopeTable provider_table = {
 };
 
 static char provider_interface_name[] = "PKCS 11";
+static CK_INTERFACE provider_interface;
 
 /* A table whose last byte sits one byte before an unmapped page, so the
  * production bounded read must report truncation rather than a short copy. */
@@ -221,23 +248,26 @@ C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count) {
     if (count == NULL) {
         return CKR_ARGUMENTS_BAD;
     }
+    CK_ULONG interface_count = fixture_interface_count();
     if (out == NULL) {
-        *count = 1;
+        *count = interface_count;
         return CKR_OK;
     }
-    if (*count < 1) {
-        *count = 1;
+    if (*count < interface_count) {
+        *count = interface_count;
         return CKR_BUFFER_TOO_SMALL;
     }
-    out[0].pInterfaceName = provider_interface_name;
-    out[0].pFunctionList = published_table();
-    out[0].flags = 0;
-    *count = 1;
+    for (CK_ULONG index = 0; index < interface_count; index++) {
+        out[index].pInterfaceName = provider_interface_name;
+        out[index].pFunctionList = published_table();
+        out[index].flags = 0;
+    }
+    *count = interface_count;
     return CKR_OK;
 }
 
 PROVIDER_EXPORT __attribute__((noinline, used)) CK_RV
-C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags) {
+C_GetInterface(void *name, void *version, CK_INTERFACE_PTR_PTR out, CK_FLAGS flags) {
     (void)name;
     (void)version;
     (void)flags;
@@ -245,16 +275,22 @@ C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags) {
     if (out == NULL) {
         return CKR_ARGUMENTS_BAD;
     }
-    *out = published_table();
+    provider_interface.pInterfaceName = provider_interface_name;
+    provider_interface.pFunctionList = published_table();
+    provider_interface.flags = 0;
+    *out = &provider_interface;
     return CKR_OK;
 }
 
 __attribute__((constructor)) static void provider_constructor(void) {
     void *table = NULL;
     (void)C_GetFunctionList(&table);
-    CK_INTERFACE interface;
-    CK_ULONG count = 1;
-    (void)C_GetInterfaceList(&interface, &count);
-    (void)C_GetInterface(provider_interface_name, NULL, &table, 0);
+    CK_INTERFACE interfaces[P11SCOPE_FIXTURE_MAX_INTERFACES];
+    CK_ULONG count = P11SCOPE_FIXTURE_MAX_INTERFACES;
+    (void)C_GetInterfaceList(interfaces, &count);
+    if (count != 0) {
+        CK_INTERFACE_PTR interface = NULL;
+        (void)C_GetInterface(provider_interface_name, NULL, &interface, 0);
+    }
     provider_application_phase = 1;
 }

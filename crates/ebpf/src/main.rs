@@ -10,7 +10,6 @@
 use aya_ebpf::bindings::BPF_F_RDONLY_PROG;
 use aya_ebpf::macros::{map, tracepoint, uprobe, uretprobe};
 use aya_ebpf::maps::ring_buf::RingBufEntry;
-#[cfg(feature = "unsafe-unvalidated-metadata")]
 use aya_ebpf::maps::ProgramArray;
 use aya_ebpf::maps::{Array, CgroupArray, HashMap, PerCpuArray, PerCpuHashMap, RingBuf};
 use aya_ebpf::programs::{ProbeContext, RetProbeContext, TracePointContext};
@@ -19,14 +18,17 @@ use core::mem::MaybeUninit;
 use p11scope_ebpf_common::{
     bucket_of, capture, cookie_descriptor, cookie_slot, discovery_pause_coalesced,
     discovery_pause_enabled, discovery_state_take_failed, discovery_table_slots,
-    discovery_usable_prefix, event_type, lifecycle, return_allows_mechanism, shape, valid_config,
-    valid_loader_cookie, CallStart, DiscoveryRecord, Event, FunctionNameKey, PauseKey, RvKey,
-    SlotSemantics, SlotStats, StartKey, StartState, StateKey, ARG_NONE, CFG_FLAGS,
-    COALESCED_NO_HELPER_RC, DISCOVERY_BYTES, DISCOVERY_COUNTER_CELLS,
+    discovery_usable_prefix, event_type, interface_continuation_next,
+    interface_continuation_pack, interface_continuation_unpack, lifecycle,
+    return_allows_mechanism, shape, valid_config, valid_loader_cookie, CallStart, DiscoveryRecord,
+    Event, FunctionNameKey, PauseKey, RvKey, SlotSemantics, SlotStats, StartKey, StartState,
+    StateKey, ARG_NONE, CFG_FLAGS, COALESCED_NO_HELPER_RC, DISCOVERY_BYTES,
+    DISCOVERY_COUNTER_CELLS,
     DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES, DISCOVERY_COUNTER_EXPORT_STATE_FAILURES,
     DISCOVERY_COUNTER_LOADER_HITS, DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES,
     DISCOVERY_COUNTER_RING_LOSS, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
     DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
+    DISCOVERY_INTERFACES,
     DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER, DISCOVERY_NAME_EXACT_STANDARD,
     DISCOVERY_NAME_NA, DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER, DISCOVERY_NAME_UNREADABLE,
     DISCOVERY_STATUS_COALESCED_NO_HELPER, DISCOVERY_STATUS_LOADER_CONTEXT_INVALID,
@@ -36,11 +38,13 @@ use p11scope_ebpf_common::{
     FLAG_CGROUP_FILTER, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
     FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, LOADER_STATE_PRESENT, MAX_ATTRS, MAX_DESCRIPTORS,
     MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, PAUSE_ARMED, PAUSE_REQUESTED, RING_BYTES, RV_ENTRIES,
-    R_STATE_OFFSET, SESSION_NONE, START_ENTRIES, USER_TYPE_NONE,
+    R_STATE_OFFSET, SESSION_NONE, START_ENTRIES, TAIL_CALLS_INTERFACE_WORKER_SLOT,
+    USER_TYPE_NONE,
 };
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use p11scope_ebpf_common::{
     EVIDENCE_TEMPLATE_TAIL_FAILURES, FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA,
+    TAIL_CALLS_TEMPLATE_SECOND_SLOT,
 };
 
 #[map]
@@ -79,9 +83,8 @@ static MECH_SHAPE: HashMap<u64, u32> =
 #[map]
 static ATTR_BOOL_BITS: HashMap<u32, u32> = HashMap::with_max_entries(16, BPF_F_RDONLY_PROG);
 
-#[cfg(feature = "unsafe-unvalidated-metadata")]
 #[map]
-static TEMPLATE_TAIL: ProgramArray = ProgramArray::with_max_entries(1, 0);
+static TAIL_CALLS: ProgramArray = ProgramArray::with_max_entries(2, 0);
 
 /// Exact bounded standard function name -> stable shared-table id. Raw
 /// `pFunctionName` bytes never leave the BPF stack.
@@ -117,11 +120,19 @@ fn bump_evidence(index: u32) {
 }
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct ScopeAuth {
     flags: u64,
     tgid: u32,
+    _pad: u32,
     generation_token: u64,
 }
+
+const _: [(); 24] = [(); core::mem::size_of::<ScopeAuth>()];
+const _: [(); 0] = [(); core::mem::offset_of!(ScopeAuth, flags)];
+const _: [(); 8] = [(); core::mem::offset_of!(ScopeAuth, tgid)];
+const _: [(); 12] = [(); core::mem::offset_of!(ScopeAuth, _pad)];
+const _: [(); 16] = [(); core::mem::offset_of!(ScopeAuth, generation_token)];
 
 fn scope_auth() -> Option<ScopeAuth> {
     let flags = CONFIG.get(CFG_FLAGS).copied().unwrap_or(0);
@@ -136,6 +147,7 @@ fn scope_auth() -> Option<ScopeAuth> {
             return Some(ScopeAuth {
                 flags,
                 tgid,
+                _pad: 0,
                 generation_token: token,
             });
         }
@@ -146,6 +158,7 @@ fn scope_auth() -> Option<ScopeAuth> {
                 return Some(ScopeAuth {
                     flags,
                     tgid,
+                    _pad: 0,
                     generation_token: 0,
                 });
             }
@@ -622,6 +635,21 @@ fn take_export_state(ctx: &RetProbeContext, scoped: bool) -> Option<(StateKey, S
     state.map(|state| (key, state))
 }
 
+fn discard_export_state(key: &StateKey) {
+    let _ = DISCOVERY_STATE.remove(key);
+}
+
+fn fail_export_state(key: &StateKey) {
+    discard_export_state(key);
+    bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
+}
+
+fn finish_export_state(key: &StateKey) {
+    if DISCOVERY_STATE.remove(key).is_err() {
+        fail_export_state(key);
+    }
+}
+
 #[uprobe]
 pub fn function_list_entry(ctx: ProbeContext) -> u32 {
     insert_export_state(
@@ -675,10 +703,10 @@ pub fn interface_list_entry(ctx: ProbeContext) -> u32 {
 #[uretprobe]
 pub fn interface_list_return(ctx: RetProbeContext) -> u32 {
     let scope = scope_auth();
-    let Some((key, state)) = take_export_state(&ctx, scope.is_some()) else {
+    let Some((entry_key, state)) = take_export_state(&ctx, scope.is_some()) else {
         return 0;
     };
-    let Some(scope) = scope else {
+    let Some(_scope) = scope else {
         return 0;
     };
     let rv: u64 = ctx.ret();
@@ -689,8 +717,7 @@ pub fn interface_list_return(ctx: RetProbeContext) -> u32 {
         bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
         return 0;
     };
-    let announced_count = count.min(u32::MAX as u64) as u32;
-    let active_count = count.min(16);
+    let active_count = count.min(u64::from(DISCOVERY_INTERFACES));
     if active_count == 0 {
         return 0;
     }
@@ -705,22 +732,114 @@ pub fn interface_list_return(ctx: RetProbeContext) -> u32 {
         bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES);
         return 0;
     }
-    let mut interface_index = 0usize;
-    while interface_index < 16 {
-        if interface_index as u64 >= active_count {
-            break;
-        }
-        let address = state.arg0 + interface_index as u64 * 24;
-        classify_direct_interface(
-            DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN as u64
-                | ((interface_index as u64) << 8)
-                | ((key.attach_cookie as u32 as u64) << 32),
-            announced_count,
-            address,
-            &scope,
-        );
-        interface_index += 1;
+    let symbol_id = entry_key.attach_cookie as u32;
+    let Some(packed) = interface_continuation_pack(count, 0, symbol_id) else {
+        bump_discovery_counter(DISCOVERY_COUNTER_EXPORT_STATE_FAILURES);
+        return 0;
+    };
+    let key = StateKey {
+        pid_tgid: entry_key.pid_tgid,
+        attach_cookie: 0,
+    };
+    let continuation = StartState {
+        arg0: state.arg0,
+        arg1: packed,
+    };
+    if DISCOVERY_STATE
+        .insert(
+            &key,
+            &continuation,
+            aya_ebpf::bindings::BPF_NOEXIST as u64,
+        )
+        .is_err()
+    {
+        fail_export_state(&key);
+        return 0;
     }
+    unsafe { TAIL_CALLS.tail_call(&ctx, TAIL_CALLS_INTERFACE_WORKER_SLOT) };
+    fail_export_state(&key);
+    0
+}
+
+#[uretprobe]
+pub fn interface_list_worker(ctx: RetProbeContext) -> u32 {
+    let key = StateKey {
+        pid_tgid: helpers::bpf_get_current_pid_tgid(),
+        attach_cookie: 0,
+    };
+    let Some(scope) = scope_auth() else {
+        discard_export_state(&key);
+        return 0;
+    };
+    let Some(state) = (unsafe { DISCOVERY_STATE.get(&key) }).copied() else {
+        fail_export_state(&key);
+        return 0;
+    };
+    if state.arg0 == 0 {
+        fail_export_state(&key);
+        return 0;
+    }
+    let Some((announced_count, interface_index, symbol_id)) =
+        interface_continuation_unpack(state.arg1)
+    else {
+        fail_export_state(&key);
+        return 0;
+    };
+    let active_count = u64::from(if announced_count < DISCOVERY_INTERFACES as u32 {
+        announced_count
+    } else {
+        DISCOVERY_INTERFACES as u32
+    });
+    if active_count == 0 {
+        fail_export_state(&key);
+        return 0;
+    }
+    let Some(last_offset) = active_count
+        .checked_sub(1)
+        .and_then(|index| index.checked_mul(24))
+    else {
+        fail_export_state(&key);
+        return 0;
+    };
+    if state.arg0.checked_add(last_offset).is_none() {
+        fail_export_state(&key);
+        return 0;
+    }
+    let Some(interface_offset) = u64::from(interface_index).checked_mul(24) else {
+        fail_export_state(&key);
+        return 0;
+    };
+    let Some(address) = state.arg0.checked_add(interface_offset)
+    else {
+        fail_export_state(&key);
+        return 0;
+    };
+    classify_direct_interface(
+        DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN as u64
+            | (u64::from(interface_index) << 8)
+            | (u64::from(symbol_id) << 32),
+        announced_count,
+        address,
+        &scope,
+    );
+
+    let Some(next) = interface_continuation_next(state.arg1) else {
+        finish_export_state(&key);
+        return 0;
+    };
+    let continuation = StartState {
+        arg0: state.arg0,
+        arg1: next,
+    };
+    if DISCOVERY_STATE
+        .insert(&key, &continuation, aya_ebpf::bindings::BPF_EXIST as u64)
+        .is_err()
+    {
+        fail_export_state(&key);
+        return 0;
+    }
+    unsafe { TAIL_CALLS.tail_call(&ctx, TAIL_CALLS_INTERFACE_WORKER_SLOT) };
+    fail_export_state(&key);
     0
 }
 
@@ -1414,7 +1533,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8>(ctx: ProbeContext) -> u32 {
     if TEMPLATE_MODE == 3 {
         // Success never returns. Failure leaves template0 as usable partial
         // evidence and is independently disclosed below.
-        unsafe { TEMPLATE_TAIL.tail_call(&ctx, 0) };
+        unsafe { TAIL_CALLS.tail_call(&ctx, TAIL_CALLS_TEMPLATE_SECOND_SLOT) };
         bump_evidence(EVIDENCE_TEMPLATE_TAIL_FAILURES);
     }
     0

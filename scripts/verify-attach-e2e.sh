@@ -107,7 +107,12 @@ if [ "${1-}" = "--self-test" ]; then
 fi
 
 MODULE=/usr/lib/softhsm/libsofthsm2.so
-WORK=target/e2e
+WORK=${P11SCOPE_TASK4_WORK-target/e2e}
+if [ "${P11SCOPE_TASK4_WORK+set}" = set ]; then
+    case $WORK in /*) ;; *) echo "P11SCOPE_TASK4_WORK must be absolute" >&2; exit 2 ;; esac
+else
+    WORK=$(pwd -P)/$WORK
+fi
 WPID=
 SPID=
 . scripts/lib.sh
@@ -145,7 +150,7 @@ export SOFTHSM2_CONF="$WORK/softhsm2.conf"
 rm -rf "$WORK/tokens"
 mkdir -p "$WORK/tokens"
 cat > "$SOFTHSM2_CONF" <<EOF
-directories.tokendir = $PWD/$WORK/tokens
+directories.tokendir = $WORK/tokens
 objectstore.backend = file
 log.level = ERROR
 slots.removable = false

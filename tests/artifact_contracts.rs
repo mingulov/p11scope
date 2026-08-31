@@ -2569,8 +2569,11 @@ fn live_discovery_bpf_classification_is_exact_and_output_only() {
         "if active_count == 0",
         "if state.arg0 == 0",
         "checked_add((active_count - 1) * 24)",
-        "interface_continuation_pack(count, 0)",
-        "BPF_EXIST",
+        "interface_continuation_pack(count, 0, symbol_id)",
+        "take_export_state(&ctx, scope.is_some())",
+        "StateKey {",
+        "attach_cookie: 0",
+        "BPF_NOEXIST",
         "TAIL_CALLS.tail_call(&ctx, TAIL_CALLS_INTERFACE_WORKER_SLOT)",
         "fail_export_state(&key)",
     ] {
@@ -2587,11 +2590,18 @@ fn live_discovery_bpf_classification_is_exact_and_output_only() {
         1,
         "worker must own the sole direct classifier call"
     );
+    assert!(
+        !worker.contains("export_state_key(&ctx)"),
+        "worker must use a fixed zero-cookie state key"
+    );
     for marker in [
-        "export_state_key(&ctx)",
+        "StateKey {",
+        "pid_tgid: helpers::bpf_get_current_pid_tgid()",
+        "attach_cookie: 0",
         "interface_continuation_unpack(state.arg1)",
         "DISCOVERY_STATE.get(&key)",
         "DISCOVERY_INTERFACES",
+        "(u64::from(symbol_id) << 32)",
         "if active_count == 0",
         "u64::from(interface_index).checked_mul(24)",
         "interface_continuation_next(state.arg1)",

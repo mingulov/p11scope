@@ -55,6 +55,8 @@ typedef struct {
     void *pFunctionList;
     CK_FLAGS flags;
 } CK_INTERFACE;
+typedef CK_INTERFACE *CK_INTERFACE_PTR;
+typedef CK_INTERFACE_PTR *CK_INTERFACE_PTR_PTR;
 
 typedef struct {
     CK_VERSION version;
@@ -195,6 +197,11 @@ static P11ScopeTable provider_table = {
 };
 
 static char provider_interface_name[] = "PKCS 11";
+static CK_INTERFACE provider_interface = {
+    .pInterfaceName = provider_interface_name,
+    .pFunctionList = &provider_table,
+    .flags = 0,
+};
 
 /* A table whose last byte sits one byte before an unmapped page, so the
  * production bounded read must report truncation rather than a short copy. */
@@ -264,7 +271,7 @@ C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count) {
 }
 
 PROVIDER_EXPORT __attribute__((noinline, used)) CK_RV
-C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags) {
+C_GetInterface(void *name, void *version, CK_INTERFACE_PTR_PTR out, CK_FLAGS flags) {
     (void)name;
     (void)version;
     (void)flags;
@@ -272,7 +279,7 @@ C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags) {
     if (out == NULL) {
         return CKR_ARGUMENTS_BAD;
     }
-    *out = published_table();
+    *out = &provider_interface;
     return CKR_OK;
 }
 
@@ -283,7 +290,8 @@ __attribute__((constructor)) static void provider_constructor(void) {
     CK_ULONG count = P11SCOPE_FIXTURE_MAX_INTERFACES;
     (void)C_GetInterfaceList(interfaces, &count);
     if (count != 0) {
-        (void)C_GetInterface(provider_interface_name, NULL, &table, 0);
+        CK_INTERFACE_PTR interface = NULL;
+        (void)C_GetInterface(provider_interface_name, NULL, &interface, 0);
     }
     provider_application_phase = 1;
 }

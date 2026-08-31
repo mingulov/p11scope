@@ -185,8 +185,9 @@ Generated `target/` trees are not evidence.
 
 ## Portable transfer package
 
-The complete `main` history through `90a03acbbbaff6de39fe56d3eb4de8b8add27e43`
-and the finite accepted evidence set are packaged at:
+The historical `main` history through
+`90a03acbbbaff6de39fe56d3eb4de8b8add27e43` and its then-current evidence set
+remain packaged at:
 
 `/home/user/.local/state/p11scope/pkcs11-scope-portable-90a03ac.tar.zst`
 
@@ -198,8 +199,8 @@ and the finite accepted evidence set are packaged at:
   `b9f8f6171d0820b9a8e98def82ba804000bf174a6cf5ff1c04e6fdc69ea0ea71`
 - unpacked/archive sizes: 32 MiB / 14 MiB.
 
-`git bundle verify` reports a complete history with `refs/heads/main` at
-`90a03ac`. The package contains the Jammy/Noble accepted runtime roots,
+`git bundle verify` reports a complete historical package with
+`refs/heads/main` at `90a03ac`. The package contains the Jammy/Noble accepted runtime roots,
 Stage 3A3 GREEN6 reports, exact security scan artifacts, and the release
 binaries/receipts without rebuildable Cargo intermediates. Its adjacent
 `.sha256` file is the authoritative archive checksum.
@@ -238,14 +239,20 @@ Durable private copy (mode 0700/0600):
 
 ## Remaining critical path
 
-1. Fix the smallest release-relevant identity/boundedness/build-receipt
+1. Generate and verify the refreshed portable package after this commit.
+2. Fix the smallest release-relevant identity/boundedness/build-receipt
    findings.
-2. Rerun the four exact-tip local gates and exact-tip CI.
-3. Complete the release build/receipt and release closeout.
-4. After MVP closeout, run the approved Fedora QEMU smoke with SELinux
-   `Enforcing`; do not duplicate the historical high-volume campaign unless a
-   portability failure requires it.
+3. Rerun exact-tip hosted CI.
+4. Complete the release build/receipt and release closeout.
+
+## Fedora 44 SELinux-Enforcing portability result
+
+The post-MVP portability campaign passed on exact product commit `1d3837b`:
+Rust 1.88 workspace gates, Fedora SoftHSM core capture, the focused
+startup-interface row (`208/208`, 104 slots, one exact interface),
+inspect/doctor, seven privacy-canary lanes, zero AVCs, and clean BPF cleanup.
+See [the exact report](2026-09-01-fedora44-selinux-evidence.md).
 
 Full security clearance, exact-final-candidate container/deployment reruns,
-exact-tip CI, complete packaging, publication, push, tag, and release remain
-UNRUN unless a separate accepted record says otherwise.
+exact-tip hosted CI, complete release packaging, publication, push, tag, and
+release remain UNRUN unless a separate accepted record says otherwise.

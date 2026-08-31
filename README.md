@@ -15,8 +15,11 @@ assessment and incident diagnostics.
 > capture, schema v2, and owned-child live discovery are implemented. The
 > frozen candidate passed all six semantic/privacy/cleanup rows on Ubuntu
 > 22.04 kernel 5.15 and Ubuntu 24.04 kernel 6.8, and its merged `main` tree
-> passes the four locked workspace gates. Exact-tip CI, packaging, release,
-> and final security closeout remain pending.
+> passes the four locked workspace gates. The exact-candidate static security
+> review is complete and found one high, six medium, and two low issues; the
+> default `sudo p11scope run` child-authority finding blocks a public release.
+> Exact-tip CI, complete packaging, remediation, publication, and release
+> remain pending.
 
 Function-table support is cumulative: legacy PKCS #11 2.00, every 2.01–2.40
 table, and standard 3.0, 3.1, and 3.2 interfaces (all 104 slots published in
@@ -212,11 +215,17 @@ conflict modules; an accepted manifest may authorize only its exact pinned
 object, offset, and canonical function name. The owned-child `run` path and
 capture-history corrections passed the local 5.15/6.8 semantic campaign.
 The project remains unreleased while exact-tip CI, packaging, and final
-security/release review are pending.
+security remediation/release review are pending. **Current safety warning:**
+when the observer itself runs as root, `p11scope run -- ...` currently execs
+the child with that same authority. Until the tracked privilege-boundary fix
+lands, use `profile`/`trace` against an already-running workload, or run only a
+command that is explicitly intended and trusted to execute as root.
 
-Fresh final-candidate unprivileged, privileged, container, Kubernetes, and
-release results are recorded in the Task 4 handoff. No remote CI result is
-claimed.
+Fresh final-candidate unprivileged self-tests, local packaging subsets, and
+the Jammy/Noble owned-run campaign are recorded in the productization evidence
+index. Container and Kubernetes results predate the final candidate and remain
+historical support evidence, not an exact-tip rerun. No remote exact-tip CI or
+complete release-build result is claimed.
 
 When used, the helper recreates the table in its own process; it never reads or
 injects into the observed process. Uprobes are bound to the verified target

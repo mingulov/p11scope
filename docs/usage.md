@@ -9,8 +9,10 @@ implementation limits are code contracts, not measurements.
 > Memory-scan discovery, `inspect`, `doctor`, public `run`, multi-module
 > capture, schema v2, and owned-child live discovery are implemented. The
 > frozen candidate passed all six semantic/privacy/cleanup rows on Ubuntu
-> 22.04 kernel 5.15 and Ubuntu 24.04 kernel 6.8. Exact-tip CI, packaging,
-> release, and final security closeout remain pending.
+> 22.04 kernel 5.15 and Ubuntu 24.04 kernel 6.8. The static security closeout
+> is complete and found release-blocking privilege, identity, boundedness,
+> output, and build-receipt gaps. Exact-tip CI, complete packaging,
+> remediation, publication, and release remain pending.
 > See the
 > [safe metadata design](superpowers/specs/2026-08-13-safe-and-unvalidated-metadata-design.md)
 > and the
@@ -119,6 +121,13 @@ sudo p11scope trace --cgroup /sys/fs/cgroup/... --duration 15
 sudo p11scope run --module /opt/vendor/lib/pkcs11.so \
   -o observed-profile.json --pause auto -- /opt/application/bin/workload
 ```
+
+> **Current `run` safety boundary:** an observer started with `sudo` currently
+> execs the owned child with the observer's root authority. Until the tracked
+> privilege-drop fix lands, use `profile`/`trace` against an already-running
+> workload, or use `run` only for a command explicitly intended and trusted to
+> run as root. The six-row campaign proves capture semantics and cleanup; it
+> does not make this authority transfer safe.
 
 ### Discovery timing and optional offline discovery
 
@@ -430,9 +439,9 @@ scan-only and conflict modules. An accepted manifest authorizes only the exact
 pinned object, offset, and canonical function name it attests; stale fallback,
 hash agreement, path identity, and raw `{dev,ino}` never transfer that
 attestation. The owned-child `run` path and capture-history corrections passed
-the local 5.15/6.8 semantic campaign. Exact-tip CI, packaging, and final
-security/release review remain pending, so no release or security-clearance
-claim applies yet.
+the local 5.15/6.8 semantic campaign. Exact-tip CI, complete packaging, and
+the recorded security remediations remain pending, so no release or full
+security-clearance claim applies yet.
 
 **`PARTIAL`** is forced by any single gap in that list — an attach
 failure, ring-buffer loss, a template the in-kernel walk couldn't finish

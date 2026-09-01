@@ -158,12 +158,19 @@ kernel is *expected to work*, not *supported*.
 under any flag (privacy contract, §5); macOS/Windows.
 
 **Design invariant, not a non-goal — discovery never calls `C_GetInterface`.**
-The why (Phase 1 design, ROADMAP): `C_GetInterface` executes the module's
-*selection* policy — name/version/flags matching, possibly with fallback — so
-its result records what the module would choose for a particular caller, not
-what tables exist; and fallback-resolved interfaces may alias the primary
-table by design, fabricating false aliasing evidence. Inventory must come
-only from `C_GetFunctionList` + `C_GetInterfaceList` enumeration. An
+The why (Phase 1 design, ROADMAP; version-dependence rationale added by the
+owner 2026-09-01): `C_GetInterface` is a *parameterized selection* call — its
+answer depends on the requested interface name, version, and flags AND on
+which PKCS#11 versions the particular module supports, with possible
+fallback. There is no single caller-independent answer to record: any result
+would be an artifact of the query p11scope chose to make, not a property of
+the module. Worse, fallback-resolved interfaces may alias the primary table
+by design, fabricating false aliasing evidence. So inventory comes only from
+`C_GetFunctionList` + `C_GetInterfaceList` enumeration — version-complete and
+caller-independent (every 2.x table and 3.0/3.1/3.2 interface recorded).
+Nothing is lost: the target app's own selection is still observable, because
+whichever table the app was given, its calls land on enumerated functions
+that p11scope probes by file offset. An
 *explicit, clearly-labeled* selection-probe diagnostic ("what would a
 consumer asking for 'PKCS 11' v3.0 get?") is a legitimate future feature —
 recorded as selection-behavior evidence, never merged into inventory — and is

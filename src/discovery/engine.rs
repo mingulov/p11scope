@@ -1171,6 +1171,9 @@ pub(crate) struct IncompleteTerminalDrain {
     pub(crate) records: Vec<DiscoveryRecord>,
     pub(crate) malformed: u64,
     pub(crate) unvalidated_records: u64,
+    /// The drain stopped at its work quantum, not on a failure: the prefix is
+    /// exact and the rest is still queued on the ring for the next drain.
+    pub(crate) backlog: bool,
     cause: String,
 }
 
@@ -1185,7 +1188,18 @@ impl IncompleteTerminalDrain {
             records,
             malformed,
             unvalidated_records,
+            backlog: false,
             cause: cause.to_string(),
+        }
+    }
+
+    fn backlog(records: Vec<DiscoveryRecord>, malformed: u64) -> Self {
+        Self {
+            records,
+            malformed,
+            unvalidated_records: 0,
+            backlog: true,
+            cause: DISCOVERY_DRAIN_BACKLOG_REASON.into(),
         }
     }
 }
@@ -1197,6 +1211,7 @@ impl std::fmt::Debug for IncompleteTerminalDrain {
             .field("records", &self.records.len())
             .field("malformed", &self.malformed)
             .field("unvalidated_records", &self.unvalidated_records)
+            .field("backlog", &self.backlog)
             .field("cause", &self.cause)
             .finish()
     }
@@ -2763,6 +2778,15 @@ const STALE_VIEW_REASON: &str = "accepted process generation changed during atta
 /// *retry*, so it is only true while the journal that owes it is still
 /// pending; `settle_terminal_drain` judges it at capture end.
 const TERMINAL_DRAIN_SUBJECT: &str = "live loader retirement";
+/// Records one live drain takes off the private discovery ring before it
+/// returns to a caller that checks duration, signal and pause deadline. The
+/// 64 KiB ring holds ~73 records, so a drain stopped here has emptied the
+/// ring several times over and leaves only what the producer wrote during the
+/// drain itself; that backlog is reported as an incomplete drain, never as an
+/// empty ring, and any overflow it causes is the producer's `ring_loss`.
+pub(crate) const LIVE_DISCOVERY_DRAIN_QUANTUM: usize = 256;
+const DISCOVERY_DRAIN_BACKLOG_REASON: &str =
+    "the live discovery drain stopped at its work quantum with records still queued";
 const TERMINAL_DRAIN_RETRY_REASON: &str = "the post-detach private discovery drain failed; the exact terminal batch remains \
      tombstoned for retry";
 
@@ -4962,12 +4986,17 @@ impl Engine {
         }))
     }
 
+    /// Takes at most `LIVE_DISCOVERY_DRAIN_QUANTUM` items off the private
+    /// ring, which refills while it is read. `Ok` means the ring read empty; a
+    /// quantum stop is an `IncompleteTerminalDrain` with `backlog` set, so no
+    /// route can mistake it for an empty ring, and the terminal routes retain
+    /// its exact prefix as an incomplete batch until a later drain reads empty.
     fn collect_discovery_records(
         session: &mut dyn EngineSession,
     ) -> Result<(Vec<DiscoveryRecord>, u64)> {
         let mut records = Vec::new();
         let mut malformed = 0u64;
-        loop {
+        for _ in 0..LIVE_DISCOVERY_DRAIN_QUANTUM {
             match session.discovery_dequeue() {
                 Ok(Some(crate::events::DiscoveryItem::Record(record))) => records.push(record),
                 Ok(Some(crate::events::DiscoveryItem::Malformed)) => {
@@ -4981,6 +5010,18 @@ impl Engine {
                     return Err(IncompleteTerminalDrain::new(records, malformed, 0, error).into());
                 }
             }
+        }
+        Err(IncompleteTerminalDrain::backlog(records, malformed).into())
+    }
+
+    /// Every dequeue is capture-wide work, charged where the records enter the
+    /// Engine. They are already off the ring, so a refused charge never drops
+    /// them: the sticky stop it leaves is what the budget's other consumers
+    /// refuse on and publish under its own reason.
+    fn charge_discovery_drain(&mut self, records: usize, malformed: u64) {
+        let units = (records as u64).saturating_add(malformed);
+        if units != 0 {
+            self.budget.charge(units);
         }
     }
 
@@ -6833,8 +6874,11 @@ impl Engine {
             .terminal_batch
             .as_mut()
             .ok_or_else(|| anyhow!("terminal loader drain batch is missing"))?;
+        let before = batch.records.len();
         batch.extend(records);
         batch.complete = complete;
+        let added = batch.records.len() - before;
+        self.charge_discovery_drain(added, malformed);
         if malformed != 0 {
             self.record_malformed_discovery(malformed);
         }
@@ -8317,8 +8361,22 @@ impl Engine {
     /// semantic consumers immediately when this reports a plan change, before
     /// draining the ordinary event ring.
     pub fn drain_discovery(&mut self, session: &mut Session) -> Result<bool> {
-        let (records, malformed) =
-            Self::collect_discovery_records(session).map_err(Self::generic_drain_error)?;
+        self.drain_discovery_from(session)
+    }
+
+    /// A quantum stop is backlog, not failure: the exact prefix is applied now
+    /// and the rest stays on the ring for the next tick, which the run loop's
+    /// duration/signal checks precede. Overflow in between is the producer's
+    /// `ring_loss`, read with every batch.
+    pub(crate) fn drain_discovery_from(&mut self, session: &mut dyn EngineSession) -> Result<bool> {
+        let (records, malformed) = match Self::collect_discovery_records(session) {
+            Ok(drained) => drained,
+            Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
+                Ok(incomplete) if incomplete.backlog => (incomplete.records, incomplete.malformed),
+                Ok(incomplete) => return Err(Self::generic_drain_error(incomplete.into())),
+                Err(error) => return Err(error),
+            },
+        };
         self.apply_discovery_batch(session, records, malformed)
     }
 
@@ -8385,6 +8443,7 @@ impl Engine {
         terminal_dispatch: bool,
         collect: &mut DiscoveryCollector<'_>,
     ) -> Result<DiscoveryBatchOutcome> {
+        self.charge_discovery_drain(records.len(), malformed);
         let mut queued = std::mem::take(&mut self.pending_discovery_records);
         queued.extend(records.into_iter().map(|record| QueuedDiscoveryRecord {
             record,
@@ -9301,6 +9360,141 @@ mod tests {
             !error.to_string().contains("retained"),
             "the generic drain retains nothing across ticks: {error:#}"
         );
+    }
+
+    fn malformed_dequeues(count: usize) -> Vec<Result<Option<crate::events::DiscoveryItem>>> {
+        (0..count)
+            .map(|_| Ok(Some(crate::events::DiscoveryItem::Malformed)))
+            .collect()
+    }
+
+    /// One record past the quantum, then a dequeue that must never be reached:
+    /// a producer that keeps the live ring nonempty must not keep the shared
+    /// collector from returning to its caller's deadline and signal checks.
+    #[test]
+    fn live_collector_stops_at_its_quantum_with_the_backlog_still_queued() {
+        let record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        let mut session = ScriptedSession::default();
+        session.dequeues.extend(
+            (0..=LIVE_DISCOVERY_DRAIN_QUANTUM)
+                .map(|_| Ok(Some(crate::events::DiscoveryItem::Record(record)))),
+        );
+        session
+            .dequeues
+            .push_back(Err(anyhow!("dequeued past the quantum")));
+
+        let incomplete = match Engine::collect_discovery_records(&mut session) {
+            Ok((records, malformed)) => panic!(
+                "a quantum stop is an incomplete drain, never an empty ring: {} records, {malformed} malformed",
+                records.len()
+            ),
+            Err(error) => error
+                .downcast::<IncompleteTerminalDrain>()
+                .expect("the exact prefix travels with the stop"),
+        };
+
+        assert!(incomplete.backlog, "{incomplete:?}");
+        assert_eq!(incomplete.records.len(), LIVE_DISCOVERY_DRAIN_QUANTUM);
+        assert_eq!(incomplete.malformed, 0);
+        assert_eq!(
+            session.dequeues.len(),
+            2,
+            "the record past the quantum and the sentinel stay queued"
+        );
+    }
+
+    /// The generic tick route applies a quantum's exact prefix and returns;
+    /// the backlog waits on the ring for the next tick, behind the run loop's
+    /// duration/signal checks, and is never a batch error.
+    #[test]
+    fn the_live_drain_applies_the_quantum_prefix_and_leaves_the_backlog_queued() {
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        let mut session = ScriptedSession::default();
+        session
+            .dequeues
+            .extend(malformed_dequeues(LIVE_DISCOVERY_DRAIN_QUANTUM + 1));
+        session
+            .dequeues
+            .push_back(Err(anyhow!("dequeued past the quantum")));
+
+        engine
+            .drain_discovery_from(&mut session)
+            .expect("a backlog is not a drain failure");
+
+        assert_eq!(
+            engine.malformed_discovery,
+            LIVE_DISCOVERY_DRAIN_QUANTUM as u64
+        );
+        assert_eq!(session.dequeues.len(), 2);
+
+        session.dequeues.pop_back();
+        engine.drain_discovery_from(&mut session).unwrap();
+
+        assert_eq!(
+            engine.malformed_discovery,
+            LIVE_DISCOVERY_DRAIN_QUANTUM as u64 + 1
+        );
+        assert!(session.dequeues.is_empty());
+    }
+
+    #[test]
+    fn a_real_dequeue_failure_still_aborts_the_generic_route() {
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        let mut session = ScriptedSession::default();
+        session
+            .dequeues
+            .push_back(Err(anyhow!("scripted ring read failed")));
+
+        let error = engine.drain_discovery_from(&mut session).unwrap_err();
+
+        assert_eq!(error.to_string(), "scripted ring read failed");
+    }
+
+    /// Every dequeue is capture-wide work, charged at the sink the records
+    /// enter so the one work ceiling counts ring traffic too. The budget has
+    /// no unit accessor and `DEFAULT_WORK_CEILING` is private to scan.rs, so
+    /// the charge is observed exactly through the ceiling itself.
+    #[test]
+    fn dequeued_discovery_work_is_charged_to_the_capture_budget() {
+        const WORK_CEILING: u64 = 16 * 1024 * 1024;
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        assert!(engine.budget.charge(WORK_CEILING - 3));
+        let mut session = ScriptedSession::default();
+        session.dequeues.extend(malformed_dequeues(3));
+        engine.drain_discovery_from(&mut session).unwrap();
+        assert!(
+            !engine.budget.charge(1),
+            "three dequeues must have consumed the last three work units"
+        );
+
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        assert!(engine.budget.charge(WORK_CEILING - 4));
+        let mut session = ScriptedSession::default();
+        session.dequeues.extend(malformed_dequeues(3));
+        engine.drain_discovery_from(&mut session).unwrap();
+        assert!(engine.budget.charge(1), "exactly one unit per dequeue");
+        assert!(!engine.budget.charge(1));
+    }
+
+    /// Past the ceiling the records are already off the ring, so they are
+    /// still applied — dropping them would be silent loss — and the sticky
+    /// stop the refused charge leaves is what the lowering and the next scan
+    /// refuse on and publish.
+    #[test]
+    fn a_drain_past_the_work_ceiling_still_applies_the_dequeued_records() {
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        assert!(engine.budget.charge(16 * 1024 * 1024));
+        let mut session = ScriptedSession::default();
+        session.dequeues.extend(malformed_dequeues(2));
+        engine.drain_discovery_from(&mut session).unwrap();
+        session.dequeues.extend(malformed_dequeues(1));
+        engine.drain_discovery_from(&mut session).unwrap();
+
+        assert_eq!(
+            engine.malformed_discovery, 3,
+            "dequeued records are never dropped"
+        );
+        assert!(!engine.budget.charge(1), "the ceiling stays sticky");
     }
 
     #[test]
@@ -13827,6 +14021,98 @@ int main(int argc, char **argv) {
         assert!(engine.terminal_batch.is_none());
         assert!(engine.terminal_journal.is_none());
         assert!(engine.loader_registry.context(owner).is_none());
+    }
+
+    /// The post-detach collector shares the quantum. A stop there is retained
+    /// as an explicitly incomplete batch — never claimed complete, nothing
+    /// dispatched — and the one shared continuation finishes it once the ring
+    /// reads empty, dispatching every dequeued record exactly once.
+    #[test]
+    fn a_quantum_stop_after_detach_retains_an_incomplete_batch_until_the_ring_reads_empty() {
+        let pid = std::process::id();
+        let (mut engine, owner) = Engine::retiring_loader_context(pid);
+        let unrelated = LoaderContextId::from_case_id(9);
+        let mut session = ScriptedSession::with_records([], 1024);
+        session.detach_exports = vec![terminal_export()];
+        session
+            .dequeues
+            .push_back(Ok(Some(crate::events::DiscoveryItem::Record(
+                loader_record_for(owner, pid),
+            ))));
+        session
+            .dequeues
+            .extend((1..=LIVE_DISCOVERY_DRAIN_QUANTUM).map(|_| {
+                Ok(Some(crate::events::DiscoveryItem::Record(
+                    loader_record_for(unrelated, pid),
+                )))
+            }));
+        session
+            .dequeues
+            .push_back(Err(anyhow!("dequeued past the quantum")));
+
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+            .expect("a quantum stop is backlog, never a batch error");
+
+        assert_eq!(
+            engine.loader_records_accepted, 0,
+            "an incomplete batch dispatches nothing"
+        );
+        let batch = engine.terminal_batch.as_ref().unwrap();
+        assert_eq!(batch.record_count(), LIVE_DISCOVERY_DRAIN_QUANTUM);
+        assert!(
+            !batch.complete(),
+            "a quantum stop never claims a complete drain"
+        );
+        assert_eq!(
+            session.dequeues.len(),
+            2,
+            "the record past the quantum and the sentinel stay queued"
+        );
+        assert!(engine.terminal_journal.is_some());
+
+        session.dequeues.pop_back();
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+        assert_eq!(
+            engine.loader_records_accepted as usize,
+            LIVE_DISCOVERY_DRAIN_QUANTUM + 1,
+            "every dequeued record reached dispatch exactly once"
+        );
+        assert!(engine.terminal_batch.is_none());
+        assert!(engine.terminal_journal.is_none());
+        assert!(engine.loader_registry.context(owner).is_none());
+    }
+
+    /// The terminal sink charges too: a retained prefix is dequeued work even
+    /// while nothing has been dispatched yet.
+    #[test]
+    fn a_retained_terminal_prefix_is_charged_as_capture_work() {
+        const WORK_CEILING: u64 = 16 * 1024 * 1024;
+        let pid = std::process::id();
+        let (mut engine, owner) = Engine::retiring_loader_context(pid);
+        assert!(
+            engine
+                .budget
+                .charge(WORK_CEILING - LIVE_DISCOVERY_DRAIN_QUANTUM as u64)
+        );
+        let mut session = ScriptedSession::with_records([], 1024);
+        session.detach_exports = vec![terminal_export()];
+        session
+            .dequeues
+            .extend((0..=LIVE_DISCOVERY_DRAIN_QUANTUM).map(|_| {
+                Ok(Some(crate::events::DiscoveryItem::Record(
+                    loader_record_for(owner, pid),
+                )))
+            }));
+
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+        assert_eq!(engine.loader_records_accepted, 0);
+        assert!(!engine.terminal_batch.as_ref().unwrap().complete());
+        assert!(
+            !engine.budget.charge(1),
+            "the retained quantum consumed the last work units"
+        );
     }
 
     #[test]

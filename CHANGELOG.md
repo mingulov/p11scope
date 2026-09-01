@@ -55,6 +55,8 @@ pending.
   registered-mechanism, return-code, latency, and lifecycle evidence. There is
   no object-handle correlation or promised symbolic `CKA_CLASS`/
   `CKA_KEY_TYPE` output.
+- **Discovery helper hygiene**: inherited descriptors and loader-sensitive
+  environment, including `LD_LIBRARY_PATH`, are stripped before provider loading.
 
 ## Unreleased — productization slice 1a
 

@@ -3,7 +3,11 @@
 //! never silently proceed (design spec, Architecture).
 
 use std::fs::File;
+use std::io;
+use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
+use std::process::Command;
 
 const USAGE: &str = "usage: p11scope-discover --module <provider.so> [-o manifest.json]";
 
@@ -131,8 +135,175 @@ fn set_dumpable_zero() -> Result<(), String> {
     Ok(())
 }
 
+fn close_range_syscall() -> io::Result<()> {
+    if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn close_fd(fd: RawFd) -> io::Result<()> {
+    if unsafe { libc::close(fd) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn collect_proc_fd_snapshot(path: &std::path::Path) -> io::Result<(RawFd, Vec<RawFd>)> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in fd directory path"))?;
+    let directory = unsafe { libc::opendir(path.as_ptr()) };
+    if directory.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let enumeration_fd = unsafe { libc::dirfd(directory) };
+    if enumeration_fd < 0 {
+        let error = io::Error::last_os_error();
+        unsafe { libc::closedir(directory) };
+        return Err(error);
+    }
+    let mut fds = Vec::new();
+    loop {
+        unsafe { *libc::__errno_location() = 0 };
+        let entry = unsafe { libc::readdir(directory) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error().is_some_and(|errno| errno != 0) {
+                unsafe { libc::closedir(directory) };
+                return Err(error);
+            }
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes().iter().all(u8::is_ascii_digit) {
+            if let Ok(fd) = name.to_string_lossy().parse::<RawFd>() {
+                if fd > 2 {
+                    fds.push(fd);
+                }
+            }
+        }
+    }
+    if unsafe { libc::closedir(directory) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((enumeration_fd, fds))
+}
+
+fn close_inherited_descriptors_with<R, S, C>(
+    close_range: R,
+    snapshot: S,
+    close: C,
+) -> io::Result<()>
+where
+    R: FnOnce() -> io::Result<()>,
+    S: FnOnce() -> io::Result<(RawFd, Vec<RawFd>)>,
+    C: Fn(RawFd) -> io::Result<()>,
+{
+    match close_range() {
+        Ok(()) => return Ok(()),
+        Err(error) if !matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) => {
+            return Err(error);
+        }
+        Err(_) => {}
+    }
+
+    let (enumeration_fd, mut fds) = snapshot()?;
+    if enumeration_fd <= 2 || !fds.contains(&enumeration_fd) {
+        return Err(io::Error::other(
+            "incomplete /proc/self/fd snapshot omitted its enumeration descriptor",
+        ));
+    }
+    fds.sort_unstable();
+    for fd in fds {
+        if let Err(error) = close(fd) {
+            if fd == enumeration_fd && error.raw_os_error() == Some(libc::EBADF) {
+                continue;
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn close_inherited_descriptors() -> io::Result<()> {
+    close_inherited_descriptors_with(
+        close_range_syscall,
+        || collect_proc_fd_snapshot(std::path::Path::new("/proc/self/fd")),
+        close_fd,
+    )
+}
+
+const LOADER_SENSITIVE_ENV: &[&str] = &[
+    "GCONV_PATH",
+    "GETCONF_DIR",
+    "GLIBC_TUNABLES",
+    "HOSTALIASES",
+    "LD_AUDIT",
+    "LD_BIND_NOT",
+    "LD_BIND_NOW",
+    "LD_DEBUG",
+    "LD_DEBUG_OUTPUT",
+    "LD_DYNAMIC_WEAK",
+    "LD_HWCAP_MASK",
+    "LD_LIBRARY_PATH",
+    "LD_ORIGIN_PATH",
+    "LD_PRELOAD",
+    "LD_PROFILE",
+    "LD_PROFILE_OUTPUT",
+    "LD_SHOW_AUXV",
+    "LD_USE_LOAD_BIAS",
+    "LOCALDOMAIN",
+    "LOCPATH",
+    "MALLOC_ARENA_MAX",
+    "MALLOC_ARENA_TEST",
+    "MALLOC_CHECK_",
+    "MALLOC_MMAP_MAX_",
+    "MALLOC_MMAP_THRESHOLD_",
+    "MALLOC_PERTURB_",
+    "MALLOC_TOP_PAD_",
+    "MALLOC_TRACE",
+    "NIS_PATH",
+    "NLSPATH",
+    "RESOLV_HOST_CONF",
+    "RES_OPTIONS",
+    "TMPDIR",
+    "TZDIR",
+];
+
+const SANITIZED_ENV_MARKER: &str = "P11SCOPE_LOADER_ENV_SANITIZED";
+
+fn ensure_loader_env_sanitized() -> io::Result<()> {
+    let present = LOADER_SENSITIVE_ENV
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+    let marked = std::env::var_os(SANITIZED_ENV_MARKER).is_some();
+    if marked && present {
+        return Err(io::Error::other(
+            "sanitized marker with loader-sensitive environment",
+        ));
+    }
+    if !present {
+        return Ok(());
+    }
+
+    let mut command = Command::new("/proc/self/exe");
+    command
+        .args(std::env::args_os().skip(1))
+        .env(SANITIZED_ENV_MARKER, "1");
+    for name in LOADER_SENSITIVE_ENV {
+        command.env_remove(name);
+    }
+    Err(std::os::unix::process::CommandExt::exec(&mut command))
+}
+
 /// Provider constructors and exports must never inherit observer authority.
 fn drop_privileges_and_open_self_memory(target: DropTarget) -> Result<File, String> {
+    close_inherited_descriptors()
+        .map_err(|e| format!("inherited descriptor closure failed: {e}"))?;
+    ensure_loader_env_sanitized()
+        .map_err(|e| format!("loader environment sanitization failed: {e}"))?;
     if target.credential_transition {
         set_dumpable_zero()?;
     }
@@ -281,5 +452,54 @@ fn main() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::close_inherited_descriptors_with;
+    use std::io::{Error, ErrorKind};
+    use std::os::fd::IntoRawFd as _;
+
+    #[test]
+    fn close_range_failure_uses_verified_proc_fallback() {
+        let planted = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
+        let result = close_inherited_descriptors_with(
+            || Err(Error::from_raw_os_error(libc::EPERM)),
+            || Ok((planted, vec![planted])),
+            |fd| {
+                if unsafe { libc::close(fd) } == 0 {
+                    Ok(())
+                } else {
+                    Err(Error::last_os_error())
+                }
+            },
+        );
+        assert!(result.is_ok(), "verified fallback failed: {result:?}");
+        assert_eq!(unsafe { libc::fcntl(planted, libc::F_GETFD) }, -1);
+        assert_eq!(Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[test]
+    fn unreadable_proc_fallback_fails_closed_before_provider_load() {
+        let provider_loaded = std::cell::Cell::new(false);
+        let result = close_inherited_descriptors_with(
+            || Err(Error::from_raw_os_error(libc::EPERM)),
+            || {
+                Err(Error::new(
+                    ErrorKind::PermissionDenied,
+                    "injected /proc denial",
+                ))
+            },
+            |_| {
+                provider_loaded.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::PermissionDenied);
+        assert!(
+            !provider_loaded.get(),
+            "provider load followed a closure failure"
+        );
     }
 }

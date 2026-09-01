@@ -20,7 +20,10 @@ preserved artifacts). Nothing durable anywhere else.
   tip sits above a "not ready" wip commit — reconciling it is a W8/owner item.
   Historical reviewed bases (`7d6eff7`, `556f7cf`, and `b86d4d5`) remain
   preserved as history only; W1 execution starts from the verified tip above.
-- Wave 1 plan is fully reviewed and executable. Waves 2–8 are defined below.
+- Wave 1 plan is fully reviewed and executable. W1 execution begins with
+  **Task 0 custody rescue** (both ignore fences, no-clobber/hash verification,
+  private-only SDD trove) before product Tasks 1–8; Waves 2–8 are defined
+  below.
 
 ## Read in this order
 
@@ -34,7 +37,8 @@ preserved artifacts). Nothing durable anywhere else.
    you plan, verify anchors, review-to-zero, branch, commit).
 5. Your wave's document:
    - W1: `2026-09-01-release-hardening-wave1-findings.md` (full plan —
-     execute via superpowers:subagent-driven-development).
+     execute Task 0 custody first, then product Tasks 1–8, Task 10 gates,
+     Task 11 review-to-zero, and Task 12 closeout/finishing).
    - W2: `2026-09-01-wave2-storage-consolidation.md` (full plan).
    - W3–W8: `2026-09-01-release-wave-charters.md` (charter; its Task 1 is
      writing the wave's plan under the verified-anchor protocol, two passes).

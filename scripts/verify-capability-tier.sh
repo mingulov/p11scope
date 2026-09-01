@@ -60,8 +60,8 @@ elif row == "bpf-perfmon":
         for failure in failures
     ):
         raise SystemExit(f"{row}: expected perf_event_open refusal for every attach failure")
-    if not has_sanitized_discovery_skips or len(skipped) != 3:
-        raise SystemExit(f"{row}: expected exactly three sanitized discovery-unavailable skips")
+    if not has_sanitized_discovery_skips or len(skipped) != 4:
+        raise SystemExit(f"{row}: expected exactly four sanitized discovery-unavailable skips")
 else:
     raise SystemExit(f"unknown capability row {row!r}")
 print(f"{row}: expected capability-tier shape")
@@ -83,7 +83,7 @@ document = {"evidence": {
     "completeness": "PARTIAL",
     "attach_failures": [] if row == "sysadmin" else [perf_event_open_refusal] * 68,
     "skipped": [{"name": "discovery subject", "reason": "discovery unavailable"}] * (
-        2 if row == "sysadmin" else 3
+        2 if row == "sysadmin" else 4
     ),
 }}
 evidence = document["evidence"]
@@ -194,7 +194,11 @@ sudo -n true 2>/dev/null || { echo "passwordless sudo required" >&2; exit 1; }
 
 MODULE=${P11SCOPE_PKCS11_MODULE:-/usr/lib/softhsm/libsofthsm2.so}
 [ -f "$MODULE" ] || { echo "SoftHSM2 not installed at $MODULE" >&2; exit 1; }
-WORK=target/capability-tier
+# See verify-canaries.sh: the observer refuses an output directory with a
+# group/world-writable non-sticky ancestor, which this checkout has. This lane
+# has no work-path override, so the private 0700 root is its only work root.
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-verify-XXXXXX")/target/capability-tier
+echo "work root: $WORK"
 BIN="$PWD/target/release/p11scope"
 HARNESS="$WORK/harness"
 MANIFEST="$WORK/manifest.json"
@@ -259,7 +263,7 @@ trap 'on_signal 130' INT
 trap 'on_signal 143' TERM
 
 cargo +1.88 build --locked --release --workspace
-mkdir -p "$WORK"
+(umask 077; mkdir -p "$WORK")
 record_metadata
 gcc -O2 -o "$HARNESS" spike/harness.c -ldl
 "$PWD/target/release/p11scope-discover" --module "$MODULE" -o "$MANIFEST"
@@ -304,14 +308,14 @@ run_row() {
             printf 'uid_gid='; id
             printf 'capabilities='; grep '^Cap' /proc/self/status
             printf 'capsh='; capsh --print
-            printf 'command=%s\\n' '$BIN profile --manifest $PWD/$MANIFEST --pid $TARGET_PID --mode metrics --duration 1 -o $PWD/$out'
-        } >> '$PWD/$meta'
-        exec '$BIN' profile --manifest '$PWD/$MANIFEST' --pid '$TARGET_PID' --mode metrics --duration 1 -o '$PWD/$out'" \
+            printf 'command=%s\\n' '$BIN profile --manifest $MANIFEST --pid $TARGET_PID --mode metrics --duration 1 -o $out'
+        } >> '$meta'
+        exec '$BIN' profile --manifest '$MANIFEST' --pid '$TARGET_PID' --mode metrics --duration 1 -o '$out'" \
         >"$stdout" 2>"$stderr"
     status=$?
     set -e
     row_metadata "$label" "exit_status=$status"
-    row_metadata "$label" "stderr=$PWD/$stderr"
+    row_metadata "$label" "stderr=$stderr"
     if [ -f "$stderr" ]; then
         printf 'stderr_sha256=' >>"$meta"
         sha256sum "$stderr" | awk '{print $1}' >>"$meta"

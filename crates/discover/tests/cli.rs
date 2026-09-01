@@ -105,3 +105,89 @@ fn o_write_failure_exits_1() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("write"));
 }
+
+#[test]
+fn constructor_sees_no_planted_fd_or_loader_env() {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fd-canary");
+    std::fs::create_dir_all(&dir).unwrap();
+    let provider = dir.join("fd-env-canary.so");
+    let dependency = dir.join("fd-env-dependency.so");
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture/fd_env_canary.c");
+    assert!(
+        Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&provider)
+            .arg(&src)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("gcc")
+            .args(["-shared", "-fPIC", "-DDEPENDENCY", "-o"])
+            .arg(&dependency)
+            .arg(&src)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let (mut reader, writer) = std::io::pipe().unwrap();
+    let raw = writer.as_raw_fd();
+    let mut cmd = Command::new(BIN);
+    cmd.arg("--module")
+        .arg(&provider)
+        .env("LD_LIBRARY_PATH", &dir)
+        .env("LD_PRELOAD", &dependency)
+        .stderr(std::process::Stdio::piped());
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(raw, 17) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = cmd.output().unwrap();
+    drop(writer);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("CANARY_FD=closed"),
+        "planted fd survived: {stderr}"
+    );
+    assert!(
+        stderr.contains("CANARY_SEARCH=absent"),
+        "LD_LIBRARY_PATH survived: {stderr}"
+    );
+    assert!(
+        stderr.contains("CANARY_PRELOAD=absent"),
+        "LD_PRELOAD survived: {stderr}"
+    );
+    let mut leaked = Vec::new();
+    reader.read_to_end(&mut leaked).unwrap();
+    assert!(
+        leaked.is_empty(),
+        "constructor wrote through planted fd: {leaked:?}"
+    );
+
+    let forged = Command::new(BIN)
+        .arg("--module")
+        .arg(&provider)
+        .env("P11SCOPE_LOADER_ENV_SANITIZED", "forged")
+        .env("LD_LIBRARY_PATH", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(forged.status.code(), Some(1));
+    let forged_stderr = String::from_utf8_lossy(&forged.stderr);
+    assert!(
+        forged_stderr.contains("loader environment sanitization failed"),
+        "forged marker was accepted: {forged_stderr}"
+    );
+    assert!(
+        !forged_stderr.contains("CANARY_"),
+        "provider loaded before forged marker refusal: {forged_stderr}"
+    );
+}

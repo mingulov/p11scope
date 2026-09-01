@@ -835,6 +835,211 @@ fn task4_receipt_lane14_release_work_is_private_and_single_owner() {
     assert_eq!(fs::read(&sentinel).unwrap(), b"must survive\n");
 }
 
+// A stateful `docker` CLI stub: `names/<name>` maps a mutable name to the
+// immutable id recorded under `ids/<id>`, so a name collision is a real 125
+// refusal and every subcommand the lane reaches is logged verbatim.
+const LANE14_DOCKER_STUB: &str = r#"#!/bin/sh
+set -u
+printf '%s\n' "$*" >> "$STUB_LOG"
+cmd=$1
+shift
+
+resolve() {
+    if [ -f "$STUB_STATE/ids/$1" ]; then
+        printf '%s\n' "$1"
+    elif [ -f "$STUB_STATE/names/$1" ]; then
+        cat "$STUB_STATE/names/$1"
+    else
+        return 1
+    fi
+}
+
+case $cmd in
+pull)
+    exit 0
+    ;;
+create|run)
+    name=
+    prev=
+    for arg in "$@"; do
+        [ "$prev" = --name ] && name=$arg
+        prev=$arg
+    done
+    if [ -n "$name" ] && { [ -n "$STUB_CONFLICT" ] || [ -f "$STUB_STATE/names/$name" ]; }; then
+        echo "docker: Error response from daemon: Conflict. The container name \"/$name\" is already in use." >&2
+        exit 125
+    fi
+    count=$(cat "$STUB_STATE/count")
+    count=$((count + 1))
+    printf '%s' "$count" > "$STUB_STATE/count"
+    id=$(printf '%064d' "$count")
+    : > "$STUB_STATE/ids/$id"
+    [ -z "$name" ] || printf '%s\n' "$id" > "$STUB_STATE/names/$name"
+    [ "$cmd" != create ] || printf '%s\n' "$id"
+    exit 0
+    ;;
+start)
+    target=
+    for arg in "$@"; do
+        case $arg in -*) ;; *) target=$arg ;; esac
+    done
+    resolve "$target" >/dev/null || { echo "No such container: $target" >&2; exit 1; }
+    exit 0
+    ;;
+inspect)
+    fmt=
+    target=
+    while [ $# -gt 0 ]; do
+        case $1 in
+        -f|--format) fmt=$2; shift 2 ;;
+        -*) shift ;;
+        *) target=$1; shift ;;
+        esac
+    done
+    id=$(resolve "$target") || { echo "No such object: $target" >&2; exit 1; }
+    [ -z "$fmt" ] || printf '%s\n' "$id"
+    exit 0
+    ;;
+rm)
+    target=
+    for arg in "$@"; do
+        case $arg in -*) ;; *) target=$arg ;; esac
+    done
+    id=$(resolve "$target") || exit 1
+    rm -f "$STUB_STATE/ids/$id"
+    for entry in "$STUB_STATE"/names/*; do
+        [ -f "$entry" ] || continue
+        [ "$(cat "$entry")" = "$id" ] && rm -f "$entry"
+    done
+    exit 0
+    ;;
+esac
+exit 0
+"#;
+
+#[test]
+fn lane14_container_ownership_follows_creation_not_names() {
+    // csf_610b398 (Task 10 F5) registered the PID-derived `--name` as a cleanup
+    // id *before* `docker run`, so a stale or concurrent foreign container
+    // holding that name failed creation (125) and the EXIT trap `docker rm -f`'d
+    // the foreign object. The ratified resource journal runs the other way:
+    // `requested` precedes creation, `resolved` carries the immutable identity,
+    // and mutable names alone never authorize deletion
+    // (docs/superpowers/reports/2026-08-28-task4-receipt-architecture-decision.md:100-117).
+    let fixture = tempfile::tempdir().expect("create lane 14 docker-stub fixture");
+    let root = fixture.path();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    fs::write(bin.join("docker"), LANE14_DOCKER_STUB).unwrap();
+    fs::write(
+        bin.join("cargo"),
+        "#!/bin/sh\nprintf '[source.vendored-sources]\\ndirectory = \"/stub\"\\n'\n",
+    )
+    .unwrap();
+    for tool in ["docker", "cargo"] {
+        fs::set_permissions(bin.join(tool), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let lane = |phase: &str, conflict: &str| {
+        let work = root.join(phase);
+        let artifacts = work.join("artifacts");
+        let state = work.join("state");
+        fs::create_dir_all(&artifacts).unwrap();
+        fs::create_dir_all(state.join("ids")).unwrap();
+        fs::create_dir_all(state.join("names")).unwrap();
+        fs::write(state.join("count"), b"0").unwrap();
+        fs::set_permissions(&artifacts, fs::Permissions::from_mode(0o700)).unwrap();
+        let log = work.join("docker.log");
+        fs::write(&log, b"").unwrap();
+        let facts = artifacts.join("discover.facts");
+        let output = Command::new("/bin/sh")
+            .arg("scripts/verify-discover-containers.sh")
+            .arg("--lane14-facts")
+            .arg(&facts)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("P11SCOPE_TASK4_WORK", &work)
+            .env("STUB_LOG", &log)
+            .env("STUB_STATE", &state)
+            .env("STUB_CONFLICT", conflict)
+            .output()
+            .expect("run lane 14 against the stateful docker stub");
+        (
+            output,
+            fs::read_to_string(&log).unwrap(),
+            fs::read_to_string(&facts).unwrap_or_default(),
+        )
+    };
+
+    // A foreign container already holds the lane's name: refuse, delete nothing.
+    let (collision, collision_log, collision_facts) = lane("collision", "1");
+    assert!(
+        !collision.status.success(),
+        "a name collision must refuse the lane"
+    );
+    assert!(
+        !collision_log.lines().any(|line| line.starts_with("rm ")),
+        "the lane removed a container it never created:\n{collision_log}"
+    );
+    assert!(
+        !collision_facts.contains("container_"),
+        "a refused creation was still recorded as an owned container:\n{collision_facts}"
+    );
+
+    // The lane's own containers are created, read back by exact id, recorded,
+    // started, and then removed by that id.
+    let (success, success_log, success_facts) = lane("success", "");
+    assert!(
+        success.status.success(),
+        "stubbed lane failed: {}",
+        String::from_utf8_lossy(&success.stderr)
+    );
+    assert_eq!(
+        success_log
+            .lines()
+            .filter(|line| line.starts_with("create "))
+            .count(),
+        3,
+        "each container must be created before it is owned:\n{success_log}"
+    );
+    assert!(
+        !success_log.lines().any(|line| line.starts_with("run ")),
+        "`docker run` creates and starts in one step, leaving no pre-start id:\n{success_log}"
+    );
+    let removed: Vec<&str> = success_log
+        .lines()
+        .filter_map(|line| line.strip_prefix("rm -f "))
+        .collect();
+    assert_eq!(removed.len(), 3, "cleanup log:\n{success_log}");
+    for id in &removed {
+        assert!(
+            id.len() == 64 && id.chars().all(|character| character.is_ascii_hexdigit()),
+            "cleanup removed {id}, which is not an immutable container id"
+        );
+        assert!(
+            success_facts.contains(id),
+            "cleanup removed {id}, which the receipt never recorded as owned"
+        );
+        require_before(
+            &success_log,
+            &format!("inspect -f {{{{.Id}}}} {id}"),
+            &format!("start -a {id}"),
+            "lane 14 exact-id readback",
+        )
+        .unwrap();
+    }
+    assert!(
+        !success_facts.contains("p11scope-discover-"),
+        "the receipt records a mutable container name as an identity:\n{success_facts}"
+    );
+    for fact in [
+        "container_glibc_build",
+        "container_glibc_run",
+        "container_musl_build",
+    ] {
+        assert!(success_facts.contains(fact), "receipt misses {fact}");
+    }
+}
+
 #[test]
 fn task4_receipt_lane14_capture_binding_is_literal_and_checker_evidence_framed() {
     let release = read("scripts/build-release.sh");

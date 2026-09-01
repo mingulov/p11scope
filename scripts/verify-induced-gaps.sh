@@ -596,7 +596,7 @@ lane = """freeze-CONFIG-PID_FILTER-CGROUP_FILTER-DESCRIPTORS-ASYNC_FUNCTIONS-MEC
 freeze-missing-rejected
 freeze-duplicate-rejected
 freeze-inventory-mutation-rejected
-g1-160-93-186-exact-accepted
+g1-161-93-186-exact-accepted
 g1-missing-rejected
 g1-duplicate-rejected
 g1-cardinality-mutation-rejected
@@ -658,7 +658,7 @@ with tempfile.TemporaryDirectory() as raw:
     mark(common[28],(work/"fixture").read_text()=="evidence\n");mark(common[29],seq==["facts","capture","checker","cleanup","status"]);mark(common[30],state=={"head":"h","input":"i","ephemeral":"pid:start","cleanup":True})
 
 policy=["CONFIG","PID_FILTER","CGROUP_FILTER","DESCRIPTORS","ASYNC_FUNCTIONS","MECH_SHAPE","ATTR_BOOL_BITS","TEMPLATE_TAIL"]
-good={"freeze":policy,"g1":[(160,93,186)],"g2":[(68,2,4)],"g3":[(68,68,136,200000)],"g4":[(988,104,208,9,8)],"g5":[(988,104,208,11,9,6,1)]}
+good={"freeze":policy,"g1":[(161,93,186)],"g2":[(68,2,4)],"g3":[(68,68,136,200000)],"g4":[(988,104,208,9,8)],"g5":[(988,104,208,11,9,6,1)]}
 def lane_valid(d):
     return d.get("freeze")==policy and all(len(d.get(k,[]))==1 and d[k][0]==good[k][0] for k in ("g1","g2","g3","g4","g5"))
 mark(lane[0],lane_valid(good))

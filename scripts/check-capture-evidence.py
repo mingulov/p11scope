@@ -160,7 +160,9 @@ DISCOVERY_REASONS = {
     SHARED_OVERLAY_UNCERTAINTY,
 }
 ENTRY_REASONS = {"null pointer", ENTRY_UNAVAILABLE}
-G1_SURFACES = Counter({("full", 68): 1, ("full", 92): 1, ("not_walked", 0): 1})
+# Both walks publish the provider's two tables, so every walked surface is
+# doubled; the unwalked one is a single scan-side record.
+G1_SURFACES = Counter({("full", 68): 2, ("full", 92): 2, ("not_walked", 0): 1})
 LEGACY_SURFACES = Counter({("full", 68): 1})
 # `p11scope_ebpf_common::MAX_SLOTS` (src/discovery/scan.rs, plan:83): the frozen
 # attach ceiling a whole-module capacity refusal is taken against.
@@ -1296,15 +1298,14 @@ def validate_canary(lane, document):
 # provider (G4, G5) yields a three-table scan subset and reads `conflict`.
 # The gap being induced is never the discovery one.
 #
-# G1 alone still carries the pre-1d3837b manifest-only expectation. Its
-# corrected tuple — 161 table entries (159 deduplicated targets plus one
-# null-entry skip record per walking source, `decoded_occurrence_count`) and
-# the doubled per-source skip disclosure — is pinned by the contracted
-# `g1-160-93-186-exact-accepted` self-test row in tests/artifact_contracts.rs,
-# outside this harness's ownership. The lane stays red until the owner moves
-# that row, the driver's self-test model, and this oracle together
-# (task-10-fixes2 writer log).
-INDUCED_ALLOWANCES = {"discovery_uncorroborated": 1}
+# G1 is a single-table provider too, so it reads `agreed` like G2 and G3, and
+# nothing in any lane is uncorroborated any more. Its 161 table entries are 159
+# deduplicated targets plus one null-entry skip record per walking source:
+# `src/plan.rs` `decoded_occurrence_count` keys targets across sources but skips
+# per source, because a skip is a per-walk disclosure and a target is a physical
+# thing. The same per-source keying is what doubles `evidence.skipped`, and
+# `corroborate` decides `agreed` on the deduplicated targets, so 161 entries and
+# an agreed module are one consistent statement, not a contradiction.
 
 
 def validate_induced(lane, document):
@@ -1315,19 +1316,19 @@ def validate_induced(lane, document):
     exact_capture_modules(document)
     evidence = document["evidence"]
     sources = [module["sources"] for module in evidence["discovery"]]
-    wanted_sources = [["manifest"]] if lane == "G1" else [["scan", "manifest"]]
-    require(sources == wanted_sources, f"unexpected discovery sources: {sources}")
-    if lane != "G1":
-        outcomes = [module["corroboration"] for module in evidence["discovery"]]
-        wanted_outcomes = [["conflict"]] if lane in {"G4", "G5"} else [["agreed"]]
-        require(outcomes == wanted_outcomes, f"unexpected corroboration: {outcomes}")
+    require(sources == [["scan", "manifest"]], f"unexpected discovery sources: {sources}")
+    outcomes = [module["corroboration"] for module in evidence["discovery"]]
+    wanted_outcomes = [["conflict"]] if lane in {"G4", "G5"} else [["agreed"]]
+    require(outcomes == wanted_outcomes, f"unexpected corroboration: {outcomes}")
 
     if lane == "G1":
         aliases = [["C_CancelFunction", "C_WaitForSlotEvent"]]
-        skipped = [{"name": "C_GetFunctionStatus", "reason": "null pointer"}]
-        exact_shape(evidence, 160, 93, 186, G1_SURFACES, 1, "ok")
+        # One null-entry disclosure per walking source: the manifest walk and
+        # the live scan walk each report the provider's single NULL entry.
+        skipped = [{"name": "C_GetFunctionStatus", "reason": "null pointer"}] * 2
+        exact_shape(evidence, 161, 93, 186, G1_SURFACES, 1, "ok")
         exact_common(evidence, aliases=aliases, skipped=skipped, in_flight=0)
-        exact_counters(evidence, INDUCED_ALLOWANCES)
+        exact_counters(evidence)
     elif lane == "G2":
         groups = evidence["aliased"]
         require(len(groups) == 1, f"G2 aliases: {groups}")
@@ -2050,15 +2051,15 @@ def self_test():
     print("canary aggregate exact baseline: OK")
 
     induced = {}
-    g1 = evidence_fixture(G1_SURFACES, sources=("manifest",))
+    g1 = evidence_fixture(G1_SURFACES, sources=("scan", "manifest"))
     g1.update(
-        table_entries=160,
+        table_entries=161,
         slots=93,
         attached_probes=186,
         vendor_interfaces=1,
         interface_list="ok",
         aliased=[["C_CancelFunction", "C_WaitForSlotEvent"]],
-        skipped=[{"name": "C_GetFunctionStatus", "reason": "null pointer"}],
+        skipped=[{"name": "C_GetFunctionStatus", "reason": "null pointer"}] * 2,
     )
     induced["G1"] = document_fixture(g1)
     g2 = evidence_fixture(LEGACY_SURFACES + LEGACY_SURFACES, sources=("scan", "manifest"))

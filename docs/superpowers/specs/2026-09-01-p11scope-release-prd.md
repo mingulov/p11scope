@@ -69,7 +69,8 @@ The behavior authority is `docs/usage.md`; this list fixes *scope*, not detail.
 - **Discovery:** in-memory function-table scan of the live process (2.00–2.40
   legacy tables and 3.0/3.1/3.2 interfaces, all 104 slots); corroborated
   alternate/null-name prefixes recorded as PARTIAL; deceptive/vendor tables
-  left undecoded; never calls `C_GetInterface`. `p11scope-discover` remains the
+  left undecoded; never calls `C_GetInterface` (evidence-integrity
+  invariant — §8 explains why). `p11scope-discover` remains the
   optional offline manifest path (explicit operator attestation).
 - **Multi-module capture**, including proxy stacks (p11-kit/proxy-ng style):
   release-qualified with at least one proxy-over-provider configuration lane
@@ -152,8 +153,21 @@ kernel is *expected to work*, not *supported*.
 
 ## 8. Non-goals and default deferrals for v0.1.0
 
-**Hard non-goals** (not in v0.1.0 under any pace): interposition mode;
-`C_GetInterface` calls; key/PIN decoding under any flag; macOS/Windows.
+**Hard non-goals** (not in v0.1.0 under any pace): interposition mode
+(non-interposing observation is the product's identity); key/PIN decoding
+under any flag (privacy contract, §5); macOS/Windows.
+
+**Design invariant, not a non-goal — discovery never calls `C_GetInterface`.**
+The why (Phase 1 design, ROADMAP): `C_GetInterface` executes the module's
+*selection* policy — name/version/flags matching, possibly with fallback — so
+its result records what the module would choose for a particular caller, not
+what tables exist; and fallback-resolved interfaces may alias the primary
+table by design, fabricating false aliasing evidence. Inventory must come
+only from `C_GetFunctionList` + `C_GetInterfaceList` enumeration. An
+*explicit, clearly-labeled* selection-probe diagnostic ("what would a
+consumer asking for 'PKCS 11' v3.0 get?") is a legitimate future feature —
+recorded as selection-behavior evidence, never merged into inventory — and is
+listed in the deferred doc; only the implicit use inside discovery is barred.
 
 **Deferred by default — pullable by owner decision if pace allows:** AArch64
 host; raw-tracepoint variants (tracefs stays a requirement meanwhile); Slice 2

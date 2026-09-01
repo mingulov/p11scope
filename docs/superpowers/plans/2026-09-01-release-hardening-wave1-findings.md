@@ -24,6 +24,23 @@
 
 ---
 
+### Task 0: Stage 3A3 evidence-custody rescue (before product Task 1)
+
+**Files:**
+- Modify: `docs/superpowers/reports/2026-08-31-productization-evidence-index.md:66-70`, root `.gitignore`, and `/home/user/src/m/p11scope-ws/.gitignore`
+- Restore only into: `/home/user/src/m/p11scope-ws/preserved/sdd/2026-08-27-task4-receipt-closure/` (durable home per spec §4)
+- Never recreate the private SDD trove under the public repository; public files may contain only a pointer/fence.
+
+- [ ] **Step 1 — install both ignore fences first:** create/verify the public root `.gitignore` fence for `.superpowers/sdd/` and the private sibling `/home/user/src/m/p11scope-ws/.gitignore` fence for `incoming/`, `vm-bases/`, `preserved/evidence-roots/`, `preserved/portable/`, `*.tar.zst`, `*.qcow2`, and `*.img`. Do not recreate the private SDD trove under the public repository.
+- [ ] **Step 2 — no-clobber preflight and source choice:** use the complete source under `/home/user/.local/state/p11scope/retired-generated-slice1b2-finish/.superpowers/sdd/2026-08-27-task4-receipt-closure/` only as input. The destination `/home/user/src/m/p11scope-ws/preserved/sdd/2026-08-27-task4-receipt-closure/` must be absent, or already have complete exact manifest equality; in either case do not copy. Otherwise copy only to a private sibling temporary directory under `p11scope-ws`, never to a public path.
+- [ ] **Step 3 — verify and classify:** hash every source file before copying and every temporary/destination file after it with a sorted, path-stable manifest; record exact before/after SHA-256 values and the manifest hash. Verify the two named reports are non-empty and match the tarball cross-check byte-for-byte. Run a private-data/privacy scan and classify PID, address, and raw-capture content as private-only; classify any such content, forbidden paths, or a public SDD recreation as forbidden in the public diff.
+- [ ] **Step 4 — publish without replacement:** publish the verified temporary tree with `mv -T --no-clobber` (or an equally minimal native no-replace operation), then assert the destination's exact file set and hashes and that no existing destination was overwritten. Update the evidence index to point to `p11scope-ws/preserved/sdd/2026-08-27-task4-receipt-closure/` and state that no public SDD copy exists; the portable package may hold only the explicitly approved three-file `stage3a3/` subset.
+- [ ] **Step 5 — mirror the scanner record privately:** copy `findings.json` only into `/home/user/src/m/p11scope-ws/preserved/security-scan-3e10be9/findings.json` under the same no-clobber, exact-hash, deterministic-manifest, and private-data scan rules. Never copy it into public `.superpowers/sdd/` or another public evidence path.
+- [ ] **Step 6 — explicit staging and separate reviews:** stage only an explicit path list (never `git add -A` or a broad glob): public pointer/fence paths in the public repository, and durable private text/manifests in `p11scope-ws`; never stage raw captures or ignored binaries. Review and commit the public pointer/fence separately from the private custody commit, with exact before/after hashes in each review record.
+- [ ] **Step 7 — gates and privacy fence:** verify that a fresh public clone cannot stage the private trove, scan both repositories' diffs for PIDs, addresses, raw captures, and forbidden paths, and run the public repository's non-Cargo markdown/source checks. Privileged/container rows remain UNRUN without separate approval and do not block the W1 unprivileged exit.
+
+---
+
 ### Task 1: Helper file-descriptor and environment confinement (csf_f5953ae, MEDIUM)
 
 **Files:**
@@ -32,7 +49,7 @@
 - Test: `crates/discover/tests/cli.rs` (add one test; reuses `BIN` at :4)
 
 **Interfaces:**
-- Produces: `close_inherited_descriptors() -> Result<()>` (fail closed if neither `close_range` nor a verified `/proc/self/fd` fallback establishes closure), `ensure_loader_env_sanitized()` with a private re-exec marker, and a `LOADER_SENSITIVE_ENV: &[&str]` const, all private to `crates/discover/src/main.rs`.
+- Produces: `close_inherited_descriptors() -> Result<()>` (fail closed if neither `close_range` nor a verified `/proc/self/fd` fallback establishes closure), `ensure_loader_env_sanitized()` with a private re-exec marker, and a `LOADER_SENSITIVE_ENV: &[&str]` const, all private to `crates/discover/src/main.rs`; the `Result<File, String>` caller maps both helper errors to its existing string error contract.
 - The fix MUST live in `main.rs` only — never in `discover.rs`, whose `discover()` is called in-process by four test binaries (`fixture_provider.rs`, `version_matrix.rs`, `lazy_dependency.rs`, `softhsm.rs`); a `close_range` there would shred the libtest harness fds.
 
 - [ ] **Step 1: Write the failing test.** New fixture `crates/discover/tests/fixture/fd_env_canary.c` (constructor reports on stderr, so it needs no env of its own):
@@ -97,7 +114,7 @@ fn constructor_sees_no_planted_fd_or_loader_env() {
 }
 ```
 
-- [ ] **Step 2: Run it, verify FAIL** (`CANARY_FD=OPEN`, `CANARY_SEARCH=present`, or `CANARY_PRELOAD=present` before the fix): `cargo +1.88 test -p p11scope-discover --test cli constructor_sees_no_planted_fd -- --nocapture`. Add a second invocation with a forged marker plus one sensitive variable and assert a hard refusal; the marker must never bypass sanitization.
+- [ ] **Step 2: Run it, verify FAIL** (`CANARY_FD=OPEN`, `CANARY_SEARCH=present`, or `CANARY_PRELOAD=present` before the fix): `cargo +1.88 test -p p11scope-discover --test cli constructor_sees_no_planted_fd -- --nocapture`. Add `close_range_failure_uses_verified_proc_fallback` (inject `close_range` → `EPERM`, then assert the planted fd is closed) and `unreadable_proc_fallback_fails_closed` (inject `close_range` → `EPERM` plus `read_dir` → `PermissionDenied`, then assert a hard error and no provider load). Run all three before implementation and observe failure. Add a second invocation with a forged marker plus one sensitive variable and assert a hard refusal; the marker must never bypass sanitization.
 - [ ] **Step 3: Implement.** In `crates/discover/src/main.rs`, add the closure helper, sanitized re-exec helper, and denylist const, and call them at the very top of `drop_privileges_and_open_self_memory` (before `File::open("/proc/self/mem")` at :142 — self-mem fd then lands at 3, outside the closed range; no `dup2` renumber needed):
 
 ```rust
@@ -106,26 +123,21 @@ fn close_inherited_descriptors() -> std::io::Result<()> {
     // is gnu-only (libc 0.2.189 declares it under linux/gnu only) and build-release.sh
     // also builds a musl helper — use the raw syscall.
     if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0) } == 0 { return Ok(()); }
-    // Fallback: seccomp ENOSYS/EPERM. Collect first — the ReadDir is consumed by the
-    // collect, so its own dirfd is closed before the loop; the stale list entry for it
-    // draws one harmless EBADF close (single-threaded here). If even /proc/self/fd is
-    // unreadable (masked /proc, e.g. the musl container lane,
+    // Fallback: seccomp ENOSYS/EPERM. `collect_proc_fd_snapshot` uses read_dir, propagates
+    // every entry error, records the enumeration dirfd, collects the complete snapshot while
+    // this code is single-threaded, and drops ReadDir before returning. If even /proc/self/fd
+    // is unreadable (masked /proc, e.g. the musl container lane,
     // verify-discover-containers.sh:239-245), return the error. A closure failure is
     // security-relevant: fail closed rather than continue.
-    let entries = match std::fs::read_dir("/proc/self/fd") {
-        Ok(dir) => dir,
-        Err(e) => {
-            return Err(e);
-        }
-    };
-    let mut fds: Vec<i32> = entries.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
-        .filter(|fd| *fd > 2).collect();
+    let (enumeration_fd, mut fds) = collect_proc_fd_snapshot("/proc/self/fd")?;
     fds.sort_unstable();
-    for fd in fds { unsafe { libc::close(fd) }; }
-    let open = std::fs::read_dir("/proc/self/fd")?
-        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
-        .any(|fd| fd > 2);
-    if open { return Err(std::io::Error::other("inherited descriptor closure could not be verified")); }
+    for fd in fds {
+        let rc = unsafe { libc::close(fd) };
+        let error = std::io::Error::last_os_error();
+        if rc < 0 && !(fd == enumeration_fd && error.raw_os_error() == Some(libc::EBADF)) {
+            return Err(error);
+        }
+    }
     Ok(())
 }
 
@@ -147,7 +159,7 @@ fn ensure_loader_env_sanitized() -> std::io::Result<()> {
     let marked = std::env::var_os(SANITIZED_ENV_MARKER).is_some();
     if marked && present { return Err(std::io::Error::other("sanitized marker with loader-sensitive environment")); }
     if !present { return Ok(()); } // a forged marker is safe only when every sensitive var is absent
-    let exe = std::env::current_exe()?;
+    let exe = "/proc/self/exe";
     let mut cmd = std::process::Command::new(exe);
     cmd.args(std::env::args_os().skip(1)).env(SANITIZED_ENV_MARKER, "1");
     for name in LOADER_SENSITIVE_ENV { cmd.env_remove(name); }
@@ -155,15 +167,25 @@ fn ensure_loader_env_sanitized() -> std::io::Result<()> {
 }
 ```
 
+`collect_proc_fd_snapshot` is a private raw-fd-backed `read_dir` adapter: it
+returns the enumeration fd plus every parsed fd greater than 2, propagates
+every `read_dir` entry error, collects while single-threaded, and drops
+`ReadDir` before the close loop. The fallback permits `EBADF` only for that
+enumeration fd's stale entry; every other `EBADF` or close error fails closed.
+The close-range seam is injectable so the two fallback tests above exercise
+both successful proc fallback and fail-closed unreadable `/proc` behavior.
+
 At the call site (denylist, not allowlist — `SOFTHSM2_CONF` and other provider config must survive; `verify-attach-e2e.sh:149` threads it):
 
 ```rust
-    close_inherited_descriptors()?;
+    close_inherited_descriptors()
+        .map_err(|e| format!("inherited descriptor closure failed: {e}"))?;
     // Re-exec before discover.rs:53 can dlopen the provider. The second process
     // starts with all loader-sensitive vars absent, while SOFTHSM2_CONF and other
     // provider configuration stays intact. A marker is trusted only with no
     // sensitive variable present; marker+variable is a hard failure.
-    ensure_loader_env_sanitized()?;
+    ensure_loader_env_sanitized()
+        .map_err(|e| format!("loader environment sanitization failed: {e}"))?;
 ```
 
 Note: `prepare_drop()` at `main.rs:253` reads `SUDO_UID`/`SUDO_GID` (`target_id`, `:37-43`) before this point — the denylist deliberately excludes them, so provider configuration and privilege-selection inputs survive the re-exec. Keep the closure and re-exec at the top of `drop_privileges_and_open_self_memory`, before any provider load.
@@ -185,7 +207,7 @@ Note: `prepare_drop()` at `main.rs:253` reads `SUDO_UID`/`SUDO_GID` (`target_id`
 - Produces: `Common.max_events: Option<u64>`; `CaptureEnd::LimitReached`; `trace::truncated_line(limit: u64) -> String`; `trace::evidence_line(ev, policy, truncated: bool)` (added 3rd param).
 - Consumes: existing `render::Evidence`, `CapturePolicy`, `trace::lost_line`.
 
-- [ ] **Step 1: Write the failing CLI test** in `src/cli.rs` mod tests (shape of `trace_rejects_mode_and_accepts_the_rest:590`):
+- [ ] **Step 1: Write every failing test before implementation.** In `src/cli.rs` mod tests (shape of `trace_rejects_mode_and_accepts_the_rest:590`):
 
 ```rust
 #[test]
@@ -201,10 +223,15 @@ fn trace_takes_a_max_events_bound_and_profile_refuses_it() {
 }
 ```
 
-- [ ] **Step 2: Run, verify FAIL** (field/parse missing).
+Also add these RED integration tests before touching the parser or capture loop: `default_trace_bound_applies_to_stdout` (an omitted `--max-events` still emits at most the documented default and then `TRUNCATED` plus one partial evidence record), `bounded_file_trace_is_cumulative` (the same bound applies across `-o` rather than separately per sink), and `owned_child_limit_reaches_settlement_and_reap` (a `--max-events 1` owned run reaches terminal drain, emits truncation/evidence, and verifies the child has been reaped). Keep the test fixtures deterministic and assert the event count and terminal records, not merely process success.
+
+Write the failing evidence assertion shown in Step 4 now as part of this same RED set; do not defer writing any test until after a production edit.
+
+- [ ] **Step 2: Run every RED test and record the failures before implementation.** Run the CLI parser test, the evidence test below, `default_trace_bound_applies_to_stdout`, `bounded_file_trace_is_cumulative`, and `owned_child_limit_reaches_settlement_and_reap` in one focused command (or equivalent individually); each must fail for the missing behavior before any production edit.
+
 - [ ] **Step 3: Implement the flag.** In `src/cli.rs`: add `max_events: Option<u64>` to `Common` (:173-182); in `capture_option` parse a positive integer and reject `0` with `"--max-events must be greater than zero"`; in `parse_capture`/`parse_run` add `if kind == Kind::Profile && common.max_events.is_some() { return Err(usage_err("--max-events is a trace option; profile publishes one aggregate document")); }`; extend the trace USAGE line (:103) with `[--max-events <n>]`. There is no unlimited mode: an omitted value uses the documented default cumulative bound.
-- [ ] **Step 4: Run CLI test, verify PASS.**
-- [ ] **Step 5: Write the failing evidence test** in `src/trace.rs` mod tests (reuse the `Evidence` literal from `final_evidence_line_is_machine_readable_and_never_claims_a_proven_drain:436`):
+
+- [ ] **Step 4: Keep the already-written evidence assertion in `src/trace.rs` mod tests** (reuse the `Evidence` literal from `final_evidence_line_is_machine_readable_and_never_claims_a_proven_drain:436`; it was run RED with the other tests in Step 2):
 
 ```rust
 #[test]
@@ -218,9 +245,9 @@ fn a_truncated_trace_says_so_in_its_terminal_record() {
 }
 ```
 
-- [ ] **Step 6: Implement termination + evidence.** In `src/run.rs`: `const DEFAULT_TRACE_MAX_EVENTS: u64 = 10_000_000;` (10M, so `bench-overhead.sh`'s default 1M workload is not truncated; an operator raising `N_CALLS` past 10M sees the visible `TRUNCATED` line — documented behavior). Add `CaptureEnd::LimitReached` to :923 (NOT in `allows_handoff` :931 — an owned child must not be handed back on truncation). In `capture_trace`, use one `remaining` counter initialized from the positive CLI value or the default **before** borrowing `out_sink`; the default applies cumulatively to stdout and file trace. Pass `remaining: &mut Option<u64>` into both regular and terminal `drain_trace_events` calls, appending the arg after `session` so the pinned source text survives. Inside `drain.poll`, when `remaining == Some(0)` still call `state.observe_process(process,&ev)` but do not emit; otherwise emit and decrement. After the drain, `if remaining == Some(0) { break Ok(CaptureEnd::LimitReached); }` goes between drain and `retire_exited`. Thread `max_events` through `run_loop` (:1117, already `#[allow(clippy::too_many_arguments)]`; call sites :1063, :1580). `LimitReached` must flow through terminal drain, emit one `TRUNCATED` line and `trace_truncated: true` evidence with `PARTIAL`, then settle and reap the owned child before returning; it must not be converted into a normal handoff. In `src/trace.rs`, add `truncated_line(limit: u64) -> String`, add the boolean to `evidence_line`, and update all four callers. Compile churn: every exhaustive `Common` literal gains `max_events: None`.
-- [ ] **Step 7: Run focused tests for parsing, evidence, default stdout, bounded file trace, and an owned run; verify PASS.** The default path must be bounded on stdout as well as `-o`, and `CaptureEnd::LimitReached` must still produce terminal evidence and a reaped child.
-- [ ] **Step 8:** Add a `--max-events 1` assertion to `scripts/bench-overhead.sh` trace lane (or a small verify step): output file has the `CAPTURE` line, ≤1 event line, a `TRUNCATED` line, one `EVIDENCE …"trace_truncated":true`, process exits 0. Commit `security: bound trace output by event count with truncation evidence (csf_ad79ebb)`.
+- [ ] **Step 5: Implement termination + evidence.** In `src/run.rs`: `const DEFAULT_TRACE_MAX_EVENTS: u64 = 10_000_000;` (10M, so `bench-overhead.sh`'s default 1M workload is not truncated; an operator raising `N_CALLS` past 10M sees the visible `TRUNCATED` line — documented behavior). Add `CaptureEnd::LimitReached` to :923 (NOT in `allows_handoff` :931 — an owned child must not be handed back on truncation). In `capture_trace`, use one `remaining` counter initialized from the positive CLI value or the default **before** borrowing `out_sink`; the default applies cumulatively to stdout and file trace. Pass `remaining: &mut Option<u64>` into both regular and terminal `drain_trace_events` calls, appending the arg after `session` so the pinned source text survives. Inside `drain.poll`, when `remaining == Some(0)` still call `state.observe_process(process,&ev)` but do not emit; otherwise emit and decrement. After the drain, `if remaining == Some(0) { break Ok(CaptureEnd::LimitReached); }` goes between drain and `retire_exited`. Thread `max_events` through `run_loop` (:1117, already `#[allow(clippy::too_many_arguments)]`; call sites :1063, :1580). `LimitReached` must flow through terminal drain, emit one `TRUNCATED` line and `trace_truncated: true` evidence with `PARTIAL`, then settle and reap the owned child before returning; it must not be converted into a normal handoff. In `src/trace.rs`, add `truncated_line(limit: u64) -> String`, add the boolean to `evidence_line`, and update all four callers. Compile churn: every exhaustive `Common` literal gains `max_events: None`.
+- [ ] **Step 6: Run focused tests and verify PASS.** Run parsing, evidence, default stdout, bounded file trace, and the owned run. The default path must be bounded on stdout as well as `-o`, and `CaptureEnd::LimitReached` must still produce terminal evidence and a reaped child.
+- [ ] **Step 7:** Add a `--max-events 1` assertion to `scripts/bench-overhead.sh` trace lane (or a small verify step): output file has the `CAPTURE` line, ≤1 event line, a `TRUNCATED` line, one `EVIDENCE …"trace_truncated":true`, process exits 0. Commit `security: bound trace output by event count with truncation evidence (csf_ad79ebb)`.
 
 **Regression watch:** `tests/artifact_contracts.rs::both_capture_loops_keep_the_one_frozen_per_tick_ordering:3628` slices `capture_trace` source and requires literal substrings incl. `"    loop {\n        let elapsed = clock.elapsed();"`, `"drain_trace_events(\n            session,"`, `"report_trace_loss("`, `"    finish_capture_loop("` — preserve formatting exactly. Also `usage_documents_every_subcommand…:3440` (keep `p11scope trace` on its USAGE line), `tests/pause.rs:160`, `src/cli.rs` parser tests, `src/trace.rs::final_evidence_line_…:436` (signature change).
 
@@ -253,7 +280,7 @@ fn text_escapes_module_path_controls_while_json_preserves_them() {
 }
 ```
 
-And in `src/render.rs` mod tests (beside `the_live_heading_names_capture_facts…:3341`): a hostile `path = "/opt/p\u{1b}[2Jevil\r.so"`, assert `heading()` contains no raw `\u{1b}`/`\r` but contains `\u{1b}`/`\r` escaped, and the `live(...)` frame contains no `\u{1b}[2J` beyond the caller's own clear-screen prefix.
+And in `src/render.rs` mod tests (beside `the_live_heading_names_capture_facts…:3341`): a hostile `path = "/opt/p\u{1b}[2Jevil\r.so"`, assert `heading()` contains no raw `\u{1b}`/`\r` but contains `\u{1b}`/`\r` escaped, and the `live(...)` frame contains no `\u{1b}[2J` beyond the caller's own clear-screen prefix. Before implementing either renderer, add the two target-controlled `engine.rs` error-detail sink tests at the `:2263-2267` scan/pin eprintln and `:2782` diagnostic eprintln: inject hostile detail into each and assert emitted stderr has escaped controls and no raw ESC/CR. Run all four RED tests and observe their failures before the implementation step.
 
 - [ ] **Step 2: Run, verify FAIL** (raw controls present).
 - [ ] **Step 3: Implement** in `src/render.rs`:
@@ -290,9 +317,9 @@ Apply inside `heading()` (:136-142: `escape_controls(&only.path).into_owned()`, 
 - Produces: `fn open_directory_nofollow_walk(path: &Path) -> std::io::Result<std::fs::File>` (component-wise `O_NOFOLLOW|O_DIRECTORY` walk); a trusted-ancestor boundary check reused by both sinks.
 - Note: HEAD already has `openat2 RESOLVE_NO_SYMLINKS` (commits 7487377/fef8ab3), and per `openat2(2)` `RESOLVE_NO_SYMLINKS` is a **superset** of `RESOLVE_NO_MAGICLINKS` — so magiclinks are already blocked; do not claim otherwise. This task closes the residual gaps: no seccomp fallback (`-o` hard-fails today when `openat2` is blocked — `output.rs:296-302` maps every `fd == -1` to a plain error), no ancestry trust rule, `create_private_stream` unnormalized.
 
-- [ ] **Step 1: Write failing tests** in `src/output.rs` mod tests, `tempfile::tempdir()` + `std::os::unix::fs::PermissionsExt` (the dead "brief B" pointer is gone — the assertions here are the spec): `output_refuses_a_symlinked_intermediate_ancestor` (symlink is an ancestor, not the parent; both `AtomicFile::create` and `create_private_stream` refuse; protected bytes untouched); `output_refuses_a_group_or_world_writable_ancestor` (chmod an ancestor 0775 or 0707 non-sticky → refused with the ancestor named + "untrusted"; chmod 0700 → accepted; chmod 1707 → accepted only for the mandatory sticky carve-out; test fixtures and gates use private output directories); `the_nofollow_walk_fallback_matches_openat2_and_refuses_the_same_symlinks` (direct `open_directory_nofollow_walk` on a real dir returns the same dev+ino as `open_output_directory`; on a symlinked component and on `/proc/self/fd/1` it errors). Inject the `openat2` syscall result so both `EPERM` and `ENOSYS` fallback cases run automatically without privileged e2e.
+- [ ] **Step 1: Write failing tests** in `src/output.rs` mod tests, `tempfile::tempdir()` + `std::os::unix::fs::PermissionsExt` (the dead "brief B" pointer is gone — the assertions here are the spec): `output_refuses_a_symlinked_intermediate_ancestor` (symlink is an ancestor, not the parent; both `AtomicFile::create` and `create_private_stream` refuse; protected bytes untouched); `output_refuses_a_group_or_world_writable_ancestor` (chmod an ancestor 0775 or 0707 non-sticky → refused with the ancestor named + "untrusted"; chmod 0700 → accepted; chmod 1707 → accepted only for the mandatory sticky carve-out; test fixtures and gates use private output directories); `root_owner_is_accepted_but_unrelated_owner_is_rejected` (root-owned and, when euid is root, validated `SUDO_UID`-owned private fixture are accepted; no ownership case waives the mode rule); `the_nofollow_walk_fallback_matches_openat2_and_refuses_the_same_symlinks` (direct `open_directory_nofollow_walk` on a real dir returns the same dev+ino as `open_output_directory`; on a symlinked component and on `/proc/self/fd/1` it errors). Inject the `openat2` syscall result so both `EPERM` and `ENOSYS` fallback cases run automatically without privileged e2e. Test and gate setup names the private fixture/output directories explicitly; no trusted-group directory is invented.
 - [ ] **Step 2: Run, verify FAIL.**
-- [ ] **Step 3: Implement** in `src/output.rs`: delete the local `OpenHow` in favor of `libc::open_how` (construct via zeroed value plus field assignment because it is `#[non_exhaustive]`); keep `RESOLVE_NO_SYMLINKS`; extract the component-wise `O_NOFOLLOW|O_DIRECTORY` walk and fall back on `ENOSYS`/`EPERM` only, never `ELOOP`. Enforce every component from `/` to the output parent as owned by euid/root and with `(mode & 0o022) == 0` unless sticky; there is no trusted-group invention. Normalize `create_private_stream` before opening. Keep the fallback syscall injectable so unprivileged tests cover both seccomp errors without a privileged run.
+- [ ] **Step 3: Implement** in `src/output.rs`: delete the local `OpenHow` in favor of `libc::open_how` (construct via zeroed value plus field assignment because it is `#[non_exhaustive]`); keep `RESOLVE_NO_SYMLINKS`; extract the component-wise `O_NOFOLLOW|O_DIRECTORY` walk and fall back on `ENOSYS`/`EPERM` only, never `ELOOP`. Enforce every component from `/` to the output parent as owned by euid or root, accepting a validated existing `SUDO_UID` owner only for the root-running fixture path, and always reject non-sticky `(mode & 0o022) != 0`; there is no trusted-group exception and ownership never waives the mode rule. Normalize `create_private_stream` before opening. Keep the fallback syscall injectable so unprivileged tests cover both seccomp errors without a privileged run.
 - [ ] **Step 4: Run focused output tests and workspace checks, verify PASS.** Prepare private test/gate directories; the privileged e2e lane is explicitly UNRUN without separate owner approval and does not block the W1 unprivileged exit. Add the existing `CHANGELOG.md` note and commit the scoped fix.
 
 **Regression watch:** 9 `src/output.rs` mod tests (:397,:408,:422,:432,:453,:474,:488,:506 + `src/run.rs:3580`'s use of `AtomicFile::create`) — all write under `tempfile::tempdir()`, NOT `CARGO_TARGET_TMPDIR`; private fixture directories are required. `tests/run_lifecycle.rs:179` and every gate output root must be prepared without group/world write. The privileged e2e lane is UNRUN without separate approval and does not block W1's unprivileged exit. (`tests/live_discovery.rs` sets `out: None` — not a target.)
@@ -308,6 +335,7 @@ Apply inside `heading()` (:136-142: `escape_controls(&only.path).into_owned()`, 
 **Interfaces:**
 - Produces: `Scope::Cgroup { id: u64, path: PathBuf, dir: std::sync::Arc<std::fs::File> }`; `pub fn scope::cgroup(path: &Path) -> Result<Scope>` (opens once, ino from the fd).
 - The retained fd is the one object both the userspace walk and the kernel publish route through — one guard fixes every caller.
+- Keep publication testable without BPF through one private seam used by the real publish path: `publish_cgroup_fd_with(dir: &File, set: impl FnOnce(File) -> Result<()>)`, where `publish` passes `dir.try_clone()?` to the closure and the production closure performs the existing groups publish. This is a test seam, not a new public abstraction or dependency.
 
 - [ ] **Step 1: Write the failing test** in `src/discovery/engine.rs` mod tests (calls private `scope_pids` like :17659):
 
@@ -337,9 +365,7 @@ fn cgroup_walk_follows_the_retained_directory_not_a_replaced_path() {
 }
 ```
 
-Plus `cgroup_walk_reports_losses_under_the_operator_path_not_a_proc_fd_path` (mode-000 leaf, like :17694; assert `lost[0].subject.starts_with(root.path())`).
-
-Add a companion assertion that `scope::publish` is called after the live directory is renamed and publishes through the retained descriptor (the published group identity/contents match the stashed live cgroup, never the pathname impostor); this proves the fd is used for publication as well as traversal.
+Plus `cgroup_walk_reports_losses_under_the_operator_path_not_a_proc_fd_path` (mode-000 leaf, like :17694; assert `lost[0].subject.starts_with(root.path())`). Add `publish_uses_the_retained_cgroup_fd` using the private `publish_cgroup_fd_with` seam: rename the live directory aside, replace its pathname with the impostor, pass a clone of the retained fd to a closure that compares `MetadataExt::ino()` to the original retained inode, and assert the selected inode is the live/stashed cgroup without starting BPF. The production `publish` must call the same seam, proving the retained fd is used for publication as well as traversal.
 
 - [ ] **Step 2: Run, verify FAIL** (walk currently follows the pathname → sees 99).
 - [ ] **Step 3: Implement.** `Scope::Cgroup` gains `dir: Arc<File>` (keeps `#[derive(Debug, Clone)]` — the only derives on `Scope`; nothing derives `PartialEq`). Compile churn the field forces: `scope.rs:94` matches `Scope::Cgroup { id, path }` exhaustively — bind or elide the new field there; every other pattern already uses `..` (`scope.rs:73`, `attach.rs:367/1081/1115`, `engine.rs:2144/2217/7873`). New `scope::cgroup(path)` opens the dir, reads `ino()` from the fd, returns the variant (used at `run.rs:1038`) — and KEEPS the `"reading cgroup path {}"` error context (`scope.rs:191`'s `missing_cgroup_path_errors_loudly` asserts that string). In `scope_pids`, the I/O root is `/proc/self/fd/{}` of the retained fd (repo idiom: `crates/manifest/src/identity.rs:154-168`, `src/discovery/identity.rs:367`) and the stack carries **relative suffixes**; the label root is the operator path — `Skipped.subject` MUST use the label (privacy: no `/proc/self/fd/N` in the capture doc; note `readlink` on the fd reports the moved path, another reason the stored operator path is the only valid subject). `scope::publish` simplifies: drop `File::open` + inode re-check (:96-111) since the fd is the checked object, keep `groups.set(0, dir.try_clone()?, 0)` (:114), delete `drop(cgroup_file)` (:134). Non-goals (one-line comment each): `scope::label` (:34) and `doctor::cgroup_check` (:447) stay path-based (trusted fixed root, label/diagnostic only).
@@ -353,16 +379,16 @@ Add a companion assertion that `scope::publish` is called after the live directo
 ### Task 6: Discovery scan computation budget + pause deadline (csf_ce5962b, MEDIUM)
 
 **Files:**
-- Modify: `crates/manifest/src/maps.rs` (new `MapIndex`, extract `resolved_for`, entry-count ceiling in `parse_maps`), `src/discovery/scan.rs` (`CaptureWorkBudget` :49-149, the maps read :778, `detect_tables` :424, `decode_candidate` :308, `scan_interfaces` :478, `scan_process_view` :763, three reason consts), `src/discovery/engine.rs` (`apply_discovery_batch(_with)` :8296/:8307 — thread `deadline`), `src/discovery/pause.rs:2076`
+- Modify: `crates/manifest/src/maps.rs` (new `MapIndex`, extract `resolved_for`), `src/discovery/scan.rs` (`CaptureWorkBudget` :49-149, the maps read :778, `detect_tables` :424, `decode_candidate` :308, `scan_interfaces` :478, `scan_process_view` :763, reason consts), `src/discovery/engine.rs` (`apply_discovery_batch(_with)` :8296/:8307 — thread `deadline`), `src/discovery/pause.rs:2076`
 - Test: `src/discovery/scan.rs` mod tests (:1134 area), one `tests/discovery_scan.rs` PARTIAL-wiring assertion
 
 **Interfaces:**
-- Produces: `manifest::maps::MapIndex<'a>` (with `new`, `resolve` — sorted-interval `partition_point` lookup; unsorted input is rejected fail-closed); `CaptureWorkBudget::charge(units: u64) -> bool`, `set_deadline(Option<u64>)`, `WORK_CEILING_REASON`, `SCAN_DEADLINE_REASON`, `MAPS_CEILING_REASON`.
+- Produces: `manifest::maps::MapIndex<'a>` (with `new`, `resolve` — sorted-interval `partition_point` lookup; unsorted input is rejected fail-closed); `CaptureWorkBudget::charge(units: u64) -> bool`, `set_deadline(Option<u64>)`, `WORK_CEILING_REASON`, `SCAN_DEADLINE_REASON`, `MAPS_CEILING_REASON`, and `MAPS_ENTRY_CEILING_REASON`.
 - Consumes: `attach::monotonic_ns()` (verified: `attach.rs:711`, `pub(crate)` — deadline tests must live in `src/` mod tests; `SessionPauseIo::now_ns` at `pause.rs:1997-1999` is literally the same fn, so the clocks match); the existing `Skipped{subject,reason}` → `capture_skipped_out` → `modules_skipped` → PARTIAL path (no renderer/evidence change).
 
-- [ ] **Step 1: Write failing tests** in `src/discovery/scan.rs` mod tests (model on `dense_candidates_and_interfaces_stop_at_capture_caps:1134`; synthetic `parse_maps(b"…")` plus an injectable maps-reader seam): `adversarial_near_misses_and_a_512_table_tail_stop_at_the_computation_ceiling` (4096 candidates each a full-104-field near miss rejected at the last field; assert `tables.is_empty()` and `skipped == vec![WORK_CEILING_REASON]`); `a_crossed_deadline_stops_the_scan_and_reports_it` (`budget.set_deadline(Some(monotonic_ns().saturating_sub(1)))`; assert `skipped == vec![SCAN_DEADLINE_REASON]`); `maps_exact_cap_is_not_truncated` (reader returns exactly `MAX_MAPS_BYTES`, assert no maps-ceiling reason); `maps_cap_plus_one_is_truncated_at_the_last_newline` (reader returns `MAX_MAPS_BYTES + 1`, assert only complete lines before the cut, `MAPS_CEILING_REASON`, and no hard error); `unsorted_maps_fail_closed` (construct reversed intervals, assert the scan refuses instead of using a linear fallback); and `maps_total_byte_exhaustion_is_partial` (exhaust `total_bytes` during the injected maps read, assert `IO_CEILING_REASON` and the existing PARTIAL path).
+- [ ] **Step 1: Write failing tests** in `src/discovery/scan.rs` mod tests (model on `dense_candidates_and_interfaces_stop_at_capture_caps:1134`; use an injectable maps-reader seam): `adversarial_near_misses_and_a_512_table_tail_stop_at_the_computation_ceiling` (4096 candidates each a full-104-field near miss rejected at the last field; assert `tables.is_empty()` and `skipped == vec![WORK_CEILING_REASON]`); `maps_reader_crosses_64_mib_without_a_per_object_ceiling` (one maps snapshot crossing 64 MiB still reads until the total budget or `MAX_MAPS_BYTES`, proving no `per_object_bytes` allowance); `maps_exact_cap_is_not_truncated` (reader returns exactly `MAX_MAPS_BYTES`, assert no maps-ceiling reason); `maps_cap_plus_one_is_truncated_at_the_last_newline` (reader returns `MAX_MAPS_BYTES + 1`, assert only complete lines before the cut, `MAPS_CEILING_REASON`, and no hard error); `maps_entry_ceiling_truncates_at_complete_line` (more than `MAX_MAP_ENTRIES`, assert truncation at the `MAX_MAP_ENTRIES`th complete newline, `MAPS_ENTRY_CEILING_REASON`, and PARTIAL without changing the generic parser); `maps_total_byte_exhaustion_is_partial` (exhaust `total_bytes` during the injected maps read, assert `IO_CEILING_REASON` and the existing PARTIAL path); `deadline_interrupts_between_64k_chunks` (deadline becomes expired after a chunk, assert `SCAN_DEADLINE_REASON`); `deadline_is_cleared_after_error_and_success` (subsequent scan has no stale deadline); and `unsorted_maps_fail_closed` (construct reversed intervals, assert the scan refuses instead of using a linear fallback).
 - [ ] **Step 2: Run, verify FAIL** (scan currently completes / near misses cost zero budget / the maps read is uncapped).
-- [ ] **Step 3: Implement (a) `MapIndex`** in `maps.rs`: extract `:204-222` into `resolved_for`; build a sorted-interval `partition_point` index once after `parse_maps`, and reject unsorted intervals immediately (no unsorted fallback). Add `const MAX_MAP_ENTRIES: usize = 1_048_576` and fail closed when parsing the next entry. **(b)** HashMap `by_address` in `scan_interfaces` replacing the linear `position`. **(c)** add an independent `work` counter with `const DEFAULT_WORK_CEILING: u64 = 16 * 1024 * 1024`; it is test-overridable and never derived from `total_bytes`. Charge at each window and inside `decode_candidate`'s field loop before `resolve`; on exhaustion return `WORK_CEILING_REASON`. A `charge(1)` against the O(log n) index is the unit definition. **(d)** add `deadline_ns: Option<u64>` + `set_deadline`; check immediately on entry to each scan, then every 4096 windows via `attach::monotonic_ns()`; thread `deadline` through `apply_discovery_batch(_with)` and set it on entry. Clear it on every exit, including all early returns (a small guard/finally closure is acceptable). `pause.rs:2076` passes the deadline already held. **(e)** push all reason constants through the existing `Vec<String>` returns. **(f) Bound the maps read itself.** Replace the bare `/proc/{pid}/maps` read with an injectable reader using `File::open` + `Read::take(MAX_MAPS_BYTES + 1)`; charge every returned byte through `allowed_io`/`record_io` so `total_bytes` exhaustion yields `IO_CEILING_REASON`. Reading `MAX_MAPS_BYTES + 1` distinguishes exact EOF (no truncation reason) from cap-plus-one; when the extra byte exists, trim at the last complete newline before `parse_maps`, push `MAPS_CEILING_REASON`, and continue PARTIAL. Use `const MAX_MAPS_BYTES: u64 = 128 * 1024 * 1024` with the existing `ponytail:` calibration note; `MAX_MAP_ENTRIES` bounds allocations too.
+- [ ] **Step 3: Implement (a) `MapIndex`** in `maps.rs`: extract `:204-222` into `resolved_for`; build a sorted-interval `partition_point` index once after `parse_maps`, and reject unsorted intervals immediately (delete the unsorted linear fallback). **(b)** HashMap `by_address` in `scan_interfaces` replacing the linear `position`. **(c)** add an independent work counter with `const DEFAULT_WORK_CEILING: u64 = 16 * 1024 * 1024`; it is test-overridable and never derived from `total_bytes` (there is no `per_object_bytes` allowance). Charge at each window and inside `decode_candidate`'s field loop before `resolve`; on exhaustion return `WORK_CEILING_REASON`. A `charge(1)` against the O(log n) index is the unit definition. **(d)** add `deadline_ns: Option<u64>` + `set_deadline`; check immediately on entry to each scan, then every 4096 windows via `attach::monotonic_ns()`. For the maps reader, read in bounded 64 KiB chunks through `Read::take(MAX_MAPS_BYTES + 1)`, check the deadline between chunks, and charge every returned byte against the total I/O budget. On total exhaustion return `IO_CEILING_REASON`; do not reset or split that charge per object. Reading `MAX_MAPS_BYTES + 1` distinguishes exact EOF from cap-plus-one. If the extra byte exists, truncate before generic parse at the `MAX_MAP_ENTRIES`th complete newline (or the last complete newline for the byte cap), emit `MAPS_ENTRY_CEILING_REASON` or `MAPS_CEILING_REASON`, and continue with PARTIAL evidence. **(e)** thread `deadline` through `apply_discovery_batch(_with)` and set it on entry. Clear it on every exit, including all early returns (a guard/finally closure is acceptable); `pause.rs:2076` passes the held deadline already. **(f)** push all reason constants through the existing `Vec<String>` returns. There is no weaker deadline fallback.
 - [ ] **Step 4: Run tests, verify PASS.** Add a `tests/discovery_scan.rs` assertion that `render::capture_skipped_out(&Skipped{subject:"/lib/x.so".into(), reason: WORK_CEILING_REASON.into()}).reason == "discovery unavailable"` (pins PARTIAL wiring).
 - [ ] **Step 5: Measure the honest path** — `p11scope inspect --pid <softhsm-loaded pid>` before/after, compare `scan.scan_ms` from the JSON; `MapIndex` should make it faster (log n vs n). If `DEFAULT_WORK_CEILING` ever trips on a real provider, raise the const (the calibration knob — noted in a `ponytail:` comment). Commit `security: bound discovery scan computation, the maps read, and honor the pause deadline (csf_ce5962b)`.
 
@@ -380,9 +406,11 @@ Add a companion assertion that `scope::publish` is called after the live directo
 - "Integrate the preflight" does NOT mean invoking BS2b (`scripts/task4-build-subject.py:3461-3462` exits 77 by construction, review-gated; `tests/task4_build_subjects.rs:417` pins candidate-only). It means enforcing the ratified input-trust rules (`docs/superpowers/reports/2026-08-28-task4-receipt-architecture-decision.md:83-91`, `docs/superpowers/reports/2026-08-28-task4-build-subject-decision.md:107-112` — note: `reports/`, not `plans/`) in the shell driver. Every recorded tool must be invoked by the resolved absolute non-symlink path recorded in the receipt, not merely hashed via `command -v`.
 - Context on A1: `:285` already refuses a dirty TRACKED tree (`git diff --quiet && git diff --cached --quiet`, twin inside `task4_finalize` at :231; the fn itself starts :220) and `task4_snapshot:202` hashes `git ls-files` only — **untracked files are invisible to every existing gate**, which is exactly how an untracked `.cargo/config.toml` steers Cargo unnoticed. The porcelain replacement is what closes that.
 
-- [ ] **Step 1: Write failing tests.** (a) Real-process refusal in `tests/artifact_contracts.rs` (pattern of :811, PATH tripwires from :2512-2543): tempdir `CARGO_HOME` with a planted `config.toml`, run `build-release.sh <absent_root>` → `exit 77`, stderr contains `"untracked cargo config"`, tripwire log absent (never reached cargo/sudo/rm). (b) Self-test model rows: add `untracked-build-input-rejected-status-77-no-touch-before-body` to `LANE14_CASES` (:2429) AND the `lane` heredoc (:105-122); modeled on `root-preflight-blocks-body-cargo-runtime` (:62). (c) Static assert: extend `official_build_is_safe_only:709` for `--offline`.
+The preflight is self-contained and exact: **A1** requires full `git status --porcelain=v1 --untracked-files=all` cleanliness (tracked, staged, and untracked); **A2** searches the exact repository-ancestor sequence from the worktree to `/` for each `.cargo/config.toml` and `.cargo/config`, then the effective `CARGO_HOME/config.toml` and `CARGO_HOME/config`, refusing any untracked or unexpected config input; **A3** records and rejects changes to exactly these ten inherited variables: `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET`, `CARGO_HOME`, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`, `RUSTC_WRAPPER`, `CC`, and `CFLAGS`; **A4** records the exact nine tools `cargo`, `docker`, `file`, `jq`, `python3`, `rustup`, `setpriv`, `sudo`, and `sha256sum`, plus the `rustup`-reported `cargo`/`rustc` toolchain binaries, and every invocation uses its resolved absolute non-symlink path; **A5** permits host build execution only with `--offline` (container/privileged commands retain their separate owner gates). Initial and final repository/tool/environment hashes must match; PATH replacement or mismatch is refusal, never a warning.
+
+- [ ] **Step 1: Write failing tests.** (a) Real-process refusal in `tests/artifact_contracts.rs` (pattern of :811, PATH tripwires from :2512-2543): tempdir `CARGO_HOME` with a planted `config.toml`, run `build-release.sh <absent_root>` → `exit 77`, stderr contains `"untracked cargo config"`, tripwire log absent (never reached cargo/sudo/rm). (b) Self-test model rows: add `untracked-build-input-rejected-status-77-no-touch-before-body` to `LANE14_CASES` (:2429) AND the `lane` heredoc (:105-122); modeled on `root-preflight-blocks-body-cargo-runtime` (:62). (c) Add refusal rows for replacing one recorded tool between preflight and finalization, and for a PATH change that resolves a different binary; both must fail closed. (d) Static assert: extend `official_build_is_safe_only:709` for `--offline`.
 - [ ] **Step 2: Run, verify FAIL.**
-- [ ] **Step 3: Implement** in `task4_receipt_run`, all before `command -v`(:295)/`sudo -n`(:296)/`release_body`(:305), refusal `exit 77` (POSIX sh; `sh -n` gate at :2267): preserve A1–A3, resolve each recorded tool to an absolute non-symlink path and invoke those exact paths (including the toolchain binaries), and record `task4_fact` path/hash rows. At finalization, rehash every recorded tool path and refuse publication on any mismatch or replacement; a PATH change that resolves a different binary is a refusal, not a warning. Add `--offline` to the host build only (:335-336). New receipt fields remain additive TSV rows.
+- [ ] **Step 3: Implement** in `task4_receipt_run`, all before `command -v`(:295)/`sudo -n`(:296)/`release_body`(:305), refusal `exit 77` (POSIX sh; `sh -n` gate at :2267): implement self-contained A1–A5 exactly as listed above, resolve each recorded tool to an absolute non-symlink path and invoke those exact paths (including the rustup-selected cargo/rustc binaries), and record `task4_fact` path/hash rows. At finalization, rehash every recorded tool path and refuse publication on any mismatch or replacement; a PATH change that resolves a different binary is a refusal, not a warning. Add `--offline` to the host build only (:335-336). New receipt fields remain additive TSV rows.
 - [ ] **Step 4: Run focused artifact-contract tests and workspace checks, including tool replacement/PATH-mismatch refusal tests, verify PASS** (update the byte-exact cargo block literal in :709 in the SAME commit as `--offline`). Commit the scoped fix.
 
 **Regression watch:** `artifact_contracts.rs:709` (byte-exact cargo block — update literal), `:734` (literal path relationships, `trap … EXIT` count ==1, `release_body_cleanup` ==2, poisoned-env exit 2 — keep `WORK=`/invocation strings byte-identical), `:2339`/`:2650` (uncontracted self-test rows fail; `build-release.sh:161` enforces row-count equality), `:2267` (POSIX `sh -n` — no bashisms), `tests/task4_build_subjects.rs:417,:196` (don't touch the .py). `facts.log` has no parser today → new rows safe.
@@ -411,24 +439,6 @@ Add a companion assertion that `scope::publish` is called after the live directo
 
 ---
 
-### Task 9: Stage 3A3 evidence-custody repair
-
-**Files:**
-- Modify: `docs/superpowers/reports/2026-08-31-productization-evidence-index.md:66-70`, root `.gitignore`, and `/home/user/src/m/p11scope-ws/.gitignore`
-- Restore only into: `/home/user/src/m/p11scope-ws/preserved/sdd/2026-08-27-task4-receipt-closure/` (durable home per spec §4)
-- Never recreate the private SDD trove under the public repository; public files may contain only a pointer/fence.
-
-- [ ] **Step 1:** The evidence index's worktree pointer is dead. Use the complete source under `/home/user/.local/state/p11scope/retired-generated-slice1b2-finish/.superpowers/sdd/2026-08-27-task4-receipt-closure/` only as an input, and copy the FULL trove only to `/home/user/src/m/p11scope-ws/preserved/sdd/2026-08-27-task4-receipt-closure/`; do not create any public `.superpowers/sdd/` copy. Before copying, run a no-clobber preflight: destination must be absent, or every existing file must match its source hash; mismatches stop without overwrite.
-- [ ] **Step 2:** Hash every source file before the copy and every destination file after it with a sorted, path-stable manifest; verify the two named reports are non-empty and match the tarball cross-check byte-for-byte. Record exact before/after SHA-256 values and the manifest hash.
-- [ ] **Step 3:** Edit the evidence index to point to `p11scope-ws/preserved/sdd/2026-08-27-task4-receipt-closure/` and state that no public SDD copy exists; the portable package may hold only the explicitly approved three-file `stage3a3/` subset.
-- [ ] **Step 4:** Mirror `findings.json` only into `p11scope-ws/preserved/security-scan-3e10be9/findings.json`, with the same no-clobber, exact-hash, deterministic-manifest, and private-data scan rules.
-- [ ] **Step 5:** **Before any staging**, create the `p11scope-ws/.gitignore` fence for `incoming/`, `vm-bases/`, `preserved/evidence-roots/`, `preserved/portable/`, `*.tar.zst`, `*.qcow2`, and `*.img`; add the public root `.gitignore` fence for `.superpowers/sdd/`. Then stage only the durable text and manifests in `p11scope-ws`, never raw captures or ignored binaries. Run a privacy scan for PIDs, addresses, raw captures, and forbidden paths before staging; inspect both repositories' diffs.
-- [ ] **Step 6:** Permissions: `chmod 0700 /home/user/p11scope-vm-bases` (currently 0755; mitigation only — the parent `/home/user` is 0750 so exposure is group-scoped, and the audit's key-rotation item stays open under the spec §4 migration wave, this does not un-leak anything) and `chmod 0600 /home/user/.local/state/p11scope/pkcs11-scope-portable-b86d4d5.tar.zst` (currently 0664; its siblings and its own extracted contents are 0600).
-- [ ] **Step 7:** Verify the privacy fence before staging: keep `.superpowers/sdd/` ignored in the tracked public root, keep the private-data/binary patterns in the tracked `p11scope-ws/.gitignore`, and refuse any public SDD recreation. A fresh clone must not be able to stage the private trove via `git add -A`.
-- [ ] **Step 8:** Run the public repository's non-Cargo markdown/source checks and all four gates where authorized (docs-only still runs); review the `p11scope-ws` diff separately. Privileged/container rows remain UNRUN without approval. Commit only the public pointer/fence and the separately reviewed durable workspace custody change.
-
----
-
 ### Task 10: Full-gate verification
 
 - [ ] **Step 1:** All four canonical gates on the branch tip, clean.
@@ -442,7 +452,7 @@ Add a companion assertion that `scope::publish` is called after the live directo
 - [ ] **Step 1:** Dispatch two independent Opus review agents over both repositories: (a) adversarial security/correctness review of the public `git diff main...hardening/findings-wave1` plus the private `p11scope-ws` custody diff, including each finding's root closure and all sibling callers; (b) test-quality + regression review of both diffs (tests fail without the fix, assertions are meaningful, no weakened existing test, no private data crossed the public boundary).
 - [ ] **Step 2:** Triage (Fable adjudicates — accept/reject each with reasoning). Fix every accepted finding TDD-style; rerun gates.
 - [ ] **Step 3:** Repeat Step 1 with fresh agents until a full cycle reports zero accepted findings.
-- [ ] **Step 4:** Keep the closeout report committed and reviewed on the branch before integration. Invoke `superpowers:finishing-a-development-branch` to present the owner's integration choice; after integration, rerun all four gates on the merged `main` tip before packaging.
+- **Exit condition:** Task 11 is review-to-zero only. It performs no integration, packaging, or finishing workflow; those occur exactly once in Task 12 after the closeout is committed and reviewed.
 
 ---
 
@@ -450,12 +460,12 @@ Add a companion assertion that `scope::publish` is called after the live directo
 
 - [ ] **Step 1:** Write `docs/superpowers/reports/2026-09-01-wave1-findings-closure.md`: per-finding closure evidence (test name + commit), the two upgraded findings called out honestly (Lane 14 receipt was a live mis-binding affecting all prior receipts; `-o` was broken under old Docker seccomp), review-cycle count, private-custody hashes, and every UNRUN privileged confirmation listed plainly.
 - [ ] **Step 2:** Commit the closeout report on the W1 branch. Run the exact branch-tip gates and perform the final public-plus-`p11scope-ws` review before any integration choice; accepted findings require fixes and a fresh gate/review cycle.
-- [ ] **Step 3:** Invoke `superpowers:finishing-a-development-branch` for the owner's integration choice. Once merged, rerun the gates on the merged tip; only then refresh/package the portable bundle and evidence archive. Never package from an unmerged branch tip.
-- [ ] **Step 4:** Record memory only through a platform-permitted ad-hoc note under `/home/user/.codex/memories/extensions/ad_hoc/notes/`, never by editing the memory registry directly. Name W2 storage consolidation next and name **W3 priority one** as the `C_GetInterface` compatibility closure; W3 then handles tracepoint offsets, opened-file identity, capability breadth, and `uprobe_multi` according to the ROADMAP/charter. Allowlist/schema wording remains owner-gated.
+- [ ] **Step 3:** After the closeout is written, committed, gated, and reviewed on the branch, invoke `superpowers:finishing-a-development-branch` exactly once for the owner's integration choice. After a merge, rerun all gates on the merged tip; package the portable bundle/evidence archive only after those merged-tip gates pass. Never package from an unmerged branch tip.
+- [ ] **Step 4:** Memory update is conditional: only an explicit contemporaneous owner request may create a platform-permitted ad-hoc note under `/home/user/.codex/memories/extensions/ad_hoc/notes/`; otherwise record `SKIPPED` in the closeout. When requested, name W2 storage consolidation next and **W3 priority one** as the `C_GetInterface` compatibility closure; W3 then handles tracepoint offsets, opened-file identity, capability breadth, and `uprobe_multi` according to the ROADMAP/charter. Allowlist/schema wording remains owner-gated.
 
 ## Self-Review
 
-- **Spec coverage:** all 8 findings (Tasks 1-8) + research #3 (Task 6f) + custody gap (Task 9) + gates/review/closeout (10-12). Task 6 now specifies `DEFAULT_WORK_CEILING=16*1024*1024`, `MAX_MAP_ENTRIES=1_048_576`, cap-plus-one maps reads, exact EOF/truncation tests, injected readers, fail-closed ordering, immediate/periodic deadlines, and unconditional deadline clearing. W3 priority one is the `C_GetInterface` compatibility closure, with tracepoint offsets and opened-file identity following it.
+- **Spec coverage:** all 8 findings (Tasks 1-8) + research #3 (Task 6f) + custody rescue (Task 0) + gates/review/closeout (10-12). Task 6 now specifies `DEFAULT_WORK_CEILING=16*1024*1024`, `MAX_MAP_ENTRIES=1_048_576`, cap-plus-one maps reads, exact EOF/truncation tests, injected readers, fail-closed ordering, immediate/periodic deadlines, and unconditional deadline clearing. W3 priority one is the `C_GetInterface` compatibility closure, with tracepoint offsets and opened-file identity following it.
 - **Placeholder scan:** every code step carries real code or an exact edit locus; the `/* same literal as … */` markers point at existing test fixtures the executor copies, not invented content; no scratchpad/brief pointers remain.
 - **Type consistency:** `Scope::Cgroup{id,path,dir}`, `scope::cgroup()`, `MapIndex`, `CaptureWorkBudget::charge/set_deadline`, `CaptureEnd::LimitReached`, `trace::truncated_line -> String`/`evidence_line(…, truncated)`, `render::escape_controls` — names used consistently across tasks.
 - **2026-09-01 verification pass (three independent read-only verifiers over historical HEAD 556f7cf):** all cited line anchors were confirmed or corrected in place; the current execution base is verified `main` `5d251b76b33b14839a7147e14b5ccd1348855587`, origin gap 239. The three blocking defects found (Task 6 maps-read gap, Task 5 test destroying the fd's directory, Task 4 ancestry rule vs 775 checkouts + sudo inversion) and both compile-breaks (Task 2 `out_sink` borrow, Task 4 `open_how` non_exhaustive) remain recorded as historical review context.

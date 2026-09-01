@@ -835,6 +835,146 @@ fn task4_receipt_lane14_release_work_is_private_and_single_owner() {
     assert_eq!(fs::read(&sentinel).unwrap(), b"must survive\n");
 }
 
+#[test]
+fn task4_receipt_lane14_capture_binding_is_literal_and_checker_evidence_framed() {
+    let release = read("scripts/build-release.sh");
+
+    // csf_19fb2f: `find … '*observed*.json' | sort | head -n 1` always chose
+    // the attach-e2e lane's observed-scan.json (ASCII: `-` < `.`, `c` < `t`),
+    // never the release's own observed-static-smoke.json, and whole-body
+    // stdout stood in for checker evidence. The ratified receipt architecture
+    // forbids glob, find|head, path-order authority, and stdout-as-capture.
+    assert!(
+        release.contains(
+            "cp \"$WORK/observed-static-smoke.json\" \"$TASK4_ROOT/artifacts/capture.json\""
+        ),
+        "capture.json is not bound to the literal static-smoke output path"
+    );
+    assert!(
+        !release.contains("head -n 1"),
+        "path-order authority still selects a receipt artifact"
+    );
+    assert!(
+        !release.contains("cp \"$TASK4_ROOT/stdout.log\" \"$TASK4_ROOT/artifacts/checker.log\""),
+        "aggregate body stdout still stands in for checker evidence"
+    );
+
+    // The framed checker record carries the exact argv line, the checker's
+    // own captured stdout/stderr, and a terminal status line. Execute the
+    // real framing block from release_body against a stub checker, then
+    // parse and validate the structure it wrote.
+    let framing = format!(
+        "t4_checker_argv={}",
+        between(
+            &release,
+            "\nt4_checker_argv=",
+            "\necho \"static p11scope smoke attach OK"
+        )
+    );
+    let fixture = tempfile::tempdir().expect("create checker-framing fixture");
+    let work = fixture.path().join("work");
+    fs::create_dir(&work).expect("create framing work directory");
+    let stub = fixture.path().join("stub-checker");
+    fs::write(
+        &stub,
+        b"#!/bin/sh\nprintf 'checker-stdout\\n'\nprintf 'checker-stderr\\n' >&2\nexit \"${P11SCOPE_TASK8_CHECKER_STATUS:-0}\"\n",
+    )
+    .expect("write stub checker");
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).expect("make stub executable");
+    let runner = fixture.path().join("run-framing.sh");
+    fs::write(
+        &runner,
+        format!(
+            "#!/bin/sh\nset -eu\nT4_TOOL_python3={stub}\nWORK={work}\n{framing}\n",
+            stub = stub.display(),
+            work = work.display(),
+        ),
+    )
+    .expect("write framing runner");
+
+    let framed_checker_evidence = |log: &str| {
+        let lines: Vec<&str> = log.lines().collect();
+        if lines.len() < 2 {
+            return false;
+        }
+        let argv_ok = lines[0]
+            .strip_prefix("argv\t")
+            .is_some_and(|argv| argv.contains("scripts/check-capture-evidence.py"));
+        let status_ok = lines[lines.len() - 1]
+            .strip_prefix("status\t")
+            .is_some_and(|status| !status.is_empty() && status.bytes().all(|b| b.is_ascii_digit()));
+        argv_ok && status_ok
+    };
+
+    let success = Command::new("/bin/sh")
+        .arg(&runner)
+        .output()
+        .expect("run the checker framing block");
+    assert!(
+        success.status.success(),
+        "framing block failed on a clean checker: stdout={} stderr={}",
+        String::from_utf8_lossy(&success.stdout),
+        String::from_utf8_lossy(&success.stderr)
+    );
+    let log = fs::read_to_string(work.join("checker.log")).expect("read framed checker.log");
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        lines[0],
+        format!(
+            "argv\t{} scripts/check-capture-evidence.py clean-metrics-manifest-only {}/observed-static-smoke.json spike/expected.txt",
+            stub.display(),
+            work.display()
+        ),
+        "framed record must open with the exact checker argv"
+    );
+    assert!(
+        lines.contains(&"checker-stdout"),
+        "framed record must capture the checker's stdout: {log:?}"
+    );
+    assert!(
+        lines.contains(&"checker-stderr"),
+        "framed record must capture the checker's stderr: {log:?}"
+    );
+    assert_eq!(
+        lines[lines.len() - 1],
+        "status\t0",
+        "framed record must close with the checker's status"
+    );
+    assert!(framed_checker_evidence(&log));
+
+    // A checker failure keeps its status in the frame and fails the body
+    // with that same status.
+    fs::remove_file(work.join("checker.log")).expect("reset framed checker.log");
+    let failure = Command::new("/bin/sh")
+        .arg(&runner)
+        .env("P11SCOPE_TASK8_CHECKER_STATUS", "3")
+        .output()
+        .expect("run the checker framing block with a failing checker");
+    assert_eq!(
+        failure.status.code(),
+        Some(3),
+        "a checker failure must fail the release body with the checker's status"
+    );
+    let failed_log =
+        fs::read_to_string(work.join("checker.log")).expect("read failed framed checker.log");
+    assert_eq!(
+        failed_log.lines().last(),
+        Some("status\t3"),
+        "the framed record must retain the checker's failure status: {failed_log:?}"
+    );
+    assert!(framed_checker_evidence(&failed_log));
+
+    // Non-empty is not the bar: an unframed aggregate stdout log -- the
+    // pre-fix checker.log shape -- must be rejected as checker evidence.
+    let aggregate = "=== release privacy gate ===\ncanaries OK\n\
+        === p11scope: dynamic-build attach correctness ===\n\
+        static p11scope smoke attach OK: {}\n=== build-release: ALL OK ===\n";
+    assert!(
+        !framed_checker_evidence(aggregate),
+        "an unframed aggregate stdout log must be rejected as checker evidence"
+    );
+}
+
 /// The build inputs the release driver refuses to inherit. Cargo and rustup
 /// read every one of them, so a non-empty inherited value silently re-steers
 /// the official build away from the recorded source tree.
@@ -2770,6 +2910,9 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         "untracked-build-input-rejected-status-77-no-touch-before-body",
         "recorded-tool-replaced-between-preflight-and-finalization-rejected",
         "path-change-resolving-a-different-binary-rejected",
+        "literal-static-smoke-capture-path-exact-accepted",
+        "decoy-observed-json-under-work-rejected",
+        "aggregate-stdout-as-checker-evidence-rejected",
     ];
     const LANE16_CASES: &[&str] = &[
         "never-68-68-136-one-timing-zero-loss-ambiguity-inflight-child-false-none-0-0-0-exact-accepted",

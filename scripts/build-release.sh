@@ -122,7 +122,10 @@ cleanup-failure-upgrades-one-status-written-last
 absolute-nested-work-and-legacy-defaults-exact-accepted
 untracked-build-input-rejected-status-77-no-touch-before-body
 recorded-tool-replaced-between-preflight-and-finalization-rejected
-path-change-resolving-a-different-binary-rejected""".splitlines()
+path-change-resolving-a-different-binary-rejected
+literal-static-smoke-capture-path-exact-accepted
+decoy-observed-json-under-work-rejected
+aggregate-stdout-as-checker-evidence-rejected""".splitlines()
 
 good={"owners":1,"child_status":False,"facts":["43:99","hash"],"executables":["p11scope","p11scope-discover","p11scope-discover-glibc","p11scope-discover-musl"],"softhsm":68,"fixture":[68,92,104],"static":[68,68,136]}
 def lane_valid(d):
@@ -176,6 +179,29 @@ replaced=dict(recorded,cargo=("/usr/lib/toolchain/cargo","sha-c"))
 repathed=dict(recorded,sudo=("/tmp/shadow/sudo","sha-b"))
 mark(lane[19],tools_unchanged(dict(recorded)) and not tools_unchanged(replaced))
 mark(lane[20],not tools_unchanged(repathed))
+# csf_19fb2f: the capture binding names its source literally. Selection by
+# sorted-glob order would pick observed-scan.json ('-'<'.', 'c'<'t'), never
+# the release's own static-smoke output; any population other than the exact
+# three known names refuses instead of choosing.
+work_entries=["canaries","discover","dist","harness","manifest.json","observed-scan.json",
+              "observed-static-smoke.json","observed.json","release-manifest.json","softhsm2.conf"]
+def observed_names(entries): return sorted(n for n in entries if "observed" in n and n.endswith(".json"))
+def capture_binding(entries):
+    if observed_names(entries)!=["observed-scan.json","observed-static-smoke.json","observed.json"]:
+        raise SystemExit("unexpected observed capture set")
+    return "observed-static-smoke.json"
+mark(lane[21],capture_binding(work_entries)=="observed-static-smoke.json"
+     and observed_names(work_entries)[0]!="observed-static-smoke.json")
+try: capture_binding(work_entries+["observed-decoy.json"]); decoy_rejected=False
+except SystemExit: decoy_rejected=True
+mark(lane[22],decoy_rejected)
+framed="argv\tpython3 scripts/check-capture-evidence.py clean-metrics-manifest-only observed-static-smoke.json spike/expected.txt\nstatus\t0"
+aggregate="=== release privacy gate ===\n=== build-release: ALL OK ==="
+def checker_evidence_framed(text):
+    lines=text.splitlines()
+    return (len(lines)>=2 and lines[0].startswith("argv\t") and "check-capture-evidence.py" in lines[0]
+            and lines[-1].startswith("status\t") and lines[-1].split("\t",1)[1].isdigit())
+mark(lane[23],checker_evidence_framed(framed) and not checker_evidence_framed(aggregate))
 
 if len(rows)!=len(common)+len(lane) or len(rows)!=len(set(rows)): raise SystemExit("row coverage")
 report.parent.mkdir(parents=True,exist_ok=True);fd=os.open(report,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
@@ -422,10 +448,23 @@ task4_receipt_run() {
     TASK4_CHILD_FACTS_HASH=$(task4_digest /proc/$$/fd/8) || exit 1
     task4_fact child_facts_identity "$TASK4_CHILD_FACTS_ID"
     task4_fact child_facts_sha256 "$TASK4_CHILD_FACTS_HASH"
-    t4_capture=$(find "$TASK4_ROOT/work" -type f -name '*observed*.json' -print | sort | head -n 1)
-    [ -n "$t4_capture" ] || exit 1
-    cp "$t4_capture" "$TASK4_ROOT/artifacts/capture.json"
-    cp "$TASK4_ROOT/stdout.log" "$TASK4_ROOT/artifacts/checker.log"
+    # csf_19fb2f: the receipt capture is bound to the literal path the static
+    # smoke wrote; find remains only as a guard that the observed-capture
+    # population under work/ is exactly the three known files (two attach-e2e
+    # lanes plus the static smoke), so a planted decoy refuses instead of
+    # being silently ranked. checker.log is the framed checker record from
+    # release_body, never the whole-body stdout.
+    t4_observed=$(find "$TASK4_ROOT/work" -type f -name '*observed*.json' -print | sort)
+    [ "$t4_observed" = "$(printf '%s\n' \
+        "$TASK4_ROOT/work/observed-scan.json" \
+        "$TASK4_ROOT/work/observed-static-smoke.json" \
+        "$TASK4_ROOT/work/observed.json")" ] \
+        || { echo "unexpected observed capture set under work: $t4_observed" >&2; exit 1; }
+    cp "$WORK/observed-static-smoke.json" "$TASK4_ROOT/artifacts/capture.json"
+    cp "$WORK/checker.log" "$TASK4_ROOT/artifacts/checker.log"
+    task4_fact checker_argv "$t4_checker_argv"
+    task4_fact checker_status "$t4_checker_status"
+    task4_fact checker_log_sha256 "$(task4_digest "$TASK4_ROOT/artifacts/checker.log")"
 }
 
 release_body() {
@@ -604,8 +643,20 @@ if wait "$LPID"; then LPID=; WPID=; TARGET_STARTTIME=; else status=$?; LPID=; WP
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "static smoke profiler failed: $status"; cat "$WORK/profile-static-smoke.log" || true; exit "$status"; fi
 reclaim_root_output "$WORK/observed-static-smoke.json"
 
-"$T4_TOOL_python3" scripts/check-capture-evidence.py clean-metrics-manifest-only \
-    "$WORK/observed-static-smoke.json" spike/expected.txt
+# Framed checker record (csf_19fb2f): exact argv, the checker's own captured
+# stdout/stderr, and a terminal status line. The frame keeps the record
+# non-empty even though the checker is silent on success, and it -- not the
+# aggregate body stdout -- is what the receipt retains as checker.log.
+t4_checker_argv="$T4_TOOL_python3 scripts/check-capture-evidence.py clean-metrics-manifest-only $WORK/observed-static-smoke.json spike/expected.txt"
+t4_checker_status=0
+{
+    printf 'argv\t%s\n' "$t4_checker_argv"
+    "$T4_TOOL_python3" scripts/check-capture-evidence.py clean-metrics-manifest-only \
+        "$WORK/observed-static-smoke.json" spike/expected.txt 2>&1 || t4_checker_status=$?
+    printf 'status\t%s\n' "$t4_checker_status"
+} > "$WORK/checker.log"
+[ "$t4_checker_status" -eq 0 ] \
+    || { echo "capture evidence checker failed: $t4_checker_status"; exit "$t4_checker_status"; }
 echo "static p11scope smoke attach OK: $("$T4_TOOL_jq" -c .evidence "$WORK/observed-static-smoke.json")"
 
 echo "=== dist/ ==="

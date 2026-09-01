@@ -859,6 +859,32 @@ fn task4_receipt_lane14_capture_binding_is_literal_and_checker_evidence_framed()
         "aggregate body stdout still stands in for checker evidence"
     );
 
+    // Review findings (csf_19fb2f): the framed record must also be RETAINED
+    // -- the receipt copies $WORK/checker.log, records the three checker
+    // facts rows, and the observed-set guard both exists and collates in C
+    // so a healthy run cannot false-refuse under a UTF-8 ambient locale.
+    assert!(
+        release.contains("cp \"$WORK/checker.log\" \"$TASK4_ROOT/artifacts/checker.log\""),
+        "the framed checker record is not retained as the receipt's checker.log"
+    );
+    for fact in [
+        "task4_fact checker_argv \"$t4_checker_argv\"",
+        "task4_fact checker_status \"$t4_checker_status\"",
+        "task4_fact checker_log_sha256 \"$(task4_digest \"$TASK4_ROOT/artifacts/checker.log\")\"",
+    ] {
+        assert!(release.contains(fact), "receipt misses facts row {fact:?}");
+    }
+    assert!(
+        release.contains("-name '*observed*.json' -print | LC_ALL=C sort)"),
+        "the observed-set guard must collate in C, not the ambient locale"
+    );
+    assert!(
+        release.contains(
+            "|| { echo \"unexpected observed capture set under work: $t4_observed\" >&2; exit 1; }"
+        ),
+        "the observed-set guard refusal is missing from the receipt step"
+    );
+
     // The framed checker record carries the exact argv line, the checker's
     // own captured stdout/stderr, and a terminal status line. Execute the
     // real framing block from release_body against a stub checker, then
@@ -972,6 +998,82 @@ fn task4_receipt_lane14_capture_binding_is_literal_and_checker_evidence_framed()
     assert!(
         !framed_checker_evidence(aggregate),
         "an unframed aggregate stdout log must be rejected as checker evidence"
+    );
+}
+
+#[test]
+fn task4_receipt_lane14_observed_set_guard_refuses_decoys_in_any_locale() {
+    // Execute the real observed-set guard block from task4_receipt_run.
+    // UTF-8 collation orders observed.json BEFORE observed-scan.json (the
+    // hyphen is ignored at the primary level), so a guard sorting in the
+    // ambient locale false-refuses a healthy release; the guard must accept
+    // the exact 3-name set under any locale and refuse a planted 4th decoy
+    // and a missing member.
+    let release = read("scripts/build-release.sh");
+    let guard = format!(
+        "t4_observed=$(find{}",
+        between(
+            &release,
+            "\n    t4_observed=$(find",
+            "\n    cp \"$WORK/observed-static-smoke.json\""
+        )
+    );
+    let fixture = tempfile::tempdir().expect("create observed-set guard fixture");
+    let work = fixture.path().join("work");
+    fs::create_dir(&work).expect("create guard work directory");
+    let runner = fixture.path().join("run-guard.sh");
+    fs::write(
+        &runner,
+        format!(
+            "#!/bin/sh\nset -eu\nTASK4_ROOT={root}\n{guard}\necho guard-ok\n",
+            root = fixture.path().display(),
+        ),
+    )
+    .expect("write guard runner");
+    let run = |locale: &str| {
+        Command::new("/bin/sh")
+            .arg(&runner)
+            .env("LC_ALL", locale)
+            .output()
+            .expect("run the observed-set guard block")
+    };
+
+    for name in [
+        "observed-scan.json",
+        "observed-static-smoke.json",
+        "observed.json",
+    ] {
+        fs::write(work.join(name), b"evidence\n").expect("populate guard work directory");
+    }
+    for locale in ["C", "en_US.UTF-8"] {
+        let output = run(locale);
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("guard-ok"),
+            "guard refused the exact observed set under LC_ALL={locale}: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fs::write(work.join("observed-decoy.json"), b"decoy\n").expect("plant decoy");
+    let decoy = run("en_US.UTF-8");
+    assert_eq!(
+        decoy.status.code(),
+        Some(1),
+        "guard accepted a planted 4th *observed*.json"
+    );
+    assert!(
+        String::from_utf8_lossy(&decoy.stderr)
+            .contains("unexpected observed capture set under work"),
+        "guard refusal must name the unexpected observed set"
+    );
+    fs::remove_file(work.join("observed-decoy.json")).expect("remove decoy");
+
+    fs::remove_file(work.join("observed.json")).expect("remove a set member");
+    let missing = run("C");
+    assert_eq!(
+        missing.status.code(),
+        Some(1),
+        "guard accepted a missing observed-set member"
     );
 }
 

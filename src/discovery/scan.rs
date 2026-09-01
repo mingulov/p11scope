@@ -702,6 +702,10 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
                             device: entry.device,
                             inode: entry.inode,
                         } == key
+                        && entry
+                            .raw_path
+                            .as_deref()
+                            .is_some_and(|path| path.starts_with(b"/"))
                 })
                 .map(|entry| entry.end);
             let (name_class, name_lossy) = match name_ptr {
@@ -1608,6 +1612,42 @@ mod tests {
             "the unread name remainder is one omission"
         );
         assert_eq!(skipped[0], IO_CEILING_REASON);
+    }
+
+    #[test]
+    fn interface_name_in_non_absolute_mapping_is_not_dereferenced() {
+        let maps = parse_maps(b"0-2000 r--p 00000000 08:01 7 provider.so\n").unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let mem_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(mem_file.path(), b"xPKCS 11\0").unwrap();
+        let mem = File::open(mem_file.path()).unwrap();
+        let table = ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: Vec::new(),
+            null_entries: Vec::new(),
+            unpinned: Vec::new(),
+            address: 0x7000,
+        };
+        let mut snapshot = vec![0u8; INTERFACE_BYTES];
+        snapshot[..WORD].copy_from_slice(&1u64.to_ne_bytes());
+        snapshot[WORD..2 * WORD].copy_from_slice(&table.address.to_ne_bytes());
+        let mut budget = CaptureWorkBudget::default();
+        let mut operation_bytes = 0;
+        let (interfaces, skipped) = scan_interfaces(
+            &snapshot,
+            &mem,
+            &[table],
+            &map_index,
+            ObjectKey::of(&maps[0]),
+            &mut budget,
+            &mut operation_bytes,
+        );
+        assert!(skipped.is_empty());
+        assert_eq!(interfaces.len(), 1);
+        assert_eq!(interfaces[0].name_class, "unreadable");
+        assert_eq!(operation_bytes, 0);
+        assert_eq!(budget.attempted_io_bytes(), 0);
     }
 
     /// Case 3 is the one that matters and the one no end-to-end test can reach here:

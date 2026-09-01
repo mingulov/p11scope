@@ -3,9 +3,6 @@
 //! `p11scope-discover` computes. Both run in-process here; the helper dlopens the
 //! fixture (test-only — the observer itself never does).
 //!
-//! Run with `--test-threads=1`: every test dlopens a fixture into the shared
-//! process image and then scans that image.
-
 use p11scope::discovery::hooks::HookRegistry;
 use p11scope::discovery::scan::{
     CaptureWorkBudget, ScanLimits, ScanOutcome, ScanRequest, scan_pid,

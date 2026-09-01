@@ -8330,11 +8330,43 @@ impl Engine {
         malformed: u64,
     ) -> Result<bool> {
         let mut collect = Self::collect_discovery_records;
-        self.apply_discovery_batch_with(session, records, malformed, true, false, &mut collect)
-            .map(|outcome| outcome.changed)
+        self.apply_discovery_batch_with(
+            session,
+            records,
+            malformed,
+            true,
+            false,
+            &mut collect,
+            None,
+        )
+        .map(|outcome| outcome.changed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_discovery_batch_with(
+        &mut self,
+        session: &mut dyn EngineSession,
+        records: Vec<DiscoveryRecord>,
+        malformed: u64,
+        additions_allowed: bool,
+        terminal_dispatch: bool,
+        collect: &mut DiscoveryCollector<'_>,
+        deadline: Option<u64>,
+    ) -> Result<DiscoveryBatchOutcome> {
+        self.budget.set_deadline(deadline);
+        let result = self.apply_discovery_batch_inner(
+            session,
+            records,
+            malformed,
+            additions_allowed,
+            terminal_dispatch,
+            collect,
+        );
+        self.budget.set_deadline(None);
+        result
+    }
+
+    fn apply_discovery_batch_inner(
         &mut self,
         session: &mut dyn EngineSession,
         records: Vec<DiscoveryRecord>,
@@ -12391,7 +12423,7 @@ int main(int argc, char **argv) {
         engine.retain_terminal_batch([record], true, 0).unwrap();
         let mut collect = Engine::collect_discovery_records;
         let terminal = engine
-            .apply_discovery_batch_with(&mut session, Vec::new(), 0, true, true, &mut collect)
+            .apply_discovery_batch_with(&mut session, Vec::new(), 0, true, true, &mut collect, None)
             .unwrap();
 
         assert!(terminal.required_complete);
@@ -13303,7 +13335,42 @@ int main(int argc, char **argv) {
         records: Vec<DiscoveryRecord>,
     ) -> Result<DiscoveryBatchOutcome> {
         let mut collect = Engine::collect_discovery_records;
-        engine.apply_discovery_batch_with(session, records, 0, true, false, &mut collect)
+        engine.apply_discovery_batch_with(session, records, 0, true, false, &mut collect, None)
+    }
+
+    #[test]
+    fn discovery_batch_deadline_is_cleared_after_success_and_error() {
+        let (_fixture, mut engine, _context, _record, mut session) = armed_seed_route(0);
+        let mut collect = Engine::collect_discovery_records;
+        engine
+            .apply_discovery_batch_with(
+                &mut session,
+                Vec::new(),
+                0,
+                true,
+                false,
+                &mut collect,
+                Some(1),
+            )
+            .unwrap();
+        assert_eq!(engine.budget.deadline_for_test(), None);
+
+        session.fail_counter_reads([true]);
+        let mut collect = Engine::collect_discovery_records;
+        assert!(
+            engine
+                .apply_discovery_batch_with(
+                    &mut session,
+                    Vec::new(),
+                    0,
+                    true,
+                    false,
+                    &mut collect,
+                    Some(1),
+                )
+                .is_err()
+        );
+        assert_eq!(engine.budget.deadline_for_test(), None);
     }
 
     /// A real failed post-detach drain: the retirement route detaches,
@@ -16702,8 +16769,8 @@ int main(int argc, char **argv) {
 
         let exe = std::env::current_exe().unwrap();
         let inode = std::fs::metadata(&exe).unwrap().ino();
-        let maps = p11scope_manifest::maps::parse_maps(&std::fs::read("/proc/self/maps").unwrap())
-            .unwrap();
+        let maps_bytes = std::fs::read("/proc/self/maps").unwrap();
+        let maps = p11scope_manifest::maps::parse_maps(&maps_bytes).unwrap();
         let scan_bytes: u64 = maps
             .iter()
             .filter(|m| m.inode == inode && m.permissions[0] == b'r' && m.permissions[2] != b'x')
@@ -16712,7 +16779,7 @@ int main(int argc, char **argv) {
         let hash_bytes = std::fs::metadata(&exe).unwrap().len();
         let mut budget = CaptureWorkBudget::new(ScanLimits {
             per_object_bytes: scan_bytes.max(hash_bytes),
-            total_bytes: scan_bytes + hash_bytes,
+            total_bytes: scan_bytes + hash_bytes + maps_bytes.len() as u64,
         });
         let hints = vec![exe];
         let hooks = HookRegistry::builtin();

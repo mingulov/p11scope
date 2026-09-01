@@ -179,6 +179,36 @@ pub enum Resolved {
     Unmapped,
 }
 
+/// Address lookup over one kernel-ordered `/proc/<pid>/maps` snapshot.
+/// Intervals are half-open and must be sorted and non-overlapping.
+#[derive(Debug, Clone, Copy)]
+pub struct MapIndex<'a> {
+    entries: &'a [MapEntry],
+}
+
+impl<'a> MapIndex<'a> {
+    pub fn new(entries: &'a [MapEntry]) -> Option<Self> {
+        if entries.iter().any(|entry| entry.start >= entry.end)
+            || entries.windows(2).any(|pair| pair[0].end > pair[1].start)
+        {
+            return None;
+        }
+        Some(Self { entries })
+    }
+
+    pub fn containing(&self, vaddr: u64) -> Option<&'a MapEntry> {
+        let index = self.entries.partition_point(|entry| entry.start <= vaddr);
+        index
+            .checked_sub(1)
+            .and_then(|index| self.entries.get(index))
+            .filter(|entry| vaddr < entry.end)
+    }
+
+    pub fn resolve(&self, vaddr: u64) -> Resolved {
+        resolved_for(self.containing(vaddr), vaddr)
+    }
+}
+
 fn mapped_path(raw: &[u8]) -> MappedPath {
     let unusable = if raw.windows(4).any(|window| window == b"\\012") {
         Some("ambiguous \\012 pathname")
@@ -200,8 +230,8 @@ fn mapped_path(raw: &[u8]) -> MappedPath {
     }
 }
 
-pub fn resolve(maps: &[MapEntry], vaddr: u64) -> Resolved {
-    match maps.iter().find(|m| m.start <= vaddr && vaddr < m.end) {
+fn resolved_for(entry: Option<&MapEntry>, vaddr: u64) -> Resolved {
+    match entry {
         None => Resolved::Unmapped,
         Some(m) => match &m.raw_path {
             Some(raw_path) if raw_path.starts_with(b"/") => {
@@ -220,6 +250,10 @@ pub fn resolve(maps: &[MapEntry], vaddr: u64) -> Resolved {
             _ => Resolved::Anonymous,
         },
     }
+}
+
+pub fn resolve(maps: &[MapEntry], vaddr: u64) -> Resolved {
+    MapIndex::new(maps).map_or(Resolved::Unmapped, |index| index.resolve(vaddr))
 }
 
 #[cfg(test)]
@@ -264,7 +298,7 @@ mod tests {
 
     #[test]
     fn resolves_with_segment_offset_arithmetic() {
-        let m = parse_maps(FIXTURE).unwrap();
+        let m = sorted_fixture();
         assert_eq!(
             resolve(&m, 0x7f2b40000abc),
             Resolved::File {
@@ -291,7 +325,7 @@ mod tests {
 
     #[test]
     fn classifies_anonymous_and_unmapped() {
-        let m = parse_maps(FIXTURE).unwrap();
+        let m = sorted_fixture();
         assert_eq!(resolve(&m, 0x7f8a1c000500), Resolved::Anonymous);
         assert_eq!(resolve(&m, 0x7ffc55555100), Resolved::Anonymous); // [stack]
         assert_eq!(resolve(&m, 0x1), Resolved::Unmapped);
@@ -326,5 +360,62 @@ mod tests {
     fn malformed_nonempty_line_is_rejected() {
         let error = parse_maps(b"not a maps line\n").unwrap_err();
         assert!(error.contains("line 1"), "{error}");
+    }
+
+    fn sorted_fixture() -> Vec<MapEntry> {
+        let mut maps = parse_maps(FIXTURE).unwrap();
+        maps.sort_by_key(|entry| entry.start);
+        maps
+    }
+
+    #[test]
+    fn map_index_requires_sorted_non_overlapping_intervals() {
+        let mut maps = sorted_fixture();
+        maps.swap(0, 1);
+        assert!(MapIndex::new(&maps).is_none());
+
+        let overlapping = vec![
+            MapEntry {
+                start: 0x1000,
+                end: 0x3000,
+                ..maps[0].clone()
+            },
+            MapEntry {
+                start: 0x2000,
+                end: 0x4000,
+                ..maps[0].clone()
+            },
+        ];
+        assert!(MapIndex::new(&overlapping).is_none());
+    }
+
+    #[test]
+    fn map_index_resolves_gaps_adjacency_and_exclusive_ends() {
+        let maps = vec![
+            MapEntry {
+                start: 0x1000,
+                end: 0x2000,
+                ..sorted_fixture()[0].clone()
+            },
+            MapEntry {
+                start: 0x2000,
+                end: 0x3000,
+                ..sorted_fixture()[0].clone()
+            },
+            MapEntry {
+                start: 0x4000,
+                end: 0x5000,
+                ..sorted_fixture()[0].clone()
+            },
+        ];
+        let index = MapIndex::new(&maps).unwrap();
+        assert_eq!(index.containing(0x1000).unwrap().start, 0x1000);
+        assert_eq!(index.containing(0x1fff).unwrap().end, 0x2000);
+        assert_eq!(index.containing(0x2000).unwrap().start, 0x2000);
+        assert!(index.containing(0x3000).is_none());
+        assert!(index.containing(0x3fff).is_none());
+        assert_eq!(index.containing(0x4000).unwrap().start, 0x4000);
+        assert!(index.containing(0x5000).is_none());
+        assert_eq!(index.resolve(0x3000), Resolved::Unmapped);
     }
 }

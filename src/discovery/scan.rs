@@ -73,6 +73,11 @@ pub struct CaptureWorkBudget {
     work_ceiling: u64,
     work_units: u64,
     deadline_ns: Option<u64>,
+    /// Test-only: the deadline most recently *installed* (a `Some` passed to
+    /// `set_deadline`). The end-of-batch `None` clear leaves it in place, so a
+    /// test can observe what a finished batch apply actually forwarded.
+    #[cfg(test)]
+    pub(crate) last_installed_deadline: Option<u64>,
     scan_stop_reason: Option<&'static str>,
     scan_stop_reported: bool,
 }
@@ -90,6 +95,8 @@ impl CaptureWorkBudget {
             work_ceiling: DEFAULT_WORK_CEILING,
             work_units: 0,
             deadline_ns: None,
+            #[cfg(test)]
+            last_installed_deadline: None,
             scan_stop_reason: None,
             scan_stop_reported: false,
         }
@@ -138,6 +145,10 @@ impl CaptureWorkBudget {
     }
 
     pub fn set_deadline(&mut self, deadline_ns: Option<u64>) {
+        #[cfg(test)]
+        if deadline_ns.is_some() {
+            self.last_installed_deadline = deadline_ns;
+        }
         self.deadline_ns = deadline_ns;
         if deadline_ns.is_none()
             && matches!(

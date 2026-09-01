@@ -1643,20 +1643,43 @@ fn no_modules_hint(scope: &ScopeArg) -> String {
 /// blocked by `perf_event_paranoid`).
 fn report_attach_failures(session: &Session) {
     for (idx, msg) in session.attach_failures() {
-        eprintln!("attach failed (slot {idx}): {msg}");
+        eprintln!("{}", format_attach_failure(*idx, msg));
     }
     if session.attached_probes() == 0 {
         if let Some((_, first)) = session.attach_failures().first() {
             eprintln!(
-                "p11scope: {}/{} attach attempts failed, every one the same way — this almost \
-                 always means the environment cannot attach BPF uprobes at all: missing \
-                 CAP_BPF/CAP_SYS_ADMIN (or root), a kernel lockdown mode, or a restrictive \
-                 kernel.perf_event_paranoid sysctl. First underlying error: {first}",
-                session.attach_failures().len(),
-                session.attached_probes() + session.attach_failures().len()
+                "{}",
+                format_total_attach_refusal(
+                    session.attach_failures().len(),
+                    session.attached_probes() + session.attach_failures().len(),
+                    first
+                )
             );
         }
     }
+}
+
+/// The per-slot attach diagnostic. The failure message embeds the module's
+/// `/proc/<pid>/maps` filename (attach.rs builds it from `slot.object_path`),
+/// which the target controls, so this terminal boundary escapes control bytes
+/// — the stored `attach_failures` evidence keeps the raw string.
+fn format_attach_failure(slot: u32, message: &str) -> String {
+    format!(
+        "attach failed (slot {slot}): {}",
+        render::escape_controls(message)
+    )
+}
+
+/// The zero-probes summary; `first` is the first per-slot failure message and
+/// carries the same target-controlled path bytes.
+fn format_total_attach_refusal(failed: usize, attempted: usize, first: &str) -> String {
+    format!(
+        "p11scope: {failed}/{attempted} attach attempts failed, every one the same way — this \
+         almost always means the environment cannot attach BPF uprobes at all: missing \
+         CAP_BPF/CAP_SYS_ADMIN (or root), a kernel lockdown mode, or a restrictive \
+         kernel.perf_event_paranoid sysctl. First underlying error: {}",
+        render::escape_controls(first)
+    )
 }
 
 /// Gives unsafe rendering the same diagnostic shape expectations that
@@ -1793,8 +1816,11 @@ fn retire_pause_policy(error: PauseError) -> Result<()> {
     if error.required() || error.lifecycle() {
         return Err(pause_failure(error));
     }
+    // The pause error chain can quote discovery-batch application failures,
+    // which handle target-named records; escape at this terminal boundary too.
     eprintln!(
-        "p11scope: pause: {error}; the capture continues unpaused and reports pause: partial"
+        "p11scope: pause: {}; the capture continues unpaused and reports pause: partial",
+        render::escape_controls(&error.to_string())
     );
     Ok(())
 }
@@ -2593,6 +2619,24 @@ mod tests {
             assert!(Instant::now() < deadline, "{message}");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn attach_failure_diagnostics_escape_target_controls() {
+        let message = format_attach_failure(3, "p11_hook at /opt/p\u{1b}[2Jevil\r.so+0x10: EPERM");
+        assert_eq!(
+            message,
+            r"attach failed (slot 3): p11_hook at /opt/p\u{1b}[2Jevil\r.so+0x10: EPERM"
+        );
+        assert!(!message.contains('\u{1b}') && !message.contains('\r'));
+    }
+
+    #[test]
+    fn total_attach_refusal_summary_escapes_target_controls() {
+        let message = format_total_attach_refusal(2, 2, "at /opt/p\u{1b}[2Jevil\r.so: EPERM");
+        assert!(message.starts_with("p11scope: 2/2 attach attempts failed"));
+        assert!(message.ends_with(r"First underlying error: at /opt/p\u{1b}[2Jevil\r.so: EPERM"));
+        assert!(!message.contains('\u{1b}') && !message.contains('\r'));
     }
 
     #[test]

@@ -69,8 +69,10 @@ The behavior authority is `docs/usage.md`; this list fixes *scope*, not detail.
 - **Discovery:** in-memory function-table scan of the live process (2.00–2.40
   legacy tables and 3.0/3.1/3.2 interfaces, all 104 slots); corroborated
   alternate/null-name prefixes recorded as PARTIAL; deceptive/vendor tables
-  left undecoded; never calls `C_GetInterface` (evidence-integrity
-  invariant — §8 explains why). `p11scope-discover` remains the
+  left undecoded. `C_GetInterface` selection behavior is investigated and
+  recorded as separate selection evidence (owner decision 2026-09-01 — §8
+  defines both mechanisms and the inventory-separation invariant; W3).
+  `p11scope-discover` remains the
   optional offline manifest path (explicit operator attestation).
 - **Multi-module capture**, including proxy stacks (p11-kit/proxy-ng style):
   release-qualified with at least one proxy-over-provider configuration lane
@@ -157,24 +159,37 @@ kernel is *expected to work*, not *supported*.
 (non-interposing observation is the product's identity); key/PIN decoding
 under any flag (privacy contract, §5); macOS/Windows.
 
-**Design invariant, not a non-goal — discovery never calls `C_GetInterface`.**
-The why (Phase 1 design, ROADMAP; version-dependence rationale added by the
-owner 2026-09-01): `C_GetInterface` is a *parameterized selection* call — its
-answer depends on the requested interface name, version, and flags AND on
-which PKCS#11 versions the particular module supports, with possible
-fallback. There is no single caller-independent answer to record: any result
-would be an artifact of the query p11scope chose to make, not a property of
-the module. Worse, fallback-resolved interfaces may alias the primary table
-by design, fabricating false aliasing evidence. So inventory comes only from
-`C_GetFunctionList` + `C_GetInterfaceList` enumeration — version-complete and
-caller-independent (every 2.x table and 3.0/3.1/3.2 interface recorded).
-Nothing is lost: the target app's own selection is still observable, because
-whichever table the app was given, its calls land on enumerated functions
-that p11scope probes by file offset. An
-*explicit, clearly-labeled* selection-probe diagnostic ("what would a
-consumer asking for 'PKCS 11' v3.0 get?") is a legitimate future feature —
-recorded as selection-behavior evidence, never merged into inventory — and is
-listed in the deferred doc; only the implicit use inside discovery is barred.
+**`C_GetInterface` — investigated, with one narrow invariant (owner decision
+2026-09-01, superseding the earlier blanket "never calls" stance).**
+`C_GetInterface` is the usual 3.x entry point and MUST be investigated: the
+release records both what is requested and what comes back, two ways (W3):
+
+- **Live selection observation:** `C_GetInterface` is a mandatory export, so
+  it is offset-probed like any other function. The capture records the
+  target's own calls: requested interface name (matched against the known
+  finite name set per the allowlist discipline — a non-matching name is
+  recorded as present-but-unnamed, never leaked), requested version and
+  flags, and the returned interface identity-mapped to its enumerated table.
+  Honest timing limit: an already-running `--pid` target usually made this
+  call before attach — `run` (owned child, attach-before-exec) captures it;
+  a missed call is a recorded absence, not silence.
+- **Known-parameter probing (offline helper path):** the helper queries the
+  finite standard set — interfaceName NULL (the module default, which the
+  spec guarantees), `"PKCS 11"` with no version, `"PKCS 11"` ×
+  {3.0, 3.1, 3.2}, standard flag variants — and records each request→result
+  pair, with the returned table identity-mapped to the enumeration.
+
+The surviving invariant is narrow: **selection results are recorded as
+selection evidence beside the inventory, never merged into it.** The call is
+parameterized — its answer depends on the query and on which PKCS#11
+versions the module supports, with possible fallback — so a selection result
+describes what a caller gets, while `C_GetFunctionList` +
+`C_GetInterfaceList` enumeration stays the caller-independent inventory.
+Kept separate, aliasing between a selection result and an enumerated table
+becomes *explicit recorded evidence* instead of a fabrication risk. New
+captured fields follow the existing allowlist discipline (§5 — exact
+membership in published finite sets; an addition is an explicit versioned
+allowlist revision, never implicit).
 
 **Deferred by default — pullable by owner decision if pace allows:** AArch64
 host; raw-tracepoint variants (tracefs stays a requirement meanwhile); Slice 2

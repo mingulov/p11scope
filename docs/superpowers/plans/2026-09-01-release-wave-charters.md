@@ -80,9 +80,30 @@ capability-tier model — after this wave the *product logic* is release-final.
    the raw bpf-link syscall behind the pinned aya (no aya version bump
    without an owner decision); if that proves disproportionate, stop and
    present the options to the owner rather than silently dropping the item.
+6. **`C_GetInterface` selection evidence (owner decision 2026-09-01 —
+   release scope; PRD §8 defines the requirement):** two mechanisms.
+   (a) *Live:* offset-probe the provider's exported `C_GetInterface`
+   (mandatory export in 3.x) — uprobe reads the requested interfaceName
+   (bounded read, exact-match against the known finite name set per the
+   allowlist; non-matching → present-but-unnamed), requested version and
+   flags; uretprobe reads the returned `CK_INTERFACE` (name, version,
+   function-list pointer) and userspace maps the returned table to its
+   enumerated interface. Timing honesty: a `--pid` target usually selected
+   before attach — record the absence explicitly; `run` mode (attach before
+   exec) is the covered path. (b) *Offline helper:* query the finite
+   standard set — interfaceName NULL (module default), `"PKCS 11"`
+   unversioned, `"PKCS 11"` × {3.0, 3.1, 3.2}, standard flag variants —
+   recording each request→result pair with the returned table
+   identity-mapped to the enumeration. **Invariant:** selection results are
+   a separate labeled evidence class, never merged into inventory. **Schema
+   and privacy:** new fields are a schema revision and an explicit
+   allowlist-vX revision (owner-approved wording change, never implicit
+   broadening); target-controlled name bytes surface only by exact
+   membership in the published name set.
 
 **Owner-gated:** any privileged e2e verification lanes (unprivileged rows
-run; privileged rows recorded UNRUN unless approved).
+run; privileged rows recorded UNRUN unless approved); the allowlist revision
+wording for selection-evidence fields.
 
 **Known facts for the planner:** aya pinned `=0.14.0` (`Cargo.toml:24`),
 build `--locked` (item #16 posture); anchor lines above were verified

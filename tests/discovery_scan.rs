@@ -550,6 +550,11 @@ fn readable_data_bytes(so: &Path) -> u64 {
         .sum()
 }
 
+fn maps_snapshot_bytes() -> u64 {
+    u64::try_from(std::fs::read("/proc/self/maps").unwrap().len())
+        .expect("/proc/self/maps length fits in u64")
+}
+
 #[test]
 fn the_per_capture_byte_cap_accumulates_across_objects() {
     let dir = tmp("scan-capture-cap");
@@ -559,12 +564,18 @@ fn the_per_capture_byte_cap_accumulates_across_objects() {
     load_and_populate(&second);
     // Room for exactly one of the two: the second object must trip the running total,
     // not the per-object cap.
-    let budget = readable_data_bytes(&first);
-    assert_eq!(budget, readable_data_bytes(&second), "fixtures must match");
+    let total_bytes = maps_snapshot_bytes()
+        .checked_add(readable_data_bytes(&first))
+        .expect("capture byte budget fits in u64");
+    assert_eq!(
+        readable_data_bytes(&first),
+        readable_data_bytes(&second),
+        "fixtures must match"
+    );
     let hooks = HookRegistry::builtin();
     let mut budget = CaptureWorkBudget::new(ScanLimits {
         per_object_bytes: 64 * 1024 * 1024,
-        total_bytes: budget,
+        total_bytes,
     });
     let ScanOutcome::Scanned {
         modules, skipped, ..
@@ -603,8 +614,12 @@ fn separate_process_scans_cannot_renew_the_capture_byte_budget() {
     let second = build_fixture(&dir, "shared-b", &["-DMATRIX_INTERFACES=0"]);
     load_and_populate(&first);
     load_and_populate(&second);
-    let total_bytes = readable_data_bytes(&first);
-    assert_eq!(total_bytes, readable_data_bytes(&second));
+    let object_bytes = readable_data_bytes(&first);
+    assert_eq!(object_bytes, readable_data_bytes(&second));
+    let total_bytes = maps_snapshot_bytes()
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(object_bytes))
+        .expect("capture byte budget fits in u64");
     let hooks = HookRegistry::builtin();
     let limits = ScanLimits {
         per_object_bytes: 64 * 1024 * 1024,

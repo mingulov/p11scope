@@ -61,6 +61,20 @@ def one(value):
     return value
 
 
+def write_receipt(path, text):
+    """Write a receipt file 0600 from creation, owned by the invoking user.
+
+    The dumper runs under sudo, but its receipts are audited and normalized by
+    the unprivileged finalizer, which cannot chmod a root-owned 0644 file.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(text)
+    uid, gid = (int(os.environ.get(name, "-1")) for name in ("SUDO_UID", "SUDO_GID"))
+    if os.getuid() == 0 and uid >= 0 and gid >= 0:
+        os.chown(path, uid, gid)
+
+
 def self_test():
     assert map_ids_from_fdinfo(["pos:\t0\nmap_id:\t17\n", "map_id: 4\n", "map_id: 17\n"]) == [4, 17]
     assert one([{"id": 4}]) == {"id": 4}
@@ -188,12 +202,12 @@ def main():
                 ["bpftool", "-j", "map", "dump", "id", str(item["id"])],
                 require_list=True,
             )
-            output.write_text(json.dumps(dumped, separators=(",", ":")) + "\n")
+            write_receipt(output, json.dumps(dumped, separators=(",", ":")) + "\n")
             record["file"] = str(output)
         manifest.append(record)
 
     manifest_path = out_dir / f"mapdump_manifest{suffix}.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    write_receipt(manifest_path, json.dumps(manifest, indent=2) + "\n")
     print(
         f"observer pid {pid}: dumped {len(manifest)} owned maps; "
         f"START id={start['id']} max_entries={start['max_entries']}"

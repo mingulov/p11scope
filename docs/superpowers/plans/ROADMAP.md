@@ -590,10 +590,12 @@ boundaries.
     implementation/probe, producer, runtime, publication, or release is
     authorized by this amendment. The privacy allowlist and schema row limits
     remain unchanged.**
-- **Slice 2 — capture quality**: ring/epoll, budgets, safe-policy params, per-module profile
-  sections, filters, snapshots.
-- **Slice 3 — structure**: module split, evidence plumbing, docs consolidation, multi-kernel CI.
-- Then AArch64, 32-bit counting mode, `uprobe_multi`, freezer pause, manifest catalog.
+- **Slice 2 — capture quality** and **Slice 3 — structure** are deferred by
+  default: see [the deferred feature slices doc](../specs/2026-09-01-post-release-feature-slices.md)
+  (also holds the parked items: AArch64, 32-bit counting mode, freezer pause,
+  manifest catalog, raw-tracepoint variants, packages/images). Deferral is a
+  default, not a lock — the owner may pull items into v0.1.0 depending on
+  pace; `uprobe_multi` was pulled into release scope on 2026-09-01 (W3).
 
 **Gate for each slice:** the four cargo checks, the unprivileged suite, and the CI e2e job
 green; root gates run locally only with owner approval and are otherwise recorded UNRUN.
@@ -611,3 +613,68 @@ the three-export initial-set fixture, inspect/doctor, all seven privacy-canary
 lanes, zero AVCs, and cleanup. This is post-MVP portability evidence, not a
 release declaration. Remaining work is release hardening, hosted CI,
 container/deployment refresh, the complete receipt, and publication authority.
+
+## Release program (2026-09-01) — waves W1–W8 to v0.1.0
+
+Authority for sequencing the first public release. Product truth:
+[the release PRD](../specs/2026-09-01-p11scope-release-prd.md). Work method and
+priority: [the owner requirements spec](../specs/2026-09-01-release-requirements-and-goal.md).
+Post-release scope: [the feature-slices doc](../specs/2026-09-01-post-release-feature-slices.md).
+
+Each wave: entry gate = previous wave's exit gate. Exit gate = the four
+canonical cargo gates green on `main` **plus** a full independent review +
+gap-analysis cycle with zero accepted findings **plus** the wave's own
+evidence row(s), recorded pass/fail/UNRUN — never inherited. A wave's detailed
+plan is written at wave start under the verified-anchor protocol below —
+detailed plans written before their inputs exist would be fiction (this file's
+founding rule).
+
+| Wave | Scope | Plan / charter |
+| --- | --- | --- |
+| W1 | Eight scan findings + custody rescue, TDD, review-to-zero | [full plan, reviewed 2026-09-01](2026-09-01-release-hardening-wave1-findings.md) |
+| W2 | Storage consolidation: two-directory rule, migrate + repoint, `p11scope-ws` custody | [full plan](2026-09-01-wave2-storage-consolidation.md) |
+| W3 | Correctness residue: tracepoint offsets (research #1), opened-inode identity (#2), capability tier ladder + caps model, honest-degradation fixes, `uprobe_multi` attach (owner-pulled into release scope) | [charter](2026-09-01-release-wave-charters.md#w3) |
+| W4 | Hosted CI running the full suite; "green locally, not in CI" dies | [charter](2026-09-01-release-wave-charters.md#w4) |
+| W5 | Container/K8s requalification (provisional; W8 re-runs on the final tip) + seccomp/SELinux artifacts | [charter](2026-09-01-release-wave-charters.md#w5) |
+| W6 | Multi-distro/kernel matrix; support restated "5.15.x, tested on ⟨list⟩"; load-only CI matrix | [charter](2026-09-01-release-wave-charters.md#w6) |
+| W7 | ia32 targets on x86-64 hosts | [charter](2026-09-01-release-wave-charters.md#w7) |
+| W8 | Release assembly: receipt, docs truth pass, final review-to-zero, ready-to-publish bundle | [charter](2026-09-01-release-wave-charters.md#w8) |
+
+Publication (push, tag, release) is NOT a wave — it is an explicit owner
+decision after W8.
+
+### Agent execution protocol (all waves)
+
+Any fresh agent (or agent team) executing a wave follows this; it is the
+generalization of how wave 1 was planned and reviewed on 2026-09-01.
+
+1. **Read first:** the PRD, the owner requirements spec, this section, the
+   wave's plan/charter, and `CLAUDE.md`. Memory notes are background, not
+   authority.
+2. **Verified-anchor planning:** dispatch independent read-only verifiers
+   over EVERY cited file:line anchor and behavioral claim; adjudicate; fold
+   corrections into the document and commit it. A plan whose anchors don't
+   verify is not executable. **Charter waves run this twice:** pass 1 over
+   the charter's own anchors and claims BEFORE writing the plan; pass 2 over
+   the written plan BEFORE executing it.
+3. **Superpowers chain:** brainstorming (if design is open) → writing-plans →
+   subagent-driven-development or executing-plans → requesting/receiving-code-review
+   → verification-before-completion. TDD per task: failing test first, minimal
+   fix, gates after every task.
+4. **Review-to-zero:** wave end = two independent review agents (adversarial
+   correctness/security + test-quality/regression) over the wave's full diff;
+   triage with reasoning; fix accepted findings TDD-style; repeat with fresh
+   agents until a full cycle accepts zero findings.
+5. **Subagent policy:** Opus/Sonnet subagents liberally and in parallel for
+   research, briefs, implementation, review; depth over speed.
+6. **Branch/commit:** one branch per wave (`hardening/<wave-name>`), one
+   commit per task, merge to `main` only after review-to-zero; rerun gates on
+   `main`. Never push.
+7. **Honest evidence:** privileged/container lanes run only with owner
+   approval; otherwise recorded UNRUN. Never claim an unrun lane.
+8. **Owner-gated (never do autonomously):** push/tag/publish, privileged or
+   container experiments, deleting original evidence, rotating keys,
+   broadening the privacy allowlist, spending money.
+9. **Storage:** durable output only in the two directories; non-public
+   material only in `p11scope-ws` (commit it there — text/metadata in git,
+   large binaries gitignored but sha256-manifested).

@@ -229,10 +229,28 @@ TASK4_BUILD_INPUTS='RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_TARGET_DIR CARGO_BUI
 CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTC_WRAPPER CC CFLAGS'
 
 # An untracked `.cargo/config.toml` is invisible to `git ls-files`, to the
-# source ledger, and to the cleanliness gate, yet Cargo obeys it. Refuse every
-# one Cargo would consult: each repository ancestor up to /, then CARGO_HOME.
-task4_refuse_cargo_config() {
-    [ ! -e "$1" ] && [ ! -L "$1" ] || { echo "untracked cargo config: $1" >&2; exit 77; }
+# source ledger, and to the cleanliness gate, yet Cargo obeys it. Report every
+# one Cargo would consult: each repository ancestor up to /, then the effective
+# cargo home. The scan only reports, so both the preflight (refuse) and
+# finalization (fail the receipt) can run it -- the effective cargo home stays
+# writable for the whole body, and a `[build]` rustc-wrapper or target linker
+# planted there mid-run is overridden by none of the command-local values.
+# Without HOME the effective cargo home cannot be named, while Cargo can still
+# reach one through the passwd database, so that is a refusal too.
+task4_cargo_config_scan() {
+    [ -n "${HOME-}" ] || return 1
+    t4_dir=$(pwd -P) || return 1
+    while :; do
+        for t4_cfg in "$t4_dir/.cargo/config" "$t4_dir/.cargo/config.toml"; do
+            [ ! -e "$t4_cfg" ] && [ ! -L "$t4_cfg" ] || printf '%s\n' "$t4_cfg"
+        done
+        [ "$t4_dir" != / ] || break
+        t4_dir=${t4_dir%/*}; [ -n "$t4_dir" ] || t4_dir=/
+    done
+    t4_dir=${CARGO_HOME:-$HOME/.cargo}
+    for t4_cfg in "$t4_dir/config" "$t4_dir/config.toml"; do
+        [ ! -e "$t4_cfg" ] && [ ! -L "$t4_cfg" ] || printf '%s\n' "$t4_cfg"
+    done
 }
 
 # Resolve one command to a single absolute non-symlink executable and pin it to
@@ -298,6 +316,8 @@ task4_finalize() {
             eval "t4_value=\${$t4_var-}"
             [ -z "$t4_value" ] || t4_result=1
         done
+        t4_configs=$(task4_cargo_config_scan 2>/dev/null) || t4_result=1
+        [ -z "$t4_configs" ] || t4_result=1
         [ "$(task4_tool_ledger 2>/dev/null)" = "$TASK4_TOOLS" ] || t4_result=1
         [ "$(task4_digest scripts/build-release.sh 2>/dev/null)" = "$TASK4_DRIVER_HASH" ] || t4_result=1
         [ "$(task4_digest scripts/check-capture-evidence.py 2>/dev/null)" = "$TASK4_CHECKER_HASH" ] || t4_result=1
@@ -310,7 +330,7 @@ task4_finalize() {
     fi
     find "$TASK4_ROOT" -type d -exec chmod 700 {} + 2>/dev/null || t4_result=1
     find "$TASK4_ROOT" -type f -exec chmod 600 {} + 2>/dev/null || t4_result=1
-    python3 - "$TASK4_ROOT" <<'PY' || t4_result=1
+    "$T4_TOOL_python3" - "$TASK4_ROOT" <<'PY' || t4_result=1
 import os, stat, sys
 root=sys.argv[1]
 if set(os.listdir(root)) != {"facts.log","stdout.log","stderr.log","artifacts","work"}: raise SystemExit("foreign root entry")
@@ -358,6 +378,10 @@ task4_receipt_run() {
     TASK4_HEAD=$(git rev-parse HEAD) || exit 77; TASK4_TREE=$(git rev-parse 'HEAD^{tree}') || exit 77
     TASK4_STATUS=$(git status --porcelain=v1 --untracked-files=all) || exit 77
     [ -z "$TASK4_STATUS" ] || { echo "worktree must be clean, untracked files included" >&2; exit 77; }
+    for t4_tool in cargo docker file jq python3 rustup setpriv sudo sha256sum; do
+        t4_found=$(command -v "$t4_tool") || exit 77
+        task4_pin_tool "$t4_found" "T4_TOOL_$t4_tool" || exit 77
+    done
     TASK4_DRIVER_HASH=$(task4_digest scripts/build-release.sh); TASK4_CHECKER_HASH=$(task4_digest scripts/check-capture-evidence.py)
     task4_snapshot > "$TASK4_ROOT/artifacts/source.start.tsv" || exit 77
     TASK4_SOURCE_HASH=$(task4_digest "$TASK4_ROOT/artifacts/source.start.tsv")
@@ -367,24 +391,13 @@ task4_receipt_run() {
     task4_fact lock_identity "$TASK4_LOCK_ID"; task4_fact lock_holder "$$:$(process_starttime $$)"
     task4_fact driver_sha256 "$TASK4_DRIVER_HASH"; task4_fact checker_sha256 "$TASK4_CHECKER_HASH"
     task4_fact source_input_ledger_sha256 "$TASK4_SOURCE_HASH"
-    t4_dir=$(pwd -P) || exit 77
-    while :; do
-        task4_refuse_cargo_config "$t4_dir/.cargo/config"
-        task4_refuse_cargo_config "$t4_dir/.cargo/config.toml"
-        [ "$t4_dir" != / ] || break
-        t4_dir=${t4_dir%/*}; [ -n "$t4_dir" ] || t4_dir=/
-    done
-    t4_cargo_home=${CARGO_HOME:-${HOME-}/.cargo}
-    task4_refuse_cargo_config "$t4_cargo_home/config"
-    task4_refuse_cargo_config "$t4_cargo_home/config.toml"
+    TASK4_CONFIGS=$(task4_cargo_config_scan) \
+        || { echo "cannot evaluate the effective cargo home" >&2; exit 77; }
+    [ -z "$TASK4_CONFIGS" ] || { echo "untracked cargo config: $TASK4_CONFIGS" >&2; exit 77; }
     for t4_var in $TASK4_BUILD_INPUTS; do
         eval "t4_value=\${$t4_var-}"
         [ -z "$t4_value" ] || { echo "refusing inherited $t4_var" >&2; exit 77; }
         task4_fact "inherited_$t4_var" ""
-    done
-    for t4_tool in cargo docker file jq python3 rustup setpriv sudo sha256sum; do
-        t4_found=$(command -v "$t4_tool") || exit 77
-        task4_pin_tool "$t4_found" "T4_TOOL_$t4_tool" || exit 77
     done
     t4_found=$("$T4_TOOL_rustup" which --toolchain 1.88 cargo) || exit 77
     task4_pin_tool "$t4_found" T4_TOOLCHAIN_CARGO || exit 77

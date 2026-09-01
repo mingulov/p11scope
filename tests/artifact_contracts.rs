@@ -237,13 +237,14 @@ fn assert_live_discovery_host_contract(
         ("FLAG_PAUSE_ENABLED", "pause config bit"),
         ("File::open(path)", "opened cgroup descriptor"),
         (
-            "let opened_id = directory",
-            "opened cgroup inode revalidation",
+            "let id = dir\n        .metadata()",
+            "retained cgroup inode identity",
         ),
         (
-            "groups.set(0, directory.try_clone()?, 0)?",
-            "cgroup insertion proof",
+            "publish_cgroup_fd_with(dir, |directory|",
+            "retained cgroup descriptor publication seam",
         ),
+        ("groups.set(0, directory, 0)?", "cgroup insertion proof"),
     ] {
         require_contract_marker(scope, marker, contract)?;
     }

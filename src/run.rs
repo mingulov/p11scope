@@ -2347,6 +2347,7 @@ fn emit_bounded_trace_event<W: Write, F: FnOnce() -> String>(
 /// Drains whatever the ring buffer currently holds, rendering and
 /// emitting one line per completed call. Returns the malformed-record
 /// count from this drain, to accumulate at the call site.
+#[allow(clippy::too_many_arguments)]
 fn drain_trace_events<W: Write>(
     session: &mut Session,
     remaining: &mut Option<u64>,

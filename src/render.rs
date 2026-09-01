@@ -9,6 +9,24 @@ use crate::plan::{ModuleId, TableSummary};
 use serde::Serialize;
 use std::time::Duration;
 
+/// Target-controlled bytes reach a terminal here. Only control characters —
+/// C0, DEL, C1 (including CSI U+009B) — are rewritten; legitimate non-ASCII
+/// pathnames still render as themselves. JSON is unaffected.
+pub(crate) fn escape_controls(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.chars().any(char::is_control) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Which live-discovery strategy each exact bound context used (design §9.2).
 /// Only `debug_state_every_hit` leaves no completeness gap.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
@@ -136,8 +154,10 @@ impl CaptureFacts {
     pub fn heading(&self) -> String {
         match self.discovery.modules.as_slice() {
             [] => "no modules discovered".to_string(),
-            [only] => only.path.clone(),
-            [first, rest @ ..] => format!("{} (+{} more)", first.path, rest.len()),
+            [only] => escape_controls(&only.path).into_owned(),
+            [first, rest @ ..] => {
+                format!("{} (+{} more)", escape_controls(&first.path), rest.len())
+            }
         }
     }
 }
@@ -3375,5 +3395,38 @@ mod tests {
         assert_eq!(both.heading(), "/opt/p11.so (+1 more)");
         // And the honest empty case still says so.
         assert_eq!(CaptureFacts::default().heading(), "no modules discovered");
+    }
+
+    #[test]
+    fn headings_and_live_frames_escape_module_path_controls() {
+        let mut facts = CaptureFacts {
+            discovery: DiscoveryEvidence {
+                modules: vec![discovered_fixture()],
+                ..DiscoveryEvidence::default()
+            },
+            ..CaptureFacts::default()
+        };
+        facts.discovery.modules[0].path = "/opt/p\u{1b}[2Jevil\r.so".into();
+
+        let heading = facts.heading();
+        assert!(
+            !heading.contains('\u{1b}') && !heading.contains('\r'),
+            "{heading:?}"
+        );
+        assert!(heading.contains(r"\u{1b}[2Jevil\r"), "{heading:?}");
+
+        let frame = live(
+            &reports_fixture(),
+            &evidence(),
+            Duration::from_secs(1),
+            &heading,
+            "profile",
+            CapturePolicy::Allowlisted,
+        );
+        assert!(
+            !frame.contains("\u{1b}[2J"),
+            "raw clear-screen sequence: {frame:?}"
+        );
+        assert!(frame.contains(r"\u{1b}[2Jevil\r"), "{frame:?}");
     }
 }

@@ -3682,6 +3682,9 @@ mod tests {
     #[test]
     fn shutdown_path_publishes_valid_json_over_a_stale_file() {
         let dir = tempfile::tempdir().unwrap();
+        let mut permissions = std::fs::metadata(dir.path()).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(dir.path(), permissions).unwrap();
         let path = dir.path().join("observed.json");
         std::fs::write(&path, b"stale trailing bytes that must disappear").unwrap();
         let j = serde_json::json!({"schema": "pkcs11-scope/observed-profile/v2", "evidence": {}});

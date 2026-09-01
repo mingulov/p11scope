@@ -13,11 +13,13 @@ second, breadth (CI/containers/distros/ABIs) third.
 and `/home/user/src/m/p11scope-ws` (non-public workspace: evidence, VM bases,
 preserved artifacts). Nothing durable anywhere else.
 
-## State at handoff (2026-09-01, main @ 7d6eff7)
+## State at handoff (2026-09-01, verified main @ 5d251b76b33b14839a7147e14b5ccd1348855587)
 
 - All four cargo gates green on `main`. Nothing has been pushed by agents;
-  `origin/main` (`367cadd`) is a stale 234+-commit-old ancestor whose public
+  `origin/main` (`367cadd`) is a stale 239-commit-old ancestor whose public
   tip sits above a "not ready" wip commit — reconciling it is a W8/owner item.
+  Historical reviewed bases (`7d6eff7`, `556f7cf`, and `b86d4d5`) remain
+  preserved as history only; W1 execution starts from the verified tip above.
 - Wave 1 plan is fully reviewed and executable. Waves 2–8 are defined below.
 
 ## Read in this order

@@ -5,8 +5,9 @@
 default, not excluded from v0.1.0**: depending on execution speed the owner
 may pull any item into the release (owner decision 2026-09-01); a pulled item
 joins a release wave with full gate coverage and gets recorded here and in
-the ROADMAP. `uprobe_multi` was already pulled INTO release scope
-(2026-09-01, now W3 — see the charter) and is no longer listed below. This
+the ROADMAP. `uprobe_multi` and `C_GetInterface` selection evidence were already pulled
+INTO release scope (2026-09-01, now W3 — see the charter) and are no longer
+listed below. This
 document exists so deferred work is planned deliberately, not re-derived;
 each slice gets its own spec → plan cycle when it starts.
 **Consumes:** `2026-09-01-p11scope-release-prd.md` §8 (non-goals),
@@ -50,7 +51,6 @@ Deepens what a capture can express; no structural change.
 | Container image + K8s manifests as shipped artifacts | Post-release; W5 qualification report is the v0.1.0 substitute |
 | deb/rpm packages | Post-release demand |
 | `pkcs11-lab assess` integration (observed-profile × pkcs11-check) | pkcs11-lab side ready; owner prioritization |
-| Selection-probe diagnostic: an explicit `C_GetInterface` query mode ("what would a consumer asking for name/version X get?"), recorded as clearly-labeled selection-behavior evidence, never merged into inventory (PRD §8 invariant) | Operator demand for consumer-selection diagnostics |
 | Seccomp/Landlock jail around the discover helper's `dlopen` | Research Tier-1 #4 residual; requires design (helper runs vendor code as a real host user) |
 | Scan rate-limiting + (dev,inode) dedupe against target `mmap_lock` stall | Research item #6 residual (measured 0.097 ms → 8020 ms target stall); W1 Task 6(f) bounds the bytes only — start on any real-world stall report |
 | PID-namespace attribution verification (`NSpid` depth check at startup) | Research #14; becomes mandatory work the moment in-cluster deployment is a shipped artifact |

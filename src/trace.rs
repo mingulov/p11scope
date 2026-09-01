@@ -167,6 +167,10 @@ pub fn lost_line(n: u64) -> Option<String> {
     (n > 0).then(|| format!("LOST {n} events"))
 }
 
+pub fn truncated_line(limit: u64) -> String {
+    format!("TRUNCATED at {limit} events (--max-events)")
+}
+
 pub fn capture_line(policy: CapturePolicy) -> String {
     format!("CAPTURE privacy={}", policy.privacy_mode())
 }
@@ -174,7 +178,7 @@ pub fn capture_line(policy: CapturePolicy) -> String {
 /// Final machine-readable evidence record for a normally stopped trace.
 /// Detaching perf links does not prove already-running callbacks quiesced, so
 /// this record must remain PARTIAL and must not claim a proven final drain.
-pub fn evidence_line(ev: &render::Evidence, policy: CapturePolicy) -> String {
+pub fn evidence_line(ev: &render::Evidence, policy: CapturePolicy, truncated: bool) -> String {
     let encoded = serde_json::to_string(ev).expect("Evidence serializes");
     let mut value: serde_json::Value =
         serde_json::from_str(&encoded).expect("serialized Evidence is valid JSON");
@@ -192,6 +196,7 @@ pub fn evidence_line(ev: &render::Evidence, policy: CapturePolicy) -> String {
     object.insert("capture_aborted".into(), serde_json::Value::Null);
     object.insert("final_drain".into(), serde_json::Value::Bool(false));
     object.insert("counters_available".into(), serde_json::Value::Bool(true));
+    object.insert("trace_truncated".into(), serde_json::Value::Bool(truncated));
     format!("EVIDENCE {value}")
 }
 
@@ -432,9 +437,8 @@ mod tests {
         assert_eq!(lost_line(42), Some("LOST 42 events".to_string()));
     }
 
-    #[test]
-    fn final_evidence_line_is_machine_readable_and_never_claims_a_proven_drain() {
-        let evidence = render::Evidence {
+    fn empty_evidence() -> render::Evidence {
+        render::Evidence {
             discovery: render::DiscoveryEvidence::default(),
             table_entries: 0,
             slots: 0,
@@ -491,8 +495,13 @@ mod tests {
             module_unresolved_slots: 0,
             provider_changed: false,
             completeness: "COMPLETE",
-        };
-        let line = evidence_line(&evidence, crate::attach::CapturePolicy::Allowlisted);
+        }
+    }
+
+    #[test]
+    fn final_evidence_line_is_machine_readable_and_never_claims_a_proven_drain() {
+        let evidence = empty_evidence();
+        let line = evidence_line(&evidence, crate::attach::CapturePolicy::Allowlisted, false);
         let value: serde_json::Value =
             serde_json::from_str(line.strip_prefix("EVIDENCE ").unwrap()).unwrap();
         assert_eq!(value["semantic_state_drops"], 0);
@@ -516,6 +525,17 @@ mod tests {
         }
         assert_eq!(value["modules_skipped"], serde_json::json!([]));
         assert_eq!(value["scan_unavailable"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_truncated_trace_says_so_in_its_terminal_record() {
+        assert_eq!(truncated_line(1), "TRUNCATED at 1 events (--max-events)");
+        let evidence = empty_evidence();
+        let line = evidence_line(&evidence, crate::attach::CapturePolicy::Allowlisted, true);
+        let value: serde_json::Value =
+            serde_json::from_str(line.strip_prefix("EVIDENCE ").unwrap()).unwrap();
+        assert_eq!(value["trace_truncated"], true);
+        assert_eq!(value["completeness"], "PARTIAL");
     }
 
     #[test]

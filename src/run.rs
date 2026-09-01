@@ -924,6 +924,7 @@ enum CaptureEnd {
     DurationExpired,
     TargetExit,
     Signal,
+    LimitReached,
     Error,
 }
 
@@ -1066,6 +1067,7 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         kind,
         policy,
         a.duration,
+        a.max_events,
         out,
         &stop,
         None,
@@ -1120,6 +1122,7 @@ fn run_loop(
     kind: Kind,
     policy: CapturePolicy,
     duration: Option<Duration>,
+    max_events: Option<u64>,
     out: OutputSink,
     interrupted: &SignalState,
     owned: Option<&mut Owned>,
@@ -1138,7 +1141,16 @@ fn run_loop(
                 OutputSink::Trace(file) => Some(file),
                 _ => None,
             };
-            capture_trace(engine, session, policy, duration, out, interrupted, owned)
+            capture_trace(
+                engine,
+                session,
+                policy,
+                duration,
+                max_events,
+                out,
+                interrupted,
+                owned,
+            )
         }
     }
 }
@@ -1502,6 +1514,7 @@ fn run_owned_inner(args: &RunArgs) -> Result<OwnedRunOutcome> {
         metrics: args.metrics,
         duration: args.duration,
         out: args.out.clone(),
+        max_events: args.max_events,
         unsafe_requested: args.unsafe_requested,
     };
     // Initial capture still uses the one `discover_plan` pass and keeps its
@@ -1583,6 +1596,7 @@ fn run_owned_inner(args: &RunArgs) -> Result<OwnedRunOutcome> {
         args.kind,
         policy,
         args.duration,
+        args.max_events,
         out,
         &stop,
         Some(&mut owned),
@@ -1835,6 +1849,11 @@ fn tick_sleep(paused: bool, cadence: Duration) {
 
 const PROFILE_CADENCE: Duration = Duration::from_secs(1);
 const TRACE_CADENCE: Duration = Duration::from_millis(200);
+const DEFAULT_TRACE_MAX_EVENTS: u64 = 10_000_000;
+
+fn resolve_trace_max_events(max_events: Option<u64>) -> u64 {
+    max_events.unwrap_or(DEFAULT_TRACE_MAX_EVENTS)
+}
 
 #[allow(clippy::too_many_arguments)]
 fn capture_profile(
@@ -2073,10 +2092,13 @@ fn capture_trace(
     session: &mut Session,
     policy: CapturePolicy,
     duration: Option<Duration>,
+    max_events: Option<u64>,
     out: Option<std::fs::File>,
     interrupted: &SignalState,
     mut owned: Option<&mut Owned>,
 ) -> Result<render::Evidence> {
+    let trace_limit = resolve_trace_max_events(max_events);
+    let mut remaining = Some(trace_limit);
     // A line stream, not a published artifact: opened by the caller before the
     // attach, then appended to as lines arrive.
     let mut out_sink = out;
@@ -2136,6 +2158,7 @@ fn capture_trace(
         // 3. Drain call events.
         malformed_records += drain_trace_events(
             session,
+            &mut remaining,
             &mut state,
             &mut process_tracker,
             &mut tracer,
@@ -2143,6 +2166,9 @@ fn capture_trace(
             &mut stdout_open,
             out_file,
         )?;
+        if remaining == Some(0) {
+            break Ok(CaptureEnd::LimitReached);
+        }
         // 4. Retire exited process state.
         retire_exited(&mut process_tracker, &mut state);
         // 5. Snapshot the loss counter.
@@ -2169,7 +2195,7 @@ fn capture_trace(
     }
     })();
 
-    finish_capture_loop(
+    let end = finish_capture_loop(
         loop_result,
         engine,
         session,
@@ -2185,6 +2211,7 @@ fn capture_trace(
     // on another CPU, so terminal evidence below remains explicitly PARTIAL.
     malformed_records += drain_trace_events(
         session,
+        &mut remaining,
         &mut state,
         &mut process_tracker,
         &mut tracer,
@@ -2212,6 +2239,7 @@ fn capture_trace(
         .check_unchanged()
         .map_err(anyhow::Error::msg)?;
     engine.settle_terminal_drain();
+    let trace_truncated = end == CaptureEnd::LimitReached || remaining == Some(0);
     let mut evidence = evidence_for(
         engine,
         session,
@@ -2224,8 +2252,16 @@ fn capture_trace(
         owned.as_deref(),
     );
     evidence.mark_terminal_drain_unproven();
+    if trace_truncated {
+        emit_trace_line(
+            &trace::truncated_line(trace_limit),
+            stdout,
+            &mut stdout_open,
+            out_file,
+        )?;
+    }
     emit_trace_line(
-        &trace::evidence_line(&evidence, policy),
+        &trace::evidence_line(&evidence, policy, trace_truncated),
         stdout,
         &mut stdout_open,
         out_file,
@@ -2291,6 +2327,7 @@ fn flush_stdout(writer: &mut dyn Write, open: &mut bool) -> Result<()> {
 /// count from this drain, to accumulate at the call site.
 fn drain_trace_events<W: Write>(
     session: &mut Session,
+    remaining: &mut Option<u64>,
     state: &mut semantics::State,
     tracker: &mut process::Tracker,
     tracer: &mut trace::Tracer,
@@ -2305,7 +2342,9 @@ fn drain_trace_events<W: Write>(
             return;
         }
         let process = identify_tracked(tracker, state, &ev);
-        if write_error.is_none() {
+        if matches!(*remaining, Some(0)) || write_error.is_some() {
+            state.observe_process(process, &ev);
+        } else {
             write_error = emit_trace_line(
                 &tracer.on_event_process(&ev, process, state),
                 stdout,
@@ -2313,8 +2352,11 @@ fn drain_trace_events<W: Write>(
                 out_file,
             )
             .err();
-        } else {
-            state.observe_process(process, &ev);
+            if write_error.is_none()
+                && let Some(remaining) = remaining.as_mut()
+            {
+                *remaining = (*remaining).saturating_sub(1);
+            }
         }
         if !state.has_process_state(process) {
             state.retire_process(process);
@@ -3314,6 +3356,7 @@ mod tests {
             metrics: false,
             duration: None,
             out: None,
+            max_events: None,
             unsafe_requested: false,
             pause,
             kill_on_timeout: false,
@@ -3502,9 +3545,15 @@ mod tests {
     fn capture_end_only_allows_handoff_for_clean_duration_expiry() {
         assert!(CaptureEnd::DurationExpired.allows_handoff(false));
         assert!(!CaptureEnd::DurationExpired.allows_handoff(true));
+        assert!(!CaptureEnd::LimitReached.allows_handoff(false));
         assert!(!CaptureEnd::TargetExit.allows_handoff(false));
         assert!(!CaptureEnd::Signal.allows_handoff(false));
         assert!(!CaptureEnd::Error.allows_handoff(false));
+    }
+
+    #[test]
+    fn default_trace_bound_resolver_none_is_10m() {
+        assert_eq!(resolve_trace_max_events(None), 10_000_000);
     }
 
     #[test]

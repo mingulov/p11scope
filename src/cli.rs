@@ -30,6 +30,7 @@ pub struct CaptureArgs {
     pub metrics: bool,
     pub duration: Option<Duration>,
     pub out: Option<PathBuf>,
+    pub max_events: Option<u64>,
     pub unsafe_requested: bool,
 }
 
@@ -57,6 +58,7 @@ pub struct RunArgs {
     pub metrics: bool,
     pub duration: Option<Duration>,
     pub out: Option<PathBuf>,
+    pub max_events: Option<u64>,
     pub unsafe_requested: bool,
     pub pause: PausePolicy,
     /// `--kill-on-timeout`: `--duration` expiry ends the child too, instead of
@@ -100,7 +102,7 @@ pub const USAGE: &str = "usage:
                    [--mode profile|metrics] [--duration <30|30s|5m|1h>] [-o <out.json>]
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
-  p11scope trace   [same scope and discovery options] [--duration <…>] [-o <out.file>]
+  p11scope trace   [same scope and discovery options] [--duration <…>] [--max-events <n>] [-o <out.file>]
   p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--duration <…>]
                    [-o <out>] [--pause never|auto|always] [--kill-on-timeout] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
@@ -178,6 +180,7 @@ struct Common {
     metrics: Option<bool>,
     duration: Option<Duration>,
     out: Option<PathBuf>,
+    max_events: Option<u64>,
     unsafe_requested: bool,
 }
 
@@ -227,6 +230,16 @@ fn capture_option(
                 parse_duration(&v)
                     .map_err(|e| usage_err(format!("--duration: invalid value {v:?}: {e}")))?,
             );
+        }
+        "--max-events" => {
+            let v = require_value(args, "--max-events")?;
+            let value = v
+                .parse::<u64>()
+                .map_err(|_| usage_err(format!("--max-events: invalid number {v:?}")))?;
+            if value == 0 {
+                return Err(usage_err("--max-events must be greater than zero"));
+            }
+            common.max_events = Some(value);
         }
         "-o" => common.out = Some(require_value(args, "-o")?.into()),
         "--unsafe-unvalidated-metadata" => common.unsafe_requested = true,
@@ -333,6 +346,12 @@ pub fn parse_capture(
         (Some(_), Some(_)) => return Err(usage_err("--pid and --cgroup are mutually exclusive")),
     };
 
+    if kind == Kind::Profile && common.max_events.is_some() {
+        return Err(usage_err(
+            "--max-events is a trace option; profile publishes one aggregate document",
+        ));
+    }
+
     let metrics = common.metrics_for(kind, "trace")?;
     Ok(CaptureArgs {
         kind,
@@ -343,6 +362,7 @@ pub fn parse_capture(
         metrics,
         duration: common.duration,
         out: common.out,
+        max_events: common.max_events,
         unsafe_requested: common.unsafe_requested,
     })
 }
@@ -399,6 +419,11 @@ fn parse_run(mut args: impl Iterator<Item = String>) -> Result<RunArgs, CliError
         ));
     }
     let kind = if trace { Kind::Trace } else { Kind::Profile };
+    if kind == Kind::Profile && common.max_events.is_some() {
+        return Err(usage_err(
+            "--max-events is a trace option; profile publishes one aggregate document",
+        ));
+    }
     let metrics = common.metrics_for(kind, "run --trace")?;
     Ok(RunArgs {
         kind,
@@ -408,6 +433,7 @@ fn parse_run(mut args: impl Iterator<Item = String>) -> Result<RunArgs, CliError
         metrics,
         duration: common.duration,
         out: common.out,
+        max_events: common.max_events,
         unsafe_requested: common.unsafe_requested,
         pause,
         kill_on_timeout,
@@ -608,6 +634,27 @@ mod tests {
         .unwrap();
         assert!(a.unsafe_requested);
         assert_eq!(a.scope, ScopeArg::Cgroup(PathBuf::from("/sys/fs/cgroup/x")));
+    }
+
+    #[test]
+    fn trace_takes_a_max_events_bound_and_profile_refuses_it() {
+        let a = parse_capture(Kind::Trace, args(&["--pid", "1", "--max-events", "1"])).unwrap();
+        assert_eq!(a.max_events, Some(1));
+        assert!(matches!(
+            parse_capture(
+                Kind::Profile,
+                args(&["--pid", "1", "--max-events", "1"])
+            ),
+            Err(CliError::Usage(m)) if m.contains("--max-events is a trace option")
+        ));
+        assert!(matches!(
+            parse_capture(Kind::Trace, args(&["--pid", "1", "--max-events", "x"])),
+            Err(CliError::Usage(m)) if m.contains("invalid number")
+        ));
+        assert!(matches!(
+            parse_capture(Kind::Trace, args(&["--pid", "1", "--max-events", "0"])),
+            Err(CliError::Usage(m)) if m.contains("must be greater than zero")
+        ));
     }
 
     #[test]

@@ -16,6 +16,15 @@ use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+
+fn serial_guard() -> MutexGuard<'static, ()> {
+    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
 
 fn tmp(name: &str) -> PathBuf {
     let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
@@ -95,6 +104,7 @@ fn helper_offsets(so: &Path) -> BTreeMap<String, u64> {
 
 #[test]
 fn scanned_offsets_equal_the_helpers_for_the_legacy_table() {
+    let _guard = serial_guard();
     let dir = tmp("scan-oracle");
     let so = build_fixture(&dir, "oracle", &["-DMATRIX_INTERFACES=0"]);
     load_and_populate(&so);
@@ -133,6 +143,7 @@ fn scanned_offsets_equal_the_helpers_for_the_legacy_table() {
 
 #[test]
 fn every_supported_version_layout_is_found_with_its_documented_entry_count() {
+    let _guard = serial_guard();
     // (major, minor, expected entry+null count) — the N of spec §4.1 step 4.
     for (major, minor, expected) in [(2u8, 0u8, 67usize), (2, 40, 68), (3, 0, 92), (3, 2, 104)] {
         let dir = tmp(&format!("scan-v{major}-{minor}"));
@@ -220,6 +231,7 @@ CK_RV C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags) {
 
 #[test]
 fn interfaces_are_recorded_with_their_name_class() {
+    let _guard = serial_guard();
     let dir = tmp("scan-interfaces");
     let source = dir.join("interface_array.c");
     std::fs::write(&source, INTERFACE_ARRAY_FIXTURE).unwrap();
@@ -267,6 +279,7 @@ fn interfaces_are_recorded_with_their_name_class() {
 
 #[test]
 fn interface_names_do_not_cross_readable_vmas() {
+    let _guard = serial_guard();
     const PREFIX: &[u8] = b"EDGE";
     const ADJACENT: &[u8] = b"ADJACENT_SECRET\0";
 
@@ -386,6 +399,7 @@ fn interface_names_do_not_cross_readable_vmas() {
 
 #[test]
 fn a_table_less_object_and_a_non_elf_hint_produce_no_module_and_no_panic() {
+    let _guard = serial_guard();
     let dir = tmp("scan-negative");
     let plain = dir.join("plain.so");
     let c = dir.join("plain.c");
@@ -436,6 +450,7 @@ fn load_and_populate_ignoring_missing_entry(so: &Path) {
 /// complete-body clause and therefore is not evidence of a truncated table.
 #[test]
 fn a_table_header_running_past_file_backed_data_is_silently_ignored() {
+    let _guard = serial_guard();
     let dir = tmp("scan-truncated");
     let so = build_fixture(&dir, "truncated", &["-DMATRIX_INTERFACES=0"]);
     load_and_populate(&so);
@@ -465,6 +480,7 @@ fn a_table_header_running_past_file_backed_data_is_silently_ignored() {
 /// found any other provider publishes COMPLETE over the gap.
 #[test]
 fn an_unhinted_object_the_tool_called_a_provider_says_when_it_yielded_no_table() {
+    let _guard = serial_guard();
     let dir = tmp("scan-unhinted-empty");
     let so = dir.join("tableless.so");
     let c = dir.join("tableless.c");
@@ -512,6 +528,7 @@ fn an_unhinted_object_the_tool_called_a_provider_says_when_it_yielded_no_table()
 
 #[test]
 fn a_hinted_object_with_no_table_says_so() {
+    let _guard = serial_guard();
     let dir = tmp("scan-hinted-empty");
     let plain = dir.join("empty.so");
     let c = dir.join("empty.c");
@@ -557,6 +574,7 @@ fn maps_snapshot_bytes() -> u64 {
 
 #[test]
 fn the_per_capture_byte_cap_accumulates_across_objects() {
+    let _guard = serial_guard();
     let dir = tmp("scan-capture-cap");
     let first = build_fixture(&dir, "budget-a", &["-DMATRIX_INTERFACES=0"]);
     let second = build_fixture(&dir, "budget-b", &["-DMATRIX_INTERFACES=0"]);
@@ -609,6 +627,7 @@ fn the_per_capture_byte_cap_accumulates_across_objects() {
 
 #[test]
 fn separate_process_scans_cannot_renew_the_capture_byte_budget() {
+    let _guard = serial_guard();
     let dir = tmp("scan-shared-capture-cap");
     let first = build_fixture(&dir, "shared-a", &["-DMATRIX_INTERFACES=0"]);
     let second = build_fixture(&dir, "shared-b", &["-DMATRIX_INTERFACES=0"]);
@@ -657,6 +676,7 @@ fn separate_process_scans_cannot_renew_the_capture_byte_budget() {
 
 #[test]
 fn the_per_object_byte_cap_is_enforced_as_a_skip_not_a_truncation() {
+    let _guard = serial_guard();
     let dir = tmp("scan-cap");
     let so = build_fixture(&dir, "capped", &["-DMATRIX_INTERFACES=0"]);
     load_and_populate(&so);
@@ -698,6 +718,7 @@ fn the_per_object_byte_cap_is_enforced_as_a_skip_not_a_truncation() {
 
 #[test]
 fn scan_budget_charges_only_the_prefix_read_before_aggregate_exhaustion() {
+    let _guard = serial_guard();
     let dir = tmp("scan-prefix-budget");
     let so = build_fixture(&dir, "prefix-capped", &["-DMATRIX_INTERFACES=0"]);
     load_and_populate(&so);
@@ -737,6 +758,7 @@ fn scan_budget_charges_only_the_prefix_read_before_aggregate_exhaustion() {
 /// configuration rather than assumed, exactly as `proc_access.rs` does.
 #[test]
 fn an_unreadable_proc_mem_is_reported_as_unavailable_not_as_an_error() {
+    let _guard = serial_guard();
     let mut child = Command::new("setsid")
         .args(["--fork", "sleep", "27.1828"])
         .spawn()
@@ -813,6 +835,7 @@ fn an_unreadable_proc_mem_is_reported_as_unavailable_not_as_an_error() {
 
 #[test]
 fn softhsm_if_installed_is_discovered_without_false_positives() {
+    let _guard = serial_guard();
     let module = Path::new("/usr/lib/softhsm/libsofthsm2.so");
     if !module.exists() {
         eprintln!("SKIP: SoftHSM2 not installed");
@@ -857,6 +880,7 @@ fn softhsm_if_installed_is_discovered_without_false_positives() {
 
 #[test]
 fn inspect_renders_a_scanned_fixture_end_to_end() {
+    let _guard = serial_guard();
     let dir = tmp("inspect-e2e");
     let so = build_fixture(&dir, "inspected", &["-DMATRIX_INTERFACES=0"]);
     load_and_populate(&so);

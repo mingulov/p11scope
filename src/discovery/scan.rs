@@ -178,11 +178,12 @@ impl CaptureWorkBudget {
     }
 
     fn take_scan_stop_reason(&mut self) -> Option<&'static str> {
+        let reason = self.scan_stop_reason?;
         if self.scan_stop_reported {
             None
         } else {
             self.scan_stop_reported = true;
-            self.scan_stop_reason
+            Some(reason)
         }
     }
 
@@ -528,11 +529,30 @@ fn detect_tables(
     maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
 ) -> (Vec<ScannedTable>, Vec<String>) {
+    detect_tables_with_clock(
+        snapshot,
+        base_address,
+        maps,
+        budget,
+        crate::attach::monotonic_ns,
+    )
+}
+
+fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
+    snapshot: &[u8],
+    base_address: u64,
+    maps: &MapIndex<'_>,
+    budget: &mut CaptureWorkBudget,
+    mut now: F,
+) -> (Vec<ScannedTable>, Vec<String>) {
     let mut skipped = Vec::new();
     let mut found: Vec<(usize, usize, ScannedTable)> = Vec::new();
     let mut offset = 0usize;
     while offset + WORD <= snapshot.len() {
-        if (offset == 0 || budget.work_units % 4096 == 0) && budget.check_deadline_now().is_some() {
+        if (offset / WORD) % 4096 == 0
+            && budget.deadline_ns.is_some()
+            && budget.check_deadline(now()).is_some()
+        {
             if let Some(reason) = budget.take_scan_stop_reason() {
                 skipped.push(reason.into());
             }
@@ -594,6 +614,29 @@ fn scan_interfaces(
     budget: &mut CaptureWorkBudget,
     operation_bytes: &mut u64,
 ) -> (Vec<ScannedInterface>, Vec<String>) {
+    scan_interfaces_with_clock(
+        snapshot,
+        mem,
+        tables,
+        maps,
+        key,
+        budget,
+        operation_bytes,
+        crate::attach::monotonic_ns,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
+    snapshot: &[u8],
+    mem: &File,
+    tables: &[ScannedTable],
+    maps: &MapIndex<'_>,
+    key: ObjectKey,
+    budget: &mut CaptureWorkBudget,
+    operation_bytes: &mut u64,
+    mut now: F,
+) -> (Vec<ScannedInterface>, Vec<String>) {
     let word_at = |offset: usize| -> Option<u64> {
         Some(u64::from_ne_bytes(
             snapshot
@@ -615,7 +658,10 @@ fn scan_interfaces(
             });
     let mut offset = 0usize;
     while offset + INTERFACE_BYTES <= snapshot.len() {
-        if (offset == 0 || budget.work_units % 4096 == 0) && budget.check_deadline_now().is_some() {
+        if (offset / WORD) % 4096 == 0
+            && budget.deadline_ns.is_some()
+            && budget.check_deadline(now()).is_some()
+        {
             if let Some(reason) = budget.take_scan_stop_reason() {
                 skipped.push(reason.into());
             }
@@ -648,14 +694,16 @@ fn scan_interfaces(
             // pointer of a look-alike structure could aim anywhere. Only this object's
             // own readable pages — where a provider keeps its interface names — are
             // ever dereferenced; anything else is recorded without being read.
-            let mapping_end = matches!(
-                maps.resolve(name_ptr),
-                Resolved::File {
-                    device, inode, permissions, ..
-                } if permissions[0] == b'r' && ObjectKey { device, inode } == key
-            )
-            .then(|| maps.containing(name_ptr).map(|entry| entry.end))
-            .flatten();
+            let mapping_end = maps
+                .containing(name_ptr)
+                .filter(|entry| {
+                    entry.permissions[0] == b'r'
+                        && ObjectKey {
+                            device: entry.device,
+                            inode: entry.inode,
+                        } == key
+                })
+                .map(|entry| entry.end);
             let (name_class, name_lossy) = match name_ptr {
                 0 => ("null", None),
                 _ if mapping_end.is_none() => ("unreadable", None),
@@ -922,6 +970,7 @@ fn read_maps_with_limits<R: Read, F: FnMut() -> Option<u64>>(
     let mut entry_ceiling = false;
     let mut io_ceiling = false;
     let mut deadline_stop = false;
+    let mut chunk = vec![0; chunk_size];
 
     loop {
         if budget.deadline_ns.is_some() && budget.check_deadline(now()).is_some() {
@@ -940,8 +989,7 @@ fn read_maps_with_limits<R: Read, F: FnMut() -> Option<u64>>(
             io_ceiling = true;
             break;
         }
-        let mut chunk = vec![0; allowed];
-        let read = reader.read(&mut chunk)?;
+        let read = reader.read(&mut chunk[..allowed])?;
         if read == 0 {
             break;
         }
@@ -1709,6 +1757,48 @@ mod tests {
         let (tables, skipped) = detect_tables(&snapshot, 0x7000, &map_index, &mut budget);
         assert!(tables.is_empty());
         assert_eq!(skipped, vec![WORK_CEILING_REASON]);
+    }
+
+    #[test]
+    fn taking_an_empty_stop_does_not_hide_a_later_work_stop() {
+        let mut budget = CaptureWorkBudget {
+            work_ceiling: 0,
+            ..Default::default()
+        };
+        assert_eq!(budget.take_scan_stop_reason(), None);
+        assert!(!budget.charge(1));
+        assert_eq!(budget.take_scan_stop_reason(), Some(WORK_CEILING_REASON));
+        assert_eq!(budget.take_scan_stop_reason(), None);
+    }
+
+    #[test]
+    fn deadline_polling_uses_the_local_window_boundary_after_variable_work() {
+        let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let second_offset = 4095 * WORD;
+        let mut snapshot = vec![0u8; second_offset + 8 + 104 * WORD];
+        for offset in [0, second_offset] {
+            snapshot[offset..offset + 8].copy_from_slice(&0x0203u64.to_ne_bytes());
+            for slot in 0..104 {
+                let at = offset + 8 + slot * WORD;
+                snapshot[at..at + WORD].copy_from_slice(&0x1500u64.to_ne_bytes());
+            }
+        }
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_deadline(Some(10));
+        let mut polls = 0;
+        let (tables, skipped) =
+            detect_tables_with_clock(&snapshot, 0x7000, &map_index, &mut budget, || {
+                polls += 1;
+                Some(if polls == 1 { 0 } else { 10 })
+            });
+        assert_eq!(polls, 2, "initial and next local 4096-window boundary");
+        assert!(
+            tables
+                .iter()
+                .any(|table| table.address == 0x7000 + second_offset as u64)
+        );
+        assert_eq!(skipped, vec![SCAN_DEADLINE_REASON]);
     }
 
     #[test]

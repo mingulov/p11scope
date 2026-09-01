@@ -2964,7 +2964,7 @@ mod tests {
     ];
 
     fn trace_evidence_object(ev: &Evidence) -> serde_json::Value {
-        let line = crate::trace::evidence_line(ev, CapturePolicy::Allowlisted);
+        let line = crate::trace::evidence_line(ev, CapturePolicy::Allowlisted, false);
         serde_json::from_str(line.strip_prefix("EVIDENCE ").expect("EVIDENCE prefix"))
             .expect("the final trace evidence record is one JSON object")
     }

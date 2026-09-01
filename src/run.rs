@@ -2195,7 +2195,9 @@ fn capture_trace(
     }
     })();
 
-    let end = finish_capture_loop(
+    #[rustfmt::skip]
+    let end =
+    finish_capture_loop(
         loop_result,
         engine,
         session,
@@ -2322,6 +2324,26 @@ fn flush_stdout(writer: &mut dyn Write, open: &mut bool) -> Result<()> {
     }
 }
 
+fn emit_bounded_trace_event<W: Write, F: FnOnce() -> String>(
+    remaining: &mut Option<u64>,
+    render: F,
+    stdout: &mut dyn Write,
+    stdout_open: &mut bool,
+    out_file: &mut Option<W>,
+) -> (bool, Option<anyhow::Error>) {
+    if matches!(*remaining, Some(0)) {
+        return (false, None);
+    }
+    let line = render();
+    let error = emit_trace_line(&line, stdout, stdout_open, out_file).err();
+    if error.is_none()
+        && let Some(remaining) = remaining.as_mut()
+    {
+        *remaining = (*remaining).saturating_sub(1);
+    }
+    (true, error)
+}
+
 /// Drains whatever the ring buffer currently holds, rendering and
 /// emitting one line per completed call. Returns the malformed-record
 /// count from this drain, to accumulate at the call site.
@@ -2342,20 +2364,19 @@ fn drain_trace_events<W: Write>(
             return;
         }
         let process = identify_tracked(tracker, state, &ev);
-        if matches!(*remaining, Some(0)) || write_error.is_some() {
+        if write_error.is_some() {
             state.observe_process(process, &ev);
         } else {
-            write_error = emit_trace_line(
-                &tracer.on_event_process(&ev, process, state),
+            let (emitted, error) = emit_bounded_trace_event(
+                remaining,
+                || tracer.on_event_process(&ev, process, state),
                 stdout,
                 stdout_open,
                 out_file,
-            )
-            .err();
-            if write_error.is_none()
-                && let Some(remaining) = remaining.as_mut()
-            {
-                *remaining = (*remaining).saturating_sub(1);
+            );
+            write_error = error;
+            if !emitted {
+                state.observe_process(process, &ev);
             }
         }
         if !state.has_process_state(process) {
@@ -2915,6 +2936,14 @@ mod tests {
             ),
             (
                 "/bin/sleep",
+                CaptureEnd::LimitReached,
+                true,
+                false,
+                None,
+                Some(128 + libc::SIGTERM),
+            ),
+            (
+                "/bin/sleep",
                 CaptureEnd::Error,
                 true,
                 false,
@@ -3460,6 +3489,36 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[test]
+    fn stdout_truncation_with_max_events_one_and_bounded_file_trace_is_cumulative() {
+        let mut remaining = Some(1);
+        let mut stdout = Vec::new();
+        let mut stdout_open = true;
+        let mut file = Some(Vec::new());
+
+        let (emitted, error) = emit_bounded_trace_event(
+            &mut remaining,
+            || "event-1".to_string(),
+            &mut stdout,
+            &mut stdout_open,
+            &mut file,
+        );
+        assert!(emitted);
+        assert!(error.is_none());
+        let (emitted, error) = emit_bounded_trace_event(
+            &mut remaining,
+            || "event-2".to_string(),
+            &mut stdout,
+            &mut stdout_open,
+            &mut file,
+        );
+        assert!(!emitted);
+        assert!(error.is_none());
+        assert_eq!(remaining, Some(0));
+        assert_eq!(stdout, b"event-1\n");
+        assert_eq!(file.as_deref(), Some(&b"event-1\n"[..]));
     }
 
     /// build.rs must embed the real cross-compiled BPF object, never a

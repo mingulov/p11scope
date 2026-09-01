@@ -32,6 +32,7 @@ fn run_args(command: &[&str]) -> RunArgs {
         metrics: false,
         duration: None,
         out: None,
+        max_events: None,
         unsafe_requested: false,
         pause: PausePolicy::Never,
         kill_on_timeout: false,

@@ -50,6 +50,7 @@ Deepens what a capture can express; no structural change.
 | Container image + K8s manifests as shipped artifacts | Post-release; W5 qualification report is the v0.1.0 substitute |
 | deb/rpm packages | Post-release demand |
 | `pkcs11-lab assess` integration (observed-profile × pkcs11-check) | pkcs11-lab side ready; owner prioritization |
+| Selection-probe diagnostic: an explicit `C_GetInterface` query mode ("what would a consumer asking for name/version X get?"), recorded as clearly-labeled selection-behavior evidence, never merged into inventory (PRD §8 invariant) | Operator demand for consumer-selection diagnostics |
 | Seccomp/Landlock jail around the discover helper's `dlopen` | Research Tier-1 #4 residual; requires design (helper runs vendor code as a real host user) |
 | Scan rate-limiting + (dev,inode) dedupe against target `mmap_lock` stall | Research item #6 residual (measured 0.097 ms → 8020 ms target stall); W1 Task 6(f) bounds the bytes only — start on any real-world stall report |
 | PID-namespace attribution verification (`NSpid` depth check at startup) | Research #14; becomes mandatory work the moment in-cluster deployment is a shipped artifact |

@@ -8,8 +8,6 @@ cd "$(dirname "$0")/.."
 WORK=${P11SCOPE_TASK4_WORK-target/canaries}
 if [ "${P11SCOPE_TASK4_WORK+set}" = set ]; then
     case $WORK in /*) ;; *) echo "P11SCOPE_TASK4_WORK must be absolute" >&2; exit 2 ;; esac
-else
-    WORK=$(pwd -P)/$WORK
 fi
 
 assert_lanes() {
@@ -1570,7 +1568,15 @@ fi
 
 . scripts/lib.sh
 require_non_root_caller
-mkdir -p "$WORK"
+# The observer refuses to publish into a directory that has a group/world-writable
+# non-sticky ancestor (src/output.rs), and a checkout under a shared source root
+# has one, so the standalone default cannot live in the tree. Root it in a private
+# 0700 directory on sticky /tmp; a supplied path stays the caller's to keep private.
+[ "${P11SCOPE_TASK4_WORK+set}" = set ] || {
+    WORK=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-verify-XXXXXX")/$WORK
+    echo "work root: $WORK"
+}
+(umask 077; mkdir -p "$WORK")
 
 command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
 command -v bpftool >/dev/null || { echo "bpftool required"; exit 1; }

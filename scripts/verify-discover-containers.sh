@@ -6,10 +6,10 @@
 # (glibc 2.36) so it runs on ubuntu 24.04 (2.39) — the host glibc may be
 # newer than the container's, so a host build is not portable.
 #
-# Both --target-dir paths below are under $PWD/target (bind-mounted into
-# the container as /src), not the container's own /tmp, so the built
-# artifacts survive the container's --rm and are reused as-is by
-# scripts/build-release.sh instead of building them a second time.
+# Both --target-dir paths below are under the private receipt mount (/receipt),
+# not the container's own /tmp, so the built artifacts survive the container's
+# --rm and are reused as-is by scripts/build-release.sh, which supplies its own
+# P11SCOPE_TASK4_WORK base, instead of building them a second time.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -157,13 +157,27 @@ chmod 600 "$LANE14_FACTS"
 LANE14_FACTS_ID=$(stat -Lc %d:%i "$LANE14_FACTS")
 printf 'facts_identity\t%s\nstarted_utc\t%s\n' "$LANE14_FACTS_ID" \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LANE14_FACTS"
-DISCOVER_WORK=${P11SCOPE_TASK4_WORK:-target}/discover
-mkdir -m 700 -p "$DISCOVER_WORK"
+# docker refuses a relative -v source, so the receipt mount must be absolute: a
+# supplied base is required to be absolute (the sibling gates' contract) and the
+# standalone default is rooted in a private 0700 directory on sticky /tmp rather
+# than in the checkout, which root-owned container build output must not litter.
+if [ -n "${P11SCOPE_TASK4_WORK:-}" ]; then
+    case $P11SCOPE_TASK4_WORK in /*) ;; *) echo "P11SCOPE_TASK4_WORK must be absolute" >&2; exit 2 ;; esac
+    DISCOVER_WORK=$P11SCOPE_TASK4_WORK/discover
+else
+    DISCOVER_WORK=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-verify-XXXXXX")/target/discover
+    echo "work root: $DISCOVER_WORK"
+fi
+(umask 077; mkdir -p "$DISCOVER_WORK")
 
 TOKEN=$$
 GLIBC_BUILD="p11scope-discover-glibc-build-$TOKEN"
 GLIBC_RUN="p11scope-discover-glibc-run-$TOKEN"
 MUSL_BUILD="p11scope-discover-musl-build-$TOKEN"
+# Registered with the container's --name *before* its `docker run`, so a lane
+# that fails is still removed by the trap and the receipt's containers-absent
+# claim stays truthful; `docker rm -f`/`docker inspect` take a name as readily
+# as an id, and each is overwritten with the resolved id once the run succeeds.
 GLIBC_BUILD_ID=
 GLIBC_RUN_ID=
 MUSL_BUILD_ID=
@@ -202,6 +216,7 @@ sed 's|directory = ".*"|directory = "/receipt/vendor/src"|' \
     "$DISCOVER_WORK/vendor/config.toml" > "$DISCOVER_WORK/vendor/config.container.toml"
 
 echo "=== glibc: build in rust:1.88.0-bookworm, run in ubuntu:24.04 ==="
+GLIBC_BUILD_ID=$GLIBC_BUILD
 timeout --signal=TERM --kill-after=5s 600s docker run --name "$GLIBC_BUILD" \
     -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src rust:1.88.0-bookworm sh -ec '
   export CARGO_HOME=/tmp/cargo
@@ -209,6 +224,7 @@ timeout --signal=TERM --kill-after=5s 600s docker run --name "$GLIBC_BUILD" \
   cargo build --locked --release -p p11scope-discover --offline --target-dir /receipt/glibc-build'
 GLIBC_BUILD_ID=$(docker inspect -f '{{.Id}}' "$GLIBC_BUILD")
 printf 'container_glibc_build\t%s\n' "$GLIBC_BUILD_ID" >> "$LANE14_FACTS"
+GLIBC_RUN_ID=$GLIBC_RUN
 timeout --signal=TERM --kill-after=5s 300s docker run --name "$GLIBC_RUN" \
     -v "$PWD:/src:ro" \
     -v "$DISCOVER_WORK/glibc-build/release/p11scope-discover:/usr/local/bin/p11scope-discover:ro" \
@@ -230,6 +246,7 @@ GLIBC_RUN_ID=$(docker inspect -f '{{.Id}}' "$GLIBC_RUN")
 printf 'container_glibc_run\t%s\n' "$GLIBC_RUN_ID" >> "$LANE14_FACTS"
 
 echo "=== musl-dynamic: build + run in rust:1.88.0-alpine ==="
+MUSL_BUILD_ID=$MUSL_BUILD
 timeout --signal=TERM --kill-after=5s 600s docker run --name "$MUSL_BUILD" \
     -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src rust:1.88.0-alpine sh -ec '
   apk add -q musl-dev gcc softhsm file jq util-linux
@@ -240,9 +257,14 @@ timeout --signal=TERM --kill-after=5s 600s docker run --name "$MUSL_BUILD" \
   file /receipt/musl-build/release/p11scope-discover | grep -q "dynamically linked" \
       || { echo "helper is NOT dynamic"; exit 1; }
   ldd /receipt/musl-build/release/p11scope-discover
+  # /receipt is the private 0700 receipt mount, which uid 65534 cannot traverse,
+  # so the dropped-privilege runner gets the helper from a 0755 directory --
+  # exactly where the glibc lane bind-mounts its own binary. Same file, same
+  # dynamic links: `file` and `ldd` above still check the built artifact itself.
+  install -m 0755 /receipt/musl-build/release/p11scope-discover /usr/local/bin/p11scope-discover
   run_discover() {
     setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs \
-      /receipt/musl-build/release/p11scope-discover "$@"
+      p11scope-discover "$@"
   }
   run_discover --module /usr/lib/softhsm/libsofthsm2.so -o /tmp/m.json
   n=$(grep -c "\"name\": \"C_" /tmp/m.json)

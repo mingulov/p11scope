@@ -24,10 +24,12 @@ use p11scope_ebpf_common::{
 };
 use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
 use std::mem::size_of_val;
 use std::num::NonZeroU64;
 use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const BPF_F_RDONLY_PROG: u32 = 1 << 7;
 
@@ -282,6 +284,7 @@ pub enum Scope {
     Cgroup {
         id: u64,
         path: PathBuf,
+        dir: Arc<File>,
     },
 }
 
@@ -2482,16 +2485,9 @@ mod tests {
             generation: std::num::NonZeroU64::new(99).unwrap(),
         };
         assert!(pause_key_for(&Scope::Pid(41), Some(&capability)).is_err());
-        assert!(
-            pause_key_for(
-                &Scope::Cgroup {
-                    id: 1,
-                    path: "/sys/fs/cgroup".into(),
-                },
-                Some(&capability),
-            )
-            .is_err()
-        );
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        let cgroup = crate::scope::cgroup(cgroup_dir.path()).unwrap();
+        assert!(pause_key_for(&cgroup, Some(&capability)).is_err());
 
         let key = pause_key_for(&Scope::Pid(42), Some(&capability))
             .unwrap()

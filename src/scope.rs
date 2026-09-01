@@ -11,15 +11,22 @@ use p11scope_ebpf_common::{
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 
-/// A cgroup's kernel id is its directory inode number — the value returned
-/// by `bpf_get_current_cgroup_id()` for a task directly inside it. Scope
-/// matching itself uses a `CgroupArray`, including descendants.
-pub fn cgroup_id(path: &Path) -> Result<u64> {
+/// Opens and retains a cgroup directory for userspace walking and kernel publication.
+pub fn cgroup(path: &Path) -> Result<Scope> {
     use std::os::unix::fs::MetadataExt as _;
-    let md = std::fs::metadata(path)
-        .with_context(|| format!("reading cgroup path {}", path.display()))?;
-    Ok(md.ino())
+    let dir =
+        File::open(path).with_context(|| format!("reading cgroup path {}", path.display()))?;
+    let id = dir
+        .metadata()
+        .with_context(|| format!("reading cgroup path {}", path.display()))?
+        .ino();
+    Ok(Scope::Cgroup {
+        id,
+        path: path.to_path_buf(),
+        dir: Arc::new(dir),
+    })
 }
 
 /// Best-effort human label for a `cgroup_id`, for the per-cgroup profile
@@ -53,9 +60,12 @@ pub fn label(root: &Path, target: u64) -> Option<String> {
     None
 }
 
+fn publish_cgroup_fd_with(dir: &File, set: impl FnOnce(File) -> Result<()>) -> Result<()> {
+    set(dir.try_clone()?)
+}
+
 /// Publishes one exact scope and policy and verifies every supported
-/// readback. The cgroup descriptor opened for `--cgroup` is dropped on return —
-/// the kernel holds its own cgroup reference through the map.
+/// readback. The retained cgroup descriptor is cloned into the kernel map.
 pub(crate) fn publish(
     ebpf: &mut Ebpf,
     scope: &Scope,
@@ -79,7 +89,6 @@ pub(crate) fn publish(
     }
 
     let mut expected_pids = BTreeMap::new();
-    let mut cgroup_file = None;
     match scope {
         Scope::Pid(pid) => {
             if *pid == 0 {
@@ -91,28 +100,15 @@ pub(crate) fn publish(
             m.insert(*pid, token, 0)?;
             expected_pids.insert(*pid, token);
         }
-        Scope::Cgroup { id, path } => {
-            use std::os::unix::fs::MetadataExt as _;
-            let directory =
-                File::open(path).with_context(|| format!("opening cgroup {}", path.display()))?;
+        Scope::Cgroup { dir, .. } => {
             let mut groups: CgroupArray<_> =
                 CgroupArray::try_from(ebpf.map_mut("CGROUP_FILTER").context("CGROUP_FILTER map")?)?;
-            let opened_id = directory
-                .metadata()
-                .with_context(|| format!("reading opened cgroup {}", path.display()))?
-                .ino();
-            if opened_id != *id {
-                bail!(
-                    "cgroup {} changed from inode {} to {}; refusing mismatched scope",
-                    path.display(),
-                    id,
-                    opened_id
-                );
-            }
             // CgroupArray has no userspace lookup; exact metadata, this
-            // opened-FD inode check, and successful set are the content proof.
-            groups.set(0, directory.try_clone()?, 0)?;
-            cgroup_file = Some(directory);
+            // retained descriptor, and successful set are the content proof.
+            publish_cgroup_fd_with(dir, |directory| {
+                groups.set(0, directory, 0)?;
+                Ok(())
+            })?;
         }
     }
 
@@ -131,7 +127,6 @@ pub(crate) fn publish(
         bail!("CONFIG exact readback {readback:#x} differs from {config:#x}");
     }
 
-    drop(cgroup_file);
     Ok(())
 }
 
@@ -172,23 +167,45 @@ mod tests {
     }
 
     #[test]
-    fn cgroup_id_is_the_directory_inode() {
-        // The unified hierarchy root always exists on a cgroup2 system;
-        // if it does not, there is nothing meaningful to assert.
-        let root = Path::new("/sys/fs/cgroup");
-        if !root.exists() {
-            eprintln!("SKIP: no /sys/fs/cgroup");
-            return;
-        }
+    fn cgroup_constructor_uses_the_directory_inode() {
+        let root = tempfile::tempdir().unwrap();
         use std::os::unix::fs::MetadataExt as _;
-        let expected = std::fs::metadata(root).unwrap().ino();
-        assert_eq!(cgroup_id(root).unwrap(), expected);
+        let expected = std::fs::metadata(root.path()).unwrap().ino();
+        let Scope::Cgroup { id, .. } = cgroup(root.path()).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(id, expected);
     }
 
     #[test]
     fn missing_cgroup_path_errors_loudly() {
-        let e = cgroup_id(Path::new("/sys/fs/cgroup/definitely-not-here")).unwrap_err();
+        let e = cgroup(Path::new("/sys/fs/cgroup/definitely-not-here")).unwrap_err();
         assert!(e.to_string().contains("reading cgroup path"));
+    }
+
+    #[test]
+    fn publish_uses_the_retained_cgroup_fd() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("target.scope");
+        let impostor = root.path().join("impostor.scope");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&impostor).unwrap();
+        let scope = cgroup(&real).unwrap();
+        let Scope::Cgroup { dir, .. } = &scope else {
+            unreachable!()
+        };
+        let retained_inode = dir.metadata().unwrap().ino();
+        let stash = root.path().join("moved.scope");
+        std::fs::rename(&real, &stash).unwrap();
+        std::fs::rename(&impostor, &real).unwrap();
+
+        publish_cgroup_fd_with(dir, |candidate| {
+            assert_eq!(candidate.metadata().unwrap().ino(), retained_inode);
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

@@ -1034,13 +1034,7 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
                 .map_err(|error| anyhow!("--pid {p}: {error}"))?;
             (Scope::Pid(*p), Some(view))
         }
-        ScopeArg::Cgroup(c) => (
-            Scope::Cgroup {
-                id: scope::cgroup_id(c)?,
-                path: c.clone(),
-            },
-            None,
-        ),
+        ScopeArg::Cgroup(c) => (scope::cgroup(c)?, None),
     };
     if kind == Kind::Trace && a.duration.is_none() {
         eprintln!(

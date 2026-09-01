@@ -36,6 +36,7 @@ use p11scope_manifest::maps::{
     Device, MapEntry, MappedPath, ObjectKey, Resolved, parse_maps, resolve,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
@@ -2139,14 +2140,19 @@ fn corroboration_corroborates(outcome: Corroboration) -> bool {
 }
 
 fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
-    let path = match scope {
+    let (path, io_root) = match scope {
         Scope::Pid(pid) => return (vec![*pid], Vec::new()),
-        Scope::Cgroup { path, .. } => path,
+        Scope::Cgroup { path, dir, .. } => (
+            path.as_path(),
+            PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())),
+        ),
     };
     let mut pids = Vec::new();
     let mut lost = Vec::new();
-    let mut stack = vec![path.clone()];
-    while let Some(dir) = stack.pop() {
+    let mut stack = vec![PathBuf::new()];
+    while let Some(relative) = stack.pop() {
+        let dir = io_root.join(&relative);
+        let label_dir = path.join(&relative);
         match std::fs::read_to_string(dir.join("cgroup.procs")) {
             Ok(text) => pids.extend(
                 text.lines()
@@ -2157,7 +2163,7 @@ fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
             // permission, I/O — means processes exist here that were never listed.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => lost.push(Skipped {
-                subject: dir.display().to_string(),
+                subject: label_dir.display().to_string(),
                 reason: format!(
                     "cgroup.procs could not be read ({error}); no process of this cgroup \
                      was scanned"
@@ -2171,7 +2177,7 @@ fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
                         Ok(entry) => entry,
                         Err(error) => {
                             lost.push(Skipped {
-                                subject: dir.display().to_string(),
+                                subject: label_dir.display().to_string(),
                                 reason: format!(
                                     "a cgroup directory entry could not be read ({error}); membership absence is not authoritative"
                                 ),
@@ -2179,11 +2185,12 @@ fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
                             continue;
                         }
                     };
+                    let relative_entry = relative.join(entry.file_name());
                     match entry.file_type() {
-                        Ok(kind) if kind.is_dir() => stack.push(entry.path()),
+                        Ok(kind) if kind.is_dir() => stack.push(relative_entry),
                         Ok(_) => {}
                         Err(error) => lost.push(Skipped {
-                            subject: entry.path().display().to_string(),
+                            subject: path.join(&relative_entry).display().to_string(),
                             reason: format!(
                                 "a cgroup directory entry type could not be read ({error}); membership absence is not authoritative"
                             ),
@@ -2197,7 +2204,7 @@ fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
             // parent's listing and this read held no process to lose.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => lost.push(Skipped {
-                subject: dir.display().to_string(),
+                subject: label_dir.display().to_string(),
                 reason: format!(
                     "the cgroup directory could not be listed ({error}); any process \
                      below it was never discovered"
@@ -8997,7 +9004,6 @@ mod tests {
     };
     use std::cell::Cell;
     use std::io::Write as _;
-    use std::os::fd::AsRawFd as _;
     use std::path::PathBuf;
 
     #[test]
@@ -11040,10 +11046,7 @@ mod tests {
         let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
         std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
         let mut engine = Engine::empty();
-        engine.scope = Scope::Cgroup {
-            path: dir.path().to_path_buf(),
-            id: 0,
-        };
+        engine.scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
         (engine, dir)
     }
 
@@ -11354,10 +11357,7 @@ mod tests {
             max_events: None,
             unsafe_requested: false,
         };
-        let scope = Scope::Cgroup {
-            path: dir.path().to_path_buf(),
-            id: 0,
-        };
+        let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
 
         let engine = Engine::discover(&args, &scope, None).expect("an empty cgroup still captures");
 
@@ -11385,10 +11385,8 @@ mod tests {
         let (mut engine, context) = Engine::retiring_loader_context(pid);
         // A cgroup capture continues when one member exits; the record its
         // exited member already queued is what this is about.
-        engine.scope = Scope::Cgroup {
-            path: PathBuf::from("/sys/fs/cgroup/test.scope"),
-            id: 0,
-        };
+        let scope_dir = tempfile::tempdir().expect("a scope directory");
+        engine.scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
         engine.retirement_intents.clear();
         child.kill().unwrap();
         child.wait().unwrap();
@@ -11706,10 +11704,8 @@ mod tests {
         );
 
         let mut cgroup = Engine::empty();
-        cgroup.scope = Scope::Cgroup {
-            id: 7,
-            path: "/sys/fs/cgroup/p11scope.test".into(),
-        };
+        let cgroup_dir = tempfile::tempdir().expect("a scope directory");
+        cgroup.scope = crate::scope::cgroup(cgroup_dir.path()).expect("open scope directory");
         cgroup.arm_expected_target_exit(view);
         cgroup.finalize_expected_target_exit();
         assert!(
@@ -17706,16 +17702,58 @@ int main(int argc, char **argv) {
     /// A pod's processes live in the container cgroups below the pod directory;
     /// capture scope already includes every descendant, so discovery must too.
     #[test]
+    fn cgroup_walk_follows_the_retained_directory_not_a_replaced_path() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("target.scope");
+        let impostor = root.path().join("impostor.scope");
+        std::fs::create_dir_all(real.join("leaf.scope")).unwrap();
+        std::fs::create_dir(&impostor).unwrap();
+        std::fs::write(real.join("cgroup.procs"), "11\n").unwrap();
+        std::fs::write(real.join("leaf.scope/cgroup.procs"), "22\n").unwrap();
+        std::fs::write(impostor.join("cgroup.procs"), "99\n").unwrap();
+        let scope = crate::scope::cgroup(&real).unwrap();
+        let stash = root.path().join("moved.scope");
+        std::fs::rename(&real, &stash).unwrap();
+        std::fs::rename(&impostor, &real).unwrap();
+
+        let (pids, lost) = scope_pids(&scope);
+
+        assert_eq!(pids, vec![11, 22], "the retained fd's descendants, not 99");
+        assert!(!pids.contains(&99));
+        assert_eq!(lost, vec![]);
+    }
+
+    #[test]
+    fn cgroup_walk_reports_losses_under_the_operator_path_not_a_proc_fd_path() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("target.scope");
+        let leaf = real.join("leaf.scope");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(real.join("cgroup.procs"), "11\n").unwrap();
+        std::fs::create_dir(leaf.join("cgroup.procs")).unwrap();
+        let scope = crate::scope::cgroup(&real).unwrap();
+
+        let (pids, lost) = scope_pids(&scope);
+
+        assert_eq!(pids, vec![11]);
+        assert_eq!(
+            lost.len(),
+            1,
+            "the directory cannot be read as text: {lost:?}"
+        );
+        assert_eq!(lost[0].subject, leaf.display().to_string());
+        assert!(!format!("{lost:?}").contains("/proc/self/fd"));
+    }
+
+    #[test]
     fn cgroup_scope_collects_pids_from_every_descendant() {
         let root = tempfile::tempdir().unwrap();
         let leaf = root.path().join("kubepods.slice").join("container.scope");
         std::fs::create_dir_all(&leaf).unwrap();
         std::fs::write(root.path().join("cgroup.procs"), "11\n").unwrap();
         std::fs::write(leaf.join("cgroup.procs"), "22\n33\n\n22\n").unwrap();
-        let (pids, lost) = scope_pids(&Scope::Cgroup {
-            id: 0,
-            path: root.path().to_path_buf(),
-        });
+        let scope = crate::scope::cgroup(root.path()).unwrap();
+        let (pids, lost) = scope_pids(&scope);
         assert_eq!(pids, vec![11, 22, 33], "deduplicated, descendants included");
         assert_eq!(lost, vec![], "every directory was readable");
         assert_eq!(scope_pids(&Scope::Pid(7)).0, vec![7]);
@@ -17724,10 +17762,10 @@ int main(int argc, char **argv) {
         // cgroups churn constantly, and one is removable only when empty — held
         // no process to lose, on either read. Claiming otherwise would publish a
         // false loss and force PARTIAL on ordinary pod turnover.
-        let (pids, lost) = scope_pids(&Scope::Cgroup {
-            id: 0,
-            path: root.path().join("vanished.scope"),
-        });
+        let vanished = tempfile::tempdir().unwrap();
+        let vanished_scope = crate::scope::cgroup(vanished.path()).unwrap();
+        std::fs::remove_dir(vanished.path()).unwrap();
+        let (pids, lost) = scope_pids(&vanished_scope);
         assert_eq!(pids, Vec::<u32>::new());
         assert_eq!(lost, vec![], "a cgroup that no longer exists is not a loss");
 
@@ -17749,10 +17787,7 @@ int main(int argc, char **argv) {
         permissions.set_mode(0o000);
         std::fs::set_permissions(&leaf, permissions).unwrap();
         let denied = std::fs::read_dir(&leaf).is_err();
-        let (pids, lost) = scope_pids(&Scope::Cgroup {
-            id: 0,
-            path: root.path().to_path_buf(),
-        });
+        let (pids, lost) = scope_pids(&scope);
         std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o755)).unwrap();
         if !denied {
             assert_eq!(

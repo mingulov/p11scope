@@ -51,6 +51,9 @@ pending.
   object only after exact scan coverage survives final planning; malformed,
   incomparable, permission/I/O, invalid-offset, and stale-sole-source cases are
   fatal.
+- **Output safety**: `-o` rejects symlinked, writable, or unrelated-owner
+  ancestors, normalizes both output sinks, and falls back safely when
+  `openat2` is blocked by seccomp.
 - **Privacy-first 1.0**: the default boundary is bounded function,
   registered-mechanism, return-code, latency, and lifecycle evidence. There is
   no object-handle correlation or promised symbolic `CKA_CLASS`/

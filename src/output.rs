@@ -205,34 +205,43 @@ pub fn create_private_stream(path: &Path) -> Result<std::fs::File, String> {
     if path.as_os_str().as_bytes().last() == Some(&b'/') {
         return Err(format!("output {} has no file name", path.display()));
     }
-    let directory_path = path
+    let final_path = normalize_output_path(path.to_path_buf())?;
+    let directory_path = final_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let directory = open_output_directory(directory_path)?;
-    let final_name = path
+    let final_name = final_path
         .file_name()
-        .ok_or_else(|| format!("output {} has no file name", path.display()))?;
+        .ok_or_else(|| format!("output {} has no file name", final_path.display()))?;
     let final_name = c_name(final_name, "output file name")?;
     let file = openat_stream(&directory, &final_name)
-        .map_err(|error| format!("opening output {} failed: {error}", path.display()))?;
+        .map_err(|error| format!("opening output {} failed: {error}", final_path.display()))?;
     let metadata = file
         .metadata()
-        .map_err(|error| format!("checking output {} failed: {error}", path.display()))?;
+        .map_err(|error| format!("checking output {} failed: {error}", final_path.display()))?;
     if !metadata.is_file() {
-        return Err(format!("output {} is not a regular file", path.display()));
+        return Err(format!(
+            "output {} is not a regular file",
+            final_path.display()
+        ));
     }
     if metadata.uid() != unsafe { libc::geteuid() } {
         return Err(format!(
             "output {} exists and is owned by uid {}; refusing to overwrite it",
-            path.display(),
+            final_path.display(),
             metadata.uid()
         ));
     }
     file.set_len(0)
-        .map_err(|error| format!("truncating output {} failed: {error}", path.display()))?;
+        .map_err(|error| format!("truncating output {} failed: {error}", final_path.display()))?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("setting output {} private failed: {error}", path.display()))?;
+        .map_err(|error| {
+            format!(
+                "setting output {} private failed: {error}",
+                final_path.display()
+            )
+        })?;
     Ok(file)
 }
 
@@ -267,40 +276,183 @@ fn c_name(name: &OsStr, label: &str) -> Result<CString, String> {
     CString::new(name.as_bytes()).map_err(|_| format!("{label} contains a NUL byte"))
 }
 
-#[repr(C)]
-struct OpenHow {
-    flags: u64,
-    mode: u64,
-    resolve: u64,
+fn open_output_directory(path: &Path) -> Result<std::fs::File, String> {
+    open_output_directory_with(path, openat2_directory)
 }
 
-fn open_output_directory(path: &Path) -> Result<std::fs::File, String> {
+fn open_output_directory_with<F>(path: &Path, openat2: F) -> Result<std::fs::File, String>
+where
+    F: FnOnce(&Path) -> std::io::Result<std::fs::File>,
+{
     let display = path.display().to_string();
+    match openat2(path) {
+        Ok(opened) => {
+            let walked = open_directory_nofollow_walk(path)
+                .map_err(|error| format!("opening output directory {display} failed: {error}"))?;
+            let opened_identity =
+                FileIdentity::from_metadata(&opened.metadata().map_err(|error| {
+                    format!("checking output directory {display} failed: {error}")
+                })?);
+            let walked_identity =
+                FileIdentity::from_metadata(&walked.metadata().map_err(|error| {
+                    format!("checking output directory {display} failed: {error}")
+                })?);
+            if opened_identity != walked_identity {
+                return Err(format!(
+                    "opening output directory {display} failed: retained directory identity changed"
+                ));
+            }
+            Ok(opened)
+        }
+        Err(error) if matches!(error.raw_os_error(), Some(code) if code == libc::ENOSYS || code == libc::EPERM) => {
+            open_directory_nofollow_walk(path)
+                .map_err(|error| format!("opening output directory {display} failed: {error}"))
+        }
+        Err(error) => Err(format!(
+            "opening output directory {display} failed: {error}"
+        )),
+    }
+}
+
+fn openat2_directory(path: &Path) -> std::io::Result<std::fs::File> {
     let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-        format!("opening output directory {display} failed: path contains a NUL byte")
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains a NUL byte")
     })?;
-    let how = OpenHow {
-        flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
-        mode: 0,
-        resolve: libc::RESOLVE_NO_SYMLINKS,
-    };
+    // SAFETY: open_how is a plain kernel input struct; zero initializes all
+    // fields not used by this call, including future non-exhaustive fields.
+    let mut how = unsafe { std::mem::zeroed::<libc::open_how>() };
+    how.flags = (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64;
+    how.resolve = libc::RESOLVE_NO_SYMLINKS;
     let fd = unsafe {
         libc::syscall(
             libc::SYS_openat2,
             libc::AT_FDCWD,
             path.as_ptr(),
             &how,
-            std::mem::size_of::<OpenHow>(),
+            std::mem::size_of::<libc::open_how>(),
         )
     };
     if fd == -1 {
-        return Err(format!(
-            "opening output directory {} failed: {}",
-            display,
-            std::io::Error::last_os_error()
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { std::fs::File::from_raw_fd(fd as _) })
+    }
+}
+
+fn open_directory_nofollow_walk(path: &Path) -> std::io::Result<std::fs::File> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "output directory walk requires an absolute path",
         ));
     }
-    Ok(unsafe { std::fs::File::from_raw_fd(fd as _) })
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    let root = CString::new("/").expect("root has no NUL");
+    let fd = unsafe { libc::open(root.as_ptr(), flags) };
+    if fd == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut directory = unsafe { std::fs::File::from_raw_fd(fd) };
+    validate_trusted_directory(&directory, Path::new("/"))?;
+    let mut current = PathBuf::from("/");
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            match component {
+                std::path::Component::RootDir | std::path::Component::CurDir => continue,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "output directory walk rejects parent or prefix components",
+                    ));
+                }
+                std::path::Component::Normal(_) => unreachable!(),
+            }
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path component contains a NUL byte",
+            )
+        })?;
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let next = unsafe { std::fs::File::from_raw_fd(fd) };
+        current.push(OsStr::from_bytes(name.as_bytes()));
+        validate_trusted_directory(&next, &current)?;
+        directory = next;
+    }
+    Ok(directory)
+}
+
+fn validate_trusted_directory(directory: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    let metadata = directory.metadata()?;
+    let mode = metadata.mode();
+    if mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "output directory ancestor {} is untrusted: not a directory",
+                path.display()
+            ),
+        ));
+    }
+    if mode & 0o022 != 0 && mode & libc::S_ISVTX == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "output directory ancestor {} is untrusted: writable",
+                path.display()
+            ),
+        ));
+    }
+    let euid = unsafe { libc::geteuid() } as u32;
+    let owner = metadata.uid();
+    let owner_trusted = owner == euid || owner == 0 || (euid == 0 && sudo_uid() == Some(owner));
+    if !owner_trusted {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "output directory ancestor {} is untrusted: owned by uid {}",
+                path.display(),
+                owner
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn sudo_uid() -> Option<u32> {
+    if unsafe { libc::geteuid() } != 0 {
+        return None;
+    }
+    let value = std::env::var_os("SUDO_UID")?;
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let uid = value.to_str()?.parse::<u32>().ok()?;
+    if uid == 0 || uid == u32::MAX || !uid_has_account(uid) {
+        return None;
+    }
+    Some(uid)
+}
+
+fn uid_has_account(uid: u32) -> bool {
+    let mut account = unsafe { std::mem::zeroed::<libc::passwd>() };
+    let mut result = std::ptr::null_mut();
+    let mut buffer = vec![0; 16 * 1024];
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut account,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    status == 0 && !result.is_null()
 }
 
 fn openat_stream(directory: &std::fs::File, name: &CString) -> std::io::Result<std::fs::File> {
@@ -393,9 +545,15 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
 
+    fn private_tempdir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
     #[test]
     fn private_stream_refuses_a_symlinked_target() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let target = dir.path().join("target");
         std::fs::write(&target, b"do not touch").unwrap();
         let link = dir.path().join("trace.log");
@@ -406,7 +564,7 @@ mod tests {
 
     #[test]
     fn private_stream_refuses_a_symlinked_parent() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let target_dir = dir.path().join("target-dir");
         std::fs::create_dir(&target_dir).unwrap();
         let target = target_dir.join("trace.log");
@@ -420,7 +578,7 @@ mod tests {
 
     #[test]
     fn private_stream_refuses_a_fifo_without_blocking() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let fifo = dir.path().join("trace.log");
         let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
@@ -430,7 +588,7 @@ mod tests {
 
     #[test]
     fn private_stream_creates_0600_and_truncates_an_existing_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let path = dir.path().join("trace.log");
         let mut file = create_private_stream(&path).unwrap();
         assert_eq!(
@@ -451,7 +609,7 @@ mod tests {
 
     #[test]
     fn commit_publishes_atomically_and_replaces_stale_content() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let path = dir.path().join("observed.json");
         std::fs::write(&path, b"stale").unwrap();
         let mut a = AtomicFile::create(&path).unwrap();
@@ -472,7 +630,7 @@ mod tests {
 
     #[test]
     fn atomic_file_refuses_a_symlinked_parent() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let target_dir = dir.path().join("target-dir");
         std::fs::create_dir(&target_dir).unwrap();
         let target = target_dir.join("observed.json");
@@ -485,8 +643,179 @@ mod tests {
     }
 
     #[test]
+    fn output_refuses_a_symlinked_intermediate_ancestor() {
+        let dir = private_tempdir();
+        let target_dir = dir.path().join("target-dir");
+        let target = target_dir.join("nested/observed.json");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"do not touch").unwrap();
+        let link = dir.path().join("ancestor");
+        std::os::unix::fs::symlink(&target_dir, &link).unwrap();
+        let path = link.join("nested/observed.json");
+
+        assert!(AtomicFile::create(&path).is_err());
+        assert!(create_private_stream(&path).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not touch");
+    }
+
+    #[test]
+    fn both_sinks_reject_parent_components_without_touching_target() {
+        let dir = private_tempdir();
+        let safe = dir.path().join("safe");
+        let protected = dir.path().join("protected");
+        std::fs::create_dir(&safe).unwrap();
+        std::fs::create_dir(&protected).unwrap();
+        let target = protected.join("trace.log");
+        std::fs::write(&target, b"do not touch").unwrap();
+        let path = safe.join("../protected/trace.log");
+
+        assert!(AtomicFile::create(&path).is_err());
+        assert!(create_private_stream(&path).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not touch");
+    }
+
+    #[test]
+    fn output_refuses_a_group_or_world_writable_ancestor() {
+        let dir = private_tempdir();
+        let ancestor = dir.path().join("ancestor");
+        std::fs::create_dir(&ancestor).unwrap();
+        let path = ancestor.join("observed.json");
+
+        for mode in [0o775, 0o707] {
+            std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(mode)).unwrap();
+            let error = AtomicFile::create(&path)
+                .err()
+                .expect("writable ancestor must refuse");
+            assert!(error.contains("ancestor"), "{error}");
+            assert!(error.contains("untrusted"), "{error}");
+            let error = create_private_stream(&path).unwrap_err();
+            assert!(error.contains("ancestor"), "{error}");
+            assert!(error.contains("untrusted"), "{error}");
+        }
+
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        drop(AtomicFile::create(&path).unwrap());
+        drop(create_private_stream(&ancestor.join("trace.log")).unwrap());
+
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o1707)).unwrap();
+        drop(AtomicFile::create(&ancestor.join("sticky.json")).unwrap());
+        drop(create_private_stream(&ancestor.join("sticky.log")).unwrap());
+    }
+
+    #[test]
+    fn root_owner_is_accepted_but_unrelated_owner_is_rejected() {
+        let dir = private_tempdir();
+        let root_owned = dir.path().join("root-owned");
+        std::fs::create_dir(&root_owned).unwrap();
+        std::fs::set_permissions(&root_owned, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root_owned.join("root.json");
+
+        if unsafe { libc::geteuid() } == 0 {
+            let root_path = std::ffi::CString::new(root_owned.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(root_path.as_ptr(), 0, u32::MAX) }, 0);
+            drop(AtomicFile::create(&path).unwrap());
+
+            std::fs::set_permissions(&root_owned, std::fs::Permissions::from_mode(0o775)).unwrap();
+            let error = AtomicFile::create(&root_owned.join("mode.json"))
+                .err()
+                .expect("root ownership must not waive the mode rule");
+            assert!(error.contains("untrusted"), "{error}");
+            std::fs::set_permissions(&root_owned, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+            let foreign = dir.path().join("foreign-owned");
+            std::fs::create_dir(&foreign).unwrap();
+            std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let sudo_uid = std::env::var_os("SUDO_UID")
+                .and_then(|value| value.to_str().and_then(|value| value.parse::<u32>().ok()))
+                .filter(|uid| *uid != 0 && *uid != u32::MAX);
+            let foreign_uid = [1, 2, 3]
+                .into_iter()
+                .find(|uid| Some(*uid) != sudo_uid)
+                .expect("a foreign fixture uid must be available");
+            let foreign_path = std::ffi::CString::new(foreign.as_os_str().as_bytes()).unwrap();
+            assert_eq!(
+                unsafe { libc::chown(foreign_path.as_ptr(), foreign_uid, u32::MAX) },
+                0
+            );
+            let error = AtomicFile::create(&foreign.join("foreign.json"))
+                .err()
+                .expect("unrelated ownership must refuse");
+            assert!(error.contains("untrusted"), "{error}");
+
+            if let Some(sudo_uid) = sudo_uid.filter(|uid| uid_has_account(*uid)) {
+                let sudo_owned = dir.path().join("sudo-owned");
+                std::fs::create_dir(&sudo_owned).unwrap();
+                std::fs::set_permissions(&sudo_owned, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                let sudo_path = std::ffi::CString::new(sudo_owned.as_os_str().as_bytes()).unwrap();
+                assert_eq!(
+                    unsafe { libc::chown(sudo_path.as_ptr(), sudo_uid, u32::MAX) },
+                    0
+                );
+                assert!(
+                    open_output_directory(&sudo_owned).is_ok(),
+                    "validated SUDO_UID owner must be accepted"
+                );
+                drop(AtomicFile::create(&sudo_owned.join("sudo.json")).unwrap());
+            }
+        } else {
+            drop(AtomicFile::create(&path).unwrap());
+        }
+    }
+
+    #[test]
+    fn the_nofollow_walk_fallback_matches_openat2_and_refuses_the_same_symlinks() {
+        let dir = private_tempdir();
+        let real = dir.path().join("real");
+        let nested = real.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let openat2 = open_output_directory(&nested).unwrap();
+        let walk = open_directory_nofollow_walk(&nested).unwrap();
+        assert_eq!(
+            (
+                openat2.metadata().unwrap().dev(),
+                openat2.metadata().unwrap().ino()
+            ),
+            (
+                walk.metadata().unwrap().dev(),
+                walk.metadata().unwrap().ino()
+            )
+        );
+
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(open_directory_nofollow_walk(&link.join("nested")).is_err());
+        assert!(open_directory_nofollow_walk(Path::new("/proc/self/fd/1")).is_err());
+
+        for errno in [libc::EPERM, libc::ENOSYS] {
+            let fallback = open_output_directory_with(&nested, |_| {
+                Err(std::io::Error::from_raw_os_error(errno))
+            })
+            .unwrap();
+            assert_eq!(
+                (
+                    fallback.metadata().unwrap().dev(),
+                    fallback.metadata().unwrap().ino()
+                ),
+                (
+                    walk.metadata().unwrap().dev(),
+                    walk.metadata().unwrap().ino()
+                )
+            );
+            assert!(
+                open_output_directory_with(&link.join("nested"), |_| {
+                    Err(std::io::Error::from_raw_os_error(errno))
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn temp_is_private_and_removed_when_not_committed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let path = dir.path().join("observed.json");
         {
             let mut a = AtomicFile::create(&path).unwrap();
@@ -504,7 +833,7 @@ mod tests {
 
     #[test]
     fn commit_fails_and_cleans_up_when_the_temp_was_replaced() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let path = dir.path().join("observed.json");
         let mut a = AtomicFile::create(&path).unwrap();
         std::io::Write::write_all(a.file(), b"x").unwrap();

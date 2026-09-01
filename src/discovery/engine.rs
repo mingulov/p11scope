@@ -16,7 +16,7 @@ use crate::discovery::identity::{
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::scan::{
     CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
-    ScannedTable, Skipped, scan_process_view, spans_for,
+    ScannedTable, Skipped, read_maps_or_refuse, scan_process_view, spans_for,
 };
 use crate::manifest_input::{read_manifest, validate_structure};
 use crate::process::{self, ProcessView, ProcessViewId};
@@ -32,9 +32,7 @@ use p11scope_ebpf_common::{
 };
 use p11scope_manifest::elf::ElfSnapshot;
 use p11scope_manifest::manifest::{Acquisition, Manifest, Resolution, SCHEMA, WalkOutcome};
-use p11scope_manifest::maps::{
-    Device, MapEntry, MappedPath, ObjectKey, Resolved, parse_maps, resolve,
-};
+use p11scope_manifest::maps::{Device, MapEntry, MappedPath, ObjectKey, Resolved, resolve};
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
@@ -4874,17 +4872,27 @@ impl Engine {
         }
     }
 
-    fn read_maps(view: &ProcessView) -> Result<Vec<MapEntry>> {
+    /// The live path's `/proc/<pid>/maps` snapshot: the scan path's bounded
+    /// reader, refused whole when any ceiling or the batch deadline cuts it
+    /// (`read_maps_or_refuse`). Every caller turns `Err` into a refused
+    /// record or an unarmed view, never into a decision on a shorter map.
+    fn read_maps(view: &ProcessView, budget: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>> {
         let pid = view.pid();
-        let bytes = view
-            .run_while_same(|| std::fs::read(format!("/proc/{pid}/maps")))
-            .map_err(anyhow::Error::msg)??;
-        parse_maps(&bytes).map_err(anyhow::Error::msg)
+        view.run_while_same(|| {
+            let maps = std::fs::File::open(format!("/proc/{pid}/maps"))
+                .map_err(|error| error.to_string())?;
+            read_maps_or_refuse(maps, budget, crate::attach::monotonic_ns)
+        })
+        .map_err(anyhow::Error::msg)?
+        .map_err(anyhow::Error::msg)
     }
 
-    fn loader_locator(view: &ProcessView) -> Result<Option<LoaderLocator>> {
+    fn loader_locator(
+        view: &ProcessView,
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<Option<LoaderLocator>> {
         let pid = view.pid();
-        let before_maps = Self::read_maps(view)?;
+        let before_maps = Self::read_maps(view, budget)?;
         let executable_path = PathBuf::from(format!("/proc/{pid}/exe"));
         let before_executable =
             view_object_key(view, &executable_path).map_err(anyhow::Error::msg)?;
@@ -4914,7 +4922,7 @@ impl Engine {
             None
         };
 
-        let after_maps = Self::read_maps(view)?;
+        let after_maps = Self::read_maps(view, budget)?;
         let after_executable =
             view_object_key(view, &executable_path).map_err(anyhow::Error::msg)?;
         if before_executable != retained_executable || retained_executable != after_executable {
@@ -5691,7 +5699,7 @@ impl Engine {
         };
         let lowered = {
             let view = &self.views[position];
-            let maps = Self::read_maps(view)?;
+            let maps = Self::read_maps(view, &mut self.budget)?;
             lower_export_record(view, &maps, &self.hooks, record, &mut self.budget)
         };
         let Some(lowered) = lowered.map_err(|error| anyhow!(error))? else {
@@ -5779,7 +5787,7 @@ impl Engine {
             ));
         };
         let loader = context.spec.loader;
-        let maps = Self::read_maps(&self.views[position])?;
+        let maps = Self::read_maps(&self.views[position], &mut self.budget)?;
         let view_id = self.views[position].id();
         let Some(mapping) = maps
             .iter()
@@ -6231,7 +6239,7 @@ impl Engine {
             return Ok(false);
         }
         let pid = self.views[position].pid();
-        let Some(locator) = Self::loader_locator(&self.views[position])? else {
+        let Some(locator) = Self::loader_locator(&self.views[position], &mut self.budget)? else {
             return Ok(false);
         };
         let loader_path = locator.authority.loader_path.clone();
@@ -6348,12 +6356,14 @@ impl Engine {
             || {
                 self.views[position].still_the_same()
                     && self.pinned.check_unchanged().unwrap_or(false)
-                    && Self::loader_locator(&self.views[position]).is_ok_and(|current| {
-                        current.is_some_and(|current| {
-                            current.authority == locator.authority
-                                && current.maps.contains(&loader_mapping)
-                        })
-                    })
+                    && Self::loader_locator(&self.views[position], &mut self.budget).is_ok_and(
+                        |current| {
+                            current.is_some_and(|current| {
+                                current.authority == locator.authority
+                                    && current.maps.contains(&loader_mapping)
+                            })
+                        },
+                    )
             },
             || {
                 session.attach_dynamic_loader(
@@ -9040,9 +9050,38 @@ mod tests {
         Acquisition, AliasEntry, AliasGroup, FunctionRecord, InterfaceClassification,
         SurfaceRecord, SurfaceSource, Version, WalkOutcome,
     };
+    use p11scope_manifest::maps::parse_maps;
     use std::cell::Cell;
     use std::io::Write as _;
     use std::path::PathBuf;
+
+    /// Task 11 fix round 2 (csf_ce5962b root closure): the live per-record
+    /// snapshot read charges the capture budget and honors the installed
+    /// batch deadline on the real `/proc` path, refusing before a byte is read.
+    #[test]
+    fn live_maps_snapshot_charges_the_budget_and_honors_the_installed_deadline() {
+        use crate::discovery::scan::SCAN_DEADLINE_REASON;
+
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        assert!(!Engine::read_maps(&view, &mut budget).unwrap().is_empty());
+        assert!(
+            budget.attempted_io_bytes() > 0,
+            "the snapshot read is charged to the capture budget"
+        );
+
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_deadline(Some(0));
+        let error = Engine::read_maps(&view, &mut budget)
+            .err()
+            .map(|error| error.to_string());
+        assert_eq!(error.as_deref(), Some(SCAN_DEADLINE_REASON));
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            0,
+            "an expired deadline refuses before a byte is read"
+        );
+    }
 
     #[test]
     fn lifecycle_tier_gap_uses_existing_public_discovery_evidence() {

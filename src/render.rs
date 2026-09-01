@@ -1332,6 +1332,22 @@ mod tests {
     use super::*;
     use p11scope_ebpf_common::{LATENCY_BUCKETS, shape};
 
+    /// Task 11 fix round 2 (csf_b8067e3 sibling): the C1 range — the raw 8-bit
+    /// CSI U+009B above all — is escaped exactly like C0 and DEL, and legitimate
+    /// non-ASCII pathnames pass through untouched. Pinned so an ASCII-only
+    /// control check cannot silently re-open raw 8-bit CSI.
+    #[test]
+    fn escape_controls_rewrites_c0_del_and_c1_only() {
+        assert_eq!(
+            escape_controls("a\u{9b}b\u{85}c\u{7f}d\u{1}e\u{1b}[2Jf\rg"),
+            r"a\u{9b}b\u{85}c\u{7f}d\u{1}e\u{1b}[2Jf\rg"
+        );
+        assert!(matches!(
+            escape_controls("/opt/p11-ключ-é.so"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
     fn report(name: &str, calls: u64, in_flight: u64, aliased: bool) -> SlotReport {
         SlotReport {
             names: vec![name.into()],

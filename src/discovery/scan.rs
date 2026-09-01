@@ -1057,6 +1057,37 @@ fn read_maps_with_limits<R: Read, F: FnMut() -> Option<u64>>(
     Ok((bytes, reasons))
 }
 
+/// The live engine's `/proc/<pid>/maps` snapshot. The engine decides identity
+/// and ownership from it, so unlike the scan path's trimmed-and-reported read
+/// it is refused whole when the byte, entry, or total-I/O ceiling or the batch
+/// deadline cuts it; an already-expired deadline refuses before a byte is read.
+pub(crate) fn read_maps_or_refuse<R: Read, F: FnMut() -> Option<u64>>(
+    reader: R,
+    budget: &mut CaptureWorkBudget,
+    mut now: F,
+) -> Result<Vec<MapEntry>, String> {
+    // The reader reports a stopped batch's reason only once; the refusal must
+    // not depend on that, so ask the budget directly before reading.
+    if budget.deadline_ns.is_some() {
+        if let Some(reason) = budget.check_deadline(now()) {
+            return Err(reason.into());
+        }
+    }
+    let (bytes, reasons) = read_maps_with_limits(
+        reader,
+        budget,
+        MAX_MAPS_BYTES,
+        MAX_MAP_ENTRIES,
+        64 * 1024,
+        now,
+    )
+    .map_err(|error| error.to_string())?;
+    if let Some(reason) = reasons.first() {
+        return Err((*reason).into());
+    }
+    parse_maps(&bytes)
+}
+
 pub fn scan_pid(
     request: &ScanRequest<'_>,
     budget: &mut CaptureWorkBudget,
@@ -1917,5 +1948,90 @@ mod tests {
             assert_eq!(bytes, b"aa\n");
             assert!(reasons.contains(&reason), "{reasons:?}");
         }
+    }
+
+    /// Task 11 fix round 2 (csf_ce5962b root closure): the live engine's
+    /// per-record snapshot is refused whole — never trimmed — at the byte,
+    /// entry, and total-I/O ceilings and at the batch deadline; an already
+    /// expired deadline refuses before a byte is read, on every read of the
+    /// stopped batch, not only the once the reader reports it.
+    #[test]
+    fn live_maps_snapshot_is_refused_whole_at_every_bound() {
+        use std::io::Cursor;
+
+        let line: &[u8] = b"7f0000000000-7f0000001000 r-xp 00000000 08:01 12345 /opt/p.so\n";
+        let snapshot = |budget: &mut CaptureWorkBudget, input: &[u8], clock: Vec<Option<u64>>| {
+            let mut clock = clock.into_iter();
+            read_maps_or_refuse(Cursor::new(input), budget, || {
+                clock.next().unwrap_or(Some(0))
+            })
+        };
+
+        // Lines long enough that the byte ceiling lands before the entry ceiling.
+        let long_line = [&line[..line.len() - 1], &[b'p'; 64][..], b"\n"].concat();
+        let oversized =
+            long_line.repeat(usize::try_from(MAX_MAPS_BYTES).unwrap() / long_line.len() + 1);
+        assert!(u64::try_from(oversized.len()).unwrap() > MAX_MAPS_BYTES);
+        let mut budget = CaptureWorkBudget::default();
+        assert_eq!(
+            snapshot(&mut budget, &oversized, vec![]).err(),
+            Some(MAPS_CEILING_REASON.into()),
+            "one byte over the byte ceiling is refused, not trimmed"
+        );
+
+        let short_line: &[u8] = b"0-1 ---p 0 0:0 0\n";
+        let mut budget = CaptureWorkBudget::default();
+        assert_eq!(
+            snapshot(&mut budget, &short_line.repeat(MAX_MAP_ENTRIES + 1), vec![]).err(),
+            Some(MAPS_ENTRY_CEILING_REASON.into()),
+            "one entry over the entry ceiling is refused, not trimmed"
+        );
+
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: 8,
+        });
+        assert_eq!(
+            snapshot(&mut budget, &line.repeat(2), vec![]).err(),
+            Some(IO_CEILING_REASON.into()),
+            "the capture's total-I/O ceiling refuses the snapshot"
+        );
+
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_deadline(Some(5));
+        assert_eq!(
+            snapshot(
+                &mut budget,
+                &line.repeat(2),
+                vec![Some(0), Some(0), Some(10)]
+            )
+            .err(),
+            Some(SCAN_DEADLINE_REASON.into()),
+            "a deadline reached during the read refuses the snapshot"
+        );
+
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_deadline(Some(5));
+        for attempt in 1..=2 {
+            assert_eq!(
+                snapshot(&mut budget, line, vec![Some(10)]).err(),
+                Some(SCAN_DEADLINE_REASON.into()),
+                "read {attempt} of a stopped batch is refused"
+            );
+            assert_eq!(
+                budget.attempted_io_bytes(),
+                0,
+                "read {attempt} read nothing"
+            );
+        }
+
+        let mut budget = CaptureWorkBudget::default();
+        let entries = snapshot(&mut budget, line, vec![]).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            u64::try_from(line.len()).unwrap(),
+            "a complete snapshot is charged to the capture's I/O total"
+        );
     }
 }

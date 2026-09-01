@@ -119,7 +119,10 @@ fixed-private-work-descendants-exact-accepted
 caller-path-overrides-rejected-before-mutation
 same-shell-single-finalizer-exact-accepted
 cleanup-failure-upgrades-one-status-written-last
-absolute-nested-work-and-legacy-defaults-exact-accepted""".splitlines()
+absolute-nested-work-and-legacy-defaults-exact-accepted
+untracked-build-input-rejected-status-77-no-touch-before-body
+recorded-tool-replaced-between-preflight-and-finalization-rejected
+path-change-resolving-a-different-binary-rejected""".splitlines()
 
 good={"owners":1,"child_status":False,"facts":["43:99","hash"],"executables":["p11scope","p11scope-discover","p11scope-discover-glibc","p11scope-discover-musl"],"softhsm":68,"fixture":[68,92,104],"static":[68,68,136]}
 def lane_valid(d):
@@ -157,6 +160,22 @@ legacy_defaults={"canary":"target/canaries","attach":"target/e2e"}
 supplied={"canary":str(paths["canary"]),"attach":str(paths["attach"])}
 mark(lane[17],all(value.startswith("/") for value in supplied.values())
      and all(not value.startswith("/") for value in legacy_defaults.values()))
+inherited=dict.fromkeys(("RUSTFLAGS","CARGO_ENCODED_RUSTFLAGS","CARGO_TARGET_DIR","CARGO_BUILD_TARGET",
+                         "CARGO_HOME","RUSTUP_HOME","RUSTUP_TOOLCHAIN","RUSTC_WRAPPER","CC","CFLAGS"),"")
+def preflight_accepts(status,configs,env):
+    return status=="" and not configs and not any(env.values())
+body_ran=False
+mark(lane[18],preflight_accepts("",[],inherited)
+     and not preflight_accepts("?? .cargo/config.toml",[],inherited)
+     and not preflight_accepts("",[str(private_work/".cargo/config.toml")],inherited)
+     and all(not preflight_accepts("",[],dict(inherited,**{name:"/poisoned"})) for name in inherited)
+     and not body_ran)
+recorded={"cargo":("/usr/lib/toolchain/cargo","sha-a"),"sudo":("/usr/bin/sudo","sha-b")}
+def tools_unchanged(observed): return observed==recorded
+replaced=dict(recorded,cargo=("/usr/lib/toolchain/cargo","sha-c"))
+repathed=dict(recorded,sudo=("/tmp/shadow/sudo","sha-b"))
+mark(lane[19],tools_unchanged(dict(recorded)) and not tools_unchanged(replaced))
+mark(lane[20],not tools_unchanged(repathed))
 
 if len(rows)!=len(common)+len(lane) or len(rows)!=len(set(rows)): raise SystemExit("row coverage")
 report.parent.mkdir(parents=True,exist_ok=True);fd=os.open(report,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
@@ -198,9 +217,54 @@ task4_prepare_root() {
     TASK4_ROOT_ID=$(stat -Lc %d:%i "$TASK4_ROOT") || return 1
 }
 
-task4_digest() { sha256sum "$1" | awk '{print $1}'; }
-task4_snapshot() { git ls-files -z | sort -z | xargs -0 sha256sum; }
+task4_digest() { "$T4_TOOL_sha256sum" "$1" | awk '{print $1}'; }
+task4_snapshot() { git ls-files -z | sort -z | xargs -0 "$T4_TOOL_sha256sum"; }
 task4_fact() { printf '%s\t%s\n' "$1" "$2" >> "$TASK4_FACTS"; }
+
+# The build inputs Cargo, rustup, and the C toolchain read from the
+# environment. Any non-empty inherited value re-steers the official build away
+# from the recorded source tree without leaving a trace in the receipt, so the
+# driver refuses them outright and supplies only command-local values.
+TASK4_BUILD_INPUTS='RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_TARGET_DIR CARGO_BUILD_TARGET
+CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTC_WRAPPER CC CFLAGS'
+
+# An untracked `.cargo/config.toml` is invisible to `git ls-files`, to the
+# source ledger, and to the cleanliness gate, yet Cargo obeys it. Refuse every
+# one Cargo would consult: each repository ancestor up to /, then CARGO_HOME.
+task4_refuse_cargo_config() {
+    [ ! -e "$1" ] && [ ! -L "$1" ] || { echo "untracked cargo config: $1" >&2; exit 77; }
+}
+
+# Resolve one command to a single absolute non-symlink executable and pin it to
+# the named variable, so the recorded receipt and the invocation cannot diverge.
+task4_pin_tool() {
+    t4_path=$(realpath -e "$1") || return 1
+    case $t4_path in /*) ;; *) return 1 ;; esac
+    [ -f "$t4_path" ] && [ ! -L "$t4_path" ] && [ -x "$t4_path" ] || return 1
+    eval "$2=\$t4_path"
+}
+
+# One row per pinned tool: the path the driver invokes, what the current PATH
+# (or rustup) resolves that name to now, and the pinned binary's digest.
+# Re-running this at finalization catches an in-place replacement and a PATH
+# that resolves a different binary alike -- both refuse, neither warns.
+task4_tool_ledger() {
+    for t4_tool in cargo docker file jq python3 rustup setpriv sudo sha256sum; do
+        eval "t4_pinned=\$T4_TOOL_$t4_tool"
+        t4_found=$(command -v "$t4_tool") || return 1
+        t4_now=$(realpath -e "$t4_found") || return 1
+        printf 'tool_%s\t%s %s %s\n' \
+            "$t4_tool" "$t4_pinned" "$t4_now" "$(task4_digest "$t4_pinned")" || return 1
+    done
+    t4_found=$("$T4_TOOL_rustup" which --toolchain 1.88 cargo) || return 1
+    t4_now=$(realpath -e "$t4_found") || return 1
+    printf 'toolchain_cargo\t%s %s %s\n' \
+        "$T4_TOOLCHAIN_CARGO" "$t4_now" "$(task4_digest "$T4_TOOLCHAIN_CARGO")" || return 1
+    t4_found=$("$T4_TOOL_rustup" which --toolchain 1.88 rustc) || return 1
+    t4_now=$(realpath -e "$t4_found") || return 1
+    printf 'toolchain_rustc\t%s %s %s\n' \
+        "$T4_TOOLCHAIN_RUSTC" "$t4_now" "$(task4_digest "$T4_TOOLCHAIN_RUSTC")" || return 1
+}
 
 release_body_cleanup() {
     release_cleanup_status=0
@@ -228,7 +292,13 @@ task4_finalize() {
     if [ "$t4_result" -ne 77 ]; then
         [ "$(git rev-parse HEAD 2>/dev/null)" = "$TASK4_HEAD" ] || t4_result=1
         [ "$(git rev-parse 'HEAD^{tree}' 2>/dev/null)" = "$TASK4_TREE" ] || t4_result=1
-        git diff --quiet && git diff --cached --quiet || t4_result=1
+        t4_status=$(git status --porcelain=v1 --untracked-files=all 2>/dev/null) || t4_result=1
+        [ -z "$t4_status" ] || t4_result=1
+        for t4_var in $TASK4_BUILD_INPUTS; do
+            eval "t4_value=\${$t4_var-}"
+            [ -z "$t4_value" ] || t4_result=1
+        done
+        [ "$(task4_tool_ledger 2>/dev/null)" = "$TASK4_TOOLS" ] || t4_result=1
         [ "$(task4_digest scripts/build-release.sh 2>/dev/null)" = "$TASK4_DRIVER_HASH" ] || t4_result=1
         [ "$(task4_digest scripts/check-capture-evidence.py 2>/dev/null)" = "$TASK4_CHECKER_HASH" ] || t4_result=1
         task4_snapshot > "$TASK4_ROOT/artifacts/source.end.tsv" || t4_result=1
@@ -273,7 +343,11 @@ task4_receipt_run() {
     TASK4_ARTIFACTS_ID=$(stat -Lc %d:%i "$TASK4_ROOT/artifacts")
     TASK4_WORK_ID=$(stat -Lc %d:%i "$TASK4_ROOT/work")
     TASK4_HEAD= TASK4_TREE= TASK4_DRIVER_HASH= TASK4_CHECKER_HASH=
-    TASK4_CHILD_FACTS_ID= TASK4_CHILD_FACTS_HASH=
+    TASK4_CHILD_FACTS_ID= TASK4_CHILD_FACTS_HASH= TASK4_TOOLS=
+    T4_TOOLCHAIN_CARGO= T4_TOOLCHAIN_RUSTC=
+    for t4_tool in cargo docker file jq python3 rustup setpriv sudo sha256sum; do
+        eval "T4_TOOL_$t4_tool=\$t4_tool"
+    done
     trap task4_finalize EXIT INT TERM HUP
     [ ! -L "$TASK4_CAMPAIGN/.task4.lock" ] || exit 77
     exec 9>>"$TASK4_CAMPAIGN/.task4.lock"; chmod 600 "$TASK4_CAMPAIGN/.task4.lock"
@@ -282,7 +356,8 @@ task4_receipt_run() {
     flock -n 9 || exit 77
     TASK4_LOCK_ID=$(stat -Lc %d:%i "$TASK4_CAMPAIGN/.task4.lock")
     TASK4_HEAD=$(git rev-parse HEAD) || exit 77; TASK4_TREE=$(git rev-parse 'HEAD^{tree}') || exit 77
-    git diff --quiet && git diff --cached --quiet || exit 77
+    TASK4_STATUS=$(git status --porcelain=v1 --untracked-files=all) || exit 77
+    [ -z "$TASK4_STATUS" ] || { echo "worktree must be clean, untracked files included" >&2; exit 77; }
     TASK4_DRIVER_HASH=$(task4_digest scripts/build-release.sh); TASK4_CHECKER_HASH=$(task4_digest scripts/check-capture-evidence.py)
     task4_snapshot > "$TASK4_ROOT/artifacts/source.start.tsv" || exit 77
     TASK4_SOURCE_HASH=$(task4_digest "$TASK4_ROOT/artifacts/source.start.tsv")
@@ -292,8 +367,32 @@ task4_receipt_run() {
     task4_fact lock_identity "$TASK4_LOCK_ID"; task4_fact lock_holder "$$:$(process_starttime $$)"
     task4_fact driver_sha256 "$TASK4_DRIVER_HASH"; task4_fact checker_sha256 "$TASK4_CHECKER_HASH"
     task4_fact source_input_ledger_sha256 "$TASK4_SOURCE_HASH"
-    for tool in cargo docker file jq python3 rustup setpriv sudo sha256sum; do command -v "$tool" >/dev/null || exit 77; done
-    sudo -n true >/dev/null 2>&1 || exit 77
+    t4_dir=$(pwd -P) || exit 77
+    while :; do
+        task4_refuse_cargo_config "$t4_dir/.cargo/config"
+        task4_refuse_cargo_config "$t4_dir/.cargo/config.toml"
+        [ "$t4_dir" != / ] || break
+        t4_dir=${t4_dir%/*}; [ -n "$t4_dir" ] || t4_dir=/
+    done
+    t4_cargo_home=${CARGO_HOME:-${HOME-}/.cargo}
+    task4_refuse_cargo_config "$t4_cargo_home/config"
+    task4_refuse_cargo_config "$t4_cargo_home/config.toml"
+    for t4_var in $TASK4_BUILD_INPUTS; do
+        eval "t4_value=\${$t4_var-}"
+        [ -z "$t4_value" ] || { echo "refusing inherited $t4_var" >&2; exit 77; }
+        task4_fact "inherited_$t4_var" ""
+    done
+    for t4_tool in cargo docker file jq python3 rustup setpriv sudo sha256sum; do
+        t4_found=$(command -v "$t4_tool") || exit 77
+        task4_pin_tool "$t4_found" "T4_TOOL_$t4_tool" || exit 77
+    done
+    t4_found=$("$T4_TOOL_rustup" which --toolchain 1.88 cargo) || exit 77
+    task4_pin_tool "$t4_found" T4_TOOLCHAIN_CARGO || exit 77
+    t4_found=$("$T4_TOOL_rustup" which --toolchain 1.88 rustc) || exit 77
+    task4_pin_tool "$t4_found" T4_TOOLCHAIN_RUSTC || exit 77
+    TASK4_TOOLS=$(task4_tool_ledger) || exit 77
+    printf '%s\n' "$TASK4_TOOLS" >> "$TASK4_FACTS"
+    "$T4_TOOL_sudo" -n true >/dev/null 2>&1 || exit 77
     [ -f "$MODULE" ] || exit 77
     WORK=$TASK4_ROOT/work
     DIST="$WORK/dist"
@@ -328,11 +427,16 @@ echo "=== p11scope: dynamic-build attach correctness ==="
 P11SCOPE_TASK4_WORK="$ATTACH_WORK" sh scripts/verify-attach-e2e.sh
 
 echo "=== p11scope: isolated safe-only official static build ==="
-rustup target add --toolchain 1.88 x86_64-unknown-linux-musl
+"$T4_TOOL_rustup" target add --toolchain 1.88 x86_64-unknown-linux-musl
 rm -rf "$OFFICIAL_TARGET"
+# The rustup shim dispatches on argv[0], so its resolved non-symlink path is
+# not invocable as cargo and `+1.88` cannot survive path pinning. Run the
+# recorded toolchain binaries directly instead, offline, with RUSTC supplied
+# command-locally so cargo never resolves the compiler through PATH.
 CARGO_TARGET_DIR="$OFFICIAL_TARGET" \
 RUSTFLAGS="-C target-feature=+crt-static" \
-    cargo +1.88 build --locked --release --no-default-features \
+RUSTC="$T4_TOOLCHAIN_RUSTC" \
+    "$T4_TOOLCHAIN_CARGO" build --locked --offline --release --no-default-features \
         --target x86_64-unknown-linux-musl --bin p11scope
 P11SCOPE_STATIC=$OFFICIAL_TARGET/x86_64-unknown-linux-musl/release/p11scope
 
@@ -342,7 +446,7 @@ OFFICIAL_BPF=$1
 set -- "$CANARY_WORK"/feature-build/release/build/p11scope-*/out/p11scope-ebpf
 [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "diagnostic BPF object is not unique"; exit 1; }
 DIAGNOSTIC_BPF=$1
-python3 scripts/check-bpf-map-defs.py --policy-inventory "$OFFICIAL_BPF" "$DIAGNOSTIC_BPF"
+"$T4_TOOL_python3" scripts/check-bpf-map-defs.py --policy-inventory "$OFFICIAL_BPF" "$DIAGNOSTIC_BPF"
 
 if "$P11SCOPE_STATIC" profile --unsafe-unvalidated-metadata \
     --manifest /nonexistent/manifest.json --pid 1 \
@@ -358,8 +462,8 @@ grep -Fq -- "--unsafe-unvalidated-metadata requires a build with" \
     }
 
 echo "--- file: p11scope (static musl) ---"
-file "$P11SCOPE_STATIC"
-file "$P11SCOPE_STATIC" | grep -qE "statically linked|static-pie linked" \
+"$T4_TOOL_file" "$P11SCOPE_STATIC"
+"$T4_TOOL_file" "$P11SCOPE_STATIC" | grep -qE "statically linked|static-pie linked" \
     || { echo "p11scope is NOT static"; exit 1; }
 echo "--- ldd: p11scope (static musl) ---"
 ldd "$P11SCOPE_STATIC" || true   # diagnostic only; file(1) above is the enforced static-link check
@@ -373,7 +477,7 @@ GLIBC_DISCOVER=$DISCOVER_WORK/glibc-build/release/p11scope-discover
 MUSL_DISCOVER=$DISCOVER_WORK/musl-build/release/p11scope-discover
 
 echo "--- file: p11scope-discover (glibc) ---"
-file "$GLIBC_DISCOVER"
+"$T4_TOOL_file" "$GLIBC_DISCOVER"
 echo "--- ldd: p11scope-discover (glibc) ---"
 ldd "$GLIBC_DISCOVER"
 echo "--- smoke run: p11scope-discover (glibc), on host ---"
@@ -386,7 +490,7 @@ cp "$GLIBC_DISCOVER" "$DIST/p11scope-discover-glibc"
 cp "$GLIBC_DISCOVER" "$DIST/p11scope-discover"
 
 echo "--- file: p11scope-discover (musl) ---"
-file "$MUSL_DISCOVER"
+"$T4_TOOL_file" "$MUSL_DISCOVER"
 echo "musl-dynamic file/ldd/smoke run already verified inside the alpine" \
      "container by verify-discover-containers.sh above -- this (glibc)" \
      "host has no musl dynamic linker to exec it directly."
@@ -444,9 +548,9 @@ export SOFTHSM2_CONF="$WORK/softhsm2.conf"
 TARGET_UID=$(id -u)
 TARGET_GID=$(id -g)
 rm -f "$WORK/observed-static-smoke.json" "$WORK/hardened-target.pid"
-sudo --preserve-env=SOFTHSM2_CONF sh -c 'umask 077; exec 3>"$1"; shift; exec "$@"' \
+"$T4_TOOL_sudo" --preserve-env=SOFTHSM2_CONF sh -c 'umask 077; exec 3>"$1"; shift; exec "$@"' \
     sh "$WORK/hardened-target.pid" \
-    setpriv --no-new-privs --reuid "$TARGET_UID" --regid "$TARGET_GID" \
+    "$T4_TOOL_setpriv" --no-new-privs --reuid "$TARGET_UID" --regid "$TARGET_GID" \
     --clear-groups --inh-caps=-all --ambient-caps=-all --bounding-set=-all -- \
     sh -c '
         starttime=$(awk '\''{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[20]; exit }'\'' \
@@ -459,20 +563,20 @@ sudo --preserve-env=SOFTHSM2_CONF sh -c 'umask 077; exec 3>"$1"; shift; exec "$@
     ' sh "$WORK/harness" "$MODULE" &
 LPID=$!
 target_attempt=0
-while ! sudo test -s "$WORK/hardened-target.pid" && [ "$target_attempt" -lt 160 ]; do
+while ! "$T4_TOOL_sudo" test -s "$WORK/hardened-target.pid" && [ "$target_attempt" -lt 160 ]; do
     kill -0 "$LPID" 2>/dev/null || { echo "Hardened target launcher exited before publishing its pid"; exit 1; }
     target_attempt=$((target_attempt + 1))
     sleep 0.05
 done
-sudo test -s "$WORK/hardened-target.pid" || { echo "Hardened target pid missing"; exit 1; }
-set -- $(sudo cat "$WORK/hardened-target.pid")
+"$T4_TOOL_sudo" test -s "$WORK/hardened-target.pid" || { echo "Hardened target pid missing"; exit 1; }
+set -- $("$T4_TOOL_sudo" cat "$WORK/hardened-target.pid")
 [ "$#" -eq 2 ] || { echo "invalid Hardened target identity record"; exit 1; }
 WPID=$1
 TARGET_STARTTIME=$2
 case $WPID:$TARGET_STARTTIME in *[!0-9:]*) echo "invalid Hardened target identity"; exit 1 ;; esac
 wait_for_hardened_target "$WPID" "$TARGET_STARTTIME"
 
-sudo --preserve-env=SOFTHSM2_CONF "$DIST/p11scope" profile \
+"$T4_TOOL_sudo" --preserve-env=SOFTHSM2_CONF "$DIST/p11scope" profile \
     --manifest "$WORK/release-manifest.json" \
     --pid "$WPID" \
     --mode metrics --duration 20 -o "$WORK/observed-static-smoke.json" \
@@ -487,9 +591,9 @@ if wait "$LPID"; then LPID=; WPID=; TARGET_STARTTIME=; else status=$?; LPID=; WP
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "static smoke profiler failed: $status"; cat "$WORK/profile-static-smoke.log" || true; exit "$status"; fi
 reclaim_root_output "$WORK/observed-static-smoke.json"
 
-python3 scripts/check-capture-evidence.py clean-metrics-manifest-only \
+"$T4_TOOL_python3" scripts/check-capture-evidence.py clean-metrics-manifest-only \
     "$WORK/observed-static-smoke.json" spike/expected.txt
-echo "static p11scope smoke attach OK: $(jq -c .evidence "$WORK/observed-static-smoke.json")"
+echo "static p11scope smoke attach OK: $("$T4_TOOL_jq" -c .evidence "$WORK/observed-static-smoke.json")"
 
 echo "=== dist/ ==="
 ls -la "$DIST"

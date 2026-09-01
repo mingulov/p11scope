@@ -715,14 +715,22 @@ fn official_build_is_safe_only() {
         "=== p11scope: isolated safe-only official static build ===",
         "=== p11scope-discover: dynamic glibc + dynamic musl builds ===",
     );
+    // The rustup shim dispatches on argv[0], so its resolved non-symlink path
+    // is not invocable as cargo and `+1.88` cannot survive path pinning. The
+    // official build runs the recorded toolchain binaries directly, offline.
     let command = [
         "CARGO_TARGET_DIR=\"$OFFICIAL_TARGET\" \\",
         "RUSTFLAGS=\"-C target-feature=+crt-static\" \\",
-        "    cargo +1.88 build --locked --release --no-default-features \\",
+        "RUSTC=\"$T4_TOOLCHAIN_RUSTC\" \\",
+        "    \"$T4_TOOLCHAIN_CARGO\" build --locked --offline --release --no-default-features \\",
         "        --target x86_64-unknown-linux-musl --bin p11scope",
     ]
     .join("\n");
     assert!(official.contains(&command));
+    assert!(
+        !official.contains("cargo +1.88"),
+        "official build resolves cargo through the argv[0]-dispatching shim"
+    );
     for marker in [
         "--policy-inventory \"$OFFICIAL_BPF\" \"$DIAGNOSTIC_BPF\"",
         "--unsafe-unvalidated-metadata requires a build with",
@@ -825,6 +833,213 @@ fn task4_receipt_lane14_release_work_is_private_and_single_owner() {
         "poisoned rootless invocation reached rm"
     );
     assert_eq!(fs::read(&sentinel).unwrap(), b"must survive\n");
+}
+
+/// The build inputs the release driver refuses to inherit. Cargo and rustup
+/// read every one of them, so a non-empty inherited value silently re-steers
+/// the official build away from the recorded source tree.
+const TASK7_BUILD_INPUT_VARIABLES: &[&str] = &[
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_TARGET_DIR",
+    "CARGO_BUILD_TARGET",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "RUSTC_WRAPPER",
+    "CC",
+    "CFLAGS",
+];
+
+/// A one-commit repository holding the driver under test. The driver `cd`s to
+/// its own parent and demands a fully clean worktree, so the preflight must be
+/// exercised against a tree it owns rather than against this checkout.
+fn task7_pristine_driver_repo() -> tempfile::TempDir {
+    let repo = tempfile::tempdir().expect("create pristine release-driver repository");
+    fs::create_dir(repo.path().join("scripts")).expect("create pristine scripts directory");
+    for name in ["build-release.sh", "lib.sh", "check-capture-evidence.py"] {
+        fs::copy(
+            format!("scripts/{name}"),
+            repo.path().join("scripts").join(name),
+        )
+        .unwrap_or_else(|error| panic!("copy scripts/{name} into the pristine repo: {error}"));
+    }
+    for arguments in [
+        vec!["init", "--quiet", "-b", "task7"],
+        vec!["add", "-A"],
+        vec![
+            "-c",
+            "user.email=task7@example.invalid",
+            "-c",
+            "user.name=task7",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "pristine release driver",
+        ],
+    ] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(&arguments)
+            .status()
+            .unwrap_or_else(|error| panic!("run git {arguments:?}: {error}"));
+        assert!(status.success(), "git {arguments:?} failed");
+    }
+    repo
+}
+
+/// Tripwires for every command the preflight refusal must never reach.
+fn task7_tripwire_bin() -> tempfile::TempDir {
+    let bin = tempfile::tempdir().expect("create release preflight tripwires");
+    for command in [
+        "cargo", "docker", "file", "jq", "rm", "rustup", "setpriv", "sudo",
+    ] {
+        let path = bin.path().join(command);
+        fs::write(
+            &path,
+            b"#!/bin/sh\nprintf '%s\\n' \"${0##*/}\" >> \"$P11SCOPE_TASK4_TRIPWIRE_LOG\"\nexit 97\n",
+        )
+        .expect("write release preflight tripwire");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("make release preflight tripwire executable");
+    }
+    bin
+}
+
+/// Runs the pristine driver against an absent evidence root, with every
+/// refused build input cleared and only `inherited` restored.
+fn task7_run_preflight(
+    repo: &tempfile::TempDir,
+    home: &std::path::Path,
+    bin: &tempfile::TempDir,
+    tripwire: &std::path::Path,
+    root: &std::path::Path,
+    inherited: &[(&str, &str)],
+) -> std::process::Output {
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg(repo.path().join("scripts/build-release.sh"))
+        .arg(root)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+        .env("HOME", home)
+        .env("P11SCOPE_TASK4_TRIPWIRE_LOG", tripwire);
+    for name in TASK7_BUILD_INPUT_VARIABLES {
+        command.env_remove(name);
+    }
+    for (name, value) in inherited {
+        command.env(name, value);
+    }
+    command
+        .output()
+        .expect("run the release driver input-trust preflight")
+}
+
+/// A mode-0700 campaign parent the driver accepts, plus its tripwire log path.
+fn task7_campaign() -> tempfile::TempDir {
+    let campaign = tempfile::tempdir().expect("create release preflight campaign parent");
+    fs::set_permissions(campaign.path(), fs::Permissions::from_mode(0o700))
+        .expect("make the campaign parent private");
+    campaign
+}
+
+#[test]
+fn release_preflight_refuses_an_untracked_cargo_config_before_the_body() {
+    // An untracked `.cargo/config.toml` is invisible to `git ls-files`, to the
+    // source ledger, and to the tracked-cleanliness gate, yet Cargo obeys it.
+    // The driver must refuse it before it touches a build command.
+    let repo = task7_pristine_driver_repo();
+    let bin = task7_tripwire_bin();
+    let campaign = task7_campaign();
+    let home = tempfile::tempdir().expect("create release preflight home");
+    fs::create_dir(home.path().join(".cargo")).expect("create untracked cargo home");
+    fs::write(
+        home.path().join(".cargo/config.toml"),
+        b"[build]\nrustflags = [\"-C\", \"target-feature=-crt-static\"]\n",
+    )
+    .expect("write the untracked cargo config");
+
+    let tripwire = campaign.path().join("tripwire.log");
+    let output = task7_run_preflight(
+        &repo,
+        home.path(),
+        &bin,
+        &tripwire,
+        &campaign.path().join("evidence"),
+        &[],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(77),
+        "untracked cargo config must refuse with 77: stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("untracked cargo config"),
+        "refusal must name the untracked cargo config: stderr={stderr:?}"
+    );
+    assert!(
+        !tripwire.exists(),
+        "refusal reached a build command: {:?}",
+        fs::read_to_string(&tripwire).unwrap_or_default()
+    );
+    let residue = Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .expect("inspect the pristine repository after the refusal");
+    assert!(
+        residue.stdout.is_empty(),
+        "refusal mutated its own worktree: {:?}",
+        String::from_utf8_lossy(&residue.stdout)
+    );
+}
+
+#[test]
+fn release_preflight_refuses_every_inherited_build_input_variable() {
+    // Each of the ten re-steers Cargo, rustup, or the C toolchain. One shared
+    // clean fixture proves the refusal is per-variable and not an accident of
+    // the earlier untracked-config gate.
+    let repo = task7_pristine_driver_repo();
+    let bin = task7_tripwire_bin();
+    let campaign = task7_campaign();
+    let home = tempfile::tempdir().expect("create release preflight home");
+
+    for (index, variable) in TASK7_BUILD_INPUT_VARIABLES.iter().enumerate() {
+        let tripwire = campaign.path().join(format!("tripwire-{index}.log"));
+        let output = task7_run_preflight(
+            &repo,
+            home.path(),
+            &bin,
+            &tripwire,
+            &campaign.path().join(format!("evidence-{index}")),
+            &[(variable, "/task7/poisoned")],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(
+            output.status.code(),
+            Some(77),
+            "inherited {variable} must refuse with 77: stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains(&format!("refusing inherited {variable}")),
+            "refusal must name {variable}: stderr={stderr:?}"
+        );
+        assert!(
+            !stderr.contains("untracked cargo config"),
+            "{variable} refusal was preempted by the cargo-config gate: stderr={stderr:?}"
+        );
+        assert!(
+            !tripwire.exists(),
+            "inherited {variable} reached a build command: {:?}",
+            fs::read_to_string(&tripwire).unwrap_or_default()
+        );
+    }
 }
 
 #[test]
@@ -2446,6 +2661,9 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         "same-shell-single-finalizer-exact-accepted",
         "cleanup-failure-upgrades-one-status-written-last",
         "absolute-nested-work-and-legacy-defaults-exact-accepted",
+        "untracked-build-input-rejected-status-77-no-touch-before-body",
+        "recorded-tool-replaced-between-preflight-and-finalization-rejected",
+        "path-change-resolving-a-different-binary-rejected",
     ];
     const LANE16_CASES: &[&str] = &[
         "never-68-68-136-one-timing-zero-loss-ambiguity-inflight-child-false-none-0-0-0-exact-accepted",

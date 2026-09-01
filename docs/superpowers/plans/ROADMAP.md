@@ -37,10 +37,10 @@ SoftHSM2 has `p_offset == p_vaddr`).
   primary and versioned; fallback provenance). See
   [the extraction design](../specs/2026-08-10-module-crate-extraction-design.md).
 - `p11scope-discover`: Rust bin on that crate + `pkcs11-proxy-ng-types`;
-  2.x `C_GetFunctionList` **and** 3.x `C_GetInterfaceList` (never
-  `C_GetInterface` — interface *selection* is proxy policy; the helper
-  records what the module reports), ELF build-ID plus whole-file SHA-256 in
-  the manifest, JSON output. Shipped as glibc **and** musl
+  2.x `C_GetFunctionList` **and** 3.x `C_GetInterfaceList` (the Phase-1
+  helper did not perform selection; W3 adds the finite `C_GetInterface`
+  compatibility closure as separate evidence), ELF build-ID plus whole-file
+  SHA-256 in the manifest, JSON output. Shipped as glibc **and** musl
   *dynamic* builds — a fully static binary cannot dlopen.
 - `p11scope`: Rust + aya; attach uprobe+uretprobe per manifest entry
   (offset-based), PID/cgroup filter maps, aggregate counts/latency/CK_RV in
@@ -633,7 +633,7 @@ founding rule).
 | --- | --- | --- |
 | W1 | Eight scan findings + custody rescue, TDD, review-to-zero | [full plan, reviewed 2026-09-01](2026-09-01-release-hardening-wave1-findings.md) |
 | W2 | Storage consolidation: two-directory rule, migrate + repoint, `p11scope-ws` custody | [full plan](2026-09-01-wave2-storage-consolidation.md) |
-| W3 | Correctness residue: tracepoint offsets (research #1), opened-inode identity (#2), capability tier ladder + caps model, honest-degradation fixes, `uprobe_multi` attach + `C_GetInterface` selection evidence (both owner-pulled into release scope) | [charter](2026-09-01-release-wave-charters.md#w3) |
+| W3 | **Priority 1: `C_GetInterface` compatibility closure** (partial passive behavior → separate live request/result/failure evidence plus finite offline helper matrix and privacy/schema ruling); then tracepoint offsets (research #1), opened-inode identity (#2), capability tier ladder + caps model, honest-degradation fixes, and `uprobe_multi` attach | [charter](2026-09-01-release-wave-charters.md#w3) |
 | W4 | Hosted CI running the full suite; "green locally, not in CI" dies | [charter](2026-09-01-release-wave-charters.md#w4) |
 | W5 | Container/K8s requalification (provisional; W8 re-runs on the final tip) + seccomp/SELinux artifacts | [charter](2026-09-01-release-wave-charters.md#w5) |
 | W6 | Multi-distro/kernel matrix; support restated "5.15.x, tested on ⟨list⟩"; load-only CI matrix | [charter](2026-09-01-release-wave-charters.md#w6) |

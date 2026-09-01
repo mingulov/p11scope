@@ -27,8 +27,15 @@ Spec §3.3/§6 "on the release tip" is satisfied by W8, not by W5/W6.
 
 ## W3 — Correctness residue {#w3}
 
-**Objective:** close the two remaining Tier-1 research findings and ship the
-capability-tier model — after this wave the *product logic* is release-final.
+**Objective:** begin with the `C_GetInterface` compatibility closure, then
+close the remaining Tier-1 research findings and ship the capability-tier
+model — after this wave the *product logic* is release-final.
+
+**Execution priority:** W3 starts with `C_GetInterface` selection evidence.
+Only after that compatibility slice is closed does it proceed to
+`uprobe_multi`, capability breadth, and the remaining residue. The existing
+implementation is only partial: passive return discovery/inventory exists,
+but selection requests, failures, and aliases are not yet release-complete.
 
 **Scope:**
 1. **Tracepoint offsets (checklist 1 / item #1):** stop hardcoding field
@@ -94,16 +101,20 @@ capability-tier model — after this wave the *product logic* is release-final.
    standard set — interfaceName NULL (module default), `"PKCS 11"`
    unversioned, `"PKCS 11"` × {3.0, 3.1, 3.2}, standard flag variants —
    recording each request→result pair with the returned table
-   identity-mapped to the enumeration. **Invariant:** selection results are
-   a separate labeled evidence class, never merged into inventory. **Schema
-   and privacy:** new fields are a schema revision and an explicit
-   allowlist-vX revision (owner-approved wording change, never implicit
-   broadening); target-controlled name bytes surface only by exact
-   membership in the published name set.
+   identity-mapped to the enumeration. **Invariant:** selection requests,
+   results, and failures are separate labeled evidence classes, never merged
+   into inventory. Cover tests for NULL and exact names, unknown names,
+   versions and flags, failures, aliases, preattach absence, and privacy
+   escaping; include an open design ruling on whether a selection result may
+   ever authorize attachment (default: it may not). **Schema and privacy:**
+   new fields are a schema revision and an explicit allowlist-vX revision
+   (owner-approved wording change, never implicit broadening);
+   target-controlled name bytes surface only by exact membership in the
+   published name set.
 
 **Owner-gated:** any privileged e2e verification lanes (unprivileged rows
-run; privileged rows recorded UNRUN unless approved); the allowlist revision
-wording for selection-evidence fields.
+run; privileged rows recorded UNRUN unless approved); all allowlist/schema
+revision wording for selection-evidence fields.
 
 **Known facts for the planner:** aya pinned `=0.14.0` (`Cargo.toml:24`),
 build `--locked` (item #16 posture); anchor lines above were verified
@@ -133,10 +144,11 @@ the remote (including a CI-enablement push).
 
 **Known constraint for the planner (corrected 2026-09-01):** the repo HAS a
 remote with old history — `origin/main` = `367cadd` (`.codex`), a strict
-fast-forwardable ancestor 234 commits behind local `main`, whose public tip
+fast-forwardable ancestor 239 commits behind verified local `main`
+`5d251b76b33b14839a7147e14b5ccd1348855587`, whose public tip
 sits one commit above a "not ready" wip checkpoint. So hosted CI is
 technically enableable on the existing remote, but bringing it current means
-pushing 234 commits — an owner decision. **The wave STARTS by surfacing that
+pushing 239 commits — an owner decision. **The wave STARTS by surfacing that
 decision.** If the owner defers the push: deliver the complete pipeline
 definition (`.github/workflows/` or equivalent) with `act`/local dry-run
 evidence, and record — visibly, in the wave report and the W8 acceptance
@@ -249,8 +261,8 @@ locally.
 requalification lane; and publication itself (push, tag, GitHub release) —
 the wave ENDS at "staged and verified"; the last artifact is a one-page
 publication runbook for the owner, which MUST address reconciling the stale
-public remote (its tip `367cadd` sits one commit above a "not ready" wip
-checkpoint that is already public).
+public remote (its tip `367cadd` remains 239 commits behind local main and
+sits one commit above a "not ready" wip checkpoint that is already public).
 
 **Exit evidence:** the filled acceptance table; the staged bundle's checksums;
 zero accepted findings in the final cycle.

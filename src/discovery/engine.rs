@@ -2407,8 +2407,8 @@ fn discover_plan(
     discovered.counters.report_notes();
     for refused in &discovered.plan.modules_skipped {
         eprintln!(
-            "p11scope: module refused: {} — {}",
-            refused.subject, refused.reason
+            "{}",
+            format_module_refusal(&refused.subject, &refused.reason)
         );
     }
     discovered.counters.report(&discovered.plan);
@@ -2782,6 +2782,14 @@ fn format_unreadable_member(pid: u32, detail: &str) -> String {
     format!(
         "p11scope: discovery skipped pid {pid}: {}",
         render::escape_controls(detail)
+    )
+}
+
+fn format_module_refusal(subject: &str, reason: &str) -> String {
+    format!(
+        "p11scope: module refused: {} — {}",
+        render::escape_controls(subject),
+        render::escape_controls(reason)
     )
 }
 
@@ -11133,6 +11141,17 @@ mod tests {
         assert_eq!(
             message,
             r"p11scope: discovery skipped pid 4242: detail: \u{1b}[2Jevil\r"
+        );
+        assert!(!message.contains('\u{1b}') && !message.contains('\r'));
+    }
+
+    #[test]
+    fn module_refusal_diagnostics_escape_target_controls() {
+        let message =
+            format_module_refusal("/opt/p\u{1b}[2Jevil\r.so", "capacity: \u{1b}[31mboom\r");
+        assert_eq!(
+            message,
+            r"p11scope: module refused: /opt/p\u{1b}[2Jevil\r.so — capacity: \u{1b}[31mboom\r"
         );
         assert!(!message.contains('\u{1b}') && !message.contains('\r'));
     }

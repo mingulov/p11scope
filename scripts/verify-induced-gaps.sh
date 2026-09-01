@@ -835,6 +835,9 @@ freeze_policy_maps() {
     set -- $(sudo cat "$WORK/freeze-policy-map-ids")
     sudo "$WORK/freeze-policy-maps" "$workload_pid" "$cgroup_path" \
         "$@"
+    # Written root-owned under sudo; the unprivileged receipt finalizer must be
+    # able to chmod every retained file, so hand it back to the caller.
+    reclaim_root_output "$WORK/freeze-policy-map-ids"
 }
 
 write_freeze_policy_maps_source "$WORK/freeze-policy-maps.c"
@@ -907,9 +910,9 @@ assert_dynamic_maps_advanced "$WORK/mapdump_manifest_freeze-before.json" \
 signal_verified_root_process INT "$OBSERVER_PID" "$OBSERVER_STARTTIME"
 if wait "$SPID"; then SPID=; OBSERVER_PID=; OBSERVER_STARTTIME=; else status=$?; SPID=; OBSERVER_PID=; OBSERVER_STARTTIME=; echo "freeze observer failed: $status"; exit "$status"; fi
 resume_and_wait_workload freeze
-reclaim_root_output "$WORK/freeze-observed.json"
+reclaim_root_output "$WORK/freeze-observed.json" "$WORK/freeze-observer.pid"
 test -s "$WORK/freeze-observed.json" || { echo "freeze observer produced no output"; exit 1; }
-python3 scripts/check-capture-evidence.py canary freeze-unsafe-profile \
+python3 scripts/check-capture-evidence.py canary feature-unsafe-profile \
     "$WORK/freeze-observed.json"
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); n=sum(f["calls"] for f in d["functions"]); assert n == 27, n' \
     "$WORK/freeze-observed.json"

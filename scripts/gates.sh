@@ -15,10 +15,14 @@ python3 scripts/check-live-discovery-evidence.py --self-test
 # The inspect/doctor lane is unprivileged and takes seconds, so it runs first:
 # if the CLI cannot even read a target, nothing below is worth waiting for.
 for gate in scripts/verify-inspect-doctor.sh scripts/verify-attach-e2e.sh \
-    scripts/verify-induced-gaps.sh scripts/verify-canaries.sh; do
+    scripts/verify-canaries.sh; do
     echo "=== $gate ==="
     "$gate"
 done
+# The induced-gaps driver takes a Task 4 receipt contract argument, not a bare
+# call: an absent evidence root whose parent is private (0700) to the caller.
+echo "=== scripts/verify-induced-gaps.sh ==="
+scripts/verify-induced-gaps.sh "$(mktemp -d "${TMPDIR:-/tmp}/p11scope-gates-XXXXXX")/induced-gaps"
 echo "=== scripts/verify-capability-tier.sh ==="
 scripts/verify-capability-tier.sh
 echo "=== gates: ALL OK ==="

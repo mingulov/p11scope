@@ -2262,8 +2262,8 @@ fn scan_and_pin(
     // document claiming a clean capture.
     for skipped in outcome.skipped().iter().chain(&pin_skips) {
         eprintln!(
-            "p11scope: discovery skipped {} — {}",
-            skipped.subject, skipped.reason
+            "{}",
+            format_discovery_skip(&skipped.subject, &skipped.reason)
         );
         attribution::note(skipped);
         counters.object_skips.push(skipped.clone());
@@ -2770,6 +2770,21 @@ const UNREADABLE_MEMBER_SUBJECT: &str = "process view";
 const UNREADABLE_MEMBER_REASON: &str = "a process in scope could not be retained or scanned before it changed; a provider \
      only that generation mapped was never discovered";
 
+fn format_discovery_skip(subject: &str, reason: &str) -> String {
+    format!(
+        "p11scope: discovery skipped {} — {}",
+        render::escape_controls(subject),
+        render::escape_controls(reason)
+    )
+}
+
+fn format_unreadable_member(pid: u32, detail: &str) -> String {
+    format!(
+        "p11scope: discovery skipped pid {pid}: {}",
+        render::escape_controls(detail)
+    )
+}
+
 /// One member of the scope discovery could not read. `None` when the
 /// generation is *provably* gone — the ordinary end of a process, on the same
 /// authority `queue_retirement` and the live-record rule already use, and
@@ -2779,7 +2794,7 @@ fn unreadable_member_skip(pid: u32, gone: bool, detail: &str) -> Option<Skipped>
     if gone {
         return None;
     }
-    eprintln!("p11scope: discovery skipped pid {pid}: {detail}");
+    eprintln!("{}", format_unreadable_member(pid, detail));
     Some(Skipped {
         subject: UNREADABLE_MEMBER_SUBJECT.into(),
         reason: UNREADABLE_MEMBER_REASON.into(),
@@ -11099,6 +11114,27 @@ mod tests {
             unreadable_member_skip(11, true, "scripted, proven gone").is_none(),
             "a generation that is provably gone is the ordinary end of a process"
         );
+    }
+
+    #[test]
+    fn scan_pin_diagnostics_escape_target_controls() {
+        let message =
+            format_discovery_skip("/opt/p\u{1b}[2Jevil\r.so", "scan failed: \u{1b}[31mboom\r");
+        assert_eq!(
+            message,
+            r"p11scope: discovery skipped /opt/p\u{1b}[2Jevil\r.so — scan failed: \u{1b}[31mboom\r"
+        );
+        assert!(!message.contains('\u{1b}') && !message.contains('\r'));
+    }
+
+    #[test]
+    fn unreadable_member_diagnostics_escape_target_controls() {
+        let message = format_unreadable_member(4242, "detail: \u{1b}[2Jevil\r");
+        assert_eq!(
+            message,
+            r"p11scope: discovery skipped pid 4242: detail: \u{1b}[2Jevil\r"
+        );
+        assert!(!message.contains('\u{1b}') && !message.contains('\r'));
     }
 
     /// Task 9.2-fix5 item B, first half. The same `exec` transition, one step

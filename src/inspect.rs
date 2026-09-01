@@ -65,13 +65,22 @@ pub fn render_text(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> S
     }
 
     for skipped in outcome.skipped() {
-        let _ = writeln!(out, "skipped: {} — {}", skipped.subject, skipped.reason);
+        let _ = writeln!(
+            out,
+            "skipped: {} — {}",
+            crate::render::escape_controls(&skipped.subject),
+            crate::render::escape_controls(&skipped.reason)
+        );
     }
     out
 }
 
 fn render_module(out: &mut String, module: &ScannedModule, pinned: &PinnedObjects) {
-    let _ = writeln!(out, "module  {}", module.path);
+    let _ = writeln!(
+        out,
+        "module  {}",
+        crate::render::escape_controls(&module.path)
+    );
 
     let pin = pinned.pinned().find(|p| p.key == module.key);
     let sha256 = pin.map_or("-", |p| p.sha256);
@@ -140,7 +149,7 @@ fn render_module(out: &mut String, module: &ScannedModule, pinned: &PinnedObject
     if !others.is_empty() {
         let parts: Vec<String> = others
             .iter()
-            .map(|(path, count)| format!("{path} ({count})"))
+            .map(|(path, count)| format!("{} ({count})", crate::render::escape_controls(path)))
             .collect();
         let _ = writeln!(out, "  entries in other objects: {}", parts.join(", "));
     }
@@ -462,6 +471,33 @@ mod tests {
         assert!(
             !out.contains("quote\"\\\n"),
             "raw controls reached text output: {out:?}"
+        );
+    }
+
+    #[test]
+    fn text_escapes_module_path_controls_while_json_preserves_them() {
+        const HOSTILE: &str = "/opt/p\u{1b}[2Jevil\r.so";
+        let mut outcome = sample();
+        let ScanOutcome::Scanned { modules, .. } = &mut outcome else {
+            unreachable!()
+        };
+        modules[0].path = HOSTILE.into();
+
+        let text = render_text(4242, &outcome, &PinnedObjects::empty());
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\r'),
+            "raw controls reached text: {text:?}"
+        );
+        assert!(text.contains(r"\u{1b}[2Jevil\r"), "{text:?}");
+
+        let json = render_json(4242, &outcome, &PinnedObjects::empty());
+        assert_eq!(
+            json["modules"][0]["path"], HOSTILE,
+            "JSON keeps original bytes"
+        );
+        assert!(
+            serde_json::to_string(&json).unwrap().contains(r"\u001b"),
+            "serde escapes on the wire"
         );
     }
 

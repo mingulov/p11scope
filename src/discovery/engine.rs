@@ -11296,6 +11296,7 @@ mod tests {
             metrics: false,
             duration: None,
             out: None,
+            max_events: None,
             unsafe_requested: false,
         };
         let scope = Scope::Cgroup {
@@ -16887,7 +16888,7 @@ int main(int argc, char **argv) {
             ..profile_capture
         };
         let metrics = render::json(&[], &evidence, &metrics_capture);
-        let trace = trace::evidence_line(&evidence, CapturePolicy::Allowlisted);
+        let trace = trace::evidence_line(&evidence, CapturePolicy::Allowlisted, false);
 
         for rendered in [
             serde_json::to_string(&profile).unwrap(),

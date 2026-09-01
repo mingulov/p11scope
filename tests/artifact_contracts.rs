@@ -6025,6 +6025,38 @@ fn every_gate_script_self_tests_its_own_validator() {
         ),
         "the live capability-tier validator is not labelled at the root gate boundary"
     );
+    // The induced-gaps driver mirrors the capability-tier idiom: one labelled
+    // standalone live call carrying its Task 4 receipt-contract argument (an
+    // absent path under a fresh private mktemp -d root), never the generic loop.
+    let induced_live_call = r#"scripts/verify-induced-gaps.sh "$(mktemp -d "${TMPDIR:-/tmp}/p11scope-gates-XXXXXX")/induced-gaps""#;
+    assert_eq!(
+        gates
+            .lines()
+            .filter(|line| *line == induced_live_call)
+            .count(),
+        1,
+        "the induced-gaps driver must have exactly one standalone live call with its \
+         mktemp-rooted absent-path argument"
+    );
+    assert_eq!(
+        live_section
+            .lines()
+            .filter(|line| *line == induced_live_call)
+            .count(),
+        1,
+        "the standalone live induced-gaps call must follow the live gate loop"
+    );
+    assert!(
+        !live_gate_loop.contains("scripts/verify-induced-gaps.sh"),
+        "the induced-gaps driver must not be added to the generic live gate loop"
+    );
+    assert!(
+        live_section.contains(concat!(
+            "echo \"=== scripts/verify-induced-gaps.sh ===\"\n",
+            r#"scripts/verify-induced-gaps.sh "$(mktemp -d "#
+        )),
+        "the live induced-gaps driver is not labelled at the root gate boundary"
+    );
     assert!(
         ci.contains("python3 scripts/check-live-discovery-evidence.py --self-test"),
         "the frozen evidence validator self-test is not wired into CI"

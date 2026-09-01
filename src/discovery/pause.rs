@@ -4926,6 +4926,30 @@ mod tests {
         assert_eq!(engine.loader_context_state_for_test(owner), None);
     }
 
+    /// csf_ce5962b revert guard. The deadline a held pause hands to
+    /// `SessionPauseIo::apply_batch` must be installed into the Engine's
+    /// capture work budget by `apply_discovery_batch_with`; silently dropping
+    /// that forward re-ships unbounded scan work while the target is frozen.
+    #[test]
+    fn the_held_pause_deadline_reaches_the_engine_budget_through_the_real_adapter() {
+        let child = OwnedChild::spawn("/bin/true".into(), Vec::new()).unwrap();
+        let (mut engine, _owner) = Engine::retiring_loader_context(child.pid());
+        let mut session = ScriptedSession::with_records([], 16);
+        session.detach_exports = vec![terminal_export()];
+        let mut terminal_batch = None;
+
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), Some(u64::MAX), true, false, &mut terminal_batch)
+                .expect("an empty drain under a far-future deadline applies")
+        });
+
+        assert_eq!(
+            engine.installed_budget_deadline_for_test(),
+            Some(u64::MAX),
+            "the held-pause deadline was not forwarded into the engine's work budget"
+        );
+    }
+
     #[test]
     fn round7_adopted_incomplete_batch_collects_to_empty_before_dispatch() {
         let child = OwnedChild::spawn("/bin/true".into(), Vec::new()).unwrap();

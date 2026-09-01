@@ -176,12 +176,16 @@ fn collect_proc_fd_snapshot(path: &std::path::Path) -> io::Result<(RawFd, Vec<Ra
             }
             break;
         }
-        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if name.to_bytes().iter().all(u8::is_ascii_digit) {
-            if let Ok(fd) = name.to_string_lossy().parse::<RawFd>() {
-                if fd > 2 {
-                    fds.push(fd);
-                }
+        let name = unsafe { std::ffi::CStr::from_ptr(std::ptr::addr_of!((*entry).d_name).cast()) };
+        if !name.to_bytes().is_empty() && name.to_bytes().iter().all(u8::is_ascii_digit) {
+            let fd = name.to_string_lossy().parse::<RawFd>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid numeric fd directory entry",
+                )
+            })?;
+            if fd > 2 {
+                fds.push(fd);
             }
         }
     }
@@ -457,17 +461,33 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::close_inherited_descriptors_with;
+    use super::{close_inherited_descriptors_with, collect_proc_fd_snapshot};
     use std::io::{Error, ErrorKind};
     use std::os::fd::IntoRawFd as _;
 
     #[test]
+    fn overflowing_fd_name_fails_snapshot() {
+        let directory =
+            std::env::temp_dir().join(format!("fd-snapshot-overflow-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let overflow = directory.join("999999999999999999999999999999999999");
+        std::fs::write(&overflow, b"not an fd").unwrap();
+        let error = collect_proc_fd_snapshot(&directory).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn close_range_failure_uses_verified_proc_fallback() {
         let planted = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
+        let enumeration_fd = 1_000_000;
         let result = close_inherited_descriptors_with(
             || Err(Error::from_raw_os_error(libc::EPERM)),
-            || Ok((planted, vec![planted])),
+            || Ok((enumeration_fd, vec![planted, enumeration_fd])),
             |fd| {
+                if fd == enumeration_fd {
+                    return Err(Error::from_raw_os_error(libc::EBADF));
+                }
                 if unsafe { libc::close(fd) } == 0 {
                     Ok(())
                 } else {
@@ -481,8 +501,8 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_proc_fallback_fails_closed_before_provider_load() {
-        let provider_loaded = std::cell::Cell::new(false);
+    fn unreadable_proc_fallback_fails_closed_without_closing_any_fd() {
+        let close_calls = std::cell::Cell::new(0);
         let result = close_inherited_descriptors_with(
             || Err(Error::from_raw_os_error(libc::EPERM)),
             || {
@@ -492,14 +512,29 @@ mod tests {
                 ))
             },
             |_| {
-                provider_loaded.set(true);
+                close_calls.set(close_calls.get() + 1);
                 Ok(())
             },
         );
         assert_eq!(result.unwrap_err().kind(), ErrorKind::PermissionDenied);
-        assert!(
-            !provider_loaded.get(),
-            "provider load followed a closure failure"
+        assert_eq!(close_calls.get(), 0);
+    }
+
+    #[test]
+    fn non_enumeration_ebadf_fails_closed() {
+        let planted = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
+        let enumeration_fd = 1_000_000;
+        let result = close_inherited_descriptors_with(
+            || Err(Error::from_raw_os_error(libc::EPERM)),
+            || Ok((enumeration_fd, vec![planted, enumeration_fd])),
+            |fd| {
+                if fd == planted {
+                    Err(Error::from_raw_os_error(libc::EBADF))
+                } else {
+                    Ok(())
+                }
+            },
         );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EBADF));
     }
 }

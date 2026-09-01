@@ -63,11 +63,12 @@ transfer.
 | `productization/slice1b2-finish` | `5a7c9a7cfd24c8b938866d12e78089935000a9d3` | Exact GREEN6 pair plus separately unaccepted artifact-contract/contracts/report WIP. GREEN6 and prerequisites are integrated; the remaining snapshot is preserved only. |
 | `research/raw-tracepoint-lifecycle` | `5e027743c01072b47ac5bb0bf7ebdfe4767c8428` | `DONE_WITH_CONCERNS`; verifier, masked-tracefs, capability-parity, and cross-kernel runtime remain UNRUN. Post-v1 unless promoted separately. |
 
-Stage 3A3 acceptance is scoped to the exact GREEN6 pair. Its local evidence is
-under
-`.claude/worktrees/slice1b2-finish/.superpowers/sdd/2026-08-27-task4-receipt-closure/`;
-the final report and independent review are
-`stage3a3-green6-report.md` and `stage3a3-green6-final-review.md`.
+Stage 3A3 acceptance is scoped to the exact GREEN6 pair. Its durable local
+evidence is preserved privately at
+`p11scope-ws/preserved/sdd/2026-08-27-task4-receipt-closure/`; no public SDD
+copy exists. The portable package holds only the approved three-file
+`stage3a3/` subset: `stage3a3-green6-report.md`,
+`stage3a3-green6-final-review.md`, and `progress.md`.
 
 ## Kernel runtime evidence
 

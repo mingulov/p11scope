@@ -2939,7 +2939,7 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         "freeze-missing-rejected",
         "freeze-duplicate-rejected",
         "freeze-inventory-mutation-rejected",
-        "g1-160-93-186-exact-accepted",
+        "g1-161-93-186-exact-accepted",
         "g1-missing-rejected",
         "g1-duplicate-rejected",
         "g1-cardinality-mutation-rejected",

@@ -913,7 +913,7 @@ fn task7_tripwire_bin() -> tempfile::TempDir {
 /// refused build input cleared and only `inherited` restored.
 fn task7_run_preflight(
     repo: &tempfile::TempDir,
-    home: &std::path::Path,
+    home: Option<&std::path::Path>,
     bin: &tempfile::TempDir,
     tripwire: &std::path::Path,
     root: &std::path::Path,
@@ -924,8 +924,11 @@ fn task7_run_preflight(
         .arg(repo.path().join("scripts/build-release.sh"))
         .arg(root)
         .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
-        .env("HOME", home)
         .env("P11SCOPE_TASK4_TRIPWIRE_LOG", tripwire);
+    match home {
+        Some(home) => command.env("HOME", home),
+        None => command.env_remove("HOME"),
+    };
     for name in TASK7_BUILD_INPUT_VARIABLES {
         command.env_remove(name);
     }
@@ -964,7 +967,7 @@ fn release_preflight_refuses_an_untracked_cargo_config_before_the_body() {
     let tripwire = campaign.path().join("tripwire.log");
     let output = task7_run_preflight(
         &repo,
-        home.path(),
+        Some(home.path()),
         &bin,
         &tripwire,
         &campaign.path().join("evidence"),
@@ -1013,7 +1016,7 @@ fn release_preflight_refuses_every_inherited_build_input_variable() {
         let tripwire = campaign.path().join(format!("tripwire-{index}.log"));
         let output = task7_run_preflight(
             &repo,
-            home.path(),
+            Some(home.path()),
             &bin,
             &tripwire,
             &campaign.path().join(format!("evidence-{index}")),
@@ -1040,6 +1043,109 @@ fn release_preflight_refuses_every_inherited_build_input_variable() {
             fs::read_to_string(&tripwire).unwrap_or_default()
         );
     }
+}
+
+#[test]
+fn release_preflight_refuses_an_unevaluable_cargo_home() {
+    // Without HOME the preflight cannot name the effective cargo home, while
+    // Cargo can still reach one through the passwd database. Checking
+    // `/.cargo` instead would vouch for a location Cargo never reads.
+    let repo = task7_pristine_driver_repo();
+    let bin = task7_tripwire_bin();
+    let campaign = task7_campaign();
+    let tripwire = campaign.path().join("tripwire.log");
+    let output = task7_run_preflight(
+        &repo,
+        None,
+        &bin,
+        &tripwire,
+        &campaign.path().join("evidence"),
+        &[],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(77),
+        "an unevaluable cargo home must refuse with 77: stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("cannot evaluate the effective cargo home"),
+        "refusal must name the unevaluable cargo home: stderr={stderr:?}"
+    );
+    assert!(
+        !tripwire.exists(),
+        "unevaluable cargo home reached a build command: {:?}",
+        fs::read_to_string(&tripwire).unwrap_or_default()
+    );
+}
+
+#[test]
+fn release_finalizer_rechecks_cargo_configs_with_pinned_tools() {
+    let release = read("scripts/build-release.sh");
+    let finalize = between(&release, "\ntask4_finalize() {", "\ntask4_receipt_run() {");
+
+    // The finalizer writes the terminal receipt. A PATH-priority shadow
+    // dropped mid-run must never be the binary that decides, or writes, it --
+    // it runs even once the ledger recheck has already failed the run.
+    assert!(
+        finalize.contains("\"$T4_TOOL_python3\" - \"$TASK4_ROOT\""),
+        "finalizer validates the evidence root through an unpinned interpreter"
+    );
+    for tool in [
+        "cargo",
+        "docker",
+        "file",
+        "jq",
+        "python3",
+        "rustup",
+        "setpriv",
+        "sudo",
+        "sha256sum",
+    ] {
+        for indent in ["\n    ", "\n        "] {
+            assert!(
+                !finalize.contains(&format!("{indent}{tool} ")),
+                "task4_finalize invokes bare {tool} instead of its pinned path"
+            );
+        }
+    }
+
+    // Out-of-repo cargo configs are a TOCTOU: the body is long and the
+    // effective cargo home stays writable throughout it. A `[build]`
+    // rustc-wrapper or a target linker planted there is honoured by the
+    // pinned cargo and overridden by none of the command-local values, so
+    // the scan has to run again before the receipt is published.
+    assert!(
+        finalize.contains("task4_cargo_config_scan"),
+        "finalizer never re-scans for cargo configs planted during the body"
+    );
+    assert!(
+        !release.contains("task4_refuse_cargo_config"),
+        "cargo-config check still exits from inside its helper, so finalization cannot reuse it"
+    );
+    assert_eq!(
+        release.matches("task4_cargo_config_scan").count(),
+        3,
+        "cargo-config scan must be one definition with a preflight and a finalization call site"
+    );
+}
+
+#[test]
+fn release_preflight_pins_its_tools_before_the_first_digest() {
+    // Every recorded digest must come from the pinned sha256sum, including
+    // the driver/checker hashes and the source input ledger.
+    let release = read("scripts/build-release.sh");
+    let pinned = release
+        .find("task4_pin_tool \"$t4_found\" \"T4_TOOL_$t4_tool\"")
+        .expect("preflight pins the nine recorded tools");
+    let first_digest = release
+        .find("TASK4_DRIVER_HASH=$(task4_digest")
+        .expect("preflight digests the driver");
+    assert!(
+        pinned < first_digest,
+        "the first digest runs before the tool-pinning loop, so it resolves sha256sum through PATH"
+    );
 }
 
 #[test]

@@ -1949,14 +1949,16 @@ mod tests {
 
     #[test]
     fn bounded_decode_omissions_render_finite_partial_evidence() {
-        use crate::discovery::scan::Skipped;
+        use crate::discovery::scan::{Skipped, WORK_CEILING_REASON};
 
-        for reason in [
+        let mut reasons = vec![
             "capture table decode ceiling reached (512 candidates, 53248 entries); remaining \
              table data was not decoded",
             "capture interface decode ceiling reached (512 records); remaining interface data \
              was not decoded",
-        ] {
+        ];
+        reasons.push(WORK_CEILING_REASON);
+        for reason in reasons {
             let mut ev = evidence();
             ev.skipped = vec![capture_skipped_out(&Skipped {
                 subject: "/private/provider.so".into(),

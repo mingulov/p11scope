@@ -2080,6 +2080,7 @@ impl PauseIo for SessionPauseIo<'_> {
             additions_allowed,
             terminal_dispatch,
             &mut collect,
+            deadline,
         ) {
             Ok(outcome) => {
                 self.plan_changed |= outcome.changed;

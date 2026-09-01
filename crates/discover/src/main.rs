@@ -158,41 +158,48 @@ fn collect_proc_fd_snapshot(path: &std::path::Path) -> io::Result<(RawFd, Vec<Ra
     if directory.is_null() {
         return Err(io::Error::last_os_error());
     }
-    let enumeration_fd = unsafe { libc::dirfd(directory) };
-    if enumeration_fd < 0 {
-        let error = io::Error::last_os_error();
-        unsafe { libc::closedir(directory) };
-        return Err(error);
-    }
-    let mut fds = Vec::new();
-    loop {
-        unsafe { *libc::__errno_location() = 0 };
-        let entry = unsafe { libc::readdir(directory) };
-        if entry.is_null() {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error().is_some_and(|errno| errno != 0) {
-                unsafe { libc::closedir(directory) };
-                return Err(error);
-            }
-            break;
+    let collection = (|| -> io::Result<(RawFd, Vec<RawFd>)> {
+        let enumeration_fd = unsafe { libc::dirfd(directory) };
+        if enumeration_fd < 0 {
+            return Err(io::Error::last_os_error());
         }
-        let name = unsafe { std::ffi::CStr::from_ptr(std::ptr::addr_of!((*entry).d_name).cast()) };
-        if !name.to_bytes().is_empty() && name.to_bytes().iter().all(u8::is_ascii_digit) {
-            let fd = name.to_string_lossy().parse::<RawFd>().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid numeric fd directory entry",
-                )
-            })?;
-            if fd > 2 {
-                fds.push(fd);
+        let mut fds = Vec::new();
+        loop {
+            unsafe { *libc::__errno_location() = 0 };
+            let entry = unsafe { libc::readdir(directory) };
+            if entry.is_null() {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error().is_some_and(|errno| errno != 0) {
+                    return Err(error);
+                }
+                break;
+            }
+            let name =
+                unsafe { std::ffi::CStr::from_ptr(std::ptr::addr_of!((*entry).d_name).cast()) };
+            if !name.to_bytes().is_empty() && name.to_bytes().iter().all(u8::is_ascii_digit) {
+                let fd = name.to_string_lossy().parse::<RawFd>().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid numeric fd directory entry",
+                    )
+                })?;
+                if fd > 2 {
+                    fds.push(fd);
+                }
             }
         }
+        Ok((enumeration_fd, fds))
+    })();
+    let close = if unsafe { libc::closedir(directory) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    };
+    match (collection, close) {
+        (Ok(snapshot), Ok(())) => Ok(snapshot),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
     }
-    if unsafe { libc::closedir(directory) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok((enumeration_fd, fds))
 }
 
 fn close_inherited_descriptors_with<R, S, C>(
@@ -474,6 +481,12 @@ mod tests {
         std::fs::write(&overflow, b"not an fd").unwrap();
         let error = collect_proc_fd_snapshot(&directory).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidData);
+        let leaked = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .any(|target| target == directory);
+        assert!(!leaked, "snapshot directory descriptor leaked");
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -522,13 +535,13 @@ mod tests {
 
     #[test]
     fn non_enumeration_ebadf_fails_closed() {
-        let planted = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
-        let enumeration_fd = 1_000_000;
+        let data_fd = 1_000_000;
+        let enumeration_fd = 2_000_000;
         let result = close_inherited_descriptors_with(
             || Err(Error::from_raw_os_error(libc::EPERM)),
-            || Ok((enumeration_fd, vec![planted, enumeration_fd])),
+            || Ok((enumeration_fd, vec![data_fd, enumeration_fd])),
             |fd| {
-                if fd == planted {
+                if fd == data_fd {
                     Err(Error::from_raw_os_error(libc::EBADF))
                 } else {
                     Ok(())

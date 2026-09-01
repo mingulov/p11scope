@@ -454,7 +454,7 @@ task4_receipt_run() {
     # lanes plus the static smoke), so a planted decoy refuses instead of
     # being silently ranked. checker.log is the framed checker record from
     # release_body, never the whole-body stdout.
-    t4_observed=$(find "$TASK4_ROOT/work" -type f -name '*observed*.json' -print | sort)
+    t4_observed=$(find "$TASK4_ROOT/work" -type f -name '*observed*.json' -print | LC_ALL=C sort)
     [ "$t4_observed" = "$(printf '%s\n' \
         "$TASK4_ROOT/work/observed-scan.json" \
         "$TASK4_ROOT/work/observed-static-smoke.json" \

@@ -461,7 +461,7 @@ The preflight is self-contained and exact: **A1** requires full `git status --po
 ### Task 11: Independent review → fix cycles (repeat until clean)
 
 - [ ] **Step 1:** Dispatch two independent Opus review agents over both repositories: (a) adversarial security/correctness review of the public `git diff main...hardening/findings-wave1` plus the private `p11scope-ws` custody diff, including each finding's root closure and all sibling callers; (b) test-quality + regression review of both diffs (tests fail without the fix, assertions are meaningful, no weakened existing test, no private data crossed the public boundary).
-- [ ] **Step 2:** Triage (Fable adjudicates — accept/reject each with reasoning). Fix every accepted finding TDD-style; rerun gates.
+- [ ] **Step 2:** Triage (Fable 5.1 adjudicates — accept/reject each with reasoning). Fix every accepted finding TDD-style; rerun gates.
 - [ ] **Step 3:** Repeat Step 1 with fresh agents until a full cycle reports zero accepted findings.
 - **Exit condition:** Task 11 is review-to-zero only. It performs no integration, packaging, or finishing workflow; those occur exactly once in Task 12 after the closeout is committed and reviewed.
 

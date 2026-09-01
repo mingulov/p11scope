@@ -666,7 +666,10 @@ generalization of how wave 1 was planned and reviewed on 2026-09-01.
    triage with reasoning; fix accepted findings TDD-style; repeat with fresh
    agents until a full cycle accepts zero findings.
 5. **Subagent policy:** Opus/Sonnet subagents liberally and in parallel for
-   research, briefs, implementation, review; depth over speed.
+   research, briefs, implementation, review; depth over speed. Reviews, deep
+   planning, adjudication, and security-critical writing run on Fable 5.1
+   (owner decision 2026-09-01); when Fable writes, the review pair adds an
+   Opus adversarial reviewer for model diversity.
 6. **Branch/commit:** one branch per wave (`hardening/<wave-name>`), one
    commit per task, merge to `main` only after review-to-zero; rerun gates on
    `main`. Never push.

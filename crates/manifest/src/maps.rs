@@ -196,6 +196,12 @@ impl<'a> MapIndex<'a> {
         Some(Self { entries })
     }
 
+    /// The validated snapshot behind this index. Live consumers iterate it
+    /// through the index they already built, never a second unvalidated slice.
+    pub fn entries(&self) -> &'a [MapEntry] {
+        self.entries
+    }
+
     pub fn containing(&self, vaddr: u64) -> Option<&'a MapEntry> {
         let index = self.entries.partition_point(|entry| entry.start <= vaddr);
         index

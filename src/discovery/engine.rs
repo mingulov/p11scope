@@ -16,7 +16,7 @@ use crate::discovery::identity::{
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::scan::{
     CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
-    ScannedTable, Skipped, read_maps_or_refuse, scan_process_view, spans_for,
+    ScannedTable, Skipped, index_maps_or_refuse, read_maps_or_refuse, scan_process_view, spans_for,
 };
 use crate::manifest_input::{read_manifest, validate_structure};
 use crate::process::{self, ProcessView, ProcessViewId};
@@ -32,7 +32,7 @@ use p11scope_ebpf_common::{
 };
 use p11scope_manifest::elf::ElfSnapshot;
 use p11scope_manifest::manifest::{Acquisition, Manifest, Resolution, SCHEMA, WalkOutcome};
-use p11scope_manifest::maps::{Device, MapEntry, MappedPath, ObjectKey, Resolved, resolve};
+use p11scope_manifest::maps::{Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved};
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
@@ -3708,7 +3708,7 @@ fn name_class(class: u8) -> &'static str {
 /// names remain private inputs to the candidate transaction.
 fn lower_export_record(
     view: &ProcessView,
-    maps: &[MapEntry],
+    maps: &MapIndex<'_>,
     hooks: &HookRegistry,
     record: &DiscoveryRecord,
     budget: &mut CaptureWorkBudget,
@@ -3732,13 +3732,14 @@ fn lower_export_record(
         return Err("process generation changed before export lowering".into());
     }
 
+    budget.spend(1)?;
     let Resolved::File {
         path: MappedPath::Usable(owner_path),
         device: owner_device,
         inode: owner_inode,
         permissions: owner_permissions,
         ..
-    } = resolve(maps, record.table_ptr)
+    } = maps.resolve(record.table_ptr)
     else {
         return Ok(None);
     };
@@ -3775,6 +3776,7 @@ fn lower_export_record(
             null_entries.push(field.name);
             continue;
         }
+        budget.spend(1)?;
         let Resolved::File {
             path: MappedPath::Usable(path),
             file_offset,
@@ -3782,7 +3784,7 @@ fn lower_export_record(
             inode,
             permissions,
             ..
-        } = resolve(maps, pointer)
+        } = maps.resolve(pointer)
         else {
             return Ok(None);
         };
@@ -3879,8 +3881,8 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
     }
 }
 
-fn usable_path(maps: &[MapEntry], mapping: &MapEntry) -> Option<PathBuf> {
-    match resolve(maps, mapping.start) {
+fn usable_path(maps: &MapIndex<'_>, mapping: &MapEntry) -> Option<PathBuf> {
+    match maps.resolve(mapping.start) {
         Resolved::File {
             path: MappedPath::Usable(path),
             inode,
@@ -3891,11 +3893,12 @@ fn usable_path(maps: &[MapEntry], mapping: &MapEntry) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-fn exact_executable_mapping(
-    maps: &[MapEntry],
+fn exact_executable_mapping<'a>(
+    maps: &MapIndex<'a>,
     identity: ObjectKey,
-) -> Option<(&MapEntry, PathBuf)> {
-    maps.iter()
+) -> Option<(&'a MapEntry, PathBuf)> {
+    maps.entries()
+        .iter()
         .filter(|mapping| mapping.permissions[2] == b'x' && ObjectKey::of(mapping) == identity)
         .find_map(|mapping| usable_path(maps, mapping).map(|path| (mapping, path)))
 }
@@ -4032,14 +4035,21 @@ fn read_bounded_interpreter(
 }
 
 fn executable_map_snapshot(
-    maps: &[MapEntry],
+    maps: &MapIndex<'_>,
     identity: ObjectKey,
+    budget: &mut CaptureWorkBudget,
 ) -> std::result::Result<Vec<(MapEntry, PathBuf)>, String> {
-    let mappings: Vec<_> = maps
-        .iter()
-        .filter(|mapping| mapping.permissions[2] == b'x' && ObjectKey::of(mapping) == identity)
-        .filter_map(|mapping| usable_path(maps, mapping).map(|path| (mapping.clone(), path)))
-        .collect();
+    let mut mappings = Vec::new();
+    for mapping in maps.entries() {
+        budget.spend(1)?;
+        if mapping.permissions[2] != b'x' || ObjectKey::of(mapping) != identity {
+            continue;
+        }
+        budget.spend(1)?;
+        if let Some(path) = usable_path(maps, mapping) {
+            mappings.push((mapping.clone(), path));
+        }
+    }
     if mappings.is_empty() {
         return Err("retained executable has no usable executable mapping".into());
     }
@@ -4047,14 +4057,17 @@ fn executable_map_snapshot(
 }
 
 fn loader_map_snapshot(
-    maps: &[MapEntry],
+    maps: &MapIndex<'_>,
     identity: ObjectKey,
+    budget: &mut CaptureWorkBudget,
 ) -> std::result::Result<(PathBuf, Vec<MapEntry>), String> {
     let mut by_path: BTreeMap<PathBuf, Vec<MapEntry>> = BTreeMap::new();
-    for mapping in maps
-        .iter()
-        .filter(|mapping| mapping.permissions[2] == b'x' && ObjectKey::of(mapping) == identity)
-    {
+    for mapping in maps.entries() {
+        budget.spend(1)?;
+        if mapping.permissions[2] != b'x' || ObjectKey::of(mapping) != identity {
+            continue;
+        }
+        budget.spend(1)?;
         if let Some(path) = usable_path(maps, mapping) {
             by_path.entry(path).or_default().push(mapping.clone());
         }
@@ -4952,10 +4965,15 @@ impl Engine {
         if before_executable != retained_executable || retained_executable != after_executable {
             bail!("retained executable identity changed during PT_INTERP discovery");
         }
-        let before_executable_maps = executable_map_snapshot(&before_maps, retained_executable)
-            .map_err(anyhow::Error::msg)?;
-        let after_executable_maps = executable_map_snapshot(&after_maps, retained_executable)
-            .map_err(anyhow::Error::msg)?;
+        let before_index =
+            index_maps_or_refuse(&before_maps, budget).map_err(anyhow::Error::msg)?;
+        let after_index = index_maps_or_refuse(&after_maps, budget).map_err(anyhow::Error::msg)?;
+        let before_executable_maps =
+            executable_map_snapshot(&before_index, retained_executable, budget)
+                .map_err(anyhow::Error::msg)?;
+        let after_executable_maps =
+            executable_map_snapshot(&after_index, retained_executable, budget)
+                .map_err(anyhow::Error::msg)?;
         if before_executable_maps != after_executable_maps {
             bail!("retained executable mappings changed during PT_INTERP discovery");
         }
@@ -4965,9 +4983,9 @@ impl Engine {
         let (interpreter_file, loader_key) =
             interpreter_file.expect("a PT_INTERP snapshot has its retained file identity");
         let (before_loader_path, before_loader_maps) =
-            loader_map_snapshot(&before_maps, loader_key).map_err(anyhow::Error::msg)?;
+            loader_map_snapshot(&before_index, loader_key, budget).map_err(anyhow::Error::msg)?;
         let (loader_path, loader_maps) =
-            loader_map_snapshot(&after_maps, loader_key).map_err(anyhow::Error::msg)?;
+            loader_map_snapshot(&after_index, loader_key, budget).map_err(anyhow::Error::msg)?;
         if before_loader_path != loader_path || before_loader_maps != loader_maps {
             bail!("retained loader mappings changed during PT_INTERP discovery");
         }
@@ -5741,7 +5759,9 @@ impl Engine {
         let lowered = {
             let view = &self.views[position];
             let maps = Self::read_maps(view, &mut self.budget)?;
-            lower_export_record(view, &maps, &self.hooks, record, &mut self.budget)
+            let index =
+                index_maps_or_refuse(&maps, &mut self.budget).map_err(|error| anyhow!(error))?;
+            lower_export_record(view, &index, &self.hooks, record, &mut self.budget)
         };
         let Some(lowered) = lowered.map_err(|error| anyhow!(error))? else {
             self.mark_live_loss(
@@ -5829,11 +5849,11 @@ impl Engine {
         };
         let loader = context.spec.loader;
         let maps = Self::read_maps(&self.views[position], &mut self.budget)?;
+        let index =
+            index_maps_or_refuse(&maps, &mut self.budget).map_err(|error| anyhow!(error))?;
         let view_id = self.views[position].id();
-        let Some(mapping) = maps
-            .iter()
-            .find(|mapping| (mapping.start..mapping.end).contains(&record.table_ptr))
-        else {
+        self.budget.spend(1).map_err(|reason| anyhow!(reason))?;
+        let Some(mapping) = index.containing(record.table_ptr) else {
             // The same exec transition the identity check below already
             // excuses, one step earlier: replacing the whole image usually
             // leaves the hit's address resolving to *nothing*, not to a moved
@@ -9103,13 +9123,15 @@ mod tests {
         reconcile_scanned_modules,
     };
     use crate::discovery::loader::LoaderContextSpec;
-    use crate::discovery::scan::{ScanLimits, ScannedEntry, ScannedTable, scan_pid};
+    use crate::discovery::scan::{
+        ScanLimits, ScannedEntry, ScannedTable, WORK_CEILING_REASON, scan_pid,
+    };
     use crate::{semantics, trace};
     use p11scope_manifest::manifest::{
         Acquisition, AliasEntry, AliasGroup, FunctionRecord, InterfaceClassification,
         SurfaceRecord, SurfaceSource, Version, WalkOutcome,
     };
-    use p11scope_manifest::maps::parse_maps;
+    use p11scope_manifest::maps::{parse_maps, resolve};
     use std::cell::Cell;
     use std::io::Write as _;
     use std::path::PathBuf;
@@ -14375,7 +14397,8 @@ int main(int argc, char **argv) {
             },
         ];
 
-        let (mapping, path) = exact_executable_mapping(&maps, key).unwrap();
+        let index = MapIndex::new(&maps).unwrap();
+        let (mapping, path) = exact_executable_mapping(&index, key).unwrap();
         assert_eq!(mapping.start, 0x3000, "inode alone is not full identity");
         assert_eq!(path, mapped, "pin through the mapping's usable alias");
         assert_ne!(path, interpreter, "PT_INTERP spelling is not map authority");
@@ -14461,6 +14484,82 @@ int main(int argc, char **argv) {
         assert!(bounded_interpreter(&overflowing_interp).is_err());
     }
 
+    /// Task 11 fix round 3 (shadow finding 5). The live consumers used the
+    /// compatibility `maps::resolve(&[MapEntry], addr)`, which rebuilds — and
+    /// so revalidates, O(entries) — the whole index for every lookup: the
+    /// loader snapshot loops were quadratic in a target-controlled entry count
+    /// and none of it was charged. One validated index is now built per
+    /// accepted snapshot and every examined entry and lookup is charged, so
+    /// this exact unit arithmetic is what a regression to that wrapper breaks.
+    #[test]
+    fn one_charged_index_serves_every_live_lookup_in_one_snapshot() {
+        const WORK_CEILING: u64 = 16 * 1024 * 1024;
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 20,
+        };
+        // The shape a target creates to make a per-lookup index rebuild
+        // quadratic: many executable mappings of one identity and one path.
+        let entries: Vec<MapEntry> = (0..128u64)
+            .map(|index| MapEntry {
+                start: 0x700000 + index * 0x2000,
+                end: 0x700000 + index * 0x2000 + 0x1000,
+                file_offset: index * 0x1000,
+                permissions: if index % 2 == 0 { *b"r-xp" } else { *b"rw-p" },
+                device: key.device,
+                inode: if index % 2 == 0 { key.inode } else { 0 },
+                raw_path: (index % 2 == 0).then(|| b"/lib/ld.so".to_vec()),
+            })
+            .collect();
+        let matching = 64u64;
+
+        // One validation pass per snapshot, then one unit per entry examined
+        // and one per index lookup in each of the two snapshot loops.
+        let expected = entries.len() as u64 * 3 + matching * 2;
+        let snapshots = |budget: &mut CaptureWorkBudget| {
+            let index = index_maps_or_refuse(&entries, budget).expect("a kernel-ordered snapshot");
+            let executable =
+                executable_map_snapshot(&index, key, budget).expect("the executable mappings");
+            assert_eq!(executable.len() as u64, matching);
+            let (path, loader) =
+                loader_map_snapshot(&index, key, budget).expect("the loader mappings");
+            assert_eq!(path, PathBuf::from("/lib/ld.so"));
+            assert_eq!(loader.len() as u64, matching);
+        };
+
+        let mut budget = CaptureWorkBudget::default();
+        assert!(budget.charge(WORK_CEILING - expected));
+        snapshots(&mut budget);
+        assert!(
+            !budget.charge(1),
+            "one index and two charged passes cost exactly {expected} units"
+        );
+
+        let mut budget = CaptureWorkBudget::default();
+        assert!(budget.charge(WORK_CEILING - expected - 1));
+        snapshots(&mut budget);
+        assert!(budget.charge(1), "and never fewer");
+        assert!(!budget.charge(1));
+
+        // A stopped capture refuses the snapshot under its own reason, not as
+        // "no usable executable mapping".
+        let mut budget = CaptureWorkBudget::default();
+        assert!(!budget.charge(u64::MAX));
+        assert_eq!(
+            index_maps_or_refuse(&entries, &mut budget).unwrap_err(),
+            WORK_CEILING_REASON
+        );
+        let index = MapIndex::new(&entries).unwrap();
+        assert_eq!(
+            executable_map_snapshot(&index, key, &mut budget).unwrap_err(),
+            WORK_CEILING_REASON
+        );
+        assert_eq!(
+            loader_map_snapshot(&index, key, &mut budget).unwrap_err(),
+            WORK_CEILING_REASON
+        );
+    }
+
     #[test]
     fn loader_mapping_selection_is_path_qualified_and_offset_exact() {
         let key = ObjectKey {
@@ -14480,7 +14579,9 @@ int main(int argc, char **argv) {
             mapping(0x700000, 0, b"/lib/ld.so"),
             mapping(0x702000, 0x2000, b"/lib/ld.so"),
         ];
-        let (path, executable) = loader_map_snapshot(&maps, key).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let index = MapIndex::new(&maps).unwrap();
+        let (path, executable) = loader_map_snapshot(&index, key, &mut budget).unwrap();
         assert_eq!(path, PathBuf::from("/lib/ld.so"));
         assert_eq!(
             unique_mapping_for_offset(&executable, 0x2100).unwrap(),
@@ -14489,7 +14590,8 @@ int main(int argc, char **argv) {
 
         let mut collision = maps.clone();
         collision.push(mapping(0x800000, 0, b"/other/ld.so"));
-        assert!(loader_map_snapshot(&collision, key).is_err());
+        let collision_index = MapIndex::new(&collision).unwrap();
+        assert!(loader_map_snapshot(&collision_index, key, &mut budget).is_err());
         assert!(unique_mapping_for_offset(&executable, 0x5000).is_err());
     }
 
@@ -15477,7 +15579,6 @@ int main(int argc, char **argv) {
             DISCOVERY_KIND_FUNCTION_LIST_RETURN, DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN,
             DISCOVERY_STATUS_READ_FAILURE, DiscoveryRecord,
         };
-        use p11scope_manifest::maps::{MappedPath, Resolved, parse_maps, resolve};
 
         let view = ProcessView::open(ProcessViewId(41), std::process::id()).unwrap();
         let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
@@ -15524,7 +15625,8 @@ int main(int argc, char **argv) {
             total_bytes: u64::MAX,
         };
         let mut budget = CaptureWorkBudget::new(limits);
-        let lowered = lower_export_record(&view, &maps, &hooks, &record, &mut budget)
+        let index = MapIndex::new(&maps).expect("a kernel-ordered self snapshot");
+        let lowered = lower_export_record(&view, &index, &hooks, &record, &mut budget)
             .expect("the structurally valid record lowers")
             .expect("one usable pointer gives one table");
         assert_eq!(lowered.view, view.id());
@@ -15540,7 +15642,7 @@ int main(int argc, char **argv) {
         interface_record.interface_index = 3;
         interface_record.announced_count = 4;
         interface_record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
-        let interface = lower_export_record(&view, &maps, &hooks, &interface_record, &mut budget)
+        let interface = lower_export_record(&view, &index, &hooks, &interface_record, &mut budget)
             .unwrap()
             .unwrap();
         let mut merged = vec![lowered.clone()];
@@ -15550,12 +15652,12 @@ int main(int argc, char **argv) {
         let mut wrong_hook = record;
         wrong_hook.symbol_id = 2;
         assert!(
-            lower_export_record(&view, &maps, &hooks, &wrong_hook, &mut budget).is_err(),
+            lower_export_record(&view, &index, &hooks, &wrong_hook, &mut budget).is_err(),
             "the retained symbol ABI must agree with the record kind"
         );
         wrong_hook.symbol_id = u32::MAX;
         assert!(
-            lower_export_record(&view, &maps, &hooks, &wrong_hook, &mut budget).is_err(),
+            lower_export_record(&view, &index, &hooks, &wrong_hook, &mut budget).is_err(),
             "unknown private symbol IDs have no hook authority"
         );
 
@@ -15571,7 +15673,7 @@ int main(int argc, char **argv) {
         record.status_flags = DISCOVERY_STATUS_READ_FAILURE;
         record.usable_n = 0;
         assert!(
-            lower_export_record(&view, &maps, &hooks, &record, &mut budget)
+            lower_export_record(&view, &index, &hooks, &record, &mut budget)
                 .expect("the completed raw prefix is structurally valid")
                 .is_none(),
             "a read-failed completed prefix is not target authority"
@@ -15585,7 +15687,7 @@ int main(int argc, char **argv) {
             .expect("this process has an anonymous readable mapping")
             .start;
         assert!(
-            lower_export_record(&view, &maps, &hooks, &record, &mut budget)
+            lower_export_record(&view, &index, &hooks, &record, &mut budget)
                 .expect("an anonymous table owner is a count-only outcome")
                 .is_none(),
             "an anonymous mapping cannot own a live table"

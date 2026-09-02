@@ -180,7 +180,7 @@ impl CaptureWorkBudget {
         Some(reason)
     }
 
-    fn check_deadline_now(&mut self) -> Option<&'static str> {
+    pub(crate) fn check_deadline_now(&mut self) -> Option<&'static str> {
         if self.deadline_ns.is_some() {
             self.check_deadline(crate::attach::monotonic_ns())
         } else {
@@ -188,7 +188,26 @@ impl CaptureWorkBudget {
         }
     }
 
-    fn take_scan_stop_reason(&mut self) -> Option<&'static str> {
+    /// The capture's stop, sticky reason first and otherwise one clock poll:
+    /// the single question every live admission asks before doing more work.
+    pub(crate) fn stopped_now(&mut self) -> Option<&'static str> {
+        if let Some(reason) = self.scan_stop_reason {
+            return Some(reason);
+        }
+        self.check_deadline_now()
+    }
+
+    /// One charged step of live map work, refused under the budget's own stop
+    /// reason so a caller publishes what actually stopped it.
+    pub(crate) fn spend(&mut self, units: u64) -> Result<(), &'static str> {
+        if self.charge(units) {
+            Ok(())
+        } else {
+            Err(self.scan_stop_reason.unwrap_or(WORK_CEILING_REASON))
+        }
+    }
+
+    pub(crate) fn take_scan_stop_reason(&mut self) -> Option<&'static str> {
         let reason = self.scan_stop_reason?;
         if self.scan_stop_reported {
             None
@@ -1088,6 +1107,19 @@ pub(crate) fn read_maps_or_refuse<R: Read, F: FnMut() -> Option<u64>>(
     parse_maps(&bytes)
 }
 
+/// One validated `MapIndex` per accepted snapshot. The order/overlap validation
+/// is O(entries) and is charged once here, so every live consumer does charged
+/// O(log n) lookups against this index instead of rebuilding — and revalidating —
+/// one per lookup.
+pub(crate) fn index_maps_or_refuse<'a>(
+    maps: &'a [MapEntry],
+    budget: &mut CaptureWorkBudget,
+) -> Result<MapIndex<'a>, String> {
+    budget.spend(maps.len() as u64).map_err(String::from)?;
+    MapIndex::new(maps)
+        .ok_or_else(|| "reversed or overlapping /proc/<pid>/maps intervals".to_string())
+}
+
 pub fn scan_pid(
     request: &ScanRequest<'_>,
     budget: &mut CaptureWorkBudget,
@@ -1136,6 +1168,17 @@ pub fn scan_process_view(
         .into_iter()
         .map(|reason| scan_skip(&map_subject, reason.into()))
         .collect::<Vec<_>>();
+    // `parse_maps`, `MapIndex::new` and `candidate_groups` are each O(entries)
+    // on a snapshot the target sizes. Charge that preprocessing and answer the
+    // capture's stop here: a dense map cannot defer the first check past it,
+    // and a stop that arrived before this scan is published instead of
+    // breaking the group loop with no reason at all.
+    let scannable = budget.spend(maps.len() as u64).is_ok() && budget.stopped_now().is_none();
+    if !scannable {
+        if let Some(reason) = budget.take_scan_stop_reason() {
+            skipped.push(scan_skip("capture discovery", reason.into()));
+        }
+    }
     // `/proc/<pid>/mem` is gated by PTRACE_MODE_ATTACH and Yama; losing it costs the
     // tables, never the object inventory (spec §4.1 step 3). Only an access refusal is
     // a ptrace refusal — a pid that died mid-scan gets its own label.
@@ -1157,7 +1200,12 @@ pub fn scan_process_view(
         request.hints.iter().map(|h| hint_identity(h)).collect();
     let mut hint_matched = vec![false; request.hints.len()];
 
-    for (key, group) in candidate_groups(&maps) {
+    let groups = if scannable {
+        candidate_groups(&maps)
+    } else {
+        BTreeMap::new()
+    };
+    for (key, group) in groups {
         if budget.scan_stopped() {
             break;
         }
@@ -1403,6 +1451,67 @@ pub fn scan_process_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task 11 fix round 3 (shadow finding 5, scan branch). `parse_maps`,
+    /// `MapIndex::new` and `candidate_groups` are each O(entries) on a snapshot
+    /// the target sizes, and none of them charged or polled: a dense map could
+    /// defer the capture's first check until after all three, and a stop that
+    /// arrived before the scan broke the group loop with no published reason.
+    /// The preprocessing is now charged and answers the stop before the first
+    /// group, publishing exactly what stopped it.
+    #[test]
+    fn the_scan_charges_its_map_preprocessing_and_answers_the_stop_before_any_group() {
+        let pid = std::process::id();
+        let hooks = HookRegistry::builtin();
+        let request = ScanRequest {
+            pid,
+            hints: &[],
+            hooks: &hooks,
+        };
+
+        let mut budget = CaptureWorkBudget::default();
+        assert!(
+            !budget.charge(u64::MAX),
+            "the work ceiling refuses and sticks"
+        );
+        let outcome = scan_pid(&request, &mut budget).expect("a stopped capture still scans");
+        assert!(
+            outcome.modules().is_empty(),
+            "a stopped capture scans no group: {:?}",
+            outcome.modules().len()
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.subject == "capture discovery"
+                    && skip.reason == WORK_CEILING_REASON),
+            "the stop is published, never a silent break: {:?}",
+            outcome.skipped()
+        );
+
+        // The preprocessing itself is charged, one unit per snapshot entry: with
+        // fewer units left than this process has mappings, the scan stops right
+        // there. (The scan reads its own snapshot, so the allowance is one unit
+        // short of the count read here — a mapping added in between only makes
+        // the refusal more certain.)
+        let mut budget = CaptureWorkBudget::default();
+        let entries = parse_maps(&std::fs::read(format!("/proc/{pid}/maps")).unwrap())
+            .unwrap()
+            .len() as u64;
+        assert!(budget.charge(DEFAULT_WORK_CEILING - entries + 1));
+        let outcome = scan_pid(&request, &mut budget).expect("a scan of this process");
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.subject == "capture discovery"
+                    && skip.reason == WORK_CEILING_REASON),
+            "the map preprocessing spends the last units and stops here: {:?}",
+            outcome.skipped()
+        );
+        assert!(outcome.modules().is_empty());
+    }
 
     /// Task 9.2-fix5 item A. A process that has already exited cannot have its
     /// memory read and cannot read any more of anyone else's: `scan_unavailable`

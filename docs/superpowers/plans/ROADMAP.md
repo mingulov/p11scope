@@ -672,7 +672,7 @@ generalization of how wave 1 was planned and reviewed on 2026-09-01.
    Opus adversarial reviewer for model diversity.
 6. **Branch/commit:** one branch per wave (`hardening/<wave-name>`), one
    commit per task, merge to `main` only after review-to-zero; rerun gates on
-   `main`. Never push.
+   `main`. Never push, except the owner-approved W4 test/CI branch.
 7. **Honest evidence:** privileged/container lanes run only with owner
    approval; otherwise recorded UNRUN. Never claim an unrun lane.
 8. **Owner-gated (never do autonomously):** push/tag/publish, privileged or

@@ -638,11 +638,26 @@ founding rule).
 | W4 | Hosted CI running the full suite; "green locally, not in CI" dies | [charter](2026-09-01-release-wave-charters.md#w4) |
 | W7 | ia32 targets on x86-64 hosts | [charter](2026-09-01-release-wave-charters.md#w7) |
 | W5 | Container/K8s requalification (provisional; W8 re-runs on the final tip) + seccomp/SELinux artifacts | [charter](2026-09-01-release-wave-charters.md#w5) |
-| W6 | Multi-distro/kernel matrix; support restated "5.15.x, tested on ⟨list⟩"; load-only CI matrix | [charter](2026-09-01-release-wave-charters.md#w6) |
-| W8 | Release assembly: receipt, docs truth pass, final review-to-zero, ready-to-publish bundle | [charter](2026-09-01-release-wave-charters.md#w8) |
+| W6 | Multi-distro/kernel matrix; support restated "5.15.x, tested on ⟨list⟩"; load-only CI matrix; run the supported-rate/loss and fork-exec-loader-unload product oracles on 5.15 per-offset and a supported `uprobe_multi` kernel | [charter](2026-09-01-release-wave-charters.md#w6) |
+| W8 | Release assembly: receipt, docs truth pass, final review-to-zero, repeat both product oracles on the exact release tip, ready-to-publish bundle | [charter](2026-09-01-release-wave-charters.md#w8) |
 
 Publication (push, tag, release) is NOT a wave — it is an explicit owner
 decision after W8.
+
+The two product oracles are release gates, not inherited historical evidence:
+
+- `supported_rate_loss_oracle`: a fixed PKCS#11 burst must produce exact
+  profile/trace counts and zero loss at the declared supported rate; a
+  deliberately constrained ring must report exact nonzero loss and force
+  `PARTIAL`.
+- `fork_exec_loader_unload_oracle`: one adversarial lifecycle must cover
+  fork, exec, `dlopen`, calls, `dlclose`, pathname replacement/reload, terminal
+  drain, exact attachment retirement, and absence of stale attribution.
+
+W3 supplies their correctness primitives. W6 establishes the kernel/rate
+envelope, including the Linux 5.15 per-offset path. W8 repeats both on the
+exact release candidate; `UNRUN` is honest evidence but cannot establish
+publication readiness.
 
 ### Agent execution protocol (all waves)
 

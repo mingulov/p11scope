@@ -216,21 +216,21 @@ The 2026-09-02 independent Task-3 pre-mortem adds these execution invariants:
 - Aggregate policy creates no selection binding, tuple, coverage debt, or
   selection loss.
 
-- [ ] RED first: `c_get_interface_selection_never_mutates_inventory` proves
+- [x] RED first: `c_get_interface_selection_never_mutates_inventory` proves
   kind 4 changes no caller-independent surface, interface, alias group,
   `fork_safe`, or inventory table.
-- [ ] GREEN: reject kind 4 from `lower_export_record`; add a dedicated reducer
+- [x] GREEN: reject kind 4 from `lower_export_record`; add a dedicated reducer
   with capture-lifetime unique binding IDs, exact provider attribution, bounded
   tuples, factual match retention, `InventorySurfaceKey`, and the
   order-independent standard-export reducer. Agreement is proven equality of
   readable finite fields, never inferred for null or unreadable fields.
-- [ ] RED: `selection_binding_ids_never_reuse` pins a capture-local
+- [x] RED: `selection_binding_ids_never_reuse` pins a capture-local
   checked monotonic `u64` allocator: zero is invalid, `u64::MAX` is allocated
   once, the next allocation is refused/`PARTIAL`, retirement removes the active
   lookup, and a delayed record cannot resolve to a later binding.
-- [ ] GREEN: use one capture-local checked counter plus the existing active
+- [x] GREEN: use one capture-local checked counter plus the existing active
   binding map; no retained-id registry or allocator abstraction is needed.
-- [ ] RED: `selection_bindings_reuse_existing_physical_attachments` proves
+- [x] RED: `selection_bindings_reuse_existing_physical_attachments` proves
   refresh does not reattach or recount an existing binding and
   `selection_postcheck_failure_retains_attached_binding` proves rollback or
   retirement still owns every link created before a generation postcheck.
@@ -530,6 +530,13 @@ Commit: `feat: attach initial probe sets with uprobe_multi`
 - [ ] Run the four canonical gates on the exact branch tip and record counts.
 - [ ] Record privileged/container/VM rows as PASS, FAIL, or `UNRUN`; never
   inherit W1/W2 evidence.
+- [ ] Record the two post-W3 product-qualification rows in the closure report:
+  `supported_rate_loss_oracle` (fixed burst, exact counts, zero loss at the
+  declared supported rate, induced loss forces `PARTIAL`) and
+  `fork_exec_loader_unload_oracle` (fork, exec, `dlopen`, calls, `dlclose`,
+  replacement/reload, exact retirement and attribution). These privileged
+  runtime rows may be `UNRUN` at W3 closeout, but both must PASS on the exact
+  release candidate before publication readiness.
 - [ ] Independent full-diff Sol correctness/security review and Luna
   test-quality/regression review. Add a third distinct reviewer only for a
   genuinely separate risk. Triage with source evidence; batch accepted fixes

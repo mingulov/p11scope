@@ -155,10 +155,15 @@ status is:
 A module with a custom interface binding may therefore appear in both
 `providers[]` and `standard_exports[]`; the custom binding never hides a
 missing mandatory standard export. Reduction across repeatable manifests and
-live ELF evidence is order-independent: identical exact statuses coalesce;
-`unresolved` is replaced when exactly one exact status exists; no exact status,
-or disagreement between two exact statuses, reduces to `unresolved` and
-`PARTIAL`. Any capture-global selection loss whose producer cannot be
+live ELF evidence is order-independent and first retains two private facts:
+`export = present | absent | outside | unknown` and
+`requirement = legacy | v3 | unknown`. Unknown export evidence is neutral, but
+exact `present`, `absent`, and `outside` facts must all agree; disagreement
+reduces to public `unresolved` and `PARTIAL`. For agreed `absent`, exact legacy
+and v3 requirements must also agree; legacy becomes `legacy_absent`, v3 becomes
+`required_absent`, and no exact requirement or disagreement becomes
+`unresolved`. Thus exact absence with unknown requirement still conflicts with
+exact presence. Any capture-global selection loss whose producer cannot be
 attributed changes each silent binding to uncovered; a provider already
 observed becomes `observed_uncovered`, while a fully silent provider becomes
 `absent_uncovered`. It never erases an observed tuple or creates a guessed
@@ -244,14 +249,18 @@ published caller-independent surface is unmatched.
 
 The private address-free `InventorySurfaceKey` that assigns those ordinals is
 `{module exact object, table object, table object-relative offset, kind,
-finite name class, version, flags, duplicate ordinal}`. Legacy uses its finite
-legacy values. `duplicate ordinal` is the position inside the sorted multiset
-of otherwise identical keys, not a provider enumeration index. Keys are
-ordered lexicographically and merged across retained views only when every
-field matches; reordered enumeration therefore merges, while the same provider
-index naming a different table does not. A table without a stable exact object
-and object-relative offset cannot receive a public surface reference or
-inventory authority.
+private name discriminator, version, flags, duplicate ordinal}`. The private
+name discriminator compares already-budgeted inventory name bytes byte-for-byte
+and is never serialized: null and exact-standard names have finite values;
+`other` aliases merge across views only when their private bounded bytes agree;
+unreadable names never merge across views. Legacy uses its finite legacy value.
+`duplicate ordinal` is the position inside the sorted multiset of otherwise
+identical keys, not a provider enumeration index. Keys are ordered
+lexicographically and merged across retained views only when every field
+matches; reordered enumeration of the same exact names therefore merges, while
+same-class/different-name and same-index/different-table aliases do not. A
+table without a stable exact object and object-relative offset cannot receive a
+public surface reference or inventory authority.
 
 Each match's `name_agrees` and `version_agrees` booleans are derived after the
 exact table match. They expose a provider inconsistency but never widen a match.
@@ -399,11 +408,15 @@ selector order with flags `0` then `1`. For either zero-call acquisition,
 For nonzero `rv`, `result`, `selection_table`, and `helper_failure` are null,
 `inventory_matches` is empty, and authority is `none`. For `CKR_OK`, a readable
 but unsupported or unmatched result may also have authority `none` without a
-helper failure. Authority is `inventory` exactly when matches are nonempty and
-`selection_table` is null; it is `selection_count_only` exactly when matches
-are empty and `selection_table` is nonnull. `helper_failure` is nonnull only
-when post-success inspection could not produce a readable result or safe
-authority decision; whenever `helper_failure` is nonnull, authority is `none`.
+helper failure. Exact pointer matches remain factual when name or version is
+unreadable: retain them, keep `selection_table` null, set the corresponding
+helper failure, set authority to `none`, and force `PARTIAL`. Authority is
+`inventory` exactly when matches are nonempty, all authority-relevant fields
+are readable, `helper_failure` is null, and `selection_table` is null; it is
+`selection_count_only` exactly when matches are empty and `selection_table` is
+nonnull. `helper_failure` is nonnull only when post-success inspection could
+not produce a readable result or safe authority decision; whenever it is
+nonnull, authority is `none`.
 More than 16 exact aliases retains the first 16 in surface order, sets
 `selection_truncated`, and forces `PARTIAL`. A table record has a unique integer
 id from 0 through 9, a 3.0/3.1/3.2 version, a `full` walk outcome, at most 104
@@ -555,6 +568,8 @@ Implementation proceeds TDD and must leave these runnable pins:
    `absent_covered`, while a non-prearmed `run` or `--pid` provider is
    `absent_uncovered`; a constructor call proves the prearm was live before
    constructors, and real finalization preserves the closed coverage interval;
+   a duration handoff that leaves the child running cannot close the interval,
+   so retirement makes it `absent_uncovered` and `PARTIAL`;
    two retained views sharing one provider produce
    `observed_uncovered`; `legacy_absent` is non-loss, while a custom-only 3.x
    provider remains `required_absent` and `PARTIAL`;
@@ -567,7 +582,7 @@ Implementation proceeds TDD and must leave these runnable pins:
     without pointer equality does not; live legacy and two interface aliases
     sharing one table retain three distinct privacy-safe surface references;
     reordered views merge identical keys, while same-index/different-table
-    views remain distinct;
+    and same-class/different-private-name views remain distinct;
 11. manifest v5 accepts only the fixed matrix and v4 is rejected precisely;
     exact JSON mutation tests pin every enum, bound, result-null relation,
     object/offset reference, orphan-table refusal, full-walk requirement,
@@ -588,8 +603,9 @@ Implementation proceeds TDD and must leave these runnable pins:
 15. every repository v2-profile/v4-manifest exact pin is migrated or retained
     only where explicitly historical, and README/helper module documentation
     truthfully states that the explicit offline helper now makes the ten calls;
-    repeated manifest and live standard-export statuses reduce independently of
-    input order, with exact disagreement becoming `unresolved`/`PARTIAL`;
+    repeated manifest and live export/requirement facts reduce independently of
+    input order, with present-versus-absent and other exact disagreement becoming
+    `unresolved`/`PARTIAL` even when the absence requirement is unknown;
     and
 16. the canonical Rust 1.88 gates pass, followed by independent security and
     test-quality review to zero.

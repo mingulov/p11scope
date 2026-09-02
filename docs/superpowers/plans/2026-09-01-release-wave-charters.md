@@ -77,10 +77,13 @@ but selection requests, failures, and aliases are not yet release-complete.
    paths (today `hint_gate` at `scan.rs:864-882` compares only size, only for
    `--module` hints). Closes the rename/copy/swap misattribution class.
 4. **Capability tier ladder** (PRD §4; standing owner requirement): implement
-   the ladder from `docs/notes/2026-08-15-architecture-and-gap-analysis.md`
-   §4.2/§4.4 (the only place the ladder exists — there is NO "tier table"
-   artifact in the tree yet; the wave creates the shipped one in
-   `docs/usage.md` and the code model in `src/doctor.rs` `CAP_BITS` :37-43).
+   the current-product T0–T4 availability ladder defined by the W3 execution
+   plan Task 6. The earlier leased/hardened T3/T4 proposal in
+   `docs/notes/2026-08-15-architecture-and-gap-analysis.md` §4.2/§4.4 is
+   superseded: commit `3a3ec2808e14c77f78e2021723c1c9c75979f02d`
+   deliberately removed those lanes and W3 does not restore them. The wave
+   creates the shipped table in `docs/usage.md` and the code model in
+   `src/doctor.rs` (`CAP_BITS` currently at :37-43).
    Add `CAP_DAC_READ_SEARCH` to `CAP_BITS` (checklist 4 / item #8 — aya
    tracefs mount check). **`CAP_SYS_RESOURCE`:** it appears NOWHERE in the
    code and no `RLIMIT_MEMLOCK` bump exists — the "drop" is (a) confirm +
@@ -91,9 +94,9 @@ but selection requests, failures, and aliases are not yet release-complete.
    (mutating it invalidates existing live-discovery evidence). The tier
    probe loads the REAL program with REAL map sizes and attaches
    (checklist 5); `doctor` probes procfs mount options, Yama `ptrace_scope`,
-   non-dumpable targets and reports a degraded tier (item #15); tiered
-   degradation replaces all-or-nothing failure (standing owner requirement,
-   requirements spec §3).
+   non-dumpable targets and reports the highest proven availability tier plus
+   any unassessed target/scope predicate (item #15); tiered degradation replaces
+   all-or-nothing failure (standing owner requirement, requirements spec §3).
 5. **Diagnostics and verdict honesty:** distinguish seccomp-EPERM from
    capability-EPERM (checklist 7); log aya's `VerifierLog` on load failure
    (checklist 8 — aya reports verifier rejections as bare `EACCES`); prove
@@ -105,13 +108,20 @@ but selection requests, failures, and aliases are not yet release-complete.
    per-offset attach as the mandatory fallback at the 5.15 floor. Runtime
    feature detection, never a compile-time split; the attach mechanism in use
    is recorded in the evidence output; both paths covered by the e2e oracle
-   lane. **Planner must verify first:** aya 0.14.0's uprobe_multi support
-   surface (API or raw link syscall needed) and interaction with the
-   PidPin/attach-before-run flow — do not assume the crate exposes it.
-   **Fallback decision rule:** if aya 0.14.0 lacks the surface, implement via
-   the raw bpf-link syscall behind the pinned aya (no aya version bump
-   without an owner decision); if that proves disproportionate, stop and
-   present the options to the owner rather than silently dropping the item.
+   lane. **Planner verification:** aya 0.14.0's support surface and the
+   PidPin/attach-before-run interaction were checked; the verified ruling below
+   supersedes the earlier raw-link contingency.
+   **Verified ruling (2026-09-02):** aya 0.14.0 cannot provide a valid
+   `uprobe_multi` program FD because it loads ordinary uprobes with expected
+   attach type zero; a raw link syscall is therefore not a fallback. The owner
+   delegated autonomous W3 implementation and the reviewed plan selected exact
+   open-PR Aya revision `8d16163ca436e3030cbd45a0f331c62cd6c059fa`, with
+   dedicated ordinary/multi program twins, Aya-managed links, and the mandatory
+   5.15 per-offset path. Before loading multi twins, p11scope calls the public
+   `ProcessScopedPidFilter` support probe once: `Ok(true)` selects multi,
+   `Ok(false)` selects sticky per-offset fallback, and probe errors fail. After
+   a positive probe, every load/link error fails and rolls back. Do not add a
+   raw syscall, direct `aya-obj`, moving branch, or Aya fork.
 **Owner-gated:** any privileged e2e verification lanes (unprivileged rows
 run; privileged rows recorded UNRUN unless approved); all allowlist/schema
 revision wording for selection-evidence fields.
@@ -125,7 +135,7 @@ be re-verified after W1 merges (W1 touches `scan.rs`).
 selection matrix separately records live request/result/failure rows and
 finite offline queries under the exact-generation/attested-identity authority
 rule, with unmatched enumeration explicit/PARTIAL; one
-tier-degradation matrix row per ladder tier of gap-analysis §4.4
+   tier-degradation matrix row per current ladder tier in W3 Task 6 / PRD §4
 (unprivileged rows run; privileged rows UNRUN unless owner-approved); the
 checklist-9 verdict-binding test named in the wave report.
 

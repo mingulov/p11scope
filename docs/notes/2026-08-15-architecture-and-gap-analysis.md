@@ -474,6 +474,11 @@ rationale"; `docs/notes/naming.md` is an empty tracked file.
 
 ### 4.1 What is required today (in run order)
 
+> **Historical snapshot:** this table describes the pre-Slice-1a tree reviewed
+> on 2026-08-15. The lease, hardened-oracle, helper-ownership, and
+> `suid_dumpable` lanes were removed by
+> `3a3ec2808e14c77f78e2021723c1c9c75979f02d`; current guidance is W3 Task 6.
+
 | Step | Needs | Failure | Where |
 | --- | --- | --- | --- |
 | Manifest + object open (`/proc/<pid>/root/…` for containers) | read access; **`CAP_SYS_PTRACE`** for cross-uid `/proc/<pid>/root` | fatal | `verify.rs:2298-2306` |
@@ -502,6 +507,13 @@ runs its capability row without `--trusted-workload`, which `oracle.rs:322-345` 
 
 ### 4.2 Proposed capability ladder (graceful degradation)
 
+> **Superseded 2026-09-02:** this proposal predates Productization Slice 1a.
+> Commit `3a3ec2808e14c77f78e2021723c1c9c75979f02d` deliberately removed the
+> leased and hardened-oracle authorization lanes, so the historical T3/T4 rows
+> below are not release requirements and must not be restored. W3 defines the
+> current-product availability ladder in
+> `docs/superpowers/plans/2026-09-02-wave3-correctness-residue.md` Task 6.
+
 Every tier is labelled in the output (`evidence.authority`, `evidence.tier`) so a lower
 tier can never be mistaken for a higher one — the same discipline already used for
 `privacy_mode`.
@@ -526,6 +538,10 @@ non-root ptrace).
 
 ### 4.3 Preflight (`p11scope doctor`) — the missing piece for "understand what is available"
 
+> **Historical proposal:** the lease-aware T3 example below is superseded. W3
+> Task 6 defines the current `doctor` H/R/L/S availability ladder and does not
+> restore lease or hardened authority.
+
 One unprivileged-safe command that prints a table and exits non-zero if the requested tier
 is unavailable:
 
@@ -548,6 +564,8 @@ It reuses checks that already exist (`attach.rs` hint logic, `has_effective_priv
 `LeaseMonitor::acquire`, `validate_helper_metadata`) — ~200 lines, no new deps.
 
 ### 4.4 Minimum set, per tier, on a stock kernel (to be measured, not asserted)
+
+> **Historical only:** the supersession notice in §4.2 also applies here.
 
 - T1: `CAP_BPF` + `CAP_PERFMON` (upstream ≥5.8) — **`CAP_SYS_ADMIN` on Ubuntu/hardened
   hosts** (`perf_event_paranoid=4`, already measured); read/`mmap` on the provider file.
@@ -581,6 +599,9 @@ It reuses checks that already exist (`attach.rs` hint logic, `has_effective_priv
    `CAP_LEASE` on root-owned libc.
 
 **Next — the two big design corrections (1–2 weeks):**
+
+> **Historical:** item 7's leased/hardened recommendation is superseded by the
+> §4.2 notice and is not current implementation guidance.
 
 7. **Capability ladder (§4.2) + `p11scope doctor` (§4.3).** Make lease acquisition and
    the provenance pass optional/advisory in `--trusted-workload` (default for that flag),
@@ -713,6 +734,8 @@ Yes, once discovery is live/static (A1) the floor is only what uprobes themselve
 - read access to `/proc/<pid>/maps` and `/proc/<pid>/root/…`: free for same-uid targets,
   `CAP_SYS_PTRACE` for cross-uid (containers/pods). `CAP_SYS_ADMIN` only if discovery uses
   `setns`.
+  **Historical qualification:** the following T3/T4 sentence predates the §4.2
+  supersession and must not be restored as current product authority.
 - nothing else: no `CAP_LEASE`, no root-owned helper, no sysctl, no `/run/p11scope`, no
   static observer binary. Leases/hardened become the opt-in T3/T4 lanes (report §4.2), and
   `p11scope doctor` tells the operator which tier the host allows before anything is loaded.
@@ -752,6 +775,10 @@ informational). Live discovery learns the offsets from the target's own
 hook is in place; it cannot attach mid-run to a process that obtained its table earlier.
 
 Decided:
+
+> **Historical qualification:** points 2–3 record the superseded 2026-08-15
+> lease/hardened decision. Current authority is the W3 Task 6 availability
+> ladder referenced by §4.2.
 
 1. **Two first-class discovery paths, one probe engine, chosen automatically.**
    - *Live* — default when the target has not loaded the module yet (`run -- cmd`,

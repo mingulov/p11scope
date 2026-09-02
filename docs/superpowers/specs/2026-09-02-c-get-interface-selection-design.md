@@ -402,7 +402,7 @@ The helper emits only `p11scope-manifest/5`. The top-level
 | `acquisition` | `export_absent`, `export_outside_module`, or `queried` |
 | `queries` | array of exactly 0 entries for the first two acquisition states or exactly 10 entries for `queried` |
 | `tables` | array of at most 10 selection-only table records |
-| `selection_truncated` | boolean; true exactly when more than 16 exact aliases were available to a query |
+| `selection_truncated` | boolean; true exactly when more than 16 exact aliases were available to a query or two successful queries returned different selection-only tables for one eligible `(returned version, returned flags)` pair |
 
 Each query has:
 
@@ -451,6 +451,14 @@ every table is referenced by at least one
 `CKR_OK` query with `authority=selection_count_only`, null `helper_failure`, and
 matching `selection_table`; orphan or merely known-prefix tables are rejected,
 and only reachable tables enter attachment planning.
+
+For the fixed query order, the first eligible selection-only table for one
+`(returned version, returned flags)` pair may receive authority. If a later
+successful query returns a different table for that pair, its factual result is
+retained with `authority=none` and a null `selection_table`,
+`selection_truncated` is set, and no second table is admitted. Structural
+validation rejects a manifest that authorizes two distinct tables for one pair
+or reports the conflict without truncation.
 
 Manifest v4 is intentionally rejected after W3, not silently upgraded. It
 cannot prove whether the matrix ran, so a mechanical default would fabricate
@@ -611,7 +619,8 @@ Implementation proceeds TDD and must leave these runnable pins:
 11. manifest v5 accepts only the fixed matrix and v4 is rejected precisely;
     exact JSON mutation tests pin every enum, bound, result-null relation,
     object/offset reference, orphan-table refusal, full-walk requirement,
-    seventeenth-alias truncation, and inventory-separation rule;
+    seventeenth-alias truncation, same-version/flags table-conflict truncation,
+    and inventory-separation rule;
 12. two providers with the same built-in or custom hook symbol are attributed
     by their private attachment bindings, including a returned table outside
     the hook owner that is refused authority; binding ids never reuse, and a

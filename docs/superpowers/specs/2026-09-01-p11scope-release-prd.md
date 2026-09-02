@@ -84,9 +84,11 @@ The behavior authority is `docs/usage.md`; this list fixes *scope*, not detail.
 - **Attach engine:** offset-based uprobe/uretprobe, PID/cgroup filter maps,
   in-kernel ring-loss counters, PidPin (pidfd + starttime) generation guard.
   **`uprobe_multi` attach is release scope** (owner decision 2026-09-01):
-  used where the running kernel supports it (≥6.6), with the existing
-  per-offset attach as the fallback at the 5.15 floor; the attach mechanism
-  in use is recorded in evidence (W3).
+  used only when the runtime
+  `ProcessScopedPidFilter` feature probe returns `Ok(true)`, with the existing
+  per-offset attach otherwise. Link creation began in 6.6, but that version
+  fact alone does not prove process-scoped filtering. The attach mechanism in
+  use is recorded in evidence (W3).
 - **Capture policy:** `allowlisted` default; pointer-derived bytes only by
   exact membership in the published finite sets.
 
@@ -96,20 +98,35 @@ by waves W1/W3.
 
 ## 4. Capability and privilege model (release requirement)
 
-The current model is all-or-nothing root; the release must ship the **tier
-ladder** (proposed in `docs/notes/2026-08-15-architecture-and-gap-analysis.md`
-§4):
+The release ships a **current-product availability ladder**. The older proposed
+leased/hardened T3/T4 meanings in
+`docs/notes/2026-08-15-architecture-and-gap-analysis.md` §4 are historical:
+Productization Slice 1a deliberately removed those authorization lanes, and W3
+must not restore them.
+
+The monotonic tiers are: T0 offline when the real embedded object and ordinary
+self-uprobe cannot load/attach; T1 when that real host probe succeeds but no
+requested target is proved readable; T2 when the exact target generation,
+required procfs views, and provider opens are readable but exec/exit lifecycle
+links are unavailable; T3 when base lifecycle links also work but a requested
+scope-specific mechanism does not; and T4 when every mechanism required by the
+requested current-product lane preflights. T4 means availability, not leased or
+hardened authority and not a promise that the eventual capture is `COMPLETE`.
 
 - Documented minimum capability set per feature; `CAP_DAC_READ_SEARCH` added
   to the model (aya tracefs mount check), `CAP_SYS_RESOURCE` dropped (memlock
   is memcg-accounted at the 5.15 floor).
 - Graceful degradation: with reduced capabilities, p11scope does what it can
-  and **reports its tier honestly** (`doctor` probes procfs mount options,
+  and **reports its highest proven availability tier honestly** (`doctor`
+  probes procfs mount options,
   Yama `ptrace_scope`, non-dumpable targets, and reports a degraded tier —
   never a silent blind spot).
 - The tier probe must load the real BPF program with real map sizes and
   actually attach — a toy probe that says "supported" while the real load
   fails is a known industry failure (research checklist #5).
+- Capability bits, uid, sysctls, Yama, hidepid, dumpability, seccomp, and LSM
+  state explain operational probe results; they never override them. Tier is a
+  `doctor` preflight result. Capture loss and `PARTIAL` evidence remain separate.
 
 ## 5. Privacy contract
 

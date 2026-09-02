@@ -17,11 +17,16 @@ transactional attach plan, exact-object pinning, and render path. Selection is a
 bounded sibling of inventory, never a new inventory source. Tracepoint offsets
 come from tracefs format metadata; scan-open identity is checked before parsing
 the opened object. Capability and attach-mechanism evidence use finite enums.
-`uprobe_multi` is a narrow raw `BPF_LINK_CREATE` backend behind Aya 0.14's
-loaded program FD; dynamic changes retain the existing per-offset path.
+`uprobe_multi` cannot use Aya 0.14's ordinary loaded program FD: the kernel
+requires a distinct `BPF_TRACE_UPROBE_MULTI` expected attach type. Aya master
+now supports that path. Task 7 is an explicit owner decision between an exact
+upstream revision with dedicated multi twins and waiting/deferral; dynamic
+changes retain the existing per-offset path.
 
-**Tech stack:** Rust 1.88 / edition 2024, Aya exactly 0.14.0, existing
-`libc`, `cryptoki-sys`, and `libloading`; no new dependency or toolchain pin.
+**Tech stack:** Rust 1.88 / edition 2024, Aya 0.14.0 baseline, existing `libc`,
+`cryptoki-sys`, and `libloading`. Tasks 1–6 add no dependency. Task 7 may change
+Aya from that crates.io release to an exact upstream Git revision only after
+owner selection.
 
 **Authorities:**
 
@@ -35,12 +40,15 @@ loaded program FD; dynamic changes retain the existing per-offset path.
 
 - Preserve `docs/privacy/allowlist-v1.md` byte-for-byte. Create v2 explicitly;
   do not broaden target reads or output by implication.
-- Preserve Rust 1.88, Aya 0.14.0, Linux x86-64 first, and the 5.15 per-offset
-  attach path.
+- Preserve Rust 1.88, Linux x86-64 first, Aya 0.14.0 through Tasks 1–6, and the
+  5.15 per-offset attach path. Any Task-7 Aya change must be an exact reviewed
+  revision recorded by the owner decision below.
 - No raw names, pointers, addresses, PIDs/TIDs, provider errors, or target paths
   in selection or attach-mechanism output.
 - Parallel writers may touch only disjoint file sets. Review starts only after
   the writer stops.
+- File lists are task-local ownership. A later sequential task may extend the
+  unreleased v3 schema/allowlist created by Task 4; no concurrent writer may.
 - Privileged/container/VM/runtime lanes are `UNRUN` unless separately
   authorized. Local unit/integration tests and ordinary Cargo gates are not
   privileged.
@@ -60,6 +68,9 @@ loaded program FD; dynamic changes retain the existing per-offset path.
   owned-`run` prearm coverage, alias identity, selection-only claim ownership,
   manifest v5, profile v3, and allowlist-v2 wording through delegated
   review-to-zero.
+- [x] Owner explicitly authorized autonomous W3 tracing/schema/privacy review
+  and implementation in this thread on 2026-09-02; the reviewed design is the
+  exact field/allowlist authority and v1 remains immutable.
 - [x] Verify W3 charter anchors for tracepoint offsets, scan-open identity,
   capability/diagnostic gaps, and Aya 0.14 `uprobe_multi` feasibility.
 - [ ] Run pass-2 review over every file/symbol/test command cited below; correct
@@ -75,8 +86,12 @@ Commit: `docs: plan wave 3 correctness residue`
 - Modify: `crates/manifest/tests/{elf,identity}.rs`
 - Modify: `src/manifest_input.rs`
 - Modify: `crates/discover/src/discover.rs`
-- Modify: `crates/discover/tests/{fixture_provider,softhsm,version_matrix}.rs`
-- Modify: relevant helper fixtures under `crates/discover/tests/`
+- Modify: `crates/discover/tests/{cli,fixture_provider,softhsm,version_matrix}.rs`
+- Modify: `crates/discover/tests/fixture/{provider,version_matrix}.c`
+- Modify: `README.md`, `CHANGELOG.md`, `scripts/lib.sh`
+- Modify: `tests/artifact_contracts.rs`
+
+Design acceptance: §12 items 2, 5, and 9–11.
 
 Current anchors: manifest v4 is fixed at
 `crates/manifest/src/manifest.rs:10`; `discover_with_self_memory` begins at
@@ -91,6 +106,11 @@ Current anchors: manifest v4 is fixed at
   field is null or unreadable. Prove v4 rejection is precise.
 - [ ] GREEN: add only the design's finite v5 types and structural validation.
   Keep inventory `surfaces`, interfaces, and alias groups unchanged.
+- [ ] RED: `no_live_manifest_v4_pin_remains` enumerates every live producer,
+  consumer, fixture, script, and exact pin and fails before migration.
+- [ ] GREEN: atomically migrate that set to v5 in this task; old plans,
+  reports, changelog history, and observed-profile-v2 documentation remain
+  explicitly historical.
 - [ ] RED: fixture test proves zero calls for absent/outside export and exactly
   ten ordered calls for queried; retain nonzero `CK_RV`, helper failures, full
   returned flags, and all bounded exact aliases.
@@ -99,7 +119,10 @@ Current anchors: manifest v4 is fixed at
   Query before `C_Initialize`; do not change the external facts-crate pin.
 - [ ] Focused checks:
   `cargo +1.88 test --locked -p p11scope-manifest -p p11scope-discover` and
-  `cargo +1.88 test --locked --test manifest_pinning`.
+  `cargo +1.88 test --locked --test manifest_pinning`; the RED test names are
+  `manifest_v5_selection_matrix_is_exact`,
+  `selection_helper_makes_exactly_ten_queries`, and
+  `selection_agreement_requires_readable_fields`.
 - [ ] Four canonical gates; commit.
 
 Commit: `feat: record bounded offline interface selection evidence`
@@ -113,6 +136,8 @@ Commit: `feat: record bounded offline interface selection evidence`
 - Modify: `src/discovery/hooks.rs`
 - Modify: `tests/artifact_contracts.rs`
 
+Design acceptance: §12 items 2, 3, and 8.
+
 Current anchors: `DiscoveryRecord` at
 `crates/ebpf-common/src/lib.rs:342`, `StartState` at `:374`,
 `interface_entry`/`interface_return` at
@@ -120,7 +145,9 @@ Current anchors: `DiscoveryRecord` at
 
 - [ ] RED: ABI tests cover all finite request/result classes, full-width flags
   and `CK_RV`, nonzero return without output dereference, null/unreadable
-  success, reserved-zero layout, record size, and recursive no-overwrite loss.
+  success, reserved-zero layout, record size, recursive no-overwrite loss, and
+  a dedicated full-width nonzero `u64` binding id. A failed provider outcome
+  emits but never requests the owned-child discovery pause.
 - [ ] GREEN: extend the existing state and kind-4 record only enough to carry
   sanitized classifications/scalars and private return correlation. Emit one
   record for every matched return, including failure.
@@ -131,7 +158,10 @@ Current anchors: `DiscoveryRecord` at
   maps, read/state/ring counters, and bounded table walker.
 - [ ] Focused checks:
   `cargo +1.88 test --locked -p p11scope-ebpf-common` and
-  `cargo +1.88 test --locked --test artifact_contracts`.
+  `cargo +1.88 test --locked --test artifact_contracts`; the RED test names
+  are `selection_transport_round_trips_failures` and
+  `selection_transport_never_carries_name_bytes`; the former pins zero-id
+  refusal and `u64::MAX` round-trip.
 - [ ] Four canonical gates; commit.
 
 Commit: `feat: capture bounded C_GetInterface request outcomes`
@@ -145,7 +175,11 @@ Commit: `feat: capture bounded C_GetInterface request outcomes`
 - Modify: `src/attach.rs`
 - Modify: `src/run.rs`
 - Modify: `tests/fixtures/live-discovery-{provider,driver}.c`
-- Modify: focused discovery/lifecycle tests colocated with the modules above
+- Modify: unit tests inside the four Rust modules above
+- Modify: `tests/{live_discovery,run_lifecycle}.rs`
+
+Design acceptance: §12 items 1, 2, 4–7, 10, and 12–13, plus the reduction
+invariant in item 15.
 
 Current anchors: kind-4 lowering at `src/discovery/engine.rs:3709`, inventory
 merge at `:5752`, dispatch at `:7617`, owned-loader prearm at `:6539`, owned
@@ -160,6 +194,12 @@ child execution at `src/run.rs:1484`, and physical slot state at
   tuples, factual match retention, `InventorySurfaceKey`, and the
   order-independent standard-export reducer. Agreement is proven equality of
   readable finite fields, never inferred for null or unreadable fields.
+- [ ] RED: `selection_binding_ids_never_reuse` pins a capture-local
+  checked monotonic `u64` allocator: zero is invalid, `u64::MAX` is allocated
+  once, the next allocation is refused/`PARTIAL`, retirement removes the active
+  lookup, and a delayed record cannot resolve to a later binding.
+- [ ] GREEN: use one capture-local checked counter plus the existing active
+  binding map; no retained-id registry or allocator abstraction is needed.
 - [ ] RED: same-address/different-name and two-view claims produce occurrence-
   based `table_entries`, one physical `AttachKey`, one aggregate cell, and
   independent retirement. Delayed records for retired IDs fail closed.
@@ -173,7 +213,21 @@ child execution at `src/run.rs:1484`, and physical slot state at
 - [ ] GREEN: preattach entry+return to exact freshly pinned provider exports
   before `OwnedChild::release`, then accept proof only after the eventual
   mapping agrees on device, inode, view, and generation.
-- [ ] Focused engine/plan/run tests, then four canonical gates; commit.
+- [ ] RED: `selection_ring_loss_invalidates_silent_coverage` proves nonzero
+  discovery-ring loss makes affected silent bindings uncovered and the verdict
+  `PARTIAL`; it never becomes an empty/covered result.
+- [ ] RED: `selection_only_claims_are_semantically_bounded` permits one
+  distinct table per exact provider generation and standard `(returned version,
+  returned flags)` pair, reuses repeated exact claims, and refuses a conflicting
+  table as truncated without allocating slots. Unknown flag bits remain factual
+  evidence but authorize nothing.
+- [ ] GREEN: enforce that finite semantic key before the existing indivisible
+  512-slot admission; add no separate quota or slot allocator.
+- [ ] Focused checks:
+  `cargo +1.88 test --locked --lib c_get_interface_selection`,
+  `cargo +1.88 test --locked --test live_discovery selection`, and
+  `cargo +1.88 test --locked --test run_lifecycle owned_run_selection_coverage`;
+  then four canonical gates; commit.
 
 Commit: `feat: reduce interface selection with exact lifecycle authority`
 
@@ -185,7 +239,9 @@ Commit: `feat: reduce interface selection with exact lifecycle authority`
 - Create: `docs/schema/observed-profile-v3.md`
 - Create: `docs/privacy/allowlist-v2.md`
 - Modify: `README.md`, `docs/usage.md`, `src/inspect.rs`
-- Modify: exact-schema/canary scripts and fixtures that dispatch on profile v2
+- Modify: `scripts/{check-capture-evidence.py,verify-canaries.sh}`
+
+Design acceptance: §12 items 3, 14, and 15.
 
 - [ ] RED: exact JSON/mutation tests pin `interface_selection`, all finite
   arrays/enums/cross-references, count saturation, every selection loss to
@@ -194,11 +250,16 @@ Commit: `feat: reduce interface selection with exact lifecycle authority`
   v2-metrics and reads no selection arguments. Preserve v1 allowlist unchanged;
   v2 authorizes only the reviewed finite classes and existing offline inventory
   name exception.
-- [ ] RED/GREEN: update docs and canaries so the observer remains passive while
-  the explicit helper is documented as making the ten calls. Migrate every
-  live v2/v4 exact pin; retain historical records as historical.
-- [ ] Run relevant script `--self-test` modes, focused render/trace tests, then
-  four canonical gates.
+- [ ] RED: `profile_v3_selection_contract_is_exact` and the two validator
+  self-tests reject missing/extra v3 selection fields, secret canaries, stale
+  live profile-v2 pins, and an observer/helper description with reversed roles.
+- [ ] GREEN: update docs, exact-schema dispatch, and canaries so the observer
+  remains passive while the explicit helper is documented as making ten calls.
+  Migrate live profile-v2 exact pins; retain historical records as historical.
+- [ ] Focused checks:
+  `cargo +1.88 test --locked --lib profile_v3_selection_contract_is_exact`,
+  `python3 -I scripts/check-capture-evidence.py --self-test`, and
+  `sh scripts/verify-canaries.sh --self-test`; then four canonical gates.
 - [ ] Independent selection-slice correctness and test-quality review; batch
   accepted fixes until one cycle is zero. Commit.
 
@@ -209,7 +270,8 @@ Commit: `docs: publish versioned interface selection evidence`
 This is one review batch but permits two disjoint writers:
 
 - Writer A owns `crates/ebpf-common/src/lib.rs`, `crates/ebpf/src/main.rs`,
-  the trace-format parser/config publication site, and its artifact tests.
+  `src/attach.rs` (`parse_tracepoint_format` and CONFIG publication), and
+  `tests/artifact_contracts.rs`.
 - Writer B owns `src/discovery/scan.rs` and `tests/discovery_scan.rs`.
 - Neither writer edits the other's files; the primary integrates and runs Cargo
   serially.
@@ -230,8 +292,12 @@ scan entry at `:1139`.
 - [ ] GREEN B: immediately after `open_in_target`, compare the opened file's
   maps-comparable device/inode against the maps snapshot key using the existing
   identity operation; size remains supplementary only.
-- [ ] Focused tests, then four canonical gates; commit the two root fixes
-  together after integration review.
+- [ ] Focused checks:
+  `cargo +1.88 test --locked --lib tracepoint_format`,
+  `cargo +1.88 test --locked --test artifact_contracts dynamic_sched_fork_offsets`,
+  and `cargo +1.88 test --locked --test discovery_scan opened_file_identity`;
+  then four canonical gates and commit the two root fixes together after
+  integration review.
 
 Commit: `fix: bind tracing metadata and scan opens to live identities`
 
@@ -247,6 +313,8 @@ Commit: `fix: bind tracing metadata and scan opens to live identities`
   `scripts/check-live-discovery-evidence.py`
 - Modify: `docs/usage.md` and observed-profile-v3 schema/allowlist v2
 
+Charter acceptance: W3 items 4–5.
+
 Current anchors: `CAP_BITS` at `src/doctor.rs:37`, real BPF/attach probe at
 `:223-290`, evidence/verdict at `src/render.rs:169,506`.
 
@@ -256,46 +324,98 @@ Current anchors: `CAP_BITS` at `src/doctor.rs:37`, real BPF/attach probe at
   RLIMIT_MEMLOCK requirement.
 - [ ] GREEN: emit finite consumer-visible `tier`; reuse current doctor checks
   and real embedded program rather than a toy probe. Document losses per tier.
-- [ ] RED/GREEN: distinguish evidence-backed seccomp denial from missing-
-  capability denial without guessing from `EPERM` alone; retain unknown when
-  origin cannot be proved. Surface bounded Aya verifier diagnostics on load
-  failure without exposing target data.
+- [ ] RED: `eperm_origin_requires_independent_evidence` proves bare `EPERM`
+  stays unknown, a matching finite seccomp fact selects seccomp, and a proven
+  missing capability selects capability; `verifier_diagnostics_are_bounded`
+  rejects target-derived text and over-limit output.
+- [ ] GREEN: distinguish evidence-backed seccomp denial from missing-capability
+  denial without guessing from `EPERM` alone, and surface bounded Aya verifier
+  diagnostics on load failure without target data.
 - [ ] RED: for each discovery loss counter, serialize profile/metrics/terminal
   evidence and prove consumer verdict is `PARTIAL` exactly once.
 - [ ] Update capability self-test and docs; privileged rows remain `UNRUN` if
-  not authorized. Focused tests, then four canonical gates; commit.
+  not authorized. Focused checks:
+  `cargo +1.88 test --locked --lib capability_tier`,
+  `cargo +1.88 test --locked --test proc_access capability_tier`, and
+  `sh scripts/verify-capability-tier.sh --self-test`; then four canonical
+  gates; commit.
 
 Commit: `feat: report capability tiers and tracing degradation honestly`
 
 ## Task 7: `uprobe_multi` initial attach with safe fallback
 
+**Owner decision — BLOCKING Task 7 and Task 8, not Tasks 1–6:** released Aya
+0.14 loads
+ordinary `UProbe` programs with expected attach type zero. A raw
+`BPF_LINK_CREATE(BPF_TRACE_UPROBE_MULTI)` using that FD is invalid, so the prior
+raw-link-only design would fall back everywhere and publish misleading
+evidence. Raising the kernel floor does not fix the program-load type.
+
+- **Pin option (recommended):** approve an exact reviewed Aya upstream Git
+  revision containing merged PRs #1417/#1654. Aya master has native multi
+  sections/load/attach/link ownership, declares MSRV 1.87, and passed
+  `cargo +1.88 check --locked -p aya` at `03bee7dca209651c2f8a951d362665294c0144c9`.
+- **Wait/defer option:** wait for the next Aya release, or amend the
+  PRD/charter/ROADMAP, keep the existing per-offset path for v0.1, omit
+  `attach_mechanisms`, and move multi attach to the post-release slices.
+- Dropping Linux 5.15 is rejected: it saves none of the required loader work and
+  removes an owner-approved release platform.
+
+Evidence and upstream contribution guidance:
+[`docs/notes/2026-09-02-aya-uprobe-multi-status.md`](../../notes/2026-09-02-aya-uprobe-multi-status.md).
+
 **Files:**
 
+- Modify under pin option: `Cargo.toml`, `Cargo.lock`
+- Modify: `crates/ebpf/src/main.rs`
 - Modify: `src/attach.rs`, `src/discovery/engine.rs`, `src/render.rs`, `src/run.rs`
 - Modify: `docs/schema/observed-profile-v3.md`,
   `docs/privacy/allowlist-v2.md`, `docs/usage.md`
 - Modify: `tests/artifact_contracts.rs`, `scripts/verify-attach-e2e.sh`
 
+Charter acceptance: W3 item 6.
+
 Current anchors: registered-link ownership around `src/attach.rs:488`, static
 attach transaction at `:734`, dynamic attach/detach at `:1450,1564`. Aya 0.14
-has no public multi-attach API; `UProbe::fd()` is the retained safe seam.
+`UProbe::load()` uses expected attach type zero. Aya master recognizes
+`uprobe.multi` sections, loads attach type 48, and owns multi links natively.
 
-- [ ] RED: UAPI layout/alignment/offset tests for one private 64-byte
-  `BPF_LINK_CREATE` payload; checked count, aligned offsets/cookies, and exactly
-  one `OwnedFd` owner.
-- [ ] GREEN: group the initial plan by exact `{object, program}` and attach all
-  return bundles before entry bundles. Count logical endpoints, not link FDs.
-- [ ] RED/GREEN: only the first real preflighted `EINVAL`/`EOPNOTSUPP` selects a
-  sticky per-offset fallback. `EPERM`, `EACCES`, identity/process errors, and
-  errors after any successful multi link remain real failures.
-- [ ] RED/GREEN: selective retirement closes the affected bundle, rechecks
-  pins, reattaches surviving siblings per-offset, records the real gap as
-  `PARTIAL`, and never orphans/double-attaches an endpoint. Later additions are
+- [ ] OWNER: record `pin`, `wait`, or `defer` with the exact dependency or
+  authority-doc revision before any Task-7 writer starts.
+- [ ] RED pin: dependency test proves the multi twin loads with expected
+  attach type 48 while the legacy twin remains zero; p11scope proves the two
+  mechanisms use distinct program FDs with shared maps/lifecycle state.
+- [ ] GREEN pin: add dedicated `#[uprobe(multi)]`/`#[uretprobe(multi)]` wrappers
+  calling the existing handlers and use Aya's iterator attach/managed link API;
+  add no raw syscall, direct `aya-obj` dependency, or private link owner.
+- [ ] RED pin: initial grouping test requires exact `{object, program}`
+  bundles, all return bundles before entries, and logical endpoint counts.
+- [ ] GREEN pin: implement that grouping with dedicated multi twins.
+- [ ] RED: `uprobe_multi_fallback_is_narrow_and_sticky` accepts only the first
+  fixed-attribute multi-load `EINVAL` or fully valid link `EOPNOTSUPP` as
+  unsupported. Link-create `EINVAL`, `EPERM`, `EACCES`, identity/process errors,
+  and errors after a successful multi link remain real failures.
+- [ ] GREEN: select sticky legacy fallback only for those proven unsupported
+  stages; never use generic link-create `EINVAL` as feature detection.
+- [ ] RED: `multi_bundle_retirement_downgrades_without_orphans` proves bundle
+  close, pin recheck, surviving sibling per-offset reattach, exact endpoint
+  ownership, and a real `PARTIAL` gap.
+- [ ] GREEN: implement that selective retirement; later additions stay
   per-offset.
+- [ ] RED: `uprobe_multi_attempt_rolls_back_every_owned_link` injects a second
+  return-group failure and an entry-group failure after a shared return bundle;
+  both close every link created by that attempt and leave no return-only or
+  successful endpoint state.
+- [ ] GREEN: make the initial multi attach one transaction. Before its first
+  successful link only a proven unsupported stage selects fallback; after
+  success every failure rolls back all links owned by the attempt.
 - [ ] Add finite sorted `evidence.attach_mechanisms` containing only
   `uprobe-multi` and/or `per-offset`; authorize it in allowlist v2.
-- [ ] Run unit/contracts and the unprivileged e2e self-test. Actual 5.15/6.6
-  kernel attachment rows are privileged evidence and remain `UNRUN` unless
+- [ ] Focused checks:
+  `cargo +1.88 test --locked --lib uprobe_multi`,
+  `cargo +1.88 test --locked --test artifact_contracts attach_mechanisms`, and
+  `sh scripts/verify-attach-e2e.sh --self-test`. Actual 5.15/6.6 kernel
+  attachment rows are privileged evidence and remain `UNRUN` unless
   authorized. Four canonical gates; commit.
 
 Commit: `feat: attach initial probe sets with uprobe_multi`

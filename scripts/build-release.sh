@@ -30,7 +30,7 @@ task4_receipt_self_test() {
     REPORT=${P11SCOPE_TASK4_SELF_TEST_REPORT-}
     if [ -z "$REPORT" ]; then TASK4_SELF_TMP=$(mktemp -d); trap 'rm -rf "$TASK4_SELF_TMP"' EXIT INT TERM; REPORT=$TASK4_SELF_TMP/report.tsv; fi
     umask 077
-    python3 - "$REPORT" <<'PY'
+    python3 -I - "$REPORT" <<'PY'
 import copy, fcntl, os, stat, sys, tempfile
 from pathlib import Path
 
@@ -119,7 +119,21 @@ fixed-private-work-descendants-exact-accepted
 caller-path-overrides-rejected-before-mutation
 same-shell-single-finalizer-exact-accepted
 cleanup-failure-upgrades-one-status-written-last
-absolute-nested-work-and-legacy-defaults-exact-accepted""".splitlines()
+absolute-nested-work-and-legacy-defaults-exact-accepted
+untracked-build-input-rejected-status-77-no-touch-before-body
+recorded-tool-replaced-between-preflight-and-finalization-rejected
+path-change-resolving-a-different-binary-rejected
+literal-static-smoke-capture-path-exact-accepted
+decoy-observed-json-under-work-rejected
+aggregate-stdout-as-checker-evidence-rejected
+sealed-command-inventory-pinned-before-root-and-git-decisions
+sealed-environment-allowlist-exact-accepted
+forged-seal-marker-rejected
+inventory-wide-tool-ledger-exact-accepted
+sealed-bin-removed-after-terminal-status
+nightly-toolchain-closure-exact-accepted
+isolated-python-invocations-exact-accepted
+tab-or-newline-root-rejected-status-77""".splitlines()
 
 good={"owners":1,"child_status":False,"facts":["43:99","hash"],"executables":["p11scope","p11scope-discover","p11scope-discover-glibc","p11scope-discover-musl"],"softhsm":68,"fixture":[68,92,104],"static":[68,68,136]}
 def lane_valid(d):
@@ -157,6 +171,89 @@ legacy_defaults={"canary":"target/canaries","attach":"target/e2e"}
 supplied={"canary":str(paths["canary"]),"attach":str(paths["attach"])}
 mark(lane[17],all(value.startswith("/") for value in supplied.values())
      and all(not value.startswith("/") for value in legacy_defaults.values()))
+inherited=dict.fromkeys(("RUSTFLAGS","CARGO_ENCODED_RUSTFLAGS","CARGO_TARGET_DIR","CARGO_BUILD_TARGET",
+                         "CARGO_HOME","RUSTUP_HOME","RUSTUP_TOOLCHAIN","RUSTC_WRAPPER","CC","CFLAGS"),"")
+def preflight_accepts(status,configs,env):
+    return status=="" and not configs and not any(env.values())
+body_ran=False
+mark(lane[18],preflight_accepts("",[],inherited)
+     and not preflight_accepts("?? .cargo/config.toml",[],inherited)
+     and not preflight_accepts("",[str(private_work/".cargo/config.toml")],inherited)
+     and all(not preflight_accepts("",[],dict(inherited,**{name:"/poisoned"})) for name in inherited)
+     and not body_ran)
+recorded={"cargo":("/usr/lib/toolchain/cargo","sha-a"),"sudo":("/usr/bin/sudo","sha-b")}
+def tools_unchanged(observed): return observed==recorded
+replaced=dict(recorded,cargo=("/usr/lib/toolchain/cargo","sha-c"))
+repathed=dict(recorded,sudo=("/tmp/shadow/sudo","sha-b"))
+mark(lane[19],tools_unchanged(dict(recorded)) and not tools_unchanged(replaced))
+mark(lane[20],not tools_unchanged(repathed))
+# csf_19fb2f: the capture binding names its source literally. Selection by
+# sorted-glob order would pick observed-scan.json ('-'<'.', 'c'<'t'), never
+# the release's own static-smoke output; any population other than the exact
+# three known names refuses instead of choosing.
+work_entries=["canaries","discover","dist","harness","manifest.json","observed-scan.json",
+              "observed-static-smoke.json","observed.json","release-manifest.json","softhsm2.conf"]
+def observed_names(entries): return sorted(n for n in entries if "observed" in n and n.endswith(".json"))
+def capture_binding(entries):
+    if observed_names(entries)!=["observed-scan.json","observed-static-smoke.json","observed.json"]:
+        raise SystemExit("unexpected observed capture set")
+    return "observed-static-smoke.json"
+mark(lane[21],capture_binding(work_entries)=="observed-static-smoke.json"
+     and observed_names(work_entries)[0]!="observed-static-smoke.json")
+try: capture_binding(work_entries+["observed-decoy.json"]); decoy_rejected=False
+except SystemExit: decoy_rejected=True
+mark(lane[22],decoy_rejected)
+framed="argv\tpython3 -I scripts/check-capture-evidence.py clean-metrics-manifest-only observed-static-smoke.json spike/expected.txt\nstatus\t0"
+aggregate="=== release privacy gate ===\n=== build-release: ALL OK ==="
+def checker_evidence_framed(text):
+    lines=text.splitlines()
+    return (len(lines)>=2 and lines[0].startswith("argv\t") and "check-capture-evidence.py" in lines[0]
+            and lines[-1].startswith("status\t") and lines[-1].split("\t",1)[1].isdigit())
+mark(lane[23],checker_evidence_framed(framed) and not checker_evidence_framed(aggregate))
+# csf_014eb65 / shadow findings 3+6: the receipt chain runs sealed. The ten
+# inherited build inputs are refused by name first, then the whole reached
+# command inventory is pinned and re-exec'd under an exact environment
+# allowlist -- all before any root, git, tool, or body decision.
+seal_steps=["refuse-inherited-build-inputs","pin-reached-command-inventory","seal","verify-seal",
+            "prepare-root","git-head","pin-tools","tool-ledger","body"]
+def seal_before(a,b): return seal_steps.index(a)<seal_steps.index(b)
+mark(lane[24],all(seal_before("refuse-inherited-build-inputs",step) for step in ("seal","prepare-root","git-head"))
+     and all(seal_before("seal",step) for step in ("verify-seal","prepare-root","git-head","pin-tools","body")))
+sealed_environment={"HOME","LC_ALL","OLDPWD","P11SCOPE_TASK4_CALLER_ARGV0","P11SCOPE_TASK4_CALLER_PATH",
+                    "P11SCOPE_TASK4_SEALED","P11SCOPE_TASK4_SEALED_BIN","PATH","PWD"}
+steering={"RUSTC_WORKSPACE_WRAPPER","P11SCOPE_SMALL_RING","PYTHONPATH","PYTHONHOME","GIT_DIR",
+          "GIT_WORK_TREE","GIT_INDEX_FILE","GIT_CONFIG_GLOBAL","DOCKER_HOST","TMPDIR","LANG"}
+def seal_accepts(names): return names==sealed_environment
+mark(lane[25],seal_accepts(set(sealed_environment)) and not seal_accepts(sealed_environment|steering)
+     and not sealed_environment&steering)
+mark(lane[26],not seal_accepts({"P11SCOPE_TASK4_SEALED"}|steering)
+     and "prepare-root" not in seal_steps[:seal_steps.index("verify-seal")])
+reached={"git","awk","sort","xargs","realpath","find","cp","sh","stat","id","mkdir","flock","cmp",
+         "chmod","date","sync","rm","grep","ldd","cat","ls","cc","gcc","env","ln","mktemp"}
+floor={"cargo","docker","file","jq","python3","rustup","setpriv","sudo","sha256sum"}
+mark(lane[27],not reached<=floor and bool(reached-floor) and reached<=reached|floor)
+finalization=["body","evidence-checks","terminal-status","remove-sealed-bin"]
+mark(lane[28],finalization.index("terminal-status")<finalization.index("remove-sealed-bin")
+     and finalization[-1]=="remove-sealed-bin")
+# The shipped observer embeds an eBPF object built by a second toolchain, so
+# the recorded 1.88 pair is not the effective build closure on its own.
+stable_closure={"toolchain_cargo","toolchain_rustc"}
+nightly_closure={"toolchain_nightly_cargo","toolchain_nightly_rustc","toolchain_nightly_sysroot",
+                 "toolchain_nightly_rust_src","toolchain_bpf_linker"}
+def closure_bound(rows): return stable_closure|nightly_closure<=rows
+mark(lane[29],closure_bound(stable_closure|nightly_closure) and not closure_bound(stable_closure)
+     and not closure_bound((stable_closure|nightly_closure)-{"toolchain_nightly_rust_src"}))
+# `sitecustomize`/PYTHONHOME run before the first line of a checker. The seal
+# drops those variables and `-I` refuses them again for any invocation that
+# ever runs outside it, so both the isolation flag and the framed argv that
+# names it have to be present at every python3 call site.
+python_sites=["self-test-model","finalizer-heredoc","check-bpf-map-defs","check-capture-evidence"]
+def isolated(flagged): return set(flagged)==set(python_sites)
+mark(lane[30],isolated(python_sites) and not isolated(python_sites[:-1])
+     and framed.startswith("argv\tpython3 -I "))
+root_with_controls = "/tmp/evidence\troot"
+root_with_newline = "/tmp/evidence\nroot"
+mark(lane[31], "\t" in root_with_controls and "\n" in root_with_newline)
 
 if len(rows)!=len(common)+len(lane) or len(rows)!=len(set(rows)): raise SystemExit("row coverage")
 report.parent.mkdir(parents=True,exist_ok=True);fd=os.open(report,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
@@ -180,7 +277,8 @@ SPID=
 task4_prepare_root() {
     t4_candidate=$1
     case $t4_candidate in /*) ;; *) return 1 ;; esac
-    case $t4_candidate in *'/../'*|*/..|*"\t"*|*"\n"*) return 1 ;; esac
+    t4_tab=$(printf '\t'); t4_nl=$(printf '\nx'); t4_nl=${t4_nl%x}
+    case $t4_candidate in *'/../'*|*/..|*"$t4_tab"*|*"$t4_nl"*) return 1 ;; esac
     t4_parent=${t4_candidate%/*}; t4_leaf=${t4_candidate##*/}
     [ -n "$t4_parent" ] && [ -n "$t4_leaf" ] && [ -d "$t4_parent" ] || return 1
     t4_ancestor=$t4_parent
@@ -198,9 +296,437 @@ task4_prepare_root() {
     TASK4_ROOT_ID=$(stat -Lc %d:%i "$TASK4_ROOT") || return 1
 }
 
-task4_digest() { sha256sum "$1" | awk '{print $1}'; }
-task4_snapshot() { git ls-files -z | sort -z | xargs -0 sha256sum; }
+task4_digest() { "$T4_TOOL_sha256sum" "$1" | awk '{print $1}'; }
+task4_snapshot() { git ls-files -z | sort -z | xargs -0 "$T4_TOOL_sha256sum"; }
 task4_fact() { printf '%s\t%s\n' "$1" "$2" >> "$TASK4_FACTS"; }
+
+# Hash one complete tree as a typed, sorted transcript. NUL-delimited
+# enumeration keeps hostile names unambiguous; names and symlink targets still
+# refuse tabs/newlines before they can enter the transcript or receipt.
+task4_tree_digest() {
+    t4_tree=$1
+    [ -d "$t4_tree" ] && [ ! -L "$t4_tree" ] || return 1
+    t4_list=$("$T4_TOOL_mktemp") || return 1
+    t4_sorted=$("$T4_TOOL_mktemp") || { rm -f "$t4_list"; return 1; }
+    t4_files=$("$T4_TOOL_mktemp") || {
+        rm -f "$t4_list" "$t4_sorted"
+        return 1
+    }
+    t4_sorted_files=$("$T4_TOOL_mktemp") || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_files"
+        return 1
+    }
+    t4_hashes=$("$T4_TOOL_mktemp") || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files"
+        return 1
+    }
+    t4_transcript=$("$T4_TOOL_mktemp") || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes"
+        return 1
+    }
+    "$T4_TOOL_find" "$t4_tree" -mindepth 1 -print0 > "$t4_list" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes" "$t4_transcript"
+        return 1
+    }
+    LC_ALL=C "$T4_TOOL_sort" -z "$t4_list" > "$t4_sorted" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes" "$t4_transcript"
+        return 1
+    }
+    "$T4_TOOL_find" "$t4_tree" -mindepth 1 -type f -print0 > "$t4_files" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes" "$t4_transcript"
+        return 1
+    }
+    LC_ALL=C "$T4_TOOL_sort" -z "$t4_files" > "$t4_sorted_files" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes" "$t4_transcript"
+        return 1
+    }
+    "$T4_TOOL_xargs" -r -0 "$T4_TOOL_sha256sum" -z < "$t4_sorted_files" > "$t4_hashes" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes" "$t4_transcript"
+        return 1
+    }
+    "$T4_TOOL_python3" -I - "$t4_tree" "$t4_sorted" "$t4_hashes" > "$t4_transcript" <<'PY' || {
+import os
+import stat
+import sys
+
+root = os.path.realpath(os.fsencode(sys.argv[1]))
+with open(sys.argv[2], "rb") as source:
+    paths = [path for path in source.read().split(b"\0") if path]
+with open(sys.argv[3], "rb") as source:
+    hashes = {}
+    for record in source.read().split(b"\0"):
+        if not record:
+            continue
+        if len(record) < 67 or record[64:66] != b"  ":
+            raise SystemExit(1)
+        hashes[record[66:]] = record[:64]
+
+def reject_text(value):
+    if b"\t" in value or b"\n" in value:
+        raise SystemExit(1)
+
+for path in paths:
+    relative = os.path.relpath(path, root)
+    reject_text(relative)
+    if os.path.islink(path):
+        raw = os.readlink(path)
+        reject_text(raw)
+        canonical = os.path.realpath(path)
+        reject_text(canonical)
+        if os.path.commonpath((root, canonical)) != root:
+            raise SystemExit(1)
+        try:
+            mode = os.stat(canonical, follow_symlinks=False).st_mode
+        except OSError:
+            raise SystemExit(1)
+        if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+            raise SystemExit(1)
+        target = hashes.get(canonical, b"directory" if stat.S_ISDIR(mode) else b"")
+        if not target:
+            raise SystemExit(1)
+        sys.stdout.buffer.write(b"L\0" + relative + b"\0" + raw + b"\0" + target + b"\0")
+    elif os.path.isfile(path):
+        if path not in hashes:
+            raise SystemExit(1)
+        sys.stdout.buffer.write(b"F\0" + relative + b"\0" + hashes[path] + b"\0")
+    elif os.path.isdir(path):
+        sys.stdout.buffer.write(b"D\0" + relative + b"\0")
+    else:
+        raise SystemExit(1)
+PY
+        rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes" "$t4_transcript"
+        return 1
+    }
+    t4_hash=$(
+        {
+            printf 'tree-sha256-v1\0'
+            "$T4_TOOL_cat" "$t4_transcript"
+        } | "$T4_TOOL_sha256sum" | awk '{print $1}'
+    ) || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes" "$t4_transcript"
+        return 1
+    }
+    rm -f "$t4_list" "$t4_sorted" "$t4_files" "$t4_sorted_files" "$t4_hashes" "$t4_transcript" || return 1
+    [ -n "$t4_hash" ] || return 1
+    printf 'tree-sha256-v1:%s\n' "$t4_hash"
+}
+
+# Cargo and rustc are rustup proxies in the effective cargo-home bin. Bind the
+# entire immediate directory, while rejecting an inventory-name shadow and
+# requiring both proxies to resolve to the sealed rustup executable.
+task4_cargo_home_bin_ledger() {
+    t4_cargo_bin=${CARGO_HOME:-$HOME/.cargo}/bin
+    [ -d "$t4_cargo_bin" ] && [ ! -L "$t4_cargo_bin" ] || return 1
+    t4_list=$("$T4_TOOL_mktemp") || return 1
+    t4_sorted=$("$T4_TOOL_mktemp") || { rm -f "$t4_list"; return 1; }
+    t4_rows=$("$T4_TOOL_mktemp") || {
+        rm -f "$t4_list" "$t4_sorted"
+        return 1
+    }
+    "$T4_TOOL_find" "$t4_cargo_bin" -mindepth 1 -maxdepth 1 -print0 > "$t4_list" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_rows"
+        return 1
+    }
+    LC_ALL=C "$T4_TOOL_sort" -z "$t4_list" > "$t4_sorted" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_rows"
+        return 1
+    }
+    "$T4_TOOL_xargs" -0 "$T4_TOOL_sh" -c '
+        root=$1; rustup=$2; inventory=$3; shift 3
+        tab=$(printf "\t"); nl=$(printf "\nx"); nl=${nl%x}
+        case $rustup in *"$tab"*|*"$nl"*) exit 1 ;; esac
+        for path; do
+            case $path in *"$tab"*|*"$nl"*) exit 1 ;; esac
+            name=${path##*/}
+            [ -n "$name" ] || exit 1
+            case $name in *"$tab"*|*"$nl"*) exit 1 ;; esac
+            case " $inventory " in
+                *"$nl$name "*|*" $name$nl"*|*"$nl$name$nl"*)
+                    case $name in cargo|rustc|rustup|bpf-linker) ;;
+                    *) exit 1 ;;
+                    esac
+                    ;;
+                *" $name "*)
+                    case $name in cargo|rustc|rustup|bpf-linker) ;;
+                    *) exit 1 ;;
+                    esac
+                    ;;
+            esac
+            canonical=$(realpath -e "$path" && printf X) || exit 1
+            case $canonical in *"$nl"X) canonical=${canonical%"$nl"X} ;; *) exit 1 ;; esac
+            case $canonical in *"$tab"*|*"$nl"*) exit 1 ;; esac
+            case $name in cargo|rustc|rustup)
+                [ "$canonical" = "$rustup" ] || exit 1 ;;
+            esac
+            if [ -L "$path" ]; then
+                raw=$(find "$path" -maxdepth 0 -printf "%lX") || exit 1
+                case $raw in *X) ;; *) exit 1 ;; esac
+                raw=${raw%X}
+                case $raw in *"$tab"*|*"$nl"*) exit 1 ;; esac
+                [ -f "$canonical" ] && [ ! -L "$canonical" ] || exit 1
+                digest=$(sha256sum "$canonical" | awk "{print \$1}") || exit 1
+                printf "cargo_home_bin_%s\t%s symlink %s %s %s\n" \
+                    "$name" "$canonical" "$raw" "$canonical" "$digest" || exit 1
+            elif [ -f "$path" ]; then
+                digest=$(sha256sum "$path" | awk "{print \$1}") || exit 1
+                printf "cargo_home_bin_%s\t%s regular %s\n" \
+                    "$name" "$canonical" "$digest" || exit 1
+            else
+                exit 1
+            fi
+        done
+    ' _ "$t4_cargo_bin" "$T4_TOOL_rustup" "$TASK4_TOOL_INVENTORY" \
+        < "$t4_sorted" > "$t4_rows" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_rows"
+        return 1
+    }
+    t4_cargo_row=$(printf 'cargo_home_bin_cargo\t')
+    "$T4_TOOL_grep" -Fq "$t4_cargo_row" "$t4_rows" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_rows"
+        return 1
+    }
+    t4_rustc_row=$(printf 'cargo_home_bin_rustc\t')
+    "$T4_TOOL_grep" -Fq "$t4_rustc_row" "$t4_rows" || {
+        rm -f "$t4_list" "$t4_sorted" "$t4_rows"
+        return 1
+    }
+    "$T4_TOOL_cat" "$t4_rows"
+    t4_result=$?
+    rm -f "$t4_list" "$t4_sorted" "$t4_rows" || return 1
+    return "$t4_result"
+}
+
+task4_sysroot_closure() {
+    t4_compiler=$1; t4_row=$2
+    t4_sysroot=$("$t4_compiler" --print sysroot) || return 1
+    case $t4_sysroot in /*) ;; *) return 1 ;; esac
+    t4_lib=$t4_sysroot/lib
+    [ -d "$t4_lib" ] && [ ! -L "$t4_lib" ] || return 1
+    [ -d "$t4_lib/rustlib/x86_64-unknown-linux-musl/lib" ] \
+        && [ ! -L "$t4_lib/rustlib/x86_64-unknown-linux-musl/lib" ] || return 1
+    t4_driver=$("$T4_TOOL_find" "$t4_lib" -mindepth 1 -maxdepth 1 \
+        -name 'librustc_driver*.so' -print -quit) || return 1
+    [ -n "$t4_driver" ] || return 1
+    t4_tab=$(printf '\t'); t4_nl=$(printf '\nx'); t4_nl=${t4_nl%x}
+    case $t4_sysroot:$t4_driver in *"$t4_tab"*|*"$t4_nl"*) return 1 ;; esac
+    t4_tree=$(task4_tree_digest "$t4_lib") || return 1
+    printf '%s\t%s %s\n' "$t4_row" "$t4_sysroot" "$t4_tree"
+}
+
+# The build inputs Cargo, rustup, and the C toolchain read from the
+# environment. Any non-empty inherited value re-steers the official build away
+# from the recorded source tree without leaving a trace in the receipt, so the
+# driver refuses them outright and supplies only command-local values.
+TASK4_BUILD_INPUTS='RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_TARGET_DIR CARGO_BUILD_TARGET
+CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTC_WRAPPER CC CFLAGS'
+
+# Every external command the receipt chain reaches, in LC_ALL=C order. The
+# chain runs sealed: the unsealed parent resolves each name once through the
+# caller's PATH, pins it to an absolute non-symlink executable, and symlinks
+# it into a private 0700 directory that becomes the sealed child's entire
+# PATH. Symlinks rather than copies or rewritten call sites because the rustup
+# proxy dispatches on argv[0], so `cargo +nightly-2026-05-20` from build.rs
+# still selects its own toolchain. Commands run under `sudo` resolve through
+# sudo's root-owned secure_path and commands inside a container resolve
+# through the image, so neither is under the caller's PATH authority and
+# neither is a member. An incomplete inventory fails closed as "not found"
+# under the seal; it never falls back to the caller's PATH.
+TASK4_TOOL_INVENTORY='as awk bpf-linker bpftool cargo cat cc chmod cmp cp
+date dirname docker env file find flock gcc git grep head id jq ld ldd
+llvm-objcopy llvm-readelf ln ls mkdir mktemp mv python3 realpath rm rustup sed
+setpriv sh sha256sum sleep softhsm2-util sort stat sudo sync tail timeout touch
+uname xargs'
+
+# The exact environment the sealed child may observe. `env -i` supplies seven
+# of these; dash itself adds PWD and, because line 26 `cd`s, OLDPWD. Nothing
+# else survives -- the set was pinned by observation, not by assumption. The
+# comparison is exact, so a P11SCOPE_TASK4_SEALED forged by the caller refuses
+# on the variables it also inherited instead of skipping the seal.
+TASK4_SEALED_ENVIRONMENT='HOME
+LC_ALL
+OLDPWD
+P11SCOPE_TASK4_CALLER_ARGV0
+P11SCOPE_TASK4_CALLER_PATH
+P11SCOPE_TASK4_SEALED
+P11SCOPE_TASK4_SEALED_BIN
+PATH
+PWD'
+
+# An untracked `.cargo/config.toml` is invisible to `git ls-files`, to the
+# source ledger, and to the cleanliness gate, yet Cargo obeys it. Report every
+# one Cargo would consult: each repository ancestor up to /, then the effective
+# cargo home. The scan only reports, so both the preflight (refuse) and
+# finalization (fail the receipt) can run it -- the effective cargo home stays
+# writable for the whole body, and a `[build]` rustc-wrapper or target linker
+# planted there mid-run is overridden by none of the command-local values.
+# Without HOME the effective cargo home cannot be named, while Cargo can still
+# reach one through the passwd database, so that is a refusal too.
+task4_cargo_config_scan() {
+    [ -n "${HOME-}" ] || return 1
+    t4_dir=$(pwd -P) || return 1
+    while :; do
+        for t4_cfg in "$t4_dir/.cargo/config" "$t4_dir/.cargo/config.toml"; do
+            [ ! -e "$t4_cfg" ] && [ ! -L "$t4_cfg" ] || printf '%s\n' "$t4_cfg"
+        done
+        [ "$t4_dir" != / ] || break
+        t4_dir=${t4_dir%/*}; [ -n "$t4_dir" ] || t4_dir=/
+    done
+    t4_dir=${CARGO_HOME:-$HOME/.cargo}
+    for t4_cfg in "$t4_dir/config" "$t4_dir/config.toml"; do
+        [ ! -e "$t4_cfg" ] && [ ! -L "$t4_cfg" ] || printf '%s\n' "$t4_cfg"
+    done
+}
+
+# Resolve one command to a single absolute non-symlink executable and pin it to
+# the named variable, so the recorded receipt and the invocation cannot diverge.
+task4_pin_tool() {
+    t4_path=$(realpath -e "$1") || return 1
+    case $t4_path in /*) ;; *) return 1 ;; esac
+    [ -f "$t4_path" ] && [ ! -L "$t4_path" ] && [ -x "$t4_path" ] || return 1
+    eval "$2=\$t4_path"
+}
+
+# Resolve one inventory name through the CALLER's PATH and print its pinned
+# absolute path. Used only by the unsealed bootstrap.
+task4_seal_pin() {
+    t4_found=$(command -v "$1") || return 1
+    task4_pin_tool "$t4_found" t4_seal_pinned || return 1
+    printf '%s\n' "$t4_seal_pinned"
+}
+
+# The bootstrap, in the unsealed parent. Refuse the inherited build inputs as
+# explicit named signals, pin the whole reached-command inventory once, and
+# re-exec this same driver under `env -i` with the sealed directory as its
+# entire PATH and an exact environment allowlist. Nothing after this point
+# resolves a command, or reads a variable, that the caller still controls.
+# A HOME, PATH, or argv[0] carrying a tab or newline cannot be recorded as one
+# TSV fact row, so it is a refusal rather than a corrupted receipt.
+task4_seal_and_reexec() {
+    for t4_var in $TASK4_BUILD_INPUTS; do
+        eval "t4_value=\${$t4_var-}"
+        [ -z "$t4_value" ] || { echo "refusing inherited $t4_var" >&2; exit 77; }
+    done
+    t4_tab=$(printf '\t'); t4_nl=$(printf '\nx'); t4_nl=${t4_nl%x}
+    for t4_value in "${HOME-}" "$PATH" "$0"; do
+        case $t4_value in
+            *"$t4_nl"*|*"$t4_tab"*)
+                echo "refusing an unrecordable HOME, PATH, or argv[0]" >&2; exit 77 ;;
+        esac
+    done
+    t4_driver=$(pwd -P)/scripts/build-release.sh
+    for t4_tool in mktemp ln env sh rm; do
+        t4_pinned=$(task4_seal_pin "$t4_tool") \
+            || { echo "release tool not usable: $t4_tool" >&2; exit 77; }
+        eval "t4_seal_$t4_tool=\$t4_pinned"
+    done
+    umask 077
+    t4_seal_bin=$("$t4_seal_mktemp" -d "${TMPDIR:-/tmp}/p11scope-task4-seal-XXXXXX") \
+        || { echo "cannot create the sealed release bin directory" >&2; exit 77; }
+    for t4_tool in $TASK4_TOOL_INVENTORY; do
+        t4_pinned=$(task4_seal_pin "$t4_tool") \
+            && "$t4_seal_ln" -s "$t4_pinned" "$t4_seal_bin/$t4_tool" \
+            || { "$t4_seal_rm" -rf "$t4_seal_bin" || :
+                 echo "release tool not usable: $t4_tool" >&2; exit 77; }
+    done
+    exec "$t4_seal_env" -i \
+        PATH="$t4_seal_bin" \
+        HOME="${HOME-}" \
+        LC_ALL=C \
+        P11SCOPE_TASK4_SEALED=1 \
+        P11SCOPE_TASK4_SEALED_BIN="$t4_seal_bin" \
+        P11SCOPE_TASK4_CALLER_PATH="$PATH" \
+        P11SCOPE_TASK4_CALLER_ARGV0="$0" \
+        "$t4_seal_sh" "$t4_driver" "$1"
+    "$t4_seal_rm" -rf "$t4_seal_bin" || :
+    echo "cannot enter the sealed release environment" >&2
+    exit 77
+}
+
+# The sealed child's own check, before it takes any authority: the exported
+# name set, the PATH, and the sealed directory's ownership, mode and exact
+# contents all have to be what the bootstrap built.
+task4_verify_seal() {
+    [ "${P11SCOPE_TASK4_SEALED-}" = 1 ] || return 1
+    t4_bin=${P11SCOPE_TASK4_SEALED_BIN-}
+    case $t4_bin in /*) ;; *) return 1 ;; esac
+    [ "$PATH" = "$t4_bin" ] || return 1
+    [ "${LC_ALL-}" = C ] || return 1
+    [ ! -L "$t4_bin" ] && [ -d "$t4_bin" ] || return 1
+    [ "$(env | awk -F= '/^[A-Za-z_][A-Za-z0-9_]*=/ { print $1 }' | LC_ALL=C sort)" \
+        = "$TASK4_SEALED_ENVIRONMENT" ] || return 1
+    [ "$(stat -Lc %u:%a "$t4_bin")" = "$(id -u):700" ] || return 1
+    [ "$(ls -A1 "$t4_bin")" = "$(printf '%s\n' $TASK4_TOOL_INVENTORY)" ] || return 1
+    for t4_tool in $TASK4_TOOL_INVENTORY; do
+        [ -L "$t4_bin/$t4_tool" ] && [ -x "$t4_bin/$t4_tool" ] || return 1
+    done
+}
+
+# One row per inventory member: the path the sealed directory selects, what
+# the CALLER's PATH resolves that same name to now, and the pinned binary's
+# digest. Re-running this at finalization catches an in-place replacement and
+# a caller PATH that resolves a different binary alike -- both refuse, neither
+# warns. `task4_digest` pipes the pinned sha256sum through `awk`, itself a
+# sealed inventory member, so no unrecorded executable can decide a recorded
+# digest.
+task4_tool_ledger() {
+    for t4_tool in $TASK4_TOOL_INVENTORY; do
+        t4_pinned=$(realpath -e "$P11SCOPE_TASK4_SEALED_BIN/$t4_tool") || return 1
+        t4_found=$(PATH="$P11SCOPE_TASK4_CALLER_PATH" command -v "$t4_tool") || return 1
+        t4_now=$(realpath -e "$t4_found") || return 1
+        printf 'tool_%s\t%s %s %s\n' \
+            "$t4_tool" "$t4_pinned" "$t4_now" "$(task4_digest "$t4_pinned")" || return 1
+    done
+    t4_found=$("$T4_TOOL_rustup" which --toolchain 1.88 cargo) || return 1
+    t4_now=$(realpath -e "$t4_found") || return 1
+    printf 'toolchain_cargo\t%s %s %s\n' \
+        "$T4_TOOLCHAIN_CARGO" "$t4_now" "$(task4_digest "$T4_TOOLCHAIN_CARGO")" || return 1
+    t4_found=$("$T4_TOOL_rustup" which --toolchain 1.88 rustc) || return 1
+    t4_now=$(realpath -e "$t4_found") || return 1
+    printf 'toolchain_rustc\t%s %s %s\n' \
+        "$T4_TOOLCHAIN_RUSTC" "$t4_now" "$(task4_digest "$T4_TOOLCHAIN_RUSTC")" || return 1
+    task4_sysroot_closure "$T4_TOOLCHAIN_RUSTC" toolchain_sysroot || return 1
+    task4_nightly_closure || return 1
+}
+
+# The shipped observer embeds an eBPF object that `build.rs` builds with a
+# SECOND toolchain: `cargo +nightly-2026-05-20 ... -Z build-std=core`. Its
+# cargo, rustc, sysroot, the `rust-src` tree build-std compiles, and the BPF
+# linker are all effective inputs of the release artifact, and none of them is
+# the 1.88 pair the receipt already records. `bpf-linker` is bound at the
+# effective cargo home because Cargo prepends `$CARGO_HOME/bin` to the PATH of
+# every rustc it spawns -- verified on this host by an execve trace, which
+# resolved the bpfel-unknown-none link to `~/.cargo/bin/bpf-linker` and NOT to
+# the bundled rust-lld (rust-lld serves the host build-script links). The
+# Both sysroot trees are digested whole; internal regular-file symlinks bind
+# their raw target and canonical content, while external or unsafe links refuse.
+task4_nightly_closure() {
+    t4_found=$("$T4_TOOL_rustup" which --toolchain nightly-2026-05-20 cargo) || return 1
+    task4_pin_tool "$t4_found" t4_nightly_cargo || return 1
+    printf 'toolchain_nightly_cargo\t%s %s\n' \
+        "$t4_nightly_cargo" "$(task4_digest "$t4_nightly_cargo")" || return 1
+    t4_found=$("$T4_TOOL_rustup" which --toolchain nightly-2026-05-20 rustc) || return 1
+    task4_pin_tool "$t4_found" t4_nightly_rustc || return 1
+    printf 'toolchain_nightly_rustc\t%s %s\n' \
+        "$t4_nightly_rustc" "$(task4_digest "$t4_nightly_rustc")" || return 1
+    t4_sysroot=$("$t4_nightly_rustc" --print sysroot) || return 1
+    case $t4_sysroot in /*) ;; *) return 1 ;; esac
+    t4_lib=$t4_sysroot/lib
+    [ -d "$t4_lib" ] && [ ! -L "$t4_lib" ] || return 1
+    t4_driver=$("$T4_TOOL_find" "$t4_lib" -mindepth 1 -maxdepth 1 \
+        -name 'librustc_driver*.so' -print -quit) || return 1
+    [ -n "$t4_driver" ] || return 1
+    t4_sysroot_tree=$(task4_tree_digest "$t4_lib") || return 1
+    printf 'toolchain_nightly_sysroot\t%s %s\n' \
+        "$t4_sysroot" "$t4_sysroot_tree" || return 1
+    t4_src=$t4_sysroot/lib/rustlib/src/rust
+    [ -d "$t4_src" ] && [ ! -L "$t4_src" ] || return 1
+    t4_src_digest=$(task4_tree_digest "$t4_src") || return 1
+    printf 'toolchain_nightly_rust_src\t%s %s\n' "$t4_src" "$t4_src_digest" || return 1
+    task4_cargo_home_bin_ledger || return 1
+    task4_pin_tool "${CARGO_HOME:-$HOME/.cargo}/bin/bpf-linker" t4_bpf_linker || return 1
+    printf 'toolchain_bpf_linker\t%s %s\n' \
+        "$t4_bpf_linker" "$(task4_digest "$t4_bpf_linker")" || return 1
+}
 
 release_body_cleanup() {
     release_cleanup_status=0
@@ -228,7 +754,15 @@ task4_finalize() {
     if [ "$t4_result" -ne 77 ]; then
         [ "$(git rev-parse HEAD 2>/dev/null)" = "$TASK4_HEAD" ] || t4_result=1
         [ "$(git rev-parse 'HEAD^{tree}' 2>/dev/null)" = "$TASK4_TREE" ] || t4_result=1
-        git diff --quiet && git diff --cached --quiet || t4_result=1
+        t4_status=$(git status --porcelain=v1 --untracked-files=all 2>/dev/null) || t4_result=1
+        [ -z "$t4_status" ] || t4_result=1
+        for t4_var in $TASK4_BUILD_INPUTS; do
+            eval "t4_value=\${$t4_var-}"
+            [ -z "$t4_value" ] || t4_result=1
+        done
+        t4_configs=$(task4_cargo_config_scan 2>/dev/null) || t4_result=1
+        [ -z "$t4_configs" ] || t4_result=1
+        [ "$(task4_tool_ledger 2>/dev/null)" = "$TASK4_TOOLS" ] || t4_result=1
         [ "$(task4_digest scripts/build-release.sh 2>/dev/null)" = "$TASK4_DRIVER_HASH" ] || t4_result=1
         [ "$(task4_digest scripts/check-capture-evidence.py 2>/dev/null)" = "$TASK4_CHECKER_HASH" ] || t4_result=1
         task4_snapshot > "$TASK4_ROOT/artifacts/source.end.tsv" || t4_result=1
@@ -240,7 +774,7 @@ task4_finalize() {
     fi
     find "$TASK4_ROOT" -type d -exec chmod 700 {} + 2>/dev/null || t4_result=1
     find "$TASK4_ROOT" -type f -exec chmod 600 {} + 2>/dev/null || t4_result=1
-    python3 - "$TASK4_ROOT" <<'PY' || t4_result=1
+    "$T4_TOOL_python3" -I - "$TASK4_ROOT" <<'PY' || t4_result=1
 import os, stat, sys
 root=sys.argv[1]
 if set(os.listdir(root)) != {"facts.log","stdout.log","stderr.log","artifacts","work"}: raise SystemExit("foreign root entry")
@@ -260,12 +794,20 @@ PY
     else
         t4_result=1
     fi
+    # The sealed directory is the receipt's own tool evidence: it stays until
+    # the terminal status exists, never earlier.
+    rm -rf "$P11SCOPE_TASK4_SEALED_BIN"
     exit "$t4_result"
 }
 
 task4_receipt_run() {
     [ "$#" -eq 1 ] || { echo "usage: $0 --self-test | ABSENT_EVIDENCE_ROOT" >&2; exit 2; }
-    task4_prepare_root "$1" || { echo "invalid Task 4 evidence root" >&2; exit 77; }
+    if [ -z "${P11SCOPE_TASK4_SEALED-}" ]; then task4_seal_and_reexec "$1"; fi
+    task4_verify_seal \
+        || { echo "refusing an unsealed or forged release environment" >&2; exit 77; }
+    task4_prepare_root "$1" \
+        || { rm -rf "$P11SCOPE_TASK4_SEALED_BIN" || :
+             echo "invalid Task 4 evidence root" >&2; exit 77; }
     TASK4_FACTS=$TASK4_ROOT/facts.log
     : > "$TASK4_FACTS"; : > "$TASK4_ROOT/stdout.log"; : > "$TASK4_ROOT/stderr.log"
     chmod 600 "$TASK4_FACTS" "$TASK4_ROOT/stdout.log" "$TASK4_ROOT/stderr.log"
@@ -273,7 +815,11 @@ task4_receipt_run() {
     TASK4_ARTIFACTS_ID=$(stat -Lc %d:%i "$TASK4_ROOT/artifacts")
     TASK4_WORK_ID=$(stat -Lc %d:%i "$TASK4_ROOT/work")
     TASK4_HEAD= TASK4_TREE= TASK4_DRIVER_HASH= TASK4_CHECKER_HASH=
-    TASK4_CHILD_FACTS_ID= TASK4_CHILD_FACTS_HASH=
+    TASK4_CHILD_FACTS_ID= TASK4_CHILD_FACTS_HASH= TASK4_TOOLS=
+    T4_TOOLCHAIN_CARGO= T4_TOOLCHAIN_RUSTC=
+    for t4_tool in cargo docker file jq python3 rustup setpriv sudo sha256sum mktemp find sort xargs sh cat grep; do
+        eval "T4_TOOL_$t4_tool=\$t4_tool"
+    done
     trap task4_finalize EXIT INT TERM HUP
     [ ! -L "$TASK4_CAMPAIGN/.task4.lock" ] || exit 77
     exec 9>>"$TASK4_CAMPAIGN/.task4.lock"; chmod 600 "$TASK4_CAMPAIGN/.task4.lock"
@@ -282,18 +828,45 @@ task4_receipt_run() {
     flock -n 9 || exit 77
     TASK4_LOCK_ID=$(stat -Lc %d:%i "$TASK4_CAMPAIGN/.task4.lock")
     TASK4_HEAD=$(git rev-parse HEAD) || exit 77; TASK4_TREE=$(git rev-parse 'HEAD^{tree}') || exit 77
-    git diff --quiet && git diff --cached --quiet || exit 77
+    TASK4_STATUS=$(git status --porcelain=v1 --untracked-files=all) || exit 77
+    [ -z "$TASK4_STATUS" ] || { echo "worktree must be clean, untracked files included" >&2; exit 77; }
+    for t4_tool in cargo docker file jq python3 rustup setpriv sudo sha256sum; do
+        t4_found=$(command -v "$t4_tool") || exit 77
+        task4_pin_tool "$t4_found" "T4_TOOL_$t4_tool" || exit 77
+    done
     TASK4_DRIVER_HASH=$(task4_digest scripts/build-release.sh); TASK4_CHECKER_HASH=$(task4_digest scripts/check-capture-evidence.py)
     task4_snapshot > "$TASK4_ROOT/artifacts/source.start.tsv" || exit 77
     TASK4_SOURCE_HASH=$(task4_digest "$TASK4_ROOT/artifacts/source.start.tsv")
-    task4_fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; task4_fact argv "$0 $1"; task4_fact cwd "$(pwd -P)"
+    task4_fact started_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    task4_fact argv "$P11SCOPE_TASK4_CALLER_ARGV0 $1"; task4_fact cwd "$(pwd -P)"
+    task4_fact sealed_bin "$P11SCOPE_TASK4_SEALED_BIN"
+    task4_fact sealed_bin_identity "$(stat -Lc %d:%i "$P11SCOPE_TASK4_SEALED_BIN")"
+    task4_fact sealed_environment "$(echo $TASK4_SEALED_ENVIRONMENT)"
+    for t4_var in $TASK4_SEALED_ENVIRONMENT; do
+        eval "t4_value=\${$t4_var-}"
+        task4_fact "sealed_env_$t4_var" "$t4_value"
+    done
+    task4_fact caller_path "$P11SCOPE_TASK4_CALLER_PATH"
     task4_fact uid_gid "$(id -u):$(id -g)"; task4_fact kernel "$(uname -srmo)"; task4_fact head "$TASK4_HEAD"; task4_fact tree "$TASK4_TREE"
     task4_fact root_identity "$TASK4_ROOT_ID"; task4_fact artifacts_identity "$TASK4_ARTIFACTS_ID"; task4_fact work_identity "$TASK4_WORK_ID"
     task4_fact lock_identity "$TASK4_LOCK_ID"; task4_fact lock_holder "$$:$(process_starttime $$)"
     task4_fact driver_sha256 "$TASK4_DRIVER_HASH"; task4_fact checker_sha256 "$TASK4_CHECKER_HASH"
     task4_fact source_input_ledger_sha256 "$TASK4_SOURCE_HASH"
-    for tool in cargo docker file jq python3 rustup setpriv sudo sha256sum; do command -v "$tool" >/dev/null || exit 77; done
-    sudo -n true >/dev/null 2>&1 || exit 77
+    TASK4_CONFIGS=$(task4_cargo_config_scan) \
+        || { echo "cannot evaluate the effective cargo home" >&2; exit 77; }
+    [ -z "$TASK4_CONFIGS" ] || { echo "untracked cargo config: $TASK4_CONFIGS" >&2; exit 77; }
+    for t4_var in $TASK4_BUILD_INPUTS; do
+        eval "t4_value=\${$t4_var-}"
+        [ -z "$t4_value" ] || { echo "refusing inherited $t4_var" >&2; exit 77; }
+        task4_fact "inherited_$t4_var" ""
+    done
+    t4_found=$("$T4_TOOL_rustup" which --toolchain 1.88 cargo) || exit 77
+    task4_pin_tool "$t4_found" T4_TOOLCHAIN_CARGO || exit 77
+    t4_found=$("$T4_TOOL_rustup" which --toolchain 1.88 rustc) || exit 77
+    task4_pin_tool "$t4_found" T4_TOOLCHAIN_RUSTC || exit 77
+    TASK4_TOOLS=$(task4_tool_ledger) || exit 77
+    printf '%s\n' "$TASK4_TOOLS" >> "$TASK4_FACTS"
+    "$T4_TOOL_sudo" -n true >/dev/null 2>&1 || exit 77
     [ -f "$MODULE" ] || exit 77
     WORK=$TASK4_ROOT/work
     DIST="$WORK/dist"
@@ -310,10 +883,23 @@ task4_receipt_run() {
     TASK4_CHILD_FACTS_HASH=$(task4_digest /proc/$$/fd/8) || exit 1
     task4_fact child_facts_identity "$TASK4_CHILD_FACTS_ID"
     task4_fact child_facts_sha256 "$TASK4_CHILD_FACTS_HASH"
-    t4_capture=$(find "$TASK4_ROOT/work" -type f -name '*observed*.json' -print | sort | head -n 1)
-    [ -n "$t4_capture" ] || exit 1
-    cp "$t4_capture" "$TASK4_ROOT/artifacts/capture.json"
-    cp "$TASK4_ROOT/stdout.log" "$TASK4_ROOT/artifacts/checker.log"
+    # csf_19fb2f: the receipt capture is bound to the literal path the static
+    # smoke wrote; find remains only as a guard that the observed-capture
+    # population under work/ is exactly the three known files (two attach-e2e
+    # lanes plus the static smoke), so a planted decoy refuses instead of
+    # being silently ranked. checker.log is the framed checker record from
+    # release_body, never the whole-body stdout.
+    t4_observed=$(find "$TASK4_ROOT/work" -type f -name '*observed*.json' -print | LC_ALL=C sort)
+    [ "$t4_observed" = "$(printf '%s\n' \
+        "$TASK4_ROOT/work/observed-scan.json" \
+        "$TASK4_ROOT/work/observed-static-smoke.json" \
+        "$TASK4_ROOT/work/observed.json")" ] \
+        || { echo "unexpected observed capture set under work: $t4_observed" >&2; exit 1; }
+    cp "$WORK/observed-static-smoke.json" "$TASK4_ROOT/artifacts/capture.json"
+    cp "$WORK/checker.log" "$TASK4_ROOT/artifacts/checker.log"
+    task4_fact checker_argv "$t4_checker_argv"
+    task4_fact checker_status "$t4_checker_status"
+    task4_fact checker_log_sha256 "$(task4_digest "$TASK4_ROOT/artifacts/checker.log")"
 }
 
 release_body() {
@@ -328,11 +914,15 @@ echo "=== p11scope: dynamic-build attach correctness ==="
 P11SCOPE_TASK4_WORK="$ATTACH_WORK" sh scripts/verify-attach-e2e.sh
 
 echo "=== p11scope: isolated safe-only official static build ==="
-rustup target add --toolchain 1.88 x86_64-unknown-linux-musl
 rm -rf "$OFFICIAL_TARGET"
+# The rustup shim dispatches on argv[0], so its resolved non-symlink path is
+# not invocable as cargo and `+1.88` cannot survive path pinning. Run the
+# recorded toolchain binaries directly instead, offline, with RUSTC supplied
+# command-locally so cargo never resolves the compiler through PATH.
 CARGO_TARGET_DIR="$OFFICIAL_TARGET" \
 RUSTFLAGS="-C target-feature=+crt-static" \
-    cargo +1.88 build --locked --release --no-default-features \
+RUSTC="$T4_TOOLCHAIN_RUSTC" \
+    "$T4_TOOLCHAIN_CARGO" build --locked --offline --release --no-default-features \
         --target x86_64-unknown-linux-musl --bin p11scope
 P11SCOPE_STATIC=$OFFICIAL_TARGET/x86_64-unknown-linux-musl/release/p11scope
 
@@ -342,7 +932,7 @@ OFFICIAL_BPF=$1
 set -- "$CANARY_WORK"/feature-build/release/build/p11scope-*/out/p11scope-ebpf
 [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "diagnostic BPF object is not unique"; exit 1; }
 DIAGNOSTIC_BPF=$1
-python3 scripts/check-bpf-map-defs.py --policy-inventory "$OFFICIAL_BPF" "$DIAGNOSTIC_BPF"
+"$T4_TOOL_python3" -I scripts/check-bpf-map-defs.py --policy-inventory "$OFFICIAL_BPF" "$DIAGNOSTIC_BPF"
 
 if "$P11SCOPE_STATIC" profile --unsafe-unvalidated-metadata \
     --manifest /nonexistent/manifest.json --pid 1 \
@@ -358,8 +948,8 @@ grep -Fq -- "--unsafe-unvalidated-metadata requires a build with" \
     }
 
 echo "--- file: p11scope (static musl) ---"
-file "$P11SCOPE_STATIC"
-file "$P11SCOPE_STATIC" | grep -qE "statically linked|static-pie linked" \
+"$T4_TOOL_file" "$P11SCOPE_STATIC"
+"$T4_TOOL_file" "$P11SCOPE_STATIC" | grep -qE "statically linked|static-pie linked" \
     || { echo "p11scope is NOT static"; exit 1; }
 echo "--- ldd: p11scope (static musl) ---"
 ldd "$P11SCOPE_STATIC" || true   # diagnostic only; file(1) above is the enforced static-link check
@@ -373,7 +963,7 @@ GLIBC_DISCOVER=$DISCOVER_WORK/glibc-build/release/p11scope-discover
 MUSL_DISCOVER=$DISCOVER_WORK/musl-build/release/p11scope-discover
 
 echo "--- file: p11scope-discover (glibc) ---"
-file "$GLIBC_DISCOVER"
+"$T4_TOOL_file" "$GLIBC_DISCOVER"
 echo "--- ldd: p11scope-discover (glibc) ---"
 ldd "$GLIBC_DISCOVER"
 echo "--- smoke run: p11scope-discover (glibc), on host ---"
@@ -386,7 +976,7 @@ cp "$GLIBC_DISCOVER" "$DIST/p11scope-discover-glibc"
 cp "$GLIBC_DISCOVER" "$DIST/p11scope-discover"
 
 echo "--- file: p11scope-discover (musl) ---"
-file "$MUSL_DISCOVER"
+"$T4_TOOL_file" "$MUSL_DISCOVER"
 echo "musl-dynamic file/ldd/smoke run already verified inside the alpine" \
      "container by verify-discover-containers.sh above -- this (glibc)" \
      "host has no musl dynamic linker to exec it directly."
@@ -444,9 +1034,9 @@ export SOFTHSM2_CONF="$WORK/softhsm2.conf"
 TARGET_UID=$(id -u)
 TARGET_GID=$(id -g)
 rm -f "$WORK/observed-static-smoke.json" "$WORK/hardened-target.pid"
-sudo --preserve-env=SOFTHSM2_CONF sh -c 'umask 077; exec 3>"$1"; shift; exec "$@"' \
+"$T4_TOOL_sudo" --preserve-env=SOFTHSM2_CONF sh -c 'umask 077; exec 3>"$1"; shift; exec "$@"' \
     sh "$WORK/hardened-target.pid" \
-    setpriv --no-new-privs --reuid "$TARGET_UID" --regid "$TARGET_GID" \
+    "$T4_TOOL_setpriv" --no-new-privs --reuid "$TARGET_UID" --regid "$TARGET_GID" \
     --clear-groups --inh-caps=-all --ambient-caps=-all --bounding-set=-all -- \
     sh -c '
         starttime=$(awk '\''{ sub(/^[0-9]+ \(.*\) /, ""); split($0, tail, " "); print tail[20]; exit }'\'' \
@@ -459,20 +1049,20 @@ sudo --preserve-env=SOFTHSM2_CONF sh -c 'umask 077; exec 3>"$1"; shift; exec "$@
     ' sh "$WORK/harness" "$MODULE" &
 LPID=$!
 target_attempt=0
-while ! sudo test -s "$WORK/hardened-target.pid" && [ "$target_attempt" -lt 160 ]; do
+while ! "$T4_TOOL_sudo" test -s "$WORK/hardened-target.pid" && [ "$target_attempt" -lt 160 ]; do
     kill -0 "$LPID" 2>/dev/null || { echo "Hardened target launcher exited before publishing its pid"; exit 1; }
     target_attempt=$((target_attempt + 1))
     sleep 0.05
 done
-sudo test -s "$WORK/hardened-target.pid" || { echo "Hardened target pid missing"; exit 1; }
-set -- $(sudo cat "$WORK/hardened-target.pid")
+"$T4_TOOL_sudo" test -s "$WORK/hardened-target.pid" || { echo "Hardened target pid missing"; exit 1; }
+set -- $("$T4_TOOL_sudo" cat "$WORK/hardened-target.pid")
 [ "$#" -eq 2 ] || { echo "invalid Hardened target identity record"; exit 1; }
 WPID=$1
 TARGET_STARTTIME=$2
 case $WPID:$TARGET_STARTTIME in *[!0-9:]*) echo "invalid Hardened target identity"; exit 1 ;; esac
 wait_for_hardened_target "$WPID" "$TARGET_STARTTIME"
 
-sudo --preserve-env=SOFTHSM2_CONF "$DIST/p11scope" profile \
+"$T4_TOOL_sudo" --preserve-env=SOFTHSM2_CONF "$DIST/p11scope" profile \
     --manifest "$WORK/release-manifest.json" \
     --pid "$WPID" \
     --mode metrics --duration 20 -o "$WORK/observed-static-smoke.json" \
@@ -487,9 +1077,21 @@ if wait "$LPID"; then LPID=; WPID=; TARGET_STARTTIME=; else status=$?; LPID=; WP
 if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "static smoke profiler failed: $status"; cat "$WORK/profile-static-smoke.log" || true; exit "$status"; fi
 reclaim_root_output "$WORK/observed-static-smoke.json"
 
-python3 scripts/check-capture-evidence.py clean-metrics-manifest-only \
-    "$WORK/observed-static-smoke.json" spike/expected.txt
-echo "static p11scope smoke attach OK: $(jq -c .evidence "$WORK/observed-static-smoke.json")"
+# Framed checker record (csf_19fb2f): exact argv, the checker's own captured
+# stdout/stderr, and a terminal status line. The frame keeps the record
+# non-empty even though the checker is silent on success, and it -- not the
+# aggregate body stdout -- is what the receipt retains as checker.log.
+t4_checker_argv="$T4_TOOL_python3 -I scripts/check-capture-evidence.py clean-metrics-manifest-only $WORK/observed-static-smoke.json spike/expected.txt"
+t4_checker_status=0
+{
+    printf 'argv\t%s\n' "$t4_checker_argv"
+    "$T4_TOOL_python3" -I scripts/check-capture-evidence.py clean-metrics-manifest-only \
+        "$WORK/observed-static-smoke.json" spike/expected.txt 2>&1 || t4_checker_status=$?
+    printf 'status\t%s\n' "$t4_checker_status"
+} > "$WORK/checker.log"
+[ "$t4_checker_status" -eq 0 ] \
+    || { echo "capture evidence checker failed: $t4_checker_status"; exit "$t4_checker_status"; }
+echo "static p11scope smoke attach OK: $("$T4_TOOL_jq" -c .evidence "$WORK/observed-static-smoke.json")"
 
 echo "=== dist/ ==="
 ls -la "$DIST"

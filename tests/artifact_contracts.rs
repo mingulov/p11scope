@@ -237,13 +237,14 @@ fn assert_live_discovery_host_contract(
         ("FLAG_PAUSE_ENABLED", "pause config bit"),
         ("File::open(path)", "opened cgroup descriptor"),
         (
-            "let opened_id = directory",
-            "opened cgroup inode revalidation",
+            "let id = dir\n        .metadata()",
+            "retained cgroup inode identity",
         ),
         (
-            "groups.set(0, directory.try_clone()?, 0)?",
-            "cgroup insertion proof",
+            "publish_cgroup_fd_with(dir, |directory|",
+            "retained cgroup descriptor publication seam",
         ),
+        ("groups.set(0, directory, 0)?", "cgroup insertion proof"),
     ] {
         require_contract_marker(scope, marker, contract)?;
     }
@@ -714,14 +715,22 @@ fn official_build_is_safe_only() {
         "=== p11scope: isolated safe-only official static build ===",
         "=== p11scope-discover: dynamic glibc + dynamic musl builds ===",
     );
+    // The rustup shim dispatches on argv[0], so its resolved non-symlink path
+    // is not invocable as cargo and `+1.88` cannot survive path pinning. The
+    // official build runs the recorded toolchain binaries directly, offline.
     let command = [
         "CARGO_TARGET_DIR=\"$OFFICIAL_TARGET\" \\",
         "RUSTFLAGS=\"-C target-feature=+crt-static\" \\",
-        "    cargo +1.88 build --locked --release --no-default-features \\",
+        "RUSTC=\"$T4_TOOLCHAIN_RUSTC\" \\",
+        "    \"$T4_TOOLCHAIN_CARGO\" build --locked --offline --release --no-default-features \\",
         "        --target x86_64-unknown-linux-musl --bin p11scope",
     ]
     .join("\n");
     assert!(official.contains(&command));
+    assert!(
+        !official.contains("cargo +1.88"),
+        "official build resolves cargo through the argv[0]-dispatching shim"
+    );
     for marker in [
         "--policy-inventory \"$OFFICIAL_BPF\" \"$DIAGNOSTIC_BPF\"",
         "--unsafe-unvalidated-metadata requires a build with",
@@ -824,6 +833,1833 @@ fn task4_receipt_lane14_release_work_is_private_and_single_owner() {
         "poisoned rootless invocation reached rm"
     );
     assert_eq!(fs::read(&sentinel).unwrap(), b"must survive\n");
+}
+
+// A stateful `docker` CLI stub: `names/<name>` maps a mutable name to the
+// immutable id recorded under `ids/<id>`, so a name collision is a real 125
+// refusal and every subcommand the lane reaches is logged verbatim.
+const LANE14_DOCKER_STUB: &str = r#"#!/bin/sh
+set -u
+printf '%s\n' "$*" >> "$STUB_LOG"
+cmd=$1
+shift
+
+resolve() {
+    if [ -f "$STUB_STATE/ids/$1" ]; then
+        printf '%s\n' "$1"
+    elif [ -f "$STUB_STATE/names/$1" ]; then
+        cat "$STUB_STATE/names/$1"
+    else
+        return 1
+    fi
+}
+
+case $cmd in
+pull)
+    exit 0
+    ;;
+create|run)
+    name=
+    prev=
+    for arg in "$@"; do
+        [ "$prev" = --name ] && name=$arg
+        prev=$arg
+    done
+    if [ -n "$name" ] && { [ -n "$STUB_CONFLICT" ] || [ -f "$STUB_STATE/names/$name" ]; }; then
+        echo "docker: Error response from daemon: Conflict. The container name \"/$name\" is already in use." >&2
+        exit 125
+    fi
+    count=$(cat "$STUB_STATE/count")
+    count=$((count + 1))
+    printf '%s' "$count" > "$STUB_STATE/count"
+    id=$(printf '%064d' "$count")
+    : > "$STUB_STATE/ids/$id"
+    [ -z "$name" ] || printf '%s\n' "$id" > "$STUB_STATE/names/$name"
+    [ "$cmd" != create ] || printf '%s\n' "$id"
+    exit 0
+    ;;
+start)
+    target=
+    for arg in "$@"; do
+        case $arg in -*) ;; *) target=$arg ;; esac
+    done
+    resolve "$target" >/dev/null || { echo "No such container: $target" >&2; exit 1; }
+    exit 0
+    ;;
+inspect)
+    fmt=
+    target=
+    while [ $# -gt 0 ]; do
+        case $1 in
+        -f|--format) fmt=$2; shift 2 ;;
+        -*) shift ;;
+        *) target=$1; shift ;;
+        esac
+    done
+    id=$(resolve "$target") || { echo "No such object: $target" >&2; exit 1; }
+    [ -z "$fmt" ] || printf '%s\n' "$id"
+    exit 0
+    ;;
+rm)
+    target=
+    for arg in "$@"; do
+        case $arg in -*) ;; *) target=$arg ;; esac
+    done
+    id=$(resolve "$target") || exit 1
+    rm -f "$STUB_STATE/ids/$id"
+    for entry in "$STUB_STATE"/names/*; do
+        [ -f "$entry" ] || continue
+        [ "$(cat "$entry")" = "$id" ] && rm -f "$entry"
+    done
+    exit 0
+    ;;
+esac
+exit 0
+"#;
+
+#[test]
+fn lane14_container_ownership_follows_creation_not_names() {
+    // csf_610b398 (Task 10 F5) registered the PID-derived `--name` as a cleanup
+    // id *before* `docker run`, so a stale or concurrent foreign container
+    // holding that name failed creation (125) and the EXIT trap `docker rm -f`'d
+    // the foreign object. The ratified resource journal runs the other way:
+    // `requested` precedes creation, `resolved` carries the immutable identity,
+    // and mutable names alone never authorize deletion
+    // (docs/superpowers/reports/2026-08-28-task4-receipt-architecture-decision.md:100-117).
+    let fixture = tempfile::tempdir().expect("create lane 14 docker-stub fixture");
+    let root = fixture.path();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    fs::write(bin.join("docker"), LANE14_DOCKER_STUB).unwrap();
+    fs::write(
+        bin.join("cargo"),
+        "#!/bin/sh\nprintf '[source.vendored-sources]\\ndirectory = \"/stub\"\\n'\n",
+    )
+    .unwrap();
+    for tool in ["docker", "cargo"] {
+        fs::set_permissions(bin.join(tool), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let lane = |phase: &str, conflict: &str| {
+        let work = root.join(phase);
+        let artifacts = work.join("artifacts");
+        let state = work.join("state");
+        fs::create_dir_all(&artifacts).unwrap();
+        fs::create_dir_all(state.join("ids")).unwrap();
+        fs::create_dir_all(state.join("names")).unwrap();
+        fs::write(state.join("count"), b"0").unwrap();
+        fs::set_permissions(&artifacts, fs::Permissions::from_mode(0o700)).unwrap();
+        let log = work.join("docker.log");
+        fs::write(&log, b"").unwrap();
+        let facts = artifacts.join("discover.facts");
+        let output = Command::new("/bin/sh")
+            .arg("scripts/verify-discover-containers.sh")
+            .arg("--lane14-facts")
+            .arg(&facts)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("P11SCOPE_TASK4_WORK", &work)
+            .env("STUB_LOG", &log)
+            .env("STUB_STATE", &state)
+            .env("STUB_CONFLICT", conflict)
+            .output()
+            .expect("run lane 14 against the stateful docker stub");
+        (
+            output,
+            fs::read_to_string(&log).unwrap(),
+            fs::read_to_string(&facts).unwrap_or_default(),
+        )
+    };
+
+    // A foreign container already holds the lane's name: refuse, delete nothing.
+    let (collision, collision_log, collision_facts) = lane("collision", "1");
+    assert!(
+        !collision.status.success(),
+        "a name collision must refuse the lane"
+    );
+    assert!(
+        !collision_log.lines().any(|line| line.starts_with("rm ")),
+        "the lane removed a container it never created:\n{collision_log}"
+    );
+    assert!(
+        !collision_facts.contains("container_"),
+        "a refused creation was still recorded as an owned container:\n{collision_facts}"
+    );
+
+    // The lane's own containers are created, read back by exact id, recorded,
+    // started, and then removed by that id.
+    let (success, success_log, success_facts) = lane("success", "");
+    assert!(
+        success.status.success(),
+        "stubbed lane failed: {}",
+        String::from_utf8_lossy(&success.stderr)
+    );
+    assert_eq!(
+        success_log
+            .lines()
+            .filter(|line| line.starts_with("create "))
+            .count(),
+        3,
+        "each container must be created before it is owned:\n{success_log}"
+    );
+    assert!(
+        !success_log.lines().any(|line| line.starts_with("run ")),
+        "`docker run` creates and starts in one step, leaving no pre-start id:\n{success_log}"
+    );
+    let removed: Vec<&str> = success_log
+        .lines()
+        .filter_map(|line| line.strip_prefix("rm -f "))
+        .collect();
+    assert_eq!(removed.len(), 3, "cleanup log:\n{success_log}");
+    for id in &removed {
+        assert!(
+            id.len() == 64 && id.chars().all(|character| character.is_ascii_hexdigit()),
+            "cleanup removed {id}, which is not an immutable container id"
+        );
+        assert!(
+            success_facts.contains(id),
+            "cleanup removed {id}, which the receipt never recorded as owned"
+        );
+        require_before(
+            &success_log,
+            &format!("inspect -f {{{{.Id}}}} {id}"),
+            &format!("start -a {id}"),
+            "lane 14 exact-id readback",
+        )
+        .unwrap();
+    }
+    assert!(
+        !success_facts.contains("p11scope-discover-"),
+        "the receipt records a mutable container name as an identity:\n{success_facts}"
+    );
+    for fact in [
+        "container_glibc_build",
+        "container_glibc_run",
+        "container_musl_build",
+    ] {
+        assert!(success_facts.contains(fact), "receipt misses {fact}");
+    }
+}
+
+#[test]
+fn task4_receipt_lane14_capture_binding_is_literal_and_checker_evidence_framed() {
+    let release = read("scripts/build-release.sh");
+
+    // csf_19fb2f: `find … '*observed*.json' | sort | head -n 1` always chose
+    // the attach-e2e lane's observed-scan.json (ASCII: `-` < `.`, `c` < `t`),
+    // never the release's own observed-static-smoke.json, and whole-body
+    // stdout stood in for checker evidence. The ratified receipt architecture
+    // forbids glob, find|head, path-order authority, and stdout-as-capture.
+    assert!(
+        release.contains(
+            "cp \"$WORK/observed-static-smoke.json\" \"$TASK4_ROOT/artifacts/capture.json\""
+        ),
+        "capture.json is not bound to the literal static-smoke output path"
+    );
+    assert!(
+        !release.contains("head -n 1"),
+        "path-order authority still selects a receipt artifact"
+    );
+    assert!(
+        !release.contains("cp \"$TASK4_ROOT/stdout.log\" \"$TASK4_ROOT/artifacts/checker.log\""),
+        "aggregate body stdout still stands in for checker evidence"
+    );
+
+    // Review findings (csf_19fb2f): the framed record must also be RETAINED
+    // -- the receipt copies $WORK/checker.log, records the three checker
+    // facts rows, and the observed-set guard both exists and collates in C
+    // so a healthy run cannot false-refuse under a UTF-8 ambient locale.
+    assert!(
+        release.contains("cp \"$WORK/checker.log\" \"$TASK4_ROOT/artifacts/checker.log\""),
+        "the framed checker record is not retained as the receipt's checker.log"
+    );
+    for fact in [
+        "task4_fact checker_argv \"$t4_checker_argv\"",
+        "task4_fact checker_status \"$t4_checker_status\"",
+        "task4_fact checker_log_sha256 \"$(task4_digest \"$TASK4_ROOT/artifacts/checker.log\")\"",
+    ] {
+        assert!(release.contains(fact), "receipt misses facts row {fact:?}");
+    }
+    assert!(
+        release.contains("-name '*observed*.json' -print | LC_ALL=C sort)"),
+        "the observed-set guard must collate in C, not the ambient locale"
+    );
+    assert!(
+        release.contains(
+            "|| { echo \"unexpected observed capture set under work: $t4_observed\" >&2; exit 1; }"
+        ),
+        "the observed-set guard refusal is missing from the receipt step"
+    );
+
+    // The framed checker record carries the exact argv line, the checker's
+    // own captured stdout/stderr, and a terminal status line. Execute the
+    // real framing block from release_body against a stub checker, then
+    // parse and validate the structure it wrote.
+    let framing = format!(
+        "t4_checker_argv={}",
+        between(
+            &release,
+            "\nt4_checker_argv=",
+            "\necho \"static p11scope smoke attach OK"
+        )
+    );
+    let fixture = tempfile::tempdir().expect("create checker-framing fixture");
+    let work = fixture.path().join("work");
+    fs::create_dir(&work).expect("create framing work directory");
+    let stub = fixture.path().join("stub-checker");
+    fs::write(
+        &stub,
+        b"#!/bin/sh\nprintf 'checker-stdout\\n'\nprintf 'checker-stderr\\n' >&2\nexit \"${P11SCOPE_TASK8_CHECKER_STATUS:-0}\"\n",
+    )
+    .expect("write stub checker");
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).expect("make stub executable");
+    let runner = fixture.path().join("run-framing.sh");
+    fs::write(
+        &runner,
+        format!(
+            "#!/bin/sh\nset -eu\nT4_TOOL_python3={stub}\nWORK={work}\n{framing}\n",
+            stub = stub.display(),
+            work = work.display(),
+        ),
+    )
+    .expect("write framing runner");
+
+    let framed_checker_evidence = |log: &str| {
+        let lines: Vec<&str> = log.lines().collect();
+        if lines.len() < 2 {
+            return false;
+        }
+        let argv_ok = lines[0]
+            .strip_prefix("argv\t")
+            .is_some_and(|argv| argv.contains("scripts/check-capture-evidence.py"));
+        let status_ok = lines[lines.len() - 1]
+            .strip_prefix("status\t")
+            .is_some_and(|status| !status.is_empty() && status.bytes().all(|b| b.is_ascii_digit()));
+        argv_ok && status_ok
+    };
+
+    let success = Command::new("/bin/sh")
+        .arg(&runner)
+        .output()
+        .expect("run the checker framing block");
+    assert!(
+        success.status.success(),
+        "framing block failed on a clean checker: stdout={} stderr={}",
+        String::from_utf8_lossy(&success.stdout),
+        String::from_utf8_lossy(&success.stderr)
+    );
+    let log = fs::read_to_string(work.join("checker.log")).expect("read framed checker.log");
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        lines[0],
+        format!(
+            "argv\t{} -I scripts/check-capture-evidence.py clean-metrics-manifest-only {}/observed-static-smoke.json spike/expected.txt",
+            stub.display(),
+            work.display()
+        ),
+        "framed record must open with the exact checker argv"
+    );
+    assert!(
+        lines.contains(&"checker-stdout"),
+        "framed record must capture the checker's stdout: {log:?}"
+    );
+    assert!(
+        lines.contains(&"checker-stderr"),
+        "framed record must capture the checker's stderr: {log:?}"
+    );
+    assert_eq!(
+        lines[lines.len() - 1],
+        "status\t0",
+        "framed record must close with the checker's status"
+    );
+    assert!(framed_checker_evidence(&log));
+
+    // A checker failure keeps its status in the frame and fails the body
+    // with that same status.
+    fs::remove_file(work.join("checker.log")).expect("reset framed checker.log");
+    let failure = Command::new("/bin/sh")
+        .arg(&runner)
+        .env("P11SCOPE_TASK8_CHECKER_STATUS", "3")
+        .output()
+        .expect("run the checker framing block with a failing checker");
+    assert_eq!(
+        failure.status.code(),
+        Some(3),
+        "a checker failure must fail the release body with the checker's status"
+    );
+    let failed_log =
+        fs::read_to_string(work.join("checker.log")).expect("read failed framed checker.log");
+    assert_eq!(
+        failed_log.lines().last(),
+        Some("status\t3"),
+        "the framed record must retain the checker's failure status: {failed_log:?}"
+    );
+    assert!(framed_checker_evidence(&failed_log));
+
+    // Non-empty is not the bar: an unframed aggregate stdout log -- the
+    // pre-fix checker.log shape -- must be rejected as checker evidence.
+    let aggregate = "=== release privacy gate ===\ncanaries OK\n\
+        === p11scope: dynamic-build attach correctness ===\n\
+        static p11scope smoke attach OK: {}\n=== build-release: ALL OK ===\n";
+    assert!(
+        !framed_checker_evidence(aggregate),
+        "an unframed aggregate stdout log must be rejected as checker evidence"
+    );
+}
+
+#[test]
+fn task4_receipt_lane14_observed_set_guard_refuses_decoys_in_any_locale() {
+    // Execute the real observed-set guard block from task4_receipt_run.
+    // UTF-8 collation orders observed.json BEFORE observed-scan.json (the
+    // hyphen is ignored at the primary level), so a guard sorting in the
+    // ambient locale false-refuses a healthy release; the guard must accept
+    // the exact 3-name set under any locale and refuse a planted 4th decoy
+    // and a missing member.
+    let release = read("scripts/build-release.sh");
+    let guard = format!(
+        "t4_observed=$(find{}",
+        between(
+            &release,
+            "\n    t4_observed=$(find",
+            "\n    cp \"$WORK/observed-static-smoke.json\""
+        )
+    );
+    let fixture = tempfile::tempdir().expect("create observed-set guard fixture");
+    let work = fixture.path().join("work");
+    fs::create_dir(&work).expect("create guard work directory");
+    let runner = fixture.path().join("run-guard.sh");
+    fs::write(
+        &runner,
+        format!(
+            "#!/bin/sh\nset -eu\nTASK4_ROOT={root}\n{guard}\necho guard-ok\n",
+            root = fixture.path().display(),
+        ),
+    )
+    .expect("write guard runner");
+    let run = |locale: &str| {
+        Command::new("/bin/sh")
+            .arg(&runner)
+            .env("LC_ALL", locale)
+            .output()
+            .expect("run the observed-set guard block")
+    };
+
+    for name in [
+        "observed-scan.json",
+        "observed-static-smoke.json",
+        "observed.json",
+    ] {
+        fs::write(work.join(name), b"evidence\n").expect("populate guard work directory");
+    }
+    for locale in ["C", "en_US.UTF-8"] {
+        let output = run(locale);
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("guard-ok"),
+            "guard refused the exact observed set under LC_ALL={locale}: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fs::write(work.join("observed-decoy.json"), b"decoy\n").expect("plant decoy");
+    let decoy = run("en_US.UTF-8");
+    assert_eq!(
+        decoy.status.code(),
+        Some(1),
+        "guard accepted a planted 4th *observed*.json"
+    );
+    assert!(
+        String::from_utf8_lossy(&decoy.stderr)
+            .contains("unexpected observed capture set under work"),
+        "guard refusal must name the unexpected observed set"
+    );
+    fs::remove_file(work.join("observed-decoy.json")).expect("remove decoy");
+
+    fs::remove_file(work.join("observed.json")).expect("remove a set member");
+    let missing = run("C");
+    assert_eq!(
+        missing.status.code(),
+        Some(1),
+        "guard accepted a missing observed-set member"
+    );
+}
+
+/// The build inputs the release driver refuses to inherit. Cargo and rustup
+/// read every one of them, so a non-empty inherited value silently re-steers
+/// the official build away from the recorded source tree.
+const TASK7_BUILD_INPUT_VARIABLES: &[&str] = &[
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_TARGET_DIR",
+    "CARGO_BUILD_TARGET",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "RUSTC_WRAPPER",
+    "CC",
+    "CFLAGS",
+];
+
+/// A one-commit repository holding the driver under test. The driver `cd`s to
+/// its own parent and demands a fully clean worktree, so the preflight must be
+/// exercised against a tree it owns rather than against this checkout.
+fn task7_pristine_driver_repo() -> tempfile::TempDir {
+    let repo = tempfile::tempdir().expect("create pristine release-driver repository");
+    fs::create_dir(repo.path().join("scripts")).expect("create pristine scripts directory");
+    for name in ["build-release.sh", "lib.sh", "check-capture-evidence.py"] {
+        fs::copy(
+            format!("scripts/{name}"),
+            repo.path().join("scripts").join(name),
+        )
+        .unwrap_or_else(|error| panic!("copy scripts/{name} into the pristine repo: {error}"));
+    }
+    for arguments in [
+        vec!["init", "--quiet", "-b", "task7"],
+        vec!["add", "-A"],
+        vec![
+            "-c",
+            "user.email=task7@example.invalid",
+            "-c",
+            "user.name=task7",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "pristine release driver",
+        ],
+    ] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(&arguments)
+            .status()
+            .unwrap_or_else(|error| panic!("run git {arguments:?}: {error}"));
+        assert!(status.success(), "git {arguments:?} failed");
+    }
+    repo
+}
+
+/// Tripwires for the mutating and build commands a preflight refusal reaches,
+/// or must never reach. The log path is baked into each stub rather than read
+/// from the environment: the seal drops every variable a stub could inherit,
+/// so an environment-driven tripwire would pass vacuously.
+fn task7_tripwire_bin(log: &std::path::Path) -> tempfile::TempDir {
+    let bin = tempfile::tempdir().expect("create release preflight tripwires");
+    for command in [
+        "cargo", "docker", "file", "jq", "rm", "rustup", "setpriv", "sudo",
+    ] {
+        let path = bin.path().join(command);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho \"${{0##*/}}\" >> {log}\nexit 97\n",
+                log = log.display()
+            ),
+        )
+        .expect("write release preflight tripwire");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("make release preflight tripwire executable");
+    }
+    bin
+}
+
+/// The one command a sealed refusal does legitimately reach: `task4_finalize`
+/// removes the sealed bin directory once the terminal status exists. Any other
+/// name in the log is a command that escaped the refusal.
+const TASK7_EXPECTED_TRIPWIRES: &str = "rm\n";
+
+/// Runs the pristine driver against an absent evidence root, with every
+/// refused build input cleared and only `inherited` restored.
+fn task7_run_preflight(
+    repo: &tempfile::TempDir,
+    home: Option<&std::path::Path>,
+    bin: &tempfile::TempDir,
+    root: &std::path::Path,
+    inherited: &[(&str, &str)],
+) -> std::process::Output {
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg(repo.path().join("scripts/build-release.sh"))
+        .arg(root)
+        // The whole reached-command inventory must resolve through the
+        // caller's PATH for the seal to be built at all; the tripwires only
+        // shadow the build and mutating commands ahead of it.
+        .env(
+            "PATH",
+            format!(
+                "{}:{}:/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin",
+                bin.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+    match home {
+        Some(home) => command.env("HOME", home),
+        None => command.env_remove("HOME"),
+    };
+    for name in TASK7_BUILD_INPUT_VARIABLES {
+        command.env_remove(name);
+    }
+    for (name, value) in inherited {
+        command.env(name, value);
+    }
+    command
+        .output()
+        .expect("run the release driver input-trust preflight")
+}
+
+/// A mode-0700 campaign parent the driver accepts, plus its tripwire log path.
+fn task7_campaign() -> tempfile::TempDir {
+    let campaign = tempfile::tempdir().expect("create release preflight campaign parent");
+    fs::set_permissions(campaign.path(), fs::Permissions::from_mode(0o700))
+        .expect("make the campaign parent private");
+    campaign
+}
+
+#[test]
+fn release_preflight_refuses_an_untracked_cargo_config_before_the_body() {
+    // An untracked `.cargo/config.toml` is invisible to `git ls-files`, to the
+    // source ledger, and to the tracked-cleanliness gate, yet Cargo obeys it.
+    // The driver must refuse it before it touches a build command.
+    let repo = task7_pristine_driver_repo();
+    let campaign = task7_campaign();
+    let tripwire = campaign.path().join("tripwire.log");
+    let bin = task7_tripwire_bin(&tripwire);
+    let home = tempfile::tempdir().expect("create release preflight home");
+    fs::create_dir(home.path().join(".cargo")).expect("create untracked cargo home");
+    fs::write(
+        home.path().join(".cargo/config.toml"),
+        b"[build]\nrustflags = [\"-C\", \"target-feature=-crt-static\"]\n",
+    )
+    .expect("write the untracked cargo config");
+
+    let output = task7_run_preflight(
+        &repo,
+        Some(home.path()),
+        &bin,
+        &campaign.path().join("evidence"),
+        &[],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(77),
+        "untracked cargo config must refuse with 77: stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("untracked cargo config"),
+        "refusal must name the untracked cargo config: stderr={stderr:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&tripwire).unwrap_or_default(),
+        TASK7_EXPECTED_TRIPWIRES,
+        "refusal reached a command beyond the finalizer's sealed-directory removal"
+    );
+    let residue = Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .expect("inspect the pristine repository after the refusal");
+    assert!(
+        residue.stdout.is_empty(),
+        "refusal mutated its own worktree: {:?}",
+        String::from_utf8_lossy(&residue.stdout)
+    );
+}
+
+#[test]
+fn release_preflight_refuses_every_inherited_build_input_variable() {
+    // Each of the ten re-steers Cargo, rustup, or the C toolchain. One shared
+    // clean fixture proves the refusal is per-variable and not an accident of
+    // the earlier untracked-config gate.
+    let repo = task7_pristine_driver_repo();
+    let campaign = task7_campaign();
+    let tripwire = campaign.path().join("tripwire.log");
+    let bin = task7_tripwire_bin(&tripwire);
+    let home = tempfile::tempdir().expect("create release preflight home");
+
+    for (index, variable) in TASK7_BUILD_INPUT_VARIABLES.iter().enumerate() {
+        let output = task7_run_preflight(
+            &repo,
+            Some(home.path()),
+            &bin,
+            &campaign.path().join(format!("evidence-{index}")),
+            &[(variable, "/task7/poisoned")],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(
+            output.status.code(),
+            Some(77),
+            "inherited {variable} must refuse with 77: stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains(&format!("refusing inherited {variable}")),
+            "refusal must name {variable}: stderr={stderr:?}"
+        );
+        assert!(
+            !stderr.contains("untracked cargo config"),
+            "{variable} refusal was preempted by the cargo-config gate: stderr={stderr:?}"
+        );
+        assert!(
+            !tripwire.exists(),
+            "inherited {variable} reached a command: {:?}",
+            fs::read_to_string(&tripwire).unwrap_or_default()
+        );
+        assert!(
+            !campaign.path().join(format!("evidence-{index}")).exists(),
+            "inherited {variable} was refused only after the evidence root existed"
+        );
+    }
+}
+
+#[test]
+fn release_preflight_refuses_an_unevaluable_cargo_home() {
+    // Without HOME the preflight cannot name the effective cargo home, while
+    // Cargo can still reach one through the passwd database. Checking
+    // `/.cargo` instead would vouch for a location Cargo never reads.
+    let repo = task7_pristine_driver_repo();
+    let campaign = task7_campaign();
+    let tripwire = campaign.path().join("tripwire.log");
+    let bin = task7_tripwire_bin(&tripwire);
+    let output = task7_run_preflight(&repo, None, &bin, &campaign.path().join("evidence"), &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(77),
+        "an unevaluable cargo home must refuse with 77: stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("cannot evaluate the effective cargo home"),
+        "refusal must name the unevaluable cargo home: stderr={stderr:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&tripwire).unwrap_or_default(),
+        TASK7_EXPECTED_TRIPWIRES,
+        "unevaluable cargo home reached a command beyond the sealed-directory removal"
+    );
+}
+
+#[test]
+fn release_finalizer_rechecks_cargo_configs_with_pinned_tools() {
+    let release = read("scripts/build-release.sh");
+    let finalize = between(&release, "\ntask4_finalize() {", "\ntask4_receipt_run() {");
+
+    // The finalizer writes the terminal receipt. A PATH-priority shadow
+    // dropped mid-run must never be the binary that decides, or writes, it --
+    // it runs even once the ledger recheck has already failed the run.
+    assert!(
+        finalize.contains("\"$T4_TOOL_python3\" -I - \"$TASK4_ROOT\""),
+        "finalizer validates the evidence root through an unpinned or unisolated interpreter"
+    );
+    for tool in [
+        "cargo",
+        "docker",
+        "file",
+        "jq",
+        "python3",
+        "rustup",
+        "setpriv",
+        "sudo",
+        "sha256sum",
+    ] {
+        for indent in ["\n    ", "\n        "] {
+            assert!(
+                !finalize.contains(&format!("{indent}{tool} ")),
+                "task4_finalize invokes bare {tool} instead of its pinned path"
+            );
+        }
+    }
+
+    // Out-of-repo cargo configs are a TOCTOU: the body is long and the
+    // effective cargo home stays writable throughout it. A `[build]`
+    // rustc-wrapper or a target linker planted there is honoured by the
+    // pinned cargo and overridden by none of the command-local values, so
+    // the scan has to run again before the receipt is published.
+    assert!(
+        finalize.contains("task4_cargo_config_scan"),
+        "finalizer never re-scans for cargo configs planted during the body"
+    );
+    assert!(
+        !release.contains("task4_refuse_cargo_config"),
+        "cargo-config check still exits from inside its helper, so finalization cannot reuse it"
+    );
+    assert_eq!(
+        release.matches("task4_cargo_config_scan").count(),
+        3,
+        "cargo-config scan must be one definition with a preflight and a finalization call site"
+    );
+}
+
+#[test]
+fn release_preflight_pins_its_tools_before_the_first_digest() {
+    // Every recorded digest must come from the pinned sha256sum, including
+    // the driver/checker hashes and the source input ledger.
+    let release = read("scripts/build-release.sh");
+    let pinned = release
+        .find("task4_pin_tool \"$t4_found\" \"T4_TOOL_$t4_tool\"")
+        .expect("preflight pins the nine recorded tools");
+    let first_digest = release
+        .find("TASK4_DRIVER_HASH=$(task4_digest")
+        .expect("preflight digests the driver");
+    assert!(
+        pinned < first_digest,
+        "the first digest runs before the tool-pinning loop, so it resolves sha256sum through PATH"
+    );
+}
+
+/// Every external command the receipt chain reaches, in the exact `LC_ALL=C`
+/// order the driver pins, symlinks into its sealed bin directory, and
+/// self-checks. Derived statically from `scripts/build-release.sh` (including
+/// its `cd`/`dirname` line and `task4_finalize`), `scripts/lib.sh`, the three
+/// nested gate scripts, and `build.rs`'s nightly Cargo invocation plus the
+/// linker drivers rustc reaches through PATH -- then proven by execution
+/// under the seal. Shell builtins are excluded. Commands that run under
+/// `sudo` resolve through sudo's root-owned `secure_path`, and commands
+/// inside a container resolve through the image, so neither is under the
+/// caller's PATH authority and neither is a member.
+const TASK11_TOOL_INVENTORY: &[&str] = &[
+    "as",
+    "awk",
+    "bpf-linker",
+    "bpftool",
+    "cargo",
+    "cat",
+    "cc",
+    "chmod",
+    "cmp",
+    "cp",
+    "date",
+    "dirname",
+    "docker",
+    "env",
+    "file",
+    "find",
+    "flock",
+    "gcc",
+    "git",
+    "grep",
+    "head",
+    "id",
+    "jq",
+    "ld",
+    "ldd",
+    "llvm-objcopy",
+    "llvm-readelf",
+    "ln",
+    "ls",
+    "mkdir",
+    "mktemp",
+    "mv",
+    "python3",
+    "realpath",
+    "rm",
+    "rustup",
+    "sed",
+    "setpriv",
+    "sh",
+    "sha256sum",
+    "sleep",
+    "softhsm2-util",
+    "sort",
+    "stat",
+    "sudo",
+    "sync",
+    "tail",
+    "timeout",
+    "touch",
+    "uname",
+    "xargs",
+];
+
+/// The exact environment name set the sealed child may observe. `env -i`
+/// supplies seven of them; dash itself adds `PWD` and nothing else.
+const TASK11_SEALED_ENVIRONMENT: &[&str] = &[
+    "HOME",
+    "LC_ALL",
+    "OLDPWD",
+    "P11SCOPE_TASK4_CALLER_ARGV0",
+    "P11SCOPE_TASK4_CALLER_PATH",
+    "P11SCOPE_TASK4_SEALED",
+    "P11SCOPE_TASK4_SEALED_BIN",
+    "PATH",
+    "PWD",
+];
+
+struct SealedDriverRun {
+    output: std::process::Output,
+    root: std::path::PathBuf,
+    repo: std::path::PathBuf,
+    facts: String,
+    tripwire_log: std::path::PathBuf,
+    environment_dump: std::path::PathBuf,
+    seal_parent: std::path::PathBuf,
+    _repo: tempfile::TempDir,
+    _fixture: tempfile::TempDir,
+}
+
+impl SealedDriverRun {
+    fn fact(&self, name: &str) -> Option<&str> {
+        self.facts.lines().find_map(|line| {
+            line.strip_prefix(name)
+                .and_then(|rest| rest.strip_prefix('\t'))
+        })
+    }
+
+    fn tripped(&self) -> String {
+        fs::read_to_string(&self.tripwire_log).unwrap_or_default()
+    }
+
+    fn stderr(&self) -> String {
+        String::from_utf8_lossy(&self.output.stderr).into_owned()
+    }
+}
+
+#[derive(Default)]
+struct Task11FixtureOptions {
+    external_rust_src_symlink: bool,
+    internal_rust_src_symlink: bool,
+    cargo_proxy_mismatch: bool,
+    cargo_proxy_regular_mismatch: bool,
+    cargo_home_raw_target_newline: bool,
+    cargo_home_canonical_target_newline: bool,
+    cargo_home_inventory_shadow: bool,
+    missing_musl: bool,
+}
+
+/// Runs the pristine driver until it reaches the pinned `sudo -n true` probe
+/// -- the first external command the receipt chain executes that a test can
+/// own -- with `sudo` replaced by a stub that is the seal's positive control:
+/// it records that it ran, dumps the environment it was handed, and plants a
+/// tripwire named for every inventory member into a directory that is FIRST
+/// in the caller's PATH. Nothing the driver runs afterwards may reach one.
+/// `rustup` is stubbed too so the 1.88 toolchain probe succeeds under the
+/// fixture HOME. Stub paths are baked in, never inherited: the seal drops
+/// every variable a stub could otherwise read.
+fn task11_run_to_the_sudo_probe(
+    extra_env: &[(&str, &str)],
+    options: Task11FixtureOptions,
+) -> SealedDriverRun {
+    let repo = task7_pristine_driver_repo();
+    let fixture = tempfile::tempdir().expect("create sealed release-driver fixture");
+    let fake_bin = fixture.path().join("bin");
+    let tripwire_bin = fixture.path().join("tripwire-bin");
+    let home = fixture.path().join("home");
+    let seal_parent = fixture.path().join("tmp");
+    let campaign = fixture.path().join("campaign");
+    for directory in [&fake_bin, &tripwire_bin, &home, &seal_parent, &campaign] {
+        fs::create_dir(directory).expect("create sealed release-driver fixture directory");
+    }
+    fs::set_permissions(&campaign, fs::Permissions::from_mode(0o700))
+        .expect("make the campaign parent private");
+
+    let tripwire_log = fixture.path().join("tripwire.log");
+    let environment_dump = fixture.path().join("sealed-environment");
+
+    // The nightly closure the eBPF object is actually built from: cargo,
+    // rustc, its sysroot, the `rust-src` tree `-Z build-std=core` consumes,
+    // and the BPF linker. `bpf-linker` lives under the effective cargo home,
+    // which Cargo prepends to the PATH of every rustc it spawns.
+    let sysroot = fixture.path().join("sysroot");
+    let rust_src = sysroot.join("lib/rustlib/src/rust");
+    fs::create_dir_all(rust_src.join("library/core/src")).expect("create rust-src fixture");
+    fs::create_dir_all(sysroot.join("lib/rustlib/x86_64-unknown-linux-musl/lib"))
+        .expect("create stable musl sysroot fixture");
+    fs::write(sysroot.join("lib/librustc_driver.so"), b"rustc-driver\n")
+        .expect("write top-level rustc driver fixture");
+    fs::write(
+        sysroot.join("lib/rustlib/x86_64-unknown-linux-musl/lib/libc.rlib"),
+        b"musl-target\n",
+    )
+    .expect("write stable musl target fixture");
+    if options.missing_musl {
+        fs::remove_dir_all(sysroot.join("lib/rustlib/x86_64-unknown-linux-musl/lib"))
+            .expect("remove stable musl target fixture");
+    }
+    for (name, body) in [
+        ("library/core/src/lib.rs", "#![no_std]\n"),
+        ("library/core/Cargo.toml", "[package]\nname = \"core\"\n"),
+    ] {
+        fs::write(rust_src.join(name), body).expect("write rust-src fixture file");
+    }
+    let cargo_bin = home.join(".cargo/bin");
+    fs::create_dir_all(&cargo_bin).expect("create the fixture cargo home");
+    fs::write(cargo_bin.join("bpf-linker"), b"#!/bin/sh\nexit 0\n").expect("write bpf-linker");
+    fs::set_permissions(
+        cargo_bin.join("bpf-linker"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("make bpf-linker executable");
+    if options.internal_rust_src_symlink {
+        std::os::unix::fs::symlink("lib.rs", rust_src.join("library/core/src/internal-link"))
+            .expect("plant an internal rust-src symlink");
+    }
+    if options.external_rust_src_symlink {
+        std::os::unix::fs::symlink("/etc/passwd", rust_src.join("library/core/planted"))
+            .expect("plant a symlink in the rust-src fixture");
+    }
+
+    let toolchain = fixture.path().join("toolchain-binary");
+    fs::write(
+        &toolchain,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n\"--print sysroot\") echo {sysroot} ;;\nesac\nexit 0\n",
+            sysroot = sysroot.display()
+        ),
+    )
+    .expect("write toolchain fixture binary");
+    fs::set_permissions(&toolchain, fs::Permissions::from_mode(0o700))
+        .expect("make the toolchain fixture binary executable");
+
+    let stub = |name: &str, body: String| {
+        let path = fake_bin.join(name);
+        fs::write(&path, body).expect("write sealed release-driver stub");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("make the sealed release-driver stub executable");
+    };
+    stub(
+        "rustup",
+        format!(
+            r#"#!/bin/sh
+case "$1 $2 $3" in
+"which --toolchain 1.88"|"which --toolchain nightly-2026-05-20") echo {toolchain}; exit 0 ;;
+esac
+exit 1
+"#,
+            toolchain = toolchain.display()
+        ),
+    );
+    let proxy_target = fake_bin.join("rustup-proxy-target");
+    fs::write(&proxy_target, b"#!/bin/sh\nexit 0\n").expect("write mismatched cargo proxy");
+    fs::set_permissions(&proxy_target, fs::Permissions::from_mode(0o700))
+        .expect("make mismatched cargo proxy executable");
+    let rustup_target = fake_bin.join("rustup");
+    let cargo_target = if options.cargo_home_canonical_target_newline {
+        let newline_target = fake_bin.join("rustup\n");
+        fs::write(&newline_target, b"#!/bin/sh\nexit 0\n")
+            .expect("write newline-terminated cargo target");
+        fs::set_permissions(&newline_target, fs::Permissions::from_mode(0o700))
+            .expect("make newline-terminated cargo target executable");
+        let intermediate = fake_bin.join("cargo-intermediate");
+        std::os::unix::fs::symlink(&newline_target, &intermediate)
+            .expect("link safe-named cargo intermediate");
+        intermediate
+    } else {
+        rustup_target.clone()
+    };
+    if options.cargo_proxy_regular_mismatch {
+        fs::write(cargo_bin.join("cargo"), b"#!/bin/sh\nexit 0\n")
+            .expect("write regular cargo proxy mismatch");
+        fs::set_permissions(cargo_bin.join("cargo"), fs::Permissions::from_mode(0o700))
+            .expect("make regular cargo proxy mismatch executable");
+    } else {
+        std::os::unix::fs::symlink(
+            if options.cargo_proxy_mismatch {
+                proxy_target.as_path()
+            } else {
+                cargo_target.as_path()
+            },
+            cargo_bin.join("cargo"),
+        )
+        .expect("link cargo proxy");
+    }
+    std::os::unix::fs::symlink(&rustup_target, cargo_bin.join("rustc")).expect("link rustc proxy");
+    std::os::unix::fs::symlink(&rustup_target, cargo_bin.join("rustup"))
+        .expect("link rustup proxy");
+    let third_party = cargo_bin.join("cargo-third-party");
+    fs::write(&third_party, b"#!/bin/sh\nexit 0\n").expect("write third-party cargo command");
+    fs::set_permissions(&third_party, fs::Permissions::from_mode(0o700))
+        .expect("make third-party cargo command executable");
+    fs::write(
+        cargo_bin.join("cargo-third-party-target"),
+        b"#!/bin/sh\nexit 0\n",
+    )
+    .expect("write third-party symlink target");
+    fs::set_permissions(
+        cargo_bin.join("cargo-third-party-target"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("make third-party symlink target executable");
+    let third_party_link_target = if options.cargo_home_raw_target_newline {
+        let external_plain_target = fake_bin.join("third-party-target");
+        fs::write(&external_plain_target, b"#!/bin/sh\nexit 0\n")
+            .expect("write plain symlink target twin");
+        fs::set_permissions(&external_plain_target, fs::Permissions::from_mode(0o700))
+            .expect("make plain symlink target twin executable");
+        let external_target = fake_bin.join("third-party-target\n");
+        fs::write(&external_target, b"#!/bin/sh\nexit 0\n")
+            .expect("write newline-terminated symlink target");
+        fs::set_permissions(&external_target, fs::Permissions::from_mode(0o700))
+            .expect("make newline-terminated symlink target executable");
+        external_target
+    } else {
+        cargo_bin.join("cargo-third-party-target")
+    };
+    std::os::unix::fs::symlink(
+        &third_party_link_target,
+        cargo_bin.join("cargo-third-party-link"),
+    )
+    .expect("link third-party cargo command");
+    if options.cargo_home_inventory_shadow {
+        fs::write(cargo_bin.join("date"), b"#!/bin/sh\nexit 0\n")
+            .expect("write cargo-home inventory shadow");
+        fs::set_permissions(cargo_bin.join("date"), fs::Permissions::from_mode(0o700))
+            .expect("make cargo-home inventory shadow executable");
+    }
+    stub(
+        "sudo",
+        format!(
+            "#!/bin/sh\n\
+             echo \"${{0##*/}}\" >> {log}\n\
+             env > {dump}\n\
+             for name in {inventory}; do\n\
+             \x20   printf '#!/bin/sh\\necho \"${{0##*/}}\" >> {log}\\nexit 97\\n' > \"{bin}/$name\"\n\
+             \x20   chmod 700 \"{bin}/$name\"\n\
+             done\n\
+             exit 1\n",
+            log = tripwire_log.display(),
+            dump = environment_dump.display(),
+            bin = tripwire_bin.display(),
+            inventory = TASK11_TOOL_INVENTORY.join(" "),
+        ),
+    );
+
+    let root = campaign.join("evidence");
+    let caller_path = format!(
+        "{}:{}:{}:/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin",
+        tripwire_bin.display(),
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg(repo.path().join("scripts/build-release.sh"))
+        .arg(&root)
+        .env("PATH", &caller_path)
+        .env("HOME", &home)
+        .env("TMPDIR", &seal_parent);
+    for name in TASK7_BUILD_INPUT_VARIABLES {
+        command.env_remove(name);
+    }
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    let output = command.output().expect("run the sealed release driver");
+    let facts = fs::read_to_string(root.join("facts.log")).unwrap_or_default();
+    SealedDriverRun {
+        output,
+        root,
+        repo: repo.path().to_path_buf(),
+        facts,
+        tripwire_log,
+        environment_dump,
+        seal_parent,
+        _repo: repo,
+        _fixture: fixture,
+    }
+}
+
+#[test]
+fn release_seal_denies_the_caller_path_to_every_reached_command() {
+    // csf_014eb65 / shadow finding 3: bare PATH-resolved commands establish
+    // HEAD, the source ledger, every digest, and the receipt itself. The
+    // ratified rule (W1 plan line 417) is that no inherited PATH authority
+    // survives anywhere in the receipt chain, so the closure is a sealed
+    // execution environment, not a longer hand-maintained tool list.
+    let run = task11_run_to_the_sudo_probe(&[], Task11FixtureOptions::default());
+    let stderr = run.stderr();
+
+    assert_eq!(
+        run.output.status.code(),
+        Some(77),
+        "the stubbed sudo probe must refuse the run: stderr={stderr:?}"
+    );
+    // The positive control proves the tripwire mechanism itself works: the
+    // one command legitimately reached after the seal did write the log.
+    assert_eq!(
+        run.tripped(),
+        "sudo\n",
+        "exactly the positive control may appear in the tripwire log"
+    );
+    assert_eq!(
+        fs::read_to_string(run.root.join("status"))
+            .expect("the refusal still writes its terminal status"),
+        "77\n"
+    );
+
+    let sealed_bin = run
+        .fact("sealed_bin")
+        .expect("the receipt records the sealed bin directory");
+    assert!(
+        !std::path::Path::new(sealed_bin).exists(),
+        "finalization left the sealed bin directory behind: {sealed_bin}"
+    );
+    assert_eq!(
+        fs::read_dir(&run.seal_parent)
+            .expect("read the seal parent")
+            .count(),
+        0,
+        "the seal parent still holds sealed-run residue"
+    );
+    // Every inventory member -- not the nine-name floor -- is recorded with
+    // the path the seal selects, what the caller's PATH resolves it to, and
+    // the pinned binary's digest.
+    for tool in TASK11_TOOL_INVENTORY {
+        let row = run
+            .fact(&format!("tool_{tool}"))
+            .unwrap_or_else(|| panic!("the receipt tool ledger omits {tool}"));
+        let fields: Vec<&str> = row.split(' ').collect();
+        assert_eq!(fields.len(), 3, "malformed tool_{tool} row: {row:?}");
+        assert!(
+            fields[0].starts_with('/') && fields[0] == fields[1],
+            "tool_{tool} must pin one absolute path the caller's PATH still resolves: {row:?}"
+        );
+        assert!(
+            fields[2].len() == 64 && fields[2].bytes().all(|b| b.is_ascii_hexdigit()),
+            "tool_{tool} must carry the pinned binary's digest: {row:?}"
+        );
+    }
+
+    // The nightly eBPF toolchain closure is an effective input of the release
+    // artifact and is bound like one. `cc` is reached through PATH by rustc's
+    // gcc-flavour linker driver, so it is an ordinary inventory member above;
+    // gcc's own collect2/ld/as come from its configured prefix, not PATH
+    // (verified by execve trace on this host).
+    for (row, shape) in [
+        ("toolchain_sysroot", 2usize),
+        ("toolchain_nightly_cargo", 2usize),
+        ("toolchain_nightly_rustc", 2),
+        ("toolchain_nightly_sysroot", 2),
+        ("toolchain_nightly_rust_src", 2),
+        ("toolchain_bpf_linker", 2),
+    ] {
+        let value = run
+            .fact(row)
+            .unwrap_or_else(|| panic!("the receipt omits the {row} closure row"));
+        let fields: Vec<&str> = value.split(' ').collect();
+        assert_eq!(fields.len(), shape, "malformed {row} row: {value:?}");
+        assert!(
+            fields[0].starts_with('/'),
+            "malformed {row} path: {value:?}"
+        );
+        if shape == 2 {
+            let digest = fields[1]
+                .strip_prefix("tree-sha256-v1:")
+                .unwrap_or(fields[1]);
+            assert!(
+                digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{row} must carry a digest: {value:?}"
+            );
+        }
+    }
+    assert!(
+        run.fact("toolchain_bpf_linker")
+            .is_some_and(|row| row.contains("/.cargo/bin/bpf-linker")),
+        "the BPF linker must be bound where rustc actually reaches it"
+    );
+
+    let caller_path = run
+        .fact("caller_path")
+        .expect("the receipt records the caller's PATH");
+    assert!(
+        caller_path
+            .split(':')
+            .any(|entry| entry.ends_with("tripwire-bin")),
+        "the recorded caller PATH is not the PATH the driver was handed: {caller_path}"
+    );
+}
+
+#[test]
+fn release_seal_exports_exactly_the_reviewed_environment() {
+    // Shadow finding 6: RUSTC_WORKSPACE_WRAPPER re-steers the official build,
+    // PYTHONPATH/PYTHONHOME re-steer both Python steps, and the GIT_* family
+    // re-steers the source authority itself -- none of them recorded. The
+    // driver runs under an explicit allowlist instead of a longer denylist.
+    // A real PYTHONPATH carrier, not a placeholder: `sitecustomize` runs on
+    // interpreter start-up, so the driver's own finalizer would execute it.
+    let carrier = tempfile::tempdir().expect("create the PYTHONPATH carrier");
+    let executed = carrier.path().join("sitecustomize-ran");
+    fs::write(
+        carrier.path().join("sitecustomize.py"),
+        format!(
+            "import pathlib\npathlib.Path({executed:?}).write_text('executed')\n",
+            executed = executed.display().to_string()
+        ),
+    )
+    .expect("write the sitecustomize carrier");
+    let carrier_path = carrier.path().display().to_string();
+    let planted = [
+        ("RUSTC_WORKSPACE_WRAPPER", "/task11/wrapper"),
+        ("P11SCOPE_SMALL_RING", "1"),
+        ("PYTHONPATH", carrier_path.as_str()),
+        ("PYTHONHOME", ""),
+        ("GIT_DIR", "/task11/git"),
+        ("GIT_WORK_TREE", "/task11/worktree"),
+        ("GIT_INDEX_FILE", "/task11/index"),
+        ("GIT_CONFIG_GLOBAL", "/task11/gitconfig"),
+        ("DOCKER_HOST", "tcp://task11.invalid:2375"),
+        ("LANG", "en_US.UTF-8"),
+    ];
+    let run = task11_run_to_the_sudo_probe(&planted, Task11FixtureOptions::default());
+    assert_eq!(
+        run.output.status.code(),
+        Some(77),
+        "the stubbed sudo probe must refuse the run: stderr={:?}",
+        run.stderr()
+    );
+
+    let dumped = fs::read_to_string(&run.environment_dump)
+        .expect("the positive control dumped the sealed environment");
+    let mut names: Vec<&str> = dumped
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(name, _)| name)
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names, TASK11_SEALED_ENVIRONMENT,
+        "the sealed child saw an environment outside its allowlist: {dumped:?}"
+    );
+    for (name, _) in planted {
+        assert!(
+            !dumped.contains(&format!("{name}=")),
+            "planted {name} survived the seal: {dumped:?}"
+        );
+    }
+    let value = |name: &str| {
+        dumped
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert_eq!(value("LC_ALL"), "C");
+    assert_eq!(value("P11SCOPE_TASK4_SEALED"), "1");
+    assert_eq!(
+        value("PATH"),
+        value("P11SCOPE_TASK4_SEALED_BIN"),
+        "PATH must be exactly the sealed bin directory"
+    );
+    assert!(
+        !executed.exists(),
+        "an inherited PYTHONPATH sitecustomize executed inside the release driver"
+    );
+
+    let driver_head = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&run.repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("read the driver repository HEAD")
+            .stdout,
+    )
+    .expect("UTF-8 HEAD");
+    assert_eq!(
+        run.fact("head"),
+        Some(driver_head.trim()),
+        "an inherited GIT_DIR must never decide the recorded HEAD"
+    );
+}
+
+#[test]
+fn release_runs_every_python3_in_isolated_mode() {
+    // Shadow finding 6's independent carrier: the pinned interpreter was
+    // launched without isolated mode, so an external `sitecustomize` or a
+    // shadowed module on PYTHONPATH executed inside both capture approval and
+    // the inline finalizer. The seal drops those variables; `-I` also refuses
+    // them for any invocation that ever runs outside it, and drops the user
+    // site directory and the script directory from sys.path as well.
+    let release = read("scripts/build-release.sh");
+    assert!(
+        release.contains("    python3 -I - \"$REPORT\" <<'PY'"),
+        "the --self-test model runner is not isolated"
+    );
+    let sites: Vec<&str> = release
+        .match_indices("T4_TOOL_python3")
+        .map(|(at, _)| &release[at..])
+        .collect();
+    assert_eq!(
+        sites.len(),
+        5,
+        "the pinned-interpreter call sites moved; re-check each one for -I"
+    );
+    for site in sites {
+        let rest = site
+            .strip_prefix("T4_TOOL_python3")
+            .and_then(|rest| rest.strip_prefix('"').or(Some(rest)))
+            .unwrap();
+        assert!(
+            rest.starts_with(" -I "),
+            "an unisolated pinned python3 invocation: {:?}",
+            &site[..site.len().min(90)]
+        );
+    }
+    // The framed checker record names the argv it actually ran.
+    assert!(
+        release.contains("t4_checker_argv=\"$T4_TOOL_python3 -I scripts/check-capture-evidence.py"),
+        "the framed checker argv does not match the isolated invocation"
+    );
+
+    // Production mutation caught: removing `-I` from
+    // `scripts/verify-attach-e2e.sh:16` must fail this contract. Strip shell
+    // comments before checking so documentation does not count as a command;
+    // `command -v python3` is a lookup, not an interpreter invocation.
+    for path in [
+        "scripts/lib.sh",
+        "scripts/verify-canaries.sh",
+        "scripts/verify-attach-e2e.sh",
+        "scripts/verify-discover-containers.sh",
+    ] {
+        let source = read(path);
+        for (line_number, line) in source.lines().enumerate() {
+            let code = line.split_once('#').map_or(line, |(code, _)| code);
+            if code.trim_start().starts_with("command -v python3") {
+                continue;
+            }
+            let mut offset = 0;
+            while let Some(relative) = code[offset..].find("python3") {
+                let start = offset + relative;
+                let end = start + "python3".len();
+                let bytes = code.as_bytes();
+                let token_before = start == 0
+                    || !bytes[start - 1].is_ascii_alphanumeric() && bytes[start - 1] != b'_';
+                let token_after =
+                    end == bytes.len() || !bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_';
+                if token_before && token_after {
+                    let after = code[end..].trim_start();
+                    let rest = after.strip_prefix("-I").unwrap_or_else(|| {
+                        panic!("unisolated executable python3 in {path}:{line_number}: {line:?}")
+                    });
+                    assert!(
+                        rest.is_empty()
+                            || (!rest.as_bytes()[0].is_ascii_alphanumeric()
+                                && rest.as_bytes()[0] != b'_'),
+                        "python3 option is not the isolated -I token in {path}:{line_number}: {line:?}"
+                    );
+                }
+                offset = end;
+            }
+        }
+    }
+}
+
+#[test]
+fn release_cargo_home_bin_closure_is_complete_and_refuses_shadows() {
+    // The rustup proxy prepends HOME/.cargo/bin to the nightly build's PATH.
+    // Every immediate entry is therefore part of the receipt: regular files,
+    // internal symlinks, and the cargo/rustc/rustup proxy identity alike.
+    let safe = task11_run_to_the_sudo_probe(&[], Task11FixtureOptions::default());
+    assert_eq!(safe.output.status.code(), Some(77));
+    for name in [
+        "cargo",
+        "rustc",
+        "rustup",
+        "bpf-linker",
+        "cargo-third-party",
+        "cargo-third-party-link",
+        "cargo-third-party-target",
+    ] {
+        assert!(
+            safe.fact(&format!("cargo_home_bin_{name}")).is_some(),
+            "the cargo-home ledger omits {name}"
+        );
+    }
+    assert!(
+        safe.fact("cargo_home_bin_cargo-third-party-link")
+            .is_some_and(|row| row.contains("cargo-third-party-target")),
+        "the cargo-home symlink row must bind its raw target"
+    );
+    assert_eq!(
+        safe.tripped(),
+        "sudo\n",
+        "the safe fixture reaches only the probe"
+    );
+
+    let shadow = task11_run_to_the_sudo_probe(
+        &[],
+        Task11FixtureOptions {
+            cargo_home_inventory_shadow: true,
+            ..Task11FixtureOptions::default()
+        },
+    );
+    assert_eq!(shadow.output.status.code(), Some(77));
+    assert!(
+        shadow.tripped().is_empty(),
+        "an exact inventory-name shadow reached the release body: {}",
+        shadow.tripped()
+    );
+
+    let mismatch = task11_run_to_the_sudo_probe(
+        &[],
+        Task11FixtureOptions {
+            cargo_proxy_mismatch: true,
+            ..Task11FixtureOptions::default()
+        },
+    );
+    assert_eq!(mismatch.output.status.code(), Some(77));
+    assert!(
+        mismatch.tripped().is_empty(),
+        "a cargo proxy mismatch reached the release body: {}",
+        mismatch.tripped()
+    );
+
+    let regular_mismatch = task11_run_to_the_sudo_probe(
+        &[],
+        Task11FixtureOptions {
+            cargo_proxy_regular_mismatch: true,
+            ..Task11FixtureOptions::default()
+        },
+    );
+    assert_eq!(regular_mismatch.output.status.code(), Some(77));
+    assert!(
+        regular_mismatch.tripped().is_empty(),
+        "a regular cargo proxy mismatch reached the release body: {}",
+        regular_mismatch.tripped()
+    );
+
+    let raw_target_newline = task11_run_to_the_sudo_probe(
+        &[],
+        Task11FixtureOptions {
+            cargo_home_raw_target_newline: true,
+            ..Task11FixtureOptions::default()
+        },
+    );
+    assert_eq!(raw_target_newline.output.status.code(), Some(77));
+    assert!(
+        raw_target_newline.tripped().is_empty(),
+        "a newline-terminated raw target reached the release body: {}",
+        raw_target_newline.tripped()
+    );
+
+    let canonical_target_newline = task11_run_to_the_sudo_probe(
+        &[],
+        Task11FixtureOptions {
+            cargo_home_canonical_target_newline: true,
+            ..Task11FixtureOptions::default()
+        },
+    );
+    assert_eq!(canonical_target_newline.output.status.code(), Some(77));
+    assert!(
+        canonical_target_newline.tripped().is_empty(),
+        "a newline-terminated two-hop canonical target reached the release body: {}",
+        canonical_target_newline.tripped()
+    );
+}
+
+#[test]
+fn release_sysroot_closure_is_bound_and_missing_musl_refuses_before_body() {
+    let release = read("scripts/build-release.sh");
+    assert!(
+        release.contains("tree-sha256-v1:"),
+        "sysroot closure does not use the typed tree digest"
+    );
+    assert!(
+        !release.contains("target add"),
+        "the release body may not mutate the stable toolchain"
+    );
+
+    let safe = task11_run_to_the_sudo_probe(
+        &[],
+        Task11FixtureOptions {
+            internal_rust_src_symlink: true,
+            ..Task11FixtureOptions::default()
+        },
+    );
+    assert_eq!(safe.output.status.code(), Some(77));
+    for row in [
+        "toolchain_sysroot",
+        "toolchain_nightly_sysroot",
+        "toolchain_nightly_rust_src",
+    ] {
+        let value = safe.fact(row).unwrap_or_else(|| panic!("missing {row}"));
+        assert!(
+            value.contains("tree-sha256-v1:"),
+            "{row} is not a typed tree digest: {value:?}"
+        );
+    }
+    assert_eq!(safe.tripped(), "sudo\n");
+
+    let missing = task11_run_to_the_sudo_probe(
+        &[],
+        Task11FixtureOptions {
+            missing_musl: true,
+            ..Task11FixtureOptions::default()
+        },
+    );
+    assert_eq!(missing.output.status.code(), Some(77));
+    assert!(
+        missing.tripped().is_empty(),
+        "missing stable musl target reached the body: {}",
+        missing.tripped()
+    );
+    assert!(
+        missing.fact("toolchain_sysroot").is_none(),
+        "missing stable musl target was recorded as a valid sysroot"
+    );
+}
+
+#[test]
+fn release_root_with_a_real_tab_is_refused_before_creation() {
+    let repo = task7_pristine_driver_repo();
+    let campaign = task7_campaign();
+    let home = tempfile::tempdir().expect("create release preflight home");
+    let bin = task7_tripwire_bin(&campaign.path().join("tripwire.log"));
+    let root = campaign.path().join("evidence\troot");
+    let output = task7_run_preflight(&repo, Some(home.path()), &bin, &root, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(77),
+        "a real tab in the root path must refuse with 77: stderr={stderr:?}"
+    );
+    assert!(!root.exists(), "the tabbed root was created before refusal");
+}
+
+#[test]
+fn release_refuses_an_external_nightly_rust_src_symlink() {
+    // `-Z build-std=core` compiles the installed `rust-src` tree into the
+    // shipped eBPF object, so the tree is an effective input and is digested
+    // whole. An external symlink is outside the typed tree closure and must
+    // refuse; an internal symlink is covered by the positive case above.
+    let run = task11_run_to_the_sudo_probe(
+        &[],
+        Task11FixtureOptions {
+            external_rust_src_symlink: true,
+            ..Task11FixtureOptions::default()
+        },
+    );
+    let stderr = run.stderr();
+    assert_eq!(
+        run.output.status.code(),
+        Some(77),
+        "a symlinked rust-src tree must refuse: stderr={stderr:?}"
+    );
+    assert!(
+        run.fact("head").is_some(),
+        "the refusal must come from the ledger, after the source facts"
+    );
+    for absent in ["toolchain_nightly_rust_src", "tool_awk", "tool_bpf-linker"] {
+        assert!(
+            run.fact(absent).is_none(),
+            "an unbindable rust-src tree still published the {absent} ledger row"
+        );
+    }
+    assert_eq!(
+        run.tripped(),
+        "",
+        "the refusal ran past the ledger into the body probe"
+    );
+    let sealed_bin = run
+        .fact("sealed_bin")
+        .expect("the receipt records the sealed bin directory");
+    assert!(
+        !std::path::Path::new(sealed_bin).exists(),
+        "finalization left the sealed bin directory behind: {sealed_bin}"
+    );
+}
+
+#[test]
+fn release_refuses_a_forged_seal_marker() {
+    // A caller who merely exports the marker must not skip the seal: the
+    // exact-name-set self-check refuses the extra variables it inherited.
+    let repo = task7_pristine_driver_repo();
+    let campaign = task7_campaign();
+    let home = tempfile::tempdir().expect("create forged-marker home");
+    let root = campaign.path().join("evidence");
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg(repo.path().join("scripts/build-release.sh"))
+        .arg(&root)
+        .env("HOME", home.path())
+        .env("P11SCOPE_TASK4_SEALED", "1");
+    for name in TASK7_BUILD_INPUT_VARIABLES {
+        command.env_remove(name);
+    }
+    let output = command
+        .output()
+        .expect("run the driver with a forged marker");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(77),
+        "a forged seal marker must refuse: stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("unsealed or forged"),
+        "the refusal must name the forged seal: stderr={stderr:?}"
+    );
+    assert!(
+        !root.exists(),
+        "the forged marker created an evidence root before refusing"
+    );
+
+    // The forgery that matters: a caller who reproduces the seal's shape --
+    // a private 0700 directory holding exactly the inventory as symlinks,
+    // PATH pointing at it, all four markers set -- but keeps one variable of
+    // its own. Only the exact-name-set check separates that from the real
+    // seal, and it must refuse before any root exists.
+    let forged_bin = campaign.path().join("forged-bin");
+    fs::create_dir(&forged_bin).expect("create the forged sealed bin");
+    fs::set_permissions(&forged_bin, fs::Permissions::from_mode(0o700)).unwrap();
+    for tool in TASK11_TOOL_INVENTORY {
+        let resolved = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("command -v {tool}"))
+            .output()
+            .expect("resolve an inventory tool");
+        assert!(
+            resolved.status.success(),
+            "inventory member {tool} is absent from this host's PATH"
+        );
+        std::os::unix::fs::symlink(
+            String::from_utf8_lossy(&resolved.stdout).trim(),
+            forged_bin.join(tool),
+        )
+        .expect("link the forged sealed bin");
+    }
+    let forged_root = campaign.path().join("forged-evidence");
+    let forged = Command::new("/bin/sh")
+        .env_clear()
+        .arg(repo.path().join("scripts/build-release.sh"))
+        .arg(&forged_root)
+        .env("PATH", &forged_bin)
+        .env("HOME", home.path())
+        .env("LC_ALL", "C")
+        .env("P11SCOPE_TASK4_SEALED", "1")
+        .env("P11SCOPE_TASK4_SEALED_BIN", &forged_bin)
+        .env("P11SCOPE_TASK4_CALLER_PATH", "/forged")
+        .env("P11SCOPE_TASK4_CALLER_ARGV0", "forged")
+        .env("PYTHONPATH", "/task11/forged-python")
+        .output()
+        .expect("run the driver with a reproduced seal plus one extra variable");
+    let forged_stderr = String::from_utf8_lossy(&forged.stderr);
+    assert_eq!(
+        forged.status.code(),
+        Some(77),
+        "one variable outside the allowlist must refuse: stderr={forged_stderr:?}"
+    );
+    assert!(
+        forged_stderr.contains("unsealed or forged"),
+        "the refusal must name the forged seal: stderr={forged_stderr:?}"
+    );
+    assert!(
+        !forged_root.exists(),
+        "the forged seal created an evidence root before refusing"
+    );
+}
+
+#[test]
+fn release_pins_its_reached_command_inventory_and_sealed_environment() {
+    let release = read("scripts/build-release.sh");
+
+    let inventory: Vec<&str> = between(&release, "\nTASK4_TOOL_INVENTORY='", "'")
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        inventory, TASK11_TOOL_INVENTORY,
+        "the driver's reached-command inventory drifted from the contract"
+    );
+    let mut ordered = TASK11_TOOL_INVENTORY.to_vec();
+    ordered.sort_unstable();
+    assert_eq!(
+        ordered, TASK11_TOOL_INVENTORY,
+        "the inventory must stay in LC_ALL=C order: the seal compares it to `ls -A1` directly"
+    );
+    assert_eq!(
+        between(&release, "\nTASK4_SEALED_ENVIRONMENT='", "'")
+            .lines()
+            .collect::<Vec<_>>(),
+        TASK11_SEALED_ENVIRONMENT,
+        "the driver's sealed-environment allowlist drifted from the contract"
+    );
+
+    // The seal is built in the unsealed parent, before any root, lock, git,
+    // tool, or cargo-config decision -- and after the ten explicit refusals,
+    // which stay recognisable named signals rather than becoming a silent drop.
+    let bootstrap = between(&release, "\ntask4_seal_and_reexec() {", "\n}\n");
+    let refusal = bootstrap
+        .find("echo \"refusing inherited $t4_var\" >&2; exit 77;")
+        .expect("the bootstrap refuses each inherited build input by name");
+    let reexec = bootstrap
+        .find("exec \"$t4_seal_env\" -i")
+        .expect("the bootstrap re-execs under an emptied environment");
+    assert!(
+        refusal < reexec,
+        "the inherited-build-input refusals must precede the re-exec"
+    );
+    let seal = release
+        .find("task4_seal_and_reexec \"$1\"")
+        .expect("the driver seals its environment before the receipt chain");
+    for later in [
+        "\n    task4_prepare_root \"$1\"",
+        "TASK4_HEAD=$(git rev-parse HEAD)",
+        "TASK4_CONFIGS=$(task4_cargo_config_scan)",
+        "\"$T4_TOOL_sudo\" -n true",
+    ] {
+        assert!(
+            seal < release
+                .find(later)
+                .unwrap_or_else(|| panic!("missing {later}")),
+            "the seal must precede {later}"
+        );
+    }
+
+    // The ledger covers every inventory member, not the nine-name floor.
+    assert!(
+        release.contains("for t4_tool in $TASK4_TOOL_INVENTORY; do"),
+        "the tool ledger still walks a hand-maintained name list"
+    );
+    assert!(
+        release.contains("PATH=\"$P11SCOPE_TASK4_CALLER_PATH\" command -v"),
+        "the ledger never re-resolves the caller's PATH, so a divergence cannot refuse"
+    );
+    // The nightly closure is rechecked at finalization, so it lives in the
+    // ledger the finalizer compares, not in a one-shot preflight block.
+    let ledger = between(&release, "\ntask4_tool_ledger() {", "\n}\n");
+    assert!(
+        ledger.contains("task4_nightly_closure || return 1"),
+        "the rechecked tool ledger does not bind the nightly closure"
+    );
+    let ledger = between(&release, "\ntask4_nightly_closure() {", "\n}\n");
+    for row in [
+        "toolchain_nightly_cargo",
+        "toolchain_nightly_rustc",
+        "toolchain_nightly_sysroot",
+        "toolchain_nightly_rust_src",
+        "toolchain_bpf_linker",
+    ] {
+        assert!(
+            ledger.contains(row),
+            "the rechecked tool ledger omits {row}"
+        );
+    }
+    assert!(
+        ledger.contains("nightly-2026-05-20"),
+        "the ledger does not name the pinned nightly toolchain"
+    );
+    assert!(
+        ledger.contains("task4_tree_digest \"$t4_src\""),
+        "the rust-src closure does not use the typed tree digest"
+    );
+    assert!(
+        ledger.contains("librustc_driver*.so"),
+        "the sysroot closure does not require the top-level compiler driver"
+    );
+
+    // The sealed bin directory is evidence until the receipt status exists.
+    let finalize = between(&release, "\ntask4_finalize() {", "\ntask4_receipt_run() {");
+    let status = finalize
+        .find("printf '%s\\n' \"$t4_result\" > \"$TASK4_ROOT/status\"")
+        .expect("finalization writes the terminal status");
+    let removal = finalize
+        .find("rm -rf \"$P11SCOPE_TASK4_SEALED_BIN\"")
+        .expect("finalization removes the sealed bin directory");
+    assert!(
+        status < removal,
+        "the sealed bin directory is removed before the receipt status is written"
+    );
 }
 
 #[test]
@@ -1181,11 +3017,11 @@ real_python=$(command -v python3)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 python3() {
-    if [ "$1" = - ]; then
-        case ${3-} in
+    if [ "$1" = -I ] && [ "$2" = - ]; then
+        case ${4-} in
             ''|*[!0-9]*) command "$real_python" "$@"; return ;;
         esac
-        "$real_python" - "$2" <<'PY'
+        "$real_python" -I - "$3" <<'PY'
 import json
 import sys
 
@@ -1687,8 +3523,8 @@ fn port_forward_term_during_launch_reaps_the_trap_visible_generation() {
     fs::write(
         &python_wrapper,
         r#"#!/bin/sh
-if [ "$1" = - ] && [ "$#" -gt 5 ]; then
-    case ${3-} in
+if [ "$1" = -I ] && [ "$2" = - ] && [ "$#" -gt 6 ]; then
+    case ${4-} in
         ''|*[!0-9]*) ;;
         *)
             [ -e "$PF_TEST_WORK/validation" ] || : > "$PF_TEST_WORK/validation"
@@ -1825,11 +3661,11 @@ fn mutated_process_group_record_never_signals_the_live_decoy_or_unvalidated_owne
     fs::write(
         &python_wrapper,
         r#"#!/bin/sh
-if [ "$1" = - ] && [ "$#" -gt 5 ]; then
-    case ${3-} in
+if [ "$1" = -I ] && [ "$2" = - ] && [ "$#" -gt 6 ]; then
+    case ${4-} in
         ''|*[!0-9]*) ;;
         *) [ -e "$PF_TEST_WORK/mutated" ||
-    "$PF_TEST_REAL_PYTHON" - "$2" "$PF_TEST_WORK" <<'PY'
+    "$PF_TEST_REAL_PYTHON" -I - "$3" "$PF_TEST_WORK" <<'PY'
 import json
 import os
 import subprocess
@@ -2375,7 +4211,7 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         "freeze-missing-rejected",
         "freeze-duplicate-rejected",
         "freeze-inventory-mutation-rejected",
-        "g1-160-93-186-exact-accepted",
+        "g1-161-93-186-exact-accepted",
         "g1-missing-rejected",
         "g1-duplicate-rejected",
         "g1-cardinality-mutation-rejected",
@@ -2445,6 +4281,20 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         "same-shell-single-finalizer-exact-accepted",
         "cleanup-failure-upgrades-one-status-written-last",
         "absolute-nested-work-and-legacy-defaults-exact-accepted",
+        "untracked-build-input-rejected-status-77-no-touch-before-body",
+        "recorded-tool-replaced-between-preflight-and-finalization-rejected",
+        "path-change-resolving-a-different-binary-rejected",
+        "literal-static-smoke-capture-path-exact-accepted",
+        "decoy-observed-json-under-work-rejected",
+        "aggregate-stdout-as-checker-evidence-rejected",
+        "sealed-command-inventory-pinned-before-root-and-git-decisions",
+        "sealed-environment-allowlist-exact-accepted",
+        "forged-seal-marker-rejected",
+        "inventory-wide-tool-ledger-exact-accepted",
+        "sealed-bin-removed-after-terminal-status",
+        "nightly-toolchain-closure-exact-accepted",
+        "isolated-python-invocations-exact-accepted",
+        "tab-or-newline-root-rejected-status-77",
     ];
     const LANE16_CASES: &[&str] = &[
         "never-68-68-136-one-timing-zero-loss-ambiguity-inflight-child-false-none-0-0-0-exact-accepted",
@@ -5454,6 +7304,38 @@ fn every_gate_script_self_tests_its_own_validator() {
             "echo \"=== scripts/verify-capability-tier.sh ===\"\nscripts/verify-capability-tier.sh"
         ),
         "the live capability-tier validator is not labelled at the root gate boundary"
+    );
+    // The induced-gaps driver mirrors the capability-tier idiom: one labelled
+    // standalone live call carrying its Task 4 receipt-contract argument (an
+    // absent path under a fresh private mktemp -d root), never the generic loop.
+    let induced_live_call = r#"scripts/verify-induced-gaps.sh "$(mktemp -d "${TMPDIR:-/tmp}/p11scope-gates-XXXXXX")/induced-gaps""#;
+    assert_eq!(
+        gates
+            .lines()
+            .filter(|line| *line == induced_live_call)
+            .count(),
+        1,
+        "the induced-gaps driver must have exactly one standalone live call with its \
+         mktemp-rooted absent-path argument"
+    );
+    assert_eq!(
+        live_section
+            .lines()
+            .filter(|line| *line == induced_live_call)
+            .count(),
+        1,
+        "the standalone live induced-gaps call must follow the live gate loop"
+    );
+    assert!(
+        !live_gate_loop.contains("scripts/verify-induced-gaps.sh"),
+        "the induced-gaps driver must not be added to the generic live gate loop"
+    );
+    assert!(
+        live_section.contains(concat!(
+            "echo \"=== scripts/verify-induced-gaps.sh ===\"\n",
+            r#"scripts/verify-induced-gaps.sh "$(mktemp -d "#
+        )),
+        "the live induced-gaps driver is not labelled at the root gate boundary"
     );
     assert!(
         ci.contains("python3 scripts/check-live-discovery-evidence.py --self-test"),

@@ -160,7 +160,9 @@ DISCOVERY_REASONS = {
     SHARED_OVERLAY_UNCERTAINTY,
 }
 ENTRY_REASONS = {"null pointer", ENTRY_UNAVAILABLE}
-G1_SURFACES = Counter({("full", 68): 1, ("full", 92): 1, ("not_walked", 0): 1})
+# Both walks publish the provider's two tables, so every walked surface is
+# doubled; the unwalked one is a single scan-side record.
+G1_SURFACES = Counter({("full", 68): 2, ("full", 92): 2, ("not_walked", 0): 1})
 LEGACY_SURFACES = Counter({("full", 68): 1})
 # `p11scope_ebpf_common::MAX_SLOTS` (src/discovery/scan.rs, plan:83): the frozen
 # attach ceiling a whole-module capacity refusal is taken against.
@@ -1210,11 +1212,17 @@ def validate_canary(lane, document):
     """A canary lane: the version-matrix provider, exact in shape and policy.
 
     The third element of each row is how discovery saw the provider. The canary
-    workload maps it before attach, so both sources describe it (`scanned`); the
-    freeze lane's workload is released only after attach, so the manifest stands
-    alone (`manifest-only`). Nothing else about those lanes differs, and neither
-    value is optional: a lane that scanned when it should not have, or failed to
-    scan when it should have, fails here.
+    workload maps it before attach, so both sources describe it (`scanned`).
+    Since 1d3837b the initial provider export hooks attach before readiness, so
+    a workload released only after attach is still observed live: its bootstrap
+    calls trigger the scan, which corroborates the manifest mid-capture. The
+    live freeze lane therefore measures the scanned row exactly, and
+    verify-induced-gaps.sh validates its capture as `feature-unsafe-profile`.
+    The `freeze-unsafe-profile` row keeps the manifest-only expectation — still
+    a real shape for a target that never calls into the provider during
+    capture — under its contracted self-test marker. Neither value is optional:
+    a lane that scanned when it should not have, or failed to scan when it
+    should have, fails here.
     """
     lanes = {
         "default-safe-profile": ("safe", "profile", "scanned"),
@@ -1283,10 +1291,21 @@ def validate_canary(lane, document):
 
 
 # Every induced-gap lane holds its workload behind a go-file, so nothing has
-# dlopened the provider when the observer attaches and the scan finds nothing in
-# scope to corroborate the manifest against. One uncorroborated module each,
-# exactly — the gap being induced is never the discovery one.
-INDUCED_ALLOWANCES = {"discovery_uncorroborated": 1}
+# dlopened the provider when the observer attaches. Since 1d3837b the initial
+# provider export hooks attach before readiness, so the workload's bootstrap
+# calls trigger a live scan that corroborates the manifest mid-capture: the
+# single-table providers (G2, G3) read `agreed`, while the version-matrix
+# provider (G4, G5) yields a three-table scan subset and reads `conflict`.
+# The gap being induced is never the discovery one.
+#
+# G1 is a single-table provider too, so it reads `agreed` like G2 and G3, and
+# nothing in any lane is uncorroborated any more. Its 161 table entries are 159
+# deduplicated targets plus one null-entry skip record per walking source:
+# `src/plan.rs` `decoded_occurrence_count` keys targets across sources but skips
+# per source, because a skip is a per-walk disclosure and a target is a physical
+# thing. The same per-source keying is what doubles `evidence.skipped`, and
+# `corroborate` decides `agreed` on the deduplicated targets, so 161 entries and
+# an agreed module are one consistent statement, not a contradiction.
 
 
 def validate_induced(lane, document):
@@ -1297,24 +1316,29 @@ def validate_induced(lane, document):
     exact_capture_modules(document)
     evidence = document["evidence"]
     sources = [module["sources"] for module in evidence["discovery"]]
-    require(sources == [["manifest"]], f"unexpected discovery sources: {sources}")
+    require(sources == [["scan", "manifest"]], f"unexpected discovery sources: {sources}")
+    outcomes = [module["corroboration"] for module in evidence["discovery"]]
+    wanted_outcomes = [["conflict"]] if lane in {"G4", "G5"} else [["agreed"]]
+    require(outcomes == wanted_outcomes, f"unexpected corroboration: {outcomes}")
 
     if lane == "G1":
         aliases = [["C_CancelFunction", "C_WaitForSlotEvent"]]
-        skipped = [{"name": "C_GetFunctionStatus", "reason": "null pointer"}]
-        exact_shape(evidence, 160, 93, 186, G1_SURFACES, 1, "ok")
+        # One null-entry disclosure per walking source: the manifest walk and
+        # the live scan walk each report the provider's single NULL entry.
+        skipped = [{"name": "C_GetFunctionStatus", "reason": "null pointer"}] * 2
+        exact_shape(evidence, 161, 93, 186, G1_SURFACES, 1, "ok")
         exact_common(evidence, aliases=aliases, skipped=skipped, in_flight=0)
-        exact_counters(evidence, INDUCED_ALLOWANCES)
+        exact_counters(evidence)
     elif lane == "G2":
         groups = evidence["aliased"]
         require(len(groups) == 1, f"G2 aliases: {groups}")
         require(len(groups[0]) == len(set(groups[0])) == 67, f"G2 alias group: {groups}")
         require("C_WaitForSlotEvent" not in groups[0], f"G2 stranded name was aliased: {groups}")
-        exact_shape(evidence, 68, 2, 4, LEGACY_SURFACES, 0, "absent")
+        exact_shape(evidence, 68, 2, 4, LEGACY_SURFACES + LEGACY_SURFACES, 0, "absent")
         exact_common(evidence, aliases=groups, skipped=[], in_flight=1)
-        exact_counters(evidence, INDUCED_ALLOWANCES)
+        exact_counters(evidence)
     elif lane == "G3":
-        exact_shape(evidence, 68, 68, 136, LEGACY_SURFACES, 0, "absent")
+        exact_shape(evidence, 68, 68, 136, LEGACY_SURFACES + LEGACY_SURFACES, 0, "absent")
         exact_common(evidence, aliases=[], skipped=[], in_flight=0)
         require(evidence["event_loss"] > 0, f"event_loss: {evidence['event_loss']}")
         require(evidence["unmatched_closes"] in (0, 1), evidence["unmatched_closes"])
@@ -1326,26 +1350,25 @@ def validate_induced(lane, document):
         exact_counters(
             evidence,
             dict(
-                INDUCED_ALLOWANCES,
                 event_loss=evidence["event_loss"],
                 unmatched_closes=evidence["unmatched_closes"],
             ),
         )
     elif lane == "G4":
-        exact_shape(evidence, *VERSION_SHAPE_MANIFEST_ONLY)
+        exact_shape(evidence, *VERSION_SHAPE_SCANNED)
         exact_common(evidence, aliases=[], skipped=[], in_flight=9)
-        exact_counters(evidence, dict(INDUCED_ALLOWANCES, start_insert_failures=8))
+        exact_counters(evidence, {"discovery_conflicts": 1, "start_insert_failures": 8})
     else:
-        exact_shape(evidence, *VERSION_SHAPE_MANIFEST_ONLY)
+        exact_shape(evidence, *VERSION_SHAPE_SCANNED)
         exact_common(evidence, aliases=[], skipped=[], in_flight=0)
         exact_counters(
             evidence,
-            dict(
-                INDUCED_ALLOWANCES,
-                rv_update_failures=9,
-                unregistered_mechanisms=6,
-                async_orphans=1,
-            ),
+            {
+                "discovery_conflicts": 1,
+                "rv_update_failures": 9,
+                "unregistered_mechanisms": 6,
+                "async_orphans": 1,
+            },
         )
         require(sum(item["calls"] for item in document["functions"]) == 11, document["functions"])
 
@@ -2028,18 +2051,18 @@ def self_test():
     print("canary aggregate exact baseline: OK")
 
     induced = {}
-    g1 = evidence_fixture(G1_SURFACES, sources=("manifest",))
+    g1 = evidence_fixture(G1_SURFACES, sources=("scan", "manifest"))
     g1.update(
-        table_entries=160,
+        table_entries=161,
         slots=93,
         attached_probes=186,
         vendor_interfaces=1,
         interface_list="ok",
         aliased=[["C_CancelFunction", "C_WaitForSlotEvent"]],
-        skipped=[{"name": "C_GetFunctionStatus", "reason": "null pointer"}],
+        skipped=[{"name": "C_GetFunctionStatus", "reason": "null pointer"}] * 2,
     )
     induced["G1"] = document_fixture(g1)
-    g2 = evidence_fixture(LEGACY_SURFACES, sources=("manifest",))
+    g2 = evidence_fixture(LEGACY_SURFACES + LEGACY_SURFACES, sources=("scan", "manifest"))
     g2.update(
         table_entries=68,
         slots=2,
@@ -2048,7 +2071,7 @@ def self_test():
         aliased=[[f"C_Alias_{index}" for index in range(67)]],
     )
     induced["G2"] = document_fixture(g2)
-    g3 = evidence_fixture(LEGACY_SURFACES, sources=("manifest",))
+    g3 = evidence_fixture(LEGACY_SURFACES + LEGACY_SURFACES, sources=("scan", "manifest"))
     g3.update(
         table_entries=68,
         slots=68,
@@ -2060,12 +2083,11 @@ def self_test():
     induced["G3"]["functions"] = function_items(
         [([name], calls) for name, calls in G3_COUNTS.items()]
     )
-    g4 = copy.deepcopy(freeze_evidence)
-    g4.update(in_flight_at_end=9, start_insert_failures=8, **{k: 0 for k in UNSAFE_ALLOWANCES})
+    g4 = copy.deepcopy(version)
+    g4.update(in_flight_at_end=9, start_insert_failures=8)
     induced["G4"] = document_fixture(g4)
-    g5 = copy.deepcopy(freeze_evidence)
-    g5.update(rv_update_failures=9, unregistered_mechanisms=6, async_orphans=1,
-              **{k: 0 for k in UNSAFE_ALLOWANCES if k not in ("async_orphans",)})
+    g5 = copy.deepcopy(version)
+    g5.update(rv_update_failures=9, unregistered_mechanisms=6, async_orphans=1)
     induced["G5"] = document_fixture(g5)
     induced["G5"]["functions"] = function_items([(["C_Initialize"], 11)])
     for lane, document in induced.items():

@@ -9,10 +9,11 @@ use crate::discovery::hooks::HookRegistry;
 use crate::process::{MountNamespaceId, ProcessView, ProcessViewId};
 use p11scope_manifest::elf::exports_matching;
 use p11scope_manifest::identity::open_object;
-use p11scope_manifest::maps::{MapEntry, MappedPath, ObjectKey, Resolved, parse_maps, resolve};
+use p11scope_manifest::maps::{MapEntry, MapIndex, MappedPath, ObjectKey, Resolved, parse_maps};
 use pkcs11_module::{Surface, TableSet, TableSpan, read_fn_pointers, tables_for};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
+use std::io::Read;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -26,8 +27,22 @@ const STANDARD_INTERFACE_NAME: &[u8] = b"PKCS 11";
 const MAX_TABLE_CANDIDATES: usize = 512;
 const MAX_DECODED_TABLE_ENTRIES: usize = 512 * 104;
 const MAX_INTERFACE_RECORDS: usize = 512;
+const MAX_MAPS_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_MAP_ENTRIES: usize = 1_048_576;
+// ponytail: this independent ceiling is the calibration knob if real providers hit it.
+const DEFAULT_WORK_CEILING: u64 = 16 * 1024 * 1024;
 pub(crate) const IO_CEILING_REASON: &str =
     "capture attempted-I/O ceiling reached; remaining provider bytes were not read";
+pub(crate) const WORK_CEILING_REASON: &str =
+    "capture discovery work ceiling reached; remaining provider bytes were not scanned";
+pub(crate) const SCAN_DEADLINE_REASON: &str =
+    "capture discovery deadline reached; remaining provider bytes were not scanned";
+pub(crate) const SCAN_CLOCK_REASON: &str =
+    "monotonic clock read failed; remaining provider bytes were not scanned";
+pub(crate) const MAPS_CEILING_REASON: &str =
+    "capture /proc maps byte ceiling reached; remaining mappings were not read";
+pub(crate) const MAPS_ENTRY_CEILING_REASON: &str =
+    "capture /proc maps entry ceiling reached; remaining mappings were not read";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanLimits {
@@ -55,6 +70,16 @@ pub struct CaptureWorkBudget {
     interface_records: usize,
     table_exhaustion_reported: bool,
     interface_exhaustion_reported: bool,
+    work_ceiling: u64,
+    work_units: u64,
+    deadline_ns: Option<u64>,
+    /// Test-only: the deadline most recently *installed* (a `Some` passed to
+    /// `set_deadline`). The end-of-batch `None` clear leaves it in place, so a
+    /// test can observe what a finished batch apply actually forwarded.
+    #[cfg(test)]
+    pub(crate) last_installed_deadline: Option<u64>,
+    scan_stop_reason: Option<&'static str>,
+    scan_stop_reported: bool,
 }
 
 impl CaptureWorkBudget {
@@ -67,6 +92,13 @@ impl CaptureWorkBudget {
             interface_records: 0,
             table_exhaustion_reported: false,
             interface_exhaustion_reported: false,
+            work_ceiling: DEFAULT_WORK_CEILING,
+            work_units: 0,
+            deadline_ns: None,
+            #[cfg(test)]
+            last_installed_deadline: None,
+            scan_stop_reason: None,
+            scan_stop_reported: false,
         }
     }
 
@@ -93,10 +125,114 @@ impl CaptureWorkBudget {
     }
 
     pub(crate) fn record_io(&mut self, bytes: usize) {
-        self.attempted_io_bytes += bytes as u64;
+        self.attempted_io_bytes = self.attempted_io_bytes.saturating_add(bytes as u64);
+    }
+
+    pub fn charge(&mut self, units: u64) -> bool {
+        if self.scan_stop_reason.is_some() {
+            return false;
+        }
+        let Some(next) = self.work_units.checked_add(units) else {
+            self.scan_stop_reason = Some(WORK_CEILING_REASON);
+            return false;
+        };
+        if next > self.work_ceiling {
+            self.scan_stop_reason = Some(WORK_CEILING_REASON);
+            return false;
+        }
+        self.work_units = next;
+        true
+    }
+
+    pub fn set_deadline(&mut self, deadline_ns: Option<u64>) {
+        #[cfg(test)]
+        if deadline_ns.is_some() {
+            self.last_installed_deadline = deadline_ns;
+        }
+        self.deadline_ns = deadline_ns;
+        if deadline_ns.is_none()
+            && matches!(
+                self.scan_stop_reason,
+                Some(SCAN_DEADLINE_REASON | SCAN_CLOCK_REASON)
+            )
+        {
+            self.scan_stop_reason = None;
+            self.scan_stop_reported = false;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deadline_for_test(&self) -> Option<u64> {
+        self.deadline_ns
+    }
+
+    fn check_deadline(&mut self, now: Option<u64>) -> Option<&'static str> {
+        if let Some(reason) = self.scan_stop_reason {
+            return Some(reason);
+        }
+        let deadline = self.deadline_ns?;
+        let reason = match now {
+            Some(now) if now < deadline => return None,
+            Some(_) => SCAN_DEADLINE_REASON,
+            None => SCAN_CLOCK_REASON,
+        };
+        self.scan_stop_reason = Some(reason);
+        Some(reason)
+    }
+
+    pub(crate) fn check_deadline_now(&mut self) -> Option<&'static str> {
+        if self.deadline_ns.is_some() {
+            self.check_deadline(crate::attach::monotonic_ns())
+        } else {
+            None
+        }
+    }
+
+    /// The capture's stop, sticky reason first and otherwise one clock poll:
+    /// the single question every live admission asks before doing more work.
+    pub(crate) fn stopped_now(&mut self) -> Option<&'static str> {
+        if let Some(reason) = self.scan_stop_reason {
+            return Some(reason);
+        }
+        self.check_deadline_now()
+    }
+
+    /// One charged step of live map work, refused under the budget's own stop
+    /// reason so a caller publishes what actually stopped it.
+    pub(crate) fn spend(&mut self, units: u64) -> Result<(), &'static str> {
+        if self.charge(units) {
+            Ok(())
+        } else {
+            Err(self.scan_stop_reason.unwrap_or(WORK_CEILING_REASON))
+        }
+    }
+
+    pub(crate) fn take_scan_stop_reason(&mut self) -> Option<&'static str> {
+        let reason = self.scan_stop_reason?;
+        if self.scan_stop_reported {
+            None
+        } else {
+            self.scan_stop_reported = true;
+            Some(reason)
+        }
+    }
+
+    fn scan_stopped(&self) -> bool {
+        self.scan_stop_reason.is_some()
+    }
+
+    fn allowed_capture_io(&self, wanted: usize) -> usize {
+        self.limits
+            .total_bytes
+            .saturating_sub(self.attempted_io_bytes)
+            .try_into()
+            .map_or(usize::MAX, |left| wanted.min(left))
     }
 
     pub(crate) fn admit_table(&mut self, entries: usize) -> bool {
+        if self.scan_stopped() {
+            return false;
+        }
         let Some(decoded) = self.decoded_table_entries.checked_add(entries) else {
             return false;
         };
@@ -125,6 +261,9 @@ impl CaptureWorkBudget {
     }
 
     pub(crate) fn admit_interface(&mut self) -> bool {
+        if self.scan_stopped() {
+            return false;
+        }
         if self.interface_records == MAX_INTERFACE_RECORDS {
             return false;
         }
@@ -309,8 +448,7 @@ fn decode_candidate(
     snapshot: &[u8],
     offset: usize,
     base_address: u64,
-    maps: &[MapEntry],
-    mapped: &std::ops::Range<u64>,
+    maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
 ) -> Result<Option<(ScannedTable, usize)>, ()> {
     let Some(raw_word) = offset
@@ -340,6 +478,9 @@ fn decode_candidate(
     let mut non_null = 0usize;
     for span in spans {
         for field in span.fields() {
+            if !budget.charge(1) {
+                return Err(());
+            }
             let Some(raw) = field
                 .offset
                 .checked_add(WORD)
@@ -352,12 +493,9 @@ fn decode_candidate(
                 continue;
             }
             non_null += 1;
-            if !mapped.contains(&(value as u64)) {
-                return Ok(None); // outside every mapping ⇒ resolve would say Unmapped
-            }
             let Resolved::File {
                 permissions, path, ..
-            } = resolve(maps, value as u64)
+            } = maps.resolve(value as u64)
             else {
                 return Ok(None); // anonymous or unmapped ⇒ not a function table
             };
@@ -391,7 +529,7 @@ fn decode_candidate(
                 device,
                 inode,
                 ..
-            } = resolve(maps, value as u64)
+            } = maps.resolve(value as u64)
             else {
                 unreachable!("validated above")
             };
@@ -424,29 +562,57 @@ fn decode_candidate(
 fn detect_tables(
     snapshot: &[u8],
     base_address: u64,
-    maps: &[MapEntry],
+    maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
 ) -> (Vec<ScannedTable>, Vec<String>) {
-    // One pass over the maps here saves a linear `resolve` scan per rejected word.
-    let (low, high) = maps.iter().fold((u64::MAX, 0), |(low, high), entry| {
-        (low.min(entry.start), high.max(entry.end))
-    });
-    let mapped = low..high;
+    detect_tables_with_clock(
+        snapshot,
+        base_address,
+        maps,
+        budget,
+        crate::attach::monotonic_ns,
+    )
+}
+
+fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
+    snapshot: &[u8],
+    base_address: u64,
+    maps: &MapIndex<'_>,
+    budget: &mut CaptureWorkBudget,
+    mut now: F,
+) -> (Vec<ScannedTable>, Vec<String>) {
     let mut skipped = Vec::new();
     let mut found: Vec<(usize, usize, ScannedTable)> = Vec::new();
     let mut offset = 0usize;
     while offset + WORD <= snapshot.len() {
+        if (offset / WORD) % 4096 == 0
+            && budget.deadline_ns.is_some()
+            && budget.check_deadline(now()).is_some()
+        {
+            if let Some(reason) = budget.take_scan_stop_reason() {
+                skipped.push(reason.into());
+            }
+            break;
+        }
         if budget.tables_exhausted() {
             if let Some(reason) = budget.table_exhaustion_reason() {
                 skipped.push(reason);
             }
             break;
         }
-        match decode_candidate(snapshot, offset, base_address, maps, &mapped, budget) {
+        if !budget.charge(1) {
+            if let Some(reason) = budget.take_scan_stop_reason() {
+                skipped.push(reason.into());
+            }
+            break;
+        }
+        match decode_candidate(snapshot, offset, base_address, maps, budget) {
             Ok(Some((table, len))) => found.push((offset, len, table)),
             Ok(None) => {}
             Err(()) => {
-                if let Some(reason) = budget.table_exhaustion_reason() {
+                if let Some(reason) = budget.take_scan_stop_reason() {
+                    skipped.push(reason.into());
+                } else if let Some(reason) = budget.table_exhaustion_reason() {
                     skipped.push(reason);
                 }
                 break;
@@ -479,10 +645,33 @@ fn scan_interfaces(
     snapshot: &[u8],
     mem: &File,
     tables: &[ScannedTable],
-    maps: &[MapEntry],
+    maps: &MapIndex<'_>,
     key: ObjectKey,
     budget: &mut CaptureWorkBudget,
     operation_bytes: &mut u64,
+) -> (Vec<ScannedInterface>, Vec<String>) {
+    scan_interfaces_with_clock(
+        snapshot,
+        mem,
+        tables,
+        maps,
+        key,
+        budget,
+        operation_bytes,
+        crate::attach::monotonic_ns,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
+    snapshot: &[u8],
+    mem: &File,
+    tables: &[ScannedTable],
+    maps: &MapIndex<'_>,
+    key: ObjectKey,
+    budget: &mut CaptureWorkBudget,
+    operation_bytes: &mut u64,
+    mut now: F,
 ) -> (Vec<ScannedInterface>, Vec<String>) {
     let word_at = |offset: usize| -> Option<u64> {
         Some(u64::from_ne_bytes(
@@ -495,11 +684,34 @@ fn scan_interfaces(
     let mut found = Vec::new();
     let mut skipped = Vec::new();
     let mut io_exhausted = false;
+    let by_address: HashMap<u64, usize> =
+        tables
+            .iter()
+            .enumerate()
+            .fold(HashMap::new(), |mut by_address, (index, table)| {
+                by_address.entry(table.address).or_insert(index);
+                by_address
+            });
     let mut offset = 0usize;
     while offset + INTERFACE_BYTES <= snapshot.len() {
+        if (offset / WORD) % 4096 == 0
+            && budget.deadline_ns.is_some()
+            && budget.check_deadline(now()).is_some()
+        {
+            if let Some(reason) = budget.take_scan_stop_reason() {
+                skipped.push(reason.into());
+            }
+            break;
+        }
         if budget.interfaces_exhausted() {
             if let Some(reason) = budget.interface_exhaustion_reason() {
                 skipped.push(reason);
+            }
+            break;
+        }
+        if !budget.charge(1) {
+            if let Some(reason) = budget.take_scan_stop_reason() {
+                skipped.push(reason.into());
             }
             break;
         }
@@ -510,7 +722,7 @@ fn scan_interfaces(
             // The function-list pointer is the anchor: without it a triple of words
             // is just data. Requiring a decoded table also keeps the byte budget —
             // only the provider's own mappings are ever read.
-            let table = tables.iter().position(|t| t.address == table_ptr)?;
+            let table = by_address.get(&table_ptr).copied()?;
             if !budget.admit_interface() {
                 return None;
             }
@@ -518,18 +730,20 @@ fn scan_interfaces(
             // pointer of a look-alike structure could aim anywhere. Only this object's
             // own readable pages — where a provider keeps its interface names — are
             // ever dereferenced; anything else is recorded without being read.
-            let mapping_end = matches!(
-                resolve(maps, name_ptr),
-                Resolved::File {
-                    device, inode, permissions, ..
-                } if permissions[0] == b'r' && ObjectKey { device, inode } == key
-            )
-            .then(|| {
-                maps.iter()
-                    .find(|entry| entry.start <= name_ptr && name_ptr < entry.end)
-                    .map(|entry| entry.end)
-            })
-            .flatten();
+            let mapping_end = maps
+                .containing(name_ptr)
+                .filter(|entry| {
+                    entry.permissions[0] == b'r'
+                        && ObjectKey {
+                            device: entry.device,
+                            inode: entry.inode,
+                        } == key
+                        && entry
+                            .raw_path
+                            .as_deref()
+                            .is_some_and(|path| path.starts_with(b"/"))
+                })
+                .map(|entry| entry.end);
             let (name_class, name_lossy) = match name_ptr {
                 0 => ("null", None),
                 _ if mapping_end.is_none() => ("unreadable", None),
@@ -562,7 +776,12 @@ fn scan_interfaces(
             found.push(scanned);
         }
         if io_exhausted {
-            skipped.push(IO_CEILING_REASON.into());
+            skipped.push(
+                budget
+                    .take_scan_stop_reason()
+                    .unwrap_or(IO_CEILING_REASON)
+                    .into(),
+            );
             break;
         }
         offset += WORD;
@@ -585,6 +804,9 @@ fn read_name(
     let limit = mapping_bytes.min(INTERFACE_NAME_CAP as u64) as usize;
     let mut raw: Vec<u8> = Vec::with_capacity(limit);
     while raw.len() < limit {
+        if budget.check_deadline_now().is_some() {
+            return Err(());
+        }
         let mut chunk = [0u8; 32];
         let want = chunk.len().min(limit - raw.len());
         let Some(at) = address.checked_add(raw.len() as u64) else {
@@ -628,6 +850,11 @@ fn read_mapping(
     let mut short = None;
     let mut exhausted = false;
     while done < len {
+        if budget.check_deadline_now().is_some() {
+            short = budget.take_scan_stop_reason().map(str::to_owned);
+            exhausted = true;
+            break;
+        }
         let requested = READ_CHUNK.min(len - done);
         let want = budget.allowed_io(*operation_bytes, requested);
         if want == 0 {
@@ -750,6 +977,155 @@ fn mem_unavailable(error: &std::io::Error) -> (&'static str, bool) {
     }
 }
 
+fn capture_scan_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        WORK_CEILING_REASON | SCAN_DEADLINE_REASON | SCAN_CLOCK_REASON
+    )
+}
+
+fn scan_skip(subject: &str, reason: String) -> Skipped {
+    Skipped {
+        subject: if capture_scan_reason(&reason) {
+            "capture discovery".into()
+        } else {
+            subject.into()
+        },
+        reason,
+    }
+}
+
+fn read_maps_with_limits<R: Read, F: FnMut() -> Option<u64>>(
+    mut reader: R,
+    budget: &mut CaptureWorkBudget,
+    max_bytes: u64,
+    max_entries: usize,
+    chunk_size: usize,
+    mut now: F,
+) -> std::io::Result<(Vec<u8>, Vec<&'static str>)> {
+    let chunk_size = chunk_size.max(1);
+    let mut bytes = Vec::new();
+    let mut newline_count = 0usize;
+    let mut byte_ceiling = false;
+    let mut entry_ceiling = false;
+    let mut io_ceiling = false;
+    let mut deadline_stop = false;
+    let mut chunk = vec![0; chunk_size];
+
+    loop {
+        if budget.deadline_ns.is_some() && budget.check_deadline(now()).is_some() {
+            deadline_stop = true;
+            break;
+        }
+        let read_so_far = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let Some(left) = max_bytes.checked_sub(read_so_far) else {
+            byte_ceiling = true;
+            break;
+        };
+        let requested = left.saturating_add(1).min(chunk_size as u64);
+        let requested = usize::try_from(requested).unwrap_or(chunk_size);
+        let allowed = budget.allowed_capture_io(requested);
+        if allowed == 0 {
+            io_ceiling = true;
+            break;
+        }
+        let read = reader.read(&mut chunk[..allowed])?;
+        if read == 0 {
+            break;
+        }
+        budget.record_io(read);
+        newline_count = newline_count
+            .saturating_add(chunk[..read].iter().filter(|byte| **byte == b'\n').count());
+        bytes.extend_from_slice(&chunk[..read]);
+        byte_ceiling = u64::try_from(bytes.len()).is_ok_and(|len| len > max_bytes);
+        entry_ceiling = newline_count > max_entries;
+        if byte_ceiling || entry_ceiling {
+            break;
+        }
+    }
+
+    let mut reasons = Vec::new();
+    let original_len = bytes.len();
+    let mut end = original_len;
+    if byte_ceiling {
+        reasons.push(MAPS_CEILING_REASON);
+        end = end.min(usize::try_from(max_bytes).unwrap_or(usize::MAX));
+    }
+    if entry_ceiling {
+        reasons.push(MAPS_ENTRY_CEILING_REASON);
+        end = end.min(if max_entries == 0 {
+            0
+        } else {
+            bytes
+                .iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte == b'\n')
+                .nth(max_entries - 1)
+                .map_or(0, |(index, _)| index + 1)
+        });
+    }
+    if io_ceiling {
+        reasons.push(IO_CEILING_REASON);
+    }
+    if deadline_stop {
+        if let Some(reason) = budget.take_scan_stop_reason() {
+            reasons.push(reason);
+        }
+    }
+    if byte_ceiling || io_ceiling || deadline_stop {
+        end = bytes[..end]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+    }
+    bytes.truncate(end);
+    Ok((bytes, reasons))
+}
+
+/// The live engine's `/proc/<pid>/maps` snapshot. The engine decides identity
+/// and ownership from it, so unlike the scan path's trimmed-and-reported read
+/// it is refused whole when the byte, entry, or total-I/O ceiling or the batch
+/// deadline cuts it; an already-expired deadline refuses before a byte is read.
+pub(crate) fn read_maps_or_refuse<R: Read, F: FnMut() -> Option<u64>>(
+    reader: R,
+    budget: &mut CaptureWorkBudget,
+    mut now: F,
+) -> Result<Vec<MapEntry>, String> {
+    // The reader reports a stopped batch's reason only once; the refusal must
+    // not depend on that, so ask the budget directly before reading.
+    if budget.deadline_ns.is_some() {
+        if let Some(reason) = budget.check_deadline(now()) {
+            return Err(reason.into());
+        }
+    }
+    let (bytes, reasons) = read_maps_with_limits(
+        reader,
+        budget,
+        MAX_MAPS_BYTES,
+        MAX_MAP_ENTRIES,
+        64 * 1024,
+        now,
+    )
+    .map_err(|error| error.to_string())?;
+    if let Some(reason) = reasons.first() {
+        return Err((*reason).into());
+    }
+    parse_maps(&bytes)
+}
+
+/// One validated `MapIndex` per accepted snapshot. The order/overlap validation
+/// is O(entries) and is charged once here, so every live consumer does charged
+/// O(log n) lookups against this index instead of rebuilding — and revalidating —
+/// one per lookup.
+pub(crate) fn index_maps_or_refuse<'a>(
+    maps: &'a [MapEntry],
+    budget: &mut CaptureWorkBudget,
+) -> Result<MapIndex<'a>, String> {
+    budget.spend(maps.len() as u64).map_err(String::from)?;
+    MapIndex::new(maps)
+        .ok_or_else(|| "reversed or overlapping /proc/<pid>/maps intervals".to_string())
+}
+
 pub fn scan_pid(
     request: &ScanRequest<'_>,
     budget: &mut CaptureWorkBudget,
@@ -773,14 +1149,42 @@ pub fn scan_process_view(
     }
     let started = Instant::now();
     let pid = request.pid;
-    let maps = parse_maps(
-        &view
-            .run_while_same(|| std::fs::read(format!("/proc/{pid}/maps")))?
-            .map_err(|error| format!("/proc/{pid}/maps: {error}"))?,
-    )?;
-
+    let (map_bytes, map_reasons) = view
+        .run_while_same(|| {
+            File::open(format!("/proc/{pid}/maps")).and_then(|maps_file| {
+                read_maps_with_limits(
+                    maps_file,
+                    budget,
+                    MAX_MAPS_BYTES,
+                    MAX_MAP_ENTRIES,
+                    64 * 1024,
+                    crate::attach::monotonic_ns,
+                )
+                .map_err(std::io::Error::other)
+            })
+        })
+        .map_err(|error| format!("/proc/{pid}/maps: {error}"))?
+        .map_err(|error| format!("/proc/{pid}/maps: {error}"))?;
+    let maps = parse_maps(&map_bytes)?;
+    let map_index = MapIndex::new(&maps)
+        .ok_or_else(|| "reversed or overlapping /proc/<pid>/maps intervals".to_string())?;
     let mut modules = Vec::new();
-    let mut skipped = Vec::new();
+    let map_subject = format!("/proc/{pid}/maps");
+    let mut skipped = map_reasons
+        .into_iter()
+        .map(|reason| scan_skip(&map_subject, reason.into()))
+        .collect::<Vec<_>>();
+    // `parse_maps`, `MapIndex::new` and `candidate_groups` are each O(entries)
+    // on a snapshot the target sizes. Charge that preprocessing and answer the
+    // capture's stop here: a dense map cannot defer the first check past it,
+    // and a stop that arrived before this scan is published instead of
+    // breaking the group loop with no reason at all.
+    let scannable = budget.spend(maps.len() as u64).is_ok() && budget.stopped_now().is_none();
+    if !scannable {
+        if let Some(reason) = budget.take_scan_stop_reason() {
+            skipped.push(scan_skip("capture discovery", reason.into()));
+        }
+    }
     // `/proc/<pid>/mem` is gated by PTRACE_MODE_ATTACH and Yama; losing it costs the
     // tables, never the object inventory (spec §4.1 step 3). Only an access refusal is
     // a ptrace refusal — a pid that died mid-scan gets its own label.
@@ -802,12 +1206,26 @@ pub fn scan_process_view(
         request.hints.iter().map(|h| hint_identity(h)).collect();
     let mut hint_matched = vec![false; request.hints.len()];
 
-    for (key, group) in candidate_groups(&maps) {
+    let groups = if scannable {
+        candidate_groups(&maps)
+    } else {
+        BTreeMap::new()
+    };
+    for (key, group) in groups {
+        if budget.scan_stopped() {
+            break;
+        }
+        if budget.check_deadline_now().is_some() {
+            if let Some(reason) = budget.take_scan_stop_reason() {
+                skipped.push(scan_skip("capture discovery", reason.into()));
+            }
+            break;
+        }
         // A group with no `/`-rooted pathname (memfd, pseudo-path) is still a real
         // object: it is recorded as skipped rather than silently dropped.
         let named = group
             .iter()
-            .find_map(|entry| match resolve(&maps, entry.start) {
+            .find_map(|entry| match map_index.resolve(entry.start) {
                 Resolved::File { path, raw_path, .. } => Some((path, raw_path)),
                 _ => None,
             });
@@ -936,10 +1354,7 @@ pub fn scan_process_view(
             // Bytes past a failed read were never examined; saying nothing here would
             // present a partial decode as a complete one.
             if let Some(reason) = short {
-                skipped.push(Skipped {
-                    subject: module.path.clone(),
-                    reason,
-                });
+                skipped.push(scan_skip(&module.path, reason));
             }
             snapshots.push((entry.start, bytes));
             if exhausted {
@@ -948,31 +1363,43 @@ pub fn scan_process_view(
             }
         }
         for (base, snapshot) in &snapshots {
-            let (tables, exhausted) = detect_tables(snapshot, *base, &maps, budget);
+            let (tables, exhausted) = detect_tables(snapshot, *base, &map_index, budget);
             module.tables.extend(tables);
-            skipped.extend(exhausted.into_iter().map(|reason| Skipped {
-                subject: module.path.clone(),
-                reason,
-            }));
+            skipped.extend(
+                exhausted
+                    .into_iter()
+                    .map(|reason| scan_skip(&module.path, reason)),
+            );
+            if budget.scan_stopped() {
+                break;
+            }
+        }
+        if budget.scan_stopped() {
+            modules.push(module);
+            break;
         }
         for (_, snapshot) in &snapshots {
             let (interfaces, exhausted) = scan_interfaces(
                 snapshot,
                 mem,
                 &module.tables,
-                &maps,
+                &map_index,
                 key,
                 budget,
                 &mut operation_bytes,
             );
             module.interfaces.extend(interfaces);
             let interface_io_exhausted = exhausted.iter().any(|reason| reason == IO_CEILING_REASON);
-            skipped.extend(exhausted.into_iter().map(|reason| Skipped {
-                subject: module.path.clone(),
-                reason,
-            }));
+            skipped.extend(
+                exhausted
+                    .into_iter()
+                    .map(|reason| scan_skip(&module.path, reason)),
+            );
             if interface_io_exhausted {
                 io_exhausted = true;
+                break;
+            }
+            if budget.scan_stopped() {
                 break;
             }
         }
@@ -984,7 +1411,7 @@ pub fn scan_process_view(
         // which classified it by its exports and will report it in `discovery[]` and
         // `capture.modules[]` as a module the capture observed. Without this the
         // gap has nothing to show — no entry to skip, no attach to fail, no counter.
-        if module.tables.is_empty() && !io_exhausted {
+        if module.tables.is_empty() && !io_exhausted && !budget.scan_stopped() {
             let named = if hinted {
                 "matched a --module hint; "
             } else {
@@ -1030,6 +1457,97 @@ pub fn scan_process_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_pins_one_index_per_live_snapshot() {
+        fn production_body<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            let source = &source[source.find(start).expect("production start marker")..];
+            let body_start = source.find('{').expect("production body start");
+            let body_end = source.find(end).expect("production end marker");
+            &source[body_start..body_end]
+        }
+
+        let usable_path = production_body(
+            include_str!("engine.rs"),
+            "fn usable_path(",
+            "\n}\n\n#[cfg(test)]\nfn exact_executable_mapping",
+        );
+        assert!(usable_path.contains("maps.resolve(mapping.start)"));
+        assert!(!usable_path.contains("maps::resolve("));
+        assert!(!usable_path.contains("resolve(&"));
+
+        let index_maps_or_refuse = production_body(
+            include_str!("scan.rs"),
+            "pub(crate) fn index_maps_or_refuse<'a>(",
+            "\n}\n\npub fn scan_pid(",
+        );
+        assert_eq!(
+            index_maps_or_refuse.matches("MapIndex::new(").count(),
+            1,
+            "shared snapshot index must be constructed exactly once"
+        );
+    }
+
+    /// Task 11 fix round 3 (shadow finding 5, scan branch). `parse_maps`,
+    /// `MapIndex::new` and `candidate_groups` are each O(entries) on a snapshot
+    /// the target sizes, and none of them charged or polled: a dense map could
+    /// defer the capture's first check until after all three, and a stop that
+    /// arrived before the scan broke the group loop with no published reason.
+    /// The preprocessing is now charged and answers the stop before the first
+    /// group, publishing exactly what stopped it.
+    #[test]
+    fn the_scan_charges_its_map_preprocessing_and_answers_the_stop_before_any_group() {
+        let pid = std::process::id();
+        let hooks = HookRegistry::builtin();
+        let request = ScanRequest {
+            pid,
+            hints: &[],
+            hooks: &hooks,
+        };
+
+        let mut budget = CaptureWorkBudget::default();
+        assert!(
+            !budget.charge(u64::MAX),
+            "the work ceiling refuses and sticks"
+        );
+        let outcome = scan_pid(&request, &mut budget).expect("a stopped capture still scans");
+        assert!(
+            outcome.modules().is_empty(),
+            "a stopped capture scans no group: {:?}",
+            outcome.modules().len()
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.subject == "capture discovery"
+                    && skip.reason == WORK_CEILING_REASON),
+            "the stop is published, never a silent break: {:?}",
+            outcome.skipped()
+        );
+
+        // The preprocessing itself is charged, one unit per snapshot entry: with
+        // fewer units left than this process has mappings, the scan stops right
+        // there. (The scan reads its own snapshot, so the allowance is one unit
+        // short of the count read here — a mapping added in between only makes
+        // the refusal more certain.)
+        let mut budget = CaptureWorkBudget::default();
+        let entries = parse_maps(&std::fs::read(format!("/proc/{pid}/maps")).unwrap())
+            .unwrap()
+            .len() as u64;
+        assert!(budget.charge(DEFAULT_WORK_CEILING - entries + 1));
+        let outcome = scan_pid(&request, &mut budget).expect("a scan of this process");
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.subject == "capture discovery"
+                    && skip.reason == WORK_CEILING_REASON),
+            "the map preprocessing spends the last units and stops here: {:?}",
+            outcome.skipped()
+        );
+        assert!(outcome.modules().is_empty());
+    }
 
     /// Task 9.2-fix5 item A. A process that has already exited cannot have its
     /// memory read and cannot read any more of anyone else's: `scan_unavailable`
@@ -1081,6 +1599,7 @@ mod tests {
     #[test]
     fn a_shorter_match_inside_a_longer_one_is_dropped() {
         let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
         // A 3.2 table (104 slots) whose 68th..104th slots also start with a word that
         // reads as a valid 2.40 header would otherwise be reported twice.
         let mut snapshot = vec![0u8; 8 + 104 * 8];
@@ -1091,8 +1610,12 @@ mod tests {
         }
         let inner = 8 + 30 * 8;
         snapshot[inner..inner + 8].copy_from_slice(&0x2802u64.to_ne_bytes());
-        let (tables, truncated) =
-            detect_tables(&snapshot, 0x7000, &maps, &mut CaptureWorkBudget::default());
+        let (tables, truncated) = detect_tables(
+            &snapshot,
+            0x7000,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+        );
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].version, (3, 2));
         assert_eq!(tables[0].address, 0x7000);
@@ -1105,6 +1628,7 @@ mod tests {
     #[test]
     fn a_header_whose_body_runs_past_the_snapshot_is_not_a_candidate() {
         let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
         // A 2.40 header with only 10 of its 68 slots inside the snapshot: exactly the
         // shape of a table whose .bss has spilled into an anonymous mapping.
         let mut snapshot = vec![0u8; 8 + 10 * 8];
@@ -1113,8 +1637,12 @@ mod tests {
             let at = 8 + slot * 8;
             snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_ne_bytes());
         }
-        let (tables, truncated) =
-            detect_tables(&snapshot, 0x7000, &maps, &mut CaptureWorkBudget::default());
+        let (tables, truncated) = detect_tables(
+            &snapshot,
+            0x7000,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+        );
         assert!(tables.is_empty(), "an incomplete table is never decoded");
         assert!(truncated.is_empty(), "a version word alone is not evidence");
         // Ordinary data must not generate this diagnostic.
@@ -1122,7 +1650,7 @@ mod tests {
             detect_tables(
                 &vec![0u8; 4096],
                 0x7000,
-                &maps,
+                &map_index,
                 &mut CaptureWorkBudget::default()
             )
             .1
@@ -1133,6 +1661,7 @@ mod tests {
     #[test]
     fn dense_candidates_and_interfaces_stop_at_capture_caps() {
         let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
         let table_len = 8 + 104 * 8;
         let mut snapshot = vec![0u8; 513 * table_len];
         for table in 0..513 {
@@ -1144,7 +1673,7 @@ mod tests {
             }
         }
         let mut budget = CaptureWorkBudget::default();
-        let (tables, skipped) = detect_tables(&snapshot, 0x7000, &maps, &mut budget);
+        let (tables, skipped) = detect_tables(&snapshot, 0x7000, &map_index, &mut budget);
         assert_eq!(tables.len(), 512, "candidate amplification must be bounded");
         assert_eq!(
             tables
@@ -1168,7 +1697,7 @@ mod tests {
             &interfaces,
             &mem,
             &[table],
-            &maps,
+            &map_index,
             ObjectKey::of(&maps[0]),
             &mut budget,
             &mut operation_bytes,
@@ -1187,12 +1716,52 @@ mod tests {
     }
 
     #[test]
+    fn interface_address_index_keeps_the_first_duplicate_table() {
+        let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let tables = [
+            ScannedTable {
+                version: (2, 40),
+                walk: "full",
+                entries: Vec::new(),
+                null_entries: Vec::new(),
+                unpinned: Vec::new(),
+                address: 0x7000,
+            },
+            ScannedTable {
+                version: (3, 2),
+                walk: "full",
+                entries: Vec::new(),
+                null_entries: Vec::new(),
+                unpinned: Vec::new(),
+                address: 0x7000,
+            },
+        ];
+        let mut snapshot = vec![0u8; INTERFACE_BYTES];
+        snapshot[WORD..2 * WORD].copy_from_slice(&0x7000u64.to_ne_bytes());
+        let mem = tempfile::tempfile().unwrap();
+        let mut operation_bytes = 0;
+        let (interfaces, skipped) = scan_interfaces(
+            &snapshot,
+            &mem,
+            &tables,
+            &map_index,
+            ObjectKey::of(&maps[0]),
+            &mut CaptureWorkBudget::default(),
+            &mut operation_bytes,
+        );
+        assert!(skipped.is_empty());
+        assert_eq!(interfaces[0].table, Some(0));
+    }
+
+    #[test]
     fn interface_name_reads_share_the_capture_io_budget() {
         let maps = parse_maps(
             b"0-1000 r--p 00000000 08:01 7 /lib/provider.so\n\
               1000-3000 r-xp 00001000 08:01 7 /lib/provider.so\n",
         )
         .unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
         let name_file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(name_file.path(), b"_PKCS 11\0").unwrap();
         let mem = File::open(name_file.path()).unwrap();
@@ -1216,7 +1785,7 @@ mod tests {
             &snapshot,
             &mem,
             &[table],
-            &maps,
+            &map_index,
             ObjectKey::of(&maps[0]),
             &mut budget,
             &mut operation_bytes,
@@ -1230,6 +1799,42 @@ mod tests {
             "the unread name remainder is one omission"
         );
         assert_eq!(skipped[0], IO_CEILING_REASON);
+    }
+
+    #[test]
+    fn interface_name_in_non_absolute_mapping_is_not_dereferenced() {
+        let maps = parse_maps(b"0-2000 r--p 00000000 08:01 7 provider.so\n").unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let mem_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(mem_file.path(), b"xPKCS 11\0").unwrap();
+        let mem = File::open(mem_file.path()).unwrap();
+        let table = ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: Vec::new(),
+            null_entries: Vec::new(),
+            unpinned: Vec::new(),
+            address: 0x7000,
+        };
+        let mut snapshot = vec![0u8; INTERFACE_BYTES];
+        snapshot[..WORD].copy_from_slice(&1u64.to_ne_bytes());
+        snapshot[WORD..2 * WORD].copy_from_slice(&table.address.to_ne_bytes());
+        let mut budget = CaptureWorkBudget::default();
+        let mut operation_bytes = 0;
+        let (interfaces, skipped) = scan_interfaces(
+            &snapshot,
+            &mem,
+            &[table],
+            &map_index,
+            ObjectKey::of(&maps[0]),
+            &mut budget,
+            &mut operation_bytes,
+        );
+        assert!(skipped.is_empty());
+        assert_eq!(interfaces.len(), 1);
+        assert_eq!(interfaces[0].name_class, "unreadable");
+        assert_eq!(operation_bytes, 0);
+        assert_eq!(budget.attempted_io_bytes(), 0);
     }
 
     /// Case 3 is the one that matters and the one no end-to-end test can reach here:
@@ -1283,6 +1888,7 @@ mod tests {
               2000-3000 rw-p 00001000 08:01 7 /lib/provider.so\n",
         )
         .unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
         let build = |bad: u64| {
             let mut snapshot = vec![0u8; 8 + 68 * 8];
             snapshot[..8].copy_from_slice(&0x2802u64.to_ne_bytes());
@@ -1297,7 +1903,7 @@ mod tests {
             detect_tables(
                 &build(0x1600),
                 0x2000,
-                &maps,
+                &map_index,
                 &mut CaptureWorkBudget::default()
             )
             .0
@@ -1308,7 +1914,7 @@ mod tests {
             detect_tables(
                 &build(0x2500),
                 0x2000,
-                &maps,
+                &map_index,
                 &mut CaptureWorkBudget::default()
             )
             .0
@@ -1318,7 +1924,7 @@ mod tests {
             detect_tables(
                 &build(0x9000),
                 0x2000,
-                &maps,
+                &map_index,
                 &mut CaptureWorkBudget::default()
             )
             .0
@@ -1329,7 +1935,7 @@ mod tests {
             detect_tables(
                 &vec![0u8; 8 + 68 * 8],
                 0x2000,
-                &maps,
+                &map_index,
                 &mut CaptureWorkBudget::default()
             )
             .0
@@ -1338,9 +1944,239 @@ mod tests {
         // One NULL slot among live ones is legitimate evidence, not a rejection.
         let mut with_null = build(0x1600);
         with_null[16..24].copy_from_slice(&0u64.to_ne_bytes());
-        let (tables, _) =
-            detect_tables(&with_null, 0x2000, &maps, &mut CaptureWorkBudget::default());
+        let (tables, _) = detect_tables(
+            &with_null,
+            0x2000,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+        );
         assert_eq!(tables[0].null_entries.len(), 1);
         assert_eq!(tables[0].entries.len(), 67);
+    }
+
+    #[test]
+    fn work_budget_allows_exact_ceiling_and_rejects_overflow() {
+        let mut budget = CaptureWorkBudget {
+            work_ceiling: 4,
+            ..Default::default()
+        };
+        assert!(budget.charge(4));
+        assert!(!budget.charge(1));
+        budget.work_units = u64::MAX;
+        assert!(!budget.charge(1));
+    }
+
+    #[test]
+    fn near_miss_field_validation_stops_at_work_ceiling() {
+        let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let mut snapshot = vec![0u8; 8 + 104 * 8];
+        snapshot[..8].copy_from_slice(&0x0203u64.to_ne_bytes());
+        for slot in 0..104 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_ne_bytes());
+        }
+        snapshot[8 + 103 * 8..8 + 104 * 8].copy_from_slice(&0x9000u64.to_ne_bytes());
+        let mut budget = CaptureWorkBudget {
+            work_ceiling: 104,
+            ..Default::default()
+        };
+        let (tables, skipped) = detect_tables(&snapshot, 0x7000, &map_index, &mut budget);
+        assert!(tables.is_empty());
+        assert_eq!(skipped, vec![WORK_CEILING_REASON]);
+    }
+
+    #[test]
+    fn taking_an_empty_stop_does_not_hide_a_later_work_stop() {
+        let mut budget = CaptureWorkBudget {
+            work_ceiling: 0,
+            ..Default::default()
+        };
+        assert_eq!(budget.take_scan_stop_reason(), None);
+        assert!(!budget.charge(1));
+        assert_eq!(budget.take_scan_stop_reason(), Some(WORK_CEILING_REASON));
+        assert_eq!(budget.take_scan_stop_reason(), None);
+    }
+
+    #[test]
+    fn deadline_polling_uses_the_local_window_boundary_after_variable_work() {
+        let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let second_offset = 4095 * WORD;
+        let mut snapshot = vec![0u8; second_offset + 8 + 104 * WORD];
+        for offset in [0, second_offset] {
+            snapshot[offset..offset + 8].copy_from_slice(&0x0203u64.to_ne_bytes());
+            for slot in 0..104 {
+                let at = offset + 8 + slot * WORD;
+                snapshot[at..at + WORD].copy_from_slice(&0x1500u64.to_ne_bytes());
+            }
+        }
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_deadline(Some(10));
+        let mut polls = 0;
+        let (tables, skipped) =
+            detect_tables_with_clock(&snapshot, 0x7000, &map_index, &mut budget, || {
+                polls += 1;
+                Some(if polls == 1 { 0 } else { 10 })
+            });
+        assert_eq!(polls, 2, "initial and next local 4096-window boundary");
+        assert!(
+            tables
+                .iter()
+                .any(|table| table.address == 0x7000 + second_offset as u64)
+        );
+        assert_eq!(skipped, vec![SCAN_DEADLINE_REASON]);
+    }
+
+    #[test]
+    fn maps_reader_distinguishes_eof_byte_entry_io_and_deadline_bounds() {
+        use std::io::Cursor;
+
+        let run = |input: &[u8], max_bytes, max_entries, total_bytes, clock: Vec<Option<u64>>| {
+            let mut budget = CaptureWorkBudget::new(ScanLimits {
+                per_object_bytes: u64::MAX,
+                total_bytes,
+            });
+            budget.set_deadline(Some(5));
+            let mut clock = clock.into_iter();
+            read_maps_with_limits(
+                Cursor::new(input),
+                &mut budget,
+                max_bytes,
+                max_entries,
+                4,
+                || clock.next().unwrap_or(Some(0)),
+            )
+            .unwrap()
+        };
+
+        let (_, reasons) = run(b"aa\nbb\n", 6, 10, 100, vec![Some(0), Some(0), Some(0)]);
+        assert!(
+            reasons.is_empty(),
+            "exact EOF is not a byte cut: {reasons:?}"
+        );
+
+        let (bytes, reasons) = run(b"aa\nbb\n", 5, 10, 100, vec![Some(0), Some(0), Some(0)]);
+        assert_eq!(bytes, b"aa\n");
+        assert!(reasons.contains(&MAPS_CEILING_REASON));
+
+        let (bytes, reasons) = run(b"aa\nbb\n", 100, 1, 100, vec![Some(0), Some(0), Some(0)]);
+        assert_eq!(bytes, b"aa\n");
+        assert!(reasons.contains(&MAPS_ENTRY_CEILING_REASON));
+
+        let (bytes, reasons) = run(b"aa\nbb\n", 100, 10, 3, vec![Some(0), Some(0), Some(0)]);
+        assert_eq!(bytes, b"aa\n");
+        assert!(reasons.contains(&IO_CEILING_REASON));
+
+        let (bytes, reasons) = run(b"aa\nbb\n", 5, 1, 100, vec![Some(0), Some(0), Some(10)]);
+        assert_eq!(bytes, b"aa\n");
+        assert!(reasons.contains(&MAPS_CEILING_REASON));
+        assert!(reasons.contains(&MAPS_ENTRY_CEILING_REASON));
+    }
+
+    #[test]
+    fn maps_reader_trims_incomplete_lines_on_deadline_and_clock_failure() {
+        use std::io::Cursor;
+
+        for (clock, reason) in [
+            (vec![Some(0), Some(10)], SCAN_DEADLINE_REASON),
+            (vec![Some(0), None], SCAN_CLOCK_REASON),
+        ] {
+            let mut budget = CaptureWorkBudget::new(ScanLimits::default());
+            budget.set_deadline(Some(5));
+            let mut clock = clock.into_iter();
+            let (bytes, reasons) =
+                read_maps_with_limits(Cursor::new(b"aa\nbb\n"), &mut budget, 100, 10, 4, || {
+                    clock.next().unwrap_or(Some(0))
+                })
+                .unwrap();
+            assert_eq!(bytes, b"aa\n");
+            assert!(reasons.contains(&reason), "{reasons:?}");
+        }
+    }
+
+    /// Task 11 fix round 2 (csf_ce5962b root closure): the live engine's
+    /// per-record snapshot is refused whole — never trimmed — at the byte,
+    /// entry, and total-I/O ceilings and at the batch deadline; an already
+    /// expired deadline refuses before a byte is read, on every read of the
+    /// stopped batch, not only the once the reader reports it.
+    #[test]
+    fn live_maps_snapshot_is_refused_whole_at_every_bound() {
+        use std::io::Cursor;
+
+        let line: &[u8] = b"7f0000000000-7f0000001000 r-xp 00000000 08:01 12345 /opt/p.so\n";
+        let snapshot = |budget: &mut CaptureWorkBudget, input: &[u8], clock: Vec<Option<u64>>| {
+            let mut clock = clock.into_iter();
+            read_maps_or_refuse(Cursor::new(input), budget, || {
+                clock.next().unwrap_or(Some(0))
+            })
+        };
+
+        // Lines long enough that the byte ceiling lands before the entry ceiling.
+        let long_line = [&line[..line.len() - 1], &[b'p'; 64][..], b"\n"].concat();
+        let oversized =
+            long_line.repeat(usize::try_from(MAX_MAPS_BYTES).unwrap() / long_line.len() + 1);
+        assert!(u64::try_from(oversized.len()).unwrap() > MAX_MAPS_BYTES);
+        let mut budget = CaptureWorkBudget::default();
+        assert_eq!(
+            snapshot(&mut budget, &oversized, vec![]).err(),
+            Some(MAPS_CEILING_REASON.into()),
+            "one byte over the byte ceiling is refused, not trimmed"
+        );
+
+        let short_line: &[u8] = b"0-1 ---p 0 0:0 0\n";
+        let mut budget = CaptureWorkBudget::default();
+        assert_eq!(
+            snapshot(&mut budget, &short_line.repeat(MAX_MAP_ENTRIES + 1), vec![]).err(),
+            Some(MAPS_ENTRY_CEILING_REASON.into()),
+            "one entry over the entry ceiling is refused, not trimmed"
+        );
+
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: 8,
+        });
+        assert_eq!(
+            snapshot(&mut budget, &line.repeat(2), vec![]).err(),
+            Some(IO_CEILING_REASON.into()),
+            "the capture's total-I/O ceiling refuses the snapshot"
+        );
+
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_deadline(Some(5));
+        assert_eq!(
+            snapshot(
+                &mut budget,
+                &line.repeat(2),
+                vec![Some(0), Some(0), Some(10)]
+            )
+            .err(),
+            Some(SCAN_DEADLINE_REASON.into()),
+            "a deadline reached during the read refuses the snapshot"
+        );
+
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_deadline(Some(5));
+        for attempt in 1..=2 {
+            assert_eq!(
+                snapshot(&mut budget, line, vec![Some(10)]).err(),
+                Some(SCAN_DEADLINE_REASON.into()),
+                "read {attempt} of a stopped batch is refused"
+            );
+            assert_eq!(
+                budget.attempted_io_bytes(),
+                0,
+                "read {attempt} read nothing"
+            );
+        }
+
+        let mut budget = CaptureWorkBudget::default();
+        let entries = snapshot(&mut budget, line, vec![]).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            u64::try_from(line.len()).unwrap(),
+            "a complete snapshot is charged to the capture's I/O total"
+        );
     }
 }

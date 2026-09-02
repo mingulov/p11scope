@@ -73,6 +73,9 @@ A nonzero return value is an observed outcome, not a discovery error. A
 `CKR_OK` result with a null or unreadable `ppInterface`, interface, table, name,
 or version is retained as an outcome with the appropriate class and read-loss
 evidence; it is never upgraded to authority.
+Because a nonzero return contains no table that could authorize new probes, its
+record never arms the owned-child discovery pause; the outcome is still emitted
+and reduced normally.
 
 The shared `StartState` and `DiscoveryRecord` layouts may grow only enough to
 carry these fields. Their C layout, zeroed reserved bytes, map value size, and
@@ -81,11 +84,15 @@ same-thread call that loses the no-overwrite state race increments
 `discovery_state_failures`, removes no ambiguity by guessing, and forces
 `PARTIAL`.
 
-The attach cookie becomes a private per-attachment binding id, not merely a
-global hook-symbol id. Binding ids are monotonically allocated, unique for the
-whole capture, and never reused after retirement. Exhaustion refuses the new
-attachment and forces `PARTIAL`; a delayed record for a retired id is rejected
-rather than resolved against another binding. Userspace retains the binding
+The selection attach cookie becomes a private unsigned 64-bit per-attachment
+binding id, not merely a global hook-symbol id. Zero is invalid. A
+capture-local checked monotonic counter allocates each id once; exhaustion
+refuses the new attachment and forces `PARTIAL` rather than wrapping or
+reusing an id. Every selection record carries the full id in a dedicated
+field; the existing narrower export and interface-list symbol ids do not
+encode it. Removing the active binding rejects a delayed record after
+retirement, while monotonic allocation prevents resolution against another
+binding. Userspace retains the binding
 `{hook_id, abi, ProcessView, generation, hook-owner object, loader context}` and
 validates it before attributing a record. `module` is always the index of that
 hook-owner provider in `capture.modules[]`; it is never inferred from the
@@ -282,6 +289,7 @@ only when all of these hold:
 
 - request and returned names are `exact_standard`;
 - the returned version is one of 3.0, 3.1, or 3.2 with a known table layout;
+- returned flags are exactly zero or `CKF_INTERFACE_FORK_SAFE`;
 - the table and every non-null function pointer resolve inside the same
   retained process generation and exact pinned hook-owner provider module
   object;
@@ -300,7 +308,17 @@ The resulting function identities may be probed and counted so real calls are
 not missed, but `semantic_authorized` is always `false`, semantic argument
 decoders are disabled, and the capture is `PARTIAL`. `null`, `other`, or
 `unreadable` names; 2.40, `other`, null, or unreadable versions; unstable or
-unmatched objects; and helper failures authorize nothing.
+unmatched objects; unknown returned flag bits; and helper failures authorize
+nothing.
+
+Within one exact provider generation, at most one distinct selection-only table
+may hold authority for each `(returned version, returned flags)` pair. Repeated
+requests and aliases for the same exact table reuse its claim. A different table
+for an already-authorized pair is a conflict: retain the factual outcome, add no
+slots, set `selection_truncated`, and force `PARTIAL`. This bounds live authority
+to the six standard version/flag pairs before the existing capture-wide 512-slot
+ceiling; that ceiling still refuses an indivisible claim rather than attaching a
+prefix.
 
 Selection-only targets appear only in selection evidence and the aggregate
 function rows they count. They do not contribute to
@@ -565,8 +583,10 @@ Implementation proceeds TDD and must leave these runnable pins:
    name/version agreement alone fails; all exact inventory matches are sorted
    and retained, including shared-address aliases;
 5. only exact-standard known-layout unmatched results gain count-only targets,
-   with semantic decoding disabled and `PARTIAL`; anonymous, dependency,
-   outside-provider, unstable, and unresolved offline closures are refused;
+   with standard returned flags, semantic decoding disabled, and `PARTIAL`;
+   repeated exact claims reuse slots, a second table for one version/flag pair
+   is refused as truncated, and anonymous, dependency, outside-provider,
+   unstable, unknown-flag, and unresolved offline closures are refused;
 6. `observed` and `absent_uncovered` are pinned at live call sites; an exact
    provider prearmed while the owned-child barrier is held is silent
    `absent_covered`, while a non-prearmed `run` or `--pid` provider is
@@ -581,7 +601,8 @@ Implementation proceeds TDD and must leave these runnable pins:
 8. recursive no-overwrite state failure is counted and forces `PARTIAL`;
 9. absent/outside helper exports make zero calls; queried makes exactly ten;
    nonzero `CK_RV` stays an outcome and post-success unreadability becomes
-   `helper_failure`; unknown returned flag bits round-trip unmasked;
+   `helper_failure`; unknown returned flag bits round-trip unmasked; a nonzero
+   live outcome emits without arming the discovery pause;
 10. offline pointer equality selects a manifest surface; name/version equality
     without pointer equality does not; live legacy and two interface aliases
     sharing one table retain three distinct privacy-safe surface references;
@@ -594,6 +615,7 @@ Implementation proceeds TDD and must leave these runnable pins:
 12. two providers with the same built-in or custom hook symbol are attributed
     by their private attachment bindings, including a returned table outside
     the hook owner that is refused authority; binding ids never reuse, and a
+    maximum id is accepted once, exhaustion refuses the next binding, and a
     delayed record after retirement is rejected;
 13. an unmatched selection-only table enters the existing transactional attach
     path; same-address/different-name and two-view claims reuse one physical

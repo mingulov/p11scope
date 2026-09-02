@@ -43,6 +43,7 @@ fn module(
             null_entries: vec![],
             unpinned: vec![],
             address: 0x1000 + inode,
+            file_offset: Some(0),
         }],
         interfaces: vec![],
     }

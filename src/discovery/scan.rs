@@ -323,6 +323,9 @@ pub struct ScannedTable {
     pub unpinned: Vec<Skipped>,
     /// Address of the version word in the target, for interface cross-reference.
     pub address: u64,
+    /// Exact object-relative location of that version word. Runtime addresses
+    /// are generation-local and never identify a table across remaps.
+    pub file_offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,6 +338,9 @@ pub struct ScannedInterface {
     pub name_class: &'static str,
     /// Kept for `inspect` and manifests only; never rendered in capture output.
     pub name_lossy: Option<String>,
+    /// Exact bounded bytes used only for private cross-view alias identity.
+    /// They are never rendered in capture output.
+    pub name_private: Option<Vec<u8>>,
     pub flags: u64,
     /// Index into `ScannedModule::tables`. A triple is only accepted as an interface
     /// when its function-list pointer names a table this scan decoded, so this is
@@ -467,6 +473,10 @@ fn decode_candidate(
     let Some(address) = base_address.checked_add(offset as u64) else {
         return Ok(None);
     };
+    let file_offset = match maps.resolve(address) {
+        Resolved::File { file_offset, .. } => Some(file_offset),
+        _ => None,
+    };
     let Some(bytes) = offset
         .checked_add(len)
         .and_then(|end| snapshot.get(offset..end))
@@ -552,6 +562,7 @@ fn decode_candidate(
             null_entries,
             unpinned: Vec::new(),
             address,
+            file_offset,
         },
         len,
     )))
@@ -744,22 +755,25 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
                             .is_some_and(|path| path.starts_with(b"/"))
                 })
                 .map(|entry| entry.end);
-            let (name_class, name_lossy) = match name_ptr {
-                0 => ("null", None),
-                _ if mapping_end.is_none() => ("unreadable", None),
+            let (name_class, name_lossy, name_private) = match name_ptr {
+                0 => ("null", None, None),
+                _ if mapping_end.is_none() => ("unreadable", None, None),
                 _ => {
                     match read_name(mem, name_ptr, mapping_end.unwrap(), budget, operation_bytes) {
                         Ok(Some(raw)) if raw == STANDARD_INTERFACE_NAME => (
                             "exact_standard",
                             Some(String::from_utf8_lossy(&raw).into_owned()),
+                            Some(raw),
                         ),
-                        Ok(Some(raw)) => {
-                            ("other", Some(String::from_utf8_lossy(&raw).into_owned()))
-                        }
-                        Ok(None) => ("unreadable", None),
+                        Ok(Some(raw)) => (
+                            "other",
+                            Some(String::from_utf8_lossy(&raw).into_owned()),
+                            Some(raw),
+                        ),
+                        Ok(None) => ("unreadable", None, None),
                         Err(()) => {
                             io_exhausted = true;
-                            ("unreadable", None)
+                            ("unreadable", None, None)
                         }
                     }
                 }
@@ -768,6 +782,7 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
                 index: 0,
                 name_class,
                 name_lossy,
+                name_private,
                 flags,
                 table: Some(table),
             })
@@ -1727,6 +1742,7 @@ mod tests {
                 null_entries: Vec::new(),
                 unpinned: Vec::new(),
                 address: 0x7000,
+                file_offset: Some(0),
             },
             ScannedTable {
                 version: (3, 2),
@@ -1735,6 +1751,7 @@ mod tests {
                 null_entries: Vec::new(),
                 unpinned: Vec::new(),
                 address: 0x7000,
+                file_offset: Some(0),
             },
         ];
         let mut snapshot = vec![0u8; INTERFACE_BYTES];
@@ -1772,6 +1789,7 @@ mod tests {
             null_entries: vec![],
             unpinned: vec![],
             address: 0x7000,
+            file_offset: Some(0),
         };
         let mut snapshot = vec![0u8; INTERFACE_BYTES];
         snapshot[..WORD].copy_from_slice(&1u64.to_ne_bytes());
@@ -1815,6 +1833,7 @@ mod tests {
             null_entries: Vec::new(),
             unpinned: Vec::new(),
             address: 0x7000,
+            file_offset: Some(0),
         };
         let mut snapshot = vec![0u8; INTERFACE_BYTES];
         snapshot[..WORD].copy_from_slice(&1u64.to_ne_bytes());

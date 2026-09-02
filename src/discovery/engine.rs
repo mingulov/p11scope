@@ -27,11 +27,16 @@ use p11scope_ebpf_common::{
     DISCOVERY_INTERFACES, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
     DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
     DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER, DISCOVERY_NAME_EXACT_STANDARD,
-    DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER, DISCOVERY_STATUS_LOADER_CONTEXT_INVALID,
-    DiscoveryRecord, valid_discovery_record,
+    DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER, DISCOVERY_NAME_UNREADABLE,
+    DISCOVERY_STATUS_LOADER_CONTEXT_INVALID, DISCOVERY_VERSION_NULL, DISCOVERY_VERSION_OTHER,
+    DISCOVERY_VERSION_UNREADABLE, DISCOVERY_VERSION_V2_40, DISCOVERY_VERSION_V3_0,
+    DISCOVERY_VERSION_V3_1, DISCOVERY_VERSION_V3_2, DiscoveryRecord, valid_discovery_record,
 };
 use p11scope_manifest::elf::ElfSnapshot;
-use p11scope_manifest::manifest::{Acquisition, Manifest, Resolution, SCHEMA, WalkOutcome};
+use p11scope_manifest::manifest::{
+    Acquisition, Manifest, Resolution, SCHEMA, SelectionNameClass, SelectionRequest,
+    SelectionVersionClass, WalkOutcome,
+};
 use p11scope_manifest::maps::{Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved};
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::AsRawFd as _;
@@ -262,6 +267,236 @@ struct CaptureHistory {
     scan_ms: u64,
     vendor_interfaces: usize,
     interface_list: String,
+    selection_inventory: BTreeMap<ExactSelectionTable, Vec<InventorySurfaceKey>>,
+    selection_surfaces: BTreeSet<InventorySurfaceKey>,
+    selections: Vec<LiveSelectionTuple>,
+    selection_truncated: bool,
+}
+
+const MAX_LIVE_SELECTION_TUPLES: usize = 16;
+const MAX_LIVE_SELECTION_MATCHES: usize = 16;
+const MAX_LIVE_SELECTION_SURFACES: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ExactSelectionTable {
+    view: ProcessViewId,
+    provider: PinnedTimingKey,
+    address: u64,
+    file_offset: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum InventorySurfaceKind {
+    Legacy,
+    Interface,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum PrivateSelectionName {
+    Legacy,
+    Null,
+    ExactStandard,
+    Other(Vec<u8>),
+    OtherUnmergeable(ProcessViewId, usize),
+    Unreadable(ProcessViewId, usize),
+}
+
+impl PrivateSelectionName {
+    fn class(&self) -> Option<SelectionNameClass> {
+        match self {
+            Self::Legacy => None,
+            Self::Null => Some(SelectionNameClass::Null),
+            Self::ExactStandard => Some(SelectionNameClass::ExactStandard),
+            Self::Other(_) | Self::OtherUnmergeable(_, _) => Some(SelectionNameClass::Other),
+            Self::Unreadable(_, _) => Some(SelectionNameClass::Unreadable),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct InventorySurfaceBase {
+    provider: PinnedTimingKey,
+    table_file_offset: u64,
+    kind: InventorySurfaceKind,
+    name: PrivateSelectionName,
+    version: SelectionVersionClass,
+    flags: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct InventorySurfaceKey {
+    base: InventorySurfaceBase,
+    duplicate: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct LiveInventoryMatch {
+    surface: InventorySurfaceKey,
+    name_agrees: bool,
+    version_agrees: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveSelectionTuple {
+    module: plan::ModuleId,
+    request: SelectionRequest,
+    rv: u64,
+    result: Option<SelectionRequest>,
+    inventory_matches: Vec<LiveInventoryMatch>,
+    count: u64,
+}
+
+fn selection_name_class(class: u8) -> Option<SelectionNameClass> {
+    match class {
+        DISCOVERY_NAME_EXACT_STANDARD => Some(SelectionNameClass::ExactStandard),
+        DISCOVERY_NAME_OTHER => Some(SelectionNameClass::Other),
+        DISCOVERY_NAME_NULL => Some(SelectionNameClass::Null),
+        DISCOVERY_NAME_UNREADABLE => Some(SelectionNameClass::Unreadable),
+        _ => None,
+    }
+}
+
+fn selection_version_class(class: u8) -> Option<SelectionVersionClass> {
+    match class {
+        DISCOVERY_VERSION_NULL => Some(SelectionVersionClass::Null),
+        DISCOVERY_VERSION_UNREADABLE => Some(SelectionVersionClass::Unreadable),
+        DISCOVERY_VERSION_V2_40 => Some(SelectionVersionClass::V2_40),
+        DISCOVERY_VERSION_V3_0 => Some(SelectionVersionClass::V3_0),
+        DISCOVERY_VERSION_V3_1 => Some(SelectionVersionClass::V3_1),
+        DISCOVERY_VERSION_V3_2 => Some(SelectionVersionClass::V3_2),
+        DISCOVERY_VERSION_OTHER => Some(SelectionVersionClass::Other),
+        _ => None,
+    }
+}
+
+fn inventory_version_class(version: (u8, u8)) -> SelectionVersionClass {
+    match version {
+        (2, 40) => SelectionVersionClass::V2_40,
+        (3, 0) => SelectionVersionClass::V3_0,
+        (3, 1) => SelectionVersionClass::V3_1,
+        (3, 2) => SelectionVersionClass::V3_2,
+        _ => SelectionVersionClass::Other,
+    }
+}
+
+fn private_selection_name(
+    interface: &ScannedInterface,
+    view: ProcessViewId,
+) -> PrivateSelectionName {
+    match interface.name_class {
+        "exact_standard" => PrivateSelectionName::ExactStandard,
+        "other" => interface.name_private.clone().map_or_else(
+            || PrivateSelectionName::OtherUnmergeable(view, interface.index),
+            PrivateSelectionName::Other,
+        ),
+        "null" => PrivateSelectionName::Null,
+        _ => PrivateSelectionName::Unreadable(view, interface.index),
+    }
+}
+
+fn readable_name(class: SelectionNameClass) -> bool {
+    !matches!(
+        class,
+        SelectionNameClass::Null | SelectionNameClass::Unreadable
+    )
+}
+
+fn readable_version(class: SelectionVersionClass) -> bool {
+    !matches!(
+        class,
+        SelectionVersionClass::Null | SelectionVersionClass::Unreadable
+    )
+}
+
+fn insert_selection_loss(history: &mut CaptureHistory, reason: &str) {
+    let skipped = Skipped {
+        subject: "live interface selection".into(),
+        reason: reason.into(),
+    };
+    history
+        .losses
+        .entry((skipped.subject.clone(), skipped.reason.clone()))
+        .or_insert(skipped);
+}
+
+fn canonical_inventory_keys(mut bases: Vec<InventorySurfaceBase>) -> Vec<InventorySurfaceKey> {
+    bases.sort();
+    let mut prior = None;
+    let mut duplicate = 0u16;
+    bases
+        .into_iter()
+        .map(|base| {
+            if prior.as_ref() == Some(&base) {
+                duplicate = duplicate.saturating_add(1);
+            } else {
+                duplicate = 0;
+            }
+            prior = Some(base.clone());
+            InventorySurfaceKey { base, duplicate }
+        })
+        .collect()
+}
+
+fn admit_inventory_keys(
+    history: &mut CaptureHistory,
+    keys: Vec<InventorySurfaceKey>,
+) -> Vec<InventorySurfaceKey> {
+    let new_surfaces = keys
+        .iter()
+        .filter(|key| !history.selection_surfaces.contains(*key))
+        .count();
+    let admit_all = history
+        .selection_surfaces
+        .len()
+        .checked_add(new_surfaces)
+        .is_some_and(|total| total <= MAX_LIVE_SELECTION_SURFACES);
+    if admit_all {
+        history.selection_surfaces.extend(keys.iter().cloned());
+    } else {
+        history.selection_truncated = true;
+        insert_selection_loss(
+            history,
+            "the bounded selection surface inventory was truncated",
+        );
+    }
+    keys.into_iter()
+        .filter(|key| history.selection_surfaces.contains(key))
+        .collect()
+}
+
+fn stable_selection_mapping(before: Option<&MapEntry>, after: Option<&MapEntry>) -> bool {
+    before == after
+}
+
+/// Bracket one returned table address with two complete map snapshots. The
+/// callbacks are deliberately tiny so tests can prove the ordering without a
+/// racy live remap: the output is read from snapshot A, then snapshot B closes
+/// the attempt, and only then are generation and pin stability consulted.
+fn selection_mapping_bracket(
+    table_ptr: u64,
+    mut read_maps: impl FnMut() -> Result<Vec<MapEntry>, ()>,
+    mut view_same: impl FnMut() -> bool,
+    mut pin_same: impl FnMut() -> bool,
+) -> Result<(Option<MapEntry>, Resolved), ()> {
+    let maps_a = read_maps()?;
+    let index_a = MapIndex::new(&maps_a).ok_or(())?;
+    let mapping_a = index_a.containing(table_ptr).cloned();
+    let resolved_a = index_a.resolve(table_ptr);
+    let maps_b = read_maps()?;
+    let index_b = MapIndex::new(&maps_b).ok_or(())?;
+    let mapping_same = stable_selection_mapping(mapping_a.as_ref(), index_b.containing(table_ptr));
+    let view_same = view_same();
+    let pin_same = pin_same();
+    if !mapping_same || !view_same || !pin_same {
+        return Err(());
+    }
+    Ok((mapping_a, resolved_a))
+}
+
+fn prune_selection_inventory(history: &mut CaptureHistory, live_views: &BTreeSet<ProcessViewId>) {
+    history
+        .selection_inventory
+        .retain(|table, _| live_views.contains(&table.view));
 }
 
 fn capture_manifest_object_key(manifest: &Manifest, object: u32) -> Option<(ObjectKey, &str)> {
@@ -387,12 +622,47 @@ impl CaptureFacts {
         self.staged.as_ref().unwrap_or(&self.history)
     }
 
+    fn visible_history_mut(&mut self) -> &mut CaptureHistory {
+        self.staged.as_mut().unwrap_or(&mut self.history)
+    }
+
     fn replace_visible_history(&mut self, history: CaptureHistory) {
         if self.staged.is_some() {
             self.staged = Some(history);
         } else {
             self.history = history;
         }
+    }
+
+    /// Retains only the finite, address-free selection tuple. Returns true
+    /// when either the tuple or its exact alias set exceeded the capture bound.
+    fn record_selection(&mut self, mut tuple: LiveSelectionTuple, matches_truncated: bool) -> bool {
+        let history = self.visible_history_mut();
+        let was_truncated = history.selection_truncated;
+        let existing = history.selections.iter_mut().find(|known| {
+            known.module == tuple.module
+                && known.request == tuple.request
+                && known.rv == tuple.rv
+                && known.result == tuple.result
+                && known.inventory_matches == tuple.inventory_matches
+        });
+        if let Some(existing) = existing {
+            existing.count = existing.count.saturating_add(1);
+        } else if history.selections.len() < MAX_LIVE_SELECTION_TUPLES {
+            tuple.count = 1;
+            history.selections.push(tuple);
+        } else {
+            history.selection_truncated = true;
+        }
+        history.selection_truncated |= matches_truncated;
+        if history.selection_truncated && !was_truncated {
+            insert_selection_loss(history, "the bounded selection evidence was truncated");
+        }
+        !was_truncated && history.selection_truncated
+    }
+
+    fn record_selection_loss(&mut self, reason: &str) {
+        insert_selection_loss(self.visible_history_mut(), reason);
     }
 
     fn invalidate_discovery_proofs(
@@ -550,6 +820,8 @@ impl CaptureFacts {
             bail!("accepted manifest history lost its source ordinals");
         }
         let mut history = self.visible_history().clone();
+        let live_views: BTreeSet<_> = modules.iter().map(|module| module.scanned.view).collect();
+        prune_selection_inventory(&mut history, &live_views);
         let current = discovery_evidence(plan, pinned, counters);
 
         // §4.12 by capture end. Each fresh reading replaces the retained one;
@@ -614,6 +886,9 @@ impl CaptureFacts {
 
         for module in modules {
             let owner = self.module_id_for_object(pinned, module.object)?;
+            let provider = pinned
+                .owned_timing_key(module.object)
+                .ok_or_else(|| anyhow!("scanned provider has no exact opened identity"))?;
             let mut targets = BTreeMap::new();
             let mut skips = BTreeMap::new();
             let mut surfaces = BTreeMap::new();
@@ -623,15 +898,16 @@ impl CaptureFacts {
                     table.entries.len() + table.null_entries.len() + table.unpinned.len();
                 let surface = (table.version, table.walk.to_string(), functions);
                 let surface_occurrence = surfaces.entry(surface.clone()).or_insert(0usize);
+                let scan_surface = SurfaceOccurrence::Scan {
+                    module: owner,
+                    version: surface.0,
+                    walk: surface.1.clone(),
+                    functions,
+                    occurrence: *surface_occurrence,
+                };
                 history
                     .surfaces
-                    .entry(SurfaceOccurrence::Scan {
-                        module: owner,
-                        version: surface.0,
-                        walk: surface.1.clone(),
-                        functions,
-                        occurrence: *surface_occurrence,
-                    })
+                    .entry(scan_surface.clone())
                     .or_insert_with(|| plan::SurfaceSummary {
                         source: format!(
                             "{} table {}.{}",
@@ -641,22 +917,36 @@ impl CaptureFacts {
                         acquisition: "ok".into(),
                         functions,
                     });
+                let mut inventory_bases = table
+                    .file_offset
+                    .map(|table_file_offset| {
+                        vec![InventorySurfaceBase {
+                            provider: provider.clone(),
+                            table_file_offset,
+                            kind: InventorySurfaceKind::Legacy,
+                            name: PrivateSelectionName::Legacy,
+                            version: inventory_version_class(table.version),
+                            flags: 0,
+                        }]
+                    })
+                    .unwrap_or_default();
                 for interface in module
                     .scanned
                     .interfaces
                     .iter()
                     .filter(|interface| interface.table == Some(table_index))
                 {
+                    let interface_surface = SurfaceOccurrence::Interface {
+                        module: owner,
+                        index: interface.index,
+                        name_class: interface.name_class,
+                        version: table.version,
+                        walk: table.walk.to_string(),
+                        functions,
+                    };
                     history
                         .surfaces
-                        .entry(SurfaceOccurrence::Interface {
-                            module: owner,
-                            index: interface.index,
-                            name_class: interface.name_class,
-                            version: table.version,
-                            walk: table.walk.to_string(),
-                            functions,
-                        })
+                        .entry(interface_surface.clone())
                         .or_insert_with(|| plan::SurfaceSummary {
                             source: format!(
                                 "interface[{}] {}",
@@ -666,6 +956,29 @@ impl CaptureFacts {
                             acquisition: "ok".into(),
                             functions,
                         });
+                    if let Some(table_file_offset) = table.file_offset {
+                        inventory_bases.push(InventorySurfaceBase {
+                            provider: provider.clone(),
+                            table_file_offset,
+                            kind: InventorySurfaceKind::Interface,
+                            name: private_selection_name(interface, module.scanned.view),
+                            version: inventory_version_class(table.version),
+                            flags: interface.flags,
+                        });
+                    }
+                }
+                let admitted =
+                    admit_inventory_keys(&mut history, canonical_inventory_keys(inventory_bases));
+                if !admitted.is_empty() {
+                    history.selection_inventory.insert(
+                        ExactSelectionTable {
+                            view: module.scanned.view,
+                            provider: provider.clone(),
+                            address: table.address,
+                            file_offset: table.file_offset.expect("admitted table offset"),
+                        },
+                        admitted,
+                    );
                 }
                 let table_fact = (table.version, table.entries.len());
                 let table_occurrence = tables.entry(table_fact).or_insert(0usize);
@@ -3777,6 +4090,7 @@ fn lower_export_record(
         path: MappedPath::Usable(owner_path),
         device: owner_device,
         inode: owner_inode,
+        file_offset: table_file_offset,
         permissions: owner_permissions,
         ..
     } = maps.resolve(record.table_ptr)
@@ -3848,6 +4162,7 @@ fn lower_export_record(
                 index: usize::from(record.interface_index),
                 name_class: name_class(record.name_class),
                 name_lossy: None,
+                name_private: None,
                 flags: record.interface_flags,
                 table: Some(0),
             }]
@@ -3870,6 +4185,7 @@ fn lower_export_record(
             null_entries,
             unpinned: Vec::new(),
             address: record.table_ptr,
+            file_offset: Some(table_file_offset),
         }],
         interfaces,
     };
@@ -3914,6 +4230,9 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
         }) {
             if known.name_lossy.is_none() {
                 known.name_lossy = interface.name_lossy;
+            }
+            if known.name_private.is_none() {
+                known.name_private = interface.name_private;
             }
         } else {
             existing.interfaces.push(interface);
@@ -6142,6 +6461,187 @@ impl Engine {
                 "a selection record failed binding, context, or process-generation attribution",
             );
             return DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed);
+        }
+
+        let Some(request_name) = selection_name_class(record.case_id) else {
+            self.mark_live_loss(
+                "live interface selection",
+                "a selection record carried an unknown request-name class",
+            );
+            return DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed);
+        };
+        let Some(request_version) = selection_version_class(record.interface_index) else {
+            self.mark_live_loss(
+                "live interface selection",
+                "a selection record carried an unknown request-version class",
+            );
+            return DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed);
+        };
+        let request = SelectionRequest {
+            name: request_name,
+            version: request_version,
+            flags: record.request_flags,
+        };
+        let module = match self
+            .capture_facts
+            .module_id_for_object(&self.pinned, binding.object)
+        {
+            Ok(module) => module,
+            Err(_) => {
+                self.mark_live_loss(
+                    "live interface selection",
+                    "a selection binding had no stable provider module",
+                );
+                return DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed);
+            }
+        };
+
+        let mut result = None;
+        let mut inventory_matches = Vec::new();
+        let mut matches_truncated = false;
+        let mut read_loss = false;
+        let mut assessment_loss = false;
+        if record.return_rv == 0 && record.table_ptr != 0 {
+            let Some(result_name) = selection_name_class(record.name_class) else {
+                self.mark_live_loss(
+                    "live interface selection",
+                    "a selection record carried an unknown result-name class",
+                );
+                return DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed);
+            };
+            let Some(result_version) = selection_version_class(record.selection_version_class)
+            else {
+                self.mark_live_loss(
+                    "live interface selection",
+                    "a selection record carried an unknown result-version class",
+                );
+                return DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed);
+            };
+            let observed = SelectionRequest {
+                name: result_name,
+                version: result_version,
+                flags: record.interface_flags,
+            };
+            read_loss = matches!(result_name, SelectionNameClass::Unreadable)
+                || matches!(result_version, SelectionVersionClass::Unreadable);
+            let assessed = (|| -> Result<Vec<LiveInventoryMatch>, ()> {
+                let position = self
+                    .views
+                    .iter()
+                    .position(|view| {
+                        view.id() == binding.view && view.pid() == pid && view.still_the_same()
+                    })
+                    .ok_or(())?;
+                let provider = self.pinned.owned_timing_key(binding.object).ok_or(())?;
+                let provider_key = self
+                    .pinned
+                    .summary(binding.object)
+                    .map(|summary| summary.key);
+                if !self.pinned.check_unchanged().unwrap_or(false) {
+                    return Err(());
+                }
+                let view = &self.views[position];
+                let budget = &mut self.budget;
+                let (_mapping_a, resolved_a) = selection_mapping_bracket(
+                    record.table_ptr,
+                    || {
+                        let maps = Self::read_maps(view, budget).map_err(|_| ())?;
+                        index_maps_or_refuse(&maps, budget).map_err(|_| ())?;
+                        Ok(maps)
+                    },
+                    || view.still_the_same(),
+                    || self.pinned.check_unchanged().unwrap_or(false),
+                )?;
+                let mut matches = if let Resolved::File {
+                    device,
+                    inode,
+                    file_offset,
+                    ..
+                } = resolved_a
+                {
+                    if provider_key == Some(ObjectKey { device, inode }) {
+                        self.capture_facts
+                            .visible_history()
+                            .selection_inventory
+                            .get(&ExactSelectionTable {
+                                view: binding.view,
+                                provider,
+                                address: record.table_ptr,
+                                file_offset,
+                            })
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|surface| {
+                                let inventory_name = surface.base.name.class();
+                                LiveInventoryMatch {
+                                    surface: surface.clone(),
+                                    name_agrees: inventory_name.is_some_and(|name| {
+                                        readable_name(result_name)
+                                            && readable_name(name)
+                                            && result_name == name
+                                    }),
+                                    version_agrees: readable_version(result_version)
+                                        && readable_version(surface.base.version)
+                                        && result_version == surface.base.version,
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+                matches.sort();
+                matches.dedup();
+                Ok(matches)
+            })();
+            match assessed {
+                Ok(matches) => inventory_matches = matches,
+                Err(()) if queued.terminal_owner.is_some() => assessment_loss = true,
+                Err(()) => {
+                    self.mark_live_loss(
+                        "live interface selection",
+                        "a selection result could not be bracketed by one stable live mapping",
+                    );
+                    return DiscoveryRecordOutcome::Rejected(
+                        RecordRejection::SelectionUnattributed,
+                    );
+                }
+            }
+            if inventory_matches.len() > MAX_LIVE_SELECTION_MATCHES {
+                inventory_matches.truncate(MAX_LIVE_SELECTION_MATCHES);
+                matches_truncated = true;
+            }
+            result = Some(observed);
+        } else if record.return_rv == 0 {
+            read_loss = true;
+        }
+
+        let unmatched = result.is_some() && inventory_matches.is_empty() && !assessment_loss;
+        self.capture_facts.record_selection(
+            LiveSelectionTuple {
+                module,
+                request,
+                rv: record.return_rv,
+                result,
+                inventory_matches,
+                count: 1,
+            },
+            matches_truncated,
+        );
+        if read_loss {
+            self.capture_facts
+                .record_selection_loss("a successful selection result was unreadable");
+        }
+        if assessment_loss {
+            self.capture_facts.record_selection_loss(
+                "a terminal selection result had no stable live table assessment",
+            );
+        } else if unmatched {
+            self.capture_facts
+                .record_selection_loss("a successful selection result matched no inventory table");
         }
         DiscoveryRecordOutcome::applied(false, true)
     }
@@ -10176,6 +10676,7 @@ mod tests {
             index: 0,
             name_class: "exact_standard",
             name_lossy: None,
+            name_private: None,
             flags: 0,
             table: Some(0),
         });
@@ -12660,6 +13161,7 @@ mod tests {
             null_entries: vec![],
             unpinned: vec![],
             address: 0x7000,
+            file_offset: Some(0),
         }];
         module
     }
@@ -12811,6 +13313,24 @@ int main(int argc, char **argv) {
             .unwrap();
         assert!(additions_allowed);
         (fixture, engine, session)
+    }
+
+    fn attached_selection_route() -> (
+        LoadedSeedProvider,
+        Engine,
+        ScriptedSession,
+        SelectionBindingFact,
+    ) {
+        let (fixture, mut engine, mut session) = initial_export_route();
+        session.dynamic_attach_reports_added = true;
+        engine.attach_initial_exports(
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+            &mut PauseClosure::new(true),
+        );
+        let binding = *engine.selection_bindings.values().next().unwrap();
+        (fixture, engine, session, binding)
     }
 
     fn armed_seed_route(
@@ -13193,6 +13713,489 @@ int main(int argc, char **argv) {
             "a delayed ordinary record fails closed after retirement"
         );
         assert_eq!(engine.counters.object_skips.len(), skips + 1);
+    }
+
+    #[test]
+    fn c_get_interface_selection_tuples_are_capture_bounded_and_counted() {
+        let (_fixture, mut engine, _session, binding) = attached_selection_route();
+        let before_plan = engine.plan.clone();
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+        record.pid_tgid = u64::from(engine.views[0].pid()) << 32;
+        record.case_id = DISCOVERY_NAME_NULL;
+        record.return_rv = 1;
+        record.binding_id = binding.id;
+        let queued = |record| QueuedDiscoveryRecord {
+            record,
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        };
+
+        for flags in 0..16 {
+            record.request_flags = flags;
+            assert_eq!(
+                engine.process_selection_record(&queued(record)),
+                DiscoveryRecordOutcome::applied(false, true)
+            );
+        }
+        assert_eq!(engine.capture_facts.history.selections.len(), 16);
+        assert!(engine.capture_facts.history.selections[0].result.is_none());
+        assert!(
+            engine.capture_facts.history.selections[0]
+                .inventory_matches
+                .is_empty()
+        );
+        record.request_flags = 0;
+        engine.process_selection_record(&queued(record));
+        assert_eq!(engine.capture_facts.history.selections[0].count, 2);
+        engine.capture_facts.history.selections[0].count = u64::MAX;
+        engine.process_selection_record(&queued(record));
+        assert_eq!(engine.capture_facts.history.selections[0].count, u64::MAX);
+
+        record.request_flags = 16;
+        engine.process_selection_record(&queued(record));
+        assert_eq!(engine.capture_facts.history.selections.len(), 16);
+        assert!(engine.capture_facts.history.selection_truncated);
+        assert_eq!(
+            engine.plan, before_plan,
+            "selection tuples never mutate inventory"
+        );
+    }
+
+    #[test]
+    fn c_get_interface_selection_exact_match_keeps_inventory_aliases() {
+        let (_fixture, mut engine, _session, binding) = attached_selection_route();
+        let pid = engine.views[0].pid();
+        let provider = engine.pinned.summary(binding.object).unwrap().key;
+        let maps = parse_maps(&std::fs::read(format!("/proc/{pid}/maps")).unwrap()).unwrap();
+        let address = maps
+            .iter()
+            .find(|mapping| ObjectKey::of(mapping) == provider)
+            .unwrap()
+            .start;
+        let table_file_offset = match resolve(&maps, address) {
+            Resolved::File { file_offset, .. } => file_offset,
+            _ => unreachable!(),
+        };
+        engine.modules[0].scanned.tables.push(ScannedTable {
+            version: (3, 0),
+            walk: "full",
+            entries: Vec::new(),
+            null_entries: vec!["C_Initialize"],
+            unpinned: Vec::new(),
+            address,
+            file_offset: Some(table_file_offset),
+        });
+        engine.modules[0].entry_objects.push(Vec::new());
+        engine.modules[0].scanned.interfaces.extend([
+            ScannedInterface {
+                index: 0,
+                name_class: "exact_standard",
+                name_lossy: None,
+                name_private: Some(b"PKCS 11".to_vec()),
+                flags: 0,
+                table: Some(0),
+            },
+            ScannedInterface {
+                index: 1,
+                name_class: "exact_standard",
+                name_lossy: None,
+                name_private: Some(b"PKCS 11".to_vec()),
+                flags: 1,
+                table: Some(0),
+            },
+        ]);
+        engine.publish_current_capture_facts().unwrap();
+        let before_plan = engine.plan.clone();
+
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+        record.pid_tgid = u64::from(pid) << 32;
+        record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+        record.interface_index = DISCOVERY_VERSION_V3_0;
+        record.request_flags = 1;
+        record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        record.selection_version_class = DISCOVERY_VERSION_V3_0;
+        record.interface_flags = 1;
+        record.table_ptr = address;
+        record.binding_id = binding.id;
+        assert_eq!(
+            engine.process_selection_record(&QueuedDiscoveryRecord {
+                record,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            }),
+            DiscoveryRecordOutcome::applied(false, true)
+        );
+
+        let tuple = engine.capture_facts.history.selections.last().unwrap();
+        assert_eq!(tuple.inventory_matches.len(), 3);
+        assert_eq!(
+            tuple
+                .inventory_matches
+                .iter()
+                .filter(|matched| matched.name_agrees)
+                .count(),
+            2,
+            "legacy has no name while both interface aliases remain distinct"
+        );
+        assert!(
+            tuple
+                .inventory_matches
+                .iter()
+                .all(|matched| matched.version_agrees)
+        );
+        let provider_module = tuple.module;
+        assert_eq!(engine.plan, before_plan);
+
+        record.name_class = DISCOVERY_NAME_UNREADABLE;
+        engine.process_selection_record(&QueuedDiscoveryRecord {
+            record,
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        });
+        assert!(
+            engine.capture_facts.history.selections[1]
+                .inventory_matches
+                .iter()
+                .all(|matched| !matched.name_agrees),
+            "unreadable classifications never agree"
+        );
+
+        record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        let losses = engine.capture_facts.history.losses.len();
+        record.table_ptr = maps
+            .iter()
+            .find(|mapping| ObjectKey::of(mapping) != provider)
+            .unwrap()
+            .start;
+        engine.process_selection_record(&QueuedDiscoveryRecord {
+            record,
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        });
+        let foreign = engine.capture_facts.history.selections.last().unwrap();
+        assert_eq!(
+            foreign.module, provider_module,
+            "the hook owner stays the provider"
+        );
+        assert!(
+            foreign.inventory_matches.is_empty(),
+            "a returned pointer in another object never becomes an inventory match"
+        );
+        assert_eq!(engine.capture_facts.history.losses.len(), losses + 1);
+        assert!(engine.capture_facts.history.losses.values().any(|loss| {
+            loss.reason == "a successful selection result matched no inventory table"
+        }));
+
+        record.table_ptr = address;
+        let original_key = engine
+            .capture_facts
+            .history
+            .selection_inventory
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let surfaces = engine
+            .capture_facts
+            .history
+            .selection_inventory
+            .remove(&original_key)
+            .unwrap();
+        let mut wrong_offset = original_key;
+        wrong_offset.file_offset = wrong_offset.file_offset.saturating_add(1);
+        engine
+            .capture_facts
+            .history
+            .selection_inventory
+            .insert(wrong_offset, surfaces);
+        engine.process_selection_record(&QueuedDiscoveryRecord {
+            record,
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        });
+        let unmatched = engine
+            .capture_facts
+            .history
+            .selections
+            .iter()
+            .find(|tuple| {
+                tuple.result.is_some()
+                    && tuple.inventory_matches.is_empty()
+                    && tuple.request.flags == record.request_flags
+            })
+            .unwrap();
+        assert_eq!(
+            unmatched.count, 2,
+            "the same inode and address cannot recover a stale table offset"
+        );
+    }
+
+    #[test]
+    fn selection_facts_follow_capture_stage_commit_and_rollback() {
+        let tuple = LiveSelectionTuple {
+            module: plan::ModuleId(7),
+            request: SelectionRequest {
+                name: SelectionNameClass::Null,
+                version: SelectionVersionClass::Null,
+                flags: 0,
+            },
+            rv: 1,
+            result: None,
+            inventory_matches: Vec::new(),
+            count: 1,
+        };
+        let mut facts = CaptureFacts::default();
+        let provider = timing_key(0);
+        let selection_surfaces = |start: usize, count: usize| {
+            canonical_inventory_keys(
+                (start..start + count)
+                    .map(|offset| InventorySurfaceBase {
+                        provider: provider.clone(),
+                        table_file_offset: offset as u64,
+                        kind: InventorySurfaceKind::Interface,
+                        name: PrivateSelectionName::ExactStandard,
+                        version: SelectionVersionClass::V3_0,
+                        flags: 0,
+                    })
+                    .collect(),
+            )
+        };
+        let baseline_surfaces = facts.history.selection_surfaces.clone();
+        let baseline_inventory = facts.history.selection_inventory.clone();
+        let baseline_losses = facts.history.losses.clone();
+        facts.begin_stage().unwrap();
+        assert_eq!(
+            admit_inventory_keys(
+                facts.visible_history_mut(),
+                selection_surfaces(0, MAX_LIVE_SELECTION_SURFACES),
+            )
+            .len(),
+            MAX_LIVE_SELECTION_SURFACES
+        );
+        assert!(
+            admit_inventory_keys(
+                facts.visible_history_mut(),
+                selection_surfaces(MAX_LIVE_SELECTION_SURFACES, 1),
+            )
+            .is_empty()
+        );
+        for flags in 0..17 {
+            let mut distinct = tuple.clone();
+            distinct.request.flags = flags;
+            facts.record_selection(distinct, false);
+        }
+        assert_eq!(facts.visible_history().selections.len(), 16);
+        assert!(facts.visible_history().selection_truncated);
+        assert_eq!(facts.visible_history().losses.len(), 1);
+        facts.rollback_stage();
+        assert!(facts.history.selections.is_empty());
+        assert_eq!(facts.history.selection_surfaces, baseline_surfaces);
+        assert_eq!(facts.history.selection_inventory, baseline_inventory);
+        assert_eq!(facts.history.losses, baseline_losses);
+        assert!(!facts.history.selection_truncated);
+
+        facts.begin_stage().unwrap();
+        assert_eq!(
+            admit_inventory_keys(
+                facts.visible_history_mut(),
+                selection_surfaces(0, MAX_LIVE_SELECTION_SURFACES),
+            )
+            .len(),
+            MAX_LIVE_SELECTION_SURFACES
+        );
+        assert!(
+            admit_inventory_keys(
+                facts.visible_history_mut(),
+                selection_surfaces(MAX_LIVE_SELECTION_SURFACES, 1),
+            )
+            .is_empty()
+        );
+        for flags in 0..17 {
+            let mut distinct = tuple.clone();
+            distinct.request.flags = flags;
+            facts.record_selection(distinct, false);
+        }
+        facts.commit_stage().unwrap();
+        assert_eq!(
+            facts.history.selection_surfaces.len(),
+            MAX_LIVE_SELECTION_SURFACES
+        );
+        assert_eq!(facts.history.selections.len(), 16);
+        assert!(facts.history.selection_truncated);
+        assert_eq!(facts.history.losses.len(), 1);
+    }
+
+    #[test]
+    fn terminal_selection_success_survives_view_loss_as_unmatched_fact() {
+        let (_fixture, mut engine, _session, binding) = attached_selection_route();
+        engine
+            .selection_bindings
+            .get_mut(&binding.id)
+            .unwrap()
+            .retired = true;
+        engine.loader_registry.tombstone(binding.context).unwrap();
+        engine.views.clear();
+        let identity = DynamicExportIdentity {
+            object: binding.object,
+            file_offset: binding.file_offset,
+            cookie: binding.id,
+            abi: binding.abi,
+        };
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+        record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+        record.interface_index = DISCOVERY_VERSION_V3_0;
+        record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        record.selection_version_class = DISCOVERY_VERSION_V3_0;
+        record.table_ptr = 0x1000;
+        record.binding_id = binding.id;
+
+        assert_eq!(
+            engine.process_selection_record(&tagged_by_authority(
+                binding.context,
+                &[identity],
+                record,
+            )),
+            DiscoveryRecordOutcome::applied(false, true)
+        );
+        let tuple = engine.capture_facts.history.selections.last().unwrap();
+        assert!(tuple.result.is_some());
+        assert!(tuple.inventory_matches.is_empty());
+        assert!(engine.capture_facts.history.losses.values().any(|loss| {
+            loss.reason == "a terminal selection result had no stable live table assessment"
+        }));
+    }
+
+    #[test]
+    fn selection_inventory_keys_are_canonical_bounded_and_pruned() {
+        let (_fixture, engine, _session, binding) = attached_selection_route();
+        let provider = engine.pinned.owned_timing_key(binding.object).unwrap();
+        let base = |table_file_offset, name, flags| InventorySurfaceBase {
+            provider: provider.clone(),
+            table_file_offset,
+            kind: InventorySurfaceKind::Interface,
+            name,
+            version: SelectionVersionClass::V3_0,
+            flags,
+        };
+        let first = base(0x20, PrivateSelectionName::Other(b"alpha".to_vec()), 0);
+        let second = base(0x20, PrivateSelectionName::Other(b"beta".to_vec()), 1);
+        assert_eq!(
+            canonical_inventory_keys(vec![first.clone(), second.clone()]),
+            canonical_inventory_keys(vec![second.clone(), first.clone()]),
+            "enumeration order does not change canonical aliases"
+        );
+        assert_ne!(
+            canonical_inventory_keys(vec![first.clone()]),
+            canonical_inventory_keys(vec![second.clone()]),
+            "private names and flags remain part of alias identity"
+        );
+        assert_ne!(
+            canonical_inventory_keys(vec![first.clone()]),
+            canonical_inventory_keys(vec![base(
+                0x28,
+                PrivateSelectionName::Other(b"alpha".to_vec()),
+                0,
+            )]),
+            "the same apparent alias at another table offset stays distinct"
+        );
+        let duplicates = canonical_inventory_keys(vec![first.clone(), first]);
+        assert_eq!(duplicates[0].duplicate, 0);
+        assert_eq!(duplicates[1].duplicate, 1);
+
+        let mut history = CaptureHistory::default();
+        let first_512 = (0..MAX_LIVE_SELECTION_SURFACES)
+            .map(|offset| base(offset as u64, PrivateSelectionName::ExactStandard, 0))
+            .collect();
+        assert_eq!(
+            admit_inventory_keys(&mut history, canonical_inventory_keys(first_512)).len(),
+            MAX_LIVE_SELECTION_SURFACES
+        );
+        let overflow = canonical_inventory_keys(vec![base(
+            MAX_LIVE_SELECTION_SURFACES as u64,
+            PrivateSelectionName::ExactStandard,
+            0,
+        )]);
+        assert!(admit_inventory_keys(&mut history, overflow).is_empty());
+        assert_eq!(
+            history.selection_surfaces.len(),
+            MAX_LIVE_SELECTION_SURFACES
+        );
+        assert!(history.selection_truncated);
+        assert_eq!(history.losses.len(), 1);
+
+        let surface = history.selection_surfaces.iter().next().unwrap().clone();
+        for view in [ProcessViewId(1), ProcessViewId(2)] {
+            history.selection_inventory.insert(
+                ExactSelectionTable {
+                    view,
+                    provider: provider.clone(),
+                    address: 0x1000,
+                    file_offset: 0,
+                },
+                vec![surface.clone()],
+            );
+        }
+        prune_selection_inventory(&mut history, &[ProcessViewId(2)].into_iter().collect());
+        assert_eq!(history.selection_inventory.len(), 1);
+        assert!(
+            history
+                .selection_inventory
+                .keys()
+                .all(|table| table.view == ProcessViewId(2))
+        );
+
+        let before =
+            parse_maps(b"00001000-00002000 r--p 00000000 08:01 9 /opt/provider.so\n").unwrap();
+        let remapped =
+            parse_maps(b"00001000-00002000 r--p 00001000 08:01 9 /opt/provider.so\n").unwrap();
+        assert!(!stable_selection_mapping(before.first(), remapped.first()));
+    }
+
+    #[test]
+    fn selection_assessment_rejects_remap_view_loss_and_pin_change() {
+        fn assess(
+            before: Vec<MapEntry>,
+            after: Vec<MapEntry>,
+            view_same: bool,
+            pin_same: bool,
+        ) -> (Result<(), ()>, Vec<&'static str>) {
+            let mut snapshots = [before, after].into_iter();
+            let events = std::cell::RefCell::new(Vec::new());
+            let result = selection_mapping_bracket(
+                0x1000,
+                || {
+                    events.borrow_mut().push("maps");
+                    snapshots.next().ok_or(())
+                },
+                || {
+                    events.borrow_mut().push("view");
+                    view_same
+                },
+                || {
+                    events.borrow_mut().push("pin");
+                    pin_same
+                },
+            )
+            .map(|_| ());
+            (result, events.into_inner())
+        }
+
+        let stable =
+            parse_maps(b"00001000-00002000 r--p 00000000 08:01 9 /opt/provider.so\n").unwrap();
+        let remapped =
+            parse_maps(b"00001000-00002000 r--p 00001000 08:01 9 /opt/provider.so\n").unwrap();
+        let (result, events) = assess(stable.clone(), remapped, true, true);
+        assert!(result.is_err());
+        assert_eq!(events, ["maps", "maps", "view", "pin"]);
+        assert!(
+            assess(stable.clone(), stable.clone(), false, true)
+                .0
+                .is_err()
+        );
+        assert!(assess(stable.clone(), stable, true, false).0.is_err());
     }
 
     #[test]
@@ -15424,6 +16427,7 @@ int main(int argc, char **argv) {
             null_entries: Vec::new(),
             unpinned: Vec::new(),
             address: 0x7000,
+            file_offset: Some(0),
         });
         let mut provider_pins = pin_test_module(&view, &provider);
         let provider_modules =
@@ -16188,11 +17192,13 @@ int main(int argc, char **argv) {
                 null_entries: vec![],
                 unpinned: vec![],
                 address: 0x1000,
+                file_offset: Some(0),
             }],
             interfaces: vec![ScannedInterface {
                 index: 0,
                 name_class: "exact_standard",
                 name_lossy,
+                name_private: Some(b"PKCS 11".to_vec()),
                 flags: 7,
                 table: Some(0),
             }],
@@ -16693,6 +17699,7 @@ int main(int argc, char **argv) {
             null_entries: vec![],
             unpinned: vec![],
             address: 0x7000,
+            file_offset: Some(0),
         });
         let manifest = manifest_naming(&path, Some(sha256));
         let input = ManifestInput {
@@ -16803,6 +17810,7 @@ int main(int argc, char **argv) {
                 null_entries: vec![],
                 unpinned: vec![],
                 address: 0x7000,
+                file_offset: Some(0),
             }],
             interfaces: vec![],
         }
@@ -17588,6 +18596,7 @@ int main(int argc, char **argv) {
                 null_entries: vec![],
                 unpinned: vec![],
                 address: 0x7000,
+                file_offset: Some(0),
             }],
             interfaces: vec![],
         };
@@ -17813,6 +18822,7 @@ int main(int argc, char **argv) {
                     null_entries: vec![],
                     unpinned: vec![],
                     address: 0x7000 + offset,
+                    file_offset: Some(offset),
                 }],
                 interfaces: vec![],
             },
@@ -17892,6 +18902,7 @@ int main(int argc, char **argv) {
                     null_entries: vec![],
                     unpinned: vec![],
                     address: 0x7000,
+                    file_offset: Some(0),
                 }],
                 interfaces: vec![],
             },
@@ -17953,6 +18964,7 @@ int main(int argc, char **argv) {
                     null_entries: vec![],
                     unpinned: vec![],
                     address: 0x7000,
+                    file_offset: Some(0),
                 }],
                 interfaces: vec![],
             },
@@ -18140,6 +19152,7 @@ int main(int argc, char **argv) {
                 null_entries: vec![],
                 unpinned: vec![],
                 address: 0x7000,
+                file_offset: Some(0),
             });
         modules[0].tables.last_mut().unwrap().entries[0].object_path = modules[0].path.clone();
 
@@ -18196,6 +19209,7 @@ int main(int argc, char **argv) {
                 null_entries: vec![],
                 unpinned: vec![raw.clone()],
                 address: 0x7000,
+                file_offset: Some(0),
             });
         let reconciled = reconcile_for_test(&modules, &mut pinned);
         let plan = plan::build_from_reconciled_modules(&reconciled);
@@ -18780,6 +19794,7 @@ int main(int argc, char **argv) {
                 null_entries: vec![],
                 unpinned: vec![],
                 address: 0x7000,
+                file_offset: Some(0),
             }],
             interfaces: vec![],
         };

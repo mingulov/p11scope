@@ -1581,6 +1581,7 @@ pub(crate) mod test_fixture {
                 null_entries: vec![],
                 unpinned: vec![],
                 address: 0x7000,
+                file_offset: Some(0),
             }],
             interfaces: vec![],
         }

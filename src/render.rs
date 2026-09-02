@@ -1663,6 +1663,7 @@ mod tests {
                     null_entries: vec![],
                     unpinned: vec![],
                     address: 0x7000,
+                    file_offset: Some(0),
                 }],
                 interfaces: vec![],
             },

@@ -424,11 +424,13 @@ mod tests {
                     null_entries: vec!["C_GetFunctionStatus"],
                     unpinned: vec![],
                     address: 0x7f0000001000,
+                    file_offset: Some(0),
                 }],
                 interfaces: vec![ScannedInterface {
                     index: 0,
                     name_class: "exact_standard",
                     name_lossy: Some("PKCS 11".into()),
+                    name_private: Some(b"PKCS 11".to_vec()),
                     flags: 0,
                     table: Some(0),
                 }],

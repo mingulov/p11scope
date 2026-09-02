@@ -2091,6 +2091,50 @@ fn release_runs_every_python3_in_isolated_mode() {
         release.contains("t4_checker_argv=\"$T4_TOOL_python3 -I scripts/check-capture-evidence.py"),
         "the framed checker argv does not match the isolated invocation"
     );
+
+    // Production mutation caught: removing `-I` from
+    // `scripts/verify-attach-e2e.sh:16` must fail this contract. Strip shell
+    // comments before checking so documentation does not count as a command;
+    // `command -v python3` is a lookup, not an interpreter invocation.
+    for path in [
+        "scripts/lib.sh",
+        "scripts/verify-canaries.sh",
+        "scripts/verify-attach-e2e.sh",
+        "scripts/verify-discover-containers.sh",
+    ] {
+        let source = read(path);
+        for (line_number, line) in source.lines().enumerate() {
+            let code = line.split_once('#').map_or(line, |(code, _)| code);
+            if code.trim_start().starts_with("command -v python3") {
+                continue;
+            }
+            let mut offset = 0;
+            while let Some(relative) = code[offset..].find("python3") {
+                let start = offset + relative;
+                let end = start + "python3".len();
+                let bytes = code.as_bytes();
+                let token_before = start == 0
+                    || !bytes[start - 1].is_ascii_alphanumeric() && bytes[start - 1] != b'_';
+                let token_after = end == bytes.len()
+                    || !bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_';
+                if token_before && token_after {
+                    let after = code[end..].trim_start();
+                    let rest = after.strip_prefix("-I").unwrap_or_else(|| {
+                        panic!(
+                            "unisolated executable python3 in {path}:{line_number}: {line:?}"
+                        )
+                    });
+                    assert!(
+                        rest.is_empty()
+                            || (!rest.as_bytes()[0].is_ascii_alphanumeric()
+                                && rest.as_bytes()[0] != b'_'),
+                        "python3 option is not the isolated -I token in {path}:{line_number}: {line:?}"
+                    );
+                }
+                offset = end;
+            }
+        }
+    }
 }
 
 #[test]
@@ -2683,11 +2727,11 @@ real_python=$(command -v python3)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 python3() {
-    if [ "$1" = - ]; then
-        case ${3-} in
+    if [ "$1" = -I ] && [ "$2" = - ]; then
+        case ${4-} in
             ''|*[!0-9]*) command "$real_python" "$@"; return ;;
         esac
-        "$real_python" - "$2" <<'PY'
+        "$real_python" -I - "$3" <<'PY'
 import json
 import sys
 
@@ -3189,8 +3233,8 @@ fn port_forward_term_during_launch_reaps_the_trap_visible_generation() {
     fs::write(
         &python_wrapper,
         r#"#!/bin/sh
-if [ "$1" = - ] && [ "$#" -gt 5 ]; then
-    case ${3-} in
+if [ "$1" = -I ] && [ "$2" = - ] && [ "$#" -gt 6 ]; then
+    case ${4-} in
         ''|*[!0-9]*) ;;
         *)
             [ -e "$PF_TEST_WORK/validation" ] || : > "$PF_TEST_WORK/validation"
@@ -3327,11 +3371,11 @@ fn mutated_process_group_record_never_signals_the_live_decoy_or_unvalidated_owne
     fs::write(
         &python_wrapper,
         r#"#!/bin/sh
-if [ "$1" = - ] && [ "$#" -gt 5 ]; then
-    case ${3-} in
+if [ "$1" = -I ] && [ "$2" = - ] && [ "$#" -gt 6 ]; then
+    case ${4-} in
         ''|*[!0-9]*) ;;
         *) [ -e "$PF_TEST_WORK/mutated" ||
-    "$PF_TEST_REAL_PYTHON" - "$2" "$PF_TEST_WORK" <<'PY'
+    "$PF_TEST_REAL_PYTHON" -I - "$3" "$PF_TEST_WORK" <<'PY'
 import json
 import os
 import subprocess

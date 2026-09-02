@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 # The lane oracle, in one place. `--self-test` runs it over synthetic evidence
 # and requires every claimed field to refuse a mutation, unprivileged.
 assert_lane_evidence() {
-    python3 - "$@" <<'PY'
+    python3 -I - "$@" <<'PY'
 import copy
 import json
 import sys
@@ -186,7 +186,7 @@ run_lane() {
     if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "profiler failed: $status"; tail -n 20 "$WORK/$lane.log" || true; exit "$status"; fi
     tail -n 3 "$WORK/$lane.log"
     reclaim_root_output "$WORK/$lane.json"
-    python3 scripts/check-capture-evidence.py "$mode" \
+    python3 -I scripts/check-capture-evidence.py "$mode" \
         "$WORK/$lane.json" spike/expected.txt
 }
 

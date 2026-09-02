@@ -181,8 +181,8 @@ signal_pinned_process() {
     spp_privilege=$1
     shift
     case $spp_privilege in
-        user) spp_python=python3 ;;
-        root) spp_python='sudo -n python3' ;;
+        user) spp_python='python3 -I' ;;
+        root) spp_python='sudo -n python3 -I' ;;
         *) return 1 ;;
     esac
     $spp_python - "$@" <<'PY'
@@ -235,7 +235,7 @@ launch_user_recorded_process_group() {
     umask 077
     USER_PROCESS_SID=
     export USER_PROCESS_SID
-    python3 - "$lurpg_pidfile" "$@" > "$lurpg_log" 2>&1 <<'PY' &
+    python3 -I - "$lurpg_pidfile" "$@" > "$lurpg_log" 2>&1 <<'PY' &
 import json
 import os
 import sys
@@ -303,7 +303,7 @@ PY
         echo "user process group identity was not recorded" >&2
         return 1
     }
-    lurpg_record=$(python3 - "$lurpg_pidfile" "$USER_PROCESS_LAUNCH_PID" \
+    lurpg_record=$(python3 -I - "$lurpg_pidfile" "$USER_PROCESS_LAUNCH_PID" \
         "$USER_PROCESS_INITIAL_STARTTIME" "$@" <<'PY'
 import json
 import sys
@@ -337,7 +337,7 @@ PY
     USER_PROCESS_SID=$4
     export USER_PROCESS_SID
 
-    python3 - "$USER_PROCESS_PID" "$USER_PROCESS_STARTTIME" "$USER_PROCESS_PGID" "$USER_PROCESS_SID" <<'PY'
+    python3 -I - "$USER_PROCESS_PID" "$USER_PROCESS_STARTTIME" "$USER_PROCESS_PGID" "$USER_PROCESS_SID" <<'PY'
 import sys
 
 
@@ -368,7 +368,7 @@ PY
 snapshot_user_process_session() {
     sups_sid=$1
     case $sups_sid in ''|*[!0-9]*) return 1 ;; esac
-    python3 - "$sups_sid" <<'PY'
+    python3 -I - "$sups_sid" <<'PY'
 import glob
 import hashlib
 import json
@@ -537,7 +537,7 @@ discover_copied_provider() {
 # and every attach object at the same file inside the container's mount
 # namespace, refusing any object that escapes the copied directory.
 rewrite_container_manifest() {
-    timeout --signal=TERM --kill-after=5s 60s python3 - "$@" <<'PY'
+    timeout --signal=TERM --kill-after=5s 60s python3 -I - "$@" <<'PY'
 import json
 import sys
 from pathlib import Path

@@ -19,14 +19,13 @@ come from tracefs format metadata; scan-open identity is checked before parsing
 the opened object. Capability and attach-mechanism evidence use finite enums.
 `uprobe_multi` cannot use Aya 0.14's ordinary loaded program FD: the kernel
 requires a distinct `BPF_TRACE_UPROBE_MULTI` expected attach type. Aya master
-now supports that path. Task 7 is an explicit owner decision between an exact
-upstream revision with dedicated multi twins and waiting/deferral; dynamic
-changes retain the existing per-offset path.
+now supports that path. Task 7 uses the selected exact upstream revision with
+dedicated multi twins; dynamic changes retain the existing per-offset path.
 
 **Tech stack:** Rust 1.88 / edition 2024, Aya 0.14.0 baseline, existing `libc`,
-`cryptoki-sys`, and `libloading`. Tasks 1–6 add no dependency. Task 7 may change
-Aya from that crates.io release to an exact upstream Git revision only after
-owner selection.
+`cryptoki-sys`, and `libloading`. Tasks 1–6 add no dependency. Task 7 changes
+Aya from that crates.io release to the exact reviewed Git revision recorded
+below.
 
 **Authorities:**
 
@@ -41,8 +40,8 @@ owner selection.
 - Preserve `docs/privacy/allowlist-v1.md` byte-for-byte. Create v2 explicitly;
   do not broaden target reads or output by implication.
 - Preserve Rust 1.88, Linux x86-64 first, Aya 0.14.0 through Tasks 1–6, and the
-  5.15 per-offset attach path. Any Task-7 Aya change must be an exact reviewed
-  revision recorded by the owner decision below.
+  5.15 per-offset attach path. Task 7 uses only the exact reviewed Aya revision
+  recorded below.
 - No raw names, pointers, addresses, PIDs/TIDs, provider errors, or target paths
   in selection or attach-mechanism output.
 - Parallel writers may touch only disjoint file sets. Review starts only after
@@ -61,6 +60,7 @@ owner selection.
 
 - Create: `docs/superpowers/specs/2026-09-02-c-get-interface-selection-design.md`
 - Create: this plan
+- Modify: `docs/superpowers/plans/2026-09-01-release-wave-charters.md`
 
 - [x] Verify current selection transport, helper, manifest, render, lifecycle,
   and privacy anchors at merged W2 base `a2a2644`.
@@ -73,7 +73,7 @@ owner selection.
   exact field/allowlist authority and v1 remains immutable.
 - [x] Verify W3 charter anchors for tracepoint offsets, scan-open identity,
   capability/diagnostic gaps, and Aya 0.14 `uprobe_multi` feasibility.
-- [ ] Run pass-2 review over every file/symbol/test command cited below; correct
+- [x] Run pass-2 review over every file/symbol/test command cited below; correct
   stale anchors before Task 1.
 
 Commit: `docs: plan wave 3 correctness residue`
@@ -84,12 +84,13 @@ Commit: `docs: plan wave 3 correctness residue`
 
 - Modify: `crates/manifest/src/manifest.rs`
 - Modify: `crates/manifest/tests/{elf,identity}.rs`
-- Modify: `src/manifest_input.rs`
+- Modify: `src/manifest_input.rs`, `src/plan.rs`
+- Modify: `src/discovery/{engine,identity}.rs`
 - Modify: `crates/discover/src/discover.rs`
 - Modify: `crates/discover/tests/{cli,fixture_provider,softhsm,version_matrix}.rs`
 - Modify: `crates/discover/tests/fixture/{provider,version_matrix}.c`
 - Modify: `README.md`, `CHANGELOG.md`, `scripts/lib.sh`
-- Modify: `tests/artifact_contracts.rs`
+- Modify: `tests/{artifact_contracts,manifest_pinning}.rs`
 
 Design acceptance: §12 items 2, 5, and 9–11.
 
@@ -114,6 +115,10 @@ Current anchors: manifest v4 is fixed at
 - [ ] RED: fixture test proves zero calls for absent/outside export and exactly
   ten ordered calls for queried; retain nonzero `CK_RV`, helper failures, full
   returned flags, and all bounded exact aliases.
+- [ ] RED: `selection_helper_conflicting_semantic_pair_is_truncated` returns
+  two different eligible tables with the same returned version/flags pair;
+  only the first fixed-order table may receive authority, the later outcome is
+  factual with no table reference, and missing truncation is invalid.
 - [ ] GREEN: add one local raw `C_GetInterface` ABI adapter in
   `p11scope-discover`, using its existing dependencies and no fallback policy.
   Query before `C_Initialize`; do not change the external facts-crate pin.
@@ -206,10 +211,11 @@ child execution at `src/run.rs:1484`, and physical slot state at
 - [ ] GREEN: implement `SelectionClaimKey -> AttachKey` reference ownership and
   source-local count-only authorization through the existing
   preflight/apply/rollback transaction. Never attach a duplicate offset.
-- [ ] RED: exact provider prearmed behind the owned-child barrier observes a
-  constructor call and reports a silent completed run as `absent_covered`;
-  non-prearmed `run` and `--pid` report `absent_uncovered`; normal finalization
-  preserves the closed coverage interval.
+- [ ] RED: `owned_run_selection_coverage` proves an exact provider prearmed
+  behind the owned-child barrier observes a constructor call and reports a
+  silent completed run as `absent_covered`; non-prearmed `run` and `--pid`
+  report `absent_uncovered`; normal finalization preserves the closed coverage
+  interval.
 - [ ] GREEN: preattach entry+return to exact freshly pinned provider exports
   before `OwnedChild::release`, then accept proof only after the eventual
   mapping agrees on device, inode, view, and generation.
@@ -223,6 +229,15 @@ child execution at `src/run.rs:1484`, and physical slot state at
   evidence but authorize nothing.
 - [ ] GREEN: enforce that finite semantic key before the existing indivisible
   512-slot admission; add no separate quota or slot allocator.
+- [ ] RED: `manifest_selection_tables_enter_the_attach_transaction` proves a
+  reachable manifest-v5 selection table creates source-local count-only claims,
+  `semantic_authorized=false`, and `PARTIAL`; an inventory target at the same
+  physical key shares one slot, and rollback/retirement remove only the
+  applicable owner without mutating inventory.
+- [ ] GREEN: lower only reachable, structurally validated manifest-v5 tables
+  through the existing candidate preflight/apply/rollback path and the same
+  `SelectionClaimKey -> AttachKey` reference ownership as live selection. Add
+  no manifest-only attach path.
 - [ ] Focused checks:
   `cargo +1.88 test --locked --lib c_get_interface_selection`,
   `cargo +1.88 test --locked --test live_discovery selection`, and
@@ -311,23 +326,57 @@ Commit: `fix: bind tracing metadata and scan opens to live identities`
 - Modify: `scripts/verify-capability-tier.sh`
 - Version, do not mutate: historical `FROZEN_CAPS` contract in
   `scripts/check-live-discovery-evidence.py`
-- Modify: `docs/usage.md` and observed-profile-v3 schema/allowlist v2
+- Modify: `docs/usage.md`
+- Modify: `docs/superpowers/specs/2026-09-01-p11scope-release-prd.md`
+- Modify: `docs/superpowers/plans/2026-09-01-release-wave-charters.md`
+- Modify: `docs/notes/2026-08-15-architecture-and-gap-analysis.md`
 
 Charter acceptance: W3 items 4–5.
 
 Current anchors: `CAP_BITS` at `src/doctor.rs:37`, real BPF/attach probe at
-`:223-290`, evidence/verdict at `src/render.rs:169,506`.
+`:223-290`, lifecycle degradation around `src/attach.rs:432`, and
+evidence/verdict at `src/render.rs:169,506`.
 
-- [ ] RED: pure table-driven T0–T4 classification covers uid/capability,
-  procfs/Yama/hidepid, non-dumpable target, real-program load/attach, and lease
-  inputs; add CAP_DAC_READ_SEARCH bit 2. Do not claim CAP_SYS_RESOURCE or an
-  RLIMIT_MEMLOCK requirement.
-- [ ] GREEN: emit finite consumer-visible `tier`; reuse current doctor checks
-  and real embedded program rather than a toy probe. Document losses per tier.
+The tier is a `doctor` availability result for the requested host/target/scope,
+not capture authority or completeness. Let `H` mean the supported kernel plus
+successful load of the real embedded object/maps/programs and an actual
+ordinary self-uprobe attach; `R` mean the supplied target generation stayed
+stable while required `/proc/<pid>/{maps,mem,root}` and exact provider opens
+succeeded; `L` mean the real exec and exit lifecycle links both attached; and
+`S` mean every requested scope-specific operation succeeded, including filter
+publication, cgroup access, and fork tracing when required.
+
+| Tier | Predicate | Meaning and explicit loss |
+| --- | --- | --- |
+| T0 offline | `!H` | Offline helper/inspect/report only; no live-call evidence. |
+| T1 host attach | `H && (!R or target unassessed)` | Real observer load/attach works; target readability/capture is not claimed. |
+| T2 target readable | `H && R && !L` | Exact target/providers can be planned; lifecycle changes may be missed and an attempted capture is `PARTIAL`. |
+| T3 lifecycle | `H && R && L && !S` | Base target/lifecycle works; the requested scope-specific lane is unavailable or degraded. |
+| T4 current full | `H && R && L && S` | All requested current-product mechanisms preflighted; this is not leased/hardened authority or a `COMPLETE` promise. |
+
+Operational results outrank inferred privilege. Capability bits, uid, sysctls,
+Yama, hidepid, dumpability, seccomp, and LSM state are diagnostics only. Return
+the highest proven prefix; unknown target/scope inputs produce T1 plus
+`unassessed`, never a guessed upper tier. Do not add `tier` to capture JSON or
+change `evidence.authority`; actual attach/loss/skipped-object evidence owns the
+capture verdict.
+
+- [ ] RED: `capability_tier_is_monotonic_without_lease_authority` covers the
+  exact `H/R/L/S` truth table, `R=unassessed`, and operational results overriding
+  capability guesses; classifier inputs contain no lease, trusted-workload,
+  root-authority, or hardened-oracle predicate. Add CAP_DAC_READ_SEARCH bit 2.
+  Do not claim CAP_SYS_RESOURCE or an RLIMIT_MEMLOCK requirement.
+- [ ] GREEN: emit the finite tier and assessed/unassessed state from `doctor`;
+  reuse current real probes rather than a toy program. Capture output gains no
+  `tier`, lease, or hardened authority field. Document exact losses per tier.
 - [ ] RED: `eperm_origin_requires_independent_evidence` proves bare `EPERM`
-  stays unknown, a matching finite seccomp fact selects seccomp, and a proven
-  missing capability selects capability; `verifier_diagnostics_are_bounded`
-  rejects target-derived text and over-limit output.
+  stays unknown, merely observing seccomp mode 2 is not causal proof, a
+  controlled syscall-denial fact selects seccomp, and a proven missing
+  capability selects capability. `verifier_diagnostics_are_bounded` accepts
+  only Aya's verifier log for the fixed embedded object, escapes controls with
+  the existing terminal helper, and caps the complete rendered fragment at
+  4096 UTF-8 bytes including a literal ` [truncated]` suffix without splitting
+  a scalar; it never includes a target path or generic error chain.
 - [ ] GREEN: distinguish evidence-backed seccomp denial from missing-capability
   denial without guessing from `EPERM` alone, and surface bounded Aya verifier
   diagnostics on load failure without target data.
@@ -344,18 +393,24 @@ Commit: `feat: report capability tiers and tracing degradation honestly`
 
 ## Task 7: `uprobe_multi` initial attach with safe fallback
 
-**Owner decision — BLOCKING Task 7 and Task 8, not Tasks 1–6:** released Aya
-0.14 loads
+**Decision recorded 2026-09-02:** the owner's autonomous W3 implementation
+authority selects exact Aya revision
+`8d16163ca436e3030cbd45a0f331c62cd6c059fa`, the locally reviewed snapshot of
+upstream-unreviewed open PR #1696. Released Aya 0.14 loads
 ordinary `UProbe` programs with expected attach type zero. A raw
 `BPF_LINK_CREATE(BPF_TRACE_UPROBE_MULTI)` using that FD is invalid, so the prior
 raw-link-only design would fall back everywhere and publish misleading
 evidence. Raising the kernel floor does not fix the program-load type.
 
-- **Pin option (recommended):** approve an exact reviewed Aya upstream Git
-  revision containing merged PRs #1417/#1654. Aya master has native multi
-  sections/load/attach/link ownership, declares MSRV 1.87, and passed
-  `cargo +1.88 check --locked -p aya` at `03bee7dca209651c2f8a951d362665294c0144c9`.
-- **Wait/defer option:** wait for the next Aya release, or amend the
+- **Master baseline:** Aya master `03bee7dca209651c2f8a951d362665294c0144c9`
+  contains merged PRs #1417/#1654 and native multi
+  sections/load/attach/link ownership. The dependency pin above additionally
+  exposes the process-scoped PID-filter probe required to avoid silently
+  missing sibling threads on affected early multi-uprobe kernels. Aya declares
+  MSRV 1.87; both exact revisions passed
+  `cargo +1.88 check --locked -p aya`.
+- **Rejected wait/defer alternative:** waiting for the next Aya release, or
+  amending the
   PRD/charter/ROADMAP, keep the existing per-offset path for v0.1, omit
   `attach_mechanisms`, and move multi attach to the post-release slices.
 - Dropping Linux 5.15 is rejected: it saves none of the required loader work and
@@ -366,11 +421,12 @@ Evidence and upstream contribution guidance:
 
 **Files:**
 
-- Modify under pin option: `Cargo.toml`, `Cargo.lock`
+- Modify: `Cargo.toml`, `Cargo.lock`
 - Modify: `crates/ebpf/src/main.rs`
 - Modify: `src/attach.rs`, `src/discovery/engine.rs`, `src/render.rs`, `src/run.rs`
 - Modify: `docs/schema/observed-profile-v3.md`,
   `docs/privacy/allowlist-v2.md`, `docs/usage.md`
+- Modify: `docs/notes/2026-09-02-aya-uprobe-multi-status.md`
 - Modify: `tests/artifact_contracts.rs`, `scripts/verify-attach-e2e.sh`
 
 Charter acceptance: W3 item 6.
@@ -380,8 +436,6 @@ attach transaction at `:734`, dynamic attach/detach at `:1450,1564`. Aya 0.14
 `UProbe::load()` uses expected attach type zero. Aya master recognizes
 `uprobe.multi` sections, loads attach type 48, and owns multi links natively.
 
-- [ ] OWNER: record `pin`, `wait`, or `defer` with the exact dependency or
-  authority-doc revision before any Task-7 writer starts.
 - [ ] RED pin: dependency test proves the multi twin loads with expected
   attach type 48 while the legacy twin remains zero; p11scope proves the two
   mechanisms use distinct program FDs with shared maps/lifecycle state.
@@ -391,12 +445,21 @@ attach transaction at `:734`, dynamic attach/detach at `:1450,1564`. Aya 0.14
 - [ ] RED pin: initial grouping test requires exact `{object, program}`
   bundles, all return bundles before entries, and logical endpoint counts.
 - [ ] GREEN pin: implement that grouping with dedicated multi twins.
-- [ ] RED: `uprobe_multi_fallback_is_narrow_and_sticky` accepts only the first
-  fixed-attribute multi-load `EINVAL` or fully valid link `EOPNOTSUPP` as
-  unsupported. Link-create `EINVAL`, `EPERM`, `EACCES`, identity/process errors,
-  and errors after a successful multi link remain real failures.
-- [ ] GREEN: select sticky legacy fallback only for those proven unsupported
-  stages; never use generic link-create `EINVAL` as feature detection.
+- [ ] RED: `uprobe_multi_probe_is_once_strict_and_sticky` injects public
+  process-scoped probe results `Ok(true)`, `Ok(false)`, and `Err`; proves exactly
+  one call before either multi twin loads; and statically rejects use of the
+  weaker `LinkCreation` feature. This stricter probe governs every capture,
+  including cgroup scope.
+- [ ] GREEN: call
+  `aya::sys::is_uprobe_multi_supported(UProbeMultiFeature::ProcessScopedPidFilter)`
+  once. `Ok(true)` selects the dedicated multi twins, `Ok(false)` selects
+  ordinary per-offset twins for the capture, and `Err` fails with the probe
+  diagnostic. Never use Aya's `AttachMode::Unknown` fallback.
+- [ ] RED: `positive_uprobe_multi_probe_never_falls_back` proves every multi
+  load/link `EINVAL`, `EOPNOTSUPP`, `EPERM`, `EACCES`, identity/process error,
+  and failure after a successful multi link is a real transactional failure.
+- [ ] GREEN: after `Ok(true)`, roll back on every multi load/link error; never
+  reinterpret a later failure as unsupported.
 - [ ] RED: `multi_bundle_retirement_downgrades_without_orphans` proves bundle
   close, pin recheck, surviving sibling per-offset reattach, exact endpoint
   ownership, and a real `PARTIAL` gap.
@@ -406,9 +469,10 @@ attach transaction at `:734`, dynamic attach/detach at `:1450,1564`. Aya 0.14
   return-group failure and an entry-group failure after a shared return bundle;
   both close every link created by that attempt and leave no return-only or
   successful endpoint state.
-- [ ] GREEN: make the initial multi attach one transaction. Before its first
-  successful link only a proven unsupported stage selects fallback; after
-  success every failure rolls back all links owned by the attempt.
+- [ ] GREEN: make the initial multi attach one transaction. Only the pre-load
+  support probe returning `Ok(false)` selects per-offset. After `Ok(true)`,
+  every transaction error rolls back all links owned by the attempt without
+  fallback.
 - [ ] Add finite sorted `evidence.attach_mechanisms` containing only
   `uprobe-multi` and/or `per-offset`; authorize it in allowlist v2.
 - [ ] Focused checks:
@@ -426,6 +490,8 @@ Commit: `feat: attach initial probe sets with uprobe_multi`
 
 - Create: `docs/superpowers/reports/2026-09-02-wave3-correctness-closure.md`
 - Modify: `docs/superpowers/plans/ROADMAP.md`
+- Modify: `docs/superpowers/plans/2026-09-01-release-wave-charters.md` only if
+  closeout evidence changes its recorded Aya decision
 - Modify: `CHANGELOG.md` only if its existing release convention requires it
 
 - [ ] Run every unprivileged validator self-test and focused W3 test named in

@@ -2762,7 +2762,7 @@ mkdir "$root/copy"
 : > "$root/copy/dep.so"
 : > "$root/escape.so"
 manifest() {
-    printf '{"schema":"p11scope-manifest/4","module_path":"%s","objects":[{"id":0,"path":"%s"},{"id":1,"path":"%s"}]}\n' \
+    printf '{"schema":"p11scope-manifest/5","module_path":"%s","objects":[{"id":0,"path":"%s"},{"id":1,"path":"%s"}]}\n' \
         "$root/copy/provider.so" "$root/copy/provider.so" "$1" > "$root/in.json"
 }
 manifest "$root/copy/dep.so"
@@ -7544,7 +7544,7 @@ SCRIPT
 #!/bin/sh
 module=; output=; previous=
 for argument do [ "$previous" = --module ] && module=$argument; [ "$previous" = -o ] && output=$argument; previous=$argument; done
-printf '{"schema":"p11scope-manifest/4","module_path":"%s","objects":[{"path":"%s"}]}\n' "$module" "$module" > "$output"
+printf '{"schema":"p11scope-manifest/5","module_path":"%s","objects":[{"path":"%s"}]}\n' "$module" "$module" > "$output"
 SCRIPT
     chmod 755 "$target/release/p11scope-discover"
     [ "$D2_MODE" = sleep-build ] && sleep 30

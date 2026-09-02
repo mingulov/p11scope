@@ -1,5 +1,6 @@
 //! dlopen + table-walk glue: raw provider facts become bounded manifest evidence.
-//! The helper never calls C_Initialize or C_GetInterface.
+//! The helper never calls C_Initialize and performs only the fixed v5
+//! C_GetInterface compatibility matrix.
 
 use crate::maps::{self, Device, MappedPath, ObjectKey};
 use libloading::Library;
@@ -10,6 +11,7 @@ use pkcs11_module::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
+use std::os::raw::c_void;
 use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 
@@ -66,6 +68,11 @@ pub fn discover_with_self_memory(
         std::fs::read("/proc/self/maps").map_err(|e| format!("/proc/self/maps: {e}"))?;
     let maps = maps::parse_maps(&maps_bytes)?;
     let module_map_key = loaded_module_key(raw_exports, &maps, module_file_key, &module_identity)?;
+    let initial_module_mappings: Vec<maps::MapEntry> = maps
+        .iter()
+        .filter(|mapping| ObjectKey::of(mapping) == module_map_key)
+        .cloned()
+        .collect();
     let mut approved_keys: BTreeSet<ObjectKey> = maps
         .iter()
         .map(ObjectKey::of)
@@ -88,11 +95,11 @@ pub fn discover_with_self_memory(
     let mut objects = ObjectTable::new(
         module_path.to_path_buf(),
         module_map_key,
-        module_identity,
+        module_identity.clone(),
         approved_keys,
     );
 
-    let (legacy, legacy_240) = legacy_surface(
+    let (legacy, legacy_240, legacy_ptr) = legacy_surface(
         legacy_acquisition,
         raw_exports.get_function_list,
         exports.get_function_list,
@@ -100,7 +107,7 @@ pub fn discover_with_self_memory(
         &maps,
         &mut objects,
     );
-    let (interface_list, interface_surfaces, vendor_interfaces) = interface_records(
+    let (interface_list, interface_surfaces, vendor_interfaces, interface_ptrs) = interface_records(
         interfaces_acquisition,
         raw_exports.get_interface_list,
         exports,
@@ -112,8 +119,38 @@ pub fn discover_with_self_memory(
 
     let mut surfaces = vec![legacy];
     surfaces.extend(interface_surfaces);
+    let mut inventory_tables = Vec::with_capacity(1 + interface_ptrs.len());
+    inventory_tables.push(legacy_ptr);
+    inventory_tables.extend(interface_ptrs);
+    let selection_raw = selection_acquisition(
+        &lib,
+        raw_exports.get_interface,
+        exports.get_interface,
+        &memory,
+        &inventory_tables,
+        module_path,
+        module_file_key,
+        &module_identity,
+        &objects,
+    );
+    let selection_evidence = selection_records(selection_raw, &surfaces);
     let alias_groups = alias_groups(&surfaces);
-    let provenance_objects = provenance_objects(&maps)?;
+    let final_maps = maps::parse_maps(
+        &std::fs::read("/proc/self/maps").map_err(|e| format!("/proc/self/maps: {e}"))?,
+    )?;
+    let (final_file_key, final_identity) = identity_and_key(module_path)?;
+    if final_file_key != module_file_key
+        || final_identity != module_identity
+        || !initial_module_mappings
+            .iter()
+            .all(|mapping| final_maps.contains(mapping))
+    {
+        return Err(format!(
+            "module {} changed while discovery was running",
+            module_path.display()
+        ));
+    }
+    let provenance_objects = provenance_objects(&final_maps)?;
 
     Ok(Manifest {
         schema: SCHEMA.to_string(),
@@ -124,6 +161,7 @@ pub fn discover_with_self_memory(
         surfaces,
         vendor_interfaces,
         alias_groups,
+        selection_evidence,
     })
 }
 
@@ -496,7 +534,7 @@ fn legacy_surface(
     memory: &ProcessMemory,
     maps: &[maps::MapEntry],
     objects: &mut ObjectTable,
-) -> (SurfaceRecord, Option<Vec<usize>>) {
+) -> (SurfaceRecord, Option<Vec<usize>>, Option<usize>) {
     let source = SurfaceSource::LegacyFunctionList;
     let Some(acquisition) = acquisition else {
         return (
@@ -507,6 +545,7 @@ fn legacy_surface(
                 walk: WalkOutcome::NotWalked,
                 functions: vec![],
             },
+            None,
             None,
         );
     };
@@ -522,6 +561,7 @@ fn legacy_surface(
                 functions: vec![],
             },
             None,
+            None,
         );
     }
     let base = match acquisition {
@@ -535,6 +575,7 @@ fn legacy_surface(
                     walk: WalkOutcome::NotWalked,
                     functions: vec![],
                 },
+                None,
                 None,
             );
         }
@@ -551,6 +592,7 @@ fn legacy_surface(
                     functions: vec![],
                 },
                 None,
+                None,
             );
         }
     };
@@ -564,6 +606,8 @@ fn legacy_surface(
         && matches!(&snapshot.walk, WalkOutcome::Full)
         && snapshot.values.len() == 68)
         .then(|| snapshot.values.iter().map(|(_, value)| *value).collect());
+    let inventory_pointer =
+        matches!(snapshot.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix).then_some(base);
     let functions = resolve_values(snapshot.values, maps, objects);
     (
         SurfaceRecord {
@@ -574,6 +618,7 @@ fn legacy_surface(
             functions,
         },
         legacy_240,
+        inventory_pointer,
     )
 }
 
@@ -585,7 +630,12 @@ fn interface_records(
     memory: &ProcessMemory,
     maps: &[maps::MapEntry],
     objects: &mut ObjectTable,
-) -> (Acquisition, Vec<SurfaceRecord>, Vec<VendorInterface>) {
+) -> (
+    Acquisition,
+    Vec<SurfaceRecord>,
+    Vec<VendorInterface>,
+    Vec<Option<usize>>,
+) {
     if raw_export.is_some() && exports.get_interface_list.is_none() {
         return (
             Acquisition::Error {
@@ -593,26 +643,28 @@ fn interface_records(
             },
             vec![],
             vec![],
+            vec![],
         );
     }
     let raw = match acquisition {
-        Err(detail) => return (Acquisition::Error { detail }, vec![], vec![]),
-        Ok(None) => return (Acquisition::Absent, vec![], vec![]),
+        Err(detail) => return (Acquisition::Error { detail }, vec![], vec![], vec![]),
+        Ok(None) => return (Acquisition::Absent, vec![], vec![], vec![]),
         Ok(Some(entries)) if entries.is_empty() => {
-            return (Acquisition::Empty, vec![], vec![]);
+            return (Acquisition::Empty, vec![], vec![], vec![]);
         }
         Ok(Some(entries)) => entries,
     };
 
     let mut surfaces = Vec::new();
     let mut vendor = Vec::new();
+    let mut table_ptrs = Vec::new();
     for (index, entry) in raw.into_iter().enumerate() {
         let name = read_name(memory, entry.name_ptr as usize);
         let exact = name.raw.as_deref() == Some(b"PKCS 11".as_slice()) && name.error.is_none();
         let version = read_version(memory, entry.func_list as usize);
 
         if exact {
-            surfaces.push(interface_surface(
+            let surface = interface_surface(
                 index,
                 &entry,
                 name,
@@ -622,7 +674,12 @@ fn interface_records(
                 memory,
                 maps,
                 objects,
-            ));
+            );
+            table_ptrs.push(
+                matches!(surface.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix)
+                    .then_some(entry.func_list as usize),
+            );
+            surfaces.push(surface);
             continue;
         }
 
@@ -635,7 +692,7 @@ fn interface_records(
                 }),
             );
             if corroborates_standard(version_value, &snapshot, exports, legacy_240) {
-                surfaces.push(interface_surface_from_snapshot(
+                let surface = interface_surface_from_snapshot(
                     index,
                     &entry,
                     name,
@@ -645,7 +702,12 @@ fn interface_records(
                     true,
                     maps,
                     objects,
-                ));
+                );
+                table_ptrs.push(
+                    matches!(surface.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix)
+                        .then_some(entry.func_list as usize),
+                );
+                surfaces.push(surface);
                 continue;
             }
             vendor.push(vendor_interface(
@@ -659,7 +721,636 @@ fn interface_records(
             vendor.push(vendor_interface(index, &entry, name, None, version.err()));
         }
     }
-    (Acquisition::Ok, surfaces, vendor)
+    (Acquisition::Ok, surfaces, vendor, table_ptrs)
+}
+
+type GetInterfaceFn = unsafe extern "C" fn(
+    *mut cryptoki_sys::CK_UTF8CHAR,
+    *mut cryptoki_sys::CK_VERSION,
+    *mut *mut c_void,
+    cryptoki_sys::CK_FLAGS,
+) -> cryptoki_sys::CK_RV;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TableOrigin {
+    object: ObjectKey,
+    file_offset: u64,
+}
+
+struct RawSelectionResult {
+    name: SelectionNameClass,
+    version: SelectionVersionClass,
+    flags: u64,
+    table: Option<(SelectionTable, TableOrigin)>,
+    inventory_matches: Vec<usize>,
+}
+
+struct RawSelectionQuery {
+    selector: u8,
+    request: SelectionRequest,
+    rv: u64,
+    result: Option<RawSelectionResult>,
+    helper_failure: Option<SelectionFailure>,
+}
+
+fn selection_request(selector: u8, flags: u64) -> SelectionRequest {
+    let (name, version) = match selector {
+        0 => (SelectionNameClass::Null, SelectionVersionClass::Null),
+        1 => (
+            SelectionNameClass::ExactStandard,
+            SelectionVersionClass::Null,
+        ),
+        2 => (
+            SelectionNameClass::ExactStandard,
+            SelectionVersionClass::V3_0,
+        ),
+        3 => (
+            SelectionNameClass::ExactStandard,
+            SelectionVersionClass::V3_1,
+        ),
+        4 => (
+            SelectionNameClass::ExactStandard,
+            SelectionVersionClass::V3_2,
+        ),
+        _ => unreachable!("fixed selection selector"),
+    };
+    SelectionRequest {
+        name,
+        version,
+        flags,
+    }
+}
+
+fn selection_maps_unchanged(first: &[maps::MapEntry], second: &[maps::MapEntry]) -> bool {
+    first == second
+}
+
+fn selection_bracket<T, SnapshotA, Resolve, SnapshotB>(
+    snapshot_a: SnapshotA,
+    resolve: Resolve,
+    snapshot_b: SnapshotB,
+) -> Result<T, SelectionFailure>
+where
+    SnapshotA: FnOnce() -> Result<Vec<maps::MapEntry>, ()>,
+    Resolve: FnOnce(&[maps::MapEntry]) -> Result<T, SelectionFailure>,
+    SnapshotB: FnOnce() -> Result<Vec<maps::MapEntry>, ()>,
+{
+    let maps_a = snapshot_a();
+    let resolved = resolve(maps_a.as_deref().unwrap_or(&[]));
+    let maps_b = snapshot_b();
+    if maps_a.is_err()
+        || maps_b.is_err()
+        || !selection_maps_unchanged(
+            maps_a.as_deref().unwrap_or(&[]),
+            maps_b.as_deref().unwrap_or(&[]),
+        )
+    {
+        Err(SelectionFailure::ProviderChanged)
+    } else {
+        resolved
+    }
+}
+
+fn selection_inventory_indices(inventory_tables: &[Option<usize>], pointer: usize) -> Vec<usize> {
+    inventory_tables
+        .iter()
+        .enumerate()
+        .filter_map(|(surface, candidate)| (*candidate == Some(pointer)).then_some(surface))
+        .collect()
+}
+
+fn selection_table_incomplete(
+    version: SelectionVersionClass,
+    snapshot: Option<&TableSnapshot>,
+) -> bool {
+    matches!(
+        version,
+        SelectionVersionClass::V3_0 | SelectionVersionClass::V3_1 | SelectionVersionClass::V3_2
+    ) && !snapshot.is_some_and(|snapshot| matches!(snapshot.walk, WalkOutcome::Full))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn selection_acquisition(
+    lib: &Library,
+    raw_export: Option<usize>,
+    module_export: Option<usize>,
+    memory: &ProcessMemory,
+    inventory_tables: &[Option<usize>],
+    module_path: &Path,
+    module_file_key: ObjectKey,
+    module_identity: &ObjectIdentity,
+    objects: &ObjectTable,
+) -> (SelectionAcquisition, Vec<RawSelectionQuery>) {
+    if raw_export.is_none() {
+        return (SelectionAcquisition::ExportAbsent, Vec::new());
+    }
+    if module_export.is_none() {
+        return (SelectionAcquisition::ExportOutsideModule, Vec::new());
+    }
+    let get_interface: libloading::Symbol<'_, GetInterfaceFn> = unsafe {
+        match lib.get(b"C_GetInterface\0") {
+            Ok(symbol) => symbol,
+            Err(_) => return (SelectionAcquisition::ExportOutsideModule, Vec::new()),
+        }
+    };
+    let mut queries = Vec::with_capacity(10);
+    for selector in 0..5u8 {
+        for flags in [0u64, 1] {
+            let request = selection_request(selector, flags);
+            let mut version = match request.version {
+                SelectionVersionClass::V3_0 => cryptoki_sys::CK_VERSION { major: 3, minor: 0 },
+                SelectionVersionClass::V3_1 => cryptoki_sys::CK_VERSION { major: 3, minor: 1 },
+                SelectionVersionClass::V3_2 => cryptoki_sys::CK_VERSION { major: 3, minor: 2 },
+                _ => cryptoki_sys::CK_VERSION { major: 0, minor: 0 },
+            };
+            let mut output = std::ptr::null_mut();
+            let name = b"PKCS 11\0";
+            let name_ptr = if request.name == SelectionNameClass::ExactStandard {
+                name.as_ptr() as *mut cryptoki_sys::CK_UTF8CHAR
+            } else {
+                std::ptr::null_mut()
+            };
+            let version_ptr = matches!(
+                request.version,
+                SelectionVersionClass::V3_0
+                    | SelectionVersionClass::V3_1
+                    | SelectionVersionClass::V3_2
+            )
+            .then_some(&mut version as *mut cryptoki_sys::CK_VERSION)
+            .unwrap_or(std::ptr::null_mut());
+            let rv = unsafe { get_interface(name_ptr, version_ptr, &mut output, flags) };
+            let (result, helper_failure) = if rv != cryptoki_sys::CKR_OK {
+                (None, None)
+            } else if output.is_null() {
+                (None, Some(SelectionFailure::NullOutput))
+            } else {
+                let mut captured = None;
+                let bracket = selection_bracket(
+                    || stable_selection_maps(module_path, module_file_key, module_identity),
+                    |maps_a| {
+                        let (name_pointer, table_pointer, returned_flags) =
+                            read_interface(memory, output as usize)
+                                .map_err(|_| SelectionFailure::UnreadableInterface)?;
+                        let inventory_matches =
+                            selection_inventory_indices(inventory_tables, table_pointer);
+                        let name = read_name(memory, name_pointer);
+                        let version_read = read_version(memory, table_pointer);
+                        let name_class = selection_name_class(&name, name_pointer);
+                        let version_class = selection_version_class(&version_read, table_pointer);
+                        let table_snapshot = match version_class {
+                            SelectionVersionClass::V3_0
+                            | SelectionVersionClass::V3_1
+                            | SelectionVersionClass::V3_2 => Some(snapshot_table(
+                                memory,
+                                table_pointer,
+                                tables_for(Surface::StandardInterface {
+                                    version: cryptoki_sys::CK_VERSION {
+                                        major: 3,
+                                        minor: match version_class {
+                                            SelectionVersionClass::V3_0 => 0,
+                                            SelectionVersionClass::V3_1 => 1,
+                                            SelectionVersionClass::V3_2 => 2,
+                                            _ => unreachable!(),
+                                        },
+                                    },
+                                }),
+                            )),
+                            _ => None,
+                        };
+                        let mut helper_failure = if name_pointer == 0 || name.error.is_some() {
+                            Some(SelectionFailure::UnreadableName)
+                        } else if table_pointer == 0 {
+                            Some(SelectionFailure::UnreadableTable)
+                        } else if version_read.is_err() {
+                            Some(SelectionFailure::UnreadableVersion)
+                        } else if selection_table_incomplete(version_class, table_snapshot.as_ref())
+                        {
+                            Some(SelectionFailure::UnreadableTable)
+                        } else {
+                            None
+                        };
+                        let mut selection_table = None;
+                        if helper_failure.is_none()
+                            && request.name == SelectionNameClass::ExactStandard
+                            && inventory_matches.is_empty()
+                            && name_class == SelectionNameClass::ExactStandard
+                            && matches!(
+                                version_class,
+                                SelectionVersionClass::V3_0
+                                    | SelectionVersionClass::V3_1
+                                    | SelectionVersionClass::V3_2
+                            )
+                            && matches!(returned_flags, 0 | 1)
+                        {
+                            match selection_table_for(
+                                table_pointer,
+                                version_class,
+                                table_snapshot.as_ref(),
+                                maps_a,
+                                objects,
+                            ) {
+                                Ok((table, origin)) => {
+                                    selection_table = Some((table, origin));
+                                }
+                                Err(failure) => {
+                                    helper_failure = Some(failure);
+                                }
+                            }
+                        }
+                        captured = Some((
+                            RawSelectionResult {
+                                name: name_class,
+                                version: version_class,
+                                flags: returned_flags,
+                                table: selection_table,
+                                inventory_matches,
+                            },
+                            helper_failure,
+                        ));
+                        Ok(())
+                    },
+                    || stable_selection_maps(module_path, module_file_key, module_identity),
+                );
+                match bracket {
+                    Ok(()) => captured
+                        .map(|(result, helper_failure)| (Some(result), helper_failure))
+                        .unwrap_or((None, Some(SelectionFailure::UnreadableInterface))),
+                    Err(SelectionFailure::ProviderChanged) => captured
+                        .map(|(mut result, _)| {
+                            result.table = None;
+                            (Some(result), Some(SelectionFailure::ProviderChanged))
+                        })
+                        .unwrap_or((None, Some(SelectionFailure::ProviderChanged))),
+                    Err(failure) => (None, Some(failure)),
+                }
+            };
+            queries.push(RawSelectionQuery {
+                selector,
+                request,
+                rv: rv as u64,
+                result,
+                helper_failure,
+            });
+        }
+    }
+    (SelectionAcquisition::Queried, queries)
+}
+
+fn ptr_bytes(bytes: &[u8], offset: usize) -> Result<usize, String> {
+    let width = std::mem::size_of::<usize>();
+    let end = offset
+        .checked_add(width)
+        .ok_or_else(|| "interface pointer offset overflow".to_string())?;
+    let bytes = bytes
+        .get(offset..end)
+        .ok_or_else(|| "short CK_INTERFACE read".to_string())?;
+    match width {
+        8 => Ok(u64::from_ne_bytes(bytes.try_into().unwrap()) as usize),
+        4 => Ok(u32::from_ne_bytes(bytes.try_into().unwrap()) as usize),
+        _ => Err("unsupported provider pointer width".into()),
+    }
+}
+
+fn read_interface(memory: &ProcessMemory, address: usize) -> Result<(usize, usize, u64), String> {
+    let width = std::mem::size_of::<usize>();
+    let bytes = memory.read_exact(address, width * 3)?;
+    Ok((
+        ptr_bytes(&bytes, 0)?,
+        ptr_bytes(&bytes, width)?,
+        ptr_bytes(&bytes, width * 2)? as u64,
+    ))
+}
+
+fn selection_name_class(name: &NameRead, pointer: usize) -> SelectionNameClass {
+    if pointer == 0 {
+        SelectionNameClass::Null
+    } else if name.error.is_some() {
+        SelectionNameClass::Unreadable
+    } else if name.raw.as_deref() == Some(b"PKCS 11".as_slice()) {
+        SelectionNameClass::ExactStandard
+    } else {
+        SelectionNameClass::Other
+    }
+}
+
+fn selection_version_class(
+    version: &Result<cryptoki_sys::CK_VERSION, String>,
+    pointer: usize,
+) -> SelectionVersionClass {
+    if pointer == 0 {
+        SelectionVersionClass::Null
+    } else {
+        match version {
+            Ok(version) => match (version.major, version.minor) {
+                (2, 40) => SelectionVersionClass::V2_40,
+                (3, 0) => SelectionVersionClass::V3_0,
+                (3, 1) => SelectionVersionClass::V3_1,
+                (3, 2) => SelectionVersionClass::V3_2,
+                _ => SelectionVersionClass::Other,
+            },
+            Err(_) => SelectionVersionClass::Unreadable,
+        }
+    }
+}
+
+fn selection_result_readable(result: &SelectionRequest) -> bool {
+    !matches!(
+        (result.name, result.version),
+        (SelectionNameClass::Null | SelectionNameClass::Unreadable, _)
+            | (
+                _,
+                SelectionVersionClass::Null | SelectionVersionClass::Unreadable
+            )
+    )
+}
+
+fn inventory_name_class(source: &SurfaceSource) -> SelectionNameClass {
+    let SurfaceSource::Interface {
+        raw_name_hex,
+        name_error,
+        ..
+    } = source
+    else {
+        return SelectionNameClass::Null;
+    };
+    if name_error.is_some() {
+        SelectionNameClass::Unreadable
+    } else if raw_name_hex.as_deref() == Some("504b4353203131") {
+        SelectionNameClass::ExactStandard
+    } else if raw_name_hex.is_some() {
+        SelectionNameClass::Other
+    } else {
+        SelectionNameClass::Null
+    }
+}
+
+fn inventory_version_class(surface: &SurfaceRecord) -> SelectionVersionClass {
+    match surface.version {
+        Some(version) => match (version.major, version.minor) {
+            (2, 40) => SelectionVersionClass::V2_40,
+            (3, 0) => SelectionVersionClass::V3_0,
+            (3, 1) => SelectionVersionClass::V3_1,
+            (3, 2) => SelectionVersionClass::V3_2,
+            _ => SelectionVersionClass::Other,
+        },
+        None if matches!(surface.walk, WalkOutcome::Unreadable { .. }) => {
+            SelectionVersionClass::Unreadable
+        }
+        None => SelectionVersionClass::Null,
+    }
+}
+
+fn selection_resolve_values(
+    values: Vec<(&'static str, usize)>,
+    maps: &[maps::MapEntry],
+    objects: &ObjectTable,
+) -> Result<Vec<FunctionRecord>, SelectionFailure> {
+    values
+        .into_iter()
+        .map(|(name, value)| {
+            let resolution = if value == 0 {
+                Resolution::NullPointer
+            } else {
+                match maps::resolve(maps, value as u64) {
+                    maps::Resolved::File {
+                        file_offset,
+                        device,
+                        inode,
+                        permissions,
+                        ..
+                    } if ObjectKey { device, inode } == objects.module_key
+                        && permissions[2] == b'x' =>
+                    {
+                        Resolution::Resolved {
+                            object: 0,
+                            file_offset,
+                        }
+                    }
+                    maps::Resolved::File { .. } => {
+                        return Err(SelectionFailure::UnresolvedFunction);
+                    }
+                    maps::Resolved::Anonymous | maps::Resolved::Unmapped => {
+                        return Err(SelectionFailure::UnresolvedFunction);
+                    }
+                }
+            };
+            Ok(FunctionRecord {
+                name: name.to_string(),
+                resolution,
+            })
+        })
+        .collect()
+}
+
+fn selection_table_for(
+    pointer: usize,
+    version: SelectionVersionClass,
+    snapshot: Option<&TableSnapshot>,
+    maps: &[maps::MapEntry],
+    objects: &ObjectTable,
+) -> Result<(SelectionTable, TableOrigin), SelectionFailure> {
+    let version = match version {
+        SelectionVersionClass::V3_0 => Version { major: 3, minor: 0 },
+        SelectionVersionClass::V3_1 => Version { major: 3, minor: 1 },
+        SelectionVersionClass::V3_2 => Version { major: 3, minor: 2 },
+        _ => return Err(SelectionFailure::UnreadableTable),
+    };
+    let maps::Resolved::File {
+        device,
+        inode,
+        file_offset,
+        ..
+    } = maps::resolve(maps, pointer as u64)
+    else {
+        return Err(SelectionFailure::OutsideProvider);
+    };
+    if (ObjectKey { device, inode }) != objects.module_key {
+        return Err(SelectionFailure::OutsideProvider);
+    }
+    let Some(snapshot) = snapshot else {
+        return Err(SelectionFailure::UnreadableTable);
+    };
+    if !matches!(snapshot.walk, WalkOutcome::Full) {
+        return Err(SelectionFailure::UnreadableTable);
+    }
+    let functions = selection_resolve_values(snapshot.values.clone(), maps, objects)?;
+    Ok((
+        SelectionTable {
+            id: 0,
+            version,
+            walk: WalkOutcome::Full,
+            functions,
+            semantic_authorized: false,
+        },
+        TableOrigin {
+            object: ObjectKey { device, inode },
+            file_offset,
+        },
+    ))
+}
+
+fn stable_selection_maps(
+    module_path: &Path,
+    expected_key: ObjectKey,
+    expected_identity: &ObjectIdentity,
+) -> Result<Vec<maps::MapEntry>, ()> {
+    let bytes = std::fs::read("/proc/self/maps").map_err(|_| ())?;
+    let current_maps = maps::parse_maps(&bytes).map_err(|_| ())?;
+    let (current_key, current_identity) = identity_and_key(module_path).map_err(|_| ())?;
+    if current_key != expected_key
+        || current_identity != *expected_identity
+        || !current_maps
+            .iter()
+            .any(|mapping| ObjectKey::of(mapping) == expected_key)
+    {
+        return Err(());
+    }
+    Ok(current_maps)
+}
+
+fn selection_records(
+    acquisition: (SelectionAcquisition, Vec<RawSelectionQuery>),
+    surfaces: &[SurfaceRecord],
+) -> SelectionEvidence {
+    let (acquisition, raw_queries) = acquisition;
+    if !matches!(acquisition, SelectionAcquisition::Queried) {
+        return SelectionEvidence {
+            acquisition,
+            ..SelectionEvidence::default()
+        };
+    }
+    let mut tables = Vec::<SelectionTable>::new();
+    let mut pair_tables = BTreeMap::<(SelectionVersionClass, u64), (TableOrigin, u8)>::new();
+    let mut table_pointers = BTreeMap::<(TableOrigin, SelectionVersionClass), u8>::new();
+    let mut selection_truncated = false;
+    let mut queries = Vec::with_capacity(raw_queries.len());
+    for raw in raw_queries {
+        if raw.rv != 0 {
+            queries.push(SelectionQuery {
+                selector: raw.selector,
+                request: raw.request,
+                rv: raw.rv,
+                result: None,
+                inventory_matches: Vec::new(),
+                selection_table: None,
+                authority: SelectionAuthority::None,
+                helper_failure: None,
+            });
+            continue;
+        }
+        let Some(raw_result) = raw.result else {
+            queries.push(SelectionQuery {
+                selector: raw.selector,
+                request: raw.request,
+                rv: raw.rv,
+                result: None,
+                inventory_matches: Vec::new(),
+                selection_table: None,
+                authority: SelectionAuthority::None,
+                helper_failure: raw.helper_failure,
+            });
+            continue;
+        };
+        let result = SelectionRequest {
+            name: raw_result.name,
+            version: raw_result.version,
+            flags: raw_result.flags,
+        };
+        let mut matches = raw_result
+            .inventory_matches
+            .into_iter()
+            .filter(|surface| *surface < surfaces.len())
+            .map(|surface| {
+                let surface_name = inventory_name_class(&surfaces[surface].source);
+                let surface_version = inventory_version_class(&surfaces[surface]);
+                SelectionInventoryMatch {
+                    surface,
+                    name_agrees: !matches!(
+                        (result.name, surface_name),
+                        (SelectionNameClass::Null | SelectionNameClass::Unreadable, _)
+                            | (_, SelectionNameClass::Null | SelectionNameClass::Unreadable)
+                    ) && matches!(
+                        surfaces[surface].source,
+                        SurfaceSource::Interface { .. }
+                    ) && result.name == surface_name,
+                    version_agrees: !matches!(
+                        (result.version, surface_version),
+                        (
+                            SelectionVersionClass::Null | SelectionVersionClass::Unreadable,
+                            _
+                        ) | (
+                            _,
+                            SelectionVersionClass::Null | SelectionVersionClass::Unreadable
+                        )
+                    ) && result.version == surface_version,
+                }
+            })
+            .collect::<Vec<_>>();
+        if matches.len() > 16 {
+            matches.truncate(16);
+            selection_truncated = true;
+        }
+        let mut selection_table = None;
+        let mut authority = SelectionAuthority::None;
+        if raw.helper_failure.is_none()
+            && raw.request.name == SelectionNameClass::ExactStandard
+            && raw_result.table.is_some()
+            && matches.is_empty()
+            && result.name == SelectionNameClass::ExactStandard
+            && matches!(
+                result.version,
+                SelectionVersionClass::V3_0
+                    | SelectionVersionClass::V3_1
+                    | SelectionVersionClass::V3_2
+            )
+            && matches!(result.flags, 0 | 1)
+        {
+            let (mut table, origin) = raw_result.table.unwrap();
+            let key = (origin, result.version);
+            let pair = (result.version, result.flags);
+            if let Some((known_origin, table_id)) = pair_tables.get(&pair).copied() {
+                if known_origin != origin {
+                    selection_truncated = true;
+                } else {
+                    selection_table = Some(table_id);
+                    authority = SelectionAuthority::SelectionCountOnly;
+                }
+            } else {
+                let table_id = if let Some(table_id) = table_pointers.get(&key).copied() {
+                    table_id
+                } else {
+                    let table_id = tables.len() as u8;
+                    table.id = table_id;
+                    tables.push(table);
+                    table_pointers.insert(key, table_id);
+                    table_id
+                };
+                pair_tables.insert(pair, (origin, table_id));
+                selection_table = Some(table_id);
+                authority = SelectionAuthority::SelectionCountOnly;
+            }
+        }
+        if !matches.is_empty() && raw.helper_failure.is_none() && selection_result_readable(&result)
+        {
+            authority = SelectionAuthority::Inventory;
+        }
+        queries.push(SelectionQuery {
+            selector: raw.selector,
+            request: raw.request,
+            rv: raw.rv,
+            result: Some(result),
+            inventory_matches: matches,
+            selection_table,
+            authority,
+            helper_failure: raw.helper_failure,
+        });
+    }
+    SelectionEvidence {
+        acquisition,
+        queries,
+        tables,
+        selection_truncated,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1064,6 +1755,110 @@ mod tests {
                 file_offset: off,
             },
         }
+    }
+
+    #[test]
+    fn selection_bracket_rejects_synthetic_remap() {
+        let first = maps::MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 1, minor: 2 },
+            inode: 3,
+            raw_path: Some(b"/provider.so".to_vec()),
+        };
+        let mut remapped = first.clone();
+        remapped.start = 0x3000;
+        let result = selection_bracket(|| Ok(vec![first]), |_| Ok(7u8), || Ok(vec![remapped]));
+        assert_eq!(result, Err(SelectionFailure::ProviderChanged));
+    }
+
+    #[test]
+    fn selection_bracket_orders_snapshots_around_resolution() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result = selection_bracket(
+            || {
+                events.borrow_mut().push("a");
+                Ok(Vec::new())
+            },
+            |_| {
+                events.borrow_mut().push("read");
+                Ok(7u8)
+            },
+            || {
+                events.borrow_mut().push("b");
+                Ok(Vec::new())
+            },
+        );
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(*events.borrow(), vec!["a", "read", "b"]);
+    }
+
+    #[test]
+    fn selection_inventory_indices_require_literal_pointer_equality() {
+        let indices =
+            selection_inventory_indices(&[Some(0x1000), Some(0x2000), Some(0x1000)], 0x3000);
+        assert!(indices.is_empty());
+        assert_eq!(
+            selection_inventory_indices(&[Some(0x1000), Some(0x2000)], 0x2000),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn known_incomplete_selection_table_is_unreadable() {
+        let snapshot = TableSnapshot {
+            walk: WalkOutcome::Unreadable {
+                detail: "short table".into(),
+            },
+            values: vec![],
+        };
+        assert!(selection_table_incomplete(
+            SelectionVersionClass::V3_0,
+            Some(&snapshot)
+        ));
+    }
+
+    #[test]
+    fn selector_zero_never_gets_selection_count_only_authority() {
+        let evidence = selection_records(
+            (
+                SelectionAcquisition::Queried,
+                vec![RawSelectionQuery {
+                    selector: 0,
+                    request: selection_request(0, 0),
+                    rv: 0,
+                    result: Some(RawSelectionResult {
+                        name: SelectionNameClass::ExactStandard,
+                        version: SelectionVersionClass::V3_0,
+                        flags: 0,
+                        table: Some((
+                            SelectionTable {
+                                id: 0,
+                                version: Version { major: 3, minor: 0 },
+                                walk: WalkOutcome::Full,
+                                functions: vec![],
+                                semantic_authorized: false,
+                            },
+                            TableOrigin {
+                                object: ObjectKey {
+                                    device: Device { major: 1, minor: 1 },
+                                    inode: 1,
+                                },
+                                file_offset: 0,
+                            },
+                        )),
+                        inventory_matches: vec![],
+                    }),
+                    helper_failure: None,
+                }],
+            ),
+            &[],
+        );
+        assert_eq!(evidence.queries[0].authority, SelectionAuthority::None);
+        assert!(evidence.queries[0].selection_table.is_none());
+        assert!(evidence.tables.is_empty());
     }
 
     #[test]

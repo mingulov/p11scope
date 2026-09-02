@@ -1,10 +1,10 @@
 //! Manifest input hygiene: bounded read and structural validation of
-//! `p11scope-manifest/4` documents. Trusted operator input, validated before use.
+//! `p11scope-manifest/5` documents. Trusted operator input, validated before use.
 
 use p11scope_manifest::identity::{IdentityKind, ObjectIdentity, open_regular};
 use p11scope_manifest::manifest::*;
 use pkcs11_module::{Surface, TableSet, tables_for};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
 use std::path::Path;
 
@@ -15,6 +15,9 @@ const MAX_SURFACES: usize = 257; // legacy + the shared acquisition cap
 const MAX_FUNCTIONS: usize = 32_768;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_DETAIL_BYTES: usize = 4096;
+const MAX_SELECTION_TABLES: usize = 10;
+const MAX_SELECTION_MATCHES: usize = 16;
+const SELECTION_QUERIES: usize = 10;
 
 /// Reads one regular, bounded UTF-8 manifest. The descriptor is opened before
 /// metadata and content are inspected, so replacing its pathname cannot mix
@@ -128,6 +131,477 @@ fn walk_name(walk: &WalkOutcome) -> &'static str {
         WalkOutcome::Refused => "refused",
         WalkOutcome::NotWalked => "not_walked",
         WalkOutcome::Unreadable { .. } => "unreadable",
+    }
+}
+
+fn selection_request(selector: u8, flags: u64) -> Option<SelectionRequest> {
+    let (name, version) = match selector {
+        0 => (SelectionNameClass::Null, SelectionVersionClass::Null),
+        1 => (
+            SelectionNameClass::ExactStandard,
+            SelectionVersionClass::Null,
+        ),
+        2 => (
+            SelectionNameClass::ExactStandard,
+            SelectionVersionClass::V3_0,
+        ),
+        3 => (
+            SelectionNameClass::ExactStandard,
+            SelectionVersionClass::V3_1,
+        ),
+        4 => (
+            SelectionNameClass::ExactStandard,
+            SelectionVersionClass::V3_2,
+        ),
+        _ => return None,
+    };
+    Some(SelectionRequest {
+        name,
+        version,
+        flags,
+    })
+}
+
+fn selection_result_readable(result: &SelectionRequest) -> bool {
+    !matches!(
+        (result.name, result.version),
+        (SelectionNameClass::Null | SelectionNameClass::Unreadable, _)
+            | (
+                _,
+                SelectionVersionClass::Null | SelectionVersionClass::Unreadable
+            )
+    )
+}
+
+fn selection_table_names(version: Version) -> Option<Vec<&'static str>> {
+    let cryptoki_version = cryptoki_sys::CK_VERSION {
+        major: version.major,
+        minor: version.minor,
+    };
+    match tables_for(Surface::StandardInterface {
+        version: cryptoki_version,
+    }) {
+        TableSet::Walk(spans) => Some(
+            spans
+                .iter()
+                .flat_map(|span| span.fields().iter().map(|field| field.name))
+                .collect(),
+        ),
+        TableSet::WalkKnownPrefix(_) | TableSet::Refuse => None,
+    }
+}
+
+fn selection_name_agrees(result: &SelectionResult, surface: &SurfaceRecord) -> bool {
+    let SurfaceSource::Interface {
+        raw_name_hex,
+        name_error,
+        ..
+    } = &surface.source
+    else {
+        return false;
+    };
+    let surface_name = if name_error.is_some() {
+        SelectionNameClass::Unreadable
+    } else if raw_name_hex.as_deref() == Some("504b4353203131") {
+        SelectionNameClass::ExactStandard
+    } else if raw_name_hex.is_some() {
+        SelectionNameClass::Other
+    } else {
+        SelectionNameClass::Null
+    };
+    !matches!(
+        result.name,
+        SelectionNameClass::Null | SelectionNameClass::Unreadable
+    ) && result.name == surface_name
+}
+
+fn selection_version_agrees(result: &SelectionResult, surface: &SurfaceRecord) -> bool {
+    let surface_version = match surface.version {
+        Some(version) => match (version.major, version.minor) {
+            (2, 40) => SelectionVersionClass::V2_40,
+            (3, 0) => SelectionVersionClass::V3_0,
+            (3, 1) => SelectionVersionClass::V3_1,
+            (3, 2) => SelectionVersionClass::V3_2,
+            _ => SelectionVersionClass::Other,
+        },
+        None if matches!(surface.walk, WalkOutcome::Unreadable { .. }) => {
+            SelectionVersionClass::Unreadable
+        }
+        None => SelectionVersionClass::Null,
+    };
+    !matches!(
+        result.version,
+        SelectionVersionClass::Null | SelectionVersionClass::Unreadable
+    ) && result.version == surface_version
+}
+
+fn validate_selection_table(
+    table: &SelectionTable,
+    object_ids: &BTreeSet<u32>,
+    problems: &mut Vec<String>,
+) {
+    if table.id as usize >= MAX_SELECTION_TABLES {
+        problems.push(format!("selection table id {} is out of range", table.id));
+    }
+    if table.version.major != 3 || table.version.minor > 2 {
+        problems.push(format!(
+            "selection table {} has unsupported version {}.{}",
+            table.id, table.version.major, table.version.minor
+        ));
+    }
+    if !matches!(table.walk, WalkOutcome::Full) {
+        problems.push(format!(
+            "selection table {} must have a full walk outcome",
+            table.id
+        ));
+    }
+    if table.semantic_authorized {
+        problems.push(format!(
+            "selection table {} cannot authorize semantic decoding",
+            table.id
+        ));
+    }
+    if let Some(expected) = selection_table_names(table.version) {
+        let actual: Vec<&str> = table
+            .functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        if actual != expected {
+            problems.push(format!(
+                "selection table {} does not match its canonical function layout",
+                table.id
+            ));
+        }
+    }
+    if table.functions.len() > 104 {
+        problems.push(format!(
+            "selection table {} has too many functions",
+            table.id
+        ));
+    }
+    for function in &table.functions {
+        bounded("selection function name", &function.name, 128, problems);
+        match function.resolution {
+            Resolution::NullPointer => {}
+            Resolution::Resolved { object, .. } if object_ids.contains(&object) && object == 0 => {}
+            Resolution::Resolved { object, .. } => problems.push(format!(
+                "selection function {} refers to dependency object {}",
+                function.name, object
+            )),
+            Resolution::NonFileBacked | Resolution::Unmapped | Resolution::UnusableFile { .. } => {
+                problems.push(format!(
+                    "selection function {} has an unresolved resolution",
+                    function.name
+                ));
+            }
+        }
+    }
+}
+
+fn validate_selection_evidence(
+    evidence: &SelectionEvidence,
+    surfaces: &[SurfaceRecord],
+    object_ids: &BTreeSet<u32>,
+    problems: &mut Vec<String>,
+) {
+    if evidence.tables.len() > MAX_SELECTION_TABLES {
+        problems.push(format!(
+            "manifest has {} selection tables; limit is {MAX_SELECTION_TABLES}",
+            evidence.tables.len()
+        ));
+    }
+    let mut table_ids = BTreeSet::new();
+    for table in &evidence.tables {
+        if !table_ids.insert(table.id) {
+            problems.push(format!("duplicate selection table id {}", table.id));
+        }
+        validate_selection_table(table, object_ids, problems);
+    }
+
+    match evidence.acquisition {
+        SelectionAcquisition::ExportAbsent | SelectionAcquisition::ExportOutsideModule => {
+            if !evidence.queries.is_empty() {
+                problems.push("zero-call selection acquisition has queries".into());
+            }
+            if !evidence.tables.is_empty() {
+                problems.push("zero-call selection acquisition has tables".into());
+            }
+            if evidence.selection_truncated {
+                problems.push("zero-call selection acquisition is truncated".into());
+            }
+            return;
+        }
+        SelectionAcquisition::Queried if evidence.queries.len() != SELECTION_QUERIES => {
+            problems.push(format!(
+                "queried selection acquisition requires exactly {SELECTION_QUERIES} queries"
+            ));
+        }
+        SelectionAcquisition::Queried => {}
+    }
+
+    let mut referenced_tables = BTreeSet::new();
+    let mut pair_authority = BTreeMap::<(SelectionVersionClass, u64), u8>::new();
+    let mut conflict_pair = false;
+    for (position, query) in evidence.queries.iter().enumerate() {
+        let expected_selector = (position / 2) as u8;
+        let expected_flags = (position % 2) as u64;
+        if query.selector != expected_selector {
+            problems.push(format!(
+                "selection query {position} has selector {}; expected {expected_selector}",
+                query.selector
+            ));
+        }
+        if query.request
+            != selection_request(query.selector, query.request.flags).unwrap_or(SelectionRequest {
+                name: SelectionNameClass::Unreadable,
+                version: SelectionVersionClass::Unreadable,
+                flags: query.request.flags,
+            })
+        {
+            problems.push(format!(
+                "selection query {position} has an invalid selector"
+            ));
+        }
+        if query.request.flags != expected_flags {
+            problems.push(format!(
+                "selection query {position} has flags {}; expected {expected_flags}",
+                query.request.flags
+            ));
+        }
+        let mut previous_surface = None;
+        for found in &query.inventory_matches {
+            if found.surface >= surfaces.len() {
+                problems.push(format!(
+                    "selection query {position} refers to missing surface {}",
+                    found.surface
+                ));
+            }
+            if previous_surface.is_some_and(|previous| found.surface <= previous) {
+                problems.push(format!(
+                    "selection query {position} contains duplicate or unsorted surfaces"
+                ));
+            }
+            previous_surface = Some(found.surface);
+            if let (Some(result), Some(surface)) =
+                (query.result.as_ref(), surfaces.get(found.surface))
+            {
+                if found.name_agrees != selection_name_agrees(result, surface) {
+                    problems.push(format!(
+                        "selection query {position} has incorrect name agreement"
+                    ));
+                }
+                if found.version_agrees != selection_version_agrees(result, surface) {
+                    problems.push(format!(
+                        "selection query {position} has incorrect version agreement"
+                    ));
+                }
+            }
+        }
+        if query.inventory_matches.len() > MAX_SELECTION_MATCHES {
+            problems.push(format!(
+                "selection query {position} has more than {MAX_SELECTION_MATCHES} inventory matches"
+            ));
+        }
+        match query.rv {
+            0 => {
+                let Some(result) = query.result else {
+                    if !matches!(
+                        query.helper_failure,
+                        Some(
+                            SelectionFailure::NullOutput
+                                | SelectionFailure::UnreadableInterface
+                                | SelectionFailure::ProviderChanged,
+                        )
+                    ) {
+                        problems.push(format!(
+                            "successful selection query {position} has no result"
+                        ));
+                    }
+                    if !query.inventory_matches.is_empty()
+                        || query.selection_table.is_some()
+                        || !matches!(query.authority, SelectionAuthority::None)
+                    {
+                        problems.push(format!(
+                            "successful selection query {position} has null result cross-fields"
+                        ));
+                    }
+                    continue;
+                };
+                if query.helper_failure.is_some()
+                    && !matches!(query.authority, SelectionAuthority::None)
+                {
+                    problems.push(format!(
+                        "selection query {position} with helper failure has authority"
+                    ));
+                }
+                match query.helper_failure {
+                    Some(SelectionFailure::NullOutput | SelectionFailure::UnreadableInterface) => {
+                        problems.push(format!(
+                            "selection query {position} has an invalid helper failure for a result"
+                        ));
+                    }
+                    Some(SelectionFailure::UnreadableName)
+                        if !matches!(
+                            result.name,
+                            SelectionNameClass::Null | SelectionNameClass::Unreadable
+                        ) =>
+                    {
+                        problems.push(format!(
+                            "selection query {position} unreadable-name failure disagrees with result"
+                        ));
+                    }
+                    Some(SelectionFailure::UnreadableVersion)
+                        if result.version != SelectionVersionClass::Unreadable =>
+                    {
+                        problems.push(format!(
+                            "selection query {position} unreadable-version failure disagrees with result"
+                        ));
+                    }
+                    Some(SelectionFailure::UnreadableTable)
+                        if !matches!(
+                            result.version,
+                            SelectionVersionClass::Null
+                                | SelectionVersionClass::V3_0
+                                | SelectionVersionClass::V3_1
+                                | SelectionVersionClass::V3_2
+                        ) =>
+                    {
+                        problems.push(format!(
+                            "selection query {position} unreadable-table failure disagrees with result"
+                        ));
+                    }
+                    Some(
+                        SelectionFailure::UnreadableTable
+                        | SelectionFailure::OutsideProvider
+                        | SelectionFailure::UnresolvedFunction
+                        | SelectionFailure::ProviderChanged,
+                    ) if query.selection_table.is_some() => {
+                        problems.push(format!(
+                            "selection query {position} helper failure has a selection table"
+                        ));
+                    }
+                    _ => {}
+                }
+                if let Some(table_id) = query.selection_table {
+                    let Some(table) = evidence.tables.iter().find(|table| table.id == table_id)
+                    else {
+                        problems.push(format!(
+                            "selection query {position} refers to missing table {table_id}"
+                        ));
+                        continue;
+                    };
+                    if !query.inventory_matches.is_empty()
+                        || query.helper_failure.is_some()
+                        || query.request.name != SelectionNameClass::ExactStandard
+                        || !matches!(query.authority, SelectionAuthority::SelectionCountOnly)
+                        || result.name != SelectionNameClass::ExactStandard
+                        || !matches!(
+                            result.version,
+                            SelectionVersionClass::V3_0
+                                | SelectionVersionClass::V3_1
+                                | SelectionVersionClass::V3_2
+                        )
+                        || !matches!(result.flags, 0 | 1)
+                    {
+                        problems.push(format!(
+                            "selection query {position} has invalid selection-table authority"
+                        ));
+                    }
+                    let result_version = match result.version {
+                        SelectionVersionClass::V3_0 => Some(Version { major: 3, minor: 0 }),
+                        SelectionVersionClass::V3_1 => Some(Version { major: 3, minor: 1 }),
+                        SelectionVersionClass::V3_2 => Some(Version { major: 3, minor: 2 }),
+                        _ => None,
+                    };
+                    if result_version != Some(table.version) {
+                        problems.push(format!(
+                            "selection query {position} table version disagrees with result"
+                        ));
+                    }
+                    referenced_tables.insert(table_id);
+                    let pair = (result.version, result.flags);
+                    if let Some(previous) = pair_authority.insert(pair, table_id)
+                        && previous != table_id
+                    {
+                        conflict_pair = true;
+                        problems.push(format!(
+                            "selection query {position} conflicts for version/flags pair"
+                        ));
+                    }
+                } else if matches!(query.authority, SelectionAuthority::Inventory)
+                    && (query.inventory_matches.is_empty()
+                        || query.helper_failure.is_some()
+                        || !selection_result_readable(&result))
+                {
+                    problems.push(format!(
+                        "selection query {position} has invalid inventory authority"
+                    ));
+                } else if !query.inventory_matches.is_empty()
+                    && query.helper_failure.is_none()
+                    && selection_result_readable(&result)
+                    && !matches!(query.authority, SelectionAuthority::Inventory)
+                {
+                    problems.push(format!(
+                        "selection query {position} has matches without inventory authority"
+                    ));
+                } else if matches!(query.authority, SelectionAuthority::SelectionCountOnly) {
+                    problems.push(format!(
+                        "selection query {position} has count-only authority without a table"
+                    ));
+                } else if query.helper_failure.is_none()
+                    && query.inventory_matches.is_empty()
+                    && query.request.name == SelectionNameClass::ExactStandard
+                    && result.name == SelectionNameClass::ExactStandard
+                    && matches!(
+                        result.version,
+                        SelectionVersionClass::V3_0
+                            | SelectionVersionClass::V3_1
+                            | SelectionVersionClass::V3_2
+                    )
+                    && matches!(result.flags, 0 | 1)
+                {
+                    let pair = (result.version, result.flags);
+                    if pair_authority.contains_key(&pair) {
+                        conflict_pair = true;
+                    } else {
+                        problems.push(format!(
+                            "selection query {position} has unexplained selection truncation or conflict"
+                        ));
+                    }
+                }
+            }
+            _ => {
+                if query.result.is_some()
+                    || !query.inventory_matches.is_empty()
+                    || query.selection_table.is_some()
+                    || query.helper_failure.is_some()
+                    || !matches!(query.authority, SelectionAuthority::None)
+                {
+                    problems.push(format!(
+                        "nonzero selection query {position} has success-only fields"
+                    ));
+                }
+            }
+        }
+    }
+    for table in &evidence.tables {
+        if !referenced_tables.contains(&table.id) {
+            problems.push(format!("selection table {} is orphaned", table.id));
+        }
+    }
+    if conflict_pair && !evidence.selection_truncated {
+        problems.push("selection semantic-pair conflict is not truncated".into());
+    }
+    if evidence.selection_truncated
+        && !conflict_pair
+        && !evidence
+            .queries
+            .iter()
+            .any(|query| query.inventory_matches.len() == MAX_SELECTION_MATCHES)
+    {
+        problems
+            .push("selection truncation has no bounded alias or semantic conflict evidence".into());
     }
 }
 
@@ -520,5 +994,11 @@ pub fn validate_structure(m: &Manifest) -> Vec<String> {
             }
         }
     }
+    validate_selection_evidence(
+        &m.selection_evidence,
+        &m.surfaces,
+        &object_ids,
+        &mut problems,
+    );
     problems
 }

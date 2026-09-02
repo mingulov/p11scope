@@ -92,8 +92,10 @@ handles alternate, null, unreadable, and non-UTF-8 names. It walks those tables
 only when standard export anchors—or an independently acquired legacy 2.40
 table—corroborate the expected layout. Such a walk is a known prefix and keeps
 the report `PARTIAL`; uncorroborated entries remain present as vendor evidence
-and are not decoded. Discovery enumerates `C_GetInterfaceList` but never calls
-`C_GetInterface`.
+and are not decoded. Discovery enumerates `C_GetInterfaceList`, then performs
+exactly ten bounded `C_GetInterface` compatibility queries (the fixed
+selector/version/flag matrix) before `C_Initialize`; these helper calls are
+separate from live target observation and never initialize the provider.
 
 Interface-name discovery reads at most 64 bytes and never crosses the readable
 VMA containing the pointer. A name without an in-VMA NUL is unreadable. Text

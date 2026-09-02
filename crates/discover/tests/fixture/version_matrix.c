@@ -163,8 +163,19 @@ CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count) {
     return CKR_OK;
 }
 
-/* Discovery may compare this address but must never call the entry point. */
 CK_RV C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags) {
-    (void)name; (void)version; (void)out; (void)flags;
-    __builtin_trap();
+    (void)name;
+    fill();
+    if (!out) return CKR_ARGUMENTS_BAD;
+    Table *table = &t32;
+    if (version) {
+        CK_VERSION requested = *(CK_VERSION *)version;
+        if (requested.major == 3 && requested.minor == 0) table = &t30;
+        if (requested.major == 3 && requested.minor == 1) table = &t31;
+        if (requested.major == 3 && requested.minor == 2) table = &t32;
+    }
+    static CK_INTERFACE selected;
+    selected = (CK_INTERFACE){exact, table, flags};
+    *out = &selected;
+    return CKR_OK;
 }

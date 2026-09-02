@@ -99,36 +99,36 @@ Current anchors: manifest v4 is fixed at
 `crates/discover/src/discover.rs:36`; exact v4 validation begins at
 `src/manifest_input.rs:134`.
 
-- [ ] RED: add exact-shape and mutation tests for manifest v5
+- [x] RED: add exact-shape and mutation tests for manifest v5
   `selection_evidence`: three acquisition states, exact selector/flag matrix,
   result/authority cross-fields, at-most-16 matches, truncation, table IDs
   `0..9`, full-walk/reachability, null slots, unresolved refusal, and orphan
   table rejection. Pin false name/version agreement whenever either compared
   field is null or unreadable. Prove v4 rejection is precise.
-- [ ] GREEN: add only the design's finite v5 types and structural validation.
+- [x] GREEN: add only the design's finite v5 types and structural validation.
   Keep inventory `surfaces`, interfaces, and alias groups unchanged.
-- [ ] RED: `no_live_manifest_v4_pin_remains` enumerates every live producer,
+- [x] RED: `no_live_manifest_v4_pin_remains` enumerates every live producer,
   consumer, fixture, script, and exact pin and fails before migration.
-- [ ] GREEN: atomically migrate that set to v5 in this task; old plans,
+- [x] GREEN: atomically migrate that set to v5 in this task; old plans,
   reports, changelog history, and observed-profile-v2 documentation remain
   explicitly historical.
-- [ ] RED: fixture test proves zero calls for absent/outside export and exactly
+- [x] RED: fixture test proves zero calls for absent/outside export and exactly
   ten ordered calls for queried; retain nonzero `CK_RV`, helper failures, full
   returned flags, and all bounded exact aliases.
-- [ ] RED: `selection_helper_conflicting_semantic_pair_is_truncated` returns
+- [x] RED: `selection_helper_conflicting_semantic_pair_is_truncated` returns
   two different eligible tables with the same returned version/flags pair;
   only the first fixed-order table may receive authority, the later outcome is
   factual with no table reference, and missing truncation is invalid.
-- [ ] GREEN: add one local raw `C_GetInterface` ABI adapter in
+- [x] GREEN: add one local raw `C_GetInterface` ABI adapter in
   `p11scope-discover`, using its existing dependencies and no fallback policy.
   Query before `C_Initialize`; do not change the external facts-crate pin.
-- [ ] Focused checks:
+- [x] Focused checks:
   `cargo +1.88 test --locked -p p11scope-manifest -p p11scope-discover` and
   `cargo +1.88 test --locked --test manifest_pinning`; the RED test names are
   `manifest_v5_selection_matrix_is_exact`,
   `selection_helper_makes_exactly_ten_queries`, and
   `selection_agreement_requires_readable_fields`.
-- [ ] Four canonical gates; commit.
+- [x] Four canonical gates; commit.
 
 Commit: `feat: record bounded offline interface selection evidence`
 

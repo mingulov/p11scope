@@ -521,6 +521,7 @@ fn retiring_one_shared_namespace_view_keeps_only_the_stable_views_claims() {
             null_entries: vec![],
             unpinned: vec![],
             address: 0x1000,
+            file_offset: Some(0),
         }],
         interfaces: vec![],
     };
@@ -604,6 +605,7 @@ fn retiring_a_rejected_provider_view_removes_its_unplanned_pins_and_raw_aliases(
             null_entries: vec![],
             unpinned: vec![],
             address: 0x1000,
+            file_offset: Some(0),
         }],
         interfaces: vec![],
     };

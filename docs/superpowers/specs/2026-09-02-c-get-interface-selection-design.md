@@ -111,8 +111,10 @@ bindings for one `capture.modules[]` provider without exposing process identity:
 
 `absent_covered` is allowed only for either:
 
-1. an owned `run` initial set whose pre-exec/constructor protection was
-   confirmed before the provider could execute; or
+1. an exact provider whose selection entry and return probes were
+   transactionally attached while the owned-child release barrier was held,
+   then whose eventual mapping matched the retained provider device, inode,
+   `ProcessView`, and generation before the proof was accepted; or
 2. a newly loaded provider whose qualified loader window was confirmed stopped
    until the selection hook was installed.
 
@@ -123,25 +125,37 @@ generation change, selection truncation, ring loss, state failure, bounded-read
 failure, malformed record, or unresolved provider attribution also makes an
 otherwise silent provider `absent_uncovered` and forces `PARTIAL`.
 
-The base tree has no populated timing-catalog proof for either covered case.
-Therefore this slice reports a silent `run` provider as `absent_uncovered` too;
-`absent_covered` is pinned at unit level through the engine's proof input but is
-not claimed from a live call site until a later timing slice supplies that
+This slice implements the first proof by reusing the existing owned-child
+barrier and attach transaction. The proof is minted only after both links
+commit before release and is invalidated by partial attachment, identity or
+generation disagreement, link retirement, or selection loss. The empty timing
+catalog still prevents the second proof: a provider not exactly known and
+pinned before release, including a later `dlopen`, remains uncovered unless a
+qualified loader window exists. Command mode alone never establishes either
 proof. `observed_uncovered` and `absent_uncovered` force `PARTIAL`.
 
-An exact pinned ELF proof that the export is absent is recorded separately in
-`export_absent[]` only when no exact configured interface binding exists for
-that provider. An entry is `{module, required}`. `required=false` is permitted
-only when exact caller-independent inventory establishes a legacy 2.x provider;
-it is not a coverage loss and does not force `PARTIAL`. `required=true` means
-exact inventory establishes Cryptoki 3.x, whose missing standard export forces
-`PARTIAL`. A provider whose export or binding status cannot be proved is a
-selection-capable unresolved provider with `absent_uncovered`, not an
-`export_absent` entry. The two sets are disjoint. Any capture-global selection
-loss whose producer cannot be attributed changes each silent binding to
-uncovered; a provider already observed becomes `observed_uncovered`, while a
-fully silent provider becomes `absent_uncovered`. It never erases an observed
-tuple or creates a guessed provider attribution.
+Binding coverage and standard-export validity are independent. Each
+`capture.modules[]` entry with caller-independent provider inventory or an
+interface binding has one `standard_exports[]` row `{module, status}` whose
+status is:
+
+- `present`: exact pinned in-module `C_GetInterface` export;
+- `legacy_absent`: exact absence plus authoritative legacy 2.x inventory,
+  non-loss;
+- `required_absent`: exact absence plus authoritative Cryptoki 3.x inventory,
+  forcing `PARTIAL`;
+- `outside_module`: the resolved symbol belongs to another object, refused and
+  `PARTIAL`; or
+- `unresolved`: export identity or requirement cannot be proved, forcing
+  `PARTIAL`.
+
+A module with a custom interface binding may therefore appear in both
+`providers[]` and `standard_exports[]`; the custom binding never hides a
+missing mandatory standard export. Any capture-global selection loss whose
+producer cannot be attributed changes each silent binding to uncovered; a
+provider already observed becomes `observed_uncovered`, while a fully silent
+provider becomes `absent_uncovered`. It never erases an observed tuple or
+creates a guessed provider attribution.
 
 ## 5. Bounded aggregation
 
@@ -161,19 +175,30 @@ A tuple consists of the exact fields below. Unknown fields are rejected.
 | `rv` | unsigned 64-bit integer |
 | `result` | `null` when no readable result exists, otherwise an object with the same finite `name`/`version` classes and unsigned 64-bit `flags` |
 | `table_match` | boolean, true exactly when `inventory_matches` is nonempty |
-| `inventory_matches` | sorted unique array of at most 16 `{surface: u16, name_agrees: boolean, version_agrees: boolean}` objects; `surface` indexes `evidence.discovery[module].tables[]` for that provider |
+| `inventory_matches` | sorted unique array of at most 16 `{surface: u16, name_agrees: boolean, version_agrees: boolean}` objects; `surface` indexes `evidence.interface_selection.inventory_surfaces[]` and that row's module must equal this tuple's module |
 | `authority` | `inventory`, `selection_count_only`, or `none` |
 | `count` | saturating unsigned 64-bit integer, at least 1 |
 
 `result=null` distinguishes a nonzero return or unreadable result from a
 provider that returned readable zero-valued fields. More than 16 exact
 inventory matches sets `selection_truncated`, retains the first 16 in numeric
-order, and forces `PARTIAL`. At most 512 provider/export-status entries are
-serialized; each module index is unique and less than
-`capture.modules.len()`. Overflow is truncation and `PARTIAL`.
+order, and forces `PARTIAL`. Each selection array has its section-9.2 bound;
+module indices are unique within `providers` and `standard_exports`, while
+`{module, ordinal}` is unique within `inventory_surfaces`. Overflow is
+truncation and `PARTIAL`.
 
 No tuple contains a PID, TID, address, pointer, raw name, arbitrary byte string,
 or provider error text. Counters saturate rather than wrap.
+
+Cross-field validity is exact. A nonzero `rv`, or `CKR_OK` with a null or
+unreadable interface/table output, requires `result=null`, empty matches,
+`table_match=false`, and `authority=none`; an unreadable finite name/version
+classification may remain in a readable result object but also has no
+authority. `authority=inventory` holds exactly when bounded matches are
+nonempty and `table_match=true`. `authority=selection_count_only` holds exactly
+when matches are empty and an exact-standard, known-layout, fully resolved
+closure passed section 7. Every other readable result has `authority=none`;
+the two non-none authority classes are mutually exclusive.
 
 ## 6. Exact table matching
 
@@ -181,8 +206,8 @@ Name or version agreement never establishes a table match.
 
 For live evidence, an `inventory_matches[]` entry exists only when the returned
 `pFunctionList` address equals a `ScannedTable.address` that is published as a
-caller-independent legacy or interface surface in
-`evidence.discovery[module].tables[]` and:
+caller-independent legacy or interface alias in the bounded module-local
+surface inventory and:
 
 - came from the memory scan, `C_GetFunctionList`, or a kind-2
   `C_GetInterfaceList` record;
@@ -194,14 +219,23 @@ caller-independent legacy or interface surface in
 For offline evidence, an inventory match exists only when the returned
 `pFunctionList` pointer equals one of the helper's own caller-independent
 legacy or interface surfaces from the same loaded provider instance. The
-manifest records that entry's ordinal in `surfaces[]`, not either pointer. The
-live and offline ordinals are bounded by their referenced array lengths. All
-matches are retained in sorted order so shared-address aliases remain explicit;
-a scanned table without a published caller-independent surface is unmatched.
+manifest records that entry's ordinal in `surfaces[]`, not either pointer. Live
+output publishes `inventory_surfaces[]`, at most 512 rows sorted by module and
+module-local ordinal, with one privacy-safe `{module, ordinal, kind}` row for
+the legacy surface and for every distinct interface alias; `ordinal` is a
+unique unsigned 16-bit position in that provider's canonical surface list and
+`kind` is `legacy` or `interface`. A live match indexes that array, so legacy
+and multiple interface aliases sharing one table remain distinct. The live and
+offline ordinals are bounded by their referenced array lengths. All matches
+within the 16-entry bound are retained in sorted order; excess aliases set the
+applicable truncation flag and force `PARTIAL`. A scanned table without a
+published caller-independent surface is unmatched.
 
 Each match's `name_agrees` and `version_agrees` booleans are derived after the
 exact table match. They expose a provider inconsistency but never widen a match.
-An unmatched result is explicit and forces `PARTIAL`.
+For a legacy surface, which has no interface name, `name_agrees` is false by
+definition; version agreement still compares table versions. An unmatched
+result is explicit and forces `PARTIAL`.
 
 ## 7. Open design ruling: authority of selection-only tables
 
@@ -215,17 +249,19 @@ only when all of these hold:
 
 - request and returned names are `exact_standard`;
 - the returned version is one of 3.0, 3.1, or 3.2 with a known table layout;
-- the table and every function pointer resolve inside the same retained
-  process generation and exact pinned hook-owner provider module object;
+- the table and every non-null function pointer resolve inside the same
+  retained process generation and exact pinned hook-owner provider module
+  object;
 - the provider, maps snapshot, and pin remain stable through attach; and
 - no selection read, state, transport, attribution, or truncation loss applies.
 
 An unmatched offline result has the same name/layout requirements and is
 eligible only under manifest-v5 attestation for the exact provider identity
-already enforced by manifest pinning. Its returned table and every function
-pointer must resolve to file offsets inside that exact pinned provider module
-object. Anonymous, dependency-object, outside-module, unstable, or unresolved
-pointers are retained only as a finite helper failure and authorize nothing.
+already enforced by manifest pinning. Its returned table and every non-null
+function pointer must resolve to file offsets inside that exact pinned provider
+module object. Anonymous, dependency-object, outside-module, unstable, or
+unresolved pointers are retained only as a finite helper failure and authorize
+nothing.
 
 The resulting function identities may be probed and counted so real calls are
 not missed, but `semantic_authorized` is always `false`, semantic argument
@@ -236,20 +272,25 @@ unmatched objects; and helper failures authorize nothing.
 Selection-only targets appear only in selection evidence and the aggregate
 function rows they count. They do not contribute to
 `evidence.discovery[].tables`, `.interfaces`, `surfaces`, `interface_list`,
-`vendor_interfaces`, aliases, or slot-level `fork_safe` conclusions.
+`vendor_interfaces`, caller-independent alias groups, or slot-level `fork_safe`
+conclusions. Finite standard function names from active selection claims may
+join the aggregate row's displayed alias set, but never the inventory.
 
-Their decoded non-null function occurrences contribute to `table_entries`
-under the existing exact-occurrence deduplication rule. A target whose exact
-`{object, file_offset}` already has a planned or attached slot is linked to that
-slot and is never attached again; it contributes no new `slots`,
-`attached_probes`, or aggregate function row. A new target contributes one
-slot and, after successful attachment, two probes exactly as existing slots do.
-Thus selection cannot double-count a call or break the existing
-`table_entries`/`slots`/`attached_probes` relationships.
+Each source-tagged logical `SelectionClaimKey` is
+`{binding id, ProcessView, generation, loader context, hook-owner object,
+selected object, function name, file offset}` and maps to the existing physical
+`AttachKey {selected object, file offset}`. Claims are reference-counted per
+physical key; their count-only authorization remains source-local and cannot
+upgrade or downgrade independent inventory authorization. A target whose
+physical key already has a planned or attached slot is linked to that slot and
+is never attached again. Multiple claims may add finite names to its one
+aggregate row, but one call is read from one aggregate cell exactly once. A new
+physical target contributes one `table_entries` row, one slot, and, after
+successful attachment, two probes. Later claims for that target contribute
+none of those physical counts. Retirement removes only the retiring claim and
+detaches the slot only after its final inventory or selection owner leaves.
 
-They are source-tagged slots keyed by
-`{ProcessView, generation, loader context, hook-owner object, selected object,
-function name, file offset}`. They enter the existing candidate
+New physical selection slots enter the existing candidate
 preflight/apply/rollback transaction but remain outside `CaptureHistory`'s
 inventory collections. Unload, exec, generation loss, loader-context
 retirement, and terminal cleanup retire their links and authority. No
@@ -334,11 +375,15 @@ when post-success inspection could not produce a readable result or safe
 authority decision; whenever `helper_failure` is nonnull, authority is `none`.
 More than 16 exact aliases retains the first 16 in surface order, sets
 `selection_truncated`, and forces `PARTIAL`. A table record has a unique integer
-id, a 3.0/3.1/3.2 version, a `full` walk outcome, at most 104 existing
-`FunctionRecord` values, and `semantic_authorized: false`. Every resolution
-must name an existing manifest object and an offset inside the exact provider
-module object; selection tables may not name dependency objects. No table or
-function pointer is serialized. Every table is referenced by at least one
+id from 0 through 9, a 3.0/3.1/3.2 version, a `full` walk outcome, at most 104
+existing `FunctionRecord` values, and `semantic_authorized: false`. Every
+non-null function record must be `Resolved` to an existing manifest object and
+an offset inside the exact provider module object. `NullPointer` is retained and
+skipped; `NonFileBacked`, `Unmapped`, or `UnusableFile` becomes
+`helper_failure=unresolved_function`, produces no table authority, and cannot
+enter `tables[]`. Selection tables may not name dependency objects. No table or
+function pointer is serialized. Every id equals its exact query reference and
+every table is referenced by at least one
 `CKR_OK` query with `authority=selection_count_only`, null `helper_failure`, and
 matching `selection_table`; orphan or merely known-prefix tables are rejected,
 and only reachable tables enter attachment planning.
@@ -371,22 +416,25 @@ evidence add `evidence.interface_selection`:
   "providers": [
     {"module": 0, "coverage": "observed"}
   ],
-  "export_absent": [],
+  "standard_exports": [
+    {"module": 0, "status": "present"}
+  ],
+  "inventory_surfaces": [],
   "tuples": [],
   "selection_truncated": false
 }
 ```
 
-`providers` contains unique selection-capable or unresolved module
-ordinals with one of the four section-4 coverage values. It includes every
-module with an exact configured built-in or custom `HookAbi::Interface`
-binding, plus an unresolved module only as `absent_uncovered`. `export_absent`
-contains sorted unique `{module, required}` records backed by exact pinned ELF
-proof and is disjoint from `providers`; the two arrays contain at most 512
-entries combined.
-`tuples` is the at-most-16 array in
-section 5. `selection_truncated` is a boolean. Every ordinal is less than
-`capture.modules.len()`; duplicates, overlap, unknown fields, invalid enums,
+`providers` contains every module with an exact configured built-in or custom
+`HookAbi::Interface` binding, once, with one of the four section-4 coverage
+values. `standard_exports` contains every relevant module once with one of the
+five independent section-4 statuses. `inventory_surfaces` is the at-most-512
+array from section 6; only rows referenced by an exact live match are required,
+and `{module, ordinal}` is unique.
+The three arrays contain at most 512 entries each. `tuples` is the at-most-16
+array in section 5. `selection_truncated` is a boolean. Every module index is less than
+`capture.modules.len()` and every tuple surface index is less than
+`inventory_surfaces.len()`; duplicates, unknown fields, invalid enums,
 bad result-null combinations, and inconsistent `table_match` are rejected by
 exact JSON-shape and mutation tests.
 
@@ -410,11 +458,15 @@ the following contract:
 - **Interface selection:** allow the four finite name classes, seven finite
   version classes, full-width request/result flags and `CK_RV`, three agreement
   booleans, three finite authority classes, four finite coverage classes,
-  bounded module/surface/table/selector indices, finite acquisition,
-  export-required, and helper-failure classifications, bounded counts, and
-  live/offline truncation booleans. Exact target name bytes are compared in BPF
-  and discarded; nonmatching bytes become `other`. No name bytes, pointer,
-  address, PID/TID, or provider-controlled error string is output.
+  bounded module/surface/table/selector indices and module-local surface
+  ordinals, two finite surface kinds, finite acquisition, standard-export, and
+  helper-failure classifications,
+  bounded counts, and live/offline truncation booleans. Exact target name bytes
+  are compared in BPF and discarded; nonmatching bytes become `other`. Capture
+  output and manifest selection evidence contain no name bytes, pointer,
+  address, PID/TID, or provider-controlled error string. Manifest v5 preserves
+  v4's separately allowlisted escaped `raw_name_hex`/`name_lossy` exception for
+  caller-independent offline `C_GetInterfaceList` inventory only.
 
 The existing prohibition that interface name bytes are not capture output
 remains true. The allowlist revision authorizes finite classifications, not
@@ -431,12 +483,16 @@ bounded userspace reduction increments `discovery_truncated` exactly once.
 The call-event `malformed_records` counter is unrelated and is not incremented.
 
 Any of these forces `PARTIAL`: `absent_uncovered`, `observed_uncovered`, a
-required missing export, unmatched successful table,
+`required_absent`, `outside_module`, or `unresolved` standard export,
+`export_outside_module` helper acquisition, unmatched successful table,
 `authority == selection_count_only`, live or offline `selection_truncated`,
 helper failure, selection read/state/ring/malformed loss, process-generation
 instability, or an outcome
 whose provider cannot be attributed exactly. The renderer validates that every
 loss that should affect completeness actually changes the consumer verdict.
+An `export_absent` helper acquisition maps to non-loss `legacy_absent` only
+when exact caller-independent inventory proves legacy 2.x; otherwise it maps
+to `required_absent` or `unresolved` and is `PARTIAL`.
 An unattributable global selection loss changes every silent binding to
 uncovered and makes the capture globally `PARTIAL`; observed providers keep
 their observed tuples and become `observed_uncovered` when another binding is
@@ -448,7 +504,8 @@ profile/terminal-trace test covers each cause and proves no double counting.
 Implementation proceeds TDD and must leave these runnable pins:
 
 1. kind 4, including a custom interface hook, changes no discovery surface,
-   interface count, alias group, table inventory, or `fork_safe` fact;
+   interface count, caller-independent alias group, table inventory, or
+   `fork_safe` fact;
 2. request/result name and version classes, flags, `CK_RV`, and nonzero failure
    outcomes round-trip through the transport validator;
 3. unknown/unterminated/aliased name bytes yield only `other` or `unreadable`,
@@ -461,18 +518,21 @@ Implementation proceeds TDD and must leave these runnable pins:
 5. only exact-standard known-layout unmatched results gain count-only targets,
    with semantic decoding disabled and `PARTIAL`; anonymous, dependency,
    outside-provider, unstable, and unresolved offline closures are refused;
-6. `observed` and `absent_uncovered` are pinned at live call sites, including
-   actual silent `--pid` and `run` cases; `absent_covered` is pinned through the
-   engine proof input; two retained views sharing one provider produce
-   `observed_uncovered`; exact legacy `export_absent` is non-loss, while a
-   required 3.x missing export is `PARTIAL`;
+6. `observed` and `absent_uncovered` are pinned at live call sites; an exact
+   provider prearmed while the owned-child barrier is held is silent
+   `absent_covered`, while a non-prearmed `run` or `--pid` provider is
+   `absent_uncovered`; a constructor call proves the prearm was live before
+   constructors; two retained views sharing one provider produce
+   `observed_uncovered`; `legacy_absent` is non-loss, while a custom-only 3.x
+   provider remains `required_absent` and `PARTIAL`;
 7. the seventeenth distinct tuple sets `selection_truncated` and `PARTIAL`;
 8. recursive no-overwrite state failure is counted and forces `PARTIAL`;
 9. absent/outside helper exports make zero calls; queried makes exactly ten;
    nonzero `CK_RV` stays an outcome and post-success unreadability becomes
    `helper_failure`; unknown returned flag bits round-trip unmasked;
 10. offline pointer equality selects a manifest surface; name/version equality
-    without pointer equality does not;
+    without pointer equality does not; live legacy and two interface aliases
+    sharing one table retain three distinct privacy-safe surface references;
 11. manifest v5 accepts only the fixed matrix and v4 is rejected precisely;
     exact JSON mutation tests pin every enum, bound, result-null relation,
     object/offset reference, orphan-table refusal, full-walk requirement,
@@ -482,9 +542,10 @@ Implementation proceeds TDD and must leave these runnable pins:
     the hook owner that is refused authority; binding ids never reuse, and a
     delayed record after retirement is rejected;
 13. an unmatched selection-only table enters the existing transactional attach
-    path, reuses rather than duplicates an existing `{object, file_offset}`
-    slot, then unload/exec/generation retirement detaches its new links without
-    changing inventory, double-counting, or leaking rollback state;
+    path; same-address/different-name and two-view claims reuse one physical
+    `{object, file_offset}` slot, keep source-local authorization, and independent
+    retirement detaches only after the final owner leaves, without changing
+    inventory, double-counting, or leaking rollback state;
 14. profile v3 and terminal trace expose the bounded aggregate; metrics reads
     no selection arguments for built-in or custom hooks; no trace line emits
     raw selection data; every selection loss owner has a loss-to-verdict test;

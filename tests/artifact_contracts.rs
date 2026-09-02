@@ -1152,7 +1152,7 @@ fn task4_receipt_lane14_capture_binding_is_literal_and_checker_evidence_framed()
     assert_eq!(
         lines[0],
         format!(
-            "argv\t{} scripts/check-capture-evidence.py clean-metrics-manifest-only {}/observed-static-smoke.json spike/expected.txt",
+            "argv\t{} -I scripts/check-capture-evidence.py clean-metrics-manifest-only {}/observed-static-smoke.json spike/expected.txt",
             stub.display(),
             work.display()
         ),
@@ -1550,8 +1550,8 @@ fn release_finalizer_rechecks_cargo_configs_with_pinned_tools() {
     // dropped mid-run must never be the binary that decides, or writes, it --
     // it runs even once the ledger recheck has already failed the run.
     assert!(
-        finalize.contains("\"$T4_TOOL_python3\" - \"$TASK4_ROOT\""),
-        "finalizer validates the evidence root through an unpinned interpreter"
+        finalize.contains("\"$T4_TOOL_python3\" -I - \"$TASK4_ROOT\""),
+        "finalizer validates the evidence root through an unpinned or unisolated interpreter"
     );
     for tool in [
         "cargo",
@@ -1966,11 +1966,24 @@ fn release_seal_exports_exactly_the_reviewed_environment() {
     // PYTHONPATH/PYTHONHOME re-steer both Python steps, and the GIT_* family
     // re-steers the source authority itself -- none of them recorded. The
     // driver runs under an explicit allowlist instead of a longer denylist.
+    // A real PYTHONPATH carrier, not a placeholder: `sitecustomize` runs on
+    // interpreter start-up, so the driver's own finalizer would execute it.
+    let carrier = tempfile::tempdir().expect("create the PYTHONPATH carrier");
+    let executed = carrier.path().join("sitecustomize-ran");
+    fs::write(
+        carrier.path().join("sitecustomize.py"),
+        format!(
+            "import pathlib\npathlib.Path({executed:?}).write_text('executed')\n",
+            executed = executed.display().to_string()
+        ),
+    )
+    .expect("write the sitecustomize carrier");
+    let carrier_path = carrier.path().display().to_string();
     let planted = [
         ("RUSTC_WORKSPACE_WRAPPER", "/task11/wrapper"),
         ("P11SCOPE_SMALL_RING", "1"),
-        ("PYTHONPATH", "/task11/python"),
-        ("PYTHONHOME", "/task11/pythonhome"),
+        ("PYTHONPATH", carrier_path.as_str()),
+        ("PYTHONHOME", ""),
         ("GIT_DIR", "/task11/git"),
         ("GIT_WORK_TREE", "/task11/worktree"),
         ("GIT_INDEX_FILE", "/task11/index"),
@@ -2018,6 +2031,11 @@ fn release_seal_exports_exactly_the_reviewed_environment() {
         value("P11SCOPE_TASK4_SEALED_BIN"),
         "PATH must be exactly the sealed bin directory"
     );
+    assert!(
+        !executed.exists(),
+        "an inherited PYTHONPATH sitecustomize executed inside the release driver"
+    );
+
     let driver_head = String::from_utf8(
         Command::new("git")
             .arg("-C")
@@ -2032,6 +2050,46 @@ fn release_seal_exports_exactly_the_reviewed_environment() {
         run.fact("head"),
         Some(driver_head.trim()),
         "an inherited GIT_DIR must never decide the recorded HEAD"
+    );
+}
+
+#[test]
+fn release_runs_every_python3_in_isolated_mode() {
+    // Shadow finding 6's independent carrier: the pinned interpreter was
+    // launched without isolated mode, so an external `sitecustomize` or a
+    // shadowed module on PYTHONPATH executed inside both capture approval and
+    // the inline finalizer. The seal drops those variables; `-I` also refuses
+    // them for any invocation that ever runs outside it, and drops the user
+    // site directory and the script directory from sys.path as well.
+    let release = read("scripts/build-release.sh");
+    assert!(
+        release.contains("    python3 -I - \"$REPORT\" <<'PY'"),
+        "the --self-test model runner is not isolated"
+    );
+    let sites: Vec<&str> = release
+        .match_indices("T4_TOOL_python3")
+        .map(|(at, _)| &release[at..])
+        .collect();
+    assert_eq!(
+        sites.len(),
+        4,
+        "the pinned-interpreter call sites moved; re-check each one for -I"
+    );
+    for site in sites {
+        let rest = site
+            .strip_prefix("T4_TOOL_python3")
+            .and_then(|rest| rest.strip_prefix('"').or(Some(rest)))
+            .unwrap();
+        assert!(
+            rest.starts_with(" -I "),
+            "an unisolated pinned python3 invocation: {:?}",
+            &site[..site.len().min(90)]
+        );
+    }
+    // The framed checker record names the argv it actually ran.
+    assert!(
+        release.contains("t4_checker_argv=\"$T4_TOOL_python3 -I scripts/check-capture-evidence.py"),
+        "the framed checker argv does not match the isolated invocation"
     );
 }
 
@@ -3901,6 +3959,7 @@ fn task4_receipt_drivers_execute_behavioral_self_tests() {
         "inventory-wide-tool-ledger-exact-accepted",
         "sealed-bin-removed-after-terminal-status",
         "nightly-toolchain-closure-exact-accepted",
+        "isolated-python-invocations-exact-accepted",
     ];
     const LANE16_CASES: &[&str] = &[
         "never-68-68-136-one-timing-zero-loss-ambiguity-inflight-child-false-none-0-0-0-exact-accepted",

@@ -230,6 +230,9 @@ impl CaptureWorkBudget {
     }
 
     pub(crate) fn admit_table(&mut self, entries: usize) -> bool {
+        if self.scan_stopped() {
+            return false;
+        }
         let Some(decoded) = self.decoded_table_entries.checked_add(entries) else {
             return false;
         };
@@ -258,6 +261,9 @@ impl CaptureWorkBudget {
     }
 
     pub(crate) fn admit_interface(&mut self) -> bool {
+        if self.scan_stopped() {
+            return false;
+        }
         if self.interface_records == MAX_INTERFACE_RECORDS {
             return false;
         }

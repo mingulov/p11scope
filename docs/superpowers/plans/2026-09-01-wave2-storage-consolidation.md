@@ -70,7 +70,7 @@
 
 ### Task 6: Review-to-zero and closeout
 
-- [ ] **Step 1:** Two independent review agents per the ROADMAP protocol: (a) Sol xhigh rule-compliance review (does anything durable still depend on a non-durable root? was any history rewritten?), (b) Luna high custody review (manifests complete, perms right, nothing large in ws git). Add Terra xhigh only for a distinct third lane when materially useful. Triage, fix, repeat until a cycle accepts zero findings.
-- [ ] **Step 2:** Merge to `main`; gates on `main`.
-- [ ] **Step 3:** Present the owner-gated deletion list (old roots with sizes: `~/.local/state/p11scope` ~11 GB, `~/p11scope-vm-bases` ~1.6 GB) and the key-rotation item. **Stop — do not delete or rotate.**
-- [ ] **Step 4:** Memory update is conditional on an explicit contemporaneous owner request; otherwise record `SKIPPED`. If requested, record that the two-directory rule is enforced as of `<tip>`, originals await owner deletion, and keys await rotation.
+- [x] **Step 1:** Two independent review agents per the ROADMAP protocol: (a) Sol xhigh rule-compliance review (does anything durable still depend on a non-durable root? was any history rewritten?), (b) Luna high custody review (manifests complete, perms right, nothing large in ws git). Add Terra xhigh only for a distinct third lane when materially useful. Triage, fix, repeat until a cycle accepts zero findings. Sol xhigh and Luna high accepted zero findings at public tip `f2d5979` and private tip `18b0c7a`.
+- [x] **Step 2:** Merge to `main`; gates on `main`. Local merge `e5e8517` passed all four canonical gates with 937 tests and zero failures.
+- [x] **Step 3:** Present the owner-gated deletion list (old roots with sizes: `~/.local/state/p11scope` ~11 GB, `~/p11scope-vm-bases` ~1.6 GB) and the key-rotation item. **Stop — do not delete or rotate.** The relocation report records the exact current sizes; neither root was deleted and the key was not rotated.
+- [x] **Step 4:** Memory update is conditional on an explicit contemporaneous owner request; otherwise record `SKIPPED`. If requested, record that the two-directory rule is enforced as of `<tip>`, originals await owner deletion, and keys await rotation. **SKIPPED:** no contemporaneous owner request.

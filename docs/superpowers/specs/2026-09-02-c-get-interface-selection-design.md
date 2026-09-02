@@ -1,8 +1,8 @@
 # `C_GetInterface` selection-evidence design
 
 **Date:** 2026-09-02 (Europe/Helsinki)
-**Status:** proposed W3 design; implementation requires owner approval of this
-document, including the schema and privacy wording below
+**Status:** owner-approved W3 direction; implementation begins only after the
+schema and privacy wording below pass delegated review to zero
 **Base:** `main@a2a264456bc0c30d3c30e727c85507940a90b75f`
 
 ## 1. Decision
@@ -82,7 +82,10 @@ same-thread call that loses the no-overwrite state race increments
 `PARTIAL`.
 
 The attach cookie becomes a private per-attachment binding id, not merely a
-global hook-symbol id. Userspace retains the binding
+global hook-symbol id. Binding ids are monotonically allocated, unique for the
+whole capture, and never reused after retirement. Exhaustion refuses the new
+attachment and forces `PARTIAL`; a delayed record for a retired id is rejected
+rather than resolved against another binding. Userspace retains the binding
 `{hook_id, abi, ProcessView, generation, hook-owner object, loader context}` and
 validates it before attributing a record. `module` is always the index of that
 hook-owner provider in `capture.modules[]`; it is never inferred from the
@@ -90,15 +93,21 @@ returned table mapping. A missing, retired, or disagreeing binding records no
 authority and forces `PARTIAL`. This is required even when two providers expose
 the same symbol in one process, and applies equally to custom interface hooks.
 
-## 4. Coverage is per provider
+## 4. Coverage is per provider and retained binding
 
-Every provider with an exact in-module `C_GetInterface` export in the final
-capture has exactly one selection coverage state:
+Every exact configured `HookAbi::Interface` binding, built-in or custom, has an
+internal state for its retained `ProcessView` and generation: observed,
+silently covered, or silently uncovered. The public state collapses all such
+bindings for one `capture.modules[]` provider without exposing process identity:
 
-- `observed`: at least one valid selection tuple was received;
-- `absent_covered`: no tuple was received, and the observer proves it installed
-  the hook before that provider could execute selection in this generation;
-- `absent_uncovered`: no tuple was received and the proof above is unavailable.
+- `observed`: at least one binding was observed and no silent binding was
+  uncovered;
+- `observed_uncovered`: at least one binding was observed and at least one
+  other binding was silently uncovered;
+- `absent_covered`: no binding was observed and every silent binding was
+  covered; or
+- `absent_uncovered`: no binding was observed and at least one silent binding
+  was uncovered.
 
 `absent_covered` is allowed only for either:
 
@@ -114,13 +123,25 @@ generation change, selection truncation, ring loss, state failure, bounded-read
 failure, malformed record, or unresolved provider attribution also makes an
 otherwise silent provider `absent_uncovered` and forces `PARTIAL`.
 
+The base tree has no populated timing-catalog proof for either covered case.
+Therefore this slice reports a silent `run` provider as `absent_uncovered` too;
+`absent_covered` is pinned at unit level through the engine's proof input but is
+not claimed from a live call site until a later timing slice supplies that
+proof. `observed_uncovered` and `absent_uncovered` force `PARTIAL`.
+
 An exact pinned ELF proof that the export is absent is recorded separately in
-`export_absent[]`; it is not a coverage loss and does not make a legacy 2.x
-provider `PARTIAL`. A provider whose export status cannot be proved is included
-as `absent_uncovered` and forces `PARTIAL`. Any capture-global selection loss
-whose producer cannot be attributed changes **every silent selection-capable
-provider** to `absent_uncovered`; it never poisons an observed tuple or creates
-a guessed provider attribution.
+`export_absent[]` only when no exact configured interface binding exists for
+that provider. An entry is `{module, required}`. `required=false` is permitted
+only when exact caller-independent inventory establishes a legacy 2.x provider;
+it is not a coverage loss and does not force `PARTIAL`. `required=true` means
+exact inventory establishes Cryptoki 3.x, whose missing standard export forces
+`PARTIAL`. A provider whose export or binding status cannot be proved is a
+selection-capable unresolved provider with `absent_uncovered`, not an
+`export_absent` entry. The two sets are disjoint. Any capture-global selection
+loss whose producer cannot be attributed changes each silent binding to
+uncovered; a provider already observed becomes `observed_uncovered`, while a
+fully silent provider becomes `absent_uncovered`. It never erases an observed
+tuple or creates a guessed provider attribution.
 
 ## 5. Bounded aggregation
 
@@ -140,7 +161,7 @@ A tuple consists of the exact fields below. Unknown fields are rejected.
 | `rv` | unsigned 64-bit integer |
 | `result` | `null` when no readable result exists, otherwise an object with the same finite `name`/`version` classes and unsigned 64-bit `flags` |
 | `table_match` | boolean, true exactly when `inventory_matches` is nonempty |
-| `inventory_matches` | sorted unique array of at most 16 `{interface: u16, name_agrees: boolean, version_agrees: boolean}` objects; `interface` is 0 through 255 and indexes that provider's caller-independent interface inventory |
+| `inventory_matches` | sorted unique array of at most 16 `{surface: u16, name_agrees: boolean, version_agrees: boolean}` objects; `surface` indexes `evidence.discovery[module].tables[]` for that provider |
 | `authority` | `inventory`, `selection_count_only`, or `none` |
 | `count` | saturating unsigned 64-bit integer, at least 1 |
 
@@ -159,19 +180,24 @@ or provider error text. Counters saturate rather than wrap.
 Name or version agreement never establishes a table match.
 
 For live evidence, an `inventory_matches[]` entry exists only when the returned
-`pFunctionList` address equals a `ScannedTable.address` that:
+`pFunctionList` address equals a `ScannedTable.address` that is published as a
+caller-independent legacy or interface surface in
+`evidence.discovery[module].tables[]` and:
 
-- came from the memory scan or a kind-2 `C_GetInterfaceList` record;
+- came from the memory scan, `C_GetFunctionList`, or a kind-2
+  `C_GetInterfaceList` record;
 - belongs to the same `ProcessView` and retained process generation;
 - resolves through the same fresh maps snapshot to the same module device and
   inode; and
 - remains stable through selection reduction.
 
 For offline evidence, an inventory match exists only when the returned
-`pFunctionList` pointer equals one of the helper's own `C_GetInterfaceList`
-entries from the same loaded provider instance. The manifest records the
-matched inventory surface indices, not either pointer. All matches are retained
-in sorted order so shared-address aliases remain explicit.
+`pFunctionList` pointer equals one of the helper's own caller-independent
+legacy or interface surfaces from the same loaded provider instance. The
+manifest records that entry's ordinal in `surfaces[]`, not either pointer. The
+live and offline ordinals are bounded by their referenced array lengths. All
+matches are retained in sorted order so shared-address aliases remain explicit;
+a scanned table without a published caller-independent surface is unmatched.
 
 Each match's `name_agrees` and `version_agrees` booleans are derived after the
 exact table match. They expose a provider inconsistency but never widen a match.
@@ -212,6 +238,15 @@ function rows they count. They do not contribute to
 `evidence.discovery[].tables`, `.interfaces`, `surfaces`, `interface_list`,
 `vendor_interfaces`, aliases, or slot-level `fork_safe` conclusions.
 
+Their decoded non-null function occurrences contribute to `table_entries`
+under the existing exact-occurrence deduplication rule. A target whose exact
+`{object, file_offset}` already has a planned or attached slot is linked to that
+slot and is never attached again; it contributes no new `slots`,
+`attached_probes`, or aggregate function row. A new target contributes one
+slot and, after successful attachment, two probes exactly as existing slots do.
+Thus selection cannot double-count a call or break the existing
+`table_entries`/`slots`/`attached_probes` relationships.
+
 They are source-tagged slots keyed by
 `{ProcessView, generation, loader context, hook-owner object, selected object,
 function name, file offset}`. They enter the existing candidate
@@ -235,13 +270,13 @@ Acquisition has exactly three outer states:
 - `export_outside_module`: zero calls and the export is refused; or
 - `queried`: exactly ten calls.
 
-The ten calls are the Cartesian product of these five selectors:
+The ten calls are the Cartesian product of these five numbered selectors:
 
-1. name `NULL`, version `NULL`;
-2. name `"PKCS 11"`, version `NULL`;
-3. name `"PKCS 11"`, version 3.0;
-4. name `"PKCS 11"`, version 3.1;
-5. name `"PKCS 11"`, version 3.2;
+0. name `NULL`, version `NULL`;
+1. name `"PKCS 11"`, version `NULL`;
+2. name `"PKCS 11"`, version 3.0;
+3. name `"PKCS 11"`, version 3.1;
+4. name `"PKCS 11"`, version 3.2;
 
 with flags `0` and `CKF_INTERFACE_FORK_SAFE` (`1`). No adaptive retry,
 fallback, or vendor query is added.
@@ -266,6 +301,7 @@ The helper emits only `p11scope-manifest/5`. The top-level
 | `acquisition` | `export_absent`, `export_outside_module`, or `queried` |
 | `queries` | array of exactly 0 entries for the first two acquisition states or exactly 10 entries for `queried` |
 | `tables` | array of at most 10 selection-only table records |
+| `selection_truncated` | boolean; true exactly when more than 16 exact aliases were available to a query |
 
 Each query has:
 
@@ -274,15 +310,19 @@ Each query has:
 - `rv`: unsigned 64-bit integer;
 - `result`: `null`, or finite returned name/version classes plus unmasked
   unsigned 64-bit flags;
-- `inventory_matches`: sorted unique array of at most 16 interface indices from
-  0 through 255 with separate name/version agreement booleans;
+- `inventory_matches`: sorted unique array of at most 16 `surface` indices into
+  `surfaces[]`, each less than that array's length, with separate name/version
+  agreement booleans;
 - `selection_table`: `null` or an integer 0 through 9 referencing
   `tables[].id`;
 - `authority`: `inventory`, `selection_count_only`, or `none`; and
-  and
 - `helper_failure`: `null` or one of `null_output`, `unreadable_interface`,
   `unreadable_name`, `unreadable_version`, `unreadable_table`,
   `outside_provider`, `unresolved_function`, or `provider_changed`.
+
+For `queried`, the array contains each selector/flag pair exactly once in
+selector order with flags `0` then `1`. For either zero-call acquisition,
+`tables` is empty and `selection_truncated` is false.
 
 For nonzero `rv`, `result`, `selection_table`, and `helper_failure` are null,
 `inventory_matches` is empty, and authority is `none`. For `CKR_OK`, a readable
@@ -291,12 +331,17 @@ helper failure. Authority is `inventory` exactly when matches are nonempty and
 `selection_table` is null; it is `selection_count_only` exactly when matches
 are empty and `selection_table` is nonnull. `helper_failure` is nonnull only
 when post-success inspection could not produce a readable result or safe
-authority decision. A table record has a unique integer id,
-a 3.0/3.1/3.2 version, a full/known-prefix walk outcome, at most 104 existing
+authority decision; whenever `helper_failure` is nonnull, authority is `none`.
+More than 16 exact aliases retains the first 16 in surface order, sets
+`selection_truncated`, and forces `PARTIAL`. A table record has a unique integer
+id, a 3.0/3.1/3.2 version, a `full` walk outcome, at most 104 existing
 `FunctionRecord` values, and `semantic_authorized: false`. Every resolution
 must name an existing manifest object and an offset inside the exact provider
 module object; selection tables may not name dependency objects. No table or
-function pointer is serialized.
+function pointer is serialized. Every table is referenced by at least one
+`CKR_OK` query with `authority=selection_count_only`, null `helper_failure`, and
+matching `selection_table`; orphan or merely known-prefix tables are rejected,
+and only reachable tables enter attachment planning.
 
 Manifest v4 is intentionally rejected after W3, not silently upgraded. It
 cannot prove whether the matrix ran, so a mechanical default would fabricate
@@ -333,10 +378,12 @@ evidence add `evidence.interface_selection`:
 ```
 
 `providers` contains unique selection-capable or unresolved module
-ordinals with one of the three section-4 coverage values. `export_absent`
-contains sorted unique module ordinals backed by exact pinned ELF proof and
-is disjoint from `providers`; the two arrays contain at most 512 entries
-combined. An unresolved module is present only as `absent_uncovered`.
+ordinals with one of the four section-4 coverage values. It includes every
+module with an exact configured built-in or custom `HookAbi::Interface`
+binding, plus an unresolved module only as `absent_uncovered`. `export_absent`
+contains sorted unique `{module, required}` records backed by exact pinned ELF
+proof and is disjoint from `providers`; the two arrays contain at most 512
+entries combined.
 `tuples` is the at-most-16 array in
 section 5. `selection_truncated` is a boolean. Every ordinal is less than
 `capture.modules.len()`; duplicates, overlap, unknown fields, invalid enums,
@@ -362,9 +409,11 @@ the following contract:
   always `semantic_authorized=false`, never inventory, and forces `PARTIAL`.
 - **Interface selection:** allow the four finite name classes, seven finite
   version classes, full-width request/result flags and `CK_RV`, three agreement
-  booleans, three finite authority classes, per-provider coverage, bounded
-  counts, and one truncation boolean. Exact target name bytes are compared in
-  BPF and discarded; nonmatching bytes become `other`. No name bytes, pointer,
+  booleans, three finite authority classes, four finite coverage classes,
+  bounded module/surface/table/selector indices, finite acquisition,
+  export-required, and helper-failure classifications, bounded counts, and
+  live/offline truncation booleans. Exact target name bytes are compared in BPF
+  and discarded; nonmatching bytes become `other`. No name bytes, pointer,
   address, PID/TID, or provider-controlled error string is output.
 
 The existing prohibition that interface name bytes are not capture output
@@ -381,14 +430,17 @@ selection transport record rejected for ABI shape, producer binding, or
 bounded userspace reduction increments `discovery_truncated` exactly once.
 The call-event `malformed_records` counter is unrelated and is not incremented.
 
-Any of these forces `PARTIAL`: `absent_uncovered`, unmatched successful table,
-selection-scoped authority, `selection_truncated`, helper failure, selection
-read/state/ring/malformed loss, process-generation instability, or an outcome
+Any of these forces `PARTIAL`: `absent_uncovered`, `observed_uncovered`, a
+required missing export, unmatched successful table,
+`authority == selection_count_only`, live or offline `selection_truncated`,
+helper failure, selection read/state/ring/malformed loss, process-generation
+instability, or an outcome
 whose provider cannot be attributed exactly. The renderer validates that every
 loss that should affect completeness actually changes the consumer verdict.
-An unattributable global selection loss changes every silent
-selection-capable provider to `absent_uncovered` and makes the capture globally
-`PARTIAL`; observed providers keep their observed tuples. One table-driven
+An unattributable global selection loss changes every silent binding to
+uncovered and makes the capture globally `PARTIAL`; observed providers keep
+their observed tuples and become `observed_uncovered` when another binding is
+silent. One table-driven
 profile/terminal-trace test covers each cause and proves no double counting.
 
 ## 12. Acceptance tests
@@ -409,25 +461,30 @@ Implementation proceeds TDD and must leave these runnable pins:
 5. only exact-standard known-layout unmatched results gain count-only targets,
    with semantic decoding disabled and `PARTIAL`; anonymous, dependency,
    outside-provider, unstable, and unresolved offline closures are refused;
-6. `observed`, `absent_covered`, and `absent_uncovered` are pinned at live call
-   sites, including an actual `--pid`/unprotected refusal; exact legacy
-   `export_absent` is non-loss in both `--pid` and `run`;
+6. `observed` and `absent_uncovered` are pinned at live call sites, including
+   actual silent `--pid` and `run` cases; `absent_covered` is pinned through the
+   engine proof input; two retained views sharing one provider produce
+   `observed_uncovered`; exact legacy `export_absent` is non-loss, while a
+   required 3.x missing export is `PARTIAL`;
 7. the seventeenth distinct tuple sets `selection_truncated` and `PARTIAL`;
 8. recursive no-overwrite state failure is counted and forces `PARTIAL`;
 9. absent/outside helper exports make zero calls; queried makes exactly ten;
    nonzero `CK_RV` stays an outcome and post-success unreadability becomes
    `helper_failure`; unknown returned flag bits round-trip unmasked;
-10. offline pointer equality selects an inventory index; name/version equality
+10. offline pointer equality selects a manifest surface; name/version equality
     without pointer equality does not;
 11. manifest v5 accepts only the fixed matrix and v4 is rejected precisely;
     exact JSON mutation tests pin every enum, bound, result-null relation,
-    object/offset reference, and inventory-separation rule;
+    object/offset reference, orphan-table refusal, full-walk requirement,
+    seventeenth-alias truncation, and inventory-separation rule;
 12. two providers with the same built-in or custom hook symbol are attributed
     by their private attachment bindings, including a returned table outside
-    the hook owner that is refused authority;
+    the hook owner that is refused authority; binding ids never reuse, and a
+    delayed record after retirement is rejected;
 13. an unmatched selection-only table enters the existing transactional attach
-    path, then unload/exec/generation retirement detaches it without changing
-    inventory or leaking rollback state;
+    path, reuses rather than duplicates an existing `{object, file_offset}`
+    slot, then unload/exec/generation retirement detaches its new links without
+    changing inventory, double-counting, or leaking rollback state;
 14. profile v3 and terminal trace expose the bounded aggregate; metrics reads
     no selection arguments for built-in or custom hooks; no trace line emits
     raw selection data; every selection loss owner has a loss-to-verdict test;

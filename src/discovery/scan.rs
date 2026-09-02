@@ -446,6 +446,34 @@ fn span_bytes(spans: &[TableSpan]) -> Option<usize> {
         .max()
 }
 
+pub(crate) fn exact_table_bytes(header: &[u8]) -> Option<usize> {
+    let word = u64::from_ne_bytes(header.get(..WORD)?.try_into().ok()?);
+    let (_, spans, _) = spans_for(word)?;
+    span_bytes(spans)
+}
+
+/// Returns every non-NULL function pointer in one complete table snapshot.
+/// Addresses are capture-local and are used only to close the maps-A/maps-B
+/// stability bracket; callers must not persist them as identity.
+pub(crate) fn exact_table_addresses(snapshot: &[u8]) -> Option<Vec<u64>> {
+    let word = u64::from_ne_bytes(snapshot.get(..WORD)?.try_into().ok()?);
+    let (_, spans, _) = spans_for(word)?;
+    let mut addresses = Vec::new();
+    for span in spans {
+        for field in span.fields() {
+            let raw = field
+                .offset
+                .checked_add(WORD)
+                .and_then(|end| snapshot.get(field.offset..end))?;
+            let address = u64::from_ne_bytes(raw.try_into().ok()?);
+            if address != 0 {
+                addresses.push(address);
+            }
+        }
+    }
+    Some(addresses)
+}
+
 /// Decodes one candidate at `offset` inside `snapshot` (whose first byte is at
 /// `base_address` in the target). Returns the table only when every published slot
 /// is either NULL or points into a file-backed executable mapping — the criterion
@@ -566,6 +594,19 @@ fn decode_candidate(
         },
         len,
     )))
+}
+
+/// Decode one table whose first byte is at `address`, using the same bounded
+/// layout decoder as heuristic memory discovery.  Callers own the bounded
+/// `/proc/<pid>/mem` read; this helper only accepts a complete table snapshot.
+pub(crate) fn decode_exact_table(
+    snapshot: &[u8],
+    address: u64,
+    maps: &MapIndex<'_>,
+    budget: &mut CaptureWorkBudget,
+) -> Result<Option<ScannedTable>, ()> {
+    decode_candidate(snapshot, 0, address, maps, budget)
+        .map(|decoded| decoded.map(|(table, _)| table))
 }
 
 /// Every 8-byte-aligned candidate in one snapshot, longest match kept on overlap.
@@ -1971,6 +2012,17 @@ mod tests {
         );
         assert_eq!(tables[0].null_entries.len(), 1);
         assert_eq!(tables[0].entries.len(), 67);
+    }
+
+    #[test]
+    fn exact_table_addresses_keep_non_null_fields_in_canonical_order() {
+        let mut snapshot = vec![0u8; 8 + 68 * 8];
+        snapshot[..8].copy_from_slice(&0x2802u64.to_ne_bytes());
+        snapshot[8..16].copy_from_slice(&0x1110u64.to_ne_bytes());
+        snapshot[16..24].copy_from_slice(&0u64.to_ne_bytes());
+        snapshot[24..32].copy_from_slice(&0x3330u64.to_ne_bytes());
+
+        assert_eq!(exact_table_addresses(&snapshot).unwrap(), [0x1110, 0x3330]);
     }
 
     #[test]

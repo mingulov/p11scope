@@ -855,9 +855,9 @@ pub mod capture {
 }
 
 /// Ring buffer capacity in bytes. Must be a power of two and page-aligned.
-/// 256 KiB holds ~2700 events. The `small-ring` feature (off by default;
-/// the default build is unaffected) shrinks this to one page so the
-/// induced-gap test (Task 7, `scripts/verify-induced-gaps.sh`) can force
+/// 256 KiB holds roughly 900 current 288-byte events. The `small-ring` feature
+/// (off by default; the default build is unaffected) shrinks this to one page
+/// so the induced-gap test (Task 7, `scripts/verify-induced-gaps.sh`) can force
 /// ring-buffer loss deliberately with a high call rate.
 #[cfg(not(feature = "small-ring"))]
 pub const RING_BYTES: u32 = 256 * 1024;

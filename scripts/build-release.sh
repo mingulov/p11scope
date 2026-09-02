@@ -452,7 +452,8 @@ task4_cargo_home_bin_ledger() {
                     esac
                     ;;
             esac
-            canonical=$(realpath -e "$path") || exit 1
+            canonical=$(realpath -e "$path" && printf X) || exit 1
+            case $canonical in *"$nl"X) canonical=${canonical%"$nl"X} ;; *) exit 1 ;; esac
             case $canonical in *"$tab"*|*"$nl"*) exit 1 ;; esac
             case $name in cargo|rustc|rustup)
                 [ "$canonical" = "$rustup" ] || exit 1 ;;

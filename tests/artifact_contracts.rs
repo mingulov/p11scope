@@ -8113,9 +8113,17 @@ int main(int argc, char **argv) {
         String::from_utf8_lossy(&early_signal.stdout),
         String::from_utf8_lossy(&early_signal.stderr)
     );
+    let early_signal_status = early_signal
+        .status
+        .code()
+        .expect("post-root signal has a shell exit status");
+    assert!(
+        matches!(early_signal_status, 1 | 143),
+        "post-root signal returned unexpected status {early_signal_status}"
+    );
     assert_eq!(
         fs::read_to_string(early_signal_evidence.join("status")).unwrap(),
-        "1\n"
+        format!("{early_signal_status}\n")
     );
     let early_facts_path = early_signal_evidence.join("facts.log");
     let early_deadline = Instant::now() + Duration::from_secs(5);

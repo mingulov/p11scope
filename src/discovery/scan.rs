@@ -1458,6 +1458,36 @@ pub fn scan_process_view(
 mod tests {
     use super::*;
 
+    #[test]
+    fn source_pins_one_index_per_live_snapshot() {
+        fn production_body<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            let source = &source[source.find(start).expect("production start marker")..];
+            let body_start = source.find('{').expect("production body start");
+            let body_end = source.find(end).expect("production end marker");
+            &source[body_start..body_end]
+        }
+
+        let usable_path = production_body(
+            include_str!("engine.rs"),
+            "fn usable_path(",
+            "\n}\n\n#[cfg(test)]\nfn exact_executable_mapping",
+        );
+        assert!(usable_path.contains("maps.resolve(mapping.start)"));
+        assert!(!usable_path.contains("maps::resolve("));
+        assert!(!usable_path.contains("resolve(&"));
+
+        let index_maps_or_refuse = production_body(
+            include_str!("scan.rs"),
+            "pub(crate) fn index_maps_or_refuse<'a>(",
+            "\n}\n\npub fn scan_pid(",
+        );
+        assert_eq!(
+            index_maps_or_refuse.matches("MapIndex::new(").count(),
+            1,
+            "shared snapshot index must be constructed exactly once"
+        );
+    }
+
     /// Task 11 fix round 3 (shadow finding 5, scan branch). `parse_maps`,
     /// `MapIndex::new` and `candidate_groups` are each O(entries) on a snapshot
     /// the target sizes, and none of them charged or polled: a dense map could

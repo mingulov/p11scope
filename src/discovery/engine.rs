@@ -5049,6 +5049,16 @@ impl Engine {
         if units != 0 {
             self.budget.charge(units);
         }
+        // The drain quantum returns to its caller here, so this is the live
+        // collector path's one clock poll per quantum: a batch deadline that
+        // expired during the drain stops the capture at this boundary instead
+        // of one whole batch later. A refused charge is published exactly once,
+        // under whichever ceiling actually stopped it — never mislabelled.
+        if self.budget.stopped_now().is_some()
+            && let Some(reason) = self.budget.take_scan_stop_reason()
+        {
+            self.mark_live_loss("live discovery drain", reason);
+        }
     }
 
     fn record_malformed_discovery(&mut self, malformed: u64) {
@@ -5869,6 +5879,11 @@ impl Engine {
             // re-arms it, so the rejection costs the capture no observation —
             // only its causal timing proof — so, exactly as in the identity
             // branch below, it is counted by nothing either.
+            // The exec-transition proof scans the snapshot linearly: charge that
+            // pass like every other live map iteration. A refused charge leaves
+            // the sticky stop for the budget's consumers, exactly as at the
+            // drain sink — it never changes this record's rejection.
+            self.budget.charge(maps.len() as u64);
             if self.exec_replaced_the_armed_image(&context.spec, view_id, pid, &maps, pending_views)
             {
                 self.invalidate_causal_timing();
@@ -9525,6 +9540,90 @@ mod tests {
             "dequeued records are never dropped"
         );
         assert!(!engine.budget.charge(1), "the ceiling stays sticky");
+    }
+
+    /// Task 11 fix round 3 (writer A1 follow-ups 1 and 2). A1's drain quantum
+    /// returns to the caller at this sink, so the sink is where the live
+    /// collector path polls the clock: a batch deadline that expired during the
+    /// drain stops the capture at the quantum boundary instead of one whole
+    /// batch later. A refused charge is published there exactly once, under
+    /// whichever ceiling actually stopped it — the work ceiling and the
+    /// deadline are never labelled as each other.
+    #[test]
+    fn a_drained_quantum_polls_the_batch_deadline_and_publishes_its_own_stop() {
+        let drain_skip = |engine: &Engine| -> Vec<Skipped> {
+            engine
+                .counters
+                .object_skips
+                .iter()
+                .filter(|skip| skip.subject == "live discovery drain")
+                .cloned()
+                .collect()
+        };
+
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        let mut session = ScriptedSession::default();
+        let mut collect = Engine::collect_discovery_records;
+        engine
+            .apply_discovery_batch_with(
+                &mut session,
+                Vec::new(),
+                2,
+                true,
+                false,
+                &mut collect,
+                Some(0),
+            )
+            .unwrap();
+        assert_eq!(
+            drain_skip(&engine),
+            vec![Skipped {
+                subject: "live discovery drain".into(),
+                reason: SCAN_DEADLINE_REASON.into(),
+            }],
+            "an expired batch deadline stops the drain at its quantum, once"
+        );
+
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        assert!(engine.budget.charge(16 * 1024 * 1024));
+        let mut session = ScriptedSession::default();
+        let mut collect = Engine::collect_discovery_records;
+        engine
+            .apply_discovery_batch_with(
+                &mut session,
+                Vec::new(),
+                2,
+                true,
+                false,
+                &mut collect,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            drain_skip(&engine),
+            vec![Skipped {
+                subject: "live discovery drain".into(),
+                reason: WORK_CEILING_REASON.into(),
+            }],
+            "a refused charge is the work ceiling, never mislabelled as the deadline"
+        );
+
+        // An ordinary drain inside its deadline publishes nothing at all.
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        let mut session = ScriptedSession::default();
+        let mut collect = Engine::collect_discovery_records;
+        engine
+            .apply_discovery_batch_with(
+                &mut session,
+                Vec::new(),
+                2,
+                true,
+                false,
+                &mut collect,
+                Some(u64::MAX),
+            )
+            .unwrap();
+        assert!(drain_skip(&engine).is_empty());
     }
 
     #[test]

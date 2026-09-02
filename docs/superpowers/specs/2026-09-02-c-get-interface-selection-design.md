@@ -264,6 +264,8 @@ public surface reference or inventory authority.
 
 Each match's `name_agrees` and `version_agrees` booleans are derived after the
 exact table match. They expose a provider inconsistency but never widen a match.
+Agreement means proven equality of two readable finite classifications; it is
+false whenever either compared field is null or unreadable.
 For a legacy surface, which has no interface name, `name_agrees` is false by
 definition; version agreement still compares table versions. An unmatched
 result is explicit and forces `PARTIAL`.
@@ -552,7 +554,9 @@ Implementation proceeds TDD and must leave these runnable pins:
    `fork_safe` fact;
 2. request/result name and version classes, flags, `CK_RV`, and nonzero failure
    outcomes round-trip through the transport validator; an exact table match
-   with unreadable name/version retains its match but has no authority;
+   with unreadable name/version retains its match but has no authority, and
+   live/offline mutation tests require the corresponding agreement boolean to
+   be false whenever either compared field is null or unreadable;
 3. unknown/unterminated/aliased name bytes yield only `other` or `unreadable`,
    and secret canaries do not appear in maps or output; an aliased buffer whose
    exact bytes are `PKCS 11\0` is necessarily `exact_standard`, but those bytes

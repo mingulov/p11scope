@@ -1723,6 +1723,7 @@ struct Task11FixtureOptions {
     cargo_proxy_mismatch: bool,
     cargo_proxy_regular_mismatch: bool,
     cargo_home_raw_target_newline: bool,
+    cargo_home_canonical_target_newline: bool,
     cargo_home_inventory_shadow: bool,
     missing_musl: bool,
 }
@@ -1834,6 +1835,19 @@ exit 1
     fs::set_permissions(&proxy_target, fs::Permissions::from_mode(0o700))
         .expect("make mismatched cargo proxy executable");
     let rustup_target = fake_bin.join("rustup");
+    let cargo_target = if options.cargo_home_canonical_target_newline {
+        let newline_target = fake_bin.join("rustup\n");
+        fs::write(&newline_target, b"#!/bin/sh\nexit 0\n")
+            .expect("write newline-terminated cargo target");
+        fs::set_permissions(&newline_target, fs::Permissions::from_mode(0o700))
+            .expect("make newline-terminated cargo target executable");
+        let intermediate = fake_bin.join("cargo-intermediate");
+        std::os::unix::fs::symlink(&newline_target, &intermediate)
+            .expect("link safe-named cargo intermediate");
+        intermediate
+    } else {
+        rustup_target.clone()
+    };
     if options.cargo_proxy_regular_mismatch {
         fs::write(cargo_bin.join("cargo"), b"#!/bin/sh\nexit 0\n")
             .expect("write regular cargo proxy mismatch");
@@ -1844,7 +1858,7 @@ exit 1
             if options.cargo_proxy_mismatch {
                 proxy_target.as_path()
             } else {
-                rustup_target.as_path()
+                cargo_target.as_path()
             },
             cargo_bin.join("cargo"),
         )
@@ -2317,6 +2331,20 @@ fn release_cargo_home_bin_closure_is_complete_and_refuses_shadows() {
         raw_target_newline.tripped().is_empty(),
         "a newline-terminated raw target reached the release body: {}",
         raw_target_newline.tripped()
+    );
+
+    let canonical_target_newline = task11_run_to_the_sudo_probe(
+        &[],
+        Task11FixtureOptions {
+            cargo_home_canonical_target_newline: true,
+            ..Task11FixtureOptions::default()
+        },
+    );
+    assert_eq!(canonical_target_newline.output.status.code(), Some(77));
+    assert!(
+        canonical_target_newline.tripped().is_empty(),
+        "a newline-terminated two-hop canonical target reached the release body: {}",
+        canonical_target_newline.tripped()
     );
 }
 

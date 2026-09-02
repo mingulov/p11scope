@@ -25,6 +25,7 @@ use std::fs::File;
 use std::io;
 use std::io::{Seek as _, SeekFrom, Write};
 use std::num::NonZeroU64;
+use std::ops::ControlFlow;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::MetadataExt as _;
@@ -924,6 +925,7 @@ enum CaptureEnd {
     DurationExpired,
     TargetExit,
     Signal,
+    LimitReached,
     Error,
 }
 
@@ -1033,13 +1035,7 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
                 .map_err(|error| anyhow!("--pid {p}: {error}"))?;
             (Scope::Pid(*p), Some(view))
         }
-        ScopeArg::Cgroup(c) => (
-            Scope::Cgroup {
-                id: scope::cgroup_id(c)?,
-                path: c.clone(),
-            },
-            None,
-        ),
+        ScopeArg::Cgroup(c) => (scope::cgroup(c)?, None),
     };
     if kind == Kind::Trace && a.duration.is_none() {
         eprintln!(
@@ -1066,6 +1062,7 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
         kind,
         policy,
         a.duration,
+        a.max_events,
         out,
         &stop,
         None,
@@ -1120,6 +1117,7 @@ fn run_loop(
     kind: Kind,
     policy: CapturePolicy,
     duration: Option<Duration>,
+    max_events: Option<u64>,
     out: OutputSink,
     interrupted: &SignalState,
     owned: Option<&mut Owned>,
@@ -1138,7 +1136,16 @@ fn run_loop(
                 OutputSink::Trace(file) => Some(file),
                 _ => None,
             };
-            capture_trace(engine, session, policy, duration, out, interrupted, owned)
+            capture_trace(
+                engine,
+                session,
+                policy,
+                duration,
+                max_events,
+                out,
+                interrupted,
+                owned,
+            )
         }
     }
 }
@@ -1502,6 +1509,7 @@ fn run_owned_inner(args: &RunArgs) -> Result<OwnedRunOutcome> {
         metrics: args.metrics,
         duration: args.duration,
         out: args.out.clone(),
+        max_events: args.max_events,
         unsafe_requested: args.unsafe_requested,
     };
     // Initial capture still uses the one `discover_plan` pass and keeps its
@@ -1583,6 +1591,7 @@ fn run_owned_inner(args: &RunArgs) -> Result<OwnedRunOutcome> {
         args.kind,
         policy,
         args.duration,
+        args.max_events,
         out,
         &stop,
         Some(&mut owned),
@@ -1635,20 +1644,43 @@ fn no_modules_hint(scope: &ScopeArg) -> String {
 /// blocked by `perf_event_paranoid`).
 fn report_attach_failures(session: &Session) {
     for (idx, msg) in session.attach_failures() {
-        eprintln!("attach failed (slot {idx}): {msg}");
+        eprintln!("{}", format_attach_failure(*idx, msg));
     }
     if session.attached_probes() == 0 {
         if let Some((_, first)) = session.attach_failures().first() {
             eprintln!(
-                "p11scope: {}/{} attach attempts failed, every one the same way — this almost \
-                 always means the environment cannot attach BPF uprobes at all: missing \
-                 CAP_BPF/CAP_SYS_ADMIN (or root), a kernel lockdown mode, or a restrictive \
-                 kernel.perf_event_paranoid sysctl. First underlying error: {first}",
-                session.attach_failures().len(),
-                session.attached_probes() + session.attach_failures().len()
+                "{}",
+                format_total_attach_refusal(
+                    session.attach_failures().len(),
+                    session.attached_probes() + session.attach_failures().len(),
+                    first
+                )
             );
         }
     }
+}
+
+/// The per-slot attach diagnostic. The failure message embeds the module's
+/// `/proc/<pid>/maps` filename (attach.rs builds it from `slot.object_path`),
+/// which the target controls, so this terminal boundary escapes control bytes
+/// — the stored `attach_failures` evidence keeps the raw string.
+fn format_attach_failure(slot: u32, message: &str) -> String {
+    format!(
+        "attach failed (slot {slot}): {}",
+        render::escape_controls(message)
+    )
+}
+
+/// The zero-probes summary; `first` is the first per-slot failure message and
+/// carries the same target-controlled path bytes.
+fn format_total_attach_refusal(failed: usize, attempted: usize, first: &str) -> String {
+    format!(
+        "p11scope: {failed}/{attempted} attach attempts failed, every one the same way — this \
+         almost always means the environment cannot attach BPF uprobes at all: missing \
+         CAP_BPF/CAP_SYS_ADMIN (or root), a kernel lockdown mode, or a restrictive \
+         kernel.perf_event_paranoid sysctl. First underlying error: {}",
+        render::escape_controls(first)
+    )
 }
 
 /// Gives unsafe rendering the same diagnostic shape expectations that
@@ -1785,8 +1817,11 @@ fn retire_pause_policy(error: PauseError) -> Result<()> {
     if error.required() || error.lifecycle() {
         return Err(pause_failure(error));
     }
+    // The pause error chain can quote discovery-batch application failures,
+    // which handle target-named records; escape at this terminal boundary too.
     eprintln!(
-        "p11scope: pause: {error}; the capture continues unpaused and reports pause: partial"
+        "p11scope: pause: {}; the capture continues unpaused and reports pause: partial",
+        render::escape_controls(&error.to_string())
     );
     Ok(())
 }
@@ -1835,6 +1870,11 @@ fn tick_sleep(paused: bool, cadence: Duration) {
 
 const PROFILE_CADENCE: Duration = Duration::from_secs(1);
 const TRACE_CADENCE: Duration = Duration::from_millis(200);
+const DEFAULT_TRACE_MAX_EVENTS: u64 = 10_000_000;
+
+fn resolve_trace_max_events(max_events: Option<u64>) -> u64 {
+    max_events.unwrap_or(DEFAULT_TRACE_MAX_EVENTS)
+}
 
 #[allow(clippy::too_many_arguments)]
 fn capture_profile(
@@ -1873,19 +1913,9 @@ fn capture_profile(
                         state: &mut semantics::State,
                         tracker: &mut process::Tracker|
      -> Result<u64> {
+        let quantum = session.live_poll_quantum();
         let mut drain = session.event_drain()?;
-        drain.poll(|ev| {
-            if observe_fork(tracker, state, &ev) {
-                return;
-            }
-            let process = identify_tracked(tracker, state, &ev);
-            state.observe_process(process, &ev);
-            if !state.has_process_state(process) {
-                state.retire_process(process);
-                tracker.retire(process);
-            }
-        });
-        Ok(drain.malformed())
+        Ok(drain_profile_events(&mut drain, state, tracker, quantum))
     };
     let mut malformed_records: u64 = 0;
     let mut stdout_open = true;
@@ -1908,7 +1938,8 @@ fn capture_profile(
         if let Some(end) = capture_end(engine, owned.as_deref(), interrupted, elapsed, duration) {
             break Ok(end);
         }
-        // 3. Drain call events.
+        // 3. Drain call events — one quantum while the producers are live, so
+        //    a hot producer hands control back to step 2's checks every tick.
         if profile {
             malformed_records += drain_events(session, &mut state, &mut process_tracker)?;
         }
@@ -2073,10 +2104,13 @@ fn capture_trace(
     session: &mut Session,
     policy: CapturePolicy,
     duration: Option<Duration>,
+    max_events: Option<u64>,
     out: Option<std::fs::File>,
     interrupted: &SignalState,
     mut owned: Option<&mut Owned>,
 ) -> Result<render::Evidence> {
+    let trace_limit = resolve_trace_max_events(max_events);
+    let mut remaining = Some(trace_limit);
     // A line stream, not a published artifact: opened by the caller before the
     // attach, then appended to as lines arrive.
     let mut out_sink = out;
@@ -2133,9 +2167,12 @@ fn capture_trace(
         if let Some(end) = capture_end(engine, owned.as_deref(), interrupted, elapsed, duration) {
             break Ok(end);
         }
-        // 3. Drain call events.
+        // 3. Drain call events — one quantum while the producers are live, and
+        //    the poll itself stops at the last permitted line, so a hot
+        //    producer can neither hold off step 2's checks nor the limit below.
         malformed_records += drain_trace_events(
             session,
+            &mut remaining,
             &mut state,
             &mut process_tracker,
             &mut tracer,
@@ -2143,6 +2180,9 @@ fn capture_trace(
             &mut stdout_open,
             out_file,
         )?;
+        if remaining == Some(0) {
+            break Ok(CaptureEnd::LimitReached);
+        }
         // 4. Retire exited process state.
         retire_exited(&mut process_tracker, &mut state);
         // 5. Snapshot the loss counter.
@@ -2169,6 +2209,8 @@ fn capture_trace(
     }
     })();
 
+    #[rustfmt::skip]
+    let end =
     finish_capture_loop(
         loop_result,
         engine,
@@ -2185,6 +2227,7 @@ fn capture_trace(
     // on another CPU, so terminal evidence below remains explicitly PARTIAL.
     malformed_records += drain_trace_events(
         session,
+        &mut remaining,
         &mut state,
         &mut process_tracker,
         &mut tracer,
@@ -2212,6 +2255,7 @@ fn capture_trace(
         .check_unchanged()
         .map_err(anyhow::Error::msg)?;
     engine.settle_terminal_drain();
+    let trace_truncated = end == CaptureEnd::LimitReached || remaining == Some(0);
     let mut evidence = evidence_for(
         engine,
         session,
@@ -2224,8 +2268,16 @@ fn capture_trace(
         owned.as_deref(),
     );
     evidence.mark_terminal_drain_unproven();
+    if trace_truncated {
+        emit_trace_line(
+            &trace::truncated_line(trace_limit),
+            stdout,
+            &mut stdout_open,
+            out_file,
+        )?;
+    }
     emit_trace_line(
-        &trace::evidence_line(&evidence, policy),
+        &trace::evidence_line(&evidence, policy, trace_truncated),
         stdout,
         &mut stdout_open,
         out_file,
@@ -2286,11 +2338,58 @@ fn flush_stdout(writer: &mut dyn Write, open: &mut bool) -> Result<()> {
     }
 }
 
-/// Drains whatever the ring buffer currently holds, rendering and
-/// emitting one line per completed call. Returns the malformed-record
-/// count from this drain, to accumulate at the call site.
+fn emit_bounded_trace_event<W: Write, F: FnOnce() -> String>(
+    remaining: &mut Option<u64>,
+    render: F,
+    stdout: &mut dyn Write,
+    stdout_open: &mut bool,
+    out_file: &mut Option<W>,
+) -> (bool, Option<anyhow::Error>) {
+    if matches!(*remaining, Some(0)) {
+        return (false, None);
+    }
+    let line = render();
+    let error = emit_trace_line(&line, stdout, stdout_open, out_file).err();
+    if error.is_none()
+        && let Some(remaining) = remaining.as_mut()
+    {
+        *remaining = (*remaining).saturating_sub(1);
+    }
+    (true, error)
+}
+
+/// One profile poll: `Some(quantum)` on the live ring, `None` once the
+/// producers are detached and the drain is finite. Returns the malformed
+/// count so far.
+fn drain_profile_events<S: crate::events::RecordSource>(
+    drain: &mut crate::events::EventDrain<S>,
+    state: &mut semantics::State,
+    tracker: &mut process::Tracker,
+    quantum: Option<usize>,
+) -> u64 {
+    drain.poll(quantum, |ev| {
+        if observe_fork(tracker, state, &ev) {
+            return ControlFlow::Continue(());
+        }
+        let process = identify_tracked(tracker, state, &ev);
+        state.observe_process(process, &ev);
+        if !state.has_process_state(process) {
+            state.retire_process(process);
+            tracker.retire(process);
+        }
+        ControlFlow::Continue(())
+    });
+    drain.malformed()
+}
+
+/// Drains what the ring buffer currently holds — one quantum on the live
+/// ring, whole after detach — rendering and emitting one line per completed
+/// call. Returns the malformed-record count from this drain, to accumulate at
+/// the call site.
+#[allow(clippy::too_many_arguments)]
 fn drain_trace_events<W: Write>(
     session: &mut Session,
+    remaining: &mut Option<u64>,
     state: &mut semantics::State,
     tracker: &mut process::Tracker,
     tracer: &mut trace::Tracer,
@@ -2298,27 +2397,65 @@ fn drain_trace_events<W: Write>(
     stdout_open: &mut bool,
     out_file: &mut Option<W>,
 ) -> Result<u64> {
+    let quantum = session.live_poll_quantum();
     let mut drain = session.event_drain()?;
+    drain_trace_events_from(
+        &mut drain,
+        remaining,
+        state,
+        tracker,
+        tracer,
+        stdout,
+        stdout_open,
+        out_file,
+        quantum,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_trace_events_from<S: crate::events::RecordSource, W: Write>(
+    drain: &mut crate::events::EventDrain<S>,
+    remaining: &mut Option<u64>,
+    state: &mut semantics::State,
+    tracker: &mut process::Tracker,
+    tracer: &mut trace::Tracer,
+    stdout: &mut dyn Write,
+    stdout_open: &mut bool,
+    out_file: &mut Option<W>,
+    quantum: Option<usize>,
+) -> Result<u64> {
     let mut write_error = None;
-    drain.poll(|ev| {
+    drain.poll(quantum, |ev| {
         if observe_fork(tracker, state, &ev) {
-            return;
+            return ControlFlow::Continue(());
         }
         let process = identify_tracked(tracker, state, &ev);
-        if write_error.is_none() {
-            write_error = emit_trace_line(
-                &tracer.on_event_process(&ev, process, state),
+        if write_error.is_some() {
+            state.observe_process(process, &ev);
+        } else {
+            let (emitted, error) = emit_bounded_trace_event(
+                remaining,
+                || tracer.on_event_process(&ev, process, state),
                 stdout,
                 stdout_open,
                 out_file,
-            )
-            .err();
-        } else {
-            state.observe_process(process, &ev);
+            );
+            write_error = error;
+            if !emitted {
+                state.observe_process(process, &ev);
+            }
         }
         if !state.has_process_state(process) {
             state.retire_process(process);
             tracker.retire(process);
+        }
+        // Live only: the last permitted line ends the capture, and what is
+        // still queued waits for the post-detach terminal drain, which reads
+        // the ring whole for semantics regardless of the limit.
+        if quantum.is_some() && matches!(*remaining, Some(0)) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
     });
     if let Some(error) = write_error {
@@ -2535,6 +2672,24 @@ mod tests {
             assert!(Instant::now() < deadline, "{message}");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn attach_failure_diagnostics_escape_target_controls() {
+        let message = format_attach_failure(3, "p11_hook at /opt/p\u{1b}[2Jevil\r.so+0x10: EPERM");
+        assert_eq!(
+            message,
+            r"attach failed (slot 3): p11_hook at /opt/p\u{1b}[2Jevil\r.so+0x10: EPERM"
+        );
+        assert!(!message.contains('\u{1b}') && !message.contains('\r'));
+    }
+
+    #[test]
+    fn total_attach_refusal_summary_escapes_target_controls() {
+        let message = format_total_attach_refusal(2, 2, "at /opt/p\u{1b}[2Jevil\r.so: EPERM");
+        assert!(message.starts_with("p11scope: 2/2 attach attempts failed"));
+        assert!(message.ends_with(r"First underlying error: at /opt/p\u{1b}[2Jevil\r.so: EPERM"));
+        assert!(!message.contains('\u{1b}') && !message.contains('\r'));
     }
 
     #[test]
@@ -2869,6 +3024,14 @@ mod tests {
                 true,
                 false,
                 Some(libc::SIGTERM),
+                Some(128 + libc::SIGTERM),
+            ),
+            (
+                "/bin/sleep",
+                CaptureEnd::LimitReached,
+                true,
+                false,
+                None,
                 Some(128 + libc::SIGTERM),
             ),
             (
@@ -3314,6 +3477,7 @@ mod tests {
             metrics: false,
             duration: None,
             out: None,
+            max_events: None,
             unsafe_requested: false,
             pause,
             kill_on_timeout: false,
@@ -3419,6 +3583,200 @@ mod tests {
         }
     }
 
+    fn call_event() -> p11scope_ebpf_common::Event {
+        p11scope_ebpf_common::Event {
+            event_type: p11scope_ebpf_common::event_type::CALL,
+            pid_tgid: u64::from(std::process::id()) << 32,
+            ..Default::default()
+        }
+    }
+
+    /// One event past the quantum, then a record the live profile poll must
+    /// never take: the loop's duration/signal check runs between quanta.
+    #[test]
+    fn a_live_profile_poll_returns_at_its_quantum_with_the_backlog_still_queued() {
+        use crate::events::{EventDrain, LIVE_POLL_QUANTUM, ScriptedRecords};
+        let plan = crate::plan::AttachPlan::from_slots(vec![]);
+        let mut state = semantics::State::new(&plan);
+        let mut tracker = process::Tracker::new();
+        let events = (0..=LIVE_POLL_QUANTUM).map(|_| call_event());
+        let mut drain = EventDrain::over(ScriptedRecords::events(events, LIVE_POLL_QUANTUM));
+
+        let malformed = drain_profile_events(
+            &mut drain,
+            &mut state,
+            &mut tracker,
+            Some(LIVE_POLL_QUANTUM),
+        );
+
+        assert_eq!(malformed, 0);
+        assert_eq!(drain.source().remaining(), 1);
+    }
+
+    fn trace_fixture() -> (semantics::State, process::Tracker, trace::Tracer) {
+        let plan = crate::plan::AttachPlan::from_slots(vec![]);
+        (
+            semantics::State::new(&plan),
+            process::Tracker::new(),
+            trace::Tracer::new(&plan),
+        )
+    }
+
+    /// `--max-events` is a stop, not a filter: at zero the live poll breaks
+    /// and the run loop ends the capture; what is still queued waits for the
+    /// post-detach terminal drain.
+    #[test]
+    fn a_live_trace_poll_stops_at_the_last_permitted_line() {
+        use crate::events::{EventDrain, LIVE_POLL_QUANTUM, ScriptedRecords};
+        let (mut state, mut tracker, mut tracer) = trace_fixture();
+        let mut remaining = Some(2);
+        let mut stdout = Vec::new();
+        let mut stdout_open = true;
+        let mut out_file: Option<Vec<u8>> = None;
+        let events = (0..5).map(|_| call_event());
+        let mut drain = EventDrain::over(ScriptedRecords::events(events, 2));
+
+        let malformed = drain_trace_events_from(
+            &mut drain,
+            &mut remaining,
+            &mut state,
+            &mut tracker,
+            &mut tracer,
+            &mut stdout,
+            &mut stdout_open,
+            &mut out_file,
+            Some(LIVE_POLL_QUANTUM),
+        )
+        .unwrap();
+
+        assert_eq!(malformed, 0);
+        assert_eq!(remaining, Some(0));
+        assert_eq!(stdout.iter().filter(|byte| **byte == b'\n').count(), 2);
+        assert_eq!(
+            drain.source().remaining(),
+            3,
+            "the rest waits for the terminal drain"
+        );
+    }
+
+    /// The live trace poll also yields at the quantum while lines remain.
+    #[test]
+    fn a_live_trace_poll_returns_at_its_quantum_with_lines_still_permitted() {
+        use crate::events::{EventDrain, LIVE_POLL_QUANTUM, ScriptedRecords};
+        let (mut state, mut tracker, mut tracer) = trace_fixture();
+        let mut remaining = Some(u64::MAX);
+        let mut stdout = Vec::new();
+        let mut stdout_open = true;
+        let mut out_file: Option<Vec<u8>> = None;
+        let events = (0..=LIVE_POLL_QUANTUM).map(|_| call_event());
+        let mut drain = EventDrain::over(ScriptedRecords::events(events, LIVE_POLL_QUANTUM));
+
+        drain_trace_events_from(
+            &mut drain,
+            &mut remaining,
+            &mut state,
+            &mut tracker,
+            &mut tracer,
+            &mut stdout,
+            &mut stdout_open,
+            &mut out_file,
+            Some(LIVE_POLL_QUANTUM),
+        )
+        .unwrap();
+
+        assert_eq!(drain.source().remaining(), 1);
+        assert_eq!(remaining, Some(u64::MAX - LIVE_POLL_QUANTUM as u64));
+    }
+
+    /// After detach the drain is finite and reads the ring whole: past the
+    /// limit nothing more is printed, but every record still reaches semantics.
+    #[test]
+    fn the_terminal_trace_drain_reads_the_ring_whole_past_the_limit() {
+        use crate::events::{EventDrain, ScriptedRecords};
+        let (mut state, mut tracker, mut tracer) = trace_fixture();
+        let mut remaining = Some(0);
+        let mut stdout = Vec::new();
+        let mut stdout_open = true;
+        let mut out_file: Option<Vec<u8>> = None;
+        let events = (0..crate::events::LIVE_POLL_QUANTUM + 5).map(|_| call_event());
+        let mut drain = EventDrain::over(ScriptedRecords::events(events, usize::MAX));
+
+        drain_trace_events_from(
+            &mut drain,
+            &mut remaining,
+            &mut state,
+            &mut tracker,
+            &mut tracer,
+            &mut stdout,
+            &mut stdout_open,
+            &mut out_file,
+            None,
+        )
+        .unwrap();
+
+        assert!(stdout.is_empty());
+        assert_eq!(remaining, Some(0));
+        assert_eq!(drain.source().remaining(), 0);
+    }
+
+    /// Both loops take their poll bound from the session — the quantum while
+    /// the producers are live, whole only once `detach_producers` detached
+    /// them all — so duration, signal and the line limit are checked between
+    /// quanta and the terminal drain still reads the detached ring whole.
+    #[test]
+    fn every_events_poll_takes_its_bound_from_the_session() {
+        let run = include_str!("run.rs");
+        let run = run.split_once("#[cfg(test)]\nmod tests {").unwrap().0;
+        assert_eq!(
+            run.matches("let quantum = session.live_poll_quantum();")
+                .count(),
+            2,
+            "one bound decision per drain wrapper, taken before the ring is opened"
+        );
+        assert_eq!(
+            run.matches(".poll(quantum, |ev|").count(),
+            2,
+            "both event polls carry that bound"
+        );
+        let attach = include_str!("attach.rs");
+        let detach = attach.split_once("pub fn detach_producers(").unwrap().1;
+        let detach = detach.split_once("fn has_slot_link").unwrap().0;
+        assert!(
+            detach.contains("self.producers_detached = detached.is_ok();"),
+            "only a fully successful detach makes the ring finite"
+        );
+    }
+
+    #[test]
+    fn stdout_truncation_with_max_events_one_and_bounded_file_trace_is_cumulative() {
+        let mut remaining = Some(1);
+        let mut stdout = Vec::new();
+        let mut stdout_open = true;
+        let mut file = Some(Vec::new());
+
+        let (emitted, error) = emit_bounded_trace_event(
+            &mut remaining,
+            || "event-1".to_string(),
+            &mut stdout,
+            &mut stdout_open,
+            &mut file,
+        );
+        assert!(emitted);
+        assert!(error.is_none());
+        let (emitted, error) = emit_bounded_trace_event(
+            &mut remaining,
+            || "event-2".to_string(),
+            &mut stdout,
+            &mut stdout_open,
+            &mut file,
+        );
+        assert!(!emitted);
+        assert!(error.is_none());
+        assert_eq!(remaining, Some(0));
+        assert_eq!(stdout, b"event-1\n");
+        assert_eq!(file.as_deref(), Some(&b"event-1\n"[..]));
+    }
+
     /// build.rs must embed the real cross-compiled BPF object, never a
     /// placeholder byte array — a stub would silently break every attach.
     #[test]
@@ -3502,9 +3860,15 @@ mod tests {
     fn capture_end_only_allows_handoff_for_clean_duration_expiry() {
         assert!(CaptureEnd::DurationExpired.allows_handoff(false));
         assert!(!CaptureEnd::DurationExpired.allows_handoff(true));
+        assert!(!CaptureEnd::LimitReached.allows_handoff(false));
         assert!(!CaptureEnd::TargetExit.allows_handoff(false));
         assert!(!CaptureEnd::Signal.allows_handoff(false));
         assert!(!CaptureEnd::Error.allows_handoff(false));
+    }
+
+    #[test]
+    fn default_trace_bound_resolver_none_is_10m() {
+        assert_eq!(resolve_trace_max_events(None), 10_000_000);
     }
 
     #[test]
@@ -3579,6 +3943,9 @@ mod tests {
     #[test]
     fn shutdown_path_publishes_valid_json_over_a_stale_file() {
         let dir = tempfile::tempdir().unwrap();
+        let mut permissions = std::fs::metadata(dir.path()).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(dir.path(), permissions).unwrap();
         let path = dir.path().join("observed.json");
         std::fs::write(&path, b"stale trailing bytes that must disappear").unwrap();
         let j = serde_json::json!({"schema": "pkcs11-scope/observed-profile/v2", "evidence": {}});

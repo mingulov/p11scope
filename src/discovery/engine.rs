@@ -16,7 +16,7 @@ use crate::discovery::identity::{
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::scan::{
     CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
-    ScannedTable, Skipped, scan_process_view, spans_for,
+    ScannedTable, Skipped, index_maps_or_refuse, read_maps_or_refuse, scan_process_view, spans_for,
 };
 use crate::manifest_input::{read_manifest, validate_structure};
 use crate::process::{self, ProcessView, ProcessViewId};
@@ -32,10 +32,9 @@ use p11scope_ebpf_common::{
 };
 use p11scope_manifest::elf::ElfSnapshot;
 use p11scope_manifest::manifest::{Acquisition, Manifest, Resolution, SCHEMA, WalkOutcome};
-use p11scope_manifest::maps::{
-    Device, MapEntry, MappedPath, ObjectKey, Resolved, parse_maps, resolve,
-};
+use p11scope_manifest::maps::{Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved};
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
@@ -1172,6 +1171,9 @@ pub(crate) struct IncompleteTerminalDrain {
     pub(crate) records: Vec<DiscoveryRecord>,
     pub(crate) malformed: u64,
     pub(crate) unvalidated_records: u64,
+    /// The drain stopped at its work quantum, not on a failure: the prefix is
+    /// exact and the rest is still queued on the ring for the next drain.
+    pub(crate) backlog: bool,
     cause: String,
 }
 
@@ -1186,7 +1188,18 @@ impl IncompleteTerminalDrain {
             records,
             malformed,
             unvalidated_records,
+            backlog: false,
             cause: cause.to_string(),
+        }
+    }
+
+    fn backlog(records: Vec<DiscoveryRecord>, malformed: u64) -> Self {
+        Self {
+            records,
+            malformed,
+            unvalidated_records: 0,
+            backlog: true,
+            cause: DISCOVERY_DRAIN_BACKLOG_REASON.into(),
         }
     }
 }
@@ -1198,6 +1211,7 @@ impl std::fmt::Debug for IncompleteTerminalDrain {
             .field("records", &self.records.len())
             .field("malformed", &self.malformed)
             .field("unvalidated_records", &self.unvalidated_records)
+            .field("backlog", &self.backlog)
             .field("cause", &self.cause)
             .finish()
     }
@@ -2139,14 +2153,19 @@ fn corroboration_corroborates(outcome: Corroboration) -> bool {
 }
 
 fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
-    let path = match scope {
+    let (path, io_root) = match scope {
         Scope::Pid(pid) => return (vec![*pid], Vec::new()),
-        Scope::Cgroup { path, .. } => path,
+        Scope::Cgroup { path, dir, .. } => (
+            path.as_path(),
+            PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())),
+        ),
     };
     let mut pids = Vec::new();
     let mut lost = Vec::new();
-    let mut stack = vec![path.clone()];
-    while let Some(dir) = stack.pop() {
+    let mut stack = vec![PathBuf::new()];
+    while let Some(relative) = stack.pop() {
+        let dir = io_root.join(&relative);
+        let label_dir = path.join(&relative);
         match std::fs::read_to_string(dir.join("cgroup.procs")) {
             Ok(text) => pids.extend(
                 text.lines()
@@ -2157,7 +2176,7 @@ fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
             // permission, I/O — means processes exist here that were never listed.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => lost.push(Skipped {
-                subject: dir.display().to_string(),
+                subject: label_dir.display().to_string(),
                 reason: format!(
                     "cgroup.procs could not be read ({error}); no process of this cgroup \
                      was scanned"
@@ -2171,7 +2190,7 @@ fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
                         Ok(entry) => entry,
                         Err(error) => {
                             lost.push(Skipped {
-                                subject: dir.display().to_string(),
+                                subject: label_dir.display().to_string(),
                                 reason: format!(
                                     "a cgroup directory entry could not be read ({error}); membership absence is not authoritative"
                                 ),
@@ -2179,11 +2198,12 @@ fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
                             continue;
                         }
                     };
+                    let relative_entry = relative.join(entry.file_name());
                     match entry.file_type() {
-                        Ok(kind) if kind.is_dir() => stack.push(entry.path()),
+                        Ok(kind) if kind.is_dir() => stack.push(relative_entry),
                         Ok(_) => {}
                         Err(error) => lost.push(Skipped {
-                            subject: entry.path().display().to_string(),
+                            subject: path.join(&relative_entry).display().to_string(),
                             reason: format!(
                                 "a cgroup directory entry type could not be read ({error}); membership absence is not authoritative"
                             ),
@@ -2197,7 +2217,7 @@ fn scope_pids(scope: &Scope) -> (Vec<u32>, Vec<Skipped>) {
             // parent's listing and this read held no process to lose.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => lost.push(Skipped {
-                subject: dir.display().to_string(),
+                subject: label_dir.display().to_string(),
                 reason: format!(
                     "the cgroup directory could not be listed ({error}); any process \
                      below it was never discovered"
@@ -2262,8 +2282,8 @@ fn scan_and_pin(
     // document claiming a clean capture.
     for skipped in outcome.skipped().iter().chain(&pin_skips) {
         eprintln!(
-            "p11scope: discovery skipped {} — {}",
-            skipped.subject, skipped.reason
+            "{}",
+            format_discovery_skip(&skipped.subject, &skipped.reason)
         );
         attribution::note(skipped);
         counters.object_skips.push(skipped.clone());
@@ -2407,8 +2427,8 @@ fn discover_plan(
     discovered.counters.report_notes();
     for refused in &discovered.plan.modules_skipped {
         eprintln!(
-            "p11scope: module refused: {} — {}",
-            refused.subject, refused.reason
+            "{}",
+            format_module_refusal(&refused.subject, &refused.reason)
         );
     }
     discovered.counters.report(&discovered.plan);
@@ -2758,6 +2778,15 @@ const STALE_VIEW_REASON: &str = "accepted process generation changed during atta
 /// *retry*, so it is only true while the journal that owes it is still
 /// pending; `settle_terminal_drain` judges it at capture end.
 const TERMINAL_DRAIN_SUBJECT: &str = "live loader retirement";
+/// Records one live drain takes off the private discovery ring before it
+/// returns to a caller that checks duration, signal and pause deadline. The
+/// 64 KiB ring holds ~73 records, so a drain stopped here has emptied the
+/// ring several times over and leaves only what the producer wrote during the
+/// drain itself; that backlog is reported as an incomplete drain, never as an
+/// empty ring, and any overflow it causes is the producer's `ring_loss`.
+pub(crate) const LIVE_DISCOVERY_DRAIN_QUANTUM: usize = 256;
+const DISCOVERY_DRAIN_BACKLOG_REASON: &str =
+    "the live discovery drain stopped at its work quantum with records still queued";
 const TERMINAL_DRAIN_RETRY_REASON: &str = "the post-detach private discovery drain failed; the exact terminal batch remains \
      tombstoned for retry";
 
@@ -2770,6 +2799,29 @@ const UNREADABLE_MEMBER_SUBJECT: &str = "process view";
 const UNREADABLE_MEMBER_REASON: &str = "a process in scope could not be retained or scanned before it changed; a provider \
      only that generation mapped was never discovered";
 
+fn format_discovery_skip(subject: &str, reason: &str) -> String {
+    format!(
+        "p11scope: discovery skipped {} — {}",
+        render::escape_controls(subject),
+        render::escape_controls(reason)
+    )
+}
+
+fn format_unreadable_member(pid: u32, detail: &str) -> String {
+    format!(
+        "p11scope: discovery skipped pid {pid}: {}",
+        render::escape_controls(detail)
+    )
+}
+
+fn format_module_refusal(subject: &str, reason: &str) -> String {
+    format!(
+        "p11scope: module refused: {} — {}",
+        render::escape_controls(subject),
+        render::escape_controls(reason)
+    )
+}
+
 /// One member of the scope discovery could not read. `None` when the
 /// generation is *provably* gone — the ordinary end of a process, on the same
 /// authority `queue_retirement` and the live-record rule already use, and
@@ -2779,7 +2831,7 @@ fn unreadable_member_skip(pid: u32, gone: bool, detail: &str) -> Option<Skipped>
     if gone {
         return None;
     }
-    eprintln!("p11scope: discovery skipped pid {pid}: {detail}");
+    eprintln!("{}", format_unreadable_member(pid, detail));
     Some(Skipped {
         subject: UNREADABLE_MEMBER_SUBJECT.into(),
         reason: UNREADABLE_MEMBER_REASON.into(),
@@ -3656,7 +3708,7 @@ fn name_class(class: u8) -> &'static str {
 /// names remain private inputs to the candidate transaction.
 fn lower_export_record(
     view: &ProcessView,
-    maps: &[MapEntry],
+    maps: &MapIndex<'_>,
     hooks: &HookRegistry,
     record: &DiscoveryRecord,
     budget: &mut CaptureWorkBudget,
@@ -3679,14 +3731,23 @@ fn lower_export_record(
     if !view.still_the_same() {
         return Err("process generation changed before export lowering".into());
     }
+    // The live path's one clock poll per record: nothing between the bounded
+    // snapshot read and this decode polls the batch deadline, and a sticky stop
+    // another consumer of the one budget left must refuse the record here — the
+    // caller publishes either as live loss. Admission below refuses on the
+    // sticky stop too; a decode ceiling stays the count-only outcome it was.
+    if let Some(reason) = budget.stopped_now() {
+        return Err(reason.into());
+    }
 
+    budget.spend(1)?;
     let Resolved::File {
         path: MappedPath::Usable(owner_path),
         device: owner_device,
         inode: owner_inode,
         permissions: owner_permissions,
         ..
-    } = resolve(maps, record.table_ptr)
+    } = maps.resolve(record.table_ptr)
     else {
         return Ok(None);
     };
@@ -3723,6 +3784,7 @@ fn lower_export_record(
             null_entries.push(field.name);
             continue;
         }
+        budget.spend(1)?;
         let Resolved::File {
             path: MappedPath::Usable(path),
             file_offset,
@@ -3730,7 +3792,7 @@ fn lower_export_record(
             inode,
             permissions,
             ..
-        } = resolve(maps, pointer)
+        } = maps.resolve(pointer)
         else {
             return Ok(None);
         };
@@ -3827,8 +3889,8 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
     }
 }
 
-fn usable_path(maps: &[MapEntry], mapping: &MapEntry) -> Option<PathBuf> {
-    match resolve(maps, mapping.start) {
+fn usable_path(maps: &MapIndex<'_>, mapping: &MapEntry) -> Option<PathBuf> {
+    match maps.resolve(mapping.start) {
         Resolved::File {
             path: MappedPath::Usable(path),
             inode,
@@ -3839,11 +3901,12 @@ fn usable_path(maps: &[MapEntry], mapping: &MapEntry) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-fn exact_executable_mapping(
-    maps: &[MapEntry],
+fn exact_executable_mapping<'a>(
+    maps: &MapIndex<'a>,
     identity: ObjectKey,
-) -> Option<(&MapEntry, PathBuf)> {
-    maps.iter()
+) -> Option<(&'a MapEntry, PathBuf)> {
+    maps.entries()
+        .iter()
         .filter(|mapping| mapping.permissions[2] == b'x' && ObjectKey::of(mapping) == identity)
         .find_map(|mapping| usable_path(maps, mapping).map(|path| (mapping, path)))
 }
@@ -3980,14 +4043,21 @@ fn read_bounded_interpreter(
 }
 
 fn executable_map_snapshot(
-    maps: &[MapEntry],
+    maps: &MapIndex<'_>,
     identity: ObjectKey,
+    budget: &mut CaptureWorkBudget,
 ) -> std::result::Result<Vec<(MapEntry, PathBuf)>, String> {
-    let mappings: Vec<_> = maps
-        .iter()
-        .filter(|mapping| mapping.permissions[2] == b'x' && ObjectKey::of(mapping) == identity)
-        .filter_map(|mapping| usable_path(maps, mapping).map(|path| (mapping.clone(), path)))
-        .collect();
+    let mut mappings = Vec::new();
+    for mapping in maps.entries() {
+        budget.spend(1)?;
+        if mapping.permissions[2] != b'x' || ObjectKey::of(mapping) != identity {
+            continue;
+        }
+        budget.spend(1)?;
+        if let Some(path) = usable_path(maps, mapping) {
+            mappings.push((mapping.clone(), path));
+        }
+    }
     if mappings.is_empty() {
         return Err("retained executable has no usable executable mapping".into());
     }
@@ -3995,14 +4065,17 @@ fn executable_map_snapshot(
 }
 
 fn loader_map_snapshot(
-    maps: &[MapEntry],
+    maps: &MapIndex<'_>,
     identity: ObjectKey,
+    budget: &mut CaptureWorkBudget,
 ) -> std::result::Result<(PathBuf, Vec<MapEntry>), String> {
     let mut by_path: BTreeMap<PathBuf, Vec<MapEntry>> = BTreeMap::new();
-    for mapping in maps
-        .iter()
-        .filter(|mapping| mapping.permissions[2] == b'x' && ObjectKey::of(mapping) == identity)
-    {
+    for mapping in maps.entries() {
+        budget.spend(1)?;
+        if mapping.permissions[2] != b'x' || ObjectKey::of(mapping) != identity {
+            continue;
+        }
+        budget.spend(1)?;
         if let Some(path) = usable_path(maps, mapping) {
             by_path.entry(path).or_default().push(mapping.clone());
         }
@@ -4844,17 +4917,27 @@ impl Engine {
         }
     }
 
-    fn read_maps(view: &ProcessView) -> Result<Vec<MapEntry>> {
+    /// The live path's `/proc/<pid>/maps` snapshot: the scan path's bounded
+    /// reader, refused whole when any ceiling or the batch deadline cuts it
+    /// (`read_maps_or_refuse`). Every caller turns `Err` into a refused
+    /// record or an unarmed view, never into a decision on a shorter map.
+    fn read_maps(view: &ProcessView, budget: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>> {
         let pid = view.pid();
-        let bytes = view
-            .run_while_same(|| std::fs::read(format!("/proc/{pid}/maps")))
-            .map_err(anyhow::Error::msg)??;
-        parse_maps(&bytes).map_err(anyhow::Error::msg)
+        view.run_while_same(|| {
+            let maps = std::fs::File::open(format!("/proc/{pid}/maps"))
+                .map_err(|error| error.to_string())?;
+            read_maps_or_refuse(maps, budget, crate::attach::monotonic_ns)
+        })
+        .map_err(anyhow::Error::msg)?
+        .map_err(anyhow::Error::msg)
     }
 
-    fn loader_locator(view: &ProcessView) -> Result<Option<LoaderLocator>> {
+    fn loader_locator(
+        view: &ProcessView,
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<Option<LoaderLocator>> {
         let pid = view.pid();
-        let before_maps = Self::read_maps(view)?;
+        let before_maps = Self::read_maps(view, budget)?;
         let executable_path = PathBuf::from(format!("/proc/{pid}/exe"));
         let before_executable =
             view_object_key(view, &executable_path).map_err(anyhow::Error::msg)?;
@@ -4884,16 +4967,21 @@ impl Engine {
             None
         };
 
-        let after_maps = Self::read_maps(view)?;
+        let after_maps = Self::read_maps(view, budget)?;
         let after_executable =
             view_object_key(view, &executable_path).map_err(anyhow::Error::msg)?;
         if before_executable != retained_executable || retained_executable != after_executable {
             bail!("retained executable identity changed during PT_INTERP discovery");
         }
-        let before_executable_maps = executable_map_snapshot(&before_maps, retained_executable)
-            .map_err(anyhow::Error::msg)?;
-        let after_executable_maps = executable_map_snapshot(&after_maps, retained_executable)
-            .map_err(anyhow::Error::msg)?;
+        let before_index =
+            index_maps_or_refuse(&before_maps, budget).map_err(anyhow::Error::msg)?;
+        let after_index = index_maps_or_refuse(&after_maps, budget).map_err(anyhow::Error::msg)?;
+        let before_executable_maps =
+            executable_map_snapshot(&before_index, retained_executable, budget)
+                .map_err(anyhow::Error::msg)?;
+        let after_executable_maps =
+            executable_map_snapshot(&after_index, retained_executable, budget)
+                .map_err(anyhow::Error::msg)?;
         if before_executable_maps != after_executable_maps {
             bail!("retained executable mappings changed during PT_INTERP discovery");
         }
@@ -4903,9 +4991,9 @@ impl Engine {
         let (interpreter_file, loader_key) =
             interpreter_file.expect("a PT_INTERP snapshot has its retained file identity");
         let (before_loader_path, before_loader_maps) =
-            loader_map_snapshot(&before_maps, loader_key).map_err(anyhow::Error::msg)?;
+            loader_map_snapshot(&before_index, loader_key, budget).map_err(anyhow::Error::msg)?;
         let (loader_path, loader_maps) =
-            loader_map_snapshot(&after_maps, loader_key).map_err(anyhow::Error::msg)?;
+            loader_map_snapshot(&after_index, loader_key, budget).map_err(anyhow::Error::msg)?;
         if before_loader_path != loader_path || before_loader_maps != loader_maps {
             bail!("retained loader mappings changed during PT_INTERP discovery");
         }
@@ -4924,12 +5012,17 @@ impl Engine {
         }))
     }
 
+    /// Takes at most `LIVE_DISCOVERY_DRAIN_QUANTUM` items off the private
+    /// ring, which refills while it is read. `Ok` means the ring read empty; a
+    /// quantum stop is an `IncompleteTerminalDrain` with `backlog` set, so no
+    /// route can mistake it for an empty ring, and the terminal routes retain
+    /// its exact prefix as an incomplete batch until a later drain reads empty.
     fn collect_discovery_records(
         session: &mut dyn EngineSession,
     ) -> Result<(Vec<DiscoveryRecord>, u64)> {
         let mut records = Vec::new();
         let mut malformed = 0u64;
-        loop {
+        for _ in 0..LIVE_DISCOVERY_DRAIN_QUANTUM {
             match session.discovery_dequeue() {
                 Ok(Some(crate::events::DiscoveryItem::Record(record))) => records.push(record),
                 Ok(Some(crate::events::DiscoveryItem::Malformed)) => {
@@ -4943,6 +5036,28 @@ impl Engine {
                     return Err(IncompleteTerminalDrain::new(records, malformed, 0, error).into());
                 }
             }
+        }
+        Err(IncompleteTerminalDrain::backlog(records, malformed).into())
+    }
+
+    /// Every dequeue is capture-wide work, charged where the records enter the
+    /// Engine. They are already off the ring, so a refused charge never drops
+    /// them: the sticky stop it leaves is what the budget's other consumers
+    /// refuse on and publish under its own reason.
+    fn charge_discovery_drain(&mut self, records: usize, malformed: u64) {
+        let units = (records as u64).saturating_add(malformed);
+        if units != 0 {
+            self.budget.charge(units);
+        }
+        // The drain quantum returns to its caller here, so this is the live
+        // collector path's one clock poll per quantum: a batch deadline that
+        // expired during the drain stops the capture at this boundary instead
+        // of one whole batch later. A refused charge is published exactly once,
+        // under whichever ceiling actually stopped it — never mislabelled.
+        if self.budget.stopped_now().is_some()
+            && let Some(reason) = self.budget.take_scan_stop_reason()
+        {
+            self.mark_live_loss("live discovery drain", reason);
         }
     }
 
@@ -5661,8 +5776,10 @@ impl Engine {
         };
         let lowered = {
             let view = &self.views[position];
-            let maps = Self::read_maps(view)?;
-            lower_export_record(view, &maps, &self.hooks, record, &mut self.budget)
+            let maps = Self::read_maps(view, &mut self.budget)?;
+            let index =
+                index_maps_or_refuse(&maps, &mut self.budget).map_err(|error| anyhow!(error))?;
+            lower_export_record(view, &index, &self.hooks, record, &mut self.budget)
         };
         let Some(lowered) = lowered.map_err(|error| anyhow!(error))? else {
             self.mark_live_loss(
@@ -5749,12 +5866,12 @@ impl Engine {
             ));
         };
         let loader = context.spec.loader;
-        let maps = Self::read_maps(&self.views[position])?;
+        let maps = Self::read_maps(&self.views[position], &mut self.budget)?;
+        let index =
+            index_maps_or_refuse(&maps, &mut self.budget).map_err(|error| anyhow!(error))?;
         let view_id = self.views[position].id();
-        let Some(mapping) = maps
-            .iter()
-            .find(|mapping| (mapping.start..mapping.end).contains(&record.table_ptr))
-        else {
+        self.budget.spend(1).map_err(|reason| anyhow!(reason))?;
+        let Some(mapping) = index.containing(record.table_ptr) else {
             // The same exec transition the identity check below already
             // excuses, one step earlier: replacing the whole image usually
             // leaves the hit's address resolving to *nothing*, not to a moved
@@ -5762,6 +5879,11 @@ impl Engine {
             // re-arms it, so the rejection costs the capture no observation —
             // only its causal timing proof — so, exactly as in the identity
             // branch below, it is counted by nothing either.
+            // The exec-transition proof scans the snapshot linearly: charge that
+            // pass like every other live map iteration. A refused charge leaves
+            // the sticky stop for the budget's consumers, exactly as at the
+            // drain sink — it never changes this record's rejection.
+            self.budget.charge(maps.len() as u64);
             if self.exec_replaced_the_armed_image(&context.spec, view_id, pid, &maps, pending_views)
             {
                 self.invalidate_causal_timing();
@@ -6201,7 +6323,7 @@ impl Engine {
             return Ok(false);
         }
         let pid = self.views[position].pid();
-        let Some(locator) = Self::loader_locator(&self.views[position])? else {
+        let Some(locator) = Self::loader_locator(&self.views[position], &mut self.budget)? else {
             return Ok(false);
         };
         let loader_path = locator.authority.loader_path.clone();
@@ -6318,12 +6440,14 @@ impl Engine {
             || {
                 self.views[position].still_the_same()
                     && self.pinned.check_unchanged().unwrap_or(false)
-                    && Self::loader_locator(&self.views[position]).is_ok_and(|current| {
-                        current.is_some_and(|current| {
-                            current.authority == locator.authority
-                                && current.maps.contains(&loader_mapping)
-                        })
-                    })
+                    && Self::loader_locator(&self.views[position], &mut self.budget).is_ok_and(
+                        |current| {
+                            current.is_some_and(|current| {
+                                current.authority == locator.authority
+                                    && current.maps.contains(&loader_mapping)
+                            })
+                        },
+                    )
             },
             || {
                 session.attach_dynamic_loader(
@@ -6793,8 +6917,11 @@ impl Engine {
             .terminal_batch
             .as_mut()
             .ok_or_else(|| anyhow!("terminal loader drain batch is missing"))?;
+        let before = batch.records.len();
         batch.extend(records);
         batch.complete = complete;
+        let added = batch.records.len() - before;
+        self.charge_discovery_drain(added, malformed);
         if malformed != 0 {
             self.record_malformed_discovery(malformed);
         }
@@ -8277,8 +8404,22 @@ impl Engine {
     /// semantic consumers immediately when this reports a plan change, before
     /// draining the ordinary event ring.
     pub fn drain_discovery(&mut self, session: &mut Session) -> Result<bool> {
-        let (records, malformed) =
-            Self::collect_discovery_records(session).map_err(Self::generic_drain_error)?;
+        self.drain_discovery_from(session)
+    }
+
+    /// A quantum stop is backlog, not failure: the exact prefix is applied now
+    /// and the rest stays on the ring for the next tick, which the run loop's
+    /// duration/signal checks precede. Overflow in between is the producer's
+    /// `ring_loss`, read with every batch.
+    pub(crate) fn drain_discovery_from(&mut self, session: &mut dyn EngineSession) -> Result<bool> {
+        let (records, malformed) = match Self::collect_discovery_records(session) {
+            Ok(drained) => drained,
+            Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
+                Ok(incomplete) if incomplete.backlog => (incomplete.records, incomplete.malformed),
+                Ok(incomplete) => return Err(Self::generic_drain_error(incomplete.into())),
+                Err(error) => return Err(error),
+            },
+        };
         self.apply_discovery_batch(session, records, malformed)
     }
 
@@ -8300,10 +8441,19 @@ impl Engine {
         malformed: u64,
     ) -> Result<bool> {
         let mut collect = Self::collect_discovery_records;
-        self.apply_discovery_batch_with(session, records, malformed, true, false, &mut collect)
-            .map(|outcome| outcome.changed)
+        self.apply_discovery_batch_with(
+            session,
+            records,
+            malformed,
+            true,
+            false,
+            &mut collect,
+            None,
+        )
+        .map(|outcome| outcome.changed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_discovery_batch_with(
         &mut self,
         session: &mut dyn EngineSession,
@@ -8312,7 +8462,31 @@ impl Engine {
         additions_allowed: bool,
         terminal_dispatch: bool,
         collect: &mut DiscoveryCollector<'_>,
+        deadline: Option<u64>,
     ) -> Result<DiscoveryBatchOutcome> {
+        self.budget.set_deadline(deadline);
+        let result = self.apply_discovery_batch_inner(
+            session,
+            records,
+            malformed,
+            additions_allowed,
+            terminal_dispatch,
+            collect,
+        );
+        self.budget.set_deadline(None);
+        result
+    }
+
+    fn apply_discovery_batch_inner(
+        &mut self,
+        session: &mut dyn EngineSession,
+        records: Vec<DiscoveryRecord>,
+        malformed: u64,
+        additions_allowed: bool,
+        terminal_dispatch: bool,
+        collect: &mut DiscoveryCollector<'_>,
+    ) -> Result<DiscoveryBatchOutcome> {
+        self.charge_discovery_drain(records.len(), malformed);
         let mut queued = std::mem::take(&mut self.pending_discovery_records);
         queued.extend(records.into_iter().map(|record| QueuedDiscoveryRecord {
             record,
@@ -8899,6 +9073,12 @@ impl Engine {
         self.terminal_batch.as_ref()
     }
 
+    /// The deadline most recently installed into the capture work budget by a
+    /// batch apply; the end-of-batch clear does not erase it.
+    pub(crate) fn installed_budget_deadline_for_test(&self) -> Option<u64> {
+        self.budget.last_installed_deadline
+    }
+
     #[cfg(test)]
     pub(crate) fn malformed_discovery_for_test(&self) -> u64 {
         self.malformed_discovery
@@ -8966,16 +9146,46 @@ mod tests {
         reconcile_scanned_modules,
     };
     use crate::discovery::loader::LoaderContextSpec;
-    use crate::discovery::scan::{ScanLimits, ScannedEntry, ScannedTable, scan_pid};
+    use crate::discovery::scan::{
+        SCAN_DEADLINE_REASON, ScanLimits, ScannedEntry, ScannedTable, WORK_CEILING_REASON, scan_pid,
+    };
     use crate::{semantics, trace};
     use p11scope_manifest::manifest::{
         Acquisition, AliasEntry, AliasGroup, FunctionRecord, InterfaceClassification,
         SurfaceRecord, SurfaceSource, Version, WalkOutcome,
     };
+    use p11scope_manifest::maps::{parse_maps, resolve};
     use std::cell::Cell;
     use std::io::Write as _;
-    use std::os::fd::AsRawFd as _;
     use std::path::PathBuf;
+
+    /// Task 11 fix round 2 (csf_ce5962b root closure): the live per-record
+    /// snapshot read charges the capture budget and honors the installed
+    /// batch deadline on the real `/proc` path, refusing before a byte is read.
+    #[test]
+    fn live_maps_snapshot_charges_the_budget_and_honors_the_installed_deadline() {
+        use crate::discovery::scan::SCAN_DEADLINE_REASON;
+
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        assert!(!Engine::read_maps(&view, &mut budget).unwrap().is_empty());
+        assert!(
+            budget.attempted_io_bytes() > 0,
+            "the snapshot read is charged to the capture budget"
+        );
+
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_deadline(Some(0));
+        let error = Engine::read_maps(&view, &mut budget)
+            .err()
+            .map(|error| error.to_string());
+        assert_eq!(error.as_deref(), Some(SCAN_DEADLINE_REASON));
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            0,
+            "an expired deadline refuses before a byte is read"
+        );
+    }
 
     #[test]
     fn lifecycle_tier_gap_uses_existing_public_discovery_evidence() {
@@ -9195,6 +9405,225 @@ mod tests {
             !error.to_string().contains("retained"),
             "the generic drain retains nothing across ticks: {error:#}"
         );
+    }
+
+    fn malformed_dequeues(count: usize) -> Vec<Result<Option<crate::events::DiscoveryItem>>> {
+        (0..count)
+            .map(|_| Ok(Some(crate::events::DiscoveryItem::Malformed)))
+            .collect()
+    }
+
+    /// One record past the quantum, then a dequeue that must never be reached:
+    /// a producer that keeps the live ring nonempty must not keep the shared
+    /// collector from returning to its caller's deadline and signal checks.
+    #[test]
+    fn live_collector_stops_at_its_quantum_with_the_backlog_still_queued() {
+        let record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        let mut session = ScriptedSession::default();
+        session.dequeues.extend(
+            (0..=LIVE_DISCOVERY_DRAIN_QUANTUM)
+                .map(|_| Ok(Some(crate::events::DiscoveryItem::Record(record)))),
+        );
+        session
+            .dequeues
+            .push_back(Err(anyhow!("dequeued past the quantum")));
+
+        let incomplete = match Engine::collect_discovery_records(&mut session) {
+            Ok((records, malformed)) => panic!(
+                "a quantum stop is an incomplete drain, never an empty ring: {} records, {malformed} malformed",
+                records.len()
+            ),
+            Err(error) => error
+                .downcast::<IncompleteTerminalDrain>()
+                .expect("the exact prefix travels with the stop"),
+        };
+
+        assert!(incomplete.backlog, "{incomplete:?}");
+        assert_eq!(incomplete.records.len(), LIVE_DISCOVERY_DRAIN_QUANTUM);
+        assert_eq!(incomplete.malformed, 0);
+        assert_eq!(
+            session.dequeues.len(),
+            2,
+            "the record past the quantum and the sentinel stay queued"
+        );
+    }
+
+    /// The generic tick route applies a quantum's exact prefix and returns;
+    /// the backlog waits on the ring for the next tick, behind the run loop's
+    /// duration/signal checks, and is never a batch error.
+    #[test]
+    fn the_live_drain_applies_the_quantum_prefix_and_leaves_the_backlog_queued() {
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        let mut session = ScriptedSession::default();
+        session
+            .dequeues
+            .extend(malformed_dequeues(LIVE_DISCOVERY_DRAIN_QUANTUM + 1));
+        session
+            .dequeues
+            .push_back(Err(anyhow!("dequeued past the quantum")));
+
+        engine
+            .drain_discovery_from(&mut session)
+            .expect("a backlog is not a drain failure");
+
+        assert_eq!(
+            engine.malformed_discovery,
+            LIVE_DISCOVERY_DRAIN_QUANTUM as u64
+        );
+        assert_eq!(session.dequeues.len(), 2);
+
+        session.dequeues.pop_back();
+        engine.drain_discovery_from(&mut session).unwrap();
+
+        assert_eq!(
+            engine.malformed_discovery,
+            LIVE_DISCOVERY_DRAIN_QUANTUM as u64 + 1
+        );
+        assert!(session.dequeues.is_empty());
+    }
+
+    #[test]
+    fn a_real_dequeue_failure_still_aborts_the_generic_route() {
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        let mut session = ScriptedSession::default();
+        session
+            .dequeues
+            .push_back(Err(anyhow!("scripted ring read failed")));
+
+        let error = engine.drain_discovery_from(&mut session).unwrap_err();
+
+        assert_eq!(error.to_string(), "scripted ring read failed");
+    }
+
+    /// Every dequeue is capture-wide work, charged at the sink the records
+    /// enter so the one work ceiling counts ring traffic too. The budget has
+    /// no unit accessor and `DEFAULT_WORK_CEILING` is private to scan.rs, so
+    /// the charge is observed exactly through the ceiling itself.
+    #[test]
+    fn dequeued_discovery_work_is_charged_to_the_capture_budget() {
+        const WORK_CEILING: u64 = 16 * 1024 * 1024;
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        assert!(engine.budget.charge(WORK_CEILING - 3));
+        let mut session = ScriptedSession::default();
+        session.dequeues.extend(malformed_dequeues(3));
+        engine.drain_discovery_from(&mut session).unwrap();
+        assert!(
+            !engine.budget.charge(1),
+            "three dequeues must have consumed the last three work units"
+        );
+
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        assert!(engine.budget.charge(WORK_CEILING - 4));
+        let mut session = ScriptedSession::default();
+        session.dequeues.extend(malformed_dequeues(3));
+        engine.drain_discovery_from(&mut session).unwrap();
+        assert!(engine.budget.charge(1), "exactly one unit per dequeue");
+        assert!(!engine.budget.charge(1));
+    }
+
+    /// Past the ceiling the records are already off the ring, so they are
+    /// still applied — dropping them would be silent loss — and the sticky
+    /// stop the refused charge leaves is what the lowering and the next scan
+    /// refuse on and publish.
+    #[test]
+    fn a_drain_past_the_work_ceiling_still_applies_the_dequeued_records() {
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        assert!(engine.budget.charge(16 * 1024 * 1024));
+        let mut session = ScriptedSession::default();
+        session.dequeues.extend(malformed_dequeues(2));
+        engine.drain_discovery_from(&mut session).unwrap();
+        session.dequeues.extend(malformed_dequeues(1));
+        engine.drain_discovery_from(&mut session).unwrap();
+
+        assert_eq!(
+            engine.malformed_discovery, 3,
+            "dequeued records are never dropped"
+        );
+        assert!(!engine.budget.charge(1), "the ceiling stays sticky");
+    }
+
+    /// Task 11 fix round 3 (writer A1 follow-ups 1 and 2). A1's drain quantum
+    /// returns to the caller at this sink, so the sink is where the live
+    /// collector path polls the clock: a batch deadline that expired during the
+    /// drain stops the capture at the quantum boundary instead of one whole
+    /// batch later. A refused charge is published there exactly once, under
+    /// whichever ceiling actually stopped it — the work ceiling and the
+    /// deadline are never labelled as each other.
+    #[test]
+    fn a_drained_quantum_polls_the_batch_deadline_and_publishes_its_own_stop() {
+        let drain_skip = |engine: &Engine| -> Vec<Skipped> {
+            engine
+                .counters
+                .object_skips
+                .iter()
+                .filter(|skip| skip.subject == "live discovery drain")
+                .cloned()
+                .collect()
+        };
+
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        let mut session = ScriptedSession::default();
+        let mut collect = Engine::collect_discovery_records;
+        engine
+            .apply_discovery_batch_with(
+                &mut session,
+                Vec::new(),
+                2,
+                true,
+                false,
+                &mut collect,
+                Some(0),
+            )
+            .unwrap();
+        assert_eq!(
+            drain_skip(&engine),
+            vec![Skipped {
+                subject: "live discovery drain".into(),
+                reason: SCAN_DEADLINE_REASON.into(),
+            }],
+            "an expired batch deadline stops the drain at its quantum, once"
+        );
+
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        assert!(engine.budget.charge(16 * 1024 * 1024));
+        let mut session = ScriptedSession::default();
+        let mut collect = Engine::collect_discovery_records;
+        engine
+            .apply_discovery_batch_with(
+                &mut session,
+                Vec::new(),
+                2,
+                true,
+                false,
+                &mut collect,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            drain_skip(&engine),
+            vec![Skipped {
+                subject: "live discovery drain".into(),
+                reason: WORK_CEILING_REASON.into(),
+            }],
+            "a refused charge is the work ceiling, never mislabelled as the deadline"
+        );
+
+        // An ordinary drain inside its deadline publishes nothing at all.
+        let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
+        let mut session = ScriptedSession::default();
+        let mut collect = Engine::collect_discovery_records;
+        engine
+            .apply_discovery_batch_with(
+                &mut session,
+                Vec::new(),
+                2,
+                true,
+                false,
+                &mut collect,
+                Some(u64::MAX),
+            )
+            .unwrap();
+        assert!(drain_skip(&engine).is_empty());
     }
 
     #[test]
@@ -11017,10 +11446,7 @@ mod tests {
         let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
         std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
         let mut engine = Engine::empty();
-        engine.scope = Scope::Cgroup {
-            path: dir.path().to_path_buf(),
-            id: 0,
-        };
+        engine.scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
         (engine, dir)
     }
 
@@ -11099,6 +11525,38 @@ mod tests {
             unreadable_member_skip(11, true, "scripted, proven gone").is_none(),
             "a generation that is provably gone is the ordinary end of a process"
         );
+    }
+
+    #[test]
+    fn scan_pin_diagnostics_escape_target_controls() {
+        let message =
+            format_discovery_skip("/opt/p\u{1b}[2Jevil\r.so", "scan failed: \u{1b}[31mboom\r");
+        assert_eq!(
+            message,
+            r"p11scope: discovery skipped /opt/p\u{1b}[2Jevil\r.so — scan failed: \u{1b}[31mboom\r"
+        );
+        assert!(!message.contains('\u{1b}') && !message.contains('\r'));
+    }
+
+    #[test]
+    fn unreadable_member_diagnostics_escape_target_controls() {
+        let message = format_unreadable_member(4242, "detail: \u{1b}[2Jevil\r");
+        assert_eq!(
+            message,
+            r"p11scope: discovery skipped pid 4242: detail: \u{1b}[2Jevil\r"
+        );
+        assert!(!message.contains('\u{1b}') && !message.contains('\r'));
+    }
+
+    #[test]
+    fn module_refusal_diagnostics_escape_target_controls() {
+        let message =
+            format_module_refusal("/opt/p\u{1b}[2Jevil\r.so", "capacity: \u{1b}[31mboom\r");
+        assert_eq!(
+            message,
+            r"p11scope: module refused: /opt/p\u{1b}[2Jevil\r.so — capacity: \u{1b}[31mboom\r"
+        );
+        assert!(!message.contains('\u{1b}') && !message.contains('\r'));
     }
 
     /// Task 9.2-fix5 item B, first half. The same `exec` transition, one step
@@ -11296,12 +11754,10 @@ mod tests {
             metrics: false,
             duration: None,
             out: None,
+            max_events: None,
             unsafe_requested: false,
         };
-        let scope = Scope::Cgroup {
-            path: dir.path().to_path_buf(),
-            id: 0,
-        };
+        let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
 
         let engine = Engine::discover(&args, &scope, None).expect("an empty cgroup still captures");
 
@@ -11329,10 +11785,8 @@ mod tests {
         let (mut engine, context) = Engine::retiring_loader_context(pid);
         // A cgroup capture continues when one member exits; the record its
         // exited member already queued is what this is about.
-        engine.scope = Scope::Cgroup {
-            path: PathBuf::from("/sys/fs/cgroup/test.scope"),
-            id: 0,
-        };
+        let scope_dir = tempfile::tempdir().expect("a scope directory");
+        engine.scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
         engine.retirement_intents.clear();
         child.kill().unwrap();
         child.wait().unwrap();
@@ -11650,10 +12104,8 @@ mod tests {
         );
 
         let mut cgroup = Engine::empty();
-        cgroup.scope = Scope::Cgroup {
-            id: 7,
-            path: "/sys/fs/cgroup/p11scope.test".into(),
-        };
+        let cgroup_dir = tempfile::tempdir().expect("a scope directory");
+        cgroup.scope = crate::scope::cgroup(cgroup_dir.path()).expect("open scope directory");
         cgroup.arm_expected_target_exit(view);
         cgroup.finalize_expected_target_exit();
         assert!(
@@ -12339,7 +12791,7 @@ int main(int argc, char **argv) {
         engine.retain_terminal_batch([record], true, 0).unwrap();
         let mut collect = Engine::collect_discovery_records;
         let terminal = engine
-            .apply_discovery_batch_with(&mut session, Vec::new(), 0, true, true, &mut collect)
+            .apply_discovery_batch_with(&mut session, Vec::new(), 0, true, true, &mut collect, None)
             .unwrap();
 
         assert!(terminal.required_complete);
@@ -13251,7 +13703,42 @@ int main(int argc, char **argv) {
         records: Vec<DiscoveryRecord>,
     ) -> Result<DiscoveryBatchOutcome> {
         let mut collect = Engine::collect_discovery_records;
-        engine.apply_discovery_batch_with(session, records, 0, true, false, &mut collect)
+        engine.apply_discovery_batch_with(session, records, 0, true, false, &mut collect, None)
+    }
+
+    #[test]
+    fn discovery_batch_deadline_is_cleared_after_success_and_error() {
+        let (_fixture, mut engine, _context, _record, mut session) = armed_seed_route(0);
+        let mut collect = Engine::collect_discovery_records;
+        engine
+            .apply_discovery_batch_with(
+                &mut session,
+                Vec::new(),
+                0,
+                true,
+                false,
+                &mut collect,
+                Some(1),
+            )
+            .unwrap();
+        assert_eq!(engine.budget.deadline_for_test(), None);
+
+        session.fail_counter_reads([true]);
+        let mut collect = Engine::collect_discovery_records;
+        assert!(
+            engine
+                .apply_discovery_batch_with(
+                    &mut session,
+                    Vec::new(),
+                    0,
+                    true,
+                    false,
+                    &mut collect,
+                    Some(1),
+                )
+                .is_err()
+        );
+        assert_eq!(engine.budget.deadline_for_test(), None);
     }
 
     /// A real failed post-detach drain: the retirement route detaches,
@@ -13665,6 +14152,98 @@ int main(int argc, char **argv) {
         assert!(engine.loader_registry.context(owner).is_none());
     }
 
+    /// The post-detach collector shares the quantum. A stop there is retained
+    /// as an explicitly incomplete batch — never claimed complete, nothing
+    /// dispatched — and the one shared continuation finishes it once the ring
+    /// reads empty, dispatching every dequeued record exactly once.
+    #[test]
+    fn a_quantum_stop_after_detach_retains_an_incomplete_batch_until_the_ring_reads_empty() {
+        let pid = std::process::id();
+        let (mut engine, owner) = Engine::retiring_loader_context(pid);
+        let unrelated = LoaderContextId::from_case_id(9);
+        let mut session = ScriptedSession::with_records([], 1024);
+        session.detach_exports = vec![terminal_export()];
+        session
+            .dequeues
+            .push_back(Ok(Some(crate::events::DiscoveryItem::Record(
+                loader_record_for(owner, pid),
+            ))));
+        session
+            .dequeues
+            .extend((1..=LIVE_DISCOVERY_DRAIN_QUANTUM).map(|_| {
+                Ok(Some(crate::events::DiscoveryItem::Record(
+                    loader_record_for(unrelated, pid),
+                )))
+            }));
+        session
+            .dequeues
+            .push_back(Err(anyhow!("dequeued past the quantum")));
+
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+            .expect("a quantum stop is backlog, never a batch error");
+
+        assert_eq!(
+            engine.loader_records_accepted, 0,
+            "an incomplete batch dispatches nothing"
+        );
+        let batch = engine.terminal_batch.as_ref().unwrap();
+        assert_eq!(batch.record_count(), LIVE_DISCOVERY_DRAIN_QUANTUM);
+        assert!(
+            !batch.complete(),
+            "a quantum stop never claims a complete drain"
+        );
+        assert_eq!(
+            session.dequeues.len(),
+            2,
+            "the record past the quantum and the sentinel stay queued"
+        );
+        assert!(engine.terminal_journal.is_some());
+
+        session.dequeues.pop_back();
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+        assert_eq!(
+            engine.loader_records_accepted as usize,
+            LIVE_DISCOVERY_DRAIN_QUANTUM + 1,
+            "every dequeued record reached dispatch exactly once"
+        );
+        assert!(engine.terminal_batch.is_none());
+        assert!(engine.terminal_journal.is_none());
+        assert!(engine.loader_registry.context(owner).is_none());
+    }
+
+    /// The terminal sink charges too: a retained prefix is dequeued work even
+    /// while nothing has been dispatched yet.
+    #[test]
+    fn a_retained_terminal_prefix_is_charged_as_capture_work() {
+        const WORK_CEILING: u64 = 16 * 1024 * 1024;
+        let pid = std::process::id();
+        let (mut engine, owner) = Engine::retiring_loader_context(pid);
+        assert!(
+            engine
+                .budget
+                .charge(WORK_CEILING - LIVE_DISCOVERY_DRAIN_QUANTUM as u64)
+        );
+        let mut session = ScriptedSession::with_records([], 1024);
+        session.detach_exports = vec![terminal_export()];
+        session
+            .dequeues
+            .extend((0..=LIVE_DISCOVERY_DRAIN_QUANTUM).map(|_| {
+                Ok(Some(crate::events::DiscoveryItem::Record(
+                    loader_record_for(owner, pid),
+                )))
+            }));
+
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+        assert_eq!(engine.loader_records_accepted, 0);
+        assert!(!engine.terminal_batch.as_ref().unwrap().complete());
+        assert!(
+            !engine.budget.charge(1),
+            "the retained quantum consumed the last work units"
+        );
+    }
+
     #[test]
     fn terminal_predispatch_counter_failure_retains_the_exact_batch_for_one_retry() {
         let pid = std::process::id();
@@ -13925,7 +14504,8 @@ int main(int argc, char **argv) {
             },
         ];
 
-        let (mapping, path) = exact_executable_mapping(&maps, key).unwrap();
+        let index = MapIndex::new(&maps).unwrap();
+        let (mapping, path) = exact_executable_mapping(&index, key).unwrap();
         assert_eq!(mapping.start, 0x3000, "inode alone is not full identity");
         assert_eq!(path, mapped, "pin through the mapping's usable alias");
         assert_ne!(path, interpreter, "PT_INTERP spelling is not map authority");
@@ -14011,6 +14591,82 @@ int main(int argc, char **argv) {
         assert!(bounded_interpreter(&overflowing_interp).is_err());
     }
 
+    /// Task 11 fix round 3 (shadow finding 5). The live consumers used the
+    /// compatibility `maps::resolve(&[MapEntry], addr)`, which rebuilds — and
+    /// so revalidates, O(entries) — the whole index for every lookup: the
+    /// loader snapshot loops were quadratic in a target-controlled entry count
+    /// and none of it was charged. One validated index is now built per
+    /// accepted snapshot and every examined entry and lookup is charged, so
+    /// this exact unit arithmetic is what a regression to that wrapper breaks.
+    #[test]
+    fn one_charged_index_serves_every_live_lookup_in_one_snapshot() {
+        const WORK_CEILING: u64 = 16 * 1024 * 1024;
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 20,
+        };
+        // The shape a target creates to make a per-lookup index rebuild
+        // quadratic: many executable mappings of one identity and one path.
+        let entries: Vec<MapEntry> = (0..128u64)
+            .map(|index| MapEntry {
+                start: 0x700000 + index * 0x2000,
+                end: 0x700000 + index * 0x2000 + 0x1000,
+                file_offset: index * 0x1000,
+                permissions: if index % 2 == 0 { *b"r-xp" } else { *b"rw-p" },
+                device: key.device,
+                inode: if index % 2 == 0 { key.inode } else { 0 },
+                raw_path: (index % 2 == 0).then(|| b"/lib/ld.so".to_vec()),
+            })
+            .collect();
+        let matching = 64u64;
+
+        // One validation pass per snapshot, then one unit per entry examined
+        // and one per index lookup in each of the two snapshot loops.
+        let expected = entries.len() as u64 * 3 + matching * 2;
+        let snapshots = |budget: &mut CaptureWorkBudget| {
+            let index = index_maps_or_refuse(&entries, budget).expect("a kernel-ordered snapshot");
+            let executable =
+                executable_map_snapshot(&index, key, budget).expect("the executable mappings");
+            assert_eq!(executable.len() as u64, matching);
+            let (path, loader) =
+                loader_map_snapshot(&index, key, budget).expect("the loader mappings");
+            assert_eq!(path, PathBuf::from("/lib/ld.so"));
+            assert_eq!(loader.len() as u64, matching);
+        };
+
+        let mut budget = CaptureWorkBudget::default();
+        assert!(budget.charge(WORK_CEILING - expected));
+        snapshots(&mut budget);
+        assert!(
+            !budget.charge(1),
+            "one index and two charged passes cost exactly {expected} units"
+        );
+
+        let mut budget = CaptureWorkBudget::default();
+        assert!(budget.charge(WORK_CEILING - expected - 1));
+        snapshots(&mut budget);
+        assert!(budget.charge(1), "and never fewer");
+        assert!(!budget.charge(1));
+
+        // A stopped capture refuses the snapshot under its own reason, not as
+        // "no usable executable mapping".
+        let mut budget = CaptureWorkBudget::default();
+        assert!(!budget.charge(u64::MAX));
+        assert_eq!(
+            index_maps_or_refuse(&entries, &mut budget).unwrap_err(),
+            WORK_CEILING_REASON
+        );
+        let index = MapIndex::new(&entries).unwrap();
+        assert_eq!(
+            executable_map_snapshot(&index, key, &mut budget).unwrap_err(),
+            WORK_CEILING_REASON
+        );
+        assert_eq!(
+            loader_map_snapshot(&index, key, &mut budget).unwrap_err(),
+            WORK_CEILING_REASON
+        );
+    }
+
     #[test]
     fn loader_mapping_selection_is_path_qualified_and_offset_exact() {
         let key = ObjectKey {
@@ -14030,7 +14686,9 @@ int main(int argc, char **argv) {
             mapping(0x700000, 0, b"/lib/ld.so"),
             mapping(0x702000, 0x2000, b"/lib/ld.so"),
         ];
-        let (path, executable) = loader_map_snapshot(&maps, key).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let index = MapIndex::new(&maps).unwrap();
+        let (path, executable) = loader_map_snapshot(&index, key, &mut budget).unwrap();
         assert_eq!(path, PathBuf::from("/lib/ld.so"));
         assert_eq!(
             unique_mapping_for_offset(&executable, 0x2100).unwrap(),
@@ -14039,7 +14697,8 @@ int main(int argc, char **argv) {
 
         let mut collision = maps.clone();
         collision.push(mapping(0x800000, 0, b"/other/ld.so"));
-        assert!(loader_map_snapshot(&collision, key).is_err());
+        let collision_index = MapIndex::new(&collision).unwrap();
+        assert!(loader_map_snapshot(&collision_index, key, &mut budget).is_err());
         assert!(unique_mapping_for_offset(&executable, 0x5000).is_err());
     }
 
@@ -15021,13 +15680,210 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// The valid self-export fixture: a retained view of this process, its own
+    /// `/proc/self/maps`, and one structurally valid FUNCTION_LIST record whose
+    /// table owner is a file-backed readable data mapping of the test
+    /// executable and whose single pointer is the matching code mapping —
+    /// exactly the shape `engine_lowers_export_table_owner_and_prefix` proves
+    /// lowers whole.
+    fn self_export_fixture(id: ProcessViewId) -> (ProcessView, Vec<MapEntry>, DiscoveryRecord) {
+        use p11scope_ebpf_common::DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+
+        let pid = std::process::id();
+        let view = ProcessView::open(id, pid).unwrap();
+        let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let executable = executable.canonicalize().unwrap_or(executable);
+        let owner = maps
+            .iter()
+            .find(|mapping| {
+                mapping.inode != 0
+                    && mapping.permissions[0] == b'r'
+                    && mapping.permissions[2] != b'x'
+                    && matches!(
+                        resolve(&maps, mapping.start),
+                        Resolved::File {
+                            path: MappedPath::Usable(ref path),
+                            ..
+                        } if path == &executable
+                    )
+            })
+            .expect("the test executable has a file-backed data mapping")
+            .clone();
+        let code = maps
+            .iter()
+            .find(|mapping| {
+                mapping.inode == owner.inode
+                    && mapping.device == owner.device
+                    && mapping.permissions[2] == b'x'
+            })
+            .expect("the test executable has a matching code mapping")
+            .clone();
+
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_FUNCTION_LIST_RETURN;
+        record.symbol_id = 1;
+        record.pid_tgid = u64::from(pid) << 32;
+        record.table_ptr = owner.start;
+        record.version_major = 2;
+        record.version_minor = 40;
+        record.pointers[0] = code.start;
+        record.pointers_attempted = 1;
+        record.completed_prefix = 1;
+        record.usable_n = 1;
+        (view, maps, record)
+    }
+
+    /// Task 11 fix round 3 (shadow finding 5): live admission is stop-aware.
+    /// A structurally valid record used to lower whole through a capture that
+    /// had already stopped — `admit_table`/`admit_interface` looked only at
+    /// their own cardinality counters, so a sticky work stop refused nothing
+    /// and an expired batch deadline was never polled between the snapshot and
+    /// the decode.
+    #[test]
+    fn a_stopped_capture_refuses_a_valid_live_export_record() {
+        let (view, maps, record) = self_export_fixture(ProcessViewId(42));
+        let hooks = HookRegistry::builtin();
+        let index = MapIndex::new(&maps).expect("a kernel-ordered self snapshot");
+
+        // An expired batch deadline, nothing sticky yet: only an admission
+        // clock poll can catch it.
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_deadline(Some(0));
+        assert_eq!(
+            lower_export_record(&view, &index, &hooks, &record, &mut budget).unwrap_err(),
+            SCAN_DEADLINE_REASON
+        );
+
+        // A sticky work stop left by any other consumer of the one budget.
+        let mut budget = CaptureWorkBudget::default();
+        assert!(
+            !budget.charge(u64::MAX),
+            "the work ceiling refuses and sticks"
+        );
+        assert_eq!(
+            lower_export_record(&view, &index, &hooks, &record, &mut budget).unwrap_err(),
+            WORK_CEILING_REASON
+        );
+
+        // The same record still lowers when neither ceiling was reached: the
+        // refusals above are the capture's stop, not the fixture's shape.
+        let mut budget = CaptureWorkBudget::default();
+        assert!(
+            lower_export_record(&view, &index, &hooks, &record, &mut budget)
+                .unwrap()
+                .is_some()
+        );
+
+        // And the admission functions refuse the stop themselves, so no caller
+        // of theirs can decode new work past the capture's ceiling.
+        let mut budget = CaptureWorkBudget::default();
+        assert!(budget.admit_table(1) && budget.admit_interface());
+        assert!(!budget.charge(u64::MAX));
+        assert!(!budget.admit_table(1), "a stopped capture admits no table");
+        assert!(
+            !budget.admit_interface(),
+            "a stopped capture admits no interface"
+        );
+    }
+
+    /// Task 11 fix round 3 (shadow-review test blocker 1): the production call
+    /// site. An ordinary batch carrying the valid self-export record under an
+    /// expired batch deadline admits no candidate and no slot, and publishes
+    /// the exact live loss — and the refusal lands before one byte of the
+    /// target's maps is read.
+    #[test]
+    fn an_expired_batch_deadline_admits_no_live_export_record() {
+        let refused = {
+            let (view, _maps, record) = self_export_fixture(ProcessViewId(0));
+            let mut engine = Engine::empty();
+            engine.next_view_id = 1;
+            engine.views.push(view);
+            let mut session = ScriptedSession::default();
+            let mut collect = Engine::collect_discovery_records;
+            let outcome = engine
+                .apply_discovery_batch_with(
+                    &mut session,
+                    vec![record],
+                    0,
+                    true,
+                    false,
+                    &mut collect,
+                    Some(0),
+                )
+                .expect("a refused live snapshot is loss, never a batch error");
+            assert!(!outcome.required_complete, "the batch is incomplete");
+            assert!(engine.plan.slots.is_empty(), "no slot is admitted");
+            assert!(engine.modules.is_empty(), "no candidate is admitted");
+            assert!(
+                engine.counters.object_skips.contains(&Skipped {
+                    subject: "live discovery record".into(),
+                    reason: "a structurally valid private record failed exact live resolution"
+                        .into(),
+                }),
+                "{:?}",
+                engine.counters.object_skips
+            );
+            assert_eq!(
+                engine.budget.attempted_io_bytes(),
+                0,
+                "the expired deadline refuses the snapshot before a byte is read"
+            );
+            engine.counters.object_skips.clone()
+        };
+
+        // The positive control: the same fixture through the same route with no
+        // deadline is admitted, so the refusal above is the deadline's.
+        let (view, _maps, record) = self_export_fixture(ProcessViewId(0));
+        let mut engine = Engine::empty();
+        engine.next_view_id = 1;
+        engine.views.push(view);
+        // This test binary is larger than the default per-object cap, which
+        // would skip its own pin for an unrelated reason.
+        engine.budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        });
+        let mut session = ScriptedSession::default();
+        let mut collect = Engine::collect_discovery_records;
+        engine
+            .apply_discovery_batch_with(
+                &mut session,
+                vec![record],
+                0,
+                true,
+                false,
+                &mut collect,
+                None,
+            )
+            .expect("an ordinary batch");
+        assert_eq!(
+            engine.plan.slots.len(),
+            1,
+            "{:?}",
+            engine.counters.object_skips
+        );
+        assert!(
+            engine.budget.attempted_io_bytes() > 0,
+            "the snapshot was read"
+        );
+        assert!(
+            !engine
+                .counters
+                .object_skips
+                .iter()
+                .any(|skip| refused.contains(skip)),
+            "{:?}",
+            engine.counters.object_skips
+        );
+    }
+
     #[test]
     fn engine_lowers_export_table_owner_and_prefix() {
         use p11scope_ebpf_common::{
             DISCOVERY_KIND_FUNCTION_LIST_RETURN, DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN,
             DISCOVERY_STATUS_READ_FAILURE, DiscoveryRecord,
         };
-        use p11scope_manifest::maps::{MappedPath, Resolved, parse_maps, resolve};
 
         let view = ProcessView::open(ProcessViewId(41), std::process::id()).unwrap();
         let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
@@ -15074,7 +15930,8 @@ int main(int argc, char **argv) {
             total_bytes: u64::MAX,
         };
         let mut budget = CaptureWorkBudget::new(limits);
-        let lowered = lower_export_record(&view, &maps, &hooks, &record, &mut budget)
+        let index = MapIndex::new(&maps).expect("a kernel-ordered self snapshot");
+        let lowered = lower_export_record(&view, &index, &hooks, &record, &mut budget)
             .expect("the structurally valid record lowers")
             .expect("one usable pointer gives one table");
         assert_eq!(lowered.view, view.id());
@@ -15090,7 +15947,7 @@ int main(int argc, char **argv) {
         interface_record.interface_index = 3;
         interface_record.announced_count = 4;
         interface_record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
-        let interface = lower_export_record(&view, &maps, &hooks, &interface_record, &mut budget)
+        let interface = lower_export_record(&view, &index, &hooks, &interface_record, &mut budget)
             .unwrap()
             .unwrap();
         let mut merged = vec![lowered.clone()];
@@ -15100,12 +15957,12 @@ int main(int argc, char **argv) {
         let mut wrong_hook = record;
         wrong_hook.symbol_id = 2;
         assert!(
-            lower_export_record(&view, &maps, &hooks, &wrong_hook, &mut budget).is_err(),
+            lower_export_record(&view, &index, &hooks, &wrong_hook, &mut budget).is_err(),
             "the retained symbol ABI must agree with the record kind"
         );
         wrong_hook.symbol_id = u32::MAX;
         assert!(
-            lower_export_record(&view, &maps, &hooks, &wrong_hook, &mut budget).is_err(),
+            lower_export_record(&view, &index, &hooks, &wrong_hook, &mut budget).is_err(),
             "unknown private symbol IDs have no hook authority"
         );
 
@@ -15121,7 +15978,7 @@ int main(int argc, char **argv) {
         record.status_flags = DISCOVERY_STATUS_READ_FAILURE;
         record.usable_n = 0;
         assert!(
-            lower_export_record(&view, &maps, &hooks, &record, &mut budget)
+            lower_export_record(&view, &index, &hooks, &record, &mut budget)
                 .expect("the completed raw prefix is structurally valid")
                 .is_none(),
             "a read-failed completed prefix is not target authority"
@@ -15135,7 +15992,7 @@ int main(int argc, char **argv) {
             .expect("this process has an anonymous readable mapping")
             .start;
         assert!(
-            lower_export_record(&view, &maps, &hooks, &record, &mut budget)
+            lower_export_record(&view, &index, &hooks, &record, &mut budget)
                 .expect("an anonymous table owner is a count-only outcome")
                 .is_none(),
             "an anonymous mapping cannot own a live table"
@@ -16650,8 +17507,8 @@ int main(int argc, char **argv) {
 
         let exe = std::env::current_exe().unwrap();
         let inode = std::fs::metadata(&exe).unwrap().ino();
-        let maps = p11scope_manifest::maps::parse_maps(&std::fs::read("/proc/self/maps").unwrap())
-            .unwrap();
+        let maps_bytes = std::fs::read("/proc/self/maps").unwrap();
+        let maps = p11scope_manifest::maps::parse_maps(&maps_bytes).unwrap();
         let scan_bytes: u64 = maps
             .iter()
             .filter(|m| m.inode == inode && m.permissions[0] == b'r' && m.permissions[2] != b'x')
@@ -16660,7 +17517,7 @@ int main(int argc, char **argv) {
         let hash_bytes = std::fs::metadata(&exe).unwrap().len();
         let mut budget = CaptureWorkBudget::new(ScanLimits {
             per_object_bytes: scan_bytes.max(hash_bytes),
-            total_bytes: scan_bytes + hash_bytes,
+            total_bytes: scan_bytes + hash_bytes + maps_bytes.len() as u64,
         });
         let hints = vec![exe];
         let hooks = HookRegistry::builtin();
@@ -16887,7 +17744,7 @@ int main(int argc, char **argv) {
             ..profile_capture
         };
         let metrics = render::json(&[], &evidence, &metrics_capture);
-        let trace = trace::evidence_line(&evidence, CapturePolicy::Allowlisted);
+        let trace = trace::evidence_line(&evidence, CapturePolicy::Allowlisted, false);
 
         for rendered in [
             serde_json::to_string(&profile).unwrap(),
@@ -17650,16 +18507,58 @@ int main(int argc, char **argv) {
     /// A pod's processes live in the container cgroups below the pod directory;
     /// capture scope already includes every descendant, so discovery must too.
     #[test]
+    fn cgroup_walk_follows_the_retained_directory_not_a_replaced_path() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("target.scope");
+        let impostor = root.path().join("impostor.scope");
+        std::fs::create_dir_all(real.join("leaf.scope")).unwrap();
+        std::fs::create_dir(&impostor).unwrap();
+        std::fs::write(real.join("cgroup.procs"), "11\n").unwrap();
+        std::fs::write(real.join("leaf.scope/cgroup.procs"), "22\n").unwrap();
+        std::fs::write(impostor.join("cgroup.procs"), "99\n").unwrap();
+        let scope = crate::scope::cgroup(&real).unwrap();
+        let stash = root.path().join("moved.scope");
+        std::fs::rename(&real, &stash).unwrap();
+        std::fs::rename(&impostor, &real).unwrap();
+
+        let (pids, lost) = scope_pids(&scope);
+
+        assert_eq!(pids, vec![11, 22], "the retained fd's descendants, not 99");
+        assert!(!pids.contains(&99));
+        assert_eq!(lost, vec![]);
+    }
+
+    #[test]
+    fn cgroup_walk_reports_losses_under_the_operator_path_not_a_proc_fd_path() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("target.scope");
+        let leaf = real.join("leaf.scope");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(real.join("cgroup.procs"), "11\n").unwrap();
+        std::fs::create_dir(leaf.join("cgroup.procs")).unwrap();
+        let scope = crate::scope::cgroup(&real).unwrap();
+
+        let (pids, lost) = scope_pids(&scope);
+
+        assert_eq!(pids, vec![11]);
+        assert_eq!(
+            lost.len(),
+            1,
+            "the directory cannot be read as text: {lost:?}"
+        );
+        assert_eq!(lost[0].subject, leaf.display().to_string());
+        assert!(!format!("{lost:?}").contains("/proc/self/fd"));
+    }
+
+    #[test]
     fn cgroup_scope_collects_pids_from_every_descendant() {
         let root = tempfile::tempdir().unwrap();
         let leaf = root.path().join("kubepods.slice").join("container.scope");
         std::fs::create_dir_all(&leaf).unwrap();
         std::fs::write(root.path().join("cgroup.procs"), "11\n").unwrap();
         std::fs::write(leaf.join("cgroup.procs"), "22\n33\n\n22\n").unwrap();
-        let (pids, lost) = scope_pids(&Scope::Cgroup {
-            id: 0,
-            path: root.path().to_path_buf(),
-        });
+        let scope = crate::scope::cgroup(root.path()).unwrap();
+        let (pids, lost) = scope_pids(&scope);
         assert_eq!(pids, vec![11, 22, 33], "deduplicated, descendants included");
         assert_eq!(lost, vec![], "every directory was readable");
         assert_eq!(scope_pids(&Scope::Pid(7)).0, vec![7]);
@@ -17668,10 +18567,10 @@ int main(int argc, char **argv) {
         // cgroups churn constantly, and one is removable only when empty — held
         // no process to lose, on either read. Claiming otherwise would publish a
         // false loss and force PARTIAL on ordinary pod turnover.
-        let (pids, lost) = scope_pids(&Scope::Cgroup {
-            id: 0,
-            path: root.path().join("vanished.scope"),
-        });
+        let vanished = tempfile::tempdir().unwrap();
+        let vanished_scope = crate::scope::cgroup(vanished.path()).unwrap();
+        std::fs::remove_dir(vanished.path()).unwrap();
+        let (pids, lost) = scope_pids(&vanished_scope);
         assert_eq!(pids, Vec::<u32>::new());
         assert_eq!(lost, vec![], "a cgroup that no longer exists is not a loss");
 
@@ -17693,10 +18592,7 @@ int main(int argc, char **argv) {
         permissions.set_mode(0o000);
         std::fs::set_permissions(&leaf, permissions).unwrap();
         let denied = std::fs::read_dir(&leaf).is_err();
-        let (pids, lost) = scope_pids(&Scope::Cgroup {
-            id: 0,
-            path: root.path().to_path_buf(),
-        });
+        let (pids, lost) = scope_pids(&scope);
         std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o755)).unwrap();
         if !denied {
             assert_eq!(

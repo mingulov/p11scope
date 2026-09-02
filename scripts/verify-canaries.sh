@@ -8,14 +8,12 @@ cd "$(dirname "$0")/.."
 WORK=${P11SCOPE_TASK4_WORK-target/canaries}
 if [ "${P11SCOPE_TASK4_WORK+set}" = set ]; then
     case $WORK in /*) ;; *) echo "P11SCOPE_TASK4_WORK must be absolute" >&2; exit 2 ;; esac
-else
-    WORK=$(pwd -P)/$WORK
 fi
 
 assert_lanes() {
     case ${1-} in
-        --raw-events|--hostile-starts|--fault-starts) oracle_runner="sudo python3" ;;
-        *) oracle_runner=python3 ;;
+        --raw-events|--hostile-starts|--fault-starts) oracle_runner="sudo python3 -I" ;;
+        *) oracle_runner='python3 -I' ;;
     esac
     $oracle_runner - "$@" <<'PY'
 import ctypes
@@ -1563,14 +1561,22 @@ PY
 }
 
 if [ "${1-}" = "--self-test" ]; then
-    python3 scripts/check-capture-evidence.py --self-test
+    python3 -I scripts/check-capture-evidence.py --self-test
     assert_lanes --self-test
     exit 0
 fi
 
 . scripts/lib.sh
 require_non_root_caller
-mkdir -p "$WORK"
+# The observer refuses to publish into a directory that has a group/world-writable
+# non-sticky ancestor (src/output.rs), and a checkout under a shared source root
+# has one, so the standalone default cannot live in the tree. Root it in a private
+# 0700 directory on sticky /tmp; a supplied path stays the caller's to keep private.
+[ "${P11SCOPE_TASK4_WORK+set}" = set ] || {
+    WORK=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-verify-XXXXXX")/$WORK
+    echo "work root: $WORK"
+}
+(umask 077; mkdir -p "$WORK")
 
 command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
 command -v bpftool >/dev/null || { echo "bpftool required"; exit 1; }
@@ -1623,7 +1629,7 @@ gcc -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 \
     -o "$WORK/matrix-provider.so" crates/discover/tests/fixture/version_matrix.c
 gcc -shared -fPIC -Wall -Wextra -DPRIVACY_FIXTURE=1 -DPRIVACY_BLOCKS=1 \
     -o "$WORK/privacy-provider.so" crates/discover/tests/fixture/version_matrix.c
-python3 scripts/dump-owned-bpf-maps.py --self-test
+python3 -I scripts/dump-owned-bpf-maps.py --self-test
 
 set -- "$WORK"/default-build/release/build/p11scope-*/out/p11scope-ebpf
 [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "default BPF object is not unique"; exit 1; }
@@ -1631,7 +1637,7 @@ DEFAULT_BPF=$1
 set -- "$WORK"/feature-build/release/build/p11scope-*/out/p11scope-ebpf
 [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "feature BPF object is not unique"; exit 1; }
 FEATURE_BPF=$1
-python3 scripts/check-bpf-map-defs.py --policy-inventory "$DEFAULT_BPF" "$FEATURE_BPF"
+python3 -I scripts/check-bpf-map-defs.py --policy-inventory "$DEFAULT_BPF" "$FEATURE_BPF"
 
 wait_for_stopped() {
     wfs_pid=$1
@@ -1730,7 +1736,7 @@ run_lane() {
     wait_for_stopped "$OBSERVER_PID" "$OBSERVER_STARTTIME"
     touch "$WORK/$lane.go"
     wait_for_workload_stopped "$WPID" "$WORKLOAD_STARTTIME"
-    sudo python3 scripts/dump-owned-bpf-maps.py \
+    sudo python3 -I scripts/dump-owned-bpf-maps.py \
         "$OBSERVER_PID" "$WORK" "$lane" 0 16384
     assert_lanes --raw-events "$WORK/mapdump_manifest_$lane.json" "$lane" \
         "$lane_workload_pid" "$WORK/$lane"
@@ -1754,7 +1760,7 @@ run_lane() {
         exit "$status"
     fi
     reclaim_root_output "$WORK/$lane.output"
-    python3 scripts/check-capture-evidence.py canary "$lane" "$WORK/$lane.output"
+    python3 -I scripts/check-capture-evidence.py canary "$lane" "$WORK/$lane.output"
 }
 
 echo "=== discover deterministic matrix providers ==="
@@ -1813,7 +1819,7 @@ run_start_lane() {
     OBSERVER_STARTTIME=$ROOT_PROCESS_STARTTIME
     wait_for_capture_ready "$WORK/$start_lane.observer.log" "$start_privacy" profile
     touch "$WORK/$start_lane.go"
-    sudo python3 scripts/dump-owned-bpf-maps.py "$OBSERVER_PID" "$WORK" \
+    sudo python3 -I scripts/dump-owned-bpf-maps.py "$OBSERVER_PID" "$WORK" \
         "$start_lane" "$start_entries" 16384
     reclaim_root_output "$WORK"/mapdump_*_"$start_lane".json
     if [ "$start_oracle" = --fault-starts ]; then

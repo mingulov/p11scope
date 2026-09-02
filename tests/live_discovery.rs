@@ -55,6 +55,7 @@ fn engine_initial_discovery_preserves_plan() {
         metrics: false,
         duration: None,
         out: None,
+        max_events: None,
         unsafe_requested: false,
     };
     let scope = Scope::Pid(pid);

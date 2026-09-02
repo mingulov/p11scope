@@ -6,10 +6,10 @@
 # (glibc 2.36) so it runs on ubuntu 24.04 (2.39) — the host glibc may be
 # newer than the container's, so a host build is not portable.
 #
-# Both --target-dir paths below are under $PWD/target (bind-mounted into
-# the container as /src), not the container's own /tmp, so the built
-# artifacts survive the container's --rm and are reused as-is by
-# scripts/build-release.sh instead of building them a second time.
+# Both --target-dir paths below are under the private receipt mount (/receipt),
+# not the container's own /tmp, so the built artifacts survive the container's
+# --rm and are reused as-is by scripts/build-release.sh, which supplies its own
+# P11SCOPE_TASK4_WORK base, instead of building them a second time.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -25,7 +25,7 @@ self_test() {
     command -v jq >/dev/null || { echo "jq required"; exit 1; }
     st_work=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-discover-selftest-XXXXXX")
     trap 'rm -rf "$st_work"' EXIT INT TERM
-    python3 - "$st_work" "$ORACLE" "$SOFTHSM_FUNCTION_RECORDS" <<'PY'
+    python3 -I - "$st_work" "$ORACLE" "$SOFTHSM_FUNCTION_RECORDS" <<'PY'
 import copy
 import json
 from pathlib import Path
@@ -157,13 +157,29 @@ chmod 600 "$LANE14_FACTS"
 LANE14_FACTS_ID=$(stat -Lc %d:%i "$LANE14_FACTS")
 printf 'facts_identity\t%s\nstarted_utc\t%s\n' "$LANE14_FACTS_ID" \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LANE14_FACTS"
-DISCOVER_WORK=${P11SCOPE_TASK4_WORK:-target}/discover
-mkdir -m 700 -p "$DISCOVER_WORK"
+# docker refuses a relative -v source, so the receipt mount must be absolute: a
+# supplied base is required to be absolute (the sibling gates' contract) and the
+# standalone default is rooted in a private 0700 directory on sticky /tmp rather
+# than in the checkout, which root-owned container build output must not litter.
+if [ -n "${P11SCOPE_TASK4_WORK:-}" ]; then
+    case $P11SCOPE_TASK4_WORK in /*) ;; *) echo "P11SCOPE_TASK4_WORK must be absolute" >&2; exit 2 ;; esac
+    DISCOVER_WORK=$P11SCOPE_TASK4_WORK/discover
+else
+    DISCOVER_WORK=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-verify-XXXXXX")/target/discover
+    echo "work root: $DISCOVER_WORK"
+fi
+(umask 077; mkdir -p "$DISCOVER_WORK")
 
 TOKEN=$$
 GLIBC_BUILD="p11scope-discover-glibc-build-$TOKEN"
 GLIBC_RUN="p11scope-discover-glibc-run-$TOKEN"
 MUSL_BUILD="p11scope-discover-musl-build-$TOKEN"
+# Ownership follows creation. Each id stays empty until `docker create` returns
+# one and an exact-id readback confirms it, so a lane that fails after its own
+# container exists is still removed by the trap (Task 10 F5), while a name
+# collision fails creation with nothing recorded and the trap deletes nothing:
+# mutable names alone never authorize deletion
+# (docs/superpowers/reports/2026-08-28-task4-receipt-architecture-decision.md).
 GLIBC_BUILD_ID=
 GLIBC_RUN_ID=
 MUSL_BUILD_ID=
@@ -188,6 +204,17 @@ cleanup() {
 }
 . scripts/cleanup-traps.sh
 
+# Prints the immutable id of a newly created container, refusing anything the
+# daemon does not hand back under that exact id. The caller records the id
+# before `docker start`, so cleanup authority is never held over a name.
+create_owned() {
+    owned=$(timeout --signal=TERM --kill-after=5s 60s docker create "$@")
+    [ -n "$owned" ] || { echo "docker create returned no container id" >&2; exit 1; }
+    readback=$(timeout --signal=TERM --kill-after=5s 30s docker inspect -f '{{.Id}}' "$owned")
+    [ "$readback" = "$owned" ] || { echo "container id readback mismatch" >&2; exit 1; }
+    printf '%s\n' "$owned"
+}
+
 timeout --signal=TERM --kill-after=5s 300s docker pull -q ubuntu:24.04
 timeout --signal=TERM --kill-after=5s 300s docker pull -q rust:1.88.0-bookworm
 timeout --signal=TERM --kill-after=5s 300s docker pull -q rust:1.88.0-alpine
@@ -202,14 +229,14 @@ sed 's|directory = ".*"|directory = "/receipt/vendor/src"|' \
     "$DISCOVER_WORK/vendor/config.toml" > "$DISCOVER_WORK/vendor/config.container.toml"
 
 echo "=== glibc: build in rust:1.88.0-bookworm, run in ubuntu:24.04 ==="
-timeout --signal=TERM --kill-after=5s 600s docker run --name "$GLIBC_BUILD" \
+GLIBC_BUILD_ID=$(create_owned --name "$GLIBC_BUILD" \
     -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src rust:1.88.0-bookworm sh -ec '
   export CARGO_HOME=/tmp/cargo
   mkdir -p /tmp/cargo && cp /receipt/vendor/config.container.toml /tmp/cargo/config.toml
-  cargo build --locked --release -p p11scope-discover --offline --target-dir /receipt/glibc-build'
-GLIBC_BUILD_ID=$(docker inspect -f '{{.Id}}' "$GLIBC_BUILD")
+  cargo build --locked --release -p p11scope-discover --offline --target-dir /receipt/glibc-build')
 printf 'container_glibc_build\t%s\n' "$GLIBC_BUILD_ID" >> "$LANE14_FACTS"
-timeout --signal=TERM --kill-after=5s 300s docker run --name "$GLIBC_RUN" \
+timeout --signal=TERM --kill-after=5s 600s docker start -a "$GLIBC_BUILD_ID"
+GLIBC_RUN_ID=$(create_owned --name "$GLIBC_RUN" \
     -v "$PWD:/src:ro" \
     -v "$DISCOVER_WORK/glibc-build/release/p11scope-discover:/usr/local/bin/p11scope-discover:ro" \
     ubuntu:24.04 sh -ec '
@@ -225,12 +252,12 @@ timeout --signal=TERM --kill-after=5s 300s docker run --name "$GLIBC_RUN" \
       -o /tmp/matrix.so /src/crates/discover/tests/fixture/version_matrix.c
   run_discover --module /tmp/matrix.so -o /tmp/matrix.json
   jq -e -f /src/scripts/fixtures/discover-manifest.jq /tmp/matrix.json >/dev/null
-  echo "ubuntu glibc: SoftHSM 68 + fixture 68/92/104 + alternate/null names OK"'
-GLIBC_RUN_ID=$(docker inspect -f '{{.Id}}' "$GLIBC_RUN")
+  echo "ubuntu glibc: SoftHSM 68 + fixture 68/92/104 + alternate/null names OK"')
 printf 'container_glibc_run\t%s\n' "$GLIBC_RUN_ID" >> "$LANE14_FACTS"
+timeout --signal=TERM --kill-after=5s 300s docker start -a "$GLIBC_RUN_ID"
 
 echo "=== musl-dynamic: build + run in rust:1.88.0-alpine ==="
-timeout --signal=TERM --kill-after=5s 600s docker run --name "$MUSL_BUILD" \
+MUSL_BUILD_ID=$(create_owned --name "$MUSL_BUILD" \
     -v "$PWD:/src:ro" -v "$DISCOVER_WORK:/receipt" -w /src rust:1.88.0-alpine sh -ec '
   apk add -q musl-dev gcc softhsm file jq util-linux
   export CARGO_HOME=/tmp/cargo
@@ -240,9 +267,14 @@ timeout --signal=TERM --kill-after=5s 600s docker run --name "$MUSL_BUILD" \
   file /receipt/musl-build/release/p11scope-discover | grep -q "dynamically linked" \
       || { echo "helper is NOT dynamic"; exit 1; }
   ldd /receipt/musl-build/release/p11scope-discover
+  # /receipt is the private 0700 receipt mount, which uid 65534 cannot traverse,
+  # so the dropped-privilege runner gets the helper from a 0755 directory --
+  # exactly where the glibc lane bind-mounts its own binary. Same file, same
+  # dynamic links: `file` and `ldd` above still check the built artifact itself.
+  install -m 0755 /receipt/musl-build/release/p11scope-discover /usr/local/bin/p11scope-discover
   run_discover() {
     setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs \
-      /receipt/musl-build/release/p11scope-discover "$@"
+      p11scope-discover "$@"
   }
   run_discover --module /usr/lib/softhsm/libsofthsm2.so -o /tmp/m.json
   n=$(grep -c "\"name\": \"C_" /tmp/m.json)
@@ -251,9 +283,9 @@ timeout --signal=TERM --kill-after=5s 600s docker run --name "$MUSL_BUILD" \
       -o /tmp/matrix.so /src/crates/discover/tests/fixture/version_matrix.c
   run_discover --module /tmp/matrix.so -o /tmp/matrix.json
   jq -e -f /src/scripts/fixtures/discover-manifest.jq /tmp/matrix.json >/dev/null
-  echo "alpine musl-dynamic: SoftHSM 68 + fixture 68/92/104 + alternate/null names OK"'
-MUSL_BUILD_ID=$(docker inspect -f '{{.Id}}' "$MUSL_BUILD")
+  echo "alpine musl-dynamic: SoftHSM 68 + fixture 68/92/104 + alternate/null names OK"')
 printf 'container_musl_build\t%s\n' "$MUSL_BUILD_ID" >> "$LANE14_FACTS"
+timeout --signal=TERM --kill-after=5s 600s docker start -a "$MUSL_BUILD_ID"
 
 echo "=== container verification: ALL OK ==="
 printf 'oracle\tsofthsm-68-and-fixture-68-92-104\n' >> "$LANE14_FACTS"

@@ -9,6 +9,24 @@ use crate::plan::{ModuleId, TableSummary};
 use serde::Serialize;
 use std::time::Duration;
 
+/// Target-controlled bytes reach a terminal here. Only control characters —
+/// C0, DEL, C1 (including CSI U+009B) — are rewritten; legitimate non-ASCII
+/// pathnames still render as themselves. JSON is unaffected.
+pub(crate) fn escape_controls(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.chars().any(char::is_control) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Which live-discovery strategy each exact bound context used (design §9.2).
 /// Only `debug_state_every_hit` leaves no completeness gap.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
@@ -136,8 +154,10 @@ impl CaptureFacts {
     pub fn heading(&self) -> String {
         match self.discovery.modules.as_slice() {
             [] => "no modules discovered".to_string(),
-            [only] => only.path.clone(),
-            [first, rest @ ..] => format!("{} (+{} more)", first.path, rest.len()),
+            [only] => escape_controls(&only.path).into_owned(),
+            [first, rest @ ..] => {
+                format!("{} (+{} more)", escape_controls(&first.path), rest.len())
+            }
         }
     }
 }
@@ -1312,6 +1332,22 @@ mod tests {
     use super::*;
     use p11scope_ebpf_common::{LATENCY_BUCKETS, shape};
 
+    /// Task 11 fix round 2 (csf_b8067e3 sibling): the C1 range — the raw 8-bit
+    /// CSI U+009B above all — is escaped exactly like C0 and DEL, and legitimate
+    /// non-ASCII pathnames pass through untouched. Pinned so an ASCII-only
+    /// control check cannot silently re-open raw 8-bit CSI.
+    #[test]
+    fn escape_controls_rewrites_c0_del_and_c1_only() {
+        assert_eq!(
+            escape_controls("a\u{9b}b\u{85}c\u{7f}d\u{1}e\u{1b}[2Jf\rg"),
+            r"a\u{9b}b\u{85}c\u{7f}d\u{1}e\u{1b}[2Jf\rg"
+        );
+        assert!(matches!(
+            escape_controls("/opt/p11-ключ-é.so"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
     fn report(name: &str, calls: u64, in_flight: u64, aliased: bool) -> SlotReport {
         SlotReport {
             names: vec![name.into()],
@@ -1929,14 +1965,16 @@ mod tests {
 
     #[test]
     fn bounded_decode_omissions_render_finite_partial_evidence() {
-        use crate::discovery::scan::Skipped;
+        use crate::discovery::scan::{Skipped, WORK_CEILING_REASON};
 
-        for reason in [
+        let mut reasons = vec![
             "capture table decode ceiling reached (512 candidates, 53248 entries); remaining \
              table data was not decoded",
             "capture interface decode ceiling reached (512 records); remaining interface data \
              was not decoded",
-        ] {
+        ];
+        reasons.push(WORK_CEILING_REASON);
+        for reason in reasons {
             let mut ev = evidence();
             ev.skipped = vec![capture_skipped_out(&Skipped {
                 subject: "/private/provider.so".into(),
@@ -2964,7 +3002,7 @@ mod tests {
     ];
 
     fn trace_evidence_object(ev: &Evidence) -> serde_json::Value {
-        let line = crate::trace::evidence_line(ev, CapturePolicy::Allowlisted);
+        let line = crate::trace::evidence_line(ev, CapturePolicy::Allowlisted, false);
         serde_json::from_str(line.strip_prefix("EVIDENCE ").expect("EVIDENCE prefix"))
             .expect("the final trace evidence record is one JSON object")
     }
@@ -3375,5 +3413,38 @@ mod tests {
         assert_eq!(both.heading(), "/opt/p11.so (+1 more)");
         // And the honest empty case still says so.
         assert_eq!(CaptureFacts::default().heading(), "no modules discovered");
+    }
+
+    #[test]
+    fn headings_and_live_frames_escape_module_path_controls() {
+        let mut facts = CaptureFacts {
+            discovery: DiscoveryEvidence {
+                modules: vec![discovered_fixture()],
+                ..DiscoveryEvidence::default()
+            },
+            ..CaptureFacts::default()
+        };
+        facts.discovery.modules[0].path = "/opt/p\u{1b}[2Jevil\r.so".into();
+
+        let heading = facts.heading();
+        assert!(
+            !heading.contains('\u{1b}') && !heading.contains('\r'),
+            "{heading:?}"
+        );
+        assert!(heading.contains(r"\u{1b}[2Jevil\r"), "{heading:?}");
+
+        let frame = live(
+            &reports_fixture(),
+            &evidence(),
+            Duration::from_secs(1),
+            &heading,
+            "profile",
+            CapturePolicy::Allowlisted,
+        );
+        assert!(
+            !frame.contains("\u{1b}[2J"),
+            "raw clear-screen sequence: {frame:?}"
+        );
+        assert!(frame.contains(r"\u{1b}[2Jevil\r"), "{frame:?}");
     }
 }

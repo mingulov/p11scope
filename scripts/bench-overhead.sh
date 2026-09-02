@@ -172,6 +172,41 @@ measure_trace() {
     echo $((T1 - T0))
 }
 
+verify_trace_bound() {
+    rm -f "$WORK/go"
+    ( while [ ! -f "$WORK/go" ]; do sleep 0.02; done
+      exec "$WORK/hammer" "$MODULE" "$N_CALLS" ) > "$WORK/trace_bound_hammer.log" 2>&1 &
+    WPID=$!
+    sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" trace \
+        --manifest "$WORK/manifest.json" --pid "$WPID" \
+        --duration 60 --max-events 1 -o "$WORK/trace_bound.txt" \
+        > "$WORK/trace_bound_p11scope.log" 2>&1 &
+    SPID=$!
+    sleep 3
+    touch "$WORK/go"
+    if wait "$WPID"; then WPID=; else status=$?; WPID=; return "$status"; fi
+    if wait "$SPID"; then status=0; else status=$?; fi
+    SPID=
+    [ "$status" -eq 0 ] || {
+        echo "bounded trace lane exited $status" >&2
+        cat "$WORK/trace_bound_p11scope.log" >&2
+        return 1
+    }
+    reclaim_root_output "$WORK/trace_bound.txt"
+    python3 - "$WORK/trace_bound.txt" <<'PY'
+import json, sys
+
+lines = [line.rstrip("\n") for line in open(sys.argv[1])]
+events = [line for line in lines if line and not line.startswith(("CAPTURE ", "TRUNCATED ", "EVIDENCE ", "LOST "))]
+assert any(line.startswith("CAPTURE ") for line in lines), lines
+assert len(events) <= 1, events
+assert sum(line.startswith("TRUNCATED at 1 events (--max-events)") for line in lines) == 1, lines
+evidence = [line.removeprefix("EVIDENCE ") for line in lines if line.startswith("EVIDENCE ")]
+assert len(evidence) == 1, evidence
+assert json.loads(evidence[0])["trace_truncated"] is True, evidence[0]
+PY
+}
+
 echo "=== unobserved ==="
 : > "$WORK/unobserved.times"
 i=1
@@ -203,6 +238,7 @@ while [ "$i" -le "$RUNS" ]; do
     measure_trace "$i" >> "$WORK/trace.times"
     i=$((i + 1))
 done
+verify_trace_bound
 
 echo "=== results ==="
 python3 - "$WORK" "$N_CALLS" "$KERNEL" "$CPU" <<'PY'

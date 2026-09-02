@@ -27,11 +27,43 @@ Spec §3.3/§6 "on the release tip" is satisfied by W8, not by W5/W6.
 
 ## W3 — Correctness residue {#w3}
 
-**Objective:** close the two remaining Tier-1 research findings and ship the
-capability-tier model — after this wave the *product logic* is release-final.
+**Objective:** begin with the `C_GetInterface` compatibility closure, then
+close the remaining Tier-1 research findings and ship the capability-tier
+model — after this wave the *product logic* is release-final.
+
+**Execution priority:** W3 starts with `C_GetInterface` selection evidence.
+Only after that compatibility slice is closed does it proceed to
+`uprobe_multi`, capability breadth, and the remaining residue. The existing
+implementation is only partial: passive return discovery/inventory exists,
+but selection requests, failures, and aliases are not yet release-complete.
 
 **Scope:**
-1. **Tracepoint offsets (checklist 1 / item #1):** stop hardcoding field
+1. **`C_GetInterface` selection evidence (owner decision 2026-09-01 —
+   release scope; PRD §8 defines the requirement):** current behavior is only
+   partial passive return discovery/inventory; W3 adds separate live request,
+   result, and failure evidence plus a finite offline helper matrix. *Live:*
+   offset-probe the provider's exported `C_GetInterface` (mandatory export in
+   3.x) — uprobe reads the requested interfaceName (bounded read, exact-match
+   against the known finite name set per the allowlist; non-matching →
+   present-but-unnamed), requested version, and flags; uretprobe reads the
+   returned `CK_INTERFACE` (name, version, function-list pointer) and userspace
+   maps the returned table to its enumerated interface. A `--pid` target
+   selected before attach records preattach absence explicitly; `run` mode is
+   the covered attach-before-exec path. *Offline:* query the finite standard
+   set — interfaceName NULL (module default), `"PKCS 11"` unversioned,
+   `"PKCS 11"` × {3.0, 3.1, 3.2}, and standard flag variants — recording each
+   request→result/failure pair with the returned table identity-mapped to the
+   enumeration. Cover null/exact/unknown names, versions/flags, failure,
+   aliases, preattach absence, and privacy escaping. A successful live
+   selection may authorize a selection-scoped table only for that exact
+   retained process generation; an offline finite-query result may authorize
+   only with explicit manifest attestation and exact provider identity.
+   Neither result becomes inventory, and unmatched enumeration remains
+   explicit/PARTIAL. Add an open design ruling recording these authority
+   limits. New fields require owner approval for both schema and allowlist
+   wording; target-controlled name bytes surface only by exact membership in
+   the published name set.
+2. **Tracepoint offsets (checklist 1 / item #1):** stop hardcoding field
    offsets — the literal `24`/`44` reads for `sched_process_fork` are at
    `crates/ebpf/src/main.rs:1704,1707` (the research note and spec §5 cite
    :1703,:1706 — off by one, the comment line; corrected here 2026-09-01).
@@ -39,12 +71,12 @@ capability-tier model — after this wave the *product logic* is release-final.
    via a config map, hard-assert on mismatch (the bcc precedent failed
    *silently with wrong data* — an error is the required behavior). Preserve
    BTF-independence (item #12): no CO-RE dependency may enter.
-2. **Opened-file identity (checklist 2 / item #3):** after opening
+3. **Opened-file identity (checklist 2 / item #3):** after opening
    `/proc/<pid>/root{path}` (`src/discovery/scan.rs:687`), verify the opened
    file's (dev, inode) against the maps-line key for BOTH hinted and unhinted
    paths (today `hint_gate` at `scan.rs:864-882` compares only size, only for
    `--module` hints). Closes the rename/copy/swap misattribution class.
-3. **Capability tier ladder** (PRD §4; standing owner requirement): implement
+4. **Capability tier ladder** (PRD §4; standing owner requirement): implement
    the ladder from `docs/notes/2026-08-15-architecture-and-gap-analysis.md`
    §4.2/§4.4 (the only place the ladder exists — there is NO "tier table"
    artifact in the tree yet; the wave creates the shipped one in
@@ -62,12 +94,12 @@ capability-tier model — after this wave the *product logic* is release-final.
    non-dumpable targets and reports a degraded tier (item #15); tiered
    degradation replaces all-or-nothing failure (standing owner requirement,
    requirements spec §3).
-4. **Diagnostics and verdict honesty:** distinguish seccomp-EPERM from
+5. **Diagnostics and verdict honesty:** distinguish seccomp-EPERM from
    capability-EPERM (checklist 7); log aya's `VerifierLog` on load failure
    (checklist 8 — aya reports verifier rejections as bare `EACCES`); prove
    the loss-counter → consumer-verdict binding with a test (checklist 9 —
    PRD §6 requires it as evidence, not assumption).
-5. **`uprobe_multi` attach (owner decision 2026-09-01 — release scope):**
+6. **`uprobe_multi` attach (owner decision 2026-09-01 — release scope):**
    attach all offsets of an object via `uprobe_multi` where the running
    kernel supports it (link type landed in 6.6), keeping the existing
    per-offset attach as the mandatory fallback at the 5.15 floor. Runtime
@@ -80,37 +112,19 @@ capability-tier model — after this wave the *product logic* is release-final.
    the raw bpf-link syscall behind the pinned aya (no aya version bump
    without an owner decision); if that proves disproportionate, stop and
    present the options to the owner rather than silently dropping the item.
-6. **`C_GetInterface` selection evidence (owner decision 2026-09-01 —
-   release scope; PRD §8 defines the requirement):** two mechanisms.
-   (a) *Live:* offset-probe the provider's exported `C_GetInterface`
-   (mandatory export in 3.x) — uprobe reads the requested interfaceName
-   (bounded read, exact-match against the known finite name set per the
-   allowlist; non-matching → present-but-unnamed), requested version and
-   flags; uretprobe reads the returned `CK_INTERFACE` (name, version,
-   function-list pointer) and userspace maps the returned table to its
-   enumerated interface. Timing honesty: a `--pid` target usually selected
-   before attach — record the absence explicitly; `run` mode (attach before
-   exec) is the covered path. (b) *Offline helper:* query the finite
-   standard set — interfaceName NULL (module default), `"PKCS 11"`
-   unversioned, `"PKCS 11"` × {3.0, 3.1, 3.2}, standard flag variants —
-   recording each request→result pair with the returned table
-   identity-mapped to the enumeration. **Invariant:** selection results are
-   a separate labeled evidence class, never merged into inventory. **Schema
-   and privacy:** new fields are a schema revision and an explicit
-   allowlist-vX revision (owner-approved wording change, never implicit
-   broadening); target-controlled name bytes surface only by exact
-   membership in the published name set.
-
 **Owner-gated:** any privileged e2e verification lanes (unprivileged rows
-run; privileged rows recorded UNRUN unless approved); the allowlist revision
-wording for selection-evidence fields.
+run; privileged rows recorded UNRUN unless approved); all allowlist/schema
+revision wording for selection-evidence fields.
 
 **Known facts for the planner:** aya pinned `=0.14.0` (`Cargo.toml:24`),
 build `--locked` (item #16 posture); anchor lines above were verified
 2026-09-01 at `fb3dffc` (and the :1704,:1707 correction re-checked) but MUST
 be re-verified after W1 merges (W1 touches `scan.rs`).
 
-**Exit evidence:** each item closed with a test failing without the fix; one
+**Exit evidence:** each item closed with a test failing without the fix; the
+selection matrix separately records live request/result/failure rows and
+finite offline queries under the exact-generation/attested-identity authority
+rule, with unmatched enumeration explicit/PARTIAL; one
 tier-degradation matrix row per ladder tier of gap-analysis §4.4
 (unprivileged rows run; privileged rows UNRUN unless owner-approved); the
 checklist-9 verdict-binding test named in the wave report.
@@ -133,10 +147,11 @@ the remote (including a CI-enablement push).
 
 **Known constraint for the planner (corrected 2026-09-01):** the repo HAS a
 remote with old history — `origin/main` = `367cadd` (`.codex`), a strict
-fast-forwardable ancestor 234 commits behind local `main`, whose public tip
+fast-forwardable ancestor 239 commits behind verified local `main`
+`5d251b76b33b14839a7147e14b5ccd1348855587`, whose public tip
 sits one commit above a "not ready" wip checkpoint. So hosted CI is
 technically enableable on the existing remote, but bringing it current means
-pushing 234 commits — an owner decision. **The wave STARTS by surfacing that
+pushing 239 commits — an owner decision. **The wave STARTS by surfacing that
 decision.** If the owner defers the push: deliver the complete pipeline
 definition (`.github/workflows/` or equivalent) with `act`/local dry-run
 evidence, and record — visibly, in the wave report and the W8 acceptance
@@ -249,8 +264,8 @@ locally.
 requalification lane; and publication itself (push, tag, GitHub release) —
 the wave ENDS at "staged and verified"; the last artifact is a one-page
 publication runbook for the owner, which MUST address reconciling the stale
-public remote (its tip `367cadd` sits one commit above a "not ready" wip
-checkpoint that is already public).
+public remote (its tip `367cadd` remains 239 commits behind local main and
+sits one commit above a "not ready" wip checkpoint that is already public).
 
 **Exit evidence:** the filled acceptance table; the staged bundle's checksums;
 zero accepted findings in the final cycle.

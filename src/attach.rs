@@ -24,10 +24,12 @@ use p11scope_ebpf_common::{
 };
 use pkcs11_proxy_ng_types::mechanism_registry::MechanismRegistry;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
 use std::mem::size_of_val;
 use std::num::NonZeroU64;
 use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const BPF_F_RDONLY_PROG: u32 = 1 << 7;
 
@@ -282,6 +284,7 @@ pub enum Scope {
     Cgroup {
         id: u64,
         path: PathBuf,
+        dir: Arc<File>,
     },
 }
 
@@ -372,6 +375,9 @@ pub struct Session {
     pub(crate) ebpf: Ebpf,
     attach_failures: Vec<(u32, String)>,
     detach_failures: Vec<String>,
+    /// Set once `detach_producers` detached every producer: only then is the
+    /// `EVENTS` ring finite and a poll of it allowed to read it whole.
+    producers_detached: bool,
     successful_static: BTreeSet<StaticEndpoint>,
     policy: CapturePolicy,
     uprobe_scope: UProbeScope,
@@ -1158,6 +1164,7 @@ impl Session {
             ebpf,
             attach_failures: vec![],
             detach_failures: vec![],
+            producers_detached: false,
             successful_static: BTreeSet::new(),
             policy,
             uprobe_scope,
@@ -1565,7 +1572,14 @@ impl Session {
     /// removed last. Kernel detach does not wait for callbacks already running
     /// on another CPU; callers must not claim that the terminal drain is final.
     pub fn detach_producers(&mut self) -> Result<()> {
-        self.detach_links(|_| true)
+        let detached = self.detach_links(|_| true);
+        self.producers_detached = detached.is_ok();
+        detached
+    }
+
+    /// The bound the next `EVENTS` poll gets — see `events::poll_quantum`.
+    pub fn live_poll_quantum(&self) -> Option<usize> {
+        events::poll_quantum(self.producers_detached)
     }
 
     fn has_slot_link(&self, slot: u32) -> bool {
@@ -2482,16 +2496,9 @@ mod tests {
             generation: std::num::NonZeroU64::new(99).unwrap(),
         };
         assert!(pause_key_for(&Scope::Pid(41), Some(&capability)).is_err());
-        assert!(
-            pause_key_for(
-                &Scope::Cgroup {
-                    id: 1,
-                    path: "/sys/fs/cgroup".into(),
-                },
-                Some(&capability),
-            )
-            .is_err()
-        );
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        let cgroup = crate::scope::cgroup(cgroup_dir.path()).unwrap();
+        assert!(pause_key_for(&cgroup, Some(&capability)).is_err());
 
         let key = pause_key_for(&Scope::Pid(42), Some(&capability))
             .unwrap()

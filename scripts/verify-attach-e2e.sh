@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 # The lane oracle, in one place. `--self-test` runs it over synthetic evidence
 # and requires every claimed field to refuse a mutation, unprivileged.
 assert_lane_evidence() {
-    python3 - "$@" <<'PY'
+    python3 -I - "$@" <<'PY'
 import copy
 import json
 import sys
@@ -110,14 +110,18 @@ MODULE=${P11SCOPE_PKCS11_MODULE:-/usr/lib/softhsm/libsofthsm2.so}
 WORK=${P11SCOPE_TASK4_WORK-target/e2e}
 if [ "${P11SCOPE_TASK4_WORK+set}" = set ]; then
     case $WORK in /*) ;; *) echo "P11SCOPE_TASK4_WORK must be absolute" >&2; exit 2 ;; esac
-else
-    WORK=$(pwd -P)/$WORK
 fi
 WPID=
 SPID=
 . scripts/lib.sh
 require_non_root_caller
-mkdir -p "$WORK"
+# See verify-canaries.sh: the observer refuses an output directory with a
+# group/world-writable non-sticky ancestor, which this checkout has.
+[ "${P11SCOPE_TASK4_WORK+set}" = set ] || {
+    WORK=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-verify-XXXXXX")/$WORK
+    echo "work root: $WORK"
+}
+(umask 077; mkdir -p "$WORK")
 
 cleanup() {
     CLEANUP_STATUS=$?
@@ -182,7 +186,7 @@ run_lane() {
     if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "profiler failed: $status"; tail -n 20 "$WORK/$lane.log" || true; exit "$status"; fi
     tail -n 3 "$WORK/$lane.log"
     reclaim_root_output "$WORK/$lane.json"
-    python3 scripts/check-capture-evidence.py "$mode" \
+    python3 -I scripts/check-capture-evidence.py "$mode" \
         "$WORK/$lane.json" spike/expected.txt
 }
 

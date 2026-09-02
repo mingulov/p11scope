@@ -127,12 +127,15 @@ otherwise silent provider `absent_uncovered` and forces `PARTIAL`.
 
 This slice implements the first proof by reusing the existing owned-child
 barrier and attach transaction. The proof is minted only after both links
-commit before release and is invalidated by partial attachment, identity or
-generation disagreement, link retirement, or selection loss. The empty timing
-catalog still prevents the second proof: a provider not exactly known and
-pinned before release, including a later `dlopen`, remains uncovered unless a
-qualified loader window exists. Command mode alone never establishes either
-proof. `observed_uncovered` and `absent_uncovered` force `PARTIAL`.
+commit before release. Partial attachment, identity or generation disagreement,
+selection loss, or premature link retirement while the retained generation can
+still execute invalidates it. Confirmed process exit/stop first closes the
+coverage interval; normal terminal detach afterwards preserves the historical
+proof for final evidence. The empty timing catalog still prevents the second
+proof: a provider not exactly known and pinned before release, including a
+later `dlopen`, remains uncovered unless a qualified loader window exists.
+Command mode alone never establishes either proof. `observed_uncovered` and
+`absent_uncovered` force `PARTIAL`.
 
 Binding coverage and standard-export validity are independent. Each
 `capture.modules[]` entry with caller-independent provider inventory or an
@@ -151,11 +154,15 @@ status is:
 
 A module with a custom interface binding may therefore appear in both
 `providers[]` and `standard_exports[]`; the custom binding never hides a
-missing mandatory standard export. Any capture-global selection loss whose
-producer cannot be attributed changes each silent binding to uncovered; a
-provider already observed becomes `observed_uncovered`, while a fully silent
-provider becomes `absent_uncovered`. It never erases an observed tuple or
-creates a guessed provider attribution.
+missing mandatory standard export. Reduction across repeatable manifests and
+live ELF evidence is order-independent: identical exact statuses coalesce;
+`unresolved` is replaced when exactly one exact status exists; no exact status,
+or disagreement between two exact statuses, reduces to `unresolved` and
+`PARTIAL`. Any capture-global selection loss whose producer cannot be
+attributed changes each silent binding to uncovered; a provider already
+observed becomes `observed_uncovered`, while a fully silent provider becomes
+`absent_uncovered`. It never erases an observed tuple or creates a guessed
+provider attribution.
 
 ## 5. Bounded aggregation
 
@@ -194,11 +201,15 @@ Cross-field validity is exact. A nonzero `rv`, or `CKR_OK` with a null or
 unreadable interface/table output, requires `result=null`, empty matches,
 `table_match=false`, and `authority=none`; an unreadable finite name/version
 classification may remain in a readable result object but also has no
-authority. `authority=inventory` holds exactly when bounded matches are
-nonempty and `table_match=true`. `authority=selection_count_only` holds exactly
-when matches are empty and an exact-standard, known-layout, fully resolved
-closure passed section 7. Every other readable result has `authority=none`;
-the two non-none authority classes are mutually exclusive.
+authority. Factual exact matches remain present with `table_match=true` even
+when an authority-relevant result field is unreadable, but then authority is
+`none` and the read loss forces `PARTIAL`. `authority=inventory` holds exactly
+when bounded matches are nonempty, `table_match=true`, every authority-relevant
+result field is readable, and no applicable loss exists.
+`authority=selection_count_only` holds exactly when matches are empty and an
+exact-standard, known-layout, fully resolved closure passed section 7. Every
+other readable result has `authority=none`; the two non-none authority classes
+are mutually exclusive.
 
 ## 6. Exact table matching
 
@@ -230,6 +241,17 @@ offline ordinals are bounded by their referenced array lengths. All matches
 within the 16-entry bound are retained in sorted order; excess aliases set the
 applicable truncation flag and force `PARTIAL`. A scanned table without a
 published caller-independent surface is unmatched.
+
+The private address-free `InventorySurfaceKey` that assigns those ordinals is
+`{module exact object, table object, table object-relative offset, kind,
+finite name class, version, flags, duplicate ordinal}`. Legacy uses its finite
+legacy values. `duplicate ordinal` is the position inside the sorted multiset
+of otherwise identical keys, not a provider enumeration index. Keys are
+ordered lexicographically and merged across retained views only when every
+field matches; reordered enumeration therefore merges, while the same provider
+index naming a different table does not. A table without a stable exact object
+and object-relative offset cannot receive a public surface reference or
+inventory authority.
 
 Each match's `name_agrees` and `version_agrees` booleans are derived after the
 exact table match. They expose a provider inconsistency but never widen a match.
@@ -284,17 +306,26 @@ physical key; their count-only authorization remains source-local and cannot
 upgrade or downgrade independent inventory authorization. A target whose
 physical key already has a planned or attached slot is linked to that slot and
 is never attached again. Multiple claims may add finite names to its one
-aggregate row, but one call is read from one aggregate cell exactly once. A new
-physical target contributes one `table_entries` row, one slot, and, after
-successful attachment, two probes. Later claims for that target contribute
-none of those physical counts. Retirement removes only the retiring claim and
-detaches the slot only after its final inventory or selection owner leaves.
+aggregate row, but one call is read from one aggregate cell exactly once.
+
+`table_entries` retains its established logical-occurrence meaning. Selection
+uses the private address-free `SelectionOccurrenceKey {hook-owner exact object,
+selected-table object-relative offset, table version, function ordinal,
+function name, resolution}`. Identical occurrences across calls or retained
+views coalesce; different names, ordinals, nulls, or resolutions remain
+distinct even when they map to one physical target. Each new occurrence
+increments `table_entries`; only a new `AttachKey` increments `slots` and,
+after successful attachment, `attached_probes` by two. Retirement removes only
+the retiring claim and detaches the slot only after its final inventory or
+selection owner leaves.
 
 New physical selection slots enter the existing candidate
 preflight/apply/rollback transaction but remain outside `CaptureHistory`'s
 inventory collections. Unload, exec, generation loss, loader-context
-retirement, and terminal cleanup retire their links and authority. No
-selection link is attached directly outside that transaction.
+retirement, and terminal cleanup retire their live claims and authority. After
+confirmed exit/stop closes the coverage interval, terminal cleanup preserves
+only the historical coverage proof described in section 4. No selection link
+is attached directly outside that transaction.
 
 ## 8. Offline helper matrix
 
@@ -507,7 +538,8 @@ Implementation proceeds TDD and must leave these runnable pins:
    interface count, caller-independent alias group, table inventory, or
    `fork_safe` fact;
 2. request/result name and version classes, flags, `CK_RV`, and nonzero failure
-   outcomes round-trip through the transport validator;
+   outcomes round-trip through the transport validator; an exact table match
+   with unreadable name/version retains its match but has no authority;
 3. unknown/unterminated/aliased name bytes yield only `other` or `unreadable`,
    and secret canaries do not appear in maps or output; an aliased buffer whose
    exact bytes are `PKCS 11\0` is necessarily `exact_standard`, but those bytes
@@ -522,7 +554,8 @@ Implementation proceeds TDD and must leave these runnable pins:
    provider prearmed while the owned-child barrier is held is silent
    `absent_covered`, while a non-prearmed `run` or `--pid` provider is
    `absent_uncovered`; a constructor call proves the prearm was live before
-   constructors; two retained views sharing one provider produce
+   constructors, and real finalization preserves the closed coverage interval;
+   two retained views sharing one provider produce
    `observed_uncovered`; `legacy_absent` is non-loss, while a custom-only 3.x
    provider remains `required_absent` and `PARTIAL`;
 7. the seventeenth distinct tuple sets `selection_truncated` and `PARTIAL`;
@@ -533,6 +566,8 @@ Implementation proceeds TDD and must leave these runnable pins:
 10. offline pointer equality selects a manifest surface; name/version equality
     without pointer equality does not; live legacy and two interface aliases
     sharing one table retain three distinct privacy-safe surface references;
+    reordered views merge identical keys, while same-index/different-table
+    views remain distinct;
 11. manifest v5 accepts only the fixed matrix and v4 is rejected precisely;
     exact JSON mutation tests pin every enum, bound, result-null relation,
     object/offset reference, orphan-table refusal, full-walk requirement,
@@ -543,15 +578,18 @@ Implementation proceeds TDD and must leave these runnable pins:
     delayed record after retirement is rejected;
 13. an unmatched selection-only table enters the existing transactional attach
     path; same-address/different-name and two-view claims reuse one physical
-    `{object, file_offset}` slot, keep source-local authorization, and independent
-    retirement detaches only after the final owner leaves, without changing
-    inventory, double-counting, or leaking rollback state;
+    `{object, file_offset}` slot while preserving two logical `table_entries`,
+    keep source-local authorization, and independent retirement detaches only
+    after the final owner leaves, without changing inventory, double-counting,
+    or leaking rollback state;
 14. profile v3 and terminal trace expose the bounded aggregate; metrics reads
     no selection arguments for built-in or custom hooks; no trace line emits
     raw selection data; every selection loss owner has a loss-to-verdict test;
 15. every repository v2-profile/v4-manifest exact pin is migrated or retained
     only where explicitly historical, and README/helper module documentation
     truthfully states that the explicit offline helper now makes the ten calls;
+    repeated manifest and live standard-export statuses reduce independently of
+    input order, with exact disagreement becoming `unresolved`/`PARTIAL`;
     and
 16. the canonical Rust 1.88 gates pass, followed by independent security and
     test-quality review to zero.

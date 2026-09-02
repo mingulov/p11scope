@@ -16,7 +16,8 @@ use crate::discovery::identity::{
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::scan::{
     CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
-    ScannedTable, Skipped, index_maps_or_refuse, read_maps_or_refuse, scan_process_view, spans_for,
+    ScannedTable, Skipped, decode_exact_table, exact_table_addresses, exact_table_bytes,
+    index_maps_or_refuse, read_maps_or_refuse, scan_process_view, spans_for,
 };
 use crate::manifest_input::{read_manifest, validate_structure};
 use crate::process::{self, ProcessView, ProcessViewId};
@@ -39,6 +40,7 @@ use p11scope_manifest::manifest::{
 };
 use p11scope_manifest::maps::{Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
@@ -89,6 +91,8 @@ pub struct Engine {
     /// All identity stays out: only the classification is kept, and it is all
     /// that can be rendered.
     loader_contexts: BTreeMap<(ProcessViewId, LoaderAggregateKey, bool), LoaderContextClass>,
+    selection_claims: BTreeMap<SelectionClaimKey, SelectionClaim>,
+    selection_tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +167,15 @@ enum DecodedOccurrence {
         surface: usize,
         function: usize,
     },
+    Selection {
+        module: plan::ModuleId,
+        provider: PinnedTimingKey,
+        table_file_offset: u64,
+        version: (u8, u8),
+        ordinal: u16,
+        name: &'static str,
+        object: Option<(PinnedTimingKey, u64)>,
+    },
 }
 
 impl DecodedOccurrence {
@@ -170,7 +183,8 @@ impl DecodedOccurrence {
         match self {
             Self::Target { module, .. }
             | Self::ScanSkip { module, .. }
-            | Self::ManifestFunction { module, .. } => *module,
+            | Self::ManifestFunction { module, .. }
+            | Self::Selection { module, .. } => *module,
         }
     }
 }
@@ -346,6 +360,55 @@ struct LiveSelectionTuple {
     count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SelectionClaimKey {
+    binding_id: u64,
+    view: ProcessViewId,
+    context: u16,
+    hook_owner: PinnedObjectId,
+    provider: PinnedTimingKey,
+    selected_object: PinnedObjectId,
+    table_file_offset: u64,
+    version: SelectionVersionClass,
+    flags: u64,
+    name: &'static str,
+    file_offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectionClaim {
+    target: plan::AttachKey,
+    /// Diagnostic only; never part of selection identity.
+    object_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SelectionTableKey {
+    view: ProcessViewId,
+    provider: PinnedTimingKey,
+    version: SelectionVersionClass,
+    flags: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectionTableFact {
+    object: PinnedObjectId,
+    file_offset: u64,
+    targets: Vec<plan::SelectionTableTarget>,
+}
+
+type SelectionClaims = BTreeMap<SelectionClaimKey, SelectionClaim>;
+type SelectionTables = BTreeMap<SelectionTableKey, SelectionTableFact>;
+type ProposedSelectionClaim = (SelectionClaims, SelectionTables, PendingSelectionAdmission);
+
+#[derive(Debug, Clone)]
+struct PendingSelectionAdmission {
+    key: SelectionTableKey,
+    table: SelectionTableFact,
+    previous_claims: BTreeMap<SelectionClaimKey, SelectionClaim>,
+    previous_tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
+}
+
 fn selection_name_class(class: u8) -> Option<SelectionNameClass> {
     match class {
         DISCOVERY_NAME_EXACT_STANDARD => Some(SelectionNameClass::ExactStandard),
@@ -491,6 +554,135 @@ fn selection_mapping_bracket(
         return Err(());
     }
     Ok((mapping_a, resolved_a))
+}
+
+fn selection_table_key(claim: &SelectionClaimKey) -> SelectionTableKey {
+    SelectionTableKey {
+        view: claim.view,
+        provider: claim.provider.clone(),
+        version: claim.version,
+        flags: claim.flags,
+    }
+}
+
+fn canonical_selection_targets(
+    entries: impl IntoIterator<Item = (SelectionClaimKey, SelectionClaim)>,
+) -> Vec<plan::SelectionTableTarget> {
+    let mut targets = BTreeMap::<(PinnedObjectId, u64, &'static str), String>::new();
+    for (key, claim) in entries {
+        let target = claim.target;
+        let target_key = (target.object, target.file_offset, key.name);
+        targets
+            .entry(target_key)
+            .and_modify(|path| {
+                if claim.object_path < *path {
+                    *path = claim.object_path.clone();
+                }
+            })
+            .or_insert(claim.object_path);
+    }
+    targets
+        .into_iter()
+        .map(
+            |((object, file_offset, name), object_path)| plan::SelectionTableTarget {
+                object,
+                object_path,
+                file_offset,
+                name,
+            },
+        )
+        .collect()
+}
+
+fn same_selection_target_set(
+    left: &[plan::SelectionTableTarget],
+    right: &[plan::SelectionTableTarget],
+) -> bool {
+    let identity =
+        |target: &plan::SelectionTableTarget| (target.object, target.file_offset, target.name);
+    let mut left = left.iter().map(identity).collect::<Vec<_>>();
+    let mut right = right.iter().map(identity).collect::<Vec<_>>();
+    left.sort();
+    right.sort();
+    left == right
+}
+
+/// Drops ambiguous selection claims before rebuilding their table facts. One
+/// semantic key is intentionally one physical table: a second offset or a
+/// changed complete target set is factual loss, never a union of authorities.
+fn prune_selection_table_conflicts(
+    claims: &mut BTreeMap<SelectionClaimKey, SelectionClaim>,
+) -> bool {
+    type ClaimEntries = Vec<(SelectionClaimKey, SelectionClaim)>;
+    type ClaimsByBinding = BTreeMap<(u64, PinnedObjectId, u64), ClaimEntries>;
+    let mut groups: BTreeMap<SelectionTableKey, ClaimsByBinding> = BTreeMap::new();
+    for (key, claim) in claims.iter() {
+        groups
+            .entry(selection_table_key(key))
+            .or_default()
+            .entry((key.table_file_offset, key.hook_owner, key.binding_id))
+            .or_default()
+            .push((key.clone(), claim.clone()));
+    }
+    let mut remove = BTreeSet::new();
+    for (semantic, by_binding) in groups {
+        let mut known: Option<(u64, PinnedObjectId, Vec<plan::SelectionTableTarget>)> = None;
+        let mut conflict = false;
+        for ((table_file_offset, hook_owner, _), entries) in by_binding {
+            let targets = canonical_selection_targets(entries);
+            if let Some((known_offset, known_owner, known_targets)) = &known {
+                if *known_offset != table_file_offset
+                    || *known_owner != hook_owner
+                    || !same_selection_target_set(known_targets, &targets)
+                {
+                    conflict = true;
+                    break;
+                }
+            } else {
+                known = Some((table_file_offset, hook_owner, targets));
+            }
+        }
+        if conflict {
+            remove.extend(
+                claims
+                    .keys()
+                    .filter(|claim| selection_table_key(claim) == semantic)
+                    .cloned(),
+            );
+        }
+    }
+    let changed = !remove.is_empty();
+    for key in remove {
+        claims.remove(&key);
+    }
+    changed
+}
+
+fn selection_tables_from_claims(
+    claims: &BTreeMap<SelectionClaimKey, SelectionClaim>,
+) -> BTreeMap<SelectionTableKey, SelectionTableFact> {
+    let mut grouped: BTreeMap<SelectionTableKey, Vec<(SelectionClaimKey, SelectionClaim)>> =
+        BTreeMap::new();
+    for (key, claim) in claims {
+        grouped
+            .entry(selection_table_key(key))
+            .or_default()
+            .push((key.clone(), claim.clone()));
+    }
+    grouped
+        .into_iter()
+        .filter_map(|(key, entries)| {
+            let first = entries.first()?.0.clone();
+            Some((
+                key,
+                SelectionTableFact {
+                    object: first.hook_owner,
+                    file_offset: first.table_file_offset,
+                    targets: canonical_selection_targets(entries),
+                },
+            ))
+        })
+        .collect()
 }
 
 fn prune_selection_inventory(history: &mut CaptureHistory, live_views: &BTreeSet<ProcessViewId>) {
@@ -648,7 +840,13 @@ impl CaptureFacts {
         });
         if let Some(existing) = existing {
             existing.count = existing.count.saturating_add(1);
-        } else if history.selections.len() < MAX_LIVE_SELECTION_TUPLES {
+        } else if history
+            .selections
+            .iter()
+            .filter(|known| known.module == tuple.module)
+            .count()
+            < MAX_LIVE_SELECTION_TUPLES
+        {
             tuple.count = 1;
             history.selections.push(tuple);
         } else {
@@ -1609,6 +1807,9 @@ struct LiveCandidate {
     views: BTreeSet<ProcessViewId>,
     corroboration: Vec<(BTreeSet<PinnedObjectId>, &'static str)>,
     manifest_fallbacks: Vec<ManifestFallback>,
+    selection_claims: BTreeMap<SelectionClaimKey, SelectionClaim>,
+    selection_tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
+    selection_admission: Option<PendingSelectionAdmission>,
 }
 
 struct StartPublicationSnapshot {
@@ -1621,6 +1822,8 @@ struct StartPublicationSnapshot {
     views: BTreeSet<ProcessViewId>,
     next_selection_binding_id: Option<u64>,
     selection_bindings: BTreeMap<u64, SelectionBindingFact>,
+    selection_claims: BTreeMap<SelectionClaimKey, SelectionClaim>,
+    selection_tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
 }
 
 /// What one `apply_candidate` actually did. `committed` used to conflate all
@@ -1650,6 +1853,7 @@ struct ApplyOutcome {
     static_completions: Vec<(BTreeSet<PinnedTimingKey>, Option<u64>)>,
     static_failures: BTreeSet<PinnedTimingKey>,
     newly_rejected_keys: BTreeSet<ObjectKey>,
+    selection_authorized: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5003,6 +5207,8 @@ impl Engine {
             expected_target_exit: false,
             next_selection_binding_id: Some(1),
             selection_bindings: BTreeMap::new(),
+            selection_claims: BTreeMap::new(),
+            selection_tables: BTreeMap::new(),
             loader_contexts: BTreeMap::new(),
         }
     }
@@ -5476,6 +5682,8 @@ impl Engine {
             views: self.views.iter().map(ProcessView::id).collect(),
             next_selection_binding_id: self.next_selection_binding_id,
             selection_bindings: self.selection_bindings.clone(),
+            selection_claims: self.selection_claims.clone(),
+            selection_tables: self.selection_tables.clone(),
         }
     }
 
@@ -5488,6 +5696,8 @@ impl Engine {
         }
         self.next_selection_binding_id = Some(1);
         self.selection_bindings.clear();
+        self.selection_claims.clear();
+        self.selection_tables.clear();
         Ok(snapshot)
     }
 
@@ -5524,6 +5734,12 @@ impl Engine {
         self.counters.manifest_fallbacks = snapshot.manifest_fallbacks;
         self.next_selection_binding_id = snapshot.next_selection_binding_id;
         self.selection_bindings = snapshot.selection_bindings;
+        self.selection_claims = snapshot.selection_claims;
+        self.selection_claims
+            .retain(|claim, _| !removed_views.contains(&claim.view));
+        self.selection_tables = snapshot.selection_tables;
+        self.selection_tables
+            .retain(|table, _| !removed_views.contains(&table.view));
         if removed_views.is_empty() {
             self.discovery = snapshot.discovery;
         } else if self.capture_facts.history.modules.is_empty()
@@ -5556,9 +5772,19 @@ impl Engine {
 
     fn live_candidate(
         &mut self,
+        pinned: PinnedObjects,
+        raw_modules: Vec<ScannedModule>,
+        skipped: Vec<Skipped>,
+    ) -> Result<LiveCandidate> {
+        self.live_candidate_with_pending(pinned, raw_modules, skipped, None)
+    }
+
+    fn live_candidate_with_pending(
+        &mut self,
         mut pinned: PinnedObjects,
         mut raw_modules: Vec<ScannedModule>,
         mut skipped: Vec<Skipped>,
+        pending_selection: Option<&SelectionTableKey>,
     ) -> Result<LiveCandidate> {
         self.pending_rejected_keys
             .extend(pinned.newly_rejected_keys(&self.pinned));
@@ -5640,6 +5866,109 @@ impl Engine {
                 "a late identity collision invalidated prior exact fallback or corroboration evidence",
             );
         }
+        let mut selection_claims = self.selection_claims.clone();
+        let active_keys: BTreeSet<_> = self
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| self.plan.is_active(slot.index))
+            .map(|slot| plan::AttachKey {
+                object: slot.object,
+                file_offset: slot.file_offset,
+            })
+            .collect();
+        selection_claims.retain(|key, claim| {
+            let Some(binding) = self.selection_bindings.get(&key.binding_id) else {
+                return false;
+            };
+            let live_view = self
+                .views
+                .iter()
+                .any(|view| view.id() == key.view && view.still_the_same());
+            let binding_live = binding.attached
+                && !binding.retired
+                && binding.context.get() == key.context
+                && binding.view == key.view
+                && binding.object == key.hook_owner
+                && self
+                    .loader_registry
+                    .context(binding.context)
+                    .is_some_and(|context| {
+                        context.spec.view == key.view
+                            && !self.loader_registry.is_tombstoned(binding.context)
+                    })
+                && pinned
+                    .owned_timing_key(binding.object)
+                    .is_some_and(|provider| provider == key.provider)
+                && pinned.summary(claim.target.object).is_some()
+                && claim.target.object == key.selected_object
+                && claim.target.file_offset == key.file_offset;
+            let pending =
+                pending_selection.is_some_and(|pending| selection_table_key(key) == *pending);
+            live_view && binding_live && (pending || active_keys.contains(&claim.target))
+        });
+        if prune_selection_table_conflicts(&mut selection_claims) {
+            self.refuse_selection_authority(
+                "conflicting selection claims shared one semantic table key",
+            );
+        }
+        let mut selection_tables = self.selection_tables.clone();
+        selection_tables.retain(|key, _| {
+            self.views
+                .iter()
+                .any(|view| view.id() == key.view && view.still_the_same())
+                && modules.iter().any(|module| {
+                    module.scanned.view == key.view
+                        && pinned
+                            .owned_timing_key(module.object)
+                            .is_some_and(|provider| provider == key.provider)
+                })
+        });
+        let active_selection_tables = selection_tables_from_claims(&selection_claims);
+        for (key, table) in active_selection_tables {
+            if selection_tables.get(&key).is_some_and(|known| {
+                known.object != table.object
+                    || known.file_offset != table.file_offset
+                    || !same_selection_target_set(&known.targets, &table.targets)
+            }) {
+                self.refuse_selection_authority(
+                    "a live selection claim conflicted with its provider-generation table latch",
+                );
+                selection_claims.retain(|claim, _| selection_table_key(claim) != key);
+                continue;
+            }
+            selection_tables
+                .entry(key.clone())
+                .or_insert_with(|| table.clone());
+            let Some(module_id) = modules
+                .iter()
+                .find(|module| {
+                    module.scanned.view == key.view
+                        && pinned
+                            .owned_timing_key(module.object)
+                            .is_some_and(|provider| provider == key.provider)
+                })
+                .and_then(|selected| {
+                    rebuilt
+                        .modules
+                        .iter()
+                        .find(|module| module.object == selected.object)
+                })
+                .map(|module| module.id)
+            else {
+                self.capture_facts
+                    .record_selection_loss("a live selection claim lost its provider module");
+                selection_claims.retain(|claim, _| selection_table_key(claim) != key);
+                continue;
+            };
+            if let Err(reason) =
+                rebuilt.add_selection_table(&self.plan, module_id, table.targets.clone())
+            {
+                self.mark_partial("live interface selection", &reason);
+                self.refuse_selection_authority("a live selection table could not be admitted");
+                selection_claims.retain(|claim, _| selection_table_key(claim) != key);
+            }
+        }
         let mut candidate_plan = self.plan.clone();
         let delta = candidate_plan
             .extend_exact_with_stable_module_ids(rebuilt)
@@ -5657,6 +5986,9 @@ impl Engine {
             views,
             corroboration,
             manifest_fallbacks,
+            selection_claims,
+            selection_tables,
+            selection_admission: None,
         })
     }
 
@@ -5999,6 +6331,7 @@ impl Engine {
         additions_allowed: &mut bool,
         outcome: &mut ApplyOutcome,
     ) {
+        let selection_pending = candidate.selection_admission.take();
         outcome.stale_views = stale_process_views(&self.views, extra_views, &candidate.views);
         let retired = !outcome.stale_views.is_empty();
         if retired {
@@ -6010,6 +6343,106 @@ impl Engine {
                 "a process generation changed after link mutation; its targets were retired before context cleanup",
             );
         }
+        if let Some(pending) = selection_pending {
+            let target_keys: BTreeSet<_> = pending
+                .table
+                .targets
+                .iter()
+                .map(|target| plan::AttachKey {
+                    object: target.object,
+                    file_offset: target.file_offset,
+                })
+                .collect();
+            let table_survives =
+                candidate
+                    .selection_tables
+                    .get(&pending.key)
+                    .is_some_and(|table| {
+                        table.object == pending.table.object
+                            && table.file_offset == pending.table.file_offset
+                            && same_selection_target_set(&table.targets, &pending.table.targets)
+                    });
+            let targets_survive = pending.table.targets.iter().all(|target| {
+                let key = plan::AttachKey {
+                    object: target.object,
+                    file_offset: target.file_offset,
+                };
+                candidate
+                    .plan
+                    .slots
+                    .iter()
+                    .find(|slot| slot.object == key.object && slot.file_offset == key.file_offset)
+                    .is_some_and(|slot| candidate.plan.is_active(slot.index))
+            });
+            if table_survives && targets_survive {
+                outcome.selection_authorized = true;
+            } else {
+                let inventory_keys: BTreeSet<_> = self
+                    .plan
+                    .slots
+                    .iter()
+                    .filter(|slot| self.plan.is_active(slot.index))
+                    .map(|slot| plan::AttachKey {
+                        object: slot.object,
+                        file_offset: slot.file_offset,
+                    })
+                    .collect();
+                for slot in &mut candidate.plan.slots {
+                    let key = plan::AttachKey {
+                        object: slot.object,
+                        file_offset: slot.file_offset,
+                    };
+                    if target_keys.contains(&key)
+                        && inventory_keys.contains(&key)
+                        && let Some(previous) = self.plan.slots.iter().find(|previous| {
+                            previous.object == key.object && previous.file_offset == key.file_offset
+                        })
+                    {
+                        *slot = previous.clone();
+                    }
+                }
+                let detach: Vec<_> = candidate
+                    .delta
+                    .new
+                    .iter()
+                    .filter(|slot| {
+                        let key = plan::AttachKey {
+                            object: slot.object,
+                            file_offset: slot.file_offset,
+                        };
+                        target_keys.contains(&key)
+                            && !inventory_keys.contains(&key)
+                            && candidate.plan.is_active(slot.index)
+                    })
+                    .cloned()
+                    .collect();
+                if session.detach_slots(&detach).is_err() {
+                    self.mark_partial(
+                        "live interface selection",
+                        "a refused selection table could not detach one-shot additions",
+                    );
+                }
+                for slot in detach {
+                    candidate.plan.deactivate(slot.index);
+                }
+                candidate.selection_claims.retain(|claim, value| {
+                    selection_table_key(claim) != pending.key
+                        || pending.previous_claims.get(claim) == Some(value)
+                });
+                if candidate.selection_tables.contains_key(&pending.key) {
+                    if let Some(previous) = pending.previous_tables.get(&pending.key) {
+                        candidate
+                            .selection_tables
+                            .insert(pending.key.clone(), previous.clone());
+                    } else {
+                        candidate.selection_tables.remove(&pending.key);
+                    }
+                }
+                self.refuse_selection_authority(
+                    "a selection table did not survive exact admission and attachment",
+                );
+            }
+        }
         record_object_skips(&mut candidate.plan, &self.counters.object_skips);
         outcome.changed |= candidate.plan != self.plan;
         self.pinned = candidate.pinned;
@@ -6017,6 +6450,8 @@ impl Engine {
         self.plan = candidate.plan;
         self.counters.corroboration = candidate.corroboration;
         self.counters.manifest_fallbacks = candidate.manifest_fallbacks;
+        self.selection_claims = candidate.selection_claims;
+        self.selection_tables = candidate.selection_tables;
         outcome.disposition = if retired {
             ApplyDisposition::ConservativeRetirement
         } else {
@@ -6032,6 +6467,7 @@ impl Engine {
                 "the retired candidate's provider history could not be published",
             );
         }
+        outcome.selection_authorized &= outcome.disposition == ApplyDisposition::Accepted;
     }
 
     /// Drops the pins, modules, proofs, and live endpoints a lost process
@@ -6052,6 +6488,67 @@ impl Engine {
             .filter(|module| !stale_views.contains(&module.scanned.view))
             .cloned()
             .collect();
+        let prior_selection_keys: BTreeSet<_> =
+            selection_tables_from_claims(&candidate.selection_claims)
+                .values()
+                .flat_map(|table| table.targets.iter())
+                .map(|target| plan::AttachKey {
+                    object: target.object,
+                    file_offset: target.file_offset,
+                })
+                .collect();
+        candidate
+            .selection_claims
+            .retain(|claim, _| !stale_views.contains(&claim.view));
+        candidate
+            .selection_tables
+            .retain(|table, _| !stale_views.contains(&table.view));
+        let surviving_selection_keys: BTreeSet<_> =
+            selection_tables_from_claims(&candidate.selection_claims)
+                .values()
+                .flat_map(|table| table.targets.iter())
+                .map(|target| plan::AttachKey {
+                    object: target.object,
+                    file_offset: target.file_offset,
+                })
+                .collect();
+        let inventory_plan =
+            self.plan
+                .rebuild_from_sources(&cleaned_modules, &self.manifests, &cleaned_pins);
+        let inventory_keys: BTreeSet<_> = inventory_plan
+            .slots
+            .iter()
+            .map(|slot| plan::AttachKey {
+                object: slot.object,
+                file_offset: slot.file_offset,
+            })
+            .collect();
+        let orphaned_selection_keys: BTreeSet<_> = prior_selection_keys
+            .difference(&surviving_selection_keys)
+            .filter(|key| !inventory_keys.contains(key))
+            .copied()
+            .collect();
+        let orphaned_selection: Vec<_> = candidate
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| {
+                orphaned_selection_keys.contains(&plan::AttachKey {
+                    object: slot.object,
+                    file_offset: slot.file_offset,
+                }) && candidate.plan.is_active(slot.index)
+            })
+            .cloned()
+            .collect();
+        if !orphaned_selection.is_empty() && session.detach_slots(&orphaned_selection).is_err() {
+            self.mark_partial(
+                "live discovery detach",
+                "stale selection claims lost their final owner but one link detach failed",
+            );
+        }
+        for slot in orphaned_selection {
+            candidate.plan.deactivate(slot.index);
+        }
         let retired = candidate
             .plan
             .retire_unpinned_targets(&cleaned_pins, self.plan.slots.len());
@@ -6414,17 +6911,222 @@ impl Engine {
         Ok(DiscoveryRecordOutcome::applied(changed, required_complete))
     }
 
+    fn record_selection_occurrences(
+        &mut self,
+        module: plan::ModuleId,
+        provider: PinnedTimingKey,
+        table: &ScannedTable,
+    ) {
+        let Some(table_file_offset) = table.file_offset else {
+            return;
+        };
+        let history = self.capture_facts.visible_history_mut();
+        let mut record = |name: &'static str, object: Option<(PinnedTimingKey, u64)>| {
+            let Some(ordinal) =
+                crate::kinds::function_id(name).and_then(|ordinal| u16::try_from(ordinal).ok())
+            else {
+                history.selection_truncated = true;
+                insert_selection_loss(
+                    history,
+                    "a selection table contained an unknown canonical function name",
+                );
+                return;
+            };
+            history.decoded.insert(DecodedOccurrence::Selection {
+                module,
+                provider: provider.clone(),
+                table_file_offset,
+                version: table.version,
+                ordinal,
+                name,
+                object,
+            });
+        };
+        for name in &table.null_entries {
+            record(name, None);
+        }
+        for entry in &table.entries {
+            record(entry.name, Some((provider.clone(), entry.file_offset)));
+        }
+    }
+
+    fn refuse_selection_authority(&mut self, reason: &str) {
+        let history = self.capture_facts.visible_history_mut();
+        history.selection_truncated = true;
+        insert_selection_loss(history, reason);
+    }
+
+    fn propose_selection_claim(
+        &mut self,
+        binding: &SelectionBindingFact,
+        provider: PinnedTimingKey,
+        table: &ScannedTable,
+        result: &SelectionRequest,
+    ) -> Option<ProposedSelectionClaim> {
+        let table_file_offset = table.file_offset?;
+        let table_key = SelectionTableKey {
+            view: binding.view,
+            provider: provider.clone(),
+            version: result.version,
+            flags: result.flags,
+        };
+        let targets: Vec<_> = table
+            .entries
+            .iter()
+            .map(|entry| plan::SelectionTableTarget {
+                object: binding.object,
+                object_path: entry.object_path.clone(),
+                file_offset: entry.file_offset,
+                name: entry.name,
+            })
+            .collect();
+        let previous_claims = self
+            .selection_claims
+            .iter()
+            .filter(|(claim, _)| selection_table_key(claim) == table_key)
+            .map(|(claim, value)| (claim.clone(), value.clone()))
+            .collect();
+        let mut tables = self.selection_tables.clone();
+        if let Some(known) = tables.get(&table_key) {
+            if known.object != binding.object
+                || known.file_offset != table_file_offset
+                || !same_selection_target_set(&known.targets, &targets)
+            {
+                let history = self.capture_facts.visible_history_mut();
+                history.selection_truncated = true;
+                insert_selection_loss(
+                    history,
+                    "conflicting selection tables shared one returned version and flags",
+                );
+                return None;
+            }
+        } else {
+            tables.insert(
+                table_key.clone(),
+                SelectionTableFact {
+                    object: binding.object,
+                    file_offset: table_file_offset,
+                    targets: targets.clone(),
+                },
+            );
+        }
+        let mut claims = self.selection_claims.clone();
+        for target in targets {
+            let key = SelectionClaimKey {
+                binding_id: binding.id,
+                view: binding.view,
+                context: binding.context.get(),
+                hook_owner: binding.object,
+                provider: provider.clone(),
+                selected_object: target.object,
+                table_file_offset,
+                version: result.version,
+                flags: result.flags,
+                name: target.name,
+                file_offset: target.file_offset,
+            };
+            claims.insert(
+                key,
+                SelectionClaim {
+                    target: plan::AttachKey {
+                        object: target.object,
+                        file_offset: target.file_offset,
+                    },
+                    object_path: target.object_path,
+                },
+            );
+        }
+        let pending = PendingSelectionAdmission {
+            key: table_key,
+            table: SelectionTableFact {
+                object: binding.object,
+                file_offset: table_file_offset,
+                targets: table
+                    .entries
+                    .iter()
+                    .map(|entry| plan::SelectionTableTarget {
+                        object: binding.object,
+                        object_path: entry.object_path.clone(),
+                        file_offset: entry.file_offset,
+                        name: entry.name,
+                    })
+                    .collect(),
+            },
+            previous_claims,
+            previous_tables: self.selection_tables.clone(),
+        };
+        Some((claims, tables, pending))
+    }
+
+    fn live_candidate_with_selection(
+        &mut self,
+        pinned: PinnedObjects,
+        raw_modules: Vec<ScannedModule>,
+        selection_claims: BTreeMap<SelectionClaimKey, SelectionClaim>,
+        selection_tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
+        selection_admission: PendingSelectionAdmission,
+    ) -> Result<LiveCandidate> {
+        let old_claims = std::mem::replace(&mut self.selection_claims, selection_claims);
+        let old_tables = std::mem::replace(&mut self.selection_tables, selection_tables);
+        let result = self.live_candidate_with_pending(
+            pinned,
+            raw_modules,
+            Vec::new(),
+            Some(&selection_admission.key),
+        );
+        self.selection_claims = old_claims;
+        self.selection_tables = old_tables;
+        result.map(|mut candidate| {
+            candidate.selection_admission = Some(selection_admission);
+            candidate
+        })
+    }
+
+    #[cfg(test)]
     fn process_selection_record(
         &mut self,
         queued: &QueuedDiscoveryRecord,
     ) -> DiscoveryRecordOutcome {
+        self.process_selection_record_inner(queued, None).unwrap_or(
+            DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed),
+        )
+    }
+
+    fn process_selection_record_with_session(
+        &mut self,
+        queued: &QueuedDiscoveryRecord,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+    ) -> Result<DiscoveryRecordOutcome> {
+        self.process_selection_record_inner(
+            queued,
+            Some((session, additions_allowed, pending_views)),
+        )
+    }
+
+    fn process_selection_record_inner(
+        &mut self,
+        queued: &QueuedDiscoveryRecord,
+        transaction: Option<(
+            &mut dyn EngineSession,
+            &mut bool,
+            &mut PendingViewRetirements,
+        )>,
+    ) -> Result<DiscoveryRecordOutcome> {
+        let transactional = transaction.is_some();
+        let can_attach = transaction
+            .as_ref()
+            .is_some_and(|(_, additions_allowed, _)| **additions_allowed);
         let record = &queued.record;
         let Some(binding) = self.selection_bindings.get(&record.binding_id).copied() else {
             self.mark_live_loss(
                 "live interface selection",
                 "a selection record named an unknown capture-local binding",
             );
-            return DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed);
+            return Ok(DiscoveryRecordOutcome::Rejected(
+                RecordRejection::SelectionUnattributed,
+            ));
         };
         let hook_matches = self
             .hooks
@@ -6460,7 +7162,9 @@ impl Engine {
                 "live interface selection",
                 "a selection record failed binding, context, or process-generation attribution",
             );
-            return DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed);
+            return Ok(DiscoveryRecordOutcome::Rejected(
+                RecordRejection::SelectionUnattributed,
+            ));
         }
 
         let Some(request_name) = selection_name_class(record.case_id) else {
@@ -6468,14 +7172,18 @@ impl Engine {
                 "live interface selection",
                 "a selection record carried an unknown request-name class",
             );
-            return DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed);
+            return Ok(DiscoveryRecordOutcome::Rejected(
+                RecordRejection::SelectionUnattributed,
+            ));
         };
         let Some(request_version) = selection_version_class(record.interface_index) else {
             self.mark_live_loss(
                 "live interface selection",
                 "a selection record carried an unknown request-version class",
             );
-            return DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed);
+            return Ok(DiscoveryRecordOutcome::Rejected(
+                RecordRejection::SelectionUnattributed,
+            ));
         };
         let request = SelectionRequest {
             name: request_name,
@@ -6492,7 +7200,9 @@ impl Engine {
                     "live interface selection",
                     "a selection binding had no stable provider module",
                 );
-                return DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed);
+                return Ok(DiscoveryRecordOutcome::Rejected(
+                    RecordRejection::SelectionUnattributed,
+                ));
             }
         };
 
@@ -6501,13 +7211,16 @@ impl Engine {
         let mut matches_truncated = false;
         let mut read_loss = false;
         let mut assessment_loss = false;
+        let mut decoded_table = None;
         if record.return_rv == 0 && record.table_ptr != 0 {
             let Some(result_name) = selection_name_class(record.name_class) else {
                 self.mark_live_loss(
                     "live interface selection",
                     "a selection record carried an unknown result-name class",
                 );
-                return DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed);
+                return Ok(DiscoveryRecordOutcome::Rejected(
+                    RecordRejection::SelectionUnattributed,
+                ));
             };
             let Some(result_version) = selection_version_class(record.selection_version_class)
             else {
@@ -6515,7 +7228,9 @@ impl Engine {
                     "live interface selection",
                     "a selection record carried an unknown result-version class",
                 );
-                return DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed);
+                return Ok(DiscoveryRecordOutcome::Rejected(
+                    RecordRejection::SelectionUnattributed,
+                ));
             };
             let observed = SelectionRequest {
                 name: result_name,
@@ -6542,7 +7257,7 @@ impl Engine {
                 }
                 let view = &self.views[position];
                 let budget = &mut self.budget;
-                let (_mapping_a, resolved_a) = selection_mapping_bracket(
+                let (_mapping, resolved) = selection_mapping_bracket(
                     record.table_ptr,
                     || {
                         let maps = Self::read_maps(view, budget).map_err(|_| ())?;
@@ -6557,39 +7272,36 @@ impl Engine {
                     inode,
                     file_offset,
                     ..
-                } = resolved_a
+                } = resolved
+                    && provider_key == Some(ObjectKey { device, inode })
                 {
-                    if provider_key == Some(ObjectKey { device, inode }) {
-                        self.capture_facts
-                            .visible_history()
-                            .selection_inventory
-                            .get(&ExactSelectionTable {
-                                view: binding.view,
-                                provider,
-                                address: record.table_ptr,
-                                file_offset,
-                            })
-                            .cloned()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|surface| {
-                                let inventory_name = surface.base.name.class();
-                                LiveInventoryMatch {
-                                    surface: surface.clone(),
-                                    name_agrees: inventory_name.is_some_and(|name| {
-                                        readable_name(result_name)
-                                            && readable_name(name)
-                                            && result_name == name
-                                    }),
-                                    version_agrees: readable_version(result_version)
-                                        && readable_version(surface.base.version)
-                                        && result_version == surface.base.version,
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                    } else {
-                        Vec::new()
-                    }
+                    self.capture_facts
+                        .visible_history()
+                        .selection_inventory
+                        .get(&ExactSelectionTable {
+                            view: binding.view,
+                            provider,
+                            address: record.table_ptr,
+                            file_offset,
+                        })
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|surface| {
+                            let inventory_name = surface.base.name.class();
+                            LiveInventoryMatch {
+                                surface: surface.clone(),
+                                name_agrees: inventory_name.is_some_and(|name| {
+                                    readable_name(result_name)
+                                        && readable_name(name)
+                                        && result_name == name
+                                }),
+                                version_agrees: readable_version(result_version)
+                                    && readable_version(surface.base.version)
+                                    && result_version == surface.base.version,
+                            }
+                        })
+                        .collect::<Vec<_>>()
                 } else {
                     Vec::new()
                 };
@@ -6599,15 +7311,14 @@ impl Engine {
             })();
             match assessed {
                 Ok(matches) => inventory_matches = matches,
-                Err(()) if queued.terminal_owner.is_some() => assessment_loss = true,
                 Err(()) => {
-                    self.mark_live_loss(
-                        "live interface selection",
-                        "a selection result could not be bracketed by one stable live mapping",
-                    );
-                    return DiscoveryRecordOutcome::Rejected(
-                        RecordRejection::SelectionUnattributed,
-                    );
+                    assessment_loss = true;
+                    if queued.terminal_owner.is_none() {
+                        self.mark_live_loss(
+                            "live interface selection",
+                            "a selection result could not be bracketed by one stable live mapping",
+                        );
+                    }
                 }
             }
             if inventory_matches.len() > MAX_LIVE_SELECTION_MATCHES {
@@ -6619,31 +7330,231 @@ impl Engine {
             read_loss = true;
         }
 
-        let unmatched = result.is_some() && inventory_matches.is_empty() && !assessment_loss;
-        self.capture_facts.record_selection(
+        let authority_shape = request.name == SelectionNameClass::ExactStandard
+            && result
+                .as_ref()
+                .is_some_and(|result| result.name == SelectionNameClass::ExactStandard)
+            && result.as_ref().is_some_and(|result| {
+                matches!(
+                    result.version,
+                    SelectionVersionClass::V3_0
+                        | SelectionVersionClass::V3_1
+                        | SelectionVersionClass::V3_2
+                ) && matches!(result.flags, 0 | cryptoki_sys::CKF_INTERFACE_FORK_SAFE)
+            });
+        if transactional
+            && inventory_matches.is_empty()
+            && !assessment_loss
+            && !read_loss
+            && authority_shape
+        {
+            let decoded = self
+                .views
+                .iter()
+                .find(|view| view.id() == binding.view && view.pid() == pid)
+                .ok_or(())
+                .and_then(|view| {
+                    if !self.pinned.check_unchanged().unwrap_or(false) {
+                        return Err(());
+                    }
+                    let (mapping, table) =
+                        Self::read_selection_table(view, record.table_ptr, &mut self.budget)?;
+                    if !self.pinned.check_unchanged().unwrap_or(false) {
+                        return Err(());
+                    }
+                    let provider = self.pinned.summary(binding.object).ok_or(())?.key;
+                    let table_owned = ObjectKey::of(&mapping) == provider
+                        && table.entries.iter().all(|entry| entry.object == provider);
+                    table_owned.then_some(table).ok_or(())
+                });
+            match decoded {
+                Ok(table) => decoded_table = Some(table),
+                Err(()) => assessment_loss = true,
+            }
+        }
+
+        let selection_became_truncated = self.capture_facts.record_selection(
             LiveSelectionTuple {
                 module,
                 request,
                 rv: record.return_rv,
                 result,
-                inventory_matches,
+                inventory_matches: inventory_matches.clone(),
                 count: 1,
             },
             matches_truncated,
         );
+        let unmatched = result.is_some() && inventory_matches.is_empty() && !assessment_loss;
+        let mut claim_authorized = false;
+        if unmatched
+            && can_attach
+            && queued.terminal_owner.is_none()
+            && !selection_became_truncated
+            && !read_loss
+            && !matches_truncated
+            && self.counter_snapshot.ring_loss == 0
+            && self.counter_snapshot.export_state_failures == 0
+            && self.counter_snapshot.export_bounded_read_failures == 0
+            && !self.capture_facts.visible_history().selection_truncated
+            && authority_shape
+            && result.as_ref().is_some_and(|result| {
+                decoded_table.as_ref().is_some_and(|table| {
+                    table.walk == "full" && inventory_version_class(table.version) == result.version
+                })
+            })
+        {
+            if let (Some(table), Some(result), Some(provider)) = (
+                decoded_table.as_ref(),
+                result.as_ref(),
+                self.pinned.owned_timing_key(binding.object),
+            ) {
+                if let Some((claims, tables, pending)) =
+                    self.propose_selection_claim(&binding, provider, table, result)
+                {
+                    let raw_modules = self
+                        .modules
+                        .iter()
+                        .map(|module| module.scanned.clone())
+                        .collect();
+                    let candidate = self.live_candidate_with_selection(
+                        self.pinned.clone(),
+                        raw_modules,
+                        claims,
+                        tables,
+                        pending,
+                    )?;
+                    if let Some((session, additions_allowed, pending_views)) = transaction {
+                        let outcome = self.apply_candidate(
+                            session,
+                            candidate,
+                            additions_allowed,
+                            false,
+                            &[],
+                        )?;
+                        self.record_apply_timing(&outcome);
+                        self.queue_apply_outcome(&outcome, pending_views);
+                        claim_authorized = outcome.selection_authorized;
+                        if !claim_authorized {
+                            self.mark_live_loss(
+                                "live interface selection",
+                                "an eligible selection-only table was refused by the attach transaction",
+                            );
+                        }
+                        if claim_authorized
+                            && let (Some(table), Some(provider)) = (
+                                decoded_table.as_ref(),
+                                self.pinned.owned_timing_key(binding.object),
+                            )
+                        {
+                            self.record_selection_occurrences(module, provider, table);
+                        }
+                    } else {
+                        self.mark_live_loss(
+                            "live interface selection",
+                            "an eligible selection-only table had no attach transaction",
+                        );
+                    }
+                }
+            }
+        }
         if read_loss {
             self.capture_facts
                 .record_selection_loss("a successful selection result was unreadable");
         }
         if assessment_loss {
-            self.capture_facts.record_selection_loss(
-                "a terminal selection result had no stable live table assessment",
-            );
-        } else if unmatched {
+            self.capture_facts
+                .record_selection_loss(if queued.terminal_owner.is_some() {
+                    "a terminal selection result had no stable live table assessment"
+                } else {
+                    "a selection result had no stable live table assessment"
+                });
+        } else if unmatched && !claim_authorized {
             self.capture_facts
                 .record_selection_loss("a successful selection result matched no inventory table");
         }
-        DiscoveryRecordOutcome::applied(false, true)
+        if transactional {
+            self.project_capture_facts();
+        }
+        Ok(DiscoveryRecordOutcome::applied(claim_authorized, true))
+    }
+
+    fn read_selection_table(
+        view: &ProcessView,
+        address: u64,
+        budget: &mut CaptureWorkBudget,
+    ) -> std::result::Result<(MapEntry, ScannedTable), ()> {
+        let maps_a = Self::read_maps(view, budget).map_err(|_| ())?;
+        let index_a = index_maps_or_refuse(&maps_a, budget).map_err(|_| ())?;
+        let mapping_a = index_a.containing(address).cloned().ok_or(())?;
+        if mapping_a.permissions[0] != b'r' {
+            return Err(());
+        }
+        let mem = view
+            .run_while_same(|| File::open(format!("/proc/{}/mem", view.pid())))
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
+        let mut bytes = vec![0; std::mem::size_of::<u64>()];
+        let mut operation_bytes = 0u64;
+        let mut read_exact = |bytes: &mut [u8], base: u64| -> Result<(), ()> {
+            let mut done = 0usize;
+            while done < bytes.len() {
+                if budget.check_deadline_now().is_some() {
+                    return Err(());
+                }
+                let allowed = budget.allowed_io(operation_bytes, bytes.len() - done);
+                if allowed == 0 {
+                    return Err(());
+                }
+                let at = base.checked_add(done as u64).ok_or(())?;
+                let read = mem
+                    .read_at(&mut bytes[done..done + allowed], at)
+                    .map_err(|_| ())?;
+                if read == 0 {
+                    return Err(());
+                }
+                budget.record_io(read);
+                operation_bytes = operation_bytes.saturating_add(read as u64);
+                done += read;
+            }
+            Ok(())
+        };
+        read_exact(&mut bytes, address)?;
+        let table_bytes = exact_table_bytes(&bytes).ok_or(())?;
+        let table_end = address.checked_add(table_bytes as u64).ok_or(())?;
+        if table_end > mapping_a.end {
+            return Err(());
+        }
+        bytes.resize(table_bytes, 0);
+        if table_bytes > std::mem::size_of::<u64>() {
+            read_exact(
+                &mut bytes[std::mem::size_of::<u64>()..],
+                address
+                    .checked_add(std::mem::size_of::<u64>() as u64)
+                    .ok_or(())?,
+            )?;
+        }
+        let raw_addresses = exact_table_addresses(&bytes).ok_or(())?;
+        let mut addresses = Vec::with_capacity(raw_addresses.len() + 1);
+        addresses.push(address);
+        addresses.extend(raw_addresses);
+        let mappings_a: Vec<_> = addresses
+            .iter()
+            .map(|address| index_a.containing(*address).cloned().ok_or(()))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let table = decode_exact_table(&bytes, address, &index_a, budget)
+            .map_err(|_| ())?
+            .ok_or(())?;
+        let maps_b = Self::read_maps(view, budget).map_err(|_| ())?;
+        let index_b = index_maps_or_refuse(&maps_b, budget).map_err(|_| ())?;
+        if !mappings_a
+            .iter()
+            .zip(&addresses)
+            .all(|(mapping, address)| index_b.containing(*address) == Some(mapping))
+            || !view.still_the_same()
+        {
+            return Err(());
+        }
+        Ok((mapping_a, table))
     }
 
     fn collect_dynamic_export_work(
@@ -8345,7 +9256,12 @@ impl Engine {
             DISCOVERY_KIND_FUNCTION_LIST_RETURN | DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN => {
                 self.process_export_record(&record, session, additions_allowed, pending_views)
             }
-            DISCOVERY_KIND_INTERFACE_RETURN => Ok(self.process_selection_record(&queued)),
+            DISCOVERY_KIND_INTERFACE_RETURN => self.process_selection_record_with_session(
+                &queued,
+                session,
+                additions_allowed,
+                pending_views,
+            ),
             DISCOVERY_KIND_LOADER => self.process_loader_record(
                 queued,
                 session,
@@ -13128,6 +14044,7 @@ mod tests {
             static_completions: vec![([completed.clone()].into_iter().collect(), Some(20))],
             static_failures: [failed.clone()].into_iter().collect(),
             newly_rejected_keys: BTreeSet::new(),
+            selection_authorized: false,
         };
 
         engine.record_apply_timing(&outcome);
@@ -13331,6 +14248,51 @@ int main(int argc, char **argv) {
         );
         let binding = *engine.selection_bindings.values().next().unwrap();
         (fixture, engine, session, binding)
+    }
+
+    fn selection_only_table(
+        engine: &Engine,
+        binding: SelectionBindingFact,
+        table_file_offset: u64,
+        entries: &[(&'static str, u64)],
+        null_entries: Vec<&'static str>,
+    ) -> ScannedTable {
+        let summary = engine.pinned.summary(binding.object).unwrap();
+        let path = engine
+            .modules
+            .iter()
+            .find(|module| module.object == binding.object)
+            .unwrap()
+            .scanned
+            .path
+            .clone();
+        ScannedTable {
+            version: (3, 0),
+            walk: "full",
+            entries: entries
+                .iter()
+                .map(|(name, file_offset)| ScannedEntry {
+                    name,
+                    object: summary.key,
+                    object_path: path.clone(),
+                    file_offset: *file_offset,
+                })
+                .collect(),
+            null_entries,
+            unpinned: Vec::new(),
+            address: 0,
+            file_offset: Some(table_file_offset),
+        }
+    }
+
+    fn selection_provider_address(engine: &Engine, binding: SelectionBindingFact) -> u64 {
+        let provider = engine.pinned.summary(binding.object).unwrap().key;
+        parse_maps(&std::fs::read(format!("/proc/{}/maps", engine.views[0].pid())).unwrap())
+            .unwrap()
+            .into_iter()
+            .find(|mapping| ObjectKey::of(mapping) == provider)
+            .unwrap()
+            .start
     }
 
     fn armed_seed_route(
@@ -13722,8 +14684,11 @@ int main(int argc, char **argv) {
         let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
         record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
         record.pid_tgid = u64::from(engine.views[0].pid()) << 32;
-        record.case_id = DISCOVERY_NAME_NULL;
-        record.return_rv = 1;
+        record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+        record.interface_index = DISCOVERY_VERSION_V3_0;
+        record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        record.selection_version_class = DISCOVERY_VERSION_V3_0;
+        record.table_ptr = selection_provider_address(&engine, binding);
         record.binding_id = binding.id;
         let queued = |record| QueuedDiscoveryRecord {
             record,
@@ -13739,7 +14704,7 @@ int main(int argc, char **argv) {
             );
         }
         assert_eq!(engine.capture_facts.history.selections.len(), 16);
-        assert!(engine.capture_facts.history.selections[0].result.is_none());
+        assert!(engine.capture_facts.history.selections[0].result.is_some());
         assert!(
             engine.capture_facts.history.selections[0]
                 .inventory_matches
@@ -13760,6 +14725,43 @@ int main(int argc, char **argv) {
             engine.plan, before_plan,
             "selection tuples never mutate inventory"
         );
+        assert!(engine.selection_claims.is_empty());
+        assert!(engine.selection_tables.is_empty());
+    }
+
+    #[test]
+    fn selection_unknown_result_flags_remain_factual_without_authority() {
+        let (_fixture, mut engine, _session, binding) = attached_selection_route();
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+        record.pid_tgid = u64::from(engine.views[0].pid()) << 32;
+        record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+        record.interface_index = DISCOVERY_VERSION_V3_0;
+        record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+        record.selection_version_class = DISCOVERY_VERSION_V3_0;
+        record.interface_flags = 1 << 63;
+        record.table_ptr = selection_provider_address(&engine, binding);
+        record.binding_id = binding.id;
+
+        assert_eq!(
+            engine.process_selection_record(&QueuedDiscoveryRecord {
+                record,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            }),
+            DiscoveryRecordOutcome::applied(false, true)
+        );
+        assert_eq!(
+            engine.capture_facts.history.selections[0]
+                .result
+                .as_ref()
+                .unwrap()
+                .flags,
+            1 << 63
+        );
+        assert!(engine.selection_claims.is_empty());
+        assert!(engine.selection_tables.is_empty());
+        assert!(!engine.capture_facts.history.selection_truncated);
     }
 
     #[test]
@@ -13986,7 +14988,10 @@ int main(int argc, char **argv) {
             distinct.request.flags = flags;
             facts.record_selection(distinct, false);
         }
-        assert_eq!(facts.visible_history().selections.len(), 16);
+        let mut other_provider = tuple.clone();
+        other_provider.module = plan::ModuleId(8);
+        facts.record_selection(other_provider, false);
+        assert_eq!(facts.visible_history().selections.len(), 17);
         assert!(facts.visible_history().selection_truncated);
         assert_eq!(facts.visible_history().losses.len(), 1);
         facts.rollback_stage();
@@ -14017,12 +15022,15 @@ int main(int argc, char **argv) {
             distinct.request.flags = flags;
             facts.record_selection(distinct, false);
         }
+        let mut other_provider = tuple;
+        other_provider.module = plan::ModuleId(8);
+        facts.record_selection(other_provider, false);
         facts.commit_stage().unwrap();
         assert_eq!(
             facts.history.selection_surfaces.len(),
             MAX_LIVE_SELECTION_SURFACES
         );
-        assert_eq!(facts.history.selections.len(), 16);
+        assert_eq!(facts.history.selections.len(), 17);
         assert!(facts.history.selection_truncated);
         assert_eq!(facts.history.losses.len(), 1);
     }
@@ -14066,6 +15074,273 @@ int main(int argc, char **argv) {
         assert!(engine.capture_facts.history.losses.values().any(|loss| {
             loss.reason == "a terminal selection result had no stable live table assessment"
         }));
+        assert!(engine.selection_claims.is_empty());
+        assert!(engine.selection_tables.is_empty());
+    }
+
+    #[test]
+    fn selection_occurrences_keep_canonical_null_and_alias_ordinals() {
+        let mut engine = Engine::empty();
+        let provider = timing_key(0);
+        let table = ScannedTable {
+            version: (3, 0),
+            walk: "full",
+            entries: vec![
+                ScannedEntry {
+                    name: "C_Finalize",
+                    object: plan::TEST_OBJECT,
+                    object_path: "/provider.so".into(),
+                    file_offset: 0x40,
+                },
+                ScannedEntry {
+                    name: "C_GetInfo",
+                    object: plan::TEST_OBJECT,
+                    object_path: "/provider.so".into(),
+                    file_offset: 0x40,
+                },
+            ],
+            null_entries: vec!["C_Initialize"],
+            unpinned: Vec::new(),
+            address: 0,
+            file_offset: Some(0x20),
+        };
+
+        engine.record_selection_occurrences(plan::ModuleId(7), provider, &table);
+
+        let occurrences: Vec<_> = engine
+            .capture_facts
+            .history
+            .decoded
+            .iter()
+            .filter_map(|occurrence| match occurrence {
+                DecodedOccurrence::Selection {
+                    ordinal,
+                    name,
+                    object,
+                    ..
+                } => Some((*ordinal, *name, object.is_some())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(occurrences.len(), 3);
+        assert!(occurrences.contains(&(
+            crate::kinds::function_id("C_Initialize").unwrap() as u16,
+            "C_Initialize",
+            false,
+        )));
+        assert!(occurrences.contains(&(
+            crate::kinds::function_id("C_Finalize").unwrap() as u16,
+            "C_Finalize",
+            true,
+        )));
+        assert!(occurrences.contains(&(
+            crate::kinds::function_id("C_GetInfo").unwrap() as u16,
+            "C_GetInfo",
+            true,
+        )));
+    }
+
+    #[test]
+    fn selection_semantic_key_reuses_same_table_and_refuses_changed_targets() {
+        let (_fixture, mut engine, _session, binding) = attached_selection_route();
+        let provider = engine.pinned.owned_timing_key(binding.object).unwrap();
+        let result = SelectionRequest {
+            name: SelectionNameClass::ExactStandard,
+            version: SelectionVersionClass::V3_0,
+            flags: 0,
+        };
+        let first = selection_only_table(
+            &engine,
+            binding,
+            0x20,
+            &[("C_Initialize", 0x100), ("C_Finalize", 0x108)],
+            Vec::new(),
+        );
+        let (claims, tables, _) = engine
+            .propose_selection_claim(&binding, provider.clone(), &first, &result)
+            .unwrap();
+        engine.selection_claims = claims.clone();
+        engine.selection_tables = tables.clone();
+
+        let (same_claims, same_tables, _) = engine
+            .propose_selection_claim(&binding, provider.clone(), &first, &result)
+            .unwrap();
+        assert_eq!(same_claims, claims);
+        assert_eq!(same_tables, tables);
+
+        engine.selection_claims.clear();
+        assert_eq!(engine.selection_tables, tables);
+
+        let changed = selection_only_table(
+            &engine,
+            binding,
+            0x20,
+            &[("C_Initialize", 0x100), ("C_Finalize", 0x110)],
+            Vec::new(),
+        );
+        assert!(
+            engine
+                .propose_selection_claim(&binding, provider, &changed, &result)
+                .is_none()
+        );
+        assert!(engine.selection_claims.is_empty());
+        assert_eq!(engine.selection_tables, tables);
+        assert!(engine.capture_facts.history.selection_truncated);
+    }
+
+    #[test]
+    fn selection_table_partial_attach_rolls_back_the_successful_prefix() {
+        let (_fixture, mut engine, mut session, binding) = attached_selection_route();
+        let provider = engine.pinned.owned_timing_key(binding.object).unwrap();
+        let table = selection_only_table(
+            &engine,
+            binding,
+            0x20,
+            &[("C_Initialize", 0x100), ("C_Finalize", 0x108)],
+            Vec::new(),
+        );
+        let result = SelectionRequest {
+            name: SelectionNameClass::ExactStandard,
+            version: SelectionVersionClass::V3_0,
+            flags: 0,
+        };
+        let (claims, tables, pending) = engine
+            .propose_selection_claim(&binding, provider, &table, &result)
+            .unwrap();
+        let raw_modules = engine
+            .modules
+            .iter()
+            .map(|module| module.scanned.clone())
+            .collect();
+        let candidate = engine
+            .live_candidate_with_selection(
+                engine.pinned.clone(),
+                raw_modules,
+                claims,
+                tables,
+                pending,
+            )
+            .unwrap();
+        assert_eq!(candidate.delta.new.len(), 2);
+        session.fail_target_slots([candidate.delta.new[1].index]);
+
+        let outcome = engine
+            .apply_candidate(&mut session, candidate, &mut true, false, &[])
+            .unwrap();
+
+        assert!(!outcome.selection_authorized);
+        assert!(engine.selection_claims.is_empty());
+        assert!(engine.selection_tables.is_empty());
+        assert!(
+            engine
+                .plan
+                .slots
+                .iter()
+                .filter(|slot| matches!(slot.file_offset, 0x100 | 0x108))
+                .all(|slot| !engine.plan.is_active(slot.index))
+        );
+        assert_eq!(session.attached_slots.last(), Some(&2));
+        assert_eq!(
+            session.detached_slots.iter().rev().take(2).sum::<usize>(),
+            2
+        );
+    }
+
+    #[test]
+    fn selection_candidate_preflight_refusal_keeps_claims_and_latch_unchanged() {
+        let (_fixture, mut engine, _session, binding) = attached_selection_route();
+        let table = selection_only_table(
+            &engine,
+            binding,
+            0x20,
+            &[("C_Initialize", 0x100)],
+            Vec::new(),
+        );
+        let result = SelectionRequest {
+            name: SelectionNameClass::ExactStandard,
+            version: SelectionVersionClass::V3_0,
+            flags: 0,
+        };
+        let (claims, tables, pending) = engine
+            .propose_selection_claim(
+                &binding,
+                engine.pinned.owned_timing_key(binding.object).unwrap(),
+                &table,
+                &result,
+            )
+            .unwrap();
+        let candidate = engine
+            .live_candidate_with_selection(
+                engine.pinned.clone(),
+                engine
+                    .modules
+                    .iter()
+                    .map(|module| module.scanned.clone())
+                    .collect(),
+                claims,
+                tables,
+                pending,
+            )
+            .unwrap();
+        let before_plan = engine.plan.clone();
+        let mut session = ScriptedSession::refusing_preflight();
+
+        let outcome = engine
+            .apply_candidate(&mut session, candidate, &mut true, false, &[])
+            .unwrap();
+
+        assert!(!outcome.selection_authorized);
+        assert_eq!(engine.plan, before_plan);
+        assert!(engine.selection_claims.is_empty());
+        assert!(engine.selection_tables.is_empty());
+        assert!(session.attached_slots.is_empty());
+    }
+
+    #[test]
+    fn selection_rollback_does_not_restore_a_latch_after_generation_loss() {
+        let (_fixture, mut engine, _session, binding) = attached_selection_route();
+        let table = selection_only_table(
+            &engine,
+            binding,
+            0x20,
+            &[("C_Initialize", 0x100)],
+            Vec::new(),
+        );
+        let result = SelectionRequest {
+            name: SelectionNameClass::ExactStandard,
+            version: SelectionVersionClass::V3_0,
+            flags: 0,
+        };
+        let provider = engine.pinned.owned_timing_key(binding.object).unwrap();
+        let (_, latched, _) = engine
+            .propose_selection_claim(&binding, provider.clone(), &table, &result)
+            .unwrap();
+        engine.selection_tables = latched;
+        let (claims, tables, pending) = engine
+            .propose_selection_claim(&binding, provider, &table, &result)
+            .unwrap();
+        let candidate = engine
+            .live_candidate_with_selection(
+                engine.pinned.clone(),
+                engine
+                    .modules
+                    .iter()
+                    .map(|module| module.scanned.clone())
+                    .collect(),
+                claims,
+                tables,
+                pending,
+            )
+            .unwrap();
+        let mut session = ScriptedSession::losing_generation_at_attach(engine.views[0].pid());
+
+        let outcome = engine
+            .apply_candidate(&mut session, candidate, &mut true, false, &[])
+            .unwrap();
+
+        assert!(!outcome.selection_authorized);
+        assert!(engine.selection_claims.is_empty());
+        assert!(engine.selection_tables.is_empty());
     }
 
     #[test]
@@ -16870,6 +18145,9 @@ int main(int argc, char **argv) {
             views: [stale].into_iter().collect(),
             corroboration: Vec::new(),
             manifest_fallbacks: Vec::new(),
+            selection_claims: BTreeMap::new(),
+            selection_tables: BTreeMap::new(),
+            selection_admission: None,
         };
         commit_cleaned_candidate_identity(
             &mut candidate,

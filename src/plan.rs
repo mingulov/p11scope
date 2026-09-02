@@ -233,6 +233,14 @@ pub(crate) struct ProvisionalGetFunctionList {
     pub(crate) file_offset: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SelectionTableTarget {
+    pub(crate) object: PinnedObjectId,
+    pub(crate) object_path: String,
+    pub(crate) file_offset: u64,
+    pub(crate) name: &'static str,
+}
+
 /// The finite link work induced by one complete rebuilt-plan snapshot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttachDelta {
@@ -392,6 +400,96 @@ impl AttachPlan {
         self.aggregate_owners
             .push(AggregateOwner::Sole(provisional.module));
         Ok(Some(slot))
+    }
+
+    /// Adds one complete selection-only table to a rebuilt candidate. Capacity
+    /// is checked against capture-lifetime allocations before any candidate
+    /// mutation, so a table either contributes every physical target or none.
+    pub(crate) fn add_selection_table(
+        &mut self,
+        allocated: &Self,
+        module: ModuleId,
+        targets: impl IntoIterator<Item = SelectionTableTarget>,
+    ) -> Result<(), String> {
+        self.validate_slot_index()?;
+        allocated.validate_slot_index()?;
+        let Some(provider) = self.modules.iter().find(|known| known.id == module) else {
+            return Err(format!("selection table names missing module {}", module.0));
+        };
+        let mut grouped: BTreeMap<AttachKey, (String, BTreeSet<&'static str>)> = BTreeMap::new();
+        for target in targets {
+            if target.object != provider.object {
+                return Err(format!(
+                    "selection table module {} names object {:?}, got {:?}",
+                    module.0, provider.object, target.object
+                ));
+            }
+            let (path, names) = grouped
+                .entry(AttachKey {
+                    object: target.object,
+                    file_offset: target.file_offset,
+                })
+                .or_insert_with(|| (target.object_path.clone(), BTreeSet::new()));
+            if target.object_path < *path {
+                *path = target.object_path;
+            }
+            names.insert(target.name);
+        }
+
+        let candidate_additions = self
+            .slot_by_key
+            .keys()
+            .filter(|key| !allocated.slot_by_key.contains_key(key))
+            .count();
+        let table_additions = grouped
+            .keys()
+            .filter(|key| {
+                !self.slot_by_key.contains_key(key) && !allocated.slot_by_key.contains_key(key)
+            })
+            .count();
+        let required = allocated
+            .slots
+            .len()
+            .checked_add(candidate_additions)
+            .and_then(|required| required.checked_add(table_additions))
+            .ok_or_else(|| "selection table slot requirement overflowed".to_string())?;
+        if required > MAX_SLOTS as usize {
+            return Err(format!(
+                "selection table needs {table_additions} more of the {MAX_SLOTS} attach slots; \
+                 {} are allocated or pending — refusing to attach a prefix",
+                required - table_additions
+            ));
+        }
+
+        for (key, (object_path, names)) in grouped {
+            if let Some(position) = self.slot_by_key.get(&key).copied() {
+                let slot = &mut self.slots[position];
+                slot.names.extend(names.into_iter().map(str::to_string));
+                slot.names.sort();
+                slot.names.dedup();
+                slot.aliased |= slot.names.len() >= 2;
+                continue;
+            }
+            let names: Vec<_> = names.into_iter().map(str::to_string).collect();
+            let slot = Slot {
+                index: self.slots.len() as u32,
+                descriptor_index: 0,
+                object: key.object,
+                object_path,
+                file_offset: key.file_offset,
+                aliased: names.len() >= 2,
+                names,
+                semantics: SlotSemantics::COUNT_ONLY,
+                semantic_authorized: false,
+                semantic_ambiguous: false,
+                fork_safe: false,
+                module_ids: vec![module],
+            };
+            self.slot_by_key.insert(key, slot.index as usize);
+            self.slots.push(slot);
+            self.aggregate_owners.push(AggregateOwner::Sole(module));
+        }
+        Ok(())
     }
 
     /// True while this slot still accepts probes. Retired slots remain in
@@ -2151,6 +2249,208 @@ mod tests {
 
     fn provisional_plan(object: PinnedObjectId) -> AttachPlan {
         exact_plan(vec![], vec![exact_module(0, object)])
+    }
+
+    fn selection_target(
+        object: PinnedObjectId,
+        file_offset: u64,
+        name: &'static str,
+    ) -> SelectionTableTarget {
+        SelectionTableTarget {
+            object,
+            object_path: format!("/proc/self/fd/{}", object.0),
+            file_offset,
+            name,
+        }
+    }
+
+    #[test]
+    fn selection_table_reuses_inventory_key_without_descriptor_downgrade() {
+        let object = PinnedObjectId(7);
+        let inventory = exact_slot(0, object, 0x10, 1, vec![ModuleId(0)]);
+        let allocated = exact_plan(vec![inventory.clone()], vec![exact_module(0, object)]);
+        let mut rebuilt = allocated.clone();
+
+        rebuilt
+            .add_selection_table(
+                &allocated,
+                ModuleId(0),
+                [selection_target(object, 0x10, "C_Verify")],
+            )
+            .unwrap();
+
+        assert_eq!(rebuilt.slots.len(), 1);
+        let reused = &rebuilt.slots[0];
+        assert_eq!(reused.descriptor_index, inventory.descriptor_index);
+        assert_eq!(reused.semantics, inventory.semantics);
+        assert_eq!(reused.semantic_authorized, inventory.semantic_authorized);
+        assert_eq!(reused.semantic_ambiguous, inventory.semantic_ambiguous);
+        assert_eq!(reused.fork_safe, inventory.fork_safe);
+        assert_eq!(reused.module_ids, inventory.module_ids);
+        assert_eq!(reused.names, ["C_Sign", "C_Verify"]);
+        assert!(reused.aliased);
+        let mut expected = allocated.clone();
+        expected.slots[0].names.push("C_Verify".into());
+        expected.slots[0].aliased = true;
+        assert_eq!(rebuilt, expected, "only finite alias metadata may change");
+        assert_eq!(rebuilt.module_of_slot(0), Some(ModuleId(0)));
+    }
+
+    #[test]
+    fn selection_table_coalesces_physical_keys_and_extends_with_ordinary_delta() {
+        let object = PinnedObjectId(7);
+        let allocated = exact_plan(vec![], vec![exact_module(0, object)]);
+        let mut rebuilt = allocated.clone();
+
+        rebuilt
+            .add_selection_table(
+                &allocated,
+                ModuleId(0),
+                [
+                    selection_target(object, 0x10, "C_Sign"),
+                    selection_target(object, 0x10, "C_Verify"),
+                    selection_target(object, 0x20, "C_Encrypt"),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(rebuilt.slots.len(), 2);
+        assert_eq!(rebuilt.slots[0].names, ["C_Sign", "C_Verify"]);
+        assert!(rebuilt.slots[0].aliased);
+        assert_eq!(rebuilt.slots[1].names, ["C_Encrypt"]);
+        for slot in &rebuilt.slots {
+            assert_eq!(slot.descriptor_index, 0);
+            assert_eq!(slot.semantics, SlotSemantics::COUNT_ONLY);
+            assert!(!slot.semantic_authorized);
+            assert!(!slot.semantic_ambiguous);
+            assert!(!slot.fork_safe);
+            assert_eq!(slot.module_ids, [ModuleId(0)]);
+        }
+
+        let mut committed = allocated;
+        let delta = committed.extend_exact(rebuilt).unwrap();
+        assert_eq!(
+            delta.new.iter().map(|slot| slot.index).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert!(delta.replace.is_empty());
+        assert!(delta.retire.is_empty());
+    }
+
+    #[test]
+    fn selection_table_capacity_refusal_mutates_nothing() {
+        let object = PinnedObjectId(7);
+        let slots = (0..MAX_SLOTS)
+            .map(|index| exact_slot(index, object, u64::from(index) * 8, 0, vec![ModuleId(0)]))
+            .collect();
+        let allocated = exact_plan(slots, vec![exact_module(0, object)]);
+        let mut rebuilt = exact_plan(vec![], vec![exact_module(0, object)]);
+        let before = rebuilt.clone();
+
+        assert!(
+            rebuilt
+                .add_selection_table(
+                    &allocated,
+                    ModuleId(0),
+                    [
+                        selection_target(object, 0x10000, "C_Sign"),
+                        selection_target(object, 0x10008, "C_Verify"),
+                    ],
+                )
+                .is_err()
+        );
+        assert_eq!(rebuilt, before, "a refused table cannot leave a prefix");
+    }
+
+    #[test]
+    fn selection_table_capacity_counts_pending_overlap_and_retired_allocations() {
+        let object = PinnedObjectId(7);
+        let allocated_slots = (0..510)
+            .map(|index| exact_slot(index, object, u64::from(index) * 8, 0, vec![ModuleId(0)]))
+            .collect();
+        let allocated = exact_plan(allocated_slots, vec![exact_module(0, object)]);
+        let pending = exact_slot(0, object, 0x10000, 1, vec![ModuleId(0)]);
+        let mut fits = exact_plan(vec![pending.clone()], vec![exact_module(0, object)]);
+        fits.add_selection_table(
+            &allocated,
+            ModuleId(0),
+            [
+                selection_target(object, pending.file_offset, "C_Verify"),
+                selection_target(object, 0x10008, "C_Encrypt"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            fits.slots.len(),
+            2,
+            "the overlapping target is not charged twice"
+        );
+        let mut committed = allocated.clone();
+        assert_eq!(committed.extend_exact(fits).unwrap().new.len(), 2);
+        assert_eq!(committed.slots.len(), 512);
+
+        let mut overflows = exact_plan(vec![pending], vec![exact_module(0, object)]);
+        let before = overflows.clone();
+        assert!(
+            overflows
+                .add_selection_table(
+                    &allocated,
+                    ModuleId(0),
+                    [
+                        selection_target(object, 0x10000, "C_Verify"),
+                        selection_target(object, 0x10008, "C_Encrypt"),
+                        selection_target(object, 0x10010, "C_Decrypt"),
+                    ],
+                )
+                .is_err()
+        );
+        assert_eq!(overflows, before, "pending 513-slot work leaves no prefix");
+
+        let retired_key = 0x20000;
+        let mut retired = exact_plan(
+            vec![exact_slot(0, object, retired_key, 0, vec![ModuleId(0)])],
+            vec![exact_module(0, object)],
+        );
+        retired.deactivate(0);
+        let mut rebuilt = exact_plan(vec![], vec![exact_module(0, object)]);
+        rebuilt
+            .add_selection_table(
+                &retired,
+                ModuleId(0),
+                [selection_target(object, retired_key, "C_Sign")],
+            )
+            .unwrap();
+        let delta = retired.extend_exact(rebuilt).unwrap();
+        assert_eq!(delta.new[0].index, 1, "a retired key gets a fresh slot");
+    }
+
+    #[test]
+    fn selection_table_rejects_missing_or_wrong_provider_without_mutation() {
+        let object = PinnedObjectId(7);
+        let allocated = exact_plan(vec![], vec![exact_module(0, object)]);
+        let mut rebuilt = allocated.clone();
+        let before = rebuilt.clone();
+
+        assert!(
+            rebuilt
+                .add_selection_table(
+                    &allocated,
+                    ModuleId(9),
+                    [selection_target(object, 0x10, "C_Sign")],
+                )
+                .is_err()
+        );
+        assert_eq!(rebuilt, before);
+        assert!(
+            rebuilt
+                .add_selection_table(
+                    &allocated,
+                    ModuleId(0),
+                    [selection_target(PinnedObjectId(8), 0x10, "C_Sign")],
+                )
+                .is_err()
+        );
+        assert_eq!(rebuilt, before);
     }
 
     #[test]
